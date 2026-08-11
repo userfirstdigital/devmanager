@@ -11,10 +11,10 @@ use crate::domain::event::{
     HostCleanupBranchCompletedPayload, HostCloseBegunPayload, OperationAcceptedFact,
     OperationCancelledFact, OperationFailedFact, OperationSettledFact, OperationUncertainFact,
     PrimaryAgentSetPayload, ProviderApprovalPresentedPayload, ProviderInputAcceptedPayload,
-    ProviderQuestionPresentedPayload, ProviderWaitSettledPayload, ResourceRegisteredPayload,
-    ResourceReleaseBegunPayload, ResourceReleasedPayload, TaskAttentionSetPayload,
-    TaskCloseBegunPayload, TaskCreatedPayload, TaskRenamedPayload, TaskUnitPayload,
-    EVENT_SCHEMA_VERSION,
+    ProviderInputDeliveredPayload, ProviderQuestionPresentedPayload, ProviderWaitSettledPayload,
+    ResourceRegisteredPayload, ResourceReleaseBegunPayload, ResourceReleasedPayload,
+    TaskAttentionSetPayload, TaskCloseBegunPayload, TaskCreatedPayload, TaskRenamedPayload,
+    TaskUnitPayload, EVENT_SCHEMA_VERSION,
 };
 use crate::domain::id::{EventId, OperationId, OutboxId, TaskId};
 use crate::domain::operation::{
@@ -38,6 +38,7 @@ use crate::kernel::StoreMaintenanceReport;
 
 const BUSY_TIMEOUT_MS: i64 = 5_000;
 const MAX_DISPATCH_LEASE_MS: i64 = 3_600_000;
+pub(crate) const MAX_PROVIDER_EVENT_PAYLOAD_BYTES: usize = 256 * 1024;
 
 /// Opaque SQLite-backed kernel store. No public connection accessor.
 pub struct KernelStore {
@@ -924,7 +925,25 @@ fn rebuild_projection_tables_tx(tx: &Transaction<'_>) -> Result<ProjectionRebuil
         let event_type: String = row.get(4)?;
         let schema_version: i64 = row.get(5)?;
         let occurred_at_ms: i64 = row.get(6)?;
-        let payload: Vec<u8> = row.get(7)?;
+        // `ValueRef` keeps the SQLite BLOB borrowed until its length has been
+        // checked. Do not materialize an untrusted provider event payload just
+        // to reject it in `decode_stored_event`.
+        let payload_ref = row.get_ref(7)?;
+        let payload_bytes = payload_ref
+            .as_blob()
+            .map_err(|error| StoreError::CodecMismatch {
+                detail: format!("event payload is not a BLOB: {error}"),
+            })?;
+        if event_type.starts_with("provider_input.")
+            && payload_bytes.len() > MAX_PROVIDER_EVENT_PAYLOAD_BYTES
+        {
+            return Err(StoreError::CodecMismatch {
+                detail: format!(
+                    "provider event payload exceeds {MAX_PROVIDER_EVENT_PAYLOAD_BYTES} bytes"
+                ),
+            });
+        }
+        let payload = payload_bytes.to_vec();
 
         let domain = decode_stored_domain_event(
             sequence,
@@ -1237,7 +1256,10 @@ pub(crate) fn encode_event_payload(event: &Event) -> Result<Vec<u8>, StoreError>
         Event::ProviderInputAccepted {
             command_id,
             client_id,
+            operation_id,
             agent_session_id,
+            provider_kind,
+            provider_session_id,
             runtime_generation,
             turn_id,
             action_epoch,
@@ -1249,7 +1271,10 @@ pub(crate) fn encode_event_payload(event: &Event) -> Result<Vec<u8>, StoreError>
         } => rmp_serde::to_vec(&ProviderInputAcceptedPayload {
             command_id: *command_id,
             client_id: *client_id,
+            operation_id: *operation_id,
             agent_session_id: *agent_session_id,
+            provider_kind: provider_kind.clone(),
+            provider_session_id: provider_session_id.clone(),
             runtime_generation: *runtime_generation,
             turn_id: *turn_id,
             action_epoch: *action_epoch,
@@ -1261,12 +1286,16 @@ pub(crate) fn encode_event_payload(event: &Event) -> Result<Vec<u8>, StoreError>
         }),
         Event::ProviderQuestionPresented {
             agent_session_id,
+            provider_kind,
+            provider_session_id,
             runtime_generation,
             turn_id,
             action_epoch,
             question_id,
         } => rmp_serde::to_vec(&ProviderQuestionPresentedPayload {
             agent_session_id: *agent_session_id,
+            provider_kind: provider_kind.clone(),
+            provider_session_id: provider_session_id.clone(),
             runtime_generation: *runtime_generation,
             turn_id: *turn_id,
             action_epoch: *action_epoch,
@@ -1274,12 +1303,16 @@ pub(crate) fn encode_event_payload(event: &Event) -> Result<Vec<u8>, StoreError>
         }),
         Event::ProviderApprovalPresented {
             agent_session_id,
+            provider_kind,
+            provider_session_id,
             runtime_generation,
             turn_id,
             action_epoch,
             approval_id,
         } => rmp_serde::to_vec(&ProviderApprovalPresentedPayload {
             agent_session_id: *agent_session_id,
+            provider_kind: provider_kind.clone(),
+            provider_session_id: provider_session_id.clone(),
             runtime_generation: *runtime_generation,
             turn_id: *turn_id,
             action_epoch: *action_epoch,
@@ -1288,8 +1321,40 @@ pub(crate) fn encode_event_payload(event: &Event) -> Result<Vec<u8>, StoreError>
         Event::ProviderWaitSettled { fence } => rmp_serde::to_vec(&ProviderWaitSettledPayload {
             fence: fence.clone(),
         }),
+        Event::ProviderInputDelivered {
+            command_id,
+            client_id,
+            operation_id,
+            agent_session_id,
+            provider_kind,
+            provider_session_id,
+            runtime_generation,
+            turn_id,
+            action_epoch,
+            question_id,
+            approval_id,
+        } => rmp_serde::to_vec(&ProviderInputDeliveredPayload {
+            command_id: *command_id,
+            client_id: *client_id,
+            operation_id: *operation_id,
+            agent_session_id: *agent_session_id,
+            provider_kind: provider_kind.clone(),
+            provider_session_id: provider_session_id.clone(),
+            runtime_generation: *runtime_generation,
+            turn_id: *turn_id,
+            action_epoch: *action_epoch,
+            question_id: *question_id,
+            approval_id: *approval_id,
+        }),
     }
     .map_err(|e| StoreError::EventDecode(e.to_string()))?;
+    if event.event_type().starts_with("provider_input.")
+        && bytes.len() > MAX_PROVIDER_EVENT_PAYLOAD_BYTES
+    {
+        return Err(StoreError::EventDecode(format!(
+            "provider event payload exceeds {MAX_PROVIDER_EVENT_PAYLOAD_BYTES} bytes"
+        )));
+    }
     Ok(bytes)
 }
 
@@ -1301,6 +1366,14 @@ pub(crate) fn decode_stored_event(
     if schema_version != i64::from(EVENT_SCHEMA_VERSION) {
         return Err(StoreError::CodecMismatch {
             detail: format!("schema_version column {schema_version} != {EVENT_SCHEMA_VERSION}"),
+        });
+    }
+    if event_type.starts_with("provider_input.") && payload.len() > MAX_PROVIDER_EVENT_PAYLOAD_BYTES
+    {
+        return Err(StoreError::CodecMismatch {
+            detail: format!(
+                "provider event payload exceeds {MAX_PROVIDER_EVENT_PAYLOAD_BYTES} bytes"
+            ),
         });
     }
 
@@ -1431,7 +1504,10 @@ pub(crate) fn decode_stored_event(
             Event::ProviderInputAccepted {
                 command_id: p.command_id,
                 client_id: p.client_id,
+                operation_id: p.operation_id,
                 agent_session_id: p.agent_session_id,
+                provider_kind: p.provider_kind,
+                provider_session_id: p.provider_session_id,
                 runtime_generation: p.runtime_generation,
                 turn_id: p.turn_id,
                 action_epoch: p.action_epoch,
@@ -1446,6 +1522,8 @@ pub(crate) fn decode_stored_event(
             let p: ProviderQuestionPresentedPayload = unpack(payload)?;
             Event::ProviderQuestionPresented {
                 agent_session_id: p.agent_session_id,
+                provider_kind: p.provider_kind,
+                provider_session_id: p.provider_session_id,
                 runtime_generation: p.runtime_generation,
                 turn_id: p.turn_id,
                 action_epoch: p.action_epoch,
@@ -1456,6 +1534,8 @@ pub(crate) fn decode_stored_event(
             let p: ProviderApprovalPresentedPayload = unpack(payload)?;
             Event::ProviderApprovalPresented {
                 agent_session_id: p.agent_session_id,
+                provider_kind: p.provider_kind,
+                provider_session_id: p.provider_session_id,
                 runtime_generation: p.runtime_generation,
                 turn_id: p.turn_id,
                 action_epoch: p.action_epoch,
@@ -1465,6 +1545,22 @@ pub(crate) fn decode_stored_event(
         "provider_input.wait_settled" => {
             let p: ProviderWaitSettledPayload = unpack(payload)?;
             Event::ProviderWaitSettled { fence: p.fence }
+        }
+        "provider_input.delivered" => {
+            let p: ProviderInputDeliveredPayload = unpack(payload)?;
+            Event::ProviderInputDelivered {
+                command_id: p.command_id,
+                client_id: p.client_id,
+                operation_id: p.operation_id,
+                agent_session_id: p.agent_session_id,
+                provider_kind: p.provider_kind,
+                provider_session_id: p.provider_session_id,
+                runtime_generation: p.runtime_generation,
+                turn_id: p.turn_id,
+                action_epoch: p.action_epoch,
+                question_id: p.question_id,
+                approval_id: p.approval_id,
+            }
         }
         other => {
             return Err(StoreError::CodecMismatch {
@@ -1485,7 +1581,10 @@ pub(crate) fn decode_stored_event(
     match &event {
         Event::ProviderInputAccepted {
             command_id,
+            operation_id,
             agent_session_id,
+            provider_kind,
+            provider_session_id,
             runtime_generation,
             turn_id,
             action_epoch,
@@ -1493,12 +1592,21 @@ pub(crate) fn decode_stored_event(
             approval_id,
             action,
             wait,
+            delivery,
             ..
         } => {
-            let fence = crate::domain::provider_input::ProviderFenceIdentity::new(
+            if delivery.is_delivered() {
+                return Err(StoreError::CodecMismatch {
+                    detail: "provider input accepted event cannot claim delivery".into(),
+                });
+            }
+            let fence = crate::domain::provider_input::ProviderFenceIdentity::new_with_identity(
                 Some(*command_id),
                 None,
                 *agent_session_id,
+                provider_kind.clone(),
+                provider_session_id.clone(),
+                Some(*operation_id),
                 *runtime_generation,
                 *action_epoch,
                 *turn_id,
@@ -1517,15 +1625,20 @@ pub(crate) fn decode_stored_event(
         }
         Event::ProviderQuestionPresented {
             agent_session_id,
+            provider_kind,
+            provider_session_id,
             runtime_generation,
             turn_id,
             action_epoch,
             question_id,
         } => {
-            let fence = crate::domain::provider_input::ProviderFenceIdentity::new(
+            let fence = crate::domain::provider_input::ProviderFenceIdentity::new_with_identity(
                 None,
                 None,
                 *agent_session_id,
+                provider_kind.clone(),
+                provider_session_id.clone(),
+                None,
                 *runtime_generation,
                 *action_epoch,
                 *turn_id,
@@ -1539,15 +1652,20 @@ pub(crate) fn decode_stored_event(
         }
         Event::ProviderApprovalPresented {
             agent_session_id,
+            provider_kind,
+            provider_session_id,
             runtime_generation,
             turn_id,
             action_epoch,
             approval_id,
         } => {
-            let fence = crate::domain::provider_input::ProviderFenceIdentity::new(
+            let fence = crate::domain::provider_input::ProviderFenceIdentity::new_with_identity(
                 None,
                 None,
                 *agent_session_id,
+                provider_kind.clone(),
+                provider_session_id.clone(),
+                None,
                 *runtime_generation,
                 *action_epoch,
                 *turn_id,
@@ -1569,6 +1687,37 @@ pub(crate) fn decode_stored_event(
             .map_err(|err| StoreError::CodecMismatch {
                 detail: err.to_string(),
             })?;
+        }
+        Event::ProviderInputDelivered {
+            command_id,
+            operation_id,
+            agent_session_id,
+            provider_kind,
+            provider_session_id,
+            runtime_generation,
+            turn_id,
+            action_epoch,
+            question_id,
+            approval_id,
+            ..
+        } => {
+            let fence = crate::domain::provider_input::ProviderFenceIdentity::new_with_identity(
+                Some(*command_id),
+                None,
+                *agent_session_id,
+                provider_kind.clone(),
+                provider_session_id.clone(),
+                Some(*operation_id),
+                *runtime_generation,
+                *action_epoch,
+                *turn_id,
+                *question_id,
+                *approval_id,
+            );
+            crate::domain::provider_input::validate_provider_fence(&fence, None, None, None)
+                .map_err(|err| StoreError::CodecMismatch {
+                    detail: err.to_string(),
+                })?;
         }
         _ => {}
     }
@@ -1612,7 +1761,10 @@ fn validate_provider_event_task_identity(
     let Some((identity, action, wait)) = (match event {
         Event::ProviderInputAccepted {
             command_id,
+            operation_id,
             agent_session_id,
+            provider_kind,
+            provider_session_id,
             runtime_generation,
             turn_id,
             action_epoch,
@@ -1622,10 +1774,13 @@ fn validate_provider_event_task_identity(
             wait,
             ..
         } => Some((
-            crate::domain::provider_input::ProviderFenceIdentity::new(
+            crate::domain::provider_input::ProviderFenceIdentity::new_with_identity(
                 Some(*command_id),
                 task_id,
                 *agent_session_id,
+                provider_kind.clone(),
+                provider_session_id.clone(),
+                Some(*operation_id),
                 *runtime_generation,
                 *action_epoch,
                 *turn_id,
@@ -1637,15 +1792,20 @@ fn validate_provider_event_task_identity(
         )),
         Event::ProviderQuestionPresented {
             agent_session_id,
+            provider_kind,
+            provider_session_id,
             runtime_generation,
             turn_id,
             action_epoch,
             question_id,
         } => Some((
-            crate::domain::provider_input::ProviderFenceIdentity::new(
+            crate::domain::provider_input::ProviderFenceIdentity::new_with_identity(
                 None,
                 task_id,
                 *agent_session_id,
+                provider_kind.clone(),
+                provider_session_id.clone(),
+                None,
                 *runtime_generation,
                 *action_epoch,
                 *turn_id,
@@ -1657,15 +1817,20 @@ fn validate_provider_event_task_identity(
         )),
         Event::ProviderApprovalPresented {
             agent_session_id,
+            provider_kind,
+            provider_session_id,
             runtime_generation,
             turn_id,
             action_epoch,
             approval_id,
         } => Some((
-            crate::domain::provider_input::ProviderFenceIdentity::new(
+            crate::domain::provider_input::ProviderFenceIdentity::new_with_identity(
                 None,
                 task_id,
                 *agent_session_id,
+                provider_kind.clone(),
+                provider_session_id.clone(),
+                None,
                 *runtime_generation,
                 *action_epoch,
                 *turn_id,
@@ -1683,6 +1848,35 @@ fn validate_provider_event_task_identity(
             }
             Some((fence.identity(), None, None))
         }
+        Event::ProviderInputDelivered {
+            command_id,
+            operation_id,
+            agent_session_id,
+            provider_kind,
+            provider_session_id,
+            runtime_generation,
+            turn_id,
+            action_epoch,
+            question_id,
+            approval_id,
+            ..
+        } => Some((
+            crate::domain::provider_input::ProviderFenceIdentity::new_with_identity(
+                Some(*command_id),
+                task_id,
+                *agent_session_id,
+                provider_kind.clone(),
+                provider_session_id.clone(),
+                Some(*operation_id),
+                *runtime_generation,
+                *action_epoch,
+                *turn_id,
+                *question_id,
+                *approval_id,
+            ),
+            None,
+            None,
+        )),
         _ => None,
     }) else {
         return Ok(());
@@ -1690,6 +1884,17 @@ fn validate_provider_event_task_identity(
     if identity.task_id.is_none() {
         return Err(StoreError::CodecMismatch {
             detail: "provider event requires a task scope".into(),
+        });
+    }
+    if matches!(
+        event,
+        Event::ProviderInputAccepted { .. }
+            | Event::ProviderWaitSettled { .. }
+            | Event::ProviderInputDelivered { .. }
+    ) && identity.operation_id.is_none()
+    {
+        return Err(StoreError::CodecMismatch {
+            detail: "provider acceptance/wait event requires operation identity".into(),
         });
     }
     crate::domain::provider_input::validate_provider_fence(&identity, action, wait, None).map_err(
@@ -2395,6 +2600,17 @@ fn record_dispatch_ambiguity_in_tx(
         return Err(StoreError::Corruption);
     }
 
+    if disposition == AmbiguityDisposition::Uncertain {
+        command_bus::record_no_retry_dispatch_uncertainty_in_tx(
+            tx,
+            &row,
+            &effect_doc,
+            fence,
+            now_ms,
+        )?;
+        return Ok(disposition);
+    }
+
     let started_at = row.dispatch_started_at_ms.ok_or(StoreError::Corruption)?;
     let available_at = lease_deadline(now_ms.max(started_at).max(row.available_at_ms), delay_ms)?;
     let (next_state, last_error_class) = match disposition {
@@ -2402,10 +2618,7 @@ fn record_dispatch_ambiguity_in_tx(
         AmbiguityDisposition::ReconciliationRequired => {
             ("reconcile_required", Some("ambiguous_dispatch"))
         }
-        // There is no production NoAutomaticRetry effect in this phase. The
-        // pure policy mapping is locked now; the first durable uncertain path
-        // is exercised with its real effect in Phase 4.
-        AmbiguityDisposition::Uncertain => return Err(StoreError::InvalidDispatchTransition),
+        AmbiguityDisposition::Uncertain => unreachable!("handled above"),
     };
     let changed = tx.execute(
         "UPDATE outbox
@@ -2515,14 +2728,22 @@ fn recover_next_expired_dispatch_in_tx(
             return Err(StoreError::InvalidDispatchTransition);
         }
         let disposition = ambiguity_disposition(effect_doc.replay_policy);
+        if disposition == AmbiguityDisposition::Uncertain {
+            command_bus::record_no_retry_dispatch_uncertainty_in_tx(
+                tx,
+                &row,
+                &effect_doc,
+                revalidate_outbox_effect(tx, &row)?.1,
+                now_ms,
+            )?;
+            return Ok(Some(disposition));
+        }
         let (next_state, last_error_class) = match disposition {
             AmbiguityDisposition::RetryScheduled => ("pending", None),
             AmbiguityDisposition::ReconciliationRequired => {
                 ("reconcile_required", Some("ambiguous_dispatch"))
             }
-            AmbiguityDisposition::Uncertain => {
-                return Err(StoreError::InvalidDispatchTransition);
-            }
+            AmbiguityDisposition::Uncertain => unreachable!("handled above"),
         };
         let started_at = row.dispatch_started_at_ms.ok_or(StoreError::Corruption)?;
         let available_at =

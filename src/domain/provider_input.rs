@@ -10,12 +10,14 @@ use serde::de::{self, Deserializer, MapAccess, Visitor};
 use serde::ser;
 use serde::{Deserialize, Serialize};
 
-use crate::domain::agent::AgentSessionLifecycle;
+use crate::domain::agent::{AgentSessionLifecycle, ProviderSessionId};
+use crate::domain::canonical;
 use crate::domain::id::{
-    AgentSessionId, ApprovalId, ClientId, CommandId, QuestionId, TaskId, TurnId,
+    AgentSessionId, ApprovalId, ClientId, CommandId, OperationId, QuestionId, TaskId, TurnId,
 };
 
 pub const MAX_PROVIDER_INPUT_TEXT_BYTES: usize = 64 * 1024;
+pub const MAX_PROVIDER_KIND_BYTES: usize = 64;
 pub const MAX_PROVIDER_QUESTION_WINS: usize = 256;
 pub const MAX_PROVIDER_APPROVAL_WINS: usize = 256;
 pub const MAX_PROVIDER_WAITS: usize = 64;
@@ -29,6 +31,8 @@ pub enum ProviderInputIntentError {
     QuestionWinnerLimit,
     ApprovalWinnerLimit,
     WaitLimit,
+    MissingOperationId,
+    InvalidFence,
 }
 
 impl fmt::Display for ProviderInputIntentError {
@@ -51,11 +55,96 @@ impl fmt::Display for ProviderInputIntentError {
                 "provider approval winner map exceeds {MAX_PROVIDER_APPROVAL_WINS} entries"
             ),
             Self::WaitLimit => write!(f, "provider wait map exceeds {MAX_PROVIDER_WAITS} entries"),
+            Self::MissingOperationId => {
+                f.write_str("provider settlement requires an operation identity")
+            }
+            Self::InvalidFence => f.write_str("provider wait fence is invalid"),
         }
     }
 }
 
 impl std::error::Error for ProviderInputIntentError {}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+pub struct ProviderKind(String);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderKindError {
+    Empty,
+    TooLarge,
+    NonCanonical,
+}
+
+impl fmt::Display for ProviderKindError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => f.write_str("provider kind must be non-empty"),
+            Self::TooLarge => write!(f, "provider kind exceeds {MAX_PROVIDER_KIND_BYTES} bytes"),
+            Self::NonCanonical => f.write_str("provider kind must be canonical text"),
+        }
+    }
+}
+
+impl std::error::Error for ProviderKindError {}
+
+impl ProviderKind {
+    pub fn new(value: impl Into<String>) -> Result<Self, ProviderKindError> {
+        let value = value.into();
+        if value.is_empty() {
+            return Err(ProviderKindError::Empty);
+        }
+        if value.len() > MAX_PROVIDER_KIND_BYTES {
+            return Err(ProviderKindError::TooLarge);
+        }
+        if !canonical::is_canonical(&value) {
+            return Err(ProviderKindError::NonCanonical);
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ProviderKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl AsRef<str> for ProviderKind {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl<'de> Deserialize<'de> for ProviderKind {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ProviderKindVisitor;
+
+        impl Visitor<'_> for ProviderKindVisitor {
+            type Value = ProviderKind;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                write!(
+                    formatter,
+                    "canonical provider kind of at most {MAX_PROVIDER_KIND_BYTES} bytes"
+                )
+            }
+
+            fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                ProviderKind::new(value.to_owned()).map_err(E::custom)
+            }
+
+            fn visit_string<E: de::Error>(self, value: String) -> Result<Self::Value, E> {
+                ProviderKind::new(value).map_err(E::custom)
+            }
+        }
+
+        deserializer.deserialize_str(ProviderKindVisitor)
+    }
+}
 
 #[derive(Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -176,19 +265,21 @@ pub enum ProviderIntentPhase {
     Accepted,
 }
 
-/// Why delivery remains visible HOLD/Uncertain.
+/// Why a provider write is visible before/after the external boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ProviderDeliveryHoldReason {
     DestinationAdapterNotWired,
 }
 
-/// Delivery visibility. There is no `Delivered` variant until a real
-/// destination/outbox adapter exists, so this cannot be misreported.
+/// Delivery visibility. `Delivered` is only emitted by the durable effect
+/// completion path after an adapter proves the write; initial acceptance is
+/// never represented as delivery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ProviderDeliveryVisibility {
     Hold { reason: ProviderDeliveryHoldReason },
+    Delivered,
 }
 
 impl ProviderDeliveryVisibility {
@@ -199,7 +290,7 @@ impl ProviderDeliveryVisibility {
     }
 
     pub const fn is_delivered(self) -> bool {
-        false
+        matches!(self, Self::Delivered)
     }
 
     pub const fn reason_code(self) -> &'static str {
@@ -207,7 +298,12 @@ impl ProviderDeliveryVisibility {
             Self::Hold {
                 reason: ProviderDeliveryHoldReason::DestinationAdapterNotWired,
             } => "destination_adapter_not_wired",
+            Self::Delivered => "delivered",
         }
+    }
+
+    pub(crate) const fn delivered() -> Self {
+        Self::Delivered
     }
 }
 
@@ -215,6 +311,7 @@ impl ProviderDeliveryVisibility {
 #[serde(deny_unknown_fields)]
 pub struct ProviderInputSettlement {
     pub command_id: CommandId,
+    pub operation_id: Option<OperationId>,
     pub intent: ProviderIntentPhase,
     pub delivery: ProviderDeliveryVisibility,
 }
@@ -223,6 +320,7 @@ impl ProviderInputSettlement {
     pub fn intent_accepted_delivery_hold(command_id: CommandId) -> Self {
         Self {
             command_id,
+            operation_id: None,
             intent: ProviderIntentPhase::Accepted,
             delivery: ProviderDeliveryVisibility::hold_until_destination_adapter(),
         }
@@ -253,8 +351,11 @@ pub struct ProviderWaitRecord {
 pub struct ProviderWaitFence {
     command_id: CommandId,
     task_id: TaskId,
+    operation_id: Option<OperationId>,
     action_epoch: u64,
     agent_session_id: AgentSessionId,
+    provider_kind: Option<ProviderKind>,
+    provider_session_id: Option<ProviderSessionId>,
     runtime_generation: u64,
     turn_id: TurnId,
     question_id: Option<QuestionId>,
@@ -275,8 +376,40 @@ impl ProviderWaitFence {
         Self {
             command_id,
             task_id,
+            operation_id: None,
             action_epoch,
             agent_session_id,
+            provider_kind: None,
+            provider_session_id: None,
+            runtime_generation,
+            turn_id,
+            question_id,
+            approval_id,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_identity(
+        command_id: CommandId,
+        task_id: TaskId,
+        operation_id: OperationId,
+        action_epoch: u64,
+        agent_session_id: AgentSessionId,
+        provider_kind: ProviderKind,
+        provider_session_id: ProviderSessionId,
+        runtime_generation: u64,
+        turn_id: TurnId,
+        question_id: Option<QuestionId>,
+        approval_id: Option<ApprovalId>,
+    ) -> Self {
+        Self {
+            command_id,
+            task_id,
+            operation_id: Some(operation_id),
+            action_epoch,
+            agent_session_id,
+            provider_kind: Some(provider_kind),
+            provider_session_id: Some(provider_session_id),
             runtime_generation,
             turn_id,
             question_id,
@@ -292,12 +425,24 @@ impl ProviderWaitFence {
         self.task_id
     }
 
+    pub fn operation_id(&self) -> Option<OperationId> {
+        self.operation_id
+    }
+
     pub fn action_epoch(&self) -> u64 {
         self.action_epoch
     }
 
     pub fn agent_session_id(&self) -> AgentSessionId {
         self.agent_session_id
+    }
+
+    pub fn provider_kind(&self) -> Option<&ProviderKind> {
+        self.provider_kind.as_ref()
+    }
+
+    pub fn provider_session_id(&self) -> Option<&ProviderSessionId> {
+        self.provider_session_id.as_ref()
     }
 
     pub fn runtime_generation(&self) -> u64 {
@@ -321,7 +466,7 @@ impl ProviderWaitFence {
     }
 
     pub fn identity(&self) -> ProviderFenceIdentity {
-        ProviderFenceIdentity::new(
+        let mut identity = ProviderFenceIdentity::new(
             Some(self.command_id),
             Some(self.task_id),
             self.agent_session_id,
@@ -330,7 +475,11 @@ impl ProviderWaitFence {
             self.turn_id,
             self.question_id,
             self.approval_id,
-        )
+        );
+        identity.provider_kind = self.provider_kind.clone();
+        identity.provider_session_id = self.provider_session_id.clone();
+        identity.operation_id = self.operation_id;
+        identity
     }
 }
 
@@ -339,11 +488,14 @@ impl ProviderWaitFence {
 /// The command identity is optional only for provider-originated question and
 /// approval presentation events; accepted input and wait settlement always
 /// carry it. No identity is inferred from cwd, timestamps, or PTY state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderFenceIdentity {
     pub command_id: Option<CommandId>,
     pub task_id: Option<TaskId>,
     pub agent_session_id: AgentSessionId,
+    pub provider_kind: Option<ProviderKind>,
+    pub provider_session_id: Option<ProviderSessionId>,
+    pub operation_id: Option<OperationId>,
     pub runtime_generation: u64,
     pub action_epoch: u64,
     pub turn_id: TurnId,
@@ -366,6 +518,38 @@ impl ProviderFenceIdentity {
             command_id,
             task_id,
             agent_session_id,
+            provider_kind: None,
+            provider_session_id: None,
+            operation_id: None,
+            runtime_generation,
+            action_epoch,
+            turn_id,
+            question_id,
+            approval_id,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub const fn new_with_identity(
+        command_id: Option<CommandId>,
+        task_id: Option<TaskId>,
+        agent_session_id: AgentSessionId,
+        provider_kind: ProviderKind,
+        provider_session_id: ProviderSessionId,
+        operation_id: Option<OperationId>,
+        runtime_generation: u64,
+        action_epoch: u64,
+        turn_id: TurnId,
+        question_id: Option<QuestionId>,
+        approval_id: Option<ApprovalId>,
+    ) -> Self {
+        Self {
+            command_id,
+            task_id,
+            agent_session_id,
+            provider_kind: Some(provider_kind),
+            provider_session_id: Some(provider_session_id),
+            operation_id,
             runtime_generation,
             action_epoch,
             turn_id,
@@ -375,11 +559,13 @@ impl ProviderFenceIdentity {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderFenceContext {
     pub task_id: TaskId,
     pub agent_session_id: AgentSessionId,
     pub agent_task_id: TaskId,
+    pub provider_kind: ProviderKind,
+    pub provider_session_id: Option<ProviderSessionId>,
     pub runtime_generation: u64,
     pub action_epoch: u64,
     pub lifecycle: AgentSessionLifecycle,
@@ -398,6 +584,10 @@ pub enum ProviderFenceError {
     AgentNotLive,
     InvalidNestedIds,
     WaitFlagMismatch,
+    MissingProviderIdentity,
+    ProviderKindMismatch,
+    ProviderSessionMismatch,
+    MissingOperationId,
 }
 
 impl fmt::Display for ProviderFenceError {
@@ -412,6 +602,12 @@ impl fmt::Display for ProviderFenceError {
             Self::AgentNotLive => "provider fence agent lifecycle is not live",
             Self::InvalidNestedIds => "provider fence nested identities are inconsistent",
             Self::WaitFlagMismatch => "provider input wait flag disagrees with action",
+            Self::MissingProviderIdentity => {
+                "provider fence requires provider kind and session identity"
+            }
+            Self::ProviderKindMismatch => "provider fence provider kind mismatch",
+            Self::ProviderSessionMismatch => "provider fence provider session identity mismatch",
+            Self::MissingOperationId => "accepted provider fence requires an operation identity",
         };
         f.write_str(message)
     }
@@ -425,6 +621,19 @@ pub fn validate_provider_fence(
     wait: Option<bool>,
     context: Option<&ProviderFenceContext>,
 ) -> Result<(), ProviderFenceError> {
+    let has_provider_kind = fence.provider_kind.is_some();
+    let has_provider_session = fence.provider_session_id.is_some();
+    if !has_provider_kind || has_provider_kind != has_provider_session {
+        return Err(ProviderFenceError::MissingProviderIdentity);
+    }
+    if fence.operation_id.is_some() {
+        if fence.command_id.is_none() {
+            return Err(ProviderFenceError::MissingOperationId);
+        }
+    }
+    if fence.question_id.is_some() && fence.approval_id.is_some() {
+        return Err(ProviderFenceError::InvalidNestedIds);
+    }
     if let Some(action) = action {
         validate_action_nested_ids(action, fence.question_id, fence.approval_id)
             .map_err(|_| ProviderFenceError::InvalidNestedIds)?;
@@ -440,6 +649,15 @@ pub fn validate_provider_fence(
         }
         if fence.agent_session_id != context.agent_session_id {
             return Err(ProviderFenceError::AgentSessionMismatch);
+        }
+        let Some(provider_kind) = fence.provider_kind.as_ref() else {
+            return Err(ProviderFenceError::MissingProviderIdentity);
+        };
+        if provider_kind != &context.provider_kind {
+            return Err(ProviderFenceError::ProviderKindMismatch);
+        }
+        if fence.provider_session_id != context.provider_session_id {
+            return Err(ProviderFenceError::ProviderSessionMismatch);
         }
         if context.agent_task_id != context.task_id {
             return Err(ProviderFenceError::AgentOwnershipMismatch);
@@ -461,6 +679,9 @@ pub fn validate_provider_fence(
                 return Err(ProviderFenceError::TurnMismatch);
             }
         }
+    }
+    if action.is_some() && fence.operation_id.is_none() {
+        return Err(ProviderFenceError::MissingOperationId);
     }
     Ok(())
 }
@@ -603,6 +824,19 @@ impl ProviderSessionProjection {
         if self.waits.len() > MAX_PROVIDER_WAITS {
             return Err(ProviderInputIntentError::WaitLimit);
         }
+        if self
+            .last_settlement
+            .is_some_and(|settlement| settlement.operation_id.is_none())
+        {
+            return Err(ProviderInputIntentError::MissingOperationId);
+        }
+        for (command_id, record) in &self.waits {
+            if record.fence.command_id() != *command_id || record.fence.operation_id().is_none() {
+                return Err(ProviderInputIntentError::InvalidFence);
+            }
+            validate_provider_fence(&record.fence.identity(), None, None, None)
+                .map_err(|_| ProviderInputIntentError::InvalidFence)?;
+        }
         Ok(())
     }
 
@@ -674,41 +908,62 @@ pub fn validate_provider_text(text: &str) -> Result<(), ProviderInputIntentError
     Ok(())
 }
 
+struct ProviderTextVisitor;
+
+impl<'de> Visitor<'de> for ProviderTextVisitor {
+    type Value = String;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "non-empty provider input text of at most {MAX_PROVIDER_INPUT_TEXT_BYTES} bytes"
+        )
+    }
+
+    fn visit_borrowed_str<E: de::Error>(self, value: &'de str) -> Result<Self::Value, E> {
+        validate_provider_text(value).map_err(E::custom)?;
+        Ok(value.to_owned())
+    }
+
+    fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+        validate_provider_text(value).map_err(E::custom)?;
+        Ok(value.to_owned())
+    }
+
+    fn visit_string<E: de::Error>(self, value: String) -> Result<Self::Value, E> {
+        validate_provider_text(&value).map_err(E::custom)?;
+        Ok(value)
+    }
+}
+
 fn deserialize_provider_text<'de, D: Deserializer<'de>>(
     deserializer: D,
 ) -> Result<String, D::Error> {
-    struct TextVisitor;
-    impl Visitor<'_> for TextVisitor {
-        type Value = String;
+    deserializer.deserialize_str(ProviderTextVisitor)
+}
 
-        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-            write!(
-                formatter,
-                "non-empty provider input text of at most {MAX_PROVIDER_INPUT_TEXT_BYTES} bytes"
-            )
-        }
+struct OptionalProviderTextVisitor;
 
-        fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
-            validate_provider_text(value).map_err(E::custom)?;
-            Ok(value.to_string())
-        }
+impl<'de> Visitor<'de> for OptionalProviderTextVisitor {
+    type Value = Option<String>;
 
-        fn visit_string<E: de::Error>(self, value: String) -> Result<Self::Value, E> {
-            validate_provider_text(&value).map_err(E::custom)?;
-            Ok(value)
-        }
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("an optional bounded provider input text")
     }
-    deserializer.deserialize_str(TextVisitor)
+
+    fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_some<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_str(ProviderTextVisitor).map(Some)
+    }
 }
 
 pub(crate) fn deserialize_optional_provider_text<'de, D: Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<String>, D::Error> {
-    let value = Option::<String>::deserialize(deserializer)?;
-    if let Some(ref text) = value {
-        validate_provider_text(text).map_err(de::Error::custom)?;
-    }
-    Ok(value)
+    deserializer.deserialize_option(OptionalProviderTextVisitor)
 }
 
 pub fn validate_action_nested_ids(

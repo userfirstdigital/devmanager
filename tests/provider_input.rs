@@ -7,9 +7,10 @@ use devmanager::client::action::{
     ACTION_PROVIDER_STOP_TURN,
 };
 use devmanager::domain::{
-    decide, AgentSessionId, ClientId, Command, CommandEnvelope, CommandId,
-    PresentProviderApprovalIntent, PresentProviderQuestionIntent, ProviderInputAction, QuestionId,
-    RejectionCode, SubmitProviderInputIntent, TaskId, TurnId,
+    decide, AgentSessionId, ClientId, Command, CommandEnvelope, CommandId, OperationId,
+    PresentProviderApprovalIntent, PresentProviderQuestionIntent, ProviderInputAction,
+    ProviderKind, ProviderWaitFence, QuestionId, RejectionCode, SubmitProviderInputIntent, TaskId,
+    TurnId,
 };
 
 fn fixed_uuid_v7(tail: u8) -> [u8; 16] {
@@ -22,6 +23,21 @@ fn fixed_uuid_v7(tail: u8) -> [u8; 16] {
 fn seed_open_task_with_agent(
     bus: &mut devmanager::kernel::CommandBus,
     tail: u8,
+) -> (TaskId, AgentSessionId, u64, u64, ClientId) {
+    seed_open_task_with_agent_runtime(bus, tail, true)
+}
+
+fn seed_open_task_without_provider_runtime(
+    bus: &mut devmanager::kernel::CommandBus,
+    tail: u8,
+) -> (TaskId, AgentSessionId, u64, u64, ClientId) {
+    seed_open_task_with_agent_runtime(bus, tail, false)
+}
+
+fn seed_open_task_with_agent_runtime(
+    bus: &mut devmanager::kernel::CommandBus,
+    tail: u8,
+    bind_provider_runtime: bool,
 ) -> (TaskId, AgentSessionId, u64, u64, ClientId) {
     use devmanager::domain::command::CommandReceipt;
     use devmanager::domain::{
@@ -77,7 +93,12 @@ fn seed_open_task_with_agent(
                     task_id,
                     role: AgentRole::Primary,
                     provider_kind: "codex".into(),
-                    provider_session_id: None,
+                    provider_session_id: bind_provider_runtime.then(|| {
+                        devmanager::domain::ProviderSessionId::new(format!(
+                            "codex-session-{tail:02x}"
+                        ))
+                        .expect("provider session")
+                    }),
                     lifecycle: AgentSessionLifecycle::Open,
                     runtime_generation: 3,
                     revision: 0,
@@ -126,6 +147,36 @@ fn send_now_intent(
         },
     )
     .expect("valid send-now intent")
+}
+
+fn bound_wait_fence(
+    bus: &devmanager::kernel::CommandBus,
+    task_id: TaskId,
+    agent_session_id: AgentSessionId,
+    command_id: CommandId,
+    operation_id: OperationId,
+    action_epoch: u64,
+    runtime_generation: u64,
+    turn_id: TurnId,
+) -> ProviderWaitFence {
+    let snapshot = bus.task_snapshot(task_id).expect("snapshot").expect("task");
+    let agent = snapshot.agents.get(&agent_session_id).expect("agent");
+    ProviderWaitFence::new_with_identity(
+        command_id,
+        task_id,
+        operation_id,
+        action_epoch,
+        agent_session_id,
+        ProviderKind::new(agent.provider_kind.clone()).expect("provider kind"),
+        agent
+            .provider_session_id
+            .clone()
+            .expect("bound provider session"),
+        runtime_generation,
+        turn_id,
+        None,
+        None,
+    )
 }
 
 #[test]
@@ -445,6 +496,7 @@ fn wait_settlement_requires_exact_fence_and_rejects_replacement_generation() {
         })
         .expect("send and wait");
     let CommandReceipt::Accepted {
+        operation_id,
         task_revision: Some(after_wait),
         ..
     } = accepted
@@ -452,25 +504,25 @@ fn wait_settlement_requires_exact_fence_and_rejects_replacement_generation() {
         panic!("expected accepted wait, got {accepted:?}");
     };
 
-    let fence = ProviderWaitFence::new(
-        command_id,
+    let fence = bound_wait_fence(
+        &bus,
         task_id,
-        action_epoch,
         agent_session_id,
+        command_id,
+        operation_id,
+        action_epoch,
         3,
         turn_id,
-        None,
-        None,
     );
-    let bad = ProviderWaitFence::new(
-        command_id,
+    let bad = bound_wait_fence(
+        &bus,
         task_id,
-        action_epoch,
         agent_session_id,
+        command_id,
+        operation_id,
+        action_epoch,
         4,
         turn_id,
-        None,
-        None,
     );
     let rejected = bus
         .execute(CommandEnvelope {
@@ -547,6 +599,7 @@ fn settled_waits_reclaim_capacity_across_sixty_five_cycles() {
             })
             .expect("wait input");
         let CommandReceipt::Accepted {
+            operation_id,
             task_revision: Some(after_wait),
             ..
         } = accepted
@@ -554,15 +607,15 @@ fn settled_waits_reclaim_capacity_across_sixty_five_cycles() {
             panic!("wait input must be accepted");
         };
 
-        let fence = ProviderWaitFence::new(
-            wait_command_id,
+        let fence = bound_wait_fence(
+            &bus,
             task_id,
-            action_epoch,
             agent_session_id,
+            wait_command_id,
+            operation_id,
+            action_epoch,
             3,
             turn_id,
-            None,
-            None,
         );
         let settled = bus
             .execute(CommandEnvelope {
@@ -668,6 +721,16 @@ fn first_approval_wins_reports_typed_resolution_and_clears_open_approval() {
     let CommandReceipt::Accepted { .. } = winner else {
         panic!("approval winner must be accepted: {winner:?}");
     };
+    let winner_snapshot = bus
+        .task_snapshot(task_id)
+        .expect("winner snapshot")
+        .expect("winner task");
+    let winner_timestamp = winner_snapshot
+        .provider_sessions
+        .get(&agent_session_id)
+        .and_then(|session| session.approval_winners.get(&approval_id))
+        .map(|winner| winner.accepted_at_ms)
+        .expect("durable approval winner timestamp");
 
     let loser = bus
         .execute(CommandEnvelope {
@@ -675,7 +738,9 @@ fn first_approval_wins_reports_typed_resolution_and_clears_open_approval() {
             client_id,
             task_id: Some(task_id),
             issued_at_ms: winner_at + 1,
-            expected_task_revision: Some(revision + 1),
+            // Deliberately retain the pre-winner revision: a concurrent loser
+            // must still receive the typed first-winner resolution.
+            expected_task_revision: Some(revision),
             command: Command::SubmitProviderInput(
                 SubmitProviderInputIntent::try_new(
                     agent_session_id,
@@ -693,14 +758,18 @@ fn first_approval_wins_reports_typed_resolution_and_clears_open_approval() {
             ),
         })
         .expect("loser approval");
-    assert!(matches!(
-        loser,
-        CommandReceipt::Rejected {
-            code: RejectionCode::AlreadyResolved,
-            resolution: Some(_),
-            ..
-        }
-    ));
+    let CommandReceipt::Rejected {
+        code,
+        resolution: Some(resolution),
+        ..
+    } = loser
+    else {
+        unreachable!("already-resolved loser must carry winner metadata");
+    };
+    assert_eq!(code, RejectionCode::AlreadyResolved);
+    assert_eq!(resolution.command_id, winner_command_id);
+    assert_eq!(resolution.client_id, client_id);
+    assert_eq!(resolution.accepted_at_ms, winner_timestamp);
 
     let snapshot = bus.task_snapshot(task_id).expect("snapshot").expect("task");
     let session = snapshot
@@ -741,6 +810,16 @@ fn provider_input_debug_redacts_raw_text() {
     let rendered = format!("{action:?}");
     assert!(!rendered.contains("secret prompt"), "{rendered}");
     assert!(rendered.contains("text_bytes"), "{rendered}");
+}
+
+#[test]
+fn provider_kind_decode_rejects_unbounded_or_noncanonical_identity() {
+    let oversized = format!(
+        "\"{}\"",
+        "x".repeat(devmanager::domain::MAX_PROVIDER_KIND_BYTES + 1)
+    );
+    assert!(serde_json::from_str::<ProviderKind>(&oversized).is_err());
+    assert!(serde_json::from_str::<ProviderKind>(r#"" codex""#).is_err());
 }
 
 #[test]
@@ -991,21 +1070,22 @@ fn duplicate_journal_only_provider_inputs_do_not_create_empty_operations() {
         })
         .expect("wait input");
     let CommandReceipt::Accepted {
+        operation_id,
         task_revision: Some(after_wait),
         ..
     } = accepted
     else {
         panic!("expected accepted wait, got {accepted:?}");
     };
-    let fence = ProviderWaitFence::new(
-        wait_command_id,
+    let fence = bound_wait_fence(
+        &bus,
         task_id,
-        action_epoch,
         agent_session_id,
+        wait_command_id,
+        operation_id,
+        action_epoch,
         3,
         turn_id,
-        None,
-        None,
     );
     let settled = bus
         .execute(CommandEnvelope {
@@ -1133,7 +1213,11 @@ fn provider_input_event_decode_rejects_mismatched_nested_identity_and_wait_flag(
     let event = Event::ProviderInputAccepted {
         command_id: CommandId::from_bytes(fixed_uuid_v7(0xD2)).expect("command"),
         client_id: ClientId::from_bytes(fixed_uuid_v7(0xD3)).expect("client"),
+        operation_id: OperationId::from_bytes(fixed_uuid_v7(0xD6)).expect("operation"),
         agent_session_id: AgentSessionId::from_bytes(fixed_uuid_v7(0xD4)).expect("agent"),
+        provider_kind: ProviderKind::new("codex").expect("provider kind"),
+        provider_session_id: devmanager::domain::ProviderSessionId::new("session-d4")
+            .expect("provider session"),
         runtime_generation: 3,
         turn_id: TurnId::from_bytes(fixed_uuid_v7(0xD5)).expect("turn"),
         action_epoch: 0,
@@ -1153,4 +1237,40 @@ fn provider_input_event_decode_rejects_mismatched_nested_identity_and_wait_flag(
         rendered.contains("inconsistent") || rendered.contains("wait"),
         "unexpected error: {rendered}"
     );
+}
+
+#[test]
+fn provider_input_without_bound_runtime_is_rejected_as_unsupported() {
+    use devmanager::domain::command::CommandReceipt;
+    use devmanager::kernel::CommandBus;
+    use tempfile::TempDir;
+
+    let dir = TempDir::new().expect("tempdir");
+    let path = dir.path().join("provider-input-unavailable.sqlite3");
+    let mut bus = CommandBus::open(&path).expect("open");
+    let (task_id, agent_session_id, action_epoch, revision, client_id) =
+        seed_open_task_without_provider_runtime(&mut bus, 0xF0);
+    let receipt = bus
+        .execute(CommandEnvelope {
+            command_id: CommandId::from_bytes(fixed_uuid_v7(0xFA)).expect("command"),
+            client_id,
+            task_id: Some(task_id),
+            issued_at_ms: 1_725_000_002_000,
+            expected_task_revision: Some(revision),
+            command: Command::SubmitProviderInput(send_now_intent(
+                agent_session_id,
+                TurnId::from_bytes(fixed_uuid_v7(0xFB)).expect("turn"),
+                action_epoch,
+                "runtime unavailable",
+                false,
+            )),
+        })
+        .expect("unavailable provider input must return a typed receipt");
+    assert!(matches!(
+        receipt,
+        CommandReceipt::Rejected {
+            code: RejectionCode::UnsupportedCapability,
+            ..
+        }
+    ));
 }

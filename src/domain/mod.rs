@@ -46,10 +46,11 @@ pub use provider_input::{
     validate_provider_fence, PresentProviderApprovalIntent, PresentProviderQuestionIntent,
     ProviderDeliveryHoldReason, ProviderDeliveryVisibility, ProviderFenceContext,
     ProviderFenceError, ProviderFenceIdentity, ProviderInputAction, ProviderInputIntentError,
-    ProviderInputSettlement, ProviderIntentPhase, ProviderResolutionWinner,
-    ProviderSessionProjection, ProviderWaitFence, ProviderWaitRecord, SettleProviderWaitIntent,
-    MAX_PROVIDER_APPROVAL_WINS, MAX_PROVIDER_INPUT_TEXT_BYTES, MAX_PROVIDER_QUESTION_WINS,
-    MAX_PROVIDER_SESSION_STATE_BYTES, MAX_PROVIDER_WAITS,
+    ProviderInputSettlement, ProviderIntentPhase, ProviderKind, ProviderKindError,
+    ProviderResolutionWinner, ProviderSessionProjection, ProviderWaitFence, ProviderWaitRecord,
+    SettleProviderWaitIntent, MAX_PROVIDER_APPROVAL_WINS, MAX_PROVIDER_INPUT_TEXT_BYTES,
+    MAX_PROVIDER_KIND_BYTES, MAX_PROVIDER_QUESTION_WINS, MAX_PROVIDER_SESSION_STATE_BYTES,
+    MAX_PROVIDER_WAITS,
 };
 pub use query::{Query, QueryEnvelope, QueryError, QueryOutcome, QueryReply, QueryResult};
 pub use resource::{

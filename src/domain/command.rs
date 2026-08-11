@@ -1162,6 +1162,12 @@ fn decide_submit_provider_input(
         return Err(RejectionCode::OwnershipConflict);
     }
     require_open_agent(agent)?;
+    let Some(provider_session_id) = agent.provider_session_id.clone() else {
+        return Err(RejectionCode::UnsupportedCapability);
+    };
+    let provider_kind =
+        crate::domain::provider_input::ProviderKind::new(agent.provider_kind.clone())
+            .map_err(|_| RejectionCode::UnsupportedCapability)?;
     if agent.runtime_generation != intent.runtime_generation() {
         return Err(RejectionCode::InvalidTransition);
     }
@@ -1225,7 +1231,10 @@ fn decide_submit_provider_input(
     Ok(vec![Event::ProviderInputAccepted {
         command_id: envelope.command_id,
         client_id: envelope.client_id,
+        operation_id: OperationId::new(),
         agent_session_id: intent.agent_session_id(),
+        provider_kind,
+        provider_session_id,
         runtime_generation: intent.runtime_generation(),
         turn_id: intent.turn_id(),
         action_epoch: intent.action_epoch(),
@@ -1249,6 +1258,12 @@ fn decide_present_provider_question(
         .get(&intent.agent_session_id())
         .ok_or(RejectionCode::NotFound)?;
     require_open_agent(agent)?;
+    let Some(provider_session_id) = agent.provider_session_id.clone() else {
+        return Err(RejectionCode::UnsupportedCapability);
+    };
+    let provider_kind =
+        crate::domain::provider_input::ProviderKind::new(agent.provider_kind.clone())
+            .map_err(|_| RejectionCode::UnsupportedCapability)?;
     if agent.runtime_generation != intent.runtime_generation()
         || snap.task.action_epoch != intent.action_epoch()
     {
@@ -1275,6 +1290,8 @@ fn decide_present_provider_question(
     }
     Ok(vec![Event::ProviderQuestionPresented {
         agent_session_id: intent.agent_session_id(),
+        provider_kind,
+        provider_session_id,
         runtime_generation: intent.runtime_generation(),
         turn_id: intent.turn_id(),
         action_epoch: intent.action_epoch(),
@@ -1294,6 +1311,12 @@ fn decide_present_provider_approval(
         .get(&intent.agent_session_id())
         .ok_or(RejectionCode::NotFound)?;
     require_open_agent(agent)?;
+    let Some(provider_session_id) = agent.provider_session_id.clone() else {
+        return Err(RejectionCode::UnsupportedCapability);
+    };
+    let provider_kind =
+        crate::domain::provider_input::ProviderKind::new(agent.provider_kind.clone())
+            .map_err(|_| RejectionCode::UnsupportedCapability)?;
     if agent.runtime_generation != intent.runtime_generation()
         || snap.task.action_epoch != intent.action_epoch()
     {
@@ -1320,6 +1343,8 @@ fn decide_present_provider_approval(
     }
     Ok(vec![Event::ProviderApprovalPresented {
         agent_session_id: intent.agent_session_id(),
+        provider_kind,
+        provider_session_id,
         runtime_generation: intent.runtime_generation(),
         turn_id: intent.turn_id(),
         action_epoch: intent.action_epoch(),
@@ -1337,6 +1362,13 @@ fn decide_settle_provider_wait(
     if intent.fence().task_id() != snap.task.id {
         return Err(RejectionCode::OwnershipConflict);
     }
+    crate::domain::provider_input::validate_provider_fence(
+        &intent.fence().identity(),
+        None,
+        None,
+        None,
+    )
+    .map_err(|_| RejectionCode::InvalidTransition)?;
     let session = snap
         .provider_sessions
         .get(&intent.fence().agent_session_id())

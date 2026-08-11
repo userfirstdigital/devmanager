@@ -732,6 +732,16 @@ pub(crate) fn record_dispatch_completion_in_tx(
         _ => return Err(StoreError::Corruption),
     };
 
+    // ProviderInput has no stock adapter yet. A generic dispatch callback is
+    // not proof that bytes crossed the provider boundary, so keeping this
+    // path from manufacturing ProviderInputDelivered is an intentional HOLD.
+    // The future adapter-proof seam must call the typed delivery path instead.
+    if operation.state == "accepted"
+        && matches!(&effect_doc.effect, Effect::DeliverProviderInput { .. })
+    {
+        return Err(StoreError::InvalidDispatchTransition);
+    }
+
     let kind = match completion {
         DispatchCompletion::Settled => OperationOutcomeKind::Settled {
             result_event_ids: settled_result_ids_for_callback(tx, permit.operation_id())?,
@@ -749,6 +759,72 @@ pub(crate) fn record_dispatch_completion_in_tx(
     )
     .map_err(|_| StoreError::ConstraintViolation)?;
     record_outcome_in_tx(tx, outcome)
+}
+
+/// Permanently record an ambiguous provider dispatch. NoAutomaticRetry effects
+/// must become durable Uncertain once bytes may have crossed the adapter
+/// boundary; callers never receive a reusable dispatch permit afterward.
+pub(crate) fn record_no_retry_dispatch_uncertainty_in_tx(
+    tx: &Transaction<'_>,
+    row: &OutboxRow,
+    effect_doc: &PlannedEffectDocument,
+    fence: OperationFence,
+    observed_at_ms: i64,
+) -> Result<(), StoreError> {
+    if effect_doc.replay_policy != ReplayPolicy::NoAutomaticRetry
+        || row.state != "dispatching"
+        || row.attempts <= 0
+        || row.reconciliation_receipt.is_some()
+    {
+        return Err(StoreError::InvalidDispatchTransition);
+    }
+    let operation =
+        load_operation_projection_by_id(tx, row.operation_id)?.ok_or(StoreError::Corruption)?;
+    if operation.state != "accepted" {
+        return Err(StoreError::InvalidDispatchTransition);
+    }
+    let task_id = operation.task_id.ok_or(StoreError::Corruption)?;
+    if !matches!(
+        &effect_doc.effect,
+        Effect::DeliverProviderInput { operation_id, .. } if *operation_id == row.operation_id
+    ) {
+        return Err(StoreError::Corruption);
+    }
+    validate_effect_matches_fence(&effect_doc.effect, task_id, fence)?;
+    // The dispatch begin transaction already proved live ownership before the
+    // external boundary. Recovery must still be able to record uncertainty if
+    // the provider session crashed or closed after bytes may have crossed.
+    let command_id = load_operation_command_id(tx, row.operation_id)?;
+    let (resource_id, runtime_generation) = ResourceFence::into_parts(
+        ResourceFence::from_parts(fence.resource_id, fence.runtime_generation)
+            .map_err(|_| StoreError::Corruption)?,
+    );
+    let uncertain = OperationUncertainFact::new(
+        command_id,
+        row.operation_id,
+        observed_at_ms.max(operation.accepted_at_ms),
+        OperationUncertaintyCode::AmbiguousDispatch,
+        fence.action_epoch,
+        resource_id,
+        runtime_generation,
+    )
+    .map_err(|_| StoreError::ConstraintViolation)?;
+    append_and_project(
+        tx,
+        EventId::new(),
+        Some(task_id),
+        None,
+        observed_at_ms.max(operation.accepted_at_ms),
+        Event::OperationUncertain(uncertain),
+    )?;
+    transition_outbox(
+        tx,
+        row,
+        "dispatching",
+        "uncertain",
+        Some("ambiguous_dispatch"),
+    )?;
+    Ok(())
 }
 
 pub(crate) fn validate_dispatch_permit_identity(
@@ -1266,6 +1342,23 @@ fn validate_effect_matches_fence(
                 return Err(StoreError::Corruption);
             }
         }
+        Effect::DeliverProviderInput {
+            task_id: effect_task,
+            action_epoch,
+            runtime_generation: _,
+            ..
+        } => {
+            if *effect_task != task_id
+                || fence.resource_id.is_some()
+                || fence.action_epoch != Some(*action_epoch)
+                // Provider runtime identity is validated from the typed
+                // effect and current ownership fence, not from the generic
+                // resource fence (which must be all-or-nothing).
+                || fence.runtime_generation.is_some()
+            {
+                return Err(StoreError::Corruption);
+            }
+        }
     }
     Ok(())
 }
@@ -1661,6 +1754,65 @@ fn require_current_effect_ownership(
                 return Err(StoreError::StaleFence);
             }
         }
+        Effect::DeliverProviderInput {
+            agent_session_id,
+            provider_kind,
+            provider_session_id,
+            action_epoch,
+            runtime_generation,
+            ..
+        } => {
+            let row: Option<(Vec<u8>, String, Option<String>, String, i64)> = tx
+                .query_row(
+                    "SELECT task_id, provider_kind, provider_session_id, lifecycle,
+                            runtime_generation
+                     FROM agent_sessions WHERE agent_session_id = ?1",
+                    [agent_session_id.as_bytes().as_slice()],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((owned_task, current_kind, current_session, lifecycle, generation)) = row
+            else {
+                return Err(StoreError::StaleFence);
+            };
+            let generation =
+                u64_from_nonnegative_i64("agent_sessions.runtime_generation", generation)?;
+            let expected_session = current_session
+                .map(crate::domain::agent::ProviderSessionId::new)
+                .transpose()
+                .map_err(|_| StoreError::Corruption)?;
+            let owned_ok = owned_task == task_id.as_bytes().to_vec();
+            if !owned_ok
+                || lifecycle != "open"
+                || current_kind != provider_kind.as_str()
+                || expected_session.as_ref() != Some(provider_session_id)
+                || generation != *runtime_generation
+            {
+                return Err(StoreError::StaleFence);
+            }
+            let (_task_lifecycle, epoch): (String, i64) = tx
+                .query_row(
+                    "SELECT lifecycle, action_epoch FROM tasks WHERE task_id = ?1",
+                    [task_id.as_bytes().as_slice()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .map_err(|err| match err {
+                    rusqlite::Error::QueryReturnedNoRows => StoreError::StaleFence,
+                    other => other.into(),
+                })?;
+            let epoch = u64_from_nonnegative_i64("tasks.action_epoch", epoch)?;
+            if Some(epoch) != fence.action_epoch || epoch != *action_epoch {
+                return Err(StoreError::StaleFence);
+            }
+        }
     }
     Ok(())
 }
@@ -1715,19 +1867,51 @@ fn apply_new_outcome(
                 refuse_archive_with_live_resources(tx, task_id)?;
             }
             let result_id = require_single_unused_result_id(tx, result_event_ids)?;
-            let result_payload = match effect {
-                Effect::BeginTaskTeardown { .. } => Event::TaskArchived,
-                Effect::ReleaseResource { resource_fence, .. } => Event::ResourceReleased {
-                    resource_id: resource_fence.resource_id,
-                    runtime_generation: resource_fence.runtime_generation,
-                },
+            let (result_revision, result_payload) = match effect {
+                Effect::BeginTaskTeardown { .. } => {
+                    (Some(next_task_revision(tx, task_id)?), Event::TaskArchived)
+                }
+                Effect::ReleaseResource { resource_fence, .. } => (
+                    Some(next_task_revision(tx, task_id)?),
+                    Event::ResourceReleased {
+                        resource_id: resource_fence.resource_id,
+                        runtime_generation: resource_fence.runtime_generation,
+                    },
+                ),
+                Effect::DeliverProviderInput {
+                    operation_id,
+                    client_id,
+                    agent_session_id,
+                    provider_kind,
+                    provider_session_id,
+                    runtime_generation,
+                    action_epoch,
+                    turn_id,
+                    question_id,
+                    approval_id,
+                    ..
+                } => (
+                    None,
+                    Event::ProviderInputDelivered {
+                        command_id,
+                        client_id: *client_id,
+                        operation_id: *operation_id,
+                        agent_session_id: *agent_session_id,
+                        provider_kind: provider_kind.clone(),
+                        provider_session_id: provider_session_id.clone(),
+                        runtime_generation: *runtime_generation,
+                        turn_id: *turn_id,
+                        action_epoch: *action_epoch,
+                        question_id: *question_id,
+                        approval_id: *approval_id,
+                    },
+                ),
             };
-            let next_revision = next_task_revision(tx, task_id)?;
             append_and_project(
                 tx,
                 result_id,
                 Some(task_id),
-                Some(next_revision),
+                result_revision,
                 outcome.occurred_at_ms,
                 result_payload,
             )?;
@@ -2103,15 +2287,26 @@ fn execute_in_tx(
     let current_revision = snapshot.as_ref().map(|snap| snap.task.revision);
 
     match decide(snapshot.as_ref(), &envelope) {
-        Err(code) => persist_rejection_with_resolution(
-            tx,
-            &envelope,
-            effective_task_id,
-            code,
-            current_revision,
-            accepted_at_ms,
-            provider_resolution_for_rejection(snapshot.as_ref(), &envelope, code),
-        ),
+        Err(code) => {
+            let resolution = provider_resolution_for_rejection(snapshot.as_ref(), &envelope);
+            // A concurrent answer/approval can advance the task revision or close the
+            // request before this command reaches the decision gate. Preserve the typed
+            // first-winner contract instead of leaking a generic rejection to the loser.
+            let code = if resolution.is_some() {
+                RejectionCode::AlreadyResolved
+            } else {
+                code
+            };
+            persist_rejection_with_resolution(
+                tx,
+                &envelope,
+                effective_task_id,
+                code,
+                current_revision,
+                accepted_at_ms,
+                resolution,
+            )
+        }
         Ok(decision) => {
             // Empty authoritative decisions for already Closing/Releasing stay unsupported
             // rather than inventing a duplicate in-flight operation/effect.
@@ -2631,16 +2826,7 @@ fn validate_accepted_receipt_correlation(
     }
     // Missing outbox must not fall through into the pure validator for accepted ops.
     if operation.state == "accepted" {
-        return validate_provider_input_accepted_receipt(
-            tx,
-            command_id,
-            expected_operation_id,
-            event_ids,
-            receipt_final_revision,
-            scope,
-            committed_sequence,
-            &operation,
-        );
+        return Err(StoreError::Corruption);
     }
     validate_pure_accepted_receipt(
         tx,
@@ -2651,71 +2837,6 @@ fn validate_accepted_receipt_correlation(
         scope,
         committed_sequence,
         &operation,
-    )
-}
-
-fn validate_provider_input_accepted_receipt(
-    tx: &Connection,
-    command_id: CommandId,
-    expected_operation_id: OperationId,
-    event_ids: &[EventId],
-    receipt_final_revision: u64,
-    scope: TaskId,
-    committed_sequence: u64,
-    operation: &OperationProjectionRow,
-) -> Result<(), StoreError> {
-    if operation.state != "accepted"
-        || operation.action_epoch.is_some()
-        || operation.resource_id.is_some()
-        || operation.runtime_generation.is_some()
-        || operation.result.is_some()
-        || operation.outcome_code.is_some()
-        || operation.outcome_at_ms.is_some()
-    {
-        return Err(StoreError::Corruption);
-    }
-    if event_ids.len() != 1 {
-        return Err(StoreError::Corruption);
-    }
-    let decision_count = u64::try_from(event_ids.len()).map_err(|_| StoreError::Corruption)?;
-    let first_decision_sequence = committed_sequence
-        .checked_sub(decision_count)
-        .ok_or(StoreError::Corruption)?;
-    validate_decision_event_batch(
-        tx,
-        event_ids,
-        scope,
-        receipt_final_revision,
-        first_decision_sequence,
-        operation.accepted_at_ms,
-        is_provider_input_decision_fact,
-    )?;
-    let accepted_row = load_event_row_at_sequence(tx, committed_sequence)?;
-    validate_accepted_fact_row(
-        &accepted_row,
-        command_id,
-        expected_operation_id,
-        Some(scope),
-        operation.accepted_at_ms,
-        OperationFence {
-            action_epoch: None,
-            resource_id: None,
-            runtime_generation: None,
-        },
-    )?;
-    ensure_unique_operation_accepted_fact(
-        tx,
-        command_id,
-        expected_operation_id,
-        Some(scope),
-        operation.accepted_at_ms,
-        committed_sequence,
-        &accepted_row,
-        OperationFence {
-            action_epoch: None,
-            resource_id: None,
-            runtime_generation: None,
-        },
     )
 }
 
@@ -3331,8 +3452,13 @@ fn validate_side_effect_accepted_receipt(
         is_side_effect_decision_fact,
     )?;
 
-    let expected_effects =
-        effects_from_durable_decision_facts(tx, scope, first_decision_sequence, &decision_facts)?;
+    let expected_effects = effects_from_durable_decision_facts(
+        tx,
+        scope,
+        first_decision_sequence,
+        expected_operation_id,
+        &decision_facts,
+    )?;
     if expected_effects.len() != outbox_rows.len() {
         return Err(StoreError::Corruption);
     }
@@ -4236,6 +4362,75 @@ fn validate_settled_result_fact(
     if result_task != Some(scope) || occurred_at != settled_at_ms {
         return Err(StoreError::Corruption);
     }
+    if let Effect::DeliverProviderInput {
+        operation_id,
+        command_id,
+        client_id,
+        agent_session_id,
+        provider_kind,
+        provider_session_id,
+        runtime_generation,
+        action_epoch,
+        turn_id,
+        question_id,
+        approval_id,
+        ..
+    } = effect
+    {
+        if task_revision.is_some()
+            || settled_sequence
+                != result_sequence
+                    .checked_add(1)
+                    .ok_or(StoreError::Corruption)?
+        {
+            return Err(StoreError::Corruption);
+        }
+        let decoded =
+            crate::kernel::store::decode_stored_event(&event_type, schema_version, &payload)?;
+        match decoded {
+            Event::ProviderInputDelivered {
+                command_id: result_command,
+                client_id: result_client,
+                operation_id: result_operation,
+                agent_session_id: result_agent,
+                provider_kind: result_kind,
+                provider_session_id: result_session,
+                runtime_generation: result_generation,
+                turn_id: result_turn,
+                action_epoch: result_epoch,
+                question_id: result_question,
+                approval_id: result_approval,
+            } if event_type == "provider_input.delivered"
+                && result_command == *command_id
+                && result_client == *client_id
+                && result_operation == *operation_id
+                && result_agent == *agent_session_id
+                && result_kind == *provider_kind
+                && result_session == *provider_session_id
+                && result_generation == *runtime_generation
+                && result_turn == *turn_id
+                && result_epoch == *action_epoch
+                && result_question == *question_id
+                && result_approval == *approval_id => {}
+            _ => return Err(StoreError::Corruption),
+        }
+        let snapshot = load_task_snapshot(tx, scope)?.ok_or(StoreError::Corruption)?;
+        let session = snapshot
+            .provider_sessions
+            .get(agent_session_id)
+            .ok_or(StoreError::Corruption)?;
+        let Some(settlement) = session.last_settlement else {
+            return Err(StoreError::Corruption);
+        };
+        if settlement.command_id != *command_id
+            || settlement.operation_id != Some(*operation_id)
+            || !settlement.delivery.is_delivered()
+        {
+            return Err(StoreError::Corruption);
+        }
+        let _ = validate_task_history_and_projection(tx, scope)?;
+        return Ok(());
+    }
     let Some(result_revision) = task_revision else {
         return Err(StoreError::Corruption);
     };
@@ -4624,6 +4819,7 @@ fn effects_from_durable_decision_facts(
     tx: &Connection,
     scope: TaskId,
     first_decision_sequence: u64,
+    expected_operation_id: OperationId,
     decision_facts: &[(Event, u64)],
 ) -> Result<Vec<PlannedEffect>, StoreError> {
     let mut planned = Vec::new();
@@ -4671,6 +4867,52 @@ fn effects_from_durable_decision_facts(
                         action_epoch: Some(epoch),
                         resource_id: Some(*resource_id),
                         runtime_generation: Some(*runtime_generation),
+                    },
+                });
+            }
+            Event::ProviderInputAccepted {
+                operation_id,
+                command_id,
+                client_id,
+                agent_session_id,
+                provider_kind,
+                provider_session_id,
+                runtime_generation,
+                action_epoch,
+                turn_id,
+                question_id,
+                approval_id,
+                action,
+                wait,
+                ..
+            } => {
+                if *operation_id != expected_operation_id {
+                    return Err(StoreError::Corruption);
+                }
+                planned.push(PlannedEffect {
+                    document: crate::kernel::outbox::PlannedEffectDocument::new(
+                        Effect::DeliverProviderInput {
+                            task_id: scope,
+                            operation_id: *operation_id,
+                            command_id: *command_id,
+                            client_id: *client_id,
+                            agent_session_id: *agent_session_id,
+                            provider_kind: provider_kind.clone(),
+                            provider_session_id: provider_session_id.clone(),
+                            runtime_generation: *runtime_generation,
+                            action_epoch: *action_epoch,
+                            turn_id: *turn_id,
+                            question_id: *question_id,
+                            approval_id: *approval_id,
+                            action: action.clone(),
+                            wait: *wait,
+                        },
+                        crate::kernel::outbox::ReplayPolicy::NoAutomaticRetry,
+                    ),
+                    fence: OperationFence {
+                        action_epoch: Some(*action_epoch),
+                        resource_id: None,
+                        runtime_generation: None,
                     },
                 });
             }
@@ -5566,21 +5808,18 @@ fn is_pure_slice_decision_fact(event: &Event) -> bool {
             | Event::PrimaryAgentSet { .. }
             | Event::ArtifactRegistered { .. }
             | Event::ResourceRegistered { .. }
-            | Event::ProviderInputAccepted { .. }
             | Event::ProviderQuestionPresented { .. }
             | Event::ProviderApprovalPresented { .. }
             | Event::ProviderWaitSettled { .. }
     )
 }
 
-fn is_provider_input_decision_fact(event: &Event) -> bool {
-    matches!(event, Event::ProviderInputAccepted { .. })
-}
-
 fn is_side_effect_decision_fact(event: &Event) -> bool {
     matches!(
         event,
-        Event::TaskCloseBegun { .. } | Event::ResourceReleaseBegun { .. }
+        Event::TaskCloseBegun { .. }
+            | Event::ResourceReleaseBegun { .. }
+            | Event::ProviderInputAccepted { .. }
     )
 }
 
@@ -5675,11 +5914,7 @@ fn persist_rejection_with_resolution(
 fn provider_resolution_for_rejection(
     snapshot: Option<&TaskSnapshot>,
     envelope: &CommandEnvelope,
-    code: RejectionCode,
 ) -> Option<crate::domain::ProviderResolutionWinner> {
-    if code != RejectionCode::AlreadyResolved {
-        return None;
-    }
     let snapshot = snapshot?;
     let Command::SubmitProviderInput(intent) = &envelope.command else {
         return None;
@@ -5696,9 +5931,9 @@ fn provider_resolution_for_rejection(
     }
 }
 
-/// Commits pure decision facts plus OperationAccepted in one transaction.
-/// Provider input deliberately stops at Accepted/HOLD: without a destination
-/// adapter there is no durable delivery proof and therefore no settlement.
+/// Commits pure decision facts plus OperationAccepted/Settled in one transaction.
+/// Provider input is deliberately excluded: it always requires a concrete
+/// NoAutomaticRetry outbox effect and therefore must use the side-effect path.
 fn persist_pure_acceptance(
     tx: &Transaction<'_>,
     envelope: &CommandEnvelope,
@@ -5707,8 +5942,14 @@ fn persist_pure_acceptance(
     decision: Vec<Event>,
     accepted_at_ms: i64,
 ) -> Result<CommandReceipt, StoreError> {
-    let is_provider_input = decision.len() == 1
-        && matches!(decision.first(), Some(Event::ProviderInputAccepted { .. }));
+    if decision
+        .iter()
+        .any(|event| matches!(event, Event::ProviderInputAccepted { .. }))
+    {
+        return Err(StoreError::Projection(
+            "provider input acceptance requires a durable outbox effect".into(),
+        ));
+    }
     let operation_id = OperationId::new();
     let decision_event_ids: Vec<EventId> = (0..decision.len()).map(|_| EventId::new()).collect();
     let accepted_event_id = EventId::new();
@@ -5774,7 +6015,7 @@ fn persist_pure_acceptance(
         None,
     )
     .map_err(|err| StoreError::Projection(err.to_string()))?;
-    let committed_sequence = append_and_project(
+    append_and_project(
         tx,
         accepted_event_id,
         effective_task_id,
@@ -5782,11 +6023,6 @@ fn persist_pure_acceptance(
         accepted_at_ms,
         Event::OperationAccepted(accepted),
     )?;
-
-    if is_provider_input {
-        set_committed_sequence(tx, envelope.command_id, committed_sequence)?;
-        return Ok(receipt);
-    }
 
     let settled = OperationSettledFact::new(
         envelope.command_id,
@@ -5834,7 +6070,27 @@ fn persist_side_effect_acceptance(
         }
     }
 
-    let operation_id = OperationId::new();
+    let operation_id = decision
+        .iter()
+        .find_map(|event| match event {
+            Event::ProviderInputAccepted { operation_id, .. } => Some(*operation_id),
+            _ => None,
+        })
+        .unwrap_or_else(OperationId::new);
+    for planned_effect in &planned {
+        if let Effect::DeliverProviderInput {
+            operation_id: effect_operation,
+            ..
+        } = &planned_effect.document.effect
+        {
+            if *effect_operation != operation_id {
+                return Err(StoreError::Projection(
+                    "provider input effect operation identity disagrees with accepted operation"
+                        .into(),
+                ));
+            }
+        }
+    }
     let decision_event_ids: Vec<EventId> = (0..decision.len()).map(|_| EventId::new()).collect();
     let accepted_event_id = EventId::new();
     let outbox_ids: Vec<OutboxId> = (0..planned.len()).map(|_| OutboxId::new()).collect();

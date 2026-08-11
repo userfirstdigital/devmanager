@@ -26,10 +26,15 @@ pub(crate) enum SettledLineageKind {
         resource_id: ResourceId,
         runtime_generation: u64,
     },
+    /// A provider adapter delivery is an external side effect whose result is
+    /// a non-task-mutating `provider_input.delivered` fact immediately before
+    /// `operation.settled`.
+    ProviderInput,
 }
 
 /// Pure = all-none; teardown = action + task scope; host admission = action + global scope;
-/// release = action + both resource fields. Any other combination fails closed.
+/// release = action + both resource fields; provider input = action + runtime generation.
+/// Any other combination fails closed.
 pub(crate) fn classify_settled_lineage_fence(
     action_epoch: Option<u64>,
     resource_id: Option<ResourceId>,
@@ -47,6 +52,7 @@ pub(crate) fn classify_settled_lineage_fence(
                 runtime_generation,
             })
         }
+        (Some(_), None, Some(_), Some(_)) => Ok(SettledLineageKind::ProviderInput),
         _ => Err(mismatch(
             as_projection,
             "unsupported operation fence shape for lineage",
@@ -69,10 +75,13 @@ pub(crate) fn classify_operation_settled_fact(
 }
 
 pub(crate) fn is_derived_lifecycle_result(event: &Event) -> bool {
-    matches!(event, Event::TaskArchived | Event::ResourceReleased { .. })
+    matches!(
+        event,
+        Event::TaskArchived | Event::ResourceReleased { .. } | Event::ProviderInputDelivered { .. }
+    )
 }
 
-/// Forward + reverse adjacency for a derived lifecycle result immediately
+/// Forward + reverse adjacency for a derived side-effect result immediately
 /// followed by its OperationSettled (or reject orphan / missing / wrong pair).
 pub(crate) fn validate_derived_settled_adjacency(
     derived_id: EventId,
@@ -168,14 +177,35 @@ pub(crate) fn validate_side_effect_settled_against_derived(
             "derived result and operation.settled occurred_at mismatch",
         ));
     }
-    let Some(_revision) = derived_revision else {
-        return Err(mismatch(
-            as_projection,
-            "derived lifecycle result requires non-null task_revision",
-        ));
-    };
     match (kind, derived) {
-        (SettledLineageKind::TaskTeardown, Event::TaskArchived) => Ok(()),
+        (
+            SettledLineageKind::ProviderInput,
+            Event::ProviderInputDelivered {
+                command_id,
+                operation_id,
+                runtime_generation,
+                action_epoch,
+                ..
+            },
+        ) if derived_revision.is_none()
+            && *command_id == fact.command_id
+            && *operation_id == fact.operation_id
+            && fact.action_epoch == Some(*action_epoch)
+            && fact.runtime_generation == Some(*runtime_generation) =>
+        {
+            Ok(())
+        }
+        (SettledLineageKind::ProviderInput, Event::ProviderInputDelivered { .. }) => Err(mismatch(
+            as_projection,
+            "provider input delivery and operation.settled identity mismatch",
+        )),
+        (SettledLineageKind::ProviderInput, _) => Err(mismatch(
+            as_projection,
+            "provider input settlement requires immediately preceding provider_input.delivered",
+        )),
+        (SettledLineageKind::TaskTeardown, Event::TaskArchived) if derived_revision.is_some() => {
+            Ok(())
+        }
         (
             SettledLineageKind::Release {
                 resource_id,
@@ -185,7 +215,10 @@ pub(crate) fn validate_side_effect_settled_against_derived(
                 resource_id: derived_resource,
                 runtime_generation: derived_generation,
             },
-        ) if resource_id == *derived_resource && runtime_generation == *derived_generation => {
+        ) if derived_revision.is_some()
+            && resource_id == *derived_resource
+            && runtime_generation == *derived_generation =>
+        {
             Ok(())
         }
         (SettledLineageKind::TaskTeardown, _) => Err(mismatch(
@@ -500,7 +533,6 @@ fn is_pure_decision_fact(event: &Event) -> bool {
             | Event::PrimaryAgentSet { .. }
             | Event::ArtifactRegistered { .. }
             | Event::ResourceRegistered { .. }
-            | Event::ProviderInputAccepted { .. }
             | Event::ProviderQuestionPresented { .. }
             | Event::ProviderApprovalPresented { .. }
             | Event::ProviderWaitSettled { .. }
