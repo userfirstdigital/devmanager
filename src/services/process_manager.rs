@@ -3396,10 +3396,7 @@ impl ProcessManager {
                 Ok(())
             }
             Ok(false) if session_projection_is_already_settled(&self.inner, session_id) => Ok(()),
-            Ok(false) => {
-                self.note_missing_session_close_request(session_id, closed_by_user);
-                Err(format!("Unknown session `{session_id}`"))
-            }
+            Ok(false) => Err(format!("Unknown session `{session_id}`")),
             Err(error) => {
                 self.note_exact_teardown_failure(session_id, &error, closed_by_user);
                 Err(error)
@@ -3418,28 +3415,6 @@ impl ProcessManager {
                 summary: format!("Exact managed teardown remains retryable: {error}"),
             });
             session.mark_dirty();
-        });
-    }
-
-    fn note_missing_session_close_request(&self, session_id: &str, closed_by_user: bool) {
-        self.update_session_state(session_id, |session| {
-            if session.status.is_live() {
-                // A runtime row without its exact TerminalSession/Job owner
-                // cannot be declared stopped: there is no authority left to
-                // prove ACTIVE_PROCESS_ZERO or release the exact fence. Make
-                // the unavailable authority visible instead of leaving the
-                // row in an indefinitely optimistic Stopping state.
-                session.status = SessionStatus::Failed;
-                session.reap_incomplete = true;
-                session.exit = Some(SessionExitState {
-                    code: None,
-                    signal: None,
-                    closed_by_user,
-                    summary: "Exact managed teardown unavailable: terminal owner is missing"
-                        .to_string(),
-                });
-                session.mark_dirty();
-            }
         });
     }
 
@@ -3836,7 +3811,8 @@ fn sampling_mutex_until<'a, T>(
     absolute_deadline: Instant,
 ) -> Result<MutexGuard<'a, T>, ()> {
     loop {
-        if Instant::now() >= absolute_deadline {
+        let remaining = absolute_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
             return Err(());
         }
         match mutex.try_lock() {
@@ -3846,7 +3822,9 @@ fn sampling_mutex_until<'a, T>(
                 }
                 return Ok(guard);
             }
-            Err(std::sync::TryLockError::WouldBlock) => thread::sleep(Duration::from_millis(1)),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                thread::sleep(remaining.min(Duration::from_millis(1)))
+            }
             Err(std::sync::TryLockError::Poisoned(_)) => return Err(()),
         }
     }
@@ -3857,7 +3835,8 @@ fn sampling_read_until<'a, T>(
     absolute_deadline: Instant,
 ) -> Result<RwLockReadGuard<'a, T>, ()> {
     loop {
-        if Instant::now() >= absolute_deadline {
+        let remaining = absolute_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
             return Err(());
         }
         match lock.try_read() {
@@ -3867,7 +3846,9 @@ fn sampling_read_until<'a, T>(
                 }
                 return Ok(guard);
             }
-            Err(std::sync::TryLockError::WouldBlock) => thread::sleep(Duration::from_millis(1)),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                thread::sleep(remaining.min(Duration::from_millis(1)))
+            }
             Err(std::sync::TryLockError::Poisoned(_)) => return Err(()),
         }
     }
@@ -3878,7 +3859,8 @@ fn sampling_write_until<'a, T>(
     absolute_deadline: Instant,
 ) -> Result<RwLockWriteGuard<'a, T>, ()> {
     loop {
-        if Instant::now() >= absolute_deadline {
+        let remaining = absolute_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
             return Err(());
         }
         match lock.try_write() {
@@ -3888,7 +3870,9 @@ fn sampling_write_until<'a, T>(
                 }
                 return Ok(guard);
             }
-            Err(std::sync::TryLockError::WouldBlock) => thread::sleep(Duration::from_millis(1)),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                thread::sleep(remaining.min(Duration::from_millis(1)))
+            }
             Err(std::sync::TryLockError::Poisoned(_)) => return Err(()),
         }
     }
@@ -5520,13 +5504,28 @@ fn session_projection_is_already_settled(inner: &ProcessManagerInner, session_id
             runtime
                 .sessions
                 .get(session_id)
-                .map(|session| session.status == SessionStatus::Stopped && !session.reap_incomplete)
+                .map(|session| {
+                    session.status == SessionStatus::Stopped
+                        && !session.reap_incomplete
+                        && session_process_projection_is_clean(session)
+                })
                 .unwrap_or(true)
         })
         .unwrap_or(false);
     owner_absent
         && runtime_settled
         && pid_file::active_tracked_pids_for_session(session_id).is_empty()
+}
+
+fn session_process_projection_is_clean(session: &SessionRuntimeState) -> bool {
+    session.pid.is_none()
+        && session.resources.cpu_percent == 0.0
+        && session.resources.core_equivalent_percent == 0.0
+        && session.resources.memory_bytes == 0
+        && session.resources.process_count == 0
+        && session.resources.process_ids.is_empty()
+        && session.resources.processes.is_empty()
+        && session.resources.managed_process_fence.is_none()
 }
 
 /// Close and remove only the exact TerminalSession observed before teardown.
@@ -5540,11 +5539,12 @@ fn close_exact_session_owner(
     let session = match inner.sessions.lock() {
         Ok(sessions) => sessions.get(session_id).cloned(),
         Err(_) => {
-            clear_unowned_managed_process_projection(inner, session_id);
+            clear_unowned_managed_process_projection(inner, session_id, closed_by_user);
             return Err("Session store poisoned".to_string());
         }
     };
     let Some(session) = session else {
+        clear_unowned_managed_process_projection(inner, session_id, closed_by_user);
         return Ok(false);
     };
     #[cfg(windows)]
@@ -7799,14 +7799,15 @@ fn close_managed_process_exact(
     // The selected PID and Kill/Kill-tree wording are diagnostic only. Exact
     // control always closes the whole teardown-owned Job generation.
     let _ = (diagnostic_pid, kill_tree);
-    let session = inner
-        .sessions
-        .lock()
-        .map_err(|_| "Session store poisoned".to_string())?
-        .get(session_id)
-        .cloned();
+    let session = match inner.sessions.lock() {
+        Ok(sessions) => sessions.get(session_id).cloned(),
+        Err(_) => {
+            clear_unowned_managed_process_projection(inner, session_id, true);
+            return Err("Session store poisoned".to_string());
+        }
+    };
     let Some(session) = session else {
-        clear_unowned_managed_process_projection(inner, session_id);
+        clear_unowned_managed_process_projection(inner, session_id, true);
         return Err(format!(
             "Exact managed teardown authority for session `{session_id}` is unavailable"
         ));
@@ -7839,7 +7840,13 @@ fn close_managed_process_exact(
     Ok(())
 }
 
-fn clear_unowned_managed_process_projection(inner: &Arc<ProcessManagerInner>, session_id: &str) {
+fn clear_unowned_managed_process_projection(
+    inner: &Arc<ProcessManagerInner>,
+    session_id: &str,
+    closed_by_user: bool,
+) {
+    let has_live_ledger_evidence =
+        !pid_file::active_tracked_pids_for_session(session_id).is_empty();
     let mut changed = false;
     let mut runtime = match inner.runtime_state.write() {
         Ok(runtime) => runtime,
@@ -7847,20 +7854,34 @@ fn clear_unowned_managed_process_projection(inner: &Arc<ProcessManagerInner>, se
     };
     if let Some(session) = runtime.sessions.get_mut(session_id) {
         let dirty_before = session.dirty_generation;
-        session.status = SessionStatus::Failed;
-        session.reap_incomplete = true;
+        let preserves_settlement = session.status == SessionStatus::Stopped
+            && !session.reap_incomplete
+            && !has_live_ledger_evidence;
         session.pid = None;
-        session.resources = ResourceSnapshot {
-            metrics_unavailable: true,
-            metrics_status: ProcessMetricStatus::Failed,
-            metric_values: ResourceMetricValueState::Unavailable,
-            cpu_value_state: ResourceMetricValueState::Unavailable,
-            memory_value_state: ResourceMetricValueState::Unavailable,
-            process_count_value_state: ResourceMetricValueState::Unavailable,
-            metrics_error: Some("exact_owner_unavailable".to_string()),
-            last_sample_at: Some(Instant::now()),
-            ..ResourceSnapshot::default()
-        };
+        if preserves_settlement {
+            session.resources = ResourceSnapshot::default();
+        } else {
+            session.status = SessionStatus::Failed;
+            session.reap_incomplete = true;
+            session.resources = ResourceSnapshot {
+                metrics_unavailable: true,
+                metrics_status: ProcessMetricStatus::Failed,
+                metric_values: ResourceMetricValueState::Unavailable,
+                cpu_value_state: ResourceMetricValueState::Unavailable,
+                memory_value_state: ResourceMetricValueState::Unavailable,
+                process_count_value_state: ResourceMetricValueState::Unavailable,
+                metrics_error: Some("exact_owner_unavailable".to_string()),
+                last_sample_at: Some(Instant::now()),
+                ..ResourceSnapshot::default()
+            };
+            session.exit = Some(SessionExitState {
+                code: None,
+                signal: None,
+                closed_by_user,
+                summary: "Exact managed teardown unavailable: terminal owner is missing"
+                    .to_string(),
+            });
+        }
         session.mark_dirty();
         changed = session.dirty_generation != dirty_before;
     }
@@ -12094,6 +12115,146 @@ mod tests {
         let error = reconcile_port_listener_until(43123, Instant::now())
             .expect_err("an expired operation must not launch a listener helper");
         assert!(error.contains("absolute deadline"), "{error}");
+    }
+
+    fn ownerless_process_projection(
+        session_id: &str,
+        pid: u32,
+        fence: ManagedProcessFence,
+    ) -> ResourceSnapshot {
+        ResourceSnapshot {
+            process_count: 1,
+            process_count_value_state: ResourceMetricValueState::LastKnown,
+            process_ids: vec![pid],
+            processes: vec![crate::state::ProcessResourceNode {
+                pid,
+                parent_pid: None,
+                name: "ownerless".to_string(),
+                cpu_percent: 0.0,
+                core_equivalent_percent: 0.0,
+                memory_bytes: 0,
+                memory_metric: resource_memory_metric(),
+                creation_time_100ns: None,
+                executable: None,
+                command_label: None,
+                command_arg_count: 0,
+                command_arg_bytes: 0,
+                resource_id: Some(opaque_resource_id(session_id)),
+                resource_kind: None,
+                child_count: 0,
+                lifecycle: crate::state::ProcessResourceLifecycle::Failed,
+                metrics_status: crate::domain::snapshot::ProcessMetricStatus::Unknown,
+                metric_values: ResourceMetricValueState::Unavailable,
+                cpu_value_state: ResourceMetricValueState::Unavailable,
+                memory_value_state: ResourceMetricValueState::Unavailable,
+                sampling_generation: 0,
+            }],
+            managed_process_fence: Some(fence),
+            ..ResourceSnapshot::default()
+        }
+    }
+
+    fn assert_process_monitor_has_no_kill_authority(session: &SessionRuntimeState) {
+        // The process monitor only constructs Kill/Kill-tree actions when the
+        // projected row carries an exact managed-process fence.
+        assert!(session.pid.is_none());
+        assert_eq!(session.resources.process_count, 0);
+        assert!(session.resources.process_ids.is_empty());
+        assert!(session.resources.processes.is_empty());
+        assert!(session.resources.managed_process_fence.is_none());
+    }
+
+    #[test]
+    fn request_close_cleans_ownerless_stopped_projection_before_settlement() {
+        let cwd = temp_test_dir("ownerless-stopped-close");
+        let _pid_file_guard = pid_file::use_test_pid_file(cwd.join("running-pids.json"));
+        let manager = ProcessManager::new();
+        let session_id = "ownerless-stopped-close";
+        let stale_pid = 800_001;
+        let mut session = SessionRuntimeState::new(
+            session_id,
+            cwd,
+            SessionDimensions::default(),
+            TerminalBackend::PortablePtyFeedingAlacritty,
+        );
+        session.status = SessionStatus::Stopped;
+        session.pid = Some(stale_pid);
+        session.resources =
+            ownerless_process_projection(session_id, stale_pid, synthetic_process_fence(stale_pid));
+        manager.register_runtime_session(session);
+
+        manager
+            .request_session_close(session_id, true)
+            .expect("a clean ownerless Stopped row may settle only after projection cleanup");
+
+        let runtime = manager.runtime_state();
+        let session = runtime.sessions.get(session_id).expect("runtime row");
+        assert_eq!(session.status, SessionStatus::Stopped);
+        assert!(!session.reap_incomplete);
+        assert_process_monitor_has_no_kill_authority(session);
+        assert!(session_projection_is_already_settled(
+            &manager.inner,
+            session_id
+        ));
+    }
+
+    #[test]
+    fn request_close_cleans_ownerless_failed_projection_but_retains_live_ledger_evidence() {
+        let cwd = temp_test_dir("ownerless-failed-close");
+        let _pid_file_guard = pid_file::use_test_pid_file(cwd.join("running-pids.json"));
+        let manager = ProcessManager::new();
+        let session_id = "ownerless-failed-close";
+        let current = platform_service::capture_process_identity(std::process::id())
+            .expect("current process identity");
+        pid_file::track_session_process(pid_file::ManagedProcessRecord {
+            session_id: session_id.to_string(),
+            pid: current.pid,
+            started_at_unix_secs: current.started_at_unix_secs,
+            process_name: current.process_name.clone(),
+            session_kind: "shell".to_string(),
+            program: "test-shell".to_string(),
+            project_id: None,
+            command_id: None,
+            tab_id: None,
+            descendant_processes: Vec::new(),
+        })
+        .expect("track live recovery evidence");
+        let mut session = SessionRuntimeState::new(
+            session_id,
+            cwd,
+            SessionDimensions::default(),
+            TerminalBackend::PortablePtyFeedingAlacritty,
+        );
+        session.status = SessionStatus::Failed;
+        session.reap_incomplete = true;
+        session.pid = Some(current.pid);
+        session.resources = ownerless_process_projection(
+            session_id,
+            current.pid,
+            synthetic_process_fence(current.pid),
+        );
+        manager.register_runtime_session(session);
+
+        let error = manager
+            .request_session_close(session_id, true)
+            .expect_err("live ledger evidence keeps missing-owner teardown retryable");
+        assert!(error.contains("Unknown session"), "{error}");
+
+        let runtime = manager.runtime_state();
+        let session = runtime.sessions.get(session_id).expect("runtime residue");
+        assert_eq!(session.status, SessionStatus::Failed);
+        assert!(session.reap_incomplete);
+        assert_process_monitor_has_no_kill_authority(session);
+        assert_eq!(
+            pid_file::active_tracked_pids_for_session(session_id),
+            vec![current.pid],
+            "exact live ledger evidence remains for reconciliation"
+        );
+        assert!(platform_service::is_pid_running(current.pid));
+        assert!(!session_projection_is_already_settled(
+            &manager.inner,
+            session_id
+        ));
     }
 
     #[test]
