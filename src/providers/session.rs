@@ -607,6 +607,29 @@ impl ProviderProcessId {
 pub type ProviderProcessLease = ProviderManagedProcessPermit;
 pub type ActiveProcessZeroSettlement = JoinedActiveProcessZeroProof;
 
+/// A failed recovery handoff returns the opaque permit to its current owner.
+/// Callers can report the error without silently dropping the process authority
+/// that still needs to be handed off.
+#[derive(Debug)]
+pub struct ProviderRecoveryHandoffFailure {
+    error: ProviderLaunchError,
+    lease: ProviderProcessLease,
+}
+
+impl ProviderRecoveryHandoffFailure {
+    fn new(error: ProviderLaunchError, lease: ProviderProcessLease) -> Self {
+        Self { error, lease }
+    }
+
+    fn error(&self) -> ProviderLaunchError {
+        self.error
+    }
+
+    fn into_lease(self) -> ProviderProcessLease {
+        self.lease
+    }
+}
+
 /// Launch/teardown failures stay typed so exact-resume failures remain visible
 /// and cannot be silently retried as a fresh conversation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -661,8 +684,11 @@ pub trait ProviderProcessLauncher: sealed::ProviderProcessLauncher {
         &mut self,
         _state: &ProviderSessionState,
         _lease: ProviderProcessLease,
-    ) -> Result<(), ProviderLaunchError> {
-        Err(ProviderLaunchError::BridgeUnavailable)
+    ) -> Result<(), ProviderRecoveryHandoffFailure> {
+        Err(ProviderRecoveryHandoffFailure::new(
+            ProviderLaunchError::BridgeUnavailable,
+            _lease,
+        ))
     }
 
     /// Reopen/reconcile an exact durable generation. A bridge must enumerate
@@ -744,6 +770,7 @@ struct FixtureProviderLaunchState {
     joined_active_process_zero: bool,
     next_fence_valid: bool,
     next_exit_proof_valid: bool,
+    recovery_error: Option<ProviderLaunchError>,
     drop_observer: Arc<Mutex<usize>>,
     // Test-only stand-in for the process registry's durable handoff. The
     // production manager never adopts roots from a process-local map.
@@ -853,6 +880,13 @@ impl FixtureProviderProcessLauncher {
             .lock()
             .expect("fixture provider state")
             .next_exit_proof_valid = valid;
+    }
+
+    pub fn set_recovery_error(&self, error: Option<ProviderLaunchError>) {
+        self.state
+            .lock()
+            .expect("fixture provider state")
+            .recovery_error = error;
     }
 
     fn fixture_fence(
@@ -976,13 +1010,13 @@ impl ProviderProcessLauncher for FixtureProviderProcessLauncher {
         &mut self,
         state: &ProviderSessionState,
         lease: ProviderProcessLease,
-    ) -> Result<(), ProviderLaunchError> {
+    ) -> Result<(), ProviderRecoveryHandoffFailure> {
+        let mut fixture_state = self.state.lock().expect("fixture provider state");
+        if let Some(error) = fixture_state.recovery_error.take() {
+            return Err(ProviderRecoveryHandoffFailure::new(error, lease));
+        }
         let key = RecoveryKey::from_state(state);
-        self.state
-            .lock()
-            .expect("fixture provider state")
-            .recovery
-            .insert(key, lease);
+        fixture_state.recovery.insert(key, lease);
         Ok(())
     }
 
@@ -1970,12 +2004,13 @@ impl ProviderSessionStateStore for InMemoryProviderSessionStateStore {
             if state.revision != expected_revision {
                 return Err("provider session state revision is a stale CAS".to_string());
             }
-            if current.task_id != state.task_id
-                || current.launch_spec.provider_kind != state.launch_spec.provider_kind
-                || (current.generation == state.generation
-                    && (current.action_epoch != state.action_epoch
-                        || current.launch_nonce != state.launch_nonce
-                        || current.launch_spec.provider_kind != state.launch_spec.provider_kind))
+            if let Err(error) = validate_same_generation_state_identity(current, &state) {
+                return Err(error);
+            }
+            if (current.generation == state.generation
+                && (current.action_epoch != state.action_epoch
+                    || current.launch_nonce != state.launch_nonce
+                    || current.launch_spec.provider_kind != state.launch_spec.provider_kind))
                 || (state.generation > current.generation
                     && (state.action_epoch <= current.action_epoch
                         || state.launch_nonce == current.launch_nonce))
@@ -2182,7 +2217,22 @@ struct ProviderSessionStateWire {
     process_root: Option<PersistedProcessRootWire>,
 }
 
-const PROVIDER_SESSION_STATE_SCHEMA_VERSION: u16 = 1;
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderSessionStateWireV1 {
+    schema_version: u16,
+    agent_session_id: AgentSessionId,
+    task_id: TaskId,
+    generation: u64,
+    revision: u64,
+    lifecycle: String,
+    launch_nonce: Uuid,
+    launch_spec: PersistedLaunchSpecWire,
+    provider_session_id: Option<ProviderSessionId>,
+}
+
+const PROVIDER_SESSION_STATE_LEGACY_SCHEMA_VERSION: u16 = 1;
+const PROVIDER_SESSION_STATE_SCHEMA_VERSION: u16 = 2;
 
 impl ProviderSessionState {
     fn encode(&self) -> Result<Vec<u8>, String> {
@@ -2247,14 +2297,51 @@ impl ProviderSessionState {
 
     fn decode(bytes: &[u8]) -> Result<Self, String> {
         validate_bounded_state_json(bytes)?;
-        let wire: ProviderSessionStateWire =
-            serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
-        if wire.schema_version != PROVIDER_SESSION_STATE_SCHEMA_VERSION {
-            return Err(format!(
-                "unsupported provider session state schema {}",
-                wire.schema_version
-            ));
-        }
+        // Decode the current shape first so strict unknown-field errors stay
+        // actionable. The predecessor v1 shape is tried only when the new
+        // fields are absent. An earlier release emitted the new shape while
+        // still labelling it schema 1, so that transitional form is accepted
+        // and normalized in memory as well.
+        let current_decode = serde_json::from_slice::<ProviderSessionStateWire>(bytes);
+        let wire = match current_decode {
+            Ok(wire) => {
+                if wire.schema_version != PROVIDER_SESSION_STATE_SCHEMA_VERSION
+                    && wire.schema_version != PROVIDER_SESSION_STATE_LEGACY_SCHEMA_VERSION
+                {
+                    return Err(format!(
+                        "unsupported provider session state schema {}",
+                        wire.schema_version
+                    ));
+                }
+                wire
+            }
+            Err(current_error) => {
+                let legacy = serde_json::from_slice::<ProviderSessionStateWireV1>(bytes)
+                    .map_err(|_| current_error.to_string())?;
+                if legacy.schema_version != PROVIDER_SESSION_STATE_LEGACY_SCHEMA_VERSION {
+                    return Err(format!(
+                        "unsupported provider session state schema {}",
+                        legacy.schema_version
+                    ));
+                }
+                ProviderSessionStateWire {
+                    schema_version: PROVIDER_SESSION_STATE_SCHEMA_VERSION,
+                    agent_session_id: legacy.agent_session_id,
+                    task_id: legacy.task_id,
+                    generation: legacy.generation,
+                    // Schema v1 had no independent action epoch. Its
+                    // generation was the only monotonic authority, so use it
+                    // as the deterministic migration epoch.
+                    action_epoch: legacy.generation,
+                    revision: legacy.revision,
+                    lifecycle: legacy.lifecycle,
+                    launch_nonce: legacy.launch_nonce,
+                    launch_spec: legacy.launch_spec,
+                    provider_session_id: legacy.provider_session_id,
+                    process_root: None,
+                }
+            }
+        };
         let persisted_launch = &wire.launch_spec;
         if wire.generation == 0
             || wire.revision == 0
@@ -2354,6 +2441,42 @@ fn persisted_lifecycle_from_name(value: &str) -> Result<PersistedRuntimeLifecycl
     }
 }
 
+fn validate_same_generation_state_identity(
+    current: &ProviderSessionState,
+    next: &ProviderSessionState,
+) -> Result<(), String> {
+    if current.agent_session_id != next.agent_session_id
+        || current.task_id != next.task_id
+        || current.launch_spec.provider_kind != next.launch_spec.provider_kind
+    {
+        return Err("provider session state task or provider identity changed".to_string());
+    }
+    if current.generation != next.generation {
+        return Ok(());
+    }
+    if current.launch_spec != next.launch_spec {
+        return Err("provider session state launch spec identity changed".to_string());
+    }
+    if current.process_root.is_some() && current.process_root != next.process_root {
+        return Err("provider session state process root identity changed".to_string());
+    }
+    if current.provider_session_id.is_some()
+        && current.provider_session_id != next.provider_session_id
+    {
+        return Err("provider session state provider ID identity changed".to_string());
+    }
+    if matches!(
+        current.lifecycle,
+        PersistedRuntimeLifecycle::LaunchFailed
+            | PersistedRuntimeLifecycle::Replaced
+            | PersistedRuntimeLifecycle::Closed
+    ) && current.lifecycle != next.lifecycle
+    {
+        return Err("provider session state terminal lifecycle regressed".to_string());
+    }
+    Ok(())
+}
+
 /// File-backed provider-session state and recovery journal. The latest state
 /// and every transition receipt are committed in one SQLite transaction, so a
 /// crash can expose either the previous authoritative state or the complete
@@ -2370,7 +2493,7 @@ impl fmt::Debug for SqliteProviderSessionStateStore {
 
 impl SqliteProviderSessionStateStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, String> {
-        let connection = Connection::open(path).map_err(|error| error.to_string())?;
+        let mut connection = Connection::open(path).map_err(|error| error.to_string())?;
         connection
             .busy_timeout(std::time::Duration::from_secs(5))
             .map_err(|error| error.to_string())?;
@@ -2415,7 +2538,129 @@ impl SqliteProviderSessionStateStore {
                  );",
             )
             .map_err(|error| error.to_string())?;
+        Self::migrate_legacy_schema(&mut connection)?;
         Ok(Self { connection })
+    }
+
+    fn table_columns(connection: &Connection, table: &str) -> Result<Vec<(String, i64)>, String> {
+        let mut statement = connection
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], |row| Ok((row.get(1)?, row.get(5)?)))
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
+    }
+
+    fn migrate_legacy_schema(connection: &mut Connection) -> Result<(), String> {
+        // Serialize schema inspection with the migration itself. Without the
+        // immediate transaction, two first-open connections could both observe
+        // the old shape and race an ALTER TABLE after one has already upgraded
+        // it.
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let recovery_columns =
+            Self::table_columns(&transaction, "provider_session_recovery_ownership")?;
+        let token_columns = Self::table_columns(&transaction, "provider_session_start_tokens")?;
+        let recovery_has = |name: &str| recovery_columns.iter().any(|(column, _)| column == name);
+        let recovery_pk = recovery_columns
+            .iter()
+            .filter(|(_, primary_key)| *primary_key != 0)
+            .map(|(column, _)| column.as_str())
+            .collect::<Vec<_>>();
+        let recovery_needs_rebuild = [
+            "action_epoch",
+            "claim_owner_id",
+            "claim_generation",
+            "claim_deadline_ms",
+        ]
+        .iter()
+        .any(|column| !recovery_has(column))
+            || recovery_pk
+                != [
+                    "agent_session_id",
+                    "generation",
+                    "action_epoch",
+                    "launch_nonce",
+                ];
+        let token_needs_migration = !token_columns
+            .iter()
+            .any(|(column, _)| column == "action_epoch");
+        if !recovery_needs_rebuild && !token_needs_migration {
+            transaction.commit().map_err(|error| error.to_string())?;
+            return Ok(());
+        }
+
+        if recovery_needs_rebuild {
+            let action_epoch = if recovery_has("action_epoch") {
+                "action_epoch"
+            } else {
+                "generation"
+            };
+            let claim_owner = if recovery_has("claim_owner_id") {
+                "claim_owner_id"
+            } else {
+                "NULL"
+            };
+            let claim_generation = if recovery_has("claim_generation") {
+                "claim_generation"
+            } else {
+                "0"
+            };
+            let claim_deadline = if recovery_has("claim_deadline_ms") {
+                "claim_deadline_ms"
+            } else {
+                "0"
+            };
+            transaction
+                .execute_batch(&format!(
+                    "DROP TABLE IF EXISTS provider_session_recovery_ownership_migrating;
+                     CREATE TABLE provider_session_recovery_ownership_migrating (
+                       agent_session_id TEXT NOT NULL,
+                       generation INTEGER NOT NULL,
+                       action_epoch INTEGER NOT NULL,
+                       launch_nonce TEXT NOT NULL,
+                       ownership_state TEXT NOT NULL,
+                       revision INTEGER NOT NULL,
+                       claim_owner_id TEXT,
+                       claim_generation INTEGER NOT NULL DEFAULT 0,
+                       claim_deadline_ms INTEGER NOT NULL DEFAULT 0,
+                       PRIMARY KEY (agent_session_id, generation, action_epoch, launch_nonce)
+                     );
+                     INSERT INTO provider_session_recovery_ownership_migrating
+                       (agent_session_id, generation, action_epoch, launch_nonce,
+                        ownership_state, revision, claim_owner_id, claim_generation,
+                        claim_deadline_ms)
+                     SELECT agent_session_id, generation, {action_epoch}, launch_nonce,
+                        ownership_state, revision, {claim_owner}, {claim_generation},
+                        {claim_deadline}
+                     FROM provider_session_recovery_ownership;
+                     DROP TABLE provider_session_recovery_ownership;
+                     ALTER TABLE provider_session_recovery_ownership_migrating
+                       RENAME TO provider_session_recovery_ownership;"
+                ))
+                .map_err(|error| error.to_string())?;
+        }
+        if token_needs_migration {
+            transaction
+                .execute(
+                    "ALTER TABLE provider_session_start_tokens
+                       ADD COLUMN action_epoch INTEGER NOT NULL DEFAULT 0",
+                    [],
+                )
+                .map_err(|error| error.to_string())?;
+            transaction
+                .execute(
+                    "UPDATE provider_session_start_tokens
+                        SET action_epoch = generation
+                      WHERE action_epoch = 0",
+                    [],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        transaction.commit().map_err(|error| error.to_string())
     }
 
     fn persist_transaction(
@@ -2452,14 +2697,13 @@ impl SqliteProviderSessionStateStore {
             if state.revision != expected_revision {
                 return Err("provider session state revision is a stale CAS".to_string());
             }
-            if current_state.agent_session_id != state.agent_session_id
-                || current_state.task_id != state.task_id
-                || current_state.launch_spec.provider_kind != state.launch_spec.provider_kind
-                || (current_state.generation == state.generation
-                    && (current_state.action_epoch != state.action_epoch
-                        || current_state.launch_nonce != state.launch_nonce
-                        || current_state.launch_spec.provider_kind
-                            != state.launch_spec.provider_kind))
+            if let Err(error) = validate_same_generation_state_identity(&current_state, state) {
+                return Err(error);
+            }
+            if (current_state.generation == state.generation
+                && (current_state.action_epoch != state.action_epoch
+                    || current_state.launch_nonce != state.launch_nonce
+                    || current_state.launch_spec.provider_kind != state.launch_spec.provider_kind))
                 || (state.generation > current_state.generation
                     && (state.action_epoch <= current_state.action_epoch
                         || state.launch_nonce == current_state.launch_nonce))
@@ -4465,7 +4709,7 @@ impl<L: ProviderProcessLauncher, S: ProviderSessionStateStore> ProviderSessionMa
         if validate_lease(&request, &lease, state.process_root.as_ref()).is_err() {
             if let Err(error) = self.launcher.retain_for_recovery(state, lease) {
                 let _ = self.state_store.release_recovery(state, &claim);
-                return Err(ProviderSessionError::StopFailed(error));
+                return Err(ProviderSessionError::StopFailed(error.error()));
             }
             let _ = self.state_store.release_recovery(state, &claim);
             return Err(ProviderSessionError::SettlementFenceMismatch);
@@ -4475,7 +4719,7 @@ impl<L: ProviderProcessLauncher, S: ProviderSessionStateStore> ProviderSessionMa
             Err(error) => {
                 if let Err(retain_error) = self.launcher.retain_for_recovery(state, lease) {
                     let _ = self.state_store.release_recovery(state, &claim);
-                    return Err(ProviderSessionError::StopFailed(retain_error));
+                    return Err(ProviderSessionError::StopFailed(retain_error.error()));
                 }
                 let _ = self.state_store.release_recovery(state, &claim);
                 return Err(ProviderSessionError::StopFailed(error));
@@ -4484,7 +4728,7 @@ impl<L: ProviderProcessLauncher, S: ProviderSessionStateStore> ProviderSessionMa
         if !settlement.matches_permit(&lease) {
             if let Err(error) = self.launcher.retain_for_recovery(state, lease) {
                 let _ = self.state_store.release_recovery(state, &claim);
-                return Err(ProviderSessionError::StopFailed(error));
+                return Err(ProviderSessionError::StopFailed(error.error()));
             }
             let _ = self.state_store.release_recovery(state, &claim);
             return Err(ProviderSessionError::SettlementFenceMismatch);
@@ -4534,7 +4778,7 @@ impl<L: ProviderProcessLauncher, S: ProviderSessionStateStore> ProviderSessionMa
     ) -> Result<(), ProviderSessionError> {
         self.launcher
             .retain_for_recovery(state, lease)
-            .map_err(ProviderSessionError::StopFailed)?;
+            .map_err(|error| ProviderSessionError::StopFailed(error.error()))?;
         self.persist_state_with_lifecycle(state, PersistedRuntimeLifecycle::UnknownLeaked)
     }
 
@@ -4629,6 +4873,57 @@ impl<L: ProviderProcessLauncher, S: ProviderSessionStateStore> ProviderSessionMa
         Ok(self.next_view_id)
     }
 
+    /// Acquire the process-registry recovery handoff before the manager is
+    /// destroyed. A failed bridge transfer returns the opaque lease to this
+    /// manager and remains visible to the caller for retry.
+    pub fn prepare_for_shutdown(&mut self) -> Result<(), ProviderSessionError> {
+        let slots = std::mem::take(&mut self.leases);
+        let mut first_error = None;
+        for (agent_id, slot) in slots {
+            self.pending_launches.remove(&agent_id);
+            let LeaseSlot {
+                lease,
+                state: slot_state,
+            } = slot;
+            let state = if let Some(runtime) = self.current.get(&agent_id) {
+                let lifecycle = if runtime.lifecycle() == RuntimeLifecycle::Closed {
+                    PersistedRuntimeLifecycle::Closed
+                } else {
+                    PersistedRuntimeLifecycle::UnknownLeaked
+                };
+                self.state_for_runtime(runtime, lifecycle)
+            } else {
+                let mut state = slot_state.clone();
+                state.lifecycle = PersistedRuntimeLifecycle::UnknownLeaked;
+                state.revision = 0;
+                state
+            };
+            match self.launcher.retain_for_recovery(&state, lease) {
+                Ok(()) => {
+                    if let Err(error) = self.persist_state(state) {
+                        if first_error.is_none() {
+                            first_error = Some(error);
+                        }
+                    }
+                }
+                Err(failure) => {
+                    let error = failure.error();
+                    self.leases.insert(
+                        agent_id,
+                        LeaseSlot {
+                            lease: failure.into_lease(),
+                            state: slot_state,
+                        },
+                    );
+                    if first_error.is_none() {
+                        first_error = Some(ProviderSessionError::StopFailed(error));
+                    }
+                }
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
     #[cfg(test)]
     fn set_next_view_id_for_test(&mut self, value: u64) {
         self.next_view_id = value;
@@ -4653,33 +4948,10 @@ impl<L: ProviderProcessLauncher, S: ProviderSessionStateStore> Drop
 {
     fn drop(&mut self) {
         // A manager may disappear during a crash or executor cancellation.
-        // Transfer every still-owned root to the injected process-registry
-        // recovery owner and journal UnknownLeaked. Process-local singleton
-        // state is not a recovery authority: restart authority belongs to the
-        // durable store plus the managed-process bridge.
-        let slots = std::mem::take(&mut self.leases);
-        for (agent_id, slot) in slots {
-            let LeaseSlot { lease, mut state } = slot;
-            self.pending_launches.remove(&agent_id);
-            let closed_journal_has_leftover_lease = self
-                .current
-                .get(&agent_id)
-                .is_some_and(|runtime| runtime.lifecycle() == RuntimeLifecycle::Closed);
-            // A crash after the Closed journal but before lease removal must
-            // retain Closed as the recovery key; rewriting it to UnknownLeaked
-            // would hide the idempotent closed-leftover reconciliation path.
-            if !closed_journal_has_leftover_lease {
-                state.lifecycle = PersistedRuntimeLifecycle::UnknownLeaked;
-            }
-            state.revision = 0;
-            let revision = self.next_state_revision.entry(agent_id).or_insert(0);
-            if let Some(next_revision) = revision.checked_add(1) {
-                *revision = next_revision;
-                state.revision = next_revision;
-                let _ = self.state_store.persist(state.clone());
-            }
-            let _ = self.launcher.retain_for_recovery(&state, lease);
-        }
+        // The explicit helper gives normal shutdown callers a visible error;
+        // Drop remains a best-effort last resort and never claims a handoff it
+        // did not acquire.
+        let _ = self.prepare_for_shutdown();
         for (agent_id, mut state) in std::mem::take(&mut self.pending_launches) {
             state.lifecycle = PersistedRuntimeLifecycle::UnknownLeaked;
             state.revision = 0;
@@ -5357,6 +5629,15 @@ mod tests {
             launcher.clone(),
             SqliteProviderSessionStateStore::open(path.path()).unwrap(),
         );
+        let durable_before_repair = SqliteProviderSessionStateStore::open(path.path())
+            .unwrap()
+            .load(agent.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            durable_before_repair.lifecycle(),
+            PersistedRuntimeLifecycle::Closed
+        );
         reopened.close_task(agent.task_id).unwrap();
         assert_eq!(launcher.snapshot().stopped().len(), 1);
         assert_eq!(
@@ -5368,6 +5649,34 @@ mod tests {
                 .lifecycle(),
             PersistedRuntimeLifecycle::Closed
         );
+    }
+
+    #[test]
+    fn recovery_handoff_failure_is_visible_and_retains_the_opaque_lease() {
+        let launcher = FixtureProviderProcessLauncher::new();
+        launcher.set_recovery_error(Some(ProviderLaunchError::BridgeUnavailable));
+        let agent = AgentSessionFacts::new(
+            TaskId::new(),
+            AgentRole::Primary,
+            ProviderKind::ClaudeCode,
+            None,
+        )
+        .unwrap();
+        let mut manager = ProviderSessionManager::new(launcher.clone());
+        let runtime = manager.start(test_request(agent.clone())).unwrap();
+
+        assert!(matches!(
+            manager.prepare_for_shutdown(),
+            Err(ProviderSessionError::StopFailed(
+                ProviderLaunchError::BridgeUnavailable
+            ))
+        ));
+        assert_eq!(launcher.snapshot().lease_drops(), 0);
+
+        manager.prepare_for_shutdown().unwrap();
+        assert_eq!(launcher.snapshot().lease_drops(), 0);
+        drop(runtime);
+        drop(manager);
     }
 
     #[test]
@@ -5440,7 +5749,6 @@ mod tests {
             provider_session_id: None,
             process_root: None,
         };
-
         let mut arguments: serde_json::Value =
             serde_json::from_slice(&state.encode().unwrap()).unwrap();
         arguments["launch_spec"]["arguments"] = serde_json::Value::Array(
@@ -5624,6 +5932,290 @@ mod tests {
         let error = store.persist(switched_task).unwrap_err();
         assert!(
             error.contains("identity") || error.contains("task"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn sqlite_open_migrates_v1_wire_and_recovery_tables() {
+        let runtime = unit_runtime();
+        let state = ProviderSessionState {
+            agent_session_id: runtime.agent_session_id(),
+            task_id: runtime.task_id(),
+            generation: runtime.generation(),
+            action_epoch: runtime.correlation().action_epoch(),
+            revision: 1,
+            lifecycle: PersistedRuntimeLifecycle::Running,
+            launch_nonce: runtime.launch_nonce(),
+            launch_spec: runtime.launch_spec(),
+            provider_session_id: None,
+            process_root: None,
+        };
+        let provider_id = ProviderSessionId::new("legacy-provider-session").unwrap();
+        let provenance = ProviderSessionStartProvenance::mint(runtime.correlation(), provider_id);
+        let mut legacy_json: serde_json::Value =
+            serde_json::from_slice(&state.encode().unwrap()).unwrap();
+        let legacy_object = legacy_json.as_object_mut().unwrap();
+        legacy_object.insert("schema_version".to_string(), serde_json::json!(1));
+        legacy_object.remove("action_epoch");
+        legacy_object.remove("process_root");
+        let legacy_bytes = serde_json::to_vec(&legacy_json).unwrap();
+
+        let path = tempfile::NamedTempFile::new().unwrap();
+        let connection = Connection::open(path.path()).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE provider_session_states (
+                    agent_session_id TEXT PRIMARY KEY,
+                    revision INTEGER NOT NULL,
+                    lifecycle TEXT NOT NULL,
+                    state_json BLOB NOT NULL
+                 );
+                 CREATE TABLE provider_session_recovery_ownership (
+                    agent_session_id TEXT NOT NULL,
+                    generation INTEGER NOT NULL,
+                    launch_nonce TEXT NOT NULL,
+                    ownership_state TEXT NOT NULL,
+                    revision INTEGER NOT NULL,
+                    PRIMARY KEY (agent_session_id, generation, launch_nonce)
+                 );
+                 CREATE TABLE provider_session_start_tokens (
+                    token_id TEXT PRIMARY KEY,
+                    task_id TEXT NOT NULL,
+                    agent_session_id TEXT NOT NULL,
+                    generation INTEGER NOT NULL,
+                    launch_nonce TEXT NOT NULL,
+                    provider_kind TEXT NOT NULL,
+                    provider_session_id TEXT NOT NULL
+                 );",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO provider_session_states
+                   (agent_session_id, revision, lifecycle, state_json)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    state.agent_session_id.to_string(),
+                    state.revision as i64,
+                    persisted_lifecycle_name(state.lifecycle),
+                    legacy_bytes,
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO provider_session_recovery_ownership
+                   (agent_session_id, generation, launch_nonce, ownership_state, revision)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    state.agent_session_id.to_string(),
+                    state.generation as i64,
+                    state.launch_nonce.raw().to_string(),
+                    persisted_lifecycle_name(state.lifecycle),
+                    state.revision as i64,
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO provider_session_start_tokens
+                   (token_id, task_id, agent_session_id, generation, launch_nonce,
+                    provider_kind, provider_session_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    provenance.token_id().to_string(),
+                    state.task_id.to_string(),
+                    state.agent_session_id.to_string(),
+                    state.generation as i64,
+                    state.launch_nonce.raw().to_string(),
+                    state.launch_spec.provider_kind.wire_name(),
+                    provenance.provider_session_id().as_str(),
+                ],
+            )
+            .unwrap();
+        drop(connection);
+
+        let mut store = SqliteProviderSessionStateStore::open(path.path()).unwrap();
+        let migrated = store.load(state.agent_session_id()).unwrap().unwrap();
+        assert_eq!(migrated.action_epoch(), state.generation());
+        assert!(!migrated.process_root_present());
+        let claim = store
+            .claim_recovery(&migrated, Uuid::now_v7(), 100)
+            .unwrap()
+            .expect("legacy recovery row is claimable after migration");
+        store.release_recovery(&migrated, &claim).unwrap();
+        assert!(!store.consume_session_start_token(&provenance).unwrap());
+
+        let columns = store
+            .connection
+            .prepare("PRAGMA table_info(provider_session_recovery_ownership)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(columns.iter().any(|column| column == "action_epoch"));
+        assert!(columns.iter().any(|column| column == "claim_owner_id"));
+        let token_columns = store
+            .connection
+            .prepare("PRAGMA table_info(provider_session_start_tokens)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(token_columns.iter().any(|column| column == "action_epoch"));
+
+        let mut closed = migrated;
+        closed.revision += 1;
+        closed.lifecycle = PersistedRuntimeLifecycle::Closed;
+        store.persist(closed).unwrap();
+        let upgraded_bytes: Vec<u8> = store
+            .connection
+            .query_row(
+                "SELECT state_json FROM provider_session_states WHERE agent_session_id = ?1",
+                params![state.agent_session_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let upgraded: serde_json::Value = serde_json::from_slice(&upgraded_bytes).unwrap();
+        assert_eq!(upgraded["schema_version"], serde_json::json!(2));
+    }
+
+    #[test]
+    fn private_state_codec_accepts_d0_schema_v1_authority_fields() {
+        let runtime = unit_runtime();
+        let state = ProviderSessionState {
+            agent_session_id: runtime.agent_session_id(),
+            task_id: runtime.task_id(),
+            generation: runtime.generation(),
+            action_epoch: runtime.correlation().action_epoch(),
+            revision: 1,
+            lifecycle: PersistedRuntimeLifecycle::Running,
+            launch_nonce: runtime.launch_nonce(),
+            launch_spec: runtime.launch_spec(),
+            provider_session_id: None,
+            process_root: Some(PersistedProcessRoot::from_fence(
+                &runtime.fence(),
+                runtime.launch_spec().executable(),
+            )),
+        };
+        let mut wire: serde_json::Value = serde_json::from_slice(&state.encode().unwrap()).unwrap();
+        wire["schema_version"] = serde_json::json!(1);
+        let migrated = ProviderSessionState::decode(&serde_json::to_vec(&wire).unwrap()).unwrap();
+        assert_eq!(migrated.action_epoch(), state.action_epoch());
+        assert!(migrated.process_root_present());
+    }
+
+    #[test]
+    fn sqlite_state_rejects_same_generation_launch_spec_drift() {
+        let runtime = unit_runtime();
+        let path = tempfile::NamedTempFile::new().unwrap();
+        let state = ProviderSessionState {
+            agent_session_id: runtime.agent_session_id(),
+            task_id: runtime.task_id(),
+            generation: runtime.generation(),
+            action_epoch: runtime.correlation().action_epoch(),
+            revision: 1,
+            lifecycle: PersistedRuntimeLifecycle::Running,
+            launch_nonce: runtime.launch_nonce(),
+            launch_spec: runtime.launch_spec(),
+            provider_session_id: None,
+            process_root: None,
+        };
+        let mut store = SqliteProviderSessionStateStore::open(path.path()).unwrap();
+        store.persist(state.clone()).unwrap();
+
+        let mut changed = state;
+        changed.revision = 2;
+        changed
+            .launch_spec
+            .arguments
+            .push(OsString::from("--drift"));
+        let error = store.persist(changed).unwrap_err();
+        assert!(
+            error.contains("identity") || error.contains("launch spec"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn sqlite_state_rejects_same_generation_root_or_provider_id_rebind() {
+        let runtime = unit_runtime();
+        let path = tempfile::NamedTempFile::new().unwrap();
+        let provider_id = ProviderSessionId::new("accepted-provider-session").unwrap();
+        let state = ProviderSessionState {
+            agent_session_id: runtime.agent_session_id(),
+            task_id: runtime.task_id(),
+            generation: runtime.generation(),
+            action_epoch: runtime.correlation().action_epoch(),
+            revision: 1,
+            lifecycle: PersistedRuntimeLifecycle::Running,
+            launch_nonce: runtime.launch_nonce(),
+            launch_spec: runtime.launch_spec(),
+            provider_session_id: Some(provider_id.clone()),
+            process_root: Some(PersistedProcessRoot::from_fence(
+                &runtime.fence(),
+                runtime.launch_spec().executable(),
+            )),
+        };
+        let mut store = SqliteProviderSessionStateStore::open(path.path()).unwrap();
+        store.persist(state.clone()).unwrap();
+
+        let mut changed_root = state.clone();
+        changed_root.revision = 2;
+        changed_root
+            .process_root
+            .as_mut()
+            .unwrap()
+            .creation_time_100ns += 1;
+        let error = store.persist(changed_root).unwrap_err();
+        assert!(
+            error.contains("identity") || error.contains("root"),
+            "{error}"
+        );
+
+        let mut changed_provider_id = state;
+        changed_provider_id.revision = 2;
+        changed_provider_id.provider_session_id =
+            Some(ProviderSessionId::new("rebound-provider-session").unwrap());
+        let error = store.persist(changed_provider_id).unwrap_err();
+        assert!(
+            error.contains("identity") || error.contains("provider"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn sqlite_state_rejects_terminal_lifecycle_regression() {
+        let runtime = unit_runtime();
+        let path = tempfile::NamedTempFile::new().unwrap();
+        let state = ProviderSessionState {
+            agent_session_id: runtime.agent_session_id(),
+            task_id: runtime.task_id(),
+            generation: runtime.generation(),
+            action_epoch: runtime.correlation().action_epoch(),
+            revision: 1,
+            lifecycle: PersistedRuntimeLifecycle::Running,
+            launch_nonce: runtime.launch_nonce(),
+            launch_spec: runtime.launch_spec(),
+            provider_session_id: None,
+            process_root: None,
+        };
+        let mut store = SqliteProviderSessionStateStore::open(path.path()).unwrap();
+        store.persist(state.clone()).unwrap();
+
+        let mut closed = state.clone();
+        closed.revision = 2;
+        closed.lifecycle = PersistedRuntimeLifecycle::Closed;
+        store.persist(closed).unwrap();
+
+        let mut stale_running = state;
+        stale_running.revision = 3;
+        let error = store.persist(stale_running).unwrap_err();
+        assert!(
+            error.contains("lifecycle") || error.contains("terminal"),
             "{error}"
         );
     }
