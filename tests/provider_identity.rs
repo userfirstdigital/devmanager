@@ -177,6 +177,68 @@ fn provider_session_id_preserves_exact_bytes_through_serde_and_sql() {
 }
 
 #[test]
+fn linux_attestation_source_requires_an_exact_exec_event_before_release() {
+    let adapter_source =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/providers/adapter.rs"))
+            .expect("read provider adapter source");
+
+    for marker in [
+        "LINUX_PTRACE_SETOPTIONS",
+        "LINUX_PTRACE_O_TRACEEXEC",
+        "LINUX_PTRACE_EVENT_EXEC",
+        "LINUX_PTRACE_GETEVENTMSG",
+        "linux_ptrace_continue",
+    ] {
+        assert!(
+            adapter_source.contains(marker),
+            "Linux barrier is missing exact exec-stop marker {marker}"
+        );
+    }
+}
+
+#[test]
+fn suspended_windows_claim_precedes_resume_and_graph_attestation() {
+    let adapter_source =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/providers/adapter.rs"))
+            .expect("read provider adapter source");
+    let spawn_start = adapter_source.find("fn spawn(").expect("probe spawn seam");
+    let spawn_end = adapter_source[spawn_start..]
+        .find("fn spawn_macos(")
+        .map(|offset| spawn_start + offset)
+        .expect("probe spawn boundary");
+    let spawn_source = &adapter_source[spawn_start..spawn_end];
+
+    let claim = spawn_source
+        .find("claim_suspended_process(child.id())")
+        .expect("suspended process claim");
+    let graph_check = spawn_source
+        .find("requested.revalidate()")
+        .expect("pre-resume graph revalidation");
+    assert!(claim < graph_check, "Job claim must precede graph proof");
+    assert!(
+        adapter_source
+            .find("resume_suspended_process(self.pid())")
+            .is_some_and(|resume| resume > spawn_start),
+        "explicit resume seam must remain separate from claim"
+    );
+}
+
+#[test]
+fn provider_cleanup_source_has_no_external_kill_subprocess() {
+    let adapter_source =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/providers/adapter.rs"))
+            .expect("read provider adapter source");
+    let platform_source = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src/services/platform_service.rs"),
+    )
+    .expect("read platform service source");
+
+    assert!(!adapter_source.contains("Command::new(\"kill\")"));
+    assert!(!platform_source.contains("Command::new(\"kill\")"));
+    assert!(!adapter_source.contains("reader\n        .join()"));
+}
+
+#[test]
 fn agent_session_facts_keep_provider_identity_typed_and_exact() {
     let exact = ProviderSessionId::new("provider-id".to_owned()).unwrap();
     let facts = AgentSessionFacts::new(

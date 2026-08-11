@@ -99,6 +99,7 @@ struct FakeAdapter {
     capability_probes: AtomicUsize,
     probe_delay: Mutex<Option<Duration>>,
     path_delay: Mutex<Option<(String, Duration)>>,
+    panic_on_probe: AtomicBool,
 }
 
 impl FakeAdapter {
@@ -110,6 +111,7 @@ impl FakeAdapter {
             capability_probes: AtomicUsize::new(0),
             probe_delay: Mutex::new(None),
             path_delay: Mutex::new(None),
+            panic_on_probe: AtomicBool::new(false),
         })
     }
 
@@ -125,6 +127,10 @@ impl FakeAdapter {
     fn set_path_delay(&self, marker: impl Into<String>, delay: Duration) {
         *self.path_delay.lock().unwrap() = Some((marker.into(), delay));
     }
+
+    fn panic_on_probe(&self) {
+        self.panic_on_probe.store(true, Ordering::Release);
+    }
 }
 
 #[async_trait]
@@ -138,6 +144,9 @@ impl ProviderAdapter for FakeAdapter {
         executable: &ProviderExecutableHandle,
     ) -> Result<ProviderCapabilities, ProviderError> {
         self.capability_probes.fetch_add(1, Ordering::Relaxed);
+        if self.panic_on_probe.load(Ordering::Acquire) {
+            panic!("fixture provider adapter panic");
+        }
         let delay = *self.probe_delay.lock().unwrap();
         if let Some(delay) = delay {
             tokio::time::sleep(delay).await;
@@ -722,6 +731,42 @@ async fn cancelled_probe_leader_stays_charged_until_worker_completion() {
     let deadline = Instant::now() + Duration::from_secs(2);
     while registry.in_flight_len() != 0 && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(registry.in_flight_len(), 0);
+}
+
+#[tokio::test]
+async fn panicking_probe_worker_is_joined_and_releases_its_admission() {
+    let temp = tempdir().unwrap();
+    let executable = executable_file(temp.path(), "claude", b"panicking-worker");
+    let adapter = FakeAdapter::new(capabilities(
+        ProviderKind::ClaudeCode,
+        "fixture-1",
+        ProviderAuthState::Unknown,
+        CapabilitySupport::Unknown,
+        CapabilitySupport::Unknown,
+        CapabilitySupport::Unknown,
+    ));
+    adapter.panic_on_probe();
+    let mut registry = ProviderRegistry::new();
+    registry.register(adapter).unwrap();
+
+    let observed = tokio::time::timeout(
+        Duration::from_secs(1),
+        registry.observe(ProviderKind::ClaudeCode, &discovery(Some(executable), None)),
+    )
+    .await
+    .expect("worker panic must not strand the caller");
+    assert!(matches!(
+        observed,
+        Err(ProviderError::Probe(ProviderProbeError::Io(
+            devmanager::providers::adapter::ProviderProbeIoError::WaitFailed,
+        )))
+    ));
+
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while registry.in_flight_len() != 0 && Instant::now() < deadline {
+        tokio::task::yield_now().await;
     }
     assert_eq!(registry.in_flight_len(), 0);
 }

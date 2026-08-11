@@ -9,6 +9,7 @@ use crate::providers::capabilities::{
     ProviderKind, ProviderVersion, SemanticSchemaVersion, MAX_PROVIDER_CAPABILITY_CACHE_ENTRIES,
 };
 use async_trait::async_trait;
+use futures_util::FutureExt;
 use serde::de;
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -18,7 +19,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
-use tokio::sync::Notify;
+use tokio::sync::{mpsc, Notify};
+use tokio::task::{JoinHandle, JoinSet};
 
 const TASK_4_1_ADAPTER_REVISION: AdapterRevision = AdapterRevision::new(1);
 const TASK_4_1_SEMANTIC_SCHEMA_VERSION: SemanticSchemaVersion = SemanticSchemaVersion::new(1);
@@ -329,6 +331,252 @@ impl Drop for ProbeLeaderCleanup {
     }
 }
 
+struct ProbeWorkerRequest {
+    flight: Arc<ProbeFlight>,
+    key: ProbeReservationKey,
+    adapter: Arc<dyn ProviderAdapter>,
+    kind: ProviderKind,
+    config: ProviderDiscoveryConfig,
+    cache: Arc<Mutex<CapabilityCache>>,
+    executable_inspector: Arc<dyn ExecutableInspector>,
+    in_flight: Arc<Mutex<HashMap<ProbeReservationKey, Arc<ProbeFlight>>>>,
+    supervisor: Arc<ProbeWorkerSupervisorState>,
+}
+
+struct ProbeWorkerCompletion {
+    flight: Arc<ProbeFlight>,
+    key: ProbeReservationKey,
+    in_flight: Arc<Mutex<HashMap<ProbeReservationKey, Arc<ProbeFlight>>>>,
+    result: Result<ProbeWorkResult, ProviderError>,
+}
+
+struct ProbeWorkerSupervisorState {
+    sender: mpsc::Sender<ProbeWorkerRequest>,
+    shutdown: Notify,
+    task: Mutex<Option<JoinHandle<()>>>,
+}
+
+struct ProbeWorkerSupervisor {
+    state: Mutex<Option<Arc<ProbeWorkerSupervisorState>>>,
+}
+
+impl ProbeWorkerSupervisor {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(None),
+        }
+    }
+
+    fn submit(&self, request: ProbeWorkerRequest) -> Result<(), ProviderError> {
+        let state = request.supervisor.clone();
+        match state.sender.try_send(request) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) | Err(mpsc::error::TrySendError::Closed(_)) => {
+                Err(ProviderError::Probe(
+                    crate::providers::adapter::ProviderProbeError::Io(
+                        crate::providers::adapter::ProviderProbeIoError::WaitFailed,
+                    ),
+                ))
+            }
+        }
+    }
+
+    fn ensure(&self) -> Arc<ProbeWorkerSupervisorState> {
+        let mut state_slot = self.state.lock().unwrap();
+        if let Some(state) = state_slot.as_ref() {
+            // Keep the completed/failed supervisor handle owned.  Replacing
+            // this state would drop a JoinHandle without joining it and could
+            // strand the bounded in-flight residue it was responsible for.
+            return Arc::clone(state);
+        }
+
+        let (sender, receiver) = mpsc::channel(MAX_PROVIDER_IN_FLIGHT_ENTRIES);
+        let state = Arc::new(ProbeWorkerSupervisorState {
+            sender,
+            shutdown: Notify::new(),
+            task: Mutex::new(None),
+        });
+        let task_state = Arc::clone(&state);
+        let task = tokio::spawn(run_probe_worker_supervisor(receiver, task_state));
+        *state.task.lock().unwrap() = Some(task);
+        *state_slot = Some(Arc::clone(&state));
+        state
+    }
+
+    fn shutdown(&self) {
+        let state = self.state.lock().unwrap().take();
+        if let Some(state) = state {
+            // The supervisor retains this state through its own task and will
+            // drain queued requests before joining every active worker. The
+            // JoinHandle therefore remains owned until the task has exited.
+            let _supervisor_still_owned = state.task.lock().unwrap().is_some();
+            state.shutdown.notify_one();
+        }
+    }
+}
+
+async fn run_probe_worker_supervisor(
+    mut receiver: mpsc::Receiver<ProbeWorkerRequest>,
+    state: Arc<ProbeWorkerSupervisorState>,
+) {
+    let mut workers = JoinSet::new();
+    let mut accepting = true;
+
+    loop {
+        if !accepting && workers.is_empty() {
+            break;
+        }
+
+        tokio::select! {
+            _ = state.shutdown.notified(), if accepting => {
+                accepting = false;
+                receiver.close();
+            }
+            request = receiver.recv(), if accepting => {
+                match request {
+                    Some(request) => {
+                        workers.spawn(async move {
+                            let flight = Arc::clone(&request.flight);
+                            let key = request.key.clone();
+                            let in_flight = Arc::clone(&request.in_flight);
+                            match std::panic::AssertUnwindSafe(run_probe_worker(request))
+                                .catch_unwind()
+                                .await
+                            {
+                                Ok(completion) => completion,
+                                Err(_) => ProbeWorkerCompletion {
+                                    flight,
+                                    key,
+                                    in_flight,
+                                    result: Err(ProviderError::Probe(
+                                        crate::providers::adapter::ProviderProbeError::Io(
+                                            crate::providers::adapter::ProviderProbeIoError::WaitFailed,
+                                        ),
+                                    )),
+                                },
+                            }
+                        });
+                    }
+                    None => accepting = false,
+                }
+            }
+            completion = workers.join_next(), if !workers.is_empty() => {
+                if let Some(Ok(completion)) = completion {
+                    publish_probe_completion(completion);
+                }
+            }
+        }
+    }
+
+    while let Some(joined) = workers.join_next().await {
+        if let Ok(completion) = joined {
+            publish_probe_completion(completion);
+        }
+    }
+
+    while let Ok(request) = receiver.try_recv() {
+        request.flight.cancel();
+        let completion = ProbeWorkerCompletion {
+            flight: request.flight,
+            key: request.key,
+            in_flight: request.in_flight,
+            result: Err(ProviderError::Probe(
+                crate::providers::adapter::ProviderProbeError::TimedOut,
+            )),
+        };
+        publish_probe_completion(completion);
+    }
+}
+
+async fn run_probe_worker(request: ProbeWorkerRequest) -> ProbeWorkerCompletion {
+    let ProbeWorkerRequest {
+        flight,
+        key,
+        adapter,
+        kind,
+        config,
+        cache,
+        executable_inspector,
+        in_flight,
+        supervisor: _supervisor,
+    } = request;
+
+    // The timer only publishes cancellation. It never owns the
+    // inspector/adapter future, so cancellation cannot drop blocking
+    // selection or native work.
+    let timer_flight: Weak<ProbeFlight> = Arc::downgrade(&flight);
+    let timer = tokio::spawn(async move {
+        let Some(flight) = timer_flight.upgrade() else {
+            return;
+        };
+        let remaining = flight.deadline.saturating_duration_since(Instant::now());
+        tokio::time::sleep(remaining).await;
+        flight.cancel();
+    });
+
+    // Selection is part of the retained worker. A caller timeout during
+    // executable inspection therefore leaves the same bounded admission
+    // charged until selection and the exact native leader have completed.
+    let result = async {
+        if flight.cancelled.load(Ordering::Acquire) {
+            return Err(ProviderError::Probe(
+                crate::providers::adapter::ProviderProbeError::TimedOut,
+            ));
+        }
+        let (requested_path, before, before_handle) =
+            ProviderRegistry::select_executable_with_inspector(
+                &executable_inspector,
+                kind,
+                &config,
+            )
+            .await?;
+        let identity_key = ProbeIdentityKey {
+            kind,
+            executable: before.clone(),
+            launch_handle: before_handle.clone(),
+            adapter_revision: TASK_4_1_ADAPTER_REVISION,
+            semantic_schema_version: TASK_4_1_SEMANTIC_SCHEMA_VERSION,
+        };
+        ProviderRegistry::perform_probe(
+            &cache,
+            &executable_inspector,
+            &adapter,
+            &requested_path,
+            &before,
+            &before_handle,
+            &identity_key,
+        )
+        .await
+    }
+    .await;
+    timer.abort();
+
+    ProbeWorkerCompletion {
+        flight,
+        key,
+        in_flight,
+        result,
+    }
+}
+
+fn publish_probe_completion(completion: ProbeWorkerCompletion) {
+    {
+        let mut slot = completion.flight.result.lock().unwrap();
+        if slot.is_none() {
+            *slot = Some(completion.result);
+        }
+    }
+    completion.flight.completed.notify_waiters();
+
+    let mut in_flight = completion.in_flight.lock().unwrap();
+    if in_flight
+        .get(&completion.key)
+        .is_some_and(|current| Arc::ptr_eq(current, &completion.flight))
+    {
+        in_flight.remove(&completion.key);
+    }
+}
+
 struct ProbeRun {
     capabilities: ProviderCapabilities,
     executable: ProviderExecutable,
@@ -457,6 +705,7 @@ pub struct ProviderRegistry {
     adapters: BTreeMap<ProviderKind, Arc<dyn ProviderAdapter>>,
     cache: Arc<Mutex<CapabilityCache>>,
     in_flight: Arc<Mutex<HashMap<ProbeReservationKey, Arc<ProbeFlight>>>>,
+    worker_supervisor: ProbeWorkerSupervisor,
     executable_inspector: Arc<dyn ExecutableInspector>,
     auth_evidence: Mutex<ProviderAuthEvidenceRegistry>,
 }
@@ -467,10 +716,8 @@ impl Drop for ProviderRegistry {
             for flight in in_flight.values() {
                 flight.cancel();
             }
-            // Do not clear the map here. A detached worker owns the same map
-            // and removes its flight only after the adapter/native leader has
-            // actually joined. This keeps drop/eviction from orphaning work.
         }
+        self.worker_supervisor.shutdown();
     }
 }
 
@@ -484,6 +731,7 @@ impl ProviderRegistry {
             adapters: BTreeMap::new(),
             cache: Arc::new(Mutex::new(CapabilityCache::default())),
             in_flight: Arc::new(Mutex::new(HashMap::new())),
+            worker_supervisor: ProbeWorkerSupervisor::new(),
             executable_inspector: inspector,
             auth_evidence: Mutex::new(ProviderAuthEvidenceRegistry::new()),
         }
@@ -769,8 +1017,13 @@ impl ProviderRegistry {
         };
 
         if leader {
-            self.spawn_probe_worker(Arc::clone(&flight), key, adapter, kind, config);
             let mut leader_cleanup = ProbeLeaderCleanup::new(Arc::clone(&flight));
+            if let Err(error) =
+                self.spawn_probe_worker(Arc::clone(&flight), key.clone(), adapter, kind, config)
+            {
+                self.remove_probe_flight(&key, &flight);
+                return Err(error);
+            }
             let published = Self::await_probe_flight(Arc::clone(&flight)).await;
             leader_cleanup.disarm();
             published.map(|probe| ProbeRun {
@@ -800,69 +1053,30 @@ impl ProviderRegistry {
         adapter: Arc<dyn ProviderAdapter>,
         kind: ProviderKind,
         config: ProviderDiscoveryConfig,
-    ) {
-        let cache = Arc::clone(&self.cache);
+    ) -> Result<(), ProviderError> {
         let in_flight = Arc::clone(&self.in_flight);
-        let executable_inspector = Arc::clone(&self.executable_inspector);
-        tokio::spawn(async move {
-            // The timer only publishes cancellation. It never owns the
-            // inspector/adapter future, so cancellation cannot drop blocking
-            // selection or native work.
-            let timer_flight: Weak<ProbeFlight> = Arc::downgrade(&flight);
-            let timer = tokio::spawn(async move {
-                let Some(flight) = timer_flight.upgrade() else {
-                    return;
-                };
-                let remaining = flight.deadline.saturating_duration_since(Instant::now());
-                tokio::time::sleep(remaining).await;
-                flight.cancel();
-            });
+        let supervisor = self.worker_supervisor.ensure();
+        self.worker_supervisor.submit(ProbeWorkerRequest {
+            flight,
+            key,
+            adapter,
+            kind,
+            config,
+            cache: Arc::clone(&self.cache),
+            executable_inspector: Arc::clone(&self.executable_inspector),
+            in_flight,
+            supervisor,
+        })
+    }
 
-            // Selection is part of the retained worker. A caller timeout
-            // during executable inspection therefore leaves the same bounded
-            // admission charged until selection and the exact native leader
-            // have completed.
-            let result = async {
-                let (requested_path, before, before_handle) =
-                    Self::select_executable_with_inspector(&executable_inspector, kind, &config)
-                        .await?;
-                let identity_key = ProbeIdentityKey {
-                    kind,
-                    executable: before.clone(),
-                    launch_handle: before_handle.clone(),
-                    adapter_revision: TASK_4_1_ADAPTER_REVISION,
-                    semantic_schema_version: TASK_4_1_SEMANTIC_SCHEMA_VERSION,
-                };
-                Self::perform_probe(
-                    &cache,
-                    &executable_inspector,
-                    &adapter,
-                    &requested_path,
-                    &before,
-                    &before_handle,
-                    &identity_key,
-                )
-                .await
-            }
-            .await;
-            timer.abort();
-
-            {
-                let mut slot = flight.result.lock().unwrap();
-                if slot.is_none() {
-                    *slot = Some(result);
-                }
-            }
-            flight.completed.notify_waiters();
-
-            let mut in_flight = in_flight.lock().unwrap();
-            if in_flight
-                .get(&key)
-                .is_some_and(|current| Arc::ptr_eq(current, &flight))
-            {
-                in_flight.remove(&key);
-            }
-        });
+    fn remove_probe_flight(&self, key: &ProbeReservationKey, flight: &Arc<ProbeFlight>) {
+        let mut in_flight = self.in_flight.lock().unwrap();
+        if in_flight
+            .get(key)
+            .is_some_and(|current| Arc::ptr_eq(current, flight))
+        {
+            in_flight.remove(key);
+        }
     }
 
     async fn await_probe_flight(
