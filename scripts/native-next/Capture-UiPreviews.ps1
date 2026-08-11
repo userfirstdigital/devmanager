@@ -26,6 +26,7 @@ $rustToolchainTomlPath = Join-Path $canonicalWorktree 'rust-toolchain.toml'
 $rustToolchainPath = Join-Path $canonicalWorktree 'rust-toolchain'
 $cargoHomePath = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile)) '.cargo'
 $rustupPath = Join-Path $cargoHomePath 'bin\rustup.exe'
+$rustupHomePath = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile)) '.rustup'
 $globalCargoConfigTomlPath = Join-Path $cargoHomePath 'config.toml'
 $globalCargoConfigPath = Join-Path $cargoHomePath 'config'
 $buildProfile = 'dev'
@@ -147,9 +148,10 @@ public static class DevManagerPreviewArtifactNative
     private const uint FILE_TRAVERSE = 0x00000020;
     private const uint FILE_FLAG_BACKUP_SEMANTICS = 0x02000000;
     private const uint CREATE_NEW = 1;
-    private const uint MOVEFILE_REPLACE_EXISTING = 1;
-    private const uint MOVEFILE_WRITE_THROUGH = 8;
     private const uint FILE_GENERIC_WRITE = 0x40000000;
+    private const uint DELETE_ACCESS = 0x00010000;
+    private const int FileRenameInfo = 3;
+    private const int FileDispositionInfo = 4;
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool WriteFile(
@@ -159,14 +161,29 @@ public static class DevManagerPreviewArtifactNative
         out uint bytesWritten,
         IntPtr overlapped);
 
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    private static extern bool MoveFileExW(string existingName, string newName, uint flags);
-
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    private static extern bool DeleteFileW(string name);
-
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool FlushFileBuffers(SafeFileHandle file);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool SetFileInformationByHandle(
+        SafeFileHandle file,
+        int fileInformationClass,
+        IntPtr fileInformation,
+        uint bufferSize);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct FileRenameInfoHeader
+    {
+        public byte ReplaceIfExists;
+        public IntPtr RootDirectory;
+        public uint FileNameLength;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct FileDispositionInfoData
+    {
+        public byte DeleteFile;
+    }
 
     public static SafeFileHandle OpenReadExclusiveNoFollow(string path)
     {
@@ -211,32 +228,43 @@ public static class DevManagerPreviewArtifactNative
         return handle;
     }
 
-    public static void WriteAtomicPreviewReceipt(string directory, string fileName, string contents)
+    public static void WriteAtomicPreviewReceiptRelative(
+        SafeFileHandle parentDirectory,
+        string directory,
+        string fileName,
+        string contents)
     {
+        // PublishRelative uses FILE_RENAME_INFO.RootDirectory so the final name
+        // is resolved only through the retained parent handle.
+        if (parentDirectory == null || parentDirectory.IsInvalid)
+        {
+            throw new ArgumentException("receipt publication requires a retained parent directory handle", nameof(parentDirectory));
+        }
         if (fileName.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0 ||
             fileName.Contains(Path.DirectorySeparatorChar) ||
             fileName.Contains(Path.AltDirectorySeparatorChar))
         {
             throw new ArgumentException("receipt file name must be a single path component", nameof(fileName));
         }
-        var temporary = Path.Combine(directory, $".{fileName}.{Guid.NewGuid():N}.tmp");
-        var destination = Path.Combine(directory, fileName);
-        try
-        {
-            var handle = CreateFileW(
+        var temporaryName = $".{fileName}.{Guid.NewGuid():N}.tmp";
+        var temporary = Path.Combine(directory, temporaryName);
+        var handle = CreateFileW(
                 temporary,
-                FILE_GENERIC_WRITE,
+                FILE_GENERIC_WRITE | DELETE_ACCESS,
                 FILE_SHARE_NONE,
                 IntPtr.Zero,
                 CREATE_NEW,
                 FileAttributeNormal | OpenReparsePoint,
                 IntPtr.Zero);
-            if (handle.IsInvalid)
-            {
-                throw new Win32Exception(Marshal.GetLastWin32Error(),
-                    "preview receipt temporary file could not be created");
-            }
-            using (handle)
+        if (handle.IsInvalid)
+        {
+            throw new Win32Exception(Marshal.GetLastWin32Error(),
+                "relative preview receipt temporary file could not be created");
+        }
+        var renamed = false;
+        using (handle)
+        {
+            try
             {
                 var bytes = Encoding.UTF8.GetBytes(contents);
                 uint written;
@@ -244,22 +272,63 @@ public static class DevManagerPreviewArtifactNative
                     written != bytes.Length || !FlushFileBuffers(handle))
                 {
                     throw new Win32Exception(Marshal.GetLastWin32Error(),
-                        "preview receipt temporary file could not be fully flushed");
+                        "relative preview receipt temporary file could not be fully flushed");
+                }
+
+                var fileNameBytes = Encoding.Unicode.GetBytes(fileName);
+                var headerSize = Marshal.SizeOf<FileRenameInfoHeader>();
+                var bufferSize = checked(headerSize + fileNameBytes.Length);
+                var renameInfo = Marshal.AllocHGlobal(bufferSize);
+                try
+                {
+                    var header = new FileRenameInfoHeader
+                    {
+                        ReplaceIfExists = 1,
+                        RootDirectory = parentDirectory.DangerousGetHandle(),
+                        FileNameLength = (uint)fileNameBytes.Length
+                    };
+                    Marshal.StructureToPtr(header, renameInfo, false);
+                    Marshal.Copy(fileNameBytes, 0, IntPtr.Add(renameInfo, headerSize), fileNameBytes.Length);
+                    if (!SetFileInformationByHandle(handle, FileRenameInfo, renameInfo, (uint)bufferSize))
+                    {
+                        throw new Win32Exception(Marshal.GetLastWin32Error(),
+                            "relative preview receipt could not be atomically published");
+                    }
+                    renamed = true;
+                }
+                finally
+                {
+                    Marshal.FreeHGlobal(renameInfo);
                 }
             }
-            if (!MoveFileExW(temporary, destination,
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+            finally
             {
-                throw new Win32Exception(Marshal.GetLastWin32Error(),
-                    "preview receipt could not be atomically published");
+                if (!renamed)
+                {
+                    var disposition = new FileDispositionInfoData { DeleteFile = 1 };
+                    var dispositionInfo = Marshal.AllocHGlobal(Marshal.SizeOf<FileDispositionInfoData>());
+                    try
+                    {
+                        Marshal.StructureToPtr(disposition, dispositionInfo, false);
+                        if (!SetFileInformationByHandle(
+                            handle,
+                            FileDispositionInfo,
+                            dispositionInfo,
+                            (uint)Marshal.SizeOf<FileDispositionInfoData>()))
+                        {
+                            throw new Win32Exception(Marshal.GetLastWin32Error(),
+                                "relative preview receipt temporary file could not be removed by handle");
+                        }
+                    }
+                    finally
+                    {
+                        Marshal.FreeHGlobal(dispositionInfo);
+                    }
+                }
+            }
             }
         }
-        finally
-        {
-            DeleteFileW(temporary);
-        }
     }
-}
 '@
 }
 
@@ -284,6 +353,94 @@ function Assert-PreviewDeadline {
 
 function New-PreviewIoDeadline {
     [datetime]::UtcNow.AddSeconds($PREVIEW_IO_DEADLINE_SECONDS)
+}
+
+function Get-PreviewRemainingMilliseconds {
+    param([datetime]$Deadline)
+
+    Assert-PreviewDeadline -Deadline $Deadline
+    $remaining = [int][Math]::Ceiling(($Deadline - [datetime]::UtcNow).TotalMilliseconds)
+    if ($remaining -le 0) {
+        throw 'preview artifact authority operation exceeded its bounded deadline.'
+    }
+    [Math]::Min($remaining, [int]::MaxValue)
+}
+
+function Get-PreviewToolEnvironment {
+    [ordered]@{
+        CARGO_HOME = [IO.Path]::GetFullPath($cargoHomePath)
+        RUSTUP_HOME = [IO.Path]::GetFullPath($rustupHomePath)
+        CARGO_NET_OFFLINE = 'true'
+        CARGO_TERM_COLOR = 'never'
+    }
+}
+
+function Invoke-PreviewExternalCommand {
+    param(
+        [string]$FilePath,
+        [string[]]$Arguments,
+        [datetime]$Deadline,
+        [hashtable]$Environment = @{},
+        [string]$WorkingDirectory = $canonicalWorktree,
+        [long]$MaxOutputBytes = $MAX_PREVIEW_RECEIPT_BYTES
+    )
+
+    $remaining = Get-PreviewRemainingMilliseconds -Deadline $Deadline
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $FilePath
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.WorkingDirectory = $WorkingDirectory
+    foreach ($argument in @($Arguments)) {
+        [void]$startInfo.ArgumentList.Add([string]$argument)
+    }
+    foreach ($name in @($Environment.Keys)) {
+        $startInfo.Environment[$name] = [string]$Environment[$name]
+    }
+
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    try {
+        if (-not $process.Start()) {
+            throw "preview external command could not start: $FilePath"
+        }
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        if (-not $process.WaitForExit($remaining)) {
+            try { $process.Kill($true) } catch { }
+            try { [void]$process.WaitForExit(1000) } catch { }
+            throw "preview external command exceeded its absolute deadline: $FilePath"
+        }
+        $stdoutRemaining = Get-PreviewRemainingMilliseconds -Deadline $Deadline
+        if (-not $stdoutTask.Wait($stdoutRemaining) -or
+            -not $stderrTask.Wait((Get-PreviewRemainingMilliseconds -Deadline $Deadline))) {
+            throw "preview external command output read exceeded its absolute deadline: $FilePath"
+        }
+        $stdout = $stdoutTask.GetAwaiter().GetResult()
+        $stderr = $stderrTask.GetAwaiter().GetResult()
+        $stdoutBytes = [Text.Encoding]::UTF8.GetByteCount($stdout)
+        $stderrBytes = [Text.Encoding]::UTF8.GetByteCount($stderr)
+        if ($stdoutBytes -gt $MaxOutputBytes -or $stderrBytes -gt $MaxOutputBytes) {
+            throw "preview external command output exceeded its bounded byte count: $FilePath"
+        }
+        if ($process.ExitCode -ne 0) {
+            throw "preview external command failed with exit $($process.ExitCode): $FilePath $stderr"
+        }
+        [pscustomobject]@{
+            ExitCode = $process.ExitCode
+            Output = $stdout
+            Error = $stderr
+            AbsoluteDeadline = $Deadline
+        }
+    } finally {
+        if (-not $process.HasExited) {
+            try { $process.Kill($true) } catch { }
+            try { [void]$process.WaitForExit(1000) } catch { }
+        }
+        $process.Dispose()
+    }
 }
 
 function ConvertTo-PreviewSha256 {
@@ -470,6 +627,51 @@ function Get-PreviewDirectoryChain {
     @($paths)
 }
 
+function Open-PreviewDirectoryAuthorityChain {
+    param([string]$Path)
+
+    $paths = @(Get-PreviewDirectoryChain -Path $Path)
+    if ($paths.Count -eq 0) {
+        throw 'preview directory authority could not resolve its ancestor chain.'
+    }
+    $authorities = [System.Collections.Generic.List[object]]::new()
+    try {
+        # Open from the volume root down to the requested leaf and retain every
+        # non-reparse ancestor through the final publication.
+        for ($index = $paths.Count - 1; $index -ge 0; $index--) {
+            [void]$authorities.Add((Open-PreviewDirectoryNoFollow -Path $paths[$index]))
+        }
+        $leaf = $authorities[$authorities.Count - 1]
+        $leaf | Add-Member -NotePropertyName AncestorChain -NotePropertyValue @($authorities) -Force
+        $leaf | Add-Member -NotePropertyName OutputRootAncestorChain -NotePropertyValue @($authorities) -Force
+        $leaf
+    } catch {
+        foreach ($authority in @($authorities)) {
+            if ($null -ne $authority -and $null -ne $authority.Handle) {
+                try { $authority.Handle.Dispose() } catch { }
+            }
+        }
+        throw
+    }
+}
+
+function Close-PreviewDirectoryAuthorityChain {
+    param([object]$Authority)
+
+    $chain = if ($null -ne $Authority -and $null -ne $Authority.OutputRootAncestorChain) {
+        @($Authority.OutputRootAncestorChain)
+    } elseif ($null -ne $Authority -and $null -ne $Authority.Directories) {
+        @($Authority.Directories)
+    } else {
+        @($Authority)
+    }
+    foreach ($ancestor in @($chain | Sort-Object { $_.Path.Length } -Descending)) {
+        if ($null -ne $ancestor -and $null -ne $ancestor.Handle) {
+            try { $ancestor.Handle.Dispose() } catch { }
+        }
+    }
+}
+
 function Close-PreviewLaunchAuthority {
     param([object]$Authority)
 
@@ -497,6 +699,14 @@ function Assert-PreviewDirectoryAuthorityStable {
     }
     if ([DevManagerPreviewArtifactNative]::Identity($Authority.Handle) -ne $Authority.FileIdentity) {
         throw "preview directory authority changed: $($Authority.Path)"
+    }
+    if ($null -ne $Authority.OutputRootAncestorChain) {
+        foreach ($ancestor in @($Authority.OutputRootAncestorChain)) {
+            if ($null -eq $ancestor -or $null -eq $ancestor.Handle -or
+                [DevManagerPreviewArtifactNative]::Identity($ancestor.Handle) -ne $ancestor.FileIdentity) {
+                throw "preview output ancestor authority changed: $($Authority.Path)"
+            }
+        }
     }
 }
 
@@ -614,7 +824,8 @@ function Write-PreviewAtomicJson {
     if ($jsonBytes.Length -gt $MaxBytes) {
         throw 'preview JSON publication exceeded its bounded byte count.'
     }
-    [DevManagerPreviewArtifactNative]::WriteAtomicPreviewReceipt(
+    [DevManagerPreviewArtifactNative]::WriteAtomicPreviewReceiptRelative(
+        $ParentAuthority.Handle,
         $ParentAuthority.Path,
         [IO.Path]::GetFileName($canonicalPath),
         $json)
@@ -647,16 +858,26 @@ function Get-PreviewFileSha256 {
 }
 
 function Get-PreviewSourceTreeDigest {
-    $treeLines = @(& git -C $canonicalWorktree rev-parse --verify 'HEAD^{tree}' 2>$null)
-    if ($LASTEXITCODE -ne 0 -or $treeLines.Count -ne 1) {
+    param([datetime]$Deadline)
+
+    $result = Invoke-PreviewExternalCommand -FilePath 'git' -Arguments @(
+        '-C', $canonicalWorktree, 'rev-parse', '--verify', 'HEAD^{tree}'
+    ) -Deadline $Deadline -Environment @{}
+    $treeLines = @($result.Output -split "`r?`n" | Where-Object { $_ -ne '' })
+    if ($treeLines.Count -ne 1) {
         throw 'preview artifact identity could not resolve the canonical source tree.'
     }
     $treeLines[0].ToString().Trim()
 }
 
 function Get-PreviewSourceRevision {
-    $revisionLines = @(& git -C $canonicalWorktree rev-parse --verify HEAD 2>$null)
-    if ($LASTEXITCODE -ne 0 -or $revisionLines.Count -ne 1) {
+    param([datetime]$Deadline)
+
+    $result = Invoke-PreviewExternalCommand -FilePath 'git' -Arguments @(
+        '-C', $canonicalWorktree, 'rev-parse', '--verify', 'HEAD'
+    ) -Deadline $Deadline -Environment @{}
+    $revisionLines = @($result.Output -split "`r?`n" | Where-Object { $_ -ne '' })
+    if ($revisionLines.Count -ne 1) {
         throw 'preview artifact identity could not resolve the canonical worktree revision.'
     }
     $revisionLines[0].ToString().Trim()
@@ -760,7 +981,8 @@ function Get-PreviewSourceContentDigest {
 function Get-PreviewToolPath {
     param(
         [string]$Name,
-        [datetime]$Deadline
+        [datetime]$Deadline,
+        [object]$RustupAuthority
     )
 
     # rustup which from the canonical user install is the only accepted source for the build tool path.
@@ -772,19 +994,35 @@ function Get-PreviewToolPath {
         -not (Test-Path -LiteralPath $canonicalRustupPath -PathType Leaf)) {
         throw "preview artifact identity requires the canonical rustup.exe tool to resolve $Name."
     }
-    $rustup = Open-PreviewArtifactNoFollow -Path $canonicalRustupPath
-    try {
-        Assert-PreviewDeadline -Deadline $Deadline
-        $toolLines = @(& $canonicalRustupPath which $Name 2>$null)
-    } finally {
-        $rustup.Stream.Dispose()
+    $ownsRustupAuthority = $null -eq $RustupAuthority
+    $rustup = if ($ownsRustupAuthority) {
+        Open-PreviewArtifactNoFollow -Path $canonicalRustupPath
+    } else {
+        $RustupAuthority
     }
-    if ($LASTEXITCODE -ne 0 -or $toolLines.Count -ne 1) {
+    try {
+        if (-not $rustup.Path.Equals($canonicalRustupPath, [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'preview artifact identity rejected a rustup executable outside the canonical user install.'
+        }
+        Assert-PreviewToolAuthorityStable -Authority $rustup -Deadline $Deadline
+        Assert-PreviewDeadline -Deadline $Deadline
+        $result = Invoke-PreviewExternalCommand -FilePath $rustup.Path -Arguments @('which', $Name) -Deadline $Deadline -Environment (Get-PreviewToolEnvironment)
+        $toolLines = @($result.Output -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    } finally {
+        if ($ownsRustupAuthority) {
+            $rustup.Stream.Dispose()
+        }
+    }
+    if ($toolLines.Count -ne 1) {
         throw "preview artifact identity could not resolve the rustup-managed $Name.exe tool."
     }
     $path = [IO.Path]::GetFullPath($toolLines[0].ToString().Trim())
     if (-not ([IO.Path]::GetExtension($path)).Equals('.exe', [StringComparison]::OrdinalIgnoreCase)) {
         throw "preview artifact identity rejects a non-executable rustup-managed $Name tool."
+    }
+    $rustupHomePrefix = [IO.Path]::GetFullPath($rustupHomePath).TrimEnd('\') + '\'
+    if (-not $path.StartsWith($rustupHomePrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "preview artifact identity rejects a rustup-managed $Name tool outside the pinned RUSTUP_HOME."
     }
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
         throw "preview artifact identity could not open the rustup-managed $Name.exe tool."
@@ -795,15 +1033,18 @@ function Get-PreviewToolPath {
 function Open-PreviewToolAuthority {
     param(
         [string]$Name,
-        [datetime]$Deadline
+        [datetime]$Deadline,
+        [object]$RustupAuthority
     )
 
     if ($Deadline -eq [datetime]::MinValue) {
         $Deadline = New-PreviewIoDeadline
     }
-    $path = Get-PreviewToolPath -Name $Name -Deadline $Deadline
-    $opened = Open-PreviewArtifactNoFollow -Path $path
+    $path = Get-PreviewToolPath -Name $Name -Deadline $Deadline -RustupAuthority $RustupAuthority
+    $toolParentChain = Open-PreviewDirectoryAuthorityChain -Path (Split-Path -Parent $path)
+    $opened = $null
     try {
+        $opened = Open-PreviewArtifactNoFollow -Path $path
         Assert-PreviewDeadline -Deadline $Deadline
         [pscustomobject]@{
             Name = $Name
@@ -811,12 +1052,39 @@ function Open-PreviewToolAuthority {
             Stream = $opened.Stream
             FileIdentity = $opened.FileIdentity
             Length = [int64]$opened.Length
+            Directories = @($toolParentChain.OutputRootAncestorChain)
         }
         $opened = $null
+        $toolParentChain = $null
     } finally {
         if ($null -ne $opened) {
             $opened.Stream.Dispose()
         }
+        if ($null -ne $toolParentChain) {
+            Close-PreviewDirectoryAuthorityChain -Authority $toolParentChain
+        }
+    }
+}
+
+function Assert-PreviewToolAuthorityStable {
+    param(
+        [object]$Authority,
+        [datetime]$Deadline
+    )
+
+    Assert-PreviewDeadline -Deadline $Deadline
+    if ($null -eq $Authority -or $null -eq $Authority.Stream) {
+        throw 'preview tool authority is missing its retained stream.'
+    }
+    foreach ($directory in @($Authority.Directories)) {
+        if ($null -eq $directory -or $null -eq $directory.Handle -or
+            [DevManagerPreviewArtifactNative]::Identity($directory.Handle) -ne $directory.FileIdentity) {
+            throw "preview tool authority directory changed: $($Authority.Path)"
+        }
+    }
+    if ([DevManagerPreviewArtifactNative]::Identity($Authority.Stream.SafeFileHandle) -ne $Authority.FileIdentity -or
+        [int64][DevManagerPreviewArtifactNative]::Length($Authority.Stream.SafeFileHandle) -ne [int64]$Authority.Length) {
+        throw "preview tool authority changed: $($Authority.Path)"
     }
 }
 
@@ -826,27 +1094,28 @@ function Close-PreviewToolAuthority {
     if ($null -ne $Authority -and $null -ne $Authority.Stream) {
         $Authority.Stream.Dispose()
     }
+    if ($null -ne $Authority -and $null -ne $Authority.Directories) {
+        Close-PreviewDirectoryAuthorityChain -Authority $Authority
+    }
 }
 
 function Get-PreviewHostTarget {
     param(
         [string]$RustcPath,
-        [datetime]$Deadline
+        [datetime]$Deadline,
+        [object]$RustupAuthority
     )
 
     if ($Deadline -eq [datetime]::MinValue) {
         $Deadline = New-PreviewIoDeadline
     }
     $rustcPath = if ([string]::IsNullOrWhiteSpace($RustcPath)) {
-        Get-PreviewToolPath -Name 'rustc' -Deadline $Deadline
+        Get-PreviewToolPath -Name 'rustc' -Deadline $Deadline -RustupAuthority $RustupAuthority
     } else {
         $RustcPath
     }
-    Assert-PreviewDeadline -Deadline $Deadline
-    $versionLines = @(& $rustcPath -vV 2>$null)
-    if ($LASTEXITCODE -ne 0) {
-        throw 'preview artifact identity could not resolve the Rust host target.'
-    }
+    $versionResult = Invoke-PreviewExternalCommand -FilePath $rustcPath -Arguments @('-vV') -Deadline $Deadline -Environment (Get-PreviewToolEnvironment)
+    $versionLines = @($versionResult.Output -split "`r?`n")
     $hostLine = $versionLines | Where-Object { $_ -match '^host:\s*(.+)$' } | Select-Object -First 1
     if ($null -eq $hostLine -or $hostLine -notmatch '^host:\s*(.+)$') {
         throw 'preview artifact identity could not parse the Rust host target.'
@@ -866,21 +1135,32 @@ function Get-PreviewBuildIdentity {
     }
     $ownsToolAuthorities = $null -eq $ToolAuthorities
     $identityResult = $null
+    $newRustupAuthority = $null
+    $newRustupHomeAuthority = $null
     $newRustcAuthority = $null
     $newCargoAuthority = $null
     try {
     if ($ownsToolAuthorities) {
-        $newRustcAuthority = Open-PreviewToolAuthority -Name 'rustc' -Deadline $Deadline
-        $newCargoAuthority = Open-PreviewToolAuthority -Name 'cargo' -Deadline $Deadline
-        $ToolAuthorities = @{ rustc = $newRustcAuthority; cargo = $newCargoAuthority }
+        $newRustupAuthority = Open-PreviewArtifactNoFollow -Path $rustupPath
+        $newRustupHomeAuthority = Open-PreviewDirectoryNoFollow -Path $rustupHomePath
+        $newRustcAuthority = Open-PreviewToolAuthority -Name 'rustc' -Deadline $Deadline -RustupAuthority $newRustupAuthority
+        $newCargoAuthority = Open-PreviewToolAuthority -Name 'cargo' -Deadline $Deadline -RustupAuthority $newRustupAuthority
+        $ToolAuthorities = @{
+            rustup = $newRustupAuthority
+            rustupHome = $newRustupHomeAuthority
+            rustc = $newRustcAuthority
+            cargo = $newCargoAuthority
+        }
+    } elseif (-not $ToolAuthorities.ContainsKey('rustup') -or
+        -not $ToolAuthorities.ContainsKey('rustupHome')) {
+        throw 'preview artifact identity requires retained rustup and RUSTUP_HOME authorities.'
     }
     # The clean-tree contract is the canonical git status --porcelain check.
     Assert-PreviewDeadline -Deadline $Deadline
-    $statusLines = @(& git -C $canonicalWorktree status --porcelain --untracked-files=all 2>$null)
-    if ($LASTEXITCODE -ne 0) {
-        throw 'preview artifact identity could not inspect the canonical source tree.'
-    }
-    $status = ($statusLines -join "`n").Trim()
+    $statusResult = Invoke-PreviewExternalCommand -FilePath 'git' -Arguments @(
+        '-C', $canonicalWorktree, 'status', '--porcelain', '--untracked-files=all'
+    ) -Deadline $Deadline -Environment @{}
+    $status = $statusResult.Output.Trim()
     if (-not [string]::IsNullOrWhiteSpace($status)) {
         throw "preview artifact identity requires a clean source tree: $status"
     }
@@ -890,6 +1170,7 @@ function Get-PreviewBuildIdentity {
         'RUSTFLAGS',
         'CARGO_ENCODED_RUSTFLAGS',
         'CARGO_HOME',
+        'RUSTUP_HOME',
         'RUSTUP_TOOLCHAIN',
         'RUSTC',
         'RUSTC_WRAPPER',
@@ -913,25 +1194,28 @@ function Get-PreviewBuildIdentity {
     }
 
     $features = @()
+    $rustupAuthority = $ToolAuthorities['rustup']
+    $rustupHomeAuthority = $ToolAuthorities['rustupHome']
     $rustcAuthority = $ToolAuthorities['rustc']
     $cargoAuthority = $ToolAuthorities['cargo']
+    Assert-PreviewToolAuthorityStable -Authority $rustupAuthority -Deadline $Deadline
+    Assert-PreviewDirectoryAuthorityStable -Authority $rustupHomeAuthority
     $rustcPath = $rustcAuthority.Path
     $cargoPath = $cargoAuthority.Path
     $rustcSha256 = Get-PreviewArtifactSha256 -Stream $rustcAuthority.Stream -Deadline $Deadline
     $cargoSha256 = Get-PreviewArtifactSha256 -Stream $cargoAuthority.Stream -Deadline $Deadline
-    Assert-PreviewDeadline -Deadline $Deadline
-    $rustcVersion = ((& $rustcPath -vV 2>$null) -join "`n").Trim()
-    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($rustcVersion)) {
+    $rustcVersion = (Invoke-PreviewExternalCommand -FilePath $rustcPath -Arguments @('-vV') -Deadline $Deadline -Environment (Get-PreviewToolEnvironment)).Output.Trim()
+    if ([string]::IsNullOrWhiteSpace($rustcVersion)) {
         throw 'preview artifact identity could not resolve the Rust toolchain.'
     }
-    $cargoVersion = ((& $cargoPath -V 2>$null) -join "`n").Trim()
-    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($cargoVersion)) {
+    $cargoVersion = (Invoke-PreviewExternalCommand -FilePath $cargoPath -Arguments @('-V') -Deadline $Deadline -Environment (Get-PreviewToolEnvironment)).Output.Trim()
+    if ([string]::IsNullOrWhiteSpace($cargoVersion)) {
         throw 'preview artifact identity could not resolve Cargo.'
     }
     Assert-PreviewDeadline -Deadline $Deadline
     $contract = [ordered]@{
-        sourceRevision = Get-PreviewSourceRevision
-        sourceTree = Get-PreviewSourceTreeDigest
+        sourceRevision = Get-PreviewSourceRevision -Deadline $Deadline
+        sourceTree = Get-PreviewSourceTreeDigest -Deadline $Deadline
         sourceContentDigest = Get-PreviewSourceContentDigest -Deadline $Deadline
         manifestSha256 = Get-PreviewFileSha256 -Path $manifestPath -Deadline $Deadline
         lockSha256 = Get-PreviewFileSha256 -Path $lockPath -Deadline $Deadline
@@ -958,9 +1242,13 @@ function Get-PreviewBuildIdentity {
         rustcSha256 = $rustcSha256
         cargoPath = $cargoPath
         cargoSha256 = $cargoSha256
+        rustupPath = $rustupAuthority.Path
+        rustupSha256 = Get-PreviewArtifactSha256 -Stream $rustupAuthority.Stream -Deadline $Deadline
+        rustupHomePath = $rustupHomeAuthority.Path
+        rustupHomeFileIdentity = $rustupHomeAuthority.FileIdentity
         rustcVersion = $rustcVersion
         cargoVersion = $cargoVersion
-        target = Get-PreviewHostTarget -RustcPath $rustcPath -Deadline $Deadline
+        target = Get-PreviewHostTarget -RustcPath $rustcPath -Deadline $Deadline -RustupAuthority $rustupAuthority
         profile = $buildProfile
         features = @($features)
         locked = $true
@@ -988,6 +1276,10 @@ function Get-PreviewBuildIdentity {
         RustcSha256 = $contract.rustcSha256
         CargoPath = $contract.cargoPath
         CargoSha256 = $contract.cargoSha256
+        RustupPath = $contract.rustupPath
+        RustupSha256 = $contract.rustupSha256
+        RustupHomePath = $contract.rustupHomePath
+        RustupHomeFileIdentity = $contract.rustupHomeFileIdentity
         RustcVersion = $contract.rustcVersion
         CargoVersion = $contract.cargoVersion
         Target = $contract.target
@@ -1000,11 +1292,19 @@ function Get-PreviewBuildIdentity {
     $identityResult
     } finally {
         if ($ownsToolAuthorities -and ($null -eq $identityResult -or -not $RetainToolAuthorities) -and $null -ne $ToolAuthorities) {
+            Close-PreviewToolAuthority -Authority $ToolAuthorities['rustup']
             Close-PreviewToolAuthority -Authority $ToolAuthorities['rustc']
             Close-PreviewToolAuthority -Authority $ToolAuthorities['cargo']
+            if ($null -ne $ToolAuthorities['rustupHome'] -and $null -ne $ToolAuthorities['rustupHome'].Handle) {
+                $ToolAuthorities['rustupHome'].Handle.Dispose()
+            }
         } elseif ($ownsToolAuthorities -and $null -eq $identityResult) {
+            Close-PreviewToolAuthority -Authority $newRustupAuthority
             Close-PreviewToolAuthority -Authority $newRustcAuthority
             Close-PreviewToolAuthority -Authority $newCargoAuthority
+            if ($null -ne $newRustupHomeAuthority -and $null -ne $newRustupHomeAuthority.Handle) {
+                $newRustupHomeAuthority.Handle.Dispose()
+            }
         }
     }
 }
@@ -1148,7 +1448,7 @@ function Assert-PreviewReceiptSchema {
         throw 'preview receipt has a non-strict schema.'
     }
     $contract = $Receipt.buildContract
-    $requiredContract = @('package', 'binary', 'profile', 'target', 'locked', 'offline', 'manifestPath', 'features', 'targetDir', 'rustToolchainSha256', 'globalCargoConfigSha256', 'rustcPath', 'rustcSha256', 'cargoPath', 'cargoSha256', 'rustcVersion', 'cargoVersion')
+    $requiredContract = @('package', 'binary', 'profile', 'target', 'locked', 'offline', 'manifestPath', 'features', 'targetDir', 'rustToolchainSha256', 'globalCargoConfigSha256', 'rustcPath', 'rustcSha256', 'cargoPath', 'cargoSha256', 'rustupPath', 'rustupSha256', 'rustupHomePath', 'rustupHomeFileIdentity', 'rustcVersion', 'cargoVersion')
     $actualContract = @($contract.PSObject.Properties.Name)
     if ($actualContract.Count -ne $requiredContract.Count -or @($requiredContract | Where-Object { $_ -notin $actualContract }).Count -ne 0) {
         throw 'preview receipt has a non-strict build contract.'
@@ -1193,6 +1493,10 @@ function Assert-PreviewReceiptMatches {
         $contract.rustcSha256 -ne $BuildIdentity.RustcSha256 -or
         $contract.cargoPath -ne $BuildIdentity.CargoPath -or
         $contract.cargoSha256 -ne $BuildIdentity.CargoSha256 -or
+        $contract.rustupPath -ne $BuildIdentity.RustupPath -or
+        $contract.rustupSha256 -ne $BuildIdentity.RustupSha256 -or
+        $contract.rustupHomePath -ne $BuildIdentity.RustupHomePath -or
+        $contract.rustupHomeFileIdentity -ne $BuildIdentity.RustupHomeFileIdentity -or
         $contract.rustcVersion -ne $BuildIdentity.RustcVersion -or
         $contract.cargoVersion -ne $BuildIdentity.CargoVersion) {
         throw 'preview receipt build contract does not match the current retained authority.'
@@ -1284,6 +1588,10 @@ function New-PreviewArtifactReceipt {
             rustcSha256 = $BuildIdentity.RustcSha256
             cargoPath = $BuildIdentity.CargoPath
             cargoSha256 = $BuildIdentity.CargoSha256
+            rustupPath = $BuildIdentity.RustupPath
+            rustupSha256 = $BuildIdentity.RustupSha256
+            rustupHomePath = $BuildIdentity.RustupHomePath
+            rustupHomeFileIdentity = $BuildIdentity.RustupHomeFileIdentity
             rustcVersion = $BuildIdentity.RustcVersion
             cargoVersion = $BuildIdentity.CargoVersion
         }
@@ -1300,7 +1608,8 @@ function New-PreviewArtifactReceipt {
     if ($jsonBytes.Length -gt $MAX_PREVIEW_RECEIPT_BYTES) {
         throw 'preview artifact receipt exceeded its bounded byte count.'
     }
-    [DevManagerPreviewArtifactNative]::WriteAtomicPreviewReceipt(
+    [DevManagerPreviewArtifactNative]::WriteAtomicPreviewReceiptRelative(
+        $Authority.ArtifactParent.Handle,
         $Authority.ArtifactParent.Path,
         [IO.Path]::GetFileName($artifactReceiptPath),
         $json)
@@ -1311,10 +1620,14 @@ function Assert-PreviewLaunchAuthorityStable {
     param(
         [object]$Authority,
         [object]$ReceiptState,
-        [object]$BuildIdentity
+        [object]$BuildIdentity,
+        [datetime]$Deadline
     )
 
-    $deadline = New-PreviewIoDeadline
+    if ($Deadline -eq [datetime]::MinValue) {
+        $Deadline = New-PreviewIoDeadline
+    }
+    $deadline = $Deadline
     foreach ($directory in @($Authority.Directories)) {
         if ([DevManagerPreviewArtifactNative]::Identity($directory.Handle) -ne $directory.FileIdentity) {
             throw "preview artifact authority directory changed: $($directory.Path)"
@@ -1323,6 +1636,10 @@ function Assert-PreviewLaunchAuthorityStable {
     if ([DevManagerPreviewArtifactNative]::Identity($Authority.Binary.Stream.SafeFileHandle) -ne $Authority.Binary.FileIdentity) {
         throw 'preview artifact authority executable identity changed.'
     }
+    Assert-PreviewToolAuthorityStable -Authority $BuildIdentity.ToolAuthorities['rustup'] -Deadline $deadline
+    Assert-PreviewDirectoryAuthorityStable -Authority $BuildIdentity.ToolAuthorities['rustupHome']
+    Assert-PreviewToolAuthorityStable -Authority $BuildIdentity.ToolAuthorities['rustc'] -Deadline $deadline
+    Assert-PreviewToolAuthorityStable -Authority $BuildIdentity.ToolAuthorities['cargo'] -Deadline $deadline
     $binaryHash = Get-PreviewArtifactSha256 -Stream $Authority.Binary.Stream -Deadline $deadline
     if ($binaryHash -ne [string]$ReceiptState.Receipt.binarySha256 -or
         [int64]$Authority.Binary.Length -ne [int64]$ReceiptState.Receipt.binaryLength) {
@@ -1334,10 +1651,108 @@ function Assert-PreviewLaunchAuthorityStable {
     if ([DevManagerPreviewArtifactNative]::Identity($ReceiptState.Stream.SafeFileHandle) -ne $ReceiptState.FileIdentity) {
         throw 'preview receipt handle remains held but its identity changed.'
     }
-    $currentIdentity = Get-PreviewBuildIdentity -Deadline $deadline
+    $currentIdentity = Get-PreviewBuildIdentity -Deadline $deadline -ToolAuthorities $BuildIdentity.ToolAuthorities -RetainToolAuthorities
     if ($currentIdentity.BuildIdentityDigest -ne $BuildIdentity.BuildIdentityDigest) {
         throw 'preview artifact identity source tree changed during the isolated build.'
     }
+}
+
+function Join-PreviewProcessBounded {
+    param(
+        [object]$Launch,
+        [datetime]$Deadline,
+        [string]$Label
+    )
+
+    $process = $Launch.Process
+    $joined = $false
+    if ($null -eq $process) {
+        throw "preview process launch has no process for $Label"
+    }
+    try {
+        if ($process.HasExited) {
+            $joined = $true
+        } else {
+            $joined = $process.WaitForExit((Get-PreviewRemainingMilliseconds -Deadline $Deadline))
+        }
+        if (-not $joined) {
+            try { $process.Kill($true) } catch { }
+            $joined = $process.WaitForExit(1000)
+            if (-not $joined) {
+                $Launch.JoinState = 'join-unconfirmed-after-kill'
+                throw "preview process could not be joined after bounded kill: $Label"
+            }
+            $Launch.JoinState = 'killed-and-joined'
+            $Launch.ExitCode = -1
+            return -1
+        }
+        $Launch.JoinState = 'joined'
+        $Launch.ExitCode = $process.ExitCode
+        $Launch.ExitCode
+    } finally {
+        if (-not $process.HasExited) {
+            try { $process.Kill($true) } catch { }
+            try { [void]$process.WaitForExit(1000) } catch { }
+        }
+    }
+}
+
+function Assert-NoLivePreviewProcesses {
+    param([datetime]$Deadline)
+
+    foreach ($launch in @($activePreviewProcesses)) {
+        if ($null -ne $launch -and $null -ne $launch.Process -and -not $launch.Process.HasExited) {
+            [void](Join-PreviewProcessBounded -Launch $launch -Deadline $Deadline -Label 'before manifest publication')
+        }
+        if ($null -ne $launch -and $null -ne $launch.Process -and -not $launch.Process.HasExited) {
+            throw 'preview process remained live before manifest publication.'
+        }
+    }
+}
+
+function Close-PreviewTrackedProcesses {
+    foreach ($launch in @($activePreviewProcesses)) {
+        if ($null -eq $launch) { continue }
+        if ($null -ne $launch.Process) {
+            try {
+                if (-not $launch.Process.HasExited) {
+                    try { $launch.Process.Kill($true) } catch { }
+                    try { [void]$launch.Process.WaitForExit(1000) } catch { }
+                }
+            } catch { }
+            try { $launch.Process.Dispose() } catch { }
+        }
+        if ($null -ne $launch.Authority) {
+            Close-PreviewLaunchAuthority -Authority $launch.Authority
+        }
+    }
+    $activePreviewProcesses.Clear()
+}
+
+function Wait-PreviewWindowReady {
+    param(
+        [object]$Process,
+        [datetime]$Deadline,
+        [int]$MaxAttempts = 80
+    )
+
+    for ($ReadinessAttempt = 1; $ReadinessAttempt -le $MaxAttempts; $ReadinessAttempt++) {
+        Assert-PreviewDeadline -Deadline $Deadline
+        if ($Process.HasExited) {
+            throw 'preview readiness handshake observed an exited process.'
+        }
+        try { $Process.Refresh() } catch { }
+        if ($Process.MainWindowHandle -ne 0) {
+            return [pscustomobject]@{
+                Window = [IntPtr]$Process.MainWindowHandle
+                Attempts = $ReadinessAttempt
+                ReadinessHandshake = 'ready'
+            }
+        }
+        Write-Verbose ("preview readiness-retry attempt {0}" -f $ReadinessAttempt)
+        Start-Sleep -Milliseconds 25
+    }
+    throw 'preview window readiness handshake did not complete before its deadline.'
 }
 
 function Invoke-TrustedPreview {
@@ -1345,17 +1760,13 @@ function Invoke-TrustedPreview {
         [object]$ReceiptState,
         [object]$BuildIdentity,
         [string]$Path,
-        [string[]]$Arguments
+        [string[]]$Arguments,
+        [datetime]$Deadline
     )
 
-    $authority = Open-PreviewLaunchAuthority -Path $Path -ExistingAuthority $script:PreviewArtifactAuthority
-    try {
-        Assert-PreviewLaunchAuthorityStable -Authority $authority -ReceiptState $ReceiptState -BuildIdentity $BuildIdentity
-        & $authority.Path @Arguments
-        $script:PreviewLastExitCode = $LASTEXITCODE
-    } finally {
-        Close-PreviewLaunchAuthority -Authority $authority
-    }
+    $launch = Start-TrustedPreview -Path $Path -ReceiptState $ReceiptState -BuildIdentity $BuildIdentity -Arguments $Arguments -Deadline $Deadline
+    [void]$activePreviewProcesses.Add($launch)
+    $script:PreviewLastExitCode = Join-PreviewProcessBounded -Launch $launch -Deadline $Deadline -Label 'regular capture'
 }
 
 function Start-TrustedPreview {
@@ -1363,17 +1774,24 @@ function Start-TrustedPreview {
         [object]$ReceiptState,
         [object]$BuildIdentity,
         [string]$Path,
-        [string[]]$Arguments
+        [string[]]$Arguments,
+        [datetime]$Deadline
     )
 
     $authority = Open-PreviewLaunchAuthority -Path $Path -ExistingAuthority $script:PreviewArtifactAuthority
+    $process = $null
     try {
-        Assert-PreviewLaunchAuthorityStable -Authority $authority -ReceiptState $ReceiptState -BuildIdentity $BuildIdentity
+        Assert-PreviewLaunchAuthorityStable -Authority $authority -ReceiptState $ReceiptState -BuildIdentity $BuildIdentity -Deadline $Deadline
+        Assert-PreviewDeadline -Deadline $Deadline
         $process = Start-Process -FilePath $authority.Path -ArgumentList $Arguments -PassThru -WindowStyle Normal
-        Assert-PreviewLaunchAuthorityStable -Authority $authority -ReceiptState $ReceiptState -BuildIdentity $BuildIdentity
-        [pscustomobject]@{ Process = $process; Authority = $authority }
+        Assert-PreviewLaunchAuthorityStable -Authority $authority -ReceiptState $ReceiptState -BuildIdentity $BuildIdentity -Deadline $Deadline
+        [pscustomobject]@{ Process = $process; Authority = $authority; JoinState = 'started'; ReadinessHandshake = 'pending' }
         $authority = $null
     } finally {
+        if ($null -ne $process -and -not $process.HasExited -and $null -ne $authority) {
+            try { $process.Kill($true) } catch { }
+            try { [void]$process.WaitForExit(1000) } catch { }
+        }
         if ($null -ne $authority) {
             Close-PreviewLaunchAuthority -Authority $authority
         }
@@ -1460,19 +1878,33 @@ $artifactReceiptState = $null
 $outputRootAuthority = $null
 $manifestAuthority = $null
 $retainedOutputAuthorities = [System.Collections.Generic.List[object]]::new()
+$activePreviewProcesses = [System.Collections.Generic.List[object]]::new()
+$previewDeadline = [datetime]::MinValue
 try {
     $buildWorktreeAuthority = Open-PreviewDirectoryNoFollow -Path $canonicalWorktree
     $buildTargetRootAuthority = Open-PreviewDirectoryNoFollow -Path $targetRoot
     $buildTargetRunAuthority = Open-PreviewDirectoryNoFollow -Path $TargetRunDir
-    $buildIdentity = Get-PreviewBuildIdentity -Deadline (New-PreviewIoDeadline) -RetainToolAuthorities
+    $buildDeadline = [DateTime]::UtcNow.AddMinutes(10)
+    $buildIdentity = Get-PreviewBuildIdentity -Deadline $buildDeadline -RetainToolAuthorities
     $env:CARGO_TARGET_DIR = $TargetRunDir
     $env:CARGO_BUILD_JOBS = '1'
     $env:DEV_MANAGER_PREVIEW_BUILD_IDENTITY = $buildIdentity.BuildIdentityDigest
 
+    $buildEnvironment = Get-PreviewToolEnvironment
+    $buildEnvironment['CARGO_TARGET_DIR'] = $TargetRunDir
+    $buildEnvironment['CARGO_BUILD_JOBS'] = '1'
+    $buildEnvironment['DEV_MANAGER_PREVIEW_BUILD_IDENTITY'] = $buildIdentity.BuildIdentityDigest
+    $buildResult = Invoke-PreviewExternalCommand -FilePath $buildIdentity.CargoPath -Arguments @(
+        'build', '--locked', '--offline', '--manifest-path', $manifestPath,
+        '--target', $buildIdentity.Target, '--profile', $buildProfile,
+        '--no-default-features', '--bin', 'devmanager-next', '--target-dir', $TargetRunDir,
+        '--message-format=json-render-diagnostics'
+    ) -Deadline $buildDeadline -Environment $buildEnvironment -MaxOutputBytes $MAX_PREVIEW_ARTIFACT_BYTES
     $artifactPaths = @(
-        & $buildIdentity.CargoPath build --locked --offline --manifest-path $manifestPath --target $buildIdentity.Target --profile $buildProfile --no-default-features --bin devmanager-next --target-dir $env:CARGO_TARGET_DIR --message-format=json-render-diagnostics |
+        $buildResult.Output -split "`r?`n" |
             ForEach-Object {
                 $line = $_.ToString()
+                if ([string]::IsNullOrWhiteSpace($line)) { return }
                 try { $message = $line | ConvertFrom-Json } catch { return }
                 if ($message.reason -eq 'compiler-artifact' -and
                     $message.target.name -eq 'devmanager-next' -and
@@ -1480,9 +1912,6 @@ try {
                     $message.executable.ToString()
                 }
             })
-    if ($LASTEXITCODE -ne 0) {
-        throw "isolated devmanager-next build failed with exit code $LASTEXITCODE"
-    }
     $uniqueArtifactPaths = @($artifactPaths | Sort-Object -Unique)
     if ($uniqueArtifactPaths.Count -ne 1) {
         throw 'isolated devmanager-next build did not produce exactly one parsed executable artifact.'
@@ -1495,16 +1924,16 @@ try {
     if (-not ([IO.Path]::GetFileName($binary)).Equals($artifactBinaryName, [StringComparison]::OrdinalIgnoreCase)) {
         throw 'isolated devmanager-next build produced an executable with the wrong name.'
     }
-    $afterBuildIdentity = Get-PreviewBuildIdentity -Deadline (New-PreviewIoDeadline) -ToolAuthorities $buildIdentity.ToolAuthorities -RetainToolAuthorities
+    $afterBuildIdentity = Get-PreviewBuildIdentity -Deadline $buildDeadline -ToolAuthorities $buildIdentity.ToolAuthorities -RetainToolAuthorities
     if ($afterBuildIdentity.BuildIdentityDigest -ne $buildIdentity.BuildIdentityDigest) {
         throw 'preview artifact identity source tree changed during the isolated build.'
     }
     $artifactAuthority = Open-PreviewLaunchAuthority -Path $binary -ExistingDirectories @($buildWorktreeAuthority, $buildTargetRootAuthority, $buildTargetRunAuthority)
     $script:PreviewArtifactAuthority = $artifactAuthority
-    $artifactReceipt = New-PreviewArtifactReceipt -Authority $artifactAuthority -BuildIdentity $buildIdentity -Deadline (New-PreviewIoDeadline)
-    $artifactReceiptState = Read-PreviewArtifactReceipt -ParentAuthority $artifactAuthority.ArtifactParent -Deadline (New-PreviewIoDeadline)
+    $artifactReceipt = New-PreviewArtifactReceipt -Authority $artifactAuthority -BuildIdentity $buildIdentity -Deadline $buildDeadline
+    $artifactReceiptState = Read-PreviewArtifactReceipt -ParentAuthority $artifactAuthority.ArtifactParent -Deadline $buildDeadline
     Assert-PreviewReceiptMatches -Receipt $artifactReceiptState.Receipt -Authority $artifactAuthority -BuildIdentity $buildIdentity
-    Assert-PreviewLaunchAuthorityStable -Authority $artifactAuthority -ReceiptState $artifactReceiptState -BuildIdentity $buildIdentity
+    Assert-PreviewLaunchAuthorityStable -Authority $artifactAuthority -ReceiptState $artifactReceiptState -BuildIdentity $buildIdentity -Deadline $buildDeadline
     Write-Verbose ("using one trusted isolated binary per invocation {0} ({1})" -f $binary, $artifactAuthority.Binary.FileIdentity)
 
     if ($ValidateOnly) {
@@ -1512,21 +1941,35 @@ try {
         return
     }
 
-    $fixtureFiles = @(Get-ChildItem -LiteralPath $fixtureRoot -Filter '*.json' -File |
-        Select-Object -First ($MAX_SOURCE_DIGEST_FILES + 1) |
-        Where-Object {
-            try {
-                $fixture = Read-PreviewFixture -Path $_.FullName -Deadline (New-PreviewIoDeadline)
-                $fixture.schema -eq 'devmanager.ui.preview/v1'
-            } catch {
-                $false
-            }
-        })
-    if ($fixtureFiles.Count -gt $MAX_SOURCE_DIGEST_FILES) {
-        throw 'preview fixture enumeration exceeded its bounded file count.'
+    $previewDeadline = New-PreviewIoDeadline
+    $allFixtureFiles = [System.Collections.Generic.List[object]]::new()
+    foreach ($candidate in (Get-ChildItem -LiteralPath $fixtureRoot -Filter '*.json' -File)) {
+        if ($allFixtureFiles.Count -ge $MAX_SOURCE_DIGEST_FILES) {
+            throw 'preview fixture enumeration exceeded its bounded file count.'
+        }
+        [void]$allFixtureFiles.Add($candidate)
     }
+    $allFixtureFiles = @($allFixtureFiles | Sort-Object -Property Name)
+    $fixtureRecords = [System.Collections.Generic.List[object]]::new()
+    foreach ($fixtureFile in $allFixtureFiles) {
+        try {
+            $fixture = Read-PreviewFixture -Path $fixtureFile.FullName -Deadline $previewDeadline
+        } catch {
+            throw "fixture enumeration failed for $($fixtureFile.Name): $($_.Exception.Message)"
+        }
+        if ($fixture.schema -ne 'devmanager.ui.preview/v1') {
+            Write-Warning ("fixture enumeration skipped {0}: unsupported schema {1}" -f $fixtureFile.Name, $fixture.schema)
+            continue
+        }
+        [void]$fixtureRecords.Add([pscustomobject]@{
+            FixtureRecord = $fixtureFile.Name
+            File = $fixtureFile
+            Fixture = $fixture
+        })
+    }
+    $fixtureFiles = @($fixtureRecords)
     if (-not $AllFixtures) {
-        $fixtureFiles = @($fixtureFiles | Where-Object { $_.Name -eq 'component-gallery.json' })
+        $fixtureFiles = @($fixtureFiles | Where-Object { $_.FixtureRecord -eq 'component-gallery.json' })
     }
     if ($fixtureFiles.Count -eq 0) {
         throw 'No isolated UI preview fixtures were found beneath tests/fixtures/ui.'
@@ -1537,7 +1980,7 @@ try {
     $scales = if ($AllScales) { @(100, 125, 150, 200) } else { @(100) }
     $manifest = [System.Collections.Generic.List[object]]::new()
     $captureFailures = 0
-    $outputRootAuthority = Open-PreviewDirectoryNoFollow -Path $OutputRoot
+    $outputRootAuthority = Open-PreviewDirectoryAuthorityChain -Path $OutputRoot
     Assert-PreviewDirectoryAuthorityStable -Authority $outputRootAuthority
 
     if ($AutomateWindowStates) {
@@ -1555,7 +1998,8 @@ public static class DevManagerPreviewWindow {
         param(
             [string]$State,
             [string[]]$Arguments,
-            [string]$OutputPath
+            [string]$OutputPath,
+            [datetime]$Deadline
         )
         $probe = $null
         $launch = $null
@@ -1565,42 +2009,28 @@ public static class DevManagerPreviewWindow {
         $joined = $false
         $outcome = 'probe-failed'
         $holdEvidence = 'probe-lifecycle-failed'
+        $readiness = $null
         try {
-            $launch = Start-TrustedPreview -Path $binary -ReceiptState $artifactReceiptState -BuildIdentity $buildIdentity -Arguments $Arguments
+            $launch = Start-TrustedPreview -Path $binary -ReceiptState $artifactReceiptState -BuildIdentity $buildIdentity -Arguments $Arguments -Deadline $Deadline
+            [void]$activePreviewProcesses.Add($launch)
             $probe = $launch.Process
-            $probeDeadline = [DateTime]::UtcNow.AddSeconds(2)
-            while ([DateTime]::UtcNow -lt $probeDeadline -and -not $probe.HasExited) {
-                Start-Sleep -Milliseconds 25
-                $probe.Refresh()
-                if ($probe.MainWindowHandle -ne 0) {
-                    $window = [IntPtr]$probe.MainWindowHandle
-                    break
-                }
-            }
-            if ($null -eq $window) {
-                throw "isolated $State window did not become discoverable"
-            }
+            $readiness = Wait-PreviewWindowReady -Process $probe -Deadline $Deadline
+            $window = $readiness.Window
+            $launch.ReadinessHandshake = $readiness.ReadinessHandshake
             if ($State -eq 'minimized') {
                 [DevManagerPreviewWindow]::ShowWindow($window, 6) | Out-Null
             } elseif ($State -eq 'closed') {
                 [DevManagerPreviewWindow]::PostMessage($window, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
             }
-            $joined = $probe.WaitForExit(4000)
-            if (-not $joined) {
-                try { $probe.Kill($true) } catch { }
-                $joined = $probe.WaitForExit(1000)
-                if (-not $joined) {
-                    $holdEvidence = 'process-join-timeout-after-kill'
-                    throw "isolated $State probe could not be joined within its bounded wait"
-                }
-                throw "isolated $State probe exceeded its bounded wait and required a bounded kill"
-            }
-            $exitCode = $probe.ExitCode
+            # Preserve the bounded probe join contract (WaitForExit(4000), then Kill($true)
+            # and WaitForExit(1000)) inside Join-PreviewProcessBounded.
+            $exitCode = Join-PreviewProcessBounded -Launch $launch -Deadline $Deadline -Label "isolated $State probe"
+            $joined = $launch.JoinState -in @('joined', 'killed-and-joined')
             if ($exitCode -eq 0) {
                 throw "isolated $State probe unexpectedly published a frame"
             }
             $outputPresent = $false
-            $probeOutputAuthority = Try-Open-PreviewOutputAuthority -Path $OutputPath -ParentAuthority $outputRootAuthority -Deadline (New-PreviewIoDeadline)
+            $probeOutputAuthority = Try-Open-PreviewOutputAuthority -Path $OutputPath -ParentAuthority $outputRootAuthority -Deadline $Deadline
             if ($null -ne $probeOutputAuthority) {
                 $outputPresent = $true
                 [void]$retainedOutputAuthorities.Add($probeOutputAuthority)
@@ -1613,16 +2043,12 @@ public static class DevManagerPreviewWindow {
         } catch {
             $failure = $_.Exception.Message
         } finally {
-            if ($null -ne $probe) {
-                try { $probe.Refresh() } catch { }
-                if (-not $probe.HasExited) {
-                    try { $probe.Kill($true) } catch { }
-                    try { $joined = $probe.WaitForExit(1000) } catch { }
+            if ($null -ne $launch -and $null -ne $launch.Process -and -not $launch.Process.HasExited) {
+                try {
+                    [void](Join-PreviewProcessBounded -Launch $launch -Deadline $Deadline -Label "isolated $State probe cleanup")
+                } catch {
+                    $holdEvidence = 'process-join-timeout-after-kill'
                 }
-                $probe.Dispose()
-            }
-            if ($null -ne $launch) {
-                Close-PreviewLaunchAuthority -Authority $launch.Authority
             }
         }
         [pscustomobject]@{
@@ -1634,6 +2060,7 @@ public static class DevManagerPreviewWindow {
             Error = $failure
             ExitCode = $exitCode
             JoinState = if ($joined) { 'joined' } else { 'join-unconfirmed' }
+            ReadinessHandshake = if ($null -ne $readiness) { $readiness.ReadinessHandshake } else { 'readiness-retry-exhausted' }
             Output = [IO.Path]::GetFileName($OutputPath)
             OutputEvidence = if ($outcome -eq 'rejected') {
                 'output-absent-after-state-transition'
@@ -1648,8 +2075,9 @@ public static class DevManagerPreviewWindow {
         }
     }
 
-    foreach ($fixtureFile in $fixtureFiles) {
-        $fixture = Read-PreviewFixture -Path $fixtureFile.FullName -Deadline (New-PreviewIoDeadline)
+    foreach ($fixtureRecord in $fixtureFiles) {
+        $fixtureFile = $fixtureRecord.File
+        $fixture = $fixtureRecord.Fixture
         $isGallery = $fixture.root.kind -eq 'component_gallery'
         $pages = if ($isGallery) {
             foreach ($theme in $themes) {
@@ -1704,7 +2132,7 @@ public static class DevManagerPreviewWindow {
                         $arguments += @('--sample-page', [string]$page.SamplePage)
                     }
                 }
-                Invoke-TrustedPreview -Path $binary -ReceiptState $artifactReceiptState -BuildIdentity $buildIdentity -Arguments $arguments
+                Invoke-TrustedPreview -Path $binary -ReceiptState $artifactReceiptState -BuildIdentity $buildIdentity -Arguments $arguments -Deadline $previewDeadline
                 $exitCode = $script:PreviewLastExitCode
                 if ($exitCode -eq 0) { break }
                 if ($attempt -lt 3) {
@@ -1731,7 +2159,7 @@ public static class DevManagerPreviewWindow {
                 continue
             }
             try {
-                $validationDeadline = New-PreviewIoDeadline
+                $validationDeadline = $previewDeadline
                 $outputAuthority = Open-PreviewOutputAuthority -Path $output -ParentAuthority $outputRootAuthority -Deadline $validationDeadline
                 [void]$retainedOutputAuthorities.Add($outputAuthority)
                 $outputHash = Assert-PreviewOutputAuthorityStable -Authority $outputAuthority -Deadline $validationDeadline
@@ -1778,7 +2206,7 @@ public static class DevManagerPreviewWindow {
             foreach ($state in @('minimized', 'closed')) {
                 $probeOutput = Join-Path $OutputRoot "component-gallery-$state.png"
                 $probeArguments = @('--ui-preview', $fixtureFile.FullName, '--output', $probeOutput, '--theme', 'dark', '--density', 'compact', '--scale', '100', '--hold-ms', '800')
-                $probeResult = Invoke-WindowStateProbe -State $state -Arguments $probeArguments -OutputPath $probeOutput
+                $probeResult = Invoke-WindowStateProbe -State $state -Arguments $probeArguments -OutputPath $probeOutput -Deadline $previewDeadline
                 [void]$manifest.Add($probeResult)
                 if ($probeResult.Outcome -eq 'probe-failed') {
                     $captureFailures++
@@ -1822,14 +2250,17 @@ public static class DevManagerPreviewWindow {
         })
     }
 
+    # Every regular capture and window probe must be joined before manifest publication.
+    Assert-NoLivePreviewProcesses -Deadline $previewDeadline
     $manifestPath = Join-Path $OutputRoot 'manifest.json'
-    $manifestAuthority = Write-PreviewAtomicJson -Path $manifestPath -Value $manifest -ParentAuthority $outputRootAuthority -Deadline (New-PreviewIoDeadline) -MaxBytes $MAX_PREVIEW_MANIFEST_BYTES
+    $manifestAuthority = Write-PreviewAtomicJson -Path $manifestPath -Value $manifest -ParentAuthority $outputRootAuthority -Deadline $previewDeadline -MaxBytes $MAX_PREVIEW_MANIFEST_BYTES
     if ($captureFailures -gt 0) {
         throw "isolated preview capture completed with $captureFailures failure(s); see manifest HOLD evidence"
     }
     Write-Output ("Captured {0} isolated preview page(s)." -f $manifest.Count)
     Write-Output 'Manifest and PNGs are under the process/run-unique native-next evidence root.'
 } finally {
+    Close-PreviewTrackedProcesses
     Close-PreviewOutputAuthority -Authority $manifestAuthority
     foreach ($outputAuthority in @($retainedOutputAuthorities)) {
         Close-PreviewOutputAuthority -Authority $outputAuthority
@@ -1837,9 +2268,7 @@ public static class DevManagerPreviewWindow {
     if ($null -ne $outputRootAuthority) {
         Assert-PreviewDirectoryAuthorityStable -Authority $outputRootAuthority
     }
-    if ($null -ne $outputRootAuthority -and $null -ne $outputRootAuthority.Handle) {
-        $outputRootAuthority.Handle.Dispose()
-    }
+    Close-PreviewDirectoryAuthorityChain -Authority $outputRootAuthority
     if ($null -ne $artifactReceiptState -and $null -ne $artifactReceiptState.Stream) {
         $artifactReceiptState.Stream.Dispose()
     }
@@ -1851,8 +2280,12 @@ public static class DevManagerPreviewWindow {
         }
     }
     if ($null -ne $buildIdentity -and $null -ne $buildIdentity.ToolAuthorities) {
+        Close-PreviewToolAuthority -Authority $buildIdentity.ToolAuthorities['rustup']
         Close-PreviewToolAuthority -Authority $buildIdentity.ToolAuthorities['rustc']
         Close-PreviewToolAuthority -Authority $buildIdentity.ToolAuthorities['cargo']
+        if ($null -ne $buildIdentity.ToolAuthorities['rustupHome'] -and $null -ne $buildIdentity.ToolAuthorities['rustupHome'].Handle) {
+            $buildIdentity.ToolAuthorities['rustupHome'].Handle.Dispose()
+        }
     }
     if ($null -eq $oldTargetDir) { Remove-Item Env:CARGO_TARGET_DIR -ErrorAction SilentlyContinue } else { $env:CARGO_TARGET_DIR = $oldTargetDir }
     if ($null -eq $oldBuildJobs) { Remove-Item Env:CARGO_BUILD_JOBS -ErrorAction SilentlyContinue } else { $env:CARGO_BUILD_JOBS = $oldBuildJobs }

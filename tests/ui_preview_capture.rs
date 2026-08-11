@@ -368,6 +368,147 @@ fn preview_script_bounds_every_external_reader_on_one_deadline() {
 }
 
 #[test]
+fn preview_script_keeps_retained_tool_handles_without_reopening_them() {
+    let script = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("scripts/native-next/Capture-UiPreviews.ps1"),
+    )
+    .expect("preview capture script");
+    for marker in [
+        "Assert-PreviewToolAuthorityStable",
+        "-ToolAuthorities $BuildIdentity.ToolAuthorities",
+        "Get-PreviewBuildIdentity -Deadline $deadline -ToolAuthorities $BuildIdentity.ToolAuthorities",
+    ] {
+        assert!(
+            script.contains(marker),
+            "retained FILE_SHARE_NONE tool authority must be revalidated without reopening: {marker}"
+        );
+    }
+}
+
+#[test]
+fn preview_script_pins_rustup_identity_and_fences_toolchain_environment() {
+    let script = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("scripts/native-next/Capture-UiPreviews.ps1"),
+    )
+    .expect("preview capture script");
+    for marker in [
+        "$rustupHomePath",
+        "$rustupHomeAuthority",
+        "RUSTUP_HOME",
+        "CARGO_HOME",
+        "rustupHomeFileIdentity",
+        "Assert-PreviewToolAuthorityStable -Authority $rustupAuthority",
+    ] {
+        assert!(
+            script.contains(marker),
+            "rustup provenance must pin and retain {marker}"
+        );
+    }
+}
+
+#[test]
+fn preview_script_uses_one_absolute_deadline_for_commands_and_capture_io() {
+    let script = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("scripts/native-next/Capture-UiPreviews.ps1"),
+    )
+    .expect("preview capture script");
+    for marker in [
+        "$previewDeadline = New-PreviewIoDeadline",
+        "Invoke-PreviewExternalCommand",
+        "AbsoluteDeadline",
+        "-Deadline $previewDeadline",
+    ] {
+        assert!(
+            script.contains(marker),
+            "all external commands/readers must share one absolute deadline: {marker}"
+        );
+    }
+}
+
+#[test]
+fn preview_script_retains_output_ancestor_chain_and_publishes_relative_to_handle() {
+    let script = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("scripts/native-next/Capture-UiPreviews.ps1"),
+    )
+    .expect("preview capture script");
+    for marker in [
+        "OutputRootAncestorChain",
+        "WriteAtomicPreviewReceiptRelative",
+        "RootDirectory",
+        "PublishRelative",
+    ] {
+        assert!(
+            script.contains(marker),
+            "output publication must retain the ancestor chain and stay handle-relative: {marker}"
+        );
+    }
+}
+
+#[test]
+fn preview_script_joins_every_capture_process_before_manifest_publication() {
+    let script = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("scripts/native-next/Capture-UiPreviews.ps1"),
+    )
+    .expect("preview capture script");
+    for marker in [
+        "$activePreviewProcesses",
+        "Join-PreviewProcessBounded",
+        "Assert-NoLivePreviewProcesses",
+        "before manifest publication",
+    ] {
+        assert!(
+            script.contains(marker),
+            "regular and probe captures must be killed and joined {marker}"
+        );
+    }
+}
+
+#[test]
+fn preview_script_retries_until_window_readiness_handshake() {
+    let script = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("scripts/native-next/Capture-UiPreviews.ps1"),
+    )
+    .expect("preview capture script");
+    for marker in [
+        "Wait-PreviewWindowReady",
+        "ReadinessAttempt",
+        "readiness-retry",
+        "ReadinessHandshake",
+    ] {
+        assert!(
+            script.contains(marker),
+            "window state capture must use a bounded readiness handshake/retry: {marker}"
+        );
+    }
+}
+
+#[test]
+fn preview_script_enumerates_fixtures_sorted_and_fails_visible_on_invalid_input() {
+    let script = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("scripts/native-next/Capture-UiPreviews.ps1"),
+    )
+    .expect("preview capture script");
+    for marker in [
+        "Sort-Object -Property Name",
+        "FixtureRecord",
+        "fixture enumeration failed",
+        "unsupported schema",
+    ] {
+        assert!(
+            script.contains(marker),
+            "fixture discovery must be sorted and fail-visible: {marker}"
+        );
+    }
+}
+
+#[test]
 fn preview_script_retains_output_authority_through_validation_and_manifest_publication() {
     let script = fs::read_to_string(
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -710,8 +851,9 @@ fn preview_receipt_publication_is_atomic_and_handle_verified() {
     )
     .expect("preview capture script");
     for marker in [
-        "WriteAtomicPreviewReceipt",
-        "MoveFileExW",
+        "WriteAtomicPreviewReceiptRelative",
+        "SetFileInformationByHandle",
+        "RootDirectory",
         "FlushFileBuffers",
         "receipt handle remains held",
         "Assert-PreviewReceiptSchema",
@@ -723,6 +865,10 @@ fn preview_receipt_publication_is_atomic_and_handle_verified() {
             "receipt publication must provide {marker}"
         );
     }
+    assert!(
+        !script.contains("MoveFileExW") && !script.contains("DeleteFileW"),
+        "receipt publication must not retain a path-based move or cleanup fallback"
+    );
 }
 
 #[test]
