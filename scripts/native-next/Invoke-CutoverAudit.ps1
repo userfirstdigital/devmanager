@@ -15,7 +15,9 @@ param(
 
     [string]$Root,
 
-    [string]$OutputPath
+    [string]$OutputPath,
+
+    [string]$RemoteChangeEvidencePath
 )
 
 Set-StrictMode -Version Latest
@@ -59,6 +61,8 @@ $maxMatchesPerOwner = 20
 $maxScanBytesPerFile = [int64]1048576
 $maxScannerFiles = 4096
 $maxScannerOutputBytes = [int64]262144
+$maxScannerOutputLines = 4096
+$maxScannerOutputLineChars = 32768
 $maxScannerDurationMs = $maxAuditDurationMs
 $maxErrorCount = 64
 $maxReportJsonBytes = [int64]262144
@@ -71,23 +75,37 @@ $maxEnvironmentPathChars = 1024
 $maxLedgerLines = 8192
 $maxGitIdentityLines = 8
 $maxReportStrings = 16384
+$publicationReserveMs = 4000
+$processSettlementReserveMs = 3000
+$processWorkDeadlineReserveMs = $publicationReserveMs + $processSettlementReserveMs
+$workDeadlineReserveMs = $publicationReserveMs
 $safetyBoundReached = $false
 $safetyDiagnosticEmitted = $false
 $safetyDiagnostic = 'audit[safety_bound]'
 $maxMatches = $maxMatchesPerOwner
 $rootIdentity = $null
+$rootDirectoryHandle = $null
+$reportDirectoryHandle = $null
 $commonDirectoryIdentity = $null
 $authorizedRootKind = $null
 $candidateRootPath = $null
 $gitIdentity = $null
 $authorizationFailure = $null
 $fatalDiagnosticCategory = 'audit_internal_error'
+$boundedPublicationRequired = $false
+$remoteChangeAttribution = [pscustomobject]([ordered]@{
+        evaluated = $false
+        classification = 'not-evaluated'
+        writer = 'not-evaluated'
+        changedCategories = @()
+    })
 
 # Child process environment is deliberately assembled from a fixed allowlist.
 # These limits are enforced before the C# environment block is materialized;
 # the C# layer repeats the aggregate check at the final allocation boundary.
 $allowedFixtureEnvironmentNames = @(
     'GIT_FAKE_MODE', 'GIT_REAL', 'GIT_CHILD_SENTINEL', 'GIT_PROBE_LOG',
+    'GIT_FAKE_ROOT', 'GIT_FAKE_MOVED_ROOT', 'GIT_FAKE_SWAP_LOG',
     'RG_FAKE_MODE', 'RG_FAKE_TARGET', 'RG_FAKE_RESIDUE', 'RG_FAKE_RESIDUE_PID',
     'RG_FAKE_OUTSIDE', 'RG_SHIM_LOG', 'RG_REAL'
 )
@@ -107,6 +125,15 @@ function Get-CutoverDiagnosticCategory {
     param([AllowEmptyString()][string]$Message)
 
     $text = ([string]$Message).ToLowerInvariant()
+    if ($text.Contains('report parent')) { return 'report_parent_changed' }
+    if ($text.Contains('relative report')) { return 'report_temp_invalid' }
+    if ($text.Contains('temporary report')) { return 'report_temp_invalid' }
+    if ($text.Contains('report replacement')) { return 'report_replacement_invalid' }
+    if ($text.Contains('opened handle escaped')) { return 'handle_escape' }
+    if ($text.Contains('stable windows filesystem identity')) { return 'filesystem_identity_unavailable' }
+    if ($text.Contains('repository root changed')) { return 'root_identity_changed' }
+    if ($text.Contains('remote change protected')) { return 'remote_change_protected' }
+    if ($text.Contains('remote change unattributed')) { return 'remote_change_unattributed' }
     if ($text.Contains('unsupported_runtime') -or $text.Contains('powershell 7')) { return 'unsupported_runtime' }
     if ($text.Contains('unauthorized') -or $text.Contains('authenticated fixture')) { return 'root_unauthorized' }
     if ($text.Contains('common') -or $text.Contains('git identity') -or $text.Contains('worktree')) { return 'git_identity_invalid' }
@@ -236,18 +263,51 @@ function Add-RowBlocker {
     $Blockers.Value.Add((ConvertTo-CutoverDiagnostic -Message $Message -RelativePath $RelativePath))
 }
 
-function Assert-CutoverRootStable {
-    if ($null -eq $rootPath -or $null -eq $rootIdentity -or $null -eq $gitIdentity -or $null -eq $commonDirectoryIdentity) {
-        throw 'repository root identity was not established.'
+function Assert-CutoverAuthorizedRootIdentityStable {
+    if ($null -eq $rootPath -or $null -eq $rootIdentity -or $null -eq $rootDirectoryHandle) {
+        throw 'authorized repository root identity was not established.'
+    }
+    $retained = Get-CutoverHandleIdentity -Stream $rootDirectoryHandle.stream
+    if (-not (Compare-CutoverDirectoryIdentity -Before $rootIdentity -After $retained)) {
+        throw 'repository root retained handle changed during the audit.'
     }
     $current = Get-CutoverPathIdentity -LiteralPath $rootPath -AllowDirectory
-    if (-not (Compare-CutoverIdentity -Before $rootIdentity -After $current)) {
+    if (-not (Compare-CutoverDirectoryIdentity -Before $rootIdentity -After $current)) {
         throw 'repository root changed during the audit.'
     }
+}
+
+function Assert-CutoverRootStable {
+    Assert-CutoverAuthorizedRootIdentityStable
+    if ($null -eq $gitIdentity -or $null -eq $commonDirectoryIdentity) {
+        throw 'Git repository identity was not established.'
+    }
     $currentCommon = Get-CutoverPathIdentity -LiteralPath $gitIdentity.commonDirectory -AllowDirectory
-    if (-not (Compare-CutoverIdentity -Before $commonDirectoryIdentity -After $currentCommon)) {
+    if (-not (Compare-CutoverDirectoryIdentity -Before $commonDirectoryIdentity -After $currentCommon)) {
         throw 'Git common directory changed during the audit.'
     }
+}
+
+function Assert-CutoverPublicationAuthority {
+    param(
+        [Parameter(Mandatory = $true)][object]$ParentHandle,
+        [Parameter(Mandatory = $true)][string]$ExpectedParentPath
+    )
+
+    # Surround the retained-parent check with root pathname revalidation. If
+    # the authorized root is renamed or replaced, publication cannot bind to a
+    # newly opened replacement tree. Once validated, every mutation is made
+    # relative to this retained parent handle.
+    Assert-CutoverAuthorizedRootIdentityStable
+    $parentAfter = Get-CutoverHandleIdentity -Stream $ParentHandle.stream
+    if (-not (Compare-CutoverDirectoryIdentity -Before $ParentHandle.identity -After $parentAfter) -or
+        -not [string]::Equals(
+            [string]$parentAfter.finalPath,
+            [string]$ExpectedParentPath,
+            [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw 'report parent no longer belongs to the authorized repository root.'
+    }
+    Assert-CutoverAuthorizedRootIdentityStable
 }
 
 function Assert-CutoverRelativePath {
@@ -387,6 +447,11 @@ using System.Text;
 
 public static class CutoverNativeMethods
 {
+    // NtCreateFile CreateDisposition values are not Win32 CREATE_* values.
+    // FILE_OPEN_IF (3) atomically opens an existing relative directory or
+    // creates it beneath the retained parent handle when it is absent.
+    private const uint FileOpenIf = 3;
+
     [StructLayout(LayoutKind.Sequential)]
     public struct ByHandleFileInformation
     {
@@ -448,6 +513,145 @@ public static class CutoverNativeMethods
         IntPtr fileInformation,
         uint length,
         int informationClass);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct UnicodeString
+    {
+        public ushort Length;
+        public ushort MaximumLength;
+        public IntPtr Buffer;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct ObjectAttributes
+    {
+        public int Length;
+        public IntPtr RootDirectory;
+        public IntPtr ObjectName;
+        public uint Attributes;
+        public IntPtr SecurityDescriptor;
+        public IntPtr SecurityQualityOfService;
+    }
+
+    [DllImport("ntdll.dll")]
+    private static extern int NtCreateFile(
+        out IntPtr fileHandle,
+        uint desiredAccess,
+        ref ObjectAttributes objectAttributes,
+        out IoStatusBlock ioStatusBlock,
+        IntPtr allocationSize,
+        uint fileAttributes,
+        uint shareAccess,
+        uint createDisposition,
+        uint createOptions,
+        IntPtr eaBuffer,
+        uint eaLength);
+
+    public static int CreateRelativeWriteFile(
+        IntPtr parentDirectory,
+        string leafName,
+        out IntPtr fileHandle)
+    {
+        fileHandle = IntPtr.Zero;
+        if (parentDirectory == IntPtr.Zero || String.IsNullOrEmpty(leafName) ||
+            leafName.IndexOf('\\') >= 0 || leafName.IndexOf('/') >= 0 ||
+            leafName.IndexOf('\0') >= 0 || leafName == "." || leafName == "..")
+        {
+            return unchecked((int)0xC000000D);
+        }
+        var nameBuffer = Marshal.StringToHGlobalUni(leafName);
+        var name = new UnicodeString
+        {
+            Length = checked((ushort)(leafName.Length * 2)),
+            MaximumLength = checked((ushort)((leafName.Length + 1) * 2)),
+            Buffer = nameBuffer
+        };
+        var namePointer = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(UnicodeString)));
+        try
+        {
+            Marshal.StructureToPtr(name, namePointer, false);
+            var attributes = new ObjectAttributes
+            {
+                Length = Marshal.SizeOf(typeof(ObjectAttributes)),
+                RootDirectory = parentDirectory,
+                ObjectName = namePointer,
+                Attributes = 0x40,
+                SecurityDescriptor = IntPtr.Zero,
+                SecurityQualityOfService = IntPtr.Zero
+            };
+            IoStatusBlock status;
+            return NtCreateFile(
+                out fileHandle,
+                0x00130196,
+                ref attributes,
+                out status,
+                IntPtr.Zero,
+                0x00000080,
+                0x00000007,
+                2,
+                0x00200062,
+                IntPtr.Zero,
+                0);
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(namePointer);
+            Marshal.FreeHGlobal(nameBuffer);
+        }
+    }
+
+    public static int CreateOrOpenRelativeDirectory(
+        IntPtr parentDirectory,
+        string leafName,
+        out IntPtr directoryHandle)
+    {
+        directoryHandle = IntPtr.Zero;
+        if (parentDirectory == IntPtr.Zero || String.IsNullOrEmpty(leafName) ||
+            leafName.IndexOf('\\') >= 0 || leafName.IndexOf('/') >= 0 ||
+            leafName.IndexOf('\0') >= 0 || leafName == "." || leafName == "..")
+        {
+            return unchecked((int)0xC000000D);
+        }
+        var nameBuffer = Marshal.StringToHGlobalUni(leafName);
+        var name = new UnicodeString
+        {
+            Length = checked((ushort)(leafName.Length * 2)),
+            MaximumLength = checked((ushort)((leafName.Length + 1) * 2)),
+            Buffer = nameBuffer
+        };
+        var namePointer = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(UnicodeString)));
+        try
+        {
+            Marshal.StructureToPtr(name, namePointer, false);
+            var attributes = new ObjectAttributes
+            {
+                Length = Marshal.SizeOf(typeof(ObjectAttributes)),
+                RootDirectory = parentDirectory,
+                ObjectName = namePointer,
+                Attributes = 0x40,
+                SecurityDescriptor = IntPtr.Zero,
+                SecurityQualityOfService = IntPtr.Zero
+            };
+            IoStatusBlock status;
+            return NtCreateFile(
+                out directoryHandle,
+                0x001201FF,
+                ref attributes,
+                out status,
+                IntPtr.Zero,
+                0x00000010,
+                0x00000003,
+                FileOpenIf,
+                0x00200021,
+                IntPtr.Zero,
+                0);
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(namePointer);
+            Marshal.FreeHGlobal(nameBuffer);
+        }
+    }
 
     // FILE_RENAME_INFO is supplied to NtSetInformationFile with a verified
     // RootDirectory handle; no destination pathname is followed.
@@ -570,7 +774,8 @@ function Open-CutoverConfinedFile {
         [string]$AuthorizedRoot,
         [switch]$AllowDirectory,
         [switch]$AllowDirectoryWrite,
-        [switch]$ReadOnlyShare
+        [switch]$ReadOnlyShare,
+        [switch]$DenyDeleteShare
     )
 
     if ([System.IO.Path]::GetFileName($LiteralPath).Equals('session.json', [System.StringComparison]::OrdinalIgnoreCase)) {
@@ -584,12 +789,23 @@ function Open-CutoverConfinedFile {
     }
     $authorized = Normalize-CutoverAbsolutePath -LiteralPath $AuthorizedRoot -Label 'authorized root'
     Initialize-CutoverNativeMethods
-    $shareMode = 0x00000001 -bor 0x00000002 -bor 0x00000004
+    $shareMode = if ($ReadOnlyShare) {
+        0x00000001
+    }
+    elseif ($DenyDeleteShare) {
+        0x00000001 -bor 0x00000002
+    }
+    else {
+        0x00000001 -bor 0x00000002 -bor 0x00000004
+    }
     $flags = 0x00200000 -bor 0x02000000 # OPEN_REPARSE_POINT | BACKUP_SEMANTICS
     try {
         $desiredAccess = [uint32]2147483648
         if ($AllowDirectoryWrite) {
-            $desiredAccess = [uint32](2147483648 -bor 1073741824 -bor 65536)
+            $desiredAccess = [uint32](2147483648 -bor 1073741824)
+            if (-not $DenyDeleteShare) {
+                $desiredAccess = [uint32]($desiredAccess -bor 65536)
+            }
         }
         $rawHandle = [CutoverNativeMethods]::CreateFileW(
             $full,
@@ -645,6 +861,22 @@ function Compare-CutoverIdentity {
         [string]::Equals([string]$Before.finalPath, [string]$After.finalPath, [System.StringComparison]::OrdinalIgnoreCase)
 }
 
+function Compare-CutoverDirectoryIdentity {
+    param(
+        [Parameter(Mandatory = $true)][object]$Before,
+        [Parameter(Mandatory = $true)][object]$After
+    )
+
+    # Directory link metadata may change when this audit safely creates its
+    # evidence hierarchy. The stable directory identity is volume + file ID +
+    # directory type + final path; child-count metadata is not identity.
+    return $Before.volume -eq $After.volume -and
+        $Before.index -eq $After.index -and
+        (($Before.attributes -band 0x10) -ne 0) -and
+        (($After.attributes -band 0x10) -ne 0) -and
+        [string]::Equals([string]$Before.finalPath, [string]$After.finalPath, [System.StringComparison]::OrdinalIgnoreCase)
+}
+
 function Compare-CutoverStableFileIdentity {
     param(
         [Parameter(Mandatory = $true)][object]$Before,
@@ -660,56 +892,56 @@ function Compare-CutoverStableFileIdentity {
         [string]::Equals([string]$Before.finalPath, [string]$After.finalPath, [System.StringComparison]::OrdinalIgnoreCase)
 }
 
-function Open-CutoverConfinedWriteFile {
+function Open-CutoverRelativeWriteFile {
     param(
-        [Parameter(Mandatory = $true)][string]$LiteralPath,
+        [Parameter(Mandatory = $true)][System.IO.FileStream]$ParentStream,
+        [Parameter(Mandatory = $true)][string]$ParentPath,
+        [Parameter(Mandatory = $true)][string]$LeafName,
         [Parameter(Mandatory = $true)][string]$AuthorizedRoot
     )
 
     Assert-CutoverDeadline
-    $full = Normalize-CutoverAbsolutePath -LiteralPath $LiteralPath -Label 'filesystem path'
+    if ([string]::IsNullOrWhiteSpace($LeafName) -or
+        $LeafName -match '[\\/:\x00-\x1F\x7F]' -or
+        $LeafName -in @('.', '..')) {
+        throw 'relative report leaf name was rejected.'
+    }
+    $expectedPath = Normalize-CutoverAbsolutePath `
+        -LiteralPath (Join-Path $ParentPath $LeafName) `
+        -Label 'relative report path'
     $authorized = Normalize-CutoverAbsolutePath -LiteralPath $AuthorizedRoot -Label 'authorized root'
+    if (-not (Test-CutoverPathEqualsOrBeneath -Path $expectedPath -Ancestor $authorized)) {
+        throw 'relative report path escaped its authorized root.'
+    }
     Initialize-CutoverNativeMethods
-    $flags = ([uint32]35651584) -bor ([uint32]2147483648) -bor ([uint32]1073741824) # OPEN_REPARSE_POINT | BACKUP_SEMANTICS | WRITE_THROUGH | OVERLAPPED
-    try {
-        $rawHandle = [CutoverNativeMethods]::CreateFileW(
-            $full,
-            [uint32](1073741824 -bor 65536),
-            [uint32](1 -bor 2 -bor 4),
-            [IntPtr]::Zero,
-            [uint32]1,
-            [uint32]$flags,
-            [IntPtr]::Zero)
-    }
-    catch {
-        throw 'confined write handle open failed.'
-    }
-    if ($rawHandle -eq [IntPtr]::Zero -or $rawHandle -eq [IntPtr](-1)) {
-        throw 'confined write handle open failed.'
+    $rawHandle = [IntPtr]::Zero
+    $status = [CutoverNativeMethods]::CreateRelativeWriteFile(
+        $ParentStream.SafeFileHandle.DangerousGetHandle(),
+        $LeafName,
+        [ref]$rawHandle)
+    if ($status -lt 0 -or $rawHandle -eq [IntPtr]::Zero -or $rawHandle -eq [IntPtr](-1)) {
+        if ($rawHandle -ne [IntPtr]::Zero -and $rawHandle -ne [IntPtr](-1)) {
+            [Microsoft.Win32.SafeHandles.SafeFileHandle]::new($rawHandle, $true).Dispose()
+        }
+        throw 'relative confined write handle open failed.'
     }
     $safeHandle = [Microsoft.Win32.SafeHandles.SafeFileHandle]::new($rawHandle, $true)
     $stream = $null
     try {
-        $stream = [System.IO.FileStream]::new($safeHandle, [System.IO.FileAccess]::Write, 8192, $true)
+        $stream = [System.IO.FileStream]::new($safeHandle, [System.IO.FileAccess]::Write, 8192, $false)
         $identity = Get-CutoverHandleIdentity -Stream $stream
-        if (-not (Test-CutoverPathEqualsOrBeneath -Path $identity.finalPath -Ancestor $authorized)) {
-            throw 'opened write handle escaped the authorized root.'
+        if (-not [string]::Equals(
+                [string]$identity.finalPath,
+                [string]$expectedPath,
+                [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw 'relative report handle identity did not match its retained parent.'
         }
-        if (($identity.attributes -band 0x400) -ne 0) {
-            throw 'opened write handle is a reparse point.'
+        if (($identity.attributes -band 0x400) -ne 0 -or $identity.length -lt 0 -or $identity.links -gt 1) {
+            throw 'relative report handle identity was unsafe.'
         }
-        if ($identity.length -lt 0) {
-            throw 'opened write handle is a directory.'
-        }
-        if ($identity.links -gt 1) {
-            throw 'opened write handle is hard-linked.'
-        }
-        return [pscustomobject]@{ path = $full; stream = $stream; identity = $identity }
+        return [pscustomobject]@{ path = $expectedPath; stream = $stream; identity = $identity }
     }
     catch {
-        # CREATE_NEW means this handle is the only object this invocation may
-        # remove. Delete through the retained handle before closing it so a
-        # pathname race cannot strand a half-created report.
         try {
             $handle = if ($null -ne $stream) {
                 $stream.SafeFileHandle.DangerousGetHandle()
@@ -720,6 +952,141 @@ function Open-CutoverConfinedWriteFile {
         catch { }
         if ($null -ne $stream) { $stream.Dispose() } else { $safeHandle.Dispose() }
         throw
+    }
+}
+
+function Open-CutoverRelativeDirectory {
+    param(
+        [Parameter(Mandatory = $true)][System.IO.FileStream]$ParentStream,
+        [Parameter(Mandatory = $true)][string]$ParentPath,
+        [Parameter(Mandatory = $true)][string]$LeafName,
+        [Parameter(Mandatory = $true)][string]$AuthorizedRoot
+    )
+
+    Assert-CutoverDeadline
+    if ([string]::IsNullOrWhiteSpace($LeafName) -or
+        $LeafName -match '[\\/:\x00-\x1F\x7F]' -or
+        $LeafName -in @('.', '..') -or
+        $LeafName.EndsWith('.') -or
+        $LeafName.EndsWith(' ')) {
+        throw 'relative evidence directory leaf name was rejected.'
+    }
+    $expectedPath = Normalize-CutoverAbsolutePath `
+        -LiteralPath (Join-Path $ParentPath $LeafName) `
+        -Label 'relative evidence directory'
+    $authorized = Normalize-CutoverAbsolutePath -LiteralPath $AuthorizedRoot -Label 'authorized root'
+    if (-not (Test-CutoverPathEqualsOrBeneath -Path $expectedPath -Ancestor $authorized)) {
+        throw 'relative evidence directory escaped its authorized root.'
+    }
+
+    Initialize-CutoverNativeMethods
+    $rawHandle = [IntPtr]::Zero
+    $status = [CutoverNativeMethods]::CreateOrOpenRelativeDirectory(
+        $ParentStream.SafeFileHandle.DangerousGetHandle(),
+        $LeafName,
+        [ref]$rawHandle)
+    if ($status -lt 0 -or $rawHandle -eq [IntPtr]::Zero -or $rawHandle -eq [IntPtr](-1)) {
+        if ($rawHandle -ne [IntPtr]::Zero -and $rawHandle -ne [IntPtr](-1)) {
+            [Microsoft.Win32.SafeHandles.SafeFileHandle]::new($rawHandle, $true).Dispose()
+        }
+        throw 'relative evidence directory open failed.'
+    }
+
+    $safeHandle = [Microsoft.Win32.SafeHandles.SafeFileHandle]::new($rawHandle, $true)
+    $stream = $null
+    try {
+        $stream = [System.IO.FileStream]::new(
+            $safeHandle,
+            [System.IO.FileAccess]::ReadWrite,
+            8192,
+            $false)
+        $identity = Get-CutoverHandleIdentity -Stream $stream
+        if (-not [string]::Equals(
+                [string]$identity.finalPath,
+                [string]$expectedPath,
+                [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw 'relative evidence directory identity did not match its retained parent.'
+        }
+        if (($identity.attributes -band 0x10) -eq 0 -or
+            ($identity.attributes -band 0x400) -ne 0) {
+            throw 'relative evidence directory identity was unsafe.'
+        }
+        return [pscustomobject]@{
+            path = $expectedPath
+            stream = $stream
+            identity = $identity
+        }
+    }
+    catch {
+        if ($null -ne $stream) { $stream.Dispose() } else { $safeHandle.Dispose() }
+        throw
+    }
+}
+
+function Open-CutoverRelativeDirectoryChain {
+    param(
+        [Parameter(Mandatory = $true)][object]$RootHandle,
+        [Parameter(Mandatory = $true)][string]$RootPath,
+        [Parameter(Mandatory = $true)][string]$LiteralPath
+    )
+
+    Assert-CutoverDeadline
+    $normalizedRoot = Normalize-CutoverAbsolutePath -LiteralPath $RootPath -Label 'authorized root'
+    $target = Normalize-CutoverAbsolutePath -LiteralPath $LiteralPath -Label 'evidence directory'
+    if (-not (Test-CutoverPathEqualsOrBeneath -Path $target -Ancestor $normalizedRoot) -or
+        $target.Equals($normalizedRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw 'evidence directory must be strictly beneath the authorized root.'
+    }
+    $relative = [System.IO.Path]::GetRelativePath($normalizedRoot, $target)
+    $parts = @($relative.Split(
+            [char[]]@('\', '/'),
+            [System.StringSplitOptions]::RemoveEmptyEntries))
+    if ($parts.Count -eq 0) {
+        throw 'evidence directory chain was empty.'
+    }
+
+    $handles = New-Object 'System.Collections.Generic.List[object]'
+    $parentStream = $RootHandle.stream
+    $parentPath = $normalizedRoot
+    try {
+        foreach ($part in $parts) {
+            Assert-CutoverDeadline
+            $opened = Open-CutoverRelativeDirectory `
+                -ParentStream $parentStream `
+                -ParentPath $parentPath `
+                -LeafName ([string]$part) `
+                -AuthorizedRoot $normalizedRoot
+            $handles.Add($opened)
+            $parentStream = $opened.stream
+            $parentPath = $opened.path
+        }
+        $final = $handles[$handles.Count - 1]
+        return [pscustomobject]@{
+            path = $final.path
+            stream = $final.stream
+            identity = $final.identity
+            chainHandles = @($handles.ToArray())
+        }
+    }
+    catch {
+        for ($index = $handles.Count - 1; $index -ge 0; $index--) {
+            try { $handles[$index].stream.Dispose() } catch { }
+        }
+        throw
+    }
+}
+
+function Close-CutoverPublicationHandles {
+    if ($null -ne $reportDirectoryHandle) {
+        $chain = @($reportDirectoryHandle.chainHandles)
+        for ($index = $chain.Count - 1; $index -ge 0; $index--) {
+            try { $chain[$index].stream.Dispose() } catch { }
+        }
+        $script:reportDirectoryHandle = $null
+    }
+    if ($null -ne $rootDirectoryHandle) {
+        try { $rootDirectoryHandle.stream.Dispose() } catch { }
+        $script:rootDirectoryHandle = $null
     }
 }
 
@@ -746,6 +1113,20 @@ function Assert-CutoverDeadline {
     }
 }
 
+function Assert-CutoverWorkDeadline {
+    if ((Get-CutoverDeadlineRemainingMilliseconds) -le $workDeadlineReserveMs) {
+        Add-SafetyBound
+        throw 'audit work deadline reached its bounded publication reserve.'
+    }
+}
+
+function Assert-CutoverProcessStartDeadline {
+    if ((Get-CutoverDeadlineRemainingMilliseconds) -le $processWorkDeadlineReserveMs) {
+        Add-SafetyBound
+        throw 'audit process start reached its bounded settlement and publication reserve.'
+    }
+}
+
 function Read-CutoverStreamBytes {
     param(
         [Parameter(Mandatory = $true)][System.IO.Stream]$Stream,
@@ -753,30 +1134,41 @@ function Read-CutoverStreamBytes {
         [Parameter(Mandatory = $true)][string]$Label
     )
 
-    Assert-CutoverDeadline
-    $bytes = New-Object 'System.Collections.Generic.List[byte]'
-    $buffer = New-Object byte[] 8192
-    while ($true) {
-        Assert-CutoverDeadline
-        $remaining = [Math]::Min($buffer.Length, [int]($MaxBytes + 1 - $bytes.Count))
-        if ($remaining -le 0) {
-            Add-SafetyBound
-            throw "${Label} exceeds the bounded input byte limit."
-        }
-        $task = $Stream.ReadAsync($buffer, 0, $remaining)
-        $waitMs = Get-CutoverDeadlineRemainingMilliseconds
-        if ($waitMs -le 0 -or -not $task.Wait($waitMs)) {
-            throw 'audit deadline exceeded while reading a file.'
-        }
-        $read = $task.Result
-        if ($read -le 0) { break }
-        for ($offset = 0; $offset -lt $read; $offset++) { $bytes.Add($buffer[$offset]) }
-        if ($bytes.Count -gt $MaxBytes) {
-            Add-SafetyBound
-            throw "${Label} exceeds the bounded input byte limit."
-        }
+    if ($MaxBytes -le 0 -or $MaxBytes -gt [int32]::MaxValue) {
+        throw "${Label} byte limit cannot be represented safely."
     }
-    return ,([byte[]]$bytes.ToArray())
+    Assert-CutoverWorkDeadline
+    $bytes = [System.IO.MemoryStream]::new()
+    $buffer = New-Object byte[] 8192
+    try {
+        while ($true) {
+            Assert-CutoverWorkDeadline
+            $remainingAllowed = $MaxBytes - $bytes.Length
+            $requestBytes = [int][Math]::Min([int64]$buffer.Length, $remainingAllowed + 1)
+            if ($requestBytes -le 0) {
+                Add-SafetyBound
+                throw "${Label} exceeds the bounded input byte limit."
+            }
+            $task = $Stream.ReadAsync($buffer, 0, $requestBytes)
+            $waitMs = (Get-CutoverDeadlineRemainingMilliseconds) - $workDeadlineReserveMs
+            if ($waitMs -le 0 -or -not $task.Wait($waitMs)) {
+                Add-SafetyBound
+                throw 'audit work deadline reached while reading a file.'
+            }
+            $read = $task.Result
+            if ($read -le 0) { break }
+            if ($read -gt $remainingAllowed) {
+                Add-SafetyBound
+                throw "${Label} exceeds the bounded input byte limit."
+            }
+            # MemoryStream performs one bounded block copy. The prior check is
+            # deliberately before accumulation, so MaxBytes + 1 is observed
+            # but never retained in the audit's in-memory input.
+            $bytes.Write($buffer, 0, $read)
+        }
+        return ,([byte[]]$bytes.ToArray())
+    }
+    finally { $bytes.Dispose() }
 }
 
 function Read-CutoverConfinedUtf8 {
@@ -808,6 +1200,273 @@ function Read-CutoverConfinedUtf8 {
     finally {
         $opened.stream.Dispose()
     }
+}
+
+function ConvertTo-CutoverCanonicalJson {
+    param(
+        [AllowNull()][object]$Value,
+        [string]$Path = '$',
+        [Parameter(Mandatory = $true)][hashtable]$State,
+        [switch]$IgnoreBrowserActivityFields
+    )
+
+    Assert-CutoverWorkDeadline
+    $State.nodes++
+    if ($State.nodes -gt 8192 -or $Path.Length -gt 1024) {
+        throw 'remote change evidence exceeded its bounded semantic shape.'
+    }
+    if ($null -eq $Value) { return 'null' }
+
+    if ($Value -is [System.Array] -or
+        ($Value -is [System.Collections.IList] -and $Value -isnot [string])) {
+        $parts = New-Object 'System.Collections.Generic.List[string]'
+        $values = @($Value)
+        if ($values.Count -gt 1024) {
+            throw 'remote change evidence array exceeded its bounded count.'
+        }
+        for ($index = 0; $index -lt $values.Count; $index++) {
+            $parts.Add((ConvertTo-CutoverCanonicalJson `
+                        -Value $values[$index] `
+                        -Path "$Path[$index]" `
+                        -State $State `
+                        -IgnoreBrowserActivityFields:$IgnoreBrowserActivityFields))
+        }
+        return '[' + ($parts -join ',') + ']'
+    }
+
+    if ($Value -is [pscustomobject] -or $Value -is [System.Collections.IDictionary]) {
+        $properties = if ($Value -is [System.Collections.IDictionary]) {
+            @($Value.Keys | ForEach-Object {
+                    [pscustomobject]@{ Name = [string]$_; Value = $Value[$_] }
+                })
+        }
+        else { @($Value.PSObject.Properties) }
+        if ($properties.Count -gt 256) {
+            throw 'remote change evidence object exceeded its bounded property count.'
+        }
+        $names = @($properties | ForEach-Object { [string]$_.Name })
+        [Array]::Sort($names, [System.StringComparer]::Ordinal)
+        $parts = New-Object 'System.Collections.Generic.List[string]'
+        foreach ($name in $names) {
+            $skip = $false
+            if ($IgnoreBrowserActivityFields) {
+                if ($Path -eq '$.host.web' -and $name -eq 'activityLog') {
+                    $skip = $true
+                }
+                elseif ($Path -match '^\$\.host\.web\.pairedClients\[[0-9]+\]$' -and
+                    $name -in @('lastSeenEpochMs', 'lastSeenIp')) {
+                    $skip = $true
+                }
+            }
+            if ($skip) { continue }
+            $property = @($properties | Where-Object { [string]$_.Name -ceq $name })
+            if ($property.Count -ne 1) {
+                throw 'remote change evidence contained duplicate properties.'
+            }
+            $encodedName = [string]($name | ConvertTo-Json -Compress)
+            $encodedValue = ConvertTo-CutoverCanonicalJson `
+                -Value $property[0].Value `
+                -Path "$Path.$name" `
+                -State $State `
+                -IgnoreBrowserActivityFields:$IgnoreBrowserActivityFields
+            $parts.Add("${encodedName}:${encodedValue}")
+        }
+        return '{' + ($parts -join ',') + '}'
+    }
+
+    if ($Value -is [string] -or $Value -is [bool] -or
+        $Value -is [byte] -or $Value -is [sbyte] -or
+        $Value -is [int16] -or $Value -is [uint16] -or
+        $Value -is [int32] -or $Value -is [uint32] -or
+        $Value -is [int64] -or $Value -is [uint64] -or
+        $Value -is [single] -or $Value -is [double] -or $Value -is [decimal]) {
+        return [string]($Value | ConvertTo-Json -Compress)
+    }
+    throw 'remote change evidence contained an unsupported JSON value.'
+}
+
+function Test-CutoverCanonicalJsonEqual {
+    param(
+        [AllowNull()][object]$Left,
+        [AllowNull()][object]$Right,
+        [switch]$IgnoreBrowserActivityFields
+    )
+
+    $leftState = @{ nodes = 0 }
+    $rightState = @{ nodes = 0 }
+    $leftJson = ConvertTo-CutoverCanonicalJson `
+        -Value $Left `
+        -State $leftState `
+        -IgnoreBrowserActivityFields:$IgnoreBrowserActivityFields
+    $rightJson = ConvertTo-CutoverCanonicalJson `
+        -Value $Right `
+        -State $rightState `
+        -IgnoreBrowserActivityFields:$IgnoreBrowserActivityFields
+    return [string]::Equals($leftJson, $rightJson, [System.StringComparison]::Ordinal)
+}
+
+function Test-CutoverBrowserActivityEvent {
+    param([AllowNull()][object]$Event)
+
+    if ($null -eq $Event -or $Event -isnot [pscustomobject]) { return $false }
+    $eventProperties = @($Event.PSObject.Properties | ForEach-Object { [string]$_.Name })
+    $allowedEventProperties = @(
+        'clientId', 'source', 'eventKind', 'label', 'ipAddress', 'eventAtEpochMs',
+        'browserFamily', 'browserVersion', 'osFamily', 'deviceClass'
+    )
+    return @($eventProperties | Where-Object { $_ -notin $allowedEventProperties }).Count -eq 0 -and
+        [string](Get-ContractProperty -Object $Event -Name 'source') -eq 'browser' -and
+        [string](Get-ContractProperty -Object $Event -Name 'eventKind') -in @('paired', 'connected', 'reconnected')
+}
+
+function Get-CutoverRemoteChangeAttribution {
+    param([Parameter(Mandatory = $true)][string]$EvidencePath)
+
+    # This is an offline, read-only semantic classifier for generated audit
+    # evidence. It is intentionally unavailable to the normal candidate audit
+    # and never opens production remote.json. The report emits only fixed
+    # category labels: IDs, IPs, process IDs, start times, and credentials are
+    # neither copied nor logged.
+    if ($authorizedRootKind -ne 'authenticated-fixture') {
+        throw 'remote change attribution is restricted to an authenticated fixture.'
+    }
+    $path = Normalize-CutoverAbsolutePath -LiteralPath $EvidencePath -Label 'remote change evidence path'
+    if (-not (Test-CutoverPathEqualsOrBeneath -Path $path -Ancestor $rootPath)) {
+        throw 'remote change evidence escaped the authenticated fixture.'
+    }
+    $path = Assert-CutoverConfinedPath -LiteralPath $path -AncestorPath $rootPath
+    $source = Read-CutoverConfinedUtf8 `
+        -LiteralPath $path `
+        -MaxBytes 131072 `
+        -Label 'remote change evidence'
+    Assert-CutoverWorkDeadline
+    try { $evidence = $source | ConvertFrom-Json -Depth 40 }
+    catch { throw 'remote change evidence was not valid bounded JSON.' }
+    Assert-CutoverWorkDeadline
+    if ((Get-ContractProperty -Object $evidence -Name 'schemaVersion') -ne 1) {
+        throw 'remote change evidence schema was unsupported.'
+    }
+    $before = Get-ContractProperty -Object $evidence -Name 'before'
+    $after = Get-ContractProperty -Object $evidence -Name 'after'
+    if ($null -eq $before -or $null -eq $after) {
+        throw 'remote change evidence snapshots were missing.'
+    }
+
+    $writerEvidence = Get-ContractProperty -Object $evidence -Name 'writer'
+    $writerVerified =
+        (Get-ContractProperty -Object $writerEvidence -Name 'installedDevManagerImageAttested') -eq $true -and
+        (Get-ContractProperty -Object $writerEvidence -Name 'processIdMatched') -eq $true -and
+        (Get-ContractProperty -Object $writerEvidence -Name 'creationTimeMatched') -eq $true
+    $writer = if ($writerVerified) {
+        'verified-installed-app-generation'
+    }
+    else { 'unverified' }
+
+    if (Test-CutoverCanonicalJsonEqual -Left $before -Right $after) {
+        return [pscustomobject]([ordered]@{
+                evaluated = $true
+                classification = 'unchanged'
+                writer = $writer
+                changedCategories = @()
+            })
+    }
+
+    $categories = New-Object 'System.Collections.Generic.List[string]'
+    $protectedChanged = -not (Test-CutoverCanonicalJsonEqual `
+            -Left $before `
+            -Right $after `
+            -IgnoreBrowserActivityFields)
+
+    $beforeHost = Get-ContractProperty -Object $before -Name 'host'
+    $afterHost = Get-ContractProperty -Object $after -Name 'host'
+    $beforeWeb = Get-ContractProperty -Object $beforeHost -Name 'web'
+    $afterWeb = Get-ContractProperty -Object $afterHost -Name 'web'
+    $beforeActivity = @(Get-ContractArray (Get-ContractProperty -Object $beforeWeb -Name 'activityLog'))
+    $afterActivity = @(Get-ContractArray (Get-ContractProperty -Object $afterWeb -Name 'activityLog'))
+    $activityChanged = $false
+    $activityRelationValid = $false
+    $maxActivityAppend = 8
+    if ($beforeActivity.Count -le 100 -and $afterActivity.Count -le 100) {
+        # The installed app appends browser events to a 100-entry bounded log.
+        # At capacity, one append legitimately drops the oldest entry. Accept
+        # only a small suffix-preserving trim followed by a small validated
+        # append; arbitrary rewrites remain protected/unclassified.
+        $maxDropped = [Math]::Min($maxActivityAppend, $beforeActivity.Count)
+        for ($dropped = 0; $dropped -le $maxDropped; $dropped++) {
+            $preserved = $beforeActivity.Count - $dropped
+            $appended = $afterActivity.Count - $preserved
+            if ($appended -lt 0 -or $appended -gt $maxActivityAppend -or
+                ($dropped -gt 0 -and $appended -eq 0)) { continue }
+            $requiredCapacityDrop = [Math]::Max(
+                0,
+                $beforeActivity.Count + $appended - 100)
+            if ($dropped -ne $requiredCapacityDrop) { continue }
+            $matches = $true
+            for ($index = 0; $index -lt $preserved; $index++) {
+                if (-not (Test-CutoverCanonicalJsonEqual `
+                            -Left $beforeActivity[$index + $dropped] `
+                            -Right $afterActivity[$index])) {
+                    $matches = $false
+                    break
+                }
+            }
+            if (-not $matches) { continue }
+            for ($index = $preserved; $index -lt $afterActivity.Count; $index++) {
+                if (-not (Test-CutoverBrowserActivityEvent -Event $afterActivity[$index])) {
+                    $matches = $false
+                    break
+                }
+            }
+            if ($matches) {
+                $activityRelationValid = $true
+                $activityChanged = $dropped -gt 0 -or $appended -gt 0
+                break
+            }
+        }
+    }
+    if (-not $activityRelationValid) { $protectedChanged = $true }
+    if ($activityChanged) { $categories.Add('browser-activity-log') }
+
+    $beforeClients = @(Get-ContractArray (Get-ContractProperty -Object $beforeWeb -Name 'pairedClients'))
+    $afterClients = @(Get-ContractArray (Get-ContractProperty -Object $afterWeb -Name 'pairedClients'))
+    $lastSeenChanged = $false
+    if ($beforeClients.Count -ne $afterClients.Count -or $beforeClients.Count -gt 256) {
+        $protectedChanged = $true
+    }
+    else {
+        for ($index = 0; $index -lt $beforeClients.Count; $index++) {
+            $beforeEpoch = Get-ContractProperty -Object $beforeClients[$index] -Name 'lastSeenEpochMs'
+            $afterEpoch = Get-ContractProperty -Object $afterClients[$index] -Name 'lastSeenEpochMs'
+            $beforeIp = Get-ContractProperty -Object $beforeClients[$index] -Name 'lastSeenIp'
+            $afterIp = Get-ContractProperty -Object $afterClients[$index] -Name 'lastSeenIp'
+            if (-not (Test-CutoverCanonicalJsonEqual -Left $beforeEpoch -Right $afterEpoch) -or
+                -not (Test-CutoverCanonicalJsonEqual -Left $beforeIp -Right $afterIp)) {
+                $lastSeenChanged = $true
+                if ($null -eq $afterEpoch -or
+                    ($null -ne $beforeEpoch -and [uint64]$afterEpoch -lt [uint64]$beforeEpoch)) {
+                    $protectedChanged = $true
+                }
+            }
+        }
+    }
+    if ($lastSeenChanged) { $categories.Add('browser-last-seen') }
+
+    if ($protectedChanged -or (-not $activityChanged -and -not $lastSeenChanged)) {
+        $categories.Add('protected-or-unclassified')
+        $classification = 'protected-or-unclassified-change'
+    }
+    elseif ($writerVerified) {
+        $classification = 'authorized-installed-app-browser-activity'
+    }
+    else {
+        $classification = 'browser-activity-unattributed'
+    }
+    return [pscustomobject]([ordered]@{
+            evaluated = $true
+            classification = $classification
+            writer = $writer
+            changedCategories = @($categories.ToArray())
+        })
 }
 
 function Read-CutoverScanBytes {
@@ -843,32 +1502,6 @@ function Get-CutoverSha256Hex {
     finally {
         $sha.Dispose()
     }
-}
-
-function Ensure-CutoverAuditDirectory {
-    param([Parameter(Mandatory = $true)][string]$LiteralPath)
-
-    Assert-CutoverDeadline
-    $full = Normalize-CutoverAbsolutePath -LiteralPath $LiteralPath -Label 'directory path'
-    $root = [System.IO.Path]::GetPathRoot($full)
-    $relative = if ($full.Length -gt $root.Length) { $full.Substring($root.Length) } else { '' }
-    $parts = @($relative.Split([char[]]@('\', '/'), [System.StringSplitOptions]::RemoveEmptyEntries))
-    $current = $root.TrimEnd('\', '/')
-    foreach ($part in $parts) {
-        Assert-CutoverDeadline
-        $current = Join-Path $current $part
-        $item = Get-Item -LiteralPath $current -Force -ErrorAction SilentlyContinue
-        if ($null -eq $item) {
-            Assert-CutoverDeadline
-            [System.IO.Directory]::CreateDirectory($current) | Out-Null
-            $item = Get-Item -LiteralPath $current -Force
-        }
-        if ($item -isnot [System.IO.DirectoryInfo] -or ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
-            throw "directory path contains a non-directory or reparse component: '$current'."
-        }
-    }
-    Assert-CutoverPathChain -LiteralPath $full | Out-Null
-    return $full
 }
 
 function Assert-CutoverConfinedPath {
@@ -980,7 +1613,11 @@ function Get-CutoverGitIdentity {
     }
     if (-not $result.Success) { throw 'git identity process failed.' }
     if ($result.ExitCode -ne 0) { throw 'git identity returned nonzero.' }
-    $lines = Read-CutoverUtf8Lines -Bytes $result.StandardOutput -MaxLines $maxGitIdentityLines
+    $lines = Read-CutoverUtf8Lines `
+        -Bytes $result.StandardOutput `
+        -MaxBytes 16384 `
+        -MaxLines $maxGitIdentityLines `
+        -MaxLineChars $maxEnvironmentEntryChars
     $lines = @($lines | Where-Object { $_ -ne '' })
     if ($lines.Count -ne 3 -or $lines[2] -ne 'true') { throw 'git worktree identity was malformed.' }
     $top = Normalize-CutoverAbsolutePath -LiteralPath ([string]$lines[0]) -Label 'git worktree root'
@@ -1041,7 +1678,13 @@ function Assert-CutoverAuthorizedRoot {
     # still publish a bounded HOLD report inside this already-authorized root;
     # it must not silently turn a process failure into a no-report failure.
     $script:rootPath = $requested
-    $script:rootIdentity = Get-CutoverPathIdentity -LiteralPath $script:rootPath -AllowDirectory
+    $script:rootDirectoryHandle = Open-CutoverConfinedFile `
+        -LiteralPath $script:rootPath `
+        -AuthorizedRoot $script:rootPath `
+        -AllowDirectory `
+        -AllowDirectoryWrite `
+        -DenyDeleteShare
+    $script:rootIdentity = $script:rootDirectoryHandle.identity
     try {
         $script:gitIdentity = Get-CutoverGitIdentity -RepositoryRoot $script:rootPath
     }
@@ -1058,6 +1701,47 @@ function Assert-CutoverAuthorizedRoot {
     return $script:rootPath
 }
 
+function Get-CutoverCanonicalInstalledExecutableCandidates {
+    param([Parameter(Mandatory = $true)][string]$LeafName)
+
+    if ($LeafName -notin @('git.exe', 'rg.exe')) {
+        throw 'canonical tool candidate name was rejected.'
+    }
+    $programFiles = [Environment]::GetFolderPath([Environment+SpecialFolder]::ProgramFiles)
+    $programFilesX86 = [Environment]::GetFolderPath([Environment+SpecialFolder]::ProgramFilesX86)
+    $localAppData = [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
+    $localPrograms = if ([string]::IsNullOrWhiteSpace($localAppData)) {
+        $null
+    }
+    else {
+        Join-Path $localAppData 'Programs'
+    }
+    # Keep the accepted install surface exact. These trusted tool roots are
+    # expanded into canonical executable paths; a broad "under Program Files"
+    # check would still allow an unrelated executable inside that directory.
+    $trustedRoots = @($programFiles, $programFilesX86, $localPrograms) |
+        Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }
+    $trustedExecutables = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($trustedRoot in $trustedRoots) {
+        $paths = if ($LeafName -eq 'git.exe') {
+            @(
+                (Join-Path $trustedRoot 'Git\bin\git.exe'),
+                (Join-Path $trustedRoot 'Git\cmd\git.exe'),
+                (Join-Path $trustedRoot 'Git\mingw64\bin\git.exe'),
+                (Join-Path $trustedRoot 'Git\mingw64\libexec\git-core\git.exe')
+            )
+        }
+        else {
+            @(
+                (Join-Path $trustedRoot 'ripgrep\rg.exe'),
+                (Join-Path $trustedRoot 'ripgrep\bin\rg.exe')
+            )
+        }
+        foreach ($path in $paths) { $null = $trustedExecutables.Add($path) }
+    }
+    return @($trustedExecutables.ToArray())
+}
+
 function Test-CutoverTrustedExecutablePath {
     param(
         [Parameter(Mandatory = $true)][string]$ExecutablePath,
@@ -1065,71 +1749,20 @@ function Test-CutoverTrustedExecutablePath {
     )
 
     $full = Normalize-CutoverAbsolutePath -LiteralPath $ExecutablePath -Label 'resolved process executable'
-    $lower = $full.ToLowerInvariant()
     if (-not $full.EndsWith("\$LeafName", [System.StringComparison]::OrdinalIgnoreCase)) {
         return $false
     }
 
-    # Git for Windows is installed under one of these machine/user toolchain
-    # roots.  For rg, only the known provider vendored copies or a dedicated
-    # ripgrep installation are trusted.  A candidate audit never accepts the
-    # first executable supplied by an ambient PATH directory.
-    $programFiles = [Environment]::GetFolderPath('ProgramFiles')
-    $programFilesX86 = [Environment]::GetEnvironmentVariable('ProgramFiles(x86)')
-    $localAppData = [Environment]::GetFolderPath('LocalApplicationData')
-    $localPrograms = if ([string]::IsNullOrWhiteSpace($localAppData)) {
-        $null
-    }
-    else {
-        Join-Path $localAppData 'Programs'
-    }
-    $userProfile = [Environment]::GetFolderPath('UserProfile')
-    # Keep the accepted install surface exact. These trusted tool roots are
-    # expanded to exact executable paths; a broad "under Program Files"
-    # check would still allow a different git.exe dropped somewhere inside a
-    # trusted vendor directory.
-    $trustedRoots = @($programFiles, $programFilesX86, $localPrograms) |
-        Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }
-    $trustedExecutables = New-Object 'System.Collections.Generic.List[string]'
-    foreach ($trustedRoot in $trustedRoots) {
-        $paths = if ($LeafName -eq 'git.exe') {
-            @(
-                (Join-Path $trustedRoot 'Git\cmd\git.exe'),
-                (Join-Path $trustedRoot 'Git\mingw64\bin\git.exe')
-            )
-        }
-        else {
-            @((Join-Path $trustedRoot 'ripgrep\rg.exe'))
-        }
-        foreach ($path in $paths) { $null = $trustedExecutables.Add($path) }
-    }
-    if ($LeafName -eq 'rg.exe' -and -not [string]::IsNullOrWhiteSpace($userProfile)) {
-        $null = $trustedExecutables.Add(
-            (Join-Path $userProfile 'scoop\apps\ripgrep\current\rg.exe'))
-    }
-    foreach ($trustedExecutable in $trustedExecutables) {
-        if ([string]::IsNullOrWhiteSpace($trustedExecutable)) { continue }
+    foreach ($trustedExecutable in @(Get-CutoverCanonicalInstalledExecutableCandidates -LeafName $LeafName)) {
+        if ([string]::IsNullOrWhiteSpace([string]$trustedExecutable)) { continue }
         try {
             $normalizedTrusted = Normalize-CutoverAbsolutePath `
                 -LiteralPath $trustedExecutable -Label 'trusted tool executable'
-            if ([string]::Equals(
-                    $full,
-                    $normalizedTrusted,
-                    [System.StringComparison]::OrdinalIgnoreCase)) {
+            if ([string]::Equals($full, $normalizedTrusted, [System.StringComparison]::OrdinalIgnoreCase)) {
                 return $true
             }
         }
         catch { }
-    }
-
-    # Codex and Claude ship their own rg. Their install roots are not fixed,
-    # but their package identity is. The path chain is still checked below;
-    # this suffix check prevents an arbitrary npm-cache executable from being
-    # promoted to an audit authority.
-    if ($LeafName -eq 'rg.exe' -and
-        (($lower -match '\\node_modules\\@openai\\codex-[^\\]+\\vendor\\[^\\]+\\codex-path\\rg\.exe$') -or
-         ($lower -match '\\node_modules\\@anthropic-ai\\claude-code\\vendor\\ripgrep\\[^\\]+\\rg\.exe$'))) {
-        return $true
     }
     return $false
 }
@@ -1149,21 +1782,20 @@ function Get-CutoverTrustedExecutable {
         $FileName
     }
     else { "$FileName.exe" }
-    $rawPath = [Environment]::GetEnvironmentVariable('PATH')
-    if ([string]::IsNullOrEmpty($rawPath) -or
-        $rawPath.Length -gt ($maxEnvironmentPathEntries * $maxEnvironmentPathChars)) {
-        throw 'process PATH exceeded its bounded resolution size.'
-    }
-    $pathEntries = @($rawPath.Split(';'))
-    if ($pathEntries.Count -gt $maxEnvironmentPathEntries) {
-        throw 'process PATH exceeded its bounded entry count.'
-    }
-
     $candidatePaths = New-Object 'System.Collections.Generic.List[string]'
     if ($authorizedRootKind -eq 'authenticated-fixture') {
         # Fixture-only shims are deliberately available for negative tests, but
         # only after the per-fixture authority has been verified. They can never
         # be selected for the normal candidate worktree.
+        $rawPath = [Environment]::GetEnvironmentVariable('PATH')
+        if ([string]::IsNullOrEmpty($rawPath) -or
+            $rawPath.Length -gt ($maxEnvironmentPathEntries * $maxEnvironmentPathChars)) {
+            throw 'fixture process PATH exceeded its bounded resolution size.'
+        }
+        $pathEntries = @($rawPath.Split(';'))
+        if ($pathEntries.Count -gt $maxEnvironmentPathEntries) {
+            throw 'fixture process PATH exceeded its bounded entry count.'
+        }
         foreach ($directory in $pathEntries) {
             Assert-CutoverDeadline
             if ([string]::IsNullOrWhiteSpace($directory)) { continue }
@@ -1178,53 +1810,10 @@ function Get-CutoverTrustedExecutable {
         }
     }
     else {
-        # Enumerate PATH only as an input to the package-identity filter. The
-        # first ambient match is never trusted; candidate paths are accepted
-        # only when Test-CutoverTrustedExecutablePath recognizes their install.
-        foreach ($directory in $pathEntries) {
-            Assert-CutoverDeadline
-            if ([string]::IsNullOrWhiteSpace($directory) -or
-                $directory.Length -gt $maxEnvironmentPathChars) { continue }
-            try {
-                $fullDirectory = Normalize-CutoverAbsolutePath -LiteralPath $directory -Label 'tool PATH entry'
-                $candidate = Normalize-CutoverAbsolutePath `
-                    -LiteralPath (Join-Path $fullDirectory $leaf) `
-                    -Label 'trusted process executable'
-                if ([System.IO.File]::Exists($candidate) -and
-                    (Test-CutoverTrustedExecutablePath -ExecutablePath $candidate -LeafName $leaf)) {
-                    $null = $candidatePaths.Add($candidate)
-                }
-            }
-            catch { }
-        }
-        # Include the conventional installation paths even when their parent
-        # directories are not present in PATH.
-        $programFiles = [Environment]::GetFolderPath('ProgramFiles')
-        $programFilesX86 = [Environment]::GetEnvironmentVariable('ProgramFiles(x86)')
-        $localAppData = [Environment]::GetFolderPath('LocalApplicationData')
-        $localPrograms = if ([string]::IsNullOrWhiteSpace($localAppData)) {
-            $null
-        }
-        else {
-            Join-Path $localAppData 'Programs'
-        }
-        $userProfile = [Environment]::GetFolderPath('UserProfile')
-        $fixed = New-Object 'System.Collections.Generic.List[string]'
-        $fixedRoots = @($programFiles, $programFilesX86, $localPrograms) |
-            Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }
-        foreach ($fixedRoot in $fixedRoots) {
-            if ($leaf -eq 'git.exe') {
-                $null = $fixed.Add((Join-Path $fixedRoot 'Git\cmd\git.exe'))
-                $null = $fixed.Add((Join-Path $fixedRoot 'Git\mingw64\bin\git.exe'))
-            }
-            else {
-                $null = $fixed.Add((Join-Path $fixedRoot 'ripgrep\rg.exe'))
-            }
-        }
-        if ($leaf -eq 'rg.exe' -and -not [string]::IsNullOrWhiteSpace($userProfile)) {
-            $null = $fixed.Add((Join-Path $userProfile 'scoop\apps\ripgrep\current\rg.exe'))
-        }
-        foreach ($candidate in $fixed) {
+        # Candidate audits never enumerate ambient PATH. Only explicit trusted
+        # tool root candidates are considered, and the executed image is
+        # attested again from its process handle after CreateProcessW.
+        foreach ($candidate in @(Get-CutoverCanonicalInstalledExecutableCandidates -LeafName $leaf)) {
             if (-not [string]::IsNullOrWhiteSpace($candidate)) { $null = $candidatePaths.Add($candidate) }
         }
     }
@@ -1293,8 +1882,14 @@ function Get-CutoverProcessEnvironment {
     param([Parameter(Mandatory = $true)][string]$ResolvedExecutable)
 
     # Child processes receive a deliberately small, canonical environment.
-    # Parent PATH is consulted only by Resolve-CutoverExecutable before this
-    # function; it cannot substitute a different executable at spawn time.
+    # Parent PATH is consulted only for an authenticated test fixture; a
+    # candidate audit receives a canonical absolute executable image.
+    $windowsRoot = [Environment]::GetFolderPath([Environment+SpecialFolder]::Windows)
+    $systemDirectory = [Environment]::SystemDirectory
+    if ([string]::IsNullOrWhiteSpace($windowsRoot) -or
+        [string]::IsNullOrWhiteSpace($systemDirectory)) {
+        throw 'canonical Windows directories were unavailable.'
+    }
     $pathDirectories = New-Object 'System.Collections.Generic.List[string]'
     $addPathDirectory = {
         param([string]$Directory)
@@ -1315,16 +1910,9 @@ function Get-CutoverProcessEnvironment {
         }
     }
     & $addPathDirectory (Split-Path -Parent $ResolvedExecutable)
-    & $addPathDirectory (Join-Path $env:SystemRoot 'System32')
-    & $addPathDirectory $env:SystemRoot
-    & $addPathDirectory (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0')
-    try {
-        $pwsh = Get-Command pwsh.exe -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($null -ne $pwsh -and -not [string]::IsNullOrWhiteSpace([string]$pwsh.Source)) {
-            & $addPathDirectory (Split-Path -Parent ([string]$pwsh.Source))
-        }
-    }
-    catch { }
+    & $addPathDirectory $systemDirectory
+    & $addPathDirectory $windowsRoot
+    & $addPathDirectory (Join-Path $systemDirectory 'WindowsPowerShell\v1.0')
 
     # Authenticated generated fixtures may place their shim directory at the
     # front of PATH. Every entry remains bounded and canonicalized; no other
@@ -1365,11 +1953,9 @@ function Get-CutoverProcessEnvironment {
             -Value $Value `
             -AllowEmptyValue:$AllowEmptyValue
     }
-    & $add 'SystemRoot' ([string]$env:SystemRoot)
-    & $add 'WINDIR' ([string]$env:WINDIR)
-    & $add 'TEMP' ([string]$env:TEMP)
-    & $add 'TMP' ([string]$env:TMP)
-    & $add 'COMSPEC' ([string]$env:ComSpec)
+    & $add 'SystemRoot' $windowsRoot
+    & $add 'WINDIR' $windowsRoot
+    & $add 'COMSPEC' (Join-Path $systemDirectory 'cmd.exe')
     & $add 'PATHEXT' '.COM;.EXE;.BAT;.CMD'
     & $add 'PATH' $pathValue
     & $add 'LANG' 'C'
@@ -1389,14 +1975,15 @@ function Get-CutoverProcessEnvironment {
     & $add 'GIT_CONFIG_KEY_3' 'protocol.file.allow'
     & $add 'GIT_CONFIG_VALUE_3' 'never'
 
-    # Generated fixture shims are opt-in and use the same canonical allowlist
-    # for every selected passthrough name. Any secret-shaped name is rejected
-    # rather than copied accidentally.
-    foreach ($name in $allowedFixtureEnvironmentNames) {
-        Assert-CutoverDeadline
-        $value = [Environment]::GetEnvironmentVariable($name)
-        if ($null -ne $value) {
-            & $add $name ([string]$value) -AllowEmptyValue
+    # Authenticated fixture-only environment controls use the same canonical
+    # allowlist. They are never copied into a candidate audit child.
+    if ($authorizedRootKind -eq 'authenticated-fixture') {
+        foreach ($name in $allowedFixtureEnvironmentNames) {
+            Assert-CutoverDeadline
+            $value = [Environment]::GetEnvironmentVariable($name)
+            if ($null -ne $value) {
+                & $add $name ([string]$value) -AllowEmptyValue
+            }
         }
     }
     return @($environment.ToArray())
@@ -1516,7 +2103,10 @@ function Read-CutoverContract {
         -Label 'cutover ledger'
     $jsonText = Read-CutoverContractLines -Source $jsonSource
     try {
-        return ($jsonText | ConvertFrom-Json -Depth 100)
+        Assert-CutoverWorkDeadline
+        $parsed = $jsonText | ConvertFrom-Json -Depth 100
+        Assert-CutoverWorkDeadline
+        return $parsed
     }
     catch {
         throw 'Ledger contract JSON is invalid.'
@@ -1547,7 +2137,7 @@ function Invoke-GitTrackedFiles {
     $physical = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
     $paths = New-Object 'System.Collections.Generic.List[string]'
     foreach ($rawPath in $rawPaths) {
-        Assert-CutoverDeadline
+        Assert-CutoverWorkDeadline
         if ($paths.Count -ge $maxTrackedFiles) {
             Add-SafetyBound
             break
@@ -1582,6 +2172,7 @@ function Invoke-CutoverProcess {
         [Parameter(Mandatory = $true)][DateTime]$DeadlineUtc
     )
 
+    Assert-CutoverProcessStartDeadline
     Initialize-CutoverProcessMethodsV2
     $resolvedExecutable = Resolve-CutoverExecutable -FileName $FileName
     $environment = Get-CutoverProcessEnvironment -ResolvedExecutable $resolvedExecutable
@@ -1721,7 +2312,7 @@ function Invoke-ReferenceScan {
     $counts = New-Object 'System.Collections.Generic.Dictionary[string,int]' ([System.StringComparer]::Ordinal)
     $fileCount = 0
     foreach ($relativePath in $Tracked) {
-        Assert-CutoverDeadline
+        Assert-CutoverWorkDeadline
         if ($fileCount -ge $maxScannerFiles) { Add-SafetyBound; break }
         $leaf = [System.IO.Path]::GetFileName($relativePath)
         if ($leaf.Equals('session.json', [System.StringComparison]::OrdinalIgnoreCase) -or
@@ -1734,7 +2325,7 @@ function Invoke-ReferenceScan {
         $opened = $null
         try {
             $absolutePath = Assert-CutoverConfinedPath -LiteralPath $absolutePath -AncestorPath $RepositoryRoot
-            $opened = Open-CutoverConfinedFile -LiteralPath $absolutePath -ReadOnlyShare
+            $opened = Open-CutoverConfinedFile -LiteralPath $absolutePath
             if ($opened.identity.length -gt $maxScanBytesPerFile) {
                 Add-SafetyBound
                 continue
@@ -1751,14 +2342,15 @@ function Invoke-ReferenceScan {
                 # Invalid UTF-8 remains eligible for rg --text byte scanning;
                 # only valid UTF-8 can use the no-process prefilter safely.
             }
-            $scanNeedles = if ($null -eq $scanText) {
-                @($Needles.ToArray())
+            $scanNeedleList = New-Object 'System.Collections.Generic.List[object]'
+            foreach ($needle in $Needles) {
+                Assert-CutoverWorkDeadline
+                if ($null -eq $scanText -or
+                    $scanText.IndexOf([string]$needle.needle, [System.StringComparison]::Ordinal) -ge 0) {
+                    $scanNeedleList.Add($needle)
+                }
             }
-            else {
-                @($Needles | Where-Object {
-                        $scanText.IndexOf([string]$_.needle, [System.StringComparison]::Ordinal) -ge 0
-                    })
-            }
+            $scanNeedles = @($scanNeedleList.ToArray())
             $scan = [pscustomobject]@{ lines = @(); exitCode = 0; boundHit = $false }
             if ($scanNeedles.Count -gt 0) {
                 $arguments = @(
@@ -1767,6 +2359,7 @@ function Invoke-ReferenceScan {
                     '--max-columns', '4096', '--max-columns-preview'
                 )
                 foreach ($needle in $scanNeedles) {
+                    Assert-CutoverWorkDeadline
                     $arguments += '-e'
                     $arguments += [string]$needle.needle
                 }
@@ -1790,7 +2383,7 @@ function Invoke-ReferenceScan {
 
             $reopened = $null
             try {
-                $reopened = Open-CutoverConfinedFile -LiteralPath $absolutePath -ReadOnlyShare
+                $reopened = Open-CutoverConfinedFile -LiteralPath $absolutePath
                 if (-not (Compare-CutoverIdentity -Before $opened.identity -After $reopened.identity)) {
                     throw 'tracked scanner pathname identity changed during the scan.'
                 }
@@ -1804,13 +2397,16 @@ function Invoke-ReferenceScan {
             }
             if ($scan.boundHit) { Add-SafetyBound; break }
             foreach ($rawLine in $scan.lines) {
+                Assert-CutoverWorkDeadline
                 if ([string]::IsNullOrWhiteSpace([string]$rawLine)) { continue }
                 try { $event = ([string]$rawLine | ConvertFrom-Json -Depth 30) }
                 catch { Add-GlobalBlocker 'rg returned a non-JSON event in JSON mode.'; continue }
+                Assert-CutoverWorkDeadline
                 if ([string](Get-ContractProperty -Object $event -Name 'type') -ne 'match') { continue }
                 $data = Get-ContractProperty -Object $event -Name 'data'
                 $submatches = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
                 foreach ($submatch in Get-ContractArray (Get-ContractProperty -Object $data -Name 'submatches')) {
+                    Assert-CutoverWorkDeadline
                     $matchData = Get-ContractProperty -Object $submatch -Name 'match'
                     $matchText = [string](Get-ContractProperty -Object $matchData -Name 'text')
                     if (-not [string]::IsNullOrEmpty($matchText)) { $null = $submatches.Add($matchText) }
@@ -1819,6 +2415,7 @@ function Invoke-ReferenceScan {
                 $lineValue = Get-ContractProperty -Object $data -Name 'line_number'
                 if ($null -ne $lineValue) { $lineNumber = [int]$lineValue }
                 foreach ($needle in $scanNeedles) {
+                    Assert-CutoverWorkDeadline
                     if (-not [string]::IsNullOrEmpty([string]$needle.contextPath) -and
                         -not [string]::Equals($relativePath, [string]$needle.contextPath, [System.StringComparison]::Ordinal)) {
                         continue
@@ -1889,11 +2486,14 @@ public sealed class CutoverProcessResultV2
 
 public static class CutoverProcessMethodsV2
 {
-    // Keep a slice of the single audit deadline available for job termination,
-    // ACTIVE_PROCESS_ZERO proof, report construction, and bounded publication.
-    // This is not a second deadline; every wait still derives from the one
-    // absolute deadline supplied by the caller.
-    private const int PublicationReserveMilliseconds = 4000;
+    // Partition the tail of the single caller-owned deadline: scanner work
+    // stops first, owned-process settlement gets its bounded slice, and the
+    // final slice remains available for a fail-closed report. These are derived
+    // cutoffs, never fresh or extended deadlines.
+    private const int ReportPublicationReserveMilliseconds = 4000;
+    private const int ProcessSettlementReserveMilliseconds = 3000;
+    private const int WorkReserveMilliseconds =
+        ReportPublicationReserveMilliseconds + ProcessSettlementReserveMilliseconds;
     private const uint JobObjectExtendedLimitInformation = 9;
     private const uint JobObjectBasicAccountingInformation = 1;
     private const uint JobObjectLimitKillOnJobClose = 0x2000;
@@ -2440,6 +3040,22 @@ public static class CutoverProcessMethodsV2
         return identity;
     }
 
+    private static bool SameTrackedProcessIdentity(
+        TrackedProcess existing,
+        uint processId,
+        long creationTime,
+        string executablePath,
+        FileIdentity executableIdentity)
+    {
+        return existing != null && existing.ProcessId == processId &&
+            existing.CreationTime == creationTime &&
+            string.Equals(
+                existing.ExecutablePath,
+                executablePath,
+                StringComparison.OrdinalIgnoreCase) &&
+            SameFileIdentity(existing.ExecutableIdentity, executableIdentity);
+    }
+
     private static List<TrackedProcess> FindDescendants(NativeProcess root, DateTime deadline)
     {
         var tracked = new List<TrackedProcess>();
@@ -2515,20 +3131,28 @@ public static class CutoverProcessMethodsV2
                         CloseHandle(handle);
                         continue;
                     }
+                    var pidIdentityConflict = false;
                     var alreadyKnown = false;
                     foreach (var existing in parents)
                     {
                         if (existing.ProcessId == entry.ProcessId)
                         {
-                            // A PID is reusable. A second observation is only
-                            // the same tracked process when its creation
-                            // generation also matches; a reused PID is never
-                            // adopted as an owned descendant.
-                            alreadyKnown = existing.CreationTime == creationTime;
+                            // Dedupe is the complete process generation:
+                            // PID + creation time + canonical executable path
+                            // + opened executable file identity. Any mismatch
+                            // for an already observed PID is ambiguous and is
+                            // never adopted as an owned descendant.
+                            alreadyKnown = SameTrackedProcessIdentity(
+                                existing,
+                                entry.ProcessId,
+                                creationTime,
+                                executablePath,
+                                executableIdentity);
+                            pidIdentityConflict = !alreadyKnown;
                             break;
                         }
                     }
-                    if (alreadyKnown)
+                    if (alreadyKnown || pidIdentityConflict)
                     {
                         CloseHandle(handle);
                         continue;
@@ -2790,8 +3414,8 @@ public static class CutoverProcessMethodsV2
         while (!task.IsCompleted)
         {
             int milliseconds;
-            if (!Remaining(deadline, out milliseconds) || milliseconds <= PublicationReserveMilliseconds) return false;
-            var winner = await Task.WhenAny(task, Task.Delay(milliseconds - PublicationReserveMilliseconds)).ConfigureAwait(false);
+            if (!Remaining(deadline, out milliseconds) || milliseconds <= WorkReserveMilliseconds) return false;
+            var winner = await Task.WhenAny(task, Task.Delay(milliseconds - WorkReserveMilliseconds)).ConfigureAwait(false);
             if (winner != task) return false;
         }
         return true;
@@ -2828,10 +3452,12 @@ public static class CutoverProcessMethodsV2
 
     private static DateTime CleanupDeadline(DateTime auditDeadline)
     {
-        // Cleanup shares the one caller-owned absolute deadline. The caller
-        // stops work early enough for this settlement window; deriving a
-        // second, earlier cutoff here would leave no time to kill descendants.
-        return auditDeadline > DateTime.UtcNow ? auditDeadline : DateTime.UtcNow;
+        // Settlement remains inside the original absolute deadline and cannot
+        // consume the final report-publication slice. If settlement cannot be
+        // proven by this cutoff, ActiveProcessZero remains false.
+        var now = DateTime.UtcNow;
+        var cutoff = auditDeadline.AddMilliseconds(-ReportPublicationReserveMilliseconds);
+        return cutoff > now ? cutoff : now;
     }
 
     private static bool TryGetActiveProcessCount(IntPtr job, out uint active)
@@ -3140,7 +3766,7 @@ function Read-CutoverNulDelimitedPaths {
     $paths = New-Object 'System.Collections.Generic.List[string]'
     $start = 0
     for ($index = 0; $index -lt $Bytes.Length; $index++) {
-        Assert-CutoverDeadline
+        Assert-CutoverWorkDeadline
         if ($Bytes[$index] -ne 0) { continue }
         if ($paths.Count -ge $MaxPaths) {
             throw 'Git path count exceeded its bounded limit.'
@@ -3167,26 +3793,33 @@ function Read-CutoverNulDelimitedPaths {
 
 function Read-CutoverUtf8Lines {
     param(
-        [Parameter(Mandatory = $true)][byte[]]$Bytes,
-        [Parameter(Mandatory = $true)][int]$MaxLines
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][byte[]]$Bytes,
+        [Parameter(Mandatory = $true)][int64]$MaxBytes,
+        [Parameter(Mandatory = $true)][int]$MaxLines,
+        [Parameter(Mandatory = $true)][int]$MaxLineChars
     )
 
-    if ($Bytes.LongLength -gt $maxTrackedBytes) {
+    if ($MaxBytes -le 0 -or $MaxLines -le 0 -or $MaxLineChars -le 0) {
+        throw 'process text bounds were invalid.'
+    }
+    if ($Bytes.LongLength -gt $MaxBytes) {
         throw 'process text exceeded its bounded aggregate size.'
     }
+    Assert-CutoverWorkDeadline
     try {
         $text = ([System.Text.UTF8Encoding]::new($false, $true)).GetString($Bytes)
     }
     catch { throw 'process output was not valid UTF-8.' }
+    Assert-CutoverWorkDeadline
     $reader = [System.IO.StringReader]::new($text)
     $lines = New-Object 'System.Collections.Generic.List[string]'
     try {
         while ($null -ne ($line = $reader.ReadLine())) {
-            Assert-CutoverDeadline
+            Assert-CutoverWorkDeadline
             if ($lines.Count -ge $MaxLines) {
                 throw 'process line count exceeded its bounded limit.'
             }
-            if ($line.Length -gt $maxEnvironmentEntryChars) {
+            if ($line.Length -gt $MaxLineChars) {
                 throw 'process line exceeded its bounded length.'
             }
             $lines.Add($line)
@@ -3209,7 +3842,7 @@ function Read-CutoverContractLines {
     $bodyBytes = [int64]0
     try {
         while ($null -ne ($line = $reader.ReadLine())) {
-            Assert-CutoverDeadline
+            Assert-CutoverWorkDeadline
             $lineCount++
             if ($lineCount -gt $maxLedgerLines) {
                 throw 'ledger line count exceeded its bounded limit.'
@@ -3256,6 +3889,7 @@ function Invoke-CutoverProcessLines {
         [Parameter(Mandatory = $true)][int64]$MaxBytes
     )
 
+    Assert-CutoverProcessStartDeadline
     Initialize-CutoverProcessMethodsV2
     $resolvedExecutable = Resolve-CutoverExecutable -FileName $FileName
     $environment = Get-CutoverProcessEnvironment -ResolvedExecutable $resolvedExecutable
@@ -3272,13 +3906,17 @@ function Invoke-CutoverProcessLines {
         throw "bounded scanner invocation failed ($($result.FailureCategory))."
     }
     try {
-        $stdout = [System.Text.UTF8Encoding]::new($false, $true).GetString($result.StandardOutput)
+        $boundedLines = @(Read-CutoverUtf8Lines `
+                -Bytes $result.StandardOutput `
+                -MaxBytes $MaxBytes `
+                -MaxLines $maxScannerOutputLines `
+                -MaxLineChars $maxScannerOutputLineChars)
     }
     catch {
         Add-SafetyBound
-        throw 'bounded scanner output was not valid UTF-8.'
+        throw 'bounded scanner output shape was invalid.'
     }
-    $lines = @($stdout -split "`r?`n" | Where-Object { $_ -ne '' })
+    $lines = @($boundedLines | Where-Object { $_ -ne '' })
     return [pscustomobject]@{ lines = $lines; exitCode = $result.ExitCode; boundHit = $false }
 }
 
@@ -3313,19 +3951,6 @@ function Assert-AuditOutputPath {
         throw 'OutputPath must remain beneath .devmanager-next/evidence.'
     }
     if ([System.IO.Path]::GetExtension($full) -ine '.json') { throw 'OutputPath must end in .json.' }
-    $parent = Split-Path -Parent $full
-    Ensure-CutoverAuditDirectory -LiteralPath $parent | Out-Null
-    Assert-CutoverConfinedPath -LiteralPath $full -AncestorPath $EvidenceRoot -AllowMissingLeaf | Out-Null
-    $existing = $null
-    try {
-        $existing = Open-CutoverConfinedFile -LiteralPath $full
-    }
-    catch {
-        if ($_.Exception.Message -ne 'confined handle open failed.') { throw }
-    }
-    finally {
-        if ($null -ne $existing) { $existing.stream.Dispose() }
-    }
     return $full
 }
 
@@ -3339,8 +3964,6 @@ function Assert-AuditHumanPath {
     if (-not (Test-CutoverPathEqualsOrBeneath -Path $full -Ancestor $EvidenceRoot)) {
         throw 'Human report path must remain beneath .devmanager-next/evidence.'
     }
-    Ensure-CutoverAuditDirectory -LiteralPath (Split-Path -Parent $full) | Out-Null
-    Assert-CutoverConfinedPath -LiteralPath $full -AncestorPath $EvidenceRoot -AllowMissingLeaf | Out-Null
     return $full
 }
 
@@ -3362,17 +3985,39 @@ function Write-CutoverAtomicUtf8 {
         [Parameter(Mandatory = $true)][string]$LiteralPath,
         [Parameter(Mandatory = $true)][string]$Text,
         [Parameter(Mandatory = $true)][string]$EvidenceRoot,
+        [Parameter(Mandatory = $true)][object]$ParentHandle,
         [Parameter(Mandatory = $true)][int64]$MaxBytes
     )
 
     if ([System.IO.Path]::GetFileName($LiteralPath).Equals('session.json', [System.StringComparison]::OrdinalIgnoreCase)) {
         throw 'Refusing to publish the protected exact session.json name.'
     }
-    $full = Assert-CutoverConfinedPath -LiteralPath $LiteralPath -AncestorPath $EvidenceRoot -AllowMissingLeaf
-    $parent = Split-Path -Parent $full
-    $parentHandle = Open-CutoverConfinedFile -LiteralPath $parent -AllowDirectory -AllowDirectoryWrite
-    $tempPath = Join-Path $parent ('.pending-{0}.tmp' -f ([guid]::NewGuid().ToString('N')))
+    $full = Normalize-CutoverAbsolutePath -LiteralPath $LiteralPath -Label 'report path'
+    $authorizedEvidenceRoot = Normalize-CutoverAbsolutePath `
+        -LiteralPath $EvidenceRoot `
+        -Label 'evidence root'
+    if (-not (Test-CutoverPathEqualsOrBeneath -Path $full -Ancestor $authorizedEvidenceRoot)) {
+        throw 'report path escaped the authorized evidence root.'
+    }
+    $parent = Normalize-CutoverAbsolutePath `
+        -LiteralPath (Split-Path -Parent $full) `
+        -Label 'report parent'
+    if (-not [string]::Equals(
+            [string]$ParentHandle.path,
+            [string]$parent,
+            [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw 'report parent did not match the retained publication handle.'
+    }
+    $leaf = [System.IO.Path]::GetFileName($full)
+    if ([string]::IsNullOrWhiteSpace($leaf) -or
+        $leaf -notmatch '^[^\\/:\x00-\x1F\x7F]+\.(json|txt)$') {
+        throw 'report leaf name was rejected.'
+    }
+    Assert-CutoverPublicationAuthority -ParentHandle $ParentHandle -ExpectedParentPath $parent
+    $tempLeaf = '.pending-{0}.tmp' -f ([guid]::NewGuid().ToString('N'))
+    $tempPath = Join-Path $parent $tempLeaf
     $tempHandle = $null
+    $published = $false
     $encoding = [System.Text.UTF8Encoding]::new($false)
     $bytes = $encoding.GetBytes($Text)
     try {
@@ -3380,8 +4025,11 @@ function Write-CutoverAtomicUtf8 {
             Add-SafetyBound
             throw 'report text exceeded its bounded output byte limit.'
         }
-        Assert-CutoverConfinedPath -LiteralPath $tempPath -AncestorPath $EvidenceRoot -AllowMissingLeaf | Out-Null
-        $tempHandle = Open-CutoverConfinedWriteFile -LiteralPath $tempPath -AuthorizedRoot $EvidenceRoot
+        $tempHandle = Open-CutoverRelativeWriteFile `
+            -ParentStream $ParentHandle.stream `
+            -ParentPath $parent `
+            -LeafName $tempLeaf `
+            -AuthorizedRoot $EvidenceRoot
         $tempIdentity = $tempHandle.identity
         if (-not [string]::Equals(
                 [string]$tempIdentity.finalPath,
@@ -3389,6 +4037,7 @@ function Write-CutoverAtomicUtf8 {
                 [System.StringComparison]::OrdinalIgnoreCase)) {
             throw 'temporary report handle identity did not match its created path.'
         }
+        Assert-CutoverPublicationAuthority -ParentHandle $ParentHandle -ExpectedParentPath $parent
         $temp = $tempHandle.stream
         try {
             Assert-CutoverDeadline
@@ -3406,10 +4055,7 @@ function Write-CutoverAtomicUtf8 {
         }
         finally { }
 
-        $parentAfter = Get-CutoverHandleIdentity -Stream $parentHandle.stream
-        if (-not (Compare-CutoverIdentity -Before $parentHandle.identity -After $parentAfter)) {
-            throw 'report parent changed before atomic replacement.'
-        }
+        Assert-CutoverPublicationAuthority -ParentHandle $ParentHandle -ExpectedParentPath $parent
         $tempAfter = Get-CutoverHandleIdentity -Stream $tempHandle.stream
         if (-not (Compare-CutoverStableFileIdentity -Before $tempIdentity -After $tempAfter)) {
             throw 'temporary report handle identity changed before replacement.'
@@ -3423,27 +4069,42 @@ function Write-CutoverAtomicUtf8 {
         # rename outside the directory represented by that handle.
         Rename-CutoverFileRelative `
             -FileStream $tempHandle.stream `
-            -ParentStream $parentHandle.stream `
-            -LeafName ([System.IO.Path]::GetFileName($full)) `
+            -ParentStream $ParentHandle.stream `
+            -LeafName $leaf `
             -ReplaceExisting
-        $finalIdentity = Get-CutoverHandleIdentity -Stream $tempHandle.stream
-        if (-not (Test-CutoverPathEqualsOrBeneath -Path $finalIdentity.finalPath -Ancestor $EvidenceRoot) -or
-            -not [string]::Equals($finalIdentity.finalPath, $full, [System.StringComparison]::OrdinalIgnoreCase)) {
-            throw 'report replacement handle escaped its verified destination.'
-        }
+        # Success of the handle-relative rename is the publication commit
+        # point. Root and every parent handle still deny delete sharing here;
+        # all fallible identity/authority checks completed before this call.
+        $published = $true
     }
     catch {
-        if ($null -ne $tempHandle) { Remove-CutoverFileByHandle -FileStream $tempHandle.stream }
+        if ($null -ne $tempHandle -and -not $published) {
+            Remove-CutoverFileByHandle -FileStream $tempHandle.stream
+        }
         throw
     }
     finally {
         if ($null -ne $tempHandle) { $tempHandle.stream.Dispose() }
-        $parentHandle.stream.Dispose()
     }
 }
 
 function New-BoundedAuditReport {
-    param([Parameter(Mandatory = $true)][object]$Report)
+    param(
+        [Parameter(Mandatory = $true)][object]$Report,
+        [ValidateRange(0, 32768)][int]$HumanOmittedLineCount = 0
+    )
+
+    $boundedBlockers = New-Object 'System.Collections.Generic.List[string]'
+    $boundedBlockers.Add($safetyDiagnostic)
+    foreach ($retainedBlocker in @(
+            'audit[remote_change_protected]',
+            'audit[remote_change_unattributed]',
+            'audit[process_deadline_exceeded]'
+        )) {
+        if (@(Get-ContractArray (Get-ContractProperty -Object $Report -Name 'blockers')) -contains $retainedBlocker) {
+            $boundedBlockers.Add($retainedBlocker)
+        }
+    }
 
     return [pscustomobject]([ordered]@{
             schemaVersion = 1
@@ -3454,13 +4115,16 @@ function New-BoundedAuditReport {
             trackedFileCount = [int](Get-ContractProperty -Object $Report -Name 'trackedFileCount')
             protectedFilesSkipped = @()
             contractErrors = @()
-            blockers = @($safetyDiagnostic)
+            blockers = @($boundedBlockers.ToArray())
             entrypointFindings = @()
             prerequisiteNodes = @()
             rows = @()
+            remoteChangeAttribution = $remoteChangeAttribution
             safety = [ordered]@{
                 boundReached = $true
                 diagnostic = $safetyDiagnostic
+                humanReportTruncated = $HumanOmittedLineCount -gt 0
+                humanReportOmittedLineCount = $HumanOmittedLineCount
                 limits = [ordered]@{
                     ledgerBytes = $maxLedgerBytes
                     trackedFiles = $maxTrackedFiles
@@ -3472,6 +4136,8 @@ function New-BoundedAuditReport {
                     scannerFiles = $maxScannerFiles
                     scanBytesPerFile = $maxScanBytesPerFile
                     scannerOutputBytes = $maxScannerOutputBytes
+                    scannerOutputLines = $maxScannerOutputLines
+                    scannerOutputLineCharacters = $maxScannerOutputLineChars
                     scannerDeadlineMilliseconds = $maxScannerDurationMs
                     errors = $maxErrorCount
                     jsonBytes = $maxReportJsonBytes
@@ -3485,6 +4151,8 @@ function New-BoundedAuditReport {
                 protectedFileBasenames = @('session.json')
                 maxMatchesPerRow = $maxMatches
                 maxOutputBytes = $maxScannerOutputBytes
+                maxOutputLines = $maxScannerOutputLines
+                maxOutputLineCharacters = $maxScannerOutputLineChars
                 deadlineMilliseconds = $maxScannerDurationMs
             }
         })
@@ -3510,6 +4178,11 @@ function Assert-CutoverReportBounds {
     }
     & $addString ([string]$Report.contractId)
     & $addString ([string]$Report.mode)
+    & $addString ([string]$Report.remoteChangeAttribution.classification)
+    & $addString ([string]$Report.remoteChangeAttribution.writer)
+    foreach ($category in @($Report.remoteChangeAttribution.changedCategories)) {
+        & $addString ([string]$category)
+    }
     foreach ($value in @($Report.contractErrors) + @($Report.blockers) + @($Report.entrypointFindings) + @($Report.protectedFilesSkipped)) {
         & $addString ([string]$value)
     }
@@ -3545,6 +4218,7 @@ function Write-AuditReports {
         [Parameter(Mandatory = $true)][string]$JsonPath,
         [Parameter(Mandatory = $true)][string]$TextPath,
         [Parameter(Mandatory = $true)][string]$EvidenceRoot,
+        [Parameter(Mandatory = $true)][object]$ParentHandle,
         [Parameter(Mandatory = $true)][ref]$ContractStatus
     )
 
@@ -3561,11 +4235,21 @@ function Write-AuditReports {
     $lines = New-Object 'System.Collections.Generic.List[string]'
     $lineBytes = [int64]0
     $lineBytesRef = [ref]$lineBytes
+    $humanTruncated = $false
+    $humanTruncatedRef = [ref]$humanTruncated
+    $humanOmittedLineCount = 0
+    $humanOmittedLineCountRef = [ref]$humanOmittedLineCount
     $addLine = {
         param([string]$Line)
+        if ($humanTruncatedRef.Value) {
+            $humanOmittedLineCountRef.Value++
+            return $false
+        }
         $candidate = [string]$Line + [Environment]::NewLine
         $candidateBytes = [System.Text.UTF8Encoding]::new($false).GetByteCount($candidate)
         if ($lineBytesRef.Value + $candidateBytes -gt $maxReportHumanBytes) {
+            $humanTruncatedRef.Value = $true
+            $humanOmittedLineCountRef.Value++
             return $false
         }
         $lineBytesRef.Value += $candidateBytes
@@ -3577,37 +4261,132 @@ function Write-AuditReports {
     $null = & $addLine "mode: $($Report.mode)"
     $null = & $addLine "tracked files: $($Report.trackedFileCount)"
     $null = & $addLine "protected exact session.json files skipped: $(@($Report.protectedFilesSkipped).Count)"
+    $null = & $addLine "remote change attribution: $($Report.remoteChangeAttribution.classification); writer=$($Report.remoteChangeAttribution.writer)"
     $null = & $addLine ''
     $null = & $addLine 'contract errors:'
-    foreach ($error in @($Report.contractErrors)) { if (-not (& $addLine "- $error")) { break } }
+    foreach ($error in @($Report.contractErrors)) { $null = & $addLine "- $error" }
     $null = & $addLine 'blockers:'
-    foreach ($blocker in @($Report.blockers)) { if (-not (& $addLine "- $blocker")) { break } }
+    foreach ($blocker in @($Report.blockers)) { $null = & $addLine "- $blocker" }
     $null = & $addLine 'rows:'
     foreach ($row in @($Report.rows)) {
-        if (-not (& $addLine "- $($row.id): $($row.status); legacy=$($row.legacy.path); present=$([bool]$row.legacy.pathPresent)")) { break }
-        foreach ($blocker in @($row.blockers)) { if (-not (& $addLine "  blocker: $blocker")) { break } }
+        $null = & $addLine "- $($row.id): $($row.status); legacy=$($row.legacy.path); present=$([bool]$row.legacy.pathPresent)"
+        foreach ($blocker in @($row.blockers)) { $null = & $addLine "  blocker: $blocker" }
     }
     $null = & $addLine 'forbidden entrypoint findings:'
-    foreach ($finding in @($Report.entrypointFindings)) { if (-not (& $addLine "- $finding")) { break } }
+    foreach ($finding in @($Report.entrypointFindings)) { $null = & $addLine "- $finding" }
     $human = ($lines -join [Environment]::NewLine) + [Environment]::NewLine
-    if ([System.Text.UTF8Encoding]::new($false).GetByteCount($human) -gt $maxReportHumanBytes) {
-        $Report.contractStatus = 'HOLD'
+    if ($humanTruncated -or [System.Text.UTF8Encoding]::new($false).GetByteCount($human) -gt $maxReportHumanBytes) {
+        Add-SafetyBound
+        $Report = New-BoundedAuditReport `
+            -Report $Report `
+            -HumanOmittedLineCount $humanOmittedLineCount
         $ContractStatus.Value = 'HOLD'
         Assert-CutoverReportBounds -Report $Report
         $json = $Report | ConvertTo-Json -Depth 50
         if ([System.Text.UTF8Encoding]::new($false).GetByteCount($json) -gt $maxReportJsonBytes) {
-            $Report = New-BoundedAuditReport -Report $Report
+            $Report = New-BoundedAuditReport `
+                -Report $Report `
+                -HumanOmittedLineCount $humanOmittedLineCount
             Assert-CutoverReportBounds -Report $Report
             $json = $Report | ConvertTo-Json -Depth 50
         }
-        $human = "Phase 11.1 cutover audit`nstatus: HOLD`n- $safetyDiagnostic`n"
+        $boundedHumanBlockers = @(Get-ContractArray (Get-ContractProperty -Object $Report -Name 'blockers'))
+        $human = "Phase 11.1 cutover audit`nstatus: HOLD`nblockers: $($boundedHumanBlockers -join ',')`n- report content omitted due to safety bound; omitted lines: $humanOmittedLineCount`n"
+        if ([System.Text.UTF8Encoding]::new($false).GetByteCount($human) -gt $maxReportHumanBytes) {
+            $human = "HOLD`n$($boundedHumanBlockers -join ',')`nomitted=$humanOmittedLineCount`n"
+        }
+        if ([System.Text.UTF8Encoding]::new($false).GetByteCount($human) -gt $maxReportHumanBytes) {
+            throw 'bounded human HOLD exceeded its output byte limit.'
+        }
     }
-    Write-CutoverAtomicUtf8 -LiteralPath $JsonPath -Text $json -EvidenceRoot $EvidenceRoot -MaxBytes $maxReportJsonBytes
-    Write-CutoverAtomicUtf8 -LiteralPath $TextPath -Text $human -EvidenceRoot $EvidenceRoot -MaxBytes $maxReportHumanBytes
+
+    # JSON is the authoritative publication gate. Publish a small typed HOLD
+    # before attempting either user-facing output or the final JSON. If any
+    # later write fails, a prior READY JSON can never remain current.
+    $guardReport = New-BoundedAuditReport -Report $Report
+    Assert-CutoverReportBounds -Report $guardReport
+    $guardJson = $guardReport | ConvertTo-Json -Depth 50
+    if ([System.Text.UTF8Encoding]::new($false).GetByteCount($guardJson) -gt $maxReportJsonBytes) {
+        throw 'bounded publication guard exceeded its output byte limit.'
+    }
+    Write-CutoverAtomicUtf8 `
+        -LiteralPath $JsonPath `
+        -Text $guardJson `
+        -EvidenceRoot $EvidenceRoot `
+        -ParentHandle $ParentHandle `
+        -MaxBytes $maxReportJsonBytes
+
+    if ($authorizedRootKind -eq 'authenticated-fixture') {
+        $moveTarget = [Environment]::GetEnvironmentVariable('DEVMANAGER_CUTOVER_TEST_MOVE_ROOT_AFTER_GUARD')
+        if (-not [string]::IsNullOrWhiteSpace($moveTarget)) {
+            $normalizedMoveTarget = Normalize-CutoverAbsolutePath `
+                -LiteralPath $moveTarget `
+                -Label 'fixture publication move target'
+            if ((Test-CutoverPathEqualsOrBeneath -Path $normalizedMoveTarget -Ancestor $rootPath) -or
+                (Test-CutoverPathEqualsOrBeneath -Path $rootPath -Ancestor $normalizedMoveTarget) -or
+                [System.IO.Directory]::Exists($normalizedMoveTarget) -or
+                [System.IO.File]::Exists($normalizedMoveTarget)) {
+                throw 'fixture publication move target was unsafe.'
+            }
+            Assert-CutoverPathChain -LiteralPath (Split-Path -Parent $normalizedMoveTarget) | Out-Null
+            $moveWasBlocked = $false
+            try {
+                [System.IO.Directory]::Move($rootPath, $normalizedMoveTarget)
+            }
+            catch {
+                $moveWasBlocked = $true
+            }
+            if (-not $moveWasBlocked -or
+                -not [System.IO.Directory]::Exists($rootPath) -or
+                [System.IO.Directory]::Exists($normalizedMoveTarget)) {
+                throw 'retained publication root could be moved during report publication.'
+            }
+            [Console]::Out.WriteLine('FIXTURE_PUBLICATION_ROOT_MOVE_BLOCKED')
+        }
+
+        if ([Environment]::GetEnvironmentVariable('DEVMANAGER_CUTOVER_TEST_FAIL_HUMAN_AFTER_GUARD') -eq '1') {
+            [Console]::Out.WriteLine('FIXTURE_HUMAN_PUBLICATION_FAILURE_INJECTED')
+            throw 'fixture injected human report publication failure.'
+        }
+    }
+
+    Write-CutoverAtomicUtf8 `
+        -LiteralPath $TextPath `
+        -Text $human `
+        -EvidenceRoot $EvidenceRoot `
+        -ParentHandle $ParentHandle `
+        -MaxBytes $maxReportHumanBytes
+    if ($authorizedRootKind -eq 'authenticated-fixture' -and
+        [Environment]::GetEnvironmentVariable('DEVMANAGER_CUTOVER_TEST_FAIL_FINAL_JSON_AFTER_HUMAN') -eq '1') {
+        [Console]::Out.WriteLine('FIXTURE_FINAL_JSON_PUBLICATION_FAILURE_INJECTED')
+        throw 'fixture injected final JSON publication failure.'
+    }
+    Write-CutoverAtomicUtf8 `
+        -LiteralPath $JsonPath `
+        -Text $json `
+        -EvidenceRoot $EvidenceRoot `
+        -ParentHandle $ParentHandle `
+        -MaxBytes $maxReportJsonBytes
 }
 
 try {
     $rootPath = Assert-CutoverAuthorizedRoot -RequestedRoot $Root
+    if ($authorizedRootKind -eq 'authenticated-fixture') {
+        # Executable contract tests can lower only the human-output ceiling to
+        # exercise the real bounded fallback. Candidate audits never read or
+        # honor this test-only control.
+        $testHumanBytes = [Environment]::GetEnvironmentVariable('DEVMANAGER_CUTOVER_TEST_HUMAN_BYTES')
+        if (-not [string]::IsNullOrEmpty($testHumanBytes)) {
+            if ($testHumanBytes -notmatch '^[0-9]{1,6}$') {
+                throw 'fixture human report bound was invalid.'
+            }
+            $parsedTestHumanBytes = [int]$testHumanBytes
+            if ($parsedTestHumanBytes -lt 192 -or $parsedTestHumanBytes -gt 131072) {
+                throw 'fixture human report bound was outside its safe test range.'
+            }
+            $maxReportHumanBytes = [int64]$parsedTestHumanBytes
+        }
+    }
     $evidenceRoot = Normalize-CutoverAbsolutePath -LiteralPath (Join-Path $rootPath '.devmanager-next\evidence') -Label 'evidence root'
     $defaultReportPath = Assert-AuditOutputPath -RepositoryRoot $rootPath -EvidenceRoot $evidenceRoot -RequestedPath $null
     if ([string]::IsNullOrEmpty($OutputPath)) {
@@ -3623,6 +4402,27 @@ try {
         }
     }
     $humanPath = Assert-AuditHumanPath -JsonPath $reportPath -EvidenceRoot $evidenceRoot
+    $reportParentPath = Normalize-CutoverAbsolutePath `
+        -LiteralPath (Split-Path -Parent $reportPath) `
+        -Label 'report parent'
+    $reportDirectoryHandle = Open-CutoverRelativeDirectoryChain `
+        -RootHandle $rootDirectoryHandle `
+        -RootPath $rootPath `
+        -LiteralPath $reportParentPath
+    Assert-CutoverPublicationAuthority `
+        -ParentHandle $reportDirectoryHandle `
+        -ExpectedParentPath $reportParentPath
+
+    if (-not [string]::IsNullOrWhiteSpace($RemoteChangeEvidencePath)) {
+        $remoteChangeAttribution = Get-CutoverRemoteChangeAttribution `
+            -EvidencePath $RemoteChangeEvidencePath
+        if ($remoteChangeAttribution.classification -eq 'protected-or-unclassified-change') {
+            Add-GlobalBlocker 'remote change protected'
+        }
+        elseif ($remoteChangeAttribution.classification -eq 'browser-activity-unattributed') {
+            Add-GlobalBlocker 'remote change unattributed'
+        }
+    }
 
     if (-not [string]::IsNullOrEmpty($authorizationFailure)) {
         throw 'authorized root Git identity was not established.'
@@ -3630,7 +4430,7 @@ try {
     Assert-CutoverRootStable
     $trackedFiles = @(Invoke-GitTrackedFiles -RepositoryRoot $rootPath)
     foreach ($tracked in $trackedFiles) {
-        Assert-CutoverDeadline
+        Assert-CutoverWorkDeadline
         if ([System.IO.Path]::GetFileName($tracked).Equals('session.json', [System.StringComparison]::OrdinalIgnoreCase) -or
             [string]::Equals($tracked, '.devmanager-next/audit-fixture.auth', [System.StringComparison]::Ordinal)) {
             $protectedTrackedFiles.Add($tracked)
@@ -3679,7 +4479,7 @@ try {
     $nodeById = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([System.StringComparer]::Ordinal)
     $nodes = @(Get-ContractArray (Get-ContractProperty -Object $contract -Name 'prerequisiteNodes'))
     foreach ($node in $nodes) {
-        Assert-CutoverDeadline
+        Assert-CutoverWorkDeadline
         if ($nodeReports.Count -ge $maxNodes) { Add-SafetyBound; break }
         $nodeId = [string](Get-ContractProperty -Object $node -Name 'id')
         if ([string]::IsNullOrWhiteSpace($nodeId)) {
@@ -3740,14 +4540,14 @@ try {
     }
     Assert-NodeGraph -Nodes $nodes -NodeById $nodeById
     foreach ($node in $nodes) {
-        Assert-CutoverDeadline
+        Assert-CutoverWorkDeadline
         $nodeId = [string](Get-ContractProperty -Object $node -Name 'id')
         $nodeStatus = [string](Get-ContractProperty -Object $node -Name 'status')
         if ($nodeStatus -ne 'READY' -or -not $nodeById.ContainsKey($nodeId)) {
             continue
         }
         foreach ($dependency in Get-ContractArray (Get-ContractProperty -Object $node -Name 'dependsOn')) {
-            Assert-CutoverDeadline
+            Assert-CutoverWorkDeadline
             if ($nodeById.ContainsKey([string]$dependency)) {
                 $dependencyStatus = [string](Get-ContractProperty -Object $nodeById[[string]$dependency] -Name 'status')
                 if ($dependencyStatus -ne 'READY') {
@@ -3766,7 +4566,7 @@ try {
         Add-ContractError 'rows must contain at least one ledger row.'
     }
     foreach ($row in $rows) {
-        Assert-CutoverDeadline
+        Assert-CutoverWorkDeadline
         if ($rowModels.Count -ge $maxRows) { Add-SafetyBound; break }
         $rowId = [string](Get-ContractProperty -Object $row -Name 'id')
         if ([string]::IsNullOrWhiteSpace($rowId)) {
@@ -3849,9 +4649,9 @@ try {
     }
 
     foreach ($model in $rowModels) {
-        Assert-CutoverDeadline
+        Assert-CutoverWorkDeadline
         foreach ($prerequisite in $model.prerequisites) {
-            Assert-CutoverDeadline
+            Assert-CutoverWorkDeadline
             if (-not $nodeById.ContainsKey($prerequisite)) {
                 Add-ContractError "row '$($model.id)' has unknown prerequisite '$prerequisite'."
             }
@@ -3861,7 +4661,7 @@ try {
     $needles = New-Object 'System.Collections.Generic.List[object]'
     $needleKeys = New-Object 'System.Collections.Generic.Dictionary[string,bool]' ([System.StringComparer]::Ordinal)
     foreach ($model in $rowModels) {
-        Assert-CutoverDeadline
+        Assert-CutoverWorkDeadline
         Add-Needle -Needles $needles -NeedleKeys $needleKeys -OwnerId $model.id -Kind 'path' -Value $model.legacyPath
         foreach ($symbol in $model.symbols) {
             Add-Needle -Needles $needles -NeedleKeys $needleKeys -OwnerId $model.id -Kind 'symbol' -Value $symbol
@@ -3879,7 +4679,7 @@ try {
         Add-ContractError 'forbiddenEntrypoints must contain at least one legacy entrypoint contract.'
     }
     foreach ($entrypoint in $forbidden) {
-        Assert-CutoverDeadline
+        Assert-CutoverWorkDeadline
         $entrypointId = [string](Get-ContractProperty -Object $entrypoint -Name 'id')
         if ($entrypointId.Length -gt $maxNeedleChars -or $entrypointId.IndexOfAny([char[]](0..31 + 127)) -ge 0) {
             Add-SafetyBound
@@ -3903,7 +4703,7 @@ try {
                 -Value $token `
                 -ContextPath $entrypointPath
             foreach ($model in $rowModels) {
-                Assert-CutoverDeadline
+                Assert-CutoverWorkDeadline
                 if ($model.legacyPath -eq $entrypointPath) {
                     Add-Needle -Needles $needles -NeedleKeys $needleKeys -OwnerId $model.id -Kind 'token' -Value $token
                 }
@@ -3922,12 +4722,12 @@ try {
     Assert-CutoverRootStable
 
     foreach ($match in $scanMatches | Where-Object { $_.ownerId -like 'entrypoint:*' }) {
-        Assert-CutoverDeadline
+        Assert-CutoverWorkDeadline
         $entrypointFindings.Add("$($match.ownerId.Substring(11)):$($match.path)")
     }
 
     foreach ($model in $rowModels) {
-        Assert-CutoverDeadline
+        Assert-CutoverWorkDeadline
         $rowBlockers = New-Object 'System.Collections.Generic.List[string]'
         $pathPresent = $false
         if ($null -ne $model.legacyPath) {
@@ -4037,9 +4837,23 @@ try {
 catch {
     $fatalDiagnosticCategory = Get-CutoverDiagnosticCategory -Message $_.Exception.Message
     Add-ContractError -Message "fatal audit error: $fatalDiagnosticCategory" -Category $fatalDiagnosticCategory
-    $sortedEntrypointFindings = @(Sort-CutoverOrdinalStrings -Values @($entrypointFindings.ToArray()))
-    $sortedContractErrors = @(Sort-CutoverOrdinalDiagnostics -Values @($contractErrors.ToArray()))
-    $sortedGlobalBlockers = @(Sort-CutoverOrdinalStrings -Values @($globalBlockers.ToArray()))
+    if ($fatalDiagnosticCategory -eq 'process_deadline_exceeded' -or
+        (Get-CutoverDeadlineRemainingMilliseconds) -le $publicationReserveMs) {
+        # Do not spend the publication slice sorting or serializing a partial,
+        # attacker-influenced report. A small typed HOLD below retains fixed
+        # safety-critical remote and deadline blockers and can be published before the one
+        # absolute audit deadline expires.
+        Add-SafetyBound
+        $boundedPublicationRequired = $true
+        $sortedEntrypointFindings = @()
+        $sortedContractErrors = @()
+        $sortedGlobalBlockers = @()
+    }
+    else {
+        $sortedEntrypointFindings = @(Sort-CutoverOrdinalStrings -Values @($entrypointFindings.ToArray()))
+        $sortedContractErrors = @(Sort-CutoverOrdinalDiagnostics -Values @($contractErrors.ToArray()))
+        $sortedGlobalBlockers = @(Sort-CutoverOrdinalStrings -Values @($globalBlockers.ToArray()))
+    }
     if ($null -eq $reportPath) {
         [Console]::Error.WriteLine("AUDIT_ERROR[$fatalDiagnosticCategory]")
     }
@@ -4048,10 +4862,32 @@ catch {
 
 if ($null -eq $rootPath -or $null -eq $evidenceRoot -or $null -eq $reportPath -or $null -eq $humanPath) {
     [Console]::Error.WriteLine("AUDIT_ERROR[$fatalDiagnosticCategory]")
+    Close-CutoverPublicationHandles
     exit 2
 }
 
-$report = [pscustomobject]([ordered]@{
+if ($boundedPublicationRequired) {
+    $boundedPublicationBlockers = New-Object 'System.Collections.Generic.List[string]'
+    $boundedPublicationBlockers.Add($safetyDiagnostic)
+    if ($fatalDiagnosticCategory -eq 'process_deadline_exceeded') {
+        $boundedPublicationBlockers.Add('audit[process_deadline_exceeded]')
+    }
+    if ($remoteChangeAttribution.classification -eq 'protected-or-unclassified-change') {
+        $boundedPublicationBlockers.Add('audit[remote_change_protected]')
+    }
+    elseif ($remoteChangeAttribution.classification -eq 'browser-activity-unattributed') {
+        $boundedPublicationBlockers.Add('audit[remote_change_unattributed]')
+    }
+    $report = New-BoundedAuditReport -Report ([pscustomobject]([ordered]@{
+                contractId = Get-ContractProperty -Object $contract -Name 'contractId'
+                mode = $Mode
+                trackedFileCount = @($trackedFiles).Count
+                blockers = @($boundedPublicationBlockers.ToArray())
+            }))
+    $contractStatus = 'HOLD'
+}
+else {
+    $report = [pscustomobject]([ordered]@{
         schemaVersion = 1
         contractId = Get-CutoverReportContractId -Value (Get-ContractProperty -Object $contract -Name 'contractId')
         mode = $Mode
@@ -4064,9 +4900,12 @@ $report = [pscustomobject]([ordered]@{
         entrypointFindings = @($sortedEntrypointFindings)
         prerequisiteNodes = @(Sort-CutoverOrdinalObjects -Values @($nodeReports.ToArray()) -Fields @('id'))
         rows = @(Sort-CutoverOrdinalObjects -Values @($rowReports.ToArray()) -Fields @('id'))
+        remoteChangeAttribution = $remoteChangeAttribution
         safety = [ordered]@{
             boundReached = [bool]$safetyBoundReached
             diagnostic = if ($safetyBoundReached) { $safetyDiagnostic } else { $null }
+            humanReportTruncated = $false
+            humanReportOmittedLineCount = 0
             limits = [ordered]@{
                 ledgerBytes = $maxLedgerBytes
                 trackedFiles = $maxTrackedFiles
@@ -4078,6 +4917,8 @@ $report = [pscustomobject]([ordered]@{
                 scannerFiles = $maxScannerFiles
                 scanBytesPerFile = $maxScanBytesPerFile
                 scannerOutputBytes = $maxScannerOutputBytes
+                scannerOutputLines = $maxScannerOutputLines
+                scannerOutputLineCharacters = $maxScannerOutputLineChars
                 scannerDeadlineMilliseconds = $maxScannerDurationMs
                 errors = $maxErrorCount
                 jsonBytes = $maxReportJsonBytes
@@ -4091,13 +4932,24 @@ $report = [pscustomobject]([ordered]@{
             protectedFileBasenames = @('session.json')
             maxMatchesPerRow = $maxMatches
             maxOutputBytes = $maxScannerOutputBytes
+            maxOutputLines = $maxScannerOutputLines
+            maxOutputLineCharacters = $maxScannerOutputLineChars
             deadlineMilliseconds = $maxScannerDurationMs
         }
-    })
+        })
+}
 
 try {
+    # Always revalidate the authorized root before report publication, even when Git identity failed.
+    Assert-CutoverAuthorizedRootIdentityStable
     if ($null -ne $gitIdentity) { Assert-CutoverRootStable }
-    Write-AuditReports -Report $report -JsonPath $reportPath -TextPath $humanPath -EvidenceRoot $evidenceRoot -ContractStatus ([ref]$contractStatus)
+    Write-AuditReports `
+        -Report $report `
+        -JsonPath $reportPath `
+        -TextPath $humanPath `
+        -EvidenceRoot $evidenceRoot `
+        -ParentHandle $reportDirectoryHandle `
+        -ContractStatus ([ref]$contractStatus)
     Write-Host ("Wrote cutover audit JSON -> {0}" -f (Get-RelativeReportPath -RepositoryRoot $rootPath -Path $reportPath))
     Write-Host ("Wrote cutover audit report -> {0}" -f (Get-RelativeReportPath -RepositoryRoot $rootPath -Path $humanPath))
 }
@@ -4105,6 +4957,9 @@ catch {
     $fatalDiagnosticCategory = Get-CutoverDiagnosticCategory -Message $_.Exception.Message
     [Console]::Error.WriteLine("AUDIT_ERROR[$fatalDiagnosticCategory]")
     exit 2
+}
+finally {
+    Close-CutoverPublicationHandles
 }
 
 if ($contractStatus -eq 'READY') {

@@ -192,6 +192,39 @@ fn spawn_audit(root: &Path, output_path: &Path) -> Output {
         .expect("spawn cutover audit")
 }
 
+fn spawn_audit_with_remote_change(
+    root: &Path,
+    output_path: &Path,
+    remote_change_path: &Path,
+    human_report_limit: Option<u32>,
+) -> Output {
+    let mut command = Command::new("pwsh");
+    command
+        .args([
+            "-NoProfile",
+            "-File",
+            AUDIT_SCRIPT,
+            "-Mode",
+            "Parity",
+            "-Root",
+            root.to_str().expect("fixture root utf8"),
+            "-OutputPath",
+            output_path.to_str().expect("output path utf8"),
+            "-RemoteChangeEvidencePath",
+            remote_change_path
+                .to_str()
+                .expect("remote change evidence path utf8"),
+        ])
+        .env("APPDATA", root.join("protected-appdata"))
+        .env("DEVMANAGER_CUTOVER_FIXTURE_AUTH", fixture_auth_token(root));
+    if let Some(limit) = human_report_limit {
+        command.env("DEVMANAGER_CUTOVER_TEST_HUMAN_BYTES", limit.to_string());
+    }
+    command
+        .output()
+        .expect("spawn cutover audit with remote change evidence")
+}
+
 fn write_git_probe_shim(shim_root: &Path, _log_path: &Path) -> PathBuf {
     fs::create_dir_all(shim_root).expect("git probe shim directory");
     let source_path = shim_root.join("git-probe.cs");
@@ -261,6 +294,24 @@ public static class Program
     {
         var isEnumeration = Array.IndexOf(args, "ls-files") >= 0;
         var mode = Environment.GetEnvironmentVariable("GIT_FAKE_MODE");
+        if (mode == "root-swap")
+        {
+            var root = Environment.GetEnvironmentVariable("GIT_FAKE_ROOT");
+            var moved = Environment.GetEnvironmentVariable("GIT_FAKE_MOVED_ROOT");
+            if (string.IsNullOrEmpty(root) || string.IsNullOrEmpty(moved)) return 19;
+            try
+            {
+                Directory.Move(root, moved);
+                Directory.CreateDirectory(Path.Combine(root, ".devmanager-next", "evidence", "current"));
+                File.WriteAllText(Path.Combine(root, "replacement-sentinel.txt"), "replacement-tree");
+                return 18;
+            }
+            catch (Exception error)
+            {
+                File.WriteAllText(Environment.GetEnvironmentVariable("GIT_FAKE_SWAP_LOG"), error.GetType().Name + ":" + error.Message);
+                return 20;
+            }
+        }
         if (isEnumeration && !string.IsNullOrEmpty(mode))
         {
             if (mode == "hang")
@@ -422,6 +473,16 @@ public static class Program
             SpawnResidue();
             Emit(Console.OpenStandardError(), (byte)'x', 400000);
             System.Threading.Thread.Sleep(30000);
+            return;
+        }
+        if (mode == "line-count-overflow")
+        {
+            for (var index = 0; index < 4097; index++) Console.WriteLine("x");
+            return;
+        }
+        if (mode == "line-length-overflow")
+        {
+            Console.WriteLine(new string('x', 32769));
             return;
         }
 
@@ -1222,7 +1283,6 @@ fn oversized_ready_report_propagates_fallback_hold_to_exit() {
         .collect::<Vec<_>>();
 
     let run = run_audit(document, &evidence_refs);
-
     assert!(!run.output.status.success());
     assert_eq!(run.report["contractStatus"], "HOLD");
 }
@@ -1848,6 +1908,8 @@ fn scanner_modes_are_bounded_and_revalidate_content_and_path_identity() {
         "hang",
         "stdout-overflow",
         "stderr-overflow",
+        "line-count-overflow",
+        "line-length-overflow",
         "mutate",
         "swap",
     ];
@@ -1897,6 +1959,8 @@ fn scanner_modes_are_bounded_and_revalidate_content_and_path_identity() {
         let report: Value = serde_json::from_slice(&fs::read(&output_path).expect("audit JSON"))
             .expect("valid audit JSON");
         assert_eq!(report["scanner"]["deadlineMilliseconds"], 15_000);
+        assert_eq!(report["scanner"]["maxOutputLines"], 4096);
+        assert_eq!(report["scanner"]["maxOutputLineCharacters"], 32768);
         assert!(!output.status.success(), "mode {mode} must fail closed");
         let blockers = strings_at(&report, &["blockers"]);
         match mode {
@@ -2178,6 +2242,289 @@ fn git_enumeration_uses_the_bounded_wrapper_for_all_failure_modes() {
 }
 
 #[test]
+fn retained_root_blocks_replacement_during_git_resolution_and_reports_hold() {
+    let real_git = real_git_executable();
+    let fixture = fixture_repo(
+        contract(
+            vec![base_row(
+                "root-swap",
+                "src/legacy.rs",
+                &["LegacyFixture"],
+                "src/replacement.rs",
+                &["gate-parity"],
+                "HOLD",
+            )],
+            vec![base_node("gate-parity", "gate", "HOLD")],
+        ),
+        &[],
+    );
+    let swap_container = tempfile::tempdir().expect("root swap container");
+    let shim_root = swap_container.path().join("git-root-swap-shim");
+    let shim = write_git_mode_shim(&shim_root);
+    assert!(shim.is_file());
+    let moved_root = swap_container.path().join("authorized-root-moved");
+    let swap_log = swap_container.path().join("root-swap.log");
+    let output_path = fixture
+        .root
+        .join(".devmanager-next/evidence/current/cutover-audit.json");
+    let moved_output = moved_root.join(".devmanager-next/evidence/current/cutover-audit.json");
+    let original_path = std::env::var_os("PATH").expect("PATH");
+    let mut path_entries = vec![shim_root];
+    path_entries.extend(std::env::split_paths(&original_path));
+    let isolated_path = std::env::join_paths(path_entries).expect("isolated PATH");
+    let output = Command::new("pwsh")
+        .args([
+            "-NoProfile",
+            "-File",
+            AUDIT_SCRIPT,
+            "-Mode",
+            "Parity",
+            "-Root",
+            fixture.root.to_str().expect("fixture root utf8"),
+            "-OutputPath",
+            output_path.to_str().expect("output path utf8"),
+        ])
+        .env("APPDATA", fixture.root.join("protected-appdata"))
+        .env(
+            "DEVMANAGER_CUTOVER_FIXTURE_AUTH",
+            fixture_auth_token(&fixture.root),
+        )
+        .env("GIT_FAKE_MODE", "root-swap")
+        .env("GIT_FAKE_ROOT", &fixture.root)
+        .env("GIT_FAKE_MOVED_ROOT", &moved_root)
+        .env("GIT_FAKE_SWAP_LOG", &swap_log)
+        .env("GIT_REAL", &real_git)
+        .env("PATH", isolated_path)
+        .output()
+        .expect("spawn root-swap audit");
+
+    assert!(
+        !output.status.success(),
+        "root replacement must fail closed"
+    );
+    assert!(
+        fixture.root.is_dir() && !moved_root.exists(),
+        "the retained authorized root was moved\nstdout={}\nstderr={}\nswap={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+        fs::read_to_string(&swap_log).unwrap_or_else(|_| "no swap log".into())
+    );
+    let swap_failure = fs::read_to_string(&swap_log).expect("root move failure log");
+    assert!(
+        swap_failure.starts_with("IOException:")
+            || swap_failure.starts_with("UnauthorizedAccessException:"),
+        "the executable move did not reach the retained-handle sharing guard: {swap_failure}"
+    );
+    assert!(
+        !moved_output.exists() && !moved_output.with_extension("txt").exists(),
+        "a nonexistent moved root unexpectedly received a report"
+    );
+    assert_eq!(
+        fixture.root.join("replacement-sentinel.txt").exists(),
+        false,
+        "the shim created a replacement tree despite the retained root handle"
+    );
+    let report: Value = serde_json::from_slice(&fs::read(&output_path).expect("bounded HOLD JSON"))
+        .expect("valid bounded HOLD JSON");
+    assert_eq!(report["contractStatus"], "HOLD");
+    assert!(strings_at(&report, &["contractErrors"]).contains(&"audit[git_identity_invalid]"));
+    for current in [
+        fixture.root.join(".devmanager-next/evidence/current"),
+        moved_root.join(".devmanager-next/evidence/current"),
+    ] {
+        if !current.is_dir() {
+            continue;
+        }
+        assert!(
+            fs::read_dir(&current)
+                .expect("current report directory")
+                .all(|entry| !entry
+                    .expect("current report entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".pending-")),
+            "root replacement left a pending report in {}",
+            current.display()
+        );
+    }
+}
+
+#[test]
+fn failed_human_publication_cannot_leave_a_ready_json_report() {
+    let fixture = fixture_repo(
+        contract(
+            vec![base_row(
+                "publication-pair",
+                "src/legacy.rs",
+                &["LegacyFixture"],
+                "src/replacement.rs",
+                &["gate-parity"],
+                "READY",
+            )],
+            vec![base_node("gate-parity", "gate", "READY")],
+        ),
+        &[
+            ("evidence/gate-parity.json", br#"{"ok":true}"#),
+            ("evidence/publication-pair.json", br#"{"ok":true}"#),
+        ],
+    );
+    let output_path = fixture
+        .root
+        .join(".devmanager-next/evidence/current/cutover-audit.json");
+    let output = Command::new("pwsh")
+        .args([
+            "-NoProfile",
+            "-File",
+            AUDIT_SCRIPT,
+            "-Mode",
+            "Parity",
+            "-Root",
+            fixture.root.to_str().expect("fixture root utf8"),
+            "-OutputPath",
+            output_path.to_str().expect("output path utf8"),
+        ])
+        .env("APPDATA", fixture.root.join("protected-appdata"))
+        .env(
+            "DEVMANAGER_CUTOVER_FIXTURE_AUTH",
+            fixture_auth_token(&fixture.root),
+        )
+        .env("DEVMANAGER_CUTOVER_TEST_FAIL_HUMAN_AFTER_GUARD", "1")
+        .output()
+        .expect("spawn paired-publication failure audit");
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains("FIXTURE_HUMAN_PUBLICATION_FAILURE_INJECTED"),
+        "the executable human-publication failure was not observed\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&fs::read(&output_path).expect("guard JSON"))
+        .expect("valid guard JSON");
+    assert_eq!(report["contractStatus"], "HOLD");
+    assert_eq!(report["safety"]["boundReached"], true);
+    assert!(strings_at(&report, &["blockers"]).contains(&"audit[safety_bound]"));
+}
+
+#[test]
+fn failed_final_json_publication_leaves_the_guard_json_on_disk() {
+    let fixture = fixture_repo(
+        contract(
+            vec![base_row(
+                "publication-final-json",
+                "src/legacy.rs",
+                &["LegacyFixture"],
+                "src/replacement.rs",
+                &["gate-parity"],
+                "READY",
+            )],
+            vec![base_node("gate-parity", "gate", "READY")],
+        ),
+        &[
+            ("evidence/gate-parity.json", br#"{"ok":true}"#),
+            ("evidence/publication-final-json.json", br#"{"ok":true}"#),
+        ],
+    );
+    let output_path = fixture
+        .root
+        .join(".devmanager-next/evidence/current/cutover-audit.json");
+    let output = Command::new("pwsh")
+        .args([
+            "-NoProfile",
+            "-File",
+            AUDIT_SCRIPT,
+            "-Mode",
+            "Parity",
+            "-Root",
+            fixture.root.to_str().expect("fixture root utf8"),
+            "-OutputPath",
+            output_path.to_str().expect("output path utf8"),
+        ])
+        .env("APPDATA", fixture.root.join("protected-appdata"))
+        .env(
+            "DEVMANAGER_CUTOVER_FIXTURE_AUTH",
+            fixture_auth_token(&fixture.root),
+        )
+        .env("DEVMANAGER_CUTOVER_TEST_FAIL_FINAL_JSON_AFTER_HUMAN", "1")
+        .output()
+        .expect("spawn final-JSON publication failure audit");
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains("FIXTURE_FINAL_JSON_PUBLICATION_FAILURE_INJECTED"),
+        "the executable final-JSON failure was not observed\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&fs::read(&output_path).expect("guard JSON"))
+        .expect("valid guard JSON");
+    assert_eq!(report["contractStatus"], "HOLD");
+    assert_eq!(report["safety"]["boundReached"], true);
+    assert!(strings_at(&report, &["blockers"]).contains(&"audit[safety_bound]"));
+    assert!(
+        output_path.with_extension("txt").is_file(),
+        "the human report should have committed before the injected final-JSON failure"
+    );
+}
+
+#[test]
+fn retained_publication_chain_blocks_root_move_between_report_writes() {
+    let fixture = fixture_repo(
+        contract(
+            vec![base_row(
+                "publication-root",
+                "src/legacy.rs",
+                &["LegacyFixture"],
+                "src/replacement.rs",
+                &["gate-parity"],
+                "HOLD",
+            )],
+            vec![base_node("gate-parity", "gate", "HOLD")],
+        ),
+        &[],
+    );
+    let move_container = tempfile::tempdir().expect("publication move container");
+    let moved_root = move_container.path().join("moved-during-publication");
+    let output_path = fixture
+        .root
+        .join(".devmanager-next/evidence/current/cutover-audit.json");
+    let output = Command::new("pwsh")
+        .args([
+            "-NoProfile",
+            "-File",
+            AUDIT_SCRIPT,
+            "-Mode",
+            "Parity",
+            "-Root",
+            fixture.root.to_str().expect("fixture root utf8"),
+            "-OutputPath",
+            output_path.to_str().expect("output path utf8"),
+        ])
+        .env("APPDATA", fixture.root.join("protected-appdata"))
+        .env(
+            "DEVMANAGER_CUTOVER_FIXTURE_AUTH",
+            fixture_auth_token(&fixture.root),
+        )
+        .env("DEVMANAGER_CUTOVER_TEST_MOVE_ROOT_AFTER_GUARD", &moved_root)
+        .output()
+        .expect("spawn publication root-move audit");
+
+    assert!(!output.status.success(), "fixture contract remains HOLD");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("FIXTURE_PUBLICATION_ROOT_MOVE_BLOCKED"),
+        "the executable move attempt was not observed\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(fixture.root.is_dir(), "authorized root was moved");
+    assert!(!moved_root.exists(), "move target unexpectedly exists");
+    assert!(output_path.is_file(), "final JSON report was not published");
+    assert!(output_path.with_extension("txt").is_file());
+}
+
+#[test]
 fn diagnostics_redact_ledger_values_and_absolute_fixture_details_everywhere() {
     let sentinel = "LEDGER_SECRET_SENTINEL";
     let mut document = contract(
@@ -2421,6 +2768,104 @@ fn report_replacement_is_relative_to_verified_parent_handle() {
 }
 
 #[test]
+fn report_publication_revalidates_root_even_when_git_identity_is_unavailable() {
+    let source = fs::read_to_string(AUDIT_SCRIPT).expect("read audit script");
+    assert!(
+        source.contains("Assert-CutoverAuthorizedRootIdentityStable"),
+        "the opened authorized-root identity needs a Git-independent revalidation helper"
+    );
+    assert!(
+        source.contains("Always revalidate the authorized root before report publication"),
+        "Git failure must not bypass root identity revalidation before a HOLD report"
+    );
+    assert!(
+        source.contains("Assert-CutoverPublicationAuthority")
+            && source.contains("Open-CutoverRelativeWriteFile")
+            && source.contains("NtCreateFile"),
+        "publication must bind the retained root/parent identities and create temporary files relative to the verified parent handle"
+    );
+}
+
+#[test]
+fn evidence_directories_are_created_relative_to_retained_no_delete_handles() {
+    let source = fs::read_to_string(AUDIT_SCRIPT).expect("read audit script");
+    assert!(
+        source.contains("Open-CutoverRelativeDirectoryChain")
+            && source.contains("CreateOrOpenRelativeDirectory"),
+        "evidence directories must be opened or created relative to retained directory handles"
+    );
+    assert!(
+        source.contains("DenyDeleteShare") && source.contains("rootDirectoryHandle"),
+        "the root and publication chain must prevent concurrent rename"
+    );
+    assert!(
+        !source.contains("[System.IO.Directory]::CreateDirectory($current)"),
+        "path-based check-then-create can follow a concurrently inserted junction"
+    );
+    assert!(
+        source.contains("private const uint FileOpenIf = 3;")
+            && source.contains("CreateOrOpenRelativeDirectory"),
+        "NtCreateFile FILE_OPEN_IF (disposition 3) must atomically create missing relative directories"
+    );
+
+    let fixture = fixture_repo(
+        contract(
+            vec![base_row(
+                "relative-directory-create",
+                "src/legacy.rs",
+                &["LegacyFixture"],
+                "src/replacement.rs",
+                &["gate-parity"],
+                "HOLD",
+            )],
+            vec![base_node("gate-parity", "gate", "HOLD")],
+        ),
+        &[],
+    );
+    let evidence_root = fixture.root.join(".devmanager-next/evidence");
+    assert!(
+        !evidence_root.exists(),
+        "the fixture must begin without an evidence directory"
+    );
+    let output_path = evidence_root.join("current/cutover-audit.json");
+    let output = spawn_audit(&fixture.root, &output_path);
+    assert!(!output.status.success(), "fixture contract remains HOLD");
+    let report: Value =
+        serde_json::from_slice(&fs::read(&output_path).expect("handle-relative created report"))
+            .expect("valid handle-relative created JSON");
+    assert_eq!(report["contractStatus"], "HOLD");
+    assert!(
+        output_path.with_extension("txt").is_file(),
+        "the missing evidence/current chain was not created relative to retained handles"
+    );
+}
+
+#[test]
+fn human_report_truncation_is_explicitly_converted_to_bounded_hold() {
+    let source = fs::read_to_string(AUDIT_SCRIPT).expect("read audit script");
+    assert!(
+        source.contains("humanTruncated") && source.contains("$humanTruncated -or"),
+        "the per-line writer must retain evidence that it omitted report content"
+    );
+    assert!(
+        source.contains("humanOmittedLineCount")
+            && source.contains("humanReportOmittedLineCount")
+            && source.contains("report content omitted due to safety bound"),
+        "the bounded HOLD fallback must disclose a bounded omitted-line count and marker"
+    );
+    assert!(
+        source.contains("status: HOLD") && source.contains("$safetyDiagnostic"),
+        "a truncated human report must be replaced by an explicit bounded HOLD"
+    );
+    assert!(
+        source.contains("boundedBlockers")
+            && source.contains("audit[remote_change_protected]")
+            && source.contains("audit[remote_change_unattributed]"),
+        "bounded fallback must retain explicit remote-change HOLD blockers"
+    );
+}
+
+#[test]
 fn fixture_authority_is_ephemeral_and_not_a_forgeable_static_marker() {
     let source = fs::read_to_string(AUDIT_SCRIPT).expect("read audit script");
     assert!(
@@ -2454,6 +2899,56 @@ fn tool_resolution_trusts_pinned_installations_and_only_allows_fixture_shims_in_
     assert!(
         source.contains("trusted tool root") || source.contains("trustedToolRoots"),
         "candidate audits must reject an ambient PATH executable"
+    );
+}
+
+#[test]
+fn candidate_tool_resolution_never_enumerates_ambient_path_or_provider_cache_suffixes() {
+    let source = fs::read_to_string(AUDIT_SCRIPT).expect("read audit script");
+    assert!(
+        source.contains("Get-CutoverCanonicalInstalledExecutableCandidates"),
+        "candidate Git/rg lookup must be generated exclusively from canonical installation roots"
+    );
+    assert!(
+        source.contains("executed image") || source.contains("ValidateExecutableIdentity"),
+        "the selected canonical tool image must be attested after CreateProcess"
+    );
+    assert!(
+        !source.contains("\\node_modules\\@openai\\codex-")
+            && !source.contains("\\node_modules\\@anthropic-ai\\claude-code"),
+        "a package-shaped path supplied through ambient PATH is forgeable"
+    );
+    assert!(
+        source
+            .to_ascii_lowercase()
+            .contains("candidate audits never enumerate ambient path"),
+        "the candidate-mode PATH prohibition must remain explicit"
+    );
+}
+
+#[test]
+fn candidate_child_environment_uses_canonical_os_paths_and_no_ambient_pwsh_lookup() {
+    let source = fs::read_to_string(AUDIT_SCRIPT).expect("read audit script");
+    assert!(
+        source.contains("SpecialFolder]::Windows")
+            && source.contains("[Environment]::SystemDirectory"),
+        "candidate Windows paths must come from OS known-folder APIs"
+    );
+    for ambient in [
+        "$env:SystemRoot",
+        "$env:WINDIR",
+        "$env:ComSpec",
+        "Get-Command pwsh",
+    ] {
+        assert!(
+            !source.contains(ambient),
+            "candidate child environment still trusts ambient lookup: {ambient}"
+        );
+    }
+    assert!(
+        source.contains("fixture-only environment")
+            && source.contains("authorizedRootKind -eq 'authenticated-fixture'"),
+        "shim controls must only enter authenticated fixture children"
     );
 }
 
@@ -2493,6 +2988,368 @@ fn descendant_records_include_pid_creation_and_verified_executable_identity() {
 }
 
 #[test]
+fn descendant_dedupe_uses_pid_creation_path_and_opened_executable_identity() {
+    let source = fs::read_to_string(AUDIT_SCRIPT).expect("read audit script");
+    assert!(
+        source.contains("SameTrackedProcessIdentity"),
+        "descendant dedupe needs one full-identity predicate"
+    );
+    assert!(
+        source.contains("existing.ProcessId")
+            && source.contains("existing.CreationTime")
+            && source.contains("existing.ExecutablePath")
+            && source.contains("existing.ExecutableIdentity")
+            && source.contains("SameFileIdentity"),
+        "PID and creation time alone are not a complete descendant identity"
+    );
+}
+
+#[test]
+fn scanner_lines_are_count_and_length_bounded_before_collection() {
+    let source = fs::read_to_string(AUDIT_SCRIPT).expect("read audit script");
+    assert!(
+        source.contains("maxScannerOutputLines") && source.contains("maxScannerOutputLineChars"),
+        "scanner output needs explicit line-count and per-line limits"
+    );
+    assert!(
+        source.contains("Read-CutoverUtf8Lines")
+            && source.contains("MaxBytes")
+            && source.contains("MaxLineChars"),
+        "byte, line-count, and line-length bounds must be applied by the incremental parser"
+    );
+    assert!(
+        !source.contains("$stdout -split"),
+        "unbounded split materializes attacker-controlled scanner lines before checking limits"
+    );
+    assert!(
+        source.contains("Read-CutoverUtf8Lines")
+            && source.contains("Read-CutoverContractLines")
+            && source.contains("Assert-CutoverWorkDeadline"),
+        "attacker-controlled parsers must preserve the settlement/publication reserve"
+    );
+}
+
+fn remote_state_fixture(pairing_token: &str, last_seen: u64, activity: Vec<Value>) -> Value {
+    json!({
+        "host": {
+            "enabled": true,
+            "bindAddress": "127.0.0.1",
+            "port": 43871,
+            "keepHostingInBackground": true,
+            "serverId": "server-id-must-never-leak",
+            "pairingToken": pairing_token,
+            "certificatePem": "certificate-must-never-leak",
+            "privateKeyPem": "private-key-must-never-leak",
+            "certificateFingerprint": "fingerprint-must-never-leak",
+            "pairedClients": [],
+            "web": {
+                "enabled": true,
+                "bindAddress": "127.0.0.1",
+                "port": 43872,
+                "pairingToken": "web-pairing-must-never-leak",
+                "cookieSecretHex": "cookie-secret-must-never-leak",
+                "pairedClients": [{
+                    "clientId": "browser-client-id-must-never-leak",
+                    "browserInstallId": "browser-install-id-must-never-leak",
+                    "nickname": "private-browser-name-must-never-leak",
+                    "label": "private-browser-label-must-never-leak",
+                    "issuedAtEpochMs": 10,
+                    "lastSeenEpochMs": last_seen,
+                    "lastSeenIp": "192.0.2.44",
+                    "userAgent": "private-user-agent-must-never-leak",
+                    "browserFamily": "Browser",
+                    "browserVersion": "1",
+                    "osFamily": "OS",
+                    "deviceClass": "desktop"
+                }],
+                "activityLog": activity,
+                "push": {
+                    "vapidPublicKey": "push-public-must-never-leak",
+                    "vapidPrivateKey": "push-private-must-never-leak",
+                    "subscriptions": []
+                }
+            }
+        },
+        "knownHosts": []
+    })
+}
+
+fn browser_activity(event_at: u64) -> Value {
+    json!({
+        "clientId": "browser-client-id-must-never-leak",
+        "source": "browser",
+        "eventKind": "reconnected",
+        "label": "private-browser-label-must-never-leak",
+        "ipAddress": "192.0.2.44",
+        "eventAtEpochMs": event_at,
+        "browserFamily": "Browser",
+        "browserVersion": "1",
+        "osFamily": "OS",
+        "deviceClass": "desktop"
+    })
+}
+
+fn remote_change_evidence(after_pairing_token: &str) -> Value {
+    let first_activity = browser_activity(100);
+    json!({
+        "schemaVersion": 1,
+        "writer": {
+            "installedDevManagerImageAttested": true,
+            "processIdMatched": true,
+            "creationTimeMatched": true
+        },
+        "before": remote_state_fixture(
+            "host-pairing-must-never-leak",
+            100,
+            vec![first_activity.clone()]
+        ),
+        "after": remote_state_fixture(
+            after_pairing_token,
+            200,
+            vec![first_activity, browser_activity(200)]
+        )
+    })
+}
+
+fn run_remote_change_evidence_with_human_limit(
+    evidence: Value,
+    human_report_limit: Option<u32>,
+) -> AuditRun {
+    let document = contract(
+        vec![base_row(
+            "remote-attribution",
+            "src/legacy.rs",
+            &["LegacyFixture"],
+            "src/replacement.rs",
+            &["gate-parity"],
+            "HOLD",
+        )],
+        vec![base_node("gate-parity", "gate", "HOLD")],
+    );
+    let evidence_bytes =
+        serde_json::to_vec_pretty(&evidence).expect("serialize remote change evidence");
+    let fixture = fixture_repo(
+        document,
+        &[(
+            ".devmanager-next/fixtures/remote-change.json",
+            evidence_bytes.as_slice(),
+        )],
+    );
+    let evidence_path = fixture
+        .root
+        .join(".devmanager-next/fixtures/remote-change.json");
+    let before_bytes = fs::read(&evidence_path).expect("remote evidence before audit");
+    let output_path = fixture
+        .root
+        .join(".devmanager-next/evidence/current/cutover-audit.json");
+    let output = spawn_audit_with_remote_change(
+        &fixture.root,
+        &output_path,
+        &evidence_path,
+        human_report_limit,
+    );
+    assert!(
+        output_path.is_file(),
+        "remote attribution audit must publish a report"
+    );
+    assert_eq!(
+        fs::read(&evidence_path).expect("remote evidence after audit"),
+        before_bytes,
+        "remote attribution must be read-only"
+    );
+    let report: Value = serde_json::from_slice(&fs::read(&output_path).expect("audit JSON"))
+        .expect("valid audit JSON");
+    let human = fs::read_to_string(output_path.with_extension("txt")).expect("human audit report");
+    AuditRun {
+        fixture,
+        output,
+        report,
+        human,
+    }
+}
+
+fn run_remote_change_evidence(evidence: Value) -> AuditRun {
+    run_remote_change_evidence_with_human_limit(evidence, None)
+}
+
+fn run_remote_change_audit(after_pairing_token: &str) -> AuditRun {
+    run_remote_change_evidence(remote_change_evidence(after_pairing_token))
+}
+
+#[test]
+fn bounded_human_report_emits_omission_count_and_preserves_remote_hold() {
+    let run = run_remote_change_evidence_with_human_limit(
+        remote_change_evidence("changed-pairing-authority-must-never-leak"),
+        Some(256),
+    );
+    assert_eq!(run.report["contractStatus"], "HOLD");
+    assert_eq!(run.report["safety"]["humanReportTruncated"], true);
+    let omitted = run.report["safety"]["humanReportOmittedLineCount"]
+        .as_u64()
+        .expect("human omitted-line count");
+    assert!(omitted > 0, "truncation must disclose omitted lines");
+    assert!(run
+        .human
+        .contains("report content omitted due to safety bound"));
+    assert!(run.human.contains(&format!("omitted lines: {omitted}")));
+    assert!(
+        run.human.contains("audit[remote_change_protected]"),
+        "the bounded human HOLD must retain its specific safety reason: {}",
+        run.human
+    );
+    assert!(strings_at(&run.report, &["blockers"]).contains(&"audit[remote_change_protected]"));
+}
+
+#[test]
+fn remote_change_attribution_is_read_only_semantic_and_redacted() {
+    let activity = run_remote_change_audit("host-pairing-must-never-leak");
+    assert_eq!(
+        activity.report["remoteChangeAttribution"]["classification"],
+        "authorized-installed-app-browser-activity"
+    );
+    assert_eq!(
+        activity.report["remoteChangeAttribution"]["writer"],
+        "verified-installed-app-generation"
+    );
+    assert_eq!(
+        activity.report["remoteChangeAttribution"]["changedCategories"],
+        json!(["browser-activity-log", "browser-last-seen"])
+    );
+    assert!(
+        !strings_at(&activity.report, &["blockers"]).contains(&"audit[remote_change_unattributed]")
+    );
+    assert!(
+        !strings_at(&activity.report, &["blockers"]).contains(&"audit[remote_change_protected]")
+    );
+
+    let mut paired_event = remote_change_evidence("host-pairing-must-never-leak");
+    paired_event["after"]["host"]["web"]["activityLog"][1]["eventKind"] = json!("paired");
+    let paired_event = run_remote_change_evidence(paired_event);
+    assert_eq!(
+        paired_event.report["remoteChangeAttribution"]["classification"],
+        "authorized-installed-app-browser-activity",
+        "the installed app's paired activity kind is valid log metadata when device authority is unchanged"
+    );
+
+    let mut paired_authority = remote_change_evidence("host-pairing-must-never-leak");
+    paired_authority["after"]["host"]["web"]["activityLog"][1]["eventKind"] = json!("paired");
+    let mut second_client = paired_authority["after"]["host"]["web"]["pairedClients"][0].clone();
+    second_client["clientId"] = json!("second-browser-client-id-must-never-leak");
+    paired_authority["after"]["host"]["web"]["pairedClients"]
+        .as_array_mut()
+        .expect("paired client array")
+        .push(second_client);
+    let paired_authority = run_remote_change_evidence(paired_authority);
+    assert_eq!(
+        paired_authority.report["remoteChangeAttribution"]["classification"],
+        "protected-or-unclassified-change",
+        "a real paired-device authority change must remain protected"
+    );
+    assert!(strings_at(&paired_authority.report, &["blockers"])
+        .contains(&"audit[remote_change_protected]"));
+
+    let mut bounded_log = remote_change_evidence("host-pairing-must-never-leak");
+    bounded_log["before"]["host"]["web"]["activityLog"] =
+        Value::Array((0..100).map(browser_activity).collect());
+    bounded_log["after"]["host"]["web"]["activityLog"] =
+        Value::Array((1..=100).map(browser_activity).collect());
+    let bounded_log = run_remote_change_evidence(bounded_log);
+    assert_eq!(
+        bounded_log.report["remoteChangeAttribution"]["classification"],
+        "authorized-installed-app-browser-activity",
+        "one bounded-log trim plus one append is normal installed-app activity"
+    );
+
+    let mut short_log_rewrite = remote_change_evidence("host-pairing-must-never-leak");
+    short_log_rewrite["before"]["host"]["web"]["activityLog"] =
+        Value::Array((0..3).map(browser_activity).collect());
+    short_log_rewrite["after"]["host"]["web"]["activityLog"] =
+        Value::Array((1..=3).map(browser_activity).collect());
+    let short_log_rewrite = run_remote_change_evidence(short_log_rewrite);
+    assert_eq!(
+        short_log_rewrite.report["remoteChangeAttribution"]["classification"],
+        "protected-or-unclassified-change",
+        "history may only be trimmed when appends overflow the 100-entry bound"
+    );
+    assert!(strings_at(&short_log_rewrite.report, &["blockers"])
+        .contains(&"audit[remote_change_protected]"));
+
+    let mut unverified = remote_change_evidence("host-pairing-must-never-leak");
+    unverified["writer"]["creationTimeMatched"] = Value::Bool(false);
+    let unverified = run_remote_change_evidence(unverified);
+    assert_eq!(
+        unverified.report["remoteChangeAttribution"]["classification"],
+        "browser-activity-unattributed"
+    );
+    assert!(strings_at(&unverified.report, &["blockers"])
+        .contains(&"audit[remote_change_unattributed]"));
+
+    let mut protected_evidence =
+        remote_change_evidence("changed-pairing-authority-must-never-leak");
+    protected_evidence["after"]["host"]["web"]["cookieSecretHex"] =
+        json!("changed-cookie-secret-must-never-leak");
+    protected_evidence["after"]["knownHosts"] = json!([{
+        "serverId": "known-host-id-must-never-leak",
+        "pairingToken": "known-host-token-must-never-leak"
+    }]);
+    let authority = run_remote_change_evidence(protected_evidence);
+    assert_eq!(
+        authority.report["remoteChangeAttribution"]["classification"],
+        "protected-or-unclassified-change"
+    );
+    assert!(
+        authority.report["remoteChangeAttribution"]["changedCategories"]
+            .as_array()
+            .expect("changed categories")
+            .iter()
+            .any(|category| category == "protected-or-unclassified")
+    );
+    assert!(
+        strings_at(&authority.report, &["blockers"]).contains(&"audit[remote_change_protected]")
+    );
+
+    for run in [
+        &activity,
+        &paired_event,
+        &paired_authority,
+        &bounded_log,
+        &unverified,
+        &authority,
+    ] {
+        let channels = [
+            run.report.to_string(),
+            run.human.clone(),
+            String::from_utf8_lossy(&run.output.stdout).into_owned(),
+            String::from_utf8_lossy(&run.output.stderr).into_owned(),
+        ];
+        for channel in channels {
+            for secret in [
+                "server-id-must-never-leak",
+                "host-pairing-must-never-leak",
+                "changed-pairing-authority-must-never-leak",
+                "cookie-secret-must-never-leak",
+                "changed-cookie-secret-must-never-leak",
+                "known-host-id-must-never-leak",
+                "known-host-token-must-never-leak",
+                "private-key-must-never-leak",
+                "push-private-must-never-leak",
+                "browser-client-id-must-never-leak",
+                "second-browser-client-id-must-never-leak",
+                "browser-install-id-must-never-leak",
+                "private-browser-name-must-never-leak",
+                "private-user-agent-must-never-leak",
+                "192.0.2.44",
+            ] {
+                assert!(
+                    !channel.contains(secret),
+                    "remote evidence leaked: {channel}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn temporary_report_creation_records_identity_and_deletes_failed_handles() {
     let source = fs::read_to_string(AUDIT_SCRIPT).expect("read audit script");
     assert!(
@@ -2500,7 +3357,7 @@ fn temporary_report_creation_records_identity_and_deletes_failed_handles() {
         "temporary report creation must retain the handle identity it created"
     );
     assert!(
-        source.contains("DeleteByHandle") && source.contains("Open-CutoverConfinedWriteFile"),
+        source.contains("DeleteByHandle") && source.contains("Open-CutoverRelativeWriteFile"),
         "failed temporary creation must delete through its retained handle"
     );
     assert!(
