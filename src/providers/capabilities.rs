@@ -1256,7 +1256,7 @@ impl ProviderAuthEvidenceReceipt {
     }
 
     pub fn is_fresh_at(&self, now: Instant) -> bool {
-        now >= self.observed_at && now <= self.deadline
+        now >= self.observed_at && now < self.deadline
     }
 
     fn key(&self) -> ProviderAuthReceiptKey {
@@ -1682,7 +1682,7 @@ impl ProviderAuthEvidenceRegistry {
         if observed_at > now {
             return Err(ProviderAuthEvidenceError::FutureTimestamp);
         }
-        if observed_at < invocation.issued_at || observed_at > invocation.deadline {
+        if observed_at < invocation.issued_at || observed_at >= invocation.deadline {
             self.remove_pending(&key);
             return Err(ProviderAuthEvidenceError::Expired);
         }
@@ -1694,7 +1694,7 @@ impl ProviderAuthEvidenceRegistry {
         {
             return Err(ProviderAuthEvidenceError::FutureTimestamp);
         }
-        if observed_at_ms < issued_at_ms || observed_at_ms > deadline_ms {
+        if observed_at_ms < issued_at_ms || observed_at_ms >= deadline_ms {
             self.remove_pending(&key);
             return Err(ProviderAuthEvidenceError::Expired);
         }
@@ -1776,7 +1776,7 @@ impl ProviderAuthEvidenceRegistry {
             return Err(ProviderAuthEvidenceError::ExecutableChanged(error));
         }
         let now = self.clock.now();
-        if receipt.deadline < now {
+        if receipt.deadline <= now {
             return Err(ProviderAuthEvidenceError::Expired);
         }
         self.evict_expired(now);
@@ -2821,6 +2821,51 @@ fn open_directory_handle(path: &Path) -> Result<(Arc<File>, u128), ProviderDisco
     Ok((Arc::new(file), stable_id))
 }
 
+#[cfg(target_os = "windows")]
+fn open_directory_reparse_handle(path: &Path) -> Result<(Arc<File>, u128), ProviderDiscoveryError> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|_| ProviderDiscoveryError::InvalidPathSnapshot(path.to_path_buf()))?;
+    if !metadata.is_dir() && !metadata_is_reparse(&metadata) {
+        return Err(ProviderDiscoveryError::InvalidPathSnapshot(
+            path.to_path_buf(),
+        ));
+    }
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+    };
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0 | FILE_FLAG_OPEN_REPARSE_POINT.0)
+        .share_mode(FILE_SHARE_READ.0);
+    let file = options
+        .open(path)
+        .map_err(|_| ProviderDiscoveryError::InvalidPathSnapshot(path.to_path_buf()))?;
+    let identity = file_identity_allow_reparse(&file, path)
+        .map_err(|_| ProviderDiscoveryError::InvalidPathSnapshot(path.to_path_buf()))?;
+    let stable_id = identity.stable_id();
+    if stable_id == 0 {
+        return Err(ProviderDiscoveryError::InvalidPathSnapshot(
+            path.to_path_buf(),
+        ));
+    }
+    Ok((Arc::new(file), stable_id))
+}
+
+#[cfg(target_os = "windows")]
+fn capture_ancestor_handles(
+    path: &Path,
+) -> Result<Vec<(PathBuf, u128, Arc<File>)>, ProviderDiscoveryError> {
+    path.ancestors()
+        .skip(1)
+        .map(|ancestor| {
+            let (handle, identity) = open_directory_reparse_handle(ancestor)?;
+            Ok((ancestor.to_path_buf(), identity, handle))
+        })
+        .collect()
+}
+
 fn reject_reparse_components(path: &Path) -> Result<(), ProviderExecutableError> {
     for ancestor in path.ancestors() {
         match fs::symlink_metadata(ancestor) {
@@ -2862,6 +2907,23 @@ fn file_identity(
     file: &File,
     path: &Path,
 ) -> Result<ProviderFileIdentity, ProviderExecutableError> {
+    windows_file_identity(file, path, true)
+}
+
+#[cfg(target_os = "windows")]
+fn file_identity_allow_reparse(
+    file: &File,
+    path: &Path,
+) -> Result<ProviderFileIdentity, ProviderExecutableError> {
+    windows_file_identity(file, path, false)
+}
+
+#[cfg(target_os = "windows")]
+fn windows_file_identity(
+    file: &File,
+    path: &Path,
+    reject_reparse: bool,
+) -> Result<ProviderFileIdentity, ProviderExecutableError> {
     use std::os::windows::io::AsRawHandle;
     use windows::Win32::Foundation::HANDLE;
     use windows::Win32::Storage::FileSystem::{
@@ -2882,9 +2944,10 @@ fn file_identity(
             .to_le_bytes(),
         link_count: information.nNumberOfLinks,
     };
-    if information.dwFileAttributes
-        & windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT.0
-        != 0
+    if reject_reparse
+        && information.dwFileAttributes
+            & windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT.0
+            != 0
     {
         return Err(ProviderExecutableError::SymlinkOrReparse(
             path.to_path_buf(),
@@ -3072,6 +3135,9 @@ struct ProviderPathSnapshotEntry {
     directory: PathBuf,
     identity: u128,
     directory_handle: Arc<File>,
+    requested_identity: u128,
+    requested_directory_handle: Arc<File>,
+    ancestor_handles: Vec<(PathBuf, u128, Arc<File>)>,
 }
 
 impl PartialEq for ProviderPathSnapshotEntry {
@@ -3133,12 +3199,25 @@ impl ProviderPathSnapshot {
             reject_reparse_components(&canonical)
                 .map_err(|_| ProviderDiscoveryError::InvalidPathSnapshot(canonical.clone()))?;
             let (directory_handle, identity) = open_directory_handle(&canonical)?;
+            #[cfg(target_os = "windows")]
+            let (requested_directory_handle, requested_identity) =
+                open_directory_reparse_handle(&directory)?;
+            #[cfg(not(target_os = "windows"))]
+            let (requested_directory_handle, requested_identity) =
+                (Arc::clone(&directory_handle), identity);
+            #[cfg(target_os = "windows")]
+            let ancestor_handles = capture_ancestor_handles(&directory)?;
+            #[cfg(not(target_os = "windows"))]
+            let ancestor_handles = Vec::new();
             directories.push(ProviderPathSnapshotEntry {
                 index,
                 requested_directory: directory,
                 directory: canonical,
                 identity,
                 directory_handle,
+                requested_identity,
+                requested_directory_handle,
+                ancestor_handles,
             });
         }
         Ok(Self { directories })
@@ -3182,6 +3261,37 @@ impl ProviderPathSnapshotEntry {
             return Err(ProviderDiscoveryError::InvalidPathSnapshot(
                 self.directory.clone(),
             ));
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let (_current_requested_handle, current_requested_identity) =
+                open_directory_reparse_handle(&self.requested_directory)?;
+            let held_requested_identity = file_identity_allow_reparse(
+                &self.requested_directory_handle,
+                &self.requested_directory,
+            )
+            .map_err(|_| {
+                ProviderDiscoveryError::InvalidPathSnapshot(self.requested_directory.clone())
+            })?
+            .stable_id();
+            if current_requested_identity != self.requested_identity
+                || held_requested_identity != self.requested_identity
+            {
+                return Err(ProviderDiscoveryError::InvalidPathSnapshot(
+                    self.requested_directory.clone(),
+                ));
+            }
+            for (ancestor, identity, handle) in &self.ancestor_handles {
+                let (_current_handle, current_identity) = open_directory_reparse_handle(ancestor)?;
+                let held_identity = file_identity_allow_reparse(handle, ancestor)
+                    .map_err(|_| ProviderDiscoveryError::InvalidPathSnapshot(ancestor.clone()))?
+                    .stable_id();
+                if current_identity != *identity || held_identity != *identity {
+                    return Err(ProviderDiscoveryError::InvalidPathSnapshot(
+                        ancestor.clone(),
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -3816,13 +3926,8 @@ impl ProviderDiscoveryContract {
 
 #[cfg(target_os = "windows")]
 fn attest_direct_cmd_wrapper(contents: &str, target_name: &str) -> bool {
-    let normalized = contents.replace("\r\n", "\n");
-    let expected = format!("@echo off\ncall \"%~dp0{target_name}\" %*\n");
-    if normalized.eq_ignore_ascii_case(&expected) {
-        return true;
-    }
-    let lower = normalized.to_ascii_lowercase();
-    let safe_markers = [
+    let target_name = target_name.to_ascii_lowercase();
+    let required = [
         "@echo off",
         "goto start",
         ":find_dp0",
@@ -3832,70 +3937,56 @@ fn attest_direct_cmd_wrapper(contents: &str, target_name: &str) -> bool {
         "setlocal",
         "call :find_dp0",
     ];
-    if !safe_markers.iter().all(|marker| lower.contains(marker))
-        || lower.contains("powershell")
-        || lower.contains("cmd /c")
-        || lower.contains("http")
-        || lower.contains("&&")
-        || lower.contains("||")
-        || lower.contains("|")
-        || lower.contains(";")
-        || !lower.contains(&target_name.to_ascii_lowercase())
+    let lines = normalized_wrapper_lines(contents);
+    if lines
+        == [
+            "@echo off".to_string(),
+            format!("call \"%~dp0{target_name}\" %*"),
+        ]
     {
-        return false;
+        return true;
     }
-    lower.lines().any(|line| {
-        line.contains("%dp0%")
-            && line.contains(&target_name.to_ascii_lowercase())
-            && line.contains("%*")
+    strict_wrapper_lines(&lines, &required, |line| {
+        line.starts_with("\"%dp0%\\")
+            && line.ends_with("%*")
+            && line.contains(&target_name)
+            && !contains_cmd_separator(line)
     })
 }
 
 #[cfg(target_os = "windows")]
 fn attest_provider_wrapper(kind: ProviderKind, path: &Path, contents: &str) -> bool {
-    let lower = contents.replace("\r\n", "\n").to_ascii_lowercase();
     let Some(extension) = path.extension().and_then(|extension| extension.to_str()) else {
         return false;
     };
-    let unsafe_marker = lower.contains("invoke-expression")
-        || lower.contains("download")
-        || lower.contains("http://")
-        || lower.contains("https://")
-        || lower.contains("cmd /c")
-        || lower.contains("start-process")
-        || lower.contains("powershell -command")
-        || lower.contains("-command ");
-    if unsafe_marker {
-        return false;
-    }
     match kind {
         ProviderKind::ClaudeCode => {
             if extension.eq_ignore_ascii_case("cmd") {
-                attest_claude_cmd_wrapper(&lower)
+                attest_claude_cmd_wrapper(contents)
             } else {
-                attest_claude_powershell_wrapper(&lower)
+                attest_claude_powershell_wrapper(contents)
             }
         }
         ProviderKind::Codex => {
             if extension.eq_ignore_ascii_case("cmd") {
-                attest_codex_cmd_wrapper(&lower)
+                attest_codex_cmd_wrapper(contents)
             } else {
-                attest_codex_powershell_wrapper(&lower)
+                attest_codex_powershell_wrapper(contents)
             }
         }
         ProviderKind::Cursor => {
             if extension.eq_ignore_ascii_case("cmd") {
-                attest_cursor_cmd_wrapper(&lower)
+                attest_cursor_cmd_wrapper(contents)
             } else {
-                attest_cursor_powershell_wrapper(&lower)
+                attest_cursor_powershell_wrapper(contents)
             }
         }
     }
 }
 
 #[cfg(target_os = "windows")]
-fn attest_claude_cmd_wrapper(lower: &str) -> bool {
-    [
+fn attest_claude_cmd_wrapper(contents: &str) -> bool {
+    let required = [
         "@echo off",
         "goto start",
         ":find_dp0",
@@ -3904,94 +3995,157 @@ fn attest_claude_cmd_wrapper(lower: &str) -> bool {
         ":start",
         "setlocal",
         "call :find_dp0",
-        "node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe",
-        "%*",
-    ]
-    .iter()
-    .all(|marker| lower.contains(marker))
-        && lower.lines().any(|line| {
-            line.contains("%dp0%")
-                && line.contains("node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe")
-                && line.contains("%*")
-        })
-}
-
-#[cfg(target_os = "windows")]
-fn attest_claude_powershell_wrapper(lower: &str) -> bool {
-    lower.contains("$basedir=split-path")
-        && lower.contains("$basedir/node_modules/@anthropic-ai/claude-code/bin/claude.exe")
-        && lower.contains("$args")
-        && lower.contains("exit $lastexitcode")
-}
-
-#[cfg(target_os = "windows")]
-fn attest_codex_cmd_wrapper(lower: &str) -> bool {
-    [
-        "@echo off",
-        "goto start",
-        ":find_dp0",
-        "set dp0=%~dp0",
-        "exit /b",
-        ":start",
-        "setlocal",
-        "call :find_dp0",
-        "if exist \"%dp0%\\node.exe\"",
-        "set \"_prog=%dp0%\\node.exe\"",
-        "set \"_prog=node\"",
-        "codex.js",
-        "%*",
-    ]
-    .iter()
-    .all(|marker| lower.contains(marker))
-        && lower.contains("endlocal & goto")
-        && lower.lines().any(|line| {
-            line.contains("%_prog%")
-                && line.contains("%dp0%\\..\\@openai\\codex\\bin\\codex.js")
-                && line.contains("%*")
-        })
-}
-
-#[cfg(target_os = "windows")]
-fn attest_codex_powershell_wrapper(lower: &str) -> bool {
-    lower.contains("split-path")
-        && lower.contains("$basedir/node$exe")
-        && lower.contains("$basedir/../@openai/codex/bin/codex.js")
-        && lower.contains("\"node$exe\"")
-        && lower.contains("$lastexitcode")
-}
-
-#[cfg(target_os = "windows")]
-fn attest_cursor_cmd_wrapper(lower: &str) -> bool {
-    [
-        "@echo off",
-        "setlocal",
-        "cursor_invoked_as=%~nx0",
-        "set \"script_dir=%~dp0\"",
-        "powershell.exe",
-        "-noprofile",
-        "-executionpolicy bypass",
-        "-file \"%script_dir%\\cursor-agent.ps1\" %*",
-    ]
-    .iter()
-    .all(|marker| lower.contains(marker))
-        && !lower.contains("-command")
-        && !lower.contains("||")
-        && !lower.contains("&&")
-}
-
-#[cfg(target_os = "windows")]
-fn attest_cursor_powershell_wrapper(lower: &str) -> bool {
-    let lower = lower.to_ascii_lowercase();
-    let markers = [
-        lower.contains("$scriptpath = split-path -parent"),
-        lower.contains("get-childitem -path \"$scriptpath\\versions\""),
-        lower.contains("node.exe"),
-        lower.contains("index.js"),
-        lower.contains("parse-versionstring"),
-        lower.contains("sort-object"),
-        lower.contains("exit $lastexitcode"),
     ];
-    markers.into_iter().all(|marker| marker)
+    let target = "node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe";
+    let lines = normalized_wrapper_lines(contents);
+    strict_wrapper_lines(&lines, &required, |line| {
+        line.starts_with("\"%dp0%\\")
+            && line.ends_with("%*")
+            && line.contains(target)
+            && !contains_cmd_separator(line)
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn attest_claude_powershell_wrapper(contents: &str) -> bool {
+    let required = ["$basedir=split-path", "exit $lastexitcode"];
+    let lines = normalized_wrapper_lines(contents);
+    strict_wrapper_lines(&lines, &required, |line| {
+        line.starts_with("& ")
+            && line.contains("$basedir/node_modules/@anthropic-ai/claude-code/bin/claude.exe")
+            && line.ends_with("$args")
+            && !line.contains(';')
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn attest_codex_cmd_wrapper(contents: &str) -> bool {
+    let required = [
+        "@echo off",
+        "goto start",
+        ":find_dp0",
+        "set dp0=%~dp0",
+        "exit /b",
+        ":start",
+        "setlocal",
+        "call :find_dp0",
+        "if exist \"%dp0%\\node.exe\" (",
+        "set \"_prog=%dp0%\\node.exe\"",
+        ") else (",
+        "set \"_prog=node\"",
+        ")",
+    ];
+    let lines = normalized_wrapper_lines(contents);
+    strict_wrapper_lines(&lines, &required, |line| {
+        line == "endlocal & goto #_undefined_# 2>nul || title %comspec% & set pathext=%pathext:;.js;=;% & \"%_prog%\" \"%dp0%\\..\\@openai\\codex\\bin\\codex.js\" %*"
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn attest_codex_powershell_wrapper(contents: &str) -> bool {
+    let required = ["$basedir=split-path", "exit $lastexitcode"];
+    let lines = normalized_wrapper_lines(contents);
+    strict_wrapper_lines(&lines, &required, |line| {
+        line.starts_with("& \"$basedir/node$exe\"")
+            && line.contains("$basedir/../@openai/codex/bin/codex.js")
+            && line.ends_with("$args")
+            && !line.contains(';')
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn attest_cursor_cmd_wrapper(contents: &str) -> bool {
+    let required = [
+        "@echo off",
+        "setlocal enabledelayedexpansion",
+        "set \"cursor_invoked_as=%~nx0\"",
+        "set \"script_dir=%~dp0\"",
+        "if \"%script_dir:~-1%\"==\"\\\" set \"script_dir=%script_dir:~0,-1%\"",
+    ];
+    let lines = normalized_wrapper_lines(contents);
+    let result = strict_wrapper_lines(&lines, &required, |line| {
+        line.contains("powershell.exe")
+            && line.contains("-noprofile")
+            && line.contains("-executionpolicy bypass")
+            && line.contains("-file \"%script_dir%\\cursor-agent.ps1\" %*")
+            && !contains_cmd_separator(line)
+    });
+    result
+}
+
+#[cfg(target_os = "windows")]
+fn attest_cursor_powershell_wrapper(contents: &str) -> bool {
+    let lines = normalized_wrapper_lines(contents);
+    let offset = if lines.len() == 6 {
+        0
+    } else if lines.len() == 7 && lines[3] == "$versionname = $versiondir.name" {
+        1
+    } else {
+        return false;
+    };
+    let version_line = &lines[2];
+    let version_prefix = "$versiondir = get-childitem -path \"$scriptpath\\versions\" -directory";
+    let version_sort = "| sort-object { parse-versionstring $_.name } -descending";
+    let version_line_is_stock = version_line == &format!("{version_prefix} {version_sort}")
+        || version_line
+            == &format!(
+                "{version_prefix} | where-object {{ $_.name -match '^\\d{{4}}\\.\\d{{1,2}}\\.\\d{{1,2}}-[a-f0-9]+$' }} {version_sort} | select-object -first 1"
+            );
+    lines[0] == "$scriptpath = split-path -parent $myinvocation.mycommand.definition"
+        && lines[1].starts_with("function parse-versionstring {")
+        && lines[1].ends_with('}')
+        && !lines[1].contains(';')
+        && version_line_is_stock
+        && lines[3 + offset].starts_with("$nodepath = \"$scriptpath\\versions\\")
+        && lines[3 + offset].ends_with("\\node.exe\"")
+        && lines[4 + offset].starts_with("& \"$nodepath\" \"$scriptpath\\versions\\")
+        && lines[4 + offset].ends_with("\\index.js\" $args")
+        && !lines[4 + offset].contains(';')
+        && lines[5 + offset] == "exit $lastexitcode"
+}
+
+#[cfg(target_os = "windows")]
+fn normalized_wrapper_lines(contents: &str) -> Vec<String> {
+    contents
+        .replace("\r\n", "\n")
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            line.to_ascii_lowercase()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect()
+}
+
+#[cfg(target_os = "windows")]
+fn strict_wrapper_lines<F>(lines: &[String], required: &[&str], dynamic: F) -> bool
+where
+    F: Fn(&str) -> bool,
+{
+    let mut counts = vec![0_u8; required.len()];
+    let mut dynamic_count = 0_u8;
+    for line in lines {
+        if dynamic(line) {
+            dynamic_count = dynamic_count.saturating_add(1);
+            continue;
+        }
+        if contains_cmd_separator(line) {
+            return false;
+        }
+        let Some(index) = required.iter().position(|required| *required == line) else {
+            return false;
+        };
+        counts[index] = counts[index].saturating_add(1);
+    }
+    dynamic_count == 1 && counts.iter().all(|count| *count == 1)
+}
+
+#[cfg(target_os = "windows")]
+fn contains_cmd_separator(line: &str) -> bool {
+    line.contains('&') || line.contains('|') || line.contains(';') || line.contains('>')
 }
 
 #[cfg(target_os = "windows")]
@@ -4218,6 +4372,33 @@ mod auth_timestamp_tests {
     }
 
     #[test]
+    fn auth_receipt_expiry_is_exclusive_at_the_absolute_deadline() {
+        let observed_at = Instant::now();
+        let executable = ProviderExecutable::from_path(std::env::current_exe().unwrap())
+            .unwrap()
+            .open_for_launch()
+            .unwrap();
+        let deadline = observed_at + Duration::from_secs(30);
+        let receipt = ProviderAuthEvidenceReceipt {
+            kind: ProviderKind::ClaudeCode,
+            source: ProviderAuthEvidenceSource::ClaudeCodeSubscriptionLogin,
+            executable,
+            version: ProviderVersion::new("fixture-1").unwrap(),
+            nonce: [1; PROVIDER_AUTH_NONCE_BYTES],
+            generation: 1,
+            result: ProviderAuthProbeResult::AuthRequired,
+            observed_at,
+            deadline,
+            observed_at_ms: 1,
+            deadline_ms: 2,
+            confidence: EvidenceConfidence::High,
+        };
+
+        assert!(receipt.is_fresh_at(observed_at));
+        assert!(!receipt.is_fresh_at(deadline));
+    }
+
+    #[test]
     fn auth_capability_evidence_uses_clock_timestamp_not_generation() {
         let executable = ProviderExecutable::from_path(std::env::current_exe().unwrap())
             .unwrap()
@@ -4404,8 +4585,8 @@ fn is_forbidden_runner_name(name: &str) -> bool {
 #[cfg(all(test, target_os = "windows"))]
 mod wrapper_tests {
     use super::{
-        attest_codex_cmd_wrapper, attest_cursor_cmd_wrapper, attest_cursor_powershell_wrapper,
-        attest_provider_wrapper,
+        attest_claude_cmd_wrapper, attest_codex_cmd_wrapper, attest_cursor_cmd_wrapper,
+        attest_cursor_powershell_wrapper, attest_provider_wrapper,
     };
     use crate::providers::capabilities::ProviderKind;
 
@@ -4462,6 +4643,43 @@ exit $LASTEXITCODE
         .replace("\r\n", "\n")
         .to_ascii_lowercase();
         assert!(attest_cursor_powershell_wrapper(&cursor_ps1));
+    }
+
+    #[test]
+    fn controlled_wrappers_reject_appended_commands() {
+        let mut claude = r#"@ECHO off
+GOTO start
+:find_dp0
+SET dp0=%~dp0
+EXIT /b
+:start
+SETLOCAL
+CALL :find_dp0
+"%dp0%\node_modules\@anthropic-ai\claude-code\bin\claude.exe" %*
+"#
+        .replace("\r\n", "\n")
+        .to_ascii_lowercase();
+        assert!(attest_claude_cmd_wrapper(&claude));
+        claude.push_str("whoami\n");
+        assert!(!attest_claude_cmd_wrapper(&claude));
+        assert!(!attest_provider_wrapper(
+            ProviderKind::ClaudeCode,
+            std::path::Path::new("claude.cmd"),
+            &claude
+        ));
+
+        let mut cursor = r#"$scriptPath = Split-Path -parent $MyInvocation.MyCommand.Definition
+function Parse-VersionString { param ([string]$versionString) return 1 }
+$versionDir = Get-ChildItem -Path "$scriptPath\versions" -Directory | Sort-Object { Parse-VersionString $_.Name } -Descending
+$nodePath = "$scriptPath\versions\x\node.exe"
+& "$nodePath" "$scriptPath\versions\x\index.js" $args
+exit $LASTEXITCODE
+"#
+        .replace("\r\n", "\n")
+        .to_ascii_lowercase();
+        assert!(attest_cursor_powershell_wrapper(&cursor));
+        cursor.push_str("Get-Process\n");
+        assert!(!attest_cursor_powershell_wrapper(&cursor));
     }
 }
 

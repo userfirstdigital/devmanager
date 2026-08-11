@@ -557,6 +557,7 @@ pub struct ProviderProbeResult {
     stdout_bytes: usize,
     stderr_bytes: usize,
     output: Option<ProviderProbeOutput>,
+    request_binding: ProviderProbeRequestBinding,
     auth_proof: Option<ProviderProbeProof>,
 }
 
@@ -604,6 +605,7 @@ impl ProviderProbeResult {
             stdout_bytes,
             stderr_bytes,
             output: None,
+            request_binding: request.binding(),
             auth_proof: None,
         })
     }
@@ -630,6 +632,7 @@ impl ProviderProbeResult {
             stdout_bytes: output.stdout.len(),
             stderr_bytes: output.stderr.len(),
             output: Some(output),
+            request_binding: request.binding(),
             auth_proof: None,
         })
     }
@@ -687,6 +690,9 @@ impl ProviderProbeResult {
             || !request.auth_binding_matches(invocation)
         {
             return Err(ProviderAuthEvidenceError::UntrustedAuthenticationEvidence);
+        }
+        if self.request_binding != request.binding() {
+            return Err(ProviderAuthEvidenceError::RequestBindingMismatch);
         }
         let Some(proof) = self.auth_proof.as_ref() else {
             return Err(ProviderAuthEvidenceError::UntrustedAuthenticationEvidence);
@@ -962,7 +968,7 @@ impl WindowsProviderProbeRunner {
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
-            scrub_provider_secret_environment(&mut command);
+            provider_environment_allowlist(&mut command);
 
             #[cfg(windows)]
             command
@@ -996,7 +1002,7 @@ impl WindowsProviderProbeRunner {
                 ProviderProbeIoError::ExecutableNotAllowed,
             ));
         }
-        if let Err(error) = process.release_attestation_barrier() {
+        if let Err(error) = process.release_attestation_barrier_once() {
             let _ = process.terminate_tree(deadline);
             return Err(error);
         }
@@ -1067,8 +1073,8 @@ impl WindowsProviderProbeRunner {
             .take_stderr()
             .ok_or(ProviderProbeError::Io(ProviderProbeIoError::SpawnFailed))?;
         let capture = Arc::new(BoundedProbeCapture::new(request.max_output_bytes()));
-        let stdout_reader = spawn_probe_reader(stdout, Arc::clone(&capture), true);
-        let stderr_reader = spawn_probe_reader(stderr, Arc::clone(&capture), false);
+        let stdout_reader = spawn_probe_reader(stdout, Arc::clone(&capture), true, deadline);
+        let stderr_reader = spawn_probe_reader(stderr, Arc::clone(&capture), false, deadline);
 
         let mut timed_out = false;
         let mut primary_error = None;
@@ -1104,16 +1110,11 @@ impl WindowsProviderProbeRunner {
         }
         let mut stdout_reader = stdout_reader;
         let mut stderr_reader = stderr_reader;
-        let stdout_join = receive_probe_reader(&mut stdout_reader, deadline);
-        let stderr_join = receive_probe_reader(&mut stderr_reader, deadline);
+        let readers_join = receive_probe_readers(&mut stdout_reader, &mut stderr_reader, deadline);
         if let Some(error) = primary_error {
             return Err(error);
         }
-        if let Err(error) = stdout_join {
-            let _ = stderr_join;
-            return Err(error);
-        }
-        if let Err(error) = stderr_join {
+        if let Err(error) = readers_join {
             return Err(error);
         }
         let (stdout, stderr, overflowed) = capture.finish();
@@ -1333,45 +1334,33 @@ unsafe extern "C" {
     fn unix_fcntl(fd: i32, command: i32, argument: i32) -> i32;
 }
 
-fn scrub_provider_secret_environment(command: &mut std::process::Command) {
-    for (key, _) in std::env::vars_os() {
-        let normalized = key.to_string_lossy().to_ascii_uppercase();
-        if is_provider_secret_environment_key(&normalized) {
-            command.env_remove(key);
+const PROVIDER_ENVIRONMENT_ALLOWLIST: &[&str] = &[
+    "PATH",
+    "PATHEXT",
+    "SystemRoot",
+    "WINDIR",
+    "ComSpec",
+    "TEMP",
+    "TMP",
+];
+
+fn provider_environment_allowlist(command: &mut std::process::Command) {
+    command.env_clear();
+    for key in PROVIDER_ENVIRONMENT_ALLOWLIST {
+        if let Some(value) = std::env::var_os(key) {
+            command.env(key, value);
         }
     }
 }
 
-fn is_provider_secret_environment_key(key: &str) -> bool {
-    [
-        "ANTHROPIC_API_KEY",
-        "ANTHROPIC_AUTH_TOKEN",
-        "CLAUDE_CODE_OAUTH_TOKEN",
-        "OPENAI_API_KEY",
-        "OPENAI_AUTH_TOKEN",
-        "CODEX_API_KEY",
-        "CODEX_AUTH_TOKEN",
-        "CURSOR_API_KEY",
-        "CURSOR_AUTH_TOKEN",
-        "AWS_ACCESS_KEY_ID",
-        "AWS_SECRET_ACCESS_KEY",
-        "AWS_SESSION_TOKEN",
-        "GOOGLE_APPLICATION_CREDENTIALS",
-        "GITHUB_TOKEN",
-        "GH_TOKEN",
-    ]
-    .iter()
-    .any(|known| *known == key)
-        || key.contains("API_KEY")
-        || key.contains("APIKEY")
-        || key.contains("TOKEN")
-        || key.contains("AUTH_TOKEN")
-        || key.contains("OAUTH_TOKEN")
-        || key.contains("ACCESS_TOKEN")
-        || key.contains("SECRET")
-        || key.contains("CLIENT_SECRET")
-        || key.contains("PRIVATE_KEY")
-        || key.contains("CREDENTIAL")
+#[cfg(target_os = "macos")]
+fn provider_environment_values() -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    PROVIDER_ENVIRONMENT_ALLOWLIST
+        .iter()
+        .filter_map(|key| {
+            std::env::var_os(key).map(|value| (std::ffi::OsString::from(*key), value))
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1405,6 +1394,9 @@ struct ProbeProcess {
     macos_suspended: bool,
     #[cfg(windows)]
     windows_suspended: bool,
+    attestation_barrier_killed: bool,
+    #[cfg(target_os = "linux")]
+    linux_process_start: u64,
 }
 
 impl ProbeProcess {
@@ -1444,6 +1436,12 @@ impl ProbeProcess {
             reap_child_until(&mut child, deadline);
             return Err(error);
         }
+        #[cfg(target_os = "linux")]
+        let linux_process_start = linux_process_start_token(child.id()).ok_or_else(|| {
+            let _ = child.kill();
+            reap_child_until(&mut child, deadline);
+            ProviderProbeError::Io(ProviderProbeIoError::SpawnFailed)
+        })?;
         let managed_job =
             match crate::services::platform_service::claim_suspended_process(child.id()) {
                 Ok(job) => job,
@@ -1495,6 +1493,9 @@ impl ProbeProcess {
             macos_suspended: true,
             #[cfg(windows)]
             windows_suspended: true,
+            attestation_barrier_killed: false,
+            #[cfg(target_os = "linux")]
+            linux_process_start,
         })
     }
 
@@ -1536,11 +1537,7 @@ impl ProbeProcess {
         argv.push(std::ptr::null_mut());
 
         let mut environment = Vec::new();
-        for (key, value) in std::env::vars_os() {
-            let normalized = key.to_string_lossy().to_ascii_uppercase();
-            if is_provider_secret_environment_key(&normalized) {
-                continue;
-            }
+        for (key, value) in provider_environment_values() {
             let mut entry = key.as_os_str().as_bytes().to_vec();
             entry.push(b'=');
             entry.extend_from_slice(value.as_os_str().as_bytes());
@@ -1718,6 +1715,7 @@ impl ProbeProcess {
             macos_suspended: true,
             #[cfg(target_os = "linux")]
             linux_ptrace_stopped: false,
+            attestation_barrier_killed: false,
         })
     }
 
@@ -1803,7 +1801,7 @@ impl ProbeProcess {
         Ok(ProbeWait::Exited(self.macos_exit_code))
     }
 
-    fn release_attestation_barrier(&mut self) -> Result<(), ProviderProbeError> {
+    fn release_attestation_barrier_once(&mut self) -> Result<(), ProviderProbeError> {
         #[cfg(windows)]
         if self.windows_suspended {
             // Consume the one explicit release attempt before calling the OS.
@@ -1833,23 +1831,83 @@ impl ProbeProcess {
         Ok(())
     }
 
+    fn kill_while_attestation_barrier(&mut self) -> bool {
+        if self.attestation_barrier_killed {
+            return true;
+        }
+        let barrier_active = {
+            #[cfg(windows)]
+            {
+                self.windows_suspended
+            }
+            #[cfg(target_os = "linux")]
+            {
+                self.linux_ptrace_stopped
+            }
+            #[cfg(target_os = "macos")]
+            {
+                self.macos_suspended
+            }
+            #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+            {
+                false
+            }
+            #[cfg(not(any(unix, windows)))]
+            {
+                false
+            }
+        };
+        if !barrier_active {
+            return true;
+        }
+        self.attestation_barrier_killed = true;
+        let mut killed = true;
+        if let Some(job) = self.managed_job.as_ref() {
+            if job.terminate_members().is_err() {
+                killed = false;
+            }
+        }
+        #[cfg(unix)]
+        if self.process_group {
+            #[cfg(target_os = "linux")]
+            let identity_matches =
+                process_group_matches_start(self.pid(), self.linux_process_start);
+            #[cfg(not(target_os = "linux"))]
+            let identity_matches = true;
+            if identity_matches {
+                if !force_kill_unix_process_group(
+                    self.pid(),
+                    #[cfg(target_os = "linux")]
+                    Some(self.linux_process_start),
+                    #[cfg(not(target_os = "linux"))]
+                    None,
+                ) {
+                    killed = false;
+                }
+            } else {
+                killed = false;
+            }
+        }
+        if matches!(self.try_wait(), Ok(ProbeWait::Running)) && self.kill_process().is_err() {
+            killed = false;
+        }
+        killed
+    }
+
     fn terminate_tree(&mut self, deadline: std::time::Instant) -> Result<(), ProviderProbeError> {
         let mut job_empty = true;
-        let mut cleanup_failed = false;
-        if self.release_attestation_barrier().is_err() {
-            cleanup_failed = true;
-        }
+        let barrier_kill_ok = self.kill_while_attestation_barrier();
+        let mut cleanup_failed = !barrier_kill_ok;
         #[cfg(unix)]
         let now = std::time::Instant::now();
         #[cfg(unix)]
-        let group_cleanup_deadline = deadline
-            .checked_sub(PROVIDER_PROBE_CLEANUP_RESERVE)
-            .filter(|candidate| *candidate > now)
-            .unwrap_or(now);
+        let group_cleanup_deadline = deadline;
         if let Some(job) = self.managed_job.as_ref() {
             match job.active_process_ids() {
                 Ok(active_before) => {
-                    if !active_before.is_empty() {
+                    if !active_before.is_empty()
+                        && (!self.attestation_barrier_killed || !barrier_kill_ok)
+                    {
                         if job.terminate_members().is_err() {
                             cleanup_failed = true;
                         }
@@ -1866,22 +1924,37 @@ impl ProbeProcess {
             };
         }
         #[cfg(unix)]
-        let group_signal_ok = if self.process_group {
-            let remaining = group_cleanup_deadline.saturating_duration_since(now);
-            let term_grace = remaining / 3;
-            let result = crate::services::platform_service::terminate_owned_process_group(
-                self.pid(),
-                term_grace,
-            );
-            if result.is_err() {
-                force_kill_unix_process_group(self.pid());
-                false
+        let group_signal_ok =
+            if self.process_group && (!self.attestation_barrier_killed || !barrier_kill_ok) {
+                #[cfg(target_os = "linux")]
+                let identity_matches =
+                    process_group_matches_start(self.pid(), self.linux_process_start);
+                #[cfg(not(target_os = "linux"))]
+                let identity_matches = true;
+                if !identity_matches {
+                    false
+                } else {
+                    let remaining = group_cleanup_deadline.saturating_duration_since(now);
+                    let term_grace = remaining / 3;
+                    let result = crate::services::platform_service::terminate_owned_process_group(
+                        self.pid(),
+                        term_grace,
+                    );
+                    if result.is_err() {
+                        force_kill_unix_process_group(
+                            self.pid(),
+                            #[cfg(target_os = "linux")]
+                            Some(self.linux_process_start),
+                            #[cfg(not(target_os = "linux"))]
+                            None,
+                        )
+                    } else {
+                        true
+                    }
+                }
             } else {
                 true
-            }
-        } else {
-            true
-        };
+            };
         #[cfg(not(unix))]
         let _group_cleanup_ok = true;
         // Job ACTIVE_PROCESS_ZERO state is authoritative for the managed tree.
@@ -1962,6 +2035,8 @@ const LINUX_PTRACE_GETEVENTMSG: i64 = 0x4201;
 #[cfg(target_os = "linux")]
 const LINUX_PTRACE_O_TRACEEXEC: i64 = 0x10;
 #[cfg(target_os = "linux")]
+const LINUX_PTRACE_O_EXITKILL: i64 = 0x0010_0000;
+#[cfg(target_os = "linux")]
 const LINUX_PTRACE_EVENT_EXEC: i32 = 4;
 #[cfg(target_os = "linux")]
 const LINUX_WAIT_NOHANG: i32 = 1;
@@ -2027,7 +2102,7 @@ fn linux_ptrace_set_options(pid: u32) -> Result<(), ProviderProbeError> {
             LINUX_PTRACE_SETOPTIONS,
             pid as i32,
             std::ptr::null_mut(),
-            LINUX_PTRACE_O_TRACEEXEC as usize as *mut std::ffi::c_void,
+            (LINUX_PTRACE_O_TRACEEXEC | LINUX_PTRACE_O_EXITKILL) as usize as *mut std::ffi::c_void,
         )
     } == -1
     {
@@ -2135,6 +2210,18 @@ unsafe fn linux_ptrace_detach(pid: u32) -> i64 {
     )
 }
 
+#[cfg(target_os = "linux")]
+fn linux_process_start_token(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let (_, fields) = stat.rsplit_once(") ")?;
+    fields.split_whitespace().nth(19)?.parse().ok()
+}
+
+#[cfg(target_os = "linux")]
+fn process_group_matches_start(pid: u32, expected_start: u64) -> bool {
+    linux_process_start_token(pid).is_some_and(|actual| actual == expected_start)
+}
+
 #[cfg(target_os = "macos")]
 const MACOS_SIGCONT: i32 = 19;
 
@@ -2186,8 +2273,16 @@ fn reap_child_until(child: &mut Child, deadline: std::time::Instant) -> bool {
 }
 
 #[cfg(unix)]
-fn force_kill_unix_process_group(pid: u32) {
-    let _ = unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
+fn force_kill_unix_process_group(pid: u32, expected_start: Option<u64>) -> bool {
+    #[cfg(target_os = "linux")]
+    if let Some(expected_start) = expected_start {
+        if !process_group_matches_start(pid, expected_start) {
+            return false;
+        }
+    }
+    let result = unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
+    result == 0
+        || (result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH))
 }
 
 #[cfg(unix)]
@@ -2346,13 +2441,14 @@ impl BoundedProbeCapture {
 
 struct ProbeReaderHandle {
     cancelled: Arc<AtomicBool>,
-    join: Option<JoinHandle<()>>,
+    join: Option<JoinHandle<io::Result<()>>>,
 }
 
 fn spawn_probe_reader(
     mut pipe: Box<dyn ProbePipe>,
     capture: Arc<BoundedProbeCapture>,
     stdout: bool,
+    deadline: std::time::Instant,
 ) -> ProbeReaderHandle {
     let cancelled = Arc::new(AtomicBool::new(false));
     let reader_cancelled = Arc::clone(&cancelled);
@@ -2360,14 +2456,22 @@ fn spawn_probe_reader(
         let mut buffer = [0_u8; 8 * 1024];
         while !reader_cancelled.load(Ordering::Acquire) {
             match pipe.poll_read(&mut buffer) {
-                Ok(0) => break,
+                Ok(0) => return Ok(()),
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(5));
+                    if reader_cancelled.load(Ordering::Acquire) {
+                        return Ok(());
+                    }
+                    let now = std::time::Instant::now();
+                    if now >= deadline {
+                        return Ok(());
+                    }
+                    std::thread::sleep((deadline - now).min(Duration::from_millis(5)));
                 }
-                Err(_) => break,
+                Err(error) => return Err(error),
                 Ok(read) => capture.append(stdout, &buffer[..read]),
             }
         }
+        Ok(())
     });
     ProbeReaderHandle {
         cancelled,
@@ -2385,23 +2489,51 @@ fn receive_probe_reader(
     while !join.is_finished() {
         let now = std::time::Instant::now();
         if now >= deadline {
-            // Let a real pipe drain to EOF first. If the provider was killed
-            // or a reader is otherwise stuck, cancellation remains bounded
-            // because the native pipe implementation polls an OS handle.
+            // Cancellation uses the caller's absolute deadline. A real pipe
+            // closes when the owned provider process is killed; retain the
+            // handle if a custom pipe violates that contract rather than
+            // silently detaching an unowned reader worker.
             reader.cancelled.store(true, Ordering::Release);
-            let cancellation_deadline = now + Duration::from_millis(50);
-            while !join.is_finished() && std::time::Instant::now() < cancellation_deadline {
+            while !join.is_finished() && std::time::Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(1));
             }
             if !join.is_finished() {
+                reader.join = Some(join);
                 return Err(ProviderProbeError::Io(ProviderProbeIoError::WaitFailed));
             }
             break;
         }
         std::thread::sleep((deadline - now).min(Duration::from_millis(5)));
     }
-    join.join()
-        .map_err(|_| ProviderProbeError::Io(ProviderProbeIoError::WaitFailed))
+    let result = join
+        .join()
+        .map_err(|_| ProviderProbeError::Io(ProviderProbeIoError::WaitFailed))?;
+    result.map_err(|_| ProviderProbeError::Io(ProviderProbeIoError::WaitFailed))
+}
+
+fn receive_probe_readers(
+    stdout: &mut ProbeReaderHandle,
+    stderr: &mut ProbeReaderHandle,
+    deadline: std::time::Instant,
+) -> Result<(), ProviderProbeError> {
+    while stdout.join.as_ref().is_some_and(|join| !join.is_finished())
+        || stderr.join.as_ref().is_some_and(|join| !join.is_finished())
+    {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            // Both readers share the probe's one absolute cleanup deadline;
+            // signal both before collecting either result so one idle stream
+            // cannot consume the entire remaining join window.
+            stdout.cancelled.store(true, Ordering::Release);
+            stderr.cancelled.store(true, Ordering::Release);
+            break;
+        }
+        std::thread::sleep((deadline - now).min(Duration::from_millis(5)));
+    }
+
+    let stdout_result = receive_probe_reader(stdout, deadline);
+    let stderr_result = receive_probe_reader(stderr, deadline);
+    stdout_result.and(stderr_result)
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -2826,16 +2958,43 @@ mod tests {
         }
     }
 
+    struct FailingProbePipe;
+
+    impl super::ProbePipe for FailingProbePipe {
+        fn poll_read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "test pipe failed",
+            ))
+        }
+    }
+
     #[test]
     fn probe_reader_cancellation_is_bounded() {
         let capture = std::sync::Arc::new(super::BoundedProbeCapture::new(64));
-        let mut reader = super::spawn_probe_reader(Box::new(WouldBlockProbePipe), capture, true);
+        let deadline = std::time::Instant::now() + Duration::from_millis(250);
+        let mut reader =
+            super::spawn_probe_reader(Box::new(WouldBlockProbePipe), capture, true, deadline);
+        // The production caller signals cancellation after its owned process
+        // has been reaped. Exercise that join path directly; waiting until an
+        // exact deadline would make the test depend on OS thread scheduling at
+        // the deadline boundary.
+        reader
+            .cancelled
+            .store(true, std::sync::atomic::Ordering::Release);
 
-        assert!(super::receive_probe_reader(
-            &mut reader,
-            std::time::Instant::now() + Duration::from_millis(100),
-        )
-        .is_ok());
+        assert!(super::receive_probe_reader(&mut reader, deadline,).is_ok());
+        assert!(reader.join.is_none(), "reader worker must be joined");
+    }
+
+    #[test]
+    fn probe_reader_surfaces_pipe_errors() {
+        let capture = std::sync::Arc::new(super::BoundedProbeCapture::new(64));
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        let mut reader =
+            super::spawn_probe_reader(Box::new(FailingProbePipe), capture, true, deadline);
+
+        assert!(super::receive_probe_reader(&mut reader, deadline,).is_err());
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

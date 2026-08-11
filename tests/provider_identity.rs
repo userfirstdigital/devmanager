@@ -239,6 +239,85 @@ fn provider_cleanup_source_has_no_external_kill_subprocess() {
 }
 
 #[test]
+fn provider_cleanup_keeps_attestation_barrier_until_kill_and_reap() {
+    let adapter_source =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/providers/adapter.rs"))
+            .expect("read provider adapter source");
+    let terminate_start = adapter_source
+        .find("fn terminate_tree(")
+        .expect("owned cleanup seam");
+    let terminate_end = adapter_source[terminate_start..]
+        .find("fn kill_process(")
+        .map(|offset| terminate_start + offset)
+        .expect("owned cleanup boundary");
+    let terminate_source = &adapter_source[terminate_start..terminate_end];
+
+    assert!(
+        !terminate_source.contains("release_attestation_barrier"),
+        "cleanup must kill while the process is still behind the attestation barrier"
+    );
+    assert!(
+        adapter_source.contains("kill_while_attestation_barrier"),
+        "the fail-closed barrier kill path must be explicit"
+    );
+    assert!(
+        adapter_source.contains("release_attestation_barrier_once"),
+        "release must be a one-shot post-attestation operation"
+    );
+}
+
+#[test]
+fn provider_probe_uses_an_empty_base_environment_allowlist() {
+    let adapter_source =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/providers/adapter.rs"))
+            .expect("read provider adapter source");
+    assert!(
+        adapter_source.contains("command.env_clear()"),
+        "provider probes must not inherit the caller environment"
+    );
+    assert!(
+        adapter_source.contains("provider_environment_allowlist"),
+        "provider probes must use a named bounded environment allowlist"
+    );
+}
+
+#[test]
+fn linux_probe_cleanup_requires_exit_kill_and_process_start_identity() {
+    let adapter_source =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/providers/adapter.rs"))
+            .expect("read provider adapter source");
+    for marker in [
+        "LINUX_PTRACE_O_EXITKILL",
+        "linux_process_start_token",
+        "process_group_matches_start",
+        "PTRACE_O_EXITKILL",
+    ] {
+        assert!(
+            adapter_source.contains(marker),
+            "Unix cleanup is missing owned identity marker {marker}"
+        );
+    }
+}
+
+#[test]
+fn provider_worker_shutdown_uses_one_absolute_deadline_and_owned_reaper() {
+    let registry_source =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/providers/registry.rs"))
+            .expect("read provider registry source");
+    for marker in [
+        "worker_deadline",
+        "timeout_at",
+        "ProbeWorkerReaper",
+        "join_until_deadline",
+    ] {
+        assert!(
+            registry_source.contains(marker),
+            "worker lifecycle is missing bounded ownership marker {marker}"
+        );
+    }
+}
+
+#[test]
 fn agent_session_facts_keep_provider_identity_typed_and_exact() {
     let exact = ProviderSessionId::new("provider-id".to_owned()).unwrap();
     let facts = AgentSessionFacts::new(

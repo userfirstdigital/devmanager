@@ -27,6 +27,7 @@ const TASK_4_1_SEMANTIC_SCHEMA_VERSION: SemanticSchemaVersion = SemanticSchemaVe
 const PROVIDER_CAPABILITY_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 const MAX_PROVIDER_IN_FLIGHT_ENTRIES: usize = 64;
 const PROVIDER_IN_FLIGHT_TTL: Duration = Duration::from_secs(30);
+const PROVIDER_WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Default)]
 pub struct ProviderDiscoveryConfig {
@@ -360,6 +361,25 @@ struct ProbeWorkerSupervisor {
     state: Mutex<Option<Arc<ProbeWorkerSupervisorState>>>,
 }
 
+struct ProbeWorkerReaper {
+    task: JoinHandle<()>,
+    worker_deadline: tokio::time::Instant,
+}
+
+impl ProbeWorkerReaper {
+    async fn join_until_deadline(mut self) {
+        let joined = tokio::time::timeout_at(self.worker_deadline, &mut self.task).await;
+        if joined.is_err() {
+            // The supervisor owns a JoinSet, so aborting it at the shared
+            // deadline also aborts every async worker still in that set.
+            // Native spawn_blocking work remains owned by its own runtime
+            // task and is independently bounded by the flight deadline.
+            self.task.abort();
+            let _ = self.task.await;
+        }
+    }
+}
+
 impl ProbeWorkerSupervisor {
     fn new() -> Self {
         Self {
@@ -406,11 +426,20 @@ impl ProbeWorkerSupervisor {
     fn shutdown(&self) {
         let state = self.state.lock().unwrap().take();
         if let Some(state) = state {
-            // The supervisor retains this state through its own task and will
-            // drain queued requests before joining every active worker. The
-            // JoinHandle therefore remains owned until the task has exited.
-            let _supervisor_still_owned = state.task.lock().unwrap().is_some();
+            let worker_deadline = Instant::now() + PROVIDER_WORKER_SHUTDOWN_TIMEOUT;
             state.shutdown.notify_one();
+            let task = state.task.lock().unwrap().take();
+            if let Some(task) = task {
+                let reaper = ProbeWorkerReaper {
+                    task,
+                    worker_deadline: tokio::time::Instant::from_std(worker_deadline),
+                };
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    handle.spawn(reaper.join_until_deadline());
+                } else {
+                    reaper.task.abort();
+                }
+            }
         }
     }
 }
@@ -509,8 +538,7 @@ async fn run_probe_worker(request: ProbeWorkerRequest) -> ProbeWorkerCompletion 
         let Some(flight) = timer_flight.upgrade() else {
             return;
         };
-        let remaining = flight.deadline.saturating_duration_since(Instant::now());
-        tokio::time::sleep(remaining).await;
+        tokio::time::sleep_until(tokio::time::Instant::from_std(flight.deadline)).await;
         flight.cancel();
     });
 
