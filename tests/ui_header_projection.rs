@@ -1,4 +1,3 @@
-use devmanager::client::action::TaskRenameArguments;
 use devmanager::domain::agent::{AgentRole, AgentSessionFacts, AgentSessionLifecycle};
 use devmanager::domain::id::{AgentSessionId, EnvironmentId, ProjectId, TaskId};
 use devmanager::domain::snapshot::TaskSnapshot;
@@ -507,7 +506,7 @@ fn top_bar_reports_each_missing_or_invalid_observation_and_truthful_state() {
 #[test]
 fn equal_stamp_changed_remote_or_quota_payload_is_rejected() {
     let session = OpaqueProviderSessionRef::try_from_raw("conflict-session").unwrap();
-    let mut controller = TopBarProjectionController::new(TopBarProjectionInput {
+    let mut controller = TopBarProjectionController::try_new(TopBarProjectionInput {
         now_ms: 10_000,
         generation: 9,
         remote: Some(
@@ -521,7 +520,8 @@ fn equal_stamp_changed_remote_or_quota_payload_is_rejected() {
             ),
         ),
         ..TopBarProjectionInput::default()
-    });
+    })
+    .unwrap();
     assert_eq!(
         controller.observe_remote(
             devmanager::ui::task_cockpit::header::RemoteObservation::new(
@@ -535,14 +535,15 @@ fn equal_stamp_changed_remote_or_quota_payload_is_rejected() {
         ),
         HighWaterDecision::RejectedConflict
     );
-    let mut quota_controller = TopBarProjectionController::new(TopBarProjectionInput {
+    let mut quota_controller = TopBarProjectionController::try_new(TopBarProjectionInput {
         now_ms: 10_000,
         generation: 9,
         quotas: vec![QuotaObservation::new(
             "claude", session, 9, 1, 10_000, "old",
         )],
         ..TopBarProjectionInput::default()
-    });
+    })
+    .unwrap();
     assert_eq!(
         quota_controller.observe_quota(QuotaObservation::new(
             "claude", session, 9, 1, 10_000, "new",
@@ -565,16 +566,13 @@ fn controller_constructor_never_retains_over_cap_quota_input() {
             "ok",
         ));
     }
-    let controller = TopBarProjectionController::new(TopBarProjectionInput {
+    let controller = TopBarProjectionController::try_new(TopBarProjectionInput {
         now_ms: 10_000,
         generation: 9,
         quotas,
         ..TopBarProjectionInput::default()
     });
-    assert!(
-        controller.input().quotas.len()
-            <= devmanager::ui::task_cockpit::header::MAX_TOP_BAR_QUOTA_CACHE
-    );
+    assert!(controller.is_err(), "over-cap snapshots must fail closed");
 }
 
 #[test]
@@ -595,13 +593,7 @@ fn action_epochs_and_queue_coalesce_only_safe_equivalents() {
     assert_eq!(queue.push(show.clone()), PendingHeaderActionOutcome::Queued);
     assert_eq!(queue.push(show), PendingHeaderActionOutcome::Coalesced);
 
-    let rename = ProjectedAction::new(
-        ActionRequest::TaskRename(TaskRenameArguments {
-            task_id: identity.task_id,
-            title: "next".into(),
-        }),
-        ActionTarget::Task(identity),
-    );
+    let rename = ProjectedAction::task_rename(identity, "next").unwrap();
     assert_eq!(
         queue.push(rename.clone()),
         PendingHeaderActionOutcome::Queued
@@ -615,10 +607,28 @@ fn action_epochs_and_queue_coalesce_only_safe_equivalents() {
 
     let huge_title = "untrusted ".repeat(10_000);
     let bounded = ProjectedAction::task_rename(identity, huge_title);
+    assert!(bounded.is_err());
+    let bounded = ProjectedAction::task_rename(identity, "bounded title").unwrap();
     let ActionRequest::TaskRename(arguments) = bounded.request() else {
         panic!("rename action")
     };
     assert!(arguments.title.chars().count() <= 160);
+
+    let stamp = devmanager::ui::task_cockpit::header::ObservationStamp {
+        observed_at_ms: 10,
+        generation: 2,
+        revision: 3,
+    };
+    let remote = ProjectedAction::remote_status(stamp);
+    assert!(matches!(remote.target(), ActionTarget::Remote(captured) if *captured == stamp));
+    assert_eq!(
+        PendingHeaderActionOutcome::from_high_water(HighWaterDecision::RejectedConflict),
+        PendingHeaderActionOutcome::Conflict
+    );
+    assert_eq!(
+        PendingHeaderActionOutcome::from_high_water(HighWaterDecision::NeedsFullResync),
+        PendingHeaderActionOutcome::Uncertain
+    );
 }
 
 #[test]
@@ -818,4 +828,259 @@ fn top_bar_empty_snapshot_exposes_unavailable_semantics() {
     });
     assert!(!model.unavailable.is_empty());
     assert!(model.accessible_description.contains("unavailable"));
+}
+
+#[test]
+fn specialist_eviction_keeps_a_coarse_floor_and_rejects_stale_reentry() {
+    let task = task_id(21);
+    let mut observations = Vec::with_capacity(MAX_HEADER_SPECIALISTS + 3);
+    for index in 1..=MAX_HEADER_SPECIALISTS as u32 {
+        observations.push(AgentObservation {
+            id: agent_id(index),
+            task_id: task,
+            label: "fresh",
+            provider: "claude",
+            provider_session_id: None,
+            lifecycle: AgentSessionLifecycle::Open,
+            runtime_generation: 1,
+            revision: 10,
+            removed: false,
+        });
+    }
+    observations.push(AgentObservation {
+        id: agent_id(0),
+        task_id: task,
+        label: "new lower key",
+        provider: "claude",
+        provider_session_id: None,
+        lifecycle: AgentSessionLifecycle::Open,
+        runtime_generation: 1,
+        revision: 10,
+        removed: false,
+    });
+    observations.push(AgentObservation {
+        id: agent_id(0),
+        task_id: task,
+        label: "removed lower key",
+        provider: "claude",
+        provider_session_id: None,
+        lifecycle: AgentSessionLifecycle::Closed,
+        runtime_generation: 1,
+        revision: 11,
+        removed: true,
+    });
+    observations.push(AgentObservation {
+        id: agent_id(MAX_HEADER_SPECIALISTS as u32),
+        task_id: task,
+        label: "stale replay",
+        provider: "claude",
+        provider_session_id: None,
+        lifecycle: AgentSessionLifecycle::Open,
+        runtime_generation: 1,
+        revision: 1,
+        removed: false,
+    });
+
+    let projection = SpecialistProjection::from_iter(observations);
+    assert!(
+        projection
+            .retained()
+            .iter()
+            .all(|agent| agent.id != agent_id(MAX_HEADER_SPECIALISTS as u32)),
+        "an evicted identity must not re-enter with an older revision"
+    );
+    assert!(projection.overflowed());
+    assert!(!projection.source_available());
+    assert!(projection.requires_full_resync());
+}
+
+#[test]
+fn controller_observations_advance_snapshot_epoch_and_clock_atomically() {
+    let mut controller = TopBarProjectionController::try_new(TopBarProjectionInput {
+        now_ms: 100,
+        generation: 1,
+        ..TopBarProjectionInput::default()
+    })
+    .unwrap();
+    assert_eq!(
+        controller.observe_host(HostObservation {
+            identity: HostObservationIdentity {
+                host_id: "host".into(),
+                revision: 2,
+            },
+            health: HostHealth::Healthy,
+            observed_at_ms: Some(2_000),
+            generation: Some(2),
+        }),
+        HighWaterDecision::Accepted
+    );
+    let model = controller.model();
+    assert!(model.host.is_some(), "new-generation host must be visible");
+}
+
+#[test]
+fn task_header_accessibility_names_every_rendered_sibling() {
+    let model = TaskHeaderModel {
+        identity: TaskIdentity {
+            task_id: task_id(22),
+            revision: 1,
+            resource_generation: 1,
+            connection_epoch: 1,
+            focus_epoch: 1,
+            client_epoch: 1,
+            navigation_epoch: 1,
+            request_epoch: 1,
+            action_epoch: 1,
+        },
+        title: "Task title".into(),
+        project: ProjectProjection {
+            id: ProjectId::from_bytes([
+                0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x16,
+            ])
+            .unwrap(),
+            label: "Project".into(),
+        },
+        workspace: WorkspaceProjection::External {
+            path: PathBuf::from("C:/workspace"),
+        },
+        specialists: SpecialistProjection::from_iter(std::iter::empty()),
+        status: VisibleTaskStatus::Idle,
+        accessible_description: "Task title. Project. Workspace. Idle.".into(),
+    };
+    let tree = model.accessibility_tree();
+    let labels: Vec<_> = tree
+        .children
+        .iter()
+        .map(|child| child.label.as_str())
+        .collect();
+    assert!(labels.iter().any(|label| label.contains("Project")));
+    assert!(labels.iter().any(|label| label.contains("workspace")));
+    assert!(labels.iter().any(|label| label.contains("Idle")));
+}
+
+#[test]
+fn header_layout_does_not_split_grapheme_clusters_and_accepts_scale() {
+    let title = "👩‍💻".repeat(80);
+    let model = TaskHeaderModel {
+        identity: TaskIdentity {
+            task_id: task_id(23),
+            revision: 1,
+            resource_generation: 1,
+            connection_epoch: 1,
+            focus_epoch: 1,
+            client_epoch: 1,
+            navigation_epoch: 1,
+            request_epoch: 1,
+            action_epoch: 1,
+        },
+        title,
+        project: ProjectProjection {
+            id: ProjectId::from_bytes([
+                0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x17,
+            ])
+            .unwrap(),
+            label: "Project".into(),
+        },
+        workspace: WorkspaceProjection::Main,
+        specialists: SpecialistProjection::from_iter(std::iter::empty()),
+        status: VisibleTaskStatus::Idle,
+        accessible_description: "Task".into(),
+    };
+    let layout = HeaderLayout::for_model_at_scale(&model, 800, 2.0);
+    let TitleLayout::Wrapped(lines) = layout.title else {
+        panic!("expected wrapped title")
+    };
+    assert!(lines
+        .iter()
+        .all(|line| !line.starts_with('\u{200d}') && !line.ends_with('\u{200d}')));
+}
+
+#[test]
+fn raw_observation_ids_are_opaque_in_debug_and_json() {
+    let host = HostObservation {
+        identity: HostObservationIdentity {
+            host_id: "host-secret-123".into(),
+            revision: 1,
+        },
+        health: HostHealth::Healthy,
+        observed_at_ms: Some(1),
+        generation: Some(1),
+    };
+    assert!(!format!("{host:?}").contains("host-secret-123"));
+    let json = serde_json::to_string(&host).unwrap();
+    assert!(!json.contains("host-secret-123"));
+}
+
+#[test]
+fn controller_full_resync_is_epoch_bound_and_updates_the_visible_snapshot() {
+    let mut controller = TopBarProjectionController::try_new(TopBarProjectionInput {
+        now_ms: 100,
+        generation: 1,
+        ..TopBarProjectionInput::default()
+    })
+    .unwrap();
+    let snapshot = TopBarProjectionInput {
+        now_ms: 2_000,
+        generation: 2,
+        host: Some(HostObservation {
+            identity: HostObservationIdentity {
+                host_id: "resynced-host".into(),
+                revision: 4,
+            },
+            health: HostHealth::Healthy,
+            observed_at_ms: Some(2_000),
+            generation: Some(2),
+        }),
+        ..TopBarProjectionInput::default()
+    };
+    assert_eq!(
+        controller
+            .apply_full_resync(
+                1,
+                snapshot,
+                [observation(
+                    HeaderFieldKey::Host {
+                        source_id: "resynced-host".into()
+                    },
+                    2,
+                    4,
+                    false
+                )]
+            )
+            .unwrap(),
+        HighWaterDecision::Accepted
+    );
+    assert!(controller.model().host.is_some());
+    let second = controller
+        .apply_full_resync(
+            1,
+            TopBarProjectionInput {
+                now_ms: 3_000,
+                generation: 3,
+                ..TopBarProjectionInput::default()
+            },
+            std::iter::empty(),
+        )
+        .unwrap();
+    assert_eq!(second, HighWaterDecision::RejectedInvalid);
+    assert!(controller.model().host.is_some());
+}
+
+#[test]
+fn typed_cpu_contract_normalizes_core_scaled_samples() {
+    assert_eq!(
+        devmanager::ui::task_cockpit::header::TaskManagerCpuPercent::from_core_scaled(125.0, 64)
+            .value(),
+        1.953125
+    );
+    assert_eq!(
+        devmanager::ui::task_cockpit::header::TaskManagerCpuPercent::from_core_scaled(
+            12_800.0,
+            64,
+        )
+        .value(),
+        100.0
+    );
 }

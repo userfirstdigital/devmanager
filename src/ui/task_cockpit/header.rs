@@ -125,6 +125,49 @@ impl fmt::Display for OpaqueProviderSessionRef {
     }
 }
 
+/// A fixed-size identity token used at observation and accessibility
+/// boundaries.  Source names are useful to the host adapter, but the header
+/// projection must not make them observable through Debug/serde output.
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct OpaqueSourceRef([u8; 16]);
+
+impl OpaqueSourceRef {
+    pub fn try_from_raw(raw: &str) -> Result<Self, &'static str> {
+        if raw.trim().is_empty() {
+            return Err("source id must not be blank");
+        }
+        if raw.chars().count() > MAX_SOURCE_SCALARS {
+            return Err("source id exceeds the bounded scalar limit");
+        }
+        let digest = Sha256::digest(raw.as_bytes());
+        let mut bytes = [0_u8; 16];
+        bytes.copy_from_slice(&digest[..16]);
+        Ok(Self(bytes))
+    }
+
+    fn token(self) -> String {
+        let mut token = String::from("source-ref:");
+        for byte in self.0 {
+            use std::fmt::Write as _;
+            let _ = write!(token, "{byte:02x}");
+        }
+        token
+    }
+}
+
+impl fmt::Debug for OpaqueSourceRef {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("source-ref[opaque]")
+    }
+}
+
+impl fmt::Display for OpaqueSourceRef {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("source-ref[opaque]")
+    }
+}
+
 /// Copy at most `max_scalars` sanitized scalars before invoking the bounded
 /// secret redactor.  In particular, this does not first clone or redact an
 /// unbounded provider/path/input string.
@@ -793,6 +836,7 @@ pub struct SpecialistProjection {
     source_available: bool,
     unique_count_exact: bool,
     conflicts_rejected: usize,
+    requires_full_resync: bool,
 }
 
 impl SpecialistProjection {
@@ -829,6 +873,12 @@ impl SpecialistProjection {
         let mut source_available = source_available;
         let mut unique_count_exact = true;
         let mut conflicts_rejected = 0_usize;
+        let mut requires_full_resync = false;
+        // When a candidate leaves the bounded top-k set its detailed
+        // watermark is retired.  Keep one coarse monotonic floor so a stale
+        // replay cannot revive that identity after the map eviction.  A
+        // newer unknown stamp is ambiguous and therefore also fails closed.
+        let mut coarse_floor: Option<AgentWaterMark> = None;
         let mut last_id = None;
         let mut ordered = true;
 
@@ -863,7 +913,48 @@ impl SpecialistProjection {
                 overflowed = true;
             }
 
+            if observation.label.chars().count() > MAX_LABEL_SCALARS
+                || observation.provider.chars().count() > MAX_PROVIDER_SCALARS
+                || observation
+                    .provider_session_id
+                    .is_some_and(|value| value.len() > MAX_PROVIDER_SESSION_ID_BYTES)
+            {
+                overflowed = true;
+                source_available = false;
+                unique_count_exact = false;
+                requires_full_resync = true;
+                continue;
+            }
+
             let fingerprint = agent_observation_fingerprint(observation);
+            if !watermarks.contains_key(&observation.id) {
+                if let Some(floor) = coarse_floor {
+                    match compare_stamp(
+                        observation.runtime_generation,
+                        observation.revision,
+                        floor.runtime_generation,
+                        floor.revision,
+                    ) {
+                        std::cmp::Ordering::Less | std::cmp::Ordering::Equal => {
+                            overflowed = true;
+                            source_available = false;
+                            unique_count_exact = false;
+                            requires_full_resync = true;
+                            continue;
+                        }
+                        std::cmp::Ordering::Greater => {
+                            // We cannot prove whether this is a legitimate
+                            // post-eviction update or an incomplete replay.
+                            // Reject it until an authoritative snapshot.
+                            overflowed = true;
+                            source_available = false;
+                            unique_count_exact = false;
+                            requires_full_resync = true;
+                            continue;
+                        }
+                    }
+                }
+            }
             if let Some(previous) = watermarks.get(&observation.id).copied() {
                 match compare_stamp(
                     observation.runtime_generation,
@@ -909,6 +1000,18 @@ impl SpecialistProjection {
                     );
                 } else {
                     overflowed = true;
+                    source_available = false;
+                    unique_count_exact = false;
+                    requires_full_resync = true;
+                    update_agent_coarse_floor(
+                        &mut coarse_floor,
+                        AgentWaterMark {
+                            runtime_generation: observation.runtime_generation,
+                            revision: observation.revision,
+                            fingerprint,
+                            removed: true,
+                        },
+                    );
                 }
                 continue;
             }
@@ -949,7 +1052,9 @@ impl SpecialistProjection {
                 if observation.id < largest {
                     largest_ids.pop();
                     candidates.remove(&largest);
-                    watermarks.remove(&largest);
+                    if let Some(retired) = watermarks.remove(&largest) {
+                        update_agent_coarse_floor(&mut coarse_floor, retired);
+                    }
                     largest_ids.push(observation.id);
                     candidates.insert(observation.id, candidate);
                     watermarks.insert(
@@ -980,6 +1085,7 @@ impl SpecialistProjection {
             source_available,
             unique_count_exact,
             conflicts_rejected,
+            requires_full_resync,
         }
     }
 
@@ -1023,6 +1129,10 @@ impl SpecialistProjection {
         self.conflicts_rejected
     }
 
+    pub fn requires_full_resync(&self) -> bool {
+        self.requires_full_resync
+    }
+
     /// Return a bounded exclusive keyset window.  Adding or relabelling an
     /// id before `anchor` cannot change the identity of rows after `anchor`.
     pub fn window_after_id(
@@ -1060,12 +1170,28 @@ struct AgentWaterMark {
     removed: bool,
 }
 
+fn update_agent_coarse_floor(floor: &mut Option<AgentWaterMark>, candidate: AgentWaterMark) {
+    let replace = floor.is_none_or(|current| {
+        compare_stamp(
+            candidate.runtime_generation,
+            candidate.revision,
+            current.runtime_generation,
+            current.revision,
+        ) == std::cmp::Ordering::Greater
+    });
+    if replace {
+        *floor = Some(candidate);
+    }
+}
+
 fn agent_observation_fingerprint(observation: AgentObservation<'_>) -> u64 {
     let mut hasher = Sha256::new();
     hasher.update(observation.id.as_bytes());
     hasher.update(observation.task_id.as_bytes());
-    hasher.update(observation.label.as_bytes());
-    hasher.update(observation.provider.as_bytes());
+    let bounded_label = presentation_text(observation.label, MAX_LABEL_SCALARS);
+    let bounded_provider = presentation_text(observation.provider, MAX_PROVIDER_SCALARS);
+    hasher.update(bounded_label.as_bytes());
+    hasher.update(bounded_provider.as_bytes());
     if let Some(session) = observation.provider_session_id {
         // Session refs are opaque and size-checked before they are retained;
         // the raw value is only fed into the digest and never formatted.
@@ -1129,38 +1255,103 @@ pub struct ProjectedAction {
     target: ActionTarget,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HeaderActionError {
+    MismatchedTarget,
+    EmptyTaskTitle,
+    TaskTitleTooLong { actual: usize, max: usize },
+}
+
+impl fmt::Display for HeaderActionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MismatchedTarget => formatter.write_str("action request and target disagree"),
+            Self::EmptyTaskTitle => formatter.write_str("task title must not be blank"),
+            Self::TaskTitleTooLong { actual, max } => {
+                write!(
+                    formatter,
+                    "task title has {actual} scalars; maximum is {max}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for HeaderActionError {}
+
 impl ProjectedAction {
-    pub fn new(request: ActionRequest, target: ActionTarget) -> Self {
-        Self {
+    fn checked(request: ActionRequest, target: ActionTarget) -> Result<Self, HeaderActionError> {
+        let matches = match (&request, &target) {
+            (ActionRequest::TaskShow { task_id }, ActionTarget::Task(identity)) => {
+                *task_id == identity.task_id
+            }
+            (ActionRequest::TaskRename(arguments), ActionTarget::Task(identity)) => {
+                arguments.task_id == identity.task_id
+            }
+            // Host status is the catalog request for all read-only status
+            // projections, including remote and provider-quota status.
+            (
+                ActionRequest::HostStatus,
+                ActionTarget::Host(_) | ActionTarget::Remote(_) | ActionTarget::Quota(_),
+            ) => true,
+            _ => false,
+        };
+        if !matches {
+            return Err(HeaderActionError::MismatchedTarget);
+        }
+        Ok(Self {
             request: sanitize_action_request(request),
             target,
-        }
+        })
     }
 
     pub fn task_show(identity: TaskIdentity) -> Self {
-        Self::new(
+        Self::checked(
             ActionRequest::TaskShow {
                 task_id: identity.task_id,
             },
             ActionTarget::Task(identity),
         )
+        .expect("task-show factory always captures a matching task identity")
     }
 
-    pub fn task_rename(identity: TaskIdentity, title: impl AsRef<str>) -> Self {
-        Self::new(
+    pub fn task_rename(
+        identity: TaskIdentity,
+        title: impl AsRef<str>,
+    ) -> Result<Self, HeaderActionError> {
+        let title = title.as_ref();
+        let actual = title.chars().count();
+        if title.trim().is_empty() {
+            return Err(HeaderActionError::EmptyTaskTitle);
+        }
+        if actual > MAX_LABEL_SCALARS {
+            return Err(HeaderActionError::TaskTitleTooLong {
+                actual,
+                max: MAX_LABEL_SCALARS,
+            });
+        }
+        Self::checked(
             ActionRequest::TaskRename(TaskRenameArguments {
                 task_id: identity.task_id,
-                // Bound the borrowed caller text before creating the owned
-                // action payload.  This is the only public constructor that
-                // accepts untrusted rename text directly.
-                title: presentation_text(title.as_ref(), MAX_LABEL_SCALARS),
+                title: title.to_owned(),
             }),
             ActionTarget::Task(identity),
         )
     }
 
     pub fn host_status(stamp: ObservationStamp) -> Self {
-        Self::new(ActionRequest::HostStatus, ActionTarget::Host(stamp))
+        Self::checked(ActionRequest::HostStatus, ActionTarget::Host(stamp))
+            .expect("host-status factory always captures a matching host stamp")
+    }
+
+    pub fn remote_status(stamp: ObservationStamp) -> Self {
+        Self::checked(ActionRequest::HostStatus, ActionTarget::Remote(stamp))
+            .expect("remote-status factory always captures a matching remote stamp")
+    }
+
+    pub fn quota_status(stamp: ObservationStamp) -> Self {
+        Self::checked(ActionRequest::HostStatus, ActionTarget::Quota(stamp))
+            .expect("quota-status factory always captures a matching quota stamp")
     }
 
     pub fn request(&self) -> &ActionRequest {
@@ -1199,11 +1390,32 @@ pub enum PendingHeaderActionOutcome {
     Queued,
     Coalesced,
     Full,
+    Stale,
+    Conflict,
+    Unavailable,
+    Uncertain,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PendingHeaderActionError {
     Full,
+    Stale,
+    Conflict,
+    Unavailable,
+    Uncertain,
+}
+
+impl PendingHeaderActionOutcome {
+    pub fn from_high_water(decision: HighWaterDecision) -> Self {
+        match decision {
+            HighWaterDecision::Accepted => Self::Queued,
+            HighWaterDecision::IgnoredStale => Self::Stale,
+            HighWaterDecision::RejectedConflict => Self::Conflict,
+            HighWaterDecision::NeedsFullResync => Self::Uncertain,
+            HighWaterDecision::RejectedCapacity => Self::Full,
+            HighWaterDecision::RejectedInvalid => Self::Unavailable,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1304,16 +1516,13 @@ pub enum RemoteHealth {
     Unavailable,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct HostObservationIdentity {
-    #[serde(deserialize_with = "deserialize_source_string")]
     pub host_id: String,
     pub revision: u64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct HostObservation {
     pub identity: HostObservationIdentity,
     pub health: HostHealth,
@@ -1321,10 +1530,8 @@ pub struct HostObservation {
     pub generation: Option<u64>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct ConnectObservation {
-    #[serde(deserialize_with = "deserialize_source_string")]
     pub host_id: String,
     pub state: ConnectState,
     pub revision: u64,
@@ -1332,10 +1539,8 @@ pub struct ConnectObservation {
     pub generation: Option<u64>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct UpdateObservation {
-    #[serde(deserialize_with = "deserialize_source_string")]
     pub source_id: String,
     pub state: UpdateState,
     pub revision: u64,
@@ -1343,20 +1548,16 @@ pub struct UpdateObservation {
     pub generation: Option<u64>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct RemoteObservationIdentity {
-    #[serde(deserialize_with = "deserialize_source_string")]
     pub source_id: String,
     pub revision: u64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct RemoteObservation {
     pub identity: RemoteObservationIdentity,
     pub health: RemoteHealth,
-    #[serde(deserialize_with = "deserialize_label_string")]
     pub label: String,
     pub observed_at_ms: Option<i64>,
     pub generation: Option<u64>,
@@ -1381,6 +1582,324 @@ impl RemoteObservation {
             observed_at_ms: Some(observed_at_ms),
             generation: Some(generation),
         }
+    }
+}
+
+impl fmt::Debug for HostObservationIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HostObservationIdentity")
+            .field(
+                "host_ref",
+                &OpaqueSourceRef::try_from_raw(&self.host_id).ok(),
+            )
+            .field("revision", &self.revision)
+            .finish()
+    }
+}
+
+impl fmt::Debug for HostObservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HostObservation")
+            .field("identity", &self.identity)
+            .field("health", &self.health)
+            .field("observed_at_ms", &self.observed_at_ms)
+            .field("generation", &self.generation)
+            .finish()
+    }
+}
+
+impl fmt::Debug for ConnectObservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ConnectObservation")
+            .field(
+                "host_ref",
+                &OpaqueSourceRef::try_from_raw(&self.host_id).ok(),
+            )
+            .field("state", &self.state)
+            .field("revision", &self.revision)
+            .field("observed_at_ms", &self.observed_at_ms)
+            .field("generation", &self.generation)
+            .finish()
+    }
+}
+
+impl fmt::Debug for UpdateObservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("UpdateObservation")
+            .field(
+                "source_ref",
+                &OpaqueSourceRef::try_from_raw(&self.source_id).ok(),
+            )
+            .field("state", &self.state)
+            .field("revision", &self.revision)
+            .field("observed_at_ms", &self.observed_at_ms)
+            .field("generation", &self.generation)
+            .finish()
+    }
+}
+
+impl fmt::Debug for RemoteObservationIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RemoteObservationIdentity")
+            .field(
+                "source_ref",
+                &OpaqueSourceRef::try_from_raw(&self.source_id).ok(),
+            )
+            .field("revision", &self.revision)
+            .finish()
+    }
+}
+
+impl fmt::Debug for RemoteObservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RemoteObservation")
+            .field("identity", &self.identity)
+            .field("health", &self.health)
+            .field("label", &"[bounded]")
+            .field("observed_at_ms", &self.observed_at_ms)
+            .field("generation", &self.generation)
+            .finish()
+    }
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct SourceIdentityWire {
+    source_ref: OpaqueSourceRef,
+    revision: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourceIdentityWireIn {
+    source_ref: OpaqueSourceRef,
+    revision: u64,
+}
+
+fn source_token_from_wire(reference: OpaqueSourceRef) -> String {
+    reference.token()
+}
+
+impl Serialize for HostObservationIdentity {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        SourceIdentityWire {
+            source_ref: OpaqueSourceRef::try_from_raw(&self.host_id)
+                .map_err(serde::ser::Error::custom)?,
+            revision: self.revision,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for HostObservationIdentity {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = SourceIdentityWireIn::deserialize(deserializer)?;
+        Ok(Self {
+            host_id: source_token_from_wire(wire.source_ref),
+            revision: wire.revision,
+        })
+    }
+}
+
+impl Serialize for HostObservation {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire<'a> {
+            identity: &'a HostObservationIdentity,
+            health: HostHealth,
+            observed_at_ms: Option<i64>,
+            generation: Option<u64>,
+        }
+        Wire {
+            identity: &self.identity,
+            health: self.health,
+            observed_at_ms: self.observed_at_ms,
+            generation: self.generation,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for HostObservation {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            identity: HostObservationIdentity,
+            health: HostHealth,
+            observed_at_ms: Option<i64>,
+            generation: Option<u64>,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        Ok(Self {
+            identity: wire.identity,
+            health: wire.health,
+            observed_at_ms: wire.observed_at_ms,
+            generation: wire.generation,
+        })
+    }
+}
+
+impl Serialize for ConnectObservation {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            host_ref: OpaqueSourceRef,
+            state: ConnectState,
+            revision: u64,
+            observed_at_ms: Option<i64>,
+            generation: Option<u64>,
+        }
+        Wire {
+            host_ref: OpaqueSourceRef::try_from_raw(&self.host_id)
+                .map_err(serde::ser::Error::custom)?,
+            state: self.state,
+            revision: self.revision,
+            observed_at_ms: self.observed_at_ms,
+            generation: self.generation,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ConnectObservation {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            host_ref: OpaqueSourceRef,
+            state: ConnectState,
+            revision: u64,
+            observed_at_ms: Option<i64>,
+            generation: Option<u64>,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        Ok(Self {
+            host_id: source_token_from_wire(wire.host_ref),
+            state: wire.state,
+            revision: wire.revision,
+            observed_at_ms: wire.observed_at_ms,
+            generation: wire.generation,
+        })
+    }
+}
+
+impl Serialize for UpdateObservation {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            source_ref: OpaqueSourceRef,
+            state: UpdateState,
+            revision: u64,
+            observed_at_ms: Option<i64>,
+            generation: Option<u64>,
+        }
+        Wire {
+            source_ref: OpaqueSourceRef::try_from_raw(&self.source_id)
+                .map_err(serde::ser::Error::custom)?,
+            state: self.state,
+            revision: self.revision,
+            observed_at_ms: self.observed_at_ms,
+            generation: self.generation,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for UpdateObservation {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            source_ref: OpaqueSourceRef,
+            state: UpdateState,
+            revision: u64,
+            observed_at_ms: Option<i64>,
+            generation: Option<u64>,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        Ok(Self {
+            source_id: source_token_from_wire(wire.source_ref),
+            state: wire.state,
+            revision: wire.revision,
+            observed_at_ms: wire.observed_at_ms,
+            generation: wire.generation,
+        })
+    }
+}
+
+impl Serialize for RemoteObservationIdentity {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        SourceIdentityWire {
+            source_ref: OpaqueSourceRef::try_from_raw(&self.source_id)
+                .map_err(serde::ser::Error::custom)?,
+            revision: self.revision,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for RemoteObservationIdentity {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = SourceIdentityWireIn::deserialize(deserializer)?;
+        Ok(Self {
+            source_id: source_token_from_wire(wire.source_ref),
+            revision: wire.revision,
+        })
+    }
+}
+
+impl Serialize for RemoteObservation {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire<'a> {
+            identity: &'a RemoteObservationIdentity,
+            health: RemoteHealth,
+            label: String,
+            observed_at_ms: Option<i64>,
+            generation: Option<u64>,
+        }
+        Wire {
+            identity: &self.identity,
+            health: self.health,
+            label: bounded_label(&self.label, MAX_LABEL_SCALARS),
+            observed_at_ms: self.observed_at_ms,
+            generation: self.generation,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for RemoteObservation {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            identity: RemoteObservationIdentity,
+            health: RemoteHealth,
+            #[serde(deserialize_with = "deserialize_label_string")]
+            label: String,
+            observed_at_ms: Option<i64>,
+            generation: Option<u64>,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        Ok(Self {
+            identity: wire.identity,
+            health: wire.health,
+            label: wire.label,
+            observed_at_ms: wire.observed_at_ms,
+            generation: wire.generation,
+        })
     }
 }
 
@@ -1528,13 +2047,6 @@ where
     deserializer.deserialize_str(BoundedTextVisitor { field, max_scalars })
 }
 
-fn deserialize_source_string<'de, D>(deserializer: D) -> Result<String, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    deserialize_bounded_string(deserializer, "source", MAX_SOURCE_SCALARS)
-}
-
 fn deserialize_provider_string<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -1647,6 +2159,30 @@ impl QuotaObservation {
     }
 }
 
+/// CPU values shown by Task Manager are whole-machine percentages.  The
+/// constructor makes the source semantics explicit when an adapter reports a
+/// core-scaled sample and clamps all malformed values to the safe range.
+#[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
+pub struct TaskManagerCpuPercent(f64);
+
+impl TaskManagerCpuPercent {
+    pub fn from_whole_machine(value: f64) -> Option<Self> {
+        (value.is_finite() && (0.0..=100.0).contains(&value)).then_some(Self(value))
+    }
+
+    pub fn from_core_scaled(core_scaled_value: f64, logical_processor_count: u32) -> Self {
+        if !core_scaled_value.is_finite() || core_scaled_value < 0.0 {
+            return Self(0.0);
+        }
+        let divisor = f64::from(logical_processor_count.max(1));
+        Self((core_scaled_value / divisor).clamp(0.0, 100.0))
+    }
+
+    pub const fn value(self) -> f64 {
+        self.0
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct HostResourceObservation {
     pub cpu_percent: Option<f64>,
@@ -1687,10 +2223,45 @@ impl Default for TopBarProjectionInput {
     }
 }
 
+impl TopBarProjectionInput {
+    /// Build an input from a streaming quota source without collecting more
+    /// than one over-cap sentinel.  Callers with an already-owned Vec still
+    /// pass through `TopBarProjectionController::try_new`, which validates it
+    /// before any sanitizing/hash work.
+    pub fn from_quota_iter<I>(
+        now_ms: i64,
+        generation: u64,
+        quotas: I,
+    ) -> Result<Self, TopBarProjectionError>
+    where
+        I: IntoIterator<Item = QuotaObservation>,
+    {
+        let mut bounded = Vec::with_capacity(MAX_TOP_BAR_QUOTA_CACHE);
+        for quota in quotas {
+            if bounded.len() >= MAX_TOP_BAR_QUOTA_CACHE {
+                return Err(TopBarProjectionError::TooManyQuotas {
+                    actual: MAX_TOP_BAR_QUOTA_CACHE + 1,
+                    max: MAX_TOP_BAR_QUOTA_CACHE,
+                });
+            }
+            bounded.push(quota);
+        }
+        let input = Self {
+            now_ms,
+            generation,
+            quotas: bounded,
+            ..Self::default()
+        };
+        validate_top_bar_input(&input)?;
+        Ok(input)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TopBarProjectionError {
     InvalidNow,
     InvalidGeneration,
+    InvalidObservation(&'static str),
     TooManyQuotas { actual: usize, max: usize },
     QuotaConflict,
 }
@@ -1700,6 +2271,9 @@ impl fmt::Display for TopBarProjectionError {
         match self {
             Self::InvalidNow => formatter.write_str("top-bar now_ms must be non-negative"),
             Self::InvalidGeneration => formatter.write_str("top-bar generation must be nonzero"),
+            Self::InvalidObservation(field) => {
+                write!(formatter, "top-bar observation field {field} is invalid")
+            }
             Self::TooManyQuotas { actual, max } => {
                 write!(formatter, "quota count {actual} exceeds bound {max}")
             }
@@ -1740,18 +2314,19 @@ pub struct QuotaProjection {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RemoteProjection {
-    pub source_id: String,
+    pub source_id: OpaqueSourceRef,
     pub health: RemoteHealth,
     pub label: String,
     pub age_ms: i64,
     pub role: AccessibleRole,
     pub focusable: bool,
+    pub action: TopBarAction,
     pub accessible_description: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ResourceProjection {
-    pub cpu_percent: Option<f64>,
+    pub cpu_percent: Option<TaskManagerCpuPercent>,
     pub memory_bytes: Option<u64>,
     pub age_ms: i64,
 }
@@ -1810,6 +2385,7 @@ impl TopBarModel {
     }
 
     pub fn try_from_input(input: &TopBarProjectionInput) -> Result<Self, TopBarProjectionError> {
+        validate_top_bar_input(input)?;
         if input.now_ms < 0 {
             return Err(TopBarProjectionError::InvalidNow);
         }
@@ -1867,25 +2443,30 @@ impl TopBarModel {
                 observation.generation,
                 observation.identity.revision,
             )
-            .map(|stamp| {
-                let source_id = bounded_label(&observation.identity.source_id, MAX_SOURCE_SCALARS);
+            .and_then(|stamp| {
+                let Some(source_id) =
+                    OpaqueSourceRef::try_from_raw(&observation.identity.source_id).ok()
+                else {
+                    return None;
+                };
                 let label = bounded_label(&observation.label, MAX_LABEL_SCALARS);
                 let accessible_description = format!(
                     "Remote {label} is {}.",
                     remote_health_label(observation.health)
                 );
-                RemoteProjection {
+                Some(RemoteProjection {
                     source_id,
                     health: observation.health,
                     label,
                     age_ms: stamp.age_ms(input.now_ms),
                     role: AccessibleRole::Status,
                     focusable: false,
+                    action: ProjectedAction::remote_status(stamp),
                     accessible_description: presentation_text(
                         &accessible_description,
                         MAX_ACCESSIBLE_SCALARS,
                     ),
-                }
+                })
             })
         });
 
@@ -1953,10 +2534,7 @@ impl TopBarModel {
                     age_ms: stamp.age_ms(input.now_ms),
                     role: AccessibleRole::Status,
                     focusable: false,
-                    action: ProjectedAction::new(
-                        ActionRequest::HostStatus,
-                        ActionTarget::Quota(stamp),
-                    ),
+                    action: ProjectedAction::quota_status(stamp),
                 })
             })
             .collect::<Vec<_>>();
@@ -1970,7 +2548,7 @@ impl TopBarModel {
                 observation.revision,
             )
             .map(|stamp| ResourceProjection {
-                cpu_percent: valid_cpu_percent(observation.cpu_percent),
+                cpu_percent: typed_cpu_percent(observation.cpu_percent),
                 memory_bytes: observation.memory_bytes,
                 age_ms: stamp.age_ms(input.now_ms),
             })
@@ -2031,9 +2609,10 @@ impl TopBarModel {
             append_accessible(&mut accessible, Some(&description));
         }
         if let Some(resource) = resources.as_ref() {
-            let cpu = resource
-                .cpu_percent
-                .map_or_else(|| "unavailable".to_string(), |value| format!("{value:.1}%"));
+            let cpu = resource.cpu_percent.map_or_else(
+                || "unavailable".to_string(),
+                |value| format!("{:.1}%", value.value()),
+            );
             let memory = resource
                 .memory_bytes
                 .map_or_else(|| "unavailable".to_string(), |value| value.to_string());
@@ -2062,9 +2641,8 @@ impl TopBarModel {
             quota_hidden_count,
             quota_overflow_count: 0,
             quotas_truncated: quota_hidden_count != 0,
-            quota_overflow_action: quota_action_stamp.map(|stamp| {
-                ProjectedAction::new(ActionRequest::HostStatus, ActionTarget::Quota(stamp))
-            }),
+            quota_overflow_action: quota_action_stamp
+                .map(|stamp| ProjectedAction::quota_status(stamp)),
             resources,
             unavailable,
             accessible_description: presentation_text(&accessible, MAX_ACCESSIBLE_SCALARS),
@@ -2087,8 +2665,8 @@ pub struct TopBarProjectionController {
 }
 
 impl TopBarProjectionController {
-    pub fn new(input: TopBarProjectionInput) -> Self {
-        let quota_overflow_count = input.quotas.len().saturating_sub(MAX_TOP_BAR_QUOTA_CACHE);
+    pub fn try_new(input: TopBarProjectionInput) -> Result<Self, TopBarProjectionError> {
+        validate_top_bar_input(&input)?;
         let input = normalize_top_bar_input(input);
         let mut controller = Self {
             input,
@@ -2096,10 +2674,10 @@ impl TopBarProjectionController {
                 MAX_HEADER_HIGH_WATER_ENTRIES,
                 HEADER_HIGH_WATER_TTL_MS,
             ),
-            quota_overflow_count,
+            quota_overflow_count: 0,
         };
         controller.seed_high_water();
-        controller
+        Ok(controller)
     }
 
     pub fn input(&self) -> &TopBarProjectionInput {
@@ -2110,6 +2688,47 @@ impl TopBarProjectionController {
         &self.high_water
     }
 
+    /// Replace the projected snapshot only after the bounded ledger accepts
+    /// the caller's newer authoritative epoch.  Both the ledger and model
+    /// input are staged so a rejected/conflicting bundle cannot partially
+    /// advance either state.
+    pub fn apply_full_resync<I>(
+        &mut self,
+        full_resync_epoch: u64,
+        snapshot: TopBarProjectionInput,
+        observations: I,
+    ) -> Result<HighWaterDecision, TopBarProjectionError>
+    where
+        I: IntoIterator<Item = HeaderObservation>,
+    {
+        validate_top_bar_input(&snapshot)?;
+        if snapshot.generation < self.input.generation
+            || (snapshot.generation == self.input.generation && snapshot.now_ms < self.input.now_ms)
+        {
+            return Ok(HighWaterDecision::IgnoredStale);
+        }
+        let mut candidate = self.high_water.clone();
+        let decision =
+            candidate.apply_full_resync(full_resync_epoch, snapshot.generation, observations);
+        if decision == HighWaterDecision::Accepted {
+            self.high_water = candidate;
+            self.input = normalize_top_bar_input(snapshot);
+            self.quota_overflow_count = 0;
+        }
+        Ok(decision)
+    }
+
+    fn commit_observation_clock(&mut self, generation: u64, observed_at_ms: i64) {
+        if generation > self.input.generation {
+            self.input.generation = generation;
+        }
+        self.input.now_ms = self.input.now_ms.max(observed_at_ms);
+    }
+
+    fn accepts_generation(&self, generation: u64) -> bool {
+        generation >= self.input.generation
+    }
+
     pub fn observe_quota(&mut self, observation: QuotaObservation) -> HighWaterDecision {
         let Some(generation) = observation.generation else {
             return HighWaterDecision::RejectedInvalid;
@@ -2117,6 +2736,14 @@ impl TopBarProjectionController {
         let Some(observed_at_ms) = observation.observed_at_ms else {
             return HighWaterDecision::RejectedInvalid;
         };
+        if !self.accepts_generation(generation) {
+            return HighWaterDecision::IgnoredStale;
+        }
+        if !bounded_observation_text(&observation.identity.provider, MAX_PROVIDER_SCALARS)
+            || !bounded_observation_text(&observation.detail, MAX_DETAIL_SCALARS)
+        {
+            return HighWaterDecision::RejectedInvalid;
+        }
         let provider = bounded_label(&observation.identity.provider, MAX_PROVIDER_SCALARS);
         let key = HeaderFieldKey::Quota {
             provider: provider.clone(),
@@ -2139,6 +2766,7 @@ impl TopBarProjectionController {
             false,
         );
         if decision == HighWaterDecision::Accepted {
+            self.commit_observation_clock(generation, observed_at_ms);
             let sanitized = sanitize_quota_observation(&observation);
             self.input
                 .quotas
@@ -2155,6 +2783,12 @@ impl TopBarProjectionController {
         let Some(observed_at_ms) = observation.observed_at_ms else {
             return HighWaterDecision::RejectedInvalid;
         };
+        if !self.accepts_generation(generation) {
+            return HighWaterDecision::IgnoredStale;
+        }
+        if !bounded_observation_text(&observation.identity.host_id, MAX_SOURCE_SCALARS) {
+            return HighWaterDecision::RejectedInvalid;
+        }
         let source_id = bounded_label(&observation.identity.host_id, MAX_SOURCE_SCALARS);
         let decision = self.high_water.observe(
             HeaderFieldKey::Host {
@@ -2167,6 +2801,7 @@ impl TopBarProjectionController {
             false,
         );
         if decision == HighWaterDecision::Accepted {
+            self.commit_observation_clock(generation, observed_at_ms);
             self.input.host = Some(HostObservation {
                 identity: HostObservationIdentity {
                     host_id: source_id,
@@ -2187,6 +2822,12 @@ impl TopBarProjectionController {
         let Some(observed_at_ms) = observation.observed_at_ms else {
             return HighWaterDecision::RejectedInvalid;
         };
+        if !self.accepts_generation(generation) {
+            return HighWaterDecision::IgnoredStale;
+        }
+        if !bounded_observation_text(&observation.host_id, MAX_SOURCE_SCALARS) {
+            return HighWaterDecision::RejectedInvalid;
+        }
         let source_id = bounded_label(&observation.host_id, MAX_SOURCE_SCALARS);
         let decision = self.high_water.observe(
             HeaderFieldKey::Connect {
@@ -2199,6 +2840,7 @@ impl TopBarProjectionController {
             false,
         );
         if decision == HighWaterDecision::Accepted {
+            self.commit_observation_clock(generation, observed_at_ms);
             self.input.connect = Some(ConnectObservation {
                 host_id: source_id,
                 state: observation.state,
@@ -2217,6 +2859,12 @@ impl TopBarProjectionController {
         let Some(observed_at_ms) = observation.observed_at_ms else {
             return HighWaterDecision::RejectedInvalid;
         };
+        if !self.accepts_generation(generation) {
+            return HighWaterDecision::IgnoredStale;
+        }
+        if !bounded_observation_text(&observation.source_id, MAX_SOURCE_SCALARS) {
+            return HighWaterDecision::RejectedInvalid;
+        }
         let source_id = bounded_label(&observation.source_id, MAX_SOURCE_SCALARS);
         let decision = self.high_water.observe(
             HeaderFieldKey::Update {
@@ -2229,6 +2877,7 @@ impl TopBarProjectionController {
             false,
         );
         if decision == HighWaterDecision::Accepted {
+            self.commit_observation_clock(generation, observed_at_ms);
             self.input.update = Some(UpdateObservation {
                 source_id,
                 state: observation.state,
@@ -2247,6 +2896,9 @@ impl TopBarProjectionController {
         let Some(observed_at_ms) = observation.observed_at_ms else {
             return HighWaterDecision::RejectedInvalid;
         };
+        if !self.accepts_generation(generation) {
+            return HighWaterDecision::IgnoredStale;
+        }
         let fingerprint = resource_fingerprint(&observation);
         let cpu = self.high_water.observe(
             HeaderFieldKey::HostResource {
@@ -2270,6 +2922,7 @@ impl TopBarProjectionController {
         );
         let decision = combine_high_water_decisions(cpu, memory);
         if matches!(decision, HighWaterDecision::Accepted) {
+            self.commit_observation_clock(generation, observed_at_ms);
             self.input.resources = Some(HostResourceObservation {
                 cpu_percent: valid_cpu_percent(observation.cpu_percent),
                 memory_bytes: observation.memory_bytes,
@@ -2288,6 +2941,14 @@ impl TopBarProjectionController {
         let Some(observed_at_ms) = observation.observed_at_ms else {
             return HighWaterDecision::RejectedInvalid;
         };
+        if !self.accepts_generation(generation) {
+            return HighWaterDecision::IgnoredStale;
+        }
+        if !bounded_observation_text(&observation.identity.source_id, MAX_SOURCE_SCALARS)
+            || !bounded_observation_text(&observation.label, MAX_LABEL_SCALARS)
+        {
+            return HighWaterDecision::RejectedInvalid;
+        }
         let key = HeaderFieldKey::Remote {
             source_id: bounded_label(&observation.identity.source_id, MAX_SOURCE_SCALARS),
         };
@@ -2300,6 +2961,7 @@ impl TopBarProjectionController {
             false,
         );
         if decision == HighWaterDecision::Accepted {
+            self.commit_observation_clock(generation, observed_at_ms);
             self.input.remote = Some(RemoteObservation::new(
                 &observation.identity.source_id,
                 observation.health,
@@ -2429,6 +3091,71 @@ impl TopBarProjectionController {
     }
 }
 
+fn validate_top_bar_input(input: &TopBarProjectionInput) -> Result<(), TopBarProjectionError> {
+    if input.now_ms < 0 {
+        return Err(TopBarProjectionError::InvalidNow);
+    }
+    if input.generation == 0 {
+        return Err(TopBarProjectionError::InvalidGeneration);
+    }
+    if input.quotas.len() > MAX_TOP_BAR_QUOTA_CACHE {
+        return Err(TopBarProjectionError::TooManyQuotas {
+            actual: input.quotas.len(),
+            max: MAX_TOP_BAR_QUOTA_CACHE,
+        });
+    }
+    let validate_stamp = |observed_at_ms: Option<i64>, generation: Option<u64>| {
+        if observed_at_ms.is_some_and(|value| value < 0)
+            || generation.is_some_and(|value| value == 0)
+        {
+            Err(TopBarProjectionError::InvalidObservation("stamp"))
+        } else {
+            Ok(())
+        }
+    };
+    if let Some(host) = input.host.as_ref() {
+        validate_bounded_wire("host_id", &host.identity.host_id, MAX_SOURCE_SCALARS)
+            .map_err(|_| TopBarProjectionError::InvalidObservation("host_id"))?;
+        validate_stamp(host.observed_at_ms, host.generation)?;
+    }
+    if let Some(connect) = input.connect.as_ref() {
+        validate_bounded_wire("host_id", &connect.host_id, MAX_SOURCE_SCALARS)
+            .map_err(|_| TopBarProjectionError::InvalidObservation("host_id"))?;
+        validate_stamp(connect.observed_at_ms, connect.generation)?;
+    }
+    if let Some(update) = input.update.as_ref() {
+        validate_bounded_wire("source_id", &update.source_id, MAX_SOURCE_SCALARS)
+            .map_err(|_| TopBarProjectionError::InvalidObservation("source_id"))?;
+        validate_stamp(update.observed_at_ms, update.generation)?;
+    }
+    if let Some(remote) = input.remote.as_ref() {
+        validate_bounded_wire("source_id", &remote.identity.source_id, MAX_SOURCE_SCALARS)
+            .map_err(|_| TopBarProjectionError::InvalidObservation("source_id"))?;
+        validate_bounded_wire("label", &remote.label, MAX_LABEL_SCALARS)
+            .map_err(|_| TopBarProjectionError::InvalidObservation("label"))?;
+        validate_stamp(remote.observed_at_ms, remote.generation)?;
+    }
+    for quota in &input.quotas {
+        validate_bounded_wire(
+            "quota.provider",
+            &quota.identity.provider,
+            MAX_PROVIDER_SCALARS,
+        )
+        .map_err(|_| TopBarProjectionError::InvalidObservation("quota.provider"))?;
+        validate_bounded_wire("quota.detail", &quota.detail, MAX_DETAIL_SCALARS)
+            .map_err(|_| TopBarProjectionError::InvalidObservation("quota.detail"))?;
+        validate_stamp(quota.observed_at_ms, quota.generation)?;
+    }
+    if let Some(resource) = input.resources.as_ref() {
+        validate_stamp(resource.observed_at_ms, resource.generation)?;
+    }
+    Ok(())
+}
+
+fn bounded_observation_text(value: &str, max_scalars: usize) -> bool {
+    validate_bounded_wire("observation", value, max_scalars).is_ok()
+}
+
 fn normalize_top_bar_input(mut input: TopBarProjectionInput) -> TopBarProjectionInput {
     input.host = input.host.map(|observation| HostObservation {
         identity: HostObservationIdentity {
@@ -2478,7 +3205,6 @@ fn normalize_top_bar_input(mut input: TopBarProjectionInput) -> TopBarProjection
                     .cmp(&right.identity.provider_session_ref)
             })
     });
-    quotas.truncate(MAX_TOP_BAR_QUOTA_CACHE);
     input.quotas = quotas;
     if let Some(resource) = input.resources.as_mut() {
         resource.cpu_percent = valid_cpu_percent(resource.cpu_percent);
@@ -2591,21 +3317,30 @@ fn hash_digest_prefix(hasher: Sha256) -> u64 {
 
 fn quota_fingerprint(observation: &QuotaObservation) -> u64 {
     let mut hasher = Sha256::new();
-    hasher.update(observation.identity.provider.as_bytes());
+    let provider = bounded_label(&observation.identity.provider, MAX_PROVIDER_SCALARS);
+    let detail = bounded_label(&observation.detail, MAX_DETAIL_SCALARS);
+    hasher.update(provider.as_bytes());
     hasher.update(observation.identity.provider_session_ref.as_digest());
     hasher.update(observation.identity.observation_id.to_be_bytes());
-    hasher.update(observation.detail.as_bytes());
+    hasher.update(detail.as_bytes());
     hash_option_i64(&mut hasher, observation.observed_at_ms);
     hash_option_u64(&mut hasher, observation.generation);
     hasher.update(observation.revision.to_be_bytes());
     hash_digest_prefix(hasher)
 }
 
+fn source_ref_digest(raw: &str) -> [u8; 16] {
+    OpaqueSourceRef::try_from_raw(&presentation_text(raw, MAX_SOURCE_SCALARS))
+        .map(|reference| reference.0)
+        .unwrap_or([0; 16])
+}
+
 fn remote_fingerprint(observation: &RemoteObservation) -> u64 {
     let mut hasher = Sha256::new();
-    hasher.update(observation.identity.source_id.as_bytes());
+    hasher.update(source_ref_digest(&observation.identity.source_id));
     hasher.update([remote_health_fingerprint(observation.health)]);
-    hasher.update(observation.label.as_bytes());
+    let label = bounded_label(&observation.label, MAX_LABEL_SCALARS);
+    hasher.update(label.as_bytes());
     hasher.update(observation.identity.revision.to_be_bytes());
     hash_option_i64(&mut hasher, observation.observed_at_ms);
     hash_option_u64(&mut hasher, observation.generation);
@@ -2614,7 +3349,7 @@ fn remote_fingerprint(observation: &RemoteObservation) -> u64 {
 
 fn host_fingerprint(observation: &HostObservation) -> u64 {
     let mut hasher = Sha256::new();
-    hasher.update(observation.identity.host_id.as_bytes());
+    hasher.update(source_ref_digest(&observation.identity.host_id));
     hasher.update([host_health_fingerprint(observation.health)]);
     hasher.update(observation.identity.revision.to_be_bytes());
     hash_option_i64(&mut hasher, observation.observed_at_ms);
@@ -2624,7 +3359,7 @@ fn host_fingerprint(observation: &HostObservation) -> u64 {
 
 fn connect_fingerprint(observation: &ConnectObservation) -> u64 {
     let mut hasher = Sha256::new();
-    hasher.update(observation.host_id.as_bytes());
+    hasher.update(source_ref_digest(&observation.host_id));
     hasher.update([connect_state_fingerprint(observation.state)]);
     hasher.update(observation.revision.to_be_bytes());
     hash_option_i64(&mut hasher, observation.observed_at_ms);
@@ -2634,7 +3369,7 @@ fn connect_fingerprint(observation: &ConnectObservation) -> u64 {
 
 fn update_observation_fingerprint(observation: &UpdateObservation) -> u64 {
     let mut hasher = Sha256::new();
-    hasher.update(observation.source_id.as_bytes());
+    hasher.update(source_ref_digest(&observation.source_id));
     hasher.update([update_fingerprint(observation.state)]);
     hasher.update(observation.revision.to_be_bytes());
     hash_option_i64(&mut hasher, observation.observed_at_ms);
@@ -2681,6 +3416,10 @@ fn compare_observation_stamps(
 
 fn valid_cpu_percent(value: Option<f64>) -> Option<f64> {
     value.filter(|value| value.is_finite() && (0.0..=100.0).contains(value))
+}
+
+fn typed_cpu_percent(value: Option<f64>) -> Option<TaskManagerCpuPercent> {
+    value.and_then(TaskManagerCpuPercent::from_whole_machine)
 }
 
 fn unavailable_description(unavailable: TopBarUnavailable) -> &'static str {
@@ -2915,6 +3654,10 @@ impl TaskHeaderModel {
         HeaderLayout::for_model(self, width_px)
     }
 
+    pub fn layout_at_scale(&self, width_px: u16, scale_factor: f32) -> HeaderLayout {
+        HeaderLayout::for_model_at_scale(self, width_px, scale_factor)
+    }
+
     pub fn accessibility_tree(&self) -> SemanticNode {
         let specialist_description = if !self.specialists.source_available() {
             "Specialist observations are unavailable."
@@ -2925,6 +3668,16 @@ impl TaskHeaderModel {
         } else {
             "Specialists are navigated by stable session identity."
         };
+        let task_action = Some(self.task_show_action());
+        let workspace_label = match &self.workspace {
+            WorkspaceProjection::Main => "Workspace: main".to_string(),
+            WorkspaceProjection::Worktree { path, branch } => {
+                format!("Workspace: {path:?} ({branch})")
+            }
+            WorkspaceProjection::External { path } => {
+                format!("Workspace: external {path:?}")
+            }
+        };
         SemanticNode {
             role: AccessibleRole::Region,
             label: "Task header".to_string(),
@@ -2932,17 +3685,47 @@ impl TaskHeaderModel {
             children: vec![
                 SemanticNode {
                     role: AccessibleRole::Status,
-                    label: self.title.clone(),
+                    label: format!("Title: {}", self.title),
                     description: self.accessible_description.clone(),
                     children: Vec::new(),
+                    action: task_action.clone(),
+                    unavailable: false,
+                },
+                SemanticNode {
+                    role: AccessibleRole::Status,
+                    label: format!("Project: {}", self.project.label),
+                    description: format!("Project {}.", self.project.label),
+                    children: Vec::new(),
+                    action: task_action.clone(),
+                    unavailable: false,
+                },
+                SemanticNode {
+                    role: AccessibleRole::Status,
+                    label: workspace_label,
+                    description: "Workspace location.".to_string(),
+                    children: Vec::new(),
+                    action: task_action.clone(),
+                    unavailable: false,
+                },
+                SemanticNode {
+                    role: AccessibleRole::Status,
+                    label: format!("Status: {:?}", self.status),
+                    description: format!("Task status is {:?}.", self.status),
+                    children: Vec::new(),
+                    action: task_action.clone(),
+                    unavailable: false,
                 },
                 SemanticNode {
                     role: AccessibleRole::Status,
                     label: format!("{} specialist sessions", self.specialists.total_seen()),
                     description: specialist_description.to_string(),
                     children: Vec::new(),
+                    action: Some(self.task_show_action()),
+                    unavailable: !self.specialists.source_available(),
                 },
             ],
+            action: None,
+            unavailable: false,
         }
     }
 }
@@ -3052,16 +3835,29 @@ impl HeaderLayout {
             ),
         }
     }
+
+    /// `width_px` is physical pixels and `scale_factor` is physical pixels
+    /// per logical UI pixel.  Layout thresholds are evaluated in logical
+    /// pixels, with invalid scales failing closed to a zero-width layout.
+    pub fn for_model_at_scale(model: &TaskHeaderModel, width_px: u16, scale_factor: f32) -> Self {
+        let logical_width = if scale_factor.is_finite() && scale_factor > 0.0 {
+            ((f32::from(width_px) / scale_factor).round()).clamp(0.0, f32::from(u16::MAX)) as u16
+        } else {
+            0
+        };
+        Self::for_model(model, logical_width)
+    }
 }
 
 fn truncate_with_ellipsis(value: &str, max_scalars: usize) -> String {
-    if value.chars().count() <= max_scalars {
+    let graphemes = grapheme_slices(value);
+    if graphemes.len() <= max_scalars {
         return value.to_string();
     }
     if max_scalars <= 1 {
-        return "…".chars().take(max_scalars).collect();
+        return "…".to_string();
     }
-    let mut truncated: String = value.chars().take(max_scalars - 1).collect();
+    let mut truncated: String = graphemes[..max_scalars - 1].concat();
     truncated.push('…');
     truncated
 }
@@ -3073,15 +3869,15 @@ fn wrap_title(value: &str, max_line_scalars: usize) -> Vec<String> {
     let mut lines = Vec::new();
     let mut current = String::new();
     for word in value.split_whitespace() {
-        let word_len = word.chars().count();
+        let word_len = grapheme_slices(word).len();
         if word_len > max_line_scalars {
             if !current.is_empty() {
                 lines.push(std::mem::take(&mut current));
             }
             let mut chunk = String::new();
-            for character in word.chars() {
-                chunk.push(character);
-                if chunk.chars().count() == max_line_scalars {
+            for grapheme in grapheme_slices(word) {
+                chunk.push_str(grapheme);
+                if grapheme_slices(&chunk).len() == max_line_scalars {
                     lines.push(std::mem::take(&mut chunk));
                 }
             }
@@ -3090,7 +3886,8 @@ fn wrap_title(value: &str, max_line_scalars: usize) -> Vec<String> {
             }
             continue;
         }
-        let proposed = current.chars().count() + usize::from(!current.is_empty()) + word_len;
+        let proposed =
+            grapheme_slices(&current).len() + usize::from(!current.is_empty()) + word_len;
         if proposed > max_line_scalars && !current.is_empty() {
             lines.push(std::mem::take(&mut current));
         }
@@ -3105,10 +3902,85 @@ fn wrap_title(value: &str, max_line_scalars: usize) -> Vec<String> {
     lines
 }
 
+/// Small, allocation-bounded grapheme segmentation for header text.  The
+/// component cannot add a second Unicode dependency just for layout, so this
+/// handles the cluster classes relevant to task titles: combining marks,
+/// variation selectors, emoji modifiers, ZWJ sequences, and flag pairs.
+fn grapheme_slices(value: &str) -> Vec<&str> {
+    if value.is_empty() {
+        return Vec::new();
+    }
+    let mut starts = vec![0_usize];
+    let mut characters = value.char_indices();
+    let (_, first) = characters
+        .next()
+        .expect("nonempty value has a first scalar");
+    let mut previous = Some(first);
+    let mut regional_run = usize::from(is_regional_indicator(first));
+    for (index, character) in characters {
+        let joins = is_grapheme_extend(character)
+            || previous == Some('\u{200d}')
+            || character == '\u{200d}'
+            || (is_regional_indicator(character)
+                && previous.is_some_and(is_regional_indicator)
+                && regional_run % 2 == 1);
+        if !joins {
+            starts.push(index);
+        }
+        if is_regional_indicator(character) {
+            regional_run = regional_run.saturating_add(1);
+        } else {
+            regional_run = 0;
+        }
+        previous = Some(character);
+    }
+    starts.push(value.len());
+    starts
+        .windows(2)
+        .map(|window| &value[window[0]..window[1]])
+        .collect()
+}
+
+fn is_regional_indicator(character: char) -> bool {
+    matches!(character as u32, 0x1f1e6..=0x1f1ff)
+}
+
+fn is_grapheme_extend(character: char) -> bool {
+    matches!(
+        character as u32,
+        0x0300..=0x036f
+            | 0x0483..=0x0489
+            | 0x0591..=0x05bd
+            | 0x05bf
+            | 0x05c1..=0x05c2
+            | 0x05c4..=0x05c5
+            | 0x0610..=0x061a
+            | 0x064b..=0x065f
+            | 0x0670
+            | 0x06d6..=0x06dc
+            | 0x06df..=0x06e4
+            | 0x06e7..=0x06e8
+            | 0x06ea..=0x06ed
+            | 0x1ab0..=0x1aff
+            | 0x1dc0..=0x1dff
+            | 0x20d0..=0x20ff
+            | 0x2cef..=0x2cf1
+            | 0x302a..=0x302f
+            | 0xa66f..=0xa67f
+            | 0xa69e..=0xa69f
+            | 0xfe00..=0xfe0f
+            | 0xff9e..=0xff9f
+            | 0x1f3fb..=0x1f3ff
+            | 0xe0100..=0xe01ef
+    )
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SemanticNode {
     pub role: AccessibleRole,
     pub label: String,
     pub description: String,
     pub children: Vec<SemanticNode>,
+    pub action: Option<HeaderAction>,
+    pub unavailable: bool,
 }
