@@ -860,23 +860,6 @@ impl ProcessManager {
             .map(|_| ())
     }
 
-    pub fn schedule_kill_port_and_restart(
-        &self,
-        app_state: &mut AppState,
-        command_id: &str,
-        port: u16,
-        dimensions: SessionDimensions,
-        banner: &str,
-        response: Option<Sender<RemoteActionResult>>,
-    ) -> Result<(), String> {
-        self.validate_server_launch(app_state, command_id)?;
-        let _ = (app_state, command_id, port, dimensions, banner, response);
-        Err(
-            "Port control is unavailable until an exact managed resource fence is supplied"
-                .to_string(),
-        )
-    }
-
     pub fn validate_server_launch(
         &self,
         app_state: &AppState,
@@ -6045,30 +6028,6 @@ pub(crate) fn execute_process_op_inner(
                 response,
             )
         }
-        ProcessOp::KillPortAndRestart {
-            command_id,
-            port,
-            launch,
-            dimensions,
-            banner,
-            response,
-            ..
-        } => {
-            let _ = (&launch, dimensions, &banner);
-            let result = Err(format!(
-                "Port control is unavailable until an exact managed resource fence is supplied; no listener was terminated"
-            ));
-            (
-                ProcessOpKind::KillPortAndRestart,
-                result,
-                ProcessOpContext {
-                    session_id: Some(command_id.clone()),
-                    port: Some(port),
-                    ..Default::default()
-                },
-                response,
-            )
-        }
         ProcessOp::StartSsh {
             launch,
             session_id,
@@ -6358,10 +6317,16 @@ fn run_server_launch_with_port_admission<T>(
         &snapshot,
         port,
         || {
-            if reservation.is_active() {
-                Ok(())
-            } else {
+            if !reservation.is_active() {
                 Err(crate::process::ports::PortStartError::ReservationConflict { port })
+            } else {
+                let second = inner.port_inventory.refresh(&[port]).map_err(|error| {
+                    crate::process::ports::PortStartError::ProbeFailed {
+                        port,
+                        detail: error.to_string(),
+                    }
+                })?;
+                crate::process::ports::ensure_managed_start_allowed(&second, port)
             }
         },
         operation,
@@ -6401,9 +6366,20 @@ fn settle_server_port_start(
                 thread::sleep(PORT_BIND_SETTLEMENT_POLL);
                 continue;
             }
-            Err(_) => {
+            Err(error) => {
+                let root_fence = launch_root_fence_description(inner, &launch.command_id);
+                let reaped =
+                    manager.stop_server_and_wait(&launch.command_id, Duration::from_secs(2));
                 drop(reservation);
-                return Ok(());
+                return Err(if reaped {
+                    format!(
+                        "port {port} listener settlement probe failed; exact launch root {root_fence} was reaped (diagnostic {error})"
+                    )
+                } else {
+                    format!(
+                        "port {port} listener settlement probe failed; exact launch root {root_fence} reap_incomplete"
+                    )
+                });
             }
         };
         let listeners = snapshot
@@ -6420,34 +6396,69 @@ fn settle_server_port_start(
             PostLaunchListenerSettlement::Foreign => {
                 // Stop only the exact launched session. The foreign listener
                 // itself is never selected by this operation.
-                let _ = manager.stop_server_and_wait(&launch.command_id, Duration::from_secs(2));
+                let root_fence = launch_root_fence_description(inner, &launch.command_id);
+                let reaped =
+                    manager.stop_server_and_wait(&launch.command_id, Duration::from_secs(2));
                 drop(reservation);
-                return Err(format!(
-                    "port {port} became occupied by a foreign listener during start (EADDRINUSE); no foreign process was terminated"
-                ));
+                return Err(if reaped {
+                    format!(
+                        "port {port} became occupied by a foreign listener during start (EADDRINUSE); no foreign process was terminated; exact launch root {root_fence} was reaped"
+                    )
+                } else {
+                    format!(
+                        "port {port} became occupied by a foreign listener during start (EADDRINUSE); no foreign process was terminated; exact launch root {root_fence} reap_incomplete"
+                    )
+                });
             }
             PostLaunchListenerSettlement::Unverified => {
                 // The listener identity is insufficient to decide whether
                 // the process owns the port. Reap only the exact launch
                 // session so an unrelated listener is never touched.
-                let _ = manager.stop_server_and_wait(&launch.command_id, Duration::from_secs(2));
+                let root_fence = launch_root_fence_description(inner, &launch.command_id);
+                let reaped =
+                    manager.stop_server_and_wait(&launch.command_id, Duration::from_secs(2));
                 drop(reservation);
-                return Err(format!(
-                    "port {port} listener ownership could not be proven after start; only the exact launch session was stopped"
-                ));
+                return Err(if reaped {
+                    format!(
+                        "port {port} listener ownership could not be proven after start; exact launch root {root_fence} was reaped"
+                    )
+                } else {
+                    format!(
+                        "port {port} listener ownership could not be proven after start; exact launch root {root_fence} reap_incomplete"
+                    )
+                });
             }
             PostLaunchListenerSettlement::Pending => {}
         }
         if Instant::now() >= deadline {
-            // A stock command may spawn successfully and bind later. The
-            // bounded settlement ends the reservation without manufacturing a
-            // green ownership claim; the next inventory publication remains
-            // authoritative and fail-closed until a listener is observed.
+            // A stock command may spawn successfully and bind later, but a
+            // successful operation must not hide an unsettled launch. Reap
+            // only the exact launch session and surface settlement failure.
+            let root_fence = launch_root_fence_description(inner, &launch.command_id);
+            let reaped = manager.stop_server_and_wait(&launch.command_id, Duration::from_secs(2));
             drop(reservation);
-            return Ok(());
+            return Err(if reaped {
+                format!(
+                    "port {port} listener settlement timed out; exact launch root {root_fence} was reaped"
+                )
+            } else {
+                format!(
+                    "port {port} listener settlement timed out; exact launch root {root_fence} reap_incomplete"
+                )
+            });
         }
         thread::sleep(PORT_BIND_SETTLEMENT_POLL);
     }
+}
+
+fn launch_root_fence_description(inner: &Arc<ProcessManagerInner>, session_id: &str) -> String {
+    let Some(pid) = live_runtime_root_pid(inner, session_id) else {
+        return format!("session {session_id} root unavailable");
+    };
+    let creation = platform_service::capture_process_creation_time_100ns(pid)
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    format!("session {session_id}, pid {pid}, creation {creation}, canonical executable bound")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -7554,7 +7565,7 @@ mod tests {
     #[test]
     fn blank_server_launches_leave_tabs_runtime_and_process_queue_untouched() {
         let cwd = temp_test_dir("blank-server-launch-preflight");
-        for operation in ["start", "restart", "kill-port-restart"] {
+        for operation in ["start", "restart"] {
             let manager = ProcessManager::new();
             let mut state = app_state_with_server(&cwd, true);
             state.config.projects[0].folders[0].commands[0].command = " \t ".to_string();
@@ -7570,14 +7581,6 @@ mod tests {
                 "restart" => {
                     manager.restart_server(&mut state, "server-cmd", SessionDimensions::default())
                 }
-                "kill-port-restart" => manager.schedule_kill_port_and_restart(
-                    &mut state,
-                    "server-cmd",
-                    4312,
-                    SessionDimensions::default(),
-                    "must not schedule",
-                    None,
-                ),
                 _ => unreachable!(),
             };
 
@@ -10420,7 +10423,12 @@ mod tests {
             command: command_text,
             args,
             env: None,
-            port: Some(43123),
+            // These lifecycle fixtures exercise process/session ownership,
+            // not port settlement.  The test command is `ping`/`sleep` and
+            // deliberately does not bind a listener; declaring a port would
+            // make the strict post-launch admission path reap it as an
+            // unsettled launch before the lifecycle assertions run.
+            port: None,
             auto_restart: Some(false),
             clear_logs_on_restart: Some(clear_logs_on_restart),
         };

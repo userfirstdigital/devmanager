@@ -7,6 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -643,6 +644,25 @@ impl PortInventorySnapshot {
         self
     }
 
+    /// Return whether a second listener-table publication is an independent,
+    /// still-fresh observation of exactly the same identities. A second read
+    /// with the same publication sequence is not independent evidence and a
+    /// changed endpoint/identity set must never settle ownership or
+    /// externality.
+    pub fn same_authoritative_listener_snapshot(&self, other: &Self, now: Instant) -> bool {
+        self.is_valid()
+            && other.is_valid()
+            && self.is_exactly_for(other.requested_ports())
+            && self.publication_sequence > 0
+            && other.publication_sequence > 0
+            && self.publication_sequence != other.publication_sequence
+            && self.is_fresh_at(now, DEFAULT_FREE_PROOF_MAX_AGE)
+            && other.is_fresh_at(now, DEFAULT_FREE_PROOF_MAX_AGE)
+            && self.observations == other.observations
+            && self.endpoints == other.endpoints
+            && self.issues == other.issues
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = (&u16, &PortObservation)> {
         self.observations.iter()
     }
@@ -908,6 +928,32 @@ impl ManagedResourceSnapshot {
         self.membership.is_fresh_at(now) && self.structure_is_valid()
     }
 
+    /// A path-free binding for a wire authority. The canonical executable is
+    /// included in the digest without exposing it, so a PID/creation/fence
+    /// shaped like the live one cannot be accepted unless it came from the
+    /// same exact root and member executable set.
+    pub fn authority_fingerprint(&self) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.resource().resource_id.hash(&mut hasher);
+        self.resource().runtime_generation.hash(&mut hasher);
+        self.owner().hash(&mut hasher);
+        self.root().id().pid().hash(&mut hasher);
+        self.root().id().creation_time_100ns().hash(&mut hasher);
+        self.root()
+            .canonical_executable()
+            .as_os_str()
+            .hash(&mut hasher);
+        self.state.hash(&mut hasher);
+        for member in self.member_identities() {
+            member.id().pid().hash(&mut hasher);
+            member.id().creation_time_100ns().hash(&mut hasher);
+            member.canonical_executable().as_os_str().hash(&mut hasher);
+        }
+        self.membership_revision().hash(&mut hasher);
+        self.observation_sequence().hash(&mut hasher);
+        hasher.finish()
+    }
+
     /// Compare the identity-bearing registry observation that accompanied a
     /// listener scan with a second authoritative registry read. The wall
     /// clock may advance between reads, so freshness timestamps are checked
@@ -915,7 +961,9 @@ impl ManagedResourceSnapshot {
     /// observation sequence must remain the same before ownership or
     /// externality can be projected.
     pub fn same_authoritative_membership(&self, other: &Self) -> bool {
-        self.fence == other.fence
+        self.is_fresh_at(Instant::now())
+            && other.is_fresh_at(Instant::now())
+            && self.fence == other.fence
             && self.state == other.state
             && self.members == other.members
             && self.membership.membership_revision() == other.membership.membership_revision()
@@ -1025,11 +1073,11 @@ fn classify_listener_authority(
         if listeners.is_empty() {
             return PortAuthority::Free;
         }
-        return if listeners.iter().all(ListenerIdentity::has_executable_proof) {
-            PortAuthority::ProvenExternal
-        } else {
-            PortAuthority::Unknown
-        };
+        // An executable path proves what the listener is, not that it is
+        // outside a live DevManager generation. Without the registry's
+        // current managed/leaked/transitioning snapshot, occupied is only an
+        // observation and must remain Unknown.
+        return PortAuthority::Unknown;
     };
     if !managed.is_fresh_at(now) || managed.state != ManagedProcessState::Running {
         return PortAuthority::Unknown;
@@ -1196,6 +1244,32 @@ pub fn classify_port_authority_from_snapshot_with_membership_reconciliation_at(
         return PortAuthority::Unknown;
     }
     classify_port_authority_from_snapshot_at(target, snapshot, managed, now, deadline)
+}
+
+/// Reconcile listener identity and managed membership independently after the
+/// first scan. This is the only projection seam that can settle an occupied
+/// port as Managed or ProvenExternal: both listener publications and both
+/// registry publications must be current and agree on their exact fences.
+pub fn classify_port_authority_from_two_snapshots_at(
+    target: &PortTarget,
+    first: &PortInventorySnapshot,
+    second: &PortInventorySnapshot,
+    managed: Option<&ManagedResourceSnapshot>,
+    reconciled_managed: Option<&ManagedResourceSnapshot>,
+    now: Instant,
+    deadline: Instant,
+) -> PortAuthority {
+    if !first.same_authoritative_listener_snapshot(second, now) {
+        return PortAuthority::Unknown;
+    }
+    classify_port_authority_from_snapshot_with_membership_reconciliation_at(
+        target,
+        first,
+        managed,
+        reconciled_managed,
+        now,
+        deadline,
+    )
 }
 
 fn status_for_authority(
@@ -1462,6 +1536,38 @@ pub fn project_port_status_from_snapshot_with_membership_reconciliation_at(
     project_port_status_from_snapshot_at(target, snapshot, managed, now, deadline)
 }
 
+/// Project a typed status only after an independently fresh listener
+/// publication and an independently fresh, equal registry membership
+/// publication have both been captured.
+pub fn project_port_status_from_two_snapshots_at(
+    target: &PortTarget,
+    first: &PortInventorySnapshot,
+    second: &PortInventorySnapshot,
+    managed: Option<&ManagedResourceSnapshot>,
+    reconciled_managed: Option<&ManagedResourceSnapshot>,
+    now: Instant,
+    deadline: Instant,
+) -> PortStatus {
+    let authority = classify_port_authority_from_two_snapshots_at(
+        target,
+        first,
+        second,
+        managed,
+        reconciled_managed,
+        now,
+        deadline,
+    );
+    let listeners = first
+        .observation(target.port)
+        .map_or_else(Vec::new, |observation| observation.listeners().to_vec());
+    status_for_authority(
+        target,
+        Arc::from(listeners.into_boxed_slice()),
+        authority,
+        managed,
+    )
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PortStartError {
     NotScanned {
@@ -1651,4 +1757,127 @@ pub fn launch_if_port_free_with_revalidation<T>(
     ensure_managed_start_allowed(snapshot, port)?;
     revalidate()?;
     Ok(launch())
+}
+
+#[cfg(test)]
+mod authority_tests {
+    use super::*;
+    use crate::domain::id::ResourceId;
+
+    fn listener(pid: u32, creation: u64) -> ListenerIdentity {
+        ListenerIdentity::with_executable(pid, creation, std::env::current_exe().unwrap())
+            .expect("test executable is canonicalizable")
+    }
+
+    #[test]
+    fn occupied_listener_without_authoritative_registry_is_unknown() {
+        let port = 31_741;
+        let identity = listener(41, 9);
+        let snapshot = PortInventorySnapshot::from_parts(
+            BTreeMap::from([(port, PortObservation::from_listeners(vec![identity]))]),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            Instant::now(),
+        );
+        let now = Instant::now();
+        let target = PortTarget::new(
+            port,
+            ResourceFence::new(ResourceId::new(), 1),
+            ManagedPortHealth::Ready,
+        );
+
+        assert_eq!(
+            classify_port_authority_from_snapshot_with_membership_reconciliation_at(
+                &target,
+                &snapshot,
+                None,
+                None,
+                now,
+                now + DEFAULT_FREE_PROOF_MAX_AGE,
+            ),
+            PortAuthority::Unknown,
+            "PID/executable evidence cannot prove externality without a current registry snapshot"
+        );
+    }
+
+    #[test]
+    fn membership_reconciliation_rejects_stale_second_snapshot() {
+        let port = 31_742;
+        let root = ManagedProcessIdentity::new(
+            ManagedProcessId::new(42, 10).unwrap(),
+            std::env::current_exe().unwrap(),
+        )
+        .unwrap();
+        let resource = ResourceFence::new(ResourceId::new(), 3);
+        let fence = ManagedProcessFence::new(resource, ProcessOwner::Host, root.clone());
+        let first = ManagedResourceSnapshot::new(
+            fence.clone(),
+            ManagedProcessState::Running,
+            vec![root.clone()],
+            RegistryMembershipSnapshot::valid(7, 11, Instant::now(), Duration::from_secs(30)),
+        );
+        let second = ManagedResourceSnapshot::new(
+            fence,
+            ManagedProcessState::Running,
+            vec![root.clone()],
+            RegistryMembershipSnapshot::stale(7, 11, Instant::now() - Duration::from_secs(60)),
+        );
+        assert!(!first.same_authoritative_membership(&second));
+
+        let identity = listener(42, 10);
+        let snapshot = PortInventorySnapshot::from_parts(
+            BTreeMap::from([(port, PortObservation::from_listeners(vec![identity]))]),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            Instant::now(),
+        );
+        let now = Instant::now();
+        let target = PortTarget::new(port, resource, ManagedPortHealth::Ready);
+        assert_eq!(
+            classify_port_authority_from_snapshot_with_membership_reconciliation_at(
+                &target,
+                &snapshot,
+                Some(&first),
+                Some(&second),
+                now,
+                now + DEFAULT_FREE_PROOF_MAX_AGE,
+            ),
+            PortAuthority::Unknown
+        );
+    }
+
+    #[test]
+    fn second_listener_snapshot_must_be_fresh_and_identity_equal() {
+        let port = 31_743;
+        let now = Instant::now();
+        let first_listener = listener(43, 11);
+        let second_listener = listener(43, 12);
+        let first = PortInventorySnapshot::from_parts(
+            BTreeMap::from([(
+                port,
+                PortObservation::from_listeners(vec![first_listener.clone()]),
+            )]),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            now,
+        )
+        .with_publication_sequence(1);
+        let changed = PortInventorySnapshot::from_parts(
+            BTreeMap::from([(port, PortObservation::from_listeners(vec![second_listener]))]),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            now,
+        )
+        .with_publication_sequence(2);
+        assert!(!first.same_authoritative_listener_snapshot(&changed, now));
+
+        let stale = PortInventorySnapshot::from_parts(
+            BTreeMap::from([(port, PortObservation::from_listeners(vec![first_listener]))]),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            now - Duration::from_secs(60),
+        )
+        .with_publication_sequence(3);
+        assert!(!first.same_authoritative_listener_snapshot(&stale, now));
+    }
 }

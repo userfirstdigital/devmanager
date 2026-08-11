@@ -1099,11 +1099,6 @@ pub fn check_port_in_use(port: u16) -> Result<PortStatus, String> {
     Ok(status)
 }
 
-pub fn kill_port(port: u16) -> Result<(), String> {
-    let _ = port;
-    Err("refusing to kill port: this legacy API has no exact managed resource fence; external or unknown listeners are never controlled".to_string())
-}
-
 pub fn get_port_conflicts(config: &AppConfig) -> Vec<PortConflict> {
     let mut port_map: BTreeMap<u16, Vec<PortConflictEntry>> = BTreeMap::new();
 

@@ -18,7 +18,6 @@ pub enum ProcessOpKind {
     StartServer,
     StopServer,
     RestartServer,
-    KillPortAndRestart,
     StartSsh,
     RestartSsh,
     CloseSsh,
@@ -35,7 +34,6 @@ pub enum ProcessOpKind {
 pub struct ProcessOpContext {
     pub message: Option<String>,
     pub session_id: Option<String>,
-    pub port: Option<u16>,
     pub focus: bool,
     pub shutdown_report: Option<ManagedShutdownReport>,
 }
@@ -45,7 +43,6 @@ impl Default for ProcessOpContext {
         Self {
             message: None,
             session_id: None,
-            port: None,
             focus: false,
             shutdown_report: None,
         }
@@ -83,15 +80,6 @@ pub enum ProcessOp {
         dimensions: SessionDimensions,
         banner: String,
         clear_logs: bool,
-        response: Option<Sender<RemoteActionResult>>,
-    },
-    KillPortAndRestart {
-        op_id: u64,
-        command_id: String,
-        port: u16,
-        launch: ServerLaunchSpec,
-        dimensions: SessionDimensions,
-        banner: String,
         response: Option<Sender<RemoteActionResult>>,
     },
     StartSsh {
@@ -167,7 +155,6 @@ fn op_preempts_in_flight(op: &ProcessOp) -> bool {
         op,
         ProcessOp::StopServer { .. }
             | ProcessOp::RestartServer { .. }
-            | ProcessOp::KillPortAndRestart { .. }
             | ProcessOp::RestartSsh { .. }
             | ProcessOp::CloseSsh { .. }
             | ProcessOp::RestartAi { .. }
@@ -182,7 +169,6 @@ impl ProcessOp {
             ProcessOp::StartServer { op_id, .. }
             | ProcessOp::StopServer { op_id, .. }
             | ProcessOp::RestartServer { op_id, .. }
-            | ProcessOp::KillPortAndRestart { op_id, .. }
             | ProcessOp::StartSsh { op_id, .. }
             | ProcessOp::RestartSsh { op_id, .. }
             | ProcessOp::CloseSsh { op_id, .. }
@@ -201,7 +187,6 @@ impl ProcessOp {
             ProcessOp::StartServer { launch, .. } | ProcessOp::RestartServer { launch, .. } => {
                 launch.command_id.clone()
             }
-            ProcessOp::KillPortAndRestart { command_id, .. } => command_id.clone(),
             ProcessOp::StopServer { command_id, .. } => command_id.clone(),
             ProcessOp::StartSsh { session_id, .. }
             | ProcessOp::RestartSsh { session_id, .. }
@@ -229,9 +214,6 @@ impl ProcessOp {
             ProcessOp::StartServer { response, .. } => (ProcessOpKind::StartServer, response),
             ProcessOp::StopServer { response, .. } => (ProcessOpKind::StopServer, response),
             ProcessOp::RestartServer { response, .. } => (ProcessOpKind::RestartServer, response),
-            ProcessOp::KillPortAndRestart { response, .. } => {
-                (ProcessOpKind::KillPortAndRestart, response)
-            }
             ProcessOp::StartSsh { response, .. } => (ProcessOpKind::StartSsh, response),
             ProcessOp::RestartSsh { response, .. } => (ProcessOpKind::RestartSsh, response),
             ProcessOp::CloseSsh { response, .. } => (ProcessOpKind::CloseSsh, response),

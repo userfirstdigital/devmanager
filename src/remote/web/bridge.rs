@@ -4363,12 +4363,13 @@ fn project_web_snapshot(
     semantic_metadata: &HashMap<StableSessionKey, SemanticSessionMetadata>,
     lease: &WebWriterLeaseState,
 ) -> WebWorkspaceSnapshot {
-    let mut projected = WebWorkspaceSnapshot::from_host(
+    let mut projected = WebWorkspaceSnapshot::from_host_with_authorities(
         inner.runtime_instance_id.clone(),
         revision,
         &snapshot.app_state,
         &snapshot.runtime_state,
         &snapshot.port_statuses,
+        &snapshot.port_authorities,
         lease,
         semantic_metadata,
     );

@@ -126,7 +126,6 @@ pub struct TerminalPaneActions {
     pub on_stop_server: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
     pub on_restart_server: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
     pub on_clear_output: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
-    pub on_kill_port: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
     pub on_actionable_notice_action: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
     pub on_open_local_url: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
     pub on_prompt_action: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
@@ -165,10 +164,7 @@ pub struct TerminalRuntimeControlsModel {
     pub can_stop: bool,
     pub can_restart: bool,
     pub can_clear: bool,
-    pub can_kill_port: bool,
     pub can_open_url: bool,
-    pub kill_label: &'static str,
-    pub kill_color: u32,
     pub prompt_action_label: Option<String>,
     pub prompt_action_color: u32,
     pub search_active: bool,
@@ -1238,7 +1234,6 @@ fn render_runtime_actions(
         on_stop_server,
         on_restart_server,
         on_clear_output: _,
-        on_kill_port,
         on_actionable_notice_action: _,
         on_open_local_url,
         on_prompt_action,
@@ -1283,15 +1278,6 @@ fn render_runtime_actions(
                 .then_some(on_restart_server)
                 .flatten()
                 .map(|on_click| runtime_action_button("restart", theme::WARNING_TEXT, on_click)),
-        )
-        .children(
-            controls
-                .can_kill_port
-                .then_some(on_kill_port)
-                .flatten()
-                .map(|on_click| {
-                    runtime_action_button(controls.kill_label, controls.kill_color, on_click)
-                }),
         )
         .children(
             controls

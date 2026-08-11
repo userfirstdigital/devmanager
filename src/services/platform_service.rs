@@ -199,46 +199,46 @@ fn snapshot_listener_endpoints_with_lsof(
         &["-nP", "-iTCP", "-sTCP:LISTEN", "-F", "pn"],
     )?;
     if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+        return Err("listener_probe.command_failed".to_string());
     }
 
     let mut listeners = BTreeMap::new();
     let mut current_pid = None;
     let stdout = std::str::from_utf8(&output.stdout)
-        .map_err(|_| "lsof returned non-UTF-8 listener data".to_string())?;
+        .map_err(|_| "listener_probe.invalid_utf8".to_string())?;
     for line in stdout.lines() {
         if line.is_empty() {
             continue;
         }
         if line.len() < 2 {
-            return Err("lsof returned a malformed listener record".to_string());
+            return Err("listener_probe.malformed_record".to_string());
         }
         let (prefix, value) = line.split_at(1);
         match prefix {
             "p" => {
-                current_pid = Some(value.trim().parse::<u32>().map_err(|_| {
-                    "lsof returned a listener record with an invalid PID".to_string()
-                })?);
+                current_pid = Some(
+                    value
+                        .trim()
+                        .parse::<u32>()
+                        .map_err(|_| "listener_probe.invalid_pid".to_string())?,
+                );
             }
             "n" => {
                 let Some(pid) = current_pid else {
-                    return Err("lsof returned an endpoint before its PID".to_string());
+                    return Err("listener_probe.endpoint_without_pid".to_string());
                 };
                 let endpoint = parse_lsof_listener_endpoint(value, pid)
-                    .ok_or_else(|| "lsof returned a malformed listener endpoint".to_string())?;
+                    .ok_or_else(|| "listener_probe.malformed_endpoint".to_string())?;
                 if filter.contains(&endpoint.port()) {
                     let rows = listeners.entry(endpoint.port()).or_default();
                     rows.push(endpoint);
                     if rows.len() > crate::process::ports::MAX_ENDPOINTS_PER_SCAN {
-                        return Err(format!(
-                            "listener endpoint count exceeds {}",
-                            crate::process::ports::MAX_ENDPOINTS_PER_SCAN
-                        ));
+                        return Err(format!("listener_probe.endpoint_limit_exceeded"));
                     }
                 }
             }
             _ => {
-                return Err("lsof returned an unsupported listener record field".to_string());
+                return Err("listener_probe.unsupported_record_field".to_string());
             }
         }
     }
@@ -285,15 +285,15 @@ fn run_bounded_command(program: &str, args: &[&str]) -> Result<BoundedChildOutpu
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|error| format!("Failed to run {program}: {error}"))?;
+        .map_err(|_| "listener_probe.spawn_failed".to_string())?;
     let stdout = child
         .stdout
         .take()
-        .ok_or_else(|| format!("{program} stdout was not piped"))?;
+        .ok_or_else(|| "listener_probe.stdout_unavailable".to_string())?;
     let stderr = child
         .stderr
         .take()
-        .ok_or_else(|| format!("{program} stderr was not piped"))?;
+        .ok_or_else(|| "listener_probe.stderr_unavailable".to_string())?;
     let output_exceeded = Arc::new(AtomicBool::new(false));
     let stdout_exceeded = output_exceeded.clone();
     let stderr_exceeded = output_exceeded.clone();
@@ -323,12 +323,12 @@ fn run_bounded_command(program: &str, args: &[&str]) -> Result<BoundedChildOutpu
                 break;
             }
             Ok(None) => thread::sleep(Duration::from_millis(2)),
-            Err(error) => {
+            Err(_error) => {
                 let _ = child.kill();
                 let _ = child.wait();
                 let _ = stdout_reader.join();
                 let _ = stderr_reader.join();
-                return Err(format!("could not poll {program}: {error}"));
+                return Err("listener_probe.poll_failed".to_string());
             }
         }
     }
@@ -336,24 +336,22 @@ fn run_bounded_command(program: &str, args: &[&str]) -> Result<BoundedChildOutpu
         Some(status) => status,
         None => child
             .wait()
-            .map_err(|error| format!("could not wait for {program}: {error}"))?,
+            .map_err(|_| "listener_probe.wait_failed".to_string())?,
     };
     let stdout = stdout_reader
         .join()
-        .map_err(|_| format!("{program} stdout reader panicked"))?
-        .map_err(|error| format!("could not read {program} stdout: {error}"))?;
+        .map_err(|_| "listener_probe.stdout_reader_panicked".to_string())?
+        .map_err(|_| "listener_probe.stdout_read_failed".to_string())?;
     let stderr = stderr_reader
         .join()
-        .map_err(|_| format!("{program} stderr reader panicked"))?
-        .map_err(|error| format!("could not read {program} stderr: {error}"))?;
+        .map_err(|_| "listener_probe.stderr_reader_panicked".to_string())?
+        .map_err(|_| "listener_probe.stderr_read_failed".to_string())?;
 
     if timed_out {
-        return Err(format!("{program} process probe exceeded its deadline"));
+        return Err("listener_probe.deadline_exceeded".to_string());
     }
     if output_exceeded.load(Ordering::Acquire) {
-        return Err(format!(
-            "{program} process output exceeded {MAX_LSOF_OUTPUT_BYTES} bytes"
-        ));
+        return Err("listener_probe.output_limit_exceeded".to_string());
     }
     Ok(BoundedChildOutput {
         status,
@@ -1048,7 +1046,7 @@ mod tests {
 
 #[cfg(all(test, not(windows)))]
 mod non_windows_tests {
-    use super::parse_lsof_listener_port;
+    use super::{parse_lsof_listener_port, run_bounded_command};
 
     #[test]
     fn listener_probe_uses_a_pinned_lsof_path() {
@@ -1067,6 +1065,29 @@ mod non_windows_tests {
         assert_eq!(parse_lsof_listener_port("127.0.0.1:3000"), Some(3000));
         assert_eq!(parse_lsof_listener_port("[::1]:5174"), Some(5174));
         assert_eq!(parse_lsof_listener_port("*:8080 (LISTEN)"), Some(8080));
+    }
+
+    #[test]
+    fn lsof_diagnostics_are_fixed_and_path_free() {
+        let error = match run_bounded_command("/definitely/missing/lsof", &[]) {
+            Ok(_) => panic!("missing trusted executable must fail"),
+            Err(error) => error,
+        };
+        assert_eq!(error, "listener_probe.spawn_failed");
+        assert!(!error.contains("/definitely"));
+    }
+
+    #[test]
+    fn lsof_nonzero_stderr_is_not_forwarded() {
+        let error = match run_bounded_command(
+            "/bin/sh",
+            &["-c", "printf 'secret-path-and-diagnostics' >&2; exit 7"],
+        ) {
+            Ok(_) => panic!("nonzero command must fail at the listener boundary"),
+            Err(error) => error,
+        };
+        assert_eq!(error, "listener_probe.command_failed");
+        assert!(!error.contains("secret-path"));
     }
 }
 

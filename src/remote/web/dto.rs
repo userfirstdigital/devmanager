@@ -2,6 +2,7 @@ use crate::models::{PortStatus, TabType};
 use crate::remote::presentation::{
     SemanticAdapterHealth, SemanticAttention, SemanticSessionMetadata, StableSessionKey,
 };
+use crate::remote::{RemotePortAuthority, RemotePortAuthorityKind};
 use crate::state::{
     AiActivity, AppState, RuntimeState, SessionDimensions, SessionKind, SessionRuntimeState,
     SessionStatus,
@@ -24,6 +25,9 @@ pub struct WebWorkspaceSnapshot {
     pub tabs: Vec<WebTab>,
     pub sessions: Vec<WebSessionSummary>,
     pub port_statuses: Vec<WebPortStatus>,
+    /// Typed authority is the source of colour/control decisions. The legacy
+    /// status list remains only for older clients.
+    pub port_authorities: Vec<WebPortAuthority>,
     pub writer_lease: WebWriterLeaseState,
 }
 
@@ -202,6 +206,123 @@ pub struct WebPortStatus {
     pub process_name: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WebPortAuthorityKind {
+    Managed,
+    ProvenExternal,
+    Unknown,
+    ProbeError,
+    Free,
+    Occupied,
+}
+
+impl From<RemotePortAuthorityKind> for WebPortAuthorityKind {
+    fn from(value: RemotePortAuthorityKind) -> Self {
+        match value {
+            RemotePortAuthorityKind::Managed => Self::Managed,
+            RemotePortAuthorityKind::ProvenExternal => Self::ProvenExternal,
+            RemotePortAuthorityKind::Unknown => Self::Unknown,
+            RemotePortAuthorityKind::ProbeError => Self::ProbeError,
+            RemotePortAuthorityKind::Free => Self::Free,
+            RemotePortAuthorityKind::Occupied => Self::Occupied,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WebPortControlReason {
+    ExactManagedFence,
+    ProvenExternalNoControl,
+    Starting,
+    Free,
+    Stale,
+    ProbeFault,
+    MixedOrUnverified,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebPortAuthority {
+    pub port: u16,
+    pub kind: WebPortAuthorityKind,
+    pub resource_generation: Option<u64>,
+    pub listeners: Vec<WebPortListenerIdentity>,
+    pub session_id: Option<String>,
+    pub root: Option<WebPortListenerIdentity>,
+    pub membership_revision: u64,
+    pub observation_sequence: u64,
+    pub publication_sequence: u64,
+    pub observed_at_epoch_ms: u64,
+    pub freshness_deadline_epoch_ms: u64,
+    pub fresh: bool,
+    pub control_reason: WebPortControlReason,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebPortListenerIdentity {
+    pub pid: u32,
+    pub creation_time_100ns: u64,
+    pub executable_proven: bool,
+}
+
+impl WebPortAuthority {
+    fn from_remote(authority: &RemotePortAuthority, now_epoch_ms: u64) -> Self {
+        let kind = WebPortAuthorityKind::from(authority.kind);
+        let fresh = authority.is_fresh_at(now_epoch_ms);
+        let control_reason = if !fresh {
+            WebPortControlReason::Stale
+        } else {
+            match authority.kind {
+                RemotePortAuthorityKind::Managed if authority.has_complete_wire_authority() => {
+                    WebPortControlReason::ExactManagedFence
+                }
+                RemotePortAuthorityKind::ProvenExternal => {
+                    WebPortControlReason::ProvenExternalNoControl
+                }
+                RemotePortAuthorityKind::Free => WebPortControlReason::Free,
+                RemotePortAuthorityKind::ProbeError => WebPortControlReason::ProbeFault,
+                RemotePortAuthorityKind::Unknown => WebPortControlReason::MixedOrUnverified,
+                RemotePortAuthorityKind::Occupied => WebPortControlReason::MixedOrUnverified,
+                RemotePortAuthorityKind::Managed => WebPortControlReason::MixedOrUnverified,
+            }
+        };
+        Self {
+            port: authority.port,
+            kind,
+            resource_generation: authority
+                .resource
+                .map(|resource| resource.runtime_generation),
+            listeners: authority
+                .listeners
+                .iter()
+                .map(|listener| WebPortListenerIdentity {
+                    pid: listener.pid,
+                    creation_time_100ns: listener.creation_time_100ns,
+                    executable_proven: listener.executable_proven,
+                })
+                .collect(),
+            session_id: authority.session_id.clone(),
+            root: authority.root.as_ref().map(|root| WebPortListenerIdentity {
+                pid: root.pid,
+                creation_time_100ns: root.creation_time_100ns,
+                executable_proven: root.executable_proven,
+            }),
+            membership_revision: authority.membership_revision,
+            observation_sequence: authority.observation_sequence,
+            publication_sequence: authority.publication_sequence,
+            observed_at_epoch_ms: authority.observed_at_epoch_ms,
+            freshness_deadline_epoch_ms: authority.freshness_deadline_epoch_ms,
+            fresh,
+            control_reason,
+            error: authority.error.clone(),
+        }
+    }
+}
+
 impl From<&PortStatus> for WebPortStatus {
     fn from(status: &PortStatus) -> Self {
         Self {
@@ -220,6 +341,28 @@ impl WebWorkspaceSnapshot {
         app: &AppState,
         runtime: &RuntimeState,
         ports: &HashMap<u16, PortStatus>,
+        lease: &WebWriterLeaseState,
+        semantic_metadata: &HashMap<StableSessionKey, SemanticSessionMetadata>,
+    ) -> Self {
+        Self::from_host_with_authorities(
+            runtime_instance_id,
+            revision,
+            app,
+            runtime,
+            ports,
+            &HashMap::new(),
+            lease,
+            semantic_metadata,
+        )
+    }
+
+    pub fn from_host_with_authorities(
+        runtime_instance_id: impl Into<String>,
+        revision: u64,
+        app: &AppState,
+        runtime: &RuntimeState,
+        ports: &HashMap<u16, PortStatus>,
+        authorities: &HashMap<u16, RemotePortAuthority>,
         lease: &WebWriterLeaseState,
         semantic_metadata: &HashMap<StableSessionKey, SemanticSessionMetadata>,
     ) -> Self {
@@ -302,6 +445,12 @@ impl WebWorkspaceSnapshot {
 
         let mut port_statuses = ports.values().map(WebPortStatus::from).collect::<Vec<_>>();
         port_statuses.sort_by_key(|status| status.port);
+        let now_epoch_ms = crate::remote::now_epoch_ms();
+        let mut port_authorities = authorities
+            .values()
+            .map(|authority| WebPortAuthority::from_remote(authority, now_epoch_ms))
+            .collect::<Vec<_>>();
+        port_authorities.sort_by_key(|authority| authority.port);
 
         Self {
             web_protocol_version: WEB_PROTOCOL_VERSION,
@@ -313,6 +462,7 @@ impl WebWorkspaceSnapshot {
             tabs,
             sessions,
             port_statuses,
+            port_authorities,
             writer_lease: lease.clone(),
         }
     }

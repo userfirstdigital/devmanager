@@ -107,7 +107,7 @@ enum LifecycleBoundary {
     DirectInput,
     SelectConversation,
     RestartServer,
-    KillPortRestart,
+    PortConflictRestart,
     RestartAiConversation,
     RestartSsh,
     CloseConversation,
@@ -198,7 +198,7 @@ async fn assert_boundary_terminalizes_before_late_response(boundary: LifecycleBo
         )),
         LifecycleBoundary::SelectConversation
         | LifecycleBoundary::RestartServer
-        | LifecycleBoundary::KillPortRestart
+        | LifecycleBoundary::PortConflictRestart
         | LifecycleBoundary::RestartAiConversation
         | LifecycleBoundary::RestartSsh
         | LifecycleBoundary::CloseConversation => bridge.interrupt_workspace(&key),
@@ -292,7 +292,7 @@ async fn browser_every_native_lifecycle_boundary_terminalizes_replay_and_fences_
         LifecycleBoundary::DirectInput,
         LifecycleBoundary::SelectConversation,
         LifecycleBoundary::RestartServer,
-        LifecycleBoundary::KillPortRestart,
+        LifecycleBoundary::PortConflictRestart,
         LifecycleBoundary::RestartAiConversation,
         LifecycleBoundary::RestartSsh,
         LifecycleBoundary::CloseConversation,
@@ -359,8 +359,8 @@ fn blank_server_commands_are_preflighted_before_every_lifecycle_and_process_boun
 
     let start = source_section(&app, "fn start_server_action(", "fn stop_server_action(");
     assert!(
-        start.matches("validate_server_launch").count() >= 2,
-        "start must preflight before scheduling and again after the async port check"
+        start.matches("validate_server_launch").count() >= 1,
+        "start must preflight before scheduling"
     );
     assert_before(
         start,
@@ -374,18 +374,11 @@ fn blank_server_commands_are_preflighted_before_every_lifecycle_and_process_boun
                 .unwrap()
     );
 
-    for (start_label, end_label, process_call) in [
-        (
-            "fn restart_server_action(",
-            "fn clear_server_output_action(",
-            ".restart_server(",
-        ),
-        (
-            "fn kill_server_port_action(",
-            "fn select_server_tab_action(",
-            "schedule_kill_port_and_restart",
-        ),
-    ] {
+    for (start_label, end_label, process_call) in [(
+        "fn restart_server_action(",
+        "fn clear_server_output_action(",
+        ".restart_server(",
+    )] {
         let section = source_section(&app, start_label, end_label);
         assert_before(
             section,
@@ -426,10 +419,6 @@ fn blank_server_commands_are_preflighted_before_every_lifecycle_and_process_boun
         (
             "fn schedule_restart_server(",
             "fn schedule_stop_server_and_wait(",
-        ),
-        (
-            "pub fn schedule_kill_port_and_restart(",
-            "fn prepare_start_server(",
         ),
     ] {
         assert!(
@@ -861,12 +850,6 @@ fn browser_provider_and_native_shell_lifecycle_boundaries_reach_the_shared_bridg
             "fn clear_server_output_action(",
             "validate_server_launch",
             ".restart_server(",
-        ),
-        (
-            "fn kill_server_port_action(",
-            "fn select_server_tab_action(",
-            "validate_server_launch",
-            "schedule_kill_port_and_restart",
         ),
         (
             "fn restart_ai_tab_action(",

@@ -24,8 +24,8 @@ use devmanager::process::registry::{
     JobMembership, ManagedProcessFence, ManagedProcessState, ProcessRegistry, RegisteredProcess,
 };
 use devmanager::services::ports_service::{
-    kill_port, legacy_statuses_from_snapshot, scan_listener_inventory,
-    scan_listener_inventory_with, PortInventory,
+    legacy_statuses_from_snapshot, scan_listener_inventory, scan_listener_inventory_with,
+    PortInventory,
 };
 
 fn fixed_uuid_v7(tail: u8) -> [u8; 16] {
@@ -177,7 +177,7 @@ fn stale_free_snapshot_is_unknown_instead_of_stopped() {
 }
 
 #[test]
-fn fresh_identity_proven_listener_without_managed_generation_is_external() {
+fn fresh_identity_proven_listener_without_managed_generation_is_unknown() {
     let port = 43_097;
     let listener = listener(11_097, 1_097);
     let snapshot = PortInventorySnapshot::from_parts(
@@ -193,14 +193,14 @@ fn fresh_identity_proven_listener_without_managed_generation_is_external() {
         &snapshot,
         None,
     );
-    assert_eq!(authority, PortAuthority::ProvenExternal);
+    assert_eq!(authority, PortAuthority::Unknown);
 
     let status = project_port_status_from_snapshot(
         &PortTarget::new(port, fence(107, 1), ManagedPortHealth::Ready),
         &snapshot,
         None,
     );
-    assert_eq!(status.kind(), PortStatusKind::ProvenExternal);
+    assert_eq!(status.kind(), PortStatusKind::Unknown);
     assert_eq!(status.listener(), Some(listener));
 }
 
@@ -1607,10 +1607,6 @@ fn real_temporary_listener_is_observed_and_never_touched_by_rejection() {
             listener: observed_listener,
         }
     );
-
-    let kill_error =
-        kill_port(port).expect_err("ownership-unverified listener must never be killed");
-    assert!(kill_error.contains("exact managed resource"));
 
     let still_occupied = TcpListener::bind(("127.0.0.1", port));
     assert!(

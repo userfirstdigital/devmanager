@@ -91,7 +91,7 @@ impl JobMembership for crate::process::job::ManagedProcessJob {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ManagedProcessState {
     Starting,
     Running,
