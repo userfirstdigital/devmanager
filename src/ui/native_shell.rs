@@ -34,7 +34,7 @@ use crate::client::action;
 use crate::client::{
     ClientModel, ClientSubscription, HostClient, HostClientConfig, SubscriptionUpdate,
 };
-use crate::domain::id::TaskId;
+use crate::domain::id::{CommandId, TaskId};
 use crate::domain::ClientId;
 use crate::host::IpcError;
 use crate::protocol::{Capability, CapabilitySet, FrameLimits};
@@ -65,7 +65,7 @@ const MAX_RENDERED_TASK_ROWS: usize = DEFAULT_VISIBLE_ROWS + FIXED_VIRTUAL_OVERS
 const MAX_PENDING_HOST_ACTIONS: usize = 32;
 const MAX_HOST_PROJECTIONS: usize = 64;
 const MAX_ACCESSIBILITY_ACTIONS: usize = 32;
-pub const MAX_STUB_ACTION_HISTORY: usize = 64;
+const MAX_PENDING_PREFERENCES: usize = 8;
 const CONTROLLER_TICK_INTERVAL: Duration = Duration::from_millis(16);
 const NATIVE_SHUTDOWN_BUDGET: Duration = Duration::from_secs(2);
 const NATIVE_STARTUP_BUDGET: Duration = Duration::from_secs(5);
@@ -123,6 +123,13 @@ fn reaper_counts() -> &'static Mutex<ReaperCounts> {
 }
 
 fn acquire_reaper_permit(kind: ReaperKind) -> Option<ReaperPermit> {
+    // A timed-out owner remains in the bounded reaper until its handle exits.
+    // Reap before checking the cap so a later launch can recover immediately
+    // instead of permanently treating completed work as live capacity.
+    match kind {
+        ReaperKind::Worker => reap_retained_workers(),
+        ReaperKind::Child => reap_retained_children(),
+    }
     let mut counts = reaper_counts()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -730,16 +737,31 @@ pub struct NativeActionRecord {
     pub capability: Option<Capability>,
     pub disabled_reason: Option<String>,
     pub event: ActionEvent,
-    pub command: Option<NativeHostCommand>,
+    /// Every captured action has an explicit typed host command or a typed
+    /// HOLD. Read-only actions must never disappear as `None` at dispatch.
+    pub command: NativeHostCommand,
 }
 
 #[derive(Clone, Debug)]
 pub enum NativeHostCommand {
     Envelope(crate::domain::command::CommandEnvelope),
-    TaskCreate(crate::client::action::TaskCreateArguments),
+    TaskCreate {
+        arguments: crate::client::action::TaskCreateArguments,
+        command_id: CommandId,
+        issued_at_ms: i64,
+    },
     TaskRename {
         arguments: crate::client::action::TaskRenameArguments,
         expected_task_revision: u64,
+        command_id: CommandId,
+        issued_at_ms: i64,
+    },
+    /// Explicitly surfaced until the canonical host query/request adapter is
+    /// available. This is intentionally typed so the action is not silently
+    /// ignored by the worker.
+    Hold {
+        action_id: &'static str,
+        reason: &'static str,
     },
 }
 
@@ -953,166 +975,19 @@ mod native_host_runtime_sealed {
     pub trait Sealed {}
 }
 
-/// Injectable runtime seam used by deterministic shell tests. Production uses
-/// [`NativeHostClientRuntime`] as the only concrete transport owner; tests can
-/// supply this port without opening a named pipe or starting another client.
-/// The trait is sealed so callers cannot add another unbounded transport owner.
-pub trait NativeHostRuntimePort: native_host_runtime_sealed::Sealed + Send {
+/// Crate-private compatibility port for the preview adapter. It is sealed and
+/// implemented only by the real [`NativeHostClientRuntime`]; no external
+/// caller can inject a transport, projection queue, epoch source, or action
+/// dispatcher into the production shell.
+pub(crate) trait NativeHostRuntimePort: native_host_runtime_sealed::Sealed + Send {
     fn endpoint(&self) -> &str;
     fn host_state(&self) -> NativeHostState;
-    fn epochs(&self) -> NativeHostRuntimeEpochs {
-        NativeHostRuntimeEpochs::default()
-    }
+    fn epochs(&self) -> NativeHostRuntimeEpochs;
     fn enqueue(&mut self, action: NativeActionRecord) -> NativeHostActionResult;
     fn drain_ready(&mut self, max: usize) -> Vec<NativeHostProjectionKind>;
-    fn drain_projection_messages(&mut self, max: usize) -> Vec<NativeHostProjection> {
-        self.drain_ready(max)
-            .into_iter()
-            .map(NativeHostProjection::kind)
-            .collect()
-    }
+    fn drain_projection_messages(&mut self, max: usize) -> Vec<NativeHostProjection>;
     fn take_pending(&mut self, max: usize) -> Vec<NativeActionRecord>;
     fn dispatch_pending(&mut self, action: NativeActionRecord) -> NativeHostActionResult;
-    fn executed_count(&self) -> usize {
-        0
-    }
-}
-
-#[derive(Debug)]
-pub struct NativeHostRuntimeStub {
-    endpoint: String,
-    state: NativeHostState,
-    pending: VecDeque<NativeActionRecord>,
-    projections: VecDeque<NativeHostProjection>,
-    executed: Arc<Mutex<Vec<NativeActionRecord>>>,
-    epochs: Arc<Mutex<NativeHostRuntimeEpochs>>,
-}
-
-impl NativeHostRuntimeStub {
-    pub fn new(endpoint: impl Into<String>, state: NativeHostState) -> Self {
-        Self {
-            endpoint: endpoint.into(),
-            state,
-            pending: VecDeque::new(),
-            projections: VecDeque::new(),
-            executed: Arc::new(Mutex::new(Vec::new())),
-            epochs: Arc::new(Mutex::new(NativeHostRuntimeEpochs::initial())),
-        }
-    }
-
-    pub fn pending_count(&self) -> usize {
-        self.pending.len()
-    }
-
-    pub fn push_projection(&mut self, projection: NativeHostProjectionKind) {
-        self.push_projection_message(NativeHostProjection::kind(projection));
-    }
-
-    pub fn push_projection_message(&mut self, projection: NativeHostProjection) {
-        if self.projections.len() < MAX_HOST_PROJECTIONS {
-            self.projections.push_back(projection);
-        }
-    }
-
-    pub fn push_model_projection(&mut self, model: Arc<ClientModel>) {
-        self.push_projection_message(NativeHostProjection::client_model(model));
-    }
-
-    pub fn handle(&self) -> NativeHostRuntimeStubHandle {
-        NativeHostRuntimeStubHandle {
-            executed: Arc::clone(&self.executed),
-            epochs: Arc::clone(&self.epochs),
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct NativeHostRuntimeStubHandle {
-    executed: Arc<Mutex<Vec<NativeActionRecord>>>,
-    epochs: Arc<Mutex<NativeHostRuntimeEpochs>>,
-}
-
-impl NativeHostRuntimeStubHandle {
-    pub fn executed_count(&self) -> usize {
-        self.executed
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .len()
-    }
-
-    pub fn set_epochs(&self, epochs: NativeHostRuntimeEpochs) {
-        if let Ok(mut current) = self.epochs.lock() {
-            *current = epochs;
-        }
-    }
-}
-
-impl native_host_runtime_sealed::Sealed for NativeHostRuntimeStub {}
-
-impl NativeHostRuntimePort for NativeHostRuntimeStub {
-    fn endpoint(&self) -> &str {
-        &self.endpoint
-    }
-
-    fn host_state(&self) -> NativeHostState {
-        self.state.clone()
-    }
-
-    fn epochs(&self) -> NativeHostRuntimeEpochs {
-        self.epochs
-            .lock()
-            .map(|epochs| *epochs)
-            .unwrap_or_else(|poisoned| *poisoned.into_inner())
-    }
-
-    fn enqueue(&mut self, action: NativeActionRecord) -> NativeHostActionResult {
-        if !matches!(self.state, NativeHostState::Connected { .. }) {
-            return NativeHostActionResult::Disconnected;
-        }
-        if self.pending.len() >= MAX_PENDING_HOST_ACTIONS {
-            return NativeHostActionResult::QueueFull;
-        }
-        self.pending.push_back(action);
-        NativeHostActionResult::Queued
-    }
-
-    fn drain_ready(&mut self, max: usize) -> Vec<NativeHostProjectionKind> {
-        let count = max
-            .min(MAX_PENDING_HOST_ACTIONS)
-            .min(self.projections.len());
-        self.projections
-            .drain(..count)
-            .map(|projection| projection.kind)
-            .collect()
-    }
-
-    fn drain_projection_messages(&mut self, max: usize) -> Vec<NativeHostProjection> {
-        let count = max.min(MAX_HOST_PROJECTIONS).min(self.projections.len());
-        self.projections.drain(..count).collect()
-    }
-
-    fn take_pending(&mut self, max: usize) -> Vec<NativeActionRecord> {
-        let count = max.min(MAX_PENDING_HOST_ACTIONS).min(self.pending.len());
-        self.pending.drain(..count).collect()
-    }
-
-    fn dispatch_pending(&mut self, action: NativeActionRecord) -> NativeHostActionResult {
-        let mut executed = self
-            .executed
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if executed.len() < MAX_STUB_ACTION_HISTORY {
-            executed.push(action);
-        }
-        NativeHostActionResult::Queued
-    }
-
-    fn executed_count(&self) -> usize {
-        self.executed
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .len()
-    }
 }
 
 impl std::fmt::Debug for NativeHostClientRuntime {
@@ -1676,34 +1551,44 @@ fn native_host_worker_loop(
                 if cancellation.load(Ordering::Acquire) {
                     break;
                 }
-                if let Some(command) = action.command {
-                    let result = client.lock().ok().map(|mut client| {
-                        runtime.block_on(execute_native_command_cancellable(
-                            &mut client,
-                            command,
-                            &cancellation,
-                        ))
-                    });
-                    let projection = match result {
-                        Some(Ok(())) => NativeHostProjection::kind(NativeHostProjectionKind::Live),
-                        Some(Err(error)) => NativeHostProjection {
-                            kind: NativeHostProjectionKind::Error,
-                            client_model: None,
-                            error: Some(bounded_host_error(error.to_string())),
-                            epochs: None,
-                        },
-                        None => NativeHostProjection {
-                            kind: NativeHostProjectionKind::Error,
-                            client_model: None,
-                            error: Some("native host client lock poisoned".to_string()),
-                            epochs: None,
-                        },
-                    }
-                    .at_epochs(current_runtime_epochs(&epochs));
-                    if let Ok(mut queue) = projections.lock() {
-                        if queue.len() < MAX_HOST_PROJECTIONS {
-                            queue.push_back(projection);
+                let projection = match action.command {
+                    NativeHostCommand::Hold { action_id, reason } => NativeHostProjection {
+                        kind: NativeHostProjectionKind::Error,
+                        client_model: None,
+                        error: Some(bounded_host_error(format!("{action_id}: HOLD: {reason}"))),
+                        epochs: None,
+                    },
+                    command => {
+                        let result = client.lock().ok().map(|mut client| {
+                            runtime.block_on(execute_native_command_cancellable(
+                                &mut client,
+                                command,
+                                &cancellation,
+                            ))
+                        });
+                        match result {
+                            Some(Ok(())) => {
+                                NativeHostProjection::kind(NativeHostProjectionKind::Live)
+                            }
+                            Some(Err(error)) => NativeHostProjection {
+                                kind: NativeHostProjectionKind::Error,
+                                client_model: None,
+                                error: Some(bounded_host_error(error.to_string())),
+                                epochs: None,
+                            },
+                            None => NativeHostProjection {
+                                kind: NativeHostProjectionKind::Error,
+                                client_model: None,
+                                error: Some("native host client lock poisoned".to_string()),
+                                epochs: None,
+                            },
                         }
+                    }
+                }
+                .at_epochs(current_runtime_epochs(&epochs));
+                if let Ok(mut queue) = projections.lock() {
+                    if queue.len() < MAX_HOST_PROJECTIONS {
+                        queue.push_back(projection);
                     }
                 }
             }
@@ -1979,24 +1864,31 @@ async fn execute_native_command(
 ) -> Result<(), IpcError> {
     let envelope = match command {
         NativeHostCommand::Envelope(envelope) => envelope,
-        NativeHostCommand::TaskCreate(arguments) => crate::client::action::task_create_command(
-            crate::domain::id::CommandId::new(),
+        NativeHostCommand::TaskCreate {
+            arguments,
+            command_id,
+            issued_at_ms,
+        } => crate::client::action::task_create_command(
+            command_id,
             client.client_id(),
-            unix_time_ms(),
+            issued_at_ms,
             arguments,
         )
         .map_err(|_| IpcError::Unavailable)?,
         NativeHostCommand::TaskRename {
             arguments,
             expected_task_revision,
+            command_id,
+            issued_at_ms,
         } => crate::client::action::task_rename_command(
-            crate::domain::id::CommandId::new(),
+            command_id,
             client.client_id(),
-            unix_time_ms(),
+            issued_at_ms,
             expected_task_revision,
             arguments,
         )
         .map_err(|_| IpcError::Unavailable)?,
+        NativeHostCommand::Hold { .. } => return Err(IpcError::Unavailable),
     };
     client.execute_command(envelope).await.map(|_| ())
 }
@@ -2027,7 +1919,7 @@ fn unix_time_ms() -> i64 {
         .unwrap_or(0)
 }
 
-pub enum NativeHostRuntimeAttachment {
+pub(crate) enum NativeHostRuntimeAttachment {
     Client(NativeHostClientRuntime),
     Injected(Box<dyn NativeHostRuntimePort>),
 }
@@ -2444,16 +2336,37 @@ impl NativeInteraction {
             _ => (None, None),
         };
         let (focus_epoch, request_generation) = self.begin_handler(self.selected_task());
+        let command_id = CommandId::new();
+        let issued_at_ms = unix_time_ms();
         let command = match &request {
-            ActionRequest::TaskCreate(arguments) => {
-                Some(NativeHostCommand::TaskCreate(arguments.clone()))
-            }
-            ActionRequest::TaskRename(arguments) => Some(NativeHostCommand::TaskRename {
+            ActionRequest::TaskCreate(arguments) => NativeHostCommand::TaskCreate {
+                arguments: arguments.clone(),
+                command_id,
+                issued_at_ms,
+            },
+            ActionRequest::TaskRename(arguments) => NativeHostCommand::TaskRename {
                 arguments: arguments.clone(),
                 expected_task_revision: expected_task_revision
                     .expect("rename revision was validated above"),
-            }),
-            _ => None,
+                command_id,
+                issued_at_ms,
+            },
+            ActionRequest::HostActions => NativeHostCommand::Hold {
+                action_id: action::ACTION_HOST_ACTIONS,
+                reason: "canonical host action catalog request is not wired",
+            },
+            ActionRequest::HostStatus => NativeHostCommand::Hold {
+                action_id: action::ACTION_HOST_STATUS,
+                reason: "canonical host status request is not wired",
+            },
+            ActionRequest::TaskList => NativeHostCommand::Hold {
+                action_id: action::ACTION_TASK_LIST,
+                reason: "canonical task list query request is not wired",
+            },
+            ActionRequest::TaskShow { .. } => NativeHostCommand::Hold {
+                action_id: action::ACTION_TASK_SHOW,
+                reason: "canonical task show query request is not wired",
+            },
         };
         let event = ActionEvent::new(request, source, focus_epoch);
         Some(NativeActionRecord {
@@ -3100,7 +3013,7 @@ impl NativeShell {
         )
     }
 
-    pub fn new_with_host_runtime_port(
+    pub(crate) fn new_with_host_runtime_port(
         profile: IsolatedDevProfile,
         host_runtime: Box<dyn NativeHostRuntimePort>,
         preferences: RuntimePreferencesSnapshot,
@@ -3253,7 +3166,7 @@ impl NativeShell {
     }
 
     pub fn queue_preferences(&mut self, preferences: RuntimePreferencesSnapshot) {
-        self.pending_preferences.push_back(preferences);
+        enqueue_pending_preference(&mut self.pending_preferences, preferences);
     }
 
     pub fn queue_preferences_for_test(&mut self, preferences: RuntimePreferencesSnapshot) {
@@ -3469,19 +3382,6 @@ impl NativeShell {
                 .expect("runtime attached")
                 .to_string(),
         };
-        Ok(())
-    }
-
-    pub fn attach_host_runtime_port(
-        &mut self,
-        host_runtime: Box<dyn NativeHostRuntimePort>,
-    ) -> Result<(), Box<dyn NativeHostRuntimePort>> {
-        if self.host_runtime.is_some() {
-            return Err(host_runtime);
-        }
-        self.host_state = host_runtime.host_state();
-        self.interaction.sync_host_epochs(host_runtime.epochs());
-        self.host_runtime = Some(NativeHostRuntimeAttachment::Injected(host_runtime));
         Ok(())
     }
 
@@ -4155,15 +4055,48 @@ fn bounded_host_error(message: String) -> String {
     message.chars().take(MAX_HOST_ERROR_CHARS).collect()
 }
 
+fn enqueue_pending_preference(
+    pending: &mut VecDeque<RuntimePreferencesSnapshot>,
+    preferences: RuntimePreferencesSnapshot,
+) {
+    if pending.len() >= MAX_PENDING_PREFERENCES {
+        pending.pop_front();
+    }
+    pending.push_back(preferences);
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        ensure_isolated_host_config_base, isolated_dev_profile, wait_for_cancellation,
-        AccessibilityTree, NativePlatformAccessibilityBridge, NativeShutdownDeadline,
+        acquire_reaper_permit, enqueue_pending_preference, ensure_isolated_host_config_base,
+        isolated_dev_profile, reap_retained_children, reap_retained_workers, retain_child,
+        retain_worker, wait_for_cancellation, AccessibilityTree, NativePlatformAccessibilityBridge,
+        NativeShutdownDeadline, OwnedChild, OwnedWorker, ReaperKind, MAX_PENDING_PREFERENCES,
+        MAX_RETAINED_CHILDREN, MAX_RETAINED_WORKERS,
     };
+    use std::collections::VecDeque;
+    use std::process::Command;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
+
+    fn exited_child() -> std::process::Child {
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = Command::new("cmd");
+            command.args(["/C", "exit", "0"]);
+            command
+        };
+        #[cfg(not(windows))]
+        let mut command = Command::new("true");
+        let mut child = command.spawn().expect("short-lived test child");
+        loop {
+            match child.try_wait().expect("test child status") {
+                Some(_) => return child,
+                None => std::thread::yield_now(),
+            }
+        }
+    }
 
     #[test]
     fn default_host_bootstrap_prepares_only_the_isolated_config_base() {
@@ -4218,6 +4151,60 @@ mod tests {
         bridge.sync(&tree);
         assert!(!bridge.is_current_generation(old_generation));
         assert!(bridge.is_current_generation(bridge.generation()));
+    }
+
+    #[test]
+    fn worker_reaper_capacity_recovers_finished_handles_before_admission() {
+        reap_retained_workers();
+        for _ in 0..MAX_RETAINED_WORKERS {
+            let permit = acquire_reaper_permit(ReaperKind::Worker).expect("worker permit");
+            let handle = std::thread::spawn(|| {});
+            while !handle.is_finished() {
+                std::thread::yield_now();
+            }
+            retain_worker(OwnedWorker {
+                handle,
+                _permit: permit,
+            });
+        }
+        let recovered = acquire_reaper_permit(ReaperKind::Worker);
+        assert!(
+            recovered.is_some(),
+            "finished workers must be reaped before cap"
+        );
+        drop(recovered);
+        reap_retained_workers();
+    }
+
+    #[test]
+    fn child_reaper_capacity_recovers_finished_handles_before_admission() {
+        reap_retained_children();
+        for _ in 0..MAX_RETAINED_CHILDREN {
+            let permit = acquire_reaper_permit(ReaperKind::Child).expect("child permit");
+            retain_child(OwnedChild {
+                child: exited_child(),
+                _permit: permit,
+            });
+        }
+        let recovered = acquire_reaper_permit(ReaperKind::Child);
+        assert!(
+            recovered.is_some(),
+            "finished children must be reaped before cap"
+        );
+        drop(recovered);
+        reap_retained_children();
+    }
+
+    #[test]
+    fn pending_preferences_keep_a_bounded_recent_window() {
+        let mut pending = VecDeque::new();
+        for _ in 0..(MAX_PENDING_PREFERENCES * 4) {
+            enqueue_pending_preference(
+                &mut pending,
+                crate::ui::tokens::RuntimePreferencesSnapshot::default(),
+            );
+        }
+        assert!(pending.len() <= MAX_PENDING_PREFERENCES);
     }
 }
 

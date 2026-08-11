@@ -9,9 +9,8 @@ use devmanager::ui::actions::{KeyboardShortcut, ShortcutKey};
 use devmanager::ui::components::{ActionRequest, ActivationSource};
 use devmanager::ui::native_shell::{
     headless_render_smoke, isolated_dev_profile, AccessibilityTree, NativeHeaderAttachment,
-    NativeHostLaunchSpec, NativeHostProjection, NativeHostProjectionKind, NativeHostRuntimeEpochs,
-    NativeHostRuntimeStub, NativeHostState, NativeInteraction, NativeShell, NativeShellError,
-    TerminalDockState, MAX_STUB_ACTION_HISTORY,
+    NativeHostLaunchSpec, NativeHostState, NativeInteraction, NativeShell, NativeShellError,
+    TerminalDockState,
 };
 use devmanager::ui::shell::{NavigationResult, PointerButton, TerminalPressRejection};
 use devmanager::ui::task_cockpit::inbox::MAX_TASK_SOURCE_IDS;
@@ -234,149 +233,25 @@ fn native_shell_header_uses_typed_attachment_and_explicit_unavailable_state() {
 }
 
 #[test]
-fn native_shell_accepts_one_injected_runtime_seam_without_opening_a_second_client() {
-    let workspace = tempdir().expect("workspace tempdir");
-    let profile = isolated_dev_profile(workspace.path()).expect("isolated profile");
-    let fake = NativeHostRuntimeStub::new(
-        "phase2-test://isolated",
-        NativeHostState::Connected {
-            endpoint: "phase2-test://isolated".to_string(),
-        },
-    );
-    let report_slot = std::rc::Rc::new(std::cell::RefCell::new(None));
-    let report_slot_for_app = std::rc::Rc::clone(&report_slot);
-    gpui::Application::headless().run(move |cx| {
-        devmanager::ui::init(cx);
-        let entity = cx.new(|cx| {
-            NativeShell::new_with_host_runtime_port(
-                profile,
-                Box::new(fake),
-                RuntimePreferencesSnapshot::new(
-                    ThemeMode::Dark,
-                    Density::Comfortable,
-                    Scale::Scale100,
-                ),
-                cx,
-            )
-        });
-        let result = entity.update(cx, |shell, _cx| {
-            (
-                shell.host_endpoint().to_string(),
-                shell.host_state().clone(),
-                shell.host_runtime().is_none(),
-            )
-        });
-        *report_slot_for_app.borrow_mut() = Some(result);
-        drop(entity);
-        cx.quit();
-    });
-    let (endpoint, state, concrete_runtime_absent) = report_slot
-        .borrow_mut()
-        .take()
-        .expect("injected shell report");
-    assert_eq!(endpoint, "phase2-test://isolated");
-    assert!(matches!(state, NativeHostState::Connected { .. }));
-    assert!(concrete_runtime_absent);
-}
-
-#[test]
-fn injected_host_projection_drain_is_bounded_and_keeps_live_kinds_typed() {
-    use devmanager::ui::native_shell::{NativeHostProjectionKind, NativeHostRuntimePort};
-    let mut stub = NativeHostRuntimeStub::new(
-        "phase2-test://isolated",
-        NativeHostState::Connected {
-            endpoint: "phase2-test://isolated".to_string(),
-        },
-    );
-    for kind in [
-        NativeHostProjectionKind::Snapshot,
-        NativeHostProjectionKind::Replay,
-        NativeHostProjectionKind::Live,
+fn native_shell_exposes_no_external_runtime_injection_authority() {
+    let source = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/ui/native_shell.rs"
+    ))
+    .expect("native shell source");
+    for forbidden in [
+        "pub trait NativeHostRuntimePort",
+        "pub struct NativeHostRuntimeStub",
+        "pub struct NativeHostRuntimeStubHandle",
+        "pub enum NativeHostRuntimeAttachment",
+        "pub fn new_with_host_runtime_port",
+        "pub fn attach_host_runtime_port",
     ] {
-        for _ in 0..40 {
-            stub.push_projection(kind);
-        }
-    }
-    let first = stub.drain_ready(32);
-    let second = stub.drain_ready(32);
-    assert_eq!(first.len(), 32);
-    assert_eq!(second.len(), 32);
-    assert!(first.iter().chain(second.iter()).all(|kind| matches!(
-        kind,
-        NativeHostProjectionKind::Snapshot
-            | NativeHostProjectionKind::Replay
-            | NativeHostProjectionKind::Live
-    )));
-}
-
-#[test]
-fn controller_epoch_changes_fence_actions_without_public_interaction_setters() {
-    let workspace = tempdir().expect("workspace tempdir");
-    let profile = isolated_dev_profile(workspace.path()).expect("isolated profile");
-    let model = Arc::new(model_with_tasks(&[task_id(41)]));
-    let mut fake = NativeHostRuntimeStub::new(
-        "phase2-test://isolated",
-        NativeHostState::Connected {
-            endpoint: "phase2-test://isolated".to_string(),
-        },
-    );
-    fake.push_model_projection(model);
-    let fake_handle = fake.handle();
-    let report_slot = std::rc::Rc::new(std::cell::RefCell::new(None));
-    let report_slot_for_app = std::rc::Rc::clone(&report_slot);
-    gpui::Application::headless().run(move |cx| {
-        devmanager::ui::init(cx);
-        let entity = cx.new(|cx| {
-            NativeShell::new_with_host_runtime_port(
-                profile,
-                Box::new(fake),
-                RuntimePreferencesSnapshot::default(),
-                cx,
-            )
-        });
-        let result = entity.update(cx, |shell, _cx| {
-            shell.controller_tick_for_test(32);
-            shell.dispatch_action_for_test(ActionRequest::HostStatus);
-            fake_handle.set_epochs(NativeHostRuntimeEpochs {
-                connection_epoch: 2,
-                resource_generation: 2,
-                runtime_generation: 2,
-            });
-            shell.controller_tick_for_test(32);
-            fake_handle.executed_count()
-        });
-        *report_slot_for_app.borrow_mut() = Some(result);
-        drop(entity);
-        cx.quit();
-    });
-    assert_eq!(
-        report_slot.borrow_mut().take().expect("epoch report"),
-        0,
-        "the controller must advance the interaction fence from runtime epochs"
-    );
-}
-
-#[test]
-fn injected_stub_caps_executed_action_history() {
-    use devmanager::ui::native_shell::NativeHostRuntimePort;
-
-    let mut stub = NativeHostRuntimeStub::new(
-        "phase2-test://isolated",
-        NativeHostState::Connected {
-            endpoint: "phase2-test://isolated".to_string(),
-        },
-    );
-    let mut interaction = NativeInteraction::new(None);
-    for _ in 0..(128 * 4) {
-        let action = interaction
-            .action(ActionRequest::HostStatus)
-            .expect("host status action");
-        assert_eq!(
-            stub.dispatch_pending(action),
-            devmanager::ui::native_shell::NativeHostActionResult::Queued
+        assert!(
+            !source.contains(forbidden),
+            "production native shell must not expose {forbidden}"
         );
     }
-    assert!(stub.executed_count() <= MAX_STUB_ACTION_HISTORY);
 }
 
 #[test]
@@ -456,11 +331,25 @@ fn native_action_dispatch_is_selection_and_interaction_fenced() {
         pointer_action.event.source,
         ActivationSource::Pointer { pointer_id: 17 }
     ));
+    assert!(matches!(
+        pointer_action.command,
+        devmanager::ui::native_shell::NativeHostCommand::Hold {
+            action_id: "host.status",
+            ..
+        }
+    ));
 
     let show = interaction
         .action(ActionRequest::TaskShow { task_id: selected })
         .expect("selected task show should remain dispatchable without a mutation revision");
     assert!(interaction.accepts_action_record(&show));
+    assert!(matches!(
+        show.command,
+        devmanager::ui::native_shell::NativeHostCommand::Hold {
+            action_id: "task.show",
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -484,14 +373,65 @@ fn native_mutating_action_captures_model_revision_and_epochs() {
     assert!(record.disabled_reason.is_none());
     assert!(matches!(record.capability, None));
     assert!(matches!(
-        record.command,
-        Some(
-            devmanager::ui::native_shell::NativeHostCommand::TaskRename {
-                expected_task_revision: 4,
-                ..
-            }
-        )
+        &record.command,
+        devmanager::ui::native_shell::NativeHostCommand::TaskRename {
+            command_id: _,
+            issued_at_ms: _,
+            expected_task_revision: 4,
+            ..
+        }
     ));
+
+    let retry = record.clone();
+    let (command_id, issued_at_ms, captured_task_id) = match &record.command {
+        devmanager::ui::native_shell::NativeHostCommand::TaskRename {
+            command_id,
+            issued_at_ms,
+            arguments,
+            ..
+        } => (*command_id, *issued_at_ms, arguments.task_id),
+        _ => panic!("rename must carry a typed retry identity"),
+    };
+    match &retry.command {
+        devmanager::ui::native_shell::NativeHostCommand::TaskRename {
+            command_id: retry_command_id,
+            issued_at_ms: retry_issued_at_ms,
+            arguments,
+            ..
+        } => {
+            assert_eq!(
+                (*retry_command_id, *retry_issued_at_ms, arguments.task_id),
+                (command_id, issued_at_ms, captured_task_id)
+            );
+        }
+        _ => panic!("retry must preserve the captured command identity"),
+    }
+
+    let create_task = task_id(35);
+    let create = interaction
+        .action(ActionRequest::TaskCreate(
+            devmanager::client::action::TaskCreateArguments {
+                task_id: create_task,
+                environment_id: EnvironmentId::new(),
+                title: "captured create".to_string(),
+                description: None,
+                project_id: ProjectId::new(),
+                workspace: WorkspaceRef::Main,
+            },
+        ))
+        .expect("task create should capture a retry identity");
+    match &create.command {
+        devmanager::ui::native_shell::NativeHostCommand::TaskCreate {
+            arguments,
+            command_id,
+            issued_at_ms,
+        } => {
+            assert_eq!(arguments.task_id, create_task);
+            assert_ne!(*command_id, devmanager::domain::id::CommandId::default());
+            assert!(*issued_at_ms > 0);
+        }
+        _ => panic!("create must carry a typed retry identity"),
+    }
 
     let newer = interaction
         .action(ActionRequest::HostStatus)
@@ -589,80 +529,19 @@ fn native_host_launch_spec_is_explicitly_isolated_and_single_owner() {
 }
 
 #[test]
-fn controller_tick_consumes_a_fenced_action_once_and_applies_projection() {
-    let workspace = tempdir().expect("workspace tempdir");
-    let profile = isolated_dev_profile(workspace.path()).expect("isolated profile");
-    let mut fake = NativeHostRuntimeStub::new(
-        "phase2-test://isolated",
-        NativeHostState::Connected {
-            endpoint: "phase2-test://isolated".to_string(),
-        },
-    );
-    fake.push_projection_message(NativeHostProjection::kind(NativeHostProjectionKind::Replay));
-    let fake_handle = fake.handle();
-    let report_slot = std::rc::Rc::new(std::cell::RefCell::new(None));
-    let report_slot_for_app = std::rc::Rc::clone(&report_slot);
-    gpui::Application::headless().run(move |cx| {
-        devmanager::ui::init(cx);
-        let entity = cx.new(|cx| {
-            NativeShell::new_with_host_runtime_port(
-                profile,
-                Box::new(fake),
-                RuntimePreferencesSnapshot::default(),
-                cx,
-            )
-        });
-        let result = entity.update(cx, |shell, _cx| {
-            shell.dispatch_action_for_test(ActionRequest::TaskCreate(
-                devmanager::client::action::TaskCreateArguments {
-                    task_id: task_id(9),
-                    environment_id: devmanager::domain::id::EnvironmentId::new(),
-                    title: "created once".to_string(),
-                    description: None,
-                    project_id: devmanager::domain::id::ProjectId::new(),
-                    workspace: devmanager::domain::task::WorkspaceRef::Main,
-                },
-            ));
-            shell.controller_tick_for_test(32);
-            shell.controller_tick_for_test(32);
-            (shell.controller_tick_count(), shell.last_projection_kinds())
-        });
-        *report_slot_for_app.borrow_mut() = Some(result);
-        drop(entity);
-        cx.quit();
-    });
-    let (ticks, projections) = report_slot.borrow_mut().take().expect("controller report");
-    assert!(ticks >= 2);
-    assert_eq!(projections, vec![NativeHostProjectionKind::Replay]);
-    assert_eq!(fake_handle.executed_count(), 1);
-}
-
-#[test]
 fn immutable_client_model_projection_drives_shell_rows_and_sequence() {
     let workspace = tempdir().expect("workspace tempdir");
     let profile = isolated_dev_profile(workspace.path()).expect("isolated profile");
     let model = Arc::new(model_with_tasks(&[task_id(21), task_id(22)]));
-    let mut fake = NativeHostRuntimeStub::new(
-        "phase2-test://isolated",
-        NativeHostState::Connected {
-            endpoint: "phase2-test://isolated".to_string(),
-        },
-    );
-    fake.push_model_projection(Arc::clone(&model));
     let report_slot = std::rc::Rc::new(std::cell::RefCell::new(None));
     let report_slot_for_app = std::rc::Rc::clone(&report_slot);
     gpui::Application::headless().run(move |cx| {
         devmanager::ui::init(cx);
-        let entity = cx.new(|cx| {
-            NativeShell::new_with_host_runtime_port(
-                profile,
-                Box::new(fake),
-                RuntimePreferencesSnapshot::default(),
-                cx,
-            )
-        });
+        let entity = cx.new(|cx| NativeShell::new_for_headless(profile, cx));
         let result = entity.update(cx, |shell, _cx| {
-            shell.controller_tick_for_test(32);
+            shell
+                .apply_client_model(Arc::clone(&model))
+                .expect("client model projection");
             (
                 shell
                     .client_model_snapshot()
