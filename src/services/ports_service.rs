@@ -14,10 +14,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 pub const DEFAULT_PORT_SCAN_TIMEOUT: Duration = Duration::from_secs(2);
-/// Retained for source compatibility. Timed-out scans are joined before the
-/// next scan is admitted, so no quarantine pool is used anymore.
-#[deprecated(note = "timed-out scans are joined instead of quarantined")]
-pub const MAX_SCAN_QUARANTINE: usize = 2;
 
 pub trait PortScanner: Send + Sync + 'static {
     fn scan(
@@ -494,7 +490,14 @@ impl PortScanner for NativePortScanner {
         if cancellation.is_cancelled() {
             return Err("scan cancelled before listener enumeration".to_string());
         }
-        let snapshot = scan_listener_inventory(ports)?;
+        let observation_time = Instant::now();
+        let snapshot = scan_listener_inventory_with_deadline(
+            ports,
+            platform_service::snapshot_listener_endpoints,
+            capture_listener_identity,
+            observation_time,
+            cancellation.deadline(),
+        )?;
         if cancellation.is_cancelled() {
             return Err("scan cancelled after listener enumeration".to_string());
         }
@@ -714,9 +717,9 @@ fn run_inventory_worker(weak_inner: Weak<PortInventoryInner>) {
             waiter.complete(execution.result.clone());
         }
 
-        // A timed-out scanner is never quarantined or allowed to mutate the
-        // inventory after the coordinator advances. Complete callers at the
-        // deadline above, then join the child before admitting any next scan.
+        // A timed-out scanner is never allowed to mutate the inventory after
+        // the coordinator advances. Complete callers at the deadline above,
+        // then join the child before admitting any next scan.
         if let Some(worker) = execution.worker {
             let _ = worker.join();
         }
@@ -744,10 +747,15 @@ fn run_inventory_worker(weak_inner: Weak<PortInventoryInner>) {
 /// Probe all requested ports with one native listener-table query, then
 /// revalidate the same endpoint rows after PID creation-time capture.
 pub fn scan_listener_inventory(ports: &[u16]) -> Result<PortInventorySnapshot, String> {
-    scan_listener_inventory_with(
+    let observation_time = Instant::now();
+    scan_listener_inventory_with_deadline(
         ports,
         platform_service::snapshot_listener_endpoints,
         capture_listener_identity,
+        observation_time,
+        observation_time
+            .checked_add(crate::process::ports::DEFAULT_FREE_PROOF_MAX_AGE)
+            .unwrap_or(observation_time),
     )
 }
 
@@ -757,34 +765,73 @@ pub fn scan_listener_inventory(ports: &[u16]) -> Result<PortInventorySnapshot, S
 /// authority Unknown and prevents a Free launch proof.
 pub fn scan_listener_inventory_with<Enumerate, Capture>(
     ports: &[u16],
-    mut enumerate: Enumerate,
-    mut capture: Capture,
+    enumerate: Enumerate,
+    capture: Capture,
 ) -> Result<PortInventorySnapshot, String>
 where
     Enumerate: FnMut(&[u16]) -> Result<BTreeMap<u16, Vec<TcpEndpointRecord>>, String>,
     Capture: FnMut(u32) -> Result<ListenerIdentity, String>,
 {
+    let observation_time = Instant::now();
+    let deadline = observation_time
+        .checked_add(crate::process::ports::DEFAULT_FREE_PROOF_MAX_AGE)
+        .unwrap_or(observation_time);
+    scan_listener_inventory_with_deadline(ports, enumerate, capture, observation_time, deadline)
+}
+
+/// Testable boundary for a bounded, single-observation listener scan. The
+/// caller owns both the absolute deadline and the observation timestamp so
+/// the first and second listener publications cannot silently observe time at
+/// different instants.
+pub fn scan_listener_inventory_with_deadline<Enumerate, Capture>(
+    ports: &[u16],
+    mut enumerate: Enumerate,
+    mut capture: Capture,
+    observation_time: Instant,
+    deadline: Instant,
+) -> Result<PortInventorySnapshot, String>
+where
+    Enumerate: FnMut(&[u16]) -> Result<BTreeMap<u16, Vec<TcpEndpointRecord>>, String>,
+    Capture: FnMut(u32) -> Result<ListenerIdentity, String>,
+{
+    let ensure_before_deadline = || {
+        if Instant::now() > deadline || observation_time > deadline {
+            Err("port listener scan deadline expired".to_string())
+        } else {
+            Ok(())
+        }
+    };
+    ensure_before_deadline()?;
     let ports = normalize_scan_ports(ports).map_err(|error| error.to_string())?;
+    ensure_before_deadline()?;
     let first = normalize_listener_table(enumerate(&ports)?, &ports)?;
+    ensure_before_deadline()?;
     let mut first_identities = BTreeMap::<u32, Result<ListenerIdentity, String>>::new();
     for rows in first.values() {
         for row in rows {
+            ensure_before_deadline()?;
             first_identities
                 .entry(row.pid())
                 .or_insert_with(|| capture(row.pid()));
+            ensure_before_deadline()?;
         }
     }
 
+    ensure_before_deadline()?;
     let second = normalize_listener_table(enumerate(&ports)?, &ports)?;
+    ensure_before_deadline()?;
     let mut second_identities = BTreeMap::<u32, Result<ListenerIdentity, String>>::new();
     for rows in second.values() {
         for row in rows {
+            ensure_before_deadline()?;
             second_identities
                 .entry(row.pid())
                 .or_insert_with(|| capture(row.pid()));
+            ensure_before_deadline()?;
         }
     }
 
+    ensure_before_deadline()?;
     let mut observations = BTreeMap::new();
     let mut endpoints = BTreeMap::new();
     let mut issues = BTreeMap::new();
@@ -864,11 +911,12 @@ where
             MAX_SCAN_ERRORS
         ));
     }
+    ensure_before_deadline()?;
     Ok(PortInventorySnapshot::from_parts(
         observations,
         endpoints,
         issues,
-        Instant::now(),
+        observation_time,
     ))
 }
 

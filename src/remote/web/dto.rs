@@ -277,7 +277,7 @@ impl WebPortAuthority {
             WebPortControlReason::Stale
         } else {
             match authority.kind {
-                RemotePortAuthorityKind::Managed if authority.has_complete_wire_authority() => {
+                RemotePortAuthorityKind::Managed if authority.is_host_verified() => {
                     WebPortControlReason::ExactManagedFence
                 }
                 RemotePortAuthorityKind::ProvenExternal => {
@@ -645,6 +645,59 @@ mod tests {
         assert_eq!(snapshot.sessions[0].oldest_sequence, 1);
         assert_eq!(snapshot.sessions[0].latest_sequence, 1);
         assert_eq!(snapshot.port_statuses[0].port, 43872);
+    }
+
+    #[test]
+    fn browser_managed_authority_requires_host_verified_projection() {
+        let fixture = host_fixture_with_sentinels();
+        let now = crate::remote::now_epoch_ms();
+        let authority = RemotePortAuthority {
+            port: 43872,
+            kind: RemotePortAuthorityKind::Managed,
+            resource: Some(crate::domain::operation::ResourceFence::new(
+                crate::domain::id::ResourceId::new(),
+                7,
+            )),
+            listeners: vec![crate::remote::RemoteListenerIdentity {
+                pid: 4242,
+                creation_time_100ns: 42_420_000,
+                executable_proven: true,
+                executable_fingerprint: None,
+            }],
+            session_id: Some("session-1".to_string()),
+            root: Some(crate::remote::RemoteListenerIdentity {
+                pid: 4242,
+                creation_time_100ns: 42_420_000,
+                executable_proven: true,
+                executable_fingerprint: None,
+            }),
+            membership_revision: 9,
+            observation_sequence: 11,
+            publication_sequence: 13,
+            observed_at_epoch_ms: now,
+            freshness_deadline_epoch_ms: now + crate::remote::REMOTE_PORT_AUTHORITY_MAX_AGE_MS,
+            managed_fence_fingerprint: Some(42),
+            verified: None,
+            error: None,
+        };
+        let snapshot = WebWorkspaceSnapshot::from_host_with_authorities(
+            "runtime-1",
+            7,
+            &fixture.app,
+            &fixture.runtime,
+            &fixture.ports,
+            &HashMap::from([(43872, authority)]),
+            &fixture.lease,
+            &fixture.journals.metadata_snapshot(),
+        );
+
+        assert!(
+            matches!(
+                snapshot.port_authorities[0].control_reason,
+                WebPortControlReason::MixedOrUnverified
+            ),
+            "wire-shaped managed metadata cannot mint a Web control projection"
+        );
     }
 
     #[test]

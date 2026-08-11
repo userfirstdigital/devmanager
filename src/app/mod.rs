@@ -16956,7 +16956,7 @@ fn remote_forwardable_ports(snapshot: &remote::RemoteWorkspaceSnapshot) -> Vec<u
                 };
                 if session.status.is_live()
                     && authority.is_fresh_at(now_epoch_ms())
-                    && authority.has_complete_wire_fence_for_session(port, session)
+                    && authority.is_host_verified()
                 {
                     ports.push(port);
                 }
@@ -17124,9 +17124,7 @@ fn derive_server_indicator_with_remote_authority(
         SessionStatus::Stopping => sidebar::ServerIndicatorState::Stopping,
         SessionStatus::Running => match authority.map(remote::RemotePortAuthority::kind) {
             Some(remote::RemotePortAuthorityKind::Managed)
-                if authority.is_some_and(|authority| {
-                    authority.has_complete_wire_fence_for_session(authority.port, session)
-                }) =>
+                if authority.is_some_and(remote::RemotePortAuthority::is_host_verified) =>
             {
                 sidebar::ServerIndicatorState::Ready
             }
@@ -17318,9 +17316,7 @@ fn remote_port_ui_authority(
     }
     Some(match authority.kind() {
         remote::RemotePortAuthorityKind::Managed => {
-            if session.is_some_and(|session| {
-                authority.has_complete_wire_fence_for_session(authority.port, session)
-            }) {
+            if session.is_some() && authority.is_host_verified() {
                 PortUiAuthority::Managed
             } else {
                 PortUiAuthority::Unknown
@@ -21107,6 +21103,7 @@ mod tests {
             observed_at_epoch_ms: now.saturating_sub(remote::REMOTE_PORT_AUTHORITY_MAX_AGE_MS + 1),
             freshness_deadline_epoch_ms: now.saturating_sub(1),
             managed_fence_fingerprint: None,
+            verified: None,
             error: None,
         };
 
@@ -21138,6 +21135,7 @@ mod tests {
                 pid: 4242,
                 creation_time_100ns: 42_420_000,
                 executable_proven: true,
+                executable_fingerprint: None,
             }],
             session_id: None,
             root: None,
@@ -21147,6 +21145,7 @@ mod tests {
             observed_at_epoch_ms: now,
             freshness_deadline_epoch_ms: now + remote::REMOTE_PORT_AUTHORITY_MAX_AGE_MS,
             managed_fence_fingerprint: None,
+            verified: None,
             error: None,
         };
 
@@ -21167,11 +21166,13 @@ mod tests {
             pid: 4242,
             creation_time_100ns: 42_420_000,
             executable_proven: true,
+            executable_fingerprint: None,
         });
         authority.managed_fence_fingerprint = Some(42);
         assert_eq!(
             derive_server_indicator_with_remote_authority(Some(&session), Some(&authority)),
-            sidebar::ServerIndicatorState::Ready
+            sidebar::ServerIndicatorState::Unknown,
+            "a complete wire-shaped DTO without a host proof must not render Ready"
         );
     }
 
@@ -21197,6 +21198,7 @@ mod tests {
                 pid: 4242,
                 creation_time_100ns: 42_420_000,
                 executable_proven: true,
+                executable_fingerprint: None,
             }],
             session_id: None,
             root: None,
@@ -21206,6 +21208,7 @@ mod tests {
             observed_at_epoch_ms: now,
             freshness_deadline_epoch_ms: now + remote::REMOTE_PORT_AUTHORITY_MAX_AGE_MS,
             managed_fence_fingerprint: Some(42),
+            verified: None,
             error: None,
         };
 
@@ -21219,10 +21222,12 @@ mod tests {
             pid: 4242,
             creation_time_100ns: 42_420_000,
             executable_proven: true,
+            executable_fingerprint: None,
         });
         assert_eq!(
             remote_port_ui_authority(Some(&authority), Some(&session)),
-            Some(PortUiAuthority::Managed)
+            Some(PortUiAuthority::Unknown),
+            "a complete wire-shaped DTO without a host proof must not render Managed"
         );
     }
 

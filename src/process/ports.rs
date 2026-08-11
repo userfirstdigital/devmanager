@@ -60,7 +60,6 @@ pub enum PortScanError {
     Shutdown,
     TooManyPorts { actual: usize, max: usize },
     QueueFull { actual: usize, max: usize },
-    QuarantineFull { max: usize },
     Scan(String),
 }
 
@@ -79,10 +78,6 @@ impl fmt::Display for PortScanError {
             Self::QueueFull { actual, max } => write!(
                 formatter,
                 "port inventory has {actual} queued requests; maximum is {max}"
-            ),
-            Self::QuarantineFull { max } => write!(
-                formatter,
-                "port inventory is temporarily unavailable: maximum of {max} timed-out scans is still draining"
             ),
             Self::Scan(detail) => write!(
                 formatter,
@@ -649,15 +644,21 @@ impl PortInventorySnapshot {
     /// with the same publication sequence is not independent evidence and a
     /// changed endpoint/identity set must never settle ownership or
     /// externality.
-    pub fn same_authoritative_listener_snapshot(&self, other: &Self, now: Instant) -> bool {
-        self.is_valid()
+    pub fn same_authoritative_listener_snapshot(
+        &self,
+        other: &Self,
+        observation_time: Instant,
+        deadline: Instant,
+    ) -> bool {
+        observation_time <= deadline
+            && self.is_valid()
             && other.is_valid()
             && self.is_exactly_for(other.requested_ports())
             && self.publication_sequence > 0
             && other.publication_sequence > 0
             && self.publication_sequence != other.publication_sequence
-            && self.is_fresh_at(now, DEFAULT_FREE_PROOF_MAX_AGE)
-            && other.is_fresh_at(now, DEFAULT_FREE_PROOF_MAX_AGE)
+            && self.is_fresh_at(observation_time, DEFAULT_FREE_PROOF_MAX_AGE)
+            && other.is_fresh_at(observation_time, DEFAULT_FREE_PROOF_MAX_AGE)
             && self.observations == other.observations
             && self.endpoints == other.endpoints
             && self.issues == other.issues
@@ -960,9 +961,15 @@ impl ManagedResourceSnapshot {
     /// separately; the fence, lifecycle, member identities, and registry
     /// observation sequence must remain the same before ownership or
     /// externality can be projected.
-    pub fn same_authoritative_membership(&self, other: &Self) -> bool {
-        self.is_fresh_at(Instant::now())
-            && other.is_fresh_at(Instant::now())
+    pub fn same_authoritative_membership(
+        &self,
+        other: &Self,
+        observation_time: Instant,
+        deadline: Instant,
+    ) -> bool {
+        observation_time <= deadline
+            && self.is_fresh_at(observation_time)
+            && other.is_fresh_at(observation_time)
             && self.fence == other.fence
             && self.state == other.state
             && self.members == other.members
@@ -1237,7 +1244,7 @@ pub fn classify_port_authority_from_snapshot_with_membership_reconciliation_at(
 ) -> PortAuthority {
     let membership_agrees = match (managed, reconciled_managed) {
         (None, None) => true,
-        (Some(first), Some(second)) => first.same_authoritative_membership(second),
+        (Some(first), Some(second)) => first.same_authoritative_membership(second, now, deadline),
         (None, Some(_)) | (Some(_), None) => false,
     };
     if !membership_agrees {
@@ -1259,7 +1266,7 @@ pub fn classify_port_authority_from_two_snapshots_at(
     now: Instant,
     deadline: Instant,
 ) -> PortAuthority {
-    if !first.same_authoritative_listener_snapshot(second, now) {
+    if !first.same_authoritative_listener_snapshot(second, now, deadline) {
         return PortAuthority::Unknown;
     }
     classify_port_authority_from_snapshot_with_membership_reconciliation_at(
@@ -1516,7 +1523,7 @@ pub fn project_port_status_from_snapshot_with_membership_reconciliation_at(
 ) -> PortStatus {
     let membership_agrees = match (managed, reconciled_managed) {
         (None, None) => true,
-        (Some(first), Some(second)) => first.same_authoritative_membership(second),
+        (Some(first), Some(second)) => first.same_authoritative_membership(second, now, deadline),
         (None, Some(_)) | (Some(_), None) => false,
     };
     if !membership_agrees {
@@ -1822,7 +1829,14 @@ mod authority_tests {
             vec![root.clone()],
             RegistryMembershipSnapshot::stale(7, 11, Instant::now() - Duration::from_secs(60)),
         );
-        assert!(!first.same_authoritative_membership(&second));
+        let observation_time = Instant::now();
+        let deadline = observation_time + DEFAULT_MEMBERSHIP_MAX_AGE;
+        assert!(!first.same_authoritative_membership(&second, observation_time, deadline));
+        assert!(!first.same_authoritative_membership(
+            &first,
+            observation_time,
+            observation_time - Duration::from_millis(1),
+        ));
 
         let identity = listener(42, 10);
         let snapshot = PortInventorySnapshot::from_parts(
@@ -1869,7 +1883,13 @@ mod authority_tests {
             now,
         )
         .with_publication_sequence(2);
-        assert!(!first.same_authoritative_listener_snapshot(&changed, now));
+        let deadline = now + DEFAULT_FREE_PROOF_MAX_AGE;
+        assert!(!first.same_authoritative_listener_snapshot(&changed, now, deadline));
+        assert!(!first.same_authoritative_listener_snapshot(
+            &first,
+            now,
+            now - Duration::from_millis(1),
+        ));
 
         let stale = PortInventorySnapshot::from_parts(
             BTreeMap::from([(port, PortObservation::from_listeners(vec![first_listener]))]),
@@ -1878,6 +1898,6 @@ mod authority_tests {
             now - Duration::from_secs(60),
         )
         .with_publication_sequence(3);
-        assert!(!first.same_authoritative_listener_snapshot(&stale, now));
+        assert!(!first.same_authoritative_listener_snapshot(&stale, now, deadline));
     }
 }

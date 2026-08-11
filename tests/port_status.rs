@@ -25,7 +25,7 @@ use devmanager::process::registry::{
 };
 use devmanager::services::ports_service::{
     legacy_statuses_from_snapshot, scan_listener_inventory, scan_listener_inventory_with,
-    PortInventory,
+    scan_listener_inventory_with_deadline, PortInventory,
 };
 
 fn fixed_uuid_v7(tail: u8) -> [u8; 16] {
@@ -1001,6 +1001,27 @@ fn listener_table_change_after_identity_capture_is_a_reconciliation_fault() {
         ensure_managed_start_allowed(&snapshot, port),
         Err(PortStartError::ProbeFailed { port: observed, .. }) if observed == port
     ));
+}
+
+#[test]
+fn listener_scan_rejects_an_observation_that_crosses_its_caller_deadline() {
+    let port = 43_005;
+    let observation_time = Instant::now();
+    let deadline = observation_time + Duration::from_millis(10);
+    let result = scan_listener_inventory_with_deadline(
+        &[port],
+        |_| {
+            thread::sleep(Duration::from_millis(25));
+            Ok(BTreeMap::new())
+        },
+        |_| unreachable!("no listener rows should be captured after the deadline"),
+        observation_time,
+        deadline,
+    );
+
+    assert!(result
+        .expect_err("a late listener publication must be rejected")
+        .contains("deadline expired"));
 }
 
 #[test]
