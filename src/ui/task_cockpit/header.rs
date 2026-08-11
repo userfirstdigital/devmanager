@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
 
+use serde::de::{self, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -41,6 +42,9 @@ const MAX_PROVIDER_SCALARS: usize = 64;
 const MAX_ACCESSIBLE_SCALARS: usize = 512;
 const MAX_SOURCE_SCALARS: usize = 128;
 const MAX_DETAIL_SCALARS: usize = 128;
+const MAX_WORKSPACE_PATH_SCALARS: usize = 512;
+const MAX_TITLE_SINGLE_LINE_SCALARS: usize = 96;
+const MAX_TITLE_LINE_SCALARS: usize = 28;
 
 /// A bounded opaque reference for provider conversation identity.
 ///
@@ -193,6 +197,9 @@ pub enum HeaderFieldKey {
         agent_id: AgentSessionId,
         field: AgentResourceField,
     },
+    HostResource {
+        field: AgentResourceField,
+    },
     Quota {
         provider: String,
         provider_session_ref: OpaqueProviderSessionRef,
@@ -217,6 +224,10 @@ impl fmt::Debug for HeaderFieldKey {
             Self::AgentProvider { .. } => formatter.write_str("AgentProvider([redacted])"),
             Self::AgentResource { field, .. } => formatter
                 .debug_struct("AgentResource")
+                .field("field", field)
+                .finish(),
+            Self::HostResource { field } => formatter
+                .debug_struct("HostResource")
                 .field("field", field)
                 .finish(),
             Self::Quota { .. } => formatter.write_str("Quota([redacted])"),
@@ -314,6 +325,9 @@ impl HeaderHighWaterLedger {
         if generation == 0 || observed_at_ms < 0 {
             return HighWaterDecision::RejectedInvalid;
         }
+        let Some(key) = bounded_header_key(&key) else {
+            return HighWaterDecision::RejectedInvalid;
+        };
         self.expire(observed_at_ms);
 
         if let Some(floor) = self.floors.get(&key).copied() {
@@ -419,11 +433,15 @@ impl HeaderHighWaterLedger {
             return HighWaterDecision::RejectedInvalid;
         }
         let mut bounded = Vec::with_capacity(self.capacity.min(64));
-        for observation in observations {
+        for mut observation in observations {
             if bounded.len() >= self.capacity {
                 self.needs_full_resync = true;
                 return HighWaterDecision::RejectedCapacity;
             }
+            let Some(key) = bounded_header_key(&observation.key) else {
+                return HighWaterDecision::RejectedInvalid;
+            };
+            observation.key = key;
             if observation.generation != generation || observation.observed_at_ms < 0 {
                 return HighWaterDecision::RejectedInvalid;
             }
@@ -445,7 +463,25 @@ impl HeaderHighWaterLedger {
         candidate.needs_full_resync = false;
 
         for observation in bounded {
-            if let Some(floor) = prior_floors.get(&observation.key).copied() {
+            if let Some(floor) = candidate.floors.get(&observation.key).copied() {
+                match compare_stamp(
+                    observation.generation,
+                    observation.revision,
+                    floor.generation,
+                    floor.revision,
+                ) {
+                    std::cmp::Ordering::Less => continue,
+                    std::cmp::Ordering::Equal => {
+                        if floor.fingerprint != observation.fingerprint
+                            || floor.removed != observation.removed
+                        {
+                            return HighWaterDecision::RejectedConflict;
+                        }
+                        continue;
+                    }
+                    std::cmp::Ordering::Greater => {}
+                }
+            } else if let Some(floor) = prior_floors.get(&observation.key).copied() {
                 match compare_stamp(
                     observation.generation,
                     observation.revision,
@@ -468,7 +504,22 @@ impl HeaderHighWaterLedger {
                     }
                     std::cmp::Ordering::Greater => {}
                 }
-            } else if candidate.floors.len() >= candidate.capacity {
+            } else if let Some(retirement_floor) = candidate.retirement_floor {
+                match compare_stamp(
+                    observation.generation,
+                    observation.revision,
+                    retirement_floor.generation,
+                    retirement_floor.revision,
+                ) {
+                    std::cmp::Ordering::Less | std::cmp::Ordering::Equal => {
+                        return HighWaterDecision::IgnoredStale;
+                    }
+                    std::cmp::Ordering::Greater => {}
+                }
+            }
+            if !candidate.floors.contains_key(&observation.key)
+                && candidate.floors.len() >= candidate.capacity
+            {
                 candidate.needs_full_resync = true;
                 return HighWaterDecision::RejectedCapacity;
             }
@@ -598,6 +649,60 @@ fn compare_stamp(
         .then_with(|| left_revision.cmp(&right_revision))
 }
 
+fn bounded_key_text(value: &str, max_scalars: usize) -> Option<String> {
+    if value.trim().is_empty() || value.chars().count() > max_scalars {
+        return None;
+    }
+    Some(value.to_owned())
+}
+
+fn bounded_header_key(key: &HeaderFieldKey) -> Option<HeaderFieldKey> {
+    Some(match key {
+        HeaderFieldKey::Host { source_id } => HeaderFieldKey::Host {
+            source_id: bounded_key_text(source_id, MAX_SOURCE_SCALARS)?,
+        },
+        HeaderFieldKey::Connect { source_id } => HeaderFieldKey::Connect {
+            source_id: bounded_key_text(source_id, MAX_SOURCE_SCALARS)?,
+        },
+        HeaderFieldKey::Update { source_id } => HeaderFieldKey::Update {
+            source_id: bounded_key_text(source_id, MAX_SOURCE_SCALARS)?,
+        },
+        HeaderFieldKey::Resource { resource_id, field } => HeaderFieldKey::Resource {
+            resource_id: *resource_id,
+            field: *field,
+        },
+        HeaderFieldKey::Task(task_id) => HeaderFieldKey::Task(*task_id),
+        HeaderFieldKey::Agent { task_id, agent_id } => HeaderFieldKey::Agent {
+            task_id: *task_id,
+            agent_id: *agent_id,
+        },
+        HeaderFieldKey::AgentProvider { task_id, agent_id } => HeaderFieldKey::AgentProvider {
+            task_id: *task_id,
+            agent_id: *agent_id,
+        },
+        HeaderFieldKey::AgentResource {
+            task_id,
+            agent_id,
+            field,
+        } => HeaderFieldKey::AgentResource {
+            task_id: *task_id,
+            agent_id: *agent_id,
+            field: *field,
+        },
+        HeaderFieldKey::HostResource { field } => HeaderFieldKey::HostResource { field: *field },
+        HeaderFieldKey::Quota {
+            provider,
+            provider_session_ref,
+        } => HeaderFieldKey::Quota {
+            provider: bounded_key_text(provider, MAX_PROVIDER_SCALARS)?,
+            provider_session_ref: *provider_session_ref,
+        },
+        HeaderFieldKey::Remote { source_id } => HeaderFieldKey::Remote {
+            source_id: bounded_key_text(source_id, MAX_SOURCE_SCALARS)?,
+        },
+    })
+}
+
 // -------------------------------------------------------------------------
 // Bounded specialist retention and keyset windows
 
@@ -684,6 +789,10 @@ pub struct SpecialistProjection {
     total_seen: usize,
     scanned: usize,
     removals_truncated: bool,
+    overflowed: bool,
+    source_available: bool,
+    unique_count_exact: bool,
+    conflicts_rejected: usize,
 }
 
 impl SpecialistProjection {
@@ -698,29 +807,124 @@ impl SpecialistProjection {
     where
         I: IntoIterator<Item = AgentObservation<'a>>,
     {
+        Self::from_iter_with_source(observations, true)
+    }
+
+    /// The source flag is explicit because an empty page and an unavailable
+    /// page are different states.  A caller must not turn a transport failure
+    /// into an apparently empty specialist list.
+    pub fn from_iter_with_source<'a, I>(observations: I, source_available: bool) -> Self
+    where
+        I: IntoIterator<Item = AgentObservation<'a>>,
+    {
         let mut candidates: BTreeMap<AgentSessionId, AgentProjection> = BTreeMap::new();
         let mut largest_ids = BinaryHeap::new();
         let mut removed = BTreeSet::new();
+        let mut watermarks: BTreeMap<AgentSessionId, AgentWaterMark> = BTreeMap::new();
+        let mut seen_ids = BTreeSet::new();
         let mut total_seen = 0_usize;
         let mut scanned = 0_usize;
         let mut removals_truncated = false;
+        let mut overflowed = false;
+        let mut source_available = source_available;
+        let mut unique_count_exact = true;
+        let mut conflicts_rejected = 0_usize;
+        let mut last_id = None;
+        let mut ordered = true;
 
         for observation in observations {
             scanned = scanned.saturating_add(1);
+            let previous_id = last_id;
+            if previous_id.is_some_and(|last| observation.id < last) {
+                ordered = false;
+            }
+            last_id = Some(observation.id);
+
+            if previous_id == Some(observation.id) || seen_ids.contains(&observation.id) {
+                // The bounded set covers the IDs that can affect the retained
+                // window.  IDs beyond it remain countable when the source is
+                // already in stable key order.
+            } else if seen_ids.len() < MAX_HEADER_SPECIALISTS {
+                seen_ids.insert(observation.id);
+                total_seen = total_seen.saturating_add(1);
+            } else if ordered {
+                // A monotonic keyset stream proves this is a new identity
+                // without retaining all 100k keys.
+                total_seen = total_seen.saturating_add(1);
+            } else {
+                // Keep scanning without retaining the entire unordered key
+                // set.  The count remains useful for a normal unique source,
+                // while the exactness bit makes duplicate ambiguity explicit.
+                overflowed = true;
+                unique_count_exact = false;
+                total_seen = total_seen.saturating_add(1);
+            }
+            if total_seen > MAX_HEADER_SPECIALISTS {
+                overflowed = true;
+            }
+
+            let fingerprint = agent_observation_fingerprint(observation);
+            if let Some(previous) = watermarks.get(&observation.id).copied() {
+                match compare_stamp(
+                    observation.runtime_generation,
+                    observation.revision,
+                    previous.runtime_generation,
+                    previous.revision,
+                ) {
+                    std::cmp::Ordering::Less => continue,
+                    std::cmp::Ordering::Equal => {
+                        if previous.fingerprint != fingerprint
+                            || previous.removed != observation.removed
+                        {
+                            conflicts_rejected = conflicts_rejected.saturating_add(1);
+                            source_available = false;
+                            candidates.remove(&observation.id);
+                            removed.remove(&observation.id);
+                        }
+                        continue;
+                    }
+                    std::cmp::Ordering::Greater => {}
+                }
+            }
+
             if observation.removed {
                 if removed.len() < MAX_HEADER_SPECIALISTS || removed.contains(&observation.id) {
                     removed.insert(observation.id);
                 } else {
                     removals_truncated = true;
+                    overflowed = true;
                 }
                 candidates.remove(&observation.id);
+                if watermarks.len() < MAX_HEADER_SPECIALISTS
+                    || watermarks.contains_key(&observation.id)
+                {
+                    watermarks.insert(
+                        observation.id,
+                        AgentWaterMark {
+                            runtime_generation: observation.runtime_generation,
+                            revision: observation.revision,
+                            fingerprint,
+                            removed: true,
+                        },
+                    );
+                } else {
+                    overflowed = true;
+                }
                 continue;
             }
-            total_seen = total_seen.saturating_add(1);
             removed.remove(&observation.id);
             let candidate = AgentProjection::from_observation(observation);
             if candidates.contains_key(&observation.id) {
                 candidates.insert(observation.id, candidate);
+                watermarks.insert(
+                    observation.id,
+                    AgentWaterMark {
+                        runtime_generation: observation.runtime_generation,
+                        revision: observation.revision,
+                        fingerprint,
+                        removed: false,
+                    },
+                );
                 continue;
             }
             while largest_ids
@@ -732,12 +936,31 @@ impl SpecialistProjection {
             if candidates.len() < MAX_HEADER_SPECIALISTS {
                 largest_ids.push(observation.id);
                 candidates.insert(observation.id, candidate);
+                watermarks.insert(
+                    observation.id,
+                    AgentWaterMark {
+                        runtime_generation: observation.runtime_generation,
+                        revision: observation.revision,
+                        fingerprint,
+                        removed: false,
+                    },
+                );
             } else if let Some(&largest) = largest_ids.peek() {
                 if observation.id < largest {
                     largest_ids.pop();
                     candidates.remove(&largest);
+                    watermarks.remove(&largest);
                     largest_ids.push(observation.id);
                     candidates.insert(observation.id, candidate);
+                    watermarks.insert(
+                        observation.id,
+                        AgentWaterMark {
+                            runtime_generation: observation.runtime_generation,
+                            revision: observation.revision,
+                            fingerprint,
+                            removed: false,
+                        },
+                    );
                 }
             }
         }
@@ -753,6 +976,10 @@ impl SpecialistProjection {
             total_seen,
             scanned,
             removals_truncated,
+            overflowed,
+            source_available,
+            unique_count_exact,
+            conflicts_rejected,
         }
     }
 
@@ -761,6 +988,10 @@ impl SpecialistProjection {
     }
 
     pub fn total_seen(&self) -> usize {
+        self.total_seen
+    }
+
+    pub fn unique_count(&self) -> usize {
         self.total_seen
     }
 
@@ -774,6 +1005,22 @@ impl SpecialistProjection {
 
     pub fn removals_truncated(&self) -> bool {
         self.removals_truncated
+    }
+
+    pub fn overflowed(&self) -> bool {
+        self.overflowed
+    }
+
+    pub fn source_available(&self) -> bool {
+        self.source_available
+    }
+
+    pub fn unique_count_exact(&self) -> bool {
+        self.unique_count_exact
+    }
+
+    pub fn conflicts_rejected(&self) -> usize {
+        self.conflicts_rejected
     }
 
     /// Return a bounded exclusive keyset window.  Adding or relabelling an
@@ -803,6 +1050,44 @@ impl SpecialistProjection {
             removed_ids: self.removed_ids.clone(),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AgentWaterMark {
+    runtime_generation: u64,
+    revision: u64,
+    fingerprint: u64,
+    removed: bool,
+}
+
+fn agent_observation_fingerprint(observation: AgentObservation<'_>) -> u64 {
+    let mut hasher = Sha256::new();
+    hasher.update(observation.id.as_bytes());
+    hasher.update(observation.task_id.as_bytes());
+    hasher.update(observation.label.as_bytes());
+    hasher.update(observation.provider.as_bytes());
+    if let Some(session) = observation.provider_session_id {
+        // Session refs are opaque and size-checked before they are retained;
+        // the raw value is only fed into the digest and never formatted.
+        if let Ok(reference) = OpaqueProviderSessionRef::try_from_raw(session) {
+            hasher.update(reference.as_digest());
+        } else {
+            hasher.update([0_u8; 16]);
+        }
+    }
+    hasher.update([match observation.lifecycle {
+        AgentSessionLifecycle::Open => 0,
+        AgentSessionLifecycle::Closing => 1,
+        AgentSessionLifecycle::Closed => 2,
+    }]);
+    hasher.update(observation.runtime_generation.to_be_bytes());
+    hasher.update(observation.revision.to_be_bytes());
+    hasher.update([u8::from(observation.removed)]);
+    u64::from_be_bytes(
+        hasher.finalize()[..8]
+            .try_into()
+            .expect("fixed digest prefix"),
+    )
 }
 
 // -------------------------------------------------------------------------
@@ -861,11 +1146,14 @@ impl ProjectedAction {
         )
     }
 
-    pub fn task_rename(identity: TaskIdentity, title: impl Into<String>) -> Self {
+    pub fn task_rename(identity: TaskIdentity, title: impl AsRef<str>) -> Self {
         Self::new(
             ActionRequest::TaskRename(TaskRenameArguments {
                 task_id: identity.task_id,
-                title: title.into(),
+                // Bound the borrowed caller text before creating the owned
+                // action payload.  This is the only public constructor that
+                // accepts untrusted rename text directly.
+                title: presentation_text(title.as_ref(), MAX_LABEL_SCALARS),
             }),
             ActionTarget::Task(identity),
         )
@@ -1019,6 +1307,7 @@ pub enum RemoteHealth {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostObservationIdentity {
+    #[serde(deserialize_with = "deserialize_source_string")]
     pub host_id: String,
     pub revision: u64,
 }
@@ -1035,6 +1324,7 @@ pub struct HostObservation {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConnectObservation {
+    #[serde(deserialize_with = "deserialize_source_string")]
     pub host_id: String,
     pub state: ConnectState,
     pub revision: u64,
@@ -1045,6 +1335,7 @@ pub struct ConnectObservation {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateObservation {
+    #[serde(deserialize_with = "deserialize_source_string")]
     pub source_id: String,
     pub state: UpdateState,
     pub revision: u64,
@@ -1055,6 +1346,7 @@ pub struct UpdateObservation {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RemoteObservationIdentity {
+    #[serde(deserialize_with = "deserialize_source_string")]
     pub source_id: String,
     pub revision: u64,
 }
@@ -1064,6 +1356,7 @@ pub struct RemoteObservationIdentity {
 pub struct RemoteObservation {
     pub identity: RemoteObservationIdentity,
     pub health: RemoteHealth,
+    #[serde(deserialize_with = "deserialize_label_string")]
     pub label: String,
     pub observed_at_ms: Option<i64>,
     pub generation: Option<u64>,
@@ -1094,6 +1387,7 @@ impl RemoteObservation {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QuotaObservationIdentity {
+    #[serde(deserialize_with = "deserialize_provider_string")]
     pub provider: String,
     /// Deliberately opaque: this field cannot deserialize a raw provider
     /// conversation id.
@@ -1149,6 +1443,7 @@ impl<'de> Deserialize<'de> for QuotaObservation {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Identity {
+            #[serde(deserialize_with = "deserialize_provider_string")]
             provider: String,
             provider_session_ref: OpaqueProviderSessionRef,
             observation_id: u64,
@@ -1157,6 +1452,7 @@ impl<'de> Deserialize<'de> for QuotaObservation {
         #[serde(deny_unknown_fields)]
         struct Wire {
             identity: Identity,
+            #[serde(deserialize_with = "deserialize_detail_string")]
             detail: String,
             observed_at_ms: Option<i64>,
             generation: Option<u64>,
@@ -1183,6 +1479,115 @@ impl<'de> Deserialize<'de> for QuotaObservation {
             revision: wire.revision,
         })
     }
+}
+
+fn deserialize_bounded_string<'de, D>(
+    deserializer: D,
+    field: &'static str,
+    max_scalars: usize,
+) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct BoundedTextVisitor {
+        field: &'static str,
+        max_scalars: usize,
+    }
+
+    impl<'de> Visitor<'de> for BoundedTextVisitor {
+        type Value = String;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(formatter, "a bounded {} string", self.field)
+        }
+
+        fn visit_borrowed_str<E>(self, value: &'de str) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            self.visit_str(value)
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            validate_bounded_wire(self.field, value, self.max_scalars).map_err(E::custom)?;
+            Ok(value.to_owned())
+        }
+
+        fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            validate_bounded_wire(self.field, &value, self.max_scalars).map_err(E::custom)?;
+            Ok(value)
+        }
+    }
+
+    deserializer.deserialize_str(BoundedTextVisitor { field, max_scalars })
+}
+
+fn deserialize_source_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_bounded_string(deserializer, "source", MAX_SOURCE_SCALARS)
+}
+
+fn deserialize_provider_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_bounded_string(deserializer, "provider", MAX_PROVIDER_SCALARS)
+}
+
+fn deserialize_detail_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_bounded_string(deserializer, "detail", MAX_DETAIL_SCALARS)
+}
+
+fn deserialize_label_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_bounded_string(deserializer, "label", MAX_LABEL_SCALARS)
+}
+
+fn deserialize_bounded_quotas<'de, D>(deserializer: D) -> Result<Vec<QuotaObservation>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct QuotasVisitor;
+
+    impl<'de> Visitor<'de> for QuotasVisitor {
+        type Value = Vec<QuotaObservation>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a bounded quota sequence")
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut quotas = Vec::with_capacity(MAX_TOP_BAR_QUOTA_CACHE);
+            while let Some(quota) = sequence.next_element::<QuotaObservation>()? {
+                if quotas.len() >= MAX_TOP_BAR_QUOTA_CACHE {
+                    return Err(de::Error::custom(format!(
+                        "quota count exceeds {}",
+                        MAX_TOP_BAR_QUOTA_CACHE
+                    )));
+                }
+                quotas.push(quota);
+            }
+            Ok(quotas)
+        }
+    }
+
+    deserializer.deserialize_seq(QuotasVisitor)
 }
 
 fn validate_bounded_wire(
@@ -1262,6 +1667,7 @@ pub struct TopBarProjectionInput {
     pub remote: Option<RemoteObservation>,
     /// The host-owned adapter supplies this one list.  No app-level quota
     /// poller is consulted by this component.
+    #[serde(deserialize_with = "deserialize_bounded_quotas")]
     pub quotas: Vec<QuotaObservation>,
     pub resources: Option<HostResourceObservation>,
 }
@@ -1286,6 +1692,7 @@ pub enum TopBarProjectionError {
     InvalidNow,
     InvalidGeneration,
     TooManyQuotas { actual: usize, max: usize },
+    QuotaConflict,
 }
 
 impl fmt::Display for TopBarProjectionError {
@@ -1296,6 +1703,7 @@ impl fmt::Display for TopBarProjectionError {
             Self::TooManyQuotas { actual, max } => {
                 write!(formatter, "quota count {actual} exceeds bound {max}")
             }
+            Self::QuotaConflict => formatter.write_str("equal-stamp quota observations conflict"),
         }
     }
 }
@@ -1367,6 +1775,7 @@ pub struct TopBarModel {
     pub remote: Option<RemoteProjection>,
     pub quotas: Vec<QuotaProjection>,
     pub quota_hidden_count: usize,
+    pub quota_overflow_count: usize,
     pub quotas_truncated: bool,
     pub quota_overflow_action: Option<TopBarAction>,
     pub resources: Option<ResourceProjection>,
@@ -1383,6 +1792,7 @@ impl TopBarModel {
             remote: None,
             quotas: Vec::new(),
             quota_hidden_count: 0,
+            quota_overflow_count: 0,
             quotas_truncated: false,
             quota_overflow_action: None,
             resources: None,
@@ -1419,6 +1829,7 @@ impl TopBarModel {
                 input.generation,
                 observation.observed_at_ms,
                 observation.generation,
+                observation.identity.revision,
             )
             .map(|stamp| status_link(TopBarStatus::Host(observation.health), "Host", stamp))
         });
@@ -1428,6 +1839,7 @@ impl TopBarModel {
                 input.generation,
                 observation.observed_at_ms,
                 observation.generation,
+                observation.revision,
             )
             .map(|stamp| {
                 status_link(
@@ -1443,6 +1855,7 @@ impl TopBarModel {
                 input.generation,
                 observation.observed_at_ms,
                 observation.generation,
+                observation.revision,
             )
             .map(|stamp| status_link(TopBarStatus::Update(observation.state), "Updates", stamp))
         });
@@ -1452,23 +1865,20 @@ impl TopBarModel {
                 input.generation,
                 observation.observed_at_ms,
                 observation.generation,
+                observation.identity.revision,
             )
             .map(|stamp| {
                 let source_id = bounded_label(&observation.identity.source_id, MAX_SOURCE_SCALARS);
                 let label = bounded_label(&observation.label, MAX_LABEL_SCALARS);
-                let mut accessible_description = String::with_capacity(32 + label.len());
-                accessible_description.push_str("Remote ");
-                accessible_description.push_str(&label);
-                accessible_description.push_str(match observation.health {
-                    RemoteHealth::Healthy => " is healthy.",
-                    RemoteHealth::Degraded => " is degraded.",
-                    RemoteHealth::Unavailable => " is unavailable.",
-                });
+                let accessible_description = format!(
+                    "Remote {label} is {}.",
+                    remote_health_label(observation.health)
+                );
                 RemoteProjection {
                     source_id,
                     health: observation.health,
                     label,
-                    age_ms: stamp.observed_at_ms,
+                    age_ms: stamp.age_ms(input.now_ms),
                     role: AccessibleRole::Status,
                     focusable: false,
                     accessible_description: presentation_text(
@@ -1487,6 +1897,7 @@ impl TopBarModel {
                 input.generation,
                 observation.observed_at_ms,
                 observation.generation,
+                observation.revision,
             ) else {
                 continue;
             };
@@ -1494,17 +1905,22 @@ impl TopBarModel {
                 bounded_label(&observation.identity.provider, MAX_PROVIDER_SCALARS),
                 observation.identity.provider_session_ref,
             );
-            let replace = selected.get(&key).is_none_or(|current| {
-                (
-                    observation.generation.unwrap_or_default(),
-                    observation.revision,
-                    stamp.observed_at_ms,
-                ) > (
-                    current.generation.unwrap_or_default(),
-                    current.revision,
-                    current.observed_at_ms.unwrap_or_default(),
-                )
-            });
+            let replace = match selected.get(&key) {
+                None => true,
+                Some(current) => {
+                    let current_stamp = quota_stamp_for(current).expect("selected quota is fresh");
+                    match compare_observation_stamps(stamp, current_stamp) {
+                        std::cmp::Ordering::Greater => true,
+                        std::cmp::Ordering::Less => false,
+                        std::cmp::Ordering::Equal => {
+                            if quota_fingerprint(observation) != quota_fingerprint(current) {
+                                return Err(TopBarProjectionError::QuotaConflict);
+                            }
+                            false
+                        }
+                    }
+                }
+            };
             if replace {
                 selected.insert(key, sanitize_quota_observation(observation));
             }
@@ -1521,32 +1937,25 @@ impl TopBarModel {
                 })
         });
         let quota_hidden_count = quota_values.len().saturating_sub(MAX_TOP_BAR_QUOTAS);
+        let quota_action_stamp = quota_values
+            .iter()
+            .filter_map(quota_stamp_for)
+            .max_by(|left, right| compare_observation_stamps(*left, *right));
         quota_values.truncate(MAX_TOP_BAR_QUOTAS);
-        let quota_stamp = ObservationStamp {
-            observed_at_ms: input.now_ms,
-            generation: input.generation,
-            revision: 0,
-        };
         let quotas = quota_values
             .into_iter()
             .filter_map(|observation| {
-                let age_ms = fresh(
-                    input.now_ms,
-                    input.generation,
-                    observation.observed_at_ms,
-                    observation.generation,
-                )?
-                .observed_at_ms;
+                let stamp = quota_stamp_for(&observation)?;
                 Some(QuotaProjection {
                     provider: bounded_label(&observation.identity.provider, MAX_PROVIDER_SCALARS),
                     provider_session_ref: observation.identity.provider_session_ref,
                     detail: bounded_label(&observation.detail, MAX_DETAIL_SCALARS),
-                    age_ms,
+                    age_ms: stamp.age_ms(input.now_ms),
                     role: AccessibleRole::Status,
                     focusable: false,
                     action: ProjectedAction::new(
                         ActionRequest::HostStatus,
-                        ActionTarget::Quota(quota_stamp),
+                        ActionTarget::Quota(stamp),
                     ),
                 })
             })
@@ -1558,67 +1967,44 @@ impl TopBarModel {
                 input.generation,
                 observation.observed_at_ms,
                 observation.generation,
+                observation.revision,
             )
             .map(|stamp| ResourceProjection {
-                cpu_percent: observation.cpu_percent,
+                cpu_percent: valid_cpu_percent(observation.cpu_percent),
                 memory_bytes: observation.memory_bytes,
-                age_ms: stamp.observed_at_ms,
+                age_ms: stamp.age_ms(input.now_ms),
             })
         });
 
         let mut unavailable = Vec::new();
-        if input.host.is_some() && host.is_none() {
+        if host.is_none() {
             unavailable.push(TopBarUnavailable::HostStatus);
         }
-        if input.connect.is_some() && connect.is_none() {
+        if connect.is_none() {
             unavailable.push(TopBarUnavailable::ConnectionStatus);
         }
-        if input.update.is_some() && update.is_none() {
+        if update.is_none() {
             unavailable.push(TopBarUnavailable::UpdateStatus);
         }
-        if input.remote.is_some() && remote.is_none() {
+        if remote.is_none() {
             unavailable.push(TopBarUnavailable::Remote);
         }
-        if !input.quotas.is_empty() && quotas.is_empty() {
+        if quotas.is_empty() {
             unavailable.push(TopBarUnavailable::Quota);
         }
-        if input
-            .resources
+        if resources
             .as_ref()
-            .is_some_and(|resource| resource.cpu_percent.is_some())
-            && resources
-                .as_ref()
-                .is_none_or(|resource| resource.cpu_percent.is_none())
+            .and_then(|resource| resource.cpu_percent)
+            .is_none()
         {
             unavailable.push(TopBarUnavailable::Cpu);
         }
-        if input
-            .resources
+        if resources
             .as_ref()
-            .is_some_and(|resource| resource.memory_bytes.is_some())
-            && resources
-                .as_ref()
-                .is_none_or(|resource| resource.memory_bytes.is_none())
+            .and_then(|resource| resource.memory_bytes)
+            .is_none()
         {
             unavailable.push(TopBarUnavailable::Memory);
-        }
-        if host.is_none()
-            && connect.is_none()
-            && update.is_none()
-            && remote.is_none()
-            && quotas.is_empty()
-            && resources.is_none()
-            && unavailable.is_empty()
-        {
-            unavailable.extend([
-                TopBarUnavailable::HostStatus,
-                TopBarUnavailable::ConnectionStatus,
-                TopBarUnavailable::UpdateStatus,
-                TopBarUnavailable::Remote,
-                TopBarUnavailable::Quota,
-                TopBarUnavailable::Cpu,
-                TopBarUnavailable::Memory,
-            ]);
         }
 
         let mut accessible = String::new();
@@ -1641,10 +2027,18 @@ impl TopBarModel {
                 .map(|remote| remote.accessible_description.as_str()),
         );
         for quota in &quotas {
-            append_accessible(
-                &mut accessible,
-                Some(&format!("{} quota: {}.", quota.provider, quota.detail)),
-            );
+            let description = format!("{} quota: {}.", quota.provider, quota.detail);
+            append_accessible(&mut accessible, Some(&description));
+        }
+        if let Some(resource) = resources.as_ref() {
+            let cpu = resource
+                .cpu_percent
+                .map_or_else(|| "unavailable".to_string(), |value| format!("{value:.1}%"));
+            let memory = resource
+                .memory_bytes
+                .map_or_else(|| "unavailable".to_string(), |value| value.to_string());
+            let description = format!("CPU {cpu}; memory {memory} bytes.");
+            append_accessible(&mut accessible, Some(&description));
         }
         if quota_hidden_count != 0 {
             append_accessible(
@@ -1652,26 +2046,29 @@ impl TopBarModel {
                 Some("Additional provider quotas are available in host status."),
             );
         }
+        for missing in &unavailable {
+            append_accessible(&mut accessible, Some(unavailable_description(*missing)));
+        }
         if accessible.is_empty() {
-            accessible = "Host, connection, update, remote, resource, and quota observations are unavailable.".to_string();
+            accessible = "Top-bar observations are unavailable.".to_string();
         }
 
-        Some(Self {
+        Ok(Self {
             host,
             connect,
             update,
             remote,
             quotas,
             quota_hidden_count,
+            quota_overflow_count: 0,
             quotas_truncated: quota_hidden_count != 0,
-            quota_overflow_action: (quota_hidden_count != 0).then(|| {
-                ProjectedAction::new(ActionRequest::HostStatus, ActionTarget::Quota(quota_stamp))
+            quota_overflow_action: quota_action_stamp.map(|stamp| {
+                ProjectedAction::new(ActionRequest::HostStatus, ActionTarget::Quota(stamp))
             }),
             resources,
             unavailable,
             accessible_description: presentation_text(&accessible, MAX_ACCESSIBLE_SCALARS),
         })
-        .ok_or(TopBarProjectionError::InvalidGeneration)
     }
 
     pub fn from_input(input: &TopBarProjectionInput) -> Self {
@@ -1686,17 +2083,23 @@ impl TopBarModel {
 pub struct TopBarProjectionController {
     input: TopBarProjectionInput,
     high_water: HeaderHighWaterLedger,
+    quota_overflow_count: usize,
 }
 
 impl TopBarProjectionController {
     pub fn new(input: TopBarProjectionInput) -> Self {
-        Self {
+        let quota_overflow_count = input.quotas.len().saturating_sub(MAX_TOP_BAR_QUOTA_CACHE);
+        let input = normalize_top_bar_input(input);
+        let mut controller = Self {
             input,
             high_water: HeaderHighWaterLedger::new(
                 MAX_HEADER_HIGH_WATER_ENTRIES,
                 HEADER_HIGH_WATER_TTL_MS,
             ),
-        }
+            quota_overflow_count,
+        };
+        controller.seed_high_water();
+        controller
     }
 
     pub fn input(&self) -> &TopBarProjectionInput {
@@ -1732,7 +2135,7 @@ impl TopBarProjectionController {
             generation,
             observation.revision,
             observed_at_ms,
-            observation.identity.observation_id,
+            quota_fingerprint(&observation),
             false,
         );
         if decision == HighWaterDecision::Accepted {
@@ -1741,6 +2144,139 @@ impl TopBarProjectionController {
                 .quotas
                 .retain(|current| !same_quota_identity(current, &sanitized));
             self.input.quotas.push(sanitized);
+        }
+        decision
+    }
+
+    pub fn observe_host(&mut self, observation: HostObservation) -> HighWaterDecision {
+        let Some(generation) = observation.generation else {
+            return HighWaterDecision::RejectedInvalid;
+        };
+        let Some(observed_at_ms) = observation.observed_at_ms else {
+            return HighWaterDecision::RejectedInvalid;
+        };
+        let source_id = bounded_label(&observation.identity.host_id, MAX_SOURCE_SCALARS);
+        let decision = self.high_water.observe(
+            HeaderFieldKey::Host {
+                source_id: source_id.clone(),
+            },
+            generation,
+            observation.identity.revision,
+            observed_at_ms,
+            host_fingerprint(&observation),
+            false,
+        );
+        if decision == HighWaterDecision::Accepted {
+            self.input.host = Some(HostObservation {
+                identity: HostObservationIdentity {
+                    host_id: source_id,
+                    revision: observation.identity.revision,
+                },
+                health: observation.health,
+                observed_at_ms: Some(observed_at_ms),
+                generation: Some(generation),
+            });
+        }
+        decision
+    }
+
+    pub fn observe_connect(&mut self, observation: ConnectObservation) -> HighWaterDecision {
+        let Some(generation) = observation.generation else {
+            return HighWaterDecision::RejectedInvalid;
+        };
+        let Some(observed_at_ms) = observation.observed_at_ms else {
+            return HighWaterDecision::RejectedInvalid;
+        };
+        let source_id = bounded_label(&observation.host_id, MAX_SOURCE_SCALARS);
+        let decision = self.high_water.observe(
+            HeaderFieldKey::Connect {
+                source_id: source_id.clone(),
+            },
+            generation,
+            observation.revision,
+            observed_at_ms,
+            connect_fingerprint(&observation),
+            false,
+        );
+        if decision == HighWaterDecision::Accepted {
+            self.input.connect = Some(ConnectObservation {
+                host_id: source_id,
+                state: observation.state,
+                revision: observation.revision,
+                observed_at_ms: Some(observed_at_ms),
+                generation: Some(generation),
+            });
+        }
+        decision
+    }
+
+    pub fn observe_update(&mut self, observation: UpdateObservation) -> HighWaterDecision {
+        let Some(generation) = observation.generation else {
+            return HighWaterDecision::RejectedInvalid;
+        };
+        let Some(observed_at_ms) = observation.observed_at_ms else {
+            return HighWaterDecision::RejectedInvalid;
+        };
+        let source_id = bounded_label(&observation.source_id, MAX_SOURCE_SCALARS);
+        let decision = self.high_water.observe(
+            HeaderFieldKey::Update {
+                source_id: source_id.clone(),
+            },
+            generation,
+            observation.revision,
+            observed_at_ms,
+            update_observation_fingerprint(&observation),
+            false,
+        );
+        if decision == HighWaterDecision::Accepted {
+            self.input.update = Some(UpdateObservation {
+                source_id,
+                state: observation.state,
+                revision: observation.revision,
+                observed_at_ms: Some(observed_at_ms),
+                generation: Some(generation),
+            });
+        }
+        decision
+    }
+
+    pub fn observe_resource(&mut self, observation: HostResourceObservation) -> HighWaterDecision {
+        let Some(generation) = observation.generation else {
+            return HighWaterDecision::RejectedInvalid;
+        };
+        let Some(observed_at_ms) = observation.observed_at_ms else {
+            return HighWaterDecision::RejectedInvalid;
+        };
+        let fingerprint = resource_fingerprint(&observation);
+        let cpu = self.high_water.observe(
+            HeaderFieldKey::HostResource {
+                field: AgentResourceField::Cpu,
+            },
+            generation,
+            observation.revision,
+            observed_at_ms,
+            fingerprint,
+            false,
+        );
+        let memory = self.high_water.observe(
+            HeaderFieldKey::HostResource {
+                field: AgentResourceField::Memory,
+            },
+            generation,
+            observation.revision,
+            observed_at_ms,
+            fingerprint,
+            false,
+        );
+        let decision = combine_high_water_decisions(cpu, memory);
+        if matches!(decision, HighWaterDecision::Accepted) {
+            self.input.resources = Some(HostResourceObservation {
+                cpu_percent: valid_cpu_percent(observation.cpu_percent),
+                memory_bytes: observation.memory_bytes,
+                revision: observation.revision,
+                observed_at_ms: Some(observed_at_ms),
+                generation: Some(generation),
+            });
         }
         decision
     }
@@ -1760,7 +2296,7 @@ impl TopBarProjectionController {
             generation,
             observation.identity.revision,
             observed_at_ms,
-            stable_text_fingerprint(&observation.label),
+            remote_fingerprint(&observation),
             false,
         );
         if decision == HighWaterDecision::Accepted {
@@ -1777,8 +2313,200 @@ impl TopBarProjectionController {
     }
 
     pub fn model(&self) -> TopBarModel {
-        TopBarModel::from_input(&self.input)
+        let mut model = TopBarModel::from_input(&self.input);
+        model.quota_overflow_count = self.quota_overflow_count;
+        if self.quota_overflow_count != 0 {
+            model.quota_hidden_count = model
+                .quota_hidden_count
+                .saturating_add(self.quota_overflow_count);
+            model.quotas_truncated = true;
+            if model.quota_overflow_action.is_none() {
+                model.quota_overflow_action =
+                    model.quotas.first().map(|quota| quota.action.clone());
+            }
+        }
+        model
     }
+
+    fn seed_high_water(&mut self) {
+        if let Some(host) = self.input.host.as_ref() {
+            if let (Some(generation), Some(observed_at_ms)) = (host.generation, host.observed_at_ms)
+            {
+                let _ = self.high_water.observe(
+                    HeaderFieldKey::Host {
+                        source_id: bounded_label(&host.identity.host_id, MAX_SOURCE_SCALARS),
+                    },
+                    generation,
+                    host.identity.revision,
+                    observed_at_ms,
+                    host_fingerprint(host),
+                    false,
+                );
+            }
+        }
+        if let Some(connect) = self.input.connect.as_ref() {
+            if let (Some(generation), Some(observed_at_ms)) =
+                (connect.generation, connect.observed_at_ms)
+            {
+                let _ = self.high_water.observe(
+                    HeaderFieldKey::Connect {
+                        source_id: bounded_label(&connect.host_id, MAX_SOURCE_SCALARS),
+                    },
+                    generation,
+                    connect.revision,
+                    observed_at_ms,
+                    connect_fingerprint(connect),
+                    false,
+                );
+            }
+        }
+        if let Some(update) = self.input.update.as_ref() {
+            if let (Some(generation), Some(observed_at_ms)) =
+                (update.generation, update.observed_at_ms)
+            {
+                let _ = self.high_water.observe(
+                    HeaderFieldKey::Update {
+                        source_id: bounded_label(&update.source_id, MAX_SOURCE_SCALARS),
+                    },
+                    generation,
+                    update.revision,
+                    observed_at_ms,
+                    update_observation_fingerprint(update),
+                    false,
+                );
+            }
+        }
+        if let Some(remote) = self.input.remote.as_ref() {
+            if let (Some(generation), Some(observed_at_ms)) =
+                (remote.generation, remote.observed_at_ms)
+            {
+                let _ = self.high_water.observe(
+                    HeaderFieldKey::Remote {
+                        source_id: bounded_label(&remote.identity.source_id, MAX_SOURCE_SCALARS),
+                    },
+                    generation,
+                    remote.identity.revision,
+                    observed_at_ms,
+                    remote_fingerprint(remote),
+                    false,
+                );
+            }
+        }
+        for quota in &self.input.quotas {
+            if let (Some(generation), Some(observed_at_ms)) =
+                (quota.generation, quota.observed_at_ms)
+            {
+                let _ = self.high_water.observe(
+                    HeaderFieldKey::Quota {
+                        provider: bounded_label(&quota.identity.provider, MAX_PROVIDER_SCALARS),
+                        provider_session_ref: quota.identity.provider_session_ref,
+                    },
+                    generation,
+                    quota.revision,
+                    observed_at_ms,
+                    quota_fingerprint(quota),
+                    false,
+                );
+            }
+        }
+        if let Some(resource) = self.input.resources.as_ref() {
+            if let (Some(generation), Some(observed_at_ms)) =
+                (resource.generation, resource.observed_at_ms)
+            {
+                let fingerprint = resource_fingerprint(resource);
+                for field in [AgentResourceField::Cpu, AgentResourceField::Memory] {
+                    let _ = self.high_water.observe(
+                        HeaderFieldKey::HostResource { field },
+                        generation,
+                        resource.revision,
+                        observed_at_ms,
+                        fingerprint,
+                        false,
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn normalize_top_bar_input(mut input: TopBarProjectionInput) -> TopBarProjectionInput {
+    input.host = input.host.map(|observation| HostObservation {
+        identity: HostObservationIdentity {
+            host_id: bounded_label(&observation.identity.host_id, MAX_SOURCE_SCALARS),
+            revision: observation.identity.revision,
+        },
+        health: observation.health,
+        observed_at_ms: observation.observed_at_ms,
+        generation: observation.generation,
+    });
+    input.connect = input.connect.map(|observation| ConnectObservation {
+        host_id: bounded_label(&observation.host_id, MAX_SOURCE_SCALARS),
+        state: observation.state,
+        revision: observation.revision,
+        observed_at_ms: observation.observed_at_ms,
+        generation: observation.generation,
+    });
+    input.update = input.update.map(|observation| UpdateObservation {
+        source_id: bounded_label(&observation.source_id, MAX_SOURCE_SCALARS),
+        state: observation.state,
+        revision: observation.revision,
+        observed_at_ms: observation.observed_at_ms,
+        generation: observation.generation,
+    });
+    input.remote = input.remote.map(|observation| RemoteObservation {
+        identity: RemoteObservationIdentity {
+            source_id: bounded_label(&observation.identity.source_id, MAX_SOURCE_SCALARS),
+            revision: observation.identity.revision,
+        },
+        health: observation.health,
+        label: bounded_label(&observation.label, MAX_LABEL_SCALARS),
+        observed_at_ms: observation.observed_at_ms,
+        generation: observation.generation,
+    });
+    let mut quotas: Vec<_> = input
+        .quotas
+        .into_iter()
+        .map(|observation| sanitize_quota_observation(&observation))
+        .collect();
+    quotas.sort_by(|left, right| {
+        left.identity
+            .provider
+            .cmp(&right.identity.provider)
+            .then_with(|| {
+                left.identity
+                    .provider_session_ref
+                    .cmp(&right.identity.provider_session_ref)
+            })
+    });
+    quotas.truncate(MAX_TOP_BAR_QUOTA_CACHE);
+    input.quotas = quotas;
+    if let Some(resource) = input.resources.as_mut() {
+        resource.cpu_percent = valid_cpu_percent(resource.cpu_percent);
+    }
+    input
+}
+
+fn combine_high_water_decisions(
+    left: HighWaterDecision,
+    right: HighWaterDecision,
+) -> HighWaterDecision {
+    use HighWaterDecision::*;
+    if left == RejectedConflict || right == RejectedConflict {
+        return RejectedConflict;
+    }
+    if left == RejectedInvalid || right == RejectedInvalid {
+        return RejectedInvalid;
+    }
+    if left == NeedsFullResync || right == NeedsFullResync {
+        return NeedsFullResync;
+    }
+    if left == RejectedCapacity || right == RejectedCapacity {
+        return RejectedCapacity;
+    }
+    if left == IgnoredStale || right == IgnoredStale {
+        return IgnoredStale;
+    }
+    Accepted
 }
 
 fn same_quota_identity(left: &QuotaObservation, right: &QuotaObservation) -> bool {
@@ -1786,9 +2514,185 @@ fn same_quota_identity(left: &QuotaObservation, right: &QuotaObservation) -> boo
         && left.identity.provider_session_ref == right.identity.provider_session_ref
 }
 
-fn stable_text_fingerprint(value: &str) -> u64 {
-    let digest = Sha256::digest(value.as_bytes());
-    u64::from_be_bytes(digest[..8].try_into().expect("fixed digest prefix"))
+fn update_fingerprint(state: UpdateState) -> u8 {
+    match state {
+        UpdateState::Disabled => 0,
+        UpdateState::Idle => 1,
+        UpdateState::Checking => 2,
+        UpdateState::UpToDate => 3,
+        UpdateState::Available => 4,
+        UpdateState::Downloading => 5,
+        UpdateState::ReadyToInstall => 6,
+        UpdateState::Installing => 7,
+        UpdateState::Error => 8,
+    }
+}
+
+fn host_health_fingerprint(health: HostHealth) -> u8 {
+    match health {
+        HostHealth::Healthy => 0,
+        HostHealth::Degraded => 1,
+        HostHealth::Unavailable => 2,
+    }
+}
+
+fn connect_state_fingerprint(state: ConnectState) -> u8 {
+    match state {
+        ConnectState::Connected => 0,
+        ConnectState::Connecting => 1,
+        ConnectState::Disconnected => 2,
+        ConnectState::Failed => 3,
+    }
+}
+
+fn remote_health_label(health: RemoteHealth) -> &'static str {
+    match health {
+        RemoteHealth::Healthy => "healthy",
+        RemoteHealth::Degraded => "degraded",
+        RemoteHealth::Unavailable => "unavailable",
+    }
+}
+
+fn remote_health_fingerprint(health: RemoteHealth) -> u8 {
+    match health {
+        RemoteHealth::Healthy => 0,
+        RemoteHealth::Degraded => 1,
+        RemoteHealth::Unavailable => 2,
+    }
+}
+
+fn hash_option_i64(hasher: &mut Sha256, value: Option<i64>) {
+    match value {
+        Some(value) => {
+            hasher.update([1]);
+            hasher.update(value.to_be_bytes());
+        }
+        None => hasher.update([0]),
+    }
+}
+
+fn hash_option_u64(hasher: &mut Sha256, value: Option<u64>) {
+    match value {
+        Some(value) => {
+            hasher.update([1]);
+            hasher.update(value.to_be_bytes());
+        }
+        None => hasher.update([0]),
+    }
+}
+
+fn hash_digest_prefix(hasher: Sha256) -> u64 {
+    u64::from_be_bytes(
+        hasher.finalize()[..8]
+            .try_into()
+            .expect("fixed digest prefix"),
+    )
+}
+
+fn quota_fingerprint(observation: &QuotaObservation) -> u64 {
+    let mut hasher = Sha256::new();
+    hasher.update(observation.identity.provider.as_bytes());
+    hasher.update(observation.identity.provider_session_ref.as_digest());
+    hasher.update(observation.identity.observation_id.to_be_bytes());
+    hasher.update(observation.detail.as_bytes());
+    hash_option_i64(&mut hasher, observation.observed_at_ms);
+    hash_option_u64(&mut hasher, observation.generation);
+    hasher.update(observation.revision.to_be_bytes());
+    hash_digest_prefix(hasher)
+}
+
+fn remote_fingerprint(observation: &RemoteObservation) -> u64 {
+    let mut hasher = Sha256::new();
+    hasher.update(observation.identity.source_id.as_bytes());
+    hasher.update([remote_health_fingerprint(observation.health)]);
+    hasher.update(observation.label.as_bytes());
+    hasher.update(observation.identity.revision.to_be_bytes());
+    hash_option_i64(&mut hasher, observation.observed_at_ms);
+    hash_option_u64(&mut hasher, observation.generation);
+    hash_digest_prefix(hasher)
+}
+
+fn host_fingerprint(observation: &HostObservation) -> u64 {
+    let mut hasher = Sha256::new();
+    hasher.update(observation.identity.host_id.as_bytes());
+    hasher.update([host_health_fingerprint(observation.health)]);
+    hasher.update(observation.identity.revision.to_be_bytes());
+    hash_option_i64(&mut hasher, observation.observed_at_ms);
+    hash_option_u64(&mut hasher, observation.generation);
+    hash_digest_prefix(hasher)
+}
+
+fn connect_fingerprint(observation: &ConnectObservation) -> u64 {
+    let mut hasher = Sha256::new();
+    hasher.update(observation.host_id.as_bytes());
+    hasher.update([connect_state_fingerprint(observation.state)]);
+    hasher.update(observation.revision.to_be_bytes());
+    hash_option_i64(&mut hasher, observation.observed_at_ms);
+    hash_option_u64(&mut hasher, observation.generation);
+    hash_digest_prefix(hasher)
+}
+
+fn update_observation_fingerprint(observation: &UpdateObservation) -> u64 {
+    let mut hasher = Sha256::new();
+    hasher.update(observation.source_id.as_bytes());
+    hasher.update([update_fingerprint(observation.state)]);
+    hasher.update(observation.revision.to_be_bytes());
+    hash_option_i64(&mut hasher, observation.observed_at_ms);
+    hash_option_u64(&mut hasher, observation.generation);
+    hash_digest_prefix(hasher)
+}
+
+fn resource_fingerprint(observation: &HostResourceObservation) -> u64 {
+    let mut hasher = Sha256::new();
+    match observation.cpu_percent {
+        Some(value) => {
+            hasher.update([1]);
+            hasher.update(value.to_bits().to_be_bytes());
+        }
+        None => hasher.update([0]),
+    }
+    hash_option_u64(&mut hasher, observation.memory_bytes);
+    hasher.update(observation.revision.to_be_bytes());
+    hash_option_i64(&mut hasher, observation.observed_at_ms);
+    hash_option_u64(&mut hasher, observation.generation);
+    hash_digest_prefix(hasher)
+}
+
+fn quota_stamp_for(observation: &QuotaObservation) -> Option<ObservationStamp> {
+    Some(ObservationStamp {
+        observed_at_ms: observation.observed_at_ms?,
+        generation: observation.generation?,
+        revision: observation.revision,
+    })
+}
+
+fn compare_observation_stamps(
+    left: ObservationStamp,
+    right: ObservationStamp,
+) -> std::cmp::Ordering {
+    compare_stamp(
+        left.generation,
+        left.revision,
+        right.generation,
+        right.revision,
+    )
+    .then_with(|| left.observed_at_ms.cmp(&right.observed_at_ms))
+}
+
+fn valid_cpu_percent(value: Option<f64>) -> Option<f64> {
+    value.filter(|value| value.is_finite() && (0.0..=100.0).contains(value))
+}
+
+fn unavailable_description(unavailable: TopBarUnavailable) -> &'static str {
+    match unavailable {
+        TopBarUnavailable::HostStatus => "Host status is unavailable.",
+        TopBarUnavailable::ConnectionStatus => "Connection status is unavailable.",
+        TopBarUnavailable::UpdateStatus => "Update status is unavailable.",
+        TopBarUnavailable::Remote => "Remote status is unavailable.",
+        TopBarUnavailable::Quota => "Quota status is unavailable.",
+        TopBarUnavailable::Cpu => "CPU usage is unavailable.",
+        TopBarUnavailable::Memory => "Memory usage is unavailable.",
+    }
 }
 
 fn fresh(
@@ -1796,6 +2700,7 @@ fn fresh(
     generation: u64,
     observed_at_ms: Option<i64>,
     observation_generation: Option<u64>,
+    revision: u64,
 ) -> Option<ObservationStamp> {
     let observed_at_ms = observed_at_ms?;
     let observation_generation = observation_generation?;
@@ -1804,20 +2709,56 @@ fn fresh(
         return None;
     }
     Some(ObservationStamp {
-        observed_at_ms: age_ms,
+        observed_at_ms,
         generation,
-        revision: 0,
+        revision,
     })
+}
+
+impl ObservationStamp {
+    fn age_ms(self, now_ms: i64) -> i64 {
+        now_ms.saturating_sub(self.observed_at_ms)
+    }
 }
 
 fn status_link(status: TopBarStatus, label: &str, stamp: ObservationStamp) -> TopBarStatusLink {
     TopBarStatusLink {
         status,
         label: label.to_string(),
-        description: format!("{label} status is available."),
+        description: presentation_text(
+            &format!("{label} status is {}.", status_label(status)),
+            MAX_ACCESSIBLE_SCALARS,
+        ),
         role: AccessibleRole::Status,
         focusable: false,
         action: ProjectedAction::host_status(stamp),
+    }
+}
+
+fn status_label(status: TopBarStatus) -> &'static str {
+    match status {
+        TopBarStatus::Host(health) => match health {
+            HostHealth::Healthy => "healthy",
+            HostHealth::Degraded => "degraded",
+            HostHealth::Unavailable => "unavailable",
+        },
+        TopBarStatus::Connect(state) => match state {
+            ConnectState::Connected => "connected",
+            ConnectState::Connecting => "connecting",
+            ConnectState::Disconnected => "disconnected",
+            ConnectState::Failed => "failed",
+        },
+        TopBarStatus::Update(state) => match state {
+            UpdateState::Disabled => "disabled",
+            UpdateState::Idle => "idle",
+            UpdateState::Checking => "checking",
+            UpdateState::UpToDate => "up to date",
+            UpdateState::Available => "available",
+            UpdateState::Downloading => "downloading",
+            UpdateState::ReadyToInstall => "ready to install",
+            UpdateState::Installing => "installing",
+            UpdateState::Error => "error",
+        },
     }
 }
 
@@ -1908,10 +2849,11 @@ impl TaskHeaderModel {
     }
 
     pub fn from_snapshot(
-        task_id: TaskId,
+        _task_id: TaskId,
         snapshot: &TaskSnapshot,
         context: TaskProjectionContext,
     ) -> Self {
+        let task_id = snapshot.task.id;
         let identity = TaskIdentity {
             task_id,
             revision: snapshot.task.revision,
@@ -1923,22 +2865,26 @@ impl TaskHeaderModel {
             request_epoch: context.request_epoch,
             action_epoch: snapshot.task.action_epoch,
         };
-        let specialists = SpecialistProjection::from_iter(snapshot.agents.values().map(|agent| {
-            AgentObservation {
-                id: agent.id,
-                task_id: agent.task_id,
-                label: match &agent.role {
-                    crate::domain::agent::AgentRole::Primary => "Primary",
-                    crate::domain::agent::AgentRole::Specialist { name } => name.as_str(),
-                },
-                provider: agent.provider_kind.as_str(),
-                provider_session_id: agent.provider_session_id.as_deref(),
-                lifecycle: agent.lifecycle,
-                runtime_generation: agent.runtime_generation,
-                revision: agent.revision,
-                removed: false,
-            }
-        }));
+        let specialists = SpecialistProjection::from_iter(
+            snapshot
+                .agents
+                .values()
+                .filter(|agent| agent.task_id == task_id)
+                .map(|agent| AgentObservation {
+                    id: agent.id,
+                    task_id: agent.task_id,
+                    label: match &agent.role {
+                        crate::domain::agent::AgentRole::Primary => "Primary",
+                        crate::domain::agent::AgentRole::Specialist { name } => name.as_str(),
+                    },
+                    provider: agent.provider_kind.as_str(),
+                    provider_session_id: agent.provider_session_id.as_deref(),
+                    lifecycle: agent.lifecycle,
+                    runtime_generation: agent.runtime_generation,
+                    revision: agent.revision,
+                    removed: false,
+                }),
+        );
         let project = ProjectProjection {
             id: snapshot.task.project_id,
             label: format!("project-{}", snapshot.task.project_id),
@@ -1970,6 +2916,15 @@ impl TaskHeaderModel {
     }
 
     pub fn accessibility_tree(&self) -> SemanticNode {
+        let specialist_description = if !self.specialists.source_available() {
+            "Specialist observations are unavailable."
+        } else if self.specialists.overflowed() && !self.specialists.unique_count_exact() {
+            "Specialist list is truncated and its count is approximate."
+        } else if self.specialists.overflowed() {
+            "Specialist list is truncated; stable identity pagination is available."
+        } else {
+            "Specialists are navigated by stable session identity."
+        };
         SemanticNode {
             role: AccessibleRole::Region,
             label: "Task header".to_string(),
@@ -1984,8 +2939,7 @@ impl TaskHeaderModel {
                 SemanticNode {
                     role: AccessibleRole::Status,
                     label: format!("{} specialist sessions", self.specialists.total_seen()),
-                    description: "Specialists are navigated by stable session identity."
-                        .to_string(),
+                    description: specialist_description.to_string(),
                     children: Vec::new(),
                 },
             ],
@@ -1997,11 +2951,20 @@ fn workspace_projection(workspace: &WorkspaceRef) -> WorkspaceProjection {
     match workspace {
         WorkspaceRef::Main => WorkspaceProjection::Main,
         WorkspaceRef::Worktree { path, branch } => WorkspaceProjection::Worktree {
-            path: path.clone(),
+            path: bounded_path(path),
             branch: bounded_label(branch, MAX_PROVIDER_SCALARS),
         },
-        WorkspaceRef::External { path } => WorkspaceProjection::External { path: path.clone() },
+        WorkspaceRef::External { path } => WorkspaceProjection::External {
+            path: bounded_path(path),
+        },
     }
+}
+
+fn bounded_path(path: &std::path::Path) -> PathBuf {
+    PathBuf::from(presentation_text(
+        &path.to_string_lossy(),
+        MAX_WORKSPACE_PATH_SCALARS,
+    ))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2031,29 +2994,21 @@ pub struct HeaderLayout {
 
 impl HeaderLayout {
     pub fn for_model(model: &TaskHeaderModel, width_px: u16) -> Self {
+        let bounded_title = presentation_text(&model.title, MAX_LABEL_SCALARS);
         let title = if width_px < 320 {
-            TitleLayout::Truncated(truncate_scalars(&model.title, 28))
+            TitleLayout::Truncated(truncate_with_ellipsis(
+                &bounded_title,
+                MAX_TITLE_LINE_SCALARS,
+            ))
         } else if width_px < 480 {
-            TitleLayout::Wrapped(model.title.split_whitespace().fold(
-                Vec::<String>::new(),
-                |mut lines, word| {
-                    if lines
-                        .last()
-                        .is_none_or(|line| line.chars().count() + word.chars().count() + 1 > 28)
-                    {
-                        lines.push(String::new());
-                    }
-                    if let Some(line) = lines.last_mut() {
-                        if !line.is_empty() {
-                            line.push(' ');
-                        }
-                        line.push_str(word);
-                    }
-                    lines
-                },
+            TitleLayout::Wrapped(wrap_title(&bounded_title, MAX_TITLE_LINE_SCALARS))
+        } else if bounded_title.chars().count() > MAX_TITLE_SINGLE_LINE_SCALARS {
+            TitleLayout::Truncated(truncate_with_ellipsis(
+                &bounded_title,
+                MAX_TITLE_SINGLE_LINE_SCALARS,
             ))
         } else {
-            TitleLayout::SingleLine(model.title.clone())
+            TitleLayout::SingleLine(bounded_title)
         };
         let (inline, overflow) = if width_px < 400 {
             (
@@ -2091,9 +3046,63 @@ impl HeaderLayout {
             overflow,
             title,
             overflow_label,
-            accessible_description: model.accessible_description.clone(),
+            accessible_description: presentation_text(
+                &model.accessible_description,
+                MAX_ACCESSIBLE_SCALARS,
+            ),
         }
     }
+}
+
+fn truncate_with_ellipsis(value: &str, max_scalars: usize) -> String {
+    if value.chars().count() <= max_scalars {
+        return value.to_string();
+    }
+    if max_scalars <= 1 {
+        return "…".chars().take(max_scalars).collect();
+    }
+    let mut truncated: String = value.chars().take(max_scalars - 1).collect();
+    truncated.push('…');
+    truncated
+}
+
+fn wrap_title(value: &str, max_line_scalars: usize) -> Vec<String> {
+    if max_line_scalars == 0 {
+        return Vec::new();
+    }
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in value.split_whitespace() {
+        let word_len = word.chars().count();
+        if word_len > max_line_scalars {
+            if !current.is_empty() {
+                lines.push(std::mem::take(&mut current));
+            }
+            let mut chunk = String::new();
+            for character in word.chars() {
+                chunk.push(character);
+                if chunk.chars().count() == max_line_scalars {
+                    lines.push(std::mem::take(&mut chunk));
+                }
+            }
+            if !chunk.is_empty() {
+                current = chunk;
+            }
+            continue;
+        }
+        let proposed = current.chars().count() + usize::from(!current.is_empty()) + word_len;
+        if proposed > max_line_scalars && !current.is_empty() {
+            lines.push(std::mem::take(&mut current));
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(word);
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

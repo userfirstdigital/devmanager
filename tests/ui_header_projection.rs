@@ -1,14 +1,24 @@
 use devmanager::client::action::TaskRenameArguments;
-use devmanager::domain::agent::AgentSessionLifecycle;
-use devmanager::domain::id::{AgentSessionId, TaskId};
+use devmanager::domain::agent::{AgentRole, AgentSessionFacts, AgentSessionLifecycle};
+use devmanager::domain::id::{AgentSessionId, EnvironmentId, ProjectId, TaskId};
+use devmanager::domain::snapshot::TaskSnapshot;
+use devmanager::domain::task::{
+    ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity, TaskFacts,
+    TaskLifecycle, VisibleTaskStatus, WorkspaceRef,
+};
 use devmanager::ui::components::ActionRequest;
 use devmanager::ui::task_cockpit::header::{
-    presentation_text, ActionTarget, AgentObservation, HeaderFieldKey, HeaderHighWaterLedger,
-    HeaderObservation, HighWaterDecision, OpaqueProviderSessionRef, PendingHeaderActionOutcome,
-    PendingHeaderActionQueue, ProjectedAction, QuotaObservation, RemoteHealth,
-    SpecialistProjection, TaskIdentity, TopBarModel, TopBarProjectionInput,
+    presentation_text, ActionTarget, AgentObservation, ConnectObservation, ConnectState,
+    HeaderFieldKey, HeaderHighWaterLedger, HeaderLayout, HeaderObservation, HighWaterDecision,
+    HostHealth, HostObservation, HostObservationIdentity, HostResourceObservation,
+    OpaqueProviderSessionRef, PendingHeaderActionOutcome, PendingHeaderActionQueue,
+    ProjectProjection, ProjectedAction, QuotaObservation, RemoteHealth, SpecialistProjection,
+    TaskHeaderModel, TaskIdentity, TitleLayout, TopBarModel, TopBarProjectionController,
+    TopBarProjectionInput, UpdateObservation, UpdateState, WorkspaceProjection,
     HEADER_HIGH_WATER_TTL_MS, MAX_HEADER_SPECIALISTS, MAX_SPECIALIST_VIRTUAL_WINDOW,
 };
+use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 fn task_id(byte: u8) -> TaskId {
     TaskId::from_bytes([
@@ -133,6 +143,17 @@ fn one_bounded_ledger_policy_covers_nested_fields_and_equal_conflicts() {
 }
 
 #[test]
+fn high_water_rejects_overbound_nested_keys_before_retention() {
+    let huge = "x".repeat(100_000);
+    let mut ledger = HeaderHighWaterLedger::new(4, HEADER_HIGH_WATER_TTL_MS);
+    assert_eq!(
+        ledger.observe(HeaderFieldKey::Host { source_id: huge }, 1, 1, 1, 1, false,),
+        HighWaterDecision::RejectedInvalid
+    );
+    assert!(ledger.is_empty());
+}
+
+#[test]
 fn high_water_capacity_resync_retires_omitted_keys_without_revival() {
     let first_key = HeaderFieldKey::Task(task_id(6));
     let second_key = HeaderFieldKey::Task(task_id(7));
@@ -158,6 +179,87 @@ fn high_water_capacity_resync_retires_omitted_keys_without_revival() {
 }
 
 #[test]
+fn full_resync_retirement_floor_rejects_older_reintroduced_keys() {
+    let retired = HeaderFieldKey::Task(task_id(8));
+    let replacement = HeaderFieldKey::Task(task_id(9));
+    let mut ledger = HeaderHighWaterLedger::new(4, HEADER_HIGH_WATER_TTL_MS);
+    assert_eq!(
+        ledger.observe(retired.clone(), 3, 20, 100, 20, false),
+        HighWaterDecision::Accepted
+    );
+    assert_eq!(
+        ledger.apply_full_resync(1, 3, [observation(replacement, 3, 21, false)]),
+        HighWaterDecision::Accepted
+    );
+
+    assert_eq!(
+        ledger.apply_full_resync(2, 3, [observation(retired, 3, 1, false)]),
+        HighWaterDecision::IgnoredStale,
+        "a newer resync epoch must not reopen a lower revision retired by the prior epoch"
+    );
+}
+
+#[test]
+fn full_resync_duplicates_are_conflict_safe_and_monotonic_in_any_order() {
+    let key = HeaderFieldKey::Task(task_id(10));
+    let mut conflict = HeaderHighWaterLedger::new(4, HEADER_HIGH_WATER_TTL_MS);
+    assert_eq!(
+        conflict.apply_full_resync(
+            1,
+            3,
+            [
+                observation(key.clone(), 3, 3, false),
+                HeaderObservation {
+                    key: key.clone(),
+                    generation: 3,
+                    revision: 3,
+                    observed_at_ms: 100,
+                    fingerprint: 999,
+                    removed: false,
+                },
+            ],
+        ),
+        HighWaterDecision::RejectedConflict
+    );
+
+    let mut descending = HeaderHighWaterLedger::new(4, HEADER_HIGH_WATER_TTL_MS);
+    assert_eq!(
+        descending.apply_full_resync(
+            1,
+            3,
+            [
+                observation(key.clone(), 3, 3, false),
+                observation(key.clone(), 3, 2, false),
+            ],
+        ),
+        HighWaterDecision::Accepted
+    );
+    assert_eq!(
+        descending.observe(key.clone(), 3, 2, 200, 2, false),
+        HighWaterDecision::IgnoredStale,
+        "a lower duplicate must not replace the candidate-state high-water"
+    );
+
+    let mut ascending = HeaderHighWaterLedger::new(4, HEADER_HIGH_WATER_TTL_MS);
+    assert_eq!(
+        ascending.apply_full_resync(
+            1,
+            3,
+            [
+                observation(key.clone(), 3, 2, false),
+                observation(key.clone(), 3, 3, false),
+            ],
+        ),
+        HighWaterDecision::Accepted
+    );
+    assert_eq!(descending.floor_len(), ascending.floor_len());
+    assert_eq!(
+        ascending.observe(key, 3, 2, 200, 2, false),
+        HighWaterDecision::IgnoredStale
+    );
+}
+
+#[test]
 fn specialists_keep_bounded_stable_id_order_and_keyset_windows() {
     let task = task_id(4);
     let labels = ["original", "relabelled"];
@@ -177,6 +279,9 @@ fn specialists_keep_bounded_stable_id_order_and_keyset_windows() {
     }
     let first = SpecialistProjection::from_observations(&observations);
     assert_eq!(first.scanned(), 100_000);
+    assert_eq!(first.unique_count(), 100_000);
+    assert!(first.overflowed());
+    assert!(first.source_available());
     assert_eq!(first.retained().len(), MAX_HEADER_SPECIALISTS);
     assert_eq!(first.retained().first().unwrap().id, agent_id(0));
     assert_eq!(first.retained().last().unwrap().id, agent_id(4_999));
@@ -229,6 +334,250 @@ fn specialists_keep_bounded_stable_id_order_and_keyset_windows() {
 }
 
 #[test]
+fn specialist_source_unavailable_and_equal_stamp_conflicts_stay_explicit() {
+    let unavailable = SpecialistProjection::from_iter_with_source(
+        std::iter::empty::<AgentObservation<'_>>(),
+        false,
+    );
+    assert!(!unavailable.source_available());
+    assert_eq!(unavailable.unique_count(), 0);
+
+    let task = task_id(13);
+    let base = AgentObservation {
+        id: agent_id(13),
+        task_id: task,
+        label: "first",
+        provider: "claude",
+        provider_session_id: None,
+        lifecycle: AgentSessionLifecycle::Open,
+        runtime_generation: 1,
+        revision: 1,
+        removed: false,
+    };
+    let conflict = SpecialistProjection::from_iter([
+        base,
+        AgentObservation {
+            label: "second",
+            ..base
+        },
+    ]);
+    assert!(!conflict.source_available());
+    assert_eq!(conflict.conflicts_rejected(), 1);
+    assert!(conflict.retained().is_empty());
+}
+
+#[test]
+fn specialist_duplicates_are_order_independent_and_count_unique_ids() {
+    let task = task_id(11);
+    let older = AgentObservation {
+        id: agent_id(11),
+        task_id: task,
+        label: "older",
+        provider: "claude",
+        provider_session_id: None,
+        lifecycle: AgentSessionLifecycle::Open,
+        runtime_generation: 2,
+        revision: 1,
+        removed: false,
+    };
+    let newer = AgentObservation {
+        label: "newer",
+        revision: 2,
+        ..older
+    };
+    let forward = SpecialistProjection::from_iter([older, newer]);
+    let reverse = SpecialistProjection::from_iter([newer, older]);
+    assert_eq!(forward.total_seen(), 1);
+    assert_eq!(forward.retained(), reverse.retained());
+    assert_eq!(forward.retained()[0].label, "newer");
+}
+
+#[test]
+fn top_bar_actions_keep_actual_observation_stamps() {
+    let session = OpaqueProviderSessionRef::try_from_raw("stamp-session").unwrap();
+    let input = TopBarProjectionInput {
+        now_ms: 10_000,
+        generation: 9,
+        host: Some(HostObservation {
+            identity: HostObservationIdentity {
+                host_id: "host".into(),
+                revision: 7,
+            },
+            health: HostHealth::Healthy,
+            observed_at_ms: Some(9_000),
+            generation: Some(9),
+        }),
+        connect: Some(ConnectObservation {
+            host_id: "host".into(),
+            state: ConnectState::Connected,
+            revision: 8,
+            observed_at_ms: Some(9_100),
+            generation: Some(9),
+        }),
+        update: Some(UpdateObservation {
+            source_id: "host".into(),
+            state: UpdateState::UpToDate,
+            revision: 9,
+            observed_at_ms: Some(9_200),
+            generation: Some(9),
+        }),
+        remote: None,
+        quotas: vec![QuotaObservation::new(
+            "claude",
+            session,
+            9,
+            10,
+            9_300,
+            "20% remaining",
+        )],
+        resources: None,
+    };
+    let model = TopBarModel::try_from_input(&input).unwrap();
+    let host = model.host.unwrap();
+    let ActionTarget::Host(host_stamp) = host.action.target() else {
+        panic!("host action target")
+    };
+    assert_eq!(host_stamp.observed_at_ms, 9_000);
+    assert_eq!(host_stamp.generation, 9);
+    assert_eq!(host_stamp.revision, 7);
+    let quota = &model.quotas[0];
+    let ActionTarget::Quota(quota_stamp) = quota.action.target() else {
+        panic!("quota action target")
+    };
+    assert_eq!(quota_stamp.observed_at_ms, 9_300);
+    assert_eq!(quota_stamp.generation, 9);
+    assert_eq!(quota_stamp.revision, 10);
+}
+
+#[test]
+fn top_bar_reports_each_missing_or_invalid_observation_and_truthful_state() {
+    let session = OpaqueProviderSessionRef::try_from_raw("state-session").unwrap();
+    let model = TopBarModel::from_input(&TopBarProjectionInput {
+        now_ms: 10_000,
+        generation: 9,
+        host: Some(HostObservation {
+            identity: HostObservationIdentity {
+                host_id: "host".into(),
+                revision: 1,
+            },
+            health: HostHealth::Degraded,
+            observed_at_ms: Some(10_000),
+            generation: Some(9),
+        }),
+        connect: None,
+        update: None,
+        remote: None,
+        quotas: vec![QuotaObservation::new(
+            "claude",
+            session,
+            9,
+            1,
+            10_000,
+            "20% remaining",
+        )],
+        resources: Some(HostResourceObservation {
+            cpu_percent: Some(101.0),
+            memory_bytes: Some(10),
+            revision: 1,
+            observed_at_ms: Some(10_000),
+            generation: Some(9),
+        }),
+    });
+    assert!(model
+        .host
+        .as_ref()
+        .unwrap()
+        .description
+        .contains("degraded"));
+    assert!(model
+        .unavailable
+        .contains(&devmanager::ui::task_cockpit::header::TopBarUnavailable::ConnectionStatus));
+    assert!(model
+        .unavailable
+        .contains(&devmanager::ui::task_cockpit::header::TopBarUnavailable::UpdateStatus));
+    assert!(model
+        .unavailable
+        .contains(&devmanager::ui::task_cockpit::header::TopBarUnavailable::Remote));
+    assert!(model
+        .unavailable
+        .contains(&devmanager::ui::task_cockpit::header::TopBarUnavailable::Cpu));
+    assert!(model.resources.as_ref().unwrap().cpu_percent.is_none());
+}
+
+#[test]
+fn equal_stamp_changed_remote_or_quota_payload_is_rejected() {
+    let session = OpaqueProviderSessionRef::try_from_raw("conflict-session").unwrap();
+    let mut controller = TopBarProjectionController::new(TopBarProjectionInput {
+        now_ms: 10_000,
+        generation: 9,
+        remote: Some(
+            devmanager::ui::task_cockpit::header::RemoteObservation::new(
+                "remote",
+                RemoteHealth::Healthy,
+                "Remote",
+                9,
+                1,
+                10_000,
+            ),
+        ),
+        ..TopBarProjectionInput::default()
+    });
+    assert_eq!(
+        controller.observe_remote(
+            devmanager::ui::task_cockpit::header::RemoteObservation::new(
+                "remote",
+                RemoteHealth::Degraded,
+                "Remote",
+                9,
+                1,
+                10_000,
+            )
+        ),
+        HighWaterDecision::RejectedConflict
+    );
+    let mut quota_controller = TopBarProjectionController::new(TopBarProjectionInput {
+        now_ms: 10_000,
+        generation: 9,
+        quotas: vec![QuotaObservation::new(
+            "claude", session, 9, 1, 10_000, "old",
+        )],
+        ..TopBarProjectionInput::default()
+    });
+    assert_eq!(
+        quota_controller.observe_quota(QuotaObservation::new(
+            "claude", session, 9, 1, 10_000, "new",
+        )),
+        HighWaterDecision::RejectedConflict
+    );
+}
+
+#[test]
+fn controller_constructor_never_retains_over_cap_quota_input() {
+    let mut quotas = Vec::new();
+    for index in 0..(devmanager::ui::task_cockpit::header::MAX_TOP_BAR_QUOTA_CACHE + 7) {
+        let session = OpaqueProviderSessionRef::try_from_raw(&format!("session-{index}")).unwrap();
+        quotas.push(QuotaObservation::new(
+            &format!("provider-{index}"),
+            session,
+            9,
+            index as u64 + 1,
+            10_000,
+            "ok",
+        ));
+    }
+    let controller = TopBarProjectionController::new(TopBarProjectionInput {
+        now_ms: 10_000,
+        generation: 9,
+        quotas,
+        ..TopBarProjectionInput::default()
+    });
+    assert!(
+        controller.input().quotas.len()
+            <= devmanager::ui::task_cockpit::header::MAX_TOP_BAR_QUOTA_CACHE
+    );
+}
+
+#[test]
 fn action_epochs_and_queue_coalesce_only_safe_equivalents() {
     let identity = TaskIdentity {
         task_id: task_id(5),
@@ -263,6 +612,146 @@ fn action_epochs_and_queue_coalesce_only_safe_equivalents() {
         2,
         "destructive ordering is never discarded"
     );
+
+    let huge_title = "untrusted ".repeat(10_000);
+    let bounded = ProjectedAction::task_rename(identity, huge_title);
+    let ActionRequest::TaskRename(arguments) = bounded.request() else {
+        panic!("rename action")
+    };
+    assert!(arguments.title.chars().count() <= 160);
+}
+
+#[test]
+fn serialized_header_text_and_quota_sequences_are_bounded() {
+    let host_wire = format!(
+        r#"{{"identity":{{"host_id":"{}","revision":1}},"health":"healthy","observed_at_ms":1,"generation":1}}"#,
+        "x".repeat(10_000)
+    );
+    assert!(
+        serde_json::from_str::<devmanager::ui::task_cockpit::header::HostObservation>(&host_wire)
+            .is_err()
+    );
+
+    let mut quotas = Vec::new();
+    for index in 0..65 {
+        quotas.push(QuotaObservation::new(
+            "claude",
+            OpaqueProviderSessionRef::try_from_raw(&format!("wire-{index}")).unwrap(),
+            1,
+            index + 1,
+            1,
+            "ok",
+        ));
+    }
+    let wire = serde_json::to_string(&TopBarProjectionInput {
+        now_ms: 1,
+        generation: 1,
+        quotas,
+        ..TopBarProjectionInput::default()
+    })
+    .unwrap();
+    assert!(serde_json::from_str::<TopBarProjectionInput>(&wire).is_err());
+}
+
+#[test]
+fn task_header_uses_snapshot_identity_filters_nested_agents_and_bounds_workspace_path() {
+    let snapshot_task = task_id(14);
+    let caller_task = task_id(15);
+    let project = ProjectId::from_bytes([
+        0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x0e,
+    ])
+    .unwrap();
+    let environment = EnvironmentId::from_bytes([
+        0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x0f,
+    ])
+    .unwrap();
+    let specialist = agent_id(14);
+    let wrong_task_agent = agent_id(15);
+    let task = TaskFacts {
+        id: snapshot_task,
+        environment_id: environment,
+        title: "Task".into(),
+        description: None,
+        project_id: project,
+        workspace: WorkspaceRef::External {
+            path: PathBuf::from("C:/".to_string() + &"workspace/".repeat(200)),
+        },
+        assignment: TaskAssignment::LocalOwner,
+        lifecycle: TaskLifecycle::Open,
+        action_epoch: 1,
+        revision: 2,
+        created_at_ms: 1,
+    };
+    let agent = |id: AgentSessionId, task_id: TaskId| AgentSessionFacts {
+        id,
+        task_id,
+        role: AgentRole::Primary,
+        provider_kind: "claude".into(),
+        provider_session_id: None,
+        lifecycle: AgentSessionLifecycle::Open,
+        runtime_generation: 1,
+        revision: 1,
+    };
+    let snapshot = TaskSnapshot {
+        task,
+        connectivity: TaskConnectivity::Connected,
+        attention: TaskAttention::None,
+        activity: TaskActivity::Idle,
+        review_readiness: ReviewReadiness::NotReady,
+        agents: BTreeMap::from([
+            (specialist, agent(specialist, snapshot_task)),
+            (wrong_task_agent, agent(wrong_task_agent, caller_task)),
+        ]),
+        primary_agent_id: Some(specialist),
+        artifacts: BTreeMap::new(),
+        resources: BTreeMap::new(),
+    };
+    let model = TaskHeaderModel::from_snapshot(caller_task, &snapshot, Default::default());
+    assert_eq!(model.identity.task_id, snapshot_task);
+    assert_eq!(model.specialists.unique_count(), 1);
+    let WorkspaceProjection::External { path } = model.workspace else {
+        panic!("external workspace")
+    };
+    assert!(path.to_string_lossy().chars().count() <= 512);
+}
+
+#[test]
+fn long_unbroken_titles_wrap_and_ellipsis_with_bounded_lines() {
+    let task = TaskHeaderModel {
+        identity: TaskIdentity {
+            task_id: task_id(12),
+            revision: 1,
+            resource_generation: 1,
+            connection_epoch: 1,
+            focus_epoch: 1,
+            client_epoch: 1,
+            navigation_epoch: 1,
+            request_epoch: 1,
+            action_epoch: 1,
+        },
+        title: "x".repeat(220),
+        project: ProjectProjection {
+            id: ProjectId::from_bytes([
+                0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x0d,
+            ])
+            .unwrap(),
+            label: "project".into(),
+        },
+        workspace: WorkspaceProjection::Main,
+        specialists: SpecialistProjection::from_iter(std::iter::empty()),
+        status: VisibleTaskStatus::Idle,
+        accessible_description: "task".into(),
+    };
+    let wrapped = HeaderLayout::for_model(&task, 400);
+    let TitleLayout::Wrapped(lines) = wrapped.title else {
+        panic!("expected wrapped title")
+    };
+    assert!(lines.iter().all(|line| line.chars().count() <= 28));
+    let wide = HeaderLayout::for_model(&task, 640);
+    assert!(matches!(wide.title, TitleLayout::Truncated(_)));
 }
 
 #[test]
