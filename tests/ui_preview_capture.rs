@@ -789,6 +789,89 @@ fn preview_capture_new_json_inputs_are_bounded_before_materialization() {
     );
 }
 
+#[test]
+fn preview_capture_new_final_output_identity_is_retained_through_commit_and_cleanup() {
+    let source = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/ui/preview_capture.rs"),
+    )
+    .expect("preview capture source");
+    for marker in [
+        "PublishedOutput",
+        "final_output_handle",
+        "final_output_identity",
+        "verify_published_output_identity",
+        "delete_published_output_by_handle",
+        "output residue is unresolved",
+    ] {
+        assert!(
+            source.contains(marker),
+            "final output authority must provide {marker}"
+        );
+    }
+    assert!(
+        !source.contains("self.authority.remove_output_relative()"),
+        "published output cleanup must not unlink a swapped final name"
+    );
+}
+
+#[test]
+fn preview_capture_new_rust_fixture_json_is_lexically_bounded_before_serde() {
+    let source =
+        fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/ui/preview.rs"))
+            .expect("preview source");
+    for marker in [
+        "validate_fixture_json_bytes",
+        "MAX_FIXTURE_JSON_NODES",
+        "MAX_FIXTURE_JSON_DEPTH",
+        "fixture JSON lexical limit",
+    ] {
+        assert!(
+            source.contains(marker),
+            "Rust fixture parser must provide {marker}"
+        );
+    }
+    let scanner = source
+        .find("validate_fixture_json_bytes")
+        .expect("fixture JSON scanner");
+    let serde = source
+        .find("serde_json::from_slice(&bytes)")
+        .expect("fixture serde parse");
+    assert!(
+        scanner < serde,
+        "fixture lexical bounds must run before serde materialization"
+    );
+}
+
+#[test]
+fn preview_script_minimized_transition_requires_is_iconic_readback() {
+    let script = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("scripts/native-next/Capture-UiPreviews.ps1"),
+    )
+    .expect("preview capture script");
+    for marker in [
+        "IsIconic",
+        "Wait-PreviewWindowMinimized",
+        "minimize-readback-unconfirmed",
+        "stateTransitionApplied = $true",
+    ] {
+        assert!(
+            script.contains(marker),
+            "minimized transition must provide {marker}"
+        );
+    }
+    let wait = script
+        .find("function Wait-PreviewWindowMinimized")
+        .expect("bounded minimized readback helper");
+    let applied = script
+        .find("$stateTransitionApplied = $true")
+        .expect("minimized state publication marker");
+    assert!(
+        wait < applied,
+        "stateTransitionApplied must only follow the bounded minimized readback helper"
+    );
+}
+
 #[cfg(windows)]
 #[test]
 fn preview_script_rejects_deep_high_node_and_oversize_json_fixtures_before_parse() {

@@ -376,6 +376,65 @@ struct CaptureFileIdentity {
     length: u64,
 }
 
+/// The exact inode/file object published for an attempt.  The handle remains
+/// owned by the attempt until the generation commit succeeds, so cleanup can
+/// never infer ownership from a final name that another process may have
+/// replaced.
+struct PublishedOutput {
+    final_output_handle: std::fs::File,
+    final_output_identity: CaptureFileIdentity,
+}
+
+impl PublishedOutput {
+    fn from_handle(final_output_handle: std::fs::File) -> Result<Self, PreviewCaptureError> {
+        let final_output_identity = file_identity_from_handle(&final_output_handle)?;
+        Ok(Self {
+            final_output_handle,
+            final_output_identity,
+        })
+    }
+
+    fn verify_published_output_identity(
+        &self,
+        authority: &CaptureOutputAuthority,
+    ) -> Result<(), PreviewCaptureError> {
+        authority.verify_published_output_identity(self)
+    }
+
+    fn delete_published_output_by_handle(
+        &self,
+        authority: &CaptureOutputAuthority,
+    ) -> Result<(), PreviewCaptureError> {
+        #[cfg(windows)]
+        {
+            let _ = authority;
+            delete_published_output_by_handle(&self.final_output_handle).map_err(|error| {
+                PreviewCaptureError::OutputFailed(format!(
+                    "handle-relative published output cleanup failed ({error})"
+                ))
+            })
+        }
+        #[cfg(unix)]
+        {
+            let _ = authority;
+            // Unix has no unlink-by-file-descriptor primitive.  A name check
+            // followed by unlinkat would be a TOCTOU deletion primitive: an
+            // attacker can swap the final name after the check.  Leave the
+            // exact residue visible rather than risking a replacement.
+            Err(PreviewCaptureError::OutputFailed(
+                "output residue is unresolved".into(),
+            ))
+        }
+        #[cfg(not(any(windows, unix)))]
+        {
+            let _ = authority;
+            Err(PreviewCaptureError::OutputFailed(
+                "output residue is unresolved".into(),
+            ))
+        }
+    }
+}
+
 impl std::fmt::Debug for CaptureOutputAuthority {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("CaptureOutputAuthority(<opaque>)")
@@ -595,6 +654,88 @@ impl CaptureOutputAuthority {
 
     fn remove_output_relative(&self) -> Result<(), PreviewCaptureError> {
         self.remove_name_relative(&self.output_name)
+    }
+
+    fn output_identity_relative(&self) -> Result<CaptureFileIdentity, PreviewCaptureError> {
+        self.verify_ancestor_chain()?;
+        #[cfg(windows)]
+        {
+            let parent = self.reopen_parent_for_publication()?;
+            let output =
+                open_relative_windows_existing(&parent, &self.output_name).map_err(|_| {
+                    PreviewCaptureError::OutputFailed("output residue is unresolved".into())
+                })?;
+            return file_identity_from_handle(&output);
+        }
+        #[cfg(unix)]
+        {
+            use std::ffi::CString;
+            use std::os::fd::{AsRawFd, FromRawFd};
+            use std::os::unix::ffi::OsStrExt;
+
+            let name = CString::new(self.output_name.as_bytes()).map_err(|_| {
+                PreviewCaptureError::OutputFailed("output residue is unresolved".into())
+            })?;
+            let parent = self.reopen_parent_for_publication()?;
+            let fd = unsafe {
+                libc::openat(
+                    parent.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                )
+            };
+            if fd < 0 {
+                return Err(PreviewCaptureError::OutputFailed(
+                    "output residue is unresolved".into(),
+                ));
+            }
+            let output = std::fs::File::from(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) });
+            return file_identity_from_handle(&output);
+        }
+        #[cfg(not(any(windows, unix)))]
+        {
+            Err(PreviewCaptureError::OutputFailed(
+                "output residue is unresolved".into(),
+            ))
+        }
+    }
+
+    fn verify_published_output_identity(
+        &self,
+        published: &PublishedOutput,
+    ) -> Result<(), PreviewCaptureError> {
+        #[cfg(windows)]
+        {
+            // Prefer a handle-relative identity lookup.  Some hardened
+            // directories deny a second child open even to the publishing
+            // process; the retained handle's final kernel path is the
+            // fail-closed fallback in that case and still detects a moved
+            // original before a replacement can be reported as committed.
+            if let Ok(current) = self.output_identity_relative() {
+                if current != published.final_output_identity {
+                    return Err(PreviewCaptureError::OutputFailed(
+                        "output residue is unresolved".into(),
+                    ));
+                }
+            }
+            return verify_windows_published_output_path(
+                &published.final_output_handle,
+                &self.output_path(),
+            );
+        }
+        #[cfg(not(windows))]
+        {
+            let current = self.output_identity_relative().map_err(|_| {
+                PreviewCaptureError::OutputFailed("output residue is unresolved".into())
+            })?;
+            if current == published.final_output_identity {
+                Ok(())
+            } else {
+                Err(PreviewCaptureError::OutputFailed(
+                    "output residue is unresolved".into(),
+                ))
+            }
+        }
     }
 
     fn remove_temp_relative(&self, name: &OsString) -> Result<(), PreviewCaptureError> {
@@ -961,9 +1102,100 @@ fn delete_relative_windows(
 }
 
 #[cfg(windows)]
+fn delete_published_output_by_handle(file: &std::fs::File) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+
+    #[repr(C)]
+    struct NativeFileDispositionInformation {
+        delete_file: u8,
+    }
+
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn NtSetInformationFile(
+            file_handle: HANDLE,
+            io_status_block: *mut NativeIoStatusBlock,
+            file_information: *const std::ffi::c_void,
+            length: u32,
+            file_information_class: i32,
+        ) -> i32;
+        fn RtlNtStatusToDosError(status: i32) -> u32;
+    }
+
+    const FILE_DISPOSITION_INFORMATION: i32 = 13;
+    let disposition = NativeFileDispositionInformation { delete_file: 1 };
+    let mut io_status = NativeIoStatusBlock {
+        status: 0,
+        information: 0,
+    };
+    let status = unsafe {
+        NtSetInformationFile(
+            HANDLE(file.as_raw_handle()),
+            &mut io_status,
+            (&disposition as *const NativeFileDispositionInformation).cast(),
+            u32::try_from(std::mem::size_of::<NativeFileDispositionInformation>())
+                .unwrap_or(u32::MAX),
+            FILE_DISPOSITION_INFORMATION,
+        )
+    };
+    if status < 0 {
+        let error = unsafe { RtlNtStatusToDosError(status) };
+        return Err(std::io::Error::from_raw_os_error(
+            i32::try_from(error).unwrap_or(i32::MAX),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
 fn open_relative_windows(
     parent: &std::os::windows::io::OwnedHandle,
     name: &OsString,
+) -> std::io::Result<std::fs::File> {
+    // Keep the production source handle delete-exclusive.  The retained
+    // handle therefore fences a final-name swap for the whole commit window;
+    // the dedicated source-swap unit test uses its own test-only opener.
+    const FILE_CREATE: u32 = 0x0000_0002;
+    const FILE_READ_DATA: u32 = 0x0000_0001;
+    const FILE_WRITE_DATA: u32 = 0x0000_0002;
+    const FILE_READ_ATTRIBUTES: u32 = 0x0000_0080;
+    const DELETE: u32 = 0x0001_0000;
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+    open_relative_windows_with_disposition(
+        parent,
+        name,
+        FILE_CREATE,
+        FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | DELETE | SYNCHRONIZE,
+        0x0000_0001 | 0x0000_0002,
+    )
+}
+
+#[cfg(windows)]
+fn open_relative_windows_existing(
+    parent: &std::os::windows::io::OwnedHandle,
+    name: &OsString,
+) -> std::io::Result<std::fs::File> {
+    const FILE_OPEN: u32 = 0x0000_0001;
+    const FILE_READ_DATA: u32 = 0x0000_0001;
+    const FILE_READ_ATTRIBUTES: u32 = 0x0000_0080;
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+    open_relative_windows_with_disposition(
+        parent,
+        name,
+        FILE_OPEN,
+        FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        0x0000_0001 | 0x0000_0002,
+    )
+}
+
+#[cfg(windows)]
+fn open_relative_windows_with_disposition(
+    parent: &std::os::windows::io::OwnedHandle,
+    name: &OsString,
+    create_disposition: u32,
+    desired_access: u32,
+    share_access: u32,
 ) -> std::io::Result<std::fs::File> {
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
@@ -1004,14 +1236,6 @@ fn open_relative_windows(
         fn RtlNtStatusToDosError(status: i32) -> u32;
     }
 
-    const DELETE: u32 = 0x0001_0000;
-    const FILE_READ_DATA: u32 = 0x0000_0001;
-    const FILE_WRITE_DATA: u32 = 0x0000_0002;
-    const SYNCHRONIZE: u32 = 0x0010_0000;
-    const FILE_SHARE_READ: u32 = 0x0000_0001;
-    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
-    const FILE_SHARE_DELETE: u32 = 0x0000_0004;
-    const FILE_CREATE: u32 = 0x0000_0002;
     const FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
     const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x0000_0020;
     const FILE_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
@@ -1050,13 +1274,13 @@ fn open_relative_windows(
     let status = unsafe {
         NtCreateFile(
             &mut raw,
-            FILE_READ_DATA | FILE_WRITE_DATA | DELETE | SYNCHRONIZE,
+            desired_access,
             &mut attributes,
             &mut io_status,
             &mut allocation_size,
             0,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            FILE_CREATE,
+            share_access,
+            create_disposition,
             FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
             std::ptr::null_mut(),
             0,
@@ -1097,6 +1321,165 @@ fn directory_identity_from_handle(
     })
 }
 
+#[cfg(windows)]
+fn file_identity_from_handle(
+    file: &std::fs::File,
+) -> Result<CaptureFileIdentity, PreviewCaptureError> {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY,
+        FILE_ATTRIBUTE_REPARSE_POINT,
+    };
+
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &mut information) }
+        .map_err(|_| PreviewCaptureError::OutputFailed("output residue is unresolved".into()))?;
+    if information.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY.0 | FILE_ATTRIBUTE_REPARSE_POINT.0)
+        != 0
+    {
+        return Err(PreviewCaptureError::OutputFailed(
+            "output residue is unresolved".into(),
+        ));
+    }
+    Ok(CaptureFileIdentity {
+        volume_serial: information.dwVolumeSerialNumber,
+        file_index: (u64::from(information.nFileIndexHigh) << 32)
+            | u64::from(information.nFileIndexLow),
+    })
+}
+
+#[cfg(windows)]
+fn verify_windows_published_output_path(
+    file: &std::fs::File,
+    expected_path: &Path,
+) -> Result<(), PreviewCaptureError> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetFinalPathNameByHandleW(
+            file_handle: HANDLE,
+            file_path: *mut u16,
+            file_path_length: u32,
+            flags: u32,
+        ) -> u32;
+        fn GetFullPathNameW(
+            file_name: *const u16,
+            buffer_length: u32,
+            buffer: *mut u16,
+            file_part: *mut *mut u16,
+        ) -> u32;
+    }
+
+    fn read_final_path(file: &std::fs::File) -> std::io::Result<Vec<u16>> {
+        let mut buffer = vec![0_u16; 512];
+        loop {
+            let length = unsafe {
+                GetFinalPathNameByHandleW(
+                    HANDLE(file.as_raw_handle()),
+                    buffer.as_mut_ptr(),
+                    u32::try_from(buffer.len()).unwrap_or(u32::MAX),
+                    0,
+                )
+            };
+            if length == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let length = usize::try_from(length).unwrap_or(usize::MAX);
+            if length < buffer.len() {
+                buffer.truncate(length);
+                return Ok(buffer);
+            }
+            if length >= 32_768 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "preview output handle path is too long",
+                ));
+            }
+            buffer.resize(length.saturating_add(1), 0);
+        }
+    }
+
+    fn read_full_path(path: &Path) -> std::io::Result<Vec<u16>> {
+        let mut input: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut buffer = vec![0_u16; 512];
+        loop {
+            let mut file_part = std::ptr::null_mut();
+            let length = unsafe {
+                GetFullPathNameW(
+                    input.as_mut_ptr(),
+                    u32::try_from(buffer.len()).unwrap_or(u32::MAX),
+                    buffer.as_mut_ptr(),
+                    &mut file_part,
+                )
+            };
+            if length == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let length = usize::try_from(length).unwrap_or(usize::MAX);
+            if length < buffer.len() {
+                buffer.truncate(length);
+                return Ok(buffer);
+            }
+            if length >= 32_768 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "preview output path is too long",
+                ));
+            }
+            buffer.resize(length.saturating_add(1), 0);
+        }
+    }
+
+    fn normalize(mut path: Vec<u16>) -> Vec<u16> {
+        if path.len() >= 8
+            && path[0] == '\\' as u16
+            && path[1] == '\\' as u16
+            && path[2] == '?' as u16
+            && path[3] == '\\' as u16
+            && path[4] == 'U' as u16
+            && path[5] == 'N' as u16
+            && path[6] == 'C' as u16
+            && path[7] == '\\' as u16
+        {
+            path.drain(..8);
+            path.splice(0..0, ['\\' as u16, '\\' as u16]);
+        } else if path.len() >= 4
+            && path[0] == '\\' as u16
+            && path[1] == '\\' as u16
+            && path[2] == '?' as u16
+            && path[3] == '\\' as u16
+        {
+            path.drain(..4);
+        }
+        path.iter_mut().for_each(|unit| {
+            if (b'A' as u16..=b'Z' as u16).contains(unit) {
+                *unit = unit.saturating_add(b'a' as u16 - b'A' as u16);
+            }
+        });
+        path
+    }
+
+    let actual = read_final_path(file)
+        .map_err(|_| PreviewCaptureError::OutputFailed("output residue is unresolved".into()))?;
+    let expected = read_full_path(expected_path)
+        .map_err(|_| PreviewCaptureError::OutputFailed("output residue is unresolved".into()))?;
+    if normalize(actual) == normalize(expected) {
+        Ok(())
+    } else {
+        Err(PreviewCaptureError::OutputFailed(
+            "output residue is unresolved".into(),
+        ))
+    }
+}
+
 #[cfg(not(windows))]
 fn capture_file_identity(path: &Path) -> std::io::Result<CaptureFileIdentity> {
     let metadata = fs::symlink_metadata(path)?;
@@ -1127,6 +1510,50 @@ fn capture_file_identity(path: &Path) -> std::io::Result<CaptureFileIdentity> {
             length: metadata.len(),
         })
     }
+}
+
+#[cfg(unix)]
+fn file_identity_from_handle(
+    file: &std::fs::File,
+) -> Result<CaptureFileIdentity, PreviewCaptureError> {
+    use std::os::fd::AsRawFd;
+
+    let mut information = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let result = unsafe { libc::fstat(file.as_raw_fd(), information.as_mut_ptr()) };
+    if result != 0 {
+        return Err(PreviewCaptureError::OutputFailed(
+            "output residue is unresolved".into(),
+        ));
+    }
+    let information = unsafe { information.assume_init() };
+    if information.st_mode & libc::S_IFMT != libc::S_IFREG {
+        return Err(PreviewCaptureError::OutputFailed(
+            "output residue is unresolved".into(),
+        ));
+    }
+    Ok(CaptureFileIdentity {
+        dev: information.st_dev as u64,
+        inode: information.st_ino as u64,
+    })
+}
+
+#[cfg(not(any(windows, unix)))]
+fn file_identity_from_handle(
+    file: &std::fs::File,
+) -> Result<CaptureFileIdentity, PreviewCaptureError> {
+    let metadata = file
+        .metadata()
+        .map_err(|_| PreviewCaptureError::OutputFailed("output residue is unresolved".into()))?;
+    let modified_nanos = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    Ok(CaptureFileIdentity {
+        modified_nanos,
+        length: metadata.len(),
+    })
 }
 
 #[cfg(windows)]
@@ -1437,6 +1864,49 @@ mod publication_tests {
         assert_eq!(
             fs::read(&temp).expect("attacker temp replacement remains isolated"),
             b"attacker replacement"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_published_handle_cleanup_preserves_a_swapped_final_name() {
+        let root = tempfile::tempdir().expect("published swap test root");
+        let output = root.path().join("published.png");
+        let temp = root.path().join(".published.tmp");
+        let moved = root.path().join(".published-moved.png");
+        let authority = CaptureOutputAuthority::new(&output, root.path())
+            .expect("published swap test authority should open");
+        let mut file = open_temp_output(&temp).expect("trusted temp handle");
+        std::io::Write::write_all(&mut file, b"trusted source").expect("trusted source");
+        file.sync_all().expect("trusted source sync");
+        atomic_publish_temp(
+            Some(temp.file_name().expect("temporary file name")),
+            &authority,
+            &file,
+        )
+        .expect("handle-relative publication");
+        let published = PublishedOutput::from_handle(file).expect("published identity");
+
+        fs::rename(&output, &moved).expect("attacker moves original final name");
+        fs::write(&output, b"attacker replacement").expect("attacker replacement");
+        assert!(
+            published
+                .verify_published_output_identity(&authority)
+                .is_err(),
+            "a moved original must not report the replacement as the published output"
+        );
+        published
+            .delete_published_output_by_handle(&authority)
+            .expect("handle cleanup should delete only the original inode");
+        drop(published);
+
+        assert_eq!(
+            fs::read(&output).expect("replacement remains"),
+            b"attacker replacement"
+        );
+        assert!(
+            !moved.exists(),
+            "the retained handle cleanup should remove the moved original"
         );
     }
 
@@ -2468,15 +2938,30 @@ fn encode_bgra_png_atomic_sync(
             .map_err(|error| PreviewCaptureError::OutputFailed(error.to_string()))?;
         lease.check(deadline)?;
         lease.publish_with(deadline, || {
-            let publication_result =
-                atomic_publish_temp(temp_name.as_deref(), &authority, &file)
-                    .map_err(|error| PreviewCaptureError::OutputFailed(error.to_string()))?;
+            let published = PublishedOutput::from_handle(file)?;
+            let publication_result = atomic_publish_temp(
+                temp_name.as_deref(),
+                &authority,
+                &published.final_output_handle,
+            )
+            .map_err(|error| PreviewCaptureError::OutputFailed(error.to_string()))?;
+            temp.final_output = Some(published);
             temp.renamed = true;
             temp.temp_removed = matches!(&publication_result, AtomicPublishOutcome::Published);
-            drop(file);
+            temp.final_output
+                .as_ref()
+                .expect("published output retained before identity verification")
+                .verify_published_output_identity(&authority)?;
             if let Some(callback) = publication.take() {
                 callback();
             }
+            // The callback may publish receipt metadata and external actors
+            // may race the final name while it runs.  Revalidate immediately
+            // before the generation commit can report success.
+            temp.final_output
+                .as_ref()
+                .expect("published output retained through commit")
+                .verify_published_output_identity(&authority)?;
             Ok(())
         })?;
         temp.committed = true;
@@ -2906,6 +3391,7 @@ struct TempOutput {
     temp_name: Option<OsString>,
     authority: Arc<CaptureOutputAuthority>,
     cleanup: TempCleanupState,
+    final_output: Option<PublishedOutput>,
     renamed: bool,
     temp_removed: bool,
     committed: bool,
@@ -2922,6 +3408,7 @@ impl TempOutput {
             temp_name,
             authority,
             cleanup,
+            final_output: None,
             renamed: false,
             temp_removed,
             committed: false,
@@ -2934,12 +3421,15 @@ impl Drop for TempOutput {
         if self.committed {
             return;
         }
-        if let Err(error) = self.authority.verify_reopened() {
-            self.cleanup
-                .record_cleanup_failure("verify output authority", error);
-            return;
-        }
-        if !self.temp_removed {
+        let authority_valid = match self.authority.verify_reopened() {
+            Ok(()) => true,
+            Err(error) => {
+                self.cleanup
+                    .record_cleanup_failure("verify output authority", error);
+                false
+            }
+        };
+        if authority_valid && !self.temp_removed {
             if let Some(temp_name) = &self.temp_name {
                 if let Err(error) = self.authority.remove_temp_relative(temp_name) {
                     self.cleanup
@@ -2952,9 +3442,16 @@ impl Drop for TempOutput {
             }
         }
         if self.renamed && !self.committed {
-            if let Err(error) = self.authority.remove_output_relative() {
-                self.cleanup
-                    .record_cleanup_failure("remove published output", error);
+            if let Some(published) = self.final_output.as_ref() {
+                if let Err(error) = published.delete_published_output_by_handle(&self.authority) {
+                    self.cleanup
+                        .record_cleanup_failure("remove published output", error);
+                }
+            } else {
+                self.cleanup.record_cleanup_failure(
+                    "remove published output",
+                    PreviewCaptureError::OutputFailed("output residue is unresolved".into()),
+                );
             }
         }
     }

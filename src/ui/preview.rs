@@ -11,7 +11,7 @@ use std::error::Error;
 use std::ffi::{OsStr, OsString};
 use std::fmt::{Display, Formatter};
 use std::fs;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -29,6 +29,8 @@ use crate::ui::tokens::{theme, Density, Scale, StatusMeaning, ThemeMode};
 
 pub const PREVIEW_SCHEMA: &str = "devmanager.ui.preview/v1";
 pub const MAX_FIXTURE_BYTES: u64 = 256 * 1024;
+pub const MAX_FIXTURE_JSON_NODES: usize = 16_384;
+pub const MAX_FIXTURE_JSON_DEPTH: usize = 64;
 pub const PREVIEW_SENTINEL_RGBA: [u8; 4] = [0x91, 0x2b, 0xd4, 0xff];
 #[used]
 #[no_mangle]
@@ -821,6 +823,8 @@ impl PreviewApplication {
             request
         })?;
         let bytes = read_fixture_bytes(&request.fixture_authority)?;
+        validate_fixture_json_bytes(&bytes)
+            .map_err(|error| map_fixture_json_scan_error(&request.fixture_path, error))?;
         let fixture: PreviewFixture =
             serde_json::from_slice(&bytes).map_err(|error| PreviewError::MalformedFixture {
                 path: request.fixture_path.clone(),
@@ -1718,6 +1722,357 @@ impl FixtureFileAuthority {
     }
 }
 
+const FIXTURE_JSON_LEXICAL_LIMIT: &str = "fixture JSON lexical limit";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FixtureJsonScanError {
+    Io,
+    BytesExceeded { bytes: u64 },
+    NodesExceeded,
+    DepthExceeded,
+    Invalid,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FixtureJsonLiteral {
+    True,
+    False,
+    Null,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FixtureJsonLexState {
+    Outside,
+    String {
+        escaped: bool,
+        unicode_digits: u8,
+    },
+    Number {
+        has_digit: bool,
+    },
+    Literal {
+        kind: FixtureJsonLiteral,
+        matched: u8,
+    },
+}
+
+struct FixtureJsonScanner {
+    total_bytes: u64,
+    nodes: usize,
+    depth: usize,
+    nesting: [u8; MAX_FIXTURE_JSON_DEPTH],
+    state: FixtureJsonLexState,
+}
+
+impl FixtureJsonScanner {
+    fn new() -> Self {
+        Self {
+            total_bytes: 0,
+            nodes: 0,
+            depth: 0,
+            nesting: [0; MAX_FIXTURE_JSON_DEPTH],
+            state: FixtureJsonLexState::Outside,
+        }
+    }
+
+    fn consume(&mut self, byte: u8) -> Result<(), FixtureJsonScanError> {
+        self.total_bytes = self.total_bytes.saturating_add(1);
+        if self.total_bytes > MAX_FIXTURE_BYTES {
+            return Err(FixtureJsonScanError::BytesExceeded {
+                bytes: self.total_bytes,
+            });
+        }
+
+        loop {
+            match self.state {
+                FixtureJsonLexState::Outside => {
+                    return self.consume_outside(byte);
+                }
+                FixtureJsonLexState::String {
+                    escaped,
+                    unicode_digits,
+                } => {
+                    if unicode_digits != 0 {
+                        if !byte.is_ascii_hexdigit() {
+                            return Err(FixtureJsonScanError::Invalid);
+                        }
+                        self.state = FixtureJsonLexState::String {
+                            escaped: false,
+                            unicode_digits: unicode_digits - 1,
+                        };
+                        return Ok(());
+                    }
+                    if escaped {
+                        self.state = FixtureJsonLexState::String {
+                            escaped: false,
+                            unicode_digits: if byte == b'u' { 4 } else { 0 },
+                        };
+                        return Ok(());
+                    }
+                    match byte {
+                        b'\\' => {
+                            self.state = FixtureJsonLexState::String {
+                                escaped: true,
+                                unicode_digits: 0,
+                            };
+                            return Ok(());
+                        }
+                        b'"' => {
+                            self.state = FixtureJsonLexState::Outside;
+                            return Ok(());
+                        }
+                        0..=0x1f => return Err(FixtureJsonScanError::Invalid),
+                        _ => return Ok(()),
+                    }
+                }
+                FixtureJsonLexState::Number { has_digit } => {
+                    if byte.is_ascii_digit() || matches!(byte, b'.' | b'e' | b'E' | b'+' | b'-') {
+                        self.state = FixtureJsonLexState::Number {
+                            has_digit: has_digit || byte.is_ascii_digit(),
+                        };
+                        return Ok(());
+                    }
+                    if !has_digit {
+                        return Err(FixtureJsonScanError::Invalid);
+                    }
+                    if is_fixture_json_delimiter(byte) {
+                        self.state = FixtureJsonLexState::Outside;
+                        continue;
+                    }
+                    return Err(FixtureJsonScanError::Invalid);
+                }
+                FixtureJsonLexState::Literal { kind, matched } => {
+                    let expected = fixture_json_literal_byte(kind, matched);
+                    if let Some(expected) = expected {
+                        if byte != expected {
+                            return Err(FixtureJsonScanError::Invalid);
+                        }
+                        self.state = FixtureJsonLexState::Literal {
+                            kind,
+                            matched: matched.saturating_add(1),
+                        };
+                        return Ok(());
+                    }
+                    if is_fixture_json_delimiter(byte) {
+                        self.state = FixtureJsonLexState::Outside;
+                        continue;
+                    }
+                    return Err(FixtureJsonScanError::Invalid);
+                }
+            }
+        }
+    }
+
+    fn consume_outside(&mut self, byte: u8) -> Result<(), FixtureJsonScanError> {
+        match byte {
+            b' ' | b'\t' | b'\r' | b'\n' | b',' | b':' => Ok(()),
+            b'"' => {
+                self.bump_node()?;
+                self.state = FixtureJsonLexState::String {
+                    escaped: false,
+                    unicode_digits: 0,
+                };
+                Ok(())
+            }
+            b'{' | b'[' => {
+                self.bump_node()?;
+                if self.depth >= MAX_FIXTURE_JSON_DEPTH {
+                    return Err(FixtureJsonScanError::DepthExceeded);
+                }
+                self.nesting[self.depth] = byte;
+                self.depth += 1;
+                Ok(())
+            }
+            b'}' | b']' => {
+                let expected = if byte == b'}' { b'{' } else { b'[' };
+                if self.depth == 0 || self.nesting[self.depth - 1] != expected {
+                    return Err(FixtureJsonScanError::Invalid);
+                }
+                self.depth -= 1;
+                Ok(())
+            }
+            b'-' => {
+                self.bump_node()?;
+                self.state = FixtureJsonLexState::Number { has_digit: false };
+                Ok(())
+            }
+            b'0'..=b'9' => {
+                self.bump_node()?;
+                self.state = FixtureJsonLexState::Number { has_digit: true };
+                Ok(())
+            }
+            b't' => {
+                self.bump_node()?;
+                self.state = FixtureJsonLexState::Literal {
+                    kind: FixtureJsonLiteral::True,
+                    matched: 1,
+                };
+                Ok(())
+            }
+            b'f' => {
+                self.bump_node()?;
+                self.state = FixtureJsonLexState::Literal {
+                    kind: FixtureJsonLiteral::False,
+                    matched: 1,
+                };
+                Ok(())
+            }
+            b'n' => {
+                self.bump_node()?;
+                self.state = FixtureJsonLexState::Literal {
+                    kind: FixtureJsonLiteral::Null,
+                    matched: 1,
+                };
+                Ok(())
+            }
+            _ => Err(FixtureJsonScanError::Invalid),
+        }
+    }
+
+    fn bump_node(&mut self) -> Result<(), FixtureJsonScanError> {
+        if self.nodes >= MAX_FIXTURE_JSON_NODES {
+            return Err(FixtureJsonScanError::NodesExceeded);
+        }
+        self.nodes += 1;
+        Ok(())
+    }
+
+    fn finish(self) -> Result<(), FixtureJsonScanError> {
+        let state_finished = match self.state {
+            FixtureJsonLexState::Outside => true,
+            FixtureJsonLexState::Number { has_digit } => has_digit,
+            FixtureJsonLexState::Literal { kind, matched } => {
+                matched == fixture_json_literal_len(kind)
+            }
+            FixtureJsonLexState::String { .. } => false,
+        };
+        if !state_finished || self.depth != 0 {
+            return Err(FixtureJsonScanError::Invalid);
+        }
+        Ok(())
+    }
+}
+
+fn is_fixture_json_delimiter(byte: u8) -> bool {
+    matches!(
+        byte,
+        b' ' | b'\t' | b'\r' | b'\n' | b',' | b']' | b'}' | b':'
+    )
+}
+
+fn fixture_json_literal_len(kind: FixtureJsonLiteral) -> u8 {
+    match kind {
+        FixtureJsonLiteral::True => 4,
+        FixtureJsonLiteral::False => 5,
+        FixtureJsonLiteral::Null => 4,
+    }
+}
+
+fn fixture_json_literal_byte(kind: FixtureJsonLiteral, index: u8) -> Option<u8> {
+    match (kind, index) {
+        (FixtureJsonLiteral::True, 0) => Some(b't'),
+        (FixtureJsonLiteral::True, 1) => Some(b'r'),
+        (FixtureJsonLiteral::True, 2) => Some(b'u'),
+        (FixtureJsonLiteral::True, 3) => Some(b'e'),
+        (FixtureJsonLiteral::False, 0) => Some(b'f'),
+        (FixtureJsonLiteral::False, 1) => Some(b'a'),
+        (FixtureJsonLiteral::False, 2) => Some(b'l'),
+        (FixtureJsonLiteral::False, 3) => Some(b's'),
+        (FixtureJsonLiteral::False, 4) => Some(b'e'),
+        (FixtureJsonLiteral::Null, 0) => Some(b'n'),
+        (FixtureJsonLiteral::Null, 1) => Some(b'u'),
+        (FixtureJsonLiteral::Null, 2) => Some(b'l'),
+        (FixtureJsonLiteral::Null, 3) => Some(b'l'),
+        _ => None,
+    }
+}
+
+fn validate_fixture_json_reader<R: Read>(reader: &mut R) -> Result<(), FixtureJsonScanError> {
+    let mut scanner = FixtureJsonScanner::new();
+    let mut buffer = [0u8; 8192];
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .map_err(|_| FixtureJsonScanError::Io)?;
+        if read == 0 {
+            return scanner.finish();
+        }
+        for byte in &buffer[..read] {
+            scanner.consume(*byte)?;
+        }
+    }
+}
+
+fn validate_fixture_json_bytes(bytes: &[u8]) -> Result<(), FixtureJsonScanError> {
+    validate_fixture_json_reader(&mut Cursor::new(bytes))
+}
+
+fn map_fixture_json_scan_error(path: &Path, error: FixtureJsonScanError) -> PreviewError {
+    match error {
+        FixtureJsonScanError::Io => PreviewError::FixtureIo {
+            path: path.to_path_buf(),
+            message: "fixture JSON scanner I/O failed".into(),
+        },
+        FixtureJsonScanError::BytesExceeded { bytes } => PreviewError::FixtureTooLarge {
+            path: path.to_path_buf(),
+            bytes,
+            max_bytes: MAX_FIXTURE_BYTES,
+        },
+        FixtureJsonScanError::NodesExceeded
+        | FixtureJsonScanError::DepthExceeded
+        | FixtureJsonScanError::Invalid => PreviewError::MalformedFixture {
+            path: path.to_path_buf(),
+            message: FIXTURE_JSON_LEXICAL_LIMIT.into(),
+        },
+    }
+}
+
+#[cfg(test)]
+mod fixture_json_scanner_tests {
+    use super::*;
+
+    #[test]
+    fn high_node_fixture_is_rejected_by_lexical_preflight() {
+        let mut bytes = Vec::with_capacity(MAX_FIXTURE_JSON_NODES * 2);
+        bytes.push(b'[');
+        for index in 0..MAX_FIXTURE_JSON_NODES {
+            if index != 0 {
+                bytes.push(b',');
+            }
+            bytes.push(b'0');
+        }
+        bytes.push(b']');
+
+        assert_eq!(
+            validate_fixture_json_bytes(&bytes),
+            Err(FixtureJsonScanError::NodesExceeded)
+        );
+    }
+
+    #[test]
+    fn deeply_nested_fixture_is_rejected_by_lexical_preflight() {
+        let mut bytes = Vec::with_capacity(MAX_FIXTURE_JSON_DEPTH * 2 + 1);
+        for _ in 0..=MAX_FIXTURE_JSON_DEPTH {
+            bytes.push(b'[');
+        }
+        bytes.push(b'0');
+        for _ in 0..=MAX_FIXTURE_JSON_DEPTH {
+            bytes.push(b']');
+        }
+
+        assert_eq!(
+            validate_fixture_json_bytes(&bytes),
+            Err(FixtureJsonScanError::DepthExceeded)
+        );
+    }
+
+    #[test]
+    fn valid_fixture_lexemes_are_bounded_without_materializing_tokens() {
+        let bytes = br#"{"schema":"devmanager.ui.preview/v1","id":"ok","title":"line\n\u2603","root":{"kind":"minimal","label":"ok","capability":"exact","output_written":true,"host_started":false},"capture":{"cursor":"excluded","border":"excluded"}}"#;
+        assert_eq!(validate_fixture_json_bytes(bytes), Ok(()));
+    }
+}
+
 fn read_fixture_bytes(authority: &FixtureFileAuthority) -> Result<Vec<u8>, PreviewError> {
     authority.verify_fixture_containment()?;
     let path = &authority.path;
@@ -1758,6 +2113,21 @@ fn read_fixture_bytes(authority: &FixtureFileAuthority) -> Result<Vec<u8>, Previ
             message: "fixture authority changed before it was read".into(),
         });
     }
+
+    fixture_handle
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| PreviewError::FixtureIo {
+            path: path.clone(),
+            message: error.to_string(),
+        })?;
+    validate_fixture_json_reader(&mut *fixture_handle)
+        .map_err(|error| map_fixture_json_scan_error(path, error))?;
+    fixture_handle
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| PreviewError::FixtureIo {
+            path: path.clone(),
+            message: error.to_string(),
+        })?;
 
     let mut bytes = Vec::with_capacity(metadata_before.len() as usize);
     fixture_handle

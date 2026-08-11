@@ -3604,6 +3604,7 @@ using System;
 using System.Runtime.InteropServices;
 public static class DevManagerPreviewWindow {
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hwnd, int command);
+    [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hwnd);
     [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr hwnd, uint message, IntPtr wParam, IntPtr lParam);
     [DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW")] private static extern IntPtr GetWindowLongPtr(IntPtr hwnd, int index);
     private const long WS_MINIMIZEBOX = 0x00020000L;
@@ -3612,6 +3613,27 @@ public static class DevManagerPreviewWindow {
     }
 }
 '@
+    }
+
+    function Wait-PreviewWindowMinimized {
+        param(
+            [IntPtr]$Window,
+            [datetime]$Deadline,
+            [int]$MaxAttempts = 40
+        )
+
+        for ($MinimizeAttempt = 1; $MinimizeAttempt -le $MaxAttempts; $MinimizeAttempt++) {
+            Assert-PreviewDeadline -Deadline $Deadline
+            if ([DevManagerPreviewWindow]::IsIconic($Window)) {
+                return $true
+            }
+            [void][DevManagerPreviewWindow]::ShowWindow($Window, 6)
+            if ([DevManagerPreviewWindow]::IsIconic($Window)) {
+                return $true
+            }
+            Wait-PreviewBackoff -Deadline $Deadline -Milliseconds 25
+        }
+        return $false
     }
 
     function Invoke-WindowStateProbe {
@@ -3640,8 +3662,12 @@ public static class DevManagerPreviewWindow {
             $launch.ReadinessHandshake = $readiness.ReadinessHandshake
             if ($State -eq 'minimized') {
                 if ([DevManagerPreviewWindow]::CanMinimize($window)) {
-                    [DevManagerPreviewWindow]::ShowWindow($window, 6) | Out-Null
-                    $stateTransitionApplied = $true
+                    if (Wait-PreviewWindowMinimized -Window $window -Deadline $Deadline) {
+                        $stateTransitionApplied = $true
+                    } else {
+                        $outcome = 'deferred'
+                        $holdEvidence = 'minimize-readback-unconfirmed'
+                    }
                 } else {
                     $outcome = 'deferred'
                     $holdEvidence = 'window-not-minimizable'
