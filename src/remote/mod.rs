@@ -40,10 +40,10 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::{ErrorKind, Read, Write};
-use std::net::{Shutdown, TcpListener, TcpStream};
+use std::net::{Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex, RwLock};
+use std::sync::{mpsc, Arc, Mutex, OnceLock, RwLock, Weak};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -52,6 +52,9 @@ const REMOTE_FILE_NAME: &str = "remote.json";
 const SNAPSHOT_BROADCAST_INTERVAL: Duration = Duration::from_millis(33);
 const IDLE_BROADCAST_INTERVAL: Duration = Duration::from_millis(250);
 const PENDING_BOOTSTRAP_RETRY_INTERVAL: Duration = Duration::from_millis(250);
+const REMOTE_WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(500);
+const REMOTE_CALLBACK_TIMEOUT: Duration = Duration::from_millis(500);
+const PORT_FORWARD_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 pub(crate) const AI_STARTUP_REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
 pub(crate) const GIT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
@@ -70,6 +73,21 @@ type TerminalInputHandler =
     Arc<dyn Fn(RemoteTerminalInput, u64) -> Result<(), String> + Send + Sync>;
 type TerminalResizeHandler = Arc<dyn Fn(String, SessionDimensions) + Send + Sync>;
 type FocusedSessionHandler = Arc<dyn Fn(String) + Send + Sync>;
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeLifecycleTestEvent {
+    ListenerStarted,
+    ClientRegistered,
+    ClientRemoved,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalPortForwardLifecycleTestEvent {
+    ConnectionAccepted,
+    AcceptanceClosed,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, rename_all = "camelCase")]
@@ -873,6 +891,20 @@ pub struct RemotePortForwardState {
 static REMOTE_STATE_SAVE_LOCK: Mutex<()> = Mutex::new(());
 static REMOTE_STATE_SAVE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HostConfigPersistenceTestPhase {
+    BeforeWrite,
+    AfterWrite,
+}
+#[cfg(test)]
+type HostConfigPersistenceTestHook = Arc<
+    dyn Fn(&RemoteHostConfig, HostConfigPersistenceTestPhase) -> std::io::Result<()> + Send + Sync,
+>;
+#[cfg(test)]
+static HOST_CONFIG_PERSISTENCE_TEST_HOOK: Mutex<Option<HostConfigPersistenceTestHook>> =
+    Mutex::new(None);
+
 pub fn load_remote_machine_state() -> Result<RemoteMachineState, PersistenceError> {
     let _guard = REMOTE_STATE_SAVE_LOCK
         .lock()
@@ -1275,12 +1307,31 @@ fn save_remote_machine_state_locked(state: &RemoteMachineState) -> Result<(), Pe
 }
 
 fn persist_host_config_snapshot(config: &RemoteHostConfig) -> Result<(), PersistenceError> {
+    #[cfg(test)]
+    let test_hook = HOST_CONFIG_PERSISTENCE_TEST_HOOK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    #[cfg(test)]
+    if let Some(hook) = test_hook.as_ref() {
+        hook(config, HostConfigPersistenceTestPhase::BeforeWrite).map_err(|source| {
+            PersistenceError::Io {
+                path: remote_state_path().unwrap_or_else(|_| PathBuf::from(REMOTE_FILE_NAME)),
+                source,
+            }
+        })?;
+    }
     let _guard = REMOTE_STATE_SAVE_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut state = load_remote_machine_state_locked()?;
     state.host = config.clone();
-    save_remote_machine_state_locked(&state)
+    save_remote_machine_state_locked(&state)?;
+    #[cfg(test)]
+    if let Some(hook) = test_hook.as_ref() {
+        let _ = hook(config, HostConfigPersistenceTestPhase::AfterWrite);
+    }
+    Ok(())
 }
 
 pub fn save_remote_known_hosts(known_hosts: &[KnownRemoteHost]) -> Result<(), PersistenceError> {
@@ -1316,7 +1367,6 @@ pub(crate) fn mutate_host_config_if<T>(
         return Ok(None);
     };
 
-    flush_host_config_persistence(inner);
     if let Err(error) = persist_host_config_snapshot(&snapshot) {
         if let Ok(mut config) = inner.config.write() {
             *config = previous;
@@ -1345,7 +1395,6 @@ pub(crate) fn mutate_host_config<T>(
         (result, config.clone(), previous)
     };
 
-    flush_host_config_persistence(inner);
     if let Err(error) = persist_host_config_snapshot(&snapshot) {
         if let Ok(mut config) = inner.config.write() {
             *config = previous;
@@ -1357,82 +1406,39 @@ pub(crate) fn mutate_host_config<T>(
     Ok(result)
 }
 
-fn flush_pending_host_config_snapshots(pending: &Arc<Mutex<Option<RemoteHostConfig>>>) {
-    loop {
-        let snapshot = pending.lock().ok().and_then(|mut pending| pending.take());
-        let Some(snapshot) = snapshot else {
-            return;
-        };
-        if let Err(error) = persist_host_config_snapshot(&snapshot) {
-            eprintln!("[remote] failed to persist host config snapshot: {error}");
-        }
-    }
-}
-
-fn queue_host_config_snapshot(inner: &Arc<RemoteHostInner>, snapshot: RemoteHostConfig) {
-    if let Ok(worker) = inner.host_persistence_worker.lock() {
-        if let Some(worker) = worker.as_ref() {
-            worker.queue(snapshot);
-        }
-    }
-}
-
-fn flush_host_config_persistence(inner: &Arc<RemoteHostInner>) {
-    if let Ok(worker) = inner.host_persistence_worker.lock() {
-        if let Some(worker) = worker.as_ref() {
-            worker.flush();
-        }
-    }
-}
-
-fn record_native_connection_activity(
-    inner: &Arc<RemoteHostInner>,
+fn append_native_connection_activity(
+    config: &mut RemoteHostConfig,
     client_id: String,
     label: String,
     ip_address: Option<String>,
-) -> Result<(), String> {
-    let _update_guard = inner
-        .config_update_lock
-        .lock()
-        .map_err(|_| "host config update unavailable".to_string())?;
-    let snapshot = {
-        let mut config = inner
-            .config
-            .write()
-            .map_err(|_| "host config unavailable".to_string())?;
-        let had_previous_connect = config.web.activity_log.iter().any(|event| {
-            event.source == RemoteAccessSource::NativeApp
-                && event.client_id == client_id
-                && matches!(
-                    event.event_kind,
-                    RemoteAccessActivityKind::Connected | RemoteAccessActivityKind::Reconnected
-                )
-        });
-        append_remote_access_activity_event(
-            &mut config,
-            RemoteAccessActivityEvent {
-                client_id,
-                source: RemoteAccessSource::NativeApp,
-                event_kind: if had_previous_connect {
-                    RemoteAccessActivityKind::Reconnected
-                } else {
-                    RemoteAccessActivityKind::Connected
-                },
-                label,
-                ip_address,
-                event_at_epoch_ms: Some(now_epoch_ms()),
-                browser_family: None,
-                browser_version: None,
-                os_family: None,
-                device_class: Some("desktop".to_string()),
+) {
+    let had_previous_connect = config.web.activity_log.iter().any(|event| {
+        event.source == RemoteAccessSource::NativeApp
+            && event.client_id == client_id
+            && matches!(
+                event.event_kind,
+                RemoteAccessActivityKind::Connected | RemoteAccessActivityKind::Reconnected
+            )
+    });
+    append_remote_access_activity_event(
+        config,
+        RemoteAccessActivityEvent {
+            client_id,
+            source: RemoteAccessSource::NativeApp,
+            event_kind: if had_previous_connect {
+                RemoteAccessActivityKind::Reconnected
+            } else {
+                RemoteAccessActivityKind::Connected
             },
-        );
-        let snapshot = config.clone();
-        bump_host_config_revision(inner);
-        snapshot
-    };
-    queue_host_config_snapshot(inner, snapshot);
-    Ok(())
+            label,
+            ip_address,
+            event_at_epoch_ms: Some(now_epoch_ms()),
+            browser_family: None,
+            browser_version: None,
+            os_family: None,
+            device_class: Some("desktop".to_string()),
+        },
+    );
 }
 
 pub(crate) fn append_remote_access_activity_event(
@@ -1533,82 +1539,236 @@ pub struct RemoteHostService {
     _lifetime_owner: Option<RemoteHostServiceOwner>,
 }
 
-struct NativeConnectionWorker {
-    done: Arc<AtomicBool>,
-    handle: thread::JoinHandle<()>,
-}
-
-struct NativeConnectionWorkerDone(Arc<AtomicBool>);
-
-impl Drop for NativeConnectionWorkerDone {
-    fn drop(&mut self) {
-        self.0.store(true, Ordering::Release);
-    }
-}
-
-enum HostPersistenceWake {
-    Work,
-    Flush(mpsc::SyncSender<()>),
-    Stop,
-}
-
-struct HostPersistenceWorker {
-    wake_tx: mpsc::SyncSender<HostPersistenceWake>,
-    pending: Arc<Mutex<Option<RemoteHostConfig>>>,
+struct RemoteWorker {
+    name: String,
+    completion_rx: mpsc::Receiver<()>,
     handle: Option<thread::JoinHandle<()>>,
 }
 
-impl HostPersistenceWorker {
-    fn new() -> Self {
-        let (wake_tx, wake_rx) = mpsc::sync_channel(1);
-        let pending = Arc::new(Mutex::new(None));
-        let worker_pending = pending.clone();
-        let handle = thread::spawn(move || {
-            while let Ok(wake) = wake_rx.recv() {
-                let should_stop = matches!(&wake, HostPersistenceWake::Stop);
-                let flush_ack = match wake {
-                    HostPersistenceWake::Flush(ack) => Some(ack),
-                    HostPersistenceWake::Work | HostPersistenceWake::Stop => None,
+struct RemoteWorkerCompletion {
+    completion_tx: Option<mpsc::SyncSender<()>>,
+    done: Option<Arc<AtomicBool>>,
+}
+
+impl Drop for RemoteWorkerCompletion {
+    fn drop(&mut self) {
+        if let Some(done) = self.done.as_ref() {
+            done.store(true, Ordering::Release);
+        }
+        if let Some(completion_tx) = self.completion_tx.take() {
+            let _ = completion_tx.try_send(());
+        }
+    }
+}
+
+impl RemoteWorker {
+    fn spawn(
+        name: impl Into<String>,
+        done: Option<Arc<AtomicBool>>,
+        job: impl FnOnce() + Send + 'static,
+    ) -> Self {
+        let name = name.into();
+        let (completion_tx, completion_rx) = mpsc::sync_channel(1);
+        let handle = thread::Builder::new()
+            .name(name.clone())
+            .spawn(move || {
+                let _completion = RemoteWorkerCompletion {
+                    completion_tx: Some(completion_tx),
+                    done,
                 };
-                flush_pending_host_config_snapshots(&worker_pending);
-                if let Some(ack) = flush_ack {
-                    let _ = ack.send(());
-                }
-                if should_stop {
-                    break;
-                }
-            }
-        });
+                job();
+            })
+            .unwrap_or_else(|error| panic!("could not spawn remote worker {name}: {error}"));
         Self {
-            wake_tx,
-            pending,
+            name,
+            completion_rx,
             handle: Some(handle),
         }
     }
+}
 
-    fn queue(&self, snapshot: RemoteHostConfig) {
-        if let Ok(mut pending) = self.pending.lock() {
-            *pending = Some(snapshot);
+struct NativeConnectionWorker {
+    generation: u64,
+    done: Arc<AtomicBool>,
+    worker: RemoteWorker,
+}
+
+struct DeferredRemoteWorker {
+    name: String,
+    handle: thread::JoinHandle<()>,
+    owner: DeferredRemoteWorkerOwner,
+}
+
+enum DeferredRemoteWorkerOwner {
+    Host(Weak<RemoteHostInner>),
+    LocalPortForward {
+        inner: Weak<LocalPortForwardManagerInner>,
+        port: u16,
+    },
+    Unowned,
+}
+
+struct RemoteWorkerReaper {
+    sender: mpsc::Sender<DeferredRemoteWorker>,
+    _handle: Mutex<Option<thread::JoinHandle<()>>>,
+}
+
+static REMOTE_WORKER_REAPER: OnceLock<RemoteWorkerReaper> = OnceLock::new();
+
+fn remote_worker_reaper() -> &'static RemoteWorkerReaper {
+    REMOTE_WORKER_REAPER.get_or_init(|| {
+        let (sender, receiver) = mpsc::channel::<DeferredRemoteWorker>();
+        let handle = thread::Builder::new()
+            .name("remote-worker-reaper".to_string())
+            .spawn(move || {
+                let mut pending = Vec::<DeferredRemoteWorker>::new();
+                loop {
+                    match receiver.recv_timeout(Duration::from_millis(25)) {
+                        Ok(worker) => pending.push(worker),
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(mpsc::RecvTimeoutError::Disconnected) if pending.is_empty() => break,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {}
+                    }
+                    while let Ok(worker) = receiver.try_recv() {
+                        pending.push(worker);
+                    }
+
+                    let mut index = 0;
+                    while index < pending.len() {
+                        if pending[index].handle.is_finished() {
+                            finish_deferred_remote_worker(pending.swap_remove(index));
+                        } else {
+                            index += 1;
+                        }
+                    }
+                }
+            })
+            .expect("remote worker reaper should start");
+        RemoteWorkerReaper {
+            sender,
+            _handle: Mutex::new(Some(handle)),
         }
-        let _ = self.wake_tx.try_send(HostPersistenceWake::Work);
+    })
+}
+
+fn finish_deferred_remote_worker(worker: DeferredRemoteWorker) {
+    let DeferredRemoteWorker {
+        name,
+        handle,
+        owner,
+    } = worker;
+    if handle.join().is_err() {
+        eprintln!("[remote] deferred worker {name} panicked during shutdown");
+    }
+    match owner {
+        DeferredRemoteWorkerOwner::Host(owner) => {
+            if let Some(inner) = owner.upgrade() {
+                let previous = inner.worker_residue_count.fetch_sub(1, Ordering::AcqRel);
+                if previous == 1 {
+                    let residue_is_current = inner
+                        .last_connection_note
+                        .read()
+                        .ok()
+                        .and_then(|note| note.clone())
+                        .is_some_and(|note| {
+                            note.contains("Remote worker residue") && note.contains(&name)
+                        });
+                    if residue_is_current {
+                        set_last_connection_note(
+                            &inner,
+                            format!("Remote worker {name} finished its deferred shutdown."),
+                            false,
+                        );
+                    }
+                }
+                #[cfg(test)]
+                if let Some(hook) = inner
+                    .worker_reaped_test_hook
+                    .read()
+                    .ok()
+                    .and_then(|slot| slot.clone())
+                {
+                    hook(&name);
+                }
+            }
+        }
+        DeferredRemoteWorkerOwner::LocalPortForward { inner, port } => {
+            if let Some(inner) = inner.upgrade() {
+                inner.worker_residue_count.fetch_sub(1, Ordering::AcqRel);
+                let residue_is_current = inner
+                    .statuses
+                    .read()
+                    .ok()
+                    .and_then(|statuses| statuses.get(&port).cloned())
+                    .and_then(|state| state.message)
+                    .is_some_and(|message| {
+                        message.contains("worker residue") && message.contains(&name)
+                    });
+                if residue_is_current {
+                    set_port_forward_state(
+                        &inner,
+                        RemotePortForwardState {
+                            port,
+                            listener_active: false,
+                            local_port_busy: false,
+                            message: Some(format!(
+                                "Local forward worker {name} finished its deferred shutdown."
+                            )),
+                        },
+                    );
+                }
+            }
+        }
+        DeferredRemoteWorkerOwner::Unowned => {}
+    }
+}
+
+fn defer_remote_worker(inner: &Arc<RemoteHostInner>, mut worker: RemoteWorker) {
+    let Some(handle) = worker.handle.take() else {
+        return;
+    };
+    inner.worker_residue_count.fetch_add(1, Ordering::AcqRel);
+    set_last_connection_note(
+        inner,
+        format!(
+            "Remote worker residue: {} did not stop within {} ms; DevManager still owns it until cooperative shutdown completes.",
+            worker.name,
+            REMOTE_WORKER_SHUTDOWN_TIMEOUT.as_millis()
+        ),
+        true,
+    );
+    remote_worker_reaper()
+        .sender
+        .send(DeferredRemoteWorker {
+            name: worker.name,
+            handle,
+            owner: DeferredRemoteWorkerOwner::Host(Arc::downgrade(inner)),
+        })
+        .expect("remote worker reaper should remain available");
+}
+
+fn settle_remote_worker(inner: &Arc<RemoteHostInner>, mut worker: RemoteWorker, deadline: Instant) {
+    let Some(handle) = worker.handle.as_ref() else {
+        return;
+    };
+    if handle.thread().id() == thread::current().id() {
+        defer_remote_worker(inner, worker);
+        return;
     }
 
-    fn flush(&self) {
-        let (ack_tx, ack_rx) = mpsc::sync_channel(0);
-        if self
-            .wake_tx
-            .send(HostPersistenceWake::Flush(ack_tx))
-            .is_ok()
-        {
-            let _ = ack_rx.recv();
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    match worker.completion_rx.recv_timeout(remaining) {
+        Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+            let handle = worker.handle.take().expect("remote worker handle");
+            if handle.join().is_err() {
+                set_last_connection_note(
+                    inner,
+                    format!("Remote worker {} panicked during shutdown.", worker.name),
+                    true,
+                );
+            }
         }
-    }
-
-    fn shutdown(mut self) {
-        let _ = self.wake_tx.send(HostPersistenceWake::Stop);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
+        Err(mpsc::RecvTimeoutError::Timeout) => defer_remote_worker(inner, worker),
     }
 }
 
@@ -1618,58 +1778,68 @@ struct RemoteHostServiceOwner {
 
 impl Drop for RemoteHostServiceOwner {
     fn drop(&mut self) {
-        let _lifecycle_guard = self
-            .inner
-            .lifecycle_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        self.inner
-            .native_runtime_generation
-            .fetch_add(1, Ordering::SeqCst);
-        self.inner.stop_flag.store(true, Ordering::SeqCst);
+        let (
+            stop_generation,
+            session_bootstrap_provider,
+            terminal_input_handler,
+            terminal_resize_handler,
+            focused_session_handler,
+            web_listener,
+            listener_worker,
+            broadcaster_worker,
+        ) = {
+            let _lifecycle_guard = self
+                .inner
+                .lifecycle_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let stop_generation = self
+                .inner
+                .native_runtime_generation
+                .fetch_add(1, Ordering::SeqCst)
+                .wrapping_add(1);
+            self.inner.stop_flag.store(true, Ordering::SeqCst);
+            self.inner.listener_running.store(false, Ordering::Release);
 
-        let session_bootstrap_provider = self
-            .inner
-            .session_bootstrap_provider
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take();
-        let terminal_input_handler = self
-            .inner
-            .terminal_input_handler
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take();
-        let terminal_resize_handler = self
-            .inner
-            .terminal_resize_handler
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take();
-        let focused_session_handler = self
-            .inner
-            .focused_session_handler
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take();
-        let web_listener = self
-            .inner
-            .web_listener
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take();
-        let listener_thread = self
-            .inner
-            .listener_thread
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take();
-        let broadcaster_thread = self
-            .inner
-            .broadcaster_thread
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take();
+            (
+                stop_generation,
+                self.inner
+                    .session_bootstrap_provider
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take(),
+                self.inner
+                    .terminal_input_handler
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take(),
+                self.inner
+                    .terminal_resize_handler
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take(),
+                self.inner
+                    .focused_session_handler
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take(),
+                self.inner
+                    .web_listener
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take(),
+                self.inner
+                    .listener_thread
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take(),
+                self.inner
+                    .broadcaster_thread
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take(),
+            )
+        };
 
         // Drop callbacks outside their locks. The app callbacks can retain
         // non-owning service clones (and the process manager), so running their
@@ -1685,27 +1855,22 @@ impl Drop for RemoteHostServiceOwner {
         // disconnect, then drain once more after shutdown to close the narrow
         // registration race between the first drain and listener teardown.
         drain_web_clients_for_restart(&self.inner);
+        let deadline = Instant::now() + REMOTE_WORKER_SHUTDOWN_TIMEOUT;
         if let Some(listener) = web_listener {
-            listener.shutdown();
+            let worker = RemoteWorker::spawn("remote-web-shutdown", None, move || {
+                listener.shutdown();
+            });
+            settle_remote_worker(&self.inner, worker, deadline);
         }
         drain_web_clients_for_restart(&self.inner);
 
-        if let Some(thread) = listener_thread {
-            let _ = thread.join();
+        if let Some(worker) = listener_worker {
+            settle_remote_worker(&self.inner, worker, deadline);
         }
-        if let Some(thread) = broadcaster_thread {
-            let _ = thread.join();
+        if let Some(worker) = broadcaster_worker {
+            settle_remote_worker(&self.inner, worker, deadline);
         }
-        join_all_native_connection_workers(&self.inner);
-        if let Some(worker) = self
-            .inner
-            .host_persistence_worker
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take()
-        {
-            worker.shutdown();
-        }
+        join_native_connection_workers_before_generation(&self.inner, stop_generation, deadline);
     }
 }
 
@@ -1830,6 +1995,16 @@ pub(crate) struct RemoteHostInner {
     semantic_delivery_lock: Mutex<()>,
     #[cfg(test)]
     semantic_delivery_test_hook: RwLock<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    port_forward_authorizer_test_hook: RwLock<Option<Arc<dyn Fn(u16) -> bool + Send + Sync>>>,
+    #[cfg(test)]
+    lifecycle_lock_acquired_test_hook: RwLock<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    worker_reaped_test_hook: RwLock<Option<Arc<dyn Fn(&str) + Send + Sync>>>,
+    #[cfg(test)]
+    native_lifecycle_test_hook: RwLock<Option<Arc<dyn Fn(NativeLifecycleTestEvent) + Send + Sync>>>,
+    #[cfg(test)]
+    native_worker_registration_test_hook: RwLock<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// Non-blocking admission handle for the web listener's bounded Push
     /// delivery pool. It is absent whenever the listener is stopped.
     web_push_sender: RwLock<Option<web::push::PushSender>>,
@@ -1863,10 +2038,10 @@ pub(crate) struct RemoteHostInner {
     next_push_event_id: AtomicU64,
     native_runtime_generation: AtomicU64,
     stop_flag: AtomicBool,
-    listener_thread: Mutex<Option<thread::JoinHandle<()>>>,
-    broadcaster_thread: Mutex<Option<thread::JoinHandle<()>>>,
+    worker_residue_count: AtomicUsize,
+    listener_thread: Mutex<Option<RemoteWorker>>,
+    broadcaster_thread: Mutex<Option<RemoteWorker>>,
     native_connection_workers: Mutex<HashMap<u64, NativeConnectionWorker>>,
-    host_persistence_worker: Mutex<Option<HostPersistenceWorker>>,
     // Both fields are written on lifecycle transitions and (Phase 1b+)
     // surfaced through the settings panel; suppress the transient warning.
     #[allow(dead_code)]
@@ -1988,6 +2163,7 @@ fn revoke_failed_delivery(
 #[derive(Clone)]
 pub struct RemoteClientHandle {
     inner: Arc<RemoteClientInner>,
+    connection: Arc<RemoteClientConnectionOwner>,
 }
 
 fn sync_screen_snapshot_dimensions(
@@ -2001,7 +2177,6 @@ fn sync_screen_snapshot_dimensions(
 }
 
 struct RemoteClientInner {
-    outgoing: mpsc::Sender<ClientMessage>,
     pending: Mutex<HashMap<u64, mpsc::Sender<RemoteActionResult>>>,
     next_request_id: AtomicU64,
     latest_snapshot: RwLock<Option<RemoteWorkspaceSnapshot>>,
@@ -2018,6 +2193,32 @@ struct RemoteClientInner {
     certificate_fingerprint: String,
     address: String,
     port: u16,
+    #[cfg(test)]
+    reader_exit_test_hook: RwLock<Option<Arc<dyn Fn() + Send + Sync>>>,
+}
+
+struct RemoteClientConnectionOwner {
+    outgoing: mpsc::Sender<ClientMessage>,
+    reader: Mutex<Option<RemoteWorker>>,
+    inner: Weak<RemoteClientInner>,
+}
+
+impl Drop for RemoteClientConnectionOwner {
+    fn drop(&mut self) {
+        let _ = self.outgoing.send(ClientMessage::Disconnect);
+        let reader = self
+            .reader
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(reader) = reader {
+            settle_remote_client_worker(
+                self.inner.upgrade(),
+                reader,
+                Instant::now() + REMOTE_WORKER_SHUTDOWN_TIMEOUT,
+            );
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -2027,14 +2228,45 @@ pub struct LocalPortForwardManager {
 
 struct LocalPortForwardManagerInner {
     client: RemoteClientHandle,
+    operation_lock: Mutex<()>,
     entries: Mutex<HashMap<u16, LocalPortForwardEntry>>,
+    worker_registry: Mutex<LocalPortForwardWorkerRegistry>,
+    next_scope_id: AtomicU64,
+    next_connection_id: AtomicU64,
+    worker_residue_count: AtomicUsize,
     statuses: RwLock<HashMap<u16, RemotePortForwardState>>,
+    #[cfg(test)]
+    connection_handler_test_hook:
+        RwLock<Option<Arc<dyn Fn(u16, TcpStream, Arc<AtomicBool>) + Send + Sync>>>,
+    #[cfg(test)]
+    lifecycle_test_hook:
+        RwLock<Option<Arc<dyn Fn(LocalPortForwardLifecycleTestEvent) + Send + Sync>>>,
 }
 
 struct LocalPortForwardEntry {
+    scope_id: Option<u64>,
     stop: Option<Arc<AtomicBool>>,
-    handle: Option<thread::JoinHandle<()>>,
+    worker: Option<RemoteWorker>,
     retry_after_epoch_ms: u64,
+}
+
+struct LocalPortForwardConnectionWorker {
+    port: u16,
+    scope_id: u64,
+    worker: RemoteWorker,
+}
+
+#[derive(Default)]
+struct LocalPortForwardWorkerRegistry {
+    active_scopes: HashMap<u16, u64>,
+    connections: HashMap<u64, LocalPortForwardConnectionWorker>,
+}
+
+#[cfg(test)]
+impl LocalPortForwardWorkerRegistry {
+    fn is_empty(&self) -> bool {
+        self.active_scopes.is_empty() && self.connections.is_empty()
+    }
 }
 
 impl RemoteHostService {
@@ -2061,6 +2293,16 @@ impl RemoteHostService {
             semantic_delivery_lock: Mutex::new(()),
             #[cfg(test)]
             semantic_delivery_test_hook: RwLock::new(None),
+            #[cfg(test)]
+            port_forward_authorizer_test_hook: RwLock::new(None),
+            #[cfg(test)]
+            lifecycle_lock_acquired_test_hook: RwLock::new(None),
+            #[cfg(test)]
+            worker_reaped_test_hook: RwLock::new(None),
+            #[cfg(test)]
+            native_lifecycle_test_hook: RwLock::new(None),
+            #[cfg(test)]
+            native_worker_registration_test_hook: RwLock::new(None),
             web_push_sender: RwLock::new(None),
             session_bootstrap_provider: RwLock::new(None),
             terminal_input_handler: RwLock::new(None),
@@ -2087,10 +2329,10 @@ impl RemoteHostService {
             next_push_event_id: AtomicU64::new(1),
             native_runtime_generation: AtomicU64::new(1),
             stop_flag: AtomicBool::new(false),
+            worker_residue_count: AtomicUsize::new(0),
             listener_thread: Mutex::new(None),
             broadcaster_thread: Mutex::new(None),
             native_connection_workers: Mutex::new(HashMap::new()),
-            host_persistence_worker: Mutex::new(Some(HostPersistenceWorker::new())),
             web_listener: Mutex::new(None),
             web_listener_error: RwLock::new(None),
         });
@@ -2130,7 +2372,6 @@ impl RemoteHostService {
             let Ok(_update_guard) = self.inner.config_update_lock.lock() else {
                 return;
             };
-            flush_host_config_persistence(&self.inner);
             if let Ok(mut slot) = self.inner.config.write() {
                 *slot = config;
             }
@@ -3679,52 +3920,88 @@ impl RemoteHostService {
     }
 
     fn restart_threads(&self) {
-        let _lifecycle_guard = self
-            .inner
-            .lifecycle_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        self.inner
-            .native_runtime_generation
-            .fetch_add(1, Ordering::SeqCst);
-        self.inner.stop_flag.store(true, Ordering::SeqCst);
-        self.inner.listener_running.store(false, Ordering::Relaxed);
-        if let Ok(mut error) = self.inner.listener_error.write() {
-            *error = None;
-        }
-        if let Ok(mut note) = self.inner.last_connection_note.write() {
-            *note = None;
-        }
-        self.inner
-            .last_connection_is_error
-            .store(false, Ordering::Relaxed);
-        if let Ok(mut handle) = self.inner.listener_thread.lock() {
-            if let Some(thread) = handle.take() {
-                let _ = thread.join();
+        let (generation, listener_worker, broadcaster_worker, web_listener, test_hook) = {
+            let _lifecycle_guard = self
+                .inner
+                .lifecycle_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if self.inner.stop_flag.load(Ordering::Acquire) {
+                return;
             }
-        }
-        if let Ok(mut handle) = self.inner.broadcaster_thread.lock() {
-            if let Some(thread) = handle.take() {
-                let _ = thread.join();
+            let generation = self
+                .inner
+                .native_runtime_generation
+                .fetch_add(1, Ordering::SeqCst)
+                .wrapping_add(1);
+            self.inner.listener_running.store(false, Ordering::Release);
+            if let Ok(mut error) = self.inner.listener_error.write() {
+                *error = None;
             }
+            if let Ok(mut note) = self.inner.last_connection_note.write() {
+                *note = None;
+            }
+            self.inner
+                .last_connection_is_error
+                .store(false, Ordering::Release);
+            if let Ok(mut error) = self.inner.web_listener_error.write() {
+                *error = None;
+            }
+            #[cfg(test)]
+            let test_hook = self
+                .inner
+                .lifecycle_lock_acquired_test_hook
+                .read()
+                .ok()
+                .and_then(|slot| slot.clone());
+            #[cfg(not(test))]
+            let test_hook: Option<Arc<dyn Fn() + Send + Sync>> = None;
+
+            (
+                generation,
+                self.inner
+                    .listener_thread
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take(),
+                self.inner
+                    .broadcaster_thread
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take(),
+                self.inner
+                    .web_listener
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take(),
+                test_hook,
+            )
+        };
+        if let Some(hook) = test_hook {
+            hook();
         }
-        join_all_native_connection_workers(&self.inner);
+
         // Stop accepting browser connections first. Tokio shutdown may cancel
         // WebSocket tasks before their async unregister tail runs, so drain
         // any records left behind immediately afterwards. This ordering also
         // closes the narrow race where a new browser could register between a
         // pre-shutdown drain and runtime teardown.
-        if let Ok(mut slot) = self.inner.web_listener.lock() {
-            if let Some(handle) = slot.take() {
+        drain_web_clients_for_restart(&self.inner);
+        let deadline = Instant::now() + REMOTE_WORKER_SHUTDOWN_TIMEOUT;
+        if let Some(handle) = web_listener {
+            let worker = RemoteWorker::spawn("remote-web-restart", None, move || {
                 handle.shutdown();
-            }
+            });
+            settle_remote_worker(&self.inner, worker, deadline);
         }
         drain_web_clients_for_restart(&self.inner);
-        // Web-listener errors are scoped independently from native TCP state.
-        if let Ok(mut error) = self.inner.web_listener_error.write() {
-            *error = None;
+        if let Some(worker) = listener_worker {
+            settle_remote_worker(&self.inner, worker, deadline);
         }
-        self.inner.stop_flag.store(false, Ordering::SeqCst);
+        if let Some(worker) = broadcaster_worker {
+            settle_remote_worker(&self.inner, worker, deadline);
+        }
+        join_native_connection_workers_before_generation(&self.inner, generation, deadline);
 
         let config = self
             .inner
@@ -3733,27 +4010,59 @@ impl RemoteHostService {
             .map(|slot| slot.clone())
             .unwrap_or_default();
 
-        if config.enabled {
+        let mut new_listener_worker = config.enabled.then(|| {
             let listener_inner = self.inner.clone();
-            let native_runtime_generation =
-                self.inner.native_runtime_generation.load(Ordering::SeqCst);
-            let listener_thread =
-                thread::spawn(move || run_listener(listener_inner, native_runtime_generation));
-            if let Ok(mut handle) = self.inner.listener_thread.lock() {
-                *handle = Some(listener_thread);
-            }
-        }
-
-        // The broadcaster drives snapshot/delta fan-out to every connected
-        // client, regardless of transport. Run it whenever any listener is
-        // enabled — the native TCP one, the browser web one, or both —
-        // otherwise web clients would connect and never see a single delta.
-        if config.enabled || config.web.enabled {
+            RemoteWorker::spawn("remote-native-listener", None, move || {
+                run_listener(listener_inner, generation);
+            })
+        });
+        let mut new_broadcaster_worker = (config.enabled || config.web.enabled).then(|| {
             let broadcaster_inner = self.inner.clone();
-            let broadcaster_thread = thread::spawn(move || run_broadcaster(broadcaster_inner));
-            if let Ok(mut handle) = self.inner.broadcaster_thread.lock() {
-                *handle = Some(broadcaster_thread);
+            RemoteWorker::spawn("remote-broadcaster", None, move || {
+                run_broadcaster(broadcaster_inner, generation);
+            })
+        });
+        let installed = {
+            let _lifecycle_guard = self
+                .inner
+                .lifecycle_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if self.inner.stop_flag.load(Ordering::Acquire)
+                || self.inner.native_runtime_generation.load(Ordering::Acquire) != generation
+            {
+                false
+            } else {
+                if let Some(worker) = new_listener_worker.take() {
+                    *self
+                        .inner
+                        .listener_thread
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(worker);
+                }
+
+                // The broadcaster drives snapshot/delta fan-out to every connected
+                // client, regardless of transport. Run it whenever any listener is
+                // enabled — the native TCP one, the browser web one, or both.
+                if let Some(worker) = new_broadcaster_worker.take() {
+                    *self
+                        .inner
+                        .broadcaster_thread
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(worker);
+                }
+                true
             }
+        };
+        if !installed {
+            let deadline = Instant::now() + REMOTE_WORKER_SHUTDOWN_TIMEOUT;
+            if let Some(worker) = new_listener_worker {
+                settle_remote_worker(&self.inner, worker, deadline);
+            }
+            if let Some(worker) = new_broadcaster_worker {
+                settle_remote_worker(&self.inner, worker, deadline);
+            }
+            return;
         }
 
         // Web listener runs independently of the native TCP listener: users
@@ -3762,13 +4071,47 @@ impl RemoteHostService {
         if config.web.enabled {
             match WebListenerHandle::start(self.inner.clone(), config.web.clone()) {
                 Ok(handle) => {
-                    if let Ok(mut slot) = self.inner.web_listener.lock() {
-                        *slot = Some(handle);
+                    let mut stale_handle = Some(handle);
+                    {
+                        let _lifecycle_guard = self
+                            .inner
+                            .lifecycle_lock
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        if !self.inner.stop_flag.load(Ordering::Acquire)
+                            && self.inner.native_runtime_generation.load(Ordering::Acquire)
+                                == generation
+                        {
+                            *self
+                                .inner
+                                .web_listener
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                                stale_handle.take();
+                        }
+                    }
+                    if let Some(handle) = stale_handle {
+                        let worker =
+                            RemoteWorker::spawn("remote-stale-web-listener", None, move || {
+                                handle.shutdown()
+                            });
+                        settle_remote_worker(
+                            &self.inner,
+                            worker,
+                            Instant::now() + REMOTE_WORKER_SHUTDOWN_TIMEOUT,
+                        );
                     }
                 }
                 Err(error) => {
-                    if let Ok(mut error_slot) = self.inner.web_listener_error.write() {
-                        *error_slot = Some(error);
+                    let _lifecycle_guard = self
+                        .inner
+                        .lifecycle_lock
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if self.inner.native_runtime_generation.load(Ordering::Acquire) == generation {
+                        if let Ok(mut error_slot) = self.inner.web_listener_error.write() {
+                            *error_slot = Some(error);
+                        }
                     }
                 }
             }
@@ -3846,7 +4189,6 @@ impl RemoteClientHandle {
             .into_iter()
             .collect::<Vec<_>>();
         let inner = Arc::new(RemoteClientInner {
-            outgoing: tx.clone(),
             pending: Mutex::new(HashMap::new()),
             next_request_id: AtomicU64::new(1),
             latest_snapshot: RwLock::new(Some(snapshot.clone())),
@@ -3863,18 +4205,27 @@ impl RemoteClientHandle {
             certificate_fingerprint: certificate_fingerprint.clone(),
             address: address.to_string(),
             port,
+            #[cfg(test)]
+            reader_exit_test_hook: RwLock::new(None),
         });
 
         let reader_inner = inner.clone();
-        thread::spawn(move || run_client_connection(stream, rx, reader_inner));
+        let reader = RemoteWorker::spawn("remote-client-reader", None, move || {
+            run_client_connection(stream, rx, reader_inner)
+        });
         if !initial_subscriptions.is_empty() {
             let _ = tx.send(ClientMessage::SubscribeSessions {
                 session_ids: initial_subscriptions,
             });
         }
+        let connection = Arc::new(RemoteClientConnectionOwner {
+            outgoing: tx,
+            reader: Mutex::new(Some(reader)),
+            inner: Arc::downgrade(&inner),
+        });
 
         Ok(RemoteClientConnectResult {
-            client: Self { inner },
+            client: Self { inner, connection },
             server_id,
             certificate_fingerprint,
             client_id,
@@ -3887,7 +4238,7 @@ impl RemoteClientHandle {
 
     pub fn set_focused_session(&self, session_id: Option<String>) {
         let _ = self
-            .inner
+            .connection
             .outgoing
             .send(ClientMessage::SetFocusedSession { session_id });
     }
@@ -3897,7 +4248,7 @@ impl RemoteClientHandle {
             return;
         }
         let _ = self
-            .inner
+            .connection
             .outgoing
             .send(ClientMessage::SubscribeSessions { session_ids });
     }
@@ -3907,27 +4258,30 @@ impl RemoteClientHandle {
             return;
         }
         let _ = self
-            .inner
+            .connection
             .outgoing
             .send(ClientMessage::UnsubscribeSessions { session_ids });
     }
 
     pub fn send_terminal_input(&self, input: RemoteTerminalInput) {
-        let _ = self.inner.outgoing.send(ClientMessage::TerminalInput {
+        let _ = self.connection.outgoing.send(ClientMessage::TerminalInput {
             input,
             enqueued_at_epoch_ms: now_epoch_ms(),
         });
     }
 
     pub fn send_terminal_resize(&self, session_id: String, dimensions: SessionDimensions) {
-        let _ = self.inner.outgoing.send(ClientMessage::ResizeSession {
+        let _ = self.connection.outgoing.send(ClientMessage::ResizeSession {
             session_id,
             dimensions,
         });
     }
 
     pub fn send_action(&self, action: RemoteAction) {
-        let _ = self.inner.outgoing.send(ClientMessage::Action { action });
+        let _ = self
+            .connection
+            .outgoing
+            .send(ClientMessage::Action { action });
     }
 
     pub fn take_control(&self) {
@@ -3938,7 +4292,7 @@ impl RemoteClientHandle {
             }
         }
         self.inner.snapshot_revision.fetch_add(1, Ordering::Relaxed);
-        let _ = self.inner.outgoing.send(ClientMessage::TakeControl);
+        let _ = self.connection.outgoing.send(ClientMessage::TakeControl);
     }
 
     pub fn release_control(&self) {
@@ -3951,11 +4305,11 @@ impl RemoteClientHandle {
             }
         }
         self.inner.snapshot_revision.fetch_add(1, Ordering::Relaxed);
-        let _ = self.inner.outgoing.send(ClientMessage::ReleaseControl);
+        let _ = self.connection.outgoing.send(ClientMessage::ReleaseControl);
     }
 
     pub fn disconnect(&self) {
-        let _ = self.inner.outgoing.send(ClientMessage::Disconnect);
+        let _ = self.connection.outgoing.send(ClientMessage::Disconnect);
     }
 
     pub fn request(&self, action: RemoteAction) -> Result<RemoteActionResult, String> {
@@ -3965,7 +4319,7 @@ impl RemoteClientHandle {
         if let Ok(mut pending) = self.inner.pending.lock() {
             pending.insert(request_id, tx);
         }
-        self.inner
+        self.connection
             .outgoing
             .send(ClientMessage::Request { request_id, action })
             .map_err(|error| format!("Remote request failed: {error}"))?;
@@ -4132,14 +4486,9 @@ impl RemoteClientHandle {
         }
     }
 
+    #[cfg(test)]
     fn note_output_received(&self, emitted_at_epoch_ms: u64) {
-        let now_ms = now_epoch_ms();
-        if let Ok(mut latency) = self.inner.latency.write() {
-            latency.output_host_to_client_ms = Some(now_ms.saturating_sub(emitted_at_epoch_ms));
-        }
-        self.inner
-            .pending_paint_received_at_epoch_ms
-            .store(now_ms, Ordering::Relaxed);
+        note_remote_output_received(&self.inner, emitted_at_epoch_ms);
     }
 
     fn note_terminal_paint_ready(&self) {
@@ -4157,64 +4506,112 @@ impl RemoteClientHandle {
     }
 }
 
+fn note_remote_output_received(inner: &Arc<RemoteClientInner>, emitted_at_epoch_ms: u64) {
+    let now_ms = now_epoch_ms();
+    if let Ok(mut latency) = inner.latency.write() {
+        latency.output_host_to_client_ms = Some(now_ms.saturating_sub(emitted_at_epoch_ms));
+    }
+    inner
+        .pending_paint_received_at_epoch_ms
+        .store(now_ms, Ordering::Relaxed);
+}
+
 impl LocalPortForwardManager {
     pub fn new(client: RemoteClientHandle) -> Self {
         Self {
             inner: Arc::new(LocalPortForwardManagerInner {
                 client,
+                operation_lock: Mutex::new(()),
                 entries: Mutex::new(HashMap::new()),
+                worker_registry: Mutex::new(LocalPortForwardWorkerRegistry::default()),
+                next_scope_id: AtomicU64::new(1),
+                next_connection_id: AtomicU64::new(1),
+                worker_residue_count: AtomicUsize::new(0),
                 statuses: RwLock::new(HashMap::new()),
+                #[cfg(test)]
+                connection_handler_test_hook: RwLock::new(None),
+                #[cfg(test)]
+                lifecycle_test_hook: RwLock::new(None),
             }),
         }
     }
 
     pub fn sync_ports(&self, desired_ports: &[u16]) -> bool {
+        let _operation = self
+            .inner
+            .operation_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let desired = desired_ports.iter().copied().collect::<HashSet<_>>();
         let now_epoch_ms = now_epoch_ms();
         let mut changed = false;
 
-        let Ok(mut entries) = self.inner.entries.lock() else {
-            return false;
+        let listener_states = self
+            .inner
+            .statuses
+            .read()
+            .map(|statuses| statuses.clone())
+            .unwrap_or_default();
+        let (entries_to_stop, ports_to_start, removed_ports) = {
+            let Ok(mut entries) = self.inner.entries.lock() else {
+                return false;
+            };
+            let mut entries_to_stop = Vec::new();
+            let mut ports_to_start = Vec::new();
+            let mut removed_ports = Vec::new();
+
+            let existing_ports = entries.keys().copied().collect::<Vec<_>>();
+            for port in existing_ports {
+                if desired.contains(&port) {
+                    continue;
+                }
+                if let Some(entry) = entries.remove(&port) {
+                    entries_to_stop.push((port, entry));
+                }
+                removed_ports.push(port);
+                changed = true;
+            }
+
+            for &port in &desired {
+                let listener_active = listener_states
+                    .get(&port)
+                    .map(|state| state.listener_active)
+                    .unwrap_or(false);
+                let should_start = match entries.get(&port) {
+                    Some(entry) => {
+                        (!listener_active)
+                            || (entry.stop.is_none() && now_epoch_ms >= entry.retry_after_epoch_ms)
+                    }
+                    None => true,
+                };
+                if !should_start {
+                    continue;
+                }
+                if let Some(entry) = entries.remove(&port) {
+                    entries_to_stop.push((port, entry));
+                }
+                ports_to_start.push(port);
+                changed = true;
+            }
+            (entries_to_stop, ports_to_start, removed_ports)
         };
 
-        let existing_ports = entries.keys().copied().collect::<Vec<_>>();
-        for port in existing_ports {
-            if desired.contains(&port) {
-                continue;
-            }
-            if let Some(mut entry) = entries.remove(&port) {
-                stop_local_port_forward_entry(&mut entry);
-            }
-            if let Ok(mut statuses) = self.inner.statuses.write() {
+        let deadline = Instant::now() + REMOTE_WORKER_SHUTDOWN_TIMEOUT;
+        for (port, entry) in entries_to_stop {
+            stop_local_port_forward_port(&self.inner, port, entry, deadline);
+        }
+        if let Ok(mut statuses) = self.inner.statuses.write() {
+            for port in removed_ports {
                 statuses.remove(&port);
             }
-            changed = true;
         }
 
-        for &port in &desired {
-            let listener_active = self
-                .inner
-                .statuses
-                .read()
-                .ok()
-                .and_then(|statuses| statuses.get(&port).map(|state| state.listener_active))
-                .unwrap_or(false);
-            let should_start = match entries.get(&port) {
-                Some(entry) => {
-                    (!listener_active)
-                        || (entry.stop.is_none() && now_epoch_ms >= entry.retry_after_epoch_ms)
-                }
-                None => true,
-            };
-            if !should_start {
-                continue;
-            }
-            if let Some(mut old_entry) = entries.remove(&port) {
-                stop_local_port_forward_entry(&mut old_entry);
-            }
+        for port in ports_to_start {
             match start_local_port_forward_listener(self.inner.clone(), port) {
                 Ok(entry) => {
-                    entries.insert(port, entry);
+                    if let Ok(mut entries) = self.inner.entries.lock() {
+                        entries.insert(port, entry);
+                    }
                     set_port_forward_state(
                         &self.inner,
                         RemotePortForwardState {
@@ -4228,14 +4625,17 @@ impl LocalPortForwardManager {
                     );
                 }
                 Err(error) => {
-                    entries.insert(
-                        port,
-                        LocalPortForwardEntry {
-                            stop: None,
-                            handle: None,
-                            retry_after_epoch_ms: now_epoch_ms.saturating_add(1000),
-                        },
-                    );
+                    if let Ok(mut entries) = self.inner.entries.lock() {
+                        entries.insert(
+                            port,
+                            LocalPortForwardEntry {
+                                scope_id: None,
+                                stop: None,
+                                worker: None,
+                                retry_after_epoch_ms: now_epoch_ms.saturating_add(1000),
+                            },
+                        );
+                    }
                     let local_port_busy = error.contains("already in use");
                     set_port_forward_state(
                         &self.inner,
@@ -4248,22 +4648,40 @@ impl LocalPortForwardManager {
                     );
                 }
             }
-            changed = true;
         }
 
         changed
     }
 
     pub fn shutdown(&self) {
-        let Ok(mut entries) = self.inner.entries.lock() else {
-            return;
-        };
-        for entry in entries.values_mut() {
-            stop_local_port_forward_entry(entry);
+        let _operation = self
+            .inner
+            .operation_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entries = self
+            .inner
+            .entries
+            .lock()
+            .map(|mut entries| entries.drain().collect::<Vec<_>>())
+            .unwrap_or_default();
+        for (_, entry) in &entries {
+            if let Some(stop) = entry.stop.as_ref() {
+                stop.store(true, Ordering::Release);
+            }
         }
-        entries.clear();
+        let deadline = Instant::now() + REMOTE_WORKER_SHUTDOWN_TIMEOUT;
+        for (port, entry) in entries {
+            stop_local_port_forward_port(&self.inner, port, entry, deadline);
+        }
+        settle_all_local_port_forward_connections(&self.inner, deadline);
         if let Ok(mut statuses) = self.inner.statuses.write() {
-            statuses.clear();
+            statuses.retain(|_, state| {
+                state
+                    .message
+                    .as_deref()
+                    .is_some_and(|message| message.contains("worker residue"))
+            });
         }
     }
 
@@ -4290,6 +4708,41 @@ impl LocalPortForwardManager {
     }
 }
 
+impl Drop for LocalPortForwardManagerInner {
+    fn drop(&mut self) {
+        let entries = {
+            let entries = self
+                .entries
+                .get_mut()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            std::mem::take(entries)
+        };
+        for entry in entries.values() {
+            if let Some(stop) = entry.stop.as_ref() {
+                stop.store(true, Ordering::Release);
+            }
+        }
+
+        let deadline = Instant::now() + REMOTE_WORKER_SHUTDOWN_TIMEOUT;
+        for (_, mut entry) in entries {
+            if let Some(worker) = entry.worker.take() {
+                settle_unowned_remote_worker(worker, deadline);
+            }
+        }
+        let connections = {
+            let registry = self
+                .worker_registry
+                .get_mut()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            registry.active_scopes.clear();
+            std::mem::take(&mut registry.connections)
+        };
+        for (_, connection) in connections {
+            settle_unowned_remote_worker(connection.worker, deadline);
+        }
+    }
+}
+
 fn format_handshake_stage_error(address: &str, port: u16, stage: &str, error: &str) -> String {
     let trimmed = error.trim();
     let mut message = format!("Handshake failed: {trimmed}");
@@ -4313,12 +4766,258 @@ fn set_port_forward_state(
     }
 }
 
-fn stop_local_port_forward_entry(entry: &mut LocalPortForwardEntry) {
+fn stop_local_port_forward_port(
+    inner: &Arc<LocalPortForwardManagerInner>,
+    port: u16,
+    mut entry: LocalPortForwardEntry,
+    deadline: Instant,
+) {
     if let Some(stop) = entry.stop.take() {
         stop.store(true, Ordering::SeqCst);
     }
-    if let Some(handle) = entry.handle.take() {
-        let _ = handle.join();
+    let connections = close_local_port_forward_scope(inner, port, entry.scope_id.take());
+    #[cfg(test)]
+    if let Some(hook) = inner
+        .lifecycle_test_hook
+        .read()
+        .ok()
+        .and_then(|slot| slot.clone())
+    {
+        hook(LocalPortForwardLifecycleTestEvent::AcceptanceClosed);
+    }
+    if let Some(worker) = entry.worker.take() {
+        settle_local_port_forward_worker(inner, port, worker, deadline);
+    }
+    for connection in connections {
+        settle_local_port_forward_worker(inner, port, connection.worker, deadline);
+    }
+}
+
+fn defer_local_port_forward_worker(
+    inner: &Arc<LocalPortForwardManagerInner>,
+    port: u16,
+    mut worker: RemoteWorker,
+) {
+    let Some(handle) = worker.handle.take() else {
+        return;
+    };
+    inner.worker_residue_count.fetch_add(1, Ordering::AcqRel);
+    set_port_forward_state(
+        inner,
+        RemotePortForwardState {
+            port,
+            listener_active: false,
+            local_port_busy: false,
+            message: Some(format!(
+                "Local forward worker residue: {} did not stop within {} ms; DevManager still owns it until cooperative shutdown completes.",
+                worker.name,
+                REMOTE_WORKER_SHUTDOWN_TIMEOUT.as_millis()
+            )),
+        },
+    );
+    remote_worker_reaper()
+        .sender
+        .send(DeferredRemoteWorker {
+            name: worker.name,
+            handle,
+            owner: DeferredRemoteWorkerOwner::LocalPortForward {
+                inner: Arc::downgrade(inner),
+                port,
+            },
+        })
+        .expect("remote worker reaper should remain available");
+}
+
+fn defer_unowned_remote_worker(mut worker: RemoteWorker) {
+    let Some(handle) = worker.handle.take() else {
+        return;
+    };
+    remote_worker_reaper()
+        .sender
+        .send(DeferredRemoteWorker {
+            name: worker.name,
+            handle,
+            owner: DeferredRemoteWorkerOwner::Unowned,
+        })
+        .expect("remote worker reaper should remain available");
+}
+
+fn settle_local_port_forward_worker(
+    inner: &Arc<LocalPortForwardManagerInner>,
+    port: u16,
+    mut worker: RemoteWorker,
+    deadline: Instant,
+) {
+    let Some(handle) = worker.handle.as_ref() else {
+        return;
+    };
+    if handle.thread().id() == thread::current().id() {
+        defer_local_port_forward_worker(inner, port, worker);
+        return;
+    }
+
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    match worker.completion_rx.recv_timeout(remaining) {
+        Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+            let handle = worker.handle.take().expect("local forward worker handle");
+            if handle.join().is_err() {
+                set_port_forward_state(
+                    inner,
+                    RemotePortForwardState {
+                        port,
+                        listener_active: false,
+                        local_port_busy: false,
+                        message: Some(format!(
+                            "Local forward worker {} panicked during shutdown.",
+                            worker.name
+                        )),
+                    },
+                );
+            }
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            defer_local_port_forward_worker(inner, port, worker)
+        }
+    }
+}
+
+fn settle_unowned_remote_worker(mut worker: RemoteWorker, deadline: Instant) {
+    let Some(handle) = worker.handle.as_ref() else {
+        return;
+    };
+    if handle.thread().id() == thread::current().id() {
+        defer_unowned_remote_worker(worker);
+        return;
+    }
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    match worker.completion_rx.recv_timeout(remaining) {
+        Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+            let handle = worker.handle.take().expect("remote worker handle");
+            let _ = handle.join();
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => defer_unowned_remote_worker(worker),
+    }
+}
+
+fn settle_remote_client_worker(
+    inner: Option<Arc<RemoteClientInner>>,
+    mut worker: RemoteWorker,
+    deadline: Instant,
+) {
+    let Some(handle) = worker.handle.as_ref() else {
+        return;
+    };
+    if handle.thread().id() == thread::current().id() {
+        if let Some(inner) = inner.as_ref() {
+            if let Ok(mut message) = inner.disconnected_message.write() {
+                *message = Some(format!(
+                    "Remote client worker residue: {} could not join itself; DevManager retained its handle.",
+                    worker.name
+                ));
+            }
+        }
+        defer_unowned_remote_worker(worker);
+        return;
+    }
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    match worker.completion_rx.recv_timeout(remaining) {
+        Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+            let handle = worker.handle.take().expect("remote client worker handle");
+            if handle.join().is_err() {
+                if let Some(inner) = inner.as_ref() {
+                    if let Ok(mut message) = inner.disconnected_message.write() {
+                        *message = Some(format!(
+                            "Remote client worker {} panicked during shutdown.",
+                            worker.name
+                        ));
+                    }
+                }
+            }
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            if let Some(inner) = inner.as_ref() {
+                if let Ok(mut message) = inner.disconnected_message.write() {
+                    *message = Some(format!(
+                        "Remote client worker residue: {} did not stop within {} ms; DevManager retained its handle.",
+                        worker.name,
+                        REMOTE_WORKER_SHUTDOWN_TIMEOUT.as_millis()
+                    ));
+                }
+            }
+            defer_unowned_remote_worker(worker);
+        }
+    }
+}
+
+fn reap_completed_local_port_forward_workers(inner: &Arc<LocalPortForwardManagerInner>) {
+    let completed = {
+        let Ok(mut registry) = inner.worker_registry.lock() else {
+            return;
+        };
+        let completed_ids = registry
+            .connections
+            .iter()
+            .filter_map(|(connection_id, worker)| {
+                worker
+                    .worker
+                    .handle
+                    .as_ref()
+                    .is_some_and(thread::JoinHandle::is_finished)
+                    .then_some(*connection_id)
+            })
+            .collect::<Vec<_>>();
+        completed_ids
+            .into_iter()
+            .filter_map(|connection_id| registry.connections.remove(&connection_id))
+            .collect::<Vec<_>>()
+    };
+    for mut connection in completed {
+        if let Some(handle) = connection.worker.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn close_local_port_forward_scope(
+    inner: &Arc<LocalPortForwardManagerInner>,
+    port: u16,
+    scope_id: Option<u64>,
+) -> Vec<LocalPortForwardConnectionWorker> {
+    let Some(scope_id) = scope_id else {
+        return Vec::new();
+    };
+    let Ok(mut registry) = inner.worker_registry.lock() else {
+        return Vec::new();
+    };
+    if registry.active_scopes.get(&port).copied() == Some(scope_id) {
+        registry.active_scopes.remove(&port);
+    }
+    let connection_ids = registry
+        .connections
+        .iter()
+        .filter_map(|(connection_id, worker)| {
+            (worker.port == port && worker.scope_id == scope_id).then_some(*connection_id)
+        })
+        .collect::<Vec<_>>();
+    connection_ids
+        .into_iter()
+        .filter_map(|connection_id| registry.connections.remove(&connection_id))
+        .collect()
+}
+
+fn settle_all_local_port_forward_connections(
+    inner: &Arc<LocalPortForwardManagerInner>,
+    deadline: Instant,
+) {
+    let connections = {
+        let Ok(mut registry) = inner.worker_registry.lock() else {
+            return;
+        };
+        registry.active_scopes.clear();
+        std::mem::take(&mut registry.connections)
+    };
+    for connection in connections.into_values() {
+        settle_local_port_forward_worker(inner, connection.port, connection.worker, deadline);
     }
 }
 
@@ -4336,66 +5035,132 @@ fn start_local_port_forward_listener(
     listener
         .set_nonblocking(true)
         .map_err(|error| format!("Could not configure localhost:{port}: {error}"))?;
+    let scope_id = inner.next_scope_id.fetch_add(1, Ordering::Relaxed);
+    inner
+        .worker_registry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .active_scopes
+        .insert(port, scope_id);
     let stop = Arc::new(AtomicBool::new(false));
     let stop_flag = stop.clone();
-    let thread_inner = inner.clone();
-    let handle = thread::spawn(move || {
-        run_local_port_forward_listener(thread_inner, port, listener, stop_flag)
+    let thread_inner = Arc::downgrade(&inner);
+    let worker = RemoteWorker::spawn(format!("local-forward-listener-{port}"), None, move || {
+        run_local_port_forward_listener(thread_inner, port, scope_id, listener, stop_flag)
     });
     Ok(LocalPortForwardEntry {
+        scope_id: Some(scope_id),
         stop: Some(stop),
-        handle: Some(handle),
+        worker: Some(worker),
         retry_after_epoch_ms: 0,
     })
 }
 
 fn run_local_port_forward_listener(
-    inner: Arc<LocalPortForwardManagerInner>,
+    inner: Weak<LocalPortForwardManagerInner>,
     port: u16,
+    scope_id: u64,
     listener: TcpListener,
     stop_flag: Arc<AtomicBool>,
 ) {
-    set_port_forward_state(
-        &inner,
-        RemotePortForwardState {
-            port,
-            listener_active: true,
-            local_port_busy: false,
-            message: Some(format!(
-                "Forwarding http://localhost:{port} to the remote host."
-            )),
-        },
-    );
+    if let Some(inner) = inner.upgrade() {
+        set_port_forward_state(
+            &inner,
+            RemotePortForwardState {
+                port,
+                listener_active: true,
+                local_port_busy: false,
+                message: Some(format!(
+                    "Forwarding http://localhost:{port} to the remote host."
+                )),
+            },
+        );
+    }
 
     while !stop_flag.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((socket, _)) => {
-                let connection_inner = inner.clone();
-                let client = inner.client.clone();
+                let Some(strong_inner) = inner.upgrade() else {
+                    let _ = socket.shutdown(Shutdown::Both);
+                    return;
+                };
+                #[cfg(test)]
+                if let Some(hook) = strong_inner
+                    .lifecycle_test_hook
+                    .read()
+                    .ok()
+                    .and_then(|slot| slot.clone())
+                {
+                    hook(LocalPortForwardLifecycleTestEvent::ConnectionAccepted);
+                }
+                #[cfg(test)]
+                let connection_handler_test_hook = strong_inner
+                    .connection_handler_test_hook
+                    .read()
+                    .ok()
+                    .and_then(|slot| slot.clone());
+                let mut registry = strong_inner
+                    .worker_registry
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let scope_is_active = !stop_flag.load(Ordering::Acquire)
+                    && registry.active_scopes.get(&port).copied() == Some(scope_id);
+                if !scope_is_active {
+                    let _ = socket.shutdown(Shutdown::Both);
+                    return;
+                }
+                let connection_inner = Arc::downgrade(&strong_inner);
+                let client = strong_inner.client.clone();
                 let connection_stop_flag = stop_flag.clone();
-                thread::spawn(move || {
-                    handle_local_port_forward_connection(
-                        connection_inner,
-                        client,
+                let connection_id = strong_inner
+                    .next_connection_id
+                    .fetch_add(1, Ordering::Relaxed);
+                let worker = RemoteWorker::spawn(
+                    format!("local-forward-{port}-{connection_id}"),
+                    None,
+                    move || {
+                        #[cfg(test)]
+                        if let Some(hook) = connection_handler_test_hook {
+                            hook(port, socket, connection_stop_flag);
+                            return;
+                        }
+                        handle_local_port_forward_connection(
+                            connection_inner,
+                            client,
+                            port,
+                            socket,
+                            connection_stop_flag,
+                        )
+                    },
+                );
+                registry.connections.insert(
+                    connection_id,
+                    LocalPortForwardConnectionWorker {
                         port,
-                        socket,
-                        connection_stop_flag,
-                    )
-                });
+                        scope_id,
+                        worker,
+                    },
+                );
+                drop(registry);
+                reap_completed_local_port_forward_workers(&strong_inner);
             }
             Err(error) if error.kind() == ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(12));
             }
             Err(error) => {
-                set_port_forward_state(
-                    &inner,
-                    RemotePortForwardState {
-                        port,
-                        listener_active: false,
-                        local_port_busy: false,
-                        message: Some(format!("Local forward listener on {port} failed: {error}")),
-                    },
-                );
+                if let Some(inner) = inner.upgrade() {
+                    set_port_forward_state(
+                        &inner,
+                        RemotePortForwardState {
+                            port,
+                            listener_active: false,
+                            local_port_busy: false,
+                            message: Some(format!(
+                                "Local forward listener on {port} failed: {error}"
+                            )),
+                        },
+                    );
+                }
                 return;
             }
         }
@@ -4403,7 +5168,7 @@ fn run_local_port_forward_listener(
 }
 
 fn handle_local_port_forward_connection(
-    inner: Arc<LocalPortForwardManagerInner>,
+    inner: Weak<LocalPortForwardManagerInner>,
     client: RemoteClientHandle,
     port: u16,
     mut local_socket: TcpStream,
@@ -4415,15 +5180,17 @@ fn handle_local_port_forward_connection(
     let mut remote_stream = match client.open_port_forward(port) {
         Ok(stream) => stream,
         Err(error) => {
-            set_port_forward_state(
-                &inner,
-                RemotePortForwardState {
-                    port,
-                    listener_active: true,
-                    local_port_busy: false,
-                    message: Some(format!("Tunnel error on localhost:{port}: {error}")),
-                },
-            );
+            if let Some(inner) = inner.upgrade() {
+                set_port_forward_state(
+                    &inner,
+                    RemotePortForwardState {
+                        port,
+                        listener_active: true,
+                        local_port_busy: false,
+                        message: Some(format!("Tunnel error on localhost:{port}: {error}")),
+                    },
+                );
+            }
             let _ = local_socket.shutdown(Shutdown::Both);
             return;
         }
@@ -4435,15 +5202,17 @@ fn handle_local_port_forward_connection(
     if let Err(error) = copy_bidirectional(&mut local_socket, &mut remote_stream, || {
         stop_flag.load(Ordering::Acquire)
     }) {
-        set_port_forward_state(
-            &inner,
-            RemotePortForwardState {
-                port,
-                listener_active: true,
-                local_port_busy: false,
-                message: Some(format!("Tunnel error on localhost:{port}: {error}")),
-            },
-        );
+        if let Some(inner) = inner.upgrade() {
+            set_port_forward_state(
+                &inner,
+                RemotePortForwardState {
+                    port,
+                    listener_active: true,
+                    local_port_busy: false,
+                    message: Some(format!("Tunnel error on localhost:{port}: {error}")),
+                },
+            );
+        }
     }
     let _ = local_socket.shutdown(Shutdown::Both);
     let _ = remote_stream.sock.shutdown(Shutdown::Both);
@@ -4518,6 +5287,18 @@ fn native_connection_should_stop(inner: &RemoteHostInner, native_runtime_generat
         || inner.native_runtime_generation.load(Ordering::Acquire) != native_runtime_generation
 }
 
+#[cfg(test)]
+fn notify_native_lifecycle(inner: &Arc<RemoteHostInner>, event: NativeLifecycleTestEvent) {
+    let hook = inner
+        .native_lifecycle_test_hook
+        .read()
+        .ok()
+        .and_then(|slot| slot.clone());
+    if let Some(hook) = hook {
+        hook(event);
+    }
+}
+
 fn spawn_native_connection_worker(
     inner: &Arc<RemoteHostInner>,
     connection_id: u64,
@@ -4525,22 +5306,56 @@ fn spawn_native_connection_worker(
     native_runtime_generation: u64,
 ) {
     let done = Arc::new(AtomicBool::new(false));
-    let worker_done = done.clone();
     let thread_inner = inner.clone();
-    let handle = thread::spawn(move || {
-        let _done = NativeConnectionWorkerDone(worker_done);
-        handle_client_connection(
-            thread_inner,
-            connection_id,
-            stream,
-            native_runtime_generation,
+    let worker = RemoteWorker::spawn(
+        format!("remote-native-{connection_id}"),
+        Some(done.clone()),
+        move || {
+            handle_client_connection(
+                thread_inner,
+                connection_id,
+                stream,
+                native_runtime_generation,
+            );
+        },
+    );
+    #[cfg(test)]
+    if let Some(hook) = inner
+        .native_worker_registration_test_hook
+        .read()
+        .ok()
+        .and_then(|slot| slot.clone())
+    {
+        hook();
+    }
+    let mut worker = Some(worker);
+    {
+        let _lifecycle_guard = inner
+            .lifecycle_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !native_connection_should_stop(inner, native_runtime_generation) {
+            inner
+                .native_connection_workers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(
+                    connection_id,
+                    NativeConnectionWorker {
+                        generation: native_runtime_generation,
+                        done,
+                        worker: worker.take().expect("native worker should register once"),
+                    },
+                );
+        }
+    }
+    if let Some(worker) = worker {
+        settle_remote_worker(
+            inner,
+            worker,
+            Instant::now() + REMOTE_WORKER_SHUTDOWN_TIMEOUT,
         );
-    });
-    let mut workers = inner
-        .native_connection_workers
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    workers.insert(connection_id, NativeConnectionWorker { done, handle });
+    }
 }
 
 fn reap_completed_native_connection_workers(inner: &Arc<RemoteHostInner>) {
@@ -4564,20 +5379,37 @@ fn reap_completed_native_connection_workers(inner: &Arc<RemoteHostInner>) {
             .collect::<Vec<_>>()
     };
     for worker in completed {
-        let _ = worker.handle.join();
+        settle_remote_worker(
+            inner,
+            worker.worker,
+            Instant::now() + REMOTE_WORKER_SHUTDOWN_TIMEOUT,
+        );
     }
 }
 
-fn join_all_native_connection_workers(inner: &Arc<RemoteHostInner>) {
-    let workers = inner
-        .native_connection_workers
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .drain()
-        .map(|(_, worker)| worker)
-        .collect::<Vec<_>>();
+fn join_native_connection_workers_before_generation(
+    inner: &Arc<RemoteHostInner>,
+    generation: u64,
+    deadline: Instant,
+) {
+    let workers = {
+        let mut workers = inner
+            .native_connection_workers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let stopped_ids = workers
+            .iter()
+            .filter_map(|(connection_id, worker)| {
+                (worker.generation < generation).then_some(*connection_id)
+            })
+            .collect::<Vec<_>>();
+        stopped_ids
+            .into_iter()
+            .filter_map(|connection_id| workers.remove(&connection_id))
+            .collect::<Vec<_>>()
+    };
     for worker in workers {
-        let _ = worker.handle.join();
+        settle_remote_worker(inner, worker.worker, deadline);
     }
 }
 
@@ -4609,6 +5441,8 @@ fn run_listener(inner: Arc<RemoteHostInner>, native_runtime_generation: u64) {
         *slot = None;
     }
     let _ = listener.set_nonblocking(true);
+    #[cfg(test)]
+    notify_native_lifecycle(&inner, NativeLifecycleTestEvent::ListenerStarted);
 
     while !native_connection_should_stop(&inner, native_runtime_generation) {
         reap_completed_native_connection_workers(&inner);
@@ -4631,13 +5465,13 @@ fn run_listener(inner: Arc<RemoteHostInner>, native_runtime_generation: u64) {
     inner.listener_running.store(false, Ordering::Relaxed);
 }
 
-fn run_broadcaster(inner: Arc<RemoteHostInner>) {
+fn run_broadcaster(inner: Arc<RemoteHostInner>, native_runtime_generation: u64) {
     let mut last_snapshot_revision = 0_u64;
     let mut last_semantic_delivery_revision = 0_u64;
     let mut last_controller_client_id: Option<String> = None;
     let mut last_bootstrap_retry_at: HashMap<String, Instant> = HashMap::new();
 
-    while !inner.stop_flag.load(Ordering::Relaxed) {
+    while !native_connection_should_stop(&inner, native_runtime_generation) {
         reap_completed_native_connection_workers(&inner);
         let connected_clients = inner
             .clients
@@ -4649,7 +5483,11 @@ fn run_broadcaster(inner: Arc<RemoteHostInner>) {
             continue;
         }
 
-        deliver_pending_bootstraps(&inner, &mut last_bootstrap_retry_at);
+        deliver_pending_bootstraps_for_generation(
+            &inner,
+            &mut last_bootstrap_retry_at,
+            native_runtime_generation,
+        );
 
         let snapshot_revision = inner.snapshot_revision.load(Ordering::Relaxed);
         if snapshot_revision != last_semantic_delivery_revision
@@ -4746,9 +5584,19 @@ fn run_broadcaster(inner: Arc<RemoteHostInner>) {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn deliver_pending_bootstraps(
     inner: &Arc<RemoteHostInner>,
     last_bootstrap_retry_at: &mut HashMap<String, Instant>,
+) {
+    let generation = inner.native_runtime_generation.load(Ordering::Acquire);
+    deliver_pending_bootstraps_for_generation(inner, last_bootstrap_retry_at, generation);
+}
+
+fn deliver_pending_bootstraps_for_generation(
+    inner: &Arc<RemoteHostInner>,
+    last_bootstrap_retry_at: &mut HashMap<String, Instant>,
+    native_runtime_generation: u64,
 ) {
     // Retry pending bootstraps from the broadcaster thread instead of the PTY
     // output path. That keeps terminal output flowing immediately and rate-
@@ -4811,7 +5659,13 @@ pub(crate) fn deliver_pending_bootstraps(
     let bootstraps: HashMap<String, RemoteSessionBootstrap> = due_session_ids
         .iter()
         .filter_map(|session_id| {
-            provider(session_id).map(|bootstrap| (session_id.clone(), bootstrap))
+            run_bounded_bootstrap_provider(
+                inner,
+                provider.clone(),
+                session_id,
+                native_runtime_generation,
+            )
+            .map(|bootstrap| (session_id.clone(), bootstrap))
         })
         .collect();
     if bootstraps.is_empty() {
@@ -4865,6 +5719,62 @@ pub(crate) fn deliver_pending_bootstraps(
             }
         } else {
             revoke_failed_delivery(inner, connection_id, target);
+        }
+    }
+}
+
+fn run_bounded_bootstrap_provider(
+    inner: &Arc<RemoteHostInner>,
+    provider: SessionBootstrapProvider,
+    session_id: &str,
+    native_runtime_generation: u64,
+) -> Option<RemoteSessionBootstrap> {
+    if native_connection_should_stop(inner, native_runtime_generation) {
+        return None;
+    }
+    let Some(permit) = inner.host_work_limiter.try_acquire() else {
+        set_last_connection_note(
+            inner,
+            "Remote bootstrap callback capacity is exhausted; retrying shortly.".to_string(),
+            true,
+        );
+        return None;
+    };
+    let callback_session_id = session_id.to_string();
+    let worker_name = format!(
+        "remote-bootstrap-{:016x}",
+        stable_hash(&callback_session_id)
+    );
+    let (result_tx, result_rx) = mpsc::sync_channel(1);
+    let worker = RemoteWorker::spawn(worker_name, None, move || {
+        let result = permit.run(|| provider(&callback_session_id));
+        let _ = result_tx.try_send(result);
+    });
+
+    match result_rx.recv_timeout(REMOTE_CALLBACK_TIMEOUT) {
+        Ok(result) => {
+            settle_remote_worker(
+                inner,
+                worker,
+                Instant::now() + REMOTE_WORKER_SHUTDOWN_TIMEOUT,
+            );
+            if native_connection_should_stop(inner, native_runtime_generation) {
+                None
+            } else {
+                result
+            }
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            settle_remote_worker(inner, worker, Instant::now());
+            None
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            settle_remote_worker(
+                inner,
+                worker,
+                Instant::now() + REMOTE_WORKER_SHUTDOWN_TIMEOUT,
+            );
+            None
         }
     }
 }
@@ -4946,7 +5856,11 @@ fn handle_client_connection(
 
     let (tx, rx) = mpsc::channel::<ServerMessage>();
 
-    let (client_id, client_token, client_label) = match authenticate_client(&inner, hello) {
+    let (client_id, client_token, _client_label) = match authenticate_client_and_record_activity(
+        &inner,
+        hello,
+        peer_ip.clone(),
+    ) {
         Ok(auth) => auth,
         Err(message) => {
             set_last_connection_note(
@@ -4961,6 +5875,9 @@ fn handle_client_connection(
             return;
         }
     };
+    if native_connection_should_stop(&inner, native_runtime_generation) {
+        return;
+    }
 
     let controller_client_id = inner
         .controller_client_id
@@ -4972,7 +5889,7 @@ fn handle_client_connection(
     let app_hash = stable_hash(&snapshot.app_state);
     let runtime_hash = stable_hash(&snapshot.runtime_state);
     let port_hash = stable_hash(&snapshot.port_statuses);
-    if let Ok(mut clients) = inner.clients.lock() {
+    let _registered = if let Ok(mut clients) = inner.clients.lock() {
         clients.insert(
             connection_id,
             ConnectedRemoteClient {
@@ -4993,6 +5910,13 @@ fn handle_client_connection(
                 last_snapshot_revision: inner.snapshot_revision.load(Ordering::Relaxed),
             },
         );
+        true
+    } else {
+        false
+    };
+    #[cfg(test)]
+    if _registered {
+        notify_native_lifecycle(&inner, NativeLifecycleTestEvent::ClientRegistered);
     }
 
     let hello_ok = ServerMessage::HelloOk {
@@ -5017,19 +5941,14 @@ fn handle_client_connection(
             "[remote] handshake reply failed for connection {connection_id} ({client_id} from {peer_label}): {error}"
         );
         if let Ok(mut clients) = inner.clients.lock() {
-            clients.remove(&connection_id);
+            let _removed = clients.remove(&connection_id).is_some();
+            drop(clients);
+            #[cfg(test)]
+            if _removed {
+                notify_native_lifecycle(&inner, NativeLifecycleTestEvent::ClientRemoved);
+            }
         }
         return;
-    }
-    if let Err(error) = record_native_connection_activity(
-        &inner,
-        client_id.clone(),
-        client_label.clone(),
-        peer_ip.clone(),
-    ) {
-        eprintln!(
-            "[remote] failed to persist native access log for {client_id} from {peer_label}: {error}"
-        );
     }
     set_last_connection_note(
         &inner,
@@ -5071,10 +5990,13 @@ fn handle_client_connection(
                     }
                 }
                 if let Some(session_id) = session_id {
-                    if let Ok(handler) = inner.focused_session_handler.read() {
-                        if let Some(handler) = handler.as_ref() {
-                            handler(session_id);
-                        }
+                    let handler = inner
+                        .focused_session_handler
+                        .read()
+                        .ok()
+                        .and_then(|slot| slot.clone());
+                    if let Some(handler) = handler {
+                        handler(session_id);
                     }
                 }
             }
@@ -5136,10 +6058,13 @@ fn handle_client_connection(
                 enqueued_at_epoch_ms,
             })) => {
                 if current_controller_allows(&inner, &client_id) {
-                    if let Ok(handler) = inner.terminal_input_handler.read() {
-                        if let Some(handler) = handler.as_ref() {
-                            let _ = handler(input, enqueued_at_epoch_ms);
-                        }
+                    let handler = inner
+                        .terminal_input_handler
+                        .read()
+                        .ok()
+                        .and_then(|slot| slot.clone());
+                    if let Some(handler) = handler {
+                        let _ = handler(input, enqueued_at_epoch_ms);
                     }
                 }
             }
@@ -5148,10 +6073,13 @@ fn handle_client_connection(
                 dimensions,
             })) => {
                 if current_controller_allows(&inner, &client_id) {
-                    if let Ok(handler) = inner.terminal_resize_handler.read() {
-                        if let Some(handler) = handler.as_ref() {
-                            handler(session_id, dimensions);
-                        }
+                    let handler = inner
+                        .terminal_resize_handler
+                        .read()
+                        .ok()
+                        .and_then(|slot| slot.clone());
+                    if let Some(handler) = handler {
+                        handler(session_id, dimensions);
                     }
                 }
             }
@@ -5199,9 +6127,11 @@ fn handle_client_connection(
     }
 
     let _ = stream.sock.shutdown(Shutdown::Both);
-    if let Ok(mut clients) = inner.clients.lock() {
-        clients.remove(&connection_id);
-    }
+    let _removed = inner
+        .clients
+        .lock()
+        .map(|mut clients| clients.remove(&connection_id).is_some())
+        .unwrap_or(false);
     if let Ok(mut controller) = inner.controller_client_id.write() {
         if controller.as_deref() == Some(client_id.as_str()) {
             *controller = None;
@@ -5212,23 +6142,63 @@ fn handle_client_connection(
         format!("Remote client {client_id} disconnected from {peer_label}."),
         false,
     );
-    if let Ok(_update_guard) = inner.config_update_lock.lock() {
-        if let Ok(mut config) = inner.config.write() {
-            if let Some(client) = config
-                .paired_clients
-                .iter_mut()
-                .find(|client| client.client_id == client_id)
-            {
-                client.last_seen_epoch_ms = Some(now_epoch_ms());
-                bump_host_config_revision(&inner);
-            }
+    // The successful handshake already persisted a last-seen value. Refresh it
+    // for an ordinary client disconnect, but do not begin filesystem work after
+    // the host generation has been cancelled; root teardown must remain
+    // cooperative and bounded under a slow profile filesystem.
+    if !native_connection_should_stop(&inner, native_runtime_generation) {
+        if let Err(error) = mutate_host_config_if(
+            &inner,
+            |config| {
+                config
+                    .paired_clients
+                    .iter()
+                    .any(|client| client.client_id == client_id)
+            },
+            |config| {
+                config
+                    .paired_clients
+                    .iter_mut()
+                    .find(|client| client.client_id == client_id)
+                    .expect("serialized native client condition must remain true")
+                    .last_seen_epoch_ms = Some(now_epoch_ms());
+            },
+        ) {
+            set_last_connection_note(
+                &inner,
+                format!(
+                    "Remote client {client_id} disconnected, but its last-seen update could not be saved: {error}"
+                ),
+                true,
+            );
         }
+    }
+    #[cfg(test)]
+    if _removed {
+        notify_native_lifecycle(&inner, NativeLifecycleTestEvent::ClientRemoved);
     }
 }
 
+#[cfg(test)]
 fn authenticate_client(
     inner: &Arc<RemoteHostInner>,
     hello: ClientMessage,
+) -> Result<(String, String, String), String> {
+    authenticate_client_with_activity(inner, hello, None)
+}
+
+fn authenticate_client_and_record_activity(
+    inner: &Arc<RemoteHostInner>,
+    hello: ClientMessage,
+    ip_address: Option<String>,
+) -> Result<(String, String, String), String> {
+    authenticate_client_with_activity(inner, hello, Some(ip_address))
+}
+
+fn authenticate_client_with_activity(
+    inner: &Arc<RemoteHostInner>,
+    hello: ClientMessage,
+    activity_ip_address: Option<Option<String>>,
 ) -> Result<(String, String, String), String> {
     let ClientMessage::Hello {
         protocol_version,
@@ -5251,6 +6221,8 @@ fn authenticate_client(
     } else {
         client_label
     };
+    let record_activity = activity_ip_address.is_some();
+    let activity_ip_address = activity_ip_address.flatten();
 
     match auth {
         ClientAuth::PairToken { token } => {
@@ -5266,6 +6238,14 @@ fn authenticate_client(
                         auth_token: client_token.clone(),
                         last_seen_epoch_ms: Some(now_epoch_ms()),
                     });
+                    if record_activity {
+                        append_native_connection_activity(
+                            config,
+                            client_id.clone(),
+                            client_label.clone(),
+                            activity_ip_address.clone(),
+                        );
+                    }
                     (client_id, client_token, client_label)
                 },
             )?
@@ -5283,18 +6263,31 @@ fn authenticate_client(
                     .any(|client| client.client_id == client_id && client.auth_token == auth_token)
             },
             |config| {
-                let client = config
-                    .paired_clients
-                    .iter_mut()
-                    .find(|client| client.client_id == client_id && client.auth_token == auth_token)
-                    .expect("serialized native client condition must remain true");
-                client.label = client_label;
-                client.last_seen_epoch_ms = Some(now_epoch_ms());
-                (
-                    client.client_id.clone(),
-                    client.auth_token.clone(),
-                    client.label.clone(),
-                )
+                let authenticated = {
+                    let client = config
+                        .paired_clients
+                        .iter_mut()
+                        .find(|client| {
+                            client.client_id == client_id && client.auth_token == auth_token
+                        })
+                        .expect("serialized native client condition must remain true");
+                    client.label = client_label;
+                    client.last_seen_epoch_ms = Some(now_epoch_ms());
+                    (
+                        client.client_id.clone(),
+                        client.auth_token.clone(),
+                        client.label.clone(),
+                    )
+                };
+                if record_activity {
+                    append_native_connection_activity(
+                        config,
+                        authenticated.0.clone(),
+                        authenticated.2.clone(),
+                        activity_ip_address.clone(),
+                    );
+                }
+                authenticated
             },
         )?
         .ok_or_else(|| "Saved remote credentials are no longer valid.".to_string()),
@@ -5309,11 +6302,31 @@ fn handle_port_forward_connection(
     native_runtime_generation: u64,
 ) -> Result<(), String> {
     let (client_id, auth_token, requested_port) = authenticate_port_forward(inner, hello)?;
-    let mut upstream = TcpStream::connect(("127.0.0.1", requested_port))
-        .or_else(|_| TcpStream::connect(("::1", requested_port)))
-        .map_err(|error| {
-            format!("Could not connect to host localhost:{requested_port}: {error}")
-        })?;
+    let mut last_connect_error = None;
+    let mut upstream = None;
+    for address in [
+        SocketAddr::from((Ipv4Addr::LOCALHOST, requested_port)),
+        SocketAddr::from((Ipv6Addr::LOCALHOST, requested_port)),
+    ] {
+        if native_connection_should_stop(inner, native_runtime_generation) {
+            return Err("Remote host stopped before the port forward connected.".to_string());
+        }
+        match TcpStream::connect_timeout(&address, PORT_FORWARD_CONNECT_TIMEOUT) {
+            Ok(stream) => {
+                upstream = Some(stream);
+                break;
+            }
+            Err(error) => last_connect_error = Some(error),
+        }
+    }
+    let mut upstream = upstream.ok_or_else(|| {
+        format!(
+            "Could not connect to host localhost:{requested_port}: {}",
+            last_connect_error
+                .map(|error| error.to_string())
+                .unwrap_or_else(|| "no loopback address was available".to_string())
+        )
+    })?;
     let _ = upstream.set_nodelay(true);
     let _ = upstream.set_read_timeout(Some(Duration::from_millis(40)));
     let _ = upstream.set_write_timeout(Some(Duration::from_secs(5)));
@@ -5391,6 +6404,16 @@ fn native_client_credentials_are_current(
 }
 
 fn host_can_forward_port(inner: &Arc<RemoteHostInner>, requested_port: u16) -> bool {
+    #[cfg(test)]
+    if let Some(authorize) = inner
+        .port_forward_authorizer_test_hook
+        .read()
+        .ok()
+        .and_then(|slot| slot.clone())
+    {
+        return authorize(requested_port);
+    }
+
     let app_state = inner
         .shared_state
         .read()
@@ -5987,10 +7010,7 @@ fn run_client_connection(
                         bytes,
                         ..
                     } => {
-                        let handle = RemoteClientHandle {
-                            inner: inner.clone(),
-                        };
-                        handle.note_output_received(emitted_at_epoch_ms);
+                        note_remote_output_received(&inner, emitted_at_epoch_ms);
                         apply_remote_session_output(&inner, &session_id, &bytes);
                     }
                     RemoteSessionStreamEvent::RuntimePatch {
@@ -6088,6 +7108,15 @@ fn run_client_connection(
         if disconnected.is_none() {
             *disconnected = Some("Remote host connection was lost.".to_string());
         }
+    }
+    #[cfg(test)]
+    if let Some(hook) = inner
+        .reader_exit_test_hook
+        .read()
+        .ok()
+        .and_then(|slot| slot.clone())
+    {
+        hook();
     }
 }
 
@@ -6356,17 +7385,20 @@ mod tests {
         apply_remote_session_output, apply_workspace_delta, authenticate_client,
         current_controller_allows, current_snapshot, deliver_live_semantic_events,
         deliver_pending_bootstraps, drain_web_clients_for_restart, format_handshake_stage_error,
-        generate_pairing_token, light_snapshot, load_remote_machine_state,
-        native_connection_should_stop, now_epoch_ms, publish_semantic_event, read_message,
+        generate_pairing_token, handle_client_connection, light_snapshot,
+        load_remote_machine_state, native_connection_should_stop, now_epoch_ms,
+        publish_semantic_event, read_message, read_message_until_cancelled, remote_state_path,
         request_timeout_for_action, requires_control, run_broadcaster, save_remote_known_hosts,
-        save_remote_machine_state, set_last_connection_note, try_enqueue_pending_request,
-        upsert_known_host, write_message, ClientAuth, ClientMessage, ConnectedRemoteClient,
-        KnownRemoteHost, LocalPortForwardManager, PairedRemoteClient, PairedWebClient,
-        PendingRemoteRequest, RemoteAccessActivityEvent, RemoteAccessActivityKind,
+        save_remote_machine_state, set_last_connection_note, spawn_native_connection_worker,
+        try_enqueue_pending_request, upsert_known_host, write_message, ClientAuth, ClientMessage,
+        ConnectedRemoteClient, HostConfigPersistenceTestPhase, KnownRemoteHost,
+        LocalPortForwardLifecycleTestEvent, LocalPortForwardManager, PairedRemoteClient,
+        PairedWebClient, PendingRemoteRequest, RemoteAccessActivityEvent, RemoteAccessActivityKind,
         RemoteAccessSource, RemoteAction, RemoteClientHandle, RemoteClientInner, RemoteHostConfig,
         RemoteHostService, RemoteHostWorkLimiter, RemoteLatencyStats, RemoteMachineState,
-        RemoteSessionBootstrap, RemoteSessionStreamEvent, RemoteTerminalInput,
-        RemoteWorkspaceDelta, RemoteWorkspaceSnapshot, ServerMessage, MAX_PENDING_REMOTE_REQUESTS,
+        RemoteSessionBootstrap, RemoteSessionStreamEvent, RemoteTerminalInput, RemoteWorker,
+        RemoteWorkspaceDelta, RemoteWorkspaceSnapshot, ServerMessage,
+        HOST_CONFIG_PERSISTENCE_TEST_HOOK, MAX_PENDING_REMOTE_REQUESTS,
     };
     use crate::models::{PortStatus, SessionTab, TabType};
     use crate::remote::presentation::{
@@ -6389,12 +7421,40 @@ mod tests {
     };
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
     use std::collections::{HashMap, HashSet};
+    use std::io::{ErrorKind, Read as _, Write as _};
     use std::net::{TcpListener, TcpStream};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::sync::{mpsc, Arc, Mutex, RwLock};
     use std::thread;
     use std::time::{Duration, Instant};
+
+    struct HostConfigPersistenceHookGuard;
+
+    impl HostConfigPersistenceHookGuard {
+        fn install(
+            hook: Arc<
+                dyn Fn(&RemoteHostConfig, HostConfigPersistenceTestPhase) -> std::io::Result<()>
+                    + Send
+                    + Sync,
+            >,
+        ) -> Self {
+            let mut slot = HOST_CONFIG_PERSISTENCE_TEST_HOOK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert!(slot.is_none(), "host config persistence test hook leaked");
+            *slot = Some(hook);
+            Self
+        }
+    }
+
+    impl Drop for HostConfigPersistenceHookGuard {
+        fn drop(&mut self) {
+            *HOST_CONFIG_PERSISTENCE_TEST_HOOK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        }
+    }
 
     fn test_terminal_screen(text: &str) -> TerminalScreenSnapshot {
         let mut snapshot = TerminalScreenSnapshot::default();
@@ -8961,6 +10021,292 @@ mod tests {
     }
 
     #[test]
+    fn broadcaster_callback_can_reenter_lifecycle_while_restart_waits_for_it() {
+        let _profile = TestProfileGuard::new("reentrant-broadcaster-restart");
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let (client_tx, _client_rx) = mpsc::channel();
+        let mut client = test_connected_client("client-1", client_tx, None);
+        client.subscribed_session_ids.insert("alpha".to_string());
+        client
+            .bootstrap_pending_session_ids
+            .insert("alpha".to_string());
+        service
+            .inner
+            .clients
+            .lock()
+            .expect("clients lock")
+            .insert(1, client);
+
+        let (provider_entered_tx, provider_entered_rx) = mpsc::sync_channel(1);
+        let (provider_release_tx, provider_release_rx) = mpsc::sync_channel(0);
+        let provider_release_rx = Arc::new(Mutex::new(provider_release_rx));
+        let (reentry_done_tx, reentry_done_rx) = mpsc::sync_channel(1);
+        let reentrant_service = service.clone();
+        service.set_session_bootstrap_provider(Some(Arc::new(move |_| {
+            provider_entered_tx
+                .send(())
+                .expect("provider observer should remain");
+            provider_release_rx
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .recv_timeout(Duration::from_secs(3))
+                .expect("provider should be released");
+            reentrant_service.apply_config(RemoteHostConfig::default());
+            reentry_done_tx
+                .send(())
+                .expect("reentry observer should remain");
+            None
+        })));
+
+        let broadcaster_inner = service.inner.clone();
+        let generation = service
+            .inner
+            .native_runtime_generation
+            .load(Ordering::Acquire);
+        let broadcaster = RemoteWorker::spawn("test-reentrant-broadcaster", None, move || {
+            run_broadcaster(broadcaster_inner, generation);
+        });
+        *service
+            .inner
+            .broadcaster_thread
+            .lock()
+            .expect("broadcaster handle lock") = Some(broadcaster);
+        provider_entered_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("broadcaster should invoke provider");
+
+        let (restart_locked_tx, restart_locked_rx) = mpsc::sync_channel(1);
+        *service
+            .inner
+            .lifecycle_lock_acquired_test_hook
+            .write()
+            .expect("lifecycle hook lock") = Some(Arc::new(move || {
+            let _ = restart_locked_tx.try_send(());
+        }));
+        let restart_service = service.clone();
+        let (restart_done_tx, restart_done_rx) = mpsc::sync_channel(1);
+        let restart = thread::spawn(move || {
+            restart_service.apply_config(RemoteHostConfig::default());
+            restart_done_tx
+                .send(())
+                .expect("restart observer should remain");
+        });
+        restart_locked_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("restart should acquire lifecycle state");
+        provider_release_tx
+            .send(())
+            .expect("provider should still be waiting");
+        reentry_done_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("provider should reenter apply_config without deadlocking");
+        restart_done_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("restart should finish after provider returns");
+        restart.join().expect("restart thread should finish");
+    }
+
+    #[test]
+    fn broadcaster_bounds_a_blocked_bootstrap_callback_and_reports_residue() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let (client_tx, _client_rx) = mpsc::channel();
+        let mut client = test_connected_client("client-1", client_tx, None);
+        client.subscribed_session_ids.insert("alpha".to_string());
+        client
+            .bootstrap_pending_session_ids
+            .insert("alpha".to_string());
+        service
+            .inner
+            .clients
+            .lock()
+            .expect("clients lock")
+            .insert(1, client);
+
+        let (provider_entered_tx, provider_entered_rx) = mpsc::sync_channel(1);
+        let (provider_release_tx, provider_release_rx) = mpsc::sync_channel(0);
+        let provider_release_rx = Arc::new(Mutex::new(provider_release_rx));
+        service.set_session_bootstrap_provider(Some(Arc::new(move |_| {
+            provider_entered_tx
+                .send(())
+                .expect("provider observer should remain");
+            provider_release_rx
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .recv_timeout(Duration::from_secs(3))
+                .expect("provider should be released");
+            None
+        })));
+
+        let delivery_inner = service.inner.clone();
+        let (delivery_done_tx, delivery_done_rx) = mpsc::sync_channel(1);
+        let delivery = thread::spawn(move || {
+            deliver_pending_bootstraps(&delivery_inner, &mut HashMap::new());
+            delivery_done_tx
+                .send(())
+                .expect("delivery observer should remain");
+        });
+        provider_entered_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("delivery should invoke provider");
+        let returned_within_bound = delivery_done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .is_ok();
+        let bounded_status = returned_within_bound.then(|| service.status());
+
+        provider_release_tx
+            .send(())
+            .expect("provider should still be waiting");
+        if !returned_within_bound {
+            delivery_done_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("delivery should finish once provider is released");
+        }
+        delivery.join().expect("delivery worker should finish");
+
+        assert!(
+            returned_within_bound,
+            "broadcaster waited indefinitely for a bootstrap callback"
+        );
+        let status = bounded_status.expect("bounded callback should expose status");
+        assert!(status.last_connection_is_error);
+        assert!(
+            status
+                .last_connection_note
+                .as_deref()
+                .is_some_and(|note| note.contains("worker residue")),
+            "callback timeout did not expose retained worker ownership: {:?}",
+            status.last_connection_note
+        );
+    }
+
+    #[test]
+    fn owner_drop_is_bounded_and_reports_a_blocked_broadcaster_residue() {
+        let _profile = TestProfileGuard::new("bounded-broadcaster-shutdown");
+        let root = RemoteHostService::new(RemoteHostConfig::default());
+        let observer = root.clone();
+        let (worker_reaped_tx, worker_reaped_rx) = mpsc::sync_channel(1);
+        *root
+            .inner
+            .worker_reaped_test_hook
+            .write()
+            .expect("reaper hook lock") = Some(Arc::new(move |name| {
+            worker_reaped_tx
+                .send(name.to_string())
+                .expect("reaper observer should remain");
+        }));
+        let (broadcaster_entered_tx, broadcaster_entered_rx) = mpsc::sync_channel(1);
+        let (broadcaster_release_tx, broadcaster_release_rx) = mpsc::sync_channel(0);
+        let broadcaster = RemoteWorker::spawn("test-blocked-broadcaster", None, move || {
+            broadcaster_entered_tx
+                .send(())
+                .expect("broadcaster observer should remain");
+            broadcaster_release_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("broadcaster should be released");
+        });
+        *root
+            .inner
+            .broadcaster_thread
+            .lock()
+            .expect("broadcaster handle lock") = Some(broadcaster);
+        broadcaster_entered_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("broadcaster should start");
+
+        let (drop_done_tx, drop_done_rx) = mpsc::sync_channel(1);
+        let drop_thread = thread::spawn(move || {
+            drop(root);
+            drop_done_tx.send(()).expect("drop observer should remain");
+        });
+        let returned_within_bound = drop_done_rx.recv_timeout(Duration::from_secs(1)).is_ok();
+        if returned_within_bound {
+            let status = observer.status();
+            assert!(status.last_connection_is_error);
+            assert!(
+                status
+                    .last_connection_note
+                    .as_deref()
+                    .is_some_and(|note| note.contains("worker residue")),
+                "bounded shutdown did not expose its residue: {:?}",
+                status.last_connection_note
+            );
+        }
+        broadcaster_release_tx
+            .send(())
+            .expect("broadcaster should still be waiting");
+        if !returned_within_bound {
+            drop_done_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("drop should finish once the broadcaster is released");
+        }
+        drop_thread.join().expect("drop thread should finish");
+        let reaped_worker = worker_reaped_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("retained broadcaster handle should be joined after callback exit");
+
+        assert!(
+            returned_within_bound,
+            "owner drop waited indefinitely for a blocked broadcaster worker"
+        );
+        assert_eq!(reaped_worker, "test-blocked-broadcaster");
+        assert_eq!(
+            observer.inner.worker_residue_count.load(Ordering::Acquire),
+            0,
+            "joined deferred worker remained reported as residue"
+        );
+    }
+
+    #[test]
+    fn deferred_worker_reaper_joins_completed_work_behind_a_blocked_worker() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let (reaped_tx, reaped_rx) = mpsc::channel();
+        *service
+            .inner
+            .worker_reaped_test_hook
+            .write()
+            .expect("reaper hook lock") = Some(Arc::new(move |name| {
+            reaped_tx
+                .send(name.to_string())
+                .expect("reaper observer should remain");
+        }));
+
+        let (blocked_entered_tx, blocked_entered_rx) = mpsc::sync_channel(1);
+        let (blocked_release_tx, blocked_release_rx) = mpsc::sync_channel(0);
+        let blocked = RemoteWorker::spawn("test-reaper-blocked", None, move || {
+            blocked_entered_tx
+                .send(())
+                .expect("blocked observer should remain");
+            blocked_release_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("blocked worker should be released");
+        });
+        blocked_entered_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("blocked worker should start");
+        super::defer_remote_worker(&service.inner, blocked);
+
+        let completed = RemoteWorker::spawn("test-reaper-completed", None, || {});
+        super::defer_remote_worker(&service.inner, completed);
+        let first_reaped = reaped_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("completed deferred worker should be joined independently");
+        assert_eq!(
+            first_reaped, "test-reaper-completed",
+            "a blocked deferred worker prevented the reaper from joining independent completed work"
+        );
+        blocked_release_tx
+            .send(())
+            .expect("blocked worker should still be waiting");
+        let second_reaped = reaped_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("released deferred worker should eventually be joined");
+        assert_eq!(
+            second_reaped, "test-reaper-blocked",
+            "the released deferred worker should be reaped after its completion"
+        );
+    }
+
+    #[test]
     fn update_snapshot_parts_only_replaces_changed_sections() {
         let service = RemoteHostService::new(RemoteHostConfig::default());
         let mut app_state = AppState::default();
@@ -9176,7 +10522,7 @@ mod tests {
         let _profile = TestProfileGuard::new("loopback-handshake");
         let port = reserve_free_tcp_port();
         let mut config = RemoteHostConfig {
-            enabled: true,
+            enabled: false,
             bind_address: "127.0.0.1".to_string(),
             port,
             ..RemoteHostConfig::default()
@@ -9184,11 +10530,23 @@ mod tests {
         let pair_token = config.pairing_token.clone();
         let expected_server_id = config.server_id.clone();
         let service = RemoteHostService::new(config.clone());
-
-        wait_for(
-            || service.status().listening,
-            Duration::from_secs(3),
-            "remote host never started listening",
+        let (lifecycle_tx, lifecycle_rx) = mpsc::channel();
+        *service
+            .inner
+            .native_lifecycle_test_hook
+            .write()
+            .expect("native lifecycle hook lock") = Some(Arc::new(move |event| {
+            lifecycle_tx
+                .send(event)
+                .expect("native lifecycle observer should remain");
+        }));
+        config.enabled = true;
+        service.apply_config(config.clone());
+        assert_eq!(
+            lifecycle_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("remote host never started listening"),
+            super::NativeLifecycleTestEvent::ListenerStarted
         );
 
         let result = RemoteClientHandle::connect(
@@ -9207,22 +10565,194 @@ mod tests {
         assert!(!result.you_have_control);
         assert_eq!(result.snapshot.server_id, expected_server_id);
 
-        wait_for(
-            || service.status().connected_clients == 1,
-            Duration::from_secs(3),
-            "host never registered connected client",
+        assert_eq!(
+            lifecycle_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("host never registered connected client"),
+            super::NativeLifecycleTestEvent::ClientRegistered
         );
 
         result.client.disconnect();
 
-        wait_for(
-            || service.status().connected_clients == 0,
-            Duration::from_secs(3),
-            "host never observed client disconnect",
+        assert_eq!(
+            lifecycle_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("host never observed client disconnect"),
+            super::NativeLifecycleTestEvent::ClientRemoved
         );
 
         config.enabled = false;
         service.apply_config(config);
+    }
+
+    #[test]
+    fn native_input_callback_can_replace_its_own_handler_without_deadlock() {
+        let _profile = TestProfileGuard::new("native-input-handler-reentry");
+        let port = reserve_free_tcp_port();
+        let mut config = RemoteHostConfig {
+            enabled: false,
+            bind_address: "127.0.0.1".to_string(),
+            port,
+            ..RemoteHostConfig::default()
+        };
+        let pair_token = config.pairing_token.clone();
+        let service = RemoteHostService::new(config.clone());
+        let (lifecycle_tx, lifecycle_rx) = mpsc::channel();
+        *service
+            .inner
+            .native_lifecycle_test_hook
+            .write()
+            .expect("native lifecycle hook lock") = Some(Arc::new(move |event| {
+            lifecycle_tx
+                .send(event)
+                .expect("native lifecycle observer should remain");
+        }));
+
+        let (callback_done_tx, callback_done_rx) = mpsc::sync_channel(1);
+        let reentrant_service = service.clone();
+        service.set_terminal_input_handler(Some(Arc::new(move |_, _| {
+            reentrant_service.set_terminal_input_handler(None);
+            callback_done_tx
+                .send(())
+                .expect("callback observer should remain");
+            Ok(())
+        })));
+
+        config.enabled = true;
+        service.apply_config(config.clone());
+        assert_eq!(
+            lifecycle_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("remote host never started listening"),
+            super::NativeLifecycleTestEvent::ListenerStarted
+        );
+        let result = RemoteClientHandle::connect(
+            "127.0.0.1",
+            port,
+            "Reentrant callback client",
+            ClientAuth::PairToken { token: pair_token },
+            None,
+        )
+        .expect("loopback remote connect should succeed");
+        assert_eq!(
+            lifecycle_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("host never registered connected client"),
+            super::NativeLifecycleTestEvent::ClientRegistered
+        );
+
+        result.client.take_control();
+        result
+            .client
+            .send_terminal_input(RemoteTerminalInput::Text {
+                session_id: "alpha".to_string(),
+                text: "hello".to_string(),
+            });
+        callback_done_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("native callback deadlocked while replacing its own handler");
+
+        result.client.disconnect();
+        assert_eq!(
+            lifecycle_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("host never observed client disconnect"),
+            super::NativeLifecycleTestEvent::ClientRemoved
+        );
+        config.enabled = false;
+        service.apply_config(config);
+    }
+
+    #[test]
+    fn dropping_last_remote_client_handle_joins_its_reader_connection() {
+        let _profile = TestProfileGuard::new("remote-client-reader-drop");
+        let port = reserve_free_tcp_port();
+        let mut config = RemoteHostConfig {
+            enabled: false,
+            bind_address: "127.0.0.1".to_string(),
+            port,
+            ..RemoteHostConfig::default()
+        };
+        let pair_token = config.pairing_token.clone();
+        let service = RemoteHostService::new(config.clone());
+        let (lifecycle_tx, lifecycle_rx) = mpsc::channel();
+        *service
+            .inner
+            .native_lifecycle_test_hook
+            .write()
+            .expect("native lifecycle hook lock") = Some(Arc::new(move |event| {
+            lifecycle_tx
+                .send(event)
+                .expect("native lifecycle observer should remain");
+        }));
+        config.enabled = true;
+        service.apply_config(config);
+        assert_eq!(
+            lifecycle_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("remote host never started listening"),
+            super::NativeLifecycleTestEvent::ListenerStarted
+        );
+        let result = RemoteClientHandle::connect(
+            "127.0.0.1",
+            port,
+            "Drop client",
+            ClientAuth::PairToken { token: pair_token },
+            None,
+        )
+        .expect("loopback remote connect should succeed");
+        assert_eq!(
+            lifecycle_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("host never registered connected client"),
+            super::NativeLifecycleTestEvent::ClientRegistered
+        );
+        let (owner_event_tx, owner_event_rx) = mpsc::channel();
+        let reader_event_tx = owner_event_tx.clone();
+        *result
+            .client
+            .inner
+            .reader_exit_test_hook
+            .write()
+            .expect("reader exit hook lock") = Some(Arc::new(move || {
+            reader_event_tx
+                .send("reader-exited")
+                .expect("reader observer should remain");
+        }));
+        let client_inner = Arc::downgrade(&result.client.inner);
+
+        let drop_thread = thread::spawn(move || {
+            drop(result);
+            owner_event_tx
+                .send("owner-dropped")
+                .expect("owner observer should remain");
+        });
+
+        assert_eq!(
+            owner_event_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("client reader should exit before its owner returns"),
+            "reader-exited",
+            "last client owner returned before joining its reader"
+        );
+        assert_eq!(
+            owner_event_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("last client owner should finish after joining its reader"),
+            "owner-dropped"
+        );
+        drop_thread.join().expect("client owner drop should finish");
+        assert_eq!(
+            lifecycle_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("host should observe last client owner disconnect"),
+            super::NativeLifecycleTestEvent::ClientRemoved
+        );
+        assert!(
+            client_inner.upgrade().is_none(),
+            "client reader retained its state after connection teardown"
+        );
+        drop(service);
     }
 
     #[test]
@@ -9310,55 +10840,365 @@ mod tests {
     }
 
     #[test]
-    fn native_client_connections_are_recorded_in_activity_log() {
-        let _profile = TestProfileGuard::new("native-activity-log");
+    fn native_handshake_waits_for_durable_activity_before_success() {
+        let _profile = TestProfileGuard::new("native-activity-durable-before-success");
+        let config = RemoteHostConfig::default();
+        let pair_token = config.pairing_token.clone();
+        let service = RemoteHostService::new(config);
+
+        let (persistence_entered_tx, persistence_entered_rx) = mpsc::sync_channel(1);
+        let (persistence_release_tx, persistence_release_rx) = mpsc::sync_channel(0);
+        let (persistence_settled_tx, persistence_settled_rx) = mpsc::sync_channel(1);
+        let persistence_release_rx = Arc::new(Mutex::new(persistence_release_rx));
+        let activity_write_seen = Arc::new(AtomicBool::new(false));
+        let _persistence_hook = HostConfigPersistenceHookGuard::install(Arc::new({
+            let persistence_release_rx = persistence_release_rx.clone();
+            let activity_write_seen = activity_write_seen.clone();
+            move |snapshot, phase| {
+                if phase == HostConfigPersistenceTestPhase::BeforeWrite
+                    && !snapshot.web.activity_log.is_empty()
+                    && !activity_write_seen.swap(true, Ordering::SeqCst)
+                {
+                    persistence_entered_tx.send(()).map_err(|_| {
+                        std::io::Error::new(
+                            ErrorKind::BrokenPipe,
+                            "activity persistence observer disappeared",
+                        )
+                    })?;
+                    persistence_release_rx
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .recv_timeout(Duration::from_secs(3))
+                        .map_err(|_| {
+                            std::io::Error::new(
+                                ErrorKind::TimedOut,
+                                "activity persistence was not released",
+                            )
+                        })?;
+                }
+                if phase == HostConfigPersistenceTestPhase::AfterWrite
+                    && !snapshot.web.activity_log.is_empty()
+                {
+                    let _ = persistence_settled_tx.try_send(());
+                }
+                Ok(())
+            }
+        }));
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("test listener should bind");
+        let port = listener.local_addr().expect("test listener address").port();
+        let native_runtime_generation = service
+            .inner
+            .native_runtime_generation
+            .load(Ordering::SeqCst);
+        let host_inner = service.inner.clone();
+        let host_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("test host should accept");
+            handle_client_connection(host_inner, 1, stream, native_runtime_generation);
+        });
+
+        let (hello_tx, hello_rx) = mpsc::sync_channel(1);
+        let (client_release_tx, client_release_rx) = mpsc::sync_channel(0);
+        let client_thread = thread::spawn(move || {
+            let mut stream = super::transport::connect_tls("127.0.0.1", port, None)
+                .expect("test client should establish TLS")
+                .stream;
+            write_message(
+                &mut stream,
+                &ClientMessage::Hello {
+                    protocol_version: super::PROTOCOL_VERSION,
+                    client_label: "Studio MacBook".to_string(),
+                    auth: ClientAuth::PairToken { token: pair_token },
+                },
+            )
+            .expect("test client should write hello");
+            let reply = read_message::<ServerMessage, _>(&mut stream);
+            hello_tx.send(reply).expect("hello observer should remain");
+            let _ = client_release_rx.recv_timeout(Duration::from_secs(3));
+            let _ = write_message(&mut stream, &ClientMessage::Disconnect);
+        });
+
+        persistence_entered_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("activity persistence should start");
+        let premature_reply = match hello_rx.recv_timeout(Duration::from_secs(1)) {
+            Ok(reply) => Some(reply),
+            Err(mpsc::RecvTimeoutError::Timeout) => None,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("handshake reply worker disappeared")
+            }
+        };
+        let acknowledged_before_settlement = premature_reply.is_some();
+        persistence_release_tx
+            .send(())
+            .expect("activity persistence should still be waiting");
+        persistence_settled_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("isolated activity file should finish its durable write");
+        let reply = match premature_reply {
+            Some(reply) => reply,
+            None => hello_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("host should settle the handshake after persistence"),
+        }
+        .expect("host should return a typed handshake reply");
+
+        assert!(matches!(reply, ServerMessage::HelloOk { .. }));
+        let on_disk = load_remote_machine_state().expect("durable remote state should load");
+        assert!(on_disk.host.web.activity_log.iter().any(|event| {
+            event.source == RemoteAccessSource::NativeApp
+                && event.event_kind == RemoteAccessActivityKind::Connected
+                && event.label == "Studio MacBook"
+        }));
+
+        drop(service);
+        host_thread.join().expect("host connection should stop");
+        let after_abrupt_stop =
+            load_remote_machine_state().expect("remote state should survive abrupt host stop");
+        assert!(after_abrupt_stop
+            .host
+            .web
+            .activity_log
+            .iter()
+            .any(|event| event.label == "Studio MacBook"));
+        let _ = client_release_tx.send(());
+        client_thread.join().expect("test client should stop");
+
+        assert!(
+            !acknowledged_before_settlement,
+            "host acknowledged HelloOk before its activity write was durable"
+        );
+    }
+
+    #[test]
+    fn native_activity_persistence_failure_rejects_handshake_and_rolls_back_memory() {
+        let _profile = TestProfileGuard::new("native-activity-persistence-error");
+        let config = RemoteHostConfig::default();
+        let pair_token = config.pairing_token.clone();
+        let service = RemoteHostService::new(config);
+        let _persistence_hook =
+            HostConfigPersistenceHookGuard::install(Arc::new(|snapshot, phase| {
+                if phase == HostConfigPersistenceTestPhase::AfterWrite
+                    || snapshot.web.activity_log.is_empty()
+                {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::new(
+                        ErrorKind::PermissionDenied,
+                        "injected activity persistence failure",
+                    ))
+                }
+            }));
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("test listener should bind");
+        let port = listener.local_addr().expect("test listener address").port();
+        let native_runtime_generation = service
+            .inner
+            .native_runtime_generation
+            .load(Ordering::SeqCst);
+        let host_inner = service.inner.clone();
+        let host_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("test host should accept");
+            handle_client_connection(host_inner, 2, stream, native_runtime_generation);
+        });
+
+        let mut stream = super::transport::connect_tls("127.0.0.1", port, None)
+            .expect("test client should establish TLS")
+            .stream;
+        write_message(
+            &mut stream,
+            &ClientMessage::Hello {
+                protocol_version: super::PROTOCOL_VERSION,
+                client_label: "Failure client".to_string(),
+                auth: ClientAuth::PairToken { token: pair_token },
+            },
+        )
+        .expect("test client should write hello");
+        let reply = read_message::<ServerMessage, _>(&mut stream)
+            .expect("host should return a typed handshake reply");
+        let _ = write_message(&mut stream, &ClientMessage::Disconnect);
+        host_thread.join().expect("host connection should stop");
+
+        match reply {
+            ServerMessage::HelloErr { message } => assert!(
+                message.contains("injected activity persistence failure"),
+                "{message}"
+            ),
+            other => panic!("persistence failure unexpectedly acknowledged handshake: {other:?}"),
+        }
+        assert!(service.config().paired_clients.is_empty());
+        assert!(service.config().web.activity_log.is_empty());
+        let path = remote_state_path().expect("isolated remote state path");
+        if path.exists() {
+            let on_disk = load_remote_machine_state().expect("isolated remote state should load");
+            assert!(on_disk.host.paired_clients.is_empty());
+            assert!(on_disk.host.web.activity_log.is_empty());
+        }
+    }
+
+    #[test]
+    fn native_disconnect_durably_persists_last_seen_before_worker_join() {
+        let _profile = TestProfileGuard::new("native-disconnect-durable-last-seen");
         let port = reserve_free_tcp_port();
         let mut config = RemoteHostConfig {
-            enabled: true,
+            enabled: false,
             bind_address: "127.0.0.1".to_string(),
             port,
             ..RemoteHostConfig::default()
         };
         let pair_token = config.pairing_token.clone();
-        let service = RemoteHostService::new(config.clone());
-
-        wait_for(
-            || service.status().listening,
-            Duration::from_secs(3),
-            "remote host never started listening",
+        let root = RemoteHostService::new(config.clone());
+        let (lifecycle_tx, lifecycle_rx) = mpsc::channel();
+        let (persistence_order_tx, persistence_order_rx) = mpsc::channel();
+        let client_removed_order_tx = persistence_order_tx.clone();
+        *root
+            .inner
+            .native_lifecycle_test_hook
+            .write()
+            .expect("native lifecycle hook lock") = Some(Arc::new(move |event| {
+            if event == super::NativeLifecycleTestEvent::ClientRemoved {
+                client_removed_order_tx
+                    .send("client-removed")
+                    .expect("disconnect order observer should remain");
+            }
+            lifecycle_tx
+                .send(event)
+                .expect("native lifecycle observer should remain");
+        }));
+        config.enabled = true;
+        root.apply_config(config);
+        assert_eq!(
+            lifecycle_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("native listener should start"),
+            super::NativeLifecycleTestEvent::ListenerStarted
         );
 
-        let result = RemoteClientHandle::connect(
+        let connected = RemoteClientHandle::connect(
             "127.0.0.1",
             port,
-            "Studio MacBook",
+            "Durable disconnect client",
             ClientAuth::PairToken { token: pair_token },
             None,
         )
-        .expect("loopback remote connect should succeed");
-
-        wait_for(
-            || {
-                service.config().web.activity_log.iter().any(|event| {
-                    event.source == RemoteAccessSource::NativeApp
-                        && event.event_kind == RemoteAccessActivityKind::Connected
-                        && event.label == "Studio MacBook"
-                })
-            },
-            Duration::from_secs(3),
-            "native client connection never appeared in activity log",
+        .expect("native client should connect");
+        assert_eq!(
+            lifecycle_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("host should register native client"),
+            super::NativeLifecycleTestEvent::ClientRegistered
+        );
+        let client_id = connected.client_id.clone();
+        super::mutate_host_config(&root.inner, |config| {
+            config
+                .paired_clients
+                .iter_mut()
+                .find(|client| client.client_id == client_id)
+                .expect("paired client should remain present")
+                .last_seen_epoch_ms = None;
+        })
+        .expect("test should persist the cleared last-seen value");
+        assert!(
+            load_remote_machine_state()
+                .expect("persisted remote state")
+                .host
+                .paired_clients
+                .iter()
+                .find(|client| client.client_id == connected.client_id)
+                .expect("persisted paired client")
+                .last_seen_epoch_ms
+                .is_none(),
+            "test precondition should be durable"
         );
 
-        result.client.disconnect();
+        let (persistence_entered_tx, persistence_entered_rx) = mpsc::sync_channel(1);
+        let (persistence_release_tx, persistence_release_rx) = mpsc::sync_channel(0);
+        let persistence_release_rx = Arc::new(Mutex::new(persistence_release_rx));
+        let persistence_client_id = connected.client_id.clone();
+        let persistence_order_tx = persistence_order_tx.clone();
+        let persistence_entered = Arc::new(AtomicBool::new(false));
+        let _persistence_hook = HostConfigPersistenceHookGuard::install(Arc::new({
+            let persistence_release_rx = persistence_release_rx.clone();
+            let persistence_entered = persistence_entered.clone();
+            move |snapshot, phase| {
+                let has_last_seen = snapshot.paired_clients.iter().any(|client| {
+                    client.client_id == persistence_client_id && client.last_seen_epoch_ms.is_some()
+                });
+                if phase == HostConfigPersistenceTestPhase::BeforeWrite
+                    && has_last_seen
+                    && !persistence_entered.swap(true, Ordering::SeqCst)
+                {
+                    persistence_entered_tx.send(()).map_err(|_| {
+                        std::io::Error::new(
+                            ErrorKind::BrokenPipe,
+                            "disconnect persistence observer disappeared",
+                        )
+                    })?;
+                    persistence_release_rx
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .recv()
+                        .map_err(|_| {
+                            std::io::Error::new(
+                                ErrorKind::BrokenPipe,
+                                "disconnect persistence was not released",
+                            )
+                        })?;
+                }
+                if phase == HostConfigPersistenceTestPhase::AfterWrite && has_last_seen {
+                    persistence_order_tx
+                        .send("last-seen-persisted")
+                        .map_err(|_| {
+                            std::io::Error::new(
+                                ErrorKind::BrokenPipe,
+                                "disconnect order observer disappeared",
+                            )
+                        })?;
+                }
+                Ok(())
+            }
+        }));
 
-        wait_for(
-            || service.status().connected_clients == 0,
-            Duration::from_secs(3),
-            "host never observed client disconnect",
+        connected.client.disconnect();
+        persistence_entered_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("disconnect should enter synchronous last-seen persistence");
+        persistence_release_tx
+            .send(())
+            .expect("disconnect persistence should still be waiting");
+        assert_eq!(
+            persistence_order_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("disconnect should finish the last-seen write"),
+            "last-seen-persisted"
         );
+        assert_eq!(
+            lifecycle_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("host should observe native disconnect"),
+            super::NativeLifecycleTestEvent::ClientRemoved
+        );
+        assert_eq!(
+            persistence_order_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("disconnect should report removal after the durable write"),
+            "client-removed"
+        );
+        drop(connected);
+        drop(root);
 
-        config.enabled = false;
-        service.apply_config(config);
+        let persisted = load_remote_machine_state().expect("reload durable disconnect state");
+        assert!(
+            persisted
+                .host
+                .paired_clients
+                .iter()
+                .find(|client| client.client_id == client_id)
+                .expect("persisted paired client should remain")
+                .last_seen_epoch_ms
+                .is_some(),
+            "joined native disconnect updated last-seen only in memory"
+        );
     }
 
     #[test]
@@ -9628,72 +11468,137 @@ mod tests {
     #[test]
     fn dropping_root_service_stops_an_active_native_port_forward() {
         let _profile = TestProfileGuard::new("drop-native-port-forward");
-        let host_port = reserve_free_tcp_port();
-        let server_port = reserve_free_tcp_port();
+        let upstream = TcpListener::bind(("127.0.0.1", 0)).expect("upstream should bind");
+        let server_port = upstream.local_addr().expect("upstream address").port();
+        let native_listener =
+            TcpListener::bind(("127.0.0.1", 0)).expect("native test listener should bind");
+        let host_port = native_listener
+            .local_addr()
+            .expect("native listener address")
+            .port();
 
-        let config = RemoteHostConfig {
-            enabled: true,
-            bind_address: "127.0.0.1".to_string(),
-            port: host_port,
-            ..RemoteHostConfig::default()
-        };
-        let pair_token = config.pairing_token.clone();
+        let mut config = RemoteHostConfig::default();
+        let server_id = config.server_id.clone();
+        config.paired_clients.push(PairedRemoteClient {
+            client_id: "forward-client".to_string(),
+            label: "Forward client".to_string(),
+            auth_token: "forward-secret".to_string(),
+            last_seen_epoch_ms: Some(1),
+        });
         let root = RemoteHostService::new(config);
-        root.update_snapshot(
-            managed_server_state(server_port),
-            managed_server_runtime("command-web", 4242),
-            HashMap::from([(
-                server_port,
-                PortStatus {
-                    port: server_port,
-                    in_use: true,
-                    pid: Some(4242),
-                    process_name: Some("node".to_string()),
+        *root
+            .inner
+            .port_forward_authorizer_test_hook
+            .write()
+            .expect("port-forward test hook lock") =
+            Some(Arc::new(move |port| port == server_port));
+
+        let (upstream_closed_tx, upstream_closed_rx) = mpsc::sync_channel(1);
+        let upstream_thread = thread::spawn(move || {
+            let (mut stream, _) = upstream.accept().expect("upstream should accept forward");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .expect("upstream read timeout");
+            stream
+                .set_write_timeout(Some(Duration::from_secs(3)))
+                .expect("upstream write timeout");
+            let mut request = [0_u8; 4];
+            stream
+                .read_exact(&mut request)
+                .expect("forward should deliver request bytes");
+            assert_eq!(&request, b"ping");
+            stream
+                .write_all(b"pong")
+                .expect("upstream should write response");
+            stream.flush().expect("upstream response should flush");
+            let mut after_shutdown = [0_u8; 1];
+            let closed = matches!(stream.read(&mut after_shutdown), Ok(0) | Err(_));
+            upstream_closed_tx
+                .send(closed)
+                .expect("upstream close observer should remain");
+        });
+
+        let (forward_active_tx, forward_active_rx) = mpsc::sync_channel(1);
+        let (client_closed_tx, client_closed_rx) = mpsc::sync_channel(1);
+        let client_thread = thread::spawn(move || {
+            let mut stream = super::transport::connect_tls("127.0.0.1", host_port, None)
+                .expect("native port-forward TLS should connect")
+                .stream;
+            stream
+                .sock
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .expect("forward client read timeout");
+            write_message(
+                &mut stream,
+                &ClientMessage::PortForwardHello {
+                    protocol_version: super::PROTOCOL_VERSION,
+                    server_id,
+                    client_id: "forward-client".to_string(),
+                    auth_token: "forward-secret".to_string(),
+                    requested_port: server_port,
                 },
-            )]),
+            )
+            .expect("port-forward hello should write");
+            let handshake_deadline = Instant::now() + Duration::from_secs(3);
+            let reply = read_message_until_cancelled::<ServerMessage, _, _>(&mut stream, || {
+                Instant::now() >= handshake_deadline
+            })
+            .expect("host should answer port-forward hello");
+            assert!(matches!(reply, ServerMessage::PortForwardOk));
+            stream
+                .write_all(b"ping")
+                .expect("forward should accept bytes");
+            stream.flush().expect("forward request should flush");
+            let mut response = [0_u8; 4];
+            stream
+                .read_exact(&mut response)
+                .expect("forward should return response bytes");
+            forward_active_tx
+                .send(response)
+                .expect("forward observer should remain");
+            let mut after_shutdown = [0_u8; 1];
+            let closed = matches!(stream.read(&mut after_shutdown), Ok(0) | Err(_));
+            client_closed_tx
+                .send(closed)
+                .expect("client close observer should remain");
+        });
+
+        let (native_stream, _) = native_listener
+            .accept()
+            .expect("native test host should accept");
+        let native_runtime_generation = root.inner.native_runtime_generation.load(Ordering::SeqCst);
+        spawn_native_connection_worker(&root.inner, 1, native_stream, native_runtime_generation);
+        assert_eq!(
+            forward_active_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("real forward should exchange bytes"),
+            *b"pong"
         );
-        wait_for(
-            || root.status().listening,
-            Duration::from_secs(3),
-            "remote host never started listening",
-        );
-        let client = RemoteClientHandle::connect(
-            "127.0.0.1",
-            host_port,
-            "Test Client",
-            ClientAuth::PairToken { token: pair_token },
-            None,
-        )
-        .expect("remote client should connect");
-        let error = client
-            .client
-            .open_port_forward(server_port)
-            .expect_err("legacy PID-only status must not authorize a port forward");
-        assert!(
-            error.contains("not a live DevManager server port"),
-            "{error}"
+        assert_eq!(
+            root.inner
+                .native_connection_workers
+                .lock()
+                .expect("native worker lock")
+                .len(),
+            1,
+            "active forward must be owned by the host lifecycle"
         );
         let inner = Arc::downgrade(&root.inner);
 
         drop(root);
 
-        let teardown_deadline = Instant::now() + Duration::from_secs(2);
-        while inner.upgrade().is_some() && Instant::now() < teardown_deadline {
-            thread::sleep(Duration::from_millis(10));
-        }
-        let diagnostics = inner.upgrade().map(|inner| {
-            let service = RemoteHostService::borrowed(inner.clone());
-            (
-                Arc::strong_count(&inner),
-                service.status().connected_clients,
-                service.status().last_connection_note,
-            )
-        });
+        assert!(upstream_closed_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("upstream should observe joined teardown"));
+        assert!(client_closed_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("client should observe joined teardown"));
+        upstream_thread.join().expect("upstream thread should stop");
+        client_thread.join().expect("forward client should stop");
         assert!(
-            diagnostics.is_none(),
-            "active native port forward retained the stopped host runtime: {diagnostics:?}"
+            inner.upgrade().is_none(),
+            "joined active port forward retained the stopped host runtime"
         );
-        client.client.disconnect();
     }
 
     #[test]
@@ -9701,32 +11606,31 @@ mod tests {
         let _profile = TestProfileGuard::new("serial-native-lifecycle");
 
         let first_port = reserve_free_tcp_port();
-        let first_config = RemoteHostConfig {
-            enabled: true,
+        let mut first_config = RemoteHostConfig {
+            enabled: false,
             bind_address: "127.0.0.1".to_string(),
             port: first_port,
             ..RemoteHostConfig::default()
         };
         let first_pair_token = first_config.pairing_token.clone();
-        let first_root = RemoteHostService::new(first_config);
-        let first_server_port = reserve_free_tcp_port();
-        first_root.update_snapshot(
-            managed_server_state(first_server_port),
-            managed_server_runtime("first-server", 4242),
-            HashMap::from([(
-                first_server_port,
-                PortStatus {
-                    port: first_server_port,
-                    in_use: true,
-                    pid: Some(4242),
-                    process_name: Some("node".to_string()),
-                },
-            )]),
-        );
-        wait_for(
-            || first_root.status().listening,
-            Duration::from_secs(3),
-            "first remote host never started listening",
+        let first_root = RemoteHostService::new(first_config.clone());
+        let (first_lifecycle_tx, first_lifecycle_rx) = mpsc::channel();
+        *first_root
+            .inner
+            .native_lifecycle_test_hook
+            .write()
+            .expect("first native lifecycle hook lock") = Some(Arc::new(move |event| {
+            first_lifecycle_tx
+                .send(event)
+                .expect("first lifecycle observer should remain");
+        }));
+        first_config.enabled = true;
+        first_root.apply_config(first_config);
+        assert_eq!(
+            first_lifecycle_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("first remote host never started listening"),
+            super::NativeLifecycleTestEvent::ListenerStarted
         );
         let first_client = RemoteClientHandle::connect(
             "127.0.0.1",
@@ -9738,40 +11642,48 @@ mod tests {
             None,
         )
         .expect("first remote client should connect");
-        let first_error = first_client
-            .client
-            .open_port_forward(first_server_port)
-            .expect_err("legacy PID-only status must not authorize a port forward");
-        assert!(first_error.contains("not a live DevManager server port"));
-        wait_for(
-            || first_root.status().connected_clients == 1,
-            Duration::from_secs(3),
-            "first remote host never registered its client",
+        assert_eq!(
+            first_lifecycle_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("first remote host never registered its client"),
+            super::NativeLifecycleTestEvent::ClientRegistered
         );
         let first_inner = Arc::downgrade(&first_root.inner);
 
         drop(first_root);
 
-        wait_for(
-            || first_inner.upgrade().is_none(),
-            Duration::from_secs(2),
-            "first native connection worker survived root teardown",
+        assert!(
+            first_inner.upgrade().is_none(),
+            "first native connection worker survived bounded root teardown"
         );
         first_client.client.disconnect();
 
         let second_port = reserve_free_tcp_port();
         let mut second_config = RemoteHostConfig {
-            enabled: true,
+            enabled: false,
             bind_address: "127.0.0.1".to_string(),
             port: second_port,
             ..RemoteHostConfig::default()
         };
         let second_pair_token = second_config.pairing_token.clone();
         let second_root = RemoteHostService::new(second_config.clone());
-        wait_for(
-            || second_root.status().listening,
-            Duration::from_secs(3),
-            "second remote host never started listening",
+        let (second_lifecycle_tx, second_lifecycle_rx) = mpsc::channel();
+        *second_root
+            .inner
+            .native_lifecycle_test_hook
+            .write()
+            .expect("second native lifecycle hook lock") = Some(Arc::new(move |event| {
+            second_lifecycle_tx
+                .send(event)
+                .expect("second lifecycle observer should remain");
+        }));
+        second_config.enabled = true;
+        second_root.apply_config(second_config.clone());
+        assert_eq!(
+            second_lifecycle_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("second remote host never started listening"),
+            super::NativeLifecycleTestEvent::ListenerStarted
         );
         let second_client = RemoteClientHandle::connect(
             "127.0.0.1",
@@ -9783,26 +11695,130 @@ mod tests {
             None,
         )
         .expect("second remote client should connect");
-        wait_for(
-            || second_root.status().connected_clients == 1,
-            Duration::from_secs(3),
-            "second remote host never registered its client",
+        assert_eq!(
+            second_lifecycle_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("second remote host never registered its client"),
+            super::NativeLifecycleTestEvent::ClientRegistered
         );
         second_client.client.disconnect();
-        let disconnect_deadline = Instant::now() + Duration::from_secs(3);
-        while second_root.status().connected_clients != 0 && Instant::now() < disconnect_deadline {
-            thread::sleep(Duration::from_millis(10));
-        }
-        let second_status = second_root.status();
         assert_eq!(
-            second_status.connected_clients,
-            0,
-            "second remote host never observed client disconnect; last_note={:?}, client_state={:?}",
-            second_status.last_connection_note,
-            second_client.client.disconnected_message(),
+            second_lifecycle_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("second remote host never observed client disconnect"),
+            super::NativeLifecycleTestEvent::ClientRemoved
         );
         second_config.enabled = false;
         second_root.apply_config(second_config);
+    }
+
+    #[test]
+    fn native_restart_rejects_a_worker_paused_before_registration() {
+        let port = reserve_free_tcp_port();
+        let mut config = RemoteHostConfig {
+            enabled: false,
+            bind_address: "127.0.0.1".to_string(),
+            port,
+            ..RemoteHostConfig::default()
+        };
+        let root = RemoteHostService::new(config.clone());
+        let (native_lifecycle_tx, native_lifecycle_rx) = mpsc::sync_channel(1);
+        *root
+            .inner
+            .native_lifecycle_test_hook
+            .write()
+            .expect("native lifecycle hook lock") = Some(Arc::new(move |event| {
+            if event == super::NativeLifecycleTestEvent::ListenerStarted {
+                native_lifecycle_tx
+                    .send(())
+                    .expect("native lifecycle observer should remain");
+            }
+        }));
+        config.enabled = true;
+        root.apply_config(config.clone());
+        native_lifecycle_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("native listener should start");
+
+        let (registration_entered_tx, registration_entered_rx) = mpsc::sync_channel(1);
+        let (registration_release_tx, registration_release_rx) = mpsc::sync_channel(0);
+        let registration_release_rx = Arc::new(Mutex::new(registration_release_rx));
+        *root
+            .inner
+            .native_worker_registration_test_hook
+            .write()
+            .expect("native worker registration hook lock") = Some(Arc::new(move || {
+            registration_entered_tx
+                .send(())
+                .expect("native registration observer should remain");
+            registration_release_rx
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .recv()
+                .expect("native worker registration should be released");
+        }));
+        let (transition_tx, transition_rx) = mpsc::sync_channel(1);
+        *root
+            .inner
+            .lifecycle_lock_acquired_test_hook
+            .write()
+            .expect("lifecycle transition hook lock") = Some(Arc::new(move || {
+            transition_tx
+                .send(())
+                .expect("lifecycle transition observer should remain");
+        }));
+        let (worker_reaped_tx, worker_reaped_rx) = mpsc::channel();
+        *root
+            .inner
+            .worker_reaped_test_hook
+            .write()
+            .expect("worker reaped hook lock") = Some(Arc::new(move |name| {
+            worker_reaped_tx
+                .send(name.to_string())
+                .expect("worker reaped observer should remain");
+        }));
+
+        let raw_client = TcpStream::connect(("127.0.0.1", port))
+            .expect("raw client should reach native listener");
+        registration_entered_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("listener should pause before native worker registration");
+
+        let restart_service = root.clone();
+        let (restart_done_tx, restart_done_rx) = mpsc::sync_channel(1);
+        config.enabled = false;
+        let restart = thread::spawn(move || {
+            restart_service.apply_config(config);
+            restart_done_tx
+                .send(())
+                .expect("restart observer should remain");
+        });
+        transition_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("restart should complete its lifecycle transition");
+        restart_done_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("bounded restart should return while registration is paused");
+        restart.join().expect("restart worker should finish");
+
+        registration_release_tx
+            .send(())
+            .expect("native worker registration should still be waiting");
+        assert_eq!(
+            worker_reaped_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("deferred native listener should be reaped"),
+            "remote-native-listener"
+        );
+        assert!(
+            root.inner
+                .native_connection_workers
+                .lock()
+                .expect("native connection workers lock")
+                .is_empty(),
+            "an old listener registered a native worker after restart drained its generation"
+        );
+        drop(raw_client);
     }
 
     #[test]
@@ -9823,6 +11839,218 @@ mod tests {
             .message
             .as_deref()
             .is_some_and(|message| message.contains("already in use")));
+    }
+
+    #[test]
+    fn local_port_forward_shutdown_joins_an_accepted_connection_worker() {
+        let port = reserve_free_tcp_port();
+        let manager = LocalPortForwardManager::new(sample_remote_client_handle("client-1"));
+        let (connection_entered_tx, connection_entered_rx) = mpsc::sync_channel(1);
+        let (connection_release_tx, connection_release_rx) = mpsc::sync_channel(0);
+        let connection_release_rx = Arc::new(Mutex::new(connection_release_rx));
+        let (worker_events_tx, worker_events_rx) = mpsc::channel();
+        let shutdown_done_tx = worker_events_tx.clone();
+        *manager
+            .inner
+            .connection_handler_test_hook
+            .write()
+            .expect("connection handler hook lock") = Some(Arc::new(move |_, _socket, _stop| {
+            connection_entered_tx
+                .send(())
+                .expect("connection observer should remain");
+            connection_release_rx
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .recv_timeout(Duration::from_secs(3))
+                .expect("connection should be released");
+            worker_events_tx
+                .send("connection-exited")
+                .expect("connection exit observer should remain");
+        }));
+
+        assert!(manager.sync_ports(&[port]));
+        let client = TcpStream::connect(("127.0.0.1", port))
+            .expect("test client should reach local forward listener");
+        connection_entered_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("listener should accept the test connection");
+
+        let shutdown_manager = manager.clone();
+        let shutdown = thread::spawn(move || {
+            shutdown_manager.shutdown();
+            shutdown_done_tx
+                .send("shutdown-finished")
+                .expect("shutdown observer should remain");
+        });
+        connection_release_tx
+            .send(())
+            .expect("connection should still be waiting");
+        assert_eq!(
+            worker_events_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("connection worker should exit after release"),
+            "connection-exited"
+        );
+        assert_eq!(
+            worker_events_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("manager shutdown should finish after the connection worker exits"),
+            "shutdown-finished"
+        );
+        shutdown.join().expect("shutdown worker should finish");
+        drop(client);
+    }
+
+    #[test]
+    fn local_port_forward_shutdown_rejects_a_connection_paused_before_registration() {
+        let port = reserve_free_tcp_port();
+        let manager = LocalPortForwardManager::new(sample_remote_client_handle("client-1"));
+        let (lifecycle_tx, lifecycle_rx) = mpsc::sync_channel(2);
+        let (registration_release_tx, registration_release_rx) = mpsc::sync_channel(0);
+        let registration_release_rx = Arc::new(Mutex::new(registration_release_rx));
+        *manager
+            .inner
+            .lifecycle_test_hook
+            .write()
+            .expect("local forward lifecycle hook lock") = Some(Arc::new(move |event| {
+            lifecycle_tx
+                .send(event)
+                .expect("local forward lifecycle observer should remain");
+            if event == LocalPortForwardLifecycleTestEvent::ConnectionAccepted {
+                registration_release_rx
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .recv()
+                    .expect("accepted connection registration should be released");
+            }
+        }));
+        let (handler_started_tx, handler_started_rx) = mpsc::sync_channel(1);
+        *manager
+            .inner
+            .connection_handler_test_hook
+            .write()
+            .expect("connection handler hook lock") = Some(Arc::new(move |_, _socket, _stop| {
+            handler_started_tx
+                .send(())
+                .expect("connection handler observer should remain");
+        }));
+
+        assert!(manager.sync_ports(&[port]));
+        let client = TcpStream::connect(("127.0.0.1", port))
+            .expect("test client should reach local forward listener");
+        assert_eq!(
+            lifecycle_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("listener should pause the accepted connection before registration"),
+            LocalPortForwardLifecycleTestEvent::ConnectionAccepted
+        );
+
+        let shutdown_manager = manager.clone();
+        let (shutdown_done_tx, shutdown_done_rx) = mpsc::sync_channel(1);
+        let shutdown = thread::spawn(move || {
+            shutdown_manager.shutdown();
+            shutdown_done_tx
+                .send(())
+                .expect("shutdown observer should remain");
+        });
+        assert_eq!(
+            lifecycle_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("shutdown should close connection acceptance"),
+            LocalPortForwardLifecycleTestEvent::AcceptanceClosed
+        );
+        registration_release_tx
+            .send(())
+            .expect("accepted connection registration should still be waiting");
+        shutdown_done_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("shutdown should join the released listener");
+        shutdown.join().expect("shutdown worker should finish");
+
+        assert!(
+            handler_started_rx.try_recv().is_err(),
+            "shutdown allowed an accepted socket to register a new connection worker after acceptance closed"
+        );
+        assert!(
+            manager
+                .inner
+                .worker_registry
+                .lock()
+                .expect("connection workers lock")
+                .is_empty(),
+            "shutdown left a late connection worker registered"
+        );
+        assert_eq!(
+            manager.inner.worker_residue_count.load(Ordering::Acquire),
+            0,
+            "joined shutdown should not leave worker residue"
+        );
+        drop(client);
+    }
+
+    #[test]
+    fn dropping_local_port_forward_manager_owns_listener_and_connection_workers() {
+        let port = reserve_free_tcp_port();
+        let manager = LocalPortForwardManager::new(sample_remote_client_handle("client-1"));
+        let weak_inner = Arc::downgrade(&manager.inner);
+        let (connection_entered_tx, connection_entered_rx) = mpsc::sync_channel(1);
+        let (connection_release_tx, connection_release_rx) = mpsc::sync_channel(0);
+        let connection_release_rx = Arc::new(Mutex::new(connection_release_rx));
+        let (worker_events_tx, worker_events_rx) = mpsc::channel();
+        let drop_done_tx = worker_events_tx.clone();
+        *manager
+            .inner
+            .connection_handler_test_hook
+            .write()
+            .expect("connection handler hook lock") = Some(Arc::new(move |_, _socket, _stop| {
+            connection_entered_tx
+                .send(())
+                .expect("connection observer should remain");
+            connection_release_rx
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .recv_timeout(Duration::from_secs(3))
+                .expect("connection should be released");
+            worker_events_tx
+                .send("connection-exited")
+                .expect("connection exit observer should remain");
+        }));
+
+        assert!(manager.sync_ports(&[port]));
+        let client = TcpStream::connect(("127.0.0.1", port))
+            .expect("test client should reach local forward listener");
+        connection_entered_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("listener should accept the test connection");
+
+        let drop_thread = thread::spawn(move || {
+            drop(manager);
+            drop_done_tx
+                .send("drop-finished")
+                .expect("drop observer should remain");
+        });
+        connection_release_tx
+            .send(())
+            .expect("connection should still be waiting");
+        assert_eq!(
+            worker_events_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("connection worker should exit after release"),
+            "connection-exited"
+        );
+        assert_eq!(
+            worker_events_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("manager drop should finish after the connection exits"),
+            "drop-finished"
+        );
+        drop_thread.join().expect("drop worker should finish");
+        drop(client);
+
+        assert!(
+            weak_inner.upgrade().is_none(),
+            "manager workers retained a strong lifecycle cycle after teardown"
+        );
     }
 
     #[test]
@@ -10097,7 +12325,11 @@ mod tests {
 
         service.inner.stop_flag.store(false, Ordering::SeqCst);
         let broadcaster_inner = service.inner.clone();
-        let broadcaster = thread::spawn(move || run_broadcaster(broadcaster_inner));
+        let generation = service
+            .inner
+            .native_runtime_generation
+            .load(Ordering::Acquire);
+        let broadcaster = thread::spawn(move || run_broadcaster(broadcaster_inner, generation));
         let deadline = Instant::now() + Duration::from_secs(1);
         while observed_web.queued_bytes() == 0 && Instant::now() < deadline {
             thread::yield_now();
@@ -10329,29 +12561,36 @@ mod tests {
 
     fn sample_remote_client_handle(client_id: &str) -> RemoteClientHandle {
         let (tx, _rx) = mpsc::channel();
-        RemoteClientHandle {
-            inner: Arc::new(RemoteClientInner {
-                outgoing: tx,
-                pending: Mutex::new(HashMap::new()),
-                next_request_id: AtomicU64::new(1),
-                latest_snapshot: RwLock::new(Some(RemoteWorkspaceSnapshot {
-                    server_id: "host-1".to_string(),
-                    ..RemoteWorkspaceSnapshot::default()
-                })),
-                session_replicas: RwLock::new(HashMap::new()),
-                disconnected_message: RwLock::new(None),
-                snapshot_revision: AtomicU64::new(1),
-                session_stream_revision: AtomicU64::new(1),
-                latency: RwLock::new(RemoteLatencyStats::default()),
-                pending_paint_received_at_epoch_ms: AtomicU64::new(0),
-                pending_notification_count: AtomicU64::new(0),
-                client_id: client_id.to_string(),
-                client_token: "token-1".to_string(),
+        let inner = Arc::new(RemoteClientInner {
+            pending: Mutex::new(HashMap::new()),
+            next_request_id: AtomicU64::new(1),
+            latest_snapshot: RwLock::new(Some(RemoteWorkspaceSnapshot {
                 server_id: "host-1".to_string(),
-                certificate_fingerprint: "fingerprint-1".to_string(),
-                address: "127.0.0.1".to_string(),
-                port: 43871,
+                ..RemoteWorkspaceSnapshot::default()
+            })),
+            session_replicas: RwLock::new(HashMap::new()),
+            disconnected_message: RwLock::new(None),
+            snapshot_revision: AtomicU64::new(1),
+            session_stream_revision: AtomicU64::new(1),
+            latency: RwLock::new(RemoteLatencyStats::default()),
+            pending_paint_received_at_epoch_ms: AtomicU64::new(0),
+            pending_notification_count: AtomicU64::new(0),
+            client_id: client_id.to_string(),
+            client_token: "token-1".to_string(),
+            server_id: "host-1".to_string(),
+            certificate_fingerprint: "fingerprint-1".to_string(),
+            address: "127.0.0.1".to_string(),
+            port: 43871,
+            #[cfg(test)]
+            reader_exit_test_hook: RwLock::new(None),
+        });
+        RemoteClientHandle {
+            connection: Arc::new(super::RemoteClientConnectionOwner {
+                outgoing: tx,
+                reader: Mutex::new(None),
+                inner: Arc::downgrade(&inner),
             }),
+            inner,
         }
     }
 }
