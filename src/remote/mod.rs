@@ -81,6 +81,8 @@ type FocusedSessionHandler = Arc<dyn Fn(String) + Send + Sync>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NativeLifecycleTestEvent {
     ListenerStarted,
+    ListenerBindFailed,
+    WebListenerBindFailed,
     ClientRegistered,
     ClientRemoved,
 }
@@ -1049,6 +1051,21 @@ static REMOTE_STATE_PERMISSION_VERIFY_TEST_HOOK: Mutex<
     Option<RemoteStatePermissionVerifyTestHook>,
 > = Mutex::new(None);
 
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RemoteStatePersistenceIoTestPhase {
+    TempSync,
+    Rename,
+    ParentSync,
+}
+
+#[cfg(test)]
+type RemoteStatePersistenceIoTestHook =
+    Arc<dyn Fn(RemoteStatePersistenceIoTestPhase, &Path) -> std::io::Result<()> + Send + Sync>;
+#[cfg(test)]
+static REMOTE_STATE_PERSISTENCE_IO_TEST_HOOK: Mutex<Option<RemoteStatePersistenceIoTestHook>> =
+    Mutex::new(None);
+
 pub fn load_remote_machine_state() -> Result<RemoteMachineState, PersistenceError> {
     let _guard = REMOTE_STATE_SAVE_LOCK
         .lock()
@@ -1086,7 +1103,63 @@ fn write_private_remote_state_temp(path: &Path, contents: &[u8]) -> std::io::Res
         drop(file);
         return Err(error);
     }
-    file.write_all(contents)
+    file.write_all(contents)?;
+    sync_remote_state_temp(&file, path)
+}
+
+fn sync_remote_state_temp(file: &fs::File, path: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if let Some(hook) = REMOTE_STATE_PERSISTENCE_IO_TEST_HOOK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+    {
+        hook(RemoteStatePersistenceIoTestPhase::TempSync, path)?;
+    }
+    file.sync_all()
+}
+
+fn rename_remote_state_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if let Some(hook) = REMOTE_STATE_PERSISTENCE_IO_TEST_HOOK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+    {
+        hook(RemoteStatePersistenceIoTestPhase::Rename, to)?;
+    }
+    fs::rename(from, to)
+}
+
+fn sync_remote_state_parent(path: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if let Some(hook) = REMOTE_STATE_PERSISTENCE_IO_TEST_HOOK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+    {
+        hook(RemoteStatePersistenceIoTestPhase::ParentSync, path)?;
+    }
+
+    #[cfg(unix)]
+    {
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        fs::File::open(parent)?.sync_all()
+    }
+    #[cfg(windows)]
+    {
+        // Windows does not expose a portable directory fsync through std. The
+        // temp file is flushed before rename and the ACL is verified after it;
+        // the parent-directory barrier is therefore best effort on this
+        // platform rather than an unportable raw-handle dependency.
+        let _ = path;
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        Ok(())
+    }
 }
 
 #[cfg(unix)]
@@ -1422,11 +1495,13 @@ fn verify_saved_remote_state_permissions(path: &Path) -> std::io::Result<()> {
 
 fn restore_remote_state_bytes(path: &Path, previous_bytes: Option<&[u8]>) -> std::io::Result<()> {
     let Some(previous_bytes) = previous_bytes else {
-        return match fs::remove_file(path) {
+        let result = match fs::remove_file(path) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error),
         };
+        result?;
+        return sync_remote_state_parent(path);
     };
     let restore_path = path.with_extension(format!(
         "json.restore-{}-{}",
@@ -1437,10 +1512,11 @@ fn restore_remote_state_bytes(path: &Path, previous_bytes: Option<&[u8]>) -> std
         let _ = fs::remove_file(&restore_path);
         return Err(error);
     }
-    if let Err(error) = fs::rename(&restore_path, path) {
+    if let Err(error) = rename_remote_state_file(&restore_path, path) {
         let _ = fs::remove_file(&restore_path);
         return Err(error);
     }
+    sync_remote_state_parent(path)?;
     verify_remote_state_file_permissions(path)
 }
 
@@ -1485,9 +1561,24 @@ fn save_remote_machine_state_locked(state: &RemoteMachineState) -> Result<(), Pe
             source,
         });
     }
-    if let Err(source) = fs::rename(&temp_path, &path) {
+    if let Err(source) = rename_remote_state_file(&temp_path, &path) {
         let _ = fs::remove_file(&temp_path);
         return Err(PersistenceError::Io { path, source });
+    }
+    if let Err(source) = sync_remote_state_parent(&path) {
+        let restore_result = restore_remote_state_bytes(&path, previous_bytes.as_deref());
+        return Err(PersistenceError::Io {
+            path: path.clone(),
+            source: match restore_result {
+                Ok(()) => source,
+                Err(restore_error) => std::io::Error::new(
+                    source.kind(),
+                    format!(
+                        "remote state parent sync failed: {source}; restoring previous remote state failed: {restore_error}"
+                    ),
+                ),
+            },
+        });
     }
     if let Err(source) = verify_saved_remote_state_permissions(&path) {
         let restore_result = restore_remote_state_bytes(&path, previous_bytes.as_deref());
@@ -1759,6 +1850,7 @@ impl Drop for RemoteWorkerCompletion {
         if let Some(completion_tx) = self.completion_tx.take() {
             let _ = completion_tx.try_send(());
         }
+        notify_remote_worker_reaper();
     }
 }
 
@@ -1791,6 +1883,11 @@ impl RemoteWorker {
 struct NativeConnectionWorker {
     generation: u64,
     done: Arc<AtomicBool>,
+    socket_wakeup: Option<TcpStream>,
+    // Keep admission visible in the host reference count, but release this
+    // hold before waiting on the worker so a stalled TLS handshake cannot
+    // retain the stopped host runtime.
+    runtime_hold: Option<Arc<RemoteHostInner>>,
     worker: RemoteWorker,
 }
 
@@ -1815,23 +1912,40 @@ struct RemoteWorkerReaper {
 }
 
 static REMOTE_WORKER_REAPER: OnceLock<RemoteWorkerReaper> = OnceLock::new();
+static REMOTE_WORKER_REAPER_SIGNAL: OnceLock<Arc<(Mutex<u64>, Condvar)>> = OnceLock::new();
+
+fn remote_worker_reaper_signal() -> &'static Arc<(Mutex<u64>, Condvar)> {
+    REMOTE_WORKER_REAPER_SIGNAL.get_or_init(|| Arc::new((Mutex::new(0), Condvar::new())))
+}
+
+fn notify_remote_worker_reaper() {
+    let signal = remote_worker_reaper_signal();
+    if let Ok(mut sequence) = signal.0.lock() {
+        *sequence = sequence.wrapping_add(1);
+        signal.1.notify_one();
+    }
+}
 
 fn remote_worker_reaper() -> &'static RemoteWorkerReaper {
     REMOTE_WORKER_REAPER.get_or_init(|| {
         let (sender, receiver) = mpsc::channel::<DeferredRemoteWorker>();
+        let signal = remote_worker_reaper_signal().clone();
         let handle = thread::Builder::new()
             .name("remote-worker-reaper".to_string())
             .spawn(move || {
                 let mut pending = Vec::<DeferredRemoteWorker>::new();
+                let mut observed_sequence = 0_u64;
                 loop {
-                    match receiver.recv_timeout(Duration::from_millis(25)) {
-                        Ok(worker) => pending.push(worker),
-                        Err(mpsc::RecvTimeoutError::Timeout) => {}
-                        Err(mpsc::RecvTimeoutError::Disconnected) if pending.is_empty() => break,
-                        Err(mpsc::RecvTimeoutError::Disconnected) => {}
-                    }
                     while let Ok(worker) = receiver.try_recv() {
                         pending.push(worker);
+                    }
+
+                    if pending.is_empty() {
+                        match receiver.try_recv() {
+                            Ok(worker) => pending.push(worker),
+                            Err(mpsc::TryRecvError::Disconnected) => break,
+                            Err(mpsc::TryRecvError::Empty) => {}
+                        }
                     }
 
                     let mut index = 0;
@@ -1842,6 +1956,20 @@ fn remote_worker_reaper() -> &'static RemoteWorkerReaper {
                             index += 1;
                         }
                     }
+
+                    let guard = signal
+                        .0
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if *guard == observed_sequence {
+                        let guard = signal
+                            .1
+                            .wait(guard)
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        observed_sequence = *guard;
+                    } else {
+                        observed_sequence = *guard;
+                    }
                 }
             })
             .expect("remote worker reaper should start");
@@ -1850,6 +1978,14 @@ fn remote_worker_reaper() -> &'static RemoteWorkerReaper {
             _handle: Mutex::new(Some(handle)),
         }
     })
+}
+
+fn enqueue_deferred_remote_worker(worker: DeferredRemoteWorker) {
+    remote_worker_reaper()
+        .sender
+        .send(worker)
+        .expect("remote worker reaper should remain available");
+    notify_remote_worker_reaper();
 }
 
 fn finish_deferred_remote_worker(worker: DeferredRemoteWorker) {
@@ -1938,14 +2074,11 @@ fn defer_remote_worker(inner: &Arc<RemoteHostInner>, mut worker: RemoteWorker) {
         ),
         true,
     );
-    remote_worker_reaper()
-        .sender
-        .send(DeferredRemoteWorker {
-            name: worker.name,
-            handle,
-            owner: DeferredRemoteWorkerOwner::Host(Arc::downgrade(inner)),
-        })
-        .expect("remote worker reaper should remain available");
+    enqueue_deferred_remote_worker(DeferredRemoteWorker {
+        name: worker.name,
+        handle,
+        owner: DeferredRemoteWorkerOwner::Host(Arc::downgrade(inner)),
+    });
 }
 
 fn settle_remote_worker(inner: &Arc<RemoteHostInner>, mut worker: RemoteWorker, deadline: Instant) {
@@ -2059,6 +2192,47 @@ impl Drop for RemoteHostServiceOwner {
         // registration race between the first drain and listener teardown.
         drain_web_clients_for_restart(&self.inner);
         let deadline = Instant::now() + REMOTE_WORKER_SHUTDOWN_TIMEOUT;
+
+        // Web callback executors are part of the host owner even though their
+        // queues are fed by async request tasks. Close both queues immediately
+        // after callbacks are revoked, before a potentially stalled native or
+        // broadcaster worker can consume the shared lifecycle deadline.
+        let input_residue = self.inner.web_input_executor.shutdown_until(deadline);
+        let request_residue = self.inner.web_request_executor.shutdown_until(deadline);
+        if input_residue > 0 || request_residue > 0 {
+            set_last_connection_note(
+                &self.inner,
+                format!(
+                    "Remote web callback residue: {input_residue} input and {request_residue} request workers remain owned after bounded shutdown."
+                ),
+                true,
+            );
+            let input_handles = self
+                .inner
+                .web_input_executor
+                .take_unfinished_worker_handles();
+            if !input_handles.is_empty() {
+                let worker = RemoteWorker::spawn("remote-web-input-residue", None, move || {
+                    for handle in input_handles {
+                        let _ = handle.join();
+                    }
+                });
+                defer_remote_worker(&self.inner, worker);
+            }
+            let request_handles = self
+                .inner
+                .web_request_executor
+                .take_unfinished_worker_handles();
+            if !request_handles.is_empty() {
+                let worker = RemoteWorker::spawn("remote-web-request-residue", None, move || {
+                    for handle in request_handles {
+                        let _ = handle.join();
+                    }
+                });
+                defer_remote_worker(&self.inner, worker);
+            }
+        }
+
         if let Some(listener) = web_listener {
             let worker = RemoteWorker::spawn("remote-web-shutdown", None, move || {
                 listener.shutdown();
@@ -2173,6 +2347,49 @@ pub(crate) struct ListenerLease {
     port: u16,
     generation: u64,
     inner: Weak<RemoteHostInner>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ListenerBindFailure {
+    ExternalConflict { bind: String, detail: String },
+    GenerationStale { bind: String, phase: &'static str },
+    Other { bind: String, detail: String },
+}
+
+impl ListenerBindFailure {
+    fn from_io(bind: impl Into<String>, error: std::io::Error) -> Self {
+        let bind = bind.into();
+        if error.kind() == std::io::ErrorKind::AddrInUse {
+            Self::ExternalConflict {
+                bind,
+                detail: error.to_string(),
+            }
+        } else {
+            Self::Other {
+                bind,
+                detail: error.to_string(),
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for ListenerBindFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ExternalConflict { bind, detail } => {
+                write!(formatter, "external bind conflict on {bind}: {detail}")
+            }
+            Self::GenerationStale { bind, phase } => {
+                write!(
+                    formatter,
+                    "listener generation became stale {phase} bind on {bind}"
+                )
+            }
+            Self::Other { bind, detail } => {
+                write!(formatter, "listener bind on {bind} failed: {detail}")
+            }
+        }
+    }
 }
 
 impl ListenerLease {
@@ -2582,6 +2799,7 @@ struct LocalPortForwardEntry {
 struct LocalPortForwardConnectionWorker {
     port: u16,
     scope_id: u64,
+    socket_wakeup: Option<TcpStream>,
     worker: RemoteWorker,
 }
 
@@ -2807,7 +3025,7 @@ impl RemoteHostService {
             Some(app_state),
             Some(runtime_state),
             Some(port_statuses),
-            None,
+            Some(HashMap::new()),
         );
     }
 
@@ -2817,7 +3035,13 @@ impl RemoteHostService {
         runtime_state: Option<RuntimeState>,
         port_statuses: Option<HashMap<u16, PortStatus>>,
     ) {
-        self.update_snapshot_parts_with_authorities(app_state, runtime_state, port_statuses, None);
+        let port_authorities = port_statuses.as_ref().map(|_| HashMap::new());
+        self.update_snapshot_parts_with_authorities(
+            app_state,
+            runtime_state,
+            port_statuses,
+            port_authorities,
+        );
     }
 
     pub fn update_snapshot_parts_with_authorities(
@@ -4492,8 +4716,13 @@ impl RemoteHostService {
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
                     if self.inner.native_runtime_generation.load(Ordering::Acquire) == generation {
                         if let Ok(mut error_slot) = self.inner.web_listener_error.write() {
-                            *error_slot = Some(error);
+                            *error_slot = Some(error.to_string());
                         }
+                        #[cfg(test)]
+                        notify_native_lifecycle(
+                            &self.inner,
+                            NativeLifecycleTestEvent::WebListenerBindFailed,
+                        );
                     }
                 }
             }
@@ -5139,6 +5368,9 @@ impl Drop for LocalPortForwardManagerInner {
             std::mem::take(&mut registry.connections)
         };
         for (_, connection) in connections {
+            if let Some(socket) = connection.socket_wakeup.as_ref() {
+                let _ = socket.shutdown(Shutdown::Both);
+            }
             settle_unowned_remote_worker(connection.worker, deadline);
         }
     }
@@ -5193,6 +5425,9 @@ fn stop_local_port_forward_port(
         settle_local_port_forward_worker(inner, port, worker, deadline);
     }
     for connection in connections {
+        if let Some(socket) = connection.socket_wakeup.as_ref() {
+            let _ = socket.shutdown(Shutdown::Both);
+        }
         settle_local_port_forward_worker(inner, port, connection.worker, deadline);
     }
 }
@@ -5219,31 +5454,25 @@ fn defer_local_port_forward_worker(
             )),
         },
     );
-    remote_worker_reaper()
-        .sender
-        .send(DeferredRemoteWorker {
-            name: worker.name,
-            handle,
-            owner: DeferredRemoteWorkerOwner::LocalPortForward {
-                inner: Arc::downgrade(inner),
-                port,
-            },
-        })
-        .expect("remote worker reaper should remain available");
+    enqueue_deferred_remote_worker(DeferredRemoteWorker {
+        name: worker.name,
+        handle,
+        owner: DeferredRemoteWorkerOwner::LocalPortForward {
+            inner: Arc::downgrade(inner),
+            port,
+        },
+    });
 }
 
 fn defer_unowned_remote_worker(mut worker: RemoteWorker) {
     let Some(handle) = worker.handle.take() else {
         return;
     };
-    remote_worker_reaper()
-        .sender
-        .send(DeferredRemoteWorker {
-            name: worker.name,
-            handle,
-            owner: DeferredRemoteWorkerOwner::Unowned,
-        })
-        .expect("remote worker reaper should remain available");
+    enqueue_deferred_remote_worker(DeferredRemoteWorker {
+        name: worker.name,
+        handle,
+        owner: DeferredRemoteWorkerOwner::Unowned,
+    });
 }
 
 fn settle_local_port_forward_worker(
@@ -5421,6 +5650,9 @@ fn settle_all_local_port_forward_connections(
         std::mem::take(&mut registry.connections)
     };
     for connection in connections.into_values() {
+        if let Some(socket) = connection.socket_wakeup.as_ref() {
+            let _ = socket.shutdown(Shutdown::Both);
+        }
         settle_local_port_forward_worker(inner, connection.port, connection.worker, deadline);
     }
 }
@@ -5518,6 +5750,7 @@ fn run_local_port_forward_listener(
                 let connection_inner = Arc::downgrade(&strong_inner);
                 let client = strong_inner.client.clone();
                 let connection_stop_flag = stop_flag.clone();
+                let socket_wakeup = socket.try_clone().ok();
                 let connection_id = strong_inner
                     .next_connection_id
                     .fetch_add(1, Ordering::Relaxed);
@@ -5544,6 +5777,7 @@ fn run_local_port_forward_listener(
                     LocalPortForwardConnectionWorker {
                         port,
                         scope_id,
+                        socket_wakeup,
                         worker,
                     },
                 );
@@ -5578,8 +5812,8 @@ fn handle_local_port_forward_connection(
     stop_flag: Arc<AtomicBool>,
 ) {
     let _ = local_socket.set_nodelay(true);
-    let _ = local_socket.set_read_timeout(Some(Duration::from_millis(40)));
-    let _ = local_socket.set_write_timeout(Some(Duration::from_secs(5)));
+    let _ = local_socket.set_read_timeout(None);
+    let _ = local_socket.set_write_timeout(None);
     let mut remote_stream = match client.open_port_forward(port) {
         Ok(stream) => stream,
         Err(error) => {
@@ -5598,9 +5832,8 @@ fn handle_local_port_forward_connection(
             return;
         }
     };
-    let _ = remote_stream
-        .sock
-        .set_read_timeout(Some(Duration::from_millis(40)));
+    let _ = remote_stream.sock.set_read_timeout(None);
+    let _ = remote_stream.sock.set_write_timeout(None);
 
     if let Err(error) = copy_bidirectional(&mut local_socket, &mut remote_stream, || {
         stop_flag.load(Ordering::Acquire)
@@ -5621,15 +5854,207 @@ fn handle_local_port_forward_connection(
     let _ = remote_stream.sock.shutdown(Shutdown::Both);
 }
 
-fn copy_bidirectional<L: Read + Write, R: Read + Write>(
+#[cfg(unix)]
+use std::os::unix::io::{AsRawFd, RawFd};
+#[cfg(windows)]
+use std::os::windows::io::{AsRawSocket, RawSocket};
+
+trait RemoteForwardStream: Read + Write {
+    fn set_forward_nonblocking(&self, nonblocking: bool) -> std::io::Result<()>;
+
+    #[cfg(unix)]
+    fn raw_forward_socket(&self) -> RawFd;
+    #[cfg(windows)]
+    fn raw_forward_socket(&self) -> RawSocket;
+}
+
+impl RemoteForwardStream for TcpStream {
+    fn set_forward_nonblocking(&self, nonblocking: bool) -> std::io::Result<()> {
+        self.set_nonblocking(nonblocking)
+    }
+
+    #[cfg(unix)]
+    fn raw_forward_socket(&self) -> RawFd {
+        self.as_raw_fd()
+    }
+    #[cfg(windows)]
+    fn raw_forward_socket(&self) -> RawSocket {
+        self.as_raw_socket()
+    }
+}
+
+impl RemoteForwardStream for transport::ClientTlsStream {
+    fn set_forward_nonblocking(&self, nonblocking: bool) -> std::io::Result<()> {
+        self.sock.set_nonblocking(nonblocking)
+    }
+
+    #[cfg(unix)]
+    fn raw_forward_socket(&self) -> RawFd {
+        self.sock.as_raw_fd()
+    }
+    #[cfg(windows)]
+    fn raw_forward_socket(&self) -> RawSocket {
+        self.sock.as_raw_socket()
+    }
+}
+
+impl RemoteForwardStream for transport::ServerTlsStream {
+    fn set_forward_nonblocking(&self, nonblocking: bool) -> std::io::Result<()> {
+        self.sock.set_nonblocking(nonblocking)
+    }
+
+    #[cfg(unix)]
+    fn raw_forward_socket(&self) -> RawFd {
+        self.sock.as_raw_fd()
+    }
+    #[cfg(windows)]
+    fn raw_forward_socket(&self) -> RawSocket {
+        self.sock.as_raw_socket()
+    }
+}
+
+fn wait_for_remote_socket_io(
+    socket: &TcpStream,
+    deadline: Instant,
+    writable: bool,
+) -> std::io::Result<bool> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Ok(false);
+    }
+    let timeout = remaining.as_millis().min(i32::MAX as u128).max(1) as i32;
+    #[cfg(unix)]
+    {
+        #[repr(C)]
+        struct PollFd {
+            fd: RawFd,
+            events: i16,
+            revents: i16,
+        }
+        unsafe extern "C" {
+            fn poll(fds: *mut PollFd, nfds: usize, timeout: i32) -> i32;
+        }
+        let mut fd = PollFd {
+            fd: socket.as_raw_fd(),
+            events: if writable { 0x0004 } else { 0x0001 },
+            revents: 0,
+        };
+        let result = unsafe { poll(&mut fd, 1, timeout) };
+        if result > 0 {
+            Ok(true)
+        } else if result == 0 {
+            Ok(false)
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+    #[cfg(windows)]
+    {
+        #[repr(C)]
+        struct WsapollFd {
+            fd: RawSocket,
+            events: i16,
+            revents: i16,
+        }
+        unsafe extern "system" {
+            fn WSAPoll(fds: *mut WsapollFd, nfds: u32, timeout: i32) -> i32;
+        }
+        let mut fd = WsapollFd {
+            fd: socket.as_raw_socket(),
+            events: if writable { 0x0010 } else { 0x0300 },
+            revents: 0,
+        };
+        let result = unsafe { WSAPoll(&mut fd, 1, timeout) };
+        if result > 0 {
+            Ok(true)
+        } else if result == 0 {
+            Ok(false)
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+}
+
+fn wait_for_forward_readability<L: RemoteForwardStream, R: RemoteForwardStream>(
+    left: &L,
+    right: &R,
+) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        #[repr(C)]
+        struct PollFd {
+            fd: RawFd,
+            events: i16,
+            revents: i16,
+        }
+        unsafe extern "C" {
+            fn poll(fds: *mut PollFd, nfds: usize, timeout: i32) -> i32;
+        }
+        let mut fds = [
+            PollFd {
+                fd: left.raw_forward_socket(),
+                events: 0x0001,
+                revents: 0,
+            },
+            PollFd {
+                fd: right.raw_forward_socket(),
+                events: 0x0001,
+                revents: 0,
+            },
+        ];
+        let result = unsafe { poll(fds.as_mut_ptr(), fds.len(), -1) };
+        if result > 0 {
+            Ok(())
+        } else if result == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+    #[cfg(windows)]
+    {
+        #[repr(C)]
+        struct WsapollFd {
+            fd: RawSocket,
+            events: i16,
+            revents: i16,
+        }
+        unsafe extern "system" {
+            fn WSAPoll(fds: *mut WsapollFd, nfds: u32, timeout: i32) -> i32;
+        }
+        let mut fds = [
+            WsapollFd {
+                fd: left.raw_forward_socket(),
+                events: 0x0300,
+                revents: 0,
+            },
+            WsapollFd {
+                fd: right.raw_forward_socket(),
+                events: 0x0300,
+                revents: 0,
+            },
+        ];
+        let result = unsafe { WSAPoll(fds.as_mut_ptr(), fds.len() as u32, -1) };
+        if result >= 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+}
+
+fn copy_bidirectional<L: RemoteForwardStream, R: RemoteForwardStream>(
     left: &mut L,
     right: &mut R,
     mut should_stop: impl FnMut() -> bool,
 ) -> Result<(), String> {
     let mut left_buf = [0_u8; 16 * 1024];
     let mut right_buf = [0_u8; 16 * 1024];
-    let idle_wait_lock = Mutex::new(());
-    let idle_wakeup = Condvar::new();
+    left.set_forward_nonblocking(true)
+        .map_err(|error| format!("Could not configure forward read readiness: {error}"))?;
+    right
+        .set_forward_nonblocking(true)
+        .map_err(|error| format!("Could not configure forward read readiness: {error}"))?;
     loop {
         if should_stop() {
             break;
@@ -5641,19 +6066,28 @@ fn copy_bidirectional<L: Read + Write, R: Read + Write>(
                 if should_stop() {
                     break;
                 }
+                left.set_forward_nonblocking(false).map_err(|error| {
+                    format!("Could not configure forward write readiness: {error}")
+                })?;
+                right.set_forward_nonblocking(false).map_err(|error| {
+                    format!("Could not configure forward write readiness: {error}")
+                })?;
                 right
                     .write_all(&left_buf[..read])
                     .map_err(|error| format!("Write failed: {error}"))?;
                 right
                     .flush()
                     .map_err(|error| format!("Flush failed: {error}"))?;
+                left.set_forward_nonblocking(true).map_err(|error| {
+                    format!("Could not restore forward read readiness: {error}")
+                })?;
+                right.set_forward_nonblocking(true).map_err(|error| {
+                    format!("Could not restore forward read readiness: {error}")
+                })?;
                 made_progress = true;
             }
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
-                ) => {}
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {}
             Err(error) => return Err(format!("Read failed: {error}")),
         }
 
@@ -5666,24 +6100,31 @@ fn copy_bidirectional<L: Read + Write, R: Read + Write>(
                 if should_stop() {
                     break;
                 }
+                left.set_forward_nonblocking(false).map_err(|error| {
+                    format!("Could not configure forward write readiness: {error}")
+                })?;
+                right.set_forward_nonblocking(false).map_err(|error| {
+                    format!("Could not configure forward write readiness: {error}")
+                })?;
                 left.write_all(&right_buf[..read])
                     .map_err(|error| format!("Write failed: {error}"))?;
                 left.flush()
                     .map_err(|error| format!("Flush failed: {error}"))?;
+                left.set_forward_nonblocking(true).map_err(|error| {
+                    format!("Could not restore forward read readiness: {error}")
+                })?;
+                right.set_forward_nonblocking(true).map_err(|error| {
+                    format!("Could not restore forward read readiness: {error}")
+                })?;
                 made_progress = true;
             }
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
-                ) => {}
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {}
             Err(error) => return Err(format!("Read failed: {error}")),
         }
-
         if !made_progress {
-            if let Ok(guard) = idle_wait_lock.lock() {
-                let _ = idle_wakeup.wait_timeout(guard, Duration::from_millis(2));
-            }
+            wait_for_forward_readability(left, right)
+                .map_err(|error| format!("Forward readiness wait failed: {error}"))?;
         }
     }
     Ok(())
@@ -5692,6 +6133,23 @@ fn copy_bidirectional<L: Read + Write, R: Read + Write>(
 fn native_connection_should_stop(inner: &RemoteHostInner, native_runtime_generation: u64) -> bool {
     inner.stop_flag.load(Ordering::Acquire)
         || inner.native_runtime_generation.load(Ordering::Acquire) != native_runtime_generation
+}
+
+fn native_connection_should_stop_weak(
+    inner: &Weak<RemoteHostInner>,
+    native_runtime_generation: u64,
+) -> bool {
+    inner
+        .upgrade()
+        .map(|inner| native_connection_should_stop(&inner, native_runtime_generation))
+        .unwrap_or(true)
+}
+
+fn cancel_native_connection_socket(socket: &TcpStream) {
+    // Keep the wake operation on the shared socket so rustls/read-message
+    // workers leave their blocking read without changing the live stream's
+    // mode or normal handshake deadlines.
+    let _ = socket.shutdown(Shutdown::Both);
 }
 
 #[cfg(test)]
@@ -5712,13 +6170,21 @@ fn spawn_native_connection_worker(
     stream: TcpStream,
     native_runtime_generation: u64,
 ) {
+    // Keep a cancellation socket on the local path until registration has
+    // linearized. A restart can race this worker between spawn and the
+    // lifecycle-registry lock; in that window the owner has no registry entry
+    // from which to wake a blocking TLS read unless this local clone is used.
+    let mut socket_wakeup = stream.try_clone().ok();
     let done = Arc::new(AtomicBool::new(false));
-    let thread_inner = inner.clone();
+    // The stalled TLS phase must not keep the host runtime alive after the
+    // owner has revoked the generation. Upgrade this weak reference only for
+    // the post-handshake work that needs the live service.
+    let thread_inner = Arc::downgrade(inner);
     let worker = RemoteWorker::spawn(
         format!("remote-native-{connection_id}"),
         Some(done.clone()),
         move || {
-            handle_client_connection(
+            handle_client_connection_with_weak(
                 thread_inner,
                 connection_id,
                 stream,
@@ -5751,10 +6217,15 @@ fn spawn_native_connection_worker(
                     NativeConnectionWorker {
                         generation: native_runtime_generation,
                         done,
+                        socket_wakeup: socket_wakeup.take(),
+                        runtime_hold: Some(inner.clone()),
                         worker: worker.take().expect("native worker should register once"),
                     },
                 );
         }
+    }
+    if let Some(socket) = socket_wakeup {
+        cancel_native_connection_socket(&socket);
     }
     if let Some(worker) = worker {
         settle_remote_worker(
@@ -5786,6 +6257,7 @@ fn reap_completed_native_connection_workers(inner: &Arc<RemoteHostInner>) {
             .collect::<Vec<_>>()
     };
     for worker in completed {
+        drop(worker.runtime_hold);
         settle_remote_worker(
             inner,
             worker.worker,
@@ -5816,6 +6288,10 @@ fn join_native_connection_workers_before_generation(
             .collect::<Vec<_>>()
     };
     for worker in workers {
+        if let Some(socket) = worker.socket_wakeup.as_ref() {
+            cancel_native_connection_socket(socket);
+        }
+        drop(worker.runtime_hold);
         settle_remote_worker(inner, worker.worker, deadline);
     }
 }
@@ -5840,20 +6316,30 @@ fn run_listener(
     let listener = match TcpListener::bind(&bind) {
         Ok(listener) => listener,
         Err(error) => {
+            let failure = ListenerBindFailure::from_io(bind.clone(), error);
             inner.listener_running.store(false, Ordering::Relaxed);
             if let Ok(mut slot) = inner.listener_error.write() {
-                *slot = Some(format!("Could not listen on {bind}: {error}"));
+                *slot = Some(failure.to_string());
             }
             set_last_connection_note(
                 &inner,
-                format!("Remote host could not start listening on {bind}: {error}"),
+                format!("Remote host could not start listening: {failure}"),
                 true,
             );
-            eprintln!("[remote] failed to bind {bind}: {error}");
+            eprintln!("[remote] failed to bind {failure}");
+            #[cfg(test)]
+            notify_native_lifecycle(&inner, NativeLifecycleTestEvent::ListenerBindFailed);
             return;
         }
     };
     if !lease.is_current() {
+        let failure = ListenerBindFailure::GenerationStale {
+            bind: bind.clone(),
+            phase: "after",
+        };
+        if let Ok(mut slot) = inner.listener_error.write() {
+            *slot = Some(failure.to_string());
+        }
         let _ = listener.set_nonblocking(false);
         return;
     }
@@ -6305,23 +6791,44 @@ fn handle_client_connection(
     stream: TcpStream,
     native_runtime_generation: u64,
 ) {
+    handle_client_connection_with_weak(
+        Arc::downgrade(&inner),
+        connection_id,
+        stream,
+        native_runtime_generation,
+    );
+}
+
+fn handle_client_connection_with_weak(
+    inner: Weak<RemoteHostInner>,
+    connection_id: u64,
+    stream: TcpStream,
+    native_runtime_generation: u64,
+) {
     let peer_addr = stream.peer_addr().ok();
     let peer_label = peer_addr
         .map(|addr| addr.to_string())
         .unwrap_or_else(|| "unknown client".to_string());
     let peer_ip = peer_addr.map(|addr| addr.ip().to_string());
-    let config = inner
-        .config
-        .read()
-        .map(|slot| slot.clone())
-        .unwrap_or_default();
+    let Some(config) = inner.upgrade().map(|inner| {
+        inner
+            .config
+            .read()
+            .map(|slot| slot.clone())
+            .unwrap_or_default()
+    }) else {
+        return;
+    };
     let handshake_deadline = Instant::now() + Duration::from_secs(5);
     let mut stream =
         match transport::accept_tls_with_deadline(stream, &config, handshake_deadline, || {
-            native_connection_should_stop(&inner, native_runtime_generation)
+            native_connection_should_stop_weak(&inner, native_runtime_generation)
         }) {
             Ok(result) => result.stream,
             Err(error) => {
+                let Some(inner) = inner.upgrade() else {
+                    return;
+                };
                 if native_connection_should_stop(&inner, native_runtime_generation) {
                     return;
                 }
@@ -6337,17 +6844,18 @@ fn handle_client_connection(
     let mut read_buffer = Vec::new();
 
     let _ = stream.sock.set_read_timeout(Some(
-        handshake_deadline
-            .saturating_duration_since(Instant::now())
-            .min(Duration::from_millis(100)),
+        handshake_deadline.saturating_duration_since(Instant::now()),
     ));
     let hello = match read_message_until_deadline_cancelled::<ClientMessage, _, _>(
         &mut stream,
         handshake_deadline,
-        || native_connection_should_stop(&inner, native_runtime_generation),
+        || native_connection_should_stop_weak(&inner, native_runtime_generation),
     ) {
         Ok(message) => message,
         Err(error) => {
+            let Some(inner) = inner.upgrade() else {
+                return;
+            };
             if native_connection_should_stop(&inner, native_runtime_generation) {
                 return;
             }
@@ -6364,7 +6872,12 @@ fn handle_client_connection(
             return;
         }
     };
+    let _ = stream.sock.set_read_timeout(None);
+    let _ = stream.sock.set_write_timeout(None);
 
+    let Some(inner) = inner.upgrade() else {
+        return;
+    };
     if matches!(hello, ClientMessage::PortForwardHello { .. }) {
         if let Err(message) = handle_port_forward_connection(
             &inner,
@@ -6504,7 +7017,24 @@ fn handle_client_connection(
         false,
     );
 
-    while !native_connection_should_stop(&inner, native_runtime_generation) {
+    if let Err(error) = stream.sock.set_nonblocking(true) {
+        set_last_connection_note(
+            &inner,
+            format!("Remote native socket could not enter readiness mode: {error}"),
+            true,
+        );
+        return;
+    }
+
+    let inner_weak = Arc::downgrade(&inner);
+    drop(inner);
+    loop {
+        let Some(inner) = inner_weak.upgrade() else {
+            break;
+        };
+        if native_connection_should_stop(&inner, native_runtime_generation) {
+            break;
+        }
         let mut should_break = false;
         for _ in 0..MAX_OUTBOUND_MESSAGES_PER_TICK {
             match rx.try_recv() {
@@ -6530,7 +7060,15 @@ fn handle_client_connection(
             break;
         }
 
-        match try_read_message::<ClientMessage, _>(&mut stream, &mut read_buffer) {
+        // Do not keep the host runtime alive while readiness waits for client
+        // input. Teardown drops the last registry hold before joining this
+        // worker, so a blocked native socket cannot retain the stopped host.
+        drop(inner);
+        let incoming = try_read_message::<ClientMessage, _>(&mut stream, &mut read_buffer);
+        let Some(inner) = inner_weak.upgrade() else {
+            break;
+        };
+        match incoming {
             Ok(Some(ClientMessage::SetFocusedSession { session_id })) => {
                 if let Ok(mut clients) = inner.clients.lock() {
                     if let Some(client) = clients.get_mut(&connection_id) {
@@ -6602,7 +7140,13 @@ fn handle_client_connection(
                 }
             }
             Ok(Some(ClientMessage::Ping)) => {
-                if write_message(&mut stream, &ServerMessage::Pong).is_err() {
+                if write_message_nonblocking_until_deadline(
+                    &mut stream,
+                    &ServerMessage::Pong,
+                    Instant::now() + REMOTE_CALLBACK_TIMEOUT,
+                )
+                .is_err()
+                {
                     break;
                 }
             }
@@ -6682,20 +7226,41 @@ fn handle_client_connection(
             }
             Ok(Some(ClientMessage::Disconnect)) => break,
             Ok(Some(ClientMessage::Hello { .. } | ClientMessage::PortForwardHello { .. })) => break,
-            Ok(None) => match rx.recv_timeout(Duration::from_millis(40)) {
+            Ok(None) => match rx.try_recv() {
                 Ok(message) => {
                     let is_disconnect = matches!(message, ServerMessage::Disconnected { .. });
-                    if write_message(&mut stream, &message).is_err() || is_disconnect {
+                    if write_message_nonblocking_until_deadline(
+                        &mut stream,
+                        &message,
+                        Instant::now() + REMOTE_CALLBACK_TIMEOUT,
+                    )
+                    .is_err()
+                        || is_disconnect
+                    {
                         break;
                     }
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::TryRecvError::Empty) => {
+                    drop(inner);
+                    if wait_for_remote_socket_io(
+                        &stream.sock,
+                        Instant::now() + HEARTBEAT_INTERVAL,
+                        false,
+                    )
+                    .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(mpsc::TryRecvError::Disconnected) => break,
             },
             Err(_) => break,
         }
     }
 
+    let Some(inner) = inner_weak.upgrade() else {
+        return;
+    };
     let _ = stream.sock.shutdown(Shutdown::Both);
     let _removed = inner
         .clients
@@ -6911,8 +7476,8 @@ fn handle_port_forward_connection(
         )
     })?;
     let _ = upstream.set_nodelay(true);
-    let _ = upstream.set_read_timeout(Some(Duration::from_millis(40)));
-    let _ = upstream.set_write_timeout(Some(Duration::from_secs(5)));
+    let _ = upstream.set_read_timeout(None);
+    let _ = upstream.set_write_timeout(None);
     set_server_handshake_write_deadline(stream, handshake_deadline)?;
     write_message_until_deadline(stream, &ServerMessage::PortForwardOk, handshake_deadline)
         .map_err(|error| format!("Could not start port forward: {error}"))?;
@@ -7509,6 +8074,7 @@ fn run_client_connection(
 ) {
     let mut read_buffer = Vec::new();
     let mut last_heartbeat_at = Instant::now();
+    let _ = stream.sock.set_read_timeout(Some(HEARTBEAT_INTERVAL));
 
     while inner
         .disconnected_message
@@ -7696,7 +8262,7 @@ fn run_client_connection(
                 | ServerMessage::Error { .. }
                 | ServerMessage::Pong,
             )) => {}
-            Ok(None) => match rx.recv_timeout(Duration::from_millis(40)) {
+            Ok(None) => match rx.try_recv() {
                 Ok(message) => {
                     let is_disconnect = matches!(message, ClientMessage::Disconnect);
                     if write_message(&mut stream, &message).is_err() || is_disconnect {
@@ -7704,8 +8270,8 @@ fn run_client_connection(
                         break;
                     }
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => break,
             },
             Err(_) => {
                 if let Ok(mut disconnected) = inner.disconnected_message.write() {
@@ -7755,6 +8321,53 @@ fn write_message_until_deadline<T: Serialize, W: Write>(
         return Err("Remote handshake write deadline expired.".to_string());
     }
     write_message(stream, message)
+}
+
+fn write_message_nonblocking_until_deadline<T: Serialize>(
+    stream: &mut transport::ServerTlsStream,
+    message: &T,
+    deadline: Instant,
+) -> Result<(), String> {
+    let payload = to_vec_named(message).map_err(|error| format!("Serialize failed: {error}"))?;
+    let mut frame = Vec::with_capacity(4 + payload.len());
+    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&payload);
+    let mut written = 0;
+    while written < frame.len() {
+        if Instant::now() >= deadline {
+            return Err("Remote nonblocking write deadline expired.".to_string());
+        }
+        match stream.write(&frame[written..]) {
+            Ok(0) => return Err("Remote connection closed during write.".to_string()),
+            Ok(bytes) => written += bytes,
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                if !wait_for_remote_socket_io(&stream.sock, deadline, true)
+                    .map_err(|error| format!("Remote write readiness failed: {error}"))?
+                {
+                    return Err("Remote nonblocking write deadline expired.".to_string());
+                }
+            }
+            Err(error) => return Err(format!("Write failed: {error}")),
+        }
+    }
+    loop {
+        if Instant::now() >= deadline {
+            return Err("Remote nonblocking flush deadline expired.".to_string());
+        }
+        match stream.flush() {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                if !wait_for_remote_socket_io(&stream.sock, deadline, true)
+                    .map_err(|error| format!("Remote flush readiness failed: {error}"))?
+                {
+                    return Err("Remote nonblocking flush deadline expired.".to_string());
+                }
+            }
+            Err(error) => return Err(format!("Write failed: {error}")),
+        }
+    }
 }
 
 fn set_server_handshake_write_deadline(
@@ -8078,11 +8691,12 @@ mod tests {
         LocalPortForwardLifecycleTestEvent, LocalPortForwardManager, PairedRemoteClient,
         PairedWebClient, PendingRemoteRequest, RemoteAccessActivityEvent, RemoteAccessActivityKind,
         RemoteAccessSource, RemoteAction, RemoteClientHandle, RemoteClientInner, RemoteHostConfig,
-        RemoteHostService, RemoteHostWorkLimiter, RemoteLatencyStats, RemoteListenerIdentity,
-        RemoteMachineState, RemotePortAuthority, RemotePortAuthorityKind, RemoteSessionBootstrap,
-        RemoteSessionStreamEvent, RemoteTerminalInput, RemoteWorker, RemoteWorkspaceDelta,
+        RemoteHostService, RemoteHostWorkLimiter, RemoteLatencyStats, RemoteMachineState,
+        RemotePortAuthority, RemoteSessionBootstrap, RemoteSessionStreamEvent,
+        RemoteStatePersistenceIoTestPhase, RemoteTerminalInput, RemoteWorker, RemoteWorkspaceDelta,
         RemoteWorkspaceSnapshot, ServerMessage, HOST_CONFIG_PERSISTENCE_TEST_HOOK,
         MAX_PENDING_REMOTE_REQUESTS, REMOTE_STATE_PERMISSION_VERIFY_TEST_HOOK,
+        REMOTE_STATE_PERSISTENCE_IO_TEST_HOOK,
     };
     use crate::domain::id::ResourceId;
     use crate::domain::operation::ResourceFence;
@@ -8158,6 +8772,33 @@ mod tests {
     impl Drop for RemoteStatePermissionVerifyHookGuard {
         fn drop(&mut self) {
             *REMOTE_STATE_PERMISSION_VERIFY_TEST_HOOK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        }
+    }
+
+    struct RemoteStatePersistenceIoHookGuard;
+
+    impl RemoteStatePersistenceIoHookGuard {
+        fn install(
+            hook: Arc<
+                dyn Fn(RemoteStatePersistenceIoTestPhase, &Path) -> std::io::Result<()>
+                    + Send
+                    + Sync,
+            >,
+        ) -> Self {
+            let mut slot = REMOTE_STATE_PERSISTENCE_IO_TEST_HOOK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert!(slot.is_none(), "remote state IO hook leaked");
+            *slot = Some(hook);
+            Self
+        }
+    }
+
+    impl Drop for RemoteStatePersistenceIoHookGuard {
+        fn drop(&mut self) {
+            *REMOTE_STATE_PERSISTENCE_IO_TEST_HOOK
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         }
@@ -8955,6 +9596,111 @@ mod tests {
                 .server_id,
             "old-server"
         );
+    }
+
+    #[test]
+    fn durable_remote_save_rolls_back_on_temp_sync_and_rename_failures() {
+        let _profile = TestProfileGuard::new("remote-state-durable-io-failures");
+        let mut old_state = RemoteMachineState::default();
+        old_state.host.server_id = "old-server".to_string();
+        save_remote_machine_state(&old_state).expect("seed remote state");
+        let path = super::remote_state_path().expect("remote state path");
+        let old_bytes = std::fs::read(&path).expect("read seeded remote state");
+
+        for (phase, detail) in [
+            (RemoteStatePersistenceIoTestPhase::TempSync, "temp sync"),
+            (RemoteStatePersistenceIoTestPhase::Rename, "rename"),
+        ] {
+            let failed = Arc::new(AtomicBool::new(false));
+            let failed_for_hook = failed.clone();
+            let _io_hook =
+                RemoteStatePersistenceIoHookGuard::install(Arc::new(move |current, _| {
+                    if current == phase && !failed_for_hook.swap(true, Ordering::SeqCst) {
+                        return Err(std::io::Error::new(
+                            ErrorKind::Other,
+                            format!("injected {detail} failure"),
+                        ));
+                    }
+                    Ok(())
+                }));
+
+            let service = RemoteHostService::new(old_state.host.clone());
+            let error = super::mutate_host_config(&service.inner, |config| {
+                config.server_id = "new-server".to_string();
+            })
+            .expect_err("injected durable-save failure must reject mutation");
+            assert!(error.contains(detail), "unexpected error: {error}");
+            assert_eq!(service.config().server_id, "old-server");
+            assert_eq!(
+                std::fs::read(&path).expect("read unchanged remote state"),
+                old_bytes
+            );
+            assert_eq!(
+                load_remote_machine_state()
+                    .expect("reopen unchanged remote state")
+                    .host
+                    .server_id,
+                "old-server"
+            );
+            drop(_io_hook);
+        }
+    }
+
+    #[test]
+    fn durable_remote_save_syncs_parent_and_rolls_back_after_barrier_failure() {
+        let _profile = TestProfileGuard::new("remote-state-parent-sync-rollback");
+        let mut old_state = RemoteMachineState::default();
+        old_state.host.server_id = "old-server".to_string();
+        save_remote_machine_state(&old_state).expect("seed remote state");
+        let path = super::remote_state_path().expect("remote state path");
+        let old_bytes = std::fs::read(&path).expect("read seeded remote state");
+        let failed = Arc::new(AtomicBool::new(false));
+        let failed_for_hook = failed.clone();
+        let _io_hook = RemoteStatePersistenceIoHookGuard::install(Arc::new(move |phase, _| {
+            if phase == RemoteStatePersistenceIoTestPhase::ParentSync
+                && !failed_for_hook.swap(true, Ordering::SeqCst)
+            {
+                return Err(std::io::Error::new(
+                    ErrorKind::Other,
+                    "injected parent sync failure",
+                ));
+            }
+            Ok(())
+        }));
+
+        let service = RemoteHostService::new(old_state.host.clone());
+        let error = super::mutate_host_config(&service.inner, |config| {
+            config.server_id = "new-server".to_string();
+        })
+        .expect_err("parent barrier failure must reject mutation");
+        assert!(error.contains("parent sync"), "unexpected error: {error}");
+        assert_eq!(service.config().server_id, "old-server");
+        assert_eq!(
+            std::fs::read(&path).expect("read restored remote state"),
+            old_bytes
+        );
+        assert_eq!(
+            load_remote_machine_state()
+                .expect("reopen restored remote state")
+                .host
+                .server_id,
+            "old-server"
+        );
+    }
+
+    #[test]
+    fn production_remote_loops_have_no_short_timeout_polling() {
+        let source = include_str!("mod.rs");
+        let production = source
+            .split("#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("remote production source boundary");
+        assert!(!production.contains("recv_timeout(Duration::from_millis(25))"));
+        assert!(!production.contains("recv_timeout(Duration::from_millis(40))"));
+        assert!(!production.contains("wait_timeout(guard, Duration::from_millis(2))"));
+        let transport = include_str!("transport.rs");
+        assert!(!transport.contains("HANDSHAKE_POLL_INTERVAL"));
+        assert!(!transport.contains("ACTIVE_READ_TIMEOUT"));
     }
 
     #[test]
@@ -11077,6 +11823,15 @@ mod tests {
             runtime_state.clone(),
             port_statuses.clone(),
         );
+        assert!(
+            service
+                .inner
+                .port_authorities
+                .read()
+                .expect("port authority lock")
+                .is_empty(),
+            "legacy snapshot publication must fail closed instead of retaining a stale typed fence"
+        );
 
         let mut next_runtime = runtime_state;
         next_runtime.active_session_id = Some("server-session".to_string());
@@ -11181,6 +11936,82 @@ mod tests {
             .native_runtime_generation
             .fetch_add(1, Ordering::SeqCst);
         assert!(!second.is_current(), "stale generation must lose its lease");
+    }
+
+    #[test]
+    fn external_listener_wins_typed_bind_conflict_without_being_harmed() {
+        let _profile = TestProfileGuard::new("external-listener-bind-conflict");
+        let occupied = TcpListener::bind(("127.0.0.1", 0)).expect("external listener should bind");
+        let port = occupied
+            .local_addr()
+            .expect("external listener address")
+            .port();
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let (bind_failed_tx, bind_failed_rx) = mpsc::sync_channel(1);
+        *service
+            .inner
+            .native_lifecycle_test_hook
+            .write()
+            .expect("native lifecycle hook lock") = Some(Arc::new(move |event| {
+            if event == super::NativeLifecycleTestEvent::ListenerBindFailed {
+                let _ = bind_failed_tx.send(());
+            }
+        }));
+        service
+            .update_native_listener_settings(true, "127.0.0.1".to_string(), port)
+            .expect("native listener settings should persist");
+        bind_failed_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("external bind conflict should be published without polling");
+        assert!(service
+            .status()
+            .listener_error
+            .as_deref()
+            .is_some_and(|error| error.contains("external bind conflict")));
+        assert!(
+            TcpStream::connect(("127.0.0.1", port)).is_ok(),
+            "external listener stopped accepting after DevManager bind conflict"
+        );
+        drop(service);
+        drop(occupied);
+    }
+
+    #[test]
+    fn external_web_listener_wins_typed_bind_conflict_without_being_harmed() {
+        let _profile = TestProfileGuard::new("external-web-listener-bind-conflict");
+        let occupied = TcpListener::bind(("127.0.0.1", 0)).expect("external listener should bind");
+        let port = occupied
+            .local_addr()
+            .expect("external listener address")
+            .port();
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let (bind_failed_tx, bind_failed_rx) = mpsc::sync_channel(1);
+        *service
+            .inner
+            .native_lifecycle_test_hook
+            .write()
+            .expect("native lifecycle hook lock") = Some(Arc::new(move |event| {
+            if event == super::NativeLifecycleTestEvent::WebListenerBindFailed {
+                let _ = bind_failed_tx.send(());
+            }
+        }));
+        service
+            .update_web_listener_settings(true, "127.0.0.1".to_string(), port)
+            .expect("web listener settings should persist");
+        bind_failed_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("external web bind conflict should be published without polling");
+        assert!(service
+            .status()
+            .web_listener_error
+            .as_deref()
+            .is_some_and(|error| error.contains("external bind conflict")));
+        assert!(
+            TcpStream::connect(("127.0.0.1", port)).is_ok(),
+            "external web listener stopped accepting after DevManager bind conflict"
+        );
+        drop(service);
+        drop(occupied);
     }
 
     #[test]
@@ -12285,36 +13116,145 @@ mod tests {
             .expect("production listener should start");
 
         let app = managed_server_state(server_port);
-        let runtime = managed_server_runtime("command-web", 4242);
-        let authority = RemotePortAuthority {
+        let inventory = crate::services::ports_service::PortInventory::new();
+        let live_snapshot = inventory
+            .refresh(&[server_port])
+            .expect("strict live port inventory should complete");
+        assert!(
+            live_snapshot.is_valid(),
+            "strict live snapshot must validate"
+        );
+        assert!(
+            live_snapshot.is_fresh_at(
+                Instant::now(),
+                crate::process::ports::DEFAULT_FREE_PROOF_MAX_AGE
+            ),
+            "strict live snapshot must be fresh"
+        );
+        let live_listener = live_snapshot
+            .observation(server_port)
+            .expect("live port observation")
+            .listeners()
+            .first()
+            .expect("live listener identity");
+        let process_id = live_listener.pid();
+        let executable = live_listener
+            .canonical_executable()
+            .expect("strict live listener must include executable proof")
+            .to_path_buf();
+        let managed_identity = crate::process::identity::ManagedProcessIdentity::new(
+            crate::process::identity::ManagedProcessId::new(
+                process_id,
+                live_listener.creation_time_100ns(),
+            )
+            .expect("live listener process identity should be valid"),
+            executable,
+        )
+        .expect("live listener executable should canonicalize");
+        let resource = ResourceFence::new(ResourceId::new(), 1);
+        let managed = crate::process::ports::ManagedResourceSnapshot::new(
+            crate::process::registry::ManagedProcessFence::new(
+                resource,
+                crate::process::identity::ProcessOwner::Host,
+                managed_identity.clone(),
+            ),
+            crate::process::registry::ManagedProcessState::Running,
+            vec![managed_identity],
+            crate::process::ports::RegistryMembershipSnapshot::valid(
+                1,
+                1,
+                Instant::now(),
+                Duration::from_secs(5),
+            ),
+        );
+        assert!(
+            managed.is_fresh_at(Instant::now()),
+            "managed live membership should be fresh: {:?}",
+            managed.membership()
+        );
+        assert_eq!(
+            live_snapshot
+                .observation(server_port)
+                .expect("live port observation")
+                .listeners()[0]
+                .pid(),
+            process_id
+        );
+        assert_eq!(
+            live_snapshot
+                .observation(server_port)
+                .expect("live port observation")
+                .listeners()[0]
+                .canonical_executable(),
+            Some(managed.root().canonical_executable()),
+            "strict listener executable must match the managed root"
+        );
+        assert!(
+            managed.member_identities().iter().any(|member| {
+                member.id().pid() == live_listener.pid()
+                    && member.id().creation_time_100ns() == live_listener.creation_time_100ns()
+                    && member.canonical_executable()
+                        == live_listener.canonical_executable().unwrap()
+            }),
+            "strict listener identity must be a member of the managed live snapshot: listener={live_listener:?}, members={:?}",
+            managed.member_identities()
+        );
+        assert!(
+            live_snapshot.endpoints(server_port).is_empty()
+                || live_snapshot
+                    .endpoints(server_port)
+                    .iter()
+                    .all(|endpoint| { endpoint.identity() == *live_listener }),
+            "strict endpoint identities must agree with the listener observation"
+        );
+        let classified = crate::process::ports::classify_port_authority_from_snapshot_at(
+            &crate::process::ports::PortTarget::new(
+                server_port,
+                resource,
+                crate::process::ports::ManagedPortHealth::Ready,
+            ),
+            &live_snapshot,
+            Some(&managed),
+            Instant::now(),
+            Instant::now() + crate::process::ports::DEFAULT_FREE_PROOF_MAX_AGE,
+        );
+        assert_eq!(
+            classified,
+            crate::process::ports::PortAuthority::Managed,
+            "strict live authority classification should prove ownership"
+        );
+        let observed_at = live_snapshot.observed_at();
+        let live_status = crate::process::ports::project_port_status_from_snapshot_at(
+            &crate::process::ports::PortTarget::new(
+                server_port,
+                resource,
+                crate::process::ports::ManagedPortHealth::Ready,
+            ),
+            &live_snapshot,
+            Some(&managed),
+            Instant::now(),
+            observed_at
+                .checked_add(crate::process::ports::DEFAULT_FREE_PROOF_MAX_AGE)
+                .expect("live snapshot deadline should fit"),
+        );
+        assert_eq!(
+            live_status.kind(),
+            crate::process::ports::PortStatusKind::ManagedHealthy,
+            "forward authority must come from the strict live snapshot: {live_status:?}"
+        );
+        let authority = RemotePortAuthority::from_rich(&live_status, now_epoch_ms())
+            .with_snapshot_metadata(live_snapshot.publication_sequence(), 1, 1);
+        let runtime = managed_server_runtime("command-web", process_id);
+        let legacy_status = PortStatus {
             port: server_port,
-            kind: RemotePortAuthorityKind::Managed,
-            resource: Some(ResourceFence::new(ResourceId::new(), 1)),
-            listeners: vec![RemoteListenerIdentity {
-                pid: 4242,
-                creation_time_100ns: 1,
-                executable_proven: true,
-            }],
-            membership_revision: 1,
-            observation_sequence: 1,
-            publication_sequence: 1,
-            observed_at_epoch_ms: now_epoch_ms(),
-            freshness_deadline_epoch_ms: now_epoch_ms()
-                .saturating_add(super::REMOTE_PORT_AUTHORITY_MAX_AGE_MS),
-            error: None,
+            in_use: !live_status.listeners().is_empty(),
+            pid: live_status.listener().map(|listener| listener.pid()),
+            process_name: None,
         };
         service.update_snapshot_parts_with_authorities(
             Some(app),
             Some(runtime),
-            Some(HashMap::from([(
-                server_port,
-                PortStatus {
-                    port: server_port,
-                    in_use: true,
-                    pid: Some(4242),
-                    process_name: Some("node".to_string()),
-                },
-            )])),
+            Some(HashMap::from([(server_port, legacy_status)])),
             Some(HashMap::from([(server_port, authority)])),
         );
 

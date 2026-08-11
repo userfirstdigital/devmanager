@@ -1,7 +1,8 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, Weak};
-use std::time::Duration;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use crate::remote::presentation::StableSessionKey;
 
@@ -28,6 +29,10 @@ pub(crate) struct WebInputExecutor {
 
 struct WebInputExecutorInner {
     workers: Mutex<HashMap<StableSessionKey, WebInputWorker>>,
+    handles: Mutex<HashMap<u64, JoinHandle<()>>>,
+    completion_tx: mpsc::Sender<u64>,
+    completion_rx: Mutex<mpsc::Receiver<u64>>,
+    stopping: AtomicBool,
     max_workers: usize,
     queue_capacity: usize,
     idle_timeout: Duration,
@@ -121,9 +126,14 @@ impl WebInputExecutor {
         max_bytes: usize,
         idle_timeout: Duration,
     ) -> Self {
+        let (completion_tx, completion_rx) = mpsc::channel();
         Self {
             inner: Arc::new(WebInputExecutorInner {
                 workers: Mutex::new(HashMap::new()),
+                handles: Mutex::new(HashMap::new()),
+                completion_tx,
+                completion_rx: Mutex::new(completion_rx),
+                stopping: AtomicBool::new(false),
                 max_workers: max_workers.max(1),
                 queue_capacity: queue_capacity.max(1),
                 idle_timeout,
@@ -143,6 +153,10 @@ impl WebInputExecutor {
         retained_bytes: usize,
         job: impl FnOnce() + Send + 'static,
     ) -> Result<(), WebInputDispatchError> {
+        self.reap_completed_workers();
+        if self.inner.stopping.load(Ordering::Acquire) {
+            return Err(WebInputDispatchError::WorkerUnavailable);
+        }
         let Some(reservation) = self.inner.budget.reserve(retained_bytes) else {
             return Err(WebInputDispatchError::BudgetExceeded);
         };
@@ -158,6 +172,12 @@ impl WebInputExecutor {
                 .workers
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // Shutdown takes this same registry lock after flipping the
+            // stopping bit, so a dispatch that raced the lifecycle boundary
+            // cannot create a worker after the owner has drained the map.
+            if self.inner.stopping.load(Ordering::Acquire) {
+                return Err(WebInputDispatchError::WorkerUnavailable);
+            }
             if let Some(worker) = workers.get(&key) {
                 let job = pending.take().expect("web input job dispatched once");
                 match worker.sender.try_send(job) {
@@ -180,15 +200,136 @@ impl WebInputExecutor {
             let weak = Arc::downgrade(&self.inner);
             let worker_key = key.clone();
             let idle_timeout = self.inner.idle_timeout;
+            let completion_tx = self.inner.completion_tx.clone();
             let spawn = std::thread::Builder::new()
                 .name(format!("web-input-{id}"))
-                .spawn(move || run_worker(weak, worker_key, id, receiver, idle_timeout));
-            if spawn.is_err() {
+                .spawn(move || {
+                    run_worker(weak, worker_key, id, receiver, idle_timeout, completion_tx)
+                });
+            let Ok(handle) = spawn else {
                 return Err(WebInputDispatchError::WorkerUnavailable);
-            }
+            };
             workers.insert(key.clone(), WebInputWorker { id, sender });
+            self.inner
+                .handles
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(id, handle);
         }
         Err(WebInputDispatchError::WorkerUnavailable)
+    }
+
+    /// Stop accepting work, release queued jobs, and join every worker that
+    /// exits before the shared lifecycle deadline. Any callback that ignores
+    /// its own deadline remains in this owned handle map as visible residue;
+    /// it is never detached or silently abandoned.
+    pub(crate) fn shutdown_until(&self, deadline: Instant) -> usize {
+        self.inner.stopping.store(true, Ordering::Release);
+        let workers = std::mem::take(
+            &mut *self
+                .inner
+                .workers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        drop(workers);
+        self.reap_completed_workers();
+        self.join_completed_until(deadline)
+    }
+
+    pub(crate) fn take_unfinished_worker_handles(&self) -> Vec<JoinHandle<()>> {
+        self.inner
+            .handles
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .drain()
+            .map(|(_, handle)| handle)
+            .collect()
+    }
+
+    fn join_completed_until(&self, deadline: Instant) -> usize {
+        loop {
+            let remaining = self
+                .inner
+                .handles
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len();
+            if remaining == 0 {
+                return 0;
+            }
+            let wait = deadline.saturating_duration_since(Instant::now());
+            if wait.is_zero() {
+                return remaining;
+            }
+            let event = self
+                .inner
+                .completion_rx
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .recv_timeout(wait);
+            match event {
+                Ok(id) => {
+                    if let Some(handle) = self
+                        .inner
+                        .handles
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .remove(&id)
+                    {
+                        let _ = handle.join();
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    return self
+                        .inner
+                        .handles
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .len();
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return self
+                        .inner
+                        .handles
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .len();
+                }
+            }
+        }
+    }
+
+    fn reap_completed_workers(&self) {
+        let mut ids = {
+            let receiver = self
+                .inner
+                .completion_rx
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            std::iter::from_fn(|| receiver.try_recv().ok()).collect::<Vec<_>>()
+        };
+        ids.extend(
+            self.inner
+                .handles
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .filter_map(|(id, handle)| handle.is_finished().then_some(*id)),
+        );
+        ids.sort_unstable();
+        ids.dedup();
+        for id in ids {
+            if let Some(handle) = self
+                .inner
+                .handles
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&id)
+            {
+                let _ = handle.join();
+            }
+        }
     }
 
     #[cfg(test)]
@@ -217,7 +358,21 @@ fn run_worker(
     id: u64,
     receiver: mpsc::Receiver<AccountedWebInputJob>,
     idle_timeout: Duration,
+    completion_tx: mpsc::Sender<u64>,
 ) {
+    struct Completion {
+        id: u64,
+        tx: mpsc::Sender<u64>,
+    }
+    impl Drop for Completion {
+        fn drop(&mut self) {
+            let _ = self.tx.send(self.id);
+        }
+    }
+    let _completion = Completion {
+        id,
+        tx: completion_tx,
+    };
     loop {
         match receiver.recv_timeout(idle_timeout) {
             Ok(job) => run_accounted_job(job),
@@ -388,5 +543,36 @@ mod tests {
         executor
             .dispatch(StableSessionKey::from_tab("a"), 10, || {})
             .unwrap();
+    }
+
+    #[test]
+    fn shutdown_joins_paused_input_worker_without_detaching_it() {
+        let executor = WebInputExecutor::new(1, 1, Duration::from_secs(60));
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        executor
+            .dispatch(StableSessionKey::from_tab("paused"), 0, move || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            })
+            .expect("input worker should start");
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("input callback should enter before shutdown");
+        assert_eq!(
+            executor.shutdown_until(Instant::now() + Duration::from_millis(50)),
+            1,
+            "paused input worker should remain visible after its owner deadline"
+        );
+        let handles = executor.take_unfinished_worker_handles();
+        assert_eq!(
+            handles.len(),
+            1,
+            "paused input worker handle must stay owned"
+        );
+        release_tx.send(()).unwrap();
+        for handle in handles {
+            handle.join().unwrap();
+        }
     }
 }

@@ -31,8 +31,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
 use super::{
-    now_epoch_ms, ListenerLease, RemoteAccessActivityEvent, RemoteAccessActivityKind,
-    RemoteAccessSource, RemoteHostInner,
+    now_epoch_ms, ListenerBindFailure, ListenerLease, RemoteAccessActivityEvent,
+    RemoteAccessActivityKind, RemoteAccessSource, RemoteHostInner,
 };
 use crate::remote::presentation::StableSessionKey;
 use crate::state::SessionKind;
@@ -381,18 +381,22 @@ impl WebListenerHandle {
         inner: Arc<RemoteHostInner>,
         config: WebConfig,
         lease: ListenerLease,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, ListenerBindFailure> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
             .thread_name("devmanager-web")
             .build()
-            .map_err(|error| format!("failed to build tokio runtime: {error}"))?;
+            .map_err(|error| ListenerBindFailure::Other {
+                bind: format!("{}:{}", config.bind_address, config.port),
+                detail: format!("failed to build tokio runtime: {error}"),
+            })?;
 
         let bind = format!("{}:{}", config.bind_address, config.port);
         let bind_info = bind.clone();
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-        let (bind_result_tx, bind_result_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        let (bind_result_tx, bind_result_rx) =
+            std::sync::mpsc::channel::<Result<(), ListenerBindFailure>>();
 
         let router_state = Arc::new(WebState {
             inner: inner.clone(),
@@ -402,18 +406,19 @@ impl WebListenerHandle {
         runtime.spawn(async move {
             let app = build_router(router_state);
             if !lease.is_current() {
-                let _ = bind_result_tx.send(Err(
-                    "web listener generation reservation became stale before bind".to_string(),
-                ));
+                let _ = bind_result_tx.send(Err(ListenerBindFailure::GenerationStale {
+                    bind: bind.clone(),
+                    phase: "before",
+                }));
                 return;
             }
             match tokio::net::TcpListener::bind(&bind).await {
                 Ok(listener) => {
                     if !lease.is_current() {
-                        let _ = bind_result_tx.send(Err(
-                            "web listener generation reservation became stale after bind"
-                                .to_string(),
-                        ));
+                        let _ = bind_result_tx.send(Err(ListenerBindFailure::GenerationStale {
+                            bind: bind.clone(),
+                            phase: "after",
+                        }));
                         return;
                     }
                     let _ = bind_result_tx.send(Ok(()));
@@ -427,7 +432,7 @@ impl WebListenerHandle {
                     .await;
                 }
                 Err(error) => {
-                    let _ = bind_result_tx.send(Err(format!("bind {bind}: {error}")));
+                    let _ = bind_result_tx.send(Err(ListenerBindFailure::from_io(bind, error)));
                 }
             }
         });
@@ -456,7 +461,10 @@ impl WebListenerHandle {
                 })
             }
             Ok(Err(error)) => Err(error),
-            Err(_) => Err("web listener failed to report bind status in time".to_string()),
+            Err(_) => Err(ListenerBindFailure::Other {
+                bind: bind_info,
+                detail: "web listener failed to report bind status in time".to_string(),
+            }),
         }
     }
 

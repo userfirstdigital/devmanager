@@ -5581,11 +5581,18 @@ impl NativeShell {
             return;
         }
 
-        self.remote_host_service.update_snapshot_parts(
-            app_changed.then(|| remote_shared_app_state(&self.state)),
-            runtime_changed.then(|| runtime_state.clone()),
-            port_changed.then(|| self.server_port_snapshot.statuses.clone()),
-        );
+        // The app shell is the publication owner. Until the port inventory
+        // authority successor is installed, publish an explicit empty typed
+        // authority map whenever the live port projection changes; retaining
+        // the legacy PID-only rows must never keep an old forwarding fence
+        // alive across a new live snapshot.
+        self.remote_host_service
+            .update_snapshot_parts_with_authorities(
+                app_changed.then(|| remote_shared_app_state(&self.state)),
+                runtime_changed.then(|| runtime_state.clone()),
+                port_changed.then(|| self.server_port_snapshot.statuses.clone()),
+                port_changed.then(HashMap::new),
+            );
         self.last_remote_app_revision = app_revision;
         self.last_remote_runtime_revision = runtime_revision;
         self.last_remote_port_hash = port_hash;
