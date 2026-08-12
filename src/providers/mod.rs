@@ -15,6 +15,7 @@ pub mod input;
 pub mod journal;
 pub mod orchestrator;
 pub mod quota;
+pub mod quota_runtime;
 pub mod registry;
 pub mod session;
 pub mod startup;
@@ -75,6 +76,10 @@ pub use quota::{
     canonical_top_bar, AdapterQuotaSource, CanonicalQuotaBar, ProductionJitter, ProviderQuotaHost,
     QuotaCacheKey, QuotaDiagnostic, QuotaJitterError, QuotaObserver, QuotaObserverConfig,
     QuotaProbeLimiter, QuotaState, QuotaStripEntry, QuotaView,
+};
+pub use quota_runtime::{
+    NativeQuotaHost, QuotaRuntimeConfig, QuotaRuntimeError, SystemQuotaClock,
+    QUOTA_RUNTIME_SHUTDOWN_TIMEOUT,
 };
 pub use registry::{
     CacheStatus, CapabilityCacheKey, ExecutableInspector, FileSystemExecutableInspector,

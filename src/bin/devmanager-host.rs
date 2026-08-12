@@ -18,8 +18,8 @@ use devmanager::domain::ClientId;
 use devmanager::host::{
     AcceptHelloConfig, HelloListener, HostCleanupWorker, HostConnection, HostExecutorOutcome,
     HostLock, HostLockError, HostRequestExecutor, HostRequestHandle, HostRestartDisposition,
-    OrganizationRuntime, OrganizationRuntimeConfig, PhysicalExitArmRequest,
-    SupervisedHostExecutor, HOST_EXIT_ALREADY_RUNNING,
+    OrganizationRuntime, OrganizationRuntimeConfig, PhysicalExitArmRequest, SupervisedHostExecutor,
+    HOST_EXIT_ALREADY_RUNNING,
 };
 use devmanager::kernel::CommandBus;
 use devmanager::protocol::{
@@ -1094,6 +1094,22 @@ async fn serve_foreground_host(
     }
     let _bound_updater = bound_updater;
 
+    // Quota observation is host-owned and intentionally starts outside the
+    // request/render path. The owner keeps one typed observer per provider
+    // kind, hides observations after the canonical one-hour TTL, and is joined
+    // before the host's remaining runtime is torn down. A stock adapter with
+    // no official quota surface remains unavailable; startup never scrapes
+    // terminal output or fabricates a value.
+    let mut quota_host = match devmanager::providers::NativeQuotaHost::start_stock(
+        devmanager::providers::QuotaRuntimeConfig::production(),
+    ) {
+        Ok(owner) => Some(owner),
+        Err(error) => {
+            eprintln!("devmanager-host quota refresh unavailable: {error}");
+            None
+        }
+    };
+
     let mut connection_tasks = tokio::task::JoinSet::new();
     // `accept_with_successor` owns its listener. Keep the future pinned across
     // unrelated task-completion branches so a normal client disconnect never
@@ -1175,6 +1191,9 @@ async fn serve_foreground_host(
 
     let result =
         finish_supervised_host(exit, &mut connection_tasks, request_handle, join, armed).await;
+    if let Some(owner) = quota_host.take() {
+        let _ = owner.shutdown().await;
+    }
     organization_runtime.shutdown();
     result
 }
