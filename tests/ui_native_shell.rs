@@ -208,7 +208,6 @@ fn native_gpui_smoke_report() -> NativeGpuiSmokeReport {
         devmanager::ui::init(cx);
         let first = cx.new(|cx| NativeShell::new_for_headless(profile.clone(), cx));
         let first_report = first.update(cx, |shell, _cx| {
-            let _root = shell.element_without_handlers();
             let platform_tree = shell.platform_accessibility_tree_for_test();
             (
                 shell.accessibility_tree().nodes().len(),
