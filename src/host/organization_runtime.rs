@@ -534,7 +534,7 @@ fn snapshot_for(state: &OrganizationRuntimeState) -> OrganizationSnapshot {
         sync_state: state.projection.sync_state(),
         capability: capability_label(capability_for(state)),
         host_id: membership.map(|value| value.host_id),
-        tenant_id: membership.map(|value| value.tenant_id.to_string()),
+        tenant_id: membership.map(|value| value.tenant_id.as_str().to_owned()),
         membership_revision: state.projection.membership_revision(),
         policy_revision: membership.map(|value| value.policy_revision),
         managed_task_count: state.projection.exported_task_count() as u32,
