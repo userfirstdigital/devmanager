@@ -38,6 +38,7 @@ pub use inbox::{
 
 /// Shared semantic renderer surfaces for task-cockpit messages.
 pub mod timeline;
+pub use timeline::{Timeline, TimelineViewport};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeCockpitMount {
@@ -47,10 +48,16 @@ pub enum NativeCockpitMount {
 
 pub const NATIVE_COCKPIT_MOUNT: NativeCockpitMount = NativeCockpitMount::Mounted;
 
+pub mod artifacts_panel;
+pub mod changes_panel;
 pub mod cockpit_projection;
 pub mod composer;
 pub mod dock;
+pub mod files_panel;
+pub mod panel;
+pub mod review_panel;
 pub mod shell;
+pub mod workspace_panel;
 
 mod browser_panel;
 mod context_dock;
@@ -62,10 +69,19 @@ pub use context_dock::{
 
 pub mod services_panel;
 
+pub use artifacts_panel::{ArtifactPanelRow, ArtifactsPanelProjection};
+pub use changes_panel::ChangesPanelProjection;
 pub use cockpit_projection::{
     summary_line, surface_query_action_id, CockpitSurfaceLoad, TaskCockpitLiveProjection,
 };
+pub use files_panel::{FilePanelRow, FilesPanelProjection};
+pub use panel::{
+    action_label, render_panel_action, render_panel_frame, task_identity, PanelAction,
+    PanelDisabledReason, PanelIdentity, MAX_PANEL_LABEL_BYTES, MAX_PANEL_ROWS,
+};
+pub use review_panel::{ReviewArtifactRow, ReviewPanelProjection};
 pub use services_panel::{
     project_services_from_task_projection, project_services_panel, ServiceActionAffordance,
     ServicePanelAction, ServicePanelRow, ServicePanelTone, ServicesPanelProjection,
 };
+pub use workspace_panel::WorkspacePanelProjection;
