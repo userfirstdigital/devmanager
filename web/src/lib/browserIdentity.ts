@@ -5,6 +5,8 @@ type LocationLike = {
   host: string;
 };
 
+export { buildConnectWebSocketUrl } from "../connect/transport";
+
 function createBrowserInstallId(): string {
   if (typeof globalThis.crypto?.randomUUID === "function") {
     return globalThis.crypto.randomUUID();

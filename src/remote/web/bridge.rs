@@ -488,11 +488,125 @@ async fn run_connect_session(
             .duration_since(std::time::UNIX_EPOCH)
             .map(|elapsed| elapsed.as_secs())
             .unwrap_or(1);
-        if channel.open_bytes(&frame, now_unix).is_err() {
+        let plaintext = match channel.open_bytes(&frame, now_unix) {
+            Ok(plaintext) => plaintext,
+            Err(_) => {
+                let _ = socket.close().await;
+                return;
+            }
+        };
+        let envelope = match crate::connect::ConnectEnvelope::decode(&plaintext) {
+            Ok(envelope) => envelope,
+            Err(_) => {
+                let _ = socket.close().await;
+                return;
+            }
+        };
+        let payload = match envelope.decode_payload() {
+            Ok(payload) => payload,
+            Err(_) => {
+                let _ = socket.close().await;
+                return;
+            }
+        };
+        // A valid, authenticated application frame is never silently
+        // discarded. Until the app's host executor is exposed through a
+        // bounded callback, reply with a typed capability-unavailable
+        // envelope and retain the same authenticated channel/binding.
+        let reply = connect_dispatch_hold_reply(&envelope, payload);
+        let mut nonce = [0_u8; crate::protocol::SEALED_NONCE_BYTES];
+        if getrandom::fill(&mut nonce).is_err() {
             let _ = socket.close().await;
             return;
         }
+        let binding = match envelope.binding() {
+            Ok(binding) => binding,
+            Err(_) => {
+                let _ = socket.close().await;
+                return;
+            }
+        };
+        let response = match crate::connect::ConnectEnvelope::new(
+            binding,
+            crate::connect::ChannelKind::Critical,
+            channel.next_send_sequence(),
+            envelope.request_id,
+            envelope.operation_id,
+            envelope.limits,
+            crate::connect::ConnectPrivacyClass::LocalOnly,
+            reply,
+        ) {
+            Ok(response) => response,
+            Err(_) => {
+                let _ = socket.close().await;
+                return;
+            }
+        };
+        let Ok(sealed) = channel.seal(&response, nonce, now_unix) else {
+            let _ = socket.close().await;
+            return;
+        };
+        let Ok(encoded) = sealed.encode() else {
+            let _ = socket.close().await;
+            return;
+        };
+        if socket.send(WsMessage::Binary(encoded)).await.is_err() {
+            return;
+        }
     }
+}
+
+/// Typed production boundary for Connect application payloads.
+///
+/// The web listener currently has no safe ownership of the app's single
+/// CommandBus executor. Keep this explicit HOLD here rather than translating
+/// Connect commands into the legacy JSON action protocol or dropping decrypted
+/// bytes. Organization extensions are recognized and rejected with the same
+/// bounded response until the organization projection callback is installed.
+fn connect_dispatch_hold_reply(
+    envelope: &crate::connect::ConnectEnvelope,
+    payload: crate::connect::ConnectPayload,
+) -> Option<crate::connect::ConnectPayload> {
+    let message = match payload {
+        crate::connect::ConnectPayload::Query(_) => {
+            "Connect query dispatch is unavailable until the host executor callback is bound"
+        }
+        crate::connect::ConnectPayload::Command(_) => {
+            "Connect command dispatch is unavailable until the host executor callback is bound"
+        }
+        crate::connect::ConnectPayload::Extension(extension)
+            if extension.type_id
+                == crate::protocol::organization_extension_type(
+                    crate::protocol::OrganizationExtensionKind::OrganizationPrompt,
+                ) =>
+        {
+            "organization projection dispatch is unavailable on this standalone host"
+        }
+        crate::connect::ConnectPayload::Hello(_)
+        | crate::connect::ConnectPayload::Capabilities(_)
+        | crate::connect::ConnectPayload::SnapshotPage(_)
+        | crate::connect::ConnectPayload::EventPage(_)
+        | crate::connect::ConnectPayload::CommandReceipt(_)
+        | crate::connect::ConnectPayload::OperationSettlement(_)
+        | crate::connect::ConnectPayload::Presence(_)
+        | crate::connect::ConnectPayload::TerminalDelta(_)
+        | crate::connect::ConnectPayload::BrowserFrame(_)
+        | crate::connect::ConnectPayload::PromptExtension(_)
+        | crate::connect::ConnectPayload::BrowserExtension(_)
+        | crate::connect::ConnectPayload::Chunk(_)
+        | crate::connect::ConnectPayload::Resync(_)
+        | crate::connect::ConnectPayload::Error(_) => {
+            "Connect payload kind is not accepted on the application request lane"
+        }
+        crate::connect::ConnectPayload::Extension(_) => {
+            "Connect extension dispatch is unavailable until its host callback is bound"
+        }
+    };
+    let _ = envelope;
+    crate::connect::ConnectPayload::Error(crate::connect::ErrorPayload {
+        code: 503,
+        message: message.to_string(),
+    })
 }
 
 async fn recv_connect_binary(socket: &mut WebSocket, max_bytes: usize) -> Option<Vec<u8>> {
