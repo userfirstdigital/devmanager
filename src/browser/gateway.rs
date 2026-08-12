@@ -1091,11 +1091,14 @@ mod tests {
                         .unwrap();
                 }
                 Boundary::DirectInput => {
-                    bridge.observe_host_event(&BrowserHostEvent::user_input(
-                        key.clone(),
-                        "runtime-tab",
-                        BrowserUserInputKind::Keyboard,
-                    ));
+                    bridge.observe_host_event(
+                        &BrowserHostEvent::user_input(
+                            key.clone(),
+                            "runtime-tab",
+                            BrowserUserInputKind::Keyboard,
+                        )
+                        .expect("interaction epoch"),
+                    );
                 }
                 Boundary::SelectConversation
                 | Boundary::RestartServer

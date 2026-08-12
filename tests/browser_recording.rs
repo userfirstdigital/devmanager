@@ -1,12 +1,15 @@
 use devmanager::browser::{
-    BrowserError, BrowserRecipeAction, BrowserRecipeAssertion, BrowserRecipeInput,
-    BrowserRecipeInputKind, BrowserRecipeLocator, BrowserRecipeValue, BrowserRecipeViewport,
-    BrowserRecipeWait, BrowserRecordingAction, BrowserRecordingActor, BrowserRecordingCommit,
-    BrowserRecordingError, BrowserRecordingInstance, BrowserRecordingMetadata,
-    BrowserRecordingStatus, BrowserRisk, BrowserWorkflowRecorder, BrowserWorkspaceKey,
-    MAX_BROWSER_RECORDING_ASSERTIONS, MAX_BROWSER_RECORDING_ASSERTIONS_PER_ACTION,
-    MAX_BROWSER_RECORDING_INPUTS,
+    BrowserError, BrowserGenerationError, BrowserGenerationTicket, BrowserRecipeAction,
+    BrowserRecipeAssertion, BrowserRecipeInput, BrowserRecipeInputKind, BrowserRecipeLocator,
+    BrowserRecipeStep, BrowserRecipeV1, BrowserRecipeValue, BrowserRecipeViewport, BrowserRecipeWait,
+    BrowserRecordingAction, BrowserRecordingActor, BrowserRecordingCommit, BrowserRecordingError,
+    BrowserRecordingInstance, BrowserRecordingMetadata, BrowserRecordingStatus, BrowserRisk,
+    BrowserTaskArtifactKind, BrowserTaskService, BrowserTaskServiceError, BrowserWorkflowKind,
+    BrowserWorkflowRecorder, BrowserWorkspaceKey, BROWSER_RECIPE_SCHEMA_VERSION,
+    MAX_BROWSER_GENERATION_QUEUE, MAX_BROWSER_RECORDING_ASSERTIONS,
+    MAX_BROWSER_RECORDING_ASSERTIONS_PER_ACTION, MAX_BROWSER_RECORDING_INPUTS,
 };
+use devmanager::domain::id::{BrowserContextId, BrowserTabId, TaskId};
 use static_assertions::assert_not_impl_any;
 
 assert_not_impl_any!(BrowserRecordingAction: std::fmt::Debug, serde::Serialize);
@@ -1292,5 +1295,272 @@ fn generated_input_gc_follows_successful_reference_mutations_atomically() {
         defects.is_empty(),
         "unfixed generated-input lifecycle findings: {}",
         defects.join(", ")
+    );
+}
+
+assert_not_impl_any!(BrowserGenerationTicket: From<BrowserWorkspaceKey>);
+
+fn task_recipe(id: &str, test_id: &str) -> BrowserRecipeV1 {
+    BrowserRecipeV1 {
+        schema_version: BROWSER_RECIPE_SCHEMA_VERSION,
+        id: id.to_string(),
+        name: "Fixture recipe".to_string(),
+        description: String::new(),
+        start_url: "https://example.test/".to_string(),
+        viewport: BrowserRecipeViewport {
+            width: 800,
+            height: 600,
+            scale_percent: 100,
+        },
+        inputs: vec![],
+        steps: vec![BrowserRecipeStep {
+            id: "step-1".to_string(),
+            action: BrowserRecipeAction::Click {
+                locator: BrowserRecipeLocator {
+                    test_id: Some(test_id.to_string()),
+                    ..BrowserRecipeLocator::default()
+                },
+            },
+            wait: None,
+            assertions: vec![],
+        }],
+    }
+}
+
+fn secret_recipe() -> BrowserRecipeV1 {
+    let mut recipe = task_recipe("secret-recipe", "password-input");
+    recipe.inputs.push(BrowserRecipeInput {
+        name: "password".to_string(),
+        kind: BrowserRecipeInputKind::Secret,
+        default_value: None,
+    });
+    recipe.steps[0].action = BrowserRecipeAction::Type {
+        locator: BrowserRecipeLocator {
+            test_id: Some("password-input".to_string()),
+            ..BrowserRecipeLocator::default()
+        },
+        value: BrowserRecipeValue::Input {
+            name: "password".to_string(),
+        },
+    };
+    recipe
+}
+
+#[test]
+fn generation_authority_owns_record_replay_repair_and_cancel() {
+    let task_id = TaskId::new();
+    let context_id = BrowserContextId::new();
+    let tab_id = BrowserTabId::new();
+    let mut service = BrowserTaskService::new();
+    let generation = service
+        .open_context(task_id, context_id)
+        .expect("open context");
+    service
+        .open_tab(task_id, context_id, tab_id, "https://example.test/")
+        .expect("open tab");
+
+    let record = service
+        .start_record(task_id, context_id, Some(tab_id), generation)
+        .expect("start record");
+    assert_eq!(record.kind(), BrowserWorkflowKind::Record);
+    assert_eq!(record.generation(), generation);
+    let (recording, recipe) = service
+        .stop_record(&record, "recording-1", task_recipe("click-form", "semantic-target"))
+        .expect("stop record");
+    assert_eq!(recording.kind, BrowserTaskArtifactKind::Recording);
+    assert_eq!(recording.task_id, task_id);
+    assert_eq!(recipe.kind, BrowserTaskArtifactKind::Recipe);
+    assert_eq!(service.queued_count(task_id, context_id), 0);
+
+    let wait = service
+        .start_replay(
+            task_id,
+            context_id,
+            Some(tab_id),
+            generation,
+            recipe.artifact_id,
+        )
+        .expect("start replay");
+    let _replay_wait = wait.kind();
+    let wait = service
+        .enqueue_wait(task_id, context_id, Some(tab_id), generation)
+        .expect("wait");
+    let capture = service
+        .enqueue_capture(task_id, context_id, Some(tab_id), generation)
+        .expect("capture");
+    assert_eq!(service.queued_count(task_id, context_id), 3);
+    let dropped = service
+        .cancel(task_id, context_id, generation)
+        .expect("cancel waits");
+    assert_eq!(dropped.len(), 3);
+    assert_eq!(service.queued_count(task_id, context_id), 0);
+    assert_eq!(
+        service
+            .start_replay(
+                task_id,
+                context_id,
+                Some(tab_id),
+                generation + 1,
+                recipe.artifact_id,
+            )
+            .expect_err("stale generation cannot resume"),
+        BrowserTaskServiceError::Generation(BrowserGenerationError::GenerationMismatch)
+    );
+    assert!(matches!(
+        service
+            .recovery()
+            .authority()
+            .require_live(&wait)
+            .expect_err("cancelled wait"),
+        BrowserGenerationError::Cancelled | BrowserGenerationError::StaleOperation
+    ));
+    assert!(matches!(
+        service
+            .recovery()
+            .authority()
+            .require_live(&capture)
+            .expect_err("cancelled capture"),
+        BrowserGenerationError::Cancelled | BrowserGenerationError::StaleOperation
+    ));
+
+    let replay = service
+        .start_replay(
+            task_id,
+            context_id,
+            Some(tab_id),
+            generation,
+            recipe.artifact_id,
+        )
+        .expect("replay after cancel");
+    let proposal = service
+        .propose_repair(
+            &replay,
+            recipe.artifact_id,
+            "step-1",
+            BrowserRecipeLocator {
+                test_id: Some("semantic-target".to_string()),
+                ..BrowserRecipeLocator::default()
+            },
+            BrowserRecipeLocator {
+                test_id: Some("semantic-target-repaired".to_string()),
+                ..BrowserRecipeLocator::default()
+            },
+            "stale locator screenshot hash",
+        )
+        .expect("propose repair");
+    assert!(!proposal.approved);
+    assert_eq!(
+        service
+            .apply_repair_silently(proposal.proposal_id)
+            .expect_err("silent repair is forbidden"),
+        BrowserTaskServiceError::SilentRepairForbidden
+    );
+    let original = service
+        .original_recipe(recipe.artifact_id)
+        .expect("original")
+        .clone();
+    let revision = service
+        .approve_repair(&replay, proposal.proposal_id)
+        .expect("approve repair");
+    assert_eq!(revision.kind, BrowserTaskArtifactKind::RecipeRevision);
+    assert_ne!(revision.artifact_id, recipe.artifact_id);
+    assert_eq!(
+        service
+            .original_recipe(recipe.artifact_id)
+            .expect("original unchanged"),
+        &original
+    );
+    let revised = service
+        .original_recipe(revision.artifact_id)
+        .expect("revision");
+    assert!(matches!(
+        &revised.steps[0].action,
+        BrowserRecipeAction::Click { locator } if locator.test_id.as_deref() == Some("semantic-target-repaired")
+    ));
+
+    service.close_task(task_id).expect("close");
+    assert_eq!(service.queued_count(task_id, context_id), 0);
+}
+
+#[test]
+fn secrets_stay_placeholders_and_never_enter_the_journal() {
+    let task_id = TaskId::new();
+    let context_id = BrowserContextId::new();
+    let mut service = BrowserTaskService::new();
+    let generation = service
+        .open_context(task_id, context_id)
+        .expect("open context");
+    let record = service
+        .start_record(task_id, context_id, None, generation)
+        .expect("record");
+    let leaked = task_recipe("leaked-secret", "password-input");
+    let mut leaked = leaked;
+    leaked.steps[0].action = BrowserRecipeAction::Type {
+        locator: BrowserRecipeLocator {
+            test_id: Some("password-input".to_string()),
+            ..BrowserRecipeLocator::default()
+        },
+        value: BrowserRecipeValue::Literal {
+            value: "never-expose-this-value".to_string(),
+        },
+    };
+    assert_eq!(
+        service
+            .stop_record(&record, "recording-secret", leaked)
+            .expect_err("literal secret rejected"),
+        BrowserTaskServiceError::SecretSerialized
+    );
+    service
+        .cancel(task_id, context_id, generation)
+        .expect("drop failed record");
+
+    let record = service
+        .start_record(task_id, context_id, None, generation)
+        .expect("record placeholders");
+    let (_, recipe) = service
+        .stop_record(&record, "recording-secret", secret_recipe())
+        .expect("placeholder recipe");
+    let placeholder = service
+        .install_secret(
+            &service
+                .start_replay(task_id, context_id, None, generation, recipe.artifact_id)
+                .expect("replay"),
+            "password",
+            "never-expose-this-value".to_string(),
+        )
+        .expect("install secret host-side");
+    assert_eq!(placeholder.name, "password");
+    let journal = service
+        .journal_recipe(recipe.artifact_id)
+        .expect("journal");
+    let encoded = journal.to_string();
+    assert!(encoded.contains("password"));
+    assert!(!encoded.contains("never-expose-this-value"));
+    assert!(!encoded.contains("secret:"));
+}
+
+#[test]
+fn generation_queue_is_bounded_and_foreign_tasks_are_rejected() {
+    let owner = TaskId::new();
+    let foreign = TaskId::new();
+    let context_id = BrowserContextId::new();
+    let mut service = BrowserTaskService::new();
+    let generation = service.open_context(owner, context_id).expect("open");
+    for _ in 0..MAX_BROWSER_GENERATION_QUEUE {
+        service
+            .enqueue_wait(owner, context_id, None, generation)
+            .expect("queue wait");
+    }
+    assert_eq!(
+        service
+            .enqueue_wait(owner, context_id, None, generation)
+            .expect_err("bound"),
+        BrowserTaskServiceError::Generation(BrowserGenerationError::BoundExceeded)
+    );
+    assert_eq!(
+        service
+            .enqueue_wait(foreign, context_id, None, generation)
+            .expect_err("cross-task"),
+        BrowserTaskServiceError::Generation(BrowserGenerationError::CrossTask)
     );
 }

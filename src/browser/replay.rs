@@ -69,6 +69,8 @@ pub enum BrowserReplayError {
     RepairInstanceIdExhausted,
     RepairPreviewIdExhausted,
     RepairApplyIdExhausted,
+    RepairGenerationExhausted,
+    InteractionEpochExhausted,
     RepairConfirmationRequired,
     RepairRecipeChanged,
     RepairCandidateInvalid,
@@ -105,6 +107,8 @@ impl fmt::Display for BrowserReplayError {
             Self::RepairInstanceIdExhausted => "browser replay repair identity is exhausted",
             Self::RepairPreviewIdExhausted => "browser replay repair preview identity is exhausted",
             Self::RepairApplyIdExhausted => "browser replay repair apply identity is exhausted",
+            Self::RepairGenerationExhausted => "browser replay repair generation is exhausted",
+            Self::InteractionEpochExhausted => "browser interaction authority is exhausted",
             Self::RepairConfirmationRequired => {
                 "browser replay repair requires explicit confirmation"
             }
@@ -707,9 +711,13 @@ struct TerminalBrowserReplay {
     projection: BrowserReplayProjection,
 }
 
-fn signal_repair_state(active: &mut ActiveBrowserReplay) {
-    active.repair_generation = active.repair_generation.wrapping_add(1);
+fn signal_repair_state(active: &mut ActiveBrowserReplay) -> Result<(), BrowserReplayError> {
+    active.repair_generation = active
+        .repair_generation
+        .checked_add(1)
+        .ok_or(BrowserReplayError::RepairGenerationExhausted)?;
     active.repair_signal.send_replace(active.repair_generation);
+    Ok(())
 }
 
 fn active_repair_projection(
@@ -749,7 +757,6 @@ impl Drop for BrowserReplayCoordinatorState {
                 .cancelled
                 .store(true, Ordering::Release);
             active.secret_store.close();
-            signal_repair_state(active);
         }
     }
 }
@@ -792,7 +799,8 @@ impl BrowserReplayCoordinator {
             &mut state,
             workspace_key,
             plan,
-            next_browser_interaction_epoch(),
+            next_browser_interaction_epoch()
+                .map_err(|_| BrowserReplayError::InteractionEpochExhausted)?,
         )
     }
 
@@ -813,7 +821,8 @@ impl BrowserReplayCoordinator {
             &mut state,
             workspace_key,
             plan,
-            next_browser_interaction_epoch(),
+            next_browser_interaction_epoch()
+                .map_err(|_| BrowserReplayError::InteractionEpochExhausted)?,
         )
     }
 
@@ -949,7 +958,7 @@ impl BrowserReplayCoordinator {
             .install(&active.projection.unresolved_secret_inputs, submission)?;
         active.projection.status = BrowserReplayStatus::Running;
         active.projection.unresolved_secret_inputs.clear();
-        signal_repair_state(active);
+        signal_repair_state(active).map_err(|_| BrowserReplaySecretError::ClosedStore)?;
         Ok(active.projection.clone())
     }
 
@@ -1413,7 +1422,7 @@ impl BrowserReplayCoordinator {
                 previous,
                 authority: authority.clone(),
             });
-        signal_repair_state(active);
+        signal_repair_state(active)?;
         state.next_preview_id = preview_id.get();
         Ok((authority, receipt))
     }
@@ -1450,7 +1459,9 @@ impl BrowserReplayCoordinator {
         };
         reservation.authority.close();
         repair_state.phase = BrowserReplayPrivateRepairPhase::Paused(reservation.previous);
-        signal_repair_state(active);
+        if signal_repair_state(active).is_err() {
+            authority.close();
+        }
         BrowserReplayRepairPreviewAbortDisposition::RestorePrevious
     }
 
@@ -1516,7 +1527,7 @@ impl BrowserReplayCoordinator {
         });
         let projection = reservation.previous.projection.clone();
         repair_state.phase = BrowserReplayPrivateRepairPhase::Paused(reservation.previous);
-        signal_repair_state(active);
+        signal_repair_state(active)?;
         Ok(projection)
     }
 
@@ -1616,7 +1627,7 @@ impl BrowserReplayCoordinator {
                 previous: paused,
                 authority: authority.clone(),
             });
-        signal_repair_state(active);
+        signal_repair_state(active)?;
         state.next_apply_id = apply_id.get();
         Ok((authority, receipt))
     }
@@ -1650,7 +1661,9 @@ impl BrowserReplayCoordinator {
         };
         reservation.authority.close();
         repair_state.phase = BrowserReplayPrivateRepairPhase::Paused(reservation.previous);
-        signal_repair_state(active);
+        if signal_repair_state(active).is_err() {
+            authority.close();
+        }
     }
 
     pub(crate) fn commit_locator_repair_apply(
@@ -1712,7 +1725,7 @@ impl BrowserReplayCoordinator {
             if !already_applied && canonical_root.is_none() {
                 reservation.authority.close();
                 repair_state.phase = BrowserReplayPrivateRepairPhase::Paused(reservation.previous);
-                signal_repair_state(active);
+                signal_repair_state(active)?;
                 return Err(BrowserReplayError::RecipeRootUnavailable);
             }
             repair_state.phase = BrowserReplayPrivateRepairPhase::Committing(reservation);
@@ -1762,7 +1775,7 @@ impl BrowserReplayCoordinator {
         if let Err(error) = write_result {
             reservation.authority.close();
             repair_state.phase = BrowserReplayPrivateRepairPhase::Paused(reservation.previous);
-            signal_repair_state(active);
+            signal_repair_state(active)?;
             return Err(map_repair_locator_replace_error(error));
         }
 
@@ -1776,7 +1789,7 @@ impl BrowserReplayCoordinator {
             if !exact_override {
                 reservation.authority.close();
                 repair_state.phase = BrowserReplayPrivateRepairPhase::Paused(reservation.previous);
-                signal_repair_state(active);
+                signal_repair_state(active)?;
                 return Err(BrowserReplayError::InvalidRepairEvidence);
             }
             reservation.authority.close();
@@ -1789,7 +1802,7 @@ impl BrowserReplayCoordinator {
                 .ok_or(BrowserReplayError::InvalidRepairEvidence)?;
             active.projection.status = BrowserReplayStatus::Running;
             let replay_projection = active.projection.clone();
-            signal_repair_state(active);
+            signal_repair_state(active)?;
             return Ok(BrowserReplayRepairApplyCommit {
                 repair: repair_projection,
                 replay: replay_projection,
@@ -1812,7 +1825,7 @@ impl BrowserReplayCoordinator {
         let repair_projection = reservation.previous.projection.clone();
         repair_state.phase = BrowserReplayPrivateRepairPhase::Paused(reservation.previous);
         let replay_projection = active.projection.clone();
-        signal_repair_state(active);
+        signal_repair_state(active)?;
         Ok(BrowserReplayRepairApplyCommit {
             repair: repair_projection,
             replay: replay_projection,
@@ -1907,7 +1920,7 @@ impl BrowserReplayCoordinator {
                 previous: paused,
                 authority: authority.clone(),
             });
-        signal_repair_state(active);
+        signal_repair_state(active)?;
         state.next_apply_id = apply_id.get();
         Ok((authority, receipt))
     }
@@ -1968,7 +1981,7 @@ impl BrowserReplayCoordinator {
         repair_state.phase = BrowserReplayPrivateRepairPhase::Paused(previous);
         if !resume {
             commit.replay = active.projection.clone();
-            signal_repair_state(active);
+            signal_repair_state(active)?;
             return Ok(());
         }
         let released_repair = active
@@ -1978,7 +1991,7 @@ impl BrowserReplayCoordinator {
         active.projection.status = BrowserReplayStatus::Running;
         commit.replay = active.projection.clone();
         commit._released_repair = Some(released_repair);
-        signal_repair_state(active);
+        signal_repair_state(active)?;
         Ok(())
     }
 
@@ -2090,7 +2103,7 @@ impl BrowserReplayCoordinator {
                 .take()
                 .ok_or(BrowserReplayError::InvalidRepairEvidence)?;
             active.projection.status = BrowserReplayStatus::Running;
-            signal_repair_state(active);
+            signal_repair_state(active)?;
             (removed, active.projection.clone())
         };
         drop(removed);
@@ -2189,7 +2202,7 @@ impl BrowserReplayCoordinator {
             applied_preview_fresh: false,
         });
         active.projection.status = BrowserReplayStatus::PausedLocatorRepair;
-        signal_repair_state(active);
+        signal_repair_state(active)?;
         Ok(projection)
     }
 
@@ -2496,7 +2509,7 @@ impl BrowserReplayCoordinator {
             active.projection.status = status;
             active.projection.failure = failure;
             active.secret_store.close();
-            signal_repair_state(active);
+            signal_repair_state(active)?;
         }
         let Some(active) = state.active.remove(instance.workspace_key()) else {
             return Err(BrowserReplayError::StaleInstance);
@@ -2766,6 +2779,22 @@ fn validate_public_value(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    trait ExhaustionOutcome {
+        fn is_exhausted(&self) -> bool;
+    }
+
+    impl ExhaustionOutcome for () {
+        fn is_exhausted(&self) -> bool {
+            false
+        }
+    }
+
+    impl<T, E> ExhaustionOutcome for Result<T, E> {
+        fn is_exhausted(&self) -> bool {
+            self.is_err()
+        }
+    }
     use crate::browser::{
         BrowserElementRef, BrowserError, BrowserInvocationActor, BrowserInvocationContext,
         BrowserLocator, BrowserRecipeLocator, BrowserReplayLocatorSlot,
@@ -2803,6 +2832,47 @@ mod tests {
             assertions: Vec::new(),
         });
         plan
+    }
+
+    #[test]
+    fn repair_signal_generation_exhaustion_is_typed_and_does_not_wrap() {
+        let coordinator = BrowserReplayCoordinator::default();
+        let workspace =
+            BrowserWorkspaceKey::new("repair-generation-exhaustion", "conversation").unwrap();
+        let recipe = BrowserRecipeV1 {
+            schema_version: super::super::BROWSER_RECIPE_SCHEMA_VERSION,
+            id: "repair-generation-exhaustion".to_string(),
+            name: "repair generation exhaustion".to_string(),
+            description: "repair generation exhaustion".to_string(),
+            start_url: "https://example.test".to_string(),
+            viewport: BrowserRecipeViewport::default(),
+            inputs: Vec::new(),
+            steps: vec![BrowserRecipeStep {
+                id: "click".to_string(),
+                action: BrowserRecipeAction::Click {
+                    locator: BrowserRecipeLocator {
+                        test_id: Some("target".to_string()),
+                        ..BrowserRecipeLocator::default()
+                    },
+                },
+                wait: None,
+                assertions: Vec::new(),
+            }],
+        };
+        coordinator
+            .start(
+                workspace,
+                compile_browser_replay(&recipe, Vec::new()).unwrap(),
+            )
+            .unwrap();
+        let mut state = coordinator.inner.lock().unwrap();
+        let active = state.active.values_mut().next().unwrap();
+        active.repair_generation = u64::MAX;
+        let outcome = signal_repair_state(active);
+        assert!(
+            outcome.is_exhausted(),
+            "repair signal generation must fail closed at exhaustion"
+        );
     }
 
     #[test]

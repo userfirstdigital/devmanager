@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod artifact;
+pub mod browser;
 pub(crate) mod canonical;
 pub mod command;
 pub mod event;
@@ -30,9 +31,9 @@ pub use host::{
     HostQuitResourceBlocker, HostQuitWorktreeInspection,
 };
 pub use id::{
-    AgentSessionId, ArtifactId, BrowserContextId, ClientId, CommandId, EnvironmentId, EventId,
-    IdError, OperationId, OutboxId, ProjectId, RequestId, ResourceId, ServiceId, SnapshotId,
-    SubscriptionId, TaskId, TerminalId, TransferId,
+    AgentSessionId, ArtifactId, BrowserContextId, BrowserRequestId, BrowserSessionId, BrowserTabId,
+    ClientId, CommandId, EnvironmentId, EventId, IdError, OperationId, OutboxId, ProjectId,
+    RequestId, ResourceId, ServiceId, SnapshotId, SubscriptionId, TaskId, TerminalId, TransferId,
 };
 pub use operation::{
     validate_outcome_fence, validate_source_for_kind, validate_terminal_fact_source,

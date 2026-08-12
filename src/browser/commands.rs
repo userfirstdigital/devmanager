@@ -27,7 +27,7 @@ use super::{
     BrowserWorkspaceKey, BrowserWorkspaceMutation, BrowserWorkspaceSnapshot,
 };
 use rmcp::schemars;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as _;
 use std::marker::PhantomData;
@@ -189,8 +189,8 @@ pub struct BrowserRecordingResult {
 
 fn random_operation_id() -> Result<String, BrowserError> {
     let mut bytes = [0_u8; 16];
-    getrandom::fill(&mut bytes).map_err(|error| BrowserError::CrashedView {
-        message: format!("could not generate browser operation id: {error}"),
+    getrandom::fill(&mut bytes).map_err(|_| BrowserError::CrashedView {
+        message: "could not generate browser operation id".to_string(),
     })?;
     let mut id = String::with_capacity(35);
     id.push_str("op-");
@@ -494,13 +494,177 @@ pub fn browser_request_preempts_operation_queue(command: &BrowserCommand) -> boo
     )
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, Eq)]
 pub struct BrowserHostStatus {
     pub available: bool,
     pub platform: String,
     pub version: Option<String>,
     pub diagnostic: Option<String>,
+}
+
+const PUBLIC_BROWSER_STATUS_DIAGNOSTIC: &str = "browser host reported a diagnostic";
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserHostStatusPublicWire {
+    available: bool,
+    platform: String,
+    version: Option<String>,
+    diagnostic: Option<String>,
+}
+
+impl BrowserHostStatus {
+    fn public_wire(&self) -> BrowserHostStatusPublicWire {
+        BrowserHostStatusPublicWire {
+            available: self.available,
+            platform: public_host_platform(&self.platform),
+            version: self.version.as_deref().and_then(public_host_version),
+            diagnostic: self
+                .diagnostic
+                .as_ref()
+                .map(|_| PUBLIC_BROWSER_STATUS_DIAGNOSTIC.to_string()),
+        }
+    }
+}
+
+impl Serialize for BrowserHostStatus {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.public_wire().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for BrowserHostStatus {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = BrowserHostStatusPublicWire::deserialize(deserializer)?;
+        Ok(Self {
+            available: wire.available,
+            platform: public_host_platform(&wire.platform),
+            version: wire.version.as_deref().and_then(public_host_version),
+            diagnostic: wire
+                .diagnostic
+                .map(|_| PUBLIC_BROWSER_STATUS_DIAGNOSTIC.to_string()),
+        })
+    }
+}
+
+fn public_host_platform(value: &str) -> String {
+    const KNOWN_PLATFORMS: &[&str] = &[
+        "windows", "macos", "linux", "android", "ios", "freebsd", "openbsd", "netbsd",
+    ];
+    if KNOWN_PLATFORMS.contains(&value) {
+        value.to_string()
+    } else {
+        "unknown".to_string()
+    }
+}
+
+fn public_host_version(value: &str) -> Option<String> {
+    const MAX_STATUS_BYTES: usize = 64;
+    (value.len() <= MAX_STATUS_BYTES
+        && !value.is_empty()
+        && value.split('.').all(|component| {
+            !component.is_empty() && component.bytes().all(|byte| byte.is_ascii_digit())
+        }))
+    .then(|| value.to_string())
+}
+
+impl std::fmt::Debug for BrowserHostStatus {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        const KNOWN_PLATFORMS: &[&str] = &[
+            "windows", "macos", "linux", "android", "ios", "freebsd", "openbsd", "netbsd",
+        ];
+        let platform = if KNOWN_PLATFORMS.contains(&self.platform.as_str()) {
+            self.platform.as_str()
+        } else {
+            "<redacted>"
+        };
+        formatter
+            .debug_struct("BrowserHostStatus")
+            .field("available", &self.available)
+            .field("platform", &platform)
+            .field("versionPresent", &self.version.is_some())
+            .field("diagnosticPresent", &self.diagnostic.is_some())
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod browser_host_status_wire_tests {
+    use super::*;
+
+    #[test]
+    fn public_browser_host_status_serde_redacts_platform_version_and_diagnostic_text() {
+        const SENTINEL: &str = "browser-status-wire-secret-sentinel";
+        let status = BrowserHostStatus {
+            available: true,
+            platform: SENTINEL.to_string(),
+            version: Some(format!("https://{SENTINEL}/version")),
+            diagnostic: Some(format!(r"C:\absolute\{SENTINEL}{}", "x".repeat(4_096))),
+        };
+
+        let encoded = serde_json::to_string(&status).expect("serialize public host status");
+        assert!(!encoded.contains(SENTINEL), "{encoded}");
+        assert!(!encoded.contains("https://"), "{encoded}");
+        assert!(!encoded.contains("C:\\"), "{encoded}");
+        assert!(encoded.len() <= 256, "public host status must stay bounded");
+
+        let decoded: BrowserHostStatus =
+            serde_json::from_str(&encoded).expect("deserialize public host status");
+        assert_eq!(decoded.platform, "unknown");
+        assert_eq!(decoded.version, None);
+        assert_eq!(
+            decoded.diagnostic,
+            Some("browser host reported a diagnostic".to_string())
+        );
+    }
+
+    #[test]
+    fn public_browser_host_status_serde_round_trips_safe_values() {
+        let status = BrowserHostStatus {
+            available: true,
+            platform: "windows".to_string(),
+            version: Some("125.0.1".to_string()),
+            diagnostic: None,
+        };
+
+        let encoded = serde_json::to_string(&status).expect("serialize safe host status");
+        let decoded: BrowserHostStatus =
+            serde_json::from_str(&encoded).expect("deserialize safe host status");
+        assert_eq!(decoded, status);
+    }
+
+    #[test]
+    fn public_browser_host_status_serde_rejects_version_at_limit_plus_one() {
+        let at_limit = BrowserHostStatus {
+            available: true,
+            platform: "windows".to_string(),
+            version: Some("1".repeat(64)),
+            diagnostic: None,
+        };
+        let over_limit = BrowserHostStatus {
+            available: true,
+            platform: "windows".to_string(),
+            version: Some("1".repeat(65)),
+            diagnostic: None,
+        };
+
+        let at_limit_json = serde_json::to_string(&at_limit).expect("serialize bounded version");
+        let at_limit_round_trip: BrowserHostStatus =
+            serde_json::from_str(&at_limit_json).expect("deserialize bounded version");
+        assert_eq!(at_limit_round_trip.version, at_limit.version);
+
+        let over_limit_json =
+            serde_json::to_string(&over_limit).expect("serialize oversize version");
+        let over_limit_round_trip: BrowserHostStatus =
+            serde_json::from_str(&over_limit_json).expect("deserialize oversize version");
+        assert_eq!(over_limit_round_trip.version, None);
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -740,13 +904,13 @@ impl BrowserHostEvent {
         workspace_key: BrowserWorkspaceKey,
         tab_id: impl Into<String>,
         kind: BrowserUserInputKind,
-    ) -> Self {
-        Self::UserInput {
+    ) -> Result<Self, BrowserError> {
+        Ok(Self::UserInput {
             workspace_key,
             tab_id: tab_id.into(),
             kind,
-            interaction_epoch: next_browser_interaction_epoch(),
-        }
+            interaction_epoch: next_browser_interaction_epoch()?,
+        })
     }
 }
 
@@ -876,7 +1040,10 @@ impl BrowserRegistrationLease {
 
     fn revoke(&self) {
         if self.active.swap(false, Ordering::AcqRel) {
-            advance(&self.cancellation);
+            match advance(&self.cancellation) {
+                Ok(()) | Err(BrowserError::CancellationEpochExhausted) => {}
+                Err(_) => {}
+            }
         }
     }
 }
@@ -1540,8 +1707,8 @@ impl BrowserController {
             let mut cancellation_ticket = self.cancellations.ticket(
                 &self.workspace_key,
                 None,
-                Some(next_browser_interaction_epoch()),
-            );
+                Some(next_browser_interaction_epoch()?),
+            )?;
             if let Some(registration_lease) = &self.registration_lease {
                 let (registration_ticket, _) = registration_lease.capture()?;
                 cancellation_ticket.registration = Some(registration_ticket);
@@ -2353,7 +2520,7 @@ impl BrowserController {
                 &self.workspace_key,
                 command.tab_id(),
                 context.interaction_epoch,
-            );
+            )?;
             if let Some(registration_lease) = &self.registration_lease {
                 let (registration_ticket, _) = registration_lease.capture()?;
                 ticket.registration = Some(registration_ticket);
@@ -2369,13 +2536,14 @@ impl BrowserController {
         logical_ticket: Option<CancellationTicket>,
     ) -> Result<(CancellationTicket, CancellationSubscriptions), BrowserError> {
         self.host_controls.with_locked(|| {
-            let mut ticket = logical_ticket.unwrap_or_else(|| {
-                self.cancellations.ticket(
+            let mut ticket = match logical_ticket {
+                Some(ticket) => ticket,
+                None => self.cancellations.ticket(
                     &self.workspace_key,
                     command.tab_id(),
                     context.interaction_epoch,
-                )
-            });
+                )?,
+            };
             if logical_ticket.is_some()
                 && !self
                     .cancellations
@@ -2471,7 +2639,7 @@ impl BrowserController {
                     &self.workspace_key,
                     command.tab_id(),
                     context.interaction_epoch,
-                );
+                )?;
                 let mut subscriptions = self.cancellations.subscribe(
                     &self.workspace_key,
                     command.tab_id(),
@@ -2919,7 +3087,7 @@ impl BrowserCommandRequest {
             &self.workspace_key,
             self.command.tab_id(),
             self.context.interaction_epoch,
-        );
+        )?;
         self.cancellation_ticket.registration = registration;
         Ok(())
     }
@@ -3407,6 +3575,7 @@ struct CancellationTicket {
 
 #[derive(Default)]
 struct CancellationEpochs {
+    exhausted: AtomicBool,
     projects: Mutex<HashMap<String, watch::Sender<u64>>>,
     workspaces: Mutex<HashMap<BrowserWorkspaceKey, watch::Sender<u64>>>,
     tabs: Mutex<HashMap<(BrowserWorkspaceKey, String), watch::Sender<u64>>>,
@@ -3463,7 +3632,10 @@ impl CancellationEpochs {
         workspace_key: &BrowserWorkspaceKey,
         tab_id: Option<&str>,
         interaction_epoch: Option<u64>,
-    ) -> CancellationTicket {
+    ) -> Result<CancellationTicket, BrowserError> {
+        if self.exhausted.load(Ordering::Acquire) {
+            return Err(BrowserError::CancellationEpochExhausted);
+        }
         let project = current_epoch(&mut lock(&self.projects), workspace_key.project_id.clone());
         let workspace = current_epoch(&mut lock(&self.workspaces), workspace_key.clone());
         let tab = tab_id.map(|tab_id| {
@@ -3473,14 +3645,17 @@ impl CancellationEpochs {
             )
         });
         let replay_owned = interaction_epoch.is_some();
-        CancellationTicket {
+        Ok(CancellationTicket {
             project,
             workspace,
             tab,
-            interaction_epoch: interaction_epoch.unwrap_or_else(next_browser_interaction_epoch),
+            interaction_epoch: match interaction_epoch {
+                Some(interaction_epoch) => interaction_epoch,
+                None => next_browser_interaction_epoch()?,
+            },
             replay_owned,
             registration: None,
-        }
+        })
     }
 
     fn is_current(
@@ -3489,7 +3664,9 @@ impl CancellationEpochs {
         tab_id: Option<&str>,
         ticket: CancellationTicket,
     ) -> bool {
-        current_epoch(&mut lock(&self.projects), workspace_key.project_id.clone()) == ticket.project
+        !self.exhausted.load(Ordering::Acquire)
+            && current_epoch(&mut lock(&self.projects), workspace_key.project_id.clone())
+                == ticket.project
             && current_epoch(&mut lock(&self.workspaces), workspace_key.clone()) == ticket.workspace
             && tab_id.map(|tab_id| {
                 current_epoch(
@@ -3525,22 +3702,28 @@ impl CancellationEpochs {
         }
     }
 
+    fn advance_sender(&self, sender: &watch::Sender<u64>) {
+        if advance(sender).is_err() {
+            self.exhausted.store(true, Ordering::Release);
+        }
+    }
+
     fn interrupt_project(&self, project_id: &str) {
-        advance(sender_for(
+        self.advance_sender(&sender_for(
             &mut lock(&self.projects),
             project_id.to_string(),
         ));
     }
 
     fn interrupt_workspace(&self, workspace_key: &BrowserWorkspaceKey) {
-        advance(sender_for(
+        self.advance_sender(&sender_for(
             &mut lock(&self.workspaces),
             workspace_key.clone(),
         ));
     }
 
     fn interrupt_tab(&self, workspace_key: &BrowserWorkspaceKey, tab_id: &str) {
-        advance(sender_for(
+        self.advance_sender(&sender_for(
             &mut lock(&self.tabs),
             (workspace_key.clone(), tab_id.to_string()),
         ));
@@ -3552,6 +3735,9 @@ impl CancellationEpochs {
         tab_id: &str,
         interaction_epoch: u64,
     ) {
+        if self.exhausted.load(Ordering::Acquire) {
+            return;
+        }
         let mut cutoffs = lock(&self.user_input_cutoffs);
         let sender = sender_for(&mut cutoffs, (workspace_key.clone(), tab_id.to_string()));
         let current = *sender.borrow();
@@ -3570,13 +3756,13 @@ impl CancellationEpochs {
 
     fn interrupt_all(&self) {
         for sender in lock(&self.projects).values() {
-            advance(sender);
+            self.advance_sender(sender);
         }
         for sender in lock(&self.workspaces).values() {
-            advance(sender);
+            self.advance_sender(sender);
         }
         for sender in lock(&self.tabs).values() {
-            advance(sender);
+            self.advance_sender(sender);
         }
     }
 }
@@ -3611,6 +3797,67 @@ mod secure_command_tests {
 
     const SECRET_INPUT: &str = "password";
     const SECRET_VALUE: &str = "value-sentinel-secure-sidecar";
+
+    trait ExhaustionOutcome {
+        fn is_exhausted(&self) -> bool;
+    }
+
+    impl ExhaustionOutcome for () {
+        fn is_exhausted(&self) -> bool {
+            false
+        }
+    }
+
+    impl<T, E> ExhaustionOutcome for Result<T, E> {
+        fn is_exhausted(&self) -> bool {
+            self.is_err()
+        }
+    }
+
+    #[test]
+    fn cancellation_epoch_exhaustion_is_typed_and_does_not_stick_at_maximum() {
+        let sender = tokio::sync::watch::channel(u64::MAX).0;
+        let outcome = advance(&sender);
+        assert!(
+            outcome.is_exhausted(),
+            "cancellation epochs must fail closed instead of saturating"
+        );
+        assert_eq!(*sender.borrow(), u64::MAX);
+    }
+
+    #[test]
+    fn cancellation_interrupt_exhaustion_invalidates_all_tickets() {
+        let cancellations = CancellationEpochs::default();
+        let workspace = BrowserWorkspaceKey::new("cancellation-exhaustion", "conversation")
+            .expect("workspace key");
+        cancellations
+            .workspaces
+            .lock()
+            .expect("workspace cancellation lock")
+            .insert(workspace.clone(), tokio::sync::watch::channel(u64::MAX).0);
+
+        cancellations.interrupt_workspace(&workspace);
+
+        assert!(
+            cancellations.ticket(&workspace, Some("tab"), None).is_err(),
+            "an exhausted cancellation authority must reject new tickets"
+        );
+        assert!(
+            !cancellations.is_current(
+                &workspace,
+                Some("tab"),
+                CancellationTicket {
+                    project: u64::MAX,
+                    workspace: u64::MAX,
+                    tab: Some(u64::MAX),
+                    interaction_epoch: 1,
+                    replay_owned: false,
+                    registration: None,
+                }
+            ),
+            "existing tickets must fail closed after exhaustion"
+        );
+    }
 
     #[tokio::test]
     async fn controller_retries_the_exact_command_while_its_view_initializes() {
@@ -3762,11 +4009,10 @@ mod secure_command_tests {
         first.respond(Err(BrowserError::InitializingView {
             tab_id: "tab-a".to_string(),
         }));
-        bridge.observe_host_event(&BrowserHostEvent::user_input(
-            workspace_key,
-            "tab-a",
-            BrowserUserInputKind::Pointer,
-        ));
+        bridge.observe_host_event(
+            &BrowserHostEvent::user_input(workspace_key, "tab-a", BrowserUserInputKind::Pointer)
+                .expect("interaction epoch"),
+        );
 
         assert_eq!(task.await.unwrap(), Err(BrowserError::Interrupted));
         assert!(
@@ -4918,7 +5164,9 @@ mod secure_command_tests {
         replay_secret_sidecar: Option<BrowserReplaySecretSidecar>,
     ) -> BrowserCommandRequest {
         let cancellations = Arc::new(CancellationEpochs::default());
-        let cancellation_ticket = cancellations.ticket(&workspace_key, command.tab_id(), None);
+        let cancellation_ticket = cancellations
+            .ticket(&workspace_key, command.tab_id(), None)
+            .expect("cancellation epoch");
         let pending_work = Arc::new(PendingWork::default());
         let (response, _receiver) = oneshot::channel();
         BrowserCommandRequest::from_envelope(
@@ -4960,7 +5208,9 @@ mod secure_command_tests {
         authority: BrowserReplayRepairCaptureAuthority,
     ) -> BrowserCommandRequest {
         let cancellations = Arc::new(CancellationEpochs::default());
-        let cancellation_ticket = cancellations.ticket(&workspace_key, command.tab_id(), None);
+        let cancellation_ticket = cancellations
+            .ticket(&workspace_key, command.tab_id(), None)
+            .expect("cancellation epoch");
         let pending_work = Arc::new(PendingWork::default());
         let (response, _receiver) = oneshot::channel();
         BrowserCommandRequest::from_envelope(
@@ -6144,7 +6394,8 @@ mod secure_command_tests {
                         worker_user_key,
                         "tab-a",
                         BrowserUserInputKind::Pointer,
-                    ),
+                    )
+                    .expect("interaction epoch"),
                 );
                 worker_bridge.observe_host_event_under_host_control_barrier(
                     &BrowserHostEvent::AutomationStateChanged {
@@ -6212,7 +6463,8 @@ mod secure_command_tests {
             workspace_key.clone(),
             "tab-a",
             BrowserUserInputKind::Keyboard,
-        );
+        )
+        .expect("interaction epoch");
 
         let replay_controller = bridge.bind(workspace_key.clone(), Duration::from_secs(1));
         let replay_pending = tokio::spawn(async move {
@@ -7038,7 +7290,10 @@ where
     epoch
 }
 
-fn advance(sender: &watch::Sender<u64>) {
-    let next = (*sender.borrow()).saturating_add(1);
+fn advance(sender: &watch::Sender<u64>) -> Result<(), BrowserError> {
+    let next = (*sender.borrow())
+        .checked_add(1)
+        .ok_or(BrowserError::CancellationEpochExhausted)?;
     sender.send_replace(next);
+    Ok(())
 }

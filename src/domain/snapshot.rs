@@ -7,8 +7,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::agent::AgentSessionFacts;
 use crate::domain::artifact::{ArtifactFacts, ArtifactSummary};
+use crate::domain::browser::{BrowserBook, BrowserContextView, BrowserTabView};
 use crate::domain::event::DomainEvent;
-use crate::domain::id::{AgentSessionId, ArtifactId, OperationId, ResourceId, SnapshotId, TaskId};
+use crate::domain::id::{
+    AgentSessionId, ArtifactId, BrowserContextId, BrowserTabId, OperationId, ResourceId, SnapshotId,
+    TaskId,
+};
 use crate::domain::operation::OperationFacts;
 use crate::domain::resource::ResourceFacts;
 use crate::domain::task::{
@@ -26,9 +30,18 @@ pub struct TaskSnapshot {
     pub primary_agent_id: Option<AgentSessionId>,
     pub artifacts: BTreeMap<ArtifactId, ArtifactFacts>,
     pub resources: BTreeMap<ResourceId, ResourceFacts>,
+    pub browser: BrowserBook,
 }
 
 impl TaskSnapshot {
+    pub fn browser_context(&self, context_id: BrowserContextId) -> Option<BrowserContextView> {
+        self.browser.context_view(context_id)
+    }
+
+    pub fn browser_tab(&self, tab_id: BrowserTabId) -> Option<BrowserTabView> {
+        self.browser.tab_view(tab_id)
+    }
+
     pub fn visible_status(&self) -> VisibleTaskStatus {
         VisibleTaskStatus::derive(
             self.connectivity,
@@ -49,6 +62,8 @@ pub enum SnapshotSection {
     Artifacts,
     Resources,
     Operations,
+    BrowserContexts,
+    BrowserTabs,
 }
 
 pub const MAX_SNAPSHOT_PAGE_ITEMS: u32 = 1_000;
@@ -154,6 +169,8 @@ pub enum SnapshotItemKey {
     Artifact(ArtifactId),
     Resource(ResourceId),
     Operation(OperationId),
+    BrowserContext(BrowserContextId),
+    BrowserTab(BrowserTabId),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -175,6 +192,8 @@ pub enum SnapshotItem {
     Artifact(ArtifactSummary),
     Resource(ResourceFacts),
     Operation(OperationFacts),
+    BrowserContext(BrowserContextView),
+    BrowserTab(BrowserTabView),
 }
 
 /// One page from one immutable snapshot view.

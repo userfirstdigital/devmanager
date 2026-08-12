@@ -335,7 +335,7 @@ fn browser_persisted_model_payloads_are_camel_case_and_round_trip() {
 }
 
 #[test]
-fn browser_error_taxonomy_is_serializable_and_displayable() {
+fn browser_error_taxonomy_is_serializable_displayable_and_redacted() {
     let errors = vec![
         BrowserError::MissingFile {
             path: PathBuf::from("missing.txt"),
@@ -371,7 +371,8 @@ fn browser_error_taxonomy_is_serializable_and_displayable() {
         let json = serde_json::to_string(&error).expect("serialize browser error");
         let round_trip: BrowserError =
             serde_json::from_str(&json).expect("round-trip browser error");
-        assert_eq!(round_trip, error);
+        assert!(json.len() <= 512, "public browser errors must stay bounded");
+        assert_eq!(round_trip.to_string(), error.to_string());
     }
 }
 
@@ -674,7 +675,7 @@ fn browser_recipe_direct_serialization_rejects_secret_defaults() {
 
     let error = serde_json::to_string(&recipe).expect_err("secret default must be rejected");
     let message = error.to_string();
-    assert!(message.contains("secret input default"));
+    assert!(message.contains("browser recipe is invalid"));
     assert!(!message.contains("must-not-be-serialized"));
 }
 

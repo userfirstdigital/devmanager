@@ -326,9 +326,9 @@ async fn run_fake_host(
     run_fake_host_with_state(
         inbox,
         commands,
-        Arc::new(Mutex::new(BrowserHostState::new(PathBuf::from(
-            "gateway-fake-host",
-        )))),
+        Arc::new(Mutex::new(
+            BrowserHostState::new(PathBuf::from("gateway-fake-host")).expect("browser host state"),
+        )),
         None,
     )
     .await;
@@ -582,7 +582,8 @@ async fn run_recording_bridge_host(
         Mutex<VecDeque<Result<BrowserRecordingResult, devmanager::browser::BrowserError>>>,
     >,
 ) {
-    let mut host = BrowserHostState::new(PathBuf::from("recording-bridge-fake-host"));
+    let mut host = BrowserHostState::new(PathBuf::from("recording-bridge-fake-host"))
+        .expect("browser host state");
     while let Some(request) = inbox.recv().await {
         let workspace_key = request.workspace_key().clone();
         let command = request.command().clone();
@@ -628,7 +629,8 @@ async fn run_recording_resource_failure_host(
     coordinator: BrowserWorkflowCoordinator,
     resources: BrowserResourceStore,
 ) {
-    let mut host = BrowserHostState::new(PathBuf::from("recording-resource-failure-fake-host"));
+    let mut host = BrowserHostState::new(PathBuf::from("recording-resource-failure-fake-host"))
+        .expect("browser host state");
     while let Some(request) = inbox.recv().await {
         let workspace_key = request.workspace_key().clone();
         let result = match request.command().clone() {
@@ -1279,7 +1281,9 @@ async fn real_rmcp_annotations_list_get_and_read_resources_are_workspace_owned()
     let (bridge, inbox) = browser_command_channel(32);
     let commands: Arc<Mutex<Vec<(BrowserWorkspaceKey, BrowserCommand)>>> =
         Arc::new(Mutex::new(Vec::new()));
-    let host = Arc::new(Mutex::new(BrowserHostState::new(&config_dir)));
+    let host = Arc::new(Mutex::new(
+        BrowserHostState::new(&config_dir).expect("browser host state"),
+    ));
     let gateway = BrowserGatewayHandle::start_with_app_config_dir(bridge, &config_dir)
         .expect("start annotation gateway");
     let registration_a = gateway
@@ -1452,7 +1456,7 @@ async fn task4_mcp_commands_retain_one_agent_invocation_context() {
         client.cancel().await.expect("close context client");
     };
     let host = async move {
-        let mut state = BrowserHostState::new("context-fake-host");
+        let mut state = BrowserHostState::new("context-fake-host").expect("browser host state");
         let mut contexts: Vec<BrowserInvocationContext> = Vec::new();
         for _ in 0..4 {
             let request = inbox.recv().await.expect("context-routed request");
@@ -2931,9 +2935,10 @@ async fn mcp_refreshes_user_changed_workspace_state_before_each_tool_operation()
     let (bridge, inbox) = browser_command_channel(32);
     let commands: Arc<Mutex<Vec<(BrowserWorkspaceKey, BrowserCommand)>>> =
         Arc::new(Mutex::new(Vec::new()));
-    let host = Arc::new(Mutex::new(BrowserHostState::new(PathBuf::from(
-        "gateway-live-state-host",
-    ))));
+    let host = Arc::new(Mutex::new(
+        BrowserHostState::new(PathBuf::from("gateway-live-state-host"))
+            .expect("browser host state"),
+    ));
     let fake_host = run_fake_host_with_state(inbox, Arc::clone(&commands), Arc::clone(&host), None);
     let gateway = BrowserGatewayHandle::start(bridge).expect("start gateway");
     let scenario = async move {

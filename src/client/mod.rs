@@ -26,8 +26,8 @@ pub use inbox_controller::{
 };
 pub(crate) use model::normalize_bounded_search_text;
 pub use model::{
-    ClientModel, ClientModelBuilder, ClientModelError, SearchContinuation, SearchPage,
-    SearchPageStatus,
+    ClientBrowserDockView, ClientModel, ClientModelBuilder, ClientModelError, SearchContinuation,
+    SearchPage, SearchPageStatus,
 };
 pub use preferences::{ClientPreferenceError, InboxPreferenceStore};
 pub use subscription::{

@@ -1,5 +1,6 @@
 //! Transport-neutral protocol compatibility and wire framing contracts.
 
+mod browser;
 mod capabilities;
 mod control;
 mod envelope;
@@ -8,17 +9,18 @@ mod reconnect;
 mod request;
 mod stream;
 
+pub use browser::*;
 pub use capabilities::{
     Capability, CapabilitySet, ProtocolVersion, VersionNegotiationError, PROTOCOL_MAJOR,
     PROTOCOL_MINOR,
 };
 pub use control::{DetachAck, DetachRequest};
 pub use envelope::{
-    ClientBuildError, ClientHello, ClientHelloError, MessagePackCodec, MessagePackError,
-    MessagePackLengthKind, NegotiatedParameters, ProfileFingerprint, ServerBuildError, ServerHello,
-    ServerHelloError, MAX_CLIENT_BUILD_BYTES, MAX_MESSAGEPACK_COLLECTION_ITEMS,
-    MAX_MESSAGEPACK_DEPTH, MAX_MESSAGEPACK_VALUES, MAX_SERVER_BUILD_BYTES,
-    PROFILE_FINGERPRINT_DOMAIN,
+    BrowserProjectionEnvelope, BrowserProjectionEnvelopeError, ClientBuildError, ClientHello,
+    ClientHelloError, MessagePackCodec, MessagePackError, MessagePackLengthKind,
+    NegotiatedParameters, ProfileFingerprint, ServerBuildError, ServerHello, ServerHelloError,
+    MAX_CLIENT_BUILD_BYTES, MAX_MESSAGEPACK_COLLECTION_ITEMS, MAX_MESSAGEPACK_DEPTH,
+    MAX_MESSAGEPACK_VALUES, MAX_SERVER_BUILD_BYTES, PROFILE_FINGERPRINT_DOMAIN,
 };
 pub use frame::{
     FrameLimitField, FrameLimits, FrameLimitsError, PhysicalFrameCodec, PhysicalFrameError,

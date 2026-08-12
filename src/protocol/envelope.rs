@@ -1200,3 +1200,70 @@ impl MessagePackScanner<'_> {
         u32::try_from(self.offset).unwrap_or(u32::MAX)
     }
 }
+
+/// Transport-neutral browser projection envelope. Generation 0 fails closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowserProjectionEnvelopeError {
+    StaleGeneration,
+    ZeroFence,
+    PayloadTooLarge,
+}
+
+impl fmt::Display for BrowserProjectionEnvelopeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::StaleGeneration => write!(f, "browser projection generation is stale or zero"),
+            Self::ZeroFence => write!(f, "browser projection fence fields must be nonzero"),
+            Self::PayloadTooLarge => write!(f, "browser projection payload exceeds the physical cap"),
+        }
+    }
+}
+
+impl std::error::Error for BrowserProjectionEnvelopeError {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct BrowserProjectionEnvelope {
+    pub generation: u64,
+    pub bounds_epoch: u64,
+    pub focus_epoch: u64,
+    pub frame_id: u64,
+    pub payload_kind: u16,
+    pub payload_sha256: [u8; 32],
+}
+
+impl BrowserProjectionEnvelope {
+    pub fn new(
+        generation: u64,
+        bounds_epoch: u64,
+        focus_epoch: u64,
+        frame_id: u64,
+        payload_kind: u16,
+        payload: &[u8],
+    ) -> Result<Self, BrowserProjectionEnvelopeError> {
+        if generation == 0 || bounds_epoch == 0 || focus_epoch == 0 || frame_id == 0 {
+            return Err(BrowserProjectionEnvelopeError::ZeroFence);
+        }
+        if payload_kind == 0 {
+            return Err(BrowserProjectionEnvelopeError::ZeroFence);
+        }
+        if payload.len() > MAX_PHYSICAL_FRAME_BYTES as usize {
+            return Err(BrowserProjectionEnvelopeError::PayloadTooLarge);
+        }
+        Ok(Self {
+            generation,
+            bounds_epoch,
+            focus_epoch,
+            frame_id,
+            payload_kind,
+            payload_sha256: Sha256::digest(payload).into(),
+        })
+    }
+
+    pub fn matches_generation(&self, generation: u64) -> Result<(), BrowserProjectionEnvelopeError> {
+        if generation == 0 || self.generation != generation {
+            return Err(BrowserProjectionEnvelopeError::StaleGeneration);
+        }
+        Ok(())
+    }
+}

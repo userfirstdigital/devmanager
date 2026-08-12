@@ -7,7 +7,10 @@ use sha2::Sha256;
 use zeroize::Zeroizing;
 
 use crate::domain::artifact::ArtifactSummary;
-use crate::domain::id::{AgentSessionId, ArtifactId, OperationId, ResourceId, SnapshotId, TaskId};
+use crate::domain::id::{
+    AgentSessionId, ArtifactId, BrowserContextId, BrowserTabId, OperationId, ResourceId, SnapshotId,
+    TaskId,
+};
 use crate::domain::snapshot::{
     PageLimits, PageLimitsError, SnapshotItem, SnapshotItemKey, SnapshotPage, SnapshotSection,
     TaskSnapshotItem,
@@ -181,6 +184,8 @@ impl SnapshotSession {
             SnapshotSection::Artifacts => self.artifacts_page(after_item),
             SnapshotSection::Resources => self.resources_page(after_item),
             SnapshotSection::Operations => self.operations_page(after_item),
+            SnapshotSection::BrowserContexts => self.browser_contexts_page(after_item),
+            SnapshotSection::BrowserTabs => self.browser_tabs_page(after_item),
         }
     }
 
