@@ -6,6 +6,7 @@ pub mod event;
 pub mod host;
 pub mod id;
 pub mod operation;
+pub mod org;
 pub mod query;
 pub mod resource;
 pub mod snapshot;
@@ -40,6 +41,7 @@ pub use operation::{
     OperationState, OperationUncertaintyCode, OutcomeFenceError, OutcomeSource, ResourceFence,
     MAX_EXTERNAL_IDENTITY_BYTES,
 };
+pub use org::{ManagedScope, TaskScope};
 pub use query::{Query, QueryEnvelope, QueryError, QueryOutcome, QueryReply, QueryResult};
 pub use resource::{
     OwnerKind, ResourceFacts, ResourceKind, ResourceLifecycle, ResourceRecipe,

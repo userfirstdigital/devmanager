@@ -104,6 +104,7 @@ macro_rules! define_connect_id {
 define_connect_id!(ConnectionId);
 define_connect_id!(SessionId);
 define_connect_id!(ChannelId);
+define_connect_id!(ConnectHostId);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ChannelBinding {

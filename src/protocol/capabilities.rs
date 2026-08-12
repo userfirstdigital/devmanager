@@ -71,6 +71,7 @@ pub enum Capability {
     ManagementMetadata = 11,
     ExplicitDetach = 12,
     HostShutdown = 13,
+    OrganizationProjection = 14,
 }
 
 impl Capability {

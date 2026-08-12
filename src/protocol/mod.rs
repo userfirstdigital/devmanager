@@ -5,12 +5,18 @@ mod chunk;
 mod control;
 mod envelope;
 mod frame;
+mod org;
 mod request;
 mod stream;
 
 pub use capabilities::{
     Capability, CapabilitySet, ProtocolVersion, VersionNegotiationError, PROTOCOL_MAJOR,
     PROTOCOL_MINOR,
+};
+pub use org::{
+    organization_extension_type, OrganizationExtensionKind, ORGANIZATION_PROMPT_BODY_LIMIT_BYTES,
+    ORGANIZATION_PROMPT_PAGE_ENCODED_LIMIT_BYTES, ORGANIZATION_PROMPT_PAGE_ITEM_LIMIT,
+    ORGANIZATION_SCHEMA_VERSION,
 };
 pub use chunk::{
     ChunkContext, ChunkError, ChunkFrame, ChunkLimitField, ChunkLimits, ChunkLimitsError,

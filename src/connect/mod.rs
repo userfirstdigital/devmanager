@@ -2,6 +2,11 @@
 //! implementations are intentionally later phase gates.
 
 mod envelope;
+mod evidence;
+mod local_actions;
+mod managed;
+mod org;
+mod org_prompts;
 mod identity;
 mod identity_codec;
 mod identity_store;
@@ -13,19 +18,26 @@ mod telemetry;
 #[cfg(test)]
 mod telemetry_tests;
 mod transport;
+mod watcher;
 
 #[cfg(test)]
 mod identity_tests;
 
 pub use envelope::{
     ChannelBinding, ChannelId, ChannelKind, ChunkContext, Compression, ConnectEnvelope,
-    ConnectIdError, ConnectLimitError, ConnectLimitField, ConnectLimits, ConnectPrivacyClass,
+    ConnectHostId, ConnectIdError, ConnectLimitError, ConnectLimitField, ConnectLimits, ConnectPrivacyClass,
     ConnectionId, EnvelopeError, NegotiatedLimits, PayloadKind, PrivacyClass, SessionId,
     CONNECT_PROTOCOL_MAJOR, CONNECT_PROTOCOL_MINOR, MAX_CONNECT_CHUNK_BYTES,
     MAX_CONNECT_CUMULATIVE_BYTES, MAX_CONNECT_CURSOR_BYTES, MAX_CONNECT_DIAGNOSTIC_BYTES,
     MAX_CONNECT_PAGE_ENCODED_BYTES, MAX_CONNECT_PAGE_ITEMS, MAX_CONNECT_PHYSICAL_FRAME_BYTES,
     MAX_CONNECT_REASSEMBLED_MESSAGE_BYTES,
 };
+pub use evidence::{EvidenceBundle, EvidenceIntake, TaskDraft};
+pub use local_actions::{LocalActionReceipt, LocalActionRegistry, LocalActionRequest};
+pub use managed::{ManagedTaskLink, ManagedTaskProjection, TaskLinkReducer};
+pub use org::{OrganizationProjection, StandaloneOrganization};
+pub use org_prompts::{ComposerInsertion, OrganizationPromptProjection};
+pub use watcher::{FleetWatcherView, TaskWatcherView, WatcherProjection};
 pub use identity::{
     validate_device_credential, BrowserDeviceDto, BrowserPrivateStorage,
     ConnectIdentity, CredentialLocation, CredentialVault, DeviceCredentialProof, DeviceId,
