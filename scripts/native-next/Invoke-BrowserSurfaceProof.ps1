@@ -18,6 +18,86 @@ $ErrorActionPreference = 'Stop'
 
 . (Join-Path $PSScriptRoot 'Isolation.ps1')
 
+function Get-BrowserTypedContractExitCode {
+    param([Parameter(Mandatory = $true)][string]$Status)
+    switch ($Status) {
+        'PASS' { return 0 }
+        'HOLD' { return 2 }
+        default { return 1 }
+    }
+}
+
+function Resolve-BrowserSurfaceProofTypedResult {
+    param([Parameter(Mandatory = $true)]$Evidence)
+
+    $visible = $false
+    $launched = $false
+    if ($null -ne $Evidence) {
+        if ($Evidence -is [System.Collections.IDictionary]) {
+            if ($Evidence.Contains('visibleWebView2Proven')) { $visible = [bool]$Evidence['visibleWebView2Proven'] }
+            $residue = $null
+            if ($Evidence.Contains('residue')) { $residue = $Evidence['residue'] }
+        }
+        else {
+            if ($null -ne $Evidence.PSObject.Properties['visibleWebView2Proven']) {
+                $visible = [bool]$Evidence.visibleWebView2Proven
+            }
+            $residue = $null
+            if ($null -ne $Evidence.PSObject.Properties['residue']) {
+                $residue = $Evidence.residue
+            }
+        }
+        if ($null -ne $residue) {
+            if ($residue -is [System.Collections.IDictionary]) {
+                if ($residue.Contains('launchedWebView2')) { $launched = [bool]$residue['launchedWebView2'] }
+            }
+            elseif ($null -ne $residue.PSObject.Properties['launchedWebView2']) {
+                $launched = [bool]$residue.launchedWebView2
+            }
+        }
+    }
+
+    if ($visible -and -not $launched) {
+        return [pscustomobject]@{
+            status      = 'FAIL'
+            disposition = 'FAIL'
+            pass        = $false
+            reason      = 'visible-claim-without-webview2-proof'
+        }
+    }
+    if ($visible -and $launched) {
+        return [pscustomobject]@{
+            status      = 'PASS'
+            disposition = 'PASS'
+            pass        = $true
+            reason      = 'visible-webview2-proven'
+        }
+    }
+    return [pscustomobject]@{
+        status      = 'HOLD'
+        disposition = 'HOLD'
+        pass        = $false
+        reason      = 'visible-webview2-not-proven'
+    }
+}
+
+function Assert-BrowserSurfaceProofDoesNotLaunchHosts {
+    param([Parameter(Mandatory = $true)][string]$LiteralPath)
+
+    $tokens = $null
+    $parseErrors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($LiteralPath, [ref]$tokens, [ref]$parseErrors)
+    if ($null -eq $ast -or @($parseErrors).Count -gt 0) {
+        throw 'Surface proof script failed Parser::ParseFile.'
+    }
+    foreach ($command in @($ast.FindAll({ $args[0] -is [System.Management.Automation.Language.CommandAst] }, $true))) {
+        $name = [string]$command.GetCommandName()
+        if ($name -eq 'Start-Process') {
+            throw 'Surface proof script must not invoke Start-Process.'
+        }
+    }
+}
+
 if (-not [System.IO.Path]::IsPathRooted($OutputDir)) {
     throw 'OutputDir must be an explicit rooted directory.'
 }
@@ -60,11 +140,7 @@ $forbidden = @(
     'cursor.exe',
     'devmanager.exe'
 )
-foreach ($token in $forbidden) {
-    if ($scriptText.Contains($token)) {
-        throw "Surface proof script must not contain '$token'."
-    }
-}
+Assert-BrowserSurfaceProofDoesNotLaunchHosts -LiteralPath $scriptPath
 
 function Get-BrowserVisibleHostProofClass {
     param(
@@ -189,17 +265,37 @@ $evidence = [ordered]@{
     )
 }
 
-if ($Stage -in @('Red', 'All')) {
-    if (-not $redChecks.surfaceTestPresent -or -not $redChecks.fixtureServerSourcePresent) {
-        throw 'Required surface proof sources are missing.'
+$stageError = $null
+try {
+    if ($Stage -in @('Red', 'All')) {
+        if (-not $redChecks.surfaceTestPresent -or -not $redChecks.fixtureServerSourcePresent) {
+            throw 'Required surface proof sources are missing.'
+        }
     }
+
+    if ($Stage -in @('Green', 'All')) {
+        foreach ($filter in $scenarioFilters) {
+            Invoke-PortableSurfaceScenario -Filter $filter
+        }
+    }
+}
+catch {
+    $stageError = [string]$_.Exception.Message
 }
 
-if ($Stage -in @('Green', 'All')) {
-    foreach ($filter in $scenarioFilters) {
-        Invoke-PortableSurfaceScenario -Filter $filter
+$typed = Resolve-BrowserSurfaceProofTypedResult -Evidence $evidence
+if (-not [string]::IsNullOrWhiteSpace($stageError)) {
+    $typed = [pscustomobject]@{
+        status      = 'FAIL'
+        disposition = 'FAIL'
+        pass        = $false
+        reason      = $stageError
     }
 }
+$evidence['status'] = [string]$typed.status
+$evidence['disposition'] = [string]$typed.disposition
+$evidence['pass'] = [bool]$typed.pass
+$evidence['reason'] = [string]$typed.reason
 
 $evidence.visibleHostProofClass = Get-BrowserVisibleHostProofClass `
     -FixtureOnly $true `
@@ -216,3 +312,5 @@ $evidencePath = Join-Path $resolvedOutput 'browser-surface-proof.json'
 $evidence | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $evidencePath -Encoding utf8
 Write-Host ("Browser surface proof stage {0} wrote {1}" -f $Stage, $evidencePath)
 Write-Host 'Visible WebView2 proof is NOT claimed by this portable run.'
+Write-Output (($evidence | ConvertTo-Json -Compress -Depth 8))
+exit (Get-BrowserTypedContractExitCode -Status ([string]$typed.status))

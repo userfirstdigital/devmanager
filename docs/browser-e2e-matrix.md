@@ -50,11 +50,18 @@ ordinary fixture scripts.
 
 ## Residue and pass criteria
 
+Typed evidence JSON is required on stdout for both `Invoke-BrowserSurfaceProof.ps1`
+and `Invoke-BrowserProviderE2E.ps1`. The parent final-release gate records each
+command's `exitCode` plus typed `status`/`reason` and never marks a typed smoke
+PASS unless both the process exit code is 0 and the typed result is PASS.
+`schemaVersion`, `status`, `disposition`, `pass`, and `reason` are always present.
+
 | Arm | Pass | Fail / HOLD |
 | --- | --- | --- |
-| Portable fixture / surface | Focused cargo tests pass; evidence JSON has `launchedStockProvider=false` and `visibleWebView2Proven=false` | Missing fixtures, external URLs, secrets, or a provider launch |
-| Windows/WebView2 | Script writes evidence that labels the gap | Claiming a visible attach/park/reattach success without a later host/GPUI proof |
-| Authenticated | Script exits after recording HOLD | Missing allowlist, missing env opt-in, production ConfigBase, or any provider spawn |
+| Portable fixture / surface | Focused cargo tests may run, but evidence stays `visibleWebView2Proven=false` and the typed result is HOLD | Missing sources or a cargo failure is FAIL; a portable Rust fixture success alone is never PASS |
+| Windows/WebView2 | Typed PASS only if visible WebView2/GPUI proof was actually performed | Typed HOLD when `visibleWebView2Proven=false`; FAIL if a visible success is claimed without residue proof |
+| Fixture provider E2E | Typed PASS only after the fixture server is ready and health/index/traversal succeed with no leftover PID | Missing/unavailable fixture server is typed HOLD; ready/health/index/traversal/cleanup failures are typed FAIL |
+| Authenticated | Typed HOLD, `launched=false`, no stock provider process | Missing allowlist, missing env opt-in, production ConfigBase, or any provider spawn |
 
 ## What is NOT proven
 

@@ -53,15 +53,27 @@ Every child uses argument arrays (no shell command strings), a fresh isolated en
 
 Invoked only when present, fixture-only, and when a PowerShell AST parameter contract is discoverable and safe. The gate never passes `-Authenticated`, `-Provider`, `-HostRegistered`, `-IAcknowledgeIsolatedNonproductionProfile`, or any install/publish/kill/start/stop parameter, and never supplies credentials.
 
+The gate's typed-contract predicate is an **explicit ID set**, not `Kind=smoke`.
+Required typed JSON (`schemaVersion`, `status`/`disposition`, `pass`, `reason` on
+stdout; PASS only when exit code is 0 **and** the typed token is PASS):
+
+- `provider-smoke` and `provider-smoke:*`
+- `browser-surface-proof` and `browser-surface-proof:*`
+- `browser-provider-e2e` and `browser-provider-e2e:*`
+- `prompt-smoke` and `prompt-smoke:*`
+
+`workspace-smoke` is **not** in that set. Cargo check/test and web test/typecheck/build
+are also non-typed and keep their exit-code contract.
+
 | Smoke | Script | Contract |
 | --- | --- | --- |
-| Workspace | `Invoke-WorkspaceSmoke.ps1` | Fixture/fake-host only. Do not pass `-Authenticated`. |
-| Provider | `Invoke-ProviderSmoke.ps1` | Fixture/non-authenticated only. Pass isolated `-IsolatedProfile` when that parameter exists. Typed JSON `schemaVersion=1` with `disposition` (preferred) or `status`, parsed case-insensitively: `pass`/`passed`/`success` → **PASS**; `hold` → **HOLD**; `rejected`/`fail` → **FAIL**. `pass: true` without a conflicting token is PASS. Malformed JSON, unknown token, `pass: false` without a token, or `disposition=pass` with `pass: false` is FAIL. |
-| Browser surface | `Invoke-BrowserSurfaceProof.ps1` | Invoke only if present and safe. Pass isolated `-OutputDir` `<run>/browser-surface-proof-output` and `-Fixture` when those parameters exist. Missing or unsafe → HOLD. |
-| Browser provider E2E | `Invoke-BrowserProviderE2E.ps1` | Invoke only if present and safe. Pass isolated `-OutputDir` `<run>/browser-provider-e2e-output`, `-Fixture`, and `-IncludeProjectionFixture`/`-IncludeRecovery` when those parameters exist. Never pass `-Authenticated`. Missing or unsafe → HOLD. |
-| Prompt | `Invoke-PromptLibrarySmoke.ps1` or `Invoke-PromptSmoke.ps1` | Same discovery/safety rules. Missing → HOLD. |
+| Workspace | `Invoke-WorkspaceSmoke.ps1` | Fixture/fake-host only. Do not pass `-Authenticated`. Not a typed-contract smoke. The script emits explicit `WORKSPACE_SMOKE_OK` / `residue=0` markers; the gate classifies this ID by process exit code (0 → **PASS**, nonzero → **FAIL**) and must not treat that untyped marker output as a missing typed JSON failure. |
+| Provider | `Invoke-ProviderSmoke.ps1` | Fixture/non-authenticated only. Pass isolated `-IsolatedProfile` when that parameter exists. **Typed JSON required.** `schemaVersion=1` with `disposition` (preferred) or `status`, parsed case-insensitively: `pass`/`passed`/`success` → **PASS**; `hold` → **HOLD**; `rejected`/`fail` → **FAIL**. `pass: true` without a conflicting token is PASS. Malformed JSON, unknown token, `pass: false` without a token, `disposition=pass` with `pass: false`, typed PASS with nonzero exit, or exit 0 with no typed JSON is FAIL. |
+| Browser surface | `Invoke-BrowserSurfaceProof.ps1` | Invoke only if present and safe. Pass isolated `-OutputDir` `<run>/browser-surface-proof-output`. **Typed JSON required.** Portable/default runs set `visibleWebView2Proven=false` and must be typed **HOLD** — a successful portable Rust fixture run alone is never PASS. Typed PASS is allowed only when visible WebView2/GPUI proof was actually performed. Missing or unsafe script → HOLD. |
+| Browser provider E2E | `Invoke-BrowserProviderE2E.ps1` | Invoke only if present and safe. Pass isolated `-OutputDir` `<run>/browser-provider-e2e-output`, `-Fixture`, and `-IncludeProjectionFixture`/`-IncludeRecovery` when those parameters exist. Never pass `-Authenticated`. **Typed JSON required.** Missing/unavailable fixture server → typed **HOLD**. Ready-line, health, index, traversal, or leftover fixture-process failures → typed **FAIL**. Authenticated provider launch remains HOLD and is never started. Missing or unsafe script → HOLD. |
+| Prompt | `Invoke-PromptLibrarySmoke.ps1` or `Invoke-PromptSmoke.ps1` | Same discovery/safety rules. **Typed JSON required** (`prompt-smoke` and `prompt-smoke:*`). Missing → HOLD. |
 
-Any smoke that emits typed JSON with `disposition` or `status` is classified with the same case-insensitive mapping as provider smoke. Typed HOLD does not become FAIL merely because the process exited 2. A smoke without typed JSON uses its exit code (nonzero → FAIL), except provider smoke, which must emit typed JSON.
+If a command *does* emit typed JSON (`disposition`/`status`/`pass`), the gate classifies that token even for cargo/web/workspace. Typed HOLD does not become FAIL merely because the process exited 2. Typed-contract smokes listed above cannot PASS from exit 0 alone. Generic untyped smokes outside that set (today: workspace) and cargo/web use exit code: 0 → PASS, nonzero → FAIL.
 
 Missing, unsafe, skipped, or typed-HOLD smokes make the overall result **HOLD** unless an explicit opt-in skip is already HOLD. They never become PASS.
 
@@ -93,10 +105,10 @@ The gate must not invoke or perform:
 
 | Overall status | Exit | Meaning |
 | --- | --- | --- |
-| `PASS` | 0 | All mandatory commands exited 0, web present and successful, every available safe smoke successful (including typed fixture provider success), no attributed residue, production unchanged, evidence write succeeded |
+| `PASS` | 0 | All mandatory cargo/web commands exited 0, workspace-smoke exited 0 under its marker/exit contract, every typed-contract smoke returned typed PASS with exit 0, no attributed residue, production unchanged, evidence write succeeded |
 | `PLAN` | 0 | `-PlanOnly` static validation succeeded. This is **not** a release PASS |
-| `HOLD` | 2 | Missing/unsafe/typed-HOLD smoke, `-SkipWeb`, or `-SkipSmokes` |
-| `FAIL` | 1 | Command failure, typed rejection/malformed typed result, timeout, attributed residue, production change, baseline/assert failure, isolation breach, or evidence write failure |
+| `HOLD` | 2 | Missing/unsafe/typed-HOLD smoke (including browser surface without visible WebView2 proof, browser provider E2E with a missing fixture server, or authenticated provider HOLD), `-SkipWeb`, or `-SkipSmokes` |
+| `FAIL` | 1 | Command failure, typed-contract smoke with missing/malformed typed JSON, typed rejection, typed PASS with nonzero exit, workspace/cargo/web nonzero exit, timeout, attributed residue, production change, baseline/assert failure, isolation breach, or evidence write failure |
 
 `-SkipWeb` and `-SkipSmokes` are explicit opt-in only and cannot yield PASS.
 

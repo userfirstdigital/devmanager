@@ -142,6 +142,74 @@ function Invoke-LoopbackFixtureRequest {
     }
 }
 
+function Get-BrowserTypedContractExitCode {
+    param([Parameter(Mandatory = $true)][string]$Status)
+    switch ($Status) {
+        'PASS' { return 0 }
+        'HOLD' { return 2 }
+        default { return 1 }
+    }
+}
+
+function Resolve-BrowserProviderE2ETypedResult {
+    param(
+        [bool]$Authenticated = $false,
+        [bool]$FixtureServerAvailable = $false,
+        [bool]$ReadyLineEmitted = $false,
+        [bool]$HealthOk = $false,
+        [bool]$IndexOk = $false,
+        [bool]$TraversalOk = $false,
+        [bool]$CleanupLeftResidue = $false
+    )
+
+    if ($Authenticated) {
+        return [pscustomobject]@{
+            status      = 'HOLD'
+            disposition = 'HOLD'
+            pass        = $false
+            reason      = 'authenticated-launch-not-performed'
+        }
+    }
+    if (-not $FixtureServerAvailable) {
+        return [pscustomobject]@{
+            status      = 'HOLD'
+            disposition = 'HOLD'
+            pass        = $false
+            reason      = 'fixture-server-unavailable'
+        }
+    }
+    if ($CleanupLeftResidue) {
+        return [pscustomobject]@{
+            status      = 'FAIL'
+            disposition = 'FAIL'
+            pass        = $false
+            reason      = 'fixture-cleanup-residue'
+        }
+    }
+    if (-not $ReadyLineEmitted) {
+        return [pscustomobject]@{
+            status      = 'FAIL'
+            disposition = 'FAIL'
+            pass        = $false
+            reason      = 'fixture-ready-missing'
+        }
+    }
+    if (-not $HealthOk -or -not $IndexOk -or -not $TraversalOk) {
+        return [pscustomobject]@{
+            status      = 'FAIL'
+            disposition = 'FAIL'
+            pass        = $false
+            reason      = 'fixture-check-failed'
+        }
+    }
+    return [pscustomobject]@{
+        status      = 'PASS'
+        disposition = 'PASS'
+        pass        = $true
+        reason      = 'fixture-local-proof'
+    }
+}
+
 $fixtureRoot = Join-Path $worktreeRoot 'tests\fixtures\browser-e2e'
 if (-not (Test-Path -LiteralPath $fixtureRoot)) {
     throw "Fixture root is missing: $fixtureRoot"
@@ -178,6 +246,7 @@ if ($Authenticated) {
 }
 
 $serverProcess = $null
+$cleanupLeftResidue = $false
 $serverEvidence = [ordered]@{
     attempted = $false
     started   = $false
@@ -185,11 +254,21 @@ $serverEvidence = [ordered]@{
     url       = $null
     skipped   = 'fixture server binary was not discoverable; fixture files were validated on disk'
 }
+$typedState = @{
+    Authenticated          = [bool]$Authenticated
+    FixtureServerAvailable = $false
+    ReadyLineEmitted       = $false
+    HealthOk               = $false
+    IndexOk                = $false
+    TraversalOk            = $false
+    CleanupLeftResidue     = $false
+}
 
 try {
     if ($Fixture) {
         $serverPath = Find-BrowserFixtureServer -WorktreeRoot $worktreeRoot
         if ($serverPath) {
+            $typedState.FixtureServerAvailable = $true
             $serverEvidence.attempted = $true
             $info = [System.Diagnostics.ProcessStartInfo]::new()
             $info.FileName = $serverPath
@@ -215,6 +294,7 @@ try {
                 Start-Sleep -Milliseconds 50
             }
             if ($readyLine -and $readyLine.Contains('BROWSER_FIXTURE_SERVER_READY')) {
+                $typedState.ReadyLineEmitted = $true
                 $payload = $readyLine.Substring($readyLine.IndexOf('{'))
                 $ready = $payload | ConvertFrom-Json
                 if (-not ([Uri]$ready.url).Host.Equals('127.0.0.1', [StringComparison]::OrdinalIgnoreCase)) {
@@ -232,12 +312,15 @@ try {
                 if ($health.status -ne 200 -or $health.body -notmatch '"ok":true') {
                     throw 'Fixture server health request did not return the expected local response.'
                 }
+                $typedState.HealthOk = $true
                 if ($index.status -ne 200 -or $index.body -notmatch 'DM-BROWSER-E2E-OK') {
                     throw 'Fixture server index request did not return the verification marker.'
                 }
+                $typedState.IndexOk = $true
                 if ($traversal.status -ne 400) {
                     throw "Fixture server traversal request returned unexpected status $($traversal.status)."
                 }
+                $typedState.TraversalOk = $true
                 $serverEvidence.healthStatus = $health.status
                 $serverEvidence.indexStatus = $index.status
                 $serverEvidence.indexContainsVerificationToken = $true
@@ -248,54 +331,10 @@ try {
             }
         }
     }
-
-    $evidence = [ordered]@{
-        schemaVersion            = 1
-        kind                     = 'browser-provider-e2e'
-        fixture                  = [bool]$Fixture
-        includeProjectionFixture = [bool]$IncludeProjectionFixture
-        includeRecovery          = [bool]$IncludeRecovery
-        generatedAtUtc           = [DateTime]::UtcNow.ToString('o')
-        fixtureRoot              = $fixtureRoot
-        fixtureServer            = $serverEvidence
-        authenticated            = $(if ($authenticatedHold) { $authenticatedHold } else { [ordered]@{ requested = $false; launched = $false; hold = 'not-requested' } })
-        launchedStockProvider    = $false
-        visibleWebView2Proven    = $false
-        visibleHostProofClass    = 'FixtureProtocolOnly'
-        productionProfileTouched = $false
-        persistedPromptBody      = $false
-        persistedBearerToken     = $false
-        notProven                = @(
-            'Authenticated Claude/Codex/Cursor control of a real page',
-            'Visible WebView2 under a stock provider',
-            'Remote/projection Connect path',
-            'Provider crash recovery with a live helper tree'
-        )
-    }
-    if ($IncludeProjectionFixture) {
-        $evidence['projectionFixture'] = 'labeled-only; Phase 9 owns real Connect projection'
-    }
-    if ($IncludeRecovery) {
-        $evidence['recovery'] = 'fixture recovery pages exist; live renderer/provider crash is NOT executed'
-    }
-
-    $visibleOptIn = [string]$env:DEVMANAGER_BROWSER_WEBVIEW2_E2E -eq '1'
-    $evidence.visibleHostProofClass = Get-BrowserVisibleHostProofClass `
-        -FixtureOnly $true `
-        -VisibleClaimed ([bool]$evidence.visibleWebView2Proven) `
-        -OptInMarker $visibleOptIn `
-        -ObservedHostOwnedWebView2 $false `
-        -ObservedWindowLifecycle $false `
-        -ObservedHelperLifecycle $false
-    if ($evidence.visibleHostProofClass -eq 'VisibleGreen' -or [bool]$evidence.visibleWebView2Proven) {
-        throw 'Fixture/provider proof cannot claim visible WebView2 success. Fixture-only runs stay FixtureProtocolOnly.'
-    }
-
-    $evidencePath = Join-Path $resolvedOutput 'browser-provider-e2e.json'
-    $evidence | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $evidencePath -Encoding utf8
-    Write-Host ("Browser provider E2E evidence wrote {0}" -f $evidencePath)
-    if ($Authenticated) {
-        Write-Host 'Authenticated provider launch remains HOLD.'
+}
+catch {
+    if ($null -eq $serverEvidence['lastError']) {
+        $serverEvidence['lastError'] = [string]$_.Exception.Message
     }
 }
 finally {
@@ -310,7 +349,7 @@ finally {
                 }
             }
             if (-not $serverProcess.HasExited) {
-                throw "fixture server PID $($serverProcess.Id) remained after cleanup"
+                $cleanupLeftResidue = $true
             }
         }
         catch {
@@ -320,11 +359,11 @@ finally {
                     $serverProcess.WaitForExit(2000)
                 }
                 if (-not $serverProcess.HasExited) {
-                    throw "fixture server PID $($serverProcess.Id) remained after cleanup"
+                    $cleanupLeftResidue = $true
                 }
             }
             catch {
-                throw
+                $cleanupLeftResidue = $true
             }
         }
         finally {
@@ -332,3 +371,60 @@ finally {
         }
     }
 }
+
+$typedState.CleanupLeftResidue = [bool]$cleanupLeftResidue
+$typed = Resolve-BrowserProviderE2ETypedResult @typedState
+$evidence = [ordered]@{
+    schemaVersion            = 1
+    kind                     = 'browser-provider-e2e'
+    fixture                  = [bool]$Fixture
+    includeProjectionFixture = [bool]$IncludeProjectionFixture
+    includeRecovery          = [bool]$IncludeRecovery
+    generatedAtUtc           = [DateTime]::UtcNow.ToString('o')
+    fixtureRoot              = $fixtureRoot
+    fixtureServer            = $serverEvidence
+    authenticated            = $(if ($authenticatedHold) { $authenticatedHold } else { [ordered]@{ requested = $false; launched = $false; hold = 'not-requested' } })
+    launchedStockProvider    = $false
+    visibleWebView2Proven    = $false
+    visibleHostProofClass    = 'FixtureProtocolOnly'
+    productionProfileTouched = $false
+    persistedPromptBody      = $false
+    persistedBearerToken     = $false
+    status                   = [string]$typed.status
+    disposition              = [string]$typed.disposition
+    pass                     = [bool]$typed.pass
+    reason                   = [string]$typed.reason
+    notProven                = @(
+        'Authenticated Claude/Codex/Cursor control of a real page',
+        'Visible WebView2 under a stock provider',
+        'Remote/projection Connect path',
+        'Provider crash recovery with a live helper tree'
+    )
+}
+if ($IncludeProjectionFixture) {
+    $evidence['projectionFixture'] = 'labeled-only; Phase 9 owns real Connect projection'
+}
+if ($IncludeRecovery) {
+    $evidence['recovery'] = 'fixture recovery pages exist; live renderer/provider crash is NOT executed'
+}
+
+$visibleOptIn = [string]$env:DEVMANAGER_BROWSER_WEBVIEW2_E2E -eq '1'
+$evidence.visibleHostProofClass = Get-BrowserVisibleHostProofClass `
+    -FixtureOnly $true `
+    -VisibleClaimed ([bool]$evidence.visibleWebView2Proven) `
+    -OptInMarker $visibleOptIn `
+    -ObservedHostOwnedWebView2 $false `
+    -ObservedWindowLifecycle $false `
+    -ObservedHelperLifecycle $false
+if ($evidence.visibleHostProofClass -eq 'VisibleGreen' -or [bool]$evidence.visibleWebView2Proven) {
+    throw 'Fixture/provider proof cannot claim visible WebView2 success. Fixture-only runs stay FixtureProtocolOnly.'
+}
+
+$evidencePath = Join-Path $resolvedOutput 'browser-provider-e2e.json'
+$evidence | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $evidencePath -Encoding utf8
+Write-Host ("Browser provider E2E evidence wrote {0}" -f $evidencePath)
+if ($Authenticated) {
+    Write-Host 'Authenticated provider launch remains HOLD.'
+}
+Write-Output (($evidence | ConvertTo-Json -Compress -Depth 8))
+exit (Get-BrowserTypedContractExitCode -Status ([string]$typed.status))

@@ -15,9 +15,14 @@
 
   -SkipWeb and -SkipSmokes are explicit opt-in escapes. Either one makes the
   overall result HOLD, never PASS. A missing, unsafe, or typed-HOLD smoke is
-  also HOLD. Fixture provider smoke success is PASS when the typed JSON
-  disposition is success; a typed HOLD stays HOLD; a typed rejection or
-  malformed typed result is FAIL.
+  also HOLD. Typed-contract smokes are an explicit set: provider-smoke,
+  browser-surface-proof, browser-provider-e2e, prompt-smoke, and those IDs with
+  a `:variant` suffix. They are PASS only when the process exit code is 0 and
+  the typed JSON status/disposition is PASS. A typed HOLD stays HOLD. A typed
+  rejection, malformed typed result, or exit-0 typed-contract smoke with no
+  typed JSON is FAIL. Workspace-smoke is not in that set: it keeps its
+  WORKSPACE_SMOKE_OK / residue=0 marker plus exit-code contract. Cargo and web
+  remain non-typed and use exit code.
 
 .PARAMETER RepoRoot
   Git worktree root. Must canonicalize to this script's worktree.
@@ -395,13 +400,15 @@ function New-FinalReleaseCommandRecord {
         kind       = $Kind
         executable = $(if ([string]::IsNullOrWhiteSpace($Executable)) { $null } else { $Executable })
         arguments  = $argumentList
-        status     = $Status
-        exitCode   = $ExitCode
-        durationMs = $DurationMs
-        reason     = $(if ([string]::IsNullOrWhiteSpace($Reason)) { $null } else { $Reason })
-        stdoutLog  = $(if ([string]::IsNullOrWhiteSpace($StdoutLog)) { $null } else { $StdoutLog })
-        stderrLog  = $(if ([string]::IsNullOrWhiteSpace($StderrLog)) { $null } else { $StderrLog })
-        residue    = $null
+        status      = $Status
+        exitCode    = $ExitCode
+        durationMs  = $DurationMs
+        reason      = $(if ([string]::IsNullOrWhiteSpace($Reason)) { $null } else { $Reason })
+        typedStatus = $null
+        typedReason = $null
+        stdoutLog   = $(if ([string]::IsNullOrWhiteSpace($StdoutLog)) { $null } else { $StdoutLog })
+        stderrLog   = $(if ([string]::IsNullOrWhiteSpace($StderrLog)) { $null } else { $StderrLog })
+        residue     = $null
     }
 }
 
@@ -680,6 +687,94 @@ function Resolve-FinalReleaseTypedResult {
         default {
             return [pscustomobject]@{ typed = $true; status = 'FAIL'; reason = 'typed-unknown-disposition'; payload = $payload }
         }
+    }
+}
+
+function Test-FinalReleaseCommandRequiresTypedResult {
+    param(
+        [Parameter(Mandatory = $true)][string]$Id,
+        [Parameter(Mandatory = $true)][string]$Kind
+    )
+
+    # Explicit typed-contract smokes only. Workspace-smoke is excluded on
+    # purpose: Invoke-WorkspaceSmoke.ps1 emits WORKSPACE_SMOKE_OK / residue=0
+    # markers and is classified by process exit code, not typed JSON.
+    # Cargo/web commands are also non-typed.
+    if ($Kind -ne 'smoke') {
+        return $false
+    }
+    $exact = @(
+        'provider-smoke',
+        'browser-surface-proof',
+        'browser-provider-e2e',
+        'prompt-smoke'
+    )
+    if ($exact -contains $Id) {
+        return $true
+    }
+    foreach ($prefix in @('provider-smoke:', 'browser-surface-proof:', 'browser-provider-e2e:', 'prompt-smoke:')) {
+        if ($Id.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Resolve-FinalReleaseCommandOutcome {
+    param(
+        [Parameter(Mandatory = $true)][string]$Id,
+        [Parameter(Mandatory = $true)][string]$Kind,
+        [object]$ExitCode,
+        [string]$Stdout
+    )
+
+    $typed = Resolve-FinalReleaseTypedResult -Stdout $Stdout -ExitCode $ExitCode
+    $exit = $null
+    if ($null -ne $ExitCode -and "$ExitCode" -ne '') {
+        $exit = [int]$ExitCode
+    }
+    $requiresTyped = Test-FinalReleaseCommandRequiresTypedResult -Id $Id -Kind $Kind
+    if ([bool]$typed.typed) {
+        return [pscustomobject]@{
+            status      = [string]$typed.status
+            reason      = [string]$typed.reason
+            exitCode    = $exit
+            typedStatus = [string]$typed.status
+            typedReason = [string]$typed.reason
+        }
+    }
+    if ($requiresTyped) {
+        $parseReason = [string]$typed.reason
+        $reason = 'missing-typed-result'
+        if ($parseReason -eq 'unparseable') {
+            $reason = 'malformed-typed-result'
+        }
+        elseif (-not [string]::IsNullOrWhiteSpace($parseReason) -and $parseReason -notin @('empty-output', 'no-typed-fields', 'no-typed-token')) {
+            $reason = $parseReason
+        }
+        return [pscustomobject]@{
+            status      = 'FAIL'
+            reason      = $reason
+            exitCode    = $exit
+            typedStatus = $null
+            typedReason = $(if ([string]::IsNullOrWhiteSpace($parseReason)) { $null } else { $parseReason })
+        }
+    }
+    if ($null -ne $exit -and $exit -ne 0) {
+        return [pscustomobject]@{
+            status      = 'FAIL'
+            reason      = 'nonzero-exit'
+            exitCode    = $exit
+            typedStatus = $null
+            typedReason = $null
+        }
+    }
+    return [pscustomobject]@{
+        status      = 'PASS'
+        reason      = $null
+        exitCode    = $exit
+        typedStatus = $null
+        typedReason = $null
     }
 }
 
@@ -1120,27 +1215,17 @@ session.json may change and is never read or hashed.
                     $command.reason = 'gate-owned-residue'
                     throw ("Gate-owned process residue remains after '{0}'." -f $command.id)
                 }
-                $isProviderSmoke = ([string]$command.id -eq 'provider-smoke' -or [string]$command.id -like 'provider-smoke:*')
-                $typed = Resolve-FinalReleaseTypedResult -Stdout $result.Stdout -ExitCode $result.ExitCode
-                if ([bool]$typed.typed) {
-                    $command.status = [string]$typed.status
-                    $command.reason = [string]$typed.reason
-                    if ([string]$typed.status -eq 'FAIL') {
-                        throw ("Command '{0}' returned a typed failure ({1})." -f $command.id, $typed.reason)
-                    }
-                }
-                elseif ($isProviderSmoke) {
-                    $command.status = 'FAIL'
-                    $command.reason = 'provider-smoke-unparseable'
-                    throw 'Provider smoke did not emit a typed JSON disposition.'
-                }
-                elseif ([int]$result.ExitCode -ne 0) {
-                    $command.status = 'FAIL'
-                    $command.reason = 'nonzero-exit'
-                    throw ("Command '{0}' exited {1}." -f $command.id, $result.ExitCode)
-                }
-                else {
-                    $command.status = 'PASS'
+                $outcome = Resolve-FinalReleaseCommandOutcome `
+                    -Id ([string]$command.id) `
+                    -Kind ([string]$command.kind) `
+                    -ExitCode $result.ExitCode `
+                    -Stdout $result.Stdout
+                $command.status = [string]$outcome.status
+                $command.reason = [string]$outcome.reason
+                $command.typedStatus = $outcome.typedStatus
+                $command.typedReason = $outcome.typedReason
+                if ([string]$outcome.status -eq 'FAIL') {
+                    throw ("Command '{0}' is not a typed PASS (status={1}, reason={2}, exit={3})." -f $command.id, $outcome.status, $outcome.reason, $result.ExitCode)
                 }
             }
             catch {
