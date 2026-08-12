@@ -355,10 +355,17 @@ impl BrowserGatewayRegistrar {
         &self,
         process_session_id: &str,
     ) -> Option<HostSurfaceBinding> {
-        let registrations = lock(&self.inner.registrations);
-        let token = registrations.token_by_process.get(process_session_id)?;
-        let active = registrations.by_token.get(token)?;
-        let binding = *lock(active.surface_binding.as_ref());
+        // Detach the binding handle before releasing the registration-store
+        // guard.  Keeping a field borrow alive through the tail expression
+        // makes the compiler conservatively extend `registrations`' lifetime
+        // past the mutex guard, which fails on the production build.
+        let surface_binding = {
+            let registrations = lock(&self.inner.registrations);
+            let token = registrations.token_by_process.get(process_session_id)?;
+            let active = registrations.by_token.get(token)?;
+            Arc::clone(&active.surface_binding)
+        };
+        let binding = *lock(surface_binding.as_ref());
         binding
     }
 
