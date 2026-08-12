@@ -287,11 +287,13 @@ impl ConfigSidebarProjection {
         sections.push(section(
             "Projects",
             self.projects.iter().map(|row| row.label.clone()),
+            0,
             tokens,
         ));
         sections.push(section(
             "Servers",
             self.servers.iter().map(|row| row.label.clone()),
+            1,
             tokens,
         ));
         sections.push(section(
@@ -307,11 +309,13 @@ impl ConfigSidebarProjection {
                     }
                 )
             }),
+            2,
             tokens,
         ));
         sections.push(section(
             "Remote connections",
             self.ssh_connections.iter().map(|row| row.label.clone()),
+            3,
             tokens,
         ));
         div()
@@ -480,6 +484,7 @@ fn accessibility(role: AccessibleRole, name: &str) -> AccessibilityMetadata {
 fn section(
     title: &'static str,
     labels: impl IntoIterator<Item = String>,
+    section_id: usize,
     tokens: ThemeTokens,
 ) -> AnyElement {
     let rows = labels
@@ -488,7 +493,7 @@ fn section(
         .enumerate()
         .map(|(index, label)| div().id(("native-config-sidebar-row", index)).child(label));
     div()
-        .id(("native-config-sidebar-section", title))
+        .id(("native-config-sidebar-section", section_id))
         .flex()
         .flex_col()
         .gap(px(tokens.density.spacing.xs))

@@ -7006,7 +7006,7 @@ impl NativeShell {
             return;
         };
         self.cockpit.follow_task(task_id);
-        if let Some(model) = self.client_model.as_ref() {
+        if let Some(model) = self.client_model.clone() {
             self.cockpit
                 .follow_projection(model.as_ref(), self.granted_capabilities());
             self.sync_task_composer(model.as_ref(), task_id);
@@ -7210,6 +7210,11 @@ impl NativeShell {
             .as_ref()
             .map(|composer| composer.draft_text().chars().take(256).collect::<String>())
             .unwrap_or_default();
+        let draft_label = if draft.is_empty() {
+            "Prompt input · click and type".to_string()
+        } else {
+            draft
+        };
         div()
             .id("native-task-conversation-interactive")
             .w_full()
@@ -7224,11 +7229,7 @@ impl NativeShell {
                     .w_full()
                     .p(px(tokens.density.physical().control_padding as f32))
                     .bg(tokens.surfaces.sunken.to_gpui())
-                    .child(if draft.is_empty() {
-                        "Prompt input · click and type"
-                    } else {
-                        draft.as_str()
-                    }),
+                    .child(draft_label),
             )
             .child(
                 div()

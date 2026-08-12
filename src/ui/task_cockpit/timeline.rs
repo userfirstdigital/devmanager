@@ -3,7 +3,10 @@
 //! Production rows come only from [`SemanticJournalView`]. Caller-supplied
 //! raw `SemanticEvent` arrays are not part of the public API.
 
-use gpui::{div, px, AnyElement, InteractiveElement, IntoElement, ParentElement, Styled};
+use gpui::{
+    div, px, AnyElement, InteractiveElement, IntoElement, ParentElement,
+    StatefulInteractiveElement, Styled,
+};
 
 use crate::client::model::ClientModel;
 use crate::domain::id::{OperationId, TaskId};

@@ -390,19 +390,20 @@ impl TaskCockpitShell {
         tokens: crate::ui::tokens::ThemeTokens,
         composer: Option<&TaskComposer>,
     ) -> AnyElement {
+        let timeline_error = self.timeline_error.clone().unwrap_or_else(|| {
+            "Semantic timeline unavailable until an authenticated journal is admitted".to_string()
+        });
         let timeline = self
             .timeline
             .as_ref()
             .map(|timeline| timeline.surface(tokens))
-            .unwrap_or_else(|| {
+            .unwrap_or_else(move || {
                 div()
                     .id("native-semantic-timeline-hold")
                     .w_full()
                     .p(gpui::px(tokens.density.physical().control_padding as f32))
                     .bg(tokens.surfaces.raised.to_gpui())
-                    .child(self.timeline_error.as_deref().unwrap_or(
-                        "Semantic timeline unavailable until an authenticated journal is admitted",
-                    ))
+                    .child(timeline_error)
                     .into_any_element()
             });
         let composer = composer

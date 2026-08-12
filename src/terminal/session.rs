@@ -1680,6 +1680,24 @@ impl TerminalReplica {
         };
         terminal_buffer_lines(&term).join("\n")
     }
+
+    /// Bound replica scrollback to the exact host-admitted limit.
+    pub fn bound_history_exact(&self, max_lines: usize) {
+        let max_lines = max_lines.max(1);
+        let mut term = match self.term.lock() {
+            Ok(term) => term,
+            Err(error) => error.into_inner(),
+        };
+        term.set_options(configured_term(max_lines));
+    }
+
+    pub fn snapshot(&self) -> TerminalScreenSnapshot {
+        let term = match self.term.lock() {
+            Ok(term) => term,
+            Err(error) => error.into_inner(),
+        };
+        snapshot_term(&term)
+    }
 }
 
 impl Drop for TerminalSession {
