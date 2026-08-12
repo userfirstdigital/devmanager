@@ -565,22 +565,33 @@ impl CommandBus {
     pub fn query_with_capabilities(
         &self,
         granted: CapabilitySet,
+        max_document_bytes: u32,
         envelope: QueryEnvelope,
     ) -> Result<QueryReply, StoreError> {
         if matches!(envelope.query, Query::PromptLibrary(_)) {
-            let outcome = if granted.grants_personal_prompt_library() {
-                QueryOutcome::Err(QueryError::Unavailable {
-                    reason: prompt_unavailable_reason(
-                        PromptProjectionSubsystem::OwnerDeviceSession,
-                    ),
-                })
-            } else {
-                QueryOutcome::Err(QueryError::UnsupportedCapability)
-            };
-            return Ok(QueryReply {
-                request_id: envelope.request_id,
-                outcome,
-            });
+            if !granted.grants_personal_prompt_library() {
+                return Ok(QueryReply {
+                    request_id: envelope.request_id,
+                    outcome: QueryOutcome::Err(QueryError::UnsupportedCapability),
+                });
+            }
+            return self.query_host_authorized(max_document_bytes, envelope);
+        }
+        self.query(envelope)
+    }
+
+    /// Prompt-library query after the authenticated host has capability-gated
+    /// the request. Mints the sealed in-process paired-owner grant only at this
+    /// boundary; it never crosses the envelope.
+    pub(crate) fn query_host_authorized(
+        &self,
+        max_document_bytes: u32,
+        envelope: QueryEnvelope,
+    ) -> Result<QueryReply, StoreError> {
+        if matches!(envelope.query, Query::PromptLibrary(_)) {
+            let grant =
+                OwnerDeviceCapability::paired_owner_for_authenticated_client(envelope.client_id);
+            return self.query_with_owner_grant(&grant, max_document_bytes, envelope);
         }
         self.query(envelope)
     }
@@ -733,10 +744,12 @@ fn query_prompt_library(
     task_id: Option<TaskId>,
     query: crate::prompts::projection::PromptLibraryQuery,
 ) -> Result<QueryOutcome, StoreError> {
-    let request = PromptLibraryRequest::from_authenticated_query(
+    let request = match PromptLibraryRequest::from_authenticated_query(
         request_id, client_id, task_id, query, grant,
-    )
-    .map_err(|error| StoreError::Projection(format!("{error:?}")))?;
+    ) {
+        Ok(request) => request,
+        Err(error) => return Ok(QueryOutcome::Err(map_prompt_projection_error(error))),
+    };
     match project_prompt_store(grant, &request, store, max_document_bytes) {
         Ok(reply) => Ok(QueryOutcome::Ok(QueryResult::PromptLibrary(reply))),
         Err(error) => Ok(QueryOutcome::Err(map_prompt_projection_error(error))),

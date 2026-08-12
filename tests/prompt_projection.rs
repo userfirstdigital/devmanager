@@ -1067,16 +1067,165 @@ fn host_query_requires_granted_capability_and_keeps_search_unavailable() {
     assert_eq!(
         reply.outcome,
         QueryOutcome::Err(QueryError::Unavailable {
-            reason: "owner_device_session",
+            reason: "search_index",
         })
+    );
+    assert_ne!(
+        reply.outcome,
+        QueryOutcome::Err(QueryError::UnsupportedCapability)
+    );
+
+    let history = dispatch_host_request(
+        client_id(0x91),
+        granted_library(),
+        &mut bus,
+        ClientRequest::Query(QueryEnvelope {
+            request_id: request_id(0x9a),
+            client_id: client_id(0x91),
+            task_id: None,
+            query: Query::PromptLibrary(PromptLibraryQuery::HistoryPage {
+                cursor: None,
+                expected_revision: None,
+            }),
+        }),
+    )
+    .expect("granted history query reply");
+    let ServerMessage::QueryReply(reply) = history else {
+        panic!("expected query reply");
+    };
+    assert_eq!(
+        reply.outcome,
+        QueryOutcome::Err(QueryError::Unavailable {
+            reason: "history_store",
+        })
+    );
+}
+
+#[test]
+fn authenticated_prompt_query_uses_paired_owner_and_fails_closed() {
+    use devmanager::domain::query::{Query, QueryError, QueryOutcome, QueryResult};
+    use devmanager::host::{dispatch_host_request, IpcError};
+    use devmanager::kernel::CommandBus;
+    use devmanager::prompts::projection::PromptLibraryQuery;
+    use devmanager::protocol::{ClientRequest, FrameLimits, ServerMessage};
+
+    let dir = TempDir::new().expect("isolated host bus");
+    let mut bus = CommandBus::open(&dir.path().join("kernel.db")).expect("open bus");
+    let limit = FrameLimits::v1_default().max_physical_frame_bytes;
+    let metadata = QueryEnvelope {
+        request_id: request_id(0xa0),
+        client_id: client_id(0x91),
+        task_id: None,
+        query: Query::PromptLibrary(PromptLibraryQuery::MetadataPage {
+            namespace: PromptNamespace::Personal,
+            cursor: None,
+            expected_revision: None,
+        }),
+    };
+
+    let ungated = bus.query(metadata.clone()).expect("ungated query reply");
+    assert_eq!(
+        ungated.outcome,
+        QueryOutcome::Err(QueryError::UnsupportedCapability)
+    );
+
+    let denied = bus
+        .query_with_capabilities(CapabilitySet::empty(), limit, metadata.clone())
+        .expect("capability-denied query reply");
+    assert_eq!(
+        denied.outcome,
+        QueryOutcome::Err(QueryError::UnsupportedCapability)
+    );
+
+    let granted = dispatch_host_request(
+        client_id(0x91),
+        granted_library(),
+        &mut bus,
+        ClientRequest::Query(metadata.clone()),
+    )
+    .expect("granted authenticated metadata query");
+    let ServerMessage::QueryReply(reply) = granted else {
+        panic!("expected query reply");
+    };
+    match reply.outcome {
+        QueryOutcome::Ok(QueryResult::PromptLibrary(PromptProjectionReply::MetadataPage(page))) => {
+            assert!(page.items().is_empty());
+        }
+        QueryOutcome::Err(QueryError::Unavailable { reason }) => {
+            panic!("granted prompt query must not stay at {reason}")
+        }
+        QueryOutcome::Err(QueryError::UnsupportedCapability) => {
+            panic!("granted PromptProjection must not remain UnsupportedCapability")
+        }
+        other => panic!("expected metadata projection, got {other:?}"),
+    }
+
+    let foreign_envelope = dispatch_host_request(
+        client_id(0x91),
+        granted_library(),
+        &mut bus,
+        ClientRequest::Query(QueryEnvelope {
+            request_id: request_id(0xa1),
+            client_id: client_id(0x99),
+            task_id: None,
+            query: Query::PromptLibrary(PromptLibraryQuery::MetadataPage {
+                namespace: PromptNamespace::Personal,
+                cursor: None,
+                expected_revision: None,
+            }),
+        }),
+    );
+    assert!(
+        matches!(foreign_envelope, Err(IpcError::Unauthorized)),
+        "foreign envelope must not ride the authenticated client, got {foreign_envelope:?}"
+    );
+
+    let foreign_grant = testing::owner_grant(client_id(0x99)).expect("foreign sealed owner");
+    let rebound = bus
+        .query_with_owner_grant(&foreign_grant, limit, metadata.clone())
+        .expect("foreign grant is a query reply");
+    assert_eq!(
+        rebound.outcome,
+        QueryOutcome::Err(QueryError::UnsupportedCapability)
+    );
+
+    let zero = bus
+        .query_with_capabilities(granted_library(), 0, metadata)
+        .expect("zero negotiated limit stays a query reply");
+    assert_eq!(
+        zero.outcome,
+        QueryOutcome::Err(QueryError::Unavailable {
+            reason: "negotiated_transport_limit",
+        })
+    );
+
+    let invalid = bus
+        .query_with_capabilities(
+            granted_library(),
+            limit,
+            QueryEnvelope {
+                request_id: request_id(0xa2),
+                client_id: client_id(0x91),
+                task_id: None,
+                query: Query::PromptLibrary(PromptLibraryQuery::Search {
+                    namespace: PromptNamespace::Personal,
+                    query: "x".repeat(PROMPT_SEARCH_MAX_QUERY_BYTES + 1),
+                    cursor: None,
+                }),
+            },
+        )
+        .expect("oversized search stays a query reply");
+    assert_eq!(
+        invalid.outcome,
+        QueryOutcome::Err(QueryError::InvalidRequest)
     );
 }
 
 #[test]
 fn host_metadata_page_and_mutation_use_query_result_and_command_receipt() {
     use devmanager::domain::command::{Command, CommandEnvelope, CommandReceipt, RejectionCode};
-    use devmanager::domain::query::{Query, QueryError, QueryOutcome, QueryResult};
-    use devmanager::host::dispatch_host_request;
+    use devmanager::domain::query::{Query, QueryOutcome, QueryResult};
+    use devmanager::host::{dispatch_host_request, IpcError};
     use devmanager::kernel::CommandBus;
     use devmanager::prompts::projection::PromptLibraryQuery;
     use devmanager::protocol::{ClientRequest, FrameLimits, ServerMessage};
@@ -1102,18 +1251,14 @@ fn host_metadata_page_and_mutation_use_query_result_and_command_receipt() {
     };
     let bypass = dispatch_host_request(
         client_id(0x91),
-        granted_library(),
+        CapabilitySet::empty(),
         &mut bus,
         ClientRequest::Command(create_intent.clone()),
-    )
-    .expect("hello-bit command still returns a receipt");
-    let ServerMessage::CommandReceipt(CommandReceipt::Rejected {
-        code: RejectionCode::UnsupportedCapability,
-        ..
-    }) = bypass
-    else {
-        panic!("Hello bits must not mutate PromptLibrary, got {bypass:?}");
-    };
+    );
+    assert!(
+        matches!(bypass, Err(IpcError::UnsupportedCapability)),
+        "ungranted PromptProjection must not mutate PromptLibrary, got {bypass:?}"
+    );
 
     let grant = testing::owner_grant(client_id(0x91)).expect("sealed owner");
     let mut granted_intent = create_intent;
@@ -1227,16 +1372,21 @@ fn host_metadata_page_and_mutation_use_query_result_and_command_receipt() {
             }),
         }),
     )
-    .expect("hello-bit metadata query");
+    .expect("authenticated metadata query");
     let ServerMessage::QueryReply(hello_reply) = hello_page else {
         panic!("expected query reply");
     };
-    assert_eq!(
-        hello_reply.outcome,
-        QueryOutcome::Err(QueryError::Unavailable {
-            reason: "owner_device_session",
-        })
-    );
+    let QueryOutcome::Ok(QueryResult::PromptLibrary(PromptProjectionReply::MetadataPage(
+        hello_page,
+    ))) = hello_reply.outcome
+    else {
+        panic!(
+            "granted PromptProjection must reach metadata projection, got {:?}",
+            hello_reply.outcome
+        );
+    };
+    assert_eq!(hello_page.items().len(), 1);
+    assert_eq!(hello_page.library_revision(), 1);
 
     let page = bus
         .query_with_owner_grant(

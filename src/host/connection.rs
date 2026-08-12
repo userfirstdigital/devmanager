@@ -40,8 +40,8 @@ use crate::kernel::{
     SessionScope, SnapshotError, SnapshotSession, StoreError,
 };
 use crate::protocol::{
-    Capability, CapabilitySet, ClientRequest, DetachAck, DetachRequest, NegotiatedParameters,
-    ServerMessage, StreamFrame, StreamKey, UpdateHandoffReply,
+    Capability, CapabilitySet, ClientRequest, DetachAck, DetachRequest, FrameLimits,
+    NegotiatedParameters, ServerMessage, StreamFrame, StreamKey, UpdateHandoffReply,
 };
 use crate::terminal::protocol::TerminalSpec;
 use crate::terminal::service::AttachedTerminalRuntime;
@@ -3248,7 +3248,11 @@ impl HostRequestExecutor {
                     });
                 }
                 self.bus
-                    .query_with_capabilities(negotiated.capabilities, envelope)
+                    .query_with_capabilities(
+                        negotiated.capabilities,
+                        negotiated.limits.max_physical_frame_bytes,
+                        envelope,
+                    )
                     .map_err(map_store_error)
             }
             Query::TaskCockpit(query) => {
@@ -4408,7 +4412,11 @@ fn dispatch_authenticated_request_inner(
                         }));
                     }
                     let reply = bus
-                        .query_with_capabilities(capabilities, envelope)
+                        .query_with_capabilities(
+                            capabilities,
+                            FrameLimits::v1_default().max_physical_frame_bytes,
+                            envelope,
+                        )
                         .map_err(map_store_error)?;
                     return Ok(ServerMessage::QueryReply(reply));
                 }
