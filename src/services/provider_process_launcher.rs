@@ -137,10 +137,22 @@ mod tests {
         kind: ProviderKind,
         exact_resume: CapabilitySupport,
     ) -> ProviderCapabilities {
+        test_capabilities_with_auth(
+            kind,
+            exact_resume,
+            ProviderAuthState::AuthenticatedSubscription,
+        )
+    }
+
+    fn test_capabilities_with_auth(
+        kind: ProviderKind,
+        exact_resume: CapabilitySupport,
+        auth_state: ProviderAuthState,
+    ) -> ProviderCapabilities {
         ProviderCapabilities {
             kind,
             version: ProviderVersion::new("1.0.0-test").expect("version"),
-            auth_state: ProviderAuthState::Unknown,
+            auth_state,
             exact_resume,
             semantic_events: CapabilitySupport::Unsupported,
             provider_session_id: exact_resume,
@@ -179,6 +191,53 @@ mod tests {
             std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             BTreeMap::new(),
             test_capabilities(kind, exact_resume),
+            task_id,
+            resource_id,
+            TerminalId::new(),
+            generation,
+            launch_nonce,
+        );
+        ProviderRuntimeLaunchRequest::sealed(
+            RuntimeCorrelation::sealed(
+                task_id,
+                agent_session_id,
+                kind,
+                generation,
+                4,
+                launch_nonce,
+            ),
+            launch_spec,
+        )
+    }
+
+    fn launch_request_with_auth(
+        kind: ProviderKind,
+        exact_resume: CapabilitySupport,
+        auth_state: ProviderAuthState,
+        mode: ProviderLaunchMode,
+        arguments: Vec<OsString>,
+    ) -> ProviderRuntimeLaunchRequest {
+        let executable = ProviderExecutable::from_path(if cfg!(windows) {
+            PathBuf::from(r"C:\Windows\System32\cmd.exe")
+        } else {
+            std::env::current_exe().expect("exe")
+        })
+        .expect("identity");
+        let generation = 3;
+        let task_id = TaskId::parse("018f60b0-9c1a-7001-8000-00000000000b").expect("task");
+        let resource_id =
+            ResourceId::parse("018f60b0-9c1a-7001-8000-000000000057").expect("resource");
+        let agent_session_id =
+            AgentSessionId::parse("018f60b0-9c1a-7001-8000-000000000021").expect("agent");
+        let launch_nonce = LaunchNonce::new();
+        let launch_spec = ProviderLaunchSpec::sealed(
+            kind,
+            executable,
+            mode,
+            arguments,
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            BTreeMap::new(),
+            test_capabilities_with_auth(kind, exact_resume, auth_state),
             task_id,
             resource_id,
             TerminalId::new(),
@@ -277,5 +336,40 @@ mod tests {
             runtime_generation: 3,
             revision: 0,
         };
+    }
+
+    #[test]
+    fn stock_claude_and_codex_launches_require_subscription_auth() {
+        let manager = ProcessManager::new();
+        let mut launcher = manager.provider_process_launcher();
+        for kind in [ProviderKind::ClaudeCode, ProviderKind::Codex] {
+            let fresh = launch_request_with_auth(
+                kind,
+                CapabilitySupport::Supported,
+                ProviderAuthState::Unknown,
+                ProviderLaunchMode::NewConversation,
+                Vec::new(),
+            );
+            assert!(matches!(
+                launcher.launch(&fresh),
+                ProviderLaunchOutcome::Rejected(ProviderLaunchError::AuthenticationRequired)
+            ));
+
+            let exact = launch_request_with_auth(
+                kind,
+                CapabilitySupport::Supported,
+                ProviderAuthState::Unknown,
+                ProviderLaunchMode::ResumeExact(
+                    ProviderSessionId::new("exact-session").expect("session"),
+                ),
+                vec![OsString::from("--resume"), OsString::from("exact-session")],
+            );
+            assert!(matches!(
+                launcher.launch(&exact),
+                ProviderLaunchOutcome::Rejected(ProviderLaunchError::ExactResumeFailed(
+                    crate::providers::session::ExactResumeFailure::AuthRequired
+                ))
+            ));
+        }
     }
 }

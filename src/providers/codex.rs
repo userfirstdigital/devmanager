@@ -760,6 +760,17 @@ impl CodexIdentityAuthority {
         };
         let registry = Arc::clone(&self.registry);
         let registration = self.registration.clone();
+        // Keep the adapter's typed identity error visible even though the
+        // registry independently rejects a mismatched SessionStart before it
+        // reaches the publication closure.
+        if let Some(observed) = session_id.as_ref() {
+            if registry
+                .bound_provider_session_id(&registration.nonce)
+                .is_some_and(|bound| bound != observed.as_str())
+            {
+                return Err(CodexIdentityError::AlreadyBound);
+            }
+        }
         let admitted =
             registry.admit_and_publish(&registration, &observation, body, || match session_id {
                 Some(session_id) => self.bind_first_unchecked(session_id),

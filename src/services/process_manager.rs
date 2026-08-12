@@ -2361,9 +2361,7 @@ impl ProcessManager {
         use std::collections::HashMap;
         use std::time::Duration;
 
-        if request.launch_spec().generation() == 0
-            || request.correlation().action_epoch() == 0
-        {
+        if request.launch_spec().generation() == 0 || request.correlation().action_epoch() == 0 {
             return Err(ProviderLaunchError::ZeroProcessId);
         }
         // Cursor's stock CLI can be launched as a fresh interactive runtime,
@@ -2377,6 +2375,28 @@ impl ProcessManager {
             )
         {
             return Err(ProviderLaunchError::Unsupported);
+        }
+        // Stock Claude Code and Codex are subscription-backed CLIs in
+        // DevManager. The adapter capability snapshot is the only accepted
+        // auth proof; Unknown/API-key/auth-required evidence must fail before
+        // a Job/PTY is created. An exact-resume request keeps the stronger
+        // typed resume failure so callers cannot turn this into a fresh chat.
+        if matches!(
+            request.provider_kind(),
+            ProviderKind::ClaudeCode | ProviderKind::Codex
+        ) && request.capabilities().auth_state
+            != crate::providers::capabilities::ProviderAuthState::AuthenticatedSubscription
+        {
+            return Err(match request.launch_spec().mode() {
+                crate::providers::session::ProviderLaunchMode::ResumeExact(_) => {
+                    ProviderLaunchError::ExactResumeFailed(
+                        crate::providers::session::ExactResumeFailure::AuthRequired,
+                    )
+                }
+                crate::providers::session::ProviderLaunchMode::NewConversation => {
+                    ProviderLaunchError::AuthenticationRequired
+                }
+            });
         }
         #[cfg(not(windows))]
         {
@@ -7885,15 +7905,27 @@ fn bind_runtime_provider_session_id(
     pty_session_id: &str,
     provider_session_id: String,
 ) {
-    if let Ok(provider_session_id) =
+    let Ok(provider_session_id) =
         crate::domain::ProviderSessionId::new(provider_session_id.clone())
+    else {
+        return;
+    };
+    // SessionStart is write-once for a live PTY generation. The registry is
+    // the primary fence, but keep this ProcessManager projection fail-closed
+    // as well so a late adapter callback can never rebind a running session to
+    // a different conversation identity.
     {
-        if let Ok(mut book) = inner.provider_runtime.lock() {
-            for live in book.live.values_mut() {
-                if live.session_id == pty_session_id {
-                    live.provider_session_id = Some(provider_session_id.clone());
-                }
-            }
+        let Ok(book) = inner.provider_runtime.lock() else {
+            return;
+        };
+        if book.live.values().any(|live| {
+            live.session_id == pty_session_id
+                && live
+                    .provider_session_id
+                    .as_ref()
+                    .is_some_and(|bound| bound != &provider_session_id)
+        }) {
+            return;
         }
     }
     let changed = {
@@ -7903,14 +7935,28 @@ fn bind_runtime_provider_session_id(
         let Some(session) = runtime.sessions.get_mut(pty_session_id) else {
             return;
         };
+        if session
+            .provider_session_id
+            .as_deref()
+            .is_some_and(|bound| bound != provider_session_id.as_str())
+        {
+            return;
+        }
         if session.provider_session_id.as_deref() == Some(provider_session_id.as_str()) {
             false
         } else {
-            session.provider_session_id = Some(provider_session_id);
+            session.provider_session_id = Some(provider_session_id.clone());
             session.mark_dirty();
             true
         }
     };
+    if let Ok(mut book) = inner.provider_runtime.lock() {
+        for live in book.live.values_mut() {
+            if live.session_id == pty_session_id {
+                live.provider_session_id = Some(provider_session_id.clone());
+            }
+        }
+    }
     if changed {
         bump_runtime_revision(inner);
         emit_tracked_remote_runtime_snapshot(inner, pty_session_id);
@@ -10020,7 +10066,7 @@ mod tests {
                 changed.as_bytes(),
                 3,
             ),
-            crate::ai::codex_hooks::CodexRelayIngestStatus::Accepted
+            crate::ai::codex_hooks::CodexRelayIngestStatus::Rejected
         );
         assert_eq!(
             manager
@@ -10029,9 +10075,9 @@ mod tests {
                 .get("codex-runtime")
                 .and_then(|session| session.provider_session_id.clone())
                 .as_deref(),
-            Some("codex-provider-2")
+            Some("codex-provider")
         );
-        assert!(manager.runtime_revision() > after_codex);
+        assert_eq!(manager.runtime_revision(), after_codex);
     }
 
     fn browser_provider_replay_plan(

@@ -3,7 +3,7 @@
 //! Mirrors the Claude hooks relay (`claude_hooks.rs`).
 
 use crate::ai::claude_hooks::is_valid_loopback_relay_url_for;
-use crate::domain::{AgentSessionId, TaskId};
+use crate::domain::{AgentSessionId, ProviderSessionId, TaskId};
 use crate::process::identity::ManagedProcessId;
 use crate::remote::presentation::{
     SemanticEventDraft, SemanticEventKind, SemanticRetention, SemanticSource, SemanticToolState,
@@ -455,6 +455,10 @@ struct RegisteredCodexSession {
     stable_session_key: StableSessionKey,
     generation: u64,
     reducer: CodexHookReducer,
+    /// The provider-issued conversation identity for this exact launch
+    /// generation. It is deliberately write-once: a PTY/relay nonce is not a
+    /// substitute for the provider's SessionStart identity.
+    provider_session_id: Option<ProviderSessionId>,
 }
 
 struct CodexRegistryState {
@@ -566,6 +570,7 @@ impl CodexHookRegistry {
                 stable_session_key: stable_session_key.clone(),
                 generation,
                 reducer: CodexHookReducer::new(stable_session_key.clone()),
+                provider_session_id: None,
             },
         );
         Ok(CodexHookRegistration {
@@ -609,6 +614,20 @@ impl CodexHookRegistry {
             stable_session_key: session.stable_session_key.clone(),
             generation: session.generation,
         })
+    }
+
+    /// Return the identity already accepted for one live nonce. This is a
+    /// read-only adapter seam used to preserve the adapter's typed
+    /// AlreadyBound/Replay errors while the registry independently rejects a
+    /// mismatched SessionStart before publication.
+    pub(crate) fn bound_provider_session_id(&self, nonce: &str) -> Option<String> {
+        let _publication = self.publication_gate.read().ok()?;
+        let state = self.state.lock().ok()?;
+        let session = state.registrations.get(nonce)?;
+        session
+            .provider_session_id
+            .as_ref()
+            .map(|id| id.as_str().to_string())
     }
 
     #[cfg(test)]
@@ -755,10 +774,21 @@ impl CodexHookRegistry {
         let Some(session) = state.registrations.get_mut(&expected.nonce) else {
             return Ok(None);
         };
+        if !admit_provider_identity(session, &payload) {
+            return Ok(None);
+        }
         // The publication read-lock and registry state lock remain held while
         // the adapter commits its identity decision. The operation must only
         // mutate adapter-local state; registry callbacks would deadlock.
         let admitted = operation()?;
+        if let Some(provider_session_id) = session_start_provider_session_id(&payload) {
+            // `admit_provider_identity` has already checked the existing
+            // value. Commit only after the adapter operation succeeds, so a
+            // failed/stale adapter admission cannot poison this generation.
+            if session.provider_session_id.is_none() {
+                session.provider_session_id = Some(provider_session_id);
+            }
+        }
         let reduction = session
             .reducer
             .apply_json(&payload, observation.occurred_at_epoch_ms);
@@ -801,6 +831,39 @@ impl CodexHookRegistry {
             ),
         }
     }
+}
+
+fn session_start_provider_session_id(payload: &Value) -> Option<ProviderSessionId> {
+    (string_field(payload, "hook_event_name") == Some("SessionStart"))
+        .then(|| string_field(payload, "session_id"))
+        .flatten()
+        .and_then(|raw| ProviderSessionId::new(raw.to_string()).ok())
+}
+
+fn admit_provider_identity(session: &RegisteredCodexSession, payload: &Value) -> bool {
+    let event_name = string_field(payload, "hook_event_name");
+    if event_name == Some("SessionStart") {
+        let Some(observed) = session_start_provider_session_id(payload) else {
+            return false;
+        };
+        return session
+            .provider_session_id
+            .as_ref()
+            .is_none_or(|bound| bound == &observed);
+    }
+
+    // Known semantic events must carry the exact identity already established
+    // by SessionStart. Unknown provider events remain redacted by the adapter
+    // and do not cross this identity boundary.
+    if !event_name.is_some_and(|name| CODEX_HOOK_EVENTS.contains(&name)) {
+        return true;
+    }
+    let Some(bound) = session.provider_session_id.as_ref() else {
+        return false;
+    };
+    string_field(payload, "session_id")
+        .and_then(|raw| ProviderSessionId::new(raw.to_string()).ok())
+        .is_some_and(|observed| observed.as_str() == bound.as_str())
 }
 
 /// Loopback HTTP listener for `codex-hook-relay` POSTs. One per process,
@@ -1429,6 +1492,106 @@ mod registry_tests {
                     && binding.transcript_path.as_deref()
                         == Some(std::path::Path::new("C:\\sessions\\rollout-a.jsonl"))
         )));
+    }
+
+    #[test]
+    fn session_start_identity_is_write_once_and_generation_scoped() {
+        let registry = CodexHookRegistry::default();
+        let events = collecting_handler(&registry);
+        let registration = registry.register(StableSessionKey::from_tab("t1")).unwrap();
+        assert_eq!(
+            registry
+                .ingest(
+                    loopback_peer(),
+                    &registration.nonce,
+                    &session_start_body("first"),
+                    1,
+                )
+                .status(),
+            CodexRelayIngestStatus::Accepted
+        );
+        assert_eq!(
+            registry
+                .ingest(
+                    loopback_peer(),
+                    &registration.nonce,
+                    &session_start_body("different"),
+                    2,
+                )
+                .status(),
+            CodexRelayIngestStatus::Rejected
+        );
+        assert_eq!(
+            registry
+                .bound_provider_session_id(&registration.nonce)
+                .as_deref(),
+            Some("first")
+        );
+        assert_eq!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, event)| matches!(event, CodexRegistryEvent::SessionStarted(_)))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn session_start_missing_or_invalid_identity_is_rejected() {
+        let registry = CodexHookRegistry::default();
+        let registration = registry.register(StableSessionKey::from_tab("t1")).unwrap();
+        for body in [
+            br#"{"hook_event_name":"SessionStart"}"#.to_vec(),
+            br#"{"hook_event_name":"SessionStart","session_id":" "}"#.to_vec(),
+            br#"{"hook_event_name":"SessionStart","session_id":"bad\nid"}"#.to_vec(),
+        ] {
+            assert_eq!(
+                registry
+                    .ingest(loopback_peer(), &registration.nonce, &body, 1)
+                    .status(),
+                CodexRelayIngestStatus::Rejected
+            );
+        }
+        assert_eq!(
+            registry.bound_provider_session_id(&registration.nonce),
+            None
+        );
+    }
+
+    #[test]
+    fn known_semantic_event_must_match_bound_identity() {
+        let registry = CodexHookRegistry::default();
+        let registration = registry.register(StableSessionKey::from_tab("t1")).unwrap();
+        assert_eq!(
+            registry
+                .ingest(
+                    loopback_peer(),
+                    &registration.nonce,
+                    &session_start_body("bound"),
+                    1,
+                )
+                .status(),
+            CodexRelayIngestStatus::Accepted
+        );
+        let different = serde_json::json!({
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "other",
+            "prompt": "do not cross the boundary"
+        })
+        .to_string();
+        assert_eq!(
+            registry
+                .ingest(
+                    loopback_peer(),
+                    &registration.nonce,
+                    different.as_bytes(),
+                    2,
+                )
+                .status(),
+            CodexRelayIngestStatus::Rejected
+        );
     }
 
     #[test]
