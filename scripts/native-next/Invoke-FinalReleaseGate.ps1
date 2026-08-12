@@ -15,8 +15,9 @@
 
   -SkipWeb and -SkipSmokes are explicit opt-in escapes. Either one makes the
   overall result HOLD, never PASS. A missing, unsafe, or typed-HOLD smoke is
-  also HOLD. Provider smoke fixture HOLD is recorded as a dependency result
-  and is never converted to PASS.
+  also HOLD. Fixture provider smoke success is PASS when the typed JSON
+  disposition is success; a typed HOLD stays HOLD; a typed rejection or
+  malformed typed result is FAIL.
 
 .PARAMETER RepoRoot
   Git worktree root. Must canonicalize to this script's worktree.
@@ -109,6 +110,36 @@ $script:ForbiddenSmokeNames = [string[]]@(
     'Start-NativeNext.ps1',
     'Stop-NativeNext.ps1'
 )
+$script:SupplyableSmokeParamNames = [string[]]@(
+    'IsolatedProfile',
+    'OutputDir',
+    'TimeoutSeconds',
+    'DeadlineMs',
+    'MaxOutputBytes',
+    'RepoRoot',
+    'RunId'
+)
+$script:FixtureOnlySmokeSwitches = [string[]]@(
+    'Fixture',
+    'IncludeProjectionFixture',
+    'IncludeRecovery'
+)
+$script:ForbiddenSmokeParamNames = [string[]]@(
+    'Authenticated',
+    'Provider',
+    'IAcknowledgeIsolatedNonproductionProfile',
+    'HostRegistered',
+    'Install',
+    'Publish',
+    'Tag',
+    'Release',
+    'Soak',
+    'Kill',
+    'Stop',
+    'Start',
+    'ExtractInstallers'
+)
+$script:OwnedResidueHelperLeafPattern = '(?i)^(cargo|rustc|rustdoc|clippy-driver|npm|node|cmd|pwsh)(\.exe|\.cmd|\.bat)?$'
 
 function Get-FinalReleaseProcessEnvironmentSnapshot {
     $map = @{}
@@ -294,7 +325,7 @@ function Test-FinalReleaseSmokeContractSafe {
         if ($script:UnsafeParamNames -contains $name -and [bool]$parameter.mandatory) {
             return [pscustomobject]@{ safe = $false; reason = "mandatory-unsafe-param:$name" }
         }
-        if ([bool]$parameter.mandatory -and $name -notin @('IsolatedProfile', 'TimeoutSeconds', 'DeadlineMs', 'MaxOutputBytes', 'RepoRoot', 'RunId')) {
+        if ([bool]$parameter.mandatory -and $name -notin $script:SupplyableSmokeParamNames) {
             if (-not [bool]$parameter.isSwitch) {
                 return [pscustomobject]@{ safe = $false; reason = "mandatory-undiscoverable-param:$name" }
             }
@@ -310,7 +341,8 @@ function Get-FinalReleaseSmokeCatalog {
     $groups = @(
         [pscustomobject]@{ id = 'workspace-smoke'; leaves = @('Invoke-WorkspaceSmoke.ps1') },
         [pscustomobject]@{ id = 'provider-smoke'; leaves = @('Invoke-ProviderSmoke.ps1') },
-        [pscustomobject]@{ id = 'browser-smoke'; leaves = @('Invoke-BrowserSmoke.ps1', 'Invoke-BrowserFixtureSmoke.ps1') },
+        [pscustomobject]@{ id = 'browser-surface-proof'; leaves = @('Invoke-BrowserSurfaceProof.ps1') },
+        [pscustomobject]@{ id = 'browser-provider-e2e'; leaves = @('Invoke-BrowserProviderE2E.ps1') },
         [pscustomobject]@{ id = 'prompt-smoke'; leaves = @('Invoke-PromptLibrarySmoke.ps1', 'Invoke-PromptSmoke.ps1') }
     )
     $items = New-Object System.Collections.Generic.List[object]
@@ -373,25 +405,330 @@ function New-FinalReleaseCommandRecord {
     }
 }
 
-function Get-FinalReleaseOwnedResidue {
+function Get-FinalReleaseProcessCommandLine {
+    param([Parameter(Mandatory = $true)]$CimProcess)
+
+    if ($null -eq $CimProcess -or $null -eq $CimProcess.PSObject.Properties['CommandLine']) {
+        return $null
+    }
+    $raw = $CimProcess.CommandLine
+    if ($null -eq $raw) { return $null }
+    $text = [string]$raw
+    if ([string]::IsNullOrWhiteSpace($text)) { return $null }
+    return $text
+}
+
+function Test-FinalReleaseCommandLineMentionsPath {
     param(
+        [string]$CommandLine,
+        [Parameter(Mandatory = $true)][string]$LiteralPath
+    )
+
+    if ([string]::IsNullOrWhiteSpace($CommandLine) -or [string]::IsNullOrWhiteSpace($LiteralPath)) {
+        return $false
+    }
+    $candidates = New-Object System.Collections.Generic.List[string]
+    try {
+        $candidates.Add((Normalize-DevManagerPath -LiteralPath $LiteralPath))
+    }
+    catch {
+        return $false
+    }
+    try {
+        $candidates.Add([System.IO.Path]::GetFullPath($LiteralPath).TrimEnd('\', '/'))
+    }
+    catch {
+    }
+    foreach ($candidate in @($candidates | Select-Object -Unique)) {
+        if ($CommandLine.IndexOf($candidate, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Test-FinalReleaseInstalledDevManagerExecutable {
+    param([Parameter(Mandatory = $true)][string]$ExecutablePath)
+
+    if ([string]::IsNullOrWhiteSpace($ExecutablePath)) { return $false }
+    $normalized = $null
+    try {
+        $normalized = Normalize-DevManagerPath -LiteralPath $ExecutablePath
+    }
+    catch {
+        return $false
+    }
+    foreach ($install in @(Get-DevManagerSupportedInstallPaths)) {
+        if ($normalized -eq (Normalize-DevManagerPath -LiteralPath ([string]$install))) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Test-FinalReleaseOwnedResidueTie {
+    param(
+        [Parameter(Mandatory = $true)][string]$ExecutablePath,
+        [string]$CommandLine,
         [Parameter(Mandatory = $true)][string]$CargoTargetDir,
         [Parameter(Mandatory = $true)][string]$RunDirectory
     )
 
-    $cim = @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop)
+    if (Test-FinalReleaseInstalledDevManagerExecutable -ExecutablePath $ExecutablePath) {
+        return $false
+    }
+
+    $exeTied = $false
+    try {
+        $exeTied = (
+            (Test-DevManagerPathEqualsOrBeneath -LiteralPath $ExecutablePath -AncestorPath $CargoTargetDir) -or
+            (Test-DevManagerPathEqualsOrBeneath -LiteralPath $ExecutablePath -AncestorPath $RunDirectory)
+        )
+    }
+    catch {
+        $exeTied = $false
+    }
+    if ($exeTied) { return $true }
+
+    $cmdTied = (
+        (Test-FinalReleaseCommandLineMentionsPath -CommandLine $CommandLine -LiteralPath $CargoTargetDir) -or
+        (Test-FinalReleaseCommandLineMentionsPath -CommandLine $CommandLine -LiteralPath $RunDirectory)
+    )
+    if (-not $cmdTied) { return $false }
+
+    $leaf = [System.IO.Path]::GetFileName($ExecutablePath)
+    return [bool]($leaf -match $script:OwnedResidueHelperLeafPattern)
+}
+
+function Get-FinalReleaseOwnedResidue {
+    param(
+        [Parameter(Mandatory = $true)][string]$CargoTargetDir,
+        [Parameter(Mandatory = $true)][string]$RunDirectory,
+        [object[]]$CimProcesses
+    )
+
+    $cim = @(
+        if ($null -eq $CimProcesses) {
+            Get-CimInstance -ClassName Win32_Process -ErrorAction Stop
+        }
+        else {
+            $CimProcesses
+        }
+    )
     $owned = New-Object System.Collections.Generic.List[object]
     foreach ($proc in $cim) {
         $entry = Get-DevManagerProcessInventoryEntry -CimProcess $proc
         if ($null -eq $entry) { continue }
-        $exe = [string]$entry.executablePath
-        $underTarget = Test-DevManagerPathEqualsOrBeneath -LiteralPath $exe -AncestorPath $CargoTargetDir
-        $underRun = Test-DevManagerPathEqualsOrBeneath -LiteralPath $exe -AncestorPath $RunDirectory
-        if ($underTarget -or $underRun) {
-            $owned.Add($entry)
+        $commandLine = Get-FinalReleaseProcessCommandLine -CimProcess $proc
+        if (-not (Test-FinalReleaseOwnedResidueTie `
+                    -ExecutablePath ([string]$entry.executablePath) `
+                    -CommandLine $commandLine `
+                    -CargoTargetDir $CargoTargetDir `
+                    -RunDirectory $RunDirectory)) {
+            continue
         }
+        $owned.Add([pscustomobject]@{
+                processId       = [uint32]$entry.processId
+                executablePath  = [string]$entry.executablePath
+                creationDate    = [string]$entry.creationDate
+                parentProcessId = $(if ($null -ne $entry.PSObject.Properties['parentProcessId']) { [uint32]$entry.parentProcessId } else { [uint32]0 })
+                commandLine     = $commandLine
+            })
     }
     return , ([object[]]@($owned | Sort-Object processId, executablePath, creationDate))
+}
+
+function Resolve-FinalReleaseWindowsCmd {
+    $windowsRoot = [Environment]::GetFolderPath('Windows')
+    if ([string]::IsNullOrWhiteSpace($windowsRoot)) {
+        $windowsRoot = [string]$env:SystemRoot
+    }
+    if ([string]::IsNullOrWhiteSpace($windowsRoot)) {
+        $windowsRoot = [string]$env:WINDIR
+    }
+    if ([string]::IsNullOrWhiteSpace($windowsRoot)) {
+        throw 'Unable to resolve the Windows directory for cmd.exe.'
+    }
+    $cmd = [System.IO.Path]::GetFullPath((Join-Path $windowsRoot 'System32\cmd.exe'))
+    if (-not (Test-Path -LiteralPath $cmd -PathType Leaf)) {
+        throw "System32 cmd.exe is missing ('$cmd')."
+    }
+    if ([System.IO.Path]::GetFileName($cmd) -ine 'cmd.exe') {
+        throw "Rejected non-cmd.exe host ('$cmd')."
+    }
+    Assert-DevManagerPathHasNoReparsePoints -LiteralPath $cmd
+    return $cmd
+}
+
+function Resolve-FinalReleaseNpmLaunch {
+    param([Parameter(Mandatory = $true)][string]$NpmPath)
+
+    $full = [System.IO.Path]::GetFullPath($NpmPath)
+    $leaf = [System.IO.Path]::GetFileName($full)
+    if ($leaf -ieq 'npm.exe') {
+        return [pscustomobject]@{
+            executable      = $full
+            argumentPrefix  = [string[]]@()
+            wrapper         = $null
+        }
+    }
+    if ($leaf -ine 'npm.cmd' -and $leaf -ine 'npm.bat') {
+        throw "Resolved npm is not npm.cmd or npm.exe ('$full')."
+    }
+    $cmd = Resolve-FinalReleaseWindowsCmd
+    return [pscustomobject]@{
+        executable     = $cmd
+        argumentPrefix = [string[]]@('/d', '/c', $full)
+        wrapper        = $cmd
+    }
+}
+
+function Resolve-FinalReleaseTypedResult {
+    param(
+        [string]$Stdout,
+        [object]$ExitCode
+    )
+
+    $empty = [pscustomobject]@{
+        typed   = $false
+        status  = $null
+        reason  = 'empty-output'
+        payload = $null
+    }
+    $text = if ($null -eq $Stdout) { '' } else { [string]$Stdout.Trim() }
+    if ([string]::IsNullOrWhiteSpace($text)) { return $empty }
+
+    $payload = $null
+    try {
+        $payload = $text | ConvertFrom-Json -ErrorAction Stop
+    }
+    catch {
+        $lines = @(
+            $text -split "`r?`n" |
+                ForEach-Object { $_.Trim() } |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+        )
+        if ($lines.Count -eq 0) {
+            return [pscustomobject]@{ typed = $false; status = $null; reason = 'unparseable'; payload = $null }
+        }
+        try {
+            $payload = $lines[-1] | ConvertFrom-Json -ErrorAction Stop
+        }
+        catch {
+            return [pscustomobject]@{ typed = $false; status = $null; reason = 'unparseable'; payload = $null }
+        }
+    }
+    if ($null -eq $payload -or $payload -is [object[]] -or $null -eq $payload.PSObject) {
+        return [pscustomobject]@{ typed = $false; status = $null; reason = 'unparseable'; payload = $null }
+    }
+
+    $hasDisposition = $null -ne $payload.PSObject.Properties['disposition']
+    $hasStatus = $null -ne $payload.PSObject.Properties['status']
+    $hasPass = $null -ne $payload.PSObject.Properties['pass']
+    if (-not $hasDisposition -and -not $hasStatus -and -not $hasPass) {
+        return [pscustomobject]@{ typed = $false; status = $null; reason = 'no-typed-fields'; payload = $payload }
+    }
+
+    if (($hasDisposition -or $hasStatus) -and $null -ne $payload.PSObject.Properties['schemaVersion']) {
+        $schemaVersion = $payload.schemaVersion
+        if (-not (Test-DevManagerIntegralNumber -Value $schemaVersion) -or [int64]$schemaVersion -ne 1) {
+            return [pscustomobject]@{ typed = $true; status = 'FAIL'; reason = 'typed-schema-mismatch'; payload = $payload }
+        }
+    }
+
+    $token = $null
+    if ($hasDisposition) { $token = [string]$payload.disposition }
+    elseif ($hasStatus) { $token = [string]$payload.status }
+
+    $passFlag = $null
+    if ($hasPass) {
+        if ($payload.pass -isnot [bool] -and $payload.pass -isnot [int] -and $payload.pass -isnot [long]) {
+            return [pscustomobject]@{ typed = $true; status = 'FAIL'; reason = 'malformed-pass'; payload = $payload }
+        }
+        $passFlag = [bool]$payload.pass
+    }
+
+    if ([string]::IsNullOrWhiteSpace($token)) {
+        if ($passFlag -eq $true) {
+            return [pscustomobject]@{ typed = $true; status = 'PASS'; reason = 'typed-pass'; payload = $payload }
+        }
+        if ($hasPass) {
+            return [pscustomobject]@{ typed = $true; status = 'FAIL'; reason = 'typed-pass-false'; payload = $payload }
+        }
+        return [pscustomobject]@{ typed = $false; status = $null; reason = 'no-typed-token'; payload = $payload }
+    }
+
+    switch -Regex ($token.Trim()) {
+        '^(?i)hold$' {
+            if ($passFlag -eq $true) {
+                return [pscustomobject]@{ typed = $true; status = 'FAIL'; reason = 'inconsistent-typed-result'; payload = $payload }
+            }
+            return [pscustomobject]@{ typed = $true; status = 'HOLD'; reason = 'typed-hold'; payload = $payload }
+        }
+        '^(?i)(rejected|reject|fail|failure)$' {
+            return [pscustomobject]@{ typed = $true; status = 'FAIL'; reason = 'typed-rejected'; payload = $payload }
+        }
+        '^(?i)(pass|passed|success|successful)$' {
+            if ($passFlag -eq $false) {
+                return [pscustomobject]@{ typed = $true; status = 'FAIL'; reason = 'inconsistent-typed-result'; payload = $payload }
+            }
+            if ($null -ne $ExitCode -and [int]$ExitCode -ne 0) {
+                return [pscustomobject]@{ typed = $true; status = 'FAIL'; reason = 'typed-pass-nonzero-exit'; payload = $payload }
+            }
+            return [pscustomobject]@{ typed = $true; status = 'PASS'; reason = 'typed-pass'; payload = $payload }
+        }
+        default {
+            return [pscustomobject]@{ typed = $true; status = 'FAIL'; reason = 'typed-unknown-disposition'; payload = $payload }
+        }
+    }
+}
+
+function New-FinalReleaseSmokeArgumentList {
+    param(
+        [Parameter(Mandatory = $true)][string]$ScriptPath,
+        [Parameter(Mandatory = $true)]$Contract,
+        [Parameter(Mandatory = $true)][string]$RunDirectory,
+        [Parameter(Mandatory = $true)][string]$WorktreeRoot,
+        [Parameter(Mandatory = $true)][string]$RunId,
+        [Parameter(Mandatory = $true)][string]$SmokeId,
+        [Parameter(Mandatory = $true)][string]$GroupId
+    )
+
+    $smokeArgs = [System.Collections.Generic.List[string]]::new()
+    [void]$smokeArgs.Add('-NoProfile')
+    [void]$smokeArgs.Add('-NonInteractive')
+    [void]$smokeArgs.Add('-File')
+    [void]$smokeArgs.Add($ScriptPath)
+
+    foreach ($parameter in @($Contract.parameters)) {
+        $name = [string]$parameter.name
+        if ($script:ForbiddenSmokeParamNames -contains $name) { continue }
+        if ([bool]$parameter.isSwitch) {
+            if ($script:FixtureOnlySmokeSwitches -contains $name) {
+                [void]$smokeArgs.Add("-$name")
+            }
+            continue
+        }
+        switch ($name) {
+            'IsolatedProfile' {
+                [void]$smokeArgs.Add('-IsolatedProfile')
+                [void]$smokeArgs.Add((Join-Path $RunDirectory ("{0}-profile" -f $GroupId)))
+            }
+            'OutputDir' {
+                [void]$smokeArgs.Add('-OutputDir')
+                [void]$smokeArgs.Add((Join-Path $RunDirectory ("{0}-output" -f $SmokeId)))
+            }
+            'RepoRoot' {
+                [void]$smokeArgs.Add('-RepoRoot')
+                [void]$smokeArgs.Add($WorktreeRoot)
+            }
+            'RunId' {
+                [void]$smokeArgs.Add('-RunId')
+                [void]$smokeArgs.Add($RunId)
+            }
+        }
+    }
+    return , ([string[]]$smokeArgs.ToArray())
 }
 
 function Invoke-FinalReleaseBoundedChild {
@@ -585,8 +922,10 @@ try {
         }
         $webManifest = [System.IO.Path]::GetFullPath((Join-Path $worktreeRoot 'web\package.json'))
         $webPresent = Test-Path -LiteralPath $webManifest -PathType Leaf
+        $npmLaunch = $null
         if ($webPresent) {
             $tools.npm = Resolve-FinalReleaseUniqueApplication -Name 'npm' -PreferredLeaves @('npm.cmd', 'npm.exe')
+            $npmLaunch = Resolve-FinalReleaseNpmLaunch -NpmPath $tools.npm
         }
         elseif (-not $SkipWeb) {
             throw 'web/package.json is missing; web test/typecheck/build are mandatory unless -SkipWeb is set.'
@@ -668,9 +1007,10 @@ try {
             $commands.Add((New-FinalReleaseCommandRecord -Id 'web-build' -Kind 'web' -Status 'HOLD' -Reason 'skip-web-opt-in'))
         }
         else {
-            $commands.Add((New-FinalReleaseCommandRecord -Id 'web-test' -Kind 'web' -Executable $tools.npm -Arguments @('--prefix', 'web', 'test', '--', '--run')))
-            $commands.Add((New-FinalReleaseCommandRecord -Id 'web-typecheck' -Kind 'web' -Executable $tools.npm -Arguments @('--prefix', 'web', 'run', 'typecheck')))
-            $commands.Add((New-FinalReleaseCommandRecord -Id 'web-build' -Kind 'web' -Executable $tools.npm -Arguments @('--prefix', 'web', 'run', 'build')))
+            $npmPrefix = [string[]]@($npmLaunch.argumentPrefix)
+            $commands.Add((New-FinalReleaseCommandRecord -Id 'web-test' -Kind 'web' -Executable ([string]$npmLaunch.executable) -Arguments (@($npmPrefix) + @('--prefix', 'web', 'test', '--', '--run'))))
+            $commands.Add((New-FinalReleaseCommandRecord -Id 'web-typecheck' -Kind 'web' -Executable ([string]$npmLaunch.executable) -Arguments (@($npmPrefix) + @('--prefix', 'web', 'run', 'typecheck'))))
+            $commands.Add((New-FinalReleaseCommandRecord -Id 'web-build' -Kind 'web' -Executable ([string]$npmLaunch.executable) -Arguments (@($npmPrefix) + @('--prefix', 'web', 'run', 'build'))))
         }
 
         $smokeCatalog = Get-FinalReleaseSmokeCatalog -WorktreeRoot $worktreeRoot
@@ -689,17 +1029,15 @@ try {
                     $commands.Add((New-FinalReleaseCommandRecord -Id $smokeId -Kind 'smoke' -Executable $tools.pwsh -Arguments @('-NoProfile', '-NonInteractive', '-File', [string]$found.path) -Status 'HOLD' -Reason ('unsafe-smoke:' + [string]$found.safety.reason)))
                     continue
                 }
-                $smokeArgs = [System.Collections.Generic.List[string]]::new()
-                [void]$smokeArgs.Add('-NoProfile')
-                [void]$smokeArgs.Add('-NonInteractive')
-                [void]$smokeArgs.Add('-File')
-                [void]$smokeArgs.Add([string]$found.path)
-                $paramNames = @($found.contract.parameters | ForEach-Object { [string]$_.name })
-                if ($paramNames -contains 'IsolatedProfile') {
-                    [void]$smokeArgs.Add('-IsolatedProfile')
-                    [void]$smokeArgs.Add((Join-Path $runDirectory ("{0}-profile" -f $group.id)))
-                }
-                $commands.Add((New-FinalReleaseCommandRecord -Id $smokeId -Kind 'smoke' -Executable $tools.pwsh -Arguments @($smokeArgs.ToArray())))
+                $smokeArgs = New-FinalReleaseSmokeArgumentList `
+                    -ScriptPath ([string]$found.path) `
+                    -Contract $found.contract `
+                    -RunDirectory $runDirectory `
+                    -WorktreeRoot $worktreeRoot `
+                    -RunId $runIdValue `
+                    -SmokeId $smokeId `
+                    -GroupId ([string]$group.id)
+                $commands.Add((New-FinalReleaseCommandRecord -Id $smokeId -Kind 'smoke' -Executable $tools.pwsh -Arguments @($smokeArgs)))
             }
         }
 
@@ -740,6 +1078,8 @@ session.json may change and is never read or hashed.
             'web-build'               = 900000
             'workspace-smoke'         = 720000
             'provider-smoke'          = 180000
+            'browser-surface-proof'   = 600000
+            'browser-provider-e2e'    = 600000
         }
 
         for ($index = 0; $index -lt $commands.Count; $index++) {
@@ -750,7 +1090,7 @@ session.json may change and is never read or hashed.
             if ($timeouts.ContainsKey([string]$command.id)) {
                 $timeoutMs = [int]$timeouts[[string]$command.id]
             }
-            elseif ([string]$command.id -like 'browser-smoke*' -or [string]$command.id -like 'prompt-smoke*') {
+            elseif ([string]$command.id -like 'browser-*' -or [string]$command.id -like 'prompt-smoke*') {
                 $timeoutMs = 600000
             }
 
@@ -780,29 +1120,19 @@ session.json may change and is never read or hashed.
                     $command.reason = 'gate-owned-residue'
                     throw ("Gate-owned process residue remains after '{0}'." -f $command.id)
                 }
-                if ([string]$command.id -eq 'provider-smoke' -or [string]$command.id -like 'provider-smoke:*') {
-                    $payload = $null
-                    try { $payload = $result.Stdout | ConvertFrom-Json } catch { $payload = $null }
-                    if ($null -eq $payload -or $null -eq $payload.PSObject.Properties['disposition']) {
-                        $command.status = 'FAIL'
-                        $command.reason = 'provider-smoke-unparseable'
-                        throw 'Provider smoke did not emit a typed JSON disposition.'
+                $isProviderSmoke = ([string]$command.id -eq 'provider-smoke' -or [string]$command.id -like 'provider-smoke:*')
+                $typed = Resolve-FinalReleaseTypedResult -Stdout $result.Stdout -ExitCode $result.ExitCode
+                if ([bool]$typed.typed) {
+                    $command.status = [string]$typed.status
+                    $command.reason = [string]$typed.reason
+                    if ([string]$typed.status -eq 'FAIL') {
+                        throw ("Command '{0}' returned a typed failure ({1})." -f $command.id, $typed.reason)
                     }
-                    $disposition = [string]$payload.disposition
-                    if ($disposition -eq 'hold') {
-                        $command.status = 'HOLD'
-                        $command.reason = 'typed-hold'
-                    }
-                    elseif ($disposition -eq 'rejected' -or [int]$result.ExitCode -ne 0) {
-                        $command.status = 'FAIL'
-                        $command.reason = 'provider-smoke-rejected'
-                        throw 'Provider smoke rejected the fixture arm.'
-                    }
-                    else {
-                        $command.status = 'FAIL'
-                        $command.reason = 'provider-smoke-unexpected-pass'
-                        throw 'Provider smoke is not allowed to PASS; unexpected success is a contract failure.'
-                    }
+                }
+                elseif ($isProviderSmoke) {
+                    $command.status = 'FAIL'
+                    $command.reason = 'provider-smoke-unparseable'
+                    throw 'Provider smoke did not emit a typed JSON disposition.'
                 }
                 elseif ([int]$result.ExitCode -ne 0) {
                     $command.status = 'FAIL'
@@ -971,7 +1301,7 @@ if (-not [string]::IsNullOrWhiteSpace($gateError) -and $script:FinalReleaseStatu
     Write-Host ("Final release gate failed: {0}" -f $gateError)
 }
 elseif ($script:FinalReleaseStatus -eq 'HOLD') {
-    Write-Host 'Final release gate HOLD: a smoke is missing, unsafe, skipped, or returned a typed HOLD.'
+    Write-Host 'Final release gate HOLD: a smoke is missing, unsafe, skipped, or returned a typed HOLD (status/disposition).'
 }
 
 exit $script:FinalReleaseExitCode
