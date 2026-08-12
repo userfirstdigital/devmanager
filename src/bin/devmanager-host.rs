@@ -1041,7 +1041,7 @@ async fn serve_foreground_host(
     // Named-pipe Hello is a different protocol and stays intact. Connect
     // production is a separate factory: fail closed on identity/custody/bind
     // rather than starting a plaintext or source-level Connect listener.
-    match devmanager::connect::ConnectProductionStartup::prepare_direct(
+    let _connect_startup = match devmanager::connect::ConnectProductionStartup::prepare_direct(
         devmanager::connect::DirectBindPolicy::loopback(),
     ) {
         Ok(connect_startup) => {
@@ -1049,11 +1049,13 @@ async fn serve_foreground_host(
                 "Connect production: session ready; listener binds at /api/connect (bound={})",
                 connect_startup.listener_is_bound()
             );
+            Some(connect_startup)
         }
         Err(error) => {
             eprintln!("Connect production startup failed closed: {error}");
+            None
         }
-    }
+    };
 
     // Bind the one shared updater FSM + timed IPC port to live Host Hello.
     // Clients must not create a second gate; they drive this handle's port.
