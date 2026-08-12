@@ -404,18 +404,18 @@ fn quality_accessibility_fixture_projects_named_roles_states_and_color_independe
     let save = surface
         .control("save")
         .expect("named save control must exist");
-    assert_eq!(save.accessibility.role, AccessibleRole::Button);
-    assert_eq!(save.accessibility.name, "Save changes");
-    assert!(!save.accessibility.disabled);
+    assert_eq!(save.accessibility.role(), AccessibleRole::Button);
+    assert_eq!(save.accessibility.name(), "Save changes");
+    assert!(!save.accessibility.disabled());
     assert!(save.interactive);
 
     let status = surface
         .control("host-health")
         .expect("named status control must exist");
-    assert_eq!(status.accessibility.role, AccessibleRole::Status);
+    assert_eq!(status.accessibility.role(), AccessibleRole::Status);
     assert_eq!(status.status_meaning, Some(StatusMeaning::Success));
     assert!(
-        !status.accessibility.description.is_empty(),
+        !status.accessibility.description().is_empty(),
         "status meaning must be available as screen-reader text, not color alone"
     );
     assert!(!status.interactive);
@@ -423,8 +423,8 @@ fn quality_accessibility_fixture_projects_named_roles_states_and_color_independe
     let field = surface
         .control("prompt")
         .expect("named text field must exist");
-    assert_eq!(field.accessibility.role, AccessibleRole::TextField);
-    assert!(!field.accessibility.name.trim().is_empty());
+    assert_eq!(field.accessibility.role(), AccessibleRole::TextField);
+    assert!(!field.accessibility.name().trim().is_empty());
 
     let tokens = surface.theme_tokens();
     assert_eq!(tokens.density.motion.reduced_motion_ms, 0);
@@ -492,7 +492,7 @@ fn quality_content_states_consume_canonical_empty_error_and_hold_partial() {
     );
     let empty = EmptyState::new(&samples.empty_title, &samples.long_text)
         .expect("long text must fit the canonical description bound");
-    assert_eq!(empty.accessibility().role, AccessibleRole::Region);
+    assert_eq!(empty.accessibility().role(), AccessibleRole::Region);
     assert_eq!(empty.title(), samples.empty_title);
     assert!(empty.description().contains(' '));
     assert!(!empty.rendered_payload().is_empty());
@@ -502,8 +502,8 @@ fn quality_content_states_consume_canonical_empty_error_and_hold_partial() {
     assert!(unicode.title().contains('界'));
 
     let error = surface.error_boundary().expect("error state");
-    assert_eq!(error.accessibility().role, AccessibleRole::Alert);
-    assert!(error.accessibility().invalid);
+    assert_eq!(error.accessibility().role(), AccessibleRole::Alert);
+    assert!(error.accessibility().invalid());
     assert_eq!(error.title(), samples.error_title);
 
     let partial = surface
@@ -772,7 +772,9 @@ fn quality_preview_cli_and_pixel_readback_hold_without_canonical_shell() {
         .expect_err("headless PNG remains unsupported");
     assert!(matches!(
         rendered,
-        PreviewError::HeadlessRenderingUnsupported
+        PreviewError::VisibleWindowsCaptureUnavailable { .. }
+            | PreviewError::WindowsGraphicsCaptureFailed { .. }
+            | PreviewError::ApplicationFailed { .. }
     ));
     assert!(
         !output.exists(),
