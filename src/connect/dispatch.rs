@@ -1000,10 +1000,10 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn limits_mismatch_wrong_binding_and_replay_fail_closed() {
-        let binding = binding();
+        let channel_binding = binding();
         let mut session =
             ConnectDispatchSession::bind_paired("web-paired-owner".to_owned(), ConnectIdentityLiveState::Live);
-        let (limits, client_id) = complete_hello(&mut session, binding).await;
+        let (limits, client_id) = complete_hello(&mut session, channel_binding).await;
         let other_limits = ConnectLimits::try_new(
             limits.max_physical_frame_bytes,
             limits.max_reassembled_message_bytes,
@@ -1020,7 +1020,7 @@ mod tests {
             task_id: None,
             query: Query::TaskSnapshot,
         });
-        let env = envelope(binding, 2, Some(request_id), None, other_limits, query.clone());
+        let env = envelope(channel_binding, 2, Some(request_id), None, other_limits, query.clone());
         let (reply, disposition) = session.handle_payload(&env, query, None).await;
         assert_eq!(disposition, ConnectSessionDisposition::Disconnect);
         assert_not_hold(&reply);
@@ -1028,7 +1028,7 @@ mod tests {
 
         let mut session =
             ConnectDispatchSession::bind_paired("web-paired-owner".to_owned(), ConnectIdentityLiveState::Live);
-        let (limits, client_id) = complete_hello(&mut session, binding).await;
+        let (limits, client_id) = complete_hello(&mut session, channel_binding).await;
         let query = ConnectPayload::Query(QueryEnvelope {
             request_id,
             client_id,
@@ -1043,9 +1043,9 @@ mod tests {
 
         let mut session =
             ConnectDispatchSession::bind_paired("web-paired-owner".to_owned(), ConnectIdentityLiveState::Live);
-        let (limits, _) = complete_hello(&mut session, binding).await;
+        let (limits, _) = complete_hello(&mut session, channel_binding).await;
         let hello = ConnectPayload::Hello(hello_payload(advertised_connect_capabilities(), limits));
-        let env = envelope(binding, 1, None, None, limits, hello.clone());
+        let env = envelope(channel_binding, 1, None, None, limits, hello.clone());
         let (reply, disposition) = session.handle_payload(&env, hello, None).await;
         assert_eq!(disposition, ConnectSessionDisposition::Disconnect);
         assert_not_hold(&reply);
