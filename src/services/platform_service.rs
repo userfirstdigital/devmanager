@@ -9,7 +9,11 @@ use std::time::Duration;
 #[cfg(not(windows))]
 use std::time::Instant;
 
-pub use crate::process::job::{attach_process_to_managed_job, ManagedProcessJob};
+pub(crate) use crate::process::job::{attach_process_to_managed_job, ManagedProcessJob};
+
+const MAX_LISTENER_PORT_BATCH: usize = 4_096;
+#[cfg(windows)]
+const MAX_WINDOWS_TCP_TABLE_BYTES: u32 = 64 * 1024 * 1024;
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -21,6 +25,11 @@ const CREATE_SUSPENDED: u32 = 0x00000004;
 pub const MANAGED_PROCESS_CREATION_FLAGS: u32 = CREATE_NO_WINDOW | CREATE_SUSPENDED;
 
 pub fn snapshot_listener_pids(ports: &[u16]) -> Result<HashMap<u16, u32>, String> {
+    if ports.len() > MAX_LISTENER_PORT_BATCH {
+        return Err(format!(
+            "listener snapshot exceeds {MAX_LISTENER_PORT_BATCH} ports"
+        ));
+    }
     if ports.is_empty() {
         return Ok(HashMap::new());
     }
@@ -42,10 +51,25 @@ pub fn find_pid_on_port(port: u16) -> Result<Option<u32>, String> {
 
 #[cfg(windows)]
 fn snapshot_listener_pids_windows(ports: &[u16]) -> Result<HashMap<u16, u32>, String> {
+    let absolute_deadline = std::time::Instant::now()
+        .checked_add(std::time::Duration::from_secs(1))
+        .ok_or_else(|| "listener snapshot deadline overflow".to_string())?;
+    snapshot_listener_pids_windows_until(ports, absolute_deadline)
+}
+
+#[cfg(windows)]
+fn snapshot_listener_pids_windows_until(
+    ports: &[u16],
+    absolute_deadline: std::time::Instant,
+) -> Result<HashMap<u16, u32>, String> {
+    check_listener_snapshot_deadline(absolute_deadline, "listener filter allocation")?;
     let filter: HashSet<u16> = ports.iter().copied().collect();
+    check_listener_snapshot_deadline(absolute_deadline, "listener filter allocation")?;
     let mut listeners = HashMap::with_capacity(filter.len());
-    collect_windows_listener_pids(AF_INET, &filter, &mut listeners)?;
-    collect_windows_listener_pids(AF_INET6, &filter, &mut listeners)?;
+    check_listener_snapshot_deadline(absolute_deadline, "listener result allocation")?;
+    collect_windows_listener_pids(AF_INET, &filter, &mut listeners, absolute_deadline)?;
+    collect_windows_listener_pids(AF_INET6, &filter, &mut listeners, absolute_deadline)?;
+    check_listener_snapshot_deadline(absolute_deadline, "listener snapshot completion")?;
     Ok(listeners)
 }
 
@@ -54,7 +78,9 @@ fn collect_windows_listener_pids(
     address_family: u32,
     filter: &HashSet<u16>,
     listeners: &mut HashMap<u16, u32>,
+    absolute_deadline: std::time::Instant,
 ) -> Result<(), String> {
+    check_listener_snapshot_deadline(absolute_deadline, "TCP table size lookup")?;
     let mut size = 0u32;
     let first = unsafe {
         GetExtendedTcpTable(
@@ -66,6 +92,7 @@ fn collect_windows_listener_pids(
             0,
         )
     };
+    check_listener_snapshot_deadline(absolute_deadline, "TCP table size lookup")?;
     if first != ERROR_INSUFFICIENT_BUFFER && first != NO_ERROR {
         return Err(format!(
             "GetExtendedTcpTable size probe failed for AF {address_family}: {first}"
@@ -74,8 +101,17 @@ fn collect_windows_listener_pids(
     if size == 0 {
         return Ok(());
     }
+    if size > MAX_WINDOWS_TCP_TABLE_BYTES {
+        return Err(format!(
+            "Windows TCP listener table exceeds {MAX_WINDOWS_TCP_TABLE_BYTES} bytes"
+        ));
+    }
 
-    let mut buffer = vec![0u8; size as usize];
+    let buffer_len = usize::try_from(size)
+        .map_err(|_| "Windows TCP listener table size does not fit usize".to_string())?;
+    check_listener_snapshot_deadline(absolute_deadline, "TCP table allocation")?;
+    let mut buffer = vec![0u8; buffer_len];
+    check_listener_snapshot_deadline(absolute_deadline, "TCP table allocation")?;
     let result = unsafe {
         GetExtendedTcpTable(
             buffer.as_mut_ptr() as *mut c_void,
@@ -86,48 +122,89 @@ fn collect_windows_listener_pids(
             0,
         )
     };
+    check_listener_snapshot_deadline(absolute_deadline, "TCP table lookup")?;
     if result != NO_ERROR {
         return Err(format!(
             "GetExtendedTcpTable failed for AF {address_family}: {result}"
         ));
     }
+    let returned_len = usize::try_from(size)
+        .map_err(|_| "Windows TCP listener table result size does not fit usize".to_string())?;
+    if returned_len > buffer.len() {
+        return Err(format!(
+            "Windows TCP listener table returned {returned_len} bytes into a {} byte allocation",
+            buffer.len()
+        ));
+    }
+    let table_bytes = &buffer[..returned_len];
 
     match address_family {
         AF_INET => {
-            let table = buffer.as_ptr() as *const MibTcpTableOwnerPid;
-            let entry_count = unsafe { (*table).dw_num_entries as usize };
-            let rows = unsafe {
-                std::slice::from_raw_parts(
-                    std::ptr::addr_of!((*table).table) as *const MibTcpRowOwnerPid,
-                    entry_count,
-                )
-            };
-            for row in rows {
+            for_each_windows_tcp_row::<MibTcpRowOwnerPid, _>(table_bytes, |row| {
+                check_listener_snapshot_deadline(absolute_deadline, "IPv4 listener projection")?;
                 let port = windows_port(row.dw_local_port);
                 if filter.contains(&port) {
                     listeners.entry(port).or_insert(row.dw_owning_pid);
                 }
-            }
+                Ok::<(), String>(())
+            })?;
         }
         AF_INET6 => {
-            let table = buffer.as_ptr() as *const MibTcp6TableOwnerPid;
-            let entry_count = unsafe { (*table).dw_num_entries as usize };
-            let rows = unsafe {
-                std::slice::from_raw_parts(
-                    std::ptr::addr_of!((*table).table) as *const MibTcp6RowOwnerPid,
-                    entry_count,
-                )
-            };
-            for row in rows {
+            for_each_windows_tcp_row::<MibTcp6RowOwnerPid, _>(table_bytes, |row| {
+                check_listener_snapshot_deadline(absolute_deadline, "IPv6 listener projection")?;
                 let port = windows_port(row.dw_local_port);
                 if filter.contains(&port) {
                     listeners.entry(port).or_insert(row.dw_owning_pid);
                 }
-            }
+                Ok::<(), String>(())
+            })?;
         }
         _ => {}
     }
 
+    check_listener_snapshot_deadline(absolute_deadline, "TCP listener projection")?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn for_each_windows_tcp_row<Row: Copy, Visit>(bytes: &[u8], mut visit: Visit) -> Result<(), String>
+where
+    Visit: FnMut(Row) -> Result<(), String>,
+{
+    const HEADER_BYTES: usize = std::mem::size_of::<u32>();
+    if bytes.len() < HEADER_BYTES {
+        return Err("Windows TCP listener table is missing its entry-count header".to_string());
+    }
+    let header: [u8; HEADER_BYTES] = bytes[..HEADER_BYTES]
+        .try_into()
+        .map_err(|_| "Windows TCP listener table header length is invalid".to_string())?;
+    let entry_count = u32::from_ne_bytes(header) as usize;
+    let row_size = std::mem::size_of::<Row>();
+    if row_size == 0 {
+        return Err("Windows TCP listener table row type has zero size".to_string());
+    }
+    let row_bytes = entry_count
+        .checked_mul(row_size)
+        .ok_or_else(|| "Windows TCP listener table row count overflow".to_string())?;
+    let required = HEADER_BYTES
+        .checked_add(row_bytes)
+        .ok_or_else(|| "Windows TCP listener table byte count overflow".to_string())?;
+    if required > bytes.len() {
+        return Err(format!(
+            "Windows TCP listener table claims {entry_count} rows requiring {required} bytes, but only {} bytes were returned",
+            bytes.len()
+        ));
+    }
+
+    for index in 0..entry_count {
+        let offset = HEADER_BYTES + index * row_size;
+        // The IP Helper API writes into byte storage whose alignment is not a
+        // Rust type guarantee. Bounds are proven above; read each C row with
+        // `read_unaligned` instead of constructing a potentially misaligned
+        // typed slice.
+        let row = unsafe { std::ptr::read_unaligned(bytes.as_ptr().add(offset).cast::<Row>()) };
+        visit(row)?;
+    }
     Ok(())
 }
 
@@ -195,6 +272,7 @@ const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
 
 #[cfg(windows)]
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct MibTcpRowOwnerPid {
     dw_state: u32,
     dw_local_addr: u32,
@@ -206,13 +284,7 @@ struct MibTcpRowOwnerPid {
 
 #[cfg(windows)]
 #[repr(C)]
-struct MibTcpTableOwnerPid {
-    dw_num_entries: u32,
-    table: [MibTcpRowOwnerPid; 1],
-}
-
-#[cfg(windows)]
-#[repr(C)]
+#[derive(Clone, Copy)]
 struct MibTcp6RowOwnerPid {
     uc_local_addr: [u8; 16],
     dw_local_scope_id: u32,
@@ -222,13 +294,6 @@ struct MibTcp6RowOwnerPid {
     dw_remote_port: u32,
     dw_state: u32,
     dw_owning_pid: u32,
-}
-
-#[cfg(windows)]
-#[repr(C)]
-struct MibTcp6TableOwnerPid {
-    dw_num_entries: u32,
-    table: [MibTcp6RowOwnerPid; 1],
 }
 
 #[cfg(windows)]
@@ -247,9 +312,6 @@ extern "system" {
 #[cfg(windows)]
 #[link(name = "kernel32")]
 extern "system" {
-    fn OpenProcess(desired_access: u32, inherit_handle: i32, process_id: u32) -> *mut c_void;
-    fn TerminateProcess(handle: *mut c_void, exit_code: u32) -> i32;
-    fn WaitForSingleObject(handle: *mut c_void, milliseconds: u32) -> u32;
     fn CloseHandle(handle: *mut c_void) -> i32;
     fn CreateToolhelp32Snapshot(flags: u32, process_id: u32) -> *mut c_void;
     fn Thread32First(snapshot: *mut c_void, entry: *mut ThreadEntry32) -> i32;
@@ -259,9 +321,61 @@ extern "system" {
     fn GetActiveProcessorCount(group_number: u16) -> u32;
 }
 
-#[cfg(windows)]
+/// Deadline-bound listener inventory used by teardown settlement. The
+/// non-Windows `lsof` adapter cannot cancel `Command::output`, so it is
+/// deliberately unavailable at this authority boundary instead of returning
+/// while an unowned helper may still be running.
+pub(crate) fn snapshot_listener_pids_until(
+    ports: &[u16],
+    absolute_deadline: std::time::Instant,
+) -> Result<HashMap<u16, u32>, String> {
+    check_listener_snapshot_deadline(absolute_deadline, "listener snapshot admission")?;
+    if ports.len() > MAX_LISTENER_PORT_BATCH {
+        return Err(format!(
+            "listener snapshot exceeds {MAX_LISTENER_PORT_BATCH} ports"
+        ));
+    }
+    if ports.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    #[cfg(windows)]
+    let listeners = snapshot_listener_pids_windows_until(ports, absolute_deadline)?;
+
+    #[cfg(not(windows))]
+    let listeners = {
+        let _ = ports;
+        return Err(
+            "deadline-bound listener reconciliation is unavailable on this platform".to_string(),
+        );
+    };
+
+    check_listener_snapshot_deadline(absolute_deadline, "listener snapshot completion")?;
+    Ok(listeners)
+}
+
+fn check_listener_snapshot_deadline(
+    absolute_deadline: std::time::Instant,
+    context: &str,
+) -> Result<(), String> {
+    if std::time::Instant::now() >= absolute_deadline {
+        Err(format!("{context} exceeded its absolute deadline"))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(all(windows, test))]
+#[link(name = "kernel32")]
+extern "system" {
+    fn OpenProcess(desired_access: u32, inherit_handle: i32, process_id: u32) -> *mut c_void;
+    fn TerminateProcess(handle: *mut c_void, exit_code: u32) -> i32;
+    fn WaitForSingleObject(handle: *mut c_void, milliseconds: u32) -> u32;
+}
+
+#[cfg(all(windows, test))]
 const PROCESS_TERMINATE: u32 = 0x0001;
-#[cfg(windows)]
+#[cfg(all(windows, test))]
 const SYNCHRONIZE: u32 = 0x00100000;
 #[cfg(windows)]
 const ALL_PROCESSOR_GROUPS: u16 = 0xffff;
@@ -312,7 +426,10 @@ fn windows_port(raw_port: u32) -> u16 {
     u16::from_be((raw_port & 0xffff) as u16)
 }
 
-pub fn kill_process_tree(pid: u32) -> Result<(), String> {
+/// Test-process cleanup only. Production termination must flow through a
+/// retained Job/fence or another sealed pre-authority capability.
+#[cfg(test)]
+pub(crate) fn kill_process_tree(pid: u32) -> Result<(), String> {
     #[cfg(windows)]
     {
         // Terminate descendants leaf-first so a parent can't repopulate the tree
@@ -328,18 +445,6 @@ pub fn kill_process_tree(pid: u32) -> Result<(), String> {
     #[cfg(not(windows))]
     {
         kill_unix_target(pid, true)
-    }
-}
-
-pub fn kill_process(pid: u32) -> Result<(), String> {
-    #[cfg(windows)]
-    {
-        windows_terminate_pid(pid)
-    }
-
-    #[cfg(not(windows))]
-    {
-        kill_unix_target(pid, false)
     }
 }
 
@@ -360,7 +465,7 @@ where
 /// Claims a process created with [`MANAGED_PROCESS_CREATION_FLAGS`] before
 /// allowing any of its code to execute. On Windows the returned job must stay
 /// alive for as long as the process tree is owned.
-pub fn claim_suspended_process(pid: u32) -> Result<Option<ManagedProcessJob>, String> {
+pub(crate) fn claim_suspended_process(pid: u32) -> Result<Option<ManagedProcessJob>, String> {
     #[cfg(windows)]
     {
         claim_suspended_process_with(pid, attach_process_to_managed_job, resume_suspended_process)
@@ -575,7 +680,10 @@ fn normalize_process_name(name: &OsStr) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{claim_suspended_process_with, terminate_owned_process_group_with};
+    use super::{
+        claim_suspended_process_with, snapshot_listener_pids, snapshot_listener_pids_until,
+        terminate_owned_process_group_with, MAX_LISTENER_PORT_BATCH,
+    };
     use std::cell::RefCell;
     use std::sync::{
         atomic::{AtomicBool, Ordering},
@@ -583,14 +691,83 @@ mod tests {
     };
     use std::time::Duration;
 
+    #[test]
+    fn listener_snapshot_rejects_unbounded_port_batches_before_allocation() {
+        let ports = vec![80; MAX_LISTENER_PORT_BATCH + 1];
+        assert!(snapshot_listener_pids(&ports).is_err());
+    }
+
+    #[test]
+    fn teardown_listener_snapshot_rejects_expired_deadline_before_lookup() {
+        let error = snapshot_listener_pids_until(&[80], std::time::Instant::now())
+            .expect_err("an expired teardown lookup must fail before platform I/O");
+        assert!(error.contains("absolute deadline"));
+    }
+
     #[cfg(windows)]
-    use super::windows_port;
+    use super::{for_each_windows_tcp_row, windows_port, MibTcpRowOwnerPid};
 
     #[cfg(windows)]
     #[test]
     fn windows_port_decodes_network_order_port() {
         assert_eq!(windows_port(0x5000), 80);
         assert_eq!(windows_port(0x3614), 5174);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_tcp_rows_reject_truncated_header_and_claimed_rows() {
+        let mut visited = 0usize;
+        assert!(
+            for_each_windows_tcp_row::<MibTcpRowOwnerPid, _>(&[0, 0, 0], |_| {
+                visited += 1;
+                Ok(())
+            })
+            .is_err()
+        );
+
+        let mut truncated = vec![0u8; std::mem::size_of::<u32>()];
+        truncated[..4].copy_from_slice(&2u32.to_ne_bytes());
+        assert!(
+            for_each_windows_tcp_row::<MibTcpRowOwnerPid, _>(&truncated, |_| {
+                visited += 1;
+                Ok(())
+            })
+            .is_err()
+        );
+        assert_eq!(visited, 0, "malformed tables must not expose any row");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_tcp_rows_are_read_safely_from_unaligned_storage() {
+        let row = MibTcpRowOwnerPid {
+            dw_state: 2,
+            dw_local_addr: 0,
+            dw_local_port: 0x5000,
+            dw_remote_addr: 0,
+            dw_remote_port: 0,
+            dw_owning_pid: 42,
+        };
+        let row_bytes = unsafe {
+            std::slice::from_raw_parts(
+                std::ptr::addr_of!(row).cast::<u8>(),
+                std::mem::size_of::<MibTcpRowOwnerPid>(),
+            )
+        };
+        let table_len = std::mem::size_of::<u32>() + row_bytes.len();
+        let mut storage = vec![0u8; table_len + 1];
+        let table = &mut storage[1..];
+        table[..4].copy_from_slice(&1u32.to_ne_bytes());
+        table[4..].copy_from_slice(row_bytes);
+
+        let mut observed = Vec::new();
+        for_each_windows_tcp_row::<MibTcpRowOwnerPid, _>(table, |row| {
+            observed.push((row.dw_local_port, row.dw_owning_pid));
+            Ok(())
+        })
+        .expect("unaligned API storage must be parsed with unaligned reads");
+        assert_eq!(observed, [(0x5000, 42)]);
     }
 
     #[test]
@@ -918,7 +1095,7 @@ fn applescript_quote(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, test))]
 fn windows_terminate_pid(pid: u32) -> Result<(), String> {
     if !is_pid_running(pid) {
         return Ok(());
@@ -950,7 +1127,7 @@ fn windows_terminate_pid(pid: u32) -> Result<(), String> {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), test))]
 fn kill_unix_target(pid: u32, as_process_group: bool) -> Result<(), String> {
     let target = pid.to_string();
     let group_target = format!("-{pid}");
@@ -1068,6 +1245,7 @@ fn unix_process_group_exists(target: &str) -> bool {
 }
 
 #[cfg(not(windows))]
+#[cfg(test)]
 fn wait_for_pid_exit(pid: u32, timeout: Duration) -> bool {
     let started_at = Instant::now();
     while started_at.elapsed() < timeout {

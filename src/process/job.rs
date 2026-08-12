@@ -3,25 +3,245 @@
 #[cfg(windows)]
 use std::ffi::c_void;
 #[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
+#[cfg(windows)]
 use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle};
 #[cfg(windows)]
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 #[cfg(windows)]
 use std::sync::{Arc, Mutex};
 #[cfg(windows)]
 use std::thread::JoinHandle;
 
 #[cfg(windows)]
-use crate::process::identity::{ManagedProcessId, ManagedProcessIdentity};
+use crate::domain::operation::ResourceFence;
+use crate::process::identity::ManagedProcessIdentity;
+#[cfg(windows)]
+use crate::process::identity::{ManagedProcessId, ProcessOwner};
 use crate::process::registry::{
     JobCompletionEvent, JobCompletionMessage, JobMemberInfo, ManagedProcessFence,
 };
+use crate::process::sampler::SamplingBudget;
+use std::collections::BTreeSet;
+use std::time::{Duration, Instant};
+
+/// A read-only, exact-identity observation of one current Job member.
+///
+/// This type carries no handle and grants no termination authority. An
+/// inaccessible member remains visible by PID instead of being silently
+/// omitted or being promoted to a PID-only ownership claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JobMemberObservation {
+    Accessible {
+        identity: ManagedProcessIdentity,
+    },
+    Inaccessible {
+        pid: u32,
+        creation_time_100ns: Option<u64>,
+        reason: String,
+    },
+}
+
+/// Turn a Job's PID list into exact observations without granting a PID-only
+/// ownership claim. The inspector must perform the current `IsProcessInJob`
+/// and creation-time checks; failures remain visible as partial members.
+pub fn collect_exact_job_observations<F>(
+    active_process_ids: Result<Vec<u32>, String>,
+    inspect_process: F,
+) -> Result<Vec<JobMemberObservation>, String>
+where
+    F: FnMut(u32) -> Result<JobMemberInfo, String>,
+{
+    let mut budget = SamplingBudget::new(
+        Instant::now() + Duration::from_secs(30),
+        MAX_JOB_PROCESS_ID_CAPACITY,
+    );
+    collect_exact_job_observations_with_budget(active_process_ids, inspect_process, &mut budget)
+}
+
+/// Collect exact Job observations under the same bounded tick budget used by
+/// process accounting. The input is consumed incrementally into a set capped
+/// at `budget.max_members()`; a large Windows Job list is rejected before any
+/// process inspection or unbounded output allocation occurs.
+pub fn collect_exact_job_observations_with_budget<F>(
+    active_process_ids: Result<Vec<u32>, String>,
+    mut inspect_process: F,
+    budget: &mut SamplingBudget,
+) -> Result<Vec<JobMemberObservation>, String>
+where
+    F: FnMut(u32) -> Result<JobMemberInfo, String>,
+{
+    budget.note_job_query();
+    let mut process_ids = BTreeSet::new();
+    let mut new_local_members = 0usize;
+    for pid in active_process_ids? {
+        budget.checkpoint().map_err(|error| error.to_string())?;
+        if pid == 0 {
+            continue;
+        }
+        budget.note_job_candidate();
+        let is_new_tick_member = !budget.contains_pid(pid);
+        let is_new_local_member = !process_ids.contains(&pid);
+        if is_new_local_member
+            && (process_ids.len() >= budget.max_members()
+                || (is_new_tick_member && new_local_members >= budget.remaining_capacity()))
+        {
+            return Err(format!(
+                "managed Job process list exceeds {} members",
+                budget.remaining_capacity()
+            ));
+        }
+        if process_ids.insert(pid) && is_new_tick_member {
+            new_local_members = new_local_members.saturating_add(1);
+        }
+    }
+
+    let mut observations = Vec::with_capacity(process_ids.len());
+    for pid in process_ids {
+        if let Err(error) = budget.checkpoint() {
+            return Err(error.to_string());
+        }
+        budget.note_identity_inspection();
+        let observation = match inspect_process(pid) {
+            Ok(member) if member.identity().id().pid() == pid => JobMemberObservation::Accessible {
+                identity: member.identity().clone(),
+            },
+            Ok(member) => JobMemberObservation::Inaccessible {
+                pid,
+                creation_time_100ns: Some(member.identity().id().creation_time_100ns()),
+                reason: format!(
+                    "Job inspection returned PID {} while observing PID {pid}",
+                    member.identity().id().pid()
+                ),
+            },
+            Err(reason) => JobMemberObservation::Inaccessible {
+                pid,
+                creation_time_100ns: None,
+                reason,
+            },
+        };
+        budget.checkpoint().map_err(|error| error.to_string())?;
+        match &observation {
+            JobMemberObservation::Accessible { identity } => {
+                budget
+                    .admit_identity(identity)
+                    .map_err(|error| error.to_string())?;
+            }
+            JobMemberObservation::Inaccessible {
+                pid,
+                creation_time_100ns,
+                ..
+            } => {
+                budget
+                    .admit_inaccessible(*pid, *creation_time_100ns)
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        observations.push(observation);
+    }
+    Ok(observations)
+}
+
+/// Converts one already-bounded Job PID query into exact member observations.
+///
+/// PID values are sorted and deduplicated before the caller's cap is applied.
+/// Identity inspection stays inside the same absolute deadline and preserves
+/// inaccessible members explicitly. This helper is intentionally read-only;
+/// it cannot mint or release Job authority.
+fn collect_exact_job_observations_until<F>(
+    active_process_ids: Result<Vec<u32>, String>,
+    mut inspect_process: F,
+    absolute_deadline: std::time::Instant,
+    max_members: usize,
+) -> Result<Vec<JobMemberObservation>, String>
+where
+    F: FnMut(u32) -> Result<JobMemberInfo, String>,
+{
+    if max_members > MAX_JOB_PROCESS_ID_CAPACITY {
+        return Err(format!(
+            "managed Job observation capacity {max_members} exceeds {MAX_JOB_PROCESS_ID_CAPACITY} members"
+        ));
+    }
+    if std::time::Instant::now() >= absolute_deadline {
+        return Err("managed Job observation exceeded absolute deadline".to_string());
+    }
+    let mut process_ids = active_process_ids?;
+    if std::time::Instant::now() >= absolute_deadline {
+        return Err("managed Job observation exceeded absolute deadline".to_string());
+    }
+
+    process_ids.retain(|pid| *pid != 0);
+    process_ids.sort_unstable();
+    process_ids.dedup();
+    if std::time::Instant::now() >= absolute_deadline {
+        return Err("managed Job observation exceeded absolute deadline".to_string());
+    }
+    if process_ids.len() > max_members {
+        return Err(format!(
+            "managed Job observation contains {} members and exceeds {max_members} members",
+            process_ids.len()
+        ));
+    }
+
+    let mut observations = Vec::new();
+    observations
+        .try_reserve_exact(process_ids.len())
+        .map_err(|error| format!("managed Job observation allocation failed: {error}"))?;
+    if std::time::Instant::now() >= absolute_deadline {
+        return Err("managed Job observation exceeded absolute deadline".to_string());
+    }
+    for pid in process_ids {
+        if std::time::Instant::now() >= absolute_deadline {
+            return Err("managed Job observation exceeded absolute deadline".to_string());
+        }
+        let observation = match inspect_process(pid) {
+            Ok(member) if member.identity().id().pid() == pid => JobMemberObservation::Accessible {
+                identity: member.identity().clone(),
+            },
+            Ok(member) => JobMemberObservation::Inaccessible {
+                pid,
+                creation_time_100ns: Some(member.identity().id().creation_time_100ns()),
+                reason: format!(
+                    "Job inspection returned PID {} while observing PID {pid}",
+                    member.identity().id().pid()
+                ),
+            },
+            Err(reason) => JobMemberObservation::Inaccessible {
+                pid,
+                creation_time_100ns: None,
+                reason,
+            },
+        };
+        if std::time::Instant::now() >= absolute_deadline {
+            return Err("managed Job observation exceeded absolute deadline".to_string());
+        }
+        observations.push(observation);
+        if std::time::Instant::now() >= absolute_deadline {
+            return Err("managed Job observation exceeded absolute deadline".to_string());
+        }
+    }
+    Ok(observations)
+}
+
+/// Capability held only by the managed Job completion receiver.
+///
+/// The registry requires this token before it will mark a completion message
+/// as receiver-owned. No production caller outside this module can construct
+/// one, so a fence/event pair supplied by another adapter remains untrusted.
+pub(crate) struct CompletionReceiverToken(());
+
+impl CompletionReceiverToken {
+    fn issue() -> Self {
+        Self(())
+    }
+}
 
 #[cfg(windows)]
 #[link(name = "kernel32")]
 extern "system" {
     fn OpenProcess(desired_access: u32, inherit_handle: i32, process_id: u32) -> *mut c_void;
     fn CreateJobObjectW(attributes: *mut c_void, name: *const u16) -> *mut c_void;
+    fn SetLastError(error_code: u32);
     fn SetInformationJobObject(
         job: *mut c_void,
         job_object_info_class: u32,
@@ -29,6 +249,7 @@ extern "system" {
         job_object_info_length: u32,
     ) -> i32;
     fn AssignProcessToJobObject(job: *mut c_void, process: *mut c_void) -> i32;
+    fn TerminateJobObject(job: *mut c_void, exit_code: u32) -> i32;
     fn QueryInformationJobObject(
         job: *mut c_void,
         job_object_info_class: u32,
@@ -88,6 +309,7 @@ const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x00002000;
 #[cfg(windows)]
 const ERROR_MORE_DATA: i32 = 234;
 #[cfg(windows)]
+const ERROR_ALREADY_EXISTS: i32 = 183;
 const MAX_JOB_PROCESS_ID_CAPACITY: usize = 16_384;
 #[cfg(windows)]
 const MAX_COMPLETION_MESSAGES: usize = 4_096;
@@ -106,6 +328,15 @@ const JOB_OBJECT_MSG_ABNORMAL_EXIT_PROCESS: u32 = 8;
 const SHUTDOWN_MESSAGE: u32 = u32::MAX;
 #[cfg(windows)]
 const SHUTDOWN_COMPLETION_KEY: usize = 0;
+#[cfg(windows)]
+const COMPLETION_LISTENER_POLL_MILLIS: u32 = 25;
+#[cfg(windows)]
+const COMPLETION_LISTENER_RELEASE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_millis(COMPLETION_LISTENER_POLL_MILLIS as u64 * 4);
+#[cfg(windows)]
+const COMPLETION_LISTENER_DROP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+#[cfg(windows)]
+const ERROR_TIMEOUT: i32 = 258;
 #[cfg(windows)]
 static NEXT_COMPLETION_KEY: AtomicUsize = AtomicUsize::new(1);
 
@@ -133,7 +364,7 @@ struct CompletionMailbox {
 
 #[cfg(windows)]
 impl CompletionMailbox {
-    fn push(&mut self, message: JobCompletionMessage) {
+    fn push(&mut self, receiver: &CompletionReceiverToken, message: JobCompletionMessage) {
         let is_active_zero = matches!(message.event(), JobCompletionEvent::ActiveProcessZero);
         let has_active_zero = self
             .messages
@@ -163,12 +394,14 @@ impl CompletionMailbox {
                 .cloned()
         };
         self.messages.clear();
-        self.messages.push_back(JobCompletionMessage::new(
-            message.fence().clone(),
-            JobCompletionEvent::MonitorFailed {
-                detail: COMPLETION_OVERFLOW_DETAIL.to_string(),
-            },
-        ));
+        self.messages
+            .push_back(JobCompletionMessage::from_completion_receiver(
+                receiver,
+                message.fence().clone(),
+                JobCompletionEvent::MonitorFailed {
+                    detail: COMPLETION_OVERFLOW_DETAIL.to_string(),
+                },
+            ));
         if let Some(active_zero) = preserved_zero {
             self.messages.push_back(active_zero);
         }
@@ -226,29 +459,33 @@ struct JobObjectExtendedLimitInformation {
 /// Dropping the last owner closes the Job Object and terminates its members.
 #[cfg(windows)]
 #[derive(Debug)]
-pub struct ManagedProcessJob {
+pub(crate) struct ManagedProcessJob {
+    internal_name: String,
     handle: Option<OwnedHandle>,
     completion_port: Option<OwnedHandle>,
     completion_key: usize,
     completion_fence: Option<ManagedProcessFence>,
     completion_mailbox: Arc<Mutex<CompletionMailbox>>,
     completion_listener: Option<JoinHandle<()>>,
+    completion_stop: Arc<AtomicBool>,
 }
 
 /// Non-Windows marker type returned only behind `Option::None`.
 #[cfg(not(windows))]
 #[derive(Debug)]
-pub struct ManagedProcessJob {
+pub(crate) struct ManagedProcessJob {
     _unsupported: (),
 }
 
 impl ManagedProcessJob {
     /// Creates an empty, non-inheritable Job Object whose final handle closes
     /// every process in the tree.
-    pub fn create() -> Result<Option<Self>, String> {
+    #[cfg(test)]
+    pub(crate) fn create() -> Result<Option<Self>, String> {
         #[cfg(windows)]
         {
-            create_windows_job().map(Some)
+            let name = format!("Local\\DevManager-Test-{}", uuid::Uuid::now_v7());
+            create_windows_job(&name).map(Some)
         }
 
         #[cfg(not(windows))]
@@ -257,13 +494,38 @@ impl ManagedProcessJob {
         }
     }
 
+    /// Creates the one Job authority for an exact managed resource
+    /// generation. The stable internal name is intentionally derived only
+    /// from non-secret ownership/fence values and is never a user-facing
+    /// process label.
+    #[cfg(windows)]
+    pub(crate) fn create_for_resource(
+        owner: ProcessOwner,
+        fence: ResourceFence,
+    ) -> Result<Self, String> {
+        let owner = match owner {
+            ProcessOwner::Task(task_id) => format!("Task-{task_id}"),
+            ProcessOwner::Host => "Host".to_string(),
+        };
+        let internal_name = format!(
+            "Local\\DevManager-{owner}-{}-{}",
+            fence.resource_id, fence.runtime_generation
+        );
+        create_windows_job(&internal_name)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn internal_name(&self) -> &str {
+        &self.internal_name
+    }
+
     /// Returns the active process IDs currently assigned to this Job Object.
     ///
     /// On non-Windows platforms this always returns an empty list.
-    pub fn active_process_ids(&self) -> Result<Vec<u32>, String> {
+    pub(crate) fn active_process_ids(&self) -> Result<Vec<u32>, String> {
         #[cfg(windows)]
         {
-            query_job_active_process_ids(self.raw_job_handle())
+            query_job_active_process_ids(self.raw_job_handle(), MAX_JOB_PROCESS_ID_CAPACITY)
         }
 
         #[cfg(not(windows))]
@@ -272,7 +534,100 @@ impl ManagedProcessJob {
         }
     }
 
-    pub fn inspect_process(&self, pid: u32) -> Result<JobMemberInfo, String> {
+    pub(crate) fn active_process_ids_until(
+        &self,
+        absolute_deadline: std::time::Instant,
+    ) -> Result<Vec<u32>, String> {
+        self.active_process_ids_with_capacity_until(absolute_deadline, MAX_JOB_PROCESS_ID_CAPACITY)
+    }
+
+    fn active_process_ids_with_capacity_until(
+        &self,
+        absolute_deadline: std::time::Instant,
+        max_members: usize,
+    ) -> Result<Vec<u32>, String> {
+        if max_members == 0 || max_members > MAX_JOB_PROCESS_ID_CAPACITY {
+            return Err(format!(
+                "managed Job membership capacity must be between 1 and {MAX_JOB_PROCESS_ID_CAPACITY}"
+            ));
+        }
+        if std::time::Instant::now() >= absolute_deadline {
+            return Err("managed Job membership query exceeded teardown deadline".to_string());
+        }
+        #[cfg(windows)]
+        let process_ids = query_job_active_process_ids(self.raw_job_handle(), max_members)?;
+        #[cfg(not(windows))]
+        let process_ids = Vec::new();
+        if std::time::Instant::now() >= absolute_deadline {
+            return Err("managed Job membership query exceeded teardown deadline".to_string());
+        }
+        Ok(process_ids)
+    }
+
+    /// Observes the current Job members as exact identities without exposing
+    /// the Job handle or any close capability. The OS query allocation,
+    /// identity walk, and returned vector all share one caller deadline and
+    /// one bounded per-Job member cap.
+    pub(crate) fn active_process_observations_until(
+        &self,
+        absolute_deadline: std::time::Instant,
+        max_members: usize,
+    ) -> Result<Vec<JobMemberObservation>, String> {
+        if std::time::Instant::now() >= absolute_deadline {
+            return Err("managed Job observation exceeded absolute deadline".to_string());
+        }
+        let active_process_ids =
+            self.active_process_ids_with_capacity_until(absolute_deadline, max_members);
+        if std::time::Instant::now() >= absolute_deadline {
+            return Err("managed Job observation exceeded absolute deadline".to_string());
+        }
+        collect_exact_job_observations_until(
+            active_process_ids,
+            |pid| self.inspect_process_until(pid, absolute_deadline),
+            absolute_deadline,
+            max_members,
+        )
+    }
+
+    /// Explicitly terminates every current member of this owned Job Object.
+    ///
+    /// This is intentionally Job-scoped rather than PID-scoped. The Job,
+    /// completion port, and listener remain owned by this value until the
+    /// caller has observed the exact completion fence and authoritative empty
+    /// membership before releasing it.
+    pub(crate) fn terminate_tree(&self) -> Result<(), String> {
+        #[cfg(windows)]
+        {
+            if unsafe { TerminateJobObject(self.raw_job_handle(), 1) } == 0 {
+                return Err(format!(
+                    "TerminateJobObject failed: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            Ok(())
+        }
+
+        #[cfg(not(windows))]
+        {
+            Err("Job Object termination is unavailable off Windows".to_string())
+        }
+    }
+
+    pub(crate) fn terminate_tree_until(
+        &self,
+        absolute_deadline: std::time::Instant,
+    ) -> Result<(), String> {
+        if std::time::Instant::now() >= absolute_deadline {
+            return Err("managed Job termination exceeded teardown deadline".to_string());
+        }
+        self.terminate_tree()?;
+        if std::time::Instant::now() >= absolute_deadline {
+            return Err("managed Job termination exceeded teardown deadline".to_string());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn inspect_process(&self, pid: u32) -> Result<JobMemberInfo, String> {
         #[cfg(windows)]
         {
             inspect_windows_process(self.raw_job_handle(), pid)
@@ -285,7 +640,25 @@ impl ManagedProcessJob {
         }
     }
 
-    pub fn bind_completion_fence(&mut self, fence: ManagedProcessFence) -> Result<(), String> {
+    pub(crate) fn inspect_process_until(
+        &self,
+        pid: u32,
+        absolute_deadline: std::time::Instant,
+    ) -> Result<JobMemberInfo, String> {
+        if std::time::Instant::now() >= absolute_deadline {
+            return Err("managed Job process inspection exceeded teardown deadline".to_string());
+        }
+        let member = self.inspect_process(pid)?;
+        if std::time::Instant::now() >= absolute_deadline {
+            return Err("managed Job process inspection exceeded teardown deadline".to_string());
+        }
+        Ok(member)
+    }
+
+    pub(crate) fn bind_completion_fence(
+        &mut self,
+        fence: ManagedProcessFence,
+    ) -> Result<(), String> {
         #[cfg(windows)]
         {
             self.bind_windows_completion_fence(fence)
@@ -298,7 +671,45 @@ impl ManagedProcessJob {
         }
     }
 
-    pub fn drain_completion_messages(&self) -> Vec<JobCompletionMessage> {
+    /// Stops the completion listener and joins it before returning.
+    ///
+    /// The listener owns the only receiver capability and may mutate the
+    /// completion mailbox. Joining it is therefore part of the release
+    /// boundary: once this method returns, no receiver thread can outlive the
+    /// Job or mutate its mailbox.
+    pub(crate) fn shutdown_for_release(&mut self) -> Result<(), String> {
+        #[cfg(windows)]
+        {
+            let deadline = std::time::Instant::now()
+                .checked_add(COMPLETION_LISTENER_RELEASE_TIMEOUT)
+                .ok_or_else(|| "managed Job release deadline overflow".to_string())?;
+            self.shutdown_listener_until(deadline)
+        }
+
+        #[cfg(not(windows))]
+        {
+            Ok(())
+        }
+    }
+
+    pub(crate) fn shutdown_for_release_until(
+        &mut self,
+        absolute_deadline: std::time::Instant,
+    ) -> Result<(), String> {
+        #[cfg(windows)]
+        {
+            self.shutdown_listener_until(absolute_deadline)
+        }
+
+        #[cfg(not(windows))]
+        {
+            let _ = absolute_deadline;
+            Ok(())
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn drain_completion_messages(&self) -> Vec<JobCompletionMessage> {
         #[cfg(windows)]
         {
             self.completion_mailbox
@@ -310,6 +721,44 @@ impl ManagedProcessJob {
         #[cfg(not(windows))]
         {
             Vec::new()
+        }
+    }
+
+    pub(crate) fn drain_completion_messages_until(
+        &self,
+        absolute_deadline: std::time::Instant,
+    ) -> Result<Vec<JobCompletionMessage>, String> {
+        #[cfg(windows)]
+        {
+            loop {
+                if std::time::Instant::now() >= absolute_deadline {
+                    return Err(
+                        "managed Job completion drain exceeded teardown deadline".to_string()
+                    );
+                }
+                match self.completion_mailbox.try_lock() {
+                    Ok(mut mailbox) => {
+                        let messages = mailbox.drain();
+                        if std::time::Instant::now() >= absolute_deadline {
+                            return Err("managed Job completion drain exceeded teardown deadline"
+                                .to_string());
+                        }
+                        return Ok(messages);
+                    }
+                    Err(std::sync::TryLockError::WouldBlock) => std::thread::yield_now(),
+                    Err(std::sync::TryLockError::Poisoned(_)) => {
+                        return Err("managed Job completion mailbox poisoned".to_string())
+                    }
+                }
+            }
+        }
+
+        #[cfg(not(windows))]
+        {
+            if std::time::Instant::now() >= absolute_deadline {
+                return Err("managed Job completion drain exceeded teardown deadline".to_string());
+            }
+            Ok(Vec::new())
         }
     }
 
@@ -348,17 +797,81 @@ impl ManagedProcessJob {
             .as_raw_handle() as usize;
         let completion_key = self.completion_key;
         let mailbox = Arc::clone(&self.completion_mailbox);
+        let completion_stop = Arc::clone(&self.completion_stop);
         let listener_fence = fence.clone();
+        let receiver = CompletionReceiverToken::issue();
         let listener = std::thread::Builder::new()
             .name(format!(
                 "devmanager-job-{}-{}",
                 fence.resource().resource_id,
                 fence.resource().runtime_generation
             ))
-            .spawn(move || completion_listener(port, completion_key, listener_fence, mailbox))
+            .spawn(move || {
+                completion_listener(
+                    port,
+                    completion_key,
+                    listener_fence,
+                    mailbox,
+                    completion_stop,
+                    receiver,
+                )
+            })
             .map_err(|error| format!("could not spawn Job completion listener: {error}"))?;
         self.completion_fence = Some(fence);
         self.completion_listener = Some(listener);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn shutdown_listener_until(
+        &mut self,
+        absolute_deadline: std::time::Instant,
+    ) -> Result<(), String> {
+        let Some(listener) = self.completion_listener.take() else {
+            return Ok(());
+        };
+
+        self.completion_stop.store(true, Ordering::SeqCst);
+        let post_error = match self.completion_port.as_ref() {
+            Some(port) => {
+                let posted = unsafe {
+                    PostQueuedCompletionStatus(
+                        port.as_raw_handle(),
+                        SHUTDOWN_MESSAGE,
+                        SHUTDOWN_COMPLETION_KEY,
+                        std::ptr::null_mut(),
+                    ) != 0
+                };
+                (!posted).then(|| {
+                    format!(
+                        "managed Job completion listener shutdown post failed: {}",
+                        std::io::Error::last_os_error()
+                    )
+                })
+            }
+            None => {
+                Some("managed Job completion port is unavailable while stopping listener".into())
+            }
+        };
+        while !listener.is_finished() && std::time::Instant::now() < absolute_deadline {
+            std::thread::yield_now();
+        }
+        if !listener.is_finished() {
+            // Keep ownership of the receiver capability.  The exact release
+            // authority remains retryable and no JoinHandle is detached.
+            self.completion_listener = Some(listener);
+            return Err("managed Job completion listener did not acknowledge cancellation before the release deadline".to_string());
+        }
+        let join_error = listener
+            .join()
+            .err()
+            .map(|_| "managed Job completion listener panicked during shutdown".to_string());
+        if let Some(detail) = post_error {
+            return Err(detail);
+        }
+        if let Some(detail) = join_error {
+            return Err(detail);
+        }
         Ok(())
     }
 }
@@ -366,19 +879,34 @@ impl ManagedProcessJob {
 #[cfg(windows)]
 impl Drop for ManagedProcessJob {
     fn drop(&mut self) {
-        if let Some(listener) = self.completion_listener.take() {
-            let posted = self.completion_port.as_ref().is_some_and(|port| unsafe {
-                PostQueuedCompletionStatus(
-                    port.as_raw_handle(),
-                    SHUTDOWN_MESSAGE,
-                    SHUTDOWN_COMPLETION_KEY,
-                    std::ptr::null_mut(),
-                ) != 0
-            });
-            if !posted {
-                drop(self.completion_port.take());
+        // The listener must be joined before either handle is closed. The
+        // completion port is the listener's wakeup boundary, while the
+        // polling stop flag is the fail-closed fallback if posting fails.
+        let release_deadline = std::time::Instant::now()
+            .checked_add(COMPLETION_LISTENER_RELEASE_TIMEOUT)
+            .unwrap_or_else(|| std::process::abort());
+        if self.shutdown_listener_until(release_deadline).is_err()
+            && self.completion_listener.is_some()
+        {
+            // Closing the completion port is the final documented cancellation
+            // boundary for GetQueuedCompletionStatus.  Wait only for the
+            // bounded private receiver to acknowledge it, then join an
+            // already-finished thread.
+            drop(self.completion_port.take());
+            if let Some(listener) = self.completion_listener.take() {
+                let wait_started = std::time::Instant::now();
+                while !listener.is_finished()
+                    && wait_started.elapsed() < COMPLETION_LISTENER_DROP_TIMEOUT
+                {
+                    std::thread::yield_now();
+                }
+                if !listener.is_finished() {
+                    // Returning would detach the sole receiver capability and
+                    // violate the Job's no-orphan contract.
+                    std::process::abort();
+                }
+                let _ = listener.join();
             }
-            let _ = listener.join();
         }
         drop(self.completion_port.take());
         drop(self.handle.take());
@@ -390,7 +918,7 @@ impl Drop for ManagedProcessJob {
 /// New managed launchers must still create the process suspended before calling
 /// this compatibility boundary. The Phase 3 launcher slice will replace PID
 /// reopening with the primary process handle returned by process creation.
-pub fn attach_process_to_managed_job(pid: u32) -> Result<Option<ManagedProcessJob>, String> {
+pub(crate) fn attach_process_to_managed_job(pid: u32) -> Result<Option<ManagedProcessJob>, String> {
     #[cfg(windows)]
     {
         attach_process_to_windows_job(pid).map(Some)
@@ -404,9 +932,14 @@ pub fn attach_process_to_managed_job(pid: u32) -> Result<Option<ManagedProcessJo
 }
 
 #[cfg(windows)]
-fn query_job_active_process_ids(job: *mut c_void) -> Result<Vec<u32>, String> {
+fn query_job_active_process_ids(job: *mut c_void, max_capacity: usize) -> Result<Vec<u32>, String> {
     if job.is_null() {
         return Err("managed job handle is null".to_string());
+    }
+    if max_capacity == 0 || max_capacity > MAX_JOB_PROCESS_ID_CAPACITY {
+        return Err(format!(
+            "managed Job membership capacity must be between 1 and {MAX_JOB_PROCESS_ID_CAPACITY}"
+        ));
     }
 
     // JOBOBJECT_BASIC_PROCESS_ID_LIST:
@@ -416,12 +949,12 @@ fn query_job_active_process_ids(job: *mut c_void) -> Result<Vec<u32>, String> {
     let header_bytes = std::mem::size_of::<u32>()
         .checked_mul(2)
         .ok_or_else(|| "job process list header size overflow".to_string())?;
-    let mut capacity = 16usize;
+    let mut capacity = 16usize.min(max_capacity);
 
     loop {
-        if capacity > MAX_JOB_PROCESS_ID_CAPACITY {
+        if capacity > max_capacity {
             return Err(format!(
-                "QueryInformationJobObject process list exceeds {MAX_JOB_PROCESS_ID_CAPACITY} members"
+                "QueryInformationJobObject process list exceeds {max_capacity} members"
             ));
         }
         let list_bytes = capacity
@@ -463,14 +996,12 @@ fn query_job_active_process_ids(job: *mut c_void) -> Result<Vec<u32>, String> {
             if error.raw_os_error() == Some(ERROR_MORE_DATA) {
                 let assigned = u32::from_ne_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]);
                 let needed = (assigned as usize).max(1);
-                if needed > MAX_JOB_PROCESS_ID_CAPACITY || capacity >= MAX_JOB_PROCESS_ID_CAPACITY {
+                if needed > max_capacity || capacity >= max_capacity {
                     return Err(format!(
-                        "QueryInformationJobObject process list exceeds {MAX_JOB_PROCESS_ID_CAPACITY} members"
+                        "QueryInformationJobObject process list exceeds {max_capacity} members"
                     ));
                 }
-                let next_capacity = needed
-                    .max(capacity.saturating_mul(2))
-                    .min(MAX_JOB_PROCESS_ID_CAPACITY);
+                let next_capacity = needed.max(capacity.saturating_mul(2)).min(max_capacity);
                 if next_capacity <= capacity {
                     return Err(format!(
                         "QueryInformationJobObject returned ERROR_MORE_DATA but capacity {capacity} cannot grow"
@@ -482,19 +1013,42 @@ fn query_job_active_process_ids(job: *mut c_void) -> Result<Vec<u32>, String> {
             return Err(format!("QueryInformationJobObject failed: {error}"));
         }
 
+        let returned_bytes = usize::try_from(return_length)
+            .map_err(|_| "job process list result length does not fit usize".to_string())?;
+        if returned_bytes < header_bytes || returned_bytes > total_bytes {
+            return Err(format!(
+                "QueryInformationJobObject returned invalid process-list length {returned_bytes} for a {total_bytes}-byte buffer"
+            ));
+        }
+
         let count = u32::from_ne_bytes([buffer[4], buffer[5], buffer[6], buffer[7]]) as usize;
         if count > capacity {
-            if count > MAX_JOB_PROCESS_ID_CAPACITY {
+            if count > max_capacity {
                 return Err(format!(
-                    "QueryInformationJobObject returned {count} members (max {MAX_JOB_PROCESS_ID_CAPACITY})"
+                    "QueryInformationJobObject returned {count} members (max {max_capacity})"
                 ));
             }
             capacity = count;
             continue;
         }
+        let required_bytes = header_bytes
+            .checked_add(
+                count
+                    .checked_mul(std::mem::size_of::<usize>())
+                    .ok_or_else(|| "job process list result size overflow".to_string())?,
+            )
+            .ok_or_else(|| "job process list result size overflow".to_string())?;
+        if required_bytes > returned_bytes {
+            return Err(format!(
+                "QueryInformationJobObject reported {count} members requiring {required_bytes} bytes but returned only {returned_bytes} bytes"
+            ));
+        }
 
         let list_ptr = unsafe { buffer.as_ptr().add(header_bytes) as *const usize };
-        let mut process_ids = Vec::with_capacity(count);
+        let mut process_ids = Vec::new();
+        process_ids
+            .try_reserve_exact(count)
+            .map_err(|error| format!("managed Job PID snapshot allocation failed: {error}"))?;
         for index in 0..count {
             let pid = unsafe { *list_ptr.add(index) } as u32;
             if pid != 0 {
@@ -508,9 +1062,17 @@ fn query_job_active_process_ids(job: *mut c_void) -> Result<Vec<u32>, String> {
 }
 
 #[cfg(windows)]
-fn create_windows_job() -> Result<ManagedProcessJob, String> {
+fn create_windows_job(internal_name: &str) -> Result<ManagedProcessJob, String> {
+    if internal_name.is_empty() || internal_name.len() > 240 || internal_name.contains('\0') {
+        return Err("managed Job internal identity is invalid".to_string());
+    }
+    let wide_name: Vec<u16> = std::ffi::OsStr::new(internal_name)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
     unsafe {
-        let raw_job = CreateJobObjectW(std::ptr::null_mut(), std::ptr::null());
+        SetLastError(0);
+        let raw_job = CreateJobObjectW(std::ptr::null_mut(), wide_name.as_ptr());
         if raw_job.is_null() {
             return Err(format!(
                 "CreateJobObjectW failed: {}",
@@ -520,6 +1082,11 @@ fn create_windows_job() -> Result<ManagedProcessJob, String> {
         // Null SECURITY_ATTRIBUTES make this handle non-inheritable. OwnedHandle
         // closes exactly this sole owner on every subsequent error path.
         let job = OwnedHandle::from_raw_handle(raw_job);
+        if std::io::Error::last_os_error().raw_os_error() == Some(ERROR_ALREADY_EXISTS) {
+            return Err(format!(
+                "managed Job identity `{internal_name}` is already owned"
+            ));
+        }
 
         let raw_completion_port =
             CreateIoCompletionPort((-1isize) as *mut c_void, std::ptr::null_mut(), 0, 1);
@@ -564,12 +1131,14 @@ fn create_windows_job() -> Result<ManagedProcessJob, String> {
         }
 
         Ok(ManagedProcessJob {
+            internal_name: internal_name.to_string(),
             handle: Some(job),
             completion_port: Some(completion_port),
             completion_key,
             completion_fence: None,
             completion_mailbox: Arc::new(Mutex::new(CompletionMailbox::default())),
             completion_listener: None,
+            completion_stop: Arc::new(AtomicBool::new(false)),
         })
     }
 }
@@ -577,7 +1146,11 @@ fn create_windows_job() -> Result<ManagedProcessJob, String> {
 #[cfg(windows)]
 fn attach_process_to_windows_job(pid: u32) -> Result<ManagedProcessJob, String> {
     unsafe {
-        let job = create_windows_job()?;
+        let job = create_windows_job(&format!(
+            "Local\\DevManager-Legacy-{}-{}",
+            pid,
+            uuid::Uuid::now_v7()
+        ))?;
 
         let raw_process = OpenProcess(PROCESS_TERMINATE | PROCESS_SET_QUOTA, 0, pid);
         if raw_process.is_null() {
@@ -617,9 +1190,14 @@ fn completion_listener(
     expected_completion_key: usize,
     fence: ManagedProcessFence,
     mailbox: Arc<Mutex<CompletionMailbox>>,
+    stop: Arc<AtomicBool>,
+    receiver: CompletionReceiverToken,
 ) {
     let completion_port = completion_port_value as *mut c_void;
     loop {
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
         let mut message_id = 0u32;
         let mut completion_key = 0usize;
         let mut process_value = std::ptr::null_mut();
@@ -629,7 +1207,7 @@ fn completion_listener(
                 &mut message_id,
                 &mut completion_key,
                 &mut process_value,
-                u32::MAX,
+                COMPLETION_LISTENER_POLL_MILLIS,
             )
         };
         if completion_key == SHUTDOWN_COMPLETION_KEY
@@ -639,14 +1217,24 @@ fn completion_listener(
             break;
         }
         if ok == 0 {
+            if std::io::Error::last_os_error().raw_os_error() == Some(ERROR_TIMEOUT) {
+                if stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                continue;
+            }
             let detail = std::io::Error::last_os_error().to_string();
             mailbox
                 .lock()
                 .expect("managed Job completion mailbox poisoned")
-                .push(JobCompletionMessage::new(
-                    fence.clone(),
-                    JobCompletionEvent::MonitorFailed { detail },
-                ));
+                .push(
+                    &receiver,
+                    JobCompletionMessage::from_completion_receiver(
+                        &receiver,
+                        fence.clone(),
+                        JobCompletionEvent::MonitorFailed { detail },
+                    ),
+                );
             break;
         }
         if completion_key != expected_completion_key {
@@ -669,7 +1257,10 @@ fn completion_listener(
         mailbox
             .lock()
             .expect("managed Job completion mailbox poisoned")
-            .push(JobCompletionMessage::new(fence.clone(), event));
+            .push(
+                &receiver,
+                JobCompletionMessage::from_completion_receiver(&receiver, fence.clone(), event),
+            );
     }
 }
 
@@ -731,7 +1322,12 @@ fn inspect_windows_process(job: *mut c_void, pid: u32) -> Result<JobMemberInfo, 
                 std::io::Error::last_os_error()
             ));
         }
-        executable_buffer.truncate(executable_length as usize);
+        let executable_length = checked_process_image_length(
+            executable_length,
+            executable_buffer.len(),
+            "managed Job process image",
+        )?;
+        executable_buffer.truncate(executable_length);
         let executable = std::path::PathBuf::from(String::from_utf16_lossy(&executable_buffer));
         let identity = ManagedProcessIdentity::new(process_id, executable)
             .map_err(|error| format!("could not canonicalize executable for PID {pid}: {error}"))?;
@@ -757,6 +1353,22 @@ fn inspect_windows_process(job: *mut c_void, pid: u32) -> Result<JobMemberInfo, 
         .flatten();
         Ok(JobMemberInfo::new(identity, command_line))
     }
+}
+
+#[cfg(windows)]
+fn checked_process_image_length(
+    reported_length: u32,
+    buffer_capacity: usize,
+    context: &str,
+) -> Result<usize, String> {
+    let reported_length = usize::try_from(reported_length)
+        .map_err(|_| format!("{context} length does not fit usize"))?;
+    if reported_length > buffer_capacity {
+        return Err(format!(
+            "{context} length {reported_length} exceeds buffer capacity {buffer_capacity}"
+        ));
+    }
+    Ok(reported_length)
 }
 
 #[cfg(windows)]
@@ -809,7 +1421,13 @@ mod tests {
     use crate::domain::id::ResourceId;
     use crate::domain::operation::ResourceFence;
     use crate::process::identity::{ManagedProcessId, ManagedProcessIdentity, ProcessOwner};
-    use crate::process::registry::{JobCompletionEvent, JobCompletionMessage, ManagedProcessFence};
+    use crate::process::registry::{
+        JobCompletionEvent, JobCompletionMessage, JobMemberInfo, ManagedProcessFence,
+    };
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
 
     fn authority() -> ManagedProcessFence {
         let resource_id = ResourceId::from_bytes([
@@ -830,17 +1448,239 @@ mod tests {
     }
 
     fn message(authority: &ManagedProcessFence, event: JobCompletionEvent) -> JobCompletionMessage {
-        JobCompletionMessage::new(authority.clone(), event)
+        let receiver = super::CompletionReceiverToken::issue();
+        JobCompletionMessage::from_completion_receiver(&receiver, authority.clone(), event)
+    }
+
+    #[test]
+    fn process_image_length_is_checked_before_job_identity_buffer_truncation() {
+        assert_eq!(
+            super::checked_process_image_length(4, 4, "test process image"),
+            Ok(4)
+        );
+        let error = super::checked_process_image_length(5, 4, "test process image")
+            .expect_err("an OS-reported length outside the allocation must fail closed");
+        assert!(error.contains("buffer capacity"), "{error}");
+    }
+
+    #[test]
+    fn exact_job_observation_collection_rejects_capacity_before_identity_inspection() {
+        let inspections = AtomicUsize::new(0);
+        let deadline = Instant::now()
+            .checked_add(Duration::from_secs(1))
+            .expect("observation deadline");
+
+        let error = super::collect_exact_job_observations_until(
+            Ok(vec![71, 72]),
+            |_| {
+                inspections.fetch_add(1, Ordering::SeqCst);
+                unreachable!("over-capacity input must fail before identity inspection")
+            },
+            deadline,
+            1,
+        )
+        .expect_err("over-capacity Job observations must fail closed");
+
+        assert!(error.contains("exceeds 1 members"), "{error}");
+        assert_eq!(inspections.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn exact_job_observation_collection_preserves_accessible_and_inaccessible_members() {
+        let root = authority().root().clone();
+        let root_pid = root.id().pid();
+        let inaccessible_pid = root_pid.saturating_add(1);
+        let deadline = Instant::now()
+            .checked_add(Duration::from_secs(1))
+            .expect("observation deadline");
+
+        let observations = super::collect_exact_job_observations_until(
+            Ok(vec![root_pid, root_pid, inaccessible_pid, inaccessible_pid]),
+            |pid| {
+                if pid == root_pid {
+                    Ok(JobMemberInfo::new(root.clone(), None))
+                } else {
+                    Err("identity access denied".to_string())
+                }
+            },
+            deadline,
+            2,
+        )
+        .expect("bounded exact observations");
+
+        assert!(observations.iter().any(|observation| matches!(
+            observation,
+            super::JobMemberObservation::Accessible { identity } if identity == &root
+        )));
+        assert!(observations.iter().any(|observation| matches!(
+            observation,
+            super::JobMemberObservation::Inaccessible { pid, creation_time_100ns: None, reason }
+                if *pid == inaccessible_pid && reason == "identity access denied"
+        )));
+        assert_eq!(
+            observations.len(),
+            2,
+            "duplicate PID observations must be deduplicated before the cap"
+        );
+    }
+
+    #[test]
+    fn completion_listener_ignores_mismatched_completion_keys() {
+        let raw_port = unsafe {
+            super::CreateIoCompletionPort(
+                (-1isize) as *mut super::c_void,
+                std::ptr::null_mut(),
+                0,
+                1,
+            )
+        };
+        assert!(!raw_port.is_null(), "create completion port");
+        let port = unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(raw_port) };
+        let port_value = port.as_raw_handle() as usize;
+        let expected_key = 0x71usize;
+        let mailbox = Arc::new(Mutex::new(super::CompletionMailbox::default()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let listener = std::thread::spawn({
+            let mailbox = Arc::clone(&mailbox);
+            let stop = Arc::clone(&stop);
+            let fence = authority();
+            move || {
+                super::completion_listener(
+                    port_value,
+                    expected_key,
+                    fence,
+                    mailbox,
+                    stop,
+                    super::CompletionReceiverToken::issue(),
+                )
+            }
+        });
+
+        let wrong_key_posted = unsafe {
+            super::PostQueuedCompletionStatus(
+                port_value as *mut super::c_void,
+                super::JOB_OBJECT_MSG_NEW_PROCESS,
+                expected_key + 1,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_ne!(wrong_key_posted, 0, "post mismatched completion packet");
+        std::thread::sleep(Duration::from_millis(75));
+        assert!(
+            !listener.is_finished(),
+            "a mismatched packet must not terminate the receiver"
+        );
+
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        let shutdown_posted = unsafe {
+            super::PostQueuedCompletionStatus(
+                port_value as *mut super::c_void,
+                super::SHUTDOWN_MESSAGE,
+                super::SHUTDOWN_COMPLETION_KEY,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_ne!(shutdown_posted, 0, "post listener shutdown packet");
+        listener.join().expect("completion listener join");
+        assert!(mailbox
+            .lock()
+            .expect("completion mailbox")
+            .drain()
+            .is_empty());
+        drop(port);
+    }
+
+    #[test]
+    fn managed_job_drop_joins_listener_before_return() {
+        let Some(mut job) = super::ManagedProcessJob::create()
+            .expect("create managed Job for listener shutdown test")
+        else {
+            return;
+        };
+        let listener_finished = Arc::new(AtomicBool::new(false));
+        let listener_finished_for_thread = Arc::clone(&listener_finished);
+        job.completion_listener = Some(std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(750));
+            listener_finished_for_thread.store(true, std::sync::atomic::Ordering::SeqCst);
+        }));
+
+        let drop_started = Instant::now();
+        drop(job);
+        let returned_before_listener = !listener_finished.load(Ordering::SeqCst);
+        let elapsed = drop_started.elapsed();
+        assert!(
+            !returned_before_listener,
+            "managed Job drop returned while its completion listener was still live (elapsed {elapsed:?})"
+        );
+    }
+
+    #[test]
+    fn listener_release_timeout_retains_join_authority_for_exact_retry() {
+        let Some(mut job) = super::ManagedProcessJob::create()
+            .expect("create managed Job for retryable listener release")
+        else {
+            return;
+        };
+        let listener_finished = Arc::new(AtomicBool::new(false));
+        let listener_finished_for_thread = Arc::clone(&listener_finished);
+        job.completion_listener = Some(std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(25));
+            listener_finished_for_thread.store(true, Ordering::SeqCst);
+        }));
+
+        let first = job
+            .shutdown_for_release_until(Instant::now())
+            .expect_err("expired release must retain a live listener handle");
+        assert!(first.contains("did not acknowledge cancellation"));
+        assert!(job.completion_listener.is_some());
+
+        let retry_deadline = Instant::now()
+            .checked_add(Duration::from_secs(1))
+            .expect("retry deadline");
+        job.shutdown_for_release_until(retry_deadline)
+            .expect("same Job listener authority remains retryable");
+        assert!(listener_finished.load(Ordering::SeqCst));
+        assert!(job.completion_listener.is_none());
+    }
+
+    #[test]
+    fn repeated_managed_job_drops_join_every_listener() {
+        for _ in 0..4 {
+            let Some(mut job) = super::ManagedProcessJob::create()
+                .expect("create managed Job for repeated listener shutdown")
+            else {
+                return;
+            };
+            let listener_finished = Arc::new(AtomicBool::new(false));
+            let listener_finished_for_thread = Arc::clone(&listener_finished);
+            job.completion_listener = Some(std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(25));
+                listener_finished_for_thread.store(true, Ordering::SeqCst);
+            }));
+
+            drop(job);
+            assert!(
+                listener_finished.load(Ordering::SeqCst),
+                "repeated Job drop left a completion listener running"
+            );
+        }
     }
 
     #[test]
     fn membership_mailbox_overflow_is_visible_and_preserves_arriving_zero() {
         let authority = authority();
+        let receiver = super::CompletionReceiverToken::issue();
         let mut mailbox = CompletionMailbox::default();
         for pid in 1..=MAX_COMPLETION_MESSAGES as u32 {
-            mailbox.push(message(&authority, JobCompletionEvent::ExitProcess { pid }));
+            mailbox.push(
+                &receiver,
+                message(&authority, JobCompletionEvent::ExitProcess { pid }),
+            );
         }
-        mailbox.push(message(&authority, JobCompletionEvent::ActiveProcessZero));
+        mailbox.push(
+            &receiver,
+            message(&authority, JobCompletionEvent::ActiveProcessZero),
+        );
 
         let messages = mailbox.drain();
         assert!(messages.len() <= MAX_COMPLETION_MESSAGES);
@@ -858,10 +1698,17 @@ mod tests {
     #[test]
     fn membership_mailbox_overflow_is_visible_and_preserves_queued_zero() {
         let authority = authority();
+        let receiver = super::CompletionReceiverToken::issue();
         let mut mailbox = CompletionMailbox::default();
-        mailbox.push(message(&authority, JobCompletionEvent::ActiveProcessZero));
+        mailbox.push(
+            &receiver,
+            message(&authority, JobCompletionEvent::ActiveProcessZero),
+        );
         for pid in 1..=MAX_COMPLETION_MESSAGES as u32 {
-            mailbox.push(message(&authority, JobCompletionEvent::NewProcess { pid }));
+            mailbox.push(
+                &receiver,
+                message(&authority, JobCompletionEvent::NewProcess { pid }),
+            );
         }
 
         let messages = mailbox.drain();

@@ -1,3 +1,5 @@
+pub use crate::domain::snapshot::ProcessMetricStatus;
+use crate::process::registry::ManagedProcessFence;
 use crate::terminal::session::TerminalBackend;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -129,7 +131,182 @@ pub struct ProcessResourceNode {
     pub parent_pid: Option<u32>,
     pub name: String,
     pub cpu_percent: f32,
+    /// Unclamped core-equivalent percentage retained for diagnostics. The
+    /// user-facing `cpu_percent` remains the whole-machine Task Manager
+    /// projection in `0..=100`.
+    #[serde(default)]
+    pub core_equivalent_percent: f32,
     pub memory_bytes: u64,
+    #[serde(default = "default_memory_metric")]
+    pub memory_metric: ResourceMemoryMetric,
+    /// Exact process generation when the operating system exposed it. A PID
+    /// without creation time is never sufficient for control decisions.
+    #[serde(default)]
+    pub creation_time_100ns: Option<u64>,
+    /// Redacted executable basename. Canonical identity stays private to Job
+    /// membership and sampler baseline checks.
+    #[serde(default)]
+    pub executable: Option<String>,
+    /// Safe allowlisted command-shape label; raw command lines are never
+    /// retained in the runtime projection.
+    #[serde(default)]
+    pub command_label: Option<String>,
+    /// Number of command arguments observed, without retaining raw arguments.
+    #[serde(default)]
+    pub command_arg_count: u16,
+    /// Bounded total UTF-8 bytes of command arguments, without retaining the
+    /// command line itself.
+    #[serde(default)]
+    pub command_arg_bytes: u32,
+    /// Opaque resource/session association used by the process monitor;
+    /// arbitrary session IDs never cross this projection boundary.
+    #[serde(default)]
+    pub resource_id: Option<String>,
+    #[serde(default)]
+    pub resource_kind: Option<String>,
+    #[serde(default)]
+    pub child_count: u32,
+    #[serde(default)]
+    pub lifecycle: ProcessResourceLifecycle,
+    #[serde(default)]
+    pub metrics_status: ProcessMetricStatus,
+    #[serde(default)]
+    pub metric_values: ResourceMetricValueState,
+    #[serde(default)]
+    pub cpu_value_state: ResourceMetricValueState,
+    #[serde(default)]
+    pub memory_value_state: ResourceMetricValueState,
+    /// Monotonic sampler generation for the exact PID/creation/executable
+    /// observation represented by this row.
+    #[serde(default)]
+    pub sampling_generation: u64,
+}
+
+/// Describes whether the numeric fields in a resource projection are current
+/// observations, immutable last-known values, or unavailable. Consumers must
+/// never infer idle CPU from a zero paired with `Unavailable`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceMetricValueState {
+    Observed,
+    /// A current aggregate derived from the accessible subset while one or
+    /// more authoritative members could not provide this metric.
+    Partial,
+    LastKnown,
+    #[default]
+    Unavailable,
+}
+
+/// The private-memory counter is intentionally named by its platform truth:
+/// Windows exposes `PrivateUsage` (private committed bytes), while Unix
+/// exposes `/proc/<pid>/smaps_rollup` private clean+dirty (private resident
+/// bytes). Consumers should display this label instead of calling either
+/// value a generic working set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceMemoryMetric {
+    PrivateCommitted,
+    PrivateResident,
+}
+
+impl ResourceMemoryMetric {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::PrivateCommitted => "private committed",
+            Self::PrivateResident => "private resident",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResourceMemoryTotal {
+    pub bytes: u64,
+    pub metric: ResourceMemoryMetric,
+    pub value_state: ResourceMetricValueState,
+}
+
+/// Aggregate memory without presenting cached or unavailable values as a
+/// current total. Current Observed/Partial values are summed together; stale
+/// values are used only when every available value is LastKnown.
+pub fn aggregate_memory_snapshots<'a>(
+    snapshots: impl IntoIterator<Item = &'a ResourceSnapshot>,
+) -> ResourceMemoryTotal {
+    let mut metric = None;
+    let mut current_bytes = 0u64;
+    let mut last_known_bytes = 0u64;
+    let mut saw_current = false;
+    let mut saw_last_known = false;
+    let mut degraded_current_total = false;
+
+    for snapshot in snapshots {
+        match metric {
+            Some(existing) if existing != snapshot.memory_metric => {
+                degraded_current_total = true;
+            }
+            None => metric = Some(snapshot.memory_metric),
+            _ => {}
+        }
+        match snapshot.memory_value_state {
+            ResourceMetricValueState::Observed => {
+                saw_current = true;
+                current_bytes = current_bytes.saturating_add(snapshot.memory_bytes);
+            }
+            ResourceMetricValueState::Partial => {
+                saw_current = true;
+                degraded_current_total = true;
+                current_bytes = current_bytes.saturating_add(snapshot.memory_bytes);
+            }
+            ResourceMetricValueState::LastKnown => {
+                saw_last_known = true;
+                degraded_current_total = true;
+                last_known_bytes = last_known_bytes.saturating_add(snapshot.memory_bytes);
+            }
+            ResourceMetricValueState::Unavailable => {
+                degraded_current_total = true;
+            }
+        }
+    }
+
+    let (bytes, value_state) = if saw_current {
+        (
+            current_bytes,
+            if degraded_current_total {
+                ResourceMetricValueState::Partial
+            } else {
+                ResourceMetricValueState::Observed
+            },
+        )
+    } else if saw_last_known {
+        (last_known_bytes, ResourceMetricValueState::LastKnown)
+    } else {
+        (0, ResourceMetricValueState::Unavailable)
+    };
+
+    ResourceMemoryTotal {
+        bytes,
+        metric: metric.unwrap_or_else(default_memory_metric),
+        value_state,
+    }
+}
+
+fn default_memory_metric() -> ResourceMemoryMetric {
+    if cfg!(target_os = "windows") {
+        ResourceMemoryMetric::PrivateCommitted
+    } else {
+        ResourceMemoryMetric::PrivateResident
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessResourceLifecycle {
+    Starting,
+    #[default]
+    Running,
+    Stopping,
+    Stopped,
+    Failed,
+    Unknown,
 }
 
 fn default_logical_cpu_count() -> u32 {
@@ -157,15 +334,64 @@ pub fn equivalent_cpu_cores(system_cpu_percent: f32, logical_cpu_count: u32) -> 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResourceSnapshot {
     pub cpu_percent: f32,
+    /// Unclamped aggregate core-equivalent percentage retained for
+    /// diagnostics. The user-facing `cpu_percent` remains the whole-machine
+    /// Task Manager projection in `0..=100`.
+    #[serde(default)]
+    pub core_equivalent_percent: f32,
     pub memory_bytes: u64,
+    #[serde(default = "default_memory_metric")]
+    pub memory_metric: ResourceMemoryMetric,
     pub process_count: u32,
+    /// Confidence for the authoritative Job-member count. This remains
+    /// independent from CPU/memory confidence so a failed counter query does
+    /// not hide a successfully observed member count, while a retained count
+    /// can never be mistaken for a current one.
+    #[serde(default)]
+    pub process_count_value_state: ResourceMetricValueState,
     pub process_ids: Vec<u32>,
+    /// Some owned members may be inaccessible; totals remain useful but are
+    /// explicitly partial rather than silently presented as complete.
+    #[serde(default)]
+    pub metrics_unavailable: bool,
+    /// Typed confidence for the entire resource sample. `cpu_percent == 0`
+    /// with `unknown` or `failed` is intentionally distinguishable from an
+    /// observed idle process.
+    #[serde(default)]
+    pub metrics_status: ProcessMetricStatus,
+    #[serde(default)]
+    pub metric_values: ResourceMetricValueState,
+    /// Confidence for `cpu_percent` and `core_equivalent_percent`. This is
+    /// separate from memory because a first CPU baseline can be unavailable
+    /// while the current private-memory counter is already observed.
+    #[serde(default)]
+    pub cpu_value_state: ResourceMetricValueState,
+    /// Confidence for `memory_bytes`.
+    #[serde(default)]
+    pub memory_value_state: ResourceMetricValueState,
+    /// True when this projection intentionally carries an immutable prior
+    /// sample because current Job membership could not be queried.
+    #[serde(default)]
+    pub metrics_stale: bool,
+    #[serde(default)]
+    pub metrics_error: Option<String>,
+    #[serde(default)]
+    pub sampling_generation: u64,
+    #[serde(default)]
+    pub io_read_bytes: Option<u64>,
+    #[serde(default)]
+    pub io_write_bytes: Option<u64>,
     #[serde(default)]
     pub processes: Vec<ProcessResourceNode>,
     /// Logical CPU count used to normalize `cpu_percent`. Defaults to 1 for
     /// snapshots produced before this field existed.
     #[serde(default = "default_logical_cpu_count")]
     pub logical_cpu_count: u32,
+    /// Exact local control authority captured atomically with the current Job
+    /// observations. It is intentionally omitted from every persisted/remote
+    /// projection and is never reconstructed from a PID.
+    #[serde(skip, default)]
+    pub managed_process_fence: Option<ManagedProcessFence>,
     #[serde(skip, default)]
     pub last_sample_at: Option<Instant>,
 }
@@ -174,11 +400,25 @@ impl Default for ResourceSnapshot {
     fn default() -> Self {
         Self {
             cpu_percent: 0.0,
+            core_equivalent_percent: 0.0,
             memory_bytes: 0,
+            memory_metric: default_memory_metric(),
             process_count: 0,
+            process_count_value_state: ResourceMetricValueState::Unavailable,
             process_ids: Vec::new(),
+            metrics_unavailable: false,
+            metrics_status: ProcessMetricStatus::Unknown,
+            metric_values: ResourceMetricValueState::Unavailable,
+            cpu_value_state: ResourceMetricValueState::Unavailable,
+            memory_value_state: ResourceMetricValueState::Unavailable,
+            metrics_stale: false,
+            metrics_error: None,
+            sampling_generation: 0,
+            io_read_bytes: None,
+            io_write_bytes: None,
             processes: Vec::new(),
             logical_cpu_count: 1,
+            managed_process_fence: None,
             last_sample_at: None,
         }
     }
@@ -186,7 +426,13 @@ impl Default for ResourceSnapshot {
 
 impl ResourceSnapshot {
     pub fn equivalent_cpu_cores(&self) -> f32 {
-        equivalent_cpu_cores(self.cpu_percent, self.logical_cpu_count)
+        if (self.core_equivalent_percent.is_finite() && self.core_equivalent_percent > 0.0)
+            || self.cpu_percent == 0.0
+        {
+            self.core_equivalent_percent / 100.0
+        } else {
+            equivalent_cpu_cores(self.cpu_percent, self.logical_cpu_count)
+        }
     }
 }
 
@@ -199,6 +445,8 @@ pub struct ServerLaunchSpec {
     pub args: Vec<String>,
     pub env: HashMap<String, String>,
     pub auto_restart: bool,
+    #[serde(default)]
+    pub port: Option<u16>,
     pub log_file_path: Option<PathBuf>,
 }
 
@@ -883,7 +1131,102 @@ pub use SessionStatus as ProcessStatus;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::id::ResourceId;
+    use crate::domain::operation::ResourceFence;
+    use crate::process::identity::{ManagedProcessId, ManagedProcessIdentity, ProcessOwner};
+    use crate::process::registry::ManagedProcessFence;
     use std::path::PathBuf;
+
+    fn test_managed_process_fence() -> ManagedProcessFence {
+        let resource_id = ResourceId::from_bytes([
+            0x01, 0x9a, 0x11, 0x22, 0x33, 0x44, 0x70, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x51,
+        ])
+        .expect("resource id");
+        let identity = ManagedProcessIdentity::new(
+            ManagedProcessId::new(42, 7).expect("managed process id"),
+            std::env::current_exe().expect("test executable"),
+        )
+        .expect("canonical test executable");
+        ManagedProcessFence::new(
+            ResourceFence::new(resource_id, 3),
+            ProcessOwner::Host,
+            identity,
+        )
+    }
+
+    #[test]
+    fn resource_snapshot_control_fence_is_local_only_and_never_deserialized() {
+        let fence = test_managed_process_fence();
+        let executable_name = fence
+            .root()
+            .canonical_executable()
+            .file_name()
+            .expect("test executable name")
+            .to_string_lossy()
+            .into_owned();
+        let snapshot = ResourceSnapshot {
+            managed_process_fence: Some(fence.clone()),
+            ..ResourceSnapshot::default()
+        };
+
+        let encoded = serde_json::to_string(&snapshot).expect("resource snapshot JSON");
+        assert!(!encoded.contains("managed_process_fence"));
+        assert!(!encoded.contains(&executable_name));
+
+        let decoded: ResourceSnapshot = serde_json::from_str(&encoded).expect("resource snapshot");
+        assert_eq!(snapshot.managed_process_fence.as_ref(), Some(&fence));
+        assert!(decoded.managed_process_fence.is_none());
+    }
+
+    #[test]
+    fn memory_totals_never_mix_stale_or_unavailable_values_into_current_bytes() {
+        let snapshots = [
+            ResourceSnapshot {
+                memory_bytes: 100,
+                memory_metric: ResourceMemoryMetric::PrivateCommitted,
+                memory_value_state: ResourceMetricValueState::Observed,
+                ..ResourceSnapshot::default()
+            },
+            ResourceSnapshot {
+                memory_bytes: 200,
+                memory_metric: ResourceMemoryMetric::PrivateCommitted,
+                memory_value_state: ResourceMetricValueState::LastKnown,
+                ..ResourceSnapshot::default()
+            },
+            ResourceSnapshot {
+                memory_bytes: 300,
+                memory_metric: ResourceMemoryMetric::PrivateCommitted,
+                memory_value_state: ResourceMetricValueState::Unavailable,
+                ..ResourceSnapshot::default()
+            },
+        ];
+
+        let total = aggregate_memory_snapshots(snapshots.iter());
+        assert_eq!(total.bytes, 100);
+        assert_eq!(total.value_state, ResourceMetricValueState::Partial);
+        assert_eq!(total.metric, ResourceMemoryMetric::PrivateCommitted);
+    }
+
+    #[test]
+    fn all_last_known_memory_totals_remain_explicitly_last_known() {
+        let snapshots = [
+            ResourceSnapshot {
+                memory_bytes: 100,
+                memory_value_state: ResourceMetricValueState::LastKnown,
+                ..ResourceSnapshot::default()
+            },
+            ResourceSnapshot {
+                memory_bytes: 200,
+                memory_value_state: ResourceMetricValueState::LastKnown,
+                ..ResourceSnapshot::default()
+            },
+        ];
+
+        let total = aggregate_memory_snapshots(snapshots.iter());
+        assert_eq!(total.bytes, 300);
+        assert_eq!(total.value_state, ResourceMetricValueState::LastKnown);
+    }
 
     fn test_ai_session() -> SessionRuntimeState {
         let mut session = SessionRuntimeState::new(

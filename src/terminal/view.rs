@@ -3,7 +3,7 @@ use crate::browser::{
     BrowserAnnotation, BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
 };
 use crate::models::TabType;
-use crate::state::{AiActivity, SessionStatus};
+use crate::state::{AiActivity, ResourceMetricValueState, ResourceSnapshot, SessionStatus};
 use crate::terminal::session::{
     TerminalCellSnapshot, TerminalCursorSnapshot, TerminalIndexedCellSnapshot, TerminalSessionView,
 };
@@ -742,9 +742,8 @@ fn surface_header_detail(model: &TerminalPaneModel) -> Option<String> {
     let has_live_terminal = session.runtime.status.is_live() || session.runtime.interactive_shell;
 
     if session.runtime.status.is_live() && session.runtime.resources.last_sample_at.is_some() {
-        let mem_mb = session.runtime.resources.memory_bytes / 1024 / 1024;
-        let cpu = session.runtime.resources.cpu_percent;
-        let procs = session.runtime.resources.process_count;
+        let resource_metrics = format_compact_resource_metrics(&session.runtime.resources);
+        let process_count = format_compact_process_count(&session.runtime.resources);
         let uptime = session
             .runtime
             .started_at
@@ -765,10 +764,7 @@ fn surface_header_detail(model: &TerminalPaneModel) -> Option<String> {
         } else {
             format!(" • {uptime}")
         };
-        return Some(format!(
-            "{mem_mb} MB • {cpu:.1}% • {procs} proc{}{uptime_part}",
-            if procs == 1 { "" } else { "s" }
-        ));
+        return Some(format!("{resource_metrics} • {process_count}{uptime_part}"));
     }
 
     has_live_terminal.then(|| match model.active_tab_type.as_ref() {
@@ -1553,5 +1549,95 @@ fn session_status_color(session: &TerminalSessionView) -> u32 {
         SessionStatus::Starting | SessionStatus::Stopping => theme::WARNING_TEXT,
         SessionStatus::Crashed | SessionStatus::Failed => theme::DANGER_TEXT,
         _ => theme::TEXT_MUTED,
+    }
+}
+
+fn format_compact_resource_metrics(resources: &ResourceSnapshot) -> String {
+    let cpu = match resources.cpu_value_state {
+        ResourceMetricValueState::Observed => format!("{:.1}% CPU", resources.cpu_percent),
+        ResourceMetricValueState::Partial => {
+            format!("{:.1}% CPU (partial)", resources.cpu_percent)
+        }
+        ResourceMetricValueState::LastKnown => {
+            format!("{:.1}% CPU (last known)", resources.cpu_percent)
+        }
+        ResourceMetricValueState::Unavailable => "CPU unavailable".to_string(),
+    };
+    let memory_mb = resources.memory_bytes / 1024 / 1024;
+    let memory = match resources.memory_value_state {
+        ResourceMetricValueState::Observed => {
+            format!("{} {memory_mb} MB", resources.memory_metric.label())
+        }
+        ResourceMetricValueState::Partial => format!(
+            "{} {memory_mb} MB (partial)",
+            resources.memory_metric.label()
+        ),
+        ResourceMetricValueState::LastKnown => format!(
+            "{} {memory_mb} MB (last known)",
+            resources.memory_metric.label()
+        ),
+        ResourceMetricValueState::Unavailable => {
+            format!("{} unavailable", resources.memory_metric.label())
+        }
+    };
+    format!("{cpu} • {memory}")
+}
+
+fn format_compact_process_count(resources: &ResourceSnapshot) -> String {
+    let count = resources.process_count;
+    let noun = if count == 1 { "proc" } else { "procs" };
+    match resources.process_count_value_state {
+        ResourceMetricValueState::Observed => format!("{count} {noun}"),
+        ResourceMetricValueState::Partial => format!("{count} {noun} (partial)"),
+        ResourceMetricValueState::LastKnown => format!("{count} {noun} (last known)"),
+        ResourceMetricValueState::Unavailable => "process count unavailable".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod resource_metric_tests {
+    use super::{format_compact_process_count, format_compact_resource_metrics};
+    use crate::state::{ResourceMemoryMetric, ResourceMetricValueState, ResourceSnapshot};
+
+    #[test]
+    fn compact_terminal_metrics_do_not_render_unavailable_zero_as_idle() {
+        let unavailable = ResourceSnapshot {
+            cpu_percent: 0.0,
+            memory_bytes: 0,
+            memory_metric: ResourceMemoryMetric::PrivateCommitted,
+            cpu_value_state: ResourceMetricValueState::Unavailable,
+            memory_value_state: ResourceMetricValueState::Unavailable,
+            ..ResourceSnapshot::default()
+        };
+        let label = format_compact_resource_metrics(&unavailable);
+        assert!(label.contains("CPU unavailable"));
+        assert!(label.contains("private committed unavailable"));
+        assert!(!label.contains("0.0%"));
+
+        let partial = ResourceSnapshot {
+            cpu_percent: 6.25,
+            memory_bytes: 4 * 1024 * 1024,
+            memory_metric: ResourceMemoryMetric::PrivateCommitted,
+            cpu_value_state: ResourceMetricValueState::Partial,
+            memory_value_state: ResourceMetricValueState::Observed,
+            ..ResourceSnapshot::default()
+        };
+        let label = format_compact_resource_metrics(&partial);
+        assert!(label.contains("6.2% CPU (partial)"));
+        assert!(label.contains("private committed 4 MB"));
+
+        let retained_count = ResourceSnapshot {
+            process_count: 3,
+            process_count_value_state: ResourceMetricValueState::LastKnown,
+            ..ResourceSnapshot::default()
+        };
+        assert_eq!(
+            format_compact_process_count(&retained_count),
+            "3 procs (last known)"
+        );
+        assert_eq!(
+            format_compact_process_count(&ResourceSnapshot::default()),
+            "process count unavailable"
+        );
     }
 }

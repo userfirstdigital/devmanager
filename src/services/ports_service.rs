@@ -1,5 +1,5 @@
 use crate::models::{AppConfig, PortConflict, PortConflictEntry, PortStatus};
-use crate::services::{pid_file, platform_service};
+use crate::services::platform_service;
 use std::collections::{BTreeMap, HashMap};
 
 pub fn snapshot_ports(ports: &[u16]) -> Result<HashMap<u16, PortStatus>, String> {
@@ -40,14 +40,6 @@ pub fn check_port_in_use(port: u16) -> Result<PortStatus, String> {
         status.process_name = platform_service::get_process_name(pid)?;
     }
     Ok(status)
-}
-
-pub fn kill_port(port: u16) -> Result<(), String> {
-    let pid = platform_service::find_pid_on_port(port)?
-        .ok_or_else(|| format!("No process found listening on port {port}"))?;
-    platform_service::kill_process_tree(pid)?;
-    let _ = pid_file::prune_inactive_entries();
-    Ok(())
 }
 
 pub fn get_port_conflicts(config: &AppConfig) -> Vec<PortConflict> {

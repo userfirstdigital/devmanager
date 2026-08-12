@@ -4,7 +4,7 @@
 
 **Goal:** Make DevManager report and control the complete verified process set for each terminal and present CPU with the same whole-machine convention as Windows Task Manager.
 
-**Architecture:** Resource sampling unions live ancestry, Windows Job Object membership, and verified ledger identities into one owned PID set. Runtime CPU fields carry normalized whole-machine percentages plus the logical CPU count; equivalent cores are derived in presentation. Process names are reduced through a safe allowlisted classifier.
+**Architecture:** Current exact Windows Job Object membership is the sole accounting ownership set. Parent links and the legacy PID ledger remain bounded presentation/cleanup inputs and never grant sampling or kill authority. Runtime CPU fields carry normalized whole-machine percentages plus the logical CPU count; equivalent cores are derived in presentation. Process names are reduced through a safe allowlisted classifier.
 
 **Tech stack:** Rust 2021, GPUI 0.2.2, `sysinfo` 0.38.4, Win32 Job Objects.
 
@@ -42,7 +42,7 @@
 - [x] Add a Windows integration test that assigns a process, spawns a child, and observes both PIDs.
 - [x] Run platform-service and terminal-session tests.
 
-### Task 3: Unify process discovery and ledger retention
+### Task 3: Bind accounting to exact Job ownership
 
 **Files:**
 
@@ -50,12 +50,12 @@
 - Modify: `src/services/pid_file.rs`
 
 - [x] Snapshot live `TerminalSession` references without retaining the sessions lock.
-- [x] Union the verified root, ancestry, managed Job members, and identity-matched ledger descendants.
+- [x] Deduplicate exact Job identities under one bounded tick budget; never add runtime roots, ancestry, or ledger descendants to accounting ownership.
 - [x] Refresh command metadata for sampled processes without persisting raw commands.
-- [x] Build memory, CPU, process count, IDs, labels, and parent metadata from that same PID set.
+- [x] Build memory, CPU, process count, IDs, labels, and parent metadata from that exact Job set.
 - [x] Sync the complete verified descendant set back to the ledger.
 - [x] Make pre-respawn and root-release syncs retain verified known descendants.
-- [x] Ensure kill authorization and reap collection accept the same verified owned PIDs.
+- [x] Ensure monitor kill actions carry and revalidate the same exact Job/fence identity used by reporting.
 - [x] Run process-manager and PID-ledger tests.
 
 ### Task 4: Normalize CPU and improve monitor labels

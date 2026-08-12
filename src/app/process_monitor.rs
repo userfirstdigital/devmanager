@@ -1,5 +1,8 @@
+use crate::process::registry::ManagedProcessFence;
 use crate::state::{
-    AppState, ProcessResourceNode, RuntimeState, SessionKind, SessionRuntimeState, SessionStatus,
+    aggregate_memory_snapshots, AppState, ProcessResourceNode, ResourceMemoryMetric,
+    ResourceMemoryTotal, ResourceMetricValueState, RuntimeState, SessionKind, SessionRuntimeState,
+    SessionStatus,
 };
 use crate::{icons, theme};
 use gpui::{
@@ -8,6 +11,7 @@ use gpui::{
     Window,
 };
 use std::collections::BTreeSet;
+use std::path::Path;
 
 #[derive(Debug, Clone, Default)]
 pub struct ProcessMonitorState {
@@ -18,8 +22,16 @@ pub struct ProcessMonitorState {
 pub enum ProcessMonitorAction {
     Close,
     ToggleSession(String),
-    KillProcess { session_id: String, pid: u32 },
-    KillProcessTree { session_id: String, pid: u32 },
+    KillProcess {
+        session_id: String,
+        pid: u32,
+        fence: ManagedProcessFence,
+    },
+    KillProcessTree {
+        session_id: String,
+        pid: u32,
+        fence: ManagedProcessFence,
+    },
     StopSession(String),
 }
 
@@ -37,9 +49,13 @@ pub fn render_process_monitor(
     let (open_terminals, total_memory) = monitor_totals(runtime);
     let sessions = process_monitor_entries(app_state, runtime);
     let description = format!(
-        "{open_terminals} terminal{} · {} total memory",
+        "{open_terminals} terminal{} · {} total",
         if open_terminals == 1 { "" } else { "s" },
-        format_memory(total_memory)
+        format_metric_memory(
+            total_memory.bytes,
+            total_memory.metric,
+            total_memory.value_state,
+        ),
     );
 
     let body = if sessions.is_empty() {
@@ -182,10 +198,19 @@ fn render_session_card(
     let root_pid = entry.pid;
     let cpu = entry.cpu_percent;
     let memory = entry.memory_bytes;
+    let memory_metric = entry.memory_metric;
     let process_count = entry.process_count;
+    let process_count_value_state = entry.process_count_value_state;
+    let metrics_unavailable = entry.metrics_unavailable;
+    let metrics_status = entry.metrics_status;
+    let cpu_value_state = entry.cpu_value_state;
+    let memory_value_state = entry.memory_value_state;
+    let metrics_stale = entry.metrics_stale;
+    let core_equivalent_percent = entry.core_equivalent_percent;
     let unreaped = entry.unreaped;
     let logical_cpu_count = entry.logical_cpu_count;
     let processes = entry.processes;
+    let process_fence = entry.managed_process_fence;
 
     div()
         .rounded_sm()
@@ -271,19 +296,50 @@ fn render_session_card(
                                                     theme::TEXT_MUTED
                                                 }))
                                                 .child(status_label),
-                                        ),
+                                        )
+                                        .children((metrics_unavailable || metrics_status != crate::domain::snapshot::ProcessMetricStatus::Complete).then(|| {
+                                            div()
+                                                .px(px(5.0))
+                                                .py(px(1.0))
+                                                .rounded_sm()
+                                                .bg(rgb(theme::PRIMARY_MUTED))
+                                                .text_xs()
+                                                .text_color(rgb(theme::WARNING_TEXT))
+                                                .child(SharedString::from(process_metrics_label(metrics_status)))
+                                                .into_any_element()
+                                        })),
                                 )
                                 .child(
                                     div()
                                         .text_xs()
                                         .text_color(rgb(theme::TEXT_SUBTLE))
                                         .child(SharedString::from(format!(
-                                            "{project_name} · {} · {process_count} proc · {:.1}% CPU · {}",
+                                            "{project_name} · {} · {} · {} · {}{}",
                                             root_pid
                                                 .map(|pid| format!("pid {pid}"))
                                                 .unwrap_or_else(|| "no root pid".to_string()),
-                                            cpu,
-                                            format_memory(memory),
+                                            format_metric_process_count(
+                                                process_count,
+                                                process_count_value_state,
+                                            ),
+                                            format_metric_cpu_detail(
+                                                cpu,
+                                                core_equivalent_percent,
+                                                logical_cpu_count,
+                                                cpu_value_state,
+                                            ),
+                                            format_metric_memory(
+                                                memory,
+                                                memory_metric,
+                                                memory_value_state,
+                                            ),
+                                            if metrics_stale {
+                                                " · stale"
+                                            } else if metrics_unavailable {
+                                                " · partial"
+                                            } else {
+                                                ""
+                                            },
                                         ))),
                                 ),
                         ),
@@ -333,6 +389,7 @@ fn render_session_card(
                                 node,
                                 root_pid,
                                 logical_cpu_count,
+                                process_fence.as_ref(),
                                 actions,
                             )
                             .into_any_element()
@@ -347,12 +404,32 @@ fn render_process_row(
     node: ProcessResourceNode,
     root_pid: Option<u32>,
     logical_cpu_count: u32,
+    process_fence: Option<&ManagedProcessFence>,
     actions: &ProcessMonitorActions<'_>,
 ) -> impl IntoElement {
     let is_root = root_pid == Some(node.pid);
     let indent = if is_root { 0.0 } else { 16.0 };
     let session_id = session_id.to_string();
     let pid = node.pid;
+    let resource_label = node
+        .resource_kind
+        .clone()
+        .unwrap_or_else(|| "resource".to_string());
+    let command_label = node
+        .command_label
+        .clone()
+        .unwrap_or_else(|| node.name.clone());
+    let metrics_label = process_metrics_label(node.metrics_status);
+    let identity_label = node
+        .creation_time_100ns
+        .map(|creation| format!("pid {pid} · start {creation}"))
+        .unwrap_or_else(|| format!("pid {pid} · identity pending"));
+    let executable_label = node
+        .executable
+        .as_deref()
+        .and_then(|path| Path::new(path).file_name())
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "executable unknown".to_string());
 
     div()
         .flex()
@@ -379,17 +456,41 @@ fn render_process_row(
                     div()
                         .text_xs()
                         .text_color(rgb(theme::TEXT_DIM))
-                        .child(SharedString::from(format!("pid {}", node.pid))),
+                        .child(SharedString::from(identity_label)),
                 )
                 .child(div().text_xs().text_color(rgb(theme::TEXT_SUBTLE)).child(
                     SharedString::from(format!(
-                        "{} · {}",
-                        format_cpu_detail(node.cpu_percent, logical_cpu_count),
-                        format_memory(node.memory_bytes)
+                        "{} · {} · {} · {} · {} child{}{}",
+                        format_metric_cpu_detail(
+                            node.cpu_percent,
+                            node.core_equivalent_percent,
+                            logical_cpu_count,
+                            node.cpu_value_state,
+                        ),
+                        format_metric_memory(
+                            node.memory_bytes,
+                            node.memory_metric,
+                            node.memory_value_state,
+                        ),
+                        resource_label,
+                        command_label,
+                        executable_label,
+                        node.child_count,
+                        if metrics_label.is_empty() {
+                            "".to_string()
+                        } else {
+                            format!(" · {metrics_label}")
+                        }
                     )),
                 )),
         )
-        .child(
+        .child(if let Some(process_fence) = process_fence {
+            let kill_action =
+                build_process_monitor_kill_action(&session_id, pid, Some(process_fence), false)
+                    .expect("a fence is required for a process close action");
+            let kill_tree_action =
+                build_process_monitor_kill_action(&session_id, pid, Some(process_fence), true)
+                    .expect("a fence is required for a process close action");
             div()
                 .flex()
                 .items_center()
@@ -397,17 +498,52 @@ fn render_process_row(
                 .child(render_text_button(
                     "Kill",
                     theme::WARNING_TEXT,
-                    (actions.on_action)(ProcessMonitorAction::KillProcess {
-                        session_id: session_id.clone(),
-                        pid,
-                    }),
+                    (actions.on_action)(kill_action),
                 ))
                 .child(render_text_button(
                     "Kill tree",
                     theme::DANGER_TEXT,
-                    (actions.on_action)(ProcessMonitorAction::KillProcessTree { session_id, pid }),
-                )),
-        )
+                    (actions.on_action)(kill_tree_action),
+                ))
+                .into_any_element()
+        } else {
+            div()
+                .text_xs()
+                .text_color(rgb(theme::TEXT_DIM))
+                .child("Exact close unavailable")
+                .into_any_element()
+        })
+}
+
+fn build_process_monitor_kill_action(
+    session_id: &str,
+    pid: u32,
+    process_fence: Option<&ManagedProcessFence>,
+    kill_tree: bool,
+) -> Option<ProcessMonitorAction> {
+    let fence = process_fence?.clone();
+    Some(if kill_tree {
+        ProcessMonitorAction::KillProcessTree {
+            session_id: session_id.to_string(),
+            pid,
+            fence,
+        }
+    } else {
+        ProcessMonitorAction::KillProcess {
+            session_id: session_id.to_string(),
+            pid,
+            fence,
+        }
+    })
+}
+
+fn process_metrics_label(status: crate::domain::snapshot::ProcessMetricStatus) -> &'static str {
+    match status {
+        crate::domain::snapshot::ProcessMetricStatus::Complete => "",
+        crate::domain::snapshot::ProcessMetricStatus::Partial => "partial metrics",
+        crate::domain::snapshot::ProcessMetricStatus::Unknown => "metrics unknown",
+        crate::domain::snapshot::ProcessMetricStatus::Failed => "metrics failed",
+    }
 }
 
 fn render_text_button(
@@ -474,10 +610,19 @@ fn process_monitor_entries(
                 status_label: session_status_label(&session),
                 pid: session.pid,
                 cpu_percent: session.resources.cpu_percent,
+                core_equivalent_percent: session.resources.core_equivalent_percent,
                 memory_bytes: session.resources.memory_bytes,
+                memory_metric: session.resources.memory_metric,
                 process_count,
+                process_count_value_state: session.resources.process_count_value_state,
+                metrics_unavailable: session.resources.metrics_unavailable,
+                metrics_status: session.resources.metrics_status,
+                cpu_value_state: session.resources.cpu_value_state,
+                memory_value_state: session.resources.memory_value_state,
+                metrics_stale: session.resources.metrics_stale,
                 unreaped: session.reap_incomplete,
                 logical_cpu_count: session.resources.logical_cpu_count.max(1),
+                managed_process_fence: session.resources.managed_process_fence.clone(),
                 processes: ordered_process_nodes(&session),
             }
         })
@@ -547,6 +692,7 @@ fn ordered_process_nodes(session: &SessionRuntimeState) -> Vec<ProcessResourceNo
         }
         return nodes;
     }
+    let memory_metric = session.resources.memory_metric;
     session
         .resources
         .process_ids
@@ -554,24 +700,39 @@ fn ordered_process_nodes(session: &SessionRuntimeState) -> Vec<ProcessResourceNo
         .map(|pid| ProcessResourceNode {
             pid: *pid,
             parent_pid: None,
-            name: format!("pid-{pid}"),
+            name: format!("pid-{pid} (compatibility-only observation)"),
             cpu_percent: 0.0,
+            core_equivalent_percent: 0.0,
             memory_bytes: 0,
+            memory_metric,
+            creation_time_100ns: None,
+            executable: None,
+            command_label: None,
+            command_arg_count: 0,
+            command_arg_bytes: 0,
+            resource_id: None,
+            resource_kind: None,
+            child_count: 0,
+            lifecycle: crate::state::ProcessResourceLifecycle::Unknown,
+            metrics_status: crate::domain::snapshot::ProcessMetricStatus::Unknown,
+            metric_values: crate::state::ResourceMetricValueState::Unavailable,
+            cpu_value_state: crate::state::ResourceMetricValueState::Unavailable,
+            memory_value_state: crate::state::ResourceMetricValueState::Unavailable,
+            sampling_generation: 0,
         })
         .collect()
 }
 
-fn monitor_totals(runtime: &RuntimeState) -> (usize, u64) {
-    runtime
-        .sessions
-        .values()
-        .filter(|session| session.status.is_live() || session.reap_incomplete)
-        .fold((0, 0), |(count, memory), session| {
-            (
-                count + 1,
-                memory.saturating_add(session.resources.memory_bytes),
-            )
-        })
+fn monitor_totals(runtime: &RuntimeState) -> (usize, ResourceMemoryTotal) {
+    let relevant = || {
+        runtime
+            .sessions
+            .values()
+            .filter(|session| session.status.is_live() || session.reap_incomplete)
+    };
+    let count = relevant().count();
+    let memory = aggregate_memory_snapshots(relevant().map(|session| &session.resources));
+    (count, memory)
 }
 
 fn session_label(session: &SessionRuntimeState) -> String {
@@ -624,24 +785,213 @@ fn format_memory(bytes: u64) -> String {
     }
 }
 
-fn format_cpu_detail(system_cpu_percent: f32, logical_cpu_count: u32) -> String {
-    let cores = crate::state::equivalent_cpu_cores(system_cpu_percent, logical_cpu_count);
-    format!("{system_cpu_percent:.1}% system · {cores:.2} cores")
+fn format_cpu_detail_with_core(
+    system_cpu_percent: f32,
+    core_equivalent_percent: f32,
+    logical_cpu_count: u32,
+) -> String {
+    let cores = if core_equivalent_percent.is_finite() && core_equivalent_percent > 0.0 {
+        core_equivalent_percent / 100.0
+    } else {
+        crate::state::equivalent_cpu_cores(system_cpu_percent, logical_cpu_count)
+    };
+    format!("{system_cpu_percent:.1}% machine · {cores:.2} cores")
+}
+
+fn format_metric_cpu_detail(
+    system_cpu_percent: f32,
+    core_equivalent_percent: f32,
+    logical_cpu_count: u32,
+    value_state: ResourceMetricValueState,
+) -> String {
+    match value_state {
+        ResourceMetricValueState::Observed => format_cpu_detail_with_core(
+            system_cpu_percent,
+            core_equivalent_percent,
+            logical_cpu_count,
+        ),
+        ResourceMetricValueState::Partial => format!(
+            "{} (partial)",
+            format_cpu_detail_with_core(
+                system_cpu_percent,
+                core_equivalent_percent,
+                logical_cpu_count,
+            )
+        ),
+        ResourceMetricValueState::LastKnown => format!(
+            "{} (last known)",
+            format_cpu_detail_with_core(
+                system_cpu_percent,
+                core_equivalent_percent,
+                logical_cpu_count,
+            )
+        ),
+        ResourceMetricValueState::Unavailable => "CPU unavailable".to_string(),
+    }
+}
+
+fn format_metric_memory(
+    memory_bytes: u64,
+    memory_metric: ResourceMemoryMetric,
+    value_state: ResourceMetricValueState,
+) -> String {
+    match value_state {
+        ResourceMetricValueState::Observed => {
+            format!("{} {}", memory_metric.label(), format_memory(memory_bytes))
+        }
+        ResourceMetricValueState::Partial => format!(
+            "{} {} (partial)",
+            memory_metric.label(),
+            format_memory(memory_bytes)
+        ),
+        ResourceMetricValueState::LastKnown => format!(
+            "{} {} (last known)",
+            memory_metric.label(),
+            format_memory(memory_bytes)
+        ),
+        ResourceMetricValueState::Unavailable => {
+            format!("{} unavailable", memory_metric.label())
+        }
+    }
+}
+
+fn format_metric_process_count(
+    process_count: u32,
+    value_state: ResourceMetricValueState,
+) -> String {
+    let noun = if process_count == 1 { "proc" } else { "procs" };
+    match value_state {
+        ResourceMetricValueState::Observed => format!("{process_count} {noun}"),
+        ResourceMetricValueState::Partial => format!("{process_count} {noun} (partial)"),
+        ResourceMetricValueState::LastKnown => {
+            format!("{process_count} {noun} (last known)")
+        }
+        ResourceMetricValueState::Unavailable => "process count unavailable".to_string(),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        format_cpu_detail, monitor_sessions, ordered_process_nodes, pointer_disposition,
-        process_monitor_entries, session_label, PointerDisposition, PointerTarget,
+        build_process_monitor_kill_action, format_cpu_detail_with_core, format_metric_cpu_detail,
+        format_metric_memory, format_metric_process_count, monitor_sessions, monitor_totals,
+        ordered_process_nodes, pointer_disposition, process_monitor_entries, session_label,
+        PointerDisposition, PointerTarget,
     };
+    use crate::domain::id::ResourceId;
+    use crate::domain::operation::ResourceFence;
     use crate::models::Project;
+    use crate::process::identity::{ManagedProcessId, ManagedProcessIdentity, ProcessOwner};
+    use crate::process::registry::ManagedProcessFence;
     use crate::state::{
         AppState, ProcessResourceNode, ResourceSnapshot, RuntimeState, SessionDimensions,
         SessionKind, SessionRuntimeState, SessionStatus,
     };
     use crate::terminal::session::TerminalBackend;
     use std::path::PathBuf;
+
+    mod sealed_fence_issuer {
+        use super::*;
+
+        trait Sealed {}
+
+        struct Issuer;
+
+        impl Sealed for Issuer {}
+
+        trait IssueExactFence: Sealed {
+            fn issue(&self) -> ManagedProcessFence;
+        }
+
+        impl IssueExactFence for Issuer {
+            fn issue(&self) -> ManagedProcessFence {
+                let resource_id = ResourceId::from_bytes([
+                    0x01, 0x9a, 0x11, 0x22, 0x33, 0x44, 0x70, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x42,
+                ])
+                .expect("resource id");
+                let identity = ManagedProcessIdentity::new(
+                    ManagedProcessId::new(42, 7).expect("test process identity"),
+                    std::env::current_exe().expect("test executable"),
+                )
+                .expect("canonical test executable");
+                ManagedProcessFence::new(
+                    ResourceFence::new(resource_id, 3),
+                    ProcessOwner::Host,
+                    identity,
+                )
+            }
+        }
+
+        pub(super) fn issue() -> ManagedProcessFence {
+            Issuer.issue()
+        }
+    }
+
+    fn test_process_fence() -> ManagedProcessFence {
+        sealed_fence_issuer::issue()
+    }
+
+    #[test]
+    fn process_monitor_kill_actions_fail_closed_without_fence() {
+        assert!(build_process_monitor_kill_action("session", 42, None, false).is_none());
+        assert!(build_process_monitor_kill_action("session", 42, None, true).is_none());
+    }
+
+    #[test]
+    fn process_monitor_kill_actions_carry_exact_fence_and_diagnostic_pid() {
+        let fence = test_process_fence();
+        let action = build_process_monitor_kill_action("session", 9_999, Some(&fence), false)
+            .expect("fenced process action");
+        match action {
+            super::ProcessMonitorAction::KillProcess {
+                session_id,
+                pid,
+                fence: action_fence,
+            } => {
+                assert_eq!(session_id, "session");
+                assert_eq!(pid, 9_999);
+                assert_eq!(action_fence, fence);
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
+
+        let tree_action = build_process_monitor_kill_action("session", 10_000, Some(&fence), true)
+            .expect("fenced tree action");
+        match tree_action {
+            super::ProcessMonitorAction::KillProcessTree {
+                session_id,
+                pid,
+                fence: action_fence,
+            } => {
+                assert_eq!(session_id, "session");
+                assert_eq!(pid, 10_000);
+                assert_eq!(action_fence, fence);
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn process_monitor_entry_uses_only_the_fence_bound_to_its_resource_snapshot() {
+        let fence = test_process_fence();
+        let app_state = AppState::default();
+        let mut runtime = RuntimeState::new(false);
+        let mut session = SessionRuntimeState::new(
+            "snapshot-fenced",
+            PathBuf::from("."),
+            SessionDimensions::default(),
+            TerminalBackend::PortablePtyFeedingAlacritty,
+        );
+        session.status = SessionStatus::Running;
+        session.resources.managed_process_fence = Some(fence.clone());
+        runtime.sessions.insert(session.session_id.clone(), session);
+
+        let entries = process_monitor_entries(&app_state, &runtime);
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].managed_process_fence.as_ref(), Some(&fence));
+    }
 
     #[test]
     fn monitor_sessions_includes_live_and_unreaped() {
@@ -691,6 +1041,42 @@ mod tests {
     }
 
     #[test]
+    fn monitor_total_excludes_stale_memory_and_marks_current_subset_partial() {
+        let mut runtime = RuntimeState::new(false);
+        for (id, bytes, state) in [
+            (
+                "current",
+                64,
+                crate::state::ResourceMetricValueState::Observed,
+            ),
+            (
+                "stale",
+                128,
+                crate::state::ResourceMetricValueState::LastKnown,
+            ),
+        ] {
+            let mut session = SessionRuntimeState::new(
+                id,
+                PathBuf::from("."),
+                SessionDimensions::default(),
+                TerminalBackend::PortablePtyFeedingAlacritty,
+            );
+            session.status = SessionStatus::Running;
+            session.resources.memory_bytes = bytes;
+            session.resources.memory_value_state = state;
+            runtime.sessions.insert(id.to_string(), session);
+        }
+
+        let (count, total) = monitor_totals(&runtime);
+        assert_eq!(count, 2);
+        assert_eq!(total.bytes, 64);
+        assert_eq!(
+            total.value_state,
+            crate::state::ResourceMetricValueState::Partial
+        );
+    }
+
+    #[test]
     fn ordered_process_nodes_prefers_root_first() {
         let mut session = SessionRuntimeState::new(
             "session-1",
@@ -706,14 +1092,46 @@ mod tests {
                     parent_pid: Some(10),
                     name: "node".to_string(),
                     cpu_percent: 1.0,
+                    core_equivalent_percent: 1.0,
                     memory_bytes: 100,
+                    memory_metric: crate::state::ResourceMemoryMetric::PrivateResident,
+                    creation_time_100ns: None,
+                    executable: None,
+                    command_label: Some("node".to_string()),
+                    command_arg_count: 0,
+                    command_arg_bytes: 0,
+                    resource_id: None,
+                    resource_kind: None,
+                    child_count: 0,
+                    lifecycle: crate::state::ProcessResourceLifecycle::Running,
+                    metrics_status: crate::domain::snapshot::ProcessMetricStatus::Complete,
+                    metric_values: crate::state::ResourceMetricValueState::Observed,
+                    cpu_value_state: crate::state::ResourceMetricValueState::Observed,
+                    memory_value_state: crate::state::ResourceMetricValueState::Observed,
+                    sampling_generation: 1,
                 },
                 ProcessResourceNode {
                     pid: 10,
                     parent_pid: None,
                     name: "shell".to_string(),
                     cpu_percent: 0.1,
+                    core_equivalent_percent: 0.1,
                     memory_bytes: 50,
+                    memory_metric: crate::state::ResourceMemoryMetric::PrivateResident,
+                    creation_time_100ns: None,
+                    executable: None,
+                    command_label: Some("shell".to_string()),
+                    command_arg_count: 0,
+                    command_arg_bytes: 0,
+                    resource_id: None,
+                    resource_kind: None,
+                    child_count: 1,
+                    lifecycle: crate::state::ProcessResourceLifecycle::Running,
+                    metrics_status: crate::domain::snapshot::ProcessMetricStatus::Complete,
+                    metric_values: crate::state::ResourceMetricValueState::Observed,
+                    cpu_value_state: crate::state::ResourceMetricValueState::Observed,
+                    memory_value_state: crate::state::ResourceMetricValueState::Observed,
+                    sampling_generation: 1,
                 },
             ],
             ..Default::default()
@@ -809,6 +1227,27 @@ mod tests {
     }
 
     #[test]
+    fn process_monitor_entries_preserve_and_mark_partial_metrics() {
+        let app_state = AppState::default();
+        let mut runtime = RuntimeState::new(false);
+        let mut session = SessionRuntimeState::new(
+            "partial",
+            PathBuf::from("."),
+            SessionDimensions::default(),
+            TerminalBackend::PortablePtyFeedingAlacritty,
+        );
+        session.status = SessionStatus::Running;
+        session.resources.metrics_unavailable = true;
+        session.resources.io_read_bytes = Some(75);
+        session.resources.io_write_bytes = Some(60);
+        runtime.sessions.insert(session.session_id.clone(), session);
+
+        let entries = process_monitor_entries(&app_state, &runtime);
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].metrics_unavailable);
+    }
+
+    #[test]
     fn modal_interactions_consume_internal_pointer_events() {
         assert_eq!(
             pointer_disposition(PointerTarget::Backdrop),
@@ -825,9 +1264,72 @@ mod tests {
     }
 
     #[test]
-    fn cpu_detail_explains_system_percent_and_equivalent_cores() {
-        assert_eq!(format_cpu_detail(1.953_125, 64), "2.0% system · 1.25 cores");
-        assert_eq!(format_cpu_detail(0.0, 1), "0.0% system · 0.00 cores");
+    fn cpu_detail_explains_machine_percent_and_equivalent_cores() {
+        assert_eq!(
+            format_cpu_detail_with_core(1.953_125, 0.0, 64),
+            "2.0% machine · 1.25 cores"
+        );
+        assert_eq!(
+            format_cpu_detail_with_core(0.0, 0.0, 1),
+            "0.0% machine · 0.00 cores"
+        );
+        assert_eq!(
+            format_cpu_detail_with_core(100.0, 1_600.0, 8),
+            "100.0% machine · 16.00 cores"
+        );
+        assert_eq!(
+            format_cpu_detail_with_core(100.0, 1_600.0, 8),
+            "100.0% machine · 16.00 cores"
+        );
+    }
+
+    #[test]
+    fn unavailable_and_stale_metrics_never_render_as_idle() {
+        assert!(format_metric_cpu_detail(
+            6.25,
+            50.0,
+            8,
+            crate::state::ResourceMetricValueState::Partial,
+        )
+        .contains("partial"));
+        assert!(format_metric_memory(
+            4_096,
+            crate::state::ResourceMemoryMetric::PrivateCommitted,
+            crate::state::ResourceMetricValueState::Partial,
+        )
+        .contains("partial"));
+        assert_eq!(
+            format_metric_cpu_detail(
+                0.0,
+                0.0,
+                8,
+                crate::state::ResourceMetricValueState::Unavailable,
+            ),
+            "CPU unavailable"
+        );
+        assert_eq!(
+            format_metric_memory(
+                0,
+                crate::state::ResourceMemoryMetric::PrivateCommitted,
+                crate::state::ResourceMetricValueState::Unavailable,
+            ),
+            "private committed unavailable"
+        );
+        assert!(format_metric_cpu_detail(
+            12.5,
+            100.0,
+            8,
+            crate::state::ResourceMetricValueState::LastKnown,
+        )
+        .contains("last known"));
+        assert_eq!(
+            format_metric_process_count(2, crate::state::ResourceMetricValueState::LastKnown,),
+            "2 procs (last known)"
+        );
+        assert_eq!(
+            format_metric_process_count(0, crate::state::ResourceMetricValueState::Unavailable,),
+            "process count unavailable"
+        );
     }
 }
 
@@ -841,10 +1343,19 @@ struct ProcessMonitorEntry {
     status_label: &'static str,
     pid: Option<u32>,
     cpu_percent: f32,
+    core_equivalent_percent: f32,
     memory_bytes: u64,
+    memory_metric: ResourceMemoryMetric,
     process_count: u32,
+    process_count_value_state: ResourceMetricValueState,
+    metrics_unavailable: bool,
+    metrics_status: crate::domain::snapshot::ProcessMetricStatus,
+    cpu_value_state: ResourceMetricValueState,
+    memory_value_state: ResourceMetricValueState,
+    metrics_stale: bool,
     unreaped: bool,
     logical_cpu_count: u32,
+    managed_process_fence: Option<ManagedProcessFence>,
     processes: Vec<ProcessResourceNode>,
 }
 

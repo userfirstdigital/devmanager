@@ -440,3 +440,76 @@ impl<'de> Deserialize<'de> for ArtifactContentPage {
         deserializer.deserialize_struct("ArtifactContentPage", FIELDS, PageVisitor)
     }
 }
+
+/// The confidence of a background-produced process accounting sample.
+///
+/// A numeric zero is not a substitute for a failed query or an unavailable
+/// first-sample baseline. Consumers must inspect this status before treating
+/// CPU/resource values as complete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessMetricStatus {
+    Complete,
+    Partial,
+    #[default]
+    Unknown,
+    Failed,
+}
+
+impl ProcessMetricStatus {
+    pub fn is_complete(self) -> bool {
+        matches!(self, Self::Complete)
+    }
+
+    pub fn is_failed(self) -> bool {
+        matches!(self, Self::Failed)
+    }
+}
+
+/// Immutable, background-produced accounting for one owned process tree.
+///
+/// This is intentionally a runtime projection rather than a durable domain
+/// fact. It carries enough information for consumers to distinguish a complete
+/// tree from a partial observation without making the render/input path query
+/// the operating system.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProcessAccountingSnapshot {
+    pub sampled_at: std::time::Duration,
+    pub interval: Option<std::time::Duration>,
+    pub logical_processors: u32,
+    pub machine_cpu_percent: f64,
+    pub core_equivalent_percent: f64,
+    pub memory_bytes: u64,
+    pub process_count: u32,
+    pub metrics_unavailable: bool,
+    pub status: ProcessMetricStatus,
+    /// A bounded, sanitized diagnostic for a failed/partial observation. Raw
+    /// command lines and environment values never enter this projection.
+    pub error: Option<String>,
+    /// Monotonic sampler generation. A new generation fences PID reuse and
+    /// counter baselines even when a PID number is recycled.
+    pub generation: u64,
+    pub io_read_bytes: Option<u64>,
+    pub io_write_bytes: Option<u64>,
+    pub members: Vec<ProcessAccountingMemberSnapshot>,
+}
+
+/// One unique Job-member observation in an accounting snapshot.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProcessAccountingMemberSnapshot {
+    pub pid: u32,
+    pub creation_time_100ns: Option<u64>,
+    pub machine_cpu_percent: Option<f64>,
+    pub core_equivalent_percent: Option<f64>,
+    /// Platform-private memory bytes. Windows uses `PrivateUsage` (private
+    /// committed bytes); Unix uses `/proc/<pid>/smaps_rollup` private
+    /// clean+dirty (private resident bytes). This is deliberately not named
+    /// working set.
+    pub private_memory_bytes: Option<u64>,
+    pub io_read_bytes: Option<u64>,
+    pub io_write_bytes: Option<u64>,
+    pub metrics_unavailable: bool,
+    pub status: ProcessMetricStatus,
+    pub executable: Option<String>,
+    pub generation: u64,
+}
