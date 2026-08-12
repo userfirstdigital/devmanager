@@ -249,6 +249,7 @@ impl KernelIdentityPersistence {
     /// Open the active profile's durable kernel store for Connect identity.
     pub fn open_active_profile() -> Result<Self, IdentityError> {
         let root = crate::persistence::app_config_dir().map_err(|_| IdentityError::Corrupt)?;
+        std::fs::create_dir_all(&root).map_err(|_| IdentityError::Corrupt)?;
         let path = root.join("kernel.sqlite3");
         let store = KernelStore::open(&path).map_err(map_store_error)?;
         Ok(Self {
