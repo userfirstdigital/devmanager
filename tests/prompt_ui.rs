@@ -297,7 +297,10 @@ fn chain_overview_inserts_between_adjacent_links_and_suggests_next_manually() {
             Some(link_id(40)),
         )))
         .expect("put first link");
-    let suggested = session.suggested_next.expect("manual suggested next");
+    let suggested = session
+        .suggested_next
+        .as_ref()
+        .expect("manual suggested next");
     assert!(!suggested.automatic);
     assert_eq!(suggested.link_id, link_id(41));
     let revision_before_send = session
