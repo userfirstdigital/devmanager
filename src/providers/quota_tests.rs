@@ -7,13 +7,13 @@ use super::*;
 use crate::domain::snapshot::omit_stale_quota_display;
 use crate::providers::adapter::{
     AdapterDeliveryPermit, AdapterIngressUnavailable, JournalNormalizeError, LaunchProviderRequest,
-    NormalizedAdapterDelivery, ProviderAdapter, ProviderError, ProviderExecutableHandle,
-    ProviderLaunchSpec, ProviderQuotaStatus, ProviderRuntime,
-    QuotaObservation as AdapterQuotaSample, StopStrategy,
+    NormalizedAdapterDelivery, ProviderAdapter, ProviderError, ProviderLaunchSpec,
+    ProviderQuotaStatus, ProviderRuntime, QuotaObservation as AdapterQuotaSample, StopStrategy,
 };
 use crate::providers::capabilities::{
     CapabilityEvidence, CapabilitySupport, EvidenceSourceId, EvidenceStatus, ProviderAuthState,
-    ProviderCapabilities, ProviderCapability, ProviderExecutable, ProviderKind, ProviderVersion,
+    ProviderCapabilities, ProviderCapability, ProviderExecutable, ProviderExecutableHandle,
+    ProviderKind, ProviderVersion,
 };
 use async_trait::async_trait;
 use std::collections::VecDeque;

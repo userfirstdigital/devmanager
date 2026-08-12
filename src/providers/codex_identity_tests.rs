@@ -1,6 +1,6 @@
 use super::{
-    CodexAdapter, CodexAdmission, CodexCorrelatedLaunch, CodexIdentityError, CodexResumeFailure,
-    CodexResumeObservation, CodexSemanticLaunchState,
+    require_attestation, CodexAdapter, CodexAdmission, CodexCorrelatedLaunch, CodexIdentityError,
+    CodexResumeFailure, CodexResumeObservation, CodexSemanticLaunchState,
 };
 use crate::ai::codex_hooks::{
     CodexHookRegistry, CodexLaunchPermit, CodexRegistryEvent, CodexRelayIngestStatus,

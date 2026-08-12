@@ -1708,7 +1708,18 @@ pub(crate) fn validate_semantic_journal_schema(conn: &Connection) -> Result<(), 
                 row.get::<_, i64>(5).map_err(StoreError::from)?,
             ));
         }
-        if actual.as_slice() != *expected {
+        let expected = expected
+            .iter()
+            .map(|(name, type_name, not_null, primary_key)| {
+                (
+                    (*name).to_owned(),
+                    (*type_name).to_owned(),
+                    *not_null,
+                    *primary_key,
+                )
+            })
+            .collect::<Vec<_>>();
+        if actual != expected {
             return Err(StoreError::MigrationInterrupted);
         }
     }
