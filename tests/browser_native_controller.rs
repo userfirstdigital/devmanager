@@ -9,8 +9,8 @@ use devmanager::browser::{
     BrowserGatewayBindingRef, BrowserNativeCallback, BrowserNativeCallbackKind,
     BrowserNativeControllerError, BrowserNativeDestination, BrowserNativeHostCommand,
     BrowserNativeIdentity, BrowserNativeLeaseFence, BrowserNativeShellController,
-    BrowserVisibleHostProofClaim,
-    BrowserVisibleHostProofClass, BrowserWorkspaceKey, BROWSER_VISIBLE_WEBVIEW2_OPT_IN_ENV,
+    BrowserVisibleHostProofClaim, BrowserVisibleHostProofClass, BrowserWorkspaceKey,
+    BROWSER_VISIBLE_WEBVIEW2_OPT_IN_ENV,
 };
 use devmanager::domain::{AgentSessionId, BrowserContextId, ResourceId, TaskId};
 
@@ -60,7 +60,10 @@ fn bind_mints_exact_identity_generation_and_gateway_lease() {
     assert!(!controller.is_attached());
     let debug = format!("{lease:?}");
     assert!(debug.contains("generation"));
-    assert!(!debug.contains("token"), "lease debug must not reveal the token");
+    assert!(
+        !debug.contains("token"),
+        "lease debug must not reveal the token"
+    );
 }
 
 #[test]
@@ -194,10 +197,7 @@ fn attach_replace_and_detach_are_idempotent() {
     assert_eq!(first_attach, second_attach);
 
     let detached = controller.detach(&first).expect("detach");
-    assert!(matches!(
-        detached,
-        BrowserNativeHostCommand::Detach { .. }
-    ));
+    assert!(matches!(detached, BrowserNativeHostCommand::Detach { .. }));
     assert!(!controller.is_attached());
     let detached_again = controller.detach(&first).expect("idempotent detach");
     assert_eq!(detached, detached_again);
@@ -396,8 +396,58 @@ fn host_lease_fence_rejects_commands_from_a_replaced_binding() {
         fence.admit(stale_command.lease()),
         Err(BrowserNativeControllerError::StaleGeneration)
     );
-    fence.retire(current_command.lease()).expect("retire current");
+    fence
+        .retire(current_command.lease())
+        .expect("retire current");
     assert_eq!(fence.current(), None);
+}
+
+#[test]
+fn close_retires_detached_binding_and_rejects_late_callbacks() {
+    let controller = BrowserNativeShellController::supported();
+    let identity = identity();
+    let lease = controller
+        .bind(
+            identity,
+            workspace("project", "conversation"),
+            BrowserGatewayBindingRef::new("process-session-a"),
+        )
+        .expect("bind");
+    controller.detach(&lease).expect("detach");
+
+    controller.close(&lease).expect("close detached binding");
+    assert_eq!(controller.current_lease(), None);
+    assert_eq!(controller.current_identity(), None);
+    assert!(!controller.is_attached());
+    assert!(controller
+        .take_callback(BrowserNativeCallback {
+            generation: lease.generation(),
+            lease,
+            kind: BrowserNativeCallbackKind::NavigationComplete,
+        })
+        .is_none());
+}
+
+#[test]
+fn close_while_attached_requires_host_detach_first() {
+    let controller = BrowserNativeShellController::supported();
+    let lease = controller
+        .bind(
+            identity(),
+            workspace("project", "conversation"),
+            BrowserGatewayBindingRef::new("process-session-a"),
+        )
+        .expect("bind");
+    controller
+        .attach(&lease, dest(0xB801), bounds())
+        .expect("attach");
+
+    assert_eq!(
+        controller.close(&lease),
+        Err(BrowserNativeControllerError::AttachedBindingMustDetach)
+    );
+    assert_eq!(controller.current_lease(), Some(lease));
+    assert!(controller.is_attached());
 }
 
 #[test]

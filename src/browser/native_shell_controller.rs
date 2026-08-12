@@ -59,9 +59,7 @@ impl BrowserNativeIdentity {
         }
     }
 
-    pub fn gateway_tuple(
-        &self,
-    ) -> (TaskId, AgentSessionId, BrowserContextId, ResourceId) {
+    pub fn gateway_tuple(&self) -> (TaskId, AgentSessionId, BrowserContextId, ResourceId) {
         (
             self.task_id,
             self.agent_session_id,
@@ -127,10 +125,7 @@ pub struct BrowserNativeLeaseFence {
 impl BrowserNativeLeaseFence {
     /// Admit the first lease or the exact lease already owned by the host.
     /// Any other generation/token is stale and must not reach host state.
-    pub fn admit(
-        &mut self,
-        lease: BrowserNativeLease,
-    ) -> Result<(), BrowserNativeControllerError> {
+    pub fn admit(&mut self, lease: BrowserNativeLease) -> Result<(), BrowserNativeControllerError> {
         match self.current {
             None => {
                 self.current = Some(lease);
@@ -678,6 +673,22 @@ impl BrowserNativeShellController {
         current.focused = false;
         current.last_detach = Some(command.clone());
         Ok(command)
+    }
+
+    /// Retire a detached binding after the host has completed its park/close
+    /// join.  Keeping a detached binding in the controller would allow a late
+    /// callback carrying the old lease to look current until another Task was
+    /// bound.  The host calls this only after it has accepted the matching
+    /// [`BrowserNativeHostCommand::Detach`], so the controller and host have a
+    /// single close boundary and never leave an orphaned surface lease behind.
+    pub fn close(&self, lease: &BrowserNativeLease) -> Result<(), BrowserNativeControllerError> {
+        let mut state = self.lock();
+        let current = require_current_mut(&mut state, lease)?;
+        if current.attached {
+            return Err(BrowserNativeControllerError::AttachedBindingMustDetach);
+        }
+        state.current = None;
+        Ok(())
     }
 
     pub fn require_identity(

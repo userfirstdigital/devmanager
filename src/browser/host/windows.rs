@@ -1378,6 +1378,37 @@ impl BrowserWebViewHost {
         Ok(super::BrowserHostOwnedSurfaceProof::from_windows_child_observation(descriptor))
     }
 
+    /// Settle one accepted durable browser HOLD from the exact live native
+    /// surface.  The proof is observed from this host's registered Wry view;
+    /// callers cannot provide a copied descriptor or a different Task/
+    /// resource and cannot bypass the BrowserService settler fence.
+    pub fn settle_accepted_browser_hold(
+        &mut self,
+        hello: crate::protocol::CapabilitySet,
+        intent: &crate::browser::protocol::BrowserHostSettleIntent,
+        hold: &crate::kernel::Effect,
+        identity: &BrowserSurfaceIdentity,
+    ) -> Result<
+        crate::domain::browser::BrowserHostOutcome,
+        crate::browser::protocol::BrowserHoldSettleError,
+    > {
+        let proof = self.host_owned_surface_proof(identity).map_err(|_| {
+            crate::browser::protocol::BrowserHoldSettleError::Hold(
+                crate::domain::browser::BrowserIntegrationHold::WebViewSurfaceAbsent,
+            )
+        })?;
+        let authority =
+            crate::browser::protocol::browser_service_authority_for_live_surface(&proof)
+                .map_err(crate::browser::protocol::BrowserHoldSettleError::Hold)?;
+        crate::browser::protocol::settle_accepted_browser_hold_for_live_surface(
+            Some(&authority),
+            intent,
+            hold,
+            &hello,
+            &proof,
+        )
+    }
+
     pub fn last_task_surface_bind_blocker(&self) -> Option<BrowserTaskSurfaceBindBlocker> {
         self.task_surface_bind_blocker
     }

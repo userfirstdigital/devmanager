@@ -6,11 +6,10 @@ use super::super::{
     discard_browser_workflow_review, preview_browser_workflow_review, save_browser_workflow_review,
     BrowserBounds, BrowserGatewayRegistrar, BrowserHostControl, BrowserHostEvent,
     BrowserNativeHostCommand, BrowserNativeHostOutcome, BrowserNativeLeaseFence,
-    BrowserPageRecordingIpcError,
-    BrowserPaneSurface, BrowserRecipeV1, BrowserRecordingError, BrowserRecordingInstance,
-    BrowserRecordingReview, BrowserRecordingStatus, BrowserReplayRepairCleanupWork,
-    BrowserWorkflowCoordinator, BrowserWorkflowReviewMutation, BrowserWorkflowReviewProjection,
-    BrowserWorkspaceKey,
+    BrowserPageRecordingIpcError, BrowserPaneSurface, BrowserRecipeV1, BrowserRecordingError,
+    BrowserRecordingInstance, BrowserRecordingReview, BrowserRecordingStatus,
+    BrowserReplayRepairCleanupWork, BrowserWorkflowCoordinator, BrowserWorkflowReviewMutation,
+    BrowserWorkflowReviewProjection, BrowserWorkspaceKey,
 };
 use super::super::{
     validate_direct_repair_preview_command, validate_direct_secret_command, BrowserCommand,
@@ -163,6 +162,25 @@ impl BrowserWebViewHost {
 
     pub fn status(&self) -> BrowserHostStatus {
         self.status.clone()
+    }
+
+    /// Unsupported platforms never mint a BrowserService settler.  Keeping
+    /// this method on the same host facade makes the production call seam
+    /// explicit while preserving the typed HOLD instead of silently falling
+    /// back to a source-level browser command.
+    pub fn settle_accepted_browser_hold(
+        &mut self,
+        _hello: crate::protocol::CapabilitySet,
+        _intent: &crate::browser::protocol::BrowserHostSettleIntent,
+        _hold: &crate::kernel::Effect,
+        _identity: &crate::protocol::BrowserSurfaceIdentity,
+    ) -> Result<
+        crate::domain::browser::BrowserHostOutcome,
+        crate::browser::protocol::BrowserHoldSettleError,
+    > {
+        Err(crate::browser::protocol::BrowserHoldSettleError::Hold(
+            crate::domain::browser::BrowserIntegrationHold::WebViewSurfaceAbsent,
+        ))
     }
 
     pub fn attach_foreground_executor(&mut self, _executor: gpui::ForegroundExecutor) {}
