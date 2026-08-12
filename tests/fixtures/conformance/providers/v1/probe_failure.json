@@ -1,0 +1,39 @@
+{
+  "case_id": "launch_success_probe_failure",
+  "provider": "claude_code",
+  "version": "unknown",
+  "task_id": "018f0000-0000-7000-8000-000000000001",
+  "agent_id": "018f0000-0000-7000-8000-000000000002",
+  "generation": 1,
+  "action_id": "018f0000-0000-7000-8000-000000000003",
+  "nonce": "nonce-probe-failure",
+  "cli_launchable": true,
+  "probe_ok": false,
+  "resume_command_proven": false,
+  "capabilities": {
+    "kind": "claude_code",
+    "version": "unknown",
+    "auth_state": "unknown",
+    "exact_resume": "unknown",
+    "semantic_events": "unknown",
+    "provider_session_id": "unknown",
+    "build_launch": "supported",
+    "parse_signal": "unknown",
+    "cooperative_stop": "unknown",
+    "observe_quota": "unknown",
+    "evidence": [
+      {
+        "source": "capability_probe",
+        "observed_at": 1,
+        "status": "failed",
+        "diagnostic": { "code": "probe_failed" }
+      }
+    ]
+  },
+  "events": [],
+  "declared_metrics": [
+    "exact_resume_result",
+    "terminal_fallback",
+    "process_residue"
+  ]
+}

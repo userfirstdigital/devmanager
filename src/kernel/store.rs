@@ -31,9 +31,7 @@ use crate::kernel::dispatch::{
     ReconciliationFinding, ReconciliationOrigin,
 };
 use crate::kernel::maintenance;
-use crate::kernel::outbox::{
-    external_idempotency_key, DestinationClass, Effect, ReplayPolicy,
-};
+use crate::kernel::outbox::{external_idempotency_key, DestinationClass, Effect, ReplayPolicy};
 use crate::kernel::projector;
 use crate::kernel::runtime::RecoveringResource;
 use crate::kernel::schema::{self, Migration, PROJECTION_TABLES};

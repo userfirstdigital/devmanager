@@ -1,0 +1,39 @@
+{
+  "case_id": "terminal_only_fallback",
+  "provider": "cursor",
+  "version": "1.4.0",
+  "task_id": "018f0000-0000-7000-8000-000000000001",
+  "agent_id": "018f0000-0000-7000-8000-000000000002",
+  "generation": 1,
+  "action_id": "018f0000-0000-7000-8000-000000000003",
+  "nonce": "nonce-seeded-clean",
+  "cli_launchable": true,
+  "probe_ok": true,
+  "resume_command_proven": false,
+  "diagnostic_code": "hooks_unavailable",
+  "capabilities": {
+    "kind": "cursor",
+    "version": "1.4.0",
+    "auth_state": "unknown",
+    "exact_resume": "unsupported",
+    "semantic_events": "unsupported",
+    "provider_session_id": "unsupported",
+    "build_launch": "supported",
+    "parse_signal": "unsupported",
+    "cooperative_stop": "unknown",
+    "observe_quota": "unknown",
+    "evidence": [
+      {
+        "source": "capability_probe",
+        "observed_at": 1,
+        "status": "unsupported"
+      }
+    ]
+  },
+  "events": [],
+  "declared_metrics": [
+    "exact_resume_result",
+    "terminal_fallback",
+    "process_residue"
+  ]
+}

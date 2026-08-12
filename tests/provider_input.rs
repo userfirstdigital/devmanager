@@ -259,8 +259,14 @@ fn begin_provider_dispatch(
     let permit = store
         .begin_dispatch(&claim)
         .expect("begin provider dispatch");
-    assert_eq!(permit.destination_class(), devmanager::kernel::DestinationClass::ProviderInput);
-    assert_eq!(permit.replay_policy(), devmanager::kernel::ReplayPolicy::NoAutomaticRetry);
+    assert_eq!(
+        permit.destination_class(),
+        devmanager::kernel::DestinationClass::ProviderInput
+    );
+    assert_eq!(
+        permit.replay_policy(),
+        devmanager::kernel::ReplayPolicy::NoAutomaticRetry
+    );
     match permit.effect() {
         devmanager::kernel::Effect::DeliverProviderInput {
             runtime_generation,
@@ -333,11 +339,15 @@ fn rebuild_uncertain_provider_and_reject_payload_tamper(
     use rusqlite::Connection;
 
     let mut store = KernelStore::open(path).expect("reopen uncertain provider store");
-    let rebuild = store.rebuild_projections().expect("rebuild uncertain provider state");
+    let rebuild = store
+        .rebuild_projections()
+        .expect("rebuild uncertain provider state");
     assert!(rebuild.events_replayed > 0);
     assert!(rebuild.drift_detected, "projection tamper must be reported");
     assert!(matches!(
-        store.operation_status(operation_id).expect("rebuilt operation status"),
+        store
+            .operation_status(operation_id)
+            .expect("rebuilt operation status"),
         Some(OperationState::Uncertain {
             code: devmanager::domain::OperationUncertaintyCode::AmbiguousDispatch,
             ..
@@ -396,7 +406,9 @@ fn provider_dispatch_ambiguity_survives_provider_close_after_bytes_may_cross() {
         AmbiguityDisposition::Uncertain,
     );
     assert!(matches!(
-        store.operation_status(operation_id).expect("operation status"),
+        store
+            .operation_status(operation_id)
+            .expect("operation status"),
         Some(OperationState::Uncertain {
             code: devmanager::domain::OperationUncertaintyCode::AmbiguousDispatch,
             ..
@@ -407,10 +419,7 @@ fn provider_dispatch_ambiguity_survives_provider_close_after_bytes_may_cross() {
         .expect("no automatic provider retry")
         .is_none());
     assert!(store
-        .record_dispatch_completion(
-            &permit,
-            devmanager::kernel::DispatchCompletion::Settled,
-        )
+        .record_dispatch_completion(&permit, devmanager::kernel::DispatchCompletion::Settled,)
         .is_err());
 
     let conn = Connection::open(&path).expect("reopen sqlite");
@@ -458,7 +467,9 @@ fn expired_provider_dispatch_recovery_preserves_g1_after_runtime_replacement() {
     use tempfile::TempDir;
 
     let dir = TempDir::new().expect("tempdir");
-    let path = dir.path().join("provider-input-replacement-ambiguity.sqlite3");
+    let path = dir
+        .path()
+        .join("provider-input-replacement-ambiguity.sqlite3");
     let (task_id, agent_session_id, operation_id, permit) = begin_provider_dispatch(&path, 0x21);
     let conn = Connection::open(&path).expect("open sqlite");
     conn.execute(
@@ -483,7 +494,9 @@ fn expired_provider_dispatch_recovery_preserves_g1_after_runtime_replacement() {
         Some(AmbiguityDisposition::Uncertain),
     );
     assert!(matches!(
-        store.operation_status(operation_id).expect("operation status"),
+        store
+            .operation_status(operation_id)
+            .expect("operation status"),
         Some(OperationState::Uncertain {
             code: devmanager::domain::OperationUncertaintyCode::AmbiguousDispatch,
             ..
@@ -494,10 +507,7 @@ fn expired_provider_dispatch_recovery_preserves_g1_after_runtime_replacement() {
         .expect("G1 uncertainty must not authorize resend")
         .is_none());
     assert!(store
-        .record_dispatch_completion(
-            &permit,
-            devmanager::kernel::DispatchCompletion::Settled,
-        )
+        .record_dispatch_completion(&permit, devmanager::kernel::DispatchCompletion::Settled,)
         .is_err());
     drop(store);
 
@@ -534,7 +544,10 @@ fn expired_provider_dispatch_recovery_preserves_g1_after_runtime_replacement() {
         .expect("retained typed provider effect");
     assert_eq!(destination, "provider_input");
     assert_eq!(replay_policy, "no_automatic_retry");
-    assert!(payload_len > 0, "uncertainty must retain provider identity payload");
+    assert!(
+        payload_len > 0,
+        "uncertainty must retain provider identity payload"
+    );
     match permit.effect() {
         devmanager::kernel::Effect::DeliverProviderInput {
             runtime_generation,
@@ -590,7 +603,9 @@ fn generic_ambiguity_fails_closed_on_tampered_task_fence() {
         .claim_next_dispatch(std::time::Duration::from_secs(30))
         .expect("claim generic dispatch")
         .expect("generic dispatch ready");
-    let permit = store.begin_dispatch(&claim).expect("begin generic dispatch");
+    let permit = store
+        .begin_dispatch(&claim)
+        .expect("begin generic dispatch");
     assert!(matches!(permit.effect(), Effect::BeginTaskTeardown { .. }));
     drop(store);
 
@@ -672,7 +687,9 @@ fn generic_retry_safe_ambiguity_keeps_current_dispatch_path() {
         .claim_next_dispatch(std::time::Duration::from_secs(30))
         .expect("claim generic dispatch")
         .expect("generic dispatch ready");
-    let permit = store.begin_dispatch(&claim).expect("begin generic dispatch");
+    let permit = store
+        .begin_dispatch(&claim)
+        .expect("begin generic dispatch");
     assert!(matches!(permit.effect(), Effect::BeginTaskTeardown { .. }));
     assert_eq!(
         store
@@ -701,7 +718,9 @@ fn expired_provider_recovery_rejects_attempts_behind_lease_generation() {
     use tempfile::TempDir;
 
     let dir = TempDir::new().expect("tempdir");
-    let path = dir.path().join("provider-input-recovery-generation.sqlite3");
+    let path = dir
+        .path()
+        .join("provider-input-recovery-generation.sqlite3");
     let (_, _, operation_id, _permit) = begin_provider_dispatch(&path, 0x39);
     let conn = Connection::open(&path).expect("open provider state");
     conn.execute(
@@ -830,8 +849,7 @@ fn provider_dispatch_ambiguity_rejects_immutable_attempt_tampering() {
         }),
         ("runtime_generation", 0x91, |mut effect| {
             if let Effect::DeliverProviderInput {
-                runtime_generation,
-                ..
+                runtime_generation, ..
             } = &mut effect
             {
                 *runtime_generation = (*runtime_generation).saturating_add(1);
@@ -887,15 +905,14 @@ fn provider_dispatch_ambiguity_rejects_immutable_attempt_tampering() {
 
     for (label, tail, mutate) in cases {
         let dir = TempDir::new().expect("tempdir");
-        let path = dir.path().join(format!("provider-input-tamper-{label}.sqlite3"));
+        let path = dir
+            .path()
+            .join(format!("provider-input-tamper-{label}.sqlite3"));
         let (_, _, operation_id, permit) = begin_provider_dispatch(&path, tail);
         overwrite_provider_effect(&path, operation_id, mutate(permit.effect().clone()));
 
         let mut store = KernelStore::open(&path).expect("reopen tampered provider store");
-        let result = store.record_dispatch_ambiguity(
-            &permit,
-            std::time::Duration::from_millis(1),
-        );
+        let result = store.record_dispatch_ambiguity(&permit, std::time::Duration::from_millis(1));
         assert!(
             result.is_err(),
             "immutable provider {label} tamper must be rejected: {result:?}"
@@ -910,7 +927,10 @@ fn provider_dispatch_ambiguity_rejects_immutable_attempt_tampering() {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .expect("tampered provider outbox row");
-        assert_eq!(state, "dispatching", "tampered {label} row must stay in flight");
+        assert_eq!(
+            state, "dispatching",
+            "tampered {label} row must stay in flight"
+        );
         assert_eq!(attempts, 1, "tampered {label} row must not advance attempt");
     }
 
@@ -932,9 +952,7 @@ fn provider_dispatch_ambiguity_rejects_immutable_attempt_tampering() {
     assert!(
         matches!(
             store.record_dispatch_ambiguity(&permit, std::time::Duration::from_millis(1)),
-            Err(StoreError::StaleClaim)
-                | Err(StoreError::Corruption)
-                | Err(StoreError::StaleFence)
+            Err(StoreError::StaleClaim) | Err(StoreError::Corruption) | Err(StoreError::StaleFence)
         ),
         "dispatch-attempt tamper must fail closed"
     );

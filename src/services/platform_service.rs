@@ -994,8 +994,7 @@ fn normalize_process_name(name: &OsStr) -> Option<String> {
 mod tests {
     use super::{
         claim_suspended_process_with, resume_suspended_process_with, snapshot_listener_pids,
-        snapshot_listener_pids_until,
-        terminate_owned_process_group_with, MAX_LISTENER_PORT_BATCH,
+        snapshot_listener_pids_until, terminate_owned_process_group_with, MAX_LISTENER_PORT_BATCH,
     };
     use std::cell::RefCell;
     use std::sync::{

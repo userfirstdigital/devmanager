@@ -5,11 +5,12 @@ pub mod adapter;
 pub mod capabilities;
 pub mod claude;
 pub mod codex;
+pub mod conformance;
 pub mod cursor;
 pub mod input;
 pub mod journal;
-pub mod quota;
 pub mod orchestrator;
+pub mod quota;
 pub mod registry;
 pub mod session;
 
@@ -46,9 +47,9 @@ pub use capabilities::{
     PROVIDER_EXECUTABLE_SCHEMA_VERSION, PROVIDER_FILE_IDENTITY_SCHEMA_VERSION,
     PROVIDER_OBSERVATION_SCHEMA_VERSION,
 };
-pub use cursor::CursorAdapter;
 pub use claude::ClaudeCodeAdapter;
 pub use codex::CodexAdapter;
+pub use cursor::CursorAdapter;
 pub use journal::{
     JournalBackpressure, JournalEvent, JournalIngestOutcome, JournalLimits, JournalRedactionClass,
     JournalRejectReason, JournalSemanticKind, JournalVisibility, SemanticJournal,

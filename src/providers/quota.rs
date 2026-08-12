@@ -507,8 +507,8 @@ impl QuotaObserverSource for AdapterQuotaSource {
         executable: &Path,
         _version: &ProviderVersion,
     ) -> Result<QuotaSourceOutcome, QuotaSourceError> {
-        let identity = ProviderExecutable::from_path(executable)
-            .map_err(|_| QuotaSourceError::Failed)?;
+        let identity =
+            ProviderExecutable::from_path(executable).map_err(|_| QuotaSourceError::Failed)?;
         let handle = identity
             .open_for_launch()
             .map_err(|_| QuotaSourceError::Failed)?;
