@@ -1038,6 +1038,26 @@ mod tests {
         expected_revision: u64,
         role: AgentRole,
     ) {
+        if matches!(role, AgentRole::Specialist { .. }) {
+            let agent = agent_facts(task_id, agent_session_id, role);
+            let connection = Connection::open(store.path()).expect("open agent projection");
+            connection
+                .execute(
+                    "INSERT INTO agent_sessions(
+                        agent_session_id, task_id, role, provider_kind,
+                        provider_session_id, lifecycle, runtime_generation, revision
+                    ) VALUES (?1, ?2, ?3, 'codex', ?4, 'open', 0, 0)",
+                    rusqlite::params![
+                        agent.id.as_bytes(),
+                        agent.task_id.as_bytes(),
+                        rmp_serde::to_vec(&agent.role).expect("encode agent role"),
+                        agent.provider_session_id.as_ref().map(ToString::to_string),
+                    ],
+                )
+                .expect("insert agent projection");
+            return;
+        }
+
         store
             .execute(envelope(
                 command_id,

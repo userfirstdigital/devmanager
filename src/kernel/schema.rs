@@ -2280,7 +2280,7 @@ mod tests {
             }
 
             {
-                if prior_version == 12 {
+                if prior_version == 11 {
                     use crate::domain::id::{
                         CommandId, EventId, PromptChainId, PromptId, PromptVersionId,
                     };
