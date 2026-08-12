@@ -16,6 +16,7 @@ use devmanager::providers::capabilities::{
     ProviderExecutableError, ProviderExecutableHandle, ProviderExecutablePolicy, ProviderKind,
     ProviderVersion, ProviderVersionError, SemanticSchemaVersion, MAX_CAPABILITY_EVIDENCE_ITEMS,
 };
+use devmanager::providers::cursor::CursorAdapter;
 use devmanager::providers::registry::{
     CacheStatus, CapabilityCacheKey, ExecutableInspector, FileSystemExecutableInspector,
     ProviderDiscoveryConfig, ProviderObservation, ProviderRegistry,
@@ -2319,5 +2320,48 @@ async fn unix_probe_runner_timeout_kills_and_joins_the_entire_probe_tree() {
     }
     assert!(!devmanager::services::platform_service::is_pid_running(
         child_pid
+    ));
+}
+
+#[tokio::test]
+async fn cursor_empty_registry_does_not_observe_unregistered_adapter() {
+    let registry = ProviderRegistry::new();
+    assert_eq!(
+        registry
+            .observe(ProviderKind::Cursor, &ProviderDiscoveryConfig::default())
+            .await
+            .unwrap_err(),
+        ProviderError::ProviderNotRegistered(ProviderKind::Cursor)
+    );
+}
+
+#[tokio::test]
+async fn cursor_public_adapter_registers_without_accepting_desktop_cursor_exe() {
+    let temp = tempdir().unwrap();
+    let desktop = temp.path().join("cursor.exe");
+    std::fs::write(&desktop, b"desktop-cursor").unwrap();
+
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(CursorAdapter::new())).unwrap();
+    assert_eq!(
+        registry
+            .register(Arc::new(CursorAdapter::new()))
+            .unwrap_err(),
+        ProviderError::DuplicateProviderKind(ProviderKind::Cursor)
+    );
+
+    let rejected = registry
+        .resolve_executable(
+            ProviderKind::Cursor,
+            &ProviderDiscoveryConfig {
+                executable_override: Some(desktop),
+                path: None,
+            },
+        )
+        .await;
+    assert!(matches!(
+        rejected,
+        Err(ProviderError::WrapperCommandNotAllowed { .. })
+            | Err(ProviderError::ExecutableNotAllowed { .. })
     ));
 }

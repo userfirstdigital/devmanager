@@ -7,6 +7,7 @@
 pub mod adapter;
 pub mod capabilities;
 pub mod claude;
+pub mod cursor;
 pub mod registry;
 pub mod session;
 
@@ -43,6 +44,7 @@ pub use capabilities::{
     PROVIDER_EXECUTABLE_SCHEMA_VERSION, PROVIDER_FILE_IDENTITY_SCHEMA_VERSION,
     PROVIDER_OBSERVATION_SCHEMA_VERSION,
 };
+pub use cursor::CursorAdapter;
 pub use registry::{
     CacheStatus, CapabilityCacheKey, ExecutableInspector, FileSystemExecutableInspector,
     ProviderDiscoveryConfig, ProviderObservation, ProviderRegistry,
