@@ -6,6 +6,7 @@ pub mod event;
 pub mod host;
 pub mod id;
 pub mod operation;
+pub mod org;
 pub mod query;
 pub mod resource;
 pub mod snapshot;
@@ -32,7 +33,7 @@ pub use host::{
 pub use id::{
     AgentSessionId, ArtifactId, BrowserContextId, ClientId, CommandId, EnvironmentId, EventId,
     IdError, OperationId, OutboxId, ProjectId, RequestId, ResourceId, ServiceId, SnapshotId,
-    SubscriptionId, TaskId, TerminalId, TransferId,
+    SubscriptionId, TaskId, TaskInviteId, TerminalId, TransferId,
 };
 pub use operation::{
     validate_outcome_fence, validate_source_for_kind, validate_terminal_fact_source,
@@ -40,15 +41,17 @@ pub use operation::{
     OperationState, OperationUncertaintyCode, OutcomeFenceError, OutcomeSource, ResourceFence,
     MAX_EXTERNAL_IDENTITY_BYTES,
 };
+pub use org::{ManagedScope, TaskScope};
 pub use query::{Query, QueryEnvelope, QueryError, QueryOutcome, QueryReply, QueryResult};
 pub use resource::{
     OwnerKind, ResourceFacts, ResourceKind, ResourceLifecycle, ResourceRecipe,
     ResourceValidationError,
 };
 pub use snapshot::{
-    ArtifactContentPage, EventPage, PageLimits, PageLimitsError, SnapshotItem, SnapshotItemKey,
-    SnapshotPage, SnapshotSection, TaskSnapshot, TaskSnapshotItem, MAX_SNAPSHOT_PAGE_ENCODED_BYTES,
-    MAX_SNAPSHOT_PAGE_ITEMS,
+    canonical_artifact_content_page_size, canonical_event_page_size, canonical_snapshot_page_size,
+    ArtifactContentPage, CanonicalPageSizeError, EventPage, PageLimits, PageLimitsError,
+    SnapshotItem, SnapshotItemKey, SnapshotPage, SnapshotSection, TaskSnapshot, TaskSnapshotItem,
+    MAX_SNAPSHOT_PAGE_ENCODED_BYTES, MAX_SNAPSHOT_PAGE_ITEMS,
 };
 pub use task::{
     RepositoryFingerprint, ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention,

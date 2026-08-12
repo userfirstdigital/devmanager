@@ -8,6 +8,7 @@ mod connection;
 mod host_client;
 pub mod inbox_controller;
 pub mod model;
+pub mod port;
 pub mod preferences;
 pub mod subscription;
 
@@ -17,6 +18,7 @@ pub use action::{
 };
 pub use cli::{dispatch_ctl_from_args, parse_ctl_args, run_ctl, CliError, CtlCommand};
 pub use connection::{connect, perform_client_hello, ClientConnection, UnsolicitedServerMessage};
+pub(crate) use host_client::track_accepted_receipt;
 pub use host_client::{
     ArtifactContentBatch, EventReplayBatch, HostClient, HostClientConfig, TrackedOperation,
 };
@@ -28,6 +30,10 @@ pub(crate) use model::normalize_bounded_search_text;
 pub use model::{
     ClientModel, ClientModelBuilder, ClientModelError, SearchContinuation, SearchPage,
     SearchPageStatus,
+};
+pub use port::{
+    ApprovalAnswerCall, HostCommandPort, HostPortError, PromptMetadataItem, PromptMetadataPage,
+    PromptQueryCall, ProviderInputCall, TranscriptFetchCall,
 };
 pub use preferences::{ClientPreferenceError, InboxPreferenceStore};
 pub use subscription::{
