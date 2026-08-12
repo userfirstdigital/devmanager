@@ -461,9 +461,9 @@ fn history_rows_are_separate_read_only_projection_and_never_actionable() {
         InboxRenderItem::HistoryRow(row)
             if row.task_id == archived
                 && row.read_only
-                && row.accessibility.role == devmanager::ui::components::AccessibleRole::Region
-                && row.accessibility.disabled
-                && row.accessibility.read_only
+                && row.accessibility.role() == devmanager::ui::components::AccessibleRole::Region
+                && row.accessibility.disabled()
+                && row.accessibility.read_only()
                 && row.accessible_description.contains("read-only")
     )));
 }
