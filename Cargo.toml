@@ -2,7 +2,7 @@
 name = "devmanager"
 version = "0.4.2"
 edition = "2021"
-description = "Native GPUI rewrite of DevManager"
+description = "DevManager native GPUI client and durable local host"
 license = "Apache-2.0"
 
 [[bin]]
@@ -78,6 +78,7 @@ windows = { version = "=0.61.3", features = [
 libc = "0.2.183"
 
 [target.'cfg(windows)'.build-dependencies]
+embed-resource = "3.0"
 winresource = "0.1"
 
 [dev-dependencies]
@@ -88,10 +89,10 @@ tempfile = "3"
 [package.metadata.packager]
 product-name = "DevManager"
 identifier = "com.userfirst.devmanager"
-before-packaging-command = "cargo build --release"
+before-packaging-command = "cargo build --release --bin devmanager --bin devmanager-host"
 authors = ["UserFirst"]
 copyright = "Copyright (c) UserFirst"
-description = "Native GPUI workspace and terminal manager for projects, servers, AI sessions, and SSH."
+description = "Native GPUI client plus durable host for Tasks, terminals, providers, workspace tools, and Connect."
 icons = [
     "packaging/icons/devmanager-32.png",
     "packaging/icons/devmanager-128.png",
@@ -100,6 +101,15 @@ icons = [
     "packaging/icons/devmanager.ico",
 ]
 resources = ["assets", "third_party/ghostty"]
-long-description = "DevManager is the native GPUI rewrite of the archived Tauri app. It keeps local project orchestration, server tabs, AI terminals, SSH sessions, config import/export, and a signed update path in a single desktop shell."
+long-description = "DevManager ships one product with sibling binaries: the native GPUI desktop client (devmanager) and the durable local execution host (devmanager-host). They share semantic version, build, and protocol identity. Packages exclude worktrees, target/evidence trees, test fixtures, session.json, development profiles, Portal proprietary trees, zz-archive, and secrets. User prompt databases and organization content are never packaged."
+binaries-dir = "target/release"
 out-dir = "dist/packager"
 publisher = "UserFirst"
+
+[[package.metadata.packager.binaries]]
+path = "devmanager"
+main = true
+
+[[package.metadata.packager.binaries]]
+path = "devmanager-host"
+main = false

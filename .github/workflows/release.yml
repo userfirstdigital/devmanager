@@ -5,6 +5,16 @@ on:
     branches:
       - master
   workflow_dispatch:
+    inputs:
+      publish:
+        description: "Promote an already-staged draft release to public (requires release-publish environment approval)"
+        type: boolean
+        default: false
+      tag_name:
+        description: "Required when publish=true: existing draft release tag to promote (for example v0.4.2). Never computes a new patch."
+        type: string
+        required: false
+        default: ""
 
 concurrency:
   group: release-${{ github.repository }}
@@ -16,6 +26,7 @@ env:
   NSIS_VERSION: "3.12.0"
   WIX_VERSION: "3.14.1.20250415"
   WIX_BINARY_VERSION: "3.14.1.8722"
+  MINISIGN_VERSION: "0.11"
 
 permissions:
   contents: read
@@ -48,6 +59,29 @@ jobs:
           cache: "npm"
           cache-dependency-path: web/package-lock.json
 
+      - name: Validate Cargo.lock via cargo metadata --locked
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo metadata --format-version 1 --locked >/tmp/cargo-metadata-locked.json
+          python - <<'PY'
+          import json
+          import pathlib
+          meta = json.loads(pathlib.Path("/tmp/cargo-metadata-locked.json").read_text(encoding="utf-8"))
+          packages = {pkg["name"]: pkg["version"] for pkg in meta["packages"]}
+          if packages.get("devmanager") is None:
+              raise SystemExit("cargo metadata --locked did not resolve the root devmanager package")
+          print(f"cargo metadata --locked ok for devmanager {packages['devmanager']} ({len(packages)} packages)")
+          PY
+
+      - name: Phase 11 packaging stale-reference scan
+        shell: pwsh
+        run: ./packaging/Assert-StaleReferences.ps1
+
+      - name: Machine-check third-party provenance against Cargo.lock
+        shell: pwsh
+        run: ./packaging/Assert-ThirdPartyProvenance.ps1
+
       - name: Verify browser web UI
         shell: bash
         run: |
@@ -72,7 +106,7 @@ jobs:
           cargo fmt --all -- --check
           cargo test --locked --all-targets -- --test-threads=1
 
-  # Packaging (prepare/build) runs for every eligible deploy attempt; it does not wait on verify.
+  # Packaging (prepare/build) is independent from publication and never auto-publishes public.
   prepare:
     if: >-
       github.ref == 'refs/heads/master' &&
@@ -331,6 +365,30 @@ jobs:
           DEVMANAGER_UPDATE_WINDOWS_INSTALL_MODE: passive
         run: cargo packager --release --formats "${{ matrix.formats }}"
 
+      - name: Ensure 7-Zip for NSIS payload extraction
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          choco install 7zip.install --yes --no-progress
+          if ($LASTEXITCODE -ne 0) {
+            throw "Chocolatey failed to install 7-Zip."
+          }
+          $sevenZip = Join-Path ${env:ProgramFiles} "7-Zip\7z.exe"
+          if (-not (Test-Path -LiteralPath $sevenZip -PathType Leaf)) {
+            throw "7-Zip executable was not found at $sevenZip."
+          }
+          $sevenZipDir = Split-Path -Parent $sevenZip
+          $env:Path = "$sevenZipDir;$env:Path"
+          $sevenZipDir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Assert package contract against staged/extracted payload
+        shell: pwsh
+        run: |
+          ./packaging/Assert-PackageContract.ps1 `
+            -TargetReleaseDir "target/release" `
+            -StageDir "dist/packager" `
+            -ExtractInstallers
+
       - name: Collect packaged artifacts
         shell: bash
         env:
@@ -347,12 +405,18 @@ jobs:
           path: release-artifacts/${{ matrix.platform }}
           if-no-files-found: error
 
-  # Publication waits for verify + packaging so a failed verify still blocks the GitHub release.
-  release:
+# Staging waits for verify + packaging, cryptographically verifies signatures, and creates a
+  # draft only. Public publication never happens automatically from a push.
+  stage:
     needs: [verify, prepare, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    outputs:
+      release_id: ${{ steps.draft_release.outputs.id }}
+      tag_name: ${{ needs.prepare.outputs.tag_name }}
+      release_version: ${{ needs.prepare.outputs.release_version }}
+      commit_sha: ${{ needs.prepare.outputs.commit_sha }}
 
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -365,19 +429,33 @@ jobs:
         with:
           path: release-artifacts
 
-      - name: Validate and stage the release contract
+      - name: Install minisign
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -sL "https://github.com/jedisct1/minisign/releases/download/${MINISIGN_VERSION}/minisign-${MINISIGN_VERSION}-linux.tar.gz" \
+            | tar -xz
+          sudo install -m 0755 "minisign-linux/x86_64/minisign" /usr/local/bin/minisign
+          minisign -v
+
+      - name: Validate, verify signatures, and stage the release contract
         shell: bash
         env:
           REPO: ${{ github.repository }}
           VERSION: ${{ needs.prepare.outputs.release_version }}
           TAG_NAME: ${{ needs.prepare.outputs.tag_name }}
+          DEVMANAGER_UPDATE_PUBKEY: ${{ vars.DEVMANAGER_UPDATE_PUBKEY }}
         run: |
+          set -euo pipefail
+          chmod +x packaging/verify-packager-signatures.sh
           python - <<'PY'
           import datetime as dt
+          import hashlib
           import json
           import os
           import pathlib
           import shutil
+          import subprocess
 
           root = pathlib.Path("release-artifacts")
           repo = os.environ["REPO"]
@@ -387,6 +465,29 @@ jobs:
           if publish_dir.exists():
               shutil.rmtree(publish_dir)
           publish_dir.mkdir()
+
+          contract = json.loads(
+              pathlib.Path("packaging/package-contract.json").read_text(encoding="utf-8")
+          )
+          if contract["productName"] != "DevManager":
+              raise SystemExit("package contract productName must remain DevManager")
+          if contract.get("binariesDir") != "target/release":
+              raise SystemExit("package contract binariesDir must be target/release")
+          expected_names = {entry["name"] for entry in contract["binaries"]}
+          if expected_names != {"devmanager", "devmanager-host"}:
+              raise SystemExit(
+                  f"package contract binaries must be exactly client+host, found {sorted(expected_names)}"
+              )
+          forbidden = {name for name in contract["forbiddenBinaries"]}
+          if "devmanager-next" not in forbidden:
+              raise SystemExit("package contract must forbid devmanager-next")
+          if "zz-archive" not in contract["excludes"]:
+              raise SystemExit("package contract excludes must include zz-archive")
+          shipping = contract["shippingIdentity"]["format"].replace("{version}", version)
+          if shipping != f"devmanager/{version}":
+              raise SystemExit(f"unexpected shipping identity {shipping}")
+          if contract.get("publication", {}).get("autoPublishPublic") is not False:
+              raise SystemExit("package contract must keep autoPublishPublic=false")
 
           required_assets = {
               "windows-x86_64": [
@@ -442,15 +543,24 @@ jobs:
               return signature
 
           selected = []
-          for platform, contract in required_assets.items():
+          for platform, contract_assets in required_assets.items():
               directory = root / platform
               if not directory.is_dir():
                   raise SystemExit(f"Missing packaged artifacts for {platform}: {directory}")
-              for label, pattern in contract:
+              for label, pattern in contract_assets:
                   asset = pick_single_asset(directory, pattern, label)
                   selected.append(asset)
                   if asset.suffix == ".sig":
                       read_signature(asset)
+              for path in directory.rglob("*"):
+                  if not path.is_file():
+                      continue
+                  lowered = path.name.lower()
+                  if any(
+                      token in lowered
+                      for token in ("devmanager-next", "process-test-helper", "legacy", "zz-archive")
+                  ):
+                      raise SystemExit(f"Forbidden packaged artifact path: {path}")
 
           names = [asset.name for asset in selected]
           if len(selected) != 10 or len(names) != len(set(names)):
@@ -460,6 +570,11 @@ jobs:
           for asset in selected:
               shutil.copy2(asset, publish_dir / asset.name)
 
+          subprocess.check_call(
+              ["bash", "packaging/verify-packager-signatures.sh", str(publish_dir)],
+              env=os.environ.copy(),
+          )
+
           platforms = {}
           for platform, metadata in updater_assets.items():
               directory = root / platform
@@ -467,18 +582,34 @@ jobs:
                   raise SystemExit(f"Missing packaged artifacts for {platform}: {directory}")
               asset = pick_single_asset(directory, metadata["pattern"], f"{platform} updater asset")
               signature = read_signature(pathlib.Path(f"{asset}.sig"))
+              digest = hashlib.sha256(asset.read_bytes()).hexdigest()
               platforms[platform] = {
                   "format": metadata["format"],
                   "signature": signature,
                   "url": f"https://github.com/{repo}/releases/download/{tag_name}/{asset.name}",
+                  "sha256": digest,
               }
 
+          # Signed updater metadata is generated only after cryptographic signature verification.
           manifest = {
               "version": version,
               "notes": "See the GitHub release notes for details.",
               "pub_date": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "identity": shipping,
+              "protocol": {
+                  "major": contract["protocol"]["major"],
+                  "minor": contract["protocol"]["minor"],
+              },
               "platforms": platforms,
           }
+          for field in contract["updaterManifestRequiredFields"]:
+              if field not in manifest:
+                  raise SystemExit(f"latest.json missing required field {field}")
+          for platform_meta in platforms.values():
+              for field in contract["platformRequiredFields"]:
+                  if field not in platform_meta or not platform_meta[field]:
+                      raise SystemExit(f"latest.json platform missing required field {field}")
+
           manifest_path = publish_dir / "latest.json"
           manifest_path.write_text(
               json.dumps(manifest, indent=2) + "\n",
@@ -486,7 +617,7 @@ jobs:
           )
           if manifest_path.stat().st_size <= 0:
               raise SystemExit("Generated latest.json is empty")
-          print(f"Validated and staged {len(selected) + 1} required release assets.")
+          print(f"Validated, signature-verified, and staged {len(selected) + 1} required release assets.")
           PY
 
       - name: Create and validate release tag
@@ -540,9 +671,11 @@ jobs:
               raise SystemExit(f"Release lookup failed closed with HTTP {error.code}: {error.reason}")
           except (urllib.error.URLError, TimeoutError) as error:
               raise SystemExit(f"Release lookup failed closed: {error}")
+          if release.get("draft") is True:
+              raise SystemExit(0)
           raise SystemExit(
               f"Release {release.get('tag_name')} already exists "
-              f"(draft={release.get('draft')}); refusing to mutate it."
+              f"(draft={release.get('draft')}); refusing to mutate a public release."
           )
           PY
 
@@ -557,6 +690,16 @@ jobs:
           VERSION: ${{ needs.prepare.outputs.release_version }}
         run: |
           set -euo pipefail
+          existing_draft_id="$(
+            gh api --paginate "repos/${REPO}/releases?per_page=100" \
+              --jq ".[] | select(.tag_name == \"${TAG_NAME}\" and .draft == true) | .id" \
+              | head -n 1 || true
+          )"
+          if [ -n "${existing_draft_id}" ]; then
+            echo "Draft release for ${TAG_NAME} already exists as ${existing_draft_id}; leaving it unchanged."
+            echo "id=${existing_draft_id}" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
           gh release create "${TAG_NAME}" publish-assets/* \
             --repo "${REPO}" \
             --draft \
@@ -594,7 +737,7 @@ jobs:
           fi
           echo "id=${RELEASE_ID}" >> "${GITHUB_OUTPUT}"
 
-      - name: Verify draft assets and publish atomically
+      - name: Verify draft assets remain unpublished
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -661,8 +804,215 @@ jobs:
                       f"Draft asset {name} digest mismatch: expected {metadata['digest']}, "
                       f"found {asset.get('digest')}"
                   )
-          print(f"Verified names, sizes, and SHA-256 digests for {len(actual)} draft assets.")
+          release = json.loads(
+              subprocess.check_output(
+                  ["gh", "api", f"repos/{os.environ['REPO']}/releases/{os.environ['RELEASE_ID']}"],
+                  text=True,
+              )
+          )
+          if release.get("draft") is not True:
+              raise SystemExit("Stage job must leave the release in draft state; refusing public publish")
+          print(f"Verified draft-only staging for {len(actual)} assets; public publish requires manual approval.")
           PY
+
+  # Public publication is independent from packaging/stage. It promotes an explicitly
+  # selected existing draft tag and never computes or creates a new patch version.
+  publish:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish == true }}
+    runs-on: ubuntu-latest
+    environment: release-publish
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+
+      - name: Validate explicit draft tag input
+        id: selected
+        shell: bash
+        env:
+          TAG_NAME: ${{ inputs.tag_name }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TAG_NAME}" ]; then
+            echo "publish=true requires workflow_dispatch input tag_name for an existing draft tag." >&2
+            exit 1
+          fi
+          if ! [[ "${TAG_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "tag_name must look like vX.Y.Z, got ${TAG_NAME}" >&2
+            exit 1
+          fi
+          echo "tag_name=${TAG_NAME}" >> "${GITHUB_OUTPUT}"
+          echo "version=${TAG_NAME#v}" >> "${GITHUB_OUTPUT}"
+
+      - name: Resolve existing draft release for selected tag
+        id: draft
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG_NAME: ${{ steps.selected.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+          if ! git ls-remote --exit-code --tags origin "refs/tags/${TAG_NAME}" >/dev/null 2>&1; then
+            echo "Refusing publish: tag ${TAG_NAME} does not exist on origin." >&2
+            exit 1
+          fi
+          git fetch --force origin "refs/tags/${TAG_NAME}:refs/tags/${TAG_NAME}"
+          RELEASE_JSON="$(gh api "repos/${REPO}/releases/tags/${TAG_NAME}" || true)"
+          # Prefer authenticated list for drafts GitHub may hide from the tag endpoint.
+          RELEASE_ID="$(
+            gh api --paginate "repos/${REPO}/releases?per_page=100" \
+              --jq ".[] | select(.tag_name == \"${TAG_NAME}\" and .draft == true) | .id" \
+              | head -n 1 || true
+          )"
+          if [ -z "${RELEASE_ID}" ]; then
+            echo "Refusing publish: no draft release exists for ${TAG_NAME}." >&2
+            exit 1
+          fi
+          if [ "$(gh api "repos/${REPO}/releases/${RELEASE_ID}" --jq .draft)" != "true" ]; then
+            echo "Refusing publish: release ${TAG_NAME} is not a draft." >&2
+            exit 1
+          fi
+          echo "id=${RELEASE_ID}" >> "${GITHUB_OUTPUT}"
+          echo "Resolved existing draft ${RELEASE_ID} for ${TAG_NAME}"
+
+      - name: Install minisign
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -sL "https://github.com/jedisct1/minisign/releases/download/${MINISIGN_VERSION}/minisign-${MINISIGN_VERSION}-linux.tar.gz" \
+            | tar -xz
+          sudo install -m 0755 "minisign-linux/x86_64/minisign" /usr/local/bin/minisign
+
+      - name: Download draft assets, verify signatures, and recompute hashes vs latest.json
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RELEASE_ID: ${{ steps.draft.outputs.id }}
+          TAG_NAME: ${{ steps.selected.outputs.tag_name }}
+          VERSION: ${{ steps.selected.outputs.version }}
+          DEVMANAGER_UPDATE_PUBKEY: ${{ vars.DEVMANAGER_UPDATE_PUBKEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p publish-assets
+          release_tag="$(gh api "repos/${REPO}/releases/${RELEASE_ID}" --jq .tag_name)"
+          release_draft="$(gh api "repos/${REPO}/releases/${RELEASE_ID}" --jq .draft)"
+          if [ "${release_tag}" != "${TAG_NAME}" ] || [ "${release_draft}" != "true" ]; then
+            echo "Resolved release ${RELEASE_ID} does not match the selected draft ${TAG_NAME}." >&2
+            exit 1
+          fi
+          assets="$(gh api --paginate "repos/${REPO}/releases/${RELEASE_ID}/assets?per_page=100" \
+            --jq '.[] | [.name, .browser_download_url] | @tsv')"
+          if [ -z "${assets}" ]; then
+            echo "Resolved draft ${RELEASE_ID} has no downloadable assets." >&2
+            exit 1
+          fi
+          while IFS=$'\t' read -r asset_name asset_url; do
+            [ -n "${asset_name}" ] && [ -n "${asset_url}" ] || continue
+            case "${asset_name}" in
+              */*|.*|*..*)
+                echo "Refusing unsafe draft asset name: ${asset_name}" >&2
+                exit 1
+                ;;
+            esac
+            curl --fail --silent --show-error --location --retry 3 \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H 'Accept: application/octet-stream' \
+              "${asset_url}" -o "publish-assets/${asset_name}"
+          done <<< "${assets}"
+          chmod +x packaging/verify-packager-signatures.sh
+          bash packaging/verify-packager-signatures.sh publish-assets
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import urllib.parse
+
+          root = pathlib.Path("publish-assets")
+          manifest_path = root / "latest.json"
+          if not manifest_path.is_file():
+              raise SystemExit("latest.json missing from downloaded draft assets")
+          manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+          version = os.environ["VERSION"]
+          tag_name = os.environ["TAG_NAME"]
+          for required in ("version", "identity", "protocol", "platforms"):
+              if required not in manifest:
+                  raise SystemExit(f"latest.json missing {required}")
+          if manifest["version"] != version:
+              raise SystemExit(
+                  f"latest.json version {manifest['version']} does not match selected tag version {version}"
+              )
+          if manifest["identity"] != f"devmanager/{version}":
+              raise SystemExit(
+                  f"latest.json identity must be devmanager/{version}, found {manifest['identity']}"
+              )
+
+          files = {
+              path.name: path
+              for path in root.iterdir()
+              if path.is_file() and path.name != "latest.json"
+          }
+          recomputed = {
+              name: hashlib.sha256(path.read_bytes()).hexdigest()
+              for name, path in files.items()
+          }
+
+          # Every platform asset referenced by latest.json must match recomputed hashes.
+          for platform, meta in manifest["platforms"].items():
+              for field in ("format", "signature", "url", "sha256"):
+                  if not meta.get(field):
+                      raise SystemExit(f"latest.json {platform} missing {field}")
+              url = meta["url"]
+              name = pathlib.PurePosixPath(urllib.parse.urlparse(url).path).name
+              if name not in recomputed:
+                  raise SystemExit(f"latest.json {platform} references missing asset {name}")
+              if recomputed[name] != meta["sha256"]:
+                  raise SystemExit(
+                      f"Hash mismatch for {name}: latest.json={meta['sha256']} recomputed={recomputed[name]}"
+                  )
+              sig_name = f"{name}.sig"
+              if sig_name not in files:
+                  raise SystemExit(f"Missing signature sibling for {name}")
+
+          # Recompute hashes for every downloaded artifact and require coverage.
+          expected_names = set(files)
+          referenced = set()
+          for meta in manifest["platforms"].values():
+              name = pathlib.PurePosixPath(urllib.parse.urlparse(meta["url"]).path).name
+              referenced.add(name)
+              referenced.add(f"{name}.sig")
+          # Non-updater artifacts (msi/dmg) may also be present; every file must have a stable digest.
+          for name, digest in sorted(recomputed.items()):
+              if len(digest) != 64:
+                  raise SystemExit(f"Invalid sha256 for {name}")
+              print(f"recomputed sha256 {name}={digest}")
+          missing_refs = referenced - expected_names
+          if missing_refs:
+              raise SystemExit(f"latest.json references missing files: {sorted(missing_refs)}")
+          print(
+              f"Recomputed hashes for {len(recomputed)} artifacts; "
+              f"latest.json platform hashes matched for tag {tag_name}."
+          )
+          PY
+
+      - name: Publish selected draft release after protected approval
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ steps.draft.outputs.id }}
+          REPO: ${{ github.repository }}
+          TAG_NAME: ${{ steps.selected.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+          if [ "$(gh api "repos/${REPO}/releases/${RELEASE_ID}" --jq .draft)" != "true" ]; then
+            echo "Refusing to mutate a non-draft release ${TAG_NAME}." >&2
+            exit 1
+          fi
           gh api \
             --method PATCH \
             "repos/${REPO}/releases/${RELEASE_ID}" \
@@ -674,3 +1024,4 @@ jobs:
             echo "Release ${TAG_NAME} did not leave draft state." >&2
             exit 1
           fi
+          echo "Published existing draft ${TAG_NAME} after protected manual approval."

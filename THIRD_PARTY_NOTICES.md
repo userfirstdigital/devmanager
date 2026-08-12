@@ -1,6 +1,47 @@
 # Third-party notices
 
+## gpui 0.2.2 and gpui-component 0.5.1
+
+- Sources: `https://crates.io/crates/gpui/0.2.2` and `https://crates.io/crates/gpui-component/0.5.1`
+- Declared in `Cargo.toml` as `gpui = "0.2.2"` and `gpui-component = "=0.5.1"`; resolved checksums are in `Cargo.lock`
+- These crates provide the native desktop UI shell packaged as `devmanager.exe`
+- Detailed `gpui-component` provenance remains in the section below
+
+## rusqlite 0.39.0 (bundled SQLite)
+
+- Source: `https://crates.io/crates/rusqlite/0.39.0`
+- Declared in `Cargo.toml` as `rusqlite = { version = "0.39.0", features = ["bundled"] }`
+- The bundled SQLite amalgamation is compiled into the application binaries; no separate SQLite redistributable is packaged
+- Used for durable host/task storage. Packages do not ship user prompt databases or organization content
+
+## similar 3.1.2 (prompt version diff)
+
+- Source: `https://crates.io/crates/similar/3.1.2`
+- Planned pin: `similar = { version = "=3.1.2", default-features = false, features = ["text", "unicode", "inline"] }`
+- License: Apache-2.0
+- Required only if actually locked after dependency union. Current `Cargo.lock` status: NOT_LOCKED / not present in `Cargo.lock`.
+- When locked, `packaging/Assert-ThirdPartyProvenance.ps1` requires this exact version in notices.
+
+## Selected crypto (exact Cargo.lock versions)
+
+Machine-checked against `Cargo.lock` by `packaging/Assert-ThirdPartyProvenance.ps1`:
+
+| Crate | Locked version | Root-direct |
+| --- | --- | --- |
+| `rustls` | `0.23.37` | yes |
+| `ring` | `0.17.14` | no (via rustls) |
+| `rcgen` | `0.13.2` | yes |
+| `sha2` | `0.10.9` | yes |
+| `hmac` | `0.12.1` | yes |
+| `zeroize` | `1.8.2` | yes |
+| `web-push-native` | `0.4.0` | yes |
+| `getrandom` | `0.3.4` | yes |
+| `base64` | `0.22.1` | yes |
+
+Phase 9 Connect E2E may add a Noise core later; extend this table with the exact pinned crate versions when locked. Packaging must not embed private keys, pairing secrets, or OS-vault material.
+
 ## caseless 0.2.2 and unicode-normalization 0.1.24
+
 
 - Sources: `https://crates.io/crates/caseless/0.2.2` and `https://crates.io/crates/unicode-normalization/0.1.24`
 - Upstream repositories: `https://github.com/unicode-rs/rust-caseless` and `https://github.com/unicode-rs/unicode-normalization`

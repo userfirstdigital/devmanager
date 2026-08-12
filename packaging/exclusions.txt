@@ -1,0 +1,20 @@
+# Paths and filename patterns that must never ship in a DevManager package.
+# Consumed by packaging/Assert-PackageContract.ps1 and tests/package_contract.rs.
+.worktrees
+target
+dist
+.devmanager-next
+evidence
+tests/fixtures
+session.json
+dev-profile
+remote.json
+config.json
+.env
+secrets
+Portal
+zz-archive
+devmanager-next
+devmanager-next.exe
+devmanager-process-test-helper
+devmanager-process-test-helper.exe

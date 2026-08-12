@@ -1,0 +1,69 @@
+{
+  "platform": "windows-x86_64",
+  "version": "0.4.2",
+  "identity": "devmanager/0.4.2",
+  "protocol": {
+    "major": 1,
+    "minor": 0
+  },
+  "productName": "DevManager",
+  "identifier": "com.userfirst.devmanager",
+  "binaries": [
+    {
+      "path": "devmanager.exe",
+      "name": "devmanager",
+      "role": "client",
+      "main": true,
+      "buildIdentity": "devmanager/0.4.2",
+      "productName": "DevManager",
+      "fileDescription": "DevManager",
+      "originalFilename": "devmanager.exe",
+      "internalName": "devmanager",
+      "fileVersion": "0.4.2",
+      "productVersion": "0.4.2",
+      "companyName": "UserFirst"
+    },
+    {
+      "path": "devmanager-host.exe",
+      "name": "devmanager-host",
+      "role": "host",
+      "main": false,
+      "buildIdentity": "devmanager-host/0.4.2",
+      "productName": "DevManager",
+      "fileDescription": "DevManager Host",
+      "originalFilename": "devmanager-host.exe",
+      "internalName": "devmanager-host",
+      "fileVersion": "0.4.2",
+      "productVersion": "0.4.2",
+      "companyName": "UserFirst"
+    },
+    {
+      "path": "devmanager-next.exe",
+      "name": "devmanager-next",
+      "role": "legacy",
+      "main": false,
+      "buildIdentity": "devmanager-next/0.4.2",
+      "productName": "DevManager Next",
+      "fileDescription": "Development identity",
+      "originalFilename": "devmanager-next.exe",
+      "internalName": "devmanager-next",
+      "fileVersion": "0.4.2",
+      "productVersion": "0.4.2",
+      "companyName": "UserFirst"
+    }
+  ],
+  "resources": [
+    "assets",
+    "third_party/ghostty"
+  ],
+  "icons": [
+    "packaging/icons/devmanager.ico"
+  ],
+  "webview2": {
+    "windowsExpectation": "Evergreen WebView2 Runtime required for wry/webview2-com browser surfaces"
+  },
+  "signatures": [
+    "DevManager_0.4.2_x64-setup.exe.sig"
+  ],
+  "forbiddenPaths": []
+}
