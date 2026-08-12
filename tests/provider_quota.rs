@@ -5,13 +5,14 @@ use async_trait::async_trait;
 use devmanager::domain::snapshot::omit_stale_quota_display;
 use devmanager::providers::adapter::{
     AdapterDeliveryPermit, AdapterIngressUnavailable, JournalNormalizeError, LaunchProviderRequest,
-    NormalizedAdapterDelivery, ProviderAdapter, ProviderError, ProviderExecutableHandle,
-    ProviderLaunchSpec, ProviderQuotaStatus, ProviderRuntime,
+    NormalizedAdapterDelivery, ProviderAdapter, ProviderError, ProviderLaunchSpec,
+    ProviderQuotaStatus, ProviderRuntime,
     QuotaObservation as AdapterQuotaSample, StopStrategy,
 };
 use devmanager::providers::capabilities::{
     CapabilityEvidence, CapabilitySupport, EvidenceSourceId, EvidenceStatus, ProviderAuthState,
-    ProviderCapabilities, ProviderCapability, ProviderKind, ProviderVersion,
+    ProviderCapabilities, ProviderCapability, ProviderExecutableHandle, ProviderKind,
+    ProviderVersion,
 };
 use devmanager::providers::quota::{
     AdapterQuotaSource, ProductionJitter, QuotaObservation, QuotaObserverConfig,
