@@ -28,26 +28,23 @@ pub use inbox::{
     InboxRenderModel, InboxRenderRow, InboxRowActionCapture, InboxRowMouseDownHandler,
     InboxRuntime, InboxSection, InboxState, LiveClientSubscription, PrimaryProviderIcon,
     PrimaryProviderState, ResourceSummary, RuntimeSummary, SearchProgress, SearchWorkerState,
-    TaskRow, TaskRowDisplay, TaskRowModel, UnreadCursor, ViewportError, VirtualWindow,
-    TaskList, TaskListOverflow, VirtualKeysetWindow, VirtualListViewport, DEFAULT_VISIBLE_ROWS,
-    FIXED_VIRTUAL_OVERSCAN, MAX_ACCESSIBLE_DESCRIPTION_CHARS,
-    MAX_ACCESSIBLE_NAME_CHARS, MAX_PROJECT_LABEL_CHARS, MAX_PROVIDER_LABEL_CHARS, MAX_SEARCH_CHARS,
-    MAX_SECONDARY_LABEL_CHARS, MAX_TASK_LIST_ITEMS, MAX_TASK_SOURCE_IDS, MAX_VIRTUAL_WINDOW_ROWS,
-    MAX_WORKTREE_LABEL_CHARS,
+    TaskList, TaskListOverflow, TaskRow, TaskRowDisplay, TaskRowModel, UnreadCursor, ViewportError,
+    VirtualKeysetWindow, VirtualListViewport, VirtualWindow, DEFAULT_VISIBLE_ROWS,
+    FIXED_VIRTUAL_OVERSCAN, MAX_ACCESSIBLE_DESCRIPTION_CHARS, MAX_ACCESSIBLE_NAME_CHARS,
+    MAX_PROJECT_LABEL_CHARS, MAX_PROVIDER_LABEL_CHARS, MAX_SEARCH_CHARS, MAX_SECONDARY_LABEL_CHARS,
+    MAX_TASK_LIST_ITEMS, MAX_TASK_SOURCE_IDS, MAX_VIRTUAL_WINDOW_ROWS, MAX_WORKTREE_LABEL_CHARS,
 };
 
-
 /// Shared semantic renderer surfaces for task-cockpit messages.
- pub mod timeline;
+pub mod timeline;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
- pub enum NativeCockpitMount {
-     HoldMissingShell,
- }
+pub enum NativeCockpitMount {
+    HoldMissingShell,
+}
 
- pub const NATIVE_COCKPIT_MOUNT: NativeCockpitMount = NativeCockpitMount::HoldMissingShell;
+pub const NATIVE_COCKPIT_MOUNT: NativeCockpitMount = NativeCockpitMount::HoldMissingShell;
 
-
- pub mod composer;
+pub mod composer;
 pub mod dock;
 pub mod shell;

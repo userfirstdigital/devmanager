@@ -44,4 +44,4 @@ pub fn component_init_count() -> usize {
     COMPONENT_INIT_COUNT.load(Ordering::SeqCst)
 }
 
- pub mod quality;
+pub mod quality;
