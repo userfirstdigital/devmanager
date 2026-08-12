@@ -16,9 +16,10 @@ use crate::providers::capabilities::{
     CapabilitySupport, ProviderAuthState, ProviderCapability, ProviderExecutable, ProviderKind,
 };
 use crate::providers::registry::{ProviderDiscoveryConfig, ProviderRegistry};
+use crate::providers::test_support::{executable as test_executable, TestExecutableSlot};
 use async_trait::async_trait;
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 const FIXTURE_SESSION_ID: &str = "019f-fixture-codex-session";
@@ -169,15 +170,15 @@ impl ProviderProbeRunner for ScriptedProbeRunner {
 }
 
 fn fixture_executable() -> ProviderExecutable {
-    ProviderExecutable::new(PathBuf::from("/fixture/codex"), [4; 32]).unwrap()
+    test_executable(TestExecutableSlot::Primary)
 }
 
 fn other_executable() -> ProviderExecutable {
-    ProviderExecutable::new(PathBuf::from("/fixture/codex-other"), [5; 32]).unwrap()
+    test_executable(TestExecutableSlot::Alternate)
 }
 
 fn replaced_hash_executable() -> ProviderExecutable {
-    ProviderExecutable::new(PathBuf::from("/fixture/codex"), [9; 32]).unwrap()
+    test_executable(TestExecutableSlot::Replacement)
 }
 
 fn session_id() -> ProviderSessionId {

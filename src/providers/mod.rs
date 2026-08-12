@@ -20,6 +20,11 @@ pub mod registry;
 pub mod session;
 pub mod startup;
 
+// Test-only provider identities are copied from the real test executable so
+// the production attestation invariant remains exercised on every platform.
+#[cfg(test)]
+pub(crate) mod test_support;
+
 pub use adapter::{
     AdapterDeliveryPermit, AdapterIngressUnavailable, JournalNormalizeError, LaunchProviderRequest,
     NormalizedAdapterDelivery, ProviderAdapter, ProviderArgument, ProviderError, ProviderInput,

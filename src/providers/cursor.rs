@@ -335,7 +335,8 @@ mod tests {
         LaunchProviderRequest, ProviderProbeRequest, ProviderProbeResult,
     };
     use crate::providers::capabilities::{ProviderExecutable, ProviderExecutableHandle};
-    use std::path::{Path, PathBuf};
+    use crate::providers::test_support::{executable as test_executable, TestExecutableSlot};
+    use std::path::Path;
 
     const PINNED_VERSION: &[u8] =
         include_bytes!("../../tests/fixtures/providers/cursor/version.txt");
@@ -347,7 +348,7 @@ mod tests {
     }
 
     fn cursor_executable() -> ProviderExecutable {
-        ProviderExecutable::new(PathBuf::from("C:/bin/cursor-agent"), [0x44; 32]).unwrap()
+        test_executable(TestExecutableSlot::Primary)
     }
 
     fn cursor_handle() -> ProviderExecutableHandle {

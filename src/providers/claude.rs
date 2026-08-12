@@ -1018,6 +1018,7 @@ mod tests {
     use super::*;
     use crate::providers::adapter::{ProviderProbeKind, ProviderProbeResult};
     use crate::providers::registry::{ProviderDiscoveryConfig, ProviderRegistry};
+    use crate::providers::test_support::{executable as test_executable, TestExecutableSlot};
     use tempfile::tempdir;
 
     fn fixture(name: &str) -> &'static [u8] {
@@ -1046,8 +1047,7 @@ mod tests {
     }
 
     fn fixture_handle() -> ProviderExecutableHandle {
-        ProviderExecutable::new(r"C:\bin\claude.exe", [0x11; 32])
-            .expect("executable")
+        test_executable(TestExecutableSlot::Primary)
             .open_for_launch()
             .expect("launch handle")
     }
@@ -1251,8 +1251,7 @@ mod tests {
 
     #[test]
     fn replace_bound_keeps_one_correlation_per_task_agent() {
-        let executable =
-            ProviderExecutable::new(r"C:\bin\claude.exe", [0x11; 32]).expect("executable");
+        let executable = test_executable(TestExecutableSlot::Primary);
         let version = ProviderVersion::from_probe_output(fixture("version")).unwrap();
         let task = TaskId::new();
         let agent = AgentSessionId::new();
@@ -1300,8 +1299,7 @@ mod tests {
 
     #[test]
     fn bound_correlations_evict_oldest_at_the_capacity() {
-        let executable =
-            ProviderExecutable::new(r"C:\bin\claude.exe", [0x11; 32]).expect("executable");
+        let executable = test_executable(TestExecutableSlot::Primary);
         let version = ProviderVersion::from_probe_output(fixture("version")).unwrap();
         let mut bound = HashMap::new();
         let mut order = VecDeque::new();

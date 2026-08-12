@@ -1598,10 +1598,11 @@ mod authority_seal_tests {
         }
 
         let adapter = CodexAdapter::new(Arc::new(RejectRunner));
-        let executable = ProviderExecutable::new(r"C:\bin\codex.exe", [0x22; 32])
-            .expect("executable")
-            .open_for_launch()
-            .expect("handle");
+        let executable = crate::providers::test_support::executable(
+            crate::providers::test_support::TestExecutableSlot::Primary,
+        )
+        .open_for_launch()
+        .expect("handle");
         assert!(matches!(
             adapter.observe_quota(&executable).await,
             Err(ProviderError::UnsupportedCapability(
