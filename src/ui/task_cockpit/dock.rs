@@ -169,6 +169,22 @@ pub struct TerminalRuntimeIdentity {
 }
 
 impl TerminalRuntimeIdentity {
+    pub fn new(
+        task_id: TaskId,
+        agent_session_id: AgentSessionId,
+        resource_id: ResourceId,
+        runtime_generation: u64,
+        resource_generation: u64,
+    ) -> Self {
+        Self {
+            task_id,
+            agent_session_id,
+            resource_id,
+            runtime_generation,
+            resource_generation,
+        }
+    }
+
     pub fn task_id(self) -> TaskId {
         self.task_id
     }
@@ -260,6 +276,18 @@ pub struct HostStreamCursor {
 }
 
 impl HostStreamCursor {
+    pub fn from_identity(
+        identity: TerminalRuntimeIdentity,
+        sequence: u64,
+        full_snapshot: bool,
+    ) -> Self {
+        Self {
+            identity,
+            sequence,
+            full_snapshot,
+        }
+    }
+
     pub fn delta(
         model: &ClientModel,
         task_id: TaskId,
@@ -300,6 +328,10 @@ impl HostAdmitReport {
         Self {
             stream: Err(DependencyUnavailable::HostTerminalStream),
         }
+    }
+
+    fn host_stream_admitted() -> Self {
+        Self { stream: Ok(()) }
     }
 
     pub fn stream(self) -> Result<(), DependencyUnavailable> {
@@ -530,6 +562,13 @@ struct RememberedDockState {
     last_sequence: u64,
     surface_state: TerminalSurfaceState,
     exit_summary: Option<String>,
+    /// The most recent complete native terminal view admitted for this exact
+    /// task/resource/runtime fence. This is client presentation state only;
+    /// the dock never owns the PTY or provider process.
+    replica_view: Option<TerminalSessionView>,
+    /// Last complete view retained while a bounded reconnect/resync/exit
+    /// overlay is shown. It is never used for a different identity.
+    last_valid_view: Option<TerminalSessionView>,
 }
 
 impl RememberedDockState {
@@ -544,6 +583,8 @@ impl RememberedDockState {
             last_sequence: 0,
             surface_state: TerminalSurfaceState::Live,
             exit_summary: None,
+            replica_view: None,
+            last_valid_view: None,
         }
     }
 }
@@ -759,6 +800,8 @@ impl ContextDock {
                     memory.exit_summary = None;
                     memory.identity = Some(identity);
                     memory.terminal_presentation = TerminalPresentation::Semantic;
+                    memory.replica_view = None;
+                    memory.last_valid_view = None;
                 });
                 self.needs_resync = true;
                 self.press_owner = None;
@@ -841,7 +884,51 @@ impl ContextDock {
             }
         });
         self.needs_resync = false;
-        Ok(HostAdmitReport::host_stream_hold())
+        Ok(HostAdmitReport::host_stream_admitted())
+    }
+
+    /// Admit a complete native terminal view from the task-owned stream.
+    ///
+    /// The cursor performs all identity, generation, and sequence fencing;
+    /// only a view admitted by that fence reaches the renderer. A complete
+    /// view is required for every update because the native renderer consumes
+    /// a coherent screen snapshot rather than a loosely correlated cell list.
+    pub fn admit_host_view(
+        &mut self,
+        cursor: HostStreamCursor,
+        view: TerminalSessionView,
+    ) -> Result<HostAdmitReport, DockProjectionError> {
+        let full_snapshot = cursor.full_snapshot;
+        self.admit_host_cursor(cursor)?;
+        self.with_memory(|memory| {
+            memory.replica_view = Some(view.clone());
+            memory.last_valid_view = Some(view);
+            if full_snapshot {
+                memory.surface_state = TerminalSurfaceState::Live;
+                memory.exit_summary = None;
+            }
+        });
+        Ok(HostAdmitReport::host_stream_admitted())
+    }
+
+    /// Convenience seam for the native shell's task-owned subscription. The
+    /// client model remains the authority for task/session/resource identity;
+    /// the stream is allowed to supply only sequence/full-snapshot metadata
+    /// and the already-materialized native view.
+    pub fn admit_host_view_from_model(
+        &mut self,
+        model: &ClientModel,
+        task_id: TaskId,
+        sequence: u64,
+        full_snapshot: bool,
+        view: TerminalSessionView,
+    ) -> Result<HostAdmitReport, DockProjectionError> {
+        let cursor = if full_snapshot {
+            HostStreamCursor::full_snapshot(model, task_id, sequence)?
+        } else {
+            HostStreamCursor::delta(model, task_id, sequence)?
+        };
+        self.admit_host_view(cursor, view)
     }
 
     pub fn present_host_overlay(
@@ -946,7 +1033,11 @@ impl ContextDock {
     }
 
     pub fn replica_view(&self) -> Option<TerminalSessionView> {
-        None
+        self.current_memory().replica_view
+    }
+
+    pub fn last_valid_view(&self) -> Option<TerminalSessionView> {
+        self.current_memory().last_valid_view
     }
 
     pub fn emit_terminal_mouse_to_host(&self) -> Result<(), DependencyUnavailable> {
@@ -1307,8 +1398,8 @@ impl ContextDock {
         terminal_pane_from_replica(ReplicaPaneRequest {
             active_project: "",
             session_label: "task terminal",
-            replica_view: None,
-            last_valid_view: None,
+            replica_view: memory.replica_view.as_ref(),
+            last_valid_view: memory.last_valid_view.as_ref(),
             overlay: overlay_from(memory.surface_state, memory.exit_summary.as_deref()),
             selection: memory.viewport.selection,
             search: memory.viewport.search.clone(),
@@ -1514,6 +1605,21 @@ fn bound_exit_summary(value: &str) -> String {
 mod process_census_tests {
     use super::*;
 
+    fn terminal_view() -> TerminalSessionView {
+        use crate::state::SessionDimensions;
+        use crate::terminal::session::TerminalScreenSnapshot;
+
+        TerminalSessionView {
+            runtime: crate::state::SessionRuntimeState::new(
+                "task-terminal",
+                std::path::PathBuf::from("."),
+                SessionDimensions::default(),
+                crate::terminal::session::TerminalBackend::default(),
+            ),
+            screen: TerminalScreenSnapshot::default(),
+        }
+    }
+
     fn census_client_model() -> (ClientModel, TaskId) {
         use crate::client::model::ClientModelBuilder;
         use crate::domain::{
@@ -1630,6 +1736,51 @@ mod process_census_tests {
         assert_eq!(
             census.one_provider_one_pty_proof(),
             Err(DependencyUnavailable::LiveRuntimeCensus)
+        );
+    }
+
+    #[test]
+    fn admitted_native_view_reaches_renderer_and_survives_overlay() {
+        let (model, task_id) = census_client_model();
+        let mut dock = ContextDock::new(DockEdge::Right);
+        dock.follow_task(task_id);
+        dock.bind_from_model(&model).expect("bind");
+
+        let cursor = HostStreamCursor::full_snapshot(&model, task_id, 1).expect("cursor");
+        dock.admit_host_view(cursor, terminal_view())
+            .expect("admit native view");
+        assert!(dock.replica_view().is_some());
+        assert!(dock.terminal_pane_model().session.is_some());
+
+        dock.present_host_overlay(&model, TerminalSurfaceState::Reconnecting, None)
+            .expect("overlay");
+        assert!(dock.terminal_pane_model().session.is_some());
+        assert!(dock.terminal_pane_model().blocking_notice.is_some());
+    }
+
+    #[test]
+    fn stale_generation_cannot_replace_native_view() {
+        let (model, task_id) = census_client_model();
+        let mut dock = ContextDock::new(DockEdge::Right);
+        dock.follow_task(task_id);
+        dock.bind_from_model(&model).expect("bind");
+        let cursor = HostStreamCursor::full_snapshot(&model, task_id, 1).expect("cursor");
+        dock.admit_host_view(cursor, terminal_view())
+            .expect("admit native view");
+
+        let mut stale = HostStreamCursor::full_snapshot(&model, task_id, 2).expect("cursor");
+        stale.identity.runtime_generation = 2;
+        assert!(matches!(
+            dock.admit_host_view(stale, terminal_view()),
+            Err(DockProjectionError::GenerationMismatch { .. })
+        ));
+        assert_eq!(
+            dock.terminal_pane_model()
+                .session
+                .unwrap()
+                .runtime
+                .session_id,
+            "task-terminal"
         );
     }
 }

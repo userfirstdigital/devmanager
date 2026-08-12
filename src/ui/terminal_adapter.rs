@@ -16,7 +16,7 @@ use gpui::{
 pub const TERMINAL_ADAPTER_DEPENDENCY: &str =
     "src/terminal/view.rs::render_terminal_surface(TerminalPaneModel, TerminalPaneActions)";
 
-const TERMINAL_UNAVAILABLE_MESSAGE: &str = "Raw terminal unavailable in the isolated native shell: src/terminal/view.rs::render_terminal_surface requires a complete TerminalPaneModel and legacy runtime-owned actions. The adapter dependency is the only integration seam; no terminal is synthesized.";
+const TERMINAL_UNAVAILABLE_MESSAGE: &str = "No task-bound native terminal view has been admitted yet. The dock will render the established terminal surface as soon as the exact task/resource generation is available.";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TerminalDockState {
@@ -129,7 +129,7 @@ impl RenderOnce for TerminalDockUnavailable {
             .text_color(tokens.text.primary.to_gpui())
             .whitespace_normal()
             .child("Terminal dock unavailable")
-            .child("Raw terminal unavailable")
-            .child("The existing adapter needs a complete TerminalPaneModel.")
+            .child("Waiting for the task terminal stream")
+            .child("No terminal is synthesized and no extra PTY is started.")
     }
 }
