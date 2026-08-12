@@ -10590,7 +10590,7 @@ mod tests {
         let result = claim_then_resume_suspended_child(
             7,
             |_| Err("managed Windows Job was unavailable".to_string()),
-            |_| {
+            |_: &()| {
                 gated.set(true);
                 Ok(())
             },
@@ -10657,7 +10657,7 @@ mod tests {
 
         assert!(
             matches!(
-                error,
+                &error,
                 GitError::CommandStart { message, .. }
                     if message.contains("Cannot resume Git process")
             ),
