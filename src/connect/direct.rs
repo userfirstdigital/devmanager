@@ -4,6 +4,12 @@
 //! LAN binding is opt-in and requires TLS whose SAN matches the advertised
 //! host name. Pairing is a one-time POST; tokens never appear in URLs,
 //! referrers, or query strings.
+//!
+//! Physical Connect frames on this path remain capped by
+//! [`MAX_DIRECT_FRAME_BYTES`]. Realtime payloads must arrive as sealed frames
+//! from a production-grade [`crate::connect::crypto::EndToEndChannel`] before
+//! framing. This module never admits plaintext Connect application bytes.
+//! Production construction fail-closes while Noise XX/IK is unavailable.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -12,6 +18,9 @@ use std::time::{Duration, Instant};
 /// Hard bound for a pairing POST body.
 pub const MAX_DIRECT_PAIRING_BODY_BYTES: u64 = 4 * 1024;
 /// Hard bound for Connect physical frames on the direct path.
+///
+/// Stricter than the protocol physical maximum so direct admission stays
+/// conservative for browser and LAN peers.
 pub const MAX_DIRECT_FRAME_BYTES: u64 = 256 * 1024;
 
 pub const CSP_DIRECT: &str =

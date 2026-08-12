@@ -1382,10 +1382,18 @@ pub(crate) fn apply_event(
                 fact.observed_at_ms,
             )?;
         }
-        Event::Browser(_) => {
-            if event.task_id.is_none() || event.task_revision.is_none() {
+        Event::Browser(fact) => {
+            let task_id = event.task_id.ok_or_else(|| {
+                StoreError::Projection("browser.fact requires task_id and task_revision".into())
+            })?;
+            if event.task_revision.is_none() {
                 return Err(StoreError::Projection(
                     "browser.fact requires task_id and task_revision".into(),
+                ));
+            }
+            if fact.task_id() != task_id {
+                return Err(StoreError::Projection(
+                    "browser.fact embedded task_id disagrees with DomainEvent.task_id".into(),
                 ));
             }
         }
@@ -2847,5 +2855,33 @@ mod tests {
             })
             .expect_err("uncertain partial fence");
         assert!(matches!(err, StoreError::Projection(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn browser_fact_rejects_embedded_task_identity_mismatch() {
+        use crate::domain::browser::BrowserDurableFact;
+        use crate::domain::id::BrowserContextId;
+
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("kernel.sqlite3");
+        let mut store = KernelStore::open(&path).expect("open");
+
+        let envelope_task = TaskId::from_bytes(fixed_uuid_v7(0x40)).unwrap();
+        let embedded_task = TaskId::from_bytes(fixed_uuid_v7(0x41)).unwrap();
+        let mut event = domain(Event::Browser(BrowserDurableFact::ContextClosed {
+            context_id: BrowserContextId::from_bytes(fixed_uuid_v7(0x42)).unwrap(),
+            task_id: embedded_task,
+            generation: 1,
+        }));
+        event.task_id = Some(envelope_task);
+        event.task_revision = Some(1);
+
+        let err = store
+            .with_transaction(|tx| apply_event(tx, &event, false))
+            .expect_err("mismatched browser task identity");
+        assert!(
+            matches!(err, StoreError::Projection(ref detail) if detail.contains("embedded task_id")),
+            "got {err:?}"
+        );
     }
 }

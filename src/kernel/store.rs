@@ -42,6 +42,7 @@ use crate::workspace::WorkspaceAuthorization;
 const BUSY_TIMEOUT_MS: i64 = 5_000;
 const MAX_DISPATCH_LEASE_MS: i64 = 3_600_000;
 pub(crate) const MAX_PROVIDER_EVENT_PAYLOAD_BYTES: usize = 256 * 1024;
+const MAX_CONNECT_IDENTITY_BYTES: usize = 64 * 1024;
 
 /// Opaque SQLite-backed kernel store. No public connection accessor.
 pub struct KernelStore {
@@ -649,6 +650,104 @@ impl KernelStore {
             Err(StoreError::IntegrityCheckFailed(result))
         }
     }
+
+    /// Current Connect identity CAS epoch. Zero means no durable document.
+    pub(crate) fn connect_identity_revision(&self) -> Result<u64, StoreError> {
+        let revision: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT cas_epoch FROM connect_identity WHERE singleton_key = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match revision {
+            None => Ok(0),
+            Some(value) => u64_from_nonnegative_i64("connect_identity.cas_epoch", value),
+        }
+    }
+
+    /// Read the durable Connect identity document under a hard byte bound.
+    pub(crate) fn read_connect_identity_bounded(
+        &self,
+        max_bytes: usize,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        let payload: Option<Vec<u8>> = self
+            .conn
+            .query_row(
+                "SELECT payload FROM connect_identity WHERE singleton_key = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match payload {
+            None => Ok(None),
+            Some(bytes) if bytes.len() > max_bytes => Err(StoreError::CodecMismatch {
+                detail: format!("connect identity exceeds {max_bytes} bytes"),
+            }),
+            Some(bytes) if bytes.is_empty() => Err(StoreError::Corruption),
+            Some(bytes) => Ok(Some(bytes)),
+        }
+    }
+
+    /// CAS replace Connect identity bytes. Leaves store unchanged on conflict.
+    pub(crate) fn compare_and_swap_connect_identity(
+        &mut self,
+        expected_revision: u64,
+        expected_bytes: Option<&[u8]>,
+        bytes: &[u8],
+    ) -> Result<u64, StoreError> {
+        if bytes.is_empty() || bytes.len() > MAX_CONNECT_IDENTITY_BYTES {
+            return Err(StoreError::CodecMismatch {
+                detail: format!(
+                    "connect identity payload must be 1..={MAX_CONNECT_IDENTITY_BYTES} bytes"
+                ),
+            });
+        }
+        self.with_immediate_transaction(|tx| {
+            let current: Option<(i64, Vec<u8>)> = tx
+                .query_row(
+                    "SELECT cas_epoch, payload FROM connect_identity WHERE singleton_key = 1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let (current_revision, current_bytes) = match current {
+                None => (0_u64, None),
+                Some((epoch, payload)) => {
+                    if payload.is_empty() {
+                        return Err(StoreError::Corruption);
+                    }
+                    (
+                        u64_from_nonnegative_i64("connect_identity.cas_epoch", epoch)?,
+                        Some(payload),
+                    )
+                }
+            };
+            if current_revision != expected_revision || current_bytes.as_deref() != expected_bytes {
+                return Err(StoreError::ConstraintViolation);
+            }
+            let next_revision =
+                current_revision
+                    .checked_add(1)
+                    .ok_or(StoreError::IntegerOutOfRange {
+                        field: "connect_identity.cas_epoch",
+                        value: u64::MAX,
+                    })?;
+            let next_i64 = u64_to_sqlite_i64("connect_identity.cas_epoch", next_revision)?;
+            let updated_at = now_ms()?;
+            tx.execute(
+                "INSERT INTO connect_identity(singleton_key, cas_epoch, payload, updated_at_ms)
+                 VALUES (1, ?1, ?2, ?3)
+                 ON CONFLICT(singleton_key) DO UPDATE SET
+                   cas_epoch = excluded.cas_epoch,
+                   payload = excluded.payload,
+                   updated_at_ms = excluded.updated_at_ms",
+                rusqlite::params![next_i64, bytes, updated_at],
+            )?;
+            Ok(next_revision)
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -891,7 +990,8 @@ fn detect_interrupted_partial_schema(
                          'prompt_chain_links', 'prompt_chain_command_receipts',
                          'prompt_chain_events', 'prompt_command_receipts',
                          'prompt_events', 'prompt_history', 'prompt_history_policy',
-                         'prompt_search_state', 'prompt_search_pending')",
+                         'prompt_search_state', 'prompt_search_pending',
+                         'connect_identity')",
         [],
         |row| row.get(0),
     )?;
@@ -935,6 +1035,17 @@ fn detect_interrupted_partial_schema(
             |row| row.get(0),
         )?;
         if v10_partial > 0 {
+            return Err(StoreError::MigrationInterrupted);
+        }
+    }
+    if latest < 14 {
+        let v14_partial: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_schema
+             WHERE type = 'table' AND name = 'connect_identity'",
+            [],
+            |row| row.get(0),
+        )?;
+        if v14_partial > 0 {
             return Err(StoreError::MigrationInterrupted);
         }
     }
@@ -1896,6 +2007,7 @@ pub(crate) fn decode_stored_domain_event(
     };
     let payload = decode_stored_event(event_type, schema_version, payload)?;
     validate_provider_event_task_identity(&payload, task_id)?;
+    validate_browser_event_task_identity(&payload, task_id)?;
     Ok(DomainEvent {
         id: event_id_from_bytes(event_id_bytes)?,
         task_id,
@@ -2057,6 +2169,26 @@ fn validate_provider_event_task_identity(
             detail: err.to_string(),
         },
     )
+}
+
+fn validate_browser_event_task_identity(
+    event: &Event,
+    task_id: Option<TaskId>,
+) -> Result<(), StoreError> {
+    let Event::Browser(fact) = event else {
+        return Ok(());
+    };
+    let Some(envelope_task) = task_id else {
+        return Err(StoreError::CodecMismatch {
+            detail: "browser fact requires a task scope".into(),
+        });
+    };
+    if fact.task_id() != envelope_task {
+        return Err(StoreError::CodecMismatch {
+            detail: "browser fact task identity disagrees with event scope".into(),
+        });
+    }
+    Ok(())
 }
 
 fn unpack<T: serde::de::DeserializeOwned>(payload: &[u8]) -> Result<T, StoreError> {
@@ -3997,6 +4129,93 @@ mod tests {
         assert_eq!(
             store.operation_status(terminal.operation_id),
             Err(StoreError::Corruption)
+        );
+    }
+
+    #[test]
+    fn decode_rejects_browser_fact_task_identity_mismatch() {
+        use crate::domain::browser::BrowserDurableFact;
+        use crate::domain::id::{BrowserContextId, EventId};
+
+        let envelope = TaskId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x50,
+        ])
+        .unwrap();
+        let embedded = TaskId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x51,
+        ])
+        .unwrap();
+        let fact = BrowserDurableFact::ContextClosed {
+            context_id: BrowserContextId::from_bytes([
+                0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x52,
+            ])
+            .unwrap(),
+            task_id: embedded,
+            generation: 1,
+        };
+        let payload = rmp_serde::to_vec(&fact).expect("encode browser fact");
+        let event_id = EventId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x53,
+        ])
+        .unwrap();
+        let err = decode_stored_domain_event(
+            1,
+            event_id.as_bytes(),
+            Some(envelope.as_bytes()),
+            Some(1),
+            "browser.fact",
+            i64::from(EVENT_SCHEMA_VERSION),
+            1,
+            &payload,
+        )
+        .expect_err("mismatched browser identity");
+        assert!(
+            matches!(
+                err,
+                StoreError::CodecMismatch { ref detail }
+                    if detail.contains("browser fact task identity")
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn connect_identity_cas_round_trip_and_conflict() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("kernel.sqlite3");
+        let mut store = KernelStore::open(&path).expect("open");
+        assert_eq!(store.connect_identity_revision().expect("rev"), 0);
+        assert_eq!(
+            store
+                .read_connect_identity_bounded(MAX_CONNECT_IDENTITY_BYTES)
+                .expect("empty"),
+            None
+        );
+        let first = b"identity-doc-v1";
+        let rev = store
+            .compare_and_swap_connect_identity(0, None, first)
+            .expect("cas");
+        assert_eq!(rev, 1);
+        assert_eq!(
+            store
+                .read_connect_identity_bounded(MAX_CONNECT_IDENTITY_BYTES)
+                .expect("read"),
+            Some(first.to_vec())
+        );
+        assert!(matches!(
+            store.compare_and_swap_connect_identity(0, None, b"stale"),
+            Err(StoreError::ConstraintViolation)
+        ));
+        let second = b"identity-doc-v2";
+        assert_eq!(
+            store
+                .compare_and_swap_connect_identity(1, Some(first), second)
+                .expect("exact"),
+            2
         );
     }
 }

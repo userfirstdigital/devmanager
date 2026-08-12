@@ -1363,6 +1363,15 @@ CREATE INDEX idx_prompt_history_submitted\n\
   ON prompt_history(submitted_at_ms DESC, prompt_history_id);\n\
 ";
 
+const CONNECT_V14_SQL: &str = "\
+CREATE TABLE connect_identity (\n\
+  singleton_key INTEGER PRIMARY KEY CHECK(singleton_key = 1),\n\
+  cas_epoch INTEGER NOT NULL CHECK(cas_epoch > 0),\n\
+  payload BLOB NOT NULL CHECK(length(payload) > 0 AND length(payload) <= 65536),\n\
+  updated_at_ms INTEGER NOT NULL\n\
+);\n\
+";
+
 /// Provider input authority and durable fenced state are additive to the
 /// scoped receipt ledger. The payload digest lets typed provider retries reject
 /// a reused command id without weakening connection/session scope checks.
@@ -1465,6 +1474,15 @@ pub(crate) const V9_SHA256: [u8; 32] = [
     0xe5, 0x15, 0x64, 0xcc, 0x51, 0x8f, 0x00, 0xa8, 0xb2, 0x40, 0x50, 0x6d, 0xda, 0x22, 0x3b, 0x96,
     0x4f, 0x6f, 0xd5, 0x9e, 0xa6, 0xde, 0xf9, 0xa6, 0x4a, 0x70, 0x26, 0x05, 0x23, 0x41, 0x0e, 0x2c,
 ];
+
+/// Compiled SHA-256 of [`CONNECT_V14_SQL`]. Do not change V14 SQL without updating this literal.
+pub(crate) const V14_SHA256: [u8; 32] = [
+    0x2f, 0xb1, 0xc7, 0xc2, 0xe0, 0x70, 0xb8, 0x16, 0x81, 0x76, 0x2a, 0xb4, 0xd0, 0x96, 0xf8, 0x47,
+    0x5f, 0x23, 0x06, 0x15, 0xaa, 0xc4, 0xc8, 0xe1, 0x08, 0x5f, 0x56, 0xf0, 0x73, 0x98, 0x90, 0x98,
+];
+pub(crate) const V14_SHA256_HEX: &str =
+    "2fb1c7c2e070b81681762ab4d096f8475f230615aac4c8e1085f56f073989098";
+
 /// Stable hex form of [`V1_SHA256`] for internal diagnostics.
 pub(crate) const V1_SHA256_HEX: &str =
     "79f0a38f1092f770a884ef3a12848184f00e7741270ffb07b0de823263e2521f";
@@ -1531,6 +1549,16 @@ pub(crate) fn migration_manifest() -> &'static [Migration] {
                 V9_SHA256,
                 sha256_bytes(V9_SQL),
                 "V9_SHA256 literal must match V9_SQL bytes"
+            );
+            assert_eq!(
+                V14_SHA256,
+                sha256_bytes(CONNECT_V14_SQL),
+                "V14_SHA256 literal must match CONNECT_V14_SQL bytes"
+            );
+            assert_eq!(
+                V14_SHA256_HEX,
+                hex_lower(&V14_SHA256),
+                "V14_SHA256_HEX must match V14_SHA256"
             );
             let migrations = vec![
                 Migration {
@@ -1610,6 +1638,12 @@ pub(crate) fn migration_manifest() -> &'static [Migration] {
                     name: "phase07-prompt-history-v1",
                     sql: PROMPT_V13_SQL,
                     sha256: sha256_bytes(PROMPT_V13_SQL),
+                },
+                Migration {
+                    version: 14,
+                    name: "connect-identity-v1",
+                    sql: CONNECT_V14_SQL,
+                    sha256: V14_SHA256,
                 },
             ];
             verify_manifest(&migrations);
@@ -1926,7 +1960,7 @@ mod tests {
                 .map(|row| row.unwrap())
                 .collect()
         };
-        assert_eq!(history.len(), 13);
+        assert_eq!(history.len(), 14);
         assert_eq!(history[0], (1, "v1_initial".into(), V1_SHA256.to_vec()));
         assert_eq!(
             history[1],
@@ -1965,6 +1999,9 @@ mod tests {
         assert_eq!(history[12].0, 13);
         assert_eq!(history[12].1, "phase07-prompt-history-v1");
         assert_eq!(history[12].2.len(), 32);
+        assert_eq!(history[13].0, 14);
+        assert_eq!(history[13].1, "connect-identity-v1");
+        assert_eq!(history[13].2, V14_SHA256.to_vec());
 
         let compacted_column: (String, i64) = conn
             .query_row(
@@ -1999,6 +2036,10 @@ mod tests {
         );
         assert_eq!(migrations[12].name, "phase07-prompt-history-v1");
         assert_eq!(migrations[12].version, 13);
+        assert_eq!(migrations[13].name, "connect-identity-v1");
+        assert_eq!(migrations[13].version, 14);
+        assert_eq!(migrations[13].sha256, V14_SHA256);
+        assert_eq!(migrations[13].sql, CONNECT_V14_SQL);
     }
 
     #[test]
@@ -2634,5 +2675,88 @@ mod tests {
             .unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn connect_identity_v14_is_contiguous_and_hash_locked() {
+        let migrations = migration_manifest();
+        assert_eq!(latest_migration_version(), 14);
+        assert_eq!(migrations.len(), 14);
+        assert_eq!(migrations[13].version, 14);
+        assert_eq!(migrations[13].name, "connect-identity-v1");
+        assert_eq!(migrations[13].sha256, V14_SHA256);
+        assert_eq!(V14_SHA256, sha256_bytes(CONNECT_V14_SQL));
+        assert_eq!(V14_SHA256_HEX, hex_lower(&V14_SHA256));
+    }
+
+    #[test]
+    fn v13_store_upgrades_to_connect_identity_v14() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("v13-upgrade.sqlite3");
+        {
+            let conn = Connection::open(&path).expect("raw");
+            for migration in migration_manifest().iter().take(13) {
+                conn.execute_batch(migration.sql).expect("prior sql");
+                conn.execute(
+                    "INSERT INTO schema_migrations(version, name, applied_at_ms, sha256)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![
+                        migration.version,
+                        migration.name,
+                        migration.version,
+                        migration.sha256.as_slice(),
+                    ],
+                )
+                .expect("record");
+            }
+        }
+        drop(crate::kernel::KernelStore::open(&path).expect("upgrade open"));
+        let conn = Connection::open(&path).expect("reopen");
+        let (version, name, sha): (i64, String, Vec<u8>) = conn
+            .query_row(
+                "SELECT version, name, sha256 FROM schema_migrations WHERE version = 14",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("v14 row");
+        assert_eq!(version, 14);
+        assert_eq!(name, "connect-identity-v1");
+        assert_eq!(sha, V14_SHA256.to_vec());
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE type = 'table' AND name = 'connect_identity'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("table");
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn partial_connect_identity_without_v14_row_is_interrupted() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("partial-v14.sqlite3");
+        {
+            let conn = Connection::open(&path).expect("raw");
+            for migration in migration_manifest().iter().take(13) {
+                conn.execute_batch(migration.sql).expect("prior sql");
+                conn.execute(
+                    "INSERT INTO schema_migrations(version, name, applied_at_ms, sha256)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![
+                        migration.version,
+                        migration.name,
+                        migration.version,
+                        migration.sha256.as_slice(),
+                    ],
+                )
+                .expect("record");
+            }
+            conn.execute_batch(CONNECT_V14_SQL)
+                .expect("unrecorded v14 table");
+        }
+        let error = crate::kernel::KernelStore::open(&path).expect_err("interrupted v14");
+        assert!(matches!(error, StoreError::MigrationInterrupted));
     }
 }

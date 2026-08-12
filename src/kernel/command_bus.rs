@@ -49,8 +49,9 @@ use crate::kernel::artifact_content::{ArtifactContentError, ArtifactContentSessi
 use crate::kernel::dispatch::{decode_absence_receipt, DispatchCompletion, DispatchPermit};
 use crate::kernel::outbox::{
     decode_effect_document, decode_receipt_document, effect_document_sha256,
-    encode_effect_document, encode_receipt_document, external_idempotency_key, plan_effects,
-    DestinationClass, Effect, OperationFence, PlannedEffect, PlannedEffectDocument, ReplayPolicy,
+    encode_effect_document, encode_receipt_document, external_idempotency_key,
+    is_pure_slice_decision_fact, is_side_effect_decision_fact, plan_effects, DestinationClass,
+    Effect, OperationFence, PlannedEffect, PlannedEffectDocument, ReplayPolicy,
 };
 use crate::kernel::projector;
 use crate::kernel::replay::{EventReplaySession, ReplayError};
@@ -7267,32 +7268,6 @@ fn load_event_row_at_sequence(tx: &Connection, sequence: u64) -> Result<EventRow
     })
 }
 
-fn is_pure_slice_decision_fact(event: &Event) -> bool {
-    matches!(
-        event,
-        Event::TaskCreated { .. }
-            | Event::TaskRenamed { .. }
-            | Event::TaskAttentionSet { .. }
-            | Event::TaskReopened
-            | Event::AgentSessionRegistered { .. }
-            | Event::PrimaryAgentSet { .. }
-            | Event::ArtifactRegistered { .. }
-            | Event::ResourceRegistered { .. }
-            | Event::ProviderQuestionPresented { .. }
-            | Event::ProviderApprovalPresented { .. }
-            | Event::ProviderWaitSettled { .. }
-    )
-}
-
-fn is_side_effect_decision_fact(event: &Event) -> bool {
-    matches!(
-        event,
-        Event::TaskCloseBegun { .. }
-            | Event::ResourceReleaseBegun { .. }
-            | Event::ProviderInputAccepted { .. }
-    )
-}
-
 fn validate_rejected_receipt_correlation(
     tx: &Connection,
     command_id: CommandId,
@@ -7914,6 +7889,11 @@ fn load_browser_book(
         let decoded =
             crate::kernel::store::decode_stored_event(&event_type, schema_version, &payload)?;
         if let Event::Browser(fact) = decoded {
+            if fact.task_id() != task_id {
+                return Err(StoreError::CodecMismatch {
+                    detail: "browser fact task identity disagrees with event scope".into(),
+                });
+            }
             book.apply_facts(&[fact])
                 .map_err(|err| StoreError::Projection(err.to_string()))?;
         }

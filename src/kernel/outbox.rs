@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::domain::agent::ProviderSessionId;
-use crate::domain::browser::BrowserIntegrationHold;
+use crate::domain::browser::{BrowserDurableFact, BrowserIntegrationHold};
 use crate::domain::command::{CommandReceipt, RejectionCode};
 use crate::domain::event::Event;
 use crate::domain::id::{
@@ -178,6 +178,62 @@ pub(crate) fn external_idempotency_key(operation_id: OperationId, effect_index: 
 
 /// Pure planner: maps accepted decision facts + pre-command snapshot to effects.
 /// No clock, RNG, SQLite, filesystem, process, or provider calls.
+/// Decision facts that settle without host side effects. Keep in lockstep with
+/// [`plan_effects`] pure arms (including Browser facts that do not require host
+/// settlement).
+pub(crate) fn is_pure_slice_decision_fact(event: &Event) -> bool {
+    match event {
+        Event::TaskCreated { .. }
+        | Event::TaskRenamed { .. }
+        | Event::TaskAttentionSet { .. }
+        | Event::TaskReopened
+        | Event::TaskArchived
+        | Event::AgentSessionRegistered { .. }
+        | Event::PrimaryAgentSet { .. }
+        | Event::SpecialistRequested { .. }
+        | Event::PrimaryPromoted { .. }
+        | Event::SpecialistHandoffRecorded { .. }
+        | Event::SpecialistClosed { .. }
+        | Event::ArtifactRegistered { .. }
+        | Event::ResourceRegistered { .. }
+        | Event::ResourceReleased { .. }
+        | Event::ProviderQuestionPresented { .. }
+        | Event::ProviderApprovalPresented { .. }
+        | Event::ProviderWaitSettled { .. } => true,
+        Event::Browser(fact) => !browser_fact_requires_host_settlement(fact),
+        Event::TaskCloseBegun { .. }
+        | Event::ResourceReleaseBegun { .. }
+        | Event::ProviderInputAccepted { .. }
+        | Event::OperationAccepted(_)
+        | Event::OperationSettled(_)
+        | Event::OperationFailed(_)
+        | Event::OperationCancelled(_)
+        | Event::OperationUncertain(_)
+        | Event::ProviderInputDelivered { .. }
+        | Event::HostCloseBegun { .. }
+        | Event::HostCleanupBranchCompleted { .. } => false,
+    }
+}
+
+/// Decision facts that plan exactly one host side effect. Keep in lockstep with
+/// [`plan_effects`] side-effect arms.
+pub(crate) fn is_side_effect_decision_fact(event: &Event) -> bool {
+    match event {
+        Event::TaskCloseBegun { .. }
+        | Event::ResourceReleaseBegun { .. }
+        | Event::ProviderInputAccepted { .. } => true,
+        Event::Browser(fact) => browser_fact_requires_host_settlement(fact),
+        _ => false,
+    }
+}
+
+fn browser_fact_requires_host_settlement(fact: &BrowserDurableFact) -> bool {
+    matches!(
+        fact,
+        BrowserDurableFact::RequestAccepted { action, .. } if action.requires_host_settlement()
+    )
+}
+
 pub(crate) fn plan_effects(
     snapshot: Option<&TaskSnapshot>,
     task_id: TaskId,
@@ -1185,5 +1241,88 @@ mod tests {
             external_idempotency_key(operation_id, 0),
             format!("v1:{operation_id}:0")
         );
+    }
+
+    #[test]
+    fn decision_fact_classifiers_match_plan_effects_partition() {
+        use crate::domain::artifact::PrivacyClass;
+        use crate::domain::browser::{BrowserAction, BrowserDurableFact, BrowserPermission};
+        use crate::domain::id::{AgentSessionId, BrowserContextId, BrowserRequestId, BrowserTabId};
+
+        let task = TaskId::from_bytes(fixed_uuid_v7(0x41)).unwrap();
+        let context = BrowserContextId::from_bytes(fixed_uuid_v7(0x44)).unwrap();
+        let pure = [
+            Event::TaskArchived,
+            Event::ResourceReleased {
+                resource_id: ResourceId::from_bytes(fixed_uuid_v7(0x42)).unwrap(),
+                runtime_generation: 1,
+            },
+            Event::SpecialistClosed {
+                specialist_id: AgentSessionId::from_bytes(fixed_uuid_v7(0x43)).unwrap(),
+                action_epoch: 1,
+                runtime_generation: 1,
+            },
+            Event::Browser(BrowserDurableFact::ContextClosed {
+                context_id: context,
+                task_id: task,
+                generation: 1,
+            }),
+            Event::Browser(BrowserDurableFact::RequestAccepted {
+                request_id: BrowserRequestId::from_bytes(fixed_uuid_v7(0x45)).unwrap(),
+                task_id: task,
+                context_id: context,
+                tab_id: Some(BrowserTabId::from_bytes(fixed_uuid_v7(0x47)).unwrap()),
+                generation: 1,
+                action: BrowserAction::CreateContext,
+                privacy_class: PrivacyClass::Shareable,
+                permission: BrowserPermission::CreateContext,
+                payload_hash: [0; 32],
+                action_epoch: 1,
+                command_id: None,
+            }),
+        ];
+        for event in &pure {
+            assert!(
+                is_pure_slice_decision_fact(event),
+                "expected pure: {event:?}"
+            );
+            assert!(
+                !is_side_effect_decision_fact(event),
+                "pure must not also be side-effect: {event:?}"
+            );
+        }
+
+        let side = [
+            Event::TaskCloseBegun { action_epoch: 2 },
+            Event::ResourceReleaseBegun {
+                resource_id: ResourceId::from_bytes(fixed_uuid_v7(0x48)).unwrap(),
+                runtime_generation: 3,
+            },
+            Event::Browser(BrowserDurableFact::RequestAccepted {
+                request_id: BrowserRequestId::from_bytes(fixed_uuid_v7(0x49)).unwrap(),
+                task_id: task,
+                context_id: context,
+                tab_id: Some(BrowserTabId::from_bytes(fixed_uuid_v7(0x4B)).unwrap()),
+                generation: 1,
+                action: BrowserAction::Navigate {
+                    url: "https://example.test".into(),
+                },
+                privacy_class: PrivacyClass::Shareable,
+                permission: BrowserPermission::Navigate,
+                payload_hash: [1; 32],
+                action_epoch: 1,
+                command_id: None,
+            }),
+        ];
+        for event in &side {
+            assert!(
+                is_side_effect_decision_fact(event),
+                "expected side-effect: {event:?}"
+            );
+            assert!(
+                !is_pure_slice_decision_fact(event),
+                "side-effect must not also be pure: {event:?}"
+            );
+        }
     }
 }

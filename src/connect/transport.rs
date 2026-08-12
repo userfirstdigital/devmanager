@@ -1,4 +1,10 @@
 //! Transport-neutral Connect boundaries and bounded projection interfaces.
+//!
+//! Physical framing stays on [`FramedConnectTransport`]. Production callers
+//! must attach a production-grade channel through
+//! [`SealedFramedConnectTransport::production`]; source-level openers and
+//! [`SealedFramedConnectTransport::new`] are crate-private test/harness paths.
+//! Relay forwards already-sealed frames and never opens them.
 
 use std::fmt;
 use std::io::{ErrorKind, Read, Write};
@@ -12,8 +18,11 @@ use crate::domain::snapshot::{
     canonical_event_page_size, canonical_snapshot_page_size, EventPage, PageLimits, SnapshotPage,
     SnapshotSection,
 };
-use crate::protocol::{CapabilitySet, FrameLimitsError, PhysicalFrameCodec, PhysicalFrameError};
+use crate::protocol::{
+    CapabilitySet, FrameLimitsError, PhysicalFrameCodec, PhysicalFrameError, SEALED_NONCE_BYTES,
+};
 
+use super::crypto::{ConnectCryptoError, ConnectSealedFrame, EndToEndChannel};
 use super::envelope::{
     ChunkContext, ConnectEnvelope, ConnectLimitError, ConnectLimits, EnvelopeError,
 };
@@ -52,6 +61,7 @@ pub enum ConnectTransportError {
     FrameLimits(FrameLimitsError),
     Frame(PhysicalFrameError),
     Envelope(EnvelopeError),
+    Crypto(ConnectCryptoError),
     Flush { kind: ErrorKind },
 }
 
@@ -66,6 +76,7 @@ impl fmt::Display for ConnectTransportError {
             Self::FrameLimits(error) => error.fmt(formatter),
             Self::Frame(error) => error.fmt(formatter),
             Self::Envelope(error) => error.fmt(formatter),
+            Self::Crypto(error) => error.fmt(formatter),
             Self::Flush { kind } => write!(formatter, "Connect transport flush failed: {kind}"),
         }
     }
@@ -78,6 +89,7 @@ impl std::error::Error for ConnectTransportError {
             Self::FrameLimits(error) => Some(error),
             Self::Frame(error) => Some(error),
             Self::Envelope(error) => Some(error),
+            Self::Crypto(error) => Some(error),
             Self::Closed | Self::NegotiatedLimitsMismatch | Self::Flush { .. } => None,
         }
     }
@@ -207,6 +219,145 @@ impl<T: Read + Write> ConnectTransport for FramedConnectTransport<T> {
             }
         }
         Ok(())
+    }
+}
+
+/// Sealed Connect path: authenticated channel, then physical framing.
+///
+/// Direct and relay stay distinct via [`ConnectRoute`] on the channel; this
+/// wrapper never opens relay-opaque frames for a mismatched route policy.
+/// [`Self::production`] refuses non-production (source-level) channels.
+pub struct SealedFramedConnectTransport<T> {
+    framed: FramedConnectTransport<T>,
+    channel: EndToEndChannel,
+    route: ConnectRoute,
+    closed: bool,
+}
+
+impl<T> SealedFramedConnectTransport<T> {
+    pub(crate) fn new(
+        io: T,
+        local: ConnectLimits,
+        peer: ConnectLimits,
+        channel: EndToEndChannel,
+    ) -> Result<Self, ConnectTransportError> {
+        let route = channel.preferred_route();
+        Ok(Self {
+            framed: FramedConnectTransport::new(io, local, peer)?,
+            channel,
+            route,
+            closed: false,
+        })
+    }
+
+    /// Production constructor. Rejects source-level/test channels.
+    pub fn production(
+        io: T,
+        local: ConnectLimits,
+        peer: ConnectLimits,
+        channel: EndToEndChannel,
+    ) -> Result<Self, ConnectTransportError> {
+        if !channel.is_production_grade() {
+            return Err(ConnectTransportError::Closed);
+        }
+        Self::new(io, local, peer, channel)
+    }
+
+    pub const fn route(&self) -> ConnectRoute {
+        self.route
+    }
+
+    pub const fn negotiated_limits(&self) -> ConnectLimits {
+        self.framed.negotiated_limits()
+    }
+
+    pub fn into_parts(self) -> (T, EndToEndChannel)
+    where
+        T: Sized,
+    {
+        (self.framed.into_inner(), self.channel)
+    }
+}
+
+impl<T: Read + Write> SealedFramedConnectTransport<T> {
+    pub fn send_sealed(
+        &mut self,
+        envelope: &ConnectEnvelope,
+        nonce: [u8; SEALED_NONCE_BYTES],
+        now_unix: u64,
+    ) -> Result<(), ConnectTransportError> {
+        if self.closed {
+            return Err(ConnectTransportError::Closed);
+        }
+        if self.channel.preferred_route() != self.route {
+            self.closed = true;
+            return Err(ConnectTransportError::Closed);
+        }
+        let frame = self
+            .channel
+            .seal(envelope, nonce, now_unix)
+            .map_err(ConnectTransportError::Crypto)?;
+        self.write_sealed_frame(&frame)
+    }
+
+    pub fn receive_sealed(
+        &mut self,
+        now_unix: u64,
+    ) -> Result<Option<ConnectEnvelope>, ConnectTransportError> {
+        if self.closed {
+            return Err(ConnectTransportError::Closed);
+        }
+        let encoded = match self.framed.frame.read(&mut self.framed.io) {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                self.closed = true;
+                return Err(ConnectTransportError::Frame(error));
+            }
+        };
+        let frame = ConnectSealedFrame::decode(&encoded).map_err(ConnectTransportError::Crypto)?;
+        match self.channel.open(&frame, now_unix) {
+            Ok(envelope) => Ok(Some(envelope)),
+            Err(error) => {
+                self.closed = true;
+                Err(ConnectTransportError::Crypto(error))
+            }
+        }
+    }
+
+    /// Relay path: forward an already-sealed frame without opening it.
+    pub fn forward_sealed_frame(
+        &mut self,
+        frame: &ConnectSealedFrame,
+    ) -> Result<(), ConnectTransportError> {
+        if self.closed {
+            return Err(ConnectTransportError::Closed);
+        }
+        if self.route != ConnectRoute::Relay {
+            self.closed = true;
+            return Err(ConnectTransportError::Closed);
+        }
+        self.write_sealed_frame(frame)
+    }
+
+    fn write_sealed_frame(
+        &mut self,
+        frame: &ConnectSealedFrame,
+    ) -> Result<(), ConnectTransportError> {
+        let encoded = frame.encode().map_err(ConnectTransportError::Crypto)?;
+        if let Err(error) = self.framed.frame.write(&mut self.framed.io, &encoded) {
+            self.closed = true;
+            return Err(ConnectTransportError::Frame(error));
+        }
+        if let Err(error) = self.framed.io.flush() {
+            self.closed = true;
+            return Err(ConnectTransportError::Flush { kind: error.kind() });
+        }
+        Ok(())
+    }
+
+    pub fn close(&mut self) -> Result<(), ConnectTransportError> {
+        self.closed = true;
+        self.framed.close()
     }
 }
 
@@ -356,4 +507,82 @@ fn validate_cursor(cursor: Option<&[u8]>) -> Result<(), ProjectionError> {
         return Err(ProjectionError::Bounds);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::connect::crypto::{connect_prologue, EndToEndChannel};
+    use crate::protocol::{ChannelKey, ChannelRole, CredentialPurpose};
+    use std::io::Cursor;
+
+    #[test]
+    fn sealed_transport_keeps_direct_and_relay_routes_distinct() {
+        let secret = ChannelKey::from_bytes([9; 32]);
+        let prologue =
+            connect_prologue(CredentialPurpose::OwnerPairing, [3; 16], [4; 16]).expect("prologue");
+        let limits = ConnectLimits::v1_default();
+        let direct_channel = EndToEndChannel::open_source_level(
+            secret.clone(),
+            prologue,
+            ChannelRole::Initiator,
+            true,
+            1,
+            false,
+        )
+        .expect("direct channel");
+        let relay_channel = EndToEndChannel::open_source_level(
+            secret,
+            prologue,
+            ChannelRole::Responder,
+            false,
+            1,
+            false,
+        )
+        .expect("relay channel");
+
+        let direct = SealedFramedConnectTransport::new(
+            Cursor::new(Vec::<u8>::new()),
+            limits,
+            limits,
+            direct_channel,
+        )
+        .expect("direct transport");
+        let relay = SealedFramedConnectTransport::new(
+            Cursor::new(Vec::<u8>::new()),
+            limits,
+            limits,
+            relay_channel,
+        )
+        .expect("relay transport");
+        assert_eq!(direct.route(), ConnectRoute::Direct);
+        assert_eq!(relay.route(), ConnectRoute::Relay);
+        assert_ne!(direct.route(), relay.route());
+    }
+
+    #[test]
+    fn production_sealed_transport_rejects_source_level_channels() {
+        let secret = ChannelKey::from_bytes([9; 32]);
+        let prologue =
+            connect_prologue(CredentialPurpose::OwnerPairing, [3; 16], [4; 16]).expect("prologue");
+        let limits = ConnectLimits::v1_default();
+        let channel = EndToEndChannel::open_source_level(
+            secret,
+            prologue,
+            ChannelRole::Initiator,
+            true,
+            1,
+            false,
+        )
+        .expect("source-level");
+        assert!(!channel.is_production_grade());
+        let err = SealedFramedConnectTransport::production(
+            Cursor::new(Vec::<u8>::new()),
+            limits,
+            limits,
+            channel,
+        )
+        .expect_err("source-level is not production");
+        assert!(matches!(err, ConnectTransportError::Closed));
+    }
 }

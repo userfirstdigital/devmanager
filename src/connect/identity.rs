@@ -1244,9 +1244,11 @@ pub fn validate_device_credential<V: CredentialVault>(
 
 /// Vault authority seam.
 ///
-/// HOLD: no OS DPAPI / WebCrypto / Portal / relay adapter is wired here.
-/// `IsolatedRemoteStore::new` stays `ProductionStoreForbidden` in release
-/// until that reviewed adapter exists. Tests use an in-crate fake only.
+/// OS DPAPI / WebCrypto adapters remain outside this module. Durable identity
+/// documents persist through [`crate::connect::identity_store::ConnectProductionSession`]
+/// / [`crate::connect::identity_store::IsolatedRemoteStore`] on the
+/// profile-scoped kernel store. Tests may use the in-memory seam. Production
+/// Noise remains fail-closed until the protocol `snow` dependency lands.
 pub trait CredentialVault {
     /// On error, no credential may have been established. Repeating an
     /// interrupted establishment for the same public ID must return the same
