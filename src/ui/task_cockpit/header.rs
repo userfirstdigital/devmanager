@@ -3490,7 +3490,10 @@ mod tests {
         assert!(projection.resources.is_some());
         assert_eq!(projection.quotas.len(), 1);
         assert_eq!(projection.quotas[0].detail, "55% remaining");
-        let details = projection.host_details.expect("host details affordance");
+        let details = projection
+            .host_details
+            .as_ref()
+            .expect("host details affordance");
         assert_eq!(details.role, AccessibleRole::Button);
         assert!(details.focusable);
         assert_eq!(details.action.id(), ACTION_HOST_STATUS);
