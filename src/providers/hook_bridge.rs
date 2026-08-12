@@ -229,8 +229,8 @@ fn stable_event_id(
     };
     let mut hasher = Sha256::new();
     hasher.update(match kind {
-        ProviderHookKind::Claude => b"claude:",
-        ProviderHookKind::Codex => b"codex:",
+        ProviderHookKind::Claude => &b"claude:"[..],
+        ProviderHookKind::Codex => &b"codex:"[..],
     });
     hasher.update(hook_event.as_bytes());
     hasher.update(b":");

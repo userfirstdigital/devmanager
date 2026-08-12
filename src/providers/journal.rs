@@ -579,7 +579,7 @@ impl AdapterDeliveryPermit {
 
     /// Match the durable journal permit to an already authenticated provider
     /// launch correlation before normalized content can be handed to ingest.
-    pub(crate) const fn matches_correlation(
+    pub(crate) fn matches_correlation(
         &self,
         task_id: TaskId,
         agent_session_id: AgentSessionId,
