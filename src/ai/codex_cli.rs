@@ -162,6 +162,36 @@ fn executable_candidate_names(program: &str, windows: bool, path_ext: &str) -> V
     names
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum SuspendedChildStartup<Job> {
+    ClaimFailed(String),
+    AfterClaim { error: String, job: Job },
+}
+
+fn claim_then_resume_suspended_child<Job, Claim, BeforeResume, Resume>(
+    pid: u32,
+    claim: Claim,
+    before_resume: BeforeResume,
+    resume: Resume,
+) -> Result<Job, SuspendedChildStartup<Job>>
+where
+    Claim: FnOnce(u32) -> Result<Job, String>,
+    BeforeResume: FnOnce(&Job) -> Result<(), String>,
+    Resume: FnOnce(u32) -> Result<(), String>,
+{
+    let job = match claim(pid) {
+        Ok(job) => job,
+        Err(error) => return Err(SuspendedChildStartup::ClaimFailed(error)),
+    };
+    if let Err(error) = before_resume(&job) {
+        return Err(SuspendedChildStartup::AfterClaim { error, job });
+    }
+    match resume(pid) {
+        Ok(()) => Ok(job),
+        Err(error) => Err(SuspendedChildStartup::AfterClaim { error, job }),
+    }
+}
+
 pub(crate) fn run_probe(executable: &Path, args: &[String]) -> Result<String, String> {
     let mut command = std::process::Command::new(executable);
     command
@@ -191,12 +221,41 @@ pub(crate) fn run_probe(executable: &Path, args: &[String]) -> Result<String, St
     // in a dedicated process group above. A failed Windows claim leaves the
     // root suspended, so only its retained Child handle may be used to roll it
     // back; a raw PID/tree fallback would recreate authority we do not own.
-    let managed_job = match crate::services::platform_service::claim_suspended_process(pid) {
+    // Resume happens only after a successful claim (and any attestation gate)
+    // so identity checks observe a still-suspended child. A resume failure
+    // keeps the exact Child/Job pair for terminate_probe_tree.
+    let managed_job = match claim_then_resume_suspended_child(
+        pid,
+        |pid| match crate::services::platform_service::claim_suspended_process(pid) {
+            Ok(None) if cfg!(windows) => {
+                Err("managed Windows Job was unavailable".to_string())
+            }
+            Ok(job) => Ok(job),
+            Err(error) => Err(error),
+        },
+        |_| Ok(()),
+        {
+            #[cfg(windows)]
+            {
+                crate::services::platform_service::resume_suspended_process
+            }
+            #[cfg(not(windows))]
+            {
+                |_pid| Ok(())
+            }
+        },
+    ) {
         Ok(managed_job) => managed_job,
-        Err(error) => {
+        Err(SuspendedChildStartup::ClaimFailed(error)) => {
             terminate_probe_tree(&mut child, pid, None);
             return Err(format!(
                 "Cannot own Codex capability probe process tree: {error}"
+            ));
+        }
+        Err(SuspendedChildStartup::AfterClaim { error, job }) => {
+            terminate_probe_tree(&mut child, pid, job);
+            return Err(format!(
+                "Cannot resume Codex capability probe process: {error}"
             ));
         }
     };
@@ -723,5 +782,92 @@ $child = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentL
             "[Image]\n[Image]\nfixit"
         );
         assert_eq!(canonical_codex_composer_prompt("", 1), "[Image]");
+    }
+
+    #[test]
+    fn capability_probe_claims_job_before_explicit_resume() {
+        let events = std::cell::RefCell::new(Vec::new());
+        let job = claim_then_resume_suspended_child(
+            42,
+            |pid| {
+                events.borrow_mut().push(format!("claim:{pid}"));
+                Ok("job")
+            },
+            |job| {
+                events.borrow_mut().push(format!("gate:{job}"));
+                Ok(())
+            },
+            |pid| {
+                events.borrow_mut().push(format!("resume:{pid}"));
+                Ok(())
+            },
+        )
+        .expect("successful claim must resume");
+
+        assert_eq!(job, "job");
+        assert_eq!(
+            events.into_inner(),
+            ["claim:42", "gate:job", "resume:42"]
+        );
+    }
+
+    #[test]
+    fn capability_probe_claim_failure_does_not_resume() {
+        let gated = std::cell::Cell::new(false);
+        let resumed = std::cell::Cell::new(false);
+        let result = claim_then_resume_suspended_child(
+            42,
+            |_| Err("claim failed".to_string()),
+            |_| {
+                gated.set(true);
+                Ok(())
+            },
+            |_| {
+                resumed.set(true);
+                Ok(())
+            },
+        );
+
+        assert_eq!(
+            result,
+            Err(SuspendedChildStartup::ClaimFailed("claim failed".to_string()))
+        );
+        assert!(!gated.get(), "claim failure must not reach the resume gate");
+        assert!(!resumed.get(), "claim failure must not resume the child");
+    }
+
+    #[test]
+    fn capability_probe_resume_failure_retains_job_for_cleanup() {
+        let cleaned = std::cell::RefCell::new(None);
+        let result = match claim_then_resume_suspended_child(
+            42,
+            |_| Ok("job"),
+            |_| Ok(()),
+            |_| Err("resume failed".to_string()),
+        ) {
+            Ok(job) => Ok(job),
+            Err(SuspendedChildStartup::ClaimFailed(error)) => {
+                cleaned.replace(None);
+                Err(format!(
+                    "Cannot own Codex capability probe process tree: {error}"
+                ))
+            }
+            Err(SuspendedChildStartup::AfterClaim { error, job }) => {
+                cleaned.replace(Some(job));
+                Err(format!(
+                    "Cannot resume Codex capability probe process: {error}"
+                ))
+            }
+        };
+
+        assert_eq!(
+            result,
+            Err("Cannot resume Codex capability probe process: resume failed".to_string())
+        );
+        assert_eq!(
+            cleaned.into_inner(),
+            Some("job"),
+            "resume failure must pass the exact job into probe-tree cleanup"
+        );
     }
 }

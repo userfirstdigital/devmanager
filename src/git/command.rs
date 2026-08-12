@@ -23,7 +23,8 @@ use uuid::Uuid;
 
 #[cfg(windows)]
 use crate::services::platform_service::{
-    claim_suspended_process, ManagedProcessJob, MANAGED_PROCESS_CREATION_FLAGS,
+    claim_suspended_process, resume_suspended_process, ManagedProcessJob,
+    MANAGED_PROCESS_CREATION_FLAGS,
 };
 
 #[cfg(windows)]
@@ -5741,6 +5742,38 @@ fn verify_windows_child_image(
     Ok(())
 }
 
+#[cfg(any(test, windows))]
+#[derive(Debug, PartialEq, Eq)]
+enum SuspendedChildStartup<Job> {
+    ClaimFailed(String),
+    AfterClaim { error: String, job: Job },
+}
+
+#[cfg(any(test, windows))]
+fn claim_then_resume_suspended_child<Job, Claim, BeforeResume, Resume>(
+    pid: u32,
+    claim: Claim,
+    before_resume: BeforeResume,
+    resume: Resume,
+) -> Result<Job, SuspendedChildStartup<Job>>
+where
+    Claim: FnOnce(u32) -> Result<Job, String>,
+    BeforeResume: FnOnce(&Job) -> Result<(), String>,
+    Resume: FnOnce(u32) -> Result<(), String>,
+{
+    let job = match claim(pid) {
+        Ok(job) => job,
+        Err(error) => return Err(SuspendedChildStartup::ClaimFailed(error)),
+    };
+    if let Err(error) = before_resume(&job) {
+        return Err(SuspendedChildStartup::AfterClaim { error, job });
+    }
+    match resume(pid) {
+        Ok(()) => Ok(job),
+        Err(error) => Err(SuspendedChildStartup::AfterClaim { error, job }),
+    }
+}
+
 struct ManagedGitChild {
     child: Child,
     /// Keep the exact executable file/ancestor binding alive until the child
@@ -5827,44 +5860,58 @@ impl ManagedGitChild {
                     operation, &error, cleanup, &root.path,
                 ));
             }
-            let job = match claim_suspended_process(child.id()) {
-                Ok(Some(job)) => job,
-                Ok(None) => {
+            match claim_then_resume_suspended_child(
+                child.id(),
+                |pid| match claim_suspended_process(pid) {
+                    Ok(Some(job)) => Ok(job),
+                    Ok(None) => Err("managed Windows Job was unavailable".to_string()),
+                    Err(error) => Err(error),
+                },
+                |_| {
+                    if deadline.is_expired() {
+                        Err("Git process resume exceeded the operation deadline".to_string())
+                    } else {
+                        Ok(())
+                    }
+                },
+                |pid| {
+                    resume_suspended_process(pid)
+                        .map_err(|error| format!("Cannot resume Git process: {error}"))
+                },
+            ) {
+                Ok(job) => Ok(Self {
+                    child,
+                    executable_binding,
+                    authority,
+                    root: root.clone(),
+                    endpoint,
+                    deadline,
+                    settled: false,
+                    job: Some(job),
+                }),
+                Err(SuspendedChildStartup::ClaimFailed(error)) => {
                     let cleanup = cleanup_unmanaged_child(&mut child, deadline);
-                    return Err(command_start_with_cleanup(
-                        operation,
-                        "managed Windows Job was unavailable",
-                        cleanup,
-                        &root.path,
-                    ));
-                }
-                Err(error) => {
-                    let cleanup = cleanup_unmanaged_child(&mut child, deadline);
-                    return Err(command_start_with_cleanup(
+                    Err(command_start_with_cleanup(
                         operation, &error, cleanup, &root.path,
-                    ));
+                    ))
                 }
-            };
-            let mut managed = Self {
-                child,
-                executable_binding,
-                authority,
-                root: root.clone(),
-                endpoint,
-                deadline,
-                settled: false,
-                job: Some(job),
-            };
-            if deadline.is_expired() {
-                let cleanup = managed.cleanup(deadline);
-                return Err(command_start_with_cleanup(
-                    operation,
-                    "Git process resume exceeded the operation deadline",
-                    cleanup,
-                    &root.path,
-                ));
+                Err(SuspendedChildStartup::AfterClaim { error, job }) => {
+                    let mut managed = Self {
+                        child,
+                        executable_binding,
+                        authority,
+                        root: root.clone(),
+                        endpoint,
+                        deadline,
+                        settled: false,
+                        job: Some(job),
+                    };
+                    let cleanup = managed.cleanup(deadline);
+                    Err(command_start_with_cleanup(
+                        operation, &error, cleanup, &root.path,
+                    ))
+                }
             }
-            Ok(managed)
         }
 
         #[cfg(not(windows))]
@@ -10256,6 +10303,120 @@ mod tests {
         assert!(
             !unix_pid_exists(child_pid),
             "owned process-group descendant {child_pid} survived cleanup"
+        );
+    }
+
+    #[test]
+    fn managed_git_child_claims_job_before_explicit_resume() {
+        let events = std::cell::RefCell::new(Vec::new());
+        let job = claim_then_resume_suspended_child(
+            7,
+            |pid| {
+                events.borrow_mut().push(format!("claim:{pid}"));
+                Ok("job")
+            },
+            |job| {
+                events.borrow_mut().push(format!("gate:{job}"));
+                Ok(())
+            },
+            |pid| {
+                events.borrow_mut().push(format!("resume:{pid}"));
+                Ok(())
+            },
+        )
+        .expect("successful claim must resume");
+
+        assert_eq!(job, "job");
+        assert_eq!(
+            events.into_inner(),
+            ["claim:7", "gate:job", "resume:7"]
+        );
+    }
+
+    #[test]
+    fn managed_git_child_claim_failure_does_not_resume() {
+        let gated = std::cell::Cell::new(false);
+        let resumed = std::cell::Cell::new(false);
+        let result = claim_then_resume_suspended_child(
+            7,
+            |_| Err("managed Windows Job was unavailable".to_string()),
+            |_| {
+                gated.set(true);
+                Ok(())
+            },
+            |_| {
+                resumed.set(true);
+                Ok(())
+            },
+        );
+
+        assert_eq!(
+            result,
+            Err(SuspendedChildStartup::ClaimFailed(
+                "managed Windows Job was unavailable".to_string()
+            ))
+        );
+        assert!(!gated.get(), "claim failure must not reach the resume gate");
+        assert!(!resumed.get(), "claim failure must not resume the child");
+    }
+
+    #[test]
+    fn managed_git_child_deadline_before_resume_retains_job() {
+        let resumed = std::cell::Cell::new(false);
+        let result = claim_then_resume_suspended_child(
+            7,
+            |_| Ok("job"),
+            |_| Err("Git process resume exceeded the operation deadline".to_string()),
+            |_| {
+                resumed.set(true);
+                Ok(())
+            },
+        );
+
+        assert_eq!(
+            result,
+            Err(SuspendedChildStartup::AfterClaim {
+                error: "Git process resume exceeded the operation deadline".to_string(),
+                job: "job",
+            })
+        );
+        assert!(
+            !resumed.get(),
+            "an expired resume deadline must keep the child suspended"
+        );
+    }
+
+    #[test]
+    fn managed_git_child_resume_failure_retains_job_for_cleanup() {
+        let cleaned = std::cell::RefCell::new(None);
+        let error = match claim_then_resume_suspended_child(
+            7,
+            |_| Ok("job"),
+            |_| Ok(()),
+            |_| Err("Cannot resume Git process: resume failed".to_string()),
+        ) {
+            Ok(_) => panic!("resume failure must not succeed"),
+            Err(SuspendedChildStartup::ClaimFailed(_)) => {
+                panic!("resume failure must not look like a claim failure")
+            }
+            Err(SuspendedChildStartup::AfterClaim { error, job }) => {
+                cleaned.replace(Some(job));
+                command_start_with_cleanup("status", &error, None, Path::new("."))
+            }
+        };
+
+        assert!(
+            matches!(
+                error,
+                GitError::CommandStart { message, .. }
+                    if message.contains("Cannot resume Git process")
+            ),
+            "resume failure must fail closed as a startup error: {error:?}"
+        );
+        assert_eq!(
+            cleaned.into_inner(),
+            Some("job"),
+            "resume failure must keep Job authority for managed cleanup"
         );
     }
 
