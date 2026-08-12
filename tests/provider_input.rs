@@ -92,7 +92,7 @@ fn seed_open_task_with_agent_runtime(
                     id: agent_session_id,
                     task_id,
                     role: AgentRole::Primary,
-                    provider_kind: "codex".into(),
+                    provider_kind: ProviderKind::Codex,
                     provider_session_id: bind_provider_runtime.then(|| {
                         devmanager::domain::ProviderSessionId::new(format!(
                             "codex-session-{tail:02x}"
@@ -167,7 +167,7 @@ fn bound_wait_fence(
         operation_id,
         action_epoch,
         agent_session_id,
-        ProviderKind::new(agent.provider_kind.clone()).expect("provider kind"),
+        agent.provider_kind,
         agent
             .provider_session_id
             .clone()
@@ -308,7 +308,7 @@ fn register_secondary_agent(path: &std::path::Path, task_id: TaskId, tail: u8) -
                     id: agent_session_id,
                     task_id,
                     role: AgentRole::specialist("reviewer").expect("specialist role"),
-                    provider_kind: "codex".into(),
+                    provider_kind: ProviderKind::Codex,
                     provider_session_id: Some(
                         ProviderSessionId::new(format!("codex-secondary-{tail:02x}"))
                             .expect("secondary provider session"),
@@ -832,7 +832,7 @@ fn provider_dispatch_ambiguity_rejects_immutable_attempt_tampering() {
         }),
         ("provider_kind", 0x71, |mut effect| {
             if let Effect::DeliverProviderInput { provider_kind, .. } = &mut effect {
-                *provider_kind = ProviderKind::new("claude").expect("provider kind");
+                *provider_kind = ProviderKind::ClaudeCode;
             }
             effect
         }),
@@ -1994,7 +1994,7 @@ fn provider_input_event_decode_rejects_mismatched_nested_identity_and_wait_flag(
         client_id: ClientId::from_bytes(fixed_uuid_v7(0xD3)).expect("client"),
         operation_id: OperationId::from_bytes(fixed_uuid_v7(0xD6)).expect("operation"),
         agent_session_id: AgentSessionId::from_bytes(fixed_uuid_v7(0xD4)).expect("agent"),
-        provider_kind: ProviderKind::new("codex").expect("provider kind"),
+        provider_kind: ProviderKind::Codex,
         provider_session_id: devmanager::domain::ProviderSessionId::new("session-d4")
             .expect("provider session"),
         runtime_generation: 3,

@@ -4,6 +4,10 @@
 //! primary/specialist transitions live in `domain::command::decide` and
 //! `domain::event::apply`. Session launch, journal correlation, and input
 //! sequencing are typed HOLDs until those provider contracts exist.
+//!
+//! The approved task model is exactly one Primary plus optional Specialists.
+//! Native-child observation is not a second harness; subprocess evidence stays
+//! behind the provider-journal HOLD until a correlated stock receipt exists.
 
 pub use crate::domain::command::{
     SpecialistPermission, SpecialistResult, SpecialistStatus, DEFAULT_MAX_TOP_LEVEL_RUNTIMES,
@@ -25,6 +29,8 @@ pub fn specialist_write_hold() -> OrchestrationHold {
     OrchestrationHold::ProcessCapabilityUnbound
 }
 
+/// Optional specialist subprocess observation remains journal-gated. This is
+/// not a NativeChild role or parallel orchestration harness.
 pub fn specialist_native_child_hold() -> OrchestrationHold {
     OrchestrationHold::ProviderJournalAbsent
 }

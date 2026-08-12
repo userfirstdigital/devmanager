@@ -15,6 +15,15 @@ pub use projection::*;
 pub use search::*;
 pub use service::*;
 pub use store::*;
+
+/// Canonical prompt-library UI surface without compiling `ui` twice.
+///
+/// Nested module (not `pub use crate::ui as ui`) so rustfmt cannot collapse the
+/// alias and erase the `prompts::ui::…` path clients/tests rely on.
+pub mod ui {
+    pub use crate::ui::*;
+}
+
 pub mod organization {
     //! Published organization prompt libraries and linear guided chains.
     //!
@@ -26,10 +35,10 @@ pub mod organization {
     use serde::{Deserialize, Serialize};
     use sha2::{Digest, Sha256};
 
-    use crate::org::error::OrgError;
-    use crate::org::identity::{PortalAccountId, PortalTenantId};
-    use crate::org::ids::{OrgPromptChainId, OrgPromptId, OrgPromptVersionId};
-    use crate::org::membership::{HostMembership, MembershipRole, OrganizationPolicyDocument};
+    use crate::org::{
+        HostMembership, MembershipRole, OrgError, OrgPromptChainId, OrgPromptId,
+        OrgPromptVersionId, OrganizationPolicyDocument, PortalAccountId, PortalTenantId,
+    };
     use crate::protocol::{
         ORGANIZATION_PROMPT_BODY_LIMIT_BYTES, ORGANIZATION_PROMPT_PAGE_ENCODED_LIMIT_BYTES,
         ORGANIZATION_PROMPT_PAGE_ITEM_LIMIT,

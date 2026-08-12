@@ -2374,18 +2374,10 @@ fn display_for_snapshot(snapshot: &crate::domain::snapshot::TaskSnapshot) -> Tas
         .primary_agent_id
         .and_then(|agent_id| snapshot.agents.get(&agent_id))
         .map(|agent| {
-            let icon = if agent.provider_kind.eq_ignore_ascii_case("claude")
-                || agent.provider_kind.eq_ignore_ascii_case("claude_code")
-            {
-                PrimaryProviderIcon::Claude
-            } else if agent.provider_kind.eq_ignore_ascii_case("codex") {
-                PrimaryProviderIcon::Codex
-            } else if agent.provider_kind.eq_ignore_ascii_case("cursor")
-                || agent.provider_kind.eq_ignore_ascii_case("cursor_cli")
-            {
-                PrimaryProviderIcon::Cursor
-            } else {
-                PrimaryProviderIcon::Other
+            let icon = match agent.provider_kind {
+                crate::providers::ProviderKind::ClaudeCode => PrimaryProviderIcon::Claude,
+                crate::providers::ProviderKind::Codex => PrimaryProviderIcon::Codex,
+                crate::providers::ProviderKind::Cursor => PrimaryProviderIcon::Cursor,
             };
             (
                 PrimaryProviderState::Present {

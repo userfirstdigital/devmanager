@@ -5,13 +5,19 @@ use serde::de::{self, Deserializer};
 use serde::ser::{self, Serializer};
 use serde::{Deserialize, Serialize};
 
-use crate::domain::agent::{AgentSessionFacts, ProviderSessionId};
-use crate::domain::artifact::ArtifactFacts;
+use crate::domain::agent::{
+    AgentRole, AgentSessionFacts, AgentSessionLifecycle, ProviderSessionId, SpecialistPermission,
+};
+use crate::domain::artifact::{
+    structured_specialist_result, verify_inline_content_digest, ArtifactContentRef, ArtifactFacts,
+    ArtifactKind, SpecialistResult, MAX_SPECIALIST_RAW_ARTIFACT_BYTES,
+};
 use crate::domain::browser::{BrowserBook, BrowserContractError, BrowserDurableFact};
+use crate::domain::canonical;
 use crate::domain::host::{HostCleanupBranch, HostCleanupBranchOutcome};
 use crate::domain::id::{
-    AgentSessionId, ApprovalId, ClientId, CommandId, EventId, OperationId, QuestionId, ResourceId,
-    TaskId, TurnId,
+    AgentSessionId, ApprovalId, ArtifactId, ClientId, CommandId, EventId, OperationId, QuestionId,
+    ResourceId, TaskId, TurnId,
 };
 use crate::domain::operation::{
     validate_outcome_fence, validate_terminal_fact_source, CancellationReason, OperationErrorCode,
@@ -19,14 +25,16 @@ use crate::domain::operation::{
 };
 use crate::domain::provider_input::{
     validate_provider_fence, ProviderDeliveryVisibility, ProviderFenceIdentity,
-    ProviderInputAction, ProviderInputSettlement, ProviderKind, ProviderResolutionWinner,
-    ProviderWaitFence, ProviderWaitRecord,
+    ProviderInputAction, ProviderInputSettlement, ProviderResolutionWinner, ProviderWaitFence,
+    ProviderWaitRecord,
 };
 use crate::domain::resource::{ResourceFacts, ResourceLifecycle};
 use crate::domain::snapshot::TaskSnapshot;
 use crate::domain::task::{
     ReviewReadiness, TaskActivity, TaskAttention, TaskConnectivity, TaskFacts, TaskLifecycle,
+    WorkspaceRef,
 };
+use crate::providers::ProviderKind;
 
 pub const EVENT_SCHEMA_VERSION: u32 = 1;
 
@@ -687,6 +695,287 @@ pub struct ProviderInputDeliveredPayload {
     pub approval_id: Option<ApprovalId>,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct SpecialistRequestedPayload {
+    pub specialist_id: AgentSessionId,
+    pub requested_by: AgentSessionId,
+    pub purpose: String,
+    pub agent: AgentSessionFacts,
+    pub permission: SpecialistPermission,
+    pub workspace: WorkspaceRef,
+    pub action_epoch: u64,
+    pub runtime_generation: u64,
+    pub resource_id: Option<ResourceId>,
+}
+
+impl fmt::Debug for SpecialistRequestedPayload {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SpecialistRequestedPayload")
+            .field("specialist_id", &self.specialist_id)
+            .field("requested_by", &self.requested_by)
+            .field(
+                "purpose",
+                &format_args!("<redacted {} bytes>", self.purpose.len()),
+            )
+            .field("agent", &self.agent)
+            .field("permission", &self.permission)
+            .field("workspace", &"<redacted>")
+            .field("action_epoch", &self.action_epoch)
+            .field("runtime_generation", &self.runtime_generation)
+            .field("resource_id", &self.resource_id)
+            .finish()
+    }
+}
+
+impl SpecialistRequestedPayload {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if !canonical::is_bounded_canonical(&self.purpose) {
+            return Err("specialist purpose exceeds bound or is not canonical");
+        }
+        if self.agent.id != self.specialist_id
+            || self.requested_by == self.specialist_id
+            || !matches!(self.agent.role, AgentRole::Specialist { .. })
+            || self.agent.runtime_generation != self.runtime_generation
+            || !matches!(self.permission, SpecialistPermission::ReadOnly)
+        {
+            return Err("specialist request lineage is invalid");
+        }
+        self.agent
+            .validate_for_registration()
+            .map_err(|_| "specialist agent registration facts are invalid")?;
+        self.workspace
+            .validate()
+            .map_err(|_| "specialist workspace is invalid")?;
+        Ok(())
+    }
+}
+
+impl Serialize for SpecialistRequestedPayload {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate().map_err(ser::Error::custom)?;
+        #[derive(Serialize)]
+        struct SpecialistRequestedPayloadWire<'a> {
+            specialist_id: AgentSessionId,
+            requested_by: AgentSessionId,
+            purpose: &'a str,
+            agent: &'a AgentSessionFacts,
+            permission: SpecialistPermission,
+            workspace: &'a WorkspaceRef,
+            action_epoch: u64,
+            runtime_generation: u64,
+            resource_id: Option<ResourceId>,
+        }
+        SpecialistRequestedPayloadWire {
+            specialist_id: self.specialist_id,
+            requested_by: self.requested_by,
+            purpose: &self.purpose,
+            agent: &self.agent,
+            permission: self.permission,
+            workspace: &self.workspace,
+            action_epoch: self.action_epoch,
+            runtime_generation: self.runtime_generation,
+            resource_id: self.resource_id,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SpecialistRequestedPayload {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct SpecialistRequestedPayloadWire {
+            specialist_id: AgentSessionId,
+            requested_by: AgentSessionId,
+            purpose: String,
+            agent: AgentSessionFacts,
+            permission: SpecialistPermission,
+            workspace: WorkspaceRef,
+            action_epoch: u64,
+            runtime_generation: u64,
+            resource_id: Option<ResourceId>,
+        }
+
+        let wire = SpecialistRequestedPayloadWire::deserialize(deserializer)?;
+        let payload = Self {
+            specialist_id: wire.specialist_id,
+            requested_by: wire.requested_by,
+            purpose: wire.purpose,
+            agent: wire.agent,
+            permission: wire.permission,
+            workspace: wire.workspace,
+            action_epoch: wire.action_epoch,
+            runtime_generation: wire.runtime_generation,
+            resource_id: wire.resource_id,
+        };
+        payload.validate().map_err(de::Error::custom)?;
+        Ok(payload)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrimaryPromotedPayload {
+    pub previous: AgentSessionId,
+    pub promoted: AgentSessionId,
+    pub action_epoch: u64,
+    pub runtime_generation: u64,
+}
+
+impl PrimaryPromotedPayload {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.previous == self.promoted {
+            return Err("primary promotion requires distinct previous and promoted agents");
+        }
+        Ok(())
+    }
+}
+
+impl Serialize for PrimaryPromotedPayload {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate().map_err(ser::Error::custom)?;
+        #[derive(Serialize)]
+        #[serde(deny_unknown_fields)]
+        struct PrimaryPromotedPayloadWire {
+            previous: AgentSessionId,
+            promoted: AgentSessionId,
+            action_epoch: u64,
+            runtime_generation: u64,
+        }
+        PrimaryPromotedPayloadWire {
+            previous: self.previous,
+            promoted: self.promoted,
+            action_epoch: self.action_epoch,
+            runtime_generation: self.runtime_generation,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for PrimaryPromotedPayload {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct PrimaryPromotedPayloadWire {
+            previous: AgentSessionId,
+            promoted: AgentSessionId,
+            action_epoch: u64,
+            runtime_generation: u64,
+        }
+
+        let wire = PrimaryPromotedPayloadWire::deserialize(deserializer)?;
+        let payload = Self {
+            previous: wire.previous,
+            promoted: wire.promoted,
+            action_epoch: wire.action_epoch,
+            runtime_generation: wire.runtime_generation,
+        };
+        payload.validate().map_err(de::Error::custom)?;
+        Ok(payload)
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct SpecialistHandoffRecordedPayload {
+    pub specialist_id: AgentSessionId,
+    pub artifact: ArtifactFacts,
+    pub structured: bool,
+    pub action_epoch: u64,
+    pub runtime_generation: u64,
+}
+
+impl fmt::Debug for SpecialistHandoffRecordedPayload {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SpecialistHandoffRecordedPayload")
+            .field("specialist_id", &self.specialist_id)
+            .field("artifact", &self.artifact)
+            .field("structured", &self.structured)
+            .field("action_epoch", &self.action_epoch)
+            .field("runtime_generation", &self.runtime_generation)
+            .finish()
+    }
+}
+
+impl SpecialistHandoffRecordedPayload {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        self.artifact
+            .validate()
+            .map_err(|_| "handoff artifact is invalid")?;
+        if self.artifact.kind != ArtifactKind::ReviewReport
+            || verify_inline_content_digest(&self.artifact).is_err()
+        {
+            return Err("handoff artifact digest or kind is invalid");
+        }
+        let ArtifactContentRef::InlineUtf8(body) = &self.artifact.content_ref else {
+            return Err("handoff artifact must retain bounded inline output");
+        };
+        if body.len() > MAX_SPECIALIST_RAW_ARTIFACT_BYTES {
+            return Err("handoff artifact exceeds raw output bound");
+        }
+        if self.structured {
+            structured_specialist_result(&self.artifact)
+                .map_err(|_| "structured handoff body failed specialist result validation")?;
+        }
+        Ok(())
+    }
+}
+
+impl Serialize for SpecialistHandoffRecordedPayload {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate().map_err(ser::Error::custom)?;
+        #[derive(Serialize)]
+        struct SpecialistHandoffRecordedPayloadWire<'a> {
+            specialist_id: AgentSessionId,
+            artifact: &'a ArtifactFacts,
+            structured: bool,
+            action_epoch: u64,
+            runtime_generation: u64,
+        }
+        SpecialistHandoffRecordedPayloadWire {
+            specialist_id: self.specialist_id,
+            artifact: &self.artifact,
+            structured: self.structured,
+            action_epoch: self.action_epoch,
+            runtime_generation: self.runtime_generation,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SpecialistHandoffRecordedPayload {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct SpecialistHandoffRecordedPayloadWire {
+            specialist_id: AgentSessionId,
+            artifact: ArtifactFacts,
+            structured: bool,
+            action_epoch: u64,
+            runtime_generation: u64,
+        }
+
+        let wire = SpecialistHandoffRecordedPayloadWire::deserialize(deserializer)?;
+        let payload = Self {
+            specialist_id: wire.specialist_id,
+            artifact: wire.artifact,
+            structured: wire.structured,
+            action_epoch: wire.action_epoch,
+            runtime_generation: wire.runtime_generation,
+        };
+        payload.validate().map_err(de::Error::custom)?;
+        Ok(payload)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpecialistClosedPayload {
+    pub specialist_id: AgentSessionId,
+    pub action_epoch: u64,
+    pub runtime_generation: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     TaskCreated {
@@ -712,6 +1001,35 @@ pub enum Event {
     },
     PrimaryAgentSet {
         agent_session_id: AgentSessionId,
+    },
+    SpecialistRequested {
+        specialist_id: AgentSessionId,
+        requested_by: AgentSessionId,
+        purpose: String,
+        agent: AgentSessionFacts,
+        permission: SpecialistPermission,
+        workspace: WorkspaceRef,
+        action_epoch: u64,
+        runtime_generation: u64,
+        resource_id: Option<ResourceId>,
+    },
+    PrimaryPromoted {
+        previous: AgentSessionId,
+        promoted: AgentSessionId,
+        action_epoch: u64,
+        runtime_generation: u64,
+    },
+    SpecialistHandoffRecorded {
+        specialist_id: AgentSessionId,
+        artifact: ArtifactFacts,
+        structured: bool,
+        action_epoch: u64,
+        runtime_generation: u64,
+    },
+    SpecialistClosed {
+        specialist_id: AgentSessionId,
+        action_epoch: u64,
+        runtime_generation: u64,
     },
     ArtifactRegistered {
         artifact: ArtifactFacts,
@@ -807,6 +1125,10 @@ impl Event {
             Self::TaskArchived => "task.archived",
             Self::AgentSessionRegistered { .. } => "agent_session.registered",
             Self::PrimaryAgentSet { .. } => "primary_agent.set",
+            Self::SpecialistRequested { .. } => "specialist.requested",
+            Self::PrimaryPromoted { .. } => "primary_agent.promoted",
+            Self::SpecialistHandoffRecorded { .. } => "specialist.handoff_recorded",
+            Self::SpecialistClosed { .. } => "specialist.closed",
             Self::ArtifactRegistered { .. } => "artifact.registered",
             Self::ResourceRegistered { .. } => "resource.registered",
             Self::ResourceReleaseBegun { .. } => "resource.release_begun",
@@ -861,6 +1183,10 @@ enum EventBody {
     AgentSessionRegistered(AgentSessionRegisteredPayload),
     #[serde(rename = "primary_agent.set")]
     PrimaryAgentSet(PrimaryAgentSetPayload),
+    SpecialistRequested(SpecialistRequestedPayload),
+    PrimaryPromoted(PrimaryPromotedPayload),
+    SpecialistHandoffRecorded(SpecialistHandoffRecordedPayload),
+    SpecialistClosed(SpecialistClosedPayload),
     #[serde(rename = "artifact.registered")]
     ArtifactRegistered(ArtifactRegisteredPayload),
     #[serde(rename = "resource.registered")]
@@ -945,6 +1271,61 @@ impl From<&Event> for EventDocument {
                     agent_session_id: *agent_session_id,
                 })
             }
+
+            Event::SpecialistRequested {
+                specialist_id,
+                requested_by,
+                purpose,
+                agent,
+                permission,
+                workspace,
+                action_epoch,
+                runtime_generation,
+                resource_id,
+            } => EventBody::SpecialistRequested(SpecialistRequestedPayload {
+                specialist_id: *specialist_id,
+                requested_by: *requested_by,
+                purpose: purpose.clone(),
+                agent: agent.clone(),
+                permission: *permission,
+                workspace: workspace.clone(),
+                action_epoch: *action_epoch,
+                runtime_generation: *runtime_generation,
+                resource_id: *resource_id,
+            }),
+            Event::PrimaryPromoted {
+                previous,
+                promoted,
+                action_epoch,
+                runtime_generation,
+            } => EventBody::PrimaryPromoted(PrimaryPromotedPayload {
+                previous: *previous,
+                promoted: *promoted,
+                action_epoch: *action_epoch,
+                runtime_generation: *runtime_generation,
+            }),
+            Event::SpecialistHandoffRecorded {
+                specialist_id,
+                artifact,
+                structured,
+                action_epoch,
+                runtime_generation,
+            } => EventBody::SpecialistHandoffRecorded(SpecialistHandoffRecordedPayload {
+                specialist_id: *specialist_id,
+                artifact: artifact.clone(),
+                structured: *structured,
+                action_epoch: *action_epoch,
+                runtime_generation: *runtime_generation,
+            }),
+            Event::SpecialistClosed {
+                specialist_id,
+                action_epoch,
+                runtime_generation,
+            } => EventBody::SpecialistClosed(SpecialistClosedPayload {
+                specialist_id: *specialist_id,
+                action_epoch: *action_epoch,
+                runtime_generation: *runtime_generation,
+            }),
             Event::ArtifactRegistered { artifact } => {
                 EventBody::ArtifactRegistered(ArtifactRegisteredPayload {
                     artifact: artifact.clone(),
@@ -1143,6 +1524,48 @@ impl TryFrom<EventDocument> for Event {
             }
             EventBody::PrimaryAgentSet(p) => Event::PrimaryAgentSet {
                 agent_session_id: p.agent_session_id,
+            },
+
+            EventBody::SpecialistRequested(p) => {
+                p.validate()
+                    .map_err(|err| EventSerdeError::Payload(err.to_string()))?;
+                Event::SpecialistRequested {
+                    specialist_id: p.specialist_id,
+                    requested_by: p.requested_by,
+                    purpose: p.purpose,
+                    agent: p.agent,
+                    permission: p.permission,
+                    workspace: p.workspace,
+                    action_epoch: p.action_epoch,
+                    runtime_generation: p.runtime_generation,
+                    resource_id: p.resource_id,
+                }
+            }
+            EventBody::PrimaryPromoted(p) => {
+                p.validate()
+                    .map_err(|err| EventSerdeError::Payload(err.to_string()))?;
+                Event::PrimaryPromoted {
+                    previous: p.previous,
+                    promoted: p.promoted,
+                    action_epoch: p.action_epoch,
+                    runtime_generation: p.runtime_generation,
+                }
+            }
+            EventBody::SpecialistHandoffRecorded(p) => {
+                p.validate()
+                    .map_err(|err| EventSerdeError::Payload(err.to_string()))?;
+                Event::SpecialistHandoffRecorded {
+                    specialist_id: p.specialist_id,
+                    artifact: p.artifact,
+                    structured: p.structured,
+                    action_epoch: p.action_epoch,
+                    runtime_generation: p.runtime_generation,
+                }
+            }
+            EventBody::SpecialistClosed(p) => Event::SpecialistClosed {
+                specialist_id: p.specialist_id,
+                action_epoch: p.action_epoch,
+                runtime_generation: p.runtime_generation,
             },
             EventBody::ArtifactRegistered(p) => {
                 p.artifact
@@ -1666,10 +2089,7 @@ fn validate_snapshot_provider_fence(
         task_id: snap.task.id,
         agent_session_id,
         agent_task_id: agent.task_id,
-        provider_kind: crate::domain::provider_input::ProviderKind::new(
-            agent.provider_kind.clone(),
-        )
-        .map_err(|_| ApplyError::InvalidTransition)?,
+        provider_kind: agent.provider_kind,
         provider_session_id: agent.provider_session_id.clone(),
         runtime_generation: agent.runtime_generation,
         action_epoch: snap.task.action_epoch,
@@ -1732,6 +2152,12 @@ fn apply_into(
             }) {
                 return Err(ApplyError::InvalidTransition);
             }
+            if snap.agents.values().any(|agent| {
+                agent.lifecycle == AgentSessionLifecycle::Open
+                    && matches!(agent.role, AgentRole::Specialist { .. })
+            }) {
+                return Err(ApplyError::InvalidTransition);
+            }
             snap.task.lifecycle = TaskLifecycle::Archived;
         }
         Event::AgentSessionRegistered { agent } => {
@@ -1755,6 +2181,178 @@ fn apply_into(
                 return Err(ApplyError::InvalidTransition);
             }
             snap.primary_agent_id = Some(*agent_session_id);
+        }
+        Event::SpecialistRequested {
+            specialist_id,
+            requested_by,
+            agent,
+            purpose,
+            permission,
+            action_epoch,
+            runtime_generation,
+            resource_id,
+            workspace,
+            ..
+        } => {
+            if agent.id != *specialist_id || agent.task_id != snap.task.id {
+                return Err(ApplyError::OwnershipConflict);
+            }
+            if !canonical::is_bounded_canonical(purpose)
+                || !matches!(agent.role, AgentRole::Specialist { .. })
+                || !matches!(permission, SpecialistPermission::ReadOnly)
+                || *action_epoch != snap.task.action_epoch
+                || agent.runtime_generation != *runtime_generation
+                || agent.id == *requested_by
+            {
+                return Err(ApplyError::InvalidTransition);
+            }
+            workspace
+                .validate()
+                .map_err(|_| ApplyError::InvalidTransition)?;
+            let Some(requester) = snap.agents.get(requested_by) else {
+                return Err(ApplyError::NotFound);
+            };
+            if requester.lifecycle != AgentSessionLifecycle::Open
+                || !matches!(requester.role, AgentRole::Primary)
+                || snap.primary_agent_id != Some(*requested_by)
+                || requester.runtime_generation != *runtime_generation
+            {
+                return Err(ApplyError::InvalidTransition);
+            }
+            if snap
+                .agents
+                .values()
+                .filter(|existing| {
+                    existing.lifecycle == AgentSessionLifecycle::Open
+                        && matches!(
+                            existing.role,
+                            AgentRole::Primary | AgentRole::Specialist { .. }
+                        )
+                })
+                .count()
+                >= crate::domain::command::DEFAULT_MAX_TOP_LEVEL_RUNTIMES
+            {
+                return Err(ApplyError::InvalidTransition);
+            }
+            if let Some(resource_id) = resource_id {
+                let Some(resource) = snap.resources.get(resource_id) else {
+                    return Err(ApplyError::NotFound);
+                };
+                if resource.task_id != Some(snap.task.id)
+                    || resource.runtime_generation != *runtime_generation
+                {
+                    return Err(ApplyError::InvalidTransition);
+                }
+            }
+            agent
+                .validate_for_registration()
+                .map_err(|_| ApplyError::InvalidTransition)?;
+            if snap.agents.contains_key(&agent.id) {
+                return Err(ApplyError::AlreadyExists);
+            }
+            snap.agents.insert(agent.id, agent.clone());
+        }
+        Event::PrimaryPromoted {
+            previous,
+            promoted,
+            action_epoch,
+            runtime_generation,
+        } => {
+            if previous == promoted || *action_epoch != snap.task.action_epoch {
+                return Err(ApplyError::InvalidTransition);
+            }
+            if snap.primary_agent_id != Some(*previous) {
+                return Err(ApplyError::InvalidTransition);
+            }
+            let Some(previous_agent) = snap.agents.get_mut(previous) else {
+                return Err(ApplyError::NotFound);
+            };
+            if !matches!(previous_agent.role, AgentRole::Primary)
+                || previous_agent.lifecycle != AgentSessionLifecycle::Open
+                || previous_agent.runtime_generation != *runtime_generation
+            {
+                return Err(ApplyError::InvalidTransition);
+            }
+            previous_agent.role =
+                AgentRole::specialist("primary").map_err(|_| ApplyError::InvalidTransition)?;
+            let Some(promoted_agent) = snap.agents.get_mut(promoted) else {
+                return Err(ApplyError::NotFound);
+            };
+            if !matches!(promoted_agent.role, AgentRole::Specialist { .. })
+                || promoted_agent.lifecycle != AgentSessionLifecycle::Open
+                || promoted_agent.runtime_generation != *runtime_generation
+            {
+                return Err(ApplyError::InvalidTransition);
+            }
+            promoted_agent.role = AgentRole::Primary;
+            snap.primary_agent_id = Some(*promoted);
+        }
+        Event::SpecialistHandoffRecorded {
+            specialist_id,
+            artifact,
+            structured,
+            action_epoch,
+            runtime_generation,
+        } => {
+            if artifact.task_id != snap.task.id {
+                return Err(ApplyError::OwnershipConflict);
+            }
+            if artifact.kind != ArtifactKind::ReviewReport
+                || *action_epoch != snap.task.action_epoch
+            {
+                return Err(ApplyError::InvalidTransition);
+            }
+            let ArtifactContentRef::InlineUtf8(body) = &artifact.content_ref else {
+                return Err(ApplyError::InvalidTransition);
+            };
+            if body.len() > MAX_SPECIALIST_RAW_ARTIFACT_BYTES {
+                return Err(ApplyError::InvalidTransition);
+            }
+            artifact
+                .validate()
+                .map_err(|_| ApplyError::InvalidTransition)?;
+            verify_inline_content_digest(artifact).map_err(|_| ApplyError::InvalidTransition)?;
+            if *structured {
+                let result = structured_specialist_result(artifact)
+                    .map_err(|_| ApplyError::InvalidTransition)?;
+                for id in result.evidence.iter().chain(&result.artifacts) {
+                    let existing = snap.artifacts.get(id).ok_or(ApplyError::NotFound)?;
+                    if existing.task_id != snap.task.id {
+                        return Err(ApplyError::OwnershipConflict);
+                    }
+                }
+            }
+            if snap.artifacts.contains_key(&artifact.id) {
+                return Err(ApplyError::AlreadyExists);
+            }
+            let Some(specialist) = snap.agents.get_mut(specialist_id) else {
+                return Err(ApplyError::NotFound);
+            };
+            if !matches!(specialist.role, AgentRole::Specialist { .. })
+                || specialist.lifecycle != AgentSessionLifecycle::Open
+                || specialist.runtime_generation != *runtime_generation
+            {
+                return Err(ApplyError::InvalidTransition);
+            }
+            specialist.lifecycle = AgentSessionLifecycle::Closed;
+            snap.artifacts.insert(artifact.id, artifact.clone());
+        }
+        Event::SpecialistClosed {
+            specialist_id,
+            action_epoch,
+            runtime_generation,
+        } => {
+            let Some(specialist) = snap.agents.get_mut(specialist_id) else {
+                return Err(ApplyError::NotFound);
+            };
+            if !matches!(specialist.role, AgentRole::Specialist { .. })
+                || specialist.lifecycle != AgentSessionLifecycle::Open
+                || specialist.runtime_generation != *runtime_generation
+                || *action_epoch != snap.task.action_epoch
+            {
+                return Err(ApplyError::InvalidTransition);
+            }
+            specialist.lifecycle = AgentSessionLifecycle::Closed;
         }
         Event::ArtifactRegistered { artifact } => {
             if artifact.task_id != snap.task.id {

@@ -1223,7 +1223,7 @@ fn read_provider_fence_context(
             )))
         }
     };
-    let provider_kind = crate::domain::provider_input::ProviderKind::new(provider_kind)
+    let provider_kind = crate::domain::provider_input::provider_kind_from_wire(&provider_kind)
         .map_err(|err| StoreError::Projection(err.to_string()))?;
     let provider_session_id = provider_session_id
         .map(crate::domain::agent::ProviderSessionId::new)

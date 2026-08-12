@@ -15,10 +15,11 @@ use crate::domain::id::{
     OperationId, QuestionId, ResourceId, TaskId, TurnId,
 };
 use crate::domain::operation::ResourceFence;
-use crate::domain::provider_input::{ProviderInputAction, ProviderKind};
+use crate::domain::provider_input::ProviderInputAction;
 use crate::domain::resource::{OwnerKind, ResourceLifecycle};
 use crate::domain::snapshot::TaskSnapshot;
 use crate::kernel::store::StoreError;
+use crate::providers::ProviderKind;
 
 pub(crate) const RECEIPT_SCHEMA_VERSION: u32 = 1;
 pub(crate) const EFFECT_SCHEMA_VERSION: u32 = 1;
@@ -318,7 +319,7 @@ pub(crate) fn plan_effects(
                     ));
                 };
                 if agent.provider_session_id.as_ref() != Some(provider_session_id)
-                    || agent.provider_kind != provider_kind.as_str()
+                    || agent.provider_kind != *provider_kind
                     || agent.runtime_generation != *runtime_generation
                 {
                     return Err(StoreError::Projection(
@@ -1095,7 +1096,7 @@ mod tests {
                 id: agent_session_id,
                 task_id,
                 role: AgentRole::Primary,
-                provider_kind: "codex".into(),
+                provider_kind: crate::providers::ProviderKind::Codex,
                 provider_session_id: Some(provider_session_id.clone()),
                 lifecycle: AgentSessionLifecycle::Open,
                 runtime_generation: 9,
@@ -1110,7 +1111,7 @@ mod tests {
             client_id: provider_client,
             operation_id: provider_operation,
             agent_session_id,
-            provider_kind: crate::domain::ProviderKind::new("codex").unwrap(),
+            provider_kind: crate::providers::ProviderKind::Codex,
             provider_session_id,
             runtime_generation: 9,
             turn_id: crate::domain::TurnId::from_bytes(fixed_uuid_v7(0x29)).unwrap(),

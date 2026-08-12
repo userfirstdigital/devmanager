@@ -832,6 +832,8 @@ async fn serve_foreground_host(
             Capability::PromptProjection,
             Capability::ExplicitDetach,
             Capability::HostShutdown,
+            Capability::ProviderInput,
+            Capability::OrganizationProjection,
         ]),
         local_limits: FrameLimits::v1_default(),
     };

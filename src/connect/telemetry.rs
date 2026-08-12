@@ -406,6 +406,7 @@ impl ProviderObservation {
             .map_err(|_| ObservationError::InvalidUsage)?;
         role.validate()
             .map_err(|_| ObservationError::InvalidUsage)?;
+        let kind = kind.wire_name().to_string();
         if kind.len() > MAX_USAGE_SOURCE_BYTES {
             return Err(ObservationError::BoundExceeded);
         }
@@ -616,7 +617,9 @@ impl UsageMeasure {
         revision: u64,
     ) -> Result<Self, ObservationError> {
         let provider = AgentSessionFacts::canonicalize_provider_kind(provider)
-            .map_err(|_| ObservationError::InvalidUsage)?;
+            .map_err(|_| ObservationError::InvalidUsage)?
+            .wire_name()
+            .to_string();
         let source =
             canonical::canonicalize(source.into()).ok_or(ObservationError::InvalidUsage)?;
         let unit = canonical::canonicalize(unit.into()).ok_or(ObservationError::InvalidUsage)?;

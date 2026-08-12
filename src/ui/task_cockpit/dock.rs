@@ -1588,7 +1588,7 @@ mod process_census_tests {
                     id: agent_id,
                     task_id,
                     role: AgentRole::Primary,
-                    provider_kind: "claude".into(),
+                    provider_kind: crate::providers::ProviderKind::ClaudeCode,
                     provider_session_id: None,
                     lifecycle: AgentSessionLifecycle::Open,
                     runtime_generation: 1,

@@ -2,11 +2,14 @@ use std::path::PathBuf;
 
 use devmanager::client::action;
 use devmanager::client::{ClientModel, ClientModelBuilder};
-use devmanager::domain::agent::{AgentRole, AgentSessionFacts, AgentSessionLifecycle};
+use devmanager::domain::agent::{
+    AgentRole, AgentSessionFacts, AgentSessionLifecycle, ProviderSessionId,
+};
 use devmanager::domain::id::AgentSessionId;
 use devmanager::domain::id::TaskId;
 use devmanager::domain::snapshot::{SnapshotItem, SnapshotItemKey, SnapshotPage};
 use devmanager::domain::task::{TaskActivity, VisibleTaskStatus};
+use devmanager::providers::ProviderKind;
 use devmanager::ui::actions::{KeyboardShortcut, ShortcutKey};
 use devmanager::ui::components::AccessibleRole;
 use devmanager::ui::shell::{HostEpochSnapshot, PointerButton, Shell, ShellAttachmentError};
@@ -530,9 +533,7 @@ fn presentation_is_bounded_redacted_and_does_not_leak_sensitive_labels() {
                         branch: "feature\nHEADER_BRANCH_SECRET_SENTINEL".into(),
                     };
                 }
-                SnapshotItem::AgentSession(agent) => {
-                    agent.provider_kind = "provider-secret-sentinel".into();
-                }
+                SnapshotItem::AgentSession(_agent) => {}
                 _ => {}
             }
         }
@@ -548,9 +549,6 @@ fn presentation_is_bounded_redacted_and_does_not_leak_sensitive_labels() {
     assert!(!header
         .accessible_description
         .contains("HEADER_PATH_SECRET_SENTINEL"));
-    assert!(!header
-        .accessible_description
-        .contains("provider-secret-sentinel"));
 
     let mut top_bar_input = fixture.top_bar;
     top_bar_input
@@ -726,8 +724,11 @@ fn specialist_cap_announces_total_hidden_count_and_orders_by_agent_id() {
                 role: AgentRole::Specialist {
                     name: format!("specialist-{index:02}"),
                 },
-                provider_kind: "codex".into(),
-                provider_session_id: Some(format!("codex-specialist-{index:02}")),
+                provider_kind: ProviderKind::Codex,
+                provider_session_id: Some(
+                    ProviderSessionId::new(format!("codex-specialist-{index:02}"))
+                        .expect("provider session"),
+                ),
                 lifecycle: AgentSessionLifecycle::Open,
                 runtime_generation: 1,
                 revision: 1,
@@ -1179,8 +1180,11 @@ fn specialist_projection_retains_5000_and_stable_window_keys_across_page_reorder
             role: AgentRole::Specialist {
                 name: format!("extra-{index:05}"),
             },
-            provider_kind: "codex".to_string(),
-            provider_session_id: Some(format!("extra-session-{index:05}")),
+            provider_kind: ProviderKind::Codex,
+            provider_session_id: Some(
+                ProviderSessionId::new(format!("extra-session-{index:05}"))
+                    .expect("provider session"),
+            ),
             lifecycle: AgentSessionLifecycle::Open,
             runtime_generation: 1,
             revision: 1,

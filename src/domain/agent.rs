@@ -1,3 +1,5 @@
+use std::ops::Deref;
+
 use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSqlOutput, ValueRef};
 use rusqlite::ToSql;
 use serde::de::{self, Deserializer};
@@ -161,6 +163,25 @@ impl ProviderSessionId {
     }
 }
 
+impl AgentSessionFacts {
+    fn validate_provider_session_id(
+        provider_session_id: Option<ProviderSessionId>,
+    ) -> Result<Option<ProviderSessionId>, AgentValidationError> {
+        match provider_session_id {
+            Some(session) => {
+                session
+                    .validate()
+                    .map_err(|_| AgentValidationError::EmptyProviderSessionId)?;
+                if !canonical::is_canonical(session.as_str()) {
+                    return Err(AgentValidationError::EmptyProviderSessionId);
+                }
+                Ok(Some(session))
+            }
+            None => Ok(None),
+        }
+    }
+}
+
 fn is_unsafe_provider_session_character(character: char) -> bool {
     character.is_control()
         || matches!(
@@ -207,6 +228,14 @@ impl std::fmt::Display for AgentValidationError {
 
 impl std::error::Error for AgentValidationError {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum SpecialistPermission {
+    ReadOnly,
+    IsolatedWrite,
+    SharedWrite { explicit_approval: bool },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentRole {
@@ -216,7 +245,7 @@ pub enum AgentRole {
 
 impl AgentRole {
     pub fn specialist(name: impl Into<String>) -> Result<Self, AgentValidationError> {
-        let name = canonical::canonicalize(name.into())
+        let name = canonical::bounded_canonical(&name.into())
             .ok_or(AgentValidationError::EmptySpecialistName)?;
         Ok(Self::Specialist { name })
     }
@@ -225,7 +254,7 @@ impl AgentRole {
         match self {
             Self::Primary => Ok(()),
             Self::Specialist { name } => {
-                if canonical::is_canonical(name) {
+                if canonical::is_bounded_canonical(name) {
                     Ok(())
                 } else {
                     Err(AgentValidationError::EmptySpecialistName)
@@ -312,12 +341,13 @@ impl AgentSessionFacts {
 
     pub fn canonicalize_provider_session_id(
         value: Option<String>,
-    ) -> Result<Option<String>, AgentValidationError> {
+    ) -> Result<Option<ProviderSessionId>, AgentValidationError> {
         match value {
-            Some(session) => Ok(Some(
-                canonical::canonicalize(session)
-                    .ok_or(AgentValidationError::EmptyProviderSessionId)?,
-            )),
+            Some(session) => {
+                Ok(Some(ProviderSessionId::new(session).map_err(|_| {
+                    AgentValidationError::EmptyProviderSessionId
+                })?))
+            }
             None => Ok(None),
         }
     }

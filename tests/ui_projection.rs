@@ -2,7 +2,9 @@ use devmanager::client::model::{MAX_CLIENT_SEARCH_CHARS, MAX_CLIENT_SEARCH_POSTI
 use devmanager::client::{
     ClientModel, ClientModelBuilder, InboxHostController, InboxPreferenceStore,
 };
-use devmanager::domain::agent::{AgentRole, AgentSessionFacts, AgentSessionLifecycle};
+use devmanager::domain::agent::{
+    AgentRole, AgentSessionFacts, AgentSessionLifecycle, ProviderSessionId,
+};
 use devmanager::domain::event::{DomainEvent, Event};
 use devmanager::domain::id::{
     AgentSessionId, EnvironmentId, EventId, ProjectId, ResourceId, SnapshotId, TaskId,
@@ -15,6 +17,7 @@ use devmanager::domain::task::{
     ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity, TaskFacts,
     TaskLifecycle, WorkspaceRef,
 };
+use devmanager::providers::ProviderKind;
 use devmanager::ui::components::AccessibleRole;
 use devmanager::ui::preview::{
     parse_preview_args, PreviewApplication, PreviewDismiss, PreviewError, PreviewOutputCapability,
@@ -576,14 +579,16 @@ fn inbox_model_with_related(
 fn inbox_agent_item(
     task_id: TaskId,
     agent_id: AgentSessionId,
-    provider_kind: &str,
+    provider_kind: ProviderKind,
 ) -> SnapshotItem {
     SnapshotItem::AgentSession(AgentSessionFacts {
         id: agent_id,
         task_id,
         role: AgentRole::Primary,
-        provider_kind: provider_kind.into(),
-        provider_session_id: Some(format!("session-{agent_id}")),
+        provider_kind,
+        provider_session_id: Some(
+            ProviderSessionId::new(format!("session-{agent_id}")).expect("provider session"),
+        ),
         lifecycle: AgentSessionLifecycle::Open,
         runtime_generation: 1,
         revision: 1,
@@ -1067,7 +1072,8 @@ fn inbox_fixture_drives_bounded_display_data_and_compact_render_items() {
         vec![inbox_agent_item(
             rich_id,
             rich_agent,
-            rich["provider"].as_str().expect("provider"),
+            ProviderKind::parse_wire(rich["provider"].as_str().expect("provider"))
+                .expect("canonical provider"),
         )],
         vec![
             inbox_resource_item(
@@ -1212,7 +1218,7 @@ fn inbox_redacts_control_path_and_provider_session_data_at_projection_ingress() 
     task.primary_agent_id = Some(agent_id);
     let model = inbox_model_with_related(
         vec![SnapshotItem::Task(task)],
-        vec![inbox_agent_item(task_id, agent_id, "codex:account-secret")],
+        vec![inbox_agent_item(task_id, agent_id, ProviderKind::Codex)],
         Vec::new(),
     );
     let inbox = Inbox::from_model(&model);
@@ -1224,8 +1230,8 @@ fn inbox_redacts_control_path_and_provider_session_data_at_projection_ingress() 
     assert_eq!(
         row.display.primary_provider,
         PrimaryProviderState::Present {
-            icon: PrimaryProviderIcon::Other,
-            kind: "Provider".into(),
+            icon: PrimaryProviderIcon::Codex,
+            kind: "Codex".into(),
         }
     );
     let render = inbox.render_model(InboxPresentationWidth::Regular);

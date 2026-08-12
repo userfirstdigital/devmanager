@@ -2321,7 +2321,7 @@ fn agent_projection(task: TaskIdentity, agent: &AgentSessionFacts) -> AgentProje
             )
         }
     };
-    let provider = provider_label(&agent.provider_kind);
+    let provider = provider_label(agent.provider_kind.wire_name());
     let accessible_description = presentation_text(
         &format!("{} provider {} is {:?}.", label, provider, agent.lifecycle),
         MAX_ACCESSIBLE_SCALARS,

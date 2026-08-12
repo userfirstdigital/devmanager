@@ -2824,7 +2824,7 @@ fn require_current_effect_ownership(
             let owned_ok = owned_task == task_id.as_bytes().to_vec();
             if !owned_ok
                 || lifecycle != "open"
-                || current_kind != provider_kind.as_str()
+                || current_kind != provider_kind.wire_name()
                 || expected_session.as_ref() != Some(provider_session_id)
                 || generation != *runtime_generation
             {

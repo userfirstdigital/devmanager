@@ -1,15 +1,22 @@
+use std::fmt;
+
 use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::domain::canonical;
 use crate::domain::id::{ArtifactId, TaskId};
+use crate::domain::task::WorkspaceRef;
+
+pub const MAX_SPECIALIST_RAW_ARTIFACT_BYTES: usize = 64 * 1024;
+pub use crate::domain::canonical::{MAX_SPECIALIST_ID_REFS, MAX_SPECIALIST_TEXT_BYTES};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArtifactValidationError {
     EmptyLabel,
     EmptyContent,
     ContentDigestMismatch,
+    InvalidSpecialistResult,
 }
 
 impl std::fmt::Display for ArtifactValidationError {
@@ -22,6 +29,9 @@ impl std::fmt::Display for ArtifactValidationError {
                     f,
                     "artifact inline content SHA-256 does not match declared digest"
                 )
+            }
+            Self::InvalidSpecialistResult => {
+                write!(f, "structured specialist result failed validation")
             }
         }
     }
@@ -46,11 +56,174 @@ pub enum PrivacyClass {
     Shareable,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpecialistStatus {
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct SpecialistResult {
+    pub role: String,
+    pub status: SpecialistStatus,
+    pub summary: String,
+    pub evidence: Vec<ArtifactId>,
+    pub artifacts: Vec<ArtifactId>,
+    pub workspace: Option<WorkspaceRef>,
+    pub commit: Option<String>,
+    pub requested_follow_up: Option<String>,
+}
+
+impl fmt::Debug for SpecialistResult {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SpecialistResult")
+            .field("role", &self.role)
+            .field("status", &self.status)
+            .field(
+                "summary",
+                &format_args!("<redacted {} bytes>", self.summary.len()),
+            )
+            .field("evidence_count", &self.evidence.len())
+            .field("artifact_count", &self.artifacts.len())
+            .field("workspace", &self.workspace.as_ref().map(|_| "<redacted>"))
+            .field("commit", &self.commit)
+            .field(
+                "requested_follow_up",
+                &self
+                    .requested_follow_up
+                    .as_ref()
+                    .map(|text| format!("<redacted {} bytes>", text.len())),
+            )
+            .finish()
+    }
+}
+
+impl Serialize for SpecialistResult {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate().map_err(serde::ser::Error::custom)?;
+        #[derive(Serialize)]
+        struct SpecialistResultWire<'a> {
+            role: &'a str,
+            status: SpecialistStatus,
+            summary: &'a str,
+            evidence: &'a [ArtifactId],
+            artifacts: &'a [ArtifactId],
+            workspace: &'a Option<WorkspaceRef>,
+            commit: &'a Option<String>,
+            requested_follow_up: &'a Option<String>,
+        }
+        SpecialistResultWire {
+            role: &self.role,
+            status: self.status,
+            summary: &self.summary,
+            evidence: &self.evidence,
+            artifacts: &self.artifacts,
+            workspace: &self.workspace,
+            commit: &self.commit,
+            requested_follow_up: &self.requested_follow_up,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl SpecialistResult {
+    pub fn validate(&self) -> Result<(), ArtifactValidationError> {
+        if canonical::bounded_canonical(&self.role).is_none()
+            || canonical::bounded_canonical(&self.summary).is_none()
+        {
+            return Err(ArtifactValidationError::InvalidSpecialistResult);
+        }
+        if !canonical::specialist_id_refs_ok(self.evidence.len())
+            || !canonical::specialist_id_refs_ok(self.artifacts.len())
+        {
+            return Err(ArtifactValidationError::InvalidSpecialistResult);
+        }
+        if let Some(commit) = &self.commit {
+            let len = commit.len();
+            if !(len == 40 || len == 64) || !commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(ArtifactValidationError::InvalidSpecialistResult);
+            }
+        }
+        if let Some(follow_up) = &self.requested_follow_up {
+            if canonical::bounded_canonical(follow_up).is_none() {
+                return Err(ArtifactValidationError::InvalidSpecialistResult);
+            }
+        }
+        if let Some(workspace) = &self.workspace {
+            workspace
+                .validate()
+                .map_err(|_| ArtifactValidationError::InvalidSpecialistResult)?;
+        }
+        Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for SpecialistResult {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct SpecialistResultWire {
+            role: String,
+            status: SpecialistStatus,
+            summary: String,
+            evidence: Vec<ArtifactId>,
+            artifacts: Vec<ArtifactId>,
+            workspace: Option<WorkspaceRef>,
+            commit: Option<String>,
+            requested_follow_up: Option<String>,
+        }
+
+        let wire = SpecialistResultWire::deserialize(deserializer)?;
+        let result = Self {
+            role: wire.role,
+            status: wire.status,
+            summary: wire.summary,
+            evidence: wire.evidence,
+            artifacts: wire.artifacts,
+            workspace: wire.workspace,
+            commit: wire.commit,
+            requested_follow_up: wire.requested_follow_up,
+        };
+        result.validate().map_err(de::Error::custom)?;
+        Ok(result)
+    }
+}
+
+pub fn structured_specialist_result(
+    artifact: &ArtifactFacts,
+) -> Result<SpecialistResult, ArtifactValidationError> {
+    let ArtifactContentRef::InlineUtf8(body) = &artifact.content_ref else {
+        return Err(ArtifactValidationError::InvalidSpecialistResult);
+    };
+    if body.len() > MAX_SPECIALIST_RAW_ARTIFACT_BYTES {
+        return Err(ArtifactValidationError::InvalidSpecialistResult);
+    }
+    serde_json::from_str(body).map_err(|_| ArtifactValidationError::InvalidSpecialistResult)
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ArtifactContentRef {
     InlineUtf8(String),
     ContentAddressed { digest_hex: String },
+}
+
+impl fmt::Debug for ArtifactContentRef {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InlineUtf8(body) => formatter
+                .debug_struct("InlineUtf8")
+                .field("bytes", &body.len())
+                .finish(),
+            Self::ContentAddressed { digest_hex } => formatter
+                .debug_struct("ContentAddressed")
+                .field("digest_hex", digest_hex)
+                .finish(),
+        }
+    }
 }
 
 impl ArtifactContentRef {

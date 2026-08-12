@@ -1,14 +1,22 @@
 use serde::de::{self, DeserializeSeed, MapAccess, Visitor};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use sha2::{Digest, Sha256};
+use std::fmt;
 
-use crate::domain::agent::{AgentSessionFacts, AgentSessionLifecycle};
-use crate::domain::artifact::ArtifactFacts;
+pub use crate::domain::agent::SpecialistPermission;
+use crate::domain::agent::{AgentRole, AgentSessionFacts, AgentSessionLifecycle};
+use crate::domain::artifact::{
+    verify_inline_content_digest, ArtifactContentRef, ArtifactFacts, ArtifactKind, PrivacyClass,
+    MAX_SPECIALIST_RAW_ARTIFACT_BYTES,
+};
+pub use crate::domain::artifact::{SpecialistResult, SpecialistStatus};
 use crate::domain::browser::{BrowserContractError, BrowserRequest};
+use crate::domain::canonical;
 use crate::domain::event::Event;
 use crate::domain::id::{
-    AgentSessionId, ClientId, CommandId, EnvironmentId, EventId, OperationId, ProjectId,
-    ResourceId, TaskId, TurnId,
+    AgentSessionId, ArtifactId, ClientId, CommandId, EnvironmentId, EventId, OperationId,
+    ProjectId, ResourceId, TaskId, TurnId,
 };
 use crate::domain::provider_input::{
     validate_action_nested_ids, PresentProviderApprovalIntent, PresentProviderQuestionIntent,
@@ -924,6 +932,266 @@ impl<'de> Deserialize<'de> for SubmitProviderInputIntent {
     }
 }
 
+pub const DEFAULT_MAX_TOP_LEVEL_RUNTIMES: usize = 2;
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct RequestSpecialistIntent {
+    pub specialist: AgentSessionFacts,
+    pub requested_by: AgentSessionId,
+    pub purpose: String,
+    pub permission: SpecialistPermission,
+    pub workspace: WorkspaceRef,
+    pub expected_artifact_kind: ArtifactKind,
+    pub expected_action_epoch: u64,
+    pub expected_runtime_generation: u64,
+    pub resource_id: Option<ResourceId>,
+    pub max_top_level_runtimes: usize,
+}
+
+impl fmt::Debug for RequestSpecialistIntent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RequestSpecialistIntent")
+            .field("specialist", &self.specialist)
+            .field("requested_by", &self.requested_by)
+            .field(
+                "purpose",
+                &format_args!("<redacted {} bytes>", self.purpose.len()),
+            )
+            .field("permission", &self.permission)
+            .field("workspace", &"<redacted>")
+            .field("expected_artifact_kind", &self.expected_artifact_kind)
+            .field("expected_action_epoch", &self.expected_action_epoch)
+            .field(
+                "expected_runtime_generation",
+                &self.expected_runtime_generation,
+            )
+            .field("resource_id", &self.resource_id)
+            .field("max_top_level_runtimes", &self.max_top_level_runtimes)
+            .finish()
+    }
+}
+
+impl Serialize for RequestSpecialistIntent {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate_bounds().map_err(|_| {
+            serde::ser::Error::custom("specialist request bounds or lineage are invalid")
+        })?;
+        #[derive(Serialize)]
+        struct RequestSpecialistIntentWire<'a> {
+            specialist: &'a AgentSessionFacts,
+            requested_by: AgentSessionId,
+            purpose: &'a str,
+            permission: SpecialistPermission,
+            workspace: &'a WorkspaceRef,
+            expected_artifact_kind: ArtifactKind,
+            expected_action_epoch: u64,
+            expected_runtime_generation: u64,
+            resource_id: Option<ResourceId>,
+            max_top_level_runtimes: usize,
+        }
+        RequestSpecialistIntentWire {
+            specialist: &self.specialist,
+            requested_by: self.requested_by,
+            purpose: &self.purpose,
+            permission: self.permission,
+            workspace: &self.workspace,
+            expected_artifact_kind: self.expected_artifact_kind,
+            expected_action_epoch: self.expected_action_epoch,
+            expected_runtime_generation: self.expected_runtime_generation,
+            resource_id: self.resource_id,
+            max_top_level_runtimes: self.max_top_level_runtimes,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl RequestSpecialistIntent {
+    pub fn validate_bounds(&self) -> Result<(), RejectionCode> {
+        if canonical::bounded_canonical(&self.purpose).is_none() {
+            return Err(RejectionCode::InvalidTransition);
+        }
+        if self.specialist.id == self.requested_by
+            || !matches!(self.specialist.role, AgentRole::Specialist { .. })
+        {
+            return Err(RejectionCode::InvalidTransition);
+        }
+        self.specialist
+            .validate_for_registration()
+            .map_err(|_| RejectionCode::InvalidTransition)?;
+        self.workspace
+            .validate()
+            .map_err(|_| RejectionCode::InvalidTransition)?;
+        if self.expected_artifact_kind != ArtifactKind::ReviewReport {
+            return Err(RejectionCode::UnsupportedCapability);
+        }
+        Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for RequestSpecialistIntent {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct RequestSpecialistIntentWire {
+            specialist: AgentSessionFacts,
+            requested_by: AgentSessionId,
+            purpose: String,
+            permission: SpecialistPermission,
+            workspace: WorkspaceRef,
+            expected_artifact_kind: ArtifactKind,
+            expected_action_epoch: u64,
+            expected_runtime_generation: u64,
+            resource_id: Option<ResourceId>,
+            max_top_level_runtimes: usize,
+        }
+
+        let wire = RequestSpecialistIntentWire::deserialize(deserializer)?;
+        let intent = Self {
+            specialist: wire.specialist,
+            requested_by: wire.requested_by,
+            purpose: wire.purpose,
+            permission: wire.permission,
+            workspace: wire.workspace,
+            expected_artifact_kind: wire.expected_artifact_kind,
+            expected_action_epoch: wire.expected_action_epoch,
+            expected_runtime_generation: wire.expected_runtime_generation,
+            resource_id: wire.resource_id,
+            max_top_level_runtimes: wire.max_top_level_runtimes,
+        };
+        intent
+            .validate_bounds()
+            .map_err(|_| de::Error::custom("specialist request bounds or lineage are invalid"))?;
+        Ok(intent)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PromotePrimaryIntent {
+    pub agent_session_id: AgentSessionId,
+    pub expected_action_epoch: u64,
+    pub expected_runtime_generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CancelSpecialistIntent {
+    pub agent_session_id: AgentSessionId,
+    pub expected_action_epoch: u64,
+    pub expected_runtime_generation: u64,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct AcceptSpecialistHandoffIntent {
+    pub specialist_id: AgentSessionId,
+    pub artifact_id: ArtifactId,
+    pub expected_action_epoch: u64,
+    pub expected_runtime_generation: u64,
+    pub structured: Option<SpecialistResult>,
+    pub raw_inline_utf8: Option<String>,
+}
+
+impl fmt::Debug for AcceptSpecialistHandoffIntent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AcceptSpecialistHandoffIntent")
+            .field("specialist_id", &self.specialist_id)
+            .field("artifact_id", &self.artifact_id)
+            .field("expected_action_epoch", &self.expected_action_epoch)
+            .field(
+                "expected_runtime_generation",
+                &self.expected_runtime_generation,
+            )
+            .field(
+                "structured",
+                &self
+                    .structured
+                    .as_ref()
+                    .map(|_| "<redacted structured result>"),
+            )
+            .field(
+                "raw_inline_utf8",
+                &self
+                    .raw_inline_utf8
+                    .as_ref()
+                    .map(|text| format!("<redacted {} bytes>", text.len())),
+            )
+            .finish()
+    }
+}
+
+impl Serialize for AcceptSpecialistHandoffIntent {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if self
+            .raw_inline_utf8
+            .as_ref()
+            .is_some_and(|raw| raw.is_empty() || raw.len() > MAX_SPECIALIST_RAW_ARTIFACT_BYTES)
+            || self.structured.is_none() && self.raw_inline_utf8.is_none()
+        {
+            return Err(serde::ser::Error::custom(
+                "specialist handoff must contain one bounded result",
+            ));
+        }
+        if let Some(result) = &self.structured {
+            result.validate().map_err(serde::ser::Error::custom)?;
+        }
+        #[derive(Serialize)]
+        struct AcceptSpecialistHandoffIntentWire<'a> {
+            specialist_id: AgentSessionId,
+            artifact_id: ArtifactId,
+            expected_action_epoch: u64,
+            expected_runtime_generation: u64,
+            structured: &'a Option<SpecialistResult>,
+            raw_inline_utf8: &'a Option<String>,
+        }
+        AcceptSpecialistHandoffIntentWire {
+            specialist_id: self.specialist_id,
+            artifact_id: self.artifact_id,
+            expected_action_epoch: self.expected_action_epoch,
+            expected_runtime_generation: self.expected_runtime_generation,
+            structured: &self.structured,
+            raw_inline_utf8: &self.raw_inline_utf8,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for AcceptSpecialistHandoffIntent {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct AcceptSpecialistHandoffIntentWire {
+            specialist_id: AgentSessionId,
+            artifact_id: ArtifactId,
+            expected_action_epoch: u64,
+            expected_runtime_generation: u64,
+            structured: Option<SpecialistResult>,
+            raw_inline_utf8: Option<String>,
+        }
+
+        let wire = AcceptSpecialistHandoffIntentWire::deserialize(deserializer)?;
+        if let Some(raw) = &wire.raw_inline_utf8 {
+            if raw.is_empty() || raw.len() > MAX_SPECIALIST_RAW_ARTIFACT_BYTES {
+                return Err(de::Error::custom("raw specialist handoff exceeds bound"));
+            }
+        }
+        if wire.structured.is_none() && wire.raw_inline_utf8.is_none() {
+            return Err(de::Error::custom(
+                "specialist handoff must contain one bounded result",
+            ));
+        }
+        Ok(Self {
+            specialist_id: wire.specialist_id,
+            artifact_id: wire.artifact_id,
+            expected_action_epoch: wire.expected_action_epoch,
+            expected_runtime_generation: wire.expected_runtime_generation,
+            structured: wire.structured,
+            raw_inline_utf8: wire.raw_inline_utf8,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum Command {
@@ -956,6 +1224,10 @@ pub enum Command {
     PresentProviderApproval(PresentProviderApprovalIntent),
     /// Journal ingress only. Host `ClientRequest` rejects this variant.
     SettleProviderWait(SettleProviderWaitIntent),
+    RequestSpecialist(RequestSpecialistIntent),
+    PromotePrimary(PromotePrimaryIntent),
+    CancelSpecialist(CancelSpecialistIntent),
+    AcceptSpecialistHandoff(AcceptSpecialistHandoffIntent),
     PromptLibrary(PromptCommand),
     Browser(BrowserRequest),
 }
@@ -1032,6 +1304,21 @@ pub fn decide(
                 return Err(RejectionCode::InvalidTransition);
             }
             if snap.agents.contains_key(&agent.id) {
+                return Err(RejectionCode::AlreadyExists);
+            }
+            if matches!(
+                agent.role,
+                crate::domain::agent::AgentRole::Specialist { .. }
+            ) {
+                // Specialists must be admitted through RequestSpecialist so the
+                // primary fence and permission policy remain authoritative.
+                return Err(RejectionCode::InvalidTransition);
+            }
+            if matches!(agent.role, crate::domain::agent::AgentRole::Primary)
+                && snap.agents.values().any(|existing| {
+                    matches!(existing.role, crate::domain::agent::AgentRole::Primary)
+                })
+            {
                 return Err(RejectionCode::AlreadyExists);
             }
             Ok(vec![Event::AgentSessionRegistered {
@@ -1126,6 +1413,12 @@ pub fn decide(
         }
         Command::SettleProviderWait(intent) => {
             decide_settle_provider_wait(snapshot, envelope, intent)
+        }
+        Command::RequestSpecialist(intent) => decide_request_specialist(snapshot, envelope, intent),
+        Command::PromotePrimary(intent) => decide_promote_primary(snapshot, envelope, intent),
+        Command::CancelSpecialist(intent) => decide_cancel_specialist(snapshot, envelope, intent),
+        Command::AcceptSpecialistHandoff(intent) => {
+            decide_accept_specialist_handoff(snapshot, envelope, intent)
         }
         Command::PromptLibrary(_) => Err(RejectionCode::InvalidTransition),
         Command::Browser(request) => decide_browser(snapshot, envelope, request),
@@ -1251,9 +1544,7 @@ fn decide_submit_provider_input(
     let Some(provider_session_id) = agent.provider_session_id.clone() else {
         return Err(RejectionCode::UnsupportedCapability);
     };
-    let provider_kind =
-        crate::domain::provider_input::ProviderKind::new(agent.provider_kind.clone())
-            .map_err(|_| RejectionCode::UnsupportedCapability)?;
+    let provider_kind = agent.provider_kind;
     if agent.runtime_generation != intent.runtime_generation() {
         return Err(RejectionCode::InvalidTransition);
     }
@@ -1347,9 +1638,7 @@ fn decide_present_provider_question(
     let Some(provider_session_id) = agent.provider_session_id.clone() else {
         return Err(RejectionCode::UnsupportedCapability);
     };
-    let provider_kind =
-        crate::domain::provider_input::ProviderKind::new(agent.provider_kind.clone())
-            .map_err(|_| RejectionCode::UnsupportedCapability)?;
+    let provider_kind = agent.provider_kind;
     if agent.runtime_generation != intent.runtime_generation()
         || snap.task.action_epoch != intent.action_epoch()
     {
@@ -1400,9 +1689,7 @@ fn decide_present_provider_approval(
     let Some(provider_session_id) = agent.provider_session_id.clone() else {
         return Err(RejectionCode::UnsupportedCapability);
     };
-    let provider_kind =
-        crate::domain::provider_input::ProviderKind::new(agent.provider_kind.clone())
-            .map_err(|_| RejectionCode::UnsupportedCapability)?;
+    let provider_kind = agent.provider_kind;
     if agent.runtime_generation != intent.runtime_generation()
         || snap.task.action_epoch != intent.action_epoch()
     {
@@ -1548,4 +1835,277 @@ fn require_live_agent(agent: &AgentSessionFacts) -> Result<(), RejectionCode> {
         AgentSessionLifecycle::Open | AgentSessionLifecycle::Closing => Ok(()),
         AgentSessionLifecycle::Closed => Err(RejectionCode::InvalidTransition),
     }
+}
+
+fn require_orchestration_fences(
+    snap: &TaskSnapshot,
+    expected_action_epoch: u64,
+    agent: &AgentSessionFacts,
+    expected_runtime_generation: u64,
+) -> Result<(), RejectionCode> {
+    if snap.task.action_epoch != expected_action_epoch
+        || agent.runtime_generation != expected_runtime_generation
+    {
+        return Err(RejectionCode::RevisionConflict);
+    }
+    Ok(())
+}
+
+fn top_level_runtime_count(snap: &TaskSnapshot) -> usize {
+    snap.agents
+        .values()
+        .filter(|agent| {
+            agent.lifecycle == AgentSessionLifecycle::Open
+                && matches!(
+                    agent.role,
+                    AgentRole::Primary | AgentRole::Specialist { .. }
+                )
+        })
+        .count()
+}
+
+fn decide_request_specialist(
+    snapshot: Option<&TaskSnapshot>,
+    envelope: &CommandEnvelope,
+    intent: &RequestSpecialistIntent,
+) -> Result<Vec<Event>, RejectionCode> {
+    let snap = require_runtime_capable_task(snapshot, envelope)?;
+    require_expected_revision(snap, envelope)?;
+    intent.validate_bounds()?;
+    let requester = snap
+        .agents
+        .get(&intent.requested_by)
+        .ok_or(RejectionCode::NotFound)?;
+    require_orchestration_fences(
+        snap,
+        intent.expected_action_epoch,
+        requester,
+        intent.expected_runtime_generation,
+    )?;
+    if !matches!(requester.role, AgentRole::Primary)
+        || snap.primary_agent_id != Some(intent.requested_by)
+    {
+        return Err(RejectionCode::OwnershipConflict);
+    }
+    if intent.specialist.task_id != snap.task.id || intent.specialist.id == intent.requested_by {
+        return Err(RejectionCode::OwnershipConflict);
+    }
+    let purpose =
+        canonical::bounded_canonical(&intent.purpose).ok_or(RejectionCode::InvalidTransition)?;
+    intent
+        .workspace
+        .validate()
+        .map_err(|_| RejectionCode::InvalidTransition)?;
+    if intent.expected_artifact_kind != ArtifactKind::ReviewReport {
+        return Err(RejectionCode::UnsupportedCapability);
+    }
+    if intent.specialist.validate_for_registration().is_err()
+        || intent.specialist.runtime_generation != intent.expected_runtime_generation
+    {
+        return Err(RejectionCode::InvalidTransition);
+    }
+    if snap.agents.contains_key(&intent.specialist.id) {
+        return Err(RejectionCode::AlreadyExists);
+    }
+    match intent.permission {
+        SpecialistPermission::ReadOnly => {}
+        SpecialistPermission::IsolatedWrite => {
+            if !matches!(snap.task.workspace, WorkspaceRef::Worktree { .. })
+                || intent.workspace != snap.task.workspace
+            {
+                return Err(RejectionCode::InvalidTransition);
+            }
+            return Err(RejectionCode::UnsupportedCapability);
+        }
+        SpecialistPermission::SharedWrite {
+            explicit_approval: true,
+        } => return Err(RejectionCode::UnsupportedCapability),
+        SpecialistPermission::SharedWrite {
+            explicit_approval: false,
+        } => return Err(RejectionCode::InvalidTransition),
+    }
+    if let Some(resource_id) = intent.resource_id {
+        let resource = snap
+            .resources
+            .get(&resource_id)
+            .ok_or(RejectionCode::NotFound)?;
+        if resource.task_id != Some(snap.task.id) {
+            return Err(RejectionCode::OwnershipConflict);
+        }
+        if resource.runtime_generation != intent.expected_runtime_generation {
+            return Err(RejectionCode::RevisionConflict);
+        }
+    }
+    let requested_cap = intent
+        .max_top_level_runtimes
+        .min(DEFAULT_MAX_TOP_LEVEL_RUNTIMES);
+    let next_top_level_count = top_level_runtime_count(snap)
+        .checked_add(1)
+        .ok_or(RejectionCode::InvalidTransition)?;
+    if requested_cap == 0 || next_top_level_count > requested_cap {
+        return Err(RejectionCode::InvalidTransition);
+    }
+    Ok(vec![Event::SpecialistRequested {
+        specialist_id: intent.specialist.id,
+        requested_by: intent.requested_by,
+        purpose,
+        agent: intent.specialist.clone(),
+        permission: intent.permission,
+        workspace: intent.workspace.clone(),
+        action_epoch: intent.expected_action_epoch,
+        runtime_generation: intent.expected_runtime_generation,
+        resource_id: intent.resource_id,
+    }])
+}
+
+fn decide_promote_primary(
+    snapshot: Option<&TaskSnapshot>,
+    envelope: &CommandEnvelope,
+    intent: &PromotePrimaryIntent,
+) -> Result<Vec<Event>, RejectionCode> {
+    let snap = require_runtime_capable_task(snapshot, envelope)?;
+    require_expected_revision(snap, envelope)?;
+    let candidate = snap
+        .agents
+        .get(&intent.agent_session_id)
+        .ok_or(RejectionCode::NotFound)?;
+    require_orchestration_fences(
+        snap,
+        intent.expected_action_epoch,
+        candidate,
+        intent.expected_runtime_generation,
+    )?;
+    let previous = snap.primary_agent_id.ok_or(RejectionCode::NotFound)?;
+    let previous_agent = snap.agents.get(&previous).ok_or(RejectionCode::NotFound)?;
+    if !matches!(candidate.role, AgentRole::Specialist { .. })
+        || candidate.lifecycle != AgentSessionLifecycle::Open
+        || !matches!(previous_agent.role, AgentRole::Primary)
+        || previous_agent.lifecycle != AgentSessionLifecycle::Open
+        || previous_agent.runtime_generation != intent.expected_runtime_generation
+    {
+        return Err(RejectionCode::InvalidTransition);
+    }
+    Ok(vec![Event::PrimaryPromoted {
+        previous,
+        promoted: intent.agent_session_id,
+        action_epoch: intent.expected_action_epoch,
+        runtime_generation: intent.expected_runtime_generation,
+    }])
+}
+
+fn decide_cancel_specialist(
+    snapshot: Option<&TaskSnapshot>,
+    envelope: &CommandEnvelope,
+    intent: &CancelSpecialistIntent,
+) -> Result<Vec<Event>, RejectionCode> {
+    let snap = require_runtime_capable_task(snapshot, envelope)?;
+    require_expected_revision(snap, envelope)?;
+    let specialist = snap
+        .agents
+        .get(&intent.agent_session_id)
+        .ok_or(RejectionCode::NotFound)?;
+    require_orchestration_fences(
+        snap,
+        intent.expected_action_epoch,
+        specialist,
+        intent.expected_runtime_generation,
+    )?;
+    if !matches!(specialist.role, AgentRole::Specialist { .. })
+        || specialist.lifecycle != AgentSessionLifecycle::Open
+    {
+        return Err(RejectionCode::InvalidTransition);
+    }
+    Ok(vec![Event::SpecialistClosed {
+        specialist_id: intent.agent_session_id,
+        action_epoch: intent.expected_action_epoch,
+        runtime_generation: intent.expected_runtime_generation,
+    }])
+}
+
+fn decide_accept_specialist_handoff(
+    snapshot: Option<&TaskSnapshot>,
+    envelope: &CommandEnvelope,
+    intent: &AcceptSpecialistHandoffIntent,
+) -> Result<Vec<Event>, RejectionCode> {
+    let snap = require_runtime_capable_task(snapshot, envelope)?;
+    require_expected_revision(snap, envelope)?;
+    let specialist = snap
+        .agents
+        .get(&intent.specialist_id)
+        .ok_or(RejectionCode::NotFound)?;
+    require_orchestration_fences(
+        snap,
+        intent.expected_action_epoch,
+        specialist,
+        intent.expected_runtime_generation,
+    )?;
+    if !matches!(specialist.role, AgentRole::Specialist { .. })
+        || specialist.lifecycle != AgentSessionLifecycle::Open
+    {
+        return Err(RejectionCode::InvalidTransition);
+    }
+    if snap.artifacts.contains_key(&intent.artifact_id) {
+        return Err(RejectionCode::AlreadyExists);
+    }
+    if intent
+        .raw_inline_utf8
+        .as_ref()
+        .is_some_and(|raw| raw.is_empty() || raw.len() > MAX_SPECIALIST_RAW_ARTIFACT_BYTES)
+    {
+        return Err(RejectionCode::InvalidTransition);
+    }
+    let (body, structured) = match (&intent.structured, &intent.raw_inline_utf8) {
+        (Some(result), _) if result.validate().is_ok() => {
+            for id in result.evidence.iter().chain(&result.artifacts) {
+                let artifact = snap.artifacts.get(id).ok_or(RejectionCode::NotFound)?;
+                if artifact.task_id != snap.task.id {
+                    return Err(RejectionCode::OwnershipConflict);
+                }
+            }
+            let body =
+                serde_json::to_string(result).map_err(|_| RejectionCode::InvalidTransition)?;
+            if body.len() > MAX_SPECIALIST_RAW_ARTIFACT_BYTES {
+                return Err(RejectionCode::InvalidTransition);
+            }
+            (body, true)
+        }
+        (_, Some(raw)) => {
+            if raw.is_empty() || raw.len() > MAX_SPECIALIST_RAW_ARTIFACT_BYTES {
+                return Err(RejectionCode::InvalidTransition);
+            }
+            (raw.clone(), false)
+        }
+        _ => return Err(RejectionCode::InvalidTransition),
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(body.as_bytes());
+    let sha256: [u8; 32] = hasher.finalize().into();
+    let label = if structured {
+        "specialist-handoff-structured"
+    } else {
+        "specialist-handoff-raw"
+    };
+    let artifact = ArtifactFacts {
+        id: intent.artifact_id,
+        task_id: snap.task.id,
+        kind: ArtifactKind::ReviewReport,
+        label: ArtifactFacts::canonicalize_label(label)
+            .map_err(|_| RejectionCode::InvalidTransition)?,
+        content_ref: ArtifactContentRef::inline_utf8(body)
+            .map_err(|_| RejectionCode::InvalidTransition)?,
+        sha256,
+        privacy_class: PrivacyClass::LocalOnly,
+        created_at_ms: envelope.issued_at_ms,
+    };
+    artifact
+        .validate()
+        .map_err(|_| RejectionCode::InvalidTransition)?;
+    verify_inline_content_digest(&artifact).map_err(|_| RejectionCode::InvalidTransition)?;
+    Ok(vec![Event::SpecialistHandoffRecorded {
+        specialist_id: intent.specialist_id,
+        artifact,
+        structured,
+        action_epoch: intent.expected_action_epoch,
+        runtime_generation: intent.expected_runtime_generation,
+    }])
 }

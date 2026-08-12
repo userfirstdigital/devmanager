@@ -15,6 +15,7 @@ use crate::domain::canonical;
 use crate::domain::id::{
     AgentSessionId, ApprovalId, ClientId, CommandId, OperationId, QuestionId, TaskId, TurnId,
 };
+use crate::providers::ProviderKind;
 
 pub const MAX_PROVIDER_INPUT_TEXT_BYTES: usize = 64 * 1024;
 pub const MAX_PROVIDER_KIND_BYTES: usize = 64;
@@ -28,6 +29,7 @@ pub enum ProviderInputIntentError {
     EmptyText,
     TextTooLarge,
     InconsistentNestedIds,
+    UnsupportedProviderKind,
     QuestionWinnerLimit,
     ApprovalWinnerLimit,
     WaitLimit,
@@ -46,6 +48,7 @@ impl fmt::Display for ProviderInputIntentError {
             Self::InconsistentNestedIds => {
                 write!(f, "provider input nested identities are inconsistent")
             }
+            Self::UnsupportedProviderKind => write!(f, "provider kind is not supported"),
             Self::QuestionWinnerLimit => write!(
                 f,
                 "provider question winner map exceeds {MAX_PROVIDER_QUESTION_WINS} entries"
@@ -65,85 +68,18 @@ impl fmt::Display for ProviderInputIntentError {
 
 impl std::error::Error for ProviderInputIntentError {}
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
-pub struct ProviderKind(String);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProviderKindError {
-    Empty,
-    TooLarge,
-    NonCanonical,
-}
-
-impl fmt::Display for ProviderKindError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Empty => f.write_str("provider kind must be non-empty"),
-            Self::TooLarge => write!(f, "provider kind exceeds {MAX_PROVIDER_KIND_BYTES} bytes"),
-            Self::NonCanonical => f.write_str("provider kind must be canonical text"),
-        }
+/// Convert a bounded wire provider-kind string into the canonical enum.
+pub fn provider_kind_from_wire(value: &str) -> Result<ProviderKind, ProviderInputIntentError> {
+    if value.is_empty() {
+        return Err(ProviderInputIntentError::EmptyText);
     }
-}
-
-impl std::error::Error for ProviderKindError {}
-
-impl ProviderKind {
-    pub fn new(value: impl Into<String>) -> Result<Self, ProviderKindError> {
-        let value = value.into();
-        if value.is_empty() {
-            return Err(ProviderKindError::Empty);
-        }
-        if value.len() > MAX_PROVIDER_KIND_BYTES {
-            return Err(ProviderKindError::TooLarge);
-        }
-        if !canonical::is_canonical(&value) {
-            return Err(ProviderKindError::NonCanonical);
-        }
-        Ok(Self(value))
+    if value.len() > MAX_PROVIDER_KIND_BYTES {
+        return Err(ProviderInputIntentError::TextTooLarge);
     }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
+    if !canonical::is_canonical(value) {
+        return Err(ProviderInputIntentError::UnsupportedProviderKind);
     }
-}
-
-impl fmt::Display for ProviderKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl AsRef<str> for ProviderKind {
-    fn as_ref(&self) -> &str {
-        self.as_str()
-    }
-}
-
-impl<'de> Deserialize<'de> for ProviderKind {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct ProviderKindVisitor;
-
-        impl Visitor<'_> for ProviderKindVisitor {
-            type Value = ProviderKind;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-                write!(
-                    formatter,
-                    "canonical provider kind of at most {MAX_PROVIDER_KIND_BYTES} bytes"
-                )
-            }
-
-            fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
-                ProviderKind::new(value.to_owned()).map_err(E::custom)
-            }
-
-            fn visit_string<E: de::Error>(self, value: String) -> Result<Self::Value, E> {
-                ProviderKind::new(value).map_err(E::custom)
-            }
-        }
-
-        deserializer.deserialize_str(ProviderKindVisitor)
-    }
+    ProviderKind::parse_wire(value).ok_or(ProviderInputIntentError::UnsupportedProviderKind)
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize)]

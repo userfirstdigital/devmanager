@@ -15,10 +15,15 @@ pub mod resource;
 pub mod snapshot;
 pub mod task;
 
-pub use agent::{AgentRole, AgentSessionFacts, AgentSessionLifecycle, AgentValidationError};
+pub use crate::providers::ProviderKind;
+pub use agent::{
+    AgentRole, AgentSessionFacts, AgentSessionLifecycle, AgentValidationError, ProviderSessionId,
+    ProviderSessionIdError, SpecialistPermission, MAX_PROVIDER_SESSION_ID_BYTES,
+};
 pub use artifact::{
     ArtifactContentRef, ArtifactFacts, ArtifactKind, ArtifactSummary, ArtifactValidationError,
-    PrivacyClass,
+    PrivacyClass, SpecialistResult, SpecialistStatus, MAX_SPECIALIST_ID_REFS,
+    MAX_SPECIALIST_RAW_ARTIFACT_BYTES, MAX_SPECIALIST_TEXT_BYTES,
 };
 pub use codec::{
     decode_orchestration_msgpack, encode_orchestration_msgpack, preflight_msgpack,
@@ -27,9 +32,11 @@ pub use codec::{
     MAX_ORCHESTRATION_MSGPACK_NODES, MAX_ORCHESTRATION_MSGPACK_STRING_BYTES,
 };
 pub use command::{
-    command_payload_digest, decide, Command, CommandEnvelope, CommandReceipt,
-    ConfirmHostQuitIntent, CreateTaskIntent, CreateTaskRequestIntent, RejectionCode,
-    RenameTaskIntent, SetTaskAttentionIntent, SubmitProviderInputIntent,
+    command_payload_digest, decide, AcceptSpecialistHandoffIntent, CancelSpecialistIntent, Command,
+    CommandEnvelope, CommandReceipt, ConfirmHostQuitIntent, CreateTaskIntent,
+    CreateTaskRequestIntent, PromotePrimaryIntent, RejectionCode, RenameTaskIntent,
+    RequestSpecialistIntent, SetTaskAttentionIntent, SubmitProviderInputIntent,
+    DEFAULT_MAX_TOP_LEVEL_RUNTIMES,
 };
 pub use event::{
     apply, ApplyError, DomainEvent, Event, EventSerdeError, OperationAcceptedFact,
@@ -55,10 +62,10 @@ pub use operation::{
 };
 pub use org::{ManagedScope, TaskScope};
 pub use provider_input::{
-    validate_provider_fence, PresentProviderApprovalIntent, PresentProviderQuestionIntent,
-    ProviderDeliveryHoldReason, ProviderDeliveryVisibility, ProviderFenceContext,
-    ProviderFenceError, ProviderFenceIdentity, ProviderInputAction, ProviderInputIntentError,
-    ProviderInputSettlement, ProviderIntentPhase, ProviderKind, ProviderKindError,
+    provider_kind_from_wire, validate_provider_fence, PresentProviderApprovalIntent,
+    PresentProviderQuestionIntent, ProviderDeliveryHoldReason, ProviderDeliveryVisibility,
+    ProviderFenceContext, ProviderFenceError, ProviderFenceIdentity, ProviderInputAction,
+    ProviderInputIntentError, ProviderInputSettlement, ProviderIntentPhase,
     ProviderResolutionWinner, ProviderSessionProjection, ProviderWaitFence, ProviderWaitRecord,
     SettleProviderWaitIntent, MAX_PROVIDER_APPROVAL_WINS, MAX_PROVIDER_INPUT_TEXT_BYTES,
     MAX_PROVIDER_KIND_BYTES, MAX_PROVIDER_QUESTION_WINS, MAX_PROVIDER_SESSION_STATE_BYTES,
