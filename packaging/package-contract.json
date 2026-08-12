@@ -3,11 +3,19 @@
   "identifier": "com.userfirst.devmanager",
   "publisher": "UserFirst",
   "versionSource": "Cargo.toml#package.version",
+  "shippingIdentity": {
+    "format": "devmanager/{version}",
+    "clientBuild": "devmanager/{version}",
+    "hostBuild": "devmanager-host/{version}",
+    "ctlBuild": "devmanager-host-ctl/{version}",
+    "notes": "Final shipping client identity is always devmanager/<semver>. Host and ctl identities share the same semver and protocol major/minor; package surfaces must not preserve a development next/legacy prefix."
+  },
   "protocol": {
     "major": 1,
     "minor": 0,
     "source": "src/protocol/capabilities.rs"
   },
+  "binariesDir": "target/release",
   "binaries": [
     {
       "name": "devmanager",
@@ -42,6 +50,13 @@
     "assets",
     "third_party/ghostty"
   ],
+  "webview2": {
+    "windowsExpectation": "Evergreen WebView2 Runtime required for wry/webview2-com browser surfaces",
+    "dependencyCrates": [
+      "wry",
+      "webview2-com"
+    ]
+  },
   "excludes": [
     ".worktrees",
     "target",
@@ -55,7 +70,8 @@
     "config.json",
     ".env",
     "secrets",
-    "Portal"
+    "Portal",
+    "zz-archive"
   ],
   "hostCtlSmoke": [
     "ctl",
@@ -71,5 +87,71 @@
   ],
   "beforePackagingCommand": "cargo build --release --bin devmanager --bin devmanager-host",
   "updaterManifest": "latest.json",
-  "notes": "SQLite/FTS and prompt-diff behavior ship only through application binaries; no user prompt database or organization content is packaged."
+  "updaterManifestRequiredFields": [
+    "version",
+    "notes",
+    "pub_date",
+    "identity",
+    "protocol",
+    "platforms"
+  ],
+  "platformRequiredFields": [
+    "format",
+    "signature",
+    "url",
+    "sha256"
+  ],
+  "publication": {
+    "mode": "manual-approval",
+    "environment": "release-publish",
+    "autoPublishPublic": false,
+    "packagingIndependentFromPublication": true,
+    "requiresExplicitTagInput": true
+  },
+  "provenance": {
+    "similar": {
+      "name": "similar",
+      "requiredVersion": "3.1.2",
+      "requiredOnlyIfLocked": true
+    },
+    "selectedCrypto": [
+      { "name": "rustls", "version": "0.23.37", "direct": true },
+      { "name": "ring", "version": "0.17.14", "direct": false },
+      { "name": "rcgen", "version": "0.13.2", "direct": true },
+      { "name": "sha2", "version": "0.10.9", "direct": true },
+      { "name": "hmac", "version": "0.12.1", "direct": true },
+      { "name": "zeroize", "version": "1.8.2", "direct": true },
+      { "name": "web-push-native", "version": "0.4.0", "direct": true },
+      { "name": "getrandom", "version": "0.3.4", "direct": true },
+      { "name": "base64", "version": "0.22.1", "direct": true }
+    ],
+    "requiredDirect": [
+      { "name": "gpui", "version": "0.2.2" },
+      { "name": "gpui-component", "version": "0.5.1" },
+      { "name": "rusqlite", "version": "0.39.0" }
+    ]
+  },
+  "staleReferenceScan": {
+    "scanRoots": [
+      "src",
+      "tests",
+      "docs",
+      "scripts",
+      "packaging",
+      "README.md",
+      "AGENTS.md",
+      "THIRD_PARTY_NOTICES.md",
+      ".github/workflows"
+    ],
+    "historicalAllowlistFile": "packaging/stale-reference-historical-allowlist.txt",
+    "forbiddenPatterns": [
+      "devmanager-next",
+      "#[tauri::command]",
+      "tauri::command",
+      "session.json",
+      "src/sessions/",
+      "web/src/sessions/"
+    ]
+  },
+  "notes": "SQLite/FTS and prompt-diff behavior ship only through application binaries; no user prompt database or organization content is packaged. similar 3.1.2 is required only when present in Cargo.lock after dependency union."
 }

@@ -101,7 +101,8 @@ icons = [
     "packaging/icons/devmanager.ico",
 ]
 resources = ["assets", "third_party/ghostty"]
-long-description = "DevManager ships one product with sibling binaries: the native GPUI desktop client (devmanager) and the durable local execution host (devmanager-host). They share semantic version, build, and protocol identity. Packages exclude worktrees, target/evidence trees, test fixtures, session.json, development profiles, Portal proprietary trees, and secrets. User prompt databases and organization content are never packaged."
+long-description = "DevManager ships one product with sibling binaries: the native GPUI desktop client (devmanager) and the durable local execution host (devmanager-host). They share semantic version, build, and protocol identity. Packages exclude worktrees, target/evidence trees, test fixtures, session.json, development profiles, Portal proprietary trees, zz-archive, and secrets. User prompt databases and organization content are never packaged."
+binaries-dir = "target/release"
 out-dir = "dist/packager"
 publisher = "UserFirst"
 

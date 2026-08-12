@@ -78,6 +78,14 @@ fn validate_manifest(manifest: &Value, contract: &Value, version: &str) -> Resul
         ));
     }
 
+    let expected_identity = format!("devmanager/{version}");
+    if manifest["identity"].as_str() != Some(expected_identity.as_str()) {
+        return Err(format!(
+            "manifest identity {:?} != {expected_identity}",
+            manifest["identity"]
+        ));
+    }
+
     let protocol = &contract["protocol"];
     if manifest["protocol"]["major"] != protocol["major"]
         || manifest["protocol"]["minor"] != protocol["minor"]
@@ -122,6 +130,21 @@ fn validate_manifest(manifest: &Value, contract: &Value, version: &str) -> Resul
         if binary["productName"].as_str() != Some(product) {
             return Err(format!("binary {name} productName must be {product}"));
         }
+        let expected_build = if name == "devmanager" {
+            format!("devmanager/{version}")
+        } else if name == "devmanager-host" {
+            format!("devmanager-host/{version}")
+        } else {
+            String::new()
+        };
+        if !expected_build.is_empty()
+            && binary["buildIdentity"].as_str() != Some(expected_build.as_str())
+        {
+            return Err(format!(
+                "binary {name} buildIdentity {:?} != {expected_build}",
+                binary["buildIdentity"]
+            ));
+        }
     }
 
     for expected_binary in expected {
@@ -162,6 +185,14 @@ fn validate_manifest(manifest: &Value, contract: &Value, version: &str) -> Resul
         return Err("manifest must not include next/legacy development binaries".into());
     }
 
+    if !manifest["webview2"]["windowsExpectation"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("WebView2")
+    {
+        return Err("manifest must declare WebView2 expectation".into());
+    }
+
     Ok(())
 }
 
@@ -173,8 +204,26 @@ fn package_contract_source_declares_sibling_client_and_host_only() {
 
     assert_eq!(contract["productName"], "DevManager");
     assert_eq!(contract["identifier"], "com.userfirst.devmanager");
+    assert_eq!(contract["binariesDir"], "target/release");
     assert_eq!(contract["protocol"]["major"], 1);
     assert_eq!(contract["protocol"]["minor"], 0);
+    assert_eq!(
+        contract["shippingIdentity"]["format"],
+        "devmanager/{version}"
+    );
+    assert_eq!(
+        contract["shippingIdentity"]["clientBuild"],
+        "devmanager/{version}"
+    );
+    assert_eq!(contract["publication"]["autoPublishPublic"], false);
+    assert_eq!(contract["publication"]["requiresExplicitTagInput"], true);
+    assert!(
+        !contract["shippingIdentity"]["clientBuild"]
+            .as_str()
+            .unwrap()
+            .contains("next"),
+        "package tests must not preserve devmanager-next shipping identity"
+    );
 
     let before = contract["beforePackagingCommand"]
         .as_str()
@@ -183,6 +232,7 @@ fn package_contract_source_declares_sibling_client_and_host_only() {
         cargo.contains(&format!("before-packaging-command = \"{before}\"")),
         "Cargo.toml before-packaging-command must build both shipping binaries once"
     );
+    assert!(cargo.contains("binaries-dir = \"target/release\""));
     assert!(before.contains("--bin devmanager"));
     assert!(before.contains("--bin devmanager-host"));
     assert!(!before.contains("devmanager-next"));
@@ -207,15 +257,25 @@ fn package_contract_source_declares_sibling_client_and_host_only() {
     for required in [
         ".worktrees",
         "target",
+        "evidence",
+        "tests/fixtures",
         "session.json",
         "dev-profile",
         "devmanager-next",
         "Portal",
         "secrets",
+        "zz-archive",
     ] {
         assert!(
             exclusions.lines().any(|line| line.trim() == required),
             "exclusions.txt must list {required}"
+        );
+    }
+    for required in contract["excludes"].as_array().expect("excludes") {
+        let token = required.as_str().expect("exclude token");
+        assert!(
+            exclusions.lines().any(|line| line.trim() == token),
+            "exclusions.txt must list contract exclude {token}"
         );
     }
 
@@ -226,6 +286,18 @@ fn package_contract_source_declares_sibling_client_and_host_only() {
         version,
         cargo_package_version(&cargo),
         "semantic version identity must stay single-sourced from Cargo.toml"
+    );
+
+    assert!(
+        contract["webview2"]["windowsExpectation"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("WebView2"),
+        "contract must declare WebView2 expectation"
+    );
+    assert_eq!(
+        contract["hostCtlSmoke"],
+        serde_json::json!(["ctl", "actions", "--json"])
     );
 }
 
@@ -249,7 +321,7 @@ fn package_contract_windows_metadata_is_stamped_per_shipping_binary() {
     assert!(build_rs.contains("DevManager Host"));
     assert!(build_rs.contains("devmanager-host.exe"));
     assert!(build_rs.contains("OriginalFilename"));
-    assert!(build_rs.contains("rustc-link-arg-bin="));
+    assert!(build_rs.contains("DEVMANAGER_SHIPPING_IDENTITY"));
 
     let client = &contract["binaries"][0]["windows"];
     let host = &contract["binaries"][1]["windows"];
@@ -298,13 +370,19 @@ fn package_docs_and_workflows_describe_one_product_two_binaries_without_next_ide
     let readme = read(&repo_root().join("README.md"));
     assert!(readme.contains("devmanager.exe"));
     assert!(readme.contains("devmanager-host.exe"));
+    assert!(readme.contains("devmanager/"));
     assert!(
         !readme.contains("devmanager-next.exe"),
         "README must not advertise the development-only next binary as the product"
     );
+    assert!(
+        readme.contains("manual approval") || readme.contains("release-publish"),
+        "README must describe protected/manual publication"
+    );
 
     let architecture = read(&repo_root().join("docs/architecture.md"));
     assert!(architecture.contains("devmanager-host"));
+    assert!(architecture.contains("devmanager/"));
     assert!(architecture.contains("GPUI"));
 
     let connect = read(&repo_root().join("docs/connect.md"));
@@ -314,10 +392,15 @@ fn package_docs_and_workflows_describe_one_product_two_binaries_without_next_ide
     let checklist = read(&repo_root().join("docs/release-checklist.md"));
     assert!(checklist.contains("latest.json"));
     assert!(checklist.contains("devmanager-host"));
+    assert!(checklist.contains("sha256") || checklist.contains("immutable"));
+    assert!(checklist.contains("release-publish") || checklist.contains("manual"));
 
     let release = read(&repo_root().join(".github/workflows/release.yml"));
     assert!(release.contains("Assert-PackageContract.ps1"));
     assert!(release.contains("latest.json"));
+    assert!(release.contains("verify-packager-signatures"));
+    assert!(release.contains("cargo metadata --format-version 1 --locked"));
+    assert!(release.contains("environment: release-publish"));
     assert!(
         release.contains("CARGO_PACKAGER_SIGN_PRIVATE_KEY"),
         "release workflow must preserve signed updater artifact generation"
@@ -331,5 +414,33 @@ fn package_docs_and_workflows_describe_one_product_two_binaries_without_next_ide
     assert!(
         notices.to_lowercase().contains("sqlite") || notices.contains("rusqlite"),
         "third-party notices must cover SQLite via rusqlite"
+    );
+    assert!(
+        notices.contains("similar")
+            && (notices.contains("NOT_LOCKED") || notices.contains("3.1.2")),
+        "third-party notices must cover similar 3.1.2 conditionally on lock membership"
+    );
+    assert!(
+        notices.contains("0.23.37") && notices.contains("rustls"),
+        "third-party notices must cover exact locked rustls"
+    );
+    assert!(
+        release.contains("recompute") || release.contains("recomputed"),
+        "publish must recompute artifact hashes before publication"
+    );
+    assert!(
+        release.contains("inputs.tag_name") || release.contains("steps.selected.outputs.tag_name"),
+        "publish must require an explicit selected draft tag"
+    );
+    assert!(
+        !release
+            .split("\n  publish:")
+            .nth(1)
+            .expect("publish job")
+            .split("\n    steps:")
+            .next()
+            .expect("publish header")
+            .contains("needs:"),
+        "publish job must remain independent from stage/prepare"
     );
 }

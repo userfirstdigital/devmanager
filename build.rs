@@ -1,6 +1,7 @@
 #[cfg(target_os = "windows")]
 fn main() {
     emit_preview_build_identity();
+    emit_shipping_build_identity();
     validate_web_bundle();
     stamp_windows_binaries();
 }
@@ -8,6 +9,7 @@ fn main() {
 #[cfg(not(target_os = "windows"))]
 fn main() {
     emit_preview_build_identity();
+    emit_shipping_build_identity();
     validate_web_bundle();
 }
 
@@ -21,6 +23,18 @@ fn emit_preview_build_identity() {
     }
     println!("cargo:rustc-env=DEV_MANAGER_PREVIEW_BUILD_IDENTITY={identity}");
     println!("cargo:rerun-if-env-changed=DEV_MANAGER_PREVIEW_BUILD_IDENTITY");
+}
+
+fn emit_shipping_build_identity() {
+    let version = std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".to_string());
+    let shipping = format!("devmanager/{version}");
+    let host = format!("devmanager-host/{version}");
+    let ctl = format!("devmanager-host-ctl/{version}");
+    println!("cargo:rustc-env=DEVMANAGER_SHIPPING_IDENTITY={shipping}");
+    println!("cargo:rustc-env=DEVMANAGER_HOST_BUILD_IDENTITY={host}");
+    println!("cargo:rustc-env=DEVMANAGER_CTL_BUILD_IDENTITY={ctl}");
+    println!("cargo:rerun-if-env-changed=CARGO_PKG_VERSION");
+    println!("cargo:rerun-if-changed=packaging/package-contract.json");
 }
 
 #[cfg(target_os = "windows")]

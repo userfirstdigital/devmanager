@@ -106,7 +106,7 @@ fn release_verify_installs_rustfmt_before_running_cargo_fmt() {
 }
 
 #[test]
-fn release_packaging_runs_independently_of_verify_but_publish_requires_verify() {
+fn release_packaging_runs_independently_of_verify_but_stage_requires_verify() {
     let workflow = fs::read_to_string(release_workflow_path()).expect("read release workflow");
     let prepare_job = workflow
         .split("\n  prepare:")
@@ -116,16 +116,25 @@ fn release_packaging_runs_independently_of_verify_but_publish_requires_verify() 
     let build_job = workflow
         .split("\n  build:")
         .nth(1)
-        .and_then(|tail| tail.split("\n  release:").next())
-        .expect("build job should precede release");
-    let release_job = workflow
-        .split("\n  release:")
+        .and_then(|tail| tail.split("\n  stage:").next())
+        .expect("build job should precede stage");
+    let stage_job = workflow
+        .split("\n  stage:")
         .nth(1)
-        .expect("release job should exist");
-    let release_header = release_job
+        .and_then(|tail| tail.split("\n  publish:").next())
+        .expect("stage job should precede publish");
+    let stage_header = stage_job
         .split("\n    steps:")
         .next()
-        .expect("release job should declare steps");
+        .expect("stage job should declare steps");
+    let publish_job = workflow
+        .split("\n  publish:")
+        .nth(1)
+        .expect("publish job should exist");
+    let publish_header = publish_job
+        .split("\n    steps:")
+        .next()
+        .expect("publish job should declare steps");
 
     assert!(
         !prepare_job.contains("needs: verify") && !prepare_job.contains("needs: [verify"),
@@ -140,20 +149,34 @@ fn release_packaging_runs_independently_of_verify_but_publish_requires_verify() 
         "build must still wait for version preparation"
     );
     assert!(
-        release_header.contains("needs: [verify, prepare, build]")
-            || release_header.contains("needs: [prepare, build, verify]")
-            || release_header.contains("needs: [build, verify, prepare]")
-            || release_header.contains("needs: [verify, build, prepare]")
-            || release_header.contains("needs: [prepare, verify, build]")
-            || release_header.contains("needs: [build, prepare, verify]"),
-        "release publication must require verify, prepare, and build together"
+        stage_header.contains("needs: [verify, prepare, build]")
+            || stage_header.contains("needs: [prepare, build, verify]")
+            || stage_header.contains("needs: [build, verify, prepare]")
+            || stage_header.contains("needs: [verify, build, prepare]")
+            || stage_header.contains("needs: [prepare, verify, build]")
+            || stage_header.contains("needs: [build, prepare, verify]"),
+        "stage must require verify, prepare, and build together"
+    );
+    assert!(
+        !publish_header.contains("needs:"),
+        "publish must be an independent protected job that does not need stage/prepare outputs"
+    );
+    assert!(
+        publish_job.contains("inputs.tag_name")
+            || publish_job.contains("TAG_NAME: ${{ inputs.tag_name }}")
+            || publish_job.contains("TAG_NAME: ${{ steps.selected.outputs.tag_name }}"),
+        "publish must promote an explicitly selected existing draft tag input"
+    );
+    assert!(
+        publish_job.contains("recompute") || publish_job.contains("recomputed"),
+        "publish must recompute artifact hashes and compare latest.json"
     );
     assert!(
         build_job.contains("platform: windows-x86_64")
             && build_job.contains("formats: nsis,wix")
-            && release_job.contains("\"*_x64-setup.exe\"")
-            && release_job.contains("\"*.msi\""),
-        "Windows x64 NSIS EXE and WiX MSI assets must remain mandatory in packaging and publish"
+            && stage_job.contains("\"*_x64-setup.exe\"")
+            && stage_job.contains("\"*.msi\""),
+        "Windows x64 NSIS EXE and WiX MSI assets must remain mandatory in packaging and stage"
     );
 }
 
@@ -163,8 +186,8 @@ fn release_build_reuses_the_tracked_fingerprinted_web_bundle() {
     let build_job = workflow
         .split("\n  build:")
         .nth(1)
-        .and_then(|tail| tail.split("\n  release:").next())
-        .expect("build job should precede release");
+        .and_then(|tail| tail.split("\n  stage:").next())
+        .expect("build job should precede stage");
 
     assert!(build_job.contains("cargo test remote::web::assets --lib"));
     assert!(
@@ -179,8 +202,8 @@ fn release_windows_build_exports_the_installed_nsis_directory() {
     let build_job = workflow
         .split("\n  build:")
         .nth(1)
-        .and_then(|tail| tail.split("\n  release:").next())
-        .expect("build job should precede release");
+        .and_then(|tail| tail.split("\n  stage:").next())
+        .expect("build job should precede stage");
     let nsis_install = build_job
         .split("- name: Install NSIS")
         .nth(1)
@@ -202,7 +225,7 @@ fn release_draft_id_is_resolved_from_the_authenticated_release_list() {
         .split("- name: Create draft release and upload assets")
         .nth(1)
         .and_then(|tail| tail.split("\n      - name:").next())
-        .expect("release job should create a draft release");
+        .expect("stage job should create a draft release");
 
     assert!(draft_step.contains("repos/${REPO}/releases?per_page=100"));
     assert!(draft_step.contains(".draft == true"));
