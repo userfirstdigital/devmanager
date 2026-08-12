@@ -30,7 +30,7 @@ use sha2::{Digest, Sha256};
 use std::fmt;
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{atomic::AtomicU64, Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const HOOK_TRUST_FLAG: &str = "--dangerously-bypass-hook-trust";
@@ -72,6 +72,7 @@ pub struct CodexAdapter {
     runner: Arc<dyn ProviderProbeRunner>,
     probed: Arc<Mutex<Option<ProbedCodexSurface>>>,
     pinned: Arc<Mutex<Option<ProviderExecutable>>>,
+    attestation_generation: AtomicU64,
 }
 
 impl CodexAdapter {
@@ -80,6 +81,7 @@ impl CodexAdapter {
             runner,
             probed: Arc::new(Mutex::new(None)),
             pinned: Arc::new(Mutex::new(None)),
+            attestation_generation: AtomicU64::new(0),
         }
     }
 
@@ -111,6 +113,7 @@ impl CodexAdapter {
             .pinned
             .lock()
             .map_err(|_| dependency(ProviderCapability::BuildLaunch))?;
+        self.bump_attestation_generation()?;
         let mut probed = self
             .probed
             .lock()
@@ -120,60 +123,132 @@ impl CodexAdapter {
         Ok(())
     }
 
+    fn begin_attestation(&self, identity: &ProviderExecutable) -> Result<u64, ProviderError> {
+        let mut pinned = self
+            .pinned
+            .lock()
+            .map_err(|_| dependency(ProviderCapability::BuildLaunch))?;
+        let generation = self.bump_attestation_generation()?;
+        let mut probed = self
+            .probed
+            .lock()
+            .map_err(|_| dependency(ProviderCapability::BuildLaunch))?;
+        // A probe is an attestation epoch, even when path and digest are
+        // unchanged. Clear the prior surface before the first probe command
+        // so a stale concurrent probe cannot publish usable capabilities.
+        *probed = None;
+        *pinned = Some(identity.clone());
+        Ok(generation)
+    }
+
+    fn bump_attestation_generation(&self) -> Result<u64, ProviderError> {
+        let previous = self
+            .attestation_generation
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |generation| generation.checked_add(1),
+            )
+            .map_err(|_| dependency(ProviderCapability::BuildLaunch))?;
+        Ok(previous + 1)
+    }
+
+    fn publish_attestation(
+        &self,
+        identity: &ProviderExecutable,
+        generation: u64,
+        surface: ProbedCodexSurface,
+    ) -> Result<(), ProviderError> {
+        let pinned = self
+            .pinned
+            .lock()
+            .map_err(|_| dependency(ProviderCapability::BuildLaunch))?;
+        if pinned.as_ref() != Some(identity)
+            || self
+                .attestation_generation
+                .load(std::sync::atomic::Ordering::Acquire)
+                != generation
+        {
+            return Err(dependency(ProviderCapability::BuildLaunch));
+        }
+        let mut probed = self
+            .probed
+            .lock()
+            .map_err(|_| dependency(ProviderCapability::BuildLaunch))?;
+        *probed = Some(surface);
+        Ok(())
+    }
+
     async fn probe_attested(
         &self,
         identity: &ProviderExecutable,
     ) -> Result<ProviderCapabilities, ProviderError> {
-        {
-            let mut pinned = self
-                .pinned
-                .lock()
-                .map_err(|_| dependency(ProviderCapability::BuildLaunch))?;
-            let mut probed = self
-                .probed
-                .lock()
-                .map_err(|_| dependency(ProviderCapability::BuildLaunch))?;
-            // A reprobe is a new attestation, even when the path and digest
-            // are unchanged. Never leave a prior capability surface usable
-            // while a current-generation probe is in flight or failed.
-            *probed = None;
-            *pinned = Some(identity.clone());
-        }
+        let generation = self.begin_attestation(identity)?;
 
         let executable = identity.canonical_path();
         let version_request =
             attested_probe_request(ProviderProbeRequest::version(executable), identity)?;
         require_request_identity(&version_request, identity)?;
         let version_result = self.runner.run(version_request).await?;
-        require_pinned(&self.pinned, identity)?;
+        require_attestation(
+            &self.pinned,
+            &self.attestation_generation,
+            generation,
+            identity,
+        )?;
         require_clean_completion(&version_result)?;
         let version = ProviderVersion::from_probe_output(version_result.stdout())?;
 
         let help_request =
             attested_probe_request(ProviderProbeRequest::help(executable), identity)?;
         require_request_identity(&help_request, identity)?;
-        require_pinned(&self.pinned, identity)?;
+        require_attestation(
+            &self.pinned,
+            &self.attestation_generation,
+            generation,
+            identity,
+        )?;
         let help_result = self.runner.run(help_request).await?;
-        require_pinned(&self.pinned, identity)?;
+        require_attestation(
+            &self.pinned,
+            &self.attestation_generation,
+            generation,
+            identity,
+        )?;
         require_clean_completion(&help_result)?;
         let help = classified_text(help_result.stdout()).unwrap_or("");
 
         let resume_request =
             attested_probe_request(ProviderProbeRequest::resume_help(executable), identity)?;
         require_request_identity(&resume_request, identity)?;
-        require_pinned(&self.pinned, identity)?;
+        require_attestation(
+            &self.pinned,
+            &self.attestation_generation,
+            generation,
+            identity,
+        )?;
         let exact_resume = match self.runner.run(resume_request).await {
             Ok(result) if is_clean_completion(&result) => {
                 support(resume_help_supports_exact_id(result.stdout()))
             }
             _ => CapabilitySupport::Unsupported,
         };
-        require_pinned(&self.pinned, identity)?;
+        require_attestation(
+            &self.pinned,
+            &self.attestation_generation,
+            generation,
+            identity,
+        )?;
 
         let login_request =
             attested_probe_request(ProviderProbeRequest::login_status(executable), identity)?;
         require_request_identity(&login_request, identity)?;
-        require_pinned(&self.pinned, identity)?;
+        require_attestation(
+            &self.pinned,
+            &self.attestation_generation,
+            generation,
+            identity,
+        )?;
         if login_request.kind() != crate::providers::adapter::ProviderProbeKind::LoginStatus
             || login_request.arguments() != ["login", "status"]
         {
@@ -182,7 +257,12 @@ impl CodexAdapter {
             )));
         }
         let login_result = self.runner.run(login_request).await?;
-        require_pinned(&self.pinned, identity)?;
+        require_attestation(
+            &self.pinned,
+            &self.attestation_generation,
+            generation,
+            identity,
+        )?;
         require_clean_completion(&login_result)?;
         let (auth_state, auth_status) = classify_login_status(login_result.stdout());
 
@@ -246,16 +326,16 @@ impl CodexAdapter {
             evidence,
         };
         capabilities.validate()?;
-        require_pinned(&self.pinned, identity)?;
-        *self
-            .probed
-            .lock()
-            .map_err(|_| dependency(ProviderCapability::BuildLaunch))? = Some(ProbedCodexSurface {
-            identity: identity.clone(),
-            capabilities: capabilities.clone(),
-            hooks_advertised,
-            semantic_state,
-        });
+        self.publish_attestation(
+            identity,
+            generation,
+            ProbedCodexSurface {
+                identity: identity.clone(),
+                capabilities: capabilities.clone(),
+                hooks_advertised,
+                semantic_state,
+            },
+        )?;
         Ok(capabilities)
     }
 
@@ -781,6 +861,28 @@ fn require_pinned(
             after: identity.clone(),
         }),
         None => Err(dependency(ProviderCapability::BuildLaunch)),
+    }
+}
+
+fn require_attestation(
+    pinned: &Mutex<Option<ProviderExecutable>>,
+    generation: &AtomicU64,
+    expected_generation: u64,
+    identity: &ProviderExecutable,
+) -> Result<(), ProviderError> {
+    let current = pinned
+        .lock()
+        .map_err(|_| dependency(ProviderCapability::BuildLaunch))?
+        .clone();
+    match current {
+        Some(current) if current != *identity => Err(ProviderError::ExecutableChanged {
+            before: current,
+            after: identity.clone(),
+        }),
+        Some(_) if generation.load(std::sync::atomic::Ordering::Acquire) == expected_generation => {
+            Ok(())
+        }
+        _ => Err(dependency(ProviderCapability::BuildLaunch)),
     }
 }
 

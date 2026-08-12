@@ -783,6 +783,40 @@ async fn codex_public_probe_inspection_failure_quarantines_previous_capabilities
     ));
 }
 
+#[test]
+fn codex_attestation_generation_fences_stale_probe_publication() {
+    let adapter = CodexAdapter::new(ScriptedProbeRunner::ok(
+        VERSION,
+        HELP,
+        RESUME_HELP,
+        LOGIN_CHATGPT,
+    ));
+    let identity = fixture_executable();
+    let first = adapter.begin_attestation(&identity).expect("first epoch");
+    let second = adapter
+        .begin_attestation(&identity)
+        .expect("replacement epoch");
+
+    assert!(matches!(
+        require_attestation(
+            &adapter.pinned,
+            &adapter.attestation_generation,
+            first,
+            &identity,
+        ),
+        Err(ProviderError::DependencyUnavailable {
+            capability: crate::providers::capabilities::ProviderCapability::BuildLaunch
+        })
+    ));
+    assert!(require_attestation(
+        &adapter.pinned,
+        &adapter.attestation_generation,
+        second,
+        &identity,
+    )
+    .is_ok());
+}
+
 #[tokio::test]
 async fn codex_bind_first_rechecks_current_generation_atomically() {
     let adapter = probed(HELP, RESUME_HELP, LOGIN_CHATGPT).await;
