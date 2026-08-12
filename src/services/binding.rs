@@ -1,9 +1,11 @@
 //! Bind `config.json` run commands to validated service definitions.
 //!
 //! Environment *values* never enter [`CommandSpec`]. They stay in a redacted
-//! overlay that is applied only at managed-launch time.
+//! overlay that is applied only at managed-launch time. Caller-supplied cwd and
+//! env maps are not trusted; cwd and env layering come from project/folder/
+//! command config (plus an optional host-resolved folder env-file overlay).
 
-use std::{collections::BTreeMap, fmt};
+use std::{collections::BTreeMap, fmt, path::Path};
 
 use crate::{
     config::{Nullable, Project, ProjectFolder, RunCommand},
@@ -122,14 +124,16 @@ impl From<ValidationError> for BindingError {
     }
 }
 
+/// Authoritative binding inputs. Cwd is derived from project/folder paths;
+/// `folder_env_file` may only carry host-resolved values for the folder's
+/// configured env-file path.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConfiguredServiceSource<'a> {
     pub project: &'a Project,
     pub folder: &'a ProjectFolder,
     pub command: &'a RunCommand,
     pub owner: ConfiguredServiceOwner,
-    pub workspace_cwd: Option<&'a str>,
-    pub workspace_env: &'a BTreeMap<String, String>,
+    pub folder_env_file: Option<&'a BTreeMap<String, String>>,
 }
 
 pub fn bind_configured_command(
@@ -142,12 +146,14 @@ pub fn bind_configured_command(
     let scope = source.owner.catalog_scope();
     let mut command = CommandSpec::new(source.command.command.clone())?;
     command = command.with_args(source.command.args.iter().cloned())?;
-    if let Some(cwd) = source.workspace_cwd {
+    if let Some(cwd) = derive_workspace_cwd(source.project, source.folder) {
         command = command.with_cwd(cwd)?;
     }
 
     let mut overlay = BTreeMap::new();
-    layer_env(&mut overlay, source.workspace_env)?;
+    if let Some(folder_env) = source.folder_env_file {
+        layer_env(&mut overlay, folder_env)?;
+    }
     if let Nullable::Value(command_env) = &source.command.env {
         layer_env(&mut overlay, command_env)?;
     }
@@ -232,6 +238,49 @@ pub fn bind_configured_services(
         bindings.push(binding);
     }
     Ok(bindings)
+}
+
+fn derive_workspace_cwd(project: &Project, folder: &ProjectFolder) -> Option<String> {
+    let folder_path = folder.folder_path.trim();
+    if folder_path.is_empty() {
+        return None;
+    }
+    if !is_absolute_path(folder_path) {
+        return Some(normalize_relative(folder_path));
+    }
+    let root = project.root_path.trim();
+    if root.is_empty() {
+        return None;
+    }
+    strip_root_prefix(folder_path, root).map(|relative| normalize_relative(&relative))
+}
+
+fn is_absolute_path(path: &str) -> bool {
+    Path::new(path).is_absolute()
+        || path.starts_with('/')
+        || path.starts_with('\\')
+        || path.chars().nth(1) == Some(':')
+}
+
+fn strip_root_prefix(path: &str, root: &str) -> Option<String> {
+    let path_norm = path.replace('\\', "/").trim_end_matches('/').to_owned();
+    let root_norm = root.replace('\\', "/").trim_end_matches('/').to_owned();
+    let prefix = format!("{root_norm}/");
+    path_norm
+        .strip_prefix(&prefix)
+        .or_else(|| {
+            let root_lower = root_norm.to_ascii_lowercase();
+            let path_lower = path_norm.to_ascii_lowercase();
+            path_lower
+                .strip_prefix(&format!("{root_lower}/"))
+                .map(|_| &path_norm[root_norm.len() + 1..])
+        })
+        .map(|relative| relative.to_owned())
+        .filter(|relative| !relative.is_empty())
+}
+
+fn normalize_relative(path: &str) -> String {
+    path.replace('\\', "/").trim_matches('/').to_owned()
 }
 
 fn layer_env(

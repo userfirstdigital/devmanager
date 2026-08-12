@@ -661,3 +661,25 @@ fn catalog_decode_preflights_malicious_field_names_arrays_and_depth() {
         + &"]".repeat(MAX_SERVICE_CATALOG_JSON_DEPTH + 1);
     assert!(ServiceCatalog::decode_json(nested.as_bytes()).is_err());
 }
+
+#[test]
+fn public_supervisor_api_exposes_production_authority_without_private_errors() {
+    use devmanager::services::{
+        HostManagedLaunchAuthority, ManagedLaunchAuthority, ManagedLaunchStage, SupervisorError,
+        SupervisorRefusal,
+    };
+    use devmanager::ui::{project_services_panel, ServicePanelTone};
+
+    let authority = HostManagedLaunchAuthority::new();
+    assert_eq!(ManagedLaunchAuthority::live_count(&authority), 0);
+    assert_eq!(ManagedLaunchAuthority::residue_count(&authority), 0);
+    let _ = ManagedLaunchStage::Prepare;
+    let refusal = SupervisorError::Refused(SupervisorRefusal::External);
+    assert!(!format!("{refusal}").contains("AdmissionRejection"));
+    let panel = project_services_panel(&[], &[]);
+    assert!(panel.rows.is_empty());
+    assert_eq!(
+        ServicePanelTone::from(devmanager::services::StatusTone::Green),
+        ServicePanelTone::Green
+    );
+}

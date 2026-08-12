@@ -20,6 +20,7 @@ use crate::{
             LifecycleAxis, OwnershipAxis, PortAxis, ProbeOutcome, ProcessAxis,
             RedactedServiceSnapshot, ServiceEvidence, ServiceState,
         },
+        launch_authority::HostManagedLaunchAuthority,
         model::{
             ActionEpoch, ActiveOperation, AdmissionDecision, AdmissionFence, AdmissionRejection,
             AdmissionRequest, AdmissionRequester, AdmissionSnapshot, HostId, LaunchIntent,
@@ -104,16 +105,32 @@ pub struct RedactedSupervisorEvent {
     pub observed_at_ms: u64,
 }
 
+/// Public refusal class. Admission internals stay crate-private.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SupervisorRefusal {
+    StaleFence,
+    Ownership,
+    External,
+    Dependency,
+    OperationInProgress,
+    AlreadyRunning,
+    AlreadyStopped,
+    EvidenceUnknown,
+    TaskClosing,
+    Other,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SupervisorError {
     UnknownService(ServiceId),
     Binding(ValidationError),
-    Refused(AdmissionRejection),
+    Refused(SupervisorRefusal),
     StaleGeneration { expected: u64, received: u64 },
     Launch { stage: ManagedLaunchStage },
     PortBusy { port: u16 },
     ExternalPort { port: u16 },
     ProbeHotPath,
+    TeardownFailed,
 }
 
 impl fmt::Display for SupervisorError {
@@ -127,6 +144,7 @@ impl fmt::Display for SupervisorError {
             Self::PortBusy { port } => write!(formatter, "port {port} is reserved"),
             Self::ExternalPort { port } => write!(formatter, "port {port} is externally owned"),
             Self::ProbeHotPath => formatter.write_str("probe executed on the hot path"),
+            Self::TeardownFailed => formatter.write_str("managed teardown failed"),
         }
     }
 }
@@ -174,7 +192,7 @@ impl fmt::Debug for ManagedLaunchSpec {
     }
 }
 
-pub(crate) trait ManagedLaunchAuthority {
+pub trait ManagedLaunchAuthority {
     type Pending;
     type Live;
 
@@ -187,15 +205,26 @@ pub(crate) trait ManagedLaunchAuthority {
         pending: Self::Pending,
     ) -> Result<Self::Pending, SupervisorError>;
     fn resume(&mut self, pending: Self::Pending) -> Result<Self::Live, SupervisorError>;
-    fn teardown(&mut self, live: Self::Live, fence: ResourceFence) -> Result<(), SupervisorError>;
+    /// Exact Job teardown. On failure the live handle must be restored into
+    /// `live` so the caller can retry; never raw-PID kill.
+    fn teardown(
+        &mut self,
+        live: &mut Option<Self::Live>,
+        fence: ResourceFence,
+    ) -> Result<(), SupervisorError>;
     fn live_count(&self) -> usize;
     fn residue_count(&self) -> usize;
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum PortClaim {
-    Reserved { generation: u64 },
-    External { owner_pid: Option<u32> },
+    Reserved {
+        service_id: ServiceId,
+        generation: u64,
+    },
+    External {
+        owner_pid: Option<u32>,
+    },
 }
 
 struct ServiceRuntime<A: ManagedLaunchAuthority> {
@@ -211,7 +240,7 @@ struct ServiceRuntime<A: ManagedLaunchAuthority> {
     log_truncated: bool,
 }
 
-pub(crate) struct ServiceSupervisor<A: ManagedLaunchAuthority> {
+pub struct ServiceSupervisor<A: ManagedLaunchAuthority> {
     catalog: ServiceCatalog,
     snapshot: AdmissionSnapshot,
     host_id: HostId,
@@ -223,6 +252,9 @@ pub(crate) struct ServiceSupervisor<A: ManagedLaunchAuthority> {
     events: VecDeque<RedactedSupervisorEvent>,
     probe_executions: usize,
 }
+
+/// Production supervisor bound to the Phase 3 suspended Job/PTY authority.
+pub type ConfiguredServiceSupervisor = ServiceSupervisor<HostManagedLaunchAuthority>;
 
 impl<A: ManagedLaunchAuthority> ServiceSupervisor<A> {
     pub fn from_bindings(
@@ -371,21 +403,27 @@ impl<A: ManagedLaunchAuthority> ServiceSupervisor<A> {
                         })
                     }
                     AdmissionDecision::Refused(rejection) => {
-                        Err(SupervisorError::Refused(rejection))
+                        Err(SupervisorError::Refused(refusal_from(rejection)))
                     }
                     AdmissionDecision::Start(plan) => {
                         plan.revalidate(&self.catalog, &self.snapshot)
-                            .map_err(SupervisorError::Refused)?;
+                            .map_err(|rejection| {
+                                SupervisorError::Refused(refusal_from(rejection))
+                            })?;
                         self.execute_start(plan)
                     }
                     AdmissionDecision::Stop(plan) => {
                         plan.revalidate(&self.catalog, &self.snapshot)
-                            .map_err(SupervisorError::Refused)?;
+                            .map_err(|rejection| {
+                                SupervisorError::Refused(refusal_from(rejection))
+                            })?;
                         self.execute_stop(plan, false)
                     }
                     AdmissionDecision::Restart(plan) => {
                         plan.revalidate(&self.catalog, &self.snapshot)
-                            .map_err(SupervisorError::Refused)?;
+                            .map_err(|rejection| {
+                                SupervisorError::Refused(refusal_from(rejection))
+                            })?;
                         self.execute_stop(plan.stop().clone(), true)?;
                         self.execute_start(plan.start().clone())
                     }
@@ -405,9 +443,9 @@ impl<A: ManagedLaunchAuthority> ServiceSupervisor<A> {
         let plan = self
             .catalog
             .admit_task_close(task_id, epoch, &self.snapshot)
-            .map_err(SupervisorError::Refused)?;
+            .map_err(|rejection| SupervisorError::Refused(refusal_from(rejection)))?;
         plan.revalidate(&self.catalog, &self.snapshot)
-            .map_err(SupervisorError::Refused)?;
+            .map_err(|rejection| SupervisorError::Refused(refusal_from(rejection)))?;
         self.execute_task_close(plan)
     }
 
@@ -437,8 +475,11 @@ impl<A: ManagedLaunchAuthority> ServiceSupervisor<A> {
                 }
             }
             PortAuthority::Free => {
-                if matches!(self.ports.get(&port), Some(PortClaim::External { .. })) {
+                let was_external =
+                    matches!(self.ports.get(&port), Some(PortClaim::External { .. }));
+                if was_external {
                     self.ports.remove(&port);
+                    self.clear_external_for_port(port);
                 }
             }
             PortAuthority::Managed | PortAuthority::Unknown | PortAuthority::ProbeError => {}
@@ -539,13 +580,28 @@ impl<A: ManagedLaunchAuthority> ServiceSupervisor<A> {
                 received: generation,
             });
         }
+        let resource_id = runtime.resource_id;
+        let fence = ResourceFence::new(resource_id, generation);
+        if runtime.live.is_some() {
+            self.authority.teardown(
+                &mut self
+                    .runtimes
+                    .get_mut(service_id)
+                    .ok_or_else(|| SupervisorError::UnknownService(service_id.clone()))?
+                    .live,
+                fence,
+            )?;
+        }
+        let runtime = self
+            .runtimes
+            .get_mut(service_id)
+            .ok_or_else(|| SupervisorError::UnknownService(service_id.clone()))?;
         if let Some(tracker) = runtime.health.as_mut() {
             let _ = tracker.process_exit(self.now_ms, generation);
             runtime.evidence.health = tracker.axis();
         }
         runtime.evidence.lifecycle = LifecycleAxis::Failed;
         runtime.evidence.process = ProcessAxis::Crashed { generation };
-        runtime.live = None;
         runtime.pending = None;
         runtime.operation = None;
         self.release_port_for(service_id, generation);
@@ -644,7 +700,11 @@ impl<A: ManagedLaunchAuthority> ServiceSupervisor<A> {
 
     pub fn port_claim(&self, port: u16) -> Option<PortClaimView> {
         match self.ports.get(&port) {
-            Some(PortClaim::Reserved { generation }) => Some(PortClaimView::Reserved {
+            Some(PortClaim::Reserved {
+                service_id,
+                generation,
+            }) => Some(PortClaimView::Reserved {
+                service_id: service_id.clone(),
                 generation: *generation,
             }),
             Some(PortClaim::External { owner_pid }) => Some(PortClaimView::External {
@@ -715,7 +775,32 @@ impl<A: ManagedLaunchAuthority> ServiceSupervisor<A> {
         fence: &ServiceFence,
         intent: &LaunchIntent,
     ) -> Result<(), SupervisorError> {
-        let generation = fence.resource_generation().get();
+        let admitted_generation = fence.resource_generation().get();
+        let admitted_epoch = fence.action_epoch().get();
+        let runtime = self
+            .runtimes
+            .get(service_id)
+            .ok_or_else(|| SupervisorError::UnknownService(service_id.clone()))?;
+        let current_generation = runtime.evidence.generation;
+        let current_epoch = runtime.evidence.epoch;
+        // Direct start/stop sees an exact fence match. Restart stop advances
+        // first, so start is allowed when current is exactly admitted+1.
+        let restart_continuation = current_generation == admitted_generation.saturating_add(1)
+            && current_epoch == admitted_epoch.saturating_add(1);
+        if current_generation != admitted_generation && !restart_continuation {
+            return Err(SupervisorError::Refused(SupervisorRefusal::StaleFence));
+        }
+        let generation = current_generation
+            .checked_add(1)
+            .ok_or(SupervisorError::Refused(SupervisorRefusal::Other))?;
+        let epoch = current_epoch
+            .checked_add(1)
+            .ok_or(SupervisorError::Refused(SupervisorRefusal::Other))?;
+        if let Some(runtime) = self.runtimes.get_mut(service_id) {
+            runtime.evidence.generation = generation;
+            runtime.evidence.epoch = epoch;
+        }
+
         if let Some(port) = intent.expected_port().map(|port| port.port) {
             match self.ports.get(&port) {
                 Some(PortClaim::External { .. }) => {
@@ -723,8 +808,11 @@ impl<A: ManagedLaunchAuthority> ServiceSupervisor<A> {
                     return Err(SupervisorError::ExternalPort { port });
                 }
                 Some(PortClaim::Reserved {
+                    service_id: owner,
                     generation: claimed,
-                }) if *claimed != generation => {
+                }) if owner != service_id
+                    || (*claimed != current_generation && *claimed != admitted_generation) =>
+                {
                     return Err(SupervisorError::PortBusy { port });
                 }
                 Some(PortClaim::Reserved { .. }) | None => {}
@@ -732,7 +820,13 @@ impl<A: ManagedLaunchAuthority> ServiceSupervisor<A> {
         }
 
         let spec = self.launch_spec(service_id, generation, intent)?;
-        let pending = self.authority.prepare_suspended(&spec)?;
+        let pending = match self.authority.prepare_suspended(&spec) {
+            Ok(pending) => pending,
+            Err(error) => {
+                self.fail_member(service_id, generation);
+                return Err(error);
+            }
+        };
         let runtime = self
             .runtimes
             .get_mut(service_id)
@@ -758,7 +852,13 @@ impl<A: ManagedLaunchAuthority> ServiceSupervisor<A> {
         };
 
         if let Some(port) = intent.expected_port().map(|port| port.port) {
-            self.ports.insert(port, PortClaim::Reserved { generation });
+            self.ports.insert(
+                port,
+                PortClaim::Reserved {
+                    service_id: service_id.clone(),
+                    generation,
+                },
+            );
             self.push_event(
                 Some(service_id.clone()),
                 SupervisorEventKind::PortReserved,
@@ -783,7 +883,7 @@ impl<A: ManagedLaunchAuthority> ServiceSupervisor<A> {
             }
         };
         runtime.evidence.generation = generation;
-        runtime.evidence.epoch = fence.action_epoch().get();
+        runtime.evidence.epoch = epoch;
         runtime.evidence.observed_at_ms = self.now_ms;
         runtime.evidence.port = intent
             .expected_port()
@@ -793,7 +893,7 @@ impl<A: ManagedLaunchAuthority> ServiceSupervisor<A> {
             source: EvidenceSource::ProcessRegistry,
             observed_at_ms: self.now_ms,
             generation: Some(generation),
-            epoch: Some(fence.action_epoch().get()),
+            epoch: Some(epoch),
         };
         if let Some(tracker) = runtime.health.as_mut() {
             tracker.start(self.now_ms, generation).map_err(|_| {
@@ -836,23 +936,42 @@ impl<A: ManagedLaunchAuthority> ServiceSupervisor<A> {
         fence: &ServiceFence,
         for_restart: bool,
     ) -> Result<(), SupervisorError> {
-        let generation = fence.resource_generation().get();
+        let admitted_generation = fence.resource_generation().get();
+        let admitted_epoch = fence.action_epoch().get();
         let runtime = self
             .runtimes
             .get_mut(service_id)
             .ok_or_else(|| SupervisorError::UnknownService(service_id.clone()))?;
+        if runtime.evidence.generation != admitted_generation
+            || runtime.evidence.epoch != admitted_epoch
+        {
+            return Err(SupervisorError::Refused(SupervisorRefusal::StaleFence));
+        }
+        let generation = admitted_generation
+            .checked_add(1)
+            .ok_or(SupervisorError::Refused(SupervisorRefusal::Other))?;
+        let epoch = admitted_epoch
+            .checked_add(1)
+            .ok_or(SupervisorError::Refused(SupervisorRefusal::Other))?;
+        runtime.evidence.generation = generation;
+        runtime.evidence.epoch = epoch;
         runtime.evidence.lifecycle = LifecycleAxis::Stopping;
         runtime.pending = None;
         if let Some(tracker) = runtime.health.as_mut() {
             let _ = tracker.cancel(self.now_ms, generation);
             runtime.evidence.health = tracker.axis();
         }
-        let live = runtime.live.take();
         let resource_id = runtime.resource_id;
-        if let Some(live) = live {
-            self.authority
-                .teardown(live, ResourceFence::new(resource_id, generation))?;
-        }
+        let fence = ResourceFence::new(resource_id, generation);
+        self.authority.teardown(
+            &mut self
+                .runtimes
+                .get_mut(service_id)
+                .ok_or_else(|| SupervisorError::UnknownService(service_id.clone()))?
+                .live,
+            fence,
+        )?;
+        self.release_port_for(service_id, admitted_generation);
         self.release_port_for(service_id, generation);
         let runtime = self
             .runtimes
@@ -878,9 +997,23 @@ impl<A: ManagedLaunchAuthority> ServiceSupervisor<A> {
     }
 
     fn fail_member(&mut self, service_id: &ServiceId, generation: u64) {
+        let resource_id = self
+            .runtimes
+            .get(service_id)
+            .map(|runtime| runtime.resource_id);
+        if let Some(resource_id) = resource_id {
+            let fence = ResourceFence::new(resource_id, generation);
+            let _ = self.authority.teardown(
+                &mut self
+                    .runtimes
+                    .get_mut(service_id)
+                    .expect("service runtime present")
+                    .live,
+                fence,
+            );
+        }
         if let Some(runtime) = self.runtimes.get_mut(service_id) {
             runtime.pending = None;
-            runtime.live = None;
             runtime.evidence.lifecycle = LifecycleAxis::Failed;
             runtime.evidence.process = ProcessAxis::Crashed { generation };
             runtime.evidence.health = HealthAxis::Crashed;
@@ -920,6 +1053,34 @@ impl<A: ManagedLaunchAuthority> ServiceSupervisor<A> {
                 .unwrap_or(0),
         );
         self.project_runtime(service_id);
+    }
+
+    fn clear_external_for_port(&mut self, port: u16) {
+        let ids: Vec<ServiceId> = self
+            .catalog
+            .definitions()
+            .filter(|definition| {
+                definition
+                    .expected_port
+                    .is_some_and(|expected| expected.port == port)
+            })
+            .map(|definition| definition.id.clone())
+            .collect();
+        for id in ids {
+            let Some(runtime) = self.runtimes.get_mut(&id) else {
+                continue;
+            };
+            if !matches!(runtime.evidence.ownership, OwnershipAxis::External) {
+                continue;
+            }
+            if runtime.live.is_some() {
+                continue;
+            }
+            let generation = runtime.evidence.generation;
+            let epoch = runtime.evidence.epoch;
+            runtime.evidence = stopped_evidence(self.now_ms, generation, epoch);
+            self.project_runtime(&id);
+        }
     }
 
     fn launch_spec(
@@ -1005,11 +1166,7 @@ impl<A: ManagedLaunchAuthority> ServiceSupervisor<A> {
     ) -> Result<(), SupervisorError> {
         let current = self.fence(service_id)?;
         if current != fence {
-            return Err(SupervisorError::Refused(AdmissionRejection::StaleFence {
-                service: service_id.clone(),
-                expected: current,
-                received: fence,
-            }));
+            return Err(SupervisorError::Refused(SupervisorRefusal::StaleFence));
         }
         Ok(())
     }
@@ -1024,8 +1181,9 @@ impl<A: ManagedLaunchAuthority> ServiceSupervisor<A> {
             if matches!(
                 self.ports.get(&port),
                 Some(PortClaim::Reserved {
+                    service_id: owner,
                     generation: claimed
-                }) if *claimed == generation
+                }) if owner == service_id && *claimed == generation
             ) {
                 self.ports.remove(&port);
             }
@@ -1070,13 +1228,13 @@ impl<A: ManagedLaunchAuthority> Drop for ServiceSupervisor<A> {
     fn drop(&mut self) {
         let ids: Vec<ServiceId> = self.runtimes.keys().cloned().collect();
         for id in ids {
+            let Some(runtime) = self.runtimes.get(&id) else {
+                continue;
+            };
+            let fence = ResourceFence::new(runtime.resource_id, runtime.evidence.generation);
             if let Some(runtime) = self.runtimes.get_mut(&id) {
                 runtime.pending = None;
-                if let Some(live) = runtime.live.take() {
-                    let fence =
-                        ResourceFence::new(runtime.resource_id, runtime.evidence.generation);
-                    let _ = self.authority.teardown(live, fence);
-                }
+                let _ = self.authority.teardown(&mut runtime.live, fence);
             }
         }
     }
@@ -1097,10 +1255,15 @@ pub enum SupervisorOutcome {
     Health(RedactedServiceSnapshot),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PortClaimView {
-    Reserved { generation: u64 },
-    External { owner_pid: Option<u32> },
+    Reserved {
+        service_id: ServiceId,
+        generation: u64,
+    },
+    External {
+        owner_pid: Option<u32>,
+    },
 }
 
 pub fn session_status_for_ui(state: ServiceState) -> SessionStatus {
@@ -1111,6 +1274,29 @@ pub fn session_status_for_ui(state: ServiceState) -> SessionStatus {
         ServiceState::External => SessionStatus::Stopped,
         ServiceState::Stopping => SessionStatus::Stopping,
         ServiceState::Failed => SessionStatus::Failed,
+    }
+}
+
+fn refusal_from(rejection: AdmissionRejection) -> SupervisorRefusal {
+    match rejection {
+        AdmissionRejection::StaleFence { .. } | AdmissionRejection::PlanStale { .. } => {
+            SupervisorRefusal::StaleFence
+        }
+        AdmissionRejection::OwnershipMismatch { .. }
+        | AdmissionRejection::RequesterMismatch { .. } => SupervisorRefusal::Ownership,
+        AdmissionRejection::ExternalNotControllable { .. }
+        | AdmissionRejection::DependencyExternal { .. } => SupervisorRefusal::External,
+        AdmissionRejection::DependencyNotReady { .. } => SupervisorRefusal::Dependency,
+        AdmissionRejection::OperationInProgress { .. } => SupervisorRefusal::OperationInProgress,
+        AdmissionRejection::AlreadyRunning { .. } => SupervisorRefusal::AlreadyRunning,
+        AdmissionRejection::AlreadyStopped { .. } => SupervisorRefusal::AlreadyStopped,
+        AdmissionRejection::EvidenceUnknown { .. } | AdmissionRejection::UnknownService { .. } => {
+            SupervisorRefusal::EvidenceUnknown
+        }
+        AdmissionRejection::TaskClosing { .. }
+        | AdmissionRejection::TaskCloseNotAdmitted { .. }
+        | AdmissionRejection::TaskEpochStale { .. } => SupervisorRefusal::TaskClosing,
+        _ => SupervisorRefusal::Other,
     }
 }
 
@@ -1356,9 +1542,16 @@ impl ManagedLaunchAuthority for FakeLaunchAuthority {
         Ok(token)
     }
 
-    fn teardown(&mut self, live: Self::Live, _fence: ResourceFence) -> Result<(), SupervisorError> {
+    fn teardown(
+        &mut self,
+        live: &mut Option<Self::Live>,
+        _fence: ResourceFence,
+    ) -> Result<(), SupervisorError> {
+        let Some(token) = live.take() else {
+            return Ok(());
+        };
         let mut inner = self.inner.borrow_mut();
-        inner.live.remove(&live);
+        inner.live.remove(&token);
         inner.torn_down = inner.torn_down.saturating_add(1);
         Ok(())
     }

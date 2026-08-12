@@ -313,7 +313,7 @@ fn wait_for_identity(host: &mut ChildGuard, lock_path: &Path) -> HostIdentity {
 #[test]
 fn action_catalog_ids_are_unique_and_classified() {
     let catalog = action::catalog();
-    assert_eq!(catalog.len(), 11);
+    assert_eq!(catalog.len(), 6);
 
     let mut ids = Vec::new();
     for action in catalog {
@@ -326,12 +326,7 @@ fn action_catalog_ids_are_unique_and_classified() {
         ids.push(action.id);
         let expected_risk = if matches!(
             action.id,
-            ACTION_TASK_CREATE
-                | ACTION_TASK_CREATE_V2
-                | ACTION_TASK_RENAME
-                | "service.start"
-                | "service.stop"
-                | "service.restart"
+            ACTION_TASK_CREATE | ACTION_TASK_CREATE_V2 | ACTION_TASK_RENAME
         ) {
             ActionRisk::Mutating
         } else {
@@ -393,12 +388,7 @@ fn ctl_actions_json_is_stable_unique_and_offline() {
         ids.push(id.to_string());
         let expected_risk = if matches!(
             id,
-            ACTION_TASK_CREATE
-                | ACTION_TASK_CREATE_V2
-                | ACTION_TASK_RENAME
-                | "service.start"
-                | "service.stop"
-                | "service.restart"
+            ACTION_TASK_CREATE | ACTION_TASK_CREATE_V2 | ACTION_TASK_RENAME
         ) {
             "mutating"
         } else {

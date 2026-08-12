@@ -155,9 +155,7 @@ fn service_catalog_config_cannot_imply_health_ports_process_or_action_availabili
     assert!(snapshot.actions().ready().is_none());
     assert_eq!(
         request_action(Some(catalog()), "service.start").unwrap_err(),
-        UnavailableReason::Hold {
-            dependency: HoldDependency::ActionCatalog,
-        }
+        UnavailableReason::HostFactMissing
     );
     assert_eq!(
         request_action(Some(catalog()), "git.commit").unwrap_err(),
@@ -244,9 +242,7 @@ fn request_action_without_catalog_or_action_id_is_unavailable() {
     );
     assert_eq!(
         request_action(Some(catalog()), "service.start").unwrap_err(),
-        UnavailableReason::Hold {
-            dependency: HoldDependency::ActionCatalog,
-        }
+        UnavailableReason::HostFactMissing
     );
     assert_eq!(
         request_action(Some(catalog()), "git.commit").unwrap_err(),

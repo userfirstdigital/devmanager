@@ -1822,7 +1822,7 @@ impl ActionEpoch {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct AdmissionFence {
+pub struct AdmissionFence {
     resource_generation: ResourceGeneration,
     connection_epoch: ConnectionEpoch,
     action_epoch: ActionEpoch,
@@ -1830,11 +1830,7 @@ pub(crate) struct AdmissionFence {
 
 #[allow(dead_code)]
 impl AdmissionFence {
-    pub(crate) const fn new(
-        resource_generation: u64,
-        connection_epoch: u64,
-        action_epoch: u64,
-    ) -> Self {
+    pub const fn new(resource_generation: u64, connection_epoch: u64, action_epoch: u64) -> Self {
         Self {
             resource_generation: ResourceGeneration::new(resource_generation),
             connection_epoch: ConnectionEpoch::new(connection_epoch),
@@ -1842,38 +1838,38 @@ impl AdmissionFence {
         }
     }
 
-    pub(crate) const fn resource_generation(self) -> u64 {
+    pub const fn resource_generation(self) -> u64 {
         self.resource_generation.get()
     }
 
-    pub(crate) const fn connection_epoch(self) -> u64 {
+    pub const fn connection_epoch(self) -> u64 {
         self.connection_epoch.get()
     }
 
-    pub(crate) const fn action_epoch(self) -> u64 {
+    pub const fn action_epoch(self) -> u64 {
         self.action_epoch.get()
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) struct HostId(u64);
+pub struct HostId(u64);
 
 #[allow(dead_code)]
 impl HostId {
-    pub(crate) const fn new(value: u64) -> Self {
+    pub const fn new(value: u64) -> Self {
         Self(value)
     }
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 #[allow(dead_code)]
-pub(crate) struct HostAuthority {
+pub struct HostAuthority {
     host_id: HostId,
 }
 
 #[allow(dead_code)]
 impl HostAuthority {
-    pub(crate) const fn new(host_id: HostId) -> Self {
+    pub const fn new(host_id: HostId) -> Self {
         Self { host_id }
     }
 }
@@ -1886,7 +1882,7 @@ impl fmt::Debug for HostAuthority {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[allow(dead_code)]
-pub(crate) enum AdmissionRequester {
+pub enum AdmissionRequester {
     Task(TaskId),
     Host(HostAuthority),
 }

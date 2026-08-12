@@ -315,8 +315,8 @@ pub fn project_command_center(input: &CommandCenterInput<'_>) -> CommandCenterVi
 }
 
 /// Canonical action output is `ClientRequest` (Phase 2.4). This view does not
-/// mint envelopes; catalogued service ActionIds stay Hold until a host factory
-/// exists. Unknown ids remain HostFactMissing.
+/// mint envelopes. Reserved service ActionIds are not catalogued until a host
+/// factory exists; unknown ids remain HostFactMissing.
 pub fn request_action(
     actions: Option<&[ActionDescriptor]>,
     action_id: &str,

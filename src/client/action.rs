@@ -40,15 +40,16 @@ pub const ACTION_TASK_CREATE: &str = "task.create";
 pub const ACTION_TASK_CREATE_V2: &str = "task.create.v2";
 /// Stable id for renaming one Task through the host command boundary.
 pub const ACTION_TASK_RENAME: &str = "task.rename";
-/// Stable id for starting one configured service through the host supervisor.
+/// Reserved control ids for the configured-service supervisor. They are not
+/// advertised in the shared catalog until a host dispatch path exists.
 pub const ACTION_SERVICE_START: &str = "service.start";
-/// Stable id for stopping one configured service through the host supervisor.
+/// Reserved stop id; not advertised until host dispatch is wired.
 pub const ACTION_SERVICE_STOP: &str = "service.stop";
-/// Stable id for restarting one configured service through the host supervisor.
+/// Reserved restart id; not advertised until host dispatch is wired.
 pub const ACTION_SERVICE_RESTART: &str = "service.restart";
-/// Stable id for reading bounded redacted service logs.
+/// Reserved logs id; not advertised until host dispatch is wired.
 pub const ACTION_SERVICE_LOGS: &str = "service.logs";
-/// Stable id for reading the last redacted service health snapshot.
+/// Reserved health id; not advertised until host dispatch is wired.
 pub const ACTION_SERVICE_HEALTH: &str = "service.health";
 
 /// Where an action applies.
@@ -150,56 +151,6 @@ const ACTIONS: &[ActionDescriptor] = &[
         required_capability: None,
         risk: ActionRisk::Mutating,
         argument_schema: ActionArgumentSchema::TaskRenameV1,
-    },
-    ActionDescriptor {
-        id: ACTION_SERVICE_START,
-        title: "Start service",
-        description: "Start one configured command through the managed service supervisor.",
-        keywords: &["service", "start", "command", "server"],
-        scope: ActionScope::Host,
-        required_capability: None,
-        risk: ActionRisk::Mutating,
-        argument_schema: ActionArgumentSchema::ServiceControlV1,
-    },
-    ActionDescriptor {
-        id: ACTION_SERVICE_STOP,
-        title: "Stop service",
-        description: "Stop one managed configured command through the service supervisor.",
-        keywords: &["service", "stop", "command", "server"],
-        scope: ActionScope::Host,
-        required_capability: None,
-        risk: ActionRisk::Mutating,
-        argument_schema: ActionArgumentSchema::ServiceControlV1,
-    },
-    ActionDescriptor {
-        id: ACTION_SERVICE_RESTART,
-        title: "Restart service",
-        description: "Restart one managed configured command through the service supervisor.",
-        keywords: &["service", "restart", "command", "server"],
-        scope: ActionScope::Host,
-        required_capability: None,
-        risk: ActionRisk::Mutating,
-        argument_schema: ActionArgumentSchema::ServiceControlV1,
-    },
-    ActionDescriptor {
-        id: ACTION_SERVICE_LOGS,
-        title: "Service logs",
-        description: "Read bounded redacted logs for one configured service.",
-        keywords: &["service", "logs", "output"],
-        scope: ActionScope::Host,
-        required_capability: None,
-        risk: ActionRisk::ReadOnly,
-        argument_schema: ActionArgumentSchema::ServiceControlV1,
-    },
-    ActionDescriptor {
-        id: ACTION_SERVICE_HEALTH,
-        title: "Service health",
-        description: "Read the last redacted health snapshot for one configured service.",
-        keywords: &["service", "health", "probe"],
-        scope: ActionScope::Host,
-        required_capability: None,
-        risk: ActionRisk::ReadOnly,
-        argument_schema: ActionArgumentSchema::ServiceControlV1,
     },
 ];
 
@@ -424,12 +375,12 @@ mod tests {
         assert!(ids.contains(&ACTION_TASK_SHOW));
         assert!(!ids.contains(&ACTION_TASK_CREATE));
         assert!(ids.contains(&ACTION_TASK_RENAME));
-        assert!(ids.contains(&ACTION_SERVICE_START));
-        assert!(ids.contains(&ACTION_SERVICE_STOP));
-        assert!(ids.contains(&ACTION_SERVICE_RESTART));
-        assert!(ids.contains(&ACTION_SERVICE_LOGS));
-        assert!(ids.contains(&ACTION_SERVICE_HEALTH));
-        assert_eq!(ids.len(), 11);
+        assert!(!ids.contains(&ACTION_SERVICE_START));
+        assert!(!ids.contains(&ACTION_SERVICE_STOP));
+        assert!(!ids.contains(&ACTION_SERVICE_RESTART));
+        assert!(!ids.contains(&ACTION_SERVICE_LOGS));
+        assert!(!ids.contains(&ACTION_SERVICE_HEALTH));
+        assert_eq!(ids.len(), 6);
         require_unique_ids().expect("ids must be unique");
         for action in catalog() {
             let (expected_scope, expected_risk, expected_schema, expected_capability) =
@@ -456,18 +407,6 @@ mod tests {
                         ActionScope::Task,
                         ActionRisk::Mutating,
                         ActionArgumentSchema::TaskRenameV1,
-                        None,
-                    ),
-                    ACTION_SERVICE_START | ACTION_SERVICE_STOP | ACTION_SERVICE_RESTART => (
-                        ActionScope::Host,
-                        ActionRisk::Mutating,
-                        ActionArgumentSchema::ServiceControlV1,
-                        None,
-                    ),
-                    ACTION_SERVICE_LOGS | ACTION_SERVICE_HEALTH => (
-                        ActionScope::Host,
-                        ActionRisk::ReadOnly,
-                        ActionArgumentSchema::ServiceControlV1,
                         None,
                     ),
                     _ => (

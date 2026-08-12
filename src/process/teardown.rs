@@ -1491,6 +1491,45 @@ impl ManagedTerminalTeardown {
             .map_err(|error| error.to_string())
     }
 
+    /// Configured-service seam: arm the exact Job teardown before the one-way
+    /// resume boundary.
+    pub(crate) fn arm_before_resume(self: &Arc<Self>) {
+        self.armed.store(true, Ordering::Release);
+    }
+
+    /// Configured-service seam: resume a register-before-resume pending root.
+    pub(crate) fn resume_registered_for_service(
+        teardown: &Arc<Self>,
+        pending: RegisteredPendingManagedLaunch,
+    ) -> Result<ManagedPtyChild, String> {
+        Self::resume_registered_launch(teardown, pending)
+    }
+
+    /// Configured-service seam: build teardown around an already-registered
+    /// suspended root without resuming it.
+    pub(crate) fn from_registered_for_service(
+        registry: ProcessRegistry<ManagedProcessJob>,
+        fence: ManagedProcessFence,
+        operation_id: OperationId,
+        action_epoch: u64,
+        completion_store: TeardownCompletionStore,
+        session_id: String,
+        ports: Vec<u16>,
+        io: Arc<ManagedTerminalIo>,
+    ) -> Result<Arc<Self>, String> {
+        let ports = validate_terminal_teardown_inputs(&session_id, action_epoch, &ports)?;
+        Ok(Self::from_registered(
+            registry,
+            fence,
+            operation_id,
+            action_epoch,
+            completion_store,
+            session_id,
+            ports,
+            io,
+        ))
+    }
+
     fn from_registered(
         registry: ProcessRegistry<ManagedProcessJob>,
         fence: ManagedProcessFence,

@@ -41,6 +41,13 @@ fn fence() -> AdmissionFence {
     AdmissionFence::new(1, 1, 1)
 }
 
+fn current_fence(
+    supervisor: &ServiceSupervisor<FakeLaunchAuthority>,
+    name: &str,
+) -> AdmissionFence {
+    supervisor.fence(&id(name)).expect("fence")
+}
+
 fn policy() -> HealthPolicy {
     HealthPolicy {
         startup_deadline_ms: 5_000,
@@ -101,12 +108,13 @@ fn supervisor_from_catalog(
 }
 
 fn become_healthy(supervisor: &mut ServiceSupervisor<FakeLaunchAuthority>, name: &str) {
+    let generation = current_fence(supervisor, name).resource_generation();
     supervisor
-        .apply_probe(&id(name), 1, ProbeOutcome::Success)
+        .apply_probe(&id(name), generation, ProbeOutcome::Success)
         .expect("probe 1");
     supervisor.advance_clock(supervisor.now_ms().saturating_add(1_000));
     supervisor
-        .apply_probe(&id(name), 1, ProbeOutcome::Success)
+        .apply_probe(&id(name), generation, ProbeOutcome::Success)
         .expect("probe 2");
 }
 
@@ -124,7 +132,7 @@ fn project_fixture() -> (Project, ProjectFolder, RunCommand) {
     let folder = ProjectFolder {
         id: "web".to_owned(),
         name: "web".to_owned(),
-        folder_path: "C:/repo/apps/api".to_owned(),
+        folder_path: "apps/api".to_owned(),
         commands: vec![command.clone()],
         port_variable: Nullable::Value("PORT".to_owned()),
         ..ProjectFolder::default()
@@ -142,17 +150,16 @@ fn project_fixture() -> (Project, ProjectFolder, RunCommand) {
 #[test]
 fn configured_command_binds_to_project_workspace_and_task() {
     let (project, folder, command) = project_fixture();
-    let mut workspace_env = BTreeMap::new();
-    workspace_env.insert("NODE_ENV".to_owned(), "test".to_owned());
-    workspace_env.insert("API_TOKEN".to_owned(), "secret-value".to_owned());
+    let mut folder_env = BTreeMap::new();
+    folder_env.insert("NODE_ENV".to_owned(), "test".to_owned());
+    folder_env.insert("API_TOKEN".to_owned(), "secret-value".to_owned());
 
     let task = bind_configured_command(ConfiguredServiceSource {
         project: &project,
         folder: &folder,
         command: &command,
         owner: ConfiguredServiceOwner::Task { task_id: task_a() },
-        workspace_cwd: Some("apps/api"),
-        workspace_env: &workspace_env,
+        folder_env_file: Some(&folder_env),
     })
     .expect("task binding");
     assert!(matches!(
@@ -161,6 +168,10 @@ fn configured_command_binds_to_project_workspace_and_task() {
     ));
     assert_eq!(task.definition.scope, ServiceScope::task(task_a()));
     assert_eq!(task.definition.command.program().as_str(), "node");
+    assert_eq!(
+        task.definition.command.cwd().map(|cwd| cwd.as_str()),
+        Some("apps/api")
+    );
     assert_eq!(
         task.definition
             .command
@@ -180,8 +191,7 @@ fn configured_command_binds_to_project_workspace_and_task() {
             project_id: project.id.clone(),
             folder_id: folder.id.clone(),
         },
-        workspace_cwd: Some("apps/api"),
-        workspace_env: &BTreeMap::new(),
+        folder_env_file: None,
     })
     .expect("workspace binding");
     assert_eq!(workspace.definition.scope, ServiceScope::Host);
@@ -193,15 +203,14 @@ fn configured_command_binds_to_project_workspace_and_task() {
         owner: ConfiguredServiceOwner::Project {
             project_id: project.id.clone(),
         },
-        workspace_cwd: None,
-        workspace_env: &BTreeMap::new(),
+        folder_env_file: None,
     })
     .expect("project binding");
     assert_eq!(host_owned.definition.scope, ServiceScope::Host);
 }
 
 #[test]
-fn binding_rejects_secret_arguments_and_absolute_cwd() {
+fn binding_rejects_secret_arguments_and_derives_cwd_from_folder() {
     let (project, folder, mut command) = project_fixture();
     command.args = vec!["--token".to_owned(), "secret-value".to_owned()];
     let error = bind_configured_command(ConfiguredServiceSource {
@@ -211,40 +220,36 @@ fn binding_rejects_secret_arguments_and_absolute_cwd() {
         owner: ConfiguredServiceOwner::Project {
             project_id: project.id.clone(),
         },
-        workspace_cwd: None,
-        workspace_env: &BTreeMap::new(),
+        folder_env_file: None,
     })
     .expect_err("raw secret");
     assert!(!format!("{error:?}").contains("secret-value"));
 
     command.args.clear();
-    let error = bind_configured_command(ConfiguredServiceSource {
+    let mut absolute_folder = folder.clone();
+    absolute_folder.folder_path = "C:/outside".to_owned();
+    let binding = bind_configured_command(ConfiguredServiceSource {
         project: &project,
-        folder: &folder,
+        folder: &absolute_folder,
         command: &command,
         owner: ConfiguredServiceOwner::Task { task_id: task_a() },
-        workspace_cwd: Some("C:/abs"),
-        workspace_env: &BTreeMap::new(),
+        folder_env_file: None,
     })
-    .expect_err("absolute cwd");
-    assert!(matches!(
-        error,
-        crate::services::binding::BindingError::Validation(_)
-    ));
+    .expect("absolute folder outside project root omits cwd");
+    assert!(binding.definition.command.cwd().is_none());
 }
 
 #[test]
 fn launch_layers_environment_and_stays_on_managed_authority() {
     let (project, folder, command) = project_fixture();
-    let mut workspace_env = BTreeMap::new();
-    workspace_env.insert("API_TOKEN".to_owned(), "secret-value".to_owned());
+    let mut folder_env = BTreeMap::new();
+    folder_env.insert("API_TOKEN".to_owned(), "secret-value".to_owned());
     let binding = bind_configured_command(ConfiguredServiceSource {
         project: &project,
         folder: &folder,
         command: &command,
         owner: ConfiguredServiceOwner::Task { task_id: task_a() },
-        workspace_cwd: Some("apps/api"),
-        workspace_env: &workspace_env,
+        folder_env_file: Some(&folder_env),
     })
     .expect("binding");
     let authority = FakeLaunchAuthority::new();
@@ -272,6 +277,8 @@ fn launch_layers_environment_and_stays_on_managed_authority() {
         supervisor.session_status(&id("api")),
         SessionStatus::Starting
     );
+    assert_eq!(current_fence(&supervisor, "api").resource_generation(), 2);
+    assert_eq!(current_fence(&supervisor, "api").action_epoch(), 2);
 }
 
 #[test]
@@ -297,7 +304,7 @@ fn health_probes_are_off_the_action_hot_path() {
     assert_eq!(supervisor.probe_executions(), 0);
     let due = supervisor.due_probes();
     assert_eq!(due.len(), 1);
-    assert_eq!(due[0].generation, 1);
+    assert_eq!(due[0].generation, 2);
     become_healthy(&mut supervisor, "api");
     assert_eq!(supervisor.state(&id("api")), ServiceState::Healthy);
     assert_eq!(
@@ -309,7 +316,7 @@ fn health_probes_are_off_the_action_hot_path() {
         .handle(
             SupervisorAction::Health,
             &id("api"),
-            fence(),
+            current_fence(&supervisor, "api"),
             AdmissionRequester::Task(task_a()),
         )
         .expect("health action");
@@ -345,22 +352,24 @@ fn crash_and_manual_stop_and_task_close_leave_no_orphan() {
         )
         .expect("start graph");
     assert_eq!(inspect.resumed(), 2);
+    let api_generation = current_fence(&supervisor, "api").resource_generation();
     supervisor
-        .report_exit(&id("api"), 1, Some(1))
+        .report_exit(&id("api"), api_generation, Some(1))
         .expect("crash");
     assert_eq!(supervisor.state(&id("api")), ServiceState::Failed);
     assert_eq!(supervisor.session_status(&id("api")), SessionStatus::Failed);
+    assert_eq!(inspect.torn_down(), 1);
     supervisor
         .handle(
             SupervisorAction::Stop,
             &id("db"),
-            fence(),
+            current_fence(&supervisor, "db"),
             AdmissionRequester::Task(task_a()),
         )
         .expect("manual stop");
     assert_eq!(supervisor.state(&id("db")), ServiceState::Stopped);
     assert_eq!(supervisor.live_count(), 0);
-    assert_eq!(inspect.torn_down(), 1);
+    assert_eq!(inspect.torn_down(), 2);
 
     let authority = FakeLaunchAuthority::new();
     let inspect = authority.clone();
@@ -408,7 +417,7 @@ fn host_owned_service_starts_through_host_requester() {
         supervisor.handle(
             SupervisorAction::Start,
             &id("host-db"),
-            fence(),
+            current_fence(&supervisor, "host-db"),
             AdmissionRequester::Task(task_a()),
         ),
         Err(SupervisorError::Refused(_))
@@ -440,7 +449,7 @@ fn duplicate_start_coalesces_without_a_second_launch() {
         .handle(
             SupervisorAction::Start,
             &id("api"),
-            fence(),
+            current_fence(&supervisor, "api"),
             AdmissionRequester::Task(task_a()),
         )
         .expect("duplicate");
@@ -488,6 +497,9 @@ fn occupied_external_port_is_blue_and_uncontrolled() {
         ),
         Err(SupervisorError::Refused(_))
     ));
+    supervisor.observe_port(8080, PortAuthority::Free, None);
+    assert_eq!(supervisor.state(&id("api")), ServiceState::Stopped);
+    assert_eq!(supervisor.state(&id("api")).tone(), StatusTone::Gray);
 }
 
 #[test]
@@ -591,15 +603,14 @@ fn launch_failure_and_supervisor_drop_leave_no_orphan() {
 #[test]
 fn stale_generation_is_ignored_and_logs_stay_redacted() {
     let (project, folder, command) = project_fixture();
-    let mut workspace_env = BTreeMap::new();
-    workspace_env.insert("API_TOKEN".to_owned(), "secret-value".to_owned());
+    let mut folder_env = BTreeMap::new();
+    folder_env.insert("API_TOKEN".to_owned(), "secret-value".to_owned());
     let binding = bind_configured_command(ConfiguredServiceSource {
         project: &project,
         folder: &folder,
         command: &command,
         owner: ConfiguredServiceOwner::Task { task_id: task_a() },
-        workspace_cwd: Some("apps/api"),
-        workspace_env: &workspace_env,
+        folder_env_file: Some(&folder_env),
     })
     .expect("binding");
     let mut supervisor =
@@ -616,7 +627,7 @@ fn stale_generation_is_ignored_and_logs_stay_redacted() {
     assert!(matches!(
         supervisor.apply_probe(&id("api"), 99, ProbeOutcome::Success),
         Err(SupervisorError::StaleGeneration {
-            expected: 1,
+            expected: 2,
             received: 99
         })
     ));
@@ -624,7 +635,7 @@ fn stale_generation_is_ignored_and_logs_stay_redacted() {
         supervisor.handle(
             SupervisorAction::Start,
             &id("api"),
-            AdmissionFence::new(2, 1, 1),
+            AdmissionFence::new(1, 1, 1),
             AdmissionRequester::Task(task_a()),
         ),
         Err(SupervisorError::Refused(_))
@@ -633,7 +644,7 @@ fn stale_generation_is_ignored_and_logs_stay_redacted() {
         .handle(
             SupervisorAction::Logs,
             &id("api"),
-            fence(),
+            current_fence(&supervisor, "api"),
             AdmissionRequester::Task(task_a()),
         )
         .expect("logs")
@@ -646,6 +657,44 @@ fn stale_generation_is_ignored_and_logs_stay_redacted() {
     assert!(supervisor
         .events()
         .any(|event| event.kind == SupervisorEventKind::Started));
+}
+
+#[test]
+fn restart_advances_generation_so_stale_events_cannot_match() {
+    let mut supervisor = supervisor_from_catalog(
+        vec![service(
+            "api",
+            ServiceScope::task(task_a()),
+            vec![],
+            Some(8080),
+        )],
+        FakeLaunchAuthority::new(),
+    );
+    supervisor
+        .handle(
+            SupervisorAction::Start,
+            &id("api"),
+            fence(),
+            AdmissionRequester::Task(task_a()),
+        )
+        .expect("start");
+    let first = current_fence(&supervisor, "api").resource_generation();
+    assert_eq!(first, 2);
+    become_healthy(&mut supervisor, "api");
+    supervisor
+        .handle(
+            SupervisorAction::Restart,
+            &id("api"),
+            current_fence(&supervisor, "api"),
+            AdmissionRequester::Task(task_a()),
+        )
+        .expect("restart");
+    let second = current_fence(&supervisor, "api").resource_generation();
+    assert!(second > first);
+    assert!(matches!(
+        supervisor.apply_probe(&id("api"), first, ProbeOutcome::Success),
+        Err(SupervisorError::StaleGeneration { .. })
+    ));
 }
 
 #[test]
@@ -683,7 +732,6 @@ fn ui_session_status_preserves_existing_server_semantics() {
 #[test]
 fn bind_configured_services_rejects_duplicates() {
     let (project, folder, command) = project_fixture();
-    let env = BTreeMap::new();
     let source = ConfiguredServiceSource {
         project: &project,
         folder: &folder,
@@ -691,8 +739,7 @@ fn bind_configured_services_rejects_duplicates() {
         owner: ConfiguredServiceOwner::Project {
             project_id: project.id.clone(),
         },
-        workspace_cwd: Some("apps/api"),
-        workspace_env: &env,
+        folder_env_file: None,
     };
     assert!(bind_configured_services([source.clone(), source]).is_err());
 }

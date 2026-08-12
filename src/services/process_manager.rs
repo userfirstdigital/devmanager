@@ -334,6 +334,7 @@ pub(crate) struct ProcessManagerInner {
     background_thread: Mutex<Option<thread::JoinHandle<()>>>,
     auto_restart_workers: Mutex<Vec<thread::JoinHandle<()>>>,
     terminal_authority_issuer: TerminalAuthorityIssuer,
+    service_launch_issuer: Arc<crate::services::launch_authority::ServiceLaunchIssuer>,
     op_queue: Mutex<Weak<ProcessOpQueue>>,
     handle_lifecycle: Arc<ProcessManagerHandleLifecycle>,
     #[cfg(test)]
@@ -624,6 +625,9 @@ impl ProcessManager {
             background_thread: Mutex::new(None),
             auto_restart_workers: Mutex::new(Vec::new()),
             terminal_authority_issuer: TerminalAuthorityIssuer::new(),
+            service_launch_issuer: Arc::new(
+                crate::services::launch_authority::ServiceLaunchIssuer::new(),
+            ),
             op_queue: Mutex::new(Weak::new()),
             handle_lifecycle: handle_lifecycle.clone(),
             #[cfg(test)]
@@ -813,6 +817,17 @@ impl ProcessManager {
             ProcessOwner::Task(task_id),
             ports.to_vec(),
         )
+    }
+
+    /// Narrow host seam for the configured-service supervisor. Shares one
+    /// service launch issuer so prepare/register/resume stay on the Phase 3
+    /// suspended Job path owned by this process manager.
+    pub(crate) fn configured_service_launch_authority(
+        &self,
+    ) -> crate::services::launch_authority::HostManagedLaunchAuthority {
+        crate::services::launch_authority::HostManagedLaunchAuthority::with_issuer(Arc::clone(
+            &self.inner.service_launch_issuer,
+        ))
     }
 
     pub fn port_inventory(&self) -> PortInventory {
