@@ -8,13 +8,16 @@ use gpui::{App, Global};
 
 pub mod actions;
 pub mod components;
+pub mod native_shell;
 pub mod preview;
 pub mod preview_capture;
 pub mod renderers;
 pub mod shell;
 pub mod task_cockpit;
+pub mod terminal_adapter;
 pub mod tokens;
 
+pub use native_shell::{NativeClientDetach, NativeHostFullQuit};
 pub use preview::PreviewInitReport;
 
 static COMPONENT_INIT_COUNT: AtomicUsize = AtomicUsize::new(0);

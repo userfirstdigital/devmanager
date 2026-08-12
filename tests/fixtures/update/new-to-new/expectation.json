@@ -1,0 +1,18 @@
+{
+  "cutover": "new-to-new",
+  "installedVersion": "0.4.1",
+  "candidateVersion": "0.4.2",
+  "preserveTaskPromptDatabase": true,
+  "canonicalRowHash": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+  "mustPreserve": [
+    "tasks",
+    "operations",
+    "providerSessionIds",
+    "personalPromptVersions",
+    "chains",
+    "organizationPromptRefs",
+    "taskInvitation",
+    "fts"
+  ],
+  "migrationFailureLeavesOldUsable": true
+}

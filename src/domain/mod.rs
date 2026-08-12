@@ -37,6 +37,7 @@ pub use command::{
     CreateTaskRequestIntent, PromotePrimaryIntent, RejectionCode, RenameTaskIntent,
     RequestSpecialistIntent, SetTaskAttentionIntent, SubmitProviderInputIntent,
     DEFAULT_MAX_TOP_LEVEL_RUNTIMES,
+    ArmUpdateInstallIntent, ConfirmUpdateDrainIntent, PrepareUpdateIntent,
 };
 pub use event::{
     apply, ApplyError, DomainEvent, Event, EventSerdeError, OperationAcceptedFact,

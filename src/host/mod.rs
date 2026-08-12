@@ -7,7 +7,11 @@ mod connection;
 mod ipc;
 mod lock;
 mod shutdown;
+mod update;
 
+#[cfg(test)]
+pub(crate) use connection::{ConnectionOutputHandle, ConnectionOutputId, OutputInspection};
+pub use crate::updater::handoff::{HostUpdateAdmission, HostUpdateHandoff};
 pub use connection::{
     dispatch_host_request, HostExecutorOutcome, HostRequestExecutor, HostRequestHandle,
     PhysicalExitArmRequest, SupervisedHostExecutor, HOST_REQUEST_QUEUE_CAPACITY,
@@ -25,4 +29,9 @@ pub use lock::{HostIdentity, HostLock, HostLockError, HOST_EXIT_ALREADY_RUNNING}
 pub use shutdown::{
     HostCleanupProgress, HostCleanupSuccessSettlement, HostCleanupWorker, HostRestartDisposition,
     ProcessEmptyTeardown, ProcessEmptyTeardownWorker,
+};
+pub use update::{
+    owned_probe_from_quit_inspection, update_inspection_from_host_quit,
+    HostExecutorActiveResourceProbe, HostQuitInspectionSource, HostUpdateRuntimeGate,
+    OwnedActiveResourceProbe,
 };

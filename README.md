@@ -1,14 +1,24 @@
-# DevManager Native
+# DevManager
 
-DevManager is the native GPUI rewrite of the archived Tauri + React app. The active code lives at the repo root and the archived reference app remains in `zz-archive/tauri-react-v0.1.11`.
+DevManager is a native GPUI desktop product with a durable local host. One package ships sibling binaries that share semantic version, build, and protocol identity (`devmanager/<version>`):
 
-The native stack currently centers on:
+- `devmanager.exe` — GPUI client (Task cockpit, terminals, workspace UI); build identity `devmanager/<version>`
+- `devmanager-host.exe` — local execution authority (tasks, processes, providers, browser, Connect secrets); build identity `devmanager-host/<version>`
 
-- `gpui`
-- `alacritty_terminal`
-- `portable-pty`
-- `cargo-packager`
-- `cargo-packager-updater`
+Development-only binaries such as `devmanager-next` are not part of the shipping product.
+
+The active codebase lives at the repo root. Approved design history remains under `docs/superpowers/`. Architecture, Connect boundaries, and release gates are summarized in:
+
+- [docs/architecture.md](docs/architecture.md)
+- [docs/connect.md](docs/connect.md)
+- [docs/release-checklist.md](docs/release-checklist.md)
+
+## Stack
+
+- `gpui` / `gpui-component`
+- `alacritty_terminal` / `portable-pty`
+- `rusqlite` (bundled SQLite)
+- `cargo-packager` / `cargo-packager-updater`
 
 ## Run
 
@@ -50,7 +60,7 @@ Install the packager CLI once:
 cargo install cargo-packager --version 0.11.8 --locked
 ```
 
-Package a signed Windows build:
+Package a signed Windows build (builds `devmanager` and `devmanager-host` once, then packs both):
 
 ```powershell
 $env:CARGO_PACKAGER_SIGN_PRIVATE_KEY = "<private key>"
@@ -70,16 +80,29 @@ $env:CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD = "<key password>"
 cargo packager --release --formats app,dmg
 ```
 
-Generated artifacts are written to `dist/packager`. Temporary replaceable installer icons live in `packaging/icons`.
+Generated artifacts are written to `dist/packager`. Icons live in `packaging/icons`. cargo-packager reads release binaries from `binaries-dir = "target/release"` with an explicit `devmanager` + `devmanager-host` payload. The package contract is `packaging/package-contract.json`; validate a stage with:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\packaging\Assert-PackageContract.ps1 -TargetReleaseDir target\release -StageDir dist\packager -ExtractInstallers
+```
+
+Cryptographically verify updater signatures before any publication attempt:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\packaging\Verify-PackagerSignatures.ps1 -ArtifactDir dist\packager
+```
+
+Packages must not embed `.worktrees`, `target`/evidence trees, test fixtures, `session.json`, development profiles, Portal proprietary trees, `zz-archive`, or secrets. User prompt databases and organization content are never packaged.
 
 ## Native Updater
 
-The app now contains a native updater module in `src/updater/mod.rs`.
+The app contains a native updater module in `src/updater/mod.rs`.
 
 - It reads updater endpoints and the public verification key from runtime env vars first, then from build-time embedded env vars.
 - It checks for updates in the background on startup when updater configuration is available.
 - It supports `check`, `download`, and `restart to update` through the native settings surface.
 - It surfaces updater state in the shell header so availability and download progress are visible outside settings.
+- Detection compares signed semantic release versions against the installed build identity, never development checkout files or stale PWA assets.
 
 The updater expects a GitHub-hosted manifest at:
 
@@ -92,24 +115,31 @@ The manifest shape matches the `cargo-packager-updater` multi-platform format an
 - `version`
 - `notes`
 - `pub_date`
+- `identity` (`devmanager/<version>`)
+- `protocol` (`major` / `minor`)
 - `platforms.<target>.format`
 - `platforms.<target>.signature`
 - `platforms.<target>.url`
+- `platforms.<target>.sha256` (immutable artifact hash)
 
-The GitHub-hosted updater flow assumes public release assets. If releases are private, the native updater will need an authenticated distribution endpoint instead of raw GitHub asset URLs.
+`latest.json` is generated only after signed artifacts exist and signatures verify against `DEVMANAGER_UPDATE_PUBKEY`. The GitHub-hosted updater flow assumes public release assets. If releases are private, the native updater will need an authenticated distribution endpoint instead of raw GitHub asset URLs.
 
 ## GitHub Release Workflow
 
-`.github/workflows/release.yml` packages the native crate and publishes a public GitHub Release on every non-`[skip ci]` push to `master`.
+`.github/workflows/release.yml` packages the native crate on eligible `master` pushes. Packaging/staging is independent from public publication.
 
-- A Windows verification job runs the complete locked Rust test suite plus the web tests, typecheck, audit, production build, embedded-bundle check, and Rust formatting check in parallel with release preparation and packaging. Installer artifacts are still built when verification fails, but publication remains blocked until verification and every platform build succeed.
+- A Windows verification job runs `cargo metadata --format-version 1 --locked`, the Phase 11 packaging stale-reference scan, the complete locked Rust test suite, and the web tests/typecheck/audit/production build/embedded-bundle/format checks. Installer artifacts may still build when verification fails, but staging remains blocked until verification and every platform build succeed.
 - Release builds use the supported Node `24` LTS line and pin Rust `1.94.0`, `cargo-packager` `0.11.8`, NSIS `3.12.0`, and WiX `3.14.1.20250415`; manual dispatches outside `master` are refused and all release runs share one concurrency lock.
+- Each platform build asserts the package contract against `target/release` and the staged/extracted installer payload (sibling client/host, ctl smoke, exclusions, WebView2 expectations) before collecting artifacts.
+- The `stage` job cryptographically verifies `.sig` files with minisign and `DEVMANAGER_UPDATE_PUBKEY`, writes `latest.json` with identity plus immutable hashes, and uploads a **draft** release only.
+- Public publication never auto-runs on push. Promoting a draft requires `workflow_dispatch` with `publish=true` and an explicit existing `tag_name` (for example `v0.4.2`), then approval through the protected GitHub Environment `release-publish`. Publish never computes a new patch version.
 - The workflow uses `Cargo.toml` when it is newer than the latest stable `vX.Y.Z` tag; otherwise it selects the next patch version.
 - The prepare job writes the release version into `Cargo.toml` and `Cargo.lock`, then commits that bump back to `master` with `[skip ci]`.
 - Every platform checks out that exact prepared commit, and the release tag is explicitly pinned to the same commit rather than the moving branch head.
 - Windows builds publish updater-signed `nsis` installers (plus `wix` on x64). macOS builds publish updater-signed `app` bundles plus `dmg` artifacts.
-- The workflow creates a new draft without updating an existing release, requires the exact 11-file platform/signature/manifest contract, and verifies every uploaded size and SHA-256 digest before publication.
-- A push to `master` can therefore publish immediately when the required secrets and variables are configured. Treat the push as the production approval point.
+- Draft staging requires the exact 11-file platform/signature/manifest contract and verifies every uploaded size and SHA-256 digest before operators may approve publication.
+
+See [docs/release-checklist.md](docs/release-checklist.md) for the operator checklist.
 
 ## Required GitHub Secrets And Variables
 
@@ -131,15 +161,17 @@ Use the generated private key for release signing and embed the public key into 
 
 ## Release Smoke Check
 
-After pushing `master`, do not consider the release complete until all of these checks pass:
+After packaging on `master`, do not consider the release complete until all of these checks pass:
 
-- the `verify`, `prepare`, all three platform `build` jobs, and `release` job succeed; the release remains a draft until its exact asset set and tag commit pass the final check
+- the `verify`, `prepare`, all three platform `build` jobs, and `stage` job succeed; the release remains a draft until protected manual approval publishes it
+- signatures verify with `DEVMANAGER_UPDATE_PUBKEY` before draft staging and again before publish
 - the new tag points to the workflow's reported prepared commit, not merely the latest `master` commit
-- the GitHub Release contains Windows x64/ARM64, macOS ARM64, matching updater `.sig` files, and `latest.json`
+- the draft GitHub Release contains Windows x64/ARM64, macOS ARM64, matching updater `.sig` files, and `latest.json` with `identity` plus per-platform `sha256`
 - every URL and platform key in `latest.json` resolves to the uploaded asset for the same version
-- a clean Windows install launches and the existing app detects, verifies, downloads, and offers the update
+- a clean Windows install launches `devmanager.exe` beside `devmanager-host.exe`, and the existing app detects, verifies, downloads, and offers the update
 - the mobile web health endpoint, HTTPS app shell, pairing, WebSocket reconnect, and one real prompt all work through the production proxy
 - backgrounding and reopening the installed iPhone app resumes the same host session without a button, while restarting the native host produces a new blank runtime
+- an operator explicitly approves the `release-publish` environment via `workflow_dispatch` (`publish=true`) before the draft becomes public
 
 If packaging fails before draft creation, fix forward and push again; no release exists to roll back. If a late check leaves an unpublished draft and orphan tag, delete both before retrying only after confirming that version was never public. If the public release is bad, keep the native host running and remove the bad GitHub Release so `releases/latest` returns to the prior updater manifest, but retain the bad version's tag so it can never be reused. Fix forward from `master` as the next higher version. A successful authoritative check replaces or discards a downloaded-but-uninstalled recalled update; clients that have not checked again must not click **Restart to update**. Do not delete or replace the user's persisted DevManager profile during rollback.
 
@@ -169,9 +201,9 @@ This workaround is needed until proper Apple code signing and notarization are a
 
 ## Mobile Web App
 
-DevManager includes an iPhone-first web app for working with the same live sessions managed by the native desktop process. Claude, Codex, servers, shell, and SSH are rendered as wrapping, selectable native web views; the terminal grid is loaded only for interactions that genuinely require terminal cursor semantics.
+DevManager includes an iPhone-first web app for working with the same live sessions managed by the native host. Claude, Codex, servers, shell, and SSH are rendered as wrapping, selectable native web views; the terminal grid is loaded only for interactions that genuinely require terminal cursor semantics.
 
-The native DevManager process remains the source of truth. App switching, phone locking, browser suspension, and ordinary network loss reconnect automatically and return to the current host state without a Resume, Reload, or Take Control button. Closing the web app does not close sessions. Restarting the native host intentionally starts a new blank web runtime.
+The native host remains the source of truth. App switching, phone locking, browser suspension, and ordinary network loss reconnect automatically and return to the current host state without a Resume, Reload, or Take Control button. Closing the web app does not close sessions. Restarting the native host intentionally starts a new blank web runtime.
 
 ### Connect and install
 
@@ -183,8 +215,9 @@ The native DevManager process remains the source of truth. App switching, phone 
 
 The installed app opens on Sessions, highlights work needing attention, and labels every item with its project. It restores the last valid session only after the host confirms that the same runtime and session still exist. Normal prompts use a real multiline text area, so iOS dictation, paste, selection, autocorrection, and the software keyboard work normally.
 
-See [Mobile Web App operations](docs/REMOTE_MOBILE_WEB.md) for lifecycle guarantees, HTTPS setup, notification behavior, adapter fallback, security boundaries, and development commands.
+See [Connect](docs/connect.md) and [Mobile Web App operations](docs/REMOTE_MOBILE_WEB.md) for lifecycle guarantees, pairing versus task invitations, HTTPS setup, notification behavior, adapter fallback, security boundaries, and development commands.
 
 ## Notes
 
-- The archived Tauri release path is intentionally not used anymore.
+- Packaging and docs describe the GPUI client + durable host product; approved plans under `docs/superpowers/` are retained as history.
+- Third-party notices for the shipping dependency surface live in `THIRD_PARTY_NOTICES.md`.

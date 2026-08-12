@@ -2428,7 +2428,7 @@ fn workspace_preview_temp_roots_are_process_run_unique() {
             .temp_root()
             .file_name()
             .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with("devmanager-next-preview-")),
+            .is_some_and(|name| name.starts_with("devmanager-preview-")),
         "the temporary root must be scoped to this process/run"
     );
 }
@@ -3447,7 +3447,7 @@ fn visible_capture_uses_isolated_process_and_decodes_exact_sentinel() {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ui/theme-gallery.json");
     let before = foreground_hwnd();
 
-    let child = Command::new(env!("CARGO_BIN_EXE_devmanager-next"))
+    let child = Command::new(env!("CARGO_BIN_EXE_devmanager"))
         .env("DEVMANAGER_INSTANCE_LABEL", "Next")
         .env("DEVMANAGER_RUNTIME_KIND", "native-next")
         .args([
@@ -3457,7 +3457,7 @@ fn visible_capture_uses_isolated_process_and_decodes_exact_sentinel() {
             output.to_str().expect("output path is UTF-8"),
         ])
         .output()
-        .expect("isolated devmanager-next --ui-preview must start");
+        .expect("isolated devmanager --ui-preview must start");
     assert!(
         child.status.success(),
         "isolated preview failed: {}",

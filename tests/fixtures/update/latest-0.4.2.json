@@ -1,0 +1,16 @@
+{
+  "version": "0.4.2",
+  "notes": "Phase 11 signed release with matching host and client.",
+  "pub_date": "2026-08-11T18:00:00Z",
+  "minimum_protocol": "1.0",
+  "platforms": {
+    "windows-x86_64": {
+      "format": "nsis",
+      "signature": "dGVzdC1zaWduYXR1cmUtMC40LjItc2lnbmVkLXJlbGVhc2U=",
+      "url": "https://github.com/example/devmanager/releases/download/v0.4.2/DevManager_0.4.2_x64-setup.exe",
+      "hash": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "client_build": "devmanager/0.4.2",
+      "host_build": "devmanager-host/0.4.2"
+    }
+  }
+}

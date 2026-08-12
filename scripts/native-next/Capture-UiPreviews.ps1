@@ -30,9 +30,9 @@ $rustupHomePath = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFo
 $globalCargoConfigTomlPath = Join-Path $cargoHomePath 'config.toml'
 $globalCargoConfigPath = Join-Path $cargoHomePath 'config'
 $buildProfile = 'dev'
-$artifactSchema = 'devmanager.native-next.preview-artifact/v1'
-$artifactName = 'devmanager-next'
-$artifactBinaryName = 'devmanager-next.exe'
+$artifactSchema = 'devmanager.preview-artifact/v1'
+$artifactName = 'devmanager'
+$artifactBinaryName = 'devmanager.exe'
 $MAX_SOURCE_DIGEST_FILES = 4096
 $MAX_SOURCE_DIGEST_DIRECTORIES = 4096
 $MAX_SOURCE_DIGEST_BYTES = 536870912
@@ -3759,7 +3759,7 @@ try {
     $buildResult = Invoke-PreviewExternalCommand -FilePath $buildIdentity.CargoPath -Arguments @(
         'build', '--locked', '--offline', '--manifest-path', $manifestPath,
         '--target', $buildIdentity.Target, '--profile', $buildProfile,
-        '--no-default-features', '--bin', 'devmanager-next', '--target-dir', $TargetRunDir,
+        '--no-default-features', '--bin', 'devmanager', '--target-dir', $TargetRunDir,
         '--message-format=json-render-diagnostics'
     ) -Deadline $buildDeadline -Environment $buildEnvironment -MaxOutputBytes $MAX_PREVIEW_ARTIFACT_BYTES
     $artifactPaths = [System.Collections.Generic.List[string]]::new()
@@ -3773,7 +3773,7 @@ try {
                 return
             }
             if ($message.reason -eq 'compiler-artifact' -and
-                $message.target.name -eq 'devmanager-next' -and
+                $message.target.name -eq 'devmanager' -and
                 -not [string]::IsNullOrWhiteSpace($message.executable)) {
                 if ($artifactPaths.Count -ge $MAX_PREVIEW_JSON_NODES) {
                     throw 'preview.json.node-limit'
@@ -3783,15 +3783,15 @@ try {
         }
     $uniqueArtifactPaths = @($artifactPaths | Sort-Object -Unique)
     if ($uniqueArtifactPaths.Count -ne 1) {
-        throw 'isolated devmanager-next build did not produce exactly one parsed executable artifact.'
+        throw 'isolated devmanager build did not produce exactly one parsed executable artifact.'
     }
     $binary = [IO.Path]::GetFullPath($uniqueArtifactPaths[0])
     $targetRunPrefix = [IO.Path]::GetFullPath($TargetRunDir).TrimEnd('\') + '\'
     if (-not $binary.StartsWith($targetRunPrefix, [StringComparison]::OrdinalIgnoreCase)) {
-        throw 'isolated devmanager-next build produced an executable outside the retained target run.'
+        throw 'isolated devmanager build produced an executable outside the retained target run.'
     }
     if (-not ([IO.Path]::GetFileName($binary)).Equals($artifactBinaryName, [StringComparison]::OrdinalIgnoreCase)) {
-        throw 'isolated devmanager-next build produced an executable with the wrong name.'
+        throw 'isolated devmanager build produced an executable with the wrong name.'
     }
     $afterBuildIdentity = Get-PreviewBuildIdentity -Deadline $buildDeadline -ToolAuthorities $buildIdentity.ToolAuthorities -RetainToolAuthorities
     if ($afterBuildIdentity.BuildIdentityDigest -ne $buildIdentity.BuildIdentityDigest) {

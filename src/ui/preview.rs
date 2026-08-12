@@ -28,10 +28,9 @@ pub const PREVIEW_SCHEMA: &str = "devmanager.ui.preview/v1";
 pub const MAX_FIXTURE_BYTES: u64 = 256 * 1024;
 pub const PREVIEW_SENTINEL_RGBA: [u8; 4] = [0x91, 0x2b, 0xd4, 0xff];
 const PREVIEW_SENTINEL_SIZE: f32 = 32.0;
-const PREVIEW_USAGE: &str =
-    "usage: devmanager-next --ui-preview <fixture.json> --output <preview.png>";
+const PREVIEW_USAGE: &str = "usage: devmanager --ui-preview <fixture.json> --output <preview.png>";
 
-gpui::actions!(devmanager_next, [PreviewDismiss]);
+gpui::actions!(devmanager, [PreviewDismiss]);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -204,11 +203,18 @@ impl PreviewPathPolicy {
     }
 
     pub fn for_workspace(workspace_root: impl AsRef<Path>) -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static PREVIEW_TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
         let workspace_root = workspace_root.as_ref();
+        let run_token = format!(
+            "devmanager-preview-{}-{}",
+            std::process::id(),
+            PREVIEW_TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
         Self::new(
             workspace_root.join("tests/fixtures/ui"),
             workspace_root.join(".devmanager-next/evidence/phase-05/screenshots"),
-            std::env::temp_dir().join("devmanager-next-preview"),
+            std::env::temp_dir().join(run_token),
         )
     }
 

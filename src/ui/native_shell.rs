@@ -35,6 +35,8 @@ use crate::client::action;
 use crate::client::{
     ClientModel, ClientSubscription, HostClient, HostClientConfig, SubscriptionUpdate,
 };
+use crate::config::paths::{resolve_app_paths, AppProfile, BuildKind};
+use crate::domain::host::{HostQuitInspection, HostQuitWorktreeInspection};
 use crate::domain::id::{CommandId, TaskId};
 use crate::domain::ClientId;
 use crate::host::IpcError;
@@ -58,9 +60,22 @@ use crate::ui::terminal_adapter::TerminalDockAdapter;
 pub use crate::ui::terminal_adapter::{TerminalDockState, TERMINAL_ADAPTER_DEPENDENCY};
 use crate::ui::tokens::RuntimePreferencesSnapshot;
 
+/// Explicit UI action: acknowledged client detach (host survives in production).
+#[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
+#[action(name = "native.client_detach")]
+pub struct NativeClientDetach;
+
+/// Explicit UI action: full host quit via inspect_host_quit + confirm_host_quit.
+#[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
+#[action(name = "native.host_full_quit")]
+pub struct NativeHostFullQuit;
+
 const NATIVE_PROFILE_DIR: &str = ".devmanager-next/dev-profile";
 const NATIVE_PROFILE_NAME_PREFIX: &str = "native-next";
 const NATIVE_HOST_SCHEME: &str = "devtest";
+/// Stable pipe/lock profile name for the packaged production host.
+const PRODUCTION_HOST_PROFILE: &str = "production";
+const CLIENT_BUILD_PREFIX: &str = "devmanager";
 const NATIVE_POINTER_ID: u64 = 1;
 const MAX_RENDERED_TASK_ROWS: usize = DEFAULT_VISIBLE_ROWS + FIXED_VIRTUAL_OVERSCAN * 2;
 const MAX_PENDING_HOST_ACTIONS: usize = 32;
@@ -383,6 +398,27 @@ fn terminate_child_with_deadline(mut child: OwnedChild, deadline: NativeShutdown
     retain_child(child);
 }
 
+/// Wait for a host that has accepted an intentional full-quit request to
+/// complete its durable cleanup before releasing the child handle. The host
+/// owns the cleanup state machine; killing it immediately after the Accepted
+/// receipt could strand the Closing journal. If it outlives the bounded wait,
+/// retain the handle for the existing child reaper (the isolated host also has
+/// its parent-pid watchdog).
+fn wait_for_child_exit_with_deadline(mut child: OwnedChild, deadline: NativeShutdownDeadline) {
+    reap_retained_children();
+    while !deadline.expired() {
+        match child.child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => std::thread::sleep(Duration::from_millis(2).min(deadline.remaining())),
+            Err(_) => {
+                retain_child(child);
+                return;
+            }
+        }
+    }
+    retain_child(child);
+}
+
 fn stable_task_element_id(task_id: TaskId) -> ElementId {
     // GPUI has a UUID element identity, so retain all 128 bits of the domain
     // TaskId instead of collapsing it to an offset or a lossy hash.
@@ -458,11 +494,28 @@ impl Display for NativeShellError {
 
 impl Error for NativeShellError {}
 
+/// Whether the shell owns an isolated debug host or the durable production host.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeShellMode {
+    IsolatedDebug,
+    Production,
+}
+
+/// Child-host lifetime policy for the shell that launched it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeHostChildOwnership {
+    /// Debug/test: kill and reap the child when the client drops.
+    TerminateWithClient,
+    /// Production: client close detaches only; the durable host survives.
+    DetachOnClientClose,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IsolatedDevProfile {
     workspace_root: PathBuf,
     root: PathBuf,
     named_profile: String,
+    mode: NativeShellMode,
 }
 
 impl IsolatedDevProfile {
@@ -474,6 +527,14 @@ impl IsolatedDevProfile {
         &self.root
     }
 
+    pub fn mode(&self) -> NativeShellMode {
+        self.mode
+    }
+
+    pub fn is_production(&self) -> bool {
+        self.mode == NativeShellMode::Production
+    }
+
     /// Config base to pass to the isolated `devmanager-host` process. The
     /// host's named profile is created beneath this generated directory; it
     /// never resolves the installed app-data root.
@@ -481,15 +542,22 @@ impl IsolatedDevProfile {
         &self.root
     }
 
-    /// The only profile name accepted by the development host attachment.
+    /// Pipe/lock profile name for host attachment.
     ///
-    /// The name is intentionally explicit and stable; callers must still
-    /// supply the generated isolated profile root when launching the host.
+    /// Isolated debug names are workspace-bound. Production uses the stable
+    /// `production` profile and never reads `DEVMANAGER_PROFILE`.
     pub fn named_profile(&self) -> &str {
         &self.named_profile
     }
 
-    /// Build the one client configuration used by the native-next shell.
+    fn child_ownership(&self) -> NativeHostChildOwnership {
+        match self.mode {
+            NativeShellMode::IsolatedDebug => NativeHostChildOwnership::TerminateWithClient,
+            NativeShellMode::Production => NativeHostChildOwnership::DetachOnClientClose,
+        }
+    }
+
+    /// Build the one client configuration used by the native shell.
     ///
     /// This does not connect, read a profile, or create files. A caller-owned
     /// host controller may use it from its I/O lane and then attach the single
@@ -497,11 +565,13 @@ impl IsolatedDevProfile {
     pub fn host_client_config(&self) -> HostClientConfig {
         HostClientConfig {
             named_profile: self.named_profile().to_string(),
-            client_build: format!("devmanager-next/{}", env!("CARGO_PKG_VERSION")),
+            client_build: format!("{CLIENT_BUILD_PREFIX}/{}", env!("CARGO_PKG_VERSION")),
             client_id: ClientId::new(),
             requested: CapabilitySet::from_capabilities([
                 Capability::PagedSnapshots,
                 Capability::EventReplay,
+                Capability::ExplicitDetach,
+                Capability::HostShutdown,
             ]),
             limits: FrameLimits::v1_default(),
         }
@@ -531,23 +601,36 @@ impl DevTestHostConnection {
     }
 }
 
-/// Exact command line used by the default native-next binary to own the
-/// development host. Keeping this as a value object makes the process seam
-/// injectable without allowing tests to start an installed host.
+/// Exact command line used to own or attach the sibling `devmanager-host`.
+/// Keeping this as a value object makes the process seam injectable without
+/// allowing tests to start an installed host from an isolated profile.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct NativeHostLaunchSpec {
     executable: PathBuf,
-    profile: String,
-    instance_label: String,
-    parent_pid: u32,
-    config_base: PathBuf,
+    mode: NativeHostLaunchMode,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum NativeHostLaunchMode {
+    Isolated {
+        profile: String,
+        instance_label: String,
+        parent_pid: u32,
+        config_base: PathBuf,
+    },
+    Production,
 }
 
 impl NativeHostLaunchSpec {
-    pub(crate) fn for_profile(
+    pub(crate) fn for_isolated_profile(
         profile: &IsolatedDevProfile,
         parent_pid: u32,
     ) -> Result<Self, NativeShellError> {
+        if profile.is_production() {
+            return Err(NativeShellError::HostConnect {
+                message: "isolated host launch requires an isolated debug profile".to_string(),
+            });
+        }
         if parent_pid == 0 {
             return Err(NativeShellError::HostConnect {
                 message: "native host parent PID must be nonzero".to_string(),
@@ -555,25 +638,42 @@ impl NativeHostLaunchSpec {
         }
         Ok(Self {
             executable: native_host_executable()?,
-            profile: profile.named_profile().to_string(),
-            instance_label: "Native Next".to_string(),
-            parent_pid,
-            config_base: profile.host_config_base().to_path_buf(),
+            mode: NativeHostLaunchMode::Isolated {
+                profile: profile.named_profile().to_string(),
+                instance_label: "Native Debug".to_string(),
+                parent_pid,
+                config_base: profile.host_config_base().to_path_buf(),
+            },
+        })
+    }
+
+    pub(crate) fn for_production() -> Result<Self, NativeShellError> {
+        Ok(Self {
+            executable: native_host_executable()?,
+            mode: NativeHostLaunchMode::Production,
         })
     }
 
     fn arguments(&self) -> Vec<String> {
-        vec![
-            "--profile".to_string(),
-            self.profile.clone(),
-            "--instance-label".to_string(),
-            self.instance_label.clone(),
-            "--parent-pid".to_string(),
-            self.parent_pid.to_string(),
-            "--foreground".to_string(),
-            "--config-base".to_string(),
-            self.config_base.display().to_string(),
-        ]
+        match &self.mode {
+            NativeHostLaunchMode::Isolated {
+                profile,
+                instance_label,
+                parent_pid,
+                config_base,
+            } => vec![
+                "--profile".to_string(),
+                profile.clone(),
+                "--instance-label".to_string(),
+                instance_label.clone(),
+                "--parent-pid".to_string(),
+                parent_pid.to_string(),
+                "--foreground".to_string(),
+                "--config-base".to_string(),
+                config_base.display().to_string(),
+            ],
+            NativeHostLaunchMode::Production => vec!["--foreground".to_string()],
+        }
     }
 }
 
@@ -650,12 +750,17 @@ fn validate_native_host_executable(path: &Path) -> Result<PathBuf, NativeShellEr
 }
 
 enum NativeHostProcessKind {
-    Child(OwnedChild),
+    Child {
+        child: OwnedChild,
+        ownership: NativeHostChildOwnership,
+    },
     Empty,
 }
 
-/// Owns the one host child for the native shell. Drop always joins the child
-/// after requesting termination, so no detached host survives a shell close.
+/// Owns an optional host child for the native shell.
+///
+/// Isolated debug ownership terminates the child on drop. Production ownership
+/// detaches only so the durable host survives client close.
 pub struct NativeHostProcess {
     kind: NativeHostProcessKind,
 }
@@ -667,7 +772,10 @@ impl std::fmt::Debug for NativeHostProcess {
             .field(
                 "kind",
                 &match self.kind {
-                    NativeHostProcessKind::Child(_) => "child",
+                    NativeHostProcessKind::Child { ownership, .. } => match ownership {
+                        NativeHostChildOwnership::TerminateWithClient => "child-terminate",
+                        NativeHostChildOwnership::DetachOnClientClose => "child-detach",
+                    },
                     NativeHostProcessKind::Empty => "empty",
                 },
             )
@@ -677,15 +785,52 @@ impl std::fmt::Debug for NativeHostProcess {
 
 impl Drop for NativeHostProcess {
     fn drop(&mut self) {
-        self.terminate(NativeShutdownDeadline::from_now(NATIVE_SHUTDOWN_BUDGET));
+        self.dispose(NativeShutdownDeadline::from_now(NATIVE_SHUTDOWN_BUDGET));
     }
 }
 
 impl NativeHostProcess {
-    fn terminate(&mut self, deadline: NativeShutdownDeadline) {
+    fn owned_child(child: OwnedChild, ownership: NativeHostChildOwnership) -> Self {
+        Self {
+            kind: NativeHostProcessKind::Child { child, ownership },
+        }
+    }
+
+    fn dispose(&mut self, deadline: NativeShutdownDeadline) {
         let kind = std::mem::replace(&mut self.kind, NativeHostProcessKind::Empty);
-        if let NativeHostProcessKind::Child(child) = kind {
-            terminate_child_with_deadline(child, deadline);
+        match kind {
+            NativeHostProcessKind::Child {
+                child,
+                ownership: NativeHostChildOwnership::TerminateWithClient,
+            } => terminate_child_with_deadline(child, deadline),
+            NativeHostProcessKind::Child {
+                mut child,
+                ownership: NativeHostChildOwnership::DetachOnClientClose,
+            } => {
+                // Detach only: never kill a production durable host on client drop.
+                let _ = child.child.try_wait();
+            }
+            NativeHostProcessKind::Empty => {}
+        }
+    }
+
+    /// Dispose after `ConfirmHostQuit` has been accepted. Debug hosts must be
+    /// given time to run their durable cleanup and intentional-exit path; they
+    /// are not killed merely because the client window is closing.
+    fn dispose_after_full_quit(&mut self, deadline: NativeShutdownDeadline) {
+        let kind = std::mem::replace(&mut self.kind, NativeHostProcessKind::Empty);
+        match kind {
+            NativeHostProcessKind::Child {
+                child,
+                ownership: NativeHostChildOwnership::TerminateWithClient,
+            } => wait_for_child_exit_with_deadline(child, deadline),
+            NativeHostProcessKind::Child {
+                mut child,
+                ownership: NativeHostChildOwnership::DetachOnClientClose,
+            } => {
+                let _ = child.child.try_wait();
+            }
+            NativeHostProcessKind::Empty => {}
         }
     }
 }
@@ -710,16 +855,74 @@ impl NativeHostBootstrap for ProcessNativeHostBootstrap {
         let deadline = NativeShutdownDeadline::until(deadline);
         if deadline.expired() {
             return Err(NativeShellError::HostConnect {
-                message: "native host startup deadline expired before launch".to_string(),
+                message: "native host startup deadline expired before attach".to_string(),
             });
         }
-        ensure_isolated_host_config_base(profile)?;
+        if !profile.is_production() {
+            ensure_isolated_host_config_base(profile)?;
+        }
+        if deadline.expired() {
+            return Err(NativeShellError::HostConnect {
+                message: "native host startup deadline expired before attach".to_string(),
+            });
+        }
+
+        // Attach-first: reuse a live host when the pipe is already present.
+        // Missing pipe (Unavailable) falls through to a single spawn.
+        // Pipe Busy gets bounded attach retries and must not be treated as absence.
+        // Timeout means a present-but-slow host: retry attach, never spawn.
+        loop {
+            if deadline.expired() {
+                return Err(NativeShellError::HostConnect {
+                    message: "native host startup deadline expired before attach".to_string(),
+                });
+            }
+            match try_attach_existing_host(profile, deadline) {
+                Ok(runtime) => {
+                    return Ok(NativeHostRuntimeAttachment::Client(runtime));
+                }
+                Err(IpcError::Unavailable) => break,
+                Err(IpcError::Busy) => {
+                    let remaining = deadline.remaining();
+                    if remaining.is_zero() {
+                        return Err(NativeShellError::HostConnect {
+                            message: "native host startup deadline expired while pipe was busy"
+                                .to_string(),
+                        });
+                    }
+                    std::thread::sleep(remaining.min(Duration::from_millis(25)));
+                    continue;
+                }
+                Err(IpcError::Timeout) => {
+                    let remaining = deadline.remaining();
+                    if remaining.is_zero() {
+                        return Err(NativeShellError::HostConnect {
+                            message: "native host attach timed out waiting for a present host"
+                                .to_string(),
+                        });
+                    }
+                    std::thread::sleep(remaining.min(Duration::from_millis(25)));
+                    continue;
+                }
+                Err(error) => {
+                    return Err(NativeShellError::HostConnect {
+                        message: error.to_string(),
+                    });
+                }
+            }
+        }
+
         if deadline.expired() {
             return Err(NativeShellError::HostConnect {
                 message: "native host startup deadline expired before launch".to_string(),
             });
         }
-        let spec = NativeHostLaunchSpec::for_profile(profile, std::process::id())?;
+
+        let spec = if profile.is_production() {
+            NativeHostLaunchSpec::for_production()?
+        } else {
+            NativeHostLaunchSpec::for_isolated_profile(profile, std::process::id())?
+        };
         let permit = acquire_reaper_permit(ReaperKind::Child).ok_or_else(|| {
             NativeShellError::HostConnect {
                 message: "native host child reaper capacity exhausted".to_string(),
@@ -732,6 +935,7 @@ impl NativeHostBootstrap for ProcessNativeHostBootstrap {
         }
         let mut command = Command::new(&spec.executable);
         command.args(spec.arguments());
+        sanitize_spawned_host_environment(&mut command);
         command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -739,17 +943,125 @@ impl NativeHostBootstrap for ProcessNativeHostBootstrap {
         let child = command
             .spawn()
             .map_err(|error| NativeShellError::HostConnect {
-                message: format!("isolated devmanager-host launch failed: {error}"),
+                message: format!("devmanager-host launch failed: {error}"),
             })?;
-        let process = NativeHostProcess {
-            kind: NativeHostProcessKind::Child(OwnedChild {
+        let process = NativeHostProcess::owned_child(
+            OwnedChild {
                 child,
                 _permit: permit,
-            }),
-        };
+            },
+            profile.child_ownership(),
+        );
+        // Concurrent clients may lose the HostLock race; bounded attach retries
+        // converge on the lock winner without inventing a second shutdown path.
         let runtime =
             NativeHostClientRuntime::connect_blocking_with_process(profile, process, deadline)?;
         Ok(NativeHostRuntimeAttachment::Client(runtime))
+    }
+}
+
+/// Strip parent DevManager identity overrides so the sibling host resolves only
+/// from its CLI/profile contract (same removals as library/phase-gate child rules).
+fn sanitize_spawned_host_environment(command: &mut Command) {
+    for key in [
+        "DEVMANAGER_PROFILE",
+        "DEVMANAGER_INSTANCE_LABEL",
+        "DEVMANAGER_RUNTIME_KIND",
+        "DEVMANAGER_CONFIG_DIR",
+        "DEVMANAGER_APP_IDENTITY",
+    ] {
+        command.env_remove(key);
+    }
+}
+
+fn try_attach_existing_host(
+    profile: &IsolatedDevProfile,
+    deadline: NativeShutdownDeadline,
+) -> Result<NativeHostClientRuntime, IpcError> {
+    let runtime = Arc::new(
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .map_err(|_| IpcError::Unavailable)?,
+    );
+    let client = runtime.block_on(tokio::time::timeout(
+        deadline.remaining(),
+        HostClient::connect(profile.host_client_config()),
+    ));
+    let client = match client {
+        Ok(Ok(client)) => client,
+        Ok(Err(error)) => {
+            if let Ok(runtime) = Arc::try_unwrap(runtime) {
+                runtime.shutdown_timeout(Duration::from_millis(1));
+            }
+            return Err(error);
+        }
+        Err(_) => {
+            if let Ok(runtime) = Arc::try_unwrap(runtime) {
+                runtime.shutdown_timeout(Duration::from_millis(1));
+            }
+            // Present-but-slow connect/bootstrap must remain Timeout, never
+            // Unavailable (Unavailable alone authorizes first-launch spawn).
+            return Err(IpcError::Timeout);
+        }
+    };
+    match NativeHostClientRuntime::new_with_runtime(profile, client, runtime.clone()) {
+        Ok(mut runtime_owner) => {
+            let bootstrap = runtime.block_on(tokio::time::timeout(
+                deadline.remaining(),
+                runtime_owner.bootstrap_projection(),
+            ));
+            match bootstrap {
+                Ok(Ok(_)) => Ok(runtime_owner),
+                Ok(Err(error)) => Err(IpcError::Security(error.to_string())),
+                Err(_) => Err(IpcError::Timeout),
+            }
+        }
+        Err(error) => {
+            if let Ok(runtime) = Arc::try_unwrap(runtime) {
+                runtime.shutdown_timeout(Duration::from_millis(1));
+            }
+            Err(IpcError::Security(error.to_string()))
+        }
+    }
+}
+
+/// Authorize ConfirmHostQuit from current inspect facts.
+///
+/// Host may report `confirmable=false` while worktrees are [`HostQuitWorktreeInspection::NotInspected`].
+/// An explicit full-quit action may authorize that uninspected confirmation path, but
+/// agent/resource blockers always fail closed.
+pub(crate) fn authorize_full_host_quit(
+    inspection: &HostQuitInspection,
+    allow_uninspected_worktrees: bool,
+) -> Result<(), String> {
+    if !inspection.agents.is_empty() {
+        return Err(format!(
+            "host quit blocked by {} open agent session(s)",
+            inspection.agents.len()
+        ));
+    }
+    if !inspection.resources.is_empty() {
+        return Err(format!(
+            "host quit blocked by {} active resource(s)",
+            inspection.resources.len()
+        ));
+    }
+    if inspection.confirmable {
+        return Ok(());
+    }
+    match inspection.worktrees {
+        HostQuitWorktreeInspection::NotInspected => {
+            if allow_uninspected_worktrees {
+                Ok(())
+            } else {
+                Err(
+                    "host quit requires allow_uninspected_worktrees while worktrees are NotInspected"
+                        .to_string(),
+                )
+            }
+        }
     }
 }
 
@@ -901,6 +1213,92 @@ pub fn isolated_dev_profile(
         root: workspace_root.join(NATIVE_PROFILE_DIR),
         workspace_root,
         named_profile,
+        mode: NativeShellMode::IsolatedDebug,
+    })
+}
+
+/// Resolve the fail-closed production app root for release native-shell launch.
+///
+/// Never consults `DEVMANAGER_PROFILE`. The pipe/lock profile is the stable
+/// [`PRODUCTION_HOST_PROFILE`] name while storage uses [`AppProfile::Production`].
+pub fn production_shell_profile() -> Result<IsolatedDevProfile, NativeShellError> {
+    if let Some(value) = env::var_os("DEVMANAGER_PROFILE") {
+        return Err(NativeShellError::ProfileOverride {
+            value: value.to_string_lossy().into_owned(),
+        });
+    }
+    let config_dir = dirs::config_dir().ok_or_else(|| NativeShellError::HostConnect {
+        message: "unable to resolve config directory for production profile".to_string(),
+    })?;
+    let config_dir = config_dir
+        .canonicalize()
+        .map_err(|error| NativeShellError::HostConnect {
+            message: format!("unable to canonicalize config directory: {error}"),
+        })?;
+    let resolved = resolve_app_paths(&config_dir, AppProfile::Production, BuildKind::Release)
+        .map_err(|error| NativeShellError::HostConnect {
+            message: error.to_string(),
+        })?;
+    let expected_root = config_dir.join("com.userfirst.devmanager");
+    if resolved.root != expected_root {
+        return Err(NativeShellError::HostConnect {
+            message: format!(
+                "production profile root mismatch: {} != {}",
+                resolved.root.display(),
+                expected_root.display()
+            ),
+        });
+    }
+    let root = if resolved.root.exists() {
+        let canonical =
+            resolved
+                .root
+                .canonicalize()
+                .map_err(|error| NativeShellError::HostConnect {
+                    message: format!(
+                        "unable to canonicalize production root {}: {error}",
+                        resolved.root.display()
+                    ),
+                })?;
+        let expected = if expected_root.exists() {
+            expected_root
+                .canonicalize()
+                .map_err(|error| NativeShellError::HostConnect {
+                    message: format!("unable to canonicalize expected production root: {error}"),
+                })?
+        } else {
+            expected_root
+        };
+        if canonical != expected {
+            return Err(NativeShellError::HostConnect {
+                message: format!(
+                    "production root redirected away from exact app path: {}",
+                    canonical.display()
+                ),
+            });
+        }
+        let metadata = std::fs::symlink_metadata(&canonical).map_err(|error| {
+            NativeShellError::HostConnect {
+                message: format!("unable to inspect production root metadata: {error}"),
+            }
+        })?;
+        if path_is_reparse_or_symlink(&metadata) {
+            return Err(NativeShellError::HostConnect {
+                message: format!(
+                    "production root must not be a reparse point: {}",
+                    canonical.display()
+                ),
+            });
+        }
+        canonical
+    } else {
+        expected_root
+    };
+    Ok(IsolatedDevProfile {
+        workspace_root: root.clone(),
+        root,
+        named_profile: PRODUCTION_HOST_PROFILE.to_string(),
+        mode: NativeShellMode::Production,
     })
 }
 
@@ -1484,7 +1882,9 @@ impl NativeHostRuntimeBinding {
 pub(crate) struct NativeHostClientRuntime {
     binding: NativeHostRuntimeBinding,
     endpoint: String,
-    client: Arc<Mutex<HostClient>>,
+    /// `None` only while a lifecycle path temporarily owns the client so locks
+    /// are never held across host awaits.
+    client: Arc<Mutex<Option<HostClient>>>,
     subscription: Arc<Mutex<ClientSubscription>>,
     client_model: Arc<Mutex<Option<Arc<ClientModel>>>>,
     bootstrapped: Arc<AtomicBool>,
@@ -1500,6 +1900,19 @@ pub(crate) struct NativeHostClientRuntime {
     host_process: Option<NativeHostProcess>,
     deferred_action_outcome: Arc<Mutex<Option<NativeHostActionOutcome>>>,
     worker_overflow: Arc<Mutex<VecDeque<NativeHostActionOutcome>>>,
+    /// Ordinary close/detach never arms host quit; full-quit uses inspect/confirm.
+    lifecycle: NativeClientLifecycle,
+}
+
+/// Explicit client-to-host lifecycle intent owned by the shell runtime.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum NativeClientLifecycle {
+    #[default]
+    Connected,
+    /// Host-acknowledged ExplicitDetach completed; production host survives.
+    Detached,
+    /// confirm_host_quit was accepted through HostShutdown authority.
+    FullQuitConfirmed,
 }
 
 mod native_host_runtime_sealed {
@@ -1535,7 +1948,8 @@ impl std::fmt::Debug for NativeHostClientRuntime {
                 &self
                     .client
                     .lock()
-                    .map(|client| client.is_connected())
+                    .ok()
+                    .and_then(|guard| guard.as_ref().map(|client| client.is_connected()))
                     .unwrap_or(false),
             )
             .field("pending_count", &self.pending.len())
@@ -1651,7 +2065,7 @@ impl NativeHostClientRuntime {
             Ok(runtime) => Arc::new(runtime),
             Err(error) => {
                 let mut process = process;
-                process.terminate(deadline);
+                process.dispose(deadline);
                 return Err(NativeShellError::HostConnect {
                     message: format!("runtime bootstrap failed: {error}"),
                 });
@@ -1661,7 +2075,7 @@ impl NativeHostClientRuntime {
             Ok(client) => client,
             Err(error) => {
                 let mut process = process;
-                process.terminate(deadline);
+                process.dispose(deadline);
                 return Err(NativeShellError::HostConnect {
                     message: error.to_string(),
                 });
@@ -1671,7 +2085,7 @@ impl NativeHostClientRuntime {
             match Self::new_with_runtime_and_process(profile, client, runtime.clone(), process) {
                 Ok(runtime_owner) => runtime_owner,
                 Err((error, mut process)) => {
-                    process.terminate(deadline);
+                    process.dispose(deadline);
                     return Err(error);
                 }
             };
@@ -1690,7 +2104,7 @@ impl NativeHostClientRuntime {
             });
         if let Err(error) = bootstrap {
             if let Some(process) = runtime_owner.host_process.as_mut() {
-                process.terminate(deadline);
+                process.dispose(deadline);
             }
             return Err(error);
         }
@@ -1711,7 +2125,7 @@ impl NativeHostClientRuntime {
         runtime_guard: Option<Arc<tokio::runtime::Runtime>>,
     ) -> Result<Self, NativeShellError> {
         let endpoint = client.endpoint().to_string();
-        let client = Arc::new(Mutex::new(client));
+        let client = Arc::new(Mutex::new(Some(client)));
         let subscription = Arc::new(Mutex::new(ClientSubscription::new()));
         let client_model = Arc::new(Mutex::new(None));
         let bootstrapped = Arc::new(AtomicBool::new(false));
@@ -1792,6 +2206,7 @@ impl NativeHostClientRuntime {
             host_process: None,
             deferred_action_outcome,
             worker_overflow,
+            lifecycle: NativeClientLifecycle::Connected,
         })
     }
 
@@ -1812,7 +2227,8 @@ impl NativeHostClientRuntime {
     pub(crate) fn is_connected(&self) -> bool {
         self.client
             .lock()
-            .map(|client| client.is_connected())
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|client| client.is_connected()))
             .unwrap_or(false)
     }
 
@@ -1880,6 +2296,172 @@ impl NativeHostClientRuntime {
         self.cancellation.store(true, Ordering::Release);
         if self.worker.is_some() {
             let _ = self.command_tx.try_send(NativeHostWorkerCommand::Shutdown);
+        }
+    }
+
+    /// Host-acknowledged detach. Ordinary window close uses this path and never
+    /// calls [`HostClient::confirm_host_quit`].
+    ///
+    /// Cancels/joins the subscription worker first, then takes client ownership
+    /// so host awaits never run under `client`/`subscription` locks (worker uses
+    /// client→subscription order; this path must not invert or nest locks).
+    pub(crate) fn acknowledge_client_detach(
+        &mut self,
+        deadline: NativeShutdownDeadline,
+    ) -> Result<Uuid, NativeShellError> {
+        if matches!(
+            self.lifecycle,
+            NativeClientLifecycle::Detached | NativeClientLifecycle::FullQuitConfirmed
+        ) {
+            return Ok(Uuid::nil());
+        }
+        self.begin_shutdown();
+        if let Some(worker) = self.worker.take() {
+            join_worker_with_deadline(worker, deadline);
+        }
+        let Some(runtime) = self.runtime_guard.as_ref() else {
+            return Err(NativeShellError::HostConnect {
+                message: "native host runtime unavailable for client detach".to_string(),
+            });
+        };
+        let remaining = deadline.remaining();
+        if remaining.is_zero() {
+            return Err(NativeShellError::HostConnect {
+                message: "native host detach deadline expired".to_string(),
+            });
+        }
+
+        // Take ownership without holding locks across host awaits.
+        let mut client = self
+            .client
+            .lock()
+            .map_err(|_| NativeShellError::HostConnect {
+                message: "native host client lock poisoned during detach".to_string(),
+            })?
+            .take()
+            .ok_or_else(|| NativeShellError::HostConnect {
+                message: "native host client unavailable during detach".to_string(),
+            })?;
+        let mut subscription = {
+            let mut guard =
+                self.subscription
+                    .lock()
+                    .map_err(|_| NativeShellError::HostConnect {
+                        message: "native host subscription lock poisoned during detach".to_string(),
+                    })?;
+            std::mem::replace(&mut *guard, ClientSubscription::new())
+        };
+
+        let result = runtime.block_on(async {
+            tokio::time::timeout(remaining, async {
+                let _ = subscription.release(&mut client).await;
+                client.detach().await
+            })
+            .await
+        });
+
+        // Restore owned handles (detached client stays disconnected).
+        if let Ok(mut guard) = self.subscription.lock() {
+            *guard = subscription;
+        }
+        if let Ok(mut guard) = self.client.lock() {
+            *guard = Some(client);
+        }
+
+        match result {
+            Ok(Ok(connection_id)) => {
+                self.lifecycle = NativeClientLifecycle::Detached;
+                Ok(connection_id)
+            }
+            Ok(Err(error)) => Err(NativeShellError::HostConnect {
+                message: format!("acknowledged client detach failed: {error}"),
+            }),
+            Err(_) => Err(NativeShellError::HostConnect {
+                message: "acknowledged client detach deadline expired".to_string(),
+            }),
+        }
+    }
+
+    /// Explicit full quit through existing HostShutdown inspect/confirm authority.
+    ///
+    /// Uses inspect facts for fail-closed blocker checks. When worktrees are
+    /// `NotInspected` and `confirmable` is false, only an explicitly authorized
+    /// `allow_uninspected_worktrees` confirmation may proceed.
+    pub(crate) fn confirm_full_host_quit(
+        &mut self,
+        allow_uninspected_worktrees: bool,
+        deadline: NativeShutdownDeadline,
+    ) -> Result<crate::domain::command::CommandReceipt, NativeShellError> {
+        if matches!(self.lifecycle, NativeClientLifecycle::FullQuitConfirmed) {
+            return Err(NativeShellError::HostConnect {
+                message: "full host quit already confirmed on this client".to_string(),
+            });
+        }
+        self.begin_shutdown();
+        if let Some(worker) = self.worker.take() {
+            join_worker_with_deadline(worker, deadline);
+        }
+        let Some(runtime) = self.runtime_guard.as_ref() else {
+            return Err(NativeShellError::HostConnect {
+                message: "native host runtime unavailable for full quit".to_string(),
+            });
+        };
+        let remaining = deadline.remaining();
+        if remaining.is_zero() {
+            return Err(NativeShellError::HostConnect {
+                message: "native host full-quit deadline expired".to_string(),
+            });
+        }
+
+        let mut client = self
+            .client
+            .lock()
+            .map_err(|_| NativeShellError::HostConnect {
+                message: "native host client lock poisoned during full quit".to_string(),
+            })?
+            .take()
+            .ok_or_else(|| NativeShellError::HostConnect {
+                message: "native host client unavailable during full quit".to_string(),
+            })?;
+
+        let result = runtime.block_on(async {
+            tokio::time::timeout(remaining, async {
+                let inspection = match client.inspect_host_quit().await? {
+                    Ok(inspection) => inspection,
+                    Err(error) => {
+                        return Err(IpcError::Security(format!(
+                            "inspect_host_quit rejected: {error}"
+                        )));
+                    }
+                };
+                authorize_full_host_quit(&inspection, allow_uninspected_worktrees)
+                    .map_err(|message| IpcError::Security(message))?;
+                client
+                    .confirm_host_quit(
+                        CommandId::new(),
+                        inspection.inspection_id,
+                        allow_uninspected_worktrees,
+                    )
+                    .await
+            })
+            .await
+        });
+
+        if let Ok(mut guard) = self.client.lock() {
+            *guard = Some(client);
+        }
+
+        match result {
+            Ok(Ok(receipt)) => {
+                self.lifecycle = NativeClientLifecycle::FullQuitConfirmed;
+                Ok(receipt)
+            }
+            Ok(Err(error)) => Err(NativeShellError::HostConnect {
+                message: format!("full host quit failed: {error}"),
+            }),
+            Err(_) => Err(NativeShellError::HostConnect {
+                message: "full host quit deadline expired".to_string(),
+            }),
         }
     }
 
@@ -1967,46 +2549,70 @@ impl NativeHostClientRuntime {
     pub async fn bootstrap_projection(
         &mut self,
     ) -> Result<Vec<NativeHostProjectionKind>, NativeShellError> {
-        {
-            let mut client = self
-                .client
-                .lock()
-                .map_err(|_| NativeShellError::HostConnect {
-                    message: "native host client lock poisoned".to_string(),
-                })?;
-            let mut subscription =
+        // Take ownership before the await. Holding either mutex across host
+        // I/O would deadlock lifecycle paths and previously passed the
+        // `MutexGuard<Option<HostClient>>` itself to `synchronize`.
+        let mut client_owned = self
+            .client
+            .lock()
+            .map_err(|_| NativeShellError::HostConnect {
+                message: "native host client lock poisoned".to_string(),
+            })?
+            .take()
+            .ok_or_else(|| NativeShellError::HostConnect {
+                message: "native host client unavailable during bootstrap".to_string(),
+            })?;
+        let mut subscription_owned = {
+            let mut guard =
                 self.subscription
                     .lock()
                     .map_err(|_| NativeShellError::HostConnect {
                         message: "native host subscription lock poisoned".to_string(),
                     })?;
-            subscription
-                .synchronize(&mut client)
-                .await
-                .map_err(|error| NativeShellError::HostConnect {
-                    message: error.to_string(),
-                })?;
-            let model = Arc::new(subscription.model().cloned().ok_or_else(|| {
-                NativeShellError::HostConnect {
-                    message: "native host subscription produced no client model".to_string(),
-                }
-            })?);
-            if let Ok(mut current) = self.client_model.lock() {
-                *current = Some(Arc::clone(&model));
-            }
-            let epochs = current_runtime_epochs(&self.epochs);
+            std::mem::replace(&mut *guard, ClientSubscription::new())
+        };
+        let synchronized = subscription_owned.synchronize(&mut client_owned).await;
+        let model = synchronized
+            .map_err(|error| NativeShellError::HostConnect {
+                message: error.to_string(),
+            })
+            .and_then(|()| {
+                subscription_owned
+                    .model()
+                    .cloned()
+                    .map(Arc::new)
+                    .ok_or_else(|| NativeShellError::HostConnect {
+                        message: "native host subscription produced no client model".to_string(),
+                    })
+            });
+        let restore_subscription = self.subscription.lock().map(|mut guard| {
+            *guard = subscription_owned;
+        });
+        let restore_client = self.client.lock().map(|mut guard| {
+            *guard = Some(client_owned);
+        });
+        restore_subscription.map_err(|_| NativeShellError::HostConnect {
+            message: "native host subscription lock poisoned during bootstrap restore".to_string(),
+        })?;
+        restore_client.map_err(|_| NativeShellError::HostConnect {
+            message: "native host client lock poisoned during bootstrap restore".to_string(),
+        })?;
+        let model = model?;
+        if let Ok(mut current) = self.client_model.lock() {
+            *current = Some(Arc::clone(&model));
+        }
+        let epochs = current_runtime_epochs(&self.epochs);
+        publish_projection(
+            &self.ready_projections,
+            NativeHostProjection::client_model(Arc::clone(&model)).at_epochs(epochs),
+        );
+        for _ in 0..MAX_HOST_PROJECTIONS.saturating_sub(1) {
             publish_projection(
                 &self.ready_projections,
-                NativeHostProjection::client_model(Arc::clone(&model)).at_epochs(epochs),
+                NativeHostProjection::kind(NativeHostProjectionKind::Replay).at_epochs(epochs),
             );
-            for _ in 0..MAX_HOST_PROJECTIONS.saturating_sub(1) {
-                publish_projection(
-                    &self.ready_projections,
-                    NativeHostProjection::kind(NativeHostProjectionKind::Replay).at_epochs(epochs),
-                );
-            }
-            self.bootstrapped.store(true, Ordering::Release);
         }
+        self.bootstrapped.store(true, Ordering::Release);
         Ok([
             NativeHostProjectionKind::Snapshot,
             NativeHostProjectionKind::Replay,
@@ -2022,7 +2628,8 @@ impl NativeHostClientRuntime {
         &mut self,
         envelope: crate::domain::command::CommandEnvelope,
     ) -> Result<crate::domain::command::CommandReceipt, IpcError> {
-        let mut client = self.client.lock().map_err(|_| IpcError::Unavailable)?;
+        let mut guard = self.client.lock().map_err(|_| IpcError::Unavailable)?;
+        let client = guard.as_mut().ok_or(IpcError::Unavailable)?;
         client.execute_command(envelope).await
     }
 
@@ -2138,27 +2745,55 @@ impl Drop for NativeHostClientRuntime {
         if !shutdown_outcomes.is_empty() {
             retain_uncertain_action_batch(shutdown_outcomes);
         }
-        if let Some(runtime) = self.runtime_guard.as_ref() {
-            // A worker retained past the join budget may still own either
-            // mutex while it observes cancellation. Never block on those
-            // locks after the shared deadline has started; the retained
-            // worker keeps the client/subscription ownership alive for its
-            // eventual reaper.
-            if let (Ok(mut client), Ok(mut subscription)) =
-                (self.client.try_lock(), self.subscription.try_lock())
-            {
-                let remaining = deadline.remaining();
-                if !remaining.is_zero() {
-                    let _ = runtime.block_on(async {
-                        tokio::time::timeout(remaining, subscription.release(&mut client)).await
-                    });
+        match self.lifecycle {
+            NativeClientLifecycle::Connected => {
+                // Ordinary window close: acknowledged detach only. Never
+                // inspect/confirm host quit from Drop.
+                let _ = self.acknowledge_client_detach(deadline);
+            }
+            NativeClientLifecycle::Detached | NativeClientLifecycle::FullQuitConfirmed => {
+                if let Some(runtime) = self.runtime_guard.as_ref() {
+                    // client → subscription order; no host awaits under nested locks.
+                    let mut client = match self.client.lock() {
+                        Ok(mut guard) => guard.take(),
+                        Err(_) => None,
+                    };
+                    let mut subscription = match self.subscription.lock() {
+                        Ok(mut guard) => {
+                            Some(std::mem::replace(&mut *guard, ClientSubscription::new()))
+                        }
+                        Err(_) => None,
+                    };
+                    if let (Some(ref mut client), Some(ref mut subscription)) =
+                        (client.as_mut(), subscription.as_mut())
+                    {
+                        let remaining = deadline.remaining();
+                        if !remaining.is_zero() {
+                            let _ = runtime.block_on(async {
+                                tokio::time::timeout(remaining, subscription.release(client)).await
+                            });
+                        }
+                    }
+                    if let (Ok(mut guard), Some(subscription)) =
+                        (self.subscription.lock(), subscription)
+                    {
+                        *guard = subscription;
+                    }
+                    if let (Ok(mut guard), Some(client)) = (self.client.lock(), client) {
+                        *guard = Some(client);
+                    }
                 }
             }
         }
         if let Some(process) = self.host_process.as_mut() {
-            let kind = std::mem::replace(&mut process.kind, NativeHostProcessKind::Empty);
-            if let NativeHostProcessKind::Child(child) = kind {
-                terminate_child_with_deadline(child, deadline);
+            // Production DetachOnClientClose never kills the durable host here.
+            // A debug full quit is different from an ordinary client close:
+            // wait for the host's accepted cleanup/intentional-exit path before
+            // releasing its TerminateWithClient child handle.
+            if matches!(self.lifecycle, NativeClientLifecycle::FullQuitConfirmed) {
+                process.dispose_after_full_quit(deadline);
+            } else {
+                process.dispose(deadline);
             }
         }
         if let Some(runtime) = self.runtime_guard.take() {
@@ -2207,7 +2842,7 @@ async fn connect_with_startup_retry(
 }
 
 fn native_host_worker_loop(
-    client: Arc<Mutex<HostClient>>,
+    client: Arc<Mutex<Option<HostClient>>>,
     subscription: Arc<Mutex<ClientSubscription>>,
     client_model: Arc<Mutex<Option<Arc<ClientModel>>>>,
     bootstrapped: Arc<AtomicBool>,
@@ -2290,12 +2925,13 @@ fn native_host_worker_loop(
                         }
                     }
                     command => {
-                        let result = client.lock().ok().map(|mut client| {
-                            runtime.block_on(execute_native_command_cancellable(
-                                &mut client,
+                        let result = client.lock().ok().and_then(|mut guard| {
+                            let client = guard.as_mut()?;
+                            Some(runtime.block_on(execute_native_command_cancellable(
+                                client,
                                 command,
                                 &cancellation,
-                            ))
+                            )))
                         });
                         match result {
                             Some(Ok(receipt)) => {
@@ -2501,7 +3137,7 @@ fn publish_worker_projection(
 }
 
 fn pump_subscription_once(
-    client: &Arc<Mutex<HostClient>>,
+    client: &Arc<Mutex<Option<HostClient>>>,
     subscription: &Arc<Mutex<ClientSubscription>>,
     client_model: &Arc<Mutex<Option<Arc<ClientModel>>>>,
     runtime: &tokio::runtime::Runtime,
@@ -2527,6 +3163,9 @@ fn pump_subscription_once(
             );
             return;
         };
+        let Some(client_ref) = client_guard.as_ref() else {
+            return;
+        };
         let Ok(mut subscription_guard) = subscription.lock() else {
             publish_projection(
                 projections,
@@ -2543,7 +3182,7 @@ fn pump_subscription_once(
         };
         runtime.block_on(tokio::time::timeout(
             Duration::from_millis(2),
-            subscription_guard.recv_and_apply(&client_guard),
+            subscription_guard.recv_and_apply(client_ref),
         ))
     };
 
@@ -2563,7 +3202,8 @@ fn pump_subscription_once(
             ) {
                 let was_connected = client
                     .lock()
-                    .map(|client| client.is_connected())
+                    .ok()
+                    .and_then(|guard| guard.as_ref().map(|client| client.is_connected()))
                     .unwrap_or(false);
                 match resynchronize_subscription(
                     client,
@@ -2633,7 +3273,8 @@ fn pump_subscription_once(
         SubscriptionUpdate::ResyncRequired { .. } => {
             let was_connected = client
                 .lock()
-                .map(|client| client.is_connected())
+                .ok()
+                .and_then(|guard| guard.as_ref().map(|client| client.is_connected()))
                 .unwrap_or(false);
             let model = resynchronize_subscription(
                 client,
@@ -2685,38 +3326,44 @@ fn pump_subscription_once(
 }
 
 fn resynchronize_subscription(
-    client: &Arc<Mutex<HostClient>>,
+    client: &Arc<Mutex<Option<HostClient>>>,
     subscription: &Arc<Mutex<ClientSubscription>>,
     runtime: &tokio::runtime::Runtime,
     cancellation: &Arc<AtomicBool>,
     deadline: NativeShutdownDeadline,
 ) -> Result<(Arc<ClientModel>, bool), String> {
-    let mut client_guard = client
+    // Take ownership so host awaits do not run under mutex guards.
+    let mut client_owned = client
         .lock()
-        .map_err(|_| "native host client lock poisoned".to_string())?;
-    let mut subscription_guard = subscription
-        .lock()
-        .map_err(|_| "native host subscription lock poisoned".to_string())?;
-    let was_connected = client_guard.is_connected();
+        .map_err(|_| "native host client lock poisoned".to_string())?
+        .take()
+        .ok_or_else(|| "native host client unavailable during resync".to_string())?;
+    let mut subscription_owned = {
+        let mut guard = subscription
+            .lock()
+            .map_err(|_| "native host subscription lock poisoned".to_string())?;
+        std::mem::replace(&mut *guard, ClientSubscription::new())
+    };
+    let was_connected = client_owned.is_connected();
     let result = runtime.block_on(async {
         tokio::time::timeout(deadline.remaining(), async {
             tokio::select! {
                 result = async {
-                    if client_guard.is_connected() {
-                        subscription_guard
-                            .release(&mut client_guard)
+                    if client_owned.is_connected() {
+                        subscription_owned
+                            .release(&mut client_owned)
                             .await
                             .map_err(|error| error.to_string())?;
                     }
-                    if !client_guard.is_connected() {
-                        client_guard
+                    if !client_owned.is_connected() {
+                        client_owned
                             .reconnect()
                             .await
                             .map_err(|error| error.to_string())?;
                     }
-                    *subscription_guard = ClientSubscription::new();
-                    subscription_guard
-                        .synchronize(&mut client_guard)
+                    subscription_owned = ClientSubscription::new();
+                    subscription_owned
+                        .synchronize(&mut client_owned)
                         .await
                         .map_err(|error| error.to_string())
                 } => result,
@@ -2728,12 +3375,21 @@ fn resynchronize_subscription(
         .await
         .map_err(|_| "native host subscription resync deadline expired".to_string())?
     });
-    result?;
-    let model = subscription_guard
-        .model()
-        .cloned()
-        .map(Arc::new)
-        .ok_or_else(|| "native host resync produced no client model".to_string())?;
+    let model = match result {
+        Ok(()) => subscription_owned
+            .model()
+            .cloned()
+            .map(Arc::new)
+            .ok_or_else(|| "native host resync produced no client model".to_string()),
+        Err(error) => Err(error),
+    };
+    if let Ok(mut guard) = subscription.lock() {
+        *guard = subscription_owned;
+    }
+    if let Ok(mut guard) = client.lock() {
+        *guard = Some(client_owned);
+    }
+    let model = model?;
     Ok((model, !was_connected))
 }
 
@@ -4713,6 +5369,42 @@ impl NativeShell {
         self.bounds_subscription = Some(bounds);
     }
 
+    /// Explicit acknowledged detach path used by UI action and ordinary close.
+    pub fn request_acknowledged_client_detach(&mut self) -> Result<(), NativeShellError> {
+        let deadline = NativeShutdownDeadline::from_now(NATIVE_SHUTDOWN_BUDGET);
+        match self.host_runtime.as_mut() {
+            Some(NativeHostRuntimeAttachment::Client(runtime)) => {
+                runtime.acknowledge_client_detach(deadline)?;
+                Ok(())
+            }
+            Some(NativeHostRuntimeAttachment::Injected(_)) => Err(NativeShellError::HostConnect {
+                message: "injected host runtime cannot acknowledge detach".to_string(),
+            }),
+            None => Err(NativeShellError::HostConnect {
+                message: "no host runtime attached for client detach".to_string(),
+            }),
+        }
+    }
+
+    /// Explicit full-quit path using inspect_host_quit then confirm_host_quit.
+    pub fn request_full_host_quit(
+        &mut self,
+        allow_uninspected_worktrees: bool,
+    ) -> Result<crate::domain::command::CommandReceipt, NativeShellError> {
+        let deadline = NativeShutdownDeadline::from_now(NATIVE_SHUTDOWN_BUDGET);
+        match self.host_runtime.as_mut() {
+            Some(NativeHostRuntimeAttachment::Client(runtime)) => {
+                runtime.confirm_full_host_quit(allow_uninspected_worktrees, deadline)
+            }
+            Some(NativeHostRuntimeAttachment::Injected(_)) => Err(NativeShellError::HostConnect {
+                message: "injected host runtime cannot confirm full quit".to_string(),
+            }),
+            None => Err(NativeShellError::HostConnect {
+                message: "no host runtime attached for full quit".to_string(),
+            }),
+        }
+    }
+
     pub(crate) fn host_runtime(&self) -> Option<&NativeHostClientRuntime> {
         self.host_runtime
             .as_ref()
@@ -5184,6 +5876,34 @@ impl NativeShell {
             cx.stop_propagation();
             shell.dispatch_action(ActionRequest::HostStatus);
         });
+        let client_detach = cx.listener(|shell, _action: &NativeClientDetach, _window, cx| {
+            cx.stop_propagation();
+            match shell.request_acknowledged_client_detach() {
+                Ok(_) => cx.quit(),
+                Err(error) => {
+                    shell.last_action_failure = Some(NativeHostActionFailure::ExecutionFailed {
+                        action_id: "native.client_detach",
+                        command_id: None,
+                        message: bounded_host_error(error.to_string()),
+                    });
+                }
+            }
+        });
+        let host_full_quit = cx.listener(|shell, _action: &NativeHostFullQuit, _window, cx| {
+            cx.stop_propagation();
+            // Explicit UI full quit authorizes the NotInspected worktree path;
+            // agent/resource blockers still fail closed via inspect facts.
+            match shell.request_full_host_quit(true) {
+                Ok(_) => cx.quit(),
+                Err(error) => {
+                    shell.last_action_failure = Some(NativeHostActionFailure::ExecutionFailed {
+                        action_id: "native.host_full_quit",
+                        command_id: None,
+                        message: bounded_host_error(error.to_string()),
+                    });
+                }
+            }
+        });
         let task_list = cx.listener(|shell, _action: &TaskListAction, _window, cx| {
             cx.stop_propagation();
             shell.dispatch_action(ActionRequest::TaskList);
@@ -5297,6 +6017,8 @@ impl NativeShell {
             .track_focus(&self.focus_handle)
             .on_action::<HostActions>(host_actions)
             .on_action::<HostStatus>(host_status)
+            .on_action::<NativeClientDetach>(client_detach)
+            .on_action::<NativeHostFullQuit>(host_full_quit)
             .on_action::<TaskListAction>(task_list)
             .on_action::<TaskShow>(task_show)
             .on_action::<TaskCreate>(task_create)
@@ -5508,12 +6230,25 @@ impl Render for NativeShell {
     }
 }
 
-/// Launch the actual native GPUI shell with only the generated isolated
-/// dev/test profile. The preview CLI remains a separate host-free path.
+/// Launch the native GPUI shell.
+///
+/// Debug builds use the generated isolated workspace profile and may parent-bind
+/// the host. Release builds use the fail-closed production profile and attach to
+/// the durable sibling host without parent-pid ownership.
 pub fn run_native_shell(workspace_root: impl AsRef<Path>) -> Result<(), NativeShellError> {
-    let profile = isolated_dev_profile(workspace_root)?;
-    let mut bootstrap = ProcessNativeHostBootstrap;
-    run_native_shell_with_bootstrap(profile, &mut bootstrap)
+    #[cfg(debug_assertions)]
+    {
+        let profile = isolated_dev_profile(workspace_root)?;
+        let mut bootstrap = ProcessNativeHostBootstrap;
+        run_native_shell_with_bootstrap(profile, &mut bootstrap)
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = workspace_root;
+        let profile = production_shell_profile()?;
+        let mut bootstrap = ProcessNativeHostBootstrap;
+        run_native_shell_with_bootstrap(profile, &mut bootstrap)
+    }
 }
 
 pub(crate) fn run_native_shell_with_bootstrap(
@@ -5569,7 +6304,7 @@ fn launch_native_shell(
     host_state: NativeHostState,
 ) -> Result<(), NativeShellError> {
     eprintln!(
-        "devmanager-next native shell profile: {}",
+        "devmanager native shell profile: {}",
         profile.root().display()
     );
     let error_slot = Rc::new(RefCell::new(None));
@@ -5665,7 +6400,7 @@ mod tests {
         ensure_isolated_host_config_base, isolated_dev_profile, publish_projection,
         reap_retained_children, reap_retained_workers, retain_child, retain_worker,
         retained_children, take_retained_action_outcomes, wait_for_cancellation, AccessibilityTree,
-        NativeActionRecord, NativeHostActionFailure, NativeHostActionOutcome,
+        ClientId, CommandId, NativeActionRecord, NativeHostActionFailure, NativeHostActionOutcome,
         NativeHostActionResult, NativeHostProjection, NativeHostProjectionKind,
         NativeHostRuntimeEpochs, NativeHostRuntimePort, NativeHostWorkerCommand, NativeInteraction,
         NativePlatformAccessibilityBridge, NativeShell, NativeShutdownDeadline, OwnedChild,
@@ -6754,6 +7489,74 @@ mod tests {
     }
 
     #[test]
+    fn product_client_build_never_uses_devmanager_next_prefix() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let profile = isolated_dev_profile(workspace.path()).expect("isolated profile");
+        assert!(profile
+            .host_client_config()
+            .client_build
+            .starts_with("devmanager/"));
+        assert!(!profile
+            .host_client_config()
+            .client_build
+            .contains("devmanager-next"));
+    }
+
+    #[test]
+    fn isolated_launch_spec_parent_binds_and_production_omits_parent_pid() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let isolated = isolated_dev_profile(workspace.path()).expect("isolated profile");
+        let isolated_spec = NativeHostLaunchSpec {
+            executable: PathBuf::from("devmanager-host.exe"),
+            mode: NativeHostLaunchMode::Isolated {
+                profile: isolated.named_profile().to_string(),
+                instance_label: "Native Debug".to_string(),
+                parent_pid: 42,
+                config_base: isolated.host_config_base().to_path_buf(),
+            },
+        };
+        let isolated_args = isolated_spec.arguments();
+        assert!(isolated_args.iter().any(|arg| arg == "--parent-pid"));
+        assert!(isolated_args.iter().any(|arg| arg == "--config-base"));
+        assert_eq!(isolated.mode(), NativeShellMode::IsolatedDebug);
+
+        let production = IsolatedDevProfile {
+            workspace_root: isolated.root().to_path_buf(),
+            root: isolated.root().to_path_buf(),
+            named_profile: PRODUCTION_HOST_PROFILE.to_string(),
+            mode: NativeShellMode::Production,
+        };
+        let production_spec = NativeHostLaunchSpec {
+            executable: PathBuf::from("devmanager-host.exe"),
+            mode: NativeHostLaunchMode::Production,
+        };
+        let production_args = production_spec.arguments();
+        assert_eq!(production_args, vec!["--foreground".to_string()]);
+        assert!(!production_args.iter().any(|arg| arg == "--parent-pid"));
+        assert_eq!(
+            production.child_ownership(),
+            NativeHostChildOwnership::DetachOnClientClose
+        );
+        assert_eq!(
+            isolated.child_ownership(),
+            NativeHostChildOwnership::TerminateWithClient
+        );
+    }
+
+    #[test]
+    fn native_host_process_detach_ownership_does_not_require_child_kill_path() {
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/ui/native_shell.rs"
+        ));
+        assert!(source.contains("DetachOnClientClose"));
+        assert!(source.contains("try_attach_existing_host"));
+        assert!(source.contains("PRODUCTION_HOST_PROFILE"));
+        assert!(!source.contains("\"devmanager-next/"));
+        assert!(!source.contains("Native Next"));
+    }
+
+    #[test]
     fn native_profile_identity_is_workspace_bound_not_global() {
         let first = tempfile::tempdir().expect("first workspace");
         let second = tempfile::tempdir().expect("second workspace");
@@ -6813,6 +7616,281 @@ mod tests {
             );
         }
         assert!(pending.len() <= MAX_PENDING_PREFERENCES);
+    }
+
+    #[test]
+    fn spawned_host_environment_sanitizer_clears_devmanager_identity_overrides() {
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/ui/native_shell.rs"
+        ));
+        assert!(source.contains("fn sanitize_spawned_host_environment"));
+        assert!(source.contains("sanitize_spawned_host_environment(&mut command)"));
+        for key in [
+            "DEVMANAGER_PROFILE",
+            "DEVMANAGER_INSTANCE_LABEL",
+            "DEVMANAGER_RUNTIME_KIND",
+            "DEVMANAGER_CONFIG_DIR",
+            "DEVMANAGER_APP_IDENTITY",
+        ] {
+            assert!(
+                source.contains(&format!("\"{key}\"")),
+                "sanitizer must clear {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn authorize_full_host_quit_uses_inspect_facts_not_always_false_confirmable() {
+        use crate::domain::host::{
+            HostQuitInspection, HostQuitResourceBlocker, HostQuitWorktreeInspection,
+        };
+        use crate::domain::id::ResourceId;
+        use crate::domain::resource::{OwnerKind, ResourceKind, ResourceLifecycle};
+
+        let clean = HostQuitInspection {
+            inspection_id: 7,
+            agents: Vec::new(),
+            resources: Vec::new(),
+            worktrees: HostQuitWorktreeInspection::NotInspected,
+            confirmable: false,
+        };
+        assert!(
+            authorize_full_host_quit(&clean, false).is_err(),
+            "NotInspected without authorization must fail closed"
+        );
+        assert!(
+            authorize_full_host_quit(&clean, true).is_ok(),
+            "explicit allow_uninspected_worktrees authorizes NotInspected when no blockers"
+        );
+
+        let mut confirmable = clean.clone();
+        confirmable.confirmable = true;
+        assert!(authorize_full_host_quit(&confirmable, false).is_ok());
+
+        let blocked = HostQuitInspection {
+            inspection_id: 8,
+            agents: Vec::new(),
+            resources: vec![HostQuitResourceBlocker {
+                resource_id: ResourceId::from_bytes([
+                    0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0xb1,
+                ])
+                .expect("resource"),
+                task_id: None,
+                task_title: None,
+                owner_kind: OwnerKind::Host,
+                resource_kind: ResourceKind::Terminal,
+                lifecycle: ResourceLifecycle::Active,
+                runtime_generation: 0,
+            }],
+            worktrees: HostQuitWorktreeInspection::NotInspected,
+            confirmable: false,
+        };
+        assert!(
+            authorize_full_host_quit(&blocked, true).is_err(),
+            "resource blockers must fail closed even with uninspected authorization"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fake_host_two_clients_attach_detach_and_inspect_confirm_full_quit() {
+        use crate::domain::command::{
+            Command, CommandEnvelope, CommandReceipt, ConfirmHostQuitIntent,
+        };
+        use crate::domain::id::RequestId;
+        use crate::domain::query::{Query, QueryEnvelope, QueryOutcome, QueryResult};
+        use crate::host::{
+            ConnectionOutputHandle, ConnectionOutputId, HostRequestExecutor, OutputInspection,
+        };
+        use crate::kernel::CommandBus;
+        use crate::protocol::{
+            Capability, CapabilitySet, ClientRequest, DetachAck, DetachRequest, FrameLimits,
+            NegotiatedParameters, ProtocolVersion, ServerMessage,
+        };
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Isolated temp DB — never production profile / installed app root.
+        let bus = CommandBus::open(&dir.path().join("phase11-entry.db")).expect("bus");
+        let (requests, executor) = HostRequestExecutor::start(bus);
+
+        let id_a = uuid::Uuid::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xa1,
+        ]);
+        let id_b = uuid::Uuid::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xa2,
+        ]);
+        let (out_a, mut ports_a) = ConnectionOutputHandle::with_connection_id(id_a, 2, 4, 1);
+        let (out_b, _ports_b) = ConnectionOutputHandle::with_connection_id(id_b, 2, 4, 1);
+        let shutdown_a = out_a.subscribe_shutdown();
+        let reg_a = requests
+            .register_output(out_a.clone())
+            .await
+            .expect("register client A");
+        let reg_b = requests
+            .register_output(out_b.clone())
+            .await
+            .expect("register client B");
+        assert_eq!(reg_a.id().as_uuid(), id_a);
+        assert_eq!(reg_b.id().as_uuid(), id_b);
+
+        let client = ClientId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xa3,
+        ])
+        .expect("client");
+        let negotiated = NegotiatedParameters {
+            version: ProtocolVersion::current(),
+            client_id: client,
+            capabilities: CapabilitySet::from_capabilities([
+                Capability::ExplicitDetach,
+                Capability::HostShutdown,
+                Capability::PagedSnapshots,
+                Capability::EventReplay,
+            ]),
+            limits: FrameLimits::v1_default(),
+        };
+        let handle_a = requests.with_output(reg_a.id());
+        let handle_b = requests.with_output(reg_b.id());
+
+        let detach_request_id = RequestId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xa4,
+        ])
+        .expect("detach request");
+        let ack_message = handle_a
+            .execute(
+                negotiated,
+                ClientRequest::Detach(DetachRequest {
+                    request_id: detach_request_id,
+                    client_id: client,
+                    connection_id: id_a,
+                }),
+            )
+            .await
+            .expect("acknowledged detach");
+        assert_eq!(
+            ack_message,
+            ServerMessage::Detached(DetachAck {
+                request_id: detach_request_id,
+                connection_id: id_a,
+            })
+        );
+        assert_eq!(
+            requests
+                .inspect_output(ConnectionOutputId::from_uuid(id_a))
+                .await
+                .expect("inspect A after detach"),
+            OutputInspection {
+                registered: false,
+                live_bound: false,
+            }
+        );
+        assert!(
+            requests
+                .inspect_output(ConnectionOutputId::from_uuid(id_b))
+                .await
+                .expect("inspect B after A detach")
+                .registered,
+            "second client must remain attached"
+        );
+        out_a
+            .try_enqueue_critical_shutdown_after_write(ack_message.clone())
+            .expect("admit detach ack");
+        let outbound = ports_a
+            .try_recv_prioritized()
+            .expect("detach ack on critical lane");
+        assert_eq!(outbound.message(), &ack_message);
+        outbound.after_successful_write();
+        assert!(*shutdown_a.borrow());
+
+        let inspect = handle_b
+            .execute(
+                negotiated,
+                ClientRequest::Query(QueryEnvelope {
+                    request_id: RequestId::from_bytes([
+                        0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00,
+                        0x00, 0x00, 0x00, 0xa5,
+                    ])
+                    .expect("inspect request"),
+                    client_id: client,
+                    task_id: None,
+                    query: Query::InspectHostQuit,
+                }),
+            )
+            .await
+            .expect("inspect");
+        let ServerMessage::QueryReply(reply) = inspect else {
+            panic!("expected inspect query reply, got {inspect:?}");
+        };
+        let QueryOutcome::Ok(QueryResult::HostQuitInspection { inspection }) = reply.outcome else {
+            panic!("expected HostQuitInspection, got {:?}", reply.outcome);
+        };
+        assert!(
+            !inspection.confirmable,
+            "current host slice reports confirmable=false while worktrees are NotInspected"
+        );
+        authorize_full_host_quit(&inspection, true).expect("authorized uninspected path");
+        let confirmed = handle_b
+            .execute(
+                negotiated,
+                ClientRequest::Command(CommandEnvelope {
+                    command_id: CommandId::from_bytes([
+                        0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00,
+                        0x00, 0x00, 0x00, 0xa6,
+                    ])
+                    .expect("confirm command"),
+                    client_id: client,
+                    task_id: None,
+                    issued_at_ms: 1_725_000_000_500,
+                    expected_task_revision: None,
+                    command: Command::ConfirmHostQuit(ConfirmHostQuitIntent {
+                        inspection_id: inspection.inspection_id,
+                        allow_uninspected_worktrees: true,
+                    }),
+                }),
+            )
+            .await
+            .expect("confirm");
+        assert!(
+            matches!(
+                confirmed,
+                ServerMessage::CommandReceipt(CommandReceipt::Accepted { .. })
+            ),
+            "inspect→confirm full quit must Accept, got {confirmed:?}"
+        );
+        drop(executor);
+    }
+
+    #[test]
+    fn attach_timeout_is_preserved_and_never_treated_as_missing_pipe() {
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/ui/native_shell.rs"
+        ));
+        assert!(
+            source.contains("return Err(IpcError::Timeout)"),
+            "slow connect/bootstrap must map to Timeout"
+        );
+        let attach_loop = source
+            .split("match try_attach_existing_host")
+            .nth(1)
+            .unwrap_or_default();
+        assert!(
+            attach_loop.contains("Err(IpcError::Unavailable) => break"),
+            "only Unavailable may fall through to spawn"
+        );
+        assert!(
+            attach_loop.contains("Err(IpcError::Timeout)")
+                && attach_loop.contains("continue")
+                && !attach_loop
+                    .lines()
+                    .take(40)
+                    .any(|line| line.contains("Err(IpcError::Busy) | Err(IpcError::Timeout)")),
+            "Timeout must retry separately from Busy and must not spawn"
+        );
     }
 }
 

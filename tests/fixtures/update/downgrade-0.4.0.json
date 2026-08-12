@@ -1,0 +1,16 @@
+{
+  "version": "0.4.0",
+  "notes": "Older release must not downgrade an installed 0.4.1.",
+  "pub_date": "2026-07-01T12:00:00Z",
+  "minimum_protocol": "1.0",
+  "platforms": {
+    "windows-x86_64": {
+      "format": "nsis",
+      "signature": "dGVzdC1zaWduYXR1cmUtMC40LjAtZG93bmdyYWRl",
+      "url": "https://github.com/example/devmanager/releases/download/v0.4.0/DevManager_0.4.0_x64-setup.exe",
+      "hash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "client_build": "devmanager/0.4.0",
+      "host_build": "devmanager-host/0.4.0"
+    }
+  }
+}

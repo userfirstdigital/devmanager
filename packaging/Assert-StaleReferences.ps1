@@ -1,0 +1,113 @@
+#Requires -Version 5.1
+<##
+.SYNOPSIS
+  Fail-closed stale-reference scan for active Phase 11 package sources.
+
+.DESCRIPTION
+  Scans only the roots and forbidden patterns declared by package-contract.json.
+  Historical residuals are allowed only by the narrow, reviewed allowlist in
+  packaging/stale-reference-historical-allowlist.txt. This package check is
+  intentionally separate from scripts/native-next/Invoke-CutoverAudit.ps1,
+  which owns the authenticated, bounded cutover parity audit.
+#>
+[CmdletBinding()]
+param(
+    [string]$RepoRoot = ''
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+if (-not $RepoRoot) {
+    $scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
+    $RepoRoot = (Resolve-Path (Join-Path $scriptDir '..')).Path
+}
+
+function Write-Failure([string]$Message) {
+    Write-Error -Message $Message -ErrorAction Stop
+}
+
+function Get-RelativePath([string]$Root, [string]$FullPath) {
+    $rootNorm = (Resolve-Path -LiteralPath $Root).Path.Replace('\', '/').TrimEnd('/')
+    $fullNorm = (Resolve-Path -LiteralPath $FullPath).Path.Replace('\', '/')
+    if ($fullNorm.Length -le $rootNorm.Length -or
+        -not $fullNorm.StartsWith($rootNorm + '/', [System.StringComparison]::OrdinalIgnoreCase)) {
+        Write-Failure "Scanned path escaped repository root: $FullPath"
+    }
+    return $fullNorm.Substring($rootNorm.Length + 1)
+}
+
+function Test-HistoricalAllowlisted([string]$RelativePath, [string[]]$Allowlist) {
+    $rel = $RelativePath.Replace('\', '/')
+    foreach ($entry in $Allowlist) {
+        if (-not $entry) { continue }
+        if ($entry.EndsWith('/')) {
+            if ($rel.StartsWith($entry) -or $rel.Contains('/' + $entry.TrimEnd('/') + '/')) {
+                return $true
+            }
+        } elseif ($rel -eq $entry) {
+            return $true
+        }
+    }
+    return $false
+}
+
+$contractPath = Join-Path $RepoRoot 'packaging\package-contract.json'
+$allowlistPath = Join-Path $RepoRoot 'packaging\stale-reference-historical-allowlist.txt'
+if (-not (Test-Path -LiteralPath $contractPath -PathType Leaf)) {
+    Write-Failure "Missing package contract: $contractPath"
+}
+if (-not (Test-Path -LiteralPath $allowlistPath -PathType Leaf)) {
+    Write-Failure "Missing stale-reference allowlist: $allowlistPath"
+}
+
+$contract = Get-Content -LiteralPath $contractPath -Raw | ConvertFrom-Json
+$scan = $contract.staleReferenceScan
+$roots = @($scan.scanRoots | ForEach-Object { [string]$_ })
+$patterns = @($scan.forbiddenPatterns | ForEach-Object { [string]$_ })
+$allowlist = @(
+    Get-Content -LiteralPath $allowlistPath |
+        Where-Object { $_ -and -not $_.StartsWith('#') } |
+        ForEach-Object { $_.Trim().Replace('\', '/') }
+)
+if ($roots.Count -lt 1 -or $patterns.Count -lt 1 -or $allowlist.Count -lt 1) {
+    Write-Failure 'staleReferenceScan requires scan roots, forbidden patterns, and allowlist entries'
+}
+
+$failures = New-Object 'System.Collections.Generic.List[string]'
+$scanned = 0
+foreach ($root in $roots) {
+    $path = Join-Path $RepoRoot $root
+    if (-not (Test-Path -LiteralPath $path)) {
+        $failures.Add("missing scan root: $root")
+        continue
+    }
+    $files = @()
+    if (Test-Path -LiteralPath $path -PathType Leaf) {
+        $files = @(Get-Item -LiteralPath $path)
+    } else {
+        $files = @(Get-ChildItem -LiteralPath $path -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.Extension -in @('.md', '.yml', '.yaml', '.ps1', '.json', '.rs', '.toml', '.txt', '.sh')
+            })
+    }
+    foreach ($file in $files) {
+        $relative = Get-RelativePath -Root $RepoRoot -FullPath $file.FullName
+        if (Test-HistoricalAllowlisted -RelativePath $relative -Allowlist $allowlist) {
+            continue
+        }
+        $text = Get-Content -LiteralPath $file.FullName -Raw -ErrorAction SilentlyContinue
+        if (-not $text) { continue }
+        $scanned += 1
+        foreach ($pattern in $patterns) {
+            if ($text.Contains($pattern)) {
+                $failures.Add("stale reference '$pattern' in $relative")
+            }
+        }
+    }
+}
+
+if ($failures.Count -gt 0) {
+    Write-Failure ("Stale reference scan failed:`n - " + ($failures -join "`n - "))
+}
+Write-Host ("Stale reference scan passed ({0} files scanned; {1} historical allowlist entries)." -f $scanned, $allowlist.Count)
