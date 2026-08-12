@@ -7,14 +7,34 @@ use devmanager::ui::components::error_boundary::{
 };
 use devmanager::ui::components::icon_button::{IconButton, TooltipContract};
 use devmanager::ui::components::interaction::{
-    AccessibilityMetadata, AccessibleRole, ActivationSource, ComponentError, FocusEpochSource,
-    InteractionState, InteractionStateModel, InteractionTransition, KeyboardKey,
+    AccessibilityMetadata, AccessibleRole, ActionEvent, ActionId, ActivationSource, ComponentError,
+    FocusEpochSource, InteractionState, InteractionStateModel, InteractionTransition, KeyboardKey,
 };
 use devmanager::ui::components::status_light::StatusLight;
 use devmanager::ui::components::text_field::{
     TextField, TextFieldError, TextFieldKey, TextFieldLimits,
 };
 use devmanager::ui::tokens::{theme, Density, Scale, StatusMeaning, ThemeMode};
+use static_assertions::assert_not_impl_any;
+use std::sync::{Arc, Mutex};
+
+assert_not_impl_any!(InteractionStateModel: Clone);
+assert_not_impl_any!(InteractionStateModel: Copy);
+
+fn action_id(value: &str) -> ActionId {
+    ActionId::new(value).expect("test action ids are stable and valid")
+}
+
+fn recording_callback() -> (
+    Arc<Mutex<Vec<ActionEvent>>>,
+    impl Fn(ActionEvent) + Send + Sync + 'static,
+) {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&events);
+    (events, move |event| {
+        sink.lock().expect("event sink lock").push(event)
+    })
+}
 #[test]
 fn interaction_transition_table_rejects_invalid_combinations_and_fails_closed() {
     let state = InteractionState::default()
