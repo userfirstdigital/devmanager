@@ -71,12 +71,83 @@ export function createConnectClientSession(taskId: string): ConnectClientSession
   };
 }
 
-export function visibleController(_session: ConnectClientSession): null {
-  return null;
+export interface VisibleController {
+  clientId: string;
+  taskId: string;
+  turnEpoch: TurnEpoch;
+  focusEpoch: FocusEpoch;
 }
 
-export function ownerBadge(_session: ConnectClientSession): null {
-  return null;
+export interface OwnerBadge {
+  clientId: string;
+  revision: number;
+}
+
+export interface HostSessionProjection {
+  taskId: string;
+  revision: number;
+  turnEpoch: TurnEpoch;
+  focusEpoch: FocusEpoch;
+}
+
+function lastSenderMatches(session: ConnectClientSession): boolean {
+  const lastSender = session.lastSender;
+  return (
+    lastSender !== null &&
+    lastSender.taskId === session.taskId &&
+    lastSender.turnEpoch === session.turnEpoch &&
+    lastSender.focusEpoch === session.focusEpoch
+  );
+}
+
+export function visibleController(
+  session: ConnectClientSession,
+): VisibleController | null {
+  if (!lastSenderMatches(session) || !session.lastSender) return null;
+  return {
+    clientId: session.lastSender.clientId,
+    taskId: session.taskId,
+    turnEpoch: session.turnEpoch,
+    focusEpoch: session.focusEpoch,
+  };
+}
+
+export function ownerBadge(session: ConnectClientSession): OwnerBadge | null {
+  const controller = visibleController(session);
+  if (!controller) return null;
+  return {
+    clientId: controller.clientId,
+    revision: session.revision,
+  };
+}
+
+export function applyHostProjection(
+  session: ConnectClientSession,
+  projection: HostSessionProjection,
+): void {
+  if (projection.taskId !== session.taskId) {
+    session.taskId = projection.taskId;
+    session.accepted.clear();
+    session.lastSender = null;
+  }
+  session.revision = projection.revision;
+  session.turnEpoch = projection.turnEpoch;
+  session.focusEpoch = projection.focusEpoch;
+}
+
+export function observeAuthoritativeSender(
+  session: ConnectClientSession,
+  clientId: string | null,
+  observedAtMs = 0,
+): void {
+  if (!clientId) return;
+  session.lastSender = {
+    taskId: session.taskId,
+    clientId,
+    observedAtMs,
+    turnEpoch: session.turnEpoch,
+    focusEpoch: session.focusEpoch,
+  };
 }
 
 export function connectClient(
@@ -155,6 +226,6 @@ export function reconcileEcho(
   return session.accepted.get(commandId);
 }
 
-export function requiresManualRefresh(_session: ConnectClientSession): false {
-  return false;
+export function requiresManualRefresh(session: ConnectClientSession): boolean {
+  return session.lastSender !== null && !lastSenderMatches(session);
 }

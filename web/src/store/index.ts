@@ -30,6 +30,7 @@ import type {
   WsStatus,
 } from "../api/ws";
 import { isTransientComposerRejection, WsClient } from "../api/ws";
+import { staleResumeRequiresRefresh } from "../connect/resume";
 import { stageDraftHandoff } from "../drafts/draftStore";
 import { requestCompatibleBuild } from "../pwa/register";
 
@@ -873,9 +874,11 @@ export const useStore = create<StoreState>((set, get) => {
     if (resumeState.workspace) {
       reconcileSnapshot(resumeState.workspace, resumeState.hardReset);
     } else if (
-      resumeState.hardReset ||
-      (get().runtimeInstanceId !== null &&
-        get().runtimeInstanceId !== resumeState.runtimeInstanceId)
+      staleResumeRequiresRefresh({
+        hardReset: resumeState.hardReset,
+        seenRuntimeInstanceId: get().runtimeInstanceId,
+        resumeRuntimeInstanceId: resumeState.runtimeInstanceId,
+      })
     ) {
       invalidateAsyncOperations();
       get().client?.resetRuntime("host runtime changed");

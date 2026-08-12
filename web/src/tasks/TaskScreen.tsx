@@ -23,6 +23,23 @@ import {
   useReturnBehavior,
   useTerminalPreference,
 } from "../settings/inputPreference";
+import { GuestActionNotice } from "../connect/GuestActionNotice";
+import {
+  canPerform,
+  canUseOwnerControls,
+  deriveComposerMode,
+  deriveConnectUiGate,
+  resolveCapabilityGrant,
+  type CapabilityGrant,
+} from "../connect/permissions";
+import {
+  applyHostProjection,
+  createConnectClientSession,
+  observeAuthoritativeSender,
+  ownerBadge,
+  requiresManualRefresh,
+  visibleController,
+} from "../connect/session";
 import { useStore } from "../store";
 import { DEFAULT_TASK_RESOURCE } from "./taskId";
 import { Composer } from "./Composer";
@@ -81,12 +98,14 @@ export function TaskScreen({
   status,
   onNavigate,
   demoEvents,
+  grant: grantProp,
 }: {
   route: Extract<AppRoute, { name: "task" }>;
   workspace: WebWorkspaceSnapshot;
   status: WsStatus;
   onNavigate(route: AppRoute): void;
   demoEvents?: SemanticEvent[];
+  grant?: CapabilityGrant | null;
 }) {
   const stableSessionKey = stableSessionKeyForRoute(route);
   const summary = workspace.sessions.find(
@@ -116,6 +135,9 @@ export function TaskScreen({
   const restartSsh = useStore((state) => state.restartSsh);
   const disconnectSsh = useStore((state) => state.disconnectSsh);
   const foregroundConnection = useStore((state) => state.foregroundConnection);
+  const refreshActiveConnection = useStore(
+    (state) => state.refreshActiveConnection,
+  );
   const sendInput = useStore((state) => state.sendInput);
   const [density] = useDensityPreference();
   const [returnBehavior] = useReturnBehavior();
@@ -129,6 +151,9 @@ export function TaskScreen({
   >(null);
   const latestDraft = useRef("");
   const loadedDraftKey = useRef<string | null>(null);
+  const connectSessionRef = useRef(
+    createConnectClientSession(stableSessionKey ?? route.taskId),
+  );
 
   const item = useMemo(
     () => (summary ? describeTask(workspace, summary) : null),
@@ -185,6 +210,37 @@ export function TaskScreen({
   }
 
   const connected = status.kind === "open";
+  const grant = resolveCapabilityGrant({
+    statusKind: status.kind,
+    taskId: stableSessionKey,
+    grant: grantProp,
+  });
+  const composerMode = deriveComposerMode(grant);
+  const sendGate = deriveConnectUiGate({
+    grant,
+    action: "sendPrompt",
+    statusKind: status.kind,
+  });
+  const mutateAllowed = canPerform(grant, "mutateTask") && connected;
+  const answerAllowed = canPerform(grant, "answerRequest") && connected;
+  const sendAllowed = sendGate.kind === "allowed";
+  const ownerControls = canUseOwnerControls(grant);
+  if (connectSessionRef.current.taskId !== stableSessionKey) {
+    connectSessionRef.current = createConnectClientSession(stableSessionKey);
+  }
+  applyHostProjection(connectSessionRef.current, {
+    taskId: stableSessionKey,
+    revision: workspace.revision,
+    turnEpoch: Math.max(1, writerLease.generation),
+    focusEpoch: 1,
+  });
+  observeAuthoritativeSender(
+    connectSessionRef.current,
+    writerLease.ownerClientInstanceId,
+  );
+  const controller = visibleController(connectSessionRef.current);
+  const badge = ownerBadge(connectSessionRef.current);
+  const refreshRequired = requiresManualRefresh(connectSessionRef.current);
   const live = isLiveStatus(summary.status);
   const ai = summary.kind === "claude" || summary.kind === "codex";
   const provider = ai ? (summary.kind as "claude" | "codex") : null;
@@ -222,48 +278,67 @@ export function TaskScreen({
     connected && writerLease.ownerClientInstanceId && !writerLease.youAreOwner
       ? "Active on another device · tap here to continue"
       : null;
-  const composer = (
-    <Composer
-      key={`${workspace.runtimeInstanceId}:${stableSessionKey}`}
-      scopeKey={`${workspace.runtimeInstanceId}:${stableSessionKey}`}
-      value={draft}
-      disabled={!connected}
-      editingDisabled={!live}
-      pending={mutationPending}
-      supportsAttachments={ai}
-      provider={provider ?? undefined}
-      catalogSessionKey={stableSessionKey}
-      returnBehavior={returnBehavior}
-      placeholder={
-        ai
-          ? `Message ${summary.kind === "claude" ? "Claude" : "Codex"}`
-          : "Enter a command"
-      }
-      note={controlNote}
-      thinking={ai && summary.aiActivity === "Thinking"}
-      onStop={() => interruptSession(stableSessionKey)}
-      onFocus={prepareComposer}
-      onSafetyStateChange={(safety) =>
-        setComposerSafety(stableSessionKey, safety)
-      }
-      onChange={(value) => {
-        setDraft(stableSessionKey, value);
-        saveDraft(workspace.runtimeInstanceId, stableSessionKey, value);
-      }}
-      onSubmit={async (text, attachments) => {
-        await submitComposer(stableSessionKey, text, attachments);
-        removeDraft(workspace.runtimeInstanceId, stableSessionKey);
-      }}
-      onProviderCommandSubmitted={(command) => {
-        if (!provider) return;
-        setProviderInteractionLabel(
-          `${provider === "claude" ? "Claude" : "Codex"} · ${command.name}`,
-        );
-        setTerminalPinned(true);
-        onNavigate(routeForTaskId(route.taskId, "terminal"));
-      }}
+  const composerNotice = (
+    <GuestActionNotice
+      grant={grant}
+      action="sendPrompt"
+      statusKind={status.kind}
     />
   );
+  const composer =
+    composerMode === "hidden" ? (
+      composerNotice
+    ) : (
+      <>
+        {sendGate.kind === "denied" ? composerNotice : null}
+        <Composer
+          key={`${workspace.runtimeInstanceId}:${stableSessionKey}`}
+          scopeKey={`${workspace.runtimeInstanceId}:${stableSessionKey}`}
+          value={draft}
+          disabled={!connected}
+          editingDisabled={!live}
+          pending={mutationPending}
+          supportsAttachments={ai}
+          provider={provider ?? undefined}
+          catalogSessionKey={stableSessionKey}
+          returnBehavior={returnBehavior}
+          placeholder={
+            ai
+              ? `Message ${summary.kind === "claude" ? "Claude" : "Codex"}`
+              : "Enter a command"
+          }
+          note={controlNote}
+          thinking={ai && summary.aiActivity === "Thinking"}
+          onStop={() => {
+            if (!mutateAllowed) return;
+            interruptSession(stableSessionKey);
+          }}
+          onFocus={prepareComposer}
+          onSafetyStateChange={(safety) =>
+            setComposerSafety(stableSessionKey, safety)
+          }
+          onChange={(value) => {
+            setDraft(stableSessionKey, value);
+            saveDraft(workspace.runtimeInstanceId, stableSessionKey, value);
+          }}
+          onSubmit={async (text, attachments) => {
+            if (!sendAllowed) {
+              throw new Error("This action is not permitted.");
+            }
+            await submitComposer(stableSessionKey, text, attachments);
+            removeDraft(workspace.runtimeInstanceId, stableSessionKey);
+          }}
+          onProviderCommandSubmitted={(command) => {
+            if (!provider || !sendAllowed) return;
+            setProviderInteractionLabel(
+              `${provider === "claude" ? "Claude" : "Codex"} · ${command.name}`,
+            );
+            setTerminalPinned(true);
+            onNavigate(routeForTaskId(route.taskId, "terminal"));
+          }}
+        />
+      </>
+    );
 
   let content;
   if (resource === "browser") {
@@ -292,18 +367,20 @@ export function TaskScreen({
         density={density}
         adapterHealth={summary.adapterHealth}
         running={live}
-        actionsDisabled={!connected}
+        actionsDisabled={!mutateAllowed}
         questionChoicesDisabled={
-          !connected ||
+          !answerAllowed ||
           !live ||
           mutationPending ||
           summary.attention !== "needsInput"
         }
         composer={composer}
         onRestart={() => {
-          if (tab) void restartAiTab(tab.id);
+          if (!mutateAllowed || !tab) return;
+          void restartAiTab(tab.id);
         }}
         onQuestionChoice={(choice) => {
+          if (!answerAllowed) return;
           const draftSnapshot = latestDraft.current;
           const submission = submitComposer(stableSessionKey, choice, []);
           // Restore without setDraft: setDraft cancels a pending mutation when
@@ -330,18 +407,19 @@ export function TaskScreen({
         port={port}
         events={events}
         density={density}
-        actionsDisabled={!connected}
-        onStart={() =>
-          commandId &&
-          sendAction({ type: "startServer", command_id: commandId })
-        }
-        onStop={() =>
-          commandId && sendAction({ type: "stopServer", command_id: commandId })
-        }
-        onRestart={() =>
-          commandId &&
-          sendAction({ type: "restartServer", command_id: commandId })
-        }
+        actionsDisabled={!mutateAllowed}
+        onStart={() => {
+          if (!mutateAllowed || !commandId) return;
+          sendAction({ type: "startServer", command_id: commandId });
+        }}
+        onStop={() => {
+          if (!mutateAllowed || !commandId) return;
+          sendAction({ type: "stopServer", command_id: commandId });
+        }}
+        onRestart={() => {
+          if (!mutateAllowed || !commandId) return;
+          sendAction({ type: "restartServer", command_id: commandId });
+        }}
       />
     );
   } else {
@@ -350,29 +428,35 @@ export function TaskScreen({
         events={events}
         density={density}
         connected={live}
-        actionsDisabled={!connected}
+        actionsDisabled={!mutateAllowed}
         composer={composer}
         onReconnect={
-          summary.kind === "ssh" && tab?.connectionId
-            ? () => connectSsh(tab.connectionId as string)
-            : commandId
-              ? () => sendAction({ type: "startServer", command_id: commandId })
-              : undefined
+          !mutateAllowed
+            ? undefined
+            : summary.kind === "ssh" && tab?.connectionId
+              ? () => connectSsh(tab.connectionId as string)
+              : commandId
+                ? () => sendAction({ type: "startServer", command_id: commandId })
+                : undefined
         }
         onRestart={
-          summary.kind === "ssh" && tab?.connectionId
-            ? () => restartSsh(tab.connectionId as string)
-            : summary.kind === "server" && commandId
-              ? () =>
-                  sendAction({ type: "restartServer", command_id: commandId })
-              : undefined
+          !mutateAllowed
+            ? undefined
+            : summary.kind === "ssh" && tab?.connectionId
+              ? () => restartSsh(tab.connectionId as string)
+              : summary.kind === "server" && commandId
+                ? () =>
+                    sendAction({ type: "restartServer", command_id: commandId })
+                : undefined
         }
         onDisconnect={
-          summary.kind === "ssh" && tab?.connectionId
-            ? () => disconnectSsh(tab.connectionId as string)
-            : summary.kind === "server" && commandId
-              ? () => sendAction({ type: "stopServer", command_id: commandId })
-              : undefined
+          !mutateAllowed
+            ? undefined
+            : summary.kind === "ssh" && tab?.connectionId
+              ? () => disconnectSsh(tab.connectionId as string)
+              : summary.kind === "server" && commandId
+                ? () => sendAction({ type: "stopServer", command_id: commandId })
+                : undefined
         }
         disconnectLabel={summary.kind === "server" ? "Stop" : "Disconnect"}
       />
@@ -397,6 +481,14 @@ export function TaskScreen({
           <p>
             {item.projectName} · {item.stateLabel}
           </p>
+          {controller ? (
+            <p data-testid="connect-visible-controller">
+              Controller · {controller.clientId}
+            </p>
+          ) : null}
+          {badge && ownerControls ? (
+            <p data-testid="connect-owner-badge">Owner · rev {badge.revision}</p>
+          ) : null}
         </div>
         <button
           type="button"
@@ -421,7 +513,9 @@ export function TaskScreen({
                 // Claude keeps provider menus open after the web view returns
                 // to native mode. Close the known interaction at that exact
                 // boundary so the next native prompt starts in the composer.
-                sendInput(summary.sessionId, "\u{1b}", "bytes");
+                if (mutateAllowed) {
+                  sendInput(summary.sessionId, "\u{1b}", "bytes");
+                }
               }
               setProviderInteractionLabel(null);
               setTerminalPinned(false);
@@ -445,6 +539,17 @@ export function TaskScreen({
           )}
         </button>
       </header>
+      {refreshRequired ? (
+        <div data-testid="connect-manual-refresh" role="status">
+          <span>Session is stale · refresh to resume safely.</span>
+          <button
+            type="button"
+            onClick={() => refreshActiveConnection()}
+          >
+            Refresh session
+          </button>
+        </div>
+      ) : null}
       {content}
     </section>
   );

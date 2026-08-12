@@ -11,8 +11,18 @@ import type {
   WsOutbound,
 } from "./types";
 import { EMPTY_WRITER_LEASE, WEB_PROTOCOL_VERSION } from "./types";
-import { buildWebSocketUrl } from "../lib/browserIdentity";
 import { CLIENT_WEB_BUILD_ID } from "../pwa/buildCompatibility";
+import {
+  MAX_PENDING_OUTBOUND_BYTES,
+  MAX_PENDING_OUTBOUND_ITEMS,
+  allowsRawTerminal,
+  classifyInboundFrame,
+  inboundTextByteLength,
+  isRawTerminalWriterFrame,
+  selectConnectRoute,
+  type ConnectRoute,
+  type ConnectRouteSelection,
+} from "../connect/transport";
 
 export type WsStatus =
   | { kind: "idle" }
@@ -52,6 +62,11 @@ export interface WsClientCallbacks {
   getResumeContext?(): ResumeContext;
   onHelloFailure?(failure: WsHelloFailure): void;
 }
+
+export type WsClientOptions = Pick<
+  ConnectRouteSelection,
+  "preferDirect" | "directAvailable" | "relayUrl"
+>;
 
 export type WsHelloFailure =
   | { kind: "missingHello" }
@@ -112,8 +127,6 @@ const COMPOSER_RETRY_MIN_MS = 250;
 const COMPOSER_RETRY_MAX_MS = 1_000;
 const COMPOSER_ACK_TIMEOUT_MS = 5_000;
 const FOREGROUND_WAKE_COALESCE_MS = 1_000;
-const MAX_PENDING_OUTBOUND_ITEMS = 256;
-const MAX_PENDING_OUTBOUND_BYTES = 8 * 1_024 * 1_024;
 const OUTBOUND_CAPACITY_MESSAGE =
   "Too much outbound work is waiting to be sent.";
 const CLIENT_INSTANCE_ID_KEY = "devmanager.clientInstanceId";
@@ -264,8 +277,16 @@ export class WsClient {
   private pendingOutboundItems = 0;
   private pendingOutboundBytes = 0;
   private handshakeReady = false;
+  private route: ConnectRoute | null = null;
 
-  constructor(private readonly cb: WsClientCallbacks) {}
+  constructor(
+    private readonly cb: WsClientCallbacks,
+    private readonly options: WsClientOptions = {},
+  ) {}
+
+  currentRoute(): ConnectRoute | null {
+    return this.route;
+  }
 
   async start(): Promise<void> {
     if (this.stopped || this.starting) return;
@@ -297,9 +318,15 @@ export class WsClient {
     }
 
     if (!this.isCurrentEpoch(epoch)) return;
+    this.route = selectConnectRoute({
+      preferDirect: this.options.preferDirect,
+      directAvailable: this.options.directAvailable,
+      relayUrl: this.options.relayUrl,
+      location,
+    });
     let socket: WebSocket;
     try {
-      socket = new WebSocket(buildWebSocketUrl(location));
+      socket = new WebSocket(this.route.url);
     } catch (error) {
       this.scheduleReconnect(`construct failed: ${error}`);
       return;
@@ -320,6 +347,16 @@ export class WsClient {
     socket.onmessage = (event) => {
       if (!this.isCurrentSocket(socket, epoch)) return;
       if (typeof event.data === "string") {
+        const inboundClass = classifyInboundFrame({
+          channel: "text",
+          byteLength: inboundTextByteLength(event.data),
+        });
+        if (inboundClass !== "ok") {
+          if (!this.handshakeReady) {
+            this.failHello(socket, epoch, { kind: "missingHello" });
+          }
+          return;
+        }
         let parsedValue: unknown;
         try {
           parsedValue = JSON.parse(event.data) as unknown;
@@ -390,6 +427,14 @@ export class WsClient {
           this.failHello(socket, epoch, { kind: "missingHello" });
           return;
         }
+        if (this.route && !allowsRawTerminal(this.route)) return;
+        const view = new DataView(event.data);
+        const inboundClass = classifyInboundFrame({
+          channel: "binary",
+          byteLength: event.data.byteLength,
+          frameType: view.byteLength > 0 ? view.getUint8(0) : undefined,
+        });
+        if (inboundClass !== "ok") return;
         this.lastFrameAt = Date.now();
         const frame = decodeSessionOutputFrame(event.data);
         if (frame) this.cb.onSessionOutput(frame);
@@ -473,6 +518,13 @@ export class WsClient {
    */
   sendWithWriterLease(message: WriterLeaseFrame): boolean {
     if (this.stopped) return false;
+    if (
+      isRawTerminalWriterFrame(message) &&
+      this.route &&
+      !allowsRawTerminal(this.route)
+    ) {
+      return false;
+    }
     if (
       this.ws?.readyState === WebSocket.OPEN &&
       this.writerLease.youAreOwner &&
@@ -894,6 +946,18 @@ export class WsClient {
       this.writerLease.youAreOwner
     ) {
       const pending = this.pendingWriterFrames[0];
+      if (
+        this.route &&
+        !allowsRawTerminal(this.route) &&
+        isRawTerminalWriterFrame(pending.message)
+      ) {
+        // A raw frame may have been staged before route selection completed.
+        // Never let that frame cross a relay boundary; it has not reached the
+        // host yet, so dropping it is safer than replaying it elsewhere.
+        this.pendingWriterFrames.shift();
+        this.releasePendingWork(pending.accountedBytes);
+        continue;
+      }
       if (
         !this.send({
           ...pending.message,

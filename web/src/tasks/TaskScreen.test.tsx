@@ -12,6 +12,7 @@ import {
 } from "../api/types";
 import { EMPTY_WRITER_LEASE } from "../api/types";
 import { useStore } from "../store";
+import type { CapabilityGrant } from "../connect/permissions";
 import { TaskScreen } from "./TaskScreen";
 
 vi.mock("./views/AiSessionView", () => ({
@@ -429,6 +430,145 @@ describe("native AI session interactions", () => {
     );
     expect(screen.getByRole("button", { name: /stop/i }).isConnected).toBe(
       true,
+    );
+  });
+});
+
+const watcherGrant: CapabilityGrant = {
+  role: "watcher",
+  taskId: "tab:ai-a",
+  actions: ["readTask", "readPresence"],
+};
+
+const collaboratorGrant: CapabilityGrant = {
+  role: "collaborator",
+  taskId: "tab:ai-a",
+  actions: ["readTask", "readPresence", "mutateTask", "sendPrompt"],
+};
+
+describe("connect permission and controller gating", () => {
+  it("lets watchers observe but not send, answer, or use owner controls", () => {
+    useStore.setState({
+      writerLease: {
+        ownerClientInstanceId: "host-owner",
+        generation: 4,
+        expiresAtEpochMs: 10_000,
+        youAreOwner: false,
+      },
+    });
+    render(
+      <TaskScreen
+        route={{ name: "task", taskId: "tab:ai-a" }}
+        workspace={workspace("claude", "ai-a", { attention: "needsInput" })}
+        status={{ kind: "open" }}
+        onNavigate={() => {}}
+        grant={watcherGrant}
+      />,
+    );
+
+    expect(screen.getByTestId("guest-action-disabled").textContent).toMatch(
+      /view only/i,
+    );
+    expect(screen.queryByRole("button", { name: /send message/i })).toBeNull();
+    expect(
+      (screen.getByRole("button", { name: "Continue" }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(true);
+    expect(screen.queryByTestId("connect-owner-badge")).toBeNull();
+    expect(screen.getByTestId("connect-visible-controller").textContent).toMatch(
+      /host-owner/,
+    );
+  });
+
+  it("keeps collaborator send enabled and hides owner-only badge", async () => {
+    const user = userEvent.setup();
+    const submitComposer = vi.fn().mockResolvedValue({
+      mutationId: "mutation-collab",
+      stableSessionKey: "tab:ai-a",
+      acceptedSequence: 1,
+      leaseGeneration: 1,
+    });
+    useStore.setState({
+      drafts: { "tab:ai-a": "hello from collaborator" },
+      submitComposer,
+      writerLease: {
+        ownerClientInstanceId: "host-owner",
+        generation: 4,
+        expiresAtEpochMs: 10_000,
+        youAreOwner: false,
+      },
+    });
+    render(
+      <TaskScreen
+        route={{ name: "task", taskId: "tab:ai-a" }}
+        workspace={workspace("claude")}
+        status={{ kind: "open" }}
+        onNavigate={() => {}}
+        grant={collaboratorGrant}
+      />,
+    );
+
+    expect(screen.queryByTestId("guest-action-disabled")).toBeNull();
+    expect(screen.queryByTestId("connect-owner-badge")).toBeNull();
+    await user.click(screen.getByRole("button", { name: /send message/i }));
+    expect(submitComposer).toHaveBeenCalledWith(
+      "tab:ai-a",
+      "hello from collaborator",
+      [],
+    );
+  });
+
+  it("shows a denied notice and does not submit when sendPrompt is missing", async () => {
+    const user = userEvent.setup();
+    const submitComposer = vi.fn();
+    useStore.setState({
+      drafts: { "tab:ai-a": "blocked text" },
+      submitComposer,
+    });
+    render(
+      <TaskScreen
+        route={{ name: "task", taskId: "tab:ai-a" }}
+        workspace={workspace("claude")}
+        status={{ kind: "open" }}
+        onNavigate={() => {}}
+        grant={{
+          role: "collaborator",
+          taskId: "tab:ai-a",
+          actions: ["readTask", "readPresence", "mutateTask"],
+        }}
+      />,
+    );
+
+    expect(screen.getByTestId("guest-action-disabled").textContent).toMatch(
+      /not permitted/i,
+    );
+    await user.click(screen.getByRole("button", { name: /send message/i }));
+    expect(submitComposer).not.toHaveBeenCalled();
+  });
+
+  it("shows owner badge and controller for an authoritative owner", () => {
+    useStore.setState({
+      writerLease: {
+        ownerClientInstanceId: "paired-owner",
+        generation: 9,
+        expiresAtEpochMs: 10_000,
+        youAreOwner: true,
+      },
+    });
+    render(
+      <TaskScreen
+        route={{ name: "task", taskId: "tab:ai-a" }}
+        workspace={workspace("claude")}
+        status={{ kind: "open" }}
+        onNavigate={() => {}}
+      />,
+    );
+
+    expect(screen.getByTestId("connect-owner-badge").textContent).toMatch(
+      /owner/i,
+    );
+    expect(screen.getByTestId("connect-visible-controller").textContent).toMatch(
+      /paired-owner/,
     );
   });
 });

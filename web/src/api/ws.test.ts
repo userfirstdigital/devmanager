@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { RemoteAction } from "./types";
 import { WEB_PROTOCOL_VERSION } from "./types";
 import { CLIENT_WEB_BUILD_ID } from "../pwa/buildCompatibility";
+import { MAX_INBOUND_TEXT_BYTES } from "../connect/transport";
 import { WsClient } from "./ws";
 
 const resumeContext = {
@@ -1538,4 +1539,160 @@ describe("WsClient reconnect wake handling", () => {
       ).toHaveLength(1);
     },
   );
+});
+
+describe("WsClient connect route and inbound bounds", () => {
+  beforeEach(() => {
+    FakeWebSocket.instances = [];
+    vi.stubGlobal("window", globalThis);
+    vi.stubGlobal("location", { protocol: "http:", host: "example.test" });
+    vi.stubGlobal("localStorage", {
+      getItem: vi.fn(() => "browser-install-uuid"),
+      setItem: vi.fn(),
+    });
+    vi.stubGlobal("sessionStorage", {
+      getItem: vi.fn(() => null),
+      setItem: vi.fn(),
+    });
+    vi.stubGlobal("crypto", {
+      randomUUID: vi.fn(() => "browser-install-uuid"),
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({ ok: true, status: 200 }),
+    );
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it("prefers the direct host socket and still sends raw terminal there", async () => {
+    const client = new WsClient(clientCallbacks());
+    await client.start();
+    const socket = FakeWebSocket.instances[0];
+    socket.emitOpen();
+    socket.emitMessage(
+      JSON.stringify({
+        type: "writerLeaseState",
+        writerLease: {
+          ownerClientInstanceId: "browser-install-uuid",
+          generation: 8,
+          expiresAtEpochMs: 10_000,
+          youAreOwner: true,
+        },
+      }),
+    );
+
+    expect(client.currentRoute()?.kind).toBe("direct");
+    expect(
+      client.sendWithWriterLease({
+        type: "input",
+        sessionId: "pty-a",
+        text: "hello",
+      }),
+    ).toBe(true);
+    expect(
+      jsonFrames(socket).some((frame) => frame.type === "input"),
+    ).toBe(true);
+  });
+
+  it("falls back to relay on the same host URL and refuses raw terminal", async () => {
+    const callbacks = clientCallbacks();
+    const client = new WsClient(callbacks, { directAvailable: false });
+    await client.start();
+    const socket = FakeWebSocket.instances[0];
+    socket.emitOpen();
+    socket.emitMessage(
+      JSON.stringify({
+        type: "writerLeaseState",
+        writerLease: {
+          ownerClientInstanceId: "browser-install-uuid",
+          generation: 8,
+          expiresAtEpochMs: 10_000,
+          youAreOwner: true,
+        },
+      }),
+    );
+
+    expect(client.currentRoute()).toMatchObject({
+      kind: "relay",
+      reason: "directUnavailable",
+    });
+    expect(socket.url).toContain("/api/ws");
+    expect(
+      client.sendWithWriterLease({
+        type: "input",
+        sessionId: "pty-a",
+        text: "must not relay",
+      }),
+    ).toBe(false);
+    expect(
+      jsonFrames(socket).filter((frame) => frame.type === "input"),
+    ).toEqual([]);
+
+    const binary = new ArrayBuffer(32);
+    new DataView(binary).setUint8(0, 0x01);
+    socket.emitMessage(binary);
+    expect(callbacks.onSessionOutput).not.toHaveBeenCalled();
+  });
+
+  it("drops raw terminal staged before a relay route is selected", async () => {
+    const client = new WsClient(clientCallbacks(), { directAvailable: false });
+    expect(
+      client.sendWithWriterLease({
+        type: "input",
+        sessionId: "pty-a",
+        text: "staged before route",
+      }),
+    ).toBe(true);
+
+    await client.start();
+    const socket = FakeWebSocket.instances[0];
+    socket.emitOpen();
+    socket.emitMessage(
+      JSON.stringify({
+        type: "writerLeaseState",
+        writerLease: {
+          ownerClientInstanceId: "browser-install-uuid",
+          generation: 8,
+          expiresAtEpochMs: 10_000,
+          youAreOwner: true,
+        },
+      }),
+    );
+
+    expect(jsonFrames(socket).filter((frame) => frame.type === "input")).toEqual(
+      [],
+    );
+  });
+
+  it("drops oversized inbound text after hello without delivering it", async () => {
+    const callbacks = clientCallbacks();
+    const client = new WsClient(callbacks);
+    await client.start();
+    const socket = FakeWebSocket.instances[0];
+    socket.emitOpen();
+
+    expect(() =>
+      socket.emitMessage(`${"x".repeat(MAX_INBOUND_TEXT_BYTES + 1)}`),
+    ).not.toThrow();
+    expect(callbacks.onMessage).not.toHaveBeenCalledWith(
+      expect.objectContaining({ type: "error" }),
+    );
+    const delivered = callbacks.onMessage.mock.calls.map(
+      ([message]: [unknown]) => message,
+    );
+    expect(
+      delivered.every(
+        (message) =>
+          typeof message === "object" &&
+          message !== null &&
+          (message as { type?: string }).type !== undefined &&
+          JSON.stringify(message).length < 1_024,
+      ),
+    ).toBe(true);
+  });
 });
