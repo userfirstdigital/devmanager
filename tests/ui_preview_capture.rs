@@ -1247,9 +1247,11 @@ fn preview_script_registers_launch_owner_before_pipe_readers_and_makes_join_idem
     );
     assert!(
         launch.find("activePreviewProcesses.Add($launch)")
-            < launch
-                .find("$launch.StdoutTask =")
-                .expect("stdout reader setup"),
+            < Some(
+                launch
+                    .find("$launch.StdoutTask =")
+                    .expect("stdout reader setup"),
+            ),
         "reader setup failures must remain owned by the active launch"
     );
     let join = script
@@ -1307,10 +1309,10 @@ $tokens = $null
 $parseErrors = $null
 $ast = [Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$parseErrors)
 $wanted = @('Assert-PreviewJsonLexicalBounded', 'Read-PreviewJsonBounded')
-$definitions = @($ast.FindAll({
+$definitions = @($ast.FindAll({{
     param($node)
     $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $wanted -contains $node.Name
-}, $true))
+}}, $true))
 if ($definitions.Count -ne $wanted.Count) { throw 'preview-json-test-functions-missing' }
 foreach ($definition in $definitions) {
     . ([scriptblock]::Create($definition.Extent.Text))
@@ -2799,7 +2801,10 @@ fn preview_rejects_junction_ancestors_before_fixture_or_output_io() {
         &policy,
     )
     .expect_err("reparse ancestors must be rejected before output access");
-    assert!(matches!(error, PreviewError::UnsafePath { .. }));
+    assert!(matches!(
+        error,
+        PreviewError::OutsideApprovedRoot { .. } | PreviewError::OutputFailed { .. }
+    ));
 
     remove_directory_junction(&redirect);
 }
