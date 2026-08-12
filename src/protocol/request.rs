@@ -11,7 +11,7 @@ use crate::domain::id::{CommandId, SubscriptionId};
 use crate::domain::query::{QueryEnvelope, QueryReply};
 use crate::protocol::control::{DetachAck, DetachRequest};
 use crate::protocol::stream::StreamFrame;
-use crate::terminal::protocol::{InputAck, TerminalInputRequest};
+use crate::terminal::protocol::{TerminalInputAck, TerminalInputRequest};
 use crate::updater::UpdateHandoffToken;
 
 /// One client-initiated request on an authenticated connection.
@@ -149,7 +149,7 @@ impl fmt::Debug for UpdateHandoffReply {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServerMessage {
     CommandReceipt(CommandReceipt),
-    TerminalInputAck(InputAck),
+    TerminalInputAck(TerminalInputAck),
     UpdateHandoff(UpdateHandoffReply),
     QueryReply(QueryReply),
     DurableEvent {

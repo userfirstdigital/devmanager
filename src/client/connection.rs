@@ -28,6 +28,7 @@ use crate::protocol::{
     PhysicalFrameCodec, ServerHello, ServerMessage, StreamFrame, UpdateHandoffReply,
     MAX_PHYSICAL_FRAME_BYTES, MAX_REASSEMBLED_MESSAGE_BYTES,
 };
+use crate::terminal::protocol::{InputAck, InputId, TerminalInputRequest};
 
 const WRITE_QUEUE_CAPACITY: usize = 32;
 const UNSOLICITED_QUEUE_CAPACITY: usize = 64;
@@ -392,6 +393,7 @@ impl UnsolicitedInbox {
 enum PendingKind {
     Command(oneshot::Sender<Result<CommandReceipt, IpcError>>),
     UpdateHandoff(oneshot::Sender<Result<UpdateHandoffReply, IpcError>>),
+    TerminalInput(oneshot::Sender<Result<InputAck, IpcError>>),
     Query(oneshot::Sender<Result<QueryReply, IpcError>>),
     Detach(oneshot::Sender<Result<DetachAck, IpcError>>),
 }
@@ -400,6 +402,7 @@ enum PendingKind {
 enum PendingKey {
     Command(CommandId),
     UpdateHandoff(CommandId),
+    TerminalInput(InputId),
     Query(RequestId),
     Detach(RequestId),
 }
@@ -435,6 +438,7 @@ impl<T> PendingReply<T> {
 enum ErasedPendingReply {
     Command(PendingReply<CommandReceipt>),
     UpdateHandoff(PendingReply<UpdateHandoffReply>),
+    TerminalInput(PendingReply<InputAck>),
     Query(PendingReply<QueryReply>),
     Detach(PendingReply<DetachAck>),
 }
@@ -444,6 +448,7 @@ impl ErasedPendingReply {
         match self {
             Self::Command(pending) => pending.complete_from_deadline(),
             Self::UpdateHandoff(pending) => pending.complete_from_deadline(),
+            Self::TerminalInput(pending) => pending.complete_from_deadline(),
             Self::Query(pending) => pending.complete_from_deadline(),
             Self::Detach(pending) => pending.complete_from_deadline(),
         }
@@ -453,6 +458,7 @@ impl ErasedPendingReply {
         match self {
             Self::Command(pending) => pending.cancel(),
             Self::UpdateHandoff(pending) => pending.cancel(),
+            Self::TerminalInput(pending) => pending.cancel(),
             Self::Query(pending) => pending.cancel(),
             Self::Detach(pending) => pending.cancel(),
         }
@@ -517,6 +523,15 @@ impl PendingRegistration {
                     pending.deadline_task = deadline_task.take();
                 }
             }
+            PendingKey::TerminalInput(id) => {
+                if let Some(pending) = state
+                    .terminal_input_waiters
+                    .get_mut(&id)
+                    .filter(|pending| pending.registration_id == registration_id)
+                {
+                    pending.deadline_task = deadline_task.take();
+                }
+            }
             PendingKey::Query(id) => {
                 if let Some(pending) = state
                     .query_waiters
@@ -568,6 +583,7 @@ struct SharedState {
     next_registration_id: u64,
     command_waiters: HashMap<CommandId, PendingReply<CommandReceipt>>,
     update_handoff_waiters: HashMap<CommandId, PendingReply<UpdateHandoffReply>>,
+    terminal_input_waiters: HashMap<InputId, PendingReply<InputAck>>,
     query_waiters: HashMap<RequestId, PendingReply<QueryReply>>,
     detach_waiters: HashMap<RequestId, PendingReply<DetachAck>>,
     poisoned: bool,
@@ -831,6 +847,35 @@ impl ClientConnection {
         reply_rx.await.map_err(|_| IpcError::Unavailable)?
     }
 
+    /// Send raw terminal bytes through the authenticated host bridge. The
+    /// caller supplies all identity and generation fences; this method never
+    /// creates or guesses a terminal session.
+    pub async fn execute_terminal_input(
+        &self,
+        request: TerminalInputRequest,
+    ) -> Result<InputAck, IpcError> {
+        let input_id = request.input_id;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let mut registration = self.register_waiter(
+            PendingKey::TerminalInput(input_id),
+            PendingKind::TerminalInput(reply_tx),
+        )?;
+        if let Err(error) = self
+            .enqueue_write(ClientRequest::TerminalInput(request))
+            .await
+        {
+            self.fail_closed();
+            return Err(error);
+        }
+        if let Err(error) = registration
+            .arm_response_deadline(self.io_abort_handle()?, request_completion_timeout())
+        {
+            self.fail_closed();
+            return Err(error);
+        }
+        reply_rx.await.map_err(|_| IpcError::Unavailable)?
+    }
+
     pub async fn query(&self, envelope: QueryEnvelope) -> Result<QueryReply, IpcError> {
         let request_id = envelope.request_id;
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -929,6 +974,19 @@ impl ClientConnection {
                     return Err(IpcError::DuplicateInFlight);
                 }
                 state.update_handoff_waiters.insert(
+                    id,
+                    PendingReply {
+                        registration_id,
+                        sender: tx,
+                        deadline_task: None,
+                    },
+                );
+            }
+            (PendingKey::TerminalInput(id), PendingKind::TerminalInput(tx)) => {
+                if state.terminal_input_waiters.contains_key(&id) {
+                    return Err(IpcError::DuplicateInFlight);
+                }
+                state.terminal_input_waiters.insert(
                     id,
                     PendingReply {
                         registration_id,
@@ -1193,7 +1251,19 @@ async fn dispatch_server_message(
         // when a caller installs that API. The legacy HostClient surface has
         // no terminal-input waiter, so never reinterpret this as a command or
         // query receipt.
-        ServerMessage::TerminalInputAck(_) => Err(IpcError::Unsupported),
+        ServerMessage::TerminalInputAck(response) => {
+            let pending = {
+                let mut guard = state.lock().expect("client connection state");
+                guard.terminal_input_waiters.remove(&response.input_id)
+            };
+            match pending {
+                Some(pending) => {
+                    pending.complete(Ok(response.ack));
+                    Ok(())
+                }
+                None => Err(IpcError::CorrelationMismatch),
+            }
+        }
         ServerMessage::UpdateHandoff(reply) => {
             let waiter = {
                 let mut guard = state.lock().expect("client connection state");
@@ -1286,6 +1356,17 @@ fn remove_pending_exact(
                 .remove(&id)
                 .map(ErasedPendingReply::UpdateHandoff)
         }
+        PendingKey::TerminalInput(id)
+            if guard
+                .terminal_input_waiters
+                .get(&id)
+                .is_some_and(|pending| pending.registration_id == registration_id) =>
+        {
+            guard
+                .terminal_input_waiters
+                .remove(&id)
+                .map(ErasedPendingReply::TerminalInput)
+        }
         PendingKey::Query(id)
             if guard
                 .query_waiters
@@ -1323,6 +1404,7 @@ fn poison_mutex(state: &Arc<Mutex<SharedState>>) {
     guard.closed = true;
     let commands = std::mem::take(&mut guard.command_waiters);
     let update_handoffs = std::mem::take(&mut guard.update_handoff_waiters);
+    let terminal_inputs = std::mem::take(&mut guard.terminal_input_waiters);
     let queries = std::mem::take(&mut guard.query_waiters);
     let detaches = std::mem::take(&mut guard.detach_waiters);
     drop(guard);
@@ -1330,6 +1412,9 @@ fn poison_mutex(state: &Arc<Mutex<SharedState>>) {
         pending.complete(Err(IpcError::Unavailable));
     }
     for (_, pending) in update_handoffs {
+        pending.complete(Err(IpcError::Unavailable));
+    }
+    for (_, pending) in terminal_inputs {
         pending.complete(Err(IpcError::Unavailable));
     }
     for (_, pending) in queries {

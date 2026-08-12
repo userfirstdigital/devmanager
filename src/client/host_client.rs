@@ -31,6 +31,7 @@ use crate::protocol::{
     Capability, CapabilitySet, ClientHello, DetachAck, DetachRequest, FrameLimits, ReconnectGrant,
     ServerHello,
 };
+use crate::terminal::protocol::{InputAck, TerminalInputRequest};
 use crate::updater::UpdateHandoffToken;
 
 use super::action::{task_cockpit_query, task_show_query};
@@ -233,6 +234,28 @@ impl HostClient {
             return Err(IpcError::Unauthorized);
         }
         self.live_connection()?.execute_command(envelope).await
+    }
+
+    /// Forward one fully-fenced terminal input request to the host-owned
+    /// terminal service. The caller must provide the exact task/session,
+    /// generation, focus/action epoch, and monotonic input sequence.
+    pub async fn execute_terminal_input(
+        &self,
+        request: TerminalInputRequest,
+    ) -> Result<InputAck, IpcError> {
+        if request.client_id != self.config.client_id {
+            return Err(IpcError::Unauthorized);
+        }
+        if !self
+            .server_hello
+            .granted
+            .contains(Capability::ProviderInput)
+        {
+            return Err(IpcError::UnsupportedCapability);
+        }
+        self.live_connection()?
+            .execute_terminal_input(request)
+            .await
     }
 
     /// Ask the authenticated host to prepare one update handoff on this exact

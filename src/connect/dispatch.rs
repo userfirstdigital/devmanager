@@ -747,6 +747,14 @@ impl DispatchFailure {
 
 fn bind_request_identity(request: &ClientRequest, bound: ClientId) -> Result<(), DispatchFailure> {
     match request {
+        ClientRequest::TerminalInput(request) => {
+            if request.client_id != bound {
+                return Err(DispatchFailure::soft(
+                    CONNECT_ERROR_UNAUTHORIZED,
+                    "request client_id is not the authenticated paired identity",
+                ));
+            }
+        }
         ClientRequest::Query(envelope) => {
             if envelope.client_id != bound {
                 return Err(DispatchFailure::soft(
@@ -773,6 +781,7 @@ fn deny_if_capability_missing(
     granted: CapabilitySet,
 ) -> Result<(), DispatchFailure> {
     let required = match request {
+        ClientRequest::TerminalInput(_) => Some(Capability::ProviderInput),
         ClientRequest::Query(envelope) => match envelope.query {
             crate::domain::query::Query::SnapshotPage { .. }
             | crate::domain::query::Query::ReleaseSnapshot { .. } => {

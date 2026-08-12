@@ -48,6 +48,9 @@ impl SessionPermissionContext {
 /// Maps a host request onto a local action before the host port is invoked.
 pub fn action_for_client_request(request: &ClientRequest) -> Option<(ActionId, Option<TaskId>)> {
     match request {
+        ClientRequest::TerminalInput(request) => {
+            Some((ActionId::SEND_PROMPT, Some(request.context.task_id)))
+        }
         ClientRequest::Query(envelope) => {
             let action = match envelope.query {
                 Query::TaskSnapshot

@@ -9,7 +9,7 @@ use std::num::NonZeroU64;
 use serde::{Deserialize, Serialize};
 use uuid::{Uuid, Variant};
 
-use crate::domain::id::{ClientId, IdError, ResourceId, TaskId, TerminalId};
+use crate::domain::id::{AgentSessionId, ClientId, IdError, ResourceId, TaskId, TerminalId};
 use crate::terminal::session::{TerminalCursorSnapshot, TerminalModeSnapshot};
 
 pub const MAX_TERMINAL_COLS: u16 = 512;
@@ -313,19 +313,85 @@ pub struct InputEnvelope {
     pub bytes: Vec<u8>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Exact identity captured by the native task cockpit for one raw input
+/// gesture. Every durable/runtime fence is checked before bytes reach the
+/// already-owned terminal session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalInputContext {
+    pub task_id: TaskId,
+    pub agent_session_id: AgentSessionId,
+    pub resource_id: ResourceId,
+    pub runtime_generation: u64,
+    pub resource_generation: u64,
+    pub session_id: TerminalSessionId,
+    pub terminal_generation: TerminalGeneration,
+    pub focus_epoch: FocusEpoch,
+    pub action_epoch: u64,
+    pub input_sequence: u64,
+}
+
+impl TerminalInputContext {
+    pub fn validate(self) -> Result<(), TerminalError> {
+        if self.runtime_generation == 0
+            || self.resource_generation == 0
+            || self.action_epoch == 0
+            || self.input_sequence == 0
+        {
+            return Err(TerminalError::InvalidFence);
+        }
+        Ok(())
+    }
+}
+
+/// Host request for raw terminal bytes. The payload is opaque so control
+/// characters and paste bytes are preserved exactly; this request contains no
+/// launch operation and can only write to an existing attached session.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalInputRequest {
+    pub client_id: ClientId,
+    pub input_id: InputId,
+    pub terminal_id: TerminalId,
+    pub context: TerminalInputContext,
+    pub bytes: Vec<u8>,
+}
+
+impl TerminalInputRequest {
+    pub fn validate(&self) -> Result<(), TerminalError> {
+        self.context.validate()?;
+        if self.bytes.is_empty() || self.bytes.len() > MAX_INPUT_BYTES {
+            return Err(TerminalError::BoundExceeded);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InputAck {
     Accepted { sequence: u64 },
     Duplicate { sequence: u64 },
     Rejected { reason: InputRejectReason },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Correlates a host response with the exact idempotency key submitted by the
+/// client. Keeping the wire id beside (rather than inside) the admission
+/// result preserves the existing service API while allowing concurrent input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalInputAck {
+    pub input_id: InputId,
+    pub ack: InputAck,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InputRejectReason {
     StaleTask,
+    StaleAgent,
+    StaleResource,
+    StaleRuntimeGeneration,
     StaleSession,
     StaleGeneration,
     StaleFocus,
+    StaleAction,
+    StaleInputSequence,
     ReadOnly,
     Closed,
     Empty,

@@ -149,7 +149,24 @@ impl ConnectHostCommandPort for HostClientConnectPort {
         // HostClient's authenticated IPC Hello is the grant authority. The
         // Connect capability claim is intentionally not used to elevate it.
         let result = match request {
-            ClientRequest::TerminalInput(_) => Err(IpcError::Unsupported),
+            ClientRequest::TerminalInput(request) => {
+                let input_id = request.input_id;
+                client_guard
+                    .execute_terminal_input(request)
+                    .await
+                    .map(|ack| {
+                        ServerMessage::TerminalInputAck(
+                            crate::terminal::protocol::TerminalInputAck {
+                                // The low-level HostClient API returns only the
+                                // admission result; the request id is retained by
+                                // the caller-side connection. Connect's one request
+                                // path uses the request's own id for correlation.
+                                input_id,
+                                ack,
+                            },
+                        )
+                    })
+            }
             ClientRequest::Command(envelope) => {
                 if let crate::domain::command::Command::PrepareUpdate(intent) = &envelope.command {
                     client_guard

@@ -2908,11 +2908,14 @@ impl HostRequestExecutor {
                 if !negotiated.capabilities.contains(Capability::ProviderInput) {
                     return Err(IpcError::UnsupportedCapability);
                 }
+                let input_id = request.input_id;
                 let ack = self
                     .terminal_service
                     .write_task_input(request)
                     .map_err(|_| IpcError::Unavailable)?;
-                Ok(ServerMessage::TerminalInputAck(ack))
+                Ok(ServerMessage::TerminalInputAck(
+                    crate::terminal::protocol::TerminalInputAck { input_id, ack },
+                ))
             }
             ClientRequest::Detach(request) => self.serve_detach(negotiated, request, output_id),
         }

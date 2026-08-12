@@ -9,10 +9,10 @@ use crate::state::{SessionDimensions, SessionRuntimeState, SessionStatus};
 use crate::terminal::protocol::{
     AttachmentFence, ClientInputGrant, CloseReason, CoalesceReason, FocusEpoch, InputAck,
     InputEnvelope, InputId, InputRejectReason, ReplicaUpdate, ResizeFence, TeardownReport,
-    TerminalDelta, TerminalDeltaOp, TerminalError, TerminalGeneration, TerminalResourceFence,
-    TerminalSequence, TerminalSessionId, TerminalSize, TerminalSnapshot, TerminalSpec,
-    TerminalViewHandle, ViewKind, MAX_ACCEPTED_INPUT_HISTORY_BYTES, MAX_INPUT_BYTES,
-    MAX_PENDING_OUTPUT_BYTES, MAX_PENDING_OUTPUT_CHUNKS, MAX_RETAINED_DELTAS,
+    TerminalDelta, TerminalDeltaOp, TerminalError, TerminalGeneration, TerminalInputContext,
+    TerminalInputRequest, TerminalResourceFence, TerminalSequence, TerminalSessionId, TerminalSize,
+    TerminalSnapshot, TerminalSpec, TerminalViewHandle, ViewKind, MAX_ACCEPTED_INPUT_HISTORY_BYTES,
+    MAX_INPUT_BYTES, MAX_PENDING_OUTPUT_BYTES, MAX_PENDING_OUTPUT_CHUNKS, MAX_RETAINED_DELTAS,
     MAX_TRACKED_INPUT_IDS,
 };
 use crate::terminal::session::{
@@ -185,6 +185,9 @@ enum PendingOutputDrain {
 
 struct HostedTerminal {
     task_id: TaskId,
+    agent_session_id: Option<crate::domain::AgentSessionId>,
+    runtime_generation: Option<u64>,
+    action_epoch: Option<u64>,
     session_id: TerminalSessionId,
     resource_id: ResourceId,
     generation: TerminalGeneration,
@@ -237,6 +240,9 @@ impl HostedTerminal {
         let last_title = spec.title.clone();
         Ok(Self {
             task_id,
+            agent_session_id: None,
+            runtime_generation: None,
+            action_epoch: None,
             session_id: spec.session_id,
             resource_id: ResourceId::new(),
             generation: TerminalGeneration::initial(),
@@ -300,6 +306,9 @@ impl HostedTerminal {
         }))?;
         Ok(Self {
             task_id,
+            agent_session_id: None,
+            runtime_generation: None,
+            action_epoch: None,
             session_id: spec.session_id,
             resource_id: attachment.resource_id,
             generation: attachment.generation,
@@ -953,6 +962,9 @@ impl HostedTerminal {
         replica.bound_history(self.spec.max_scrollback_rows);
         self.projection = ProjectionSource::Fixture(replica);
         self.generation = next;
+        self.agent_session_id = None;
+        self.runtime_generation = None;
+        self.action_epoch = None;
         self.sequence = TerminalSequence::ZERO;
         self.truncated = false;
         self.accepted_input_sequence = 0;
@@ -1025,6 +1037,43 @@ impl TerminalService {
         Ok(terminal_id)
     }
 
+    /// Bind durable task/agent admission to an already-attached terminal.
+    /// Repeating the exact bind is idempotent; conflicting identity fails.
+    pub fn bind_task_identity(
+        &self,
+        id: TerminalId,
+        agent_session_id: crate::domain::AgentSessionId,
+        runtime_generation: u64,
+        action_epoch: u64,
+    ) -> Result<(), TerminalError> {
+        if runtime_generation == 0 || action_epoch == 0 {
+            return Err(TerminalError::InvalidFence);
+        }
+        let mut terminals = self.lock()?;
+        let hosted = terminals.get_mut(&id).ok_or(TerminalError::NotFound)?;
+        hosted.ensure_open()?;
+        match (
+            hosted.agent_session_id,
+            hosted.runtime_generation,
+            hosted.action_epoch,
+        ) {
+            (Some(current_agent), Some(current_runtime), Some(current_action))
+                if current_agent == agent_session_id
+                    && current_runtime == runtime_generation
+                    && current_action == action_epoch =>
+            {
+                Ok(())
+            }
+            (None, None, None) => {
+                hosted.agent_session_id = Some(agent_session_id);
+                hosted.runtime_generation = Some(runtime_generation);
+                hosted.action_epoch = Some(action_epoch);
+                Ok(())
+            }
+            _ => Err(TerminalError::InvalidFence),
+        }
+    }
+
     pub fn write(&self, id: TerminalId, input: InputEnvelope) -> Result<InputAck, TerminalError> {
         if input.terminal_id != id {
             return Err(TerminalError::InvalidFence);
@@ -1032,6 +1081,82 @@ impl TerminalService {
         let mut terminals = self.lock()?;
         let hosted = terminals.get_mut(&id).ok_or(TerminalError::NotFound)?;
         Ok(hosted.write(&input))
+    }
+
+    /// Admit raw bytes only to the exact already-bound terminal session. This
+    /// path never launches a PTY and rejects stale/missing fences before the
+    /// attached runtime writer is called.
+    pub fn write_task_input(
+        &self,
+        request: TerminalInputRequest,
+    ) -> Result<InputAck, TerminalError> {
+        request.validate()?;
+        let context = request.context;
+        let mut terminals = self.lock()?;
+        let hosted = terminals
+            .get_mut(&request.terminal_id)
+            .ok_or(TerminalError::NotFound)?;
+        hosted.ensure_open()?;
+        if hosted.task_id != context.task_id {
+            return Ok(InputAck::Rejected {
+                reason: InputRejectReason::StaleTask,
+            });
+        }
+        if hosted.agent_session_id != Some(context.agent_session_id) {
+            return Ok(InputAck::Rejected {
+                reason: InputRejectReason::StaleAgent,
+            });
+        }
+        if hosted.resource_id != context.resource_id {
+            return Ok(InputAck::Rejected {
+                reason: InputRejectReason::StaleResource,
+            });
+        }
+        if hosted.runtime_generation != Some(context.runtime_generation) {
+            return Ok(InputAck::Rejected {
+                reason: InputRejectReason::StaleRuntimeGeneration,
+            });
+        }
+        if hosted.generation != context.terminal_generation
+            || hosted.generation.get() != context.resource_generation
+        {
+            return Ok(InputAck::Rejected {
+                reason: InputRejectReason::StaleGeneration,
+            });
+        }
+        if hosted.session_id != context.session_id {
+            return Ok(InputAck::Rejected {
+                reason: InputRejectReason::StaleSession,
+            });
+        }
+        if hosted.focus_epoch != context.focus_epoch {
+            return Ok(InputAck::Rejected {
+                reason: InputRejectReason::StaleFocus,
+            });
+        }
+        if hosted.action_epoch != Some(context.action_epoch) {
+            return Ok(InputAck::Rejected {
+                reason: InputRejectReason::StaleAction,
+            });
+        }
+        let envelope = InputEnvelope {
+            client_id: request.client_id,
+            input_id: request.input_id,
+            task_id: context.task_id,
+            session_id: context.session_id,
+            terminal_id: request.terminal_id,
+            terminal_generation: context.terminal_generation,
+            focus_epoch: context.focus_epoch,
+            bytes: request.bytes,
+        };
+        if !hosted.accepted_input_ids.contains_key(&envelope.input_id)
+            && context.input_sequence != hosted.accepted_input_sequence.saturating_add(1)
+        {
+            return Ok(InputAck::Rejected {
+                reason: InputRejectReason::StaleInputSequence,
+            });
+        }
+        Ok(hosted.write(&envelope))
     }
 
     pub fn resize(
@@ -1601,6 +1726,73 @@ mod tests {
             )
             .expect("write");
         assert_eq!(ack, InputAck::Accepted { sequence: 1 });
+    }
+
+    #[test]
+    fn task_input_checks_exact_identity_sequence_and_raw_bytes() {
+        let service = TerminalService::new();
+        let task = TaskId::new();
+        let agent = crate::domain::AgentSessionId::new();
+        let session = TerminalSessionId::new();
+        let spec =
+            TerminalSpec::new(session, TerminalSize::new(40, 10).expect("size")).expect("spec");
+        let terminal_id = service.create_fixture(task, spec).expect("fixture");
+        let client = ClientId::new();
+        service
+            .grant_client(terminal_id, client, ClientInputGrant::ReadWrite)
+            .expect("grant");
+        service
+            .bind_task_identity(terminal_id, agent, 9, 11)
+            .expect("bind");
+        let fence = service.fence(terminal_id).expect("fence");
+        let context = TerminalInputContext {
+            task_id: task,
+            agent_session_id: agent,
+            resource_id: fence.resource_id,
+            runtime_generation: 9,
+            resource_generation: fence.generation.get(),
+            session_id: fence.session_id,
+            terminal_generation: fence.generation,
+            focus_epoch: service.current_focus(terminal_id).expect("focus"),
+            action_epoch: 11,
+            input_sequence: 1,
+        };
+        let bytes = vec![0x03, 0x1b, b'[', b'2', b'0', b'~', 0x00];
+        assert_eq!(
+            service
+                .write_task_input(TerminalInputRequest {
+                    client_id: client,
+                    input_id: InputId::new(),
+                    terminal_id,
+                    context,
+                    bytes: bytes.clone(),
+                })
+                .expect("write"),
+            InputAck::Accepted { sequence: 1 }
+        );
+        assert_eq!(
+            service.accepted_input_bytes(terminal_id).expect("history"),
+            bytes
+        );
+        let mut stale = context;
+        stale.input_sequence = 3;
+        assert_eq!(
+            service
+                .write_task_input(TerminalInputRequest {
+                    client_id: client,
+                    input_id: InputId::new(),
+                    terminal_id,
+                    context: stale,
+                    bytes: b"not forwarded".to_vec(),
+                })
+                .expect("typed stale ack"),
+            InputAck::Rejected {
+                reason: InputRejectReason::StaleInputSequence
+            }
+        );
+        assert!(!service
+            .is_attached(terminal_id)
+            .expect("fixture has no PTY"));
     }
 
     #[test]
