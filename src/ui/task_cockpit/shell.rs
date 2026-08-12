@@ -1,6 +1,8 @@
 //! Native shell mount for the single context dock.
 
-use gpui::{div, Context, InteractiveElement, IntoElement, ParentElement, Render, Window};
+use gpui::{
+    div, AnyElement, Context, InteractiveElement, IntoElement, ParentElement, Render, Window,
+};
 
 use crate::browser::{
     BrowserBounds, BrowserCommand, BrowserGatewayBindingRef, BrowserHostEvent,
@@ -15,11 +17,14 @@ use crate::ui::actions::{
     DockSelectArtifacts, DockSelectBrowser, DockSelectChanges, DockSelectFiles, DockSelectReview,
     DockSelectServices, DockSelectTerminal, DockToggleRawTerminal,
 };
+use crate::ui::renderers::{RendererRegistry, SemanticJournalView};
 use crate::ui::task_cockpit::cockpit_projection::TaskCockpitLiveProjection;
+use crate::ui::task_cockpit::composer::TaskComposer;
 use crate::ui::task_cockpit::dock::{
     ContextDock, DependencyUnavailable, DockEdge, DockProjectionError, DockTool, PointerPhase,
     PointerPress,
 };
+use crate::ui::task_cockpit::timeline::{Timeline, TimelineViewport};
 use crate::ui::tokens::{theme, Density, Scale, ThemeMode};
 
 pub struct TaskCockpitShell {
@@ -28,6 +33,8 @@ pub struct TaskCockpitShell {
     projection: Option<TaskCockpitLiveProjection>,
     browser_controller: BrowserNativeShellController,
     browser_projection: Option<BrowserNativeProjection>,
+    timeline: Option<Timeline>,
+    timeline_error: Option<String>,
 }
 
 /// Authoritative browser surface projection mounted by the active Task
@@ -83,6 +90,8 @@ impl TaskCockpitShell {
             projection: None,
             browser_controller: BrowserNativeShellController::for_current_platform(),
             browser_projection: None,
+            timeline: None,
+            timeline_error: None,
         }
     }
 
@@ -109,9 +118,9 @@ impl TaskCockpitShell {
         gateway: BrowserGatewayBindingRef,
         bounds: BrowserBounds,
     ) -> Result<BrowserNativeLease, BrowserNativeControllerError> {
-        let lease = self
-            .browser_controller
-            .bind(identity, workspace_key.clone(), gateway.clone())?;
+        let lease =
+            self.browser_controller
+                .bind(identity, workspace_key.clone(), gateway.clone())?;
         self.browser_projection = Some(BrowserNativeProjection {
             identity,
             workspace_key,
@@ -133,9 +142,12 @@ impl TaskCockpitShell {
             .browser_projection
             .as_mut()
             .ok_or(BrowserNativeControllerError::GatewayUnbound)?;
-        let command = self
-            .browser_controller
-            .attach_with_gateway(&projection.lease, &projection.gateway, destination, bounds)?;
+        let command = self.browser_controller.attach_with_gateway(
+            &projection.lease,
+            &projection.gateway,
+            destination,
+            bounds,
+        )?;
         projection.bounds = bounds;
         projection.attached = true;
         Ok(command)
@@ -175,7 +187,8 @@ impl TaskCockpitShell {
             .browser_projection
             .as_ref()
             .ok_or(BrowserNativeControllerError::GatewayUnbound)?;
-        self.browser_controller.submit_command(&projection.lease, command)
+        self.browser_controller
+            .submit_command(&projection.lease, command)
     }
 
     pub fn detach_browser_native(
@@ -194,8 +207,13 @@ impl TaskCockpitShell {
     /// Clear the UI projection only after the host has accepted the matching
     /// detach command. This keeps stale callbacks visible until teardown has
     /// actually drained.
-    pub fn finish_browser_detach(&mut self) {
+    pub fn finish_browser_detach(&mut self) -> Result<(), BrowserNativeControllerError> {
+        let Some(projection) = self.browser_projection.as_ref() else {
+            return Ok(());
+        };
+        self.browser_controller.close(&projection.lease)?;
         self.browser_projection = None;
+        Ok(())
     }
 
     /// Convert host lifecycle events into controller-fenced callbacks. Events
@@ -238,11 +256,12 @@ impl TaskCockpitShell {
             BrowserHostEvent::UserInput { .. } => BrowserNativeCallbackKind::SurfaceFocused,
             _ => BrowserNativeCallbackKind::SurfaceResized,
         };
-        self.browser_controller.take_callback(BrowserNativeCallback {
-            generation: projection.lease.generation(),
-            lease: projection.lease,
-            kind,
-        })
+        self.browser_controller
+            .take_callback(BrowserNativeCallback {
+                generation: projection.lease.generation(),
+                lease: projection.lease,
+                kind,
+            })
     }
 
     pub fn native_bin_mount(&self) -> Result<(), DependencyUnavailable> {
@@ -311,6 +330,85 @@ impl TaskCockpitShell {
             }
         }
         self.model = Some(model.clone());
+        self.project_timeline(model);
+    }
+
+    fn project_timeline(&mut self, model: &ClientModel) {
+        let Some(task_id) = self.dock.selected_task() else {
+            self.timeline = None;
+            self.timeline_error = None;
+            return;
+        };
+        let result = (|| {
+            let journal = SemanticJournalView::from_live_projection(model, task_id)
+                .map_err(|error| error.to_string())?;
+            let registry = RendererRegistry::standard().map_err(|error| error.to_string())?;
+            Timeline::project(
+                model,
+                task_id,
+                crate::protocol::CapabilitySet::empty(),
+                &journal,
+                &registry,
+                TimelineViewport {
+                    height: 280,
+                    scroll_offset: 0,
+                },
+            )
+            .map_err(|error| error.to_string())
+        })();
+        match result {
+            Ok(timeline) => {
+                self.timeline = Some(timeline);
+                self.timeline_error = None;
+            }
+            Err(error) => {
+                self.timeline = None;
+                self.timeline_error = Some(error);
+            }
+        }
+    }
+
+    pub fn timeline(&self) -> Option<&Timeline> {
+        self.timeline.as_ref()
+    }
+
+    pub fn conversation_surface(
+        &self,
+        tokens: crate::ui::tokens::ThemeTokens,
+        composer: Option<&TaskComposer>,
+    ) -> AnyElement {
+        let timeline = self
+            .timeline
+            .as_ref()
+            .map(|timeline| timeline.surface(tokens))
+            .unwrap_or_else(|| {
+                div()
+                    .id("native-semantic-timeline-hold")
+                    .w_full()
+                    .p(gpui::px(tokens.density.physical().control_padding as f32))
+                    .bg(tokens.surfaces.raised.to_gpui())
+                    .child(self.timeline_error.as_deref().unwrap_or(
+                        "Semantic timeline unavailable until an authenticated journal is admitted",
+                    ))
+                    .into_any_element()
+            });
+        let composer = composer
+            .map(|composer| composer.surface(tokens))
+            .unwrap_or_else(|| {
+                div()
+                    .id("native-task-composer-hold")
+                    .w_full()
+                    .p(gpui::px(tokens.density.physical().control_padding as f32))
+                    .child("Task composer unavailable until a primary agent is bound")
+                    .into_any_element()
+            });
+        div()
+            .id("native-task-conversation-surface")
+            .w_full()
+            .flex_col()
+            .child(timeline)
+            .child(composer)
+            .into_any_element()
     }
 
     pub fn selected_task(&self) -> Option<TaskId> {

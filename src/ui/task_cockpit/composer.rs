@@ -26,6 +26,8 @@ use crate::ui::components::interaction::{
     InteractionStateModel, MAX_ACCESSIBLE_DESCRIPTION_SCALARS, MAX_ACCESSIBLE_NAME_SCALARS,
 };
 use crate::ui::components::text_field::{TextField, TextFieldError, TextFieldKey, TextFieldLimits};
+use crate::ui::tokens::ThemeTokens;
+use gpui::{div, px, AnyElement, IntoElement, ParentElement, Styled};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt::{Debug, Display, Formatter};
@@ -427,6 +429,39 @@ pub struct ComposerHostProjection {
     pub disabled_reasons: Vec<(ComposerControl, String)>,
 }
 
+/// Build the composer projection for one selected task/agent pair.
+///
+/// The caller supplies identities from the canonical task snapshot. This
+/// helper deliberately does not derive a turn id from a PTY, timestamp, or
+/// transcript position; the exact provider turn is supplied separately at
+/// the typed host-action boundary.
+pub fn projection_for_task(
+    fence: ComposerFence,
+    owned_artifacts: Vec<ArtifactId>,
+    question: Option<(RequestId, u64)>,
+    approval: Option<(RequestId, u64)>,
+) -> ComposerHostProjection {
+    ComposerHostProjection {
+        fence,
+        draft: ComposerDraftProjection {
+            text: String::new(),
+            attachments: Vec::new(),
+            prompt: None,
+        },
+        owned_artifacts,
+        question: question.map(|(request_id, state_revision)| QuestionProjection {
+            request_id,
+            state_revision,
+            options: Vec::new(),
+        }),
+        approval: approval.map(|(request_id, state_revision)| ApprovalProjection {
+            request_id,
+            state_revision,
+        }),
+        disabled_reasons: Vec::new(),
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ControlAvailability {
     available: bool,
@@ -688,6 +723,17 @@ impl TaskComposer {
         Self::bind_inner(projection, catalog())
     }
 
+    /// Bind a task-owned composer and capture the current UI focus epoch
+    /// before any pointer or keyboard gesture can submit it.
+    pub fn bind_for_task(
+        projection: ComposerHostProjection,
+        focus_epoch: FocusEpoch,
+    ) -> Result<Self, ComposerError> {
+        let mut composer = Self::bind(projection)?;
+        composer.set_focus_epoch(focus_epoch)?;
+        Ok(composer)
+    }
+
     #[cfg(test)]
     fn bind_with_catalog(
         projection: ComposerHostProjection,
@@ -729,6 +775,58 @@ impl TaskComposer {
 
     pub fn fence(&self) -> ComposerFence {
         self.fence
+    }
+
+    pub fn focus_epoch(&self) -> Option<FocusEpoch> {
+        self.focus_epoch
+    }
+
+    pub fn pending_question_identity(&self) -> Option<(RequestId, u64)> {
+        self.question
+            .as_ref()
+            .map(|question| (question.request_id, question.state_revision))
+    }
+
+    pub fn pending_approval_identity(&self) -> Option<(RequestId, u64)> {
+        self.approval
+            .as_ref()
+            .map(|approval| (approval.request_id, approval.state_revision))
+    }
+
+    /// Render the task-owned composer status from the same projection used by
+    /// typed input actions. This surface is intentionally presentation-only;
+    /// submission still goes through `ComposerIntent` and the host action lane.
+    pub fn surface(&self, tokens: ThemeTokens) -> AnyElement {
+        let question = self
+            .pending_question_identity()
+            .map(|(_, revision)| format!("question rev {revision}"))
+            .unwrap_or_else(|| "no pending question".to_string());
+        let approval = self
+            .pending_approval_identity()
+            .map(|(_, revision)| format!("approval rev {revision}"))
+            .unwrap_or_else(|| "no pending approval".to_string());
+        let turn = if self.fence.turn_id.is_some() {
+            "turn available"
+        } else {
+            "turn identity unavailable"
+        };
+        div()
+            .id("native-task-composer")
+            .w_full()
+            .flex_col()
+            .gap(px(tokens.density.spacing.xs))
+            .p(px(tokens.density.physical().control_padding as f32))
+            .bg(tokens.surfaces.raised.to_gpui())
+            .child("Task composer")
+            .child(format!(
+                "{} character draft · {} · {} · {}",
+                self.draft_text().chars().count(),
+                self.primary_submit_label(),
+                question,
+                approval
+            ))
+            .child(turn)
+            .into_any_element()
     }
 
     pub fn text_limits(&self) -> TextFieldLimits {
@@ -3175,5 +3273,59 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn task_binding_preserves_task_request_and_action_epochs() {
+        let task_id = TaskId::new();
+        let agent_session_id = AgentSessionId::new();
+        let question_id = RequestId::new();
+        let approval_id = RequestId::new();
+        let fence = ComposerFence {
+            task_id,
+            agent_session_id,
+            runtime_generation: 17,
+            action_epoch: 23,
+            turn_id: None,
+        };
+        let projection = projection_for_task(
+            fence,
+            vec![ArtifactId::new()],
+            Some((question_id, 41)),
+            Some((approval_id, 43)),
+        );
+
+        let focus_epoch = FocusEpochSource::new().current();
+        let composer =
+            TaskComposer::bind_for_task(projection, focus_epoch).expect("task composer binds");
+
+        assert_eq!(composer.fence(), fence);
+        assert_eq!(
+            composer.pending_question_identity(),
+            Some((question_id, 41))
+        );
+        assert_eq!(
+            composer.pending_approval_identity(),
+            Some((approval_id, 43))
+        );
+        assert_eq!(composer.focus_epoch(), Some(focus_epoch));
+    }
+
+    #[test]
+    fn task_binding_does_not_infer_a_turn_id() {
+        let fence = ComposerFence {
+            task_id: TaskId::new(),
+            agent_session_id: AgentSessionId::new(),
+            runtime_generation: 5,
+            action_epoch: 6,
+            turn_id: None,
+        };
+        let composer = TaskComposer::bind_for_task(
+            projection_for_task(fence, Vec::new(), None, None),
+            FocusEpochSource::new().current(),
+        )
+        .expect("task composer binds");
+
+        assert_eq!(composer.fence().turn_id, None);
     }
 }

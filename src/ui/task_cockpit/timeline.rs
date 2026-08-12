@@ -3,6 +3,8 @@
 //! Production rows come only from [`SemanticJournalView`]. Caller-supplied
 //! raw `SemanticEvent` arrays are not part of the public API.
 
+use gpui::{div, px, AnyElement, IntoElement, ParentElement, Styled};
+
 use crate::client::model::ClientModel;
 use crate::domain::id::{OperationId, TaskId};
 use crate::protocol::CapabilitySet;
@@ -29,6 +31,7 @@ struct TimelineAnchor {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Timeline {
     task_id: TaskId,
+    availability: JournalAvailability,
     items: Vec<TimelineItemModel>,
     prefix: Vec<u32>,
     content_height: u32,
@@ -54,6 +57,7 @@ impl Timeline {
         let items = journal.project_items(registry, capabilities)?;
         let mut timeline = Self {
             task_id,
+            availability: journal.availability(),
             items,
             prefix: Vec::new(),
             content_height: 0,
@@ -72,6 +76,55 @@ impl Timeline {
 
     pub fn item_count(&self) -> usize {
         self.items.len()
+    }
+
+    pub fn task_id(&self) -> TaskId {
+        self.task_id
+    }
+
+    pub fn availability(&self) -> JournalAvailability {
+        self.availability
+    }
+
+    /// Render the semantic surface without deriving transcript content from
+    /// the native terminal. An unavailable journal remains visibly mounted as
+    /// a typed hold until an authenticated semantic page is admitted.
+    pub fn surface(&self, tokens: crate::ui::tokens::ThemeTokens) -> AnyElement {
+        let status = match self.availability {
+            JournalAvailability::Unavailable(_) => {
+                "Semantic timeline awaiting authenticated journal"
+            }
+            #[cfg(any(test, feature = "semantic-conformance"))]
+            JournalAvailability::ConformanceFixture => "Semantic timeline",
+        };
+        let rows = self
+            .painted_items()
+            .iter()
+            .map(|item| {
+                div()
+                    .w_full()
+                    .p(px(tokens.density.physical().row_padding as f32))
+                    .border_b_1()
+                    .border_color(tokens.borders.subtle.to_gpui())
+                    .child(item.accessibility.name().to_string())
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
+        div()
+            .id("native-semantic-timeline")
+            .w_full()
+            .max_h(px(280.0))
+            .overflow_y_scroll()
+            .bg(tokens.surfaces.raised.to_gpui())
+            .child(
+                div()
+                    .w_full()
+                    .p(px(tokens.density.physical().control_padding as f32))
+                    .text_color(tokens.text.secondary.to_gpui())
+                    .child(format!("{status} · {} item(s)", self.items.len())),
+            )
+            .children(rows)
+            .into_any_element()
     }
 
     pub fn items(&self) -> &[TimelineItemModel] {

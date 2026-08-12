@@ -76,7 +76,9 @@ use crate::ui::shell::{
     PointerOwner, PromptLibraryViewport, ScalePercent, Shell, TerminalPressRejection,
     TerminalRelease,
 };
-use crate::ui::task_cockpit::composer::{ComposerError, TaskComposer};
+use crate::ui::task_cockpit::composer::{
+    ComposerDraftProjection, ComposerError, ComposerFence, ComposerHostProjection, TaskComposer,
+};
 use crate::ui::task_cockpit::dock::{DockEdge, DockTool as CockpitDockTool};
 use crate::ui::task_cockpit::shell::TaskCockpitShell;
 use crate::ui::task_cockpit::{
@@ -5249,7 +5251,7 @@ impl Drop for NativeShell {
         if self.cockpit.browser_projection().is_some() {
             if let Ok(command) = self.cockpit.detach_browser_native() {
                 let _ = self.browser_host.apply_native_shell_command(&command);
-                self.cockpit.finish_browser_detach();
+                let _ = self.cockpit.finish_browser_detach();
             }
         }
         let _ = self.browser_host.drain_events();
@@ -5615,7 +5617,7 @@ impl NativeShell {
     ) -> Result<BrowserNativeHostOutcome, BrowserError> {
         let outcome = self.browser_host.apply_native_shell_command(command)?;
         if matches!(command, BrowserNativeHostCommand::Detach { .. }) {
-            self.cockpit.finish_browser_detach();
+            self.cockpit.finish_browser_detach()?;
         }
         self.forward_browser_host_events();
         Ok(outcome)
@@ -6787,15 +6789,86 @@ impl NativeShell {
     fn sync_cockpit_follow(&mut self) {
         let Some(task_id) = self.interaction.selected_task() else {
             self.clear_cockpit_projection();
+            self.composer = None;
             return;
         };
         self.cockpit.follow_task(task_id);
         if let Some(model) = self.client_model.as_ref() {
             self.cockpit.follow_projection(model.as_ref());
+            self.sync_task_composer(model.as_ref(), task_id);
+        } else {
+            self.composer = None;
         }
         self.refresh_selected_cockpit_surfaces();
         self.sync_terminal_from_cockpit();
         self.sync_header_projection();
+    }
+
+    fn sync_task_composer(&mut self, model: &ClientModel, task_id: TaskId) {
+        let Some(snapshot) = model.task(task_id) else {
+            self.composer = None;
+            return;
+        };
+        let Some(agent_session_id) = snapshot.primary_agent_id else {
+            self.composer = None;
+            self.composer_error = Some("primary agent is not bound".to_string());
+            return;
+        };
+        let Some(agent) = snapshot.agents.get(&agent_session_id) else {
+            self.composer = None;
+            self.composer_error = Some("primary agent facts are unavailable".to_string());
+            return;
+        };
+        let projection = ComposerHostProjection {
+            fence: ComposerFence {
+                task_id,
+                agent_session_id,
+                runtime_generation: agent.runtime_generation,
+                action_epoch: snapshot.task.action_epoch,
+                // The kernel's exact provider TurnId is not interchangeable
+                // with a PTY or journal position. Leave it absent until the
+                // provider projection supplies the typed turn identity.
+                turn_id: None,
+            },
+            draft: ComposerDraftProjection {
+                text: String::new(),
+                attachments: Vec::new(),
+                prompt: None,
+            },
+            owned_artifacts: snapshot.artifacts.keys().copied().collect(),
+            // Open QuestionId/ApprovalId values in the provider snapshot are
+            // not interchangeable with the journal's RequestId plus revision.
+            // Keep these controls unbound until the authenticated semantic
+            // page provides the exact request identity and state revision.
+            question: None,
+            approval: None,
+            disabled_reasons: Vec::new(),
+        };
+        let focus_epoch = self.interaction.current_focus_epoch();
+        let same_binding = self.composer.as_ref().is_some_and(|composer| {
+            composer.fence().task_id == task_id
+                && composer.fence().agent_session_id == agent_session_id
+        });
+        let result = if same_binding {
+            self.composer
+                .as_mut()
+                .expect("same composer binding")
+                .apply_projection(projection, focus_epoch)
+        } else {
+            match TaskComposer::bind_for_task(projection, focus_epoch) {
+                Ok(composer) => {
+                    self.composer = Some(composer);
+                    self.composer_error = None;
+                    return;
+                }
+                Err(error) => Err(error),
+            }
+        };
+        if let Err(error) = result {
+            self.composer_error = Some(error.to_string());
+        } else {
+            self.composer_error = None;
+        }
     }
 
     fn clear_cockpit_projection(&mut self) {
@@ -7849,6 +7922,10 @@ impl NativeShell {
                     }),
             )
             .child(div().w_full().child(self.prompt_library_surface(tokens)))
+            .child(
+                self.cockpit
+                    .conversation_surface(tokens, self.composer.as_ref()),
+            )
             .child(
                 div()
                     .id("native-shell-context-dock")
