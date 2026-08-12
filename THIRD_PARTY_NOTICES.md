@@ -34,6 +34,10 @@ Machine-checked against `Cargo.lock` by `packaging/Assert-ThirdPartyProvenance.p
 | `sha2` | `0.10.9` | yes |
 | `hmac` | `0.12.1` | yes |
 | `snow` | `0.10.0` | yes |
+| `chacha20poly1305` | `0.10.1` | no (via snow) |
+| `chacha20` | `0.9.1` | no (via chacha20poly1305) |
+| `poly1305` | `0.8.0` | no (via chacha20poly1305) |
+| `fiat-crypto` | `0.2.9` | no (via curve25519-dalek) |
 | `tokio-rustls` | `0.26.4` | yes |
 | `webpki-roots` | `1.0.6` | yes |
 | `zeroize` | `1.8.2` | yes |
@@ -47,11 +51,33 @@ Connect production Noise is the pinned `snow` 0.10.0 crate listed above. Connect
 
 - Source: `https://crates.io/crates/snow/0.10.0`
 - Upstream: `https://github.com/mcginty/snow`
-- Declared in `Cargo.toml` as `snow = { version = "=0.10.0", default-features = false, features = ["ring-accelerated", "use-aes-gcm", "use-blake2", "use-curve25519", "use-getrandom"] }`
+- Declared in `Cargo.toml` as `snow = { version = "=0.10.0", default-features = false, features = ["ring-accelerated", "use-chacha20poly1305", "use-blake2", "use-curve25519", "use-getrandom"] }`
 - License: Apache-2.0 OR MIT (crate metadata; no formal third-party audit claim)
 - Locked checksum: `599b506ccc4aff8cf7844bc42cf783009a434c1e26c964432560fb6d6ad02d82`
 - RustSec advisory RUSTSEC-2024-0011 (unauthenticated nonce increment on stateful `TransportState`) is patched in `snow >= 0.9.5`. This pin is 0.10.0.
 - This is a security-note/risk record, not an audit. Production Connect uses snow's Noise XX/IK implementation rather than a homemade HMAC substitute.
+
+The selected Noise feature graph also includes `chacha20poly1305` 0.10.1,
+`chacha20` 0.9.1, and `poly1305` 0.8.0 (Apache-2.0 OR MIT), plus
+`fiat-crypto` 0.2.9 (MIT OR Apache-2.0 OR BSD-1-Clause). Versions and
+checksums are pinned by `Cargo.lock`.
+
+## webpki-roots 1.0.6
+
+- Source: `https://crates.io/crates/webpki-roots/1.0.6`
+- Upstream: `https://github.com/rustls/webpki-roots`
+- License: CDLA-Permissive-2.0
+- Used only as the public trust-root set for Connect `wss://` relay TLS.
+
+## Vendored Ghostty shell integration
+
+- Source: `https://github.com/ghostty-org/ghostty`, path `src/shell-integration/`
+- Vendored file inventory and the known unpinned-source limitation are recorded
+  in `third_party/ghostty/UPSTREAM.md`.
+- `bash/ghostty.bash` and `zsh/ghostty-integration` retain their upstream GPLv3
+  headers; other copied files retain their original upstream headers.
+- These resources are packaged for terminal prompt marks and shell UX. Any
+  refresh must record the exact upstream commit before replacement.
 
 ## caseless 0.2.2 and unicode-normalization 0.1.24
 
