@@ -630,6 +630,7 @@ mod tests {
             profile_fingerprint: ProfileFingerprint::hash_normalized("subscription-release"),
             granted: CapabilitySet::from_capabilities([Capability::EventReplay]),
             limits: FrameLimits::v1_default(),
+            reconnect_grant: None,
         };
         let connection = ClientConnection::scripted_for_test(
             client_id,

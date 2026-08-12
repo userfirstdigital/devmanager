@@ -1928,7 +1928,7 @@ impl ClientBrowserDockView {
     ) -> Result<Self, ClientModelError> {
         let mut generation = None;
         let mut shareable_url = None;
-        let mut tab_count = 0;
+        let mut tab_count = 0usize;
         for page in pages {
             for row in &page.items {
                 if row.task_id() != Some(task_id) {

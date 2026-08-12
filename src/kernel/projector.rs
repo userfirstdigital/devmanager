@@ -2,7 +2,11 @@
 
 use rusqlite::{OptionalExtension, Transaction};
 
-use crate::domain::agent::AgentRole;
+use crate::domain::agent::{AgentRole, AgentSessionLifecycle, SpecialistPermission};
+use crate::domain::artifact::{
+    structured_specialist_result, verify_inline_content_digest, ArtifactContentRef, ArtifactKind,
+    MAX_SPECIALIST_RAW_ARTIFACT_BYTES,
+};
 use crate::domain::event::{DomainEvent, Event};
 use crate::domain::host::{HostCleanupBranch, HostCleanupBranchOutcome};
 use crate::domain::id::{AgentSessionId, CommandId, EventId, ResourceId, TaskId};
@@ -238,6 +242,296 @@ pub(crate) fn apply_event(
                 ],
             )?;
             require_one_change(tx, "primary_agent.set")?;
+        }
+        Event::SpecialistRequested {
+            specialist_id,
+            requested_by,
+            purpose: _,
+            agent,
+            permission,
+            workspace,
+            action_epoch,
+            runtime_generation,
+            resource_id,
+        } => {
+            let task_id = require_task_id(event)?;
+            let (task_lifecycle, stored_epoch) = read_task_lifecycle_epoch(tx, shadow, task_id)?;
+            if task_lifecycle != lifecycle_text(TaskLifecycle::Open)
+                || u64_from_nonnegative_i64("tasks.action_epoch", stored_epoch)? != *action_epoch
+            {
+                return Err(StoreError::Projection(
+                    "specialist.requested action fence does not match task".into(),
+                ));
+            }
+            if agent.id != *specialist_id
+                || agent.task_id != task_id
+                || agent.runtime_generation != *runtime_generation
+                || !matches!(agent.role, AgentRole::Specialist { .. })
+                || agent.lifecycle != AgentSessionLifecycle::Open
+                || agent.revision != 0
+                || !matches!(permission, SpecialistPermission::ReadOnly)
+            {
+                return Err(StoreError::Projection(
+                    "specialist.requested agent facts are invalid".into(),
+                ));
+            }
+            agent
+                .validate_for_registration()
+                .map_err(|err| StoreError::Projection(err.to_string()))?;
+            workspace
+                .validate()
+                .map_err(|err| StoreError::Projection(err.to_string()))?;
+            let (requester_task, requester_role, requester_lifecycle, requester_generation) =
+                load_agent_projection_state(tx, shadow, *requested_by)?;
+            if requester_task != task_id
+                || !matches!(requester_role, AgentRole::Primary)
+                || requester_lifecycle != AgentSessionLifecycle::Open
+                || requester_generation != *runtime_generation
+            {
+                return Err(StoreError::Projection(
+                    "specialist.requested requester fence is invalid".into(),
+                ));
+            }
+            if let Some(resource_id) = resource_id {
+                let resource = tx
+                    .query_row(
+                        &format!(
+                            "SELECT task_id, runtime_generation FROM {} WHERE resource_id = ?1",
+                            table_name("resources", shadow)
+                        ),
+                        [resource_id.as_bytes().as_slice()],
+                        |row| Ok((row.get::<_, Option<Vec<u8>>>(0)?, row.get::<_, i64>(1)?)),
+                    )
+                    .optional()?;
+                let Some((Some(resource_task), resource_generation)) = resource else {
+                    return Err(StoreError::Projection(
+                        "specialist.requested resource is missing or unowned".into(),
+                    ));
+                };
+                if resource_task.as_slice() != task_id.as_bytes().as_slice()
+                    || resource_generation
+                        != u64_to_sqlite_i64("resources.runtime_generation", *runtime_generation)?
+                {
+                    return Err(StoreError::Projection(
+                        "specialist.requested resource fence is invalid".into(),
+                    ));
+                }
+            }
+            let table = table_name("agent_sessions", shadow);
+            tx.execute(
+                &format!(
+                    "INSERT INTO {table} (
+                        agent_session_id, task_id, role, provider_kind, provider_session_id,
+                        lifecycle, runtime_generation, revision
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
+                ),
+                rusqlite::params![
+                    agent.id.as_bytes().as_slice(),
+                    agent.task_id.as_bytes().as_slice(),
+                    pack(&agent.role)?,
+                    agent.provider_kind.wire_name(),
+                    agent.provider_session_id,
+                    agent_lifecycle_text(agent.lifecycle),
+                    u64_to_sqlite_i64(
+                        "agent_sessions.runtime_generation",
+                        agent.runtime_generation
+                    )?,
+                    u64_to_sqlite_i64("agent_sessions.revision", agent.revision)?,
+                ],
+            )?;
+            bump_task_revision(tx, shadow, task_id, event)?;
+            upsert_provider_session_state(tx, shadow, task_id, agent.id, |session| {
+                let _ = session;
+                Ok(())
+            })?;
+        }
+        Event::PrimaryPromoted {
+            previous,
+            promoted,
+            action_epoch,
+            runtime_generation,
+        } => {
+            let task_id = require_task_id(event)?;
+            let (task_lifecycle, stored_epoch) = read_task_lifecycle_epoch(tx, shadow, task_id)?;
+            if task_lifecycle != lifecycle_text(TaskLifecycle::Open)
+                || u64_from_nonnegative_i64("tasks.action_epoch", stored_epoch)? != *action_epoch
+            {
+                return Err(StoreError::Projection(
+                    "primary_agent.promoted action fence does not match task".into(),
+                ));
+            }
+            let current_primary: Option<Vec<u8>> = tx.query_row(
+                &format!(
+                    "SELECT primary_agent_session_id FROM {} WHERE task_id = ?1",
+                    table_name("tasks", shadow)
+                ),
+                [task_id.as_bytes().as_slice()],
+                |row| row.get(0),
+            )?;
+            if current_primary.as_deref() != Some(previous.as_bytes().as_slice()) {
+                return Err(StoreError::Projection(
+                    "primary_agent.promoted previous primary mismatch".into(),
+                ));
+            }
+            let (previous_task, previous_role, previous_lifecycle, previous_generation) =
+                load_agent_projection_state(tx, shadow, *previous)?;
+            let (promoted_task, promoted_role, promoted_lifecycle, promoted_generation) =
+                load_agent_projection_state(tx, shadow, *promoted)?;
+            if previous_task != task_id
+                || promoted_task != task_id
+                || !matches!(previous_role, AgentRole::Primary)
+                || !matches!(promoted_role, AgentRole::Specialist { .. })
+                || previous_lifecycle != AgentSessionLifecycle::Open
+                || promoted_lifecycle != AgentSessionLifecycle::Open
+                || previous_generation != *runtime_generation
+                || promoted_generation != *runtime_generation
+            {
+                return Err(StoreError::Projection(
+                    "primary_agent.promoted agent fences are invalid".into(),
+                ));
+            }
+            let previous_role = AgentRole::specialist("primary")
+                .map_err(|err| StoreError::Projection(err.to_string()))?;
+            let table = table_name("agent_sessions", shadow);
+            tx.execute(
+                &format!("UPDATE {table} SET role = ?1 WHERE agent_session_id = ?2"),
+                rusqlite::params![pack(&previous_role)?, previous.as_bytes().as_slice(),],
+            )?;
+            require_one_change(tx, "primary_agent.promoted previous role")?;
+            tx.execute(
+                &format!("UPDATE {table} SET role = ?1 WHERE agent_session_id = ?2"),
+                rusqlite::params![pack(&AgentRole::Primary)?, promoted.as_bytes().as_slice()],
+            )?;
+            require_one_change(tx, "primary_agent.promoted promoted role")?;
+            let task_table = table_name("tasks", shadow);
+            tx.execute(
+                &format!(
+                    "UPDATE {task_table}
+                     SET primary_agent_session_id = ?1
+                     WHERE task_id = ?2"
+                ),
+                rusqlite::params![
+                    promoted.as_bytes().as_slice(),
+                    task_id.as_bytes().as_slice()
+                ],
+            )?;
+            require_one_change(tx, "primary_agent.promoted primary selection")?;
+            bump_task_revision(tx, shadow, task_id, event)?;
+        }
+        Event::SpecialistHandoffRecorded {
+            specialist_id,
+            artifact,
+            structured,
+            action_epoch,
+            runtime_generation,
+        } => {
+            let task_id = require_task_id(event)?;
+            let (_, stored_epoch) = read_task_lifecycle_epoch(tx, shadow, task_id)?;
+            if u64_from_nonnegative_i64("tasks.action_epoch", stored_epoch)? != *action_epoch
+                || artifact.task_id != task_id
+                || artifact.kind != ArtifactKind::ReviewReport
+            {
+                return Err(StoreError::Projection(
+                    "specialist.handoff_recorded task fence is invalid".into(),
+                ));
+            }
+            artifact
+                .validate()
+                .map_err(|err| StoreError::Projection(err.to_string()))?;
+            verify_inline_content_digest(artifact)
+                .map_err(|err| StoreError::Projection(err.to_string()))?;
+            let ArtifactContentRef::InlineUtf8(body) = &artifact.content_ref else {
+                return Err(StoreError::Projection(
+                    "specialist handoff artifact must be inline".into(),
+                ));
+            };
+            if body.len() > MAX_SPECIALIST_RAW_ARTIFACT_BYTES {
+                return Err(StoreError::Projection(
+                    "specialist handoff artifact exceeds bound".into(),
+                ));
+            }
+            if *structured {
+                structured_specialist_result(artifact)
+                    .map_err(|err| StoreError::Projection(err.to_string()))?;
+            }
+            let (specialist_task, specialist_role, specialist_lifecycle, specialist_generation) =
+                load_agent_projection_state(tx, shadow, *specialist_id)?;
+            if specialist_task != task_id
+                || !matches!(specialist_role, AgentRole::Specialist { .. })
+                || specialist_lifecycle != AgentSessionLifecycle::Open
+                || specialist_generation != *runtime_generation
+            {
+                return Err(StoreError::Projection(
+                    "specialist handoff agent fence is invalid".into(),
+                ));
+            }
+            let table = table_name("artifacts", shadow);
+            tx.execute(
+                &format!(
+                    "INSERT INTO {table} (
+                        artifact_id, task_id, kind, label, content_ref, sha256,
+                        privacy_class, created_at_ms
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
+                ),
+                rusqlite::params![
+                    artifact.id.as_bytes().as_slice(),
+                    artifact.task_id.as_bytes().as_slice(),
+                    artifact_kind_text(artifact.kind),
+                    artifact.label,
+                    pack(&artifact.content_ref)?,
+                    artifact.sha256.as_slice(),
+                    privacy_text(artifact.privacy_class),
+                    artifact.created_at_ms,
+                ],
+            )?;
+            let agent_table = table_name("agent_sessions", shadow);
+            tx.execute(
+                &format!(
+                    "UPDATE {agent_table}
+                     SET lifecycle = ?1
+                     WHERE agent_session_id = ?2"
+                ),
+                rusqlite::params![
+                    agent_lifecycle_text(AgentSessionLifecycle::Closed),
+                    specialist_id.as_bytes().as_slice(),
+                ],
+            )?;
+            require_one_change(tx, "specialist handoff close")?;
+            bump_task_revision(tx, shadow, task_id, event)?;
+        }
+        Event::SpecialistClosed {
+            specialist_id,
+            action_epoch,
+            runtime_generation,
+        } => {
+            let task_id = require_task_id(event)?;
+            let (_, stored_epoch) = read_task_lifecycle_epoch(tx, shadow, task_id)?;
+            if u64_from_nonnegative_i64("tasks.action_epoch", stored_epoch)? != *action_epoch {
+                return Err(StoreError::Projection(
+                    "specialist.closed action fence does not match task".into(),
+                ));
+            }
+            let (specialist_task, specialist_role, specialist_lifecycle, specialist_generation) =
+                load_agent_projection_state(tx, shadow, *specialist_id)?;
+            if specialist_task != task_id
+                || !matches!(specialist_role, AgentRole::Specialist { .. })
+                || specialist_lifecycle != AgentSessionLifecycle::Open
+                || specialist_generation != *runtime_generation
+            {
+                return Err(StoreError::Projection(
+                    "specialist.closed agent fence is invalid".into(),
+                ));
+            }
+            let table = table_name("agent_sessions", shadow);
+            tx.execute(
+                &format!("UPDATE {table} SET lifecycle = ?1 WHERE agent_session_id = ?2"),
+                rusqlite::params![
+                    agent_lifecycle_text(AgentSessionLifecycle::Closed),
+                    specialist_id.as_bytes().as_slice(),
+                ],
+            )?;
+            require_one_change(tx, "specialist.closed lifecycle")?;
+            bump_task_revision(tx, shadow, task_id, event)?;
         }
         Event::ArtifactRegistered { artifact } => {
             let task_id = require_task_id(event)?;
@@ -1342,6 +1636,43 @@ fn require_archive(tx: &Transaction<'_>, shadow: bool, task_id: TaskId) -> Resul
         }
     }
     Ok(())
+}
+
+fn load_agent_projection_state(
+    tx: &Transaction<'_>,
+    shadow: bool,
+    agent_session_id: AgentSessionId,
+) -> Result<(TaskId, AgentRole, AgentSessionLifecycle, u64), StoreError> {
+    let table = table_name("agent_sessions", shadow);
+    let (task_bytes, role_blob, lifecycle, runtime_generation): (Vec<u8>, Vec<u8>, String, i64) =
+        tx.query_row(
+            &format!(
+                "SELECT task_id, role, lifecycle, runtime_generation FROM {table}
+             WHERE agent_session_id = ?1"
+            ),
+            [agent_session_id.as_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+    let task_bytes: [u8; 16] = task_bytes
+        .try_into()
+        .map_err(|_| StoreError::Projection("agent task id must be 16 bytes".into()))?;
+    let task_id =
+        TaskId::from_bytes(task_bytes).map_err(|err| StoreError::Projection(err.to_string()))?;
+    let role: AgentRole = rmp_serde::from_slice(&role_blob)
+        .map_err(|err| StoreError::Projection(format!("invalid agent role blob: {err}")))?;
+    let lifecycle = match lifecycle.as_str() {
+        "open" => AgentSessionLifecycle::Open,
+        "closing" => AgentSessionLifecycle::Closing,
+        "closed" => AgentSessionLifecycle::Closed,
+        other => {
+            return Err(StoreError::Projection(format!(
+                "invalid agent lifecycle '{other}'"
+            )))
+        }
+    };
+    let runtime_generation =
+        u64_from_nonnegative_i64("agent_sessions.runtime_generation", runtime_generation)?;
+    Ok((task_id, role, lifecycle, runtime_generation))
 }
 
 fn validate_primary_agent(

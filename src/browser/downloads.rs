@@ -6,9 +6,9 @@ use crate::domain::artifact::PrivacyClass;
 use crate::domain::browser::BrowserPermission;
 use crate::domain::id::{ArtifactId, BrowserContextId, TaskId};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 #[cfg(target_os = "windows")]
 use std::os::windows::fs::MetadataExt;
-use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
@@ -627,8 +627,8 @@ impl BrowserIoController {
         if !self.role.may_submit_host_path() {
             return Err(BrowserIoError::RemotePathRejected);
         }
-        let (path, risk) =
-            classify_upload_path(workspace_root, candidate).map_err(|_| BrowserIoError::OutsideWorkspace)?;
+        let (path, risk) = classify_upload_path(workspace_root, candidate)
+            .map_err(|_| BrowserIoError::OutsideWorkspace)?;
         if risk == BrowserRisk::OutsideWorkspaceFile {
             return Err(BrowserIoError::OutsideWorkspace);
         }
@@ -645,7 +645,7 @@ impl BrowserIoController {
         if text.len() > MAX_BROWSER_CLIPBOARD_BYTES {
             return Err(BrowserIoError::BoundExceeded);
         }
-        *self.clipboard = Zeroizing::new(text.to_string());
+        self.clipboard = Zeroizing::new(text.to_string());
         Ok(redact_browser_text(text))
     }
 

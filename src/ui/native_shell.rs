@@ -2467,7 +2467,7 @@ impl NativeHostClientRuntime {
                     Ok(inspection) => inspection,
                     Err(error) => {
                         return Err(IpcError::Security(format!(
-                            "inspect_host_quit rejected: {error}"
+                            "inspect_host_quit rejected: {error:?}"
                         )));
                     }
                 };
@@ -2550,7 +2550,7 @@ impl NativeHostClientRuntime {
 
     pub fn take_ready_projection_messages(&mut self, max: usize) -> Vec<NativeHostProjection> {
         let limit = max.min(MAX_HOST_PROJECTIONS);
-        let mut projections = self
+        let mut projections: Vec<NativeHostProjection> = self
             .ready_projections
             .lock()
             .map(|mut projections| {
@@ -3339,17 +3339,19 @@ fn pump_subscription_once(
                             .at_epochs(current_epochs),
                     );
                 }
-                Err(error) => publish_projection(
-                    projections,
-                    NativeHostProjection {
-                        kind: NativeHostProjectionKind::Error,
-                        client_model: None,
-                        error: Some(bounded_host_error(error)),
-                        epochs: None,
-                        action_outcome: None,
-                    }
-                    .at_epochs(current_runtime_epochs(epochs)),
-                ),
+                Err(error) => {
+                    let _ = publish_projection(
+                        projections,
+                        NativeHostProjection {
+                            kind: NativeHostProjectionKind::Error,
+                            client_model: None,
+                            error: Some(bounded_host_error(error)),
+                            epochs: None,
+                            action_outcome: None,
+                        }
+                        .at_epochs(current_runtime_epochs(epochs)),
+                    );
+                }
             }
         }
         SubscriptionUpdate::Stream(_) => {
@@ -3591,7 +3593,7 @@ pub struct NativeInteraction {
 impl NativeInteraction {
     pub fn new(selected_task: Option<TaskId>) -> Self {
         Self {
-            shell: Shell::new(selected_task),
+            shell: Shell::detached(selected_task),
             focus_epochs: FocusEpochSource::new(),
             interaction: InteractionStateModel::default(),
             request_generation: 0,

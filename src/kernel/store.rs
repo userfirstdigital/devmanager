@@ -10,11 +10,12 @@ use crate::domain::event::{
     AgentSessionRegisteredPayload, ArtifactRegisteredPayload, DomainEvent, Event,
     HostCleanupBranchCompletedPayload, HostCloseBegunPayload, OperationAcceptedFact,
     OperationCancelledFact, OperationFailedFact, OperationSettledFact, OperationUncertainFact,
-    PrimaryAgentSetPayload, ProviderApprovalPresentedPayload, ProviderInputAcceptedPayload,
-    ProviderInputDeliveredPayload, ProviderQuestionPresentedPayload, ProviderWaitSettledPayload,
-    ResourceRegisteredPayload, ResourceReleaseBegunPayload, ResourceReleasedPayload,
-    TaskAttentionSetPayload, TaskCloseBegunPayload, TaskCreatedPayload, TaskRenamedPayload,
-    TaskUnitPayload, EVENT_SCHEMA_VERSION,
+    PrimaryAgentSetPayload, PrimaryPromotedPayload, ProviderApprovalPresentedPayload,
+    ProviderInputAcceptedPayload, ProviderInputDeliveredPayload, ProviderQuestionPresentedPayload,
+    ProviderWaitSettledPayload, ResourceRegisteredPayload, ResourceReleaseBegunPayload,
+    ResourceReleasedPayload, SpecialistClosedPayload, SpecialistHandoffRecordedPayload,
+    SpecialistRequestedPayload, TaskAttentionSetPayload, TaskCloseBegunPayload, TaskCreatedPayload,
+    TaskRenamedPayload, TaskUnitPayload, EVENT_SCHEMA_VERSION,
 };
 use crate::domain::id::{EventId, OperationId, OutboxId, TaskId};
 use crate::domain::operation::{
@@ -1256,6 +1257,60 @@ pub(crate) fn encode_event_payload(event: &Event) -> Result<Vec<u8>, StoreError>
         Event::PrimaryAgentSet { agent_session_id } => rmp_serde::to_vec(&PrimaryAgentSetPayload {
             agent_session_id: *agent_session_id,
         }),
+        Event::SpecialistRequested {
+            specialist_id,
+            requested_by,
+            purpose,
+            agent,
+            permission,
+            workspace,
+            action_epoch,
+            runtime_generation,
+            resource_id,
+        } => rmp_serde::to_vec(&SpecialistRequestedPayload {
+            specialist_id: *specialist_id,
+            requested_by: *requested_by,
+            purpose: purpose.clone(),
+            agent: agent.clone(),
+            permission: *permission,
+            workspace: workspace.clone(),
+            action_epoch: *action_epoch,
+            runtime_generation: *runtime_generation,
+            resource_id: *resource_id,
+        }),
+        Event::PrimaryPromoted {
+            previous,
+            promoted,
+            action_epoch,
+            runtime_generation,
+        } => rmp_serde::to_vec(&PrimaryPromotedPayload {
+            previous: *previous,
+            promoted: *promoted,
+            action_epoch: *action_epoch,
+            runtime_generation: *runtime_generation,
+        }),
+        Event::SpecialistHandoffRecorded {
+            specialist_id,
+            artifact,
+            structured,
+            action_epoch,
+            runtime_generation,
+        } => rmp_serde::to_vec(&SpecialistHandoffRecordedPayload {
+            specialist_id: *specialist_id,
+            artifact: artifact.clone(),
+            structured: *structured,
+            action_epoch: *action_epoch,
+            runtime_generation: *runtime_generation,
+        }),
+        Event::SpecialistClosed {
+            specialist_id,
+            action_epoch,
+            runtime_generation,
+        } => rmp_serde::to_vec(&SpecialistClosedPayload {
+            specialist_id: *specialist_id,
+            action_epoch: *action_epoch,
+            runtime_generation: *runtime_generation,
+        }),
         Event::ArtifactRegistered { artifact } => rmp_serde::to_vec(&ArtifactRegisteredPayload {
             artifact: artifact.clone(),
         }),
@@ -1477,6 +1532,53 @@ pub(crate) fn decode_stored_event(
             let p: PrimaryAgentSetPayload = unpack(payload)?;
             Event::PrimaryAgentSet {
                 agent_session_id: p.agent_session_id,
+            }
+        }
+        "specialist.requested" => {
+            let p: SpecialistRequestedPayload = unpack(payload)?;
+            p.validate()
+                .map_err(|e| StoreError::EventDecode(e.to_string()))?;
+            Event::SpecialistRequested {
+                specialist_id: p.specialist_id,
+                requested_by: p.requested_by,
+                purpose: p.purpose,
+                agent: p.agent,
+                permission: p.permission,
+                workspace: p.workspace,
+                action_epoch: p.action_epoch,
+                runtime_generation: p.runtime_generation,
+                resource_id: p.resource_id,
+            }
+        }
+        "primary_agent.promoted" => {
+            let p: PrimaryPromotedPayload = unpack(payload)?;
+            p.validate()
+                .map_err(|e| StoreError::EventDecode(e.to_string()))?;
+            Event::PrimaryPromoted {
+                previous: p.previous,
+                promoted: p.promoted,
+                action_epoch: p.action_epoch,
+                runtime_generation: p.runtime_generation,
+            }
+        }
+        "specialist.handoff_recorded" => {
+            let p: SpecialistHandoffRecordedPayload = unpack(payload)?;
+            p.validate()
+                .map_err(|e| StoreError::EventDecode(e.to_string()))?;
+            Event::SpecialistHandoffRecorded {
+                specialist_id: p.specialist_id,
+                artifact: p.artifact,
+                structured: p.structured,
+                action_epoch: p.action_epoch,
+                runtime_generation: p.runtime_generation,
+            }
+        }
+        "specialist.closed" => {
+            let p: SpecialistClosedPayload = unpack(payload)?;
+            Event::SpecialistClosed {
+                specialist_id: p.specialist_id,
+                action_epoch: p.action_epoch,
+                runtime_generation: p.runtime_generation,
             }
         }
         "artifact.registered" => {

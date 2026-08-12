@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt;
 
 use hmac::{Hmac, Mac};
@@ -7,6 +8,7 @@ use sha2::Sha256;
 use zeroize::Zeroizing;
 
 use crate::domain::artifact::ArtifactSummary;
+use crate::domain::browser::{BrowserSnapshotRow, BrowserSnapshotSection};
 use crate::domain::id::{
     AgentSessionId, ArtifactId, BrowserContextId, BrowserTabId, OperationId, ResourceId,
     SnapshotId, TaskId,
@@ -14,6 +16,7 @@ use crate::domain::id::{
 use crate::domain::snapshot::{
     canonical_snapshot_page_size, CanonicalPageSizeError, PageLimits, PageLimitsError,
     SnapshotItem, SnapshotItemKey, SnapshotPage, SnapshotSection, TaskSnapshotItem,
+    MAX_SNAPSHOT_PAGE_ENCODED_BYTES,
 };
 use crate::kernel::command_bus;
 use crate::kernel::store::{load_event_log_bounds, KernelStore, StoreError};
@@ -330,6 +333,81 @@ impl SnapshotSession {
         )
     }
 
+    fn browser_contexts_page(
+        &self,
+        after_item: Option<SnapshotItemKey>,
+    ) -> Result<SnapshotPage, SnapshotError> {
+        let after_context = match after_item {
+            Some(SnapshotItemKey::BrowserContext(context_id)) => Some(context_id),
+            Some(_) => return Err(SnapshotError::CursorContextMismatch),
+            None => None,
+        };
+        let (contexts, _) = load_browser_views(&self.conn)?;
+        let fetch_limit = usize::try_from(i64::from(self.limits.max_items) + 1)
+            .expect("validated snapshot item limit fits usize");
+        let ids = contexts
+            .keys()
+            .copied()
+            .filter(|id| after_context.map_or(true, |after| *id > after))
+            .take(fetch_limit)
+            .collect::<Vec<_>>();
+        self.assemble_page(
+            SnapshotSection::BrowserContexts,
+            after_item,
+            ids,
+            SnapshotItemKey::BrowserContext,
+            |context_id| {
+                contexts
+                    .get(&context_id)
+                    .cloned()
+                    .map(SnapshotItem::BrowserContext)
+                    .ok_or_else(|| {
+                        StoreError::Projection(
+                            "browser context disappeared from pinned snapshot".into(),
+                        )
+                        .into()
+                    })
+            },
+        )
+    }
+
+    fn browser_tabs_page(
+        &self,
+        after_item: Option<SnapshotItemKey>,
+    ) -> Result<SnapshotPage, SnapshotError> {
+        let after_tab = match after_item {
+            Some(SnapshotItemKey::BrowserTab(tab_id)) => Some(tab_id),
+            Some(_) => return Err(SnapshotError::CursorContextMismatch),
+            None => None,
+        };
+        let (_, tabs) = load_browser_views(&self.conn)?;
+        let fetch_limit = usize::try_from(i64::from(self.limits.max_items) + 1)
+            .expect("validated snapshot item limit fits usize");
+        let ids = tabs
+            .keys()
+            .copied()
+            .filter(|id| after_tab.map_or(true, |after| *id > after))
+            .take(fetch_limit)
+            .collect::<Vec<_>>();
+        self.assemble_page(
+            SnapshotSection::BrowserTabs,
+            after_item,
+            ids,
+            SnapshotItemKey::BrowserTab,
+            |tab_id| {
+                tabs.get(&tab_id)
+                    .cloned()
+                    .map(SnapshotItem::BrowserTab)
+                    .ok_or_else(|| {
+                        StoreError::Projection(
+                            "browser tab disappeared from pinned snapshot".into(),
+                        )
+                        .into()
+                    })
+            },
+        )
+    }
+
     fn assemble_page<Id, KeyFor, LoadItem>(
         &self,
         section: SnapshotSection,
@@ -476,6 +554,75 @@ impl SnapshotSession {
         }
         Ok(document)
     }
+}
+
+fn load_browser_views(
+    conn: &Connection,
+) -> Result<
+    (
+        BTreeMap<BrowserContextId, crate::domain::browser::BrowserContextView>,
+        BTreeMap<BrowserTabId, crate::domain::browser::BrowserTabView>,
+    ),
+    SnapshotError,
+> {
+    let task_ids = load_task_ids(conn, None, i64::MAX)?;
+    let mut contexts = BTreeMap::new();
+    let mut tabs = BTreeMap::new();
+    for task_id in task_ids {
+        let Some(snapshot) = command_bus::load_task_snapshot(conn, task_id)? else {
+            return Err(StoreError::Projection(
+                "browser task disappeared from pinned snapshot".into(),
+            )
+            .into());
+        };
+        let context_page = snapshot
+            .browser
+            .snapshot_page(
+                BrowserSnapshotSection::Contexts,
+                None,
+                crate::domain::browser::MAX_BROWSER_CONTEXTS as u32,
+                MAX_SNAPSHOT_PAGE_ENCODED_BYTES,
+            )
+            .map_err(|error| StoreError::Projection(error.to_string()))?;
+        for row in context_page.items {
+            let BrowserSnapshotRow::Context(view) = row else {
+                return Err(StoreError::Projection(
+                    "browser context snapshot returned a tab".into(),
+                )
+                .into());
+            };
+            if contexts.insert(view.context_id, view).is_some() {
+                return Err(StoreError::Projection(
+                    "duplicate browser context identity in pinned snapshot".into(),
+                )
+                .into());
+            }
+        }
+        let tab_page = snapshot
+            .browser
+            .snapshot_page(
+                BrowserSnapshotSection::Tabs,
+                None,
+                crate::domain::browser::MAX_BROWSER_TABS as u32,
+                MAX_SNAPSHOT_PAGE_ENCODED_BYTES,
+            )
+            .map_err(|error| StoreError::Projection(error.to_string()))?;
+        for row in tab_page.items {
+            let BrowserSnapshotRow::Tab(view) = row else {
+                return Err(StoreError::Projection(
+                    "browser tab snapshot returned a context".into(),
+                )
+                .into());
+            };
+            if tabs.insert(view.tab_id, view).is_some() {
+                return Err(StoreError::Projection(
+                    "duplicate browser tab identity in pinned snapshot".into(),
+                )
+                .into());
+            }
+        }
+    }
+    Ok((contexts, tabs))
 }
 
 fn load_task_ids(

@@ -159,6 +159,7 @@ mod tests {
     use crate::domain::id::{AgentSessionId, ResourceId, TaskId};
     use crate::domain::resource::{OwnerKind, ResourceKind};
     use crate::domain::{AgentRole, AgentSessionLifecycle};
+    use crate::providers::capabilities::ProviderKind;
     use crate::updater::handoff::{
         FixedActiveResourceProbe, HostUpdateAdmission, HostUpdateHandoff, HostUpdateRuntimeGate,
         SilentReplacementDecision, UpdateResourceInspection,
@@ -174,7 +175,7 @@ mod tests {
                 task_id: TaskId::new(),
                 task_title: "t".into(),
                 role: AgentRole::Primary,
-                provider_kind: "claude".into(),
+                provider_kind: ProviderKind::ClaudeCode,
                 lifecycle: AgentSessionLifecycle::Open,
                 runtime_generation: 1,
             }],

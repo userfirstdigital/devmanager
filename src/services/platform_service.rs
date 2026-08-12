@@ -620,7 +620,7 @@ fn check_listener_snapshot_deadline(
     }
 }
 
-#[cfg(all(windows, test))]
+#[cfg(windows)]
 #[link(name = "kernel32")]
 extern "system" {
     fn OpenProcess(desired_access: u32, inherit_handle: i32, process_id: u32) -> *mut c_void;
@@ -628,9 +628,9 @@ extern "system" {
     fn WaitForSingleObject(handle: *mut c_void, milliseconds: u32) -> u32;
 }
 
-#[cfg(all(windows, test))]
+#[cfg(windows)]
 const PROCESS_TERMINATE: u32 = 0x0001;
-#[cfg(all(windows, test))]
+#[cfg(windows)]
 const SYNCHRONIZE: u32 = 0x00100000;
 #[cfg(windows)]
 const ALL_PROCESSOR_GROUPS: u16 = 0xffff;
@@ -997,10 +997,6 @@ mod tests {
         snapshot_listener_pids_until, terminate_owned_process_group_with, MAX_LISTENER_PORT_BATCH,
     };
     use std::cell::RefCell;
-    use std::sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    };
     use std::time::Duration;
 
     #[test]
@@ -1420,7 +1416,7 @@ fn applescript_quote(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
-#[cfg(all(windows, test))]
+#[cfg(windows)]
 fn windows_terminate_pid(pid: u32) -> Result<(), String> {
     if !is_pid_running(pid) {
         return Ok(());

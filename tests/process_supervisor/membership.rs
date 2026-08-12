@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use devmanager::domain::id::{OperationId, ResourceId, TaskId};
+use devmanager::domain::id::{OperationId, ResourceId};
 use devmanager::domain::operation::ResourceFence;
 use devmanager::process::identity::{ManagedProcessId, ManagedProcessIdentity, ProcessOwner};
 use devmanager::process::registry::{
@@ -481,10 +481,6 @@ fn membership_stale_completion_cannot_mutate_replacement_generation() {
     // only the registry/Task 3 bridge can mint the sealed capability. The
     // stale-generation checks below cover the remaining externally observable
     // rejection path.
-    assert!(!registry.apply_job_completion(completion(
-        stale_fence.clone(),
-        JobCompletionEvent::ExitProcess { pid: 4_001 },
-    )));
     assert!(!registry.apply_job_observation(completion(
         stale_fence.clone(),
         JobCompletionEvent::AbnormalExitProcess { pid: 4_001 },

@@ -23,7 +23,7 @@ use std::{
 use portable_pty::{native_pty_system, MasterPty, PtySize, SlavePty};
 
 use crate::{
-    domain::id::ResourceId,
+    domain::id::{OperationId, ResourceId},
     process::identity::ProcessOwner,
     process::teardown::TeardownCompletionStore,
     services::supervisor::{
@@ -34,10 +34,7 @@ use crate::{
 
 #[cfg(windows)]
 use crate::{
-    domain::{
-        operation::{OperationId, ResourceFence},
-        resource::ResourceKind,
-    },
+    domain::{operation::ResourceFence, resource::ResourceKind},
     process::{
         launcher::{prepare_suspended_pty, PendingManagedLaunch},
         teardown::{
@@ -48,10 +45,7 @@ use crate::{
 };
 
 #[cfg(not(windows))]
-use crate::domain::{
-    operation::{OperationId, ResourceFence},
-    resource::ResourceKind,
-};
+use crate::domain::{operation::ResourceFence, resource::ResourceKind};
 
 const MAX_SERVICE_AUTHORITY_RESOURCES: usize = 256;
 #[cfg(windows)]

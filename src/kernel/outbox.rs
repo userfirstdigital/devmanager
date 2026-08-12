@@ -412,6 +412,10 @@ pub(crate) fn plan_effects(
             | Event::TaskArchived
             | Event::AgentSessionRegistered { .. }
             | Event::PrimaryAgentSet { .. }
+            | Event::SpecialistRequested { .. }
+            | Event::PrimaryPromoted { .. }
+            | Event::SpecialistHandoffRecorded { .. }
+            | Event::SpecialistClosed { .. }
             | Event::ArtifactRegistered { .. }
             | Event::ResourceRegistered { .. }
             | Event::ResourceReleased { .. }

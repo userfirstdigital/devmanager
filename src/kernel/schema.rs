@@ -1,4 +1,7 @@
+use rusqlite::{Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
+
+use crate::kernel::store::StoreError;
 
 /// One immutable compiled migration entry.
 #[derive(Debug, Clone, Copy)]
