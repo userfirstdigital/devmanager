@@ -7,6 +7,7 @@ pub mod history;
 pub mod library;
 pub mod mutation;
 pub mod picker;
+pub mod surface;
 pub mod version_diff;
 
 use super::shell::{AccessibleName, LibrarySection, PromptLibraryChrome, PromptLibraryViewport};
@@ -33,6 +34,10 @@ use self::library::{filter_saved_prompts, virtualize, LibraryListState, SavedPro
 use self::picker::{open_picker, PromptPicker, PromptPickerHit, PromptPickerSource};
 use self::version_diff::VersionDiffView;
 pub use super::shell::PromptLibraryUiError;
+pub use surface::{
+    PromptChainSurfaceRow, PromptLibrarySurface, PromptSurfaceError, PromptSurfaceSelection,
+    PromptTaskAuthority, MAX_SURFACE_CHAIN_ROWS,
+};
 
 pub const LIBRARY_VISIBLE_ROWS: usize = 80;
 pub const CHAIN_VISIBLE_LINKS: usize = 80;
