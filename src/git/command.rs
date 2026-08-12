@@ -174,7 +174,8 @@ impl GitLimits {
 
 /// Private identity carried by every host authority marker.  A live bit on its
 /// own is not an authority: the marker must still belong to this exact task,
-/// workspace/repository graph, controller, and connection.
+/// workspace/repository graph, controller, connection, request/command, and
+/// action/runtime generation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct AuthorityIdentity {
     task_id: String,
@@ -182,6 +183,10 @@ struct AuthorityIdentity {
     repository_static_identity: String,
     controller_id: String,
     connection_id: String,
+    request_id: String,
+    command_id: String,
+    action_epoch: u64,
+    runtime_generation: u64,
 }
 
 /// Private marker for the live WorkspaceService authorization.  A Git binding
@@ -267,6 +272,7 @@ struct GitAuthorityCapability {
     repository_static_identity: String,
     approved_external_roots: Vec<PathBuf>,
     authority_deadline: Instant,
+    forced_expiry: Arc<AtomicBool>,
     limits: GitLimits,
     workspace_resource_lease: Option<std::sync::Arc<crate::workspace::WorkspaceResourceLease>>,
 }
@@ -283,6 +289,7 @@ impl GitAuthorityCapability {
             && self.connection.is_live_for(&self.identity)
             && self.action_generation.is_current()
             && Instant::now() < self.authority_deadline
+            && !self.forced_expiry.load(Ordering::Acquire)
             && Arc::strong_count(&self.root_handle) >= 1
             && !self.graph_handles.is_empty()
             && self
@@ -313,12 +320,43 @@ impl fmt::Debug for GitHostBinding {
     }
 }
 
-#[cfg(test)]
 impl GitHostBinding {
+    fn confirm_cockpit_plan<P: MutationPlan>(
+        &self,
+        plan: &P,
+    ) -> Result<GitConfirmation, GitError> {
+        if !self.capability.is_live() {
+            return Err(GitError::AuthorityUnavailable);
+        }
+        if plan.workspace() != &self.capability.identity.workspace {
+            return Err(GitError::WorkspaceMismatch {
+                expected: self.capability.identity.workspace.id().to_string(),
+                actual: plan.workspace().id().to_string(),
+            });
+        }
+        if !matches!(
+            plan.capability(),
+            GitCapability::Stage | GitCapability::Unstage | GitCapability::Commit
+        ) {
+            return Err(GitError::CapabilityDenied {
+                capability: plan.capability(),
+            });
+        }
+        let gate = GitCapabilityGate::new([
+            GitCapability::Stage,
+            GitCapability::Unstage,
+            GitCapability::Commit,
+        ]);
+        let permit = GitOperationPermit::host_mutation(Arc::clone(&self.capability), plan);
+        gate.confirm(plan, permit)
+    }
+
+    #[cfg(test)]
     fn has_live_authority_for_test(&self) -> bool {
         self.capability.is_live()
     }
 
+    #[cfg(test)]
     fn retained_handle_count_for_test(&self) -> usize {
         1 + self.capability.graph_handles.len()
     }
@@ -328,6 +366,33 @@ impl GitHostBinding {
 pub(crate) fn test_issue_git_host_binding(
     root: impl AsRef<Path>,
     approved_external_roots: Vec<PathBuf>,
+) -> Result<GitHostBinding, GitError> {
+    test_issue_git_host_binding_with_fence(
+        root,
+        approved_external_roots,
+        "test-task-6-6a",
+        "test-controller",
+        "test-connection",
+        "test-request",
+        "test-command",
+        1,
+        1,
+        Duration::from_secs(30),
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn test_issue_git_host_binding_with_fence(
+    root: impl AsRef<Path>,
+    approved_external_roots: Vec<PathBuf>,
+    task_id: &str,
+    controller_id: &str,
+    connection_id: &str,
+    request_id: &str,
+    command_id: &str,
+    action_epoch: u64,
+    runtime_generation: u64,
+    live_for: Duration,
 ) -> Result<GitHostBinding, GitError> {
     let root =
         RepositoryRoot::open_with_approved_external_roots(root.as_ref(), &approved_external_roots)
@@ -346,11 +411,15 @@ pub(crate) fn test_issue_git_host_binding(
     let repository_static_identity = repository_static_graph_identity(&root);
     let workspace = WorkspaceIdentity::from_canonical_root(root.path.clone());
     let identity = AuthorityIdentity {
-        task_id: "test-task-6-6a".to_string(),
+        task_id: task_id.to_string(),
         workspace,
         repository_static_identity: repository_static_identity.clone(),
-        controller_id: "test-controller".to_string(),
-        connection_id: "test-connection".to_string(),
+        controller_id: controller_id.to_string(),
+        connection_id: connection_id.to_string(),
+        request_id: request_id.to_string(),
+        command_id: command_id.to_string(),
+        action_epoch,
+        runtime_generation,
     };
     let state = Arc::new(AuthorityState::new(identity.clone()));
     Ok(GitHostBinding {
@@ -370,7 +439,8 @@ pub(crate) fn test_issue_git_host_binding(
             repository_identity: Arc::new(Mutex::new(repository_identity)),
             repository_static_identity,
             approved_external_roots,
-            authority_deadline: Instant::now() + Duration::from_secs(30),
+            authority_deadline: Instant::now() + live_for,
+            forced_expiry: Arc::new(AtomicBool::new(false)),
             limits: GitLimits::default(),
             workspace_resource_lease: None,
         }),
@@ -463,6 +533,10 @@ pub(crate) fn issue_git_host_binding(
         repository_static_identity: repository_static_identity.clone(),
         controller_id: client_id.to_string(),
         connection_id: connection_id.to_string(),
+        request_id: request_id.to_string(),
+        command_id: command_id.to_string(),
+        action_epoch,
+        runtime_generation,
     };
     let state = Arc::new(AuthorityState::new(identity.clone()));
     Ok(GitHostBinding {
@@ -472,8 +546,8 @@ pub(crate) fn issue_git_host_binding(
             controller: ControllerHandle(Arc::clone(&state)),
             connection: ConnectionHandle(Arc::clone(&state)),
             action_generation: ActionGeneration {
-                current: Arc::new(AtomicU64::new(1)),
-                issued: 1,
+                current: Arc::new(AtomicU64::new(action_epoch.max(1))),
+                issued: action_epoch.max(1),
             },
             identity,
             root: root.path,
@@ -483,6 +557,7 @@ pub(crate) fn issue_git_host_binding(
             repository_static_identity,
             approved_external_roots,
             authority_deadline: Instant::now() + Duration::from_secs(30),
+            forced_expiry: Arc::new(AtomicBool::new(false)),
             limits: GitLimits::default(),
             workspace_resource_lease: Some(Arc::new(lease)),
         }),
@@ -501,6 +576,29 @@ enum GitPermitAuthority {
 }
 
 #[derive(Clone)]
+struct HostMutationSeal {
+    nonce: [u8; 32],
+    action_epoch: u64,
+    runtime_generation: u64,
+    /// Shared one-shot admission latch. Cloning a confirmation/permit shares
+    /// this latch so a second spawn attempt fails closed after consumption.
+    consumed: Arc<AtomicBool>,
+}
+
+impl HostMutationSeal {
+    fn is_available(&self) -> bool {
+        !self.consumed.load(Ordering::Acquire)
+    }
+
+    fn consume_once(&self) -> Result<(), GitError> {
+        self.consumed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| ())
+            .map_err(|_| GitError::AuthorityUnavailable)
+    }
+}
+
+#[derive(Clone)]
 enum GitPermitOperation {
     ReadOnly,
     Mutation {
@@ -508,6 +606,7 @@ enum GitPermitOperation {
         plan_digest: String,
         remote_policy: Option<RemotePolicy>,
         remote_name: Option<String>,
+        host_seal: Option<HostMutationSeal>,
     },
     ServiceMutation {
         plan_digest: String,
@@ -563,24 +662,32 @@ impl GitOperationPermit {
                 plan_digest: plan.plan_digest(),
                 remote_policy: plan.remote_policy().cloned(),
                 remote_name: plan.remote_name().map(str::to_string),
+                host_seal: None,
             },
             deadline: OperationDeadline::from_now(timeout.min(HARD_MAX_TIMEOUT)),
         }
     }
 
-    #[cfg(test)]
     fn host_mutation<P: MutationPlan>(capability: Arc<GitAuthorityCapability>, plan: &P) -> Self {
         let deadline = OperationDeadline::from_host_authority(
             capability.authority_deadline,
             capability.limits.timeout,
         );
+        let plan_digest = plan.plan_digest();
+        let host_seal = Some(HostMutationSeal {
+            nonce: issue_confirmation_nonce(&capability, &plan_digest),
+            action_epoch: capability.identity.action_epoch,
+            runtime_generation: capability.identity.runtime_generation,
+            consumed: Arc::new(AtomicBool::new(false)),
+        });
         Self {
             authority: GitPermitAuthority::Host(capability),
             operation: GitPermitOperation::Mutation {
                 capability: plan.capability(),
-                plan_digest: plan.plan_digest(),
+                plan_digest,
                 remote_policy: plan.remote_policy().cloned(),
                 remote_name: plan.remote_name().map(str::to_string),
+                host_seal,
             },
             deadline,
         }
@@ -645,10 +752,36 @@ impl GitOperationPermit {
 
     fn is_live(&self) -> bool {
         (match &self.authority {
-            GitPermitAuthority::Host(capability) => capability.is_live(),
+            GitPermitAuthority::Host(capability) => {
+                capability.is_live() && self.host_seal_matches_capability(capability)
+            }
             #[cfg(test)]
             GitPermitAuthority::Test => true,
         }) && !self.deadline.is_expired()
+    }
+
+    fn host_seal_matches_capability(&self, capability: &GitAuthorityCapability) -> bool {
+        match &self.operation {
+            GitPermitOperation::Mutation {
+                host_seal: Some(seal),
+                ..
+            } => {
+                seal.is_available()
+                    && seal.action_epoch == capability.identity.action_epoch
+                    && seal.runtime_generation == capability.identity.runtime_generation
+            }
+            GitPermitOperation::Mutation {
+                host_seal: None, ..
+            } => false,
+            GitPermitOperation::ReadOnly | GitPermitOperation::ServiceMutation { .. } => true,
+        }
+    }
+
+    fn host_seal(&self) -> Option<&HostMutationSeal> {
+        match &self.operation {
+            GitPermitOperation::Mutation { host_seal, .. } => host_seal.as_ref(),
+            _ => None,
+        }
     }
 
     fn renewed_for_execution(&self) -> Result<Self, GitError> {
@@ -684,6 +817,7 @@ impl GitOperationPermit {
                     capability,
                     remote_policy,
                     remote_name,
+                    host_seal: _,
                     ..
                 },
                 GitExecutionPolicy::AuthorizedMutation {
@@ -728,6 +862,7 @@ impl GitOperationPermit {
                 plan_digest,
                 remote_policy,
                 remote_name,
+                host_seal: _,
             } if *capability == plan.capability()
                 && plan_digest == &plan.plan_digest()
                 && remote_policy_matches(remote_policy.as_ref(), plan.remote_policy())
@@ -736,12 +871,32 @@ impl GitOperationPermit {
     }
 }
 
+fn issue_confirmation_nonce(capability: &GitAuthorityCapability, plan_digest: &str) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"devmanager-git-host-confirmation-v1\0");
+    hasher.update(capability.identity.task_id.as_bytes());
+    hasher.update(capability.identity.workspace.id().as_bytes());
+    hasher.update(capability.identity.repository_static_identity.as_bytes());
+    hasher.update(capability.identity.controller_id.as_bytes());
+    hasher.update(capability.identity.connection_id.as_bytes());
+    hasher.update(capability.identity.request_id.as_bytes());
+    hasher.update(capability.identity.command_id.as_bytes());
+    hasher.update(capability.identity.action_epoch.to_le_bytes());
+    hasher.update(capability.identity.runtime_generation.to_le_bytes());
+    hasher.update(plan_digest.as_bytes());
+    hasher.update(Uuid::now_v7().as_bytes());
+    hasher.finalize().into()
+}
+
 pub struct GitConfirmation {
     permit: GitOperationPermit,
     capability: GitCapability,
     workspace: WorkspaceIdentity,
     plan_digest: String,
     remote_policy: Option<RemotePolicy>,
+    confirmation_nonce: Option<[u8; 32]>,
+    action_epoch: Option<u64>,
+    runtime_generation: Option<u64>,
 }
 
 impl fmt::Debug for GitConfirmation {
@@ -759,6 +914,47 @@ impl fmt::Debug for GitConfirmation {
 impl GitConfirmation {
     pub fn capability(&self) -> GitCapability {
         self.capability
+    }
+
+    fn host_seal_matches_permit(&self) -> bool {
+        match (self.permit.host_seal(), self.confirmation_nonce) {
+            (Some(seal), Some(nonce)) => {
+                seal.nonce == nonce
+                    && Some(seal.action_epoch) == self.action_epoch
+                    && Some(seal.runtime_generation) == self.runtime_generation
+            }
+            (None, None) => true,
+            _ => false,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tamper_plan_digest_for_test(&mut self) {
+        self.plan_digest.push_str("-tampered");
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tamper_confirmation_nonce_for_test(&mut self) {
+        match &mut self.confirmation_nonce {
+            Some(nonce) => nonce[0] ^= 0xff,
+            None => self.confirmation_nonce = Some([0xff; 32]),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tamper_host_fence_for_test(&mut self, action_epoch: u64, runtime_generation: u64) {
+        self.action_epoch = Some(action_epoch);
+        self.runtime_generation = Some(runtime_generation);
+        if let GitPermitOperation::Mutation {
+            host_seal: Some(seal),
+            ..
+        } = &mut self.permit.operation
+        {
+            seal.action_epoch = action_epoch;
+            seal.runtime_generation = runtime_generation;
+            // Keep the shared one-shot latch intact so replay tests and fence
+            // tamper tests exercise the same opaque seal object.
+        }
     }
 }
 
@@ -807,12 +1003,16 @@ impl GitCapabilityGate {
                 return Err(GitError::RemoteNotAuthorized);
             }
         }
+        let host_seal = permit.host_seal().cloned();
         Ok(GitConfirmation {
             permit,
             capability: plan.capability(),
             workspace: plan.workspace().clone(),
             plan_digest: plan.plan_digest(),
             remote_policy: plan.remote_policy().cloned(),
+            confirmation_nonce: host_seal.as_ref().map(|seal| seal.nonce),
+            action_epoch: host_seal.as_ref().map(|seal| seal.action_epoch),
+            runtime_generation: host_seal.as_ref().map(|seal| seal.runtime_generation),
         })
     }
 
@@ -6660,11 +6860,13 @@ impl GitRepository {
                 GitRepositoryAuthority::Host(binding),
             ) => {
                 if !Arc::ptr_eq(permit_capability, &binding.capability)
+                    || permit_capability.identity != binding.capability.identity
                     || permit_capability.identity.workspace != self.workspace
                     || permit_capability.repository_static_identity
                         != repository_static_graph_identity(&self.root)
                     || permit_capability.identity.repository_static_identity
                         != permit_capability.repository_static_identity
+                    || !permit.host_seal_matches_capability(permit_capability)
                 {
                     return Err(GitError::AuthorityUnavailable);
                 }
@@ -6899,11 +7101,28 @@ impl GitRepository {
         ))
     }
 
-    /// The legacy self-authorization entry point is retained only as a sealed
-    /// fail-closed shim while the host issuer is integrated.  It cannot mint a
-    /// permit from a repository path or plan alone.
+    /// The legacy self-authorization entry point stays sealed. It cannot mint a
+    /// permit from a repository path, plan, or caller-supplied capability gate.
     pub(crate) fn confirm<P: MutationPlan>(&self, _plan: &P) -> Result<GitConfirmation, GitError> {
         Err(GitError::AuthorityUnavailable)
+    }
+
+    /// Host-issued confirmation for Task Cockpit Stage/Unstage/Commit only.
+    /// Authorization comes from the live host binding fence, not the plan.
+    pub(crate) fn host_confirm<P: MutationPlan>(
+        &self,
+        plan: &P,
+    ) -> Result<GitConfirmation, GitError> {
+        if plan.workspace() != &self.workspace {
+            return Err(GitError::WorkspaceMismatch {
+                expected: self.workspace.id().to_string(),
+                actual: plan.workspace().id().to_string(),
+            });
+        }
+        let GitRepositoryAuthority::Host(binding) = &self.authority else {
+            return Err(GitError::AuthorityUnavailable);
+        };
+        binding.confirm_cockpit_plan(plan)
     }
 
     #[cfg(test)]
@@ -6930,6 +7149,27 @@ impl GitRepository {
             }
         };
         gate.confirm(plan, permit)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn expire_host_authority_for_test(&self) {
+        if let GitRepositoryAuthority::Host(binding) = &self.authority {
+            binding
+                .capability
+                .forced_expiry
+                .store(true, Ordering::Release);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn revoke_host_authority_for_test(&self) {
+        if let GitRepositoryAuthority::Host(binding) = &self.authority {
+            binding
+                .capability
+                .action_generation
+                .current
+                .store(0, Ordering::Release);
+        }
     }
 
     pub fn stage(&self, plan: &StagePlan, confirmation: &GitConfirmation) -> Result<(), GitError> {
@@ -7189,6 +7429,7 @@ impl GitRepository {
             || confirmation.workspace != self.workspace
             || confirmation.plan_digest != plan.plan_digest()
             || !remote_policy_matches(confirmation.remote_policy.as_ref(), plan.remote_policy())
+            || !confirmation.host_seal_matches_permit()
         {
             return Err(GitError::ConfirmationMismatch {
                 capability: plan.capability(),
@@ -7732,6 +7973,13 @@ impl GitRepository {
                 timeout: deadline.timeout,
             });
         }
+        // Host mutation confirmations are one-shot. Consume only after every
+        // plan/fingerprint/authority/graph/executable admission check and
+        // immediately before the authorized spawn path. Failed previews that
+        // never reach this boundary leave the confirmation reusable.
+        if let Some(seal) = permit.host_seal() {
+            seal.consume_once()?;
+        }
         let mut process = ManagedGitChild::spawn(
             command,
             executable,
@@ -8196,7 +8444,9 @@ impl GitRepository {
         let Some(binding) = self.authority_binding() else {
             return Ok(());
         };
-        if !binding.capability.is_live() {
+        if !binding.capability.is_live()
+            || binding.capability.identity.workspace != self.workspace
+        {
             return Err("host Git authority capability is unavailable".to_string());
         }
         let current_repository_identity = repository_graph_identity(&self.root);

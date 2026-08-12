@@ -1,5 +1,6 @@
 use crate::git::command::{
-    test_issue_git_host_binding, GitConfirmation, GitError, GitOperationPermit, GitRepository,
+    issue_git_host_binding, test_issue_git_host_binding, test_issue_git_host_binding_with_fence,
+    GitCancellation, GitConfirmation, GitError, GitOperationPermit, GitRepository,
 };
 use crate::git::model::{
     parse_porcelain_v2_z, parse_porcelain_v2_z_limited, BranchName, CommitId, DiffLineKind,
@@ -1264,4 +1265,456 @@ fn repository_graph_rejects_a_real_head_swap_until_the_original_is_restored() {
     repository
         .status()
         .expect("restored graph must be usable again");
+}
+
+fn issued_production_host_repository(
+    root: &Path,
+    action_epoch: u64,
+    runtime_generation: u64,
+) -> GitRepository {
+    issued_production_host_repository_with_ids(
+        root,
+        crate::domain::TaskId::new(),
+        crate::domain::ClientId::new(),
+        uuid::Uuid::now_v7(),
+        action_epoch,
+        runtime_generation,
+    )
+}
+
+fn issued_production_host_repository_with_ids(
+    root: &Path,
+    task_id: crate::domain::TaskId,
+    client_id: crate::domain::ClientId,
+    connection_id: uuid::Uuid,
+    action_epoch: u64,
+    runtime_generation: u64,
+) -> GitRepository {
+    use crate::workspace::{
+        WorkspaceProjectRoots, WorkspaceRequest, WorkspaceResource, WorkspaceResourceCoordinator,
+        WorkspaceService,
+    };
+
+    let project_id = crate::domain::ProjectId::new();
+    let roots = WorkspaceProjectRoots::try_from_pairs([(project_id, root.to_path_buf())])
+        .expect("project roots");
+    let mut service = WorkspaceService::with_task_coordinator(
+        project_id,
+        task_id,
+        &roots,
+        WorkspaceResourceCoordinator::new(),
+    )
+    .expect("workspace service");
+    let request_id = crate::domain::RequestId::new();
+    let command_id = crate::domain::CommandId::from_bytes(*request_id.as_bytes()).expect("command");
+    service
+        .bind_authorized_with_generation(
+            WorkspaceRequest::main(),
+            task_id,
+            client_id,
+            connection_id,
+            request_id,
+            command_id,
+            action_epoch,
+            runtime_generation,
+        )
+        .expect("bind workspace");
+    let workspace = service
+        .current()
+        .expect("bound workspace")
+        .durable_ref()
+        .clone();
+    let authorization = service
+        .authorize_current_with_generation(
+            &workspace,
+            task_id,
+            client_id,
+            connection_id,
+            request_id,
+            command_id,
+            action_epoch,
+            runtime_generation,
+        )
+        .expect("authorize workspace");
+    let lease = service
+        .acquire_task_resource(
+            task_id,
+            WorkspaceResource::Git,
+            client_id,
+            connection_id,
+            request_id,
+            command_id,
+            action_epoch,
+            runtime_generation,
+        )
+        .expect("git lease");
+    let binding = issue_git_host_binding(
+        &authorization,
+        lease,
+        task_id,
+        project_id,
+        client_id,
+        connection_id,
+        request_id,
+        command_id,
+        &workspace,
+        action_epoch,
+        runtime_generation,
+    )
+    .expect("issue production host binding");
+    GitRepository::from_host_binding(binding, GitCancellation::new()).expect("open host repository")
+}
+
+#[test]
+fn production_host_issuer_confirms_and_executes_stage_unstage_commit_when_fence_and_plan_match() {
+    let repo_dir = init_repo();
+    commit_initial(repo_dir.path(), "tracked.txt", "tracked\n");
+    fs::write(repo_dir.path().join("tracked.txt"), "changed\n").expect("change tracked file");
+    let repo = issued_production_host_repository(repo_dir.path(), 1, 1);
+
+    assert!(
+        repo.confirm(
+            &repo
+                .plan_stage(&[RepoPath::from("tracked.txt")])
+                .expect("stage plan")
+        )
+        .is_err(),
+        "legacy confirm must stay fail-closed on a host-bound repository"
+    );
+
+    let stage = repo
+        .plan_stage(&[RepoPath::from("tracked.txt")])
+        .expect("stage plan");
+    let confirmation = repo
+        .host_confirm(&stage)
+        .expect("production host issuer must confirm the exact stage plan");
+    repo.stage(&stage, &confirmation)
+        .expect("confirmed host stage must execute");
+    assert!(repo
+        .status()
+        .expect("status after stage")
+        .entry("tracked.txt")
+        .expect("tracked")
+        .is_staged());
+
+    let unstage = repo
+        .plan_unstage(&[RepoPath::from("tracked.txt")])
+        .expect("unstage plan");
+    let confirmation = repo
+        .host_confirm(&unstage)
+        .expect("production host issuer must confirm the exact unstage plan");
+    repo.unstage(&unstage, &confirmation)
+        .expect("confirmed host unstage must execute");
+    assert!(!repo
+        .status()
+        .expect("status after unstage")
+        .entry("tracked.txt")
+        .expect("tracked")
+        .is_staged());
+
+    let stage = repo
+        .plan_stage(&[RepoPath::from("tracked.txt")])
+        .expect("stage before commit");
+    repo.stage(
+        &stage,
+        &repo.host_confirm(&stage).expect("confirm restage"),
+    )
+    .expect("restage");
+    let commit = repo.plan_commit("host issuer commit").expect("commit plan");
+    let confirmation = repo
+        .host_confirm(&commit)
+        .expect("production host issuer must confirm the exact commit plan");
+    repo.commit(&commit, &confirmation)
+        .expect("confirmed host commit must execute");
+    assert!(repo
+        .status()
+        .expect("status after commit")
+        .entry("tracked.txt")
+        .is_none());
+}
+
+#[test]
+fn host_issuer_rejects_wrong_action_or_runtime_generation() {
+    let repo_dir = init_repo();
+    commit_initial(repo_dir.path(), "tracked.txt", "tracked\n");
+    fs::write(repo_dir.path().join("tracked.txt"), "changed\n").expect("change tracked file");
+    let current = issued_production_host_repository(repo_dir.path(), 1, 1);
+    let mismatched = issued_production_host_repository(repo_dir.path(), 2, 1);
+    let plan = current
+        .plan_stage(&[RepoPath::from("tracked.txt")])
+        .expect("stage plan");
+    let confirmation = current
+        .host_confirm(&plan)
+        .expect("confirm against the issued action epoch");
+
+    let error = mismatched
+        .stage(&plan, &confirmation)
+        .expect_err("a different action epoch must not inherit the confirmation");
+    assert!(
+        matches!(
+            error,
+            GitError::AuthorityUnavailable | GitError::ConfirmationMismatch { .. }
+        ),
+        "unexpected error for a mismatched action epoch: {error}"
+    );
+
+    let mut confirmation = current
+        .host_confirm(&plan)
+        .expect("fresh confirmation for fence tamper");
+    confirmation.tamper_host_fence_for_test(9, 1);
+    let error = current
+        .stage(&plan, &confirmation)
+        .expect_err("an altered action/runtime fence must fail closed");
+    assert!(matches!(error, GitError::AuthorityUnavailable));
+}
+
+#[test]
+fn host_issuer_rejects_wrong_task_workspace_or_connection() {
+    let first_dir = init_repo();
+    commit_initial(first_dir.path(), "tracked.txt", "tracked\n");
+    fs::write(first_dir.path().join("tracked.txt"), "changed\n").expect("change first");
+    let second_dir = init_repo();
+    commit_initial(second_dir.path(), "tracked.txt", "tracked\n");
+    fs::write(second_dir.path().join("tracked.txt"), "other\n").expect("change second");
+
+    let task_a = crate::domain::TaskId::new();
+    let task_b = crate::domain::TaskId::new();
+    let client = crate::domain::ClientId::new();
+    let connection_a = uuid::Uuid::now_v7();
+    let connection_b = uuid::Uuid::now_v7();
+    let first = issued_production_host_repository_with_ids(
+        first_dir.path(),
+        task_a,
+        client,
+        connection_a,
+        1,
+        1,
+    );
+    let foreign_task = issued_production_host_repository_with_ids(
+        first_dir.path(),
+        task_b,
+        client,
+        connection_a,
+        1,
+        1,
+    );
+    let foreign_connection = issued_production_host_repository_with_ids(
+        first_dir.path(),
+        task_a,
+        client,
+        connection_b,
+        1,
+        1,
+    );
+    let other_workspace = issued_production_host_repository(second_dir.path(), 1, 1);
+
+    let plan = first
+        .plan_stage(&[RepoPath::from("tracked.txt")])
+        .expect("stage plan");
+    let confirmation = first.host_confirm(&plan).expect("confirm first task");
+
+    assert!(
+        matches!(
+            foreign_task.stage(&plan, &confirmation),
+            Err(GitError::AuthorityUnavailable | GitError::ConfirmationMismatch { .. })
+        ),
+        "a different task must not reuse the host confirmation"
+    );
+    assert!(
+        matches!(
+            foreign_connection.stage(&plan, &confirmation),
+            Err(GitError::AuthorityUnavailable | GitError::ConfirmationMismatch { .. })
+        ),
+        "a different connection must not reuse the host confirmation"
+    );
+    assert!(
+        matches!(
+            other_workspace.host_confirm(&plan),
+            Err(GitError::WorkspaceMismatch { .. } | GitError::AuthorityUnavailable)
+        ),
+        "a plan bound to another workspace must not confirm"
+    );
+}
+
+#[test]
+fn host_confirmation_cannot_be_reused_after_execution_attempt() {
+    let repo_dir = init_repo();
+    commit_initial(repo_dir.path(), "tracked.txt", "tracked\n");
+    fs::write(repo_dir.path().join("tracked.txt"), "changed\n").expect("change tracked file");
+    let repo = issued_production_host_repository(repo_dir.path(), 1, 1);
+    let plan = repo
+        .plan_stage(&[RepoPath::from("tracked.txt")])
+        .expect("stage plan");
+    let confirmation = repo
+        .host_confirm(&plan)
+        .expect("host confirmation must remain unused until execution");
+
+    fs::write(repo_dir.path().join("tracked.txt"), "drift\n").expect("preview drift");
+    let preview = repo
+        .stage(&plan, &confirmation)
+        .expect_err("fingerprint drift must fail before spawn");
+    assert!(
+        matches!(preview, GitError::FingerprintMismatch { .. }),
+        "failed preview must stay typed as fingerprint mismatch: {preview}"
+    );
+
+    fs::write(repo_dir.path().join("tracked.txt"), "changed\n").expect("restore planned content");
+    repo.stage(&plan, &confirmation)
+        .expect("the same confirmation must still execute after a failed preview");
+
+    let replay = repo
+        .stage(&plan, &confirmation)
+        .expect_err("a host confirmation must be one-shot after an execution attempt");
+    assert!(
+        matches!(replay, GitError::AuthorityUnavailable),
+        "replay must fail closed as AuthorityUnavailable: {replay}"
+    );
+}
+
+#[test]
+fn host_issuer_rejects_altered_plan_digest_or_confirmation_nonce() {
+    let repo_dir = init_repo();
+    commit_initial(repo_dir.path(), "tracked.txt", "tracked\n");
+    fs::write(repo_dir.path().join("tracked.txt"), "changed\n").expect("change tracked file");
+    let repo = issued_production_host_repository(repo_dir.path(), 1, 1);
+    let plan = repo
+        .plan_stage(&[RepoPath::from("tracked.txt")])
+        .expect("stage plan");
+
+    let mut confirmation = repo.host_confirm(&plan).expect("host confirm");
+    confirmation.tamper_plan_digest_for_test();
+    assert!(
+        matches!(
+            repo.stage(&plan, &confirmation),
+            Err(GitError::ConfirmationMismatch { .. } | GitError::AuthorityUnavailable)
+        ),
+        "an altered plan digest must not execute"
+    );
+
+    let mut confirmation = repo.host_confirm(&plan).expect("fresh host confirm");
+    confirmation.tamper_confirmation_nonce_for_test();
+    assert!(
+        matches!(
+            repo.stage(&plan, &confirmation),
+            Err(GitError::ConfirmationMismatch { .. } | GitError::AuthorityUnavailable)
+        ),
+        "an altered confirmation nonce must not execute"
+    );
+}
+
+#[test]
+fn host_issuer_rejects_expired_or_revoked_authority() {
+    let repo_dir = init_repo();
+    commit_initial(repo_dir.path(), "tracked.txt", "tracked\n");
+    fs::write(repo_dir.path().join("tracked.txt"), "changed\n").expect("change tracked file");
+    let expired_binding = test_issue_git_host_binding_with_fence(
+        repo_dir.path(),
+        Vec::new(),
+        "test-task-6-6a",
+        "test-controller",
+        "test-connection",
+        "test-request",
+        "test-command",
+        1,
+        1,
+        std::time::Duration::ZERO,
+    )
+    .expect("issue immediately expired host binding");
+    assert!(
+        GitRepository::from_host_binding(expired_binding, GitCancellation::new()).is_err(),
+        "an expired host binding must not open"
+    );
+
+    let repo = issued_production_host_repository(repo_dir.path(), 1, 1);
+    let plan = repo
+        .plan_stage(&[RepoPath::from("tracked.txt")])
+        .expect("stage plan");
+    let confirmation = repo.host_confirm(&plan).expect("confirm while live");
+    repo.expire_host_authority_for_test();
+    assert!(
+        matches!(repo.host_confirm(&plan), Err(GitError::AuthorityUnavailable)),
+        "expired host authority must not confirm"
+    );
+    assert!(
+        matches!(
+            repo.stage(&plan, &confirmation),
+            Err(GitError::AuthorityUnavailable)
+        ),
+        "expired host authority must not execute a prior confirmation"
+    );
+
+    let live = issued_production_host_repository(repo_dir.path(), 1, 1);
+    let plan = live
+        .plan_stage(&[RepoPath::from("tracked.txt")])
+        .expect("stage plan");
+    let confirmation = live.host_confirm(&plan).expect("confirm before revoke");
+    live.revoke_host_authority_for_test();
+    assert!(
+        matches!(live.host_confirm(&plan), Err(GitError::AuthorityUnavailable)),
+        "revoked host authority must not confirm"
+    );
+    assert!(
+        matches!(
+            live.stage(&plan, &confirmation),
+            Err(GitError::AuthorityUnavailable)
+        ),
+        "revoked host authority must not execute a prior confirmation"
+    );
+}
+
+#[test]
+fn host_issuer_rejects_traversal_raw_path_and_unsupported_capability() {
+    let repo_dir = init_repo();
+    commit_initial(repo_dir.path(), "tracked.txt", "tracked\n");
+    fs::write(repo_dir.path().join("tracked.txt"), "changed\n").expect("change tracked file");
+    let repo = issued_production_host_repository(repo_dir.path(), 1, 1);
+
+    assert!(
+        matches!(
+            repo.plan_stage(&[RepoPath::from("../secret")]),
+            Err(GitError::InvalidPath { .. })
+        ),
+        "relative traversal must stay rejected before host confirmation"
+    );
+    assert!(
+        matches!(
+            repo.plan_stage(&[RepoPath::from("C:\\Windows\\system32\\drivers\\etc\\hosts")]),
+            Err(GitError::InvalidPath { .. })
+        ),
+        "a raw absolute path must not become a mutation plan"
+    );
+
+    let test_repo = GitRepository::test_open(repo_dir.path()).expect("open test repository");
+    let plan = test_repo
+        .plan_stage(&[RepoPath::from("tracked.txt")])
+        .expect("test stage plan");
+    assert!(
+        matches!(
+            test_repo.host_confirm(&plan),
+            Err(GitError::AuthorityUnavailable)
+        ),
+        "a test fixture must not mint production host confirmation"
+    );
+    assert!(
+        test_repo.confirm(&plan).is_err(),
+        "legacy confirm must not self-authorize from a repository path"
+    );
+
+    let pull_request = repo
+        .plan_pull_request(
+            PullRequestProvider::GitHub,
+            "https://github.com/acme/widget.git",
+            Some("feature/demo"),
+            "main",
+            "Ship the change",
+            "Body stays in the typed invocation.",
+        )
+        .expect("pull request plan");
+    assert!(
+        matches!(
+            repo.host_confirm(&pull_request),
+            Err(GitError::CapabilityDenied { .. })
+        ),
+        "host issuer must not confirm unsupported Git capabilities"
+    );
 }

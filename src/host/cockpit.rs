@@ -420,14 +420,7 @@ fn confirm_git_mutation<P: MutationPlan>(
     repository: &GitRepository,
     plan: &P,
 ) -> Result<GitConfirmation, GitError> {
-    #[cfg(test)]
-    {
-        repository.test_confirm(plan)
-    }
-    #[cfg(not(test))]
-    {
-        repository.confirm(plan)
-    }
+    repository.host_confirm(plan)
 }
 
 fn map_git_error(error: GitError) -> QueryOutcome {
@@ -1112,6 +1105,17 @@ mod tests {
             .output()
             .expect("git init");
         assert!(output.status.success());
+        for (key, value) in [
+            ("user.name", "Cockpit Test"),
+            ("user.email", "cockpit@example.invalid"),
+        ] {
+            let configured = std::process::Command::new("git")
+                .args(["config", key, value])
+                .current_dir(repository.path())
+                .output()
+                .expect("git config");
+            assert!(configured.status.success());
+        }
         fs::write(repository.path().join("README.md"), "hello-aé\n").expect("readme");
         fs::write(repository.path().join("blob.bin"), [0u8, 1, 2, 255]).expect("binary");
         fs::write(repository.path().join(".env"), "SECRET=1\n").expect("env");
@@ -1556,6 +1560,88 @@ mod tests {
             panic!("expected confirmed stage, got {staged:?}");
         };
         assert_eq!(staged.task_id, task_id);
+    }
+
+    #[test]
+    fn git_mutate_host_issuer_unstages_and_commits_only_through_confirmed_plans() {
+        let (_repository, bus, client_id, task_id, roots) = create_bound_task();
+        let coordinator = WorkspaceResourceCoordinator::new();
+        let staged = serve_task_cockpit(dispatch(
+            &bus,
+            client_id,
+            task_id,
+            &TaskCockpitQuery::GitMutate {
+                intent: TaskGitMutateIntent::Stage {
+                    relative_paths: vec!["README.md".into()],
+                },
+                confirm: true,
+            },
+            Some(&roots),
+            Some(&coordinator),
+            Some(1),
+            Some(1),
+        ));
+        let QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Git(_))) = staged else {
+            panic!("expected host-confirmed stage, got {staged:?}");
+        };
+        let unstaged = serve_task_cockpit(dispatch(
+            &bus,
+            client_id,
+            task_id,
+            &TaskCockpitQuery::GitMutate {
+                intent: TaskGitMutateIntent::Unstage {
+                    relative_paths: vec!["README.md".into()],
+                },
+                confirm: true,
+            },
+            Some(&roots),
+            Some(&coordinator),
+            Some(1),
+            Some(1),
+        ));
+        let QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Git(_))) = unstaged else {
+            panic!("expected host-confirmed unstage, got {unstaged:?}");
+        };
+        let restaged = serve_task_cockpit(dispatch(
+            &bus,
+            client_id,
+            task_id,
+            &TaskCockpitQuery::GitMutate {
+                intent: TaskGitMutateIntent::Stage {
+                    relative_paths: vec!["README.md".into()],
+                },
+                confirm: true,
+            },
+            Some(&roots),
+            Some(&coordinator),
+            Some(1),
+            Some(1),
+        ));
+        let QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Git(_))) = restaged else {
+            panic!("expected host-confirmed restage, got {restaged:?}");
+        };
+        let committed = serve_task_cockpit(dispatch(
+            &bus,
+            client_id,
+            task_id,
+            &TaskCockpitQuery::GitMutate {
+                intent: TaskGitMutateIntent::Commit {
+                    message: "cockpit host issuer".into(),
+                },
+                confirm: true,
+            },
+            Some(&roots),
+            Some(&coordinator),
+            Some(1),
+            Some(1),
+        ));
+        let QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Git(committed))) =
+            committed
+        else {
+            panic!("expected host-confirmed commit, got {committed:?}");
+        };
+        assert_eq!(committed.task_id, task_id);
+        assert_eq!(committed.change_count, 0);
     }
 
     #[test]
