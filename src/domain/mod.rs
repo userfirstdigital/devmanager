@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod artifact;
 pub(crate) mod canonical;
+pub mod codec;
 pub mod command;
 pub mod event;
 pub mod host;
@@ -16,6 +17,12 @@ pub use agent::{AgentRole, AgentSessionFacts, AgentSessionLifecycle, AgentValida
 pub use artifact::{
     ArtifactContentRef, ArtifactFacts, ArtifactKind, ArtifactSummary, ArtifactValidationError,
     PrivacyClass,
+};
+pub use codec::{
+    decode_orchestration_msgpack, encode_orchestration_msgpack, preflight_msgpack,
+    MsgPackPreflightError, OrchestrationCodecError, MAX_ORCHESTRATION_MSGPACK_BYTES,
+    MAX_ORCHESTRATION_MSGPACK_COLLECTION_ITEMS, MAX_ORCHESTRATION_MSGPACK_DEPTH,
+    MAX_ORCHESTRATION_MSGPACK_NODES, MAX_ORCHESTRATION_MSGPACK_STRING_BYTES,
 };
 pub use command::{
     command_payload_digest, decide, Command, CommandEnvelope, CommandReceipt,

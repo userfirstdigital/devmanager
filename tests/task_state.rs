@@ -2180,30 +2180,16 @@ fn forged_resource_and_agent_registration_are_rejected() {
         runtime_generation: 0,
         revision: 0,
     };
-    let with_agent = apply_decided(
-        Some(snap),
-        &envelope(
-            command_id(0x02),
-            Some(task),
-            Some(1),
-            Command::RegisterAgentSession {
-                agent: specialist.clone(),
-            },
-        ),
-        2,
-        0x03,
-        3,
-    )
-    .expect("register specialist");
+    let with_agent = snap;
     assert!(matches!(
         decide(
             Some(&with_agent),
             &envelope(
-                command_id(0x04),
+                command_id(0x02),
                 Some(task),
-                Some(2),
-                Command::SetPrimaryAgent {
-                    agent_session_id: specialist.id,
+                Some(1),
+                Command::RegisterAgentSession {
+                    agent: specialist.clone(),
                 },
             ),
         ),
@@ -2226,7 +2212,7 @@ fn forged_resource_and_agent_registration_are_rejected() {
             &envelope(
                 command_id(0x06),
                 Some(task),
-                Some(2),
+                Some(1),
                 Command::RegisterAgentSession {
                     agent: closed_agent.clone(),
                 },
@@ -2240,8 +2226,8 @@ fn forged_resource_and_agent_registration_are_rejected() {
             &domain_event(
                 event_id(0x07),
                 Some(task),
-                3,
-                Some(3),
+                2,
+                Some(2),
                 4,
                 Event::AgentSessionRegistered {
                     agent: closed_agent,

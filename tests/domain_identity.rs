@@ -538,7 +538,10 @@ fn agent_artifact_resource_reject_invalid_labels_and_providers() {
     assert_eq!(
         specialist,
         AgentRole::Specialist {
-            name: "reviewer".into()
+            name: "reviewer".into(),
+            requested_by: None,
+            purpose: None,
+            request_operation_id: None,
         }
     );
     assert!(serde_json::from_value::<AgentRole>(serde_json::json!({
@@ -547,6 +550,9 @@ fn agent_artifact_resource_reject_invalid_labels_and_providers() {
     .is_err());
     let padded_specialist = AgentRole::Specialist {
         name: "  reviewer  ".into(),
+        requested_by: None,
+        purpose: None,
+        request_operation_id: None,
     };
     assert!(padded_specialist.validate().is_err());
 

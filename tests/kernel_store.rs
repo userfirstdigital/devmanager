@@ -565,8 +565,8 @@ fn schema_primary_agent_selection_requires_same_task_primary_role() {
     let mut store = KernelStore::open(&path).expect("reopen");
     let err = store.rebuild_projections().expect_err("specialist primary");
     assert!(
-        matches!(err, StoreError::Projection(_)),
-        "expected projection failure for non-primary role, got {err:?}"
+        matches!(err, StoreError::Projection(_) | StoreError::EventDecode(_)),
+        "expected fail-closed projection/decode error for non-primary role, got {err:?}"
     );
 }
 
