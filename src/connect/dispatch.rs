@@ -813,6 +813,9 @@ fn deny_if_capability_missing(
             crate::domain::command::Command::ServiceControl(_) => {
                 Some(Capability::ServiceSupervisor)
             }
+            crate::domain::command::Command::StartProviderSession(_) => {
+                Some(Capability::ProviderInput)
+            }
             crate::domain::command::Command::Browser(_) => Some(Capability::BrowserProjection),
             _ => None,
         },

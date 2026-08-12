@@ -2128,7 +2128,11 @@ impl HostRequestExecutor {
                     let Some(job) = job else {
                         break;
                     };
-                    let result = self.dispatch_job(job.negotiated, job.request, job.output_id, job.routing);
+                    let result = if is_provider_start_request(&job.request) {
+                        self.dispatch_provider_start(job.negotiated, job.request, job.output_id).await
+                    } else {
+                        self.dispatch_job(job.negotiated, job.request, job.output_id, job.routing)
+                    };
                     // If the connection task went away, drop the reply; do not panic.
                     let _ = job.reply.send(result);
                 }
@@ -2175,7 +2179,11 @@ impl HostRequestExecutor {
                             "supervised executor request queue closed unexpectedly".into(),
                         ));
                     };
-                    let result = self.dispatch_job(job.negotiated, job.request, job.output_id, job.routing);
+                    let result = if is_provider_start_request(&job.request) {
+                        self.dispatch_provider_start(job.negotiated, job.request, job.output_id).await
+                    } else {
+                        self.dispatch_job(job.negotiated, job.request, job.output_id, job.routing)
+                    };
                     let _ = job.reply.send(result);
                 }
                 control = self.control_rx.recv(), if !self.control_closed => {
@@ -2833,6 +2841,91 @@ impl HostRequestExecutor {
         self.pending_quit_receipt_acks
             .insert(output_id, PendingQuitReceiptAck { operation_id, ack });
         Ok(DuplexExecuteCompletion::ExecutorAdmittedQuitReceipt { operation_id })
+    }
+
+    /// Authenticated stock-provider effect. The durable bus supplies the
+    /// exact task/resource join; the live registry supplies the attested
+    /// executable/capability observation immediately before launch.
+    async fn dispatch_provider_start(
+        &mut self,
+        negotiated: NegotiatedParameters,
+        request: ClientRequest,
+        _output_id: Option<ConnectionOutputId>,
+    ) -> Result<DuplexExecuteCompletion, IpcError> {
+        let ClientRequest::Command(envelope) = request else {
+            return Err(IpcError::Unavailable);
+        };
+        if envelope.client_id != negotiated.client_id {
+            return Err(IpcError::Unauthorized);
+        }
+        validate_authenticated_command_capability(negotiated.capabilities, &envelope.command)?;
+        let Command::StartProviderSession(intent) = envelope.command else {
+            return Err(IpcError::Unavailable);
+        };
+        if envelope.task_id != Some(intent.task_id)
+            || envelope.expected_task_revision != Some(intent.expected_task_revision)
+        {
+            return Err(IpcError::Security("provider start envelope fence mismatch".into()));
+        }
+        let runtime = self
+            .configured_service_runtime
+            .as_mut()
+            .ok_or(IpcError::Unavailable)?;
+        let (binding, agent, snapshot) = self
+            .bus
+            .prepare_provider_start(&intent)
+            .map_err(map_store_error)?;
+        let loaded = self
+            .bus
+            .load_task_runtime(intent.task_id, &self.workspace_projects)
+            .map_err(|_| IpcError::Unavailable)?
+            .ok_or(IpcError::Unavailable)?;
+        let cwd = loaded
+            .workspace
+            .runtime_working_directory()
+            .map_err(|_| IpcError::Unavailable)?;
+        let observation = runtime
+            .manager
+            .provider_host()
+            .registry()
+            .observe(
+                intent.provider_kind,
+                &crate::providers::registry::ProviderDiscoveryConfig::default(),
+            )
+            .await
+            .map_err(|_| IpcError::Unavailable)?;
+        let mode = match intent.mode {
+            crate::domain::command::ProviderStartMode::Open => {
+                crate::providers::session::ProviderSessionStartMode::Open
+            }
+            crate::domain::command::ProviderStartMode::NewConversation => {
+                crate::providers::session::ProviderSessionStartMode::NewConversation
+            }
+            crate::domain::command::ProviderStartMode::ResumeExact => {
+                crate::providers::session::ProviderSessionStartMode::ResumeExact
+            }
+        };
+        runtime
+            .manager
+            .start_production_stock_provider_session(
+                binding,
+                agent,
+                &observation,
+                None,
+                cwd,
+                BTreeMap::new(),
+                mode,
+            )
+            .map_err(|_| IpcError::Unavailable)?;
+        Ok(DuplexExecuteCompletion::CallerMustWrite(
+            ServerMessage::CommandReceipt(CommandReceipt::Accepted {
+                command_id: envelope.command_id,
+                operation_id: OperationId::new(),
+                task_revision: Some(snapshot.task.revision),
+                event_ids: Vec::new(),
+                prompt_mutation: None,
+            }),
+        ))
     }
 
     fn dispatch(
@@ -3764,6 +3857,17 @@ fn command_starts_new_launch(command: &Command) -> bool {
             | Command::RegisterArtifact { .. }
             | Command::RegisterResource { .. }
             | Command::SetPrimaryAgent { .. }
+            | Command::StartProviderSession(_)
+    )
+}
+
+fn is_provider_start_request(request: &ClientRequest) -> bool {
+    matches!(
+        request,
+        ClientRequest::Command(envelope) if matches!(
+            &envelope.command,
+            Command::StartProviderSession(_)
+        )
     )
 }
 
@@ -4363,6 +4467,9 @@ fn validate_authenticated_command_capability(
             Err(IpcError::UnsupportedCapability)
         }
         Command::ServiceControl(_) if !capabilities.contains(Capability::ServiceSupervisor) => {
+            Err(IpcError::UnsupportedCapability)
+        }
+        Command::StartProviderSession(_) if !capabilities.contains(Capability::ProviderInput) => {
             Err(IpcError::UnsupportedCapability)
         }
         _ => Ok(()),

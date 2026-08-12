@@ -87,6 +87,7 @@ pub fn action_for_client_request(request: &ClientRequest) -> Option<(ActionId, O
                 | Command::CancelSpecialist(_)
                 | Command::AcceptSpecialistHandoff(_)
                 | Command::ServiceControl(_)
+                | Command::StartProviderSession(_)
                 | Command::PrepareUpdate(_)
                 | Command::ConfirmUpdateDrain(_)
                 | Command::AbortUpdateHandoff

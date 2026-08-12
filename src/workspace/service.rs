@@ -2332,6 +2332,12 @@ fn configured_root_identity_matches(path: &Path, expected_identity: &str) -> boo
 }
 
 impl WorkspaceService {
+    /// Return the admitted project root for a host-owned runtime launch.
+    /// Revalidates the pinned filesystem identity before exposing the path.
+    pub(crate) fn runtime_working_directory(&self) -> Result<PathBuf, WorkspaceError> {
+        self.canonical_configured_project_root()
+    }
+
     /// Re-open the configured project root and require the exact filesystem
     /// identity retained at ConfigStore/root admission. A replacement directory
     /// at the same path must fail closed.

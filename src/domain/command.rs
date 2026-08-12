@@ -30,6 +30,7 @@ use crate::domain::task::{
     TaskLifecycle, WorkspaceRef,
 };
 use crate::prompts::{PromptChainCommand, PromptCommand, PromptMutationReceipt};
+use crate::providers::ProviderKind;
 use crate::workspace::WorkspaceRequest;
 use uuid::Uuid;
 
@@ -1238,6 +1239,9 @@ pub enum Command {
     /// task journal; the authenticated host dispatches it to its one owned
     /// ProcessManager supervisor.
     ServiceControl(ServiceControlIntent),
+    /// Host-only stock-provider launch. The host must resolve the durable
+    /// task/resource binding before it performs the live process effect.
+    StartProviderSession(StartProviderSessionIntent),
     Browser(BrowserRequest),
     /// Host-boundary update handoff: inspect+prepare with expiring token.
     PrepareUpdate(PrepareUpdateIntent),
@@ -1274,6 +1278,27 @@ pub struct ServiceControlIntent {
     pub connection_epoch: u64,
     pub action_epoch: u64,
     pub action: ServiceControlAction,
+}
+
+/// Exact identity and admission fences for one stock provider launch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderStartMode {
+    Open,
+    NewConversation,
+    ResumeExact,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct StartProviderSessionIntent {
+    pub task_id: TaskId,
+    pub agent_session_id: AgentSessionId,
+    pub resource_id: ResourceId,
+    pub provider_kind: ProviderKind,
+    pub mode: ProviderStartMode,
+    pub expected_task_revision: u64,
+    pub expected_action_epoch: u64,
 }
 
 /// Canonical SHA-256 over client, task, expected revision, and command.
@@ -1488,7 +1513,9 @@ pub fn decide(
         Command::PromptLibrary(_) | Command::PromptChain(_) => {
             Err(RejectionCode::InvalidTransition)
         }
-        Command::ServiceControl(_) => Err(RejectionCode::InvalidTransition),
+        Command::ServiceControl(_) | Command::StartProviderSession(_) => {
+            Err(RejectionCode::InvalidTransition)
+        }
         Command::Browser(request) => decide_browser(snapshot, envelope, request),
         Command::PrepareUpdate(_)
         | Command::ConfirmUpdateDrain(_)

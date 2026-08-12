@@ -8510,7 +8510,10 @@ impl NativeShell {
                                 },
                             ))
                             .child(div().w_full().child(self.prompt_library_surface(tokens)))
-                            .child(self.task_conversation_surface(tokens, cx))
+                            .child(
+                                self.cockpit
+                                    .conversation_surface(tokens, self.composer.as_ref()),
+                            )
                             .child(div().id("native-shell-context-dock").w_full().child(
                                 self.context_dock_surface(tokens, Some(services_shell_entity)),
                             ))

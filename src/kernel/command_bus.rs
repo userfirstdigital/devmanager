@@ -21,6 +21,7 @@ use crate::domain::agent_resource::AgentResourceBinding;
 use crate::domain::artifact::{ArtifactFacts, ArtifactKind, PrivacyClass};
 use crate::domain::command::{
     decide, Command, CommandEnvelope, CommandReceipt, ConfirmHostQuitIntent, RejectionCode,
+    StartProviderSessionIntent,
 };
 use crate::domain::event::{
     apply as apply_domain_event, DomainEvent, Event, OperationAcceptedFact, OperationCancelledFact,
@@ -216,7 +217,10 @@ impl CommandBus {
         }
         if matches!(
             &envelope.command,
-            Command::CreateTask(_) | Command::CreateTaskV2(_) | Command::ServiceControl(_)
+            Command::CreateTask(_)
+                | Command::CreateTaskV2(_)
+                | Command::ServiceControl(_)
+                | Command::StartProviderSession(_)
         ) {
             return Err(StoreError::HostAuthorityRequired);
         }
@@ -282,7 +286,10 @@ impl CommandBus {
                 execute_prompt_library_in_tx(tx, Some(&grant), envelope)
             });
         }
-        if matches!(envelope.command, Command::ServiceControl(_)) {
+        if matches!(
+            envelope.command,
+            Command::ServiceControl(_) | Command::StartProviderSession(_)
+        ) {
             return Err(StoreError::HostAuthorityRequired);
         }
         match authorization {
@@ -334,6 +341,49 @@ impl CommandBus {
         requested: AgentResourceBinding,
     ) -> Result<AgentResourceBinding, StoreError> {
         self.store.claim_agent_resource(requested)
+    }
+
+    /// Resolve and claim the exact durable identity for a provider launch.
+    ///
+    /// This is deliberately a host effect port: the caller supplies only the
+    /// explicit task/agent/resource fence, while the store supplies the
+    /// current facts and performs the authoritative join. No PTY, cwd,
+    /// timestamp, or transcript may participate in this lookup.
+    pub fn prepare_provider_start(
+        &self,
+        intent: &StartProviderSessionIntent,
+    ) -> Result<(AgentResourceBinding, AgentSessionFacts, TaskSnapshot), StoreError> {
+        let snapshot = self
+            .task_snapshot(intent.task_id)?
+            .ok_or_else(|| StoreError::Projection("provider task not found".into()))?;
+        if snapshot.task.revision != intent.expected_task_revision
+            || snapshot.task.action_epoch != intent.expected_action_epoch
+        {
+            return Err(StoreError::StaleFence);
+        }
+        let agent = snapshot
+            .agents
+            .get(&intent.agent_session_id)
+            .cloned()
+            .ok_or_else(|| StoreError::Projection("provider agent not found".into()))?;
+        if agent.provider_kind != intent.provider_kind {
+            return Err(StoreError::Projection("provider kind fence mismatch".into()));
+        }
+        let resource = snapshot
+            .resources
+            .get(&intent.resource_id)
+            .ok_or_else(|| StoreError::Projection("provider resource not found".into()))?;
+        let binding = AgentResourceBinding::from_facts(&agent, resource)
+            .map_err(|error| StoreError::Projection(error.to_string()))?;
+        if binding.task_id != intent.task_id
+            || binding.agent_session_id != intent.agent_session_id
+            || binding.resource_id != intent.resource_id
+            || binding.provider_kind != intent.provider_kind
+        {
+            return Err(StoreError::Projection("provider resource fence mismatch".into()));
+        }
+        let claimed = self.claim_agent_resource(binding)?;
+        Ok((claimed, agent, snapshot))
     }
 
     /// Load the durable task and reconstruct its host-owned workspace before
@@ -957,7 +1007,10 @@ pub(crate) fn execute(
 ) -> Result<CommandReceipt, StoreError> {
     if matches!(
         &envelope.command,
-        Command::CreateTask(_) | Command::CreateTaskV2(_) | Command::ServiceControl(_)
+        Command::CreateTask(_)
+            | Command::CreateTaskV2(_)
+            | Command::ServiceControl(_)
+            | Command::StartProviderSession(_)
     ) {
         return Err(StoreError::HostAuthorityRequired);
     }
