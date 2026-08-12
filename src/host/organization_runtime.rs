@@ -6,16 +6,18 @@
 //! caller-driven and only runs when the persisted opt-in, enrollment, and a
 //! transport-backed runtime are all present.
 
+use std::collections::VecDeque;
 use std::fmt;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use serde::{Deserialize, Serialize};
 
 use crate::config::PortalConfig;
 use crate::connect::ConnectHostId;
+use crate::domain::id::OperationId;
 use crate::org::{
-    LocalActionAdmissionState, LocalActionId, OrgError, OrgPromptVersionId,
+    LocalActionAdmissionState, LocalActionId, MembershipRole, OrgError, OrgPromptVersionId,
     OrganizationCapabilityDisableReason, OrganizationCapabilityState, OrganizationProjection,
     OrganizationStateStore, OrganizationSyncState, PortalReconcileKind, PortalReconcileRequest,
     PortalSyncError, PortalSyncRuntime, PortalTransport,
@@ -23,6 +25,7 @@ use crate::org::{
 
 pub const ORGANIZATION_RUNTIME_DEFAULT_REFRESH_INTERVAL_MS: u64 = 60_000;
 pub const ORGANIZATION_RUNTIME_MAX_REFRESH_INTERVAL_MS: u64 = 15 * 60_000;
+const ORGANIZATION_CONNECT_OPERATION_CACHE_CAPACITY: usize = 64;
 
 /// Runtime-only options. The `PortalConfig` contains only a vault reference;
 /// a bearer token is resolved by the credential provider outside persistence.
@@ -84,6 +87,25 @@ pub enum OrganizationIpcCommand {
         version_id: OrgPromptVersionId,
         now_ms: i64,
     },
+}
+
+/// Request envelope carried by the authenticated Connect organization
+/// extension. The transport envelope supplies request/operation identity; the
+/// payload contains only one of the existing bounded host DTOs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum OrganizationConnectRequest {
+    Query(OrganizationIpcQuery),
+    Command(OrganizationIpcCommand),
+}
+
+/// Response envelope for an organization extension. Errors stay on the
+/// typed Connect error lane so this payload only represents successful host
+/// replies.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum OrganizationConnectResponse {
+    Reply(OrganizationIpcReply),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -151,6 +173,7 @@ pub struct OrganizationRefreshReply {
 pub enum OrganizationRuntimeError {
     Closed,
     InvalidRequest,
+    Unauthorized,
     Org(OrgError),
     Sync(PortalSyncError),
 }
@@ -160,6 +183,7 @@ impl fmt::Display for OrganizationRuntimeError {
         match self {
             Self::Closed => formatter.write_str("organization runtime is shut down"),
             Self::InvalidRequest => formatter.write_str("invalid organization request"),
+            Self::Unauthorized => formatter.write_str("organization request is not authorized"),
             Self::Org(error) => error.fmt(formatter),
             Self::Sync(error) => write!(formatter, "organization sync failed: {error:?}"),
         }
@@ -210,6 +234,7 @@ struct OrganizationRuntimeState {
     projection: OrganizationProjection,
     config: OrganizationRuntimeConfig,
     sync: Option<Box<dyn SyncDriver>>,
+    connect_operations: VecDeque<(OperationId, OrganizationIpcReply)>,
     last_refresh_ms: Option<i64>,
     last_error: Option<String>,
     closed: bool,
@@ -220,6 +245,11 @@ struct OrganizationRuntimeState {
 #[derive(Clone)]
 pub struct OrganizationRuntime {
     state: Arc<Mutex<OrganizationRuntimeState>>,
+}
+
+fn connect_runtime_slot() -> &'static RwLock<Option<OrganizationRuntimeHandle>> {
+    static SLOT: OnceLock<RwLock<Option<OrganizationRuntimeHandle>>> = OnceLock::new();
+    SLOT.get_or_init(|| RwLock::new(None))
 }
 
 impl fmt::Debug for OrganizationRuntime {
@@ -236,17 +266,28 @@ impl OrganizationRuntime {
         let restored = OrganizationStateStore::restore_hello(profile_root.as_ref());
         let diagnostic = restored.diagnostic().map(str::to_owned);
         let projection = restored.into_projection();
-        Self {
+        let runtime = Self {
             state: Arc::new(Mutex::new(OrganizationRuntimeState {
                 store: OrganizationStateStore::open(profile_root),
                 projection,
                 config: config.bounded(),
                 sync: None,
+                connect_operations: VecDeque::with_capacity(
+                    ORGANIZATION_CONNECT_OPERATION_CACHE_CAPACITY,
+                ),
                 last_refresh_ms: None,
                 last_error: diagnostic,
                 closed: false,
             })),
+        };
+        // The production web listener is started after the host opens this
+        // actor. Binding the actor here keeps Connect on the same host-owned
+        // projection and avoids a second store or command bus.
+        let handle = runtime.handle();
+        if let Ok(mut slot) = connect_runtime_slot().write() {
+            *slot = Some(handle);
         }
+        runtime
     }
 
     pub fn from_app_config(profile_root: impl AsRef<Path>, portal: PortalConfig) -> Self {
@@ -301,6 +342,21 @@ impl OrganizationRuntime {
             state.sync = None;
             state.closed = true;
         }
+        let handle = self.handle();
+        if let Ok(mut slot) = connect_runtime_slot().write() {
+            if slot
+                .as_ref()
+                .is_some_and(|bound| Arc::ptr_eq(&bound.state, &handle.state))
+            {
+                *slot = None;
+            }
+        }
+    }
+
+    /// Current host-owned actor for the authenticated in-process Connect
+    /// route. The returned handle does not create another projection owner.
+    pub fn bound_connect_runtime() -> Option<OrganizationRuntimeHandle> {
+        connect_runtime_slot().read().ok()?.clone()
     }
 }
 
@@ -335,6 +391,13 @@ impl OrganizationRuntimeHandle {
             .lock()
             .map_err(|_| OrganizationRuntimeError::Closed)?;
         ensure_open(&state)?;
+        query_locked(&state, query)
+    }
+
+    fn query_locked(
+        state: &OrganizationRuntimeState,
+        query: OrganizationIpcQuery,
+    ) -> Result<OrganizationIpcReply, OrganizationRuntimeError> {
         match query {
             OrganizationIpcQuery::Snapshot => {
                 Ok(OrganizationIpcReply::Snapshot(snapshot_for(&state)))
@@ -384,6 +447,13 @@ impl OrganizationRuntimeHandle {
             .lock()
             .map_err(|_| OrganizationRuntimeError::Closed)?;
         ensure_open(&state)?;
+        command_locked(&mut state, command)
+    }
+
+    fn command_locked(
+        state: &mut OrganizationRuntimeState,
+        command: OrganizationIpcCommand,
+    ) -> Result<OrganizationIpcReply, OrganizationRuntimeError> {
         match command {
             OrganizationIpcCommand::Refresh {
                 host_id,
@@ -472,6 +542,74 @@ impl OrganizationRuntimeHandle {
         }
     }
 
+    /// Dispatch one authenticated Connect organization request on this same
+    /// host actor. Connect has already authenticated the paired device and
+    /// verified the live session; this method applies the persisted
+    /// organization membership/policy gate and never trusts tenant identity
+    /// supplied by the remote payload.
+    pub fn dispatch_authenticated_connect(
+        &self,
+        operation_id: Option<OperationId>,
+        request: OrganizationConnectRequest,
+    ) -> Result<OrganizationIpcReply, OrganizationRuntimeError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| OrganizationRuntimeError::Closed)?;
+        ensure_open(&state)?;
+        authorize_connect_request(&state, &request)?;
+        if matches!(request, OrganizationConnectRequest::Command(_)) && operation_id.is_none() {
+            return Err(OrganizationRuntimeError::InvalidRequest);
+        }
+        if let Some(operation_id) = operation_id {
+            if let Some((_, reply)) = state
+                .connect_operations
+                .iter()
+                .find(|(cached_id, _)| *cached_id == operation_id)
+            {
+                return Ok(reply.clone());
+            }
+        }
+        let reply = match request {
+            OrganizationConnectRequest::Query(query) => query_locked(&state, query)?,
+            OrganizationConnectRequest::Command(command) => command_locked(&mut state, command)?,
+        };
+        if let Some(operation_id) = operation_id {
+            if state.connect_operations.len() >= ORGANIZATION_CONNECT_OPERATION_CACHE_CAPACITY {
+                state.connect_operations.pop_front();
+            }
+            state
+                .connect_operations
+                .push_back((operation_id, reply.clone()));
+        }
+        Ok(reply)
+    }
+
+    /// Decode/encode the bounded JSON payload used by the reserved Connect
+    /// organization extension. JSON is deliberately local to this adapter;
+    /// the outer Connect envelope still supplies the authenticated channel,
+    /// limits, request id, and operation id.
+    pub fn dispatch_authenticated_connect_payload(
+        &self,
+        operation_id: Option<OperationId>,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, OrganizationRuntimeError> {
+        if payload.is_empty() || payload.len() > crate::protocol::MAX_ORGANIZATION_PAYLOAD_BYTES {
+            return Err(OrganizationRuntimeError::InvalidRequest);
+        }
+        let request: OrganizationConnectRequest = serde_json::from_slice(payload)
+            .map_err(|_| OrganizationRuntimeError::InvalidRequest)?;
+        let response = OrganizationConnectResponse::Reply(
+            self.dispatch_authenticated_connect(operation_id, request)?,
+        );
+        let encoded =
+            serde_json::to_vec(&response).map_err(|_| OrganizationRuntimeError::InvalidRequest)?;
+        if encoded.len() > crate::protocol::MAX_ORGANIZATION_PAYLOAD_BYTES {
+            return Err(OrganizationRuntimeError::InvalidRequest);
+        }
+        Ok(encoded)
+    }
+
     /// Bounded periodic refresh gate. Callers can invoke this from a timer;
     /// it never starts a task or performs work before the interval elapses.
     pub fn maybe_refresh(
@@ -501,6 +639,49 @@ impl OrganizationRuntimeHandle {
             OrganizationIpcReply::Refreshed(reply) => Ok(Some(reply)),
             _ => Err(OrganizationRuntimeError::InvalidRequest),
         }
+    }
+}
+
+fn authorize_connect_request(
+    state: &OrganizationRuntimeState,
+    request: &OrganizationConnectRequest,
+) -> Result<(), OrganizationRuntimeError> {
+    let Some(membership) = state.projection.membership() else {
+        return Err(OrganizationRuntimeError::Unauthorized);
+    };
+    if !membership.is_enrolled()
+        || !matches!(capability_for(state), OrganizationCapabilityState::Enabled)
+        || membership.role == MembershipRole::Disabled
+    {
+        return Err(OrganizationRuntimeError::Unauthorized);
+    }
+    match request {
+        OrganizationConnectRequest::Query(_) if membership.role.can_read_published() => Ok(()),
+        OrganizationConnectRequest::Query(_) => Err(OrganizationRuntimeError::Unauthorized),
+        OrganizationConnectRequest::Command(OrganizationIpcCommand::Refresh {
+            host_id,
+            local_confirmation,
+            ..
+        }) => {
+            if *host_id != membership.host_id {
+                return Err(OrganizationRuntimeError::InvalidRequest);
+            }
+            if !*local_confirmation || !membership.role.can_administer() {
+                return Err(OrganizationRuntimeError::Unauthorized);
+            }
+            Ok(())
+        }
+        OrganizationConnectRequest::Command(OrganizationIpcCommand::UnenrollOffline { .. }) => {
+            if membership.role == MembershipRole::Owner {
+                Ok(())
+            } else {
+                Err(OrganizationRuntimeError::Unauthorized)
+            }
+        }
+        OrganizationConnectRequest::Command(OrganizationIpcCommand::PutPromptInComposer {
+            ..
+        }) if membership.role.can_read_published() => Ok(()),
+        OrganizationConnectRequest::Command(_) => Err(OrganizationRuntimeError::Unauthorized),
     }
 }
 
@@ -649,5 +830,59 @@ mod tests {
         });
         assert!(portal.validate().is_ok());
         assert!(portal.is_opted_in());
+    }
+
+    #[test]
+    fn connect_bridge_is_bounded_and_fails_closed_before_enrollment() {
+        let root = std::env::temp_dir().join(format!(
+            "devmanager-org-connect-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let runtime = OrganizationRuntime::open(&root, OrganizationRuntimeConfig::default());
+        let request = OrganizationConnectRequest::Query(OrganizationIpcQuery::Snapshot);
+        let payload = serde_json::to_vec(&request).expect("request encoding");
+        assert!(matches!(
+            runtime
+                .handle()
+                .dispatch_authenticated_connect_payload(None, &payload),
+            Err(OrganizationRuntimeError::Unauthorized)
+        ));
+        assert!(matches!(
+            runtime.handle().dispatch_authenticated_connect_payload(
+                None,
+                &[b'x'; crate::protocol::MAX_ORGANIZATION_PAYLOAD_BYTES + 1]
+            ),
+            Err(OrganizationRuntimeError::InvalidRequest)
+        ));
+        runtime.shutdown();
+    }
+
+    #[test]
+    fn connect_command_requires_operation_identity_for_replay_safety() {
+        let root = std::env::temp_dir().join(format!(
+            "devmanager-org-connect-command-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let runtime = OrganizationRuntime::open(&root, OrganizationRuntimeConfig::default());
+        let request = OrganizationConnectRequest::Command(OrganizationIpcCommand::Refresh {
+            host_id: ConnectHostId::new(),
+            local_confirmation: true,
+            now_ms: 1,
+        });
+        let result = runtime
+            .handle()
+            .dispatch_authenticated_connect(None, request);
+        assert!(matches!(
+            result,
+            Err(OrganizationRuntimeError::Unauthorized)
+                | Err(OrganizationRuntimeError::InvalidRequest)
+        ));
+        runtime.shutdown();
     }
 }
