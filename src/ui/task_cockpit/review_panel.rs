@@ -45,9 +45,9 @@ impl ReviewPanelProjection {
                 refresh: PanelAction::disabled(
                     identity,
                     ActionRequest::TaskShow { task_id },
-                    PanelDisabledReason::NoTaskSelected,
+                    PanelDisabledReason::HostProjectionMissing,
                 ),
-                disabled_reason: Some(PanelDisabledReason::NoTaskSelected),
+                disabled_reason: Some(PanelDisabledReason::HostProjectionMissing),
             };
         };
         let identity = task_identity(task_id, Some(snapshot.task.revision));
@@ -97,12 +97,12 @@ mod tests {
     use crate::domain::snapshot::TaskSnapshot;
 
     #[test]
-    fn missing_review_snapshot_disables_refresh_without_guessing_readiness() {
+    fn missing_review_snapshot_reports_missing_host_projection() {
         let panel = ReviewPanelProjection::from_model(None, Vec::new(), TaskId::new());
         assert_eq!(panel.readiness, ReviewReadiness::NotReady);
         assert_eq!(
             panel.disabled_reason,
-            Some(PanelDisabledReason::NoTaskSelected)
+            Some(PanelDisabledReason::HostProjectionMissing)
         );
         assert!(!panel.refresh.is_enabled());
     }

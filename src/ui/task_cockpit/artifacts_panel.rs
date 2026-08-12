@@ -43,7 +43,7 @@ impl ArtifactsPanelProjection {
                 refresh: PanelAction::disabled(
                     identity,
                     ActionRequest::TaskShow { task_id },
-                    super::panel::PanelDisabledReason::NoTaskSelected,
+                    super::panel::PanelDisabledReason::HostProjectionMissing,
                 ),
             };
         };
@@ -150,6 +150,15 @@ mod tests {
         assert_eq!(panel.refresh.action_id, action::ACTION_TASK_SHOW);
         assert!(
             matches!(panel.refresh.request, ActionRequest::TaskShow { task_id: id } if id == task_id)
+        );
+    }
+
+    #[test]
+    fn missing_task_snapshot_reports_missing_host_projection() {
+        let panel = ArtifactsPanelProjection::from_model(None, Vec::new(), TaskId::new());
+        assert_eq!(
+            panel.refresh.disabled_reason,
+            Some(super::super::panel::PanelDisabledReason::HostProjectionMissing)
         );
     }
 }
