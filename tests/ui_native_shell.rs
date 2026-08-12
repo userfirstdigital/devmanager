@@ -646,6 +646,9 @@ fn native_host_launch_is_pinned_and_has_no_path_fallback() {
     assert!(source.contains("try_attach_existing_host"));
     assert!(source.contains("DetachOnClientClose"));
     assert!(source.contains("for_production"));
+    assert!(source.contains("sanitize_spawned_host_environment"));
+    assert!(source.contains("authorize_full_host_quit"));
+    assert!(source.contains("return Err(IpcError::Timeout)"));
     assert!(!source.contains("\"devmanager-next/"));
 }
 

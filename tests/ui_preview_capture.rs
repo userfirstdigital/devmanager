@@ -2428,7 +2428,7 @@ fn workspace_preview_temp_roots_are_process_run_unique() {
             .temp_root()
             .file_name()
             .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with("devmanager-next-preview-")),
+            .is_some_and(|name| name.starts_with("devmanager-preview-")),
         "the temporary root must be scoped to this process/run"
     );
 }

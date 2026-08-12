@@ -977,6 +977,29 @@ pub async fn connect(endpoint: &str, hello: &ClientHello) -> Result<ClientConnec
     }
 }
 
+/// Normalize only Windows missing-pipe absence to [`IpcError::Unavailable`].
+///
+/// `ERROR_FILE_NOT_FOUND` / [`std::io::ErrorKind::NotFound`] means the named pipe
+/// endpoint is absent (clean-profile first launch must spawn). `ERROR_PIPE_BUSY`
+/// stays retryable as [`IpcError::Busy`] and must not be treated as absence.
+/// Permission, security, and other I/O failures remain visible as [`IpcError::Io`].
+#[cfg(windows)]
+fn map_named_pipe_open_error(error: std::io::Error) -> IpcError {
+    // Win32 ERROR_FILE_NOT_FOUND
+    const ERROR_FILE_NOT_FOUND: i32 = 2;
+    // Win32 ERROR_PIPE_BUSY
+    const ERROR_PIPE_BUSY: i32 = 231;
+    if error.kind() == std::io::ErrorKind::NotFound
+        || error.raw_os_error() == Some(ERROR_FILE_NOT_FOUND)
+    {
+        return IpcError::Unavailable;
+    }
+    if error.raw_os_error() == Some(ERROR_PIPE_BUSY) {
+        return IpcError::Busy;
+    }
+    IpcError::Io(error)
+}
+
 /// Connect, complete Hello, and drop the retained pipe (compatibility wrapper).
 pub async fn perform_client_hello(
     endpoint: &str,
@@ -997,7 +1020,9 @@ async fn windows_connect(
     let (hello_physical, hello_message) = handshake_codecs()?;
     let encoded = hello_message.encode(hello).map_err(IpcError::MessagePack)?;
 
-    let mut pipe = ClientOptions::new().open(endpoint).map_err(IpcError::Io)?;
+    let mut pipe = ClientOptions::new()
+        .open(endpoint)
+        .map_err(map_named_pipe_open_error)?;
 
     let server_hello = tokio::time::timeout(handshake_timeout(), async {
         write_physical_frame(&mut pipe, &hello_physical, &encoded).await?;
@@ -1284,6 +1309,31 @@ mod tests {
         bytes[8] = 0x80;
         bytes[15] = tail;
         CommandId::from_bytes(bytes).expect("command id")
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn missing_named_pipe_maps_to_unavailable_while_busy_stays_busy() {
+        let missing = std::io::Error::from_raw_os_error(2);
+        assert!(matches!(
+            super::map_named_pipe_open_error(missing),
+            IpcError::Unavailable
+        ));
+        let not_found = std::io::Error::new(std::io::ErrorKind::NotFound, "absent");
+        assert!(matches!(
+            super::map_named_pipe_open_error(not_found),
+            IpcError::Unavailable
+        ));
+        let busy = std::io::Error::from_raw_os_error(231);
+        assert!(matches!(
+            super::map_named_pipe_open_error(busy),
+            IpcError::Busy
+        ));
+        let access = std::io::Error::from_raw_os_error(5);
+        assert!(matches!(
+            super::map_named_pipe_open_error(access),
+            IpcError::Io(_)
+        ));
     }
 
     #[test]

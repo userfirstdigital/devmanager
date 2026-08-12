@@ -8,6 +8,8 @@ mod ipc;
 mod lock;
 mod shutdown;
 
+#[cfg(test)]
+pub(crate) use connection::{ConnectionOutputHandle, ConnectionOutputId, OutputInspection};
 pub use connection::{
     HostExecutorOutcome, HostRequestExecutor, HostRequestHandle, PhysicalExitArmRequest,
     SupervisedHostExecutor, HOST_REQUEST_QUEUE_CAPACITY,

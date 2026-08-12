@@ -1,8 +1,10 @@
 //! Durable `devmanager-host` entry.
 //!
-//! `ctl` dispatches before any HostLock/server bootstrap. Debug builds remain
-//! parent-bound under an isolated config base. Release builds own the
-//! Production profile at the exact installed app root and survive client detach.
+//! `ctl` dispatches before any HostLock/server bootstrap so JSON automation
+//! never races the exclusive host owner. Debug builds remain parent-bound under
+//! an isolated config base. Release builds own the Production profile at the
+//! exact installed app root and survive acknowledged client detach; only
+//! inspect_host_quit + confirm_host_quit (HostShutdown) may arm full quit.
 
 use std::fs;
 use std::io::{self, Write};
