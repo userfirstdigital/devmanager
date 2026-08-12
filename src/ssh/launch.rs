@@ -13,17 +13,16 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-#[cfg(test)]
 use std::time::Duration;
 
 use base64::Engine;
 use serde::ser::SerializeStruct;
 use serde::{Serialize, Serializer};
-#[cfg(test)]
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
-use crate::domain::id::{ResourceId, TaskId};
+use crate::config::{Nullable, SSHConnection, SshAuthMode};
+use crate::domain::id::{AgentSessionId, ResourceId, TaskId};
 use crate::process::identity::ManagedProcessIdentity;
 
 #[cfg(test)]
@@ -78,10 +77,11 @@ pub fn ssh_runtime_outcome() -> SshRuntimeOutcome {
 /// are private and never serialized or exposed to an untrusted caller.
 struct BindingInner {
     task_id: TaskId,
+    agent_session_id: AgentSessionId,
     resource_id: ResourceId,
     runtime_generation: u64,
     action_epoch: u64,
-    provider_process: ManagedProcessIdentity,
+    provider_process: Option<ManagedProcessIdentity>,
     launch_nonce: [u8; 16],
     key: [u8; 32],
 }
@@ -93,14 +93,19 @@ impl BindingClaim {
     fn same(&self, other: &Self) -> bool {
         self.0.key == other.0.key
             && self.0.task_id == other.0.task_id
+            && self.0.agent_session_id == other.0.agent_session_id
             && self.0.resource_id == other.0.resource_id
             && self.0.runtime_generation == other.0.runtime_generation
             && self.0.action_epoch == other.0.action_epoch
             && self.0.launch_nonce == other.0.launch_nonce
-            && self
-                .0
-                .provider_process
-                .matches_root(&other.0.provider_process)
+            && match (
+                self.0.provider_process.as_ref(),
+                other.0.provider_process.as_ref(),
+            ) {
+                (Some(left), Some(right)) => left.matches_root(right),
+                (None, None) => true,
+                _ => false,
+            }
     }
 
     fn key(&self) -> [u8; 32] {
@@ -119,6 +124,7 @@ impl BindingClaim {
 /// Opaque, non-cloneable, non-serializable host authority.  The only
 /// constructor is the cfg(test)-only issuer below until the Task 3 union
 /// provides the real host-issued path.
+#[derive(Clone)]
 pub(crate) struct SshBinding {
     inner: Arc<BindingInner>,
 }
@@ -146,12 +152,10 @@ impl fmt::Debug for SshBinding {
     }
 }
 
-#[cfg(test)]
-struct HostIssuedSshBinding {
+pub(crate) struct HostIssuedSshBinding {
     binding: SshBinding,
 }
 
-#[cfg(test)]
 impl HostIssuedSshBinding {
     fn into_binding(self) -> SshBinding {
         self.binding
@@ -160,17 +164,55 @@ impl HostIssuedSshBinding {
 
 /// Sealed issuer.  It is intentionally unavailable in non-test builds until
 /// the supervisor can pass all five exact identity/epoch components.
-#[cfg(test)]
-struct HostIssuedSshBindingIssuer;
+pub(crate) struct HostIssuedSshBindingIssuer;
 
-#[cfg(test)]
 impl HostIssuedSshBindingIssuer {
+    pub(crate) fn issue_for_task(
+        task_id: TaskId,
+        agent_session_id: AgentSessionId,
+        resource_id: ResourceId,
+        runtime_generation: u64,
+        action_epoch: u64,
+        launch_nonce: [u8; 16],
+    ) -> Result<HostIssuedSshBinding, SshLaunchError> {
+        Self::issue_inner(
+            task_id,
+            agent_session_id,
+            resource_id,
+            runtime_generation,
+            action_epoch,
+            None,
+            launch_nonce,
+        )
+    }
+
+    #[cfg(test)]
     fn issue(
         task_id: TaskId,
         resource_id: ResourceId,
         runtime_generation: u64,
         action_epoch: u64,
         provider_process: ManagedProcessIdentity,
+        launch_nonce: [u8; 16],
+    ) -> Result<HostIssuedSshBinding, SshLaunchError> {
+        Self::issue_inner(
+            task_id,
+            AgentSessionId::new(),
+            resource_id,
+            runtime_generation,
+            action_epoch,
+            Some(provider_process),
+            launch_nonce,
+        )
+    }
+
+    fn issue_inner(
+        task_id: TaskId,
+        agent_session_id: AgentSessionId,
+        resource_id: ResourceId,
+        runtime_generation: u64,
+        action_epoch: u64,
+        provider_process: Option<ManagedProcessIdentity>,
         launch_nonce: [u8; 16],
     ) -> Result<HostIssuedSshBinding, SshLaunchError> {
         if runtime_generation == 0
@@ -181,18 +223,21 @@ impl HostIssuedSshBindingIssuer {
         }
         let mut hasher = Sha256::new();
         hasher.update(task_id.as_bytes());
+        hasher.update(agent_session_id.as_bytes());
         hasher.update(resource_id.as_bytes());
         hasher.update(runtime_generation.to_be_bytes());
         hasher.update(action_epoch.to_be_bytes());
-        hasher.update(provider_process.id().pid().to_be_bytes());
-        hasher.update(provider_process.id().creation_time_100ns().to_be_bytes());
-        hasher.update(
-            provider_process
-                .canonical_executable()
-                .as_os_str()
-                .to_string_lossy()
-                .as_bytes(),
-        );
+        if let Some(provider_process) = provider_process.as_ref() {
+            hasher.update(provider_process.id().pid().to_be_bytes());
+            hasher.update(provider_process.id().creation_time_100ns().to_be_bytes());
+            hasher.update(
+                provider_process
+                    .canonical_executable()
+                    .as_os_str()
+                    .to_string_lossy()
+                    .as_bytes(),
+            );
+        }
         hasher.update(launch_nonce);
         let digest = hasher.finalize();
         let mut key = [0u8; 32];
@@ -201,6 +246,7 @@ impl HostIssuedSshBindingIssuer {
             binding: SshBinding {
                 inner: Arc::new(BindingInner {
                     task_id,
+                    agent_session_id,
                     resource_id,
                     runtime_generation,
                     action_epoch,
@@ -361,9 +407,8 @@ pub(crate) enum SshKnownHostPolicy {
     Strict,
 }
 
-struct SshLaunchRequest {
+pub(crate) struct SshLaunchRequest {
     binding: BindingClaim,
-    #[cfg(test)]
     issued_binding: SshBinding,
     connection_id: String,
     host: String,
@@ -392,9 +437,8 @@ impl fmt::Debug for SshLaunchRequest {
     }
 }
 
-#[cfg(test)]
 impl SshLaunchRequest {
-    fn new(
+    pub(crate) fn new(
         issued: HostIssuedSshBinding,
         connection_id: impl AsRef<str>,
         host: impl AsRef<str>,
@@ -416,7 +460,7 @@ impl SshLaunchRequest {
         )
     }
 
-    fn new_with_deadline(
+    pub(crate) fn new_with_deadline(
         issued: HostIssuedSshBinding,
         connection_id: impl AsRef<str>,
         host: impl AsRef<str>,
@@ -441,7 +485,6 @@ impl SshLaunchRequest {
         let claim = issued_binding.claim();
         Ok(Self {
             binding: claim,
-            #[cfg(test)]
             issued_binding,
             connection_id,
             host,
@@ -456,7 +499,7 @@ impl SshLaunchRequest {
         })
     }
 
-    fn with_network_policy(
+    pub(crate) fn with_network_policy(
         mut self,
         proxy_jump: Option<String>,
         known_hosts_path: Option<PathBuf>,
@@ -474,10 +517,59 @@ impl SshLaunchRequest {
         Ok(self)
     }
 
-    fn with_environment(mut self, env: BTreeMap<String, String>) -> Result<Self, SshLaunchError> {
+    pub(crate) fn with_environment(
+        mut self,
+        env: BTreeMap<String, String>,
+    ) -> Result<Self, SshLaunchError> {
         validate_env(&env)?;
         self.env = env;
         Ok(self)
+    }
+
+    pub(crate) fn from_config(
+        issued: HostIssuedSshBinding,
+        connection: &SSHConnection,
+        timeout: Duration,
+    ) -> Result<Self, SshLaunchError> {
+        Self::new(
+            issued,
+            &connection.id,
+            &connection.host,
+            connection.port,
+            &connection.username,
+            auth_from_config(connection)?,
+            timeout,
+        )
+    }
+}
+
+pub(crate) fn auth_from_config(connection: &SSHConnection) -> Result<AuthConfig, SshLaunchError> {
+    let Some(auth) = connection.auth.as_ref() else {
+        return Ok(AuthConfig::Default);
+    };
+    match auth.mode {
+        SshAuthMode::Default => Ok(AuthConfig::Default),
+        SshAuthMode::Agent => Ok(AuthConfig::Agent),
+        SshAuthMode::Password => {
+            let Nullable::Value(reference) = &auth.credential_ref else {
+                return Err(SshLaunchError::InvalidField("password_reference"));
+            };
+            Ok(AuthConfig::Password {
+                credential_ref: CredentialRef::parse(reference)
+                    .map_err(SshLaunchError::Credential)?,
+            })
+        }
+        SshAuthMode::PrivateKey => {
+            let Nullable::Value(reference) = &auth.credential_ref else {
+                return Err(SshLaunchError::InvalidField("private_key_reference"));
+            };
+            Ok(AuthConfig::PastedKey {
+                credential_ref: CredentialRef::parse(reference)
+                    .map_err(SshLaunchError::Credential)?,
+                passphrase_ref: None,
+                password_ref: None,
+            })
+        }
     }
 }
 
@@ -499,8 +591,7 @@ impl Clone for CancellationToken {
 }
 
 impl CancellationToken {
-    #[cfg(test)]
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             state: CancellationState {
                 cancelled: Arc::new(Mutex::new(BTreeMap::new())),
@@ -725,6 +816,7 @@ impl fmt::Debug for SshLaunchEvent {
 
 pub(crate) struct SshLaunchPlan {
     binding: BindingClaim,
+    issued_binding: SshBinding,
     cancellation: CancellationToken,
     command: SshCommand,
     snapshot: SshConnectSnapshot,
@@ -818,6 +910,7 @@ impl SshLaunchPlan {
         Ok(SshPreSpawn {
             command: self.command.clone(),
             binding: self.binding.clone(),
+            issued_binding: self.issued_binding.clone(),
             cancellation: self.cancellation.clone(),
             guards: self.guards.clone(),
             deadline: self.deadline,
@@ -825,7 +918,7 @@ impl SshLaunchPlan {
         })
     }
 
-    fn prompt_matcher(&self) -> PromptMatcher {
+    pub(crate) fn prompt_matcher(&self) -> PromptMatcher {
         PromptMatcher {
             binding: self.binding.clone(),
             username: self.username.clone(),
@@ -863,6 +956,7 @@ impl SshLaunchPlan {
 pub(crate) struct SshPreSpawn {
     command: SshCommand,
     binding: BindingClaim,
+    issued_binding: SshBinding,
     cancellation: CancellationToken,
     guards: LaunchGuards,
     deadline: Instant,
@@ -872,6 +966,10 @@ pub(crate) struct SshPreSpawn {
 impl SshPreSpawn {
     pub(crate) fn command(&self) -> &SshCommand {
         &self.command
+    }
+
+    pub(crate) fn binding(&self) -> &SshBinding {
+        &self.issued_binding
     }
 
     pub(crate) fn revalidate(&self) -> Result<(), SshLaunchError> {
@@ -974,7 +1072,7 @@ fn ensure_request_active(
     guards.revalidate(request.deadline)
 }
 
-fn build_ssh_launch_plan(
+pub(crate) fn build_ssh_launch_plan(
     request: &SshLaunchRequest,
     credentials: &dyn CredentialResolver,
     key_store: Option<&KeyMaterialStore>,
@@ -1133,6 +1231,7 @@ fn build_ssh_launch_plan(
     }
     Ok(LaunchOutcome::Ready(Box::new(SshLaunchPlan {
         binding: request.binding.clone(),
+        issued_binding: request.issued_binding.clone(),
         cancellation: cancellation.clone(),
         command,
         snapshot,
@@ -1183,8 +1282,7 @@ impl InputDelivery {
         Ok(Self { bytes })
     }
 
-    #[cfg(test)]
-    fn bytes(&self) -> &[u8] {
+    pub(crate) fn bytes(&self) -> &[u8] {
         &self.bytes
     }
 }
@@ -1304,8 +1402,7 @@ impl SshInputRequest {
         self.binding.same(&binding.claim())
     }
 
-    #[cfg(test)]
-    fn resolve(
+    pub(crate) fn resolve(
         &self,
         credentials: &dyn CredentialResolver,
         binding: &SshBinding,
@@ -1402,8 +1499,11 @@ impl SshHostKeyPrompt {
         self.answer(binding, b"no\r")
     }
 
-    #[cfg(test)]
-    fn answer(&self, binding: &SshBinding, answer: &[u8]) -> Result<InputDelivery, SshLaunchError> {
+    pub(crate) fn answer(
+        &self,
+        binding: &SshBinding,
+        answer: &[u8],
+    ) -> Result<InputDelivery, SshLaunchError> {
         let claim = binding.claim();
         self.lease.ensure_active(&claim)?;
         self.guards.revalidate(self.lease.deadline)?;
@@ -1477,7 +1577,7 @@ impl fmt::Debug for PromptMatcher {
 }
 
 impl PromptMatcher {
-    fn observe(&mut self, chunk: &[u8]) -> Result<PromptMatch, SshLaunchError> {
+    pub(crate) fn observe(&mut self, chunk: &[u8]) -> Result<PromptMatch, SshLaunchError> {
         if chunk.len() > MAX_PROMPT_BYTES {
             self.tail.clear();
             self.invalid_line = true;

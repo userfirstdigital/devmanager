@@ -11,8 +11,8 @@ use crate::domain::cockpit::{
     cockpit_surface, relative_path_is_safe, workspace_projection, TaskCockpitDeniedReason,
     TaskCockpitQuery, TaskCockpitResult, TaskCockpitSurface, TaskCockpitUnavailableReason,
     TaskFileEntry, TaskFilesListProjection, TaskFilesReadProjection, TaskGitMutateIntent,
-    TaskGitProjection, TaskSshEndpoint, TaskSshProjection, MAX_COCKPIT_FILE_LIST,
-    MAX_COCKPIT_READ_BYTES,
+    TaskGitProjection, TaskSshEndpoint, TaskSshLifecycle, TaskSshProjection, TaskSshRuntimeError,
+    TaskSshRuntimeProjection, MAX_COCKPIT_FILE_LIST, MAX_COCKPIT_READ_BYTES,
 };
 use crate::domain::id::{ClientId, CommandId, RequestId, TaskId};
 use crate::domain::query::{QueryError, QueryOutcome, QueryResult};
@@ -28,7 +28,8 @@ use crate::services::supervisor::{
 };
 use crate::services::ProcessManager;
 use crate::ssh::{
-    accept_exact_endpoint, ssh_runtime_outcome, SshEndpointDenial, SshRuntimeOutcome,
+    accept_exact_endpoint, SshEndpointDenial, SshLifecycle, SshRuntimeAdapter, SshRuntimeError,
+    SshRuntimeSnapshot, SshTaskIdentity,
 };
 use crate::workspace::files::{
     ContentKind, EntryKind, ExpectedRevision, FileServiceError, ReadOptions, SecretClassification,
@@ -50,6 +51,7 @@ pub(crate) struct TaskCockpitDispatch<'a> {
     pub bus: &'a CommandBus,
     pub service_runtime: Option<&'a ProcessManager>,
     pub ssh_endpoints: Option<&'a [TaskSshEndpoint]>,
+    pub ssh_runtime: Option<&'a dyn SshRuntimeAdapter>,
     pub workspace_projects: Option<&'a WorkspaceProjectRoots>,
     pub coordinator: Option<&'a WorkspaceResourceCoordinator>,
     pub action_epoch: Option<u64>,
@@ -150,6 +152,10 @@ pub(crate) fn serve_task_cockpit(dispatch: TaskCockpitDispatch<'_>) -> QueryOutc
                 TaskSshProjection {
                     task_id,
                     endpoints: endpoints.to_vec(),
+                    runtime: dispatch
+                        .ssh_runtime
+                        .and_then(|runtime| runtime.status_for_task(task_id))
+                        .map(to_ssh_runtime_projection),
                 },
             ))),
             None => unavailable(
@@ -158,7 +164,7 @@ pub(crate) fn serve_task_cockpit(dispatch: TaskCockpitDispatch<'_>) -> QueryOutc
             ),
         },
         TaskCockpitQuery::SshAction { endpoint_id } => {
-            serve_ssh_action(&dispatch, task_id, &snapshot.task, endpoint_id)
+            serve_ssh_action(&dispatch, task_id, &snapshot, endpoint_id)
         }
         TaskCockpitQuery::ServiceSnapshots => match dispatch.service_runtime {
             Some(manager) => match manager.configured_service_snapshots_for_task(task_id) {
@@ -995,9 +1001,10 @@ fn revalidate_issued_fence(
 fn serve_ssh_action(
     dispatch: &TaskCockpitDispatch<'_>,
     task_id: TaskId,
-    task: &crate::domain::task::TaskFacts,
+    snapshot: &crate::domain::snapshot::TaskSnapshot,
     endpoint_id: &str,
 ) -> QueryOutcome {
+    let task = &snapshot.task;
     let Some(endpoints) = dispatch.ssh_endpoints else {
         return unavailable(
             TaskCockpitSurface::Ssh,
@@ -1005,6 +1012,12 @@ fn serve_ssh_action(
         );
     };
     match accept_exact_endpoint(endpoints, endpoint_id) {
+        Ok(endpoint) if endpoint.archived => {
+            return unavailable(
+                TaskCockpitSurface::Ssh,
+                TaskCockpitUnavailableReason::SshOperationUnsupported,
+            );
+        }
         Ok(_) => {}
         Err(SshEndpointDenial::ForeignInput) | Err(SshEndpointDenial::UnknownEndpoint) => {
             return denied(
@@ -1024,13 +1037,128 @@ fn serve_ssh_action(
     {
         return outcome;
     }
-    match ssh_runtime_outcome() {
-        SshRuntimeOutcome::Unavailable {
-            reason: crate::ssh::SshUnavailableReason::TaskSupervisorAdapterMissing,
-        } => unavailable(
+    let Some(runtime) = dispatch.ssh_runtime else {
+        return unavailable(
             TaskCockpitSurface::Ssh,
             TaskCockpitUnavailableReason::SshTaskSupervisorAdapterMissing,
+        );
+    };
+    if task.lifecycle != crate::domain::task::TaskLifecycle::Open {
+        return unavailable(
+            TaskCockpitSurface::Ssh,
+            TaskCockpitUnavailableReason::SshOperationUnsupported,
+        );
+    }
+    let Some(agent_session_id) = snapshot.primary_agent_id else {
+        return unavailable(
+            TaskCockpitSurface::Ssh,
+            TaskCockpitUnavailableReason::SshOperationUnsupported,
+        );
+    };
+    let Some(agent) = snapshot.agents.get(&agent_session_id) else {
+        return unavailable(
+            TaskCockpitSurface::Ssh,
+            TaskCockpitUnavailableReason::SshOperationUnsupported,
+        );
+    };
+    if agent.task_id != task_id
+        || agent.lifecycle != crate::domain::agent::AgentSessionLifecycle::Open
+        || agent.runtime_generation == 0
+    {
+        return unavailable(
+            TaskCockpitSurface::Ssh,
+            TaskCockpitUnavailableReason::SshOperationUnsupported,
+        );
+    }
+    let Some(resource) = snapshot.resources.values().find(|resource| {
+        resource.task_id == Some(task_id)
+            && resource.owner_kind == crate::domain::resource::OwnerKind::Task
+            && resource.resource_kind == crate::domain::resource::ResourceKind::Terminal
+            && resource.lifecycle == crate::domain::resource::ResourceLifecycle::Active
+            && resource.runtime_generation > 0
+            && resource.runtime_generation == agent.runtime_generation
+    }) else {
+        return unavailable(
+            TaskCockpitSurface::Ssh,
+            TaskCockpitUnavailableReason::SshOperationUnsupported,
+        );
+    };
+    let Some(cwd) = dispatch
+        .workspace_projects
+        .and_then(|projects| projects.root_for(task.project_id))
+        .map(|path| path.to_path_buf())
+    else {
+        return unavailable(
+            TaskCockpitSurface::Ssh,
+            TaskCockpitUnavailableReason::WorkspaceAuthorityUnavailable,
+        );
+    };
+    let Some(action_epoch) = dispatch
+        .action_epoch
+        .filter(|epoch| *epoch > 0)
+        .or_else(|| (task.action_epoch > 0).then_some(task.action_epoch))
+    else {
+        return unavailable(
+            TaskCockpitSurface::Ssh,
+            TaskCockpitUnavailableReason::WorkspaceAuthorityUnavailable,
+        );
+    };
+    match runtime.connect_endpoint(
+        endpoint_id,
+        SshTaskIdentity {
+            task_id,
+            agent_session_id,
+            resource_id: resource.id,
+            runtime_generation: resource.runtime_generation,
+            action_epoch,
+            cwd,
+        },
+    ) {
+        Ok(runtime_snapshot) => QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Ssh(
+            TaskSshProjection {
+                task_id,
+                endpoints: endpoints.to_vec(),
+                runtime: Some(to_ssh_runtime_projection(runtime_snapshot)),
+            },
+        ))),
+        Err(SshRuntimeError::UnknownEndpoint | SshRuntimeError::ArchivedEndpoint) => denied(
+            TaskCockpitSurface::Ssh,
+            TaskCockpitDeniedReason::Unauthorized,
         ),
+        Err(_) => unavailable(
+            TaskCockpitSurface::Ssh,
+            TaskCockpitUnavailableReason::SshOperationUnsupported,
+        ),
+    }
+}
+
+fn to_ssh_runtime_projection(snapshot: SshRuntimeSnapshot) -> TaskSshRuntimeProjection {
+    TaskSshRuntimeProjection {
+        task_id: snapshot.task_id,
+        agent_session_id: snapshot.agent_session_id,
+        resource_id: snapshot.resource_id,
+        runtime_generation: snapshot.runtime_generation,
+        action_epoch: snapshot.action_epoch,
+        endpoint_id: snapshot.endpoint_id,
+        lifecycle: match snapshot.lifecycle {
+            SshLifecycle::Starting => TaskSshLifecycle::Starting,
+            SshLifecycle::Running => TaskSshLifecycle::Running,
+            SshLifecycle::Stopping => TaskSshLifecycle::Stopping,
+            SshLifecycle::Stopped => TaskSshLifecycle::Stopped,
+            SshLifecycle::Failed => TaskSshLifecycle::Failed,
+        },
+        error: snapshot.error.map(|error| match error {
+            SshRuntimeError::CredentialUnavailable => TaskSshRuntimeError::CredentialUnavailable,
+            SshRuntimeError::HostKeyPrompt => TaskSshRuntimeError::HostKeyPrompt,
+            SshRuntimeError::StaleFence => TaskSshRuntimeError::StaleFence,
+            SshRuntimeError::Teardown => TaskSshRuntimeError::Teardown,
+            SshRuntimeError::Launch
+            | SshRuntimeError::InvalidAdmission
+            | SshRuntimeError::UnknownEndpoint
+            | SshRuntimeError::ArchivedEndpoint
+            | SshRuntimeError::AlreadyRunning
+            | SshRuntimeError::NotRunning => TaskSshRuntimeError::Launch,
+        }),
     }
 }
 
@@ -1181,6 +1309,7 @@ mod tests {
             bus: &bus,
             service_runtime: None,
             ssh_endpoints: Some(&endpoints),
+            ssh_runtime: None,
             workspace_projects: Some(&roots),
             coordinator: None,
             action_epoch: None,
@@ -1206,6 +1335,7 @@ mod tests {
             bus: &bus,
             service_runtime: None,
             ssh_endpoints: Some(&endpoints),
+            ssh_runtime: None,
             workspace_projects: Some(&roots),
             coordinator: Some(&coordinator),
             action_epoch: Some(1),
@@ -1230,6 +1360,7 @@ mod tests {
             bus: &bus,
             service_runtime: None,
             ssh_endpoints: Some(&endpoints),
+            ssh_runtime: None,
             workspace_projects: Some(&roots),
             coordinator: None,
             action_epoch: None,
@@ -1262,6 +1393,7 @@ mod tests {
             bus: &bus,
             service_runtime: None,
             ssh_endpoints: None,
+            ssh_runtime: None,
             workspace_projects: Some(&roots),
             coordinator: Some(&coordinator),
             action_epoch: Some(1),
@@ -1286,6 +1418,7 @@ mod tests {
             bus: &bus,
             service_runtime: None,
             ssh_endpoints: None,
+            ssh_runtime: None,
             workspace_projects: Some(&roots),
             coordinator: Some(&coordinator),
             action_epoch: Some(1),
@@ -1311,6 +1444,7 @@ mod tests {
             bus: &bus,
             service_runtime: None,
             ssh_endpoints: None,
+            ssh_runtime: None,
             workspace_projects: Some(&roots),
             coordinator: Some(&coordinator),
             action_epoch: Some(1),
@@ -1349,6 +1483,7 @@ mod tests {
             bus,
             service_runtime: None,
             ssh_endpoints: None,
+            ssh_runtime: None,
             workspace_projects: roots,
             coordinator,
             action_epoch,

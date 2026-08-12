@@ -102,8 +102,8 @@ impl ServiceLaunchIssuer {
         if generation == 0 {
             return Err("service runtime generation must be greater than zero".to_string());
         }
-        if kind != ResourceKind::Service {
-            return Err("service authority requires ResourceKind::Service".to_string());
+        if !matches!(kind, ResourceKind::Service | ResourceKind::Terminal) {
+            return Err("managed authority does not admit this resource kind".to_string());
         }
         let mut state = self
             .state
@@ -210,6 +210,8 @@ pub struct HostLiveLaunch {
     output_lines: Arc<Mutex<VecDeque<String>>>,
     #[cfg(windows)]
     exit_code: Arc<Mutex<Option<Option<i32>>>>,
+    #[cfg(windows)]
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
     #[cfg(not(windows))]
     _private: (),
 }
@@ -263,12 +265,18 @@ impl ManagedLaunchAuthority for HostManagedLaunchAuthority {
         }
         #[cfg(windows)]
         {
-            if spec.generation == 0 || spec.kind != ResourceKind::Service {
+            if spec.generation == 0
+                || !matches!(spec.kind, ResourceKind::Service | ResourceKind::Terminal)
+            {
                 return Err(SupervisorError::Launch {
                     stage: ManagedLaunchStage::Prepare,
                 });
             }
-            let session_id = format!("service:{}", spec.display_label);
+            let session_id = match spec.kind {
+                ResourceKind::Service => format!("service:{}", spec.display_label),
+                ResourceKind::Terminal => format!("terminal:{}", spec.resource_id),
+                ResourceKind::BrowserContext => unreachable!("browser contexts are not launched"),
+            };
             let (action_epoch, completion_store, operation_id) = self
                 .issuer
                 .admit_capability(
@@ -317,7 +325,7 @@ impl ManagedLaunchAuthority for HostManagedLaunchAuthority {
                 resource_id: spec.resource_id,
                 generation: spec.generation,
                 owner: spec.owner,
-                kind: ResourceKind::Service,
+                kind: spec.kind,
                 executable: PathBuf::from(resolved_program),
                 args: spec.args.iter().cloned().map(OsString::from).collect(),
                 cwd: PathBuf::from(&spec.cwd),
@@ -472,6 +480,7 @@ impl ManagedLaunchAuthority for HostManagedLaunchAuthority {
                 fence,
                 output_lines,
                 exit_code,
+                writer,
             })
         }
     }
@@ -505,6 +514,36 @@ impl ManagedLaunchAuthority for HostManagedLaunchAuthority {
                     Err(SupervisorError::TeardownFailed)
                 }
             }
+        }
+    }
+
+    fn write_input(
+        &mut self,
+        live: &Self::Live,
+        bytes: &[u8],
+        fence: ResourceFence,
+    ) -> Result<(), SupervisorError> {
+        #[cfg(not(windows))]
+        {
+            let _ = (live, bytes, fence);
+            Err(SupervisorError::Launch {
+                stage: ManagedLaunchStage::Resume,
+            })
+        }
+        #[cfg(windows)]
+        {
+            if live.fence != fence {
+                return Err(SupervisorError::TeardownFailed);
+            }
+            let mut writer = live.writer.lock().map_err(|_| SupervisorError::Launch {
+                stage: ManagedLaunchStage::Resume,
+            })?;
+            writer
+                .write_all(bytes)
+                .and_then(|_| writer.flush())
+                .map_err(|_| SupervisorError::Launch {
+                    stage: ManagedLaunchStage::Resume,
+                })
         }
     }
 

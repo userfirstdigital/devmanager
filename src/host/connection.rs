@@ -8,6 +8,7 @@
 //! event-replay, and artifact-content queries.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::path::PathBuf;
 use std::pin::pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1559,6 +1560,72 @@ struct HostWorkspaceAdmission {
     store: ConfigStore,
     issuer: crate::config::ConfigWorkspaceIssuer,
     roots: WorkspaceProjectRoots,
+    ssh_runtime: HostSshRuntime,
+}
+
+/// Host-owned SSH adapter. Config and credential resolution stay behind this
+/// boundary; cockpit projections receive only the typed lifecycle snapshot.
+struct HostSshRuntime {
+    config: crate::config::AppConfig,
+    supervisor: Mutex<
+        crate::ssh::SshSupervisor<
+            crate::services::HostManagedLaunchAuthority,
+            crate::ssh::ConfigCredentialResolver,
+        >,
+    >,
+}
+
+impl HostSshRuntime {
+    fn new(config: crate::config::AppConfig, key_root: Option<PathBuf>) -> Self {
+        let resolver = crate::ssh::ConfigCredentialResolver::new(config.clone());
+        let key_store = key_root
+            .and_then(|root| crate::ssh::KeyMaterialStore::new(root).ok());
+        let supervisor = crate::ssh::SshSupervisor::with_credentials(
+            crate::services::HostManagedLaunchAuthority::new(),
+            resolver,
+            key_store,
+        );
+        Self {
+            config,
+            supervisor: Mutex::new(supervisor),
+        }
+    }
+}
+
+impl crate::ssh::SshRuntimeAdapter for HostSshRuntime {
+    fn status_for_task(&self, task_id: TaskId) -> Option<crate::ssh::SshRuntimeSnapshot> {
+        self.supervisor
+            .lock()
+            .ok()
+            .and_then(|mut supervisor| supervisor.snapshot_for_task(task_id))
+    }
+
+    fn connect_endpoint(
+        &self,
+        endpoint_id: &str,
+        identity: crate::ssh::SshTaskIdentity,
+    ) -> Result<crate::ssh::SshRuntimeSnapshot, crate::ssh::SshRuntimeError> {
+        let connection = self
+            .config
+            .ssh_connections
+            .iter()
+            .find(|connection| connection.id == endpoint_id)
+            .cloned()
+            .ok_or(crate::ssh::SshRuntimeError::UnknownEndpoint)?;
+        let admission = crate::ssh::SshAdmission {
+            task_id: identity.task_id,
+            agent_session_id: identity.agent_session_id,
+            resource_id: identity.resource_id,
+            runtime_generation: identity.runtime_generation,
+            action_epoch: identity.action_epoch,
+            connection,
+            cwd: identity.cwd,
+        };
+        self.supervisor
+            .lock()
+            .map_err(|_| crate::ssh::SshRuntimeError::Launch)?
+            .connect(admission)
+    }
 }
 
 /// The host's single configured-service authority.  Keeping this alongside
@@ -1663,10 +1730,15 @@ impl HostWorkspaceAdmission {
                 "configured workspace roots are unavailable",
             )
         })?;
+        let ssh_runtime = HostSshRuntime::new(
+            store.snapshot().config.clone(),
+            store.path().parent().map(|parent| parent.join("ssh-keys")),
+        );
         Ok(Self {
             store,
             issuer,
             roots,
+            ssh_runtime,
         })
     }
 
@@ -2966,6 +3038,10 @@ impl HostRequestExecutor {
                         .as_ref()
                         .map(|runtime| &runtime.manager),
                     ssh_endpoints: ssh_endpoints.as_deref(),
+                    ssh_runtime: self
+                        .config_admission
+                        .as_ref()
+                        .map(|admission| &admission.ssh_runtime as &dyn crate::ssh::SshRuntimeAdapter),
                     workspace_projects: Some(&self.workspace_projects),
                     coordinator: Some(&self.workspace_coordinator),
                     action_epoch,
@@ -4054,6 +4130,7 @@ fn dispatch_authenticated_request_inner(
                         bus,
                         service_runtime: None,
                         ssh_endpoints: None,
+                        ssh_runtime: None,
                         workspace_projects,
                         coordinator: None,
                         action_epoch: None,

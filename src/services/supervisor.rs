@@ -238,6 +238,19 @@ pub trait ManagedLaunchAuthority {
         live: &mut Option<Self::Live>,
         fence: ResourceFence,
     ) -> Result<(), SupervisorError>;
+    /// Deliver one already-authorized input lease to the managed PTY.  The
+    /// authority owns the writer and must never expose the bytes to a
+    /// projection or diagnostic surface.
+    fn write_input(
+        &mut self,
+        _live: &Self::Live,
+        _bytes: &[u8],
+        _fence: ResourceFence,
+    ) -> Result<(), SupervisorError> {
+        Err(SupervisorError::Launch {
+            stage: ManagedLaunchStage::Resume,
+        })
+    }
     /// Drain newly captured PTY output lines for the live generation.
     fn drain_output_lines(&self, live: &Self::Live) -> Vec<String>;
     /// Observe a waiter exit for the live generation. `None` means still live;
@@ -1780,6 +1793,7 @@ struct FakeLaunchInner {
     last_spec: Option<ManagedLaunchSpec>,
     outputs: BTreeMap<u64, VecDeque<String>>,
     exits: BTreeMap<u64, Option<i32>>,
+    input_writes: usize,
 }
 
 pub struct FakePending {
@@ -1803,6 +1817,7 @@ impl Drop for FakePending {
 pub struct FakeLiveLaunch {
     inner: std::rc::Rc<std::cell::RefCell<FakeLaunchInner>>,
     token: u64,
+    resource_id: ResourceId,
     generation: u64,
 }
 
@@ -1826,6 +1841,7 @@ impl FakeLaunchAuthority {
                 last_spec: None,
                 outputs: BTreeMap::new(),
                 exits: BTreeMap::new(),
+                input_writes: 0,
             })),
         }
     }
@@ -1852,6 +1868,10 @@ impl FakeLaunchAuthority {
 
     pub fn torn_down(&self) -> usize {
         self.inner.borrow().torn_down
+    }
+
+    pub fn input_writes(&self) -> usize {
+        self.inner.borrow().input_writes
     }
 
     pub fn last_env_names(&self) -> Vec<String> {
@@ -1959,6 +1979,13 @@ impl ManagedLaunchAuthority for FakeLaunchAuthority {
         }
         let token = pending.token;
         let generation = pending.generation;
+        let resource_id = inner
+            .last_spec
+            .as_ref()
+            .map(|spec| spec.resource_id)
+            .ok_or(SupervisorError::Launch {
+                stage: ManagedLaunchStage::Resume,
+            })?;
         pending.live = true;
         inner.resumed = inner.resumed.saturating_add(1);
         inner.live.insert(token);
@@ -1967,6 +1994,7 @@ impl ManagedLaunchAuthority for FakeLaunchAuthority {
         Ok(FakeLiveLaunch {
             inner: self.inner.clone(),
             token,
+            resource_id,
             generation,
         })
     }
@@ -1984,6 +2012,20 @@ impl ManagedLaunchAuthority for FakeLaunchAuthority {
         inner.outputs.remove(&handle.token);
         inner.exits.remove(&handle.token);
         inner.torn_down = inner.torn_down.saturating_add(1);
+        Ok(())
+    }
+
+    fn write_input(
+        &mut self,
+        live: &Self::Live,
+        _bytes: &[u8],
+        fence: ResourceFence,
+    ) -> Result<(), SupervisorError> {
+        if fence.resource_id != live.resource_id || fence.runtime_generation != live.generation {
+            return Err(SupervisorError::TeardownFailed);
+        }
+        let mut inner = self.inner.borrow_mut();
+        inner.input_writes = inner.input_writes.saturating_add(1);
         Ok(())
     }
 

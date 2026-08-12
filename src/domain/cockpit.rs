@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::domain::id::{ConfiguredServiceId, TaskId};
+use crate::domain::id::{AgentSessionId, ConfiguredServiceId, ResourceId, TaskId};
 use crate::domain::task::{WorkspaceBindingKind, WorkspaceRef};
 
 pub const MAX_COCKPIT_FILE_LIST: u16 = 64;
@@ -169,11 +169,46 @@ pub struct TaskSshEndpoint {
     pub has_credential: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskSshLifecycle {
+    Starting,
+    Running,
+    Stopping,
+    Stopped,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskSshRuntimeError {
+    CredentialUnavailable,
+    HostKeyPrompt,
+    Launch,
+    StaleFence,
+    Teardown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskSshRuntimeProjection {
+    pub task_id: TaskId,
+    pub agent_session_id: AgentSessionId,
+    pub resource_id: ResourceId,
+    pub runtime_generation: u64,
+    pub action_epoch: u64,
+    pub endpoint_id: String,
+    pub lifecycle: TaskSshLifecycle,
+    pub error: Option<TaskSshRuntimeError>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TaskSshProjection {
     pub task_id: TaskId,
     pub endpoints: Vec<TaskSshEndpoint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<TaskSshRuntimeProjection>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

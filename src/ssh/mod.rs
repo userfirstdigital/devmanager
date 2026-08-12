@@ -7,6 +7,12 @@
 mod cockpit;
 mod credentials;
 mod launch;
+mod supervisor;
 
 pub(crate) use cockpit::{accept_exact_endpoint, redacted_endpoints, SshEndpointDenial};
+pub(crate) use credentials::KeyMaterialStore;
 pub use launch::{ssh_runtime_outcome, SshRuntimeOutcome, SshUnavailableReason};
+pub(crate) use supervisor::{
+    ConfigCredentialResolver, SshAdmission, SshLifecycle, SshRuntimeAdapter, SshRuntimeError,
+    SshRuntimeSnapshot, SshSupervisor, SshTaskIdentity,
+};

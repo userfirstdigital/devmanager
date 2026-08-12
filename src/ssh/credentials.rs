@@ -196,7 +196,7 @@ pub(crate) enum CredentialKind {
 /// A short-lived zeroizing secret.  It is intentionally not `Clone`,
 /// `Serialize`, or `Deserialize`; only the host-owned resolver can construct
 /// one and only this module can borrow its bytes.
-pub(super) struct CredentialSecret {
+pub(crate) struct CredentialSecret {
     kind: CredentialKind,
     bytes: Zeroizing<Vec<u8>>,
 }
@@ -271,7 +271,7 @@ impl fmt::Debug for CredentialSecret {
 
 /// The only credential lookup seam.  The Task 3 supervisor will provide the
 /// production implementation; tests use a memory-only resolver.
-pub(super) trait CredentialResolver {
+pub(crate) trait CredentialResolver {
     fn resolve(&self, reference: &CredentialRef) -> Result<CredentialSecret, CredentialError>;
 }
 
