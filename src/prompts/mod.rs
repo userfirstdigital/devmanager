@@ -38,6 +38,7 @@ pub mod organization {
     use crate::org::{
         HostMembership, MembershipRole, OrgError, OrgPromptChainId, OrgPromptId,
         OrgPromptVersionId, OrganizationPolicyDocument, PortalAccountId, PortalTenantId,
+        SyncOutcome,
     };
     use crate::protocol::{
         ORGANIZATION_PROMPT_BODY_LIMIT_BYTES, ORGANIZATION_PROMPT_PAGE_ENCODED_LIMIT_BYTES,
@@ -109,12 +110,24 @@ pub mod organization {
         pub entitlement_expires_at_ms: i64,
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct OrganizationPromptSnapshot {
+        pub tenant_id: PortalTenantId,
+        pub revision: u32,
+        pub prompts: Vec<OrgPrompt>,
+        pub versions: Vec<OrgPromptVersion>,
+        pub chains: Vec<OrgPromptChain>,
+    }
+
     #[derive(Debug, Default)]
     pub struct OrganizationPromptProjection {
         prompts: BTreeMap<String, OrgPrompt>,
         versions: BTreeMap<String, OrgPromptVersion>,
         chains: BTreeMap<String, OrgPromptChain>,
         cache: BTreeMap<String, CachedPrompt>,
+        snapshot_revision: u32,
+        accepted_snapshot: Option<OrganizationPromptSnapshot>,
     }
 
     impl OrganizationPromptProjection {
@@ -332,6 +345,8 @@ pub mod organization {
             self.prompts.clear();
             self.versions.clear();
             self.chains.clear();
+            self.snapshot_revision = 0;
+            self.accepted_snapshot = None;
         }
 
         pub fn put_in_composer(
@@ -351,6 +366,153 @@ pub mod organization {
         pub fn encoded_page_limit() -> u32 {
             ORGANIZATION_PROMPT_PAGE_ENCODED_LIMIT_BYTES
         }
+
+        pub fn snapshot_revision(&self) -> u32 {
+            self.snapshot_revision
+        }
+
+        pub fn prompt_count(&self) -> usize {
+            self.prompts.len()
+        }
+
+        pub fn version(&self, version_id: OrgPromptVersionId) -> Option<&OrgPromptVersion> {
+            self.versions.get(&version_id.to_string())
+        }
+
+        pub fn apply_authoritative_snapshot(
+            &mut self,
+            membership: &HostMembership,
+            snapshot: OrganizationPromptSnapshot,
+            now_ms: i64,
+            entitlement_expires_at_ms: i64,
+        ) -> Result<SyncOutcome, OrgError> {
+            if !membership.is_enrolled() || !membership.role.can_read_published() {
+                return Err(OrgError::RoleDenied);
+            }
+            if membership.tenant_id != snapshot.tenant_id {
+                return Err(OrgError::CrossTenant);
+            }
+            if snapshot.revision == 0 {
+                return Err(OrgError::StalePolicy);
+            }
+            if snapshot.prompts.len() > ORGANIZATION_PROMPT_PAGE_ITEM_LIMIT as usize
+                || snapshot.versions.len() > ORGANIZATION_PROMPT_PAGE_ITEM_LIMIT as usize
+                || snapshot.chains.len() > ORGANIZATION_PROMPT_PAGE_ITEM_LIMIT as usize
+            {
+                return Err(OrgError::BoundExceeded);
+            }
+            if self.snapshot_revision > snapshot.revision {
+                return Err(OrgError::StalePolicy);
+            }
+            if self.snapshot_revision == snapshot.revision && self.snapshot_revision != 0 {
+                return if self.accepted_snapshot.as_ref() == Some(&snapshot) {
+                    Ok(SyncOutcome::Duplicate)
+                } else {
+                    Err(OrgError::LastWriteWinsForbidden)
+                };
+            }
+            validate_prompt_snapshot(self, &snapshot)?;
+            let mut prompts = self.prompts.clone();
+            let mut versions = self.versions.clone();
+            let mut chains = self.chains.clone();
+            let mut cache = self.cache.clone();
+            for prompt in &snapshot.prompts {
+                prompts.insert(
+                    prompt_key(&prompt.tenant_id, &prompt.namespace, &prompt.name),
+                    prompt.clone(),
+                );
+            }
+            for version in &snapshot.versions {
+                versions.insert(version.version_id.to_string(), version.clone());
+                cache.insert(
+                    version.version_id.to_string(),
+                    CachedPrompt {
+                        version: version.clone(),
+                        cached_at_ms: now_ms,
+                        entitlement_expires_at_ms,
+                    },
+                );
+            }
+            for chain in &snapshot.chains {
+                chains.insert(chain.chain_id.to_string(), chain.clone());
+            }
+            self.prompts = prompts;
+            self.versions = versions;
+            self.chains = chains;
+            self.cache = cache;
+            self.snapshot_revision = snapshot.revision;
+            self.accepted_snapshot = Some(snapshot);
+            Ok(SyncOutcome::Applied)
+        }
+    }
+
+    fn validate_prompt_snapshot(
+        projection: &OrganizationPromptProjection,
+        snapshot: &OrganizationPromptSnapshot,
+    ) -> Result<(), OrgError> {
+        let mut snapshot_versions = BTreeMap::new();
+        for version in &snapshot.versions {
+            if version.body.len() > ORGANIZATION_PROMPT_BODY_LIMIT_BYTES as usize
+                || version.title.len() > ORGANIZATION_PROMPT_BODY_LIMIT_BYTES as usize
+                || version.tags.len() > ORGANIZATION_PROMPT_PAGE_ITEM_LIMIT as usize
+            {
+                return Err(OrgError::BoundExceeded);
+            }
+            if version.content_hash_hex != hash_body(&version.body) {
+                return Err(OrgError::ImmutableVersion);
+            }
+            if let Some(existing) = projection.versions.get(&version.version_id.to_string()) {
+                if existing != version {
+                    return Err(OrgError::ImmutableVersion);
+                }
+            }
+            if snapshot_versions
+                .insert(version.version_id, version)
+                .is_some()
+            {
+                return Err(OrgError::DuplicateLink);
+            }
+        }
+        for prompt in &snapshot.prompts {
+            if prompt.tenant_id != snapshot.tenant_id {
+                return Err(OrgError::CrossTenant);
+            }
+            let current = snapshot_versions
+                .get(&prompt.current_version_id)
+                .copied()
+                .or_else(|| {
+                    projection
+                        .versions
+                        .get(&prompt.current_version_id.to_string())
+                });
+            let Some(current) = current else {
+                return Err(OrgError::Unlinked);
+            };
+            if current.prompt_id != prompt.prompt_id {
+                return Err(OrgError::Unlinked);
+            }
+        }
+        for chain in &snapshot.chains {
+            if chain.tenant_id != snapshot.tenant_id {
+                return Err(OrgError::CrossTenant);
+            }
+            if chain.links.len() > ORGANIZATION_PROMPT_PAGE_ITEM_LIMIT as usize {
+                return Err(OrgError::BoundExceeded);
+            }
+            for (index, link) in chain.links.iter().enumerate() {
+                if link.position != index as u32 {
+                    return Err(OrgError::LastWriteWinsForbidden);
+                }
+                let known = snapshot_versions.contains_key(&link.version_id)
+                    || projection
+                        .versions
+                        .contains_key(&link.version_id.to_string());
+                if !known {
+                    return Err(OrgError::Unlinked);
+                }
+            }
+        }
+        Ok(())
     }
 
     fn authorize_publish(

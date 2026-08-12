@@ -55,7 +55,10 @@ pub use envelope::{
     MAX_CONNECT_REASSEMBLED_MESSAGE_BYTES,
 };
 pub use epoch::{ActionEpoch, FocusEpoch, RuntimeGeneration, TurnEpoch};
-pub use evidence::{EvidenceBundle, EvidenceIntake, TaskDraft};
+pub use evidence::{
+    EvidenceAccessClass, EvidenceAdapter, EvidenceBundle, EvidenceIntake,
+    EvidenceMetadataProjection, TaskDraft,
+};
 pub use failure::{
     matrix_covers_direct_and_hosted, simulate_fault, ConnectActor, ConnectRouteKind,
     ConnectSurface, FailureCase, FailureClass, FailureExpectation, SimulatedFaultOutcome,
@@ -84,10 +87,23 @@ pub use invites::{
     RedeemedDevicePublicId, TaskInviteStore, INVITE_SECRET_BYTES, MAX_INVITE_AUDIT_EVENTS,
     MAX_INVITE_LIFETIME_MS, MAX_INVITE_NICKNAME_BYTES, MAX_TASK_INVITES,
 };
-pub use local_actions::{LocalActionReceipt, LocalActionRegistry, LocalActionRequest};
-pub use managed::{ManagedTaskLink, ManagedTaskProjection, TaskLinkReducer};
-pub use org::{OrganizationProjection, StandaloneOrganization};
-pub use org_prompts::{ComposerInsertion, OrganizationPromptProjection};
+pub use local_actions::{
+    LocalActionAdapter, LocalActionAdmissionState, LocalActionCatalogEntry, LocalActionKind,
+    LocalActionReceipt, LocalActionReconcileState, LocalActionRegistry, LocalActionRequest,
+    ReplayPolicy,
+};
+pub use managed::{
+    ManagedTaskAdapter, ManagedTaskLink, ManagedTaskProjection, ManagedTaskSnapshot,
+    TaskLinkReducer,
+};
+pub use org::{
+    OrganizationAdapter, OrganizationFact, OrganizationProjection, OrganizationSyncState,
+    StandaloneOrganization, SyncOutcome,
+};
+pub use org_prompts::{
+    ComposerInsertion, OrganizationPromptAdapter, OrganizationPromptProjection,
+    OrganizationPromptSnapshot,
+};
 pub use permission::{
     ActionId, AuthoritativePermissionContext, ConnectRole, KnownAction, PermissionDecision,
     PermissionDenyReason, PermissionEvaluator, PermissionRequest, ScopedPermissionGrant,
@@ -132,10 +148,11 @@ pub use session::{
 pub use telemetry::{
     encode_observation, ObservationAuthority, ObservationCompleteness, ObservationConfidence,
     ObservationCursor, ObservationDependency, ObservationError, ObservationFreshness,
-    ObservationId, ObservationMessageClass, ObservationPage, ObservationRecord, ObservationReducer,
-    ObservationSchema, PageBudget, ProviderObservation, QualifyingActivity, ReduceOutcome,
-    RestrictiveGitSummary, TaskObservationFacts, UsageKind, UsageMeasure, UsageProvenance,
-    ACTIVE_SESSION_TIME_LABEL, MAX_ACTIVITIES_PER_TASK, MAX_OBSERVATION_DOCUMENT_BYTES,
+    ObservationId, ObservationMessageClass, ObservationOutboxIntent, ObservationPage,
+    ObservationRecord, ObservationReducer, ObservationSchema, ObservationSyncIntent, PageBudget,
+    ProviderObservation, QualifyingActivity, ReduceOutcome, RestrictiveGitSummary,
+    TaskObservationFacts, UsageKind, UsageMeasure, UsageProvenance, ACTIVE_SESSION_TIME_LABEL,
+    MAX_ACTIVITIES_PER_TASK, MAX_OBSERVATION_DOCUMENT_BYTES, MAX_OBSERVATION_OUTBOX_INTENTS,
     MAX_OBSERVATION_RETENTION_MS, MAX_OBSERVATION_TASKS, MAX_READY_INTERVALS, MAX_SPECIALISTS,
     OBSERVATION_SCHEMA_REVISION, OBSERVATION_STALE_AFTER_MS,
 };

@@ -1,8 +1,8 @@
 //! Honest, bounded management observations as a sealed pure reducer.
 //!
-//! This module does not deliver to the kernel outbox or Portal. Those
-//! destinations have no observation effect class yet; delivery APIs return
-//! [`ObservationDependency::DurableOutbox`].
+//! Delivery and organization publication stay local synchronization intents.
+//! They never claim a later transport sent or settled an observation without
+//! an explicit local acknowledgement of that intent.
 //!
 //! Canonical types reused from the base: [`TaskId`], [`EventId`], [`ClientId`],
 //! [`TaskLifecycle`], [`TaskAttention`], [`TaskConnectivity`], [`TaskActivity`],
@@ -10,10 +10,6 @@
 //! There is no domain `ObservationId`, `DeviceKind`, `HostHealth`, or message
 //! origin type; local identifiers and message classes stay specific to this
 //! reducer and are not a second provider/task universe.
-//!
-//! Missing dependencies:
-//! - `src/kernel/outbox.rs` has no observation `DestinationClass` / `Effect`
-//! - Portal `DevManagerTaskObservation` / telemetry service are out of scope
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -57,6 +53,7 @@ pub const MAX_GIT_FILE_CHANGES: u32 = 10_000;
 pub const MAX_OBSERVATION_DOCUMENT_BYTES: usize = 16_384;
 pub const MAX_OBSERVATION_RETENTION_MS: u64 = 24 * 60 * 60 * 1_000;
 pub const ACTIVE_SESSION_TIME_LABEL: &str = "active session time";
+pub const MAX_OBSERVATION_OUTBOX_INTENTS: usize = MAX_OBSERVATION_TASKS * MAX_READY_INTERVALS;
 
 const MAX_SEEN_EVENTS: usize = MAX_OBSERVATION_TASKS * MAX_ACTIVITIES_PER_TASK;
 const MAX_JSON_NESTING: usize = 8;
@@ -365,6 +362,14 @@ fn bind_error(_: GrantBindError) -> ObservationError {
     ObservationError::Unavailable(ObservationDependency::AuthoritativeSource)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservationSyncIntent {
+    LocalRecord,
+    OutboxQueued,
+    LocallyAcknowledged,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ObservationId([u8; 32]);
 
@@ -385,6 +390,13 @@ impl ObservationId {
         }
         Ok(Self(bytes))
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObservationOutboxIntent {
+    pub observation_id: ObservationId,
+    pub intent: ObservationSyncIntent,
+    pub publication_queued: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1105,6 +1117,7 @@ pub struct ObservationReducer {
     tasks: BTreeMap<TaskId, TaskState>,
     seen: BTreeMap<EventId, [u8; 32]>,
     frozen: BTreeMap<IntervalKey, ObservationRecord>,
+    outbox: BTreeMap<ObservationId, ObservationOutboxIntent>,
     #[cfg(test)]
     revoke_before_commit: AtomicBool,
     #[cfg(test)]
@@ -1120,6 +1133,7 @@ impl fmt::Debug for ObservationReducer {
             .field("tasks", &self.tasks.len())
             .field("seen", &self.seen.len())
             .field("frozen", &self.frozen.len())
+            .field("outbox", &self.outbox.len())
             .finish()
     }
 }
@@ -1136,6 +1150,7 @@ impl ObservationReducer {
             tasks: BTreeMap::new(),
             seen: BTreeMap::new(),
             frozen: BTreeMap::new(),
+            outbox: BTreeMap::new(),
             #[cfg(test)]
             revoke_before_commit: AtomicBool::new(false),
             #[cfg(test)]
@@ -1583,28 +1598,98 @@ impl ObservationReducer {
         })
     }
 
-    pub fn request_delivery(&self, _id: ObservationId) -> Result<ReduceOutcome, ObservationError> {
+    pub fn request_delivery(
+        &mut self,
+        id: ObservationId,
+    ) -> Result<ReduceOutcome, ObservationError> {
         self.ensure_live()?;
-        Err(ObservationError::Unavailable(
-            ObservationDependency::DurableOutbox,
-        ))
+        if !self.observation_known(id)? {
+            return Err(ObservationError::Unavailable(
+                ObservationDependency::AuthoritativeSource,
+            ));
+        }
+        match self.outbox.get(&id).map(|slot| slot.intent) {
+            Some(ObservationSyncIntent::OutboxQueued)
+            | Some(ObservationSyncIntent::LocallyAcknowledged) => Ok(ReduceOutcome::Duplicate),
+            Some(ObservationSyncIntent::LocalRecord) | None => {
+                if self.outbox.len() >= MAX_OBSERVATION_OUTBOX_INTENTS
+                    && !self.outbox.contains_key(&id)
+                {
+                    return Err(ObservationError::BoundExceeded);
+                }
+                self.outbox.insert(
+                    id,
+                    ObservationOutboxIntent {
+                        observation_id: id,
+                        intent: ObservationSyncIntent::OutboxQueued,
+                        publication_queued: false,
+                    },
+                );
+                Ok(ReduceOutcome::Accepted)
+            }
+        }
     }
 
-    pub fn acknowledge(&mut self, _id: ObservationId) -> Result<ReduceOutcome, ObservationError> {
+    pub fn acknowledge(&mut self, id: ObservationId) -> Result<ReduceOutcome, ObservationError> {
         self.ensure_live()?;
-        Err(ObservationError::Unavailable(
-            ObservationDependency::DurableOutbox,
-        ))
+        match self.outbox.get_mut(&id) {
+            Some(slot) if slot.intent == ObservationSyncIntent::OutboxQueued => {
+                slot.intent = ObservationSyncIntent::LocallyAcknowledged;
+                Ok(ReduceOutcome::Accepted)
+            }
+            Some(slot) if slot.intent == ObservationSyncIntent::LocallyAcknowledged => {
+                Ok(ReduceOutcome::Duplicate)
+            }
+            Some(_) | None => Err(ObservationError::Unavailable(
+                ObservationDependency::AuthoritativeSource,
+            )),
+        }
     }
 
     pub fn request_organization_publication(
-        &self,
-        _id: ObservationId,
+        &mut self,
+        id: ObservationId,
     ) -> Result<ReduceOutcome, ObservationError> {
         self.ensure_live()?;
-        Err(ObservationError::Unavailable(
-            ObservationDependency::PortalObservationEffect,
-        ))
+        if !self.observation_known(id)? {
+            return Err(ObservationError::Unavailable(
+                ObservationDependency::AuthoritativeSource,
+            ));
+        }
+        if !self.outbox.contains_key(&id) && self.outbox.len() >= MAX_OBSERVATION_OUTBOX_INTENTS {
+            return Err(ObservationError::BoundExceeded);
+        }
+        let slot = self.outbox.entry(id).or_insert(ObservationOutboxIntent {
+            observation_id: id,
+            intent: ObservationSyncIntent::LocalRecord,
+            publication_queued: false,
+        });
+        if slot.publication_queued {
+            return Ok(ReduceOutcome::Duplicate);
+        }
+        slot.publication_queued = true;
+        Ok(ReduceOutcome::Accepted)
+    }
+
+    pub fn sync_intent(&self, id: ObservationId) -> Option<ObservationOutboxIntent> {
+        self.outbox.get(&id).copied()
+    }
+
+    fn observation_known(&self, id: ObservationId) -> Result<bool, ObservationError> {
+        if self
+            .frozen
+            .values()
+            .any(|record| record.observation_id == id)
+        {
+            return Ok(true);
+        }
+        match self.current_observation(self.authority.bound_task_id()) {
+            Ok(record) => Ok(record.observation_id == id),
+            Err(ObservationError::Unavailable(ObservationDependency::AuthoritativeSource)) => {
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn page_frozen(
@@ -3173,5 +3258,106 @@ fn bounded_string<E: de::Error>(value: String) -> Result<String, E> {
         Err(E::custom("string exceeds bound"))
     } else {
         Ok(value)
+    }
+}
+
+#[cfg(test)]
+mod telemetry_sync_tests {
+    use super::*;
+    use crate::connect::policy::ManagementGrant;
+    use crate::domain::id::{ClientId, EventId, TaskId};
+    use crate::domain::task::{TaskAttention, TaskConnectivity, TaskLifecycle};
+
+    fn reducer() -> (ManagementGrant, ObservationReducer) {
+        let task_id = TaskId::new();
+        let grant = ManagementGrant::issued_for_test(task_id);
+        let authority = ObservationAuthority::from_grant(&grant).expect("authority");
+        let reducer = ObservationReducer::from_host_time(1_000, authority).expect("reducer");
+        (grant, reducer)
+    }
+
+    #[test]
+    fn delivery_queues_local_outbox_intent_without_claiming_sent() {
+        let (grant, mut reducer) = reducer();
+        let task_id = grant.task_id();
+        let event_id = EventId::new();
+        reducer
+            .record_task_facts(
+                &grant,
+                TaskObservationFacts::try_new(
+                    task_id,
+                    TaskLifecycle::Open,
+                    TaskAttention::None,
+                    TaskConnectivity::Connected,
+                    None,
+                    Vec::new(),
+                    900,
+                    1,
+                )
+                .expect("facts"),
+            )
+            .expect("record facts");
+        reducer
+            .record_activity(
+                &grant,
+                QualifyingActivity::AcceptedHumanCommand {
+                    task_id,
+                    client_id: ClientId::new(),
+                    event_id,
+                },
+            )
+            .expect("activity");
+        let record = reducer.current_observation(task_id).expect("current");
+        let id = record.observation_id();
+        assert_eq!(
+            reducer.request_delivery(id).expect("queue"),
+            ReduceOutcome::Accepted
+        );
+        let intent = reducer.sync_intent(id).expect("intent");
+        assert_eq!(intent.intent, ObservationSyncIntent::OutboxQueued);
+        assert!(!intent.publication_queued);
+        assert_eq!(
+            reducer.request_delivery(id).expect("duplicate"),
+            ReduceOutcome::Duplicate
+        );
+        assert_eq!(
+            reducer.acknowledge(id).expect("ack"),
+            ReduceOutcome::Accepted
+        );
+        assert_eq!(
+            reducer.sync_intent(id).expect("acked").intent,
+            ObservationSyncIntent::LocallyAcknowledged
+        );
+        assert_eq!(
+            reducer
+                .request_organization_publication(id)
+                .expect("publish intent"),
+            ReduceOutcome::Accepted
+        );
+        assert!(reducer.sync_intent(id).expect("pub").publication_queued);
+        assert_eq!(
+            reducer
+                .request_organization_publication(id)
+                .expect("publish duplicate"),
+            ReduceOutcome::Duplicate
+        );
+    }
+
+    #[test]
+    fn unknown_observation_cannot_be_queued() {
+        let (_grant, mut reducer) = reducer();
+        let missing = ObservationId([0_u8; 32]);
+        assert_eq!(
+            reducer.request_delivery(missing),
+            Err(ObservationError::Unavailable(
+                ObservationDependency::AuthoritativeSource
+            ))
+        );
+        assert_eq!(
+            reducer.acknowledge(missing),
+            Err(ObservationError::Unavailable(
+                ObservationDependency::AuthoritativeSource
+            ))
+        );
     }
 }
