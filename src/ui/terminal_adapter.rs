@@ -82,6 +82,13 @@ impl TerminalDockAdapter {
         self.preferences = preferences;
     }
 
+    /// Bind or clear the established pane model without synthesizing identity.
+    /// `None` keeps the typed unavailable state; `Some` requires a complete
+    /// caller-owned [`TerminalPaneModel`].
+    pub fn rebind(&mut self, model: Option<TerminalPaneModel>) {
+        self.model = model;
+    }
+
     pub fn state(&self) -> TerminalDockState {
         if self.model.is_some() {
             TerminalDockState::live()

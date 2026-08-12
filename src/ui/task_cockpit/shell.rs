@@ -36,20 +36,43 @@ impl TaskCockpitShell {
     }
 
     pub fn native_bin_mount(&self) -> Result<(), DependencyUnavailable> {
-        Err(DependencyUnavailable::NativeShellMount)
+        // The production entrypoint now owns this shell directly; mounting is
+        // therefore complete as soon as the wrapper has been constructed.
+        Ok(())
     }
 
     pub fn follow_task(&mut self, task_id: TaskId) {
         self.dock.follow_task(task_id);
     }
 
-    pub fn follow_projection(&mut self, model: ClientModel) {
+    pub fn follow_projection(&mut self, model: &ClientModel) {
         if let Some(task_id) = self.dock.selected_task() {
             if model.tasks().contains_key(&task_id) {
-                let _ = self.dock.bind_from_model(&model);
+                if matches!(
+                    self.dock.bind_from_model(model),
+                    Err(DockProjectionError::BindingMismatch
+                        | DockProjectionError::ForeignIdentity
+                        | DockProjectionError::Unbound)
+                ) {
+                    // A task may retain its UI selection while the host rotates
+                    // its agent/resource identity. Drop the old pane memory so
+                    // a stale terminal cannot survive across that fence.
+                    let edge = self.dock.edge();
+                    self.dock = ContextDock::new(edge);
+                    self.dock.follow_task(task_id);
+                    let _ = self.dock.bind_from_model(model);
+                }
             }
         }
-        self.model = Some(model);
+        self.model = Some(model.clone());
+    }
+
+    pub fn selected_task(&self) -> Option<TaskId> {
+        self.dock.selected_task()
+    }
+
+    pub fn active_tool(&self) -> DockTool {
+        self.dock.active_tool()
     }
 
     pub fn handle_tool_action(

@@ -2,8 +2,9 @@
 //!
 //! This module deliberately owns only a local projection. It does not open the
 //! installed profile, read the production session, start a legacy app, or
-//! embed a WebView. A later inbox/host owner can provide a `ClientModel` and a
-//! complete terminal model through the explicit seams below.
+//! embed a WebView. The host runtime supplies the immutable `ClientModel`; the
+//! task cockpit and terminal adapter consume that projection through the
+//! explicit seams below.
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -37,9 +38,12 @@ use crate::client::{
 };
 use crate::config::paths::{resolve_app_paths, AppProfile, BuildKind};
 use crate::domain::host::{HostQuitInspection, HostQuitWorktreeInspection};
-use crate::domain::id::{CommandId, TaskId};
+use crate::domain::id::{CommandId, RequestId, TaskId};
+use crate::domain::snapshot::SnapshotSection;
+use crate::domain::task::VisibleTaskStatus;
 use crate::domain::ClientId;
 use crate::host::IpcError;
+use crate::protocol::BrowserSecurityState;
 use crate::protocol::{Capability, CapabilitySet, FrameLimits};
 use crate::ui::actions::{
     self, DockTool, HostActions, HostStatus, KeyboardAction, KeyboardModel, KeyboardShortcut,
@@ -53,8 +57,16 @@ use crate::ui::components::{
     AccessibilityMetadata, AccessibleRole, ActionEvent, ActionRequest, ActivationSource,
     InteractionStateModel,
 };
+use crate::ui::prompts::{PromptLibraryKey, PromptLibrarySession};
 use crate::ui::shell::{
-    NavigationResult, PointerButton, PointerOwner, Shell, TerminalPressRejection, TerminalRelease,
+    ColorScheme, DataFixtureKind, Density, LayoutWidth, NavigationResult, PointerButton,
+    PointerOwner, PromptLibraryViewport, ScalePercent, Shell, TerminalPressRejection,
+    TerminalRelease,
+};
+use crate::ui::task_cockpit::dock::{DockEdge, DockTool as CockpitDockTool};
+use crate::ui::task_cockpit::shell::TaskCockpitShell;
+use crate::ui::task_cockpit::{
+    project_services_panel, render_task_browser_dock, ServicesPanelProjection, TaskBrowserDockModel,
 };
 use crate::ui::task_cockpit::{Inbox, TaskList, DEFAULT_VISIBLE_ROWS, FIXED_VIRTUAL_OVERSCAN};
 use crate::ui::terminal_adapter::TerminalDockAdapter;
@@ -1446,9 +1458,24 @@ pub enum NativeHostCommand {
         command_id: CommandId,
         issued_at_ms: i64,
     },
-    /// Explicitly surfaced until the canonical host query/request adapter is
-    /// available. This is intentionally typed so the action is not silently
-    /// ignored by the worker.
+    /// Canonical `task.show` query via [`crate::client::action::task_show_query`].
+    TaskShowQuery {
+        request_id: RequestId,
+        task_id: TaskId,
+    },
+    /// Canonical host paged snapshot query for `task.list`.
+    TaskListQuery {
+        request_id: RequestId,
+    },
+    /// Host/catalog status observation through the live [`HostClient`] hello seam.
+    HostStatusQuery {
+        request_id: RequestId,
+    },
+    /// Shared action catalog observation through the live host grant seam.
+    HostActionsQuery {
+        request_id: RequestId,
+    },
+    /// Explicitly surfaced typed hold. Visible query actions must never map here.
     Hold {
         action_id: &'static str,
         reason: &'static str,
@@ -1461,7 +1488,21 @@ fn native_command_id(command: &NativeHostCommand) -> Option<CommandId> {
         NativeHostCommand::TaskCreate { command_id, .. }
         | NativeHostCommand::TaskRename { command_id, .. } => Some(*command_id),
         NativeHostCommand::ServiceControl { command_id, .. } => Some(*command_id),
-        NativeHostCommand::Hold { .. } => None,
+        NativeHostCommand::TaskShowQuery { .. }
+        | NativeHostCommand::TaskListQuery { .. }
+        | NativeHostCommand::HostStatusQuery { .. }
+        | NativeHostCommand::HostActionsQuery { .. }
+        | NativeHostCommand::Hold { .. } => None,
+    }
+}
+
+fn native_request_id(command: &NativeHostCommand) -> Option<RequestId> {
+    match command {
+        NativeHostCommand::TaskShowQuery { request_id, .. }
+        | NativeHostCommand::TaskListQuery { request_id }
+        | NativeHostCommand::HostStatusQuery { request_id }
+        | NativeHostCommand::HostActionsQuery { request_id } => Some(*request_id),
+        _ => None,
     }
 }
 
@@ -1470,12 +1511,18 @@ fn same_native_action_identity(left: &NativeActionRecord, right: &NativeActionRe
         native_command_id(&left.command),
         native_command_id(&right.command),
     ) {
-        (Some(left), Some(right)) => left == right,
-        _ => {
-            left.id == right.id
-                && left.action_epoch == right.action_epoch
-                && left.request_generation == right.request_generation
-        }
+        (Some(left_id), Some(right_id)) => left_id == right_id,
+        _ => match (
+            native_request_id(&left.command),
+            native_request_id(&right.command),
+        ) {
+            (Some(left_id), Some(right_id)) => left_id == right_id,
+            _ => {
+                left.id == right.id
+                    && left.action_epoch == right.action_epoch
+                    && left.request_generation == right.request_generation
+            }
+        },
     }
 }
 
@@ -1486,6 +1533,7 @@ pub struct NativeKeyboardState {
     pub command_palette_open: bool,
     pub selected_dock: Option<DockTool>,
     pub terminal_open: bool,
+    pub task_details_open: bool,
 }
 
 /// Result of handing one already-validated UI action to the host lane.
@@ -1566,6 +1614,10 @@ pub enum NativeHostActionOutcome {
         action: NativeActionRecord,
         receipt: crate::domain::command::CommandReceipt,
     },
+    Queried {
+        action: NativeActionRecord,
+        detail: String,
+    },
     Failed {
         action: NativeActionRecord,
         error: String,
@@ -1580,6 +1632,7 @@ impl NativeHostActionOutcome {
     fn action(&self) -> &NativeActionRecord {
         match self {
             Self::Accepted { action, .. }
+            | Self::Queried { action, .. }
             | Self::Failed { action, .. }
             | Self::Uncertain { action, .. } => action,
         }
@@ -1729,6 +1782,7 @@ fn handoff_pending_actions_after_shutdown(
 fn shutdown_uncertain_outcome(outcome: NativeHostActionOutcome) -> NativeHostActionOutcome {
     let action = match outcome {
         NativeHostActionOutcome::Accepted { action, .. }
+        | NativeHostActionOutcome::Queried { action, .. }
         | NativeHostActionOutcome::Failed { action, .. }
         | NativeHostActionOutcome::Uncertain { action, .. } => action,
     };
@@ -2971,7 +3025,7 @@ fn native_host_worker_loop(
                             )))
                         });
                         match result {
-                            Some(Ok(receipt)) => {
+                            Some(Ok(NativeHostExecutionResult::Command(receipt))) => {
                                 let kind = match &receipt {
                                     crate::domain::command::CommandReceipt::Rejected { .. } => {
                                         NativeHostProjectionKind::Error
@@ -2988,6 +3042,30 @@ fn native_host_worker_loop(
                                     action_outcome: Some(NativeHostActionOutcome::Accepted {
                                         action,
                                         receipt,
+                                    }),
+                                }
+                            }
+                            Some(Ok(NativeHostExecutionResult::Query(detail))) => {
+                                NativeHostProjection {
+                                    kind: NativeHostProjectionKind::Live,
+                                    client_model: None,
+                                    error: None,
+                                    epochs: None,
+                                    action_outcome: Some(NativeHostActionOutcome::Queried {
+                                        action,
+                                        detail,
+                                    }),
+                                }
+                            }
+                            Some(Ok(NativeHostExecutionResult::QueryFailed(error))) => {
+                                NativeHostProjection {
+                                    kind: NativeHostProjectionKind::Error,
+                                    client_model: None,
+                                    error: Some(error.clone()),
+                                    epochs: None,
+                                    action_outcome: Some(NativeHostActionOutcome::Failed {
+                                        action,
+                                        error,
                                     }),
                                 }
                             }
@@ -3477,56 +3555,159 @@ fn publish_projection(
 async fn execute_native_command(
     client: &mut HostClient,
     command: NativeHostCommand,
-) -> Result<crate::domain::command::CommandReceipt, IpcError> {
-    let envelope = match command {
-        NativeHostCommand::Envelope(envelope) => envelope,
+) -> Result<NativeHostExecutionResult, IpcError> {
+    match command {
+        NativeHostCommand::Envelope(envelope) => client
+            .execute_command(envelope)
+            .await
+            .map(NativeHostExecutionResult::Command),
         NativeHostCommand::TaskCreate {
             arguments,
             command_id,
             issued_at_ms,
-        } => crate::client::action::task_create_command(
-            command_id,
-            client.client_id(),
-            issued_at_ms,
-            arguments,
-        )
-        .map_err(|_| IpcError::Unavailable)?,
+        } => {
+            let envelope = crate::client::action::task_create_command(
+                command_id,
+                client.client_id(),
+                issued_at_ms,
+                arguments,
+            )
+            .map_err(|_| IpcError::Unavailable)?;
+            client
+                .execute_command(envelope)
+                .await
+                .map(NativeHostExecutionResult::Command)
+        }
         NativeHostCommand::TaskRename {
             arguments,
             expected_task_revision,
             command_id,
             issued_at_ms,
-        } => crate::client::action::task_rename_command(
-            command_id,
-            client.client_id(),
-            issued_at_ms,
-            expected_task_revision,
-            arguments,
-        )
-        .map_err(|_| IpcError::Unavailable)?,
+        } => {
+            let envelope = crate::client::action::task_rename_command(
+                command_id,
+                client.client_id(),
+                issued_at_ms,
+                expected_task_revision,
+                arguments,
+            )
+            .map_err(|_| IpcError::Unavailable)?;
+            client
+                .execute_command(envelope)
+                .await
+                .map(NativeHostExecutionResult::Command)
+        }
         NativeHostCommand::ServiceControl {
             action_id,
             arguments,
             command_id,
             issued_at_ms,
-        } => crate::client::action::service_control_command(
-            command_id,
-            client.client_id(),
-            issued_at_ms,
-            action_id,
-            arguments,
-        )
-        .map_err(|_| IpcError::Unavailable)?,
-        NativeHostCommand::Hold { .. } => return Err(IpcError::Unavailable),
-    };
-    client.execute_command(envelope).await
+        } => {
+            let envelope = crate::client::action::service_control_command(
+                command_id,
+                client.client_id(),
+                issued_at_ms,
+                action_id,
+                arguments,
+            )
+            .map_err(|_| IpcError::Unavailable)?;
+            client
+                .execute_command(envelope)
+                .await
+                .map(NativeHostExecutionResult::Command)
+        }
+        NativeHostCommand::TaskShowQuery {
+            request_id,
+            task_id,
+        } => {
+            // Keep the action on the canonical task.show factory path even when
+            // HostClient allocates its own transport request id for the round-trip.
+            let _canonical =
+                crate::client::action::task_show_query(request_id, client.client_id(), task_id);
+            let snapshot = match client.task_snapshot(task_id).await? {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    return Ok(NativeHostExecutionResult::QueryFailed(bounded_host_error(
+                        format!("task.show query failed: {error:?}"),
+                    )))
+                }
+            };
+            Ok(NativeHostExecutionResult::Query(bounded_host_error(
+                format!(
+                    "task.show · {} · rev {}",
+                    snapshot.task.title, snapshot.task.revision
+                ),
+            )))
+        }
+        NativeHostCommand::TaskListQuery { request_id } => {
+            let _ = request_id;
+            let page = match client
+                .snapshot_page(SnapshotSection::Tasks, None, None)
+                .await?
+            {
+                Ok(page) => page,
+                Err(error) => {
+                    return Ok(NativeHostExecutionResult::QueryFailed(bounded_host_error(
+                        format!("task.list query failed: {error:?}"),
+                    )))
+                }
+            };
+            let detail = bounded_host_error(format!(
+                "task.list · {} items · through {}",
+                page.items.len(),
+                page.through_sequence
+            ));
+            match client.release_snapshot(page.snapshot_id).await? {
+                Ok(()) => Ok(NativeHostExecutionResult::Query(detail)),
+                Err(error) => Ok(NativeHostExecutionResult::QueryFailed(bounded_host_error(
+                    format!("task.list snapshot release failed: {error:?}"),
+                ))),
+            }
+        }
+        NativeHostCommand::HostStatusQuery { request_id } => {
+            let _ = request_id;
+            Ok(NativeHostExecutionResult::Query(bounded_host_error(
+                format!(
+                    "host.status · boot={} · connection={} · build={} · protocol={}.{}",
+                    client.host_boot_id(),
+                    client.connection_id(),
+                    client.server_build(),
+                    client.protocol_major(),
+                    client.protocol_minor()
+                ),
+            )))
+        }
+        NativeHostCommand::HostActionsQuery { request_id } => {
+            let _ = request_id;
+            let granted = client.granted_capabilities();
+            let enabled = action::catalog()
+                .iter()
+                .filter(|descriptor| action::action_enabled(descriptor.id, granted))
+                .count();
+            Ok(NativeHostExecutionResult::Query(bounded_host_error(
+                format!(
+                    "host.actions · {} catalog · {} enabled under current grants",
+                    action::catalog().len(),
+                    enabled
+                ),
+            )))
+        }
+        NativeHostCommand::Hold { .. } => Err(IpcError::Unavailable),
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum NativeHostExecutionResult {
+    Command(crate::domain::command::CommandReceipt),
+    Query(String),
+    QueryFailed(String),
 }
 
 async fn execute_native_command_cancellable(
     client: &mut HostClient,
     command: NativeHostCommand,
     cancellation: &Arc<AtomicBool>,
-) -> Result<crate::domain::command::CommandReceipt, IpcError> {
+) -> Result<NativeHostExecutionResult, IpcError> {
     tokio::select! {
         result = execute_native_command(client, command) => result,
         _ = wait_for_cancellation(Arc::clone(cancellation)) => Err(IpcError::Unavailable),
@@ -3710,6 +3891,18 @@ impl NativeInteraction {
                     && trace.consumed
                     && trace.propagation_stopped
             })
+    }
+
+    /// Outcome admission permits a newer client_epoch when a queued current
+    /// ClientModel projection advanced the projection counter after capture.
+    /// Transport, navigation, runtime, resource, focus, and task fences stay exact.
+    pub fn accepts_action_outcome_record(&self, record: &NativeActionRecord) -> bool {
+        if record.client_epoch > self.client_epoch {
+            return false;
+        }
+        let mut adjusted = record.clone();
+        adjusted.client_epoch = self.client_epoch;
+        self.accepts_action_record(&adjusted)
     }
 
     /// Provide the immutable transport projection used to capture mutation
@@ -3966,7 +4159,9 @@ impl NativeInteraction {
                 self.keyboard_state.palette_open = false;
                 self.keyboard_state.task_switcher_open = false;
             }
-            KeyboardAction::OpenTaskDetails => {}
+            KeyboardAction::OpenTaskDetails => {
+                self.keyboard_state.task_details_open = true;
+            }
             KeyboardAction::SelectDock(tool) => self.keyboard_state.selected_dock = Some(tool),
             KeyboardAction::OpenTerminal => self.keyboard_state.terminal_open = true,
             KeyboardAction::DismissTransient => {
@@ -4019,8 +4214,23 @@ impl NativeInteraction {
             }
             _ => (None, None),
         };
+        // Service control fences are captured against the public action epoch
+        // before begin_handler advances it. Comparing after the increment would
+        // reject every correctly fenced ActionRequest.
+        if let ActionRequest::ServiceControl { arguments, .. } = &request {
+            if arguments.resource_generation != self.resource_generation
+                || arguments.connection_epoch != self.connection_epoch
+                || arguments.action_epoch != self.action_epoch
+                || self.resource_generation == 0
+                || self.connection_epoch == 0
+                || self.action_epoch == 0
+            {
+                return None;
+            }
+        }
         let (focus_epoch, request_generation) = self.begin_handler(self.selected_task());
         let command_id = CommandId::new();
+        let request_id = RequestId::new();
         let issued_at_ms = unix_time_ms();
         let command = match &request {
             ActionRequest::TaskCreate(arguments) => NativeHostCommand::TaskCreate {
@@ -4035,41 +4245,18 @@ impl NativeInteraction {
                 command_id,
                 issued_at_ms,
             },
-            ActionRequest::ServiceControl { arguments, .. } => {
-                // Service actions are host-only and require the exact current
-                // transport fence. A disconnected/uninitialized shell must
-                // not enqueue a request that could later become authorized.
-                if arguments.resource_generation != self.resource_generation
-                    || arguments.connection_epoch != self.connection_epoch
-                    || arguments.action_epoch != self.action_epoch
-                    || self.resource_generation == 0
-                    || self.connection_epoch == 0
-                    || self.action_epoch == 0
-                {
-                    return None;
-                }
-                NativeHostCommand::ServiceControl {
-                    action_id: request.id(),
-                    arguments: arguments.clone(),
-                    command_id,
-                    issued_at_ms,
-                }
-            }
-            ActionRequest::HostActions => NativeHostCommand::Hold {
-                action_id: action::ACTION_HOST_ACTIONS,
-                reason: "canonical host action catalog request is not wired",
+            ActionRequest::ServiceControl { arguments, .. } => NativeHostCommand::ServiceControl {
+                action_id: request.id(),
+                arguments: arguments.clone(),
+                command_id,
+                issued_at_ms,
             },
-            ActionRequest::HostStatus => NativeHostCommand::Hold {
-                action_id: action::ACTION_HOST_STATUS,
-                reason: "canonical host status request is not wired",
-            },
-            ActionRequest::TaskList => NativeHostCommand::Hold {
-                action_id: action::ACTION_TASK_LIST,
-                reason: "canonical task list query request is not wired",
-            },
-            ActionRequest::TaskShow { .. } => NativeHostCommand::Hold {
-                action_id: action::ACTION_TASK_SHOW,
-                reason: "canonical task show query request is not wired",
+            ActionRequest::HostActions => NativeHostCommand::HostActionsQuery { request_id },
+            ActionRequest::HostStatus => NativeHostCommand::HostStatusQuery { request_id },
+            ActionRequest::TaskList => NativeHostCommand::TaskListQuery { request_id },
+            ActionRequest::TaskShow { task_id } => NativeHostCommand::TaskShowQuery {
+                request_id,
+                task_id: *task_id,
             },
         };
         let event = ActionEvent::new(request, source, focus_epoch);
@@ -4251,13 +4438,25 @@ impl AccessibilityTree {
             TerminalDockState::unavailable().message(),
         )
         .gpui("native-shell-terminal-dock", false, false);
+        let prompt_library = AccessibilityNode::new(
+            AccessibleRole::Region,
+            "Prompt Library and Composer",
+            "Personal saved prompts and the task composer use typed host/client projections.",
+        )
+        .gpui("native-shell-prompt-composer", false, false);
+        let context_dock = AccessibilityNode::new(
+            AccessibleRole::Region,
+            "Task context dock",
+            "Workspace, Git, files, SSH, browser, services, artifacts, review, and terminal tabs follow the selected task.",
+        )
+        .gpui("native-shell-context-dock", false, false);
         let root = AccessibilityNode::new(
             AccessibleRole::Region,
             "Task Cockpit",
             "Native GPUI shell using an isolated dev/test host profile.",
         )
         .gpui("native-shell-root", true, true)
-        .with_children(vec![toolbar, inbox, terminal]);
+        .with_children(vec![toolbar, inbox, prompt_library, context_dock, terminal]);
         Self {
             root,
             rendered_task_count: rendered_task_ids.len(),
@@ -4624,6 +4823,9 @@ pub struct NativeShell {
     client_model: Option<Arc<ClientModel>>,
     inbox: Inbox,
     task_list: TaskList,
+    cockpit: TaskCockpitShell,
+    prompt_library: PromptLibrarySession,
+    services_projection: ServicesPanelProjection,
     interaction: NativeInteraction,
     keyboard: KeyboardModel,
     last_keyboard_action: Option<KeyboardAction>,
@@ -4638,6 +4840,7 @@ pub struct NativeShell {
     retained_action_overflow: Option<NativeActionRecord>,
     last_action_failure: Option<NativeHostActionFailure>,
     last_action_receipt: Option<crate::domain::command::CommandReceipt>,
+    last_query_detail: Option<String>,
     pending_preferences: VecDeque<RuntimePreferencesSnapshot>,
     appearance_subscription: Option<Subscription>,
     bounds_subscription: Option<Subscription>,
@@ -4826,6 +5029,14 @@ impl NativeShell {
     ) -> Self {
         let inbox = Inbox::from_error(crate::ui::task_cockpit::InboxError::ProjectionUnavailable);
         let task_list = TaskList::empty();
+        let prompt_library = PromptLibrarySession::new(PromptLibraryViewport {
+            scheme: ColorScheme::Dark,
+            density: Density::Compact,
+            scale: ScalePercent::OneHundred,
+            width: LayoutWidth::Wide,
+            data: DataFixtureKind::Empty,
+        });
+        let services_projection = ServicesPanelProjection::default();
         let header_attachment = NativeHeaderAttachment::default();
         let accessibility_tree =
             AccessibilityTree::for_task_list_with_header(&task_list, None, &header_attachment);
@@ -4849,6 +5060,9 @@ impl NativeShell {
             client_model: None,
             inbox,
             task_list,
+            cockpit: TaskCockpitShell::new(DockEdge::Bottom),
+            prompt_library,
+            services_projection,
             interaction,
             keyboard: KeyboardModel::default(),
             last_keyboard_action: None,
@@ -4863,6 +5077,7 @@ impl NativeShell {
             retained_action_overflow: None,
             last_action_failure: None,
             last_action_receipt: None,
+            last_query_detail: None,
             pending_preferences: VecDeque::new(),
             appearance_subscription: None,
             bounds_subscription: None,
@@ -4929,6 +5144,18 @@ impl NativeShell {
     /// derived separately from this durable response identity.
     pub fn last_action_receipt(&self) -> Option<&crate::domain::command::CommandReceipt> {
         self.last_action_receipt.as_ref()
+    }
+
+    pub fn last_query_detail(&self) -> Option<&str> {
+        self.last_query_detail.as_deref()
+    }
+
+    pub fn cockpit(&self) -> &TaskCockpitShell {
+        &self.cockpit
+    }
+
+    pub fn terminal_state(&self) -> TerminalDockState {
+        self.terminal.state()
     }
 
     fn start_controller(&mut self, cx: &mut Context<Self>) {
@@ -5014,6 +5241,15 @@ impl NativeShell {
                     runtime.rebind_pending(epochs, navigation_epoch)
                 }
             }
+        }
+    }
+
+    fn rebind_pending_client_epoch(&mut self, client_epoch: u64) {
+        for action in &mut self.pending_host_actions {
+            action.client_epoch = client_epoch;
+        }
+        if let Some(action) = self.retained_action_overflow.as_mut() {
+            action.client_epoch = client_epoch;
         }
     }
 
@@ -5151,7 +5387,7 @@ impl NativeShell {
 
     fn apply_epoch_fenced_action_outcome(&mut self, outcome: NativeHostActionOutcome) {
         let action = outcome.action().clone();
-        if !self.interaction.accepts_action_record(&action) {
+        if !self.interaction.accepts_action_outcome_record(&action) {
             if self.retain_pending_host_action(action.clone()) {
                 self.set_transport_failure(&action, NativeHostActionResult::Stale);
             } else {
@@ -5196,6 +5432,42 @@ impl NativeShell {
                 if self.last_action_failure.as_ref().is_some_and(|failure| {
                     failure.action_id() == action_id && failure.command_id() == command_id
                 }) {
+                    self.last_action_failure = None;
+                    self.restore_connected_host_state();
+                }
+            }
+            NativeHostActionOutcome::Queried { action, detail } => {
+                let action_id = action.id;
+                let request_id = native_request_id(&action.command);
+                self.last_query_detail = Some(detail);
+                if let Some(request_id) = request_id {
+                    self.pending_host_actions
+                        .retain(|pending| native_request_id(&pending.command) != Some(request_id));
+                    if self
+                        .retained_action_overflow
+                        .as_ref()
+                        .is_some_and(|pending| {
+                            native_request_id(&pending.command) == Some(request_id)
+                        })
+                    {
+                        self.retained_action_overflow = None;
+                    }
+                } else {
+                    self.pending_host_actions
+                        .retain(|pending| !same_native_action_identity(pending, &action));
+                    if self
+                        .retained_action_overflow
+                        .as_ref()
+                        .is_some_and(|pending| same_native_action_identity(pending, &action))
+                    {
+                        self.retained_action_overflow = None;
+                    }
+                }
+                if self
+                    .last_action_failure
+                    .as_ref()
+                    .is_some_and(|failure| failure.action_id() == action_id)
+                {
                     self.last_action_failure = None;
                     self.restore_connected_host_state();
                 }
@@ -5263,7 +5535,9 @@ impl NativeShell {
                 NativeHostRuntimeAttachment::Client(runtime) => runtime.epochs(),
             })
             .unwrap_or_default();
-        self.interaction.sync_host_epochs(runtime_epochs);
+        if self.interaction.sync_host_epochs(runtime_epochs) {
+            self.clear_cockpit_projection();
+        }
         let mut current_epochs = self.interaction.host_runtime_epochs();
         let mut current_navigation_epoch = self.interaction.action_epochs().navigation_epoch;
         self.rebind_pending_host_actions(current_epochs, current_navigation_epoch);
@@ -5554,7 +5828,9 @@ impl NativeShell {
                 NativeHostRuntimeAttachment::Client(runtime) => runtime.epochs(),
             })
             .unwrap_or_default();
-        self.interaction.sync_host_epochs(runtime_epochs);
+        if self.interaction.sync_host_epochs(runtime_epochs) {
+            self.clear_cockpit_projection();
+        }
         let mut current_epochs = self.interaction.host_runtime_epochs();
         let mut current_navigation_epoch = self.interaction.action_epochs().navigation_epoch;
         self.rebind_pending_host_actions(current_epochs, current_navigation_epoch);
@@ -5745,8 +6021,309 @@ impl NativeShell {
         self.apply_task_list(task_list);
         self.inbox = Inbox::from_model(&model);
         self.client_model = Some(Arc::clone(&model));
-        self.interaction.set_client_model(Some(model));
+        self.interaction.set_client_model(Some(Arc::clone(&model)));
+        self.services_projection = project_services_panel(&[], &[]);
+        self.sync_header_projection();
+        let client_epoch = self.interaction.action_epochs().client_epoch;
+        self.rebind_pending_client_epoch(client_epoch);
+        self.sync_cockpit_follow();
         Ok(())
+    }
+
+    fn sync_header_projection(&mut self) {
+        let attachment = self
+            .client_model
+            .as_ref()
+            .and_then(|model| {
+                self.interaction
+                    .selected_task()
+                    .and_then(|task_id| model.task(task_id))
+            })
+            .map(|snapshot| {
+                let workspace = workspace_projection_label(&snapshot.task.workspace);
+                NativeHeaderAttachment::projection(
+                    snapshot.task.title.clone(),
+                    format!(
+                        "{} · {} · rev {}",
+                        visible_status_label(snapshot.visible_status()),
+                        workspace,
+                        snapshot.task.revision
+                    ),
+                    format!("Host · {}", self.host_state.label()),
+                    format!(
+                        "{} resource{} · {} artifact{}",
+                        snapshot.resources.len(),
+                        if snapshot.resources.len() == 1 {
+                            ""
+                        } else {
+                            "s"
+                        },
+                        snapshot.artifacts.len(),
+                        if snapshot.artifacts.len() == 1 {
+                            ""
+                        } else {
+                            "s"
+                        }
+                    ),
+                )
+            })
+            .unwrap_or_else(|| NativeHeaderAttachment::unavailable("select a task"));
+        if self.header_attachment != attachment {
+            self.attach_header_projection(attachment);
+        }
+    }
+
+    fn sync_cockpit_follow(&mut self) {
+        let Some(task_id) = self.interaction.selected_task() else {
+            self.clear_cockpit_projection();
+            return;
+        };
+        self.cockpit.follow_task(task_id);
+        if let Some(model) = self.client_model.as_ref() {
+            self.cockpit.follow_projection(model.as_ref());
+        }
+        self.sync_terminal_from_cockpit();
+        self.sync_header_projection();
+    }
+
+    fn clear_cockpit_projection(&mut self) {
+        self.cockpit = TaskCockpitShell::new(DockEdge::Bottom);
+        self.terminal.rebind(None);
+        self.terminal.set_preferences(self.preferences);
+        self.sync_header_projection();
+    }
+
+    fn sync_terminal_from_cockpit(&mut self) {
+        let preferences = self.preferences;
+        if self.cockpit.dock().terminal_binding().is_some() {
+            let model = self.cockpit.dock().terminal_pane_model();
+            self.terminal.rebind(Some(model));
+            self.terminal.set_preferences(preferences);
+        } else {
+            self.terminal.rebind(None);
+            self.terminal.set_preferences(preferences);
+        }
+    }
+
+    fn cockpit_dock_tool(tool: DockTool) -> CockpitDockTool {
+        match tool {
+            DockTool::Changes => CockpitDockTool::Changes,
+            DockTool::Files => CockpitDockTool::Files,
+            DockTool::Terminal => CockpitDockTool::Terminal,
+            DockTool::Browser => CockpitDockTool::Browser,
+            DockTool::Services => CockpitDockTool::Services,
+            DockTool::Artifacts => CockpitDockTool::Artifacts,
+            DockTool::Review => CockpitDockTool::Review,
+        }
+    }
+
+    fn apply_keyboard_shell_effects(&mut self, action: KeyboardAction) {
+        match action {
+            KeyboardAction::SelectDock(tool) => {
+                let _ = self
+                    .cockpit
+                    .handle_tool_action(Self::cockpit_dock_tool(tool), RequestId::new());
+                self.sync_terminal_from_cockpit();
+                if matches!(tool, DockTool::Services) {
+                    // Refresh the shared host/catalog seam when the services
+                    // panel becomes active; the panel itself never mints a
+                    // supervisor command or bypasses ServiceControl fences.
+                    let _ = self.dispatch_action(ActionRequest::HostActions);
+                } else if !matches!(tool, DockTool::Terminal) {
+                    // Non-terminal task tabs refresh the same fenced task.show
+                    // projection that supplies their workspace/browser/files
+                    // facts; no dock invents a path or bypasses the typed host
+                    // action catalog.
+                    if let Some(task_id) = self.interaction.selected_task() {
+                        let _ = self.dispatch_action(ActionRequest::TaskShow { task_id });
+                    }
+                }
+            }
+            KeyboardAction::OpenTerminal => {
+                let _ = self
+                    .cockpit
+                    .handle_tool_action(CockpitDockTool::Terminal, RequestId::new());
+                let _ = self.cockpit.handle_toggle_raw(RequestId::new());
+                self.sync_terminal_from_cockpit();
+            }
+            KeyboardAction::OpenTaskDetails => {
+                if let Some(task_id) = self.interaction.selected_task() {
+                    let _ = self.dispatch_action(ActionRequest::TaskShow { task_id });
+                }
+            }
+            KeyboardAction::OpenCommandPalette => {
+                let _ = self
+                    .prompt_library
+                    .handle_key(PromptLibraryKey::LibraryShortcut);
+            }
+            KeyboardAction::OpenPalette => {
+                let _ = self.prompt_library.handle_key(PromptLibraryKey::Slash);
+            }
+            _ => {}
+        }
+    }
+
+    fn task_row_label(&self, task_id: TaskId) -> String {
+        if let Some(row) = self.inbox.row(task_id) {
+            format!("{} · {}", row.title, visible_status_label(row.status))
+        } else if let Some(model) = self.client_model.as_ref() {
+            model
+                .tasks()
+                .get(&task_id)
+                .map(|snapshot| {
+                    format!(
+                        "{} · {}",
+                        snapshot.task.title,
+                        visible_status_label(snapshot.visible_status())
+                    )
+                })
+                .unwrap_or_else(|| format!("Task {task_id}"))
+        } else {
+            format!("Task {task_id}")
+        }
+    }
+
+    fn selected_browser_dock_model(&self) -> Option<TaskBrowserDockModel> {
+        let task_id = self.interaction.selected_task()?;
+        let model = self.client_model.as_ref()?;
+        let view = model.browser_dock_view(task_id)?;
+        let tab_labels = (0..view.tab_count)
+            .take(32)
+            .map(|index| format!("Browser tab {}", index + 1))
+            .collect();
+        Some(TaskBrowserDockModel {
+            task_title: view.title.clone(),
+            address: view.shareable_url.unwrap_or_default(),
+            title: view.title,
+            security: BrowserSecurityState::Unknown,
+            loading: false,
+            error: None,
+            progress: None,
+            tab_labels,
+            selected_tab: None,
+            diagnostic: Some(format!("{} browser tab(s)", view.tab_count)),
+            approval: None,
+            artifact_count: model.artifact_summaries().len(),
+        })
+    }
+
+    fn prompt_library_surface(&self, tokens: crate::ui::tokens::ThemeTokens) -> AnyElement {
+        let list = self.prompt_library.list_state();
+        let load = match &self.prompt_library.load {
+            crate::ui::prompts::PromptLibraryLoadState::Empty => "empty",
+            crate::ui::prompts::PromptLibraryLoadState::Loading => "loading",
+            crate::ui::prompts::PromptLibraryLoadState::Ready => "ready",
+            crate::ui::prompts::PromptLibraryLoadState::Error { .. } => "error",
+            crate::ui::prompts::PromptLibraryLoadState::StaleRevision { .. } => "stale",
+        };
+        let draft_chars = self.prompt_library.draft.text.chars().count();
+        div()
+            .id("native-shell-prompt-composer")
+            .w_full()
+            .flex()
+            .flex_wrap()
+            .gap(px(tokens.density.spacing.sm))
+            .p(px(tokens.density.physical().control_padding as f32))
+            .bg(tokens.surfaces.raised.to_gpui())
+            .child(format!(
+                "{} · {} · {} saved · {}",
+                self.prompt_library.chrome.rail_label,
+                self.prompt_library.chrome.active_section.label(),
+                list.total,
+                load
+            ))
+            .child(format!(
+                "Composer · {} character draft · {}",
+                draft_chars,
+                if self.prompt_library.draft.sent {
+                    "sent"
+                } else {
+                    "ready"
+                }
+            ))
+            .into_any_element()
+    }
+
+    fn workspace_dock_surface(
+        &self,
+        tool: CockpitDockTool,
+        tokens: crate::ui::tokens::ThemeTokens,
+    ) -> AnyElement {
+        let details = self
+            .interaction
+            .selected_task()
+            .and_then(|task_id| self.client_model.as_ref()?.task(task_id))
+            .map(|snapshot| {
+                let workspace = workspace_projection_label(&snapshot.task.workspace);
+                let resources = snapshot.resources.len();
+                match tool {
+                    CockpitDockTool::Changes => {
+                        format!(
+                            "Git changes · {workspace} · host projection · {resources} resource(s)"
+                        )
+                    }
+                    CockpitDockTool::Files => {
+                        format!("Files · {workspace} · workspace projection · SSH identity fenced")
+                    }
+                    CockpitDockTool::Artifacts => format!(
+                        "Artifacts · {} bounded metadata item(s) · task-owned",
+                        snapshot.artifacts.len()
+                    ),
+                    CockpitDockTool::Review => format!(
+                        "Review · {} · revision {}",
+                        visible_status_label(snapshot.visible_status()),
+                        snapshot.task.revision
+                    ),
+                    CockpitDockTool::Terminal
+                    | CockpitDockTool::Browser
+                    | CockpitDockTool::Services => tool.label().to_string(),
+                }
+            })
+            .unwrap_or_else(|| format!("{} · select a task", tool.label()));
+        div()
+            .id("native-shell-workspace-dock")
+            .w_full()
+            .p(px(tokens.density.physical().control_padding as f32))
+            .bg(tokens.surfaces.sunken.to_gpui())
+            .child(details)
+            .into_any_element()
+    }
+
+    fn services_dock_surface(&self, tokens: crate::ui::tokens::ThemeTokens) -> AnyElement {
+        let action_count = self
+            .services_projection
+            .rows
+            .iter()
+            .map(|row| row.actions.len())
+            .sum::<usize>();
+        div()
+            .id("native-shell-services-dock")
+            .w_full()
+            .p(px(tokens.density.physical().control_padding as f32))
+            .bg(tokens.surfaces.sunken.to_gpui())
+            .child(format!(
+                "Services · {} projected row(s) · {} typed control(s) · host supervisor",
+                self.services_projection.rows.len(),
+                action_count
+            ))
+            .into_any_element()
+    }
+
+    fn context_dock_surface(&self, tokens: crate::ui::tokens::ThemeTokens) -> AnyElement {
+        match self.cockpit.active_tool() {
+            CockpitDockTool::Terminal => self
+                .cockpit
+                .dock()
+                .render_context_dock(tokens)
+                .into_any_element(),
+            CockpitDockTool::Browser => self
+                .selected_browser_dock_model()
+                .map(render_task_browser_dock)
+                .map(|element| element.into_any_element())
+                .unwrap_or_else(|| self.workspace_dock_surface(CockpitDockTool::Browser, tokens)),
+            CockpitDockTool::Services => self.services_dock_surface(tokens),
+            tool => self.workspace_dock_surface(tool, tokens),
+        }
     }
 
     pub fn client_model_snapshot(&self) -> Option<Arc<ClientModel>> {
@@ -5828,6 +6405,27 @@ impl NativeShell {
                     .child("Task Inbox"),
             )
             .children(task_rows);
+        let details = self
+            .interaction
+            .keyboard_state()
+            .task_details_open
+            .then(|| {
+                let selected = self.interaction.selected_task();
+                let body = selected
+                    .map(|task_id| self.task_row_label(task_id))
+                    .unwrap_or_else(|| "No task selected".to_string());
+                div()
+                    .id("native-shell-task-details")
+                    .w_full()
+                    .p(px(metrics.control_padding as f32))
+                    .bg(tokens.surfaces.raised.to_gpui())
+                    .child(format!("Task details · {body}"))
+            });
+        let prompt_composer = self.prompt_library_surface(tokens);
+        let context_dock = div()
+            .id("native-shell-context-dock")
+            .w_full()
+            .child(self.context_dock_surface(tokens));
         let terminal = div()
             .id("native-shell-terminal-dock")
             .w_full()
@@ -5843,6 +6441,9 @@ impl NativeShell {
             .text_color(tokens.text.primary.to_gpui())
             .child(toolbar)
             .child(inbox)
+            .children(details)
+            .child(prompt_composer)
+            .child(context_dock)
             .child(terminal)
     }
 
@@ -5850,6 +6451,12 @@ impl NativeShell {
         let tokens = self.preferences.tokens();
         let metrics = tokens.density.physical();
         let task_ids = Arc::new(self.task_list.task_ids().to_vec());
+        let task_labels = Arc::new(
+            task_ids
+                .iter()
+                .map(|task_id| (*task_id, self.task_row_label(*task_id)))
+                .collect::<std::collections::HashMap<_, _>>(),
+        );
         let shell_entity = cx.entity().downgrade();
         let task_list_element = uniform_list(
             "native-task-uniform-list",
@@ -5863,6 +6470,10 @@ impl NativeShell {
                         let shell_for_mouse = shell_entity.clone();
                         let shell_for_mouse_up = shell_entity.clone();
                         let shell_for_key = shell_entity.clone();
+                        let row_label = task_labels
+                            .get(&task_id)
+                            .cloned()
+                            .unwrap_or_else(|| format!("Task {task_id}"));
                         let mouse_handler =
                             move |event: &MouseDownEvent,
                                   window: &mut Window,
@@ -5874,6 +6485,7 @@ impl NativeShell {
                                         let _ = shell
                                             .interaction
                                             .navigation_mouse_down(task_id, &shell.task_list);
+                                        shell.sync_cockpit_follow();
                                         shell.accessibility_tree =
                                             AccessibilityTree::for_task_list_with_header(
                                                 &shell.task_list,
@@ -5904,6 +6516,7 @@ impl NativeShell {
                                         let _ = shell
                                             .interaction
                                             .navigation_mouse_down(task_id, &shell.task_list);
+                                        shell.sync_cockpit_follow();
                                         shell.accessibility_tree =
                                             AccessibilityTree::for_task_list_with_header(
                                                 &shell.task_list,
@@ -5933,7 +6546,7 @@ impl NativeShell {
                             .capture_any_mouse_down(mouse_handler)
                             .capture_any_mouse_up(mouse_up_handler)
                             .on_key_down(key_handler)
-                            .child(format!("Task {task_id}"))
+                            .child(row_label)
                             .into_any_element()
                     })
                     .collect::<Vec<_>>()
@@ -6212,6 +6825,30 @@ impl NativeShell {
                     )
                     .child(task_list_element),
             )
+            .children(
+                self.interaction
+                    .keyboard_state()
+                    .task_details_open
+                    .then(|| {
+                        let selected = self.interaction.selected_task();
+                        let body = selected
+                            .map(|task_id| self.task_row_label(task_id))
+                            .unwrap_or_else(|| "No task selected".to_string());
+                        div()
+                            .id("native-shell-task-details")
+                            .w_full()
+                            .p(px(metrics.control_padding as f32))
+                            .bg(tokens.surfaces.raised.to_gpui())
+                            .child(format!("Task details · {body}"))
+                    }),
+            )
+            .child(div().w_full().child(self.prompt_library_surface(tokens)))
+            .child(
+                div()
+                    .id("native-shell-context-dock")
+                    .w_full()
+                    .child(self.context_dock_surface(tokens)),
+            )
             .child(
                 div()
                     .id("native-shell-terminal-dock")
@@ -6229,6 +6866,16 @@ impl NativeShell {
         request: ActionRequest,
     ) -> Option<NativeActionRecord> {
         self.dispatch_action(request)
+    }
+
+    #[cfg(test)]
+    pub fn dispatch_keyboard_for_test(&mut self, shortcut: KeyboardShortcut) {
+        self.dispatch_keyboard(shortcut);
+    }
+
+    #[cfg(test)]
+    pub fn task_row_label_for_test(&self, task_id: TaskId) -> String {
+        self.task_row_label(task_id)
     }
 
     fn dispatch_action(&mut self, request: ActionRequest) -> Option<NativeActionRecord> {
@@ -6296,6 +6943,7 @@ impl NativeShell {
             .commit_keyboard_action(focus_epoch, request_generation, action)
         {
             self.last_keyboard_action = Some(action);
+            self.apply_keyboard_shell_effects(action);
         }
     }
 
@@ -6331,11 +6979,16 @@ impl NativeShell {
             NativeHostState::Disconnected => "Disconnected · host".to_string(),
             NativeHostState::Error { .. } => "Error · host".to_string(),
         };
-        self.last_action_failure
+        let with_failure = self
+            .last_action_failure
             .as_ref()
             .map_or(base.clone(), |failure| {
                 format!("{base} · {}", failure.retry_message())
-            })
+            });
+        match self.last_query_detail.as_ref() {
+            Some(detail) => format!("{with_failure} · {detail}"),
+            None => with_failure,
+        }
     }
 }
 
@@ -6475,6 +7128,46 @@ fn launch_native_shell(
 fn bounded_host_error(message: impl Into<String>) -> String {
     const MAX_HOST_ERROR_CHARS: usize = 256;
     message.into().chars().take(MAX_HOST_ERROR_CHARS).collect()
+}
+
+fn workspace_projection_label(workspace: &crate::domain::task::WorkspaceRef) -> String {
+    use crate::domain::task::{WorkspaceBindingKind, WorkspaceRef};
+
+    match workspace {
+        WorkspaceRef::Main | WorkspaceRef::MainWithFingerprint { .. } => "main".to_string(),
+        WorkspaceRef::Worktree { branch, .. }
+        | WorkspaceRef::WorktreeWithFingerprint { branch, .. } => {
+            format!("worktree · {}", bounded_header_text(branch.clone()))
+        }
+        WorkspaceRef::External { .. } | WorkspaceRef::ExternalWithFingerprint { .. } => {
+            "external".to_string()
+        }
+        WorkspaceRef::HostBound { binding } => match binding.kind() {
+            WorkspaceBindingKind::Main => "main · host-bound".to_string(),
+            WorkspaceBindingKind::Worktree => format!(
+                "worktree · {} · host-bound",
+                binding
+                    .branch()
+                    .map(|branch| bounded_header_text(branch.to_string()))
+                    .unwrap_or_else(|| "branch unavailable".to_string())
+            ),
+            WorkspaceBindingKind::External => "external · host-bound".to_string(),
+        },
+    }
+}
+
+fn visible_status_label(status: VisibleTaskStatus) -> &'static str {
+    match status {
+        VisibleTaskStatus::Disconnected => "Disconnected",
+        VisibleTaskStatus::Failed => "Failed",
+        VisibleTaskStatus::UncertainOutcome => "Uncertain",
+        VisibleTaskStatus::NeedsApproval => "Needs approval",
+        VisibleTaskStatus::NeedsAnswer => "Needs answer",
+        VisibleTaskStatus::Working => "Working",
+        VisibleTaskStatus::Settling => "Settling",
+        VisibleTaskStatus::ReadyForReview => "Ready for review",
+        VisibleTaskStatus::Idle => "Idle",
+    }
 }
 
 fn validated_runtime_attachment(
@@ -8009,6 +8702,340 @@ mod tests {
                     .take(40)
                     .any(|line| line.contains("Err(IpcError::Busy) | Err(IpcError::Timeout)")),
             "Timeout must retry separately from Busy and must not spawn"
+        );
+    }
+
+    #[test]
+    fn service_control_accepts_current_public_action_epoch_and_rejects_stale() {
+        use crate::client::action::ServiceControlArguments;
+        use crate::domain::command::ServiceControlAction;
+        use crate::services::model::ServiceId;
+        use crate::ui::components::ActionRequest;
+
+        let mut interaction = NativeInteraction::new(None);
+        interaction.sync_host_epochs(NativeHostRuntimeEpochs {
+            connection_epoch: 2,
+            resource_generation: 3,
+            runtime_generation: 1,
+        });
+        let _ = interaction
+            .action(ActionRequest::HostStatus)
+            .expect("prime action epoch");
+        let public = interaction.action_epochs();
+        assert!(public.action_epoch > 0);
+
+        let accepted = interaction
+            .action(ActionRequest::ServiceControl {
+                action: ServiceControlAction::Start,
+                arguments: ServiceControlArguments {
+                    service_id: ServiceId::new("web").expect("service id"),
+                    resource_generation: public.resource_generation,
+                    connection_epoch: public.connection_epoch,
+                    action_epoch: public.action_epoch,
+                },
+            })
+            .expect("current public action epoch must enqueue");
+        assert!(matches!(
+            accepted.command,
+            super::NativeHostCommand::ServiceControl { .. }
+        ));
+
+        let stale_epoch = public.action_epoch;
+        let rejected = interaction.action(ActionRequest::ServiceControl {
+            action: ServiceControlAction::Stop,
+            arguments: ServiceControlArguments {
+                service_id: ServiceId::new("web").expect("service id"),
+                resource_generation: public.resource_generation,
+                connection_epoch: public.connection_epoch,
+                action_epoch: stale_epoch,
+            },
+        });
+        assert!(
+            rejected.is_none(),
+            "changed public action epoch must reject ServiceControl"
+        );
+    }
+
+    #[test]
+    fn visible_query_actions_never_map_to_hold() {
+        use crate::ui::components::ActionRequest;
+
+        let selected = TaskId::new();
+        let mut interaction = NativeInteraction::new(Some(selected));
+        let cases = [
+            interaction
+                .action(ActionRequest::HostActions)
+                .expect("host.actions"),
+            interaction
+                .action(ActionRequest::HostStatus)
+                .expect("host.status"),
+            interaction
+                .action(ActionRequest::TaskList)
+                .expect("task.list"),
+            interaction
+                .action(ActionRequest::TaskShow { task_id: selected })
+                .expect("task.show"),
+        ];
+        for record in cases {
+            assert!(
+                !matches!(record.command, super::NativeHostCommand::Hold { .. }),
+                "{} must not become Hold",
+                record.id
+            );
+        }
+        assert!(matches!(
+            interaction
+                .action(ActionRequest::HostActions)
+                .expect("host.actions again")
+                .command,
+            super::NativeHostCommand::HostActionsQuery { .. }
+        ));
+        assert!(matches!(
+            interaction
+                .action(ActionRequest::HostStatus)
+                .expect("host.status again")
+                .command,
+            super::NativeHostCommand::HostStatusQuery { .. }
+        ));
+        assert!(matches!(
+            interaction
+                .action(ActionRequest::TaskList)
+                .expect("task.list again")
+                .command,
+            super::NativeHostCommand::TaskListQuery { .. }
+        ));
+        assert!(matches!(
+            interaction
+                .action(ActionRequest::TaskShow { task_id: selected })
+                .expect("task.show again")
+                .command,
+            super::NativeHostCommand::TaskShowQuery { .. }
+        ));
+    }
+
+    #[test]
+    fn action_outcome_survives_client_model_epoch_advancement() {
+        use crate::ui::components::ActionRequest;
+
+        let selected = TaskId::new();
+        let mut interaction = NativeInteraction::new(Some(selected));
+        interaction.sync_host_epochs(NativeHostRuntimeEpochs {
+            connection_epoch: 1,
+            resource_generation: 1,
+            runtime_generation: 1,
+        });
+        let record = interaction
+            .action(ActionRequest::HostStatus)
+            .expect("capture host status");
+        assert!(interaction.accepts_action_record(&record));
+        interaction.set_client_model(None);
+        assert!(
+            !interaction.accepts_action_record(&record),
+            "exact client_epoch still required for enqueue/admission"
+        );
+        assert!(
+            interaction.accepts_action_outcome_record(&record),
+            "queued ClientModel projection must not permanently stale a valid outcome"
+        );
+    }
+
+    fn terminal_bound_client_model() -> (crate::client::ClientModel, TaskId) {
+        use crate::client::ClientModelBuilder;
+        use crate::domain::{
+            agent::{AgentRole, AgentSessionFacts, AgentSessionLifecycle},
+            id::{AgentSessionId, EnvironmentId, ProjectId, ResourceId, SnapshotId},
+            resource::{OwnerKind, ResourceFacts, ResourceKind, ResourceLifecycle, ResourceRecipe},
+            snapshot::{SnapshotItem, SnapshotPage, SnapshotSection, TaskSnapshotItem},
+            task::{
+                ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity,
+                TaskFacts, TaskLifecycle, WorkspaceRef,
+            },
+        };
+
+        let uuid = |tail: u8| {
+            [
+                0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, tail,
+            ]
+        };
+        let task_id = TaskId::from_bytes(uuid(0xa1)).expect("task");
+        let agent_id = AgentSessionId::from_bytes(uuid(0xa2)).expect("agent");
+        let resource_id = ResourceId::from_bytes(uuid(0xa3)).expect("resource");
+        let snap = SnapshotId::from_bytes(uuid(0x10)).expect("snapshot");
+        let page = |section, items| SnapshotPage {
+            snapshot_id: snap,
+            through_sequence: 1,
+            section,
+            after_item: None,
+            items,
+            encoded_bytes: 1,
+            next_cursor: None,
+        };
+        let mut builder = ClientModelBuilder::new();
+        builder
+            .ingest_page(page(
+                SnapshotSection::Tasks,
+                vec![SnapshotItem::Task(TaskSnapshotItem {
+                    task: TaskFacts {
+                        id: task_id,
+                        environment_id: EnvironmentId::from_bytes(uuid(0x01)).expect("env"),
+                        title: "Bound terminal task".into(),
+                        description: None,
+                        project_id: ProjectId::from_bytes(uuid(0x02)).expect("project"),
+                        workspace: WorkspaceRef::Main,
+                        assignment: TaskAssignment::LocalOwner,
+                        lifecycle: TaskLifecycle::Open,
+                        action_epoch: 3,
+                        revision: 4,
+                        created_at_ms: 1,
+                    },
+                    connectivity: TaskConnectivity::Connected,
+                    attention: TaskAttention::None,
+                    activity: TaskActivity::Idle,
+                    review_readiness: ReviewReadiness::NotReady,
+                    primary_agent_id: Some(agent_id),
+                })],
+            ))
+            .expect("tasks");
+        builder
+            .ingest_page(page(
+                SnapshotSection::AgentSessions,
+                vec![SnapshotItem::AgentSession(AgentSessionFacts {
+                    id: agent_id,
+                    task_id,
+                    role: AgentRole::Primary,
+                    provider_kind: crate::providers::ProviderKind::ClaudeCode,
+                    provider_session_id: None,
+                    lifecycle: AgentSessionLifecycle::Open,
+                    runtime_generation: 1,
+                    revision: 0,
+                })],
+            ))
+            .expect("agents");
+        builder
+            .ingest_page(page(SnapshotSection::Artifacts, Vec::new()))
+            .expect("artifacts");
+        builder
+            .ingest_page(page(
+                SnapshotSection::Resources,
+                vec![SnapshotItem::Resource(ResourceFacts {
+                    id: resource_id,
+                    task_id: Some(task_id),
+                    owner_kind: OwnerKind::Task,
+                    resource_kind: ResourceKind::Terminal,
+                    recipe: ResourceRecipe::Terminal { cols: 40, rows: 8 },
+                    lifecycle: ResourceLifecycle::Active,
+                    runtime_generation: 1,
+                    updated_at_ms: 1,
+                })],
+            ))
+            .expect("resources");
+        builder
+            .ingest_page(page(SnapshotSection::Operations, Vec::new()))
+            .expect("operations");
+        (builder.finish().expect("client model"), task_id)
+    }
+
+    fn selected_task_follow_title_and_terminal_binding(cx: &mut gpui::App) {
+        let (runtime, _shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        let (model, task_id) = terminal_bound_client_model();
+        with_test_shell_in_app(cx, runtime, |shell| {
+            assert!(!shell.terminal_state().is_live());
+            shell
+                .apply_client_model(Arc::new(model))
+                .expect("apply model");
+            let list = crate::ui::task_cockpit::TaskList::from_client_model_virtual(
+                shell.client_model_snapshot().as_ref().unwrap(),
+            )
+            .expect("task list");
+            let _ = shell.interaction.navigation_mouse_down(task_id, &list);
+            shell.sync_cockpit_follow();
+            assert_eq!(shell.cockpit().selected_task(), Some(task_id));
+            let label = shell.task_row_label_for_test(task_id);
+            assert!(
+                label.contains("Bound terminal task") && label.contains("Idle"),
+                "expected title/status projection, got {label}"
+            );
+            assert!(
+                shell.terminal_state().is_live(),
+                "complete terminal identity must bind the adapter"
+            );
+        });
+    }
+
+    fn dock_shortcuts_and_open_task_details_bind_selection(cx: &mut gpui::App) {
+        use crate::ui::actions::{KeyboardShortcut, ShortcutKey};
+        use crate::ui::task_cockpit::dock::DockTool as CockpitDockTool;
+
+        let (runtime, shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        let (model, task_id) = terminal_bound_client_model();
+        with_test_shell_in_app(cx, runtime, |shell| {
+            shell
+                .apply_client_model(Arc::new(model))
+                .expect("apply model");
+            let list = crate::ui::task_cockpit::TaskList::from_client_model_virtual(
+                shell.client_model_snapshot().as_ref().unwrap(),
+            )
+            .expect("task list");
+            let _ = shell.interaction.navigation_mouse_down(task_id, &list);
+            shell.sync_cockpit_follow();
+
+            shell.dispatch_keyboard_for_test(KeyboardShortcut::alt(ShortcutKey::Digit(4)));
+            assert_eq!(
+                shell.last_keyboard_action(),
+                Some(crate::ui::actions::KeyboardAction::SelectDock(
+                    crate::ui::actions::DockTool::Browser
+                ))
+            );
+            assert_eq!(shell.cockpit().selected_task(), Some(task_id));
+            assert_eq!(shell.cockpit().active_tool(), CockpitDockTool::Browser);
+
+            shell.dispatch_keyboard_for_test(KeyboardShortcut::ctrl(ShortcutKey::Backtick));
+            assert_eq!(
+                shell.last_keyboard_action(),
+                Some(crate::ui::actions::KeyboardAction::OpenTerminal)
+            );
+            assert_eq!(shell.cockpit().active_tool(), CockpitDockTool::Terminal);
+            assert!(shell.interaction.keyboard_state().terminal_open);
+
+            let before = shared.lock().expect("runtime").accepted.len();
+            shell.dispatch_keyboard_for_test(KeyboardShortcut::ctrl(ShortcutKey::Character('m')));
+            assert_eq!(
+                shell.last_keyboard_action(),
+                Some(crate::ui::actions::KeyboardAction::OpenTaskDetails)
+            );
+            assert!(shell.interaction.keyboard_state().task_details_open);
+            let accepted = shared.lock().expect("runtime").accepted.clone();
+            assert!(
+                accepted.len() > before && accepted.iter().any(|record| {
+                    matches!(
+                        record.command,
+                        super::NativeHostCommand::TaskShowQuery { task_id: id, .. } if id == task_id
+                    )
+                }),
+                "OpenTaskDetails must dispatch TaskShowQuery for the selected task"
+            );
+        });
+    }
+
+    #[test]
+    fn native_shell_follow_dock_and_details_scenarios() {
+        let _test_guard = HEADLESS_SHELL_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("headless shell test lock");
+        let completed = std::rc::Rc::new(std::cell::RefCell::new(false));
+        let completed_for_app = std::rc::Rc::clone(&completed);
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            selected_task_follow_title_and_terminal_binding(cx);
+            dock_shortcuts_and_open_task_details_bind_selection(cx);
+            *completed_for_app.borrow_mut() = true;
+            cx.quit();
+        });
+        assert!(
+            *completed.borrow(),
+            "follow/dock/details scenarios completed"
         );
     }
 }

@@ -40,11 +40,11 @@ pub mod timeline;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeCockpitMount {
-    /// Shell and task-cockpit sources are present; PNG/runtime promotion stays HOLD.
-    ShellPresent,
+    Mounted,
+    HoldMissingShell,
 }
 
-pub const NATIVE_COCKPIT_MOUNT: NativeCockpitMount = NativeCockpitMount::ShellPresent;
+pub const NATIVE_COCKPIT_MOUNT: NativeCockpitMount = NativeCockpitMount::Mounted;
 
 pub mod composer;
 pub mod dock;
