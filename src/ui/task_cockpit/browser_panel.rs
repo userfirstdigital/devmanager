@@ -7,8 +7,8 @@ use gpui::{div, prelude::*, px, rgb, IntoElement, SharedString};
 
 use crate::browser::BrowserDockSurface;
 use crate::protocol::{BrowserProjectionMeta, BrowserSecurityState};
-use crate::theme;
 use crate::ui::task_cockpit::context_dock::BrowserContextDock;
+use crate::ui::tokens::ThemeTokens;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskBrowserDockModel {
@@ -85,7 +85,10 @@ impl TabLookup for Vec<crate::protocol::BrowserTabProjection> {
     }
 }
 
-pub fn render_task_browser_dock(model: TaskBrowserDockModel) -> impl IntoElement {
+pub fn render_task_browser_dock(
+    model: TaskBrowserDockModel,
+    tokens: ThemeTokens,
+) -> impl IntoElement {
     let status = model
         .error
         .clone()
@@ -103,11 +106,11 @@ pub fn render_task_browser_dock(model: TaskBrowserDockModel) -> impl IntoElement
             .py(px(3.0))
             .text_xs()
             .bg(rgb(if selected {
-                theme::TAB_ACTIVE_BG
+                tokens.surfaces.canvas.to_u32()
             } else {
-                theme::TOPBAR_BG
+                tokens.surfaces.raised.to_u32()
             }))
-            .text_color(rgb(theme::TEXT_PRIMARY))
+            .text_color(rgb(tokens.text.primary.to_u32()))
             .child(SharedString::from(label))
             .into_any_element()
     });
@@ -115,14 +118,14 @@ pub fn render_task_browser_dock(model: TaskBrowserDockModel) -> impl IntoElement
         .h_full()
         .flex()
         .flex_col()
-        .bg(rgb(theme::PANEL_BG))
+        .bg(rgb(tokens.surfaces.canvas.to_u32()))
         .child(
             div()
                 .h(px(26.0))
                 .flex()
                 .items_center()
                 .border_b_1()
-                .border_color(rgb(theme::BORDER_PRIMARY))
+                .border_color(rgb(tokens.borders.default.to_u32()))
                 .children(tabs),
         )
         .child(
@@ -132,7 +135,7 @@ pub fn render_task_browser_dock(model: TaskBrowserDockModel) -> impl IntoElement
                 .items_center()
                 .px(px(6.0))
                 .text_xs()
-                .text_color(rgb(theme::TEXT_PRIMARY))
+                .text_color(rgb(tokens.text.primary.to_u32()))
                 .child(SharedString::from(if model.address.is_empty() {
                     model.title
                 } else {
@@ -146,21 +149,22 @@ pub fn render_task_browser_dock(model: TaskBrowserDockModel) -> impl IntoElement
                 .items_center()
                 .px(px(6.0))
                 .text_xs()
-                .text_color(rgb(theme::TEXT_MUTED))
+                .text_color(rgb(tokens.text.muted.to_u32()))
                 .child(SharedString::from(status)),
         )
         .children(model.approval.map(|approval| {
             div()
                 .px(px(6.0))
                 .text_xs()
-                .text_color(rgb(theme::TEXT_PRIMARY))
+                .text_color(rgb(tokens.text.primary.to_u32()))
                 .child(SharedString::from(approval))
         }))
         .child(
             div()
                 .px(px(6.0))
                 .text_xs()
-                .text_color(rgb(theme::TEXT_DIM))
+                .bg(rgb(tokens.surfaces.canvas.to_u32()))
+                .text_color(rgb(tokens.text.muted.to_u32()))
                 .child(SharedString::from(format!(
                     "artifacts {}",
                     model.artifact_count
@@ -170,8 +174,13 @@ pub fn render_task_browser_dock(model: TaskBrowserDockModel) -> impl IntoElement
             div()
                 .px(px(6.0))
                 .text_xs()
-                .text_color(rgb(theme::TEXT_MUTED))
+                .text_color(rgb(tokens.text.muted.to_u32()))
                 .child(SharedString::from(diagnostic))
         }))
-        .child(div().flex_1().min_h(px(0.0)).bg(rgb(theme::TERMINAL_BG)))
+        .child(
+            div()
+                .flex_1()
+                .min_h(px(0.0))
+                .bg(rgb(tokens.terminal.background.to_u32())),
+        )
 }

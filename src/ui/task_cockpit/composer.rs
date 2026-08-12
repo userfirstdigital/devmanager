@@ -12,13 +12,13 @@
 //! HOLDs until their host commands exist.
 
 use super::super::shell::PromptLibraryUiError;
-use crate::client::action::{ActionDescriptor, catalog};
+use crate::client::action::{catalog, ActionDescriptor};
 use crate::domain::id::{PromptChainLinkId, PromptVersionId};
 use crate::domain::{AgentSessionId, ArtifactId, CommandId, RequestId, TaskId};
 use crate::prompts::model::PromptVersion;
 use crate::ui::components::interaction::{
-    AccessibilityMetadata, AccessibleRole, ComponentError, FocusEpoch, InteractionStateModel,
-    MAX_ACCESSIBLE_DESCRIPTION_SCALARS, MAX_ACCESSIBLE_NAME_SCALARS, redacted_bounded_text,
+    redacted_bounded_text, AccessibilityMetadata, AccessibleRole, ComponentError, FocusEpoch,
+    InteractionStateModel, MAX_ACCESSIBLE_DESCRIPTION_SCALARS, MAX_ACCESSIBLE_NAME_SCALARS,
 };
 use crate::ui::components::text_field::{TextField, TextFieldError, TextFieldKey, TextFieldLimits};
 use sha2::{Digest, Sha256};
@@ -2469,12 +2469,10 @@ mod tests {
         let mut epochs = FocusEpochSource::new();
         focus(&mut composer, &mut epochs);
         let epoch = epochs.current();
-        assert!(
-            composer
-                .availability(ComposerControl::SendNow)
-                .expect("availability")
-                .is_available()
-        );
+        assert!(composer
+            .availability(ComposerControl::SendNow)
+            .expect("availability")
+            .is_available());
         let mut refreshed = projection_with(composer.fence(), "still typing");
         refreshed.disabled_reasons.push((
             ComposerControl::SendNow,
@@ -2538,12 +2536,10 @@ mod tests {
         let mut epochs = FocusEpochSource::new();
         focus(&mut composer, &mut epochs);
         let epoch = epochs.current();
-        assert!(
-            composer
-                .availability(ComposerControl::StageAttachment)
-                .expect("stage")
-                .is_available()
-        );
+        assert!(composer
+            .availability(ComposerControl::StageAttachment)
+            .expect("stage")
+            .is_available());
         let staged = composer.activate_stage(owned, epoch).expect("stage owned");
         assert!(matches!(
             staged.payload,
@@ -2617,12 +2613,10 @@ mod tests {
         let mut epochs = FocusEpochSource::new();
         focus(&mut composer, &mut epochs);
         let epoch = epochs.current();
-        assert!(
-            !composer
-                .availability(ComposerControl::SendNow)
-                .expect("disabled at arm")
-                .is_available()
-        );
+        assert!(!composer
+            .availability(ComposerControl::SendNow)
+            .expect("disabled at arm")
+            .is_available());
         assert!(matches!(
             composer
                 .pointer_down(ComposerControl::SendNow, 4, epoch)
@@ -2633,12 +2627,10 @@ mod tests {
         composer
             .apply_projection(projection_with(composer.fence(), "do not fire"), epoch)
             .expect("same-fence enable refresh");
-        assert!(
-            composer
-                .availability(ComposerControl::SendNow)
-                .expect("now enabled")
-                .is_available()
-        );
+        assert!(composer
+            .availability(ComposerControl::SendNow)
+            .expect("now enabled")
+            .is_available());
         let rejected = composer
             .pointer_up(ComposerControl::SendNow, 4, epoch)
             .expect_err("disabled-at-arm release cannot fire");
@@ -2765,11 +2757,9 @@ mod tests {
             .availability(ComposerControl::Steer)
             .expect("steer");
         assert!(!availability.is_available());
-        assert!(
-            availability
-                .reason()
-                .is_some_and(|reason| reason.contains("no current turn"))
-        );
+        assert!(availability
+            .reason()
+            .is_some_and(|reason| reason.contains("no current turn")));
     }
 
     #[test]
@@ -3052,12 +3042,10 @@ mod tests {
         focus(&mut composer, &mut epochs);
         let epoch = epochs.current();
         assert!(composer.input_accessibility().focused());
-        assert!(
-            !composer
-                .control_accessibility(ComposerControl::SendNow)
-                .expect("send")
-                .focused()
-        );
+        assert!(!composer
+            .control_accessibility(ComposerControl::SendNow)
+            .expect("send")
+            .focused());
         composer
             .focus_control(ComposerControl::SendNow, epoch)
             .expect("control focus");

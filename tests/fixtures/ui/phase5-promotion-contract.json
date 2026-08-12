@@ -13,14 +13,8 @@
     "tests/fixtures/ui/quality/hold-union.json"
   ],
   "shared_absent": [
-    "src/ui/shell.rs",
-    "src/ui/task_cockpit",
-    "src/ui/renderers",
     "src/ui/virtual_list.rs",
-    "tests/ui_focus.rs",
-    "tests/ui_actions.rs",
-    "tests/renderer_registry.rs",
-    "scripts/native-next/Capture-UiPreviews.ps1"
+    "tests/renderer_registry.rs"
   ],
   "stale_screenshot_roots": [
     ".devmanager-next/evidence/phase-05/screenshots"
@@ -118,8 +112,8 @@
       ],
       "measurement": "FocusCoordinator consume on task switch, question, approval, and terminal mouse; stale FocusEpoch pointer_up must not activate",
       "artifacts": [
-        { "path": "tests/ui_focus.rs", "kind": "absent", "sha256": "ABSENT", "run_identity": "cargo test --test ui_quality_gates quality_phase5_promotion_contract_rejects_hold_proxies_and_disconnected_models -- --exact" },
-        { "path": "src/ui/shell.rs", "kind": "absent", "sha256": "ABSENT", "run_identity": "cargo test --test ui_quality_gates quality_phase5_promotion_contract_rejects_hold_proxies_and_disconnected_models -- --exact" },
+        { "path": "tests/ui_focus.rs", "kind": "present_insufficient", "sha256": "LIVE", "run_identity": "cargo test --test ui_quality_gates quality_phase5_promotion_contract_rejects_hold_proxies_and_disconnected_models -- --exact" },
+        { "path": "src/ui/shell.rs", "kind": "present_insufficient", "sha256": "LIVE", "run_identity": "cargo test --test ui_quality_gates quality_phase5_promotion_contract_rejects_hold_proxies_and_disconnected_models -- --exact" },
         { "path": "src/ui/components/interaction.rs", "kind": "present_insufficient", "sha256": "LIVE", "run_identity": "cargo test --test ui_quality_gates quality_phase5_promotion_contract_rejects_hold_proxies_and_disconnected_models -- --exact" }
       ],
       "rejects": [
@@ -134,8 +128,8 @@
       "hold_ids": ["raw_terminal_shared_provider_session"],
       "measurement": "100 semantic/raw switches leave provider process count and PTY reader count unchanged",
       "artifacts": [
-        { "path": "src/ui/task_cockpit", "kind": "absent", "sha256": "ABSENT", "run_identity": "cargo test --test ui_quality_gates quality_phase5_promotion_contract_rejects_hold_proxies_and_disconnected_models -- --exact" },
-        { "path": "src/ui/shell.rs", "kind": "absent", "sha256": "ABSENT", "run_identity": "cargo test --test ui_quality_gates quality_phase5_promotion_contract_rejects_hold_proxies_and_disconnected_models -- --exact" }
+        { "path": "src/ui/task_cockpit", "kind": "present_insufficient", "sha256": "LIVE", "run_identity": "cargo test --test ui_quality_gates quality_phase5_promotion_contract_rejects_hold_proxies_and_disconnected_models -- --exact" },
+        { "path": "src/ui/shell.rs", "kind": "present_insufficient", "sha256": "LIVE", "run_identity": "cargo test --test ui_quality_gates quality_phase5_promotion_contract_rejects_hold_proxies_and_disconnected_models -- --exact" }
       ],
       "rejects": [
         "HOLD",
@@ -153,7 +147,7 @@
       ],
       "measurement": "20000 DomainEvent journal items through src/ui/renderers and src/ui/virtual_list.rs; not PTY or raw terminal",
       "artifacts": [
-        { "path": "src/ui/renderers", "kind": "absent", "sha256": "ABSENT", "run_identity": "cargo test --test ui_quality_gates quality_phase5_promotion_contract_rejects_hold_proxies_and_disconnected_models -- --exact" },
+        { "path": "src/ui/renderers", "kind": "present_insufficient", "sha256": "LIVE", "run_identity": "cargo test --test ui_quality_gates quality_phase5_promotion_contract_rejects_hold_proxies_and_disconnected_models -- --exact" },
         { "path": "src/ui/virtual_list.rs", "kind": "absent", "sha256": "ABSENT", "run_identity": "cargo test --test ui_quality_gates quality_phase5_promotion_contract_rejects_hold_proxies_and_disconnected_models -- --exact" },
         { "path": "tests/renderer_registry.rs", "kind": "absent", "sha256": "ABSENT", "run_identity": "cargo test --test ui_quality_gates quality_phase5_promotion_contract_rejects_hold_proxies_and_disconnected_models -- --exact" }
       ],
@@ -183,7 +177,7 @@
       "hold_ids": ["windows_200pct_uia_walkthrough"],
       "measurement": "200 percent Windows scale UIA walkthrough of inbox, timeline, question, approval, composer, dock, terminal with no clip",
       "artifacts": [
-        { "path": "scripts/native-next/Capture-UiPreviews.ps1", "kind": "absent", "sha256": "ABSENT", "run_identity": "cargo test --test ui_quality_gates quality_phase5_promotion_contract_rejects_hold_proxies_and_disconnected_models -- --exact" }
+        { "path": "scripts/native-next/Capture-UiPreviews.ps1", "kind": "present_insufficient", "sha256": "LIVE", "run_identity": "cargo test --test ui_quality_gates quality_phase5_promotion_contract_rejects_hold_proxies_and_disconnected_models -- --exact" }
       ],
       "rejects": [
         "HOLD",
@@ -197,7 +191,7 @@
       "hold_ids": ["accesskit_shell_actions"],
       "measurement": "AccessKit Default action activates the named focused shell control on inbox, timeline, question, approval, composer, dock, and terminal",
       "artifacts": [
-        { "path": "src/ui/shell.rs", "kind": "absent", "sha256": "ABSENT", "run_identity": "cargo test --test ui_quality_gates quality_phase5_promotion_contract_rejects_hold_proxies_and_disconnected_models -- --exact" },
+        { "path": "src/ui/shell.rs", "kind": "present_insufficient", "sha256": "LIVE", "run_identity": "cargo test --test ui_quality_gates quality_phase5_promotion_contract_rejects_hold_proxies_and_disconnected_models -- --exact" },
         { "path": "tests/ui_accessibility.rs", "kind": "present_insufficient", "sha256": "LIVE", "run_identity": "cargo test --test ui_quality_gates quality_phase5_promotion_contract_rejects_hold_proxies_and_disconnected_models -- --exact" }
       ],
       "rejects": [
@@ -212,7 +206,7 @@
       "hold_ids": ["gpui_png_readback", "capture_ui_previews_png_matrix"],
       "measurement": "Capture-UiPreviews.ps1 writes inspected IHDR PNGs after render_to_output success; VisualGate has no success arm until then",
       "artifacts": [
-        { "path": "scripts/native-next/Capture-UiPreviews.ps1", "kind": "absent", "sha256": "ABSENT", "run_identity": "cargo test --test ui_quality_gates quality_phase5_promotion_contract_rejects_hold_proxies_and_disconnected_models -- --exact" }
+        { "path": "scripts/native-next/Capture-UiPreviews.ps1", "kind": "present_insufficient", "sha256": "LIVE", "run_identity": "cargo test --test ui_quality_gates quality_phase5_promotion_contract_rejects_hold_proxies_and_disconnected_models -- --exact" }
       ],
       "rejects": [
         "HOLD",
@@ -247,7 +241,7 @@
       ],
       "measurement": "host event p95<=100ms, nav p95<=50ms, typing p95<=16ms, scroll 60fps, idle CPU<1%, no sync fs/process/port/network on paint/input",
       "artifacts": [
-        { "path": "src/ui/shell.rs", "kind": "absent", "sha256": "ABSENT", "run_identity": "cargo test --test ui_quality_gates quality_phase5_promotion_contract_rejects_hold_proxies_and_disconnected_models -- --exact" }
+        { "path": "src/ui/shell.rs", "kind": "present_insufficient", "sha256": "LIVE", "run_identity": "cargo test --test ui_quality_gates quality_phase5_promotion_contract_rejects_hold_proxies_and_disconnected_models -- --exact" }
       ],
       "rejects": [
         "HOLD",
@@ -261,8 +255,8 @@
       "hold_ids": ["desktop_mobile_anatomy", "task_cockpit_shell"],
       "measurement": "desktop and mobile Task Cockpit anatomy PNGs at dark/light and compact/comfortable",
       "artifacts": [
-        { "path": "src/ui/shell.rs", "kind": "absent", "sha256": "ABSENT", "run_identity": "cargo test --test ui_quality_gates quality_phase5_promotion_contract_rejects_hold_proxies_and_disconnected_models -- --exact" },
-        { "path": "src/ui/task_cockpit", "kind": "absent", "sha256": "ABSENT", "run_identity": "cargo test --test ui_quality_gates quality_phase5_promotion_contract_rejects_hold_proxies_and_disconnected_models -- --exact" }
+        { "path": "src/ui/shell.rs", "kind": "present_insufficient", "sha256": "LIVE", "run_identity": "cargo test --test ui_quality_gates quality_phase5_promotion_contract_rejects_hold_proxies_and_disconnected_models -- --exact" },
+        { "path": "src/ui/task_cockpit", "kind": "present_insufficient", "sha256": "LIVE", "run_identity": "cargo test --test ui_quality_gates quality_phase5_promotion_contract_rejects_hold_proxies_and_disconnected_models -- --exact" }
       ],
       "rejects": [
         "HOLD",
@@ -276,7 +270,7 @@
       "hold_ids": ["ui_actions_tests"],
       "measurement": "tests/ui_actions.rs GPUI dispatch of ActionCatalog create/rename on the shell",
       "artifacts": [
-        { "path": "tests/ui_actions.rs", "kind": "absent", "sha256": "ABSENT", "run_identity": "cargo test --test ui_quality_gates quality_phase5_promotion_contract_rejects_hold_proxies_and_disconnected_models -- --exact" }
+        { "path": "tests/ui_actions.rs", "kind": "present_insufficient", "sha256": "LIVE", "run_identity": "cargo test --test ui_quality_gates quality_phase5_promotion_contract_rejects_hold_proxies_and_disconnected_models -- --exact" }
       ],
       "rejects": [
         "HOLD",

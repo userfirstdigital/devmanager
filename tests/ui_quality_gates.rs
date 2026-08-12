@@ -31,7 +31,7 @@ use devmanager::ui::quality::{
     MAX_QUALITY_CONTROLS, MAX_QUALITY_STRING_SCALARS, QUALITY_SCHEMA,
     TIMELINE_VIRTUALIZATION_LIMIT, VIRTUALIZATION_WINDOW,
 };
-use devmanager::ui::tokens::{contrast_ratio, theme, Density, StatusMeaning, ThemeMode};
+use devmanager::ui::tokens::{contrast_ratio, theme, Density, Scale, StatusMeaning, ThemeMode};
 
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -77,6 +77,31 @@ fn require_missing_files(paths: &[&str]) {
         assert!(
             !workspace_root().join(relative).exists(),
             "{relative} exists; this isolated quality slice must not treat that dependency as satisfied until Phase 5 union tests pass"
+        );
+    }
+}
+
+fn require_present_insufficient(paths: &[&str]) {
+    let contract = load_promotion_contract();
+    for relative in paths {
+        let path = workspace_root().join(relative);
+        assert!(
+            path.exists(),
+            "{relative} must exist as a present_insufficient promotion artifact"
+        );
+        let recorded = contract
+            .gates
+            .iter()
+            .flat_map(|gate| &gate.artifacts)
+            .any(|artifact| {
+                artifact.path == *relative
+                    && artifact.kind == "present_insufficient"
+                    && artifact.sha256 == "LIVE"
+                    && artifact.run_identity == PROMOTION_HOLD_RUN
+            });
+        assert!(
+            recorded,
+            "{relative} must stay present_insufficient LIVE under {PROMOTION_HOLD_RUN}; source presence alone cannot promote"
         );
     }
 }
@@ -159,7 +184,26 @@ struct PromotionArtifact {
 }
 
 fn live_sha256(path: &Path) -> String {
-    format!("{:x}", Sha256::digest(fs::read(path).expect("hash file")))
+    if path.is_file() {
+        return format!("{:x}", Sha256::digest(fs::read(path).expect("hash file")));
+    }
+    assert!(
+        path.is_dir(),
+        "present_insufficient path must be a live file or directory: {}",
+        path.display()
+    );
+    let mut entries = fs::read_dir(path)
+        .expect("hash directory")
+        .map(|entry| {
+            entry
+                .expect("directory entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect::<Vec<_>>();
+    entries.sort();
+    format!("{:x}", Sha256::digest(entries.join("\n").as_bytes()))
 }
 
 fn quality_gate_source() -> String {
@@ -405,7 +449,7 @@ fn quality_focus_epoch_uses_shared_interaction_state_model() {
     );
     assert!(model.pointer_down(12, second));
     assert!(model.pointer_up(12, second));
-    require_missing_files(&[
+    require_present_insufficient(&[
         "src/ui/shell.rs",
         "tests/ui_focus.rs",
         "src/ui/task_cockpit",
@@ -430,7 +474,7 @@ fn quality_keyboard_activation_uses_shared_interaction_state_model() {
         !model.key_activate(KeyboardKey::Tab, epoch),
         "Tab is not an InteractionStateModel activation; cockpit wrap remains HOLD"
     );
-    require_missing_files(&["src/ui/shell.rs", "tests/ui_focus.rs"]);
+    require_present_insufficient(&["src/ui/shell.rs", "tests/ui_focus.rs"]);
 }
 
 #[test]
@@ -501,7 +545,7 @@ fn quality_scale_contracts_cover_100_125_150_and_200_percent() {
             .expect_err("token DPI math is not PNG/200% proof"),
         &["gpui_png_readback"],
     );
-    require_missing_files(&["scripts/native-next/Capture-UiPreviews.ps1"]);
+    require_present_insufficient(&["scripts/native-next/Capture-UiPreviews.ps1"]);
 }
 
 #[test]
@@ -665,7 +709,8 @@ fn quality_timeline_20k_holds_without_a_semantic_event_journal() {
             && !events.contains("ToolUse"),
         "semantic timeline cannot be closed by inventing message/tool/question events"
     );
-    require_missing_files(&["src/ui/renderers", "src/ui/virtual_list.rs"]);
+    require_present_insufficient(&["src/ui/renderers"]);
+    require_missing_files(&["src/ui/virtual_list.rs", "tests/renderer_registry.rs"]);
     let quality = fs::read_to_string(workspace_root().join("src/ui/quality.rs")).expect("quality");
     assert!(
         !quality.contains("format!(\"{kind}-{index") && !quality.contains("inbox-0000"),
@@ -704,9 +749,7 @@ fn quality_path_authority_is_preview_not_a_forked_scanner() {
 
 #[test]
 fn quality_preview_cli_and_pixel_readback_hold_without_canonical_shell() {
-    assert!(!workspace_root().join("src/ui/shell.rs").exists());
-    assert!(!workspace_root().join("src/ui/task_cockpit").exists());
-    assert!(!workspace_root().join("src/ui/renderers").exists());
+    require_present_insufficient(&["src/ui/shell.rs", "src/ui/task_cockpit", "src/ui/renderers"]);
 
     let args = [
         "--ui-preview".to_string(),
@@ -844,7 +887,7 @@ fn quality_source_rejects_manual_dpi_or_occlusion_hold_claimed_as_pass() {
         .find(|surface| surface.id == "content_states")
         .expect("content_states mapping");
     assert_eq!(content.owning_gate, "anatomy");
-    require_missing_files(&["scripts/native-next/Capture-UiPreviews.ps1"]);
+    require_present_insufficient(&["scripts/native-next/Capture-UiPreviews.ps1"]);
     let mut focus = FocusCoordinator::new();
     let surface = load_named_surface("scales.json", &mut focus);
     require_hold(
@@ -1288,6 +1331,31 @@ fn quality_fixtures_stay_on_the_isolated_preview_surface_and_refuse_production_p
         refused,
         QualityError::SensitivePath { .. } | QualityError::OutsideQualityRoot { .. }
     ));
+}
+
+#[test]
+fn quality_browser_artifact_count_uses_token_contrast_pair() {
+    let source = fs::read_to_string(workspace_root().join("src/ui/task_cockpit/browser_panel.rs"))
+        .expect("browser panel source");
+    assert!(
+        source.contains("tokens.text.muted")
+            && source.contains("tokens.surfaces.canvas")
+            && source.contains("ThemeTokens"),
+        "artifact-count label must use ThemeTokens text_muted on canvas"
+    );
+    assert!(
+        !source.contains("TEXT_DIM")
+            && !source.contains("PANEL_BG")
+            && !source.contains("crate::theme"),
+        "browser panel artifact surface must not keep the legacy TEXT_DIM/PANEL_BG pair"
+    );
+    for mode in [ThemeMode::Dark, ThemeMode::Light] {
+        let tokens = theme(mode, Density::Comfortable, Scale::Scale100);
+        assert!(
+            contrast_ratio(tokens.text.muted, tokens.surfaces.canvas) >= 4.5,
+            "{mode:?} text_muted on canvas must keep the 4.5:1 token contrast invariant"
+        );
+    }
 }
 
 fn contains_direct_color_literal(source: &str) -> bool {
