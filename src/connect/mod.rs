@@ -110,7 +110,8 @@ pub use org_prompts::{
     OrganizationPromptSnapshot,
 };
 pub use permission::{
-    ActionId, AuthoritativePermissionContext, ConnectRole, KnownAction, PermissionDecision,
+    resolve_host_capability_grant, ActionId, AuthoritativePermissionContext, ConnectRole,
+    HostCapabilityGrant, HostConnectAction, HostConnectRole, KnownAction, PermissionDecision,
     PermissionDenyReason, PermissionEvaluator, PermissionRequest, ScopedPermissionGrant,
 };
 pub use permissions::{action_for_client_request, SessionAuthorizer, SessionPermissionContext};
@@ -162,11 +163,12 @@ pub use telemetry::{
     OBSERVATION_SCHEMA_REVISION, OBSERVATION_STALE_AFTER_MS,
 };
 pub use transport::{
-    decode_inner, encode_inner, validate_event_page, validate_snapshot_page,
-    BrowserExtensionDescriptor, ConnectRoute, ConnectTransport, ConnectTransportError,
-    FramedConnectTransport, ProjectionError, ProjectionExtensions, ProjectionResponse,
-    ProjectionSource, PromptExtensionDescriptor, ReplayRequest, SealedFramedConnectTransport,
-    SnapshotRequest, MAX_CONNECT_RESUME_CURSOR_BYTES,
+    decode_inner, encode_inner, select_connect_route, validate_advertised_relay_url,
+    validate_event_page, validate_snapshot_page, BrowserExtensionDescriptor, ConnectNoRouteReason,
+    ConnectRoute, ConnectTransport, ConnectTransportError, FramedConnectTransport, ProjectionError,
+    ProjectionExtensions, ProjectionResponse, ProjectionSource, PromptExtensionDescriptor,
+    ReplayRequest, SealedFramedConnectTransport, SelectedConnectRoute, SnapshotRequest,
+    MAX_ADVERTISED_RELAY_URL_BYTES, MAX_CONNECT_RESUME_CURSOR_BYTES,
 };
 pub use update::{PairingContinuity, UpdateContinuity, UpdateContinuityError};
 pub use watcher::{FleetWatcherView, TaskWatcherView, WatcherProjection};

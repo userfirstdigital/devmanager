@@ -3,6 +3,8 @@
 // browser state is an allowlisted, flat projection and cannot represent host
 // configuration, secrets, environment values, or startup commands.
 
+import type { CapabilityGrant } from "../connect/permissions";
+
 export const WEB_PROTOCOL_VERSION = 3;
 
 export type StableSessionKey = string;
@@ -410,6 +412,10 @@ export type WsOutbound =
       serverId: string;
       protocolVersion: number;
       webBuildId: string;
+      /** Additive host-authenticated relay advertisement. */
+      relayUrl?: string | null;
+      /** Explicit host role grant; absent metadata is not owner authority. */
+      capabilityGrant?: CapabilityGrant | null;
     }
   | { type: "snapshot"; workspace: WebWorkspaceSnapshot }
   | { type: "delta"; delta: WebWorkspaceDelta }

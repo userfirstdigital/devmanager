@@ -19,10 +19,15 @@ import {
   classifyInboundFrame,
   inboundTextByteLength,
   isRawTerminalWriterFrame,
+  parseAdvertisedRelayUrl,
   selectConnectRoute,
   type ConnectRoute,
   type ConnectRouteSelection,
 } from "../connect/transport";
+import {
+  parseHostCapabilityGrant,
+  type CapabilityGrant,
+} from "../connect/permissions";
 
 export type WsStatus =
   | { kind: "idle" }
@@ -278,6 +283,8 @@ export class WsClient {
   private pendingOutboundBytes = 0;
   private handshakeReady = false;
   private route: ConnectRoute | null = null;
+  private hostAdvertisedRelayUrl: string | null = null;
+  private hostCapabilityGrant: CapabilityGrant | null = null;
 
   constructor(
     private readonly cb: WsClientCallbacks,
@@ -288,6 +295,11 @@ export class WsClient {
     return this.route;
   }
 
+  /** The last explicitly authenticated host grant; absent metadata is null. */
+  currentCapabilityGrant(): CapabilityGrant | null {
+    return this.hostCapabilityGrant;
+  }
+
   async start(): Promise<void> {
     if (this.stopped || this.starting) return;
     if (this.ws?.readyState === WebSocket.OPEN) return;
@@ -295,6 +307,7 @@ export class WsClient {
 
     const epoch = ++this.connectionEpoch;
     this.starting = true;
+    this.hostCapabilityGrant = null;
     this.cb.onStatus({ kind: "connecting" });
 
     try {
@@ -321,9 +334,13 @@ export class WsClient {
     this.route = selectConnectRoute({
       preferDirect: this.options.preferDirect,
       directAvailable: this.options.directAvailable,
-      relayUrl: this.options.relayUrl,
+      relayUrl: this.options.relayUrl ?? this.hostAdvertisedRelayUrl,
       location,
     });
+    if (this.route.kind === "noRoute") {
+      this.cb.onStatus({ kind: "closed", reason: this.route.reason });
+      return;
+    }
     let socket: WebSocket;
     try {
       socket = new WebSocket(this.route.url);
@@ -401,6 +418,17 @@ export class WsClient {
               receivedProtocolVersion: parsed.protocolVersion,
             });
             return;
+          }
+          this.hostAdvertisedRelayUrl =
+            "relayUrl" in parsed
+              ? parseAdvertisedRelayUrl(parsed.relayUrl)
+              : null;
+          if ("capabilityGrant" in parsed) {
+            this.hostCapabilityGrant = parseHostCapabilityGrant(
+              parsed.capabilityGrant,
+            );
+          } else {
+            this.hostCapabilityGrant = null;
           }
           this.completeHello(socket, epoch);
           this.cb.onMessage(parsed);

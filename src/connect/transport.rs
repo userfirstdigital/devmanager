@@ -23,6 +23,7 @@ use crate::protocol::{
 };
 
 use super::crypto::{ConnectCryptoError, ConnectSealedFrame, EndToEndChannel};
+use super::direct::query_contains_pairing_secret;
 use super::envelope::{
     ChunkContext, ConnectEnvelope, ConnectLimitError, ConnectLimits, EnvelopeError,
 };
@@ -32,6 +33,78 @@ use super::envelope::{
 pub enum ConnectRoute {
     Direct,
     Relay,
+}
+
+pub const MAX_ADVERTISED_RELAY_URL_BYTES: usize = 2_048;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectNoRouteReason {
+    AdvertisedRelayAbsent,
+    AdvertisedRelayInvalid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelectedConnectRoute {
+    Direct,
+    Relay { url: String },
+    NoRoute { reason: ConnectNoRouteReason },
+}
+
+fn advertised_shares_direct_origin(advertised: &url::Url, direct_url: &str) -> bool {
+    let Ok(direct) = url::Url::parse(direct_url) else {
+        return false;
+    };
+    advertised.scheme() == direct.scheme() && advertised.host() == direct.host()
+}
+
+/// Validate a host-advertised relay endpoint. Pairing secrets, credentials,
+/// non-WebSocket schemes, and same-origin direct URLs fail closed.
+pub fn validate_advertised_relay_url(
+    raw: &str,
+    direct_url: Option<&str>,
+) -> Result<String, ConnectNoRouteReason> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.len() > MAX_ADVERTISED_RELAY_URL_BYTES {
+        return Err(ConnectNoRouteReason::AdvertisedRelayInvalid);
+    }
+    let parsed =
+        url::Url::parse(trimmed).map_err(|_| ConnectNoRouteReason::AdvertisedRelayInvalid)?;
+    if parsed.scheme() != "ws" && parsed.scheme() != "wss" {
+        return Err(ConnectNoRouteReason::AdvertisedRelayInvalid);
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(ConnectNoRouteReason::AdvertisedRelayInvalid);
+    }
+    if parsed.host_str().map_or(true, str::is_empty) || parsed.fragment().is_some() {
+        return Err(ConnectNoRouteReason::AdvertisedRelayInvalid);
+    }
+    if query_contains_pairing_secret(parsed.query()) {
+        return Err(ConnectNoRouteReason::AdvertisedRelayInvalid);
+    }
+    if direct_url.is_some_and(|direct| advertised_shares_direct_origin(&parsed, direct)) {
+        return Err(ConnectNoRouteReason::AdvertisedRelayInvalid);
+    }
+    Ok(trimmed.to_string())
+}
+
+pub fn select_connect_route(
+    prefer_direct: bool,
+    direct_available: bool,
+    advertised_relay_url: Option<&str>,
+    direct_url: &str,
+) -> SelectedConnectRoute {
+    if prefer_direct && direct_available {
+        return SelectedConnectRoute::Direct;
+    }
+    match advertised_relay_url {
+        None | Some("") => SelectedConnectRoute::NoRoute {
+            reason: ConnectNoRouteReason::AdvertisedRelayAbsent,
+        },
+        Some(raw) => match validate_advertised_relay_url(raw, Some(direct_url)) {
+            Ok(url) => SelectedConnectRoute::Relay { url },
+            Err(reason) => SelectedConnectRoute::NoRoute { reason },
+        },
+    }
 }
 
 /// A transport implementation moves already-authenticated envelopes. It does
@@ -594,5 +667,43 @@ mod tests {
         )
         .expect_err("source-level is not production");
         assert!(matches!(err, ConnectTransportError::Closed));
+    }
+
+    #[test]
+    fn direct_is_preferred_when_available() {
+        const DIRECT: &str = "ws://example.test/api/ws?browserInstallId=browser-install-uuid";
+        const RELAY: &str = "wss://relay.example.test/connect";
+        assert_eq!(
+            select_connect_route(true, true, Some(RELAY), DIRECT),
+            SelectedConnectRoute::Direct
+        );
+    }
+
+    #[test]
+    fn relay_selection_fails_closed_without_a_distinct_valid_advertisement() {
+        const DIRECT: &str = "ws://example.test/api/ws?browserInstallId=browser-install-uuid";
+        const RELAY: &str = "wss://relay.example.test/connect";
+        assert_eq!(
+            select_connect_route(true, false, Some(RELAY), DIRECT),
+            SelectedConnectRoute::Relay {
+                url: RELAY.to_owned()
+            }
+        );
+        assert_eq!(
+            select_connect_route(true, false, None, DIRECT),
+            SelectedConnectRoute::NoRoute {
+                reason: ConnectNoRouteReason::AdvertisedRelayAbsent
+            }
+        );
+        assert_eq!(
+            select_connect_route(true, false, Some(DIRECT), DIRECT),
+            SelectedConnectRoute::NoRoute {
+                reason: ConnectNoRouteReason::AdvertisedRelayInvalid
+            }
+        );
+        assert_eq!(
+            validate_advertised_relay_url("wss://relay.example.test/connect?t=PAIRING-CODE", None),
+            Err(ConnectNoRouteReason::AdvertisedRelayInvalid)
+        );
     }
 }

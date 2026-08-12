@@ -21,8 +21,11 @@ use super::envelope::{
     MAX_CONNECT_REASSEMBLED_MESSAGE_BYTES,
 };
 use super::epoch::{FocusEpoch, TurnEpoch};
+use super::permission::HostCapabilityGrant;
 use super::presence::LastSenderHint;
-use super::transport::{BrowserExtensionDescriptor, PromptExtensionDescriptor};
+use super::transport::{
+    validate_advertised_relay_url, BrowserExtensionDescriptor, PromptExtensionDescriptor,
+};
 
 pub const CONNECT_PAYLOAD_SCHEMA_VERSION: u16 = 1;
 
@@ -211,6 +214,12 @@ pub struct HelloPayload {
     pub capabilities: CapabilitySet,
     pub limits: ConnectLimits,
     pub privacy_class: ConnectPrivacyClass,
+    /// Optional host route advertisement for relay-capable peers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_url: Option<String>,
+    /// Optional explicit host grant. Omission is no authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_grant: Option<HostCapabilityGrant>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -534,6 +543,13 @@ impl ConnectPayload {
                         reason: "hello cannot advertise RawContent as the default privacy class",
                     });
                 }
+                if let Some(relay_url) = hello.relay_url.as_deref() {
+                    validate_advertised_relay_url(relay_url, None).map_err(|_| {
+                        PayloadDecodeError::Ambiguous {
+                            reason: "hello advertised relay URL is invalid",
+                        }
+                    })?;
+                }
             }
             Self::SnapshotPage(page) => {
                 limits.validate_page(page.items.len(), u64::from(page.encoded_bytes))?;
@@ -670,6 +686,8 @@ pub fn canonical_schema_fixtures() -> Vec<CanonicalSchemaFixture> {
                 capabilities: empty_caps,
                 limits: ConnectLimits::v1_default(),
                 privacy_class: ConnectPrivacyClass::LocalOnly,
+                relay_url: None,
+                capability_grant: None,
             }),
         },
         CanonicalSchemaFixture {
@@ -864,5 +882,45 @@ mod optional_binary {
         fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
             super::binary_payload::deserialize(deserializer).map(Self)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hello(
+        relay_url: Option<String>,
+        capability_grant: Option<HostCapabilityGrant>,
+    ) -> HelloPayload {
+        HelloPayload {
+            capabilities: CapabilitySet::empty(),
+            limits: ConnectLimits::v1_default(),
+            privacy_class: ConnectPrivacyClass::LocalOnly,
+            relay_url,
+            capability_grant,
+        }
+    }
+
+    #[test]
+    fn hello_boundary_fields_are_additive_and_fail_closed() {
+        let encoded = serde_json::to_string(&hello(None, None)).expect("encode");
+        assert!(!encoded.contains("relay_url"));
+        assert!(!encoded.contains("capability_grant"));
+        let decoded: HelloPayload = serde_json::from_str(&encoded).expect("decode");
+        assert_eq!(decoded.relay_url, None);
+        assert_eq!(decoded.capability_grant, None);
+        ConnectPayload::Hello(decoded)
+            .validate(ConnectLimits::v1_default())
+            .expect("omitted optional authority is valid");
+    }
+
+    #[test]
+    fn hello_rejects_invalid_relay_advertisement() {
+        let payload = ConnectPayload::Hello(hello(
+            Some("https://relay.example.test/connect".to_owned()),
+            None,
+        ));
+        assert!(payload.validate(ConnectLimits::v1_default()).is_err());
     }
 }

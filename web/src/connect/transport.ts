@@ -5,23 +5,33 @@ export type ConnectTransportKind = "direct" | "relay";
 export type ConnectRouteReason =
   | "preferredDirect"
   | "directUnavailable"
-  | "explicitFallback";
+  | "explicitFallback"
+  | "advertisedRelayAbsent"
+  | "advertisedRelayInvalid";
 
 export interface ConnectLocationLike {
   protocol: string;
   host: string;
 }
 
-export interface ConnectRoute {
-  kind: ConnectTransportKind;
-  url: string;
-  reason: ConnectRouteReason;
-}
+export type ConnectRoute =
+  | {
+      kind: ConnectTransportKind;
+      url: string;
+      reason: Exclude<
+        ConnectRouteReason,
+        "advertisedRelayAbsent" | "advertisedRelayInvalid"
+      >;
+    }
+  | {
+      kind: "noRoute";
+      reason: "advertisedRelayAbsent" | "advertisedRelayInvalid";
+    };
 
 export interface ConnectRouteSelection {
   preferDirect?: boolean;
   directAvailable?: boolean;
-  /** Same-origin host `/api/ws` only; any other value is ignored. */
+  /** Host-authenticated relay advertisement; never a user-entered fallback. */
   relayUrl?: string | null;
   location: ConnectLocationLike;
 }
@@ -38,6 +48,51 @@ export const MIN_SESSION_OUTPUT_FRAME_BYTES = 1 + 4 + 8;
 export const SESSION_OUTPUT_FRAME_TYPE = 0x01;
 
 const inboundEncoder = new TextEncoder();
+const MAX_ADVERTISED_RELAY_URL_BYTES = 2_048;
+const PAIRING_QUERY_KEYS = new Set([
+  "t",
+  "token",
+  "pairing",
+  "pairingToken",
+  "pairing_token",
+]);
+
+/** Validate a host-advertised WebSocket relay without accepting pairing data. */
+export function parseAdvertisedRelayUrl(raw: unknown): string | null {
+  if (typeof raw !== "string") return null;
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.length > MAX_ADVERTISED_RELAY_URL_BYTES) return null;
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== "ws:" && parsed.protocol !== "wss:") return null;
+  if (!parsed.hostname || parsed.username || parsed.password || parsed.hash) {
+    return null;
+  }
+  for (const key of parsed.searchParams.keys()) {
+    if (PAIRING_QUERY_KEYS.has(key)) return null;
+  }
+  return trimmed;
+}
+
+function sharesDirectOrigin(
+  advertised: string,
+  location: ConnectLocationLike,
+): boolean {
+  try {
+    const advertisedUrl = new URL(advertised);
+    const directUrl = new URL(buildWebSocketUrl(location));
+    return (
+      advertisedUrl.protocol === directUrl.protocol &&
+      advertisedUrl.host === directUrl.host
+    );
+  } catch {
+    return false;
+  }
+}
 
 export function selectConnectRoute(
   selection: ConnectRouteSelection,
@@ -52,14 +107,20 @@ export function selectConnectRoute(
       reason: "preferredDirect",
     };
   }
-  const documentedRelay =
-    typeof selection.relayUrl === "string" &&
-    selection.relayUrl === hostUrl
-      ? selection.relayUrl
-      : hostUrl;
+  if (
+    selection.relayUrl === undefined ||
+    selection.relayUrl === null ||
+    selection.relayUrl.trim() === ""
+  ) {
+    return { kind: "noRoute", reason: "advertisedRelayAbsent" };
+  }
+  const advertised = parseAdvertisedRelayUrl(selection.relayUrl);
+  if (!advertised || sharesDirectOrigin(advertised, selection.location)) {
+    return { kind: "noRoute", reason: "advertisedRelayInvalid" };
+  }
   return {
     kind: "relay",
-    url: documentedRelay,
+    url: advertised,
     reason: directAvailable ? "explicitFallback" : "directUnavailable",
   };
 }

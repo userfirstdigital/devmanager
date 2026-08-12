@@ -6,6 +6,7 @@ import {
   collaborationUiVisible,
   deriveComposerMode,
   deriveConnectUiGate,
+  parseHostCapabilityGrant,
   resolveCapabilityGrant,
   roleFromHostGrant,
   type CapabilityGrant,
@@ -124,5 +125,45 @@ describe("connect UI gates", () => {
     ).toEqual(watcher);
     expect(collaborationUiVisible(0)).toBe(false);
     expect(collaborationUiVisible(2)).toBe(true);
+  });
+
+  it("rejects malformed grants and grants scoped to another task", () => {
+    expect(parseHostCapabilityGrant(undefined)).toBeNull();
+    expect(parseHostCapabilityGrant(null)).toBeNull();
+    expect(
+      parseHostCapabilityGrant({
+        role: "admin",
+        taskId: "tab:a",
+        actions: ["readTask"],
+      }),
+    ).toBeNull();
+    expect(
+      parseHostCapabilityGrant({
+        role: "owner",
+        taskId: "tab:a",
+        actions: ["readTask"],
+        inferred: true,
+      }),
+    ).toBeNull();
+    expect(
+      resolveCapabilityGrant({
+        statusKind: "open",
+        taskId: "tab:b",
+        grant: owner,
+      }),
+    ).toBeNull();
+  });
+
+  it("preserves explicit owner actions without upgrading omitted metadata", () => {
+    expect(
+      resolveCapabilityGrant({
+        statusKind: "open",
+        taskId: "tab:a",
+        grant: owner,
+      }),
+    ).toEqual(owner);
+    expect(
+      resolveCapabilityGrant({ statusKind: "open", taskId: "tab:a" }),
+    ).toBeNull();
   });
 });

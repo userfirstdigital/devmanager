@@ -1599,48 +1599,26 @@ describe("WsClient connect route and inbound bounds", () => {
     ).toBe(true);
   });
 
-  it("falls back to relay on the same host URL and refuses raw terminal", async () => {
+  it("does not fabricate a same-origin relay when advertisement is absent", async () => {
     const callbacks = clientCallbacks();
     const client = new WsClient(callbacks, { directAvailable: false });
     await client.start();
-    const socket = FakeWebSocket.instances[0];
-    socket.emitOpen();
-    socket.emitMessage(
-      JSON.stringify({
-        type: "writerLeaseState",
-        writerLease: {
-          ownerClientInstanceId: "browser-install-uuid",
-          generation: 8,
-          expiresAtEpochMs: 10_000,
-          youAreOwner: true,
-        },
-      }),
-    );
-
-    expect(client.currentRoute()).toMatchObject({
-      kind: "relay",
-      reason: "directUnavailable",
+    expect(FakeWebSocket.instances).toHaveLength(0);
+    expect(client.currentRoute()).toEqual({
+      kind: "noRoute",
+      reason: "advertisedRelayAbsent",
     });
-    expect(socket.url).toContain("/api/ws");
-    expect(
-      client.sendWithWriterLease({
-        type: "input",
-        sessionId: "pty-a",
-        text: "must not relay",
-      }),
-    ).toBe(false);
-    expect(
-      jsonFrames(socket).filter((frame) => frame.type === "input"),
-    ).toEqual([]);
-
-    const binary = new ArrayBuffer(32);
-    new DataView(binary).setUint8(0, 0x01);
-    socket.emitMessage(binary);
-    expect(callbacks.onSessionOutput).not.toHaveBeenCalled();
+    expect(callbacks.onStatus).toHaveBeenCalledWith({
+      kind: "closed",
+      reason: "advertisedRelayAbsent",
+    });
   });
 
   it("drops raw terminal staged before a relay route is selected", async () => {
-    const client = new WsClient(clientCallbacks(), { directAvailable: false });
+    const client = new WsClient(clientCallbacks(), {
+      directAvailable: false,
+      relayUrl: "wss://relay.example.test/connect",
+    });
     expect(
       client.sendWithWriterLease({
         type: "input",
@@ -1667,6 +1645,52 @@ describe("WsClient connect route and inbound bounds", () => {
     expect(jsonFrames(socket).filter((frame) => frame.type === "input")).toEqual(
       [],
     );
+  });
+
+  it("retains only an explicit host grant and relay advertisement from hello", async () => {
+    const client = new WsClient(clientCallbacks());
+    await client.start();
+    const socket = FakeWebSocket.instances[0];
+    socket.emitOpen(false);
+    socket.emitMessage(
+      JSON.stringify({
+        type: "hello",
+        clientId: "web-client",
+        serverId: "server-1",
+        protocolVersion: WEB_PROTOCOL_VERSION,
+        webBuildId: CLIENT_WEB_BUILD_ID,
+        relayUrl: "wss://relay.example.test/connect",
+        capabilityGrant: {
+          role: "watcher",
+          taskId: "tab:a",
+          actions: ["readTask", "readPresence"],
+        },
+      }),
+    );
+
+    expect(client.currentCapabilityGrant()).toEqual({
+      role: "watcher",
+      taskId: "tab:a",
+      actions: ["readTask", "readPresence"],
+    });
+  });
+
+  it("does not infer a role when hello grant metadata is absent or malformed", async () => {
+    const client = new WsClient(clientCallbacks());
+    await client.start();
+    const socket = FakeWebSocket.instances[0];
+    socket.emitOpen(false);
+    socket.emitMessage(
+      JSON.stringify({
+        type: "hello",
+        clientId: "web-client",
+        serverId: "server-1",
+        protocolVersion: WEB_PROTOCOL_VERSION,
+        webBuildId: CLIENT_WEB_BUILD_ID,
+        capabilityGrant: { role: "owner", taskId: "tab:a" },
+      }),
+    );
+    expect(client.currentCapabilityGrant()).toBeNull();
   });
 
   it("drops oversized inbound text after hello without delivering it", async () => {

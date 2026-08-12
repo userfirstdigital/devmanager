@@ -3,6 +3,8 @@
 use std::fmt;
 use std::num::NonZeroU16;
 
+use serde::{Deserialize, Serialize};
+
 use crate::domain::id::TaskId;
 
 use super::identity::{
@@ -97,6 +99,57 @@ pub enum ConnectRole {
     PairedOwner,
     Watcher { task_id: TaskId },
     Collaborator { task_id: TaskId },
+}
+
+/// Host-authenticated role labels carried by the Connect/Web boundary. The
+/// absence of this DTO is never interpreted as owner authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum HostConnectRole {
+    Owner,
+    Watcher,
+    Collaborator,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum HostConnectAction {
+    ReadTask,
+    ReadPresence,
+    MutateTask,
+    SendPrompt,
+    AnswerRequest,
+    ApproveDangerous,
+    ReadPersonalPrompts,
+}
+
+/// Explicit host-authenticated capability metadata. Unknown fields and enum
+/// values are rejected by serde; callers must treat missing/null as no grant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct HostCapabilityGrant {
+    pub role: HostConnectRole,
+    pub task_id: String,
+    pub actions: Vec<HostConnectAction>,
+}
+
+impl HostCapabilityGrant {
+    pub fn from_wire(value: Option<&serde_json::Value>) -> Option<Self> {
+        let value = value?;
+        if value.is_null() {
+            return None;
+        }
+        let grant: Self = serde_json::from_value(value.clone()).ok()?;
+        if grant.task_id.trim().is_empty() {
+            return None;
+        }
+        Some(grant)
+    }
+}
+
+/// Resolve only the explicit grant member. No grant member is fail-closed.
+pub fn resolve_host_capability_grant(metadata: &serde_json::Value) -> Option<HostCapabilityGrant> {
+    HostCapabilityGrant::from_wire(metadata.get("grant"))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -539,5 +592,49 @@ mod tests {
             ),
             PermissionDecision::Denied(PermissionDenyReason::ScopedGrantRequired)
         );
+    }
+
+    #[test]
+    fn host_grant_metadata_is_explicit_and_fail_closed() {
+        assert_eq!(resolve_host_capability_grant(&serde_json::json!({})), None);
+        assert_eq!(
+            resolve_host_capability_grant(&serde_json::json!({ "grant": null })),
+            None
+        );
+        assert_eq!(
+            resolve_host_capability_grant(&serde_json::json!({
+                "grant": {
+                    "role": "owner",
+                    "taskId": "task-1",
+                    "actions": ["unknownAction"]
+                }
+            })),
+            None
+        );
+    }
+
+    #[test]
+    fn host_grant_metadata_preserves_explicit_role_and_actions() {
+        let owner = resolve_host_capability_grant(&serde_json::json!({
+            "grant": {
+                "role": "owner",
+                "taskId": "task-1",
+                "actions": ["readTask", "approveDangerous"]
+            }
+        }))
+        .expect("explicit host grant");
+        assert_eq!(owner.role, HostConnectRole::Owner);
+        assert_eq!(owner.task_id, "task-1");
+        assert!(owner.actions.contains(&HostConnectAction::ApproveDangerous));
+
+        let watcher = resolve_host_capability_grant(&serde_json::json!({
+            "grant": {
+                "role": "watcher",
+                "taskId": "task-1",
+                "actions": ["readTask"]
+            }
+        }))
+        .expect("explicit watcher grant");
+        assert_eq!(watcher.role, HostConnectRole::Watcher);
     }
 }

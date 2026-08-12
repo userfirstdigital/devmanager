@@ -86,14 +86,68 @@ export function canUseOwnerControls(grant: CapabilityGrant | null): boolean {
   return grant?.role === "owner";
 }
 
+const HOST_ROLES = new Set<ConnectRole>(["owner", "watcher", "collaborator"]);
+const HOST_ACTIONS = new Set<ConnectAction>([
+  "readTask",
+  "readPresence",
+  "mutateTask",
+  "sendPrompt",
+  "answerRequest",
+  "approveDangerous",
+  "readPersonalPrompts",
+]);
+
+/**
+ * Decode an untrusted host hello grant without manufacturing authority.
+ * Unknown roles/actions, empty task ids, and malformed values fail closed.
+ */
+export function parseHostCapabilityGrant(raw: unknown): CapabilityGrant | null {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    return null;
+  }
+  const candidate = raw as Record<string, unknown>;
+  if (
+    Object.keys(candidate).some(
+      (key) => key !== "role" && key !== "taskId" && key !== "actions",
+    )
+  ) {
+    return null;
+  }
+  if (
+    typeof candidate.role !== "string" ||
+    !HOST_ROLES.has(candidate.role as ConnectRole)
+  ) {
+    return null;
+  }
+  if (typeof candidate.taskId !== "string" || candidate.taskId.trim() === "") {
+    return null;
+  }
+  if (!Array.isArray(candidate.actions)) return null;
+  const actions: ConnectAction[] = [];
+  for (const action of candidate.actions) {
+    if (
+      typeof action !== "string" ||
+      !HOST_ACTIONS.has(action as ConnectAction)
+    ) {
+      return null;
+    }
+    actions.push(action as ConnectAction);
+  }
+  return {
+    role: candidate.role as ConnectRole,
+    taskId: candidate.taskId,
+    actions,
+  };
+}
+
 export function resolveCapabilityGrant(input: {
   statusKind: ConnectConnectionKind;
   taskId: string;
-  grant?: CapabilityGrant | null;
+  grant?: CapabilityGrant | null | unknown;
 }): CapabilityGrant | null {
   if (input.statusKind === "unauthorized") return null;
-  if (input.grant) return input.grant;
-  return null;
+  const grant = parseHostCapabilityGrant(input.grant);
+  return grant?.taskId === input.taskId ? grant : null;
 }
 
 export function deriveConnectUiGate(input: {

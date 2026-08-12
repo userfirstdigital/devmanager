@@ -10,6 +10,7 @@ import {
   classifyInboundFrame,
   inboundTextByteLength,
   isRawTerminalWriterFrame,
+  parseAdvertisedRelayUrl,
   selectConnectRoute,
 } from "./transport";
 
@@ -43,24 +44,35 @@ describe("selectConnectRoute", () => {
     expect(allowsRawTerminal(route)).toBe(true);
   });
 
-  it("falls back to an explicit relay using the same host protocol URL", () => {
+  it("uses a valid host-advertised relay when direct is unavailable", () => {
     const hostUrl = buildWebSocketUrl(location);
+    const relayUrl = "wss://relay.example.test/connect";
     const route = selectConnectRoute({
       preferDirect: true,
       directAvailable: false,
-      relayUrl: hostUrl,
+      relayUrl,
       location,
     });
 
     expect(route).toEqual({
       kind: "relay",
-      url: hostUrl,
+      url: relayUrl,
       reason: "directUnavailable",
     });
     expect(allowsRawTerminal(route)).toBe(false);
+    if (route.kind === "relay") {
+      expect(route.url).not.toBe(hostUrl);
+    }
   });
 
-  it("ignores an undocumented relay URL and stays on the host contract", () => {
+  it("fails closed when relay metadata is absent or invalid", () => {
+    expect(
+      selectConnectRoute({
+        preferDirect: true,
+        directAvailable: false,
+        location,
+      }),
+    ).toEqual({ kind: "noRoute", reason: "advertisedRelayAbsent" });
     const route = selectConnectRoute({
       preferDirect: false,
       directAvailable: true,
@@ -68,11 +80,28 @@ describe("selectConnectRoute", () => {
       location,
     });
 
-    expect(route.kind).toBe("relay");
-    expect(route.url).toBe(buildWebSocketUrl(location));
-    expect(route.url).not.toContain("relay.example");
-    expect(route.reason).toBe("explicitFallback");
-    expect(allowsRawTerminal(route)).toBe(false);
+    expect(route).toEqual({
+      kind: "relay",
+      url: "wss://relay.example/undocumented",
+      reason: "explicitFallback",
+    });
+    expect(
+      selectConnectRoute({
+        preferDirect: false,
+        directAvailable: true,
+        relayUrl: buildWebSocketUrl(location),
+        location,
+      }),
+    ).toEqual({ kind: "noRoute", reason: "advertisedRelayInvalid" });
+    expect(
+      parseAdvertisedRelayUrl("https://relay.example/connect"),
+    ).toBeNull();
+    expect(
+      parseAdvertisedRelayUrl("wss://user:secret@relay.example/connect"),
+    ).toBeNull();
+    expect(
+      parseAdvertisedRelayUrl("wss://relay.example/connect?t=PAIRCODE"),
+    ).toBeNull();
   });
 });
 
