@@ -807,8 +807,9 @@ impl NoiseHandshake {
             .prologue(&prologue_bytes)
             .map_err(|_| CryptoError::HandshakeFailed)?;
         let builder = if let Some(remote) = expected_remote {
+            let remote_bytes = remote.as_bytes();
             builder
-                .remote_public_key(&remote.as_bytes())
+                .remote_public_key(&remote_bytes)
                 .map_err(|_| CryptoError::HandshakeFailed)?
         } else {
             builder

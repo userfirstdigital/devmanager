@@ -80,10 +80,11 @@ pub use identity::{
     MAX_IDENTITY_PHYSICAL_BYTES, MAX_IDENTITY_RECEIPTS, MAX_ID_BYTES, MAX_LABEL_BYTES,
     PAIRING_CODE_LEN,
 };
+#[cfg(test)]
+pub use identity_store::InMemoryIdentityPersistence;
 pub use identity_store::{
-    ConnectProductionError, ConnectProductionSession, IdentityPersistence,
-    InMemoryIdentityPersistence, IsolatedRemoteStore, KernelIdentityPersistence,
-    LoadedRemoteDocument,
+    ConnectProductionError, ConnectProductionSession, IdentityPersistence, IsolatedRemoteStore,
+    KernelIdentityPersistence, LoadedRemoteDocument,
 };
 pub use invites::{
     guest_may_perform, ContentClass, InviteAuditEvent, InviteAuditKind, InviteError,

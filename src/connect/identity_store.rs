@@ -14,6 +14,7 @@ use super::crypto::{
     ConnectNoiseIdentityBinding, ConnectNoiseStaticPublicKey, EndToEndChannel,
     CONNECT_NOISE_FIRST_PAIRING_PATTERN, CONNECT_NOISE_PINNED_DEVICE_PATTERN,
 };
+use super::envelope::ConnectLimits;
 use super::identity::{
     bind_device_credential_from_snapshot, current_epoch_ms, generate_transition_nonce,
     rotate_pairing_until_changed, seed_pairing_code, validate_device_record, BrowserPrivateStorage,
@@ -30,9 +31,7 @@ use super::identity_codec::{
     decode_identity_bytes, device_receipt, empty_receipt, enable_receipt, encode_identity_document,
     host_rotation_receipt, pairing_receipt, scan_bounded_json, IdentityDocument,
 };
-use super::transport::{
-    ConnectLimits, ConnectRoute, ConnectTransportError, SealedFramedConnectTransport,
-};
+use super::transport::{ConnectRoute, ConnectTransportError, SealedFramedConnectTransport};
 use crate::kernel::{KernelStore, StoreError};
 
 /// Isolated persistence seam used by this contract slice.

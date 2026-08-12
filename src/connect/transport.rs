@@ -234,6 +234,16 @@ pub struct SealedFramedConnectTransport<T> {
     closed: bool,
 }
 
+impl<T> fmt::Debug for SealedFramedConnectTransport<T> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SealedFramedConnectTransport")
+            .field("route", &self.route)
+            .field("closed", &self.closed)
+            .finish()
+    }
+}
+
 impl<T> SealedFramedConnectTransport<T> {
     pub(crate) fn new(
         io: T,
