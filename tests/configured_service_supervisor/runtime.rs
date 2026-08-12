@@ -20,8 +20,8 @@ use crate::services::model::{
     ServiceScope, StartupPolicy, StopPolicy,
 };
 use crate::services::supervisor::{
-    session_status_for_ui, FakeFailStage, FakeLaunchAuthority, ServiceSupervisor, SupervisorAction,
-    SupervisorError, SupervisorEventKind, SupervisorOutcome,
+    session_status_for_ui, FakeFailStage, FakeLaunchAuthority, ManagedLaunchAuthority,
+    ServiceSupervisor, SupervisorAction, SupervisorError, SupervisorEventKind, SupervisorOutcome,
 };
 use crate::state::SessionStatus;
 

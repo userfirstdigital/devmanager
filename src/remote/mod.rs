@@ -8562,6 +8562,7 @@ fn handle_client_connection_with_weak(
             semantic_cursors: HashMap::new(),
             subscribed_session_ids: HashSet::new(),
             bootstrapped_session_ids: HashSet::new(),
+            bootstrap_pending_session_ids: HashSet::new(),
             focused_session_id: snapshot.runtime_state.active_session_id.clone(),
             last_app_hash: app_hash,
             last_runtime_hash: runtime_hash,
@@ -10798,10 +10799,14 @@ mod tests {
         RemoteAccessSource, RemoteAction, RemoteClientHandle, RemoteClientInner, RemoteHostConfig,
         RemoteHostService, RemoteHostWorkLimiter, RemoteLatencyStats, RemoteListenerIdentity,
         RemoteMachineState, RemotePortAuthority, RemotePortAuthorityKind, RemoteSessionBootstrap,
-        RemoteSessionStreamEvent, RemoteTerminalInput, RemoteWorkspaceDelta,
-        RemoteWorkspaceSnapshot, ServerMessage, MAX_PENDING_REMOTE_REQUESTS,
-        REMOTE_PORT_AUTHORITY_MAX_AGE_MS,
+        RemoteSessionStreamEvent, RemoteStatePersistenceIoTestPhase, RemoteTerminalInput,
+        RemoteWorker, RemoteWorkerAdmissionPool, RemoteWorkerReaper, RemoteWorkerSpawnError,
+        RemoteWorkspaceDelta, RemoteWorkspaceSnapshot, ServerMessage,
+        HOST_CONFIG_PERSISTENCE_TEST_HOOK, MAX_PENDING_REMOTE_REQUESTS, PROTOCOL_VERSION,
+        REMOTE_PORT_AUTHORITY_MAX_AGE_MS, REMOTE_STATE_PERMISSION_VERIFY_TEST_HOOK,
+        REMOTE_STATE_PERSISTENCE_IO_TEST_HOOK,
     };
+    use crate::domain::id::ResourceId;
     use crate::domain::operation::ResourceFence;
     use crate::models::{PortStatus, SessionTab, TabType};
     use crate::process::identity::{ManagedProcessId, ManagedProcessIdentity, ProcessOwner};

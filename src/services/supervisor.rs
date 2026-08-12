@@ -896,7 +896,7 @@ impl<A: ManagedLaunchAuthority> ServiceSupervisor<A> {
     pub fn dependency_labels(&self) -> Vec<(ServiceId, Vec<ServiceId>)> {
         self.catalog
             .definitions()
-            .map(|definition| (definition.id.clone(), definition.dependencies().to_vec()))
+            .map(|definition| (definition.id.clone(), definition.dependencies.to_vec()))
             .collect()
     }
 
@@ -2010,11 +2010,5 @@ impl ManagedLaunchAuthority for FakeLaunchAuthority {
 
     fn residue_count(&self) -> usize {
         self.inner.borrow().live.len()
-    }
-}
-
-impl AdmissionSnapshot {
-    pub(crate) fn service(&self, id: &ServiceId) -> Option<&RuntimeRecord> {
-        self.services.get(id)
     }
 }

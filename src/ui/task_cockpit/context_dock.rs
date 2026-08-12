@@ -3,7 +3,7 @@
 //! The existing terminal remains a sibling. This dock never injects Web chrome
 //! and fails closed on a stale generation.
 
-use crate::browser::surface::{
+use crate::browser::{
     BrowserDockError, BrowserDockFocusTarget, BrowserDockGesture, BrowserDockSurface,
     BrowserPointerDisposition,
 };

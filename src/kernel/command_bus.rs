@@ -14,7 +14,9 @@ use std::time::Duration;
 use rusqlite::{Connection, OptionalExtension, Transaction};
 use sha2::{Digest, Sha256};
 
-use crate::domain::agent::{AgentRole, AgentSessionFacts, AgentSessionLifecycle};
+use crate::domain::agent::{
+    AgentRole, AgentSessionFacts, AgentSessionLifecycle, ProviderSessionId,
+};
 use crate::domain::artifact::{ArtifactFacts, ArtifactKind, PrivacyClass};
 use crate::domain::command::{
     decide, Command, CommandEnvelope, CommandReceipt, ConfirmHostQuitIntent, RejectionCode,
@@ -719,6 +721,7 @@ fn replay_prompt_library_receipt(
                 command_id: envelope.command_id,
                 code: RejectionCode::AlreadyExists,
                 current_revision: Some(current),
+                resolution: None,
             })
         }
         Err(error) => Err(map_prompt_store_error(error)),
@@ -1451,6 +1454,7 @@ fn record_outcome_in_tx(
         operation_id: receipt_op,
         event_ids,
         task_revision: receipt_revision,
+        prompt_mutation: _,
     } = &receipt_row.receipt
     else {
         return Err(StoreError::Corruption);
@@ -1987,6 +1991,7 @@ pub(crate) fn validate_dispatch_attempt_lineage(
         operation_id: receipt_operation_id,
         event_ids,
         task_revision,
+        prompt_mutation: _,
     } = &receipt_row.receipt
     else {
         return Err(StoreError::Corruption);
@@ -2053,6 +2058,7 @@ fn validate_dispatch_lineage(
         operation_id: receipt_operation_id,
         event_ids,
         task_revision,
+        prompt_mutation: _,
     } = &receipt_row.receipt
     else {
         return Err(StoreError::Corruption);
@@ -3173,6 +3179,7 @@ fn cancel_untouched_begin_close_for_reopen(
         operation_id: receipt_operation_id,
         event_ids,
         task_revision,
+        prompt_mutation: _,
     } = &receipt_row.receipt
     else {
         return Err(StoreError::Corruption);
@@ -3330,6 +3337,7 @@ fn execute_in_tx(
                 current_revision,
                 accepted_at_ms,
                 resolution,
+                scope,
             )
         }
         Ok(decision) => {
@@ -3562,7 +3570,7 @@ fn lookup_receipt_for_scope(
     let fingerprint_matches = fingerprint
         .as_deref()
         .is_some_and(|bytes| bytes == expected_fingerprint.as_slice());
-    let stored_payload_digest = payload_digest
+    let stored_payload_digest: Option<[u8; 32]> = payload_digest
         .as_deref()
         .map(|bytes| {
             bytes.try_into().map_err(|_| StoreError::CodecMismatch {
@@ -5053,6 +5061,7 @@ pub(crate) fn compact_terminal_outbox_payloads_in_tx(
             operation_id: receipt_operation_id,
             event_ids,
             task_revision,
+            prompt_mutation: _,
         } = &receipt_row.receipt
         else {
             return Err(StoreError::Corruption);
@@ -7344,6 +7353,7 @@ fn persist_rejection(
         current_revision,
         created_at_ms,
         None,
+        scope,
     )
 }
 
@@ -7355,6 +7365,7 @@ fn persist_rejection_with_resolution(
     current_revision: Option<u64>,
     created_at_ms: i64,
     resolution: Option<crate::domain::ProviderResolutionWinner>,
+    scope: ReceiptScope,
 ) -> Result<CommandReceipt, StoreError> {
     let receipt = CommandReceipt::Rejected {
         command_id: envelope.command_id,
@@ -7860,6 +7871,7 @@ pub(crate) fn load_task_snapshot(
         }
     }
 
+    let task_lifecycle = task_row.task.lifecycle;
     Ok(Some(TaskSnapshot {
         task: task_row.task,
         connectivity: task_row.connectivity,
@@ -7871,7 +7883,7 @@ pub(crate) fn load_task_snapshot(
         artifacts,
         resources,
         provider_sessions: load_provider_sessions(conn, task_id)?,
-        browser: load_browser_book(conn, task_id, task_row.task.lifecycle)?,
+        browser: load_browser_book(conn, task_id, task_lifecycle)?,
     }))
 }
 

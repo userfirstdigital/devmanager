@@ -1166,18 +1166,18 @@ impl TaskComposer {
             if let Some(reason) = availability.reason() {
                 metadata.set_description(reason)?;
             }
-            metadata.disabled = true;
+            metadata.set_disabled(true);
         }
         if let Some(model) = self.controls.get(&control) {
-            metadata.focused = model.state().focused;
-            metadata.busy = model.state().loading || self.pending.is_some();
+            metadata.set_focused(model.state().focused());
+            metadata.set_busy(model.state().is_loading() || self.pending.is_some());
         }
         Ok(metadata)
     }
 
     pub fn input_accessibility(&self) -> AccessibilityMetadata {
         let mut metadata = self.field.accessibility().clone();
-        metadata.busy = self.pending.is_some() || self.ime_composing;
+        metadata.set_busy(self.pending.is_some() || self.ime_composing);
         metadata
     }
 
@@ -3051,29 +3051,29 @@ mod tests {
         let mut epochs = FocusEpochSource::new();
         focus(&mut composer, &mut epochs);
         let epoch = epochs.current();
-        assert!(composer.input_accessibility().focused);
+        assert!(composer.input_accessibility().focused());
         assert!(
             !composer
                 .control_accessibility(ComposerControl::SendNow)
                 .expect("send")
-                .focused
+                .focused()
         );
         composer
             .focus_control(ComposerControl::SendNow, epoch)
             .expect("control focus");
-        assert!(!composer.input_accessibility().focused);
+        assert!(!composer.input_accessibility().focused());
         let send = composer
             .control_accessibility(ComposerControl::SendNow)
             .expect("send");
-        assert!(send.focused);
-        assert!(!send.busy);
+        assert!(send.focused());
+        assert!(!send.busy());
         composer
             .activate(ComposerControl::SendNow, epoch)
             .expect("pending");
         let busy = composer
             .control_accessibility(ComposerControl::SendNow)
             .expect("busy");
-        assert!(busy.busy);
-        assert!(composer.input_accessibility().busy);
+        assert!(busy.busy());
+        assert!(composer.input_accessibility().busy());
     }
 }

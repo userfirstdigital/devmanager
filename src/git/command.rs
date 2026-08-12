@@ -1828,21 +1828,16 @@ fn windows_path_units(path: &Path) -> Vec<u16> {
         })
         .collect::<Vec<_>>();
     const UNC_PREFIX: [u16; 8] = [
-        u16::from(b'\\'),
-        u16::from(b'\\'),
-        u16::from(b'?'),
-        u16::from(b'\\'),
-        u16::from(b'U'),
-        u16::from(b'N'),
-        u16::from(b'C'),
-        u16::from(b'\\'),
+        b'\\' as u16,
+        b'\\' as u16,
+        b'?' as u16,
+        b'\\' as u16,
+        b'U' as u16,
+        b'N' as u16,
+        b'C' as u16,
+        b'\\' as u16,
     ];
-    const DOS_PREFIX: [u16; 4] = [
-        u16::from(b'\\'),
-        u16::from(b'\\'),
-        u16::from(b'?'),
-        u16::from(b'\\'),
-    ];
+    const DOS_PREFIX: [u16; 4] = [b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
     if units.starts_with(&UNC_PREFIX) {
         units.splice(..UNC_PREFIX.len(), [u16::from(b'\\'), u16::from(b'\\')]);
     } else if units.starts_with(&DOS_PREFIX) {
@@ -8221,7 +8216,7 @@ fn canonicalize_approved_graph_roots_with_deadline(
         // Resolve and retain the directory identity during graph admission;
         // descendants are separately represented by graph nodes and handles.
         check_graph_deadline(deadline)?;
-        let _ = directory_identity_with_deadline(&canonical, deadline)?;
+        let _ = directory_identity_with_deadline(&canonical, Some(deadline))?;
         if !canonical_roots
             .iter()
             .any(|root| same_path(root, &canonical))

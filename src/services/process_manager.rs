@@ -833,9 +833,9 @@ impl ProcessManager {
 
     /// Open (or reuse) the one configured-service supervisor lifecycle.
     /// Fresh authority/live maps are not created per call.
-    pub(crate) fn ensure_configured_service_supervisor(
+    pub(crate) fn ensure_configured_service_supervisor<'a>(
         &self,
-        sources: impl IntoIterator<Item = crate::services::binding::ConfiguredServiceSource<'_>>,
+        sources: impl IntoIterator<Item = crate::services::binding::ConfiguredServiceSource<'a>>,
         host_id: crate::services::model::HostId,
         now_ms: u64,
     ) -> Result<(), crate::services::supervisor::SupervisorError> {
@@ -935,9 +935,9 @@ impl ProcessManager {
     }
 
     /// Legacy alias kept for call sites that still say "open"; reuses one lifecycle.
-    pub(crate) fn open_configured_service_supervisor(
+    pub(crate) fn open_configured_service_supervisor<'a>(
         &self,
-        sources: impl IntoIterator<Item = crate::services::binding::ConfiguredServiceSource<'_>>,
+        sources: impl IntoIterator<Item = crate::services::binding::ConfiguredServiceSource<'a>>,
         host_id: crate::services::model::HostId,
         now_ms: u64,
     ) -> Result<(), crate::services::supervisor::SupervisorError> {
@@ -1017,31 +1017,6 @@ impl ProcessManager {
                 op_id,
                 command_id: command_id.to_string(),
                 wait,
-                response,
-            })
-            .map(|_| ())
-    }
-
-    fn enqueue_kill_port_op(
-        &self,
-        command_id: &str,
-        port: u16,
-        launch: ServerLaunchSpec,
-        dimensions: SessionDimensions,
-        banner: &str,
-        response: Option<Sender<RemoteActionResult>>,
-    ) -> Result<(), String> {
-        validate_process_op_host_string(command_id, "server command identity")?;
-        validate_process_op_host_string(banner, "restart banner")?;
-        let op_id = next_op_id();
-        self.op_queue
-            .submit(ProcessOp::KillPortAndRestart {
-                op_id,
-                command_id: command_id.to_string(),
-                port,
-                launch,
-                dimensions,
-                banner: banner.to_string(),
                 response,
             })
             .map(|_| ())
@@ -1141,64 +1116,6 @@ impl ProcessManager {
             .map(|_| ())
     }
 
-    pub fn schedule_kill_port_and_restart(
-        &self,
-        app_state: &mut AppState,
-        command_id: &str,
-        port: u16,
-        dimensions: SessionDimensions,
-        banner: &str,
-        response: Option<Sender<RemoteActionResult>>,
-    ) -> Result<(), String> {
-        validate_process_op_host_string(command_id, "server command identity")?;
-        validate_process_op_host_string(banner, "restart banner")?;
-        self.validate_server_launch(app_state, command_id)?;
-        let lookup = app_state
-            .find_command(command_id)
-            .ok_or_else(|| format!("Unknown command `{command_id}`"))?;
-        let project_id = lookup.project.id.clone();
-        let command_id_owned = lookup.command.id.clone();
-        let command_label = lookup.command.label.clone();
-        let command_auto_restart = lookup.command.auto_restart.unwrap_or(false);
-        let cwd = PathBuf::from(lookup.folder.folder_path.clone());
-        let cwd = if cwd.is_dir() {
-            cwd
-        } else {
-            PathBuf::from(lookup.project.root_path.clone())
-        };
-        let env = build_command_env(lookup.folder, lookup.command);
-        let (program, args) =
-            build_server_launch_command(&app_state.config.settings, lookup.command);
-        let launch_spec = ServerLaunchSpec {
-            command_id: command_id_owned.clone(),
-            project_id: project_id.clone(),
-            cwd,
-            program,
-            args,
-            env,
-            auto_restart: command_auto_restart,
-            port: lookup.command.port,
-            log_file_path: build_server_log_file_path(
-                lookup.project,
-                lookup.folder,
-                lookup.command,
-            ),
-        };
-        app_state.open_server_tab(&project_id, &command_id_owned, Some(command_label));
-        self.update_session_state(&command_id_owned, |state| {
-            state.status = SessionStatus::Starting;
-            state.mark_dirty();
-        });
-        self.enqueue_kill_port_op(
-            &command_id_owned,
-            port,
-            launch_spec,
-            dimensions,
-            banner,
-            response,
-        )
-    }
-
     pub fn validate_server_launch(
         &self,
         app_state: &AppState,
@@ -1279,7 +1196,6 @@ impl ProcessManager {
             args: args.clone(),
             env: env.clone(),
             auto_restart: command_auto_restart,
-            port: lookup.command.port,
             log_file_path: build_server_log_file_path(
                 lookup.project,
                 lookup.folder,
@@ -1344,7 +1260,6 @@ impl ProcessManager {
             args: args.clone(),
             env: env.clone(),
             auto_restart: command_auto_restart,
-            port: lookup.command.port,
             log_file_path: build_server_log_file_path(
                 lookup.project,
                 lookup.folder,
@@ -7719,55 +7634,6 @@ pub(crate) fn execute_process_op_inner(
                 response,
             )
         }
-        ProcessOp::KillPortAndRestart {
-            command_id,
-            port,
-            launch,
-            dimensions,
-            banner,
-            response,
-            ..
-        } => {
-            let result = (|| {
-                let is_active = inner
-                    .runtime_state
-                    .read()
-                    .ok()
-                    .and_then(|runtime| {
-                        runtime
-                            .sessions
-                            .get(&command_id)
-                            .map(|session| session.status.is_live())
-                    })
-                    .unwrap_or(false);
-                if is_active && !manager.stop_server_and_wait(&command_id, Duration::from_secs(5)) {
-                    return Err(format!(
-                        "Managed process `{command_id}` did not stop cleanly."
-                    ));
-                }
-                let reconciliation_deadline = Instant::now()
-                    .checked_add(Duration::from_secs(1))
-                    .ok_or_else(|| "port reconciliation deadline overflow".to_string())?;
-                reconcile_port_listener_until(port, reconciliation_deadline)?;
-                spawn_server_session_with_inner(inner, &launch, dimensions)?;
-                let _ = manager
-                    .write_virtual_text(&command_id, &format!("\x1b[33m{banner}\x1b[0m\r\n"));
-                manager.update_session_state(&command_id, |state| {
-                    state.configure_server(launch.clone());
-                });
-                Ok(())
-            })();
-            (
-                ProcessOpKind::KillPortAndRestart,
-                result,
-                ProcessOpContext {
-                    session_id: Some(command_id.clone()),
-                    port: Some(port),
-                    ..Default::default()
-                },
-                response,
-            )
-        }
         ProcessOp::StartSsh {
             launch,
             session_id,
@@ -8374,29 +8240,6 @@ fn validate_process_op_host_string(value: &str, field: &str) -> Result<(), Strin
         ));
     }
     Ok(())
-}
-
-fn reconcile_port_listener_until(port: u16, absolute_deadline: Instant) -> Result<(), String> {
-    check_process_operation_deadline(absolute_deadline, "port listener reconciliation")?;
-    let listeners = platform_service::snapshot_listener_pids_until(&[port], absolute_deadline)?;
-    check_process_operation_deadline(absolute_deadline, "port listener reconciliation")?;
-    if let Some(pid) = listeners.get(&port) {
-        return Err(format!(
-            "Port {port} is still owned by external or unreconciled process {pid}; DevManager will not terminate it by PID."
-        ));
-    }
-    Ok(())
-}
-
-fn check_process_operation_deadline(
-    absolute_deadline: Instant,
-    context: &str,
-) -> Result<(), String> {
-    if Instant::now() >= absolute_deadline {
-        Err(format!("{context} exceeded its absolute deadline"))
-    } else {
-        Ok(())
-    }
 }
 
 fn spawn_ssh_session_with_inner(
@@ -9240,7 +9083,6 @@ mod tests {
             args: Vec::new(),
             env: HashMap::new(),
             auto_restart: true,
-            port: None,
             log_file_path: None,
         };
         let mut session = SessionRuntimeState::new(
@@ -12813,13 +12655,6 @@ mod tests {
             .contains("generation changed"));
 
         let _ = manager.close_session(session_id);
-    }
-
-    #[test]
-    fn kill_port_reconciliation_rejects_expired_deadline_before_platform_lookup() {
-        let error = reconcile_port_listener_until(43123, Instant::now())
-            .expect_err("an expired operation must not launch a listener helper");
-        assert!(error.contains("absolute deadline"), "{error}");
     }
 
     fn ownerless_process_projection(

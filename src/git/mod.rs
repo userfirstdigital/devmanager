@@ -223,7 +223,7 @@ impl GitWindow {
     }
 
     fn ensure_mutation_control(&mut self, cx: &mut Context<Self>) -> bool {
-        if matches!(self.backend, GitBackend::Local) && !self.ensure_config_write_available(cx) {
+        if matches!(self.backend, GitBackend::Local(_)) && !self.ensure_config_write_available(cx) {
             return false;
         }
         if self.has_mutation_control() {

@@ -1261,22 +1261,10 @@ impl ContextDock {
             .map(|(index, tool)| {
                 let unavailable = self.tool_availability(*tool).is_err();
                 let mut accessibility =
-                    AccessibilityMetadata::new(AccessibleRole::Tab, tool.label()).unwrap_or_else(
-                        |_| AccessibilityMetadata {
-                            role: AccessibleRole::Tab,
-                            name: tool.label().to_string(),
-                            description: String::new(),
-                            error: None,
-                            disabled: unavailable,
-                            busy: false,
-                            focused: self.focused_tab_index == Some(index),
-                            invalid: false,
-                            read_only: false,
-                            value: None,
-                        },
-                    );
-                accessibility.disabled = unavailable;
-                accessibility.focused = self.focused_tab_index == Some(index);
+                    AccessibilityMetadata::new(AccessibleRole::Tab, tool.label())
+                        .expect("dock tool name");
+                accessibility.set_disabled(unavailable);
+                accessibility.set_focused(self.focused_tab_index == Some(index));
                 DockTabProjection {
                     tool: *tool,
                     name: tool.label().to_string(),

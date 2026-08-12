@@ -233,8 +233,8 @@ pub fn with_task_workspace_root(
     Ok(binding)
 }
 
-pub fn bind_configured_services(
-    sources: impl IntoIterator<Item = ConfiguredServiceSource<'_>>,
+pub fn bind_configured_services<'a>(
+    sources: impl IntoIterator<Item = ConfiguredServiceSource<'a>>,
 ) -> Result<Vec<ConfiguredServiceBinding>, BindingError> {
     let mut bindings = Vec::new();
     let mut seen = BTreeMap::new();

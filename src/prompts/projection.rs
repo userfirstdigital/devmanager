@@ -1674,7 +1674,9 @@ pub(crate) fn settle_prompt_mutation(
     Ok(PromptMutationSettlement {
         schema_version: PROMPT_PROJECTION_SCHEMA_VERSION,
         receipt: receipt.clone(),
-        library_revision: store.library_projection_revision()?,
+        library_revision: store
+            .library_projection_revision()
+            .map_err(|_| PromptProjectionError::InvalidRequest)?,
         request_id: request.request_id,
         verified: true,
     })

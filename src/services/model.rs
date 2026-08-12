@@ -2016,6 +2016,10 @@ impl AdmissionSnapshot {
         self.services.insert(id, runtime);
     }
 
+    pub(crate) fn service(&self, id: &ServiceId) -> Option<&RuntimeRecord> {
+        self.services.get(id)
+    }
+
     pub(crate) fn set_task_epoch(&mut self, task_id: TaskId, epoch: ActionEpoch) {
         self.task_epochs.insert(task_id, epoch);
     }

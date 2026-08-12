@@ -5,7 +5,7 @@
 
 use gpui::{div, prelude::*, px, rgb, IntoElement, SharedString};
 
-use crate::browser::surface::BrowserDockSurface;
+use crate::browser::BrowserDockSurface;
 use crate::protocol::{BrowserProjectionMeta, BrowserSecurityState};
 use crate::theme;
 use crate::ui::task_cockpit::context_dock::BrowserContextDock;

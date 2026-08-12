@@ -10,14 +10,14 @@ use crate::domain::agent::{
 };
 use crate::domain::artifact::{
     structured_specialist_result, verify_inline_content_digest, ArtifactContentRef, ArtifactFacts,
-    ArtifactKind, SpecialistResult, MAX_SPECIALIST_RAW_ARTIFACT_BYTES,
+    ArtifactKind, MAX_SPECIALIST_RAW_ARTIFACT_BYTES,
 };
 use crate::domain::browser::{BrowserBook, BrowserContractError, BrowserDurableFact};
 use crate::domain::canonical;
 use crate::domain::host::{HostCleanupBranch, HostCleanupBranchOutcome};
 use crate::domain::id::{
-    AgentSessionId, ApprovalId, ArtifactId, ClientId, CommandId, EventId, OperationId, QuestionId,
-    ResourceId, TaskId, TurnId,
+    AgentSessionId, ApprovalId, ClientId, CommandId, EventId, OperationId, QuestionId, ResourceId,
+    TaskId, TurnId,
 };
 use crate::domain::operation::{
     validate_outcome_fence, validate_terminal_fact_source, CancellationReason, OperationErrorCode,
@@ -1183,9 +1183,13 @@ enum EventBody {
     AgentSessionRegistered(AgentSessionRegisteredPayload),
     #[serde(rename = "primary_agent.set")]
     PrimaryAgentSet(PrimaryAgentSetPayload),
+    #[serde(rename = "specialist.requested")]
     SpecialistRequested(SpecialistRequestedPayload),
+    #[serde(rename = "primary_agent.promoted")]
     PrimaryPromoted(PrimaryPromotedPayload),
+    #[serde(rename = "specialist.handoff_recorded")]
     SpecialistHandoffRecorded(SpecialistHandoffRecordedPayload),
+    #[serde(rename = "specialist.closed")]
     SpecialistClosed(SpecialistClosedPayload),
     #[serde(rename = "artifact.registered")]
     ArtifactRegistered(ArtifactRegisteredPayload),
@@ -1527,8 +1531,7 @@ impl TryFrom<EventDocument> for Event {
             },
 
             EventBody::SpecialistRequested(p) => {
-                p.validate()
-                    .map_err(|err| EventSerdeError::Payload(err.to_string()))?;
+                p.validate().map_err(|_| EventSerdeError::Payload)?;
                 Event::SpecialistRequested {
                     specialist_id: p.specialist_id,
                     requested_by: p.requested_by,
@@ -1542,8 +1545,7 @@ impl TryFrom<EventDocument> for Event {
                 }
             }
             EventBody::PrimaryPromoted(p) => {
-                p.validate()
-                    .map_err(|err| EventSerdeError::Payload(err.to_string()))?;
+                p.validate().map_err(|_| EventSerdeError::Payload)?;
                 Event::PrimaryPromoted {
                     previous: p.previous,
                     promoted: p.promoted,
@@ -1552,8 +1554,7 @@ impl TryFrom<EventDocument> for Event {
                 }
             }
             EventBody::SpecialistHandoffRecorded(p) => {
-                p.validate()
-                    .map_err(|err| EventSerdeError::Payload(err.to_string()))?;
+                p.validate().map_err(|_| EventSerdeError::Payload)?;
                 Event::SpecialistHandoffRecorded {
                     specialist_id: p.specialist_id,
                     artifact: p.artifact,
@@ -1614,9 +1615,7 @@ impl TryFrom<EventDocument> for Event {
             EventBody::OperationUncertain(fact) => Event::OperationUncertain(fact),
             EventBody::ProviderInputAccepted(p) => {
                 if p.delivery.is_delivered() {
-                    return Err(EventSerdeError::Payload(
-                        "provider input accepted event cannot claim delivery".into(),
-                    ));
+                    return Err(EventSerdeError::Payload);
                 }
                 let fence = ProviderFenceIdentity::new_with_identity(
                     Some(p.command_id),
@@ -1634,7 +1633,7 @@ impl TryFrom<EventDocument> for Event {
                     p.approval_id,
                 );
                 validate_provider_fence(&fence, Some(&p.action), Some(p.wait), None)
-                    .map_err(|err| EventSerdeError::Payload(err.to_string()))?;
+                    .map_err(|_| EventSerdeError::Payload)?;
                 Event::ProviderInputAccepted {
                     command_id: p.command_id,
                     client_id: p.client_id,
@@ -1667,7 +1666,7 @@ impl TryFrom<EventDocument> for Event {
                     None,
                 );
                 validate_provider_fence(&fence, None, None, None)
-                    .map_err(|err| EventSerdeError::Payload(err.to_string()))?;
+                    .map_err(|_| EventSerdeError::Payload)?;
                 Event::ProviderQuestionPresented {
                     agent_session_id: p.agent_session_id,
                     provider_kind: p.provider_kind,
@@ -1693,7 +1692,7 @@ impl TryFrom<EventDocument> for Event {
                     Some(p.approval_id),
                 );
                 validate_provider_fence(&fence, None, None, None)
-                    .map_err(|err| EventSerdeError::Payload(err.to_string()))?;
+                    .map_err(|_| EventSerdeError::Payload)?;
                 Event::ProviderApprovalPresented {
                     agent_session_id: p.agent_session_id,
                     provider_kind: p.provider_kind,
@@ -1706,7 +1705,7 @@ impl TryFrom<EventDocument> for Event {
             }
             EventBody::ProviderWaitSettled(p) => {
                 validate_provider_fence(&p.fence.identity(), None, None, None)
-                    .map_err(|err| EventSerdeError::Payload(err.to_string()))?;
+                    .map_err(|_| EventSerdeError::Payload)?;
                 Event::ProviderWaitSettled { fence: p.fence }
             }
             EventBody::ProviderInputDelivered(p) => {
@@ -1724,7 +1723,7 @@ impl TryFrom<EventDocument> for Event {
                     p.approval_id,
                 );
                 validate_provider_fence(&fence, None, None, None)
-                    .map_err(|err| EventSerdeError::Payload(err.to_string()))?;
+                    .map_err(|_| EventSerdeError::Payload)?;
                 Event::ProviderInputDelivered {
                     command_id: p.command_id,
                     client_id: p.client_id,
