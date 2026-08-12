@@ -1482,9 +1482,10 @@ mod tests {
         ActionRisk, ActionScope, ServiceControlArguments, TaskCreateArguments,
         TaskCreateV2Arguments, TaskRenameArguments, ACTION_BROWSER_NATIVE, ACTION_FILES_LIST,
         ACTION_FILES_READ, ACTION_GIT_STATUS, ACTION_HOST_ACTIONS, ACTION_HOST_STATUS,
-        ACTION_PROVIDER_ANSWER_QUESTION, ACTION_PROVIDER_NEW_CONVERSATION,
-        ACTION_PROVIDER_QUEUE_FOLLOW_UP, ACTION_PROVIDER_RESOLVE_APPROVAL,
-        ACTION_PROVIDER_SEND_NOW, ACTION_PROVIDER_START_SESSION,
+        ACTION_PROMPT_CHAIN_PAGE, ACTION_PROMPT_DIFF, ACTION_PROMPT_METADATA_PAGE,
+        ACTION_PROMPT_VERSION_PAGE, ACTION_PROVIDER_ANSWER_QUESTION,
+        ACTION_PROVIDER_NEW_CONVERSATION, ACTION_PROVIDER_QUEUE_FOLLOW_UP,
+        ACTION_PROVIDER_RESOLVE_APPROVAL, ACTION_PROVIDER_SEND_NOW, ACTION_PROVIDER_START_SESSION,
         ACTION_PROVIDER_STEER_CURRENT_TURN, ACTION_PROVIDER_STOP_TURN, ACTION_SERVICE_HEALTH,
         ACTION_SERVICE_LOGS, ACTION_SERVICE_RESTART, ACTION_SERVICE_START, ACTION_SERVICE_STOP,
         ACTION_SSH_ACTION, ACTION_SSH_STATUS, ACTION_TASK_ANSWER_QUESTION, ACTION_TASK_CREATE,
@@ -1670,10 +1671,18 @@ mod tests {
                         None,
                     ),
                 };
-            assert_eq!(action.scope, expected_scope);
-            assert_eq!(action.risk, expected_risk);
-            assert_eq!(action.argument_schema, expected_schema);
-            assert_eq!(action.required_capability, expected_capability);
+            assert_eq!(action.scope, expected_scope, "scope for {}", action.id);
+            assert_eq!(action.risk, expected_risk, "risk for {}", action.id);
+            assert_eq!(
+                action.argument_schema, expected_schema,
+                "argument schema for {}",
+                action.id
+            );
+            assert_eq!(
+                action.required_capability, expected_capability,
+                "required capability for {}",
+                action.id
+            );
         }
     }
 
