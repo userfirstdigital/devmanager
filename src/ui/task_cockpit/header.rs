@@ -19,9 +19,10 @@ use crate::domain::agent::{
 use crate::domain::id::{AgentSessionId, ProjectId, TaskId};
 use crate::domain::snapshot::TaskSnapshot;
 use crate::domain::task::{TaskActivity, VisibleTaskStatus, WorkspaceBindingKind, WorkspaceRef};
-use crate::ui::actions::{KeyboardShortcut, ShortcutKey};
+use crate::ui::actions::{KeyboardAction, KeyboardShortcut, ShortcutKey};
 use crate::ui::components::AccessibleRole;
 use crate::ui::shell::PointerButton;
+use crate::ui::tokens::RuntimePreferencesSnapshot;
 
 /// Observation values older than this are not shown in the top bar.
 pub const PROVIDER_QUOTA_MAX_AGE_MS: i64 = 60 * 60 * 1_000;
@@ -631,6 +632,19 @@ impl TaskHeaderModel {
             accessible_description,
         }
     }
+
+    /// Pure header/cockpit anatomy for a later native renderer. Maps viewport
+    /// size and runtime preference metrics onto deterministic desktop/compact/
+    /// mobile placement without GPUI measurement.
+    pub fn responsive_anatomy(
+        &self,
+        width_px: u16,
+        height_px: u16,
+        preferences: RuntimePreferencesSnapshot,
+    ) -> HeaderCockpitAnatomy {
+        let layout = self.responsive_layout(width_px);
+        HeaderCockpitAnatomy::from_header_layout(layout, width_px, height_px, preferences)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -676,6 +690,387 @@ pub struct HeaderLayout {
     pub overflow_control: Option<OverflowControl>,
     pub title: TitleLayout,
     pub accessible_description: String,
+}
+
+/// Viewport band for header/cockpit anatomy. Boundaries use the existing
+/// [`NARROW_HEADER_WIDTH_PX`] and [`STANDARD_HEADER_WIDTH_PX`] thresholds.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CockpitBreakpoint {
+    /// `width < NARROW_HEADER_WIDTH_PX`
+    Mobile,
+    /// `NARROW_HEADER_WIDTH_PX <= width < STANDARD_HEADER_WIDTH_PX`
+    Compact,
+    /// `width >= STANDARD_HEADER_WIDTH_PX`
+    Desktop,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DockContentArrangement {
+    SideBySide,
+    Stacked,
+}
+
+/// Deterministic header/cockpit anatomy for a pure renderer.
+///
+/// [`HeaderCockpitAnatomy::resolve`] is identity-free: it may list overflow
+/// fields without minting an [`OverflowControl`]. Keyboard-safe overflow is
+/// true only when an identity-bound focusable control is actually present
+/// (via [`TaskHeaderModel::responsive_anatomy`]).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HeaderCockpitAnatomy {
+    pub breakpoint: CockpitBreakpoint,
+    pub width_px: u16,
+    pub height_px: u16,
+    pub inline: Vec<HeaderField>,
+    pub overflow: Vec<HeaderField>,
+    pub overflow_control: Option<OverflowControl>,
+    pub title: TitleLayout,
+    pub dock_arrangement: DockContentArrangement,
+    /// True only when `overflow_control` is present, focusable, and keyboard-bound.
+    pub keyboard_safe_overflow: bool,
+    /// True when overflow fields are listed without an attached identity-bound control.
+    pub overflow_fields_deferred: bool,
+    pub accessible_description: String,
+}
+
+impl HeaderCockpitAnatomy {
+    pub fn resolve(width_px: u16, height_px: u16, preferences: RuntimePreferencesSnapshot) -> Self {
+        let breakpoint = cockpit_breakpoint(width_px);
+        let (inline, overflow) = header_fields_for_breakpoint(breakpoint);
+        let dock_arrangement = dock_arrangement_for(breakpoint, height_px, preferences);
+        // Structural projection only: no task identity, so no OverflowControl.
+        let overflow_fields_deferred = !overflow.is_empty();
+        let keyboard_safe_overflow = false;
+        let title = TitleLayout::SingleLine("Task".to_string());
+        let accessible_description = anatomy_accessible_description(
+            breakpoint,
+            dock_arrangement,
+            keyboard_safe_overflow,
+            overflow_fields_deferred,
+            "Task header anatomy.",
+        );
+        Self {
+            breakpoint,
+            width_px,
+            height_px,
+            inline,
+            overflow,
+            overflow_control: None,
+            title,
+            dock_arrangement,
+            keyboard_safe_overflow,
+            overflow_fields_deferred,
+            accessible_description,
+        }
+    }
+
+    pub fn from_header_layout(
+        layout: HeaderLayout,
+        width_px: u16,
+        height_px: u16,
+        preferences: RuntimePreferencesSnapshot,
+    ) -> Self {
+        let breakpoint = cockpit_breakpoint(width_px);
+        let dock_arrangement = dock_arrangement_for(breakpoint, height_px, preferences);
+        let keyboard_safe_overflow = layout.overflow_control.as_ref().is_some_and(|control| {
+            control.focusable
+                && control.role == AccessibleRole::Button
+                && matches!(control.keyboard_action, KeyboardAction::OpenTaskDetails)
+        });
+        let overflow_fields_deferred = !layout.overflow.is_empty() && !keyboard_safe_overflow;
+        let accessible_description = anatomy_accessible_description(
+            breakpoint,
+            dock_arrangement,
+            keyboard_safe_overflow,
+            overflow_fields_deferred,
+            &layout.accessible_description,
+        );
+        Self {
+            breakpoint,
+            width_px,
+            height_px,
+            inline: layout.inline,
+            overflow: layout.overflow,
+            overflow_control: layout.overflow_control,
+            title: layout.title,
+            dock_arrangement,
+            keyboard_safe_overflow,
+            overflow_fields_deferred,
+            accessible_description,
+        }
+    }
+}
+
+pub fn cockpit_breakpoint(width_px: u16) -> CockpitBreakpoint {
+    if width_px < NARROW_HEADER_WIDTH_PX {
+        CockpitBreakpoint::Mobile
+    } else if width_px < STANDARD_HEADER_WIDTH_PX {
+        CockpitBreakpoint::Compact
+    } else {
+        CockpitBreakpoint::Desktop
+    }
+}
+
+fn header_fields_for_breakpoint(
+    breakpoint: CockpitBreakpoint,
+) -> (Vec<HeaderField>, Vec<HeaderField>) {
+    match breakpoint {
+        CockpitBreakpoint::Mobile => (
+            vec![HeaderField::Title, HeaderField::TurnStatus],
+            vec![
+                HeaderField::Project,
+                HeaderField::Workspace,
+                HeaderField::Primary,
+                HeaderField::Specialists,
+            ],
+        ),
+        CockpitBreakpoint::Compact => (
+            vec![
+                HeaderField::Title,
+                HeaderField::TurnStatus,
+                HeaderField::Project,
+                HeaderField::Primary,
+            ],
+            vec![HeaderField::Workspace, HeaderField::Specialists],
+        ),
+        CockpitBreakpoint::Desktop => (
+            vec![
+                HeaderField::Title,
+                HeaderField::TurnStatus,
+                HeaderField::Project,
+                HeaderField::Workspace,
+                HeaderField::Primary,
+                HeaderField::Specialists,
+            ],
+            Vec::new(),
+        ),
+    }
+}
+
+fn side_by_side_min_height(preferences: RuntimePreferencesSnapshot) -> u32 {
+    let metrics = preferences.metrics();
+    metrics
+        .control_height
+        .saturating_mul(6)
+        .saturating_add(metrics.row_padding.saturating_mul(4))
+}
+
+fn dock_arrangement_for(
+    breakpoint: CockpitBreakpoint,
+    height_px: u16,
+    preferences: RuntimePreferencesSnapshot,
+) -> DockContentArrangement {
+    let min_height = side_by_side_min_height(preferences);
+    match breakpoint {
+        CockpitBreakpoint::Mobile => DockContentArrangement::Stacked,
+        CockpitBreakpoint::Compact | CockpitBreakpoint::Desktop => {
+            if u32::from(height_px) < min_height {
+                DockContentArrangement::Stacked
+            } else {
+                DockContentArrangement::SideBySide
+            }
+        }
+    }
+}
+
+fn anatomy_accessible_description(
+    breakpoint: CockpitBreakpoint,
+    dock: DockContentArrangement,
+    keyboard_safe_overflow: bool,
+    overflow_fields_deferred: bool,
+    base: &str,
+) -> String {
+    let breakpoint_label = match breakpoint {
+        CockpitBreakpoint::Mobile => "mobile",
+        CockpitBreakpoint::Compact => "compact",
+        CockpitBreakpoint::Desktop => "desktop",
+    };
+    let dock_label = match dock {
+        DockContentArrangement::SideBySide => "side-by-side dock",
+        DockContentArrangement::Stacked => "stacked dock",
+    };
+    let overflow_label = if keyboard_safe_overflow {
+        "Overflow details remain keyboard reachable."
+    } else if overflow_fields_deferred {
+        "Overflow fields are deferred until an identity-bound overflow control is attached."
+    } else {
+        "All header fields remain inline."
+    };
+    presentation_text(
+        &format!("{base} {breakpoint_label} layout with {dock_label}. {overflow_label}"),
+        MAX_ACCESSIBLE_SCALARS,
+    )
+}
+
+/// Host-details affordance projected for a later native shell attachment.
+/// The shell must not invent an action id; it reuses this bounded projection.
+#[derive(Clone, Eq, PartialEq)]
+pub struct HostDetailsAffordance {
+    pub label: String,
+    pub description: String,
+    pub tooltip: String,
+    pub role: AccessibleRole,
+    pub focusable: bool,
+    pub pointer: PointerButton,
+    pub keyboard: KeyboardShortcut,
+    pub action: TopBarAction,
+}
+
+impl fmt::Debug for HostDetailsAffordance {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HostDetailsAffordance")
+            .field("label", &"[redacted]")
+            .field("role", &self.role)
+            .field("focusable", &self.focusable)
+            .field("action_id", &self.action.id())
+            .finish()
+    }
+}
+
+impl fmt::Display for HostDetailsAffordance {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("host-details-affordance[redacted]")
+    }
+}
+
+/// Transport-free, render-ready native header snapshot.
+///
+/// Consumes only [`TopBarModel`] facts that already passed freshness fencing.
+/// Stale quotas are never retained: they are absent from `quotas` and listed in
+/// `unavailable` when the caller supplied a rejected observation.
+#[derive(Clone, PartialEq)]
+pub struct NativeHeaderProjection {
+    pub generation: u64,
+    pub now_ms: i64,
+    pub host: Option<TopBarStatusLink>,
+    pub connect: Option<TopBarStatusLink>,
+    pub update: Option<TopBarStatusLink>,
+    pub remote: Option<RemoteProjection>,
+    pub resources: Option<HostResourceProjection>,
+    pub quotas: Vec<QuotaProjection>,
+    pub quota_hidden_count: usize,
+    pub quotas_truncated: bool,
+    pub quota_overflow_action: Option<TopBarAction>,
+    pub unavailable: Vec<TopBarUnavailable>,
+    pub host_details: Option<HostDetailsAffordance>,
+    pub accessible_description: String,
+}
+
+impl fmt::Debug for NativeHeaderProjection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NativeHeaderProjection")
+            .field("generation", &self.generation)
+            .field("now_ms", &self.now_ms)
+            .field("host_present", &self.host.is_some())
+            .field("connect_present", &self.connect.is_some())
+            .field("update_present", &self.update.is_some())
+            .field("remote_present", &self.remote.is_some())
+            .field("resources_present", &self.resources.is_some())
+            .field("quota_count", &self.quotas.len())
+            .field("host_details_present", &self.host_details.is_some())
+            .finish()
+    }
+}
+
+impl fmt::Display for NativeHeaderProjection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("native-header-projection[redacted]")
+    }
+}
+
+impl NativeHeaderProjection {
+    pub fn accepts_action(&self, action: &TopBarAction) -> bool {
+        if action.id() != ACTION_HOST_STATUS {
+            return false;
+        }
+        self.host
+            .as_ref()
+            .is_some_and(|link| link.action == *action)
+            || self
+                .connect
+                .as_ref()
+                .is_some_and(|link| link.action == *action)
+            || self
+                .update
+                .as_ref()
+                .is_some_and(|link| link.action == *action)
+            || self
+                .quota_overflow_action
+                .as_ref()
+                .is_some_and(|overflow| overflow == action)
+            || self
+                .host_details
+                .as_ref()
+                .is_some_and(|details| details.action == *action)
+            || self.quotas.iter().any(|quota| quota.action == *action)
+    }
+}
+
+/// Bounded adapter that turns a preflighted top-bar projection into a
+/// render-ready native header snapshot. No transport, host probing, or GPUI.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct NativeHeaderProjectionAdapter;
+
+impl NativeHeaderProjectionAdapter {
+    pub fn project(
+        input: &TopBarProjectionInput,
+    ) -> Result<NativeHeaderProjection, TopBarProjectionError> {
+        let model = TopBarModel::try_from_input(input)?;
+        Ok(Self::from_model(input.generation, input.now_ms, model))
+    }
+
+    pub fn project_controller(controller: &TopBarProjectionController) -> NativeHeaderProjection {
+        Self::from_model(
+            controller.generation(),
+            controller.now_ms(),
+            controller.model(),
+        )
+    }
+
+    fn from_model(generation: u64, now_ms: i64, model: TopBarModel) -> NativeHeaderProjection {
+        let host_details = host_details_affordance(&model);
+        NativeHeaderProjection {
+            generation,
+            now_ms,
+            host: model.host,
+            connect: model.connect,
+            update: model.update,
+            remote: model.remote,
+            resources: model.resources,
+            quotas: model.quotas,
+            quota_hidden_count: model.quota_hidden_count,
+            quotas_truncated: model.quotas_truncated,
+            quota_overflow_action: model.quota_overflow_action,
+            unavailable: model.unavailable,
+            host_details,
+            accessible_description: model.accessible_description,
+        }
+    }
+}
+
+fn host_details_affordance(model: &TopBarModel) -> Option<HostDetailsAffordance> {
+    let (description, action) = if let Some(host) = &model.host {
+        (host.description.clone(), host.action.clone())
+    } else if let Some(connect) = &model.connect {
+        (connect.description.clone(), connect.action.clone())
+    } else if let Some(update) = &model.update {
+        (update.description.clone(), update.action.clone())
+    } else {
+        return None;
+    };
+    Some(HostDetailsAffordance {
+        label: "Host details".to_string(),
+        description: description.clone(),
+        tooltip: "Open host status details".to_string(),
+        role: AccessibleRole::Button,
+        focusable: true,
+        pointer: PointerButton::Primary,
+        // Matches the shared HostStatus chord without inventing a new action id.
+        keyboard: KeyboardShortcut::new(true, false, true, ShortcutKey::Digit(2)),
+        action,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1829,6 +2224,10 @@ impl TopBarProjectionController {
 
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    pub fn now_ms(&self) -> i64 {
+        self.input.now_ms
     }
 
     pub fn cached_quota_count(&self) -> usize {
@@ -3018,4 +3417,262 @@ fn title_layout(title: &str, width_px: u16) -> TitleLayout {
         return TitleLayout::Wrapped(lines);
     }
     TitleLayout::SingleLine(title.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::tokens::{Density, Scale, ThemeMode};
+
+    fn sample_input(now_ms: i64, generation: u64) -> TopBarProjectionInput {
+        TopBarProjectionInput {
+            now_ms,
+            generation,
+            host: Some(HostObservation {
+                identity: HostObservationIdentity {
+                    host_id: "local-host".into(),
+                    revision: 1,
+                },
+                health: HostHealth::Healthy,
+                observed_at_ms: Some(now_ms - 1_000),
+                generation: Some(generation),
+            }),
+            connect: Some(ConnectObservation {
+                identity: ConnectObservationIdentity {
+                    host_id: "local-host".into(),
+                    connection_epoch: 1,
+                },
+                state: ConnectState::Connected,
+                observed_at_ms: Some(now_ms - 1_000),
+                generation: Some(generation),
+            }),
+            update: Some(UpdateObservation {
+                identity: UpdateObservationIdentity {
+                    current_version: "1.0.0".into(),
+                    target_version: None,
+                    revision: 1,
+                },
+                state: UpdateState::UpToDate,
+                observed_at_ms: Some(now_ms - 1_000),
+                generation: Some(generation),
+            }),
+            quotas: vec![QuotaObservation {
+                identity: QuotaObservationIdentity {
+                    provider: "claude".into(),
+                    provider_session_id: "session-a".into(),
+                    observation_id: 3,
+                },
+                detail: Some("55% remaining".into()),
+                observed_at_ms: Some(now_ms - 2_000),
+                generation: Some(generation),
+            }],
+            resources: Some(HostResourceObservation {
+                cpu_percent: Some(12.0),
+                cpu_input_unit: CpuInputUnit::MachinePercent,
+                memory_bytes: Some(4_096),
+                logical_cpu_count: Some(8),
+                cpu_observed_at_ms: Some(now_ms - 500),
+                memory_observed_at_ms: Some(now_ms - 500),
+                generation: Some(generation),
+                cpu_revision: 1,
+                memory_revision: 1,
+            }),
+        }
+    }
+
+    #[test]
+    fn native_adapter_surfaces_fresh_facts_and_host_details_action() {
+        let input = sample_input(1_000_000, 7);
+        let projection = NativeHeaderProjectionAdapter::project(&input).expect("fresh input");
+        assert_eq!(projection.generation, 7);
+        assert!(projection.host.is_some());
+        assert!(projection.connect.is_some());
+        assert!(projection.resources.is_some());
+        assert_eq!(projection.quotas.len(), 1);
+        assert_eq!(projection.quotas[0].detail, "55% remaining");
+        let details = projection.host_details.expect("host details affordance");
+        assert_eq!(details.role, AccessibleRole::Button);
+        assert!(details.focusable);
+        assert_eq!(details.action.id(), ACTION_HOST_STATUS);
+        assert!(projection.accepts_action(&details.action));
+        assert!(projection.accepts_action(&projection.host.as_ref().unwrap().action));
+    }
+
+    #[test]
+    fn native_adapter_hides_stale_missing_future_and_wrong_generation_quotas() {
+        let now = 1_000_000_i64;
+        let generation = 4_u64;
+        let mut input = sample_input(now, generation);
+        input.quotas = vec![
+            QuotaObservation {
+                identity: QuotaObservationIdentity {
+                    provider: "claude".into(),
+                    provider_session_id: "fresh".into(),
+                    observation_id: 1,
+                },
+                detail: Some("40% remaining".into()),
+                observed_at_ms: Some(now - 10),
+                generation: Some(generation),
+            },
+            QuotaObservation {
+                identity: QuotaObservationIdentity {
+                    provider: "codex".into(),
+                    provider_session_id: "exact-hour".into(),
+                    observation_id: 2,
+                },
+                detail: Some("11% remaining".into()),
+                observed_at_ms: Some(now - PROVIDER_QUOTA_MAX_AGE_MS),
+                generation: Some(generation),
+            },
+            QuotaObservation {
+                identity: QuotaObservationIdentity {
+                    provider: "codex".into(),
+                    provider_session_id: "future".into(),
+                    observation_id: 3,
+                },
+                detail: Some("99% remaining".into()),
+                observed_at_ms: Some(now + 1),
+                generation: Some(generation),
+            },
+            QuotaObservation {
+                identity: QuotaObservationIdentity {
+                    provider: "codex".into(),
+                    provider_session_id: "wrong-gen".into(),
+                    observation_id: 4,
+                },
+                detail: Some("33% remaining".into()),
+                observed_at_ms: Some(now - 10),
+                generation: Some(generation + 1),
+            },
+            QuotaObservation {
+                identity: QuotaObservationIdentity {
+                    provider: "codex".into(),
+                    provider_session_id: "missing-detail".into(),
+                    observation_id: 5,
+                },
+                detail: None,
+                observed_at_ms: Some(now - 10),
+                generation: Some(generation),
+            },
+        ];
+
+        let projection = NativeHeaderProjectionAdapter::project(&input).expect("project");
+        assert_eq!(projection.quotas.len(), 1);
+        assert_eq!(projection.quotas[0].detail, "40% remaining");
+        assert!(projection
+            .quotas
+            .iter()
+            .all(|quota| quota.detail != "11% remaining"));
+        assert!(projection.unavailable.contains(&TopBarUnavailable::Quota));
+    }
+
+    #[test]
+    fn native_adapter_preserves_controller_generation_session_fencing() {
+        let mut input = sample_input(2_000_000, 9);
+        let mut controller = TopBarProjectionController::new(input.clone()).expect("controller");
+        let first = NativeHeaderProjectionAdapter::project_controller(&controller);
+        assert_eq!(first.generation, 9);
+        assert_eq!(first.quotas[0].detail, "55% remaining");
+
+        input.generation = 10;
+        input.host.as_mut().unwrap().generation = Some(10);
+        input.connect.as_mut().unwrap().generation = Some(10);
+        input.update.as_mut().unwrap().generation = Some(10);
+        input.resources.as_mut().unwrap().generation = Some(10);
+        input.quotas[0].generation = Some(10);
+        input.quotas[0].identity.observation_id = 1;
+        input.quotas[0].detail = Some("12% remaining".into());
+        input.quotas[0].observed_at_ms = Some(input.now_ms);
+        assert!(controller.apply(input).expect("apply newer generation"));
+        let second = NativeHeaderProjectionAdapter::project_controller(&controller);
+        assert_eq!(second.generation, 10);
+        assert_eq!(second.quotas[0].detail, "12% remaining");
+        assert!(second.host_details.is_some());
+    }
+
+    #[test]
+    fn responsive_anatomy_covers_desktop_compact_mobile_and_exact_thresholds() {
+        let preferences =
+            RuntimePreferencesSnapshot::new(ThemeMode::Dark, Density::Comfortable, Scale::Scale100);
+        let min_side_by_side = side_by_side_min_height(preferences) as u16;
+
+        let mobile = HeaderCockpitAnatomy::resolve(
+            NARROW_HEADER_WIDTH_PX - 1,
+            min_side_by_side,
+            preferences,
+        );
+        assert_eq!(mobile.breakpoint, CockpitBreakpoint::Mobile);
+        assert_eq!(mobile.dock_arrangement, DockContentArrangement::Stacked);
+        assert!(mobile.overflow_control.is_none());
+        assert!(!mobile.keyboard_safe_overflow);
+        assert!(mobile.overflow_fields_deferred);
+        assert_eq!(
+            mobile.inline,
+            vec![HeaderField::Title, HeaderField::TurnStatus]
+        );
+
+        let compact_at_narrow =
+            HeaderCockpitAnatomy::resolve(NARROW_HEADER_WIDTH_PX, min_side_by_side, preferences);
+        assert_eq!(compact_at_narrow.breakpoint, CockpitBreakpoint::Compact);
+        assert_eq!(
+            compact_at_narrow.dock_arrangement,
+            DockContentArrangement::SideBySide
+        );
+        assert!(compact_at_narrow.overflow_control.is_none());
+        assert!(!compact_at_narrow.keyboard_safe_overflow);
+        assert!(compact_at_narrow.overflow_fields_deferred);
+
+        let still_compact = HeaderCockpitAnatomy::resolve(
+            STANDARD_HEADER_WIDTH_PX - 1,
+            min_side_by_side,
+            preferences,
+        );
+        assert_eq!(still_compact.breakpoint, CockpitBreakpoint::Compact);
+
+        let desktop =
+            HeaderCockpitAnatomy::resolve(STANDARD_HEADER_WIDTH_PX, min_side_by_side, preferences);
+        assert_eq!(desktop.breakpoint, CockpitBreakpoint::Desktop);
+        assert_eq!(desktop.dock_arrangement, DockContentArrangement::SideBySide);
+        assert!(!desktop.keyboard_safe_overflow);
+        assert!(!desktop.overflow_fields_deferred);
+        assert!(desktop.overflow.is_empty());
+
+        let short_desktop = HeaderCockpitAnatomy::resolve(
+            STANDARD_HEADER_WIDTH_PX,
+            min_side_by_side.saturating_sub(1),
+            preferences,
+        );
+        assert_eq!(short_desktop.breakpoint, CockpitBreakpoint::Desktop);
+        assert_eq!(
+            short_desktop.dock_arrangement,
+            DockContentArrangement::Stacked
+        );
+        assert!(short_desktop
+            .accessible_description
+            .contains("desktop layout"));
+        assert!(mobile
+            .accessible_description
+            .contains("identity-bound overflow control"));
+        assert!(!mobile.accessible_description.contains("keyboard reachable"));
+    }
+
+    #[test]
+    fn cockpit_breakpoint_matches_existing_header_width_thresholds() {
+        assert_eq!(
+            cockpit_breakpoint(NARROW_HEADER_WIDTH_PX - 1),
+            CockpitBreakpoint::Mobile
+        );
+        assert_eq!(
+            cockpit_breakpoint(NARROW_HEADER_WIDTH_PX),
+            CockpitBreakpoint::Compact
+        );
+        assert_eq!(
+            cockpit_breakpoint(STANDARD_HEADER_WIDTH_PX - 1),
+            CockpitBreakpoint::Compact
+        );
+        assert_eq!(
+            cockpit_breakpoint(STANDARD_HEADER_WIDTH_PX),
+            CockpitBreakpoint::Desktop
+        );
+    }
 }

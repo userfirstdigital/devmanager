@@ -20,5 +20,5 @@ pub use interaction::{
     ComponentError, ControlPresentation, FocusEpoch, FocusEpochSource, FocusRing, InteractionState,
     InteractionStateModel, InteractionTransition, KeyboardKey, VisualState,
 };
-pub use status_light::{StatusLight, StatusPresentation};
+pub use status_light::{ExternalPortStatus, StatusLight, StatusPresentation};
 pub use text_field::{TextField, TextFieldError, TextFieldKey, TextFieldLimits};

@@ -762,7 +762,7 @@ fn density_metrics_remain_internally_valid_at_supported_windows_scales() {
 }
 
 #[test]
-fn legacy_theme_aliases_preserve_existing_values() {
+fn legacy_theme_aliases_preserve_byte_values_with_aa_safe_text_dim() {
     assert_eq!(theme::APP_BG, 0x18181b);
     assert_eq!(theme::SIDEBAR_BG, 0x27272a);
     assert_eq!(theme::PANEL_BG, 0x18181b);
@@ -785,7 +785,8 @@ fn legacy_theme_aliases_preserve_existing_values() {
     assert_eq!(theme::TEXT_PRIMARY, 0xe4e4e7);
     assert_eq!(theme::TEXT_MUTED, 0xa1a1aa);
     assert_eq!(theme::TEXT_SUBTLE, 0x71717a);
-    assert_eq!(theme::TEXT_DIM, 0x52525b);
+    // TEXT_DIM was intentionally raised to the dark muted semantic (WCAG AA on PANEL_BG).
+    assert_eq!(theme::TEXT_DIM, 0xc4c4cc);
     assert_eq!(theme::SELECTION_BG, 0x22364d);
     assert_eq!(theme::SELECTION_TEXT, 0xf8fafc);
     assert_eq!(theme::PROJECT_DOT, 0x6366f1);

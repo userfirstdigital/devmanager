@@ -1980,7 +1980,12 @@ pub mod legacy {
     pub const TEXT_PRIMARY: u32 = Color::from_u32(0xe4e4e7).to_u32();
     pub const TEXT_MUTED: u32 = Color::from_u32(0xa1a1aa).to_u32();
     pub const TEXT_SUBTLE: u32 = Color::from_u32(0x71717a).to_u32();
-    pub const TEXT_DIM: u32 = Color::from_u32(0x52525b).to_u32();
+    /// Visible secondary/artifact text on [`PANEL_BG`].
+    ///
+    /// Previously `0x52525b` (~2.29:1 against panel). Aligned to the dark
+    /// semantic muted token so normal visible dim text meets WCAG AA (≥4.5:1)
+    /// without introducing a second palette.
+    pub const TEXT_DIM: u32 = Color::from_u32(0xc4c4cc).to_u32();
 
     pub const SELECTION_BG: u32 = Color::from_u32(0x22364d).to_u32();
     pub const SELECTION_TEXT: u32 = Color::from_u32(0xf8fafc).to_u32();
@@ -2003,6 +2008,27 @@ pub mod legacy {
 
 pub use legacy::*;
 
+/// Visible secondary/artifact text for the active theme mode.
+///
+/// Dark mode keeps the legacy [`TEXT_DIM`] compatibility alias (now AA-safe on
+/// [`PANEL_BG`]). Light mode uses the semantic muted token against canvas so
+/// both supported themes meet WCAG AA for normal text without a second palette.
+pub fn visible_dim_text(mode: ThemeMode) -> Color {
+    match mode {
+        ThemeMode::Dark => Color::from_u32(TEXT_DIM),
+        ThemeMode::Light => LIGHT_TEXT_MUTED,
+    }
+}
+
+/// Panel/surface paired with [`visible_dim_text`] for contrast checks and
+/// native task UI secondary copy.
+pub fn visible_dim_panel_surface(mode: ThemeMode) -> Color {
+    match mode {
+        ThemeMode::Dark => Color::from_u32(PANEL_BG),
+        ThemeMode::Light => LIGHT_SURFACE_CANVAS,
+    }
+}
+
 pub fn parse_hex_color(value: Option<&str>, fallback: u32) -> u32 {
     let Some(value) = value.map(str::trim) else {
         return fallback;
@@ -2012,4 +2038,42 @@ pub fn parse_hex_color(value: Option<&str>, fallback: u32) -> u32 {
         return fallback;
     }
     u32::from_str_radix(hex, 16).unwrap_or(fallback)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_text_dim_meets_aa_on_panel_bg() {
+        let ratio = contrast_ratio(Color::from_u32(TEXT_DIM), Color::from_u32(PANEL_BG));
+        assert!(
+            ratio >= 4.5,
+            "TEXT_DIM on PANEL_BG must be WCAG AA, got {ratio}"
+        );
+        assert_eq!(TEXT_DIM, DARK_TEXT_MUTED.to_u32());
+    }
+
+    #[test]
+    fn visible_dim_text_meets_aa_in_both_theme_modes() {
+        for mode in [ThemeMode::Dark, ThemeMode::Light] {
+            let ratio = contrast_ratio(visible_dim_text(mode), visible_dim_panel_surface(mode));
+            assert!(
+                ratio >= 4.5,
+                "visible dim text must be AA for {mode:?}, got {ratio}"
+            );
+        }
+    }
+
+    #[test]
+    fn semantic_muted_text_still_meets_aa_on_raised_surfaces() {
+        for mode in [ThemeMode::Dark, ThemeMode::Light] {
+            let tokens = theme(mode, Density::Comfortable, Scale::Scale100);
+            let ratio = contrast_ratio(tokens.text.muted, tokens.surfaces.raised);
+            assert!(
+                ratio >= 4.5,
+                "semantic muted on raised must stay AA for {mode:?}, got {ratio}"
+            );
+        }
+    }
 }
