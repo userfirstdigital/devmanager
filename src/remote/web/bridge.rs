@@ -17,7 +17,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{mpsc as std_mpsc, Arc, MutexGuard};
+use std::sync::{mpsc as std_mpsc, Arc, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
@@ -53,7 +53,11 @@ use super::wire::{
     ResumeState, SemanticReplayDescriptor, SemanticReplayPage, WebTerminalInputKind, WsInbound,
     WsOutbound,
 };
-use super::{authenticate_request, record_browser_connection, request_is_same_origin, WebState};
+use super::{
+    apply_browser_connection_activity, prepare_browser_connection_activity, request_is_same_origin,
+    validate_authenticated_request, BrowserConnectionActivity, ValidatedWebAuthentication,
+    WebAuthError, WebState,
+};
 use crate::ai::codex_cli::canonical_codex_composer_prompt;
 use crate::state::{SessionDimensions, SessionKind};
 
@@ -89,11 +93,22 @@ pub(crate) struct WsConnectQuery {
     browser_install_id: Option<String>,
 }
 
-fn authorize_ws_request(state: &WebState, headers: &HeaderMap) -> Result<String, StatusCode> {
+struct BrowserConnectionAdmission {
+    authentication: ValidatedWebAuthentication,
+    activity: BrowserConnectionActivity,
+}
+
+fn authorize_ws_request(
+    state: &WebState,
+    headers: &HeaderMap,
+) -> Result<ValidatedWebAuthentication, StatusCode> {
     if !request_is_same_origin(headers) {
         return Err(StatusCode::FORBIDDEN);
     }
-    authenticate_request(state, headers).ok_or(StatusCode::UNAUTHORIZED)
+    validate_authenticated_request(state, headers).map_err(|error| match error {
+        WebAuthError::Unauthorized => StatusCode::UNAUTHORIZED,
+        WebAuthError::Durability => StatusCode::INTERNAL_SERVER_ERROR,
+    })
 }
 
 pub(crate) async fn ws_handler(
@@ -103,10 +118,17 @@ pub(crate) async fn ws_handler(
     ws: WebSocketUpgrade,
     headers: HeaderMap,
 ) -> Response {
-    let client_id = match authorize_ws_request(&state, &headers) {
-        Ok(client_id) => client_id,
+    let authentication = match authorize_ws_request(&state, &headers) {
+        Ok(authentication) => authentication,
         Err(StatusCode::FORBIDDEN) => {
             return (StatusCode::FORBIDDEN, "cross-origin websocket rejected").into_response();
+        }
+        Err(StatusCode::INTERNAL_SERVER_ERROR) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "authentication state unavailable",
+            )
+                .into_response();
         }
         Err(_) => {
             return (
@@ -116,21 +138,25 @@ pub(crate) async fn ws_handler(
                 .into_response();
         }
     };
-    let inner = state.inner.clone();
-    if let Err(error) = record_browser_connection(
-        &inner,
-        &client_id,
+    let Some(inner) = state.upgrade_inner() else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "host unavailable").into_response();
+    };
+    let listener_generation = state.listener_generation;
+    let activity = match prepare_browser_connection_activity(
+        &authentication.client_id,
         addr.ip(),
         query.browser_install_id,
         &headers,
     ) {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to record browser connection: {error}"),
-        )
-            .into_response();
-    }
-    ws.on_upgrade(move |socket| run_session(socket, inner, client_id))
+        Ok(activity) => activity,
+        Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+    };
+    let admission = BrowserConnectionAdmission {
+        activity,
+        authentication,
+    };
+    let inner = Arc::downgrade(&inner);
+    ws.on_upgrade(move |socket| run_session(socket, inner, listener_generation, admission))
 }
 
 fn initial_web_hello(client_id: &str, snapshot: &RemoteWorkspaceSnapshot) -> WsOutbound {
@@ -166,23 +192,59 @@ fn queue_initial_browser_snapshot(
     )
 }
 
-async fn run_session(socket: WebSocket, inner: Arc<RemoteHostInner>, client_id: String) {
-    let connection_id = inner.next_connection_id.fetch_add(1, Ordering::Relaxed);
+async fn run_session(
+    socket: WebSocket,
+    inner: std::sync::Weak<RemoteHostInner>,
+    listener_generation: u64,
+    admission: BrowserConnectionAdmission,
+) {
+    let client_id = admission.authentication.client_id.clone();
+    let Some(host) = inner.upgrade() else {
+        return;
+    };
+    let connection_id = host.next_connection_id.fetch_add(1, Ordering::Relaxed);
+    drop(host);
     let (outbound, outbound_rx) =
         BrowserOutboundSender::channel(WEB_PUSH_CHANNEL_CAPACITY, WEB_OUTBOUND_MAX_BYTES);
     let tombstone = outbound.tombstone();
     // Seed hello while this sender is still private. Once the client enters
     // the broadcaster map, concurrent deltas may enqueue immediately; keeping
     // hello ahead of registration makes the first-frame contract absolute.
-    if queue_initial_browser_hello(&outbound, &inner, &client_id).is_err() {
+    let Some(host) = inner.upgrade() else {
+        tombstone.deactivate();
+        return;
+    };
+    if queue_initial_browser_hello(&outbound, &host, &client_id).is_err() {
         tombstone.deactivate();
         return;
     }
-    if !register_browser_client(&inner, connection_id, &client_id, outbound.clone()) {
+    drop(host);
+    let Some(host) = inner.upgrade() else {
+        tombstone.deactivate();
+        return;
+    };
+    let registered = register_browser_client_with_admission(
+        &host,
+        listener_generation,
+        connection_id,
+        &client_id,
+        outbound.clone(),
+        &admission,
+    );
+    if let Err(error) = registered.as_ref() {
+        super::super::set_last_connection_note(
+            &host,
+            format!("Browser admission failed: {error}"),
+            true,
+        );
+    }
+    if !matches!(registered, Ok(true)) {
         let _ = outbound
             .try_send_disconnect("This browser is no longer paired with the host.".to_string());
         tombstone.deactivate();
+        return;
     }
+    drop(host);
 
     // Push an initial snapshot so the browser has state to render before any
     // delta arrives. We deliberately use a *lightweight* snapshot that omits
@@ -196,7 +258,12 @@ async fn run_session(socket: WebSocket, inner: Arc<RemoteHostInner>, client_id: 
     // `auto_bootstrap_subscribed_clients` which sends the bootstrap as a
     // `SessionStream { Bootstrap }` event. That path is async to the initial
     // snapshot and can't stall the handshake.
-    let _ = queue_initial_browser_snapshot(&outbound, &inner, connection_id, &client_id);
+    if let Some(host) = inner.upgrade() {
+        let _ = queue_initial_browser_snapshot(&outbound, &host, connection_id, &client_id);
+    } else {
+        tombstone.deactivate();
+        return;
+    }
 
     let (mut ws_sink, mut ws_stream) = socket.split();
     let writer_inner = inner.clone();
@@ -215,13 +282,16 @@ async fn run_session(socket: WebSocket, inner: Arc<RemoteHostInner>, client_id: 
         .await;
     });
 
-    // Reader loop: handle inbound WS messages directly against
-    // `RemoteHostInner` state. We do not await while holding any std lock.
+    // Reader loop: upgrade only for the synchronous message operation. The
+    // weak handle is retained across the websocket wait, never the host Arc.
     while let Some(frame) = ws_stream.next().await {
         match frame {
             Ok(WsMessage::Text(text)) => match serde_json::from_str::<WsInbound>(&text) {
                 Ok(inbound) => {
-                    handle_inbound_browser(&inner, connection_id, &client_id, inbound, &outbound);
+                    let Some(host) = inner.upgrade() else {
+                        break;
+                    };
+                    handle_inbound_browser(&host, connection_id, &client_id, inbound, &outbound);
                 }
                 Err(error) => {
                     let _ = outbound.try_send_disconnect(format!("invalid inbound frame: {error}"));
@@ -244,7 +314,9 @@ async fn run_session(socket: WebSocket, inner: Arc<RemoteHostInner>, client_id: 
     // Teardown order matters: remove from clients first so the broadcaster
     // stops pushing into a dying channel, then let the drainer + writer wind
     // down.
-    unregister_browser_client(&inner, connection_id, &client_id, &tombstone);
+    if let Some(host) = inner.upgrade() {
+        unregister_browser_client(&host, connection_id, &client_id, &tombstone);
+    }
     drop(outbound);
     let _ = writer_task.await;
 }
@@ -252,7 +324,7 @@ async fn run_session(socket: WebSocket, inner: Arc<RemoteHostInner>, client_id: 
 async fn run_browser_writer<S>(
     ws_sink: &mut S,
     mut outbound: BrowserOutboundReceiver,
-    inner: Arc<RemoteHostInner>,
+    inner: std::sync::Weak<RemoteHostInner>,
     connection_id: u64,
     client_id: String,
     tombstone: Arc<WebConnectionTombstone>,
@@ -356,7 +428,9 @@ async fn run_browser_writer<S>(
         }
     }
     if delivery_failed {
-        unregister_browser_client(&inner, connection_id, &client_id, &tombstone);
+        if let Some(host) = inner.upgrade() {
+            unregister_browser_client(&host, connection_id, &client_id, &tombstone);
+        }
     }
     let _ = tokio::time::timeout(stall_timeout, ws_sink.close()).await;
 }
@@ -409,10 +483,48 @@ fn light_snapshot(inner: &Arc<RemoteHostInner>, client_id: &str) -> RemoteWorksp
 
 fn register_browser_client(
     inner: &Arc<RemoteHostInner>,
+    listener_generation: u64,
     connection_id: u64,
     client_id: &str,
     web_sender: BrowserOutboundSender,
 ) -> bool {
+    register_browser_client_inner(
+        inner,
+        listener_generation,
+        connection_id,
+        client_id,
+        web_sender,
+        None,
+    )
+    .unwrap_or(false)
+}
+
+fn register_browser_client_with_admission(
+    inner: &Arc<RemoteHostInner>,
+    listener_generation: u64,
+    connection_id: u64,
+    client_id: &str,
+    web_sender: BrowserOutboundSender,
+    admission: &BrowserConnectionAdmission,
+) -> Result<bool, super::super::HostConfigAdmissionError> {
+    register_browser_client_inner(
+        inner,
+        listener_generation,
+        connection_id,
+        client_id,
+        web_sender,
+        Some(admission),
+    )
+}
+
+fn register_browser_client_inner(
+    inner: &Arc<RemoteHostInner>,
+    listener_generation: u64,
+    connection_id: u64,
+    client_id: &str,
+    web_sender: BrowserOutboundSender,
+    admission: Option<&BrowserConnectionAdmission>,
+) -> Result<bool, super::super::HostConfigAdmissionError> {
     let app_state = inner
         .shared_state
         .read()
@@ -439,42 +551,295 @@ fn register_browser_client(
         .map(|slot| slot.clone())
         .unwrap_or_default();
     let you_have_control = controller_client_id.as_deref() == Some(client_id);
-    let _operation = inner
-        .web_control_operation_lock
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if !web_client_is_still_paired(inner, client_id) {
-        return false;
-    }
-    let Ok(mut clients) = inner.clients.lock() else {
-        return false;
-    };
-    if clients.contains_key(&connection_id) {
-        return false;
-    }
-    let tombstone = web_sender.tombstone();
+    #[cfg(test)]
+    super::super::notify_client_registration(
+        inner,
+        super::super::ClientRegistrationTestEvent::BeforeFence,
+    );
+    let registered = (|| -> Result<bool, super::super::HostConfigAdmissionError> {
+        // Every host-config writer acquires this serializer before browser or
+        // lifecycle authority. Only this serializer spans durable I/O. The
+        // first write is an explicitly non-success attempt marker; durable
+        // Connected state is written only after the Phase-B auth fence.
+        let _transaction = inner.host_config_tx.lock().map_err(|_| {
+            super::super::HostConfigAdmissionError::Persistence(
+                "host config transaction unavailable".to_string(),
+            )
+        })?;
+        let attempt_id = inner
+            .next_host_config_attempt_id
+            .fetch_add(1, Ordering::Relaxed);
+        let attempt_nonce = super::super::generate_secret("admission");
+        let authorized = |config: &super::super::RemoteHostConfig| match admission {
+            Some(admission) => {
+                admission.authentication.client_id == client_id
+                    && admission.activity.client_id == client_id
+                    && config.web.enabled
+                    && config.web.cookie_secret_hex == admission.authentication.cookie_secret_hex
+                    && config
+                        .web
+                        .paired_clients
+                        .iter()
+                        .any(|client| client.client_id == client_id)
+            }
+            None => config
+                .web
+                .paired_clients
+                .iter()
+                .any(|client| client.client_id == client_id),
+        };
 
-    clients.insert(
-        connection_id,
-        ConnectedRemoteClient {
-            client_id: client_id.to_string(),
-            sender: None,
-            web_sender: Some(web_sender),
-            web_tombstone: Some(tombstone),
-            semantic_cursors: HashMap::new(),
-            subscribed_session_ids: HashSet::new(),
-            bootstrapped_session_ids: HashSet::new(),
-            bootstrap_pending_session_ids: HashSet::new(),
-            focused_session_id: None,
-            last_app_hash: stable_hash(&app_state),
-            last_runtime_hash: stable_hash(&runtime_state),
-            last_port_hash: stable_hash(&port_statuses) ^ stable_hash(&port_authorities),
-            last_controller_client_id: controller_client_id,
-            last_you_have_control: you_have_control,
-            last_snapshot_revision: inner.snapshot_revision.load(Ordering::Relaxed),
+        let pending = {
+            let _operation = inner
+                .web_control_operation_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _lifecycle = inner
+                .lifecycle_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if inner.stop_flag.load(Ordering::Acquire)
+                || inner.native_runtime_generation.load(Ordering::Acquire) != listener_generation
+            {
+                return Ok(false);
+            }
+            let is_authorized = inner
+                .config
+                .read()
+                .map_or(false, |config| authorized(&config));
+            if !is_authorized
+                || inner
+                    .clients
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .contains_key(&connection_id)
+            {
+                return Ok(false);
+            }
+            admission
+                .map(|_| {
+                    let pending_attempt = super::super::PendingRemoteAdmissionAttempt {
+                        attempt_nonce: attempt_nonce.clone(),
+                        source: super::super::RemoteAccessSource::Browser,
+                        client_id: client_id.to_string(),
+                        generation: listener_generation,
+                        attempted_at_epoch_ms: super::super::browser_admission_now_epoch_ms(inner),
+                    };
+                    super::super::stage_host_config_mutation(inner, move |config| {
+                        super::super::append_pending_admission_attempt(config, pending_attempt)
+                    })
+                    .map_err(super::super::HostConfigAdmissionError::Persistence)
+                })
+                .transpose()?
+        };
+        if let Some(pending) = pending.as_ref() {
+            super::super::persist_host_config_snapshot(&pending.candidate).map_err(|error| {
+                super::super::HostConfigAdmissionError::Persistence(error.to_string())
+            })?;
+        }
+
+        let (phase_b_admitted, final_staged) = {
+            let _operation = inner
+                .web_control_operation_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _lifecycle = inner
+                .lifecycle_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (current_matches, auth_is_current) = inner
+                .config
+                .read()
+                .map(|config| {
+                    (
+                        pending.as_ref().is_none_or(|pending| {
+                            inner.config_revision.load(Ordering::Acquire) == pending.base_revision
+                                && *config == pending.base
+                        }),
+                        authorized(&config),
+                    )
+                })
+                .unwrap_or((false, false));
+            let identity_available = !inner
+                .clients
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains_key(&connection_id);
+            if inner.stop_flag.load(Ordering::Acquire)
+                || inner.native_runtime_generation.load(Ordering::Acquire) != listener_generation
+                || !current_matches
+                || !auth_is_current
+                || !identity_available
+            {
+                (false, None)
+            } else {
+                (
+                    true,
+                    pending
+                        .as_ref()
+                        .map(|pending| {
+                            let mut candidate = pending.candidate.clone();
+                            if !super::super::remove_pending_admission_attempt(
+                                &mut candidate,
+                                &attempt_nonce,
+                            ) {
+                                return Err(super::super::HostConfigAdmissionError::Persistence(
+                                    "Browser admission attempt marker disappeared before Phase B."
+                                        .to_string(),
+                                ));
+                            }
+                            // Browser last-seen and Connected/Reconnected
+                            // describe this Phase-B authorization fence. The
+                            // earlier marker retains its own attempt time.
+                            let applied = apply_browser_connection_activity(
+                                &mut candidate,
+                                &admission
+                                    .expect("pending browser admission must have activity")
+                                    .activity,
+                                super::super::browser_admission_now_epoch_ms(inner),
+                            );
+                            if !applied {
+                                return Err(super::super::HostConfigAdmissionError::Persistence(
+                                    "Browser pairing disappeared during Phase-B admission."
+                                        .to_string(),
+                                ));
+                            }
+                            Ok(super::super::StagedHostConfigMutation {
+                                base_revision: pending.base_revision,
+                                base: pending.base.clone(),
+                                candidate,
+                                result: (),
+                            })
+                        })
+                        .transpose()?,
+                )
+            }
+        };
+        if !phase_b_admitted {
+            if let Some(pending) = pending.as_ref() {
+                super::super::compensate_rejected_host_config_admission(pending, attempt_id)?;
+            }
+            return Ok(false);
+        }
+        if let Some(final_staged) = final_staged.as_ref() {
+            if let Err(error) = super::super::persist_host_config_snapshot(&final_staged.candidate)
+            {
+                super::super::compensate_rejected_host_config_candidates(
+                    &[
+                        &final_staged.candidate,
+                        &pending
+                            .as_ref()
+                            .expect("pending browser admission")
+                            .candidate,
+                    ],
+                    &final_staged.base,
+                    attempt_id,
+                )?;
+                return Err(super::super::HostConfigAdmissionError::Persistence(
+                    error.to_string(),
+                ));
+            }
+        }
+
+        let accepted = {
+            let _operation = inner
+                .web_control_operation_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _lifecycle = inner
+                .lifecycle_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (current_matches, auth_is_current) = inner
+                .config
+                .read()
+                .map(|config| {
+                    (
+                        final_staged.as_ref().is_none_or(|staged| {
+                            inner.config_revision.load(Ordering::Acquire) == staged.base_revision
+                                && *config == staged.base
+                        }),
+                        authorized(&config),
+                    )
+                })
+                .unwrap_or((false, false));
+            let identity_available = !inner
+                .clients
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains_key(&connection_id);
+            if inner.stop_flag.load(Ordering::Acquire)
+                || inner.native_runtime_generation.load(Ordering::Acquire) != listener_generation
+                || !current_matches
+                || !auth_is_current
+                || !identity_available
+            {
+                false
+            } else {
+                if let Some(staged) = final_staged.as_ref() {
+                    *inner
+                        .config
+                        .write()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                        staged.candidate.clone();
+                    super::super::bump_host_config_revision(inner);
+                }
+                let tombstone = web_sender.tombstone();
+                inner
+                    .clients
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(
+                        connection_id,
+                        ConnectedRemoteClient {
+                            client_id: client_id.to_string(),
+                            sender: None,
+                            web_sender: Some(web_sender),
+                            web_tombstone: Some(tombstone),
+                            semantic_cursors: HashMap::new(),
+                            subscribed_session_ids: HashSet::new(),
+                            bootstrapped_session_ids: HashSet::new(),
+                            bootstrap_pending_session_ids: HashSet::new(),
+                            focused_session_id: None,
+                            last_app_hash: stable_hash(&app_state),
+                            last_runtime_hash: stable_hash(&runtime_state),
+                            last_port_hash: stable_hash(&port_statuses)
+                                ^ stable_hash(&port_authorities),
+                            last_controller_client_id: controller_client_id,
+                            last_you_have_control: you_have_control,
+                            last_snapshot_revision: inner.snapshot_revision.load(Ordering::Relaxed),
+                        },
+                    );
+                true
+            }
+        };
+        if !accepted {
+            if let Some(final_staged) = final_staged.as_ref() {
+                super::super::compensate_rejected_host_config_candidates(
+                    &[
+                        &final_staged.candidate,
+                        &pending
+                            .as_ref()
+                            .expect("pending browser admission")
+                            .candidate,
+                    ],
+                    &final_staged.base,
+                    attempt_id,
+                )?;
+            }
+        }
+        Ok(accepted)
+    })();
+    #[cfg(test)]
+    super::super::notify_client_registration(
+        inner,
+        if matches!(registered, Ok(true)) {
+            super::super::ClientRegistrationTestEvent::Registered
+        } else {
+            super::super::ClientRegistrationTestEvent::Rejected
         },
     );
-    true
+    registered
 }
 
 fn unregister_browser_client(
@@ -494,7 +859,13 @@ fn register_client(
     _native_sender: std_mpsc::Sender<ServerMessage>,
     web_sender: BrowserOutboundSender,
 ) -> bool {
-    register_browser_client(inner, connection_id, client_id, web_sender)
+    register_browser_client(
+        inner,
+        inner.native_runtime_generation.load(Ordering::Acquire),
+        connection_id,
+        client_id,
+        web_sender,
+    )
 }
 
 #[cfg(test)]
@@ -705,7 +1076,7 @@ fn handle_inbound_browser(
         message,
         InboundResponder::Browser {
             sender: sender.clone(),
-            inner: inner.clone(),
+            inner: Arc::downgrade(inner),
             connection_id,
             client_id: client_id.to_string(),
         },
@@ -716,7 +1087,7 @@ fn handle_inbound_browser(
 enum InboundResponder {
     Browser {
         sender: BrowserOutboundSender,
-        inner: Arc<RemoteHostInner>,
+        inner: std::sync::Weak<RemoteHostInner>,
         connection_id: u64,
         client_id: String,
     },
@@ -744,11 +1115,14 @@ impl InboundResponder {
                 connection_id,
                 client_id,
             } => {
+                let Some(host) = inner.upgrade() else {
+                    return Err(BrowserEnqueueError::Closed);
+                };
                 let result =
-                    sender.try_send_server_message(&message, inner, *connection_id, client_id);
+                    sender.try_send_server_message(&message, &host, *connection_id, client_id);
                 if result.is_err() {
                     revoke_web_connection(
-                        inner,
+                        &host,
                         *connection_id,
                         client_id,
                         &sender.tombstone(),
@@ -772,10 +1146,13 @@ impl InboundResponder {
                 connection_id,
                 client_id,
             } => {
+                let Some(host) = inner.upgrade() else {
+                    return Err(BrowserEnqueueError::Closed);
+                };
                 let result = sender.try_send(message);
                 if result.is_err() {
                     revoke_web_connection(
-                        inner,
+                        &host,
                         *connection_id,
                         client_id,
                         &sender.tombstone(),
@@ -1718,7 +2095,7 @@ fn with_registered_web_operation<R>(
 
 #[derive(Clone)]
 struct WebInputFence {
-    inner: Arc<RemoteHostInner>,
+    inner: std::sync::Weak<RemoteHostInner>,
     connection_id: u64,
     client_id: String,
     tombstone: Option<Arc<WebConnectionTombstone>>,
@@ -1732,17 +2109,19 @@ impl WebInputFence {
     }
 
     fn is_current_at(&self, checked_at_epoch_ms: u64) -> bool {
-        if self.runtime_instance_id != self.inner.runtime_instance_id {
+        let Some(inner) = self.inner.upgrade() else {
+            return false;
+        };
+        if self.runtime_instance_id != inner.runtime_instance_id {
             return false;
         }
-        let _operation = self
-            .inner
+        let _operation = inner
             .web_control_operation_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if self.tombstone.as_ref().is_some_and(|expected| {
             !web_connection_is_authoritative_locked(
-                &self.inner,
+                &inner,
                 self.connection_id,
                 &self.client_id,
                 Some(expected),
@@ -1751,7 +2130,7 @@ impl WebInputFence {
             return false;
         }
         let (authorized, lease_changed) = {
-            let Ok(mut control) = self.inner.web_control.lock() else {
+            let Ok(mut control) = inner.web_control.lock() else {
                 return false;
             };
             let before = control.writer_leases().peek();
@@ -1768,17 +2147,16 @@ impl WebInputFence {
                 None => control.legacy_authorizes(self.connection_id, &self.client_id),
             };
             let after = control.writer_leases().peek();
-            clear_controller_after_lease_removal(&self.inner, before.as_ref(), after.as_ref());
+            clear_controller_after_lease_removal(&inner, before.as_ref(), after.as_ref());
             (authorized, before != after)
         };
-        let controller_matches = self
-            .inner
+        let controller_matches = inner
             .controller_client_id
             .read()
             .map(|controller| controller.as_deref() == Some(self.client_id.as_str()))
             .unwrap_or(false);
         if lease_changed {
-            broadcast_writer_lease_state_locked(&self.inner, checked_at_epoch_ms);
+            broadcast_writer_lease_state_locked(&inner, checked_at_epoch_ms);
         }
         authorized && controller_matches
     }
@@ -1797,7 +2175,7 @@ pub(crate) fn web_mutation_authority_is_current(
         return false;
     };
     WebInputFence {
-        inner: inner.clone(),
+        inner: Arc::downgrade(inner),
         connection_id: authority.connection_id,
         client_id: authority.client_id.clone(),
         tombstone: Some(tombstone),
@@ -1853,7 +2231,7 @@ fn reserve_web_input_fence(
         broadcast_writer_lease_state_locked(inner, now_epoch_ms);
     }
     (authorized && controller_matches).then(|| WebInputFence {
-        inner: inner.clone(),
+        inner: Arc::downgrade(inner),
         connection_id,
         client_id: client_id.to_string(),
         tombstone,
@@ -1929,7 +2307,13 @@ fn enqueue_terminal_input(
                 });
                 return;
             }
-            let (session_id, _) = match resolve_unique_session(&fence.inner, &stable_session_key) {
+            let Some(host) = fence.inner.upgrade() else {
+                let _ = response.send(ServerMessage::Error {
+                    message: "The host runtime stopped before terminal input executed.".to_string(),
+                });
+                return;
+            };
+            let (session_id, _) = match resolve_unique_session(&host, &stable_session_key) {
                 Ok(session) => session,
                 Err(_) => {
                     let _ = response.send(ServerMessage::Error {
@@ -1938,12 +2322,12 @@ fn enqueue_terminal_input(
                     return;
                 }
             };
-            let handler = fence
-                .inner
+            let handler = host
                 .terminal_input_handler
                 .read()
                 .ok()
                 .and_then(|slot| slot.as_ref().cloned());
+            drop(host);
             let result = handler.map_or_else(
                 || Err("The target PTY is not ready for input.".to_string()),
                 |handler| {
@@ -1992,22 +2376,28 @@ fn enqueue_terminal_resize(
                     });
                     return;
                 }
-                let (session_id, _) =
-                    match resolve_unique_session(&fence.inner, &stable_session_key) {
-                        Ok(session) => session,
-                        Err(_) => {
-                            let _ = response.send(ServerMessage::Error {
-                                message: "The requested session no longer exists.".to_string(),
-                            });
-                            return;
-                        }
-                    };
-                let handler = fence
-                    .inner
+                let Some(host) = fence.inner.upgrade() else {
+                    let _ = response.send(ServerMessage::Error {
+                        message: "The host runtime stopped before terminal resize executed."
+                            .to_string(),
+                    });
+                    return;
+                };
+                let (session_id, _) = match resolve_unique_session(&host, &stable_session_key) {
+                    Ok(session) => session,
+                    Err(_) => {
+                        let _ = response.send(ServerMessage::Error {
+                            message: "The requested session no longer exists.".to_string(),
+                        });
+                        return;
+                    }
+                };
+                let handler = host
                     .terminal_resize_handler
                     .read()
                     .ok()
                     .and_then(|slot| slot.as_ref().cloned());
+                drop(host);
                 if let Some(handler) = handler {
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         handler(session_id, dimensions);
@@ -3262,8 +3652,8 @@ fn dispatch_composer_submit_for_connection(
             let execution_epoch_ms =
                 fence_check_epoch_ms.unwrap_or_else(super::super::now_epoch_ms);
             if !fence.is_current_at(execution_epoch_ms) {
-                clear_in_flight_composer(&fence.inner, &mutation_id, fingerprint);
-                completion.send(Err(composer_rejected(
+                clear_in_flight_composer_weak(&fence.inner, &mutation_id, fingerprint);
+                completion.send(Err(composer_rejected_from_weak(
                     &fence.inner,
                     connection_id,
                     mutation_id,
@@ -3273,12 +3663,16 @@ fn dispatch_composer_submit_for_connection(
                 )));
                 return;
             }
-            let (session_id, session_kind) =
-                match resolve_unique_session(&fence.inner, &stable_session_key) {
+            let (session_id, session_kind) = match fence
+                .inner
+                .upgrade()
+                .map(|host| resolve_unique_session(&host, &stable_session_key))
+            {
+                Some(result) => match result {
                     Ok(session) => session,
                     Err(code) => {
-                        clear_in_flight_composer(&fence.inner, &mutation_id, fingerprint);
-                        completion.send(Err(composer_rejected(
+                        clear_in_flight_composer_weak(&fence.inner, &mutation_id, fingerprint);
+                        completion.send(Err(composer_rejected_from_weak(
                             &fence.inner,
                             connection_id,
                             mutation_id,
@@ -3288,32 +3682,61 @@ fn dispatch_composer_submit_for_connection(
                         )));
                         return;
                     }
-                };
-            let host_service = RemoteHostService::borrowed(fence.inner.clone());
-            let reconciliation = match session_kind {
-                SessionKind::Claude => host_service.reserve_claude_composer_prompt(
-                    &mutation_id,
-                    &session_id,
-                    &stable_session_key,
-                    &text,
-                ),
-                SessionKind::Codex => {
-                    let provider_visible_text =
-                        canonical_codex_composer_prompt(&text, decoded_attachments.len());
-                    host_service.reserve_codex_composer_prompt(
-                        &mutation_id,
-                        &session_id,
-                        &stable_session_key,
-                        &provider_visible_text,
-                    )
+                },
+                None => {
+                    clear_in_flight_composer_weak(&fence.inner, &mutation_id, fingerprint);
+                    completion.send(Err(composer_rejected_from_weak(
+                        &fence.inner,
+                        connection_id,
+                        mutation_id,
+                        ComposerRejectCode::PtyRejected,
+                        "The host runtime stopped before the prompt executed.",
+                        execution_epoch_ms,
+                    )));
+                    return;
                 }
-                SessionKind::Shell | SessionKind::Server | SessionKind::Ssh => {
-                    ComposerReconciliationReservation::NotNeeded
+            };
+            let reconciliation = match fence.inner.upgrade() {
+                Some(host) => {
+                    let host_service = RemoteHostService::borrowed(host);
+                    match session_kind {
+                        SessionKind::Claude => host_service.reserve_claude_composer_prompt(
+                            &mutation_id,
+                            &session_id,
+                            &stable_session_key,
+                            &text,
+                        ),
+                        SessionKind::Codex => {
+                            let provider_visible_text =
+                                canonical_codex_composer_prompt(&text, decoded_attachments.len());
+                            host_service.reserve_codex_composer_prompt(
+                                &mutation_id,
+                                &session_id,
+                                &stable_session_key,
+                                &provider_visible_text,
+                            )
+                        }
+                        SessionKind::Shell | SessionKind::Server | SessionKind::Ssh => {
+                            ComposerReconciliationReservation::NotNeeded
+                        }
+                    }
+                }
+                None => {
+                    clear_in_flight_composer_weak(&fence.inner, &mutation_id, fingerprint);
+                    completion.send(Err(composer_rejected_from_weak(
+                        &fence.inner,
+                        connection_id,
+                        mutation_id,
+                        ComposerRejectCode::PtyRejected,
+                        "The host runtime stopped before the prompt was reconciled.",
+                        execution_epoch_ms,
+                    )));
+                    return;
                 }
             };
             if reconciliation == ComposerReconciliationReservation::CapacityExceeded {
-                clear_in_flight_composer(&fence.inner, &mutation_id, fingerprint);
-                completion.send(Err(composer_rejected(
+                clear_in_flight_composer_weak(&fence.inner, &mutation_id, fingerprint);
+                completion.send(Err(composer_rejected_from_weak(
                     &fence.inner,
                     connection_id,
                     mutation_id,
@@ -3327,12 +3750,12 @@ fn dispatch_composer_submit_for_connection(
                 && reconciliation == ComposerReconciliationReservation::Reserved;
             let reconcile_codex_prompt = session_kind == SessionKind::Codex
                 && reconciliation == ComposerReconciliationReservation::Reserved;
-            let handler = fence
-                .inner
-                .terminal_input_handler
-                .read()
-                .ok()
-                .and_then(|slot| slot.as_ref().cloned());
+            let handler = fence.inner.upgrade().and_then(|host| {
+                host.terminal_input_handler
+                    .read()
+                    .ok()
+                    .and_then(|slot| slot.as_ref().cloned())
+            });
             let callback_result = handler.map_or_else(
                 || Err("The target PTY is not ready for input.".to_string()),
                 |handler| {
@@ -3343,7 +3766,7 @@ fn dispatch_composer_submit_for_connection(
                             text: format!("{text}\r"),
                             attachments: decoded_attachments,
                             authority: RemoteWebMutationAuthority {
-                                runtime_instance_id: fence.inner.runtime_instance_id.clone(),
+                                runtime_instance_id: fence.runtime_instance_id.clone(),
                                 connection_id,
                                 client_id: fence.client_id.clone(),
                                 lease_generation: Some(lease_generation),
@@ -3355,14 +3778,20 @@ fn dispatch_composer_submit_for_connection(
             );
             if let Err(message) = callback_result {
                 if reconcile_claude_prompt {
-                    host_service.cancel_claude_composer_prompt(&mutation_id);
+                    if let Some(host) = fence.inner.upgrade() {
+                        RemoteHostService::borrowed(host)
+                            .cancel_claude_composer_prompt(&mutation_id);
+                    }
                 }
                 if reconcile_codex_prompt {
-                    host_service.cancel_codex_composer_prompt(&mutation_id);
+                    if let Some(host) = fence.inner.upgrade() {
+                        RemoteHostService::borrowed(host)
+                            .cancel_codex_composer_prompt(&mutation_id);
+                    }
                 }
                 if message == super::image_paste::WEB_COMPOSER_AUTHORITY_CHANGED {
-                    clear_in_flight_composer(&fence.inner, &mutation_id, fingerprint);
-                    completion.send(Err(composer_rejected(
+                    clear_in_flight_composer_weak(&fence.inner, &mutation_id, fingerprint);
+                    completion.send(Err(composer_rejected_from_weak(
                         &fence.inner,
                         connection_id,
                         mutation_id,
@@ -3373,8 +3802,8 @@ fn dispatch_composer_submit_for_connection(
                     return;
                 }
                 let message = bounded_composer_error(&message);
-                store_pty_rejection(&fence.inner, &mutation_id, fingerprint, &message);
-                completion.send(Err(composer_rejected(
+                store_pty_rejection_weak(&fence.inner, &mutation_id, fingerprint, &message);
+                completion.send(Err(composer_rejected_from_weak(
                     &fence.inner,
                     connection_id,
                     mutation_id,
@@ -3402,41 +3831,56 @@ fn dispatch_composer_submit_for_connection(
                 }
             };
             let occurred_at_epoch_ms = execution_epoch_ms;
-            let published = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                publish_semantic_event(
-                    &fence.inner,
-                    SemanticEventDraft {
-                        stable_session_key: stable_session_key.clone(),
-                        occurred_at_epoch_ms,
-                        source,
-                        kind,
-                        retention: SemanticRetention::Canonical,
-                        deduplication_key: Some(format!("composer:{mutation_id}")),
-                    },
-                )
-            }));
+            let published = match fence.inner.upgrade() {
+                Some(host) => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    publish_semantic_event(
+                        &host,
+                        SemanticEventDraft {
+                            stable_session_key: stable_session_key.clone(),
+                            occurred_at_epoch_ms,
+                            source,
+                            kind,
+                            retention: SemanticRetention::Canonical,
+                            deduplication_key: Some(format!("composer:{mutation_id}")),
+                        },
+                    )
+                })),
+                None => Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "host runtime stopped before semantic publication",
+                )) as Box<dyn std::any::Any + Send>),
+            };
             if reconcile_claude_prompt {
-                if published.is_ok() {
-                    host_service.accept_claude_composer_prompt(&mutation_id);
-                } else {
-                    host_service.cancel_claude_composer_prompt(&mutation_id);
+                if let Some(host) = fence.inner.upgrade() {
+                    let host_service = RemoteHostService::borrowed(host);
+                    if published.is_ok() {
+                        host_service.accept_claude_composer_prompt(&mutation_id);
+                    } else {
+                        host_service.cancel_claude_composer_prompt(&mutation_id);
+                    }
                 }
             }
             if reconcile_codex_prompt {
-                if published.is_ok() {
-                    host_service.accept_codex_composer_prompt(&mutation_id);
-                } else {
-                    host_service.cancel_codex_composer_prompt(&mutation_id);
+                if let Some(host) = fence.inner.upgrade() {
+                    let host_service = RemoteHostService::borrowed(host);
+                    if published.is_ok() {
+                        host_service.accept_codex_composer_prompt(&mutation_id);
+                    } else {
+                        host_service.cancel_codex_composer_prompt(&mutation_id);
+                    }
                 }
             }
             let accepted_sequence = published.map(|event| event.sequence).unwrap_or_else(|_| {
                 fence
                     .inner
-                    .semantic_journals
-                    .lock()
-                    .ok()
-                    .and_then(|journals| journals.metadata(&stable_session_key))
-                    .map(|metadata| metadata.latest_sequence)
+                    .upgrade()
+                    .and_then(|host| {
+                        host.semantic_journals
+                            .lock()
+                            .ok()
+                            .and_then(|journals| journals.metadata(&stable_session_key))
+                            .map(|metadata| metadata.latest_sequence)
+                    })
                     .unwrap_or(0)
             });
             let accepted = ComposerAccepted {
@@ -3445,18 +3889,20 @@ fn dispatch_composer_submit_for_connection(
                 accepted_sequence,
                 lease_generation,
             };
-            store_composer_mutation_outcome(
-                &fence.inner,
-                mutation_id,
-                WebComposerMutationRecord {
-                    fingerprint,
-                    status: WebComposerMutationStatus::Accepted {
-                        stable_session_key,
-                        accepted_sequence,
-                        lease_generation,
+            if let Some(host) = fence.inner.upgrade() {
+                store_composer_mutation_outcome(
+                    &host,
+                    mutation_id,
+                    WebComposerMutationRecord {
+                        fingerprint,
+                        status: WebComposerMutationStatus::Accepted {
+                            stable_session_key,
+                            accepted_sequence,
+                            lease_generation,
+                        },
                     },
-                },
-            );
+                );
+            }
             completion.send(Ok(accepted));
         });
     if dispatch.is_err() {
@@ -3692,6 +4138,48 @@ fn composer_rejected_locked(
         code,
         message: message.into(),
         writer_lease: writer_lease_state_locked(inner, connection_id, now_epoch_ms),
+    }
+}
+
+fn composer_rejected_from_weak(
+    inner: &Weak<RemoteHostInner>,
+    connection_id: u64,
+    mutation_id: String,
+    code: ComposerRejectCode,
+    message: impl Into<String>,
+    now_epoch_ms: u64,
+) -> ComposerRejected {
+    let message = message.into();
+    let writer_lease = inner
+        .upgrade()
+        .map(|host| writer_lease_state(&host, connection_id, now_epoch_ms))
+        .unwrap_or_default();
+    ComposerRejected {
+        mutation_id,
+        code,
+        message,
+        writer_lease,
+    }
+}
+
+fn clear_in_flight_composer_weak(
+    inner: &Weak<RemoteHostInner>,
+    mutation_id: &str,
+    fingerprint: u64,
+) {
+    if let Some(host) = inner.upgrade() {
+        clear_in_flight_composer(&host, mutation_id, fingerprint);
+    }
+}
+
+fn store_pty_rejection_weak(
+    inner: &Weak<RemoteHostInner>,
+    mutation_id: &str,
+    fingerprint: u64,
+    message: &str,
+) {
+    if let Some(host) = inner.upgrade() {
+        store_pty_rejection(&host, mutation_id, fingerprint, message);
     }
 }
 
@@ -4445,8 +4933,11 @@ mod tests {
     use super::super::action::{WebAction, WebAiKind};
     use super::*;
     use crate::remote::{
-        deliver_pending_bootstraps, PairedWebClient, RemoteActionPayload, RemoteHostConfig,
-        RemoteHostService, RemoteSessionBootstrap, PROTOCOL_VERSION,
+        deliver_pending_bootstraps, load_remote_machine_state, save_remote_machine_state,
+        test_support::TestProfileGuard, HostConfigPersistenceTestPhase, PairedWebClient,
+        RemoteAccessSource, RemoteActionPayload, RemoteHostConfig, RemoteHostService,
+        RemoteMachineState, RemoteSessionBootstrap, HOST_CONFIG_PERSISTENCE_TEST_HOOK,
+        PROTOCOL_VERSION, REMOTE_WORKER_SHUTDOWN_TIMEOUT,
     };
     use crate::state::{AiLaunchSpec, SessionDimensions, SessionKind, SessionRuntimeState};
     use crate::terminal::session::{
@@ -4460,6 +4951,33 @@ mod tests {
     use std::pin::Pin;
     use std::sync::mpsc as std_mpsc;
     use std::task::{Context, Poll};
+
+    struct HostConfigPersistenceHookGuard;
+
+    impl HostConfigPersistenceHookGuard {
+        fn install(
+            hook: Arc<
+                dyn Fn(&RemoteHostConfig, HostConfigPersistenceTestPhase) -> std::io::Result<()>
+                    + Send
+                    + Sync,
+            >,
+        ) -> Self {
+            let mut slot = HOST_CONFIG_PERSISTENCE_TEST_HOOK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert!(slot.is_none(), "host config persistence test hook leaked");
+            *slot = Some(hook);
+            Self
+        }
+    }
+
+    impl Drop for HostConfigPersistenceHookGuard {
+        fn drop(&mut self) {
+            *HOST_CONFIG_PERSISTENCE_TEST_HOOK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        }
+    }
 
     fn test_web_sender() -> BrowserOutboundSender {
         let (sender, receiver) = BrowserOutboundSender::channel(4096, WEB_OUTBOUND_MAX_BYTES * 4);
@@ -4507,7 +5025,11 @@ mod tests {
         let service = RemoteHostService::new(config);
         pair_web_client(&service, "paired-browser");
         let state = WebState {
-            inner: service.inner.clone(),
+            inner: Arc::downgrade(&service.inner),
+            listener_generation: service
+                .inner
+                .native_runtime_generation
+                .load(Ordering::Acquire),
             pairing_attempts: Arc::new(std::sync::Mutex::new(Default::default())),
         };
         let config = service.config();
@@ -4539,6 +5061,25 @@ mod tests {
             authorize_ws_request(&state, &headers),
             Err(StatusCode::FORBIDDEN)
         );
+    }
+
+    #[test]
+    fn web_input_fence_does_not_retain_host_runtime() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let host = Arc::downgrade(&service.inner);
+        let fence = WebInputFence {
+            inner: Arc::downgrade(&service.inner),
+            connection_id: 0,
+            client_id: "expired".to_string(),
+            tombstone: None,
+            lease_generation: None,
+            runtime_instance_id: service.inner.runtime_instance_id.clone(),
+        };
+
+        drop(service);
+
+        assert!(host.upgrade().is_none());
+        assert!(!fence.is_current());
     }
 
     fn try_recv_web_text(receiver: &mut BrowserOutboundReceiver) -> String {
@@ -4821,7 +5362,7 @@ mod tests {
                 run_browser_writer(
                     &mut SlowSink::new(Duration::from_millis(20), observed),
                     receiver,
-                    service.inner.clone(),
+                    Arc::downgrade(&service.inner),
                     1,
                     client_id.to_string(),
                     tombstone.clone(),
@@ -5010,7 +5551,7 @@ mod tests {
             .expect("old replay");
         let lane = WebResponseLane(InboundResponder::Browser {
             sender: sender.clone(),
-            inner: service.inner.clone(),
+            inner: Arc::downgrade(&service.inner),
             connection_id: 1,
             client_id: client_id.to_string(),
         });
@@ -5234,6 +5775,586 @@ mod tests {
     }
 
     #[test]
+    fn web_restart_rejects_a_client_paused_before_registration() {
+        let _profile = TestProfileGuard::new("web-client-registration-durable-fence");
+        let web_port = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .expect("reserve isolated browser test port")
+            .local_addr()
+            .expect("isolated browser test address")
+            .port();
+        let mut config = RemoteHostConfig::default();
+        config.web.bind_address = "127.0.0.1".to_string();
+        config.web.port = web_port;
+        let service = RemoteHostService::new(config);
+        let client_id = "generation-fenced-browser";
+        pair_web_client(&service, client_id);
+        service
+            .inner
+            .config
+            .write()
+            .expect("config lock")
+            .web
+            .enabled = true;
+        save_remote_machine_state(&RemoteMachineState {
+            host: service.config(),
+            known_hosts: Vec::new(),
+        })
+        .expect("seed durable browser registration state");
+        let durable_before = load_remote_machine_state()
+            .expect("load durable browser registration state before the attempt");
+        let memory_before = service.config();
+        let old_generation = service
+            .inner
+            .native_runtime_generation
+            .load(Ordering::Acquire);
+        let (registration_event_tx, registration_event_rx) = std_mpsc::sync_channel(3);
+        let (registration_release_tx, registration_release_rx) = std_mpsc::sync_channel(0);
+        let registration_release_rx = Arc::new(std::sync::Mutex::new(registration_release_rx));
+        *service
+            .inner
+            .client_registration_test_hook
+            .write()
+            .expect("registration hook lock") = Some(Arc::new(move |event| {
+            registration_event_tx
+                .send(event)
+                .expect("registration observer should remain");
+            if event == crate::remote::ClientRegistrationTestEvent::BeforeFence {
+                registration_release_rx
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .recv()
+                    .expect("registration should be released");
+            }
+        }));
+
+        let inner = service.inner.clone();
+        let client_id_for_worker = client_id.to_string();
+        let admission = BrowserConnectionAdmission {
+            authentication: ValidatedWebAuthentication {
+                client_id: client_id.to_string(),
+                cookie_secret_hex: service.config().web.cookie_secret_hex,
+            },
+            activity: prepare_browser_connection_activity(
+                client_id,
+                "127.0.0.9".parse().expect("browser test address"),
+                Some("late-browser-install".to_string()),
+                &HeaderMap::new(),
+            )
+            .expect("valid late browser install id"),
+        };
+        let (registered_tx, registered_rx) = std_mpsc::sync_channel(1);
+        let registration = std::thread::spawn(move || {
+            let (sender, _receiver) = test_web_channel();
+            let registered = register_browser_client_with_admission(
+                &inner,
+                old_generation,
+                91,
+                &client_id_for_worker,
+                sender,
+                &admission,
+            )
+            .expect("browser admission should settle");
+            registered_tx
+                .send(registered)
+                .expect("registration result observer should remain");
+        });
+        assert_eq!(
+            registration_event_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("browser should pause before registration"),
+            crate::remote::ClientRegistrationTestEvent::BeforeFence
+        );
+
+        service.apply_config(service.config());
+        assert_ne!(
+            service
+                .inner
+                .native_runtime_generation
+                .load(Ordering::Acquire),
+            old_generation,
+            "test restart did not revoke the listener generation"
+        );
+        registration_release_tx
+            .send(())
+            .expect("browser registration should still be waiting");
+        let outcome = registration_event_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("browser registration should report its fenced outcome");
+        let registered = registered_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("browser registration worker should finish");
+        registration
+            .join()
+            .expect("registration worker should join");
+        *service
+            .inner
+            .client_registration_test_hook
+            .write()
+            .expect("registration hook lock") = None;
+
+        assert_eq!(
+            outcome,
+            crate::remote::ClientRegistrationTestEvent::Rejected,
+            "a revoked web listener generation admitted a late browser"
+        );
+        assert!(!registered, "a revoked web listener returned success");
+        assert!(
+            service
+                .inner
+                .clients
+                .lock()
+                .expect("clients lock")
+                .is_empty(),
+            "a revoked web listener left a late browser registered"
+        );
+        let memory_after = service.config();
+        assert_eq!(
+            memory_after.web.paired_clients, memory_before.web.paired_clients,
+            "a rejected browser admission changed paired authorization in memory"
+        );
+        assert_eq!(
+            memory_after.web.activity_log, memory_before.web.activity_log,
+            "a rejected browser admission recorded connection activity in memory"
+        );
+        let durable_after = load_remote_machine_state()
+            .expect("load durable browser registration state after rejection");
+        assert_eq!(
+            durable_after.host.web.paired_clients, durable_before.host.web.paired_clients,
+            "a rejected browser admission persisted paired authorization"
+        );
+        assert_eq!(
+            durable_after.host.web.activity_log, durable_before.host.web.activity_log,
+            "a rejected browser admission persisted connection activity"
+        );
+    }
+
+    #[test]
+    fn successful_browser_admission_uses_phase_b_commit_time_and_one_config_revision() {
+        let _profile = TestProfileGuard::new("browser-admission-final-time-revision");
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let client_id = "final-time-browser";
+        pair_web_client(&service, client_id);
+        service
+            .inner
+            .config
+            .write()
+            .expect("config lock")
+            .web
+            .enabled = true;
+        save_remote_machine_state(&RemoteMachineState {
+            host: service.config(),
+            known_hosts: Vec::new(),
+        })
+        .expect("seed final-time browser state");
+        let clock_calls = Arc::new(AtomicUsize::new(0));
+        *service
+            .inner
+            .browser_admission_clock_test_hook
+            .write()
+            .expect("browser admission clock hook") = Some(Arc::new({
+            let clock_calls = clock_calls.clone();
+            move || match clock_calls.fetch_add(1, Ordering::SeqCst) {
+                0 => 111_111,
+                1 => 424_242,
+                call => panic!("browser admission clock called unexpectedly at index {call}"),
+            }
+        }));
+        let (attempt_time_tx, attempt_time_rx) = std_mpsc::sync_channel(1);
+        let attempt_observed = Arc::new(AtomicBool::new(false));
+        let _persistence_hook = HostConfigPersistenceHookGuard::install(Arc::new({
+            let attempt_observed = attempt_observed.clone();
+            move |snapshot, phase| {
+                if phase == HostConfigPersistenceTestPhase::BeforeWrite
+                    && !snapshot.pending_admission_attempts.is_empty()
+                    && !attempt_observed.swap(true, Ordering::SeqCst)
+                {
+                    attempt_time_tx
+                        .send(snapshot.pending_admission_attempts[0].attempted_at_epoch_ms)
+                        .map_err(|_| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::BrokenPipe,
+                                "browser attempt-time observer disappeared",
+                            )
+                        })?;
+                }
+                Ok(())
+            }
+        }));
+        let revision_before = service.config_revision();
+        let generation = service
+            .inner
+            .native_runtime_generation
+            .load(Ordering::Acquire);
+        let admission = BrowserConnectionAdmission {
+            authentication: ValidatedWebAuthentication {
+                client_id: client_id.to_string(),
+                cookie_secret_hex: service.config().web.cookie_secret_hex,
+            },
+            activity: prepare_browser_connection_activity(
+                client_id,
+                "127.0.0.10".parse().expect("browser test address"),
+                Some("final-time-install".to_string()),
+                &HeaderMap::new(),
+            )
+            .expect("valid final-time browser install id"),
+        };
+        let (sender, _receiver) = test_web_channel();
+
+        assert!(register_browser_client_with_admission(
+            &service.inner,
+            generation,
+            93,
+            client_id,
+            sender,
+            &admission,
+        )
+        .expect("browser admission should commit"));
+
+        assert_eq!(
+            attempt_time_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("Phase A attempt marker must be persisted"),
+            111_111,
+            "the durable marker timestamp must describe only the Phase A attempt"
+        );
+        assert_eq!(
+            clock_calls.load(Ordering::SeqCst),
+            2,
+            "Phase A attempt and Phase B commit must capture separate timestamps"
+        );
+        assert_eq!(service.config_revision(), revision_before + 1);
+        let config = service.config();
+        assert!(config.pending_admission_attempts.is_empty());
+        let paired = config
+            .web
+            .paired_clients
+            .iter()
+            .find(|client| client.client_id == client_id)
+            .expect("paired browser should remain");
+        assert_eq!(paired.last_seen_epoch_ms, Some(424_242));
+        let event = config
+            .web
+            .activity_log
+            .last()
+            .expect("browser connection event should be recorded");
+        assert_eq!(event.event_at_epoch_ms, Some(424_242));
+        assert_eq!(
+            load_remote_machine_state()
+                .expect("load final-time browser state")
+                .host,
+            config,
+            "one committed revision must match the durable browser admission"
+        );
+    }
+
+    #[test]
+    fn blocked_browser_admission_persistence_cannot_block_root_drop_or_commit_after_stop() {
+        let _profile = TestProfileGuard::new("browser-admission-persistence-drop-fence");
+        let root = RemoteHostService::new(RemoteHostConfig::default());
+        let client_id = "blocked-persistence-browser";
+        pair_web_client(&root, client_id);
+        root.inner.config.write().expect("config lock").web.enabled = true;
+        save_remote_machine_state(&RemoteMachineState {
+            host: root.config(),
+            known_hosts: Vec::new(),
+        })
+        .expect("seed isolated browser admission state");
+        let durable_before = load_remote_machine_state()
+            .expect("load isolated browser admission state before the attempt");
+        let old_generation = root.inner.native_runtime_generation.load(Ordering::Acquire);
+        let admission = BrowserConnectionAdmission {
+            authentication: ValidatedWebAuthentication {
+                client_id: client_id.to_string(),
+                cookie_secret_hex: root.config().web.cookie_secret_hex,
+            },
+            activity: prepare_browser_connection_activity(
+                client_id,
+                "127.0.0.7".parse().expect("browser test address"),
+                Some("blocked-browser-install".to_string()),
+                &HeaderMap::new(),
+            )
+            .expect("valid blocked browser install id"),
+        };
+
+        let (persistence_entered_tx, persistence_entered_rx) = std_mpsc::sync_channel(1);
+        let (persistence_release_tx, persistence_release_rx) = std_mpsc::sync_channel(0);
+        let persistence_release_rx = Arc::new(std::sync::Mutex::new(persistence_release_rx));
+        let candidate_seen = Arc::new(AtomicBool::new(false));
+        let _persistence_hook = HostConfigPersistenceHookGuard::install(Arc::new({
+            let persistence_release_rx = persistence_release_rx.clone();
+            let candidate_seen = candidate_seen.clone();
+            move |snapshot, phase| {
+                if phase == HostConfigPersistenceTestPhase::AfterWrite
+                    && !snapshot.pending_admission_attempts.is_empty()
+                    && !candidate_seen.swap(true, Ordering::SeqCst)
+                {
+                    persistence_entered_tx.send(snapshot.clone()).map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::BrokenPipe,
+                            "browser persistence observer disappeared",
+                        )
+                    })?;
+                    persistence_release_rx
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .recv()
+                        .map_err(|_| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::BrokenPipe,
+                                "browser persistence release disappeared",
+                            )
+                        })?;
+                }
+                Ok(())
+            }
+        }));
+        let host = root.inner.clone();
+        let host_weak = Arc::downgrade(&root.inner);
+        let client_id_for_worker = client_id.to_string();
+        let (registered_tx, registered_rx) = std_mpsc::sync_channel(1);
+        let registration = std::thread::spawn(move || {
+            let (sender, _receiver) = test_web_channel();
+            let result = register_browser_client_with_admission(
+                &host,
+                old_generation,
+                92,
+                &client_id_for_worker,
+                sender,
+                &admission,
+            );
+            registered_tx
+                .send(result)
+                .expect("browser registration result observer should remain");
+        });
+        let durable_attempt = persistence_entered_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("browser admission should enter persistence");
+        assert_eq!(
+            durable_attempt.paired_clients,
+            durable_before.host.paired_clients
+        );
+        assert_eq!(
+            durable_attempt.web.activity_log,
+            durable_before.host.web.activity_log
+        );
+        assert_eq!(durable_attempt.pending_admission_attempts.len(), 1);
+        assert_eq!(
+            durable_attempt.pending_admission_attempts[0].source,
+            RemoteAccessSource::Browser
+        );
+
+        let (drop_done_tx, drop_done_rx) = std_mpsc::sync_channel(1);
+        let dropper = std::thread::spawn(move || {
+            drop(root);
+            let _ = drop_done_tx.try_send(());
+        });
+        let drop_returned_while_persistence_blocked = drop_done_rx
+            .recv_timeout(REMOTE_WORKER_SHUTDOWN_TIMEOUT + Duration::from_millis(500))
+            .is_ok();
+
+        persistence_release_tx
+            .send(())
+            .expect("browser persistence should remain blocked until explicit release");
+        if !drop_returned_while_persistence_blocked {
+            drop_done_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("root drop should finish after releasing the stale browser writer");
+        }
+        let registered = registered_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("browser registration should settle after root stop");
+        registration
+            .join()
+            .expect("browser registration worker should join");
+        dropper.join().expect("root drop worker should join");
+
+        assert!(
+            drop_returned_while_persistence_blocked,
+            "blocked browser admission persistence held lifecycle authority across root drop"
+        );
+        assert!(
+            matches!(registered, Ok(false)),
+            "a browser admission committed after its root generation stopped: {registered:?}"
+        );
+        let durable_after = load_remote_machine_state()
+            .expect("load isolated browser admission state after root stop");
+        assert_eq!(
+            durable_after.host, durable_before.host,
+            "stale browser admission persistence changed the isolated durable host config"
+        );
+        assert!(
+            host_weak.upgrade().is_none(),
+            "browser admission worker retained the stopped host runtime"
+        );
+    }
+
+    fn assert_blocked_browser_admission_serializes_config_mutation(
+        profile: &str,
+        mutate: impl FnOnce(RemoteHostService, &str) -> bool + Send + 'static,
+    ) {
+        let _profile = TestProfileGuard::new(profile);
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let client_id = "serialized-browser-mutation";
+        pair_web_client(&service, client_id);
+        service
+            .inner
+            .config
+            .write()
+            .expect("config lock")
+            .web
+            .enabled = true;
+        save_remote_machine_state(&RemoteMachineState {
+            host: service.config(),
+            known_hosts: Vec::new(),
+        })
+        .expect("seed serialized browser mutation state");
+        let generation = service
+            .inner
+            .native_runtime_generation
+            .load(Ordering::Acquire);
+        let admission = BrowserConnectionAdmission {
+            authentication: ValidatedWebAuthentication {
+                client_id: client_id.to_string(),
+                cookie_secret_hex: service.config().web.cookie_secret_hex,
+            },
+            activity: prepare_browser_connection_activity(
+                client_id,
+                "127.0.0.11".parse().expect("browser test address"),
+                Some("serialized-browser-install".to_string()),
+                &HeaderMap::new(),
+            )
+            .expect("valid serialized browser install id"),
+        };
+        let (persistence_entered_tx, persistence_entered_rx) = std_mpsc::sync_channel(1);
+        let (persistence_release_tx, persistence_release_rx) = std_mpsc::sync_channel(0);
+        let persistence_release_rx = Arc::new(std::sync::Mutex::new(persistence_release_rx));
+        let candidate_seen = Arc::new(AtomicBool::new(false));
+        let _persistence_hook = HostConfigPersistenceHookGuard::install(Arc::new({
+            let persistence_release_rx = persistence_release_rx.clone();
+            let candidate_seen = candidate_seen.clone();
+            move |snapshot, phase| {
+                if phase == HostConfigPersistenceTestPhase::BeforeWrite
+                    && !snapshot.pending_admission_attempts.is_empty()
+                    && !candidate_seen.swap(true, Ordering::SeqCst)
+                {
+                    persistence_entered_tx.send(()).map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::BrokenPipe,
+                            "serialized browser persistence observer disappeared",
+                        )
+                    })?;
+                    persistence_release_rx
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .recv()
+                        .map_err(|_| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::BrokenPipe,
+                                "serialized browser persistence release disappeared",
+                            )
+                        })?;
+                }
+                Ok(())
+            }
+        }));
+
+        let registration_inner = service.inner.clone();
+        let client_id_for_registration = client_id.to_string();
+        let (registered_tx, registered_rx) = std_mpsc::sync_channel(1);
+        let registration = std::thread::spawn(move || {
+            let (sender, _receiver) = test_web_channel();
+            let result = register_browser_client_with_admission(
+                &registration_inner,
+                generation,
+                94,
+                &client_id_for_registration,
+                sender,
+                &admission,
+            );
+            registered_tx
+                .send(result)
+                .expect("registration result observer should remain");
+        });
+        persistence_entered_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("browser admission should enter persistence");
+        let web_authority = service
+            .inner
+            .web_control_operation_lock
+            .try_lock()
+            .expect("blocked persistence must not retain browser authority");
+
+        let mutation_service = service.clone();
+        let (mutation_started_tx, mutation_started_rx) = std_mpsc::sync_channel(1);
+        let (mutation_done_tx, mutation_done_rx) = std_mpsc::sync_channel(1);
+        let mutation = std::thread::spawn(move || {
+            mutation_started_tx
+                .send(())
+                .expect("mutation start observer should remain");
+            let changed = mutate(mutation_service, client_id);
+            mutation_done_tx
+                .send(changed)
+                .expect("mutation result observer should remain");
+        });
+        mutation_started_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("browser config mutation should start");
+        persistence_release_tx
+            .send(())
+            .expect("release browser admission persistence");
+        drop(web_authority);
+
+        assert!(
+            registered_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("browser admission should settle")
+                .expect("browser admission should remain durable"),
+            "the serialized browser admission should commit before the queued mutation"
+        );
+        assert!(
+            mutation_done_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("browser config mutation should settle"),
+            "the queued browser config mutation should apply"
+        );
+        registration
+            .join()
+            .expect("browser registration worker should join");
+        mutation
+            .join()
+            .expect("browser config mutation worker should join");
+        assert!(
+            service.config().web.paired_clients.is_empty(),
+            "the serialized revoke/reset should be the final paired-client state"
+        );
+        assert!(
+            service
+                .inner
+                .clients
+                .lock()
+                .expect("clients lock")
+                .is_empty(),
+            "the serialized revoke/reset should remove the admitted live browser"
+        );
+    }
+
+    #[test]
+    fn blocked_browser_admission_serializes_before_revoke_without_lock_inversion() {
+        assert_blocked_browser_admission_serializes_config_mutation(
+            "browser-admission-vs-revoke",
+            |service, client_id| service.revoke_paired_web_client(client_id),
+        );
+    }
+
+    #[test]
+    fn blocked_browser_admission_serializes_before_reset_without_lock_inversion() {
+        assert_blocked_browser_admission_serializes_config_mutation(
+            "browser-admission-vs-reset",
+            |service, _| service.reset_browser_access(),
+        );
+    }
+
+    #[test]
     fn stalled_writer_times_out_and_revokes_exact_registration() {
         let service = RemoteHostService::new(RemoteHostConfig::default());
         let client_id = "stalled-writer";
@@ -5258,7 +6379,7 @@ mod tests {
                 run_browser_writer(
                     &mut StalledSink,
                     receiver,
-                    service.inner.clone(),
+                    Arc::downgrade(&service.inner),
                     1,
                     client_id.to_string(),
                     tombstone.clone(),
@@ -10191,7 +11312,7 @@ mod tests {
         register_client(&service.inner, 1, client_id, std_tx, push_tx.clone());
         let lane = WebResponseLane(InboundResponder::Browser {
             sender: push_tx.clone(),
-            inner: service.inner.clone(),
+            inner: Arc::downgrade(&service.inner),
             connection_id: 1,
             client_id: client_id.to_string(),
         });
