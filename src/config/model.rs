@@ -161,6 +161,9 @@ pub struct AppConfig {
     pub projects: Vec<Project>,
     settings: Settings,
     pub ssh_connections: Vec<SSHConnection>,
+    /// Opt-in Portal connection metadata.  This contains only an opaque
+    /// credential-vault reference; bearer material is never part of AppConfig.
+    pub portal: PortalConfig,
     pub extra: JsonMap,
     /// Host-issued opaque identities for configured project ids.  These are
     /// persisted as canonical config metadata so reopening the store never
@@ -172,6 +175,100 @@ pub struct AppConfig {
     source_version: Option<u32>,
 }
 
+/// A stable reference into the platform credential store.  The reference is
+/// intentionally opaque and is not itself a token or secret.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct PortalCredentialReference {
+    pub vault_ref: String,
+}
+
+impl fmt::Debug for PortalCredentialReference {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PortalCredentialReference")
+            .field("vault_ref", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Persisted, typed Portal opt-in.  The default is standalone and cannot
+/// start network traffic. Enrollment and a resolved credential are required
+/// by the host runtime before a transport is constructed.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct PortalConfig {
+    pub enabled: bool,
+    pub base_url: Option<String>,
+    pub credential_ref: Option<PortalCredentialReference>,
+}
+
+impl Default for PortalConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            base_url: None,
+            credential_ref: None,
+        }
+    }
+}
+
+impl fmt::Debug for PortalConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PortalConfig")
+            .field("enabled", &self.enabled)
+            .field("base_url", &self.base_url)
+            .field("credential_ref", &self.credential_ref)
+            .finish()
+    }
+}
+
+impl PortalConfig {
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if let Some(base_url) = &self.base_url {
+            if base_url.len() > MAX_TEXT_BYTES
+                || (!base_url.starts_with("https://")
+                    && !base_url.starts_with("http://127.0.0.1")
+                    && !base_url.starts_with("http://localhost"))
+            {
+                return Err(ConfigError::new(
+                    ConfigErrorKind::Validation,
+                    "Portal base URL must be HTTPS or local development HTTP",
+                ));
+            }
+        }
+        if let Some(reference) = &self.credential_ref {
+            if reference.vault_ref.is_empty()
+                || reference.vault_ref.len() > MAX_ID_BYTES
+                || reference.vault_ref.chars().any(char::is_whitespace)
+            {
+                return Err(ConfigError::new(
+                    ConfigErrorKind::Validation,
+                    "Portal credential reference is invalid",
+                ));
+            }
+        }
+        if self.enabled && (self.base_url.is_none() || self.credential_ref.is_none()) {
+            return Err(ConfigError::new(
+                ConfigErrorKind::Validation,
+                "enabled Portal configuration requires a base URL and credential reference",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Configuration alone never authorizes network access. The runtime also
+    /// requires an enrolled projection and a resolved bearer credential.
+    pub fn is_opted_in(&self) -> bool {
+        self.enabled && self.base_url.is_some() && self.credential_ref.is_some()
+    }
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -180,6 +277,7 @@ impl Default for AppConfig {
             projects: Vec::new(),
             settings: Settings::default(),
             ssh_connections: Vec::new(),
+            portal: PortalConfig::default(),
             extra: JsonMap::new(),
             workspace_project_ids: BTreeMap::new(),
             version_present: false,
@@ -1166,6 +1264,8 @@ struct AppConfigWire {
     projects: Vec<ProjectWire>,
     settings: SettingsWire,
     ssh_connections: Vec<SSHConnectionWire>,
+    #[serde(skip_serializing_if = "PortalConfig::is_default")]
+    portal: PortalConfig,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     workspace_project_ids: BTreeMap<String, String>,
     #[serde(flatten)]
@@ -1674,6 +1774,7 @@ impl TryFrom<&AppConfig> for AppConfigWire {
     type Error = ConfigError;
 
     fn try_from(config: &AppConfig) -> Result<Self, Self::Error> {
+        config.portal.validate()?;
         Ok(Self {
             version: config.version,
             revision: config.revision,
@@ -1688,6 +1789,7 @@ impl TryFrom<&AppConfig> for AppConfigWire {
                 .iter()
                 .map(SSHConnectionWire::try_from)
                 .collect::<Result<Vec<_>, _>>()?,
+            portal: config.portal.clone(),
             workspace_project_ids: config.workspace_project_ids.clone(),
             extra: config.extra.clone(),
         })
@@ -1708,12 +1810,14 @@ impl TryFrom<AppConfigWire> for AppConfig {
             .into_iter()
             .map(SSHConnection::try_from)
             .collect::<Result<Vec<_>, _>>()?;
+        config.portal.validate()?;
         Ok(Self {
             version: config.version,
             revision: config.revision,
             projects,
             settings: Settings::from(config.settings),
             ssh_connections,
+            portal: config.portal,
             workspace_project_ids: config.workspace_project_ids,
             extra: config.extra,
             version_present: false,
@@ -2278,6 +2382,7 @@ fn strict_app_config_shape(value: &Value) -> Result<(), ConfigError> {
             "settings",
             "sshConnections",
             "workspaceProjectIds",
+            "portal",
         ],
         &[
             "version",
@@ -2940,6 +3045,7 @@ impl fmt::Debug for AppConfig {
             .field("projects", &self.projects)
             .field("settings", &self.settings)
             .field("ssh_connections", &self.ssh_connections)
+            .field("portal", &self.portal)
             .field("extra", &RedactedMap(&self.extra))
             .finish()
     }

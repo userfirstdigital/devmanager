@@ -18,11 +18,10 @@ use devmanager::domain::ClientId;
 use devmanager::host::{
     AcceptHelloConfig, HelloListener, HostCleanupWorker, HostConnection, HostExecutorOutcome,
     HostLock, HostLockError, HostRequestExecutor, HostRequestHandle, HostRestartDisposition,
-    PhysicalExitArmRequest, SupervisedHostExecutor, HOST_EXIT_ALREADY_RUNNING,
+    OrganizationRuntime, OrganizationRuntimeConfig, PhysicalExitArmRequest,
+    SupervisedHostExecutor, HOST_EXIT_ALREADY_RUNNING,
 };
 use devmanager::kernel::CommandBus;
-#[cfg(windows)]
-use devmanager::org::OrganizationStateStore;
 use devmanager::protocol::{
     Capability, CapabilitySet, FrameLimits, PROTOCOL_MAJOR, PROTOCOL_MINOR,
 };
@@ -987,6 +986,7 @@ async fn serve_foreground_host(
     // is only negotiated when the executor successfully initialized the one
     // ProcessManager-owned configured supervisor; a failed binding remains
     // visible as an unavailable feature instead of a dead advertised action.
+    let portal_config = config_store.snapshot().config.portal.clone();
     let (
         request_handle,
         SupervisedHostExecutor {
@@ -995,13 +995,24 @@ async fn serve_foreground_host(
         },
     ) = HostRequestExecutor::start_supervised_with_config_store(bus, config_store)
         .map_err(|error| format!("invalid host project configuration: {error}"))?;
+
+    // The host owns the restored projection for its full process lifetime.
+    // Only the typed Portal opt-in is copied from ConfigStore; credential
+    // material is resolved by a future vault provider and never persisted.
+    let organization_runtime = OrganizationRuntime::open(
+        profile_root,
+        OrganizationRuntimeConfig {
+            portal: portal_config,
+            ..OrganizationRuntimeConfig::default()
+        },
+    );
     // Narrow same-process attach seam for /api/connect. The web listener is
     // started from remote/mod.rs (not owned here); it clones this slot after
     // bind. Cross-process HostClient wiring is the remaining external blocker.
     devmanager::connect::bind_host_request_handle(request_handle.clone());
 
-    let organization_hello = OrganizationStateStore::restore_hello(profile_root);
-    if let Some(diagnostic) = organization_hello.diagnostic() {
+    let organization_snapshot = organization_runtime.snapshot();
+    if let Some(diagnostic) = organization_snapshot.last_error.as_deref() {
         let _ = writeln!(io::stderr(), "devmanager-host: {diagnostic}");
     }
     let hello_config = AcceptHelloConfig {
@@ -1020,7 +1031,7 @@ async fn serve_foreground_host(
                 Capability::TaskCockpit,
             ]
             .into_iter()
-            .chain(organization_hello.capability().advertised_capability())
+            .chain(organization_runtime.capability().advertised_capability())
             .chain(
                 request_handle
                     .configured_service_supervisor_ready()
@@ -1162,7 +1173,10 @@ async fn serve_foreground_host(
         }
     };
 
-    finish_supervised_host(exit, &mut connection_tasks, request_handle, join, armed).await
+    let result =
+        finish_supervised_host(exit, &mut connection_tasks, request_handle, join, armed).await;
+    organization_runtime.shutdown();
+    result
 }
 
 #[cfg(windows)]

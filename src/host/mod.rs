@@ -7,6 +7,7 @@ mod cockpit;
 mod connection;
 mod ipc;
 mod lock;
+mod organization_runtime;
 mod shutdown;
 mod update;
 
@@ -27,6 +28,13 @@ pub use ipc::{
     AcceptedHello, HelloListener, HostConnection, IpcError,
 };
 pub use lock::{HostIdentity, HostLock, HostLockError, HOST_EXIT_ALREADY_RUNNING};
+pub use organization_runtime::{
+    OrganizationEvidenceMetadata, OrganizationIpcCommand, OrganizationIpcQuery,
+    OrganizationIpcReply, OrganizationPromptView, OrganizationRefreshReply, OrganizationRuntime,
+    OrganizationRuntimeConfig, OrganizationRuntimeError, OrganizationRuntimeHandle,
+    OrganizationSnapshot, ORGANIZATION_RUNTIME_DEFAULT_REFRESH_INTERVAL_MS,
+    ORGANIZATION_RUNTIME_MAX_REFRESH_INTERVAL_MS,
+};
 pub use shutdown::{
     HostCleanupProgress, HostCleanupSuccessSettlement, HostCleanupWorker, HostRestartDisposition,
     ProcessEmptyTeardown, ProcessEmptyTeardownWorker,

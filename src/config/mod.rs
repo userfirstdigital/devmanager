@@ -5,7 +5,8 @@ pub mod project_store;
 pub use model::{
     AppConfig, ConfigCommand, ConfigError, ConfigErrorKind, ConfigRevision, DefaultDirectories,
     DefaultTerminal, EditorChoice, MacTerminalProfile, Nullable, Project, ProjectFolder,
-    RunCommand, SSHConnection, Settings, SettingsField, SettingsPatch, ShellOptions, SshAuth,
+    PortalConfig, PortalCredentialReference, RunCommand, SSHConnection, Settings, SettingsField,
+    SettingsPatch, ShellOptions, SshAuth,
     SshAuthMode, MAX_CONFIG_BYTES,
 };
 #[cfg(test)]
