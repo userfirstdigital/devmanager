@@ -574,7 +574,7 @@ INSERT INTO prompt_lineage_migration_commitment(
   initial_ledger_count, initial_creation_count, initial_blocked,
   state_creation_token
 )
-SELECT 1, 9,
+SELECT 1, 12,
        (SELECT COUNT(*) FROM prompt_lineage_quarantine),
        (SELECT COUNT(*) FROM prompt_lineage_quarantine_ledger),
        (SELECT COUNT(*) FROM prompt_lineage_quarantine_creation),
@@ -2033,6 +2033,10 @@ mod tests {
             PROMPT_V12_SQL
                 .contains("migration_version INTEGER NOT NULL CHECK(migration_version = 12)"),
             "V12 pins lineage commitment at version 12, so history cannot fold into V10"
+        );
+        assert!(
+            PROMPT_V12_SQL.contains("SELECT 1, 12,"),
+            "V12 must write the same migration version enforced by its commitment constraint"
         );
         assert_eq!(migrations[12].name, "phase07-prompt-history-v1");
         assert_eq!(migrations[12].version, 13);

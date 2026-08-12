@@ -36,8 +36,8 @@ pub use cockpit::{
     TaskCockpitSurface, TaskCockpitUnavailableReason, TaskFileEntry, TaskFilesListProjection,
     TaskFilesReadProjection, TaskGitMutateIntent, TaskGitProjection, TaskServiceProjection,
     TaskServiceRuntimeState, TaskServiceScope, TaskServiceSnapshot, TaskSshEndpoint,
-    TaskSshProjection, TaskWorkspaceKind, TaskWorkspaceProjection,
-    MAX_COCKPIT_FILE_LIST, MAX_COCKPIT_READ_BYTES,
+    TaskSshProjection, TaskWorkspaceKind, TaskWorkspaceProjection, MAX_COCKPIT_FILE_LIST,
+    MAX_COCKPIT_READ_BYTES,
 };
 pub use codec::{
     decode_orchestration_msgpack, encode_orchestration_msgpack, preflight_msgpack,

@@ -3904,9 +3904,9 @@ async fn execute_native_command(
                     detail,
                     body: NativeHostQueryBody::ConfigSidebar(snapshot),
                 }),
-                Err(error) => Ok(NativeHostExecutionResult::QueryFailed(
-                    bounded_host_error(format!("{detail} · config unavailable: {error:?}")),
-                )),
+                Err(error) => Ok(NativeHostExecutionResult::QueryFailed(bounded_host_error(
+                    format!("{detail} · config unavailable: {error:?}"),
+                ))),
             }
         }
         NativeHostCommand::HostActionsQuery { request_id } => {

@@ -12,9 +12,7 @@ use crate::config::{
     AppConfig, ConfigRevision, ConfigSnapshot, Nullable, Project, ProjectFolder, RunCommand,
     SSHConnection, Settings,
 };
-use crate::domain::{
-    ConfigSidebarProviderKind, ConfigSidebarSnapshot,
-};
+use crate::domain::{ConfigSidebarProviderKind, ConfigSidebarSnapshot};
 use crate::ui::components::interaction::{AccessibilityMetadata, AccessibleRole};
 use crate::ui::tokens::ThemeTokens;
 
@@ -280,22 +278,26 @@ impl ConfigSidebarProjection {
                         ),
                         accessibility: accessibility(
                             AccessibleRole::Button,
-                            &format!("Folder {}", bounded(&folder.label, MAX_CONFIG_LABEL_SCALARS)),
+                            &format!(
+                                "Folder {}",
+                                bounded(&folder.label, MAX_CONFIG_LABEL_SCALARS)
+                            ),
                         ),
                     })
                     .collect(),
-                action: ConfigSidebarAction::enabled(
-                    ConfigSidebarActionRequest::SelectProject {
-                        config_id: bounded(&project.config_id, MAX_CONFIG_LABEL_SCALARS),
-                    },
-                ),
+                action: ConfigSidebarAction::enabled(ConfigSidebarActionRequest::SelectProject {
+                    config_id: bounded(&project.config_id, MAX_CONFIG_LABEL_SCALARS),
+                }),
                 accessibility: accessibility(
                     AccessibleRole::Button,
-                    &format!("Project {}", bounded(&project.label, MAX_CONFIG_LABEL_SCALARS)),
+                    &format!(
+                        "Project {}",
+                        bounded(&project.label, MAX_CONFIG_LABEL_SCALARS)
+                    ),
                 ),
             })
             .collect::<Vec<_>>();
-        let servers = snapshot
+        let servers: Vec<ConfigServerRow> = snapshot
             .servers
             .iter()
             .take(MAX_CONFIG_SERVERS)
@@ -312,16 +314,21 @@ impl ConfigSidebarProjection {
                     folder_label: bounded(&server.folder_label, MAX_CONFIG_LABEL_SCALARS),
                     label: label.clone(),
                     port: server.port,
-                    action: ConfigSidebarAction::enabled(ConfigSidebarActionRequest::SelectServer {
-                        project_id,
-                        folder_id,
-                        command_id,
-                    }),
-                    accessibility: accessibility(AccessibleRole::Button, &format!("Server {label}")),
+                    action: ConfigSidebarAction::enabled(
+                        ConfigSidebarActionRequest::SelectServer {
+                            project_id,
+                            folder_id,
+                            command_id,
+                        },
+                    ),
+                    accessibility: accessibility(
+                        AccessibleRole::Button,
+                        &format!("Server {label}"),
+                    ),
                 }
             })
             .collect();
-        let ssh_connections = snapshot
+        let ssh_connections: Vec<ConfigSshRow> = snapshot
             .ssh_connections
             .iter()
             .take(MAX_CONFIG_SERVERS)
@@ -334,8 +341,13 @@ impl ConfigSidebarProjection {
                     host: bounded(&connection.host, MAX_CONFIG_HOST_SCALARS),
                     port: connection.port,
                     username: bounded(&connection.username, MAX_CONFIG_LABEL_SCALARS),
-                    action: ConfigSidebarAction::enabled(ConfigSidebarActionRequest::SelectSsh { config_id }),
-                    accessibility: accessibility(AccessibleRole::Button, &format!("Remote {label}")),
+                    action: ConfigSidebarAction::enabled(ConfigSidebarActionRequest::SelectSsh {
+                        config_id,
+                    }),
+                    accessibility: accessibility(
+                        AccessibleRole::Button,
+                        &format!("Remote {label}"),
+                    ),
                 }
             })
             .collect();
@@ -359,17 +371,22 @@ impl ConfigSidebarProjection {
                         ConfigSidebarProviderKind::Codex => ConfigProvider::Codex,
                     },
                 }),
-                accessibility: accessibility(AccessibleRole::Button, match provider.provider {
-                    ConfigSidebarProviderKind::Claude => ConfigProvider::Claude.label(),
-                    ConfigSidebarProviderKind::Codex => ConfigProvider::Codex.label(),
-                }),
+                accessibility: accessibility(
+                    AccessibleRole::Button,
+                    match provider.provider {
+                        ConfigSidebarProviderKind::Claude => ConfigProvider::Claude.label(),
+                        ConfigSidebarProviderKind::Codex => ConfigProvider::Codex.label(),
+                    },
+                ),
             })
             .collect::<Vec<_>>();
         let unavailable_reason = (projects.is_empty()
             && servers.is_empty()
             && ssh_connections.is_empty()
-            && providers.iter().all(|provider| !provider.command_configured))
-            .then_some(ConfigSidebarUnavailableReason::NoConfiguredItems);
+            && providers
+                .iter()
+                .all(|provider| !provider.command_configured))
+        .then_some(ConfigSidebarUnavailableReason::NoConfiguredItems);
         Self {
             revision: Some(snapshot.revision),
             projects,

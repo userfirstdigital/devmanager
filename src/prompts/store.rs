@@ -154,8 +154,8 @@ impl PromptStore {
     /// manifest. This store owns only the prompt command/event transaction
     /// surface; the task CommandBus remains a later integration seam.
     pub fn open(path: &Path) -> Result<Self, PromptStoreError> {
-        crate::kernel::KernelStore::open(path).map_err(|_| {
-            PromptStoreError::Database("prompt database initialization failed".into())
+        crate::kernel::KernelStore::open(path).map_err(|error| {
+            PromptStoreError::Database(format!("prompt database initialization failed: {error}"))
         })?;
         let mut conn = Connection::open(path)?;
         conn.busy_timeout(std::time::Duration::from_millis(BUSY_TIMEOUT_MS))?;

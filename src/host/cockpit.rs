@@ -7,6 +7,7 @@
 
 use uuid::Uuid;
 
+use crate::config::AppConfig;
 use crate::domain::agent_resource::{AgentResourceBinding, AgentResourceBindingError};
 use crate::domain::cockpit::{
     cockpit_surface, relative_path_is_safe, workspace_projection, ConfigSidebarFolder,
@@ -17,7 +18,6 @@ use crate::domain::cockpit::{
     TaskSshEndpoint, TaskSshLifecycle, TaskSshProjection, TaskSshRuntimeError,
     TaskSshRuntimeProjection, MAX_COCKPIT_FILE_LIST, MAX_COCKPIT_READ_BYTES,
 };
-use crate::config::AppConfig;
 use crate::domain::id::{ClientId, CommandId, RequestId, TaskId};
 use crate::domain::query::{QueryError, QueryOutcome, QueryResult};
 use crate::domain::{AgentSessionFacts, ResourceFacts};
@@ -109,6 +109,9 @@ pub(crate) fn serve_task_cockpit(dispatch: TaskCockpitDispatch<'_>) -> QueryOutc
     }
 
     match dispatch.query {
+        TaskCockpitQuery::ConfigSnapshot => {
+            unreachable!("config snapshot is handled before task-scoped lookup")
+        }
         TaskCockpitQuery::WorkspaceStatus => QueryOutcome::Ok(QueryResult::TaskCockpit(
             TaskCockpitResult::Workspace(workspace_projection(task_id, &snapshot.task.workspace)),
         )),
