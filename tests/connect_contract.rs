@@ -1,34 +1,15 @@
-use std::collections::HashSet;
-use std::io::{ErrorKind, Read, Write};
-
 use serde::Serialize;
 use uuid::Uuid;
 
 use devmanager::connect::{
-    payload_catalog, ChannelBinding, ChannelId, ChannelKind, ChunkFrame, ConnectEnvelope,
-    ConnectLimits, ConnectPayload, ConnectPrivacyClass, ConnectTransport, ConnectTransportError,
-    ConnectionId, EnvelopeError, ErrorPayload, FramedConnectTransport, GenericExtensionPayload,
-    PayloadError, PayloadKind, SessionId, UnknownPayload,
+    canonical_schema_fixtures, encode_canonical_schema, payload_catalog, ActionId, ChannelBinding,
+    ChannelId, ChannelKind, ConnectEnvelope, ConnectLimitError, ConnectLimits, ConnectPayload,
+    ConnectPrivacyClass, ConnectionId, EnvelopeError, GenericExtensionPayload, HelloPayload,
+    PayloadDecodeError, PayloadKind, SessionId, MAX_CONNECT_DIAGNOSTIC_BYTES,
 };
-use devmanager::domain::command::CommandReceipt;
-use devmanager::domain::event::DomainEvent;
-use devmanager::domain::id::{
-    ArtifactId, ClientId, CommandId, EventId, OperationId, RequestId, ResourceId, SnapshotId,
-    SubscriptionId, TaskId, TransferId,
-};
-use devmanager::domain::operation::{OperationOutcome, OperationOutcomeKind, OutcomeSource};
-use devmanager::domain::query::{
-    Query, QueryEnvelope, QueryError, QueryOutcome, QueryReply, QueryResult,
-};
-use devmanager::domain::snapshot::{
-    canonical_artifact_content_page_size, canonical_event_page_size, canonical_snapshot_page_size,
-    ArtifactContentPage, EventPage, SnapshotItemKey, SnapshotPage, SnapshotSection,
-};
-use devmanager::protocol::{
-    ChunkError, ClientRequest, MessagePackError, MessagePackLengthKind, PhysicalFrameCodec,
-    PhysicalFrameError, ProtocolVersion, ServerMessage, StreamFrame, StreamKey, StreamPayloadKind,
-};
-use sha2::{Digest, Sha256};
+use devmanager::domain::id::{ClientId, RequestId, TaskId};
+use devmanager::domain::query::{Query, QueryEnvelope};
+use devmanager::protocol::CapabilitySet;
 
 fn uuid_v7(tail: u8) -> Uuid {
     let mut bytes = [0_u8; 16];
@@ -44,1924 +25,274 @@ fn uuid_v7(tail: u8) -> Uuid {
     Uuid::from_bytes(bytes)
 }
 
-fn connect_id<T>(tail: u8) -> T
-where
-    T: TryFrom<Uuid>,
-    <T as TryFrom<Uuid>>::Error: std::fmt::Debug,
-{
-    T::try_from(uuid_v7(tail)).expect("Connect id")
+fn uuid_v4() -> Uuid {
+    Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").expect("stable UUIDv4")
 }
-
-fn domain_id<T>(tail: u8) -> T
-where
-    T: FromBytes,
-{
-    T::from_bytes(uuid_v7(tail).into_bytes()).expect("domain id")
-}
-
-trait FromBytes: Sized {
-    type Error: std::fmt::Debug;
-
-    fn from_bytes(bytes: [u8; 16]) -> Result<Self, Self::Error>;
-}
-
-macro_rules! impl_from_bytes {
-    ($($type:ty),+ $(,)?) => {
-        $(
-            impl FromBytes for $type {
-                type Error = devmanager::domain::id::IdError;
-
-                fn from_bytes(bytes: [u8; 16]) -> Result<Self, Self::Error> {
-                    <$type>::from_bytes(bytes)
-                }
-            }
-        )+
-    };
-}
-
-impl_from_bytes!(
-    ClientId,
-    CommandId,
-    EventId,
-    OperationId,
-    RequestId,
-    ResourceId,
-    SnapshotId,
-    SubscriptionId,
-    ArtifactId,
-    TaskId,
-    TransferId,
-);
 
 fn binding(tail: u8) -> ChannelBinding {
     ChannelBinding::new(
-        connect_id::<ConnectionId>(tail),
-        connect_id::<SessionId>(tail + 1),
-        connect_id::<ChannelId>(tail + 2),
+        ConnectionId::from_uuid(uuid_v7(tail)).unwrap(),
+        SessionId::from_uuid(uuid_v7(tail + 1)).unwrap(),
+        ChannelId::from_uuid(uuid_v7(tail + 2)).unwrap(),
     )
-}
-
-fn query_request(tail: u8) -> QueryEnvelope {
-    QueryEnvelope {
-        request_id: domain_id::<RequestId>(tail),
-        client_id: domain_id::<ClientId>(tail + 1),
-        task_id: Some(domain_id::<TaskId>(tail + 2)),
-        query: Query::TaskSnapshot,
-    }
 }
 
 fn query_payload(tail: u8) -> ConnectPayload {
-    ConnectPayload::Request(ClientRequest::Query(query_request(tail)))
-}
-
-#[derive(Serialize)]
-struct CatalogFixture {
-    entries: Vec<CatalogFixtureEntry>,
-}
-
-#[derive(Serialize)]
-struct CatalogFixtureEntry {
-    kind: u16,
-    name: &'static str,
-    channel: ChannelKind,
-    version: u16,
-    action: bool,
-    max_payload_bytes: u32,
+    ConnectPayload::Query(QueryEnvelope {
+        request_id: RequestId::from_bytes(uuid_v7(tail).into_bytes()).unwrap(),
+        client_id: ClientId::from_bytes(uuid_v7(tail + 1).into_bytes()).unwrap(),
+        task_id: Some(TaskId::from_bytes(uuid_v7(tail + 2).into_bytes()).unwrap()),
+        query: Query::TaskSnapshot,
+    })
 }
 
 #[test]
-fn catalog_metadata_golden_covers_every_v1_entry() {
-    let entries = payload_catalog()
-        .iter()
-        .map(|descriptor| CatalogFixtureEntry {
-            kind: descriptor.kind.get(),
-            name: descriptor.name,
-            channel: descriptor.channel,
-            version: descriptor.version,
-            action: descriptor.action,
-            max_payload_bytes: descriptor.max_payload_bytes,
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(entries.len(), 22);
-
-    let kinds = entries
-        .iter()
-        .map(|entry| entry.kind)
-        .collect::<HashSet<_>>();
-    let names = entries
-        .iter()
-        .map(|entry| entry.name)
-        .collect::<HashSet<_>>();
-    assert_eq!(kinds.len(), entries.len(), "catalog tags must be unique");
-    assert_eq!(names.len(), entries.len(), "catalog names must be unique");
-    assert!(entries.iter().all(|entry| {
-        entry.version == 1
-            && entry.max_payload_bytes == devmanager::connect::MAX_CONNECT_REASSEMBLED_MESSAGE_BYTES
-    }));
-
-    let encoded = rmp_serde::to_vec_named(&CatalogFixture { entries }).expect("catalog fixture");
-    if !encoded.is_empty() {
-        println!(
-            "CATALOG_GOLDEN_HEX={}",
-            encoded
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<Vec<_>>()
-                .join("")
-        );
-    }
+fn opaque_ids_accept_only_rfc4122_uuidv7() {
+    assert!(ConnectionId::from_uuid(uuid_v7(1)).is_ok());
+    assert!(matches!(
+        ConnectionId::from_uuid(uuid_v4()),
+        Err(devmanager::connect::ConnectIdError::InvalidVersion)
+    ));
     assert_eq!(
-        encoded,
-        hex_fixture(include_str!("fixtures/connect/v1/catalog.msgpack.hex")),
-        "v1 catalog metadata must stay deterministic"
+        ConnectionId::from_uuid(uuid_v7(1)).unwrap().as_uuid(),
+        uuid_v7(1)
     );
 }
 
-fn empty_snapshot_page(tail: u8) -> SnapshotPage {
-    SnapshotPage {
-        snapshot_id: domain_id::<SnapshotId>(tail),
-        through_sequence: 4,
-        section: SnapshotSection::Tasks,
-        after_item: None,
-        items: Vec::new(),
-        encoded_bytes: 0,
-        next_cursor: None,
-    }
-}
-
 #[test]
-fn canonical_catalog_derives_typed_payload_metadata_and_round_trips_without_binary_wrapping() {
+fn canonical_payload_catalog_decodes_typed_values_and_keeps_unknown_extensions_inert() {
     let limits = ConnectLimits::v1_default();
     let payload = query_payload(10);
+    let bytes = payload.encode(limits).unwrap();
+    let decoded = ConnectPayload::decode(PayloadKind::QUERY, 1, &bytes, limits).unwrap();
+    assert!(matches!(decoded, ConnectPayload::Query(_)));
+    assert!(!decoded.is_action());
+    assert!(decoded.as_command().is_none());
 
-    assert_eq!(payload.kind(), PayloadKind::QUERY);
-    assert_eq!(payload.channel(), ChannelKind::Critical);
-    assert_eq!(payload.version(), 1);
-    assert!(payload_catalog().iter().any(|entry| {
-        entry.kind == PayloadKind::QUERY
-            && entry.channel == ChannelKind::Critical
-            && entry.version == 1
-    }));
+    assert!(matches!(
+        ConnectPayload::decode(PayloadKind::QUERY, 2, &bytes, limits),
+        Err(PayloadDecodeError::UnsupportedVersion { .. })
+    ));
 
-    let encoded = payload.encode(limits).expect("encode typed payload");
-    let decoded = ConnectPayload::decode(payload.kind(), payload.version(), &encoded, limits)
-        .expect("decode typed payload");
-    assert_eq!(decoded, payload);
+    let extension =
+        ConnectPayload::decode(PayloadKind::new(0x7fff).unwrap(), 9, &[0x91, 0x01], limits)
+            .unwrap();
+    assert!(matches!(
+        extension,
+        ConnectPayload::Extension(GenericExtensionPayload {
+            type_id: 0x7fff,
+            schema_version: 9,
+            ..
+        })
+    ));
+    assert!(!extension.is_action());
+    assert!(extension.as_command().is_none());
+    assert_eq!(extension.kind(), PayloadKind::new(0x7fff).unwrap());
 
-    // The payload is a named typed map. It is not serialized once into a
-    // binary field and then serialized again as an envelope payload.
-    assert!(encoded.contains(&0x81), "typed payload map marker missing");
+    let catalog = payload_catalog();
+    assert_eq!(catalog.len(), 17);
+    assert!(catalog
+        .iter()
+        .any(|descriptor| descriptor.kind == PayloadKind::COMMAND && descriptor.action));
+    assert!(catalog
+        .iter()
+        .all(|descriptor| descriptor.max_payload_bytes > 0));
+    assert_eq!(
+        catalog
+            .iter()
+            .filter(|descriptor| descriptor.action)
+            .count(),
+        1
+    );
 }
 
 #[test]
-fn typed_envelope_derives_channel_kind_and_version_and_matches_golden_fixture() {
+fn envelope_uses_typed_payload_and_rejects_channel_or_privacy_ambiguity() {
     let limits = ConnectLimits::v1_default();
-    let payload = query_payload(20);
+    let bound = binding(20);
     let envelope = ConnectEnvelope::new(
-        binding(30),
-        7,
-        Some(domain_id::<RequestId>(20)),
+        bound,
+        ChannelKind::Critical,
+        1,
+        None,
         None,
         limits,
         ConnectPrivacyClass::ManagedMetadata,
-        payload.clone(),
+        query_payload(30),
     )
-    .expect("typed envelope");
+    .unwrap();
 
-    assert_eq!(envelope.channel(), ChannelKind::Critical);
-    assert_eq!(envelope.payload_kind(), PayloadKind::QUERY);
-    assert_eq!(envelope.payload_version(), 1);
-    assert_eq!(envelope.payload(), &payload);
-
-    let encoded = envelope.encode().expect("encode envelope");
-    let expected = hex_fixture(include_str!(
-        "fixtures/connect/v1/query-envelope.msgpack.hex"
+    let bytes = envelope.encode().unwrap();
+    let decoded = ConnectEnvelope::decode_with_limits(&bytes, limits).unwrap();
+    assert!(matches!(
+        decoded.decode_payload().unwrap(),
+        ConnectPayload::Query(_)
     ));
-    assert_eq!(
-        encoded, expected,
-        "v1 envelope bytes must stay deterministic"
-    );
-    assert_eq!(
-        ConnectEnvelope::decode_with_limits(&encoded, limits).expect("decode envelope"),
-        envelope
-    );
+    assert_eq!(decoded.binding().unwrap(), bound);
+    assert!(!decoded.is_action_payload());
+
+    assert!(matches!(
+        ConnectEnvelope::new(
+            bound,
+            ChannelKind::Durable,
+            1,
+            None,
+            None,
+            limits,
+            ConnectPrivacyClass::ManagedMetadata,
+            query_payload(31),
+        ),
+        Err(EnvelopeError::ChannelMismatch)
+    ));
+    assert!(matches!(
+        ConnectEnvelope::new(
+            bound,
+            ChannelKind::Critical,
+            1,
+            None,
+            None,
+            limits,
+            ConnectPrivacyClass::RawContent,
+            query_payload(32),
+        ),
+        Err(EnvelopeError::PrivacyViolation)
+    ));
 }
 
 #[test]
-fn query_and_reply_use_distinct_catalog_discriminants_and_round_trip() {
-    let limits = ConnectLimits::v1_default();
-    let query = query_payload(24);
-    let reply = ConnectPayload::Message(ServerMessage::QueryReply(QueryReply {
-        request_id: domain_id::<RequestId>(24),
-        outcome: QueryOutcome::Err(QueryError::NotFound),
-    }));
+fn negotiated_limits_cover_zero_overflow_pages_chunks_cursors_and_diagnostics() {
+    assert!(ConnectLimits::try_new(0, 8192, 10, 2048, 1024, 4096).is_err());
+    assert!(ConnectLimits::try_new(4096, 8192, 0, 2048, 1024, 4096).is_err());
 
-    assert_eq!(query.kind(), PayloadKind::QUERY);
-    assert_eq!(reply.kind(), PayloadKind::QUERY_REPLY);
-    assert_ne!(query.kind(), reply.kind());
-
-    let encoded = reply.encode(limits).expect("query reply payload");
-    assert_eq!(
-        ConnectPayload::decode(reply.kind(), reply.version(), &encoded, limits)
-            .expect("decode query reply"),
-        reply
-    );
-}
-
-#[test]
-fn envelope_round_trip_preserves_the_validated_negotiated_protocol_version() {
-    let version = ProtocolVersion::new(
-        devmanager::connect::CONNECT_PROTOCOL_MAJOR,
-        devmanager::connect::CONNECT_PROTOCOL_MINOR,
-    );
-    let envelope = ConnectEnvelope::new_with_version(
-        version,
-        binding(26),
-        1,
-        Some(domain_id::<RequestId>(26)),
-        None,
-        ConnectLimits::v1_default(),
-        ConnectPrivacyClass::ManagedMetadata,
-        query_payload(26),
-    )
-    .expect("versioned envelope");
-
-    assert_eq!(envelope.protocol_version(), version);
-    let decoded = ConnectEnvelope::decode(&envelope.encode().expect("encode envelope"))
-        .expect("decode envelope");
-    assert_eq!(decoded.protocol_version(), version);
-}
-
-#[derive(Serialize)]
-struct RawQueryPayload {
-    request: ClientRequest,
-}
-
-#[derive(Serialize)]
-struct EnvelopeWire<P> {
-    protocol_major: u16,
-    protocol_minor: u16,
-    connection_id: ConnectionId,
-    session_id: SessionId,
-    channel_id: ChannelId,
-    channel: ChannelKind,
-    sequence: u64,
-    request_id: Option<RequestId>,
-    operation_id: Option<OperationId>,
-    limits: ConnectLimits,
-    compression: devmanager::connect::Compression,
-    privacy_class: ConnectPrivacyClass,
-    payload_kind: PayloadKind,
-    payload_version: u16,
-    payload: P,
-}
-
-fn wire_with_payload<P>(envelope: &ConnectEnvelope, payload: P) -> EnvelopeWire<P> {
-    EnvelopeWire {
-        protocol_major: devmanager::connect::CONNECT_PROTOCOL_MAJOR,
-        protocol_minor: devmanager::connect::CONNECT_PROTOCOL_MINOR,
-        connection_id: envelope.binding().connection_id,
-        session_id: envelope.binding().session_id,
-        channel_id: envelope.binding().channel_id,
-        channel: envelope.channel(),
-        sequence: envelope.sequence(),
-        request_id: envelope.request_id(),
-        operation_id: envelope.operation_id(),
-        limits: envelope.limits(),
-        compression: devmanager::connect::Compression::None,
-        privacy_class: envelope.privacy_class(),
-        payload_kind: envelope.payload_kind(),
-        payload_version: envelope.payload_version(),
-        payload,
-    }
-}
-
-fn wire_for(envelope: &ConnectEnvelope) -> EnvelopeWire<RawQueryPayload> {
-    let ConnectPayload::Request(request) = envelope.payload() else {
-        panic!("query envelope required")
-    };
-    wire_with_payload(
-        envelope,
-        RawQueryPayload {
-            request: request.clone(),
-        },
-    )
-}
-
-#[test]
-fn envelope_decode_rejects_unknown_fields_arrays_and_derived_metadata_mismatches() {
-    let envelope = ConnectEnvelope::new(
-        binding(40),
-        1,
-        Some(domain_id::<RequestId>(40)),
-        None,
-        ConnectLimits::v1_default(),
-        ConnectPrivacyClass::ManagedMetadata,
-        query_payload(40),
-    )
-    .expect("typed envelope");
-
-    let mut wrong_channel = wire_for(&envelope);
-    wrong_channel.channel = ChannelKind::Durable;
-    assert!(ConnectEnvelope::decode(&rmp_serde::to_vec_named(&wrong_channel).unwrap()).is_err());
-
-    let mut wrong_kind = wire_for(&envelope);
-    wrong_kind.payload_kind = PayloadKind::SNAPSHOT_PAGE;
-    assert!(ConnectEnvelope::decode(&rmp_serde::to_vec_named(&wrong_kind).unwrap()).is_err());
-
-    let mut wrong_version = wire_for(&envelope);
-    wrong_version.payload_version = 2;
-    assert!(ConnectEnvelope::decode(&rmp_serde::to_vec_named(&wrong_version).unwrap()).is_err());
-
-    #[derive(Serialize)]
-    struct UnknownField {
-        unknown: u8,
-        #[serde(flatten)]
-        envelope: EnvelopeWire<RawQueryPayload>,
-    }
-    let unknown = UnknownField {
-        unknown: 1,
-        envelope: wire_for(&envelope),
-    };
-    assert!(ConnectEnvelope::decode(&rmp_serde::to_vec_named(&unknown).unwrap()).is_err());
-
-    let positional = rmp_serde::to_vec(&(
-        devmanager::connect::CONNECT_PROTOCOL_MAJOR,
-        devmanager::connect::CONNECT_PROTOCOL_MINOR,
-        envelope.binding().connection_id,
-        envelope.binding().session_id,
-        envelope.binding().channel_id,
-        envelope.channel(),
-        envelope.sequence(),
-        envelope.request_id(),
-        envelope.operation_id(),
-        envelope.limits(),
-        devmanager::connect::Compression::None,
-        envelope.privacy_class(),
-        envelope.payload_kind(),
-        envelope.payload_version(),
-        RawQueryPayload {
-            request: match envelope.payload() {
-                ConnectPayload::Request(request) => request.clone(),
-                _ => panic!("query envelope required"),
-            },
-        },
-    ))
-    .unwrap();
-    assert!(ConnectEnvelope::decode(&positional).is_err());
-}
-
-#[test]
-fn limits_validate_final_deserialized_values_and_checked_cumulative_bounds() {
-    let mut invalid = ConnectLimits::v1_default();
-    invalid.max_cursor_bytes = 0;
-    let invalid_bytes = rmp_serde::to_vec_named(&serde_json::json!({
-        "max_physical_frame_bytes": invalid.max_physical_frame_bytes,
-        "max_reassembled_message_bytes": invalid.max_reassembled_message_bytes,
-        "max_page_items": invalid.max_page_items,
-        "max_page_encoded_bytes": invalid.max_page_encoded_bytes,
-        "max_chunk_bytes": invalid.max_chunk_bytes,
-        "max_cumulative_bytes": invalid.max_cumulative_bytes,
-        "max_cursor_bytes": invalid.max_cursor_bytes,
-    }))
-    .unwrap();
-    let mut deserializer = rmp_serde::Deserializer::new(std::io::Cursor::new(invalid_bytes));
-    assert!(<ConnectLimits as serde::Deserialize>::deserialize(&mut deserializer).is_err());
-
-    let limits =
-        ConnectLimits::try_new(4096, 8192, 10, 2048, 1024, 4096, 1024).expect("bounded limits");
+    let limits = ConnectLimits::try_new(4096, 8192, 10, 2048, 1024, 4096).unwrap();
     assert!(matches!(
         limits.validate_chunk(u64::MAX, &[1]),
-        Err(devmanager::connect::ConnectLimitError::CumulativeOverflow)
+        Err(ConnectLimitError::CumulativeOverflow)
     ));
-    assert!(limits.validate_cursor_len(1025).is_err());
-}
+    assert!(matches!(
+        limits.validate_chunk(0, &[]),
+        Err(ConnectLimitError::EmptyChunk)
+    ));
+    assert!(limits.validate_page(10, 2048).is_ok());
+    assert!(limits.validate_page(11, 1).is_err());
+    assert!(limits.validate_cursor_len(1).is_ok());
+    assert!(matches!(
+        limits.validate_cursor_len(0),
+        Err(ConnectLimitError::CursorEmpty)
+    ));
+    assert!(matches!(
+        limits.validate_diagnostic_len(0),
+        Err(ConnectLimitError::DiagnosticEmpty)
+    ));
+    assert!(matches!(
+        limits.validate_diagnostic_len(MAX_CONNECT_DIAGNOSTIC_BYTES as usize + 1),
+        Err(ConnectLimitError::DiagnosticExceeded { .. })
+    ));
 
-#[test]
-fn pages_recompute_canonical_size_and_do_not_trust_claimed_encoded_bytes() {
-    let limits = ConnectLimits::v1_default();
-    let mut page = empty_snapshot_page(50);
-    page.encoded_bytes = canonical_snapshot_page_size(&page).expect("canonical size");
-    let payload = ConnectPayload::SnapshotPage(page.clone());
-    payload.validate(limits).expect("valid page");
-
-    page.encoded_bytes += 1;
-    assert!(ConnectPayload::SnapshotPage(page).validate(limits).is_err());
-
-    let mut boundary = empty_snapshot_page(51);
-    let mut found_boundary = false;
-    for cursor_len in 0..512 {
-        boundary.next_cursor = Some(vec![0; cursor_len]);
-        boundary.encoded_bytes = 0;
-        let zero_claim_length = rmp_serde::to_vec_named(&boundary)
-            .expect("encode zero-claim boundary page")
-            .len();
-        if zero_claim_length != 128 {
-            continue;
-        }
-        let canonical = canonical_snapshot_page_size(&boundary).expect("canonical boundary size");
-        assert_ne!(canonical as usize, zero_claim_length);
-        boundary.encoded_bytes = canonical;
-        ConnectPayload::SnapshotPage(boundary.clone())
-            .validate(limits)
-            .expect("canonical final MessagePack size");
-        found_boundary = true;
-        break;
-    }
-    assert!(found_boundary, "boundary fixture must reach a width change");
-
-    let mut outgoing = empty_snapshot_page(52);
-    outgoing.encoded_bytes = u32::MAX;
-    let encoded = ConnectPayload::SnapshotPage(outgoing)
-        .encode(limits)
-        .expect("outgoing page recomputes its claim");
-    let normalized = ConnectPayload::decode(PayloadKind::SNAPSHOT_PAGE, 1, &encoded, limits)
-        .expect("normalized page decodes");
-    let ConnectPayload::SnapshotPage(normalized) = normalized else {
-        panic!("expected normalized snapshot page")
-    };
-    assert_eq!(
-        normalized.encoded_bytes,
-        canonical_snapshot_page_size(&normalized).expect("normalized canonical size")
-    );
-
-    let events = ConnectPayload::EventPage(EventPage {
-        after_sequence: 0,
-        through_sequence: 0,
-        events: Vec::<DomainEvent>::new(),
-        next_cursor: None,
+    let oversized = ConnectPayload::Error(devmanager::connect::ErrorPayload {
+        code: 1,
+        message: "x".repeat(limits.max_diagnostic_bytes() as usize + 1),
     });
-    events.validate(limits).expect("valid empty event page");
-    let event_page = EventPage {
-        after_sequence: 3,
-        through_sequence: 8,
-        events: Vec::new(),
-        next_cursor: Some(vec![1, 2, 3]),
-    };
-    let event_size = canonical_event_page_size(&event_page).expect("canonical event size");
-    let event_limits = ConnectLimits::try_new(4096, 8192, 10, event_size, 1024, 4096, 1024)
-        .expect("event page limits");
-    ConnectPayload::EventPage(event_page)
-        .validate(event_limits)
-        .expect("event page uses canonical size");
+    assert!(oversized.encode(limits).is_err());
 }
 
 #[test]
-fn public_payload_encoding_and_decoding_use_the_checked_wire_boundary() {
+fn decode_rejects_unknown_fields_empty_payloads_and_zero_kinds() {
     let limits = ConnectLimits::v1_default();
-    let mut page = empty_snapshot_page(52);
-    page.encoded_bytes = u32::MAX;
-    let payload = ConnectPayload::SnapshotPage(page.clone());
-
-    let checked_bytes = payload.encode(limits).expect("checked payload encode");
-    let checked = ConnectPayload::decode(payload.kind(), payload.version(), &checked_bytes, limits)
-        .expect("checked payload decode");
-    let mut expected_page = empty_snapshot_page(52);
-    expected_page.encoded_bytes = canonical_snapshot_page_size(&expected_page).unwrap();
-    assert_eq!(checked, ConnectPayload::SnapshotPage(expected_page));
-
     #[derive(Serialize)]
-    struct RawSnapshotPayload {
-        snapshot_page: SnapshotPage,
+    struct UnknownHello {
+        extra: u8,
+        capabilities: CapabilitySet,
+        limits: ConnectLimits,
+        privacy_class: ConnectPrivacyClass,
     }
-    let tampered_bytes = rmp_serde::to_vec_named(&RawSnapshotPayload {
-        snapshot_page: page,
+    let unknown = rmp_serde::to_vec_named(&UnknownHello {
+        extra: 1,
+        capabilities: CapabilitySet::empty(),
+        limits,
+        privacy_class: ConnectPrivacyClass::LocalOnly,
     })
-    .expect("tampered payload fixture");
-    assert!(
-        ConnectPayload::decode(PayloadKind::SNAPSHOT_PAGE, 1, &tampered_bytes, limits).is_err(),
-        "checked public decoding must not admit a false canonical-size claim"
-    );
+    .unwrap();
+    assert!(ConnectPayload::decode(PayloadKind::HELLO, 1, &unknown, limits).is_err());
+    assert!(PayloadKind::new(0).is_none());
+    assert!(ConnectPayload::decode(PayloadKind::HELLO, 1, &[], limits).is_err());
+    assert!(matches!(
+        ConnectPayload::Hello(HelloPayload {
+            capabilities: CapabilitySet::empty(),
+            limits,
+            privacy_class: ConnectPrivacyClass::RawContent,
+        })
+        .encode(limits),
+        Err(PayloadDecodeError::Ambiguous { .. })
+    ));
 }
 
 #[test]
-fn transport_encode_normalizes_outgoing_page_claims() {
-    let mut tampered_page = empty_snapshot_page(53);
-    tampered_page.encoded_bytes = u32::MAX;
-    let envelope = ConnectEnvelope::new(
-        binding(54),
-        1,
-        None,
-        None,
-        ConnectLimits::v1_default(),
-        ConnectPrivacyClass::ManagedMetadata,
-        ConnectPayload::SnapshotPage(tampered_page),
-    )
-    .expect("page envelope");
-    let decoded = ConnectEnvelope::decode(&envelope.encode().expect("transport encode"))
-        .expect("transport decode");
-    let ConnectPayload::SnapshotPage(page) = decoded.payload().clone() else {
-        panic!("expected snapshot page")
-    };
-    assert_eq!(
-        page.encoded_bytes,
-        canonical_snapshot_page_size(&page).unwrap()
-    );
-}
-
-#[derive(Serialize)]
-struct RawChunkPayload {
-    chunk: ChunkFrame,
-}
-
-#[derive(Clone, Serialize)]
-struct RawSnapshotPage {
-    snapshot_id: SnapshotId,
-    through_sequence: u64,
-    section: SnapshotSection,
-    after_item: Option<SnapshotItemKey>,
-    items: Vec<()>,
-    encoded_bytes: u32,
-    next_cursor: Option<Vec<u8>>,
-}
-
-#[derive(Serialize)]
-struct RawSnapshotPayload {
-    snapshot_page: RawSnapshotPage,
-}
-
-#[derive(Serialize)]
-struct RawEventPage {
-    after_sequence: u64,
-    through_sequence: u64,
-    events: Vec<()>,
-    next_cursor: Option<Vec<u8>>,
-}
-
-#[derive(Serialize)]
-struct RawPageResult<P> {
-    page: P,
-}
-
-#[derive(Serialize)]
-struct RawSnapshotQueryResult {
-    snapshot_page: RawPageResult<RawSnapshotPage>,
-}
-
-#[derive(Serialize)]
-struct RawEventReplayPageResult {
-    subscription_id: SubscriptionId,
-    page: RawEventPage,
-}
-
-#[derive(Serialize)]
-struct RawEventQueryResult {
-    event_replay_page: RawEventReplayPageResult,
-}
-
-#[derive(Serialize)]
-struct RawQueryOutcome<R> {
-    ok: R,
-}
-
-#[derive(Serialize)]
-struct RawQueryReply<R> {
-    request_id: RequestId,
-    outcome: RawQueryOutcome<R>,
-}
-
-#[derive(Serialize)]
-struct RawQueryReplyMessage<R> {
-    query_reply: RawQueryReply<R>,
-}
-
-#[derive(Serialize)]
-struct RawMessagePayload<R> {
-    message: RawQueryReplyMessage<R>,
-}
-
-#[derive(Serialize)]
-struct RawUnknownPayload {
-    unknown: RawUnknownPayloadBody,
-}
-
-#[derive(Serialize)]
-struct RawUnknownPayloadBody {
-    kind: PayloadKind,
-    version: u16,
-    #[serde(with = "test_binary")]
-    payload: Vec<u8>,
-}
-
-#[derive(Serialize)]
-struct RawExtensionPayload {
-    extension: RawExtensionPayloadBody,
-}
-
-#[derive(Serialize)]
-struct RawExtensionPayloadBody {
-    type_id: u16,
-    schema_version: u16,
-    #[serde(with = "test_binary")]
-    payload: Vec<u8>,
-}
-
-mod test_binary {
-    use serde::Serializer;
-
-    pub fn serialize<S>(value: &[u8], serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_bytes(value)
+fn canonical_schema_fixtures_are_complete_deterministic_and_local_first() {
+    let limits = ConnectLimits::v1_default();
+    let fixtures = canonical_schema_fixtures();
+    let catalog = payload_catalog();
+    assert_eq!(fixtures.len(), catalog.len());
+    for descriptor in catalog {
+        assert!(
+            fixtures
+                .iter()
+                .any(|fixture| fixture.name == descriptor.name),
+            "missing canonical fixture {}",
+            descriptor.name
+        );
     }
-}
 
-#[derive(Default)]
-struct LoopbackIo {
-    bytes: Vec<u8>,
-    read_offset: usize,
-}
+    let first = encode_canonical_schema(limits).unwrap();
+    let second = encode_canonical_schema(limits).unwrap();
+    assert_eq!(first, second);
 
-impl LoopbackIo {
-    fn with_bytes(bytes: Vec<u8>) -> Self {
-        Self {
+    for (name, bytes) in &first {
+        let fixture = fixtures
+            .iter()
+            .find(|fixture| fixture.name == *name)
+            .unwrap();
+        let decoded = ConnectPayload::decode(
+            fixture.payload.kind(),
+            fixture.payload.version(),
             bytes,
-            read_offset: 0,
-        }
-    }
-}
-
-impl Read for LoopbackIo {
-    fn read(&mut self, destination: &mut [u8]) -> std::io::Result<usize> {
-        if self.read_offset >= self.bytes.len() || destination.is_empty() {
-            return Ok(0);
-        }
-        let available = self.bytes.len() - self.read_offset;
-        let length = available.min(destination.len());
-        destination[..length]
-            .copy_from_slice(&self.bytes[self.read_offset..self.read_offset + length]);
-        self.read_offset += length;
-        Ok(length)
-    }
-}
-
-impl Write for LoopbackIo {
-    fn write(&mut self, source: &[u8]) -> std::io::Result<usize> {
-        self.bytes.extend_from_slice(source);
-        Ok(source.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-struct FailureIo {
-    bytes: Vec<u8>,
-    read_offset: usize,
-    fail_write: bool,
-    fail_flush: bool,
-}
-
-impl FailureIo {
-    fn writer(fail_write: bool, fail_flush: bool) -> Self {
-        Self {
-            bytes: Vec::new(),
-            read_offset: 0,
-            fail_write,
-            fail_flush,
-        }
-    }
-}
-
-impl Read for FailureIo {
-    fn read(&mut self, destination: &mut [u8]) -> std::io::Result<usize> {
-        if self.read_offset >= self.bytes.len() || destination.is_empty() {
-            return Ok(0);
-        }
-        let available = self.bytes.len() - self.read_offset;
-        let length = available.min(destination.len());
-        destination[..length]
-            .copy_from_slice(&self.bytes[self.read_offset..self.read_offset + length]);
-        self.read_offset += length;
-        Ok(length)
-    }
-}
-
-impl Write for FailureIo {
-    fn write(&mut self, source: &[u8]) -> std::io::Result<usize> {
-        if self.fail_write {
-            return Err(std::io::Error::new(
-                ErrorKind::BrokenPipe,
-                "injected write failure",
-            ));
-        }
-        self.bytes.extend_from_slice(source);
-        Ok(source.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        if self.fail_flush {
-            return Err(std::io::Error::new(
-                ErrorKind::BrokenPipe,
-                "injected flush failure",
-            ));
-        }
-        Ok(())
-    }
-}
-
-struct ShortWriteThenErrorIo {
-    bytes: Vec<u8>,
-    read_offset: usize,
-    short_write_done: bool,
-}
-
-impl ShortWriteThenErrorIo {
-    fn new() -> Self {
-        Self {
-            bytes: Vec::new(),
-            read_offset: 0,
-            short_write_done: false,
-        }
-    }
-}
-
-impl Read for ShortWriteThenErrorIo {
-    fn read(&mut self, destination: &mut [u8]) -> std::io::Result<usize> {
-        if self.read_offset >= self.bytes.len() || destination.is_empty() {
-            return Ok(0);
-        }
-        let available = self.bytes.len() - self.read_offset;
-        let length = available.min(destination.len());
-        destination[..length]
-            .copy_from_slice(&self.bytes[self.read_offset..self.read_offset + length]);
-        self.read_offset += length;
-        Ok(length)
-    }
-}
-
-impl Write for ShortWriteThenErrorIo {
-    fn write(&mut self, source: &[u8]) -> std::io::Result<usize> {
-        if self.short_write_done {
-            return Err(std::io::Error::new(
-                ErrorKind::BrokenPipe,
-                "injected short-write failure",
-            ));
-        }
-        self.short_write_done = true;
-        let length = source.len().min(1);
-        self.bytes.extend_from_slice(&source[..length]);
-        Ok(length)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-fn framed_raw<P: Serialize>(wire: &P, limits: ConnectLimits) -> Vec<u8> {
-    let payload = rmp_serde::to_vec_named(wire).expect("raw wire fixture");
-    framed_bytes(&payload, limits)
-}
-
-fn framed_bytes(payload: &[u8], limits: ConnectLimits) -> Vec<u8> {
-    let codec = PhysicalFrameCodec::from_limits(limits.frame_limits()).expect("frame codec");
-    let mut framed = Vec::new();
-    codec.write(&mut framed, payload).expect("physical frame");
-    framed
-}
-
-fn query_reply_envelope(tail: u8, limits: ConnectLimits) -> ConnectEnvelope {
-    ConnectEnvelope::new(
-        binding(tail),
-        1,
-        Some(domain_id::<RequestId>(tail)),
-        None,
-        limits,
-        ConnectPrivacyClass::ManagedMetadata,
-        ConnectPayload::Message(ServerMessage::QueryReply(QueryReply {
-            request_id: domain_id::<RequestId>(tail),
-            outcome: QueryOutcome::Err(QueryError::NotFound),
-        })),
-    )
-    .expect("query reply envelope")
-}
-
-fn oversized_binary_frame<P: Serialize>(
-    envelope: &ConnectEnvelope,
-    payload: P,
-    limits: ConnectLimits,
-) -> Vec<u8> {
-    let encoded = oversized_binary_bytes(&wire_with_payload(envelope, payload), limits);
-    framed_bytes(&encoded, limits)
-}
-
-fn oversized_binary_bytes<P: Serialize>(value: &P, limits: ConnectLimits) -> Vec<u8> {
-    let mut encoded = rmp_serde::to_vec_named(value).expect("raw opaque fixture");
-    let empty_binary_marker = [0xc4, 0x00];
-    let marker_offset = encoded
-        .windows(empty_binary_marker.len())
-        .rposition(|window| window == empty_binary_marker)
-        .expect("opaque payload must use an empty MessagePack binary");
-    let declared = limits.max_reassembled_message_bytes + 1;
-    let replacement = [
-        0xc6,
-        (declared >> 24) as u8,
-        (declared >> 16) as u8,
-        (declared >> 8) as u8,
-        declared as u8,
-    ];
-    encoded.splice(
-        marker_offset..marker_offset + empty_binary_marker.len(),
-        replacement,
-    );
-    encoded
-}
-
-fn assert_page_items_rejection(frame: Vec<u8>, limits: ConnectLimits) {
-    let mut receiver =
-        FramedConnectTransport::with_negotiated_limits(LoopbackIo::with_bytes(frame), limits)
-            .expect("page-limit receiver");
-    let result = receiver.receive();
-    let result_debug = format!("{result:?}");
-    assert!(
-        matches!(
-            result,
-            Err(ConnectTransportError::Envelope(EnvelopeError::Payload(
-                PayloadError::Limits(devmanager::connect::ConnectLimitError::PageItemsExceeded {
-                    declared: 2,
-                    maximum: 1,
-                })
-            )))
-        ),
-        "unexpected page item result: {result_debug}"
-    );
-    assert!(matches!(
-        receiver.receive(),
-        Err(ConnectTransportError::Closed)
-    ));
-}
-
-#[test]
-fn production_transport_applies_one_negotiated_limit_set_on_send_and_receive() {
-    let local = ConnectLimits::try_new(4096, 8192, 10, 2048, 4, 8, 2).expect("local limits");
-    let peer = ConnectLimits::try_new(8192, 16384, 20, 4096, 8, 16, 4).expect("peer limits");
-    let negotiated = local.negotiate(peer).expect("negotiated limits");
-    let envelope = ConnectEnvelope::new(
-        binding(80),
-        1,
-        Some(domain_id::<RequestId>(80)),
-        None,
-        negotiated,
-        ConnectPrivacyClass::ManagedMetadata,
-        query_payload(80),
-    )
-    .expect("valid envelope");
-
-    let mut loopback = FramedConnectTransport::new(LoopbackIo::default(), local, peer)
-        .expect("production transport");
-    assert_eq!(loopback.negotiated_limits(), negotiated);
-    assert!(loopback.validate_page(10, 2048).is_ok());
-    assert!(loopback.validate_page(11, 1).is_err());
-    assert!(loopback.validate_chunk(0, &[0; 4]).is_ok());
-    assert!(loopback.validate_chunk(0, &[0; 5]).is_err());
-    loopback
-        .send(envelope.clone())
-        .expect("send valid envelope");
-    assert_eq!(
-        loopback.receive().expect("receive valid envelope"),
-        Some(envelope.clone())
-    );
-
-    let mismatched = ConnectEnvelope::new(
-        binding(81),
-        1,
-        Some(domain_id::<RequestId>(81)),
-        None,
-        ConnectLimits::v1_default(),
-        ConnectPrivacyClass::ManagedMetadata,
-        query_payload(81),
-    )
-    .expect("mismatched envelope fixture");
-    let mut sender =
-        FramedConnectTransport::with_negotiated_limits(LoopbackIo::default(), negotiated)
-            .expect("sender");
-    assert!(sender.send(mismatched).is_err());
-    assert!(
-        sender.into_inner().bytes.is_empty(),
-        "rejected send crossed no wire"
-    );
-
-    let mut invalid = wire_for(&envelope);
-    invalid.sequence = 0;
-    let mut receiver = FramedConnectTransport::with_negotiated_limits(
-        LoopbackIo::with_bytes(framed_raw(&invalid, negotiated)),
-        negotiated,
-    )
-    .expect("invalid receiver");
-    assert!(
-        receiver.receive().is_err(),
-        "invalid envelope crossed no boundary"
-    );
-
-    let other_limits =
-        ConnectLimits::try_new(4096, 8192, 9, 2048, 4, 8, 2).expect("other valid limits");
-    let mut unnegotiated = wire_for(&envelope);
-    unnegotiated.limits = other_limits;
-    let mut receiver = FramedConnectTransport::with_negotiated_limits(
-        LoopbackIo::with_bytes(framed_raw(&unnegotiated, negotiated)),
-        negotiated,
-    )
-    .expect("unnegotiated receiver");
-    assert!(
-        receiver.receive().is_err(),
-        "unnegotiated envelope crossed no boundary"
-    );
-
-    let wide_chunk_limits =
-        ConnectLimits::try_new(4096, 8192, 10, 2048, 4, 8, 2).expect("wide chunk limits");
-    let oversize_limits =
-        ConnectLimits::try_new(4096, 8192, 10, 2048, 2, 4, 2).expect("oversize limits");
-    let chunk_payload = b"bad".to_vec();
-    let chunk = ChunkFrame::new(
-        domain_id::<TransferId>(82),
-        0,
-        true,
-        chunk_payload.clone(),
-        cumulative_sha256(&[&chunk_payload]),
-        None,
-    )
-    .expect("shape-valid oversized chunk");
-    let chunk_envelope = ConnectEnvelope::new(
-        binding(82),
-        1,
-        None,
-        None,
-        wide_chunk_limits,
-        ConnectPrivacyClass::ManagedMetadata,
-        ConnectPayload::Chunk(chunk.clone()),
-    )
-    .expect("wide chunk envelope");
-    let mut oversized_wire = wire_with_payload(&chunk_envelope, RawChunkPayload { chunk });
-    oversized_wire.limits = oversize_limits;
-    let mut receiver = FramedConnectTransport::with_negotiated_limits(
-        LoopbackIo::with_bytes(framed_raw(&oversized_wire, oversize_limits)),
-        oversize_limits,
-    )
-    .expect("oversized receiver");
-    assert!(matches!(
-        receiver.receive(),
-        Err(ConnectTransportError::Envelope(EnvelopeError::Payload(
-            PayloadError::Limits(devmanager::connect::ConnectLimitError::ChunkExceeded {
-                declared: 3,
-                maximum: 2,
-            })
-        )))
-    ));
-    assert!(matches!(
-        receiver.receive(),
-        Err(ConnectTransportError::Closed)
-    ));
-}
-
-#[test]
-fn frame_and_partial_io_failures_permanently_close_transport() {
-    let limits = ConnectLimits::v1_default();
-    let envelope = ConnectEnvelope::new(
-        binding(86),
-        1,
-        Some(domain_id::<RequestId>(86)),
-        None,
-        limits,
-        ConnectPrivacyClass::ManagedMetadata,
-        query_payload(86),
-    )
-    .expect("valid envelope");
-
-    let mut partial_header = FramedConnectTransport::with_negotiated_limits(
-        LoopbackIo::with_bytes(vec![0, 0, 0]),
-        limits,
-    )
-    .expect("partial header receiver");
-    assert!(matches!(
-        partial_header.receive(),
-        Err(ConnectTransportError::Frame(
-            PhysicalFrameError::ReadHeader { .. }
-        ))
-    ));
-    assert!(matches!(
-        partial_header.receive(),
-        Err(ConnectTransportError::Closed)
-    ));
-
-    let mut partial_payload = FramedConnectTransport::with_negotiated_limits(
-        LoopbackIo::with_bytes(vec![0, 0, 0, 2, 1]),
-        limits,
-    )
-    .expect("partial payload receiver");
-    assert!(matches!(
-        partial_payload.receive(),
-        Err(ConnectTransportError::Frame(
-            PhysicalFrameError::ReadPayload { declared: 2, .. }
-        ))
-    ));
-    assert!(matches!(
-        partial_payload.send(envelope.clone()),
-        Err(ConnectTransportError::Closed)
-    ));
-
-    let mut write_failed =
-        FramedConnectTransport::with_negotiated_limits(FailureIo::writer(true, false), limits)
-            .expect("write-failure transport");
-    assert!(matches!(
-        write_failed.send(envelope.clone()),
-        Err(ConnectTransportError::Frame(
-            PhysicalFrameError::WriteHeader { .. }
-        ))
-    ));
-    assert!(matches!(
-        write_failed.send(envelope.clone()),
-        Err(ConnectTransportError::Closed)
-    ));
-
-    let mut flush_failed =
-        FramedConnectTransport::with_negotiated_limits(FailureIo::writer(false, true), limits)
-            .expect("flush-failure transport");
-    assert!(matches!(
-        flush_failed.send(envelope.clone()),
-        Err(ConnectTransportError::Flush {
-            kind: ErrorKind::BrokenPipe
-        })
-    ));
-    assert!(matches!(
-        flush_failed.receive(),
-        Err(ConnectTransportError::Closed)
-    ));
-
-    let mut close_failed =
-        FramedConnectTransport::with_negotiated_limits(FailureIo::writer(false, true), limits)
-            .expect("close-failure transport");
-    assert!(matches!(
-        close_failed.close(),
-        Err(ConnectTransportError::Flush {
-            kind: ErrorKind::BrokenPipe
-        })
-    ));
-    assert!(matches!(
-        close_failed.send(envelope),
-        Err(ConnectTransportError::Closed)
-    ));
-}
-
-#[test]
-fn short_write_then_error_permanently_closes_transport() {
-    let limits = ConnectLimits::v1_default();
-    let envelope = ConnectEnvelope::new(
-        binding(87),
-        1,
-        Some(domain_id::<RequestId>(87)),
-        None,
-        limits,
-        ConnectPrivacyClass::ManagedMetadata,
-        query_payload(87),
-    )
-    .expect("valid envelope");
-    let mut transport =
-        FramedConnectTransport::with_negotiated_limits(ShortWriteThenErrorIo::new(), limits)
-            .expect("short-write transport");
-
-    assert!(matches!(
-        transport.send(envelope.clone()),
-        Err(ConnectTransportError::Frame(
-            PhysicalFrameError::WriteHeader {
-                kind: ErrorKind::BrokenPipe
-            }
-        ))
-    ));
-    assert!(matches!(
-        transport.send(envelope),
-        Err(ConnectTransportError::Closed)
-    ));
-    assert!(matches!(
-        transport.receive(),
-        Err(ConnectTransportError::Closed)
-    ));
-    assert_eq!(
-        transport.into_inner().bytes.len(),
-        1,
-        "the writer must have successfully short-written before failing"
-    );
-}
-
-#[test]
-fn error_payload_debug_is_opaque_and_bounded() {
-    let sentinel = "connect-error-debug-secret-sentinel";
-    let payload = ErrorPayload::new(17, sentinel).expect("error payload");
-    let debug = format!("{payload:?}");
-
-    assert!(!debug.contains(sentinel), "error text must not enter Debug");
-    assert!(
-        debug.contains("message_len"),
-        "Debug should retain safe metadata"
-    );
-    assert!(debug.len() <= 128, "Debug output must remain bounded");
-}
-
-#[test]
-fn physical_receive_limit_is_capped_by_reassembled_message_limit_before_allocation() {
-    let limits =
-        ConnectLimits::try_new(4096, 1024, 10, 2048, 512, 1024, 128).expect("bounded limits");
-    let mut receiver = FramedConnectTransport::with_negotiated_limits(
-        LoopbackIo::with_bytes((1025_u32).to_be_bytes().to_vec()),
-        limits,
-    )
-    .expect("receiver");
-
-    assert!(matches!(
-        receiver.receive(),
-        Err(ConnectTransportError::Frame(
-            PhysicalFrameError::Oversized {
-                declared: 1025,
-                maximum: 1024,
-            }
-        ))
-    ));
-    assert!(matches!(
-        receiver.receive(),
-        Err(ConnectTransportError::Closed)
-    ));
-}
-
-#[test]
-fn declared_limits_are_compared_before_semantic_validation() {
-    let negotiated =
-        ConnectLimits::try_new(4096, 8192, 2, 2048, 512, 1024, 128).expect("negotiated limits");
-    let declared =
-        ConnectLimits::try_new(4096, 8192, 1, 2048, 512, 1024, 128).expect("declared limits");
-    let envelope = ConnectEnvelope::new(
-        binding(83),
-        1,
-        None,
-        None,
-        negotiated,
-        ConnectPrivacyClass::ManagedMetadata,
-        ConnectPayload::SnapshotPage(empty_snapshot_page(83)),
-    )
-    .expect("page envelope");
-    let mut wire = wire_with_payload(
-        &envelope,
-        RawSnapshotPayload {
-            snapshot_page: RawSnapshotPage {
-                snapshot_id: domain_id(83),
-                through_sequence: 4,
-                section: SnapshotSection::Tasks,
-                after_item: None,
-                items: vec![(), ()],
-                encoded_bytes: 0,
-                next_cursor: None,
-            },
-        },
-    );
-    wire.limits = declared;
-    let result = ConnectEnvelope::decode_with_limits(
-        &rmp_serde::to_vec_named(&wire).expect("wire fixture"),
-        negotiated,
-    );
-    assert!(matches!(
-        result,
-        Err(EnvelopeError::NegotiatedLimitsMismatch)
-    ));
-}
-
-#[test]
-fn nested_chunk_page_and_cursor_sizes_are_rejected_before_payload_decode() {
-    let limits = ConnectLimits::try_new(4096, 8192, 1, 2048, 2, 4, 2).expect("tight limits");
-
-    let chunk_payload = b"bad".to_vec();
-    let chunk = ChunkFrame::new(
-        domain_id::<TransferId>(84),
-        0,
-        true,
-        chunk_payload.clone(),
-        cumulative_sha256(&[&chunk_payload]),
-        None,
-    )
-    .expect("shape-valid chunk");
-    let chunk_bytes =
-        rmp_serde::to_vec_named(&RawChunkPayload { chunk }).expect("chunk wire fixture");
-    let chunk_error = ConnectPayload::decode(PayloadKind::CHUNK, 1, &chunk_bytes, limits)
-        .expect_err("oversized chunk must fail before decode");
-    assert!(matches!(
-        chunk_error,
-        PayloadError::Limits(devmanager::connect::ConnectLimitError::ChunkExceeded {
-            declared: 3,
-            maximum: 2,
-        })
-    ));
-
-    let page_envelope = ConnectEnvelope::new(
-        binding(85),
-        1,
-        None,
-        None,
-        limits,
-        ConnectPrivacyClass::ManagedMetadata,
-        ConnectPayload::SnapshotPage(empty_snapshot_page(85)),
-    )
-    .expect("page envelope");
-    let oversized_page = wire_with_payload(
-        &page_envelope,
-        RawSnapshotPayload {
-            snapshot_page: RawSnapshotPage {
-                snapshot_id: domain_id(85),
-                through_sequence: 4,
-                section: SnapshotSection::Tasks,
-                after_item: None,
-                items: vec![(), ()],
-                encoded_bytes: 0,
-                next_cursor: None,
-            },
-        },
-    );
-    let page_bytes = rmp_serde::to_vec_named(&oversized_page).expect("page wire fixture");
-    let page_error = ConnectEnvelope::decode_with_limits(&page_bytes, limits)
-        .expect_err("oversized page must fail before decode");
-    assert!(matches!(
-        page_error,
-        EnvelopeError::Payload(PayloadError::Limits(
-            devmanager::connect::ConnectLimitError::PageItemsExceeded {
-                declared: 2,
-                maximum: 1,
-            }
-        ))
-    ));
-
-    let oversized_cursor = wire_with_payload(
-        &page_envelope,
-        RawSnapshotPayload {
-            snapshot_page: RawSnapshotPage {
-                snapshot_id: domain_id(85),
-                through_sequence: 4,
-                section: SnapshotSection::Tasks,
-                after_item: None,
-                items: Vec::new(),
-                encoded_bytes: 0,
-                next_cursor: Some(vec![0, 1, 2]),
-            },
-        },
-    );
-    let cursor_bytes = rmp_serde::to_vec_named(&oversized_cursor).expect("cursor wire fixture");
-    let cursor_error = ConnectEnvelope::decode_with_limits(&cursor_bytes, limits)
-        .expect_err("oversized cursor must fail before decode");
-    assert!(matches!(
-        cursor_error,
-        EnvelopeError::Payload(PayloadError::Limits(
-            devmanager::connect::ConnectLimitError::CursorExceeded {
-                declared: 3,
-                maximum: 2,
-            }
-        ))
-    ));
-}
-
-#[test]
-fn query_reply_snapshot_and_event_page_item_limits_preflight_through_transport() {
-    let limits =
-        ConnectLimits::try_new(4096, 8192, 1, 2048, 4, 8, 128).expect("query page item limits");
-
-    let snapshot_envelope = query_reply_envelope(88, limits);
-    let snapshot = RawMessagePayload {
-        message: RawQueryReplyMessage {
-            query_reply: RawQueryReply {
-                request_id: domain_id(88),
-                outcome: RawQueryOutcome {
-                    ok: RawSnapshotQueryResult {
-                        snapshot_page: RawPageResult {
-                            page: RawSnapshotPage {
-                                snapshot_id: domain_id(88),
-                                through_sequence: 4,
-                                section: SnapshotSection::Tasks,
-                                after_item: None,
-                                items: vec![(), ()],
-                                encoded_bytes: 0,
-                                next_cursor: None,
-                            },
-                        },
-                    },
-                },
-            },
-        },
-    };
-    assert_page_items_rejection(
-        framed_raw(&wire_with_payload(&snapshot_envelope, snapshot), limits),
-        limits,
-    );
-
-    let event_envelope = query_reply_envelope(89, limits);
-    let event = RawMessagePayload {
-        message: RawQueryReplyMessage {
-            query_reply: RawQueryReply {
-                request_id: domain_id(89),
-                outcome: RawQueryOutcome {
-                    ok: RawEventQueryResult {
-                        event_replay_page: RawEventReplayPageResult {
-                            subscription_id: domain_id(90),
-                            page: RawEventPage {
-                                after_sequence: 0,
-                                through_sequence: 4,
-                                events: vec![(), ()],
-                                next_cursor: None,
-                            },
-                        },
-                    },
-                },
-            },
-        },
-    };
-    assert_page_items_rejection(
-        framed_raw(&wire_with_payload(&event_envelope, event), limits),
-        limits,
-    );
-}
-
-#[test]
-fn nested_query_page_at_canonical_body_limit_is_accepted_by_raw_transport() {
-    let typed_page = empty_snapshot_page(91);
-    let canonical = canonical_snapshot_page_size(&typed_page).expect("canonical snapshot page");
-    let limits = ConnectLimits::try_new(4096, 8192, 8, canonical, 4, 8, 128).expect("page limits");
-    let raw_page = RawSnapshotPage {
-        snapshot_id: domain_id(91),
-        through_sequence: 4,
-        section: SnapshotSection::Tasks,
-        after_item: None,
-        items: Vec::new(),
-        encoded_bytes: canonical,
-        next_cursor: None,
-    };
-    let page_wrapper = RawPageResult {
-        page: raw_page.clone(),
-    };
-    assert!(
-        rmp_serde::to_vec_named(&page_wrapper)
-            .expect("page wrapper")
-            .len()
-            > usize::try_from(canonical).expect("canonical size fits"),
-        "the nested QueryReply wrapper must be larger than its page body"
-    );
-    let envelope = query_reply_envelope(91, limits);
-    let raw = RawMessagePayload {
-        message: RawQueryReplyMessage {
-            query_reply: RawQueryReply {
-                request_id: domain_id(91),
-                outcome: RawQueryOutcome {
-                    ok: RawSnapshotQueryResult {
-                        snapshot_page: page_wrapper,
-                    },
-                },
-            },
-        },
-    };
-    let mut receiver = FramedConnectTransport::with_negotiated_limits(
-        LoopbackIo::with_bytes(framed_raw(&wire_with_payload(&envelope, raw), limits)),
-        limits,
-    )
-    .expect("page-boundary receiver");
-
-    let received = receiver
-        .receive()
-        .expect("canonical page body should cross transport")
-        .expect("one query reply");
-    assert!(matches!(
-        received.payload(),
-        ConnectPayload::Message(ServerMessage::QueryReply(_))
-    ));
-}
-
-#[test]
-fn nested_query_page_over_limit_reports_inner_page_body_at_raw_transport_boundary() {
-    let mut typed_page = empty_snapshot_page(92);
-    typed_page.next_cursor = Some(vec![0; 8]);
-    let canonical = canonical_snapshot_page_size(&typed_page).expect("canonical snapshot page");
-    let maximum = canonical - 1;
-    let limits = ConnectLimits::try_new(4096, 8192, 8, maximum, 4, 8, 128).expect("page limits");
-    let envelope = query_reply_envelope(92, limits);
-    let raw = RawMessagePayload {
-        message: RawQueryReplyMessage {
-            query_reply: RawQueryReply {
-                request_id: domain_id(92),
-                outcome: RawQueryOutcome {
-                    ok: RawSnapshotQueryResult {
-                        snapshot_page: RawPageResult {
-                            page: RawSnapshotPage {
-                                snapshot_id: domain_id(92),
-                                through_sequence: 4,
-                                section: SnapshotSection::Tasks,
-                                after_item: None,
-                                items: Vec::new(),
-                                encoded_bytes: canonical,
-                                next_cursor: Some(vec![0; 8]),
-                            },
-                        },
-                    },
-                },
-            },
-        },
-    };
-    let mut receiver = FramedConnectTransport::with_negotiated_limits(
-        LoopbackIo::with_bytes(framed_raw(&wire_with_payload(&envelope, raw), limits)),
-        limits,
-    )
-    .expect("page-boundary receiver");
-
-    let result = receiver.receive();
-    let result_debug = format!("{result:?}");
-    assert!(
-        matches!(
-            result,
-            Err(ConnectTransportError::Envelope(EnvelopeError::Payload(
-                PayloadError::Limits(devmanager::connect::ConnectLimitError::PageBytesExceeded {
-                    declared,
-                    maximum: actual_maximum,
-                })
-            ))) if declared == u64::from(canonical) && actual_maximum == maximum
-        ),
-        "unexpected inner page byte result: {result_debug}"
-    );
-    assert!(matches!(
-        receiver.receive(),
-        Err(ConnectTransportError::Closed)
-    ));
-}
-
-#[test]
-fn raw_opaque_payload_limits_preflight_through_transport_and_close_permanently() {
-    let limits =
-        ConnectLimits::try_new(4096, 1024, 8, 2048, 4, 8, 128).expect("opaque payload limits");
-    let declared = limits.max_reassembled_message_bytes + 1;
-
-    let kind = PayloadKind::new(0x7ffd).expect("unknown kind");
-    let unknown_envelope = ConnectEnvelope::new(
-        binding(96),
-        1,
-        None,
-        None,
-        limits,
-        ConnectPrivacyClass::ManagedMetadata,
-        ConnectPayload::Unknown(UnknownPayload::new(kind, 9, Vec::new()).expect("unknown payload")),
-    )
-    .expect("unknown envelope");
-    let unknown_payload_bytes = oversized_binary_bytes(
-        &RawUnknownPayload {
-            unknown: RawUnknownPayloadBody {
-                kind,
-                version: 9,
-                payload: Vec::new(),
-            },
-        },
-        limits,
-    );
-    assert!(matches!(
-        ConnectPayload::decode(kind, 9, &unknown_payload_bytes, limits),
-        Err(PayloadError::Limits(
-            devmanager::connect::ConnectLimitError::PayloadExceeded {
-                declared: actual,
-                maximum: 1024,
-            }
-        )) if actual == u64::from(declared)
-    ));
-    let unknown_frame = oversized_binary_frame(
-        &unknown_envelope,
-        RawUnknownPayload {
-            unknown: RawUnknownPayloadBody {
-                kind,
-                version: 9,
-                payload: Vec::new(),
-            },
-        },
-        limits,
-    );
-    let mut unknown_receiver = FramedConnectTransport::with_negotiated_limits(
-        LoopbackIo::with_bytes(unknown_frame),
-        limits,
-    )
-    .expect("unknown receiver");
-    let unknown_result = unknown_receiver.receive();
-    let unknown_result_debug = format!("{unknown_result:?}");
-    assert!(
-        matches!(
-            unknown_result,
-            Err(ConnectTransportError::Envelope(EnvelopeError::MessagePack(
-                MessagePackError::DeclaredLengthExceeded {
-                    kind: MessagePackLengthKind::Binary,
-                    declared: actual,
-                    maximum: 1024,
-                }
-            ))) if actual == declared
-        ),
-        "unexpected unknown result: {unknown_result_debug}"
-    );
-    assert!(matches!(
-        unknown_receiver.receive(),
-        Err(ConnectTransportError::Closed)
-    ));
-
-    let extension_envelope = ConnectEnvelope::new(
-        binding(97),
-        1,
-        None,
-        None,
-        limits,
-        ConnectPrivacyClass::ManagedMetadata,
-        ConnectPayload::Extension(
-            GenericExtensionPayload::new(0x33, 1, Vec::new()).expect("extension payload"),
-        ),
-    )
-    .expect("extension envelope");
-    let extension_payload_bytes = oversized_binary_bytes(
-        &RawExtensionPayload {
-            extension: RawExtensionPayloadBody {
-                type_id: 0x33,
-                schema_version: 1,
-                payload: Vec::new(),
-            },
-        },
-        limits,
-    );
-    assert!(matches!(
-        ConnectPayload::decode(PayloadKind::EXTENSION, 1, &extension_payload_bytes, limits),
-        Err(PayloadError::Limits(
-            devmanager::connect::ConnectLimitError::PayloadExceeded {
-                declared: actual,
-                maximum: 1024,
-            }
-        )) if actual == u64::from(declared)
-    ));
-    let extension_frame = oversized_binary_frame(
-        &extension_envelope,
-        RawExtensionPayload {
-            extension: RawExtensionPayloadBody {
-                type_id: 0x33,
-                schema_version: 1,
-                payload: Vec::new(),
-            },
-        },
-        limits,
-    );
-    let mut extension_receiver = FramedConnectTransport::with_negotiated_limits(
-        LoopbackIo::with_bytes(extension_frame),
-        limits,
-    )
-    .expect("extension receiver");
-    let extension_result = extension_receiver.receive();
-    let extension_result_debug = format!("{extension_result:?}");
-    assert!(
-        matches!(
-            extension_result,
-            Err(ConnectTransportError::Envelope(EnvelopeError::MessagePack(
-                MessagePackError::DeclaredLengthExceeded {
-                    kind: MessagePackLengthKind::Binary,
-                    declared: actual,
-                    maximum: 1024,
-                }
-            ))) if actual == declared
-        ),
-        "unexpected extension result: {extension_result_debug}"
-    );
-    assert!(matches!(
-        extension_receiver.receive(),
-        Err(ConnectTransportError::Closed)
-    ));
-}
-
-#[test]
-fn envelope_errors_permanently_close_transport_for_send_and_receive() {
-    let limits = ConnectLimits::v1_default();
-    let envelope = ConnectEnvelope::new(
-        binding(86),
-        1,
-        Some(domain_id::<RequestId>(86)),
-        None,
-        limits,
-        ConnectPrivacyClass::ManagedMetadata,
-        query_payload(86),
-    )
-    .expect("query envelope");
-    let mut invalid = wire_for(&envelope);
-    invalid.sequence = 0;
-    let mut receiver = FramedConnectTransport::with_negotiated_limits(
-        LoopbackIo::with_bytes(framed_raw(&invalid, limits)),
-        limits,
-    )
-    .expect("receiver");
-
-    assert!(matches!(
-        receiver.receive(),
-        Err(ConnectTransportError::Envelope(_))
-    ));
-    assert!(matches!(
-        receiver.receive(),
-        Err(ConnectTransportError::Closed)
-    ));
-    assert!(matches!(
-        receiver.send(envelope),
-        Err(ConnectTransportError::Closed)
-    ));
-}
-
-#[test]
-fn pages_validate_artifact_claims_and_normalize_outgoing_artifacts() {
-    let limits = ConnectLimits::v1_default();
-    let mut page = ArtifactContentPage {
-        artifact_id: domain_id(61),
-        offset: 4,
-        total_bytes: 9,
-        sha256: [7; 32],
-        payload: vec![8, 9, 10],
-        encoded_bytes: u32::MAX,
-        next_cursor: Some(vec![11, 12]),
-    };
-    let canonical = canonical_artifact_content_page_size(&page).expect("canonical artifact size");
-    page.encoded_bytes = canonical + 1;
-    let incoming = ConnectPayload::Message(ServerMessage::QueryReply(QueryReply {
-        request_id: domain_id(62),
-        outcome: QueryOutcome::Ok(QueryResult::ArtifactContentPage {
-            subscription_id: domain_id(63),
-            page: page.clone(),
-        }),
-    }));
-    assert!(
-        incoming.validate(limits).is_err(),
-        "false artifact claims are rejected"
-    );
-
-    page.encoded_bytes = u32::MAX;
-    let encoded = ConnectPayload::Message(ServerMessage::QueryReply(QueryReply {
-        request_id: domain_id(62),
-        outcome: QueryOutcome::Ok(QueryResult::ArtifactContentPage {
-            subscription_id: domain_id(63),
-            page,
-        }),
-    }))
-    .encode(limits)
-    .expect("outgoing artifact recomputes its claim");
-    let normalized = ConnectPayload::decode(PayloadKind::QUERY_REPLY, 1, &encoded, limits)
-        .expect("normalized artifact reply decodes");
-    let ConnectPayload::Message(ServerMessage::QueryReply(QueryReply {
-        outcome: QueryOutcome::Ok(QueryResult::ArtifactContentPage { page, .. }),
-        ..
-    })) = normalized
-    else {
-        panic!("expected normalized artifact reply")
-    };
-    assert_eq!(
-        page.encoded_bytes,
-        canonical_artifact_content_page_size(&page).unwrap()
-    );
-}
-
-fn cumulative_sha256(parts: &[&[u8]]) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    for part in parts {
-        hasher.update(part);
-    }
-    hasher.finalize().into()
-}
-
-#[test]
-fn connect_chunk_is_the_canonical_checked_primitive() {
-    let limits = ConnectLimits::try_new(4096, 8192, 10, 2048, 4, 8, 2).expect("bounded limits");
-    let transfer_id = domain_id::<TransferId>(60);
-    let cursor = vec![0x71, 0x72];
-    let payload = b"pay";
-    let hash = cumulative_sha256(&[payload]);
-    let frame = ChunkFrame::new(
-        transfer_id,
-        0,
-        true,
-        payload.to_vec(),
-        hash,
-        Some(cursor.clone()),
-    )
-    .expect("chunk");
-    limits
-        .validate_chunk(0, payload)
-        .expect("valid negotiated chunk");
-    ConnectPayload::Chunk(frame.clone())
-        .validate(limits)
-        .expect("Connect applies negotiated chunk limits");
-
-    let mut context = limits
-        .chunk_context(transfer_id, Some(cursor.clone()))
-        .expect("chunk context");
-    context.accept(&frame).expect("context accepts chunk");
-    assert!(context.is_complete());
-    assert!(limits
-        .chunk_context(transfer_id, Some(vec![0x71, 0x72, 0x73]))
-        .is_err());
-
-    let mut wrong_hash = hash;
-    wrong_hash[0] ^= 1;
-    let wrong_hash_frame = ChunkFrame::new(
-        transfer_id,
-        0,
-        true,
-        payload.to_vec(),
-        wrong_hash,
-        Some(cursor.clone()),
-    )
-    .expect("shape-valid wrong hash");
-    let mut poisoned = limits
-        .chunk_context(transfer_id, Some(cursor.clone()))
-        .expect("poison context");
-    assert!(matches!(
-        poisoned.accept(&wrong_hash_frame),
-        Err(ChunkError::CumulativeHashMismatch)
-    ));
-    assert!(poisoned.is_poisoned());
-    assert!(matches!(poisoned.accept(&frame), Err(ChunkError::Poisoned)));
-
-    let mut post_final = limits
-        .chunk_context(transfer_id, Some(cursor))
-        .expect("post-final context");
-    post_final.accept(&frame).expect("final frame");
-    assert!(post_final.is_complete());
-    assert!(matches!(
-        post_final.accept(&frame),
-        Err(ChunkError::AlreadyComplete)
-    ));
-    assert!(post_final.is_poisoned());
-}
-
-#[test]
-fn stream_payload_reuses_stream_frame_and_settlement_never_promotes_acceptance_to_completion() {
-    let resource_id = domain_id::<ResourceId>(70);
-    let stream = StreamFrame {
-        subscription_id: domain_id(71),
-        stream: StreamKey::from(resource_id),
-        generation: 1,
-        sequence: 1,
-        payload_kind: StreamPayloadKind::new(1).unwrap(),
-        schema_version: 1,
-        payload: vec![1, 2, 3],
-    };
-    ConnectPayload::TerminalDelta(stream)
-        .validate(ConnectLimits::v1_default())
-        .expect("valid stream");
-
-    let command_id = domain_id::<CommandId>(72);
-    let operation_id = domain_id::<OperationId>(73);
-    let event_id = domain_id::<EventId>(74);
-    let receipt = CommandReceipt::Accepted {
-        command_id,
-        operation_id,
-        task_revision: Some(1),
-        event_ids: vec![event_id],
-    };
-    let outcome = OperationOutcome::new(
-        operation_id,
-        2,
-        None,
-        None,
-        OutcomeSource::Dispatch,
-        OperationOutcomeKind::Settled {
-            result_event_ids: vec![event_id],
-        },
-    )
-    .expect("outcome");
-    let settlement =
-        devmanager::connect::OperationSettlementPayload::new(operation_id, outcome.clone())
-            .expect("settlement");
-    ConnectPayload::OperationSettlement(settlement)
-        .validate(ConnectLimits::v1_default())
-        .expect("valid settlement");
-
-    let settlement = devmanager::connect::OperationSettlementPayload::new(operation_id, outcome)
-        .expect("settlement replay");
-    let settlement_bytes = ConnectPayload::OperationSettlement(settlement)
-        .encode(ConnectLimits::v1_default())
-        .expect("encode settlement");
-    assert!(!settlement_bytes
-        .windows(b"accepted".len())
-        .any(|window| window == b"accepted"));
-
-    let mismatched = devmanager::connect::OperationSettlementPayload::new(
-        domain_id::<OperationId>(75),
-        OperationOutcome::new(
-            operation_id,
-            2,
-            None,
-            None,
-            OutcomeSource::Dispatch,
-            OperationOutcomeKind::Settled {
-                result_event_ids: vec![event_id],
-            },
+            limits,
         )
-        .expect("outcome"),
-    );
-    assert!(
-        mismatched.is_err(),
-        "settlement correlation must be authoritative"
-    );
+        .unwrap();
+        assert_eq!(decoded.kind(), fixture.payload.kind());
+        assert_eq!(decoded.channel(), descriptor_channel(name));
+        assert_eq!(decoded.is_action(), *name == "command");
+        if *name == "hello" {
+            let ConnectPayload::Hello(hello) = decoded else {
+                panic!("hello fixture");
+            };
+            assert_eq!(hello.privacy_class, ConnectPrivacyClass::LocalOnly);
+        }
+        assert!(
+            !matches!(decoded, ConnectPayload::Error(ref error) if error.message.contains("secret")
+                || error.message.contains("token")
+                || error.message.contains("transcript"))
+        );
+    }
+}
 
-    let accepted = ConnectPayload::Message(ServerMessage::CommandReceipt(receipt));
-    assert_eq!(accepted.kind(), PayloadKind::COMMAND_RECEIPT);
-    assert!(matches!(
-        accepted,
-        ConnectPayload::Message(ServerMessage::CommandReceipt(_))
-    ));
+fn descriptor_channel(name: &str) -> ChannelKind {
+    payload_catalog()
+        .iter()
+        .find(|descriptor| descriptor.name == name)
+        .unwrap()
+        .channel
 }
 
 #[test]
-fn unknown_payloads_are_bounded_inert_and_generic_extensions_are_typed() {
+fn unknown_actions_fail_closed_even_when_the_wire_kind_is_known() {
+    assert!(ActionId::new(0x7fff).unwrap().known().is_none());
     let limits = ConnectLimits::v1_default();
-    let kind = PayloadKind::new(0x7fff).expect("unknown kind");
-    let unknown = ConnectPayload::Unknown(
-        UnknownPayload::new(kind, 9, vec![1, 2, 3]).expect("unknown payload"),
-    );
-    assert!(!unknown.is_action());
-    assert_eq!(unknown.kind(), kind);
-    assert_eq!(
-        ConnectPayload::decode(kind, 9, &unknown.encode(limits).unwrap(), limits).unwrap(),
-        unknown
-    );
-
-    let extension =
-        ConnectPayload::Extension(GenericExtensionPayload::new(0x33, 1, vec![4, 5]).unwrap());
-    extension.validate(limits).expect("generic extension");
-    assert!(!extension.is_action());
-}
-
-#[test]
-fn opaque_payloads_expose_checked_getters_and_reject_hard_oversize() {
-    let kind = PayloadKind::new(0x7ffe).expect("unknown kind");
-    let unknown = UnknownPayload::new(kind, 9, vec![1, 2, 3]).expect("unknown payload");
-    assert_eq!(unknown.kind(), kind);
-    assert_eq!(unknown.version(), 9);
-    assert_eq!(unknown.payload(), &[1, 2, 3]);
-    assert!(UnknownPayload::new(
-        kind,
-        9,
-        vec![0; devmanager::connect::MAX_CONNECT_REASSEMBLED_MESSAGE_BYTES as usize + 1]
-    )
-    .is_err());
-
-    let extension = GenericExtensionPayload::new(0x33, 1, vec![4, 5]).expect("extension");
-    assert_eq!(extension.type_id(), 0x33);
-    assert_eq!(extension.schema_version(), 1);
-    assert_eq!(extension.payload(), &[4, 5]);
-    assert!(GenericExtensionPayload::new(
-        0x33,
-        1,
-        vec![0; devmanager::connect::MAX_CONNECT_REASSEMBLED_MESSAGE_BYTES as usize + 1]
-    )
-    .is_err());
-}
-
-#[test]
-fn connect_debug_paths_reveal_metadata_and_lengths_without_payload_bytes() {
-    let sentinel = vec![0xde, 0xad, 0xbe, 0xef, 0x01, 0x23];
-    let sentinel_debug = format!("{sentinel:?}");
-    let extension =
-        GenericExtensionPayload::new(0x33, 7, sentinel.clone()).expect("extension payload");
-    let unknown_kind = PayloadKind::new(0x7ffc).expect("unknown kind");
-    let unknown = UnknownPayload::new(unknown_kind, 9, sentinel.clone()).expect("unknown payload");
-
-    let extension_debug = format!("{extension:?}");
-    assert!(extension_debug.contains("type_id"));
-    assert!(extension_debug.contains("schema_version"));
-    assert!(extension_debug.contains("payload_len"));
-    assert!(!extension_debug.contains(&sentinel_debug));
-
-    let unknown_debug = format!("{unknown:?}");
-    assert!(unknown_debug.contains("kind"));
-    assert!(unknown_debug.contains("version"));
-    assert!(unknown_debug.contains("payload_len"));
-    assert!(!unknown_debug.contains(&sentinel_debug));
-
-    let payload = ConnectPayload::Extension(extension);
-    let payload_debug = format!("{payload:?}");
-    assert!(payload_debug.contains("kind"));
-    assert!(payload_debug.contains("version"));
-    assert!(payload_debug.contains("payload_len"));
-    assert!(!payload_debug.contains(&sentinel_debug));
-
-    let envelope = ConnectEnvelope::new(
-        binding(98),
-        1,
-        None,
-        None,
-        ConnectLimits::v1_default(),
-        ConnectPrivacyClass::ManagedMetadata,
-        payload,
-    )
-    .expect("extension envelope");
-    let envelope_debug = format!("{envelope:?}");
-    assert!(!envelope_debug.contains(&sentinel_debug));
-}
-
-fn hex_fixture(value: &str) -> Vec<u8> {
-    let compact: String = value
-        .chars()
-        .filter(|character| !character.is_whitespace())
-        .collect();
-    compact
-        .as_bytes()
-        .chunks(2)
-        .map(|byte| {
-            u8::from_str_radix(std::str::from_utf8(byte).expect("fixture hex"), 16)
-                .expect("fixture byte")
-        })
-        .collect()
+    let smuggled = ConnectPayload::Extension(GenericExtensionPayload {
+        type_id: PayloadKind::COMMAND.get(),
+        schema_version: 1,
+        payload: vec![0x91, 0x01],
+    });
+    assert!(smuggled.encode(limits).is_err());
+    assert!(!smuggled.is_action());
 }

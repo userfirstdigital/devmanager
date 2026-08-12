@@ -1,18 +1,19 @@
 use std::collections::VecDeque;
 
+use serde::Serialize;
 use uuid::Uuid;
 
 use devmanager::connect::{
-    ActionId, ChannelBinding, ChannelId, ConnectEnvelope, ConnectLimits, ConnectPayload,
-    ConnectPrivacyClass, ConnectRole, ConnectTransport, ConnectionId, EphemeralPresence,
-    LastSenderHint, PermissionDecision, PermissionDenyReason, PermissionEvaluator,
-    PermissionRequest, PresenceSink, ProjectionExtensions, ProjectionSource, ReplayRequest,
-    SessionId, SnapshotRequest, MAX_CONNECT_RESUME_CURSOR_BYTES,
+    decode_inner, encode_inner, ActionId, ChannelKind, ConnectEnvelope, ConnectLimits,
+    ConnectPrivacyClass, ConnectRole, ConnectTransport, EphemeralPresence, LastSenderHint,
+    PayloadKind, PermissionDecision, PermissionEvaluator, PermissionRequest, PresenceSink,
+    ProjectionExtensions, ProjectionSource, ReplayRequest, SnapshotRequest,
+    MAX_CONNECT_RESUME_CURSOR_BYTES,
 };
-use devmanager::domain::id::{ClientId, RequestId, SnapshotId, TaskId};
+use devmanager::domain::id::{ClientId, OperationId, RequestId, SnapshotId, TaskId};
 use devmanager::domain::query::{Query, QueryEnvelope, QueryReply};
 use devmanager::domain::snapshot::{EventPage, PageLimits, SnapshotPage, SnapshotSection};
-use devmanager::protocol::ClientRequest;
+use devmanager::protocol::ProtocolVersion;
 
 fn fixed_uuid_v7(tail: u8) -> Uuid {
     let mut bytes = [0_u8; 16];
@@ -42,97 +43,139 @@ fn request_id(tail: u8) -> RequestId {
     RequestId::from_bytes(fixed_uuid_v7(tail).into_bytes()).expect("request id")
 }
 
+fn operation_id(tail: u8) -> OperationId {
+    OperationId::from_bytes(fixed_uuid_v7(tail).into_bytes()).expect("operation id")
+}
+
 fn snapshot_id(tail: u8) -> SnapshotId {
     SnapshotId::from_bytes(fixed_uuid_v7(tail).into_bytes()).expect("snapshot id")
 }
 
 fn fixture_envelope() -> ConnectEnvelope {
-    let request_id = request_id(0x21);
-    let payload = ConnectPayload::Request(ClientRequest::Query(QueryEnvelope {
-        request_id,
-        client_id: client_id(0x22),
-        task_id: Some(task_id(0x23)),
-        query: Query::TaskSnapshot,
-    }));
-    ConnectEnvelope::new(
-        ChannelBinding::new(
-            ConnectionId::from_uuid(fixed_uuid_v7(0x11)).expect("connection id"),
-            SessionId::from_uuid(fixed_uuid_v7(0x12)).expect("session id"),
-            ChannelId::from_uuid(fixed_uuid_v7(0x13)).expect("channel id"),
-        ),
-        7,
-        Some(request_id),
-        None,
-        ConnectLimits::v1_default(),
-        ConnectPrivacyClass::ManagedMetadata,
-        payload,
-    )
-    .expect("typed envelope")
+    ConnectEnvelope {
+        protocol_major: ProtocolVersion::current().major,
+        protocol_minor: ProtocolVersion::current().minor,
+        connection_id: fixed_uuid_v7(0x11),
+        session_id: fixed_uuid_v7(0x12),
+        channel_id: fixed_uuid_v7(0x13),
+        channel: ChannelKind::Durable,
+        sequence: 7,
+        request_id: Some(request_id(0x21)),
+        operation_id: Some(operation_id(0x22)),
+        limits: ConnectLimits::v1_default(),
+        compression: devmanager::connect::Compression::None,
+        privacy_class: ConnectPrivacyClass::ManagedMetadata,
+        payload_kind: PayloadKind::SNAPSHOT_PAGE,
+        payload_version: 1,
+        payload: vec![0x91, 0x01, 0x92, 0xa4, b't', b'e', b's', b't'],
+    }
+}
+
+fn hex_fixture(value: &str) -> Vec<u8> {
+    value
+        .split_whitespace()
+        .map(|byte| u8::from_str_radix(byte, 16).expect("hex fixture byte"))
+        .collect()
 }
 
 #[test]
-fn typed_inner_envelope_is_deterministic_and_round_trips() {
+fn wire_envelope_fixture_is_deterministic_and_round_trips() {
     let envelope = fixture_envelope();
-    let encoded = envelope.encode().expect("encode inner");
-    assert!(!encoded.is_empty());
-    assert_eq!(encoded, envelope.encode().expect("encode again"));
+    let encoded = envelope.encode().expect("encode envelope");
+    let expected = hex_fixture(include_str!("fixtures/connect/v1/envelope.msgpack.hex"));
+
     assert_eq!(
-        ConnectEnvelope::decode(&encoded).expect("decode inner"),
+        encoded, expected,
+        "v1 encoding must stay byte deterministic"
+    );
+    assert_eq!(
+        ConnectEnvelope::decode(&encoded).expect("decode envelope"),
         envelope
     );
+    assert_eq!(encode_inner(&envelope).expect("encode inner"), encoded);
+    assert_eq!(decode_inner(&encoded).expect("decode inner"), envelope);
 }
 
 #[test]
-fn unknown_payload_remains_inert_without_mutable_envelope_discriminants() {
-    let kind = devmanager::connect::PayloadKind::new(0x7fff).expect("unknown nonzero kind");
-    let payload = ConnectPayload::Unknown(
-        devmanager::connect::UnknownPayload::new(kind, 9, vec![1, 2, 3]).expect("unknown payload"),
-    );
-    let envelope = ConnectEnvelope::new(
-        ChannelBinding::new(
-            ConnectionId::from_uuid(fixed_uuid_v7(0x31)).expect("connection id"),
-            SessionId::from_uuid(fixed_uuid_v7(0x32)).expect("session id"),
-            ChannelId::from_uuid(fixed_uuid_v7(0x33)).expect("channel id"),
-        ),
-        1,
-        None,
-        None,
-        ConnectLimits::v1_default(),
-        ConnectPrivacyClass::ManagedMetadata,
-        payload,
-    )
-    .expect("unknown envelope");
+fn wire_unknown_payload_is_preserved_without_becoming_an_action() {
+    let mut envelope = fixture_envelope();
+    envelope.payload_kind = PayloadKind::new(0x7fff).expect("unknown nonzero kind");
 
     assert_eq!(envelope.known_payload_kind(), None);
     assert!(!envelope.is_action_payload());
-    assert_eq!(
-        ConnectEnvelope::decode(&envelope.encode().unwrap()).unwrap(),
-        envelope
-    );
+
+    let decoded = ConnectEnvelope::decode(&envelope.encode().expect("encode unknown")).unwrap();
+    assert_eq!(decoded.payload_kind, envelope.payload_kind);
+    assert_eq!(decoded.known_payload_kind(), None);
+}
+
+#[derive(Serialize)]
+struct UnknownEnvelopeField {
+    unknown: u8,
+    protocol_major: u16,
+    protocol_minor: u16,
+    connection_id: Uuid,
+    session_id: Uuid,
+    channel_id: Uuid,
+    channel: ChannelKind,
+    sequence: u64,
+    request_id: Option<RequestId>,
+    operation_id: Option<OperationId>,
+    limits: ConnectLimits,
+    compression: devmanager::connect::Compression,
+    privacy_class: ConnectPrivacyClass,
+    payload_kind: PayloadKind,
+    payload_version: u16,
+    payload: Vec<u8>,
 }
 
 #[test]
-fn negotiated_limits_bound_pages_chunks_and_cumulative_transfer() {
-    let local = ConnectLimits::try_new(
-        8 * 1024,
-        64 * 1024,
-        100,
-        32 * 1024,
-        8 * 1024,
-        48 * 1024,
-        1024,
-    )
-    .expect("local limits");
-    let peer = ConnectLimits::try_new(
-        16 * 1024,
-        32 * 1024,
-        200,
-        16 * 1024,
-        4 * 1024,
-        24 * 1024,
-        2048,
-    )
-    .expect("peer limits");
+fn wire_decode_rejects_unknown_fields_and_incompatible_versions() {
+    let envelope = fixture_envelope();
+    let unknown = UnknownEnvelopeField {
+        unknown: 1,
+        protocol_major: envelope.protocol_major,
+        protocol_minor: envelope.protocol_minor,
+        connection_id: envelope.connection_id,
+        session_id: envelope.session_id,
+        channel_id: envelope.channel_id,
+        channel: envelope.channel,
+        sequence: envelope.sequence,
+        request_id: envelope.request_id,
+        operation_id: envelope.operation_id,
+        limits: envelope.limits,
+        compression: envelope.compression,
+        privacy_class: envelope.privacy_class,
+        payload_kind: envelope.payload_kind,
+        payload_version: envelope.payload_version,
+        payload: envelope.payload.clone(),
+    };
+    let unknown_bytes = rmp_serde::to_vec_named(&unknown).expect("unknown field bytes");
+    assert!(ConnectEnvelope::decode(&unknown_bytes).is_err());
+
+    let mut incompatible = envelope;
+    incompatible.protocol_major = 2;
+    assert!(incompatible.encode().is_err());
+}
+
+#[test]
+fn negotiated_limits_bound_message_pages_chunks_and_cumulative_transfer() {
+    let local = ConnectLimits {
+        max_physical_frame_bytes: 8 * 1024,
+        max_reassembled_message_bytes: 64 * 1024,
+        max_page_items: 100,
+        max_page_encoded_bytes: 32 * 1024,
+        max_chunk_bytes: 8 * 1024,
+        max_cumulative_bytes: 48 * 1024,
+    };
+    let peer = ConnectLimits {
+        max_physical_frame_bytes: 16 * 1024,
+        max_reassembled_message_bytes: 32 * 1024,
+        max_page_items: 200,
+        max_page_encoded_bytes: 16 * 1024,
+        max_chunk_bytes: 4 * 1024,
+        max_cumulative_bytes: 24 * 1024,
+    };
     let negotiated = local.negotiate(peer).expect("negotiate limits");
     assert_eq!(negotiated.max_physical_frame_bytes, 8 * 1024);
     assert_eq!(negotiated.max_reassembled_message_bytes, 32 * 1024);
@@ -140,7 +183,6 @@ fn negotiated_limits_bound_pages_chunks_and_cumulative_transfer() {
     assert_eq!(negotiated.max_page_encoded_bytes, 16 * 1024);
     assert_eq!(negotiated.max_chunk_bytes, 4 * 1024);
     assert_eq!(negotiated.max_cumulative_bytes, 24 * 1024);
-    assert_eq!(negotiated.max_cursor_bytes, 1024);
 
     assert!(negotiated.validate_page(100, 16 * 1024).is_ok());
     assert!(negotiated.validate_page(101, 1).is_err());
@@ -149,6 +191,16 @@ fn negotiated_limits_bound_pages_chunks_and_cumulative_transfer() {
     assert!(negotiated.validate_chunk(4096, &[0; 4096]).is_ok());
     assert!(negotiated.validate_chunk(21 * 1024, &[0; 4096]).is_err());
     assert!(negotiated.validate_chunk(0, &[0; 4097]).is_err());
+
+    let mut oversized = fixture_envelope();
+    oversized.limits = negotiated;
+    oversized.payload = vec![0; 32 * 1024 + 1];
+    assert!(oversized.encode().is_err());
+    assert!(ConnectEnvelope::decode_with_limits(
+        &fixture_envelope().encode().expect("fixture bytes"),
+        negotiated,
+    )
+    .is_err());
 }
 
 #[test]
@@ -162,16 +214,14 @@ fn permission_evaluator_is_task_scoped_and_watcher_never_mutates() {
             role: ConnectRole::PairedOwner,
             task_id: None,
             action: ActionId::APPROVE_DANGEROUS,
-            credential: None,
         }),
-        PermissionDecision::Denied(PermissionDenyReason::DeviceCredentialRequired)
+        PermissionDecision::Allow
     );
     assert_eq!(
         evaluator.evaluate(PermissionRequest {
             role: ConnectRole::Watcher { task_id: task },
             task_id: Some(task),
             action: ActionId::READ_TASK,
-            credential: None,
         }),
         PermissionDecision::Allow
     );
@@ -180,47 +230,40 @@ fn permission_evaluator_is_task_scoped_and_watcher_never_mutates() {
             role: ConnectRole::Watcher { task_id: task },
             task_id: Some(task),
             action: ActionId::MUTATE_TASK,
-            credential: None,
         }),
-        PermissionDecision::Denied(PermissionDenyReason::WatcherReadOnly)
+        PermissionDecision::Denied(devmanager::connect::PermissionDenyReason::WatcherReadOnly)
     ));
     assert_eq!(
         evaluator.evaluate(PermissionRequest {
             role: ConnectRole::Collaborator { task_id: task },
             task_id: Some(task),
             action: ActionId::MUTATE_TASK,
-            credential: None,
         }),
         PermissionDecision::Allow
     );
     assert!(matches!(
         evaluator.evaluate(PermissionRequest {
-            role: ConnectRole::Collaborator {
-                task_id: other_task
-            },
-            task_id: Some(task),
+            role: ConnectRole::Collaborator { task_id: task },
+            task_id: Some(other_task),
             action: ActionId::MUTATE_TASK,
-            credential: None,
         }),
-        PermissionDecision::Denied(PermissionDenyReason::TaskScopeMismatch)
+        PermissionDecision::Denied(devmanager::connect::PermissionDenyReason::TaskScopeMismatch)
     ));
     assert!(matches!(
         evaluator.evaluate(PermissionRequest {
             role: ConnectRole::Collaborator { task_id: task },
             task_id: Some(task),
             action: ActionId::APPROVE_DANGEROUS,
-            credential: None,
         }),
-        PermissionDecision::Denied(PermissionDenyReason::OwnerOnly)
+        PermissionDecision::Denied(devmanager::connect::PermissionDenyReason::OwnerOnly)
     ));
     assert!(matches!(
         evaluator.evaluate(PermissionRequest {
             role: ConnectRole::Watcher { task_id: task },
             task_id: Some(task),
             action: ActionId::new(0x7fff).expect("unknown action"),
-            credential: None,
         }),
-        PermissionDecision::Denied(PermissionDenyReason::UnknownAction)
+        PermissionDecision::Denied(devmanager::connect::PermissionDenyReason::UnknownAction)
     ));
 }
 
@@ -261,7 +304,7 @@ impl ConnectTransport for MemoryTransport {
 
     fn send(&mut self, envelope: ConnectEnvelope) -> Result<(), Self::Error> {
         self.frames
-            .push_back(envelope.encode().expect("encode inner envelope"));
+            .push_back(encode_inner(&envelope).expect("encode inner envelope"));
         Ok(())
     }
 
@@ -269,7 +312,7 @@ impl ConnectTransport for MemoryTransport {
         Ok(self
             .frames
             .pop_front()
-            .map(|frame| ConnectEnvelope::decode(&frame).expect("decode inner")))
+            .map(|frame| decode_inner(&frame).expect("decode inner")))
     }
 
     fn close(&mut self) -> Result<(), Self::Error> {
@@ -279,10 +322,10 @@ impl ConnectTransport for MemoryTransport {
 }
 
 #[test]
-fn transport_trait_keeps_inner_semantics_identical() {
+fn transport_trait_keeps_direct_and_relay_inner_semantics_identical() {
     let envelope = fixture_envelope();
-    let direct_bytes = envelope.encode().expect("direct inner bytes");
-    let relay_bytes = envelope.encode().expect("relay inner bytes");
+    let direct_bytes = encode_inner(&envelope).expect("direct inner bytes");
+    let relay_bytes = encode_inner(&envelope).expect("relay inner bytes");
     assert_eq!(direct_bytes, relay_bytes);
 
     let mut transport = MemoryTransport {
@@ -358,10 +401,7 @@ fn projection_source_reuses_bounded_domain_pages_and_optional_extensions() {
     assert_eq!(snapshot.items.len(), 0);
     let mut oversized_snapshot = snapshot.clone();
     oversized_snapshot.next_cursor = Some(vec![0; MAX_CONNECT_RESUME_CURSOR_BYTES + 1]);
-    assert!(ConnectPayload::SnapshotPage(oversized_snapshot)
-        .validate(ConnectLimits::v1_default())
-        .is_err());
-
+    assert!(devmanager::connect::validate_snapshot_page(&oversized_snapshot, page_limits).is_err());
     let replay = source
         .event_page(ReplayRequest {
             task_id: Some(task_id(0x61)),
@@ -373,10 +413,7 @@ fn projection_source_reuses_bounded_domain_pages_and_optional_extensions() {
     assert_eq!(replay.after_sequence, 4);
     let mut oversized_replay = replay.clone();
     oversized_replay.next_cursor = Some(vec![0; MAX_CONNECT_RESUME_CURSOR_BYTES + 1]);
-    assert!(ConnectPayload::EventPage(oversized_replay)
-        .validate(ConnectLimits::v1_default())
-        .is_err());
-
+    assert!(devmanager::connect::validate_event_page(&oversized_replay, page_limits).is_err());
     let reply = source
         .query(QueryEnvelope {
             request_id: request_id(0x62),

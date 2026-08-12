@@ -22,8 +22,8 @@ pub use envelope::{
     ConnectIdError, ConnectLimitError, ConnectLimitField, ConnectLimits, ConnectPrivacyClass,
     ConnectionId, EnvelopeError, NegotiatedLimits, PayloadKind, PrivacyClass, SessionId,
     CONNECT_PROTOCOL_MAJOR, CONNECT_PROTOCOL_MINOR, MAX_CONNECT_CHUNK_BYTES,
-    MAX_CONNECT_CUMULATIVE_BYTES, MAX_CONNECT_CURSOR_BYTES, MAX_CONNECT_PAGE_ENCODED_BYTES,
-    MAX_CONNECT_PAGE_ITEMS, MAX_CONNECT_PHYSICAL_FRAME_BYTES,
+    MAX_CONNECT_CUMULATIVE_BYTES, MAX_CONNECT_CURSOR_BYTES, MAX_CONNECT_DIAGNOSTIC_BYTES,
+    MAX_CONNECT_PAGE_ENCODED_BYTES, MAX_CONNECT_PAGE_ITEMS, MAX_CONNECT_PHYSICAL_FRAME_BYTES,
     MAX_CONNECT_REASSEMBLED_MESSAGE_BYTES,
 };
 pub use identity::{
@@ -57,10 +57,10 @@ pub use policy::{
 };
 pub use presence::{EphemeralPresence, LastSenderHint, PresenceSink};
 pub use schema::{
-    canonical_artifact_content_page_size, canonical_event_page_size, canonical_snapshot_page_size,
-    payload_catalog, ChunkFrame, ConnectPayload, ErrorPayload, GenericExtensionPayload,
-    HelloPayload, KnownPayloadKind, OperationSettlementPayload, PayloadDescriptor, PayloadError,
-    UnknownPayload, CONNECT_PAYLOAD_SCHEMA_VERSION, PAYLOAD_CATALOG,
+    canonical_schema_fixtures, catalog_entry, encode_canonical_schema, payload_catalog,
+    CanonicalSchemaFixture, ChunkPayload, ConnectPayload, ErrorPayload, GenericExtensionPayload,
+    HelloPayload, OperationSettlementPayload, PayloadDecodeError, PayloadDescriptor, ResyncPayload,
+    ResyncReason, StreamDeltaPayload, CONNECT_PAYLOAD_SCHEMA_VERSION,
 };
 pub use telemetry::{
     encode_observation, ObservationAuthority, ObservationCompleteness, ObservationConfidence,
@@ -73,6 +73,7 @@ pub use telemetry::{
     OBSERVATION_SCHEMA_REVISION, OBSERVATION_STALE_AFTER_MS,
 };
 pub use transport::{
+    decode_inner, encode_inner, validate_event_page, validate_snapshot_page,
     BrowserExtensionDescriptor, ConnectRoute, ConnectTransport, ConnectTransportError,
     FramedConnectTransport, ProjectionError, ProjectionExtensions, ProjectionResponse,
     ProjectionSource, PromptExtensionDescriptor, ReplayRequest, SnapshotRequest,

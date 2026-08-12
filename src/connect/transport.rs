@@ -33,6 +33,14 @@ pub trait ConnectTransport {
     fn close(&mut self) -> Result<(), Self::Error>;
 }
 
+pub fn encode_inner(envelope: &ConnectEnvelope) -> Result<Vec<u8>, EnvelopeError> {
+    envelope.encode()
+}
+
+pub fn decode_inner(bytes: &[u8]) -> Result<ConnectEnvelope, EnvelopeError> {
+    ConnectEnvelope::decode(bytes)
+}
+
 #[derive(Debug)]
 pub enum ConnectTransportError {
     Closed,
