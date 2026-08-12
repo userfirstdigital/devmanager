@@ -22,6 +22,13 @@
   unrelated global Cargo or rustc processes. If a worker violates this rule,
   stop that exact worker tree, preserve its source diff, and move/clean only the
   verified generated target before continuing.
+- A delegated Cursor CLI wrapper is an owned long-lived process until its exact
+  wrapper and all descendants have exited. An agent response or source commit
+  is not proof that the Cursor wrapper stopped: it can continue executing a
+  queued Cargo command and can restart that command after the agent reports
+  completion. Before accepting delegated work, join or terminate the exact
+  Cursor wrapper tree and verify no descendant still references its worktree or
+  target directory.
 - Keep `persistence::app_config_dir()` fail-closed under `cfg(test)`. Unit tests
   must resolve beneath the process-unique test root and must never fall back to
   `%APPDATA%\com.userfirst.devmanager`.
@@ -33,6 +40,11 @@
   normally.
 - Do not set an external `DEVMANAGER_PROFILE` for the complete unit-test suite;
   individual profile-sensitive tests own and restore that variable.
+- Every Rust integration train must pass `cargo check --locked --lib --bins
+  --tests` in an isolated target before it is considered merge-ready. During a
+  large union, land bounded source waves and keep one compiler-tail owner; do
+  not defer compiler reconciliation across many independently source-clean
+  trains or start parallel all-target checks.
 - When work concerns persistence, runtime ownership, or process reporting,
   compare the production `config.json` and `remote.json` hashes before and
   after verification and confirm the installed DevManager PID and start time
