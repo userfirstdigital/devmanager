@@ -8427,7 +8427,7 @@ fn current_host_process_identity() -> Result<BrowserHostProcessIdentity, Browser
         .map_err(|_| BrowserNativeViewError::LiveWryObservationUnavailable)?;
     let creation_time = current_process_creation_time_100ns()
         .ok_or(BrowserNativeViewError::LiveWryObservationUnavailable)?;
-    BrowserHostProcessIdentity::new(pid, creation_time, executable)
+    BrowserHostProcessIdentity::new(pid, creation_time, executable.to_string_lossy().into_owned())
         .map_err(|_| BrowserNativeViewError::LiveWryObservationUnavailable)
 }
 

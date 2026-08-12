@@ -7970,7 +7970,7 @@ fn bind_runtime_provider_session_id(
         if session.provider_session_id.as_deref() == Some(provider_session_id.as_str()) {
             false
         } else {
-            session.provider_session_id = Some(provider_session_id.clone());
+            session.provider_session_id = Some(provider_session_id.to_string());
             session.mark_dirty();
             true
         }

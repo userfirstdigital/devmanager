@@ -358,7 +358,8 @@ impl BrowserGatewayRegistrar {
         let registrations = lock(&self.inner.registrations);
         let token = registrations.token_by_process.get(process_session_id)?;
         let active = registrations.by_token.get(token)?;
-        *lock(active.surface_binding.as_ref())
+        let binding = *lock(active.surface_binding.as_ref());
+        binding
     }
 
     pub fn clear_host_surface_binding(&self, process_session_id: &str) -> bool {

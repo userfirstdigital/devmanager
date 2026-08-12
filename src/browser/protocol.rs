@@ -281,10 +281,10 @@ mod live_surface_settlement_tests {
         let (_state, proof, task_id, context_id, generation) = live_proof();
         let request_id = BrowserRequestId::new();
         let (intent, hold) = hold_for(task_id, context_id, request_id, generation);
-        assert_eq!(
+        assert!(matches!(
             browser_service_authority_for_live_surface(&proof),
             Err(BrowserIntegrationHold::WebViewSurfaceAbsent)
-        );
+        ));
         assert_eq!(
             settle_accepted_browser_hold(None, &intent, &hold, &hello_with_projection()),
             Err(BrowserHoldSettleError::Hold(

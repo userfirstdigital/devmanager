@@ -331,7 +331,9 @@ fn release_native_window_lease(state: &BrowserNativeWindowLifetimeState) {
 
 #[cfg(test)]
 mod native_window_lifetime_tests {
-    use super::{BrowserAppExitDisposition, BrowserNativeWindowLifetime};
+    use super::{
+        BrowserAppExitDisposition, BrowserNativeWindowLifetime, BrowserNativeWindowPhase,
+    };
     use std::cell::Cell;
 
     trait ExhaustionOutcome {
