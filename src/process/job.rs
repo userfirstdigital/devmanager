@@ -1179,6 +1179,56 @@ fn create_windows_job(internal_name: &str) -> Result<ManagedProcessJob, String> 
     }
 }
 
+/// Opaque support guard for process-supervisor fixtures.
+///
+/// The caller transfers ownership of a [`std::process::Child`]; the managed
+/// Job is attached internally and is never exposed as a public type or
+/// reconstructed from a caller-supplied PID. Dropping the guard closes the
+/// owned Job first and then joins the Child through its process handle.
+#[doc(hidden)]
+pub struct ManagedChildGuard {
+    child: std::process::Child,
+    job: Option<ManagedProcessJob>,
+}
+
+impl ManagedChildGuard {
+    /// Attach one already-spawned Child to the process-supervisor Job.
+    ///
+    /// This is a test/support boundary only. If Job admission fails, the
+    /// owned Child handle is terminated and joined before the error returns,
+    /// so a failed fixture cannot orphan its process.
+    #[doc(hidden)]
+    pub fn attach(mut child: std::process::Child) -> Result<Self, String> {
+        let job = match attach_process_to_managed_job(child.id()) {
+            Ok(job) => job,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "attach child {} to kill-on-close Job Object: {error}",
+                    child.id()
+                ));
+            }
+        };
+        Ok(Self { child, job })
+    }
+
+    /// Borrow the owned Child handle for bounded fixture I/O and waiting.
+    #[doc(hidden)]
+    pub fn child_mut(&mut self) -> &mut std::process::Child {
+        &mut self.child
+    }
+}
+
+impl Drop for ManagedChildGuard {
+    fn drop(&mut self) {
+        // The Job must close before the Child handle is joined so all managed
+        // descendants are terminated by the same owned authority.
+        self.job.take();
+        let _ = self.child.wait();
+    }
+}
+
 #[cfg(windows)]
 fn attach_process_to_windows_job(pid: u32) -> Result<ManagedProcessJob, String> {
     unsafe {

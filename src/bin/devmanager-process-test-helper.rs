@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 #[cfg(windows)]
 use std::os::windows::io::{AsRawHandle, IntoRawHandle};
 
-use devmanager::process::job::ManagedProcessJob;
+use devmanager::process::job::ManagedChildGuard;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -173,47 +173,27 @@ fn mark_and_wait(marker: &Path) {
 }
 
 struct ChildTreeGuard {
-    children: Vec<Child>,
-    jobs: Vec<ManagedProcessJob>,
+    children: Vec<ManagedChildGuard>,
 }
 
 impl ChildTreeGuard {
     fn new() -> Self {
         Self {
             children: Vec::new(),
-            jobs: Vec::new(),
         }
     }
 
-    fn push(&mut self, mut child: Child) -> Result<(), String> {
-        let job = match devmanager::process::job::attach_process_to_managed_job(child.id()) {
-            Ok(job) => job,
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!(
-                    "attach child {} to kill-on-close Job Object: {error}",
-                    child.id()
-                ));
-            }
-        };
-        if let Some(job) = job {
-            self.jobs.push(job);
-        }
-        self.children.push(child);
+    fn push(&mut self, child: Child) -> Result<(), String> {
+        self.children.push(ManagedChildGuard::attach(child)?);
         Ok(())
     }
 }
 
 impl Drop for ChildTreeGuard {
     fn drop(&mut self) {
-        // Dropping the owned Job closes its kill-on-close fence. The Child
-        // handles are then joined for deterministic fixture settlement; no
-        // raw PID termination is used as a fallback.
-        self.jobs.clear();
-        for child in &mut self.children {
-            let _ = child.wait();
-        }
+        // Each opaque guard closes its owned Job before joining its Child;
+        // there is no raw-PID termination fallback.
+        self.children.clear();
     }
 }
 
@@ -233,6 +213,7 @@ fn spawn_child_and_wait(
         .first_mut()
         .ok_or_else(|| "child guard lost spawned child".to_string())?;
     child
+        .child_mut()
         .wait()
         .map_err(|error| format!("wait marker child: {error}"))?;
     guard.children.clear();
@@ -255,12 +236,11 @@ fn attempt_breakaway(result: &Path, escaped_marker: &Path) -> Result<(), String>
             let mut guard = ChildTreeGuard::new();
             guard.push(escaped)?;
             write_marker(result, format!("escaped:{escaped_id}"));
-            guard.jobs.clear();
             let escaped = guard
                 .children
                 .first_mut()
                 .ok_or_else(|| "child guard lost breakaway child".to_string())?;
-            let _ = escaped.wait();
+            let _ = escaped.child_mut().wait();
             guard.children.clear();
         }
         Err(error) => write_marker(result, format!("blocked:{:?}", error.kind())),
@@ -497,6 +477,7 @@ fn run_rapid_fork_exit(options: BoundedOptions) -> Result<(), String> {
     }
     for child in &mut guard.children {
         let status = child
+            .child_mut()
             .wait()
             .map_err(|error| format!("wait rapid-fork worker: {error}"))?;
         if !status.success() {
@@ -621,6 +602,7 @@ fn run_grandchild_lifetime(options: BoundedOptions) -> Result<(), String> {
         .children
         .first_mut()
         .ok_or_else(|| "child guard lost grandchild worker".to_string())?
+        .child_mut()
         .wait()
         .map_err(|error| format!("wait grandchild lifetime worker: {error}"))?;
     if !status.success() {
