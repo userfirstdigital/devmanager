@@ -4,9 +4,12 @@
 pub mod adapter;
 pub mod capabilities;
 pub mod claude;
+pub mod codex;
 pub mod cursor;
 pub mod input;
 pub mod journal;
+pub mod quota;
+pub mod orchestrator;
 pub mod registry;
 pub mod session;
 
@@ -44,10 +47,17 @@ pub use capabilities::{
     PROVIDER_OBSERVATION_SCHEMA_VERSION,
 };
 pub use cursor::CursorAdapter;
+pub use claude::ClaudeCodeAdapter;
+pub use codex::CodexAdapter;
 pub use journal::{
     JournalBackpressure, JournalEvent, JournalIngestOutcome, JournalLimits, JournalRedactionClass,
     JournalRejectReason, JournalSemanticKind, JournalVisibility, SemanticJournal,
     JOURNAL_SCHEMA_VERSION,
+};
+pub use quota::{
+    canonical_top_bar, AdapterQuotaSource, CanonicalQuotaBar, ProductionJitter, ProviderQuotaHost,
+    QuotaCacheKey, QuotaDiagnostic, QuotaJitterError, QuotaObserver, QuotaObserverConfig,
+    QuotaProbeLimiter, QuotaState, QuotaStripEntry, QuotaView,
 };
 pub use registry::{
     CacheStatus, CapabilityCacheKey, ExecutableInspector, FileSystemExecutableInspector,

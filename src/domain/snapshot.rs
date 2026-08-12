@@ -58,6 +58,21 @@ pub enum SnapshotSection {
 
 pub const MAX_SNAPSHOT_PAGE_ITEMS: u32 = 1_000;
 pub const MAX_SNAPSHOT_PAGE_ENCODED_BYTES: u32 = 512 * 1024;
+pub const QUOTA_DISPLAY_TTL_MS: u64 = 60 * 60 * 1000;
+
+/// Client snapshots omit a quota display value when it is at least one hour old,
+/// observed in the future, or observed after a clock rollback (`now < observed_at`).
+///
+/// Display cutover consumes `QuotaStripEntry` only. This helper redacts strip
+/// observations; it must not be applied to semantic replay `Status{usage}` as a
+/// second quota truth.
+pub fn omit_stale_quota_display<T>(observed_at: u64, now_ms: u64, display: T) -> Option<T> {
+    if now_ms < observed_at || now_ms.saturating_sub(observed_at) >= QUOTA_DISPLAY_TTL_MS {
+        None
+    } else {
+        Some(display)
+    }
+}
 
 /// Provider-neutral, bounded semantic payload retained by the journal. Raw
 /// provider envelopes and terminal bytes are deliberately not represented.
