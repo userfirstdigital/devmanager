@@ -6,6 +6,7 @@ pub mod cli;
 mod connection;
 mod host_client;
 pub mod model;
+pub mod port;
 pub mod subscription;
 
 pub use action::{
@@ -16,6 +17,11 @@ pub use cli::{dispatch_ctl_from_args, parse_ctl_args, run_ctl, CliError, CtlComm
 pub use connection::{connect, perform_client_hello, ClientConnection, UnsolicitedServerMessage};
 pub use host_client::{
     ArtifactContentBatch, EventReplayBatch, HostClient, HostClientConfig, TrackedOperation,
+};
+pub(crate) use host_client::track_accepted_receipt;
+pub use port::{
+    ApprovalAnswerCall, HostCommandPort, HostPortError, PromptMetadataItem, PromptMetadataPage,
+    PromptQueryCall, ProviderInputCall, TranscriptFetchCall,
 };
 pub use model::{ClientModel, ClientModelBuilder, ClientModelError};
 pub use subscription::{

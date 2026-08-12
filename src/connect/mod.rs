@@ -3,6 +3,8 @@
 //! and opaque relay tickets live here; production Noise stays on HOLD.
 
 mod crypto;
+mod deletion_ledger;
+mod direct;
 mod envelope;
 mod evidence;
 mod local_actions;
@@ -16,6 +18,7 @@ mod identity_codec;
 mod identity_store;
 mod invites;
 mod permission;
+mod permissions;
 mod policy;
 mod presence;
 mod projection;
@@ -39,6 +42,13 @@ pub use crypto::{
     ConnectCryptoHoldReason, ConnectCryptoPrologue, ConnectSealedFrame, EndToEndChannel,
     CONNECT_CRYPTO_PRODUCTION_READY, CONNECT_NOISE_FIRST_PAIRING_PATTERN,
     CONNECT_NOISE_PINNED_DEVICE_PATTERN,
+};
+pub use deletion_ledger::{DeletionLedgerEntry, DeletionStatus, DELETION_LEDGER};
+pub use direct::{
+    admit_direct_request, query_contains_pairing_secret, referer_contains_pairing_secret,
+    security_headers, DirectAdmitError, DirectBindMode, DirectBindPolicy, DirectPairingExchange,
+    DirectPairingLimiter, DirectPairingThrottle, DirectRequestView, MAX_DIRECT_FRAME_BYTES,
+    MAX_DIRECT_PAIRING_BODY_BYTES,
 };
 pub use envelope::{
     ChannelBinding, ChannelId, ChannelKind, ChunkContext, Compression, ConnectEnvelope,
@@ -87,6 +97,7 @@ pub use permission::{
     ActionId, AuthoritativePermissionContext, ConnectRole, KnownAction, PermissionDecision,
     PermissionDenyReason, PermissionEvaluator, PermissionRequest, ScopedPermissionGrant,
 };
+pub use permissions::{action_for_client_request, SessionAuthorizer, SessionPermissionContext};
 pub use policy::{
     ActiveSessionInterval, ActiveSessionIntervalError, ContentClass as ManagementContentClass,
     DeniedContentClass,
