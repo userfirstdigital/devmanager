@@ -1,6 +1,6 @@
-//! Contract-first Connect core. Network, identity, pairing persistence, and UI
-//! implementations remain later phase gates. Source-level end-to-end channel
-//! and opaque relay tickets live here; production Noise stays on HOLD.
+//! Local-first Connect core. Identity persistence binds to the profile kernel
+//! store, and production Noise XX/IK uses pinned `snow` with vault-supplied
+//! static keys. Source-level sealing exists only for contract tests.
 
 mod crypto;
 mod deletion_ledger;
@@ -32,9 +32,11 @@ mod update;
 mod watcher;
 
 pub use crypto::{
-    connect_prologue, lock_noise_pattern, preferred_connect_route, ConnectChannelKey,
-    ConnectChannelRole, ConnectCredentialPurpose, ConnectCryptoError, ConnectCryptoHold,
-    ConnectCryptoHoldReason, ConnectCryptoPrologue, ConnectSealedFrame, EndToEndChannel,
+    connect_prologue, lock_noise_pattern, preferred_connect_route, ConnectAuthenticatedPeer,
+    ConnectChannelKey, ConnectChannelRole, ConnectCredentialPurpose, ConnectCryptoError,
+    ConnectCryptoHold, ConnectCryptoHoldReason, ConnectCryptoPrologue, ConnectNoiseCustody,
+    ConnectNoiseHandshake, ConnectNoiseHandshakeMessage, ConnectNoiseIdentityBinding,
+    ConnectNoiseStaticPrivateKey, ConnectNoiseStaticPublicKey, ConnectSealedFrame, EndToEndChannel,
     CONNECT_CRYPTO_PRODUCTION_READY, CONNECT_NOISE_FIRST_PAIRING_PATTERN,
     CONNECT_NOISE_PINNED_DEVICE_PATTERN,
 };
@@ -79,7 +81,9 @@ pub use identity::{
     PAIRING_CODE_LEN,
 };
 pub use identity_store::{
-    IdentityPersistence, InMemoryIdentityPersistence, IsolatedRemoteStore, LoadedRemoteDocument,
+    ConnectProductionError, ConnectProductionSession, IdentityPersistence,
+    InMemoryIdentityPersistence, IsolatedRemoteStore, KernelIdentityPersistence,
+    LoadedRemoteDocument,
 };
 pub use invites::{
     guest_may_perform, ContentClass, InviteAuditEvent, InviteAuditKind, InviteError,
@@ -160,8 +164,8 @@ pub use transport::{
     decode_inner, encode_inner, validate_event_page, validate_snapshot_page,
     BrowserExtensionDescriptor, ConnectRoute, ConnectTransport, ConnectTransportError,
     FramedConnectTransport, ProjectionError, ProjectionExtensions, ProjectionResponse,
-    ProjectionSource, PromptExtensionDescriptor, ReplayRequest, SnapshotRequest,
-    MAX_CONNECT_RESUME_CURSOR_BYTES,
+    ProjectionSource, PromptExtensionDescriptor, ReplayRequest, SealedFramedConnectTransport,
+    SnapshotRequest, MAX_CONNECT_RESUME_CURSOR_BYTES,
 };
 pub use update::{PairingContinuity, UpdateContinuity, UpdateContinuityError};
 pub use watcher::{FleetWatcherView, TaskWatcherView, WatcherProjection};

@@ -33,12 +33,23 @@ Machine-checked against `Cargo.lock` by `packaging/Assert-ThirdPartyProvenance.p
 | `rcgen` | `0.13.2` | yes |
 | `sha2` | `0.10.9` | yes |
 | `hmac` | `0.12.1` | yes |
+| `snow` | `0.10.0` | yes |
 | `zeroize` | `1.8.2` | yes |
 | `web-push-native` | `0.4.0` | yes |
 | `getrandom` | `0.3.4` | yes |
 | `base64` | `0.22.1` | yes |
 
-Phase 9 Connect E2E may add a Noise core later; extend this table with the exact pinned crate versions when locked. Packaging must not embed private keys, pairing secrets, or OS-vault material.
+Connect production Noise is the pinned `snow` 0.10.0 crate listed above. Packaging must not embed private keys, pairing secrets, or OS-vault material.
+
+## snow 0.10.0 (Connect production Noise)
+
+- Source: `https://crates.io/crates/snow/0.10.0`
+- Upstream: `https://github.com/mcginty/snow`
+- Declared in `Cargo.toml` as `snow = { version = "=0.10.0", default-features = false, features = ["ring-accelerated", "use-aes-gcm", "use-blake2", "use-curve25519", "use-getrandom"] }`
+- License: Apache-2.0 OR MIT (crate metadata; no formal third-party audit claim)
+- Locked checksum: `599b506ccc4aff8cf7844bc42cf783009a434c1e26c964432560fb6d6ad02d82`
+- RustSec advisory RUSTSEC-2024-0011 (unauthenticated nonce increment on stateful `TransportState`) is patched in `snow >= 0.9.5`. This pin is 0.10.0.
+- This is a security-note/risk record, not an audit. Production Connect uses snow's Noise XX/IK implementation rather than a homemade HMAC substitute.
 
 ## caseless 0.2.2 and unicode-normalization 0.1.24
 

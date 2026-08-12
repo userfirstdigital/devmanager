@@ -1,33 +1,44 @@
 //! Isolated identity persistence facade.
 //!
-//! This slice exposes only an isolated in-memory persistence seam. It never
-//! follows filesystem paths, opens `%APPDATA%`, or claims OS/WebCrypto
-//! custody; a real production adapter remains an explicit future gate.
+//! Production custody binds to the profile-scoped kernel store under
+//! `app_config_dir()` / `kernel.sqlite3`. Tests may also use the in-memory
+//! seam. This module never follows caller-supplied filesystem paths or claims
+//! OS/WebCrypto vault authority.
 
 use std::fmt;
+use std::io::{Read, Write};
+use std::sync::{Arc, Mutex};
 
+use super::crypto::{
+    ConnectCryptoError, ConnectCryptoHold, ConnectNoiseCustody, ConnectNoiseHandshake,
+    ConnectNoiseIdentityBinding, ConnectNoiseStaticPublicKey, EndToEndChannel,
+    CONNECT_NOISE_FIRST_PAIRING_PATTERN, CONNECT_NOISE_PINNED_DEVICE_PATTERN,
+};
 use super::identity::{
     bind_device_credential_from_snapshot, current_epoch_ms, generate_transition_nonce,
     rotate_pairing_until_changed, seed_pairing_code, validate_device_record, BrowserPrivateStorage,
-    ConnectIdentity, CredentialVault, DeviceEstablishmentHandle, DeviceKeyProof, DeviceKind,
-    DeviceRecord, DeviceRepairHandle, HostEstablishmentHandle, HostIdentityRotation, HostKeyProof,
-    HostPublicId, HostRotationHandle, IdentityCommand, IdentityError, IdentityLimitField,
-    IdentityOp, IdentityReceipt, IdentitySetup, KeyReference, MachineBinding, PairingPurpose,
-    PendingIdentityTransition, PendingIdentityTransitionKind, PendingRevocationJournal,
-    RegisterDevice, RepairDevice, CONNECT_IDENTITY_SCHEMA_VERSION, MAX_IDENTITY_DEVICES,
-    MAX_IDENTITY_PHYSICAL_BYTES, MAX_IDENTITY_RECEIPTS, MAX_LABEL_BYTES,
+    ConnectIdentity, CredentialLocation, CredentialVault, DeviceEstablishmentHandle,
+    DeviceKeyProof, DeviceKind, DeviceRecord, DeviceRepairHandle, HostEstablishmentHandle,
+    HostIdentityRotation, HostKeyProof, HostPublicId, HostRotationHandle, IdentityCommand,
+    IdentityError, IdentityLimitField, IdentityOp, IdentityReceipt, IdentitySetup, KeyReference,
+    MachineBinding, PairingCode, PairingPurpose, PendingIdentityTransition,
+    PendingIdentityTransitionKind, PendingRevocationJournal, RegisterDevice, RepairDevice,
+    CONNECT_IDENTITY_SCHEMA_VERSION, MAX_IDENTITY_DEVICES, MAX_IDENTITY_PHYSICAL_BYTES,
+    MAX_IDENTITY_RECEIPTS, MAX_LABEL_BYTES,
 };
 use super::identity_codec::{
     decode_identity_bytes, device_receipt, empty_receipt, enable_receipt, encode_identity_document,
     host_rotation_receipt, pairing_receipt, scan_bounded_json, IdentityDocument,
 };
+use super::transport::{
+    ConnectLimits, ConnectRoute, ConnectTransportError, SealedFramedConnectTransport,
+};
+use crate::kernel::{KernelStore, StoreError};
 
 /// Isolated persistence seam used by this contract slice.
 ///
-/// The trait deliberately has no caller-supplied authority or production
-/// alias. This module has no production `remote.json` implementation; a
-/// future production adapter must be introduced behind an explicit reviewed
-/// boundary instead of claiming authority through this test seam.
+/// Production adapters must use [`KernelIdentityPersistence`] (profile-bound
+/// `KernelStore`). The in-memory implementation is `cfg(test)` only.
 pub trait IdentityPersistence {
     /// Monotonic persistence CAS epoch. A pending marker may consume an
     /// epoch without consuming the document's logical identity revision.
@@ -61,12 +72,14 @@ pub trait IdentityPersistence {
     ) -> Result<u64, IdentityError>;
 }
 
+#[cfg(test)]
 #[derive(Clone, Default)]
 pub struct InMemoryIdentityPersistence {
     bytes: Option<Vec<u8>>,
     revision: u64,
 }
 
+#[cfg(test)]
 impl fmt::Debug for InMemoryIdentityPersistence {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -77,6 +90,7 @@ impl fmt::Debug for InMemoryIdentityPersistence {
     }
 }
 
+#[cfg(test)]
 impl InMemoryIdentityPersistence {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, IdentityError> {
         if bytes.len() > MAX_IDENTITY_PHYSICAL_BYTES {
@@ -127,6 +141,7 @@ impl InMemoryIdentityPersistence {
     }
 }
 
+#[cfg(test)]
 impl IdentityPersistence for InMemoryIdentityPersistence {
     fn current_revision(&self) -> u64 {
         self.revision
@@ -207,6 +222,311 @@ impl InMemoryIdentityPersistence {
     }
 }
 
+/// Profile-bound Connect identity persistence over the durable kernel store.
+///
+/// Opens `app_config_dir()/kernel.sqlite3` through [`KernelStore`] so test
+/// builds stay under the process-unique config root and production builds use
+/// the active profile authority. Does not expose SQLite connections.
+#[derive(Clone)]
+pub struct KernelIdentityPersistence {
+    store: Arc<Mutex<KernelStore>>,
+}
+
+impl fmt::Debug for KernelIdentityPersistence {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("KernelIdentityPersistence(redacted)")
+    }
+}
+
+impl KernelIdentityPersistence {
+    /// Open the active profile's durable kernel store for Connect identity.
+    pub fn open_active_profile() -> Result<Self, IdentityError> {
+        let root = crate::persistence::app_config_dir().map_err(|_| IdentityError::Corrupt)?;
+        let path = root.join("kernel.sqlite3");
+        let store = KernelStore::open(&path).map_err(map_store_error)?;
+        Ok(Self {
+            store: Arc::new(Mutex::new(store)),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_path_for_test(path: &std::path::Path) -> Result<Self, IdentityError> {
+        let store = KernelStore::open(path).map_err(map_store_error)?;
+        Ok(Self {
+            store: Arc::new(Mutex::new(store)),
+        })
+    }
+
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, KernelStore>, IdentityError> {
+        self.store.lock().map_err(|_| IdentityError::Corrupt)
+    }
+}
+
+impl IdentityPersistence for KernelIdentityPersistence {
+    fn current_revision(&self) -> u64 {
+        self.lock()
+            .ok()
+            .and_then(|store| store.connect_identity_revision().ok())
+            .unwrap_or(0)
+    }
+
+    fn read_bounded(&self, max_bytes: usize) -> Result<Option<Vec<u8>>, IdentityError> {
+        let store = self.lock()?;
+        store
+            .read_connect_identity_bounded(max_bytes)
+            .map_err(map_store_error)
+    }
+
+    fn compare_and_swap(
+        &mut self,
+        expected_revision: u64,
+        bytes: &[u8],
+    ) -> Result<u64, IdentityError> {
+        if bytes.len() > MAX_IDENTITY_PHYSICAL_BYTES {
+            return Err(IdentityError::LimitExceeded {
+                field: IdentityLimitField::PhysicalBytes,
+            });
+        }
+        let mut store = self.lock()?;
+        let expected_bytes = store
+            .read_connect_identity_bounded(MAX_IDENTITY_PHYSICAL_BYTES)
+            .map_err(map_store_error)?;
+        store
+            .compare_and_swap_connect_identity(expected_revision, expected_bytes.as_deref(), bytes)
+            .map_err(map_store_error)
+    }
+
+    fn compare_and_swap_exact(
+        &mut self,
+        expected_revision: u64,
+        expected_bytes: Option<&[u8]>,
+        bytes: &[u8],
+    ) -> Result<u64, IdentityError> {
+        if bytes.len() > MAX_IDENTITY_PHYSICAL_BYTES {
+            return Err(IdentityError::LimitExceeded {
+                field: IdentityLimitField::PhysicalBytes,
+            });
+        }
+        let mut store = self.lock()?;
+        store
+            .compare_and_swap_connect_identity(expected_revision, expected_bytes, bytes)
+            .map_err(map_store_error)
+    }
+
+    fn replace_pending(
+        &mut self,
+        expected_revision: u64,
+        bytes: &[u8],
+    ) -> Result<u64, IdentityError> {
+        self.compare_and_swap(expected_revision, bytes)
+    }
+}
+
+impl IsolatedRemoteStore<KernelIdentityPersistence> {
+    /// Open production Connect identity persistence for the active profile.
+    pub fn open_active_profile() -> Result<Self, IdentityError> {
+        Ok(Self::from_persistence(
+            KernelIdentityPersistence::open_active_profile()?,
+        ))
+    }
+}
+
+/// Fail-closed production Connect host: profile KernelStore identity plus
+/// production-grade sealed transport. Construction never uses
+/// [`InMemoryIdentityPersistence`]. Construction never synthesizes a Noise
+/// static key from profile metadata.
+#[derive(Debug)]
+pub enum ConnectProductionError {
+    Identity(IdentityError),
+    Crypto(ConnectCryptoHold),
+    Channel(ConnectCryptoError),
+    Transport(ConnectTransportError),
+}
+
+impl fmt::Display for ConnectProductionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Identity(error) => error.fmt(formatter),
+            Self::Crypto(error) => error.fmt(formatter),
+            Self::Channel(error) => error.fmt(formatter),
+            Self::Transport(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for ConnectProductionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Identity(error) => Some(error),
+            Self::Crypto(error) => Some(error),
+            Self::Channel(error) => Some(error),
+            Self::Transport(error) => Some(error),
+        }
+    }
+}
+
+pub struct ConnectProductionSession {
+    store: IsolatedRemoteStore<KernelIdentityPersistence>,
+    custody: ConnectNoiseCustody,
+    profile_host_public_id: HostPublicId,
+}
+
+impl fmt::Debug for ConnectProductionSession {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ConnectProductionSession(redacted)")
+    }
+}
+
+impl ConnectProductionSession {
+    /// Open the active profile identity store, then fail closed because no
+    /// vault-backed Noise static key is supplied on this path.
+    pub fn open() -> Result<Self, ConnectProductionError> {
+        let _store = IsolatedRemoteStore::<KernelIdentityPersistence>::open_active_profile()
+            .map_err(ConnectProductionError::Identity)?;
+        match EndToEndChannel::open_production(CONNECT_NOISE_FIRST_PAIRING_PATTERN, true, false) {
+            Ok(_) => Err(ConnectProductionError::Crypto(ConnectCryptoHold {
+                reason: crate::protocol::CryptoHoldReason::MissingStaticKey,
+            })),
+            Err(hold) => Err(ConnectProductionError::Crypto(hold)),
+        }
+    }
+
+    /// Profile-bound production session that actually uses supplied custody.
+    ///
+    /// Requires a durable Connect identity on the active profile store. Does
+    /// not fall back to in-memory identity storage or derive keys from metadata.
+    pub fn open_with_custody(custody: ConnectNoiseCustody) -> Result<Self, ConnectProductionError> {
+        let store = IsolatedRemoteStore::<KernelIdentityPersistence>::open_active_profile()
+            .map_err(ConnectProductionError::Identity)?;
+        let profile_host_public_id = store
+            .require_active_profile_host()
+            .map_err(ConnectProductionError::Identity)?;
+        Ok(Self {
+            store,
+            custody,
+            profile_host_public_id,
+        })
+    }
+
+    pub fn profile_host_public_id(&self) -> HostPublicId {
+        self.profile_host_public_id
+    }
+
+    pub fn start_handshake(
+        &self,
+        pattern: &str,
+        first_pairing: bool,
+        expected_remote: Option<ConnectNoiseStaticPublicKey>,
+        prologue: crate::protocol::CryptoPrologue,
+        role: crate::protocol::ChannelRole,
+        identity: ConnectNoiseIdentityBinding,
+        now_unix: u64,
+        direct_reachable: bool,
+        revoked: bool,
+    ) -> Result<ConnectNoiseHandshake, ConnectProductionError> {
+        if identity.host_public_id() != *self.profile_host_public_id.as_bytes() {
+            return Err(ConnectProductionError::Identity(
+                IdentityError::CopiedProfile,
+            ));
+        }
+        EndToEndChannel::open_production_handshake(
+            pattern,
+            first_pairing,
+            &self.custody,
+            expected_remote,
+            prologue,
+            role,
+            identity,
+            now_unix,
+            direct_reachable,
+            revoked,
+        )
+        .map_err(ConnectProductionError::Crypto)
+    }
+
+    pub fn finish_channel(
+        handshake: ConnectNoiseHandshake,
+    ) -> Result<EndToEndChannel, ConnectProductionError> {
+        handshake
+            .finish()
+            .map(EndToEndChannel::from_noise_transport)
+            .map_err(ConnectProductionError::Channel)
+    }
+
+    pub fn identity_store(&self) -> &IsolatedRemoteStore<KernelIdentityPersistence> {
+        &self.store
+    }
+
+    pub fn bind_direct<T: Read + Write>(
+        &self,
+        io: T,
+        local: ConnectLimits,
+        peer: ConnectLimits,
+        channel: EndToEndChannel,
+    ) -> Result<SealedFramedConnectTransport<T>, ConnectProductionError> {
+        Self::sealed_direct(io, local, peer, channel)
+    }
+
+    pub fn bind_relay<T: Read + Write>(
+        &self,
+        io: T,
+        local: ConnectLimits,
+        peer: ConnectLimits,
+        channel: EndToEndChannel,
+    ) -> Result<SealedFramedConnectTransport<T>, ConnectProductionError> {
+        Self::sealed_relay(io, local, peer, channel)
+    }
+
+    /// Production direct send/receive path. Refuses source-level channels.
+    pub fn sealed_direct<T: Read + Write>(
+        io: T,
+        local: ConnectLimits,
+        peer: ConnectLimits,
+        channel: EndToEndChannel,
+    ) -> Result<SealedFramedConnectTransport<T>, ConnectProductionError> {
+        if channel.preferred_route() != ConnectRoute::Direct || !channel.is_production_grade() {
+            return Err(ConnectProductionError::Transport(
+                ConnectTransportError::Closed,
+            ));
+        }
+        SealedFramedConnectTransport::production(io, local, peer, channel)
+            .map_err(ConnectProductionError::Transport)
+    }
+
+    /// Production relay path: forward already-sealed frames only.
+    pub fn sealed_relay<T: Read + Write>(
+        io: T,
+        local: ConnectLimits,
+        peer: ConnectLimits,
+        channel: EndToEndChannel,
+    ) -> Result<SealedFramedConnectTransport<T>, ConnectProductionError> {
+        if channel.preferred_route() != ConnectRoute::Relay || !channel.is_production_grade() {
+            return Err(ConnectProductionError::Transport(
+                ConnectTransportError::Closed,
+            ));
+        }
+        SealedFramedConnectTransport::production(io, local, peer, channel)
+            .map_err(ConnectProductionError::Transport)
+    }
+}
+
+fn map_store_error(error: StoreError) -> IdentityError {
+    match error {
+        StoreError::ConstraintViolation => IdentityError::RevisionConflict,
+        StoreError::IntegerOutOfRange { .. } => IdentityError::Overflow,
+        StoreError::CodecMismatch { detail }
+            if detail.contains("connect identity exceeds")
+                || detail.contains("connect identity payload") =>
+        {
+            IdentityError::LimitExceeded {
+                field: IdentityLimitField::PhysicalBytes,
+            }
+        }
+        StoreError::Busy => IdentityError::RevisionConflict,
+        _ => IdentityError::Corrupt,
+    }
+}
+
 #[derive(Clone)]
 pub struct IsolatedRemoteStore<P> {
     persistence: P,
@@ -242,24 +562,30 @@ enum VaultTransition {
 }
 
 impl<P: IdentityPersistence + 'static> IsolatedRemoteStore<P> {
-    #[cfg(test)]
-    pub fn new(persistence: P) -> Result<Self, IdentityError> {
-        Ok(Self {
+    fn from_persistence(persistence: P) -> Self {
+        Self {
             persistence,
             claimed_owner: None,
-        })
+        }
     }
 
-    #[cfg(not(test))]
+    #[cfg(test)]
     pub fn new(persistence: P) -> Result<Self, IdentityError> {
-        // HOLD: Portal/relay/OS-vault production adapter is not in this slice.
-        // Debug apps are not test authority; in-memory cannot be custody.
-        let _ = persistence;
-        Err(IdentityError::ProductionStoreForbidden)
+        Ok(Self::from_persistence(persistence))
     }
 
     pub fn persistence(&self) -> &P {
         &self.persistence
+    }
+
+    fn require_active_profile_host(&self) -> Result<HostPublicId, IdentityError> {
+        let document = self.read_document()?;
+        if document.pending_revocation.is_some() || document.pending_transition.is_some() {
+            return Err(IdentityError::TransitionPending);
+        }
+        let identity = document.identity.ok_or(IdentityError::NotEnabled)?;
+        identity.validate_structure()?;
+        Ok(identity.host_public_id())
     }
 
     /// Mutable persistence is a debug/test-only fault-injection seam. A
@@ -2253,4 +2579,260 @@ fn decode_legacy_pairing_only(bytes: &[u8]) -> Result<IdentityDocument, Identity
         requires_explicit_reestablish: true,
         ..IdentityDocument::default()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn kernel_identity_persistence_cas_round_trip_and_stale_conflict() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("kernel.sqlite3");
+        let mut persistence =
+            KernelIdentityPersistence::open_path_for_test(&path).expect("open kernel identity");
+        assert_eq!(persistence.current_revision(), 0);
+        assert_eq!(
+            persistence
+                .read_bounded(MAX_IDENTITY_PHYSICAL_BYTES)
+                .expect("empty read"),
+            None
+        );
+
+        let first = br#"{"schemaVersion":1,"revision":1}"#;
+        let rev1 = persistence
+            .compare_and_swap_exact(0, None, first)
+            .expect("initial cas");
+        assert_eq!(rev1, 1);
+        assert_eq!(persistence.current_revision(), 1);
+        assert_eq!(
+            persistence
+                .read_bounded(MAX_IDENTITY_PHYSICAL_BYTES)
+                .expect("read"),
+            Some(first.to_vec())
+        );
+
+        let stale = persistence.compare_and_swap_exact(0, None, br#"stale"#);
+        assert!(matches!(stale, Err(IdentityError::RevisionConflict)));
+
+        let second = br#"{"schemaVersion":1,"revision":2}"#;
+        let rev2 = persistence
+            .compare_and_swap_exact(1, Some(first), second)
+            .expect("exact cas");
+        assert_eq!(rev2, 2);
+        assert_eq!(
+            persistence
+                .read_bounded(MAX_IDENTITY_PHYSICAL_BYTES)
+                .expect("read2"),
+            Some(second.to_vec())
+        );
+
+        let store = IsolatedRemoteStore::new(persistence).expect("wrap production path");
+        assert_eq!(store.persistence().current_revision(), 2);
+    }
+
+    #[test]
+    fn production_session_is_profile_bound_and_fail_closed_on_crypto() {
+        let root = crate::persistence::app_config_dir().expect("isolated test config");
+        let err = ConnectProductionSession::open().expect_err("production crypto hold");
+        assert!(
+            matches!(err, ConnectProductionError::Crypto(_)),
+            "got {err:?}"
+        );
+        let database = root.join("kernel.sqlite3");
+        assert!(
+            database.exists(),
+            "production open must use app_config_dir()/kernel.sqlite3"
+        );
+        assert_eq!(database.parent(), Some(root.as_path()));
+
+        let secret = crate::protocol::ChannelKey::from_bytes([3; 32]);
+        let prologue = crate::connect::crypto::connect_prologue(
+            crate::protocol::CredentialPurpose::OwnerPairing,
+            [1; 16],
+            [2; 16],
+        )
+        .expect("prologue");
+        let channel = EndToEndChannel::open_source_level(
+            secret,
+            prologue,
+            crate::protocol::ChannelRole::Initiator,
+            true,
+            1,
+            false,
+        )
+        .expect("source-level");
+        let limits = ConnectLimits::v1_default();
+        assert!(ConnectProductionSession::sealed_direct(
+            std::io::Cursor::new(Vec::<u8>::new()),
+            limits,
+            limits,
+            channel,
+        )
+        .is_err());
+        let relay = EndToEndChannel::open_source_level(
+            crate::protocol::ChannelKey::from_bytes([4; 32]),
+            prologue,
+            crate::protocol::ChannelRole::Responder,
+            false,
+            1,
+            false,
+        )
+        .expect("relay source-level");
+        assert!(ConnectProductionSession::sealed_relay(
+            std::io::Cursor::new(Vec::<u8>::new()),
+            limits,
+            limits,
+            relay,
+        )
+        .is_err());
+    }
+
+    fn persist_active_profile_identity() -> HostPublicId {
+        let mut store = IsolatedRemoteStore::<KernelIdentityPersistence>::open_active_profile()
+            .expect("open profile store");
+        let (current, expected_bytes) = store
+            .read_document_with_bytes()
+            .expect("read current identity");
+        if current.pending_transition.is_none() && current.pending_revocation.is_none() {
+            if let Some(identity) = current.identity.as_ref() {
+                if identity.validate_structure().is_ok() {
+                    return identity.host_public_id();
+                }
+            }
+        }
+        let host = HostPublicId::new();
+        let identity = ConnectIdentity {
+            schema_version: CONNECT_IDENTITY_SCHEMA_VERSION,
+            host_public_id: host,
+            host_key: KeyReference {
+                location: CredentialLocation::OsHostVault,
+                fingerprint: "ab".repeat(32),
+                generation: Some(1),
+            },
+            pairing_code: PairingCode::parse_valid("ABCDEFGH").expect("pairing"),
+            pairing_code_generation: 1,
+            pairing_purpose: PairingPurpose::OwnerDevice,
+            profile_binding_hash: MachineBinding::new("fixture-profile").binding_hash(),
+            last_seen_host_build: None,
+            created_at_epoch_ms: 1,
+            devices: Vec::new(),
+        };
+        let expected_revision = store.persistence().current_revision();
+        let document = IdentityDocument {
+            revision: current.revision.max(1),
+            cas_epoch: expected_revision.saturating_add(1),
+            identity: Some(identity),
+            ..IdentityDocument::default()
+        };
+        let encoded = encode_identity_document(&document).expect("encode identity");
+        store
+            .persistence_mut()
+            .compare_and_swap_exact(expected_revision, expected_bytes.as_deref(), &encoded)
+            .expect("persist durable identity");
+        host
+    }
+
+    #[test]
+    fn production_session_with_custody_runs_xx_handshake() {
+        let root = crate::persistence::app_config_dir().expect("isolated test config");
+        let missing = ConnectNoiseCustody::generate().expect("empty-profile custody");
+        match ConnectProductionSession::open_with_custody(missing) {
+            Err(ConnectProductionError::Identity(IdentityError::NotEnabled)) => {}
+            Ok(_) => {}
+            Err(err) => panic!("unexpected empty-profile error: {err:?}"),
+        }
+        let host = persist_active_profile_identity();
+        let initiator_keys = ConnectNoiseCustody::generate().expect("initiator");
+        let responder_keys = ConnectNoiseCustody::generate().expect("responder");
+        let initiator =
+            ConnectProductionSession::open_with_custody(initiator_keys).expect("initiator session");
+        let responder =
+            ConnectProductionSession::open_with_custody(responder_keys).expect("responder session");
+        assert_eq!(initiator.profile_host_public_id(), host);
+        assert_eq!(responder.profile_host_public_id(), host);
+        let binding = ConnectNoiseIdentityBinding::host(*host.as_bytes());
+        let mismatched = ConnectNoiseIdentityBinding::host([0x11; 16]);
+        assert!(matches!(
+            initiator.start_handshake(
+                CONNECT_NOISE_FIRST_PAIRING_PATTERN,
+                true,
+                None,
+                crate::connect::crypto::connect_prologue(
+                    crate::protocol::CredentialPurpose::OwnerPairing,
+                    [9; 16],
+                    [8; 16],
+                )
+                .expect("prologue"),
+                crate::protocol::ChannelRole::Initiator,
+                mismatched,
+                3,
+                true,
+                false,
+            ),
+            Err(ConnectProductionError::Identity(
+                IdentityError::CopiedProfile
+            ))
+        ));
+        let prologue = crate::connect::crypto::connect_prologue(
+            crate::protocol::CredentialPurpose::OwnerPairing,
+            [9; 16],
+            [8; 16],
+        )
+        .expect("prologue");
+        let mut initiator_hs = initiator
+            .start_handshake(
+                CONNECT_NOISE_FIRST_PAIRING_PATTERN,
+                true,
+                None,
+                prologue,
+                crate::protocol::ChannelRole::Initiator,
+                binding,
+                3,
+                true,
+                false,
+            )
+            .expect("start initiator");
+        let mut responder_hs = responder
+            .start_handshake(
+                CONNECT_NOISE_FIRST_PAIRING_PATTERN,
+                true,
+                None,
+                prologue,
+                crate::protocol::ChannelRole::Responder,
+                binding,
+                3,
+                true,
+                false,
+            )
+            .expect("start responder");
+        let msg1 = initiator_hs.write_message().expect("msg1");
+        responder_hs.read_message(&msg1).expect("read1");
+        let msg2 = responder_hs.write_message().expect("msg2");
+        initiator_hs.read_message(&msg2).expect("read2");
+        let msg3 = initiator_hs.write_message().expect("msg3");
+        responder_hs.read_message(&msg3).expect("read3");
+        let mut initiator_channel =
+            ConnectProductionSession::finish_channel(initiator_hs).expect("finish initiator");
+        let mut responder_channel =
+            ConnectProductionSession::finish_channel(responder_hs).expect("finish responder");
+        assert!(initiator_channel.is_production_grade());
+        let frame = initiator_channel
+            .seal_bytes(b"session-xx", [5; 16], 4)
+            .expect("seal");
+        assert_eq!(
+            responder_channel.open_bytes(&frame, 4).expect("open"),
+            b"session-xx"
+        );
+        let limits = ConnectLimits::v1_default();
+        assert!(ConnectProductionSession::sealed_direct(
+            std::io::Cursor::new(Vec::<u8>::new()),
+            limits,
+            limits,
+            initiator_channel,
+        )
+        .is_ok());
+        let _ = (root, CONNECT_NOISE_PINNED_DEVICE_PATTERN);
+    }
 }

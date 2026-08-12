@@ -24,13 +24,17 @@ pub use chunk::{
 };
 pub use control::{DetachAck, DetachRequest};
 pub use crypto::{
-    instantiate_noise_channel, validate_noise_pattern, ChannelKey, ChannelRole, CredentialPurpose,
-    CryptoError, CryptoHold, CryptoHoldReason, CryptoPrologue, ReplayWindow, SealedFrame,
-    SourceLevelSealer, CHANNEL_KEY_BYTES, CONNECT_CRYPTO_PROTOCOL, CRYPTO_PRODUCTION_READY,
-    MAX_CHANNEL_SEQUENCES, MAX_SEALED_FRAME_BYTES, MAX_SEALED_PLAINTEXT_BYTES,
-    MAX_SESSION_AGE_SECS, NOISE_FIRST_PAIRING_PATTERN, NOISE_PINNED_DEVICE_PATTERN,
-    REPLAY_WINDOW_SIZE, SEALED_FRAME_OVERHEAD_BYTES, SEALED_FRAME_VERSION, SEALED_NONCE_BYTES,
-    SEALED_TAG_BYTES,
+    generate_noise_static_keypair, instantiate_noise_channel, validate_noise_pattern,
+    AuthenticatedPeer, ChannelKey, ChannelRole, CredentialPurpose, CryptoError, CryptoHold,
+    CryptoHoldReason, CryptoPrologue, NoiseCustody, NoiseHandshake, NoiseHandshakeMessage,
+    NoiseIdentityBinding, NoiseStaticPrivateKey, NoiseStaticPublicKey, NoiseTransport,
+    ReplayWindow, SealedFrame, SourceLevelSealer, CHANNEL_KEY_BYTES, CONNECT_CRYPTO_PROTOCOL,
+    CRYPTO_PRODUCTION_READY, HANDSHAKE_FRAME_VERSION, MAX_CHANNEL_SEQUENCES,
+    MAX_HANDSHAKE_MESSAGE_BYTES, MAX_HANDSHAKE_PAYLOAD_BYTES, MAX_SEALED_FRAME_BYTES,
+    MAX_SEALED_PLAINTEXT_BYTES, MAX_SESSION_AGE_SECS, NOISE_AEAD_TAG_BYTES,
+    NOISE_FIRST_PAIRING_PATTERN, NOISE_IDENTITY_CLAIM_BYTES, NOISE_PINNED_DEVICE_PATTERN,
+    NOISE_STATIC_KEY_BYTES, REPLAY_WINDOW_SIZE, SEALED_FRAME_OVERHEAD_BYTES, SEALED_FRAME_VERSION,
+    SEALED_NONCE_BYTES, SEALED_TAG_BYTES,
 };
 pub use envelope::{
     personal_prompt_library_granted, BrowserProjectionEnvelope, BrowserProjectionEnvelopeError,
