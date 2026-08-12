@@ -1538,7 +1538,7 @@ fn task_service_cockpit_projection_excludes_foreign_task_scope() {
     let task_b = TaskId::parse("0198b6b0-0000-7000-8000-000000000002").expect("task b");
     let evidence = ServiceEvidence {
         lifecycle: LifecycleAxis::Stopped,
-        process: ProcessAxis::Stopped,
+        process: ProcessAxis::Absent,
         health: HealthAxis::Disabled,
         port: PortAxis::Free,
         ownership: OwnershipAxis::Host,
