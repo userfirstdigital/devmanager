@@ -1652,10 +1652,10 @@ $wanted = @(
     'Read-PreviewPublicationReceipt',
     'Assert-PreviewOutputMatchesPublicationReceipt'
 )
-$definitions = @($ast.FindAll({
+$definitions = @($ast.FindAll({{
     param($node)
     $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $wanted -contains $node.Name
-}, $true))
+}}, $true))
 if ($definitions.Count -ne $wanted.Count) {{ throw 'preview-runtime-test-functions-missing' }}
 foreach ($name in $wanted) {{
     $definition = $definitions | Where-Object Name -eq $name | Select-Object -First 1
