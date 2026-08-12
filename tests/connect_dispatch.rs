@@ -90,7 +90,7 @@ async fn connect_query_and_command_reach_existing_host_request_handle() {
     let env = envelope(binding, 2, Some(request_id), query.clone());
     let host = slot.get();
     let (reply, _) = session
-        .handle_payload(&env, query, host.as_ref())
+        .handle_payload(&env, query, host.as_deref())
         .await;
     refute_hold(&reply);
     let ConnectPayload::QueryReply(QueryReply {
@@ -113,7 +113,7 @@ async fn connect_query_and_command_reach_existing_host_request_handle() {
     });
     let env = envelope(binding, 3, Some(RequestId::new()), command.clone());
     let (reply, _) = session
-        .handle_payload(&env, command, host.as_ref())
+        .handle_payload(&env, command, host.as_deref())
         .await;
     refute_hold(&reply);
     let ConnectPayload::CommandReceipt(receipt) = reply else {
