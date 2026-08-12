@@ -3,13 +3,14 @@ use super::{
     classify_upload_path, effective_browser_risk, resource_id_from_uri,
     verified_authenticated_local_project_root, BrowserAction, BrowserActionTarget,
     BrowserAnnotationOperation, BrowserCommand, BrowserConsoleOperation, BrowserController,
-    BrowserDownloadOperation, BrowserElementRef, BrowserError, BrowserInvocationContext,
-    BrowserLocator, BrowserNetworkOperation, BrowserPerformanceOperation, BrowserRecipeInputKind,
-    BrowserRecipeLocator, BrowserRecordingOperation, BrowserReplayProjection,
-    BrowserReplayPublicInput, BrowserReplayRepairProjection, BrowserResourceStore, BrowserResponse,
-    BrowserRevision, BrowserRisk, BrowserScreenshotMode, BrowserTabSnapshot, BrowserWaitCondition,
-    BrowserWorkflowMcpService, BrowserWorkflowRepairApplyResult, BrowserWorkflowReplayStatus,
-    BrowserWorkflowServiceError, BrowserWorkspaceSnapshot,
+    BrowserDownloadOperation, BrowserElementRef, BrowserError, BrowserHostStatus,
+    BrowserInvocationContext, BrowserLocator, BrowserNetworkOperation, BrowserPerformanceOperation,
+    BrowserRecipeInputKind, BrowserRecipeLocator, BrowserRecordingOperation,
+    BrowserReplayProjection, BrowserReplayPublicInput, BrowserReplayRepairProjection,
+    BrowserResourceStore, BrowserResponse, BrowserRevision, BrowserRisk, BrowserScreenshotMode,
+    BrowserTabSnapshot, BrowserWaitCondition, BrowserWorkflowMcpService,
+    BrowserWorkflowRepairApplyResult, BrowserWorkflowReplayStatus, BrowserWorkflowServiceError,
+    BrowserWorkspaceSnapshot,
 };
 use base64::Engine as _;
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
@@ -236,7 +237,8 @@ impl<'de> Deserialize<'de> for BrowserRecordingRequest {
     {
         let value = Value::deserialize(deserializer)?;
         Ok(Self {
-            parsed: serde_json::from_value(value).map_err(|error| error.to_string()),
+            parsed: serde_json::from_value(value)
+                .map_err(|_| "malformed browser_recording request".to_string()),
         })
     }
 }
@@ -258,7 +260,8 @@ impl<'de> Deserialize<'de> for BrowserAnnotationsRequest {
     {
         let value = Value::deserialize(deserializer)?;
         Ok(Self {
-            parsed: serde_json::from_value(value).map_err(|error| error.to_string()),
+            parsed: serde_json::from_value(value)
+                .map_err(|_| "malformed browser_annotations request".to_string()),
         })
     }
 }
@@ -710,13 +713,13 @@ impl BrowserMcpServer {
             Ok(json!({
                 "ok": true,
                 "version": 1,
-                "host": status,
+                "host": compact_host_status(&status),
                 "workspace": self.context.controller.workspace_key(),
                 "paneOpen": snapshot.pane_open,
                 "revision": snapshot.revision,
                 "selectedTabId": snapshot.selected_tab_id,
                 "pendingWorkCount": self.context.controller.pending_work_count(),
-                "diagnostic": status.diagnostic,
+                "diagnostic": public_host_diagnostic(status.diagnostic.as_deref()),
             }))
         }
         .await;
@@ -732,10 +735,8 @@ impl BrowserMcpServer {
         Parameters(request): Parameters<BrowserAnnotationsRequest>,
     ) -> CallToolResult {
         let result = async {
-            let request = request.parsed.map_err(|message| {
-                ToolFailure::invalid_request(format!(
-                    "malformed browser_annotations request: {message}"
-                ))
+            let request = request.parsed.map_err(|_| {
+                ToolFailure::invalid_request("malformed browser_annotations request")
             })?;
             let context = invocation_context(&request.intent, request.risk)?;
             let annotation_id = match request.operation {
@@ -834,11 +835,9 @@ impl BrowserMcpServer {
         Parameters(request): Parameters<BrowserRecordingRequest>,
     ) -> CallToolResult {
         let result = async {
-            let request = request.parsed.map_err(|message| {
-                ToolFailure::invalid_request(format!(
-                    "malformed browser_recording request: {message}"
-                ))
-            })?;
+            let request = request
+                .parsed
+                .map_err(|_| ToolFailure::invalid_request("malformed browser_recording request"))?;
             if request.intent.len() > MAX_BROWSER_MCP_INTENT_BYTES {
                 return Err(ToolFailure::invalid_request(
                     "intent must be at most 1024 bytes",
@@ -1456,6 +1455,43 @@ fn is_text_resource(mime_type: &str) -> bool {
         || mime_type == "application/javascript"
 }
 
+const MAX_PUBLIC_BROWSER_STATUS_BYTES: usize = 64;
+const PUBLIC_BROWSER_DIAGNOSTIC: &str = "browser host reported a diagnostic";
+const PUBLIC_BROWSER_PLATFORMS: &[&str] = &[
+    "windows", "macos", "linux", "android", "ios", "freebsd", "openbsd", "netbsd",
+];
+
+fn public_host_diagnostic(diagnostic: Option<&str>) -> Option<&'static str> {
+    diagnostic.map(|_| PUBLIC_BROWSER_DIAGNOSTIC)
+}
+
+fn compact_host_status(status: &BrowserHostStatus) -> Value {
+    let platform = if status.platform.len() <= MAX_PUBLIC_BROWSER_STATUS_BYTES
+        && PUBLIC_BROWSER_PLATFORMS.contains(&status.platform.as_str())
+    {
+        status.platform.clone()
+    } else {
+        "unknown".to_string()
+    };
+    let version = status
+        .version
+        .as_deref()
+        .filter(|version| {
+            version.len() <= MAX_PUBLIC_BROWSER_STATUS_BYTES
+                && !version.is_empty()
+                && version.split('.').all(|component| {
+                    !component.is_empty() && component.bytes().all(|byte| byte.is_ascii_digit())
+                })
+        })
+        .map(str::to_string);
+    json!({
+        "available": status.available,
+        "platform": platform,
+        "version": version,
+        "diagnostic": public_host_diagnostic(status.diagnostic.as_deref()),
+    })
+}
+
 #[derive(Debug)]
 struct ToolFailure {
     code: &'static str,
@@ -1466,15 +1502,29 @@ impl ToolFailure {
     fn invalid_request(message: impl Into<String>) -> Self {
         Self {
             code: "invalid_request",
-            message: message.into(),
+            message: public_tool_message(message.into(), "browser request is invalid"),
         }
     }
 
     fn invalid_response(message: impl Into<String>) -> Self {
         Self {
             code: "crashed_view",
-            message: message.into(),
+            message: public_tool_message(message.into(), "browser host response is invalid"),
         }
+    }
+}
+
+fn public_tool_message(message: String, fallback: &'static str) -> String {
+    const MAX_MESSAGE_BYTES: usize = 256;
+    if message.len() <= MAX_MESSAGE_BYTES
+        && !message.bytes().any(|byte| byte < 0x20 || byte == 0x7f)
+        && !message.contains("://")
+        && !message.contains('\\')
+        && !message.contains('/')
+    {
+        message
+    } else {
+        fallback.to_string()
     }
 }
 
@@ -1497,6 +1547,8 @@ impl From<BrowserError> for ToolFailure {
             }
             BrowserError::RecordingResourceUnavailable => "recording_resource_unavailable",
             BrowserError::Interrupted => "user_interrupted",
+            BrowserError::InteractionEpochExhausted => "interaction_epoch_exhausted",
+            BrowserError::CancellationEpochExhausted => "cancellation_epoch_exhausted",
             BrowserError::Timeout { .. } => "timeout",
             BrowserError::NavigationFailure { .. } => "navigation_failure",
             BrowserError::InitializingView { .. } => "initializing_view",
@@ -1508,7 +1560,7 @@ impl From<BrowserError> for ToolFailure {
         };
         Self {
             code,
-            message: error.to_string(),
+            message: error.public_message().to_string(),
         }
     }
 }
@@ -1815,6 +1867,33 @@ mod tests {
         assert!(!format!("{request:?}").contains(SENTINEL));
     }
 
+    #[test]
+    fn browser_publication_redacts_raw_errors_and_diagnostics() {
+        const SENTINEL: &str = "mcp-path-url-attacker-sentinel";
+        let error = BrowserError::NavigationFailure {
+            url: format!("https://example.invalid/{SENTINEL}"),
+            message: format!(r#"open C:\secret\{SENTINEL}"#),
+        };
+        let body = into_tool_result(Err(ToolFailure::from(error)))
+            .structured_content
+            .expect("typed MCP error");
+        let encoded = serde_json::to_string(&body).expect("encode typed MCP error");
+        assert!(!encoded.contains(SENTINEL));
+        assert!(encoded.len() < 512);
+
+        let status = BrowserHostStatus {
+            available: false,
+            platform: SENTINEL.to_string(),
+            version: Some(format!("https://{SENTINEL}")),
+            diagnostic: Some(format!(r#"C:\secret\{SENTINEL}"#)),
+        };
+        let public = compact_host_status(&status);
+        let encoded = serde_json::to_string(&public).expect("encode host status");
+        assert!(!encoded.contains(SENTINEL));
+        assert!(!format!("{status:?}").contains(SENTINEL));
+        assert_eq!(public["diagnostic"], PUBLIC_BROWSER_DIAGNOSTIC);
+    }
+
     #[tokio::test]
     async fn recording_rejects_unc_root_before_all_six_operations_or_lifecycle_effects() {
         let (bridge, mut inbox) = browser_command_channel(16);
@@ -1839,7 +1918,8 @@ mod tests {
         let host_observed = Arc::clone(&observed);
 
         let host = async move {
-            let mut state = BrowserHostState::new(PathBuf::from("root-fence-fake-host"));
+            let mut state = BrowserHostState::new(PathBuf::from("root-fence-fake-host"))
+                .expect("browser host state");
             while let Some(request) = inbox.recv().await {
                 let key = request.workspace_key().clone();
                 let command = request.command().clone();

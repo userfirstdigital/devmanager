@@ -7,11 +7,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::domain::agent::ProviderSessionId;
+use crate::domain::browser::BrowserIntegrationHold;
 use crate::domain::command::{CommandReceipt, RejectionCode};
 use crate::domain::event::Event;
 use crate::domain::id::{
-    AgentSessionId, ApprovalId, ClientId, CommandId, EventId, OperationId, QuestionId, ResourceId,
-    TaskId, TurnId,
+    AgentSessionId, ApprovalId, BrowserContextId, BrowserRequestId, ClientId, CommandId, EventId,
+    OperationId, QuestionId, ResourceId, TaskId, TurnId,
 };
 use crate::domain::operation::ResourceFence;
 use crate::domain::provider_input::{ProviderInputAction, ProviderKind};
@@ -30,6 +31,7 @@ pub enum DestinationClass {
     TaskTeardown,
     ResourceRelease,
     ProviderInput,
+    BrowserHost,
 }
 
 impl DestinationClass {
@@ -38,6 +40,7 @@ impl DestinationClass {
             Self::TaskTeardown => "task_teardown",
             Self::ResourceRelease => "resource_release",
             Self::ProviderInput => "provider_input",
+            Self::BrowserHost => "browser_host",
         }
     }
 
@@ -46,6 +49,7 @@ impl DestinationClass {
             "task_teardown" => Ok(Self::TaskTeardown),
             "resource_release" => Ok(Self::ResourceRelease),
             "provider_input" => Ok(Self::ProviderInput),
+            "browser_host" => Ok(Self::BrowserHost),
             other => Err(StoreError::CodecMismatch {
                 detail: format!("unknown destination_class '{other}'"),
             }),
@@ -110,6 +114,38 @@ pub enum Effect {
         action: ProviderInputAction,
         wait: bool,
     },
+    HoldBrowserHost {
+        task_id: TaskId,
+        action_epoch: u64,
+        request_id: BrowserRequestId,
+        context_id: BrowserContextId,
+        generation: u64,
+        hold: BrowserIntegrationHold,
+    },
+}
+
+impl Effect {
+    pub fn browser_host_hold_identity(
+        &self,
+    ) -> Option<(TaskId, u64, BrowserRequestId, BrowserContextId, u64)> {
+        match self {
+            Self::HoldBrowserHost {
+                task_id,
+                action_epoch,
+                request_id,
+                context_id,
+                generation,
+                ..
+            } => Some((
+                *task_id,
+                *action_epoch,
+                *request_id,
+                *context_id,
+                *generation,
+            )),
+            _ => None,
+        }
+    }
 }
 
 /// Accepted-operation fence shared by every planned effect for one command.
@@ -320,6 +356,54 @@ pub(crate) fn plan_effects(
                     },
                 });
             }
+            Event::Browser(fact) => match fact {
+                crate::domain::browser::BrowserDurableFact::RequestAccepted {
+                    request_id,
+                    task_id: fact_task,
+                    context_id,
+                    generation,
+                    action,
+                    action_epoch,
+                    ..
+                } if action.requires_host_settlement() => {
+                    if *fact_task != task_id {
+                        return Err(StoreError::Projection(
+                            "browser host HOLD task scope mismatch".into(),
+                        ));
+                    }
+                    if *generation == 0 {
+                        return Err(StoreError::Projection(
+                            "browser host HOLD generation must be nonzero".into(),
+                        ));
+                    }
+                    effect_fact_count = effect_fact_count
+                        .checked_add(1)
+                        .ok_or(StoreError::Corruption)?;
+                    planned.push(PlannedEffect {
+                        document: PlannedEffectDocument::new(
+                            Effect::HoldBrowserHost {
+                                task_id,
+                                action_epoch: *action_epoch,
+                                request_id: *request_id,
+                                context_id: *context_id,
+                                generation: *generation,
+                                hold: crate::domain::browser::BrowserIntegrationHold::WebViewSurfaceAbsent,
+                            },
+                            ReplayPolicy::NoAutomaticRetry,
+                        ),
+                        fence: OperationFence {
+                            action_epoch: Some(*action_epoch),
+                            resource_id: None,
+                            runtime_generation: None,
+                        },
+                    });
+                }
+                _ => {
+                    pure_fact_count = pure_fact_count
+                        .checked_add(1)
+                        .ok_or(StoreError::Corruption)?;
+                }
+            },
             Event::TaskCreated { .. }
             | Event::TaskRenamed { .. }
             | Event::TaskAttentionSet { .. }
@@ -390,6 +474,7 @@ impl Effect {
             Self::BeginTaskTeardown { .. } => DestinationClass::TaskTeardown,
             Self::ReleaseResource { .. } => DestinationClass::ResourceRelease,
             Self::DeliverProviderInput { .. } => DestinationClass::ProviderInput,
+            Self::HoldBrowserHost { .. } => DestinationClass::BrowserHost,
         }
     }
 }
@@ -904,6 +989,7 @@ mod tests {
             artifacts: BTreeMap::new(),
             resources,
             provider_sessions: BTreeMap::new(),
+            browser: crate::domain::browser::BrowserBook::new(),
         };
 
         let close = plan_effects(

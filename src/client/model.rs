@@ -1195,6 +1195,20 @@ impl ClientModel {
             .search_task_ids_with_work(query, archived)
     }
 
+    /// Native dock chrome may read Task identity from the client model.
+    /// This is not a BrowserService settle path and carries no HWND/pixels.
+    pub fn browser_dock_view(&self, task_id: TaskId) -> Option<ClientBrowserDockView> {
+        self.tasks
+            .get(&task_id)
+            .map(|snapshot| ClientBrowserDockView {
+                task_id,
+                title: snapshot.task.title.clone(),
+                generation: None,
+                shareable_url: None,
+                tab_count: 0,
+            })
+    }
+
     /// Shared bound check for frozen replay continuation cursors/pages.
     pub fn check_replay_continuation_bounds(
         page_count: usize,
@@ -1741,6 +1755,11 @@ impl ClientModelBuilder {
                     artifacts: BTreeMap::new(),
                     resources: BTreeMap::new(),
                     provider_sessions: BTreeMap::new(),
+                    browser: {
+                        let mut browser = crate::domain::browser::BrowserBook::new();
+                        let _ = browser.open_task(task_id);
+                        browser
+                    },
                 },
             );
         }
@@ -1871,6 +1890,51 @@ impl ClientModelBuilder {
             _ => return Err(ClientModelError::SectionItemMismatch),
         }
         Ok(())
+    }
+}
+
+/// Presentation-only browser dock DTO. Assembled from Task identity or
+/// bounded browser snapshot pages; never a host-effect settler.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientBrowserDockView {
+    pub task_id: TaskId,
+    pub title: String,
+    pub generation: Option<u64>,
+    pub shareable_url: Option<String>,
+    pub tab_count: usize,
+}
+
+impl ClientBrowserDockView {
+    pub fn from_browser_pages(
+        task_id: TaskId,
+        pages: &[crate::domain::browser::BrowserSnapshotPage],
+    ) -> Result<Self, ClientModelError> {
+        let mut generation = None;
+        let mut shareable_url = None;
+        let mut tab_count = 0;
+        for page in pages {
+            for row in &page.items {
+                if row.task_id() != Some(task_id) {
+                    return Err(ClientModelError::InvalidOwnership);
+                }
+                if let Some(row_generation) = row.generation() {
+                    generation = Some(row_generation);
+                }
+                if let Some(url) = row.shareable_url() {
+                    shareable_url = Some(url);
+                }
+                if row.tab_id().is_some() && !row.closed() {
+                    tab_count = tab_count.saturating_add(1);
+                }
+            }
+        }
+        Ok(Self {
+            task_id,
+            title: String::new(),
+            generation,
+            shareable_url,
+            tab_count,
+        })
     }
 }
 

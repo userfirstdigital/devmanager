@@ -1394,6 +1394,7 @@ pub(crate) fn encode_event_payload(event: &Event) -> Result<Vec<u8>, StoreError>
             question_id: *question_id,
             approval_id: *approval_id,
         }),
+        Event::Browser(fact) => rmp_serde::to_vec(fact),
     }
     .map_err(|e| StoreError::EventDecode(e.to_string()))?;
     if event.event_type().starts_with("provider_input.")
@@ -1609,6 +1610,10 @@ pub(crate) fn decode_stored_event(
                 question_id: p.question_id,
                 approval_id: p.approval_id,
             }
+        }
+        "browser.fact" => {
+            let fact: crate::domain::browser::BrowserDurableFact = unpack(payload)?;
+            Event::Browser(fact)
         }
         other => {
             return Err(StoreError::CodecMismatch {
@@ -2355,6 +2360,9 @@ fn pending_dispatch_is_authorized(
     row: &OutboxRow,
     replay_policy: ReplayPolicy,
 ) -> Result<bool, StoreError> {
+    if matches!(replay_policy, ReplayPolicy::NoAutomaticRetry) {
+        return Ok(false);
+    }
     if row.attempts == 0 {
         return Ok(true);
     }

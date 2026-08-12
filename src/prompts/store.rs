@@ -1267,7 +1267,7 @@ fn validate_prompt_lineage_creation_commitment(
             "prompt lineage migration creation commitment is missing".into(),
         ));
     };
-    if migration_version != 9 || !(0..=1).contains(&initial_blocked) || committed_token.len() != 32
+    if migration_version != 12 || !(0..=1).contains(&initial_blocked) || committed_token.len() != 32
     {
         return Err(PromptStoreError::Corruption(
             "prompt lineage migration creation commitment is invalid".into(),

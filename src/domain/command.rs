@@ -4,6 +4,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::domain::agent::{AgentSessionFacts, AgentSessionLifecycle};
 use crate::domain::artifact::ArtifactFacts;
+use crate::domain::browser::{BrowserContractError, BrowserRequest};
 use crate::domain::event::Event;
 use crate::domain::id::{
     AgentSessionId, ClientId, CommandId, EnvironmentId, EventId, OperationId, ProjectId,
@@ -956,6 +957,7 @@ pub enum Command {
     /// Journal ingress only. Host `ClientRequest` rejects this variant.
     SettleProviderWait(SettleProviderWaitIntent),
     PromptLibrary(PromptCommand),
+    Browser(BrowserRequest),
 }
 
 /// Canonical SHA-256 over client, task, expected revision, and command.
@@ -1126,6 +1128,37 @@ pub fn decide(
             decide_settle_provider_wait(snapshot, envelope, intent)
         }
         Command::PromptLibrary(_) => Err(RejectionCode::InvalidTransition),
+        Command::Browser(request) => decide_browser(snapshot, envelope, request),
+    }
+}
+
+fn decide_browser(
+    snapshot: Option<&TaskSnapshot>,
+    envelope: &CommandEnvelope,
+    request: &BrowserRequest,
+) -> Result<Vec<Event>, RejectionCode> {
+    let snap = require_runtime_capable_task(snapshot, envelope)?;
+    require_expected_revision(snap, envelope)?;
+    if request.task_id != snap.task.id {
+        return Err(RejectionCode::OwnershipConflict);
+    }
+    let mut accepted = snap
+        .browser
+        .plan_admit(request)
+        .map_err(browser_rejection)?;
+    accepted.bind_command(envelope.command_id, snap.task.action_epoch);
+    Ok(accepted.facts.into_iter().map(Event::Browser).collect())
+}
+
+fn browser_rejection(error: BrowserContractError) -> RejectionCode {
+    match error {
+        BrowserContractError::CrossTask => RejectionCode::OwnershipConflict,
+        BrowserContractError::GenerationMismatch
+        | BrowserContractError::ClosedTask
+        | BrowserContractError::IdempotencyConflict
+        | BrowserContractError::BoundExceeded
+        | BrowserContractError::InvalidRequest
+        | BrowserContractError::HostEffectUnavailable => RejectionCode::InvalidTransition,
     }
 }
 

@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod artifact;
+pub mod browser;
 pub(crate) mod canonical;
 pub mod codec;
 pub mod command;
@@ -7,6 +8,7 @@ pub mod event;
 pub mod host;
 pub mod id;
 pub mod operation;
+pub mod org;
 pub mod provider_input;
 pub mod query;
 pub mod resource;
@@ -39,10 +41,11 @@ pub use host::{
     HostQuitResourceBlocker, HostQuitWorktreeInspection,
 };
 pub use id::{
-    AgentSessionId, ApprovalId, ArtifactId, BrowserContextId, ClientId, CommandId, EnvironmentId,
-    EventId, IdError, OperationId, OutboxId, ProjectId, PromptChainId, PromptChainLinkId,
-    PromptHistoryId, PromptId, PromptVersionId, QuestionId, RequestId, ResourceId, ServiceId,
-    SnapshotId, SubscriptionId, TaskId, TerminalId, TransferId, TurnId,
+    AgentSessionId, ApprovalId, ArtifactId, BrowserContextId, BrowserRequestId, BrowserSessionId,
+    BrowserTabId, ClientId, CommandId, EnvironmentId, EventId, IdError, OperationId, OutboxId,
+    ProjectId, PromptChainId, PromptChainLinkId, PromptHistoryId, PromptId, PromptVersionId,
+    QuestionId, RequestId, ResourceId, ServiceId, SnapshotId, SubscriptionId, TaskId, TaskInviteId,
+    TerminalId, TransferId, TurnId,
 };
 pub use operation::{
     validate_outcome_fence, validate_source_for_kind, validate_terminal_fact_source,
@@ -50,6 +53,7 @@ pub use operation::{
     OperationState, OperationUncertaintyCode, OutcomeFenceError, OutcomeSource, ResourceFence,
     MAX_EXTERNAL_IDENTITY_BYTES,
 };
+pub use org::{ManagedScope, TaskScope};
 pub use provider_input::{
     validate_provider_fence, PresentProviderApprovalIntent, PresentProviderQuestionIntent,
     ProviderDeliveryHoldReason, ProviderDeliveryVisibility, ProviderFenceContext,
@@ -66,10 +70,11 @@ pub use resource::{
     ResourceValidationError,
 };
 pub use snapshot::{
-    ArtifactContentPage, EventPage, PageLimits, PageLimitsError, SemanticJournalFact,
-    SemanticJournalPage, SemanticJournalPayload, SnapshotItem, SnapshotItemKey, SnapshotPage,
-    SnapshotSection, TaskSnapshot, TaskSnapshotItem, MAX_SNAPSHOT_PAGE_ENCODED_BYTES,
-    MAX_SNAPSHOT_PAGE_ITEMS,
+    canonical_artifact_content_page_size, canonical_event_page_size, canonical_snapshot_page_size,
+    ArtifactContentPage, CanonicalPageSizeError, EventPage, PageLimits, PageLimitsError,
+    SemanticJournalFact, SemanticJournalPage, SemanticJournalPayload, SnapshotItem,
+    SnapshotItemKey, SnapshotPage, SnapshotSection, TaskSnapshot, TaskSnapshotItem,
+    MAX_SNAPSHOT_PAGE_ENCODED_BYTES, MAX_SNAPSHOT_PAGE_ITEMS,
 };
 pub use task::{
     RepositoryFingerprint, ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention,

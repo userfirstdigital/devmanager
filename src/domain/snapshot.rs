@@ -8,9 +8,11 @@ use serde::{Deserialize, Serialize};
 use crate::domain::agent::AgentSessionFacts;
 use crate::domain::artifact::PrivacyClass;
 use crate::domain::artifact::{ArtifactFacts, ArtifactSummary};
+use crate::domain::browser::{BrowserBook, BrowserContextView, BrowserTabView};
 use crate::domain::event::DomainEvent;
 use crate::domain::id::{
-    AgentSessionId, ArtifactId, EventId, OperationId, ResourceId, SnapshotId, TaskId,
+    AgentSessionId, ArtifactId, BrowserContextId, BrowserTabId, EventId, OperationId, ResourceId,
+    SnapshotId, TaskId,
 };
 use crate::domain::operation::OperationFacts;
 use crate::domain::provider_input::ProviderSessionProjection;
@@ -31,9 +33,18 @@ pub struct TaskSnapshot {
     pub artifacts: BTreeMap<ArtifactId, ArtifactFacts>,
     pub resources: BTreeMap<ResourceId, ResourceFacts>,
     pub provider_sessions: BTreeMap<AgentSessionId, ProviderSessionProjection>,
+    pub browser: BrowserBook,
 }
 
 impl TaskSnapshot {
+    pub fn browser_context(&self, context_id: BrowserContextId) -> Option<BrowserContextView> {
+        self.browser.context_view(context_id)
+    }
+
+    pub fn browser_tab(&self, tab_id: BrowserTabId) -> Option<BrowserTabView> {
+        self.browser.tab_view(tab_id)
+    }
+
     pub fn visible_status(&self) -> VisibleTaskStatus {
         VisibleTaskStatus::derive(
             self.connectivity,
@@ -54,6 +65,8 @@ pub enum SnapshotSection {
     Artifacts,
     Resources,
     Operations,
+    BrowserContexts,
+    BrowserTabs,
 }
 
 pub const MAX_SNAPSHOT_PAGE_ITEMS: u32 = 1_000;
@@ -238,6 +251,8 @@ pub enum SnapshotItemKey {
     Artifact(ArtifactId),
     Resource(ResourceId),
     Operation(OperationId),
+    BrowserContext(BrowserContextId),
+    BrowserTab(BrowserTabId),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -259,6 +274,8 @@ pub enum SnapshotItem {
     Artifact(ArtifactSummary),
     Resource(ResourceFacts),
     Operation(OperationFacts),
+    BrowserContext(BrowserContextView),
+    BrowserTab(BrowserTabView),
 }
 
 /// One page from one immutable snapshot view.
@@ -328,6 +345,83 @@ pub struct ArtifactContentPage {
     pub payload: Vec<u8>,
     pub encoded_bytes: u32,
     pub next_cursor: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CanonicalPageSizeError {
+    Encode { detail: String },
+    TooLarge { encoded_bytes: usize },
+    DidNotConverge,
+}
+
+impl fmt::Display for CanonicalPageSizeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Encode { detail } => write!(f, "canonical page encode failed: {detail}"),
+            Self::TooLarge { encoded_bytes } => write!(
+                f,
+                "canonical page encoded length {encoded_bytes} does not fit u32"
+            ),
+            Self::DidNotConverge => write!(f, "canonical page encoded length did not converge"),
+        }
+    }
+}
+
+impl std::error::Error for CanonicalPageSizeError {}
+
+const CANONICAL_PAGE_SIZE_MAX_PASSES: usize = 8;
+
+fn canonical_fixed_point_page_size<T, F>(
+    page: &T,
+    mut set_encoded_bytes: F,
+) -> Result<u32, CanonicalPageSizeError>
+where
+    T: Clone + Serialize,
+    F: FnMut(&mut T, u32),
+{
+    let mut encoded_bytes = 0u32;
+    for _ in 0..CANONICAL_PAGE_SIZE_MAX_PASSES {
+        let mut final_page = page.clone();
+        set_encoded_bytes(&mut final_page, encoded_bytes);
+        let encoded = rmp_serde::to_vec_named(&final_page).map_err(|error| {
+            CanonicalPageSizeError::Encode {
+                detail: error.to_string(),
+            }
+        })?;
+        let actual =
+            u32::try_from(encoded.len()).map_err(|_| CanonicalPageSizeError::TooLarge {
+                encoded_bytes: encoded.len(),
+            })?;
+        if actual == encoded_bytes {
+            return Ok(actual);
+        }
+        encoded_bytes = actual;
+    }
+    Err(CanonicalPageSizeError::DidNotConverge)
+}
+
+pub fn canonical_snapshot_page_size(page: &SnapshotPage) -> Result<u32, CanonicalPageSizeError> {
+    canonical_fixed_point_page_size(page, |page, encoded_bytes| {
+        page.encoded_bytes = encoded_bytes;
+    })
+}
+
+pub fn canonical_event_page_size(page: &EventPage) -> Result<u32, CanonicalPageSizeError> {
+    let encoded =
+        rmp_serde::to_vec_named(page).map_err(|error| CanonicalPageSizeError::Encode {
+            detail: error.to_string(),
+        })?;
+    u32::try_from(encoded.len()).map_err(|_| CanonicalPageSizeError::TooLarge {
+        encoded_bytes: encoded.len(),
+    })
+}
+
+pub fn canonical_artifact_content_page_size(
+    page: &ArtifactContentPage,
+) -> Result<u32, CanonicalPageSizeError> {
+    canonical_fixed_point_page_size(page, |page, encoded_bytes| {
+        page.encoded_bytes = encoded_bytes;
+    })
 }
 
 struct ArtifactContentBinaryRef<'a>(&'a [u8]);
@@ -624,4 +718,234 @@ pub struct ProcessAccountingMemberSnapshot {
     pub status: ProcessMetricStatus,
     pub executable: Option<String>,
     pub generation: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_snapshot_page() -> SnapshotPage {
+        SnapshotPage {
+            snapshot_id: SnapshotId::new(),
+            through_sequence: 1,
+            section: SnapshotSection::Tasks,
+            after_item: None,
+            items: Vec::new(),
+            encoded_bytes: 0,
+            next_cursor: None,
+        }
+    }
+
+    fn golden_snapshot_id() -> SnapshotId {
+        SnapshotId::from_bytes([
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x70, 0x00, 0x80, 0x01, 0x02, 0x03, 0x04, 0x05,
+            0x06, 0x07,
+        ])
+        .expect("valid snapshot UUIDv7")
+    }
+
+    fn golden_artifact_id() -> ArtifactId {
+        ArtifactId::from_bytes([
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x70, 0x01, 0x80, 0x08, 0x09, 0x0a, 0x0b, 0x0c,
+            0x0d, 0x0e,
+        ])
+        .expect("valid artifact UUIDv7")
+    }
+
+    fn golden_snapshot_page() -> SnapshotPage {
+        SnapshotPage {
+            snapshot_id: golden_snapshot_id(),
+            through_sequence: 1,
+            section: SnapshotSection::Tasks,
+            after_item: None,
+            items: Vec::new(),
+            encoded_bytes: 0,
+            next_cursor: None,
+        }
+    }
+
+    fn golden_artifact_content_page() -> ArtifactContentPage {
+        ArtifactContentPage {
+            artifact_id: golden_artifact_id(),
+            offset: 4,
+            total_bytes: 9,
+            sha256: [7; 32],
+            payload: vec![8, 9, 10],
+            encoded_bytes: 0,
+            next_cursor: Some(vec![11, 12]),
+        }
+    }
+
+    const SNAPSHOT_PAGE_NAMED_GOLDEN: &[u8] = &[
+        0x87, 0xab, 0x73, 0x6e, 0x61, 0x70, 0x73, 0x68, 0x6f, 0x74, 0x5f, 0x69, 0x64, 0xc4, 0x10,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x70, 0x00, 0x80, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
+        0x07, 0xb0, 0x74, 0x68, 0x72, 0x6f, 0x75, 0x67, 0x68, 0x5f, 0x73, 0x65, 0x71, 0x75, 0x65,
+        0x6e, 0x63, 0x65, 0x01, 0xa7, 0x73, 0x65, 0x63, 0x74, 0x69, 0x6f, 0x6e, 0xa5, 0x74, 0x61,
+        0x73, 0x6b, 0x73, 0xaa, 0x61, 0x66, 0x74, 0x65, 0x72, 0x5f, 0x69, 0x74, 0x65, 0x6d, 0xc0,
+        0xa5, 0x69, 0x74, 0x65, 0x6d, 0x73, 0x90, 0xad, 0x65, 0x6e, 0x63, 0x6f, 0x64, 0x65, 0x64,
+        0x5f, 0x62, 0x79, 0x74, 0x65, 0x73, 0x00, 0xab, 0x6e, 0x65, 0x78, 0x74, 0x5f, 0x63, 0x75,
+        0x72, 0x73, 0x6f, 0x72, 0xc0,
+    ];
+    const EVENT_PAGE_NAMED_GOLDEN: &[u8] = &[
+        0x84, 0xae, 0x61, 0x66, 0x74, 0x65, 0x72, 0x5f, 0x73, 0x65, 0x71, 0x75, 0x65, 0x6e, 0x63,
+        0x65, 0x03, 0xb0, 0x74, 0x68, 0x72, 0x6f, 0x75, 0x67, 0x68, 0x5f, 0x73, 0x65, 0x71, 0x75,
+        0x65, 0x6e, 0x63, 0x65, 0x08, 0xa6, 0x65, 0x76, 0x65, 0x6e, 0x74, 0x73, 0x90, 0xab, 0x6e,
+        0x65, 0x78, 0x74, 0x5f, 0x63, 0x75, 0x72, 0x73, 0x6f, 0x72, 0x93, 0x01, 0x02, 0x03,
+    ];
+    const ARTIFACT_CONTENT_PAGE_NAMED_GOLDEN: &[u8] = &[
+        0x87, 0xab, 0x61, 0x72, 0x74, 0x69, 0x66, 0x61, 0x63, 0x74, 0x5f, 0x69, 0x64, 0xc4, 0x10,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x70, 0x01, 0x80, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+        0x0e, 0xa6, 0x6f, 0x66, 0x66, 0x73, 0x65, 0x74, 0x04, 0xab, 0x74, 0x6f, 0x74, 0x61, 0x6c,
+        0x5f, 0x62, 0x79, 0x74, 0x65, 0x73, 0x09, 0xa6, 0x73, 0x68, 0x61, 0x32, 0x35, 0x36, 0xdc,
+        0x00, 0x20, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07,
+        0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07,
+        0x07, 0x07, 0x07, 0x07, 0xa7, 0x70, 0x61, 0x79, 0x6c, 0x6f, 0x61, 0x64, 0xc4, 0x03, 0x08,
+        0x09, 0x0a, 0xad, 0x65, 0x6e, 0x63, 0x6f, 0x64, 0x65, 0x64, 0x5f, 0x62, 0x79, 0x74, 0x65,
+        0x73, 0x00, 0xab, 0x6e, 0x65, 0x78, 0x74, 0x5f, 0x63, 0x75, 0x72, 0x73, 0x6f, 0x72, 0xc4,
+        0x02, 0x0b, 0x0c,
+    ];
+
+    #[test]
+    fn snapshot_page_named_messagepack_matches_independent_golden_fixture() {
+        let encoded =
+            rmp_serde::to_vec_named(&golden_snapshot_page()).expect("encode snapshot page fixture");
+        assert_eq!(encoded, SNAPSHOT_PAGE_NAMED_GOLDEN);
+    }
+
+    #[test]
+    fn event_page_named_messagepack_matches_independent_golden_fixture() {
+        let page = EventPage {
+            after_sequence: 3,
+            through_sequence: 8,
+            events: Vec::new(),
+            next_cursor: Some(vec![1, 2, 3]),
+        };
+        let encoded = rmp_serde::to_vec_named(&page).expect("encode event page fixture");
+        assert_eq!(encoded, EVENT_PAGE_NAMED_GOLDEN);
+    }
+
+    #[test]
+    fn artifact_content_page_named_messagepack_matches_independent_golden_fixture() {
+        let encoded = rmp_serde::to_vec_named(&golden_artifact_content_page())
+            .expect("encode artifact content page fixture");
+        assert_eq!(encoded, ARTIFACT_CONTENT_PAGE_NAMED_GOLDEN);
+    }
+
+    #[test]
+    fn artifact_content_page_size_converges_across_messagepack_integer_width_boundary() {
+        let mut page = golden_artifact_content_page();
+
+        page.payload.clear();
+        page.next_cursor = None;
+        page.encoded_bytes = 0;
+        let zero_claim_length = rmp_serde::to_vec_named(&page)
+            .expect("encode zero-claim artifact content page")
+            .len();
+        assert!(
+            zero_claim_length > 127,
+            "fixture must put the final claim beyond positive fixint"
+        );
+
+        let encoded_bytes = canonical_artifact_content_page_size(&page).expect("canonical size");
+        let mut final_page = page.clone();
+        final_page.encoded_bytes = encoded_bytes;
+        let final_length = rmp_serde::to_vec_named(&final_page)
+            .expect("encode final artifact content page")
+            .len();
+
+        assert_eq!(encoded_bytes as usize, zero_claim_length + 1);
+        assert_eq!(encoded_bytes as usize, final_length);
+    }
+
+    #[test]
+    fn snapshot_page_size_converges_across_messagepack_integer_width_boundary() {
+        let mut page = empty_snapshot_page();
+        let mut found_boundary = false;
+
+        for cursor_len in 0..512 {
+            page.next_cursor = Some(vec![0; cursor_len]);
+            page.encoded_bytes = 0;
+            let zero_claim_length = rmp_serde::to_vec_named(&page)
+                .expect("encode zero-claim snapshot page")
+                .len();
+            if zero_claim_length != 128 {
+                continue;
+            }
+
+            let encoded_bytes = canonical_snapshot_page_size(&page).expect("canonical size");
+            let mut final_page = page.clone();
+            final_page.encoded_bytes = encoded_bytes;
+            let final_length = rmp_serde::to_vec_named(&final_page)
+                .expect("encode final snapshot page")
+                .len();
+
+            assert!(encoded_bytes as usize > zero_claim_length);
+            assert_eq!(encoded_bytes as usize, final_length);
+            found_boundary = true;
+            break;
+        }
+
+        assert!(
+            found_boundary,
+            "test fixture must reach the encoded_bytes MessagePack width boundary"
+        );
+    }
+
+    #[test]
+    fn canonical_snapshot_page_size_matches_final_named_messagepack_and_ignores_claim() {
+        let mut page = empty_snapshot_page();
+        page.encoded_bytes = u32::MAX;
+
+        let encoded_bytes = canonical_snapshot_page_size(&page).expect("canonical size");
+        page.encoded_bytes = encoded_bytes;
+
+        assert_eq!(
+            usize::try_from(encoded_bytes).expect("size fits"),
+            rmp_serde::to_vec_named(&page)
+                .expect("encode final snapshot page")
+                .len()
+        );
+    }
+
+    #[test]
+    fn canonical_event_page_size_matches_named_messagepack() {
+        let page = EventPage {
+            after_sequence: 3,
+            through_sequence: 8,
+            events: Vec::new(),
+            next_cursor: Some(vec![1, 2, 3]),
+        };
+
+        let encoded_bytes = canonical_event_page_size(&page).expect("canonical size");
+
+        assert_eq!(
+            usize::try_from(encoded_bytes).expect("size fits"),
+            rmp_serde::to_vec_named(&page)
+                .expect("encode event page")
+                .len()
+        );
+    }
+
+    #[test]
+    fn canonical_artifact_content_page_size_matches_final_named_messagepack_and_ignores_claim() {
+        let mut page = ArtifactContentPage {
+            artifact_id: ArtifactId::new(),
+            offset: 4,
+            total_bytes: 9,
+            sha256: [7; 32],
+            payload: vec![8, 9, 10],
+            encoded_bytes: u32::MAX,
+            next_cursor: Some(vec![11, 12]),
+        };
+
+        let encoded_bytes = canonical_artifact_content_page_size(&page).expect("canonical size");
+        page.encoded_bytes = encoded_bytes;
+
+        assert_eq!(
+            usize::try_from(encoded_bytes).expect("size fits"),
+            rmp_serde::to_vec_named(&page)
+                .expect("encode final artifact content page")
+                .len()
+        );
+    }
 }

@@ -53,6 +53,9 @@ impl<'de> Deserialize<'de> for StreamKey {
 pub struct StreamPayloadKind(NonZeroU16);
 
 impl StreamPayloadKind {
+    /// Bounded browser screenshot/frame projection. Metadata events stay off this kind.
+    pub const BROWSER_FRAME: Self = Self(unsafe { NonZeroU16::new_unchecked(8) });
+
     pub const fn new(value: u16) -> Option<Self> {
         match NonZeroU16::new(value) {
             Some(inner) => Some(Self(inner)),

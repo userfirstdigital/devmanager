@@ -558,6 +558,7 @@ fn is_pure_decision_fact(event: &Event) -> bool {
             | Event::ProviderQuestionPresented { .. }
             | Event::ProviderApprovalPresented { .. }
             | Event::ProviderWaitSettled { .. }
+            | Event::Browser(_)
     )
 }
 

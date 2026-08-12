@@ -72,6 +72,7 @@ pub enum Capability {
     ExplicitDetach = 12,
     HostShutdown = 13,
     ProviderInput = 14,
+    OrganizationProjection = 15,
 }
 
 impl Capability {
@@ -96,6 +97,8 @@ impl Capability {
             Self::ManagementMetadata => "management_metadata",
             Self::ExplicitDetach => "explicit_detach",
             Self::HostShutdown => "host_shutdown",
+            Self::ProviderInput => "provider_input",
+            Self::OrganizationProjection => "organization_projection",
         }
     }
 }

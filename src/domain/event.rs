@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::agent::{AgentSessionFacts, ProviderSessionId};
 use crate::domain::artifact::ArtifactFacts;
+use crate::domain::browser::{BrowserBook, BrowserContractError, BrowserDurableFact};
 use crate::domain::host::{HostCleanupBranch, HostCleanupBranchOutcome};
 use crate::domain::id::{
     AgentSessionId, ApprovalId, ClientId, CommandId, EventId, OperationId, QuestionId, ResourceId,
@@ -792,6 +793,7 @@ pub enum Event {
         question_id: Option<QuestionId>,
         approval_id: Option<ApprovalId>,
     },
+    Browser(BrowserDurableFact),
 }
 
 impl Event {
@@ -821,6 +823,7 @@ impl Event {
             Self::ProviderApprovalPresented { .. } => "provider_input.approval_presented",
             Self::ProviderWaitSettled { .. } => "provider_input.wait_settled",
             Self::ProviderInputDelivered { .. } => "provider_input.delivered",
+            Self::Browser(_) => "browser.fact",
         }
     }
 
@@ -890,6 +893,8 @@ enum EventBody {
     ProviderWaitSettled(ProviderWaitSettledPayload),
     #[serde(rename = "provider_input.delivered")]
     ProviderInputDelivered(ProviderInputDeliveredPayload),
+    #[serde(rename = "browser.fact")]
+    Browser(BrowserDurableFact),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1084,6 +1089,7 @@ impl From<&Event> for EventDocument {
                 question_id: *question_id,
                 approval_id: *approval_id,
             }),
+            Event::Browser(fact) => EventBody::Browser(fact.clone()),
         };
         Self {
             schema_version: EVENT_SCHEMA_VERSION,
@@ -1310,6 +1316,7 @@ impl TryFrom<EventDocument> for Event {
                     approval_id: p.approval_id,
                 }
             }
+            EventBody::Browser(fact) => Event::Browser(fact),
         })
     }
 }
@@ -1573,7 +1580,23 @@ pub fn apply(
                 artifacts: BTreeMap::new(),
                 resources: BTreeMap::new(),
                 provider_sessions: BTreeMap::new(),
+                browser: {
+                    let mut browser = BrowserBook::new();
+                    browser.open_task(task.id).map_err(apply_browser_error)?;
+                    browser
+                },
             })
+        }
+        Event::Browser(fact) => {
+            let mut snap = snapshot.ok_or(ApplyError::MissingSnapshot)?;
+            require_matching_task_id(&snap, event)?;
+            if fact.task_id() != snap.task.id {
+                return Err(ApplyError::OwnershipConflict);
+            }
+            snap.browser
+                .apply_facts(std::slice::from_ref(fact))
+                .map_err(apply_browser_error)?;
+            Ok(snap)
         }
         Event::OperationAccepted(_fact) => {
             let snap = snapshot.ok_or(ApplyError::MissingSnapshot)?;
@@ -1686,6 +1709,9 @@ fn apply_into(
             }
             snap.task.lifecycle = TaskLifecycle::Closing;
             snap.task.action_epoch = *action_epoch;
+            snap.browser
+                .close_task(snap.task.id)
+                .map_err(apply_browser_error)?;
         }
         Event::TaskReopened => {
             match snap.task.lifecycle {
@@ -2109,7 +2135,55 @@ fn apply_into(
         | Event::OperationSettled(_)
         | Event::OperationFailed(_)
         | Event::OperationCancelled(_)
-        | Event::OperationUncertain(_) => unreachable!("handled by apply()"),
+        | Event::OperationUncertain(_)
+        | Event::Browser(_) => unreachable!("handled by apply()"),
     }
     Ok(())
+}
+
+fn apply_browser_error(error: BrowserContractError) -> ApplyError {
+    match error {
+        BrowserContractError::CrossTask => ApplyError::OwnershipConflict,
+        BrowserContractError::GenerationMismatch
+        | BrowserContractError::ClosedTask
+        | BrowserContractError::IdempotencyConflict
+        | BrowserContractError::BoundExceeded
+        | BrowserContractError::InvalidRequest
+        | BrowserContractError::HostEffectUnavailable => ApplyError::InvalidTransition,
+    }
+}
+
+pub fn apply_all(
+    mut snapshot: Option<TaskSnapshot>,
+    events: &[Event],
+) -> Result<TaskSnapshot, ApplyError> {
+    let task_id = snapshot.as_ref().map(|snap| snap.task.id);
+    for (index, payload) in events.iter().enumerate() {
+        let sequence = u64::try_from(index.saturating_add(1)).unwrap_or(u64::MAX);
+        let task_revision = if payload.is_task_mutation() {
+            match snapshot.as_ref() {
+                Some(snap) => Some(
+                    snap.task
+                        .revision
+                        .checked_add(1)
+                        .ok_or(ApplyError::InvalidTransition)?,
+                ),
+                None => Some(1),
+            }
+        } else {
+            None
+        };
+        snapshot = Some(apply(
+            snapshot,
+            &DomainEvent {
+                id: EventId::new(),
+                task_id,
+                sequence,
+                task_revision,
+                occurred_at_ms: 1,
+                payload: payload.clone(),
+            },
+        )?);
+    }
+    snapshot.ok_or(ApplyError::MissingSnapshot)
 }

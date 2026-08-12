@@ -2,7 +2,12 @@ mod annotations;
 mod attachments;
 mod automation;
 mod commands;
+mod conformance;
+pub mod domain;
 mod downloads;
+mod generation;
+mod projection;
+mod surface;
 mod gateway;
 mod host;
 mod mcp;
@@ -10,9 +15,11 @@ mod model;
 mod operation_queue;
 mod pane;
 mod policy;
+pub mod protocol;
 mod provider;
 mod recipes;
 mod recording;
+mod service;
 mod recording_coordinator;
 mod recording_ipc;
 mod recording_mcp;
@@ -24,6 +31,7 @@ mod replay_repair;
 mod replay_secrets;
 mod resources;
 mod storage;
+mod teardown;
 mod workflow_mcp;
 
 pub(crate) use annotations::redacted_browser_annotation;
@@ -53,6 +61,18 @@ pub use automation::{
     BrowserSnapshotSummary, BrowserTelemetryBuffer, BrowserUploadResult, BrowserWaitCondition,
     BrowserWaitResult, MAX_BROWSER_ACTIONS, MAX_BROWSER_JOURNAL_ENTRIES, REDACTED_VALUE,
 };
+pub use conformance::{
+    browser_fixture_root, hold_authenticated_provider_launch, real_provider_launch_is_forbidden,
+    validate_browser_fixture_site, BrowserFixtureAction, BrowserFixtureCase,
+    BrowserFixtureRecoveryCase, BrowserFixtureValidation, BrowserFixtureValidationError,
+    BrowserProviderArm, BrowserProviderE2EHold, BrowserProviderHoldRecord, BROWSER_E2E_SCHEMA_VERSION,
+    BROWSER_E2E_VERIFICATION_TOKEN, BROWSER_FIXTURE_CASES,
+};
+pub use generation::{
+    BrowserGenerationError, BrowserGenerationTicket, BrowserTaskArtifact, BrowserTaskArtifactKind,
+    BrowserTaskGenerationAuthority, BrowserWorkflowKind, MAX_BROWSER_GENERATION_CONTEXTS,
+    MAX_BROWSER_GENERATION_QUEUE,
+};
 pub use commands::{
     browser_command_channel, browser_lifecycle_control, browser_operation_target_tab_id,
     browser_request_preempts_operation_queue, browser_response_resource_ids, route_browser_request,
@@ -69,7 +89,8 @@ pub(crate) use commands::{
 };
 pub use downloads::{
     prepare_verified_download_root, prepare_verified_profile_root, remove_verified_profile,
-    BrowserDownloadStore,
+    BrowserDownloadStore, BrowserIoController, BrowserIoError, BrowserSecretFillReport,
+    BrowserStagedDownload,
 };
 pub use gateway::{BrowserGatewayHandle, BrowserGatewayRegistrar, BrowserGatewayRegistration};
 pub(crate) use host::BrowserAppExitDisposition;
@@ -77,9 +98,10 @@ pub use host::{
     acknowledge_attachment_projection_and_reconcile_pins, browser_user_input_initialization_script,
     unique_download_path, unsupported_command_response, unsupported_host_status,
     unsupported_platform_error, validate_browser_url, BrowserAnnotationMutationResult,
-    BrowserHostState, BrowserMemoryTarget, BrowserProfileClearPlan, BrowserProjectContextKey,
-    BrowserViewCreationPlan, BrowserViewVisibilityPlan, BrowserWebViewHost,
-    BrowserWorkspaceMutation,
+    BrowserHostState, BrowserMemoryTarget, BrowserNativeSurfaceBackend, BrowserNativeViewError,
+    BrowserNativeViewReceipt, BrowserNativeViewRegistration, BrowserProfileClearPlan,
+    BrowserProjectContextKey, BrowserTeardownObserver, BrowserViewCreationPlan,
+    BrowserViewVisibilityPlan, BrowserWebViewHost, BrowserWorkspaceMutation,
 };
 pub use model::{
     BrowserAnnotation, BrowserAnnotationKind, BrowserAttachmentRevision, BrowserBounds,
@@ -89,6 +111,13 @@ pub use model::{
 };
 pub use operation_queue::{
     BrowserOperationQueue, BrowserOperationTarget, BrowserQueueCancellation,
+};
+pub use projection::{
+    projection_meta, BrowserProjectionError, BrowserProjectionEvent, BrowserProjectionSession,
+};
+pub use surface::{
+    BrowserDockChrome, BrowserDockError, BrowserDockFocusTarget, BrowserDockGesture,
+    BrowserDockSurface, BrowserPointerDisposition,
 };
 pub use pane::{
     apply_browser_workflow_review_mutation, browser_action_plan, browser_annotation_preview_plan,
@@ -111,7 +140,7 @@ pub use pane::{
     BrowserWorkflowReviewProjection, BrowserWorkflowReviewStepProjection,
     BrowserWorkflowReviewUiState, BROWSER_REPLAY_SECRET_MASK,
 };
-pub use policy::{classify_upload_path, BrowserApprovalPolicy, BrowserRisk};
+pub use policy::{classify_upload_path, BrowserApprovalPolicy, BrowserIoRole, BrowserRisk};
 pub use provider::{
     codex_browser_config_overrides, prepare_claude_browser_overlay, BrowserProviderAccess,
     ClaudeBrowserOverlay, DEVMANAGER_BROWSER_TOKEN_ENV,
@@ -131,6 +160,14 @@ pub use recording::{
     MAX_BROWSER_RECORDING_INPUTS,
 };
 pub use recording_coordinator::{BrowserUserChromeCapture, BrowserWorkflowCoordinator};
+pub use service::{
+    reject_serialized_secrets, BrowserRepairProposal, BrowserSecretPlaceholder, BrowserTaskService,
+    BrowserTaskServiceError,
+};
+pub use teardown::{
+    BrowserRecoveryCause, BrowserRecoveryController, BrowserRecoveryError, BrowserRecoveryOutcome,
+    BrowserTeardownStage, BROWSER_TEARDOWN_STAGE_COUNT,
+};
 pub(crate) use recording_ipc::{
     browser_page_origin_from_url, BrowserPageRecordingIngress, BrowserPageRecordingSubmit,
     BrowserPageRecordingTransport, BrowserPageRecordingTransportFailureKind,
@@ -173,6 +210,23 @@ pub use resources::{
     BrowserResourceKind, BrowserResourceLimits, BrowserResourceMetadata, BrowserResourceStore,
 };
 pub use storage::BrowserStorageLayout;
+pub use surface::{
+    BoundsEpoch, BrowserSurfaceDescriptor, BrowserSurfaceFixture, BrowserSurfaceFixtureError,
+    BrowserSurfaceFixtureSnapshot, BrowserSurfaceHost, BrowserSurfaceIdentity,
+    BrowserSurfaceRegistration, BrowserSurfaceSnapshot, ClientBinding, DpiScale, DpiScaleError,
+    FocusEpoch, HostHwndOwnership, HostHwndOwnershipError, HostProcessIdentity, HostSurfaceRequest,
+    HostTeardownProof, PhysicalBounds, PhysicalBoundsError, ProcessIdentity, ProcessIdentityError,
+    RuntimeGeneration, SurfaceAction, SurfaceAttachRequest, SurfaceAuthority, SurfaceBoundsUpdate,
+    SurfaceClientRequest, SurfaceCommand, SurfaceDescriptorField, SurfaceDetachReason,
+    SurfaceEpochError, SurfaceError, SurfaceEvent, SurfaceEventKind, SurfaceFocusUpdate,
+    SurfaceInputAction, SurfaceInputReceipt, SurfaceInputRequest, SurfaceLifecycle, SurfaceNonce,
+    SurfaceNonceError, SurfaceOwner, SurfaceParkReason, SurfacePermission, SurfacePermissions,
+    SurfaceReceipt, SurfaceTaskSwitchReceipt, SurfaceTaskSwitchRequest, SurfaceTeardownReason,
+    SurfaceThreadAffinity, SurfaceWindowHandle, SurfaceWindowHandleError, TextInputError,
+    BROWSER_SURFACE_FIXTURE_CLICK_TOKEN, BROWSER_SURFACE_FIXTURE_RETAINED_STATE,
+    BROWSER_SURFACE_FIXTURE_VISIBLE_TOKEN, MAX_SURFACE_EVENTS, MAX_SURFACE_TARGET_TOKEN_BYTES,
+    MAX_SURFACE_TEXT_INPUT_BYTES,
+};
 pub use workflow_mcp::{
     get_browser_workflow_recipe, list_browser_workflow_recipes, BrowserWorkflowRecipeGet,
     BrowserWorkflowRecipeInputSummary, BrowserWorkflowRecipeSummary,

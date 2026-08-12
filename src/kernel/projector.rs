@@ -1088,6 +1088,13 @@ pub(crate) fn apply_event(
                 fact.observed_at_ms,
             )?;
         }
+        Event::Browser(_) => {
+            if event.task_id.is_none() || event.task_revision.is_none() {
+                return Err(StoreError::Projection(
+                    "browser.fact requires task_id and task_revision".into(),
+                ));
+            }
+        }
     }
     enforce_derived_result_lineage(tx, event)?;
     Ok(())

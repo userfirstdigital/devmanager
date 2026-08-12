@@ -29,7 +29,7 @@ use std::{
 };
 
 pub fn unsupported_host_status(platform: impl Into<String>) -> BrowserHostStatus {
-    let platform = platform.into();
+    let platform = bounded_platform(platform.into());
     BrowserHostStatus {
         available: false,
         diagnostic: Some(format!(
@@ -40,11 +40,42 @@ pub fn unsupported_host_status(platform: impl Into<String>) -> BrowserHostStatus
     }
 }
 
+fn bounded_platform(platform: String) -> String {
+    const KNOWN_PLATFORMS: &[&str] = &[
+        "windows", "macos", "linux", "android", "ios", "freebsd", "openbsd", "netbsd",
+    ];
+    if KNOWN_PLATFORMS.contains(&platform.as_str()) {
+        platform
+    } else {
+        "unknown".to_string()
+    }
+}
+
 pub fn unsupported_platform_error(platform: impl Into<String>) -> BrowserError {
     // Locator failures can only be produced by the Windows host action boundary.
     // Unsupported hosts must remain unavailable without attempting locator resolution.
     BrowserError::UnavailablePlatform {
-        platform: platform.into(),
+        platform: bounded_platform(platform.into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unsupported_host_status;
+
+    #[test]
+    fn unsupported_host_status_redacts_unrecognized_platform_text() {
+        const SENTINEL: &str = "unsupported-platform-attacker-sentinel";
+        let status = unsupported_host_status(SENTINEL);
+        assert_eq!(status.platform, "unknown");
+        assert_eq!(
+            status.diagnostic.as_deref(),
+            Some("embedded browser support is unavailable on unknown")
+        );
+        assert!(!status
+            .diagnostic
+            .as_deref()
+            .is_some_and(|diagnostic| diagnostic.contains(SENTINEL)));
     }
 }
 
@@ -99,24 +130,26 @@ pub struct BrowserWebViewHost {
 #[cfg(not(target_os = "windows"))]
 impl BrowserWebViewHost {
     pub fn new(app_config_dir: impl AsRef<Path>) -> Self {
+        let app_config_dir = app_config_dir.as_ref().to_path_buf();
         Self {
             status: unsupported_host_status(std::env::consts::OS),
-            state: BrowserHostState::new(app_config_dir),
+            state: BrowserHostState::new(&app_config_dir)
+                .unwrap_or_else(|_| BrowserHostState::unavailable(&app_config_dir)),
             workflow_coordinator: BrowserWorkflowCoordinator::default(),
             native_window_lifetime: BrowserNativeWindowLifetime::default(),
             _main_thread_only: PhantomData,
         }
     }
 
-    pub fn unavailable(diagnostic: impl Into<String>) -> Self {
+    pub fn unavailable(_diagnostic: impl Into<String>) -> Self {
         Self {
             status: BrowserHostStatus {
                 available: false,
-                diagnostic: Some(diagnostic.into()),
+                diagnostic: Some("embedded browser support is unavailable".to_string()),
                 platform: std::env::consts::OS.to_string(),
                 version: None,
             },
-            state: BrowserHostState::new(PathBuf::new()),
+            state: BrowserHostState::unavailable(PathBuf::new()),
             workflow_coordinator: BrowserWorkflowCoordinator::default(),
             native_window_lifetime: BrowserNativeWindowLifetime::default(),
             _main_thread_only: PhantomData,
@@ -134,7 +167,9 @@ impl BrowserWebViewHost {
     }
 
     pub(crate) fn begin_native_window_teardown(&mut self) -> BrowserAppExitDisposition {
-        self.native_window_lifetime.begin_teardown()
+        self.native_window_lifetime
+            .begin_teardown()
+            .unwrap_or(BrowserAppExitDisposition::Deferred)
     }
 
     pub(crate) fn finish_native_window_teardown_cleanup(&mut self) {}

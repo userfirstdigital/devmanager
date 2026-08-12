@@ -7,10 +7,13 @@ use sha2::Sha256;
 use zeroize::Zeroizing;
 
 use crate::domain::artifact::ArtifactSummary;
-use crate::domain::id::{AgentSessionId, ArtifactId, OperationId, ResourceId, SnapshotId, TaskId};
+use crate::domain::id::{
+    AgentSessionId, ArtifactId, BrowserContextId, BrowserTabId, OperationId, ResourceId,
+    SnapshotId, TaskId,
+};
 use crate::domain::snapshot::{
-    PageLimits, PageLimitsError, SnapshotItem, SnapshotItemKey, SnapshotPage, SnapshotSection,
-    TaskSnapshotItem,
+    canonical_snapshot_page_size, CanonicalPageSizeError, PageLimits, PageLimitsError,
+    SnapshotItem, SnapshotItemKey, SnapshotPage, SnapshotSection, TaskSnapshotItem,
 };
 use crate::kernel::command_bus;
 use crate::kernel::store::{load_event_log_bounds, KernelStore, StoreError};
@@ -181,6 +184,8 @@ impl SnapshotSession {
             SnapshotSection::Artifacts => self.artifacts_page(after_item),
             SnapshotSection::Resources => self.resources_page(after_item),
             SnapshotSection::Operations => self.operations_page(after_item),
+            SnapshotSection::BrowserContexts => self.browser_contexts_page(after_item),
+            SnapshotSection::BrowserTabs => self.browser_tabs_page(after_item),
         }
     }
 
@@ -690,17 +695,6 @@ fn decode_operation_id(bytes: &[u8]) -> Result<OperationId, SnapshotError> {
         .map_err(Into::into)
 }
 
-#[derive(Serialize)]
-struct SnapshotPageWire<'a> {
-    snapshot_id: SnapshotId,
-    through_sequence: u64,
-    section: SnapshotSection,
-    after_item: Option<SnapshotItemKey>,
-    items: &'a [SnapshotItem],
-    encoded_bytes: u32,
-    next_cursor: &'a Option<Vec<u8>>,
-}
-
 fn canonical_page_encoded_bytes(
     snapshot_id: SnapshotId,
     through_sequence: u64,
@@ -709,33 +703,31 @@ fn canonical_page_encoded_bytes(
     items: &[SnapshotItem],
     next_cursor: &Option<Vec<u8>>,
 ) -> Result<u32, SnapshotError> {
-    let mut encoded_bytes = 0u32;
-    for _ in 0..8 {
-        let wire = SnapshotPageWire {
-            snapshot_id,
-            through_sequence,
-            section,
-            after_item,
-            items,
-            encoded_bytes,
-            next_cursor,
-        };
-        let bytes = rmp_serde::to_vec_named(&wire).map_err(|error| StoreError::CodecMismatch {
-            detail: format!("encode snapshot page: {error}"),
-        })?;
-        let actual = u32::try_from(bytes.len()).map_err(|_| StoreError::IntegerOutOfRange {
+    let page = SnapshotPage {
+        snapshot_id,
+        through_sequence,
+        section,
+        after_item,
+        items: items.to_vec(),
+        encoded_bytes: 0,
+        next_cursor: next_cursor.clone(),
+    };
+    canonical_snapshot_page_size(&page).map_err(snapshot_page_size_error)
+}
+
+fn snapshot_page_size_error(error: CanonicalPageSizeError) -> SnapshotError {
+    SnapshotError::Store(match error {
+        CanonicalPageSizeError::Encode { detail } => StoreError::CodecMismatch {
+            detail: format!("encode snapshot page: {detail}"),
+        },
+        CanonicalPageSizeError::TooLarge { encoded_bytes } => StoreError::IntegerOutOfRange {
             field: "snapshot_page.encoded_bytes",
-            value: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
-        })?;
-        if actual == encoded_bytes {
-            return Ok(actual);
-        }
-        encoded_bytes = actual;
-    }
-    Err(StoreError::CodecMismatch {
-        detail: "snapshot page encoded length did not converge".into(),
-    }
-    .into())
+            value: u64::try_from(encoded_bytes).unwrap_or(u64::MAX),
+        },
+        CanonicalPageSizeError::DidNotConverge => StoreError::CodecMismatch {
+            detail: "snapshot page encoded length did not converge".into(),
+        },
+    })
 }
 
 impl Drop for SnapshotSession {
