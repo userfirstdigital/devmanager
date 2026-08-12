@@ -6,7 +6,6 @@ use crate::ai::codex_hooks::{
     build_codex_hooks_command, codex_supports_hooks, CodexHookRegistration, CodexHookRegistry,
     CodexHookRelayListener, CodexRegistryEvent, CodexSessionBinding,
 };
-use crate::ai::codex_rollout::CodexRolloutTailer;
 use crate::browser::{
     browser_input_opens_prompt_boundary, codex_browser_config_overrides,
     prepare_claude_browser_overlay, BrowserAttachmentBroker, BrowserAttachmentSessionBinding,
@@ -424,7 +423,6 @@ enum CodexAdapterSession {
     Running {
         identity: CodexAdapterIdentity,
         registration: CodexHookRegistration,
-        tailer: Option<CodexRolloutTailer>,
         activated: bool,
     },
 }
@@ -2104,7 +2102,6 @@ impl ProcessManager {
                     CodexAdapterSession::Running {
                         identity: identity.clone(),
                         registration: registration.clone(),
-                        tailer: None,
                         activated: false,
                     },
                 );
@@ -2174,14 +2171,8 @@ impl ProcessManager {
         let removed_identity = removed
             .as_ref()
             .and_then(|session| session.registered_semantic_identity(session_id));
-        // Join the tailer and retire the relay nonce outside the registry lock.
-        if let Some(CodexAdapterSession::Running {
-            registration,
-            tailer,
-            ..
-        }) = removed
-        {
-            drop(tailer);
+        // Retire the relay nonce outside the registry lock.
+        if let Some(CodexAdapterSession::Running { registration, .. }) = removed {
             self.inner
                 .codex_hook_registry
                 .unregister(&registration.nonce);
@@ -7876,44 +7867,28 @@ fn handle_codex_session_started(
     binding: CodexSessionBinding,
 ) {
     bind_runtime_provider_session_id(inner, session_id, binding.session_id.as_str().to_owned());
-    let new_tailer = binding.transcript_path.map(|path| {
-        let tail_inner = Arc::downgrade(inner);
-        let tail_session_id = session_id.to_string();
-        let tail_identity = identity.clone();
-        CodexRolloutTailer::start(path, identity.stable_session_key.clone(), move |draft| {
-            if let Some(inner) = tail_inner.upgrade() {
-                emit_codex_semantic_if_current(&inner, &tail_session_id, &tail_identity, draft);
-            }
-        })
-    });
-    let (replaced_tailer, newly_activated) = {
+    let newly_activated = {
         let mut registry = inner
             .codex_adapter_registry
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if !registry.is_current(identity) {
-            (new_tailer, false)
+            false
         } else {
             match registry.sessions.get_mut(session_id) {
                 Some(CodexAdapterSession::Running {
                     identity: current,
-                    tailer,
                     activated,
                     ..
                 }) if current == identity => {
-                    // A resumed session re-delivers SessionStart with the
-                    // authoritative transcript path: rebind the tailer.
-                    let replaced = std::mem::replace(tailer, new_tailer);
                     let newly_activated = !*activated;
                     *activated = true;
-                    (replaced, newly_activated)
+                    newly_activated
                 }
-                _ => (new_tailer, false),
+                _ => false,
             }
         }
     };
-    // Joins the superseded tailer thread outside the registry lock.
-    drop(replaced_tailer);
     if newly_activated {
         emit_remote_session_event(
             inner,
@@ -11003,7 +10978,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_session_start_binds_tailer_and_reports_healthy() {
+    fn codex_session_start_binds_hook_identity_and_reports_healthy() {
         let manager = ProcessManager::new();
         manager.set_codex_hooks_support_probe_for_test(Arc::new(|_| Ok(())));
         let events: Arc<Mutex<Vec<RemoteSessionEvent>>> = Arc::new(Mutex::new(Vec::new()));
@@ -11027,17 +11002,10 @@ mod tests {
             other => panic!("expected running codex session, got {other:?}"),
         };
 
-        let dir = tempfile::tempdir().unwrap();
-        let rollout = dir.path().join("rollout.jsonl");
-        std::fs::write(
-            &rollout,
-            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"from-rollout\"}}\n",
-        )
-        .unwrap();
         let body = serde_json::json!({
             "session_id": "prov-1",
             "cwd": "C:\\proj",
-            "transcript_path": rollout.to_string_lossy(),
+            "transcript_path": "C:\\ignored\\rollout.jsonl",
             "hook_event_name": "SessionStart"
         })
         .to_string();
@@ -11061,7 +11029,6 @@ mod tests {
                 .sessions
                 .get(session_id),
             Some(CodexAdapterSession::Running {
-                tailer: Some(_),
                 activated: true,
                 ..
             })
@@ -11079,31 +11046,27 @@ mod tests {
                         }
                     )
                 });
-                let tailed = events.iter().any(|event| {
-                    matches!(
-                        event,
-                        RemoteSessionEvent::CodexSemantic { draft, .. }
-                            if matches!(
-                                &draft.kind,
-                                crate::remote::presentation::SemanticEventKind::AssistantMessage { text, .. }
-                                    if text == "from-rollout"
-                            )
-                    )
+                let inferred = events.iter().any(|event| {
+                    matches!(event, RemoteSessionEvent::CodexSemantic { .. })
                 });
-                if healthy && tailed {
+                assert!(
+                    !inferred,
+                    "SessionStart must not publish semantic drafts from a rollout transcript"
+                );
+                if healthy {
                     break;
                 }
             }
             assert!(
                 Instant::now() < deadline,
-                "healthy + tailed rollout events never arrived"
+                "healthy adapter event never arrived"
             );
             thread::sleep(Duration::from_millis(25));
         }
     }
 
     #[test]
-    fn codex_close_unregisters_relay_nonce_and_stops_tailer() {
+    fn codex_close_unregisters_relay_nonce() {
         let manager = ProcessManager::new();
         manager.set_codex_hooks_support_probe_for_test(Arc::new(|_| Ok(())));
         let mut launch = browser_test_launch(SessionKind::Codex, "codex --full-auto");

@@ -4878,6 +4878,14 @@ fn parity_current_ledger_is_hold() {
         completed.iter().any(|id| id == "legacy-web-sessions"),
         "the web sessions row must be a completed deletion"
     );
+    assert!(
+        completed.iter().any(|id| id == "legacy-codex-rollout"),
+        "the Codex rollout tailer row must be a completed deletion"
+    );
+    assert!(
+        completed.iter().any(|id| id == "legacy-tauri-archive"),
+        "the archived Tauri tree row must be a completed deletion"
+    );
     for row in current_rows() {
         if completed.iter().any(|id| row["id"] == *id) {
             assert_eq!(row["status"], "DELETED");
@@ -4897,12 +4905,11 @@ fn old_rust_paths_remain_tracked_until_deleted() {
     for relative in [
         "src/app/mod.rs",
         "src/services/process_manager.rs",
-        "src/ai/codex_rollout.rs",
         "src/browser/pane.rs",
         "src/sidebar/mod.rs",
         "src/models/mod.rs",
         "src/persistence/mod.rs",
-        "zz-archive/tauri-react-v0.1.11",
+        "src/services/session_manager.rs",
     ] {
         assert!(
             root.join(relative).exists(),
@@ -5085,7 +5092,9 @@ fn entry_deletion_semantics_require_deleted_or_exact_deferred_paths() {
         completed,
         vec![
             "legacy-next-entrypoint".to_owned(),
-            "legacy-web-sessions".to_owned()
+            "legacy-codex-rollout".to_owned(),
+            "legacy-web-sessions".to_owned(),
+            "legacy-tauri-archive".to_owned()
         ]
     );
 }
@@ -5125,5 +5134,151 @@ fn host_serve_request_is_an_integration_test_compatibility_seam() {
     assert!(
         ipc_tests.contains(".serve_request("),
         "keep the existing ipc_protocol compatibility caller; do not silently drop the seam"
+    );
+}
+
+#[test]
+fn phase11_codex_rollout_is_removed_as_identity_source() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    assert!(
+        !root.join("src/ai/codex_rollout.rs").exists(),
+        "codex_rollout must not remain an identity or transcript source"
+    );
+
+    let ai = read_source("src/ai/mod.rs");
+    assert!(
+        !ai.contains("codex_rollout"),
+        "ai module must not export the deleted rollout tailer"
+    );
+    assert!(ai.contains("pub mod claude_hooks;"));
+    assert!(ai.contains("pub mod codex_cli;"));
+    assert!(ai.contains("pub mod codex_hooks;"));
+
+    let process_manager = read_source("src/services/process_manager.rs");
+    assert!(!process_manager.contains("crate::ai::codex_rollout"));
+    assert!(!process_manager.contains("CodexRolloutTailer"));
+    assert!(!process_manager.contains("CodexRolloutReducer"));
+    assert!(process_manager.contains("bind_runtime_provider_session_id"));
+    assert!(process_manager.contains("CodexRegistryEvent::SessionStarted"));
+
+    let session_started = process_manager
+        .split("fn handle_codex_session_started")
+        .nth(1)
+        .expect("handle_codex_session_started")
+        .split("fn bind_runtime_provider_session_id")
+        .next()
+        .expect("session-start handler body");
+    assert!(
+        session_started.contains("bind_runtime_provider_session_id("),
+        "SessionStart must keep hook-correlated provider identity"
+    );
+    assert!(
+        !session_started.contains("transcript_path"),
+        "SessionStart must not tail or infer identity from a rollout transcript path"
+    );
+    assert!(
+        !session_started.contains("cwd"),
+        "SessionStart must not infer identity from cwd"
+    );
+
+    let row = current_row("legacy-codex-rollout");
+    assert_eq!(row["cutoverAction"], "delete");
+    assert_eq!(row["status"], "DELETED");
+    assert_eq!(row["legacy"]["path"], "src/ai/codex_rollout.rs");
+}
+
+#[test]
+fn phase11_tauri_archive_is_absent() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    assert!(
+        !root.join("zz-archive/tauri-react-v0.1.11").exists(),
+        "archived Tauri desktop tree must be absent"
+    );
+    assert!(
+        !root.join("zz-archive").exists(),
+        "zz-archive must be absent once the dead archive is deleted"
+    );
+
+    let row = current_row("legacy-tauri-archive");
+    assert_eq!(row["cutoverAction"], "delete");
+    assert_eq!(row["status"], "DELETED");
+    assert_eq!(row["legacy"]["path"], "zz-archive/tauri-react-v0.1.11/");
+
+    let deferred = current_contract()["deferredDeletionPaths"]
+        .as_array()
+        .expect("deferredDeletionPaths");
+    assert!(!deferred
+        .iter()
+        .any(|value| value == "zz-archive/tauri-react-v0.1.11/"));
+    assert!(!deferred.iter().any(|value| value == "src/ai/codex_rollout.rs"));
+
+    let scanner = read_source("src/services/scanner_service.rs");
+    assert!(
+        scanner.contains("\"zz-archive\""),
+        "scanner skip-name must remain even after the archive directory is gone"
+    );
+}
+
+#[test]
+fn phase11_legacy_app_sidebar_and_session_manager_remain_held() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let lib = read_source("src/lib.rs");
+    assert!(
+        lib.contains("pub mod app;"),
+        "app remains exported while unowned tests still include_str its source"
+    );
+    assert!(
+        lib.contains("pub mod sidebar;"),
+        "sidebar remains exported while the held app runtime imports it"
+    );
+    assert!(root.join("src/app/mod.rs").is_file());
+    assert!(root.join("src/app/chrome.rs").is_file());
+    assert!(root.join("src/app/process_monitor.rs").is_file());
+    assert!(root.join("src/sidebar/mod.rs").is_file());
+    assert!(root.join("src/services/session_manager.rs").is_file());
+
+    let app = current_row("legacy-app-runtime");
+    assert_eq!(app["status"], "HOLD");
+    let app_hold = app["approvalRequirement"].as_str().expect("app hold");
+    assert!(
+        app_hold.contains("tests/browser_pane.rs")
+            && app_hold.contains("include_str")
+            && app_hold.contains("src/app/mod.rs"),
+        "app HOLD must name the exact remaining source-inspection dependents: {app_hold}"
+    );
+
+    let sidebar = current_row("legacy-sidebar");
+    assert_eq!(sidebar["status"], "HOLD");
+    let sidebar_hold = sidebar["approvalRequirement"]
+        .as_str()
+        .expect("sidebar hold");
+    assert!(
+        sidebar_hold.contains("src/app/mod.rs")
+            && sidebar_hold.contains("use crate::sidebar")
+            && sidebar_hold.contains("sidebarCollapsed"),
+        "sidebar HOLD must name the app import and the persistence data-contract field: {sidebar_hold}"
+    );
+
+    let session = current_row("legacy-session-manager");
+    assert_eq!(session["status"], "HOLD");
+    let session_hold = session["approvalRequirement"]
+        .as_str()
+        .expect("session hold");
+    assert!(
+        session_hold.contains("src/services/mod.rs")
+            && session_hold.contains("ConfigImportMode")
+            && session_hold.contains("SessionManager")
+            && session_hold.contains("tests/config_persistence.rs")
+            && session_hold.contains("apply_import_mode"),
+        "session_manager HOLD must name the remaining export and test helpers: {session_hold}"
+    );
+
+    let services = read_source("src/services/mod.rs");
+    assert!(services.contains("mod session_manager;"));
+    assert!(services.contains("pub use session_manager::{ConfigImportMode, SessionManager};"));
+    let config = read_source("src/config/mod.rs");
+    assert!(
+        !config.contains("apply_import_mode") && !config.contains("ConfigImportMode"),
+        "config facade does not yet own SessionManager import-merge helpers"
     );
 }

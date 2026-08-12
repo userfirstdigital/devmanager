@@ -8,8 +8,10 @@ one GPUI desktop entry (`src/main.rs`) plus one durable host
 (`src/bin/devmanager-host.rs`) are the only product processes after approval.
 Final semantics: sole `devmanager` GPUI entry; durable `devmanager-host`
 attach/detach/full quit; no `devmanager-next` binary; no backward-compatibility
-shell; production profile only on the signed release path; atomic two-binary
-updater/package identity; and explicit manual publication approval.
+shell; no Codex rollout JSONL tailer as a conversation identity/transcript
+source; no `zz-archive` desktop tree; production profile only on the signed
+release path; atomic two-binary updater/package identity; and explicit manual
+publication approval.
 
 Phase 11 deletes old runtime paths once owning lanes produce evidence; it does
 not permanently `HOLD` them as a compatibility layer. A still-present delete
@@ -26,7 +28,8 @@ path must not remain `HOLD`. Handoff rows never become `DELETED`; they become
 their prerequisites are green. This foundation makes no deletion, install,
 publish, or user-data claim. The product desktop entry is already
 `run_native_shell` from `src/main.rs`; `src/app/mod.rs` remains a deferred
-legacy source compiled by `pub mod app` until its owning lanes finish. Host
+legacy source compiled by `pub mod app` because unowned tests still
+`include_str!` that file (named on the `legacy-app-runtime` HOLD). Host
 `serve_request` stays an integration-test compatibility seam because
 `tests/ipc_protocol.rs` links the library without `--cfg test`; production
 host serving uses `serve_duplex`.
@@ -118,7 +121,6 @@ process or production `config.json` / `remote.json`.
     "src/services/process_manager.rs",
     "src/terminal/session.rs",
     "src/ai/codex_cli.rs",
-    "src/ai/codex_rollout.rs",
     "src/browser/pane.rs",
     "src/state/",
     "src/models/config.rs",
@@ -132,8 +134,7 @@ process or production `config.json` / `remote.json`.
     "src/ai/claude_hooks.rs",
     "src/workspace/mod.rs",
     "tests/legacy_loader.rs",
-    "tests/fixtures/legacy-session.json",
-    "zz-archive/tauri-react-v0.1.11/"
+    "tests/fixtures/legacy-session.json"
   ],
   "hostCompatibility": {
     "serveRequest": {
@@ -368,7 +369,7 @@ process or production `config.json` / `remote.json`.
       ],
       "status": "HOLD",
       "approvalRequired": true,
-      "approvalRequirement": "Explicit Phase 11 cutover approval after merged-tree parity evidence"
+      "approvalRequirement": "HOLD: src/app/mod.rs, src/app/chrome.rs, src/app/process_monitor.rs, and src/lib.rs `pub mod app` remain because unowned tests still compile-time include that source (`include_str!(\"../src/app/mod.rs\")` in tests/browser_pane.rs, tests/config_service.rs, tests/browser_secret_prompt.rs, tests/browser_workflow_*.rs, tests/diagnostics_lifecycle.rs, tests/terminal_pending_annotations.rs, tests/browser_replay_repair.rs, tests/browser_host.rs, tests/browser_attachment_lifecycle.rs). Native entry is src/main.rs `run_native_shell` and does not call app::run. Deleting the tree without those unowned test edits would break the test compile contract."
     },
     {
       "id": "legacy-next-entrypoint",
@@ -552,9 +553,10 @@ process or production `config.json` / `remote.json`.
       "deletionSet": [
         "src/ai/codex_rollout.rs"
       ],
-      "status": "HOLD",
+      "cutoverAction": "delete",
+      "status": "DELETED",
       "approvalRequired": true,
-      "approvalRequirement": "Correlated current-generation provider identity evidence and explicit approval"
+      "approvalRequirement": "The Codex JSONL tailer is absent. Provider conversation identity remains correlated current-generation SessionStart hook data via bind_runtime_provider_session_id; no cwd/timestamp/transcript inference replacement was added."
     },
     {
       "id": "legacy-browser-pane",
@@ -744,7 +746,7 @@ process or production `config.json` / `remote.json`.
       ],
       "status": "HOLD",
       "approvalRequired": true,
-      "approvalRequirement": "Runtime ownership and no-session-write proof require explicit approval"
+      "approvalRequirement": "HOLD: src/services/session_manager.rs remains because src/services/mod.rs still `pub use session_manager::{ConfigImportMode, SessionManager}`, src/app/mod.rs still calls SessionManager::load_workspace/load_session/save_config/save_session/export_config_dialog, tests/config_persistence.rs uses SessionManager::apply_import_mode, and tests/config_service.rs include_str! the file. src/config/mod.rs has no ConfigImportMode/apply_import_mode owner. Migrating the helper would touch unowned config/services/test modules and could alter import/export behavior."
     },
     {
       "id": "legacy-remote-snapshot",
@@ -888,7 +890,7 @@ process or production `config.json` / `remote.json`.
       ],
       "status": "HOLD",
       "approvalRequired": true,
-      "approvalRequirement": "Task Cockpit navigation parity and explicit approval"
+      "approvalRequirement": "HOLD: src/sidebar/ remains because src/lib.rs still has `pub mod sidebar` and src/app/mod.rs still has `use crate::sidebar` plus sidebar::sidebar_width_px. Native shell/UI does not import the module. Persistence field `sidebarCollapsed` is a data contract in src/persistence/mod.rs and must remain. Cannot delete while the held app runtime still compiles against it."
     },
     {
       "id": "legacy-editor-ui",
@@ -1150,9 +1152,10 @@ process or production `config.json` / `remote.json`.
       "deletionSet": [
         "zz-archive/tauri-react-v0.1.11/"
       ],
-      "status": "HOLD",
+      "cutoverAction": "delete",
+      "status": "DELETED",
       "approvalRequired": true,
-      "approvalRequirement": "Archive deletion is allowed only after release-candidate evidence and explicit approval"
+      "approvalRequirement": "The archived Tauri React desktop tree is absent. Package/scanner contracts keep the `zz-archive` exclusion/skip name and do not require the directory to exist."
     },
     {
       "id": "handoff-updater-module",
@@ -1224,15 +1227,17 @@ process or production `config.json` / `remote.json`.
 }
 ```
 
-Current state: overall `HOLD` with two completed deletions. Final product
+Current state: overall `HOLD` with four completed deletions. Final product
 entry is sole GPUI `src/main.rs` (`run_native_shell` after hook relays and
 debug `--ui-preview`) plus durable `devmanager-host` attach/detach/full quit.
-`src/bin/devmanager-next.rs` and `web/src/sessions/` are absent and therefore
-`DELETED`; they must not return as a binary, compatibility shell, or
-permanent HOLD. `src/app/mod.rs` and the other `deferredDeletionPaths` remain
-present until owning lanes produce evidence, then they are deleted. Host
-`serve_request` remains a documented integration-test seam; production uses
-`serve_duplex`. Packaging/update handoff files (`src/updater/handoff.rs`,
+`src/bin/devmanager-next.rs`, `web/src/sessions/`, `src/ai/codex_rollout.rs`,
+and `zz-archive/tauri-react-v0.1.11/` are absent and therefore `DELETED`; they
+must not return as a binary, compatibility shell, identity/transcript source,
+or permanent HOLD. `src/app/mod.rs`, `src/sidebar/`,
+`src/services/session_manager.rs`, and the other `deferredDeletionPaths`
+remain present because named remaining dependents still compile against them.
+Host `serve_request` remains a documented integration-test seam; production
+uses `serve_duplex`. Packaging/update handoff files (`src/updater/handoff.rs`,
 `tests/update_contract.rs`, `tests/package_contract.rs`) exist, but signed
 release production-profile proof and explicit Phase 11 approval do not.
 Remaining integrated prerequisites are every phase-01 through phase-10 node
