@@ -3,7 +3,7 @@
 use std::net::{IpAddr, Ipv4Addr};
 
 use devmanager::connect::{
-    AccountId, DevicePublicId, HostPublicId as RelayHostPublicId, OpaqueRelay, RateKey, RelayError,
+    AccountId, DevicePublicId, RelayHostPublicId, OpaqueRelay, RateKey, RelayError,
     RouteId, RouteTicket, SignedRouteTicket, TicketAudience, TicketId, TicketSigningKey,
     MAX_RELAY_CONSUMED_NONCES, PRESENCE_TTL_SECS,
 };
