@@ -285,8 +285,9 @@ async fn read_request(stream: &mut TcpStream) -> Result<ParsedRequest, u16> {
             let mut body = rest;
             while body.len() < parsed.content_length {
                 let remaining = parsed.content_length - body.len();
+                let read_len = remaining.min(chunk.len());
                 let read = stream
-                    .read(&mut chunk[..remaining.min(chunk.len())])
+                    .read(&mut chunk[..read_len])
                     .await
                     .map_err(|_| 400_u16)?;
                 if read == 0 {

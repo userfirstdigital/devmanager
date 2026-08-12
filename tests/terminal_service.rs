@@ -302,13 +302,15 @@ fn close_semantics_stay_explicit() {
 fn attached_write_resize_forward_and_reject_runtime_failure() {
     let service = TerminalService::new();
     let runtime = MockAttachedRuntime::new(TerminalSize::new(40, 8).expect("size"));
+    let attached_runtime: Arc<dyn devmanager::terminal::service::AttachedTerminalRuntime> =
+        runtime.clone();
     let task = TaskId::new();
     let session = TerminalSessionId::new();
     let id = service
         .attach(
             task,
             TerminalSpec::new(session, TerminalSize::new(40, 8).expect("size")).expect("spec"),
-            Arc::clone(&runtime),
+            attached_runtime,
         )
         .expect("attach");
     let client = ClientId::new();

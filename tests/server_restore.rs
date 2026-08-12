@@ -45,6 +45,7 @@ fn merge_recovered_server_tabs_adds_missing() {
         project_id: "project-userfirst".to_string(),
         command_id: Some("cmd-dev".to_string()),
         pty_session_id: Some("cmd-dev".to_string()),
+        provider_session_id: None,
         label: Some("dev".to_string()),
         ssh_connection_id: None,
         browser_workspace: None,

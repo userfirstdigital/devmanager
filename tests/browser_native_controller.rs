@@ -258,10 +258,10 @@ fn stale_callbacks_are_ignored_and_cannot_mutate_the_live_binding() {
 #[test]
 fn mismatched_identity_or_generation_is_rejected() {
     let controller = BrowserNativeShellController::supported();
-    let identity = identity();
+    let bound_identity = identity();
     let lease = controller
         .bind(
-            identity,
+            bound_identity,
             workspace("project", "conversation"),
             BrowserGatewayBindingRef::new("process-session-a"),
         )

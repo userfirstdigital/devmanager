@@ -5204,7 +5204,8 @@ fn phase11_tauri_archive_is_absent() {
     assert_eq!(row["status"], "DELETED");
     assert_eq!(row["legacy"]["path"], "zz-archive/tauri-react-v0.1.11/");
 
-    let deferred = current_contract()["deferredDeletionPaths"]
+    let contract = current_contract();
+    let deferred = contract["deferredDeletionPaths"]
         .as_array()
         .expect("deferredDeletionPaths");
     assert!(!deferred

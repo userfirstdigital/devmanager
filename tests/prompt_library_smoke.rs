@@ -206,11 +206,11 @@ fn phase7_prompt_library_smoke_public_api_contract() {
     assert_eq!(second.body, fixture.v2_body);
     assert_eq!(
         first.body_sha256,
-        Sha256::digest(first.body.as_bytes()).into()
+        <[u8; 32]>::from(Sha256::digest(first.body.as_bytes()))
     );
     assert_eq!(
         second.body_sha256,
-        Sha256::digest(second.body.as_bytes()).into()
+        <[u8; 32]>::from(Sha256::digest(second.body.as_bytes()))
     );
 
     let diff = diff_versions(&first.body, &second.body);
@@ -220,7 +220,8 @@ fn phase7_prompt_library_smoke_public_api_contract() {
     assert!(diff.hunks().iter().any(|hunk| {
         hunk.changes.iter().any(|change| {
             change.kind() == LineChangeKind::Added
-                && change.text_sha256() == Sha256::digest(b"Record the exact version hash.").into()
+                && change.text_sha256()
+                    == <[u8; 32]>::from(Sha256::digest(b"Record the exact version hash."))
         })
     }));
 
