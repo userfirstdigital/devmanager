@@ -21,7 +21,12 @@ use devmanager::host::{
     PhysicalExitArmRequest, SupervisedHostExecutor, HOST_EXIT_ALREADY_RUNNING,
 };
 use devmanager::kernel::CommandBus;
-use devmanager::protocol::{Capability, CapabilitySet, FrameLimits};
+use devmanager::protocol::{
+    Capability, CapabilitySet, FrameLimits, PROTOCOL_MAJOR, PROTOCOL_MINOR,
+};
+use devmanager::updater::{
+    clear_update_handoff_recovery_marker, read_update_handoff_recovery_marker, UpdaterService,
+};
 use uuid::Uuid;
 
 const MAX_INSTANCE_LABEL_CHARS: usize = 64;
@@ -984,6 +989,7 @@ async fn serve_foreground_host(
         ]),
         local_limits: FrameLimits::v1_default(),
     };
+    let server_build = hello_config.server_build.clone();
 
     // The first instance proves no pre-existing pipe server is present. Each
     // later instance is created by this same lock owner before the connected
@@ -1001,6 +1007,24 @@ async fn serve_foreground_host(
         },
     ) = HostRequestExecutor::start_supervised_with_config_store(bus, config_store)
         .map_err(|error| format!("invalid host project configuration: {error}"))?;
+
+    // Bind the one shared updater FSM + timed IPC port to live Host Hello.
+    // Clients must not create a second gate; they drive this handle's port.
+    let bound_updater = UpdaterService::new();
+    request_handle.bind_updater_runtime(
+        &bound_updater,
+        host_boot_id,
+        &server_build,
+        PROTOCOL_MAJOR,
+        PROTOCOL_MINOR,
+    );
+    if let Err(error) =
+        complete_update_handoff_recovery_if_present(&request_handle, &server_build, &bound_updater)
+    {
+        return Err(error);
+    }
+    let _bound_updater = bound_updater;
+
     let mut connection_tasks = tokio::task::JoinSet::new();
     // `accept_with_successor` owns its listener. Keep the future pinned across
     // unrelated task-completion branches so a normal client disconnect never
@@ -1081,6 +1105,42 @@ async fn serve_foreground_host(
     };
 
     finish_supervised_host(exit, &mut connection_tasks, request_handle, join, armed).await
+}
+
+#[cfg(windows)]
+fn installed_binaries_dir() -> Result<std::path::PathBuf, String> {
+    let exe = std::env::current_exe().map_err(|error| {
+        format!("unable to resolve host executable for update recovery: {error}")
+    })?;
+    exe.parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| "host executable has no parent directory".to_string())
+}
+
+/// New production host startup: validate durable handoff marker against live
+/// Host Hello, complete matching start + resync, then clear the marker.
+/// Failed validation leaves the recoverable marker and fails closed.
+#[cfg(windows)]
+fn complete_update_handoff_recovery_if_present(
+    request_handle: &HostRequestHandle,
+    server_build: &str,
+    updater: &UpdaterService,
+) -> Result<(), String> {
+    let install_dir = installed_binaries_dir()?;
+    let Some(marker) = read_update_handoff_recovery_marker(&install_dir)? else {
+        return Ok(());
+    };
+    updater.bind_live_host_hello(server_build, PROTOCOL_MAJOR, PROTOCOL_MINOR);
+    let gate = request_handle.update_runtime_gate();
+    let install_dir_for_clear = install_dir.clone();
+    gate.complete_recovery_from_marker(
+        &marker,
+        server_build,
+        PROTOCOL_MAJOR,
+        PROTOCOL_MINOR,
+        std::time::SystemTime::now(),
+        move || clear_update_handoff_recovery_marker(&install_dir_for_clear),
+    )
 }
 
 #[cfg(all(windows, debug_assertions, test))]

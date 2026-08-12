@@ -28,10 +28,13 @@ pub use handoff::{
     HostUpdateRuntimeGate, IdentityPreservationReport, IgnoredUserStateKind,
     PreservationCheckpoint, PreservationError, PreservedUserStateKind, SilentReplacementDecision,
     UpdateCutoverKind, UpdateHandoffError, UpdateHandoffMachine, UpdateHandoffPhase,
-    UpdateHandoffToken, UpdateResourceInspection, UserStateClassification, UPDATE_IPC_DEADLINE,
+    UpdateHandoffRecoveryMarker, UpdateHandoffToken, UpdateResourceInspection,
+    UserStateClassification, UPDATE_HANDOFF_RECOVERY_MARKER, UPDATE_IPC_DEADLINE,
 };
 pub use replace::{
-    StagedBinaryReplacement, StagedReplaceError, StagedReplacePhase, StagedReplaceProgress,
+    clear_update_handoff_recovery_marker, persist_update_handoff_recovery_marker,
+    read_update_handoff_recovery_marker, StagedBinaryReplacement, StagedReplaceError,
+    StagedReplacePhase, StagedReplaceProgress,
 };
 
 const UPDATE_ENDPOINTS_VAR: &str = "DEVMANAGER_UPDATE_ENDPOINTS";
@@ -527,6 +530,22 @@ impl UpdaterService {
         }
     }
 
+    /// Production client startup: bind live Host Hello and fail closed when a
+    /// residual recovery marker disagrees with the negotiated Hello.
+    pub fn observe_production_host_hello(
+        &self,
+        server_build: &str,
+        protocol_major: u16,
+        protocol_minor: u16,
+        install_dir: &Path,
+    ) -> Result<(), String> {
+        self.bind_live_host_hello(server_build, protocol_major, protocol_minor);
+        if let Some(marker) = read_update_handoff_recovery_marker(install_dir)? {
+            marker.validate_live_host_hello(server_build, protocol_major, protocol_minor)?;
+        }
+        Ok(())
+    }
+
     /// Inject an owned Send+'static active-resource probe (host IPC / executor).
     ///
     /// Borrowed probes must not be stored here. Use
@@ -770,6 +789,25 @@ impl UpdaterService {
                 self.inner.restore_ready_snapshot(Some(error.clone()));
                 return Err(error);
             }
+        }
+
+        // Persist recoverable handoff marker before irreversible binary commit /
+        // old-process exit so the new host/client can finish Hello resync.
+        let recovery = UpdateHandoffRecoveryMarker {
+            token_id,
+            host_boot_id: uuid::Uuid::nil(),
+            inspection_id: 0,
+            target_version: ready_update.update.version.clone(),
+            client_build: ready_update.package_identity.client_build.clone(),
+            host_build: ready_update.package_identity.host_build.clone(),
+            protocol_major: ready_update.package_identity.protocol_major,
+            protocol_minor: ready_update.package_identity.protocol_minor,
+            sealed: true,
+        };
+        if let Err(error) = persist_update_handoff_recovery_marker(&install_dir, &recovery) {
+            let _ = self.abort_update_handoff();
+            self.inner.restore_ready_snapshot(Some(error.clone()));
+            return Err(error);
         }
 
         let version = ready_update.update.version.clone();
@@ -1138,7 +1176,12 @@ impl UpdaterInner {
                         return;
                     }
                 };
-            if pending.packager_target != update.target
+            // Update.target is OS-only; pending.packager_target is the OS-ARCH
+            // manifest key used for release metadata selection.
+            let os_target = packager_os_target();
+            let arch_target = packager_architecture_target();
+            if os_target.as_deref() != Some(update.target.as_str())
+                || arch_target.as_deref() != Some(pending.packager_target.as_str())
                 || pending.download_url != update.download_url.as_str()
                 || pending.signature != update.signature
                 || pending.format != update.format.to_string()
@@ -1699,11 +1742,18 @@ fn arm_pending_identity_from_packager_config(
         ));
     }
     let current = resolve_running_package_identity();
+    // cargo-packager's `Update.target` is the OS selector used to choose the
+    // updater format (for example `windows`).  The signed manifest, however,
+    // is indexed by the full OS-ARCH key (for example `windows-x86_64`).
+    // Keep those two identities separate: comparing Update.target with the
+    // manifest key makes every Windows release fail closed before download.
     let platform = packager_architecture_target()
         .ok_or_else(|| "unable to derive cargo_packager_updater target key".to_string())?;
-    if update.target != platform {
+    let os_target = packager_os_target()
+        .ok_or_else(|| "unable to derive cargo_packager_updater OS target".to_string())?;
+    if update.target != os_target {
         return Err(format!(
-            "packager update target `{}` does not match runtime architecture `{platform}`",
+            "packager update target `{}` does not match runtime OS `{os_target}`",
             update.target
         ));
     }
@@ -1724,6 +1774,21 @@ fn arm_pending_identity_from_packager_config(
 /// Exact packager `OS-ARCH` key (`cargo_packager_updater::target()`).
 pub fn packager_architecture_target() -> Option<String> {
     cargo_packager_updater::target()
+}
+
+/// The `cargo_packager_updater::Update.target` value used for request/format
+/// selection.  This intentionally omits the architecture; the remote release
+/// manifest is still keyed by [`packager_architecture_target`].
+pub fn packager_os_target() -> Option<String> {
+    if cfg!(target_os = "windows") {
+        Some("windows".to_string())
+    } else if cfg!(target_os = "macos") {
+        Some("macos".to_string())
+    } else if cfg!(target_os = "linux") {
+        Some("linux".to_string())
+    } else {
+        None
+    }
 }
 
 /// Materialize both product binaries into `staged_dir` from verified download bytes.
@@ -2068,7 +2133,7 @@ mod tests {
             current_version: "0.2.0".to_string(),
             version: version.to_string(),
             date: None,
-            target: "windows-x86_64".to_string(),
+            target: "windows".to_string(),
             extract_path: PathBuf::from("."),
             download_url: Url::parse("https://example.com/devmanager.exe").unwrap(),
             signature: "signature".to_string(),
@@ -2115,7 +2180,8 @@ mod tests {
         let admitted = AdmittedUpdate {
             version: parse_version(&update.version).unwrap(),
             notes: update.body.clone(),
-            platform: update.target.clone(),
+            platform: packager_architecture_target()
+                .unwrap_or_else(|| "windows-x86_64".to_string()),
             url: update.download_url.to_string(),
             signature: update.signature.clone(),
             format: Some(update.format.to_string()),

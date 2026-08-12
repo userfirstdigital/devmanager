@@ -92,9 +92,13 @@ The manifest shape matches the `cargo-packager-updater` multi-platform format an
 - `version`
 - `notes`
 - `pub_date`
+- `minimum_protocol`
 - `platforms.<target>.format`
 - `platforms.<target>.signature`
 - `platforms.<target>.url`
+- `platforms.<target>.hash` (`sha256:<hex>`)
+- `platforms.<target>.client_build`
+- `platforms.<target>.host_build`
 
 The GitHub-hosted updater flow assumes public release assets. If releases are private, the native updater will need an authenticated distribution endpoint instead of raw GitHub asset URLs.
 
@@ -107,8 +111,9 @@ The GitHub-hosted updater flow assumes public release assets. If releases are pr
 - The workflow uses `Cargo.toml` when it is newer than the latest stable `vX.Y.Z` tag; otherwise it selects the next patch version.
 - The prepare job writes the release version into `Cargo.toml` and `Cargo.lock`, then commits that bump back to `master` with `[skip ci]`.
 - Every platform checks out that exact prepared commit, and the release tag is explicitly pinned to the same commit rather than the moving branch head.
-- Windows builds publish updater-signed `nsis` installers (plus `wix` on x64). macOS builds publish updater-signed `app` bundles plus `dmg` artifacts.
-- The workflow creates a new draft without updating an existing release, requires the exact 11-file platform/signature/manifest contract, and verifies every uploaded size and SHA-256 digest before publication.
+- Windows builds publish updater-signed dual-binary ZIP payloads for staged replace (plus NSIS/WiX installers for manual install on x64). macOS builds publish updater-signed `app` bundles plus `dmg` artifacts.
+- `latest.json` includes `minimum_protocol`, per-platform `hash` (`sha256:`), `client_build`, `host_build`, and exact `format`/`url`/`signature`.
+- The workflow creates a new draft without updating an existing release, requires the exact 15-file platform/signature/manifest contract (NSIS/MSI/DMG for manual install plus signed dual-binary updater ZIPs), and verifies every uploaded size and SHA-256 digest before publication.
 - A push to `master` can therefore publish immediately when the required secrets and variables are configured. Treat the push as the production approval point.
 
 ## Required GitHub Secrets And Variables

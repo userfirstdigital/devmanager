@@ -331,6 +331,58 @@ jobs:
           DEVMANAGER_UPDATE_WINDOWS_INSTALL_MODE: passive
         run: cargo packager --release --formats "${{ matrix.formats }}"
 
+      - name: Build signed dual-binary updater payload
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          VERSION: ${{ needs.prepare.outputs.release_version }}
+          CARGO_PACKAGER_SIGN_PRIVATE_KEY: ${{ secrets.CARGO_PACKAGER_SIGN_PRIVATE_KEY }}
+          CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD: ${{ secrets.CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          import pathlib
+          import subprocess
+          import zipfile
+
+          platform = os.environ["PLATFORM"]
+          version = os.environ["VERSION"]
+          release_dir = pathlib.Path("target/release")
+          client = release_dir / "devmanager.exe"
+          host = release_dir / "devmanager-host.exe"
+          for path in (client, host):
+              if not path.is_file() or path.stat().st_size <= 0:
+                  raise SystemExit(f"Missing release binary for dual updater payload: {path}")
+
+          out_dir = pathlib.Path("dist/packager")
+          out_dir.mkdir(parents=True, exist_ok=True)
+          arch = "x64" if platform.endswith("x86_64") else "arm64"
+          zip_name = f"DevManager_{version}_{arch}-update.zip"
+          zip_path = out_dir / zip_name
+          if zip_path.exists():
+              zip_path.unlink()
+
+          # Store-method ZIP with exactly the two product binaries (no installers).
+          with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_STORED) as archive:
+              archive.write(client, arcname="devmanager.exe")
+              archive.write(host, arcname="devmanager-host.exe")
+          names = set(zipfile.ZipFile(zip_path).namelist())
+          if names != {"devmanager.exe", "devmanager-host.exe"}:
+              raise SystemExit(f"Dual updater ZIP must contain only product binaries, found {sorted(names)}")
+
+          # Sign with the same packager key used for NSIS/MSI/DMG artifacts.
+          subprocess.run(
+              ["cargo", "packager", "signer", "sign", str(zip_path)],
+              check=True,
+          )
+          sig = pathlib.Path(f"{zip_path}.sig")
+          if not sig.is_file() or sig.stat().st_size <= 0:
+              raise SystemExit(f"Missing dual updater signature: {sig}")
+          print(f"Created signed dual-binary updater payload {zip_path.name}")
+          PY
+
       - name: Collect packaged artifacts
         shell: bash
         env:
@@ -374,6 +426,7 @@ jobs:
         run: |
           python - <<'PY'
           import datetime as dt
+          import hashlib
           import json
           import os
           import pathlib
@@ -394,10 +447,14 @@ jobs:
                   ("Windows x64 NSIS signature", "*_x64-setup.exe.sig"),
                   ("Windows x64 WiX installer", "*.msi"),
                   ("Windows x64 WiX signature", "*.msi.sig"),
+                  ("Windows x64 dual-binary updater", "*_x64-update.zip"),
+                  ("Windows x64 dual-binary updater signature", "*_x64-update.zip.sig"),
               ],
               "windows-aarch64": [
                   ("Windows ARM64 NSIS installer", "*_arm64-setup.exe"),
                   ("Windows ARM64 NSIS signature", "*_arm64-setup.exe.sig"),
+                  ("Windows ARM64 dual-binary updater", "*_arm64-update.zip"),
+                  ("Windows ARM64 dual-binary updater signature", "*_arm64-update.zip.sig"),
               ],
               "macos-aarch64": [
                   ("macOS updater archive", "*.app.tar.gz"),
@@ -406,13 +463,18 @@ jobs:
                   ("macOS disk image signature", "*.dmg.sig"),
               ],
           }
+          # latest.json points at dual-binary ZIP/DMUP1-compatible payloads for
+          # Windows staged replace. NSIS/MSI/DMG remain published for manual install.
+          # Format stays `nsis`/`app` so cargo-packager-updater can parse the
+          # manifest; DevManager materializes ZIP/DMUP1 bytes in-process and never
+          # extracts installers.
           updater_assets = {
               "windows-x86_64": {
-                  "pattern": "*_x64-setup.exe",
+                  "pattern": "*_x64-update.zip",
                   "format": "nsis",
               },
               "windows-aarch64": {
-                  "pattern": "*_arm64-setup.exe",
+                  "pattern": "*_arm64-update.zip",
                   "format": "nsis",
               },
               "macos-aarch64": {
@@ -453,9 +515,9 @@ jobs:
                       read_signature(asset)
 
           names = [asset.name for asset in selected]
-          if len(selected) != 10 or len(names) != len(set(names)):
+          if len(selected) != 14 or len(names) != len(set(names)):
               raise SystemExit(
-                  f"Release contract requires 10 uniquely named platform files, found {sorted(names)}"
+                  f"Release contract requires 14 uniquely named platform files, found {sorted(names)}"
               )
           for asset in selected:
               shutil.copy2(asset, publish_dir / asset.name)
@@ -467,16 +529,21 @@ jobs:
                   raise SystemExit(f"Missing packaged artifacts for {platform}: {directory}")
               asset = pick_single_asset(directory, metadata["pattern"], f"{platform} updater asset")
               signature = read_signature(pathlib.Path(f"{asset}.sig"))
+              digest = hashlib.sha256(asset.read_bytes()).hexdigest()
               platforms[platform] = {
                   "format": metadata["format"],
                   "signature": signature,
                   "url": f"https://github.com/{repo}/releases/download/{tag_name}/{asset.name}",
+                  "hash": f"sha256:{digest}",
+                  "client_build": f"devmanager/{version}",
+                  "host_build": f"devmanager-host/{version}",
               }
 
           manifest = {
               "version": version,
               "notes": "See the GitHub release notes for details.",
               "pub_date": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "minimum_protocol": "1.0",
               "platforms": platforms,
           }
           manifest_path = publish_dir / "latest.json"

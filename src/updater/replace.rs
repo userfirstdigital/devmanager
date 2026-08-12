@@ -8,13 +8,62 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use super::handoff::{extract_build_version, AtomicBundleError, AtomicInstallerBundle};
+use super::handoff::{
+    extract_build_version, AtomicBundleError, AtomicInstallerBundle, UpdateHandoffRecoveryMarker,
+    UPDATE_HANDOFF_RECOVERY_MARKER,
+};
 
 const CLIENT_EXE: &str = "devmanager.exe";
 const HOST_EXE: &str = "devmanager-host.exe";
 const CLIENT_BACKUP_SUFFIX: &str = ".devmanager-update.bak";
 const HOST_BACKUP_SUFFIX: &str = ".devmanager-host-update.bak";
 const STAGE_MARKER: &str = "devmanager-update-stage.json";
+
+/// Absolute path of the durable handoff recovery marker beside installed binaries.
+pub fn update_handoff_recovery_marker_path(install_dir: &Path) -> PathBuf {
+    install_dir.join(UPDATE_HANDOFF_RECOVERY_MARKER)
+}
+
+/// Persist the sealed handoff recovery marker before old-process exit.
+pub fn persist_update_handoff_recovery_marker(
+    install_dir: &Path,
+    marker: &UpdateHandoffRecoveryMarker,
+) -> Result<(), String> {
+    let path = update_handoff_recovery_marker_path(install_dir);
+    let body = serde_json::to_string_pretty(marker)
+        .map_err(|error| format!("failed to serialize update recovery marker: {error}"))?;
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, format!("{body}\n"))
+        .map_err(|error| format!("failed to write update recovery marker temp: {error}"))?;
+    fs::rename(&tmp, &path)
+        .map_err(|error| format!("failed to publish update recovery marker: {error}"))?;
+    Ok(())
+}
+
+/// Read a durable handoff recovery marker when present.
+pub fn read_update_handoff_recovery_marker(
+    install_dir: &Path,
+) -> Result<Option<UpdateHandoffRecoveryMarker>, String> {
+    let path = update_handoff_recovery_marker_path(install_dir);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let body = fs::read_to_string(&path)
+        .map_err(|error| format!("failed to read update recovery marker: {error}"))?;
+    let marker: UpdateHandoffRecoveryMarker = serde_json::from_str(&body)
+        .map_err(|error| format!("corrupt update recovery marker (fail closed): {error}"))?;
+    Ok(Some(marker))
+}
+
+/// Transactionally clear the recovery marker after successful resync.
+pub fn clear_update_handoff_recovery_marker(install_dir: &Path) -> Result<(), String> {
+    let path = update_handoff_recovery_marker_path(install_dir);
+    if !path.exists() {
+        return Ok(());
+    }
+    fs::remove_file(&path)
+        .map_err(|error| format!("failed to clear update recovery marker: {error}"))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StagedReplaceError {
