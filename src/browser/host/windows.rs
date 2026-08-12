@@ -1,9 +1,9 @@
 use super::{
     acknowledge_attachment_projection_and_reconcile_pins, browser_user_input_initialization_script,
     require_completed_wry_task_identity, validate_browser_url, BrowserAppExitDisposition,
-    BrowserHostState, BrowserMemoryTarget, BrowserNativeViewError, BrowserNativeViewReceipt,
-    BrowserNativeViewRegistration, BrowserNativeWindowBuildLease, BrowserNativeWindowLifetime,
-    BrowserTaskSurfaceBindBlocker, HostOwnedNativeSurfaceBackend,
+    BrowserHostState, BrowserMemoryTarget, BrowserNativeSurfaceBackend, BrowserNativeViewError,
+    BrowserNativeViewReceipt, BrowserNativeViewRegistration, BrowserNativeWindowBuildLease,
+    BrowserNativeWindowLifetime, BrowserTaskSurfaceBindBlocker, HostOwnedNativeSurfaceBackend,
 };
 use crate::browser::downloads::{
     prepare_verified_storage_layout, verified_app_config_root, verified_unique_download_path,
@@ -33,8 +33,9 @@ use crate::browser::{
     BrowserDownloadState, BrowserDownloadStore, BrowserError, BrowserGatewayRegistrar,
     BrowserHostControl, BrowserHostEvent, BrowserHostStatus, BrowserInvocationActor,
     BrowserInvocationContext, BrowserJournalActor, BrowserJournalEntry,
-    BrowserLocatorFailureTarget, BrowserNetworkEntry, BrowserNetworkOperation,
-    BrowserOperationQueue, BrowserOperationTarget, BrowserPageIpcMessage, BrowserPageLoadState,
+    BrowserLocatorFailureTarget, BrowserNativeHostCommand, BrowserNativeHostOutcome,
+    BrowserNativeLeaseFence, BrowserNetworkEntry, BrowserNetworkOperation, BrowserOperationQueue,
+    BrowserOperationTarget, BrowserPageIpcMessage, BrowserPageLoadState,
     BrowserPageRecordingAuthority, BrowserPageRecordingEnvelope, BrowserPageRecordingIngress,
     BrowserPageRecordingIpc, BrowserPageRecordingIpcError, BrowserPageRecordingSubmit,
     BrowserPageRecordingTransport, BrowserPageRecordingTransportFailureKind, BrowserPaneSurface,
@@ -45,9 +46,8 @@ use crate::browser::{
     BrowserResourceStore, BrowserResponse, BrowserRevision, BrowserRuntimeTarget,
     BrowserScreenshotMode, BrowserSnapshotSummary, BrowserStorageLayout, BrowserUploadResult,
     BrowserWaitResult, BrowserWorkflowCoordinator, BrowserWorkflowReviewMutation,
-    BrowserNativeHostCommand, BrowserNativeHostOutcome, BrowserNativeLeaseFence,
-    BrowserWorkflowReviewProjection,
-    BrowserWorkspaceKey, BrowserWorkspaceSnapshot, MAX_BROWSER_ACTIONS, MAX_BROWSER_RECIPE_WAIT_MS,
+    BrowserWorkflowReviewProjection, BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
+    MAX_BROWSER_ACTIONS, MAX_BROWSER_RECIPE_WAIT_MS,
 };
 use crate::domain::id::ClientId;
 use crate::protocol::{
@@ -1625,8 +1625,11 @@ impl BrowserWebViewHost {
             &request.descriptor.child_hwnd,
             &destination,
         )?;
-        self.state
-            .reattach_native_view_with_backend(request, destination, &mut self.surface_backend)
+        self.state.reattach_native_view_with_backend(
+            request,
+            destination,
+            &mut self.surface_backend,
+        )
     }
 
     /// NativeShell-facing apply for an already-admitted controller command.
@@ -1654,9 +1657,11 @@ impl BrowserWebViewHost {
                 let Some(receipt) = self.native_view(&identity.protocol_surface()) else {
                     return Err(native_shell_missing_view());
                 };
-                if receipt.attached_parent.as_ref().is_some_and(|parent| {
-                    parent.raw_value() == destination.raw_value()
-                }) {
+                if receipt
+                    .attached_parent
+                    .as_ref()
+                    .is_some_and(|parent| parent.raw_value() == destination.raw_value())
+                {
                     self.set_bounds(*bounds)?;
                     return Ok(BrowserNativeHostOutcome::Idempotent);
                 }
@@ -1705,7 +1710,9 @@ impl BrowserWebViewHost {
                 }
                 Ok(BrowserNativeHostOutcome::CommandHandoff)
             }
-            BrowserNativeHostCommand::Resize { identity, bounds, .. } => {
+            BrowserNativeHostCommand::Resize {
+                identity, bounds, ..
+            } => {
                 if self.native_view(&identity.protocol_surface()).is_none() {
                     return Err(native_shell_missing_view());
                 }
@@ -1762,11 +1769,12 @@ impl BrowserWebViewHost {
         workspace_key: &BrowserWorkspaceKey,
         gateway: &crate::browser::BrowserGatewayBindingRef,
     ) -> Result<(), BrowserError> {
-        let registrar = self.gateway_registrar.clone().ok_or_else(|| {
-            BrowserError::InvalidInvocation {
-                field: "gateway".to_string(),
-            }
-        })?;
+        let registrar =
+            self.gateway_registrar
+                .clone()
+                .ok_or_else(|| BrowserError::InvalidInvocation {
+                    field: "gateway".to_string(),
+                })?;
         let expected = gateway.process_session_id();
         let found = registrar.process_session_id_for_workspace(workspace_key);
         if found.as_deref() != Some(expected) {
@@ -8637,8 +8645,12 @@ fn current_host_process_identity() -> Result<BrowserHostProcessIdentity, Browser
         .map_err(|_| BrowserNativeViewError::LiveWryObservationUnavailable)?;
     let creation_time = current_process_creation_time_100ns()
         .ok_or(BrowserNativeViewError::LiveWryObservationUnavailable)?;
-    BrowserHostProcessIdentity::new(pid, creation_time, executable.to_string_lossy().into_owned())
-        .map_err(|_| BrowserNativeViewError::LiveWryObservationUnavailable)
+    BrowserHostProcessIdentity::new(
+        pid,
+        creation_time,
+        executable.to_string_lossy().into_owned(),
+    )
+    .map_err(|_| BrowserNativeViewError::LiveWryObservationUnavailable)
 }
 
 fn current_process_creation_time_100ns() -> Option<u64> {
