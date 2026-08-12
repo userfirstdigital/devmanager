@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "kind": "prompt_library_lifecycle_v1",
+  "unicode_title": true,
+  "version_count": 10,
+  "history_count": 500,
+  "chain_count": 2,
+  "archived_prompt": true,
+  "provider_slash_commands": 1,
+  "five_link_chain": true
+}

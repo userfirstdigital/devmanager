@@ -9,6 +9,7 @@ use std::sync::OnceLock;
 use serde::{Deserialize, Serialize};
 
 use crate::domain::command::{Command, CommandEnvelope, CreateTaskIntent, RenameTaskIntent};
+use crate::domain::id::{AgentSessionId, PromptChainId, PromptVersionId};
 use crate::domain::query::{Query, QueryEnvelope};
 use crate::domain::task::{
     ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity, TaskFacts,
@@ -19,6 +20,7 @@ use crate::prompts::projection::{
     OwnerDeviceCapability, PromptCursor, PromptLibraryRequest, PromptNamespace,
     PromptProjectionError,
 };
+use crate::prompts::ui::composer::{ComposerInsertionMode, PutPromptVersionInComposer};
 use crate::protocol::{Capability, CapabilitySet};
 
 /// Stable id for listing the shared action catalog.
@@ -45,6 +47,8 @@ pub const ACTION_PROMPT_SEARCH_PAGE: &str = "prompt.library.search_page";
 pub const ACTION_PROMPT_CHAIN_PAGE: &str = "prompt.library.chain_page";
 /// Read-only host query for a personal prompt history page.
 pub const ACTION_PROMPT_HISTORY_PAGE: &str = "prompt.library.history_page";
+/// Client-local composer insertion. Not a host catalog action and never sends.
+pub const ACTION_PROMPT_PUT_IN_COMPOSER: &str = "prompt.library.put_in_composer";
 
 /// Where an action applies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -264,6 +268,92 @@ pub fn action_enabled(id: &str, granted: CapabilitySet) -> bool {
 
 pub fn action_by_id(id: &str) -> Option<&'static ActionDescriptor> {
     registered_actions().find(|action| action.id == id)
+}
+
+/// Build the client-local put-in-composer action. Host catalog stays unchanged.
+pub fn put_prompt_version_in_composer(
+    task_id: TaskId,
+    agent_session_id: AgentSessionId,
+    prompt_version_id: PromptVersionId,
+    insertion: ComposerInsertionMode,
+    chain_link_id: Option<crate::domain::id::PromptChainLinkId>,
+) -> PutPromptVersionInComposer {
+    crate::client::composer::put_prompt_version_in_composer(
+        task_id,
+        agent_session_id,
+        prompt_version_id,
+        insertion,
+        chain_link_id,
+    )
+}
+
+pub fn prompt_search_page_request(
+    request_id: RequestId,
+    client_id: ClientId,
+    capability: &OwnerDeviceCapability,
+    query: String,
+    cursor: Option<PromptCursor>,
+) -> Result<PromptLibraryRequest, PromptProjectionError> {
+    PromptLibraryRequest::search(
+        request_id,
+        client_id,
+        capability,
+        PromptNamespace::Personal,
+        query,
+        cursor,
+    )
+}
+
+pub fn prompt_history_page_request(
+    request_id: RequestId,
+    client_id: ClientId,
+    capability: &OwnerDeviceCapability,
+    expected_library_revision: Option<u64>,
+    cursor: Option<PromptCursor>,
+) -> Result<PromptLibraryRequest, PromptProjectionError> {
+    PromptLibraryRequest::history_page(
+        request_id,
+        client_id,
+        capability,
+        expected_library_revision,
+        cursor,
+    )
+}
+
+pub fn prompt_diff_request(
+    request_id: RequestId,
+    client_id: ClientId,
+    capability: &OwnerDeviceCapability,
+    old_version_id: PromptVersionId,
+    new_version_id: PromptVersionId,
+    cursor: Option<PromptCursor>,
+) -> Result<PromptLibraryRequest, PromptProjectionError> {
+    PromptLibraryRequest::diff(
+        request_id,
+        client_id,
+        capability,
+        old_version_id,
+        new_version_id,
+        cursor,
+    )
+}
+
+pub fn prompt_chain_page_request(
+    request_id: RequestId,
+    client_id: ClientId,
+    capability: &OwnerDeviceCapability,
+    chain_id: PromptChainId,
+    expected_library_revision: Option<u64>,
+    cursor: Option<PromptCursor>,
+) -> Result<PromptLibraryRequest, PromptProjectionError> {
+    PromptLibraryRequest::chain_page(
+        request_id,
+        client_id,
+        capability,
+        Some(chain_id),
+        expected_library_revision,
+        cursor,
+    )
 }
 
 pub fn prompt_metadata_page_request(

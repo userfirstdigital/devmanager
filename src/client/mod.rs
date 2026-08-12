@@ -3,6 +3,7 @@
 
 pub mod action;
 pub mod cli;
+pub mod composer;
 mod connection;
 mod host_client;
 pub mod model;
@@ -13,6 +14,10 @@ pub use action::{
     ACTION_HOST_ACTIONS, ACTION_HOST_STATUS, ACTION_TASK_SHOW,
 };
 pub use cli::{dispatch_ctl_from_args, parse_ctl_args, run_ctl, CliError, CtlCommand};
+pub use composer::{
+    apply_put_prompt_version, put_prompt_version_in_composer, ComposerDraft, ComposerInsertionMode,
+    ExactPromptPayload, ProviderCommandSuggestion, PutPromptVersionInComposer,
+};
 pub use connection::{connect, perform_client_hello, ClientConnection, UnsolicitedServerMessage};
 pub use host_client::{
     ArtifactContentBatch, EventReplayBatch, HostClient, HostClientConfig, TrackedOperation,

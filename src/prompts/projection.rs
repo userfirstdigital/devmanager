@@ -978,6 +978,18 @@ impl PromptChainLinkRecord {
         })
     }
 
+    pub fn id(&self) -> PromptChainLinkId {
+        self.id
+    }
+
+    pub fn chain_id(&self) -> PromptChainId {
+        self.chain_id
+    }
+
+    pub fn position(&self) -> u32 {
+        self.position
+    }
+
     pub fn prompt_id(&self) -> PromptId {
         self.prompt_id
     }

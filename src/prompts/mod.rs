@@ -6,6 +6,8 @@ pub mod projection;
 pub mod search;
 pub mod service;
 pub mod store;
+#[path = "../ui/mod.rs"]
+pub mod ui;
 
 pub use diff::*;
 pub use diff_service::*;
