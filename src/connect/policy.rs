@@ -9,6 +9,7 @@
 
 use std::fmt;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[cfg(test)]
@@ -27,11 +28,17 @@ pub const ACTIVE_SESSION_IDLE_LIMIT_MS: u64 = 15 * 60 * 1_000;
 
 const DEFAULT_GRANT_LIFETIME: Duration = Duration::from_secs(15 * 60);
 
+#[cfg(test)]
+// Telemetry tests advance a logical clock across the retention window. Keep
+// their helper grant alive independently of that clock so the tests exercise
+// retention and freshness rather than wall-clock expiry.
+const TEST_GRANT_LIFETIME: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
 /// A host-captured monotonic timestamp.  This capability has no public
 /// constructor and therefore cannot be replaced by a transport-supplied
 /// `now_ms` value.  Tests use the private deterministic constructor below.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct HostTimeAuthority {
+pub(crate) struct HostTimeAuthority {
     instant: Instant,
 }
 
@@ -49,7 +56,7 @@ impl HostTimeAuthority {
     }
 
     #[cfg(test)]
-    fn at_test_millis(millis: u64) -> Self {
+    pub(crate) fn at_test_millis(millis: u64) -> Self {
         static TEST_EPOCH: OnceLock<Instant> = OnceLock::new();
         let epoch = *TEST_EPOCH.get_or_init(Instant::now);
         Self {
@@ -111,7 +118,6 @@ impl ManagedField {
     pub const ALLOWLIST: &'static [Self] = &[
         Self::TaskState,
         Self::TaskAttention,
-        Self::TaskAssignmentReference,
         Self::ProviderKind,
         Self::ProviderState,
         Self::SourceTimestamp,
@@ -121,8 +127,6 @@ impl ManagedField {
         Self::HumanTurnCount,
         Self::ActiveSessionInterval,
         Self::GitSummary,
-        Self::HostHealth,
-        Self::ApprovedArtifactReference,
     ];
 
     /// Explicitly denied fields remain named so future projections cannot
@@ -147,7 +151,6 @@ impl ManagedField {
             self,
             Self::TaskState
                 | Self::TaskAttention
-                | Self::TaskAssignmentReference
                 | Self::ProviderKind
                 | Self::ProviderState
                 | Self::SourceTimestamp
@@ -157,8 +160,6 @@ impl ManagedField {
                 | Self::HumanTurnCount
                 | Self::ActiveSessionInterval
                 | Self::GitSummary
-                | Self::HostHealth
-                | Self::ApprovedArtifactReference
         )
     }
 
@@ -432,6 +433,7 @@ pub struct ManagementGrant {
     role: ManagementRole,
     issued_at: HostTimeAuthority,
     expires_at: HostTimeAuthority,
+    policy_revision: u32,
     state: GrantState,
 }
 
@@ -451,9 +453,9 @@ const GRANT_ACTIVE: u8 = 0;
 const GRANT_REVOKED: u8 = 1;
 const GRANT_CONSUMED: u8 = 2;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct GrantState {
-    status: AtomicU8,
+    status: Arc<AtomicU8>,
 }
 
 impl PartialEq for GrantState {
@@ -484,6 +486,114 @@ impl fmt::Debug for ManagementGrant {
 pub enum GrantError {
     ExpiryNotAfterIssue,
     ZeroActionEpoch,
+    ZeroPolicyRevision,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GrantBindError {
+    Unavailable,
+}
+
+#[derive(Clone)]
+pub(crate) struct ObservationGrantLease {
+    id: GrantId,
+    nonce: GrantNonce,
+    task_id: TaskId,
+    issued_at: HostTimeAuthority,
+    expires_at: HostTimeAuthority,
+    policy_revision: u32,
+    status: Arc<AtomicU8>,
+}
+
+impl fmt::Debug for ObservationGrantLease {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ObservationGrantLease")
+            .field("task_id", &self.task_id)
+            .field("policy_revision", &self.policy_revision)
+            .field(
+                "revoked",
+                &(self.status.load(Ordering::Acquire) == GRANT_REVOKED),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl ObservationGrantLease {
+    pub(crate) fn policy_revision(&self) -> u32 {
+        self.policy_revision
+    }
+
+    pub(crate) fn task_id(&self) -> TaskId {
+        self.task_id
+    }
+
+    pub(crate) fn ensure_live(&self) -> Result<(), GrantBindError> {
+        self.ensure_live_at(HostTimeAuthority::capture())
+    }
+
+    pub(crate) fn ensure_live_at(&self, now: HostTimeAuthority) -> Result<(), GrantBindError> {
+        let state = self.status.load(Ordering::Acquire);
+        if state != GRANT_ACTIVE {
+            return Err(GrantBindError::Unavailable);
+        }
+        if now < self.issued_at || now >= self.expires_at {
+            return Err(GrantBindError::Unavailable);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn matches_grant(&self, grant: &ManagementGrant) -> bool {
+        self.id == grant.id
+            && self.nonce == grant.nonce
+            && self.task_id == grant.binding.task_id
+            && self.policy_revision == grant.policy_revision
+    }
+
+    pub(crate) fn capture_epoch(&self) -> Result<ObservationLeaseEpoch, GrantBindError> {
+        self.ensure_live()?;
+        let status = self.status.load(Ordering::Acquire);
+        if status != GRANT_ACTIVE {
+            return Err(GrantBindError::Unavailable);
+        }
+        Ok(ObservationLeaseEpoch {
+            id: self.id,
+            nonce: self.nonce,
+            policy_revision: self.policy_revision,
+            status,
+        })
+    }
+
+    pub(crate) fn confirm_epoch(&self, epoch: ObservationLeaseEpoch) -> Result<(), GrantBindError> {
+        let status = self.status.load(Ordering::Acquire);
+        if status != GRANT_ACTIVE
+            || status != epoch.status
+            || self.id != epoch.id
+            || self.nonce != epoch.nonce
+            || self.policy_revision != epoch.policy_revision
+        {
+            return Err(GrantBindError::Unavailable);
+        }
+        self.ensure_live()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn revoke_for_test(&self) {
+        let _ = self.status.compare_exchange(
+            GRANT_ACTIVE,
+            GRANT_REVOKED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ObservationLeaseEpoch {
+    id: GrantId,
+    nonce: GrantNonce,
+    policy_revision: u32,
+    status: u8,
 }
 
 impl ManagementGrant {
@@ -498,9 +608,13 @@ impl ManagementGrant {
         role: ManagementRole,
         issued_at: HostTimeAuthority,
         expires_at: HostTimeAuthority,
+        policy_revision: u32,
     ) -> Result<Self, GrantError> {
         if binding.action_epoch == 0 {
             return Err(GrantError::ZeroActionEpoch);
+        }
+        if policy_revision == 0 {
+            return Err(GrantError::ZeroPolicyRevision);
         }
         if expires_at <= issued_at {
             return Err(GrantError::ExpiryNotAfterIssue);
@@ -516,8 +630,9 @@ impl ManagementGrant {
             role,
             issued_at,
             expires_at,
+            policy_revision,
             state: GrantState {
-                status: AtomicU8::new(GRANT_ACTIVE),
+                status: Arc::new(AtomicU8::new(GRANT_ACTIVE)),
             },
         })
     }
@@ -547,6 +662,43 @@ impl ManagementGrant {
 
     pub fn is_consumed(&self) -> bool {
         self.state.status.load(Ordering::Acquire) == GRANT_CONSUMED
+    }
+
+    pub const fn policy_revision(&self) -> u32 {
+        self.policy_revision
+    }
+
+    pub fn is_expired(&self) -> bool {
+        self.is_expired_at(HostTimeAuthority::capture())
+    }
+
+    fn is_expired_at(&self, now: HostTimeAuthority) -> bool {
+        now < self.issued_at || now >= self.expires_at
+    }
+
+    pub(crate) fn observation_lease(&self) -> Result<ObservationGrantLease, GrantBindError> {
+        self.observation_lease_at(HostTimeAuthority::capture())
+    }
+
+    pub(crate) fn observation_lease_at(
+        &self,
+        now: HostTimeAuthority,
+    ) -> Result<ObservationGrantLease, GrantBindError> {
+        if self.is_revoked() || self.is_consumed() || self.is_expired_at(now) {
+            return Err(GrantBindError::Unavailable);
+        }
+        if self.policy_revision == 0 {
+            return Err(GrantBindError::Unavailable);
+        }
+        Ok(ObservationGrantLease {
+            id: self.id,
+            nonce: self.nonce,
+            task_id: self.binding.task_id,
+            issued_at: self.issued_at,
+            expires_at: self.expires_at,
+            policy_revision: self.policy_revision,
+            status: Arc::clone(&self.state.status),
+        })
     }
 
     const fn task_generation(&self) -> u64 {
@@ -594,6 +746,42 @@ impl ManagementGrant {
     #[allow(dead_code)]
     fn nonce_for_tests(&self) -> GrantNonce {
         self.nonce
+    }
+
+    #[cfg(test)]
+    pub(crate) fn issued_for_test(task_id: TaskId) -> Self {
+        let issued_at = HostTimeAuthority::capture();
+        Self::issued_at_for_test(
+            task_id,
+            issued_at,
+            issued_at.deadline_after(TEST_GRANT_LIFETIME),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn issued_at_for_test(
+        task_id: TaskId,
+        issued_at: HostTimeAuthority,
+        expires_at: HostTimeAuthority,
+    ) -> Self {
+        let bytes = *task_id.as_bytes();
+        Self::try_new(
+            AuthorityBinding {
+                connection_id: ConnectionId::from_bytes(bytes).expect("test connection"),
+                session_id: SessionId::from_bytes(bytes).expect("test session"),
+                client_id: ClientId::from_bytes(bytes).expect("test client"),
+                task_id,
+                action: ActionId::READ_TASK,
+                action_epoch: 1,
+            },
+            1,
+            1,
+            ManagementRole::ManagerWatcher,
+            issued_at,
+            expires_at,
+            ManagementPolicy::REVISION,
+        )
+        .expect("test grant")
     }
 }
 
@@ -1024,6 +1212,7 @@ impl HostPolicyBridge {
             role,
             issued_at,
             issued_at.deadline_after(DEFAULT_GRANT_LIFETIME),
+            ManagementPolicy::REVISION,
         )
         .map_err(|_| HostPolicyError::InvalidGrant)
     }
@@ -1046,6 +1235,7 @@ impl HostPolicyBridge {
             role,
             issued_at,
             expires_at,
+            ManagementPolicy::REVISION,
         )
         .map_err(|_| HostPolicyError::InvalidGrant)
     }
@@ -1379,6 +1569,8 @@ impl PolicyDecision {
 pub struct ManagementPolicy;
 
 impl ManagementPolicy {
+    pub const REVISION: u32 = 1;
+
     pub const fn new() -> Self {
         Self
     }

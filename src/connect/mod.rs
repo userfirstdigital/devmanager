@@ -9,6 +9,9 @@ mod permission;
 mod policy;
 mod presence;
 mod schema;
+mod telemetry;
+#[cfg(test)]
+mod telemetry_tests;
 mod transport;
 
 #[cfg(test)]
@@ -58,6 +61,16 @@ pub use schema::{
     payload_catalog, ChunkFrame, ConnectPayload, ErrorPayload, GenericExtensionPayload,
     HelloPayload, KnownPayloadKind, OperationSettlementPayload, PayloadDescriptor, PayloadError,
     UnknownPayload, CONNECT_PAYLOAD_SCHEMA_VERSION, PAYLOAD_CATALOG,
+};
+pub use telemetry::{
+    encode_observation, ObservationAuthority, ObservationCompleteness, ObservationConfidence,
+    ObservationCursor, ObservationDependency, ObservationError, ObservationFreshness,
+    ObservationId, ObservationMessageClass, ObservationPage, ObservationRecord, ObservationReducer,
+    ObservationSchema, PageBudget, ProviderObservation, QualifyingActivity, ReduceOutcome,
+    RestrictiveGitSummary, TaskObservationFacts, UsageKind, UsageMeasure, UsageProvenance,
+    ACTIVE_SESSION_TIME_LABEL, MAX_ACTIVITIES_PER_TASK, MAX_OBSERVATION_DOCUMENT_BYTES,
+    MAX_OBSERVATION_RETENTION_MS, MAX_OBSERVATION_TASKS, MAX_READY_INTERVALS, MAX_SPECIALISTS,
+    OBSERVATION_SCHEMA_REVISION, OBSERVATION_STALE_AFTER_MS,
 };
 pub use transport::{
     BrowserExtensionDescriptor, ConnectRoute, ConnectTransport, ConnectTransportError,

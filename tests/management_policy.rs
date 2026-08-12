@@ -13,7 +13,6 @@ fn managed_field_allowlist_and_explicit_denylists_are_exhaustive() {
     let allowed = [
         ManagedField::TaskState,
         ManagedField::TaskAttention,
-        ManagedField::TaskAssignmentReference,
         ManagedField::ProviderKind,
         ManagedField::ProviderState,
         ManagedField::SourceTimestamp,
@@ -23,8 +22,6 @@ fn managed_field_allowlist_and_explicit_denylists_are_exhaustive() {
         ManagedField::HumanTurnCount,
         ManagedField::ActiveSessionInterval,
         ManagedField::GitSummary,
-        ManagedField::HostHealth,
-        ManagedField::ApprovedArtifactReference,
     ];
     assert_eq!(ManagedField::ALLOWLIST, allowed);
     for field in allowed {
