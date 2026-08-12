@@ -577,7 +577,6 @@ const DEFAULT_CLAUDE_COMMAND: &str =
     "npx -y @anthropic-ai/claude-code@latest --dangerously-skip-permissions";
 const DEFAULT_CODEX_COMMAND: &str =
     "npx -y @openai/codex@latest --dangerously-bypass-approvals-and-sandbox";
-const AI_COMMAND_INJECTION_DELAY_MS: u64 = 500;
 const PROCESS_MANAGER_HELPER_JOIN_BUDGET: Duration = Duration::from_secs(5);
 const MAX_AUTO_RESTART_WORKERS: usize = 256;
 const MAX_TERMINAL_AUTHORITY_RESOURCES: usize = 1_024;
@@ -9181,7 +9180,10 @@ where
     if let Ok(mut sessions) = inner.sessions.lock() {
         sessions.insert(session_id.to_string(), session.clone());
     }
-    thread::sleep(Duration::from_millis(AI_COMMAND_INJECTION_DELAY_MS));
+    // The PTY is already owned by the exact terminal authority before this
+    // write. A fixed sleep here only delays the stock provider and can leave
+    // the UI looking stalled; readiness is observed through the normal PTY
+    // stream and provider hooks instead of a timing heuristic.
     let startup_command = effective_launch.startup_command + "\r\n";
     if let Err(write_error) = write_startup_command(&session, &startup_command) {
         let error = format!("inject AI startup command: {write_error}");
