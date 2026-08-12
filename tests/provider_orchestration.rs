@@ -304,53 +304,6 @@ fn request_intent(
     }
 }
 
-fn sealed_artifact(task: TaskId, id: ArtifactId, label: &str, body: &str) -> ArtifactFacts {
-    ArtifactFacts {
-        id,
-        task_id: task,
-        kind: ArtifactKind::Finding,
-        label: label.into(),
-        content_ref: ArtifactContentRef::InlineUtf8(body.into()),
-        sha256: [7u8; 32],
-        privacy_class: PrivacyClass::LocalOnly,
-        created_at_ms: 1_725_000_000_280,
-    }
-}
-
-fn empty_client_model() -> ClientModel {
-    let snapshot = SnapshotId::from_bytes(fixed_uuid_v7(0xfe)).expect("snapshot");
-    let mut builder = ClientModelBuilder::new();
-    for section in [
-        SnapshotSection::Tasks,
-        SnapshotSection::AgentSessions,
-        SnapshotSection::Artifacts,
-        SnapshotSection::Resources,
-        SnapshotSection::Operations,
-    ] {
-        builder
-            .ingest_page(SnapshotPage {
-                snapshot_id: snapshot,
-                through_sequence: 0,
-                section,
-                after_item: None,
-                items: vec![],
-                encoded_bytes: 1,
-                next_cursor: None,
-            })
-            .expect("page");
-    }
-    builder.finish().expect("model")
-}
-
-fn accept(bus: &mut CommandBus, envelope: CommandEnvelope) -> CommandReceipt {
-    let receipt = bus.execute(envelope).expect("execute");
-    assert!(
-        matches!(receipt, CommandReceipt::Accepted { .. }),
-        "expected accepted, got {receipt:?}"
-    );
-    receipt
-}
-
 #[test]
 fn request_specialist_is_a_durable_snapshot_fact() {
     let task = task_id(0x01);
