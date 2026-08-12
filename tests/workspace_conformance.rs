@@ -1549,10 +1549,17 @@ impl FakeWorkspaceHost {
             .get(task_id)
             .ok_or(HostError::NonexistentPath)?;
         match &binding.workspace {
-            WorkspaceRef::Main => canonical(&self.main_repo),
-            WorkspaceRef::Worktree { path, .. } | WorkspaceRef::External { path } => {
-                canonical(path)
+            WorkspaceRef::Main | WorkspaceRef::MainWithFingerprint { .. } => {
+                canonical(&self.main_repo)
             }
+            WorkspaceRef::Worktree { path, .. }
+            | WorkspaceRef::External { path }
+            | WorkspaceRef::WorktreeWithFingerprint { path, .. }
+            | WorkspaceRef::ExternalWithFingerprint { path, .. } => canonical(path),
+            // Durable host-bound references intentionally keep their locator
+            // opaque to this fixture-only fake host, so they cannot be opened
+            // without the real host rebinding authority.
+            WorkspaceRef::HostBound { .. } => Err(HostError::NonexistentPath),
         }
     }
 
