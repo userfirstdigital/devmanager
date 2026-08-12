@@ -448,6 +448,66 @@ impl ManagedProcessFence {
     }
 }
 
+/// Build an immutable membership snapshot for external contract tests.
+///
+/// This hidden seam carries only an exact identity observation into the port
+/// authority projector. It does not expose a Job implementation, lifecycle
+/// mutation, termination operation, or any other process ownership authority.
+#[doc(hidden)]
+pub fn test_managed_resource_snapshot(
+    resource: ResourceFence,
+    state: ManagedProcessState,
+    root: ManagedProcessIdentity,
+    members: Vec<ManagedProcessIdentity>,
+    membership_revision: u64,
+    observation_sequence: u64,
+    observed_at: Instant,
+    max_age: Duration,
+    validity: crate::process::ports::ManagedProcessSnapshotValidity,
+    detail: Option<String>,
+) -> Result<crate::process::ports::ManagedResourceSnapshot, &'static str> {
+    if membership_revision == 0 || observation_sequence == 0 {
+        return Err("membership revision and observation sequence must be non-zero");
+    }
+    if validity == crate::process::ports::ManagedProcessSnapshotValidity::Valid
+        && !members.iter().any(|member| member == &root)
+    {
+        return Err("valid membership snapshots must include the exact root identity");
+    }
+
+    let membership = match validity {
+        crate::process::ports::ManagedProcessSnapshotValidity::Valid => {
+            crate::process::ports::RegistryMembershipSnapshot::valid(
+                membership_revision,
+                observation_sequence,
+                observed_at,
+                max_age,
+            )
+        }
+        crate::process::ports::ManagedProcessSnapshotValidity::Stale => {
+            crate::process::ports::RegistryMembershipSnapshot::stale(
+                membership_revision,
+                observation_sequence,
+                observed_at,
+            )
+        }
+        crate::process::ports::ManagedProcessSnapshotValidity::Failed => {
+            crate::process::ports::RegistryMembershipSnapshot::failed(
+                membership_revision,
+                observation_sequence,
+                detail.unwrap_or_else(|| "membership observation failed".to_string()),
+            )
+        }
+    };
+
+    Ok(crate::process::ports::ManagedResourceSnapshot::new(
+        ManagedProcessFence::new(resource, ProcessOwner::Host, root),
+        state,
+        members,
+        membership,
+    ))
+}
+
 /// Private ownership receipt embedded in a provider permit. The trait is
 /// deliberately crate-private: an external caller can hold a permit returned
 /// by the registry, but cannot implement or construct the authority seam.

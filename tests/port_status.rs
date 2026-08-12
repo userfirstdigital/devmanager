@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use devmanager::domain::id::ResourceId;
 use devmanager::domain::operation::ResourceFence;
-use devmanager::process::identity::{ManagedProcessId, ManagedProcessIdentity, ProcessOwner};
+use devmanager::process::identity::{ManagedProcessId, ManagedProcessIdentity};
 use devmanager::process::ports::{
     classify_port_authority, classify_port_authority_from_snapshot,
     classify_port_authority_from_snapshot_with_membership_reconciliation_at,
@@ -21,8 +21,7 @@ use devmanager::process::ports::{
     TcpProtocol, MAX_SCAN_WAITERS,
 };
 use devmanager::process::registry::{
-    JobCompletionEvent, JobCompletionMessage, JobMemberInfo, JobMembership, ManagedProcessFence,
-    ManagedProcessState, ProcessRegistry, RegisteredProcess,
+    test_managed_resource_snapshot, JobCompletionEvent, ManagedProcessState,
 };
 use devmanager::services::ports_service::{
     legacy_statuses_from_snapshot, scan_listener_inventory, scan_listener_inventory_with,
@@ -75,32 +74,108 @@ fn free_scan(ports: &[u16]) -> PortInventorySnapshot {
     )
 }
 
-#[derive(Debug, Clone)]
-struct TestJob {
-    root_pid: u32,
-    root_creation_time_100ns: u64,
+struct TestRegistry {
+    resource: ResourceFence,
+    root: ManagedProcessIdentity,
     inspectable: bool,
     active: Arc<AtomicBool>,
+    state: ManagedProcessState,
 }
 
-impl JobMembership for TestJob {
-    fn active_process_ids(&self) -> Result<Vec<u32>, String> {
-        Ok(self
-            .active
-            .load(Ordering::Acquire)
-            .then_some(self.root_pid)
-            .into_iter()
-            .collect())
+impl TestRegistry {
+    fn new(
+        resource: ResourceFence,
+        root: ManagedProcessIdentity,
+        inspectable: bool,
+        active: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            resource,
+            root,
+            inspectable,
+            active,
+            state: ManagedProcessState::Starting,
+        }
     }
 
-    fn inspect_process(&self, pid: u32) -> Result<JobMemberInfo, String> {
-        if !self.inspectable || pid != self.root_pid {
-            return Err(format!("process identity for PID {pid} is inaccessible"));
+    fn managed_resource_snapshot(
+        &self,
+        resource: ResourceFence,
+        observed_at: Instant,
+        max_age: Duration,
+    ) -> Option<ManagedResourceSnapshot> {
+        if resource != self.resource {
+            return None;
         }
-        Ok(JobMemberInfo::new(
-            identity(self.root_pid, self.root_creation_time_100ns, &executable()),
-            None,
-        ))
+        let valid = self.inspectable && self.active.load(Ordering::Acquire);
+        let members = valid.then(|| vec![self.root.clone()]).unwrap_or_default();
+        Some(
+            test_managed_resource_snapshot(
+                resource,
+                self.state,
+                self.root.clone(),
+                members,
+                1,
+                1,
+                observed_at,
+                max_age,
+                if valid {
+                    ManagedProcessSnapshotValidity::Valid
+                } else {
+                    ManagedProcessSnapshotValidity::Failed
+                },
+                (!valid).then(|| "test membership observation failed".to_string()),
+            )
+            .expect("test membership snapshot"),
+        )
+    }
+
+    fn commit_resumed_exact(&mut self, resource: &ResourceFence) -> Result<(), &'static str> {
+        if *resource != self.resource {
+            return Err("resource fence mismatch");
+        }
+        if self.state != ManagedProcessState::Starting {
+            return Err("resource is not starting");
+        }
+        self.state = ManagedProcessState::Running;
+        Ok(())
+    }
+
+    fn begin_stopping_exact(&mut self, resource: &ResourceFence) -> bool {
+        if *resource != self.resource {
+            return false;
+        }
+        match self.state {
+            ManagedProcessState::Starting
+            | ManagedProcessState::Running
+            | ManagedProcessState::Failed => {
+                self.state = ManagedProcessState::Stopping;
+                true
+            }
+            ManagedProcessState::Stopping => true,
+            ManagedProcessState::ZeroSettled | ManagedProcessState::Leaked => false,
+        }
+    }
+
+    fn apply_job_completion(
+        &mut self,
+        resource: &ResourceFence,
+        event: JobCompletionEvent,
+    ) -> bool {
+        if *resource != self.resource {
+            return false;
+        }
+        match event {
+            JobCompletionEvent::ActiveProcessZero => self.state = ManagedProcessState::ZeroSettled,
+            JobCompletionEvent::AbnormalExitProcess { .. } => {
+                self.state = ManagedProcessState::Failed
+            }
+            JobCompletionEvent::MonitorFailed { .. } => self.state = ManagedProcessState::Leaked,
+            JobCompletionEvent::NewProcess { .. }
+            | JobCompletionEvent::ExitProcess { .. }
+            | JobCompletionEvent::Limit { .. } => {}
+        }
+        true
     }
 }
 
@@ -108,7 +183,7 @@ fn registry_with_root(
     resource: ResourceFence,
     root_pid: u32,
     root_creation_time_100ns: u64,
-) -> (ProcessRegistry<TestJob>, ManagedProcessFence) {
+) -> (TestRegistry, ResourceFence) {
     let (registry, fence, _) =
         registry_with_root_control(resource, root_pid, root_creation_time_100ns, true, true);
     (registry, fence)
@@ -119,7 +194,7 @@ fn registry_with_root_config(
     root_pid: u32,
     root_creation_time_100ns: u64,
     inspectable: bool,
-) -> (ProcessRegistry<TestJob>, ManagedProcessFence) {
+) -> (TestRegistry, ResourceFence) {
     let (registry, fence, _) = registry_with_root_control(
         resource,
         root_pid,
@@ -136,33 +211,18 @@ fn registry_with_root_control(
     root_creation_time_100ns: u64,
     inspectable: bool,
     active: bool,
-) -> (
-    ProcessRegistry<TestJob>,
-    ManagedProcessFence,
-    Arc<AtomicBool>,
-) {
+) -> (TestRegistry, ResourceFence, Arc<AtomicBool>) {
     let root = identity(root_pid, root_creation_time_100ns, &executable());
-    let mut registry = ProcessRegistry::new();
     let active = Arc::new(AtomicBool::new(active));
-    let registered = RegisteredProcess::new(
+    (
+        TestRegistry::new(resource, root, inspectable, active.clone()),
         resource,
-        ProcessOwner::Host,
-        root,
-        devmanager::process::registry::ProcessDisplayLabel::new("port test")
-            .expect("display label"),
-        TestJob {
-            root_pid,
-            root_creation_time_100ns,
-            inspectable,
-            active: active.clone(),
-        },
-    );
-    let managed_fence = registry.register(registered).expect("register process");
-    (registry, managed_fence, active)
+        active,
+    )
 }
 
 fn registry_snapshot(
-    registry: &ProcessRegistry<TestJob>,
+    registry: &TestRegistry,
     resource: ResourceFence,
     observed_at: Instant,
     max_age: Duration,
@@ -173,7 +233,7 @@ fn registry_snapshot(
 }
 
 fn current_registry_snapshot(
-    registry: &ProcessRegistry<TestJob>,
+    registry: &TestRegistry,
     resource: ResourceFence,
 ) -> ManagedResourceSnapshot {
     registry_snapshot(registry, resource, Instant::now(), Duration::from_secs(10))
@@ -945,7 +1005,7 @@ fn inactive_managed_states_never_prove_an_external_listener() {
     let managed_identity = listener(12_103, 1_203);
     for state in [
         ManagedProcessState::Stopping,
-        ManagedProcessState::Stopped,
+        ManagedProcessState::ZeroSettled,
         ManagedProcessState::Failed,
         ManagedProcessState::Leaked,
     ] {
@@ -955,26 +1015,25 @@ fn inactive_managed_states_never_prove_an_external_listener() {
             ManagedProcessState::Stopping => {
                 assert!(registry.begin_stopping_exact(&fence));
             }
-            ManagedProcessState::Stopped => {
+            ManagedProcessState::ZeroSettled => {
                 active.store(false, Ordering::Release);
-                assert!(registry.apply_job_completion(JobCompletionMessage::new(
-                    fence.clone(),
-                    JobCompletionEvent::ActiveProcessZero,
-                )));
+                assert!(
+                    registry.apply_job_completion(&fence, JobCompletionEvent::ActiveProcessZero,)
+                );
             }
             ManagedProcessState::Failed => {
-                assert!(registry.apply_job_completion(JobCompletionMessage::new(
-                    fence.clone(),
+                assert!(registry.apply_job_completion(
+                    &fence,
                     JobCompletionEvent::AbnormalExitProcess { pid: 12_103 },
-                )));
+                ));
             }
             ManagedProcessState::Leaked => {
-                assert!(registry.apply_job_completion(JobCompletionMessage::new(
-                    fence.clone(),
+                assert!(registry.apply_job_completion(
+                    &fence,
                     JobCompletionEvent::MonitorFailed {
                         detail: "test leak".to_string(),
                     },
-                )));
+                ));
             }
             ManagedProcessState::Starting | ManagedProcessState::Running => unreachable!(),
         }
@@ -1062,33 +1121,32 @@ fn invalid_endpoint_rows_make_the_snapshot_unusable() {
 fn stopped_failed_and_leaked_generations_cannot_be_managed() {
     let resource = fence(13, 1);
     for state in [
-        ManagedProcessState::Stopped,
+        ManagedProcessState::ZeroSettled,
         ManagedProcessState::Failed,
         ManagedProcessState::Leaked,
     ] {
         let (mut registry, fence, active) =
             registry_with_root_control(resource, 11_013, 1_313, true, true);
         match state {
-            ManagedProcessState::Stopped => {
+            ManagedProcessState::ZeroSettled => {
                 active.store(false, Ordering::Release);
-                assert!(registry.apply_job_completion(JobCompletionMessage::new(
-                    fence.clone(),
-                    JobCompletionEvent::ActiveProcessZero,
-                )));
+                assert!(
+                    registry.apply_job_completion(&fence, JobCompletionEvent::ActiveProcessZero,)
+                );
             }
             ManagedProcessState::Failed => {
-                assert!(registry.apply_job_completion(JobCompletionMessage::new(
-                    fence.clone(),
+                assert!(registry.apply_job_completion(
+                    &fence,
                     JobCompletionEvent::AbnormalExitProcess { pid: 11_013 },
-                )));
+                ));
             }
             ManagedProcessState::Leaked => {
-                assert!(registry.apply_job_completion(JobCompletionMessage::new(
-                    fence.clone(),
+                assert!(registry.apply_job_completion(
+                    &fence,
                     JobCompletionEvent::MonitorFailed {
                         detail: "test leak".to_string(),
                     },
-                )));
+                ));
             }
             ManagedProcessState::Starting
             | ManagedProcessState::Running
