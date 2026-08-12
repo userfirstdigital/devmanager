@@ -67,7 +67,8 @@ use crate::prompts::projection::{
 };
 use crate::prompts::store::{
     execute_prompt_command_in_tx, library_projection_revision_in_tx,
-    prompt_mutation_receipt_matching_command, PromptStore, PromptStoreError,
+    prompt_chain_mutation_receipt_matching_command, prompt_mutation_receipt_matching_command,
+    PromptStore, PromptStoreError,
 };
 use crate::protocol::CapabilitySet;
 use crate::providers::ProviderKind;
@@ -204,7 +205,10 @@ impl CommandBus {
 
     /// Execute a command through the owned store.
     pub fn execute(&mut self, envelope: CommandEnvelope) -> Result<CommandReceipt, StoreError> {
-        if matches!(envelope.command, Command::PromptLibrary(_)) {
+        if matches!(
+            envelope.command,
+            Command::PromptLibrary(_) | Command::PromptChain(_)
+        ) {
             return self
                 .store
                 .with_immediate_transaction(|tx| execute_prompt_library_in_tx(tx, None, envelope));
@@ -224,7 +228,10 @@ impl CommandBus {
         grant: &OwnerDeviceCapability,
         envelope: CommandEnvelope,
     ) -> Result<CommandReceipt, StoreError> {
-        if !matches!(envelope.command, Command::PromptLibrary(_)) {
+        if !matches!(
+            envelope.command,
+            Command::PromptLibrary(_) | Command::PromptChain(_)
+        ) {
             return self.execute(envelope);
         }
         self.store.with_immediate_transaction(|tx| {
@@ -261,8 +268,18 @@ impl CommandBus {
         request_id: RequestId,
         connection_id: Uuid,
     ) -> Result<CommandReceipt, StoreError> {
-        if matches!(envelope.command, Command::PromptLibrary(_)) {
-            return self.execute(envelope);
+        if matches!(
+            envelope.command,
+            Command::PromptLibrary(_) | Command::PromptChain(_)
+        ) {
+            // The host transport has already authenticated the paired owner
+            // and capability-gated this request. Mint the sealed in-process
+            // grant only at this boundary; it never crosses the envelope.
+            let grant =
+                OwnerDeviceCapability::paired_owner_for_authenticated_client(envelope.client_id);
+            return self.store.with_immediate_transaction(|tx| {
+                execute_prompt_library_in_tx(tx, Some(&grant), envelope)
+            });
         }
         if matches!(envelope.command, Command::ServiceControl(_)) {
             return Err(StoreError::HostAuthorityRequired);
@@ -699,42 +716,65 @@ fn replay_prompt_library_receipt(
     envelope: &CommandEnvelope,
     existing: CommandReceipt,
 ) -> Result<CommandReceipt, StoreError> {
-    let Command::PromptLibrary(command) = &envelope.command else {
-        return Err(StoreError::Projection(
-            "prompt library replay requires PromptLibrary".into(),
-        ));
-    };
-    match prompt_mutation_receipt_matching_command(tx, envelope.command_id, command) {
-        Ok(Some(mutation)) => match existing {
-            CommandReceipt::Accepted {
-                command_id,
-                operation_id,
-                task_revision,
-                event_ids,
-                prompt_mutation: _,
-            } => Ok(CommandReceipt::Accepted {
-                command_id,
-                operation_id,
-                task_revision,
-                event_ids,
-                prompt_mutation: Some(mutation),
-            }),
-            rejected => Ok(rejected),
-        },
-        Ok(None) => match existing {
-            CommandReceipt::Rejected { .. } => Ok(existing),
-            CommandReceipt::Accepted { .. } => Err(StoreError::Corruption),
-        },
-        Err(PromptStoreError::IdempotencyConflict) => {
-            let current = library_projection_revision_in_tx(tx).map_err(map_prompt_store_error)?;
-            Ok(CommandReceipt::Rejected {
-                command_id: envelope.command_id,
-                code: RejectionCode::AlreadyExists,
-                current_revision: Some(current),
-                resolution: None,
-            })
+    match &envelope.command {
+        Command::PromptLibrary(command) => {
+            match prompt_mutation_receipt_matching_command(tx, envelope.command_id, command) {
+                Ok(Some(mutation)) => match existing {
+                    CommandReceipt::Accepted {
+                        command_id,
+                        operation_id,
+                        task_revision,
+                        event_ids,
+                        prompt_mutation: _,
+                    } => Ok(CommandReceipt::Accepted {
+                        command_id,
+                        operation_id,
+                        task_revision,
+                        event_ids,
+                        prompt_mutation: Some(mutation),
+                    }),
+                    rejected => Ok(rejected),
+                },
+                Ok(None) => match existing {
+                    CommandReceipt::Rejected { .. } => Ok(existing),
+                    CommandReceipt::Accepted { .. } => Err(StoreError::Corruption),
+                },
+                Err(PromptStoreError::IdempotencyConflict) => {
+                    let current =
+                        library_projection_revision_in_tx(tx).map_err(map_prompt_store_error)?;
+                    Ok(CommandReceipt::Rejected {
+                        command_id: envelope.command_id,
+                        code: RejectionCode::IdempotencyConflict,
+                        current_revision: Some(current),
+                        resolution: None,
+                    })
+                }
+                Err(error) => Err(map_prompt_store_error(error)),
+            }
         }
-        Err(error) => Err(map_prompt_store_error(error)),
+        Command::PromptChain(command) => {
+            match prompt_chain_mutation_receipt_matching_command(tx, envelope.command_id, command) {
+                Ok(Some(_)) => Ok(existing),
+                Ok(None) => match existing {
+                    CommandReceipt::Rejected { .. } => Ok(existing),
+                    CommandReceipt::Accepted { .. } => Err(StoreError::Corruption),
+                },
+                Err(PromptStoreError::IdempotencyConflict) => {
+                    let current =
+                        library_projection_revision_in_tx(tx).map_err(map_prompt_store_error)?;
+                    Ok(CommandReceipt::Rejected {
+                        command_id: envelope.command_id,
+                        code: RejectionCode::IdempotencyConflict,
+                        current_revision: Some(current),
+                        resolution: None,
+                    })
+                }
+                Err(error) => Err(map_prompt_store_error(error)),
+            }
+        }
+        _ => Err(StoreError::Projection(
+            "prompt library replay requires a prompt mutation".into(),
+        )),
     }
 }
 
@@ -743,11 +783,7 @@ fn persist_prompt_library(
     envelope: &CommandEnvelope,
 ) -> Result<CommandReceipt, StoreError> {
     let accepted_at_ms = now_ms()?;
-    let Command::PromptLibrary(command) = envelope.command.clone() else {
-        return Err(StoreError::Projection(
-            "persist_prompt_library requires PromptLibrary".into(),
-        ));
-    };
+    let command = envelope.command.clone();
     if envelope.task_id.is_some() {
         return persist_rejection(
             tx,
@@ -773,7 +809,21 @@ fn persist_prompt_library(
             );
         }
     }
-    match execute_prompt_command_in_tx(tx, envelope.command_id, command) {
+    let mutation = match command {
+        Command::PromptLibrary(command) => {
+            execute_prompt_command_in_tx(tx, envelope.command_id, command).map(Some)
+        }
+        Command::PromptChain(command) => {
+            PromptStore::execute_prompt_chain_command_in_tx(tx, envelope.command_id, command)
+                .map(|_| None)
+        }
+        _ => {
+            return Err(StoreError::Projection(
+                "persist_prompt_library requires a prompt mutation".into(),
+            ))
+        }
+    };
+    match mutation {
         Ok(mutation) => persist_prompt_library_acceptance(tx, envelope, mutation, accepted_at_ms),
         Err(PromptStoreError::RevisionConflict { actual, .. }) => persist_rejection(
             tx,
@@ -829,7 +879,7 @@ fn persist_prompt_library(
 fn persist_prompt_library_acceptance(
     tx: &Transaction<'_>,
     envelope: &CommandEnvelope,
-    mutation: crate::prompts::PromptMutationReceipt,
+    mutation: Option<crate::prompts::PromptMutationReceipt>,
     accepted_at_ms: i64,
 ) -> Result<CommandReceipt, StoreError> {
     let operation_id = OperationId::new();
@@ -840,7 +890,7 @@ fn persist_prompt_library_acceptance(
         operation_id,
         task_revision: None,
         event_ids: vec![accepted_event_id],
-        prompt_mutation: Some(mutation),
+        prompt_mutation: mutation,
     };
     insert_receipt_row(
         tx,

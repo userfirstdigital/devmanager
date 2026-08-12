@@ -29,7 +29,7 @@ use crate::domain::task::{
     ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity, TaskFacts,
     TaskLifecycle, WorkspaceRef,
 };
-use crate::prompts::{PromptCommand, PromptMutationReceipt};
+use crate::prompts::{PromptChainCommand, PromptCommand, PromptMutationReceipt};
 use crate::workspace::WorkspaceRequest;
 use uuid::Uuid;
 
@@ -1230,6 +1230,10 @@ pub enum Command {
     CancelSpecialist(CancelSpecialistIntent),
     AcceptSpecialistHandoff(AcceptSpecialistHandoffIntent),
     PromptLibrary(PromptCommand),
+    /// Host-scoped prompt-chain mutation carried by the same authenticated
+    /// command envelope as personal prompt mutations. The chain model owns
+    /// its canonical wire format, revision fence, and idempotency identity.
+    PromptChain(PromptChainCommand),
     /// Host-only configured-service control. This never enters the durable
     /// task journal; the authenticated host dispatches it to its one owned
     /// ProcessManager supervisor.
@@ -1481,7 +1485,9 @@ pub fn decide(
         Command::AcceptSpecialistHandoff(intent) => {
             decide_accept_specialist_handoff(snapshot, envelope, intent)
         }
-        Command::PromptLibrary(_) => Err(RejectionCode::InvalidTransition),
+        Command::PromptLibrary(_) | Command::PromptChain(_) => {
+            Err(RejectionCode::InvalidTransition)
+        }
         Command::ServiceControl(_) => Err(RejectionCode::InvalidTransition),
         Command::Browser(request) => decide_browser(snapshot, envelope, request),
         Command::PrepareUpdate(_)

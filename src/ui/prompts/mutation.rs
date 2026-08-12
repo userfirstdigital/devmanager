@@ -17,7 +17,9 @@ use crate::domain::query::QueryError;
 use crate::host::IpcError;
 use crate::kernel::{CommandBus, StoreError};
 use crate::prompts::model::{
-    ArchivePrompt, PromptChain, PromptCommand, PromptVersion, RestorePrompt, SavedPrompt,
+    ArchivePrompt, InsertPromptChainLink, MovePromptChainLink, PromptChain, PromptChainCommand,
+    PromptCommand, PromptVersion, RemovePromptChainLink, RestorePrompt, SavedPrompt,
+    UpdatePromptChainLinkVersion,
 };
 use crate::prompts::projection::{
     OwnerDeviceCapability, PromptChainLinkRecord, PromptLibraryQuery, PromptProjectionReply,
@@ -86,7 +88,10 @@ pub fn require_prompt_mutation_grant<'a>(
         PromptMutationAuthority::ReadOnly => return Err(PromptMutationError::ReadOnly),
         PromptMutationAuthority::Ungranted => return Err(PromptMutationError::Ungranted),
     };
-    if !matches!(envelope.command, Command::PromptLibrary(_)) {
+    if !matches!(
+        envelope.command,
+        Command::PromptLibrary(_) | Command::PromptChain(_)
+    ) {
         return Err(PromptMutationError::UnsupportedCommand);
     }
     if !grant.binds_client(envelope.client_id) {
@@ -211,9 +216,9 @@ pub fn apply_host_reply_to_session(
     }
 }
 
-/// Map a UI mutation to the existing owner-granted PromptLibrary command.
-/// Chain edits have no Command::PromptLibrary variant and stay explicitly
-/// unavailable instead of reporting local success.
+/// Map a UI mutation to the existing owner-granted prompt command envelope.
+/// Chain edits reuse the durable [`PromptChainCommand`] model and carry the
+/// chain revision fence captured by the UI at activation time.
 pub fn prompt_mutation_command(
     action: &PromptLibraryAction,
 ) -> Result<Command, PromptMutationError> {
@@ -250,12 +255,58 @@ pub fn prompt_mutation_command(
                 expected_revision: *expected_revision,
             },
         ))),
-        PromptLibraryAction::InsertChainLinkBetween { .. }
-        | PromptLibraryAction::ReorderChainLink { .. }
-        | PromptLibraryAction::RemoveChainLink { .. }
-        | PromptLibraryAction::UpdateLinkToCurrent { .. } => {
-            Err(PromptMutationError::UnsupportedCommand)
-        }
+        PromptLibraryAction::InsertChainLinkBetween {
+            chain_id,
+            before_link_id,
+            link,
+            expected_revision,
+            ..
+        } => Ok(Command::PromptChain(
+            PromptChainCommand::InsertPromptChainLink(InsertPromptChainLink {
+                chain_id: *chain_id,
+                link_id: link.id(),
+                prompt_id: link.prompt_id(),
+                prompt_version_id: Some(link.prompt_version_id()),
+                before_link_id: Some(*before_link_id),
+                expected_revision: *expected_revision,
+            }),
+        )),
+        PromptLibraryAction::ReorderChainLink {
+            chain_id,
+            link_id,
+            before_link_id,
+            expected_revision,
+        } => Ok(Command::PromptChain(
+            PromptChainCommand::MovePromptChainLink(MovePromptChainLink {
+                chain_id: *chain_id,
+                link_id: *link_id,
+                before_link_id: *before_link_id,
+                expected_revision: *expected_revision,
+            }),
+        )),
+        PromptLibraryAction::RemoveChainLink {
+            chain_id,
+            link_id,
+            expected_revision,
+        } => Ok(Command::PromptChain(
+            PromptChainCommand::RemovePromptChainLink(RemovePromptChainLink {
+                chain_id: *chain_id,
+                link_id: *link_id,
+                expected_revision: *expected_revision,
+            }),
+        )),
+        PromptLibraryAction::UpdateLinkToCurrent {
+            chain_id,
+            link_id,
+            expected_revision,
+            ..
+        } => Ok(Command::PromptChain(
+            PromptChainCommand::UpdatePromptChainLinkVersion(UpdatePromptChainLinkVersion {
+                chain_id: *chain_id,
+                link_id: *link_id,
+                expected_revision: *expected_revision,
+            }),
+        )),
         _ => Err(PromptMutationError::UnsupportedCommand),
     }
 }
@@ -381,7 +432,13 @@ mod tests {
         let err = prompt_mutation_command(&PromptLibraryAction::RemoveChainLink {
             chain_id: PromptChainId::new(),
             link_id: PromptChainLinkId::new(),
+            expected_revision: 1,
         });
-        assert_eq!(err, Err(PromptMutationError::UnsupportedCommand));
+        assert!(matches!(
+            err,
+            Ok(Command::PromptChain(
+                PromptChainCommand::RemovePromptChainLink(_)
+            ))
+        ));
     }
 }

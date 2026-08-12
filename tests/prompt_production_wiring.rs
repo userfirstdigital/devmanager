@@ -1,11 +1,12 @@
 //! Compile/wiring assertions for prompt-production settlement and mutation seams.
 
 use devmanager::domain::command::{Command, CommandEnvelope};
-use devmanager::domain::id::{ClientId, CommandId, PromptId};
+use devmanager::domain::id::{ClientId, CommandId, PromptChainLinkId, PromptId};
 use devmanager::prompts::projection::testing;
 use devmanager::prompts::{
-    ArchivePrompt, DurableProviderDeliveryAdapter, PromptCommand, PromptHistoryErrorCode,
-    ProviderDurableSettlement, UnsupportedProviderDurableSettlement, ValidatedDeliveredInputProof,
+    ArchivePrompt, DurableProviderDeliveryAdapter, PromptChainCommand, PromptCommand,
+    PromptHistoryErrorCode, ProviderDurableSettlement, RemovePromptChainLink,
+    UnsupportedProviderDurableSettlement, ValidatedDeliveredInputProof,
 };
 use devmanager::ui::mutation::{
     require_prompt_mutation_grant, PromptMutationAuthority, PromptMutationError,
@@ -137,4 +138,27 @@ fn owner_gated_mutation_preserves_zero_based_chain_and_host_bus_path() {
         !source.contains("position + 1") && !source.contains("position.saturating_add(1)"),
         "mutation executor must not remap 0-based chain positions"
     );
+}
+
+#[test]
+fn authenticated_command_envelope_carries_prompt_chain_mutations() {
+    let client_id = ClientId::new();
+    let envelope = CommandEnvelope {
+        command_id: CommandId::new(),
+        client_id,
+        task_id: None,
+        issued_at_ms: 1,
+        expected_task_revision: Some(1),
+        command: Command::PromptChain(PromptChainCommand::RemovePromptChainLink(
+            RemovePromptChainLink {
+                chain_id: devmanager::domain::id::PromptChainId::new(),
+                link_id: PromptChainLinkId::new(),
+                expected_revision: 1,
+            },
+        )),
+    };
+    let payload = rmp_serde::to_vec_named(&envelope).expect("chain command envelope encodes");
+    let round_trip: CommandEnvelope =
+        rmp_serde::from_slice(&payload).expect("chain command envelope decodes");
+    assert_eq!(round_trip, envelope);
 }

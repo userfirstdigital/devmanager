@@ -91,20 +91,24 @@ pub enum PromptLibraryAction {
         after_link_id: PromptChainLinkId,
         before_link_id: PromptChainLinkId,
         link: PromptChainLinkRecord,
+        expected_revision: u64,
     },
     ReorderChainLink {
         chain_id: PromptChainId,
         link_id: PromptChainLinkId,
         before_link_id: Option<PromptChainLinkId>,
+        expected_revision: u64,
     },
     RemoveChainLink {
         chain_id: PromptChainId,
         link_id: PromptChainLinkId,
+        expected_revision: u64,
     },
     UpdateLinkToCurrent {
         chain_id: PromptChainId,
         link_id: PromptChainLinkId,
         current_version_id: PromptVersionId,
+        expected_revision: u64,
     },
     PutInComposer(PutPromptVersionInComposer),
     ShowSuggestedNext {
@@ -261,6 +265,7 @@ impl PromptLibrarySession {
                 after_link_id,
                 before_link_id,
                 link,
+                expected_revision: _,
             } => {
                 apply_chain_action::insert_between(
                     &mut self.links,
@@ -275,11 +280,16 @@ impl PromptLibrarySession {
                 chain_id,
                 link_id,
                 before_link_id,
+                expected_revision: _,
             } => {
                 apply_chain_action::reorder(&mut self.links, chain_id, link_id, before_link_id)?;
                 self.bump_chain_revision(chain_id)?;
             }
-            PromptLibraryAction::RemoveChainLink { chain_id, link_id } => {
+            PromptLibraryAction::RemoveChainLink {
+                chain_id,
+                link_id,
+                expected_revision: _,
+            } => {
                 apply_chain_action::remove(&mut self.links, chain_id, link_id)?;
                 self.bump_chain_revision(chain_id)?;
             }
@@ -287,6 +297,7 @@ impl PromptLibrarySession {
                 chain_id,
                 link_id,
                 current_version_id,
+                expected_revision: _,
             } => {
                 apply_chain_action::update_pinned(
                     &mut self.links,

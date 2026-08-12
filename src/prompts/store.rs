@@ -254,19 +254,34 @@ impl PromptStore {
         Ok(receipt)
     }
 
-    /// Chain mutations stay on the store until [`PromptChainCommand`] joins
-    /// [`crate::domain::command::Command`]. Not a host settlement API.
+    /// Store-suite compatibility wrapper for the host-routable chain command.
     #[doc(hidden)]
     pub fn execute_chain(
         &mut self,
         command_id: CommandId,
         command: PromptChainCommand,
     ) -> Result<PromptChainMutationReceipt, PromptStoreError> {
-        let requested_command = command.canonicalize()?;
-        requested_command.validate()?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let receipt = Self::execute_prompt_chain_command_in_tx(&tx, command_id, command)?;
+        tx.commit()?;
+        Ok(receipt)
+    }
+
+    /// Execute one chain mutation inside a caller-owned immediate transaction.
+    ///
+    /// The host command bus uses this seam to persist the chain receipt/event
+    /// atomically with its authenticated command receipt and operation facts.
+    /// The store's standalone [`Self::execute_chain`] wrapper remains the
+    /// compatibility API for store tests and tools.
+    pub(crate) fn execute_prompt_chain_command_in_tx(
+        tx: &Transaction<'_>,
+        command_id: CommandId,
+        command: PromptChainCommand,
+    ) -> Result<PromptChainMutationReceipt, PromptStoreError> {
+        let requested_command = command.canonicalize()?;
+        requested_command.validate()?;
 
         if let Some((stored_hash, stored_payload)) = load_chain_command_payload(&tx, command_id)? {
             let stored_command = decode_chain_command(&stored_payload)?;
@@ -293,7 +308,6 @@ impl PromptStore {
                     "prompt chain receipt disappeared while replaying its command".into(),
                 )
             })?;
-            tx.commit()?;
             return Ok(receipt);
         }
 
@@ -344,7 +358,6 @@ impl PromptStore {
                 ],
             )?;
         }
-        tx.commit()?;
         Ok(receipt)
     }
 
@@ -2184,6 +2197,36 @@ pub(crate) fn prompt_mutation_receipt_matching_command(
     validate_wire_size("prompt command", &command_payload)?;
     let command_sha256 = sha256_bytes(&command_payload);
     load_receipt(tx, command_id, &command, &command_sha256)
+}
+
+pub(crate) fn prompt_chain_mutation_receipt_matching_command(
+    tx: &Transaction<'_>,
+    command_id: CommandId,
+    command: &PromptChainCommand,
+) -> Result<Option<PromptChainMutationReceipt>, PromptStoreError> {
+    let command = command.canonicalize()?;
+    command.validate()?;
+    let Some((stored_hash, stored_payload)) = load_chain_command_payload(tx, command_id)? else {
+        return Ok(None);
+    };
+    let requested_original_hash = command
+        .fingerprint()
+        .map_err(|error| PromptStoreError::Corruption(error.to_string()))?;
+    let stored_command = decode_chain_command(&stored_payload)?;
+    if requested_original_hash != stored_command.original_command_sha256
+        || command != stored_command.original_command
+    {
+        return Err(PromptStoreError::IdempotencyConflict);
+    }
+    let stored_sha256 = digest_from_bytes(&stored_hash)?;
+    load_chain_receipt(
+        tx,
+        command_id,
+        &stored_command.original_command,
+        &stored_command.command,
+        &stored_sha256,
+        stored_command.resolved_prompt_version_id,
+    )
 }
 
 pub(crate) fn execute_prompt_command_in_tx(

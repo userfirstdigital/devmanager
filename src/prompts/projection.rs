@@ -188,6 +188,13 @@ impl OwnerDeviceCapability {
         self.session == *client_id.as_bytes()
     }
 
+    /// Host-only capability derived from the already-authenticated paired
+    /// owner identity. The transport must perform the role/capability check
+    /// before calling this constructor; it is never exposed on the wire.
+    pub(crate) fn paired_owner_for_authenticated_client(client_id: ClientId) -> Self {
+        Self::bind_paired_owner(client_id)
+    }
+
     fn binding(&self) -> &[u8; 32] {
         &self.binding
     }

@@ -257,6 +257,7 @@ fn chain_overview_inserts_between_adjacent_links_and_suggests_next_manually() {
             after_link_id: link_id(41),
             before_link_id: link_id(42),
             link: inserted,
+            expected_revision: 1,
         })
         .expect("insert between 2 and 3");
     let after = session
@@ -279,6 +280,7 @@ fn chain_overview_inserts_between_adjacent_links_and_suggests_next_manually() {
             chain_id: chain_id(30),
             link_id: link_id(43),
             current_version_id: version_id(18),
+            expected_revision: 1,
         })
         .expect("pin current");
     assert!(!session
@@ -333,6 +335,7 @@ fn insert_between_rejects_non_adjacent_links() {
         after_link_id: link_id(40),
         before_link_id: link_id(43),
         link: chain_link(99, 30, 2, 21, 22, Some(40), Some(43), false),
+        expected_revision: 1,
     });
     assert_eq!(err, Err(PromptLibraryUiError::AdjacentLinksRequired));
 }
