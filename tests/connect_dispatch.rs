@@ -9,7 +9,8 @@ use devmanager::connect::{
 };
 use devmanager::domain::command::{Command, CommandEnvelope};
 use devmanager::domain::id::{ClientId, CommandId, OperationId, RequestId, TaskId};
-use devmanager::domain::query::{Query, QueryEnvelope, QueryReply};
+use devmanager::domain::query::{Query, QueryEnvelope, QueryOutcome, QueryReply, QueryResult};
+use devmanager::domain::snapshot::SnapshotSection;
 use devmanager::host::HostRequestExecutor;
 use devmanager::kernel::CommandBus;
 use devmanager::protocol::Capability;
@@ -75,8 +76,10 @@ async fn connect_query_and_command_reach_existing_host_request_handle() {
     let slot = ConnectHostRequestSlot::new();
     slot.attach(handle.clone());
     let binding = binding();
-    let mut session =
-        ConnectDispatchSession::bind_paired("web-paired".to_owned(), ConnectIdentityLiveState::Live);
+    let mut session = ConnectDispatchSession::bind_paired(
+        "web-paired".to_owned(),
+        ConnectIdentityLiveState::Live,
+    );
     let client_id = hello(&mut session, binding).await;
     let request_id = RequestId::new();
     let query = ConnectPayload::Query(QueryEnvelope {
@@ -89,9 +92,7 @@ async fn connect_query_and_command_reach_existing_host_request_handle() {
     });
     let env = envelope(binding, 2, Some(request_id), query.clone());
     let host = slot.get();
-    let (reply, _) = session
-        .handle_payload(&env, query, host.as_deref())
-        .await;
+    let (reply, _) = session.handle_payload(&env, query, host.as_deref()).await;
     refute_hold(&reply);
     let ConnectPayload::QueryReply(QueryReply {
         request_id: replied,
@@ -112,9 +113,7 @@ async fn connect_query_and_command_reach_existing_host_request_handle() {
         command: Command::BeginCloseTask,
     });
     let env = envelope(binding, 3, Some(RequestId::new()), command.clone());
-    let (reply, _) = session
-        .handle_payload(&env, command, host.as_deref())
-        .await;
+    let (reply, _) = session.handle_payload(&env, command, host.as_deref()).await;
     refute_hold(&reply);
     let ConnectPayload::CommandReceipt(receipt) = reply else {
         panic!("expected CommandReceipt {reply:?}");
@@ -128,8 +127,10 @@ async fn connect_query_and_command_reach_existing_host_request_handle() {
 #[tokio::test(flavor = "current_thread")]
 async fn connect_fail_closed_cases_do_not_dispatch_or_return_hold() {
     let binding = binding();
-    let mut session =
-        ConnectDispatchSession::bind_paired("web-paired".to_owned(), ConnectIdentityLiveState::Live);
+    let mut session = ConnectDispatchSession::bind_paired(
+        "web-paired".to_owned(),
+        ConnectIdentityLiveState::Live,
+    );
     let request_id = RequestId::new();
     let query = ConnectPayload::Query(QueryEnvelope {
         request_id,
@@ -143,8 +144,10 @@ async fn connect_fail_closed_cases_do_not_dispatch_or_return_hold() {
     refute_hold(&reply);
     assert!(matches!(reply, ConnectPayload::Error(error) if error.code == CONNECT_ERROR_PROTOCOL));
 
-    let mut session =
-        ConnectDispatchSession::bind_paired("web-paired".to_owned(), ConnectIdentityLiveState::Live);
+    let mut session = ConnectDispatchSession::bind_paired(
+        "web-paired".to_owned(),
+        ConnectIdentityLiveState::Live,
+    );
     let bound = hello(&mut session, binding).await;
     let query = ConnectPayload::Query(QueryEnvelope {
         request_id,
@@ -163,6 +166,63 @@ async fn connect_fail_closed_cases_do_not_dispatch_or_return_hold() {
     assert!(session.paired_identity_bound());
     session.disconnect();
     assert!(!session.paired_identity_bound());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn connect_resync_returns_a_fresh_bounded_snapshot_through_the_host_lane() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let bus = CommandBus::open(&directory.path().join("e2e-connect-resync.db")).expect("bus");
+    let (handle, executor) = HostRequestExecutor::start(bus);
+    let binding = binding();
+    let mut session = ConnectDispatchSession::bind_paired(
+        "web-paired".to_owned(),
+        ConnectIdentityLiveState::Live,
+    );
+    let client_id = hello(&mut session, binding).await;
+    let payload = ConnectPayload::Resync(devmanager::connect::ResyncPayload {
+        channel_sequence: 1,
+        newest_sequence: 3,
+        reason: devmanager::connect::ResyncReason::Gap,
+    });
+    let env = envelope(binding, 2, None, payload.clone());
+
+    let (reply, disposition) = session.handle_payload(&env, payload, Some(&handle)).await;
+    assert_eq!(disposition, ConnectSessionDisposition::Continue);
+    let ConnectPayload::QueryReply(reply) = reply else {
+        panic!("expected a fresh snapshot query reply, got {reply:?}");
+    };
+    assert!(matches!(
+        reply.outcome,
+        QueryOutcome::Ok(QueryResult::SnapshotPage { page })
+            if page.section == SnapshotSection::Tasks
+                && page.items.len() <= ConnectLimits::v1_default().max_page_items as usize
+    ));
+    assert_eq!(session.bound_client_id(), Some(client_id));
+
+    drop(handle);
+    executor.abort();
+    let _ = executor.await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn connect_resync_rejects_an_inverted_cursor_before_host_dispatch() {
+    let binding = binding();
+    let mut session =
+        ConnectDispatchSession::bind_paired("web-paired".to_owned(), ConnectIdentityLiveState::Live);
+    hello(&mut session, binding).await;
+    let payload = ConnectPayload::Resync(devmanager::connect::ResyncPayload {
+        channel_sequence: 4,
+        newest_sequence: 3,
+        reason: devmanager::connect::ResyncReason::Gap,
+    });
+    let env = envelope(binding, 2, None, payload.clone());
+
+    let (reply, disposition) = session.handle_payload(&env, payload, None).await;
+    assert_eq!(disposition, ConnectSessionDisposition::Continue);
+    assert!(matches!(
+        reply,
+        ConnectPayload::Error(error) if error.code == devmanager::connect::CONNECT_ERROR_CONFLICT
+    ));
 }
 
 #[test]
