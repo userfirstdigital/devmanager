@@ -1027,6 +1027,7 @@ async fn serve_foreground_host(
                 Capability::PromptProjection,
                 Capability::ExplicitDetach,
                 Capability::HostShutdown,
+                Capability::UpdateHandoff,
                 Capability::ProviderInput,
                 Capability::TaskCockpit,
             ]

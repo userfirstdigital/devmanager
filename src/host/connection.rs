@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::PathBuf;
 use std::pin::pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use futures_util::stream::{FuturesUnordered, StreamExt};
@@ -26,11 +26,14 @@ use crate::domain::command::{
     CreateTaskIntent, CreateTaskRequestIntent, PrepareUpdateIntent,
 };
 use crate::domain::event::DomainEvent;
-use crate::domain::id::{ArtifactId, OperationId, RequestId, SnapshotId, SubscriptionId, TaskId};
+use crate::domain::id::{
+    ArtifactId, OperationId, RequestId, SnapshotId, SubscriptionId, TaskId, TerminalId,
+};
 use crate::domain::query::{
     Query, QueryEnvelope, QueryError, QueryOutcome, QueryReply, QueryResult,
 };
 use crate::domain::snapshot::{PageLimits, SnapshotSection};
+use crate::domain::AgentSessionId;
 use crate::domain::ClientId;
 use crate::kernel::{
     ArtifactContentError, ArtifactContentRegistry, CommandBus, EventReplaySession, ReplayError,
@@ -38,8 +41,11 @@ use crate::kernel::{
 };
 use crate::protocol::{
     Capability, CapabilitySet, ClientRequest, DetachAck, DetachRequest, NegotiatedParameters,
-    ServerMessage, StreamFrame, StreamKey,
+    ServerMessage, StreamFrame, StreamKey, UpdateHandoffReply,
 };
+use crate::terminal::protocol::TerminalSpec;
+use crate::terminal::service::AttachedTerminalRuntime;
+use crate::terminal::service::TerminalService;
 #[cfg(test)]
 use crate::workspace::WorkspaceProjectRootsError;
 use crate::workspace::{
@@ -57,6 +63,9 @@ use super::shutdown::{
 /// When the queue is full, [`HostRequestHandle::execute`] awaits send capacity
 /// (bounded backpressure). Requests are never silently dropped.
 pub const HOST_REQUEST_QUEUE_CAPACITY: usize = 32;
+
+/// Bounded retry ledger for lost authenticated PrepareUpdate replies.
+const MAX_PREPARED_UPDATE_HANDOFFS: usize = 4;
 
 /// Default durable event output lane capacity for one duplex connection.
 pub(crate) const HOST_DURABLE_OUTPUT_QUEUE_CAPACITY: usize = 32;
@@ -769,6 +778,12 @@ struct PendingQuitReceiptAck {
     ack: PhysicalWriteAck,
 }
 
+#[derive(Clone)]
+struct PreparedUpdateReply {
+    intent: PrepareUpdateIntent,
+    reply: UpdateHandoffReply,
+}
+
 enum ExecutorControl {
     RegisterOutput {
         id: ConnectionOutputId,
@@ -779,6 +794,19 @@ enum ExecutorControl {
     },
     UnregisterOutput {
         id: ConnectionOutputId,
+    },
+    AttachTerminal {
+        owner: TaskId,
+        spec: TerminalSpec,
+        runtime: Arc<dyn AttachedTerminalRuntime>,
+        ack: oneshot::Sender<Result<TerminalId, String>>,
+    },
+    BindTerminalIdentity {
+        terminal_id: TerminalId,
+        agent_session_id: AgentSessionId,
+        runtime_generation: u64,
+        action_epoch: u64,
+        ack: oneshot::Sender<Result<(), String>>,
     },
     InspectHostQuitForUpdate {
         ack: oneshot::Sender<Result<crate::domain::host::HostQuitInspection, String>>,
@@ -1239,10 +1267,61 @@ pub struct HostRequestHandle {
     control_tx: mpsc::Sender<ExecutorControl>,
     output_id: Option<ConnectionOutputId>,
     update_gate: Arc<crate::host::update::HostUpdateRuntimeGate>,
+    host_boot_id: Arc<OnceLock<Uuid>>,
     configured_service_supervisor_ready: bool,
 }
 
 impl HostRequestHandle {
+    /// Attach an already-owned task terminal to the host terminal service.
+    /// This never launches a PTY; the runtime is supplied by the task owner.
+    pub(crate) async fn attach_terminal(
+        &self,
+        owner: TaskId,
+        spec: TerminalSpec,
+        runtime: Arc<dyn AttachedTerminalRuntime>,
+    ) -> Result<TerminalId, IpcError> {
+        let (ack, result) = oneshot::channel();
+        self.control_tx
+            .send(ExecutorControl::AttachTerminal {
+                owner,
+                spec,
+                runtime,
+                ack,
+            })
+            .await
+            .map_err(|_| IpcError::Unavailable)?;
+        result
+            .await
+            .map_err(|_| IpcError::Unavailable)?
+            .map_err(|_| IpcError::Unavailable)
+    }
+
+    /// Bind the durable task identity and generation fence before any input
+    /// is admitted for the attached terminal.
+    pub(crate) async fn bind_terminal_identity(
+        &self,
+        terminal_id: TerminalId,
+        agent_session_id: AgentSessionId,
+        runtime_generation: u64,
+        action_epoch: u64,
+    ) -> Result<(), IpcError> {
+        let (ack, result) = oneshot::channel();
+        self.control_tx
+            .send(ExecutorControl::BindTerminalIdentity {
+                terminal_id,
+                agent_session_id,
+                runtime_generation,
+                action_epoch,
+                ack,
+            })
+            .await
+            .map_err(|_| IpcError::Unavailable)?;
+        result
+            .await
+            .map_err(|_| IpcError::Unavailable)?
+            .map_err(|_| IpcError::Unavailable)
+    }
+
     /// Shared update admission gate (stop-new-launches while draining/installing).
     pub fn update_runtime_gate(&self) -> Arc<crate::host::update::HostUpdateRuntimeGate> {
         Arc::clone(&self.update_gate)
@@ -1279,6 +1358,7 @@ impl HostRequestHandle {
         protocol_major: u16,
         protocol_minor: u16,
     ) {
+        let _ = self.host_boot_id.set(host_boot_id);
         updater.bind_live_host_hello(server_build, protocol_major, protocol_minor);
         updater.bind_host_update_runtime(
             self.update_runtime_gate(),
@@ -1336,6 +1416,7 @@ impl HostRequestHandle {
             control_tx: self.control_tx.clone(),
             output_id: Some(output_id),
             update_gate: Arc::clone(&self.update_gate),
+            host_boot_id: Arc::clone(&self.host_boot_id),
             configured_service_supervisor_ready: self.configured_service_supervisor_ready,
         }
     }
@@ -1763,7 +1844,11 @@ pub struct HostRequestExecutor {
     workspace_projects: WorkspaceProjectRoots,
     config_admission: Option<HostWorkspaceAdmission>,
     configured_service_runtime: Option<ConfiguredServiceRuntime>,
+    /// Host-owned terminal admission. It only writes to terminals explicitly
+    /// attached by the task runtime; an unbound/missing terminal fails closed.
+    terminal_service: TerminalService,
     update_gate: Arc<crate::host::update::HostUpdateRuntimeGate>,
+    host_boot_id: Arc<OnceLock<Uuid>>,
     rx: mpsc::Receiver<HostRequestJob>,
     control_rx: mpsc::Receiver<ExecutorControl>,
     control_closed: bool,
@@ -1773,6 +1858,9 @@ pub struct HostRequestExecutor {
     outputs: HashMap<ConnectionOutputId, ConnectionOutputHandle>,
     /// Latest accepted ConfirmHostQuit receipt ack per output (for terminal drain).
     pending_quit_receipt_acks: HashMap<ConnectionOutputId, PendingQuitReceiptAck>,
+    /// Exact PrepareUpdate replies retained for same-command retries after a
+    /// client delivery failure or connection-epoch mismatch.
+    prepared_update_replies: HashMap<crate::domain::id::CommandId, PreparedUpdateReply>,
     /// Supervised foreground only: capacity-one arm sender to the host supervisor.
     arm_tx: Option<mpsc::Sender<PhysicalExitArmRequest>>,
     /// One host-owned workspace resource coordinator. CreateTask and Task
@@ -1935,14 +2023,18 @@ impl HostRequestExecutor {
             control_tx,
             output_id: None,
             update_gate: Arc::clone(&update_gate),
+            host_boot_id: Arc::new(OnceLock::new()),
             configured_service_supervisor_ready,
         };
+        let host_boot_id = Arc::clone(&handle.host_boot_id);
         let mut executor = Self {
             bus,
             workspace_projects,
             config_admission,
             configured_service_runtime,
+            terminal_service: TerminalService::new(),
             update_gate,
+            host_boot_id,
             rx,
             control_rx,
             control_closed: false,
@@ -1951,6 +2043,7 @@ impl HostRequestExecutor {
             artifact_content_registry: ArtifactContentRegistry::new(),
             outputs: HashMap::with_capacity(MAX_SNAPSHOT_SESSIONS),
             pending_quit_receipt_acks: HashMap::with_capacity(MAX_SNAPSHOT_SESSIONS),
+            prepared_update_replies: HashMap::with_capacity(MAX_PREPARED_UPDATE_HANDOFFS),
             arm_tx: Some(arm_tx),
             workspace_coordinator: WorkspaceResourceCoordinator::new(),
         };
@@ -1993,14 +2086,18 @@ impl HostRequestExecutor {
             control_tx,
             output_id: None,
             update_gate: Arc::clone(&update_gate),
+            host_boot_id: Arc::new(OnceLock::new()),
             configured_service_supervisor_ready,
         };
+        let host_boot_id = Arc::clone(&handle.host_boot_id);
         let mut executor = Self {
             bus,
             workspace_projects,
             config_admission,
             configured_service_runtime,
+            terminal_service: TerminalService::new(),
             update_gate,
+            host_boot_id,
             rx,
             control_rx,
             control_closed: false,
@@ -2009,6 +2106,7 @@ impl HostRequestExecutor {
             artifact_content_registry: ArtifactContentRegistry::new(),
             outputs: HashMap::with_capacity(MAX_SNAPSHOT_SESSIONS),
             pending_quit_receipt_acks: HashMap::with_capacity(MAX_SNAPSHOT_SESSIONS),
+            prepared_update_replies: HashMap::with_capacity(MAX_PREPARED_UPDATE_HANDOFFS),
             arm_tx: None,
             workspace_coordinator: WorkspaceResourceCoordinator::new(),
         };
@@ -2131,6 +2229,36 @@ impl HostRequestExecutor {
             }
             ExecutorControl::UnregisterOutput { id } => {
                 self.detach_output(id);
+            }
+            ExecutorControl::AttachTerminal {
+                owner,
+                spec,
+                runtime,
+                ack,
+            } => {
+                let result = self
+                    .terminal_service
+                    .attach(owner, spec, runtime)
+                    .map_err(|error| error.to_string());
+                let _ = ack.send(result);
+            }
+            ExecutorControl::BindTerminalIdentity {
+                terminal_id,
+                agent_session_id,
+                runtime_generation,
+                action_epoch,
+                ack,
+            } => {
+                let result = self
+                    .terminal_service
+                    .bind_task_identity(
+                        terminal_id,
+                        agent_session_id,
+                        runtime_generation,
+                        action_epoch,
+                    )
+                    .map_err(|error| error.to_string());
+                let _ = ack.send(result);
             }
             ExecutorControl::InspectHostQuitForUpdate { ack } => {
                 let result = self
@@ -2772,6 +2900,19 @@ impl HostRequestExecutor {
                 }
                 let reply = self.dispatch_query(negotiated, envelope, output_id)?;
                 Ok(ServerMessage::QueryReply(reply))
+            }
+            ClientRequest::TerminalInput(request) => {
+                if request.client_id != negotiated.client_id {
+                    return Err(IpcError::Unauthorized);
+                }
+                if !negotiated.capabilities.contains(Capability::ProviderInput) {
+                    return Err(IpcError::UnsupportedCapability);
+                }
+                let ack = self
+                    .terminal_service
+                    .write_task_input(request)
+                    .map_err(|_| IpcError::Unavailable)?;
+                Ok(ServerMessage::TerminalInputAck(ack))
             }
             ClientRequest::Detach(request) => self.serve_detach(negotiated, request, output_id),
         }
@@ -3632,16 +3773,38 @@ impl HostRequestExecutor {
         let now = SystemTime::now();
         let receipt = match &envelope.command {
             Command::PrepareUpdate(intent) => {
-                if !negotiated.capabilities.contains(Capability::HostShutdown) {
+                if !negotiated.capabilities.contains(Capability::HostShutdown)
+                    || !negotiated.capabilities.contains(Capability::UpdateHandoff)
+                {
                     return Err(IpcError::UnsupportedCapability);
                 }
+                if let Some(previous) = self.prepared_update_replies.get(&envelope.command_id) {
+                    if previous.intent != *intent {
+                        return Err(IpcError::CorrelationMismatch);
+                    }
+                    if previous.reply.token.is_expired_at(now) {
+                        self.prepared_update_replies.remove(&envelope.command_id);
+                        let _ = self.update_gate.abort_pre_install();
+                    } else {
+                        return Ok(Some(ServerMessage::UpdateHandoff(previous.reply.clone())));
+                    }
+                }
+                if self.prepared_update_replies.len() >= MAX_PREPARED_UPDATE_HANDOFFS {
+                    return Err(IpcError::Busy);
+                }
+                let host_boot_id = self.host_boot_id.get().copied().ok_or_else(|| {
+                    IpcError::Security("host boot identity is not bound".to_string())
+                })?;
                 let inspection = self.bus.inspect_host_quit().map_err(|error| {
                     IpcError::Security(format!("InspectHostQuit failed: {error}"))
                 })?;
-                let mapped =
-                    crate::host::update::update_inspection_from_host_quit(&inspection, Uuid::nil());
+                let mapped = crate::host::update::update_inspection_from_host_quit(
+                    &inspection,
+                    host_boot_id,
+                );
                 let mut probe = crate::updater::FixedActiveResourceProbe { inspection: mapped };
-                self.update_gate
+                let token = self
+                    .update_gate
                     .prepare_update(
                         &mut probe,
                         &intent.target_version,
@@ -3651,13 +3814,18 @@ impl HostRequestExecutor {
                         intent.allow_explicit_confirm_with_active,
                     )
                     .map_err(|error| IpcError::Security(error.to_string()))?;
-                CommandReceipt::Accepted {
+                let reply = UpdateHandoffReply {
                     command_id: envelope.command_id,
-                    operation_id: crate::domain::id::OperationId::new(),
-                    task_revision: None,
-                    event_ids: Vec::new(),
-                    prompt_mutation: None,
-                }
+                    token,
+                };
+                self.prepared_update_replies.insert(
+                    envelope.command_id,
+                    PreparedUpdateReply {
+                        intent: intent.clone(),
+                        reply: reply.clone(),
+                    },
+                );
+                return Ok(Some(ServerMessage::UpdateHandoff(reply)));
             }
             Command::ConfirmUpdateDrain(intent) => {
                 if !negotiated.capabilities.contains(Capability::HostShutdown) {
@@ -3681,6 +3849,7 @@ impl HostRequestExecutor {
                 self.update_gate
                     .abort_pre_install()
                     .map_err(|error| IpcError::Security(error.to_string()))?;
+                self.prepared_update_replies.clear();
                 CommandReceipt::Accepted {
                     command_id: envelope.command_id,
                     operation_id: crate::domain::id::OperationId::new(),
@@ -3696,6 +3865,8 @@ impl HostRequestExecutor {
                 self.update_gate
                     .begin_atomic_install(intent.token_id, now)
                     .map_err(|error| IpcError::Security(error.to_string()))?;
+                self.prepared_update_replies
+                    .retain(|_, prepared| prepared.reply.token.token_id != intent.token_id);
                 CommandReceipt::Accepted {
                     command_id: envelope.command_id,
                     operation_id: crate::domain::id::OperationId::new(),
@@ -4150,6 +4321,17 @@ fn dispatch_authenticated_request_inner(
             let reply = bus.query(envelope).map_err(map_store_error)?;
             Ok(ServerMessage::QueryReply(reply))
         }
+        ClientRequest::TerminalInput(request) => {
+            if request.client_id != authenticated_client_id {
+                return Err(IpcError::Unauthorized);
+            }
+            if !capabilities.contains(Capability::ProviderInput) {
+                return Err(IpcError::UnsupportedCapability);
+            }
+            // The compatibility executor has no host-owned TerminalService;
+            // never create or infer a PTY from an input request.
+            Err(IpcError::Unavailable)
+        }
         ClientRequest::Detach(_) => Err(IpcError::Unavailable),
     }
 }
@@ -4163,6 +4345,12 @@ fn validate_authenticated_command_capability(
 ) -> Result<(), IpcError> {
     match command {
         Command::ConfirmHostQuit(_) if !capabilities.contains(Capability::HostShutdown) => {
+            Err(IpcError::UnsupportedCapability)
+        }
+        Command::PrepareUpdate(_) if !capabilities.contains(Capability::HostShutdown) => {
+            Err(IpcError::UnsupportedCapability)
+        }
+        Command::PrepareUpdate(_) if !capabilities.contains(Capability::UpdateHandoff) => {
             Err(IpcError::UnsupportedCapability)
         }
         Command::PresentProviderQuestion(_)

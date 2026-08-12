@@ -16,6 +16,7 @@ pub mod icons;
 pub mod kernel;
 pub mod models;
 pub mod notifications;
+pub mod organization;
 pub mod org;
 pub mod persistence;
 pub mod process;

@@ -8,7 +8,9 @@ use std::collections::BTreeMap;
 use uuid::Uuid;
 
 use crate::domain::cockpit::TaskCockpitQuery;
-use crate::domain::command::{Command, CommandEnvelope, CommandReceipt, ConfirmHostQuitIntent};
+use crate::domain::command::{
+    Command, CommandEnvelope, CommandReceipt, ConfirmHostQuitIntent, PrepareUpdateIntent,
+};
 use crate::domain::host::HostQuitInspection;
 use crate::domain::id::{
     ArtifactId, CommandId, OperationId, RequestId, SnapshotId, SubscriptionId, TaskId,
@@ -29,6 +31,7 @@ use crate::protocol::{
     Capability, CapabilitySet, ClientHello, DetachAck, DetachRequest, FrameLimits, ReconnectGrant,
     ServerHello,
 };
+use crate::updater::UpdateHandoffToken;
 
 use super::action::{task_cockpit_query, task_show_query};
 use super::connection::{connect, ClientConnection, UnsolicitedServerMessage};
@@ -230,6 +233,69 @@ impl HostClient {
             return Err(IpcError::Unauthorized);
         }
         self.live_connection()?.execute_command(envelope).await
+    }
+
+    /// Ask the authenticated host to prepare one update handoff on this exact
+    /// connection and return the host-issued token. The caller owns the
+    /// command id so an unknown delivery outcome can retry the same request;
+    /// this method never creates a second HostClient or nests a client lock
+    /// across the await.
+    pub async fn prepare_update(
+        &mut self,
+        command_id: CommandId,
+        target_version: &str,
+        client_build: &str,
+        host_build: &str,
+        allow_explicit_confirm_with_active: bool,
+    ) -> Result<UpdateHandoffToken, IpcError> {
+        if !self.server_hello.granted.contains(Capability::HostShutdown)
+            || !self
+                .server_hello
+                .granted
+                .contains(Capability::UpdateHandoff)
+        {
+            return Err(IpcError::UnsupportedCapability);
+        }
+
+        let envelope = CommandEnvelope {
+            command_id,
+            client_id: self.config.client_id,
+            task_id: None,
+            issued_at_ms: unix_time_ms(),
+            expected_task_revision: None,
+            command: Command::PrepareUpdate(PrepareUpdateIntent {
+                target_version: target_version.to_string(),
+                client_build: client_build.to_string(),
+                host_build: host_build.to_string(),
+                allow_explicit_confirm_with_active,
+            }),
+        };
+        let outcome = {
+            let connection = self.live_connection()?;
+            connection.execute_update_handoff(envelope).await
+        };
+        let reply = match outcome {
+            Ok(reply) => reply,
+            Err(error) => {
+                // The host retains the prepared token under command_id. Retire
+                // this exact connection so a later retry cannot share a
+                // poisoned epoch or stale inbound tail.
+                self.retire_connection();
+                return Err(error);
+            }
+        };
+        let token = reply.token;
+        if reply.command_id != command_id
+            || token.host_boot_id != self.server_hello.host_boot_id
+            || token.host_boot_id == Uuid::nil()
+            || token.target_version != target_version
+            || token.client_build != client_build
+            || token.host_build != host_build
+        {
+            self.retire_connection();
+            return Err(IpcError::CorrelationMismatch);
+        }
+        Ok(token)
     }
 
     /// Execute an arbitrary query while preserving the HostClient connection
@@ -1059,6 +1125,15 @@ fn finish_detach_after_matching_ack(
     let connection_id = ack.connection_id;
     *connection = None;
     Ok(connection_id)
+}
+
+fn unix_time_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
 }
 
 /// Record an Accepted receipt. Collision with a different CommandId leaves the map unchanged.

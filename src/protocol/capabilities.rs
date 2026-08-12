@@ -75,6 +75,10 @@ pub enum Capability {
     OrganizationProjection = 15,
     ServiceSupervisor = 16,
     TaskCockpit = 17,
+    /// Correlated PrepareUpdate replies carry the exact host-issued handoff
+    /// token. This is separate from HostShutdown so older clients never see
+    /// the new reply variant on the wire.
+    UpdateHandoff = 18,
 }
 
 impl Capability {
@@ -103,6 +107,7 @@ impl Capability {
             Self::OrganizationProjection => "organization_projection",
             Self::ServiceSupervisor => "service_supervisor",
             Self::TaskCockpit => "task_cockpit",
+            Self::UpdateHandoff => "update_handoff",
         }
     }
 }
@@ -164,11 +169,28 @@ mod tests {
     fn task_cockpit_wire_name_and_bit_are_stable_and_not_service_supervisor() {
         assert_eq!(Capability::TaskCockpit.wire_name(), "task_cockpit");
         assert_eq!(Capability::TaskCockpit.bit(), 1_u64 << 17);
-        assert_eq!(Capability::ServiceSupervisor.wire_name(), "service_supervisor");
+        assert_eq!(
+            Capability::ServiceSupervisor.wire_name(),
+            "service_supervisor"
+        );
         assert_eq!(Capability::ServiceSupervisor.bit(), 1_u64 << 16);
         let granted = CapabilitySet::from_capabilities([Capability::TaskCockpit]);
         assert!(granted.grants_task_cockpit());
         assert!(!granted.contains(Capability::ServiceSupervisor));
         assert!(!CapabilitySet::empty().grants_task_cockpit());
+    }
+
+    #[test]
+    fn update_handoff_is_a_distinct_forward_compatible_capability() {
+        assert_eq!(Capability::UpdateHandoff.wire_name(), "update_handoff");
+        assert_eq!(Capability::UpdateHandoff.bit(), 1_u64 << 18);
+        let offered =
+            CapabilitySet::from_capabilities([Capability::HostShutdown, Capability::UpdateHandoff]);
+        assert!(offered.contains(Capability::UpdateHandoff));
+        assert!(offered.contains(Capability::HostShutdown));
+        assert_eq!(
+            offered.intersection(CapabilitySet::from_bits(1_u64 << 13)),
+            CapabilitySet::from_capabilities([Capability::HostShutdown])
+        );
     }
 }

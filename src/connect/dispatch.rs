@@ -52,7 +52,7 @@ const ORG_EXTENSION_TYPE: u16 = crate::protocol::organization_extension_type(
 /// lane's responsibility and a reconnect/resync is required when that lane is
 /// unavailable.
 pub fn advertised_connect_capabilities() -> CapabilitySet {
-    advertised_connect_capabilities_for_host(bound_host_request_handle().is_some())
+    advertised_connect_capabilities_for_host(false)
 }
 
 fn advertised_connect_capabilities_for_host(host_attached: bool) -> CapabilitySet {

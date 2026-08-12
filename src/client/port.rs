@@ -15,7 +15,7 @@ use crate::domain::command::{CommandEnvelope, CommandReceipt};
 use crate::domain::id::{ArtifactId, RequestId, TaskId};
 use crate::domain::query::{QueryEnvelope, QueryReply};
 use crate::host::IpcError;
-use crate::protocol::{ClientRequest, NegotiatedParameters, ServerMessage};
+use crate::protocol::{ClientRequest, NegotiatedParameters, ServerMessage, UpdateHandoffReply};
 
 use super::connection::UnsolicitedServerMessage;
 use super::host_client::{ArtifactContentBatch, EventReplayBatch, HostClient, HostClientConfig};
@@ -132,6 +132,9 @@ impl ConnectHostCommandPort for HostClientConnectPort {
     ) -> Result<ServerMessage, IpcError> {
         let client_id = negotiated.client_id;
         let client = match &request {
+            ClientRequest::TerminalInput(request) if request.client_id != client_id => {
+                return Err(IpcError::Unauthorized);
+            }
             ClientRequest::Command(envelope) if envelope.client_id != client_id => {
                 return Err(IpcError::Unauthorized);
             }
@@ -146,10 +149,31 @@ impl ConnectHostCommandPort for HostClientConnectPort {
         // HostClient's authenticated IPC Hello is the grant authority. The
         // Connect capability claim is intentionally not used to elevate it.
         let result = match request {
-            ClientRequest::Command(envelope) => client_guard
-                .execute_command(envelope)
-                .await
-                .map(ServerMessage::CommandReceipt),
+            ClientRequest::TerminalInput(_) => Err(IpcError::Unsupported),
+            ClientRequest::Command(envelope) => {
+                if let crate::domain::command::Command::PrepareUpdate(intent) = &envelope.command {
+                    client_guard
+                        .prepare_update(
+                            envelope.command_id,
+                            &intent.target_version,
+                            &intent.client_build,
+                            &intent.host_build,
+                            intent.allow_explicit_confirm_with_active,
+                        )
+                        .await
+                        .map(|token| {
+                            ServerMessage::UpdateHandoff(UpdateHandoffReply {
+                                command_id: envelope.command_id,
+                                token,
+                            })
+                        })
+                } else {
+                    client_guard
+                        .execute_command(envelope)
+                        .await
+                        .map(ServerMessage::CommandReceipt)
+                }
+            }
             ClientRequest::Query(envelope) => client_guard
                 .query(envelope)
                 .await

@@ -3,18 +3,22 @@
 use serde::de::{self, MapAccess, Visitor};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::fmt;
 
 use crate::domain::command::{CommandEnvelope, CommandReceipt};
 use crate::domain::event::DomainEvent;
-use crate::domain::id::SubscriptionId;
+use crate::domain::id::{CommandId, SubscriptionId};
 use crate::domain::query::{QueryEnvelope, QueryReply};
 use crate::protocol::control::{DetachAck, DetachRequest};
 use crate::protocol::stream::StreamFrame;
+use crate::terminal::protocol::{InputAck, TerminalInputRequest};
+use crate::updater::UpdateHandoffToken;
 
 /// One client-initiated request on an authenticated connection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClientRequest {
     Command(CommandEnvelope),
+    TerminalInput(TerminalInputRequest),
     Query(QueryEnvelope),
     Detach(DetachRequest),
 }
@@ -27,6 +31,7 @@ impl Serialize for ClientRequest {
         let mut map = serializer.serialize_map(Some(1))?;
         match self {
             Self::Command(envelope) => map.serialize_entry("command", envelope)?,
+            Self::TerminalInput(request) => map.serialize_entry("terminal_input", request)?,
             Self::Query(envelope) => map.serialize_entry("query", envelope)?,
             Self::Detach(request) => map.serialize_entry("detach", request)?,
         }
@@ -36,6 +41,7 @@ impl Serialize for ClientRequest {
 
 enum ClientRequestVariant {
     Command,
+    TerminalInput,
     Query,
     Detach,
 }
@@ -51,7 +57,7 @@ impl<'de> Deserialize<'de> for ClientRequestVariant {
             type Value = ClientRequestVariant;
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str("command, query, or detach")
+                formatter.write_str("command, terminal_input, query, or detach")
             }
 
             fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
@@ -60,11 +66,12 @@ impl<'de> Deserialize<'de> for ClientRequestVariant {
             {
                 match value {
                     "command" => Ok(ClientRequestVariant::Command),
+                    "terminal_input" => Ok(ClientRequestVariant::TerminalInput),
                     "query" => Ok(ClientRequestVariant::Query),
                     "detach" => Ok(ClientRequestVariant::Detach),
                     _ => Err(de::Error::unknown_variant(
                         value,
-                        &["command", "query", "detach"],
+                        &["command", "terminal_input", "query", "detach"],
                     )),
                 }
             }
@@ -97,6 +104,9 @@ impl<'de> Deserialize<'de> for ClientRequest {
                     .ok_or_else(|| de::Error::custom("ClientRequest variant is missing"))?;
                 let request = match variant {
                     ClientRequestVariant::Command => ClientRequest::Command(map.next_value()?),
+                    ClientRequestVariant::TerminalInput => {
+                        ClientRequest::TerminalInput(map.next_value()?)
+                    }
                     ClientRequestVariant::Query => ClientRequest::Query(map.next_value()?),
                     ClientRequestVariant::Detach => ClientRequest::Detach(map.next_value()?),
                 };
@@ -113,10 +123,34 @@ impl<'de> Deserialize<'de> for ClientRequest {
     }
 }
 
+/// Correlated reply to an authenticated PrepareUpdate command.
+///
+/// The token is the host-owned handoff authority. It is never reconstructed
+/// by the client, and its fields are deliberately omitted from `Debug` so a
+/// routine protocol diagnostic cannot log the bearer token.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateHandoffReply {
+    pub command_id: CommandId,
+    pub token: UpdateHandoffToken,
+}
+
+impl fmt::Debug for UpdateHandoffReply {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("UpdateHandoffReply")
+            .field("command_id", &self.command_id)
+            .field("token", &"[redacted]")
+            .finish()
+    }
+}
+
 /// One host-originated message on an authenticated connection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServerMessage {
     CommandReceipt(CommandReceipt),
+    TerminalInputAck(InputAck),
+    UpdateHandoff(UpdateHandoffReply),
     QueryReply(QueryReply),
     DurableEvent {
         subscription_id: SubscriptionId,
@@ -175,6 +209,8 @@ impl Serialize for ServerMessage {
         let mut map = serializer.serialize_map(Some(1))?;
         match self {
             Self::CommandReceipt(receipt) => map.serialize_entry("command_receipt", receipt)?,
+            Self::TerminalInputAck(ack) => map.serialize_entry("terminal_input_ack", ack)?,
+            Self::UpdateHandoff(reply) => map.serialize_entry("update_handoff", reply)?,
             Self::QueryReply(reply) => map.serialize_entry("query_reply", reply)?,
             Self::DurableEvent {
                 subscription_id,
@@ -207,6 +243,8 @@ impl Serialize for ServerMessage {
 
 enum ServerMessageVariant {
     CommandReceipt,
+    TerminalInputAck,
+    UpdateHandoff,
     QueryReply,
     DurableEvent,
     ResyncRequired,
@@ -225,9 +263,7 @@ impl<'de> Deserialize<'de> for ServerMessageVariant {
             type Value = ServerMessageVariant;
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str(
-                    "command_receipt, query_reply, durable_event, resync_required, stream, or detached",
-                )
+                formatter.write_str("command_receipt, terminal_input_ack, update_handoff, query_reply, durable_event, resync_required, stream, or detached")
             }
 
             fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
@@ -236,6 +272,8 @@ impl<'de> Deserialize<'de> for ServerMessageVariant {
             {
                 match value {
                     "command_receipt" => Ok(ServerMessageVariant::CommandReceipt),
+                    "terminal_input_ack" => Ok(ServerMessageVariant::TerminalInputAck),
+                    "update_handoff" => Ok(ServerMessageVariant::UpdateHandoff),
                     "query_reply" => Ok(ServerMessageVariant::QueryReply),
                     "durable_event" => Ok(ServerMessageVariant::DurableEvent),
                     "resync_required" => Ok(ServerMessageVariant::ResyncRequired),
@@ -245,6 +283,8 @@ impl<'de> Deserialize<'de> for ServerMessageVariant {
                         value,
                         &[
                             "command_receipt",
+                            "terminal_input_ack",
+                            "update_handoff",
                             "query_reply",
                             "durable_event",
                             "resync_required",
@@ -483,6 +523,12 @@ impl<'de> Deserialize<'de> for ServerMessage {
                 let message = match variant {
                     ServerMessageVariant::CommandReceipt => {
                         ServerMessage::CommandReceipt(map.next_value()?)
+                    }
+                    ServerMessageVariant::TerminalInputAck => {
+                        ServerMessage::TerminalInputAck(map.next_value()?)
+                    }
+                    ServerMessageVariant::UpdateHandoff => {
+                        ServerMessage::UpdateHandoff(map.next_value()?)
                     }
                     ServerMessageVariant::QueryReply => {
                         ServerMessage::QueryReply(map.next_value()?)

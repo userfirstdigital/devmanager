@@ -1,6 +1,7 @@
 //! Stable protocol compatibility and safety contracts.
 
 use std::io::{Cursor, Error, ErrorKind, Read, Write};
+use std::time::{Duration, SystemTime};
 
 use devmanager::domain::{
     AgentRole, AgentSessionId, AgentSessionLifecycle, ArtifactContentPage, ArtifactId,
@@ -18,8 +19,9 @@ use devmanager::protocol::{
     DetachAck, DetachRequest, FrameLimitField, FrameLimits, FrameLimitsError, MessagePackCodec,
     MessagePackError, MessagePackLengthKind, PhysicalFrameCodec, PhysicalFrameError,
     ProfileFingerprint, ProtocolVersion, ServerMessage, StreamFrame, StreamKey, StreamPayloadKind,
-    VersionNegotiationError, MAX_CLIENT_BUILD_BYTES, MAX_MESSAGEPACK_COLLECTION_ITEMS,
-    MAX_MESSAGEPACK_DEPTH, MAX_MESSAGEPACK_VALUES, PROTOCOL_MAJOR, PROTOCOL_MINOR,
+    UpdateHandoffReply, VersionNegotiationError, MAX_CLIENT_BUILD_BYTES,
+    MAX_MESSAGEPACK_COLLECTION_ITEMS, MAX_MESSAGEPACK_DEPTH, MAX_MESSAGEPACK_VALUES,
+    PROTOCOL_MAJOR, PROTOCOL_MINOR,
 };
 use devmanager::providers::ProviderKind;
 use uuid::Uuid;
@@ -46,6 +48,8 @@ fn protocol_capability_bits_are_stable_and_unknown_bits_are_tolerated() {
     for (capability, bit_index) in named {
         assert_eq!(capability.bit(), 1_u64 << bit_index);
     }
+    assert_eq!(Capability::UpdateHandoff.bit(), 1_u64 << 18);
+    assert_eq!(Capability::UpdateHandoff.wire_name(), "update_handoff");
 
     let unknown_bit = 1_u64 << 63;
     let requested = CapabilitySet::from_bits(
@@ -65,6 +69,39 @@ fn protocol_capability_bits_are_stable_and_unknown_bits_are_tolerated() {
         CapabilitySet::from_capabilities([Capability::PagedSnapshots])
     );
     assert!(!granted.contains_bit(unknown_bit));
+}
+
+#[test]
+fn prepare_update_reply_round_trips_the_exact_host_token_without_debugging_it() {
+    let command_id = CommandId::from_bytes(protocol_uuid_v7(0x71)).expect("command id");
+    let token_id = Uuid::from_bytes(protocol_uuid_v7(0x72));
+    let host_boot_id = Uuid::from_bytes(protocol_uuid_v7(0x73));
+    let issued_at = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+    let token = devmanager::updater::UpdateHandoffToken {
+        token_id,
+        host_boot_id,
+        inspection_id: 42,
+        target_version: "0.4.2".to_string(),
+        client_build: "devmanager/0.4.2".to_string(),
+        host_build: "devmanager-host/0.4.2".to_string(),
+        issued_at,
+        expires_at: issued_at + Duration::from_secs(120),
+    };
+    let reply = UpdateHandoffReply {
+        command_id,
+        token: token.clone(),
+    };
+    let message = ServerMessage::UpdateHandoff(reply.clone());
+    let codec = MessagePackCodec::from_limits(FrameLimits::v1_default()).expect("codec");
+    let encoded = codec.encode(&message).expect("encode reply");
+    let decoded = codec
+        .decode::<ServerMessage>(&encoded)
+        .expect("decode reply");
+    assert_eq!(decoded, message);
+    assert_eq!(reply.token, token);
+    let debug = format!("{reply:?}");
+    assert!(!debug.contains(&token_id.to_string()));
+    assert!(!debug.contains("devmanager/0.4.2"));
 }
 
 #[test]

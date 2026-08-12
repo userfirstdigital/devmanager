@@ -63,7 +63,7 @@ pub use org::{
     ORGANIZATION_SCHEMA_VERSION,
 };
 pub use reconnect::ReconnectGrant;
-pub use request::{ClientRequest, ServerMessage};
+pub use request::{ClientRequest, ServerMessage, UpdateHandoffReply};
 pub use stream::{StreamFrame, StreamKey, StreamPayloadKind};
 
 /// Journal pages use the same bounded MessagePack codec as other protocol
