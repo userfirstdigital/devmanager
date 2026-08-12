@@ -275,11 +275,11 @@ impl EvidenceIntake {
         }
     }
 
-    pub fn raw_evidence(
+    pub fn raw_evidence<'a>(
         &self,
         access: EvidenceAccessClass,
-        bundle: &EvidenceBundle,
-    ) -> Result<&[EvidenceSegment], OrgError> {
+        bundle: &'a EvidenceBundle,
+    ) -> Result<&'a [EvidenceSegment], OrgError> {
         if !matches!(access, EvidenceAccessClass::AuthorizedE2ERaw) || !self.e2e_raw_authorized {
             return Err(OrgError::ProhibitedField);
         }

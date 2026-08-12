@@ -940,7 +940,7 @@ impl ProcessManager {
             .catalog_definitions()
             .into_iter()
             .find(|definition| definition.id == *service_id)
-            .map(|definition| definition.scope().clone())
+            .map(|definition| definition.scope.clone())
             .ok_or_else(|| {
                 crate::services::supervisor::SupervisorError::UnknownService(service_id.clone())
             })

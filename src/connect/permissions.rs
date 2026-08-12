@@ -283,7 +283,8 @@ mod tests {
             issued_at_ms: 1,
             expected_task_revision: None,
             command: Command::ServiceControl(ServiceControlIntent {
-                service_id: "demo".into(),
+                service_id: crate::domain::id::ConfiguredServiceId::new("demo")
+                    .expect("valid configured service id"),
                 resource_generation: 1,
                 connection_epoch: 1,
                 action_epoch: 1,
