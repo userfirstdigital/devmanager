@@ -23,6 +23,7 @@ use crate::domain::task::{
 };
 use crate::prompts::{PromptCommand, PromptMutationReceipt};
 use crate::workspace::WorkspaceRequest;
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -958,6 +959,15 @@ pub enum Command {
     SettleProviderWait(SettleProviderWaitIntent),
     PromptLibrary(PromptCommand),
     Browser(BrowserRequest),
+    /// Host-boundary update handoff: inspect+prepare with expiring token.
+    PrepareUpdate(PrepareUpdateIntent),
+    /// Confirm drain after PrepareUpdate; stops new launches until abort/arm.
+    ConfirmUpdateDrain(ConfirmUpdateDrainIntent),
+    /// Abort pre-install handoff and restore Ready admission.
+    AbortUpdateHandoff,
+    /// Arm durable staged-install readiness (recoverable). Irreversible only after
+    /// durable stage marker is written by the installer path.
+    ArmUpdateInstall(ArmUpdateInstallIntent),
 }
 
 /// Canonical SHA-256 over client, task, expected revision, and command.
@@ -984,6 +994,27 @@ pub fn command_payload_digest(envelope: &CommandEnvelope) -> Result<[u8; 32], St
     let mut out = [0u8; 32];
     out.copy_from_slice(&digest);
     Ok(out)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct PrepareUpdateIntent {
+    pub target_version: String,
+    pub client_build: String,
+    pub host_build: String,
+    pub allow_explicit_confirm_with_active: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct ConfirmUpdateDrainIntent {
+    pub token_id: Uuid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct ArmUpdateInstallIntent {
+    pub token_id: Uuid,
 }
 
 pub fn decide(
@@ -1129,6 +1160,10 @@ pub fn decide(
         }
         Command::PromptLibrary(_) => Err(RejectionCode::InvalidTransition),
         Command::Browser(request) => decide_browser(snapshot, envelope, request),
+        Command::PrepareUpdate(_)
+        | Command::ConfirmUpdateDrain(_)
+        | Command::AbortUpdateHandoff
+        | Command::ArmUpdateInstall(_) => Err(RejectionCode::InvalidTransition),
     }
 }
 

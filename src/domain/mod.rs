@@ -28,8 +28,9 @@ pub use codec::{
 };
 pub use command::{
     command_payload_digest, decide, Command, CommandEnvelope, CommandReceipt,
-    ConfirmHostQuitIntent, CreateTaskIntent, CreateTaskRequestIntent, RejectionCode,
-    RenameTaskIntent, SetTaskAttentionIntent, SubmitProviderInputIntent,
+    ArmUpdateInstallIntent, ConfirmHostQuitIntent, ConfirmUpdateDrainIntent, CreateTaskIntent,
+    CreateTaskRequestIntent, PrepareUpdateIntent, RejectionCode, RenameTaskIntent,
+    SetTaskAttentionIntent, SubmitProviderInputIntent,
 };
 pub use event::{
     apply, ApplyError, DomainEvent, Event, EventSerdeError, OperationAcceptedFact,
