@@ -15,9 +15,16 @@ use crate::protocol::{
     BrowserWindowHandle, MAX_BROWSER_CLIENT_SEQUENCE,
 };
 mod initialization;
+mod native_surface;
 mod unsupported;
 #[cfg(target_os = "windows")]
 mod windows;
+
+pub use native_surface::{
+    legacy_mcp_command_task_identity, require_completed_wry_task_identity,
+    BrowserHostOwnedSurfaceProof, BrowserTaskSurfaceBindBlocker, HostOwnedNativeSurfaceBackend,
+    HostOwnedSurfaceBindError, LegacyMcpTaskSurfaceBlocker,
+};
 
 use serde::{Deserialize, Serialize};
 use std::cell::Cell;
@@ -74,6 +81,7 @@ impl std::fmt::Display for BrowserNativeWindowLifetimeError {
 struct BrowserNativeWindowLifetimeState {
     phase: Cell<BrowserNativeWindowPhase>,
     window_identity: Cell<Option<isize>>,
+    parking_hwnd: Cell<Option<u64>>,
     generation: Cell<u64>,
     lease_count: Cell<usize>,
 }
@@ -89,6 +97,7 @@ impl Default for BrowserNativeWindowLifetime {
             state: Rc::new(BrowserNativeWindowLifetimeState {
                 phase: Cell::new(BrowserNativeWindowPhase::Open),
                 window_identity: Cell::new(None),
+                parking_hwnd: Cell::new(None),
                 generation: Cell::new(0),
                 lease_count: Cell::new(0),
             }),
@@ -226,6 +235,44 @@ impl BrowserNativeWindowLifetime {
             && self.state.lease_count.get() == 0
     }
 
+    pub(crate) fn parking_window_handle(&self) -> Option<BrowserWindowHandle> {
+        let raw = self.state.parking_hwnd.get()?;
+        BrowserWindowHandle::from_raw(raw).ok()
+    }
+
+    pub(crate) fn install_parking_hwnd(
+        &self,
+        parking_hwnd: u64,
+        gpui_window_identity: isize,
+    ) -> Result<BrowserWindowHandle, BrowserNativeWindowLifetimeError> {
+        if parking_hwnd == 0 || parking_hwnd == gpui_window_identity as u64 {
+            return Err(BrowserNativeWindowLifetimeError::WindowLeaseConflict);
+        }
+        match self.state.parking_hwnd.get() {
+            Some(existing) if existing == parking_hwnd => BrowserWindowHandle::from_raw(existing)
+                .map_err(|_| BrowserNativeWindowLifetimeError::WindowLeaseConflict),
+            Some(_) => Err(BrowserNativeWindowLifetimeError::WindowLeaseConflict),
+            None => {
+                self.state.parking_hwnd.set(Some(parking_hwnd));
+                BrowserWindowHandle::from_raw(parking_hwnd)
+                    .map_err(|_| BrowserNativeWindowLifetimeError::WindowLeaseConflict)
+            }
+        }
+    }
+
+    pub(crate) fn take_parking_hwnd_for_destroy(&self) -> Option<u64> {
+        if !matches!(
+            self.state.phase.get(),
+            BrowserNativeWindowPhase::Closing | BrowserNativeWindowPhase::Draining
+        ) {
+            return None;
+        }
+        if self.state.lease_count.get() != 0 {
+            return None;
+        }
+        self.state.parking_hwnd.take()
+    }
+
     pub(crate) fn window_close_must_be_deferred(&self) -> bool {
         self.state.phase.get() != BrowserNativeWindowPhase::Open
             || self.state.lease_count.get() != 0
@@ -284,7 +331,7 @@ fn release_native_window_lease(state: &BrowserNativeWindowLifetimeState) {
 
 #[cfg(test)]
 mod native_window_lifetime_tests {
-    use super::{BrowserAppExitDisposition, BrowserNativeWindowLifetime, BrowserNativeWindowPhase};
+    use super::{BrowserAppExitDisposition, BrowserNativeWindowLifetime};
     use std::cell::Cell;
 
     trait ExhaustionOutcome {
@@ -301,6 +348,51 @@ mod native_window_lifetime_tests {
         fn is_exhausted(&self) -> bool {
             self.is_err()
         }
+    }
+
+    #[test]
+    fn parking_hwnd_survives_until_closing_drain() {
+        let lifetime = BrowserNativeWindowLifetime::default();
+        let generation = lifetime.bind_window(101).unwrap();
+        let lease = lifetime.acquire(101, generation).unwrap();
+        lifetime
+            .install_parking_hwnd(202, 101)
+            .expect("distinct parking");
+        drop(lease);
+        assert!(
+            lifetime.take_parking_hwnd_for_destroy().is_none(),
+            "open-phase host operation must retain the parking HWND even with zero leases"
+        );
+        let lease = lifetime.acquire(101, generation).unwrap();
+        assert_eq!(
+            lifetime.begin_teardown().unwrap(),
+            BrowserAppExitDisposition::Deferred
+        );
+        assert!(
+            lifetime.take_parking_hwnd_for_destroy().is_none(),
+            "parking HWND stays while build leases remain"
+        );
+        drop(lease);
+        assert!(lifetime.teardown_ready());
+        assert_eq!(lifetime.take_parking_hwnd_for_destroy(), Some(202));
+        assert!(lifetime.parking_window_handle().is_none());
+    }
+
+    #[test]
+    fn parking_hwnd_is_not_the_gpui_window_alias() {
+        let lifetime = BrowserNativeWindowLifetime::default();
+        let generation = lifetime.bind_window(101).unwrap();
+        assert!(
+            lifetime.parking_window_handle().is_none(),
+            "GPUI parent identity must not be treated as the parking HWND"
+        );
+        assert!(lifetime.install_parking_hwnd(101, 101).is_err());
+        let parking = lifetime
+            .install_parking_hwnd(202, 101)
+            .expect("distinct parking");
+        assert_eq!(parking.raw_value(), 202);
+        assert_ne!(parking.raw_value(), 101);
+        drop(generation);
     }
 
     #[test]
@@ -622,6 +714,22 @@ impl BrowserNativeViewRegistration {
     pub fn identity(&self) -> BrowserSurfaceIdentity {
         self.identity
     }
+
+    pub(crate) fn child_window(&self) -> &BrowserWindowHandle {
+        &self.child_window
+    }
+
+    pub(crate) fn parking_window_handle(&self) -> &BrowserWindowHandle {
+        self.parking_window.handle()
+    }
+
+    pub(crate) fn physical_bounds(&self) -> BrowserPhysicalBounds {
+        self.physical_bounds
+    }
+
+    pub(crate) fn host_process(&self) -> &BrowserHostProcessIdentity {
+        &self.host_process
+    }
 }
 
 mod browser_native_surface_backend_seal {
@@ -673,6 +781,7 @@ pub trait BrowserNativeSurfaceBackend: browser_native_surface_backend_seal::Seal
     fn attach_surface(
         &mut self,
         child: &BrowserWindowHandle,
+        destination: &BrowserWindowHandle,
         bounds: BrowserPhysicalBounds,
     ) -> Result<(), String>;
 
@@ -695,6 +804,7 @@ pub trait BrowserNativeSurfaceBackend: browser_native_surface_backend_seal::Seal
         &mut self,
         descriptor: &BrowserSurfaceDescriptor,
         parking: &BrowserWindowHandle,
+        attached_parent: Option<&BrowserWindowHandle>,
         attached: bool,
         bounds: BrowserPhysicalBounds,
         focused: bool,
@@ -704,6 +814,15 @@ pub trait BrowserNativeSurfaceBackend: browser_native_surface_backend_seal::Seal
     /// A caller cannot turn a capability into a crash fact without this live
     /// observation succeeding.
     fn observe_surface_crash(
+        &mut self,
+        descriptor: &BrowserSurfaceDescriptor,
+        parking: &BrowserWindowHandle,
+    ) -> Result<(), String>;
+
+    /// Observe that controller/environment/listener ownership and helper
+    /// residue are gone for this exact parked surface. Success is required
+    /// before teardown may return Ready; backends must not invent zero residue.
+    fn observe_teardown_zero_residue(
         &mut self,
         descriptor: &BrowserSurfaceDescriptor,
         parking: &BrowserWindowHandle,
@@ -823,6 +942,9 @@ impl<B: BrowserNativeSurfaceBackend> Drop for BrowserNativeViewAllocationGuard<'
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BrowserTeardownStatus {
+    /// Live backend observation proved zero residue; close may complete.
+    Ready,
+    /// Teardown work is still in flight and must not be claimed complete.
     Pending,
     Blocked(BrowserTeardownBlocker),
 }
@@ -858,6 +980,9 @@ pub enum BrowserNativeViewError {
     TeardownPending,
     TeardownBlocked(BrowserTeardownBlocker),
     HostRequestLeaseMismatch,
+    LiveWryObservationUnavailable,
+    TaskIdentityUnavailable,
+    LegacyMcpTaskIdentityUnavailable,
 }
 
 impl From<BrowserDtoError> for BrowserNativeViewError {
@@ -913,6 +1038,15 @@ impl std::fmt::Display for BrowserNativeViewError {
             Self::HostRequestLeaseMismatch => {
                 formatter.write_str("browser host request lease does not match")
             }
+            Self::LiveWryObservationUnavailable => {
+                formatter.write_str("live Wry/WebView2 controller observation is unavailable")
+            }
+            Self::TaskIdentityUnavailable => {
+                formatter.write_str("completed native view has no exact task/context identity")
+            }
+            Self::LegacyMcpTaskIdentityUnavailable => {
+                formatter.write_str("legacy MCP/chrome command has no exact TaskId")
+            }
         }
     }
 }
@@ -924,6 +1058,7 @@ pub struct BrowserNativeViewReceipt {
     pub descriptor: BrowserSurfaceDescriptor,
     pub lifecycle: BrowserSurfaceLifecycle,
     pub attachment_lease: Option<BrowserAttachmentLease>,
+    pub attached_parent: Option<BrowserWindowHandle>,
     pub focused: bool,
     pub reconciliation: BrowserNativeViewReconciliation,
 }
@@ -963,6 +1098,7 @@ struct BrowserNativeView {
     parking_window: BrowserParkingWindow,
     lifecycle: BrowserSurfaceLifecycle,
     attachment_lease: Option<BrowserAttachmentLease>,
+    attached_parent: Option<BrowserWindowHandle>,
     host_request_lease: BrowserHostRequestLease,
     focused: bool,
     last_client_sequence: Option<u64>,
@@ -1131,6 +1267,7 @@ impl BrowserHostState {
             parking_window: plan.registration.parking_window,
             lifecycle: BrowserSurfaceLifecycle::Parked,
             attachment_lease: None,
+            attached_parent: None,
             host_request_lease: plan.host_request_lease,
             focused: false,
             last_client_sequence: None,
@@ -1144,6 +1281,7 @@ impl BrowserHostState {
             descriptor: view.descriptor.clone(),
             lifecycle: view.lifecycle.clone(),
             attachment_lease: view.attachment_lease.clone(),
+            attached_parent: view.attached_parent.clone(),
             focused: view.focused,
             reconciliation: view.reconciliation,
         };
@@ -1253,6 +1391,7 @@ impl BrowserHostState {
                 descriptor: view.descriptor.clone(),
                 lifecycle: view.lifecycle.clone(),
                 attachment_lease: view.attachment_lease.clone(),
+                attached_parent: view.attached_parent.clone(),
                 focused: view.focused,
                 reconciliation: view.reconciliation,
             })
@@ -1261,12 +1400,14 @@ impl BrowserHostState {
     pub fn attach_native_view_with_backend<B: BrowserNativeSurfaceBackend>(
         &mut self,
         request: BrowserAttachRequest,
+        destination: BrowserWindowHandle,
         backend: &mut B,
     ) -> Result<BrowserNativeViewReceipt, BrowserNativeViewError> {
         backend
             .assert_ui_thread()
             .map_err(|_| BrowserNativeViewError::UiThread)?;
-        let (resource_id, prepared) = self.prepare_attach_native_view(&request, false)?;
+        let (resource_id, prepared) =
+            self.prepare_attach_native_view(&request, &destination, false)?;
         let before = self.native_view_record(resource_id)?;
         let child = prepared.descriptor.child_hwnd.clone();
         let parking = prepared.parking_window.handle().clone();
@@ -1279,7 +1420,16 @@ impl BrowserHostState {
             before,
             prepared,
             backend,
-            move |backend| Self::backend_attach(backend, &action_view, &child, &parking, bounds),
+            move |backend| {
+                Self::backend_attach(
+                    backend,
+                    &action_view,
+                    &child,
+                    &parking,
+                    &destination,
+                    bounds,
+                )
+            },
             move |backend, before| {
                 Self::backend_park(backend, before, &rollback_child, &rollback_parking)
             },
@@ -1290,12 +1440,14 @@ impl BrowserHostState {
     pub fn reattach_native_view_with_backend<B: BrowserNativeSurfaceBackend>(
         &mut self,
         request: BrowserAttachRequest,
+        destination: BrowserWindowHandle,
         backend: &mut B,
     ) -> Result<BrowserNativeViewReceipt, BrowserNativeViewError> {
         backend
             .assert_ui_thread()
             .map_err(|_| BrowserNativeViewError::UiThread)?;
-        let (resource_id, prepared) = self.prepare_attach_native_view(&request, true)?;
+        let (resource_id, prepared) =
+            self.prepare_attach_native_view(&request, &destination, true)?;
         let before = self.native_view_record(resource_id)?;
         let child = prepared.descriptor.child_hwnd.clone();
         let parking = prepared.parking_window.handle().clone();
@@ -1308,7 +1460,16 @@ impl BrowserHostState {
             before,
             prepared,
             backend,
-            move |backend| Self::backend_attach(backend, &action_view, &child, &parking, bounds),
+            move |backend| {
+                Self::backend_attach(
+                    backend,
+                    &action_view,
+                    &child,
+                    &parking,
+                    &destination,
+                    bounds,
+                )
+            },
             move |backend, before| {
                 Self::backend_park(backend, before, &rollback_child, &rollback_parking)
             },
@@ -1474,6 +1635,7 @@ impl BrowserHostState {
             crashed: true,
         };
         prepared.attachment_lease = None;
+        prepared.attached_parent = None;
         prepared.focused = false;
         prepared.host_request_lease =
             match self.next_host_request_lease(prepared.descriptor.host_fence.connection_epoch) {
@@ -1523,6 +1685,7 @@ impl BrowserHostState {
             crashed: false,
         };
         prepared.attachment_lease = None;
+        prepared.attached_parent = None;
         prepared.focused = false;
         prepared.last_client_sequence = Some(request.client_sequence);
         prepared.host_request_lease =
@@ -1548,6 +1711,48 @@ impl BrowserHostState {
         &self,
         request: &BrowserHostRequest,
     ) -> Result<BrowserTeardownStatus, BrowserNativeViewError> {
+        match self.native_teardown_preconditions(request)? {
+            Err(blocker) => Ok(BrowserTeardownStatus::Blocked(blocker)),
+            Ok(_resource_id) => {
+                // Without a host-owned backend observation, never synthesize zero residue.
+                Ok(BrowserTeardownStatus::Blocked(
+                    BrowserTeardownBlocker::RealRuntimeObservationUnavailable,
+                ))
+            }
+        }
+    }
+
+    pub(crate) fn native_teardown_status_with_backend<B: BrowserNativeSurfaceBackend>(
+        &self,
+        request: &BrowserHostRequest,
+        backend: &mut B,
+    ) -> Result<BrowserTeardownStatus, BrowserNativeViewError> {
+        let resource_id = match self.native_teardown_preconditions(request)? {
+            Err(blocker) => return Ok(BrowserTeardownStatus::Blocked(blocker)),
+            Ok(resource_id) => resource_id,
+        };
+        let view = self
+            .native_views
+            .get(&resource_id)
+            .ok_or(BrowserNativeViewError::MissingView)?;
+        backend
+            .assert_ui_thread()
+            .map_err(|_| BrowserNativeViewError::UiThread)?;
+        // Teardown observation intentionally does not reuse operation preflight:
+        // zero-residue proof requires the controller/environment to be closed.
+        match backend.observe_teardown_zero_residue(&view.descriptor, view.parking_window.handle())
+        {
+            Ok(()) => Ok(BrowserTeardownStatus::Ready),
+            Err(_) => Ok(BrowserTeardownStatus::Blocked(
+                BrowserTeardownBlocker::RealRuntimeObservationUnavailable,
+            )),
+        }
+    }
+
+    fn native_teardown_preconditions(
+        &self,
+        request: &BrowserHostRequest,
+    ) -> Result<Result<ResourceId, BrowserTeardownBlocker>, BrowserNativeViewError> {
         let resource_id = self.validate_descriptor_inner(&request.descriptor, false)?;
         let view = self
             .native_views
@@ -1560,25 +1765,19 @@ impl BrowserHostState {
             return Err(BrowserNativeViewError::HostRequestLeaseMismatch);
         }
         if view.reconciliation == BrowserNativeViewReconciliation::Unknown {
-            return Ok(BrowserTeardownStatus::Blocked(
+            return Ok(Err(
                 BrowserTeardownBlocker::NativeSurfaceReconciliationRequired,
             ));
         }
         if self.native_allocation_orphan_count() != 0 {
-            return Ok(BrowserTeardownStatus::Blocked(
+            return Ok(Err(
                 BrowserTeardownBlocker::NativeSurfaceReconciliationRequired,
             ));
         }
         if !matches!(view.lifecycle, BrowserSurfaceLifecycle::Parked) {
-            return Ok(BrowserTeardownStatus::Blocked(
-                BrowserTeardownBlocker::SurfaceMustBeParked,
-            ));
+            return Ok(Err(BrowserTeardownBlocker::SurfaceMustBeParked));
         }
-        // The real controller/environment/listener/process observation is not
-        // wired into this seam yet.  Never synthesize its zero-residue proof.
-        Ok(BrowserTeardownStatus::Blocked(
-            BrowserTeardownBlocker::RealRuntimeObservationUnavailable,
-        ))
+        Ok(Ok(resource_id))
     }
 
     pub(crate) fn close_native_context(
@@ -1586,6 +1785,9 @@ impl BrowserHostState {
         request: BrowserHostRequest,
     ) -> Result<BrowserNativeViewReceipt, BrowserNativeViewError> {
         match self.native_teardown_status(&request)? {
+            BrowserTeardownStatus::Ready => Err(BrowserNativeViewError::TeardownBlocked(
+                BrowserTeardownBlocker::RealRuntimeObservationUnavailable,
+            )),
             BrowserTeardownStatus::Pending => Err(BrowserNativeViewError::TeardownPending),
             BrowserTeardownStatus::Blocked(blocker) => {
                 Err(BrowserNativeViewError::TeardownBlocked(blocker))
@@ -1593,9 +1795,150 @@ impl BrowserHostState {
         }
     }
 
+    pub(crate) fn close_native_context_with_backend<B: BrowserNativeSurfaceBackend>(
+        &mut self,
+        request: BrowserHostRequest,
+        backend: &mut B,
+    ) -> Result<BrowserNativeViewReceipt, BrowserNativeViewError> {
+        match self.native_teardown_status_with_backend(&request, backend)? {
+            BrowserTeardownStatus::Ready => self.commit_native_context_closed(request),
+            BrowserTeardownStatus::Pending => Err(BrowserNativeViewError::TeardownPending),
+            BrowserTeardownStatus::Blocked(blocker) => {
+                Err(BrowserNativeViewError::TeardownBlocked(blocker))
+            }
+        }
+    }
+
+    fn commit_native_context_closed(
+        &mut self,
+        request: BrowserHostRequest,
+    ) -> Result<BrowserNativeViewReceipt, BrowserNativeViewError> {
+        let resource_id = self.validate_host_request(&request)?;
+        let before = self.native_view_record(resource_id)?;
+        if !matches!(before.lifecycle, BrowserSurfaceLifecycle::Parked) {
+            return Err(BrowserNativeViewError::TeardownBlocked(
+                BrowserTeardownBlocker::SurfaceMustBeParked,
+            ));
+        }
+        let mut prepared = before.clone();
+        Self::bump_native_epochs_for_view(&mut prepared)?;
+        prepared.lifecycle = BrowserSurfaceLifecycle::Closed;
+        prepared.attachment_lease = None;
+        prepared.attached_parent = None;
+        prepared.focused = false;
+        prepared.host_request_lease =
+            self.next_host_request_lease(prepared.descriptor.host_fence.connection_epoch)?;
+        self.commit_prepared_native_view(resource_id, &before, prepared)?;
+        self.native_view_receipt(resource_id)
+    }
+
+    /// A copied descriptor is not live Wry proof. BrowserHostState cannot
+    /// observe the WebView2 controller/environment; only BrowserWebViewHost can.
+    pub fn host_owned_surface_proof(
+        &self,
+        identity: &BrowserSurfaceIdentity,
+    ) -> Result<BrowserHostOwnedSurfaceProof, BrowserNativeViewError> {
+        let _ = self.registered_surface_descriptor(identity)?;
+        Err(BrowserNativeViewError::LiveWryObservationUnavailable)
+    }
+
+    fn registered_surface_descriptor(
+        &self,
+        identity: &BrowserSurfaceIdentity,
+    ) -> Result<&BrowserSurfaceDescriptor, BrowserNativeViewError> {
+        if !self.native_authority_available {
+            return Err(BrowserNativeViewError::ReconciliationRequired);
+        }
+        if self.native_allocation_orphan_count() != 0 {
+            return Err(BrowserNativeViewError::ReconciliationRequired);
+        }
+        let view = self
+            .native_views
+            .get(&identity.resource_id)
+            .filter(|view| view.descriptor.identity == *identity)
+            .ok_or(BrowserNativeViewError::MissingView)?;
+        if view.reconciliation != BrowserNativeViewReconciliation::Healthy {
+            return Err(BrowserNativeViewError::ReconciliationRequired);
+        }
+        if matches!(view.lifecycle, BrowserSurfaceLifecycle::Closed) {
+            return Err(BrowserNativeViewError::InvalidLifecycle("view is closed"));
+        }
+        Ok(&view.descriptor)
+    }
+
+    pub(crate) fn unverified_surface_descriptor(
+        &self,
+        identity: &BrowserSurfaceIdentity,
+    ) -> Result<BrowserSurfaceDescriptor, BrowserNativeViewError> {
+        self.registered_surface_descriptor(identity).cloned()
+    }
+
+    pub(crate) fn has_live_native_surface(&self) -> bool {
+        self.native_views.values().any(|view| {
+            view.reconciliation == BrowserNativeViewReconciliation::Healthy
+                && !matches!(view.lifecycle, BrowserSurfaceLifecycle::Closed)
+        })
+    }
+
+    /// Resolve the live task-bound surface identity legacy MCP/chrome commands
+    /// must use. Missing surfaces stay `None` so legacy automation can continue
+    /// before a native binding exists; a registered surface cannot be bypassed.
+    pub fn normalize_legacy_mcp_task_surface(
+        &self,
+        task_id: crate::domain::id::TaskId,
+    ) -> Option<BrowserSurfaceIdentity> {
+        self.native_views.values().find_map(|view| {
+            if view.descriptor.identity.task_id == task_id
+                && !matches!(view.lifecycle, BrowserSurfaceLifecycle::Closed)
+                && view.reconciliation == BrowserNativeViewReconciliation::Healthy
+            {
+                Some(view.descriptor.identity)
+            } else {
+                None
+            }
+        })
+    }
+
+    pub fn require_legacy_mcp_normalized_surface(
+        &self,
+        task_id: Option<crate::domain::id::TaskId>,
+    ) -> Result<(), LegacyMcpTaskSurfaceBlocker> {
+        self.require_legacy_mcp_exact_binding(task_id.map(|task_id| (task_id, None, None)))
+    }
+
+    pub fn require_legacy_mcp_exact_binding(
+        &self,
+        binding: Option<(
+            crate::domain::id::TaskId,
+            Option<crate::domain::id::BrowserContextId>,
+            Option<crate::domain::id::ResourceId>,
+        )>,
+    ) -> Result<(), LegacyMcpTaskSurfaceBlocker> {
+        if !self.has_live_native_surface() {
+            return Ok(());
+        }
+        let (task_id, context_id, resource_id) =
+            binding.ok_or(LegacyMcpTaskSurfaceBlocker::WorkspaceCommandLacksTaskId)?;
+        let task_id = legacy_mcp_command_task_identity(Some(task_id))?;
+        let identity = self
+            .normalize_legacy_mcp_task_surface(task_id)
+            .ok_or(LegacyMcpTaskSurfaceBlocker::CrossTaskOrMissingSurface)?;
+        let Some(context_id) = context_id else {
+            return Err(LegacyMcpTaskSurfaceBlocker::CrossTaskOrMissingSurface);
+        };
+        let Some(resource_id) = resource_id else {
+            return Err(LegacyMcpTaskSurfaceBlocker::CrossTaskOrMissingSurface);
+        };
+        if context_id != identity.context_id || resource_id != identity.resource_id {
+            return Err(LegacyMcpTaskSurfaceBlocker::CrossTaskOrMissingSurface);
+        }
+        Ok(())
+    }
+
     fn prepare_attach_native_view(
         &self,
         request: &BrowserAttachRequest,
+        destination: &BrowserWindowHandle,
         reattach: bool,
     ) -> Result<(ResourceId, BrowserNativeView), BrowserNativeViewError> {
         let resource_id = self.preflight_attachment(request, reattach)?;
@@ -1604,6 +1947,16 @@ impl BrowserHostState {
             .get(&resource_id)
             .ok_or(BrowserNativeViewError::MissingView)?
             .clone();
+        if destination == view.parking_window.handle() {
+            return Err(BrowserNativeViewError::InvalidInput(
+                "attach destination must not be parking",
+            ));
+        }
+        if destination == &view.descriptor.child_hwnd {
+            return Err(BrowserNativeViewError::InvalidInput(
+                "attach destination must not be child",
+            ));
+        }
         let attachment_lease = BrowserAttachmentLease::from_bytes(issue_opaque_bytes()?)?;
         let connection_fence = self.next_native_connection_fence()?;
         Self::bump_native_epochs_for_view(&mut view)?;
@@ -1612,6 +1965,7 @@ impl BrowserHostState {
         };
         view.descriptor.host_fence = connection_fence;
         view.attachment_lease = Some(attachment_lease);
+        view.attached_parent = Some(destination.clone());
         view.focused = false;
         view.last_client_sequence = None;
         view.controller_capability = BrowserControllerCapability::from_descriptor(&view.descriptor);
@@ -1636,6 +1990,7 @@ impl BrowserHostState {
         Self::bump_native_epochs_for_view(&mut view)?;
         view.lifecycle = BrowserSurfaceLifecycle::Parked;
         view.attachment_lease = None;
+        view.attached_parent = None;
         view.focused = false;
         view.host_request_lease =
             self.next_host_request_lease(view.descriptor.host_fence.connection_epoch)?;
@@ -1724,6 +2079,7 @@ impl BrowserHostState {
             && current.parking_window == expected.parking_window
             && current.lifecycle == expected.lifecycle
             && current.attachment_lease == expected.attachment_lease
+            && current.attached_parent == expected.attached_parent
             && current.host_request_lease == expected.host_request_lease
             && current.focused == expected.focused
             && current.last_client_sequence == expected.last_client_sequence
@@ -1785,6 +2141,7 @@ impl BrowserHostState {
             .verify_surface_state(
                 &view.descriptor,
                 parking,
+                view.attached_parent.as_ref(),
                 matches!(view.lifecycle, BrowserSurfaceLifecycle::Attached { .. }),
                 view.descriptor.physical_bounds,
                 view.focused,
@@ -1809,11 +2166,12 @@ impl BrowserHostState {
         view: &BrowserNativeView,
         child: &BrowserWindowHandle,
         parking: &BrowserWindowHandle,
+        destination: &BrowserWindowHandle,
         bounds: BrowserPhysicalBounds,
     ) -> Result<(), BrowserNativeViewError> {
         Self::backend_preflight(backend, view, parking)?;
         backend
-            .attach_surface(child, bounds)
+            .attach_surface(child, destination, bounds)
             .map_err(|_| BrowserNativeViewError::Backend)
     }
 
@@ -1823,11 +2181,16 @@ impl BrowserHostState {
         child: &BrowserWindowHandle,
     ) -> Result<(), BrowserNativeViewError> {
         let parking = view.parking_window.handle();
+        let destination = view
+            .attached_parent
+            .as_ref()
+            .ok_or(BrowserNativeViewError::InvalidInput("attached destination"))?;
         Self::backend_attach(
             backend,
             view,
             child,
             parking,
+            destination,
             view.descriptor.physical_bounds,
         )?;
         Self::backend_preflight(backend, view, parking)?;
@@ -2101,6 +2464,7 @@ impl BrowserHostState {
             descriptor: view.descriptor.clone(),
             lifecycle: view.lifecycle.clone(),
             attachment_lease: view.attachment_lease.clone(),
+            attached_parent: view.attached_parent.clone(),
             focused: view.focused,
             reconciliation: view.reconciliation,
         })
@@ -2779,12 +3143,14 @@ mod native_view_authority_tests {
         actual_process: Option<BrowserHostProcessIdentity>,
         allocated_identities: Vec<BrowserSurfaceIdentity>,
         actual_attached: bool,
+        actual_parent: Option<BrowserWindowHandle>,
         actual_bounds: BrowserPhysicalBounds,
         actual_focused: bool,
         partial_operation: Option<&'static str>,
         partial_seen: bool,
         rollback_fails: bool,
         allow_crash_observation: bool,
+        allow_zero_residue: bool,
         crash_mutates_then_errors: bool,
         allocation_mutates_then_errors: bool,
         allocation_rollback_fails: bool,
@@ -2804,6 +3170,7 @@ mod native_view_authority_tests {
                 actual_process: None,
                 allocated_identities: Vec::new(),
                 actual_attached: false,
+                actual_parent: None,
                 actual_bounds: BrowserPhysicalBounds::new(-16, -8, 640, 480)
                     .expect("valid default bounds"),
                 actual_focused: false,
@@ -2811,6 +3178,7 @@ mod native_view_authority_tests {
                 partial_seen: false,
                 rollback_fails: false,
                 allow_crash_observation: false,
+                allow_zero_residue: false,
                 crash_mutates_then_errors: false,
                 allocation_mutates_then_errors: false,
                 allocation_rollback_fails: false,
@@ -2922,30 +3290,37 @@ mod native_view_authority_tests {
         fn park_surface(
             &mut self,
             _child: &BrowserWindowHandle,
-            _parking: &BrowserWindowHandle,
+            parking: &BrowserWindowHandle,
         ) -> Result<(), String> {
             self.calls.push("park");
             if self.partial_operation == Some("park") && !self.partial_seen {
                 self.partial_seen = true;
                 self.actual_attached = false;
+                self.actual_parent = Some(parking.clone());
                 return Err("partial park failure".to_string());
             }
             if self.rollback_fails && self.partial_seen {
                 return Err("rollback park failure".to_string());
             }
             self.actual_attached = false;
+            self.actual_parent = Some(parking.clone());
             Ok(())
         }
 
         fn attach_surface(
             &mut self,
-            _child: &BrowserWindowHandle,
+            child: &BrowserWindowHandle,
+            destination: &BrowserWindowHandle,
             bounds: BrowserPhysicalBounds,
         ) -> Result<(), String> {
             self.calls.push("attach");
+            if destination == child {
+                return Err("destination equals child".to_string());
+            }
             if self.partial_operation == Some("attach") && !self.partial_seen {
                 self.partial_seen = true;
                 self.actual_attached = true;
+                self.actual_parent = Some(destination.clone());
                 self.actual_bounds = bounds;
                 return Err("partial attach failure".to_string());
             }
@@ -2953,6 +3328,7 @@ mod native_view_authority_tests {
                 return Err("rollback attach failure".to_string());
             }
             self.actual_attached = true;
+            self.actual_parent = Some(destination.clone());
             self.actual_bounds = bounds;
             Ok(())
         }
@@ -2996,7 +3372,8 @@ mod native_view_authority_tests {
         fn verify_surface_state(
             &mut self,
             descriptor: &BrowserSurfaceDescriptor,
-            _parking: &BrowserWindowHandle,
+            parking: &BrowserWindowHandle,
+            attached_parent: Option<&BrowserWindowHandle>,
             attached: bool,
             bounds: BrowserPhysicalBounds,
             focused: bool,
@@ -3013,6 +3390,23 @@ mod native_view_authority_tests {
             }
             if self.actual_focused != focused {
                 return Err("focus postcondition mismatch".to_string());
+            }
+            if attached {
+                let destination = attached_parent.ok_or("missing attach destination")?;
+                if destination == parking {
+                    return Err("attach destination must not be parking".to_string());
+                }
+                if self.actual_parent.as_ref() != Some(destination) {
+                    return Err("destination parent mismatch".to_string());
+                }
+            } else if attached_parent.is_some() {
+                return Err("parked surface must not retain an attach destination".to_string());
+            } else if self
+                .actual_parent
+                .as_ref()
+                .is_some_and(|parent| parent != parking)
+            {
+                return Err("parked surface must remain parented to parking HWND".to_string());
             }
             Ok(())
         }
@@ -3034,6 +3428,26 @@ mod native_view_authority_tests {
                 Err("no live crash observation".to_string())
             }
         }
+
+        fn observe_teardown_zero_residue(
+            &mut self,
+            descriptor: &BrowserSurfaceDescriptor,
+            parking: &BrowserWindowHandle,
+        ) -> Result<(), String> {
+            self.calls.push("teardown-residue");
+            if !self.on_ui_thread {
+                return Err("backend is not on its UI thread".to_string());
+            }
+            if !self.allocated_identities.contains(&descriptor.identity) {
+                return Err("surface identity changed".to_string());
+            }
+            let _ = parking;
+            if self.allow_zero_residue && !self.actual_attached {
+                Ok(())
+            } else {
+                Err("real runtime zero-residue observation unavailable".to_string())
+            }
+        }
     }
 
     fn registration() -> BrowserNativeViewRegistration {
@@ -3051,6 +3465,10 @@ mod native_view_authority_tests {
             BrowserDpi::new(144, 144).expect("valid dpi"),
         )
         .expect("valid host record")
+    }
+
+    fn attach_destination() -> BrowserWindowHandle {
+        BrowserWindowHandle::from_raw(0xA011).expect("destination")
     }
 
     fn issue(
@@ -3105,10 +3523,44 @@ mod native_view_authority_tests {
         let attached = state
             .attach_native_view_with_backend(
                 BrowserAttachRequest::new(issued.descriptor, client_id),
+                attach_destination(),
                 &mut backend,
             )
             .expect("attach succeeds");
         (state, attached, client_id, backend)
+    }
+
+    #[test]
+    fn attach_records_explicit_destination_and_rejects_parking() {
+        let mut state = BrowserHostState::new(std::env::temp_dir()).expect("browser host state");
+        let mut backend = RecordingBackend::default();
+        let issued = issue(&mut state, &mut backend);
+        let parking = BrowserWindowHandle::from_raw(0x2001).expect("parking");
+        assert!(
+            matches!(
+                state.attach_native_view_with_backend(
+                    BrowserAttachRequest::new(issued.descriptor.clone(), ClientId::new()),
+                    parking,
+                    &mut backend,
+                ),
+                Err(BrowserNativeViewError::InvalidInput(_))
+            ),
+            "parking HWND is not an attach destination"
+        );
+        let destination = attach_destination();
+        let attached = state
+            .attach_native_view_with_backend(
+                BrowserAttachRequest::new(issued.descriptor, ClientId::new()),
+                destination.clone(),
+                &mut backend,
+            )
+            .expect("attach succeeds");
+        assert_eq!(attached.attached_parent.as_ref(), Some(&destination));
+        let parked = state
+            .park_native_view_with_backend(host_request(&state, &attached), &mut backend)
+            .expect("park");
+        assert_eq!(parked.attached_parent, None);
+        assert_eq!(parked.lifecycle, BrowserSurfaceLifecycle::Parked);
     }
 
     #[test]
@@ -3122,6 +3574,7 @@ mod native_view_authority_tests {
         let error = state
             .attach_native_view_with_backend(
                 BrowserAttachRequest::new(issued.descriptor.clone(), ClientId::new()),
+                attach_destination(),
                 &mut backend,
             )
             .expect_err("connection fence overflow must reject before backend mutation");
@@ -3412,6 +3865,7 @@ mod native_view_authority_tests {
         let error = state
             .attach_native_view_with_backend(
                 BrowserAttachRequest::new(issued.descriptor.clone(), ClientId::new()),
+                attach_destination(),
                 &mut backend,
             )
             .expect_err("partial attach must not be reported as healthy");
@@ -3576,6 +4030,7 @@ mod native_view_authority_tests {
         let attached = state
             .attach_native_view_with_backend(
                 BrowserAttachRequest::new(issued.descriptor, ClientId::new()),
+                attach_destination(),
                 &mut backend,
             )
             .expect("attach succeeds");
@@ -3609,6 +4064,7 @@ mod native_view_authority_tests {
         let attached = state
             .attach_native_view_with_backend(
                 BrowserAttachRequest::new(issued.descriptor.clone(), client_id),
+                attach_destination(),
                 &mut backend,
             )
             .unwrap();
@@ -3656,6 +4112,7 @@ mod native_view_authority_tests {
         let first_attached = state
             .attach_native_view_with_backend(
                 BrowserAttachRequest::new(first.descriptor.clone(), first_client),
+                attach_destination(),
                 &mut backend,
             )
             .unwrap();
@@ -3671,6 +4128,7 @@ mod native_view_authority_tests {
         let second_attached = state
             .attach_native_view_with_backend(
                 BrowserAttachRequest::new(second.descriptor.clone(), ClientId::new()),
+                attach_destination(),
                 &mut backend,
             )
             .unwrap();
@@ -3682,6 +4140,7 @@ mod native_view_authority_tests {
         let first_reattached = state
             .reattach_native_view_with_backend(
                 BrowserAttachRequest::new(first_parked.descriptor, ClientId::new()),
+                attach_destination(),
                 &mut backend,
             )
             .unwrap();
@@ -3869,6 +4328,7 @@ mod native_view_authority_tests {
         let reattached = state
             .reattach_native_view_with_backend(
                 BrowserAttachRequest::new(detached.descriptor, ClientId::new()),
+                attach_destination(),
                 &mut backend,
             )
             .expect("reattach succeeds");
@@ -3917,6 +4377,344 @@ mod native_view_authority_tests {
                 BrowserTeardownBlocker::RealRuntimeObservationUnavailable
             ))
         );
+    }
+
+    #[test]
+    fn teardown_ready_only_after_backend_zero_residue_observation() {
+        let mut state = BrowserHostState::new(std::env::temp_dir()).expect("browser host state");
+        let mut backend = RecordingBackend::default();
+        let issued = issue(&mut state, &mut backend);
+        let request = host_request(&state, &issued);
+
+        assert_eq!(
+            state
+                .native_teardown_status_with_backend(&request, &mut backend)
+                .unwrap(),
+            BrowserTeardownStatus::Blocked(
+                BrowserTeardownBlocker::RealRuntimeObservationUnavailable
+            ),
+            "recording backend must not invent zero residue"
+        );
+
+        backend.allow_zero_residue = true;
+        assert_eq!(
+            state
+                .native_teardown_status_with_backend(&request, &mut backend)
+                .unwrap(),
+            BrowserTeardownStatus::Ready
+        );
+        let closed = state
+            .close_native_context_with_backend(request, &mut backend)
+            .expect("observed zero residue may close");
+        assert_eq!(closed.lifecycle, BrowserSurfaceLifecycle::Closed);
+        assert!(
+            backend.calls.iter().any(|call| *call == "teardown-residue"),
+            "close must observe residue through the backend"
+        );
+    }
+
+    #[test]
+    fn host_owned_backend_binds_park_attach_and_rejects_unadmitted_hwnd() {
+        let mut state = BrowserHostState::new(std::env::temp_dir()).expect("browser host state");
+        let mut backend = HostOwnedNativeSurfaceBackend::new_synthetic_for_test();
+        let child = BrowserWindowHandle::from_raw(0x5101).expect("child");
+        let parking = BrowserWindowHandle::from_raw(0x5201).expect("parking");
+        let bounds = BrowserPhysicalBounds::new(1, 2, 320, 240).expect("bounds");
+        backend
+            .admit_host_allocation(&child, &parking, bounds)
+            .expect("admit live allocation");
+        let registration = BrowserNativeViewRegistration::from_host_record(
+            BrowserSurfaceIdentity {
+                task_id: TaskId::new(),
+                context_id: BrowserContextId::new(),
+                resource_id: ResourceId::new(),
+            },
+            child.clone(),
+            parking.clone(),
+            BrowserHostProcessIdentity::new(41, 9_001, "C:\\DevManager\\devmanager-host.exe")
+                .expect("host process"),
+            bounds,
+            BrowserDpi::new(96, 96).expect("dpi"),
+        )
+        .expect("registration");
+        let issued = state
+            .register_native_view_with_backend(registration, &mut backend)
+            .expect("host-owned registration");
+        let client_id = ClientId::new();
+        let attached = state
+            .attach_native_view_with_backend(
+                BrowserAttachRequest::new(issued.descriptor.clone(), client_id),
+                BrowserWindowHandle::from_raw(0x5501).expect("destination"),
+                &mut backend,
+            )
+            .expect("attach");
+        assert!(matches!(
+            attached.lifecycle,
+            BrowserSurfaceLifecycle::Attached { .. }
+        ));
+        assert_eq!(
+            attached.attached_parent,
+            Some(BrowserWindowHandle::from_raw(0x5501).expect("destination"))
+        );
+        let parked = state
+            .park_native_view_with_backend(host_request(&state, &attached), &mut backend)
+            .expect("park");
+        assert_eq!(parked.lifecycle, BrowserSurfaceLifecycle::Parked);
+
+        let mut cold = HostOwnedNativeSurfaceBackend::new();
+        let foreign_child = BrowserWindowHandle::from_raw(0x5301).expect("foreign");
+        let foreign_registration = BrowserNativeViewRegistration::from_host_record(
+            BrowserSurfaceIdentity {
+                task_id: TaskId::new(),
+                context_id: BrowserContextId::new(),
+                resource_id: ResourceId::new(),
+            },
+            foreign_child,
+            BrowserWindowHandle::from_raw(0x5401).expect("foreign parking"),
+            BrowserHostProcessIdentity::new(41, 9_001, "C:\\DevManager\\devmanager-host.exe")
+                .expect("host process"),
+            bounds,
+            BrowserDpi::new(96, 96).expect("dpi"),
+        )
+        .expect("foreign registration");
+        assert_eq!(
+            state
+                .register_native_view_with_backend(foreign_registration, &mut cold)
+                .expect_err("unadmitted HWND must not mint authority"),
+            BrowserNativeViewError::Backend
+        );
+    }
+
+    #[test]
+    fn host_owned_surface_proof_and_legacy_mcp_normalize_to_task_identity() {
+        let mut state = BrowserHostState::new(std::env::temp_dir()).expect("browser host state");
+        let mut backend = HostOwnedNativeSurfaceBackend::new_synthetic_for_test();
+        let child = BrowserWindowHandle::from_raw(0x6101).expect("child");
+        let parking = BrowserWindowHandle::from_raw(0x6201).expect("parking");
+        let bounds = BrowserPhysicalBounds::new(0, 0, 100, 80).expect("bounds");
+        backend
+            .admit_host_allocation(&child, &parking, bounds)
+            .expect("admit");
+        let identity = BrowserSurfaceIdentity {
+            task_id: TaskId::new(),
+            context_id: BrowserContextId::new(),
+            resource_id: ResourceId::new(),
+        };
+        let registration = BrowserNativeViewRegistration::from_host_record(
+            identity,
+            child,
+            parking,
+            BrowserHostProcessIdentity::new(77, 1_001, "C:\\DevManager\\host.exe").expect("proc"),
+            bounds,
+            BrowserDpi::new(96, 96).expect("dpi"),
+        )
+        .expect("registration");
+        let issued = state
+            .register_native_view_with_backend(registration, &mut backend)
+            .expect("register");
+        assert_eq!(
+            state.host_owned_surface_proof(&issued.descriptor.identity),
+            Err(BrowserNativeViewError::LiveWryObservationUnavailable),
+            "copied host-state descriptor is not live Wry proof"
+        );
+        assert_eq!(
+            state.normalize_legacy_mcp_task_surface(issued.descriptor.identity.task_id),
+            Some(issued.descriptor.identity)
+        );
+        assert_eq!(
+            state.normalize_legacy_mcp_task_surface(TaskId::new()),
+            None,
+            "cross-task MCP must not inherit a foreign surface"
+        );
+        assert_eq!(
+            state.require_legacy_mcp_normalized_surface(None),
+            Err(LegacyMcpTaskSurfaceBlocker::WorkspaceCommandLacksTaskId)
+        );
+        assert_eq!(
+            state.require_legacy_mcp_normalized_surface(Some(issued.descriptor.identity.task_id)),
+            Err(LegacyMcpTaskSurfaceBlocker::CrossTaskOrMissingSurface),
+            "live surface requires TaskId+ContextId+ResourceId, not task-only inference"
+        );
+        assert_eq!(
+            state.require_legacy_mcp_normalized_surface(Some(TaskId::new())),
+            Err(LegacyMcpTaskSurfaceBlocker::CrossTaskOrMissingSurface)
+        );
+    }
+
+    #[test]
+    fn host_owned_teardown_requires_closed_controller_zero_residue() {
+        let mut state = BrowserHostState::new(std::env::temp_dir()).expect("browser host state");
+        let mut backend = HostOwnedNativeSurfaceBackend::new_synthetic_for_test();
+        let child = BrowserWindowHandle::from_raw(0x7101).expect("child");
+        let parking = BrowserWindowHandle::from_raw(0x7201).expect("parking");
+        let bounds = BrowserPhysicalBounds::new(0, 0, 120, 90).expect("bounds");
+        backend
+            .admit_host_allocation(&child, &parking, bounds)
+            .expect("admit");
+        let registration = BrowserNativeViewRegistration::from_host_record(
+            BrowserSurfaceIdentity {
+                task_id: TaskId::new(),
+                context_id: BrowserContextId::new(),
+                resource_id: ResourceId::new(),
+            },
+            child.clone(),
+            parking,
+            BrowserHostProcessIdentity::new(88, 2_002, "C:\\DevManager\\host.exe").expect("proc"),
+            bounds,
+            BrowserDpi::new(96, 96).expect("dpi"),
+        )
+        .expect("registration");
+        let issued = state
+            .register_native_view_with_backend(registration, &mut backend)
+            .expect("register");
+        let request = host_request(&state, &issued);
+        assert_eq!(
+            state
+                .native_teardown_status_with_backend(&request, &mut backend)
+                .unwrap(),
+            BrowserTeardownStatus::Blocked(
+                BrowserTeardownBlocker::RealRuntimeObservationUnavailable
+            )
+        );
+        backend
+            .mark_controller_closed(&child)
+            .expect("controller closed");
+        assert_eq!(
+            state
+                .native_teardown_status_with_backend(&request, &mut backend)
+                .unwrap(),
+            BrowserTeardownStatus::Ready
+        );
+        let closed = state
+            .close_native_context_with_backend(request, &mut backend)
+            .expect("zero residue close");
+        assert_eq!(closed.lifecycle, BrowserSurfaceLifecycle::Closed);
+    }
+
+    #[test]
+    fn production_host_owned_backend_cannot_admit_or_teardown_synthetic_hwnd() {
+        let mut production = HostOwnedNativeSurfaceBackend::new();
+        let child = BrowserWindowHandle::from_raw(0x7501).expect("child");
+        let parking = BrowserWindowHandle::from_raw(0x7601).expect("parking");
+        let bounds = BrowserPhysicalBounds::new(0, 0, 20, 20).expect("bounds");
+        assert_eq!(
+            production.admit_host_allocation(&child, &parking, bounds),
+            Err(HostOwnedSurfaceBindError::LiveWindowRequired)
+        );
+        assert!(production.park_surface(&child, &parking).is_err());
+    }
+
+    #[test]
+    fn host_owned_teardown_blocks_when_helper_residue_remains() {
+        let mut state = BrowserHostState::new(std::env::temp_dir()).expect("browser host state");
+        let mut backend = HostOwnedNativeSurfaceBackend::new_synthetic_for_test();
+        let child = BrowserWindowHandle::from_raw(0x7701).expect("child");
+        let parking = BrowserWindowHandle::from_raw(0x7801).expect("parking");
+        let bounds = BrowserPhysicalBounds::new(0, 0, 40, 30).expect("bounds");
+        backend
+            .admit_host_allocation(&child, &parking, bounds)
+            .expect("admit");
+        let registration = BrowserNativeViewRegistration::from_host_record(
+            BrowserSurfaceIdentity {
+                task_id: TaskId::new(),
+                context_id: BrowserContextId::new(),
+                resource_id: ResourceId::new(),
+            },
+            child.clone(),
+            parking,
+            BrowserHostProcessIdentity::new(88, 2_003, "C:\\DevManager\\host.exe").expect("proc"),
+            bounds,
+            BrowserDpi::new(96, 96).expect("dpi"),
+        )
+        .expect("registration");
+        let issued = state
+            .register_native_view_with_backend(registration, &mut backend)
+            .expect("register");
+        let request = host_request(&state, &issued);
+        backend
+            .mark_controller_closed(&child)
+            .expect("controller closed");
+        backend.inject_helper_residue_for_test(&child, 2);
+        assert_eq!(
+            state
+                .native_teardown_status_with_backend(&request, &mut backend)
+                .unwrap(),
+            BrowserTeardownStatus::Blocked(
+                BrowserTeardownBlocker::RealRuntimeObservationUnavailable
+            )
+        );
+    }
+
+    #[test]
+    fn exact_mcp_binding_rejects_cross_task_context_and_resource() {
+        let mut state = BrowserHostState::new(std::env::temp_dir()).expect("browser host state");
+        let mut backend = HostOwnedNativeSurfaceBackend::new_synthetic_for_test();
+        let child = BrowserWindowHandle::from_raw(0x7901).expect("child");
+        let parking = BrowserWindowHandle::from_raw(0x7a01).expect("parking");
+        let bounds = BrowserPhysicalBounds::new(0, 0, 40, 30).expect("bounds");
+        backend
+            .admit_host_allocation(&child, &parking, bounds)
+            .expect("admit");
+        let identity = BrowserSurfaceIdentity {
+            task_id: TaskId::new(),
+            context_id: BrowserContextId::new(),
+            resource_id: ResourceId::new(),
+        };
+        let registration = BrowserNativeViewRegistration::from_host_record(
+            identity,
+            child,
+            parking,
+            BrowserHostProcessIdentity::new(91, 3_003, "C:\\DevManager\\host.exe").expect("proc"),
+            bounds,
+            BrowserDpi::new(96, 96).expect("dpi"),
+        )
+        .expect("registration");
+        let issued = state
+            .register_native_view_with_backend(registration, &mut backend)
+            .expect("register");
+        let live = issued.descriptor.identity;
+        assert_eq!(
+            state.require_legacy_mcp_exact_binding(Some((
+                live.task_id,
+                Some(live.context_id),
+                Some(live.resource_id)
+            ))),
+            Ok(())
+        );
+        assert_eq!(
+            state.require_legacy_mcp_exact_binding(Some((
+                TaskId::new(),
+                Some(live.context_id),
+                Some(live.resource_id)
+            ))),
+            Err(LegacyMcpTaskSurfaceBlocker::CrossTaskOrMissingSurface)
+        );
+        assert_eq!(
+            state.require_legacy_mcp_exact_binding(Some((
+                live.task_id,
+                Some(BrowserContextId::new()),
+                Some(live.resource_id)
+            ))),
+            Err(LegacyMcpTaskSurfaceBlocker::CrossTaskOrMissingSurface)
+        );
+        assert_eq!(
+            state.require_legacy_mcp_exact_binding(Some((
+                live.task_id,
+                Some(live.context_id),
+                Some(ResourceId::new())
+            ))),
+            Err(LegacyMcpTaskSurfaceBlocker::CrossTaskOrMissingSurface)
+        );
+        assert_eq!(
+            state.require_legacy_mcp_exact_binding(Some((live.task_id, None, None))),
+            Err(LegacyMcpTaskSurfaceBlocker::CrossTaskOrMissingSurface)
+        );
+    }
+
+    #[test]
+    fn legacy_mcp_without_bound_surface_stays_available() {
+        let state = BrowserHostState::new(std::env::temp_dir()).expect("browser host state");
+        assert_eq!(state.require_legacy_mcp_normalized_surface(None), Ok(()));
     }
 
     #[test]

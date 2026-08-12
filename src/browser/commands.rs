@@ -26,6 +26,7 @@ use super::{
     BrowserUploadResult, BrowserViewport, BrowserWaitCondition, BrowserWaitResult,
     BrowserWorkspaceKey, BrowserWorkspaceMutation, BrowserWorkspaceSnapshot,
 };
+use crate::domain::id::{AgentSessionId, BrowserContextId, ResourceId, TaskId};
 use rmcp::schemars;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{HashMap, VecDeque};
@@ -59,6 +60,14 @@ pub struct BrowserInvocationContext {
     pub operation_id: String,
     #[serde(skip)]
     interaction_epoch: Option<u64>,
+    #[serde(skip)]
+    exact_task_id: Option<TaskId>,
+    #[serde(skip)]
+    exact_agent_session_id: Option<AgentSessionId>,
+    #[serde(skip)]
+    exact_context_id: Option<BrowserContextId>,
+    #[serde(skip)]
+    exact_resource_id: Option<ResourceId>,
 }
 
 impl BrowserInvocationContext {
@@ -74,6 +83,10 @@ impl BrowserInvocationContext {
             declared_risk,
             operation_id: operation_id.into(),
             interaction_epoch: None,
+            exact_task_id: None,
+            exact_agent_session_id: None,
+            exact_context_id: None,
+            exact_resource_id: None,
         };
         context.validate()?;
         Ok(context)
@@ -120,12 +133,57 @@ impl BrowserInvocationContext {
             operation_id: random_operation_id()
                 .unwrap_or_else(|_| "internal-operation".to_string()),
             interaction_epoch: None,
+            exact_task_id: None,
+            exact_agent_session_id: None,
+            exact_context_id: None,
+            exact_resource_id: None,
         }
     }
 
     pub(crate) fn with_interaction_epoch(mut self, interaction_epoch: u64) -> Self {
         self.interaction_epoch = Some(interaction_epoch);
         self
+    }
+
+    pub fn bind_exact_surface(
+        mut self,
+        task_id: TaskId,
+        agent_session_id: AgentSessionId,
+        context_id: BrowserContextId,
+        resource_id: ResourceId,
+    ) -> Self {
+        self.exact_task_id = Some(task_id);
+        self.exact_agent_session_id = Some(agent_session_id);
+        self.exact_context_id = Some(context_id);
+        self.exact_resource_id = Some(resource_id);
+        self
+    }
+
+    pub fn exact_task_id(&self) -> Option<TaskId> {
+        self.exact_task_id
+    }
+
+    pub fn exact_agent_session_id(&self) -> Option<AgentSessionId> {
+        self.exact_agent_session_id
+    }
+
+    pub fn exact_context_id(&self) -> Option<BrowserContextId> {
+        self.exact_context_id
+    }
+
+    pub fn exact_resource_id(&self) -> Option<ResourceId> {
+        self.exact_resource_id
+    }
+
+    pub fn exact_surface_binding(
+        &self,
+    ) -> Option<(TaskId, AgentSessionId, BrowserContextId, ResourceId)> {
+        Some((
+            self.exact_task_id?,
+            self.exact_agent_session_id?,
+            self.exact_context_id?,
+            self.exact_resource_id?,
+        ))
     }
 
     pub fn validate(&self) -> Result<(), BrowserError> {

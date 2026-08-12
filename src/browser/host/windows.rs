@@ -1,8 +1,9 @@
 use super::{
     acknowledge_attachment_projection_and_reconcile_pins, browser_user_input_initialization_script,
-    validate_browser_url, BrowserAppExitDisposition, BrowserHostState, BrowserMemoryTarget,
-    BrowserNativeViewError, BrowserNativeViewReceipt, BrowserNativeViewRegistration,
-    BrowserNativeWindowBuildLease, BrowserNativeWindowLifetime,
+    require_completed_wry_task_identity, validate_browser_url, BrowserAppExitDisposition,
+    BrowserHostState, BrowserMemoryTarget, BrowserNativeViewError, BrowserNativeViewReceipt,
+    BrowserNativeViewRegistration, BrowserNativeWindowBuildLease, BrowserNativeWindowLifetime,
+    BrowserTaskSurfaceBindBlocker, HostOwnedNativeSurfaceBackend,
 };
 use crate::browser::downloads::{
     prepare_verified_storage_layout, verified_app_config_root, verified_unique_download_path,
@@ -46,7 +47,10 @@ use crate::browser::{
     BrowserWorkflowReviewProjection, BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
     MAX_BROWSER_ACTIONS, MAX_BROWSER_RECIPE_WAIT_MS,
 };
-use crate::protocol::{BrowserSurfaceDescriptor, BrowserSurfaceIdentity};
+use crate::protocol::{
+    BrowserDpi, BrowserHostProcessIdentity, BrowserPhysicalBounds, BrowserSurfaceDescriptor,
+    BrowserSurfaceIdentity, BrowserWindowHandle,
+};
 use base64::Engine as _;
 use gpui::{ForegroundExecutor, Task};
 use raw_window_handle::{
@@ -896,6 +900,12 @@ impl BrowserNativeViewBuildCancellation {
     }
 }
 
+#[derive(Clone, Copy)]
+struct PreparedTaskSurface {
+    identity: BrowserSurfaceIdentity,
+    agent_session_id: crate::domain::id::AgentSessionId,
+}
+
 struct BrowserNativeViewBuildSpec {
     build_id: u64,
     key: BrowserViewKey,
@@ -908,6 +918,8 @@ struct BrowserNativeViewBuildSpec {
     document_secret_state: Arc<BrowserDocumentSecretState>,
     parent_window: BrowserParentWindowLease,
     cancellation: BrowserNativeViewBuildCancellation,
+    surface_identity: Option<BrowserSurfaceIdentity>,
+    agent_session_id: Option<crate::domain::id::AgentSessionId>,
 }
 
 struct BrowserNativeViewBuildJob {
@@ -923,6 +935,8 @@ struct BrowserNativeViewBuildCompletion {
     document_secret_state: Arc<BrowserDocumentSecretState>,
     result: Result<WebView, BrowserError>,
     parent_window: BrowserParentWindowLease,
+    surface_identity: Option<BrowserSurfaceIdentity>,
+    agent_session_id: Option<crate::domain::id::AgentSessionId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -945,6 +959,8 @@ impl BrowserNativeViewBuildJob {
             document_secret_state,
             parent_window,
             cancellation,
+            surface_identity,
+            agent_session_id,
         } = self.spec;
         let workspace_key = key.workspace_key.clone();
         let tab_id = key.tab_id.clone();
@@ -996,6 +1012,8 @@ impl BrowserNativeViewBuildJob {
             document_secret_state,
             result,
             parent_window,
+            surface_identity,
+            agent_session_id,
         }
     }
 }
@@ -1031,6 +1049,10 @@ pub struct BrowserWebViewHost {
     status: BrowserHostStatus,
     trusted_app_config_dir: Option<PathBuf>,
     state: BrowserHostState,
+    /// Sole host-owned native surface backend. No second WebView registry.
+    surface_backend: HostOwnedNativeSurfaceBackend,
+    task_surface_bind_blocker: Option<BrowserTaskSurfaceBindBlocker>,
+    prepared_task_surfaces: HashMap<BrowserViewKey, PreparedTaskSurface>,
     projects: HashMap<String, BrowserProjectRuntime>,
     views: HashMap<BrowserViewKey, WebView>,
     pending_native_view_teardown: Option<BrowserNativeViewTeardown>,
@@ -1147,6 +1169,9 @@ impl BrowserWebViewHost {
         Self {
             status,
             state,
+            surface_backend: HostOwnedNativeSurfaceBackend::new(),
+            task_surface_bind_blocker: None,
+            prepared_task_surfaces: HashMap::new(),
             trusted_app_config_dir,
             projects: HashMap::new(),
             views: HashMap::new(),
@@ -1217,6 +1242,372 @@ impl BrowserWebViewHost {
     ) -> Result<BrowserNativeViewReceipt, BrowserNativeViewError> {
         self.state
             .register_native_view_with_backend(registration, backend)
+    }
+
+    /// Bind an already-built Wry/WebView2 view into task-aware BrowserHostState
+    /// through the host-owned sealed backend. Registration occurs only after
+    /// live child and parking HWNDs are observed from the one owner registry.
+    pub fn bind_task_surface_for_built_view(
+        &mut self,
+        identity: BrowserSurfaceIdentity,
+        workspace_key: &BrowserWorkspaceKey,
+        tab_id: &str,
+        host_process: BrowserHostProcessIdentity,
+        physical_bounds: BrowserPhysicalBounds,
+        dpi: BrowserDpi,
+    ) -> Result<BrowserNativeViewReceipt, BrowserNativeViewError> {
+        let key = BrowserViewKey {
+            workspace_key: workspace_key.clone(),
+            tab_id: tab_id.to_string(),
+        };
+        let webview = self
+            .views
+            .get(&key)
+            .ok_or(BrowserNativeViewError::MissingView)?;
+        let child = child_hwnd_from_webview(webview)?;
+        let parking = parking_hwnd_from_lifetime(&self.native_window_lifetime)?;
+        if child == parking {
+            return Err(BrowserNativeViewError::LiveWryObservationUnavailable);
+        }
+        if self
+            .surface_backend
+            .admit_host_allocation(&child, &parking, physical_bounds)
+            .is_err()
+        {
+            return Err(BrowserNativeViewError::Backend);
+        }
+        let registration = match BrowserNativeViewRegistration::from_host_record(
+            identity,
+            child.clone(),
+            parking.clone(),
+            host_process,
+            physical_bounds,
+            dpi,
+        ) {
+            Ok(registration) => registration,
+            Err(error) => {
+                let _ = self.surface_backend.release_host_allocation(&child);
+                return Err(error);
+            }
+        };
+        let webview = match self.views.get(&key) {
+            Some(webview) => webview,
+            None => {
+                let _ = self.surface_backend.release_host_allocation(&child);
+                return Err(BrowserNativeViewError::MissingView);
+            }
+        };
+        if Self::reparent_wry_view(webview, &parking).is_err() {
+            let _ = self.surface_backend.release_host_allocation(&child);
+            return Err(BrowserNativeViewError::LiveWryObservationUnavailable);
+        }
+        match child_hwnd_from_webview(webview) {
+            Ok(observed) if observed == child => {}
+            _ => {
+                let _ = self.surface_backend.release_host_allocation(&child);
+                return Err(BrowserNativeViewError::LiveWryObservationUnavailable);
+            }
+        }
+        match self
+            .state
+            .register_native_view_with_backend(registration, &mut self.surface_backend)
+        {
+            Ok(receipt) => Ok(receipt),
+            Err(error) => {
+                let _ = self.surface_backend.release_host_allocation(&child);
+                Err(error)
+            }
+        }
+    }
+
+    pub fn host_owned_surface_proof(
+        &self,
+        identity: &BrowserSurfaceIdentity,
+    ) -> Result<super::BrowserHostOwnedSurfaceProof, BrowserNativeViewError> {
+        let descriptor = self.state.unverified_surface_descriptor(identity)?;
+        let webview = self
+            .views
+            .values()
+            .find(|webview| {
+                child_hwnd_from_webview(webview)
+                    .ok()
+                    .is_some_and(|child| child == descriptor.child_hwnd)
+            })
+            .ok_or(BrowserNativeViewError::LiveWryObservationUnavailable)?;
+
+        // `child_hwnd_from_webview` validates the actual Wry container HWND,
+        // its live WebView2 controller parent, and the environment handles.
+        // Only this observation may mint a proof; BrowserHostState alone cannot.
+        let observed_child = child_hwnd_from_webview(webview)?;
+        if observed_child != descriptor.child_hwnd {
+            return Err(BrowserNativeViewError::LiveWryObservationUnavailable);
+        }
+        Ok(super::BrowserHostOwnedSurfaceProof::from_windows_child_observation(descriptor))
+    }
+
+    pub fn last_task_surface_bind_blocker(&self) -> Option<BrowserTaskSurfaceBindBlocker> {
+        self.task_surface_bind_blocker
+    }
+
+    pub fn prepare_task_surface_identity(
+        &mut self,
+        workspace_key: &BrowserWorkspaceKey,
+        tab_id: &str,
+        identity: BrowserSurfaceIdentity,
+        agent_session_id: crate::domain::id::AgentSessionId,
+    ) {
+        self.prepared_task_surfaces.insert(
+            BrowserViewKey {
+                workspace_key: workspace_key.clone(),
+                tab_id: tab_id.to_string(),
+            },
+            PreparedTaskSurface {
+                identity,
+                agent_session_id,
+            },
+        );
+    }
+
+    fn bind_completed_identity(
+        &mut self,
+        key: &BrowserViewKey,
+        identity: BrowserSurfaceIdentity,
+    ) -> Result<(), BrowserNativeViewError> {
+        let host_process = current_host_process_identity()?;
+        let physical_bounds = BrowserPhysicalBounds::new(
+            self.bounds.x,
+            self.bounds.y,
+            self.bounds.width.max(1) as u32,
+            self.bounds.height.max(1) as u32,
+        )
+        .map_err(BrowserNativeViewError::Descriptor)?;
+        let dpi = BrowserDpi::new(96, 96).map_err(BrowserNativeViewError::Descriptor)?;
+        self.bind_task_surface_for_built_view(
+            identity,
+            &key.workspace_key,
+            &key.tab_id,
+            host_process,
+            physical_bounds,
+            dpi,
+        )
+        .map(|_| ())
+    }
+
+    fn ensure_host_parking_hwnd(
+        &mut self,
+        gpui_window_identity: isize,
+    ) -> Result<BrowserWindowHandle, BrowserError> {
+        if let Some(existing) = self.native_window_lifetime.parking_window_handle() {
+            if existing.raw_value() == gpui_window_identity as u64 {
+                return Err(BrowserError::CrashedView {
+                    message: "parking HWND must not alias the GPUI parent".to_string(),
+                });
+            }
+            return Ok(existing);
+        }
+        let parking_raw = create_host_owned_parking_hwnd(gpui_window_identity).map_err(|_| {
+            BrowserError::CrashedView {
+                message: "host-owned parking HWND could not be created".to_string(),
+            }
+        })?;
+        self.native_window_lifetime
+            .install_parking_hwnd(parking_raw, gpui_window_identity)
+            .map_err(|_| BrowserError::CrashedView {
+                message: "host-owned parking HWND failed ownership validation".to_string(),
+            })
+    }
+
+    fn destroy_host_parking_hwnd_if_drained(&mut self) {
+        if !self.views.is_empty()
+            || !self.native_view_build_tasks.is_empty()
+            || !self.pending_native_view_build_task_teardown.is_empty()
+        {
+            return;
+        }
+        if let Some(raw) = self.native_window_lifetime.take_parking_hwnd_for_destroy() {
+            destroy_host_owned_parking_hwnd(raw);
+        }
+    }
+
+    pub fn normalize_legacy_mcp_task_surface(
+        &self,
+        task_id: crate::domain::id::TaskId,
+    ) -> Option<BrowserSurfaceIdentity> {
+        self.state.normalize_legacy_mcp_task_surface(task_id)
+    }
+
+    pub fn park_task_surface(
+        &mut self,
+        request: crate::protocol::BrowserHostRequest,
+    ) -> Result<BrowserNativeViewReceipt, BrowserNativeViewError> {
+        self.park_wry_and_state(request)
+    }
+
+    pub fn attach_task_surface(
+        &mut self,
+        request: crate::protocol::BrowserAttachRequest,
+        destination: BrowserWindowHandle,
+    ) -> Result<BrowserNativeViewReceipt, BrowserNativeViewError> {
+        self.reparent_exact_wry_view(
+            &request.descriptor.identity,
+            &request.descriptor.child_hwnd,
+            &destination,
+        )?;
+        self.state
+            .attach_native_view_with_backend(request, destination, &mut self.surface_backend)
+    }
+
+    fn park_wry_and_state(
+        &mut self,
+        request: crate::protocol::BrowserHostRequest,
+    ) -> Result<BrowserNativeViewReceipt, BrowserNativeViewError> {
+        let parking = parking_hwnd_from_lifetime(&self.native_window_lifetime)?;
+        self.reparent_exact_wry_view(
+            &request.descriptor.identity,
+            &request.descriptor.child_hwnd,
+            &parking,
+        )?;
+        self.state
+            .park_native_view_with_backend(request, &mut self.surface_backend)
+    }
+
+    fn webview_for_exact_surface(
+        &self,
+        identity: &BrowserSurfaceIdentity,
+        expected_child: &BrowserWindowHandle,
+    ) -> Result<&WebView, BrowserNativeViewError> {
+        let registered = self
+            .state
+            .native_view(identity)
+            .ok_or(BrowserNativeViewError::MissingView)?;
+        if registered.descriptor.identity != *identity
+            || registered.descriptor.child_hwnd != *expected_child
+        {
+            return Err(BrowserNativeViewError::MissingView);
+        }
+        let mut found = None;
+        for webview in self.views.values() {
+            let Ok(child) = child_hwnd_from_webview(webview) else {
+                continue;
+            };
+            if child != *expected_child {
+                continue;
+            }
+            if found.is_some() {
+                return Err(BrowserNativeViewError::LiveWryObservationUnavailable);
+            }
+            found = Some(webview);
+        }
+        found.ok_or(BrowserNativeViewError::MissingView)
+    }
+
+    fn reparent_wry_view(
+        webview: &WebView,
+        destination: &BrowserWindowHandle,
+    ) -> Result<(), BrowserNativeViewError> {
+        webview
+            .reparent(destination.raw_value() as isize)
+            .map_err(|_| BrowserNativeViewError::LiveWryObservationUnavailable)?;
+        let hwnd = windows::Win32::Foundation::HWND(destination.raw_value() as usize as *mut _);
+        unsafe {
+            webview
+                .controller()
+                .SetParentWindow(hwnd)
+                .map_err(|_| BrowserNativeViewError::LiveWryObservationUnavailable)?;
+        }
+        child_hwnd_from_webview(webview).map(|_| ())
+    }
+
+    fn reparent_exact_wry_view(
+        &self,
+        identity: &BrowserSurfaceIdentity,
+        expected_child: &BrowserWindowHandle,
+        destination: &BrowserWindowHandle,
+    ) -> Result<(), BrowserNativeViewError> {
+        let webview = self.webview_for_exact_surface(identity, expected_child)?;
+        Self::reparent_wry_view(webview, destination)?;
+        let observed = child_hwnd_from_webview(webview)?;
+        if observed != *expected_child {
+            return Err(BrowserNativeViewError::LiveWryObservationUnavailable);
+        }
+        Ok(())
+    }
+
+    pub fn close_task_surface_with_observed_drain(
+        &mut self,
+        request: crate::protocol::BrowserHostRequest,
+    ) -> Result<BrowserNativeViewReceipt, BrowserNativeViewError> {
+        let child = request.descriptor.child_hwnd.clone();
+        // Cancel queued builds/operations and deny new native input first.
+        self.cancel_all_native_view_builds();
+        self.operation_queue = BrowserOperationQueue::default();
+        self.active_requests.clear();
+        // Park/detach through the same task-bound host path.
+        if !matches!(
+            self.state
+                .native_view(&request.descriptor.identity)
+                .map(|view| view.lifecycle),
+            Some(crate::protocol::BrowserSurfaceLifecycle::Parked)
+        ) {
+            let park_request = self.state.host_request(&request.descriptor.identity)?;
+            let _ = self.park_wry_and_state(park_request)?;
+        }
+        let mut matching_keys = Vec::new();
+        let mut hwnd_observation_failed = false;
+        for (key, webview) in &self.views {
+            match child_hwnd_from_webview(webview) {
+                Ok(hwnd) if hwnd == child => matching_keys.push(key.clone()),
+                Ok(_) => {}
+                Err(_) => hwnd_observation_failed = true,
+            }
+        }
+        if hwnd_observation_failed {
+            return Err(BrowserNativeViewError::LiveWryObservationUnavailable);
+        }
+        let mut retired_projects = Vec::new();
+        for key in matching_keys {
+            self.views.remove(&key);
+            retired_projects.push(key.workspace_key.project_id.clone());
+        }
+        for project_id in retired_projects {
+            if !self
+                .views
+                .keys()
+                .any(|key| key.workspace_key.project_id == project_id)
+            {
+                drop(self.projects.remove(&project_id));
+            }
+        }
+        let outstanding_build_join = !self.native_view_build_tasks.is_empty()
+            || !self.pending_native_view_build_task_teardown.is_empty();
+        if !self.native_view_build_tasks.is_empty() {
+            self.pending_native_view_build_task_teardown
+                .extend(self.native_view_build_tasks.drain().map(|(_, task)| task));
+        }
+        self.finish_native_view_build_task_teardown();
+        if outstanding_build_join {
+            return Err(BrowserNativeViewError::TeardownPending);
+        }
+        self.surface_backend
+            .mark_controller_closed(&child)
+            .map_err(|_| BrowserNativeViewError::Backend)?;
+        let refreshed = self.state.host_request(&request.descriptor.identity)?;
+        match self
+            .state
+            .native_teardown_status_with_backend(&refreshed, &mut self.surface_backend)?
+        {
+            super::BrowserTeardownStatus::Ready => {
+                let closed = self
+                    .state
+                    .close_native_context_with_backend(refreshed, &mut self.surface_backend)?;
+                self.destroy_host_parking_hwnd_if_drained();
+                Ok(closed)
+            }
+            super::BrowserTeardownStatus::Pending => Err(BrowserNativeViewError::TeardownPending),
+            super::BrowserTeardownStatus::Blocked(blocker) => {
+                Err(BrowserNativeViewError::TeardownBlocked(blocker))
+            }
+        }
     }
 
     pub fn native_view(
@@ -1481,6 +1872,26 @@ impl BrowserWebViewHost {
         self.handle_command_with_user_capture(window, workspace_key, command, true)
     }
 
+    fn require_agent_mcp_task_identity(
+        &self,
+        context: &BrowserInvocationContext,
+    ) -> Result<(), BrowserError> {
+        if context.actor != BrowserInvocationActor::Agent {
+            return Ok(());
+        }
+        let binding =
+            context
+                .exact_surface_binding()
+                .map(|(task_id, _, context_id, resource_id)| {
+                    (task_id, Some(context_id), Some(resource_id))
+                });
+        self.state
+            .require_legacy_mcp_exact_binding(binding)
+            .map_err(|_| BrowserError::InvalidInvocation {
+                field: "task_id".to_string(),
+            })
+    }
+
     fn handle_command_with_user_capture(
         &mut self,
         window: &gpui::Window,
@@ -1632,6 +2043,10 @@ impl BrowserWebViewHost {
             return;
         }
         self.pump_page_recording_ipc();
+        if let Err(error) = self.require_agent_mcp_task_identity(request.context()) {
+            request.respond(Err(error));
+            return;
+        }
         let workspace_key = request.workspace_key().clone();
         let command = request.command().clone();
         if let Err(error) = self.require_command_view_ready(window, &workspace_key, &command) {
@@ -1734,11 +2149,13 @@ impl BrowserWebViewHost {
 
     fn finish_native_view_teardown(&mut self) {
         let Some(pending) = self.pending_native_view_teardown.take() else {
+            self.destroy_host_parking_hwnd_if_drained();
             return;
         };
         let BrowserNativeViewTeardown { views, lease } = pending;
         drop(views);
         drop(lease);
+        self.destroy_host_parking_hwnd_if_drained();
     }
 
     fn operation_target(
@@ -1775,6 +2192,10 @@ impl BrowserWebViewHost {
         request: BrowserCommandRequest,
     ) {
         let operation_id = request.context().operation_id.clone();
+        if let Err(error) = self.require_agent_mcp_task_identity(request.context()) {
+            self.finish_queued_request(window, target, operation_id, request, Err(error));
+            return;
+        }
         if !request.cancellation_is_current() {
             self.finish_queued_request(
                 window,
@@ -6284,6 +6705,7 @@ impl BrowserWebViewHost {
             })?;
         let parent_window =
             BrowserParentWindowLease::from_gpui(window, &self.native_window_lifetime)?;
+        self.ensure_host_parking_hwnd(parent_window.handle.hwnd.get())?;
         let url = validate_browser_url(url)?;
         let retained_trust_root = self.verified_trusted_app_config_dir()?.to_path_buf();
         let (trusted_app_config_dir, layout) =
@@ -6317,6 +6739,7 @@ impl BrowserWebViewHost {
         let cancellation = BrowserNativeViewBuildCancellation::default();
         self.native_view_build_cancellations
             .insert(build_id, cancellation.clone());
+        let prepared = self.prepared_task_surfaces.get(&key).copied();
         self.native_view_build_specs.insert(
             build_id,
             BrowserNativeViewBuildSpec {
@@ -6331,6 +6754,8 @@ impl BrowserWebViewHost {
                 document_secret_state,
                 parent_window,
                 cancellation,
+                surface_identity: prepared.map(|prepared| prepared.identity),
+                agent_session_id: prepared.map(|prepared| prepared.agent_session_id),
             },
         );
         if starts_now {
@@ -6406,12 +6831,15 @@ impl BrowserWebViewHost {
             document_secret_state,
             result,
             parent_window,
+            surface_identity,
+            agent_session_id,
         } = completion;
         self.native_view_build_tasks.remove(&build_id);
         let project_id = key.workspace_key.project_id.clone();
         let replaced = self.projects.insert(project_id, project);
         debug_assert!(replaced.is_none(), "leased WebContext was restored twice");
         self.native_view_build_cancellations.remove(&build_id);
+        let prepared = self.prepared_task_surfaces.remove(&key);
         let result = if parent_window.build_is_allowed() {
             result.and_then(|webview| {
                 webview
@@ -6445,6 +6873,24 @@ impl BrowserWebViewHost {
                 self.document_secret_states
                     .insert(key.clone(), document_secret_state);
                 self.views.insert(key.clone(), webview);
+                match (prepared, surface_identity) {
+                    (Some(prepared), Some(identity)) if prepared.identity == identity => {
+                        let _ = agent_session_id;
+                        match self.bind_completed_identity(&key, identity) {
+                            Ok(()) => self.task_surface_bind_blocker = None,
+                            Err(_) => {
+                                self.task_surface_bind_blocker =
+                                    Some(BrowserTaskSurfaceBindBlocker::ChildHwndUnobservable)
+                            }
+                        }
+                    }
+                    (None, None) => self.task_surface_bind_blocker = None,
+                    _ => {
+                        self.task_surface_bind_blocker = Some(
+                            BrowserTaskSurfaceBindBlocker::TaskIdentityUnavailableAtBuildCompletion,
+                        );
+                    }
+                }
                 if self
                     .workflow_coordinator
                     .active_instance(&key.workspace_key)
@@ -7716,6 +8162,150 @@ fn random_annotation_capture_id() -> Result<String, BrowserError> {
         let _ = write!(id, "{byte:02x}");
     }
     Ok(id)
+}
+
+fn current_host_process_identity() -> Result<BrowserHostProcessIdentity, BrowserNativeViewError> {
+    let pid = std::process::id();
+    let executable = std::env::current_exe()
+        .map_err(|_| BrowserNativeViewError::LiveWryObservationUnavailable)?;
+    let creation_time = current_process_creation_time_100ns()
+        .ok_or(BrowserNativeViewError::LiveWryObservationUnavailable)?;
+    BrowserHostProcessIdentity::new(pid, creation_time, executable)
+        .map_err(|_| BrowserNativeViewError::LiveWryObservationUnavailable)
+}
+
+fn current_process_creation_time_100ns() -> Option<u64> {
+    use windows::Win32::Foundation::FILETIME;
+    use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+    let mut creation = FILETIME::default();
+    let mut exit = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    unsafe {
+        GetProcessTimes(
+            GetCurrentProcess(),
+            &mut creation,
+            &mut exit,
+            &mut kernel,
+            &mut user,
+        )
+        .ok()?;
+    }
+    let value = ((creation.dwHighDateTime as u64) << 32) | creation.dwLowDateTime as u64;
+    (value != 0).then_some(value)
+}
+
+unsafe extern "system" fn parking_window_proc(
+    hwnd: windows::Win32::Foundation::HWND,
+    msg: u32,
+    wparam: windows::Win32::Foundation::WPARAM,
+    lparam: windows::Win32::Foundation::LPARAM,
+) -> windows::Win32::Foundation::LRESULT {
+    windows::Win32::UI::WindowsAndMessaging::DefWindowProcW(hwnd, msg, wparam, lparam)
+}
+
+fn create_host_owned_parking_hwnd(gpui_window_identity: isize) -> Result<u64, ()> {
+    use windows::core::w;
+    use windows::Win32::Foundation::{HINSTANCE, HWND};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, GetWindowLongPtrW, IsWindow, RegisterClassW, GWLP_HINSTANCE, WNDCLASSW,
+        WS_DISABLED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
+    };
+    let gpui = HWND(gpui_window_identity as *mut _);
+    unsafe {
+        if gpui.0.is_null() || !IsWindow(Some(gpui)).as_bool() {
+            return Err(());
+        }
+        let instance = HINSTANCE(GetWindowLongPtrW(gpui, GWLP_HINSTANCE) as *mut _);
+        if instance.0.is_null() {
+            return Err(());
+        }
+        let class_name = w!("DevManagerBrowserParking");
+        let mut class = std::mem::zeroed::<WNDCLASSW>();
+        class.lpfnWndProc = Some(parking_window_proc);
+        class.hInstance = instance;
+        class.lpszClassName = class_name;
+        let _ = RegisterClassW(&class);
+        let hwnd = CreateWindowExW(
+            WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+            class_name,
+            w!(""),
+            WS_POPUP | WS_DISABLED,
+            -32_000,
+            -32_000,
+            1,
+            1,
+            None,
+            None,
+            Some(instance),
+            None,
+        )
+        .map_err(|_| ())?;
+        if hwnd.0.is_null() || !IsWindow(Some(hwnd)).as_bool() {
+            return Err(());
+        }
+        let raw = hwnd.0 as usize as u64;
+        if raw == 0 || raw == gpui_window_identity as u64 {
+            let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(hwnd);
+            return Err(());
+        }
+        Ok(raw)
+    }
+}
+
+fn destroy_host_owned_parking_hwnd(raw: u64) {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{DestroyWindow, IsWindow};
+    let hwnd = HWND(raw as usize as *mut _);
+    unsafe {
+        if !hwnd.0.is_null() && IsWindow(Some(hwnd)).as_bool() {
+            let _ = DestroyWindow(hwnd);
+        }
+    }
+}
+
+fn child_hwnd_from_webview(
+    webview: &WebView,
+) -> Result<BrowserWindowHandle, BrowserNativeViewError> {
+    // Wry 0.55 does not expose its private `InnerWebView::hwnd`, but its
+    // default WebView id is the container HWND created by `new_as_child`.
+    // Validate that id against the live WebView2 controller/environment and
+    // the Win32 parent before allowing it into host-owned state.
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{GetParent, IsWindow};
+
+    let raw = webview
+        .id()
+        .parse::<u64>()
+        .map_err(|_| BrowserNativeViewError::LiveWryObservationUnavailable)?;
+    let child = BrowserWindowHandle::from_raw(raw)
+        .map_err(|_| BrowserNativeViewError::LiveWryObservationUnavailable)?;
+    let child_hwnd = HWND(raw as usize as *mut _);
+    let controller = webview.controller();
+    let _environment = webview.environment();
+    let mut parent = HWND::default();
+    unsafe {
+        if child_hwnd.0.is_null() || !IsWindow(Some(child_hwnd)).as_bool() {
+            return Err(BrowserNativeViewError::LiveWryObservationUnavailable);
+        }
+        controller
+            .ParentWindow(&mut parent)
+            .map_err(|_| BrowserNativeViewError::LiveWryObservationUnavailable)?;
+        let actual_parent = GetParent(child_hwnd)
+            .map_err(|_| BrowserNativeViewError::LiveWryObservationUnavailable)?;
+        if parent.0.is_null() || actual_parent != parent {
+            return Err(BrowserNativeViewError::LiveWryObservationUnavailable);
+        }
+    }
+    Ok(child)
+}
+
+fn parking_hwnd_from_lifetime(
+    lifetime: &BrowserNativeWindowLifetime,
+) -> Result<BrowserWindowHandle, BrowserNativeViewError> {
+    lifetime
+        .parking_window_handle()
+        .ok_or(BrowserNativeViewError::MissingView)
 }
 
 fn wry_bounds(bounds: BrowserBounds) -> Rect {

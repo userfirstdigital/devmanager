@@ -14,7 +14,8 @@ use url::Url;
 
 use crate::domain::artifact::PrivacyClass;
 use crate::domain::id::{
-    ArtifactId, BrowserContextId, BrowserRequestId, BrowserTabId, CommandId, OperationId, TaskId,
+    ArtifactId, BrowserContextId, BrowserRequestId, BrowserTabId, CommandId, OperationId,
+    ResourceId, TaskId,
 };
 
 // Bound browser frames to the Phase 1 MessagePack physical/nesting/item caps.
@@ -55,7 +56,8 @@ pub fn browser_integration_holds() -> &'static [BrowserIntegrationHold] {
 /// Boundary (accepted HOLD → settler):
 /// - command_id / operation_id / request_id / task_id / context_id / generation /
 ///   action_epoch are required and must match the durable receipt + effect.
-/// - resource_id and runtime_generation stay absent (epoch-only fence).
+/// - resource_id is required on the live host-surface bind path and must match
+///   the registered native surface; the epoch-only `bind` path leaves it absent.
 /// - `ReplayPolicy::NoAutomaticRetry` forbids first-attempt claim/dispatch.
 /// - close/reopen must replay the same HOLD identity; it must not invent a settler.
 /// - ClientModel pages stay bounded wire DTOs and are not a settle path.
@@ -68,6 +70,7 @@ pub struct BrowserHostSettleIntent {
     request_id: BrowserRequestId,
     task_id: TaskId,
     context_id: BrowserContextId,
+    resource_id: Option<ResourceId>,
     generation: u64,
     action_epoch: u64,
 }
@@ -91,9 +94,35 @@ impl BrowserHostSettleIntent {
             request_id,
             task_id,
             context_id,
+            resource_id: None,
             generation,
             action_epoch,
         })
+    }
+
+    /// Live host-surface bind. Resource identity is required and cannot be
+    /// inferred from task/context/generation alone.
+    pub fn bind_host_surface(
+        command_id: CommandId,
+        operation_id: OperationId,
+        request_id: BrowserRequestId,
+        task_id: TaskId,
+        context_id: BrowserContextId,
+        resource_id: ResourceId,
+        generation: u64,
+        action_epoch: u64,
+    ) -> Result<Self, BrowserContractError> {
+        let mut intent = Self::bind(
+            command_id,
+            operation_id,
+            request_id,
+            task_id,
+            context_id,
+            generation,
+            action_epoch,
+        )?;
+        intent.resource_id = Some(resource_id);
+        Ok(intent)
     }
 
     pub fn command_id(&self) -> CommandId {
@@ -114,6 +143,10 @@ impl BrowserHostSettleIntent {
 
     pub fn context_id(&self) -> BrowserContextId {
         self.context_id
+    }
+
+    pub fn resource_id(&self) -> Option<ResourceId> {
+        self.resource_id
     }
 
     pub fn generation(&self) -> u64 {
@@ -148,6 +181,29 @@ impl BrowserHostSettleIntent {
         }
         Ok(())
     }
+
+    /// Exact registered surface identity for the live Windows settle path.
+    pub fn matches_host_surface(
+        &self,
+        task_id: TaskId,
+        context_id: BrowserContextId,
+        resource_id: ResourceId,
+        generation: u64,
+    ) -> Result<(), BrowserContractError> {
+        if self.task_id != task_id {
+            return Err(BrowserContractError::CrossTask);
+        }
+        if generation == 0 || self.generation != generation {
+            return Err(BrowserContractError::GenerationMismatch);
+        }
+        if self.context_id != context_id {
+            return Err(BrowserContractError::InvalidRequest);
+        }
+        match self.resource_id {
+            Some(expected) if expected == resource_id => Ok(()),
+            Some(_) | None => Err(BrowserContractError::InvalidRequest),
+        }
+    }
 }
 
 mod settler_seal {
@@ -178,25 +234,91 @@ impl BrowserServiceIssuer {
 }
 
 /// Unforgeable 8.3 host authority. No public constructor. Crate-private
-/// `issue` requires an uninhabited `BrowserServiceIssuer`.
+/// `issue` requires an uninhabited `BrowserServiceIssuer` plus the exact
+/// host-owned surface identity observed on the live Windows path.
 pub struct BrowserServiceAuthority {
-    #[allow(dead_code)]
-    _private: (),
+    task_id: TaskId,
+    context_id: BrowserContextId,
+    resource_id: ResourceId,
+    generation: u64,
 }
 
 impl BrowserServiceAuthority {
     /// Reserved for the host-owned 8.3 `BrowserService`. Not a public mint.
-    #[allow(dead_code)]
-    pub(crate) fn issue(_issuer: &BrowserServiceIssuer) -> Self {
-        Self { _private: () }
+    pub(crate) fn issue(
+        _issuer: &BrowserServiceIssuer,
+        task_id: TaskId,
+        context_id: BrowserContextId,
+        resource_id: ResourceId,
+        generation: u64,
+    ) -> Result<Self, BrowserIntegrationHold> {
+        if generation == 0 {
+            return Err(BrowserIntegrationHold::WebViewSurfaceAbsent);
+        }
+        Ok(Self {
+            task_id,
+            context_id,
+            resource_id,
+            generation,
+        })
+    }
+
+    pub fn task_id(&self) -> TaskId {
+        self.task_id
+    }
+
+    pub fn context_id(&self) -> BrowserContextId {
+        self.context_id
+    }
+
+    pub fn resource_id(&self) -> ResourceId {
+        self.resource_id
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 }
 
-/// Uninhabited until 8.1 surface, 8.3 `BrowserServiceAuthority`, and host-hello
-/// `Capability::BrowserProjection` all exist. No bool or test constructor.
+/// Production-constructible only from host-owned exact identity evidence plus
+/// 8.3 authority. No public, `Default`, bool, or test constructor.
 pub struct BrowserServiceSettlerToken {
-    #[allow(dead_code)]
-    _private: (),
+    task_id: TaskId,
+    context_id: BrowserContextId,
+    resource_id: ResourceId,
+    generation: u64,
+    request_id: BrowserRequestId,
+    action_epoch: u64,
+}
+
+impl BrowserServiceSettlerToken {
+    pub(crate) fn from_host_owned_surface(
+        authority: &BrowserServiceAuthority,
+        intent: &BrowserHostSettleIntent,
+    ) -> Result<Self, BrowserIntegrationHold> {
+        let resource_id = intent
+            .resource_id()
+            .ok_or(BrowserIntegrationHold::WebViewSurfaceAbsent)?;
+        intent
+            .matches_host_surface(
+                authority.task_id,
+                authority.context_id,
+                authority.resource_id,
+                authority.generation,
+            )
+            .map_err(|_| BrowserIntegrationHold::WebViewSurfaceAbsent)?;
+        if resource_id != authority.resource_id {
+            return Err(BrowserIntegrationHold::WebViewSurfaceAbsent);
+        }
+        Ok(Self {
+            task_id: authority.task_id,
+            context_id: authority.context_id,
+            resource_id,
+            generation: authority.generation,
+            request_id: intent.request_id(),
+            action_epoch: intent.action_epoch(),
+        })
+    }
 }
 
 impl settler_seal::Sealed for BrowserServiceSettlerToken {}
@@ -204,9 +326,35 @@ impl settler_seal::Sealed for BrowserServiceSettlerToken {}
 impl BrowserHostHoldSettler for BrowserServiceSettlerToken {
     fn settle_accepted_hold(
         &self,
-        _intent: &BrowserHostSettleIntent,
+        intent: &BrowserHostSettleIntent,
     ) -> Result<BrowserHostOutcome, BrowserIntegrationHold> {
-        Err(BrowserIntegrationHold::WebViewSurfaceAbsent)
+        intent
+            .matches_accepted_hold(
+                self.task_id,
+                self.action_epoch,
+                self.request_id,
+                self.context_id,
+                self.generation,
+            )
+            .map_err(|_| BrowserIntegrationHold::WebViewSurfaceAbsent)?;
+        intent
+            .matches_host_surface(
+                self.task_id,
+                self.context_id,
+                self.resource_id,
+                self.generation,
+            )
+            .map_err(|_| BrowserIntegrationHold::WebViewSurfaceAbsent)?;
+        Ok(BrowserHostOutcome {
+            request_id: intent.request_id(),
+            task_id: self.task_id,
+            context_id: self.context_id,
+            tab_id: None,
+            generation: intent.generation(),
+            settlement: BrowserSettlement::Recovered {
+                generation: intent.generation(),
+            },
+        })
     }
 }
 
@@ -1937,5 +2085,100 @@ fn json_exceeds_caps(value: &serde_json::Value, depth: u16) -> bool {
 impl BrowserDurableFact {
     pub fn task_id(&self) -> TaskId {
         fact_task_id(self)
+    }
+}
+
+#[cfg(test)]
+mod host_surface_settler_tests {
+    use super::*;
+    use crate::domain::id::ResourceId;
+
+    #[test]
+    fn epoch_only_bind_cannot_match_a_host_surface() {
+        let intent = BrowserHostSettleIntent::bind(
+            CommandId::new(),
+            OperationId::new(),
+            BrowserRequestId::new(),
+            TaskId::new(),
+            BrowserContextId::new(),
+            1,
+            1,
+        )
+        .expect("intent");
+        assert_eq!(
+            intent.matches_host_surface(
+                intent.task_id(),
+                intent.context_id(),
+                ResourceId::new(),
+                1
+            ),
+            Err(BrowserContractError::InvalidRequest)
+        );
+    }
+
+    #[test]
+    fn host_owned_token_settles_matching_live_identity() {
+        let task_id = TaskId::new();
+        let context_id = BrowserContextId::new();
+        let resource_id = ResourceId::new();
+        let request_id = BrowserRequestId::new();
+        let intent = BrowserHostSettleIntent::bind_host_surface(
+            CommandId::new(),
+            OperationId::new(),
+            request_id,
+            task_id,
+            context_id,
+            resource_id,
+            3,
+            2,
+        )
+        .expect("surface intent");
+        let authority = BrowserServiceAuthority::issue(
+            &BrowserServiceIssuer::for_host_service(),
+            task_id,
+            context_id,
+            resource_id,
+            3,
+        )
+        .expect("authority");
+        let token = BrowserServiceSettlerToken::from_host_owned_surface(&authority, &intent)
+            .expect("token");
+        let outcome = token.settle_accepted_hold(&intent).expect("settled");
+        assert_eq!(outcome.task_id, task_id);
+        assert_eq!(outcome.context_id, context_id);
+        assert_eq!(outcome.request_id, request_id);
+        assert_eq!(
+            outcome.settlement,
+            BrowserSettlement::Recovered { generation: 3 }
+        );
+    }
+
+    #[test]
+    fn host_owned_token_rejects_cross_task_or_resource() {
+        let intent = BrowserHostSettleIntent::bind_host_surface(
+            CommandId::new(),
+            OperationId::new(),
+            BrowserRequestId::new(),
+            TaskId::new(),
+            BrowserContextId::new(),
+            ResourceId::new(),
+            1,
+            1,
+        )
+        .expect("intent");
+        let foreign = BrowserServiceAuthority::issue(
+            &BrowserServiceIssuer::for_host_service(),
+            TaskId::new(),
+            intent.context_id(),
+            intent.resource_id().expect("resource"),
+            1,
+        )
+        .expect("foreign authority");
+        assert_eq!(
+            BrowserServiceSettlerToken::from_host_owned_surface(&foreign, &intent)
+                .err()
+                .expect("cross-task authority must not mint a token"),
+            BrowserIntegrationHold::WebViewSurfaceAbsent
+        );
     }
 }

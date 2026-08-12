@@ -5081,3 +5081,25 @@ fn browser_webview_host_exposes_the_main_thread_mounting_seam(
     let _: Vec<BrowserHostEvent> = host.drain_events();
     let _: Option<&BrowserWorkspaceSnapshot> = host.workspace_snapshot(workspace_key);
 }
+
+#[test]
+fn exact_surface_binding_is_host_provided_and_rejects_partial_identity() {
+    use devmanager::domain::id::{AgentSessionId, BrowserContextId, ResourceId, TaskId};
+
+    let unbound = BrowserInvocationContext::agent("legacy mcp", BrowserRisk::Normal).unwrap();
+    assert!(unbound.exact_surface_binding().is_none());
+    assert!(unbound.exact_task_id().is_none());
+
+    let task_id = TaskId::new();
+    let session_id = AgentSessionId::new();
+    let context_id = BrowserContextId::new();
+    let resource_id = ResourceId::new();
+    let bound = unbound.bind_exact_surface(task_id, session_id, context_id, resource_id);
+    assert_eq!(
+        bound.exact_surface_binding(),
+        Some((task_id, session_id, context_id, resource_id))
+    );
+    assert_ne!(bound.exact_task_id(), Some(TaskId::new()));
+    assert_ne!(bound.exact_context_id(), Some(BrowserContextId::new()));
+    assert_ne!(bound.exact_resource_id(), Some(ResourceId::new()));
+}

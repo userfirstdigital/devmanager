@@ -32,11 +32,19 @@ const MAX_MCP_REQUEST_BODY_BYTES: usize = 1024 * 1024;
 
 type RegistrationService = StreamableHttpService<BrowserMcpServer, LocalSessionManager>;
 
+type HostSurfaceBinding = (
+    crate::domain::id::TaskId,
+    crate::domain::id::AgentSessionId,
+    crate::domain::id::BrowserContextId,
+    crate::domain::id::ResourceId,
+);
+
 struct ActiveRegistration {
     process_session_id: String,
     workspace_key: BrowserWorkspaceKey,
     service: RegistrationService,
     lease: BrowserRegistrationLease,
+    surface_binding: Arc<Mutex<Option<HostSurfaceBinding>>>,
 }
 
 struct RegistrationDispatchSnapshot {
@@ -249,6 +257,28 @@ impl BrowserGatewayHandle {
     pub fn port(&self) -> u16 {
         self.inner.port
     }
+
+    pub fn publish_host_surface_binding(
+        &self,
+        process_session_id: &str,
+        task_id: crate::domain::id::TaskId,
+        agent_session_id: crate::domain::id::AgentSessionId,
+        context_id: crate::domain::id::BrowserContextId,
+        resource_id: crate::domain::id::ResourceId,
+    ) -> bool {
+        self.registrar().publish_host_surface_binding(
+            process_session_id,
+            task_id,
+            agent_session_id,
+            context_id,
+            resource_id,
+        )
+    }
+
+    pub fn clear_host_surface_binding(&self, process_session_id: &str) -> bool {
+        self.registrar()
+            .clear_host_surface_binding(process_session_id)
+    }
 }
 
 fn build_gateway_runtime() -> Result<tokio::runtime::Runtime, String> {
@@ -278,6 +308,38 @@ impl Drop for BrowserGatewayHandle {
 }
 
 impl BrowserGatewayRegistrar {
+    pub fn publish_host_surface_binding(
+        &self,
+        process_session_id: &str,
+        task_id: crate::domain::id::TaskId,
+        agent_session_id: crate::domain::id::AgentSessionId,
+        context_id: crate::domain::id::BrowserContextId,
+        resource_id: crate::domain::id::ResourceId,
+    ) -> bool {
+        let registrations = lock(&self.inner.registrations);
+        let Some(token) = registrations.token_by_process.get(process_session_id) else {
+            return false;
+        };
+        let Some(active) = registrations.by_token.get(token) else {
+            return false;
+        };
+        *lock(active.surface_binding.as_ref()) =
+            Some((task_id, agent_session_id, context_id, resource_id));
+        true
+    }
+
+    pub fn clear_host_surface_binding(&self, process_session_id: &str) -> bool {
+        let registrations = lock(&self.inner.registrations);
+        let Some(token) = registrations.token_by_process.get(process_session_id) else {
+            return false;
+        };
+        let Some(active) = registrations.by_token.get(token) else {
+            return false;
+        };
+        *lock(active.surface_binding.as_ref()) = None;
+        true
+    }
+
     pub fn register(
         &self,
         process_session_id: impl Into<String>,
@@ -347,8 +409,14 @@ impl BrowserGatewayRegistrar {
             BrowserResourceLimits::default(),
         )
         .map_err(|error| format!("open DevManager browser resource store: {error}"))?;
-        let server =
-            BrowserMcpServer::new(controller, initial_snapshot, resource_store, project_root);
+        let surface_binding = Arc::new(Mutex::new(None));
+        let server = BrowserMcpServer::new_with_surface_binding(
+            controller,
+            initial_snapshot,
+            resource_store,
+            project_root,
+            Arc::clone(&surface_binding),
+        );
         let allowed_hosts = [
             format!("127.0.0.1:{}", self.inner.port),
             format!("localhost:{}", self.inner.port),
@@ -363,6 +431,7 @@ impl BrowserGatewayRegistrar {
             workspace_key: workspace_key.clone(),
             service,
             lease,
+            surface_binding,
         };
         before_store();
         let mut registrations = lock(&self.inner.registrations);
@@ -375,6 +444,7 @@ impl BrowserGatewayRegistrar {
             .cloned()
         {
             if let Some(old_registration) = registrations.by_token.get(&old_token) {
+                *lock(old_registration.surface_binding.as_ref()) = None;
                 self.inner
                     .bridge
                     .revoke_registration(&old_registration.workspace_key, &old_registration.lease);
@@ -403,6 +473,7 @@ impl BrowserGatewayRegistrar {
             return false;
         }
         if let Some(active) = registrations.by_token.get(token) {
+            *lock(active.surface_binding.as_ref()) = None;
             self.inner
                 .bridge
                 .revoke_registration(&active.workspace_key, &active.lease);
@@ -437,6 +508,9 @@ impl BrowserGatewayRegistrar {
             registrations.token_by_process.remove(process_session_id);
             return false;
         };
+        if let Some(active) = registrations.by_token.get(&token) {
+            *lock(active.surface_binding.as_ref()) = None;
+        }
         self.inner
             .bridge
             .revoke_registration(&workspace_key, &lease);
@@ -448,6 +522,7 @@ impl BrowserGatewayRegistrar {
     pub fn revoke_all(&self) {
         let mut registrations = lock(&self.inner.registrations);
         for registration in registrations.by_token.values() {
+            *lock(registration.surface_binding.as_ref()) = None;
             self.inner
                 .bridge
                 .revoke_registration(&registration.workspace_key, &registration.lease);
@@ -682,6 +757,80 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.contains("fixture runtime construction failed"));
+    }
+
+    #[test]
+    fn host_surface_binding_is_isolated_per_registration() {
+        use crate::domain::id::{AgentSessionId, BrowserContextId, ResourceId, TaskId};
+        let (bridge, _inbox) = browser_command_channel(1);
+        let gateway = BrowserGatewayHandle::start(bridge).expect("start gateway");
+        let registrar = gateway.registrar();
+        let workspace_a = BrowserWorkspaceKey::new("project-a", "conversation-a").unwrap();
+        let workspace_b = BrowserWorkspaceKey::new("project-b", "conversation-b").unwrap();
+        let registration_a = registrar
+            .register(
+                "process-a",
+                workspace_a,
+                BrowserWorkspaceSnapshot::default(),
+            )
+            .expect("register a");
+        let registration_b = registrar
+            .register(
+                "process-b",
+                workspace_b,
+                BrowserWorkspaceSnapshot::default(),
+            )
+            .expect("register b");
+        let task_a = TaskId::new();
+        let task_b = TaskId::new();
+        let session = AgentSessionId::new();
+        let context_id = BrowserContextId::new();
+        let resource = ResourceId::new();
+        assert!(gateway.publish_host_surface_binding(
+            registration_a.process_session_id(),
+            task_a,
+            session,
+            context_id,
+            resource,
+        ));
+        assert!(gateway.publish_host_surface_binding(
+            registration_b.process_session_id(),
+            task_b,
+            session,
+            context_id,
+            resource,
+        ));
+        assert!(!gateway.publish_host_surface_binding(
+            "missing-process",
+            TaskId::new(),
+            session,
+            context_id,
+            resource,
+        ));
+        assert!(gateway.clear_host_surface_binding(registration_a.process_session_id()));
+        assert!(!gateway.clear_host_surface_binding("missing-process"));
+        assert!(gateway.publish_host_surface_binding(
+            registration_b.process_session_id(),
+            task_b,
+            session,
+            context_id,
+            resource,
+        ));
+        assert!(registrar.revoke(&registration_a));
+        assert!(!gateway.publish_host_surface_binding(
+            registration_a.process_session_id(),
+            task_a,
+            session,
+            context_id,
+            resource,
+        ));
+        assert!(gateway.publish_host_surface_binding(
+            registration_b.process_session_id(),
+            task_b,
+            session,
+            context_id,
+            resource,
+        ));
     }
 
     #[test]
