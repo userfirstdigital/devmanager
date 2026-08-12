@@ -116,7 +116,20 @@ impl TerminalLaunchAuthority {
 }
 
 type SessionStateNotifier = Arc<dyn Fn() + Send + Sync>;
-type SessionOutputNotifier = Arc<dyn Fn(Vec<u8>, TerminalModeSnapshot) + Send + Sync>;
+/// Shared PTY-output observer. Process-manager and terminal-service sinks both
+/// observe the single reader; neither creates a second parser.
+pub type TerminalOutputSink = Arc<dyn Fn(Vec<u8>, TerminalModeSnapshot) + Send + Sync>;
+type SessionOutputNotifier = TerminalOutputSink;
+
+/// Lifecycle observer for EOF / read failure / child exit on the one reader.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TerminalLifecycleEvent {
+    ReaderEof,
+    ReaderFailed { summary: String },
+    ChildExited { summary: String, code: Option<u32> },
+}
+
+pub type TerminalLifecycleSink = Arc<dyn Fn(TerminalLifecycleEvent) + Send + Sync>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum TerminalBackend {
@@ -453,6 +466,13 @@ pub struct TerminalSession {
     scrolling_history: Arc<RwLock<usize>>,
     replay_buffer: Arc<Mutex<Vec<u8>>>,
     output_notifier: Option<SessionOutputNotifier>,
+    /// Extra observer for the host TerminalService. Shares the one PTY reader.
+    service_output_sink: Arc<Mutex<Option<TerminalOutputSink>>>,
+    /// Lifecycle observer for EOF/read-failure/child-exit on the one reader.
+    service_lifecycle_sink: Arc<Mutex<Option<TerminalLifecycleSink>>>,
+    /// Non-Windows attachment identity published by the launch authority.
+    #[cfg(not(windows))]
+    service_attachment_pin: Mutex<Option<(ResourceId, u64)>>,
 }
 
 #[cfg(all(test, windows))]
@@ -610,6 +630,134 @@ impl TerminalSession {
 
     pub fn write_bytes(&self, bytes: &[u8]) -> Result<(), String> {
         write_composite_pty_payload(&self.writer, &self.input_admission, b"", bytes)
+    }
+
+    /// Install or replace the TerminalService observer on the existing reader.
+    /// Does not spawn a second reader or parser; process-manager notifiers stay.
+    pub fn install_service_output_sink(&self, sink: TerminalOutputSink) -> Result<(), String> {
+        let mut slot = self
+            .service_output_sink
+            .lock()
+            .map_err(|_| "terminal service output sink poisoned".to_string())?;
+        *slot = Some(sink);
+        Ok(())
+    }
+
+    pub fn clear_service_output_sink(&self) -> Result<(), String> {
+        let mut slot = self
+            .service_output_sink
+            .lock()
+            .map_err(|_| "terminal service output sink poisoned".to_string())?;
+        *slot = None;
+        Ok(())
+    }
+
+    pub fn install_service_lifecycle_sink(
+        &self,
+        sink: TerminalLifecycleSink,
+    ) -> Result<(), String> {
+        let mut slot = self
+            .service_lifecycle_sink
+            .lock()
+            .map_err(|_| "terminal service lifecycle sink poisoned".to_string())?;
+        *slot = Some(sink);
+        Ok(())
+    }
+
+    pub fn clear_service_lifecycle_sink(&self) -> Result<(), String> {
+        let mut slot = self
+            .service_lifecycle_sink
+            .lock()
+            .map_err(|_| "terminal service lifecycle sink poisoned".to_string())?;
+        *slot = None;
+        Ok(())
+    }
+
+    /// Current typed attachment fence. Windows uses the managed process fence;
+    /// non-Windows uses the generation published by the launch authority.
+    pub fn current_attachment_fence(&self) -> Result<(ResourceId, u64), String> {
+        #[cfg(windows)]
+        {
+            let fence = self
+                .managed_process_fence()?
+                .ok_or_else(|| "managed terminal fence is missing".to_string())?;
+            Ok((
+                fence.resource().resource_id,
+                fence.resource().runtime_generation,
+            ))
+        }
+        #[cfg(not(windows))]
+        {
+            let pin = self
+                .service_attachment_pin
+                .lock()
+                .map_err(|_| "terminal attachment pin poisoned".to_string())?;
+            (*pin).ok_or_else(|| "terminal attachment fence is missing".to_string())
+        }
+    }
+
+    /// Exact generation-fenced teardown for the host TerminalService.
+    /// Requires the caller-supplied expected fence; never closes a newer or
+    /// missing generation. Non-Windows remains fail-closed on the same check.
+    pub fn close_exact_for_service(
+        &self,
+        expected_resource_id: ResourceId,
+        expected_generation: u64,
+        closed_by_user: bool,
+    ) -> Result<(), String> {
+        let (current_resource_id, current_generation) = self.current_attachment_fence()?;
+        if current_resource_id != expected_resource_id || current_generation != expected_generation
+        {
+            return Err(
+                "managed terminal generation changed before teardown admission".to_string(),
+            );
+        }
+        #[cfg(windows)]
+        {
+            let fence = self
+                .managed_process_fence()?
+                .ok_or_else(|| "managed terminal fence is missing".to_string())?;
+            if fence.resource().resource_id != expected_resource_id
+                || fence.resource().runtime_generation != expected_generation
+            {
+                return Err(
+                    "managed terminal generation changed before teardown admission".to_string(),
+                );
+            }
+            self.close_managed_process_exact(&fence, closed_by_user)
+        }
+        #[cfg(not(windows))]
+        {
+            self.close(closed_by_user)
+        }
+    }
+
+    /// Bound host scrollback to exactly `max_lines` (minimum 1). Unlike
+    /// `set_scrollback_lines`, this does not clamp upward to 100.
+    pub fn bound_history_exact(&self, max_lines: usize) {
+        let max_lines = max_lines.max(1);
+        if let Ok(mut scrollback) = self.scrolling_history.write() {
+            *scrollback = max_lines;
+        }
+        if let Ok(mut term) = self.term.lock() {
+            term.set_options(configured_term(max_lines));
+        }
+        self.event_proxy.with_runtime(|session| {
+            session.display_offset = session.display_offset.min(max_lines);
+            session.mark_dirty();
+        });
+    }
+
+    pub fn session_view(&self) -> Option<TerminalSessionView> {
+        let runtime = self
+            .runtime_state
+            .read()
+            .ok()
+            .and_then(|runtime| runtime.sessions.get(&self.session_id).cloned())?;
+        Some(TerminalSessionView {
+            runtime,
+            screen: self.snapshot(),
+        })
     }
 
     pub fn write_text(&self, text: &str) -> Result<(), String> {
@@ -955,6 +1103,8 @@ impl TerminalSession {
         track_pid: bool,
         authority: TerminalLaunchAuthority,
     ) -> Result<(), String> {
+        #[cfg(not(windows))]
+        self.validate_service_restart_fence(&authority)?;
         #[cfg(windows)]
         let _lifecycle = lock_terminal_lifecycle(&self.lifecycle)?;
         #[cfg(windows)]
@@ -1212,6 +1362,8 @@ impl TerminalSession {
             self.event_proxy.debug_enabled,
             self.event_proxy.state_notifier.clone(),
             self.output_notifier.clone(),
+            Arc::clone(&self.service_output_sink),
+            Arc::clone(&self.service_lifecycle_sink),
             self.replay_buffer.clone(),
             Arc::clone(&start_gate),
             #[cfg(windows)]
@@ -1241,6 +1393,7 @@ impl TerminalSession {
             self.runtime_state.clone(),
             self.event_proxy.debug_enabled,
             self.event_proxy.state_notifier.clone(),
+            Arc::clone(&self.service_lifecycle_sink),
             Arc::clone(&start_gate),
         ) {
             Ok(actor) => actor,
@@ -1270,6 +1423,9 @@ impl TerminalSession {
         }
         #[cfg(not(windows))]
         self.input_admission.store(true, Ordering::Release);
+
+        #[cfg(not(windows))]
+        self.publish_service_attachment_fence(&authority)?;
 
         self.event_proxy.debug_log(format!("respawned {}", program));
         Ok(())
@@ -2339,6 +2495,8 @@ fn spawn_reader_thread(
     debug_enabled: bool,
     state_notifier: Option<SessionStateNotifier>,
     output_notifier: Option<SessionOutputNotifier>,
+    service_output_sink: Arc<Mutex<Option<TerminalOutputSink>>>,
+    service_lifecycle_sink: Arc<Mutex<Option<TerminalLifecycleSink>>>,
     replay_buffer: Arc<Mutex<Vec<u8>>>,
     start_gate: Arc<TerminalActorStartGate>,
     #[cfg(windows)] teardown: Arc<Mutex<Option<Arc<ManagedTerminalTeardown>>>>,
@@ -2357,6 +2515,10 @@ fn spawn_reader_thread(
                         if debug_enabled {
                             eprintln!("[terminal:{session_id}] PTY reader reached EOF");
                         }
+                        notify_service_lifecycle(
+                            &service_lifecycle_sink,
+                            TerminalLifecycleEvent::ReaderEof,
+                        );
                         break;
                     }
                     Ok(bytes_read) => {
@@ -2376,6 +2538,11 @@ fn spawn_reader_thread(
 
                         if let Some(notifier) = output_notifier.as_ref() {
                             notifier(buffer[..bytes_read].to_vec(), mode);
+                        }
+                        if let Ok(sink) = service_output_sink.lock() {
+                            if let Some(notifier) = sink.as_ref() {
+                                notifier(buffer[..bytes_read].to_vec(), mode);
+                            }
                         }
                         if let Some(notifier) = state_notifier.as_ref() {
                             notifier();
@@ -2398,6 +2565,12 @@ fn spawn_reader_thread(
                                 );
                             }
                         }
+                        notify_service_lifecycle(
+                            &service_lifecycle_sink,
+                            TerminalLifecycleEvent::ReaderFailed {
+                                summary: format!("PTY read failed: {error}"),
+                            },
+                        );
                         if let Some(notifier) = state_notifier.as_ref() {
                             notifier();
                         }
@@ -2415,6 +2588,17 @@ fn spawn_reader_thread(
         .map_err(|error| format!("Failed to spawn terminal reader actor: {error}"))
 }
 
+fn notify_service_lifecycle(
+    sink: &Arc<Mutex<Option<TerminalLifecycleSink>>>,
+    event: TerminalLifecycleEvent,
+) {
+    if let Ok(guard) = sink.lock() {
+        if let Some(notifier) = guard.as_ref() {
+            notifier(event);
+        }
+    }
+}
+
 fn spawn_wait_thread(
     session_id: String,
     mut child: Box<dyn Child + Send + Sync>,
@@ -2424,6 +2608,7 @@ fn spawn_wait_thread(
     runtime_state: Arc<RwLock<RuntimeState>>,
     debug_enabled: bool,
     state_notifier: Option<SessionStateNotifier>,
+    service_lifecycle_sink: Arc<Mutex<Option<TerminalLifecycleSink>>>,
     start_gate: Arc<TerminalActorStartGate>,
 ) -> Result<thread::JoinHandle<()>, String> {
     #[cfg(all(test, windows))]
@@ -2449,6 +2634,11 @@ fn spawn_wait_thread(
                     let surviving_descendants = pid
                         .map(platform_service::collect_descendant_process_identities)
                         .unwrap_or_default();
+                    let summary = if let Some(signal) = status.signal() {
+                        format!("Shell terminated by {signal}")
+                    } else {
+                        format!("Shell exited with code {}", status.exit_code())
+                    };
                     if let Ok(mut runtime) = runtime_state.write() {
                         if let Some(session) = runtime.sessions.get_mut(&session_id) {
                             let closed_by_user = session
@@ -2461,16 +2651,19 @@ fn spawn_wait_thread(
                                     code: Some(status.exit_code()),
                                     signal: status.signal().map(str::to_string),
                                     closed_by_user,
-                                    summary: if let Some(signal) = status.signal() {
-                                        format!("Shell terminated by {signal}")
-                                    } else {
-                                        format!("Shell exited with code {}", status.exit_code())
-                                    },
+                                    summary: summary.clone(),
                                 },
                                 SessionStatus::Exited,
                             );
                         }
                     }
+                    notify_service_lifecycle(
+                        &service_lifecycle_sink,
+                        TerminalLifecycleEvent::ChildExited {
+                            summary,
+                            code: Some(status.exit_code()),
+                        },
+                    );
                     if let Some(notifier) = state_notifier.as_ref() {
                         notifier();
                     }
@@ -2494,6 +2687,7 @@ fn spawn_wait_thread(
                     let surviving_descendants = pid
                         .map(platform_service::collect_descendant_process_identities)
                         .unwrap_or_default();
+                    let summary = format!("Failed while waiting for shell exit: {error}");
                     if let Ok(mut runtime) = runtime_state.write() {
                         if let Some(session) = runtime.sessions.get_mut(&session_id) {
                             session.note_exit(
@@ -2501,14 +2695,19 @@ fn spawn_wait_thread(
                                     code: None,
                                     signal: None,
                                     closed_by_user: false,
-                                    summary: format!(
-                                        "Failed while waiting for shell exit: {error}"
-                                    ),
+                                    summary: summary.clone(),
                                 },
                                 SessionStatus::Failed,
                             );
                         }
                     }
+                    notify_service_lifecycle(
+                        &service_lifecycle_sink,
+                        TerminalLifecycleEvent::ChildExited {
+                            summary,
+                            code: None,
+                        },
+                    );
                     if let Some(notifier) = state_notifier.as_ref() {
                         notifier();
                     }
@@ -2545,6 +2744,8 @@ fn spawn_with_command(
         .openpty(pty_size(dimensions))
         .map_err(|error| error.to_string())?;
     let scrolling_history = scrolling_history.max(100);
+    #[cfg(not(windows))]
+    let service_attachment_fence = (authority.resource_id, authority.runtime_generation);
 
     #[cfg(windows)]
     let writer = Arc::new(Mutex::new(
@@ -2704,6 +2905,8 @@ fn spawn_with_command(
         }
     };
     let start_gate = Arc::new(TerminalActorStartGate::default());
+    let service_output_sink = Arc::new(Mutex::new(None));
+    let service_lifecycle_sink = Arc::new(Mutex::new(None));
     let reader_actor = match spawn_reader_thread(
         session_id.to_string(),
         reader,
@@ -2713,6 +2916,8 @@ fn spawn_with_command(
         debug_enabled,
         state_notifier.clone(),
         output_notifier.clone(),
+        Arc::clone(&service_output_sink),
+        Arc::clone(&service_lifecycle_sink),
         replay_buffer.clone(),
         Arc::clone(&start_gate),
         #[cfg(windows)]
@@ -2743,6 +2948,7 @@ fn spawn_with_command(
         runtime_state.clone(),
         debug_enabled,
         state_notifier,
+        Arc::clone(&service_lifecycle_sink),
         Arc::clone(&start_gate),
     ) {
         Ok(actor) => actor,
@@ -2802,6 +3008,10 @@ fn spawn_with_command(
         scrolling_history,
         replay_buffer,
         output_notifier,
+        service_output_sink,
+        service_lifecycle_sink,
+        #[cfg(not(windows))]
+        service_attachment_pin: Mutex::new(Some(service_attachment_fence)),
     })
 }
 
@@ -2813,6 +3023,39 @@ fn drop_managed_process_job(process_job: &Arc<Mutex<Option<platform_service::Man
 }
 
 impl TerminalSession {
+    #[cfg(not(windows))]
+    fn validate_service_restart_fence(
+        &self,
+        authority: &TerminalLaunchAuthority,
+    ) -> Result<(), String> {
+        let pin = self
+            .service_attachment_pin
+            .lock()
+            .map_err(|_| "terminal attachment pin poisoned".to_string())?;
+        if let Some((resource_id, generation)) = *pin {
+            if resource_id == authority.resource_id && authority.runtime_generation <= generation {
+                return Err(
+                    "terminal restart authority is not newer than the attached generation"
+                        .to_string(),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    fn publish_service_attachment_fence(
+        &self,
+        authority: &TerminalLaunchAuthority,
+    ) -> Result<(), String> {
+        let mut pin = self
+            .service_attachment_pin
+            .lock()
+            .map_err(|_| "terminal attachment pin poisoned".to_string())?;
+        *pin = Some((authority.resource_id, authority.runtime_generation));
+        Ok(())
+    }
+
     /// Returns only the current exact teardown fence. This performs no Job
     /// enumeration and grants no raw process or termination capability.
     #[cfg(windows)]
