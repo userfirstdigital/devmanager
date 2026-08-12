@@ -5438,6 +5438,12 @@ fn ensure_prior_session_teardown_settled(
     let started_at = Instant::now();
     let mut last_close_error = None;
     loop {
+        // A prelaunch runtime row can outlive both authoritative process
+        // sources. Scrub its diagnostic projection before admission, but do
+        // not turn owner/ledger absence into a fabricated lifecycle result.
+        if try_admit_unowned_session_replacement(inner, session_id) {
+            return Ok(());
+        }
         if let Err(error) = retry_exact_session_teardown(inner, session_id) {
             last_close_error = Some(error);
         }
@@ -5446,7 +5452,7 @@ fn ensure_prior_session_teardown_settled(
         // evidence of an old process owner.  Admission is safe once both
         // authoritative sources of process ownership are absent: no retained
         // TerminalSession/Job and no live ledger identity.
-        if session_has_no_process_authority_or_evidence(inner, session_id) {
+        if try_admit_unowned_session_replacement(inner, session_id) {
             return Ok(());
         }
         if started_at.elapsed() >= timeout {
@@ -5489,6 +5495,38 @@ fn session_has_no_process_authority_or_evidence(
         .map(|sessions| !sessions.contains_key(session_id))
         .unwrap_or(false)
         && pid_file::active_tracked_pids_for_session(session_id).is_empty()
+}
+
+fn try_admit_unowned_session_replacement(
+    inner: &Arc<ProcessManagerInner>,
+    session_id: &str,
+) -> bool {
+    if !session_has_no_process_authority_or_evidence(inner, session_id) {
+        return false;
+    }
+
+    let mut changed = false;
+    let mut runtime = match inner.runtime_state.write() {
+        Ok(runtime) => runtime,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if let Some(session) = runtime.sessions.get_mut(session_id) {
+        if session.reap_incomplete {
+            return false;
+        }
+        let dirty_before = session.dirty_generation;
+        session.pid = None;
+        session.resources = ResourceSnapshot::default();
+        session.mark_dirty();
+        changed = session.dirty_generation != dirty_before;
+    }
+    drop(runtime);
+    if changed {
+        bump_runtime_revision(inner);
+        mark_remote_session_dirty(inner, session_id);
+        emit_tracked_remote_runtime_snapshot(inner, session_id);
+    }
+    true
 }
 
 fn session_projection_is_already_settled(inner: &ProcessManagerInner, session_id: &str) -> bool {
@@ -11575,30 +11613,183 @@ mod tests {
     }
 
     #[test]
+    fn replacement_admission_accepts_absent_runtime_without_ledger() {
+        let cwd = temp_test_dir("replacement-absent-runtime");
+        let _pid_file_guard = pid_file::use_test_pid_file(cwd.join("running-pids.json"));
+        let manager = ProcessManager::new();
+
+        ensure_prior_session_teardown_settled(&manager.inner, "absent-runtime", Duration::ZERO)
+            .expect("absence from both authoritative process sources is replaceable");
+
+        assert!(
+            !manager
+                .runtime_state()
+                .sessions
+                .contains_key("absent-runtime"),
+            "replacement admission must not synthesize a runtime row"
+        );
+    }
+
+    #[test]
+    fn replacement_admission_scrubs_diagnostic_only_starting_projection() {
+        let cwd = temp_test_dir("replacement-starting-diagnostics");
+        let _pid_file_guard = pid_file::use_test_pid_file(cwd.join("running-pids.json"));
+        let manager = ProcessManager::new();
+        let mut session = SessionRuntimeState::new(
+            "starting-diagnostics",
+            PathBuf::from("."),
+            SessionDimensions::default(),
+            TerminalBackend::PortablePtyFeedingAlacritty,
+        );
+        session.resources.metrics_unavailable = true;
+        session.resources.metrics_status = ProcessMetricStatus::Failed;
+        session.resources.metric_values = ResourceMetricValueState::LastKnown;
+        session.resources.cpu_value_state = ResourceMetricValueState::LastKnown;
+        session.resources.memory_value_state = ResourceMetricValueState::LastKnown;
+        session.resources.process_count_value_state = ResourceMetricValueState::LastKnown;
+        session.resources.metrics_stale = true;
+        session.resources.metrics_error = Some("prior_sample".to_string());
+        session.resources.sampling_generation = 41;
+        session.resources.io_read_bytes = Some(42);
+        session.resources.io_write_bytes = Some(43);
+        session.resources.logical_cpu_count = 16;
+        session.resources.last_sample_at = Some(Instant::now());
+        session.exit = Some(SessionExitState {
+            code: Some(17),
+            signal: Some("starting-signal".to_string()),
+            closed_by_user: false,
+            summary: "starting-exit-metadata".to_string(),
+        });
+        manager.register_runtime_session(session);
+
+        ensure_prior_session_teardown_settled(
+            &manager.inner,
+            "starting-diagnostics",
+            Duration::ZERO,
+        )
+        .expect("an ownerless prelaunch row without ledger evidence is replaceable");
+
+        let runtime = manager.runtime_state();
+        let session = runtime
+            .sessions
+            .get("starting-diagnostics")
+            .expect("runtime row");
+        assert_eq!(session.status, SessionStatus::Starting);
+        let exit = session.exit.as_ref().expect("seeded exit metadata");
+        assert_eq!(exit.code, Some(17));
+        assert_eq!(exit.signal.as_deref(), Some("starting-signal"));
+        assert!(!exit.closed_by_user);
+        assert_eq!(exit.summary, "starting-exit-metadata");
+        assert!(!session.resources.metrics_unavailable);
+        assert_eq!(
+            session.resources.metrics_status,
+            ProcessMetricStatus::Unknown
+        );
+        assert_eq!(
+            session.resources.metric_values,
+            ResourceMetricValueState::Unavailable
+        );
+        assert_eq!(
+            session.resources.cpu_value_state,
+            ResourceMetricValueState::Unavailable
+        );
+        assert_eq!(
+            session.resources.memory_value_state,
+            ResourceMetricValueState::Unavailable
+        );
+        assert_eq!(
+            session.resources.process_count_value_state,
+            ResourceMetricValueState::Unavailable
+        );
+        assert!(!session.resources.metrics_stale);
+        assert!(session.resources.metrics_error.is_none());
+        assert_eq!(session.resources.sampling_generation, 0);
+        assert!(session.resources.io_read_bytes.is_none());
+        assert!(session.resources.io_write_bytes.is_none());
+        assert_eq!(session.resources.logical_cpu_count, 1);
+        assert!(session.resources.last_sample_at.is_none());
+    }
+
+    #[test]
+    fn replacement_rejects_ownerless_reap_incomplete_without_live_ledger() {
+        let cwd = temp_test_dir("replacement-reap-incomplete");
+        let _pid_file_guard = pid_file::use_test_pid_file(cwd.join("running-pids.json"));
+        let manager = ProcessManager::new();
+        let mut session = SessionRuntimeState::new(
+            "replacement-reap-incomplete",
+            PathBuf::from("."),
+            SessionDimensions::default(),
+            TerminalBackend::PortablePtyFeedingAlacritty,
+        );
+        session.status = SessionStatus::Failed;
+        session.reap_incomplete = true;
+        manager.register_runtime_session(session);
+
+        let error = ensure_prior_session_teardown_settled(
+            &manager.inner,
+            "replacement-reap-incomplete",
+            Duration::ZERO,
+        )
+        .expect_err("reap-incomplete state remains fail-closed without exact release");
+        assert!(
+            error.contains("did not settle before replacement"),
+            "{error}"
+        );
+
+        let runtime = manager.runtime_state();
+        let session = runtime
+            .sessions
+            .get("replacement-reap-incomplete")
+            .expect("runtime residue");
+        assert_eq!(session.status, SessionStatus::Failed);
+        assert!(session.reap_incomplete);
+        assert_process_monitor_has_no_kill_authority(session);
+        assert_eq!(
+            session.resources.metrics_error.as_deref(),
+            Some("exact_owner_unavailable"),
+            "the explicit retry path records why exact teardown is unavailable"
+        );
+    }
+
+    #[test]
     fn replacement_safety_does_not_publish_stopped_without_exact_release() {
         let cwd = temp_test_dir("settled-stopped-session");
         let _pid_file_guard = pid_file::use_test_pid_file(cwd.join("running-pids.json"));
         let manager = ProcessManager::new();
-        manager.register_runtime_session(SessionRuntimeState::new(
+        let stale_pid = 800_002;
+        let mut session = SessionRuntimeState::new(
             "alpha",
             PathBuf::from("."),
             SessionDimensions::default(),
             TerminalBackend::PortablePtyFeedingAlacritty,
-        ));
-        manager.update_session_state("alpha", |session| {
-            session.status = SessionStatus::Stopping;
-            session.pid = None;
-            session.mark_dirty();
+        );
+        session.status = SessionStatus::Stopping;
+        session.pid = Some(stale_pid);
+        session.resources =
+            ownerless_process_projection("alpha", stale_pid, synthetic_process_fence(stale_pid));
+        session.exit = Some(SessionExitState {
+            code: Some(23),
+            signal: Some("stopping-signal".to_string()),
+            closed_by_user: true,
+            summary: "stopping-exit-metadata".to_string(),
         });
+        manager.register_runtime_session(session);
 
         assert!(manager.ensure_session_replacement_safe_for_test("alpha", Duration::from_millis(1)));
 
         let runtime = manager.runtime_state();
+        let session = runtime.sessions.get("alpha").expect("runtime row");
         assert_eq!(
-            runtime.sessions.get("alpha").map(|session| session.status),
-            Some(SessionStatus::Stopping),
+            session.status,
+            SessionStatus::Stopping,
             "replacement safety is not proof of exact Job release and must not publish Stopped"
         );
+        let exit = session.exit.as_ref().expect("seeded exit metadata");
+        assert_eq!(exit.code, Some(23));
+        assert_eq!(exit.signal.as_deref(), Some("stopping-signal"));
+        assert!(exit.closed_by_user);
+        assert_eq!(exit.summary, "stopping-exit-metadata");
+        assert_process_monitor_has_no_kill_authority(session);
     }
 
     #[test]
