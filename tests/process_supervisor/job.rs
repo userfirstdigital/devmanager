@@ -8,7 +8,7 @@ mod windows {
     use devmanager::process::job::ManagedProcessJob;
     use devmanager::services::platform_service::{
         capture_process_identity, claim_suspended_process, process_matches_identity,
-        MANAGED_PROCESS_CREATION_FLAGS,
+        resume_suspended_process, MANAGED_PROCESS_CREATION_FLAGS,
     };
 
     static_assertions::assert_impl_all!(ManagedProcessJob: Send, Sync);
@@ -119,6 +119,7 @@ mod windows {
         let mut child = TestChild { child };
         let root_pid = child.id();
         let job = claim(&child);
+        resume_suspended_process(root_pid).expect("resume suspended Job root");
 
         let marker_deadline = Instant::now() + Duration::from_secs(5);
         while !worker_pid_file.exists() && Instant::now() < marker_deadline {

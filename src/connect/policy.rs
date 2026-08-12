@@ -1159,7 +1159,7 @@ impl HostPolicyBridge {
             action: admission.binding.action,
             credential: None,
         };
-        if !self.evaluator.authorize(request) {
+        if !self.evaluator.evaluate_host_admission(request).is_allowed() {
             return Err(HostPolicyError::PermissionDenied);
         }
         Ok(CurrentHostAuthority {

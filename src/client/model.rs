@@ -2094,7 +2094,7 @@ pub fn quota_observation_is_fresh(observed_at_ms: Option<i64>, now_ms: i64) -> b
         return false;
     };
     match now_ms.checked_sub(observed_at_ms) {
-        Some(age) => age <= PROVIDER_QUOTA_MAX_AGE_MS,
+        Some(age) => (0..=PROVIDER_QUOTA_MAX_AGE_MS).contains(&age),
         None => false,
     }
 }

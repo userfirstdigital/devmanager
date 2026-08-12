@@ -4372,6 +4372,19 @@ mod auth_timestamp_tests {
     use super::*;
     use std::sync::Arc;
 
+    fn executable_handle_fixture() -> ProviderExecutableHandle {
+        static EXECUTABLE: std::sync::OnceLock<ProviderExecutableHandle> =
+            std::sync::OnceLock::new();
+        EXECUTABLE
+            .get_or_init(|| {
+                ProviderExecutable::from_path(std::env::current_exe().unwrap())
+                    .unwrap()
+                    .open_for_launch()
+                    .unwrap()
+            })
+            .clone()
+    }
+
     #[derive(Debug)]
     struct FixedClock {
         now: Instant,
@@ -4399,7 +4412,7 @@ mod auth_timestamp_tests {
             now,
             timestamp_ms: 4_242,
         });
-        let executable = ProviderExecutable::from_path(std::env::current_exe().unwrap()).unwrap();
+        let executable = executable_handle_fixture().executable().clone();
         let mut registry = ProviderAuthEvidenceRegistry::with_clock(clock);
         let invocation = registry
             .begin(
@@ -4431,10 +4444,7 @@ mod auth_timestamp_tests {
     #[test]
     fn auth_receipt_expiry_is_exclusive_at_the_absolute_deadline() {
         let observed_at = Instant::now();
-        let executable = ProviderExecutable::from_path(std::env::current_exe().unwrap())
-            .unwrap()
-            .open_for_launch()
-            .unwrap();
+        let executable = executable_handle_fixture();
         let deadline = observed_at + Duration::from_secs(30);
         let receipt = ProviderAuthEvidenceReceipt {
             kind: ProviderKind::ClaudeCode,
@@ -4457,10 +4467,7 @@ mod auth_timestamp_tests {
 
     #[test]
     fn auth_capability_evidence_uses_clock_timestamp_not_generation() {
-        let executable = ProviderExecutable::from_path(std::env::current_exe().unwrap())
-            .unwrap()
-            .open_for_launch()
-            .unwrap();
+        let executable = executable_handle_fixture();
         let observed_at = Instant::now();
         let receipt = ProviderAuthEvidenceReceipt {
             kind: ProviderKind::ClaudeCode,

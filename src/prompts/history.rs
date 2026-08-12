@@ -411,6 +411,18 @@ impl PromptHistoryStore {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn open_search_migration_fixture(path: &Path) -> Result<Self, PromptHistoryError> {
+        crate::kernel::KernelStore::open(path)
+            .map_err(|_| PromptHistoryError::from_code(PromptHistoryErrorCode::Storage))?;
+        let conn = configure_connection(path)?;
+        Ok(Self {
+            conn,
+            fail_next_index: false,
+            index_scheduler_claimed: false,
+        })
+    }
+
     pub fn claim_index_scheduler(&mut self) {
         self.index_scheduler_claimed = true;
     }

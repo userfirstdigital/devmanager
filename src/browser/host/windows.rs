@@ -8961,7 +8961,7 @@ mod secret_document_state_tests {
             agent_session_id: other_session,
         };
         assert_eq!(
-            completed_task_aware_identity(Some(mismatched), Some(identity), Some(other_session)),
+            completed_task_aware_identity(Some(mismatched), Some(identity), Some(agent_session_id)),
             Err(BrowserTaskSurfaceBindBlocker::TaskIdentityUnavailableAtBuildCompletion)
         );
     }

@@ -1533,7 +1533,9 @@ mod tests {
         assert!(ids.contains(&ACTION_UPDATER_DOWNLOAD));
         assert!(ids.contains(&ACTION_UPDATER_START_BACKGROUND));
         assert!(ids.contains(&ACTION_UPDATER_INSTALL));
-        assert_eq!(ids.len(), 36);
+        assert!(ids.contains(&ACTION_BROWSER_NATIVE));
+        assert!(ids.contains(&ACTION_PROVIDER_START_SESSION));
+        assert_eq!(ids.len(), 38);
         assert!(ids.contains(&ACTION_SERVICE_START));
         assert!(ids.contains(&ACTION_SERVICE_STOP));
         assert!(ids.contains(&ACTION_SERVICE_RESTART));

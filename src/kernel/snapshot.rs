@@ -992,11 +992,15 @@ mod tests {
         }
     }
 
-    fn agent_facts(task_id: TaskId, agent_session_id: AgentSessionId) -> AgentSessionFacts {
+    fn agent_facts(
+        task_id: TaskId,
+        agent_session_id: AgentSessionId,
+        role: AgentRole,
+    ) -> AgentSessionFacts {
         AgentSessionFacts {
             id: agent_session_id,
             task_id,
-            role: AgentRole::Primary,
+            role,
             provider_kind: ProviderKind::Codex,
             provider_session_id: Some(
                 format!("session-{}", agent_session_id)
@@ -1016,13 +1020,31 @@ mod tests {
         command_id: CommandId,
         expected_revision: u64,
     ) {
+        register_agent_with_role(
+            store,
+            task_id,
+            agent_session_id,
+            command_id,
+            expected_revision,
+            AgentRole::Primary,
+        );
+    }
+
+    fn register_agent_with_role(
+        store: &mut KernelStore,
+        task_id: TaskId,
+        agent_session_id: AgentSessionId,
+        command_id: CommandId,
+        expected_revision: u64,
+        role: AgentRole,
+    ) {
         store
             .execute(envelope(
                 command_id,
                 Some(task_id),
                 Some(expected_revision),
                 Command::RegisterAgentSession {
-                    agent: agent_facts(task_id, agent_session_id),
+                    agent: agent_facts(task_id, agent_session_id, role),
                 },
             ))
             .expect("register agent");
@@ -1384,19 +1406,32 @@ mod tests {
         for (agent_tail, command_tail, expected_revision) in
             [(0xE2, 0xE5, 1), (0xE3, 0xE6, 2), (0xE4, 0xE7, 3)]
         {
-            register_agent(
+            let role = if expected_revision == 1 {
+                AgentRole::Primary
+            } else {
+                AgentRole::specialist(format!("snapshot-{agent_tail:x}")).expect("specialist role")
+            };
+            register_agent_with_role(
                 &mut store,
                 task,
                 agent_id(agent_tail),
                 command_id(command_tail),
                 expected_revision,
+                role,
             );
         }
 
         let snapshot = store
             .begin_snapshot(PageLimits::new(2, 512 * 1024).expect("limits"))
             .expect("begin snapshot");
-        register_agent(&mut store, task, agent_id(0xE8), command_id(0xE9), 4);
+        register_agent_with_role(
+            &mut store,
+            task,
+            agent_id(0xE8),
+            command_id(0xE9),
+            4,
+            AgentRole::specialist("snapshot-new").expect("specialist role"),
+        );
 
         let first = snapshot
             .page(SnapshotSection::AgentSessions, None)

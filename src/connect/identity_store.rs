@@ -3154,6 +3154,8 @@ mod tests {
 
     #[test]
     fn production_session_is_profile_bound_and_fail_closed_on_crypto() {
+        let _profile =
+            crate::remote::test_support::TestProfileEnvGuard::new("connect-identity-profile-bound");
         let root = crate::persistence::app_config_dir().expect("isolated test config");
         let err = ConnectProductionSession::open().expect_err("unenrolled identity");
         assert!(
@@ -3259,6 +3261,9 @@ mod tests {
 
     #[test]
     fn production_session_with_custody_runs_xx_handshake() {
+        let _profile = crate::remote::test_support::TestProfileEnvGuard::new(
+            "connect-identity-custody-handshake",
+        );
         let root = crate::persistence::app_config_dir().expect("isolated test config");
         let missing = ConnectNoiseCustody::generate().expect("empty-profile custody");
         match ConnectProductionSession::open_with_custody(missing) {
@@ -3361,6 +3366,9 @@ mod tests {
 
     #[test]
     fn production_open_uses_os_custody_or_fails_closed_on_unsupported_platform() {
+        let _profile = crate::remote::test_support::TestProfileEnvGuard::new(
+            "connect-identity-production-open",
+        );
         let _root = crate::persistence::app_config_dir().expect("isolated test config");
         persist_active_profile_identity();
         match ConnectProductionSession::open() {
@@ -3384,6 +3392,8 @@ mod tests {
 
     #[test]
     fn os_custody_rejects_wrong_profile_binding() {
+        let _profile =
+            crate::remote::test_support::TestProfileEnvGuard::new("connect-identity-wrong-profile");
         let _root = crate::persistence::app_config_dir().expect("isolated test config");
         persist_active_profile_identity();
         match ConnectProductionSession::open() {
@@ -3417,6 +3427,8 @@ mod tests {
 
     #[test]
     fn production_startup_gate_rejects_legacy_web_and_raw_pty() {
+        let _profile =
+            crate::remote::test_support::TestProfileEnvGuard::new("connect-identity-startup-gate");
         assert!(ConnectProductionStartup::reject_legacy_remote_web_as_connect().is_err());
         assert!(ConnectListenerKind::ProductionDirect
             .reject_raw_pty()

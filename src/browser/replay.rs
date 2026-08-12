@@ -757,6 +757,10 @@ impl Drop for BrowserReplayCoordinatorState {
                 .cancelled
                 .store(true, Ordering::Release);
             active.secret_store.close();
+            // Dropping the coordinator is a terminal transition just like an
+            // explicit cancellation. Publish it before the sender disappears
+            // so execution handles can observe settled repair authority.
+            let _ = signal_repair_state(active);
         }
     }
 }

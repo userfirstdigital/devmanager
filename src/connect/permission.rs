@@ -433,6 +433,13 @@ impl PermissionEvaluator {
         self.evaluate_roles(request, true, false)
     }
 
+    /// Evaluate an admission that has already crossed the private trusted-host
+    /// membership boundary. This never substitutes for transport credentials
+    /// or scoped grants on caller-facing Connect requests.
+    pub(crate) fn evaluate_host_admission(&self, request: PermissionRequest) -> PermissionDecision {
+        self.evaluate_roles(request, true, true)
+    }
+
     /// Evaluate a request after reloading and validating its credential
     /// through the authoritative identity store and active session. A public
     /// evaluator must not accept a caller-supplied identity snapshot.

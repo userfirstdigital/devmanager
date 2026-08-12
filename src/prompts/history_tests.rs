@@ -1177,7 +1177,7 @@ fn phase07_v1_cannot_absorb_history_after_v8_v9_lineage() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .expect("latest");
-    assert_eq!(latest, (13, "phase07-prompt-history-v1".into()));
+    assert_eq!(latest, (14, "connect-identity-v1".into()));
 }
 
 #[test]

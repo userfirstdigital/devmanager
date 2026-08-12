@@ -5340,7 +5340,7 @@ mod secure_command_tests {
         assert_eq!(
             crate::browser::host::unsupported_request_response("fixture", &request),
             Err(BrowserError::UnavailablePlatform {
-                platform: "fixture".to_string(),
+                platform: "unknown".to_string(),
             })
         );
         let resource = request
@@ -6049,14 +6049,14 @@ mod secure_command_tests {
         assert_eq!(
             result,
             Err(BrowserError::UnavailablePlatform {
-                platform: "fixture".to_string(),
+                platform: "unknown".to_string(),
             })
         );
         request.respond(result);
         assert_eq!(
             task.await.unwrap(),
             Err(BrowserError::UnavailablePlatform {
-                platform: "fixture".to_string(),
+                platform: "unknown".to_string(),
             })
         );
     }

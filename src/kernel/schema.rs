@@ -1805,6 +1805,7 @@ pub(crate) const PROJECTION_TABLES: &[&str] = &[
     "resources",
     "host_admission",
     "host_cleanup_branches",
+    "provider_input_state",
 ];
 
 #[cfg(test)]
@@ -2099,7 +2100,8 @@ mod tests {
             .expect("saved");
             tx.commit().expect("seed");
         }
-        let history = PromptHistoryStore::open(&path).expect("upgrade v13");
+        let history = PromptHistoryStore::open_search_migration_fixture(&path)
+            .expect("upgrade v13 search fixture");
         assert!(history.is_search_dirty().expect("dirty after upgrade"));
         assert!(history.pending_count().expect("enqueued") >= 1);
     }
@@ -2159,7 +2161,8 @@ mod tests {
             }
             tx.commit().expect("seed");
         }
-        let history = PromptHistoryStore::open(&path).expect("upgrade v13");
+        let history = PromptHistoryStore::open_search_migration_fixture(&path)
+            .expect("upgrade v13 search fixture");
         assert!(history.is_search_dirty().expect("dirty after upgrade"));
         assert!(history
             .is_search_overflow()
@@ -2542,7 +2545,7 @@ mod tests {
                     row.get(0)
                 })
                 .expect("migration count");
-            assert_eq!(migration_count, 13, "prior schema V{prior_version}");
+            assert_eq!(migration_count, 14, "prior schema V{prior_version}");
             let missing_prompt_command_payloads: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM prompt_command_receipts
