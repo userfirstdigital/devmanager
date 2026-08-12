@@ -10875,7 +10875,13 @@ pub(crate) mod test_support {
 
     impl TestProfileEnvGuard {
         fn with_profile(profile: Option<String>) -> Self {
-            let lock = TEST_PROFILE_LOCK.lock().expect("profile lock");
+            // A panicking profile-sensitive test still drops its guard and
+            // restores the environment. Recover the serialization lock so
+            // one failed assertion cannot fabricate a cascade of unrelated
+            // profile failures in the required serial suite.
+            let lock = TEST_PROFILE_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let previous_profile = std::env::var("DEVMANAGER_PROFILE").ok();
             if let Some(profile) = profile.as_ref() {
                 std::env::set_var("DEVMANAGER_PROFILE", profile);

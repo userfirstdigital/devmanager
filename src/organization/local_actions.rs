@@ -83,6 +83,10 @@ impl LocalActionBridge {
         context: &AuthenticatedActionContext,
         request: &LocalActionRequest,
     ) -> Result<LocalActionReceipt, OrgError> {
+        // Reject foreign task/workspace authority before attempting to encode
+        // any provider-owned request fields. An unresolved external workspace
+        // must be an authority mismatch, not a serialization side channel.
+        authorize_scope(context, request)?;
         let digest = request_digest(request)?;
         if let Some((existing_digest, receipt)) = self.receipts.get(&request.operation_id) {
             if existing_digest != &digest {
@@ -116,16 +120,7 @@ fn authorize(
     context: &AuthenticatedActionContext,
     request: &LocalActionRequest,
 ) -> Result<(), OrgError> {
-    if context.tenant_id.is_empty() || request.tenant_id != context.tenant_id {
-        return Err(OrgError::CrossTenant);
-    }
-    if request.host_id != context.host_id
-        || request.task_id != context.task_id
-        || request.project_id != context.project_id
-        || request.workspace != context.workspace
-    {
-        return Err(OrgError::FingerprintMismatch);
-    }
+    authorize_scope(context, request)?;
     if !context
         .capabilities
         .contains(Capability::OrganizationProjection)
@@ -151,6 +146,23 @@ fn authorize(
             .all(|byte| byte.is_ascii_hexdigit())
     {
         return Err(OrgError::ProhibitedField);
+    }
+    Ok(())
+}
+
+fn authorize_scope(
+    context: &AuthenticatedActionContext,
+    request: &LocalActionRequest,
+) -> Result<(), OrgError> {
+    if context.tenant_id.is_empty() || request.tenant_id != context.tenant_id {
+        return Err(OrgError::CrossTenant);
+    }
+    if request.host_id != context.host_id
+        || request.task_id != context.task_id
+        || request.project_id != context.project_id
+        || request.workspace != context.workspace
+    {
+        return Err(OrgError::FingerprintMismatch);
     }
     Ok(())
 }
