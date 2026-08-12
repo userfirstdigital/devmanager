@@ -666,7 +666,7 @@ impl AtomicInstallerBundle {
             artifact_hash,
             signature_verified_by_packager: true,
         };
-        assert_atomic_installer_bundle(&bundle)?;
+        assert_atomic_installer_bundle(&bundle).map_err(|error| error.to_string())?;
         Ok(bundle)
     }
 }
@@ -676,8 +676,10 @@ pub enum AtomicBundleError {
     SignatureNotVerifiedByPackager,
     MissingClientExe,
     MissingHostExe,
-    HostClientBuildMismatch { client_build: String, host_build: String },
-    ProtocolMismatch { client: String, detail: String },
+    HostClientBuildMismatch {
+        client_build: String,
+        host_build: String,
+    },
 }
 
 impl std::fmt::Display for AtomicBundleError {
@@ -696,9 +698,6 @@ impl std::fmt::Display for AtomicBundleError {
                 f,
                 "installer bundle host/client mismatch: {client_build} vs {host_build}"
             ),
-            Self::ProtocolMismatch { client, detail } => {
-                write!(f, "installer bundle protocol mismatch for {client}: {detail}")
-            }
         }
     }
 }
@@ -765,16 +764,28 @@ impl std::fmt::Display for PreservationError {
                 write!(f, "device/pairing identity fingerprint must be unchanged")
             }
             Self::SessionOrLegacyImportForbidden => {
-                write!(f, "session.json and legacy conversations must not be imported")
+                write!(
+                    f,
+                    "session.json and legacy conversations must not be imported"
+                )
             }
             Self::TaskDbRequiredForNewToNew => {
-                write!(f, "new-to-new updates must preserve the task/prompt database hash")
+                write!(
+                    f,
+                    "new-to-new updates must preserve the task/prompt database hash"
+                )
             }
             Self::TaskDbMustBeEmptyForOldToNew => {
-                write!(f, "old-to-new cutover must start with an empty task/prompt database")
+                write!(
+                    f,
+                    "old-to-new cutover must start with an empty task/prompt database"
+                )
             }
             Self::OldBinariesNotUsableOnFailure => {
-                write!(f, "migration failure must leave old binaries and database usable")
+                write!(
+                    f,
+                    "migration failure must leave old binaries and database usable"
+                )
             }
         }
     }
@@ -785,8 +796,7 @@ impl std::error::Error for PreservationError {}
 pub fn validate_preservation_checkpoint(
     checkpoint: &PreservationCheckpoint,
 ) -> Result<(), PreservationError> {
-    if checkpoint.report.session_json_considered
-        || checkpoint.report.legacy_conversations_imported
+    if checkpoint.report.session_json_considered || checkpoint.report.legacy_conversations_imported
     {
         return Err(PreservationError::SessionOrLegacyImportForbidden);
     }
@@ -927,8 +937,7 @@ impl HostUpdateHandoff {
         now: SystemTime,
         allow_explicit_confirm_with_active: bool,
     ) -> Result<UpdateHandoffToken, UpdateHandoffError> {
-        let (inspection, _decision) =
-            self.inspect_with_probe(probe, client_build, host_build)?;
+        let (inspection, _decision) = self.inspect_with_probe(probe, client_build, host_build)?;
         let token = self.prepare_update(
             &inspection,
             target_version,

@@ -27,4 +27,7 @@ pub use shutdown::{
     HostCleanupProgress, HostCleanupSuccessSettlement, HostCleanupWorker, HostRestartDisposition,
     ProcessEmptyTeardown, ProcessEmptyTeardownWorker,
 };
-pub use update::{HostUpdateAdmission, HostUpdateHandoff};
+pub use update::{
+    update_inspection_from_host_quit, CommandBusActiveResourceProbe, HostConnectionUpdateProbe,
+    HostQuitInspectionSource, HostUpdateAdmission, HostUpdateHandoff,
+};

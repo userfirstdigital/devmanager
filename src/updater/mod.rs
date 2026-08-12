@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{
     atomic::{AtomicBool, Ordering as AtomicOrdering},
-    Arc, RwLock,
+    Arc, Mutex, RwLock,
 };
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -19,10 +19,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub mod handoff;
 
 pub use handoff::{
-    classify_user_state_path, extract_build_version, update_state_policy, ActiveUpdateResource,
-    HandoffBlockReason, IdentityPreservationReport, IgnoredUserStateKind, PreservedUserStateKind,
-    SilentReplacementDecision, UpdateHandoffError, UpdateHandoffMachine, UpdateHandoffPhase,
-    UpdateHandoffToken, UpdateResourceInspection, UserStateClassification,
+    assert_atomic_installer_bundle, classify_user_state_path, extract_build_version,
+    update_state_policy, validate_preservation_checkpoint, ActiveResourceProbe,
+    ActiveUpdateResource, AtomicBundleError, AtomicInstallerBundle, FixedActiveResourceProbe,
+    HandoffBlockReason, HostUpdateAdmission, HostUpdateHandoff, IdentityPreservationReport,
+    IgnoredUserStateKind, PreservationCheckpoint, PreservationError, PreservedUserStateKind,
+    SilentReplacementDecision, UpdateCutoverKind, UpdateHandoffError, UpdateHandoffMachine,
+    UpdateHandoffPhase, UpdateHandoffToken, UpdateResourceInspection, UserStateClassification,
 };
 
 const UPDATE_ENDPOINTS_VAR: &str = "DEVMANAGER_UPDATE_ENDPOINTS";
@@ -164,10 +167,13 @@ pub enum PackageVersionSource {
     EmbeddedPackageMetadata,
 }
 
-/// Why a remote candidate must not be admitted.
+/// Why a remote candidate must not be admitted for download.
+///
+/// Manifest field checks are a prefilter only. Cryptographic signature validity
+/// is established solely by `cargo_packager_updater` during download verification.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpdateRejection {
-    CorruptSignature {
+    MalformedManifestField {
         detail: String,
     },
     Downgrade {
@@ -190,12 +196,15 @@ pub enum UpdateRejection {
     StaleCachedMetadata {
         detail: String,
     },
+    SignatureNotVerifiedByPackager,
 }
 
 impl std::fmt::Display for UpdateRejection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::CorruptSignature { detail } => write!(f, "corrupt update signature: {detail}"),
+            Self::MalformedManifestField { detail } => {
+                write!(f, "malformed update manifest field: {detail}")
+            }
             Self::Downgrade { current, remote } => {
                 write!(f, "refusing downgrade from {current} to {remote}")
             }
@@ -218,6 +227,10 @@ impl std::fmt::Display for UpdateRejection {
             Self::StaleCachedMetadata { detail } => {
                 write!(f, "stale cached update metadata: {detail}")
             }
+            Self::SignatureNotVerifiedByPackager => write!(
+                f,
+                "update signature was not verified by cargo_packager_updater"
+            ),
         }
     }
 }
@@ -283,16 +296,28 @@ pub struct UpdaterService {
     inner: Arc<UpdaterInner>,
 }
 
+/// Options for [`UpdaterService::install_update_with_options`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct InstallUpdateOptions {
+    /// When true, active resources may proceed after explicit confirm/drain.
+    /// When false, active resources refuse silent replacement.
+    pub allow_explicit_confirm_with_active: bool,
+}
+
 struct UpdaterInner {
     current_version: Version,
     config: Option<PackagerUpdaterConfig>,
     background_checks_started: AtomicBool,
     state: RwLock<UpdaterState>,
+    handoff: Mutex<HostUpdateHandoff>,
+    resource_probe: Mutex<Option<Box<dyn ActiveResourceProbe>>>,
 }
 
 struct DownloadedUpdate {
     update: PackagerUpdate,
     bytes: Vec<u8>,
+    /// Set only after `cargo_packager_updater` download+verify succeeds.
+    package_identity: AtomicInstallerBundle,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -399,8 +424,44 @@ impl UpdaterService {
                     pending_update: None,
                     ready_update: None,
                 }),
+                handoff: Mutex::new(HostUpdateHandoff::default()),
+                resource_probe: Mutex::new(None),
             }),
         }
+    }
+
+    /// Inject the live active-resource probe (typically CommandBus InspectHostQuit).
+    pub fn set_active_resource_probe(&self, probe: Box<dyn ActiveResourceProbe>) {
+        if let Ok(mut slot) = self.inner.resource_probe.lock() {
+            *slot = Some(probe);
+        }
+    }
+
+    pub fn clear_active_resource_probe(&self) {
+        if let Ok(mut slot) = self.inner.resource_probe.lock() {
+            *slot = None;
+        }
+    }
+
+    pub fn handoff_admission(&self) -> HostUpdateAdmission {
+        self.inner
+            .handoff
+            .lock()
+            .map(|handoff| handoff.admission())
+            .unwrap_or(HostUpdateAdmission::Ready)
+    }
+
+    /// Abort a prepared handoff before the irreversible installer launch.
+    pub fn abort_update_handoff(&self) -> Result<(), String> {
+        let mut handoff = self
+            .inner
+            .handoff
+            .lock()
+            .map_err(|_| "Update handoff lock is unavailable.".to_string())?;
+        handoff
+            .abort_pre_install()
+            .map(|_| ())
+            .map_err(|error| error.to_string())
     }
 
     pub fn snapshot(&self) -> UpdaterSnapshot {
@@ -493,10 +554,111 @@ impl UpdaterService {
     }
 
     pub fn install_update(&self) -> Result<String, String> {
-        let ready_update = self.inner.prepare_install()?;
-        let version = ready_update.update.version.clone();
+        self.install_update_with_options(InstallUpdateOptions::default())
+    }
+
+    /// Install only after bounded handoff + packager-verified signature + atomic bundle checks.
+    ///
+    /// There is no direct `PackagerUpdate::install` bypass from this service.
+    pub fn install_update_with_options(
+        &self,
+        options: InstallUpdateOptions,
+    ) -> Result<String, String> {
+        let ready_meta = {
+            let state = self
+                .inner
+                .state
+                .read()
+                .map_err(|_| "Updater state is unavailable.".to_string())?;
+            let ready = state
+                .ready_update
+                .as_ref()
+                .ok_or_else(|| "No downloaded update is ready to install.".to_string())?;
+            if !ready.package_identity.signature_verified_by_packager {
+                return Err(UpdateRejection::SignatureNotVerifiedByPackager.to_string());
+            }
+            assert_atomic_installer_bundle(&ready.package_identity)
+                .map_err(|error| error.to_string())?;
+            (
+                ready.update.version.clone(),
+                ready.package_identity.client_build.clone(),
+                ready.package_identity.host_build.clone(),
+            )
+        };
+
+        let (version, client_build, host_build) = ready_meta;
+        let now = SystemTime::now();
+
+        let token = {
+            let mut probe_slot = self
+                .inner
+                .resource_probe
+                .lock()
+                .map_err(|_| "Update resource probe lock is unavailable.".to_string())?;
+            let probe = probe_slot.as_mut().ok_or_else(|| {
+                "Active resource probe is required before install; inject InspectHostQuit via set_active_resource_probe."
+                    .to_string()
+            })?;
+            let mut handoff = self
+                .inner
+                .handoff
+                .lock()
+                .map_err(|_| "Update handoff lock is unavailable.".to_string())?;
+            match handoff.run_pre_install_gate(
+                probe.as_mut(),
+                &version,
+                &client_build,
+                &host_build,
+                now,
+                options.allow_explicit_confirm_with_active,
+            ) {
+                Ok(token) => token,
+                Err(error) => {
+                    let _ = handoff.abort_pre_install();
+                    return Err(error.to_string());
+                }
+            }
+        };
+
+        // Handoff drained and still abortable until begin_atomic_install.
+        let ready_update = match self.inner.prepare_install() {
+            Ok(ready) => ready,
+            Err(error) => {
+                let _ = self.abort_update_handoff();
+                return Err(error);
+            }
+        };
+        if !ready_update.package_identity.signature_verified_by_packager {
+            let _ = self.abort_update_handoff();
+            self.inner
+                .set_error(UpdateRejection::SignatureNotVerifiedByPackager.to_string());
+            return Err(UpdateRejection::SignatureNotVerifiedByPackager.to_string());
+        }
+        if let Err(error) = assert_atomic_installer_bundle(&ready_update.package_identity) {
+            let _ = self.abort_update_handoff();
+            self.inner.set_error(error.to_string());
+            return Err(error.to_string());
+        }
+
+        {
+            let mut handoff = self
+                .inner
+                .handoff
+                .lock()
+                .map_err(|_| "Update handoff lock is unavailable.".to_string())?;
+            handoff
+                .begin_atomic_install(token.token_id, now)
+                .map_err(|error| error.to_string())?;
+        }
+
         match ready_update.update.install(ready_update.bytes) {
-            Ok(()) => Ok(version),
+            Ok(()) => {
+                if let Ok(mut handoff) = self.inner.handoff.lock() {
+                    let _ = handoff.complete_matching_host_start(token.token_id, SystemTime::now());
+                    let _ = handoff.finish_resync(token.token_id, SystemTime::now());
+                }
+                Ok(version)
+            }
             Err(error) => {
                 self.inner
                     .set_error(format!("Failed to hand off installer: {error}"));
@@ -687,8 +849,27 @@ impl UpdaterInner {
 
     fn set_ready_to_install(&self, update: PackagerUpdate, bytes: Vec<u8>) {
         if let Ok(mut state) = self.state.write() {
+            let package_identity = match AtomicInstallerBundle::for_verified_packager_update(
+                &update.version,
+                crate::protocol::PROTOCOL_MAJOR,
+                crate::protocol::PROTOCOL_MINOR,
+                None,
+            ) {
+                Ok(identity) => identity,
+                Err(error) => {
+                    drop(state);
+                    self.set_error(format!(
+                        "Downloaded update failed atomic package identity checks: {error}"
+                    ));
+                    return;
+                }
+            };
             state.pending_update = None;
-            state.ready_update = Some(DownloadedUpdate { update, bytes });
+            state.ready_update = Some(DownloadedUpdate {
+                update,
+                bytes,
+                package_identity,
+            });
             restore_ready_snapshot_locked(&mut state, None);
         }
     }
@@ -887,9 +1068,9 @@ pub fn evaluate_release_candidate(
                 platform: platform.to_string(),
             })?;
 
-    validate_release_signature(&platform_entry.signature)?;
+    validate_manifest_signature_field(&platform_entry.signature)?;
     if let Some(hash) = platform_entry.hash.as_deref() {
-        validate_artifact_hash(hash)?;
+        validate_manifest_artifact_hash_field(hash)?;
     }
 
     let client_build = platform_entry
@@ -951,57 +1132,52 @@ pub fn prefer_signed_manifest_over_stale_cache(
     })
 }
 
-pub fn validate_release_signature(signature: &str) -> Result<(), UpdateRejection> {
+/// Prefilter only: missing/malformed signature *field* shape.
+///
+/// This is not cryptographic verification. Packager download verification is
+/// authoritative for signature success.
+pub fn validate_manifest_signature_field(signature: &str) -> Result<(), UpdateRejection> {
     let trimmed = signature.trim();
     if trimmed.is_empty() {
-        return Err(UpdateRejection::CorruptSignature {
-            detail: "signature is empty".into(),
-        });
-    }
-    if trimmed.eq_ignore_ascii_case("corrupt")
-        || trimmed.eq_ignore_ascii_case("invalid")
-        || trimmed.contains("corrupt")
-        || trimmed.contains("placeholder-invalid")
-    {
-        return Err(UpdateRejection::CorruptSignature {
-            detail: format!("signature marker rejected: {trimmed}"),
+        return Err(UpdateRejection::MalformedManifestField {
+            detail: "signature field is empty".into(),
         });
     }
     if trimmed.len() < 16 {
-        return Err(UpdateRejection::CorruptSignature {
-            detail: "signature is too short to be a signed release payload".into(),
+        return Err(UpdateRejection::MalformedManifestField {
+            detail: "signature field is too short to be a packager .sig payload".into(),
         });
     }
     if !trimmed.bytes().all(|byte| {
         byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=' | b'-' | b'_')
     }) {
-        return Err(UpdateRejection::CorruptSignature {
-            detail: "signature contains invalid characters".into(),
+        return Err(UpdateRejection::MalformedManifestField {
+            detail: "signature field contains invalid characters".into(),
         });
     }
     Ok(())
 }
 
-pub fn validate_artifact_hash(hash: &str) -> Result<(), UpdateRejection> {
+pub fn validate_manifest_artifact_hash_field(hash: &str) -> Result<(), UpdateRejection> {
     let trimmed = hash.trim();
     let Some(hex) = trimmed.strip_prefix("sha256:") else {
-        return Err(UpdateRejection::CorruptSignature {
+        return Err(UpdateRejection::MalformedManifestField {
             detail: format!("artifact hash must use sha256: prefix, got `{trimmed}`"),
         });
     };
     if hex.len() != 64 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(UpdateRejection::CorruptSignature {
+        return Err(UpdateRejection::MalformedManifestField {
             detail: "artifact sha256 digest must be 64 hex characters".into(),
         });
     }
     Ok(())
 }
 
-fn check_update_with_policy(
-    current_version: Version,
+/// Apply cache-busting query + headers to the packager updater config used for HTTP checks.
+pub fn apply_cache_busting_to_packager_config(
     mut config: PackagerUpdaterConfig,
     policy: &CacheBustingRequestPolicy,
-) -> Result<Option<PackagerUpdate>, String> {
+) -> Result<PackagerUpdaterConfig, String> {
     let busted_endpoints = config
         .endpoints
         .iter()
@@ -1013,6 +1189,15 @@ fn check_update_with_policy(
         })
         .collect::<Result<Vec<_>, _>>()?;
     config.endpoints = busted_endpoints;
+    Ok(config)
+}
+
+fn check_update_with_policy(
+    current_version: Version,
+    config: PackagerUpdaterConfig,
+    policy: &CacheBustingRequestPolicy,
+) -> Result<Option<PackagerUpdate>, String> {
+    let config = apply_cache_busting_to_packager_config(config, policy)?;
 
     let mut builder = UpdaterBuilder::new(current_version, config);
     for (key, value) in policy.header_pairs() {
@@ -1292,6 +1477,8 @@ mod tests {
                 pending_update: None,
                 ready_update: None,
             }),
+            handoff: Mutex::new(HostUpdateHandoff::default()),
+            resource_probe: Mutex::new(None),
         }
     }
 

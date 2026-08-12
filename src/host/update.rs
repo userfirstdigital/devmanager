@@ -180,11 +180,7 @@ mod tests {
         let mut probe = HostConnectionUpdateProbe::new(&mut source, Uuid::now_v7());
         let mut handoff = HostUpdateHandoff::default();
         let (inspection, decision) = handoff
-            .inspect_with_probe(
-                &mut probe,
-                "devmanager/0.4.2",
-                "devmanager-host/0.4.2",
-            )
+            .inspect_with_probe(&mut probe, "devmanager/0.4.2", "devmanager-host/0.4.2")
             .expect("probe");
         assert!(inspection.active.is_empty());
         assert_eq!(decision, SilentReplacementDecision::Allowed);
