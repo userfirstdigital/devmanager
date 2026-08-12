@@ -3384,7 +3384,12 @@ mod tests {
                     "DPAPI envelope must live under app_config_dir"
                 );
                 let bytes = std::fs::read(&blob).expect("read envelope");
-                assert!(!bytes.windows(32).any(|window| window == first.as_bytes()));
+                assert!(
+                    !bytes
+                        .windows(NOISE_STATIC_KEY_BYTES)
+                        .any(|window| window == again.custody.private().as_bytes()),
+                    "DPAPI envelope must not contain the private custody key"
+                );
             }
             Err(ConnectProductionError::Custody(OsNoiseCustodyError::UnsupportedPlatform)) => {}
             Err(err) => panic!("unexpected production open error: {err:?}"),
