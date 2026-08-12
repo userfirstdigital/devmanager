@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "hostId": "host-stable-001",
+  "pairingCode": "PAIR-KEEP-ME",
+  "devices": [
+    {
+      "deviceId": "device-phone-001",
+      "displayName": "Phone",
+      "publicKey": "device-public-key-stable"
+    }
+  ],
+  "relay": {
+    "enabled": false
+  }
+}

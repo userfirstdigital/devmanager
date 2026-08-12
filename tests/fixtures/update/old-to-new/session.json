@@ -1,0 +1,7 @@
+{
+  "openTabs": ["legacy-session-a", "legacy-session-b"],
+  "activeSessionId": "legacy-session-a",
+  "providerConversations": {
+    "legacy-session-a": "conv-should-not-import"
+  }
+}

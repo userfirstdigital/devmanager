@@ -1,0 +1,14 @@
+{
+  "cutover": "old-to-new",
+  "installedVersion": "0.4.1",
+  "candidateVersion": "0.4.2",
+  "expectEmptyTaskPromptDatabase": true,
+  "preserve": ["config.json", "remote.json"],
+  "ignore": ["session.json"],
+  "importLegacyConversations": false,
+  "hashes": {
+    "configSha256": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+    "remoteSha256": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+    "devicePairingFingerprint": "pairing:host-stable-001:PAIR-KEEP-ME:device-phone-001"
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "endpoint": "https://github.com/example/devmanager/releases/latest/download/latest.json",
+  "redirect_chain": [
+    "https://github.com/example/devmanager/releases/latest/download/latest.json",
+    "https://github.com/example/devmanager/releases/download/v0.4.2/latest.json"
+  ],
+  "required_request_headers": {
+    "Cache-Control": "no-cache, no-store, must-revalidate",
+    "Pragma": "no-cache",
+    "X-DevManager-Update-Check": "1"
+  },
+  "cache_bust_query_param": "devmanager_cb"
+}

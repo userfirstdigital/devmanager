@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "hostId": "host-stable-001",
+  "pairingCode": "PAIR-KEEP-ME",
+  "devices": [
+    {
+      "deviceId": "device-phone-001",
+      "displayName": "Phone",
+      "publicKey": "device-public-key-stable"
+    }
+  ],
+  "taskInvitations": [
+    {
+      "id": "invite-unexpired",
+      "expiresAt": "2099-01-01T00:00:00Z"
+    }
+  ]
+}

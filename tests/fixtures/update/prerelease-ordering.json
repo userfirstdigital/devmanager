@@ -1,0 +1,34 @@
+{
+  "cases": [
+    {
+      "current": "0.4.1",
+      "remote": "0.4.2",
+      "newer": true
+    },
+    {
+      "current": "0.4.2",
+      "remote": "0.4.2-beta.1",
+      "newer": false
+    },
+    {
+      "current": "0.4.2-beta.1",
+      "remote": "0.4.2",
+      "newer": true
+    },
+    {
+      "current": "0.4.2+build.1",
+      "remote": "0.4.2+build.2",
+      "newer": false
+    },
+    {
+      "current": "0.4.1+local",
+      "remote": "0.4.2+ci",
+      "newer": true
+    },
+    {
+      "current": "v0.4.1",
+      "remote": "v0.4.2",
+      "newer": true
+    }
+  ]
+}
