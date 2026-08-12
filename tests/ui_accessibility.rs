@@ -541,3 +541,45 @@ fn error_label_redaction_normalizes_key_separators_without_redacting_unrelated_p
     }
     assert!(rendered.contains("The AccessKeyId field is documented here."));
 }
+
+#[test]
+fn composer_controls_expose_names_roles_disabled_reasons_and_input_identity() {
+    use devmanager::domain::{AgentSessionId, TaskId};
+    use devmanager::ui::task_cockpit::composer::{
+        ComposerControl, ComposerDraftProjection, ComposerFence, ComposerHostProjection,
+        TaskComposer, EXPECTED_ACTION_SEND_NOW,
+    };
+
+    let composer = TaskComposer::bind(ComposerHostProjection {
+        fence: ComposerFence {
+            task_id: TaskId::new(),
+            agent_session_id: AgentSessionId::new(),
+            runtime_generation: 1,
+            action_epoch: 1,
+            turn_id: None,
+        },
+        draft: ComposerDraftProjection {
+            text: String::new(),
+            attachments: Vec::new(),
+            prompt: None,
+        },
+        owned_artifacts: Vec::new(),
+        question: None,
+        approval: None,
+        disabled_reasons: Vec::new(),
+    })
+    .expect("composer");
+
+    let send = composer
+        .control_accessibility(ComposerControl::SendNow)
+        .expect("bounded accessibility");
+    assert_eq!(send.role, AccessibleRole::Button);
+    assert_eq!(send.name, "Send Now");
+    assert!(send.disabled);
+    assert!(send.description.contains(EXPECTED_ACTION_SEND_NOW));
+    assert!(!send.description.contains('\\'));
+
+    let input = composer.input_accessibility();
+    assert_eq!(input.role, AccessibleRole::TextField);
+    assert_eq!(input.name, "Prompt");
+}
