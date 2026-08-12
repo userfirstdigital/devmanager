@@ -17,6 +17,7 @@ use sha2::{Digest, Sha256};
 use crate::domain::agent::{
     AgentRole, AgentSessionFacts, AgentSessionLifecycle, ProviderSessionId,
 };
+use crate::domain::agent_resource::AgentResourceBinding;
 use crate::domain::artifact::{ArtifactFacts, ArtifactKind, PrivacyClass};
 use crate::domain::command::{
     decide, Command, CommandEnvelope, CommandReceipt, ConfirmHostQuitIntent, RejectionCode,
@@ -323,6 +324,16 @@ impl CommandBus {
         let snapshot = load_task_snapshot(&tx, task_id)?;
         tx.commit()?;
         Ok(snapshot)
+    }
+
+    /// Claim the exact durable provider resource identity for a later stock
+    /// provider launch. The store performs the join; callers cannot replace
+    /// the provider session identity or substitute a PTY-derived resource.
+    pub fn claim_agent_resource(
+        &self,
+        requested: AgentResourceBinding,
+    ) -> Result<AgentResourceBinding, StoreError> {
+        self.store.claim_agent_resource(requested)
     }
 
     /// Load the durable task and reconstruct its host-owned workspace before

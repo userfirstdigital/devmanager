@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod agent_resource;
 pub mod artifact;
 pub mod browser;
 pub(crate) mod canonical;
@@ -21,18 +22,20 @@ pub use agent::{
     AgentRole, AgentSessionFacts, AgentSessionLifecycle, AgentValidationError, ProviderSessionId,
     ProviderSessionIdError, SpecialistPermission, MAX_PROVIDER_SESSION_ID_BYTES,
 };
+pub use agent_resource::{AgentResourceBinding, AgentResourceBindingError};
 pub use artifact::{
     ArtifactContentRef, ArtifactFacts, ArtifactKind, ArtifactSummary, ArtifactValidationError,
     PrivacyClass, SpecialistResult, SpecialistStatus, MAX_SPECIALIST_ID_REFS,
     MAX_SPECIALIST_RAW_ARTIFACT_BYTES, MAX_SPECIALIST_TEXT_BYTES,
 };
 pub use cockpit::{
-    cockpit_surface, git_projection, relative_path_is_safe, workspace_projection,
-    TaskCockpitDeniedReason, TaskCockpitQuery, TaskCockpitResult, TaskCockpitSurface,
-    TaskCockpitUnavailableReason, TaskFileEntry, TaskFilesListProjection, TaskFilesReadProjection,
-    TaskGitMutateIntent, TaskGitProjection, TaskServiceProjection, TaskServiceRuntimeState,
-    TaskServiceScope, TaskServiceSnapshot, TaskSshEndpoint, TaskSshProjection, TaskWorkspaceKind,
-    TaskWorkspaceProjection, MAX_COCKPIT_FILE_LIST, MAX_COCKPIT_READ_BYTES,
+    cockpit_surface, git_projection, relative_path_is_safe, task_agent_resource_projection,
+    workspace_projection, TaskAgentResourceProjection, TaskCockpitDeniedReason, TaskCockpitQuery,
+    TaskCockpitResult, TaskCockpitSurface, TaskCockpitUnavailableReason, TaskFileEntry,
+    TaskFilesListProjection, TaskFilesReadProjection, TaskGitMutateIntent, TaskGitProjection,
+    TaskServiceProjection, TaskServiceRuntimeState, TaskServiceScope, TaskServiceSnapshot,
+    TaskSshEndpoint, TaskSshProjection, TaskWorkspaceKind, TaskWorkspaceProjection,
+    MAX_COCKPIT_FILE_LIST, MAX_COCKPIT_READ_BYTES,
 };
 pub use codec::{
     decode_orchestration_msgpack, encode_orchestration_msgpack, preflight_msgpack,

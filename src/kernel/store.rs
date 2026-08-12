@@ -5,6 +5,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior};
 use sha2::{Digest, Sha256};
 
+use crate::domain::agent_resource::AgentResourceBinding;
 use crate::domain::command::{CommandEnvelope, CommandReceipt};
 use crate::domain::event::{
     AgentSessionRegisteredPayload, ArtifactRegisteredPayload, DomainEvent, Event,
@@ -199,6 +200,36 @@ impl KernelStore {
         let status = command_bus::operation_status_in_tx(&tx, operation_id)?;
         tx.commit()?;
         Ok(status)
+    }
+
+    /// Validate and claim one exact task-owned provider terminal identity.
+    ///
+    /// The caller must provide the durable `ResourceId` admitted for the
+    /// provider tab. This method joins that resource with the durable agent
+    /// projection and checks task, provider, lifecycle, and generation in one
+    /// read transaction. It never searches by generation or PTY identity and
+    /// never accepts a caller-supplied provider session ID; that ID remains
+    /// solely the value captured in `AgentSessionFacts` by the correlated
+    /// current-generation hook path.
+    pub fn claim_agent_resource(
+        &self,
+        requested: AgentResourceBinding,
+    ) -> Result<AgentResourceBinding, StoreError> {
+        let conn = self.open_query_connection()?;
+        let tx = conn.unchecked_transaction()?;
+        let Some(agent) = command_bus::load_agent_session(&tx, requested.agent_session_id)? else {
+            return Err(StoreError::StaleFence);
+        };
+        let Some(resource) = command_bus::load_resource(&tx, requested.resource_id)? else {
+            return Err(StoreError::StaleFence);
+        };
+        let actual = AgentResourceBinding::from_facts(&agent, &resource)
+            .map_err(|_| StoreError::StaleFence)?;
+        if !actual.matches(requested) {
+            return Err(StoreError::StaleFence);
+        }
+        tx.commit()?;
+        Ok(actual)
     }
 
     /// Load durable recipes that require process-aware reconciliation.
@@ -3566,15 +3597,25 @@ fn build_present_reconciliation_outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::agent::{
+        AgentRole, AgentSessionFacts, AgentSessionLifecycle, ProviderSessionId,
+    };
+    use crate::domain::agent_resource::AgentResourceBinding;
     use crate::domain::command::{Command, CreateTaskIntent};
-    use crate::domain::id::{ClientId, CommandId, EnvironmentId, ProjectId, TaskId};
+    use crate::domain::id::{
+        AgentSessionId, ClientId, CommandId, EnvironmentId, ProjectId, ResourceId, TaskId,
+    };
     use crate::domain::operation::{CancellationReason, OperationErrorCode};
+    use crate::domain::resource::{
+        OwnerKind, ResourceFacts, ResourceKind, ResourceLifecycle, ResourceRecipe,
+    };
     use crate::domain::task::{
         ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity,
         WorkspaceRef,
     };
     use crate::kernel::maintenance::OutboxPayloadCleanup;
     use crate::kernel::WalCheckpointOutcome;
+    use crate::providers::ProviderKind;
     use rusqlite::ffi::Error as FfiError;
     use tempfile::TempDir;
 
@@ -3677,6 +3718,71 @@ mod tests {
             panic!("pending close must be accepted: {receipt:?}");
         };
         operation_id
+    }
+
+    #[test]
+    fn claim_agent_resource_requires_exact_durable_identity_and_generation() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("kernel.sqlite3");
+        let mut store = KernelStore::open(&path).expect("open");
+        let task_id = seed_open_task(&mut store);
+        let agent_session_id = AgentSessionId::new();
+        let resource_id = ResourceId::new();
+        let agent = AgentSessionFacts {
+            id: agent_session_id,
+            task_id,
+            role: AgentRole::Primary,
+            provider_kind: ProviderKind::Codex,
+            provider_session_id: Some(ProviderSessionId::new("hook-session").expect("session")),
+            lifecycle: AgentSessionLifecycle::Open,
+            runtime_generation: 7,
+            revision: 0,
+        };
+        store
+            .execute(maintenance_envelope(
+                CommandId::new(),
+                Some(task_id),
+                Some(1),
+                Command::RegisterAgentSession { agent },
+            ))
+            .expect("register agent");
+        let resource = ResourceFacts {
+            id: resource_id,
+            task_id: Some(task_id),
+            owner_kind: OwnerKind::Task,
+            resource_kind: ResourceKind::Terminal,
+            recipe: ResourceRecipe::Terminal {
+                cols: 120,
+                rows: 40,
+            },
+            lifecycle: ResourceLifecycle::Active,
+            runtime_generation: 7,
+            updated_at_ms: 1,
+        };
+        store
+            .execute(maintenance_envelope(
+                CommandId::new(),
+                Some(task_id),
+                Some(2),
+                Command::RegisterResource { resource },
+            ))
+            .expect("register resource");
+
+        let claim = AgentResourceBinding {
+            task_id,
+            agent_session_id,
+            resource_id,
+            provider_kind: ProviderKind::Codex,
+            runtime_generation: 7,
+        };
+        assert_eq!(store.claim_agent_resource(claim).expect("claim"), claim);
+        assert_eq!(
+            store.claim_agent_resource(AgentResourceBinding {
+                runtime_generation: 8,
+                ..claim
+            }),
+            Err(StoreError::StaleFence)
+        );
     }
 
     #[test]

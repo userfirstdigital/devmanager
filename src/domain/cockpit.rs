@@ -6,12 +6,54 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::domain::agent_resource::AgentResourceBinding;
 use crate::domain::id::{AgentSessionId, ConfiguredServiceId, ResourceId, TaskId};
 use crate::domain::task::{WorkspaceBindingKind, WorkspaceRef};
+use crate::providers::ProviderKind;
 
 pub const MAX_COCKPIT_FILE_LIST: u16 = 64;
 pub const MAX_COCKPIT_READ_BYTES: u32 = 64 * 1024;
 pub const MAX_COCKPIT_RELATIVE_PATH_BYTES: usize = 1024;
+
+/// Safe Task Cockpit projection of one exact stock-provider resource claim.
+///
+/// This is intentionally a separate projection from terminal bytes and
+/// process identities.  A host may expose it only after the kernel has
+/// validated the exact task/agent/resource tuple for the current generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct TaskAgentResourceProjection {
+    pub task_id: TaskId,
+    pub agent_session_id: AgentSessionId,
+    pub resource_id: ResourceId,
+    pub provider_kind: ProviderKind,
+    pub runtime_generation: u64,
+}
+
+impl From<AgentResourceBinding> for TaskAgentResourceProjection {
+    fn from(binding: AgentResourceBinding) -> Self {
+        Self {
+            task_id: binding.task_id,
+            agent_session_id: binding.agent_session_id,
+            resource_id: binding.resource_id,
+            provider_kind: binding.provider_kind,
+            runtime_generation: binding.runtime_generation,
+        }
+    }
+}
+
+/// Map the kernel's exact claim into a bounded Task Cockpit projection.
+pub const fn task_agent_resource_projection(
+    binding: AgentResourceBinding,
+) -> TaskAgentResourceProjection {
+    TaskAgentResourceProjection {
+        task_id: binding.task_id,
+        agent_session_id: binding.agent_session_id,
+        resource_id: binding.resource_id,
+        provider_kind: binding.provider_kind,
+        runtime_generation: binding.runtime_generation,
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

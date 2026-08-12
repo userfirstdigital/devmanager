@@ -7,6 +7,7 @@
 
 use uuid::Uuid;
 
+use crate::domain::agent_resource::{AgentResourceBinding, AgentResourceBindingError};
 use crate::domain::cockpit::{
     cockpit_surface, relative_path_is_safe, workspace_projection, TaskCockpitDeniedReason,
     TaskCockpitQuery, TaskCockpitResult, TaskCockpitSurface, TaskCockpitUnavailableReason,
@@ -16,6 +17,7 @@ use crate::domain::cockpit::{
 };
 use crate::domain::id::{ClientId, CommandId, RequestId, TaskId};
 use crate::domain::query::{QueryError, QueryOutcome, QueryResult};
+use crate::domain::{AgentSessionFacts, ResourceFacts};
 use crate::git::command::{
     issue_git_host_binding, GitCancellation, GitConfirmation, GitError, GitRepository,
 };
@@ -56,6 +58,17 @@ pub(crate) struct TaskCockpitDispatch<'a> {
     pub coordinator: Option<&'a WorkspaceResourceCoordinator>,
     pub action_epoch: Option<u64>,
     pub runtime_generation: Option<u64>,
+}
+
+/// Host-side adapter for the exact kernel provider-resource claim.  The
+/// Task Cockpit must project the already-validated tuple; it must not derive a
+/// provider identity from terminal/process observations.
+pub(crate) fn project_agent_resource(
+    agent: &AgentSessionFacts,
+    resource: &ResourceFacts,
+) -> Result<crate::domain::TaskAgentResourceProjection, AgentResourceBindingError> {
+    AgentResourceBinding::from_facts(agent, resource)
+        .map(crate::domain::task_agent_resource_projection)
 }
 
 pub(crate) fn serve_task_cockpit(dispatch: TaskCockpitDispatch<'_>) -> QueryOutcome {
@@ -1853,5 +1866,48 @@ mod tests {
             ),
             Err(crate::workspace::worktree::WorktreeError::StaleAuthority)
         ));
+    }
+
+    #[test]
+    fn host_projection_preserves_the_exact_provider_resource_identity() {
+        use crate::domain::agent::{AgentRole, AgentSessionLifecycle, ProviderSessionId};
+        use crate::domain::resource::{
+            OwnerKind, ResourceFacts, ResourceKind, ResourceLifecycle, ResourceRecipe,
+        };
+        use crate::domain::{AgentSessionId, ResourceId, TaskId};
+        use crate::providers::ProviderKind;
+
+        let task_id = TaskId::new();
+        let agent_session_id = AgentSessionId::new();
+        let resource_id = ResourceId::new();
+        let agent = AgentSessionFacts {
+            id: agent_session_id,
+            task_id,
+            role: AgentRole::Primary,
+            provider_kind: ProviderKind::ClaudeCode,
+            provider_session_id: Some(ProviderSessionId::new("hook-session").expect("session")),
+            lifecycle: AgentSessionLifecycle::Open,
+            runtime_generation: 4,
+            revision: 0,
+        };
+        let resource = ResourceFacts {
+            id: resource_id,
+            task_id: Some(task_id),
+            owner_kind: OwnerKind::Task,
+            resource_kind: ResourceKind::Terminal,
+            recipe: ResourceRecipe::Terminal {
+                cols: 120,
+                rows: 40,
+            },
+            lifecycle: ResourceLifecycle::Active,
+            runtime_generation: 4,
+            updated_at_ms: 1,
+        };
+        let projection = project_agent_resource(&agent, &resource).expect("projection");
+        assert_eq!(projection.task_id, task_id);
+        assert_eq!(projection.agent_session_id, agent_session_id);
+        assert_eq!(projection.resource_id, resource_id);
+        assert_eq!(projection.provider_kind, ProviderKind::ClaudeCode);
+        assert_eq!(projection.runtime_generation, 4);
     }
 }
