@@ -20,8 +20,8 @@ use super::crypto::{
     ConnectNoiseIdentityBinding, ConnectNoiseStaticPublicKey, EndToEndChannel,
     CONNECT_NOISE_FIRST_PAIRING_PATTERN, CONNECT_NOISE_PINNED_DEVICE_PATTERN,
 };
-use super::envelope::ConnectLimits;
 use super::direct::{DirectAdmitError, DirectBindMode, DirectBindPolicy};
+use super::envelope::ConnectLimits;
 use super::identity::{
     bind_device_credential_from_snapshot, current_epoch_ms, generate_transition_nonce,
     rotate_pairing_until_changed, seed_pairing_code, validate_device_record, BrowserPrivateStorage,
@@ -38,6 +38,7 @@ use super::identity_codec::{
     decode_identity_bytes, device_receipt, empty_receipt, enable_receipt, encode_identity_document,
     host_rotation_receipt, pairing_receipt, scan_bounded_json, IdentityDocument,
 };
+use super::host_listener::ConnectWebPublication;
 use super::transport::{ConnectRoute, ConnectTransportError, SealedFramedConnectTransport};
 use crate::kernel::{KernelStore, StoreError};
 
@@ -517,6 +518,7 @@ pub struct ConnectProductionStartup {
     session: ConnectProductionSession,
     bind_policy: DirectBindPolicy,
     listener_bound: AtomicBool,
+    web_publication: ConnectWebPublication,
 }
 
 impl fmt::Debug for ConnectProductionStartup {
@@ -543,6 +545,7 @@ impl ConnectProductionStartup {
             session,
             bind_policy: policy,
             listener_bound: AtomicBool::new(false),
+            web_publication: ConnectWebPublication::new("/api/connect"),
         })
     }
 
@@ -552,6 +555,12 @@ impl ConnectProductionStartup {
 
     pub fn bind_policy(&self) -> &DirectBindPolicy {
         &self.bind_policy
+    }
+
+    /// Bounded, non-secret browser transport metadata. The marker is present
+    /// only after the listener bind fence and is cleared before shutdown.
+    pub fn web_publication(&self) -> &ConnectWebPublication {
+        &self.web_publication
     }
 
     pub const fn listener_kind() -> ConnectListenerKind {
@@ -564,7 +573,13 @@ impl ConnectProductionStartup {
     }
 
     pub fn mark_listener_bound(&self) {
+        self.web_publication.publish();
         self.listener_bound.store(true, Ordering::Release);
+    }
+
+    pub fn revoke_listener(&self) {
+        self.web_publication.revoke();
+        self.listener_bound.store(false, Ordering::Release);
     }
 
     pub fn require_bound_listener(&self) -> Result<(), ConnectStartupError> {
@@ -577,6 +592,14 @@ impl ConnectProductionStartup {
 
     pub fn reject_legacy_remote_web_as_connect() -> Result<(), ConnectStartupError> {
         Err(ConnectStartupError::LegacyRouteIsNotConnect)
+    }
+}
+
+impl Drop for ConnectProductionStartup {
+    fn drop(&mut self) {
+        // Revoke before releasing the production session so any cloned
+        // publication handle cannot leave a stale browser transport marker.
+        self.revoke_listener();
     }
 }
 

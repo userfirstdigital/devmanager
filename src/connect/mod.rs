@@ -10,6 +10,7 @@ mod envelope;
 mod epoch;
 mod evidence;
 mod failure;
+mod host_listener;
 mod identity;
 mod identity_codec;
 mod identity_store;
@@ -52,9 +53,8 @@ pub use dispatch::{
     advertised_connect_capabilities, bind_host_executor, bind_host_request_handle,
     bound_host_request_handle, process_connect_host_request_slot, unbind_host_request_handle,
     ConnectDispatchSession, ConnectHostRequestSlot, ConnectSessionDisposition,
-    CONNECT_ERROR_CONFLICT,
-    CONNECT_ERROR_EXECUTOR_UNATTACHED, CONNECT_ERROR_FORBIDDEN, CONNECT_ERROR_PROTOCOL,
-    CONNECT_ERROR_UNAUTHORIZED, CONNECT_HOLD_CALLBACK_FRAGMENT,
+    CONNECT_ERROR_CONFLICT, CONNECT_ERROR_EXECUTOR_UNATTACHED, CONNECT_ERROR_FORBIDDEN,
+    CONNECT_ERROR_PROTOCOL, CONNECT_ERROR_UNAUTHORIZED, CONNECT_HOLD_CALLBACK_FRAGMENT,
 };
 pub use envelope::{
     ChannelBinding, ChannelId, ChannelKind, ChunkContext, Compression, ConnectEnvelope,
@@ -74,6 +74,10 @@ pub use failure::{
     matrix_covers_direct_and_hosted, simulate_fault, ConnectActor, ConnectRouteKind,
     ConnectSurface, FailureCase, FailureClass, FailureExpectation, SimulatedFaultOutcome,
     FAILURE_MATRIX,
+};
+pub use host_listener::{
+    ConnectWebPublication, ConnectWebTransportMarker, CONNECT_WEB_MARKER_MAX_ENDPOINT_BYTES,
+    CONNECT_WEB_MARKER_MAX_JSON_BYTES, CONNECT_WEB_MARKER_TRANSPORT,
 };
 #[cfg(test)]
 pub(crate) use identity::bind_device_credential_from_snapshot as bind_device_credential;
@@ -149,11 +153,10 @@ pub use relay::{
     HostPublicId as RelayHostPublicId, OpaqueRelay, RateKey, RelayEndpoint, RelayError,
     RelayObservation, RelayStatus, RouteId, RouteTicket, SignedRouteTicket, TicketAudience,
     TicketId, TicketSigningKey, BIND_RATE_WINDOW_SECS, MAX_BIND_ATTEMPTS_PER_WINDOW,
-    MAX_RELAY_CONSUMED_NONCES, MAX_RELAY_QUEUE_BYTES, MAX_RELAY_QUEUE_FRAMES, MAX_RELAY_RATE_KEYS,
-    MAX_RELAY_REVOKED_DEVICES, MAX_RELAY_REVOKED_TICKETS, MAX_RELAY_ROUTES,
-    MAX_RELAY_ENDPOINT_BYTES,
-    MAX_ROUTE_TICKET_TTL_SECS, PRESENCE_TTL_SECS, RELAY_INITIAL_BACKOFF_MS, RELAY_MAX_BACKOFF_MS,
-    ROUTE_TICKET_DOMAIN,
+    MAX_RELAY_CONSUMED_NONCES, MAX_RELAY_ENDPOINT_BYTES, MAX_RELAY_QUEUE_BYTES,
+    MAX_RELAY_QUEUE_FRAMES, MAX_RELAY_RATE_KEYS, MAX_RELAY_REVOKED_DEVICES,
+    MAX_RELAY_REVOKED_TICKETS, MAX_RELAY_ROUTES, MAX_ROUTE_TICKET_TTL_SECS, PRESENCE_TTL_SECS,
+    RELAY_INITIAL_BACKOFF_MS, RELAY_MAX_BACKOFF_MS, ROUTE_TICKET_DOMAIN,
 };
 pub use schema::{
     canonical_schema_fixtures, catalog_entry, encode_canonical_schema, payload_catalog,
