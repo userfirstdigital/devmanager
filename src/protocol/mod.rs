@@ -49,7 +49,16 @@ pub use frame::{
     MAX_PHYSICAL_FRAME_BYTES, MAX_REASSEMBLED_MESSAGE_BYTES,
 };
 pub use org::{
-    organization_extension_type, OrganizationExtensionKind, ORGANIZATION_PROMPT_BODY_LIMIT_BYTES,
+    decode_organization_envelope, decode_organization_payload, encode_organization_envelope,
+    encode_organization_payload, organization_envelope_canonical_bytes,
+    organization_extension_type, validate_organization_envelope, validate_organization_payload,
+    OrganizationCodecError, OrganizationEnvelopeWire, OrganizationEvidenceMetadataWire,
+    OrganizationExtensionKind, OrganizationFleetWatcherWire, OrganizationLocalActionCatalogWire,
+    OrganizationLocalActionStateWire, OrganizationManagedTaskWire, OrganizationMembershipWire,
+    OrganizationPolicyWire, OrganizationPromptChainLinkWire, OrganizationPromptChainWire,
+    OrganizationPromptSnapshotWire, OrganizationPromptVersionWire, OrganizationPromptWire,
+    OrganizationTaskWatcherWire, OrganizationTelemetryIntentWire, OrganizationWirePayload,
+    MAX_ORGANIZATION_PAYLOAD_BYTES, ORGANIZATION_PROMPT_BODY_LIMIT_BYTES,
     ORGANIZATION_PROMPT_PAGE_ENCODED_LIMIT_BYTES, ORGANIZATION_PROMPT_PAGE_ITEM_LIMIT,
     ORGANIZATION_SCHEMA_VERSION,
 };

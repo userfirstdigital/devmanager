@@ -34,6 +34,8 @@ pub enum OrgError {
     AutoLaunchForbidden,
     WatcherReadOnly,
     OwnerOnly,
+    CorruptState,
+    Offline,
     Unavailable(OrgDependency),
 }
 
@@ -105,6 +107,13 @@ impl fmt::Display for OrgError {
             }
             Self::WatcherReadOnly => write!(f, "manager Watcher grants are read-only"),
             Self::OwnerOnly => write!(f, "the action is Owner-only"),
+            Self::CorruptState => {
+                write!(
+                    f,
+                    "organization state is malformed, invalid, or cross-tenant"
+                )
+            }
+            Self::Offline => write!(f, "organization projection is offline or unauthenticated"),
             Self::Unavailable(dependency) => {
                 write!(f, "organization dependency unavailable: {dependency:?}")
             }

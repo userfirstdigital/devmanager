@@ -21,6 +21,8 @@ use devmanager::host::{
     PhysicalExitArmRequest, SupervisedHostExecutor, HOST_EXIT_ALREADY_RUNNING,
 };
 use devmanager::kernel::CommandBus;
+#[cfg(windows)]
+use devmanager::org::OrganizationStateStore;
 use devmanager::protocol::{
     Capability, CapabilitySet, FrameLimits, PROTOCOL_MAJOR, PROTOCOL_MINOR,
 };
@@ -129,6 +131,7 @@ fn run(raw_args: Vec<String>) -> Result<(), HostRunError> {
         let _ = &args.instance_label;
         runtime.block_on(serve_foreground_host(
             &args.profile,
+            &paths.profile_root,
             Some(parent),
             host_boot_id,
             bus,
@@ -158,6 +161,7 @@ fn run(raw_args: Vec<String>) -> Result<(), HostRunError> {
             .map_err(|error| format!("failed to build host async runtime: {error}"))?;
         runtime.block_on(serve_foreground_host(
             PRODUCTION_HOST_PROFILE,
+            &paths.profile_root,
             None,
             host_boot_id,
             bus,
@@ -969,6 +973,7 @@ fn spawn_connection_task(
 #[cfg(windows)]
 async fn serve_foreground_host(
     profile: &str,
+    profile_root: &Path,
     parent: Option<ParentProcess>,
     host_boot_id: Uuid,
     bus: CommandBus,
@@ -988,6 +993,10 @@ async fn serve_foreground_host(
     ) = HostRequestExecutor::start_supervised_with_config_store(bus, config_store)
         .map_err(|error| format!("invalid host project configuration: {error}"))?;
 
+    let organization_hello = OrganizationStateStore::restore_hello(profile_root);
+    if let Some(diagnostic) = organization_hello.diagnostic() {
+        let _ = writeln!(io::stderr(), "devmanager-host: {diagnostic}");
+    }
     let hello_config = AcceptHelloConfig {
         host_boot_id,
         server_build: format!("devmanager-host/{}", env!("CARGO_PKG_VERSION")),
@@ -1001,10 +1010,10 @@ async fn serve_foreground_host(
                 Capability::ExplicitDetach,
                 Capability::HostShutdown,
                 Capability::ProviderInput,
-                Capability::OrganizationProjection,
                 Capability::TaskCockpit,
             ]
             .into_iter()
+            .chain(organization_hello.capability().advertised_capability())
             .chain(
                 request_handle
                     .configured_service_supervisor_ready()

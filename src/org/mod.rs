@@ -13,7 +13,10 @@ mod ids;
 mod local_actions;
 mod managed;
 mod membership;
+mod persistence;
+mod publisher;
 mod watcher;
+mod wire;
 mod workflow;
 
 pub use boundary::{
@@ -23,8 +26,9 @@ pub use boundary::{
 pub use enforcement::{OrganizationEnforcer, OrganizationGrant};
 pub use error::{OrgDependency, OrgError};
 pub use evidence::{
-    compute_bundle_hash, EvidenceAccessClass, EvidenceBundle, EvidenceIntake, EvidenceMediaRef,
-    EvidenceMetadataProjection, EvidenceSegment, TaskDraft, EVIDENCE_BUNDLE_VERSION,
+    compute_bundle_hash, compute_bundle_hash_bytes, EvidenceAccessClass, EvidenceBundle,
+    EvidenceIntake, EvidenceMediaRef, EvidenceMetadataProjection, EvidenceSegment, TaskDraft,
+    EVIDENCE_BUNDLE_VERSION,
 };
 pub use identity::{
     BoardCardId, BoardId, ExternalAccount, IdentityError, PortalAccountId, PortalDeviceId,
@@ -47,9 +51,19 @@ pub use membership::{
     EnrollmentPreview, HostMembership, LocalActionApprovalRequirement, ManagedMetadataName,
     MembershipRole, MembershipStatus, OrganizationPolicyDocument, RawSharingCeiling,
 };
+pub use persistence::{
+    OrganizationHelloRestore, OrganizationStateDocument, OrganizationStateStore,
+    OutboxDeliveryState, PersistedOutboxIntent, ORGANIZATION_STATE_FILE_NAME,
+    ORGANIZATION_STATE_SCHEMA_VERSION,
+};
+pub use publisher::{OrganizationPublisher, SignedOrganizationEnvelope};
 pub use watcher::{
     reject_forbidden_fields, reject_forbidden_label, FleetWatcherView, HostReachability,
     TaskWatcherView, WatcherProjection, ACTIVE_SESSION_RULE, FORBIDDEN_WATCHER_LABELS,
+};
+pub use wire::{
+    fleet_watcher_to_wire, managed_task_to_wire, membership_to_wire, policy_to_wire,
+    prompt_snapshot_to_wire, task_watcher_to_wire,
 };
 pub use workflow::{
     AssignmentAcceptance, BoardWorkflowEvent, ManagedWorkflowProjection, ReviewState,
@@ -62,10 +76,12 @@ use sha2::{Digest, Sha256};
 
 use crate::connect::ConnectHostId;
 use crate::domain::id::{ProjectId, TaskId};
+use crate::domain::task::{TaskAttention, TaskLifecycle};
+use crate::org::persistence::PersistedSeenFact;
 use crate::prompts::{OrganizationPromptProjection, OrganizationPromptSnapshot};
 use crate::protocol::Capability;
 
-const MAX_SEEN_FACTS: usize = 1_024;
+pub const MAX_SEEN_FACTS: usize = 1_024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OperatingMode {
@@ -85,15 +101,41 @@ impl OperatingMode {
 
     pub const fn organization_capability(&self) -> Option<Capability> {
         match self {
-            Self::AnonymousLocal => None,
-            Self::ConnectSignedIn { .. } | Self::HostEnrolled { .. } => {
+            Self::HostEnrolled { membership }
+                if matches!(membership.status, MembershipStatus::Enrolled) =>
+            {
                 Some(Capability::OrganizationProjection)
             }
+            _ => None,
         }
     }
 
     pub fn sign_in(account: ExternalAccount) -> Self {
         Self::ConnectSignedIn { account }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrganizationCapabilityState {
+    Enabled,
+    Disabled(OrganizationCapabilityDisableReason),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrganizationCapabilityDisableReason {
+    Standalone,
+    Unenrolled,
+    Revoked,
+    Expired,
+    Offline,
+}
+
+impl OrganizationCapabilityState {
+    pub const fn advertised_capability(self) -> Option<Capability> {
+        match self {
+            Self::Enabled => Some(Capability::OrganizationProjection),
+            Self::Disabled(_) => None,
+        }
     }
 }
 
@@ -136,6 +178,9 @@ pub struct OrganizationProjection {
     seen_facts: BTreeMap<String, [u8; 32]>,
     membership_revision: Option<u64>,
     membership_fact_hash: Option<[u8; 32]>,
+    authenticated_online: bool,
+    prompt_snapshot: Option<OrganizationPromptSnapshot>,
+    telemetry_outbox: BTreeMap<String, crate::org::persistence::PersistedOutboxIntent>,
 }
 
 impl Default for OperatingMode {
@@ -157,6 +202,9 @@ impl OrganizationProjection {
             seen_facts: BTreeMap::new(),
             membership_revision: None,
             membership_fact_hash: None,
+            authenticated_online: false,
+            prompt_snapshot: None,
+            telemetry_outbox: BTreeMap::new(),
         }
     }
 
@@ -221,6 +269,7 @@ impl OrganizationProjection {
         self.membership_revision = None;
         self.membership_fact_hash = None;
         self.sync_state = OrganizationSyncState::Enrolled;
+        self.authenticated_online = true;
         self.evidence.bind_tenant(membership.tenant_id.clone());
         Ok(membership)
     }
@@ -242,6 +291,9 @@ impl OrganizationProjection {
                 self.membership_revision = None;
                 self.membership_fact_hash = None;
                 self.prompts.purge();
+                self.prompt_snapshot = None;
+                self.authenticated_online = false;
+                self.telemetry_outbox.clear();
                 self.evidence = EvidenceIntake::new([]);
                 Ok(())
             }
@@ -341,12 +393,50 @@ impl OrganizationProjection {
         entitlement_expires_at_ms: i64,
     ) -> Result<SyncOutcome, OrgError> {
         let membership = self.require_enrolled()?.clone();
-        self.prompts.apply_authoritative_snapshot(
+        let stored = snapshot.clone();
+        let outcome = self.prompts.apply_authoritative_snapshot(
             &membership,
             snapshot,
             now_ms,
             entitlement_expires_at_ms,
-        )
+        )?;
+        self.prompt_snapshot = Some(stored);
+        Ok(outcome)
+    }
+
+    pub fn apply_policy_document(
+        &mut self,
+        policy: OrganizationPolicyDocument,
+    ) -> Result<SyncOutcome, OrgError> {
+        let membership = self.require_enrolled()?.clone();
+        if membership.tenant_id != policy.tenant_id {
+            return Err(OrgError::CrossTenant);
+        }
+        if policy.revision == 0 {
+            return Err(OrgError::StalePolicy);
+        }
+        if let Some(current) = self.policy() {
+            if policy.revision < current.revision {
+                return Err(OrgError::StalePolicy);
+            }
+            if policy.revision == current.revision {
+                return if current.content_hash_hex == policy.content_hash_hex && current == &policy
+                {
+                    Ok(SyncOutcome::Duplicate)
+                } else {
+                    Err(OrgError::LastWriteWinsForbidden)
+                };
+            }
+        }
+        if let OperatingMode::HostEnrolled {
+            membership: enrolled,
+        } = &mut self.mode
+        {
+            enrolled.policy_revision = policy.revision;
+            enrolled.policy_hash_hex = policy.content_hash_hex.clone();
+        }
+        self.policy = Some(policy);
+        Ok(SyncOutcome::Applied)
     }
 
     pub fn personal_scope_without_link(&self, task_id: TaskId) -> crate::domain::org::TaskScope {
@@ -431,6 +521,206 @@ impl OrganizationProjection {
     ) -> Result<&'a [EvidenceSegment], OrgError> {
         self.require_enrolled()?;
         self.evidence.raw_evidence(access, bundle)
+    }
+
+    pub fn capability_state(&self) -> OrganizationCapabilityState {
+        match self.sync_state {
+            OrganizationSyncState::Standalone => OrganizationCapabilityState::Disabled(
+                OrganizationCapabilityDisableReason::Standalone,
+            ),
+            OrganizationSyncState::SignedIn | OrganizationSyncState::Unlinked => {
+                OrganizationCapabilityState::Disabled(
+                    OrganizationCapabilityDisableReason::Unenrolled,
+                )
+            }
+            OrganizationSyncState::Revoked => {
+                OrganizationCapabilityState::Disabled(OrganizationCapabilityDisableReason::Revoked)
+            }
+            OrganizationSyncState::Expired => {
+                OrganizationCapabilityState::Disabled(OrganizationCapabilityDisableReason::Expired)
+            }
+            OrganizationSyncState::Enrolled => {
+                let Some(membership) = self.membership() else {
+                    return OrganizationCapabilityState::Disabled(
+                        OrganizationCapabilityDisableReason::Unenrolled,
+                    );
+                };
+                if membership.role.is_disabled() || !membership.is_enrolled() {
+                    return OrganizationCapabilityState::Disabled(
+                        OrganizationCapabilityDisableReason::Unenrolled,
+                    );
+                }
+                if !self.authenticated_online {
+                    OrganizationCapabilityState::Disabled(
+                        OrganizationCapabilityDisableReason::Offline,
+                    )
+                } else {
+                    OrganizationCapabilityState::Enabled
+                }
+            }
+        }
+    }
+
+    pub fn set_authenticated_online(&mut self, online: bool) {
+        self.authenticated_online = online;
+    }
+
+    pub fn authenticated_online(&self) -> bool {
+        self.authenticated_online
+    }
+
+    pub fn policy(&self) -> Option<&OrganizationPolicyDocument> {
+        self.policy.as_ref()
+    }
+
+    pub fn membership_revision(&self) -> Option<u64> {
+        self.membership_revision
+    }
+
+    pub fn membership_fact_hash_hex(&self) -> Option<String> {
+        self.membership_fact_hash.map(|hash| hex_encode32(&hash))
+    }
+
+    pub fn persisted_seen_facts(&self) -> Vec<PersistedSeenFact> {
+        self.seen_facts
+            .iter()
+            .map(|(key, hash)| PersistedSeenFact {
+                key: key.clone(),
+                hash_hex: hex_encode32(hash),
+            })
+            .collect()
+    }
+
+    pub fn persisted_links(&self) -> impl Iterator<Item = &ManagedTaskLink> {
+        self.links.iter()
+    }
+
+    pub fn prompt_snapshot(&self) -> Option<&OrganizationPromptSnapshot> {
+        self.prompt_snapshot.as_ref()
+    }
+
+    pub fn local_actions(&self) -> &LocalActionRegistry {
+        &self.local_actions
+    }
+
+    pub fn local_actions_mut(&mut self) -> &mut LocalActionRegistry {
+        &mut self.local_actions
+    }
+
+    pub fn evidence(&self) -> &EvidenceIntake {
+        &self.evidence
+    }
+
+    pub fn telemetry_outbox(
+        &self,
+    ) -> &BTreeMap<String, crate::org::persistence::PersistedOutboxIntent> {
+        &self.telemetry_outbox
+    }
+
+    pub fn queue_outbox_intent(
+        &mut self,
+        intent: crate::org::persistence::PersistedOutboxIntent,
+    ) -> Result<SyncOutcome, OrgError> {
+        crate::org::persistence::validate_outbox_intent(&intent)?;
+        if let Some(existing) = self.telemetry_outbox.get(&intent.observation_id_hex) {
+            return if existing == &intent {
+                Ok(SyncOutcome::Duplicate)
+            } else {
+                Err(OrgError::LastWriteWinsForbidden)
+            };
+        }
+        if self.telemetry_outbox.len() >= crate::org::persistence::MAX_ORGANIZATION_OUTBOX_INTENTS {
+            return Err(OrgError::BoundExceeded);
+        }
+        self.telemetry_outbox
+            .insert(intent.observation_id_hex.clone(), intent);
+        Ok(SyncOutcome::Applied)
+    }
+
+    pub fn persist_to(&self, store: &OrganizationStateStore) -> Result<(), OrgError> {
+        store.save(self)
+    }
+
+    pub fn fleet_watcher_view(
+        &self,
+        reachability: HostReachability,
+        last_activity_ms: Option<i64>,
+    ) -> Result<FleetWatcherView, OrgError> {
+        let membership = self.require_enrolled()?;
+        if membership.role.is_disabled() {
+            return Err(OrgError::DisabledMember);
+        }
+        WatcherProjection::fleet(
+            membership,
+            reachability,
+            [
+                self.links.len() as u32,
+                self.links.enrolled_count() as u32,
+                0,
+                0,
+                0,
+            ],
+            last_activity_ms,
+        )
+    }
+
+    pub fn task_watcher_view(
+        &self,
+        task_id: TaskId,
+        lifecycle: TaskLifecycle,
+        attention: TaskAttention,
+        reachability: HostReachability,
+        usage_source_label: Option<String>,
+        git_summary: Option<String>,
+    ) -> Result<TaskWatcherView, OrgError> {
+        let membership = self.require_enrolled()?;
+        if membership.role.is_disabled() {
+            return Err(OrgError::DisabledMember);
+        }
+        let link = self
+            .links
+            .get(membership.host_id, task_id)
+            .ok_or(OrgError::Unlinked)?;
+        WatcherProjection::task(
+            membership,
+            link,
+            lifecycle,
+            attention,
+            reachability,
+            usage_source_label,
+            git_summary,
+        )
+    }
+
+    pub(crate) fn restore_parts(
+        mode: OperatingMode,
+        policy: Option<OrganizationPolicyDocument>,
+        authenticated_online: bool,
+        membership_revision: Option<u64>,
+        membership_fact_hash: Option<[u8; 32]>,
+        seen_facts: BTreeMap<String, [u8; 32]>,
+        links: TaskLinkReducer,
+        local_actions: LocalActionRegistry,
+        evidence: EvidenceIntake,
+        prompt_snapshot: Option<OrganizationPromptSnapshot>,
+        telemetry_outbox: BTreeMap<String, crate::org::persistence::PersistedOutboxIntent>,
+        sync_state: OrganizationSyncState,
+    ) -> Result<Self, OrgError> {
+        Ok(Self {
+            mode,
+            policy,
+            links,
+            prompts: OrganizationPromptProjection::new(),
+            local_actions,
+            evidence,
+            sync_state,
+            seen_facts,
+            membership_revision,
+            membership_fact_hash,
+            authenticated_online,
+            prompt_snapshot,
+            telemetry_outbox,
+        })
     }
 
     fn require_enrolled(&self) -> Result<&HostMembership, OrgError> {
@@ -519,6 +809,7 @@ impl OrganizationProjection {
         if let Some(expires_at_ms) = expires_at_ms {
             if now_ms >= expires_at_ms {
                 self.sync_state = OrganizationSyncState::Expired;
+                self.authenticated_online = false;
                 self.prompts.purge();
                 return Ok(SyncOutcome::Applied);
             }
@@ -530,6 +821,7 @@ impl OrganizationProjection {
                 }
                 self.sync_state = OrganizationSyncState::Revoked;
                 self.policy = None;
+                self.authenticated_online = false;
                 self.prompts.purge();
                 Ok(SyncOutcome::Applied)
             }
@@ -614,6 +906,16 @@ fn managed_fact_identity(snapshot: &ManagedTaskSnapshot) -> (String, [u8; 32]) {
 fn hash_len_prefixed(hasher: &mut Sha256, bytes: &[u8]) {
     hasher.update((bytes.len() as u64).to_le_bytes());
     hasher.update(bytes);
+}
+
+fn hex_encode32(bytes: &[u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(64);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 /// Marker used by Connect adapters when no organization overlay is present.

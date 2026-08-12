@@ -118,6 +118,57 @@ impl EvidenceIntake {
         self.e2e_raw_authorized = authorized;
     }
 
+    pub fn persist_imported_ids(&self) -> Vec<String> {
+        self.imported.iter().cloned().collect()
+    }
+
+    pub fn persist_trusted_signers(&self) -> Vec<String> {
+        self.trusted_signers.iter().cloned().collect()
+    }
+
+    pub fn persist_e2e_raw_authorized(&self) -> bool {
+        self.e2e_raw_authorized
+    }
+
+    pub fn persist_tenant_id(&self) -> Option<PortalTenantId> {
+        self.tenant_id.clone()
+    }
+
+    pub fn restore(
+        imported_ids: Vec<String>,
+        trusted_signers: Vec<String>,
+        tenant_id: Option<PortalTenantId>,
+        e2e_raw_authorized: bool,
+    ) -> Result<Self, OrgError> {
+        if imported_ids.len() > MAX_EVIDENCE_LABELS * 8
+            || trusted_signers.len() > MAX_EVIDENCE_LABELS
+        {
+            return Err(OrgError::BoundExceeded);
+        }
+        let mut imported = std::collections::BTreeSet::new();
+        for id in imported_ids {
+            EvidenceBundleId::parse(&id).map_err(|_| OrgError::EmptyIdentity)?;
+            if !imported.insert(id) {
+                return Err(OrgError::Replay);
+            }
+        }
+        let mut signers = std::collections::BTreeSet::new();
+        for signer in trusted_signers {
+            if signer.trim().is_empty() {
+                return Err(OrgError::EmptyIdentity);
+            }
+            if !signers.insert(signer) {
+                return Err(OrgError::Replay);
+            }
+        }
+        Ok(Self {
+            imported,
+            trusted_signers: signers,
+            tenant_id,
+            e2e_raw_authorized,
+        })
+    }
+
     pub fn trust_signer(&mut self, signer: impl Into<String>) -> Result<(), OrgError> {
         let signer = signer.into();
         if signer.trim().is_empty() {
@@ -295,7 +346,7 @@ impl EvidenceIntake {
     }
 }
 
-pub fn compute_bundle_hash(bundle: &EvidenceBundle) -> String {
+pub fn compute_bundle_hash_bytes(bundle: &EvidenceBundle) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(b"evidence.v1");
     hasher.update(bundle.manifest_version.to_le_bytes());
@@ -330,7 +381,11 @@ pub fn compute_bundle_hash(bundle: &EvidenceBundle) -> String {
     hash_string_list(&mut hasher, &bundle.privacy_labels);
     hash_string_list(&mut hasher, &bundle.redactions);
     hash_len_prefixed(&mut hasher, bundle.signer.as_bytes());
-    hex_encode(&hasher.finalize())
+    hasher.finalize().into()
+}
+
+pub fn compute_bundle_hash(bundle: &EvidenceBundle) -> String {
+    hex_encode(&compute_bundle_hash_bytes(bundle))
 }
 
 fn hash_string_list(hasher: &mut Sha256, items: &[String]) {

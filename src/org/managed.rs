@@ -271,6 +271,34 @@ impl TaskLinkReducer {
         self.by_task.values()
     }
 
+    pub fn restore(links: Vec<ManagedTaskLink>) -> Result<Self, OrgError> {
+        if links.len() > MAX_MANAGED_LINKS {
+            return Err(OrgError::BoundExceeded);
+        }
+        let mut reducer = Self::new();
+        let mut seen_links = std::collections::BTreeSet::new();
+        let mut seen_tasks = std::collections::BTreeSet::new();
+        for link in links {
+            if link.portal_revision == 0 {
+                return Err(OrgError::StalePolicy);
+            }
+            let link_key = link.link_id.to_string();
+            let task_key = host_task_key(link.host_id, link.local_task_id);
+            if !seen_links.insert(link_key) || !seen_tasks.insert(task_key.clone()) {
+                return Err(OrgError::DuplicateLink);
+            }
+            if link.enrollment_state == EnrollmentState::Enrolled {
+                let card_key = link.board_card_id.as_str().to_string();
+                if reducer.by_card.contains_key(&card_key) {
+                    return Err(OrgError::DuplicateLink);
+                }
+                reducer.by_card.insert(card_key, link.link_id);
+            }
+            reducer.by_task.insert(task_key, link);
+        }
+        Ok(reducer)
+    }
+
     pub fn apply_portal_snapshot(
         &mut self,
         membership: &HostMembership,

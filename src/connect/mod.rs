@@ -102,8 +102,9 @@ pub use managed::{
     TaskLinkReducer,
 };
 pub use org::{
-    OrganizationAdapter, OrganizationFact, OrganizationProjection, OrganizationSyncState,
-    StandaloneOrganization, SyncOutcome,
+    OrganizationAdapter, OrganizationCapabilityDisableReason, OrganizationCapabilityState,
+    OrganizationFact, OrganizationProjection, OrganizationPublisher, OrganizationStateStore,
+    OrganizationSyncState, SignedOrganizationEnvelope, StandaloneOrganization, SyncOutcome,
 };
 pub use org_prompts::{
     ComposerInsertion, OrganizationPromptAdapter, OrganizationPromptProjection,

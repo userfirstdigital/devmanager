@@ -176,6 +176,16 @@ impl OrganizationPolicyDocument {
         for field in &self.allowed_metadata_fields {
             hasher.update(format!("{field:?}").as_bytes());
         }
+        hasher.update([match self.raw_sharing_ceiling {
+            RawSharingCeiling::None => 0,
+        }]);
+        hasher.update([match self.local_action_approval {
+            LocalActionApprovalRequirement::OwnerRequired => 0,
+        }]);
+        for account in &self.prompt_maintainer_accounts {
+            hasher.update((account.len() as u64).to_le_bytes());
+            hasher.update(account.as_bytes());
+        }
         hex_encode(&hasher.finalize())
     }
 }

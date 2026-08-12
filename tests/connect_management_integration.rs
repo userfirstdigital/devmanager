@@ -7,13 +7,21 @@ use devmanager::connect::{
 };
 use devmanager::domain::id::{ProjectId, TaskId};
 use devmanager::domain::org::TaskScope;
+use devmanager::domain::task::{TaskAttention, TaskLifecycle};
 use devmanager::org::{
-    compute_bundle_hash, ActionRisk, Admission, EnrollmentState, EvidenceMediaRef, EvidenceSegment,
-    ExternalAccount, HostMembership, MembershipRole, MembershipStatus, OrgError,
-    OrganizationPolicyDocument, OrganizationProjection, PortalAccountId, PortalTenantId,
+    compute_bundle_hash, fleet_watcher_to_wire, managed_task_to_wire, membership_to_wire,
+    policy_to_wire, prompt_snapshot_to_wire, task_watcher_to_wire, ActionRisk, Admission,
+    EnrollmentState, EvidenceMediaRef, EvidenceSegment, ExternalAccount, HostMembership,
+    HostReachability, MembershipRole, MembershipStatus, OrgError,
+    OrganizationCapabilityDisableReason, OrganizationCapabilityState, OrganizationPolicyDocument,
+    OrganizationProjection, OrganizationPublisher, OrganizationStateStore, PortalAccountId,
+    PortalTenantId,
 };
 use devmanager::prompts::{ComposerInsertion, OrgPrompt, OrgPromptVersion, PromptLifecycle};
-use devmanager::protocol::CapabilitySet;
+use devmanager::protocol::{
+    decode_organization_payload, encode_organization_payload, CapabilitySet,
+    OrganizationWirePayload,
+};
 use sha2::{Digest, Sha256};
 
 fn tenant() -> PortalTenantId {
@@ -547,4 +555,359 @@ fn evidence_adapter_projects_metadata_only_and_rejects_untrusted() {
     adapter.bind_tenant(tenant());
     let other = PortalTenantId::parse("other").expect("other");
     assert_eq!(adapter.ingest(&other, &bundle), Err(OrgError::CrossTenant));
+}
+
+#[test]
+fn organization_state_round_trips_and_rejects_corrupt_or_cross_tenant() {
+    let root = std::env::temp_dir().join(format!("devmanager-org-it-{}", ConnectHostId::new()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("root");
+    let store = OrganizationStateStore::open(&root);
+    assert_eq!(store.load().expect_err("missing"), OrgError::StandaloneMode);
+
+    let mut projection = OrganizationProjection::standalone();
+    let membership = enroll(&mut projection, ConnectHostId::new());
+    store.save(&projection).expect("save");
+    let restored = store.load().expect("load");
+    assert_eq!(restored.sync_state(), OrganizationSyncState::Enrolled);
+    assert_eq!(
+        restored.membership().map(|item| item.host_id),
+        Some(membership.host_id)
+    );
+
+    std::fs::write(store.path(), "{\"schema_version\":1}").expect("corrupt");
+    assert_eq!(store.load().expect_err("corrupt"), OrgError::CorruptState);
+    let hello = OrganizationStateStore::restore_hello(&root);
+    assert!(hello.diagnostic().is_some());
+    assert_eq!(
+        hello.capability(),
+        OrganizationCapabilityState::Disabled(OrganizationCapabilityDisableReason::Standalone)
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn organization_capability_transitions_are_typed() {
+    let mut adapter = OrganizationAdapter::standalone();
+    assert_eq!(
+        adapter.organization_projection_capability(),
+        OrganizationCapabilityState::Disabled(OrganizationCapabilityDisableReason::Standalone)
+    );
+    assert!(!adapter
+        .advertised_capabilities(CapabilitySet::empty())
+        .contains(devmanager::protocol::Capability::OrganizationProjection));
+
+    adapter.projection_mut().sign_in(account());
+    assert_eq!(
+        adapter.organization_projection_capability(),
+        OrganizationCapabilityState::Disabled(OrganizationCapabilityDisableReason::Unenrolled)
+    );
+
+    enroll(adapter.projection_mut(), ConnectHostId::new());
+    assert_eq!(
+        adapter.organization_projection_capability(),
+        OrganizationCapabilityState::Enabled
+    );
+    assert!(adapter
+        .advertised_capabilities(CapabilitySet::empty())
+        .contains(devmanager::protocol::Capability::OrganizationProjection));
+
+    adapter.projection_mut().set_authenticated_online(false);
+    assert_eq!(
+        adapter.organization_projection_capability(),
+        OrganizationCapabilityState::Disabled(OrganizationCapabilityDisableReason::Offline)
+    );
+}
+
+#[test]
+fn organization_payload_keeps_uuidv7_local_ids_and_opaque_external_ids() {
+    let mut projection = OrganizationProjection::standalone();
+    let membership = enroll(&mut projection, ConnectHostId::new());
+    let task_id = TaskId::new();
+    let managed = snapshot(&membership, task_id, 1, EnrollmentState::Enrolled);
+    assert_eq!(
+        projection.apply_authoritative_fact(OrganizationFact::ManagedTask(managed.clone()), 1_000),
+        Ok(SyncOutcome::Applied)
+    );
+    let payload = OrganizationWirePayload::ManagedTask(managed_task_to_wire(&managed));
+    let encoded = encode_organization_payload(&payload).expect("encode");
+    let decoded = decode_organization_payload(&encoded).expect("decode");
+    match decoded {
+        OrganizationWirePayload::ManagedTask(wire) => {
+            assert_eq!(wire.tenant_id, "acme");
+            assert_eq!(wire.board_card_id, "board-card-1");
+            assert_eq!(wire.host_id, membership.host_id.as_uuid());
+            assert_eq!(wire.host_id.get_version_num(), 7);
+            assert_eq!(wire.board_card_id, "board-card-1");
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+    let membership_wire = membership_to_wire(&membership);
+    assert_eq!(membership_wire.tenant_id, "acme");
+    assert_eq!(membership_wire.host_id.get_version_num(), 7);
+}
+
+#[test]
+fn hmac_publisher_rejects_tamper_and_replay_and_queues_outbox() {
+    let mut projection = OrganizationProjection::standalone();
+    let membership = enroll(&mut projection, ConnectHostId::new());
+    let mut publisher = OrganizationPublisher::new(
+        [9u8; 32],
+        membership.tenant_id.as_str(),
+        membership.account_id.as_str(),
+        membership.host_id.as_uuid(),
+        "session-1",
+    )
+    .expect("publisher");
+    let signed = publisher
+        .sign(
+            1,
+            OrganizationWirePayload::Membership(membership_to_wire(&membership)),
+        )
+        .expect("sign");
+    publisher
+        .reconcile(&mut projection, &signed, 2_000)
+        .expect("reconcile");
+    assert_eq!(
+        publisher.reconcile(&mut projection, &signed, 2_000),
+        Err(OrgError::Replay)
+    );
+    let mut tampered = signed.clone();
+    tampered.mac_hex.replace_range(0..2, "ff");
+    assert_eq!(
+        publisher.reconcile(&mut projection, &tampered, 2_000),
+        Err(OrgError::TamperedEvidence)
+    );
+    let queued = publisher
+        .queue_publication("cd".repeat(32), "request_delivery")
+        .expect("queue");
+    assert!(queued.publication_queued);
+    assert_eq!(
+        queued.delivery,
+        devmanager::org::OutboxDeliveryState::Queued
+    );
+}
+
+#[test]
+fn evidence_hmac_is_separate_from_default_hash_signature() {
+    let mut projection = OrganizationProjection::standalone();
+    let membership = enroll(&mut projection, ConnectHostId::new());
+    projection
+        .trust_evidence_signer("trusted-device")
+        .expect("trust");
+    let mut bundle = EvidenceBundle {
+        manifest_version: 1,
+        bundle_id: devmanager::org::EvidenceBundleId::new(),
+        capture_started_at_ms: 1,
+        capture_ended_at_ms: 2,
+        timezone: "UTC".to_string(),
+        source_device: "dev".to_string(),
+        source_user: "owner".to_string(),
+        transcript_segments: vec![EvidenceSegment {
+            started_at_ms: 1,
+            ended_at_ms: 2,
+            redacted: true,
+            text: Some("[redacted]".to_string()),
+        }],
+        media_refs: vec![],
+        proposed_title: "Draft".to_string(),
+        proposed_summary: "Summary".to_string(),
+        acceptance_criteria: vec!["passes".to_string()],
+        steps: vec!["open".to_string()],
+        privacy_labels: vec!["redacted".to_string()],
+        redactions: vec!["transcript".to_string()],
+        content_hash_hex: String::new(),
+        signature_hex: String::new(),
+        signer: "trusted-device".to_string(),
+    };
+    let hash = compute_bundle_hash(&bundle);
+    bundle.content_hash_hex = hash.clone();
+    bundle.signature_hex = hash;
+    projection
+        .ingest_evidence(&bundle)
+        .expect("metadata ingest");
+    let publisher = OrganizationPublisher::new(
+        [3u8; 32],
+        membership.tenant_id.as_str(),
+        membership.account_id.as_str(),
+        membership.host_id.as_uuid(),
+        "session-e2e",
+    )
+    .expect("publisher");
+    let mac = publisher.sign_evidence_hmac(&bundle).expect("hmac");
+    publisher
+        .verify_evidence_hmac(&bundle, &mac)
+        .expect("verify hmac");
+    assert_ne!(mac, bundle.signature_hex);
+    assert_eq!(
+        publisher.verify_evidence_hmac(&bundle, &bundle.signature_hex),
+        Err(OrgError::TamperedEvidence)
+    );
+}
+
+#[test]
+fn watcher_views_are_read_only_and_same_tenant() {
+    let mut adapter = OrganizationAdapter::standalone();
+    let membership = enroll(adapter.projection_mut(), ConnectHostId::new());
+    let task_id = TaskId::new();
+    adapter
+        .apply_authoritative_fact(
+            OrganizationFact::ManagedTask(snapshot(
+                &membership,
+                task_id,
+                1,
+                EnrollmentState::Enrolled,
+            )),
+            1_000,
+        )
+        .expect("link");
+    let fleet = adapter
+        .fleet_watcher_view(HostReachability::Online, Some(1_000))
+        .expect("fleet");
+    assert_eq!(fleet.assigned, 1);
+    let wire = fleet_watcher_to_wire(membership.tenant_id.as_str(), &fleet);
+    assert!(!wire.mutation_allowed);
+    let task = adapter
+        .task_watcher_view(
+            task_id,
+            TaskLifecycle::Open,
+            TaskAttention::None,
+            HostReachability::Online,
+            None,
+            None,
+        )
+        .expect("task");
+    assert!(!task.mutation_allowed);
+    let task_wire = task_watcher_to_wire(membership.tenant_id.as_str(), membership.host_id, &task);
+    assert_eq!(task_wire.board_card_id, "board-card-1");
+    assert!(!task_wire.mutation_allowed);
+    assert_eq!(
+        adapter.dispatch_payload(OrganizationWirePayload::FleetWatcher(wire), 1_000),
+        Err(OrgError::WatcherReadOnly)
+    );
+}
+
+#[test]
+fn adapter_dispatch_routes_managed_task_payloads() {
+    let mut adapter = OrganizationAdapter::standalone();
+    let membership = enroll(adapter.projection_mut(), ConnectHostId::new());
+    let managed = snapshot(&membership, TaskId::new(), 1, EnrollmentState::Enrolled);
+    let outcome = adapter
+        .dispatch_payload(
+            OrganizationWirePayload::ManagedTask(managed_task_to_wire(&managed)),
+            1_000,
+        )
+        .expect("dispatch");
+    assert_eq!(outcome, SyncOutcome::Applied);
+    assert_eq!(adapter.projection().exported_task_count(), 1);
+}
+
+#[test]
+fn dispatch_applies_policy_and_prompt_snapshots() {
+    let mut adapter = OrganizationAdapter::standalone();
+    let membership = enroll(adapter.projection_mut(), ConnectHostId::new());
+    let current = adapter
+        .projection()
+        .policy()
+        .cloned()
+        .expect("enrolled policy");
+    assert_eq!(
+        adapter.dispatch_payload(
+            OrganizationWirePayload::Policy(policy_to_wire(&current)),
+            1_000
+        ),
+        Ok(SyncOutcome::Duplicate)
+    );
+
+    let mut next = current.clone();
+    next.revision = 2;
+    next.content_hash_hex.clear();
+    let next = next.finalize().expect("finalize");
+    assert_eq!(
+        adapter.dispatch_payload(
+            OrganizationWirePayload::Policy(policy_to_wire(&next)),
+            1_000
+        ),
+        Ok(SyncOutcome::Applied)
+    );
+    assert_eq!(
+        adapter.projection().policy().map(|policy| policy.revision),
+        Some(2)
+    );
+
+    let version_id = devmanager::org::OrgPromptVersionId::new();
+    let prompt_id = devmanager::org::OrgPromptId::new();
+    let body = "Review the assigned change.";
+    let snapshot = OrganizationPromptSnapshot {
+        tenant_id: membership.tenant_id.clone(),
+        revision: 1,
+        prompts: vec![OrgPrompt {
+            prompt_id,
+            tenant_id: membership.tenant_id.clone(),
+            namespace: "ops".to_string(),
+            name: "review".to_string(),
+            current_version_id: version_id,
+            lifecycle: PromptLifecycle::Published,
+        }],
+        versions: vec![OrgPromptVersion {
+            prompt_id,
+            version_id,
+            author: membership.account_id.clone(),
+            title: "Review".to_string(),
+            tags: vec!["review".to_string()],
+            body: body.to_string(),
+            content_hash_hex: hash_body(body),
+            published_at_ms: 1_000,
+        }],
+        chains: Vec::new(),
+    };
+    assert_eq!(
+        adapter.dispatch_payload(
+            OrganizationWirePayload::PromptSnapshot(prompt_snapshot_to_wire(&snapshot)),
+            1_000
+        ),
+        Ok(SyncOutcome::Applied)
+    );
+    assert_eq!(
+        adapter
+            .projection()
+            .prompts()
+            .expect("prompts")
+            .snapshot_revision(),
+        1
+    );
+    assert_eq!(
+        adapter
+            .projection()
+            .prompts()
+            .expect("prompts")
+            .prompt_count(),
+        1
+    );
+}
+
+#[test]
+fn outbox_duplicate_is_exact_and_conflict_is_forbidden() {
+    let mut projection = OrganizationProjection::standalone();
+    enroll(&mut projection, ConnectHostId::new());
+    let intent = devmanager::org::PersistedOutboxIntent {
+        observation_id_hex: "ab".repeat(32),
+        intent: "request_delivery".to_string(),
+        publication_queued: true,
+        delivery: devmanager::org::OutboxDeliveryState::Queued,
+    };
+    assert_eq!(
+        projection.queue_outbox_intent(intent.clone()),
+        Ok(SyncOutcome::Applied)
+    );
+    assert_eq!(
+        projection.queue_outbox_intent(intent.clone()),
+        Ok(SyncOutcome::Duplicate)
+    );
+    let mut changed = intent;
+    changed.intent = "acknowledge".to_string();
+    assert_eq!(
+        projection.queue_outbox_intent(changed),
+        Err(OrgError::LastWriteWinsForbidden)
+    );
 }

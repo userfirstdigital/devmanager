@@ -2,16 +2,21 @@
 //! an empty overlay and never advertise organization capability.
 
 pub use crate::org::{
-    OperatingMode, OrgDependency, OrgError, OrganizationFact, OrganizationProjection,
-    OrganizationSyncState, StandaloneOrganization, SyncOutcome,
+    OperatingMode, OrgDependency, OrgError, OrganizationCapabilityDisableReason,
+    OrganizationCapabilityState, OrganizationFact, OrganizationProjection, OrganizationPublisher,
+    OrganizationStateStore, OrganizationSyncState, SignedOrganizationEnvelope,
+    StandaloneOrganization, SyncOutcome,
 };
 
+use crate::domain::id::TaskId;
+use crate::domain::task::{TaskAttention, TaskLifecycle};
 use crate::org::{
     EvidenceAccessClass, EvidenceBundle, EvidenceMetadataProjection, EvidenceSegment,
-    LocalActionAdmissionState, LocalActionCatalogEntry, LocalActionId, LocalActionRequest,
+    FleetWatcherView, HostReachability, LocalActionAdmissionState, LocalActionCatalogEntry,
+    LocalActionId, LocalActionRequest, TaskWatcherView,
 };
 use crate::prompts::OrganizationPromptSnapshot;
-use crate::protocol::CapabilitySet;
+use crate::protocol::{CapabilitySet, OrganizationWirePayload};
 
 use crate::domain::id::ProjectId;
 
@@ -39,7 +44,63 @@ impl OrganizationAdapter {
     }
 
     pub fn advertised_capabilities(&self, base: CapabilitySet) -> CapabilitySet {
-        advertised_capabilities(self.projection.mode(), base)
+        match self.projection.capability_state().advertised_capability() {
+            Some(capability) => CapabilitySet::from_bits(base.bits() | capability.bit()),
+            None => base,
+        }
+    }
+
+    pub fn organization_projection_capability(&self) -> OrganizationCapabilityState {
+        self.projection.capability_state()
+    }
+
+    pub fn persist_to(&self, store: &OrganizationStateStore) -> Result<(), OrgError> {
+        self.projection.persist_to(store)
+    }
+
+    pub fn dispatch_payload(
+        &mut self,
+        payload: OrganizationWirePayload,
+        now_ms: i64,
+    ) -> Result<SyncOutcome, OrgError> {
+        self.projection.dispatch_wire_payload(payload, now_ms)
+    }
+
+    pub fn reconcile_signed(
+        &mut self,
+        publisher: &mut OrganizationPublisher,
+        signed: &SignedOrganizationEnvelope,
+        now_ms: i64,
+    ) -> Result<SyncOutcome, OrgError> {
+        publisher.reconcile(&mut self.projection, signed, now_ms)
+    }
+
+    pub fn fleet_watcher_view(
+        &self,
+        reachability: HostReachability,
+        last_activity_ms: Option<i64>,
+    ) -> Result<FleetWatcherView, OrgError> {
+        self.projection
+            .fleet_watcher_view(reachability, last_activity_ms)
+    }
+
+    pub fn task_watcher_view(
+        &self,
+        task_id: TaskId,
+        lifecycle: TaskLifecycle,
+        attention: TaskAttention,
+        reachability: HostReachability,
+        usage_source_label: Option<String>,
+        git_summary: Option<String>,
+    ) -> Result<TaskWatcherView, OrgError> {
+        self.projection.task_watcher_view(
+            task_id,
+            lifecycle,
+            attention,
+            reachability,
+            usage_source_label,
+            git_summary,
+        )
     }
 
     pub fn apply_authoritative_fact(

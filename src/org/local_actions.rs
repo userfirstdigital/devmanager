@@ -322,6 +322,54 @@ impl LocalActionRegistry {
             result.to_string()
         }
     }
+
+    pub fn persist_states(&self) -> Vec<LocalActionAdmissionState> {
+        self.states.values().cloned().collect()
+    }
+
+    pub fn persist_catalog(&self) -> Vec<LocalActionCatalogEntry> {
+        self.catalog.values().cloned().collect()
+    }
+
+    pub fn persist_seen(&self) -> Vec<String> {
+        self.seen.iter().cloned().collect()
+    }
+
+    pub fn restore(
+        catalog: Vec<LocalActionCatalogEntry>,
+        states: Vec<LocalActionAdmissionState>,
+        seen: Vec<String>,
+    ) -> Result<Self, OrgError> {
+        let mut registry = Self::new();
+        registry.bind_server_catalog(catalog)?;
+        if states.len() > MAX_LOCAL_ACTION_SEEN || seen.len() > MAX_LOCAL_ACTION_SEEN {
+            return Err(OrgError::BoundExceeded);
+        }
+        let mut restored_seen = std::collections::BTreeSet::new();
+        for id in seen {
+            if id.trim().is_empty() {
+                return Err(OrgError::EmptyIdentity);
+            }
+            if !restored_seen.insert(id) {
+                return Err(OrgError::Replay);
+            }
+        }
+        let mut restored_states = BTreeMap::new();
+        for state in states {
+            let key = state.request_id.to_string();
+            if restored_states.contains_key(&key) {
+                return Err(OrgError::Replay);
+            }
+            restored_seen.insert(key.clone());
+            restored_states.insert(key, state);
+        }
+        if restored_seen.len() > MAX_LOCAL_ACTION_SEEN {
+            return Err(OrgError::BoundExceeded);
+        }
+        registry.seen = restored_seen;
+        registry.states = restored_states;
+        Ok(registry)
+    }
 }
 
 impl HostMembership {
