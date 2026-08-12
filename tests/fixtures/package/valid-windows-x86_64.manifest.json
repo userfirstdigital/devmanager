@@ -1,6 +1,7 @@
 {
   "platform": "windows-x86_64",
   "version": "0.4.2",
+  "identity": "devmanager/0.4.2",
   "protocol": {
     "major": 1,
     "minor": 0
@@ -13,6 +14,7 @@
       "name": "devmanager",
       "role": "client",
       "main": true,
+      "buildIdentity": "devmanager/0.4.2",
       "productName": "DevManager",
       "fileDescription": "DevManager",
       "originalFilename": "devmanager.exe",
@@ -26,6 +28,7 @@
       "name": "devmanager-host",
       "role": "host",
       "main": false,
+      "buildIdentity": "devmanager-host/0.4.2",
       "productName": "DevManager",
       "fileDescription": "DevManager Host",
       "originalFilename": "devmanager-host.exe",
@@ -42,6 +45,9 @@
   "icons": [
     "packaging/icons/devmanager.ico"
   ],
+  "webview2": {
+    "windowsExpectation": "Evergreen WebView2 Runtime required for wry/webview2-com browser surfaces"
+  },
   "signatures": [
     "DevManager_0.4.2_x64-setup.exe.sig"
   ],

@@ -13,6 +13,7 @@ config.json
 .env
 secrets
 Portal
+zz-archive
 devmanager-next
 devmanager-next.exe
 devmanager-process-test-helper
