@@ -23,22 +23,26 @@ pub use envelope::{
     MAX_CONNECT_REASSEMBLED_MESSAGE_BYTES,
 };
 pub use identity::{
-    bind_device_credential, validate_device_credential, BrowserDeviceDto, BrowserPrivateStorage,
+    validate_device_credential, BrowserDeviceDto, BrowserPrivateStorage,
     ConnectIdentity, CredentialLocation, CredentialVault, DeviceCredentialProof, DeviceId,
-    DeviceKeyProof, DeviceKind, DeviceRecord, HostIdentityRotation, HostKeyProof, HostPublicId,
-    IdentityCommand, IdentityError, IdentityLimitField, IdentityOp, IdentityReceipt, IdentitySetup,
-    KeyReference, MachineBinding, PairingCode, PairingPurpose, RegisterDevice, RepairDevice,
+    DeviceEstablishmentHandle, DeviceKeyProof, DeviceKind, DeviceRecord, DeviceRepairHandle,
+    HostEstablishmentHandle, HostIdentityRotation, HostKeyProof, HostPublicId,
+    HostRotationHandle, IdentityCommand, IdentityError,
+    IdentityLimitField, IdentityOp, IdentityReceipt, IdentitySetup, KeyReference, MachineBinding,
+    PairingCode, PairingPurpose, RegisterDevice, RepairDevice,
     CONNECT_IDENTITY_SCHEMA_VERSION, IDENTITY_CODEC_VERSION, MAX_FINGERPRINT_BYTES,
     MAX_IDENTITY_ARRAY_ITEMS, MAX_IDENTITY_DEVICES, MAX_IDENTITY_MAP_ENTRIES, MAX_IDENTITY_NESTING,
     MAX_IDENTITY_PHYSICAL_BYTES, MAX_IDENTITY_RECEIPTS, MAX_ID_BYTES, MAX_LABEL_BYTES,
     PAIRING_CODE_LEN,
 };
+#[cfg(test)]
+pub(crate) use identity::bind_device_credential_from_snapshot as bind_device_credential;
 pub use identity_store::{
     IdentityPersistence, InMemoryIdentityPersistence, IsolatedRemoteStore, LoadedRemoteDocument,
 };
 pub use permission::{
-    ActionId, ConnectRole, KnownAction, PermissionDecision, PermissionDenyReason,
-    PermissionEvaluator, PermissionRequest,
+    ActionId, AuthoritativePermissionContext, ConnectRole, KnownAction, PermissionDecision,
+    PermissionDenyReason, PermissionEvaluator, PermissionRequest, ScopedPermissionGrant,
 };
 pub use presence::{EphemeralPresence, LastSenderHint, PresenceSink};
 pub use schema::{

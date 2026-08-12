@@ -9,6 +9,7 @@ use super::identity::{
     validate_device_credential, ConnectIdentity, CredentialVault, DeviceCredentialProof,
     MachineBinding,
 };
+use super::identity_store::{IdentityPersistence, IsolatedRemoteStore};
 
 /// Stable action discriminant. Unknown nonzero values are denied, never
 /// converted into a new command or interactive action.
@@ -104,9 +105,106 @@ pub struct PermissionRequest {
     pub task_id: Option<TaskId>,
     pub action: ActionId,
     /// Opaque current registered, non-revoked, host-bound credential.
-    /// A raw DeviceId is never sufficient; mint via `bind_device_credential`.
-    /// HOLD: live connection/session/epoch wiring remains outside this slice.
+    /// A raw DeviceId is never sufficient; mint via the authoritative store
+    /// binding operation.
+    /// Live connection/session/route authority is supplied separately as an
+    /// opaque `ScopedPermissionGrant`; this request alone is never enough.
     pub credential: Option<DeviceCredentialProof>,
+}
+
+/// Epoch tuple supplied by the authoritative connection/session router. The
+/// local evaluator never manufactures one; a scoped grant must carry the
+/// exact tuple that was active when it was issued.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct AuthoritativePermissionContext {
+    channel_epoch: u64,
+    session_epoch: u64,
+    route_epoch: u64,
+}
+
+impl AuthoritativePermissionContext {
+    #[cfg(test)]
+    pub(crate) fn for_test(channel_epoch: u64, session_epoch: u64, route_epoch: u64) -> Self {
+        Self {
+            channel_epoch,
+            session_epoch,
+            route_epoch,
+        }
+    }
+}
+
+impl fmt::Debug for AuthoritativePermissionContext {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AuthoritativePermissionContext")
+            .field("channel_epoch", &self.channel_epoch)
+            .field("session_epoch", &self.session_epoch)
+            .field("route_epoch", &self.route_epoch)
+            .finish()
+    }
+}
+
+/// Opaque grant issued by a trusted channel/session authority. Watcher and
+/// Collaborator role labels alone are not authorization; every guest request
+/// must present a grant bound to role, Task, action, and all three live epochs.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ScopedPermissionGrant {
+    role: ConnectRole,
+    task_id: TaskId,
+    action: ActionId,
+    channel_epoch: u64,
+    session_epoch: u64,
+    route_epoch: u64,
+}
+
+impl ScopedPermissionGrant {
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        role: ConnectRole,
+        task_id: TaskId,
+        action: ActionId,
+        context: AuthoritativePermissionContext,
+    ) -> Self {
+        Self {
+            role,
+            task_id,
+            action,
+            channel_epoch: context.channel_epoch,
+            session_epoch: context.session_epoch,
+            route_epoch: context.route_epoch,
+        }
+    }
+
+    fn matches(
+        &self,
+        request: &PermissionRequest,
+        context: AuthoritativePermissionContext,
+    ) -> bool {
+        self.channel_epoch != 0
+            && self.session_epoch != 0
+            && self.route_epoch != 0
+            && context.channel_epoch != 0
+            && context.session_epoch != 0
+            && context.route_epoch != 0
+            && self.role == request.role
+            && request.task_id == Some(self.task_id)
+            && self.action == request.action
+            && self.channel_epoch == context.channel_epoch
+            && self.session_epoch == context.session_epoch
+            && self.route_epoch == context.route_epoch
+    }
+}
+
+impl fmt::Debug for ScopedPermissionGrant {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ScopedPermissionGrant")
+            .field("role", &self.role)
+            .field("task_id", &self.task_id)
+            .field("action", &self.action)
+            .field("epochs", &"redacted")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,6 +216,8 @@ pub enum PermissionDenyReason {
     OwnerOnly,
     CollaboratorWriteDisabled,
     DeviceCredentialRequired,
+    ScopedGrantRequired,
+    NonAuthoritativeContext,
 }
 
 impl fmt::Display for PermissionDenyReason {
@@ -131,6 +231,12 @@ impl fmt::Display for PermissionDenyReason {
             Self::CollaboratorWriteDisabled => "Collaborator writes are disabled",
             Self::DeviceCredentialRequired => {
                 "PairedOwner actions require a verified device credential"
+            }
+            Self::ScopedGrantRequired => {
+                "guest roles require a current authoritative scoped grant"
+            }
+            Self::NonAuthoritativeContext => {
+                "the evaluator lacks authoritative channel/session/route context"
             }
         })
     }
@@ -168,18 +274,102 @@ impl PermissionEvaluator {
     }
 
     pub fn evaluate(&self, request: PermissionRequest) -> PermissionDecision {
+        self.evaluate_roles(request, false, false)
+    }
+
+    /// Evaluate a request after reloading and validating its credential
+    /// through the authoritative identity store and active session. A public
+    /// evaluator must not accept a caller-supplied identity snapshot.
+    pub fn evaluate_with_store<P: IdentityPersistence + 'static, V: CredentialVault>(
+        &self,
+        request: PermissionRequest,
+        store: &mut IsolatedRemoteStore<P>,
+        binding: &MachineBinding,
+        vault: &V,
+        active_session_epoch: u64,
+    ) -> PermissionDecision {
+        if matches!(request.role, ConnectRole::PairedOwner) {
+            let Some(proof) = request.credential.as_ref() else {
+                return PermissionDecision::Denied(PermissionDenyReason::DeviceCredentialRequired);
+            };
+            if store
+                .validate_device_credential(binding, vault, proof, active_session_epoch)
+                .is_err()
+            {
+                return PermissionDecision::Denied(PermissionDenyReason::DeviceCredentialRequired);
+            }
+            // Credential proof validation is authoritative for identity only;
+            // this API has no channel/session/route epoch, so it must not
+            // authorize a live permission request.
+            return PermissionDecision::Denied(PermissionDenyReason::NonAuthoritativeContext);
+        }
+        self.evaluate_roles(request, false, false)
+    }
+
+    /// Evaluate a guest request only when a trusted authority supplies a
+    /// one-shot grant bound to the live channel/session/route epoch tuple.
+    pub fn evaluate_with_scoped_grant(
+        &self,
+        request: PermissionRequest,
+        grant: &ScopedPermissionGrant,
+        context: AuthoritativePermissionContext,
+    ) -> PermissionDecision {
+        if !grant.matches(&request, context) {
+            return PermissionDecision::Denied(PermissionDenyReason::ScopedGrantRequired);
+        }
+        self.evaluate_roles(request, false, true)
+    }
+
+    /// Compatibility shim for callers that still pass an identity snapshot.
+    /// Snapshot validation can reject stale proofs, but this API deliberately
+    /// never authorizes a live request because it has no channel/route epoch.
+    pub fn evaluate_with_authority<V: CredentialVault>(
+        &self,
+        request: PermissionRequest,
+        identity: &ConnectIdentity,
+        binding: &MachineBinding,
+        vault: &V,
+        active_session_epoch: u64,
+    ) -> PermissionDecision {
+        if matches!(request.role, ConnectRole::PairedOwner) {
+            let Some(proof) = request.credential.as_ref() else {
+                return PermissionDecision::Denied(PermissionDenyReason::DeviceCredentialRequired);
+            };
+            if validate_device_credential(
+                identity,
+                binding,
+                vault,
+                proof,
+                active_session_epoch,
+            )
+            .is_err()
+            {
+                return PermissionDecision::Denied(PermissionDenyReason::DeviceCredentialRequired);
+            }
+            return PermissionDecision::Denied(PermissionDenyReason::NonAuthoritativeContext);
+        }
+        self.evaluate(request)
+    }
+
+    fn evaluate_roles(
+        &self,
+        request: PermissionRequest,
+        paired_owner_authorized: bool,
+        scoped_guest_authorized: bool,
+    ) -> PermissionDecision {
         let Some(action) = request.action.known() else {
             return PermissionDecision::Denied(PermissionDenyReason::UnknownAction);
         };
 
         match request.role {
-            ConnectRole::PairedOwner => match request.credential {
-                Some(proof) if proof.session_epoch() != 0 && proof.host_generation() != 0 => {
-                    PermissionDecision::Allow
-                }
-                _ => PermissionDecision::Denied(PermissionDenyReason::DeviceCredentialRequired),
-            },
+            ConnectRole::PairedOwner if paired_owner_authorized => PermissionDecision::Allow,
+            ConnectRole::PairedOwner => {
+                PermissionDecision::Denied(PermissionDenyReason::DeviceCredentialRequired)
+            }
             ConnectRole::Watcher { task_id } => {
+                if !scoped_guest_authorized {
+                    return PermissionDecision::Denied(PermissionDenyReason::ScopedGrantRequired);
+                }
                 if !matches!(request.task_id, Some(requested) if requested == task_id) {
                     return PermissionDecision::Denied(match request.task_id {
                         Some(_) => PermissionDenyReason::TaskScopeMismatch,
@@ -195,6 +385,9 @@ impl PermissionEvaluator {
                 }
             }
             ConnectRole::Collaborator { task_id } => {
+                if !scoped_guest_authorized {
+                    return PermissionDecision::Denied(PermissionDenyReason::ScopedGrantRequired);
+                }
                 if !matches!(request.task_id, Some(requested) if requested == task_id) {
                     return PermissionDecision::Denied(match request.task_id {
                         Some(_) => PermissionDenyReason::TaskScopeMismatch,
@@ -212,29 +405,6 @@ impl PermissionEvaluator {
                 PermissionDecision::Allow
             }
         }
-    }
-
-    /// Evaluate a request only after revalidating a PairedOwner proof against
-    /// the authoritative identity, vault, and active session epoch.
-    pub fn evaluate_with_authority<V: CredentialVault>(
-        &self,
-        request: PermissionRequest,
-        identity: &ConnectIdentity,
-        binding: &MachineBinding,
-        vault: &V,
-        active_session_epoch: u64,
-    ) -> PermissionDecision {
-        if matches!(request.role, ConnectRole::PairedOwner) {
-            let Some(proof) = request.credential.as_ref() else {
-                return PermissionDecision::Denied(PermissionDenyReason::DeviceCredentialRequired);
-            };
-            if validate_device_credential(identity, binding, vault, proof, active_session_epoch)
-                .is_err()
-            {
-                return PermissionDecision::Denied(PermissionDenyReason::DeviceCredentialRequired);
-            }
-        }
-        self.evaluate(request)
     }
 
     pub fn authorize(&self, request: PermissionRequest) -> bool {
@@ -293,6 +463,57 @@ mod tests {
         assert_eq!(
             decision,
             PermissionDecision::Denied(PermissionDenyReason::DeviceCredentialRequired)
+        );
+    }
+
+    #[test]
+    fn guest_roles_fail_closed_without_a_scoped_grant() {
+        let task_id = TaskId::new();
+        for role in [
+            ConnectRole::Watcher { task_id },
+            ConnectRole::Collaborator { task_id },
+        ] {
+            let decision = PermissionEvaluator::default().evaluate(PermissionRequest {
+                role,
+                task_id: Some(task_id),
+                action: ActionId::READ_TASK,
+                credential: None,
+            });
+            assert_eq!(
+                decision,
+                PermissionDecision::Denied(PermissionDenyReason::ScopedGrantRequired)
+            );
+        }
+    }
+
+    #[test]
+    fn scoped_guest_grant_is_bound_to_all_live_epochs() {
+        let task_id = TaskId::new();
+        let context = AuthoritativePermissionContext::for_test(4, 5, 6);
+        let grant = ScopedPermissionGrant::for_test(
+            ConnectRole::Watcher { task_id },
+            task_id,
+            ActionId::READ_TASK,
+            context,
+        );
+        let request = PermissionRequest {
+            role: ConnectRole::Watcher { task_id },
+            task_id: Some(task_id),
+            action: ActionId::READ_TASK,
+            credential: None,
+        };
+        assert_eq!(
+            PermissionEvaluator::default()
+                .evaluate_with_scoped_grant(request.clone(), &grant, context),
+            PermissionDecision::Allow
+        );
+        assert_eq!(
+            PermissionEvaluator::default().evaluate_with_scoped_grant(
+                request,
+                &grant,
+                AuthoritativePermissionContext::for_test(4, 5, 7),
+            ),
+            PermissionDecision::Denied(PermissionDenyReason::ScopedGrantRequired)
         );
     }
 }

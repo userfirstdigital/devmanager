@@ -4,6 +4,7 @@
 //! synthesized key references. Pairing is owner-device pairing only.
 
 use std::fmt;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -23,6 +24,7 @@ pub const MAX_ID_BYTES: usize = 64;
 pub const MAX_FINGERPRINT_BYTES: usize = 64;
 pub const PAIRING_CODE_LEN: usize = 8;
 pub const MAX_IDENTITY_RECEIPTS: usize = 32;
+pub(crate) const PENDING_CLAIM_LEASE_MS: u64 = 30_000;
 
 pub(crate) const PAIRING_TOKEN_ALPHABET: &[u8; 32] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
@@ -610,9 +612,35 @@ pub(crate) struct PendingIdentityTransition {
     pub(crate) command_digest: [u8; 32],
     pub(crate) kind: PendingIdentityTransitionKind,
     pub(crate) transition_nonce: [u8; 16],
+    /// The physical reader that owns this exact pending marker. The logical
+    /// transition nonce is deliberately not reused as a claim token.
+    pub(crate) claim_owner: Option<[u8; 16]>,
+    /// A claim is durable and restart-safe only while this lease is live.
+    pub(crate) claim_expires_at_epoch_ms: Option<u64>,
+    /// The logical document revision observed when the claim was made. A
+    /// physical CAS epoch alone is not sufficient to settle an old executor.
+    pub(crate) claim_logical_revision: Option<u64>,
     pub(crate) host_public_id: Option<HostPublicId>,
     pub(crate) device_id: Option<DeviceId>,
     pub(crate) previous_identity: Option<Box<ConnectIdentity>>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct PendingRevocationJournal {
+    pub(crate) command_id: crate::domain::id::CommandId,
+    pub(crate) command_digest: [u8; 32],
+    pub(crate) revoke_all: bool,
+    pub(crate) entries: Vec<(DeviceId, u64)>,
+}
+
+impl fmt::Debug for PendingRevocationJournal {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PendingRevocationJournal")
+            .field("revoke_all", &self.revoke_all)
+            .field("entry_count", &self.entries.len())
+            .finish()
+    }
 }
 
 impl fmt::Debug for PendingIdentityTransition {
@@ -622,6 +650,15 @@ impl fmt::Debug for PendingIdentityTransition {
             .field("kind", &self.kind)
             .finish()
     }
+}
+
+pub(crate) fn current_epoch_ms() -> Result<u64, IdentityError> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| IdentityError::Corrupt)
+        .and_then(|duration| {
+            u64::try_from(duration.as_millis()).map_err(|_| IdentityError::Overflow)
+        })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -751,6 +788,133 @@ impl fmt::Debug for HostKeyProof {
     }
 }
 
+/// Opaque custody handle for one host establishment. The proof is never
+/// accepted as a settlement token by the vault; callers must retain this
+/// handle, which is bound to the durable transition nonce and vault slot.
+#[derive(Clone, PartialEq, Eq)]
+pub struct HostEstablishmentHandle {
+    host_public_id: HostPublicId,
+    transition_nonce: [u8; 16],
+    slot: [u8; 16],
+    proof: HostKeyProof,
+}
+
+impl HostEstablishmentHandle {
+    pub(crate) fn from_parts(
+        host_public_id: HostPublicId,
+        transition_nonce: [u8; 16],
+        slot: [u8; 16],
+        proof: HostKeyProof,
+    ) -> Self {
+        Self {
+            host_public_id,
+            transition_nonce,
+            slot,
+            proof,
+        }
+    }
+
+    pub(crate) fn host_public_id(&self) -> HostPublicId {
+        self.host_public_id
+    }
+
+    pub(crate) fn transition_nonce(&self) -> [u8; 16] {
+        self.transition_nonce
+    }
+
+    pub(crate) fn slot(&self) -> [u8; 16] {
+        self.slot
+    }
+
+    pub(crate) fn proof(&self) -> &HostKeyProof {
+        &self.proof
+    }
+}
+
+impl fmt::Debug for HostEstablishmentHandle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HostEstablishmentHandle")
+            .field("host_public_id", &self.host_public_id)
+            .field("transition_nonce", &"redacted")
+            .field("slot", &"redacted")
+            .field("proof", &"redacted")
+            .finish()
+    }
+}
+
+/// Opaque custody handle for one prepared host rotation.
+///
+/// The vault must validate every field before settling a slot. In particular,
+/// a nonce from an older transition cannot commit or abort a newer pending
+/// rotation for the same host.
+#[derive(Clone, PartialEq, Eq)]
+pub struct HostRotationHandle {
+    host_public_id: HostPublicId,
+    transition_nonce: [u8; 16],
+    slot: [u8; 16],
+    old_generation: u64,
+    old_fingerprint: String,
+    proof: HostKeyProof,
+}
+
+impl HostRotationHandle {
+    pub(crate) fn from_parts(
+        host_public_id: HostPublicId,
+        transition_nonce: [u8; 16],
+        slot: [u8; 16],
+        old_generation: u64,
+        old_fingerprint: impl Into<String>,
+        proof: HostKeyProof,
+    ) -> Self {
+        Self {
+            host_public_id,
+            transition_nonce,
+            slot,
+            old_generation,
+            old_fingerprint: old_fingerprint.into(),
+            proof,
+        }
+    }
+
+    pub(crate) fn proof(&self) -> &HostKeyProof {
+        &self.proof
+    }
+
+    pub(crate) fn host_public_id(&self) -> HostPublicId {
+        self.host_public_id
+    }
+
+    pub(crate) fn transition_nonce(&self) -> [u8; 16] {
+        self.transition_nonce
+    }
+
+    pub(crate) fn slot(&self) -> [u8; 16] {
+        self.slot
+    }
+
+    pub(crate) fn old_generation(&self) -> u64 {
+        self.old_generation
+    }
+
+    pub(crate) fn old_fingerprint(&self) -> &str {
+        &self.old_fingerprint
+    }
+}
+
+impl fmt::Debug for HostRotationHandle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HostRotationHandle")
+            .field("host_public_id", &self.host_public_id)
+            .field("transition_nonce", &"redacted")
+            .field("slot", &"redacted")
+            .field("old_generation", &self.old_generation)
+            .field("old_fingerprint", &"redacted")
+            .finish()
+    }
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct DeviceKeyProof {
     device_id: DeviceId,
@@ -809,12 +973,130 @@ impl fmt::Debug for DeviceKeyProof {
     }
 }
 
+/// Opaque custody handle for one device establishment. A public DeviceId or
+/// raw proof cannot settle or roll back a slot without this nonce/slot-bound
+/// handle.
+#[derive(Clone, PartialEq, Eq)]
+pub struct DeviceEstablishmentHandle {
+    device_id: DeviceId,
+    transition_nonce: [u8; 16],
+    slot: [u8; 16],
+    proof: DeviceKeyProof,
+}
+
+impl DeviceEstablishmentHandle {
+    pub(crate) fn from_parts(
+        device_id: DeviceId,
+        transition_nonce: [u8; 16],
+        slot: [u8; 16],
+        proof: DeviceKeyProof,
+    ) -> Self {
+        Self {
+            device_id,
+            transition_nonce,
+            slot,
+            proof,
+        }
+    }
+
+    pub(crate) fn device_id(&self) -> DeviceId {
+        self.device_id
+    }
+
+    pub(crate) fn transition_nonce(&self) -> [u8; 16] {
+        self.transition_nonce
+    }
+
+    pub(crate) fn slot(&self) -> [u8; 16] {
+        self.slot
+    }
+
+    pub(crate) fn proof(&self) -> &DeviceKeyProof {
+        &self.proof
+    }
+}
+
+impl fmt::Debug for DeviceEstablishmentHandle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DeviceEstablishmentHandle")
+            .field("device_id", &self.device_id)
+            .field("transition_nonce", &"redacted")
+            .field("slot", &"redacted")
+            .field("proof", &"redacted")
+            .finish()
+    }
+}
+
+/// Opaque custody handle for one prepared replacement of a stable DeviceId.
+/// It carries both credentials so abort/rollback can restore the exact old
+/// slot rather than guessing from a public id.
+#[derive(Clone, PartialEq, Eq)]
+pub struct DeviceRepairHandle {
+    device_id: DeviceId,
+    transition_nonce: [u8; 16],
+    slot: [u8; 16],
+    previous: DeviceKeyProof,
+    proof: DeviceKeyProof,
+}
+
+impl DeviceRepairHandle {
+    pub(crate) fn from_parts(
+        device_id: DeviceId,
+        transition_nonce: [u8; 16],
+        slot: [u8; 16],
+        previous: DeviceKeyProof,
+        proof: DeviceKeyProof,
+    ) -> Self {
+        Self {
+            device_id,
+            transition_nonce,
+            slot,
+            previous,
+            proof,
+        }
+    }
+
+    pub(crate) fn device_id(&self) -> DeviceId {
+        self.device_id
+    }
+
+    pub(crate) fn transition_nonce(&self) -> [u8; 16] {
+        self.transition_nonce
+    }
+
+    pub(crate) fn slot(&self) -> [u8; 16] {
+        self.slot
+    }
+
+    pub(crate) fn previous(&self) -> &DeviceKeyProof {
+        &self.previous
+    }
+
+    pub(crate) fn proof(&self) -> &DeviceKeyProof {
+        &self.proof
+    }
+}
+
+impl fmt::Debug for DeviceRepairHandle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DeviceRepairHandle")
+            .field("device_id", &self.device_id)
+            .field("transition_nonce", &"redacted")
+            .field("slot", &"redacted")
+            .field("previous", &"redacted")
+            .field("proof", &"redacted")
+            .finish()
+    }
+}
+
 /// Opaque proof that a connection presented a current registered,
 /// non-revoked, host-bound device credential for one session epoch.
 ///
 /// HOLD: real connection/session wiring and OS vault verification stay
-/// outside this slice. Callers must mint this only via
-/// `bind_device_credential`; a raw `DeviceId` is never enough.
+/// outside this slice. Callers must mint this only via the authoritative
+/// store binding operation; a raw `DeviceId` is never enough.
 #[derive(Clone, PartialEq, Eq)]
 pub struct DeviceCredentialProof {
     host_public_id: HostPublicId,
@@ -862,9 +1144,12 @@ impl fmt::Debug for DeviceCredentialProof {
     }
 }
 
-/// Bind a PairedOwner credential after verifying the device is current,
-/// registered, non-revoked, and host-bound in the injected vault.
-pub fn bind_device_credential<V: CredentialVault>(
+/// Bind a credential from an already-loaded snapshot.
+///
+/// This is crate-private because a public caller must not be able to mint
+/// from a stale `ConnectIdentity`. Use `IsolatedRemoteStore::bind_device_credential`,
+/// which reloads the authoritative persistence and checks the active session.
+pub(crate) fn bind_device_credential_from_snapshot<V: CredentialVault>(
     identity: &ConnectIdentity,
     binding: &MachineBinding,
     vault: &V,
@@ -966,29 +1251,53 @@ pub trait CredentialVault {
     /// On error, no credential may have been established. Repeating an
     /// interrupted establishment for the same public ID must return the same
     /// credential rather than rotate or mint a second slot.
-    fn establish_host(&mut self, host_id: HostPublicId) -> Result<HostKeyProof, IdentityError>;
-    fn rollback_host_establishment(
+    fn establish_host(
         &mut self,
         host_id: HostPublicId,
-        proof: &HostKeyProof,
+        transition_nonce: [u8; 16],
+    ) -> Result<HostEstablishmentHandle, IdentityError>;
+    fn commit_host_establishment(
+        &mut self,
+        handle: &HostEstablishmentHandle,
     ) -> Result<(), IdentityError>;
+    fn rollback_host_establishment(
+        &mut self,
+        handle: &HostEstablishmentHandle,
+    ) -> Result<(), IdentityError>;
+    fn recover_host_establishment(
+        &mut self,
+        host_id: HostPublicId,
+        transition_nonce: [u8; 16],
+    ) -> Result<Option<HostEstablishmentHandle>, IdentityError>;
+    /// Report whether an establishment handle is durably committed. A
+    /// prepared handle must remain distinguishable from a committed slot so
+    /// abandon can clear only an uncommitted Enable/Register transition.
+    fn host_establishment_committed(
+        &self,
+        handle: &HostEstablishmentHandle,
+    ) -> Result<bool, IdentityError>;
     /// On error, the active credential remains unchanged and any pending
     /// rotation can be discarded with `abort_host_rotation`.
     fn prepare_host_rotation(
         &mut self,
         host_id: HostPublicId,
-    ) -> Result<HostKeyProof, IdentityError>;
+        transition_nonce: [u8; 16],
+    ) -> Result<HostRotationHandle, IdentityError>;
     /// Commit a prepared host rotation. After a successful commit, a
     /// matching retry must be a no-op so crash recovery can settle.
-    fn commit_host_rotation(&mut self) -> Result<(), IdentityError>;
+    fn commit_host_rotation(&mut self, handle: &HostRotationHandle)
+        -> Result<(), IdentityError>;
     /// Abort a prepared host rotation. Failure is typed and retryable;
     /// implementations must leave the pending slot in place on error.
     /// HOLD: OS vault abort remains unwired.
-    fn abort_host_rotation(&mut self) -> Result<(), IdentityError>;
-    /// Discard an uncommitted host slot by public id. Absence is success.
-    fn discard_uncommitted_host(&mut self, host_id: HostPublicId) -> Result<(), IdentityError>;
-    /// Discard an uncommitted device slot by public id. Absence is success.
-    fn discard_uncommitted_device(&mut self, device_id: DeviceId) -> Result<(), IdentityError>;
+    fn abort_host_rotation(&mut self, handle: &HostRotationHandle) -> Result<(), IdentityError>;
+    /// Recover the exact opaque handle for a durable pending marker. The
+    /// nonce is the only lookup key; a newer slot must never be returned.
+    fn recover_host_rotation(
+        &mut self,
+        host_id: HostPublicId,
+        transition_nonce: [u8; 16],
+    ) -> Result<Option<HostRotationHandle>, IdentityError>;
     fn verify_host(&self, host_id: HostPublicId, proof: &HostKeyProof)
         -> Result<(), IdentityError>;
     /// On error, no device credential may have been established. Repeating an
@@ -997,43 +1306,60 @@ pub trait CredentialVault {
         &mut self,
         device_id: DeviceId,
         kind: DeviceKind,
-    ) -> Result<DeviceKeyProof, IdentityError>;
+        transition_nonce: [u8; 16],
+    ) -> Result<DeviceEstablishmentHandle, IdentityError>;
+    fn commit_device_establishment(
+        &mut self,
+        handle: &DeviceEstablishmentHandle,
+    ) -> Result<(), IdentityError>;
+    fn recover_device_establishment(
+        &mut self,
+        device_id: DeviceId,
+        transition_nonce: [u8; 16],
+    ) -> Result<Option<DeviceEstablishmentHandle>, IdentityError>;
+    /// Report whether an establishment handle is durably committed. Raw
+    /// DeviceId lookup is insufficient because a stale transition may name a
+    /// newer slot for the same public id.
+    fn device_establishment_committed(
+        &self,
+        handle: &DeviceEstablishmentHandle,
+    ) -> Result<bool, IdentityError>;
     /// Replace the credential for an existing stable DeviceId. The old
     /// credential remains restorable until the identity CAS commits.
     fn prepare_device_repair(
         &mut self,
         device_id: DeviceId,
         kind: DeviceKind,
-    ) -> Result<DeviceKeyProof, IdentityError> {
-        self.establish_device(device_id, kind)
-    }
-    fn commit_device_repair(&mut self, _device_id: DeviceId) -> Result<(), IdentityError> {
-        Ok(())
-    }
+        transition_nonce: [u8; 16],
+    ) -> Result<DeviceRepairHandle, IdentityError>;
+    fn commit_device_repair(&mut self, handle: &DeviceRepairHandle) -> Result<(), IdentityError>;
     /// Report whether a prepared replacement is durably active. Adapters that
     /// expose a prepared key through `verify_device` before commit must
     /// override this to distinguish prepared from committed custody.
-    fn device_repair_committed(
-        &self,
-        device_id: DeviceId,
-        proof: &DeviceKeyProof,
-    ) -> Result<bool, IdentityError> {
-        self.verify_device(device_id, proof).map(|_| true)
-    }
-    fn rollback_device_repair(
+    fn device_repair_committed(&self, handle: &DeviceRepairHandle) -> Result<bool, IdentityError>;
+    fn rollback_device_repair(&mut self, handle: &DeviceRepairHandle) -> Result<(), IdentityError>;
+    fn abort_device_repair(&mut self, handle: &DeviceRepairHandle) -> Result<(), IdentityError>;
+    /// Recover the exact opaque repair handle for a durable pending marker.
+    fn recover_device_repair(
         &mut self,
         device_id: DeviceId,
-        proof: &DeviceKeyProof,
-    ) -> Result<(), IdentityError> {
-        self.rollback_device_establishment(device_id, proof)
-    }
-    fn abort_device_repair(&mut self, device_id: DeviceId) -> Result<(), IdentityError> {
-        self.discard_uncommitted_device(device_id)
-    }
+        transition_nonce: [u8; 16],
+    ) -> Result<Option<DeviceRepairHandle>, IdentityError>;
+    /// Invalidate the vault/session lease before a revoke CAS lands. The
+    /// matching restore call is used only when that CAS fails.
+    fn invalidate_device_credential(
+        &mut self,
+        device_id: DeviceId,
+        revocation_epoch: u64,
+    ) -> Result<(), IdentityError>;
+    fn restore_device_credential(
+        &mut self,
+        device_id: DeviceId,
+        revocation_epoch: u64,
+    ) -> Result<(), IdentityError>;
     fn rollback_device_establishment(
         &mut self,
-        device_id: DeviceId,
-        proof: &DeviceKeyProof,
+        handle: &DeviceEstablishmentHandle,
     ) -> Result<(), IdentityError>;
     fn verify_device(
         &self,

@@ -10,7 +10,8 @@ use super::identity::{
     hex_encode, validate_fingerprint, BrowserDeviceDto, ConnectIdentity, CredentialLocation,
     DeviceId, DeviceKind, DeviceRecord, HostIdentityRotation, HostPublicId, IdentityError,
     IdentityLimitField, IdentityReceipt, IdentitySetup, KeyReference, PairingCode, PairingPurpose,
-    PendingIdentityTransition, PendingIdentityTransitionKind, CONNECT_IDENTITY_SCHEMA_VERSION,
+    PendingIdentityTransition, PendingIdentityTransitionKind, PendingRevocationJournal,
+    CONNECT_IDENTITY_SCHEMA_VERSION,
     IDENTITY_CODEC_VERSION, MAX_FINGERPRINT_BYTES, MAX_IDENTITY_ARRAY_ITEMS, MAX_IDENTITY_DEVICES,
     MAX_IDENTITY_MAP_ENTRIES, MAX_IDENTITY_NESTING, MAX_IDENTITY_PHYSICAL_BYTES,
     MAX_IDENTITY_RECEIPTS, MAX_ID_BYTES, MAX_LABEL_BYTES, PAIRING_CODE_LEN,
@@ -36,6 +37,7 @@ pub(crate) struct IdentityDocument {
     pub identity: Option<ConnectIdentity>,
     pub receipts: Vec<IdentityReceipt>,
     pub pending_transition: Option<PendingIdentityTransition>,
+    pub pending_revocation: Option<PendingRevocationJournal>,
     pub requires_explicit_reestablish: bool,
 }
 
@@ -48,6 +50,7 @@ impl fmt::Debug for IdentityDocument {
             .field("has_identity", &self.identity.is_some())
             .field("receipt_count", &self.receipts.len())
             .field("has_pending_transition", &self.pending_transition.is_some())
+            .field("has_pending_revocation", &self.pending_revocation.is_some())
             .field(
                 "requires_explicit_reestablish",
                 &self.requires_explicit_reestablish,
@@ -80,6 +83,8 @@ struct WireDocument {
     connect_identity: Option<WireIdentity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     connect_pending_transition: Option<WirePendingTransition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    connect_pending_revocation: Option<WireRevocationJournal>,
     #[serde(default)]
     connect_requires_explicit_reestablish: bool,
 }
@@ -195,11 +200,33 @@ struct WirePendingTransition {
     kind: String,
     transition_nonce: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    claim_owner: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    claim_expires_at_epoch_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    claim_logical_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     host_public_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     device_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     previous_identity: Option<WireIdentity>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WireRevocationJournal {
+    command_id: String,
+    command_digest: String,
+    revoke_all: bool,
+    entries: Vec<WireRevocationEntry>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WireRevocationEntry {
+    device_id: String,
+    revocation_epoch: u64,
 }
 
 const CONNECT_IDENTITY_KEYS: &[&str] = &[
@@ -247,6 +274,7 @@ fn is_versioned_identity_document(value: &Value) -> bool {
         "connectCasEpoch",
         "connectRequiresExplicitReestablish",
         "connectPendingTransition",
+        "connectPendingRevocation",
     ]
     .iter()
     .any(|key| fields.contains_key(*key))
@@ -266,6 +294,7 @@ fn validate_versioned_wire_fields(value: &Value) -> Result<(), IdentityError> {
         "connectReceipts",
         "connectIdentity",
         "connectPendingTransition",
+        "connectPendingRevocation",
         "connectRequiresExplicitReestablish",
     ];
     reject_unknown_keys(fields, ROOT_KEYS)?;
@@ -348,6 +377,13 @@ fn wire_to_document(
     if let Some(pending) = &pending_transition {
         validate_pending_transition(pending)?;
     }
+    let pending_revocation = wire
+        .connect_pending_revocation
+        .map(revocation_journal_from_wire)
+        .transpose()?;
+    if pending_transition.is_some() && pending_revocation.is_some() {
+        return Err(IdentityError::Corrupt);
+    }
     let mut receipt_ids = BTreeSet::new();
     for receipt in &receipts {
         if !receipt_ids.insert(receipt.command_id()) {
@@ -382,6 +418,7 @@ fn wire_to_document(
         identity,
         receipts,
         pending_transition,
+        pending_revocation,
         requires_explicit_reestablish: wire.connect_requires_explicit_reestablish,
     })
 }
@@ -438,6 +475,12 @@ fn document_to_wire(document: &IdentityDocument) -> Result<WireDocument, Identit
     if let Some(pending) = &document.pending_transition {
         validate_pending_transition(pending)?;
     }
+    if let Some(journal) = &document.pending_revocation {
+        validate_revocation_journal(journal)?;
+    }
+    if document.pending_transition.is_some() && document.pending_revocation.is_some() {
+        return Err(IdentityError::Corrupt);
+    }
     Ok(WireDocument {
         host: Some(WireHost {
             pairing_token: document
@@ -473,6 +516,10 @@ fn document_to_wire(document: &IdentityDocument) -> Result<WireDocument, Identit
             .pending_transition
             .as_ref()
             .map(pending_transition_to_wire),
+        connect_pending_revocation: document
+            .pending_revocation
+            .as_ref()
+            .map(revocation_journal_to_wire),
         connect_requires_explicit_reestablish: document.requires_explicit_reestablish,
     })
 }
@@ -767,6 +814,13 @@ fn pending_transition_from_wire(
         command_digest: parse_digest(&wire.command_digest)?,
         kind,
         transition_nonce: parse_nonce(&wire.transition_nonce)?,
+        claim_owner: wire
+            .claim_owner
+            .as_deref()
+            .map(parse_nonce)
+            .transpose()?,
+        claim_expires_at_epoch_ms: wire.claim_expires_at_epoch_ms,
+        claim_logical_revision: wire.claim_logical_revision,
         host_public_id: wire
             .host_public_id
             .as_deref()
@@ -793,6 +847,9 @@ fn pending_transition_to_wire(pending: &PendingIdentityTransition) -> WirePendin
         }
         .to_string(),
         transition_nonce: hex_encode(&pending.transition_nonce),
+        claim_owner: pending.claim_owner.map(|owner| hex_encode(&owner)),
+        claim_expires_at_epoch_ms: pending.claim_expires_at_epoch_ms,
+        claim_logical_revision: pending.claim_logical_revision,
         host_public_id: pending.host_public_id.map(|id| uuid_string(id.as_bytes())),
         device_id: pending.device_id.map(|id| uuid_string(id.as_bytes())),
         previous_identity: pending
@@ -807,6 +864,21 @@ fn validate_pending_transition(pending: &PendingIdentityTransition) -> Result<()
         return Err(IdentityError::Corrupt);
     }
     if pending.transition_nonce == [0; 16] {
+        return Err(IdentityError::Corrupt);
+    }
+    if pending.claim_owner == Some([0; 16]) {
+        return Err(IdentityError::Corrupt);
+    }
+    if pending.claim_owner.is_some()
+        != (pending.claim_expires_at_epoch_ms.is_some()
+            && pending.claim_logical_revision.is_some())
+    {
+        return Err(IdentityError::Corrupt);
+    }
+    if pending
+        .claim_expires_at_epoch_ms
+        .is_some_and(|expires| expires == 0)
+    {
         return Err(IdentityError::Corrupt);
     }
     match pending.kind {
@@ -844,6 +916,66 @@ fn validate_pending_transition(pending: &PendingIdentityTransition) -> Result<()
             previous.validate_structure()?;
         }
         _ => return Err(IdentityError::Corrupt),
+    }
+    Ok(())
+}
+
+fn revocation_journal_from_wire(
+    wire: WireRevocationJournal,
+) -> Result<PendingRevocationJournal, IdentityError> {
+    let entries = wire
+        .entries
+        .into_iter()
+        .map(|entry| {
+            Ok((
+                DeviceId::parse(&entry.device_id)?,
+                entry.revocation_epoch,
+            ))
+        })
+        .collect::<Result<Vec<_>, IdentityError>>()?;
+    let journal = PendingRevocationJournal {
+        command_id: CommandId::parse(&wire.command_id).map_err(|_| IdentityError::Corrupt)?,
+        command_digest: parse_digest(&wire.command_digest)?,
+        revoke_all: wire.revoke_all,
+        entries,
+    };
+    validate_revocation_journal(&journal)?;
+    Ok(journal)
+}
+
+fn revocation_journal_to_wire(journal: &PendingRevocationJournal) -> WireRevocationJournal {
+    WireRevocationJournal {
+        command_id: journal.command_id.to_string(),
+        command_digest: hex_encode(&journal.command_digest),
+        revoke_all: journal.revoke_all,
+        entries: journal
+            .entries
+            .iter()
+            .map(|(device_id, revocation_epoch)| WireRevocationEntry {
+                device_id: uuid_string(device_id.as_bytes()),
+                revocation_epoch: *revocation_epoch,
+            })
+            .collect(),
+    }
+}
+
+fn validate_revocation_journal(
+    journal: &PendingRevocationJournal,
+) -> Result<(), IdentityError> {
+    if journal.command_digest == [0; 32]
+        || journal.entries.is_empty()
+        || journal.entries.len() > MAX_IDENTITY_DEVICES as usize
+    {
+        return Err(IdentityError::Corrupt);
+    }
+    let mut ids = BTreeSet::new();
+    for (device_id, _) in &journal.entries {
+        if !ids.insert(*device_id) {
+            return Err(IdentityError::DuplicateDevice);
+        }
+    }
+    if !journal.revoke_all && journal.entries.len() != 1 {
+        return Err(IdentityError::Corrupt);
     }
     Ok(())
 }

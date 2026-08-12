@@ -6,7 +6,9 @@ use sha2::{Digest, Sha256};
 use crate::connect::{
     bind_device_credential, validate_device_credential, ActionId, BrowserDeviceDto,
     BrowserPrivateStorage, ConnectRole, CredentialLocation, CredentialVault, DeviceId,
-    DeviceKeyProof, DeviceKind, HostKeyProof, IdentityCommand, IdentityError, IdentityLimitField,
+    DeviceEstablishmentHandle, DeviceKeyProof, DeviceKind, DeviceRepairHandle,
+    HostEstablishmentHandle, HostKeyProof, HostPublicId, HostRotationHandle,
+    IdentityCommand, IdentityError, IdentityLimitField,
     IdentityOp, IdentityPersistence, InMemoryIdentityPersistence, IsolatedRemoteStore,
     LoadedRemoteDocument, MachineBinding, PairingPurpose, PermissionDecision, PermissionEvaluator,
     PermissionRequest, RegisterDevice, RepairDevice, MAX_IDENTITY_ARRAY_ITEMS,
@@ -79,12 +81,26 @@ struct DeviceSlot {
     kind: DeviceKind,
 }
 
+#[derive(Clone)]
+struct PendingDeviceRepair {
+    previous: DeviceSlot,
+    handle: DeviceRepairHandle,
+}
+
 struct FakeVault {
     secret: [u8; 32],
     host: Option<HostSlot>,
+    pending_host_establishment: Option<HostEstablishmentHandle>,
+    completed_host_establishments: BTreeMap<[u8; 16], HostEstablishmentHandle>,
     pending_host: Option<HostSlot>,
+    pending_host_handle: Option<HostRotationHandle>,
+    completed_host_rotations: BTreeMap<[u8; 16], HostRotationHandle>,
     devices: BTreeMap<DeviceId, DeviceSlot>,
-    pending_device_repairs: BTreeMap<DeviceId, DeviceSlot>,
+    pending_device_establishments: BTreeMap<DeviceId, DeviceEstablishmentHandle>,
+    completed_device_establishments: BTreeMap<[u8; 16], DeviceEstablishmentHandle>,
+    pending_device_repairs: BTreeMap<DeviceId, PendingDeviceRepair>,
+    completed_device_repairs: BTreeMap<[u8; 16], DeviceRepairHandle>,
+    revoked_devices: BTreeMap<DeviceId, u64>,
     fail_next_commit: bool,
     constant_device_fingerprint: bool,
     invalid_host_proof: bool,
@@ -100,9 +116,17 @@ impl FakeVault {
         Self {
             secret,
             host: None,
+            pending_host_establishment: None,
+            completed_host_establishments: BTreeMap::new(),
             pending_host: None,
+            pending_host_handle: None,
+            completed_host_rotations: BTreeMap::new(),
             devices: BTreeMap::new(),
+            pending_device_establishments: BTreeMap::new(),
+            completed_device_establishments: BTreeMap::new(),
             pending_device_repairs: BTreeMap::new(),
+            completed_device_repairs: BTreeMap::new(),
+            revoked_devices: BTreeMap::new(),
             fail_next_commit: false,
             constant_device_fingerprint: false,
             invalid_host_proof: false,
@@ -120,9 +144,17 @@ impl FakeVault {
         Self {
             secret: self.secret,
             host: self.host.clone(),
-            pending_host: None,
+            pending_host_establishment: self.pending_host_establishment.clone(),
+            completed_host_establishments: self.completed_host_establishments.clone(),
+            pending_host: self.pending_host.clone(),
+            pending_host_handle: self.pending_host_handle.clone(),
+            completed_host_rotations: self.completed_host_rotations.clone(),
             devices: self.devices.clone(),
-            pending_device_repairs: BTreeMap::new(),
+            pending_device_establishments: self.pending_device_establishments.clone(),
+            completed_device_establishments: self.completed_device_establishments.clone(),
+            pending_device_repairs: self.pending_device_repairs.clone(),
+            completed_device_repairs: self.completed_device_repairs.clone(),
+            revoked_devices: self.revoked_devices.clone(),
             fail_next_commit: self.fail_next_commit,
             constant_device_fingerprint: self.constant_device_fingerprint,
             invalid_host_proof: self.invalid_host_proof,
@@ -169,14 +201,23 @@ impl CredentialVault for FakeVault {
     fn establish_host(
         &mut self,
         host_id: crate::connect::HostPublicId,
-    ) -> Result<HostKeyProof, IdentityError> {
+        transition_nonce: [u8; 16],
+    ) -> Result<HostEstablishmentHandle, IdentityError> {
         if self.invalid_host_proof {
             self.host = Some(HostSlot {
                 host_id,
                 generation: 1,
                 fingerprint: String::new(),
             });
-            return Ok(HostKeyProof::from_parts_for_test(host_id, 1, String::new()));
+            let proof = HostKeyProof::from_parts_for_test(host_id, 1, String::new());
+            let handle = HostEstablishmentHandle::from_parts(
+                host_id,
+                transition_nonce,
+                transition_nonce,
+                proof,
+            );
+            self.pending_host_establishment = Some(handle.clone());
+            return Ok(handle);
         }
         let fingerprint = self.fingerprint(host_id.as_bytes(), 1);
         self.host = Some(HostSlot {
@@ -184,32 +225,108 @@ impl CredentialVault for FakeVault {
             generation: 1,
             fingerprint: fingerprint.clone(),
         });
-        Ok(HostKeyProof::from_parts_for_test(host_id, 1, fingerprint))
+        let handle = HostEstablishmentHandle::from_parts(
+            host_id,
+            transition_nonce,
+            transition_nonce,
+            HostKeyProof::from_parts_for_test(host_id, 1, fingerprint),
+        );
+        self.pending_host_establishment = Some(handle.clone());
+        Ok(handle)
+    }
+
+    fn commit_host_establishment(
+        &mut self,
+        handle: &HostEstablishmentHandle,
+    ) -> Result<(), IdentityError> {
+        if self.pending_host_establishment.as_ref() != Some(handle) {
+            if self.completed_host_establishments.get(&handle.transition_nonce()) == Some(handle) {
+                return Ok(());
+            }
+            return Err(IdentityError::RevisionConflict);
+        }
+        if self.fail_next_commit {
+            self.fail_next_commit = false;
+            return Err(IdentityError::PersistFailed);
+        }
+        self.pending_host_establishment = None;
+        self.completed_host_establishments
+            .insert(handle.transition_nonce(), handle.clone());
+        Ok(())
     }
 
     fn rollback_host_establishment(
         &mut self,
-        host_id: crate::connect::HostPublicId,
-        proof: &HostKeyProof,
+        handle: &HostEstablishmentHandle,
     ) -> Result<(), IdentityError> {
         if self.fail_host_rollback {
             self.fail_host_rollback = false;
             return Err(IdentityError::PersistFailed);
         }
+        if self.pending_host_establishment.as_ref() != Some(handle) {
+            return Err(IdentityError::RevisionConflict);
+        }
         if self.host.as_ref().is_some_and(|slot| {
-            slot.host_id == host_id
-                && slot.generation == proof.generation()
-                && slot.fingerprint == proof.fingerprint()
+            slot.host_id == handle.host_public_id()
+                && slot.generation == handle.proof().generation()
+                && slot.fingerprint == handle.proof().fingerprint()
         }) {
             self.host = None;
         }
+        self.pending_host_establishment = None;
         Ok(())
+    }
+
+    fn recover_host_establishment(
+        &mut self,
+        host_id: crate::connect::HostPublicId,
+        transition_nonce: [u8; 16],
+    ) -> Result<Option<HostEstablishmentHandle>, IdentityError> {
+        if let Some(handle) = self
+            .pending_host_establishment
+            .as_ref()
+            .filter(|handle| {
+                handle.host_public_id() == host_id
+                    && handle.transition_nonce() == transition_nonce
+            })
+        {
+            return Ok(Some(handle.clone()));
+        }
+        Ok(self
+            .completed_host_establishments
+            .get(&transition_nonce)
+            .filter(|handle| handle.host_public_id() == host_id)
+            .cloned())
+    }
+
+    fn host_establishment_committed(
+        &self,
+        handle: &HostEstablishmentHandle,
+    ) -> Result<bool, IdentityError> {
+        if self.pending_host_establishment.as_ref() == Some(handle) {
+            return Ok(false);
+        }
+        if self
+            .completed_host_establishments
+            .get(&handle.transition_nonce())
+            == Some(handle)
+        {
+            return Ok(true);
+        }
+        Err(IdentityError::RevisionConflict)
     }
 
     fn prepare_host_rotation(
         &mut self,
         host_id: crate::connect::HostPublicId,
-    ) -> Result<HostKeyProof, IdentityError> {
+        transition_nonce: [u8; 16],
+    ) -> Result<HostRotationHandle, IdentityError> {
+        let (old_generation, old_fingerprint) = self
+            .host
+            .as_ref()
+            .filter(|slot| slot.host_id == host_id)
+            .map(|slot| (slot.generation, slot.fingerprint.clone()))
+            .unwrap_or((0, String::new()));
         let generation = self
             .host
             .as_ref()
@@ -228,14 +345,30 @@ impl CredentialVault for FakeVault {
             fingerprint: fingerprint.clone(),
         };
         self.pending_host = Some(slot);
-        Ok(HostKeyProof::from_parts_for_test(
+        let proof = HostKeyProof::from_parts_for_test(
             host_id,
             generation,
             fingerprint,
-        ))
+        );
+        let handle = HostRotationHandle::from_parts(
+            host_id,
+            transition_nonce,
+            transition_nonce,
+            old_generation,
+            old_fingerprint,
+            proof,
+        );
+        self.pending_host_handle = Some(handle.clone());
+        Ok(handle)
     }
 
-    fn commit_host_rotation(&mut self) -> Result<(), IdentityError> {
+    fn commit_host_rotation(&mut self, handle: &HostRotationHandle) -> Result<(), IdentityError> {
+        if self.pending_host_handle.as_ref() != Some(handle) {
+            if self.completed_host_rotations.get(&handle.transition_nonce()) == Some(handle) {
+                return Ok(());
+            }
+            return Err(IdentityError::RevisionConflict);
+        }
         if self.fail_next_commit {
             self.fail_next_commit = false;
             return Err(IdentityError::PersistFailed);
@@ -243,43 +376,45 @@ impl CredentialVault for FakeVault {
         if let Some(pending) = self.pending_host.take() {
             self.host = Some(pending);
         }
+        self.pending_host_handle = None;
+        self.completed_host_rotations
+            .insert(handle.transition_nonce(), handle.clone());
         Ok(())
     }
 
-    fn abort_host_rotation(&mut self) -> Result<(), IdentityError> {
+    fn abort_host_rotation(&mut self, handle: &HostRotationHandle) -> Result<(), IdentityError> {
+        if self.pending_host_handle.as_ref() != Some(handle) {
+            return Err(IdentityError::RevisionConflict);
+        }
         if self.fail_next_abort {
             self.fail_next_abort = false;
             return Err(IdentityError::HostRotationCleanupFailed);
         }
         self.pending_host = None;
+        self.pending_host_handle = None;
         Ok(())
     }
 
-    fn discard_uncommitted_host(
+    fn recover_host_rotation(
         &mut self,
         host_id: crate::connect::HostPublicId,
-    ) -> Result<(), IdentityError> {
-        if self.fail_host_rollback {
-            self.fail_host_rollback = false;
-            return Err(IdentityError::PersistFailed);
-        }
-        if self
-            .host
+        transition_nonce: [u8; 16],
+    ) -> Result<Option<HostRotationHandle>, IdentityError> {
+        if let Some(handle) = self
+            .pending_host_handle
             .as_ref()
-            .is_some_and(|slot| slot.host_id == host_id)
+            .filter(|handle| {
+                handle.host_public_id() == host_id
+                    && handle.transition_nonce() == transition_nonce
+            })
         {
-            self.host = None;
+            return Ok(Some(handle.clone()));
         }
-        Ok(())
-    }
-
-    fn discard_uncommitted_device(&mut self, device_id: DeviceId) -> Result<(), IdentityError> {
-        if self.fail_device_rollback {
-            self.fail_device_rollback = false;
-            return Err(IdentityError::PersistFailed);
-        }
-        self.devices.remove(&device_id);
-        Ok(())
+        Ok(self
+            .completed_host_rotations
+            .get(&transition_nonce)
+            .filter(|handle| handle.host_public_id() == host_id)
+            .cloned())
     }
 
     fn verify_host(
@@ -310,7 +445,8 @@ impl CredentialVault for FakeVault {
         &mut self,
         device_id: DeviceId,
         kind: DeviceKind,
-    ) -> Result<DeviceKeyProof, IdentityError> {
+        transition_nonce: [u8; 16],
+    ) -> Result<DeviceEstablishmentHandle, IdentityError> {
         let fingerprint = if self.constant_device_fingerprint {
             self.fingerprint(b"constant-device", 1)
         } else {
@@ -323,27 +459,90 @@ impl CredentialVault for FakeVault {
                 kind,
             },
         );
-        Ok(DeviceKeyProof::from_parts_for_test(
+        let handle = DeviceEstablishmentHandle::from_parts(
             device_id,
-            kind,
-            fingerprint,
-        ))
+            transition_nonce,
+            transition_nonce,
+            DeviceKeyProof::from_parts_for_test(device_id, kind, fingerprint),
+        );
+        self.pending_device_establishments
+            .insert(device_id, handle.clone());
+        Ok(handle)
+    }
+
+    fn commit_device_establishment(
+        &mut self,
+        handle: &DeviceEstablishmentHandle,
+    ) -> Result<(), IdentityError> {
+        if self.pending_device_establishments.get(&handle.device_id()) != Some(handle) {
+            if self.completed_device_establishments.get(&handle.transition_nonce()) == Some(handle) {
+                return Ok(());
+            }
+            return Err(IdentityError::RevisionConflict);
+        }
+        if self.fail_next_commit {
+            self.fail_next_commit = false;
+            return Err(IdentityError::PersistFailed);
+        }
+        self.pending_device_establishments.remove(&handle.device_id());
+        self.completed_device_establishments
+            .insert(handle.transition_nonce(), handle.clone());
+        Ok(())
+    }
+
+    fn recover_device_establishment(
+        &mut self,
+        device_id: DeviceId,
+        transition_nonce: [u8; 16],
+    ) -> Result<Option<DeviceEstablishmentHandle>, IdentityError> {
+        if let Some(handle) = self
+            .pending_device_establishments
+            .get(&device_id)
+            .filter(|handle| handle.transition_nonce() == transition_nonce)
+        {
+            return Ok(Some(handle.clone()));
+        }
+        Ok(self
+            .completed_device_establishments
+            .get(&transition_nonce)
+            .filter(|handle| handle.device_id() == device_id)
+            .cloned())
+    }
+
+    fn device_establishment_committed(
+        &self,
+        handle: &DeviceEstablishmentHandle,
+    ) -> Result<bool, IdentityError> {
+        if self.pending_device_establishments.get(&handle.device_id()) == Some(handle) {
+            return Ok(false);
+        }
+        if self
+            .completed_device_establishments
+            .get(&handle.transition_nonce())
+            == Some(handle)
+        {
+            return Ok(true);
+        }
+        Err(IdentityError::RevisionConflict)
     }
 
     fn rollback_device_establishment(
         &mut self,
-        device_id: DeviceId,
-        proof: &DeviceKeyProof,
+        handle: &DeviceEstablishmentHandle,
     ) -> Result<(), IdentityError> {
         if self.fail_device_rollback {
             self.fail_device_rollback = false;
             return Err(IdentityError::PersistFailed);
         }
-        if self.devices.get(&device_id).is_some_and(|slot| {
-            slot.kind == proof.kind() && slot.fingerprint == proof.fingerprint()
-        }) {
-            self.devices.remove(&device_id);
+        if self.pending_device_establishments.get(&handle.device_id()) != Some(handle) {
+            return Err(IdentityError::RevisionConflict);
         }
+        if self.devices.get(&handle.device_id()).is_some_and(|slot| {
+            slot.kind == handle.proof().kind() && slot.fingerprint == handle.proof().fingerprint()
+        }) {
+            self.devices.remove(&handle.device_id());
+        }
+        self.pending_device_establishments.remove(&handle.device_id());
         Ok(())
     }
 
@@ -352,6 +551,9 @@ impl CredentialVault for FakeVault {
         device_id: DeviceId,
         proof: &DeviceKeyProof,
     ) -> Result<(), IdentityError> {
+        if self.revoked_devices.contains_key(&device_id) {
+            return Err(IdentityError::UnknownDevice);
+        }
         let slot = self
             .devices
             .get(&device_id)
@@ -369,66 +571,142 @@ impl CredentialVault for FakeVault {
         &mut self,
         device_id: DeviceId,
         kind: DeviceKind,
-    ) -> Result<DeviceKeyProof, IdentityError> {
+        transition_nonce: [u8; 16],
+    ) -> Result<DeviceRepairHandle, IdentityError> {
         let previous = self
-            .devices
+            .pending_device_repairs
             .get(&device_id)
-            .cloned()
+            .map(|pending| pending.previous.clone())
+            .or_else(|| self.devices.get(&device_id).cloned())
             .ok_or(IdentityError::MissingCredentialProof)?;
-        self.pending_device_repairs.insert(device_id, previous);
+        let previous_proof = DeviceKeyProof::from_parts_for_test(
+            device_id,
+            previous.kind,
+            previous.fingerprint.clone(),
+        );
         let fingerprint = self.fingerprint(device_id.as_bytes(), 2);
+        let proof = DeviceKeyProof::from_parts_for_test(device_id, kind, fingerprint);
+        let handle = DeviceRepairHandle::from_parts(
+            device_id,
+            transition_nonce,
+            transition_nonce,
+            previous_proof,
+            proof,
+        );
+        self.pending_device_repairs.insert(
+            device_id,
+            PendingDeviceRepair {
+                previous,
+                handle: handle.clone(),
+            },
+        );
         self.devices.insert(
             device_id,
             DeviceSlot {
-                fingerprint: fingerprint.clone(),
+                fingerprint: handle.proof().fingerprint().to_string(),
                 kind,
             },
         );
-        Ok(DeviceKeyProof::from_parts_for_test(
-            device_id,
-            kind,
-            fingerprint,
-        ))
+        Ok(handle)
     }
 
-    fn commit_device_repair(&mut self, device_id: DeviceId) -> Result<(), IdentityError> {
+    fn commit_device_repair(&mut self, handle: &DeviceRepairHandle) -> Result<(), IdentityError> {
+        if self
+            .pending_device_repairs
+            .get(&handle.device_id())
+            .map_or(true, |pending| pending.handle != *handle)
+        {
+            if self.completed_device_repairs.get(&handle.transition_nonce()) == Some(handle) {
+                return Ok(());
+            }
+            return Err(IdentityError::RevisionConflict);
+        }
         if self.fail_next_commit {
             self.fail_next_commit = false;
             return Err(IdentityError::PersistFailed);
         }
-        self.pending_device_repairs.remove(&device_id);
+        self.pending_device_repairs.remove(&handle.device_id());
+        self.completed_device_repairs
+            .insert(handle.transition_nonce(), handle.clone());
         Ok(())
     }
 
-    fn device_repair_committed(
-        &self,
-        device_id: DeviceId,
-        proof: &DeviceKeyProof,
-    ) -> Result<bool, IdentityError> {
-        if self.pending_device_repairs.contains_key(&device_id) {
+    fn device_repair_committed(&self, handle: &DeviceRepairHandle) -> Result<bool, IdentityError> {
+        if self.pending_device_repairs.values().any(|pending| pending.handle == *handle) {
             return Ok(false);
         }
-        self.verify_device(device_id, proof).map(|_| true)
+        if self.completed_device_repairs.get(&handle.transition_nonce()) != Some(handle) {
+            return Err(IdentityError::RevisionConflict);
+        }
+        self.verify_device(handle.device_id(), handle.proof()).map(|_| true)
     }
 
-    fn rollback_device_repair(
-        &mut self,
-        device_id: DeviceId,
-        _proof: &DeviceKeyProof,
-    ) -> Result<(), IdentityError> {
+    fn rollback_device_repair(&mut self, handle: &DeviceRepairHandle) -> Result<(), IdentityError> {
+        if self
+            .pending_device_repairs
+            .get(&handle.device_id())
+            .map_or(true, |pending| pending.handle != *handle)
+        {
+            return Err(IdentityError::RevisionConflict);
+        }
         if self.fail_device_rollback {
             self.fail_device_rollback = false;
             return Err(IdentityError::PersistFailed);
         }
-        if let Some(previous) = self.pending_device_repairs.remove(&device_id) {
-            self.devices.insert(device_id, previous);
+        if let Some(previous) = self.pending_device_repairs.remove(&handle.device_id()) {
+            self.devices
+                .insert(handle.device_id(), previous.previous);
         }
         Ok(())
     }
 
-    fn abort_device_repair(&mut self, device_id: DeviceId) -> Result<(), IdentityError> {
-        if let Some(previous) = self.pending_device_repairs.remove(&device_id) {
-            self.devices.insert(device_id, previous);
+    fn abort_device_repair(&mut self, handle: &DeviceRepairHandle) -> Result<(), IdentityError> {
+        if self
+            .pending_device_repairs
+            .get(&handle.device_id())
+            .map_or(true, |pending| pending.handle != *handle)
+        {
+            return Err(IdentityError::RevisionConflict);
+        }
+        if let Some(previous) = self.pending_device_repairs.remove(&handle.device_id()) {
+            self.devices
+                .insert(handle.device_id(), previous.previous);
+        }
+        Ok(())
+    }
+
+    fn recover_device_repair(
+        &mut self,
+        device_id: DeviceId,
+        transition_nonce: [u8; 16],
+    ) -> Result<Option<DeviceRepairHandle>, IdentityError> {
+        if let Some(handle) = self
+            .pending_device_repairs
+            .get(&device_id)
+            .map(|pending| pending.handle.clone())
+            .filter(|handle| handle.transition_nonce() == transition_nonce)
+        {
+            return Ok(Some(handle));
+        }
+        Ok(self.completed_device_repairs.get(&transition_nonce).cloned())
+    }
+
+    fn invalidate_device_credential(
+        &mut self,
+        device_id: DeviceId,
+        revocation_epoch: u64,
+    ) -> Result<(), IdentityError> {
+        self.revoked_devices.insert(device_id, revocation_epoch);
+        Ok(())
+    }
+
+    fn restore_device_credential(
+        &mut self,
+        device_id: DeviceId,
+        revocation_epoch: u64,
+    ) -> Result<(), IdentityError> {
+        if self.revoked_devices.get(&device_id) == Some(&revocation_epoch) {
+            self.revoked_devices.remove(&device_id);
         }
         Ok(())
     }
@@ -548,6 +826,35 @@ impl IdentityPersistence for ScriptedPersistence {
         }
         if inner.revision != expected_revision {
             return Err(IdentityError::RevisionConflict);
+        }
+        let next_revision = inner
+            .revision
+            .checked_add(1)
+            .ok_or(IdentityError::Overflow)?;
+        inner.bytes = Some(bytes.to_vec());
+        inner.revision = next_revision;
+        inner.successful_writes = write_number;
+        Ok(inner.revision)
+    }
+
+    fn compare_and_swap_exact(
+        &mut self,
+        expected_revision: u64,
+        expected_bytes: Option<&[u8]>,
+        bytes: &[u8],
+    ) -> Result<u64, IdentityError> {
+        let mut inner = self.inner.lock().expect("scripted lock");
+        if inner.revision != expected_revision || inner.bytes.as_deref() != expected_bytes {
+            return Err(IdentityError::RevisionConflict);
+        }
+        let write_number = inner.successful_writes + 1;
+        if inner.panic_on_write == Some(write_number) {
+            drop(inner);
+            panic!("scripted crash during exact CAS");
+        }
+        if inner.fail_on_write == Some(write_number) {
+            inner.fail_on_write = None;
+            return Err(IdentityError::PersistFailed);
         }
         let next_revision = inner
             .revision
@@ -1362,19 +1669,28 @@ fn rotate_host_recovers_commit_after_identity_cas() {
 }
 
 #[test]
-fn paired_owner_allows_dangerous_only_with_bound_device_credential_proof() {
+fn paired_owner_proof_still_requires_authoritative_live_epochs() {
     let mut harness = enabled_with_two_devices();
     let identity = harness.load().identity().unwrap().clone();
     let device_id = identity.devices()[0].device_id;
     let proof = bind_device_credential(&identity, &harness.binding, &harness.vault, device_id, 7)
         .expect("current registered host-bound device");
-    let decision = PermissionEvaluator::owner_only().evaluate(PermissionRequest {
-        role: ConnectRole::PairedOwner,
-        task_id: None,
-        action: ActionId::APPROVE_DANGEROUS,
-        credential: Some(proof),
-    });
-    assert_eq!(decision, PermissionDecision::Allow);
+    let decision = PermissionEvaluator::owner_only().evaluate_with_store(
+        PermissionRequest {
+            role: ConnectRole::PairedOwner,
+            task_id: None,
+            action: ActionId::APPROVE_DANGEROUS,
+            credential: Some(proof),
+        },
+        &mut harness.store,
+        &harness.binding,
+        &harness.vault,
+        7,
+    );
+    assert_eq!(
+        decision,
+        PermissionDecision::Denied(crate::connect::PermissionDenyReason::NonAuthoritativeContext)
+    );
 
     harness.execute(
         3,
@@ -1440,14 +1756,14 @@ fn stale_credentials_are_rejected_by_authoritative_identity_validation() {
         Err(IdentityError::UnknownDevice)
     );
     assert_eq!(
-        PermissionEvaluator::owner_only().evaluate_with_authority(
+        PermissionEvaluator::owner_only().evaluate_with_store(
             PermissionRequest {
                 role: ConnectRole::PairedOwner,
                 task_id: None,
                 action: ActionId::APPROVE_DANGEROUS,
                 credential: Some(proof),
             },
-            &revoked,
+            &mut harness.store,
             &harness.binding,
             &harness.vault,
             7,
@@ -2146,6 +2462,389 @@ fn host_vault_retry_and_abandon_serialize_on_pending_cas() {
             Err(IdentityError::RevisionConflict) | Err(IdentityError::TransitionPending)
         ),
         "the loser must fail closed on the same pending CAS"
+    );
+}
+
+#[test]
+fn pending_claim_persists_one_shot_owner_and_rejects_second_reader() {
+    let persistence = ScriptedPersistence::new(LEGACY_REMOTE_JSON.as_bytes());
+    let mut store = IsolatedRemoteStore::new(persistence.clone()).unwrap();
+    let binding = MachineBinding::new("fixture-machine-a");
+    let mut vault = FakeVault::bind(&binding);
+    persistence.panic_after_marker();
+    let command = IdentityCommand {
+        command_id: CommandId::new(),
+        expected_revision: 0,
+        op: IdentityOp::Enable {
+            host_build: 100,
+            now_epoch_ms: 1,
+        },
+    };
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        store.execute(&binding, &mut vault, command)
+    }))
+    .is_err());
+    let pending = store
+        .pending_transition_for_test()
+        .unwrap()
+        .expect("durable pending marker");
+    persistence.clear_faults();
+
+    // Reader A claims and pauses before touching the vault. The marker must
+    // carry a distinct one-shot owner token, not merely re-CAS the nonce.
+    store
+        .claim_pending_transition_for_test(&pending)
+        .expect("reader A claims marker");
+    let claimed = store
+        .pending_transition_for_test()
+        .unwrap()
+        .expect("claimed marker");
+    assert!(claimed.claim_owner.is_some());
+    assert_ne!(claimed.claim_owner, Some(claimed.transition_nonce));
+
+    let mut reader_b = IsolatedRemoteStore::new(persistence).unwrap();
+    assert_eq!(
+        reader_b
+            .claim_pending_transition_for_test(&pending)
+            .expect_err("reader B cannot claim A's paused marker"),
+        IdentityError::RevisionConflict
+    );
+}
+
+#[test]
+fn expired_pending_claim_is_reclaimed_after_store_restart() {
+    let persistence = ScriptedPersistence::new(LEGACY_REMOTE_JSON.as_bytes());
+    let mut store = IsolatedRemoteStore::new(persistence.clone()).unwrap();
+    let binding = MachineBinding::new("fixture-machine-a");
+    let mut vault = FakeVault::bind(&binding);
+    persistence.panic_after_marker();
+    let command = IdentityCommand {
+        command_id: CommandId::new(),
+        expected_revision: 0,
+        op: IdentityOp::Enable {
+            host_build: 100,
+            now_epoch_ms: 1,
+        },
+    };
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        store.execute(&binding, &mut vault, command)
+    }))
+    .is_err());
+    persistence.clear_faults();
+    let pending = store.pending_transition_for_test().unwrap().unwrap();
+    store
+        .claim_pending_transition_for_test(&pending)
+        .expect("reader A claims");
+    store
+        .expire_pending_claim_for_test()
+        .expect("test expires durable claim");
+    let expired = store.pending_transition_for_test().unwrap().unwrap();
+    let mut restarted = IsolatedRemoteStore::new(persistence).unwrap();
+    restarted
+        .claim_pending_transition_for_test(&expired)
+        .expect("reader B reclaims an expired claim");
+    assert_ne!(
+        restarted.pending_transition_for_test().unwrap().unwrap().claim_owner,
+        expired.claim_owner
+    );
+}
+
+#[test]
+fn exact_persistence_cas_rejects_aba_bytes_at_same_physical_epoch() {
+    let mut persistence = InMemoryIdentityPersistence::from_bytes(LEGACY_REMOTE_JSON.as_bytes())
+        .expect("legacy fixture");
+    let original = persistence.snapshot_bytes().unwrap();
+    persistence
+        .compare_and_swap(0, b"replacement")
+        .expect("physical CAS replacement");
+    persistence.set_revision_for_test(0);
+    assert_eq!(
+        persistence.compare_and_swap_exact(0, Some(&original), b"stale executor"),
+        Err(IdentityError::RevisionConflict)
+    );
+}
+
+#[test]
+fn revocation_journal_survives_crash_after_vault_mutation_and_reconciles() {
+    let persistence = ScriptedPersistence::new(LEGACY_REMOTE_JSON.as_bytes());
+    let mut store = IsolatedRemoteStore::new(persistence.clone()).unwrap();
+    let binding = MachineBinding::new("fixture-machine-a");
+    let mut vault = FakeVault::bind(&binding);
+    store
+        .execute(
+            &binding,
+            &mut vault,
+            IdentityCommand {
+                command_id: CommandId::new(),
+                expected_revision: 0,
+                op: IdentityOp::Enable {
+                    host_build: 100,
+                    now_epoch_ms: 1,
+                },
+            },
+        )
+        .unwrap();
+    store
+        .execute(
+            &binding,
+            &mut vault,
+            IdentityCommand {
+                command_id: CommandId::new(),
+                expected_revision: 1,
+                op: IdentityOp::RegisterDevice(RegisterDevice {
+                    kind: DeviceKind::Native,
+                    label: "journal-device".to_string(),
+                    legacy_client_id: Some("journal-client".to_string()),
+                    browser: None,
+                }),
+            },
+        )
+        .unwrap();
+    let command = IdentityCommand {
+        command_id: CommandId::new(),
+        expected_revision: 2,
+        op: IdentityOp::RevokeAllDevices { now_epoch_ms: 9 },
+    };
+    persistence.panic_after_marker();
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        store.execute(&binding, &mut vault, command.clone())
+    }))
+    .is_err());
+    assert!(
+        store.pending_revocation_for_test().unwrap().is_some(),
+        "journal must remain durable after vault invalidation before the final CAS"
+    );
+    persistence.clear_faults();
+    store
+        .execute(&binding, &mut vault, command)
+        .expect("retry finalizes the already-invalidated journal");
+    assert!(store.pending_revocation_for_test().unwrap().is_none());
+}
+
+#[test]
+fn host_rotation_handles_are_bound_to_nonce_and_pending_slot() {
+    let binding = MachineBinding::new("fixture-machine-a");
+    let mut vault = FakeVault::bind(&binding);
+    let host_id = HostPublicId::new();
+    let first = vault
+        .prepare_host_rotation(host_id, [1_u8; 16])
+        .expect("first opaque rotation handle");
+    let second = vault
+        .prepare_host_rotation(host_id, [2_u8; 16])
+        .expect("second opaque rotation handle");
+
+    assert_eq!(
+        vault.commit_host_rotation(&first),
+        Err(IdentityError::RevisionConflict)
+    );
+    assert_eq!(
+        vault.abort_host_rotation(&first),
+        Err(IdentityError::RevisionConflict)
+    );
+    vault
+        .commit_host_rotation(&second)
+        .expect("current handle commits");
+}
+
+#[test]
+fn device_repair_handles_are_explicit_and_abort_restores_previous_credential() {
+    let binding = MachineBinding::new("fixture-machine-a");
+    let mut vault = FakeVault::bind(&binding);
+    let device_id = DeviceId::new();
+    let original = vault
+        .establish_device(device_id, DeviceKind::Native, [2_u8; 16])
+        .map(|handle| handle.proof().clone())
+        .expect("original credential");
+    let first = vault
+        .prepare_device_repair(device_id, DeviceKind::Native, [3_u8; 16])
+        .expect("opaque repair handle");
+    let second = vault
+        .prepare_device_repair(device_id, DeviceKind::Native, [4_u8; 16])
+        .expect("second opaque repair handle");
+
+    assert_eq!(
+        vault.commit_device_repair(&first),
+        Err(IdentityError::RevisionConflict)
+    );
+    assert_eq!(
+        vault.abort_device_repair(&first),
+        Err(IdentityError::RevisionConflict)
+    );
+    vault
+        .abort_device_repair(&second)
+        .expect("current abort restores old credential");
+    vault
+        .verify_device(device_id, &original)
+        .expect("abort restored exact original credential");
+}
+
+#[test]
+fn abandoning_post_cas_uncommitted_enable_clears_only_the_new_host() {
+    let persistence = InMemoryIdentityPersistence::from_bytes(LEGACY_REMOTE_JSON.as_bytes())
+        .expect("legacy fixture");
+    let mut store = IsolatedRemoteStore::new(persistence).unwrap();
+    let binding = MachineBinding::new("fixture-machine-a");
+    let mut vault = FakeVault::bind(&binding);
+    vault.fail_next_commit();
+    let error = store
+        .execute(
+            &binding,
+            &mut vault,
+            IdentityCommand {
+                command_id: CommandId::new(),
+                expected_revision: 0,
+                op: IdentityOp::Enable {
+                    host_build: 100,
+                    now_epoch_ms: 1,
+                },
+            },
+        )
+        .expect_err("post-CAS establishment commit failure");
+    assert_eq!(error, IdentityError::PersistFailed);
+    let abandoned = store
+        .abandon_pending_transition(&binding, &mut vault)
+        .expect("uncommitted host can be abandoned");
+    assert!(abandoned.identity().is_none());
+    assert!(vault.host.is_none());
+    assert!(!abandoned.has_pending_transition());
+}
+
+#[test]
+fn abandoning_post_cas_uncommitted_register_preserves_committed_identity() {
+    let mut harness = Harness::from_legacy();
+    harness.execute(
+        0,
+        IdentityOp::Enable {
+            host_build: 100,
+            now_epoch_ms: 1,
+        },
+    );
+    let before = harness.load().identity().unwrap().clone();
+    harness.vault.fail_next_commit();
+    let error = harness
+        .store
+        .execute(
+            &harness.binding,
+            &mut harness.vault,
+            IdentityCommand {
+                command_id: CommandId::new(),
+                expected_revision: 1,
+                op: IdentityOp::RegisterDevice(RegisterDevice {
+                    kind: DeviceKind::Native,
+                    label: "uncommitted".to_string(),
+                    legacy_client_id: Some("uncommitted".to_string()),
+                    browser: None,
+                }),
+            },
+        )
+        .expect_err("post-CAS establishment commit failure");
+    assert_eq!(error, IdentityError::PersistFailed);
+    let abandoned = harness
+        .store
+        .abandon_pending_transition(&harness.binding, &mut harness.vault)
+        .expect("uncommitted device can be abandoned");
+    assert_eq!(abandoned.identity(), Some(&before));
+    assert!(!abandoned.has_pending_transition());
+}
+
+#[test]
+fn store_binding_and_authoritative_permission_reject_stale_revoked_proof() {
+    let mut harness = enabled_with_two_devices();
+    let identity = harness.load().identity().unwrap().clone();
+    let device_id = identity.devices()[0].device_id;
+    let proof = harness
+        .store
+        .bind_device_credential(&harness.binding, &harness.vault, device_id, 7)
+        .expect("store binds from current persistence");
+
+    let request = PermissionRequest {
+        role: ConnectRole::PairedOwner,
+        task_id: None,
+        action: ActionId::APPROVE_DANGEROUS,
+        credential: Some(proof.clone()),
+    };
+    assert_eq!(
+        PermissionEvaluator::owner_only().evaluate(request.clone()),
+        PermissionDecision::Denied(crate::connect::PermissionDenyReason::DeviceCredentialRequired),
+        "snapshot-only evaluator must fail closed"
+    );
+    assert_eq!(
+        PermissionEvaluator::owner_only().evaluate_with_store(
+            request,
+            &mut harness.store,
+            &harness.binding,
+            &harness.vault,
+            7,
+        ),
+        PermissionDecision::Denied(crate::connect::PermissionDenyReason::NonAuthoritativeContext)
+    );
+
+    let mut foreign = enabled_with_two_devices();
+    let foreign_identity = foreign.load().identity().unwrap().clone();
+    let foreign_proof = foreign
+        .store
+        .bind_device_credential(
+            &foreign.binding,
+            &foreign.vault,
+            foreign_identity.devices()[0].device_id,
+            7,
+        )
+        .expect("foreign proof is valid only in its own authority");
+    assert_eq!(
+        PermissionEvaluator::owner_only().evaluate_with_store(
+            PermissionRequest {
+                role: ConnectRole::PairedOwner,
+                task_id: None,
+                action: ActionId::APPROVE_DANGEROUS,
+                credential: Some(foreign_proof),
+            },
+            &mut harness.store,
+            &harness.binding,
+            &harness.vault,
+            7,
+        ),
+        PermissionDecision::Denied(crate::connect::PermissionDenyReason::DeviceCredentialRequired)
+    );
+
+    harness.execute(
+        3,
+        IdentityOp::RevokeDevice {
+            device_id,
+            now_epoch_ms: 8,
+        },
+    );
+    assert_eq!(
+        harness
+            .store
+            .bind_device_credential(&harness.binding, &harness.vault, device_id, 9)
+            .expect_err("revoked store entry cannot mint new proof"),
+        IdentityError::UnknownDevice
+    );
+    assert_eq!(
+        bind_device_credential(
+            &identity,
+            &harness.binding,
+            &harness.vault,
+            device_id,
+            9,
+        )
+        .expect_err("pre-revoke snapshot cannot mint after vault lease invalidation"),
+        IdentityError::UnknownDevice
+    );
+    assert_eq!(
+        PermissionEvaluator::owner_only().evaluate_with_store(
+            PermissionRequest {
+                role: ConnectRole::PairedOwner,
+                task_id: None,
+                action: ActionId::APPROVE_DANGEROUS,
+                credential: Some(proof),
+            },
+            &mut harness.store,
+            &harness.binding,
+            &harness.vault,
+            7,
+        ),
+        PermissionDecision::Denied(crate::connect::PermissionDenyReason::DeviceCredentialRequired)
     );
 }
 
