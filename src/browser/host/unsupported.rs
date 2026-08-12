@@ -7,8 +7,8 @@ use super::super::{
     BrowserBounds, BrowserHostControl, BrowserHostEvent, BrowserPageRecordingIpcError,
     BrowserPaneSurface, BrowserRecipeV1, BrowserRecordingError, BrowserRecordingInstance,
     BrowserRecordingReview, BrowserRecordingStatus, BrowserReplayRepairCleanupWork,
-    BrowserWorkflowCoordinator, BrowserWorkflowReviewMutation, BrowserWorkflowReviewProjection,
-    BrowserWorkspaceKey,
+    BrowserGatewayRegistrar, BrowserWorkflowCoordinator, BrowserWorkflowReviewMutation,
+    BrowserWorkflowReviewProjection, BrowserWorkspaceKey,
 };
 use super::super::{
     validate_direct_repair_preview_command, validate_direct_secret_command, BrowserCommand,
@@ -161,6 +161,10 @@ impl BrowserWebViewHost {
     }
 
     pub fn attach_foreground_executor(&mut self, _executor: gpui::ForegroundExecutor) {}
+
+    pub fn attach_gateway_registrar(&mut self, _registrar: BrowserGatewayRegistrar) {}
+
+    pub fn detach_gateway_registrar(&mut self) {}
 
     pub(crate) fn window_lifetime_fence(&self) -> BrowserNativeWindowLifetime {
         self.native_window_lifetime.clone()

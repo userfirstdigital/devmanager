@@ -1359,6 +1359,7 @@ impl NativeShell {
                         browser_app_config_dir,
                     ) {
                         Ok(gateway) => {
+                            browser_host.attach_gateway_registrar(gateway.registrar());
                             process_manager
                                 .set_browser_gateway_registrar(Some(gateway.registrar()));
                             Some(gateway)
@@ -2041,6 +2042,7 @@ impl NativeShell {
         let should_run =
             self.state.settings().browser_enabled && self.browser_host.status().available;
         if !should_run {
+            self.browser_host.detach_gateway_registrar();
             self.process_manager.set_browser_gateway_registrar(None);
             self.browser_gateway = None;
             return None;
@@ -2049,6 +2051,7 @@ impl NativeShell {
             return None;
         }
         let Some(browser_app_config_dir) = self.browser_app_config_dir.as_ref() else {
+            self.browser_host.detach_gateway_registrar();
             self.process_manager.set_browser_gateway_registrar(None);
             self.browser_gateway = None;
             return Some(
@@ -2061,12 +2064,14 @@ impl NativeShell {
             browser_app_config_dir,
         ) {
             Ok(gateway) => {
+                self.browser_host.attach_gateway_registrar(gateway.registrar());
                 self.process_manager
                     .set_browser_gateway_registrar(Some(gateway.registrar()));
                 self.browser_gateway = Some(gateway);
                 None
             }
             Err(error) => {
+                self.browser_host.detach_gateway_registrar();
                 self.process_manager.set_browser_gateway_registrar(None);
                 Some(format!(
                     "Browser tools are unavailable; AI terminals will continue normally: {error}"

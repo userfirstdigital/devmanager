@@ -1379,7 +1379,19 @@ impl BrowserWebViewHost {
     }
 
     pub fn attach_gateway_registrar(&mut self, registrar: BrowserGatewayRegistrar) {
+        // A gateway restart must not leave the old registrar holding live
+        // surface bindings. Clear them while the old authority is still
+        // attached, then install the new authority.
+        self.clear_all_published_gateway_bindings();
         self.gateway_registrar = Some(registrar);
+    }
+
+    /// Detach the gateway authority before the app drops or disables it.
+    /// Published bindings are revoked while the registrar is still available;
+    /// subsequent host work fails closed until a new registrar is attached.
+    pub fn detach_gateway_registrar(&mut self) {
+        self.clear_all_published_gateway_bindings();
+        self.gateway_registrar = None;
     }
 
     pub fn prepare_task_surface_identity(
