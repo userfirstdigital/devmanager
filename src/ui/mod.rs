@@ -52,7 +52,7 @@ pub mod quality;
 pub use prompts::{
     MAX_VIRTUALIZED_LINKS, MAX_VIRTUALIZED_PROMPTS, PromptLibraryAction, PromptLibraryKey,
     PromptLibraryLoadState, PromptLibrarySession, chain_editor, editor, fixtures, history, library,
-    picker, put_in_composer_action, version_diff,
+    mutation, picker, put_in_composer_action, version_diff,
 };
 pub use shell::{
     AccessibleName, LibrarySection, PromptLibraryChrome, PromptLibraryUiError,

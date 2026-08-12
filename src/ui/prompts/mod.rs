@@ -5,6 +5,7 @@ pub mod editor;
 pub mod fixtures;
 pub mod history;
 pub mod library;
+pub mod mutation;
 pub mod picker;
 pub mod version_diff;
 

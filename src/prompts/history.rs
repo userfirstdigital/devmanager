@@ -265,9 +265,10 @@ pub struct IndexProgress {
 
 /// Opaque proof that a provider-input settlement accepted a user prompt.
 ///
-/// Production callers must obtain this from the durable provider-input
-/// participant. That wiring is not in this base, so the only public
-/// constructor returns [`PromptHistoryErrorCode::ProviderInputUnavailable`].
+/// Production callers must obtain this from a current, provider-owned durable
+/// settlement via [`ProviderDurableSettlement`]. Transcript, cwd, and
+/// timestamp inference are never accepted. Providers that lack durable
+/// settlement support return [`PromptHistoryErrorCode::ProviderInputUnavailable`].
 pub struct ValidatedDeliveredInputProof {
     history_id: PromptHistoryId,
     request_id: RequestId,
@@ -291,10 +292,95 @@ impl fmt::Debug for ValidatedDeliveredInputProof {
 }
 
 impl ValidatedDeliveredInputProof {
+    /// Construct a proof only from a current provider-owned durable settlement.
+    pub fn from_provider_durable_settlement(
+        settlement: &dyn ProviderDurableSettlement,
+    ) -> Result<Self, PromptHistoryError> {
+        let owned = settlement.current_durable_settlement()?;
+        if owned.settlement_generation == 0 {
+            return Err(PromptHistoryError::from_code(
+                PromptHistoryErrorCode::Validation,
+            ));
+        }
+        let proof = Self {
+            history_id: owned.history_id,
+            request_id: owned.request_id,
+            submitted_event_id: owned.submitted_event_id,
+            task_id: owned.task_id,
+            agent_session_id: owned.agent_session_id,
+            provider_kind: owned.provider_kind,
+            body: owned.body,
+            accepted_at_ms: owned.accepted_at_ms,
+            provenance: owned.provenance,
+        };
+        validate_proof(&proof)?;
+        Ok(proof)
+    }
+
+    /// Compatibility alias for callers whose provider has no durable
+    /// settlement boundary. This remains fail-closed.
     pub fn from_provider_input_settlement() -> Result<Self, PromptHistoryError> {
         Err(PromptHistoryError::from_code(
             PromptHistoryErrorCode::ProviderInputUnavailable,
         ))
+    }
+}
+
+/// Provider-owned durable settlement fact used to construct delivered-history
+/// proofs. The generation is supplied by the provider participant and prevents
+/// stale or inferred delivery claims from becoming history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderOwnedDurableSettlement {
+    pub history_id: PromptHistoryId,
+    pub request_id: RequestId,
+    pub submitted_event_id: EventId,
+    pub task_id: TaskId,
+    pub agent_session_id: AgentSessionId,
+    pub provider_kind: String,
+    pub body: String,
+    pub accepted_at_ms: i64,
+    pub provenance: PromptHistoryProvenance,
+    pub settlement_generation: u64,
+}
+
+/// Typed boundary for production-capable delivered-history settlement.
+pub trait ProviderDurableSettlement {
+    fn current_durable_settlement(
+        &self,
+    ) -> Result<ProviderOwnedDurableSettlement, PromptHistoryError>;
+}
+
+/// Marker for providers that do not expose durable settlement.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct UnsupportedProviderDurableSettlement;
+
+impl ProviderDurableSettlement for UnsupportedProviderDurableSettlement {
+    fn current_durable_settlement(
+        &self,
+    ) -> Result<ProviderOwnedDurableSettlement, PromptHistoryError> {
+        Err(PromptHistoryError::from_code(
+            PromptHistoryErrorCode::ProviderInputUnavailable,
+        ))
+    }
+}
+
+/// Adapts a provider settlement receipt onto the existing prompt-history
+/// transaction and validation path. Application is atomic in the caller's
+/// IMMEDIATE transaction; unsupported receipts do not insert history.
+pub struct DurableProviderDeliveryAdapter<'a> {
+    settlement: &'a dyn ProviderDurableSettlement,
+}
+
+impl<'a> DurableProviderDeliveryAdapter<'a> {
+    pub fn new(settlement: &'a dyn ProviderDurableSettlement) -> Self {
+        Self { settlement }
+    }
+
+    pub fn commit(
+        &self,
+        store: &mut PromptHistoryStore,
+    ) -> Result<Option<RecordedPromptHistory>, PromptHistoryError> {
+        store.commit_provider_durable_settlement(self.settlement)
     }
 }
 
@@ -401,6 +487,17 @@ impl PromptHistoryStore {
             history_id: proof.history_id,
             request_id: proof.request_id,
         }))
+    }
+
+    /// Apply one provider-owned durable settlement within the caller's
+    /// existing IMMEDIATE transaction. The provider fact is resolved and
+    /// validated before any history row is written.
+    pub fn apply_provider_durable_settlement_in_tx(
+        tx: &Transaction<'_>,
+        settlement: &dyn ProviderDurableSettlement,
+    ) -> Result<Option<RecordedPromptHistory>, PromptHistoryError> {
+        let proof = ValidatedDeliveredInputProof::from_provider_durable_settlement(settlement)?;
+        Self::apply_delivered_in_tx(tx, &proof)
     }
 
     pub fn recent(
@@ -928,6 +1025,22 @@ impl PromptHistoryStore {
             |row| row.get(0),
         )?;
         Ok(history == 1 && search == 1 && pending == 1)
+    }
+
+    /// Commit one provider-owned durable settlement atomically with the
+    /// history row and search pending state. Providers without this boundary
+    /// fail closed before SQLite's write lock is taken.
+    pub fn commit_provider_durable_settlement(
+        &mut self,
+        settlement: &dyn ProviderDurableSettlement,
+    ) -> Result<Option<RecordedPromptHistory>, PromptHistoryError> {
+        let proof = ValidatedDeliveredInputProof::from_provider_durable_settlement(settlement)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let recorded = Self::apply_delivered_in_tx(&tx, &proof)?;
+        tx.commit()?;
+        Ok(recorded)
     }
 }
 
