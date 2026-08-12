@@ -1607,11 +1607,43 @@ pub(crate) fn record_dispatch_completion(
     })
 }
 
+pub(crate) fn settle_provider_input_delivery(
+    store: &mut KernelStore,
+    permit: &DispatchPermit,
+    receipt: &crate::providers::input::ProviderInputWriteReceipt,
+) -> Result<OperationState, StoreError> {
+    store.with_immediate_transaction(|tx| {
+        record_dispatch_completion_with_provider_receipt_in_tx(
+            tx,
+            permit,
+            DispatchCompletion::Settled,
+            now_ms()?,
+            Some(receipt),
+        )
+    })
+}
+
 pub(crate) fn record_dispatch_completion_in_tx(
     tx: &Transaction<'_>,
     permit: &DispatchPermit,
     completion: DispatchCompletion,
     observed_at_ms: i64,
+) -> Result<OperationState, StoreError> {
+    record_dispatch_completion_with_provider_receipt_in_tx(
+        tx,
+        permit,
+        completion,
+        observed_at_ms,
+        None,
+    )
+}
+
+fn record_dispatch_completion_with_provider_receipt_in_tx(
+    tx: &Transaction<'_>,
+    permit: &DispatchPermit,
+    completion: DispatchCompletion,
+    observed_at_ms: i64,
+    receipt: Option<&crate::providers::input::ProviderInputWriteReceipt>,
 ) -> Result<OperationState, StoreError> {
     let outbox = load_outbox_row_by_id(tx, permit.outbox_id())?.ok_or(StoreError::StaleClaim)?;
     let operation =
@@ -1651,14 +1683,18 @@ pub(crate) fn record_dispatch_completion_in_tx(
         _ => return Err(StoreError::Corruption),
     };
 
-    // ProviderInput has no stock adapter yet. A generic dispatch callback is
-    // not proof that bytes crossed the provider boundary, so keeping this
-    // path from manufacturing ProviderInputDelivered is an intentional HOLD.
-    // The future adapter-proof seam must call the typed delivery path instead.
+    // Generic dispatch completion cannot manufacture ProviderInputDelivered.
+    // Only a live managed-session write receipt that matches the exact Effect
+    // identity, action, and bounded bytes may settle this destination.
     if operation.state == "accepted"
         && matches!(&effect_doc.effect, Effect::DeliverProviderInput { .. })
     {
-        return Err(StoreError::InvalidDispatchTransition);
+        let Some(receipt) = receipt else {
+            return Err(StoreError::InvalidDispatchTransition);
+        };
+        if !provider_input_receipt_matches_effect(receipt, &effect_doc.effect) {
+            return Err(StoreError::InvalidDispatchTransition);
+        }
     }
 
     let kind = match completion {
@@ -2318,6 +2354,48 @@ fn operation_fence_from_projection(
             None => None,
         },
     })
+}
+
+fn provider_input_receipt_matches_effect(
+    receipt: &crate::providers::input::ProviderInputWriteReceipt,
+    effect: &Effect,
+) -> bool {
+    let Effect::DeliverProviderInput {
+        task_id,
+        operation_id,
+        command_id,
+        client_id,
+        agent_session_id,
+        provider_kind,
+        provider_session_id,
+        runtime_generation,
+        action_epoch,
+        turn_id,
+        question_id,
+        approval_id,
+        action,
+        ..
+    } = effect
+    else {
+        return false;
+    };
+    let identity = receipt.identity();
+    identity.task_id == *task_id
+        && identity.operation_id == *operation_id
+        && identity.command_id == *command_id
+        && identity.client_id == *client_id
+        && identity.agent_session_id == *agent_session_id
+        && identity.provider_kind == *provider_kind
+        && identity.provider_session_id == *provider_session_id
+        && identity.runtime_generation == *runtime_generation
+        && identity.action_epoch == *action_epoch
+        && identity.turn_id == *turn_id
+        && identity.question_id == *question_id
+        && identity.approval_id == *approval_id
+        && receipt.action() == action
+        && crate::providers::input::provider_input_action_bytes(action)
+            .is_ok_and(|expected| expected == receipt.as_bytes())
+        && receipt.resource_fence().runtime_generation == *runtime_generation
 }
 
 fn validate_effect_matches_fence(

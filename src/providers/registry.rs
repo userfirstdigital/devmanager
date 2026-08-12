@@ -871,6 +871,10 @@ impl ProviderRegistry {
         self.adapters.contains_key(&kind)
     }
 
+    pub fn adapter(&self, kind: ProviderKind) -> Option<Arc<dyn ProviderAdapter>> {
+        self.adapters.get(&kind).cloned()
+    }
+
     pub async fn resolve_executable(
         &self,
         kind: ProviderKind,
