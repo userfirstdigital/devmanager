@@ -3,10 +3,11 @@ use devmanager::ui::preview::{
     PreviewPathPolicy, PreviewRequest,
 };
 use devmanager::ui::preview_capture::{
-    active_capture_thread_count, capture_contract, receive_first_frame,
-    settle_capture_with_cleanup, CaptureCleanupOperation, CaptureColorFormat, CaptureDeadline,
-    CaptureSetting, PreviewCaptureError, CLEANUP_DIAGNOSTIC_TRUNCATION_MARKER,
-    FIRST_FRAME_DEADLINE, MAX_CLEANUP_DIAGNOSTIC_BYTES,
+    active_capture_thread_count, capture_contract, preview_content_size_is_exact,
+    receive_first_frame, settle_capture_with_cleanup, CaptureCleanupOperation, CaptureColorFormat,
+    CaptureDeadline, CaptureSetting, PreviewCaptureError, CLEANUP_DIAGNOSTIC_TRUNCATION_MARKER,
+    FIRST_FRAME_DEADLINE, MAX_CLEANUP_DIAGNOSTIC_BYTES, PREVIEW_CONTENT_HEIGHT,
+    PREVIEW_CONTENT_WIDTH,
 };
 use image::GenericImageView;
 use std::fs;
@@ -120,13 +121,21 @@ fn task_cockpit_fixture_describes_the_actual_native_shell_surface() {
     let body = &preview.root_snapshot().body;
     for section in [
         "Task Cockpit",
-        "Header",
+        "Header unavailable",
         "Task Inbox",
         "Context Dock",
-        "Disconnected",
+        "Host unavailable",
     ] {
         assert!(body.contains(section), "missing {section} in {body}");
     }
+}
+
+#[test]
+fn preview_content_contract_distinguishes_client_frame_from_outer_window() {
+    assert_eq!((PREVIEW_CONTENT_WIDTH, PREVIEW_CONTENT_HEIGHT), (640, 360));
+    assert!(preview_content_size_is_exact(640, 360));
+    assert!(!preview_content_size_is_exact(624, 352));
+    assert!(!preview_content_size_is_exact(656, 368));
 }
 
 #[test]
@@ -505,7 +514,6 @@ fn visible_capture_uses_isolated_process_and_decodes_exact_sentinel() {
     let before = foreground_hwnd();
 
     let child = Command::new(env!("CARGO_BIN_EXE_devmanager-next"))
-        .env("DEVMANAGER_PROFILE", "native-next-dev")
         .env("DEVMANAGER_INSTANCE_LABEL", "Next")
         .env("DEVMANAGER_RUNTIME_KIND", "native-next")
         .args([

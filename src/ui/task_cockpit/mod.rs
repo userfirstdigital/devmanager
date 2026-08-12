@@ -29,7 +29,9 @@ pub use inbox::{
     InboxRuntime, InboxSection, InboxState, LiveClientSubscription, PrimaryProviderIcon,
     PrimaryProviderState, ResourceSummary, RuntimeSummary, SearchProgress, SearchWorkerState,
     TaskRow, TaskRowDisplay, TaskRowModel, UnreadCursor, ViewportError, VirtualWindow,
-    DEFAULT_VISIBLE_ROWS, FIXED_VIRTUAL_OVERSCAN, MAX_ACCESSIBLE_DESCRIPTION_CHARS,
+    TaskList, TaskListOverflow, VirtualKeysetWindow, VirtualListViewport, DEFAULT_VISIBLE_ROWS,
+    FIXED_VIRTUAL_OVERSCAN, MAX_ACCESSIBLE_DESCRIPTION_CHARS,
     MAX_ACCESSIBLE_NAME_CHARS, MAX_PROJECT_LABEL_CHARS, MAX_PROVIDER_LABEL_CHARS, MAX_SEARCH_CHARS,
-    MAX_SECONDARY_LABEL_CHARS, MAX_TASK_LIST_ITEMS, MAX_WORKTREE_LABEL_CHARS,
+    MAX_SECONDARY_LABEL_CHARS, MAX_TASK_LIST_ITEMS, MAX_TASK_SOURCE_IDS, MAX_VIRTUAL_WINDOW_ROWS,
+    MAX_WORKTREE_LABEL_CHARS,
 };

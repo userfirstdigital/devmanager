@@ -1,7 +1,7 @@
 //! Pure, bounded projection for the Task Cockpit inbox.
 
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::ops::Range;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{
@@ -35,6 +35,8 @@ use crate::ui::components::{AccessibilityMetadata, AccessibleRole};
 pub const MAX_TASK_LIST_ITEMS: usize = 5_000;
 pub const FIXED_VIRTUAL_OVERSCAN: usize = 32;
 pub const DEFAULT_VISIBLE_ROWS: usize = 40;
+pub const MAX_VIRTUAL_WINDOW_ROWS: usize = 128;
+pub const MAX_TASK_SOURCE_IDS: usize = 100_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct InboxOverflow {
@@ -80,6 +82,253 @@ impl VirtualWindow {
         let visible_end = visible.end.min(item_count).max(visible_start);
         visible_start.saturating_sub(self.overscan)
             ..visible_end.saturating_add(self.overscan).min(item_count)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TaskListOverflow {
+    pub limit: usize,
+    pub total_count: usize,
+    pub retained_count: usize,
+}
+
+/// A bounded identity source for the native uniform list. The source retains
+/// IDs only; row snapshots remain owned by the client model and are resolved
+/// for the active GPUI window.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskList {
+    task_ids: Arc<Vec<TaskId>>,
+    viewport: VirtualWindow,
+    overflow: Option<TaskListOverflow>,
+    virtual_source: bool,
+}
+
+impl TaskList {
+    pub fn empty() -> Self {
+        Self {
+            task_ids: Arc::new(Vec::new()),
+            viewport: VirtualWindow::for_item_count(0, DEFAULT_VISIBLE_ROWS, 0),
+            overflow: None,
+            virtual_source: false,
+        }
+    }
+
+    pub fn from_model(model: &ClientModel) -> Self {
+        let ids: Vec<_> = model
+            .tasks()
+            .iter()
+            .filter(|(_, snapshot)| snapshot.task.lifecycle != TaskLifecycle::Archived)
+            .map(|(id, _)| *id)
+            .take(MAX_TASK_SOURCE_IDS)
+            .collect();
+        if ids.len() == MAX_TASK_SOURCE_IDS {
+            return Self {
+                task_ids: Arc::new(Vec::new()),
+                viewport: VirtualWindow::for_item_count(0, DEFAULT_VISIBLE_ROWS, 0),
+                overflow: Some(TaskListOverflow {
+                    limit: MAX_TASK_SOURCE_IDS,
+                    total_count: MAX_TASK_SOURCE_IDS.saturating_add(1),
+                    retained_count: 0,
+                }),
+                virtual_source: false,
+            };
+        }
+        Self::from_ids(ids, false)
+    }
+
+    pub fn from_virtual_task_ids(task_ids: Vec<TaskId>) -> Result<Self, TaskListOverflow> {
+        if task_ids.len() > MAX_TASK_SOURCE_IDS {
+            return Err(TaskListOverflow {
+                limit: MAX_TASK_SOURCE_IDS,
+                total_count: task_ids.len(),
+                retained_count: 0,
+            });
+        }
+        let mut seen = HashSet::with_capacity(task_ids.len());
+        if task_ids.iter().any(|id| !seen.insert(*id)) {
+            return Err(TaskListOverflow {
+                limit: usize::MAX,
+                total_count: task_ids.len(),
+                retained_count: 0,
+            });
+        }
+        Ok(Self::from_ids(task_ids, true))
+    }
+
+    pub fn from_client_model_virtual(model: &ClientModel) -> Result<Self, TaskListOverflow> {
+        let ids: Vec<_> = model
+            .tasks()
+            .iter()
+            .filter(|(_, snapshot)| snapshot.task.lifecycle != TaskLifecycle::Archived)
+            .map(|(id, _)| *id)
+            .collect();
+        Self::from_virtual_task_ids(ids)
+    }
+
+    fn from_ids(task_ids: Vec<TaskId>, virtual_source: bool) -> Self {
+        let viewport = VirtualWindow::for_item_count(0, DEFAULT_VISIBLE_ROWS, task_ids.len());
+        Self {
+            task_ids: Arc::new(task_ids),
+            viewport,
+            overflow: None,
+            virtual_source,
+        }
+    }
+
+    pub fn task_ids(&self) -> &[TaskId] {
+        self.task_ids.as_slice()
+    }
+
+    pub fn len(&self) -> usize {
+        self.task_ids.len()
+    }
+
+    pub fn total_count(&self) -> usize {
+        self.task_ids.len()
+    }
+
+    pub fn stable_key_for(&self, index: usize) -> String {
+        self.task_ids
+            .get(index)
+            .map(|id| format!("native-task-row-{id}"))
+            .unwrap_or_else(|| format!("native-task-row-missing-{index}"))
+    }
+
+    pub fn window_after_id(&self, anchor: Option<TaskId>, limit: usize) -> VirtualKeysetWindow {
+        let limit = limit.min(MAX_VIRTUAL_WINDOW_ROWS);
+        let start = match anchor {
+            None => 0,
+            Some(anchor) => match self.task_ids.iter().position(|id| *id == anchor) {
+                Some(index) => index.saturating_add(1),
+                None => {
+                    return VirtualKeysetWindow {
+                        ids: Vec::new(),
+                        next_after_id: None,
+                        anchor_found: false,
+                    }
+                }
+            },
+        };
+        let ids: Vec<_> = self
+            .task_ids
+            .iter()
+            .skip(start)
+            .take(limit)
+            .copied()
+            .collect();
+        VirtualKeysetWindow {
+            next_after_id: ids.last().copied(),
+            ids,
+            anchor_found: true,
+        }
+    }
+
+    pub fn uses_gpui_uniform_list(&self) -> bool {
+        self.virtual_source
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.task_ids.is_empty()
+    }
+
+    pub fn overflow(&self) -> Option<TaskListOverflow> {
+        self.overflow
+    }
+
+    pub fn virtual_window(&self) -> VirtualWindow {
+        self.viewport
+    }
+
+    pub fn set_viewport(
+        &mut self,
+        first_visible: usize,
+        visible_rows: usize,
+    ) -> Result<(), ViewportError> {
+        if visible_rows == 0 {
+            return Err(ViewportError::ZeroVisibleRows);
+        }
+        self.viewport = VirtualWindow::for_item_count(first_visible, visible_rows, self.len());
+        Ok(())
+    }
+
+    pub fn visible_task_ids(&self) -> &[TaskId] {
+        let range = self.viewport.visible_range();
+        &self.task_ids[range]
+    }
+
+    pub fn rendered_task_ids(&self) -> &[TaskId] {
+        let range = self.viewport.render_range(self.len());
+        &self.task_ids[range]
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VirtualKeysetWindow {
+    pub ids: Vec<TaskId>,
+    pub next_after_id: Option<TaskId>,
+    pub anchor_found: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct VirtualListViewport {
+    total_rows: usize,
+    visible_rows: usize,
+    scroll_offset: f32,
+    window: VirtualWindow,
+}
+
+impl VirtualListViewport {
+    pub fn new(total_rows: usize, visible_rows: usize) -> Result<Self, ViewportError> {
+        if visible_rows == 0 {
+            return Err(ViewportError::ZeroVisibleRows);
+        }
+        Ok(Self {
+            total_rows,
+            visible_rows,
+            scroll_offset: 0.0,
+            window: VirtualWindow::for_item_count(0, visible_rows, total_rows),
+        })
+    }
+
+    pub fn total_rows(&self) -> usize {
+        self.total_rows
+    }
+
+    pub fn materialized_rows(&self) -> usize {
+        0
+    }
+
+    pub fn visible_range(&self) -> Range<usize> {
+        self.window.visible_range()
+    }
+
+    pub fn render_range(&self) -> Range<usize> {
+        self.window.render_range(self.total_rows)
+    }
+
+    pub fn scroll_offset(&self) -> f32 {
+        self.scroll_offset
+    }
+
+    pub fn apply_scroll_delta(
+        &mut self,
+        delta_pixels: f32,
+        viewport_height: f32,
+        row_height: f32,
+    ) -> Result<(), ViewportError> {
+        if viewport_height <= 0.0 || row_height <= 0.0 {
+            return Err(ViewportError::ZeroVisibleRows);
+        }
+        let visible_rows = (viewport_height / row_height).ceil().max(1.0) as usize;
+        self.visible_rows = visible_rows;
+        let max_offset = self
+            .total_rows
+            .saturating_sub(visible_rows)
+            .saturating_mul(row_height as usize) as f32;
+        self.scroll_offset = (self.scroll_offset + delta_pixels).clamp(0.0, max_offset);
+        let first_visible = (self.scroll_offset / row_height).floor() as usize;
+        self.window = VirtualWindow::for_item_count(first_visible, visible_rows, self.total_rows);
+        Ok(())
     }
 }
 

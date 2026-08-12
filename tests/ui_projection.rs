@@ -64,6 +64,10 @@ fn repository_fixture() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ui/theme-gallery.json")
 }
 
+fn task_cockpit_fixture() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ui/task-cockpit.json")
+}
+
 fn repository_output(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join(".devmanager-next/evidence/phase-05/screenshots")
@@ -122,6 +126,28 @@ fn component_init_registers_devmanager_resources_once() {
     assert!(report.root_constructed);
     assert!(!report.production_host_started);
     assert_eq!(ui::component_init_count(), report.component_init_count);
+}
+
+#[test]
+fn task_cockpit_headless_preview_instantiates_the_actual_native_shell() {
+    let _lock = HEADLESS_INIT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let policy = repository_policy();
+    let request = PreviewRequest::validate(
+        task_cockpit_fixture(),
+        repository_output("task-cockpit-native-shell-headless.png"),
+        &policy,
+    )
+    .expect("checked-in task cockpit fixture should be accepted");
+    let preview = PreviewApplication::load(request, &policy).expect("fixture should load");
+
+    let report = preview
+        .initialize_headless()
+        .expect("task cockpit headless initialization should construct the shell");
+    assert!(report.root_constructed);
+    assert!(report.native_shell_instantiated);
+    assert!(!report.production_host_started);
 }
 
 #[test]
