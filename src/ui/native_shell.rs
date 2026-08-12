@@ -5569,7 +5569,7 @@ fn launch_native_shell(
     host_state: NativeHostState,
 ) -> Result<(), NativeShellError> {
     eprintln!(
-        "devmanager-next native shell profile: {}",
+        "devmanager native shell profile: {}",
         profile.root().display()
     );
     let error_slot = Rc::new(RefCell::new(None));
