@@ -35,6 +35,7 @@ use crate::client::action;
 use crate::client::{
     ClientModel, ClientSubscription, HostClient, HostClientConfig, SubscriptionUpdate,
 };
+use crate::config::paths::{resolve_app_paths, AppProfile, BuildKind};
 use crate::domain::id::{CommandId, TaskId};
 use crate::domain::ClientId;
 use crate::host::IpcError;
@@ -61,6 +62,9 @@ use crate::ui::tokens::RuntimePreferencesSnapshot;
 const NATIVE_PROFILE_DIR: &str = ".devmanager-next/dev-profile";
 const NATIVE_PROFILE_NAME_PREFIX: &str = "native-next";
 const NATIVE_HOST_SCHEME: &str = "devtest";
+/// Stable pipe/lock profile name for the packaged production host.
+const PRODUCTION_HOST_PROFILE: &str = "production";
+const CLIENT_BUILD_PREFIX: &str = "devmanager";
 const NATIVE_POINTER_ID: u64 = 1;
 const MAX_RENDERED_TASK_ROWS: usize = DEFAULT_VISIBLE_ROWS + FIXED_VIRTUAL_OVERSCAN * 2;
 const MAX_PENDING_HOST_ACTIONS: usize = 32;
@@ -458,11 +462,28 @@ impl Display for NativeShellError {
 
 impl Error for NativeShellError {}
 
+/// Whether the shell owns an isolated debug host or the durable production host.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeShellMode {
+    IsolatedDebug,
+    Production,
+}
+
+/// Child-host lifetime policy for the shell that launched it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeHostChildOwnership {
+    /// Debug/test: kill and reap the child when the client drops.
+    TerminateWithClient,
+    /// Production: client close detaches only; the durable host survives.
+    DetachOnClientClose,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IsolatedDevProfile {
     workspace_root: PathBuf,
     root: PathBuf,
     named_profile: String,
+    mode: NativeShellMode,
 }
 
 impl IsolatedDevProfile {
@@ -474,6 +495,14 @@ impl IsolatedDevProfile {
         &self.root
     }
 
+    pub fn mode(&self) -> NativeShellMode {
+        self.mode
+    }
+
+    pub fn is_production(&self) -> bool {
+        self.mode == NativeShellMode::Production
+    }
+
     /// Config base to pass to the isolated `devmanager-host` process. The
     /// host's named profile is created beneath this generated directory; it
     /// never resolves the installed app-data root.
@@ -481,15 +510,22 @@ impl IsolatedDevProfile {
         &self.root
     }
 
-    /// The only profile name accepted by the development host attachment.
+    /// Pipe/lock profile name for host attachment.
     ///
-    /// The name is intentionally explicit and stable; callers must still
-    /// supply the generated isolated profile root when launching the host.
+    /// Isolated debug names are workspace-bound. Production uses the stable
+    /// `production` profile and never reads `DEVMANAGER_PROFILE`.
     pub fn named_profile(&self) -> &str {
         &self.named_profile
     }
 
-    /// Build the one client configuration used by the native-next shell.
+    fn child_ownership(&self) -> NativeHostChildOwnership {
+        match self.mode {
+            NativeShellMode::IsolatedDebug => NativeHostChildOwnership::TerminateWithClient,
+            NativeShellMode::Production => NativeHostChildOwnership::DetachOnClientClose,
+        }
+    }
+
+    /// Build the one client configuration used by the native shell.
     ///
     /// This does not connect, read a profile, or create files. A caller-owned
     /// host controller may use it from its I/O lane and then attach the single
@@ -497,11 +533,13 @@ impl IsolatedDevProfile {
     pub fn host_client_config(&self) -> HostClientConfig {
         HostClientConfig {
             named_profile: self.named_profile().to_string(),
-            client_build: format!("devmanager-next/{}", env!("CARGO_PKG_VERSION")),
+            client_build: format!("{CLIENT_BUILD_PREFIX}/{}", env!("CARGO_PKG_VERSION")),
             client_id: ClientId::new(),
             requested: CapabilitySet::from_capabilities([
                 Capability::PagedSnapshots,
                 Capability::EventReplay,
+                Capability::ExplicitDetach,
+                Capability::HostShutdown,
             ]),
             limits: FrameLimits::v1_default(),
         }
@@ -531,23 +569,36 @@ impl DevTestHostConnection {
     }
 }
 
-/// Exact command line used by the default native-next binary to own the
-/// development host. Keeping this as a value object makes the process seam
-/// injectable without allowing tests to start an installed host.
+/// Exact command line used to own or attach the sibling `devmanager-host`.
+/// Keeping this as a value object makes the process seam injectable without
+/// allowing tests to start an installed host from an isolated profile.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct NativeHostLaunchSpec {
     executable: PathBuf,
-    profile: String,
-    instance_label: String,
-    parent_pid: u32,
-    config_base: PathBuf,
+    mode: NativeHostLaunchMode,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum NativeHostLaunchMode {
+    Isolated {
+        profile: String,
+        instance_label: String,
+        parent_pid: u32,
+        config_base: PathBuf,
+    },
+    Production,
 }
 
 impl NativeHostLaunchSpec {
-    pub(crate) fn for_profile(
+    pub(crate) fn for_isolated_profile(
         profile: &IsolatedDevProfile,
         parent_pid: u32,
     ) -> Result<Self, NativeShellError> {
+        if profile.is_production() {
+            return Err(NativeShellError::HostConnect {
+                message: "isolated host launch requires an isolated debug profile".to_string(),
+            });
+        }
         if parent_pid == 0 {
             return Err(NativeShellError::HostConnect {
                 message: "native host parent PID must be nonzero".to_string(),
@@ -555,25 +606,42 @@ impl NativeHostLaunchSpec {
         }
         Ok(Self {
             executable: native_host_executable()?,
-            profile: profile.named_profile().to_string(),
-            instance_label: "Native Next".to_string(),
-            parent_pid,
-            config_base: profile.host_config_base().to_path_buf(),
+            mode: NativeHostLaunchMode::Isolated {
+                profile: profile.named_profile().to_string(),
+                instance_label: "Native Debug".to_string(),
+                parent_pid,
+                config_base: profile.host_config_base().to_path_buf(),
+            },
+        })
+    }
+
+    pub(crate) fn for_production() -> Result<Self, NativeShellError> {
+        Ok(Self {
+            executable: native_host_executable()?,
+            mode: NativeHostLaunchMode::Production,
         })
     }
 
     fn arguments(&self) -> Vec<String> {
-        vec![
-            "--profile".to_string(),
-            self.profile.clone(),
-            "--instance-label".to_string(),
-            self.instance_label.clone(),
-            "--parent-pid".to_string(),
-            self.parent_pid.to_string(),
-            "--foreground".to_string(),
-            "--config-base".to_string(),
-            self.config_base.display().to_string(),
-        ]
+        match &self.mode {
+            NativeHostLaunchMode::Isolated {
+                profile,
+                instance_label,
+                parent_pid,
+                config_base,
+            } => vec![
+                "--profile".to_string(),
+                profile.clone(),
+                "--instance-label".to_string(),
+                instance_label.clone(),
+                "--parent-pid".to_string(),
+                parent_pid.to_string(),
+                "--foreground".to_string(),
+                "--config-base".to_string(),
+                config_base.display().to_string(),
+            ],
+            NativeHostLaunchMode::Production => vec!["--foreground".to_string()],
+        }
     }
 }
 
@@ -650,12 +718,17 @@ fn validate_native_host_executable(path: &Path) -> Result<PathBuf, NativeShellEr
 }
 
 enum NativeHostProcessKind {
-    Child(OwnedChild),
+    Child {
+        child: OwnedChild,
+        ownership: NativeHostChildOwnership,
+    },
     Empty,
 }
 
-/// Owns the one host child for the native shell. Drop always joins the child
-/// after requesting termination, so no detached host survives a shell close.
+/// Owns an optional host child for the native shell.
+///
+/// Isolated debug ownership terminates the child on drop. Production ownership
+/// detaches only so the durable host survives client close.
 pub struct NativeHostProcess {
     kind: NativeHostProcessKind,
 }
@@ -667,7 +740,10 @@ impl std::fmt::Debug for NativeHostProcess {
             .field(
                 "kind",
                 &match self.kind {
-                    NativeHostProcessKind::Child(_) => "child",
+                    NativeHostProcessKind::Child { ownership, .. } => match ownership {
+                        NativeHostChildOwnership::TerminateWithClient => "child-terminate",
+                        NativeHostChildOwnership::DetachOnClientClose => "child-detach",
+                    },
                     NativeHostProcessKind::Empty => "empty",
                 },
             )
@@ -677,15 +753,32 @@ impl std::fmt::Debug for NativeHostProcess {
 
 impl Drop for NativeHostProcess {
     fn drop(&mut self) {
-        self.terminate(NativeShutdownDeadline::from_now(NATIVE_SHUTDOWN_BUDGET));
+        self.dispose(NativeShutdownDeadline::from_now(NATIVE_SHUTDOWN_BUDGET));
     }
 }
 
 impl NativeHostProcess {
-    fn terminate(&mut self, deadline: NativeShutdownDeadline) {
+    fn owned_child(child: OwnedChild, ownership: NativeHostChildOwnership) -> Self {
+        Self {
+            kind: NativeHostProcessKind::Child { child, ownership },
+        }
+    }
+
+    fn dispose(&mut self, deadline: NativeShutdownDeadline) {
         let kind = std::mem::replace(&mut self.kind, NativeHostProcessKind::Empty);
-        if let NativeHostProcessKind::Child(child) = kind {
-            terminate_child_with_deadline(child, deadline);
+        match kind {
+            NativeHostProcessKind::Child {
+                child,
+                ownership: NativeHostChildOwnership::TerminateWithClient,
+            } => terminate_child_with_deadline(child, deadline),
+            NativeHostProcessKind::Child {
+                mut child,
+                ownership: NativeHostChildOwnership::DetachOnClientClose,
+            } => {
+                // Detach only: never kill a production durable host on client drop.
+                let _ = child.child.try_wait();
+            }
+            NativeHostProcessKind::Empty => {}
         }
     }
 }
@@ -710,16 +803,42 @@ impl NativeHostBootstrap for ProcessNativeHostBootstrap {
         let deadline = NativeShutdownDeadline::until(deadline);
         if deadline.expired() {
             return Err(NativeShellError::HostConnect {
-                message: "native host startup deadline expired before launch".to_string(),
+                message: "native host startup deadline expired before attach".to_string(),
             });
         }
-        ensure_isolated_host_config_base(profile)?;
+        if !profile.is_production() {
+            ensure_isolated_host_config_base(profile)?;
+        }
+        if deadline.expired() {
+            return Err(NativeShellError::HostConnect {
+                message: "native host startup deadline expired before attach".to_string(),
+            });
+        }
+
+        // Attach-first: reuse a live host when the pipe is already present.
+        match try_attach_existing_host(profile, deadline) {
+            Ok(runtime) => {
+                return Ok(NativeHostRuntimeAttachment::Client(runtime));
+            }
+            Err(IpcError::Unavailable) => {}
+            Err(error) => {
+                return Err(NativeShellError::HostConnect {
+                    message: error.to_string(),
+                });
+            }
+        }
+
         if deadline.expired() {
             return Err(NativeShellError::HostConnect {
                 message: "native host startup deadline expired before launch".to_string(),
             });
         }
-        let spec = NativeHostLaunchSpec::for_profile(profile, std::process::id())?;
+
+        let spec = if profile.is_production() {
+            NativeHostLaunchSpec::for_production()?
+        } else {
+            NativeHostLaunchSpec::for_isolated_profile(profile, std::process::id())?
+        };
         let permit = acquire_reaper_permit(ReaperKind::Child).ok_or_else(|| {
             NativeShellError::HostConnect {
                 message: "native host child reaper capacity exhausted".to_string(),
@@ -739,17 +858,71 @@ impl NativeHostBootstrap for ProcessNativeHostBootstrap {
         let child = command
             .spawn()
             .map_err(|error| NativeShellError::HostConnect {
-                message: format!("isolated devmanager-host launch failed: {error}"),
+                message: format!("devmanager-host launch failed: {error}"),
             })?;
-        let process = NativeHostProcess {
-            kind: NativeHostProcessKind::Child(OwnedChild {
+        let process = NativeHostProcess::owned_child(
+            OwnedChild {
                 child,
                 _permit: permit,
-            }),
-        };
+            },
+            profile.child_ownership(),
+        );
+        // Concurrent clients may lose the HostLock race; bounded attach retries
+        // converge on the lock winner without inventing a second shutdown path.
         let runtime =
             NativeHostClientRuntime::connect_blocking_with_process(profile, process, deadline)?;
         Ok(NativeHostRuntimeAttachment::Client(runtime))
+    }
+}
+
+fn try_attach_existing_host(
+    profile: &IsolatedDevProfile,
+    deadline: NativeShutdownDeadline,
+) -> Result<NativeHostClientRuntime, IpcError> {
+    let runtime = Arc::new(
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .map_err(|_| IpcError::Unavailable)?,
+    );
+    let client = runtime.block_on(tokio::time::timeout(
+        deadline.remaining(),
+        HostClient::connect(profile.host_client_config()),
+    ));
+    let client = match client {
+        Ok(Ok(client)) => client,
+        Ok(Err(error)) => {
+            if let Ok(runtime) = Arc::try_unwrap(runtime) {
+                runtime.shutdown_timeout(Duration::from_millis(1));
+            }
+            return Err(error);
+        }
+        Err(_) => {
+            if let Ok(runtime) = Arc::try_unwrap(runtime) {
+                runtime.shutdown_timeout(Duration::from_millis(1));
+            }
+            return Err(IpcError::Unavailable);
+        }
+    };
+    match NativeHostClientRuntime::new_with_runtime(profile, client, runtime.clone()) {
+        Ok(mut runtime_owner) => {
+            let bootstrap = runtime.block_on(tokio::time::timeout(
+                deadline.remaining(),
+                runtime_owner.bootstrap_projection(),
+            ));
+            match bootstrap {
+                Ok(Ok(_)) => Ok(runtime_owner),
+                Ok(Err(error)) => Err(IpcError::Security(error.to_string())),
+                Err(_) => Err(IpcError::Unavailable),
+            }
+        }
+        Err(error) => {
+            if let Ok(runtime) = Arc::try_unwrap(runtime) {
+                runtime.shutdown_timeout(Duration::from_millis(1));
+            }
+            Err(IpcError::Security(error.to_string()))
+        }
     }
 }
 
@@ -901,6 +1074,92 @@ pub fn isolated_dev_profile(
         root: workspace_root.join(NATIVE_PROFILE_DIR),
         workspace_root,
         named_profile,
+        mode: NativeShellMode::IsolatedDebug,
+    })
+}
+
+/// Resolve the fail-closed production app root for release native-shell launch.
+///
+/// Never consults `DEVMANAGER_PROFILE`. The pipe/lock profile is the stable
+/// [`PRODUCTION_HOST_PROFILE`] name while storage uses [`AppProfile::Production`].
+pub fn production_shell_profile() -> Result<IsolatedDevProfile, NativeShellError> {
+    if let Some(value) = env::var_os("DEVMANAGER_PROFILE") {
+        return Err(NativeShellError::ProfileOverride {
+            value: value.to_string_lossy().into_owned(),
+        });
+    }
+    let config_dir = dirs::config_dir().ok_or_else(|| NativeShellError::HostConnect {
+        message: "unable to resolve config directory for production profile".to_string(),
+    })?;
+    let config_dir = config_dir
+        .canonicalize()
+        .map_err(|error| NativeShellError::HostConnect {
+            message: format!("unable to canonicalize config directory: {error}"),
+        })?;
+    let resolved = resolve_app_paths(&config_dir, AppProfile::Production, BuildKind::Release)
+        .map_err(|error| NativeShellError::HostConnect {
+            message: error.to_string(),
+        })?;
+    let expected_root = config_dir.join("com.userfirst.devmanager");
+    if resolved.root != expected_root {
+        return Err(NativeShellError::HostConnect {
+            message: format!(
+                "production profile root mismatch: {} != {}",
+                resolved.root.display(),
+                expected_root.display()
+            ),
+        });
+    }
+    let root = if resolved.root.exists() {
+        let canonical =
+            resolved
+                .root
+                .canonicalize()
+                .map_err(|error| NativeShellError::HostConnect {
+                    message: format!(
+                        "unable to canonicalize production root {}: {error}",
+                        resolved.root.display()
+                    ),
+                })?;
+        let expected = if expected_root.exists() {
+            expected_root
+                .canonicalize()
+                .map_err(|error| NativeShellError::HostConnect {
+                    message: format!("unable to canonicalize expected production root: {error}"),
+                })?
+        } else {
+            expected_root
+        };
+        if canonical != expected {
+            return Err(NativeShellError::HostConnect {
+                message: format!(
+                    "production root redirected away from exact app path: {}",
+                    canonical.display()
+                ),
+            });
+        }
+        let metadata = std::fs::symlink_metadata(&canonical).map_err(|error| {
+            NativeShellError::HostConnect {
+                message: format!("unable to inspect production root metadata: {error}"),
+            }
+        })?;
+        if path_is_reparse_or_symlink(&metadata) {
+            return Err(NativeShellError::HostConnect {
+                message: format!(
+                    "production root must not be a reparse point: {}",
+                    canonical.display()
+                ),
+            });
+        }
+        canonical
+    } else {
+        expected_root
+    };
+    Ok(IsolatedDevProfile {
+        workspace_root: root.clone(),
+        root,
+        named_profile: PRODUCTION_HOST_PROFILE.to_string(),
+        mode: NativeShellMode::Production,
     })
 }
 
@@ -1651,7 +1910,7 @@ impl NativeHostClientRuntime {
             Ok(runtime) => Arc::new(runtime),
             Err(error) => {
                 let mut process = process;
-                process.terminate(deadline);
+                process.dispose(deadline);
                 return Err(NativeShellError::HostConnect {
                     message: format!("runtime bootstrap failed: {error}"),
                 });
@@ -1661,7 +1920,7 @@ impl NativeHostClientRuntime {
             Ok(client) => client,
             Err(error) => {
                 let mut process = process;
-                process.terminate(deadline);
+                process.dispose(deadline);
                 return Err(NativeShellError::HostConnect {
                     message: error.to_string(),
                 });
@@ -1671,7 +1930,7 @@ impl NativeHostClientRuntime {
             match Self::new_with_runtime_and_process(profile, client, runtime.clone(), process) {
                 Ok(runtime_owner) => runtime_owner,
                 Err((error, mut process)) => {
-                    process.terminate(deadline);
+                    process.dispose(deadline);
                     return Err(error);
                 }
             };
@@ -1690,7 +1949,7 @@ impl NativeHostClientRuntime {
             });
         if let Err(error) = bootstrap {
             if let Some(process) = runtime_owner.host_process.as_mut() {
-                process.terminate(deadline);
+                process.dispose(deadline);
             }
             return Err(error);
         }
@@ -2156,10 +2415,7 @@ impl Drop for NativeHostClientRuntime {
             }
         }
         if let Some(process) = self.host_process.as_mut() {
-            let kind = std::mem::replace(&mut process.kind, NativeHostProcessKind::Empty);
-            if let NativeHostProcessKind::Child(child) = kind {
-                terminate_child_with_deadline(child, deadline);
-            }
+            process.dispose(deadline);
         }
         if let Some(runtime) = self.runtime_guard.take() {
             // The worker owns the only other runtime reference.  If it has
@@ -5508,12 +5764,25 @@ impl Render for NativeShell {
     }
 }
 
-/// Launch the actual native GPUI shell with only the generated isolated
-/// dev/test profile. The preview CLI remains a separate host-free path.
+/// Launch the native GPUI shell.
+///
+/// Debug builds use the generated isolated workspace profile and may parent-bind
+/// the host. Release builds use the fail-closed production profile and attach to
+/// the durable sibling host without parent-pid ownership.
 pub fn run_native_shell(workspace_root: impl AsRef<Path>) -> Result<(), NativeShellError> {
-    let profile = isolated_dev_profile(workspace_root)?;
-    let mut bootstrap = ProcessNativeHostBootstrap;
-    run_native_shell_with_bootstrap(profile, &mut bootstrap)
+    #[cfg(debug_assertions)]
+    {
+        let profile = isolated_dev_profile(workspace_root)?;
+        let mut bootstrap = ProcessNativeHostBootstrap;
+        run_native_shell_with_bootstrap(profile, &mut bootstrap)
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = workspace_root;
+        let profile = production_shell_profile()?;
+        let mut bootstrap = ProcessNativeHostBootstrap;
+        run_native_shell_with_bootstrap(profile, &mut bootstrap)
+    }
 }
 
 pub(crate) fn run_native_shell_with_bootstrap(
@@ -5569,7 +5838,7 @@ fn launch_native_shell(
     host_state: NativeHostState,
 ) -> Result<(), NativeShellError> {
     eprintln!(
-        "devmanager-next native shell profile: {}",
+        "devmanager native shell profile: {}",
         profile.root().display()
     );
     let error_slot = Rc::new(RefCell::new(None));
@@ -6751,6 +7020,74 @@ mod tests {
         let overflow = worker_overflow.lock().expect("worker overflow lane");
         assert_eq!(overflow.len(), 1);
         assert!(overflow.len() <= MAX_ACTION_LANE_RECORDS);
+    }
+
+    #[test]
+    fn product_client_build_never_uses_devmanager_next_prefix() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let profile = isolated_dev_profile(workspace.path()).expect("isolated profile");
+        assert!(profile
+            .host_client_config()
+            .client_build
+            .starts_with("devmanager/"));
+        assert!(!profile
+            .host_client_config()
+            .client_build
+            .contains("devmanager-next"));
+    }
+
+    #[test]
+    fn isolated_launch_spec_parent_binds_and_production_omits_parent_pid() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let isolated = isolated_dev_profile(workspace.path()).expect("isolated profile");
+        let isolated_spec = NativeHostLaunchSpec {
+            executable: PathBuf::from("devmanager-host.exe"),
+            mode: NativeHostLaunchMode::Isolated {
+                profile: isolated.named_profile().to_string(),
+                instance_label: "Native Debug".to_string(),
+                parent_pid: 42,
+                config_base: isolated.host_config_base().to_path_buf(),
+            },
+        };
+        let isolated_args = isolated_spec.arguments();
+        assert!(isolated_args.iter().any(|arg| arg == "--parent-pid"));
+        assert!(isolated_args.iter().any(|arg| arg == "--config-base"));
+        assert_eq!(isolated.mode(), NativeShellMode::IsolatedDebug);
+
+        let production = IsolatedDevProfile {
+            workspace_root: isolated.root().to_path_buf(),
+            root: isolated.root().to_path_buf(),
+            named_profile: PRODUCTION_HOST_PROFILE.to_string(),
+            mode: NativeShellMode::Production,
+        };
+        let production_spec = NativeHostLaunchSpec {
+            executable: PathBuf::from("devmanager-host.exe"),
+            mode: NativeHostLaunchMode::Production,
+        };
+        let production_args = production_spec.arguments();
+        assert_eq!(production_args, vec!["--foreground".to_string()]);
+        assert!(!production_args.iter().any(|arg| arg == "--parent-pid"));
+        assert_eq!(
+            production.child_ownership(),
+            NativeHostChildOwnership::DetachOnClientClose
+        );
+        assert_eq!(
+            isolated.child_ownership(),
+            NativeHostChildOwnership::TerminateWithClient
+        );
+    }
+
+    #[test]
+    fn native_host_process_detach_ownership_does_not_require_child_kill_path() {
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/ui/native_shell.rs"
+        ));
+        assert!(source.contains("DetachOnClientClose"));
+        assert!(source.contains("try_attach_existing_host"));
+        assert!(source.contains("PRODUCTION_HOST_PROFILE"));
+        assert!(!source.contains("\"devmanager-next/"));
+        assert!(!source.contains("Native Next"));
     }
 
     #[test]

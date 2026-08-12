@@ -620,7 +620,8 @@ fn isolated_profile_exposes_one_explicit_native_host_client_config() {
     assert_ne!(profile.named_profile(), "native-next-dev");
     assert!(profile.named_profile().starts_with("native-next-"));
     assert_eq!(config.named_profile, profile.named_profile());
-    assert!(config.client_build.starts_with("devmanager-next/"));
+    assert!(config.client_build.starts_with("devmanager/"));
+    assert!(!config.client_build.contains("devmanager-next"));
 }
 
 #[test]
@@ -642,6 +643,10 @@ fn native_host_launch_is_pinned_and_has_no_path_fallback() {
     .expect("native shell source");
     assert!(source.contains("current_exe"));
     assert!(!source.contains("PathBuf::from(if cfg!(windows)"));
+    assert!(source.contains("try_attach_existing_host"));
+    assert!(source.contains("DetachOnClientClose"));
+    assert!(source.contains("for_production"));
+    assert!(!source.contains("\"devmanager-next/"));
 }
 
 #[test]
