@@ -693,6 +693,11 @@ impl ClientModelBuilder {
                     primary_agent_id: item.primary_agent_id,
                     artifacts: BTreeMap::new(),
                     resources: BTreeMap::new(),
+                    browser: {
+                        let mut browser = crate::domain::browser::BrowserBook::new();
+                        let _ = browser.open_task(task_id);
+                        browser
+                    },
                 },
             );
         }

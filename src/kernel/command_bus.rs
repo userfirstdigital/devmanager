@@ -1265,6 +1265,21 @@ fn validate_effect_matches_fence(
                 return Err(StoreError::Corruption);
             }
         }
+        Effect::HoldBrowserHost {
+            task_id: effect_task,
+            action_epoch,
+            generation,
+            ..
+        } => {
+            if *effect_task != task_id
+                || fence.resource_id.is_some()
+                || fence.runtime_generation.is_some()
+                || fence.action_epoch != Some(*action_epoch)
+                || *generation == 0
+            {
+                return Err(StoreError::Corruption);
+            }
+        }
     }
     Ok(())
 }
@@ -1617,6 +1632,25 @@ fn require_current_effect_ownership(
                 return Err(StoreError::StaleFence);
             }
         }
+        Effect::HoldBrowserHost { action_epoch, .. } => {
+            let (lifecycle, stored_epoch): (String, i64) = tx
+                .query_row(
+                    "SELECT lifecycle, action_epoch FROM tasks WHERE task_id = ?1",
+                    [task_id.as_bytes().as_slice()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .map_err(|err| match err {
+                    rusqlite::Error::QueryReturnedNoRows => StoreError::StaleFence,
+                    other => other.into(),
+                })?;
+            let stored_epoch = u64_from_nonnegative_i64("tasks.action_epoch", stored_epoch)?;
+            if lifecycle != "open"
+                || Some(stored_epoch) != fence.action_epoch
+                || stored_epoch != *action_epoch
+            {
+                return Err(StoreError::StaleFence);
+            }
+        }
         Effect::ReleaseResource {
             resource_fence,
             action_epoch,
@@ -1720,6 +1754,9 @@ fn apply_new_outcome(
                     resource_id: resource_fence.resource_id,
                     runtime_generation: resource_fence.runtime_generation,
                 },
+                Effect::HoldBrowserHost { .. } => {
+                    return Err(StoreError::InvalidDispatchTransition);
+                }
             };
             let next_revision = next_task_revision(tx, task_id)?;
             append_and_project(
@@ -4145,6 +4182,7 @@ fn validate_settled_result_fact(
         ) if event_type == "resource.released"
             && resource_id == resource_fence.resource_id
             && runtime_generation == resource_fence.runtime_generation => {}
+        (Effect::HoldBrowserHost { .. }, _) => return Err(StoreError::Corruption),
         _ => return Err(StoreError::Corruption),
     }
     if settled_sequence
@@ -4518,6 +4556,37 @@ fn effects_from_durable_decision_facts(
                     ),
                     fence: OperationFence {
                         action_epoch: Some(*epoch),
+                        resource_id: None,
+                        runtime_generation: None,
+                    },
+                });
+            }
+            Event::Browser(crate::domain::browser::BrowserDurableFact::RequestAccepted {
+                request_id,
+                task_id: fact_task,
+                context_id,
+                generation,
+                action,
+                action_epoch,
+                ..
+            }) if action.requires_host_settlement() => {
+                if *fact_task != scope || *generation == 0 {
+                    return Err(StoreError::Corruption);
+                }
+                planned.push(PlannedEffect {
+                    document: crate::kernel::outbox::PlannedEffectDocument::new(
+                        Effect::HoldBrowserHost {
+                            task_id: scope,
+                            action_epoch: *action_epoch,
+                            request_id: *request_id,
+                            context_id: *context_id,
+                            generation: *generation,
+                            hold: crate::domain::browser::BrowserIntegrationHold::WebViewSurfaceAbsent,
+                        },
+                        crate::kernel::outbox::ReplayPolicy::NoAutomaticRetry,
+                    ),
+                    fence: OperationFence {
+                        action_epoch: Some(*action_epoch),
                         resource_id: None,
                         runtime_generation: None,
                     },
@@ -5891,7 +5960,44 @@ pub(crate) fn load_task_snapshot(
         primary_agent_id: task_row.primary_agent_id,
         artifacts,
         resources,
+        browser: load_browser_book(conn, task_id, task_row.task.lifecycle)?,
     }))
+}
+
+fn load_browser_book(
+    conn: &Connection,
+    task_id: TaskId,
+    lifecycle: TaskLifecycle,
+) -> Result<crate::domain::browser::BrowserBook, StoreError> {
+    let mut book = crate::domain::browser::BrowserBook::new();
+    book.open_task(task_id)
+        .map_err(|err| StoreError::Projection(err.to_string()))?;
+    let mut stmt = conn.prepare(
+        "SELECT event_type, schema_version, payload
+         FROM events
+         WHERE task_id = ?1
+         ORDER BY sequence ASC",
+    )?;
+    let rows = stmt.query_map([task_id.as_bytes().as_slice()], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, Vec<u8>>(2)?,
+        ))
+    })?;
+    for row in rows {
+        let (event_type, schema_version, payload) = row?;
+        let decoded = crate::kernel::store::decode_stored_event(&event_type, schema_version, &payload)?;
+        if let Event::Browser(fact) = decoded {
+            book.apply_facts(&[fact])
+                .map_err(|err| StoreError::Projection(err.to_string()))?;
+        }
+    }
+    if !matches!(lifecycle, TaskLifecycle::Open) {
+        book.close_task(task_id)
+            .map_err(|err| StoreError::Projection(err.to_string()))?;
+    }
+    Ok(book)
 }
 
 struct LoadedTaskRow {

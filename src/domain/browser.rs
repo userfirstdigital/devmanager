@@ -170,6 +170,13 @@ pub struct BrowserServiceIssuer {
     _private: (),
 }
 
+impl BrowserServiceIssuer {
+    /// Host-owned 8.3 `BrowserService` is the only inhabitant of this proof.
+    pub(crate) fn for_host_service() -> Self {
+        Self { _private: () }
+    }
+}
+
 /// Unforgeable 8.3 host authority. No public constructor. Crate-private
 /// `issue` requires an uninhabited `BrowserServiceIssuer`.
 pub struct BrowserServiceAuthority {
@@ -266,7 +273,10 @@ impl fmt::Display for BrowserContractError {
             Self::BoundExceeded => write!(f, "browser contract bound exceeded"),
             Self::InvalidRequest => write!(f, "browser request is not admissible"),
             Self::HostEffectUnavailable => {
-                write!(f, "browser host effect is unavailable until Task 8.3")
+                write!(
+                    f,
+                    "browser host effect is unavailable until the WebView2 surface exists"
+                )
             }
         }
     }
@@ -814,7 +824,7 @@ pub struct BrowserBook {
 }
 
 impl BrowserBook {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             ready: true,
             ..Self::default()

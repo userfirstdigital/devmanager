@@ -1036,6 +1036,7 @@ pub(crate) fn encode_event_payload(event: &Event) -> Result<Vec<u8>, StoreError>
         Event::OperationFailed(fact) => rmp_serde::to_vec(fact),
         Event::OperationCancelled(fact) => rmp_serde::to_vec(fact),
         Event::OperationUncertain(fact) => rmp_serde::to_vec(fact),
+        Event::Browser(fact) => rmp_serde::to_vec(fact),
     }
     .map_err(|e| StoreError::EventDecode(e.to_string()))?;
     Ok(bytes)
@@ -1173,6 +1174,10 @@ pub(crate) fn decode_stored_event(
         "operation.uncertain" => {
             let fact: OperationUncertainFact = unpack(payload)?;
             Event::OperationUncertain(fact)
+        }
+        "browser.fact" => {
+            let fact: crate::domain::browser::BrowserDurableFact = unpack(payload)?;
+            Event::Browser(fact)
         }
         other => {
             return Err(StoreError::CodecMismatch {
@@ -1572,6 +1577,9 @@ fn pending_dispatch_is_authorized(
     row: &OutboxRow,
     replay_policy: ReplayPolicy,
 ) -> Result<bool, StoreError> {
+    if matches!(replay_policy, ReplayPolicy::NoAutomaticRetry) {
+        return Ok(false);
+    }
     if row.attempts == 0 {
         return Ok(true);
     }

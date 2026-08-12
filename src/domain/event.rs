@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::agent::AgentSessionFacts;
 use crate::domain::artifact::ArtifactFacts;
+use crate::domain::browser::{BrowserBook, BrowserContractError, BrowserDurableFact};
 use crate::domain::host::{HostCleanupBranch, HostCleanupBranchOutcome};
 use crate::domain::id::{AgentSessionId, CommandId, EventId, OperationId, ResourceId, TaskId};
 use crate::domain::operation::{
@@ -648,6 +649,7 @@ pub enum Event {
     OperationFailed(OperationFailedFact),
     OperationCancelled(OperationCancelledFact),
     OperationUncertain(OperationUncertainFact),
+    Browser(BrowserDurableFact),
 }
 
 impl Event {
@@ -672,6 +674,7 @@ impl Event {
             Self::OperationFailed(_) => "operation.failed",
             Self::OperationCancelled(_) => "operation.cancelled",
             Self::OperationUncertain(_) => "operation.uncertain",
+            Self::Browser(_) => "browser.fact",
         }
     }
 
@@ -730,6 +733,8 @@ enum EventBody {
     OperationCancelled(OperationCancelledFact),
     #[serde(rename = "operation.uncertain")]
     OperationUncertain(OperationUncertainFact),
+    #[serde(rename = "browser.fact")]
+    Browser(BrowserDurableFact),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -829,6 +834,7 @@ impl From<&Event> for EventDocument {
             Event::OperationFailed(fact) => EventBody::OperationFailed(fact.clone()),
             Event::OperationCancelled(fact) => EventBody::OperationCancelled(fact.clone()),
             Event::OperationUncertain(fact) => EventBody::OperationUncertain(fact.clone()),
+            Event::Browser(fact) => EventBody::Browser(fact.clone()),
         };
         Self {
             schema_version: EVENT_SCHEMA_VERSION,
@@ -930,6 +936,7 @@ impl TryFrom<EventDocument> for Event {
             EventBody::OperationFailed(fact) => Event::OperationFailed(fact),
             EventBody::OperationCancelled(fact) => Event::OperationCancelled(fact),
             EventBody::OperationUncertain(fact) => Event::OperationUncertain(fact),
+            EventBody::Browser(fact) => Event::Browser(fact),
         })
     }
 }
@@ -1033,7 +1040,25 @@ pub fn apply(
                 primary_agent_id: None,
                 artifacts: BTreeMap::new(),
                 resources: BTreeMap::new(),
+                browser: {
+                    let mut browser = BrowserBook::new();
+                    browser
+                        .open_task(task.id)
+                        .map_err(apply_browser_error)?;
+                    browser
+                },
             })
+        }
+        Event::Browser(fact) => {
+            let mut snap = snapshot.ok_or(ApplyError::MissingSnapshot)?;
+            require_matching_task_id(&snap, event)?;
+            if fact.task_id() != snap.task.id {
+                return Err(ApplyError::OwnershipConflict);
+            }
+            snap.browser
+                .apply_facts(std::slice::from_ref(fact))
+                .map_err(apply_browser_error)?;
+            Ok(snap)
         }
         Event::OperationAccepted(_fact) => {
             let snap = snapshot.ok_or(ApplyError::MissingSnapshot)?;
@@ -1113,6 +1138,9 @@ fn apply_into(
             }
             snap.task.lifecycle = TaskLifecycle::Closing;
             snap.task.action_epoch = *action_epoch;
+            snap.browser
+                .close_task(snap.task.id)
+                .map_err(apply_browser_error)?;
         }
         Event::TaskReopened => {
             match snap.task.lifecycle {
@@ -1236,7 +1264,54 @@ fn apply_into(
         | Event::OperationSettled(_)
         | Event::OperationFailed(_)
         | Event::OperationCancelled(_)
-        | Event::OperationUncertain(_) => unreachable!("handled by apply()"),
+        |         Event::OperationUncertain(_) | Event::Browser(_) => unreachable!("handled by apply()"),
     }
     Ok(())
+}
+
+fn apply_browser_error(error: BrowserContractError) -> ApplyError {
+    match error {
+        BrowserContractError::CrossTask => ApplyError::OwnershipConflict,
+        BrowserContractError::GenerationMismatch
+        | BrowserContractError::ClosedTask
+        | BrowserContractError::IdempotencyConflict
+        | BrowserContractError::BoundExceeded
+        | BrowserContractError::InvalidRequest
+        | BrowserContractError::HostEffectUnavailable => ApplyError::InvalidTransition,
+    }
+}
+
+pub fn apply_all(
+    mut snapshot: Option<TaskSnapshot>,
+    events: &[Event],
+) -> Result<TaskSnapshot, ApplyError> {
+    let task_id = snapshot.as_ref().map(|snap| snap.task.id);
+    for (index, payload) in events.iter().enumerate() {
+        let sequence = u64::try_from(index.saturating_add(1)).unwrap_or(u64::MAX);
+        let task_revision = if payload.is_task_mutation() {
+            match snapshot.as_ref() {
+                Some(snap) => Some(
+                    snap.task
+                        .revision
+                        .checked_add(1)
+                        .ok_or(ApplyError::InvalidTransition)?,
+                ),
+                None => Some(1),
+            }
+        } else {
+            None
+        };
+        snapshot = Some(apply(
+            snapshot,
+            &DomainEvent {
+                id: EventId::new(),
+                task_id,
+                sequence,
+                task_revision,
+                occurred_at_ms: 1,
+                payload: payload.clone(),
+            },
+        )?);
+    }
+    snapshot.ok_or(ApplyError::MissingSnapshot)
 }

@@ -500,6 +500,7 @@ fn is_pure_decision_fact(event: &Event) -> bool {
             | Event::PrimaryAgentSet { .. }
             | Event::ArtifactRegistered { .. }
             | Event::ResourceRegistered { .. }
+            | Event::Browser(_)
     )
 }
 
