@@ -59,6 +59,7 @@ use crate::ui::task_cockpit::{Inbox, TaskList, DEFAULT_VISIBLE_ROWS, FIXED_VIRTU
 use crate::ui::terminal_adapter::TerminalDockAdapter;
 pub use crate::ui::terminal_adapter::{TerminalDockState, TERMINAL_ADAPTER_DEPENDENCY};
 use crate::ui::tokens::RuntimePreferencesSnapshot;
+use crate::updater::UpdaterService;
 
 /// Explicit UI action: acknowledged client detach (host survives in production).
 #[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
@@ -1882,6 +1883,8 @@ impl NativeHostRuntimeBinding {
 pub(crate) struct NativeHostClientRuntime {
     binding: NativeHostRuntimeBinding,
     endpoint: String,
+    /// Shared updater bound to live Host Hello (no second host FSM).
+    updater: UpdaterService,
     /// `None` only while a lifecycle path temporarily owns the client so locks
     /// are never held across host awaits.
     client: Arc<Mutex<Option<HostClient>>>,
@@ -2124,6 +2127,26 @@ impl NativeHostClientRuntime {
         client: HostClient,
         runtime_guard: Option<Arc<tokio::runtime::Runtime>>,
     ) -> Result<Self, NativeShellError> {
+        let install_dir = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(Path::to_path_buf));
+        let updater = UpdaterService::new();
+        if let Some(install_dir) = install_dir.as_ref() {
+            updater
+                .observe_production_host_hello(
+                    client.server_build(),
+                    client.protocol_major(),
+                    client.protocol_minor(),
+                    install_dir,
+                )
+                .map_err(|error| NativeShellError::HostConnect { message: error })?;
+        } else {
+            updater.bind_live_host_hello(
+                client.server_build(),
+                client.protocol_major(),
+                client.protocol_minor(),
+            );
+        }
         let endpoint = client.endpoint().to_string();
         let client = Arc::new(Mutex::new(Some(client)));
         let subscription = Arc::new(Mutex::new(ClientSubscription::new()));
@@ -2190,6 +2213,7 @@ impl NativeHostClientRuntime {
         Ok(Self {
             binding: NativeHostRuntimeBinding::for_profile(profile),
             endpoint,
+            updater,
             client,
             subscription,
             client_model,
@@ -2234,6 +2258,10 @@ impl NativeHostClientRuntime {
 
     pub(crate) fn endpoint(&self) -> &str {
         &self.endpoint
+    }
+
+    pub(crate) fn updater(&self) -> &UpdaterService {
+        &self.updater
     }
 
     fn validate_attachment(&self, profile: &IsolatedDevProfile) -> Result<(), NativeShellError> {

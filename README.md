@@ -117,10 +117,14 @@ The manifest shape matches the `cargo-packager-updater` multi-platform format an
 - `pub_date`
 - `identity` (`devmanager/<version>`)
 - `protocol` (`major` / `minor`)
+- `minimum_protocol` (the required negotiated protocol, for example `1.0`)
 - `platforms.<target>.format`
 - `platforms.<target>.signature`
 - `platforms.<target>.url`
 - `platforms.<target>.sha256` (immutable artifact hash)
+- `platforms.<target>.hash` (`sha256:<hex>`)
+- `platforms.<target>.client_build`
+- `platforms.<target>.host_build`
 
 `latest.json` is generated only after signed artifacts exist and signatures verify against `DEVMANAGER_UPDATE_PUBKEY`. The GitHub-hosted updater flow assumes public release assets. If releases are private, the native updater will need an authenticated distribution endpoint instead of raw GitHub asset URLs.
 
@@ -136,8 +140,9 @@ The manifest shape matches the `cargo-packager-updater` multi-platform format an
 - The workflow uses `Cargo.toml` when it is newer than the latest stable `vX.Y.Z` tag; otherwise it selects the next patch version.
 - The prepare job writes the release version into `Cargo.toml` and `Cargo.lock`, then commits that bump back to `master` with `[skip ci]`.
 - Every platform checks out that exact prepared commit, and the release tag is explicitly pinned to the same commit rather than the moving branch head.
-- Windows builds publish updater-signed `nsis` installers (plus `wix` on x64). macOS builds publish updater-signed `app` bundles plus `dmg` artifacts.
-- Draft staging requires the exact 11-file platform/signature/manifest contract and verifies every uploaded size and SHA-256 digest before operators may approve publication.
+- Windows builds publish updater-signed dual-binary ZIP payloads for staged replace, plus `nsis`/WiX installers for manual install on Windows. macOS builds publish updater-signed `app` bundles plus `dmg` artifacts.
+- Draft staging requires the exact platform/signature/manifest contract (including signed dual-binary updater ZIPs) and verifies every uploaded size and SHA-256 digest before operators may approve publication.
+- `latest.json` includes identity/protocol compatibility fields and per-platform `hash` (`sha256:`), `sha256`, `client_build`, and `host_build` fields.
 
 See [docs/release-checklist.md](docs/release-checklist.md) for the operator checklist.
 

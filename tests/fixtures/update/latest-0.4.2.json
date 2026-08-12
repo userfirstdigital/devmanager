@@ -7,7 +7,7 @@
     "windows-x86_64": {
       "format": "nsis",
       "signature": "dGVzdC1zaWduYXR1cmUtMC40LjItc2lnbmVkLXJlbGVhc2U=",
-      "url": "https://github.com/example/devmanager/releases/download/v0.4.2/DevManager_0.4.2_x64-setup.exe",
+      "url": "https://github.com/example/devmanager/releases/download/v0.4.2/DevManager_0.4.2_x64-update.zip",
       "hash": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
       "client_build": "devmanager/0.4.2",
       "host_build": "devmanager-host/0.4.2"

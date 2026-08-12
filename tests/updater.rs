@@ -175,8 +175,10 @@ fn release_packaging_runs_independently_of_verify_but_stage_requires_verify() {
         build_job.contains("platform: windows-x86_64")
             && build_job.contains("formats: nsis,wix")
             && stage_job.contains("\"*_x64-setup.exe\"")
-            && stage_job.contains("\"*.msi\""),
-        "Windows x64 NSIS EXE and WiX MSI assets must remain mandatory in packaging and stage"
+            && stage_job.contains("\"*.msi\"")
+            && stage_job.contains("\"*_x64-update.zip\"")
+            && build_job.contains("Build signed dual-binary updater payload"),
+        "Windows x64 must keep NSIS/MSI for manual install and publish a dual-binary updater ZIP"
     );
 }
 
@@ -241,6 +243,17 @@ fn release_draft_id_is_resolved_from_the_authenticated_release_list() {
 }
 
 #[test]
+fn release_latest_json_includes_protocol_hash_and_build_identity() {
+    let workflow = fs::read_to_string(release_workflow_path()).expect("read release workflow");
+    let release_job = workflow.split("\n  release:").nth(1).expect("release job");
+    assert!(release_job.contains("\"minimum_protocol\": \"1.0\""));
+    assert!(release_job.contains("\"hash\": f\"sha256:{digest}\""));
+    assert!(release_job.contains("\"client_build\": f\"devmanager/{version}\""));
+    assert!(release_job.contains("\"host_build\": f\"devmanager-host/{version}\""));
+    assert!(release_job.contains("\"*_x64-update.zip\""));
+}
+
+#[test]
 fn manifest_fixture_parses_expected_platform_assets() {
     let manifest_text = fs::read_to_string(fixture_path("latest.json")).expect("manifest fixture");
     let manifest = parse_release_manifest(&manifest_text).expect("parse manifest fixture");
@@ -256,7 +269,7 @@ fn manifest_fixture_parses_expected_platform_assets() {
         .get("windows-x86_64")
         .expect("windows updater entry");
     assert_eq!(windows.format, "nsis");
-    assert!(windows.url.ends_with("_x64-setup.exe"));
+    assert!(windows.url.ends_with("_x64-update.zip") || windows.url.ends_with("_x64-setup.exe"));
     assert_eq!(windows.signature, "windows-signature-placeholder");
 
     let mac = manifest

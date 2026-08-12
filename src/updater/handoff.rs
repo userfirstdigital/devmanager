@@ -72,6 +72,93 @@ impl UpdateHandoffToken {
     }
 }
 
+/// Durable post-replace recovery marker written before old-process exit.
+///
+/// New host/client startup must validate matching Host Hello build/protocol,
+/// drive [`HostUpdateHandoff::complete_matching_host_start`] +
+/// [`HostUpdateHandoff::finish_resync`], then transactionally clear the marker.
+/// Failed validation leaves the marker in place (fail closed).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateHandoffRecoveryMarker {
+    pub token_id: Uuid,
+    pub host_boot_id: Uuid,
+    pub inspection_id: u64,
+    pub target_version: String,
+    pub client_build: String,
+    pub host_build: String,
+    pub protocol_major: u16,
+    pub protocol_minor: u16,
+    pub sealed: bool,
+}
+
+impl UpdateHandoffRecoveryMarker {
+    pub fn from_token(
+        token: &UpdateHandoffToken,
+        protocol_major: u16,
+        protocol_minor: u16,
+    ) -> Self {
+        Self {
+            token_id: token.token_id,
+            host_boot_id: token.host_boot_id,
+            inspection_id: token.inspection_id,
+            target_version: token.target_version.clone(),
+            client_build: token.client_build.clone(),
+            host_build: token.host_build.clone(),
+            protocol_major,
+            protocol_minor,
+            sealed: true,
+        }
+    }
+
+    pub fn into_token(&self, now: SystemTime, ttl: Duration) -> UpdateHandoffToken {
+        UpdateHandoffToken {
+            token_id: self.token_id,
+            host_boot_id: self.host_boot_id,
+            inspection_id: self.inspection_id,
+            target_version: self.target_version.clone(),
+            client_build: self.client_build.clone(),
+            host_build: self.host_build.clone(),
+            issued_at: now,
+            expires_at: now + ttl,
+        }
+    }
+
+    /// Fail closed unless live Host Hello build + protocol match the sealed marker.
+    pub fn validate_live_host_hello(
+        &self,
+        server_build: &str,
+        protocol_major: u16,
+        protocol_minor: u16,
+    ) -> Result<(), String> {
+        if !self.sealed {
+            return Err("update recovery marker is not sealed".into());
+        }
+        if server_build != self.host_build {
+            return Err(format!(
+                "live Host Hello server_build `{server_build}` does not match recovery host_build `{}`",
+                self.host_build
+            ));
+        }
+        if protocol_major != self.protocol_major || protocol_minor < self.protocol_minor {
+            return Err(format!(
+                "live Host Hello protocol {protocol_major}.{protocol_minor} incompatible with recovery {}.{}",
+                self.protocol_major, self.protocol_minor
+            ));
+        }
+        if extract_build_version(&self.client_build) != extract_build_version(&self.host_build) {
+            return Err(format!(
+                "recovery marker host/client build mismatch: {} vs {}",
+                self.client_build, self.host_build
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Install-dir filename for the durable update handoff recovery marker.
+pub const UPDATE_HANDOFF_RECOVERY_MARKER: &str = "devmanager-update-handoff.json";
+
 /// Why a silent or automatic handoff must not proceed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "reason", rename_all = "snake_case", deny_unknown_fields)]
@@ -191,6 +278,25 @@ impl UpdateHandoffMachine {
 
     pub fn phase(&self) -> &UpdateHandoffPhase {
         &self.phase
+    }
+
+    pub fn token_ttl(&self) -> Duration {
+        self.token_ttl
+    }
+
+    /// Restore Installing after a durable sealed recovery marker validates.
+    pub fn restore_installing(
+        &mut self,
+        token: UpdateHandoffToken,
+    ) -> Result<(), UpdateHandoffError> {
+        if !matches!(self.phase, UpdateHandoffPhase::Ready) {
+            return Err(UpdateHandoffError::InvalidPhase {
+                expected: "Ready",
+                observed: self.phase.clone(),
+            });
+        }
+        self.phase = UpdateHandoffPhase::Installing { token };
+        Ok(())
     }
 
     pub fn begin_inspect(&mut self) -> Result<(), UpdateHandoffError> {
@@ -1214,6 +1320,30 @@ impl HostUpdateHandoff {
         Ok(())
     }
 
+    /// Restore a sealed install into the in-memory FSM after process restart.
+    ///
+    /// Call only after [`UpdateHandoffRecoveryMarker::validate_live_host_hello`].
+    pub fn restore_sealed_install_from_recovery_marker(
+        &mut self,
+        marker: &UpdateHandoffRecoveryMarker,
+        now: SystemTime,
+    ) -> Result<UpdateHandoffToken, UpdateHandoffError> {
+        if !matches!(self.machine.phase(), UpdateHandoffPhase::Ready) {
+            return Err(UpdateHandoffError::InvalidPhase {
+                expected: "Ready",
+                observed: self.machine.phase().clone(),
+            });
+        }
+        if !marker.sealed {
+            return Err(UpdateHandoffError::MissingToken);
+        }
+        let token = marker.into_token(now, self.machine.token_ttl());
+        self.machine.restore_installing(token.clone())?;
+        self.admission = HostUpdateAdmission::InstallingUpdate;
+        self.install_irreversible = true;
+        Ok(token)
+    }
+
     pub fn finish_resync(
         &mut self,
         token_id: Uuid,
@@ -1381,6 +1511,35 @@ impl HostUpdateRuntimeGate {
                 observed: UpdateHandoffPhase::Ready,
             })?;
         handoff.finish_resync(token_id, now)
+    }
+
+    /// Validate live Host Hello against a durable recovery marker, complete
+    /// matching host start + resync, then clear the marker transactionally.
+    pub fn complete_recovery_from_marker(
+        &self,
+        marker: &UpdateHandoffRecoveryMarker,
+        server_build: &str,
+        protocol_major: u16,
+        protocol_minor: u16,
+        now: SystemTime,
+        clear_marker: impl FnOnce() -> Result<(), String>,
+    ) -> Result<(), String> {
+        marker.validate_live_host_hello(server_build, protocol_major, protocol_minor)?;
+        let mut handoff = self
+            .handoff
+            .lock()
+            .map_err(|_| "update handoff lock is unavailable".to_string())?;
+        let token = handoff
+            .restore_sealed_install_from_recovery_marker(marker, now)
+            .map_err(|error| error.to_string())?;
+        handoff
+            .complete_matching_host_start(token.token_id, now)
+            .map_err(|error| error.to_string())?;
+        handoff
+            .finish_resync(token.token_id, now)
+            .map_err(|error| error.to_string())?;
+        drop(handoff);
+        clear_marker()
     }
 }
 

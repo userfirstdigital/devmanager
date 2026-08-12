@@ -17,17 +17,19 @@ use devmanager::host::{
 };
 use devmanager::updater::{
     apply_cache_busting_to_packager_config, assert_atomic_installer_bundle,
-    capture_preservation_checkpoint, classify_user_state_path, evaluate_release_candidate,
-    extract_build_version, inspect_atomic_installer_payload_dir, is_remote_version_newer,
-    package_identity_for_version, packager_architecture_target, parse_release_manifest,
-    parse_semver, prefer_signed_manifest_over_stale_cache, resolve_running_package_identity,
-    update_state_policy, validate_preservation_checkpoint, verify_downloaded_artifact_sha256,
-    ActiveUpdateResource, AtomicInstallerBundle, CacheBustingRequestPolicy,
-    FixedActiveResourceProbe, HandoffBlockReason, IgnoredUserStateKind, InstallUpdateOptions,
-    PackageVersionSource, PreservedUserStateKind, SilentReplacementDecision,
-    StagedBinaryReplacement, StagedReplacePhase, UpdateCutoverKind, UpdateHandoffError,
-    UpdateHandoffMachine, UpdateHandoffPhase, UpdateRejection, UpdateResourceInspection,
-    UpdaterService, UserStateClassification,
+    capture_preservation_checkpoint, classify_user_state_path,
+    clear_update_handoff_recovery_marker, evaluate_release_candidate, extract_build_version,
+    inspect_atomic_installer_payload_dir, is_remote_version_newer, package_identity_for_version,
+    packager_architecture_target, packager_os_target, parse_release_manifest, parse_semver,
+    persist_update_handoff_recovery_marker, prefer_signed_manifest_over_stale_cache,
+    read_update_handoff_recovery_marker, resolve_running_package_identity, update_state_policy,
+    validate_preservation_checkpoint, verify_downloaded_artifact_sha256, ActiveUpdateResource,
+    AtomicInstallerBundle, CacheBustingRequestPolicy, FixedActiveResourceProbe, HandoffBlockReason,
+    IgnoredUserStateKind, InstallUpdateOptions, PackageVersionSource, PreservedUserStateKind,
+    SilentReplacementDecision, StagedBinaryReplacement, StagedReplacePhase, UpdateCutoverKind,
+    UpdateHandoffError, UpdateHandoffMachine, UpdateHandoffPhase, UpdateHandoffRecoveryMarker,
+    UpdateHandoffToken, UpdateRejection, UpdateResourceInspection, UpdaterService,
+    UserStateClassification,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -125,6 +127,62 @@ fn packager_architecture_target_key_is_os_arch() {
         target.contains('-'),
         "packager target must be OS-ARCH, got {target}"
     );
+}
+
+#[test]
+fn packager_update_target_is_os_only_while_manifest_key_is_os_arch() {
+    let Some(os) = packager_os_target() else {
+        return;
+    };
+    let Some(arch) = packager_architecture_target() else {
+        return;
+    };
+    assert_eq!(os, arch.split('-').next().unwrap_or_default());
+    assert_ne!(
+        os, arch,
+        "request target and manifest key must stay distinct"
+    );
+}
+
+#[test]
+fn recovery_marker_round_trip_validates_hello_and_clears() {
+    let root = std::env::temp_dir().join(format!(
+        "devmanager-recovery-marker-{}",
+        Uuid::now_v7().as_u128()
+    ));
+    fs::create_dir_all(&root).unwrap();
+    let token = UpdateHandoffToken {
+        token_id: Uuid::now_v7(),
+        host_boot_id: Uuid::nil(),
+        inspection_id: 7,
+        target_version: "0.4.2".into(),
+        client_build: "devmanager/0.4.2".into(),
+        host_build: "devmanager-host/0.4.2".into(),
+        issued_at: UNIX_EPOCH + Duration::from_secs(1),
+        expires_at: UNIX_EPOCH + Duration::from_secs(120),
+    };
+    let marker = UpdateHandoffRecoveryMarker::from_token(&token, 1, 0);
+    persist_update_handoff_recovery_marker(&root, &marker).expect("persist");
+    let loaded = read_update_handoff_recovery_marker(&root)
+        .expect("read")
+        .expect("present");
+    loaded
+        .validate_live_host_hello("devmanager-host/0.4.2", 1, 0)
+        .expect("hello match");
+    assert!(loaded
+        .validate_live_host_hello("devmanager-host/0.4.1", 1, 0)
+        .is_err());
+
+    let gate = HostUpdateRuntimeGate::new();
+    let now = UNIX_EPOCH + Duration::from_secs(10);
+    gate.complete_recovery_from_marker(&loaded, "devmanager-host/0.4.2", 1, 0, now, || {
+        clear_update_handoff_recovery_marker(&root)
+    })
+    .expect("complete recovery");
+    assert!(read_update_handoff_recovery_marker(&root)
+        .expect("reread")
+        .is_none());
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
