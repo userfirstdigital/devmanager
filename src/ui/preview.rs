@@ -144,7 +144,9 @@ impl ComponentGalleryFixture {
             GalleryState::Destructive,
         ];
         if self.states.len() != required_states.len()
-            || required_states.iter().any(|state| !self.states.contains(state))
+            || required_states
+                .iter()
+                .any(|state| !self.states.contains(state))
         {
             return Err(
                 "component gallery must cover every reusable interaction state".to_string(),
@@ -169,7 +171,12 @@ impl ComponentGalleryFixture {
         if self.samples.long_text.chars().count() <= 256 {
             return Err("component gallery long_text must exercise overflow wrapping".to_string());
         }
-        if !self.samples.unicode.chars().any(|character| !character.is_ascii()) {
+        if !self
+            .samples
+            .unicode
+            .chars()
+            .any(|character| !character.is_ascii())
+        {
             return Err("component gallery unicode sample must contain non-ASCII text".to_string());
         }
         Ok(())

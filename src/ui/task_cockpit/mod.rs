@@ -38,7 +38,6 @@ pub use inbox::{
 
 
 /// Shared semantic renderer surfaces for task-cockpit messages.
- pub mod renderers;
  pub mod timeline;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
