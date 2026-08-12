@@ -6,8 +6,9 @@ pub mod capabilities;
 pub mod claude;
 pub mod codex;
 pub mod conformance;
-pub mod dispatch;
+pub mod controller;
 pub mod cursor;
+pub mod dispatch;
 pub mod hook_bridge;
 pub mod host;
 pub mod input;
@@ -52,6 +53,7 @@ pub use capabilities::{
 };
 pub use claude::ClaudeCodeAdapter;
 pub use codex::CodexAdapter;
+pub use controller::{StockProviderSessionController, StockProviderSessionError};
 pub use cursor::CursorAdapter;
 pub use host::{
     admit_specialist_start, cancel_specialist_with_authority, correlate_specialist_authority,

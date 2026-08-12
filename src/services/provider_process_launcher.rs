@@ -75,6 +75,13 @@ impl sealed::ProviderProcessLauncher for ProcessManagerProviderLauncher {}
 
 impl ProviderProcessLauncher for ProcessManagerProviderLauncher {
     fn launch(&mut self, request: &ProviderRuntimeLaunchRequest) -> ProviderLaunchOutcome {
+        if let Some(error) = crate::providers::controller::unauthenticated_stock_launch_error(
+            request.provider_kind(),
+            request.capabilities().auth_state(),
+            request.launch_spec().mode(),
+        ) {
+            return ProviderLaunchOutcome::Rejected(error);
+        }
         match self.manager.launch_sealed_provider_runtime(request) {
             Ok(lease) => ProviderLaunchOutcome::Started(lease),
             Err(error) => ProviderLaunchOutcome::Rejected(error),
@@ -388,5 +395,22 @@ mod tests {
                 ))
             ));
         }
+    }
+
+    #[test]
+    fn cursor_unknown_auth_does_not_open_a_fresh_runtime() {
+        let manager = ProcessManager::new();
+        let mut launcher = manager.provider_process_launcher();
+        let fresh = launch_request_with_auth(
+            ProviderKind::Cursor,
+            CapabilitySupport::Unsupported,
+            ProviderAuthState::Unknown,
+            ProviderLaunchMode::NewConversation,
+            Vec::new(),
+        );
+        assert!(matches!(
+            launcher.launch(&fresh),
+            ProviderLaunchOutcome::Rejected(ProviderLaunchError::AuthenticationRequired)
+        ));
     }
 }

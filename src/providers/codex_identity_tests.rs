@@ -1315,3 +1315,19 @@ async fn codex_registry_observe_uses_adapter_login_status_seam() {
         CapabilitySupport::Unsupported
     );
 }
+
+#[test]
+fn rollout_filename_cannot_bind_provider_session_id() {
+    assert_eq!(
+        CodexAdapter::session_id_from_rollout_path(Path::new(
+            "/fixture/codex/sessions/rollout-fixture.jsonl"
+        )),
+        Err(CodexIdentityError::RolloutInferenceForbidden)
+    );
+    assert_eq!(
+        CodexAdapter::session_id_from_rollout_path(Path::new(
+            r"C:\Users\u\.codex\sessions\2026\08\12\rollout-019f-should-not-bind.jsonl"
+        )),
+        Err(CodexIdentityError::RolloutInferenceForbidden)
+    );
+}

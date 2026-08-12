@@ -2,10 +2,12 @@
 //!
 //! [`crate::providers::host::ProviderHost::stock`] and ProcessManager startup
 //! invoke [`stock_provider_registry`] / [`register_stock_adapters`] exactly
-//! once. The adapter-sealed [`start_request_from_adapter`] seam is available
-//! when a host has a real provider process launcher. ProcessManager exposes
-//! `start_adapter_sealed_provider_session` so App code can start through
-//! `ProviderSessionManager` with the Job/PTY launcher. Legacy Claude/Codex
+//! once. Production hosts should start through
+//! [`crate::providers::StockProviderSessionController`], which fail-closes
+//! without a subscription receipt and then uses this adapter-sealed
+//! [`start_request_from_adapter`] seam. ProcessManager still exposes
+//! `start_adapter_sealed_provider_session` so a host-owned caller can pass an
+//! already-sealed request into `ProviderSessionManager`. Legacy Claude/Codex
 //! hook overlays remain available for UI tabs that still inject a shell.
 
 use crate::domain::{AgentSessionFacts, ProviderSessionId};

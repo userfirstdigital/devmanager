@@ -702,8 +702,9 @@ pub enum ExactResumeFailure {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderLaunchError {
     ExactResumeFailed(ExactResumeFailure),
-    /// Stock Claude/Codex launches require a verified subscription receipt;
-    /// unknown, API-key, and auth-required evidence cannot reach the PTY.
+    /// Stock Claude/Codex/Cursor launches require a verified subscription
+    /// receipt; unknown, API-key, and auth-required evidence cannot reach the
+    /// PTY.
     AuthenticationRequired,
     SpawnFailed,
     ProcessExited,

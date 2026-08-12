@@ -1317,4 +1317,109 @@ mod tests {
         assert!(!bound.contains_key(&oldest.expect("oldest key")));
         assert!(bound.contains_key(&newest.expect("newest key")));
     }
+
+    fn attested_observation() -> ProviderObservation {
+        let executable = current_executable_for_hooks();
+        let version = ProviderVersion::from_probe_output(fixture("version")).unwrap();
+        let capabilities = ProviderCapabilities {
+            kind: ProviderKind::ClaudeCode,
+            version: version.clone(),
+            auth_state: ProviderAuthState::Unknown,
+            exact_resume: CapabilitySupport::Supported,
+            semantic_events: CapabilitySupport::Supported,
+            provider_session_id: CapabilitySupport::Supported,
+            build_launch: CapabilitySupport::Supported,
+            parse_signal: CapabilitySupport::Unsupported,
+            cooperative_stop: CapabilitySupport::Unknown,
+            observe_quota: CapabilitySupport::Unknown,
+            evidence: vec![],
+        };
+        ProviderObservation::from_test_parts(
+            ProviderKind::ClaudeCode,
+            executable.open_for_launch().unwrap(),
+            version,
+            capabilities,
+        )
+        .expect("attested observation")
+    }
+
+    fn current_executable_for_hooks() -> ProviderExecutable {
+        ProviderExecutable::from_path(std::env::current_exe().expect("current exe"))
+            .expect("identity")
+    }
+
+    fn hook_binding() -> ClaudeCorrelationBinding {
+        ClaudeCorrelationBinding::new(
+            TaskId::parse("018f60b0-9c1a-7001-8000-00000000000b").unwrap(),
+            AgentSessionId::parse("018f60b0-9c1a-7001-8000-000000000021").unwrap(),
+            1,
+            1,
+            ResourceId::parse("018f60b0-9c1a-7001-8000-000000000057").unwrap(),
+        )
+    }
+
+    #[test]
+    fn session_start_binds_official_id_and_rejects_stale_or_mismatched_hooks() {
+        use crate::ai::claude_hooks::ClaudeHookRegistry;
+        use crate::remote::presentation::StableSessionKey;
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        use std::time::Instant;
+
+        let observation = attested_observation();
+        let adapter = ClaudeCodeAdapter::from_attested_observation(observation.clone()).unwrap();
+        let relay = ClaudeHookRegistry::default();
+        let expected = hook_binding();
+        let launch =
+            LaunchProviderRequest::new(observation.executable_handle().clone(), None, None);
+        let now = Instant::now();
+        let registration = adapter
+            .register_with_relay(
+                &relay,
+                StableSessionKey::from_tab("claude-controller"),
+                &expected,
+                &launch,
+                now,
+            )
+            .expect("register current generation");
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 45100);
+        let body = include_bytes!("../../tests/fixtures/providers/claude/session_start.json");
+        let admitted = adapter
+            .admit_session_start(&relay, peer, &registration, &expected, body, now)
+            .expect("current SessionStart");
+        assert_eq!(admitted.provider_session_id().as_str(), "session-1");
+
+        let stale_generation = ClaudeCorrelationBinding::new(
+            expected.task_id(),
+            expected.agent_session_id(),
+            expected.runtime_generation() + 1,
+            expected.action_epoch(),
+            expected.process_root(),
+        );
+        assert!(matches!(
+            adapter.admit_session_start(&relay, peer, &registration, &stale_generation, body, now),
+            Err(ClaudeBindError::WrongGeneration
+                | ClaudeBindError::StaleRegistration
+                | ClaudeBindError::CorrelationMismatch)
+        ));
+
+        let replacement = adapter
+            .register_with_relay(
+                &relay,
+                StableSessionKey::from_tab("claude-controller"),
+                &expected,
+                &launch,
+                now,
+            )
+            .expect("replacement generation");
+        assert!(matches!(
+            adapter.admit_session_start(&relay, peer, &registration, &expected, body, now),
+            Err(ClaudeBindError::StaleRegistration
+                | ClaudeBindError::WrongNonce
+                | ClaudeBindError::CorrelationMismatch)
+        ));
+        let replay = adapter
+            .admit_session_start(&relay, peer, &replacement, &expected, body, now)
+            .expect("replacement SessionStart still admits the official id");
+        assert_eq!(replay.provider_session_id().as_str(), "session-1");
+    }
 }

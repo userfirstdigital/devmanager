@@ -119,8 +119,11 @@ impl ProviderHost {
     }
 
     /// Seal a start request through the registered adapter `build_launch`.
-    /// Exact resume never falls back to a fresh conversation. ProcessManager
-    /// supplies the production Job/PTY launcher for [`ProviderSessionManager`].
+    /// Exact resume never falls back to a fresh conversation. Production
+    /// dispatchers should call [`crate::providers::StockProviderSessionController::start`]
+    /// so subscription fail-closed and session-manager handoff stay provider-owned.
+    /// ProcessManager still supplies the Job/PTY launcher for
+    /// [`ProviderSessionManager`].
     pub fn start_request_from_registered_adapter(
         &self,
         agent: AgentSessionFacts,

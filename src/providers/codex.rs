@@ -437,7 +437,7 @@ impl CodexAdapter {
         Err(dependency(ProviderCapability::SemanticEvents))
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub(crate) fn session_id_from_rollout_path(
         _path: &Path,
     ) -> Result<ProviderSessionId, CodexIdentityError> {
