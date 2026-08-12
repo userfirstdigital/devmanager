@@ -29,8 +29,8 @@ use crate::remote::presentation::{SemanticEventKind, StableSessionKey};
 use crate::remote::{
     self, ClientAuth, LocalPortForwardManager, PendingRemoteRequest, RemoteAction,
     RemoteActionPayload, RemoteActionResult, RemoteClientHandle, RemoteClientPool, RemoteGitRepo,
-    RemoteHostService, RemoteLatencyStats, RemoteMachineState, RemotePortForwardState,
-    RemoteSessionBootstrap, RemoteTerminalExport, RemoteTerminalInput,
+    RemoteHostService, RemoteHostWeakHandle, RemoteLatencyStats, RemoteMachineState,
+    RemotePortForwardState, RemoteSessionBootstrap, RemoteTerminalExport, RemoteTerminalInput,
 };
 use crate::services::{
     ai_session_needs_restore, env_service, pid_file, platform_service, ports_service,
@@ -1095,6 +1095,114 @@ fn resolve_remote_state_startup(
     }
 }
 
+fn remote_terminal_input_callback(
+    input_manager: ProcessManager,
+    input_host: RemoteHostWeakHandle,
+) -> impl Fn(RemoteTerminalInput, u64) -> Result<(), String> + Send + Sync + 'static {
+    move |input, enqueued_at_epoch_ms| {
+        // A queued callback may outlive the root shell. Upgrade only for this
+        // bounded input operation so its payload cannot retain the stopped
+        // host runtime, and fail closed if teardown has already started.
+        let Some(input_host) = input_host.upgrade() else {
+            return Err("Remote host stopped before terminal input could be applied.".to_string());
+        };
+        let result = match input {
+            RemoteTerminalInput::Text { session_id, text } => {
+                input_manager.write_user_text_to_session(&session_id, &text)
+            }
+            RemoteTerminalInput::Bytes { session_id, bytes } => {
+                input_manager.write_user_bytes_to_session(&session_id, &bytes)
+            }
+            RemoteTerminalInput::Control { session_id, bytes } => {
+                input_manager.write_bytes_to_session(&session_id, &bytes)
+            }
+            RemoteTerminalInput::Paste { session_id, text } => {
+                input_manager.paste_user_text_to_session(&session_id, &text)
+            }
+            RemoteTerminalInput::Image {
+                session_id,
+                attachment,
+                authority,
+            } => crate::remote::web::image_paste::handle_web_image_paste(
+                &input_manager,
+                &session_id,
+                &attachment,
+                || {
+                    authority.as_ref().is_none_or(|authority| {
+                        input_host.web_mutation_authority_is_current(authority)
+                    })
+                },
+            ),
+            RemoteTerminalInput::ComposerBatch {
+                session_id,
+                text,
+                attachments,
+                authority,
+            } => crate::remote::web::image_paste::handle_web_composer_batch(
+                &input_manager,
+                &session_id,
+                &attachments,
+                &text,
+                || input_host.web_mutation_authority_is_current(&authority),
+            ),
+        };
+        if result.is_ok() {
+            input_host.record_input_write_latency(enqueued_at_epoch_ms);
+        }
+        result
+    }
+}
+
+fn remote_session_event_callback(
+    event_host: RemoteHostWeakHandle,
+) -> impl Fn(RemoteSessionEvent) + Send + Sync + 'static {
+    move |event| {
+        // ProcessManager owns this callback independently of the shell. A
+        // stopped host is therefore an ordinary no-op, not an owning cycle.
+        let Some(event_host) = event_host.upgrade() else {
+            return;
+        };
+        match event {
+            RemoteSessionEvent::Output {
+                session_id,
+                bytes,
+                mode,
+                screen,
+            } => event_host.push_session_output_with_mode(&session_id, bytes, mode, screen),
+            RemoteSessionEvent::Runtime {
+                session_id,
+                runtime,
+            } => event_host.push_session_runtime(&session_id, runtime),
+            RemoteSessionEvent::Removed { session_id } => {
+                event_host.push_session_removed(&session_id)
+            }
+            RemoteSessionEvent::Semantic { draft } => event_host.push_semantic_draft(draft),
+            RemoteSessionEvent::ClaudeSemantic { identity, draft } => {
+                event_host.push_claude_semantic_draft(identity, draft)
+            }
+            RemoteSessionEvent::ClaudeAdapterRegistered { identity } => {
+                event_host.push_claude_adapter_registered(identity)
+            }
+            RemoteSessionEvent::ClaudeAdapterRemoved { identity } => {
+                event_host.push_claude_adapter_removed(&identity)
+            }
+            RemoteSessionEvent::CodexSemantic { identity, draft } => {
+                event_host.push_codex_semantic_draft(identity, draft)
+            }
+            RemoteSessionEvent::CodexAdapterRegistered { identity } => {
+                event_host.push_codex_adapter_registered(identity)
+            }
+            RemoteSessionEvent::CodexAdapterRemoved { identity } => {
+                event_host.push_codex_adapter_removed(&identity)
+            }
+            RemoteSessionEvent::AdapterHealth {
+                stable_session_key,
+                health,
+            } => event_host.push_semantic_adapter_health(stable_session_key, health),
+        }
+    }
+}
+
 impl NativeShell {
     fn new(cx: &mut Context<Self>) -> Self {
         let session_manager = SessionManager::new();
@@ -1219,55 +1327,11 @@ impl NativeShell {
                 replay_bytes,
             })
         })));
-        let input_manager = process_manager.clone();
-        let input_host_service = remote_host_service.clone();
         remote_host_service.set_terminal_input_handler(Some(Arc::new(
-            move |input, enqueued_at_epoch_ms| {
-                let result = match input {
-                    RemoteTerminalInput::Text { session_id, text } => {
-                        input_manager.write_user_text_to_session(&session_id, &text)
-                    }
-                    RemoteTerminalInput::Bytes { session_id, bytes } => {
-                        input_manager.write_user_bytes_to_session(&session_id, &bytes)
-                    }
-                    RemoteTerminalInput::Control { session_id, bytes } => {
-                        input_manager.write_bytes_to_session(&session_id, &bytes)
-                    }
-                    RemoteTerminalInput::Paste { session_id, text } => {
-                        input_manager.paste_user_text_to_session(&session_id, &text)
-                    }
-                    RemoteTerminalInput::Image {
-                        session_id,
-                        attachment,
-                        authority,
-                    } => crate::remote::web::image_paste::handle_web_image_paste(
-                        &input_manager,
-                        &session_id,
-                        &attachment,
-                        || {
-                            authority.as_ref().is_none_or(|authority| {
-                                input_host_service.web_mutation_authority_is_current(authority)
-                            })
-                        },
-                    ),
-                    RemoteTerminalInput::ComposerBatch {
-                        session_id,
-                        text,
-                        attachments,
-                        authority,
-                    } => crate::remote::web::image_paste::handle_web_composer_batch(
-                        &input_manager,
-                        &session_id,
-                        &attachments,
-                        &text,
-                        || input_host_service.web_mutation_authority_is_current(&authority),
-                    ),
-                };
-                if result.is_ok() {
-                    input_host_service.record_input_write_latency(enqueued_at_epoch_ms);
-                }
-                result
-            },
+            remote_terminal_input_callback(
+                process_manager.clone(),
+                remote_host_service.downgrade(),
+            ),
         )));
         let resize_manager = process_manager.clone();
         remote_host_service.set_terminal_resize_handler(Some(Arc::new(
@@ -1275,53 +1339,9 @@ impl NativeShell {
                 let _ = resize_manager.resize_session(&session_id, dimensions);
             },
         )));
-        let event_host_service = remote_host_service.clone();
-        process_manager.set_remote_session_handler(Some(Arc::new(move |event| match event {
-            RemoteSessionEvent::Output {
-                session_id,
-                bytes,
-                mode,
-                screen,
-            } => {
-                event_host_service.push_session_output_with_mode(&session_id, bytes, mode, screen);
-            }
-            RemoteSessionEvent::Runtime {
-                session_id,
-                runtime,
-            } => {
-                event_host_service.push_session_runtime(&session_id, runtime);
-            }
-            RemoteSessionEvent::Removed { session_id } => {
-                event_host_service.push_session_removed(&session_id);
-            }
-            RemoteSessionEvent::Semantic { draft } => {
-                event_host_service.push_semantic_draft(draft);
-            }
-            RemoteSessionEvent::ClaudeSemantic { identity, draft } => {
-                event_host_service.push_claude_semantic_draft(identity, draft);
-            }
-            RemoteSessionEvent::ClaudeAdapterRegistered { identity } => {
-                event_host_service.push_claude_adapter_registered(identity);
-            }
-            RemoteSessionEvent::ClaudeAdapterRemoved { identity } => {
-                event_host_service.push_claude_adapter_removed(&identity);
-            }
-            RemoteSessionEvent::CodexSemantic { identity, draft } => {
-                event_host_service.push_codex_semantic_draft(identity, draft);
-            }
-            RemoteSessionEvent::CodexAdapterRegistered { identity } => {
-                event_host_service.push_codex_adapter_registered(identity);
-            }
-            RemoteSessionEvent::CodexAdapterRemoved { identity } => {
-                event_host_service.push_codex_adapter_removed(&identity);
-            }
-            RemoteSessionEvent::AdapterHealth {
-                stable_session_key,
-                health,
-            } => {
-                event_host_service.push_semantic_adapter_health(stable_session_key, health);
-            }
-        })));
+        process_manager.set_remote_session_handler(Some(Arc::new(remote_session_event_callback(
+            remote_host_service.downgrade(),
+        ))));
         let focus_manager = process_manager.clone();
         remote_host_service.set_focused_session_handler(Some(Arc::new(move |session_id| {
             focus_manager.set_active_session(session_id);
@@ -1358,7 +1378,7 @@ impl NativeShell {
         }
         Self::spawn_remote_refresh_task(native_dialog_blockers.clone(), cx);
         Self::spawn_ai_quota_refresh_task(
-            remote_host_service.clone(),
+            remote_host_service.downgrade(),
             native_dialog_blockers.clone(),
             cx,
         );
@@ -4857,7 +4877,7 @@ impl NativeShell {
     }
 
     fn spawn_ai_quota_refresh_task(
-        remote_host_service: RemoteHostService,
+        remote_host_service: RemoteHostWeakHandle,
         native_dialog_blockers: Arc<AtomicUsize>,
         cx: &mut Context<Self>,
     ) {
@@ -4873,6 +4893,9 @@ impl NativeShell {
                         while native_dialog_blockers.load(Ordering::Acquire) > 0 {
                             background_executor.timer(Duration::from_millis(50)).await;
                         }
+                        let Some(remote_host_service) = remote_host_service.upgrade() else {
+                            break;
+                        };
                         if this
                             .update(&mut async_cx, |shell, cx: &mut Context<'_, Self>| {
                                 if shell.refresh_ai_quota_states(&remote_host_service) {
@@ -19483,6 +19506,69 @@ mod tests {
     use gpui::point;
     use std::collections::{BTreeSet, HashMap};
     use std::path::PathBuf;
+
+    #[test]
+    fn deferred_terminal_input_callback_does_not_retain_stopped_remote_host() {
+        let service = RemoteHostService::new(crate::remote::RemoteHostConfig::default());
+        let host = service.downgrade();
+        let callback = Arc::new(remote_terminal_input_callback(
+            ProcessManager::new(),
+            host.clone(),
+        ));
+        service.set_terminal_input_handler(Some(callback.clone()));
+
+        drop(service);
+
+        assert!(
+            host.upgrade().is_none(),
+            "terminal input callback retained the stopped host runtime"
+        );
+        let error = callback(
+            RemoteTerminalInput::Text {
+                session_id: "stopped-session".to_string(),
+                text: "must-not-run".to_string(),
+            },
+            0,
+        )
+        .expect_err("stopped host must fail terminal input closed");
+        assert!(error.contains("Remote host stopped"));
+    }
+
+    #[test]
+    fn process_manager_remote_session_callback_does_not_retain_stopped_host() {
+        let service = RemoteHostService::new(crate::remote::RemoteHostConfig::default());
+        let host = service.downgrade();
+        let manager = ProcessManager::new();
+        let callback = Arc::new(remote_session_event_callback(host.clone()));
+        manager.set_remote_session_handler(Some(callback.clone()));
+
+        drop(service);
+
+        assert!(
+            host.upgrade().is_none(),
+            "ProcessManager callback retained the stopped host runtime"
+        );
+        // A late ProcessManager event is an ordinary no-op after teardown.
+        callback(RemoteSessionEvent::Removed {
+            session_id: "stopped-session".to_string(),
+        });
+    }
+
+    #[test]
+    fn quota_refresh_task_capture_does_not_retain_stopped_remote_host() {
+        let service = RemoteHostService::new(crate::remote::RemoteHostConfig::default());
+        let deferred_tick = {
+            let quota_task_host = service.downgrade();
+            move || quota_task_host.upgrade()
+        };
+
+        drop(service);
+
+        assert!(
+            deferred_tick().is_none(),
+            "periodic quota task capture retained the stopped host runtime"
+        );
+    }
 
     #[test]
     fn remote_state_load_failure_disables_remote_and_surfaces_diagnostic() {
