@@ -1552,6 +1552,12 @@ mod tests {
         for action in catalog() {
             let (expected_scope, expected_risk, expected_schema, expected_capability) =
                 match action.id {
+                    ACTION_BROWSER_NATIVE => (
+                        ActionScope::Task,
+                        ActionRisk::Mutating,
+                        ActionArgumentSchema::None,
+                        Some(Capability::BrowserProjection),
+                    ),
                     ACTION_TASK_LIST => (
                         ActionScope::Host,
                         ActionRisk::ReadOnly,
