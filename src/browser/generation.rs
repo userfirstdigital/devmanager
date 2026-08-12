@@ -12,9 +12,7 @@ use crate::domain::browser::{
     BrowserAction, BrowserBook, BrowserContractError, BrowserHealth, BrowserHostOutcome,
     BrowserRequest, BrowserSettlement, BrowserTabKind,
 };
-use crate::domain::id::{
-    ArtifactId, BrowserContextId, BrowserRequestId, BrowserTabId, TaskId,
-};
+use crate::domain::id::{ArtifactId, BrowserContextId, BrowserRequestId, BrowserTabId, TaskId};
 
 pub const MAX_BROWSER_GENERATION_QUEUE: usize = 32;
 pub const MAX_BROWSER_GENERATION_CONTEXTS: usize = 32;
@@ -46,7 +44,10 @@ impl fmt::Display for BrowserGenerationError {
             Self::Cancelled => write!(f, "browser operation was cancelled"),
             Self::InvalidRequest => write!(f, "browser generation request is not admissible"),
             Self::SecretSerialized => {
-                write!(f, "secret values cannot be serialized into recipes or journals")
+                write!(
+                    f,
+                    "secret values cannot be serialized into recipes or journals"
+                )
             }
             Self::SilentRepairForbidden => {
                 write!(f, "locator repair requires an explicit proposed patch")
@@ -319,9 +320,7 @@ impl BrowserTaskGenerationAuthority {
             .get(&(ticket.task_id, ticket.context_id))
             .ok_or(BrowserGenerationError::InvalidRequest)?;
         if queue.cancelled.contains(&ticket.generation)
-            || queue
-                .cancelled_requests
-                .contains(&ticket.request_id)
+            || queue.cancelled_requests.contains(&ticket.request_id)
         {
             return Err(BrowserGenerationError::Cancelled);
         }
@@ -433,7 +432,12 @@ impl BrowserTaskGenerationAuthority {
         if ticket.kind != BrowserWorkflowKind::Record {
             return Err(BrowserGenerationError::InvalidRequest);
         }
-        self.settle_identity(ticket, BrowserAction::Record, recording_id, BrowserTaskArtifactKind::Recording)
+        self.settle_identity(
+            ticket,
+            BrowserAction::Record,
+            recording_id,
+            BrowserTaskArtifactKind::Recording,
+        )
     }
 
     pub fn identify_recipe(
@@ -446,7 +450,12 @@ impl BrowserTaskGenerationAuthority {
         {
             return Err(BrowserGenerationError::InvalidRequest);
         }
-        self.settle_identity(ticket, BrowserAction::Replay, recipe_id, BrowserTaskArtifactKind::Recipe)
+        self.settle_identity(
+            ticket,
+            BrowserAction::Replay,
+            recipe_id,
+            BrowserTaskArtifactKind::Recipe,
+        )
     }
 
     pub fn queued_count(&self, task_id: TaskId, context_id: BrowserContextId) -> usize {
@@ -524,7 +533,8 @@ impl BrowserTaskGenerationAuthority {
         identity: &str,
         kind: BrowserTaskArtifactKind,
     ) -> Result<BrowserTaskArtifact, BrowserGenerationError> {
-        if identity.is_empty() || identity.len() > crate::domain::browser::MAX_BROWSER_IDENTITY_BYTES
+        if identity.is_empty()
+            || identity.len() > crate::domain::browser::MAX_BROWSER_IDENTITY_BYTES
         {
             return Err(BrowserGenerationError::InvalidRequest);
         }

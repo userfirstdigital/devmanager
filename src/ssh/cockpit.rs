@@ -3,7 +3,7 @@
 //! Host catalog identity and labels may cross the wire. Hostnames, usernames,
 //! ports, and credential material never do.
 
-use crate::config::{SshAuthMode, SSHConnection};
+use crate::config::{SSHConnection, SshAuthMode};
 use crate::domain::cockpit::TaskSshEndpoint;
 
 const MAX_SSH_ENDPOINTS: usize = 32;
@@ -82,10 +82,7 @@ fn endpoint_id_is_catalog_form(endpoint_id: &str) -> bool {
 fn has_credential(connection: &SSHConnection) -> bool {
     connection.auth.as_ref().is_some_and(|auth| {
         auth.credential_ref.as_ref().is_some()
-            || matches!(
-                auth.mode,
-                SshAuthMode::Password | SshAuthMode::PrivateKey
-            )
+            || matches!(auth.mode, SshAuthMode::Password | SshAuthMode::PrivateKey)
     })
 }
 

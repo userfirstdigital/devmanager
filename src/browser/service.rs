@@ -194,7 +194,8 @@ impl BrowserTaskService {
             .recovery
             .authority_mut()
             .identify_recipe(&recipe_ticket, &recipe.id)?;
-        self.recordings.insert(recording.artifact_id, recording.clone());
+        self.recordings
+            .insert(recording.artifact_id, recording.clone());
         self.recipes.insert(
             recipe_artifact.artifact_id,
             StoredRecipe {
@@ -308,9 +309,7 @@ impl BrowserTaskService {
             lease.values.clear();
             lease.generation = ticket.generation();
         }
-        lease
-            .values
-            .insert(name.to_string(), Zeroizing::new(value));
+        lease.values.insert(name.to_string(), Zeroizing::new(value));
         Ok(BrowserSecretPlaceholder {
             name: name.to_string(),
         })
@@ -540,9 +539,9 @@ fn step_has_secret_literal(
         | crate::browser::recipes::BrowserRecipeAction::Upload { file: value, .. } => {
             literal_is_secret(value, inputs)
         }
-        crate::browser::recipes::BrowserRecipeAction::CreateTab { url: Some(value), .. } => {
-            literal_is_secret(value, inputs)
-        }
+        crate::browser::recipes::BrowserRecipeAction::CreateTab {
+            url: Some(value), ..
+        } => literal_is_secret(value, inputs),
         crate::browser::recipes::BrowserRecipeAction::Select { values, .. } => {
             values.iter().any(|value| literal_is_secret(value, inputs))
         }
@@ -567,9 +566,7 @@ fn looks_secret_literal(value: &str, inputs: &[BrowserRecipeInput]) -> bool {
 
 fn json_contains_secret_literal(value: &Value) -> bool {
     match value {
-        Value::String(text) => {
-            text.contains("secret:") || text.contains("never-expose-this-value")
-        }
+        Value::String(text) => text.contains("secret:") || text.contains("never-expose-this-value"),
         Value::Array(items) => items.iter().any(json_contains_secret_literal),
         Value::Object(map) => map.values().any(json_contains_secret_literal),
         _ => false,

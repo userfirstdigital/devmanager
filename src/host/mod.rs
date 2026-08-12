@@ -11,13 +11,13 @@ mod organization_runtime;
 mod shutdown;
 mod update;
 
-#[cfg(test)]
-pub(crate) use connection::{ConnectionOutputHandle, ConnectionOutputId, OutputInspection};
 pub use crate::updater::handoff::{HostUpdateAdmission, HostUpdateHandoff};
 pub use connection::{
     dispatch_host_request, HostExecutorOutcome, HostRequestExecutor, HostRequestHandle,
     PhysicalExitArmRequest, SupervisedHostExecutor, HOST_REQUEST_QUEUE_CAPACITY,
 };
+#[cfg(test)]
+pub(crate) use connection::{ConnectionOutputHandle, ConnectionOutputId, OutputInspection};
 pub(crate) use ipc::{
     codecs_for_limits, handshake_codecs, handshake_timeout, read_physical_frame,
     read_physical_frame_idle_then_deadline, request_completion_timeout, supervise_duplex_halves,

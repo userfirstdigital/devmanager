@@ -9,7 +9,9 @@ use crate::connect::ConnectHostId;
 use crate::domain::id::TaskId;
 use crate::org::error::OrgError;
 use crate::org::identity::{BoardCardId, ExternalAccount, PortalAccountId, PortalTenantId};
-use crate::org::ids::{LocalActionId, ManagedLinkId, OrgPromptChainId, OrgPromptId, OrgPromptVersionId};
+use crate::org::ids::{
+    LocalActionId, ManagedLinkId, OrgPromptChainId, OrgPromptId, OrgPromptVersionId,
+};
 use crate::org::local_actions::{
     ActionOutcome, ActionRisk, Admission, LocalActionCatalogEntry, LocalActionKind,
 };
@@ -18,18 +20,16 @@ use crate::org::membership::{
     HostMembership, ManagedMetadataName, MembershipRole, MembershipStatus,
     OrganizationPolicyDocument, RawSharingCeiling,
 };
-use crate::org::persistence::{PersistedOutboxIntent, OrganizationStateStore};
+use crate::org::persistence::{OrganizationStateStore, PersistedOutboxIntent};
 use crate::org::portal::{
     reject_prohibited_fields, validate_iso_timestamp, validate_opaque_id,
-    CanonicalEvidenceImportRequest, HostMembershipDto, HostReconcileRequest,
-    HostReconcileResponse,
+    CanonicalEvidenceImportRequest, HostMembershipDto, HostReconcileRequest, HostReconcileResponse,
     LocalActionCatalogDto, LocalActionReceiptRequest, ManagedTaskDto, OrgPromptChainDto,
     OrgPromptDto, OrgPromptVersionDto, OrganizationPolicyDto, PortalActionKind, PortalActionRisk,
-    PortalAdapterError, PortalAuthProvider, PortalCredentialHandle, PortalEnrollmentState,
-    PortalAdmissionStatus, PortalManagementClient, PortalMembershipStatus, PortalOrgRole,
+    PortalAdapterError, PortalAdmissionStatus, PortalAuthProvider, PortalCredentialHandle,
+    PortalEnrollmentState, PortalManagementClient, PortalMembershipStatus, PortalOrgRole,
     PortalOutcomeStatus, PortalPage, PortalPromptStatus, PortalRawSharingCeiling, PortalTransport,
-    PublishPromptRequest, TelemetryUploadRequest,
-    PORTAL_PAGE_MAX_ITEMS,
+    PublishPromptRequest, TelemetryUploadRequest, PORTAL_PAGE_MAX_ITEMS,
 };
 use crate::org::{
     OrganizationCapabilityDisableReason, OrganizationCapabilityState, OrganizationFact,
@@ -229,7 +229,8 @@ impl<C: PortalTransport> PortalSyncRuntime<C> {
                 projection.set_authenticated_online(live);
                 self.last_verified = live;
                 if let Err(error) = store.save(projection) {
-                    if let Ok(restored) = OrganizationProjection::restore_from_document(checkpoint) {
+                    if let Ok(restored) = OrganizationProjection::restore_from_document(checkpoint)
+                    {
                         *projection = restored;
                     }
                     self.cursors = checkpoint_cursors;
@@ -350,7 +351,10 @@ impl<C: PortalTransport> PortalSyncRuntime<C> {
         let mut applied = 0u32;
         let mut pages_fetched = 0u32;
 
-        if !matches!(projection.mode(), crate::org::OperatingMode::HostEnrolled { .. }) {
+        if !matches!(
+            projection.mode(),
+            crate::org::OperatingMode::HostEnrolled { .. }
+        ) {
             if !request.local_confirmation {
                 apply_membership_fact(projection, host_id, &reconcile, now_ms)?;
                 return Ok(PortalReconcileOutcome {
@@ -394,7 +398,8 @@ impl<C: PortalTransport> PortalSyncRuntime<C> {
                 capability: projection.capability_state(),
             });
         }
-        if projection.membership().is_none() || !projection.membership().is_some_and(|m| m.is_enrolled())
+        if projection.membership().is_none()
+            || !projection.membership().is_some_and(|m| m.is_enrolled())
         {
             return Err(OrgError::EnrollmentNotConfirmed.into());
         }
@@ -450,9 +455,7 @@ impl<C: PortalTransport> PortalSyncRuntime<C> {
             applied += 1;
         }
         let (actions, action_pages) = collect_pages(
-            |cursor| {
-                client.list_actions_page(Some(&host_id_str), cursor, PORTAL_SYNC_PAGE_LIMIT)
-            },
+            |cursor| client.list_actions_page(Some(&host_id_str), cursor, PORTAL_SYNC_PAGE_LIMIT),
             &mut self.cursors.actions,
         )?;
         pages_fetched += action_pages;
@@ -552,9 +555,9 @@ fn scoped_membership(
     last_verified: bool,
 ) -> Result<&HostMembership, OrgError> {
     match projection.capability_state() {
-        OrganizationCapabilityState::Enabled if last_verified => projection
-            .membership()
-            .ok_or(OrgError::HostUnenrolled),
+        OrganizationCapabilityState::Enabled if last_verified => {
+            projection.membership().ok_or(OrgError::HostUnenrolled)
+        }
         OrganizationCapabilityState::Enabled => Err(OrgError::Offline),
         OrganizationCapabilityState::Disabled(reason) => Err(match reason {
             OrganizationCapabilityDisableReason::Standalone => OrgError::StandaloneMode,
@@ -650,8 +653,8 @@ fn apply_managed_task(
     }
     let local_task_id = parse_task_id(&task.link.local_task_id)?;
     let link_id = ManagedLinkId::parse(&task.link.id).map_err(|_| OrgError::EmptyIdentity)?;
-    let metadata_policy_version = u32::try_from(task.link.metadata_policy_version)
-        .map_err(|_| OrgError::StalePolicy)?;
+    let metadata_policy_version =
+        u32::try_from(task.link.metadata_policy_version).map_err(|_| OrgError::StalePolicy)?;
     if metadata_policy_version == 0 || task.link.portal_revision == 0 {
         return Err(OrgError::StalePolicy);
     }
@@ -694,7 +697,8 @@ fn apply_local_action(
     if parse_host_id(&action.host_id)? != host_id {
         return Err(OrgError::HostUnenrolled);
     }
-    let request_id = LocalActionId::parse(&action.request_id).map_err(|_| OrgError::EmptyIdentity)?;
+    let request_id =
+        LocalActionId::parse(&action.request_id).map_err(|_| OrgError::EmptyIdentity)?;
     let admission = match action.admission_status {
         PortalAdmissionStatus::Pending | PortalAdmissionStatus::Accepted => Admission::Accepted,
         PortalAdmissionStatus::Rejected => Admission::Rejected,
@@ -769,7 +773,8 @@ fn prompt_snapshot_from_portal(
                 return Err(OrgError::StalePolicy);
             }
             Ok(OrgPromptChain {
-                chain_id: OrgPromptChainId::parse(&chain.id).map_err(|_| OrgError::EmptyIdentity)?,
+                chain_id: OrgPromptChainId::parse(&chain.id)
+                    .map_err(|_| OrgError::EmptyIdentity)?,
                 tenant_id: tenant_id.clone(),
                 revision: u32::try_from(chain.revision).map_err(|_| OrgError::BoundExceeded)?,
                 links: chain
@@ -953,8 +958,10 @@ fn iso_timestamp_to_ms(value: &str) -> Result<i64, OrgError> {
         _ => return Err(OrgError::CorruptState),
     };
     let days = days_from_civil(year, month, day)?;
-    Ok(days * 86_400_000 + hour * 3_600_000 + minute * 60_000 + second * 1_000 + millis
-        - offset_min * 60_000)
+    Ok(
+        days * 86_400_000 + hour * 3_600_000 + minute * 60_000 + second * 1_000 + millis
+            - offset_min * 60_000,
+    )
 }
 
 fn parse_digits(bytes: &[u8]) -> Result<i64, OrgError> {
@@ -1345,9 +1352,7 @@ mod tests {
         assert_eq!(outcome.kind, PortalReconcileKind::StandaloneNoop);
         assert_eq!(
             runtime.capability(&projection),
-            OrganizationCapabilityState::Disabled(
-                OrganizationCapabilityDisableReason::Standalone
-            )
+            OrganizationCapabilityState::Disabled(OrganizationCapabilityDisableReason::Standalone)
         );
         assert_eq!(runtime.transport().calls(), 0);
         assert!(store.load().is_err());
@@ -1380,9 +1385,7 @@ mod tests {
         ));
         assert_eq!(
             runtime.capability(&projection),
-            OrganizationCapabilityState::Disabled(
-                OrganizationCapabilityDisableReason::Unenrolled
-            )
+            OrganizationCapabilityState::Disabled(OrganizationCapabilityDisableReason::Unenrolled)
         );
         assert_eq!(
             runtime.publish_prompt(
@@ -1464,9 +1467,7 @@ mod tests {
         assert_eq!(projection.sign_in(account()), 0);
         assert_eq!(
             runtime.capability(&projection),
-            OrganizationCapabilityState::Disabled(
-                OrganizationCapabilityDisableReason::Unenrolled
-            )
+            OrganizationCapabilityState::Disabled(OrganizationCapabilityDisableReason::Unenrolled)
         );
         let (root, store) = temp_store();
         let outcome = runtime
@@ -1648,7 +1649,9 @@ mod tests {
             delivery: OutboxDeliveryState::Queued,
         };
         assert_eq!(
-            projection.queue_outbox_intent(intent.clone()).expect("queue"),
+            projection
+                .queue_outbox_intent(intent.clone())
+                .expect("queue"),
             SyncOutcome::Applied
         );
         assert_eq!(
@@ -1715,9 +1718,7 @@ mod tests {
                 1_000,
             )
             .expect("enroll");
-        projection
-            .trust_evidence_signer("trusted")
-            .expect("trust");
+        projection.trust_evidence_signer("trusted").expect("trust");
         let bundle_id = BundleId::new();
         let mut bundle = EvidenceBundle {
             manifest_version: crate::org::EVIDENCE_BUNDLE_VERSION,
@@ -1744,10 +1745,8 @@ mod tests {
         let meta = projection.ingest_evidence(&bundle).expect("ingest");
         assert!(!meta.raw_content_included);
         assert_eq!(
-            projection.evidence_raw_segments(
-                crate::org::EvidenceAccessClass::MetadataOnly,
-                &bundle
-            ),
+            projection
+                .evidence_raw_segments(crate::org::EvidenceAccessClass::MetadataOnly, &bundle),
             Err(OrgError::ProhibitedField)
         );
         let queued = PersistedOutboxIntent {
@@ -1771,7 +1770,10 @@ mod tests {
         let uploaded = runtime.transport().recorded_telemetry();
         assert_eq!(uploaded.len(), 1);
         assert_eq!(uploaded[0].intent, "evidence_metadata");
-        assert_eq!(uploaded[0].bundle_ref.as_deref(), Some(bundle.content_hash_hex.as_str()));
+        assert_eq!(
+            uploaded[0].bundle_ref.as_deref(),
+            Some(bundle.content_hash_hex.as_str())
+        );
         assert!(!uploaded[0].raw_content);
         assert!(reject_prohibited_fields(&serde_json::json!({"terminal":"raw"})).is_err());
         assert!(TelemetryUploadRequest {
@@ -1828,7 +1830,9 @@ mod tests {
             OrganizationCapabilityState::Disabled(OrganizationCapabilityDisableReason::Revoked)
         );
         assert_eq!(
-            runtime.read_prompt(&projection, "prompt-1").expect_err("revoked"),
+            runtime
+                .read_prompt(&projection, "prompt-1")
+                .expect_err("revoked"),
             PortalSyncError::Org(OrgError::MembershipRevoked)
         );
         let _ = fs::remove_dir_all(root);

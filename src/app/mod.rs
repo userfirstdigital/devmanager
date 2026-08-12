@@ -2064,7 +2064,8 @@ impl NativeShell {
             browser_app_config_dir,
         ) {
             Ok(gateway) => {
-                self.browser_host.attach_gateway_registrar(gateway.registrar());
+                self.browser_host
+                    .attach_gateway_registrar(gateway.registrar());
                 self.process_manager
                     .set_browser_gateway_registrar(Some(gateway.registrar()));
                 self.browser_gateway = Some(gateway);

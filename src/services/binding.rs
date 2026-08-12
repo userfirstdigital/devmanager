@@ -370,7 +370,10 @@ fn derive_workspace_cwd(
     }
 }
 
-fn folder_relative_under_root(project_root: &str, folder_path: &str) -> Result<String, BindingError> {
+fn folder_relative_under_root(
+    project_root: &str,
+    folder_path: &str,
+) -> Result<String, BindingError> {
     let folder_path = folder_path.trim();
     if folder_path.is_empty() {
         return Ok(String::new());
@@ -385,7 +388,10 @@ fn folder_relative_under_root(project_root: &str, folder_path: &str) -> Result<S
     if root.is_empty() {
         return Err(BindingError::InvalidWorkspaceRoot);
     }
-    let path_norm = folder_path.replace('\\', "/").trim_end_matches('/').to_owned();
+    let path_norm = folder_path
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_owned();
     let root_norm = root.replace('\\', "/").trim_end_matches('/').to_owned();
     if path_norm.eq_ignore_ascii_case(&root_norm) {
         // Folder is the project root itself; relative env files resolve under root.
@@ -453,8 +459,14 @@ fn push_relative_components(path: &mut PathBuf, relative: &str) -> Result<(), Bi
 }
 
 fn lexical_path_is_under_root(path: &Path, root: &str) -> bool {
-    let path_norm = path.to_string_lossy().replace('\\', "/").to_ascii_lowercase();
-    let root_norm = root.replace('\\', "/").trim_end_matches('/').to_ascii_lowercase();
+    let path_norm = path
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase();
+    let root_norm = root
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_ascii_lowercase();
     path_norm == root_norm || path_norm.starts_with(&format!("{root_norm}/"))
 }
 

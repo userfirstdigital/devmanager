@@ -321,10 +321,7 @@ impl fmt::Debug for GitHostBinding {
 }
 
 impl GitHostBinding {
-    fn confirm_cockpit_plan<P: MutationPlan>(
-        &self,
-        plan: &P,
-    ) -> Result<GitConfirmation, GitError> {
+    fn confirm_cockpit_plan<P: MutationPlan>(&self, plan: &P) -> Result<GitConfirmation, GitError> {
         if !self.capability.is_live() {
             return Err(GitError::AuthorityUnavailable);
         }
@@ -516,14 +513,13 @@ pub(crate) fn issue_git_host_binding(
         path: "<bound-root>".to_string(),
         reason,
     })?;
-    let approved_external_roots = canonicalize_approved_graph_roots(
-        &root.path,
-        &approved_external_roots,
-    )
-    .map_err(|reason| GitError::InvalidRepositoryRoot {
-        path: "<bound-root>".to_string(),
-        reason,
-    })?;
+    let approved_external_roots =
+        canonicalize_approved_graph_roots(&root.path, &approved_external_roots).map_err(
+            |reason| GitError::InvalidRepositoryRoot {
+                path: "<bound-root>".to_string(),
+                reason,
+            },
+        )?;
     let repository_identity = repository_graph_identity(&root);
     let repository_static_identity = repository_static_graph_identity(&root);
     let workspace_identity = WorkspaceIdentity::from_canonical_root(root.path.clone());
@@ -942,7 +938,11 @@ impl GitConfirmation {
     }
 
     #[cfg(test)]
-    pub(crate) fn tamper_host_fence_for_test(&mut self, action_epoch: u64, runtime_generation: u64) {
+    pub(crate) fn tamper_host_fence_for_test(
+        &mut self,
+        action_epoch: u64,
+        runtime_generation: u64,
+    ) {
         self.action_epoch = Some(action_epoch);
         self.runtime_generation = Some(runtime_generation);
         if let GitPermitOperation::Mutation {
@@ -8444,8 +8444,7 @@ impl GitRepository {
         let Some(binding) = self.authority_binding() else {
             return Ok(());
         };
-        if !binding.capability.is_live()
-            || binding.capability.identity.workspace != self.workspace
+        if !binding.capability.is_live() || binding.capability.identity.workspace != self.workspace
         {
             return Err("host Git authority capability is unavailable".to_string());
         }
@@ -10577,10 +10576,7 @@ mod tests {
         .expect("successful claim must resume");
 
         assert_eq!(job, "job");
-        assert_eq!(
-            events.into_inner(),
-            ["claim:7", "gate:job", "resume:7"]
-        );
+        assert_eq!(events.into_inner(), ["claim:7", "gate:job", "resume:7"]);
     }
 
     #[test]

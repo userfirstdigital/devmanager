@@ -549,9 +549,7 @@ async fn run_connect_session(
         let Some(binding) = binding else {
             break;
         };
-        let limits = dispatch
-            .negotiated_limits()
-            .unwrap_or(envelope.limits);
+        let limits = dispatch.negotiated_limits().unwrap_or(envelope.limits);
         let response = match crate::connect::ConnectEnvelope::new(
             binding,
             reply.channel(),

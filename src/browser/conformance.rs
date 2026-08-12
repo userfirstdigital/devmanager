@@ -289,9 +289,7 @@ pub enum BrowserFixtureValidationError {
     SecretInFixture,
 }
 
-pub fn hold_authenticated_provider_launch(
-    provider: Option<&str>,
-) -> BrowserProviderHoldRecord {
+pub fn hold_authenticated_provider_launch(provider: Option<&str>) -> BrowserProviderHoldRecord {
     let _ = provider;
     BrowserProviderHoldRecord {
         arm: BrowserProviderArm::AuthenticatedHold,

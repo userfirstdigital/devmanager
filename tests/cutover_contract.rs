@@ -5210,7 +5210,9 @@ fn phase11_tauri_archive_is_absent() {
     assert!(!deferred
         .iter()
         .any(|value| value == "zz-archive/tauri-react-v0.1.11/"));
-    assert!(!deferred.iter().any(|value| value == "src/ai/codex_rollout.rs"));
+    assert!(!deferred
+        .iter()
+        .any(|value| value == "src/ai/codex_rollout.rs"));
 
     let scanner = read_source("src/services/scanner_service.rs");
     assert!(

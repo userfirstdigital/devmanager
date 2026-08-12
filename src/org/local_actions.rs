@@ -333,9 +333,7 @@ impl LocalActionRegistry {
             (Admission::Accepted, Some(ActionOutcome::Settled)) => {
                 LocalActionReconcileState::Settled
             }
-            (Admission::Accepted, Some(ActionOutcome::Failed)) => {
-                LocalActionReconcileState::Failed
-            }
+            (Admission::Accepted, Some(ActionOutcome::Failed)) => LocalActionReconcileState::Failed,
             (Admission::Accepted, Some(ActionOutcome::Cancelled)) => {
                 LocalActionReconcileState::Cancelled
             }
@@ -344,7 +342,8 @@ impl LocalActionRegistry {
             }
             (Admission::Accepted, None) => LocalActionReconcileState::AwaitingHostExecution,
         };
-        if state.admission == admission && state.outcome == outcome && state.reconcile == reconcile {
+        if state.admission == admission && state.outcome == outcome && state.reconcile == reconcile
+        {
             return Ok(SyncOutcome::Duplicate);
         }
         state.admission = admission;

@@ -1061,7 +1061,11 @@ impl CanonicalEvidenceBundle {
             validate_opaque_id(&media.artifact_id, "media.artifactId")?;
             if media.content_hash.algorithm != "sha256"
                 || media.content_hash.hex.len() != 64
-                || !media.content_hash.hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+                || !media
+                    .content_hash
+                    .hex
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit())
             {
                 return Err(PortalAdapterError::InvalidValue {
                     field: "media.contentHash".into(),
@@ -1084,12 +1088,13 @@ impl CanonicalEvidenceBundle {
                 validate_opaque_id(user_id, "review.reviewerUserId")?;
             }
         }
-        let signature = self.signature.as_ref().ok_or_else(|| {
-            PortalAdapterError::InvalidValue {
-                field: "signature".into(),
-                reason: "signed canonical bundle required".into(),
-            }
-        })?;
+        let signature =
+            self.signature
+                .as_ref()
+                .ok_or_else(|| PortalAdapterError::InvalidValue {
+                    field: "signature".into(),
+                    reason: "signed canonical bundle required".into(),
+                })?;
         if signature.algorithm != "hmac-sha256"
             || signature.hex.len() != 64
             || !signature.hex.bytes().all(|byte| byte.is_ascii_hexdigit())
@@ -1101,9 +1106,10 @@ impl CanonicalEvidenceBundle {
         }
         validate_opaque_id(&signature.key_id, "signature.keyId")?;
         validate_iso_timestamp(&signature.signed_at, "signature.signedAt")?;
-        reject_prohibited_fields(&serde_json::to_value(self).map_err(|error| {
-            PortalAdapterError::Serialization(error.to_string())
-        })?)
+        reject_prohibited_fields(
+            &serde_json::to_value(self)
+                .map_err(|error| PortalAdapterError::Serialization(error.to_string()))?,
+        )
     }
 }
 
@@ -1344,7 +1350,10 @@ fn bound_page_limit(limit: u32) -> Result<u32, PortalAdapterError> {
     Ok(limit)
 }
 
-fn reject_oversized_page<T>(page: PortalPage<T>, limit: u32) -> Result<PortalPage<T>, PortalAdapterError> {
+fn reject_oversized_page<T>(
+    page: PortalPage<T>,
+    limit: u32,
+) -> Result<PortalPage<T>, PortalAdapterError> {
     if page.items.len() > limit as usize {
         return Err(PortalAdapterError::InvalidValue {
             field: "items".into(),
@@ -1782,7 +1791,12 @@ impl PortalManagementClient {
         if let Some(host_id) = host_id {
             validate_opaque_id(host_id, "hostId")?;
         }
-        self.get_page(&["actions"], cursor, limit, host_id.map(|id| ("hostId", id)))
+        self.get_page(
+            &["actions"],
+            cursor,
+            limit,
+            host_id.map(|id| ("hostId", id)),
+        )
     }
 
     pub fn list_action_catalog(
@@ -1825,9 +1839,10 @@ impl PortalManagementClient {
                     (key, value),
                 ],
             )?,
-            (Some(cursor), None) => {
-                self.get_data(segments, &[("limit", limit_owned.as_str()), ("cursor", cursor)])?
-            }
+            (Some(cursor), None) => self.get_data(
+                segments,
+                &[("limit", limit_owned.as_str()), ("cursor", cursor)],
+            )?,
             (None, Some((key, value))) => {
                 self.get_data(segments, &[("limit", limit_owned.as_str()), (key, value)])?
             }

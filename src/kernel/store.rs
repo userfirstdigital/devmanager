@@ -2779,12 +2779,9 @@ fn claim_next_dispatch_in_tx(
     let mut prior_candidate = None;
     let mut saw_stale_fence = false;
     loop {
-        let Some(row) = load_next_dispatch_candidate(
-            tx,
-            now_ms,
-            prior_candidate.as_ref(),
-            destination,
-        )? else {
+        let Some(row) =
+            load_next_dispatch_candidate(tx, now_ms, prior_candidate.as_ref(), destination)?
+        else {
             return if saw_stale_fence {
                 Err(StoreError::StaleFence)
             } else {

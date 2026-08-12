@@ -215,7 +215,9 @@ impl fmt::Display for ConfiguredServiceIdError {
                 f,
                 "configured service id exceeds {MAX_CONFIGURED_SERVICE_ID_BYTES} bytes"
             ),
-            Self::InvalidIdentifier => write!(f, "configured service id is not a bounded identifier"),
+            Self::InvalidIdentifier => {
+                write!(f, "configured service id is not a bounded identifier")
+            }
         }
     }
 }

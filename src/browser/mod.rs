@@ -85,12 +85,6 @@ pub use conformance::{
     BROWSER_E2E_SCHEMA_VERSION, BROWSER_E2E_VERIFICATION_TOKEN, BROWSER_FIXTURE_CASES,
     BROWSER_VISIBLE_WEBVIEW2_OPT_IN_ENV,
 };
-pub use native_shell_controller::{
-    BrowserGatewayBindingRef, BrowserNativeCallback, BrowserNativeCallbackKind,
-    BrowserNativeControllerError, BrowserNativeDestination, BrowserNativeHostCommand,
-    BrowserNativeHostOutcome, BrowserNativeIdentity, BrowserNativeLease, BrowserNativeLeaseFence,
-    BrowserNativeShellController,
-};
 pub use downloads::{
     prepare_verified_download_root, prepare_verified_profile_root, remove_verified_profile,
     BrowserDownloadStore, BrowserIoController, BrowserIoError, BrowserSecretFillReport,
@@ -120,6 +114,12 @@ pub use model::{
     BrowserElementRef, BrowserError, BrowserJournalActor, BrowserJournalEntry, BrowserLocator,
     BrowserLocatorFailureTarget, BrowserResourceId, BrowserRevision, BrowserTabSnapshot,
     BrowserViewport, BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
+};
+pub use native_shell_controller::{
+    BrowserGatewayBindingRef, BrowserNativeCallback, BrowserNativeCallbackKind,
+    BrowserNativeControllerError, BrowserNativeDestination, BrowserNativeHostCommand,
+    BrowserNativeHostOutcome, BrowserNativeIdentity, BrowserNativeLease, BrowserNativeLeaseFence,
+    BrowserNativeShellController,
 };
 pub use operation_queue::{
     BrowserOperationQueue, BrowserOperationTarget, BrowserQueueCancellation,

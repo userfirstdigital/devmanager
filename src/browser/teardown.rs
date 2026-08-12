@@ -8,9 +8,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use crate::browser::generation::{
-    BrowserGenerationError, BrowserTaskGenerationAuthority,
-};
+use crate::browser::generation::{BrowserGenerationError, BrowserTaskGenerationAuthority};
 use crate::domain::browser::BrowserHealth;
 use crate::domain::id::{BrowserContextId, TaskId};
 
@@ -211,7 +209,13 @@ impl BrowserRecoveryController {
                     self.authority
                         .recover_generation(task_id, context_id, from_generation)?;
                 self.mark_cause(context_id, cause)?;
-                Ok(self.outcome(task_id, context_id, from_generation, Some(to_generation), cause)?)
+                Ok(self.outcome(
+                    task_id,
+                    context_id,
+                    from_generation,
+                    Some(to_generation),
+                    cause,
+                )?)
             }
             BrowserRecoveryCause::SleepWake | BrowserRecoveryCause::DisplayDpiChange => {
                 self.ensure_parked(task_id, context_id)?;
@@ -226,9 +230,7 @@ impl BrowserRecoveryController {
                 let dropped =
                     self.authority
                         .cancel_generation(task_id, context_id, from_generation)?;
-                if !dropped.is_empty()
-                    && self.authority.has_orphans(task_id, context_id)
-                {
+                if !dropped.is_empty() && self.authority.has_orphans(task_id, context_id) {
                     return Err(BrowserRecoveryError::Generation(
                         BrowserGenerationError::QueueOrphan,
                     ));
@@ -238,7 +240,13 @@ impl BrowserRecoveryController {
                         .recover_generation(task_id, context_id, from_generation)?;
                 self.invalidate_epochs(context_id)?;
                 self.mark_cause(context_id, cause)?;
-                Ok(self.outcome(task_id, context_id, from_generation, Some(to_generation), cause)?)
+                Ok(self.outcome(
+                    task_id,
+                    context_id,
+                    from_generation,
+                    Some(to_generation),
+                    cause,
+                )?)
             }
         }
     }
@@ -250,9 +258,12 @@ impl BrowserRecoveryController {
         stage: BrowserTeardownStage,
     ) -> Result<BrowserTeardownStage, BrowserRecoveryError> {
         let (owner, closed, current_stage) = {
-            let state = self.states.get(&context_id).ok_or(
-                BrowserRecoveryError::Generation(BrowserGenerationError::InvalidRequest),
-            )?;
+            let state = self
+                .states
+                .get(&context_id)
+                .ok_or(BrowserRecoveryError::Generation(
+                    BrowserGenerationError::InvalidRequest,
+                ))?;
             (state.task_id, state.closed, state.teardown_stage)
         };
         if owner != task_id {
@@ -268,9 +279,7 @@ impl BrowserRecoveryController {
             Some(current) if current == stage => {
                 return Ok(stage);
             }
-            Some(current) => current
-                .next()
-                .ok_or(BrowserRecoveryError::AlreadyClosed)?,
+            Some(current) => current.next().ok_or(BrowserRecoveryError::AlreadyClosed)?,
         };
         if stage != expected {
             return Err(BrowserRecoveryError::OutOfOrderTeardown);
@@ -410,11 +419,7 @@ impl BrowserRecoveryController {
     }
 
     #[cfg(test)]
-    pub fn inject_helper_residue_for_test(
-        &mut self,
-        context_id: BrowserContextId,
-        residue: usize,
-    ) {
+    pub fn inject_helper_residue_for_test(&mut self, context_id: BrowserContextId, residue: usize) {
         if let Some(state) = self.states.get_mut(&context_id) {
             state.helper_residue = residue;
         }
@@ -450,18 +455,20 @@ impl BrowserRecoveryController {
             .ok_or(BrowserRecoveryError::Generation(
                 BrowserGenerationError::InvalidRequest,
             ))?;
-        state.bounds_epoch = state
-            .bounds_epoch
-            .checked_add(1)
-            .ok_or(BrowserRecoveryError::Generation(
-                BrowserGenerationError::BoundExceeded,
-            ))?;
-        state.focus_epoch = state
-            .focus_epoch
-            .checked_add(1)
-            .ok_or(BrowserRecoveryError::Generation(
-                BrowserGenerationError::BoundExceeded,
-            ))?;
+        state.bounds_epoch =
+            state
+                .bounds_epoch
+                .checked_add(1)
+                .ok_or(BrowserRecoveryError::Generation(
+                    BrowserGenerationError::BoundExceeded,
+                ))?;
+        state.focus_epoch =
+            state
+                .focus_epoch
+                .checked_add(1)
+                .ok_or(BrowserRecoveryError::Generation(
+                    BrowserGenerationError::BoundExceeded,
+                ))?;
         Ok(())
     }
 

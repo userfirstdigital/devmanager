@@ -8835,31 +8835,29 @@ fn settle_server_port_start(
             .map(|observation| observation.listeners())
             .unwrap_or(&[]);
         #[cfg(windows)]
-        let settlement = match current_job_members_for_port_settlement(
-            inner,
-            &launch.command_id,
-            deadline,
-        ) {
-            Ok(Some(job_members)) => classify_post_launch_settlement_with_job_authority(
-                listeners,
-                Ok(job_members.as_slice()),
-                true,
-            ),
-            Ok(None) => classify_post_launch_settlement_with_job_authority(
-                listeners,
-                Err("job_authority_unavailable"),
-                true,
-            ),
-            Err(error) => classify_post_launch_settlement_with_job_authority(
-                listeners,
-                Err(error.as_str()),
-                true,
-            ),
-        };
+        let settlement =
+            match current_job_members_for_port_settlement(inner, &launch.command_id, deadline) {
+                Ok(Some(job_members)) => classify_post_launch_settlement_with_job_authority(
+                    listeners,
+                    Ok(job_members.as_slice()),
+                    true,
+                ),
+                Ok(None) => classify_post_launch_settlement_with_job_authority(
+                    listeners,
+                    Err("job_authority_unavailable"),
+                    true,
+                ),
+                Err(error) => classify_post_launch_settlement_with_job_authority(
+                    listeners,
+                    Err(error.as_str()),
+                    true,
+                ),
+            };
         #[cfg(not(windows))]
-        let settlement = Ok(classify_post_launch_listener_settlement(listeners, |listener| {
-            listener_matches_session(inner, &launch.command_id, listener)
-        }));
+        let settlement = Ok(classify_post_launch_listener_settlement(
+            listeners,
+            |listener| listener_matches_session(inner, &launch.command_id, listener),
+        ));
 
         let settlement = match settlement {
             Ok(settlement) => settlement,
@@ -9131,7 +9129,8 @@ fn classify_post_launch_settlement_with_job_authority(
     }
     match job_members {
         Ok(job_members) => Ok(classify_post_launch_listener_settlement_against_job(
-            listeners, job_members,
+            listeners,
+            job_members,
         )),
         Err(_error) if listeners.is_empty() => Ok(PostLaunchListenerSettlement::Pending),
         Err(error) => Err(error.to_string()),
@@ -9658,8 +9657,8 @@ mod tests {
     }
 
     #[test]
-    fn post_launch_settlement_owns_listener_from_current_job_even_when_runtime_projection_lacks_pid()
-    {
+    fn post_launch_settlement_owns_listener_from_current_job_even_when_runtime_projection_lacks_pid(
+    ) {
         let (listener, identity) = settlement_test_identity(41_010, 41_010);
         let job_members = [JobMemberObservation::Accessible { identity }];
         let stale_runtime_process_ids = vec![1_001_u32];
@@ -9668,7 +9667,10 @@ mod tests {
             !stale_runtime_process_ids.contains(&listener.pid()),
             "the 1s resource projection still lacks the Job member that bound the port"
         );
-        assert!(listener_owned_by_current_job_member(&listener, &job_members));
+        assert!(listener_owned_by_current_job_member(
+            &listener,
+            &job_members
+        ));
         assert_eq!(
             classify_post_launch_listener_settlement_against_job(
                 std::slice::from_ref(&listener),
@@ -9687,8 +9689,8 @@ mod tests {
     }
 
     #[test]
-    fn post_launch_settlement_job_authority_stays_fail_closed_for_foreign_unverified_and_query_loss()
-    {
+    fn post_launch_settlement_job_authority_stays_fail_closed_for_foreign_unverified_and_query_loss(
+    ) {
         let (owned_shape, _) = settlement_test_identity(41_011, 41_011);
         let (foreign, _) = settlement_test_identity(41_012, 41_012);
         let unverified = crate::process::ports::ListenerIdentity::new(41_013, 41_013)
@@ -11136,9 +11138,9 @@ mod tests {
                         }
                     )
                 });
-                let inferred = events.iter().any(|event| {
-                    matches!(event, RemoteSessionEvent::CodexSemantic { .. })
-                });
+                let inferred = events
+                    .iter()
+                    .any(|event| matches!(event, RemoteSessionEvent::CodexSemantic { .. }));
                 assert!(
                     !inferred,
                     "SessionStart must not publish semantic drafts from a rollout transcript"

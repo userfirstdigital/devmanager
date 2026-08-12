@@ -13,7 +13,7 @@ use crate::domain::TaskId;
 use crate::services::health::{RedactedServiceSnapshot, ServiceState};
 use crate::services::model::{ServiceId, ServiceScope, ValidationError};
 use crate::services::supervisor::{
-    BoundedServiceLog, MAX_SERVICE_LOG_LINE_BYTES, MAX_SERVICE_LOG_LINES,
+    BoundedServiceLog, MAX_SERVICE_LOG_LINES, MAX_SERVICE_LOG_LINE_BYTES,
 };
 
 /// Fail-closed visibility rule for one selected Task cockpit.
@@ -49,10 +49,7 @@ pub struct TaskServiceCockpitProjection {
 }
 
 impl TaskServiceCockpitProjection {
-    pub fn from_host_snapshots(
-        task_id: TaskId,
-        snapshots: &[RedactedServiceSnapshot],
-    ) -> Self {
+    pub fn from_host_snapshots(task_id: TaskId, snapshots: &[RedactedServiceSnapshot]) -> Self {
         Self {
             task_id,
             snapshots: filter_snapshots_for_task(snapshots, task_id),

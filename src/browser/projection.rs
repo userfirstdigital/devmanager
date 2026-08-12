@@ -9,9 +9,9 @@ use std::time::Duration;
 use crate::domain::id::{BrowserTabId, ClientId, TaskId};
 use crate::protocol::{
     BrowserBoundsEpoch, BrowserFocusEpoch, BrowserFrameKind, BrowserInteractionMode,
-    BrowserProjectionEnvelope, BrowserProjectionFrame, BrowserProjectionMeta,
-    BrowserRemoteInput, BrowserRuntimeGeneration, BrowserSecurityState, BrowserTabProjection,
-    StreamPayloadKind, MAX_BROWSER_PROJECTION_BYTES_PER_SECOND, MAX_BROWSER_PROJECTION_FPS,
+    BrowserProjectionEnvelope, BrowserProjectionFrame, BrowserProjectionMeta, BrowserRemoteInput,
+    BrowserRuntimeGeneration, BrowserSecurityState, BrowserTabProjection, StreamPayloadKind,
+    MAX_BROWSER_PROJECTION_BYTES_PER_SECOND, MAX_BROWSER_PROJECTION_FPS,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,10 +47,7 @@ impl std::error::Error for BrowserProjectionError {}
 pub enum BrowserProjectionEvent {
     Metadata(BrowserProjectionMeta),
     Frame(BrowserProjectionFrame),
-    Approval {
-        request_id: String,
-        allowed: bool,
-    },
+    Approval { request_id: String, allowed: bool },
     Resync(BrowserProjectionMeta),
 }
 
@@ -159,9 +156,7 @@ impl BrowserProjectionSession {
             return Err(BrowserProjectionError::BudgetExceeded);
         }
         if self.frames_this_second >= MAX_BROWSER_PROJECTION_FPS
-            || self
-                .bytes_this_second
-                .saturating_add(bytes.len() as u64)
+            || self.bytes_this_second.saturating_add(bytes.len() as u64)
                 > MAX_BROWSER_PROJECTION_BYTES_PER_SECOND
         {
             return Err(BrowserProjectionError::BudgetExceeded);
@@ -214,7 +209,10 @@ impl BrowserProjectionSession {
             .map_err(|_| BrowserProjectionError::InvalidRequest)
     }
 
-    pub fn offer_approval(&mut self, request_id: impl Into<String>) -> Result<(), BrowserProjectionError> {
+    pub fn offer_approval(
+        &mut self,
+        request_id: impl Into<String>,
+    ) -> Result<(), BrowserProjectionError> {
         let request_id = request_id.into();
         if request_id.is_empty() {
             return Err(BrowserProjectionError::InvalidRequest);

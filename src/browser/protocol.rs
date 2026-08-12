@@ -173,8 +173,7 @@ fn settle_accepted_browser_hold_gated(
             BrowserIntegrationHold::BrowserServiceAbsent,
         ));
     };
-    let token =
-        grant_browser_service_settler_for_live_surface(*hello, authority, intent, proof)?;
+    let token = grant_browser_service_settler_for_live_surface(*hello, authority, intent, proof)?;
     use crate::domain::browser::BrowserHostHoldSettler;
     token
         .settle_accepted_hold(intent)

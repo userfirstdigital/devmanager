@@ -716,7 +716,6 @@ impl BrowserNativeSurfaceBackend for HostOwnedNativeSurfaceBackend {
         }
         Ok(())
     }
-
 }
 
 #[cfg(test)]

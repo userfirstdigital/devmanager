@@ -1042,11 +1042,7 @@ impl BrowserBook {
                 .iter()
                 .map(|(id, context)| context.view(*id))
                 .collect(),
-            tabs: self
-                .tabs
-                .iter()
-                .map(|(id, tab)| tab.view(*id))
-                .collect(),
+            tabs: self.tabs.iter().map(|(id, tab)| tab.view(*id)).collect(),
         }
     }
 

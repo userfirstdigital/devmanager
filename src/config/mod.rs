@@ -4,10 +4,9 @@ pub mod project_store;
 
 pub use model::{
     AppConfig, ConfigCommand, ConfigError, ConfigErrorKind, ConfigRevision, DefaultDirectories,
-    DefaultTerminal, EditorChoice, MacTerminalProfile, Nullable, Project, ProjectFolder,
-    PortalConfig, PortalCredentialReference, RunCommand, SSHConnection, Settings, SettingsField,
-    SettingsPatch, ShellOptions, SshAuth,
-    SshAuthMode, MAX_CONFIG_BYTES,
+    DefaultTerminal, EditorChoice, MacTerminalProfile, Nullable, PortalConfig,
+    PortalCredentialReference, Project, ProjectFolder, RunCommand, SSHConnection, Settings,
+    SettingsField, SettingsPatch, ShellOptions, SshAuth, SshAuthMode, MAX_CONFIG_BYTES,
 };
 #[cfg(test)]
 pub(crate) use project_store::AtomicWriteFailure;

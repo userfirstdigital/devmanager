@@ -1415,11 +1415,8 @@ fn production_host_issuer_confirms_and_executes_stage_unstage_commit_when_fence_
     let stage = repo
         .plan_stage(&[RepoPath::from("tracked.txt")])
         .expect("stage before commit");
-    repo.stage(
-        &stage,
-        &repo.host_confirm(&stage).expect("confirm restage"),
-    )
-    .expect("restage");
+    repo.stage(&stage, &repo.host_confirm(&stage).expect("confirm restage"))
+        .expect("restage");
     let commit = repo.plan_commit("host issuer commit").expect("commit plan");
     let confirmation = repo
         .host_confirm(&commit)
@@ -1632,7 +1629,10 @@ fn host_issuer_rejects_expired_or_revoked_authority() {
     let confirmation = repo.host_confirm(&plan).expect("confirm while live");
     repo.expire_host_authority_for_test();
     assert!(
-        matches!(repo.host_confirm(&plan), Err(GitError::AuthorityUnavailable)),
+        matches!(
+            repo.host_confirm(&plan),
+            Err(GitError::AuthorityUnavailable)
+        ),
         "expired host authority must not confirm"
     );
     assert!(
@@ -1650,7 +1650,10 @@ fn host_issuer_rejects_expired_or_revoked_authority() {
     let confirmation = live.host_confirm(&plan).expect("confirm before revoke");
     live.revoke_host_authority_for_test();
     assert!(
-        matches!(live.host_confirm(&plan), Err(GitError::AuthorityUnavailable)),
+        matches!(
+            live.host_confirm(&plan),
+            Err(GitError::AuthorityUnavailable)
+        ),
         "revoked host authority must not confirm"
     );
     assert!(

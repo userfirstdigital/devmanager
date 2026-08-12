@@ -227,9 +227,7 @@ pub(crate) fn run_probe(executable: &Path, args: &[String]) -> Result<String, St
     let managed_job = match claim_then_resume_suspended_child(
         pid,
         |pid| match crate::services::platform_service::claim_suspended_process(pid) {
-            Ok(None) if cfg!(windows) => {
-                Err("managed Windows Job was unavailable".to_string())
-            }
+            Ok(None) if cfg!(windows) => Err("managed Windows Job was unavailable".to_string()),
             Ok(job) => Ok(job),
             Err(error) => Err(error),
         },
@@ -805,10 +803,7 @@ $child = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentL
         .expect("successful claim must resume");
 
         assert_eq!(job, "job");
-        assert_eq!(
-            events.into_inner(),
-            ["claim:42", "gate:job", "resume:42"]
-        );
+        assert_eq!(events.into_inner(), ["claim:42", "gate:job", "resume:42"]);
     }
 
     #[test]
@@ -830,7 +825,9 @@ $child = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentL
 
         assert_eq!(
             result,
-            Err(SuspendedChildStartup::ClaimFailed("claim failed".to_string()))
+            Err(SuspendedChildStartup::ClaimFailed(
+                "claim failed".to_string()
+            ))
         );
         assert!(!gated.get(), "claim failure must not reach the resume gate");
         assert!(!resumed.get(), "claim failure must not resume the child");
