@@ -21,13 +21,15 @@ use uuid::Uuid;
 
 use devmanager::{
     client::action::{
-    self, ActionRisk, ActionScope, ACTION_HOST_ACTIONS, ACTION_HOST_STATUS,
-    ACTION_PROVIDER_ANSWER_QUESTION, ACTION_PROVIDER_NEW_CONVERSATION,
-    ACTION_PROVIDER_QUEUE_FOLLOW_UP, ACTION_PROVIDER_RESOLVE_APPROVAL, ACTION_PROVIDER_SEND_NOW,
-    ACTION_PROVIDER_STEER_CURRENT_TURN, ACTION_PROVIDER_STOP_TURN, ACTION_TASK_CREATE,
-    ACTION_TASK_CREATE_V2, ACTION_TASK_LIST, ACTION_TASK_RENAME, ACTION_TASK_SHOW,
+        self, ActionRisk, ActionScope, ACTION_HOST_ACTIONS, ACTION_HOST_STATUS,
+        ACTION_PROVIDER_ANSWER_QUESTION, ACTION_PROVIDER_NEW_CONVERSATION,
+        ACTION_PROVIDER_QUEUE_FOLLOW_UP, ACTION_PROVIDER_RESOLVE_APPROVAL,
+        ACTION_PROVIDER_SEND_NOW, ACTION_PROVIDER_STEER_CURRENT_TURN, ACTION_PROVIDER_STOP_TURN,
+        ACTION_TASK_CREATE, ACTION_TASK_CREATE_V2, ACTION_TASK_LIST, ACTION_TASK_RENAME,
+        ACTION_TASK_SHOW,
     },
     config::paths::{resolve_app_paths, AppProfile, BuildKind, ResolvedAppPaths},
+    config::{ConfigCommand, ConfigStore, Project},
     domain::{
         command::{Command, CommandEnvelope, CommandReceipt, CreateTaskRequestIntent},
         id::{CommandId, EnvironmentId, ProjectId, TaskId},
@@ -39,7 +41,7 @@ use devmanager::{
         Capability, CapabilitySet, ClientRequest, FrameLimits, NegotiatedParameters,
         ProtocolVersion, ServerMessage,
     },
-    workspace::WorkspaceRequest,
+    workspace::{WorkspaceProjectRoots, WorkspaceRequest},
 };
 
 const READY_TIMEOUT: Duration = Duration::from_secs(15);
@@ -65,10 +67,7 @@ fn fixed_uuid_v7(tail: u8) -> [u8; 16] {
 fn seed_task_with_base(paths: &ResolvedAppPaths, base: u8, title: &str) -> TaskId {
     fs::create_dir_all(&paths.root).expect("create isolated profile root");
     let project_id = ProjectId::from_bytes(fixed_uuid_v7(base + 4)).expect("project id");
-    let project_config = vec![(
-        project_id.to_string(),
-        paths.root.to_string_lossy().into_owned(),
-    )];
+    let configured_id = project_id.to_string();
     let client_id = ClientId::from_bytes(fixed_uuid_v7(base)).expect("seed client id");
     let task_id = TaskId::from_bytes(fixed_uuid_v7(base + 1)).expect("seed task id");
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -78,9 +77,31 @@ fn seed_task_with_base(paths: &ResolvedAppPaths, base: u8, title: &str) -> TaskI
     let receipt = runtime.block_on(async move {
         let bus = devmanager::kernel::CommandBus::open(&paths.database)
             .expect("open isolated seed command store");
+        let mut store = ConfigStore::open_host(paths).expect("open isolated host config");
+        store
+            .execute(
+                store.snapshot().revision,
+                ConfigCommand::CreateProject {
+                    project: Project {
+                        id: configured_id.clone(),
+                        name: "CLI seed project".to_string(),
+                        root_path: paths.root.to_string_lossy().into_owned(),
+                        created_at: "now".to_string(),
+                        updated_at: "now".to_string(),
+                        ..Project::default()
+                    },
+                },
+            )
+            .expect("persist isolated host project");
+        let revision = store.snapshot().revision;
+        let roots = WorkspaceProjectRoots::from_host_config_store(&mut store, revision, 1, 1)
+            .expect("issue isolated host project roots");
+        let project_id = roots
+            .project_id_for_config_id(&configured_id)
+            .expect("opaque isolated host project id");
         let (requests, executor) =
-            HostRequestExecutor::start_supervised_with_project_config(bus, project_config)
-                .expect("configured seed project roots");
+            HostRequestExecutor::start_supervised_with_config_store(bus, store)
+                .expect("configured seed host store");
         let response = requests
             .execute(
                 NegotiatedParameters {
