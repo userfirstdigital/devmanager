@@ -14,7 +14,9 @@ use crate::domain::id::{
     ArtifactId, CommandId, OperationId, RequestId, SnapshotId, SubscriptionId, TaskId,
 };
 use crate::domain::operation::OperationState;
-use crate::domain::query::{Query, QueryEnvelope, QueryError, QueryOutcome, QueryResult};
+use crate::domain::query::{
+    Query, QueryEnvelope, QueryError, QueryOutcome, QueryReply, QueryResult,
+};
 use crate::domain::snapshot::{
     ArtifactContentPage, EventPage, SnapshotPage, SnapshotSection, TaskSnapshotItem,
 };
