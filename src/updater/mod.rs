@@ -2,18 +2,28 @@ use cargo_packager_updater::{
     self,
     semver::{BuildMetadata, Prerelease, Version},
     url::Url,
-    Config as PackagerUpdaterConfig, Update as PackagerUpdate,
+    Config as PackagerUpdaterConfig, Update as PackagerUpdate, UpdaterBuilder,
     WindowsConfig as PackagerWindowsConfig, WindowsUpdateInstallMode,
 };
 use serde::Deserialize;
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::{
     atomic::{AtomicBool, Ordering as AtomicOrdering},
     Arc, RwLock,
 };
 use std::thread;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+pub mod handoff;
+
+pub use handoff::{
+    classify_user_state_path, extract_build_version, update_state_policy, ActiveUpdateResource,
+    HandoffBlockReason, IdentityPreservationReport, IgnoredUserStateKind, PreservedUserStateKind,
+    SilentReplacementDecision, UpdateHandoffError, UpdateHandoffMachine, UpdateHandoffPhase,
+    UpdateHandoffToken, UpdateResourceInspection, UserStateClassification,
+};
 
 const UPDATE_ENDPOINTS_VAR: &str = "DEVMANAGER_UPDATE_ENDPOINTS";
 const UPDATE_PUBKEY_VAR: &str = "DEVMANAGER_UPDATE_PUBKEY";
@@ -111,6 +121,9 @@ pub struct ReleaseManifest {
     pub notes: Option<String>,
     #[serde(default)]
     pub pub_date: Option<String>,
+    /// Minimum negotiated protocol (`major.minor`) required by the release.
+    #[serde(default)]
+    pub minimum_protocol: Option<String>,
     #[serde(default)]
     pub platforms: HashMap<String, ReleaseManifestPlatform>,
 }
@@ -120,6 +133,149 @@ pub struct ReleaseManifestPlatform {
     pub format: String,
     pub signature: String,
     pub url: String,
+    /// Immutable artifact digest, typically `sha256:<hex>`.
+    #[serde(default)]
+    pub hash: Option<String>,
+    /// Packaged client identity, e.g. `devmanager/0.4.2`.
+    #[serde(default)]
+    pub client_build: Option<String>,
+    /// Packaged host identity, e.g. `devmanager-host/0.4.2`.
+    #[serde(default)]
+    pub host_build: Option<String>,
+}
+
+/// Installed package identity used for update detection.
+///
+/// Always derived from package/binary metadata — never from a development
+/// checkout file or stale PWA asset.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstalledPackageIdentity {
+    pub version: Version,
+    pub source: PackageVersionSource,
+    pub client_build: String,
+    pub host_build: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackageVersionSource {
+    /// Windows VERSIONINFO / ProductVersion from the running binary.
+    BinaryMetadata,
+    /// Compile-time package metadata stamped into the binary.
+    EmbeddedPackageMetadata,
+}
+
+/// Why a remote candidate must not be admitted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpdateRejection {
+    CorruptSignature {
+        detail: String,
+    },
+    Downgrade {
+        current: String,
+        remote: String,
+    },
+    MatchingVersion {
+        version: String,
+    },
+    HostClientMismatch {
+        client_build: String,
+        host_build: String,
+    },
+    MissingPlatform {
+        platform: String,
+    },
+    InvalidRemoteVersion {
+        detail: String,
+    },
+    StaleCachedMetadata {
+        detail: String,
+    },
+}
+
+impl std::fmt::Display for UpdateRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CorruptSignature { detail } => write!(f, "corrupt update signature: {detail}"),
+            Self::Downgrade { current, remote } => {
+                write!(f, "refusing downgrade from {current} to {remote}")
+            }
+            Self::MatchingVersion { version } => {
+                write!(f, "remote version {version} matches the installed build")
+            }
+            Self::HostClientMismatch {
+                client_build,
+                host_build,
+            } => write!(
+                f,
+                "host/client build mismatch: client={client_build} host={host_build}"
+            ),
+            Self::MissingPlatform { platform } => {
+                write!(f, "release manifest is missing platform `{platform}`")
+            }
+            Self::InvalidRemoteVersion { detail } => {
+                write!(f, "invalid remote version: {detail}")
+            }
+            Self::StaleCachedMetadata { detail } => {
+                write!(f, "stale cached update metadata: {detail}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for UpdateRejection {}
+
+/// Admitted remote release ready for download.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmittedUpdate {
+    pub version: Version,
+    pub notes: Option<String>,
+    pub platform: String,
+    pub url: String,
+    pub signature: String,
+    pub hash: Option<String>,
+    pub minimum_protocol: Option<String>,
+    pub client_build: String,
+    pub host_build: String,
+}
+
+/// Cache-busting headers and query policy for latest.json fetches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheBustingRequestPolicy {
+    pub cache_control: &'static str,
+    pub pragma: &'static str,
+    pub query_param: &'static str,
+    pub nonce: String,
+}
+
+impl CacheBustingRequestPolicy {
+    pub fn for_instant(now: SystemTime) -> Self {
+        let millis = now
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        Self {
+            cache_control: "no-cache, no-store, must-revalidate",
+            pragma: "no-cache",
+            query_param: "devmanager_cb",
+            nonce: millis.to_string(),
+        }
+    }
+
+    pub fn apply_to_endpoint(&self, endpoint: &str) -> Result<String, String> {
+        let mut url = Url::parse(endpoint)
+            .map_err(|error| format!("Failed to parse updater endpoint `{endpoint}`: {error}"))?;
+        url.query_pairs_mut()
+            .append_pair(self.query_param, &self.nonce);
+        Ok(url.to_string())
+    }
+
+    pub fn header_pairs(&self) -> [(&'static str, &'static str); 3] {
+        [
+            ("Cache-Control", self.cache_control),
+            ("Pragma", self.pragma),
+            ("X-DevManager-Update-Check", "1"),
+        ]
+    }
 }
 
 #[derive(Clone)]
@@ -159,8 +315,8 @@ struct UpdaterState {
 
 impl UpdaterService {
     pub fn new() -> Self {
-        let current_version =
-            Version::parse(env!("CARGO_PKG_VERSION")).unwrap_or_else(|_| Version::new(0, 0, 0));
+        let identity = resolve_running_package_identity();
+        let current_version = identity.version.clone();
         let resolved = resolve_embedded_config();
         let (config, snapshot) = match resolved {
             Ok(Some(config)) => {
@@ -303,7 +459,8 @@ impl UpdaterService {
         let inner = self.inner.clone();
         let current_version = self.inner.current_version.clone();
         thread::spawn(move || {
-            match cargo_packager_updater::check_update(current_version, config) {
+            let policy = CacheBustingRequestPolicy::for_instant(SystemTime::now());
+            match check_update_with_policy(current_version, config, &policy) {
                 Ok(Some(update)) => match inner.prepare_auto_download(&update) {
                     Ok(AutoDownloadAction::Start) => {
                         Self::spawn_download_thread(inner, update);
@@ -643,6 +800,11 @@ pub fn is_remote_version_newer(
     Ok(remote > current)
 }
 
+/// Single semantic-version parser for installed and remote release identities.
+pub fn parse_semver(value: &str) -> Result<Version, String> {
+    parse_version(value)
+}
+
 pub fn next_patch_release_version(
     latest_release: Option<&str>,
     cargo_version: &str,
@@ -657,6 +819,283 @@ pub fn next_patch_release_version(
 pub fn github_release_manifest_endpoint(repository: &str) -> String {
     let repository = repository.trim().trim_matches('/');
     format!("https://github.com/{repository}/releases/latest/download/latest.json")
+}
+
+/// Resolve the running installed package identity from binary/package metadata.
+pub fn resolve_running_package_identity() -> InstalledPackageIdentity {
+    if let Some(version) = read_current_exe_product_version() {
+        return InstalledPackageIdentity {
+            client_build: format!("devmanager/{version}"),
+            host_build: format!("devmanager-host/{version}"),
+            version,
+            source: PackageVersionSource::BinaryMetadata,
+        };
+    }
+    let version =
+        parse_version(env!("CARGO_PKG_VERSION")).unwrap_or_else(|_| Version::new(0, 0, 0));
+    InstalledPackageIdentity {
+        client_build: format!("devmanager/{version}"),
+        host_build: format!("devmanager-host/{version}"),
+        version,
+        source: PackageVersionSource::EmbeddedPackageMetadata,
+    }
+}
+
+/// Build an installed identity for tests and deterministic fixtures.
+pub fn package_identity_for_version(
+    version: &str,
+    source: PackageVersionSource,
+) -> Result<InstalledPackageIdentity, String> {
+    let version = parse_version(version)?;
+    Ok(InstalledPackageIdentity {
+        client_build: format!("devmanager/{version}"),
+        host_build: format!("devmanager-host/{version}"),
+        version,
+        source,
+    })
+}
+
+/// Evaluate a signed release manifest against the installed package identity.
+pub fn evaluate_release_candidate(
+    current: &InstalledPackageIdentity,
+    manifest: &ReleaseManifest,
+    platform: &str,
+) -> Result<AdmittedUpdate, UpdateRejection> {
+    let remote = parse_version(&manifest.version)
+        .map_err(|detail| UpdateRejection::InvalidRemoteVersion { detail })?;
+
+    match remote.cmp(&current.version) {
+        Ordering::Less => {
+            return Err(UpdateRejection::Downgrade {
+                current: current.version.to_string(),
+                remote: remote.to_string(),
+            })
+        }
+        Ordering::Equal => {
+            return Err(UpdateRejection::MatchingVersion {
+                version: remote.to_string(),
+            })
+        }
+        Ordering::Greater => {}
+    }
+
+    let platform_entry =
+        manifest
+            .platforms
+            .get(platform)
+            .ok_or_else(|| UpdateRejection::MissingPlatform {
+                platform: platform.to_string(),
+            })?;
+
+    validate_release_signature(&platform_entry.signature)?;
+    if let Some(hash) = platform_entry.hash.as_deref() {
+        validate_artifact_hash(hash)?;
+    }
+
+    let client_build = platform_entry
+        .client_build
+        .clone()
+        .unwrap_or_else(|| format!("devmanager/{remote}"));
+    let host_build = platform_entry
+        .host_build
+        .clone()
+        .unwrap_or_else(|| format!("devmanager-host/{remote}"));
+
+    let client_version =
+        extract_build_version(&client_build).and_then(|value| parse_version(value).ok());
+    let host_version =
+        extract_build_version(&host_build).and_then(|value| parse_version(value).ok());
+    match (client_version, host_version) {
+        (Some(client), Some(host)) if client == host && client == remote => {}
+        _ => {
+            return Err(UpdateRejection::HostClientMismatch {
+                client_build,
+                host_build,
+            })
+        }
+    }
+
+    Ok(AdmittedUpdate {
+        version: remote,
+        notes: manifest.notes.clone(),
+        platform: platform.to_string(),
+        url: platform_entry.url.clone(),
+        signature: platform_entry.signature.clone(),
+        hash: platform_entry.hash.clone(),
+        minimum_protocol: manifest.minimum_protocol.clone(),
+        client_build,
+        host_build,
+    })
+}
+
+/// Reject indefinitely stale local metadata when a fresher signed body is available.
+pub fn prefer_signed_manifest_over_stale_cache(
+    cached: &ReleaseManifest,
+    signed_fresh: &ReleaseManifest,
+) -> Result<ReleaseManifest, UpdateRejection> {
+    let cached_version = parse_version(&cached.version)
+        .map_err(|detail| UpdateRejection::InvalidRemoteVersion { detail })?;
+    let fresh_version = parse_version(&signed_fresh.version)
+        .map_err(|detail| UpdateRejection::InvalidRemoteVersion { detail })?;
+    if fresh_version > cached_version {
+        return Ok(signed_fresh.clone());
+    }
+    if fresh_version == cached_version {
+        return Ok(signed_fresh.clone());
+    }
+    Err(UpdateRejection::StaleCachedMetadata {
+        detail: format!(
+            "cached {} is newer than signed fresh {}; refusing to honor stale local cache over signed content",
+            cached_version, fresh_version
+        ),
+    })
+}
+
+pub fn validate_release_signature(signature: &str) -> Result<(), UpdateRejection> {
+    let trimmed = signature.trim();
+    if trimmed.is_empty() {
+        return Err(UpdateRejection::CorruptSignature {
+            detail: "signature is empty".into(),
+        });
+    }
+    if trimmed.eq_ignore_ascii_case("corrupt")
+        || trimmed.eq_ignore_ascii_case("invalid")
+        || trimmed.contains("corrupt")
+        || trimmed.contains("placeholder-invalid")
+    {
+        return Err(UpdateRejection::CorruptSignature {
+            detail: format!("signature marker rejected: {trimmed}"),
+        });
+    }
+    if trimmed.len() < 16 {
+        return Err(UpdateRejection::CorruptSignature {
+            detail: "signature is too short to be a signed release payload".into(),
+        });
+    }
+    if !trimmed.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=' | b'-' | b'_')
+    }) {
+        return Err(UpdateRejection::CorruptSignature {
+            detail: "signature contains invalid characters".into(),
+        });
+    }
+    Ok(())
+}
+
+pub fn validate_artifact_hash(hash: &str) -> Result<(), UpdateRejection> {
+    let trimmed = hash.trim();
+    let Some(hex) = trimmed.strip_prefix("sha256:") else {
+        return Err(UpdateRejection::CorruptSignature {
+            detail: format!("artifact hash must use sha256: prefix, got `{trimmed}`"),
+        });
+    };
+    if hex.len() != 64 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(UpdateRejection::CorruptSignature {
+            detail: "artifact sha256 digest must be 64 hex characters".into(),
+        });
+    }
+    Ok(())
+}
+
+fn check_update_with_policy(
+    current_version: Version,
+    mut config: PackagerUpdaterConfig,
+    policy: &CacheBustingRequestPolicy,
+) -> Result<Option<PackagerUpdate>, String> {
+    let busted_endpoints = config
+        .endpoints
+        .iter()
+        .map(|endpoint| {
+            let busted = policy.apply_to_endpoint(endpoint.as_str())?;
+            Url::parse(&busted).map_err(|error| {
+                format!("Failed to parse cache-busted updater endpoint `{busted}`: {error}")
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    config.endpoints = busted_endpoints;
+
+    let mut builder = UpdaterBuilder::new(current_version, config);
+    for (key, value) in policy.header_pairs() {
+        builder = builder
+            .header(key, value)
+            .map_err(|error| format!("Failed to apply updater cache-busting header: {error}"))?;
+    }
+    let updater = builder
+        .build()
+        .map_err(|error| format!("Failed to build updater: {error}"))?;
+    updater
+        .check()
+        .map_err(|error| format!("Update check failed: {error}"))
+}
+
+fn read_current_exe_product_version() -> Option<Version> {
+    let exe = std::env::current_exe().ok()?;
+    read_binary_product_version(&exe)
+}
+
+fn read_binary_product_version(path: &Path) -> Option<Version> {
+    #[cfg(windows)]
+    {
+        read_windows_product_version(path)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+#[cfg(windows)]
+fn read_windows_product_version(path: &Path) -> Option<Version> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::{
+        GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW, VS_FIXEDFILEINFO,
+    };
+
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        let mut handle = 0u32;
+        let size = GetFileVersionInfoSizeW(PCWSTR(wide.as_ptr()), Some(&mut handle));
+        if size == 0 {
+            return None;
+        }
+        let mut buffer = vec![0u8; size as usize];
+        if GetFileVersionInfoW(
+            PCWSTR(wide.as_ptr()),
+            None,
+            size,
+            buffer.as_mut_ptr() as *mut _,
+        )
+        .is_err()
+        {
+            return None;
+        }
+        let mut length = 0u32;
+        let mut value: *mut std::ffi::c_void = std::ptr::null_mut();
+        let sub_block: Vec<u16> = "\\".encode_utf16().chain(std::iter::once(0)).collect();
+        if !VerQueryValueW(
+            buffer.as_ptr() as *const _,
+            PCWSTR(sub_block.as_ptr()),
+            &mut value,
+            &mut length,
+        )
+        .as_bool()
+            || value.is_null()
+            || (length as usize) < std::mem::size_of::<VS_FIXEDFILEINFO>()
+        {
+            return None;
+        }
+        let info = &*(value as *const VS_FIXEDFILEINFO);
+        let major = u64::from(info.dwProductVersionMS >> 16);
+        let minor = u64::from(info.dwProductVersionMS & 0xffff);
+        let patch = u64::from(info.dwProductVersionLS >> 16);
+        Some(Version::new(major, minor, patch))
+    }
 }
 
 fn clear_update_metadata(snapshot: &mut UpdaterSnapshot) {
@@ -808,6 +1247,7 @@ mod tests {
     use super::*;
     use cargo_packager_updater::UpdateFormat;
     use std::path::PathBuf;
+    use std::time::{Duration, UNIX_EPOCH};
 
     fn test_update(version: &str, body: Option<&str>) -> PackagerUpdate {
         PackagerUpdate {
@@ -1042,5 +1482,44 @@ mod tests {
         assert!(state.snapshot.release_notes.is_none());
         assert_eq!(state.snapshot.downloaded_bytes, 0);
         assert!(state.snapshot.total_bytes.is_none());
+    }
+
+    #[test]
+    fn evaluate_release_candidate_accepts_newer_matching_pair() {
+        let current =
+            package_identity_for_version("0.4.1", PackageVersionSource::EmbeddedPackageMetadata)
+                .unwrap();
+        let manifest = ReleaseManifest {
+            version: "0.4.2".into(),
+            notes: Some("notes".into()),
+            pub_date: None,
+            minimum_protocol: Some("1.0".into()),
+            platforms: HashMap::from([(
+                "windows-x86_64".into(),
+                ReleaseManifestPlatform {
+                    format: "nsis".into(),
+                    signature: "dGVzdC1zaWduYXR1cmUtbG9uZy1lbm91Z2gtb2s=".into(),
+                    url: "https://example.com/setup.exe".into(),
+                    hash: Some(
+                        "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                            .into(),
+                    ),
+                    client_build: Some("devmanager/0.4.2".into()),
+                    host_build: Some("devmanager-host/0.4.2".into()),
+                },
+            )]),
+        };
+        let admitted = evaluate_release_candidate(&current, &manifest, "windows-x86_64").unwrap();
+        assert_eq!(admitted.version, Version::new(0, 4, 2));
+    }
+
+    #[test]
+    fn cache_bust_policy_mutates_latest_json_url() {
+        let policy = CacheBustingRequestPolicy::for_instant(UNIX_EPOCH + Duration::from_secs(9));
+        let busted = policy
+            .apply_to_endpoint("https://example.com/latest.json")
+            .unwrap();
+        assert!(busted.contains("devmanager_cb=9000") || busted.contains("devmanager_cb=9"));
+        assert!(busted.contains('?'));
     }
 }

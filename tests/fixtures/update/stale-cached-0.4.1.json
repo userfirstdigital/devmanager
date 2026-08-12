@@ -1,0 +1,16 @@
+{
+  "version": "0.4.1",
+  "notes": "Stale cached metadata that must lose to a fresher signed 0.4.2 body.",
+  "pub_date": "2026-08-01T12:00:00Z",
+  "minimum_protocol": "1.0",
+  "platforms": {
+    "windows-x86_64": {
+      "format": "nsis",
+      "signature": "dGVzdC1zaWduYXR1cmUtc3RhbGUtY2FjaGVkLTAuNC4x",
+      "url": "https://github.com/example/devmanager/releases/download/v0.4.1/DevManager_0.4.1_x64-setup.exe",
+      "hash": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "client_build": "devmanager/0.4.1",
+      "host_build": "devmanager-host/0.4.1"
+    }
+  }
+}

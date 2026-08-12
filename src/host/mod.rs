@@ -7,6 +7,7 @@ mod connection;
 mod ipc;
 mod lock;
 mod shutdown;
+mod update;
 
 pub use connection::{
     HostExecutorOutcome, HostRequestExecutor, HostRequestHandle, PhysicalExitArmRequest,
@@ -26,3 +27,4 @@ pub use shutdown::{
     HostCleanupProgress, HostCleanupSuccessSettlement, HostCleanupWorker, HostRestartDisposition,
     ProcessEmptyTeardown, ProcessEmptyTeardownWorker,
 };
+pub use update::{HostUpdateAdmission, HostUpdateHandoff};
