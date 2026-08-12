@@ -6,6 +6,14 @@ description = "DevManager native GPUI client and durable local host"
 license = "Apache-2.0"
 
 [[bin]]
+name = "devmanager"
+path = "src/main.rs"
+
+[[bin]]
+name = "devmanager-host"
+path = "src/bin/devmanager-host.rs"
+
+[[bin]]
 name = "devmanager-provider-probe-fixture"
 path = "tests/fixtures/providers/probe_fixture.rs"
 test = false

@@ -908,6 +908,51 @@ fn current_row(id: &str) -> Value {
         .unwrap_or_else(|| panic!("missing ledger row {id}"))
 }
 
+fn is_handoff_row(row: &Value) -> bool {
+    row.get("cutoverAction").and_then(Value::as_str) == Some("handoff")
+}
+
+fn current_legacy_path_present(relative: &str) -> bool {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    if let Some(directory) = relative.strip_suffix('/') {
+        let dir = root.join(directory);
+        dir.is_dir()
+            && fs::read_dir(&dir)
+                .ok()
+                .is_some_and(|mut entries| entries.next().is_some())
+    } else {
+        root.join(relative).is_file()
+    }
+}
+
+fn current_delete_rows() -> Vec<Value> {
+    current_rows()
+        .into_iter()
+        .filter(|row| !is_handoff_row(row))
+        .collect()
+}
+
+fn expected_deferred_deletion_paths() -> Vec<String> {
+    current_delete_rows()
+        .into_iter()
+        .filter(|row| row["status"] == "HOLD")
+        .map(|row| {
+            row["legacy"]["path"]
+                .as_str()
+                .expect("legacy path")
+                .to_owned()
+        })
+        .collect()
+}
+
+fn expected_completed_deletion_ids() -> Vec<String> {
+    current_delete_rows()
+        .into_iter()
+        .filter(|row| row["status"] == "DELETED")
+        .map(|row| row["id"].as_str().expect("row id").to_owned())
+        .collect()
+}
+
 fn strip_parity_verifiable_fields(mut row: Value) -> Value {
     if let Some(object) = row.as_object_mut() {
         object.remove("tests");
@@ -2871,11 +2916,21 @@ fn current_repository_produces_deterministic_hold_report() {
     assert!(!second.status.success());
     assert_eq!(first_report, second_report);
     assert_eq!(first_report["contractStatus"], "HOLD");
-    assert!(first_report["rows"]
-        .as_array()
-        .expect("current rows")
-        .iter()
-        .all(|row| row["status"] == "HOLD"));
+    let completed = expected_completed_deletion_ids();
+    for report_row in first_report["rows"].as_array().expect("current rows") {
+        let id = report_row["id"].as_str().expect("report row id");
+        if completed.iter().any(|expected| expected == id) {
+            assert_eq!(
+                report_row["status"], "DELETED",
+                "absent deletion-set rows must stay DELETED in the live audit: {id}"
+            );
+        } else {
+            assert_eq!(
+                report_row["status"], "HOLD",
+                "deferred or handoff rows must stay HOLD until owning-lane evidence: {id}"
+            );
+        }
+    }
     for row in first_report["rows"].as_array().expect("current rows") {
         for kind in ["path", "symbol", "token"] {
             let count = row["references"][kind]
@@ -4718,6 +4773,10 @@ fn entry_old_app_dispatch_and_devmanager_next_are_forbidden() {
         "sole GPUI entry must forbid old app dispatch"
     );
     assert!(
+        forbidden.iter().any(|value| value == "app::run"),
+        "sole GPUI entry must forbid short old app dispatch"
+    );
+    assert!(
         !Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("src/bin/devmanager-next.rs")
             .is_file(),
@@ -4725,7 +4784,18 @@ fn entry_old_app_dispatch_and_devmanager_next_are_forbidden() {
     );
     let next = current_row("legacy-next-entrypoint");
     assert_eq!(next["legacy"]["path"], "src/bin/devmanager-next.rs");
-    assert_eq!(next["status"], "HOLD");
+    assert_eq!(next["cutoverAction"], "delete");
+    assert_eq!(
+        next["status"], "DELETED",
+        "an already-absent next binary must be DELETED, not a permanent HOLD"
+    );
+    let web_sessions = current_row("legacy-web-sessions");
+    assert_eq!(web_sessions["legacy"]["path"], "web/src/sessions/");
+    assert_eq!(web_sessions["cutoverAction"], "delete");
+    assert_eq!(
+        web_sessions["status"], "DELETED",
+        "an already-absent web sessions tree must be DELETED, not a permanent HOLD"
+    );
     let packaging_files = contract["packagingHandoff"]["requiredFiles"]
         .as_array()
         .expect("requiredFiles");
@@ -4787,12 +4857,38 @@ fn session_json_is_path_only_in_contract() {
 
 #[test]
 fn parity_current_ledger_is_hold() {
-    assert!(current_rows().iter().all(|row| row["status"] == "HOLD"));
-    assert!(current_contract()["prerequisiteNodes"]
+    let contract = current_contract();
+    assert_eq!(contract["deletionPolicy"]["permanentHoldForbidden"], true);
+    assert_eq!(contract["deletionPolicy"]["action"], "delete");
+    assert_eq!(
+        contract["deletionPolicy"]["deletedRequiresPathAndDeletionSetAbsent"],
+        true
+    );
+    assert!(contract["prerequisiteNodes"]
         .as_array()
         .expect("nodes")
         .iter()
         .all(|node| node["status"] == "HOLD"));
+    let completed = expected_completed_deletion_ids();
+    assert!(
+        completed.iter().any(|id| id == "legacy-next-entrypoint"),
+        "the next binary row must be a completed deletion"
+    );
+    assert!(
+        completed.iter().any(|id| id == "legacy-web-sessions"),
+        "the web sessions row must be a completed deletion"
+    );
+    for row in current_rows() {
+        if completed.iter().any(|id| row["id"] == *id) {
+            assert_eq!(row["status"], "DELETED");
+            continue;
+        }
+        assert_eq!(
+            row["status"], "HOLD",
+            "rows still waiting on owning-lane evidence must stay HOLD: {}",
+            row["id"]
+        );
+    }
 }
 
 #[test]
@@ -4842,7 +4938,14 @@ fn native_entry_cutover_source_contract_is_preserved() {
     assert!(!main.contains("use_old"));
     assert!(!main.contains("--legacy"));
     assert!(!root.join("src/bin/devmanager-next.rs").exists());
-    assert!(!read_source("Cargo.toml").contains("name = \"devmanager-next\""));
+    let cargo = read_source("Cargo.toml");
+    assert!(!cargo.contains("name = \"devmanager-next\""));
+    assert!(cargo.contains("name = \"devmanager\""));
+    assert!(cargo.contains("path = \"src/main.rs\""));
+    assert!(cargo.contains("name = \"devmanager-host\""));
+    assert!(cargo.contains("path = \"src/bin/devmanager-host.rs\""));
+    assert!(cargo.contains("name = \"devmanager-provider-probe-fixture\""));
+    assert!(cargo.contains("path = \"tests/fixtures/providers/probe_fixture.rs\""));
 
     let ui = read_source("src/ui/mod.rs");
     assert!(ui.contains("pub mod native_shell;"));
@@ -4859,8 +4962,14 @@ fn native_entry_cutover_source_contract_is_preserved() {
 
     let connection = read_source("src/client/connection.rs");
     assert!(connection.contains("map_named_pipe_open_error"));
-    assert!(connection.contains("ERROR_FILE_NOT_FOUND") || connection.contains("raw_os_error() == Some(2)"));
-    assert!(connection.contains("ERROR_PIPE_BUSY") || connection.contains("raw_os_error() == Some(231)"));
+    assert!(
+        connection.contains("ERROR_FILE_NOT_FOUND")
+            || connection.contains("raw_os_error() == Some(2)")
+    );
+    assert!(
+        connection.contains("ERROR_PIPE_BUSY")
+            || connection.contains("raw_os_error() == Some(231)")
+    );
 
     let shell = read_source("src/ui/native_shell.rs");
     assert!(shell.contains("try_attach_existing_host"));
@@ -4875,7 +4984,10 @@ fn native_entry_cutover_source_contract_is_preserved() {
         .nth(1)
         .unwrap_or_default();
     assert!(production_args.contains("--foreground"));
-    assert!(!production_args.lines().take(8).any(|line| line.contains("--parent-pid")));
+    assert!(!production_args
+        .lines()
+        .take(8)
+        .any(|line| line.contains("--parent-pid")));
 
     let main_body = main.split("fn main()").nth(1).expect("main function body");
     let claude = main_body.find("run_hook_relay_subcommand").unwrap();
@@ -4894,4 +5006,124 @@ fn native_entry_cutover_source_contract_is_preserved() {
     assert!(capture.contains("'--bin', 'devmanager'"));
     assert!(!capture.contains("$artifactName = 'devmanager-next'"));
     assert!(!capture.contains("'--bin', 'devmanager-next'"));
+}
+
+#[test]
+fn entry_deletion_semantics_require_deleted_or_exact_deferred_paths() {
+    let contract = current_contract();
+    let deferred = contract["deferredDeletionPaths"]
+        .as_array()
+        .expect("deferredDeletionPaths")
+        .iter()
+        .map(|value| value.as_str().expect("deferred path").to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(deferred, expected_deferred_deletion_paths());
+    assert!(
+        !deferred.is_empty(),
+        "active lanes still have deferred deletions"
+    );
+    assert!(
+        !deferred
+            .iter()
+            .any(|path| path == "src/bin/devmanager-next.rs" || path == "web/src/sessions/"),
+        "completed absences must not be listed as deferred"
+    );
+
+    for row in current_delete_rows() {
+        let id = row["id"].as_str().expect("row id");
+        let legacy = row["legacy"]["path"].as_str().expect("legacy path");
+        let deletion_set = row["deletionSet"]
+            .as_array()
+            .expect("deletionSet")
+            .iter()
+            .map(|value| value.as_str().expect("deletion path"))
+            .collect::<Vec<_>>();
+        assert!(
+            deletion_set.contains(&legacy),
+            "deletionSet must include the legacy owner: {id}"
+        );
+        let action = row
+            .get("cutoverAction")
+            .and_then(Value::as_str)
+            .unwrap_or("delete");
+        assert_eq!(action, "delete", "delete policy must stay delete: {id}");
+
+        let all_absent = !current_legacy_path_present(legacy)
+            && deletion_set
+                .iter()
+                .all(|path| !current_legacy_path_present(path));
+        if all_absent {
+            assert_eq!(
+                row["status"], "DELETED",
+                "absent path and deletionSet must be DELETED: {id}"
+            );
+            assert!(
+                !deferred.iter().any(|path| path == legacy),
+                "DELETED legacy path must not appear in deferredDeletionPaths: {id}"
+            );
+        } else {
+            assert_eq!(
+                row["status"], "HOLD",
+                "a still-present legacy path cannot claim DELETED: {id}"
+            );
+            assert!(
+                deferred.iter().any(|path| path == legacy),
+                "present legacy path must be an exact deferredDeletionPaths entry: {id}"
+            );
+            assert!(
+                current_legacy_path_present(legacy)
+                    || deletion_set
+                        .iter()
+                        .any(|path| current_legacy_path_present(path)),
+                "HOLD delete rows must still have a present deletion path: {id}"
+            );
+        }
+    }
+
+    let completed = expected_completed_deletion_ids();
+    assert_eq!(
+        completed,
+        vec![
+            "legacy-next-entrypoint".to_owned(),
+            "legacy-web-sessions".to_owned()
+        ]
+    );
+}
+
+#[test]
+fn host_serve_request_is_an_integration_test_compatibility_seam() {
+    let seam = &current_contract()["hostCompatibility"]["serveRequest"];
+    assert_eq!(seam["path"], "src/host/ipc.rs");
+    assert_eq!(seam["symbol"], "HostConnection::serve_request");
+    assert_eq!(seam["kind"], "integration-test-seam");
+    assert_eq!(seam["cfgTestGated"], false);
+    assert_eq!(seam["productionSymbol"], "HostConnection::serve_duplex");
+    assert_eq!(seam["productionCaller"], "src/bin/devmanager-host.rs");
+
+    let ipc = read_source("src/host/ipc.rs");
+    assert!(ipc.contains("pub async fn serve_request("));
+    assert!(ipc.contains("pub async fn serve_request_on_executor("));
+    assert!(ipc.contains("pub async fn serve_duplex("));
+    assert!(
+        ipc.contains("Integration-test compatibility path used by `tests/ipc_protocol.rs`")
+            || ipc.contains("Exclusive compatibility path used by ipc_protocol tests")
+    );
+    assert!(
+        !ipc.contains("#[cfg(test)]\n    pub async fn serve_request(")
+            && !ipc.contains("#[cfg(test)]\npub async fn serve_request("),
+        "cfg(test) would hide serve_request from tests/ipc_protocol.rs"
+    );
+
+    let host = read_source("src/bin/devmanager-host.rs");
+    assert!(host.contains(".serve_duplex("));
+    assert!(!host.contains(".serve_request("));
+
+    let shell = read_source("src/ui/native_shell.rs");
+    assert!(!shell.contains("serve_request"));
+
+    let ipc_tests = read_source("tests/ipc_protocol.rs");
+    assert!(
+        ipc_tests.contains(".serve_request("),
+        "keep the existing ipc_protocol compatibility caller; do not silently drop the seam"
+    );
 }

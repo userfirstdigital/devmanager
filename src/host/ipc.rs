@@ -483,9 +483,10 @@ impl HostConnection {
 
     /// Wait indefinitely for the first request byte, then complete under one deadline.
     ///
-    /// Exclusive compatibility path used by ipc_protocol tests: dispatches
-    /// directly against a caller-owned [`CommandBus`]. Concurrent host serving
-    /// uses [`Self::serve_duplex`] instead.
+    /// Integration-test compatibility path used by `tests/ipc_protocol.rs`. It
+    /// cannot be `#[cfg(test)]` because integration tests link the library
+    /// without `--cfg test`. Production host serving uses [`Self::serve_duplex`]
+    /// and never calls this method.
     /// The compatibility path has no host project resolver, so request-shaped
     /// `task.create.v2` commands are intentionally rejected there; production
     /// task creation must use the resolver-backed executor path.

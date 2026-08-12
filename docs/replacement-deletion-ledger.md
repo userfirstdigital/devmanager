@@ -11,18 +11,25 @@ attach/detach/full quit; no `devmanager-next` binary; no backward-compatibility
 shell; production profile only on the signed release path; atomic two-binary
 updater/package identity; and explicit manual publication approval.
 
-Every row remains `HOLD` until its prerequisite phase/gates and evidence are
-actually green. Declared tests, E2E proof, and production impact are included only when an
-exact tracked binding exists. Missing or unverified fields stay HOLD blockers.
-No row may claim assumed, partial, or compile-only evidence.
-`HOLD` may describe a still-present legacy path or one that was already ripped
-while references, packaging handoff files, or approval remain. `READY` means
-the replacement is approved for the deletion or handoff slice. `DELETED` is
-valid only for `cutoverAction: delete` rows whose legacy path and the full
-deletion set are absent. Handoff rows never become `DELETED`; they become
+Phase 11 deletes old runtime paths once owning lanes produce evidence; it does
+not permanently `HOLD` them as a compatibility layer. A still-present delete
+row stays `HOLD` only as a deferred deletion until its prerequisite
+phase/gates and evidence are actually green. Declared tests, E2E proof, and
+production impact are included only when an exact tracked binding exists.
+Missing or unverified fields stay HOLD blockers. No row may claim assumed,
+partial, or compile-only evidence. `HOLD` on a present path is a deferred
+delete, never a keep. `READY` means the replacement is approved for the
+deletion or handoff slice. `DELETED` is valid only for `cutoverAction: delete`
+rows whose legacy path and the full deletion set are absent; an already-absent
+path must not remain `HOLD`. Handoff rows never become `DELETED`; they become
 `READY` when required binaries, packager tokens, and update files exist and
 their prerequisites are green. This foundation makes no deletion, install,
-publish, or user-data claim.
+publish, or user-data claim. The product desktop entry is already
+`run_native_shell` from `src/main.rs`; `src/app/mod.rs` remains a deferred
+legacy source compiled by `pub mod app` until its owning lanes finish. Host
+`serve_request` stays an integration-test compatibility seam because
+`tests/ipc_protocol.rs` links the library without `--cfg test`; production
+host serving uses `serve_duplex`.
 
 The audit uses `git ls-files` as the tracked universe. Candidate mode uses a
 bounded internal fixed-string scanner; fixture mode may use a PATH-confined `rg`
@@ -70,7 +77,8 @@ process or production `config.json` / `remote.json`.
       "symbol": "main",
       "role": "gpui-client",
       "forbiddenDispatch": [
-        "devmanager::app::run"
+        "devmanager::app::run",
+        "app::run"
       ]
     },
     "durableHost": {
@@ -98,6 +106,45 @@ process or production `config.json` / `remote.json`.
       "src",
       "Cargo.toml"
     ]
+  },
+  "deletionPolicy": {
+    "permanentHoldForbidden": true,
+    "action": "delete",
+    "readyRequiresOwningLaneEvidence": true,
+    "deletedRequiresPathAndDeletionSetAbsent": true
+  },
+  "deferredDeletionPaths": [
+    "src/app/mod.rs",
+    "src/services/process_manager.rs",
+    "src/terminal/session.rs",
+    "src/ai/codex_cli.rs",
+    "src/ai/codex_rollout.rs",
+    "src/browser/pane.rs",
+    "src/state/",
+    "src/models/config.rs",
+    "src/persistence/mod.rs",
+    "src/services/session_manager.rs",
+    "src/remote/mod.rs",
+    "src/remote/web/bridge.rs",
+    "src/remote/web/lease.rs",
+    "src/sidebar/",
+    "src/workspace/editor_ui.rs",
+    "src/ai/claude_hooks.rs",
+    "src/workspace/mod.rs",
+    "tests/legacy_loader.rs",
+    "tests/fixtures/legacy-session.json",
+    "zz-archive/tauri-react-v0.1.11/"
+  ],
+  "hostCompatibility": {
+    "serveRequest": {
+      "path": "src/host/ipc.rs",
+      "symbol": "HostConnection::serve_request",
+      "kind": "integration-test-seam",
+      "cfgTestGated": false,
+      "reason": "tests/ipc_protocol.rs links the library without cfg(test); production host uses serve_duplex",
+      "productionSymbol": "HostConnection::serve_duplex",
+      "productionCaller": "src/bin/devmanager-host.rs"
+    }
   },
   "packagingHandoff": {
     "requiredBinaries": [
@@ -334,8 +381,7 @@ process or production `config.json` / `remote.json`.
         ],
         "tokens": [
           "devmanager-next",
-          "devmanager-next.exe",
-          "DEVMANAGER_PROFILE"
+          "devmanager-next.exe"
         ]
       },
       "replacementOwner": {
@@ -359,9 +405,10 @@ process or production `config.json` / `remote.json`.
       "deletionSet": [
         "src/bin/devmanager-next.rs"
       ],
-      "status": "HOLD",
+      "cutoverAction": "delete",
+      "status": "DELETED",
       "approvalRequired": true,
-      "approvalRequirement": "Explicit approval is required before removing the development entry identity"
+      "approvalRequirement": "The development entry identity is already absent; remaining historical references are not a product binary"
     },
     {
       "id": "legacy-process-manager",
@@ -994,9 +1041,10 @@ process or production `config.json` / `remote.json`.
       "deletionSet": [
         "web/src/sessions/"
       ],
-      "status": "HOLD",
+      "cutoverAction": "delete",
+      "status": "DELETED",
       "approvalRequired": true,
-      "approvalRequirement": "Task/Connect web route parity and explicit deletion approval"
+      "approvalRequirement": "The old web sessions tree is already absent; remaining Task/Connect routes live under web/src/tasks and web/src/connect"
     },
     {
       "id": "legacy-loader-test",
@@ -1176,14 +1224,18 @@ process or production `config.json` / `remote.json`.
 }
 ```
 
-Current state: `HOLD`. Final product entry is sole GPUI `src/main.rs` plus
-durable `devmanager-host` attach/detach/full quit; `devmanager-next` must not
-return as a binary or compatibility shell. `src/main.rs` may still dispatch
-`devmanager::app::run()` today, and that remains a forbidden-dispatch finding
-until replaced. Packaging/update handoff files (`src/updater/handoff.rs`,
-`tests/update_contract.rs`, `tests/package_contract.rs`) and signed release
-production-profile proof are still missing. Remaining integrated prerequisites
-are every phase-01 through phase-10 node plus `gate-phase11-approval` and
-`gate-release-candidate`. A nonzero audit result is the honest result until
-those gates, handoff files, and explicit manual Phase 11 approval exist. This
-contract does not install, publish, or delete user data.
+Current state: overall `HOLD` with two completed deletions. Final product
+entry is sole GPUI `src/main.rs` (`run_native_shell` after hook relays and
+debug `--ui-preview`) plus durable `devmanager-host` attach/detach/full quit.
+`src/bin/devmanager-next.rs` and `web/src/sessions/` are absent and therefore
+`DELETED`; they must not return as a binary, compatibility shell, or
+permanent HOLD. `src/app/mod.rs` and the other `deferredDeletionPaths` remain
+present until owning lanes produce evidence, then they are deleted. Host
+`serve_request` remains a documented integration-test seam; production uses
+`serve_duplex`. Packaging/update handoff files (`src/updater/handoff.rs`,
+`tests/update_contract.rs`, `tests/package_contract.rs`) exist, but signed
+release production-profile proof and explicit Phase 11 approval do not.
+Remaining integrated prerequisites are every phase-01 through phase-10 node
+plus `gate-phase11-approval` and `gate-release-candidate`. A nonzero audit
+result is the honest result until those gates and explicit manual Phase 11
+approval exist. This contract does not install, publish, or delete user data.
