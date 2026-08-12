@@ -288,6 +288,7 @@ mod tests {
         projection.apply_result(&TaskCockpitResult::Ssh(TaskSshProjection {
             task_id,
             endpoints: Vec::new(),
+            runtime: None,
         }));
         assert_eq!(
             summary_line(&projection, CockpitSurfaceKind::Ssh),
