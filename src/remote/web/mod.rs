@@ -702,6 +702,15 @@ impl WebListenerHandle {
         self.host_requests.attach(handle);
     }
 
+    /// Attach the narrow Connect request lane. The listener does not own an
+    /// executor; this is only a lifecycle-safe reference to the host bridge.
+    pub fn attach_host_executor(
+        &self,
+        executor: std::sync::Arc<dyn crate::client::ConnectHostCommandPort>,
+    ) {
+        self.host_requests.attach_executor(executor);
+    }
+
     pub fn shutdown(mut self) {
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());

@@ -4,15 +4,167 @@
 //! subscriptions enter as domain envelopes. Presentation DTOs and writer
 //! leases are not part of this contract.
 
+use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use tokio::sync::Mutex as AsyncMutex;
 
 use crate::domain::command::{CommandEnvelope, CommandReceipt};
 use crate::domain::id::{ArtifactId, RequestId, TaskId};
 use crate::domain::query::{QueryEnvelope, QueryReply};
 use crate::host::IpcError;
+use crate::protocol::{ClientRequest, NegotiatedParameters, ServerMessage};
 
 use super::connection::UnsolicitedServerMessage;
-use super::host_client::{ArtifactContentBatch, EventReplayBatch};
+use super::host_client::{ArtifactContentBatch, EventReplayBatch, HostClient, HostClientConfig};
+
+/// Async Connect-facing command port. The implementation is deliberately
+/// request-lane only: the host remains the sole executor and the web route
+/// never gets a second CommandBus or unsolicited-message writer.
+#[async_trait]
+pub trait ConnectHostCommandPort: Send + Sync {
+    async fn execute(
+        &self,
+        negotiated: NegotiatedParameters,
+        request: ClientRequest,
+    ) -> Result<ServerMessage, IpcError>;
+}
+
+const MAX_CONNECT_HOST_CLIENTS: usize = 32;
+
+struct ConnectHostClients {
+    clients: HashMap<crate::domain::id::ClientId, Arc<AsyncMutex<HostClient>>>,
+}
+
+/// Cross-process adapter for Connect. Each authenticated Connect client gets
+/// one HostClient/pipe connection keyed by its exact negotiated ClientId. The
+/// map is bounded, operations on one client are serialized, and a broken host
+/// connection is removed so a restart can be discovered on the next request.
+pub struct HostClientConnectPort {
+    template: HostClientConfig,
+    clients: Arc<AsyncMutex<ConnectHostClients>>,
+}
+
+impl fmt::Debug for HostClientConnectPort {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HostClientConnectPort")
+            .field("named_profile", &self.template.named_profile)
+            .field("max_clients", &MAX_CONNECT_HOST_CLIENTS)
+            .finish()
+    }
+}
+
+impl HostClientConnectPort {
+    pub fn new(template: HostClientConfig) -> Self {
+        Self {
+            template,
+            clients: Arc::new(AsyncMutex::new(ConnectHostClients {
+                clients: HashMap::new(),
+            })),
+        }
+    }
+
+    /// Drop all per-client pipes before the owning listener is joined.
+    pub async fn clear(&self) {
+        self.clients.lock().await.clients.clear();
+    }
+
+    pub async fn client_count(&self) -> usize {
+        self.clients.lock().await.clients.len()
+    }
+
+    async fn client_for(
+        &self,
+        client_id: crate::domain::id::ClientId,
+    ) -> Result<Arc<AsyncMutex<HostClient>>, IpcError> {
+        {
+            let state = self.clients.lock().await;
+            if let Some(client) = state.clients.get(&client_id) {
+                return Ok(client.clone());
+            }
+            if state.clients.len() >= MAX_CONNECT_HOST_CLIENTS {
+                return Err(IpcError::Busy);
+            }
+        }
+
+        let mut config = self.template.clone();
+        // The HostClient Hello and every request must carry the exact Connect
+        // identity; do not collapse clients onto the native shell's identity.
+        config.client_id = client_id;
+        let client = Arc::new(AsyncMutex::new(HostClient::connect(config).await?));
+
+        let mut state = self.clients.lock().await;
+        if let Some(existing) = state.clients.get(&client_id) {
+            return Ok(existing.clone());
+        }
+        if state.clients.len() >= MAX_CONNECT_HOST_CLIENTS {
+            return Err(IpcError::Busy);
+        }
+        state.clients.insert(client_id, client.clone());
+        Ok(client)
+    }
+
+    async fn remove_if_same(
+        &self,
+        client_id: crate::domain::id::ClientId,
+        client: &Arc<AsyncMutex<HostClient>>,
+    ) {
+        let mut state = self.clients.lock().await;
+        if state
+            .clients
+            .get(&client_id)
+            .is_some_and(|current| Arc::ptr_eq(current, client))
+        {
+            state.clients.remove(&client_id);
+        }
+    }
+}
+
+#[async_trait]
+impl ConnectHostCommandPort for HostClientConnectPort {
+    async fn execute(
+        &self,
+        negotiated: NegotiatedParameters,
+        request: ClientRequest,
+    ) -> Result<ServerMessage, IpcError> {
+        let client_id = negotiated.client_id;
+        let client = match &request {
+            ClientRequest::Command(envelope) if envelope.client_id != client_id => {
+                return Err(IpcError::Unauthorized);
+            }
+            ClientRequest::Query(envelope) if envelope.client_id != client_id => {
+                return Err(IpcError::Unauthorized);
+            }
+            ClientRequest::Detach(_) => return Err(IpcError::Unsupported),
+            _ => self.client_for(client_id).await?,
+        };
+
+        let mut client_guard = client.lock().await;
+        // HostClient's authenticated IPC Hello is the grant authority. The
+        // Connect capability claim is intentionally not used to elevate it.
+        let result = match request {
+            ClientRequest::Command(envelope) => client_guard
+                .execute_command(envelope)
+                .await
+                .map(ServerMessage::CommandReceipt),
+            ClientRequest::Query(envelope) => client_guard
+                .query(envelope)
+                .await
+                .map(ServerMessage::QueryReply),
+            ClientRequest::Detach(_) => Err(IpcError::Unsupported),
+        };
+        let still_connected = client_guard.is_connected();
+        drop(client_guard);
+
+        if !still_connected {
+            self.remove_if_same(client_id, &client).await;
+        }
+        result
+    }
+}
 
 /// Caller-owned provider input. The host remains execution authority.
 #[derive(Debug, Clone, PartialEq, Eq)]

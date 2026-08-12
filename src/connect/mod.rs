@@ -49,9 +49,10 @@ pub use direct::{
     DirectRequestView, MAX_DIRECT_FRAME_BYTES, MAX_DIRECT_PAIRING_BODY_BYTES,
 };
 pub use dispatch::{
-    advertised_connect_capabilities, bind_host_request_handle, bound_host_request_handle,
-    process_connect_host_request_slot, unbind_host_request_handle, ConnectDispatchSession,
-    ConnectHostRequestSlot, ConnectSessionDisposition, CONNECT_ERROR_CONFLICT,
+    advertised_connect_capabilities, bind_host_executor, bind_host_request_handle,
+    bound_host_request_handle, process_connect_host_request_slot, unbind_host_request_handle,
+    ConnectDispatchSession, ConnectHostRequestSlot, ConnectSessionDisposition,
+    CONNECT_ERROR_CONFLICT,
     CONNECT_ERROR_EXECUTOR_UNATTACHED, CONNECT_ERROR_FORBIDDEN, CONNECT_ERROR_PROTOCOL,
     CONNECT_ERROR_UNAUTHORIZED, CONNECT_HOLD_CALLBACK_FRAGMENT,
 };

@@ -39,7 +39,8 @@ use crate::browser::{
 };
 use crate::client::action::{self, BrowserActionRequest, CockpitSurfaceKind, UpdaterAction};
 use crate::client::{
-    ClientModel, ClientSubscription, HostClient, HostClientConfig, SubscriptionUpdate,
+    ClientModel, ClientSubscription, HostClient, HostClientConfig, HostClientConnectPort,
+    SubscriptionUpdate,
 };
 use crate::config::paths::{resolve_app_paths, AppProfile, BuildKind};
 use crate::domain::cockpit::TaskCockpitQuery;
@@ -54,6 +55,7 @@ use crate::prompts::projection::{PromptLibraryQuery, PromptNamespace, PromptProj
 use crate::protocol::BrowserSecurityState;
 use crate::protocol::StreamFrame;
 use crate::protocol::{Capability, CapabilitySet, FrameLimits};
+use crate::remote::RemoteHostService;
 use crate::ui::actions::{
     self, DockTool, HostActions, HostStatus, KeyboardAction, KeyboardModel, KeyboardShortcut,
     NativeDismissTransient, NativeDockArtifacts, NativeDockBrowser, NativeDockChanges,
@@ -5174,6 +5176,10 @@ pub struct NativeShell {
     profile: IsolatedDevProfile,
     host_connection: DevTestHostConnection,
     host_runtime: Option<NativeHostRuntimeAttachment>,
+    /// Owns the local `/api/connect` listener in the native process.
+    remote_host_service: Option<RemoteHostService>,
+    /// Keeps the IPC-backed Connect executor alive until the listener joins.
+    connect_host_port: Option<Arc<HostClientConnectPort>>,
     host_state: NativeHostState,
     preferences: RuntimePreferencesSnapshot,
     header_attachment: NativeHeaderAttachment,
@@ -5221,6 +5227,14 @@ impl Drop for NativeShell {
             }
         }
         let _ = self.browser_host.drain_events();
+
+        // Stop new Connect dispatch before joining the web listener. The
+        // listener then observes the typed unavailable result while the
+        // bounded HostClient map is dropped with this shell.
+        if self.connect_host_port.take().is_some() {
+            crate::connect::unbind_host_request_handle();
+        }
+        self.remote_host_service.take();
         // Invalidate the transport before transferring any shell-owned action
         // into shutdown retention. Dropping the shell must never turn a
         // pending identity into a fresh Execute.
@@ -5399,6 +5413,29 @@ impl NativeShell {
         cx: &mut Context<Self>,
         start_controller: bool,
     ) -> Self {
+        let (connect_host_port, remote_host_service) = if start_controller {
+            let mut host_config = profile.host_client_config();
+            host_config.requested = CapabilitySet::from_capabilities([
+                Capability::PagedSnapshots,
+                Capability::EventReplay,
+                Capability::OperationSettlement,
+                Capability::ChunkResume,
+                Capability::PromptProjection,
+                Capability::ProviderInput,
+                Capability::TaskCockpit,
+                Capability::HostShutdown,
+                Capability::ExplicitDetach,
+                Capability::ServiceSupervisor,
+            ]);
+            let bridge = Arc::new(HostClientConnectPort::new(host_config));
+            crate::connect::bind_host_executor(bridge.clone());
+            let remote_config = crate::remote::load_remote_machine_state()
+                .map(|state| state.host)
+                .unwrap_or_default();
+            (Some(bridge), Some(RemoteHostService::new(remote_config)))
+        } else {
+            (None, None)
+        };
         let inbox = Inbox::from_error(crate::ui::task_cockpit::InboxError::ProjectionUnavailable);
         let task_list = TaskList::empty();
         let prompt_library = PromptLibrarySession::new(PromptLibraryViewport {
@@ -5427,6 +5464,8 @@ impl NativeShell {
             host_connection: profile.host_connection(),
             profile,
             host_runtime,
+            remote_host_service,
+            connect_host_port,
             host_state,
             preferences,
             header_attachment,

@@ -7,7 +7,10 @@
 
 use std::sync::{Arc, OnceLock, RwLock};
 
+use async_trait::async_trait;
+
 use crate::connect::permissions::action_for_client_request;
+use crate::client::ConnectHostCommandPort;
 use crate::connect::permission::{
     PermissionDecision, PermissionDenyReason, PermissionEvaluator, PermissionRequest,
 };
@@ -53,18 +56,38 @@ pub fn advertised_connect_capabilities() -> CapabilitySet {
     ])
 }
 
-/// Cloneable attachment for the one existing [`HostRequestHandle`].
+/// Cloneable attachment for the one existing host executor.
 ///
 /// Lock ordering: acquire only to clone the handle, then release before any
 /// await (including [`HostRequestHandle::execute`]).
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ConnectHostRequestSlot {
-    inner: Arc<RwLock<Option<HostRequestHandle>>>,
+    inner: Arc<RwLock<Option<Arc<dyn ConnectHostCommandPort>>>>,
+}
+
+impl std::fmt::Debug for ConnectHostRequestSlot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ConnectHostRequestSlot")
+            .field("attached", &self.get().is_some())
+            .finish()
+    }
 }
 
 impl Default for ConnectHostRequestSlot {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[async_trait]
+impl ConnectHostCommandPort for HostRequestHandle {
+    async fn execute(
+        &self,
+        negotiated: NegotiatedParameters,
+        request: ClientRequest,
+    ) -> Result<ServerMessage, IpcError> {
+        HostRequestHandle::execute(self, negotiated, request).await
     }
 }
 
@@ -76,14 +99,18 @@ impl ConnectHostRequestSlot {
     }
 
     pub fn attach(&self, handle: HostRequestHandle) {
+        self.attach_executor(Arc::new(handle));
+    }
+
+    pub fn attach_executor(&self, executor: Arc<dyn ConnectHostCommandPort>) {
         let mut slot = self
             .inner
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *slot = Some(handle);
+        *slot = Some(executor);
     }
 
-    pub fn get(&self) -> Option<HostRequestHandle> {
+    pub fn get(&self) -> Option<Arc<dyn ConnectHostCommandPort>> {
         self.inner
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -109,7 +136,14 @@ pub fn bind_host_request_handle(handle: HostRequestHandle) {
     process_host_request_slot().attach(handle);
 }
 
-pub fn bound_host_request_handle() -> Option<HostRequestHandle> {
+/// Attach an IPC-backed executor owned by the native shell. The slot stores
+/// only the narrow request lane and remains process-local; the implementation
+/// may cross the process boundary through the existing HostClient pipe.
+pub fn bind_host_executor(executor: Arc<dyn ConnectHostCommandPort>) {
+    process_host_request_slot().attach_executor(executor);
+}
+
+pub fn bound_host_request_handle() -> Option<Arc<dyn ConnectHostCommandPort>> {
     process_host_request_slot().get()
 }
 
@@ -207,7 +241,7 @@ impl ConnectDispatchSession {
         &mut self,
         envelope: &ConnectEnvelope,
         payload: ConnectPayload,
-        host: Option<&HostRequestHandle>,
+        host: Option<&dyn ConnectHostCommandPort>,
     ) -> (ConnectPayload, ConnectSessionDisposition) {
         match self.dispatch(envelope, payload, host).await {
             Ok(payload) => (payload, ConnectSessionDisposition::Continue),
@@ -236,7 +270,7 @@ impl ConnectDispatchSession {
         &mut self,
         envelope: &ConnectEnvelope,
         payload: ConnectPayload,
-        host: Option<&HostRequestHandle>,
+        host: Option<&dyn ConnectHostCommandPort>,
     ) -> Result<ConnectPayload, DispatchFailure> {
         if !self.active {
             return Err(DispatchFailure::fatal(
@@ -451,7 +485,7 @@ impl ConnectDispatchSession {
         &mut self,
         envelope: &ConnectEnvelope,
         request: ClientRequest,
-        host: Option<&HostRequestHandle>,
+        host: Option<&dyn ConnectHostCommandPort>,
     ) -> Result<ConnectPayload, DispatchFailure> {
         let negotiated = self.require_ready()?;
         let bound = self.bound_client_id.ok_or_else(|| {

@@ -230,6 +230,25 @@ impl HostClient {
         self.live_connection()?.execute_command(envelope).await
     }
 
+    /// Execute an arbitrary query while preserving the HostClient connection
+    /// lifecycle and the exact caller-owned request id.
+    pub async fn query(&mut self, envelope: QueryEnvelope) -> Result<QueryReply, IpcError> {
+        if envelope.client_id != self.config.client_id {
+            return Err(IpcError::Unauthorized);
+        }
+        let outcome = {
+            let connection = self.live_connection()?;
+            connection.query(envelope).await
+        };
+        match outcome {
+            Ok(reply) => Ok(reply),
+            Err(error) => {
+                self.retire_connection();
+                Err(error)
+            }
+        }
+    }
+
     /// Read one Task snapshot through the shared `task.show` query factory.
     pub async fn task_snapshot(
         &mut self,

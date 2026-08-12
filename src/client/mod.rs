@@ -47,8 +47,9 @@ pub use model::{
     TaskCockpitSurfaceProjection, PROVIDER_QUOTA_MAX_AGE_MS,
 };
 pub use port::{
-    ApprovalAnswerCall, HostCommandPort, HostPortError, PromptMetadataItem, PromptMetadataPage,
-    PromptQueryCall, ProviderInputCall, TranscriptFetchCall,
+    ApprovalAnswerCall, ConnectHostCommandPort, HostClientConnectPort, HostCommandPort,
+    HostPortError, PromptMetadataItem, PromptMetadataPage, PromptQueryCall, ProviderInputCall,
+    TranscriptFetchCall,
 };
 pub use preferences::{ClientPreferenceError, InboxPreferenceStore};
 pub use subscription::{

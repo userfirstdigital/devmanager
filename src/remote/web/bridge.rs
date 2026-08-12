@@ -526,7 +526,7 @@ async fn run_connect_session(
         // Clone the handle then drop the slot lock before execute awaits.
         let host = host_requests.get();
         let (reply, disposition) = dispatch
-            .handle_payload(&envelope, payload, host.as_ref())
+            .handle_payload(&envelope, payload, host.as_deref())
             .await;
         debug_assert!(
             !matches!(
