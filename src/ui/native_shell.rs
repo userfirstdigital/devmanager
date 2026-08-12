@@ -3800,7 +3800,11 @@ impl NativeInteraction {
         task_list: &TaskList,
     ) -> NavigationHandlerOutcome {
         let (focus_epoch, request_generation) = self.begin_handler(Some(task_id));
-        let navigation = if task_list.task_ids().any(|candidate| candidate == task_id) {
+        let navigation = if task_list
+            .task_ids()
+            .iter()
+            .any(|candidate| *candidate == task_id)
+        {
             match self.shell.navigation_epoch().checked_add(1) {
                 Some(navigation_epoch) => {
                     self.replace_shell_selection(Some(task_id), navigation_epoch);

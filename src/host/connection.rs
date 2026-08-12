@@ -3287,7 +3287,7 @@ impl HostRequestExecutor {
                     .manager
                     .configured_service_control(
                         action,
-                        &crate::services::model::ServiceId::new(intent.service_id)
+                        &crate::services::model::ServiceId::new(intent.service_id.clone())
                             .map_err(|error| IpcError::Security(error.to_string()))?,
                         crate::services::model::AdmissionFence::new(
                             intent.resource_generation,
