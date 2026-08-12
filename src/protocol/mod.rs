@@ -3,6 +3,7 @@
 mod capabilities;
 mod chunk;
 mod control;
+mod crypto;
 mod envelope;
 mod frame;
 mod org;
@@ -24,6 +25,15 @@ pub use chunk::{
     MAX_CUMULATIVE_BYTES, MAX_CURSOR_BYTES,
 };
 pub use control::{DetachAck, DetachRequest};
+pub use crypto::{
+    instantiate_noise_channel, validate_noise_pattern, ChannelKey, ChannelRole, CredentialPurpose,
+    CryptoError, CryptoHold, CryptoHoldReason, CryptoPrologue, ReplayWindow, SealedFrame,
+    SourceLevelSealer, CHANNEL_KEY_BYTES, CONNECT_CRYPTO_PROTOCOL, CRYPTO_PRODUCTION_READY,
+    MAX_CHANNEL_SEQUENCES, MAX_SEALED_FRAME_BYTES, MAX_SEALED_PLAINTEXT_BYTES,
+    MAX_SESSION_AGE_SECS, NOISE_FIRST_PAIRING_PATTERN, NOISE_PINNED_DEVICE_PATTERN,
+    REPLAY_WINDOW_SIZE, SEALED_FRAME_OVERHEAD_BYTES, SEALED_FRAME_VERSION, SEALED_NONCE_BYTES,
+    SEALED_TAG_BYTES,
+};
 pub use envelope::{
     ClientBuildError, ClientHello, ClientHelloError, MessagePackCodec, MessagePackError,
     MessagePackLengthKind, NegotiatedParameters, ProfileFingerprint, ServerBuildError, ServerHello,

@@ -1,6 +1,8 @@
-//! Contract-first Connect core. Network, identity, crypto, relay, and UI
-//! implementations are intentionally later phase gates.
+//! Contract-first Connect core. Network, identity, pairing persistence, and UI
+//! implementations remain later phase gates. Source-level end-to-end channel
+//! and opaque relay tickets live here; production Noise stays on HOLD.
 
+mod crypto;
 mod envelope;
 mod evidence;
 mod local_actions;
@@ -18,6 +20,7 @@ mod policy;
 mod presence;
 mod projection;
 mod push;
+mod relay;
 mod schema;
 mod telemetry;
 #[cfg(test)]
@@ -30,6 +33,13 @@ mod update;
 #[cfg(test)]
 mod identity_tests;
 
+pub use crypto::{
+    connect_prologue, lock_noise_pattern, preferred_connect_route, ConnectChannelKey,
+    ConnectChannelRole, ConnectCredentialPurpose, ConnectCryptoError, ConnectCryptoHold,
+    ConnectCryptoHoldReason, ConnectCryptoPrologue, ConnectSealedFrame, EndToEndChannel,
+    CONNECT_CRYPTO_PRODUCTION_READY, CONNECT_NOISE_FIRST_PAIRING_PATTERN,
+    CONNECT_NOISE_PINNED_DEVICE_PATTERN,
+};
 pub use envelope::{
     ChannelBinding, ChannelId, ChannelKind, ChunkContext, Compression, ConnectEnvelope,
     ConnectHostId, ConnectIdError, ConnectLimitError, ConnectLimitField, ConnectLimits, ConnectPrivacyClass,
@@ -99,6 +109,12 @@ pub use session::{
 };
 pub use update::{
     PairingContinuity, UpdateContinuity, UpdateContinuityError,
+};
+pub use relay::{
+    AccountId, DevicePublicId, HostPublicId, OpaqueRelay, RateKey, RelayError, RelayObservation,
+    RelayStatus, RouteId, RouteTicket, SignedRouteTicket, TicketAudience, TicketId,
+    TicketSigningKey, BIND_RATE_WINDOW_SECS, MAX_BIND_ATTEMPTS_PER_WINDOW, MAX_RELAY_QUEUE_BYTES,
+    MAX_RELAY_QUEUE_FRAMES, MAX_ROUTE_TICKET_TTL_SECS, PRESENCE_TTL_SECS, ROUTE_TICKET_DOMAIN,
 };
 pub use schema::{
     canonical_schema_fixtures, catalog_entry, encode_canonical_schema, payload_catalog,
