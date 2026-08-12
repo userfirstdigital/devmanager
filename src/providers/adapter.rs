@@ -282,6 +282,8 @@ pub enum ProviderProbeKind {
     Version,
     Help,
     AuthStatus,
+    LoginStatus,
+    ResumeHelp,
 }
 
 impl ProviderProbeKind {
@@ -290,6 +292,8 @@ impl ProviderProbeKind {
             Self::Version => &["--version"],
             Self::Help => &["--help"],
             Self::AuthStatus => &["auth", "status"],
+            Self::LoginStatus => &["login", "status"],
+            Self::ResumeHelp => &["resume", "--help"],
         }
     }
 }
@@ -362,6 +366,18 @@ impl ProviderProbeRequest {
         executable: ProviderExecutableHandle,
     ) -> Result<Self, ProviderProbeRequestError> {
         Self::new(executable, ProviderProbeKind::AuthStatus)
+    }
+
+    pub fn login_status(
+        executable: ProviderExecutableHandle,
+    ) -> Result<Self, ProviderProbeRequestError> {
+        Self::new(executable, ProviderProbeKind::LoginStatus)
+    }
+
+    pub fn resume_help(
+        executable: ProviderExecutableHandle,
+    ) -> Result<Self, ProviderProbeRequestError> {
+        Self::new(executable, ProviderProbeKind::ResumeHelp)
     }
 
     pub fn new(

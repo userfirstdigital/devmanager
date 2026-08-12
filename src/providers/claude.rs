@@ -12,16 +12,19 @@ use crate::domain::{
     AgentSessionId, ProviderSessionId, ProviderSessionIdError, ResourceId, TaskId,
 };
 use crate::providers::adapter::{
-    JournalEvent, LaunchProviderRequest, ProviderAdapter, ProviderArgument, ProviderError,
+    AdapterDeliveryPermit, AdapterIngressUnavailable, JournalNormalizeError, LaunchProviderRequest,
+    NormalizedAdapterDelivery, ProviderAdapter, ProviderArgument, ProviderError,
     ProviderLaunchSpec, ProviderProbeError, ProviderProbeIoError, ProviderProbeKind,
     ProviderProbeRequest, ProviderProbeRunner, ProviderProbeStatus, ProviderRuntime,
-    ProviderSignal, QuotaObservation, StopStrategy,
+    QuotaObservation, StopStrategy,
 };
 use crate::providers::capabilities::{
     CapabilityEvidence, CapabilityEvidenceError, CapabilitySupport, EvidenceSourceId,
     EvidenceStatus, ProviderAuthState, ProviderCapabilities, ProviderCapabilitiesError,
-    ProviderCapability, ProviderExecutable, ProviderKind, ProviderVersion,
+    ProviderCapability, ProviderExecutable, ProviderExecutableHandle, ProviderKind,
+    ProviderVersion,
 };
+use crate::providers::journal::JournalEvent;
 use crate::providers::registry::ProviderObservation;
 use crate::remote::presentation::StableSessionKey;
 use async_trait::async_trait;
@@ -634,10 +637,10 @@ impl ClaudeCodeAdapter {
 
     async fn run_probe(
         &self,
-        executable: &Path,
+        executable: &ProviderExecutableHandle,
         kind: ProviderProbeKind,
     ) -> Result<crate::providers::adapter::ProviderProbeResult, ProviderError> {
-        let request = ProviderProbeRequest::new(executable.to_path_buf(), kind)
+        let request = ProviderProbeRequest::new(executable.clone(), kind)
             .map_err(ProviderProbeError::InvalidRequest)?;
         let result = self.probes.run(request).await?;
         match result.status() {
@@ -838,7 +841,10 @@ impl ProviderAdapter for ClaudeCodeAdapter {
         ProviderKind::ClaudeCode
     }
 
-    async fn probe(&self, executable: &Path) -> Result<ProviderCapabilities, ProviderError> {
+    async fn probe(
+        &self,
+        executable: &ProviderExecutableHandle,
+    ) -> Result<ProviderCapabilities, ProviderError> {
         let version = self
             .run_probe(executable, ProviderProbeKind::Version)
             .await?;
@@ -911,8 +917,14 @@ impl ProviderAdapter for ClaudeCodeAdapter {
             .map_err(|_| ProviderError::UnsupportedCapability(ProviderCapability::BuildLaunch))
     }
 
-    fn parse_signal(&self, _signal: ProviderSignal) -> Vec<JournalEvent> {
-        Vec::new()
+    fn normalize_delivery(
+        &self,
+        _permit: &AdapterDeliveryPermit,
+        _bytes: &[u8],
+    ) -> Result<NormalizedAdapterDelivery, JournalNormalizeError> {
+        Err(JournalNormalizeError::Unavailable(
+            AdapterIngressUnavailable,
+        ))
     }
 
     fn cooperative_stop(&self, _session: &ProviderRuntime) -> StopStrategy {
@@ -921,7 +933,7 @@ impl ProviderAdapter for ClaudeCodeAdapter {
 
     async fn observe_quota(
         &self,
-        _executable: &Path,
+        _executable: &ProviderExecutableHandle,
     ) -> Result<Option<QuotaObservation>, ProviderError> {
         Ok(None)
     }

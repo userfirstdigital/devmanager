@@ -15,15 +15,16 @@ use crate::domain::{
 };
 use crate::process::identity::ManagedProcessId;
 use crate::providers::adapter::{
-    JournalEvent, LaunchProviderRequest, ProviderAdapter, ProviderArgument, ProviderError,
+    AdapterDeliveryPermit, AdapterIngressUnavailable, JournalNormalizeError, LaunchProviderRequest,
+    NormalizedAdapterDelivery, ProviderAdapter, ProviderArgument, ProviderError,
     ProviderLaunchSpec, ProviderProbeError, ProviderProbeRequest, ProviderProbeRunner,
-    ProviderProbeStatus, ProviderRuntime, ProviderSignal, QuotaObservation, StopStrategy,
+    ProviderProbeStatus, ProviderRuntime, QuotaObservation, StopStrategy,
 };
 use crate::providers::capabilities::{
     CapabilityEvidence, CapabilitySupport, EvidenceDiagnostic, EvidenceDiagnosticCode,
     EvidenceSourceId, EvidenceStatus, ProviderAuthState, ProviderCapabilities,
-    ProviderCapabilitiesError, ProviderCapability, ProviderExecutable, ProviderKind,
-    ProviderVersion,
+    ProviderCapabilitiesError, ProviderCapability, ProviderExecutable, ProviderExecutableHandle,
+    ProviderKind, ProviderVersion,
 };
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
@@ -183,11 +184,22 @@ impl CodexAdapter {
         &self,
         identity: &ProviderExecutable,
     ) -> Result<ProviderCapabilities, ProviderError> {
+        let handle = identity
+            .open_for_launch()
+            .map_err(ProviderError::Executable)?;
+        self.probe_attested_handle(&handle).await
+    }
+
+    async fn probe_attested_handle(
+        &self,
+        handle: &ProviderExecutableHandle,
+    ) -> Result<ProviderCapabilities, ProviderError> {
+        let identity = handle.executable();
         let generation = self.begin_attestation(identity)?;
 
-        let executable = identity.canonical_path();
+        let executable = handle.clone();
         let version_request =
-            attested_probe_request(ProviderProbeRequest::version(executable), identity)?;
+            attested_probe_request(ProviderProbeRequest::version(executable.clone()), identity)?;
         require_request_identity(&version_request, identity)?;
         let version_result = self.runner.run(version_request).await?;
         require_attestation(
@@ -200,7 +212,7 @@ impl CodexAdapter {
         let version = ProviderVersion::from_probe_output(version_result.stdout())?;
 
         let help_request =
-            attested_probe_request(ProviderProbeRequest::help(executable), identity)?;
+            attested_probe_request(ProviderProbeRequest::help(executable.clone()), identity)?;
         require_request_identity(&help_request, identity)?;
         require_attestation(
             &self.pinned,
@@ -218,8 +230,10 @@ impl CodexAdapter {
         require_clean_completion(&help_result)?;
         let help = classified_text(help_result.stdout()).unwrap_or("");
 
-        let resume_request =
-            attested_probe_request(ProviderProbeRequest::resume_help(executable), identity)?;
+        let resume_request = attested_probe_request(
+            ProviderProbeRequest::resume_help(executable.clone()),
+            identity,
+        )?;
         require_request_identity(&resume_request, identity)?;
         require_attestation(
             &self.pinned,
@@ -436,11 +450,12 @@ impl ProviderAdapter for CodexAdapter {
         ProviderKind::Codex
     }
 
-    async fn probe(&self, executable: &Path) -> Result<ProviderCapabilities, ProviderError> {
+    async fn probe(
+        &self,
+        executable: &ProviderExecutableHandle,
+    ) -> Result<ProviderCapabilities, ProviderError> {
         self.quarantine_attestation()?;
-        let identity =
-            ProviderExecutable::inspect_blocking(executable).map_err(ProviderError::Executable)?;
-        self.probe_attested(&identity).await
+        self.probe_attested_handle(executable).await
     }
 
     fn build_launch(
@@ -476,8 +491,14 @@ impl ProviderAdapter for CodexAdapter {
         Ok(spec)
     }
 
-    fn parse_signal(&self, _signal: ProviderSignal) -> Vec<JournalEvent> {
-        Vec::new()
+    fn normalize_delivery(
+        &self,
+        _permit: &AdapterDeliveryPermit,
+        _bytes: &[u8],
+    ) -> Result<NormalizedAdapterDelivery, JournalNormalizeError> {
+        Err(JournalNormalizeError::Unavailable(
+            AdapterIngressUnavailable,
+        ))
     }
 
     fn cooperative_stop(&self, _session: &ProviderRuntime) -> StopStrategy {
@@ -486,7 +507,7 @@ impl ProviderAdapter for CodexAdapter {
 
     async fn observe_quota(
         &self,
-        _executable: &Path,
+        _executable: &ProviderExecutableHandle,
     ) -> Result<Option<QuotaObservation>, ProviderError> {
         Ok(None)
     }
@@ -908,9 +929,7 @@ fn require_request_identity(
     request: &ProviderProbeRequest,
     identity: &ProviderExecutable,
 ) -> Result<(), ProviderError> {
-    if request.executable() == identity.canonical_path()
-        && request.executable_sha256() == Some(identity.sha256())
-    {
+    if request.executable().executable() == identity {
         Ok(())
     } else {
         Err(ProviderError::ExecutableChanged {
@@ -924,7 +943,9 @@ fn attested_probe_request(
     request: Result<ProviderProbeRequest, crate::providers::adapter::ProviderProbeRequestError>,
     identity: &ProviderExecutable,
 ) -> Result<ProviderProbeRequest, ProviderError> {
-    Ok(probe_request(request)?.with_executable_digest(*identity.sha256()))
+    let request = probe_request(request)?;
+    require_request_identity(&request, identity)?;
+    Ok(request)
 }
 
 fn probe_request(

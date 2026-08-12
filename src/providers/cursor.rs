@@ -11,16 +11,17 @@
 //! `CapabilitySupport::Supported`. `CursorAdapter::new()` does not self-register.
 
 use crate::providers::adapter::{
-    JournalEvent, LaunchProviderRequest, ProviderAdapter, ProviderError, ProviderLaunchSpec,
+    AdapterDeliveryPermit, AdapterIngressUnavailable, JournalNormalizeError, LaunchProviderRequest,
+    NormalizedAdapterDelivery, ProviderAdapter, ProviderError, ProviderLaunchSpec,
     ProviderProbeError, ProviderProbeFailureCode, ProviderProbeIoError, ProviderProbeRequest,
     ProviderProbeRequestError, ProviderProbeRunner, ProviderProbeStatus, ProviderRuntime,
-    ProviderSignal, QuotaObservation, StopStrategy, WindowsProviderProbeRunner,
+    QuotaObservation, StopStrategy, WindowsProviderProbeRunner,
 };
 use crate::providers::capabilities::{
     CapabilityEvidence, CapabilityEvidenceError, CapabilitySupport, EvidenceSourceId,
     EvidenceStatus, ProviderAuthState, ProviderCapabilities, ProviderCapabilitiesError,
-    ProviderCapability, ProviderExecutablePolicy, ProviderKind, ProviderVersion,
-    ProviderVersionError,
+    ProviderCapability, ProviderExecutableHandle, ProviderExecutablePolicy, ProviderKind,
+    ProviderVersion, ProviderVersionError,
 };
 use async_trait::async_trait;
 use std::path::Path;
@@ -88,7 +89,7 @@ impl CursorAdapter {
 
     async fn version_and_help(
         &self,
-        executable: &Path,
+        executable: &ProviderExecutableHandle,
     ) -> Result<(Vec<u8>, Vec<u8>), ProviderError> {
         if let Some(pinned) = &self.pinned {
             return Ok((pinned.version.clone(), pinned.help.clone()));
@@ -98,14 +99,14 @@ impl CursorAdapter {
             .as_ref()
             .ok_or_else(|| ProviderError::MissingCli {
                 kind: ProviderKind::Cursor,
-                requested: Some(executable.to_path_buf()),
+                requested: Some(executable.canonical_path().to_path_buf()),
             })?;
-        let version = run_text_probe(runner.as_ref(), executable, |path| {
-            ProviderProbeRequest::version(path)
+        let version = run_text_probe(runner.as_ref(), executable, |handle| {
+            ProviderProbeRequest::version(handle)
         })
         .await?;
-        let help = run_text_probe(runner.as_ref(), executable, |path| {
-            ProviderProbeRequest::help(path)
+        let help = run_text_probe(runner.as_ref(), executable, |handle| {
+            ProviderProbeRequest::help(handle)
         })
         .await?;
         Ok((version, help))
@@ -125,7 +126,10 @@ impl ProviderAdapter for CursorAdapter {
         ProviderKind::Cursor
     }
 
-    async fn probe(&self, executable: &Path) -> Result<ProviderCapabilities, ProviderError> {
+    async fn probe(
+        &self,
+        executable: &ProviderExecutableHandle,
+    ) -> Result<ProviderCapabilities, ProviderError> {
         let observed_at = if self.pinned.is_some() {
             self.observed_at
         } else {
@@ -174,8 +178,14 @@ impl ProviderAdapter for CursorAdapter {
             .map_err(|_| ProviderError::UnsupportedCapability(ProviderCapability::BuildLaunch))
     }
 
-    fn parse_signal(&self, _signal: ProviderSignal) -> Vec<JournalEvent> {
-        Vec::new()
+    fn normalize_delivery(
+        &self,
+        _permit: &AdapterDeliveryPermit,
+        _bytes: &[u8],
+    ) -> Result<NormalizedAdapterDelivery, JournalNormalizeError> {
+        Err(JournalNormalizeError::Unavailable(
+            AdapterIngressUnavailable,
+        ))
     }
 
     fn cooperative_stop(&self, _session: &ProviderRuntime) -> StopStrategy {
@@ -184,7 +194,7 @@ impl ProviderAdapter for CursorAdapter {
 
     async fn observe_quota(
         &self,
-        _executable: &Path,
+        _executable: &ProviderExecutableHandle,
     ) -> Result<Option<QuotaObservation>, ProviderError> {
         Ok(None)
     }
@@ -259,10 +269,12 @@ fn normalize_whitespace(text: &str) -> String {
 
 async fn run_text_probe(
     runner: &dyn ProviderProbeRunner,
-    executable: &Path,
-    request: impl FnOnce(std::path::PathBuf) -> Result<ProviderProbeRequest, ProviderProbeRequestError>,
+    executable: &ProviderExecutableHandle,
+    request: impl FnOnce(
+        ProviderExecutableHandle,
+    ) -> Result<ProviderProbeRequest, ProviderProbeRequestError>,
 ) -> Result<Vec<u8>, ProviderError> {
-    let request = request(executable.to_path_buf()).map_err(ProviderProbeError::InvalidRequest)?;
+    let request = request(executable.clone()).map_err(ProviderProbeError::InvalidRequest)?;
     let result = runner
         .run(request)
         .await
@@ -294,12 +306,15 @@ async fn run_text_probe(
     }
 }
 
-fn map_probe_error(error: ProviderProbeError, executable: &Path) -> ProviderError {
+fn map_probe_error(
+    error: ProviderProbeError,
+    executable: &ProviderExecutableHandle,
+) -> ProviderError {
     match error {
         ProviderProbeError::Io(ProviderProbeIoError::ExecutableMissing) => {
             ProviderError::MissingCli {
                 kind: ProviderKind::Cursor,
-                requested: Some(executable.to_path_buf()),
+                requested: Some(executable.canonical_path().to_path_buf()),
             }
         }
         other => ProviderError::Probe(other),
