@@ -3,6 +3,7 @@ use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 
+use crate::domain::cockpit::{TaskCockpitQuery, TaskCockpitResult};
 use crate::domain::host::HostQuitInspection;
 use crate::domain::id::{
     ArtifactId, ClientId, OperationId, RequestId, SnapshotId, SubscriptionId, TaskId,
@@ -223,6 +224,8 @@ pub enum Query {
     InspectHostQuit,
     /// Bounded personal prompt library projection.
     PromptLibrary(PromptLibraryQuery),
+    /// Task-scoped cockpit workspace/git/files/ssh/service projection.
+    TaskCockpit(TaskCockpitQuery),
 }
 
 struct OperationStatusQueryRef<'a> {
@@ -446,6 +449,7 @@ impl Serialize for Query {
             )?,
             Self::InspectHostQuit => map.serialize_entry("inspect_host_quit", &EmptyNamedMap)?,
             Self::PromptLibrary(query) => map.serialize_entry("prompt_library", query)?,
+            Self::TaskCockpit(query) => map.serialize_entry("task_cockpit", query)?,
         }
         map.end()
     }
@@ -464,6 +468,7 @@ enum QueryVariant {
     ReleaseArtifactContent,
     InspectHostQuit,
     PromptLibrary,
+    TaskCockpit,
 }
 
 impl<'de> Deserialize<'de> for QueryVariant {
@@ -478,7 +483,7 @@ impl<'de> Deserialize<'de> for QueryVariant {
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 formatter.write_str(
-                    "operation_status, task_snapshot, snapshot_page, release_snapshot, open_event_replay, continue_event_replay, release_event_replay, open_artifact_content, continue_artifact_content, release_artifact_content, inspect_host_quit, or prompt_library",
+                    "operation_status, task_snapshot, snapshot_page, release_snapshot, open_event_replay, continue_event_replay, release_event_replay, open_artifact_content, continue_artifact_content, release_artifact_content, inspect_host_quit, prompt_library, or task_cockpit",
                 )
             }
 
@@ -499,6 +504,7 @@ impl<'de> Deserialize<'de> for QueryVariant {
                     "release_artifact_content" => Ok(QueryVariant::ReleaseArtifactContent),
                     "inspect_host_quit" => Ok(QueryVariant::InspectHostQuit),
                     "prompt_library" => Ok(QueryVariant::PromptLibrary),
+                    "task_cockpit" => Ok(QueryVariant::TaskCockpit),
                     _ => Err(de::Error::unknown_variant(
                         value,
                         &[
@@ -514,6 +520,7 @@ impl<'de> Deserialize<'de> for QueryVariant {
                             "release_artifact_content",
                             "inspect_host_quit",
                             "prompt_library",
+                            "task_cockpit",
                         ],
                     )),
                 }
@@ -1400,6 +1407,10 @@ impl<'de> Deserialize<'de> for Query {
                             .map_err(|error| de::Error::custom(format!("{error:?}")))?;
                         Query::PromptLibrary(query)
                     }
+                    QueryVariant::TaskCockpit => {
+                        let query: TaskCockpitQuery = map.next_value()?;
+                        Query::TaskCockpit(query)
+                    }
                 };
                 if map.next_key::<de::IgnoredAny>()?.is_some() {
                     return Err(de::Error::custom("Query must contain exactly one variant"));
@@ -1445,6 +1456,7 @@ pub enum QueryResult {
         inspection: HostQuitInspection,
     },
     PromptLibrary(PromptProjectionReply),
+    TaskCockpit(TaskCockpitResult),
 }
 
 struct OperationStatusResultRef<'a> {
@@ -1655,6 +1667,7 @@ impl Serialize for QueryResult {
                 })?;
                 map.serialize_entry("prompt_library", &QueryBinaryRef(&packed))?;
             }
+            Self::TaskCockpit(result) => map.serialize_entry("task_cockpit", result)?,
         }
         map.end()
     }
@@ -1671,6 +1684,7 @@ enum QueryResultVariant {
     ArtifactContentReleased,
     HostQuitInspection,
     PromptLibrary,
+    TaskCockpit,
 }
 
 impl<'de> Deserialize<'de> for QueryResultVariant {
@@ -1685,7 +1699,7 @@ impl<'de> Deserialize<'de> for QueryResultVariant {
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 formatter.write_str(
-                    "operation_status, task_snapshot, snapshot_page, snapshot_released, event_replay_page, event_replay_released, artifact_content_page, artifact_content_released, host_quit_inspection, or prompt_library",
+                    "operation_status, task_snapshot, snapshot_page, snapshot_released, event_replay_page, event_replay_released, artifact_content_page, artifact_content_released, host_quit_inspection, prompt_library, or task_cockpit",
                 )
             }
 
@@ -1704,6 +1718,7 @@ impl<'de> Deserialize<'de> for QueryResultVariant {
                     "artifact_content_released" => Ok(QueryResultVariant::ArtifactContentReleased),
                     "host_quit_inspection" => Ok(QueryResultVariant::HostQuitInspection),
                     "prompt_library" => Ok(QueryResultVariant::PromptLibrary),
+                    "task_cockpit" => Ok(QueryResultVariant::TaskCockpit),
                     _ => Err(de::Error::unknown_variant(
                         value,
                         &[
@@ -1717,6 +1732,7 @@ impl<'de> Deserialize<'de> for QueryResultVariant {
                             "artifact_content_released",
                             "host_quit_inspection",
                             "prompt_library",
+                            "task_cockpit",
                         ],
                     )),
                 }
@@ -2542,6 +2558,10 @@ impl<'de> Deserialize<'de> for QueryResult {
                                 de::Error::custom("invalid sealed prompt_library query result")
                             })?,
                         )
+                    }
+                    QueryResultVariant::TaskCockpit => {
+                        let result: TaskCockpitResult = map.next_value()?;
+                        QueryResult::TaskCockpit(result)
                     }
                 };
                 if map.next_key::<de::IgnoredAny>()?.is_some() {

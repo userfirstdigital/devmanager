@@ -593,6 +593,14 @@ fn argument_schema_json(schema: ActionArgumentSchema) -> serde_json::Value {
                 "action_epoch"
             ],
         }),
+        ActionArgumentSchema::TaskCockpitV1 => json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "task_id": uuid()
+            },
+            "required": ["task_id"],
+        }),
     }
 }
 

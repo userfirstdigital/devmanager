@@ -4,7 +4,9 @@
 //! launch and credential seams remain crate-private until the Task 3
 //! supervisor can issue exact process-bound authority.
 
+mod cockpit;
 mod credentials;
 mod launch;
 
+pub(crate) use cockpit::redacted_endpoints;
 pub use launch::{ssh_runtime_outcome, SshRuntimeOutcome, SshUnavailableReason};

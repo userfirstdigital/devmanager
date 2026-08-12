@@ -14,11 +14,14 @@ pub mod preferences;
 pub mod subscription;
 
 pub use action::{
-    action_enabled_with_service_state, catalog, require_unique_ids, service_action_disabled_reason,
-    service_control_command, task_show_query, ActionDescriptor, ActionRisk, ActionScope,
-    ServiceControlActionError, ServiceControlArguments, ACTION_HOST_ACTIONS, ACTION_HOST_STATUS,
-    ACTION_SERVICE_HEALTH, ACTION_SERVICE_LOGS, ACTION_SERVICE_RESTART, ACTION_SERVICE_START,
-    ACTION_SERVICE_STOP, ACTION_TASK_SHOW,
+    action_enabled_with_service_state, catalog, cockpit_surface_descriptors, require_unique_ids,
+    service_action_disabled_reason, service_control_command, service_control_command_with_task,
+    task_cockpit_query, task_show_query, ActionDescriptor, ActionRisk, ActionScope,
+    CockpitSurfaceAccess, CockpitSurfaceDescriptor, CockpitSurfaceKind, ServiceControlActionError,
+    ServiceControlArguments, ACTION_FILES_LIST, ACTION_FILES_READ, ACTION_GIT_STATUS,
+    ACTION_HOST_ACTIONS, ACTION_HOST_STATUS, ACTION_SERVICE_HEALTH, ACTION_SERVICE_LOGS,
+    ACTION_SERVICE_RESTART, ACTION_SERVICE_START, ACTION_SERVICE_STOP, ACTION_SSH_STATUS,
+    ACTION_TASK_SHOW, ACTION_WORKSPACE_STATUS,
 };
 pub use cli::{dispatch_ctl_from_args, parse_ctl_args, run_ctl, CliError, CtlCommand};
 pub use composer::{
@@ -37,7 +40,7 @@ pub use inbox_controller::{
 pub(crate) use model::normalize_bounded_search_text;
 pub use model::{
     ClientBrowserDockView, ClientModel, ClientModelBuilder, ClientModelError, SearchContinuation,
-    SearchPage, SearchPageStatus,
+    SearchPage, SearchPageStatus, TaskCockpitSurfaceProjection,
 };
 pub use port::{
     ApprovalAnswerCall, HostCommandPort, HostPortError, PromptMetadataItem, PromptMetadataPage,

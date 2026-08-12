@@ -2,6 +2,7 @@ pub mod agent;
 pub mod artifact;
 pub mod browser;
 pub(crate) mod canonical;
+pub mod cockpit;
 pub mod codec;
 pub mod command;
 pub mod event;
@@ -24,6 +25,14 @@ pub use artifact::{
     ArtifactContentRef, ArtifactFacts, ArtifactKind, ArtifactSummary, ArtifactValidationError,
     PrivacyClass, SpecialistResult, SpecialistStatus, MAX_SPECIALIST_ID_REFS,
     MAX_SPECIALIST_RAW_ARTIFACT_BYTES, MAX_SPECIALIST_TEXT_BYTES,
+};
+pub use cockpit::{
+    cockpit_surface, git_projection, relative_path_is_safe, workspace_projection,
+    TaskCockpitDeniedReason, TaskCockpitQuery, TaskCockpitResult, TaskCockpitSurface,
+    TaskCockpitUnavailableReason, TaskFileEntry, TaskFilesListProjection, TaskFilesReadProjection,
+    TaskGitProjection, TaskServiceProjection, TaskServiceRuntimeState, TaskServiceScope,
+    TaskServiceSnapshot, TaskSshEndpoint, TaskSshProjection, TaskWorkspaceKind,
+    TaskWorkspaceProjection, MAX_COCKPIT_FILE_LIST, MAX_COCKPIT_READ_BYTES,
 };
 pub use codec::{
     decode_orchestration_msgpack, encode_orchestration_msgpack, preflight_msgpack,
@@ -50,10 +59,11 @@ pub use host::{
 };
 pub use id::{
     AgentSessionId, ApprovalId, ArtifactId, BrowserContextId, BrowserRequestId, BrowserSessionId,
-    BrowserTabId, ClientId, CommandId, EnvironmentId, EventId, IdError, OperationId, OutboxId,
-    ProjectId, PromptChainId, PromptChainLinkId, PromptHistoryId, PromptId, PromptVersionId,
-    QuestionId, RequestId, ResourceId, ServiceId, SnapshotId, SubscriptionId, TaskId, TaskInviteId,
-    TerminalId, TransferId, TurnId,
+    BrowserTabId, ClientId, CommandId, ConfiguredServiceId, ConfiguredServiceIdError, EnvironmentId,
+    EventId, IdError, OperationId, OutboxId, ProjectId, PromptChainId, PromptChainLinkId,
+    PromptHistoryId, PromptId, PromptVersionId, QuestionId, RequestId, ResourceId, ServiceId,
+    SnapshotId, SubscriptionId, TaskId, TaskInviteId, TerminalId, TransferId, TurnId,
+    MAX_CONFIGURED_SERVICE_ID_BYTES,
 };
 pub use operation::{
     validate_outcome_fence, validate_source_for_kind, validate_terminal_fact_source,

@@ -5,7 +5,11 @@
 //! env maps are not trusted; cwd and env layering come from project/folder/
 //! command config (plus an optional host-resolved folder env-file overlay).
 
-use std::{collections::BTreeMap, fmt, path::Path};
+use std::{
+    collections::BTreeMap,
+    fmt,
+    path::{Component, Path, PathBuf},
+};
 
 use crate::{
     config::{Nullable, Project, ProjectFolder, RunCommand},
@@ -104,6 +108,9 @@ pub enum BindingError {
     DuplicateCommand { command_id: String },
     ArchivedCommand,
     InvalidWorkspaceRoot,
+    InvalidEnvFilePath,
+    EnvFileOutsideWorkspace,
+    OwnershipMismatch,
     Validation(ValidationError),
 }
 
@@ -117,6 +124,15 @@ impl fmt::Display for BindingError {
             Self::ArchivedCommand => formatter.write_str("archived configured command"),
             Self::InvalidWorkspaceRoot => {
                 formatter.write_str("configured workspace root must be absolute")
+            }
+            Self::InvalidEnvFilePath => {
+                formatter.write_str("configured env-file path is empty or unsafe")
+            }
+            Self::EnvFileOutsideWorkspace => {
+                formatter.write_str("configured env-file path resolves outside the workspace root")
+            }
+            Self::OwnershipMismatch => {
+                formatter.write_str("task workspace context requires the matching task owner")
             }
             Self::Validation(error) => error.fmt(formatter),
         }
@@ -153,7 +169,7 @@ pub fn bind_configured_command(
     let scope = source.owner.catalog_scope();
     let mut command = CommandSpec::new(source.command.command.clone())?;
     command = command.with_args(source.command.args.iter().cloned())?;
-    if let Some(cwd) = derive_workspace_cwd(source.project, source.folder) {
+    if let Some(cwd) = derive_workspace_cwd(source.project, source.folder)? {
         command = command.with_cwd(cwd)?;
     }
 
@@ -233,6 +249,82 @@ pub fn with_task_workspace_root(
     Ok(binding)
 }
 
+/// Resolve a configured folder env-file path for host overlay loading.
+///
+/// Absolute env-file paths keep absolute behavior (with traversal rejected).
+/// Relative paths resolve under `project_root` + the folder's normalized
+/// workspace-relative path and fail closed on traversal or outside-root joins.
+/// Process cwd is never consulted.
+pub fn resolve_configured_env_file_path(
+    project_root: &str,
+    folder_path: &str,
+    env_file_path: &str,
+) -> Result<PathBuf, BindingError> {
+    let env_file_path = env_file_path.trim();
+    if env_file_path.is_empty() || has_dot_dot_component(env_file_path) {
+        return Err(BindingError::InvalidEnvFilePath);
+    }
+    if is_absolute_path(env_file_path) {
+        return Ok(PathBuf::from(env_file_path));
+    }
+
+    let root = validate_absolute_workspace_root(project_root)?;
+    let folder_relative = folder_relative_under_root(project_root, folder_path)?;
+    let mut resolved = PathBuf::from(&root);
+    push_relative_components(&mut resolved, &folder_relative)?;
+    push_relative_components(&mut resolved, &normalize_relative(env_file_path))?;
+    if !lexical_path_is_under_root(&resolved, &root) {
+        return Err(BindingError::EnvFileOutsideWorkspace);
+    }
+    Ok(resolved)
+}
+
+/// Host-private context that binds one selected Task workspace root into
+/// service projection/action path resolution without exposing env values.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskServicePathContext {
+    pub task_id: crate::domain::TaskId,
+    workspace_root: String,
+}
+
+impl TaskServicePathContext {
+    pub fn try_new(
+        task_id: crate::domain::TaskId,
+        absolute_workspace_root: impl AsRef<str>,
+    ) -> Result<Self, BindingError> {
+        Ok(Self {
+            task_id,
+            workspace_root: validate_absolute_workspace_root(absolute_workspace_root.as_ref())?,
+        })
+    }
+
+    pub fn workspace_root(&self) -> &str {
+        &self.workspace_root
+    }
+
+    pub fn bind_service(
+        &self,
+        binding: ConfiguredServiceBinding,
+    ) -> Result<ConfiguredServiceBinding, BindingError> {
+        match &binding.owner {
+            ConfiguredServiceOwner::Task { task_id } if *task_id == self.task_id => {
+                with_task_workspace_root(binding, &self.workspace_root)
+            }
+            ConfiguredServiceOwner::Task { .. }
+            | ConfiguredServiceOwner::Project { .. }
+            | ConfiguredServiceOwner::Workspace { .. } => Err(BindingError::OwnershipMismatch),
+        }
+    }
+
+    pub fn resolve_env_file(
+        &self,
+        folder_path: &str,
+        env_file_path: &str,
+    ) -> Result<PathBuf, BindingError> {
+        resolve_configured_env_file_path(&self.workspace_root, folder_path, env_file_path)
+    }
+}
+
 pub fn bind_configured_services<'a>(
     sources: impl IntoIterator<Item = ConfiguredServiceSource<'a>>,
 ) -> Result<Vec<ConfiguredServiceBinding>, BindingError> {
@@ -266,19 +358,42 @@ fn validate_absolute_workspace_root(root: &str) -> Result<String, BindingError> 
     Ok(root.to_owned())
 }
 
-fn derive_workspace_cwd(project: &Project, folder: &ProjectFolder) -> Option<String> {
-    let folder_path = folder.folder_path.trim();
+fn derive_workspace_cwd(
+    project: &Project,
+    folder: &ProjectFolder,
+) -> Result<Option<String>, BindingError> {
+    let relative = folder_relative_under_root(&project.root_path, &folder.folder_path)?;
+    if relative.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(relative))
+    }
+}
+
+fn folder_relative_under_root(project_root: &str, folder_path: &str) -> Result<String, BindingError> {
+    let folder_path = folder_path.trim();
     if folder_path.is_empty() {
-        return None;
+        return Ok(String::new());
+    }
+    if has_dot_dot_component(folder_path) {
+        return Err(BindingError::EnvFileOutsideWorkspace);
     }
     if !is_absolute_path(folder_path) {
-        return Some(normalize_relative(folder_path));
+        return Ok(normalize_relative(folder_path));
     }
-    let root = project.root_path.trim();
+    let root = project_root.trim();
     if root.is_empty() {
-        return None;
+        return Err(BindingError::InvalidWorkspaceRoot);
     }
-    strip_root_prefix(folder_path, root).map(|relative| normalize_relative(&relative))
+    let path_norm = folder_path.replace('\\', "/").trim_end_matches('/').to_owned();
+    let root_norm = root.replace('\\', "/").trim_end_matches('/').to_owned();
+    if path_norm.eq_ignore_ascii_case(&root_norm) {
+        // Folder is the project root itself; relative env files resolve under root.
+        return Ok(String::new());
+    }
+    strip_root_prefix(folder_path, root)
+        .map(|relative| normalize_relative(&relative))
+        .ok_or(BindingError::EnvFileOutsideWorkspace)
 }
 
 fn is_absolute_path(path: &str) -> bool {
@@ -311,6 +426,36 @@ fn strip_root_prefix(path: &str, root: &str) -> Option<String> {
 
 fn normalize_relative(path: &str) -> String {
     path.replace('\\', "/").trim_matches('/').to_owned()
+}
+
+fn has_dot_dot_component(path: &str) -> bool {
+    Path::new(path).components().any(|component| {
+        matches!(component, Component::ParentDir)
+            || matches!(component, Component::Normal(name) if name == "..")
+    })
+}
+
+fn push_relative_components(path: &mut PathBuf, relative: &str) -> Result<(), BindingError> {
+    if relative.is_empty() {
+        return Ok(());
+    }
+    for component in Path::new(relative).components() {
+        match component {
+            Component::Normal(part) => path.push(part),
+            Component::CurDir => {}
+            Component::ParentDir => return Err(BindingError::EnvFileOutsideWorkspace),
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(BindingError::InvalidEnvFilePath);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn lexical_path_is_under_root(path: &Path, root: &str) -> bool {
+    let path_norm = path.to_string_lossy().replace('\\', "/").to_ascii_lowercase();
+    let root_norm = root.replace('\\', "/").trim_end_matches('/').to_ascii_lowercase();
+    path_norm == root_norm || path_norm.starts_with(&format!("{root_norm}/"))
 }
 
 fn layer_env(

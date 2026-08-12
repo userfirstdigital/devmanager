@@ -74,6 +74,7 @@ pub enum Capability {
     ProviderInput = 14,
     OrganizationProjection = 15,
     ServiceSupervisor = 16,
+    TaskCockpit = 17,
 }
 
 impl Capability {
@@ -101,6 +102,7 @@ impl Capability {
             Self::ProviderInput => "provider_input",
             Self::OrganizationProjection => "organization_projection",
             Self::ServiceSupervisor => "service_supervisor",
+            Self::TaskCockpit => "task_cockpit",
         }
     }
 }
@@ -147,5 +149,26 @@ impl CapabilitySet {
     /// Personal prompt library frames stay on the host / owner-device path.
     pub const fn grants_personal_prompt_library(self) -> bool {
         self.contains(Capability::PromptProjection)
+    }
+
+    pub const fn grants_task_cockpit(self) -> bool {
+        self.contains(Capability::TaskCockpit)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Capability, CapabilitySet};
+
+    #[test]
+    fn task_cockpit_wire_name_and_bit_are_stable_and_not_service_supervisor() {
+        assert_eq!(Capability::TaskCockpit.wire_name(), "task_cockpit");
+        assert_eq!(Capability::TaskCockpit.bit(), 1_u64 << 17);
+        assert_eq!(Capability::ServiceSupervisor.wire_name(), "service_supervisor");
+        assert_eq!(Capability::ServiceSupervisor.bit(), 1_u64 << 16);
+        let granted = CapabilitySet::from_capabilities([Capability::TaskCockpit]);
+        assert!(granted.grants_task_cockpit());
+        assert!(!granted.contains(Capability::ServiceSupervisor));
+        assert!(!CapabilitySet::empty().grants_task_cockpit());
     }
 }

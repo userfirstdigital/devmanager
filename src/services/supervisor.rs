@@ -163,7 +163,10 @@ impl From<crate::services::binding::BindingError> for SupervisorError {
             }
             crate::services::binding::BindingError::DuplicateCommand { .. }
             | crate::services::binding::BindingError::ArchivedCommand
-            | crate::services::binding::BindingError::InvalidWorkspaceRoot => {
+            | crate::services::binding::BindingError::InvalidWorkspaceRoot
+            | crate::services::binding::BindingError::InvalidEnvFilePath
+            | crate::services::binding::BindingError::EnvFileOutsideWorkspace
+            | crate::services::binding::BindingError::OwnershipMismatch => {
                 Self::Binding(ValidationError::InvalidIdentifier {
                     field: crate::services::model::ValidationField::Cwd,
                 })

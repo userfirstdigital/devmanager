@@ -49,9 +49,8 @@ impl ServicePanelAction {
             Self::Start => Some(SupervisorAction::Start),
             Self::Stop => Some(SupervisorAction::Stop),
             Self::Restart => Some(SupervisorAction::Restart),
-            Self::Logs => Some(SupervisorAction::Logs),
-            Self::Health => Some(SupervisorAction::Health),
-            Self::OpenTerminal => None,
+            // Logs/Health stay unbound until typed host operations exist.
+            Self::Logs | Self::Health | Self::OpenTerminal => None,
         }
     }
 }
@@ -186,14 +185,22 @@ fn project_row(snapshot: &RedactedServiceSnapshot, dependencies: &[ServiceId]) -
                 None
             },
         ),
-        affordance(ServicePanelAction::Logs, true, None),
-        affordance(ServicePanelAction::Health, true, None),
+        affordance(
+            ServicePanelAction::Logs,
+            false,
+            Some("Service log query is not available until a typed host operation exists"),
+        ),
+        affordance(
+            ServicePanelAction::Health,
+            false,
+            Some("Service health query is not available until a typed host operation exists"),
+        ),
         // OpenTerminal has no supervisor/host action yet; keep it visible but
         // disabled with a truthful reason rather than advertising a dead path.
         affordance(
             ServicePanelAction::OpenTerminal,
             false,
-            Some("Service terminal attach is not available; use Logs"),
+            Some("Service terminal attach is not available"),
         ),
     ];
     ServicePanelRow {

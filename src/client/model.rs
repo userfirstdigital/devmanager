@@ -1211,6 +1211,24 @@ impl ClientModel {
             })
     }
 
+    /// Fail-closed Task Cockpit workspace/git/files/ssh/service surface map.
+    ///
+    /// Missing tasks return `None`. Absolute workspace paths are never copied
+    /// into this projection. ServiceControl start/stop/restart and typed
+    /// TaskCockpit queries are advertised; logs/health/writes stay unavailable.
+    pub fn task_cockpit_surfaces(
+        &self,
+        task_id: TaskId,
+    ) -> Option<TaskCockpitSurfaceProjection> {
+        if !self.tasks.contains_key(&task_id) {
+            return None;
+        }
+        Some(TaskCockpitSurfaceProjection {
+            task_id,
+            surfaces: crate::client::action::cockpit_surface_descriptors().to_vec(),
+        })
+    }
+
     /// Shared bound check for frozen replay continuation cursors/pages.
     pub fn check_replay_continuation_bounds(
         page_count: usize,
@@ -1951,6 +1969,42 @@ impl ClientBrowserDockView {
             generation,
             shareable_url,
             tab_count,
+        })
+    }
+}
+
+/// Task-scoped cockpit surface projection. Carries no host paths or secrets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskCockpitSurfaceProjection {
+    pub task_id: TaskId,
+    pub surfaces: Vec<crate::client::action::CockpitSurfaceDescriptor>,
+}
+
+impl TaskCockpitSurfaceProjection {
+    pub fn available_service_controls(&self) -> impl Iterator<Item = &str> + '_ {
+        self.surfaces.iter().filter_map(|surface| {
+            if surface.kind == crate::client::action::CockpitSurfaceKind::Services
+                && surface.available
+            {
+                surface.action_id
+            } else {
+                None
+            }
+        })
+    }
+
+    pub fn unavailable_workspace_surfaces(
+        &self,
+    ) -> impl Iterator<Item = &crate::client::action::CockpitSurfaceDescriptor> + '_ {
+        self.surfaces.iter().filter(|surface| {
+            !surface.available
+                && matches!(
+                    surface.kind,
+                    crate::client::action::CockpitSurfaceKind::Workspace
+                        | crate::client::action::CockpitSurfaceKind::Git
+                        | crate::client::action::CockpitSurfaceKind::Files
+                        | crate::client::action::CockpitSurfaceKind::Ssh
+                )
         })
     }
 }
@@ -3379,5 +3433,36 @@ mod tests {
         assert_eq!(model, before);
         assert_eq!(model.tasks()[&task].task.title, "LateFail");
         assert_eq!(model.last_applied_sequence(), 3);
+    }
+
+    #[test]
+    fn task_cockpit_surfaces_fail_closed_for_unknown_task_and_omit_paths() {
+        let snap = snapshot_id(0x41);
+        let through = 1;
+        let task = task_id(0x42);
+        let model = assemble_all_sections(
+            snap,
+            through,
+            vec![page(
+                snap,
+                through,
+                SnapshotSection::Tasks,
+                None,
+                vec![SnapshotItem::Task(task_item(task, "Cockpit", None))],
+                None,
+            )],
+            Vec::new(),
+        );
+        assert!(model.task_cockpit_surfaces(task_id(0x99)).is_none());
+        let projection = model
+            .task_cockpit_surfaces(task)
+            .expect("selected task surfaces");
+        assert_eq!(projection.task_id, task);
+        let controls: Vec<_> = projection.available_service_controls().collect();
+        assert!(controls.contains(&crate::client::action::ACTION_SERVICE_START));
+        assert!(!controls.contains(&crate::client::action::ACTION_SERVICE_LOGS));
+        assert_eq!(projection.unavailable_workspace_surfaces().count(), 7);
+        assert!(!format!("{projection:?}").contains('\\'));
+        assert!(!format!("{projection:?}").contains("C:"));
     }
 }

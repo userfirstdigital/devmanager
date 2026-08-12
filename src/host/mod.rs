@@ -3,6 +3,7 @@
 //! The host lock binds to an explicitly supplied profile root and never
 //! resolves installed app-data paths on its own.
 
+mod cockpit;
 mod connection;
 mod ipc;
 mod lock;

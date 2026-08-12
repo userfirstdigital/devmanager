@@ -189,3 +189,97 @@ define_id!(PromptChainId);
 define_id!(PromptChainLinkId);
 define_id!(PromptHistoryId);
 define_id!(TaskInviteId);
+
+/// Bounded configured-service catalog identity (for example `api`).
+///
+/// This is not [`ServiceId`]. `ServiceId` is a UUIDv7 domain resource identity.
+/// Host converts [`ConfiguredServiceId`] into `crate::services::model::ServiceId`
+/// exactly once at the supervisor boundary.
+#[derive(Clone, Debug, Eq, PartialEq, PartialOrd, Ord, Hash)]
+pub struct ConfiguredServiceId(String);
+
+pub const MAX_CONFIGURED_SERVICE_ID_BYTES: usize = 64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfiguredServiceIdError {
+    Empty,
+    TooLong,
+    InvalidIdentifier,
+}
+
+impl fmt::Display for ConfiguredServiceIdError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => write!(f, "configured service id is empty"),
+            Self::TooLong => write!(
+                f,
+                "configured service id exceeds {MAX_CONFIGURED_SERVICE_ID_BYTES} bytes"
+            ),
+            Self::InvalidIdentifier => write!(f, "configured service id is not a bounded identifier"),
+        }
+    }
+}
+
+impl std::error::Error for ConfiguredServiceIdError {}
+
+impl ConfiguredServiceId {
+    pub fn new(value: impl Into<String>) -> Result<Self, ConfiguredServiceIdError> {
+        let value = value.into();
+        if value.is_empty() {
+            return Err(ConfiguredServiceIdError::Empty);
+        }
+        if value.len() > MAX_CONFIGURED_SERVICE_ID_BYTES {
+            return Err(ConfiguredServiceIdError::TooLong);
+        }
+        if value.starts_with('.')
+            || value.contains('\0')
+            || !value.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+            })
+        {
+            return Err(ConfiguredServiceIdError::InvalidIdentifier);
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ConfiguredServiceId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl Serialize for ConfiguredServiceId {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for ConfiguredServiceId {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(de::Error::custom)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ConfiguredServiceId, ServiceId};
+
+    #[test]
+    fn configured_catalog_id_rejects_empty_and_stays_distinct_from_uuid_service_id() {
+        assert!(ConfiguredServiceId::new("").is_err());
+        assert!(ConfiguredServiceId::new("api").is_ok());
+        assert!(ServiceId::parse("api").is_err());
+        let uuid = ServiceId::new();
+        let encoded_uuid = serde_json::to_string(&uuid).expect("uuid");
+        let encoded_catalog =
+            serde_json::to_string(&ConfiguredServiceId::new("api").expect("catalog")).expect("id");
+        assert_eq!(encoded_catalog, "\"api\"");
+        assert_ne!(encoded_uuid, encoded_catalog);
+    }
+}

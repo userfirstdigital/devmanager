@@ -481,7 +481,8 @@ pub fn request_from_catalog(id: &str, input: CatalogInput) -> Result<ActionReque
         | ActionArgumentSchema::PromptMetadataPageV1
         | ActionArgumentSchema::PromptVersionPageV1
         | ActionArgumentSchema::PromptDiffV1
-        | ActionArgumentSchema::PromptChainPageV1 => Err(QualityError::InvalidControl(format!(
+        | ActionArgumentSchema::PromptChainPageV1
+        | ActionArgumentSchema::TaskCockpitV1 => Err(QualityError::InvalidControl(format!(
             "catalog action {id} requires an unsupported argument schema"
         ))),
         ActionArgumentSchema::ServiceControlV1 => match input {

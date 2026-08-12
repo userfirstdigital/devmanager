@@ -1064,11 +1064,45 @@ fn services_panel_disables_open_terminal_with_truthful_reason() {
     assert!(!open.enabled);
     assert_eq!(
         open.disabled_reason,
-        Some("Service terminal attach is not available; use Logs")
+        Some("Service terminal attach is not available")
     );
     assert!(ServicePanelAction::OpenTerminal
         .as_supervisor_action()
         .is_none());
+    let logs = panel.rows[0]
+        .actions
+        .iter()
+        .find(|action| action.action == ServicePanelAction::Logs)
+        .expect("Logs affordance");
+    assert!(!logs.enabled);
+    assert_eq!(
+        logs.disabled_reason,
+        Some("Service log query is not available until a typed host operation exists")
+    );
+    assert!(ServicePanelAction::Logs.as_supervisor_action().is_none());
+    let health = panel.rows[0]
+        .actions
+        .iter()
+        .find(|action| action.action == ServicePanelAction::Health)
+        .expect("Health affordance");
+    assert!(!health.enabled);
+    assert_eq!(
+        health.disabled_reason,
+        Some("Service health query is not available until a typed host operation exists")
+    );
+    assert!(ServicePanelAction::Health.as_supervisor_action().is_none());
+    assert_eq!(
+        ServicePanelAction::Start.as_supervisor_action(),
+        Some(devmanager::services::supervisor::SupervisorAction::Start)
+    );
+    assert_eq!(
+        ServicePanelAction::Stop.as_supervisor_action(),
+        Some(devmanager::services::supervisor::SupervisorAction::Stop)
+    );
+    assert_eq!(
+        ServicePanelAction::Restart.as_supervisor_action(),
+        Some(devmanager::services::supervisor::SupervisorAction::Restart)
+    );
 }
 
 #[test]
@@ -1182,6 +1216,31 @@ fn empty_or_relative_workspace_root_fails_closed_at_bind_and_task_override() {
         with_task_workspace_root(overridden, "relative/task"),
         Err(BindingError::InvalidWorkspaceRoot)
     ));
+
+    let mut outside = folder.clone();
+    outside.folder_path = "C:/outside".to_owned();
+    assert_eq!(
+        bind_configured_command(ConfiguredServiceSource {
+            project: &project,
+            folder: &outside,
+            command: &command,
+            owner: ConfiguredServiceOwner::Task { task_id: task_a() },
+            folder_env_file: None,
+        }),
+        Err(BindingError::EnvFileOutsideWorkspace)
+    );
+
+    let mut root_folder = folder.clone();
+    root_folder.folder_path = project.root_path.clone();
+    let root_binding = bind_configured_command(ConfiguredServiceSource {
+        project: &project,
+        folder: &root_folder,
+        command: &command,
+        owner: ConfiguredServiceOwner::Task { task_id: task_a() },
+        folder_env_file: None,
+    })
+    .expect("project-root folder");
+    assert!(root_binding.definition.command.cwd().is_none());
 }
 
 #[test]
@@ -1326,4 +1385,199 @@ fn service_launch_issuer_rejects_mismatched_capability() {
         )
         .expect_err("stale generation");
     assert!(err.contains("stale"));
+}
+
+#[test]
+fn relative_env_file_resolves_under_project_root_and_rejects_traversal() {
+    use devmanager::services::binding::{resolve_configured_env_file_path, BindingError};
+
+    let resolved = resolve_configured_env_file_path("C:/repo", "apps/api", ".env.local")
+        .expect("relative env file under folder");
+    let normalized = resolved
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase();
+    assert!(
+        normalized.ends_with("c:/repo/apps/api/.env.local"),
+        "unexpected resolved path {normalized}"
+    );
+
+    let absolute = resolve_configured_env_file_path(
+        "C:/repo",
+        "apps/api",
+        "C:/elsewhere/production.env",
+    )
+    .expect("absolute env file preserved");
+    assert_eq!(
+        absolute
+            .to_string_lossy()
+            .replace('\\', "/")
+            .to_ascii_lowercase(),
+        "c:/elsewhere/production.env"
+    );
+
+    let traversal = resolve_configured_env_file_path("C:/repo", "apps/api", "../secrets.env");
+    assert!(matches!(
+        traversal,
+        Err(BindingError::InvalidEnvFilePath | BindingError::EnvFileOutsideWorkspace)
+    ));
+
+    let root_folder = resolve_configured_env_file_path("C:/repo", "C:/repo", ".env")
+        .expect("folder equal to project root is the root folder");
+    assert!(root_folder
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase()
+        .ends_with("c:/repo/.env"));
+
+    let outside_folder = resolve_configured_env_file_path("C:/repo", "C:/other", ".env");
+    assert_eq!(outside_folder, Err(BindingError::EnvFileOutsideWorkspace));
+}
+
+#[test]
+fn task_service_path_context_binds_workspace_root_without_env_values() {
+    use devmanager::config::{Nullable, Project, ProjectFolder, RunCommand};
+    use devmanager::domain::TaskId;
+    use devmanager::services::binding::{
+        bind_configured_command, ConfiguredServiceOwner, ConfiguredServiceSource,
+        TaskServicePathContext,
+    };
+    use std::collections::BTreeMap;
+
+    let task_id = TaskId::parse("0198b6b0-0000-7000-8000-000000000001").expect("task");
+    let context = TaskServicePathContext::try_new(task_id, "C:/task-worktree")
+        .expect("absolute task root");
+    let env = context
+        .resolve_env_file("apps/api", ".env")
+        .expect("task-relative env");
+    assert!(env
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase()
+        .ends_with("c:/task-worktree/apps/api/.env"));
+
+    let command = RunCommand {
+        id: "api".to_owned(),
+        label: "API".to_owned(),
+        command: "node".to_owned(),
+        args: vec![],
+        env: Nullable::Absent,
+        port: Nullable::Absent,
+        auto_restart: Nullable::Value(false),
+        ..RunCommand::default()
+    };
+    let folder = ProjectFolder {
+        id: "web".to_owned(),
+        name: "web".to_owned(),
+        folder_path: "apps/api".to_owned(),
+        commands: vec![command.clone()],
+        ..ProjectFolder::default()
+    };
+    let project = Project {
+        id: "proj".to_owned(),
+        name: "proj".to_owned(),
+        root_path: "C:/repo".to_owned(),
+        folders: vec![folder.clone()],
+        ..Project::default()
+    };
+    let mut folder_env = BTreeMap::new();
+    folder_env.insert("TOKEN".to_owned(), "secret-value".to_owned());
+    let binding = bind_configured_command(ConfiguredServiceSource {
+        project: &project,
+        folder: &folder,
+        command: &command,
+        owner: ConfiguredServiceOwner::Task { task_id },
+        folder_env_file: Some(&folder_env),
+    })
+    .expect("binding");
+    let rebound = context.bind_service(binding).expect("task root bind");
+    assert_eq!(rebound.workspace_root, "C:/task-worktree");
+    assert!(!format!("{:?}", rebound.environment).contains("secret-value"));
+
+    let host_owned = bind_configured_command(ConfiguredServiceSource {
+        project: &project,
+        folder: &folder,
+        command: &command,
+        owner: ConfiguredServiceOwner::Workspace {
+            project_id: project.id.clone(),
+            folder_id: folder.id.clone(),
+        },
+        folder_env_file: None,
+    })
+    .expect("workspace binding");
+    assert_eq!(
+        context.bind_service(host_owned),
+        Err(devmanager::services::binding::BindingError::OwnershipMismatch)
+    );
+
+    let other_task = TaskId::parse("0198b6b0-0000-7000-8000-000000000099").expect("other");
+    let foreign = bind_configured_command(ConfiguredServiceSource {
+        project: &project,
+        folder: &folder,
+        command: &command,
+        owner: ConfiguredServiceOwner::Task {
+            task_id: other_task,
+        },
+        folder_env_file: None,
+    })
+    .expect("foreign task binding");
+    assert_eq!(
+        context.bind_service(foreign),
+        Err(devmanager::services::binding::BindingError::OwnershipMismatch)
+    );
+}
+
+#[test]
+fn task_service_cockpit_projection_excludes_foreign_task_scope() {
+    use devmanager::domain::TaskId;
+    use devmanager::services::cockpit::TaskServiceCockpitProjection;
+    use devmanager::services::health::{
+        EvidenceProvenance, EvidenceSource, HealthAxis, LifecycleAxis, OwnershipAxis, PortAxis,
+        ProcessAxis, RedactedServiceSnapshot, ServiceEvidence,
+    };
+    use devmanager::services::model::ServiceScope;
+
+    let task_a = TaskId::parse("0198b6b0-0000-7000-8000-000000000001").expect("task a");
+    let task_b = TaskId::parse("0198b6b0-0000-7000-8000-000000000002").expect("task b");
+    let evidence = ServiceEvidence {
+        lifecycle: LifecycleAxis::Stopped,
+        process: ProcessAxis::Stopped,
+        health: HealthAxis::Disabled,
+        port: PortAxis::Free,
+        ownership: OwnershipAxis::Host,
+        generation: 1,
+        epoch: 1,
+        observed_at_ms: 1_000,
+        provenance: EvidenceProvenance {
+            source: EvidenceSource::Admission,
+            observed_at_ms: 1_000,
+            generation: Some(1),
+            epoch: Some(1),
+        },
+    };
+    let snapshots = vec![
+        RedactedServiceSnapshot::from_evidence(
+            id("host-db"),
+            ServiceScope::Host,
+            &evidence,
+        ),
+        RedactedServiceSnapshot::from_evidence(
+            id("api-a"),
+            ServiceScope::task(task_a),
+            &evidence,
+        ),
+        RedactedServiceSnapshot::from_evidence(
+            id("api-b"),
+            ServiceScope::task(task_b),
+            &evidence,
+        ),
+    ];
+    let projection = TaskServiceCockpitProjection::from_host_snapshots(task_a, &snapshots);
+    let ids: Vec<_> = projection
+        .snapshots
+        .iter()
+        .map(|snapshot| snapshot.service_id.as_str().to_owned())
+        .collect();
+    assert_eq!(ids, vec!["host-db".to_owned(), "api-a".to_owned()]);
+    assert!(!format!("{projection:?}").contains("secret"));
 }

@@ -62,6 +62,7 @@ pub fn action_for_client_request(request: &ClientRequest) -> Option<(ActionId, O
                 Query::OperationStatus { .. } => ActionId::READ_OPERATION,
                 Query::InspectHostQuit => ActionId::READ_OPERATION,
                 Query::PromptLibrary(_) => ActionId::READ_PERSONAL_PROMPTS,
+                Query::TaskCockpit(_) => ActionId::READ_TASK,
             };
             Some((action, envelope.task_id))
         }

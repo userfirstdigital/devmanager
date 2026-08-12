@@ -10,7 +10,7 @@ use crate::config::{Nullable, Project, ProjectFolder, RunCommand};
 use crate::domain::TaskId;
 use crate::process::ports::PortAuthority;
 use crate::services::binding::{
-    bind_configured_command, bind_configured_services, ConfiguredServiceOwner,
+    bind_configured_command, bind_configured_services, BindingError, ConfiguredServiceOwner,
     ConfiguredServiceSource,
 };
 use crate::services::health::{ProbeOutcome, ServiceState, StatusTone};
@@ -233,14 +233,27 @@ fn binding_rejects_secret_arguments_and_derives_cwd_from_folder() {
     command.args.clear();
     let mut absolute_folder = folder.clone();
     absolute_folder.folder_path = "C:/outside".to_owned();
+    assert_eq!(
+        bind_configured_command(ConfiguredServiceSource {
+            project: &project,
+            folder: &absolute_folder,
+            command: &command,
+            owner: ConfiguredServiceOwner::Task { task_id: task_a() },
+            folder_env_file: None,
+        }),
+        Err(BindingError::EnvFileOutsideWorkspace)
+    );
+
+    let mut root_folder = folder.clone();
+    root_folder.folder_path = project.root_path.clone();
     let binding = bind_configured_command(ConfiguredServiceSource {
         project: &project,
-        folder: &absolute_folder,
+        folder: &root_folder,
         command: &command,
         owner: ConfiguredServiceOwner::Task { task_id: task_a() },
         folder_env_file: None,
     })
-    .expect("absolute folder outside project root omits cwd");
+    .expect("project-root folder has no extra cwd");
     assert!(binding.definition.command.cwd().is_none());
 }
 
@@ -747,4 +760,38 @@ fn bind_configured_services_rejects_duplicates() {
         folder_env_file: None,
     };
     assert!(bind_configured_services([source.clone(), source]).is_err());
+}
+
+#[test]
+fn process_manager_reuses_one_configured_supervisor() {
+    let root = tempfile::tempdir().expect("workspace root");
+    let (mut project, folder, command) = project_fixture();
+    project.root_path = root.path().to_string_lossy().into_owned();
+    let manager = crate::services::ProcessManager::new();
+    let host = HostId::new(7);
+    let source = ConfiguredServiceSource {
+        project: &project,
+        folder: &folder,
+        command: &command,
+        owner: ConfiguredServiceOwner::Workspace {
+            project_id: project.id.clone(),
+            folder_id: folder.id.clone(),
+        },
+        folder_env_file: None,
+    };
+    manager
+        .ensure_configured_service_supervisor([source.clone()], host, 1)
+        .expect("first supervisor bind");
+    let first = manager
+        .configured_service_snapshots()
+        .expect("first snapshots");
+    manager
+        .ensure_configured_service_supervisor([source], host, 2)
+        .expect("reuse must not rebuild");
+    let second = manager
+        .configured_service_snapshots()
+        .expect("reused snapshots");
+    assert_eq!(first, second);
+    assert_eq!(first[0].service_id.as_str(), "api");
+    assert_eq!(first[0].generation, second[0].generation);
 }

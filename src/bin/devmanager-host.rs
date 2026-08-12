@@ -1002,6 +1002,7 @@ async fn serve_foreground_host(
                 Capability::HostShutdown,
                 Capability::ProviderInput,
                 Capability::OrganizationProjection,
+                Capability::TaskCockpit,
             ]
             .into_iter()
             .chain(

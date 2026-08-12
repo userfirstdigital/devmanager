@@ -13,6 +13,7 @@ use crate::domain::id::{
     ArtifactId, CommandId, OperationId, RequestId, SnapshotId, SubscriptionId, TaskId,
 };
 use crate::domain::operation::OperationState;
+use crate::domain::cockpit::TaskCockpitQuery;
 use crate::domain::query::{Query, QueryEnvelope, QueryError, QueryOutcome, QueryResult};
 use crate::domain::snapshot::{
     ArtifactContentPage, EventPage, SnapshotPage, SnapshotSection, TaskSnapshotItem,
@@ -27,7 +28,7 @@ use crate::protocol::{
     ServerHello,
 };
 
-use super::action::task_show_query;
+use super::action::{task_cockpit_query, task_show_query};
 use super::connection::{connect, ClientConnection, UnsolicitedServerMessage};
 use super::inbox_controller::{InboxTransport, InboxTransportFuture};
 use super::subscription::{ClientSubscription, SubscriptionError, SubscriptionUpdate};
@@ -381,6 +382,43 @@ impl HostClient {
             QueryOutcome::Ok(_) => {
                 self.retire_connection();
                 Err(IpcError::UnexpectedResponse)
+            }
+        }
+    }
+
+    /// Query one Task Cockpit surface. Requires granted TaskCockpit and an
+    /// exact selected Task identity in the envelope.
+    pub async fn query_task_cockpit(
+        &mut self,
+        task_id: TaskId,
+        query: TaskCockpitQuery,
+    ) -> Result<Result<crate::domain::TaskCockpitResult, QueryError>, IpcError> {
+        if !self.server_hello.granted.grants_task_cockpit() {
+            return Err(IpcError::UnsupportedCapability);
+        }
+
+        let request_id = RequestId::new();
+        let client_id = self.config.client_id;
+        let outcome = {
+            let connection = self.live_connection()?;
+            connection
+                .query(task_cockpit_query(request_id, client_id, task_id, query))
+                .await
+        };
+        let reply = match outcome {
+            Ok(reply) => reply,
+            Err(error) => {
+                self.retire_connection();
+                return Err(error);
+            }
+        };
+
+        match reply.outcome {
+            QueryOutcome::Err(error) => Ok(Err(error)),
+            QueryOutcome::Ok(QueryResult::TaskCockpit(result)) => Ok(Ok(result)),
+            QueryOutcome::Ok(_) => {
+                self.retire_connection();
+                Err(IpcError::CorrelationMismatch)
             }
         }
     }
@@ -1061,7 +1099,8 @@ fn correlate_operation_status(
         | QueryResult::ArtifactContentPage { .. }
         | QueryResult::ArtifactContentReleased { .. }
         | QueryResult::HostQuitInspection { .. }
-        | QueryResult::PromptLibrary(_) => Err(IpcError::UnexpectedResponse),
+        | QueryResult::PromptLibrary(_)
+        | QueryResult::TaskCockpit(_) => Err(IpcError::UnexpectedResponse),
     }
 }
 

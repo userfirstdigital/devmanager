@@ -421,6 +421,180 @@ mod workspace_security_tests {
             .expect("task lookup after substitution")
             .is_none());
     }
+
+    #[test]
+    fn task_cockpit_requires_capability_exact_task_and_rejects_path_traversal() {
+        let repository = tempfile::tempdir().expect("temporary repository");
+        let output = ProcessCommand::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(repository.path())
+            .output()
+            .expect("git init");
+        assert!(output.status.success());
+
+        let database = repository.path().join("cockpit.sqlite");
+        let mut bus = CommandBus::open(&database).expect("host command bus");
+        let client_id = ClientId::new();
+        let task_id = TaskId::new();
+        let project_id = ProjectId::new();
+        let project_roots =
+            WorkspaceProjectRoots::try_from_pairs([(project_id, repository.path().to_path_buf())])
+                .expect("host project roots");
+        let create = CommandEnvelope {
+            command_id: CommandId::new(),
+            client_id,
+            task_id: None,
+            issued_at_ms: 1_725_000_000_200,
+            expected_task_revision: None,
+            command: Command::CreateTaskV2(CreateTaskRequestIntent {
+                id: task_id,
+                environment_id: EnvironmentId::new(),
+                title: "Cockpit task".into(),
+                description: None,
+                project_id,
+                workspace: WorkspaceRequest::main(),
+                assignment: TaskAssignment::LocalOwner,
+                created_at_ms: 1_725_000_000_200,
+                connectivity: TaskConnectivity::Connected,
+                attention: TaskAttention::None,
+                activity: TaskActivity::Idle,
+                review_readiness: ReviewReadiness::NotReady,
+            }),
+        };
+        dispatch_authenticated_request_with_workspace_projects(
+            client_id,
+            CapabilitySet::empty(),
+            &mut bus,
+            &project_roots,
+            ClientRequest::Command(create),
+        )
+        .expect("create task");
+
+        let denied = dispatch_authenticated_request_with_workspace_projects(
+            client_id,
+            CapabilitySet::empty(),
+            &mut bus,
+            &project_roots,
+            ClientRequest::Query(crate::domain::query::QueryEnvelope {
+                request_id: crate::domain::RequestId::new(),
+                client_id,
+                task_id: Some(task_id),
+                query: crate::domain::query::Query::TaskCockpit(
+                    crate::domain::TaskCockpitQuery::WorkspaceStatus,
+                ),
+            }),
+        )
+        .expect("capability denial is a typed query reply");
+        let crate::protocol::ServerMessage::QueryReply(reply) = denied else {
+            panic!("expected query reply");
+        };
+        assert!(matches!(
+            reply.outcome,
+            crate::domain::query::QueryOutcome::Err(
+                crate::domain::query::QueryError::UnsupportedCapability
+            )
+        ));
+
+        let granted = crate::protocol::CapabilitySet::from_capabilities([
+            crate::protocol::Capability::TaskCockpit,
+        ]);
+        let missing = dispatch_authenticated_request_with_workspace_projects(
+            client_id,
+            granted,
+            &mut bus,
+            &project_roots,
+            ClientRequest::Query(crate::domain::query::QueryEnvelope {
+                request_id: crate::domain::RequestId::new(),
+                client_id,
+                task_id: Some(TaskId::new()),
+                query: crate::domain::query::Query::TaskCockpit(
+                    crate::domain::TaskCockpitQuery::WorkspaceStatus,
+                ),
+            }),
+        )
+        .expect("missing task");
+        let crate::protocol::ServerMessage::QueryReply(reply) = missing else {
+            panic!("expected query reply");
+        };
+        assert!(matches!(
+            reply.outcome,
+            crate::domain::query::QueryOutcome::Ok(
+                crate::domain::query::QueryResult::TaskCockpit(
+                    crate::domain::TaskCockpitResult::Denied {
+                        reason: crate::domain::TaskCockpitDeniedReason::MissingTask,
+                        ..
+                    }
+                )
+            )
+        ));
+
+        let workspace = dispatch_authenticated_request_with_workspace_projects(
+            client_id,
+            granted,
+            &mut bus,
+            &project_roots,
+            ClientRequest::Query(crate::domain::query::QueryEnvelope {
+                request_id: crate::domain::RequestId::new(),
+                client_id,
+                task_id: Some(task_id),
+                query: crate::domain::query::Query::TaskCockpit(
+                    crate::domain::TaskCockpitQuery::WorkspaceStatus,
+                ),
+            }),
+        )
+        .expect("workspace");
+        let crate::protocol::ServerMessage::QueryReply(reply) = workspace else {
+            panic!("expected query reply");
+        };
+        let crate::domain::query::QueryOutcome::Ok(
+            crate::domain::query::QueryResult::TaskCockpit(
+                crate::domain::TaskCockpitResult::Workspace(projection),
+            ),
+        ) = reply.outcome
+        else {
+            panic!("expected workspace projection, got {:?}", reply.outcome);
+        };
+        assert_eq!(projection.task_id, task_id);
+        assert!(projection.bound);
+        let encoded = serde_json::to_string(&projection).expect("encode");
+        assert!(
+            !encoded.contains(&repository.path().to_string_lossy().to_string()),
+            "workspace projection must not leak the filesystem path"
+        );
+
+        let traversal = dispatch_authenticated_request_with_workspace_projects(
+            client_id,
+            granted,
+            &mut bus,
+            &project_roots,
+            ClientRequest::Query(crate::domain::query::QueryEnvelope {
+                request_id: crate::domain::RequestId::new(),
+                client_id,
+                task_id: Some(task_id),
+                query: crate::domain::query::Query::TaskCockpit(
+                    crate::domain::TaskCockpitQuery::FilesRead {
+                        relative_path: "../secret.env".into(),
+                        max_bytes: 32,
+                    },
+                ),
+            }),
+        )
+        .expect("traversal");
+        let crate::protocol::ServerMessage::QueryReply(reply) = traversal else {
+            panic!("expected query reply");
+        };
+        assert!(matches!(
+            reply.outcome,
+            crate::domain::query::QueryOutcome::Ok(
+                crate::domain::query::QueryResult::TaskCockpit(
+                    crate::domain::TaskCockpitResult::Denied {
+                        surface: crate::domain::TaskCockpitSurface::Files,
+                        reason: crate::domain::TaskCockpitDeniedReason::PathTraversal,
+                    }
+                )
+            )
+        ));
+    }
 }
 
 /// Typed intentional exit from a supervised [`HostRequestExecutor`].
@@ -1271,19 +1445,32 @@ impl ConfiguredServiceRuntime {
         // Resolve folder env files on the host before handing source references
         // to the binding layer. Values remain in the redacted supervisor
         // overlay; they never enter the action catalog or a client projection.
+        // Relative env-file paths resolve under project root + folder path and
+        // fail closed on traversal; absolute paths keep absolute behavior.
         let mut env_files = Vec::new();
         for project in &config.projects {
             for folder in &project.folders {
-                let env = folder.env_file_path.as_ref().and_then(|path| {
-                    let path = std::path::Path::new(&folder.folder_path).join(path);
-                    crate::services::env_service::read_env_map(&path)
-                        .ok()
-                        .map(|values| {
-                            values
-                                .into_iter()
-                                .collect::<std::collections::BTreeMap<_, _>>()
-                        })
-                });
+                let env = match folder.env_file_path.as_ref() {
+                    None => None,
+                    Some(path) => {
+                        // Containment/path-validation errors fail closed and
+                        // prevent supervisor initialization. A valid path whose
+                        // file is missing or unreadable stays an optional overlay.
+                        let resolved = crate::services::resolve_configured_env_file_path(
+                            &project.root_path,
+                            &folder.folder_path,
+                            path,
+                        )
+                        .ok()?;
+                        crate::services::env_service::read_env_map(&resolved)
+                            .ok()
+                            .map(|values| {
+                                values
+                                    .into_iter()
+                                    .collect::<std::collections::BTreeMap<_, _>>()
+                            })
+                    }
+                };
                 env_files.push(env);
             }
         }
@@ -1358,6 +1545,10 @@ impl HostWorkspaceAdmission {
 
     fn runtime_generation(&self) -> u64 {
         self.issuer.runtime_generation()
+    }
+
+    fn redacted_ssh_endpoints(&self) -> Vec<crate::domain::TaskSshEndpoint> {
+        crate::ssh::redacted_endpoints(&self.store.snapshot().config.ssh_connections)
     }
 }
 
@@ -2597,6 +2788,26 @@ impl HostRequestExecutor {
                     .query_with_capabilities(negotiated.capabilities, envelope)
                     .map_err(map_store_error)
             }
+            Query::TaskCockpit(query) => {
+                let ssh_endpoints = self
+                    .config_admission
+                    .as_ref()
+                    .map(HostWorkspaceAdmission::redacted_ssh_endpoints);
+                let outcome = super::cockpit::serve_task_cockpit(
+                    negotiated.capabilities,
+                    envelope.task_id,
+                    &query,
+                    &self.bus,
+                    self.configured_service_runtime
+                        .as_ref()
+                        .map(|runtime| &runtime.manager),
+                    ssh_endpoints.as_deref(),
+                );
+                Ok(QueryReply {
+                    request_id: envelope.request_id,
+                    outcome,
+                })
+            }
             Query::OperationStatus { .. } | Query::TaskSnapshot => {
                 self.bus.query(envelope).map_err(map_store_error)
             }
@@ -3272,6 +3483,31 @@ impl HostRequestExecutor {
                     .configured_service_runtime
                     .as_mut()
                     .ok_or(IpcError::Unavailable)?;
+                let service_id = crate::services::supervisor_service_id(&intent.service_id)
+                    .map_err(|error| IpcError::Security(error.to_string()))?;
+                let scope = runtime
+                    .manager
+                    .configured_service_scope(&service_id)
+                    .map_err(|error| IpcError::Security(error.to_string()))?;
+                let requester = match scope {
+                    crate::services::model::ServiceScope::Host => {
+                        crate::services::model::AdmissionRequester::Host(
+                            crate::services::model::HostAuthority::new(runtime.host_id),
+                        )
+                    }
+                    crate::services::model::ServiceScope::Task { task_id } => {
+                        match envelope.task_id {
+                            Some(request_task) if request_task == task_id => {
+                                crate::services::model::AdmissionRequester::Task(task_id)
+                            }
+                            _ => {
+                                return Err(IpcError::Security(
+                                    "service control task scope mismatch".into(),
+                                ));
+                            }
+                        }
+                    }
+                };
                 let action = match intent.action {
                     crate::domain::command::ServiceControlAction::Start => {
                         crate::services::supervisor::SupervisorAction::Start
@@ -3287,16 +3523,13 @@ impl HostRequestExecutor {
                     .manager
                     .configured_service_control(
                         action,
-                        &crate::services::model::ServiceId::new(intent.service_id.clone())
-                            .map_err(|error| IpcError::Security(error.to_string()))?,
+                        &service_id,
                         crate::services::model::AdmissionFence::new(
                             intent.resource_generation,
                             intent.connection_epoch,
                             intent.action_epoch,
                         ),
-                        crate::services::model::AdmissionRequester::Host(
-                            crate::services::model::HostAuthority::new(runtime.host_id),
-                        ),
+                        requester,
                     )
                     .map_err(|error| IpcError::Security(error.to_string()))?;
                 CommandReceipt::Accepted {
@@ -3520,9 +3753,9 @@ pub fn dispatch_host_request(
 /// unsupported here; the single executor owns those registries.
 ///
 /// `capabilities` are the negotiated grant set from Hello; capability-gated
-/// bus queries (currently [`Query::InspectHostQuit`] and
-/// [`Query::PromptLibrary`]) fail closed here the same way
-/// [`HostRequestExecutor`] does.
+/// bus queries (currently [`Query::InspectHostQuit`],
+/// [`Query::PromptLibrary`], and [`Query::TaskCockpit`]) fail closed here
+/// the same way [`HostRequestExecutor`] does.
 pub(crate) fn dispatch_authenticated_request(
     authenticated_client_id: ClientId,
     capabilities: CapabilitySet,
@@ -3637,6 +3870,20 @@ fn dispatch_authenticated_request_inner(
                         .query_with_capabilities(capabilities, envelope)
                         .map_err(map_store_error)?;
                     return Ok(ServerMessage::QueryReply(reply));
+                }
+                Query::TaskCockpit(query) => {
+                    let outcome = super::cockpit::serve_task_cockpit(
+                        capabilities,
+                        envelope.task_id,
+                        query,
+                        bus,
+                        None,
+                        None,
+                    );
+                    return Ok(ServerMessage::QueryReply(QueryReply {
+                        request_id: envelope.request_id,
+                        outcome,
+                    }));
                 }
                 Query::OperationStatus { .. } | Query::TaskSnapshot => {}
             }

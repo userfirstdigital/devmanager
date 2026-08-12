@@ -453,6 +453,7 @@ impl CommandBus {
                 })
             }
             Query::PromptLibrary(_) => QueryOutcome::Err(QueryError::UnsupportedCapability),
+            Query::TaskCockpit(_) => QueryOutcome::Err(QueryError::UnsupportedCapability),
             Query::SnapshotPage { .. }
             | Query::ReleaseSnapshot { .. }
             | Query::OpenEventReplay { .. }

@@ -1,4 +1,5 @@
 pub mod binding;
+pub mod cockpit;
 pub mod env_service;
 pub mod health;
 pub mod launch_authority;
@@ -14,8 +15,13 @@ mod session_manager;
 pub mod supervisor;
 
 pub use binding::{
-    bind_configured_command, bind_configured_services, with_task_workspace_root, BindingError,
-    ConfiguredServiceBinding, ConfiguredServiceOwner, ConfiguredServiceSource, EnvironmentOverlay,
+    bind_configured_command, bind_configured_services, resolve_configured_env_file_path,
+    with_task_workspace_root, BindingError, ConfiguredServiceBinding, ConfiguredServiceOwner,
+    ConfiguredServiceSource, EnvironmentOverlay, TaskServicePathContext,
+};
+pub use cockpit::{
+    filter_snapshots_for_task, snapshot_visible_to_task, supervisor_service_id, to_wire_projection,
+    TaskServiceCockpitProjection,
 };
 pub use env_service::*;
 pub use health::*;

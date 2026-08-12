@@ -904,6 +904,48 @@ impl ProcessManager {
         Ok(snapshots)
     }
 
+    /// Host-owned, redacted, task-scoped snapshots for the Task Cockpit.
+    /// Foreign task-scoped services are excluded; host-scoped services remain.
+    pub(crate) fn configured_service_snapshots_for_task(
+        &self,
+        task_id: crate::domain::TaskId,
+    ) -> Result<
+        crate::services::cockpit::TaskServiceCockpitProjection,
+        crate::services::supervisor::SupervisorError,
+    > {
+        let snapshots = self.configured_service_snapshots()?;
+        Ok(
+            crate::services::cockpit::TaskServiceCockpitProjection::from_host_snapshots(
+                task_id, &snapshots,
+            ),
+        )
+    }
+
+    /// Read one service scope from the owned supervisor for fail-closed
+    /// requester selection. Does not expose command/env material.
+    pub(crate) fn configured_service_scope(
+        &self,
+        service_id: &crate::services::model::ServiceId,
+    ) -> Result<crate::services::model::ServiceScope, crate::services::supervisor::SupervisorError>
+    {
+        let guard = self
+            .inner
+            .configured_supervisor
+            .lock()
+            .map_err(|_| crate::services::supervisor::SupervisorError::TeardownFailed)?;
+        let supervisor = guard
+            .as_ref()
+            .ok_or(crate::services::supervisor::SupervisorError::TeardownFailed)?;
+        supervisor
+            .catalog_definitions()
+            .into_iter()
+            .find(|definition| definition.id == *service_id)
+            .map(|definition| definition.scope().clone())
+            .ok_or_else(|| {
+                crate::services::supervisor::SupervisorError::UnknownService(service_id.clone())
+            })
+    }
+
     /// Additive services panel projection from the owned supervisor.
     pub(crate) fn configured_services_panel(
         &self,
@@ -912,6 +954,29 @@ impl ProcessManager {
         let snapshots = self.configured_service_snapshots()?;
         let dependencies = self.configured_service_dependency_labels()?;
         Ok(crate::ui::project_services_panel(&snapshots, &dependencies))
+    }
+
+    /// Task-scoped services panel projection for the selected Task cockpit.
+    pub(crate) fn configured_services_panel_for_task(
+        &self,
+        task_id: crate::domain::TaskId,
+    ) -> Result<crate::ui::ServicesPanelProjection, crate::services::supervisor::SupervisorError>
+    {
+        let projection = self.configured_service_snapshots_for_task(task_id)?;
+        let dependencies = self.configured_service_dependency_labels()?;
+        let dependencies: Vec<_> = dependencies
+            .into_iter()
+            .filter(|(service_id, _)| {
+                projection
+                    .snapshots
+                    .iter()
+                    .any(|snapshot| snapshot.service_id == *service_id)
+            })
+            .collect();
+        Ok(crate::ui::project_services_panel(
+            &projection.snapshots,
+            &dependencies,
+        ))
     }
 
     fn configured_service_dependency_labels(

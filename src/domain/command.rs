@@ -1263,9 +1263,9 @@ pub enum ServiceControlAction {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServiceControlIntent {
-    /// Configured-service catalog identifier. The host validates this bounded
-    /// wire value into `services::model::ServiceId` before supervisor use.
-    pub service_id: String,
+    /// Configured-service catalog identifier. The host converts this exactly
+    /// once into `services::model::ServiceId` before supervisor use.
+    pub service_id: crate::domain::id::ConfiguredServiceId,
     pub resource_generation: u64,
     pub connection_epoch: u64,
     pub action_epoch: u64,
