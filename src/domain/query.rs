@@ -2818,6 +2818,7 @@ fn intern_unavailable_reason(reason: &str) -> Option<&'static str> {
         "organization_namespace" => Some("organization_namespace"),
         "chain_directory" => Some("chain_directory"),
         "owner_device_session" => Some("owner_device_session"),
+        "negotiated_transport_limit" => Some("negotiated_transport_limit"),
         _ => None,
     }
 }
@@ -3127,5 +3128,25 @@ impl<'de> Deserialize<'de> for QueryOutcome {
         }
 
         deserializer.deserialize_map(QueryOutcomeVisitor)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::QueryError;
+
+    #[test]
+    fn unavailable_query_error_roundtrips_negotiated_transport_limit() {
+        let encoded = serde_json::to_vec(&QueryError::Unavailable {
+            reason: "negotiated_transport_limit",
+        })
+        .expect("encode query error");
+        let decoded: QueryError = serde_json::from_slice(&encoded).expect("decode query error");
+        assert!(matches!(
+            decoded,
+            QueryError::Unavailable {
+                reason: "negotiated_transport_limit"
+            }
+        ));
     }
 }

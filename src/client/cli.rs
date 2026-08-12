@@ -10,12 +10,14 @@ use std::{
 use serde_json::json;
 
 use super::action::{
-    self, provider_input_command, task_create_v2_command, task_rename_command,
-    ActionArgumentSchema, ActionRisk, ActionScope, ProviderInputArguments, TaskCreateV2Arguments,
-    TaskRenameArguments, ACTION_HOST_STATUS, ACTION_PROVIDER_ANSWER_QUESTION,
-    ACTION_PROVIDER_NEW_CONVERSATION, ACTION_PROVIDER_QUEUE_FOLLOW_UP,
-    ACTION_PROVIDER_RESOLVE_APPROVAL, ACTION_PROVIDER_SEND_NOW, ACTION_PROVIDER_STEER_CURRENT_TURN,
-    ACTION_PROVIDER_STOP_TURN, ACTION_TASK_CREATE, ACTION_TASK_CREATE_V2, ACTION_TASK_LIST,
+    self, provider_input_command, service_control_command, task_create_v2_command,
+    task_rename_command, ActionArgumentSchema, ActionRisk, ActionScope, ProviderInputArguments,
+    ServiceControlArguments, TaskCreateV2Arguments, TaskRenameArguments, ACTION_HOST_STATUS,
+    ACTION_PROVIDER_ANSWER_QUESTION, ACTION_PROVIDER_NEW_CONVERSATION,
+    ACTION_PROVIDER_QUEUE_FOLLOW_UP, ACTION_PROVIDER_RESOLVE_APPROVAL, ACTION_PROVIDER_SEND_NOW,
+    ACTION_PROVIDER_STEER_CURRENT_TURN, ACTION_PROVIDER_STOP_TURN, ACTION_SERVICE_RESTART,
+    ACTION_SERVICE_START, ACTION_SERVICE_STOP, ACTION_TASK_CREATE, ACTION_TASK_CREATE_V2,
+    ACTION_TASK_LIST, ACTION_TASK_RENAME, ACTION_TASK_SHOW,
 };
 use super::{HostClient, HostClientConfig};
 use crate::domain::command::{CommandEnvelope, CommandReceipt, RejectionCode};
@@ -982,12 +984,86 @@ fn invoke_json_document(
                 ))
             }
         }
+        ACTION_SERVICE_START | ACTION_SERVICE_STOP | ACTION_SERVICE_RESTART => {
+            #[cfg(not(windows))]
+            {
+                let _ = profile;
+                let _ = arguments_json;
+                return Err(CliError::new("ctl invoke requires Windows"));
+            }
+            #[cfg(windows)]
+            {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| {
+                        CliError::new(format!("failed to build ctl runtime: {error}"))
+                    })?;
+                runtime.block_on(service_control_invoke_async(
+                    profile,
+                    action_id,
+                    arguments_json,
+                ))
+            }
+        }
         other => {
             if let Some(reason) = action::disabled_reason(other, CapabilitySet::empty()) {
                 return Err(CliError::new(reason.to_string()));
             }
             Err(CliError::new(format!("unsupported action id: {other}")))
         }
+    }
+}
+
+#[cfg(windows)]
+async fn service_control_invoke_async(
+    profile: &str,
+    action_id: &str,
+    arguments_json: &str,
+) -> Result<String, CliError> {
+    let args: ServiceControlArguments = serde_json::from_str(arguments_json)
+        .map_err(|error| CliError::new(format!("invalid {action_id} arguments JSON: {error}")))?;
+    let service_id = args.service_id.clone();
+    let client_id = ClientId::new();
+    let envelope = service_control_command(
+        CommandId::new(),
+        client_id,
+        unix_epoch_ms()?,
+        action_id,
+        args,
+    )
+    .map_err(|error| CliError::new(format!("invalid {action_id} arguments: {error}")))?;
+    let mut client = connect_profile_client(
+        profile,
+        client_id,
+        CapabilitySet::from_capabilities([Capability::ServiceSupervisor]),
+    )
+    .await?;
+    if !client
+        .granted_capabilities()
+        .contains(Capability::ServiceSupervisor)
+    {
+        return Err(CliError::new(
+            "host did not grant required service_supervisor capability",
+        ));
+    }
+    let receipt = execute_command_with_reconnect(&mut client, envelope, action_id).await?;
+    match &receipt {
+        CommandReceipt::Accepted { .. } => {
+            let doc = json!({
+                "schema_version": SCHEMA_VERSION,
+                "action_id": action_id,
+                "profile": profile,
+                "service_id": service_id,
+                "receipt": receipt,
+            });
+            serde_json::to_string(&doc)
+                .map_err(|error| CliError::new(format!("failed to encode invoke JSON: {error}")))
+        }
+        CommandReceipt::Rejected { code, .. } => Err(CliError::new(format!(
+            "{action_id} rejected: {}",
+            rejection_code_name(*code)
+        ))),
     }
 }
 

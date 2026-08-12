@@ -13,10 +13,12 @@ use serde::{Deserialize, Serialize};
 use crate::client::action::{self, ActionDescriptor, ACTION_HOST_STATUS, ACTION_TASK_SHOW};
 use crate::client::ClientModel;
 use crate::diagnostics::runner::redact_secrets;
-use crate::domain::agent::{AgentRole, AgentSessionFacts, AgentSessionLifecycle};
+use crate::domain::agent::{
+    AgentRole, AgentSessionFacts, AgentSessionLifecycle, ProviderSessionId,
+};
 use crate::domain::id::{AgentSessionId, ProjectId, TaskId};
 use crate::domain::snapshot::TaskSnapshot;
-use crate::domain::task::{TaskActivity, VisibleTaskStatus, WorkspaceRef};
+use crate::domain::task::{TaskActivity, VisibleTaskStatus, WorkspaceBindingKind, WorkspaceRef};
 use crate::ui::actions::{KeyboardShortcut, ShortcutKey};
 use crate::ui::components::AccessibleRole;
 use crate::ui::shell::PointerButton;
@@ -151,7 +153,7 @@ pub struct AgentIdentity {
     pub agent_id: AgentSessionId,
     pub revision: u64,
     pub resource_generation: u64,
-    pub provider_session_id: Option<String>,
+    pub provider_session_id: Option<ProviderSessionId>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2349,13 +2351,30 @@ fn specialist_name(agent: &AgentSessionFacts) -> &str {
 
 fn workspace_projection(workspace: &WorkspaceRef) -> WorkspaceProjection {
     match workspace {
-        WorkspaceRef::Main => WorkspaceProjection::Main,
-        WorkspaceRef::Worktree { path: _, branch } => WorkspaceProjection::Worktree {
+        WorkspaceRef::Main | WorkspaceRef::MainWithFingerprint { .. } => WorkspaceProjection::Main,
+        WorkspaceRef::Worktree { path: _, branch }
+        | WorkspaceRef::WorktreeWithFingerprint {
+            path: _, branch, ..
+        } => WorkspaceProjection::Worktree {
             path: PathBuf::from("workspace"),
             branch: presentation_text(branch, MAX_BRANCH_SCALARS),
         },
-        WorkspaceRef::External { path: _ } => WorkspaceProjection::External {
+        WorkspaceRef::External { path: _ }
+        | WorkspaceRef::ExternalWithFingerprint { path: _, .. } => WorkspaceProjection::External {
             path: PathBuf::from("workspace"),
+        },
+        WorkspaceRef::HostBound { binding } => match binding.kind() {
+            WorkspaceBindingKind::Main => WorkspaceProjection::Main,
+            WorkspaceBindingKind::Worktree => WorkspaceProjection::Worktree {
+                path: PathBuf::from("workspace"),
+                branch: presentation_text(
+                    binding.branch().unwrap_or("worktree"),
+                    MAX_BRANCH_SCALARS,
+                ),
+            },
+            WorkspaceBindingKind::External => WorkspaceProjection::External {
+                path: PathBuf::from("workspace"),
+            },
         },
     }
 }

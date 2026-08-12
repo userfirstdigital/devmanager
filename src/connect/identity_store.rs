@@ -666,7 +666,8 @@ impl<P: IdentityPersistence + 'static> IsolatedRemoteStore<P> {
                     return Err(IdentityError::CopiedProfile);
                 }
             }
-            if pending.command_id == command.command_id && pending.command_digest == command_digest
+            let claimed_pending = if pending.command_id == command.command_id
+                && pending.command_digest == command_digest
             {
                 // Every retry claims the exact opaque marker before touching
                 // vault state. This serializes retry/abandon and prevents a
@@ -708,15 +709,16 @@ impl<P: IdentityPersistence + 'static> IsolatedRemoteStore<P> {
                     self.clear_pending_transition(&claimed_pending, document.revision)?;
                     return Ok(existing);
                 }
+                Some(claimed_pending)
             } else if pending.command_id == command.command_id {
                 return Err(IdentityError::CommandConflict);
             } else {
                 return Err(IdentityError::TransitionPending);
-            }
+            };
             if document.revision != command.expected_revision {
                 return Err(IdentityError::RevisionConflict);
             }
-            Some(claimed_pending)
+            claimed_pending
         } else {
             None
         };

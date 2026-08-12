@@ -97,6 +97,10 @@ impl OrganizationEnforcer {
             role,
             task_id: Some(grant.task_id),
             action,
+            // Organization grants do not carry a device credential. Keep the
+            // request explicit so the evaluator's current scoped-grant and
+            // credential gates remain fail-closed.
+            credential: None,
         }) {
             PermissionDecision::Allow => Ok(()),
             PermissionDecision::Denied(reason) => match reason {

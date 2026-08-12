@@ -975,32 +975,10 @@ async fn serve_foreground_host(
     config_store: ConfigStore,
     slow_durable_reader_client_id: Option<ClientId>,
 ) -> Result<(), String> {
-    let hello_config = AcceptHelloConfig {
-        host_boot_id,
-        server_build: format!("devmanager-host/{}", env!("CARGO_PKG_VERSION")),
-        supported: CapabilitySet::from_capabilities([
-            Capability::PagedSnapshots,
-            Capability::EventReplay,
-            Capability::OperationSettlement,
-            Capability::ChunkResume,
-            Capability::PromptProjection,
-            Capability::ExplicitDetach,
-            Capability::HostShutdown,
-            Capability::ProviderInput,
-            Capability::OrganizationProjection,
-        ]),
-        local_limits: FrameLimits::v1_default(),
-    };
-    let server_build = hello_config.server_build.clone();
-
-    // The first instance proves no pre-existing pipe server is present. Each
-    // later instance is created by this same lock owner before the connected
-    // instance is handed to a connection task, so clients never depend on a
-    // close/rebind gap.
-    let listener = HelloListener::bind(profile, hello_config)
-        .map_err(|error| format!("failed to bind host pipe: {error}"))?;
-
-    // Supervised executor owns CommandBus and may arm physical exit on ReadyToExit.
+    // Build the host executor before advertising capabilities. Service control
+    // is only negotiated when the executor successfully initialized the one
+    // ProcessManager-owned configured supervisor; a failed binding remains
+    // visible as an unavailable feature instead of a dead advertised action.
     let (
         request_handle,
         SupervisedHostExecutor {
@@ -1009,6 +987,46 @@ async fn serve_foreground_host(
         },
     ) = HostRequestExecutor::start_supervised_with_config_store(bus, config_store)
         .map_err(|error| format!("invalid host project configuration: {error}"))?;
+
+    let hello_config = AcceptHelloConfig {
+        host_boot_id,
+        server_build: format!("devmanager-host/{}", env!("CARGO_PKG_VERSION")),
+        supported: CapabilitySet::from_capabilities(
+            [
+                Capability::PagedSnapshots,
+                Capability::EventReplay,
+                Capability::OperationSettlement,
+                Capability::ChunkResume,
+                Capability::PromptProjection,
+                Capability::ExplicitDetach,
+                Capability::HostShutdown,
+                Capability::ProviderInput,
+                Capability::OrganizationProjection,
+            ]
+            .into_iter()
+            .chain(
+                request_handle
+                    .configured_service_supervisor_ready()
+                    .then_some(Capability::ServiceSupervisor),
+            ),
+        ),
+        local_limits: FrameLimits::v1_default(),
+    };
+    let server_build = hello_config.server_build.clone();
+
+    // The first instance proves no pre-existing pipe server is present. Each
+    // later instance is created by this same lock owner before the connected
+    // instance is handed to a connection task, so clients never depend on a
+    // close/rebind gap.
+    let listener = match HelloListener::bind(profile, hello_config) {
+        Ok(listener) => listener,
+        Err(error) => {
+            drop(request_handle);
+            join.abort();
+            let _ = join.await;
+            return Err(format!("failed to bind host pipe: {error}"));
+        }
+    };
 
     // Bind the one shared updater FSM + timed IPC port to live Host Hello.
     // Clients must not create a second gate; they drive this handle's port.

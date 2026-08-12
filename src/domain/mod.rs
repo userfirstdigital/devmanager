@@ -32,12 +32,12 @@ pub use codec::{
     MAX_ORCHESTRATION_MSGPACK_NODES, MAX_ORCHESTRATION_MSGPACK_STRING_BYTES,
 };
 pub use command::{
-    command_payload_digest, decide, AcceptSpecialistHandoffIntent, CancelSpecialistIntent, Command,
-    CommandEnvelope, CommandReceipt, ConfirmHostQuitIntent, CreateTaskIntent,
-    CreateTaskRequestIntent, PromotePrimaryIntent, RejectionCode, RenameTaskIntent,
-    RequestSpecialistIntent, SetTaskAttentionIntent, SubmitProviderInputIntent,
+    command_payload_digest, decide, AcceptSpecialistHandoffIntent, ArmUpdateInstallIntent,
+    CancelSpecialistIntent, Command, CommandEnvelope, CommandReceipt, ConfirmHostQuitIntent,
+    ConfirmUpdateDrainIntent, CreateTaskIntent, CreateTaskRequestIntent, PrepareUpdateIntent,
+    PromotePrimaryIntent, RejectionCode, RenameTaskIntent, RequestSpecialistIntent,
+    ServiceControlAction, ServiceControlIntent, SetTaskAttentionIntent, SubmitProviderInputIntent,
     DEFAULT_MAX_TOP_LEVEL_RUNTIMES,
-    ArmUpdateInstallIntent, ConfirmUpdateDrainIntent, PrepareUpdateIntent,
 };
 pub use event::{
     apply, ApplyError, DomainEvent, Event, EventSerdeError, OperationAcceptedFact,

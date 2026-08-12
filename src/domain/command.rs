@@ -16,7 +16,7 @@ use crate::domain::canonical;
 use crate::domain::event::Event;
 use crate::domain::id::{
     AgentSessionId, ArtifactId, ClientId, CommandId, EnvironmentId, EventId, OperationId,
-    ProjectId, ResourceId, TaskId, TurnId,
+    ProjectId, ResourceId, ServiceId, TaskId, TurnId,
 };
 use crate::domain::provider_input::{
     validate_action_nested_ids, PresentProviderApprovalIntent, PresentProviderQuestionIntent,
@@ -1230,6 +1230,10 @@ pub enum Command {
     CancelSpecialist(CancelSpecialistIntent),
     AcceptSpecialistHandoff(AcceptSpecialistHandoffIntent),
     PromptLibrary(PromptCommand),
+    /// Host-only configured-service control. This never enters the durable
+    /// task journal; the authenticated host dispatches it to its one owned
+    /// ProcessManager supervisor.
+    ServiceControl(ServiceControlIntent),
     Browser(BrowserRequest),
     /// Host-boundary update handoff: inspect+prepare with expiring token.
     PrepareUpdate(PrepareUpdateIntent),
@@ -1240,6 +1244,30 @@ pub enum Command {
     /// Arm durable staged-install readiness (recoverable). Irreversible only after
     /// durable stage marker is written by the installer path.
     ArmUpdateInstall(ArmUpdateInstallIntent),
+}
+
+/// Typed host supervisor operation selected by a catalog action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceControlAction {
+    Start,
+    Stop,
+    Restart,
+}
+
+/// Exact admission fence for one configured-service control request.
+///
+/// These fields are captured by the client at activation time and are checked
+/// by the host supervisor before any process effect. The command is deliberately
+/// host-only and is rejected by the durable CommandBus if it crosses that seam.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceControlIntent {
+    pub service_id: ServiceId,
+    pub resource_generation: u64,
+    pub connection_epoch: u64,
+    pub action_epoch: u64,
+    pub action: ServiceControlAction,
 }
 
 /// Canonical SHA-256 over client, task, expected revision, and command.
@@ -1452,6 +1480,7 @@ pub fn decide(
             decide_accept_specialist_handoff(snapshot, envelope, intent)
         }
         Command::PromptLibrary(_) => Err(RejectionCode::InvalidTransition),
+        Command::ServiceControl(_) => Err(RejectionCode::InvalidTransition),
         Command::Browser(request) => decide_browser(snapshot, envelope, request),
         Command::PrepareUpdate(_)
         | Command::ConfirmUpdateDrain(_)

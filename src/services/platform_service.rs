@@ -19,7 +19,7 @@ use std::time::Duration;
 #[cfg(not(windows))]
 use std::time::Instant;
 
-pub use crate::process::job::{attach_process_to_managed_job, ManagedProcessJob};
+pub(crate) use crate::process::job::{attach_process_to_managed_job, ManagedProcessJob};
 use crate::process::ports::TcpEndpointRecord;
 
 const MAX_LISTENER_PORT_BATCH: usize = 4_096;

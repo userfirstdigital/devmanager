@@ -28,7 +28,7 @@ use crate::domain::id::TaskId;
 use crate::domain::resource::{ResourceKind, ResourceLifecycle};
 use crate::domain::task::{
     ReviewReadiness, TaskActivity, TaskAttention, TaskConnectivity, TaskLifecycle,
-    VisibleTaskStatus, WorkspaceRef,
+    VisibleTaskStatus, WorkspaceBindingKind, WorkspaceRef,
 };
 use crate::ui::components::{AccessibilityMetadata, AccessibleRole};
 
@@ -2357,19 +2357,39 @@ fn row_from_snapshot(
 }
 
 fn display_for_snapshot(snapshot: &crate::domain::snapshot::TaskSnapshot) -> TaskRowDisplay {
-    let (project, worktree, workspace_path_hidden, worktree_truncated) =
-        match &snapshot.task.workspace {
-            WorkspaceRef::Main => ("Project".to_string(), "main".to_string(), false, false),
-            WorkspaceRef::Worktree { branch, .. } => (
-                "Project".to_string(),
-                sanitize_bounded_text(branch, MAX_WORKTREE_LABEL_CHARS),
-                true,
-                text_was_truncated(branch, MAX_WORKTREE_LABEL_CHARS),
-            ),
-            WorkspaceRef::External { .. } => {
+    let (project, worktree, workspace_path_hidden, worktree_truncated) = match &snapshot
+        .task
+        .workspace
+    {
+        WorkspaceRef::Main | WorkspaceRef::MainWithFingerprint { .. } => {
+            ("Project".to_string(), "main".to_string(), false, false)
+        }
+        WorkspaceRef::Worktree { branch, .. }
+        | WorkspaceRef::WorktreeWithFingerprint { branch, .. } => (
+            "Project".to_string(),
+            sanitize_bounded_text(branch, MAX_WORKTREE_LABEL_CHARS),
+            true,
+            text_was_truncated(branch, MAX_WORKTREE_LABEL_CHARS),
+        ),
+        WorkspaceRef::External { .. } | WorkspaceRef::ExternalWithFingerprint { .. } => {
+            ("Project".to_string(), "external".to_string(), true, false)
+        }
+        WorkspaceRef::HostBound { binding } => match binding.kind() {
+            WorkspaceBindingKind::Main => ("Project".to_string(), "main".to_string(), false, false),
+            WorkspaceBindingKind::Worktree => {
+                let branch = binding.branch().unwrap_or("worktree");
+                (
+                    "Project".to_string(),
+                    sanitize_bounded_text(branch, MAX_WORKTREE_LABEL_CHARS),
+                    true,
+                    text_was_truncated(branch, MAX_WORKTREE_LABEL_CHARS),
+                )
+            }
+            WorkspaceBindingKind::External => {
                 ("Project".to_string(), "external".to_string(), true, false)
             }
-        };
+        },
+    };
     let (primary_provider, runtime, provider_truncated) = snapshot
         .primary_agent_id
         .and_then(|agent_id| snapshot.agents.get(&agent_id))

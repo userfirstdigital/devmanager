@@ -61,7 +61,8 @@ pub fn action_for_client_request(request: &ClientRequest) -> Option<(ActionId, O
                 | Command::SetPrimaryAgent { .. }
                 | Command::RegisterArtifact { .. }
                 | Command::RegisterResource { .. }
-                | Command::ReleaseResource { .. } => ActionId::MUTATE_TASK,
+                | Command::ReleaseResource { .. }
+                | Command::ServiceControl(_) => ActionId::MUTATE_TASK,
                 Command::ConfirmHostQuit(_) => ActionId::MUTATE_TASK,
             };
             let task_id = match &envelope.command {

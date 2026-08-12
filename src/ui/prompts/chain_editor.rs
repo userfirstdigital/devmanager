@@ -72,10 +72,11 @@ pub mod apply_chain_action {
             return Err(PromptLibraryUiError::AdjacentLinksRequired);
         }
         let insert_at = before.position();
+        let incoming_id = incoming.id();
         let rebuilt = rebuild(
             links,
             chain_id,
-            |existing| existing.id() != incoming.id(),
+            |existing| existing.id() != incoming_id,
             Some((insert_at, incoming)),
         )?;
         *links = rebuilt;
@@ -214,5 +215,61 @@ pub mod apply_chain_action {
         }
         others.extend(rebuilt);
         Ok(others)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apply_chain_action;
+    use crate::ui::prompts::fixtures::{chain_id, chain_link};
+
+    #[test]
+    fn insert_between_rebuilds_positions_and_navigation() {
+        let chain = chain_id(30);
+        let mut links = vec![
+            chain_link(40, 30, 1, 11, 12, None, Some(41), false),
+            chain_link(41, 30, 2, 13, 14, Some(40), Some(42), false),
+            chain_link(42, 30, 3, 15, 16, Some(41), None, false),
+        ];
+
+        apply_chain_action::insert_between(
+            &mut links,
+            chain,
+            crate::ui::prompts::fixtures::link_id(40),
+            crate::ui::prompts::fixtures::link_id(41),
+            chain_link(45, 30, 99, 17, 18, None, None, false),
+        )
+        .expect("adjacent chain links should accept an inserted link");
+
+        assert_eq!(
+            links
+                .iter()
+                .map(|link| (link.id(), link.position()))
+                .collect::<Vec<_>>(),
+            vec![
+                (crate::ui::prompts::fixtures::link_id(40), 1),
+                (crate::ui::prompts::fixtures::link_id(45), 2),
+                (crate::ui::prompts::fixtures::link_id(41), 3),
+                (crate::ui::prompts::fixtures::link_id(42), 4),
+            ]
+        );
+        assert_eq!(
+            links
+                .iter()
+                .map(|link| (link.previous_link_id(), link.next_link_id()))
+                .collect::<Vec<_>>(),
+            vec![
+                (None, Some(crate::ui::prompts::fixtures::link_id(45))),
+                (
+                    Some(crate::ui::prompts::fixtures::link_id(40)),
+                    Some(crate::ui::prompts::fixtures::link_id(41)),
+                ),
+                (
+                    Some(crate::ui::prompts::fixtures::link_id(45)),
+                    Some(crate::ui::prompts::fixtures::link_id(42)),
+                ),
+                (Some(crate::ui::prompts::fixtures::link_id(41)), None),
+            ]
+        );
     }
 }

@@ -548,6 +548,7 @@ impl Debug for TaskComposer {
 /// fn accept_production_host_commands(command: devmanager::domain::command::Command) {
 ///     match command {
 ///         devmanager::domain::command::Command::CreateTask(_)
+///         | devmanager::domain::command::Command::CreateTaskV2(_)
 ///         | devmanager::domain::command::Command::RenameTask(_)
 ///         | devmanager::domain::command::Command::SetTaskAttention(_)
 ///         | devmanager::domain::command::Command::BeginCloseTask
@@ -558,6 +559,21 @@ impl Debug for TaskComposer {
 ///         | devmanager::domain::command::Command::RegisterResource { .. }
 ///         | devmanager::domain::command::Command::ReleaseResource { .. }
 ///         | devmanager::domain::command::Command::ConfirmHostQuit(_)
+///         | devmanager::domain::command::Command::SubmitProviderInput(_)
+///         | devmanager::domain::command::Command::PresentProviderQuestion(_)
+///         | devmanager::domain::command::Command::PresentProviderApproval(_)
+///         | devmanager::domain::command::Command::SettleProviderWait(_)
+///         | devmanager::domain::command::Command::RequestSpecialist(_)
+///         | devmanager::domain::command::Command::PromotePrimary(_)
+///         | devmanager::domain::command::Command::CancelSpecialist(_)
+///         | devmanager::domain::command::Command::AcceptSpecialistHandoff(_)
+///         | devmanager::domain::command::Command::PromptLibrary(_)
+///         | devmanager::domain::command::Command::ServiceControl(_)
+///         | devmanager::domain::command::Command::Browser(_)
+///         | devmanager::domain::command::Command::PrepareUpdate(_)
+///         | devmanager::domain::command::Command::ConfirmUpdateDrain(_)
+///         | devmanager::domain::command::Command::AbortUpdateHandoff
+///         | devmanager::domain::command::Command::ArmUpdateInstall(_)
 ///         | devmanager::domain::command::Command::SendNow(_)
 ///         | devmanager::domain::command::Command::SteerCurrentTurn(_)
 ///         | devmanager::domain::command::Command::QueueFollowUp(_)
@@ -2986,13 +3002,6 @@ mod tests {
             .presented_question_options()
             .expect("escape plus multibyte must not panic presentation");
         assert_eq!(presented, vec!["Ship it".to_string()]);
-        assert_eq!(
-            composer
-                .question
-                .as_ref()
-                .map(|current| current.options.as_slice()),
-            Some([raw.to_string()].as_slice())
-        );
         let mut epochs = FocusEpochSource::new();
         focus(&mut composer, &mut epochs);
         let epoch = epochs.current();

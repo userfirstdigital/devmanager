@@ -66,6 +66,8 @@ pub const MAX_CLIENT_SEARCH_INDEX_KEYS: usize = 100_000;
 pub const MAX_CLIENT_SEARCH_POSTING_ENTRIES: usize =
     MAX_CLIENT_SEARCH_POSTING_BYTES / std::mem::size_of::<TaskId>();
 const MAX_STORED_IDS_PER_POSTING: usize = MAX_CLIENT_SEARCH_RESULTS;
+const REQUIRED_SNAPSHOT_SECTION_COUNT: usize = 5;
+const SNAPSHOT_SECTION_COUNT: usize = 7;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClientModelError {
@@ -1599,6 +1601,8 @@ fn section_index(section: SnapshotSection) -> usize {
         SnapshotSection::Artifacts => 2,
         SnapshotSection::Resources => 3,
         SnapshotSection::Operations => 4,
+        SnapshotSection::BrowserContexts => 5,
+        SnapshotSection::BrowserTabs => 6,
     }
 }
 
@@ -1617,6 +1621,12 @@ fn snapshot_item_key(item: &SnapshotItem) -> crate::domain::snapshot::SnapshotIt
         SnapshotItem::Operation(operation) => {
             crate::domain::snapshot::SnapshotItemKey::Operation(operation.id)
         }
+        SnapshotItem::BrowserContext(context) => {
+            crate::domain::snapshot::SnapshotItemKey::BrowserContext(context.context_id)
+        }
+        SnapshotItem::BrowserTab(tab) => {
+            crate::domain::snapshot::SnapshotItemKey::BrowserTab(tab.tab_id)
+        }
     }
 }
 
@@ -1627,7 +1637,7 @@ pub struct ClientModelBuilder {
     through_sequence: Option<u64>,
     page_count: usize,
     item_count: usize,
-    sections: [SectionAssembly; 5],
+    sections: [SectionAssembly; SNAPSHOT_SECTION_COUNT],
     tasks: BTreeMap<TaskId, TaskSnapshotItem>,
     agents: BTreeMap<AgentSessionId, AgentSessionFacts>,
     artifacts: BTreeMap<ArtifactId, ArtifactSummary>,
@@ -1733,7 +1743,10 @@ impl ClientModelBuilder {
     }
 
     pub fn finish(self) -> Result<ClientModel, ClientModelError> {
-        if self.sections.iter().any(|section| !section.finished) {
+        if self.sections[..REQUIRED_SNAPSHOT_SECTION_COUNT]
+            .iter()
+            .any(|section| !section.finished)
+        {
             return Err(ClientModelError::MissingSections);
         }
         let through_sequence = self
@@ -1886,6 +1899,10 @@ impl ClientModelBuilder {
                 {
                     return Err(ClientModelError::DuplicateItem);
                 }
+            }
+            (SnapshotSection::BrowserContexts, SnapshotItem::BrowserContext(_))
+            | (SnapshotSection::BrowserTabs, SnapshotItem::BrowserTab(_)) => {
+                return Err(ClientModelError::SectionItemMismatch);
             }
             _ => return Err(ClientModelError::SectionItemMismatch),
         }

@@ -2166,11 +2166,11 @@ fn cleanup_retained_published_output(
     let waited = wait_for_worker_result(task, deadline);
     let settled = cleanup_reaper_outcome(&outcome);
     match (waited, settled) {
-        (Ok(Ok(())), _) | (Err(PreviewCaptureError::DeadlineExceeded), Some(Ok(()))) => {
+        (Ok(()), _) | (Err(PreviewCaptureError::DeadlineExceeded), Some(Ok(()))) => {
             remove_cleanup_reaper(&outcome);
             primary
         }
-        (Ok(Err(error)), _) | (Err(PreviewCaptureError::DeadlineExceeded), Some(Err(error))) => {
+        (Err(PreviewCaptureError::DeadlineExceeded), Some(Err(error))) => {
             remove_cleanup_reaper(&outcome);
             PreviewCaptureError::CleanupFailed(CleanupFailureContext::from_settlement(
                 primary,

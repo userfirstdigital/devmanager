@@ -25,7 +25,6 @@ use crate::process::registry::{
 };
 use crate::process::sampler::SamplingBudget;
 use std::collections::BTreeSet;
-use std::time::{Duration, Instant};
 
 /// A read-only, exact-identity observation of one current Job member.
 ///
@@ -292,7 +291,6 @@ extern "system" {
         size: *mut u32,
     ) -> i32;
     fn IsProcessInJob(process: *mut c_void, job: *mut c_void, result: *mut i32) -> i32;
-    fn TerminateJobObject(job: *mut c_void, exit_code: u32) -> i32;
 }
 
 #[cfg(windows)]

@@ -29,10 +29,10 @@ use crate::notifications;
 use crate::persistence::{ConfigWriteAvailability, WorkspaceSnapshot};
 use crate::remote::presentation::{SemanticEventKind, StableSessionKey};
 use crate::remote::{
-    self, ClientAuth, LocalPortForwardManager, PendingRemoteRequest, RemoteAction,
-    RemoteActionPayload, RemoteActionResult, RemoteClientHandle, RemoteClientPool, RemoteGitRepo,
-    RemoteHostService, RemoteHostWeakHandle, RemoteLatencyStats, RemoteMachineState,
-    RemotePortForwardState, RemoteSessionBootstrap, RemoteTerminalExport, RemoteTerminalInput,
+    self, ClientAuth, LocalPortForwardManager, RemoteAction, RemoteActionPayload,
+    RemoteActionResult, RemoteClientHandle, RemoteClientPool, RemoteGitRepo, RemoteHostService,
+    RemoteHostWeakHandle, RemoteLatencyStats, RemoteMachineState, RemotePortForwardState,
+    RemoteSessionBootstrap, RemoteTerminalExport, RemoteTerminalInput,
 };
 use crate::services::{
     ai_session_needs_restore, env_service, pid_file, platform_service, ports_service,

@@ -1953,7 +1953,7 @@ use crate::protocol::{
     BrowserSurfaceDescriptor as BrowserProtocolSurfaceDescriptor, BrowserSurfaceLifecycle,
 };
 
-use crate::domain::id::{BrowserTabId, ClientId, TaskId};
+use crate::domain::id::BrowserTabId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BrowserDockError {
@@ -2118,7 +2118,7 @@ impl BrowserDockSurface {
             .validate()
             .map_err(|_| BrowserDockError::InvalidRequest)?;
         self.require_same_surface(&request.descriptor)?;
-        if matches!(self.lifecycle, BrowserSurfaceLifecycle::Attached { .. }) {
+        if matches!(&self.lifecycle, BrowserSurfaceLifecycle::Attached { .. }) {
             return Err(BrowserDockError::AlreadyAttached);
         }
         self.descriptor = request.descriptor;
@@ -2133,7 +2133,7 @@ impl BrowserDockSurface {
     }
 
     pub fn detach(&mut self, crashed: bool) -> Result<(), BrowserDockError> {
-        if matches!(self.lifecycle, BrowserSurfaceLifecycle::Parked) {
+        if matches!(&self.lifecycle, BrowserSurfaceLifecycle::Parked) {
             return Err(BrowserDockError::NotAttached);
         }
         self.lifecycle = BrowserSurfaceLifecycle::Detached {
@@ -2213,7 +2213,7 @@ impl BrowserDockSurface {
             | BrowserDockGesture::PageDrag
                 if self.pointer_armed
                     && !self.hidden_for_layout
-                    && matches!(self.lifecycle, BrowserSurfaceLifecycle::Attached { .. })
+                    && matches!(&self.lifecycle, BrowserSurfaceLifecycle::Attached { .. })
                     && self.focus_target == BrowserDockFocusTarget::BrowserPage =>
             {
                 BrowserPointerDisposition::ForwardToPage
@@ -2223,7 +2223,7 @@ impl BrowserDockSurface {
     }
 
     pub fn arm_page_input_after_gesture(&mut self) -> Result<(), BrowserDockError> {
-        if !matches!(self.lifecycle, BrowserSurfaceLifecycle::Attached { .. }) {
+        if !matches!(&self.lifecycle, BrowserSurfaceLifecycle::Attached { .. }) {
             return Err(BrowserDockError::NotAttached);
         }
         if self.hidden_for_layout {

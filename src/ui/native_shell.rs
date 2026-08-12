@@ -48,9 +48,10 @@ use crate::ui::actions::{
     NativeOpenCommandPalette, NativeOpenPalette, NativeOpenTaskSwitcher, NativeOpenTerminal,
     TaskCreate, TaskListAction, TaskRename, TaskShow,
 };
+use crate::ui::components::interaction::{FocusEpoch, FocusEpochSource};
 use crate::ui::components::{
     AccessibilityMetadata, AccessibleRole, ActionEvent, ActionRequest, ActivationSource,
-    FocusEpoch, FocusEpochSource, InteractionStateModel,
+    InteractionStateModel,
 };
 use crate::ui::shell::{
     NavigationResult, PointerButton, PointerOwner, Shell, TerminalPressRejection, TerminalRelease,
@@ -573,6 +574,7 @@ impl IsolatedDevProfile {
                 Capability::EventReplay,
                 Capability::ExplicitDetach,
                 Capability::HostShutdown,
+                Capability::ServiceSupervisor,
             ]),
             limits: FrameLimits::v1_default(),
         }
@@ -1438,6 +1440,12 @@ pub enum NativeHostCommand {
         command_id: CommandId,
         issued_at_ms: i64,
     },
+    ServiceControl {
+        action_id: &'static str,
+        arguments: crate::client::action::ServiceControlArguments,
+        command_id: CommandId,
+        issued_at_ms: i64,
+    },
     /// Explicitly surfaced until the canonical host query/request adapter is
     /// available. This is intentionally typed so the action is not silently
     /// ignored by the worker.
@@ -1452,6 +1460,7 @@ fn native_command_id(command: &NativeHostCommand) -> Option<CommandId> {
         NativeHostCommand::Envelope(envelope) => Some(envelope.command_id),
         NativeHostCommand::TaskCreate { command_id, .. }
         | NativeHostCommand::TaskRename { command_id, .. } => Some(*command_id),
+        NativeHostCommand::ServiceControl { command_id, .. } => Some(*command_id),
         NativeHostCommand::Hold { .. } => None,
     }
 }
@@ -3493,6 +3502,19 @@ async fn execute_native_command(
             arguments,
         )
         .map_err(|_| IpcError::Unavailable)?,
+        NativeHostCommand::ServiceControl {
+            action_id,
+            arguments,
+            command_id,
+            issued_at_ms,
+        } => crate::client::action::service_control_command(
+            command_id,
+            client.client_id(),
+            issued_at_ms,
+            action_id,
+            arguments,
+        )
+        .map_err(|_| IpcError::Unavailable)?,
         NativeHostCommand::Hold { .. } => return Err(IpcError::Unavailable),
     };
     client.execute_command(envelope).await
@@ -3966,6 +3988,26 @@ impl NativeInteraction {
                 command_id,
                 issued_at_ms,
             },
+            ActionRequest::ServiceControl { arguments, .. } => {
+                // Service actions are host-only and require the exact current
+                // transport fence. A disconnected/uninitialized shell must
+                // not enqueue a request that could later become authorized.
+                if arguments.resource_generation != self.resource_generation
+                    || arguments.connection_epoch != self.connection_epoch
+                    || arguments.action_epoch != self.action_epoch
+                    || self.resource_generation == 0
+                    || self.connection_epoch == 0
+                    || self.action_epoch == 0
+                {
+                    return None;
+                }
+                NativeHostCommand::ServiceControl {
+                    action_id: request.id(),
+                    arguments: arguments.clone(),
+                    command_id,
+                    issued_at_ms,
+                }
+            }
             ActionRequest::HostActions => NativeHostCommand::Hold {
                 action_id: action::ACTION_HOST_ACTIONS,
                 reason: "canonical host action catalog request is not wired",
@@ -4531,6 +4573,7 @@ pub struct NativeShell {
     header_attachment: NativeHeaderAttachment,
     client_model: Option<Arc<ClientModel>>,
     inbox: Inbox,
+    task_list: TaskList,
     interaction: NativeInteraction,
     keyboard: KeyboardModel,
     last_keyboard_action: Option<KeyboardAction>,
@@ -4731,13 +4774,11 @@ impl NativeShell {
         cx: &mut Context<Self>,
         start_controller: bool,
     ) -> Self {
-        let inbox = Inbox::empty();
+        let inbox = Inbox::from_error(crate::ui::task_cockpit::InboxError::ProjectionUnavailable);
+        let task_list = TaskList::empty();
         let header_attachment = NativeHeaderAttachment::default();
-        let accessibility_tree = AccessibilityTree::for_task_list_with_header(
-            inbox.task_list(),
-            None,
-            &header_attachment,
-        );
+        let accessibility_tree =
+            AccessibilityTree::for_task_list_with_header(&task_list, None, &header_attachment);
         let platform_accessibility = NativePlatformAccessibilityBridge::new(&accessibility_tree);
         let mut interaction = NativeInteraction::new(None);
         let initial_epochs = host_runtime
@@ -4757,6 +4798,7 @@ impl NativeShell {
             header_attachment,
             client_model: None,
             inbox,
+            task_list,
             interaction,
             keyboard: KeyboardModel::default(),
             last_keyboard_action: None,
@@ -4817,7 +4859,7 @@ impl NativeShell {
     pub fn attach_header_projection(&mut self, attachment: NativeHeaderAttachment) {
         self.header_attachment = attachment;
         self.accessibility_tree = AccessibilityTree::for_task_list_with_header(
-            self.inbox.task_list(),
+            &self.task_list,
             self.interaction.selected_task(),
             &self.header_attachment,
         );
@@ -5359,18 +5401,17 @@ impl NativeShell {
             };
             let _ = self
                 .interaction
-                .navigation_mouse_down(task_id, self.inbox.task_list());
+                .navigation_mouse_down(task_id, &self.task_list);
         }
 
         let offset = self.task_scroll_handle.0.borrow().base_handle.offset().y / px(1.0);
         let metrics = self.preferences.tokens().density.physical();
-        let _ = self.inbox.task_list_mut().set_scroll_offset_pixels(
-            -offset,
-            metrics.row_height as f32 * DEFAULT_VISIBLE_ROWS as f32,
-            metrics.row_height as f32,
-        );
+        let first_visible = (offset.max(0.0) / metrics.row_height as f32).floor() as usize;
+        let _ = self
+            .task_list
+            .set_viewport(first_visible, DEFAULT_VISIBLE_ROWS);
         self.accessibility_tree = AccessibilityTree::for_task_list_with_header(
-            self.inbox.task_list(),
+            &self.task_list,
             self.interaction.selected_task(),
             &self.header_attachment,
         );
@@ -5634,16 +5675,14 @@ impl NativeShell {
     /// This is a pure handoff; no client, subscription, or second connection
     /// is created by the shell.
     fn apply_task_list(&mut self, task_list: TaskList) {
-        self.client_model = None;
-        self.interaction.set_client_model(None);
         let selected_task = self
             .interaction
             .selected_task()
             .filter(|task_id| task_list.task_ids().contains(task_id));
         self.interaction.sync_selected_task(selected_task);
-        self.inbox = Inbox::from_task_list(task_list);
+        self.task_list = task_list;
         self.accessibility_tree = AccessibilityTree::for_task_list_with_header(
-            self.inbox.task_list(),
+            &self.task_list,
             self.interaction.selected_task(),
             &self.header_attachment,
         );
@@ -5654,6 +5693,7 @@ impl NativeShell {
         let task_list = TaskList::from_client_model_virtual(&model)
             .map_err(|error| format!("client model task projection failed: {error:?}"))?;
         self.apply_task_list(task_list);
+        self.inbox = Inbox::from_model(&model);
         self.client_model = Some(Arc::clone(&model));
         self.interaction.set_client_model(Some(model));
         Ok(())
@@ -5664,7 +5704,7 @@ impl NativeShell {
     }
 
     pub fn task_list(&self) -> &TaskList {
-        self.inbox.task_list()
+        &self.task_list
     }
 
     pub fn inbox(&self) -> &Inbox {
@@ -5672,8 +5712,7 @@ impl NativeShell {
     }
 
     pub fn rendered_task_count(&self) -> usize {
-        self.inbox
-            .task_list()
+        self.task_list
             .rendered_task_ids()
             .len()
             .min(MAX_RENDERED_TASK_ROWS)
@@ -5760,7 +5799,7 @@ impl NativeShell {
     fn element_with_handlers(&mut self, cx: &Context<Self>) -> impl IntoElement {
         let tokens = self.preferences.tokens();
         let metrics = tokens.density.physical();
-        let task_ids = self.inbox.task_list().shared_task_ids();
+        let task_ids = Arc::new(self.task_list.task_ids().to_vec());
         let shell_entity = cx.entity().downgrade();
         let task_list_element = uniform_list(
             "native-task-uniform-list",
@@ -5782,13 +5821,12 @@ impl NativeShell {
                                     cx.stop_propagation();
                                     if event.button == MouseButton::Left {
                                         shell.focus_handle.focus(window);
-                                        let _ = shell.interaction.navigation_mouse_down(
-                                            task_id,
-                                            shell.inbox.task_list(),
-                                        );
+                                        let _ = shell
+                                            .interaction
+                                            .navigation_mouse_down(task_id, &shell.task_list);
                                         shell.accessibility_tree =
                                             AccessibilityTree::for_task_list_with_header(
-                                                shell.inbox.task_list(),
+                                                &shell.task_list,
                                                 shell.interaction.selected_task(),
                                                 &shell.header_attachment,
                                             );
@@ -5813,13 +5851,12 @@ impl NativeShell {
                                 if matches!(event.keystroke.key.as_str(), "enter" | "space") {
                                     let _ = shell_for_key.update(app, |shell, cx| {
                                         cx.stop_propagation();
-                                        let _ = shell.interaction.navigation_mouse_down(
-                                            task_id,
-                                            shell.inbox.task_list(),
-                                        );
+                                        let _ = shell
+                                            .interaction
+                                            .navigation_mouse_down(task_id, &shell.task_list);
                                         shell.accessibility_tree =
                                             AccessibilityTree::for_task_list_with_header(
-                                                shell.inbox.task_list(),
+                                                &shell.task_list,
                                                 shell.interaction.selected_task(),
                                                 &shell.header_attachment,
                                             );
@@ -5889,7 +5926,7 @@ impl NativeShell {
                 .base_handle
                 .set_offset(point(offset.x, offset.y - delta));
             shell.accessibility_tree = AccessibilityTree::for_task_list_with_header(
-                shell.inbox.task_list(),
+                &shell.task_list,
                 shell.interaction.selected_task(),
                 &shell.header_attachment,
             );
@@ -7180,6 +7217,7 @@ mod tests {
                             operation_id: crate::domain::id::OperationId::new(),
                             task_revision: None,
                             event_ids: Vec::new(),
+                            prompt_mutation: None,
                         },
                     }),
                 });

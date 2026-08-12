@@ -938,12 +938,19 @@ pub struct HostRequestHandle {
     control_tx: mpsc::Sender<ExecutorControl>,
     output_id: Option<ConnectionOutputId>,
     update_gate: Arc<crate::host::update::HostUpdateRuntimeGate>,
+    configured_service_supervisor_ready: bool,
 }
 
 impl HostRequestHandle {
     /// Shared update admission gate (stop-new-launches while draining/installing).
     pub fn update_runtime_gate(&self) -> Arc<crate::host::update::HostUpdateRuntimeGate> {
         Arc::clone(&self.update_gate)
+    }
+
+    /// Whether the host executor successfully bound its one configured
+    /// ProcessManager-owned service supervisor at startup.
+    pub fn configured_service_supervisor_ready(&self) -> bool {
+        self.configured_service_supervisor_ready
     }
 
     /// Owned Send+'static probe that runs InspectHostQuit on the executor task.
@@ -1028,6 +1035,7 @@ impl HostRequestHandle {
             control_tx: self.control_tx.clone(),
             output_id: Some(output_id),
             update_gate: Arc::clone(&self.update_gate),
+            configured_service_supervisor_ready: self.configured_service_supervisor_ready,
         }
     }
 }
@@ -1245,6 +1253,76 @@ struct HostWorkspaceAdmission {
     roots: WorkspaceProjectRoots,
 }
 
+/// The host's single configured-service authority.  Keeping this alongside
+/// the CommandBus executor makes service lifecycle effects share one
+/// ProcessManager and prevents a second per-connection supervisor from being
+/// constructed.
+struct ConfiguredServiceRuntime {
+    manager: crate::services::ProcessManager,
+    host_id: crate::services::model::HostId,
+}
+
+impl ConfiguredServiceRuntime {
+    fn initialized_from_admission(admission: &HostWorkspaceAdmission) -> Option<Self> {
+        let manager = crate::services::ProcessManager::new();
+        let host_id = crate::services::model::HostId::new(u64::from(std::process::id()));
+        let config = &admission.store.snapshot().config;
+
+        // Resolve folder env files on the host before handing source references
+        // to the binding layer. Values remain in the redacted supervisor
+        // overlay; they never enter the action catalog or a client projection.
+        let mut env_files = Vec::new();
+        for project in &config.projects {
+            for folder in &project.folders {
+                let env = folder.env_file_path.as_ref().and_then(|path| {
+                    let path = std::path::Path::new(&folder.folder_path).join(path);
+                    crate::services::env_service::read_env_map(&path)
+                        .ok()
+                        .map(|values| {
+                            values
+                                .into_iter()
+                                .collect::<std::collections::BTreeMap<_, _>>()
+                        })
+                });
+                env_files.push(env);
+            }
+        }
+
+        let mut sources = Vec::new();
+        let mut env_index = 0;
+        for project in &config.projects {
+            for folder in &project.folders {
+                for command in &folder.commands {
+                    sources.push(crate::services::binding::ConfiguredServiceSource {
+                        project,
+                        folder,
+                        command,
+                        owner: crate::services::binding::ConfiguredServiceOwner::Workspace {
+                            project_id: project.id.clone(),
+                            folder_id: folder.id.clone(),
+                        },
+                        folder_env_file: env_files.get(env_index).and_then(Option::as_ref),
+                    });
+                }
+                env_index += 1;
+            }
+        }
+
+        manager
+            .ensure_configured_service_supervisor(sources, host_id, unix_time_ms_u64())
+            .ok()
+            .map(|()| Self { manager, host_id })
+    }
+}
+
+fn unix_time_ms_u64() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+        .unwrap_or(0)
+}
+
 impl HostWorkspaceAdmission {
     fn new(
         mut store: ConfigStore,
@@ -1288,6 +1366,7 @@ pub struct HostRequestExecutor {
     bus: CommandBus,
     workspace_projects: WorkspaceProjectRoots,
     config_admission: Option<HostWorkspaceAdmission>,
+    configured_service_runtime: Option<ConfiguredServiceRuntime>,
     update_gate: Arc<crate::host::update::HostUpdateRuntimeGate>,
     rx: mpsc::Receiver<HostRequestJob>,
     control_rx: mpsc::Receiver<ExecutorControl>,
@@ -1448,16 +1527,22 @@ impl HostRequestExecutor {
         let (control_tx, control_rx) = mpsc::channel(HOST_REQUEST_QUEUE_CAPACITY);
         let (arm_tx, arm_rx) = mpsc::channel(1);
         let update_gate = crate::host::update::HostUpdateRuntimeGate::new();
+        let configured_service_runtime = config_admission
+            .as_ref()
+            .and_then(ConfiguredServiceRuntime::initialized_from_admission);
+        let configured_service_supervisor_ready = configured_service_runtime.is_some();
         let handle = HostRequestHandle {
             tx,
             control_tx,
             output_id: None,
             update_gate: Arc::clone(&update_gate),
+            configured_service_supervisor_ready,
         };
         let mut executor = Self {
             bus,
             workspace_projects,
             config_admission,
+            configured_service_runtime,
             update_gate,
             rx,
             control_rx,
@@ -1499,16 +1584,22 @@ impl HostRequestExecutor {
         let (tx, rx) = mpsc::channel(HOST_REQUEST_QUEUE_CAPACITY);
         let (control_tx, control_rx) = mpsc::channel(HOST_REQUEST_QUEUE_CAPACITY);
         let update_gate = crate::host::update::HostUpdateRuntimeGate::new();
+        let configured_service_runtime = config_admission
+            .as_ref()
+            .and_then(ConfiguredServiceRuntime::initialized_from_admission);
+        let configured_service_supervisor_ready = configured_service_runtime.is_some();
         let handle = HostRequestHandle {
             tx,
             control_tx,
             output_id: None,
             update_gate: Arc::clone(&update_gate),
+            configured_service_supervisor_ready,
         };
         let mut executor = Self {
             bus,
             workspace_projects,
             config_admission,
+            configured_service_runtime,
             update_gate,
             rx,
             control_rx,
@@ -1555,6 +1646,7 @@ impl HostRequestExecutor {
                     self.registry.reap_idle(now);
                     self.replay_registry.reap_idle(now);
                     self.artifact_content_registry.reap(now);
+                    self.reconcile_configured_services();
                     // Missed unregister try_send must not leave completed live
                     // metadata forever once the connection has requested shutdown.
                     self.reap_shutdown_outputs();
@@ -1601,6 +1693,7 @@ impl HostRequestExecutor {
                     self.registry.reap_idle(now);
                     self.replay_registry.reap_idle(now);
                     self.artifact_content_registry.reap(now);
+                    self.reconcile_configured_services();
                     self.reap_shutdown_outputs();
                     if let Some(outcome) = self.drive_supervised_maintenance_unit().await? {
                         return Ok(outcome);
@@ -1730,6 +1823,15 @@ impl HostRequestExecutor {
                     .map(|pending| (pending.operation_id, pending.ack));
                 let _ = ack.send(taken);
             }
+        }
+    }
+
+    /// Pump the host-owned configured supervisor on the maintenance lane. The
+    /// service panel and action path therefore observe reconciled process/port
+    /// evidence without doing probes or process work in request dispatch.
+    fn reconcile_configured_services(&mut self) {
+        if let Some(runtime) = self.configured_service_runtime.as_mut() {
+            let _ = runtime.manager.configured_service_snapshots();
         }
     }
 
@@ -3103,6 +3205,7 @@ impl HostRequestExecutor {
                     operation_id: crate::domain::id::OperationId::new(),
                     task_revision: None,
                     event_ids: Vec::new(),
+                    prompt_mutation: None,
                 }
             }
             Command::ConfirmUpdateDrain(intent) => {
@@ -3117,6 +3220,7 @@ impl HostRequestExecutor {
                     operation_id: crate::domain::id::OperationId::new(),
                     task_revision: None,
                     event_ids: Vec::new(),
+                    prompt_mutation: None,
                 }
             }
             Command::AbortUpdateHandoff => {
@@ -3131,6 +3235,7 @@ impl HostRequestExecutor {
                     operation_id: crate::domain::id::OperationId::new(),
                     task_revision: None,
                     event_ids: Vec::new(),
+                    prompt_mutation: None,
                 }
             }
             Command::ArmUpdateInstall(intent) => {
@@ -3145,6 +3250,60 @@ impl HostRequestExecutor {
                     operation_id: crate::domain::id::OperationId::new(),
                     task_revision: None,
                     event_ids: Vec::new(),
+                    prompt_mutation: None,
+                }
+            }
+            Command::ServiceControl(intent) => {
+                if !negotiated
+                    .capabilities
+                    .contains(Capability::ServiceSupervisor)
+                {
+                    return Err(IpcError::UnsupportedCapability);
+                }
+                if intent.resource_generation == 0
+                    || intent.connection_epoch == 0
+                    || intent.action_epoch == 0
+                {
+                    return Err(IpcError::Security(
+                        "service control requires a nonzero admission fence".into(),
+                    ));
+                }
+                let runtime = self
+                    .configured_service_runtime
+                    .as_mut()
+                    .ok_or(IpcError::Unavailable)?;
+                let action = match intent.action {
+                    crate::domain::command::ServiceControlAction::Start => {
+                        crate::services::supervisor::SupervisorAction::Start
+                    }
+                    crate::domain::command::ServiceControlAction::Stop => {
+                        crate::services::supervisor::SupervisorAction::Stop
+                    }
+                    crate::domain::command::ServiceControlAction::Restart => {
+                        crate::services::supervisor::SupervisorAction::Restart
+                    }
+                };
+                runtime
+                    .manager
+                    .configured_service_control(
+                        action,
+                        &intent.service_id,
+                        crate::services::model::AdmissionFence::new(
+                            intent.resource_generation,
+                            intent.connection_epoch,
+                            intent.action_epoch,
+                        ),
+                        crate::services::model::AdmissionRequester::Host(
+                            crate::services::model::HostAuthority::new(runtime.host_id),
+                        ),
+                    )
+                    .map_err(|error| IpcError::Security(error.to_string()))?;
+                CommandReceipt::Accepted {
+                    command_id: envelope.command_id,
+                    operation_id: crate::domain::id::OperationId::new(),
+                    task_revision: None,
+                    event_ids: Vec::new(),
+                    prompt_mutation: None,
                 }
             }
             _ => return Ok(None),
@@ -3407,6 +3566,12 @@ fn dispatch_authenticated_request_inner(
                 return Err(IpcError::UnsupportedCapability);
             }
             validate_authenticated_command_capability(capabilities, &envelope.command)?;
+            // The compatibility seam has no ProcessManager-owned configured
+            // supervisor. Never route service control through the durable bus
+            // or create a second lifecycle owner here.
+            if matches!(envelope.command, Command::ServiceControl(_)) {
+                return Err(IpcError::Unavailable);
+            }
             if matches!(envelope.command, Command::PromptLibrary(_))
                 && !capabilities.grants_personal_prompt_library()
             {
@@ -3496,6 +3661,9 @@ fn validate_authenticated_command_capability(
         | Command::PresentProviderApproval(_)
         | Command::SettleProviderWait(_) => Err(IpcError::UnsupportedCapability),
         Command::SubmitProviderInput(_) if !capabilities.contains(Capability::ProviderInput) => {
+            Err(IpcError::UnsupportedCapability)
+        }
+        Command::ServiceControl(_) if !capabilities.contains(Capability::ServiceSupervisor) => {
             Err(IpcError::UnsupportedCapability)
         }
         _ => Ok(()),

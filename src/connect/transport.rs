@@ -8,7 +8,10 @@ use serde::{Deserialize, Serialize};
 use crate::domain::command::CommandReceipt;
 use crate::domain::id::{SnapshotId, TaskId, TransferId};
 use crate::domain::query::{QueryEnvelope, QueryReply};
-use crate::domain::snapshot::{EventPage, PageLimits, SnapshotPage, SnapshotSection};
+use crate::domain::snapshot::{
+    canonical_event_page_size, canonical_snapshot_page_size, EventPage, PageLimits, SnapshotPage,
+    SnapshotSection,
+};
 use crate::protocol::{CapabilitySet, FrameLimitsError, PhysicalFrameCodec, PhysicalFrameError};
 
 use super::envelope::{
@@ -307,6 +310,45 @@ pub enum ProjectionResponse {
     Events(EventPage),
     Query(QueryReply),
     Receipt(CommandReceipt),
+}
+
+pub fn validate_snapshot_page(
+    page: &SnapshotPage,
+    limits: PageLimits,
+) -> Result<(), ProjectionError> {
+    limits
+        .validate()
+        .map_err(|_| ProjectionError::InvalidRequest)?;
+    if page.items.len() > usize::try_from(limits.max_items).unwrap_or(usize::MAX)
+        || page.encoded_bytes > limits.max_encoded_bytes
+    {
+        return Err(ProjectionError::Bounds);
+    }
+    let encoded =
+        canonical_snapshot_page_size(page).map_err(|_| ProjectionError::InvalidRequest)?;
+    if page.encoded_bytes != encoded {
+        return Err(ProjectionError::InvalidRequest);
+    }
+    if encoded > limits.max_encoded_bytes {
+        return Err(ProjectionError::Bounds);
+    }
+    validate_cursor(page.next_cursor.as_deref())?;
+    Ok(())
+}
+
+pub fn validate_event_page(page: &EventPage, limits: PageLimits) -> Result<(), ProjectionError> {
+    limits
+        .validate()
+        .map_err(|_| ProjectionError::InvalidRequest)?;
+    if page.events.len() > usize::try_from(limits.max_items).unwrap_or(usize::MAX) {
+        return Err(ProjectionError::Bounds);
+    }
+    validate_cursor(page.next_cursor.as_deref())?;
+    let encoded = canonical_event_page_size(page).map_err(|_| ProjectionError::InvalidRequest)?;
+    if encoded > limits.max_encoded_bytes {
+        return Err(ProjectionError::Bounds);
+    }
+    Ok(())
 }
 
 fn validate_cursor(cursor: Option<&[u8]>) -> Result<(), ProjectionError> {

@@ -174,11 +174,13 @@ impl TaskLinkReducer {
         local_revision: u64,
         portal_revision: u64,
     ) -> Result<&ManagedTaskLink, OrgError> {
+        let local_title = local_title.into();
+        let portal_title = portal_title.into();
         let link = self
             .by_task
             .get_mut(&host_task_key(host_id, local_task_id))
             .ok_or(OrgError::Unlinked)?;
-        if local_title.as_ref() == portal_title.as_ref() {
+        if local_title == portal_title {
             link.title_conflict = None;
             return Ok(link);
         }
@@ -186,8 +188,8 @@ impl TaskLinkReducer {
             return Err(OrgError::LastWriteWinsForbidden);
         }
         link.title_conflict = Some(TitleConflict {
-            local_title: local_title.into(),
-            portal_title: portal_title.into(),
+            local_title,
+            portal_title,
             local_revision,
             portal_revision,
         });

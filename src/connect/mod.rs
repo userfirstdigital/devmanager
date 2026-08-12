@@ -110,10 +110,11 @@ pub use push::{
     SanitizedPush, MAX_ROUTE_BYTES, MAX_SAFE_TITLE_BYTES,
 };
 pub use relay::{
-    AccountId, DevicePublicId, HostPublicId, OpaqueRelay, RateKey, RelayError, RelayObservation,
-    RelayStatus, RouteId, RouteTicket, SignedRouteTicket, TicketAudience, TicketId,
-    TicketSigningKey, BIND_RATE_WINDOW_SECS, MAX_BIND_ATTEMPTS_PER_WINDOW, MAX_RELAY_QUEUE_BYTES,
-    MAX_RELAY_QUEUE_FRAMES, MAX_ROUTE_TICKET_TTL_SECS, PRESENCE_TTL_SECS, ROUTE_TICKET_DOMAIN,
+    AccountId, DevicePublicId, HostPublicId as RelayHostPublicId, OpaqueRelay, RateKey, RelayError,
+    RelayObservation, RelayStatus, RouteId, RouteTicket, SignedRouteTicket, TicketAudience,
+    TicketId, TicketSigningKey, BIND_RATE_WINDOW_SECS, MAX_BIND_ATTEMPTS_PER_WINDOW,
+    MAX_RELAY_QUEUE_BYTES, MAX_RELAY_QUEUE_FRAMES, MAX_ROUTE_TICKET_TTL_SECS, PRESENCE_TTL_SECS,
+    ROUTE_TICKET_DOMAIN,
 };
 pub use schema::{
     canonical_schema_fixtures, catalog_entry, encode_canonical_schema, payload_catalog,

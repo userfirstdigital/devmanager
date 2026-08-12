@@ -73,6 +73,7 @@ pub enum Capability {
     HostShutdown = 13,
     ProviderInput = 14,
     OrganizationProjection = 15,
+    ServiceSupervisor = 16,
 }
 
 impl Capability {
@@ -99,6 +100,7 @@ impl Capability {
             Self::HostShutdown => "host_shutdown",
             Self::ProviderInput => "provider_input",
             Self::OrganizationProjection => "organization_projection",
+            Self::ServiceSupervisor => "service_supervisor",
         }
     }
 }

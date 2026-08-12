@@ -200,7 +200,7 @@ impl CommandBus {
         }
         if matches!(
             &envelope.command,
-            Command::CreateTask(_) | Command::CreateTaskV2(_)
+            Command::CreateTask(_) | Command::CreateTaskV2(_) | Command::ServiceControl(_)
         ) {
             return Err(StoreError::HostAuthorityRequired);
         }
@@ -252,6 +252,9 @@ impl CommandBus {
     ) -> Result<CommandReceipt, StoreError> {
         if matches!(envelope.command, Command::PromptLibrary(_)) {
             return self.execute(envelope);
+        }
+        if matches!(envelope.command, Command::ServiceControl(_)) {
+            return Err(StoreError::HostAuthorityRequired);
         }
         match authorization {
             Some(authorization) => {
@@ -880,7 +883,7 @@ pub(crate) fn execute(
 ) -> Result<CommandReceipt, StoreError> {
     if matches!(
         &envelope.command,
-        Command::CreateTask(_) | Command::CreateTaskV2(_)
+        Command::CreateTask(_) | Command::CreateTaskV2(_) | Command::ServiceControl(_)
     ) {
         return Err(StoreError::HostAuthorityRequired);
     }

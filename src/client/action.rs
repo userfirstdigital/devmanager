@@ -2,7 +2,9 @@
 //!
 //! This slice exposes `host.actions`, `host.status`, `task.list`, `task.show`,
 //! `task.create`, `task.rename`, and provider input/turn controls. It is
-//! intentionally not a dynamic plugin framework. There is no Restart action.
+//! intentionally not a dynamic plugin framework. Configured service
+//! start/stop/restart actions are capability gated and only enabled after the
+//! host supervisor is ready.
 
 use std::sync::OnceLock;
 
@@ -10,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::command::{
     Command, CommandEnvelope, CreateTaskIntent, CreateTaskRequestIntent, RenameTaskIntent,
-    SubmitProviderInputIntent,
+    ServiceControlAction, ServiceControlIntent, SubmitProviderInputIntent,
 };
 use crate::domain::id::{AgentSessionId, PromptChainId, PromptVersionId};
 use crate::domain::provider_input::{ProviderInputAction, ProviderInputIntentError};
@@ -100,12 +102,12 @@ pub const ACTION_PROMPT_CHAIN_PAGE: &str = "prompt.library.chain_page";
 pub const ACTION_PROMPT_HISTORY_PAGE: &str = "prompt.library.history_page";
 /// Client-local composer insertion. Not a host catalog action and never sends.
 pub const ACTION_PROMPT_PUT_IN_COMPOSER: &str = "prompt.library.put_in_composer";
-/// Reserved control ids for the configured-service supervisor. They are not
-/// advertised in the shared catalog until a host dispatch path exists.
+/// Stable control ids for the configured-service supervisor. The host only
+/// grants their required capability after its one supervisor is initialized.
 pub const ACTION_SERVICE_START: &str = "service.start";
-/// Reserved stop id; not advertised until host dispatch is wired.
+/// Stable stop id; capability-gated by the host supervisor.
 pub const ACTION_SERVICE_STOP: &str = "service.stop";
-/// Reserved restart id; not advertised until host dispatch is wired.
+/// Stable restart id; capability-gated by the host supervisor.
 pub const ACTION_SERVICE_RESTART: &str = "service.restart";
 /// Reserved logs id; not advertised until host dispatch is wired.
 pub const ACTION_SERVICE_LOGS: &str = "service.logs";
@@ -348,9 +350,15 @@ pub enum ActionRequest {
     HostActions,
     HostStatus,
     TaskList,
-    TaskShow { task_id: TaskId },
+    TaskShow {
+        task_id: TaskId,
+    },
     TaskCreate(TaskCreateArguments),
     TaskRename(TaskRenameArguments),
+    ServiceControl {
+        action: ServiceControlAction,
+        arguments: ServiceControlArguments,
+    },
 }
 
 impl ActionRequest {
@@ -362,6 +370,11 @@ impl ActionRequest {
             Self::TaskShow { .. } => ACTION_TASK_SHOW,
             Self::TaskCreate(_) => ACTION_TASK_CREATE,
             Self::TaskRename(_) => ACTION_TASK_RENAME,
+            Self::ServiceControl { action, .. } => match action {
+                ServiceControlAction::Start => ACTION_SERVICE_START,
+                ServiceControlAction::Stop => ACTION_SERVICE_STOP,
+                ServiceControlAction::Restart => ACTION_SERVICE_RESTART,
+            },
         }
     }
 
@@ -387,9 +400,12 @@ pub fn catalog() -> &'static [ActionDescriptor] {
     static CATALOG: OnceLock<Vec<ActionDescriptor>> = OnceLock::new();
     CATALOG
         .get_or_init(|| {
-            let mut entries = Vec::with_capacity(ACTIONS.len() + PROMPT_LIBRARY_EXTENSION.len());
+            let mut entries = Vec::with_capacity(
+                ACTIONS.len() + PROMPT_LIBRARY_EXTENSION.len() + SERVICE_CONTROL_EXTENSION.len(),
+            );
             entries.extend_from_slice(ACTIONS);
             entries.extend_from_slice(PROMPT_LIBRARY_EXTENSION);
+            entries.extend_from_slice(SERVICE_CONTROL_EXTENSION);
             entries
         })
         .as_slice()
@@ -438,6 +454,42 @@ const PROMPT_LIBRARY_EXTENSION: &[ActionDescriptor] = &[
     },
 ];
 
+/// Host service controls are catalogued as typed actions. The host grants the
+/// `ServiceSupervisor` capability only after its configured supervisor is
+/// initialized; clients therefore fail closed until that grant is present.
+const SERVICE_CONTROL_EXTENSION: &[ActionDescriptor] = &[
+    ActionDescriptor {
+        id: ACTION_SERVICE_START,
+        title: "Start service",
+        description: "Start one configured service through the host supervisor.",
+        keywords: &["service", "start", "server"],
+        scope: ActionScope::Host,
+        required_capability: Some(Capability::ServiceSupervisor),
+        risk: ActionRisk::Mutating,
+        argument_schema: ActionArgumentSchema::ServiceControlV1,
+    },
+    ActionDescriptor {
+        id: ACTION_SERVICE_STOP,
+        title: "Stop service",
+        description: "Stop one configured service through the host supervisor.",
+        keywords: &["service", "stop", "server"],
+        scope: ActionScope::Host,
+        required_capability: Some(Capability::ServiceSupervisor),
+        risk: ActionRisk::Mutating,
+        argument_schema: ActionArgumentSchema::ServiceControlV1,
+    },
+    ActionDescriptor {
+        id: ACTION_SERVICE_RESTART,
+        title: "Restart service",
+        description: "Restart one configured service through the host supervisor.",
+        keywords: &["service", "restart", "server"],
+        scope: ActionScope::Host,
+        required_capability: Some(Capability::ServiceSupervisor),
+        risk: ActionRisk::Mutating,
+        argument_schema: ActionArgumentSchema::ServiceControlV1,
+    },
+];
+
 pub fn registered_actions() -> impl Iterator<Item = &'static ActionDescriptor> {
     catalog().iter()
 }
@@ -450,6 +502,9 @@ pub fn disabled_reason(id: &str, granted: CapabilitySet) -> Option<&'static str>
         if !granted.contains(required) {
             return Some(match required {
                 Capability::PromptProjection => "personal_prompt_library capability not granted",
+                Capability::ServiceSupervisor => {
+                    "configured service supervisor capability not granted"
+                }
                 _ => "required capability not granted",
             });
         }
@@ -467,6 +522,38 @@ pub fn disabled_reason(id: &str, granted: CapabilitySet) -> Option<&'static str>
 
 pub fn action_enabled(id: &str, granted: CapabilitySet) -> bool {
     action_by_id(id).is_some() && disabled_reason(id, granted).is_none()
+}
+
+/// Return the catalog disabled reason with the host-runtime readiness gate.
+///
+/// A negotiated capability is not enough: the host must have successfully
+/// bound its one configured supervisor before service actions become usable.
+pub fn service_action_disabled_reason(
+    id: &str,
+    granted: CapabilitySet,
+    supervisor_initialized: bool,
+) -> Option<&'static str> {
+    let reason = disabled_reason(id, granted);
+    if reason.is_some() {
+        return reason;
+    }
+    if matches!(
+        id,
+        ACTION_SERVICE_START | ACTION_SERVICE_STOP | ACTION_SERVICE_RESTART
+    ) && !supervisor_initialized
+    {
+        return Some("configured service supervisor is not initialized");
+    }
+    None
+}
+
+pub fn action_enabled_with_service_state(
+    id: &str,
+    granted: CapabilitySet,
+    supervisor_initialized: bool,
+) -> bool {
+    action_by_id(id).is_some()
+        && service_action_disabled_reason(id, granted, supervisor_initialized).is_none()
 }
 
 pub fn action_by_id(id: &str) -> Option<&'static ActionDescriptor> {
@@ -769,17 +856,67 @@ pub fn provider_input_command(
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceControlActionError {
+    UnknownAction,
+    InvalidFence,
+}
+
+impl std::fmt::Display for ServiceControlActionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownAction => formatter.write_str("unknown service control action"),
+            Self::InvalidFence => formatter.write_str("service control fence must be nonzero"),
+        }
+    }
+}
+
+impl std::error::Error for ServiceControlActionError {}
+
+/// Build a host-only configured-service command from one catalog action.
+pub fn service_control_command(
+    command_id: CommandId,
+    client_id: ClientId,
+    issued_at_ms: i64,
+    action_id: &str,
+    args: ServiceControlArguments,
+) -> Result<CommandEnvelope, ServiceControlActionError> {
+    let action = match action_id {
+        ACTION_SERVICE_START => ServiceControlAction::Start,
+        ACTION_SERVICE_STOP => ServiceControlAction::Stop,
+        ACTION_SERVICE_RESTART => ServiceControlAction::Restart,
+        _ => return Err(ServiceControlActionError::UnknownAction),
+    };
+    if args.resource_generation == 0 || args.connection_epoch == 0 || args.action_epoch == 0 {
+        return Err(ServiceControlActionError::InvalidFence);
+    }
+    Ok(CommandEnvelope {
+        command_id,
+        client_id,
+        task_id: None,
+        issued_at_ms,
+        expected_task_revision: None,
+        command: Command::ServiceControl(ServiceControlIntent {
+            service_id: args.service_id,
+            resource_generation: args.resource_generation,
+            connection_epoch: args.connection_epoch,
+            action_epoch: args.action_epoch,
+            action,
+        }),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        catalog, require_unique_ids, task_create_command, task_rename_command, task_show_query,
-        ActionArgumentSchema, ActionRisk, ActionScope, TaskCreateArguments, TaskCreateV2Arguments,
-        TaskRenameArguments, ACTION_HOST_ACTIONS, ACTION_HOST_STATUS,
-        ACTION_PROVIDER_ANSWER_QUESTION, ACTION_PROVIDER_NEW_CONVERSATION,
-        ACTION_PROVIDER_QUEUE_FOLLOW_UP, ACTION_PROVIDER_RESOLVE_APPROVAL,
-        ACTION_PROVIDER_SEND_NOW, ACTION_PROVIDER_STEER_CURRENT_TURN, ACTION_PROVIDER_STOP_TURN,
-        ACTION_SERVICE_HEALTH, ACTION_SERVICE_LOGS, ACTION_SERVICE_RESTART, ACTION_SERVICE_START,
-        ACTION_SERVICE_STOP,
+        catalog, require_unique_ids, service_control_command, task_create_command,
+        task_rename_command, task_show_query, ActionArgumentSchema, ActionRisk, ActionScope,
+        ServiceControlArguments, TaskCreateArguments, TaskCreateV2Arguments, TaskRenameArguments,
+        ACTION_HOST_ACTIONS, ACTION_HOST_STATUS, ACTION_PROVIDER_ANSWER_QUESTION,
+        ACTION_PROVIDER_NEW_CONVERSATION, ACTION_PROVIDER_QUEUE_FOLLOW_UP,
+        ACTION_PROVIDER_RESOLVE_APPROVAL, ACTION_PROVIDER_SEND_NOW,
+        ACTION_PROVIDER_STEER_CURRENT_TURN, ACTION_PROVIDER_STOP_TURN, ACTION_SERVICE_HEALTH,
+        ACTION_SERVICE_LOGS, ACTION_SERVICE_RESTART, ACTION_SERVICE_START, ACTION_SERVICE_STOP,
         ACTION_TASK_CREATE, ACTION_TASK_CREATE_V2, ACTION_TASK_LIST, ACTION_TASK_RENAME,
         ACTION_TASK_SHOW,
     };
@@ -791,7 +928,7 @@ mod tests {
                 ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity,
                 WorkspaceRef,
             },
-            ClientId, CommandId, EnvironmentId, ProjectId, RequestId, TaskId,
+            ClientId, CommandId, EnvironmentId, ProjectId, RequestId, ServiceId, TaskId,
         },
         protocol::Capability,
     };
@@ -812,10 +949,10 @@ mod tests {
         assert!(ids.contains(&ACTION_PROVIDER_RESOLVE_APPROVAL));
         assert!(ids.contains(&ACTION_PROVIDER_STOP_TURN));
         assert!(!ids.contains(&ACTION_PROVIDER_NEW_CONVERSATION));
-        assert_eq!(ids.len(), 16);
-        assert!(!ids.contains(&ACTION_SERVICE_START));
-        assert!(!ids.contains(&ACTION_SERVICE_STOP));
-        assert!(!ids.contains(&ACTION_SERVICE_RESTART));
+        assert_eq!(ids.len(), 19);
+        assert!(ids.contains(&ACTION_SERVICE_START));
+        assert!(ids.contains(&ACTION_SERVICE_STOP));
+        assert!(ids.contains(&ACTION_SERVICE_RESTART));
         assert!(!ids.contains(&ACTION_SERVICE_LOGS));
         assert!(!ids.contains(&ACTION_SERVICE_HEALTH));
         require_unique_ids().expect("ids must be unique");
@@ -857,6 +994,12 @@ mod tests {
                         ActionArgumentSchema::ProviderInputV1,
                         Some(Capability::ProviderInput),
                     ),
+                    ACTION_SERVICE_START | ACTION_SERVICE_STOP | ACTION_SERVICE_RESTART => (
+                        ActionScope::Host,
+                        ActionRisk::Mutating,
+                        ActionArgumentSchema::ServiceControlV1,
+                        Some(Capability::ServiceSupervisor),
+                    ),
                     _ => (
                         ActionScope::Host,
                         ActionRisk::ReadOnly,
@@ -881,6 +1024,50 @@ mod tests {
         assert_eq!(query.client_id, client_id);
         assert_eq!(query.task_id, Some(task_id));
         assert_eq!(query.query, Query::TaskSnapshot);
+    }
+
+    #[test]
+    fn service_control_factory_requires_a_live_fence_and_keeps_host_scope() {
+        let command_id = CommandId::new();
+        let client_id = ClientId::new();
+        let service_id = ServiceId::new("api").expect("bounded service id");
+        let envelope = service_control_command(
+            command_id,
+            client_id,
+            1_725_000_000_100,
+            ACTION_SERVICE_START,
+            ServiceControlArguments {
+                service_id: service_id.clone(),
+                resource_generation: 1,
+                connection_epoch: 2,
+                action_epoch: 3,
+            },
+        )
+        .expect("valid service action");
+        assert_eq!(envelope.command_id, command_id);
+        assert_eq!(envelope.client_id, client_id);
+        assert!(envelope.task_id.is_none());
+        let Command::ServiceControl(intent) = envelope.command else {
+            panic!("service action must build ServiceControl");
+        };
+        assert_eq!(intent.service_id, service_id);
+        assert_eq!(intent.resource_generation, 1);
+        assert_eq!(intent.connection_epoch, 2);
+        assert_eq!(intent.action_epoch, 3);
+        assert_eq!(intent.action, crate::domain::ServiceControlAction::Start);
+        assert!(service_control_command(
+            CommandId::new(),
+            client_id,
+            1,
+            ACTION_SERVICE_START,
+            ServiceControlArguments {
+                service_id,
+                resource_generation: 0,
+                connection_epoch: 2,
+                action_epoch: 3,
+            },
+        )
+        .is_err());
     }
 
     #[test]

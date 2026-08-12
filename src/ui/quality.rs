@@ -6,10 +6,12 @@
 
 use crate::client::action::{
     catalog, task_create_command, task_rename_command, ActionArgumentSchema, ActionRequest,
-    TaskCreateArguments, TaskRenameArguments, ACTION_HOST_ACTIONS, ACTION_HOST_STATUS,
+    ServiceControlArguments, TaskCreateArguments, TaskRenameArguments, ACTION_HOST_ACTIONS,
+    ACTION_HOST_STATUS, ACTION_SERVICE_RESTART, ACTION_SERVICE_START, ACTION_SERVICE_STOP,
     ACTION_TASK_LIST, ACTION_TASK_SHOW,
 };
 use crate::client::model::{ClientModel, ClientModelBuilder, ClientModelError};
+use crate::domain::command::ServiceControlAction;
 use crate::domain::event::{DomainEvent, Event};
 use crate::domain::id::{
     ClientId, CommandId, EnvironmentId, EventId, ProjectId, SnapshotId, TaskId,
@@ -55,6 +57,7 @@ pub enum CatalogInput {
         args: TaskRenameArguments,
         expected_revision: u64,
     },
+    Service(ServiceControlArguments),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -471,6 +474,32 @@ pub fn request_from_catalog(id: &str, input: CatalogInput) -> Result<ActionReque
             }
             _ => Err(QualityError::InvalidControl(
                 "task.rename requires TaskRenameArguments".into(),
+            )),
+        },
+        ActionArgumentSchema::TaskCreateV2
+        | ActionArgumentSchema::ProviderInputV1
+        | ActionArgumentSchema::PromptMetadataPageV1
+        | ActionArgumentSchema::PromptVersionPageV1
+        | ActionArgumentSchema::PromptDiffV1
+        | ActionArgumentSchema::PromptChainPageV1 => Err(QualityError::InvalidControl(format!(
+            "catalog action {id} requires an unsupported argument schema"
+        ))),
+        ActionArgumentSchema::ServiceControlV1 => match input {
+            CatalogInput::Service(arguments) => {
+                let action = match id {
+                    ACTION_SERVICE_START => ServiceControlAction::Start,
+                    ACTION_SERVICE_STOP => ServiceControlAction::Stop,
+                    ACTION_SERVICE_RESTART => ServiceControlAction::Restart,
+                    _ => {
+                        return Err(QualityError::InvalidControl(
+                            "unknown service control action".into(),
+                        ))
+                    }
+                };
+                Ok(ActionRequest::ServiceControl { action, arguments })
+            }
+            _ => Err(QualityError::InvalidControl(
+                "service control requires ServiceControlArguments".into(),
             )),
         },
     }

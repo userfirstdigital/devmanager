@@ -17,8 +17,8 @@ pub use error_boundary::{SafeErrorCode, SafeErrorProjection};
 pub use icon_button::{IconButton, IconId, TooltipContract};
 pub use interaction::{
     AccessibilityMetadata, AccessibleRole, ActionEvent, ActionRequest, ActivationSource,
-    ComponentError, ControlPresentation, FocusRing, InteractionState, InteractionStateModel,
-    InteractionTransition, KeyboardKey, VisualState,
+    ComponentError, ControlPresentation, FocusEpoch, FocusEpochSource, FocusRing, InteractionState,
+    InteractionStateModel, InteractionTransition, KeyboardKey, VisualState,
 };
 pub use status_light::{StatusLight, StatusPresentation};
 pub use text_field::{TextField, TextFieldError, TextFieldKey, TextFieldLimits};

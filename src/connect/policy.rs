@@ -1434,7 +1434,8 @@ fn canonical_command_action(command: &Command) -> Option<ActionId> {
         | Command::SetPrimaryAgent { .. }
         | Command::RegisterArtifact { .. }
         | Command::RegisterResource { .. }
-        | Command::ReleaseResource { .. } => Some(ActionId::MUTATE_TASK),
+        | Command::ReleaseResource { .. }
+        | Command::ServiceControl(_) => Some(ActionId::MUTATE_TASK),
         Command::CreateTask(_) | Command::ConfirmHostQuit(_) => None,
     }
 }

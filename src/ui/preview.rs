@@ -12,6 +12,7 @@ use std::fmt::{Display, Formatter};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::assets::AppAssets;
 use crate::client::action;
@@ -235,6 +236,8 @@ impl PreviewPathPolicy {
 pub struct PreviewRequest {
     fixture_path: PathBuf,
     output_path: PathBuf,
+    window_hold_ms: u32,
+    trusted_output_authority: Arc<preview_capture::CaptureOutputAuthority>,
 }
 
 impl PreviewRequest {
@@ -246,13 +249,29 @@ impl PreviewRequest {
         &self.output_path
     }
 
+    pub(crate) fn capture_authority(&self) -> &Arc<preview_capture::CaptureOutputAuthority> {
+        &self.trusted_output_authority
+    }
+
+    pub(crate) fn window_hold_ms(&self) -> u32 {
+        self.window_hold_ms
+    }
+
     pub fn write_bgra_png_atomic(
         &self,
         width: u32,
         height: u32,
         bgra: &[u8],
     ) -> Result<(), preview_capture::PreviewCaptureError> {
-        preview_capture::encode_bgra_png_atomic(&self.output_path, width, height, bgra)
+        let lease = preview_capture::CaptureGeneration::new().begin();
+        preview_capture::encode_bgra_png_atomic_with_authority(
+            Arc::clone(&self.trusted_output_authority),
+            width,
+            height,
+            bgra,
+            preview_capture::CaptureDeadline::from_now(preview_capture::FIRST_FRAME_DEADLINE),
+            &lease,
+        )
     }
 
     pub fn validate(
@@ -309,6 +328,11 @@ impl PreviewRequest {
         let temp_root = checked_path(policy.temp_root())?;
         let output_is_approved =
             is_within(&output_check, &output_root) || is_within(&output_check, &temp_root);
+        let trusted_output_root = if is_within(&output_check, &output_root) {
+            output_root.clone()
+        } else {
+            temp_root.clone()
+        };
         if is_sensitive_path(&output_check) {
             return Err(PreviewError::SensitivePath { path: output_path });
         }
@@ -328,9 +352,26 @@ impl PreviewRequest {
             return Err(PreviewError::OutputAlreadyExists { path: output_path });
         }
 
+        let output_parent = output_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .ok_or_else(|| {
+                PreviewError::InvalidArgument("output must have a parent directory".into())
+            })?;
+        fs::create_dir_all(output_parent).map_err(|error| PreviewError::OutputFailed {
+            reason: preview_capture::bounded_redacted_diagnostic(&error.to_string()),
+        })?;
+        let trusted_output_authority =
+            preview_capture::CaptureOutputAuthority::new(&output_path, &trusted_output_root)
+                .map_err(|error| PreviewError::OutputFailed {
+                    reason: preview_capture::bounded_redacted_diagnostic(&error.to_string()),
+                })?;
+
         Ok(Self {
             fixture_path,
             output_path,
+            window_hold_ms: 0,
+            trusted_output_authority: Arc::new(trusted_output_authority),
         })
     }
 }
@@ -519,6 +560,12 @@ impl PreviewApplication {
                 });
             }
             (_, None) => None,
+            (_, Some(_)) => {
+                return Err(PreviewError::MalformedFixture {
+                    path: request.fixture_path,
+                    message: "unsupported preview roots cannot carry a component gallery".into(),
+                });
+            }
         };
         let is_task_cockpit = fixture.root.kind == "task-cockpit";
         let body = if is_task_cockpit {
@@ -1075,6 +1122,12 @@ impl PreviewError {
             preview_capture::PreviewCaptureError::DeadlineExceeded => {
                 Self::VisibleWindowsCaptureUnavailable {
                     kind: CaptureUnavailableKind::DeadlineExceeded,
+                    reason,
+                }
+            }
+            preview_capture::PreviewCaptureError::CaptureCancelled => {
+                Self::VisibleWindowsCaptureUnavailable {
+                    kind: CaptureUnavailableKind::CaptureClosed,
                     reason,
                 }
             }
