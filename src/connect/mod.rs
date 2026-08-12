@@ -81,8 +81,8 @@ pub use identity_store::{
 pub use invites::{
     guest_may_perform, ContentClass, InviteAuditEvent, InviteAuditKind, InviteError,
     InviteGrantView, InviteRole, InviteUsePolicy, IssuedInvite, PinnedHostPublicId,
-    RedeemedDevicePublicId, TaskInviteStore, INVITE_SECRET_BYTES, MAX_INVITE_NICKNAME_BYTES,
-    MAX_TASK_INVITES,
+    RedeemedDevicePublicId, TaskInviteStore, INVITE_SECRET_BYTES, MAX_INVITE_AUDIT_EVENTS,
+    MAX_INVITE_LIFETIME_MS, MAX_INVITE_NICKNAME_BYTES, MAX_TASK_INVITES,
 };
 pub use local_actions::{LocalActionReceipt, LocalActionRegistry, LocalActionRequest};
 pub use managed::{ManagedTaskLink, ManagedTaskProjection, TaskLinkReducer};
@@ -113,8 +113,9 @@ pub use relay::{
     AccountId, DevicePublicId, HostPublicId as RelayHostPublicId, OpaqueRelay, RateKey, RelayError,
     RelayObservation, RelayStatus, RouteId, RouteTicket, SignedRouteTicket, TicketAudience,
     TicketId, TicketSigningKey, BIND_RATE_WINDOW_SECS, MAX_BIND_ATTEMPTS_PER_WINDOW,
-    MAX_RELAY_QUEUE_BYTES, MAX_RELAY_QUEUE_FRAMES, MAX_ROUTE_TICKET_TTL_SECS, PRESENCE_TTL_SECS,
-    ROUTE_TICKET_DOMAIN,
+    MAX_RELAY_CONSUMED_NONCES, MAX_RELAY_QUEUE_BYTES, MAX_RELAY_QUEUE_FRAMES, MAX_RELAY_RATE_KEYS,
+    MAX_RELAY_REVOKED_DEVICES, MAX_RELAY_REVOKED_TICKETS, MAX_RELAY_ROUTES,
+    MAX_ROUTE_TICKET_TTL_SECS, PRESENCE_TTL_SECS, ROUTE_TICKET_DOMAIN,
 };
 pub use schema::{
     canonical_schema_fixtures, catalog_entry, encode_canonical_schema, payload_catalog,
@@ -124,7 +125,9 @@ pub use schema::{
 };
 pub use session::{
     ActionAnswer, ConnectSession, DeviceInput, SessionAdmitError, SessionReceipt,
-    SessionReceiptKind,
+    SessionReceiptKind, MAX_SESSION_ACCEPTED_COMMANDS, MAX_SESSION_CONNECTED,
+    MAX_SESSION_INVALIDATED, MAX_SESSION_OUTSTANDING, MAX_SESSION_QUEUED, MAX_SESSION_RESOURCES,
+    MAX_SESSION_SETTLED,
 };
 pub use telemetry::{
     encode_observation, ObservationAuthority, ObservationCompleteness, ObservationConfidence,

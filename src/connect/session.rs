@@ -11,6 +11,14 @@ use crate::domain::id::{ClientId, CommandId, OperationId, RequestId, ResourceId,
 use super::epoch::{ActionEpoch, FocusEpoch, RuntimeGeneration, TurnEpoch};
 use super::presence::{LastSenderHint, PresenceSink};
 
+pub const MAX_SESSION_ACCEPTED_COMMANDS: usize = 4_096;
+pub const MAX_SESSION_QUEUED: usize = 256;
+pub const MAX_SESSION_RESOURCES: usize = 512;
+pub const MAX_SESSION_OUTSTANDING: usize = 64;
+pub const MAX_SESSION_SETTLED: usize = 512;
+pub const MAX_SESSION_CONNECTED: usize = 32;
+pub const MAX_SESSION_INVALIDATED: usize = 1_024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionAdmitError {
     ZeroEpoch,
@@ -25,6 +33,8 @@ pub enum SessionAdmitError {
     QueueInvalidated,
     AlreadyResolved,
     StaleAction,
+    NoOutstandingRequest,
+    StateBoundExceeded,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,6 +105,7 @@ pub struct ConnectSession {
     queue_generation: u64,
     accepted_commands: BTreeMap<CommandId, OperationId>,
     resource_sequences: BTreeMap<ResourceId, u64>,
+    outstanding_requests: BTreeMap<RequestId, ActionEpoch>,
     settled_requests: BTreeMap<RequestId, SettledAnswer>,
     queued: BTreeMap<CommandId, QueuedMutation>,
     invalidated: BTreeSet<CommandId>,
@@ -113,6 +124,7 @@ impl ConnectSession {
             queue_generation: 1,
             accepted_commands: BTreeMap::new(),
             resource_sequences: BTreeMap::new(),
+            outstanding_requests: BTreeMap::new(),
             settled_requests: BTreeMap::new(),
             queued: BTreeMap::new(),
             invalidated: BTreeSet::new(),
@@ -150,8 +162,17 @@ impl ConnectSession {
         None
     }
 
-    pub fn connect_client(&mut self, client_id: ClientId) {
+    /// Last-sender is never derived from session control state; presence owns it.
+    pub const fn last_sender_lease(&self) -> Option<ClientId> {
+        None
+    }
+
+    pub fn connect_client(&mut self, client_id: ClientId) -> Result<(), SessionAdmitError> {
+        if self.connected.len() >= MAX_SESSION_CONNECTED && !self.connected.contains(&client_id) {
+            return Err(SessionAdmitError::StateBoundExceeded);
+        }
         self.connected.insert(client_id);
+        Ok(())
     }
 
     pub fn disconnect_client(&mut self, client_id: ClientId) {
@@ -169,18 +190,39 @@ impl ConnectSession {
             .collect();
         for command_id in condemned {
             self.queued.remove(&command_id);
-            self.invalidated.insert(command_id);
+            self.retain_invalidated(command_id);
         }
     }
 
     pub fn restart_provider(&mut self) {
         self.runtime_generation = self.runtime_generation.saturating_next();
+        self.outstanding_requests.clear();
         self.settled_requests.clear();
     }
 
     pub fn switch_focus(&mut self) -> FocusEpoch {
         self.focus_epoch = self.focus_epoch.saturating_next();
         self.focus_epoch
+    }
+
+    pub fn open_request(
+        &mut self,
+        request_id: RequestId,
+        action_epoch: ActionEpoch,
+    ) -> Result<(), SessionAdmitError> {
+        if action_epoch.get() == 0 {
+            return Err(SessionAdmitError::ZeroEpoch);
+        }
+        if self.settled_requests.contains_key(&request_id) {
+            return Err(SessionAdmitError::AlreadyResolved);
+        }
+        if self.outstanding_requests.len() >= MAX_SESSION_OUTSTANDING
+            && !self.outstanding_requests.contains_key(&request_id)
+        {
+            return Err(SessionAdmitError::StateBoundExceeded);
+        }
+        self.outstanding_requests.insert(request_id, action_epoch);
+        Ok(())
     }
 
     pub fn enqueue(&mut self, input: DeviceInput) -> Result<(), SessionAdmitError> {
@@ -190,6 +232,9 @@ impl ConnectSession {
         }
         if self.invalidated.contains(&input.command_id) {
             return Err(SessionAdmitError::QueueInvalidated);
+        }
+        if self.queued.len() >= MAX_SESSION_QUEUED && !self.queued.contains_key(&input.command_id) {
+            return Err(SessionAdmitError::StateBoundExceeded);
         }
         self.queued.insert(
             input.command_id,
@@ -227,12 +272,20 @@ impl ConnectSession {
                 settled: false,
             });
         }
+        if self.accepted_commands.len() >= MAX_SESSION_ACCEPTED_COMMANDS {
+            return Err(SessionAdmitError::StateBoundExceeded);
+        }
         if let Some(expected) = input.expected_revision {
             if expected != self.revision {
                 return Err(SessionAdmitError::RevisionConflict);
             }
         }
         if let Some(resource_id) = input.resource_id {
+            if self.resource_sequences.len() >= MAX_SESSION_RESOURCES
+                && !self.resource_sequences.contains_key(&resource_id)
+            {
+                return Err(SessionAdmitError::StateBoundExceeded);
+            }
             let last = self
                 .resource_sequences
                 .get(&resource_id)
@@ -253,7 +306,8 @@ impl ConnectSession {
             self.last_client = Some(input.client_id);
         }
         self.revision = self.revision.saturating_add(1);
-        presence.record(LastSenderHint::new(
+        // Presence is UX metadata only; recording failure must not invent a lease.
+        let _ = presence.record(LastSenderHint::new(
             self.task_id,
             input.client_id,
             input.observed_at_ms,
@@ -272,6 +326,9 @@ impl ConnectSession {
         if answer.task_id != self.task_id {
             return Err(SessionAdmitError::TaskMismatch);
         }
+        if !self.connected.contains(&answer.client_id) {
+            return Err(SessionAdmitError::ClientDisconnected);
+        }
         if answer.runtime_generation != self.runtime_generation {
             return Err(SessionAdmitError::StaleGeneration);
         }
@@ -281,6 +338,17 @@ impl ConnectSession {
             }
             return Err(SessionAdmitError::AlreadyResolved);
         }
+        let Some(expected_epoch) = self.outstanding_requests.get(&answer.request_id).copied()
+        else {
+            return Err(SessionAdmitError::NoOutstandingRequest);
+        };
+        if expected_epoch != answer.action_epoch {
+            return Err(SessionAdmitError::StaleAction);
+        }
+        if self.settled_requests.len() >= MAX_SESSION_SETTLED {
+            return Err(SessionAdmitError::StateBoundExceeded);
+        }
+        self.outstanding_requests.remove(&answer.request_id);
         self.settled_requests.insert(
             answer.request_id,
             SettledAnswer {
@@ -295,6 +363,29 @@ impl ConnectSession {
     /// Optimistic echoes reconcile by command identity, never arrival order.
     pub fn reconcile_echo(&self, command_id: CommandId) -> Option<OperationId> {
         self.accepted_commands.get(&command_id).copied()
+    }
+
+    pub fn accepted_len(&self) -> usize {
+        self.accepted_commands.len()
+    }
+
+    pub fn outstanding_len(&self) -> usize {
+        self.outstanding_requests.len()
+    }
+
+    pub fn connected_len(&self) -> usize {
+        self.connected.len()
+    }
+
+    fn retain_invalidated(&mut self, command_id: CommandId) {
+        if self.invalidated.len() >= MAX_SESSION_INVALIDATED
+            && !self.invalidated.contains(&command_id)
+        {
+            if let Some(oldest) = self.invalidated.iter().copied().next() {
+                self.invalidated.remove(&oldest);
+            }
+        }
+        self.invalidated.insert(command_id);
     }
 
     fn validate_epochs(&self, input: DeviceInput) -> Result<(), SessionAdmitError> {
@@ -387,7 +478,7 @@ mod tests {
         let task_id = task(0x11);
         let desktop = client(0x21);
         let mut session = ConnectSession::new(task_id);
-        session.connect_client(desktop);
+        session.connect_client(desktop).unwrap();
         let mut presence = EphemeralPresence::default();
         let receipt = session
             .admit(
@@ -399,6 +490,7 @@ mod tests {
         assert!(!receipt.is_settled());
         assert_eq!(session.visible_controller(), None);
         assert_eq!(session.owner_badge(), None);
+        assert_eq!(session.last_sender_lease(), None);
         assert_eq!(presence.last_sender(task_id).unwrap().client_id, desktop);
         assert_eq!(
             presence.last_sender(task_id).unwrap().turn_epoch,
@@ -411,10 +503,11 @@ mod tests {
         let mut session = ConnectSession::new(task(0x12));
         let desktop = client(0x22);
         let phone = client(0x23);
-        session.connect_client(desktop);
-        session.connect_client(phone);
+        session.connect_client(desktop).unwrap();
+        session.connect_client(phone).unwrap();
         let request_id = request(0x51);
         let epoch = ActionEpoch::new(1).unwrap();
+        session.open_request(request_id, epoch).unwrap();
         assert!(session
             .answer(ActionAnswer {
                 task_id: session.task_id(),
@@ -452,7 +545,61 @@ mod tests {
         let mut concurrent = input(&session, desktop, command(0x33), operation(0x43), 20);
         concurrent.resource_id = Some(resource(0x61));
         concurrent.input_sequence = 2;
-        session.connect_client(desktop);
+        session.connect_client(desktop).unwrap();
         assert!(session.admit(concurrent, &mut presence).is_ok());
+    }
+
+    #[test]
+    fn answer_requires_connected_client_outstanding_request_and_epoch() {
+        let mut session = ConnectSession::new(task(0x13));
+        let desktop = client(0x24);
+        let phone = client(0x25);
+        session.connect_client(desktop).unwrap();
+        let request_id = request(0x53);
+        let epoch = ActionEpoch::new(2).unwrap();
+        assert_eq!(
+            session.answer(ActionAnswer {
+                task_id: session.task_id(),
+                client_id: desktop,
+                request_id,
+                action_epoch: epoch,
+                runtime_generation: session.runtime_generation(),
+                observed_at_ms: 1,
+            }),
+            Err(SessionAdmitError::NoOutstandingRequest)
+        );
+        session.open_request(request_id, epoch).unwrap();
+        assert_eq!(
+            session.answer(ActionAnswer {
+                task_id: session.task_id(),
+                client_id: phone,
+                request_id,
+                action_epoch: epoch,
+                runtime_generation: session.runtime_generation(),
+                observed_at_ms: 2,
+            }),
+            Err(SessionAdmitError::ClientDisconnected)
+        );
+        assert_eq!(
+            session.answer(ActionAnswer {
+                task_id: session.task_id(),
+                client_id: desktop,
+                request_id,
+                action_epoch: ActionEpoch::new(9).unwrap(),
+                runtime_generation: session.runtime_generation(),
+                observed_at_ms: 3,
+            }),
+            Err(SessionAdmitError::StaleAction)
+        );
+        assert!(session
+            .answer(ActionAnswer {
+                task_id: session.task_id(),
+                client_id: desktop,
+                request_id,
+                action_epoch: epoch,
+                runtime_generation: session.runtime_generation(),
+                observed_at_ms: 4,
+            })
+            .is_ok());
     }
 }

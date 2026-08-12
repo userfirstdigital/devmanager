@@ -28,6 +28,11 @@ pub const MAX_RELAY_QUEUE_BYTES: u32 = MAX_SEALED_FRAME_BYTES;
 pub const MAX_BIND_ATTEMPTS_PER_WINDOW: u32 = 8;
 pub const BIND_RATE_WINDOW_SECS: u64 = 60;
 pub const PRESENCE_TTL_SECS: u64 = 30;
+pub const MAX_RELAY_ROUTES: usize = 1_024;
+pub const MAX_RELAY_REVOKED_TICKETS: usize = 4_096;
+pub const MAX_RELAY_REVOKED_DEVICES: usize = 4_096;
+pub const MAX_RELAY_CONSUMED_NONCES: usize = 16_384;
+pub const MAX_RELAY_RATE_KEYS: usize = 4_096;
 const TICKET_TAG_BYTES: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -397,6 +402,8 @@ pub struct OpaqueRelay {
     online_hosts: HashSet<HostPublicId>,
     revoked_tickets: HashSet<TicketId>,
     revoked_devices: HashSet<DevicePublicId>,
+    revoked_ticket_overflow: bool,
+    revoked_device_overflow: bool,
     consumed_nonces: HashSet<[u8; 16]>,
     channels: HashMap<RouteId, HashMap<TicketAudience, BoundChannel>>,
     presence: HashMap<RouteId, PresenceRecord>,
@@ -412,6 +419,8 @@ impl Default for OpaqueRelay {
             online_hosts: HashSet::new(),
             revoked_tickets: HashSet::new(),
             revoked_devices: HashSet::new(),
+            revoked_ticket_overflow: false,
+            revoked_device_overflow: false,
             consumed_nonces: HashSet::new(),
             channels: HashMap::new(),
             presence: HashMap::new(),
@@ -462,24 +471,42 @@ impl OpaqueRelay {
             self.online_hosts.insert(host);
         } else {
             self.online_hosts.remove(&host);
-            self.channels.retain(|_, sockets| {
+            let mut emptied = Vec::new();
+            self.channels.retain(|route_id, sockets| {
                 sockets.retain(|_, channel| channel.claims.host_public_id != host);
-                !sockets.is_empty()
+                if sockets.is_empty() {
+                    emptied.push(*route_id);
+                    false
+                } else {
+                    true
+                }
             });
+            for route_id in emptied {
+                self.presence.remove(&route_id);
+            }
         }
     }
 
     pub fn revoke_ticket(&mut self, ticket_id: TicketId) {
-        self.revoked_tickets.insert(ticket_id);
+        self.remember_revoked_ticket(ticket_id);
         self.drop_ticket(ticket_id);
     }
 
     pub fn revoke_device(&mut self, device: DevicePublicId) {
-        self.revoked_devices.insert(device);
-        self.channels.retain(|_, sockets| {
+        self.remember_revoked_device(device);
+        let mut emptied = Vec::new();
+        self.channels.retain(|route_id, sockets| {
             sockets.retain(|_, channel| channel.claims.device_public_id != device);
-            !sockets.is_empty()
+            if sockets.is_empty() {
+                emptied.push(*route_id);
+                false
+            } else {
+                true
+            }
         });
+        for route_id in emptied {
+            self.presence.remove(&route_id);
+        }
     }
 
     pub fn bind(
@@ -488,6 +515,7 @@ impl OpaqueRelay {
         now_unix: u64,
         source: RateKey,
     ) -> Result<RelayObservation, RelayError> {
+        self.expire_stale(now_unix);
         self.admit_rate(source, now_unix)?;
         let key = self.signing_key.as_ref().ok_or(RelayError::InvalidTicket)?;
         let claims = ticket.verify(key)?.clone();
@@ -500,10 +528,25 @@ impl OpaqueRelay {
         if self.revoked_devices.contains(&claims.device_public_id) {
             return Err(RelayError::RevokedDevice);
         }
+        // Once the bounded revocation index cannot retain another identity,
+        // reject new binds rather than evicting a tombstone and reopening a
+        // revoked ticket/device.
+        if self.revoked_ticket_overflow || self.revoked_device_overflow {
+            return Err(RelayError::StateBoundExceeded);
+        }
         if claims.audience == TicketAudience::DeviceSocket
             && !self.online_hosts.contains(&claims.host_public_id)
         {
             return Err(RelayError::HostOffline);
+        }
+        if self.consumed_nonces.len() >= MAX_RELAY_CONSUMED_NONCES
+            && !self.consumed_nonces.contains(&claims.nonce)
+        {
+            return Err(RelayError::StateBoundExceeded);
+        }
+        if !self.channels.contains_key(&claims.route_id) && self.channels.len() >= MAX_RELAY_ROUTES
+        {
+            return Err(RelayError::StateBoundExceeded);
         }
         if !self.consumed_nonces.insert(claims.nonce) {
             return Err(RelayError::TicketReused);
@@ -541,7 +584,7 @@ impl OpaqueRelay {
         frame: SealedFrame,
         now_unix: u64,
     ) -> Result<RelayObservation, RelayError> {
-        self.expire_presence(now_unix);
+        self.expire_stale(now_unix);
         let encoded_len = u32::try_from(frame.encoded_len()).unwrap_or(u32::MAX);
         if encoded_len > MAX_SEALED_FRAME_BYTES {
             return Err(RelayError::FrameExceeded {
@@ -553,24 +596,32 @@ impl OpaqueRelay {
             TicketAudience::HostSocket => TicketAudience::DeviceSocket,
             TicketAudience::DeviceSocket => TicketAudience::HostSocket,
         };
-        let sockets = self
+        let (source_host, peer_host) = {
+            let sockets = self
+                .channels
+                .get(&route_id)
+                .ok_or(RelayError::UnknownRoute)?;
+            let source = sockets.get(&from).ok_or(RelayError::UnknownRoute)?;
+            Self::channel_live(
+                source,
+                now_unix,
+                &self.revoked_tickets,
+                &self.revoked_devices,
+            )?;
+            let peer = sockets.get(&target).ok_or(RelayError::PeerDisconnected)?;
+            Self::channel_live(peer, now_unix, &self.revoked_tickets, &self.revoked_devices)?;
+            (source.claims.host_public_id, peer.claims.host_public_id)
+        };
+        if from == TicketAudience::DeviceSocket && !self.online_hosts.contains(&source_host) {
+            return Err(RelayError::HostOffline);
+        }
+        if from == TicketAudience::HostSocket && !self.online_hosts.contains(&peer_host) {
+            return Err(RelayError::HostOffline);
+        }
+        let inbound = self
             .channels
             .get_mut(&route_id)
-            .ok_or(RelayError::UnknownRoute)?;
-        if !sockets.contains_key(&from) {
-            return Err(RelayError::UnknownRoute);
-        }
-        if from == TicketAudience::DeviceSocket {
-            let host = sockets
-                .get(&from)
-                .expect("source socket exists")
-                .claims
-                .host_public_id;
-            if !self.online_hosts.contains(&host) {
-                return Err(RelayError::HostOffline);
-            }
-        }
-        let inbound = sockets
+            .ok_or(RelayError::UnknownRoute)?
             .get_mut(&target)
             .ok_or(RelayError::PeerDisconnected)?;
         if inbound.queued.len() >= self.max_queue_frames
@@ -643,6 +694,16 @@ impl OpaqueRelay {
     }
 
     fn admit_rate(&mut self, source: RateKey, now_unix: u64) -> Result<(), RelayError> {
+        if self.bind_attempts.len() >= MAX_RELAY_RATE_KEYS
+            && !self.bind_attempts.contains_key(&source)
+        {
+            self.evict_expired_rate_windows(now_unix);
+            if self.bind_attempts.len() >= MAX_RELAY_RATE_KEYS
+                && !self.bind_attempts.contains_key(&source)
+            {
+                return Err(RelayError::StateBoundExceeded);
+            }
+        }
         let window = self.bind_attempts.entry(source).or_insert(RateWindow {
             started_at_unix: now_unix,
             count: 0,
@@ -658,24 +719,107 @@ impl OpaqueRelay {
         Ok(())
     }
 
-    fn expire_presence(&mut self, now_unix: u64) {
-        let expired: Vec<RouteId> = self
+    fn expire_stale(&mut self, now_unix: u64) {
+        let expired_presence: Vec<RouteId> = self
             .presence
             .iter()
             .filter_map(|(route_id, record)| {
                 (record.expires_at_unix <= now_unix).then_some(*route_id)
             })
             .collect();
-        for route_id in expired {
+        for route_id in expired_presence {
+            self.presence.remove(&route_id);
+            self.channels.remove(&route_id);
+        }
+
+        let mut stale_sockets = Vec::new();
+        for (route_id, sockets) in &self.channels {
+            for (audience, channel) in sockets {
+                let expired = now_unix < channel.claims.issued_at_unix
+                    || now_unix >= channel.claims.expires_at_unix;
+                let revoked = self.revoked_tickets.contains(&channel.claims.ticket_id)
+                    || self
+                        .revoked_devices
+                        .contains(&channel.claims.device_public_id);
+                if expired || revoked {
+                    stale_sockets.push((*route_id, *audience));
+                }
+            }
+        }
+        let mut emptied = Vec::new();
+        for (route_id, audience) in stale_sockets {
+            if let Some(sockets) = self.channels.get_mut(&route_id) {
+                sockets.remove(&audience);
+                if sockets.is_empty() {
+                    emptied.push(route_id);
+                }
+            }
+        }
+        for route_id in emptied {
+            self.channels.remove(&route_id);
             self.presence.remove(&route_id);
         }
+        self.evict_expired_rate_windows(now_unix);
+    }
+
+    fn channel_live(
+        channel: &BoundChannel,
+        now_unix: u64,
+        revoked_tickets: &HashSet<TicketId>,
+        revoked_devices: &HashSet<DevicePublicId>,
+    ) -> Result<(), RelayError> {
+        if now_unix < channel.claims.issued_at_unix || now_unix >= channel.claims.expires_at_unix {
+            return Err(RelayError::ExpiredTicket);
+        }
+        if revoked_tickets.contains(&channel.claims.ticket_id) {
+            return Err(RelayError::RevokedTicket);
+        }
+        if revoked_devices.contains(&channel.claims.device_public_id) {
+            return Err(RelayError::RevokedDevice);
+        }
+        Ok(())
+    }
+
+    fn remember_revoked_ticket(&mut self, ticket_id: TicketId) {
+        if self.revoked_tickets.len() >= MAX_RELAY_REVOKED_TICKETS
+            && !self.revoked_tickets.contains(&ticket_id)
+        {
+            self.revoked_ticket_overflow = true;
+            return;
+        }
+        self.revoked_tickets.insert(ticket_id);
+    }
+
+    fn remember_revoked_device(&mut self, device: DevicePublicId) {
+        if self.revoked_devices.len() >= MAX_RELAY_REVOKED_DEVICES
+            && !self.revoked_devices.contains(&device)
+        {
+            self.revoked_device_overflow = true;
+            return;
+        }
+        self.revoked_devices.insert(device);
+    }
+
+    fn evict_expired_rate_windows(&mut self, now_unix: u64) {
+        self.bind_attempts.retain(|_, window| {
+            now_unix.saturating_sub(window.started_at_unix) < BIND_RATE_WINDOW_SECS
+        });
     }
 
     fn drop_ticket(&mut self, ticket_id: TicketId) {
-        self.channels.retain(|_, sockets| {
+        let mut emptied = Vec::new();
+        self.channels.retain(|route_id, sockets| {
             sockets.retain(|_, channel| channel.claims.ticket_id != ticket_id);
-            !sockets.is_empty()
+            if sockets.is_empty() {
+                emptied.push(*route_id);
+                false
+            } else {
+                true
+            }
         });
+        for route_id in emptied {
+            self.presence.remove(&route_id);
+        }
     }
 }
 
@@ -724,6 +868,7 @@ pub enum RelayError {
     QueueExceeded,
     QueueEmpty,
     RateLimited,
+    StateBoundExceeded,
     EntropyUnavailable,
     Identity(ConnectIdError),
 }
@@ -749,6 +894,9 @@ impl fmt::Display for RelayError {
             Self::QueueExceeded => formatter.write_str("Connect relay queue bound exceeded"),
             Self::QueueEmpty => formatter.write_str("Connect relay queue is empty"),
             Self::RateLimited => formatter.write_str("Connect relay bind rate limit exceeded"),
+            Self::StateBoundExceeded => {
+                formatter.write_str("Connect relay state collection bound exceeded")
+            }
             Self::EntropyUnavailable => formatter.write_str("Connect relay entropy is unavailable"),
             Self::Identity(error) => error.fmt(formatter),
         }

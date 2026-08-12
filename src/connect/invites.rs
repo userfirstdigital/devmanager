@@ -20,14 +20,20 @@ use super::permission::{ActionId, ConnectRole, KnownAction};
 pub const MAX_TASK_INVITES: usize = 32;
 pub const MAX_INVITE_NICKNAME_BYTES: usize = 64;
 pub const INVITE_SECRET_BYTES: usize = 32;
+pub const MAX_INVITE_AUDIT_EVENTS: usize = 256;
+/// Hard upper bound on invitation lifetime (30 days).
+pub const MAX_INVITE_LIFETIME_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InviteError {
     NicknameRequired,
     NicknameTooLong,
     SecretRequired,
+    SecretTooShort,
+    InvalidLifetime,
     LimitExceeded,
     UnknownInvite,
+    NotYetValid,
     Expired,
     Revoked,
     AlreadyRedeemed,
@@ -38,6 +44,7 @@ pub enum InviteError {
     PairingCodeReuseForbidden,
     HostMismatch,
     DeviceAlreadyBound,
+    DeviceBindingRequired,
 }
 
 impl fmt::Display for InviteError {
@@ -46,8 +53,11 @@ impl fmt::Display for InviteError {
             Self::NicknameRequired => "invite nickname is required",
             Self::NicknameTooLong => "invite nickname exceeds the bounded size",
             Self::SecretRequired => "invite secret is required",
+            Self::SecretTooShort => "invite secret is shorter than INVITE_SECRET_BYTES",
+            Self::InvalidLifetime => "invite lifetime must be positive and within the bound",
             Self::LimitExceeded => "task invite store is at capacity",
             Self::UnknownInvite => "unknown task invite",
+            Self::NotYetValid => "task invite is not valid yet",
             Self::Expired => "task invite has expired",
             Self::Revoked => "task invite has been revoked",
             Self::AlreadyRedeemed => "single-use invite was already redeemed",
@@ -58,6 +68,7 @@ impl fmt::Display for InviteError {
             Self::PairingCodeReuseForbidden => "task invites cannot reuse the host pairing code",
             Self::HostMismatch => "invite is pinned to a different host identity",
             Self::DeviceAlreadyBound => "invite is already bound to another device",
+            Self::DeviceBindingRequired => "invite authorization requires the redeemed device",
         })
     }
 }
@@ -240,6 +251,14 @@ impl TaskInviteStore {
         &self.audit
     }
 
+    fn record_audit(&mut self, event: InviteAuditEvent) {
+        if self.audit.len() >= MAX_INVITE_AUDIT_EVENTS {
+            let remove = self.audit.len() - MAX_INVITE_AUDIT_EVENTS + 1;
+            self.audit.drain(..remove);
+        }
+        self.audit.push(event);
+    }
+
     pub fn issue(
         &mut self,
         task_id: TaskId,
@@ -260,6 +279,20 @@ impl TaskInviteStore {
         }
         if secret.is_empty() {
             return Err(InviteError::SecretRequired);
+        }
+        if secret.len() < INVITE_SECRET_BYTES {
+            return Err(InviteError::SecretTooShort);
+        }
+        if created_at_ms <= 0
+            || expires_at_ms <= created_at_ms
+            || expires_at_ms.saturating_sub(created_at_ms) > MAX_INVITE_LIFETIME_MS
+        {
+            return Err(InviteError::InvalidLifetime);
+        }
+        if let InviteUsePolicy::MultiUse { max_redemptions } = use_policy {
+            if max_redemptions == 0 {
+                return Err(InviteError::InvalidLifetime);
+            }
         }
         let nickname =
             canonical::canonicalize(nickname.into()).ok_or(InviteError::NicknameRequired)?;
@@ -284,7 +317,7 @@ impl TaskInviteStore {
             pinned_host,
         };
         self.invites.insert(invite_id, record);
-        self.audit.push(InviteAuditEvent {
+        self.record_audit(InviteAuditEvent {
             invite_id,
             task_id,
             kind: InviteAuditKind::Issued,
@@ -339,7 +372,7 @@ impl TaskInviteStore {
             record.bound_device = Some(device);
         }
         record.redemptions = record.redemptions.saturating_add(1);
-        self.audit.push(InviteAuditEvent {
+        self.record_audit(InviteAuditEvent {
             invite_id,
             task_id,
             kind: InviteAuditKind::Redeemed,
@@ -364,7 +397,7 @@ impl TaskInviteStore {
             kind: InviteAuditKind::Revoked,
             at_ms: now_ms,
         };
-        self.audit.push(event.clone());
+        self.record_audit(event.clone());
         Ok(event)
     }
 
@@ -376,6 +409,7 @@ impl TaskInviteStore {
         now_ms: i64,
         action: ActionId,
         content: ContentClass,
+        device: RedeemedDevicePublicId,
     ) -> Result<InviteGrantView, InviteError> {
         let record = self
             .invites
@@ -385,6 +419,7 @@ impl TaskInviteStore {
             return Err(InviteError::TaskScopeMismatch);
         }
         check_live(record, lifecycle, now_ms)?;
+        check_device_binding(record, device)?;
         if content.is_guest_forbidden() || !record.allowed_content.contains(&content) {
             return Err(InviteError::TaskScopeMismatch);
         }
@@ -399,8 +434,19 @@ impl TaskInviteStore {
         false
     }
 
-    pub fn grant(&self, invite_id: TaskInviteId) -> Option<InviteGrantView> {
-        self.invites.get(&invite_id).map(view)
+    /// Returns a live grant view only. Stale, revoked, closed-task, or unknown
+    /// invites never surface a reusable authority-shaped grant.
+    pub fn grant(
+        &self,
+        invite_id: TaskInviteId,
+        lifecycle: TaskLifecycle,
+        now_ms: i64,
+        device: RedeemedDevicePublicId,
+    ) -> Option<InviteGrantView> {
+        let record = self.invites.get(&invite_id)?;
+        check_live(record, lifecycle, now_ms).ok()?;
+        check_device_binding(record, device).ok()?;
+        Some(view(record))
     }
 }
 
@@ -412,13 +458,27 @@ fn check_live(
     if record.revoked_at_ms.is_some() {
         return Err(InviteError::Revoked);
     }
-    if now_ms > record.expires_at_ms {
+    if now_ms < record.created_at_ms {
+        return Err(InviteError::NotYetValid);
+    }
+    if now_ms >= record.expires_at_ms {
         return Err(InviteError::Expired);
     }
     if !matches!(lifecycle, TaskLifecycle::Open) {
         return Err(InviteError::TaskClosed);
     }
     Ok(())
+}
+
+fn check_device_binding(
+    record: &InviteRecord,
+    device: RedeemedDevicePublicId,
+) -> Result<(), InviteError> {
+    match record.bound_device {
+        Some(bound) if bound == device => Ok(()),
+        Some(_) => Err(InviteError::DeviceAlreadyBound),
+        None => Err(InviteError::DeviceBindingRequired),
+    }
 }
 
 fn view(record: &InviteRecord) -> InviteGrantView {
@@ -476,6 +536,10 @@ pub fn guest_may_perform(role: InviteRole, action: KnownAction) -> bool {
 mod tests {
     use super::*;
 
+    fn strong_secret() -> [u8; INVITE_SECRET_BYTES] {
+        [0xA5; INVITE_SECRET_BYTES]
+    }
+
     #[test]
     fn issued_secret_is_not_retained_and_pairing_code_is_rejected() {
         let mut store = TaskInviteStore::new();
@@ -490,7 +554,7 @@ mod tests {
                 1,
                 100,
                 host,
-                b"secret",
+                &strong_secret(),
                 Some("ABCD2345"),
             )
             .is_err());
@@ -503,12 +567,61 @@ mod tests {
                 1,
                 100,
                 host,
-                b"secret",
+                &strong_secret(),
                 None,
             )
             .unwrap();
         assert!(!store.has_reusable_plaintext_secret(issued.invite_id));
         assert!(store.collaboration_visible());
         assert!(!issued.plaintext_secret.is_empty());
+    }
+
+    #[test]
+    fn short_secret_and_invalid_lifetime_are_rejected() {
+        let mut store = TaskInviteStore::new();
+        let task = TaskId::new();
+        let host = PinnedHostPublicId::from_bytes([7; 16]);
+        assert_eq!(
+            store.issue(
+                task,
+                "review",
+                InviteRole::Watcher,
+                InviteUsePolicy::SingleUse,
+                1,
+                100,
+                host,
+                b"short",
+                None,
+            ),
+            Err(InviteError::SecretTooShort)
+        );
+        assert_eq!(
+            store.issue(
+                task,
+                "review",
+                InviteRole::Watcher,
+                InviteUsePolicy::SingleUse,
+                100,
+                100,
+                host,
+                &strong_secret(),
+                None,
+            ),
+            Err(InviteError::InvalidLifetime)
+        );
+        assert_eq!(
+            store.issue(
+                task,
+                "review",
+                InviteRole::Watcher,
+                InviteUsePolicy::SingleUse,
+                1,
+                1 + MAX_INVITE_LIFETIME_MS + 1,
+                host,
+                &strong_secret(),
+                None,
+            ),
+            Err(InviteError::InvalidLifetime)
+        );
     }
 }

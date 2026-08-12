@@ -10,8 +10,8 @@ use crate::domain::query::Query;
 use crate::protocol::ClientRequest;
 
 use super::permission::{
-    ActionId, ConnectRole, PermissionDecision, PermissionDenyReason, PermissionEvaluator,
-    PermissionRequest,
+    ActionId, AuthoritativePermissionContext, ConnectRole, PermissionDecision,
+    PermissionDenyReason, PermissionEvaluator, PermissionRequest, ScopedPermissionGrant,
 };
 use super::ConnectPrivacyClass;
 
@@ -26,6 +26,20 @@ impl SessionPermissionContext {
     pub const fn paired_owner(privacy: ConnectPrivacyClass) -> Self {
         Self {
             role: ConnectRole::PairedOwner,
+            privacy,
+        }
+    }
+
+    pub const fn watcher(task_id: TaskId, privacy: ConnectPrivacyClass) -> Self {
+        Self {
+            role: ConnectRole::Watcher { task_id },
+            privacy,
+        }
+    }
+
+    pub const fn collaborator(task_id: TaskId, privacy: ConnectPrivacyClass) -> Self {
+        Self {
+            role: ConnectRole::Collaborator { task_id },
             privacy,
         }
     }
@@ -145,6 +159,20 @@ impl SessionAuthorizer {
         )
     }
 
+    pub const fn watcher(task_id: TaskId) -> Self {
+        Self::new(
+            PermissionEvaluator::new(false),
+            SessionPermissionContext::watcher(task_id, ConnectPrivacyClass::ManagedMetadata),
+        )
+    }
+
+    pub const fn collaborator(task_id: TaskId) -> Self {
+        Self::new(
+            PermissionEvaluator::new(true),
+            SessionPermissionContext::collaborator(task_id, ConnectPrivacyClass::ManagedMetadata),
+        )
+    }
+
     pub const fn context(self) -> SessionPermissionContext {
         self.context
     }
@@ -159,6 +187,8 @@ impl SessionAuthorizer {
         let Some((action, task_id)) = action_for_client_request(request) else {
             return PermissionDecision::Denied(PermissionDenyReason::UnknownAction);
         };
+        // Network authentication alone never authorizes. Paired owners still
+        // need a verified credential path; guests need a live scoped grant.
         self.evaluate(PermissionRequest {
             role: self.context.role,
             task_id,
@@ -167,11 +197,53 @@ impl SessionAuthorizer {
         })
     }
 
+    /// Authorize a mapped client request only when a trusted authority supplies
+    /// the live scoped grant for the current connection/session/route epochs.
+    pub fn authorize_request_with_grant(
+        &self,
+        request: &ClientRequest,
+        grant: &ScopedPermissionGrant,
+        context: AuthoritativePermissionContext,
+    ) -> PermissionDecision {
+        if matches!(request, ClientRequest::Detach(_)) {
+            return PermissionDecision::Allow;
+        }
+        let Some((action, task_id)) = action_for_client_request(request) else {
+            return PermissionDecision::Denied(PermissionDenyReason::UnknownAction);
+        };
+        self.evaluator.evaluate_with_scoped_grant(
+            PermissionRequest {
+                role: self.context.role,
+                task_id,
+                action,
+                credential: None,
+            },
+            grant,
+            context,
+        )
+    }
+
     pub fn authorize(&self, request: PermissionRequest) -> PermissionDecision {
         self.evaluate(PermissionRequest {
             role: self.context.role,
             ..request
         })
+    }
+
+    pub fn authorize_with_grant(
+        &self,
+        request: PermissionRequest,
+        grant: &ScopedPermissionGrant,
+        context: AuthoritativePermissionContext,
+    ) -> PermissionDecision {
+        self.evaluator.evaluate_with_scoped_grant(
+            PermissionRequest {
+                role: self.context.role,
+                ..request
+            },
+            grant,
+            context,
+        )
     }
 
     pub fn authorize_personal_prompts(&self) -> PermissionDecision {
@@ -188,5 +260,69 @@ impl SessionAuthorizer {
 
     fn evaluate(&self, request: PermissionRequest) -> PermissionDecision {
         self.evaluator.evaluate(request)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::command::CommandEnvelope;
+    use crate::domain::command::{Command, ServiceControlAction, ServiceControlIntent};
+    use crate::domain::id::{ClientId, CommandId};
+    use crate::protocol::ClientRequest;
+
+    #[test]
+    fn service_control_maps_to_mutate_and_watcher_stays_read_only() {
+        let task_id = TaskId::new();
+        let authorizer = SessionAuthorizer::watcher(task_id);
+        let request = ClientRequest::Command(CommandEnvelope {
+            command_id: CommandId::new(),
+            client_id: ClientId::new(),
+            task_id: Some(task_id),
+            issued_at_ms: 1,
+            expected_task_revision: None,
+            command: Command::ServiceControl(ServiceControlIntent {
+                service_id: "demo".into(),
+                resource_generation: 1,
+                connection_epoch: 1,
+                action_epoch: 1,
+                action: ServiceControlAction::Stop,
+            }),
+        });
+        assert_eq!(
+            action_for_client_request(&request),
+            Some((ActionId::MUTATE_TASK, Some(task_id)))
+        );
+        // Without a scoped grant the watcher path remains fail-closed.
+        assert_eq!(
+            authorizer.authorize_request(&request),
+            PermissionDecision::Denied(PermissionDenyReason::ScopedGrantRequired)
+        );
+        let context = AuthoritativePermissionContext::live(1, 2, 3).unwrap();
+        let grant = ScopedPermissionGrant::issue(
+            ConnectRole::Watcher { task_id },
+            task_id,
+            ActionId::MUTATE_TASK,
+            context,
+        )
+        .unwrap();
+        assert_eq!(
+            authorizer.authorize_request_with_grant(&request, &grant, context),
+            PermissionDecision::Denied(PermissionDenyReason::WatcherReadOnly)
+        );
+    }
+
+    #[test]
+    fn unknown_unmapped_actions_deny() {
+        let authorizer = SessionAuthorizer::paired_owner();
+        assert_eq!(
+            authorizer.authorize(PermissionRequest {
+                role: ConnectRole::PairedOwner,
+                task_id: None,
+                action: ActionId::new(99).unwrap(),
+                credential: None,
+            }),
+            PermissionDecision::Denied(PermissionDenyReason::UnknownAction)
+        );
     }
 }

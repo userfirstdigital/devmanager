@@ -22,7 +22,9 @@ export function deriveComposerMode(grant: CapabilityGrant | null): ComposerMode 
   if (grant.role === "collaborator" && grant.actions.includes("sendPrompt")) {
     return "enabled";
   }
-  if (grant.role === "owner") return "enabled";
+  if (grant.role === "owner" && grant.actions.includes("sendPrompt")) {
+    return "enabled";
+  }
   return "disabled";
 }
 
@@ -32,14 +34,28 @@ export function canPerform(
 ): boolean {
   if (!grant) return false;
   if (action === "approveDangerous" || action === "readPersonalPrompts") {
-    return grant.role === "owner";
+    return grant.role === "owner" && grant.actions.includes(action);
   }
   if (grant.role === "watcher") {
-    return action === "readTask" || action === "readPresence";
+    return (
+      (action === "readTask" || action === "readPresence") &&
+      grant.actions.includes(action)
+    );
+  }
+  if (grant.role === "collaborator") {
+    if (action === "approveDangerous" || action === "readPersonalPrompts") {
+      return false;
+    }
+    return grant.actions.includes(action);
   }
   return grant.actions.includes(action);
 }
 
 export function collaborationUiVisible(inviteCount: number): boolean {
   return inviteCount > 0;
+}
+
+/** Host-authoritative role labels only; never invent owner from local state. */
+export function roleFromHostGrant(grant: CapabilityGrant | null): ConnectRole | null {
+  return grant?.role ?? null;
 }

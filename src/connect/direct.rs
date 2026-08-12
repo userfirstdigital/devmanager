@@ -236,9 +236,30 @@ pub enum DirectPairingThrottle {
 
 const BACKOFF_SECS: [u64; 5] = [1, 2, 4, 8, 16];
 const LOCKOUT_SECS: u64 = 60;
+pub const MAX_DIRECT_PAIRING_RATE_KEYS: usize = 4_096;
 
 impl DirectPairingLimiter {
+    fn ensure_capacity(&mut self, ip: IpAddr) -> Result<(), DirectAdmitError> {
+        if self.states.len() < MAX_DIRECT_PAIRING_RATE_KEYS || self.states.contains_key(&ip) {
+            return Ok(());
+        }
+        if let Some((&victim, _)) = self
+            .states
+            .iter()
+            .find(|(_, state)| state.blocked_until.is_none())
+        {
+            self.states.remove(&victim);
+            return Ok(());
+        }
+        Err(DirectAdmitError::RateLimited {
+            retry_after_secs: LOCKOUT_SECS,
+        })
+    }
+
     pub fn status(&mut self, ip: IpAddr, now: Instant) -> DirectPairingThrottle {
+        if self.ensure_capacity(ip).is_err() {
+            return DirectPairingThrottle::LockedOut(Duration::from_secs(LOCKOUT_SECS));
+        }
         let state = self.states.entry(ip).or_insert(DirectPairingState {
             consecutive_failures: 0,
             blocked_until: None,
@@ -257,6 +278,9 @@ impl DirectPairingLimiter {
     }
 
     pub fn record_failure(&mut self, ip: IpAddr, now: Instant) -> DirectPairingThrottle {
+        if self.ensure_capacity(ip).is_err() {
+            return DirectPairingThrottle::LockedOut(Duration::from_secs(LOCKOUT_SECS));
+        }
         let state = self.states.entry(ip).or_insert(DirectPairingState {
             consecutive_failures: 0,
             blocked_until: None,

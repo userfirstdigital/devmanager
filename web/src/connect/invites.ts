@@ -16,5 +16,5 @@ export function shouldShowCollaborationUi(invites: readonly TaskInvite[]): boole
 }
 
 export function inviteIsLive(invite: TaskInvite, nowMs: number): boolean {
-  return !invite.revoked && nowMs <= invite.expiresAtMs;
+  return !invite.revoked && nowMs < invite.expiresAtMs;
 }

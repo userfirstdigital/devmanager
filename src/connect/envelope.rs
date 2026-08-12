@@ -1025,10 +1025,14 @@ impl ConnectEnvelope {
             if kind.channel() != self.channel {
                 return Err(EnvelopeError::ChannelMismatch);
             }
-            if matches!(self.privacy_class, ConnectPrivacyClass::RawContent)
-                && !kind.allows_raw_content()
-            {
-                return Err(EnvelopeError::PrivacyViolation);
+        }
+        // Unknown/future kinds stay inert extension data and may never be
+        // labeled RawContent at the wire boundary. Known Terminal/Browser/Chunk
+        // grants remain the only RawContent-capable payloads.
+        if matches!(self.privacy_class, ConnectPrivacyClass::RawContent) {
+            match self.payload_kind.known() {
+                Some(kind) if kind.allows_raw_content() => {}
+                Some(_) | None => return Err(EnvelopeError::PrivacyViolation),
             }
         }
         Ok(())
