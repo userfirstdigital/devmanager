@@ -1245,3 +1245,262 @@ impl<'de> Deserialize<'de> for BrowserFrame {
         Self::new(wire.frame_id, wire.bytes).map_err(D::Error::custom)
     }
 }
+
+pub const MAX_BROWSER_PROJECTION_FPS: u32 = 8;
+pub const MAX_BROWSER_PROJECTION_BYTES_PER_SECOND: u64 = 512 * 1024;
+pub const MAX_BROWSER_TITLE_BYTES: usize = 512;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BrowserSecurityState {
+    Secure,
+    Insecure,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BrowserInteractionMode {
+    Observe,
+    Interact,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BrowserFrameKind {
+    Full,
+    Tile,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BrowserTabProjection {
+    pub tab_id: crate::domain::id::BrowserTabId,
+    pub title: String,
+    pub url: String,
+    pub kind: crate::domain::browser::BrowserTabKind,
+    pub security: BrowserSecurityState,
+    pub loading: bool,
+    pub error: Option<String>,
+}
+
+impl BrowserTabProjection {
+    pub fn validate(&self) -> Result<(), BrowserDtoError> {
+        crate::domain::browser::browser_wire_committed_url(&self.url)
+            .map_err(|_| BrowserDtoError::Invalid("shareable tab url"))?;
+        if self.title.len() > MAX_BROWSER_TITLE_BYTES {
+            return Err(BrowserDtoError::TooLarge {
+                field: "tab title",
+                bytes: self.title.len(),
+                maximum: MAX_BROWSER_TITLE_BYTES,
+            });
+        }
+        if let Some(error) = &self.error {
+            validate_text(error, "tab error", MAX_BROWSER_TEXT_BYTES)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowserProjectionMeta {
+    pub task_id: TaskId,
+    pub context_id: BrowserContextId,
+    pub generation: BrowserRuntimeGeneration,
+    pub bounds_epoch: BrowserBoundsEpoch,
+    pub focus_epoch: BrowserFocusEpoch,
+    pub frame_id: u64,
+    pub selected_tab_id: Option<crate::domain::id::BrowserTabId>,
+    pub tabs: Vec<BrowserTabProjection>,
+    pub progress: Option<String>,
+    pub interaction_mode: BrowserInteractionMode,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BrowserProjectionMetaWire {
+    task_id: TaskId,
+    context_id: BrowserContextId,
+    generation: BrowserRuntimeGeneration,
+    bounds_epoch: BrowserBoundsEpoch,
+    focus_epoch: BrowserFocusEpoch,
+    frame_id: u64,
+    selected_tab_id: Option<crate::domain::id::BrowserTabId>,
+    tabs: Vec<BrowserTabProjection>,
+    progress: Option<String>,
+    interaction_mode: BrowserInteractionMode,
+}
+
+impl BrowserProjectionMeta {
+    pub fn validate(&self) -> Result<(), BrowserDtoError> {
+        BrowserRuntimeGeneration::new(self.generation.value())?;
+        BrowserBoundsEpoch::new(self.bounds_epoch.value())?;
+        BrowserFocusEpoch::new(self.focus_epoch.value())?;
+        if self.frame_id == 0 {
+            return Err(BrowserDtoError::Zero("projection frame ID"));
+        }
+        if self.tabs.len() as u32 > MAX_BROWSER_CLIENT_SEQUENCE.min(32) as u32 {
+            return Err(BrowserDtoError::OutOfRange("projection tab count"));
+        }
+        for tab in &self.tabs {
+            tab.validate()?;
+        }
+        if let Some(selected) = self.selected_tab_id {
+            if !self.tabs.iter().any(|tab| tab.tab_id == selected) {
+                return Err(BrowserDtoError::Invalid("selected tab"));
+            }
+        }
+        if let Some(progress) = &self.progress {
+            validate_text(progress, "projection progress", MAX_BROWSER_TEXT_BYTES)?;
+        }
+        Ok(())
+    }
+}
+
+impl Serialize for BrowserProjectionMeta {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.validate().map_err(S::Error::custom)?;
+        BrowserProjectionMetaWire {
+            task_id: self.task_id,
+            context_id: self.context_id,
+            generation: self.generation,
+            bounds_epoch: self.bounds_epoch,
+            focus_epoch: self.focus_epoch,
+            frame_id: self.frame_id,
+            selected_tab_id: self.selected_tab_id,
+            tabs: self.tabs.clone(),
+            progress: self.progress.clone(),
+            interaction_mode: self.interaction_mode,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for BrowserProjectionMeta {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = BrowserProjectionMetaWire::deserialize(deserializer)?;
+        let meta = Self {
+            task_id: wire.task_id,
+            context_id: wire.context_id,
+            generation: wire.generation,
+            bounds_epoch: wire.bounds_epoch,
+            focus_epoch: wire.focus_epoch,
+            frame_id: wire.frame_id,
+            selected_tab_id: wire.selected_tab_id,
+            tabs: wire.tabs,
+            progress: wire.progress,
+            interaction_mode: wire.interaction_mode,
+        };
+        meta.validate().map_err(D::Error::custom)?;
+        Ok(meta)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowserProjectionFrame {
+    pub frame_id: u64,
+    pub kind: BrowserFrameKind,
+    pub generation: BrowserRuntimeGeneration,
+    pub bounds_epoch: BrowserBoundsEpoch,
+    pub bytes: Vec<u8>,
+}
+
+impl BrowserProjectionFrame {
+    pub fn new(
+        frame_id: u64,
+        kind: BrowserFrameKind,
+        generation: BrowserRuntimeGeneration,
+        bounds_epoch: BrowserBoundsEpoch,
+        bytes: Vec<u8>,
+    ) -> Result<Self, BrowserDtoError> {
+        if frame_id == 0 {
+            return Err(BrowserDtoError::Zero("projection frame ID"));
+        }
+        BrowserRuntimeGeneration::new(generation.value())?;
+        BrowserBoundsEpoch::new(bounds_epoch.value())?;
+        if bytes.len() > MAX_BROWSER_FRAME_BYTES {
+            return Err(BrowserDtoError::TooLarge {
+                field: "projection frame bytes",
+                bytes: bytes.len(),
+                maximum: MAX_BROWSER_FRAME_BYTES,
+            });
+        }
+        Ok(Self {
+            frame_id,
+            kind,
+            generation,
+            bounds_epoch,
+            bytes,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BrowserRemoteInputKind {
+    Pointer,
+    Touch,
+    Keyboard,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowserRemoteInput {
+    pub frame_id: u64,
+    pub generation: BrowserRuntimeGeneration,
+    pub bounds_epoch: BrowserBoundsEpoch,
+    pub focus_epoch: BrowserFocusEpoch,
+    pub kind: BrowserRemoteInputKind,
+    pub x: i32,
+    pub y: i32,
+    pub content_width: u32,
+    pub content_height: u32,
+    pub scale: u32,
+}
+
+impl BrowserRemoteInput {
+    pub fn validate(&self) -> Result<(), BrowserDtoError> {
+        if self.frame_id == 0 {
+            return Err(BrowserDtoError::Zero("input frame ID"));
+        }
+        BrowserRuntimeGeneration::new(self.generation.value())?;
+        BrowserBoundsEpoch::new(self.bounds_epoch.value())?;
+        BrowserFocusEpoch::new(self.focus_epoch.value())?;
+        if self.content_width == 0 || self.content_height == 0 || self.scale == 0 {
+            return Err(BrowserDtoError::Zero("input content scale"));
+        }
+        if u64::from(self.content_width) > MAX_BROWSER_DIMENSION
+            || u64::from(self.content_height) > MAX_BROWSER_DIMENSION
+        {
+            return Err(BrowserDtoError::OutOfRange("input content bounds"));
+        }
+        Ok(())
+    }
+
+    pub fn mapped_point(&self) -> Result<(i32, i32), BrowserDtoError> {
+        self.validate()?;
+        let x = i64::from(self.x)
+            .checked_mul(i64::from(self.scale))
+            .ok_or(BrowserDtoError::Overflow("mapped x"))?
+            / 96;
+        let y = i64::from(self.y)
+            .checked_mul(i64::from(self.scale))
+            .ok_or(BrowserDtoError::Overflow("mapped y"))?
+            / 96;
+        let x = i32::try_from(x).map_err(|_| BrowserDtoError::OutOfRange("mapped x"))?;
+        let y = i32::try_from(y).map_err(|_| BrowserDtoError::OutOfRange("mapped y"))?;
+        if x < 0
+            || y < 0
+            || (x as u32) >= self.content_width
+            || (y as u32) >= self.content_height
+        {
+            return Err(BrowserDtoError::OutOfRange("mapped point"));
+        }
+        Ok((x, y))
+    }
+}

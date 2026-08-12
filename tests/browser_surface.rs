@@ -788,3 +788,249 @@ fn automation_remains_separately_authorized_from_the_surface() {
         .iter()
         .all(|event| event.kind == SurfaceEventKind::Registered));
 }
+
+mod browser_dock_tests {
+    use devmanager::browser::{
+        BrowserDockFocusTarget, BrowserDockGesture, BrowserDockSurface, BrowserPointerDisposition,
+    };
+    use devmanager::domain::id::{BrowserContextId, BrowserTabId, ClientId, ResourceId, TaskId};
+    use devmanager::protocol::{
+        BrowserAttachRequest, BrowserPhysicalBounds, BrowserProjectionMeta, BrowserSecurityState,
+        BrowserSurfaceDescriptor, BrowserSurfaceLifecycle, BrowserTabProjection,
+    };
+    use devmanager::ui::task_cockpit::{
+        BrowserContextDock, ContextDockFocus, ContextDockLayout, TaskBrowserDockModel,
+    };
+    use serde_json::json;
+    
+    fn descriptor(task_id: TaskId, generation: u64) -> BrowserSurfaceDescriptor {
+        serde_json::from_value(json!({
+            "identity": {
+                "taskId": task_id,
+                "contextId": BrowserContextId::new(),
+                "resourceId": ResourceId::new(),
+            },
+            "childHwnd": "hwnd:42",
+            "hostProcess": {"pid": 7, "creationTime100ns": 11, "executable": "devmanager-host.exe"},
+            "hostFence": {"bootEpoch": 1, "connectionEpoch": 1},
+            "runtimeGeneration": generation,
+            "nonce": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+            "boundsEpoch": 1,
+            "focusEpoch": 1,
+            "physicalBounds": {"x": 0, "y": 0, "width": 320, "height": 200},
+            "dpi": {"horizontal": 96, "vertical": 96},
+        }))
+        .expect("host-issued descriptor")
+    }
+    
+    fn tab(task_url: &str, title: &str) -> BrowserTabProjection {
+        let tab = BrowserTabProjection {
+            tab_id: BrowserTabId::new(),
+            title: title.to_string(),
+            url: task_url.to_string(),
+            kind: devmanager::domain::browser::BrowserTabKind::Page,
+            security: BrowserSecurityState::Secure,
+            loading: false,
+            error: None,
+        };
+        tab.validate().expect("tab");
+        tab
+    }
+    
+    fn projection(task_id: TaskId, context_id: BrowserContextId, tabs: Vec<BrowserTabProjection>) -> BrowserProjectionMeta {
+        let selected = tabs.first().map(|tab| tab.tab_id);
+        let meta = BrowserProjectionMeta {
+            task_id,
+            context_id,
+            generation: devmanager::protocol::BrowserRuntimeGeneration::new(1).unwrap(),
+            bounds_epoch: devmanager::protocol::BrowserBoundsEpoch::initial(),
+            focus_epoch: devmanager::protocol::BrowserFocusEpoch::initial(),
+            frame_id: 1,
+            selected_tab_id: selected,
+            tabs,
+            progress: Some("inspecting".to_string()),
+            interaction_mode: devmanager::protocol::BrowserInteractionMode::Observe,
+        };
+        meta.validate().expect("meta");
+        meta
+    }
+    
+    #[test]
+    fn ui_chrome_is_native_and_never_web_toolbar() {
+        assert!(!BrowserDockSurface::uses_web_chrome());
+        assert!(!BrowserContextDock::uses_web_chrome());
+        assert!(!TaskBrowserDockModel::uses_web_chrome());
+        assert_eq!(BrowserDockSurface::required_chrome().len(), 6);
+    }
+    
+    #[test]
+    fn ui_task_tab_strip_and_status_come_from_projection() {
+        let task_id = TaskId::new();
+        let page = tab("https://example.test/", "Fixture");
+        let loading = BrowserTabProjection {
+            loading: true,
+            error: Some("timeout".to_string()),
+            security: BrowserSecurityState::Insecure,
+            url: "http://example.test/".to_string(),
+            ..page.clone()
+        };
+        loading.validate().expect("loading tab");
+        let model = TaskBrowserDockModel::from_projection(&projection(
+            task_id,
+            BrowserContextId::new(),
+            vec![loading],
+        ));
+        assert_eq!(model.tab_labels, vec!["Fixture".to_string()]);
+        assert_eq!(model.address, "http://example.test/");
+        assert_eq!(model.error.as_deref(), Some("timeout"));
+        assert!(model.loading);
+        assert_eq!(model.security, BrowserSecurityState::Insecure);
+        assert_eq!(model.progress.as_deref(), Some("inspecting"));
+    }
+    
+    #[test]
+    fn ui_attach_detach_and_stale_generation_fail_closed() {
+        let task_id = TaskId::new();
+        let mut surface = BrowserDockSurface::from_descriptor(descriptor(task_id, 1)).unwrap();
+        let client = ClientId::new();
+        surface
+            .attach(BrowserAttachRequest::new(descriptor(task_id, 1), client))
+            .expect("attach");
+        assert!(matches!(
+            surface.lifecycle(),
+            BrowserSurfaceLifecycle::Attached { .. }
+        ));
+        surface.detach(false).expect("detach");
+        assert!(matches!(
+            surface.lifecycle(),
+            BrowserSurfaceLifecycle::Detached { crashed: false, .. }
+        ));
+        assert_eq!(
+            surface.admit_page_input(2, 1, 1, BrowserDockGesture::PageClick),
+            Err(devmanager::browser::BrowserDockError::StaleGeneration)
+        );
+    }
+    
+    #[test]
+    fn ui_keyboard_traversal_stays_in_chrome_until_armed() {
+        let task_id = TaskId::new();
+        let mut surface = BrowserDockSurface::from_descriptor(descriptor(task_id, 1)).unwrap();
+        surface
+            .attach(BrowserAttachRequest::new(descriptor(task_id, 1), ClientId::new()))
+            .unwrap();
+        assert_eq!(
+            surface.classify_gesture(BrowserDockGesture::PageKey),
+            BrowserPointerDisposition::ConsumeShellGesture
+        );
+        surface.arm_page_input_after_gesture().unwrap();
+        assert_eq!(surface.focus_target(), BrowserDockFocusTarget::BrowserPage);
+        assert_eq!(
+            surface.classify_gesture(BrowserDockGesture::PageKey),
+            BrowserPointerDisposition::ForwardToPage
+        );
+    }
+    
+    #[test]
+    fn ui_context_dock_resize_hides_before_new_bounds() {
+        let task_id = TaskId::new();
+        let surface = BrowserDockSurface::from_descriptor(descriptor(task_id, 1)).unwrap();
+        let tabs = vec![tab("https://example.test/", "A")];
+        let context_id = surface.task_id();
+        let _ = context_id;
+        let mut dock = BrowserContextDock::open(
+            surface,
+            projection(task_id, BrowserContextId::new(), tabs),
+            ContextDockLayout::split(1000, 40).unwrap(),
+        )
+        .unwrap();
+        dock.attach(BrowserAttachRequest::new(descriptor(task_id, 1), ClientId::new()))
+            .unwrap();
+        let epoch = dock
+            .resize(
+                1,
+                ContextDockLayout::split(1200, 50).unwrap(),
+                BrowserPhysicalBounds::new(0, 0, 400, 240).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(epoch, 2);
+        assert_eq!(dock.layout().terminal_width, 600);
+        assert!(dock.terminal_present());
+    }
+    
+    #[test]
+    fn ui_task_switch_while_form_focused_consumes_pointer() {
+        let task_id = TaskId::new();
+        let mut surface = BrowserDockSurface::from_descriptor(descriptor(task_id, 1)).unwrap();
+        surface
+            .attach(BrowserAttachRequest::new(descriptor(task_id, 1), ClientId::new()))
+            .unwrap();
+        surface.arm_page_input_after_gesture().unwrap();
+        surface
+            .switch_task(BrowserAttachRequest::new(descriptor(task_id, 1), ClientId::new()))
+            .unwrap();
+        assert_eq!(
+            surface.admit_page_input(
+                1,
+                surface.bounds_epoch(),
+                surface.focus_epoch(),
+                BrowserDockGesture::PageClick
+            ),
+            Err(devmanager::browser::BrowserDockError::PointerConsumed)
+        );
+    }
+    
+    #[test]
+    fn ui_popup_selection_and_address_cannot_become_page_input() {
+        let task_id = TaskId::new();
+        let mut surface = BrowserDockSurface::from_descriptor(descriptor(task_id, 1)).unwrap();
+        surface
+            .attach(BrowserAttachRequest::new(descriptor(task_id, 1), ClientId::new()))
+            .unwrap();
+        surface.select_tab(BrowserTabId::new()).unwrap();
+        for gesture in [
+            BrowserDockGesture::PopupSelect,
+            BrowserDockGesture::AddressSubmit,
+            BrowserDockGesture::FileChoice,
+            BrowserDockGesture::PermissionAnswer,
+            BrowserDockGesture::PageDrag,
+        ] {
+            assert_eq!(
+                surface.classify_gesture(gesture),
+                BrowserPointerDisposition::ConsumeShellGesture
+            );
+        }
+    }
+    
+    #[test]
+    fn ui_terminal_browser_focus_transition_preserves_terminal() {
+        let task_id = TaskId::new();
+        let surface = BrowserDockSurface::from_descriptor(descriptor(task_id, 1)).unwrap();
+        let mut dock = BrowserContextDock::open(
+            surface,
+            projection(
+                task_id,
+                BrowserContextId::new(),
+                vec![tab("https://example.test/", "A")],
+            ),
+            ContextDockLayout::split(800, 40).unwrap(),
+        )
+        .unwrap();
+        dock.focus_terminal().unwrap();
+        assert_eq!(dock.focus(), ContextDockFocus::Terminal);
+        assert!(dock.terminal_present());
+        assert_eq!(
+            dock.classify(BrowserDockGesture::PageClick),
+            BrowserPointerDisposition::ConsumeShellGesture
+        );
+    }
+    
+    #[test]
+    fn ui_cross_task_descriptor_is_rejected() {
+        let mut surface = BrowserDockSurface::from_descriptor(descriptor(TaskId::new(), 1)).unwrap();
+        assert_eq!(
+            surface.attach(BrowserAttachRequest::new(descriptor(TaskId::new(), 1), ClientId::new())),
+            Err(devmanager::browser::BrowserDockError::CrossTask)
+        );
+    }
+}
+

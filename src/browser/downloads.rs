@@ -1,8 +1,16 @@
-use super::{BrowserDownloadEntry, BrowserError, BrowserStorageLayout};
+use super::{
+    classify_upload_path, redact_browser_text, BrowserDownloadEntry, BrowserError, BrowserIoRole,
+    BrowserRisk, BrowserStorageLayout, REDACTED_VALUE,
+};
+use crate::domain::artifact::PrivacyClass;
+use crate::domain::browser::BrowserPermission;
+use crate::domain::id::{ArtifactId, BrowserContextId, TaskId};
 use sha2::{Digest, Sha256};
 #[cfg(target_os = "windows")]
 use std::os::windows::fs::MetadataExt;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use zeroize::Zeroizing;
 
 const DOWNLOAD_ID_PREFIX: &str = "download-";
 
@@ -440,6 +448,285 @@ fn validate_download_id(id: &str) -> Result<(), BrowserError> {
         Err(BrowserError::InvalidInvocation {
             field: "downloadId".to_string(),
         })
+    }
+}
+
+pub const MAX_BROWSER_DOWNLOAD_BYTES: u64 = 8 * 1024 * 1024;
+pub const MAX_BROWSER_CLIPBOARD_BYTES: usize = 16 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowserIoError {
+    PermissionDenied,
+    StaleGeneration,
+    CrossTask,
+    OutsideWorkspace,
+    Denied,
+    Cancelled,
+    RemotePathRejected,
+    BoundExceeded,
+    InvalidRequest,
+}
+
+impl std::fmt::Display for BrowserIoError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PermissionDenied => write!(f, "browser IO permission denied"),
+            Self::StaleGeneration => write!(f, "browser IO generation is stale"),
+            Self::CrossTask => write!(f, "browser IO belongs to another Task"),
+            Self::OutsideWorkspace => write!(f, "browser file chooser left the workspace"),
+            Self::Denied => write!(f, "browser download was denied"),
+            Self::Cancelled => write!(f, "browser download was cancelled"),
+            Self::RemotePathRejected => write!(f, "remote client cannot submit a host path"),
+            Self::BoundExceeded => write!(f, "browser IO bound exceeded"),
+            Self::InvalidRequest => write!(f, "browser IO request is invalid"),
+        }
+    }
+}
+
+impl std::error::Error for BrowserIoError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowserStagedDownload {
+    pub file_name: String,
+    pub sha256_hex: String,
+    pub byte_size: u64,
+    pub privacy_class: PrivacyClass,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowserSecretFillReport {
+    pub vault_ref: String,
+    pub field_selector: String,
+    pub redacted_value: &'static str,
+}
+
+#[derive(Debug, Clone)]
+pub struct BrowserIoController {
+    task_id: TaskId,
+    context_id: BrowserContextId,
+    generation: u64,
+    role: BrowserIoRole,
+    permissions: BTreeSet<BrowserPermission>,
+    approved_artifacts: BTreeSet<ArtifactId>,
+    store: BrowserDownloadStore,
+    active_download: Option<String>,
+    clipboard: Zeroizing<String>,
+}
+
+impl BrowserIoController {
+    pub fn open(
+        task_id: TaskId,
+        context_id: BrowserContextId,
+        generation: u64,
+        role: BrowserIoRole,
+        permissions: impl IntoIterator<Item = BrowserPermission>,
+        store: BrowserDownloadStore,
+    ) -> Result<Self, BrowserIoError> {
+        if generation == 0 {
+            return Err(BrowserIoError::StaleGeneration);
+        }
+        Ok(Self {
+            task_id,
+            context_id,
+            generation,
+            role,
+            permissions: permissions.into_iter().collect(),
+            approved_artifacts: BTreeSet::new(),
+            store,
+            active_download: None,
+            clipboard: Zeroizing::new(String::new()),
+        })
+    }
+
+    pub fn approve_artifact(&mut self, artifact_id: ArtifactId) {
+        self.approved_artifacts.insert(artifact_id);
+    }
+
+    pub fn decide_download(
+        &mut self,
+        task_id: TaskId,
+        generation: u64,
+        allow: bool,
+        suggested_name: &str,
+    ) -> Result<Option<String>, BrowserIoError> {
+        self.require(task_id, generation, BrowserPermission::Download)?;
+        if !allow {
+            self.active_download = None;
+            return Err(BrowserIoError::Denied);
+        }
+        let safe = safe_download_name(suggested_name)?;
+        self.active_download = Some(safe.clone());
+        Ok(Some(safe))
+    }
+
+    pub fn cancel_download(
+        &mut self,
+        task_id: TaskId,
+        generation: u64,
+    ) -> Result<(), BrowserIoError> {
+        self.require(task_id, generation, BrowserPermission::Download)?;
+        if self.active_download.take().is_none() {
+            return Err(BrowserIoError::InvalidRequest);
+        }
+        Ok(())
+    }
+
+    pub fn stage_download(
+        &mut self,
+        task_id: TaskId,
+        generation: u64,
+        suggested_name: &str,
+        bytes: &[u8],
+    ) -> Result<BrowserStagedDownload, BrowserIoError> {
+        self.require(task_id, generation, BrowserPermission::Download)?;
+        if self.active_download.is_none() {
+            return Err(BrowserIoError::Denied);
+        }
+        if bytes.len() as u64 > MAX_BROWSER_DOWNLOAD_BYTES {
+            return Err(BrowserIoError::BoundExceeded);
+        }
+        let suggested = PathBuf::from(safe_download_name(suggested_name)?);
+        let path = unique_path_in(self.store.root(), &suggested).map_err(io_to_bound)?;
+        std::fs::write(&path, bytes).map_err(|_| BrowserIoError::InvalidRequest)?;
+        let digest = Sha256::digest(bytes);
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(BrowserIoError::InvalidRequest)?
+            .to_string();
+        self.active_download = None;
+        Ok(BrowserStagedDownload {
+            file_name,
+            sha256_hex: format!("{digest:x}"),
+            byte_size: bytes.len() as u64,
+            privacy_class: PrivacyClass::LocalOnly,
+        })
+    }
+
+    pub fn choose_artifact(
+        &self,
+        task_id: TaskId,
+        generation: u64,
+        artifact_id: ArtifactId,
+    ) -> Result<ArtifactId, BrowserIoError> {
+        self.require(task_id, generation, BrowserPermission::FileChooser)?;
+        if !self.approved_artifacts.contains(&artifact_id) {
+            return Err(BrowserIoError::PermissionDenied);
+        }
+        Ok(artifact_id)
+    }
+
+    pub fn choose_host_path(
+        &self,
+        task_id: TaskId,
+        generation: u64,
+        workspace_root: &Path,
+        candidate: &Path,
+    ) -> Result<PathBuf, BrowserIoError> {
+        self.require(task_id, generation, BrowserPermission::FileChooser)?;
+        if !self.role.may_submit_host_path() {
+            return Err(BrowserIoError::RemotePathRejected);
+        }
+        let (path, risk) =
+            classify_upload_path(workspace_root, candidate).map_err(|_| BrowserIoError::OutsideWorkspace)?;
+        if risk == BrowserRisk::OutsideWorkspaceFile {
+            return Err(BrowserIoError::OutsideWorkspace);
+        }
+        Ok(path)
+    }
+
+    pub fn write_clipboard(
+        &mut self,
+        task_id: TaskId,
+        generation: u64,
+        text: &str,
+    ) -> Result<String, BrowserIoError> {
+        self.require(task_id, generation, BrowserPermission::Clipboard)?;
+        if text.len() > MAX_BROWSER_CLIPBOARD_BYTES {
+            return Err(BrowserIoError::BoundExceeded);
+        }
+        *self.clipboard = Zeroizing::new(text.to_string());
+        Ok(redact_browser_text(text))
+    }
+
+    pub fn read_clipboard(
+        &self,
+        task_id: TaskId,
+        generation: u64,
+    ) -> Result<String, BrowserIoError> {
+        self.require(task_id, generation, BrowserPermission::Clipboard)?;
+        if !self.role.may_read_clipboard(true) {
+            return Err(BrowserIoError::PermissionDenied);
+        }
+        Ok(self.clipboard.to_string())
+    }
+
+    pub fn fill_secret(
+        &self,
+        task_id: TaskId,
+        generation: u64,
+        vault_ref: &str,
+        field_selector: &str,
+        secret: &str,
+    ) -> Result<BrowserSecretFillReport, BrowserIoError> {
+        self.require(task_id, generation, BrowserPermission::SecretFill)?;
+        if vault_ref.is_empty() || field_selector.is_empty() || secret.is_empty() {
+            return Err(BrowserIoError::InvalidRequest);
+        }
+        let _held = Zeroizing::new(secret.to_string());
+        let report = BrowserSecretFillReport {
+            vault_ref: vault_ref.to_string(),
+            field_selector: field_selector.to_string(),
+            redacted_value: REDACTED_VALUE,
+        };
+        let encoded = format!("{report:?}");
+        if encoded.contains(secret) {
+            return Err(BrowserIoError::InvalidRequest);
+        }
+        Ok(report)
+    }
+
+    pub fn context_id(&self) -> BrowserContextId {
+        self.context_id
+    }
+
+    fn require(
+        &self,
+        task_id: TaskId,
+        generation: u64,
+        permission: BrowserPermission,
+    ) -> Result<(), BrowserIoError> {
+        if task_id != self.task_id {
+            return Err(BrowserIoError::CrossTask);
+        }
+        if generation == 0 || generation != self.generation {
+            return Err(BrowserIoError::StaleGeneration);
+        }
+        if !self.permissions.contains(&permission) {
+            return Err(BrowserIoError::PermissionDenied);
+        }
+        Ok(())
+    }
+}
+
+fn safe_download_name(name: &str) -> Result<String, BrowserIoError> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() || trimmed.len() > 128 {
+        return Err(BrowserIoError::InvalidRequest);
+    }
+    if trimmed.contains(['/', '\\', ':', '*', '?', '"', '<', '>', '|'])
+        || trimmed.contains("..")
+        || Path::new(trimmed).is_absolute()
+    {
+        return Err(BrowserIoError::InvalidRequest);
+    }
+    Ok(trimmed.to_string())
+}
+
+fn io_to_bound(error: BrowserError) -> BrowserIoError {
+    match error {
+        BrowserError::OutsideWorkspace { .. } => BrowserIoError::OutsideWorkspace,
+        _ => BrowserIoError::InvalidRequest,
     }
 }
 

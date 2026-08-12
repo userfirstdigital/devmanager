@@ -227,6 +227,8 @@ pub enum BrowserPermission {
     Automate,
     Download,
     Clipboard,
+    FileChooser,
+    SecretFill,
     PermissionDecide,
     Record,
     Replay,
@@ -372,6 +374,15 @@ pub enum BrowserDurableFact {
         #[serde(deserialize_with = "deserialize_identity")]
         recording_id: String,
     },
+    DownloadSettled {
+        context_id: BrowserContextId,
+        task_id: TaskId,
+        allowed: bool,
+        #[serde(deserialize_with = "deserialize_identity")]
+        file_name: String,
+        sha256_hex: Option<String>,
+        artifact_id: Option<ArtifactId>,
+    },
     HealthTransitioned {
         context_id: BrowserContextId,
         task_id: TaskId,
@@ -422,6 +433,17 @@ pub enum BrowserAction {
     DecideDownload {
         allow: bool,
     },
+    ReadClipboard,
+    WriteClipboard,
+    ChooseFile {
+        artifact_id: ArtifactId,
+    },
+    FillSecret {
+        #[serde(deserialize_with = "deserialize_identity")]
+        vault_ref: String,
+        #[serde(deserialize_with = "deserialize_identity")]
+        field_selector: String,
+    },
     DecidePermission {
         permission: BrowserPermission,
         allowed: bool,
@@ -447,6 +469,9 @@ impl BrowserAction {
             | Self::Capture
             | Self::Automate
             | Self::DecideDownload { .. }
+            | Self::ReadClipboard
+            | Self::WriteClipboard
+            | Self::FillSecret { .. }
             | Self::Record
             | Self::Replay => PrivacyClass::LocalOnly,
             _ => PrivacyClass::Shareable,
@@ -468,6 +493,9 @@ impl BrowserAction {
             Self::Capture => BrowserPermission::Capture,
             Self::Automate => BrowserPermission::Automate,
             Self::DecideDownload { .. } => BrowserPermission::Download,
+            Self::ReadClipboard | Self::WriteClipboard => BrowserPermission::Clipboard,
+            Self::ChooseFile { .. } => BrowserPermission::FileChooser,
+            Self::FillSecret { .. } => BrowserPermission::SecretFill,
             Self::DecidePermission { .. } => BrowserPermission::PermissionDecide,
             Self::Record => BrowserPermission::Record,
             Self::Replay => BrowserPermission::Replay,
@@ -498,6 +526,10 @@ impl BrowserAction {
                 | Self::Capture
                 | Self::Automate
                 | Self::DecideDownload { .. }
+                | Self::ReadClipboard
+                | Self::WriteClipboard
+                | Self::ChooseFile { .. }
+                | Self::FillSecret { .. }
                 | Self::DecidePermission { .. }
                 | Self::Record
                 | Self::Replay
@@ -1064,6 +1096,14 @@ impl BrowserBook {
         if let Some(url) = request.action.url() {
             validate_url(url)?;
         }
+        if let BrowserAction::FillSecret {
+            vault_ref,
+            field_selector,
+        } = &request.action
+        {
+            validate_identity(vault_ref)?;
+            validate_identity(field_selector)?;
+        }
         if let BrowserAction::SetBounds { width, height } = request.action {
             if width == 0
                 || height == 0
@@ -1574,6 +1614,35 @@ impl BrowserBook {
                 }
                 context.recording_id = Some(recording_id.clone());
             }
+            BrowserDurableFact::DownloadSettled {
+                context_id,
+                task_id,
+                file_name,
+                sha256_hex,
+                artifact_id,
+                ..
+            } => {
+                validate_identity(file_name)?;
+                if let Some(digest) = sha256_hex {
+                    if digest.len() != 64
+                        || !digest
+                            .bytes()
+                            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+                    {
+                        return Err(BrowserContractError::InvalidRequest);
+                    }
+                }
+                let context = self
+                    .contexts
+                    .get_mut(context_id)
+                    .ok_or(BrowserContractError::InvalidRequest)?;
+                if context.task_id != *task_id {
+                    return Err(BrowserContractError::CrossTask);
+                }
+                if let Some(artifact_id) = artifact_id {
+                    context.linked_artifacts.insert(*artifact_id);
+                }
+            }
             BrowserDurableFact::ContextCreated {
                 context_id,
                 task_id,
@@ -1807,8 +1876,9 @@ fn fact_task_id(fact: &BrowserDurableFact) -> TaskId {
         | BrowserDurableFact::PermissionDecided { task_id, .. }
         | BrowserDurableFact::ArtifactLinked { task_id, .. }
         | BrowserDurableFact::RecipeIdentified { task_id, .. }
-        | BrowserDurableFact::RecordingIdentified { task_id, .. }
-        | BrowserDurableFact::HealthTransitioned { task_id, .. } => *task_id,
+                | BrowserDurableFact::RecordingIdentified { task_id, .. }
+                | BrowserDurableFact::DownloadSettled { task_id, .. }
+                | BrowserDurableFact::HealthTransitioned { task_id, .. } => *task_id,
     }
 }
 

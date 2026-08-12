@@ -1,4 +1,7 @@
+mod artifacts;
 mod editor_ui;
+
+pub use artifacts::promote_browser_download;
 
 use self::editor_ui::{
     render_choice_row, render_compact_text_input, render_display_field, render_editor_intro,

@@ -4,6 +4,8 @@ mod automation;
 mod commands;
 pub mod domain;
 mod downloads;
+mod projection;
+mod surface;
 mod gateway;
 mod host;
 mod mcp;
@@ -26,7 +28,6 @@ mod replay_repair;
 mod replay_secrets;
 mod resources;
 mod storage;
-mod surface;
 mod workflow_mcp;
 
 pub(crate) use annotations::redacted_browser_annotation;
@@ -72,7 +73,8 @@ pub(crate) use commands::{
 };
 pub use downloads::{
     prepare_verified_download_root, prepare_verified_profile_root, remove_verified_profile,
-    BrowserDownloadStore,
+    BrowserDownloadStore, BrowserIoController, BrowserIoError, BrowserSecretFillReport,
+    BrowserStagedDownload,
 };
 pub use gateway::{BrowserGatewayHandle, BrowserGatewayRegistrar, BrowserGatewayRegistration};
 pub(crate) use host::BrowserAppExitDisposition;
@@ -93,6 +95,13 @@ pub use model::{
 };
 pub use operation_queue::{
     BrowserOperationQueue, BrowserOperationTarget, BrowserQueueCancellation,
+};
+pub use projection::{
+    projection_meta, BrowserProjectionError, BrowserProjectionEvent, BrowserProjectionSession,
+};
+pub use surface::{
+    BrowserDockChrome, BrowserDockError, BrowserDockFocusTarget, BrowserDockGesture,
+    BrowserDockSurface, BrowserPointerDisposition,
 };
 pub use pane::{
     apply_browser_workflow_review_mutation, browser_action_plan, browser_annotation_preview_plan,
@@ -115,7 +124,7 @@ pub use pane::{
     BrowserWorkflowReviewProjection, BrowserWorkflowReviewStepProjection,
     BrowserWorkflowReviewUiState, BROWSER_REPLAY_SECRET_MASK,
 };
-pub use policy::{classify_upload_path, BrowserApprovalPolicy, BrowserRisk};
+pub use policy::{classify_upload_path, BrowserApprovalPolicy, BrowserIoRole, BrowserRisk};
 pub use provider::{
     codex_browser_config_overrides, prepare_claude_browser_overlay, BrowserProviderAccess,
     ClaudeBrowserOverlay, DEVMANAGER_BROWSER_TOKEN_ENV,

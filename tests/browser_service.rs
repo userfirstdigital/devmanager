@@ -2503,6 +2503,134 @@ fn domain_browser_event(task_id: Option<TaskId>, payload: Event) -> DomainEvent 
     }
 }
 
+#[test]
+fn io_download_allow_deny_cancel_collision_hash_and_artifact() {
+    use devmanager::browser::{
+        BrowserDownloadStore, BrowserIoController, BrowserIoError, BrowserIoRole,
+    };
+    use devmanager::domain::browser::BrowserPermission;
+    use devmanager::workspace::promote_browser_download;
+
+    let root = tempfile::TempDir::new().unwrap();
+    let store = BrowserDownloadStore::open(root.path().join("downloads")).unwrap();
+    let task = TaskId::new();
+    let mut io = BrowserIoController::open(
+        task,
+        BrowserContextId::new(),
+        1,
+        BrowserIoRole::LocalDesktop,
+        [BrowserPermission::Download],
+        store,
+    )
+    .unwrap();
+    assert_eq!(
+        io.decide_download(task, 1, false, "report.pdf")
+            .expect_err("deny"),
+        BrowserIoError::Denied
+    );
+    io.decide_download(task, 1, true, "report.pdf").unwrap();
+    io.cancel_download(task, 1).unwrap();
+    assert_eq!(
+        io.stage_download(task, 1, "report.pdf", b"one")
+            .expect_err("cancelled"),
+        BrowserIoError::Denied
+    );
+    io.decide_download(task, 1, true, "report.pdf").unwrap();
+    let first = io.stage_download(task, 1, "report.pdf", b"alpha").unwrap();
+    io.decide_download(task, 1, true, "report.pdf").unwrap();
+    let second = io.stage_download(task, 1, "report.pdf", b"beta").unwrap();
+    assert_eq!(first.file_name, "report.pdf");
+    assert_eq!(second.file_name, "report (1).pdf");
+    assert_ne!(first.sha256_hex, second.sha256_hex);
+    assert_eq!(first.sha256_hex.len(), 64);
+    let artifact = promote_browser_download(task, &first).unwrap();
+    assert_eq!(artifact.task_id, task);
+    assert_eq!(artifact.label, "report.pdf");
+}
+
+#[test]
+fn io_file_chooser_clipboard_secret_and_stale_generation() {
+    use devmanager::browser::{
+        BrowserDownloadStore, BrowserIoController, BrowserIoError, BrowserIoRole,
+        BrowserReplaySecretStore,
+    };
+    use devmanager::domain::browser::BrowserPermission;
+    use std::fs;
+
+    let root = tempfile::TempDir::new().unwrap();
+    let workspace = root.path().join("ws");
+    fs::create_dir_all(workspace.join("ok")).unwrap();
+    fs::write(workspace.join("ok").join("file.txt"), b"ok").unwrap();
+    fs::write(root.path().join("outside.txt"), b"no").unwrap();
+    let store = BrowserDownloadStore::open(root.path().join("downloads")).unwrap();
+    let task = TaskId::new();
+    let artifact = ArtifactId::new();
+    let mut local = BrowserIoController::open(
+        task,
+        BrowserContextId::new(),
+        3,
+        BrowserIoRole::LocalDesktop,
+        [
+            BrowserPermission::FileChooser,
+            BrowserPermission::Clipboard,
+            BrowserPermission::SecretFill,
+        ],
+        store,
+    )
+    .unwrap();
+    local.approve_artifact(artifact);
+    assert_eq!(local.choose_artifact(task, 3, artifact).unwrap(), artifact);
+    assert_eq!(
+        local
+            .choose_host_path(task, 3, &workspace, &root.path().join("outside.txt"))
+            .expect_err("outside"),
+        BrowserIoError::OutsideWorkspace
+    );
+    local
+        .choose_host_path(task, 3, &workspace, &workspace.join("ok").join("file.txt"))
+        .unwrap();
+    let redacted = local.write_clipboard(task, 3, "password=super-secret").unwrap();
+    assert!(!redacted.contains("super-secret"));
+    assert_eq!(local.read_clipboard(task, 3).unwrap(), "password=super-secret");
+    let secret = local
+        .fill_secret(task, 3, "vault://login", "input#password", "hunter2")
+        .unwrap();
+    assert_eq!(secret.redacted_value, "[redacted]");
+    assert!(!format!("{secret:?}").contains("hunter2"));
+    let (vault, field, mask) =
+        BrowserReplaySecretStore::redacted_fill_metadata("vault://login", "input#password").unwrap();
+    assert_eq!(vault, "vault://login");
+    assert_eq!(field, "input#password");
+    assert_eq!(mask, "[redacted]");
+    assert_eq!(
+        local
+            .fill_secret(task, 2, "vault://login", "input#password", "hunter2")
+            .expect_err("stale"),
+        BrowserIoError::StaleGeneration
+    );
+
+    let remote_store = BrowserDownloadStore::open(root.path().join("remote")).unwrap();
+    let remote = BrowserIoController::open(
+        task,
+        BrowserContextId::new(),
+        3,
+        BrowserIoRole::RemoteProjection,
+        [BrowserPermission::FileChooser, BrowserPermission::Clipboard],
+        remote_store,
+    )
+    .unwrap();
+    assert_eq!(
+        remote
+            .choose_host_path(task, 3, &workspace, &workspace.join("ok").join("file.txt"))
+            .expect_err("remote path"),
+        BrowserIoError::RemotePathRejected
+    );
+    assert_eq!(
+        remote.read_clipboard(task, 3).expect_err("remote clipboard"),
+        BrowserIoError::PermissionDenied
+    );
+}
+
 fn collect_object_keys(value: serde_json::Value, keys: &mut BTreeSet<String>) {
     match value {
         serde_json::Value::Object(map) => {

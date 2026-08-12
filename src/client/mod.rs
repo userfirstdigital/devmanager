@@ -17,7 +17,7 @@ pub use connection::{connect, perform_client_hello, ClientConnection, Unsolicite
 pub use host_client::{
     ArtifactContentBatch, EventReplayBatch, HostClient, HostClientConfig, TrackedOperation,
 };
-pub use model::{ClientModel, ClientModelBuilder, ClientModelError};
+pub use model::{ClientBrowserDockView, ClientModel, ClientModelBuilder, ClientModelError};
 pub use subscription::{
     ClientSubscription, ClientSubscriptionState, SubscriptionError, SubscriptionUpdate,
 };
