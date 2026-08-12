@@ -34,12 +34,14 @@ Machine-checked against `Cargo.lock` by `packaging/Assert-ThirdPartyProvenance.p
 | `sha2` | `0.10.9` | yes |
 | `hmac` | `0.12.1` | yes |
 | `snow` | `0.10.0` | yes |
+| `tokio-rustls` | `0.26.4` | yes |
+| `webpki-roots` | `1.0.6` | yes |
 | `zeroize` | `1.8.2` | yes |
 | `web-push-native` | `0.4.0` | yes |
 | `getrandom` | `0.3.4` | yes |
 | `base64` | `0.22.1` | yes |
 
-Connect production Noise is the pinned `snow` 0.10.0 crate listed above. Packaging must not embed private keys, pairing secrets, or OS-vault material.
+Connect production Noise is the pinned `snow` 0.10.0 crate listed above. Connect relay TLS uses `tokio-rustls` 0.26.4 plus `webpki-roots` 1.0.6 for `wss://` only. Packaging must not embed private keys, pairing secrets, or OS-vault material.
 
 ## snow 0.10.0 (Connect production Noise)
 

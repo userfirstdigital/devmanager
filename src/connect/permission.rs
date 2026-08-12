@@ -11,7 +11,7 @@ use super::identity::{
     validate_device_credential, ConnectIdentity, CredentialVault, DeviceCredentialProof,
     MachineBinding,
 };
-use super::identity_store::{IdentityPersistence, IsolatedRemoteStore};
+use super::identity_store::{ConnectIdentityLiveState, IdentityPersistence, IsolatedRemoteStore};
 
 /// Stable action discriminant. Unknown nonzero values are denied, never
 /// converted into a new command or interactive action.
@@ -29,6 +29,7 @@ impl ActionId {
     pub const TERMINAL_INPUT: Self = Self(NonZeroU16::new(13).unwrap());
     pub const BROWSER_COMMAND: Self = Self(NonZeroU16::new(14).unwrap());
     pub const APPROVE_DANGEROUS: Self = Self(NonZeroU16::new(20).unwrap());
+    pub const REDEEM_PAIRING: Self = Self(NonZeroU16::new(30).unwrap());
 
     pub const fn new(value: u16) -> Option<Self> {
         match NonZeroU16::new(value) {
@@ -53,6 +54,7 @@ impl ActionId {
             13 => KnownAction::TerminalInput,
             14 => KnownAction::BrowserCommand,
             20 => KnownAction::ApproveDangerous,
+            30 => KnownAction::RedeemPairing,
             _ => return None,
         })
     }
@@ -70,6 +72,7 @@ pub enum KnownAction {
     TerminalInput,
     BrowserCommand,
     ApproveDangerous,
+    RedeemPairing,
 }
 
 impl KnownAction {
@@ -91,6 +94,10 @@ impl KnownAction {
 
     pub const fn is_owner_only(self) -> bool {
         matches!(self, Self::ReadPersonalPrompts | Self::ApproveDangerous)
+    }
+
+    pub const fn is_pairing_only(self) -> bool {
+        matches!(self, Self::RedeemPairing)
     }
 }
 
@@ -150,6 +157,54 @@ impl HostCapabilityGrant {
 /// Resolve only the explicit grant member. No grant member is fail-closed.
 pub fn resolve_host_capability_grant(metadata: &serde_json::Value) -> Option<HostCapabilityGrant> {
     HostCapabilityGrant::from_wire(metadata.get("grant"))
+}
+
+/// Live Connect admission subject. Anonymous pairing is not a durable role
+/// label and cannot be inferred from browser metadata, cwd, or timestamps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectAdmission {
+    AnonymousPairing,
+    Established(ConnectRole),
+}
+
+/// Fail-closed live admission: pending/revoked identities cannot take
+/// task/control/raw-content actions. Anonymous pairing is pairing-only.
+pub fn admit_connect_action(
+    live: ConnectIdentityLiveState,
+    admission: ConnectAdmission,
+    request: PermissionRequest,
+    grant: Option<&ScopedPermissionGrant>,
+    context: Option<AuthoritativePermissionContext>,
+) -> PermissionDecision {
+    match admission {
+        ConnectAdmission::AnonymousPairing => {
+            if !matches!(live, ConnectIdentityLiveState::Live) {
+                return PermissionDecision::Denied(PermissionDenyReason::IdentityNotLive);
+            }
+            if request.action != ActionId::REDEEM_PAIRING
+                || request
+                    .action
+                    .known()
+                    .is_some_and(|action| !action.is_pairing_only())
+            {
+                return PermissionDecision::Denied(PermissionDenyReason::AnonymousPairingOnly);
+            }
+            PermissionDecision::Allow
+        }
+        ConnectAdmission::Established(role) => {
+            if !matches!(live, ConnectIdentityLiveState::Live) {
+                return PermissionDecision::Denied(PermissionDenyReason::IdentityNotLive);
+            }
+            let request = PermissionRequest { role, ..request };
+            let evaluator = PermissionEvaluator::default();
+            match (grant, context) {
+                (Some(grant), Some(context)) => {
+                    evaluator.evaluate_with_scoped_grant(request, grant, context)
+                }
+                _ => evaluator.evaluate(request),
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -300,6 +355,8 @@ pub enum PermissionDenyReason {
     DeviceCredentialRequired,
     ScopedGrantRequired,
     NonAuthoritativeContext,
+    AnonymousPairingOnly,
+    IdentityNotLive,
 }
 
 impl fmt::Display for PermissionDenyReason {
@@ -318,6 +375,10 @@ impl fmt::Display for PermissionDenyReason {
             Self::NonAuthoritativeContext => {
                 "the evaluator lacks authoritative channel/session/route context"
             }
+            Self::AnonymousPairingOnly => {
+                "anonymous pairing may only redeem a bounded pairing capability"
+            }
+            Self::IdentityNotLive => "Connect identity is pending, revoked, or absent",
         })
     }
 }
@@ -636,5 +697,51 @@ mod tests {
         }))
         .expect("explicit watcher grant");
         assert_eq!(watcher.role, HostConnectRole::Watcher);
+    }
+
+    #[test]
+    fn anonymous_pairing_is_pairing_only_and_pending_identities_fail_closed() {
+        let pairing = PermissionRequest {
+            role: ConnectRole::PairedOwner,
+            task_id: None,
+            action: ActionId::REDEEM_PAIRING,
+            credential: None,
+        };
+        assert_eq!(
+            admit_connect_action(
+                ConnectIdentityLiveState::Live,
+                ConnectAdmission::AnonymousPairing,
+                pairing.clone(),
+                None,
+                None,
+            ),
+            PermissionDecision::Allow
+        );
+        assert_eq!(
+            admit_connect_action(
+                ConnectIdentityLiveState::Live,
+                ConnectAdmission::AnonymousPairing,
+                PermissionRequest {
+                    action: ActionId::TERMINAL_INPUT,
+                    ..pairing.clone()
+                },
+                None,
+                None,
+            ),
+            PermissionDecision::Denied(PermissionDenyReason::AnonymousPairingOnly)
+        );
+        assert_eq!(
+            admit_connect_action(
+                ConnectIdentityLiveState::Pending,
+                ConnectAdmission::Established(ConnectRole::PairedOwner),
+                PermissionRequest {
+                    action: ActionId::MUTATE_TASK,
+                    ..pairing
+                },
+                None,
+                None,
+            ),
+            PermissionDecision::Denied(PermissionDenyReason::IdentityNotLive)
+        );
     }
 }

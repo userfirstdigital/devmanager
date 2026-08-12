@@ -159,6 +159,296 @@ pub(crate) async fn ws_handler(
     ws.on_upgrade(move |socket| run_session(socket, inner, listener_generation, admission))
 }
 
+const CONNECT_WS_GREETING_MAGIC: &[u8; 5] = b"DMCN1";
+const CONNECT_WS_MAX_FRAME_BYTES: usize = crate::connect::MAX_DIRECT_FRAME_BYTES as usize;
+
+pub(crate) async fn connect_ws_handler(
+    State(state): State<Arc<WebState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    ws: WebSocketUpgrade,
+    headers: HeaderMap,
+) -> Response {
+    let _ = addr;
+    if let Err(response) = admit_connect_ws_request(&state, &headers) {
+        return response;
+    }
+    let Some(inner) = state.upgrade_inner() else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "host unavailable").into_response();
+    };
+    inner
+        .connect_encryption_required
+        .store(true, Ordering::Release);
+    match crate::connect::ConnectProductionSession::open() {
+        Ok(session) => match session.identity_store().identity_live_state() {
+            Ok(crate::connect::ConnectIdentityLiveState::Live) => {}
+            Ok(crate::connect::ConnectIdentityLiveState::Pending) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    crate::connect::ConnectStartupError::Production(
+                        crate::connect::ConnectProductionError::Identity(
+                            crate::connect::IdentityError::TransitionPending,
+                        ),
+                    )
+                    .to_string(),
+                )
+                    .into_response();
+            }
+            Ok(crate::connect::ConnectIdentityLiveState::Absent) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    crate::connect::ConnectStartupError::Production(
+                        crate::connect::ConnectProductionError::Identity(
+                            crate::connect::IdentityError::NotEnabled,
+                        ),
+                    )
+                    .to_string(),
+                )
+                    .into_response();
+            }
+            Err(error) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    crate::connect::ConnectStartupError::Production(
+                        crate::connect::ConnectProductionError::Identity(error),
+                    )
+                    .to_string(),
+                )
+                    .into_response();
+            }
+        },
+        Err(error) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                crate::connect::ConnectStartupError::Production(error).to_string(),
+            )
+                .into_response();
+        }
+    }
+    let inner = Arc::downgrade(&inner);
+    ws.max_message_size(CONNECT_WS_MAX_FRAME_BYTES)
+        .max_frame_size(CONNECT_WS_MAX_FRAME_BYTES)
+        .on_upgrade(move |socket| run_connect_session(socket, inner))
+}
+
+fn admit_connect_ws_request(state: &WebState, headers: &HeaderMap) -> Result<(), Response> {
+    if !request_is_same_origin(headers) {
+        return Err((StatusCode::FORBIDDEN, "cross-origin websocket rejected").into_response());
+    }
+    let Some(inner) = state.upgrade_inner() else {
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, "host unavailable").into_response());
+    };
+    let host = headers
+        .get(axum::http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    let origin = headers
+        .get(axum::http::header::ORIGIN)
+        .and_then(|value| value.to_str().ok());
+    let referer = headers
+        .get(axum::http::header::REFERER)
+        .and_then(|value| value.to_str().ok());
+    let query = headers
+        .get(axum::http::header::SEC_WEBSOCKET_PROTOCOL)
+        .and_then(|value| value.to_str().ok());
+    let _ = query;
+    let policy =
+        if crate::connect::is_trustworthy_loopback_host(host.split(':').next().unwrap_or(host)) {
+            crate::connect::DirectBindPolicy::loopback()
+        } else {
+            crate::connect::DirectBindPolicy::lan(host.split(':').next().unwrap_or(host), true)
+        };
+    let view = crate::connect::DirectRequestView {
+        method: "GET",
+        path: "/api/connect",
+        scheme: "http",
+        host,
+        origin,
+        referer,
+        query: None,
+        content_length: None,
+        advertised_hostname: Some(policy.advertised_hostname.as_str()),
+    };
+    crate::connect::admit_direct_request(
+        view,
+        &policy,
+        crate::connect::MAX_DIRECT_PAIRING_BODY_BYTES,
+    )
+    .map_err(|error| {
+        let status = StatusCode::from_u16(error.status_hint()).unwrap_or(StatusCode::FORBIDDEN);
+        (status, error.to_string()).into_response()
+    })?;
+    let _ = inner;
+    Ok(())
+}
+
+async fn run_connect_session(mut socket: WebSocket, inner: Weak<RemoteHostInner>) {
+    let Some(inner) = inner.upgrade() else {
+        return;
+    };
+    inner
+        .connect_encryption_required
+        .store(true, Ordering::Release);
+    let session = match crate::connect::ConnectProductionSession::open() {
+        Ok(session) => session,
+        Err(_) => {
+            let _ = socket.close().await;
+            return;
+        }
+    };
+    if !matches!(
+        session.identity_store().identity_live_state(),
+        Ok(crate::connect::ConnectIdentityLiveState::Live)
+    ) {
+        let _ = socket.close().await;
+        return;
+    }
+    let pairing = crate::connect::admit_connect_action(
+        crate::connect::ConnectIdentityLiveState::Live,
+        crate::connect::ConnectAdmission::AnonymousPairing,
+        crate::connect::PermissionRequest {
+            role: crate::connect::ConnectRole::PairedOwner,
+            task_id: None,
+            action: crate::connect::ActionId::REDEEM_PAIRING,
+            credential: None,
+        },
+        None,
+        None,
+    );
+    if !pairing.is_allowed() {
+        let _ = socket.close().await;
+        return;
+    }
+    let mut route_id = [0_u8; 16];
+    let mut session_id = [0_u8; 16];
+    if getrandom::fill(&mut route_id).is_err() || getrandom::fill(&mut session_id).is_err() {
+        let _ = socket.close().await;
+        return;
+    }
+    let Ok(prologue) = crate::connect::connect_prologue(
+        crate::connect::ConnectCredentialPurpose::OwnerPairing,
+        route_id,
+        session_id,
+    ) else {
+        let _ = socket.close().await;
+        return;
+    };
+    let binding = crate::connect::ConnectNoiseIdentityBinding::host(
+        *session.profile_host_public_id().as_bytes(),
+    );
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(1);
+    let mut handshake = match session.start_handshake(
+        crate::connect::CONNECT_NOISE_FIRST_PAIRING_PATTERN,
+        true,
+        None,
+        prologue,
+        crate::connect::ConnectChannelRole::Responder,
+        binding,
+        now_unix,
+        true,
+        false,
+    ) {
+        Ok(handshake) => handshake,
+        Err(_) => {
+            let _ = socket.close().await;
+            return;
+        }
+    };
+    let mut greeting = Vec::with_capacity(CONNECT_WS_GREETING_MAGIC.len() + 48);
+    greeting.extend_from_slice(CONNECT_WS_GREETING_MAGIC);
+    greeting.extend_from_slice(session.profile_host_public_id().as_bytes());
+    greeting.extend_from_slice(&route_id);
+    greeting.extend_from_slice(&session_id);
+    if socket.send(WsMessage::Binary(greeting)).await.is_err() {
+        return;
+    }
+    let Some(first) = recv_connect_binary(
+        &mut socket,
+        crate::protocol::MAX_HANDSHAKE_MESSAGE_BYTES as usize,
+    )
+    .await
+    else {
+        return;
+    };
+    let Ok(first_message) = crate::connect::ConnectNoiseHandshakeMessage::decode(&first) else {
+        let _ = socket.close().await;
+        return;
+    };
+    if handshake.read_message(&first_message).is_err() {
+        let _ = socket.close().await;
+        return;
+    }
+    let Ok(second) = handshake.write_message() else {
+        let _ = socket.close().await;
+        return;
+    };
+    let Ok(second_bytes) = second.encode() else {
+        let _ = socket.close().await;
+        return;
+    };
+    if socket.send(WsMessage::Binary(second_bytes)).await.is_err() {
+        return;
+    }
+    let Some(third) = recv_connect_binary(
+        &mut socket,
+        crate::protocol::MAX_HANDSHAKE_MESSAGE_BYTES as usize,
+    )
+    .await
+    else {
+        return;
+    };
+    let Ok(third_message) = crate::connect::ConnectNoiseHandshakeMessage::decode(&third) else {
+        let _ = socket.close().await;
+        return;
+    };
+    if handshake.read_message(&third_message).is_err() {
+        let _ = socket.close().await;
+        return;
+    }
+    let mut channel = match crate::connect::ConnectProductionSession::finish_channel(handshake) {
+        Ok(channel) if channel.is_production_grade() => channel,
+        _ => {
+            let _ = socket.close().await;
+            return;
+        }
+    };
+    while let Some(bytes) = recv_connect_binary(&mut socket, CONNECT_WS_MAX_FRAME_BYTES).await {
+        let Ok(frame) = crate::protocol::SealedFrame::decode(&bytes) else {
+            let _ = socket.close().await;
+            return;
+        };
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or(1);
+        if channel.open_bytes(&frame, now_unix).is_err() {
+            let _ = socket.close().await;
+            return;
+        }
+    }
+}
+
+async fn recv_connect_binary(socket: &mut WebSocket, max_bytes: usize) -> Option<Vec<u8>> {
+    loop {
+        match socket.next().await? {
+            Ok(WsMessage::Binary(bytes)) => {
+                if bytes.is_empty() || bytes.len() > max_bytes {
+                    let _ = socket.close().await;
+                    return None;
+                }
+                return Some(bytes);
+            }
+            Ok(WsMessage::Ping(_) | WsMessage::Pong(_)) => {}
+            Ok(WsMessage::Text(_) | WsMessage::Close(_)) => {
+                let _ = socket.close().await;
+                return None;
+            }
+        }
+    }
+}
+
 fn initial_web_hello(client_id: &str, snapshot: &RemoteWorkspaceSnapshot) -> WsOutbound {
     WsOutbound::Hello {
         client_id: client_id.to_string(),
@@ -1228,6 +1518,24 @@ fn handle_inbound_core(
         let _ = tokio_tx.send(ServerMessage::Disconnected {
             message: "This browser connection is no longer active. Reconnect or pair again."
                 .to_string(),
+        });
+        return;
+    }
+
+    if inner.connect_encryption_required.load(Ordering::Acquire)
+        && matches!(
+            message,
+            WsInbound::SubscribeSessions { .. }
+                | WsInbound::Input { .. }
+                | WsInbound::PasteImage { .. }
+                | WsInbound::Resize { .. }
+                | WsInbound::InterruptSession { .. }
+                | WsInbound::ComposerSubmit { .. }
+        )
+    {
+        let _ = crate::connect::ConnectListenerKind::ProductionDirect.reject_raw_pty();
+        let _ = web_tx.send(WsOutbound::Error {
+            message: "raw PTY/session-stream is forbidden on Connect production routes".to_string(),
         });
         return;
     }
@@ -2539,6 +2847,14 @@ fn send_resume_state_with_lane(
     if !valid {
         let _ = web_tx.send(WsOutbound::Error {
             message: "Resume request identifiers are too long or empty.".to_string(),
+        });
+        return;
+    }
+    if inner.connect_encryption_required.load(Ordering::Acquire) && request.raw_session_id.is_some()
+    {
+        let _ = crate::connect::ConnectListenerKind::ProductionDirect.reject_raw_pty();
+        let _ = web_tx.send(WsOutbound::Error {
+            message: "raw PTY/session-stream is forbidden on Connect production routes".to_string(),
         });
         return;
     }
@@ -4420,10 +4736,12 @@ impl BrowserOutboundSender {
             ServerMessage::SessionStream {
                 event: RemoteSessionStreamEvent::RuntimePatch { .. }
             }
-        ) {
-            // Browser snapshots already carry runtime state. This variant is
-            // intentionally omitted from the web wire and must not be treated
-            // as a serialization failure that revokes the connection.
+        ) || (inner.connect_encryption_required.load(Ordering::Acquire)
+            && matches!(message, ServerMessage::SessionStream { .. }))
+        {
+            // Browser snapshots already carry runtime state. SessionStream
+            // raw PTY is omitted on Connect production routes and must not
+            // revoke the socket as a serialization failure.
             return Ok(());
         }
         if matches!(
@@ -4725,7 +5043,7 @@ fn translate_outbound(
         ServerMessage::Snapshot { .. } | ServerMessage::Delta { .. } => {
             serialize_web_snapshot(capture_web_snapshot(inner, connection_id, client_id))
         }
-        _ => encode_outbound(message),
+        _ => encode_outbound_gated(message, inner),
     }
 }
 
@@ -4739,7 +5057,7 @@ fn translate_outbound_locked(
         ServerMessage::Snapshot { .. } | ServerMessage::Delta { .. } => serialize_web_snapshot(
             capture_web_snapshot_inner(inner, connection_id, client_id, true),
         ),
-        _ => encode_outbound(message),
+        _ => encode_outbound_gated(message, inner),
     }
 }
 
@@ -4834,6 +5152,16 @@ fn serialize_web_snapshot(workspace: WebWorkspaceSnapshot) -> Option<EncodedFram
 /// Translate a `ServerMessage` (the type the broadcaster produces) into a
 /// WS frame. Returns `None` for variants that only make sense on the TCP
 /// path (e.g., `HelloOk`, `PortForwardOk`).
+fn encode_outbound_gated(message: &ServerMessage, inner: &RemoteHostInner) -> Option<EncodedFrame> {
+    if inner.connect_encryption_required.load(Ordering::Acquire)
+        && matches!(message, ServerMessage::SessionStream { .. })
+    {
+        let _ = crate::connect::ConnectListenerKind::ProductionDirect.reject_raw_pty();
+        return None;
+    }
+    encode_outbound(message)
+}
+
 fn encode_outbound(message: &ServerMessage) -> Option<EncodedFrame> {
     match message {
         ServerMessage::Snapshot { .. } | ServerMessage::Delta { .. } => None,
@@ -4856,6 +5184,8 @@ fn encode_outbound(message: &ServerMessage) -> Option<EncodedFrame> {
 }
 
 fn encode_session_stream(event: &RemoteSessionStreamEvent) -> Option<EncodedFrame> {
+    // Legacy `/api/ws` encoder only. Production Connect uses `/api/connect`
+    // sealed frames; translate_outbound drops this path when encryption is required.
     match event {
         RemoteSessionStreamEvent::Output {
             session_id,
@@ -6402,6 +6732,7 @@ mod tests {
     #[test]
     fn one_browser_queue_orders_initial_resume_replay_lease_live_and_raw_frames() {
         let service = RemoteHostService::new(RemoteHostConfig::default());
+        service.set_connect_encryption_required_for_test(false);
         let client_id = "fifo-client";
         pair_web_client(&service, client_id);
         let (native, _native_rx) = std_mpsc::channel();
@@ -9973,6 +10304,23 @@ mod tests {
         assert_eq!(value["result"]["payload"]["tabId"], "tab-1");
         assert_eq!(value["result"]["payload"]["sessionId"], "session-1");
         assert!(value["result"]["payload"].get("sessionView").is_none());
+    }
+
+    #[test]
+    fn connect_encryption_gate_drops_raw_session_stream() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        assert!(service.connect_encryption_required());
+        let message = ServerMessage::SessionStream {
+            event: RemoteSessionStreamEvent::Output {
+                session_id: "abc".to_string(),
+                chunk_seq: 1,
+                emitted_at_epoch_ms: 0,
+                bytes: vec![9, 8, 7],
+            },
+        };
+        assert!(encode_outbound_gated(&message, &service.inner).is_none());
+        service.set_connect_encryption_required_for_test(false);
+        assert!(encode_outbound_gated(&message, &service.inner).is_some());
     }
 
     #[test]

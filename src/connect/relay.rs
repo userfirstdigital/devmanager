@@ -1,12 +1,14 @@
-//! Minimal opaque hosted-relay and routing-ticket contract.
+//! Hosted-relay route tickets and the production `wss://` relay client.
 //!
 //! Tickets authorize a route. They do not carry task content, pairing secrets,
-//! invitation secrets, or private keys. The relay forwards `SealedFrame`
-//! bytes only and reports size/timing/status metadata.
+//! invitation secrets, or private keys. The production client forwards
+//! already-sealed `SealedFrame` bytes only. [`OpaqueRelay`] is an in-memory
+//! router/test double and is not production networking.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::net::IpAddr;
+use std::sync::Arc;
 
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
@@ -33,6 +35,9 @@ pub const MAX_RELAY_REVOKED_TICKETS: usize = 4_096;
 pub const MAX_RELAY_REVOKED_DEVICES: usize = 4_096;
 pub const MAX_RELAY_CONSUMED_NONCES: usize = 16_384;
 pub const MAX_RELAY_RATE_KEYS: usize = 4_096;
+pub const MAX_RELAY_ENDPOINT_BYTES: usize = 256;
+pub const RELAY_INITIAL_BACKOFF_MS: u64 = 250;
+pub const RELAY_MAX_BACKOFF_MS: u64 = 30_000;
 const TICKET_TAG_BYTES: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -397,6 +402,254 @@ struct PresenceRecord {
     expires_at_unix: u64,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct RelayEndpoint {
+    url: url::Url,
+}
+
+impl fmt::Debug for RelayEndpoint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RelayEndpoint")
+            .field("scheme", &self.url.scheme())
+            .field("has_host", &self.url.host_str().is_some())
+            .finish()
+    }
+}
+
+impl RelayEndpoint {
+    pub fn parse(raw: &str) -> Result<Self, RelayError> {
+        if raw.is_empty() {
+            return Err(RelayError::InsecureEndpoint);
+        }
+        if raw.len() > MAX_RELAY_ENDPOINT_BYTES {
+            return Err(RelayError::InsecureEndpoint);
+        }
+        let url = url::Url::parse(raw).map_err(|_| RelayError::InsecureEndpoint)?;
+        if url.scheme() != "wss" {
+            return Err(RelayError::InsecureEndpoint);
+        }
+        if !url.username().is_empty() || url.password().is_some() {
+            return Err(RelayError::InsecureEndpoint);
+        }
+        let host = url.host_str().unwrap_or("");
+        if host.is_empty() || host == "*" {
+            return Err(RelayError::InsecureEndpoint);
+        }
+        if url.port_or_known_default().is_none() {
+            return Err(RelayError::InsecureEndpoint);
+        }
+        Ok(Self { url })
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.url.as_str()
+    }
+}
+
+/// Production TLS WebSocket relay client. Forwards already-sealed Connect
+/// frames only. Does not wrap [`OpaqueRelay`].
+pub struct ConnectRelayClient {
+    endpoint: RelayEndpoint,
+    ticket: SignedRouteTicket,
+    route: ConnectRoute,
+    queued: VecDeque<SealedFrame>,
+    queued_bytes: u32,
+    max_queue_frames: usize,
+    max_queue_bytes: u32,
+    reconnect_attempt: u32,
+}
+
+impl fmt::Debug for ConnectRelayClient {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ConnectRelayClient")
+            .field("endpoint", &self.endpoint)
+            .field("route", &self.route)
+            .field("queued_frames", &self.queued.len())
+            .field("reconnect_attempt", &self.reconnect_attempt)
+            .finish()
+    }
+}
+
+impl ConnectRelayClient {
+    pub fn connect_configured(
+        endpoint: RelayEndpoint,
+        ticket: SignedRouteTicket,
+    ) -> Result<Self, RelayError> {
+        let _ = ticket.claims();
+        Ok(Self {
+            endpoint,
+            ticket,
+            route: ConnectRoute::Relay,
+            queued: VecDeque::new(),
+            queued_bytes: 0,
+            max_queue_frames: MAX_RELAY_QUEUE_FRAMES,
+            max_queue_bytes: MAX_RELAY_QUEUE_BYTES,
+            reconnect_attempt: 0,
+        })
+    }
+
+    pub fn preferred_route(&self) -> ConnectRoute {
+        self.route
+    }
+
+    pub fn next_backoff_ms(&self) -> u64 {
+        relay_backoff_ms(self.reconnect_attempt)
+    }
+
+    pub fn record_reconnect_failure(&mut self) {
+        self.reconnect_attempt = self.reconnect_attempt.saturating_add(1);
+    }
+
+    pub fn enqueue_sealed(&mut self, frame: SealedFrame) -> Result<(), RelayError> {
+        let encoded_len = u32::try_from(frame.encoded_len()).unwrap_or(u32::MAX);
+        if encoded_len > MAX_SEALED_FRAME_BYTES {
+            return Err(RelayError::FrameExceeded {
+                declared: u64::from(encoded_len),
+            });
+        }
+        if self.queued.len() >= self.max_queue_frames
+            || self.queued_bytes.saturating_add(encoded_len) > self.max_queue_bytes
+        {
+            return Err(RelayError::QueueExceeded);
+        }
+        self.queued_bytes = self.queued_bytes.saturating_add(encoded_len);
+        self.queued.push_back(frame);
+        Ok(())
+    }
+
+    pub async fn connect(&self) -> Result<ConnectRelaySocket, RelayError> {
+        connect_relay_socket(&self.endpoint, &self.ticket).await
+    }
+}
+
+pub struct ConnectRelaySocket {
+    stream:
+        tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>,
+    route: ConnectRoute,
+}
+
+impl fmt::Debug for ConnectRelaySocket {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ConnectRelaySocket")
+            .field("route", &self.route)
+            .finish()
+    }
+}
+
+impl ConnectRelaySocket {
+    pub fn route(&self) -> ConnectRoute {
+        self.route
+    }
+
+    pub async fn send_sealed(&mut self, frame: &SealedFrame) -> Result<(), RelayError> {
+        use futures_util::SinkExt;
+        let encoded = frame.encode().map_err(|_| RelayError::OpaqueFrame)?;
+        if encoded.len() > usize::try_from(MAX_SEALED_FRAME_BYTES).unwrap_or(usize::MAX) {
+            return Err(RelayError::FrameExceeded {
+                declared: encoded.len() as u64,
+            });
+        }
+        self.stream
+            .send(tokio_tungstenite::tungstenite::Message::Binary(encoded))
+            .await
+            .map_err(|_| RelayError::PeerDisconnected)
+    }
+
+    pub async fn recv_sealed(&mut self) -> Result<SealedFrame, RelayError> {
+        use futures_util::StreamExt;
+        loop {
+            match self.stream.next().await {
+                Some(Ok(tokio_tungstenite::tungstenite::Message::Binary(bytes))) => {
+                    if bytes.len() > usize::try_from(MAX_SEALED_FRAME_BYTES).unwrap_or(usize::MAX) {
+                        return Err(RelayError::FrameExceeded {
+                            declared: bytes.len() as u64,
+                        });
+                    }
+                    return SealedFrame::decode(&bytes).map_err(|_| RelayError::OpaqueFrame);
+                }
+                Some(Ok(
+                    tokio_tungstenite::tungstenite::Message::Ping(_)
+                    | tokio_tungstenite::tungstenite::Message::Pong(_)
+                    | tokio_tungstenite::tungstenite::Message::Frame(_),
+                )) => {}
+                Some(Ok(_)) => return Err(RelayError::OpaqueFrame),
+                Some(Err(_)) | None => return Err(RelayError::PeerDisconnected),
+            }
+        }
+    }
+}
+
+fn relay_backoff_ms(attempt: u32) -> u64 {
+    let shift = u32::min(attempt, 8);
+    u64::min(
+        RELAY_INITIAL_BACKOFF_MS.saturating_mul(1_u64 << shift),
+        RELAY_MAX_BACKOFF_MS,
+    )
+}
+
+fn relay_tls_config() -> Result<Arc<rustls::ClientConfig>, RelayError> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map_err(|_| RelayError::TlsHandshake)?
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    Ok(Arc::new(config))
+}
+
+async fn connect_relay_socket(
+    endpoint: &RelayEndpoint,
+    ticket: &SignedRouteTicket,
+) -> Result<ConnectRelaySocket, RelayError> {
+    use futures_util::SinkExt;
+    use rustls::pki_types::ServerName;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let host = endpoint
+        .url
+        .host_str()
+        .ok_or(RelayError::InsecureEndpoint)?
+        .to_string();
+    let port = endpoint
+        .url
+        .port_or_known_default()
+        .ok_or(RelayError::InsecureEndpoint)?;
+    let tcp = tokio::net::TcpStream::connect((host.as_str(), port))
+        .await
+        .map_err(|_| RelayError::Transport)?;
+    let server_name = ServerName::try_from(host).map_err(|_| RelayError::InsecureEndpoint)?;
+    let tls = tokio_rustls::TlsConnector::from(relay_tls_config()?)
+        .connect(server_name, tcp)
+        .await
+        .map_err(|_| RelayError::TlsHandshake)?;
+    let request = endpoint
+        .url
+        .as_str()
+        .into_client_request()
+        .map_err(|_| RelayError::InsecureEndpoint)?;
+    let (mut stream, _) = tokio_tungstenite::client_async(request, tls)
+        .await
+        .map_err(|_| RelayError::Transport)?;
+    stream
+        .send(tokio_tungstenite::tungstenite::Message::Binary(
+            ticket.encode(),
+        ))
+        .await
+        .map_err(|_| RelayError::PeerDisconnected)?;
+    Ok(ConnectRelaySocket {
+        stream,
+        route: ConnectRoute::Relay,
+    })
+}
+
+/// In-memory router/test double. Not a production network client.
+/// Production relay I/O uses [`ConnectRelayClient`].
 pub struct OpaqueRelay {
     signing_key: Option<TicketSigningKey>,
     online_hosts: HashSet<HostPublicId>,
@@ -870,6 +1123,9 @@ pub enum RelayError {
     RateLimited,
     StateBoundExceeded,
     EntropyUnavailable,
+    InsecureEndpoint,
+    TlsHandshake,
+    Transport,
     Identity(ConnectIdError),
 }
 
@@ -898,6 +1154,11 @@ impl fmt::Display for RelayError {
                 formatter.write_str("Connect relay state collection bound exceeded")
             }
             Self::EntropyUnavailable => formatter.write_str("Connect relay entropy is unavailable"),
+            Self::InsecureEndpoint => {
+                formatter.write_str("Connect relay endpoint must be a bounded wss:// URL")
+            }
+            Self::TlsHandshake => formatter.write_str("Connect relay TLS handshake failed"),
+            Self::Transport => formatter.write_str("Connect relay transport failed"),
             Self::Identity(error) => error.fmt(formatter),
         }
     }
@@ -915,5 +1176,70 @@ impl std::error::Error for RelayError {
 impl From<ConnectIdError> for RelayError {
     fn from(error: ConnectIdError) -> Self {
         Self::Identity(error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::{SEALED_FRAME_VERSION, SEALED_NONCE_BYTES, SEALED_TAG_BYTES};
+
+    fn test_ticket() -> SignedRouteTicket {
+        let key = TicketSigningKey::from_bytes([9; 32]);
+        let claims = RouteTicket::new(
+            TicketId::from_uuid(Uuid::now_v7()).expect("ticket"),
+            RouteId::from_uuid(Uuid::now_v7()).expect("route"),
+            HostPublicId::from_uuid(Uuid::now_v7()).expect("host"),
+            DevicePublicId::from_uuid(Uuid::now_v7()).expect("device"),
+            AccountId::from_uuid(Uuid::now_v7()).expect("account"),
+            TicketAudience::HostSocket,
+            10,
+            40,
+            [4; 16],
+        )
+        .expect("claims");
+        SignedRouteTicket::issue(&key, claims)
+    }
+
+    #[test]
+    fn relay_endpoint_rejects_insecure_empty_and_unbounded_urls() {
+        assert!(RelayEndpoint::parse("").is_err());
+        assert!(RelayEndpoint::parse("ws://relay.example/connect").is_err());
+        assert!(RelayEndpoint::parse("http://relay.example/connect").is_err());
+        assert!(RelayEndpoint::parse("wss://user:pass@relay.example/connect").is_err());
+        assert!(RelayEndpoint::parse(&format!("wss://relay.example/{}", "a".repeat(300))).is_err());
+        assert!(RelayEndpoint::parse("wss://relay.example/connect").is_ok());
+    }
+
+    #[test]
+    fn relay_client_bounds_sealed_frames_and_preserves_route() {
+        let endpoint = RelayEndpoint::parse("wss://relay.example/connect").expect("endpoint");
+        let mut client =
+            ConnectRelayClient::connect_configured(endpoint, test_ticket()).expect("client");
+        assert_eq!(client.preferred_route(), ConnectRoute::Relay);
+        assert_eq!(client.next_backoff_ms(), RELAY_INITIAL_BACKOFF_MS);
+        let frame = SealedFrame::from_parts(
+            SEALED_FRAME_VERSION,
+            1,
+            [1; SEALED_NONCE_BYTES],
+            vec![0; 8],
+            [2; SEALED_TAG_BYTES],
+        )
+        .expect("frame");
+        client.enqueue_sealed(frame).expect("enqueue");
+        for _ in 0..MAX_RELAY_QUEUE_FRAMES {
+            let extra = SealedFrame::from_parts(
+                SEALED_FRAME_VERSION,
+                2,
+                [3; SEALED_NONCE_BYTES],
+                vec![1; 8],
+                [4; SEALED_TAG_BYTES],
+            )
+            .expect("extra");
+            if client.enqueue_sealed(extra).is_err() {
+                return;
+            }
+        }
+        panic!("relay client must bound the sealed-frame queue");
     }
 }

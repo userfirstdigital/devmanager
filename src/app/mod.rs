@@ -1382,6 +1382,8 @@ impl NativeShell {
         };
         let updater = UpdaterService::new();
         let remote_host_service = RemoteHostService::new(remote_machine_state.host.clone());
+        let _ = crate::connect::ConnectProductionStartup::reject_legacy_remote_web_as_connect();
+        remote_host_service.prepare_connect_production_or_surface();
         let bootstrap_manager = process_manager.clone();
         remote_host_service.set_session_bootstrap_provider(Some(Arc::new(move |session_id| {
             let session_view = bootstrap_manager.session_view(session_id)?;
@@ -20930,6 +20932,9 @@ mod tests {
             last_connection_note: None,
             last_connection_is_error: false,
             latency: RemoteLatencyStats::default(),
+            connect_startup_error: None,
+            connect_listener_bound: false,
+            connect_encryption_required: true,
         }
     }
 

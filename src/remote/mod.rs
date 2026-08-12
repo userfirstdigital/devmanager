@@ -1373,6 +1373,9 @@ pub struct RemoteHostStatus {
     pub last_connection_note: Option<String>,
     pub last_connection_is_error: bool,
     pub latency: RemoteLatencyStats,
+    pub connect_startup_error: Option<String>,
+    pub connect_listener_bound: bool,
+    pub connect_encryption_required: bool,
 }
 
 impl RemoteHostStatus {
@@ -3685,6 +3688,11 @@ pub(crate) struct RemoteHostInner {
     web_listener: Mutex<Option<WebListenerHandle>>,
     #[allow(dead_code)]
     web_listener_error: RwLock<Option<String>>,
+    /// Fail-closed: raw PTY/session-stream cannot leave the host unless a
+    /// test explicitly disables this gate. Production Connect uses `/api/connect`.
+    connect_encryption_required: AtomicBool,
+    connect_startup_error: RwLock<Option<String>>,
+    connect_listener_bound: AtomicBool,
 }
 
 #[derive(Debug, Clone)]
@@ -4011,6 +4019,9 @@ impl RemoteHostService {
             native_connection_workers: Mutex::new(HashMap::new()),
             web_listener: Mutex::new(None),
             web_listener_error: RwLock::new(None),
+            connect_encryption_required: AtomicBool::new(true),
+            connect_startup_error: RwLock::new(None),
+            connect_listener_bound: AtomicBool::new(false),
         });
         let service = Self {
             _lifetime_owner: Some(RemoteHostServiceOwner {
@@ -4018,8 +4029,93 @@ impl RemoteHostService {
             }),
             inner,
         };
+        service.install_connect_production_gate();
         service.apply_config(config);
         service
+    }
+
+    /// Fail-closed production gate. Legacy `/api/ws` is never Connect and
+    /// cannot emit raw PTY/session-stream unless a test setter disables this.
+    pub fn install_connect_production_gate(&self) {
+        self.inner
+            .connect_encryption_required
+            .store(true, Ordering::Release);
+        self.inner
+            .connect_listener_bound
+            .store(false, Ordering::Release);
+        let _ = crate::connect::ConnectProductionStartup::reject_legacy_remote_web_as_connect();
+        surface_connect_startup(
+            &self.inner,
+            Some(crate::connect::ConnectStartupError::ListenerNotBound.to_string()),
+            false,
+        );
+    }
+
+    pub fn connect_listener_kind(&self) -> crate::connect::ConnectListenerKind {
+        crate::connect::ConnectListenerKind::LegacyRemoteWeb
+    }
+
+    pub fn connect_encryption_required(&self) -> bool {
+        self.inner
+            .connect_encryption_required
+            .load(Ordering::Acquire)
+    }
+
+    pub fn connect_startup_error(&self) -> Option<String> {
+        self.inner
+            .connect_startup_error
+            .read()
+            .ok()
+            .and_then(|slot| slot.clone())
+    }
+
+    /// Open OS-backed Connect production identity/custody. Never claims a
+    /// listener is bound. Unenrolled/pending/revoked and custody failures are
+    /// written to host status/notes and keep Connect fail-closed.
+    pub fn prepare_connect_production_or_surface(&self) {
+        self.inner
+            .connect_encryption_required
+            .store(true, Ordering::Release);
+        self.inner
+            .connect_listener_bound
+            .store(false, Ordering::Release);
+        match crate::connect::ConnectProductionStartup::prepare_direct(
+            crate::connect::DirectBindPolicy::loopback(),
+        ) {
+            Ok(startup) => {
+                let _ = startup.require_bound_listener();
+                surface_connect_startup(
+                    &self.inner,
+                    Some(crate::connect::ConnectStartupError::ListenerNotBound.to_string()),
+                    false,
+                );
+            }
+            Err(error) if error.is_unenrolled_identity() => {
+                surface_connect_startup(&self.inner, Some(error.to_string()), false);
+            }
+            Err(error) => {
+                surface_connect_startup(&self.inner, Some(error.to_string()), true);
+            }
+        }
+    }
+
+    pub(crate) fn mark_connect_listener_bound(&self, bound: bool) {
+        self.inner
+            .connect_listener_bound
+            .store(bound, Ordering::Release);
+        if bound {
+            self.inner
+                .connect_encryption_required
+                .store(true, Ordering::Release);
+            surface_connect_startup(&self.inner, None, false);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_connect_encryption_required_for_test(&self, required: bool) {
+        self.inner
+            .connect_encryption_required
+            .store(required, Ordering::Release);
     }
 
     pub(crate) fn borrowed(inner: Arc<RemoteHostInner>) -> Self {
@@ -5444,6 +5540,17 @@ impl RemoteHostService {
             .read()
             .map(|stats| stats.clone())
             .unwrap_or_default();
+        let connect_startup_error = self
+            .inner
+            .connect_startup_error
+            .read()
+            .map(|slot| slot.clone())
+            .unwrap_or(None);
+        let connect_listener_bound = self.inner.connect_listener_bound.load(Ordering::Acquire);
+        let connect_encryption_required = self
+            .inner
+            .connect_encryption_required
+            .load(Ordering::Acquire);
         RemoteHostStatus {
             enabled,
             web_enabled,
@@ -5460,6 +5567,9 @@ impl RemoteHostService {
             last_connection_note,
             last_connection_is_error,
             latency,
+            connect_startup_error,
+            connect_listener_bound,
+            connect_encryption_required,
         }
     }
 
@@ -5943,6 +6053,34 @@ impl RemoteHostService {
                                 .lock()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner()) =
                                 stale_handle.take();
+                            match crate::connect::ConnectProductionStartup::prepare_direct(
+                                crate::connect::DirectBindPolicy::loopback(),
+                            ) {
+                                Ok(startup) => {
+                                    let _ = startup.session();
+                                    self.inner
+                                        .connect_encryption_required
+                                        .store(true, Ordering::Release);
+                                    self.inner
+                                        .connect_listener_bound
+                                        .store(true, Ordering::Release);
+                                    surface_connect_startup(&self.inner, None, false);
+                                }
+                                Err(error) => {
+                                    self.inner
+                                        .connect_listener_bound
+                                        .store(false, Ordering::Release);
+                                    self.inner
+                                        .connect_encryption_required
+                                        .store(true, Ordering::Release);
+                                    let is_error = !error.is_unenrolled_identity();
+                                    surface_connect_startup(
+                                        &self.inner,
+                                        Some(error.to_string()),
+                                        is_error,
+                                    );
+                                }
+                            }
                         }
                     }
                     if let Some(handle) = stale_handle.take() {
@@ -5964,6 +6102,14 @@ impl RemoteHostService {
                         if let Ok(mut error_slot) = self.inner.web_listener_error.write() {
                             *error_slot = Some(error.to_string());
                         }
+                        self.inner
+                            .connect_listener_bound
+                            .store(false, Ordering::Release);
+                        surface_connect_startup(
+                            &self.inner,
+                            Some(format!("web listener bind failed: {error}")),
+                            true,
+                        );
                         #[cfg(test)]
                         notify_native_lifecycle(
                             &self.inner,
@@ -9614,6 +9760,21 @@ pub(crate) fn browser_admission_now_epoch_ms(inner: &Arc<RemoteHostInner>) -> u6
         return clock();
     }
     now_epoch_ms()
+}
+
+pub(crate) fn surface_connect_startup(
+    inner: &Arc<RemoteHostInner>,
+    error: Option<String>,
+    is_error: bool,
+) {
+    if let Ok(mut slot) = inner.connect_startup_error.write() {
+        *slot = error.clone();
+    }
+    if is_error {
+        if let Some(note) = error {
+            set_last_connection_note(inner, format!("Connect production: {note}"), true);
+        }
+    }
 }
 
 pub(crate) fn set_last_connection_note(inner: &Arc<RemoteHostInner>, note: String, is_error: bool) {

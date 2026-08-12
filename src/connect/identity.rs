@@ -395,6 +395,10 @@ impl ConnectIdentity {
         self.pairing_purpose
     }
 
+    pub fn profile_binding_hash(&self) -> &str {
+        &self.profile_binding_hash
+    }
+
     pub fn task_invite_id(&self) -> Option<&str> {
         None
     }
@@ -1094,9 +1098,9 @@ impl fmt::Debug for DeviceRepairHandle {
 /// Opaque proof that a connection presented a current registered,
 /// non-revoked, host-bound device credential for one session epoch.
 ///
-/// HOLD: real connection/session wiring and OS vault verification stay
-/// outside this slice. Callers must mint this only via the authoritative
-/// store binding operation; a raw `DeviceId` is never enough.
+/// Real connection/session wiring uses [`crate::connect::identity_store::ConnectProductionStartup`].
+/// Callers must mint this only via the authoritative store binding operation;
+/// a raw `DeviceId` is never enough.
 #[derive(Clone, PartialEq, Eq)]
 pub struct DeviceCredentialProof {
     host_public_id: HostPublicId,
@@ -1244,11 +1248,12 @@ pub fn validate_device_credential<V: CredentialVault>(
 
 /// Vault authority seam.
 ///
-/// OS DPAPI / WebCrypto adapters remain outside this module. Durable identity
+/// OS DPAPI Noise-static custody lives in
+/// [`crate::connect::identity_store::OsNoiseCustody`]. Durable identity
 /// documents persist through [`crate::connect::identity_store::ConnectProductionSession`]
 /// / [`crate::connect::identity_store::IsolatedRemoteStore`] on the
 /// profile-scoped kernel store. Tests may use the in-memory seam. Production
-/// Noise remains fail-closed until the protocol `snow` dependency lands.
+/// Noise uses snow 0.10.0; unsupported OS custody remains fail-closed.
 pub trait CredentialVault {
     /// On error, no credential may have been established. Repeating an
     /// interrupted establishment for the same public ID must return the same

@@ -116,7 +116,7 @@ impl NoiseStaticPrivateKey {
         Ok(Self(Zeroizing::new(bytes)))
     }
 
-    fn as_bytes(&self) -> &[u8; NOISE_STATIC_KEY_BYTES] {
+    pub(crate) fn as_bytes(&self) -> &[u8; NOISE_STATIC_KEY_BYTES] {
         &self.0
     }
 }

@@ -42,10 +42,10 @@ pub use crypto::{
 };
 pub use deletion_ledger::{DeletionLedgerEntry, DeletionStatus, DELETION_LEDGER};
 pub use direct::{
-    admit_direct_request, query_contains_pairing_secret, referer_contains_pairing_secret,
-    security_headers, DirectAdmitError, DirectBindMode, DirectBindPolicy, DirectPairingExchange,
-    DirectPairingLimiter, DirectPairingThrottle, DirectRequestView, MAX_DIRECT_FRAME_BYTES,
-    MAX_DIRECT_PAIRING_BODY_BYTES,
+    admit_direct_request, is_trustworthy_loopback_host, query_contains_pairing_secret,
+    referer_contains_pairing_secret, security_headers, DirectAdmitError, DirectBindMode,
+    DirectBindPolicy, DirectPairingExchange, DirectPairingLimiter, DirectPairingThrottle,
+    DirectRequestView, MAX_DIRECT_FRAME_BYTES, MAX_DIRECT_PAIRING_BODY_BYTES,
 };
 pub use envelope::{
     ChannelBinding, ChannelId, ChannelKind, ChunkContext, Compression, ConnectEnvelope,
@@ -83,8 +83,10 @@ pub use identity::{
 #[cfg(test)]
 pub use identity_store::InMemoryIdentityPersistence;
 pub use identity_store::{
-    ConnectProductionError, ConnectProductionSession, IdentityPersistence, IsolatedRemoteStore,
-    KernelIdentityPersistence, LoadedRemoteDocument,
+    ConnectIdentityLiveState, ConnectListenerKind, ConnectProductionError,
+    ConnectProductionSession, ConnectProductionStartup, ConnectStartupError, IdentityPersistence,
+    IsolatedRemoteStore, KernelIdentityPersistence, LoadedRemoteDocument, OsNoiseCustody,
+    OsNoiseCustodyError,
 };
 pub use invites::{
     guest_may_perform, ContentClass, InviteAuditEvent, InviteAuditKind, InviteError,
@@ -111,9 +113,10 @@ pub use org_prompts::{
     OrganizationPromptSnapshot,
 };
 pub use permission::{
-    resolve_host_capability_grant, ActionId, AuthoritativePermissionContext, ConnectRole,
-    HostCapabilityGrant, HostConnectAction, HostConnectRole, KnownAction, PermissionDecision,
-    PermissionDenyReason, PermissionEvaluator, PermissionRequest, ScopedPermissionGrant,
+    admit_connect_action, resolve_host_capability_grant, ActionId, AuthoritativePermissionContext,
+    ConnectAdmission, ConnectRole, HostCapabilityGrant, HostConnectAction, HostConnectRole,
+    KnownAction, PermissionDecision, PermissionDenyReason, PermissionEvaluator, PermissionRequest,
+    ScopedPermissionGrant,
 };
 pub use permissions::{action_for_client_request, SessionAuthorizer, SessionPermissionContext};
 pub use policy::{
@@ -133,12 +136,15 @@ pub use push::{
     SanitizedPush, MAX_ROUTE_BYTES, MAX_SAFE_TITLE_BYTES,
 };
 pub use relay::{
-    AccountId, DevicePublicId, HostPublicId as RelayHostPublicId, OpaqueRelay, RateKey, RelayError,
+    AccountId, ConnectRelayClient, ConnectRelaySocket, DevicePublicId,
+    HostPublicId as RelayHostPublicId, OpaqueRelay, RateKey, RelayEndpoint, RelayError,
     RelayObservation, RelayStatus, RouteId, RouteTicket, SignedRouteTicket, TicketAudience,
     TicketId, TicketSigningKey, BIND_RATE_WINDOW_SECS, MAX_BIND_ATTEMPTS_PER_WINDOW,
     MAX_RELAY_CONSUMED_NONCES, MAX_RELAY_QUEUE_BYTES, MAX_RELAY_QUEUE_FRAMES, MAX_RELAY_RATE_KEYS,
     MAX_RELAY_REVOKED_DEVICES, MAX_RELAY_REVOKED_TICKETS, MAX_RELAY_ROUTES,
-    MAX_ROUTE_TICKET_TTL_SECS, PRESENCE_TTL_SECS, ROUTE_TICKET_DOMAIN,
+    MAX_RELAY_ENDPOINT_BYTES,
+    MAX_ROUTE_TICKET_TTL_SECS, PRESENCE_TTL_SECS, RELAY_INITIAL_BACKOFF_MS, RELAY_MAX_BACKOFF_MS,
+    ROUTE_TICKET_DOMAIN,
 };
 pub use schema::{
     canonical_schema_fixtures, catalog_entry, encode_canonical_schema, payload_catalog,

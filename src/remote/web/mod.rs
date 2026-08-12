@@ -50,8 +50,11 @@ const MAX_BROWSER_INSTALL_ID_BYTES: usize = 128;
 const MAX_BROWSER_USER_AGENT_BYTES: usize = 512;
 const MAX_BROWSER_NICKNAME_BYTES: usize = 128;
 
-/// Persisted configuration for the web listener. Lives inside `RemoteHostConfig`
-/// and is serialized to `remote.json` via serde defaults.
+/// Persisted configuration for the legacy same-origin remote web listener.
+/// Lives inside `RemoteHostConfig` and is serialized to `remote.json` via serde
+/// defaults. This listener is not a Connect production path: it does not
+/// instantiate Noise/sealed-frame Connect sessions. Production Connect uses
+/// [`crate::connect::ConnectProductionStartup`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, rename_all = "camelCase")]
 pub struct WebConfig {
@@ -572,6 +575,12 @@ impl WebListenerHandle {
             pairing_attempts: Arc::new(std::sync::Mutex::new(PairingAttemptTracker::default())),
         });
 
+        // /api/ws remains the legacy same-origin UI. /api/connect is the
+        // production Connect route registered on this same TCP bind.
+        let _ = crate::connect::ConnectProductionStartup::reject_legacy_remote_web_as_connect();
+        inner
+            .connect_encryption_required
+            .store(true, std::sync::atomic::Ordering::Release);
         runtime.spawn(async move {
             let app = build_router(router_state);
             if !lease.is_current() {
@@ -746,6 +755,7 @@ fn build_router(state: Arc<WebState>) -> Router {
         )
         .route("/api/push/unsubscribe", post(push_unsubscribe_handler))
         .route("/api/ws", get(bridge::ws_handler))
+        .route("/api/connect", get(bridge::connect_ws_handler))
         .route("/*path", get(assets::static_handler))
         .layer(DefaultBodyLimit::max(PUSH_REGISTRATION_BODY_BYTES))
         .layer(middleware::from_fn(web_response_policy))
@@ -1693,6 +1703,20 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Acquire),
             pairing_attempts: Arc::new(std::sync::Mutex::new(PairingAttemptTracker::default())),
         })
+    }
+
+    #[test]
+    fn connect_route_is_not_the_legacy_websocket_and_rejects_cross_origin() {
+        let _profile = TestProfileGuard::new("web-connect-route");
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let service = test_service("connect-route");
+        assert!(service.connect_encryption_required());
+        assert!(!service.status().connect_listener_bound);
+        let state = test_state(&service);
+        let missing_origin = runtime.block_on(route_response(state.clone(), "/api/connect"));
+        assert_eq!(missing_origin.status(), StatusCode::FORBIDDEN);
+        let legacy = runtime.block_on(route_response(state, "/api/ws"));
+        assert_ne!(legacy.status(), StatusCode::NOT_FOUND);
     }
 
     fn test_addr() -> SocketAddr {

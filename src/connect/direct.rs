@@ -9,9 +9,11 @@
 //! [`MAX_DIRECT_FRAME_BYTES`]. Realtime payloads must arrive as sealed frames
 //! from a production-grade [`crate::connect::crypto::EndToEndChannel`] before
 //! framing. This module never admits plaintext Connect application bytes.
-//! Production construction fail-closes while Noise XX/IK is unavailable.
+//! Production construction uses snow Noise XX/IK plus OS-backed static custody.
+//! Unsupported platforms and missing/mismatched custody remain fail-closed.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
@@ -108,8 +110,26 @@ pub enum DirectAdmitError {
     RateLimited { retry_after_secs: u64 },
 }
 
+impl fmt::Display for DirectAdmitError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::WrongOrigin => "Connect direct request origin is not trusted",
+            Self::PlaintextLan => "Connect LAN bind requires TLS",
+            Self::CertificateUntrusted => {
+                "Connect certificate SAN does not match the advertised host"
+            }
+            Self::CredentialInUrl => "Connect pairing credentials must not appear in the URL",
+            Self::CredentialInReferrer => "Connect pairing credentials must not appear in Referer",
+            Self::Csrf => "Connect pairing request failed the origin check",
+            Self::OversizedBody => "Connect request body exceeds the bound",
+            Self::MethodNotAllowed => "Connect request method is not allowed",
+            Self::RateLimited { .. } => "Connect pairing is rate limited",
+        })
+    }
+}
+
 impl DirectAdmitError {
-    pub fn status_hint(self) -> u16 {
+    pub fn status_hint(&self) -> u16 {
         match self {
             Self::WrongOrigin | Self::Csrf => 403,
             Self::PlaintextLan | Self::CertificateUntrusted => 400,

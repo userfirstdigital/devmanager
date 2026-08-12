@@ -6,8 +6,13 @@
 //! OS/WebCrypto vault authority.
 
 use std::fmt;
+use std::fs;
 use std::io::{Read, Write};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+
+use sha2::{Digest, Sha256};
+use zeroize::{Zeroize, Zeroizing};
 
 use super::crypto::{
     ConnectCryptoError, ConnectCryptoHold, ConnectNoiseCustody, ConnectNoiseHandshake,
@@ -15,6 +20,7 @@ use super::crypto::{
     CONNECT_NOISE_FIRST_PAIRING_PATTERN, CONNECT_NOISE_PINNED_DEVICE_PATTERN,
 };
 use super::envelope::ConnectLimits;
+use super::direct::{DirectAdmitError, DirectBindMode, DirectBindPolicy};
 use super::identity::{
     bind_device_credential_from_snapshot, current_epoch_ms, generate_transition_nonce,
     rotate_pairing_until_changed, seed_pairing_code, validate_device_record, BrowserPrivateStorage,
@@ -337,6 +343,7 @@ impl IsolatedRemoteStore<KernelIdentityPersistence> {
 #[derive(Debug)]
 pub enum ConnectProductionError {
     Identity(IdentityError),
+    Custody(OsNoiseCustodyError),
     Crypto(ConnectCryptoHold),
     Channel(ConnectCryptoError),
     Transport(ConnectTransportError),
@@ -346,6 +353,7 @@ impl fmt::Display for ConnectProductionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Identity(error) => error.fmt(formatter),
+            Self::Custody(error) => error.fmt(formatter),
             Self::Crypto(error) => error.fmt(formatter),
             Self::Channel(error) => error.fmt(formatter),
             Self::Transport(error) => error.fmt(formatter),
@@ -357,10 +365,463 @@ impl std::error::Error for ConnectProductionError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Identity(error) => Some(error),
+            Self::Custody(error) => Some(error),
             Self::Crypto(error) => Some(error),
             Self::Channel(error) => Some(error),
             Self::Transport(error) => Some(error),
         }
+    }
+}
+
+const NOISE_CUSTODY_PURPOSE: &[u8] = b"DevManagerConnect/v1/noise-static\0";
+const NOISE_CUSTODY_MAGIC: &[u8; 6] = b"DMNS1\0";
+const NOISE_CUSTODY_MAX_BLOB_BYTES: usize = 8 * 1024;
+const NOISE_STATIC_KEY_BYTES: usize = 32;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OsNoiseCustodyError {
+    UnsupportedPlatform,
+    ContextMismatch,
+    InvalidBlob,
+    UnprotectFailed,
+    ProtectFailed,
+    PersistFailed,
+    EntropyUnavailable,
+    PublicMismatch,
+}
+
+impl fmt::Display for OsNoiseCustodyError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::UnsupportedPlatform => "Connect Noise custody is unsupported on this platform",
+            Self::ContextMismatch => {
+                "Connect Noise custody is bound to a different profile, host, or purpose"
+            }
+            Self::InvalidBlob => "Connect Noise custody blob is invalid",
+            Self::UnprotectFailed => "Connect Noise custody could not be unprotected",
+            Self::ProtectFailed => "Connect Noise custody could not be protected",
+            Self::PersistFailed => "Connect Noise custody could not be persisted",
+            Self::EntropyUnavailable => "Connect Noise custody entropy is unavailable",
+            Self::PublicMismatch => {
+                "Connect Noise custody public key does not match the sealed envelope"
+            }
+        })
+    }
+}
+
+impl std::error::Error for OsNoiseCustodyError {}
+
+/// OS-backed Noise static custody. Windows uses DPAPI plus explicit
+/// profile/host/purpose entropy. Other platforms fail closed. The opaque
+/// blob is stored under `app_config_dir()/connect/`, never as plaintext in
+/// kernel/profile/remote JSON or SQLite.
+pub struct OsNoiseCustody;
+
+impl fmt::Debug for OsNoiseCustody {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("OsNoiseCustody(redacted)")
+    }
+}
+
+impl OsNoiseCustody {
+    pub fn load_or_create(
+        identity: &ConnectIdentity,
+    ) -> Result<ConnectNoiseCustody, OsNoiseCustodyError> {
+        identity
+            .validate_structure()
+            .map_err(|_| OsNoiseCustodyError::ContextMismatch)?;
+        let path = noise_custody_blob_path()?;
+        if path.exists() {
+            return load_os_noise_custody(identity, &path);
+        }
+        create_os_noise_custody(identity, &path)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectIdentityLiveState {
+    Live,
+    Pending,
+    Absent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectListenerKind {
+    ProductionDirect,
+    LegacyRemoteWeb,
+}
+
+impl ConnectListenerKind {
+    pub const fn is_connect_production(self) -> bool {
+        matches!(self, Self::ProductionDirect)
+    }
+
+    pub fn reject_raw_pty(self) -> Result<(), ConnectStartupError> {
+        match self {
+            Self::ProductionDirect => Err(ConnectStartupError::RawPtyForbidden),
+            Self::LegacyRemoteWeb => Ok(()),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum ConnectStartupError {
+    Production(ConnectProductionError),
+    Direct(DirectAdmitError),
+    LegacyRouteIsNotConnect,
+    RawPtyForbidden,
+    ListenerNotBound,
+}
+
+impl ConnectStartupError {
+    pub fn is_unenrolled_identity(&self) -> bool {
+        matches!(
+            self,
+            Self::Production(ConnectProductionError::Identity(IdentityError::NotEnabled))
+        )
+    }
+}
+
+impl fmt::Display for ConnectStartupError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Production(error) => error.fmt(formatter),
+            Self::Direct(error) => error.fmt(formatter),
+            Self::LegacyRouteIsNotConnect => formatter
+                .write_str("legacy same-origin remote web is not a Connect production listener"),
+            Self::RawPtyForbidden => {
+                formatter.write_str("raw PTY/session-stream is forbidden on Connect production")
+            }
+            Self::ListenerNotBound => formatter.write_str(
+                "Connect production session is ready but no /api/connect listener is bound",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ConnectStartupError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Production(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+/// Authoritative Connect production factory. This is not a relabel of the
+/// legacy same-origin remote WebSocket. Browser DTO wiring remains an
+/// external integration point; this factory fail-closes on identity, custody,
+/// or bind-policy errors instead of starting plaintext Connect.
+pub struct ConnectProductionStartup {
+    session: ConnectProductionSession,
+    bind_policy: DirectBindPolicy,
+}
+
+impl fmt::Debug for ConnectProductionStartup {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ConnectProductionStartup")
+            .field("listener", &ConnectListenerKind::ProductionDirect)
+            .field("bind_mode", &self.bind_policy.mode)
+            .finish()
+    }
+}
+
+impl ConnectProductionStartup {
+    pub fn prepare_direct(policy: DirectBindPolicy) -> Result<Self, ConnectStartupError> {
+        let scheme = match policy.mode {
+            DirectBindMode::Loopback => "ws",
+            DirectBindMode::Lan => "wss",
+        };
+        policy
+            .validate_transport(scheme)
+            .map_err(ConnectStartupError::Direct)?;
+        let session = ConnectProductionSession::open().map_err(ConnectStartupError::Production)?;
+        Ok(Self {
+            session,
+            bind_policy: policy,
+        })
+    }
+
+    pub fn session(&self) -> &ConnectProductionSession {
+        &self.session
+    }
+
+    pub fn bind_policy(&self) -> &DirectBindPolicy {
+        &self.bind_policy
+    }
+
+    pub const fn listener_kind() -> ConnectListenerKind {
+        ConnectListenerKind::ProductionDirect
+    }
+
+    /// Session/custody factory only. A bound `/api/connect` listener is a
+    /// separate remote/web step and must not be inferred from this result.
+    pub const fn listener_is_bound(&self) -> bool {
+        false
+    }
+
+    pub fn require_bound_listener(&self) -> Result<(), ConnectStartupError> {
+        Err(ConnectStartupError::ListenerNotBound)
+    }
+
+    pub fn reject_legacy_remote_web_as_connect() -> Result<(), ConnectStartupError> {
+        Err(ConnectStartupError::LegacyRouteIsNotConnect)
+    }
+}
+
+fn noise_custody_blob_path() -> Result<PathBuf, OsNoiseCustodyError> {
+    let mut dir =
+        crate::persistence::app_config_dir().map_err(|_| OsNoiseCustodyError::PersistFailed)?;
+    dir.push("connect");
+    Ok(dir.join("noise-static-v1.dpapi"))
+}
+
+fn noise_custody_entropy(
+    identity: &ConnectIdentity,
+    public: &ConnectNoiseStaticPublicKey,
+) -> [u8; 32] {
+    let public_bytes = public.as_bytes();
+    let fingerprint = Sha256::digest(public_bytes);
+    let mut digest = Sha256::new();
+    digest.update(NOISE_CUSTODY_PURPOSE);
+    digest.update(identity.profile_binding_hash().as_bytes());
+    digest.update(identity.host_public_id().as_bytes());
+    digest.update(public_bytes);
+    digest.update(fingerprint);
+    digest.finalize().into()
+}
+
+fn encode_noise_custody_envelope(
+    identity: &ConnectIdentity,
+    public: &ConnectNoiseStaticPublicKey,
+    blob: &[u8],
+) -> Result<Vec<u8>, OsNoiseCustodyError> {
+    if blob.is_empty() || blob.len() > NOISE_CUSTODY_MAX_BLOB_BYTES {
+        return Err(OsNoiseCustodyError::InvalidBlob);
+    }
+    let public_bytes = public.as_bytes();
+    let fingerprint = Sha256::digest(public_bytes);
+    let mut encoded = Vec::with_capacity(
+        NOISE_CUSTODY_MAGIC.len() + 64 + 16 + NOISE_STATIC_KEY_BYTES + 32 + 4 + blob.len(),
+    );
+    encoded.extend_from_slice(NOISE_CUSTODY_MAGIC);
+    encoded.extend_from_slice(identity.profile_binding_hash().as_bytes());
+    encoded.extend_from_slice(identity.host_public_id().as_bytes());
+    encoded.extend_from_slice(&public_bytes);
+    encoded.extend_from_slice(&fingerprint);
+    encoded.extend_from_slice(&(blob.len() as u32).to_be_bytes());
+    encoded.extend_from_slice(blob);
+    Ok(encoded)
+}
+
+fn decode_noise_custody_envelope(
+    identity: &ConnectIdentity,
+    bytes: &[u8],
+) -> Result<(ConnectNoiseStaticPublicKey, Vec<u8>), OsNoiseCustodyError> {
+    let prefix = NOISE_CUSTODY_MAGIC.len() + 64 + 16 + NOISE_STATIC_KEY_BYTES + 32 + 4;
+    if bytes.len() < prefix || bytes.len() > prefix + NOISE_CUSTODY_MAX_BLOB_BYTES {
+        return Err(OsNoiseCustodyError::InvalidBlob);
+    }
+    if &bytes[..NOISE_CUSTODY_MAGIC.len()] != NOISE_CUSTODY_MAGIC {
+        return Err(OsNoiseCustodyError::InvalidBlob);
+    }
+    let mut offset = NOISE_CUSTODY_MAGIC.len();
+    let profile = std::str::from_utf8(&bytes[offset..offset + 64])
+        .map_err(|_| OsNoiseCustodyError::InvalidBlob)?;
+    offset += 64;
+    let host: [u8; 16] = bytes[offset..offset + 16]
+        .try_into()
+        .map_err(|_| OsNoiseCustodyError::InvalidBlob)?;
+    offset += 16;
+    let public_bytes: [u8; NOISE_STATIC_KEY_BYTES] = bytes[offset..offset + NOISE_STATIC_KEY_BYTES]
+        .try_into()
+        .map_err(|_| OsNoiseCustodyError::InvalidBlob)?;
+    offset += NOISE_STATIC_KEY_BYTES;
+    let fingerprint: [u8; 32] = bytes[offset..offset + 32]
+        .try_into()
+        .map_err(|_| OsNoiseCustodyError::InvalidBlob)?;
+    offset += 32;
+    let blob_len = u32::from_be_bytes(
+        bytes[offset..offset + 4]
+            .try_into()
+            .map_err(|_| OsNoiseCustodyError::InvalidBlob)?,
+    ) as usize;
+    offset += 4;
+    if blob_len == 0 || blob_len > NOISE_CUSTODY_MAX_BLOB_BYTES || bytes.len() != offset + blob_len
+    {
+        return Err(OsNoiseCustodyError::InvalidBlob);
+    }
+    if profile != identity.profile_binding_hash()
+        || &host != identity.host_public_id().as_bytes()
+        || Sha256::digest(public_bytes).as_slice() != fingerprint
+    {
+        return Err(OsNoiseCustodyError::ContextMismatch);
+    }
+    let public = ConnectNoiseStaticPublicKey::from_bytes(public_bytes)
+        .map_err(|_| OsNoiseCustodyError::InvalidBlob)?;
+    Ok((public, bytes[offset..].to_vec()))
+}
+
+fn create_os_noise_custody(
+    identity: &ConnectIdentity,
+    path: &std::path::Path,
+) -> Result<ConnectNoiseCustody, OsNoiseCustodyError> {
+    let custody =
+        ConnectNoiseCustody::generate().map_err(|_| OsNoiseCustodyError::EntropyUnavailable)?;
+    let public = custody.public();
+    let entropy = noise_custody_entropy(identity, &public);
+    let mut private = Zeroizing::new(*custody.private().as_bytes());
+    let blob = protect_noise_private(private.as_slice(), &entropy)?;
+    private.zeroize();
+    let encoded = encode_noise_custody_envelope(identity, &public, &blob)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|_| OsNoiseCustodyError::PersistFailed)?;
+    }
+    let tmp = path.with_extension("dpapi.tmp");
+    fs::write(&tmp, &encoded).map_err(|_| OsNoiseCustodyError::PersistFailed)?;
+    fs::rename(&tmp, path).map_err(|_| OsNoiseCustodyError::PersistFailed)?;
+    Ok(custody)
+}
+
+fn load_os_noise_custody(
+    identity: &ConnectIdentity,
+    path: &std::path::Path,
+) -> Result<ConnectNoiseCustody, OsNoiseCustodyError> {
+    let bytes = fs::read(path).map_err(|_| OsNoiseCustodyError::PersistFailed)?;
+    let (expected_public, blob) = decode_noise_custody_envelope(identity, &bytes)?;
+    let entropy = noise_custody_entropy(identity, &expected_public);
+    let mut plain = unprotect_noise_private(&blob, &entropy)?;
+    if plain.len() != NOISE_STATIC_KEY_BYTES {
+        plain.zeroize();
+        return Err(OsNoiseCustodyError::InvalidBlob);
+    }
+    let mut key_bytes = [0_u8; NOISE_STATIC_KEY_BYTES];
+    key_bytes.copy_from_slice(&plain);
+    plain.zeroize();
+    let private = crate::protocol::NoiseStaticPrivateKey::from_vault_bytes(key_bytes)
+        .map_err(|_| OsNoiseCustodyError::InvalidBlob)?;
+    key_bytes.fill(0);
+    let custody = ConnectNoiseCustody::from_vault(private, expected_public)
+        .map_err(|_| OsNoiseCustodyError::InvalidBlob)?;
+    if custody.public() != expected_public {
+        return Err(OsNoiseCustodyError::PublicMismatch);
+    }
+    Ok(custody)
+}
+
+#[cfg(windows)]
+fn protect_noise_private(plaintext: &[u8], entropy: &[u8]) -> Result<Vec<u8>, OsNoiseCustodyError> {
+    dpapi_protect(plaintext, entropy)
+}
+
+#[cfg(windows)]
+fn unprotect_noise_private(
+    blob: &[u8],
+    entropy: &[u8],
+) -> Result<Zeroizing<Vec<u8>>, OsNoiseCustodyError> {
+    dpapi_unprotect(blob, entropy)
+}
+
+#[cfg(not(windows))]
+fn protect_noise_private(plaintext: &[u8], entropy: &[u8]) -> Result<Vec<u8>, OsNoiseCustodyError> {
+    let _ = (plaintext, entropy);
+    Err(OsNoiseCustodyError::UnsupportedPlatform)
+}
+
+#[cfg(not(windows))]
+fn unprotect_noise_private(
+    blob: &[u8],
+    entropy: &[u8],
+) -> Result<Zeroizing<Vec<u8>>, OsNoiseCustodyError> {
+    let _ = (blob, entropy);
+    Err(OsNoiseCustodyError::UnsupportedPlatform)
+}
+
+#[cfg(windows)]
+fn dpapi_protect(plaintext: &[u8], entropy: &[u8]) -> Result<Vec<u8>, OsNoiseCustodyError> {
+    use windows::core::w;
+    use windows::Win32::Foundation::{LocalFree, HLOCAL};
+    use windows::Win32::Security::Cryptography::{
+        CryptProtectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
+    };
+
+    if plaintext.is_empty() || plaintext.len() > NOISE_STATIC_KEY_BYTES {
+        return Err(OsNoiseCustodyError::InvalidBlob);
+    }
+    let mut input = CRYPT_INTEGER_BLOB {
+        cbData: u32::try_from(plaintext.len()).map_err(|_| OsNoiseCustodyError::InvalidBlob)?,
+        pbData: plaintext.as_ptr() as *mut u8,
+    };
+    let mut entropy_blob = CRYPT_INTEGER_BLOB {
+        cbData: u32::try_from(entropy.len()).map_err(|_| OsNoiseCustodyError::InvalidBlob)?,
+        pbData: entropy.as_ptr() as *mut u8,
+    };
+    let mut output = CRYPT_INTEGER_BLOB {
+        cbData: 0,
+        pbData: std::ptr::null_mut(),
+    };
+    unsafe {
+        CryptProtectData(
+            &input,
+            w!("DevManagerConnectNoiseStaticV1"),
+            Some(&entropy_blob as *const CRYPT_INTEGER_BLOB),
+            None,
+            None,
+            CRYPTPROTECT_UI_FORBIDDEN,
+            &mut output,
+        )
+        .map_err(|_| OsNoiseCustodyError::ProtectFailed)?;
+        if output.pbData.is_null() || output.cbData == 0 {
+            return Err(OsNoiseCustodyError::ProtectFailed);
+        }
+        let copy = std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec();
+        let _ = LocalFree(Some(HLOCAL(output.pbData.cast())));
+        Ok(copy)
+    }
+}
+
+#[cfg(windows)]
+fn dpapi_unprotect(blob: &[u8], entropy: &[u8]) -> Result<Zeroizing<Vec<u8>>, OsNoiseCustodyError> {
+    use windows::Win32::Foundation::{LocalFree, HLOCAL};
+    use windows::Win32::Security::Cryptography::{
+        CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
+    };
+
+    if blob.is_empty() || blob.len() > NOISE_CUSTODY_MAX_BLOB_BYTES {
+        return Err(OsNoiseCustodyError::InvalidBlob);
+    }
+    let mut input = CRYPT_INTEGER_BLOB {
+        cbData: u32::try_from(blob.len()).map_err(|_| OsNoiseCustodyError::InvalidBlob)?,
+        pbData: blob.as_ptr() as *mut u8,
+    };
+    let mut entropy_blob = CRYPT_INTEGER_BLOB {
+        cbData: u32::try_from(entropy.len()).map_err(|_| OsNoiseCustodyError::InvalidBlob)?,
+        pbData: entropy.as_ptr() as *mut u8,
+    };
+    let mut output = CRYPT_INTEGER_BLOB {
+        cbData: 0,
+        pbData: std::ptr::null_mut(),
+    };
+    unsafe {
+        CryptUnprotectData(
+            &mut input,
+            None,
+            Some(&entropy_blob as *const CRYPT_INTEGER_BLOB),
+            None,
+            None,
+            CRYPTPROTECT_UI_FORBIDDEN,
+            &mut output,
+        )
+        .map_err(|_| OsNoiseCustodyError::UnprotectFailed)?;
+        if output.pbData.is_null() || output.cbData == 0 {
+            return Err(OsNoiseCustodyError::UnprotectFailed);
+        }
+        let copy = Zeroizing::new(
+            std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec(),
+        );
+        let _ = LocalFree(Some(HLOCAL(output.pbData.cast())));
+        Ok(copy)
     }
 }
 
@@ -377,17 +838,21 @@ impl fmt::Debug for ConnectProductionSession {
 }
 
 impl ConnectProductionSession {
-    /// Open the active profile identity store, then fail closed because no
-    /// vault-backed Noise static key is supplied on this path.
+    /// Open the active profile identity store and OS-backed Noise custody.
+    /// Never derives a production static key from profile metadata.
     pub fn open() -> Result<Self, ConnectProductionError> {
-        let _store = IsolatedRemoteStore::<KernelIdentityPersistence>::open_active_profile()
+        let store = IsolatedRemoteStore::<KernelIdentityPersistence>::open_active_profile()
             .map_err(ConnectProductionError::Identity)?;
-        match EndToEndChannel::open_production(CONNECT_NOISE_FIRST_PAIRING_PATTERN, true, false) {
-            Ok(_) => Err(ConnectProductionError::Crypto(ConnectCryptoHold {
-                reason: crate::protocol::CryptoHoldReason::MissingStaticKey,
-            })),
-            Err(hold) => Err(ConnectProductionError::Crypto(hold)),
-        }
+        let identity = store
+            .require_active_profile_identity()
+            .map_err(ConnectProductionError::Identity)?;
+        let custody =
+            OsNoiseCustody::load_or_create(&identity).map_err(ConnectProductionError::Custody)?;
+        Ok(Self {
+            profile_host_public_id: identity.host_public_id(),
+            store,
+            custody,
+        })
     }
 
     /// Profile-bound production session that actually uses supplied custody.
@@ -454,6 +919,11 @@ impl ConnectProductionSession {
 
     pub fn identity_store(&self) -> &IsolatedRemoteStore<KernelIdentityPersistence> {
         &self.store
+    }
+
+    #[cfg(test)]
+    pub(crate) fn custody_public(&self) -> ConnectNoiseStaticPublicKey {
+        self.custody.public()
     }
 
     pub fn bind_direct<T: Read + Write>(
@@ -578,13 +1048,31 @@ impl<P: IdentityPersistence + 'static> IsolatedRemoteStore<P> {
     }
 
     fn require_active_profile_host(&self) -> Result<HostPublicId, IdentityError> {
+        Ok(self.require_active_profile_identity()?.host_public_id())
+    }
+
+    fn require_active_profile_identity(&self) -> Result<ConnectIdentity, IdentityError> {
         let document = self.read_document()?;
         if document.pending_revocation.is_some() || document.pending_transition.is_some() {
             return Err(IdentityError::TransitionPending);
         }
         let identity = document.identity.ok_or(IdentityError::NotEnabled)?;
         identity.validate_structure()?;
-        Ok(identity.host_public_id())
+        Ok(identity)
+    }
+
+    pub fn identity_live_state(&self) -> Result<ConnectIdentityLiveState, IdentityError> {
+        let document = self.read_document()?;
+        if document.pending_revocation.is_some() || document.pending_transition.is_some() {
+            return Ok(ConnectIdentityLiveState::Pending);
+        }
+        match document.identity {
+            Some(identity) => {
+                identity.validate_structure()?;
+                Ok(ConnectIdentityLiveState::Live)
+            }
+            None => Ok(ConnectIdentityLiveState::Absent),
+        }
     }
 
     /// Mutable persistence is a debug/test-only fault-injection seam. A
@@ -2634,9 +3122,12 @@ mod tests {
     #[test]
     fn production_session_is_profile_bound_and_fail_closed_on_crypto() {
         let root = crate::persistence::app_config_dir().expect("isolated test config");
-        let err = ConnectProductionSession::open().expect_err("production crypto hold");
+        let err = ConnectProductionSession::open().expect_err("unenrolled identity");
         assert!(
-            matches!(err, ConnectProductionError::Crypto(_)),
+            matches!(
+                err,
+                ConnectProductionError::Identity(IdentityError::NotEnabled)
+            ),
             "got {err:?}"
         );
         let database = root.join("kernel.sqlite3");
@@ -2833,5 +3324,88 @@ mod tests {
         )
         .is_ok());
         let _ = (root, CONNECT_NOISE_PINNED_DEVICE_PATTERN);
+    }
+
+    #[test]
+    fn production_open_uses_os_custody_or_fails_closed_on_unsupported_platform() {
+        let _root = crate::persistence::app_config_dir().expect("isolated test config");
+        persist_active_profile_identity();
+        match ConnectProductionSession::open() {
+            Ok(session) => {
+                let first = session.custody_public();
+                drop(session);
+                let again = ConnectProductionSession::open().expect("reload os custody");
+                assert_eq!(again.custody_public(), first);
+                let blob = _root.join("connect").join("noise-static-v1.dpapi");
+                assert!(
+                    blob.exists(),
+                    "DPAPI envelope must live under app_config_dir"
+                );
+                let bytes = std::fs::read(&blob).expect("read envelope");
+                assert!(!bytes.windows(32).any(|window| window == first.as_bytes()));
+            }
+            Err(ConnectProductionError::Custody(OsNoiseCustodyError::UnsupportedPlatform)) => {}
+            Err(err) => panic!("unexpected production open error: {err:?}"),
+        }
+    }
+
+    #[test]
+    fn os_custody_rejects_wrong_profile_binding() {
+        let _root = crate::persistence::app_config_dir().expect("isolated test config");
+        persist_active_profile_identity();
+        match ConnectProductionSession::open() {
+            Ok(_) => {
+                let other = ConnectIdentity {
+                    schema_version: CONNECT_IDENTITY_SCHEMA_VERSION,
+                    host_public_id: HostPublicId::new(),
+                    host_key: KeyReference {
+                        location: CredentialLocation::OsHostVault,
+                        fingerprint: "cd".repeat(32),
+                        generation: Some(1),
+                    },
+                    pairing_code: PairingCode::parse_valid("ABCDEFGH").expect("pairing"),
+                    pairing_code_generation: 1,
+                    pairing_purpose: PairingPurpose::OwnerDevice,
+                    profile_binding_hash: MachineBinding::new("other-profile").binding_hash(),
+                    last_seen_host_build: None,
+                    created_at_epoch_ms: 1,
+                    devices: Vec::new(),
+                };
+                assert!(matches!(
+                    OsNoiseCustody::load_or_create(&other),
+                    Err(OsNoiseCustodyError::ContextMismatch)
+                        | Err(OsNoiseCustodyError::UnprotectFailed)
+                ));
+            }
+            Err(ConnectProductionError::Custody(OsNoiseCustodyError::UnsupportedPlatform)) => {}
+            Err(err) => panic!("unexpected production open error: {err:?}"),
+        }
+    }
+
+    #[test]
+    fn production_startup_gate_rejects_legacy_web_and_raw_pty() {
+        assert!(ConnectProductionStartup::reject_legacy_remote_web_as_connect().is_err());
+        assert!(ConnectListenerKind::ProductionDirect
+            .reject_raw_pty()
+            .is_err());
+        assert!(ConnectListenerKind::LegacyRemoteWeb
+            .reject_raw_pty()
+            .is_ok());
+        let _root = crate::persistence::app_config_dir().expect("isolated test config");
+        persist_active_profile_identity();
+        match ConnectProductionStartup::prepare_direct(DirectBindPolicy::loopback()) {
+            Ok(startup) => {
+                assert_eq!(
+                    startup.session().identity_store().identity_live_state(),
+                    Ok(ConnectIdentityLiveState::Live)
+                );
+                assert!(!startup.listener_is_bound());
+                assert!(startup.require_bound_listener().is_err());
+            }
+            Err(ConnectStartupError::Production(ConnectProductionError::Custody(
+                OsNoiseCustodyError::UnsupportedPlatform,
+            ))) => {}
+            Err(err) => panic!("unexpected startup error: {err:?}"),
+        }
     }
 }
