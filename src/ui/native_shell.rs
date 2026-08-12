@@ -457,6 +457,28 @@ fn stable_task_element_id(task_id: TaskId) -> ElementId {
     ElementId::Uuid(Uuid::from_bytes(*task_id.as_bytes()))
 }
 
+/// Return a deterministic numeric suffix for a service element identity.
+///
+/// GPUI's tuple element IDs intentionally accept only a static name and a
+/// typed integer; a runtime `String` cannot be passed directly to `.id(...)`.
+/// Hashing the validated service ID (and optional action label) keeps the
+/// identity stable across renders without depending on row order, while the
+/// static tuple name keeps rows and controls in separate ID namespaces.
+fn stable_service_element_key(service_id: &str, suffix: &str) -> u64 {
+    let mut digest = Sha256::new();
+    digest.update(b"native-service");
+    digest.update([0]);
+    digest.update(service_id.as_bytes());
+    digest.update([0]);
+    digest.update(suffix.as_bytes());
+    let digest = digest.finalize();
+    u64::from_be_bytes(
+        digest[..8]
+            .try_into()
+            .expect("sha256 digest always contains eight bytes"),
+    )
+}
+
 fn pointer_button(button: MouseButton) -> Option<PointerButton> {
     match button {
         MouseButton::Left => Some(PointerButton::Primary),
@@ -7155,13 +7177,14 @@ impl NativeShell {
                     .map(|affordance| {
                         let label = service_panel_action_label(affordance.action);
                         let action = affordance.action;
-                        let control_id = format!(
-                            "native-service-{}-{}",
-                            service_id.as_str(),
-                            label.to_ascii_lowercase()
-                        );
                         let mut control = div()
-                            .id(control_id)
+                            .id((
+                                "native-service-control",
+                                stable_service_element_key(
+                                    service_id.as_str(),
+                                    &label.to_ascii_lowercase(),
+                                ),
+                            ))
                             .px(px(tokens.density.spacing.sm))
                             .py(px(tokens.density.spacing.xs))
                             .rounded_sm()
@@ -7231,7 +7254,10 @@ impl NativeShell {
                     })
                     .collect::<Vec<_>>();
                 div()
-                    .id(format!("native-service-row-{}", row.service_id.as_str()))
+                    .id((
+                        "native-service-row",
+                        stable_service_element_key(row.service_id.as_str(), "row"),
+                    ))
                     .w_full()
                     .flex()
                     .flex_wrap()
