@@ -3295,6 +3295,10 @@ impl HostRequestExecutor {
                         coordinator: Some(&self.workspace_coordinator),
                         action_epoch,
                         runtime_generation,
+                        config: self
+                            .config_admission
+                            .as_ref()
+                            .map(|admission| &admission.store.snapshot().config),
                     });
                 Ok(QueryReply {
                     request_id: envelope.request_id,
@@ -4437,6 +4441,7 @@ fn dispatch_authenticated_request_inner(
                             coordinator: None,
                             action_epoch: None,
                             runtime_generation: None,
+                            config: None,
                         });
                     return Ok(ServerMessage::QueryReply(QueryReply {
                         request_id: envelope.request_id,

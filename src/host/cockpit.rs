@@ -9,12 +9,15 @@ use uuid::Uuid;
 
 use crate::domain::agent_resource::{AgentResourceBinding, AgentResourceBindingError};
 use crate::domain::cockpit::{
-    cockpit_surface, relative_path_is_safe, workspace_projection, TaskCockpitDeniedReason,
-    TaskCockpitQuery, TaskCockpitResult, TaskCockpitSurface, TaskCockpitUnavailableReason,
-    TaskFileEntry, TaskFilesListProjection, TaskFilesReadProjection, TaskGitMutateIntent,
-    TaskGitProjection, TaskSshEndpoint, TaskSshLifecycle, TaskSshProjection, TaskSshRuntimeError,
+    cockpit_surface, relative_path_is_safe, workspace_projection, ConfigSidebarFolder,
+    ConfigSidebarProject, ConfigSidebarProvider, ConfigSidebarProviderKind, ConfigSidebarServer,
+    ConfigSidebarSnapshot, ConfigSidebarSsh, TaskCockpitDeniedReason, TaskCockpitQuery,
+    TaskCockpitResult, TaskCockpitSurface, TaskCockpitUnavailableReason, TaskFileEntry,
+    TaskFilesListProjection, TaskFilesReadProjection, TaskGitMutateIntent, TaskGitProjection,
+    TaskSshEndpoint, TaskSshLifecycle, TaskSshProjection, TaskSshRuntimeError,
     TaskSshRuntimeProjection, MAX_COCKPIT_FILE_LIST, MAX_COCKPIT_READ_BYTES,
 };
+use crate::config::AppConfig;
 use crate::domain::id::{ClientId, CommandId, RequestId, TaskId};
 use crate::domain::query::{QueryError, QueryOutcome, QueryResult};
 use crate::domain::{AgentSessionFacts, ResourceFacts};
@@ -58,6 +61,9 @@ pub(crate) struct TaskCockpitDispatch<'a> {
     pub coordinator: Option<&'a WorkspaceResourceCoordinator>,
     pub action_epoch: Option<u64>,
     pub runtime_generation: Option<u64>,
+    /// Host-only canonical config snapshot. It is used only for the redacted
+    /// ConfigSnapshot query and is never exposed as a path-bearing AppConfig.
+    pub config: Option<&'a AppConfig>,
 }
 
 /// Host-side adapter for the exact kernel provider-resource claim.  The
@@ -76,6 +82,16 @@ pub(crate) fn serve_task_cockpit(dispatch: TaskCockpitDispatch<'_>) -> QueryOutc
         return QueryOutcome::Err(QueryError::UnsupportedCapability);
     }
     let surface = cockpit_surface(dispatch.query);
+    if matches!(dispatch.query, TaskCockpitQuery::ConfigSnapshot) {
+        let Some(config) = dispatch.config else {
+            return QueryOutcome::Err(QueryError::Unavailable {
+                reason: "config_snapshot",
+            });
+        };
+        return QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Config(
+            config_sidebar_snapshot(config),
+        )));
+    }
     let Some(task_id) = dispatch.envelope_task_id else {
         return denied(surface, TaskCockpitDeniedReason::MissingTask);
     };
@@ -229,6 +245,149 @@ pub(crate) fn serve_task_cockpit(dispatch: TaskCockpitDispatch<'_>) -> QueryOutc
             SupervisorAction::Health,
         ),
     }
+}
+
+fn config_sidebar_snapshot(config: &AppConfig) -> ConfigSidebarSnapshot {
+    const MAX_PROJECTS: usize = 128;
+    const MAX_FOLDERS: usize = 64;
+    const MAX_SERVERS: usize = 256;
+    const MAX_LABEL: usize = 96;
+    const MAX_HOST: usize = 160;
+    let projects = config
+        .projects
+        .iter()
+        .filter(|project| !is_archived(&project.archived))
+        .take(MAX_PROJECTS)
+        .map(|project| ConfigSidebarProject {
+            config_id: bounded_config_text(&project.id, MAX_LABEL),
+            label: bounded_config_text(
+                if project.name.trim().is_empty() {
+                    &project.id
+                } else {
+                    &project.name
+                },
+                MAX_LABEL,
+            ),
+            root_configured: !project.root_path.trim().is_empty(),
+            folders: project
+                .folders
+                .iter()
+                .filter(|folder| !is_archived(&folder.archived))
+                .take(MAX_FOLDERS)
+                .map(|folder| ConfigSidebarFolder {
+                    config_id: bounded_config_text(&folder.id, MAX_LABEL),
+                    label: bounded_config_text(
+                        if folder.name.trim().is_empty() {
+                            &folder.id
+                        } else {
+                            &folder.name
+                        },
+                        MAX_LABEL,
+                    ),
+                    server_count: folder
+                        .commands
+                        .iter()
+                        .filter(|command| !is_archived(&command.archived))
+                        .count(),
+                })
+                .collect(),
+        })
+        .collect();
+    let mut servers = Vec::new();
+    for project in config
+        .projects
+        .iter()
+        .filter(|project| !is_archived(&project.archived))
+    {
+        for folder in project
+            .folders
+            .iter()
+            .filter(|folder| !is_archived(&folder.archived))
+            .take(MAX_FOLDERS)
+        {
+            for command in folder
+                .commands
+                .iter()
+                .filter(|command| !is_archived(&command.archived))
+            {
+                if servers.len() == MAX_SERVERS {
+                    break;
+                }
+                servers.push(ConfigSidebarServer {
+                    project_id: bounded_config_text(&project.id, MAX_LABEL),
+                    folder_id: bounded_config_text(&folder.id, MAX_LABEL),
+                    command_id: bounded_config_text(&command.id, MAX_LABEL),
+                    project_label: bounded_config_text(&project.name, MAX_LABEL),
+                    folder_label: bounded_config_text(&folder.name, MAX_LABEL),
+                    label: bounded_config_text(
+                        if command.label.trim().is_empty() {
+                            &command.id
+                        } else {
+                            &command.label
+                        },
+                        MAX_LABEL,
+                    ),
+                    port: command.port.as_ref().copied(),
+                });
+            }
+        }
+    }
+    let ssh_connections = config
+        .ssh_connections
+        .iter()
+        .filter(|connection| !is_archived(&connection.archived))
+        .take(MAX_SERVERS)
+        .map(|connection| ConfigSidebarSsh {
+            config_id: bounded_config_text(&connection.id, MAX_LABEL),
+            label: bounded_config_text(
+                if connection.label.trim().is_empty() {
+                    &connection.id
+                } else {
+                    &connection.label
+                },
+                MAX_LABEL,
+            ),
+            host: bounded_config_text(&connection.host, MAX_HOST),
+            port: connection.port,
+            username: bounded_config_text(&connection.username, MAX_LABEL),
+        })
+        .collect();
+    let settings = config.settings();
+    let providers = vec![
+        ConfigSidebarProvider {
+            provider: ConfigSidebarProviderKind::Claude,
+            command_configured: settings
+                .claude_command
+                .as_ref()
+                .is_some_and(|command| !command.trim().is_empty()),
+        },
+        ConfigSidebarProvider {
+            provider: ConfigSidebarProviderKind::Codex,
+            command_configured: settings
+                .codex_command
+                .as_ref()
+                .is_some_and(|command| !command.trim().is_empty()),
+        },
+    ];
+    ConfigSidebarSnapshot {
+        revision: config.revision,
+        projects,
+        servers,
+        ssh_connections,
+        providers,
+    }
+}
+
+fn is_archived(value: &crate::config::Nullable<bool>) -> bool {
+    value.as_ref().copied().unwrap_or(false)
+}
+
+fn bounded_config_text(value: &str, max: usize) -> String {
+    value
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(max)
+        .collect()
 }
 
 fn serve_service_observe(
@@ -1327,6 +1486,7 @@ mod tests {
             coordinator: None,
             action_epoch: None,
             runtime_generation: None,
+            config: None,
         });
         assert!(matches!(
             accepted,
@@ -1353,6 +1513,7 @@ mod tests {
             coordinator: Some(&coordinator),
             action_epoch: Some(1),
             runtime_generation: Some(1),
+            config: None,
         });
         assert!(matches!(
             named,
@@ -1378,6 +1539,7 @@ mod tests {
             coordinator: None,
             action_epoch: None,
             runtime_generation: None,
+            config: None,
         });
         assert!(matches!(
             foreign,
@@ -1411,6 +1573,7 @@ mod tests {
             coordinator: Some(&coordinator),
             action_epoch: Some(1),
             runtime_generation: Some(1),
+            config: None,
         });
         let QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::FilesRead(text))) = text
         else {
@@ -1436,6 +1599,7 @@ mod tests {
             coordinator: Some(&coordinator),
             action_epoch: Some(1),
             runtime_generation: Some(1),
+            config: None,
         });
         let QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::FilesRead(binary))) =
             binary
@@ -1462,6 +1626,7 @@ mod tests {
             coordinator: Some(&coordinator),
             action_epoch: Some(1),
             runtime_generation: Some(1),
+            config: None,
         });
         assert!(matches!(
             secret,
@@ -1501,6 +1666,7 @@ mod tests {
             coordinator,
             action_epoch,
             runtime_generation,
+            config: None,
         }
     }
 

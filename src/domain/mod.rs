@@ -30,11 +30,13 @@ pub use artifact::{
 };
 pub use cockpit::{
     cockpit_surface, git_projection, relative_path_is_safe, task_agent_resource_projection,
-    workspace_projection, TaskAgentResourceProjection, TaskCockpitDeniedReason, TaskCockpitQuery,
-    TaskCockpitResult, TaskCockpitSurface, TaskCockpitUnavailableReason, TaskFileEntry,
-    TaskFilesListProjection, TaskFilesReadProjection, TaskGitMutateIntent, TaskGitProjection,
-    TaskServiceProjection, TaskServiceRuntimeState, TaskServiceScope, TaskServiceSnapshot,
-    TaskSshEndpoint, TaskSshProjection, TaskWorkspaceKind, TaskWorkspaceProjection,
+    workspace_projection, ConfigSidebarFolder, ConfigSidebarProject, ConfigSidebarProvider,
+    ConfigSidebarProviderKind, ConfigSidebarServer, ConfigSidebarSnapshot, ConfigSidebarSsh,
+    TaskAgentResourceProjection, TaskCockpitDeniedReason, TaskCockpitQuery, TaskCockpitResult,
+    TaskCockpitSurface, TaskCockpitUnavailableReason, TaskFileEntry, TaskFilesListProjection,
+    TaskFilesReadProjection, TaskGitMutateIntent, TaskGitProjection, TaskServiceProjection,
+    TaskServiceRuntimeState, TaskServiceScope, TaskServiceSnapshot, TaskSshEndpoint,
+    TaskSshProjection, TaskWorkspaceKind, TaskWorkspaceProjection,
     MAX_COCKPIT_FILE_LIST, MAX_COCKPIT_READ_BYTES,
 };
 pub use codec::{

@@ -104,6 +104,10 @@ pub enum TaskGitMutateIntent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum TaskCockpitQuery {
+    /// Read-only host configuration summary for the native configuration rail.
+    /// This carries labels and capability metadata only; roots, commands,
+    /// environment values, and credential material remain host-private.
+    ConfigSnapshot,
     WorkspaceStatus,
     GitStatus,
     FilesList {
@@ -315,9 +319,76 @@ pub struct TaskServiceHealth {
     pub snapshot: TaskServiceSnapshot,
 }
 
+/// Bounded, redacted configuration projection issued by the host's canonical
+/// ConfigStore.  It deliberately contains no absolute paths, command text,
+/// environment values, or credential references.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigSidebarSnapshot {
+    pub revision: u64,
+    pub projects: Vec<ConfigSidebarProject>,
+    pub servers: Vec<ConfigSidebarServer>,
+    pub ssh_connections: Vec<ConfigSidebarSsh>,
+    pub providers: Vec<ConfigSidebarProvider>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigSidebarProject {
+    pub config_id: String,
+    pub label: String,
+    pub root_configured: bool,
+    pub folders: Vec<ConfigSidebarFolder>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigSidebarFolder {
+    pub config_id: String,
+    pub label: String,
+    pub server_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigSidebarServer {
+    pub project_id: String,
+    pub folder_id: String,
+    pub command_id: String,
+    pub project_label: String,
+    pub folder_label: String,
+    pub label: String,
+    pub port: Option<u16>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigSidebarSsh {
+    pub config_id: String,
+    pub label: String,
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigSidebarProviderKind {
+    Claude,
+    Codex,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigSidebarProvider {
+    pub provider: ConfigSidebarProviderKind,
+    pub command_configured: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum TaskCockpitResult {
+    Config(ConfigSidebarSnapshot),
     Workspace(TaskWorkspaceProjection),
     Git(TaskGitProjection),
     FilesList(TaskFilesListProjection),
@@ -420,6 +491,7 @@ fn workspace_kind(kind: WorkspaceBindingKind) -> TaskWorkspaceKind {
 
 pub fn cockpit_surface(query: &TaskCockpitQuery) -> TaskCockpitSurface {
     match query {
+        TaskCockpitQuery::ConfigSnapshot => TaskCockpitSurface::Workspace,
         TaskCockpitQuery::WorkspaceStatus => TaskCockpitSurface::Workspace,
         TaskCockpitQuery::GitStatus | TaskCockpitQuery::GitMutate { .. } => TaskCockpitSurface::Git,
         TaskCockpitQuery::FilesList { .. }

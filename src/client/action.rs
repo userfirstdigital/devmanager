@@ -503,6 +503,7 @@ impl UpdaterAction {
 
 pub const fn cockpit_query_action_id(query: &TaskCockpitQuery) -> &'static str {
     match query {
+        TaskCockpitQuery::ConfigSnapshot => ACTION_WORKSPACE_STATUS,
         TaskCockpitQuery::WorkspaceStatus => ACTION_WORKSPACE_STATUS,
         TaskCockpitQuery::GitStatus | TaskCockpitQuery::GitMutate { .. } => ACTION_GIT_STATUS,
         TaskCockpitQuery::FilesList { .. } => ACTION_FILES_LIST,

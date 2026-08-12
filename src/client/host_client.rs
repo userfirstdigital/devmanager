@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 use uuid::Uuid;
 
-use crate::domain::cockpit::TaskCockpitQuery;
+use crate::domain::cockpit::{ConfigSidebarSnapshot, TaskCockpitQuery, TaskCockpitResult};
 use crate::domain::command::{
     Command, CommandEnvelope, CommandReceipt, ConfirmHostQuitIntent, PrepareUpdateIntent,
 };
@@ -526,6 +526,49 @@ impl HostClient {
         match reply.outcome {
             QueryOutcome::Err(error) => Ok(Err(error)),
             QueryOutcome::Ok(QueryResult::TaskCockpit(result)) => Ok(Ok(result)),
+            QueryOutcome::Ok(_) => {
+                self.retire_connection();
+                Err(IpcError::CorrelationMismatch)
+            }
+        }
+    }
+
+    /// Query the host-owned redacted configuration projection. The task id in
+    /// the wire envelope is intentionally synthetic; the host handles this
+    /// global read before task lookup and never uses it for authorization.
+    pub async fn query_config_sidebar(
+        &mut self,
+    ) -> Result<Result<ConfigSidebarSnapshot, QueryError>, IpcError> {
+        if !self.server_hello.granted.grants_task_cockpit() {
+            return Err(IpcError::UnsupportedCapability);
+        }
+
+        let request_id = RequestId::new();
+        let client_id = self.config.client_id;
+        let outcome = {
+            let connection = self.live_connection()?;
+            connection
+                .query(task_cockpit_query(
+                    request_id,
+                    client_id,
+                    TaskId::new(),
+                    TaskCockpitQuery::ConfigSnapshot,
+                ))
+                .await
+        };
+        let reply = match outcome {
+            Ok(reply) => reply,
+            Err(error) => {
+                self.retire_connection();
+                return Err(error);
+            }
+        };
+
+        match reply.outcome {
+            QueryOutcome::Err(error) => Ok(Err(error)),
+            QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Config(snapshot))) => {
+                Ok(Ok(snapshot))
+            }
             QueryOutcome::Ok(_) => {
                 self.retire_connection();
                 Err(IpcError::CorrelationMismatch)

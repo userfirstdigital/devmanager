@@ -12,6 +12,9 @@ use crate::config::{
     AppConfig, ConfigRevision, ConfigSnapshot, Nullable, Project, ProjectFolder, RunCommand,
     SSHConnection, Settings,
 };
+use crate::domain::{
+    ConfigSidebarProviderKind, ConfigSidebarSnapshot,
+};
 use crate::ui::components::interaction::{AccessibilityMetadata, AccessibleRole};
 use crate::ui::tokens::ThemeTokens;
 
@@ -246,6 +249,134 @@ impl ConfigSidebarProjection {
             ssh_connections,
             providers,
             settings_action,
+            unavailable_reason,
+        }
+    }
+
+    /// Project the host-issued redacted snapshot. This path never receives
+    /// absolute roots, command text, environment values, or credentials.
+    pub fn from_host_snapshot(snapshot: &ConfigSidebarSnapshot) -> Self {
+        let projects = snapshot
+            .projects
+            .iter()
+            .take(MAX_CONFIG_PROJECTS)
+            .map(|project| ConfigProjectRow {
+                config_id: bounded(&project.config_id, MAX_CONFIG_LABEL_SCALARS),
+                label: bounded(&project.label, MAX_CONFIG_LABEL_SCALARS),
+                root_configured: project.root_configured,
+                folders: project
+                    .folders
+                    .iter()
+                    .take(MAX_CONFIG_FOLDERS_PER_PROJECT)
+                    .map(|folder| ConfigFolderRow {
+                        config_id: bounded(&folder.config_id, MAX_CONFIG_LABEL_SCALARS),
+                        label: bounded(&folder.label, MAX_CONFIG_LABEL_SCALARS),
+                        server_count: folder.server_count,
+                        action: ConfigSidebarAction::enabled(
+                            ConfigSidebarActionRequest::SelectFolder {
+                                project_id: bounded(&project.config_id, MAX_CONFIG_LABEL_SCALARS),
+                                folder_id: bounded(&folder.config_id, MAX_CONFIG_LABEL_SCALARS),
+                            },
+                        ),
+                        accessibility: accessibility(
+                            AccessibleRole::Button,
+                            &format!("Folder {}", bounded(&folder.label, MAX_CONFIG_LABEL_SCALARS)),
+                        ),
+                    })
+                    .collect(),
+                action: ConfigSidebarAction::enabled(
+                    ConfigSidebarActionRequest::SelectProject {
+                        config_id: bounded(&project.config_id, MAX_CONFIG_LABEL_SCALARS),
+                    },
+                ),
+                accessibility: accessibility(
+                    AccessibleRole::Button,
+                    &format!("Project {}", bounded(&project.label, MAX_CONFIG_LABEL_SCALARS)),
+                ),
+            })
+            .collect::<Vec<_>>();
+        let servers = snapshot
+            .servers
+            .iter()
+            .take(MAX_CONFIG_SERVERS)
+            .map(|server| {
+                let project_id = bounded(&server.project_id, MAX_CONFIG_LABEL_SCALARS);
+                let folder_id = bounded(&server.folder_id, MAX_CONFIG_LABEL_SCALARS);
+                let command_id = bounded(&server.command_id, MAX_CONFIG_LABEL_SCALARS);
+                let label = bounded(&server.label, MAX_CONFIG_LABEL_SCALARS);
+                ConfigServerRow {
+                    project_id: project_id.clone(),
+                    folder_id: folder_id.clone(),
+                    command_id: command_id.clone(),
+                    project_label: bounded(&server.project_label, MAX_CONFIG_LABEL_SCALARS),
+                    folder_label: bounded(&server.folder_label, MAX_CONFIG_LABEL_SCALARS),
+                    label: label.clone(),
+                    port: server.port,
+                    action: ConfigSidebarAction::enabled(ConfigSidebarActionRequest::SelectServer {
+                        project_id,
+                        folder_id,
+                        command_id,
+                    }),
+                    accessibility: accessibility(AccessibleRole::Button, &format!("Server {label}")),
+                }
+            })
+            .collect();
+        let ssh_connections = snapshot
+            .ssh_connections
+            .iter()
+            .take(MAX_CONFIG_SERVERS)
+            .map(|connection| {
+                let config_id = bounded(&connection.config_id, MAX_CONFIG_LABEL_SCALARS);
+                let label = bounded(&connection.label, MAX_CONFIG_LABEL_SCALARS);
+                ConfigSshRow {
+                    config_id: config_id.clone(),
+                    label: label.clone(),
+                    host: bounded(&connection.host, MAX_CONFIG_HOST_SCALARS),
+                    port: connection.port,
+                    username: bounded(&connection.username, MAX_CONFIG_LABEL_SCALARS),
+                    action: ConfigSidebarAction::enabled(ConfigSidebarActionRequest::SelectSsh { config_id }),
+                    accessibility: accessibility(AccessibleRole::Button, &format!("Remote {label}")),
+                }
+            })
+            .collect();
+        let providers = snapshot
+            .providers
+            .iter()
+            .take(MAX_CONFIG_PROVIDERS)
+            .map(|provider| ConfigProviderRow {
+                provider: match provider.provider {
+                    ConfigSidebarProviderKind::Claude => ConfigProvider::Claude,
+                    ConfigSidebarProviderKind::Codex => ConfigProvider::Codex,
+                },
+                label: match provider.provider {
+                    ConfigSidebarProviderKind::Claude => ConfigProvider::Claude.label(),
+                    ConfigSidebarProviderKind::Codex => ConfigProvider::Codex.label(),
+                },
+                command_configured: provider.command_configured,
+                action: ConfigSidebarAction::enabled(ConfigSidebarActionRequest::SelectProvider {
+                    provider: match provider.provider {
+                        ConfigSidebarProviderKind::Claude => ConfigProvider::Claude,
+                        ConfigSidebarProviderKind::Codex => ConfigProvider::Codex,
+                    },
+                }),
+                accessibility: accessibility(AccessibleRole::Button, match provider.provider {
+                    ConfigSidebarProviderKind::Claude => ConfigProvider::Claude.label(),
+                    ConfigSidebarProviderKind::Codex => ConfigProvider::Codex.label(),
+                }),
+            })
+            .collect::<Vec<_>>();
+        let unavailable_reason = (projects.is_empty()
+            && servers.is_empty()
+            && ssh_connections.is_empty()
+            && providers.iter().all(|provider| !provider.command_configured))
+            .then_some(ConfigSidebarUnavailableReason::NoConfiguredItems);
+        Self {
+            revision: Some(snapshot.revision),
+            projects,
+            servers,
+            ssh_connections,
+            providers,
+            settings_action: ConfigSidebarAction::enabled(ConfigSidebarActionRequest::OpenSettings),
             unavailable_reason,
         }
     }

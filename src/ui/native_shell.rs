@@ -1759,6 +1759,7 @@ impl NativeHostActionOutcome {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NativeHostQueryBody {
     Text,
+    ConfigSidebar(crate::domain::ConfigSidebarSnapshot),
     TaskCockpit(crate::domain::TaskCockpitResult),
     PromptLibrary(PromptProjectionReply),
     Updater(UpdaterSnapshot),
@@ -3890,14 +3891,23 @@ async fn execute_native_command(
         }
         NativeHostCommand::HostStatusQuery { request_id } => {
             let _ = request_id;
-            Ok(query_text(bounded_host_error(format!(
+            let detail = bounded_host_error(format!(
                 "host.status · boot={} · connection={} · build={} · protocol={}.{}",
                 client.host_boot_id(),
                 client.connection_id(),
                 client.server_build(),
                 client.protocol_major(),
                 client.protocol_minor()
-            ))))
+            ));
+            match client.query_config_sidebar().await? {
+                Ok(snapshot) => Ok(NativeHostExecutionResult::Query {
+                    detail,
+                    body: NativeHostQueryBody::ConfigSidebar(snapshot),
+                }),
+                Err(error) => Ok(NativeHostExecutionResult::QueryFailed(
+                    bounded_host_error(format!("{detail} · config unavailable: {error:?}")),
+                )),
+            }
         }
         NativeHostCommand::HostActionsQuery { request_id } => {
             let _ = request_id;
@@ -5743,6 +5753,7 @@ impl NativeShell {
             platform_accessibility,
         };
         if start_controller {
+            let _ = shell.dispatch_action(ActionRequest::HostStatus);
             shell.start_controller(cx);
         }
         shell
@@ -5870,6 +5881,9 @@ impl NativeShell {
     fn apply_query_body(&mut self, body: NativeHostQueryBody) {
         match body {
             NativeHostQueryBody::Text => {}
+            NativeHostQueryBody::ConfigSidebar(snapshot) => {
+                self.config_sidebar = ConfigSidebarProjection::from_host_snapshot(&snapshot);
+            }
             NativeHostQueryBody::TaskCockpit(result) => {
                 self.cockpit.apply_cockpit_result(&result);
                 if let crate::domain::TaskCockpitResult::Services(services) = &result {
