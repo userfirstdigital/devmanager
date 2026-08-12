@@ -63,10 +63,10 @@ fn action_projection_reuses_every_shared_id_and_adds_accessible_presentation() {
             .all(|entry| !entry.presentation_label().is_empty()));
         assert!(projected
             .iter()
-            .all(|entry| !entry.accessibility().name.is_empty()));
+            .all(|entry| !entry.accessibility().name().is_empty()));
         assert!(projected
             .iter()
-            .all(|entry| entry.accessibility().role == AccessibleRole::Button));
+            .all(|entry| entry.accessibility().role() == AccessibleRole::Button));
 
         for entry in &projected {
             let expected_disabled = state.disabled_ids.iter().any(|id| id == entry.id());
@@ -86,10 +86,10 @@ fn action_projection_reuses_every_shared_id_and_adds_accessible_presentation() {
                 let reason = entry
                     .disabled_reason()
                     .expect("disabled actions expose a reason");
-                assert!(entry.accessibility().disabled);
-                assert_eq!(entry.accessibility().description, reason);
+                assert!(entry.accessibility().disabled());
+                assert_eq!(entry.accessibility().description(), reason);
             } else {
-                assert!(!entry.accessibility().disabled);
+                assert!(!entry.accessibility().disabled());
             }
         }
     }

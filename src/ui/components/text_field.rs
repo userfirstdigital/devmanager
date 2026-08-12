@@ -158,7 +158,7 @@ impl TextField {
     }
 
     pub fn is_disabled(&self) -> bool {
-        self.interaction.state().disabled
+        self.interaction.state().is_disabled()
     }
 
     pub fn is_read_only(&self) -> bool {
@@ -166,7 +166,7 @@ impl TextField {
     }
 
     pub fn is_focused(&self) -> bool {
-        self.interaction.state().focused
+        self.interaction.state().focused()
     }
 
     pub fn focus_epoch(&self) -> FocusEpoch {
@@ -215,38 +215,40 @@ impl TextField {
         self.validate_value(&value)?;
         self.value = value;
         self.cursor = self.value.chars().count();
-        self.accessibility.value = Some(self.value.clone());
+        self.accessibility.set_value(Some(self.value.clone()));
         Ok(())
     }
 
     pub fn set_read_only(&mut self, read_only: bool) {
         self.read_only = read_only;
-        self.accessibility.read_only = read_only;
+        self.accessibility.set_read_only(read_only);
     }
 
     pub fn set_focus_epoch(&mut self, focus_epoch: FocusEpoch) -> bool {
         let accepted = self.interaction.set_focus_epoch(focus_epoch);
-        self.accessibility.focused = self.interaction.state().focused;
+        self.accessibility
+            .set_focused(self.interaction.state().focused());
         accepted
     }
 
     pub fn set_disabled(&mut self, disabled: bool) {
         self.interaction.set_disabled(disabled);
-        self.accessibility.disabled = self.interaction.state().disabled;
+        self.accessibility
+            .set_disabled(self.interaction.state().is_disabled());
         if disabled {
-            self.accessibility.focused = false;
+            self.accessibility.set_focused(false);
         }
     }
 
     pub fn focus(&mut self) -> bool {
         let focused = self.interaction.focus();
-        self.accessibility.focused = focused;
+        self.accessibility.set_focused(focused);
         focused
     }
 
     pub fn blur(&mut self) {
         self.interaction.blur();
-        self.accessibility.focused = false;
+        self.accessibility.set_focused(false);
     }
 
     pub fn handle_key(
@@ -255,7 +257,8 @@ impl TextField {
         focus_epoch: FocusEpoch,
     ) -> Result<bool, TextFieldError> {
         let state = self.interaction.state();
-        if self.interaction.focus_epoch() != focus_epoch || state.disabled || !state.focused {
+        if self.interaction.focus_epoch() != focus_epoch || state.is_disabled() || !state.focused()
+        {
             return Ok(false);
         }
         match key {
@@ -303,8 +306,8 @@ impl TextField {
     pub fn paste(&mut self, text: &str, focus_epoch: FocusEpoch) -> Result<bool, TextFieldError> {
         let state = self.interaction.state();
         if self.interaction.focus_epoch() != focus_epoch
-            || !state.focused
-            || state.disabled
+            || !state.focused()
+            || state.is_disabled()
             || self.read_only
         {
             return Ok(false);
@@ -313,7 +316,7 @@ impl TextField {
     }
 
     fn insert_text(&mut self, text: &str) -> Result<bool, TextFieldError> {
-        if self.interaction.state().disabled || self.read_only {
+        if self.interaction.state().is_disabled() || self.read_only {
             return Ok(false);
         }
         if text.is_empty() {
@@ -325,7 +328,7 @@ impl TextField {
         next.insert_str(byte_index, text);
         self.value = next;
         self.cursor += text.chars().count();
-        self.accessibility.value = Some(self.value.clone());
+        self.accessibility.set_value(Some(self.value.clone()));
         Ok(!text.is_empty())
     }
 
@@ -381,7 +384,7 @@ impl TextField {
         let end = byte_index_at_scalar(&self.value, self.cursor);
         self.value.replace_range(start..end, "");
         self.cursor -= 1;
-        self.accessibility.value = Some(self.value.clone());
+        self.accessibility.set_value(Some(self.value.clone()));
         true
     }
 
@@ -392,7 +395,7 @@ impl TextField {
         let start = byte_index_at_scalar(&self.value, self.cursor);
         let end = byte_index_at_scalar(&self.value, self.cursor + 1);
         self.value.replace_range(start..end, "");
-        self.accessibility.value = Some(self.value.clone());
+        self.accessibility.set_value(Some(self.value.clone()));
         true
     }
 }

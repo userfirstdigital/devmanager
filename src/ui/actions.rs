@@ -463,7 +463,7 @@ pub fn catalog(selected_task: Option<TaskId>) -> Vec<ActionPresentation> {
                     let mut metadata =
                         AccessibilityMetadata::new(AccessibleRole::Button, descriptor.title)
                             .expect("catalog action title is valid accessibility text");
-                    metadata.disabled = unavailable;
+                    metadata.set_disabled(unavailable);
                     metadata
                         .set_description(if unavailable {
                             NO_SELECTED_TASK
