@@ -4362,6 +4362,15 @@ struct NoFollowOpenedFile {
     _ancestors: Vec<fs::File>,
 }
 
+impl fmt::Debug for NoFollowOpenedFile {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NoFollowOpenedFile")
+            .field("ancestor_count", &self._ancestors.len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl NoFollowOpenedFile {
     fn file_mut(&mut self) -> &mut fs::File {
         &mut self.file
