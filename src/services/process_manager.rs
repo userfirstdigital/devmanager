@@ -2361,18 +2361,22 @@ impl ProcessManager {
         use std::collections::HashMap;
         use std::time::Duration;
 
-        match request.provider_kind() {
-            ProviderKind::ClaudeCode | ProviderKind::Codex => {}
-            ProviderKind::Cursor => return Err(ProviderLaunchError::Unsupported),
-        }
         if request.launch_spec().generation() == 0
             || request.correlation().action_epoch() == 0
-            || matches!(
-                request.launch_spec().mode(),
-                crate::providers::session::ProviderLaunchMode::ResumeExact(_)
-            ) && request.provider_kind() == ProviderKind::Cursor
         {
             return Err(ProviderLaunchError::ZeroProcessId);
+        }
+        // Cursor's stock CLI can be launched as a fresh interactive runtime,
+        // but it does not expose an exact provider-session resume contract.
+        // Keep that limitation typed and visible; never turn it into a fresh
+        // conversation when the caller requested an exact resume.
+        if request.provider_kind() == ProviderKind::Cursor
+            && matches!(
+                request.launch_spec().mode(),
+                crate::providers::session::ProviderLaunchMode::ResumeExact(_)
+            )
+        {
+            return Err(ProviderLaunchError::Unsupported);
         }
         #[cfg(not(windows))]
         {
