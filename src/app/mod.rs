@@ -12080,6 +12080,7 @@ impl NativeShell {
                 .task_action_epoch
                 .saturating_add(1);
             self.server_port_snapshot.active_refresh = None;
+            clear_active_port_state_for_untracked_ports(&mut self.active_port_state, &[]);
             return;
         }
 
@@ -12106,6 +12107,10 @@ impl NativeShell {
                 .saturating_add(1);
             self.server_port_snapshot.refresh_in_flight = false;
             self.server_port_snapshot.active_refresh = None;
+            clear_active_port_state_for_untracked_ports(
+                &mut self.active_port_state,
+                &tracked_ports,
+            );
         }
 
         let should_refresh = self
@@ -12293,30 +12298,11 @@ impl NativeShell {
     }
 
     fn invalidate_server_port_snapshot(&mut self, port: Option<u16>) {
-        if let Some(port) = port {
-            self.server_port_snapshot.statuses.remove(&port);
-            self.server_port_snapshot.authorities.remove(&port);
-            self.server_port_snapshot.probe_failures.remove(&port);
-            if let Some(state) = self.active_port_state.as_mut() {
-                if state.port == port {
-                    state.status = None;
-                    state.last_checked_at = None;
-                    state.refresh_in_flight = true;
-                }
-            }
-        }
-        self.server_port_snapshot.last_checked_at = None;
-        clear_server_port_source_metadata(&mut self.server_port_snapshot);
-        self.server_port_snapshot.refresh_generation = self
-            .server_port_snapshot
-            .refresh_generation
-            .saturating_add(1);
-        self.server_port_snapshot.task_action_epoch = self
-            .server_port_snapshot
-            .task_action_epoch
-            .saturating_add(1);
-        self.server_port_snapshot.refresh_in_flight = false;
-        self.server_port_snapshot.active_refresh = None;
+        invalidate_server_port_snapshot_state(
+            &mut self.server_port_snapshot,
+            &mut self.active_port_state,
+            port,
+        );
     }
 
     fn maybe_auto_submit_ssh_password(
@@ -12638,6 +12624,7 @@ impl NativeShell {
                 local_port_ui_authority(
                     self.server_port_snapshot.authorities.get(&port),
                     active_session.map(|session| &session.runtime),
+                    self.server_port_snapshot.source_freshness_deadline,
                 )
             })
         };
@@ -12709,6 +12696,7 @@ impl NativeShell {
                         port.and_then(|value| self.server_port_snapshot.authorities.get(&value)),
                         port_probe_failure.as_deref(),
                         self.server_port_snapshot.last_checked_at,
+                        self.server_port_snapshot.source_freshness_deadline,
                         self.server_port_snapshot.refresh_in_flight,
                     )),
             prompt_action_label: None,
@@ -13272,6 +13260,7 @@ impl NativeShell {
                     .get(&port)
                     .map(String::as_str),
                 self.server_port_snapshot.last_checked_at,
+                self.server_port_snapshot.source_freshness_deadline,
                 self.server_port_snapshot.refresh_in_flight,
             ) {
                 self.terminal_notice = Some(format!(
@@ -14851,6 +14840,7 @@ impl Render for NativeShell {
                 &runtime_snapshot,
                 &self.current_port_authorities(),
                 &self.current_port_probe_failures(),
+                self.server_port_snapshot.source_freshness_deadline,
             )
         };
         let updater_snapshot = self.updater.snapshot();
@@ -16788,6 +16778,48 @@ fn stage_server_port_refresh(
     }
 }
 
+fn clear_active_port_state_for_untracked_ports(
+    active_port_state: &mut Option<ActivePortState>,
+    tracked_ports: &[u16],
+) {
+    if active_port_state
+        .as_ref()
+        .is_some_and(|state| tracked_ports.binary_search(&state.port).is_err())
+    {
+        *active_port_state = None;
+    }
+}
+
+fn invalidate_server_port_snapshot_state(
+    snapshot: &mut ServerPortSnapshotState,
+    active_port_state: &mut Option<ActivePortState>,
+    port: Option<u16>,
+) {
+    if let Some(port) = port {
+        snapshot.statuses.remove(&port);
+        snapshot.authorities.remove(&port);
+        snapshot.probe_failures.remove(&port);
+        if let Some(state) = active_port_state.as_mut() {
+            if state.port == port {
+                state.status = None;
+                state.last_checked_at = None;
+                state.refresh_in_flight = true;
+            }
+        }
+    } else {
+        snapshot.statuses.clear();
+        snapshot.authorities.clear();
+        snapshot.probe_failures.clear();
+        *active_port_state = None;
+    }
+    snapshot.last_checked_at = None;
+    clear_server_port_source_metadata(snapshot);
+    snapshot.refresh_generation = snapshot.refresh_generation.saturating_add(1);
+    snapshot.task_action_epoch = snapshot.task_action_epoch.saturating_add(1);
+    snapshot.refresh_in_flight = false;
+    snapshot.active_refresh = None;
+}
+
 fn clear_server_port_source_metadata(snapshot: &mut ServerPortSnapshotState) {
     snapshot.source_observed_at = None;
     snapshot.source_freshness_deadline = None;
@@ -16824,7 +16856,9 @@ fn port_refresh_projection_is_fresh_at(projection: &PortRefreshProjection, now: 
     ) else {
         return false;
     };
-    now <= deadline
+    projection.source_publication_sequence > 0
+        && observed_at <= now
+        && now <= deadline
         && now
             .checked_duration_since(observed_at)
             .is_some_and(|age| age <= crate::process::ports::DEFAULT_FREE_PROOF_MAX_AGE)
@@ -17043,7 +17077,8 @@ fn project_port_refresh_result(
     let snapshot = match result {
         Ok(snapshot) => snapshot,
         Err(_)
-            if cached_snapshot.is_exactly_for(ports)
+            if cached_snapshot.publication_sequence() > 0
+                && cached_snapshot.is_exactly_for(ports)
                 && ports.iter().all(|port| {
                     matches!(
                         cached_snapshot.observation(*port),
@@ -17053,10 +17088,27 @@ fn project_port_refresh_result(
         {
             cached_snapshot
         }
-        Err(error) => Arc::new(crate::process::ports::PortInventorySnapshot::probe_failure(
-            ports.iter().copied(),
-            error,
-        )),
+        Err(error) => {
+            // A request-level failure must have been published by the
+            // PortInventory coordinator before it reaches this projection.
+            // Keep an unsequenced local diagnostic for fail-closed rendering,
+            // but do not mint source timestamps or publication identity here.
+            let snapshot = crate::process::ports::PortInventorySnapshot::probe_failure(
+                ports.iter().copied(),
+                error,
+            );
+            let mut projection = project_typed_port_snapshot(
+                &snapshot,
+                ports,
+                no_managed_resource,
+                managed,
+                managed_candidate_ports,
+            );
+            projection.source_observed_at = None;
+            projection.source_freshness_deadline = None;
+            projection.source_publication_sequence = 0;
+            return projection;
+        }
     };
     project_typed_port_snapshot(
         &snapshot,
@@ -17334,6 +17386,7 @@ fn derive_server_indicator_states_with_authority(
     runtime: &RuntimeState,
     authorities: &HashMap<u16, crate::process::ports::PortStatus>,
     probe_failures: &HashMap<u16, String>,
+    source_freshness_deadline: Option<Instant>,
 ) -> HashMap<String, sidebar::ServerIndicatorState> {
     let mut indicators = HashMap::new();
     for project in state.projects() {
@@ -17347,6 +17400,7 @@ fn derive_server_indicator_states_with_authority(
                         command.port,
                         command.port.and_then(|port| authorities.get(&port)),
                         probe_failures,
+                        source_freshness_deadline,
                     ),
                 );
             }
@@ -17528,12 +17582,19 @@ fn derive_server_indicator_with_authority(
     port: Option<u16>,
     authority: Option<&crate::process::ports::PortStatus>,
     probe_failures: &HashMap<u16, String>,
+    source_freshness_deadline: Option<Instant>,
 ) -> sidebar::ServerIndicatorState {
     if session.is_some_and(|session| session.reap_incomplete) {
         return sidebar::ServerIndicatorState::Unknown;
     }
     if session.is_some_and(|session| session.status == SessionStatus::Starting) {
         return sidebar::ServerIndicatorState::Unready;
+    }
+    if session.map_or(true, |session| session.status == SessionStatus::Running)
+        && authority.is_some_and(local_authority_requires_source_freshness)
+        && !local_source_is_fresh(source_freshness_deadline)
+    {
+        return sidebar::ServerIndicatorState::Unknown;
     }
     if authority
         .is_some_and(|authority| authority.kind() == crate::process::ports::PortStatusKind::Unknown)
@@ -17632,9 +17693,15 @@ fn derive_server_indicator_with_authority(
 fn local_port_ui_authority(
     authority: Option<&crate::process::ports::PortStatus>,
     session: Option<&SessionRuntimeState>,
+    source_freshness_deadline: Option<Instant>,
 ) -> Option<PortUiAuthority> {
     if session
         .is_some_and(|session| session.reap_incomplete || session.status != SessionStatus::Running)
+    {
+        return Some(PortUiAuthority::Unknown);
+    }
+    if authority.is_some_and(local_authority_requires_source_freshness)
+        && !local_source_is_fresh(source_freshness_deadline)
     {
         return Some(PortUiAuthority::Unknown);
     }
@@ -17671,12 +17738,14 @@ fn can_open_local_server_url_now(
     authority: Option<&crate::process::ports::PortStatus>,
     probe_failure: Option<&str>,
     last_checked_at: Option<Instant>,
+    source_freshness_deadline: Option<Instant>,
     refresh_in_flight: bool,
 ) -> bool {
     status == SessionStatus::Running
         && !reap_incomplete
         && !refresh_in_flight
         && probe_failure.is_none()
+        && local_source_is_fresh(source_freshness_deadline)
         && last_checked_at.is_some_and(|checked_at| {
             Instant::now()
                 .checked_duration_since(checked_at)
@@ -17688,6 +17757,21 @@ fn can_open_local_server_url_now(
                 || (authority.kind() == crate::process::ports::PortStatusKind::ProvenExternal
                     && local_external_authority_is_proven(authority))
         })
+}
+
+fn local_authority_requires_source_freshness(
+    authority: &crate::process::ports::PortStatus,
+) -> bool {
+    matches!(
+        authority.kind(),
+        crate::process::ports::PortStatusKind::ManagedHealthy
+            | crate::process::ports::PortStatusKind::ManagedUnready
+            | crate::process::ports::PortStatusKind::ProvenExternal
+    )
+}
+
+fn local_source_is_fresh(source_freshness_deadline: Option<Instant>) -> bool {
+    source_freshness_deadline.is_some_and(|deadline| Instant::now() <= deadline)
 }
 
 fn local_managed_authority_is_proven(authority: &crate::process::ports::PortStatus) -> bool {
@@ -17749,6 +17833,7 @@ fn can_open_remote_server_url_now(
 
 fn remote_external_authority_is_proven(authority: &remote::RemotePortAuthority) -> bool {
     authority.kind() == remote::RemotePortAuthorityKind::ProvenExternal
+        && authority.diagnostic.is_none()
         && authority.error.is_none()
         && !authority.listeners.is_empty()
         && authority.listeners.iter().all(|listener| {
@@ -21358,6 +21443,7 @@ mod tests {
             Some(&healthy),
             None,
             Some(Instant::now()),
+            Some(Instant::now() + Duration::from_secs(5)),
             false,
         ));
         assert!(!can_open_local_server_url_now(
@@ -21366,6 +21452,7 @@ mod tests {
             Some(&unready),
             None,
             Some(Instant::now()),
+            Some(Instant::now() + Duration::from_secs(5)),
             false,
         ));
         assert!(!can_open_local_server_url_now(
@@ -21374,6 +21461,7 @@ mod tests {
             Some(&healthy),
             None,
             Some(Instant::now()),
+            Some(Instant::now() + Duration::from_secs(5)),
             true,
         ));
         assert!(!can_open_local_server_url_now(
@@ -21382,6 +21470,7 @@ mod tests {
             None,
             None,
             Some(Instant::now()),
+            Some(Instant::now() + Duration::from_secs(5)),
             false,
         ));
         assert!(!can_open_local_server_url_now(
@@ -21390,6 +21479,7 @@ mod tests {
             Some(&healthy),
             Some("stale listener inventory"),
             Some(Instant::now()),
+            Some(Instant::now() + Duration::from_secs(5)),
             false,
         ));
         assert!(!can_open_local_server_url_now(
@@ -21398,8 +21488,80 @@ mod tests {
             Some(&healthy),
             None,
             Some(Instant::now()),
+            Some(Instant::now() + Duration::from_secs(5)),
             false,
         ));
+    }
+
+    #[test]
+    fn local_url_action_rejects_evidence_past_source_deadline() {
+        let resource =
+            crate::domain::operation::ResourceFence::new(crate::domain::id::ResourceId::new(), 7);
+        let listener = crate::process::ports::ListenerIdentity::with_executable(
+            42,
+            123,
+            std::env::current_exe().expect("test executable"),
+        )
+        .expect("managed listener identity");
+        let healthy = crate::process::ports::PortStatus {
+            port: 5174,
+            resource,
+            kind: crate::process::ports::PortStatusKind::ManagedHealthy,
+            listeners: Arc::from([listener]),
+            error: None,
+        };
+
+        assert!(!can_open_local_server_url_now(
+            SessionStatus::Running,
+            false,
+            Some(&healthy),
+            None,
+            Some(Instant::now() - Duration::from_secs(3)),
+            Some(Instant::now() - Duration::from_secs(1)),
+            false,
+        ));
+    }
+
+    #[test]
+    fn local_indicator_and_terminal_authority_reject_expired_source_deadline() {
+        let resource =
+            crate::domain::operation::ResourceFence::new(crate::domain::id::ResourceId::new(), 7);
+        let listener = crate::process::ports::ListenerIdentity::with_executable(
+            42,
+            123,
+            std::env::current_exe().expect("test executable"),
+        )
+        .expect("managed listener identity");
+        let healthy = crate::process::ports::PortStatus {
+            port: 5174,
+            resource,
+            kind: crate::process::ports::PortStatusKind::ManagedHealthy,
+            listeners: Arc::from([listener]),
+            error: None,
+        };
+        let mut session = SessionRuntimeState::new(
+            "expired-server",
+            PathBuf::new(),
+            SessionDimensions::default(),
+            TerminalBackend::PortablePtyFeedingAlacritty,
+        );
+        session.status = SessionStatus::Running;
+        let expired = Some(Instant::now() - Duration::from_millis(1));
+
+        assert_eq!(
+            derive_server_indicator_with_authority(
+                Some(&session),
+                Some(5174),
+                Some(&healthy),
+                &HashMap::new(),
+                expired,
+            ),
+            sidebar::ServerIndicatorState::Unknown,
+        );
+        assert_eq!(
+            local_port_ui_authority(Some(&healthy), Some(&session), expired),
+            Some(PortUiAuthority::Unknown),
+        );
     }
 
     #[test]
@@ -21431,11 +21593,16 @@ mod tests {
                 Some(5174),
                 Some(&status),
                 &HashMap::new(),
+                Some(Instant::now() + Duration::from_secs(5)),
             ),
             sidebar::ServerIndicatorState::Unready,
         );
         assert_eq!(
-            local_port_ui_authority(Some(&status), None),
+            local_port_ui_authority(
+                Some(&status),
+                None,
+                Some(Instant::now() + Duration::from_secs(5)),
+            ),
             Some(PortUiAuthority::ManagedUnready),
         );
     }
@@ -21560,6 +21727,74 @@ mod tests {
     }
 
     #[test]
+    fn invalidating_all_server_port_evidence_clears_cached_authority_and_active_state() {
+        let port = 5174;
+        let mut snapshot = ServerPortSnapshotState::default();
+        snapshot.statuses.insert(
+            port,
+            PortStatus {
+                port,
+                in_use: true,
+                pid: Some(42),
+                process_name: None,
+            },
+        );
+        snapshot.authorities.insert(
+            port,
+            crate::process::ports::PortStatus {
+                port,
+                resource: crate::domain::operation::ResourceFence::new(
+                    crate::domain::id::ResourceId::new(),
+                    1,
+                ),
+                kind: crate::process::ports::PortStatusKind::ProvenExternal,
+                listeners: Arc::from([]),
+                error: None,
+            },
+        );
+        snapshot
+            .probe_failures
+            .insert(port, "old failure".to_string());
+        snapshot.source_observed_at = Some(Instant::now());
+        snapshot.source_freshness_deadline = Some(Instant::now() + Duration::from_secs(5));
+        snapshot.source_publication_sequence = 7;
+        snapshot.last_checked_at = Some(Instant::now());
+        snapshot.refresh_in_flight = true;
+        let mut active = Some(ActivePortState {
+            command_id: "server-cmd".to_string(),
+            port,
+            status: snapshot.statuses.get(&port).cloned(),
+            last_checked_at: snapshot.last_checked_at,
+            refresh_in_flight: true,
+        });
+
+        invalidate_server_port_snapshot_state(&mut snapshot, &mut active, None);
+
+        assert!(snapshot.statuses.is_empty());
+        assert!(snapshot.authorities.is_empty());
+        assert!(snapshot.probe_failures.is_empty());
+        assert!(snapshot.source_observed_at.is_none());
+        assert!(snapshot.source_freshness_deadline.is_none());
+        assert_eq!(snapshot.source_publication_sequence, 0);
+        assert!(active.is_none());
+    }
+
+    #[test]
+    fn tracked_port_invalidation_clears_removed_active_port_state() {
+        let mut active = Some(ActivePortState {
+            command_id: "server-cmd".to_string(),
+            port: 5174,
+            status: None,
+            last_checked_at: None,
+            refresh_in_flight: false,
+        });
+
+        clear_active_port_state_for_untracked_ports(&mut active, &[5175]);
+
+        assert!(active.is_none());
+    }
+
+    #[test]
     fn occupied_start_notice_preserves_exact_listener_identity() {
         let error = crate::process::ports::PortStartError::Occupied {
             port: 5174,
@@ -21668,9 +21903,43 @@ mod tests {
                 None,
                 Some(5174),
                 Some(&status),
-                &HashMap::new()
+                &HashMap::new(),
+                Some(Instant::now() + Duration::from_secs(5)),
             ),
             sidebar::ServerIndicatorState::External
+        );
+    }
+
+    #[test]
+    fn remote_external_probe_diagnostic_cannot_paint_native_blue() {
+        let status = crate::process::ports::PortStatus {
+            port: 5174,
+            resource: crate::domain::operation::ResourceFence::new(
+                crate::domain::id::ResourceId::new(),
+                1,
+            ),
+            kind: crate::process::ports::PortStatusKind::ProvenExternal,
+            listeners: Arc::from([crate::process::ports::ListenerIdentity::with_executable(
+                42,
+                9,
+                std::env::current_exe().expect("test executable"),
+            )
+            .expect("external listener identity")]),
+            error: None,
+        };
+        let now_epoch_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock after unix epoch")
+            .as_millis()
+            .min(u64::MAX as u128) as u64;
+        let mut authority = remote::RemotePortAuthority::from_rich(&status, now_epoch_ms);
+        authority.diagnostic = Some(remote::RemotePortDiagnostic::ProbeError);
+        authority.publication_sequence = 1;
+
+        assert!(!remote_external_authority_is_proven(&authority));
+        assert_eq!(
+            remote_port_ui_authority(Some(&authority), None),
+            Some(PortUiAuthority::Unknown)
         );
     }
 
@@ -21712,6 +21981,7 @@ mod tests {
                     Some(5174),
                     Some(&status),
                     &HashMap::new(),
+                    Some(Instant::now() + Duration::from_secs(5)),
                 ),
                 expected,
             );
@@ -21725,6 +21995,7 @@ mod tests {
                 Some(5174),
                 Some(&status),
                 &HashMap::new(),
+                Some(Instant::now() + Duration::from_secs(5)),
             ),
             sidebar::ServerIndicatorState::Unknown,
         );
@@ -21768,6 +22039,7 @@ mod tests {
                 Some(port),
                 projection.authorities.get(&port),
                 &HashMap::new(),
+                Some(Instant::now() + Duration::from_secs(5)),
             ),
             sidebar::ServerIndicatorState::Unknown
         );
@@ -21811,6 +22083,57 @@ mod tests {
     }
 
     #[test]
+    fn uncached_refresh_error_preserves_typed_source_metadata_through_remote_authority() {
+        let ports = [43_203, 43_204];
+        let inventory = ports_service::PortInventory::with_scanner_and_timeout(
+            |_ports: &[u16], _cancellation: &crate::process::ports::ScanCancellation| {
+                unreachable!("shutdown admission must not invoke the scanner")
+            },
+            Duration::from_millis(50),
+        );
+        inventory.shutdown();
+
+        let result = inventory.refresh(&ports).map_err(|error| error.to_string());
+        let cached_snapshot = inventory.cached_snapshot();
+        let observed_at = cached_snapshot.observed_at();
+        let deadline = cached_snapshot.freshness_deadline();
+        let sequence = cached_snapshot.publication_sequence();
+        let now = Instant::now();
+        let projection = project_port_refresh_result(
+            result,
+            cached_snapshot,
+            &ports,
+            crate::domain::operation::ResourceFence::new(crate::domain::id::ResourceId::new(), 0),
+            &HashMap::new(),
+            &std::collections::HashSet::from(ports),
+        );
+
+        assert!(sequence > 0);
+        assert_eq!(projection.source_observed_at, Some(observed_at));
+        assert_eq!(projection.source_freshness_deadline, Some(deadline));
+        assert_eq!(projection.source_publication_sequence, sequence);
+        for port in ports {
+            let authority = projection.authorities.get(&port).expect("port authority");
+            assert_eq!(
+                authority.kind(),
+                crate::process::ports::PortStatusKind::ProbeError
+            );
+            let remote = remote::RemotePortAuthority::from_rich_with_source_metadata(
+                authority,
+                instant_to_epoch_ms(observed_at, now, now_epoch_ms()),
+                instant_to_epoch_ms(deadline, now, now_epoch_ms()),
+            )
+            .with_snapshot_metadata(sequence, 0, 0);
+            assert_eq!(remote.kind(), remote::RemotePortAuthorityKind::ProbeError);
+            assert_eq!(
+                remote.diagnostic,
+                Some(remote::RemotePortDiagnostic::ProbeError)
+            );
+            assert!(remote.is_fresh_at(now_epoch_ms()));
+        }
+    }
+
+    #[test]
     fn dialog_delayed_expired_port_projection_is_rejected_and_rescans() {
         let observed_at = Instant::now() - Duration::from_secs(2);
         let projection = PortRefreshProjection {
@@ -21823,6 +22146,32 @@ mod tests {
             &projection,
             Instant::now()
         ));
+    }
+
+    #[test]
+    fn unsequenced_port_refresh_projection_is_not_fresh() {
+        let now = Instant::now();
+        let projection = PortRefreshProjection {
+            source_observed_at: Some(now - Duration::from_millis(1)),
+            source_freshness_deadline: Some(now + Duration::from_secs(5)),
+            source_publication_sequence: 0,
+            ..PortRefreshProjection::default()
+        };
+
+        assert!(!port_refresh_projection_is_fresh_at(&projection, now));
+    }
+
+    #[test]
+    fn future_observed_port_refresh_projection_is_not_fresh() {
+        let now = Instant::now();
+        let projection = PortRefreshProjection {
+            source_observed_at: Some(now + Duration::from_millis(1)),
+            source_freshness_deadline: Some(now + Duration::from_secs(5)),
+            source_publication_sequence: 1,
+            ..PortRefreshProjection::default()
+        };
+
+        assert!(!port_refresh_projection_is_fresh_at(&projection, now));
     }
 
     #[test]
@@ -21884,6 +22233,7 @@ mod tests {
                 Some(5174),
                 Some(&authority),
                 &probe_failures,
+                Some(Instant::now() + Duration::from_secs(5)),
             ),
             sidebar::ServerIndicatorState::Unknown
         );

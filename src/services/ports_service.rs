@@ -146,6 +146,7 @@ struct PendingScan {
 #[derive(Debug)]
 struct CoordinatorState {
     pending: Option<PendingScan>,
+    active_ports: Vec<u16>,
     active_waiters: Vec<Arc<ScanWaiter>>,
     active_cancellation: Option<ScanCancellation>,
     worker_active: bool,
@@ -241,6 +242,7 @@ impl PortInventory {
                 scan_timeout: scan_timeout.max(Duration::from_millis(1)),
                 coordinator: Mutex::new(CoordinatorState {
                     pending: None,
+                    active_ports: Vec::new(),
                     active_waiters: Vec::new(),
                     active_cancellation: None,
                     worker_active: false,
@@ -258,6 +260,35 @@ impl PortInventory {
             .read()
             .expect("port inventory cache lock")
             .clone()
+    }
+
+    fn request_failure_cancellation(&self) -> ScanCancellation {
+        let deadline = Instant::now()
+            .checked_add(self.inner.scan_timeout)
+            .unwrap_or_else(Instant::now);
+        ScanCancellation::new(deadline)
+    }
+
+    fn publish_typed_request_failure(
+        &self,
+        ports: &[u16],
+        detail: impl Into<String>,
+        cancellation: &ScanCancellation,
+    ) {
+        let sequence = next_publication_sequence(&self.inner);
+        let snapshot = typed_failure_snapshot(ports, detail, cancellation, sequence);
+        let _ = self.publish_if_newer(snapshot);
+    }
+
+    fn cached_snapshot_is_typed_failure(snapshot: &PortInventorySnapshot, ports: &[u16]) -> bool {
+        snapshot.publication_sequence() > 0
+            && snapshot.is_exactly_for(ports)
+            && ports.iter().all(|port| {
+                matches!(
+                    snapshot.observation(*port),
+                    Some(PortObservation::ProbeError(_))
+                )
+            })
     }
 
     /// Compatibility publication hook for existing callers. Sequenced
@@ -302,8 +333,20 @@ impl PortInventory {
     /// Request a scan without doing any listener or process work on the
     /// caller. Only one pending request is retained; all waiters coalesced
     /// into that slot receive the newest request's exact result.
-    pub fn request_scan(&self, ports: &[u16]) -> Result<PortScanRequest, PortScanError> {
-        let ports = normalize_scan_ports(ports)?;
+    pub fn request_scan(&self, requested_ports: &[u16]) -> Result<PortScanRequest, PortScanError> {
+        let ports = match normalize_scan_ports(requested_ports) {
+            Ok(ports) => ports,
+            Err(error) => {
+                let cancellation = self.request_failure_cancellation();
+                self.publish_typed_request_failure(
+                    requested_ports,
+                    error.to_string(),
+                    &cancellation,
+                );
+                return Err(error);
+            }
+        };
+        let failure_ports = ports.clone();
         let waiter = Arc::new(ScanWaiter::new());
         let mut previous_worker = None;
         {
@@ -313,7 +356,14 @@ impl PortInventory {
                 .lock()
                 .expect("port inventory coordinator lock");
             if state.shutdown {
-                return Err(PortScanError::Shutdown);
+                let error = PortScanError::Shutdown;
+                let cancellation = self.request_failure_cancellation();
+                self.publish_typed_request_failure(
+                    &failure_ports,
+                    error.to_string(),
+                    &cancellation,
+                );
+                return Err(error);
             }
             let queued_waiters = state.active_waiters.len()
                 + state
@@ -321,10 +371,17 @@ impl PortInventory {
                     .as_ref()
                     .map_or(0, |pending| pending.waiters.len());
             if queued_waiters >= MAX_SCAN_WAITERS {
-                return Err(PortScanError::QueueFull {
+                let error = PortScanError::QueueFull {
                     actual: queued_waiters.saturating_add(1),
                     max: MAX_SCAN_WAITERS,
-                });
+                };
+                let cancellation = self.request_failure_cancellation();
+                self.publish_typed_request_failure(
+                    &failure_ports,
+                    error.to_string(),
+                    &cancellation,
+                );
+                return Err(error);
             }
             if let Some(pending) = state.pending.as_mut() {
                 pending.ports = ports;
@@ -353,9 +410,14 @@ impl PortInventory {
                     Err(error) => {
                         let error =
                             PortScanError::Scan(format!("could not start scan worker: {error}"));
-                        waiter.complete(Err(error.clone()));
                         state.worker_active = false;
                         state.pending = None;
+                        publish_worker_spawn_failure_before_waiter_completion(
+                            self,
+                            &failure_ports,
+                            error.clone(),
+                            |error| waiter.complete(Err(error)),
+                        );
                         return Err(error);
                     }
                 }
@@ -372,13 +434,32 @@ impl PortInventory {
     /// considered for publication. The cache is never reread or merged into
     /// this return value.
     pub fn refresh(&self, ports: &[u16]) -> Result<Arc<PortInventorySnapshot>, String> {
+        let failure_cancellation = self.request_failure_cancellation();
         let request = self
             .request_scan(ports)
             .map_err(|error| error.to_string())?;
         match request.wait(self.inner.scan_timeout) {
             Ok(snapshot) => Ok(snapshot),
-            Err(PortScanError::Scan(error)) => Err(error),
-            Err(error) => Err(error.to_string()),
+            Err(error) => {
+                let cached = self.cached_snapshot();
+                let coordinator_published_terminal_failure = match &error {
+                    PortScanError::Shutdown | PortScanError::Cancelled => true,
+                    _ => false,
+                };
+                if !coordinator_published_terminal_failure
+                    && !Self::cached_snapshot_is_typed_failure(&cached, ports)
+                {
+                    self.publish_typed_request_failure(
+                        ports,
+                        error.to_string(),
+                        &failure_cancellation,
+                    );
+                }
+                match error {
+                    PortScanError::Scan(error) => Err(error),
+                    error => Err(error.to_string()),
+                }
+            }
         }
     }
 
@@ -431,8 +512,27 @@ impl PortInventory {
                 .lock()
                 .expect("port inventory coordinator lock");
             state.shutdown = true;
-            if let Some(cancellation) = state.active_cancellation.as_ref() {
+            let active_cancellation = state.active_cancellation.clone();
+            if let Some(cancellation) = active_cancellation.as_ref() {
                 cancellation.cancel();
+            }
+            let active_ports = std::mem::take(&mut state.active_ports);
+            if active_cancellation.is_some() || !state.active_waiters.is_empty() {
+                let cancellation =
+                    active_cancellation.unwrap_or_else(|| self.request_failure_cancellation());
+                self.publish_typed_request_failure(
+                    &active_ports,
+                    PortScanError::Shutdown.to_string(),
+                    &cancellation,
+                );
+            }
+            if let Some(pending) = state.pending.as_ref() {
+                let cancellation = self.request_failure_cancellation();
+                self.publish_typed_request_failure(
+                    &pending.ports,
+                    PortScanError::Shutdown.to_string(),
+                    &cancellation,
+                );
             }
             let active_waiters = std::mem::take(&mut state.active_waiters);
             let pending_waiters = state
@@ -458,6 +558,17 @@ impl PortInventory {
             }
         }
     }
+}
+
+fn publish_worker_spawn_failure_before_waiter_completion(
+    inventory: &PortInventory,
+    ports: &[u16],
+    error: PortScanError,
+    complete: impl FnOnce(PortScanError),
+) {
+    let cancellation = inventory.request_failure_cancellation();
+    inventory.publish_typed_request_failure(ports, error.to_string(), &cancellation);
+    complete(error);
 }
 
 impl Drop for PortInventoryInner {
@@ -609,6 +720,15 @@ fn execute_scan(
                         worker: Some(worker),
                     };
                 }
+                let failure = typed_failure_snapshot(
+                    &failure_ports,
+                    PortScanError::Cancelled.to_string(),
+                    &cancellation,
+                    sequence,
+                );
+                if let Some(inner) = weak_inner.upgrade() {
+                    let _ = inner_publish_snapshot(&inner, failure);
+                }
                 return ScanExecution {
                     result: Err(PortScanError::Cancelled),
                     worker: Some(worker),
@@ -638,6 +758,16 @@ fn execute_scan(
                     let failure = typed_failure_snapshot(
                         &failure_ports,
                         "listener inventory scan timed out",
+                        &cancellation,
+                        sequence,
+                    );
+                    if let Some(inner) = weak_inner.upgrade() {
+                        let _ = inner_publish_snapshot(&inner, failure);
+                    }
+                } else {
+                    let failure = typed_failure_snapshot(
+                        &failure_ports,
+                        PortScanError::Cancelled.to_string(),
                         &cancellation,
                         sequence,
                     );
@@ -729,6 +859,7 @@ fn run_inventory_worker(weak_inner: Weak<PortInventoryInner>) {
                     return;
                 }
                 if let Some(pending) = state.pending.take() {
+                    state.active_ports = pending.ports.clone();
                     state.active_waiters = pending.waiters.clone();
                     let cancellation = ScanCancellation::new(Instant::now() + inner.scan_timeout);
                     state.active_cancellation = Some(cancellation.clone());
@@ -765,6 +896,7 @@ fn run_inventory_worker(weak_inner: Weak<PortInventoryInner>) {
             .coordinator
             .lock()
             .expect("port inventory coordinator lock");
+        state.active_ports.clear();
         state.active_waiters.clear();
         state.active_cancellation = None;
         if state.shutdown {
@@ -1205,8 +1337,10 @@ pub fn get_port_conflicts(config: &AppConfig) -> Vec<PortConflict> {
 
 #[cfg(test)]
 mod tests {
-    use super::get_port_conflicts;
+    use super::{get_port_conflicts, publish_worker_spawn_failure_before_waiter_completion};
     use crate::models::{AppConfig, Project, ProjectFolder, RunCommand};
+    use crate::process::ports::{PortObservation, PortScanError};
+    use crate::services::ports_service::PortInventory;
 
     #[test]
     fn duplicate_ports_are_reported_once() {
@@ -1261,5 +1395,31 @@ mod tests {
         assert_eq!(conflicts.len(), 1);
         assert_eq!(conflicts[0].port, 3000);
         assert_eq!(conflicts[0].commands.len(), 2);
+    }
+
+    #[test]
+    fn worker_spawn_failure_publishes_before_waiter_completion() {
+        let inventory = PortInventory::new();
+        let ports = [43_151];
+        let error = PortScanError::Scan("worker unavailable".to_string());
+        let mut snapshot_at_completion = None;
+
+        publish_worker_spawn_failure_before_waiter_completion(
+            &inventory,
+            &ports,
+            error.clone(),
+            |completed_error| {
+                assert_eq!(completed_error, error);
+                snapshot_at_completion = Some(inventory.cached_snapshot());
+            },
+        );
+
+        let snapshot = snapshot_at_completion.expect("waiter completion callback");
+        assert!(snapshot.publication_sequence() > 0);
+        assert_eq!(snapshot.requested_ports(), ports.as_slice());
+        assert!(matches!(
+            snapshot.observation(ports[0]),
+            Some(PortObservation::ProbeError(_))
+        ));
     }
 }

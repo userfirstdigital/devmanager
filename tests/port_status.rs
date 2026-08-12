@@ -202,6 +202,34 @@ fn starting_resource_is_orange_even_before_a_listener_appears() {
 }
 
 #[test]
+fn shutdown_refresh_publishes_sequenced_typed_failure_snapshot() {
+    let inventory = PortInventory::with_scanner_and_timeout(
+        |_ports: &[u16], _cancellation: &ScanCancellation| {
+            unreachable!("shutdown admission must not invoke the scanner")
+        },
+        Duration::from_millis(50),
+    );
+    let ports = [43_107, 43_108];
+
+    inventory.shutdown();
+    let error = inventory
+        .refresh(&ports)
+        .expect_err("shutdown admission should fail");
+    assert!(error.contains("shut down"));
+
+    let snapshot = inventory.cached_snapshot();
+    assert!(snapshot.is_exactly_for(&ports));
+    assert!(snapshot.publication_sequence() > 0);
+    assert!(snapshot.freshness_deadline() >= snapshot.observed_at());
+    for port in ports {
+        assert!(matches!(
+            snapshot.observation(port),
+            Some(PortObservation::ProbeError(_))
+        ));
+    }
+}
+
+#[test]
 fn stale_starting_observation_remains_orange_with_probe_detail() {
     let resource = fence(111, 1);
     let (registry, _) = registry_with_root(resource, 11_111, 1_111);
@@ -1537,6 +1565,109 @@ fn port_inventory_timeout_cancels_scan_and_shutdown_rejects_new_work() {
 }
 
 #[test]
+fn port_inventory_cancelled_scan_publishes_sequenced_typed_failure() {
+    let started = Arc::new(AtomicBool::new(false));
+    let source_metadata = Arc::new(Mutex::new(None::<(Instant, Instant)>));
+    let scanner = {
+        let started = started.clone();
+        let source_metadata = source_metadata.clone();
+        move |ports: &[u16], cancellation: &ScanCancellation| {
+            started.store(true, Ordering::SeqCst);
+            *source_metadata.lock().unwrap() =
+                Some((cancellation.observed_at(), cancellation.deadline()));
+            while !cancellation.is_cancelled() {
+                thread::sleep(Duration::from_millis(2));
+            }
+            assert_eq!(ports, [43_014]);
+            Err("scanner noticed cancellation".to_string())
+        }
+    };
+    let inventory = PortInventory::with_scanner_and_timeout(scanner, Duration::from_secs(1));
+    let request = inventory.request_scan(&[43_014]).expect("scan request");
+    for _ in 0..200 {
+        if started.load(Ordering::SeqCst) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    assert!(started.load(Ordering::SeqCst));
+
+    inventory.cancel_active_scan();
+    assert_eq!(
+        request.wait(Duration::from_secs(1)),
+        Err(PortScanError::Cancelled)
+    );
+
+    let snapshot = inventory.cached_snapshot();
+    let (observed_at, deadline) = source_metadata
+        .lock()
+        .unwrap()
+        .as_ref()
+        .copied()
+        .expect("scanner source metadata");
+    assert!(snapshot.is_exactly_for(&[43_014]));
+    assert!(snapshot.publication_sequence() > 0);
+    assert_eq!(snapshot.observed_at(), observed_at);
+    assert_eq!(snapshot.freshness_deadline(), deadline);
+    assert!(snapshot.observed_at() <= Instant::now());
+    assert!(matches!(
+        snapshot.observation(43_014),
+        Some(PortObservation::ProbeError(detail)) if detail.contains("cancelled")
+    ));
+    inventory.shutdown();
+}
+
+#[test]
+fn port_inventory_shutdown_publishes_active_failure_with_admission_metadata() {
+    let started = Arc::new(AtomicBool::new(false));
+    let source_metadata = Arc::new(Mutex::new(None::<(Instant, Instant)>));
+    let scanner = {
+        let started = started.clone();
+        let source_metadata = source_metadata.clone();
+        move |_ports: &[u16], cancellation: &ScanCancellation| {
+            started.store(true, Ordering::SeqCst);
+            *source_metadata.lock().unwrap() =
+                Some((cancellation.observed_at(), cancellation.deadline()));
+            while !cancellation.is_cancelled() {
+                thread::sleep(Duration::from_millis(2));
+            }
+            Err("scanner stopped".to_string())
+        }
+    };
+    let inventory = PortInventory::with_scanner_and_timeout(scanner, Duration::from_secs(1));
+    let request = inventory.request_scan(&[43_015]).expect("active request");
+    for _ in 0..200 {
+        if started.load(Ordering::SeqCst) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    assert!(started.load(Ordering::SeqCst));
+
+    inventory.shutdown();
+    assert_eq!(
+        request.wait(Duration::from_secs(1)),
+        Err(PortScanError::Shutdown)
+    );
+
+    let (observed_at, deadline) = source_metadata
+        .lock()
+        .unwrap()
+        .as_ref()
+        .copied()
+        .expect("scanner source metadata");
+    let snapshot = inventory.cached_snapshot();
+    assert!(snapshot.is_exactly_for(&[43_015]));
+    assert!(snapshot.publication_sequence() > 0);
+    assert_eq!(snapshot.observed_at(), observed_at);
+    assert_eq!(snapshot.freshness_deadline(), deadline);
+    assert!(matches!(
+        snapshot.observation(43_015),
+        Some(PortObservation::ProbeError(detail)) if detail.contains("shut down")
+    ));
+}
+
+#[test]
 fn port_inventory_shutdown_completes_active_and_pending_requests() {
     let started = Arc::new(AtomicBool::new(false));
     let scanner = {
@@ -1569,6 +1700,15 @@ fn port_inventory_shutdown_completes_active_and_pending_requests() {
         pending.wait(Duration::from_secs(1)),
         Err(PortScanError::Shutdown)
     );
+    let snapshot = inventory.cached_snapshot();
+    assert!(snapshot.is_exactly_for(&[43_016]));
+    assert!(snapshot.publication_sequence() > 0);
+    assert!(snapshot.observed_at() <= Instant::now());
+    assert!(snapshot.freshness_deadline() >= snapshot.observed_at());
+    assert!(matches!(
+        snapshot.observation(43_016),
+        Some(PortObservation::ProbeError(detail)) if detail.contains("shut down")
+    ));
     assert!(matches!(
         inventory.request_scan(&[43_017]),
         Err(PortScanError::Shutdown)

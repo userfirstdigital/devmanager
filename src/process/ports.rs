@@ -127,6 +127,7 @@ fn bounded_sanitized_detail(detail: &str) -> String {
 /// projection can retain or display the detail. The result intentionally
 /// normalizes whitespace so the same native error has one stable rendering.
 pub(crate) fn sanitize_port_detail(detail: &str) -> String {
+    let detail = redact_path_spans(detail);
     let mut redacted = Vec::new();
     let mut pending_secret_values = 0usize;
     for token in detail.split_whitespace() {
@@ -146,6 +147,50 @@ pub(crate) fn sanitize_port_detail(detail: &str) -> String {
         redacted.push(redact_port_detail_token(token));
     }
     redacted.join(" ")
+}
+
+/// Redact a complete absolute path span before whitespace normalization. A
+/// path may contain spaces, so token-by-token redaction can otherwise leave a
+/// trailing filename or directory component visible. Once an absolute path
+/// starts, the remainder of the host diagnostic is intentionally suppressed;
+/// probe detail is advisory and must never become a path disclosure channel.
+fn redact_path_spans(detail: &str) -> String {
+    let Some(start) = detail
+        .char_indices()
+        .find_map(|(index, _)| is_absolute_path_start(detail, index).then_some(index))
+    else {
+        return detail.to_string();
+    };
+
+    let mut redacted = String::with_capacity(start + "[redacted path]".len());
+    redacted.push_str(&detail[..start]);
+    redacted.push_str("[redacted path]");
+    redacted
+}
+
+fn is_absolute_path_start(detail: &str, index: usize) -> bool {
+    let previous = detail[..index].chars().next_back();
+    if previous.is_some_and(|character| {
+        character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
+    }) {
+        return false;
+    }
+
+    let tail = &detail[index..];
+    let bytes = tail.as_bytes();
+    ["file://", "http://", "https://", "ws://", "wss://"]
+        .iter()
+        .any(|prefix| {
+            tail.get(..prefix.len())
+                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix))
+        })
+        || (bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'/' | b'\\'))
+        || bytes.starts_with(b"//")
+        || bytes.starts_with(b"\\\\")
+        || bytes.first() == Some(&b'/')
 }
 
 fn secret_value_tokens_to_redact(token: &str) -> usize {
@@ -2130,5 +2175,27 @@ mod authority_tests {
         )
         .with_publication_sequence(3);
         assert!(!first.same_authoritative_listener_snapshot(&stale, now, deadline));
+    }
+
+    #[test]
+    fn sanitizer_redacts_whitespace_containing_path_spans_before_tokenization() {
+        let detail = r"listener probe failed at C:\Users\alice\private file.txt: access denied";
+
+        let redacted = sanitize_port_detail(detail);
+
+        assert!(redacted.contains("[redacted path]"));
+        assert!(!redacted.contains("C:\\Users\\alice"));
+        assert!(!redacted.contains("file.txt"));
+    }
+
+    #[test]
+    fn sanitizer_handles_non_ascii_before_url_path_without_panicking() {
+        let detail = "listener probe failed 🚀🚀 https://example.com/private file.txt";
+
+        let redacted = std::panic::catch_unwind(|| sanitize_port_detail(detail))
+            .expect("diagnostic redaction must not panic on UTF-8");
+
+        assert!(redacted.contains("[redacted path]"));
+        assert!(!redacted.contains("https://example.com"));
     }
 }
