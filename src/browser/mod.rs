@@ -2,8 +2,10 @@ mod annotations;
 mod attachments;
 mod automation;
 mod commands;
+mod conformance;
 pub mod domain;
 mod downloads;
+mod generation;
 mod projection;
 mod surface;
 mod gateway;
@@ -17,6 +19,7 @@ pub mod protocol;
 mod provider;
 mod recipes;
 mod recording;
+mod service;
 mod recording_coordinator;
 mod recording_ipc;
 mod recording_mcp;
@@ -28,6 +31,7 @@ mod replay_repair;
 mod replay_secrets;
 mod resources;
 mod storage;
+mod teardown;
 mod workflow_mcp;
 
 pub(crate) use annotations::redacted_browser_annotation;
@@ -56,6 +60,18 @@ pub use automation::{
     BrowserRuntimeTarget, BrowserScreenshotMode, BrowserSemanticElement, BrowserSemanticSnapshot,
     BrowserSnapshotSummary, BrowserTelemetryBuffer, BrowserUploadResult, BrowserWaitCondition,
     BrowserWaitResult, MAX_BROWSER_ACTIONS, MAX_BROWSER_JOURNAL_ENTRIES, REDACTED_VALUE,
+};
+pub use conformance::{
+    browser_fixture_root, hold_authenticated_provider_launch, real_provider_launch_is_forbidden,
+    validate_browser_fixture_site, BrowserFixtureAction, BrowserFixtureCase,
+    BrowserFixtureRecoveryCase, BrowserFixtureValidation, BrowserFixtureValidationError,
+    BrowserProviderArm, BrowserProviderE2EHold, BrowserProviderHoldRecord, BROWSER_E2E_SCHEMA_VERSION,
+    BROWSER_E2E_VERIFICATION_TOKEN, BROWSER_FIXTURE_CASES,
+};
+pub use generation::{
+    BrowserGenerationError, BrowserGenerationTicket, BrowserTaskArtifact, BrowserTaskArtifactKind,
+    BrowserTaskGenerationAuthority, BrowserWorkflowKind, MAX_BROWSER_GENERATION_CONTEXTS,
+    MAX_BROWSER_GENERATION_QUEUE,
 };
 pub use commands::{
     browser_command_channel, browser_lifecycle_control, browser_operation_target_tab_id,
@@ -144,6 +160,14 @@ pub use recording::{
     MAX_BROWSER_RECORDING_INPUTS,
 };
 pub use recording_coordinator::{BrowserUserChromeCapture, BrowserWorkflowCoordinator};
+pub use service::{
+    reject_serialized_secrets, BrowserRepairProposal, BrowserSecretPlaceholder, BrowserTaskService,
+    BrowserTaskServiceError,
+};
+pub use teardown::{
+    BrowserRecoveryCause, BrowserRecoveryController, BrowserRecoveryError, BrowserRecoveryOutcome,
+    BrowserTeardownStage, BROWSER_TEARDOWN_STAGE_COUNT,
+};
 pub(crate) use recording_ipc::{
     browser_page_origin_from_url, BrowserPageRecordingIngress, BrowserPageRecordingSubmit,
     BrowserPageRecordingTransport, BrowserPageRecordingTransportFailureKind,
