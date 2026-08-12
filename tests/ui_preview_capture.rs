@@ -5,16 +5,19 @@ use devmanager::ui::preview::{
 use devmanager::ui::preview_capture::{
     active_capture_thread_count, capture_contract, cleanup_output_after_deadline,
     encode_bgra_png_atomic, receive_first_frame, run_cancellable_stage, settle_capture_result,
-    settle_capture_with_cleanup, CaptureCleanupOperation, CaptureColorFormat, CaptureDeadline,
-    CaptureGeneration, CaptureReport, CaptureSetting, PreviewCaptureError,
-    CLEANUP_DIAGNOSTIC_TRUNCATION_MARKER, FIRST_FRAME_DEADLINE, MAX_CLEANUP_DIAGNOSTIC_BYTES,
+    settle_capture_result_with_authority, settle_capture_with_cleanup, CaptureCleanupOperation,
+    CaptureColorFormat, CaptureDeadline, CaptureGeneration, CaptureOutputAuthority, CaptureReport,
+    CaptureSetting, PreviewCaptureError, PublishedOutput, CLEANUP_DIAGNOSTIC_TRUNCATION_MARKER,
+    FIRST_FRAME_DEADLINE, MAX_CLEANUP_DIAGNOSTIC_BYTES,
 };
 use image::GenericImageView;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{mpsc, Mutex, MutexGuard, OnceLock};
+use std::sync::{mpsc, Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
+#[cfg(windows)]
+use std::time::Instant;
 use tempfile::{tempdir, TempDir};
 
 const FIXTURE_JSON: &str = r#"{
@@ -39,6 +42,19 @@ fn temporary_policy() -> (TempDir, PreviewPathPolicy) {
     fs::create_dir_all(&output_root).expect("output root");
     let policy = PreviewPathPolicy::new(&fixture_root, &output_root, root.path().join("temp"));
     (root, policy)
+}
+
+#[cfg(windows)]
+fn open_retained_output_handle(path: &Path) -> std::fs::File {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .access_mode(0x8000_0000 | 0x4000_0000 | 0x0001_0000)
+        .share_mode(0x0000_0001 | 0x0000_0002 | 0x0000_0004);
+    options.open(path).expect("retained output handle")
 }
 
 fn write_fixture(policy: &PreviewPathPolicy) -> PathBuf {
@@ -703,6 +719,33 @@ fn preview_capture_new_external_readers_cancel_and_retain_unresolved_ownership()
 }
 
 #[test]
+fn preview_capture_new_external_join_does_not_cancel_readers_before_natural_exit() {
+    let script = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("scripts/native-next/Capture-UiPreviews.ps1"),
+    )
+    .expect("preview capture script");
+    let start = script
+        .find("function Join-PreviewExternalLaunchBounded")
+        .expect("external join helper");
+    let end = script[start..]
+        .find("function Invoke-PreviewExternalCommand")
+        .map(|offset| start + offset)
+        .expect("external join helper end");
+    let join = &script[start..end];
+    let process = join
+        .find("Join-PreviewProcessBounded")
+        .expect("process join");
+    let cancel = join
+        .find("$Launch.ReaderCancellation.Cancel()")
+        .expect("reader cancellation fallback");
+    assert!(
+        process < cancel,
+        "reader cancellation must only be a post-termination fallback so normal stdout receipts can drain"
+    );
+}
+
+#[test]
 fn preview_capture_new_inherited_pipe_descendant_regression_is_job_owned() {
     let script = fs::read_to_string(
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -963,6 +1006,260 @@ fn preview_capture_new_rust_fixture_scanner_covers_exact_boundary_and_8k_continu
             "fixture scanner adversary must cover {marker}"
         );
     }
+}
+
+#[test]
+fn preview_capture_new_deadline_settlement_uses_attempt_retained_output_handle() {
+    let source = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/ui/preview_capture.rs"),
+    )
+    .expect("preview capture source");
+    for marker in [
+        "retain_published_output",
+        "take_published_output",
+        "cleanup_retained_published_output",
+        "DeadlineExceeded",
+    ] {
+        assert!(
+            source.contains(marker),
+            "deadline settlement must provide {marker}"
+        );
+    }
+    let cleanup_start = source
+        .find("fn cleanup_authorized_output_after_deadline")
+        .expect("authorized cleanup helper");
+    let cleanup_end = source[cleanup_start..]
+        .find("fn preserve_capture_error_after_authorized_cleanup")
+        .map(|offset| cleanup_start + offset)
+        .expect("authorized cleanup helper end");
+    let cleanup = &source[cleanup_start..cleanup_end];
+    assert!(
+        cleanup.contains("take_published_output")
+            && cleanup.contains("cleanup_retained_published_output"),
+        "authorized deadline cleanup must settle the attempt-owned handle"
+    );
+    assert!(
+        !cleanup.contains("let _ = (authority, deadline)"),
+        "authorized deadline cleanup must not discard its retained authority"
+    );
+}
+
+#[test]
+fn preview_capture_new_script_requires_child_publication_receipt_before_output_open() {
+    let script = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("scripts/native-next/Capture-UiPreviews.ps1"),
+    )
+    .expect("preview capture script");
+    for marker in [
+        "PreviewPublicationReceipt",
+        "RedirectOutput",
+        "Read-PreviewPublicationReceipt",
+        "Assert-PreviewOutputMatchesPublicationReceipt",
+    ] {
+        assert!(
+            script.contains(marker),
+            "child-to-script output identity handoff must provide {marker}"
+        );
+    }
+    let start = script
+        .find("function Invoke-TrustedPreview")
+        .expect("regular preview invocation");
+    let end = script[start..]
+        .find("function Start-TrustedPreview")
+        .map(|offset| start + offset)
+        .expect("regular preview invocation end");
+    let invoke = &script[start..end];
+    assert!(
+        invoke.contains("Read-PreviewPublicationReceipt")
+            && script.contains("Assert-PreviewOutputMatchesPublicationReceipt"),
+        "regular capture must consume and later correlate the current child receipt before trusting output"
+    );
+    let open = script
+        .find("$outputAuthority = Open-PreviewOutputAuthority")
+        .expect("regular output authority");
+    let receipt = script[open..]
+        .find("Assert-PreviewOutputMatchesPublicationReceipt")
+        .map(|offset| open + offset)
+        .expect("output receipt correlation");
+    let manifest = script[open..]
+        .find("[void]$manifest.Add([pscustomobject]@{")
+        .map(|offset| open + offset)
+        .expect("manifest publication");
+    assert!(
+        receipt < manifest,
+        "the retained output handle must match the Rust publication receipt before manifest publication"
+    );
+}
+
+#[test]
+fn preview_capture_new_failed_publication_retains_source_handle_until_cleanup() {
+    let source = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/ui/preview_capture.rs"),
+    )
+    .expect("preview capture source");
+    let start = source
+        .find("let published = PublishedOutput::from_handle(file)?")
+        .expect("published output construction");
+    let end = source[start..]
+        .find("temp.committed = true")
+        .map(|offset| start + offset)
+        .expect("publication commit");
+    let publication = &source[start..end];
+    let retained = publication
+        .find("temp.final_output = Some(published)")
+        .expect("attempt must retain its source handle");
+    let publish = publication
+        .find("atomic_publish_temp(")
+        .expect("publication operation");
+    assert!(
+        retained < publish,
+        "failed publication cleanup must retain the source handle before the publication operation can fail"
+    );
+    assert!(
+        publication.contains("final_output_identity")
+            && source.contains("delete_published_output_by_handle"),
+        "failed publication cleanup must retain identity and use handle-owned deletion"
+    );
+    assert!(
+        publication.contains("temp.temp_removed = true")
+            && !publication.contains("temp.temp_removed = matches!"),
+        "after publication is attempted, cleanup must not re-resolve a replaceable temporary name"
+    );
+}
+
+#[test]
+fn preview_capture_new_publication_transfers_one_cleanup_owner_before_receipt_io() {
+    let source = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/ui/preview_capture.rs"),
+    )
+    .expect("preview capture source");
+    let start = source
+        .find("let published = PublishedOutput::from_handle(file)?")
+        .expect("published output construction");
+    let end = source[start..]
+        .find("temp.committed = true")
+        .map(|offset| start + offset)
+        .expect("publication commit");
+    let publication = &source[start..end];
+    let transfer = publication
+        .find("temp.final_output.take()")
+        .expect("publication must transfer the exact handle to the authority");
+    let retain = publication
+        .find("authority.try_retain_published_output")
+        .expect("publication owner transfer");
+    let receipt = publication
+        .find("write_preview_publication_receipt(&authority)")
+        .expect("receipt must use the retained publication owner");
+    assert!(transfer < retain && retain < receipt);
+    assert!(
+        !publication.contains(".try_clone()"),
+        "receipt publication must not leave a second cleanup owner"
+    );
+    assert!(
+        source.contains("has_retained_published_output"),
+        "TempOutput drop must recognize an authority-owned publication"
+    );
+}
+
+#[test]
+fn preview_capture_new_retained_cleanup_uses_bounded_owned_reaper() {
+    let source = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/ui/preview_capture.rs"),
+    )
+    .expect("preview capture source");
+    let start = source
+        .find("fn cleanup_retained_published_output")
+        .expect("retained cleanup helper");
+    let end = source[start..]
+        .find("/// Deadline cleanup for a validated capture request")
+        .map(|offset| start + offset)
+        .expect("retained cleanup helper end");
+    let cleanup = &source[start..end];
+    for marker in [
+        "spawn_cleanup_worker",
+        "wait_for_worker_result",
+        "cleanup reaper",
+        "retained published output",
+    ] {
+        assert!(
+            cleanup.contains(marker),
+            "bounded cleanup must provide {marker}"
+        );
+    }
+    assert!(!cleanup.contains("let _ = deadline"));
+    assert!(
+        cleanup.find("spawn_cleanup_worker") < cleanup.find("delete_published_output_by_handle"),
+        "the handle delete must run only inside the owned reaper"
+    );
+}
+
+#[test]
+fn preview_script_preserves_primary_failure_and_composes_cleanup_failure() {
+    let script = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("scripts/native-next/Capture-UiPreviews.ps1"),
+    )
+    .expect("preview capture script");
+    for marker in [
+        "New-PreviewComposedFailure",
+        "PreviewPrimaryCode",
+        "PreviewCleanupCode",
+        "cleanup failure remains secondary",
+    ] {
+        assert!(
+            script.contains(marker),
+            "PowerShell failure composition must provide {marker}"
+        );
+    }
+    let convert = script
+        .find("function ConvertTo-PreviewSafeDiagnostic")
+        .expect("safe diagnostics helper");
+    let invoke = script
+        .find("function Invoke-PreviewExternalCommand")
+        .expect("external command helper");
+    assert!(
+        script[convert..invoke].contains("PreviewPrimaryCode")
+            && script[convert..invoke].contains("PreviewCleanupCode"),
+        "safe diagnostics must retain both fixed primary and cleanup codes"
+    );
+}
+
+#[test]
+fn preview_script_registers_launch_owner_before_pipe_readers_and_makes_join_idempotent() {
+    let script = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("scripts/native-next/Capture-UiPreviews.ps1"),
+    )
+    .expect("preview capture script");
+    let start = script
+        .find("function Start-TrustedPreview")
+        .expect("trusted launch helper");
+    let end = script[start..]
+        .find("function Get-PngDimensions")
+        .map(|offset| start + offset)
+        .expect("trusted launch helper end");
+    let launch = &script[start..end];
+    assert!(
+        launch.contains("CleanupOwner = 'active-preview-process'")
+            && launch.contains("activePreviewProcesses.Add($launch)"),
+        "launch ownership must be established before reader setup"
+    );
+    assert!(
+        launch.find("activePreviewProcesses.Add($launch)")
+            < launch
+                .find("$launch.StdoutTask =")
+                .expect("stdout reader setup"),
+        "reader setup failures must remain owned by the active launch"
+    );
+    let join = script
+        .find("function Join-PreviewExternalLaunchBounded")
+        .expect("external join helper");
+    assert!(
+        script[join..].contains("Test-PreviewLaunchSettled")
+            && script[join..].contains("CleanupOwner = 'released'"),
+        "a second cleanup call must not dispose the same job/readers twice"
+    );
 }
 
 #[test]
@@ -1315,6 +1612,223 @@ fn run_preview_artifact_validation(binary: &std::path::Path) -> std::process::Ou
         .arg(output_root)
         .output()
         .expect("PowerShell must run the preview artifact validator")
+}
+
+#[cfg(windows)]
+fn run_preview_windows_runtime_probe(body: &str) -> std::process::Output {
+    use base64::Engine as _;
+
+    let script_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("scripts/native-next/Capture-UiPreviews.ps1");
+    let script_literal = script_path.to_string_lossy().replace('\'', "''");
+    let command = format!(
+        r#"
+$scriptPath = '{script_literal}'
+$source = [IO.File]::ReadAllText($scriptPath)
+$nativeStart = $source.IndexOf('using System;', [StringComparison]::Ordinal)
+$nativeEnd = $source.IndexOf("'@", $nativeStart, [StringComparison]::Ordinal)
+if ($nativeStart -lt 0 -or $nativeEnd -le $nativeStart) {{ throw 'preview-native-test-source-missing' }}
+Add-Type -TypeDefinition $source.Substring($nativeStart, $nativeEnd - $nativeStart)
+$MAX_PREVIEW_RECEIPT_BYTES = 1048576
+$MAX_PREVIEW_PNG_BYTES = 134217728
+$PREVIEW_HASH_CHUNK_BYTES = 65536
+$PREVIEW_IO_DEADLINE_SECONDS = 30
+$PreviewEnvironmentAllowlist = @('SystemRoot', 'WINDIR', 'PATH', 'TEMP', 'TMP', 'USERPROFILE')
+$tokens = $null
+$parseErrors = $null
+$ast = [Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$parseErrors)
+$wanted = @(
+    'Assert-PreviewDeadline',
+    'Assert-PreviewDirectoryAuthorityStable',
+    'Close-PreviewDirectoryAuthorityChain',
+    'Get-PreviewDirectoryChain',
+    'New-PreviewProcessStartInfo',
+    'Open-PreviewArtifactRelative',
+    'Open-PreviewDirectoryAuthorityChain',
+    'Open-PreviewDirectoryNoFollow',
+    'Open-PreviewOutputAuthority',
+    'Read-PreviewPublicationReceipt',
+    'Assert-PreviewOutputMatchesPublicationReceipt'
+)
+$definitions = @($ast.FindAll({
+    param($node)
+    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $wanted -contains $node.Name
+}, $true))
+if ($definitions.Count -ne $wanted.Count) {{ throw 'preview-runtime-test-functions-missing' }}
+foreach ($name in $wanted) {{
+    $definition = $definitions | Where-Object Name -eq $name | Select-Object -First 1
+    . ([scriptblock]::Create($definition.Extent.Text))
+}}
+{body}
+"#,
+        script_literal = script_literal,
+        body = body
+    );
+    let mut utf16 = Vec::with_capacity(command.len() * 2);
+    for unit in command.encode_utf16() {
+        utf16.extend_from_slice(&unit.to_le_bytes());
+    }
+    let encoded = base64::engine::general_purpose::STANDARD.encode(utf16);
+    Command::new("pwsh")
+        .args(["-NoLogo", "-NoProfile", "-NonInteractive"])
+        .arg("-EncodedCommand")
+        .arg(encoded)
+        .output()
+        .expect("PowerShell must run the Windows preview runtime probe")
+}
+
+#[cfg(windows)]
+#[test]
+fn preview_script_runtime_rejects_receipt_failure_mismatch_and_final_name_swap() {
+    let output = run_preview_windows_runtime_probe(
+        r#"
+function Expect-PreviewRuntimeCode {
+    param([scriptblock]$Action, [string]$Code)
+    try {
+        & $Action | Out-Null
+        throw "accepted:$Code"
+    } catch {
+        if ($_.Exception.Message -ne $Code) { throw }
+    }
+}
+
+Expect-PreviewRuntimeCode {
+    Read-PreviewPublicationReceipt -Text ''
+} 'preview.publication-receipt-missing-or-oversized'
+Expect-PreviewRuntimeCode {
+    Read-PreviewPublicationReceipt -Text @(
+        'DEV_MANAGER_PREVIEW_PUBLICATION_RECEIPT_V1 identity=00000000:0000000000000001',
+        'DEV_MANAGER_PREVIEW_PUBLICATION_RECEIPT_V1 identity=00000000:0000000000000002'
+    ) -join "`n"
+} 'preview.publication-receipt-missing-or-ambiguous'
+
+$root = Join-Path ([IO.Path]::GetTempPath()) ('devmanager-preview-receipt-' + [Guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $root -Force | Out-Null
+$directory = $null
+$authority = $null
+try {
+    $directory = Open-PreviewDirectoryAuthorityChain -Path $root
+    $outputPath = Join-Path $root 'capture.png'
+    [IO.File]::WriteAllBytes($outputPath, [byte[]](1, 2, 3, 4))
+    $authority = Open-PreviewOutputAuthority -Path $outputPath -ParentAuthority $directory -Deadline ([DateTime]::UtcNow.AddSeconds(5))
+    $identity = ([DevManagerPreviewArtifactNative]::Identity($authority.Stream.SafeFileHandle)).ToLowerInvariant()
+    $valid = Read-PreviewPublicationReceipt -Text "DEV_MANAGER_PREVIEW_PUBLICATION_RECEIPT_V1 identity=$identity`n"
+    Assert-PreviewOutputMatchesPublicationReceipt -Authority $authority -Receipt $valid -Deadline ([DateTime]::UtcNow.AddSeconds(5))
+    $mismatch = [pscustomobject]@{ Identity = '00000000:0000000000000000' }
+    Expect-PreviewRuntimeCode {
+        Assert-PreviewOutputMatchesPublicationReceipt -Authority $authority -Receipt $mismatch -Deadline ([DateTime]::UtcNow.AddSeconds(5))
+    } 'preview.output.publication-identity-mismatch'
+
+    $replacement = Join-Path $root 'replacement.png'
+    [IO.File]::WriteAllBytes($replacement, [byte[]](5, 6, 7, 8))
+    $swapBlocked = $false
+    try {
+        [IO.File]::Replace($replacement, $outputPath, $null)
+    } catch {
+        $swapBlocked = $true
+    }
+    if (-not $swapBlocked) {
+        Expect-PreviewRuntimeCode {
+            Assert-PreviewOutputMatchesPublicationReceipt -Authority $authority -Receipt $valid -Deadline ([DateTime]::UtcNow.AddSeconds(5))
+        } 'preview.output.final-name-identity-changed'
+    }
+    Write-Output "preview-receipt-runtime-ok swapBlocked=$swapBlocked"
+} finally {
+    if ($null -ne $authority -and $null -ne $authority.Stream) { $authority.Stream.Dispose() }
+    if ($null -ne $directory) { Close-PreviewDirectoryAuthorityChain -Authority $directory }
+    Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+}
+"#,
+    );
+    assert!(
+        output.status.success(),
+        "receipt runtime authority checks must fail closed:\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("preview-receipt-runtime-ok"),
+        "receipt runtime sentinel missing: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn preview_script_runtime_cancels_and_joins_inherited_pipe_timeout() {
+    let output = run_preview_windows_runtime_probe(
+        r#"
+$startInfo = [Diagnostics.ProcessStartInfo]::new()
+$startInfo.FileName = (Get-Command pwsh -ErrorAction Stop).Source
+$startInfo.UseShellExecute = $false
+$startInfo.CreateNoWindow = $true
+$startInfo.RedirectStandardOutput = $true
+$startInfo.RedirectStandardError = $true
+[void]$startInfo.ArgumentList.Add('-NoLogo')
+[void]$startInfo.ArgumentList.Add('-NoProfile')
+[void]$startInfo.ArgumentList.Add('-NonInteractive')
+[void]$startInfo.ArgumentList.Add('-Command')
+[void]$startInfo.ArgumentList.Add("[Console]::Write('inherited-timeout'); Start-Sleep -Seconds 30")
+$startInfo.Environment.Clear()
+foreach ($name in @('SystemRoot', 'WINDIR', 'PATH', 'TEMP', 'TMP', 'USERPROFILE')) {
+    $value = [Environment]::GetEnvironmentVariable($name)
+    if ($null -ne $value) { $startInfo.Environment[$name] = $value }
+}
+$owned = $null
+$cancellation = [Threading.CancellationTokenSource]::new()
+$stdoutTask = $null
+$stderrTask = $null
+try {
+    $owned = [DevManagerPreviewArtifactNative]::StartProcessInJob($startInfo)
+    $childPid = $owned.Process.Id
+    $stdoutTask = [DevManagerPreviewArtifactNative]::ReadBoundedUtf8Async($owned.StandardOutput, 1048576, $cancellation.Token)
+    $stderrTask = [DevManagerPreviewArtifactNative]::ReadBoundedUtf8Async($owned.StandardError, 1048576, $cancellation.Token)
+    $deadline = [DateTime]::UtcNow.AddSeconds(3)
+    while (-not $owned.Process.HasExited -and [DateTime]::UtcNow -lt $deadline) {
+        Start-Sleep -Milliseconds 10
+    }
+    $cancellation.Cancel()
+    $owned.Terminate()
+    while (-not $owned.Process.HasExited -and [DateTime]::UtcNow -lt $deadline) {
+        Start-Sleep -Milliseconds 10
+    }
+    if (-not $owned.Process.HasExited) { throw 'preview.runtime.process-join-deadline' }
+    $whenAll = [Threading.Tasks.Task]::WhenAll([Threading.Tasks.Task[]]@($stdoutTask, $stderrTask))
+    $remaining = [Math]::Max(1, [int][Math]::Ceiling(($deadline - [DateTime]::UtcNow).TotalMilliseconds))
+    $readerJoined = $false
+    try { $readerJoined = $whenAll.Wait($remaining) } catch { $readerJoined = $whenAll.IsCompleted }
+    if (-not $readerJoined) { throw 'preview.runtime.reader-join-deadline' }
+    try { [void]$whenAll.GetAwaiter().GetResult() } catch { }
+    $owned.Dispose()
+    $owned = $null
+    if ($null -ne (Get-Process -Id $childPid -ErrorAction SilentlyContinue)) {
+        throw 'preview.runtime.job-descendant-remains'
+    }
+    Write-Output 'preview-inherited-pipe-timeout-runtime-ok'
+} finally {
+    try { $cancellation.Cancel() } catch { }
+    if ($null -ne $owned) {
+        try { if (-not $owned.Process.HasExited) { $owned.Terminate() } } catch { }
+        try { $owned.Dispose() } catch { }
+    }
+    $cancellation.Dispose()
+}
+"#,
+    );
+    assert!(
+        output.status.success(),
+        "inherited pipe timeout must cancel, terminate, and join:\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains("preview-inherited-pipe-timeout-runtime-ok"),
+        "pipe timeout runtime sentinel missing: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[cfg(windows)]
@@ -2516,8 +3030,57 @@ fn cleanup_worker_panics_are_reported_without_unwinding_the_capture_caller() {
     ));
 }
 
+#[cfg(windows)]
 #[test]
 fn late_output_cleanup_is_owned_and_leaves_no_residue() {
+    let _capture_guard = capture_test_guard();
+    let (_root, policy) = temporary_policy();
+    let output = policy.output_root().join("late-output.png");
+    fs::write(&output, b"late output").expect("late output fixture");
+    let authority = Arc::new(
+        CaptureOutputAuthority::new(&output, policy.output_root())
+            .expect("output authority should open"),
+    );
+    let published = PublishedOutput::from_handle_for_authority(
+        open_retained_output_handle(&output),
+        &authority,
+    )
+    .expect("published output handle should bind to authority");
+    authority
+        .retain_published_output(published)
+        .expect("published output cleanup ownership");
+
+    let error = settle_capture_result_with_authority(
+        authority,
+        Err(PreviewCaptureError::DeadlineExceeded),
+        CaptureDeadline::from_now(Duration::ZERO),
+    )
+    .expect_err("an expired attempt must preserve its primary deadline error");
+
+    let primary_is_deadline = match &error {
+        PreviewCaptureError::DeadlineExceeded => true,
+        PreviewCaptureError::CleanupFailed(context) => {
+            matches!(context.primary(), PreviewCaptureError::DeadlineExceeded)
+        }
+        _ => false,
+    };
+    assert!(
+        primary_is_deadline,
+        "deadline error was not preserved: {error}"
+    );
+    let cleanup_deadline = Instant::now() + Duration::from_secs(2);
+    while output.exists() && Instant::now() < cleanup_deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        !output.exists(),
+        "retained handle cleanup left a published file"
+    );
+}
+
+#[cfg(not(windows))]
+#[test]
+fn late_output_cleanup_without_retained_handle_is_explicitly_unresolved() {
     let _capture_guard = capture_test_guard();
     let (_root, policy) = temporary_policy();
     let output = policy.output_root().join("late-output.png");
@@ -2534,21 +3097,67 @@ fn late_output_cleanup_is_owned_and_leaves_no_residue() {
         PreviewCaptureError::CleanupFailed(context)
             if matches!(context.secondary(), PreviewCaptureError::DeadlineExceeded)
     ));
-    for _ in 0..20 {
-        active_capture_thread_count();
-        if !output.exists() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
     assert!(
-        !output.exists(),
-        "late output cleanup left a published file"
+        output.exists(),
+        "path-only cleanup must leave unresolved residue visible"
     );
 }
 
+#[cfg(windows)]
 #[test]
 fn final_capture_settlement_fences_a_late_success_and_cleans_output() {
+    let _capture_guard = capture_test_guard();
+    let (_root, policy) = temporary_policy();
+    let output = policy.output_root().join("late-success.png");
+    fs::write(&output, b"late success").expect("late output fixture");
+    let authority = Arc::new(
+        CaptureOutputAuthority::new(&output, policy.output_root())
+            .expect("output authority should open"),
+    );
+    let published = PublishedOutput::from_handle_for_authority(
+        open_retained_output_handle(&output),
+        &authority,
+    )
+    .expect("published output handle should bind to authority");
+    authority
+        .retain_published_output(published)
+        .expect("published output cleanup ownership");
+    let report = CaptureReport {
+        width: 1,
+        height: 1,
+        foreground_before: 1,
+        foreground_after: 1,
+    };
+
+    let deadline = CaptureDeadline::from_now(Duration::from_millis(1));
+    std::thread::sleep(Duration::from_millis(5));
+    let error = settle_capture_result_with_authority(authority, Ok(report), deadline)
+        .expect_err("a success crossing the deadline must be rejected");
+
+    let primary_is_deadline = match &error {
+        PreviewCaptureError::DeadlineExceeded => true,
+        PreviewCaptureError::CleanupFailed(context) => {
+            matches!(context.primary(), PreviewCaptureError::DeadlineExceeded)
+        }
+        _ => false,
+    };
+    assert!(
+        primary_is_deadline,
+        "deadline error was not preserved: {error}"
+    );
+    let cleanup_deadline = Instant::now() + Duration::from_secs(2);
+    while output.exists() && Instant::now() < cleanup_deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        !output.exists(),
+        "late success left a published file behind"
+    );
+}
+
+#[cfg(not(windows))]
+#[test]
+fn final_capture_settlement_without_retained_handle_is_explicitly_unresolved() {
     let _capture_guard = capture_test_guard();
     let (_root, policy) = temporary_policy();
     let output = policy.output_root().join("late-success.png");
@@ -2569,17 +3178,11 @@ fn final_capture_settlement_fences_a_late_success_and_cleans_output() {
         error,
         PreviewCaptureError::CleanupFailed(context)
             if matches!(context.primary(), PreviewCaptureError::DeadlineExceeded)
+                && matches!(context.secondary(), PreviewCaptureError::OutputFailed(_))
     ));
-    for _ in 0..20 {
-        active_capture_thread_count();
-        if !output.exists() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
     assert!(
-        !output.exists(),
-        "late success left a published file behind"
+        output.exists(),
+        "path-only settlement must leave unresolved residue visible"
     );
 }
 

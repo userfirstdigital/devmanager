@@ -348,6 +348,10 @@ pub struct CaptureOutputAuthority {
     ancestor_handles: Vec<Arc<std::os::windows::io::OwnedHandle>>,
     #[cfg(unix)]
     ancestor_handles: Vec<Arc<std::os::fd::OwnedFd>>,
+    /// The exact published inode retained until generation settlement.  A
+    /// deadline supervisor may consume this handle, but it must never
+    /// reconstruct ownership from the final output name.
+    published_output: Arc<Mutex<Option<PublishedOutput>>>,
 }
 
 impl PartialEq for CaptureOutputAuthority {
@@ -380,7 +384,7 @@ struct CaptureFileIdentity {
 /// owned by the attempt until the generation commit succeeds, so cleanup can
 /// never infer ownership from a final name that another process may have
 /// replaced.
-struct PublishedOutput {
+pub struct PublishedOutput {
     final_output_handle: std::fs::File,
     final_output_identity: CaptureFileIdentity,
 }
@@ -392,6 +396,19 @@ impl PublishedOutput {
             final_output_handle,
             final_output_identity,
         })
+    }
+
+    /// Bind an already-retained output handle to the validated authority.
+    /// The final name is checked once while the handle is held; subsequent
+    /// cleanup uses only this handle and never re-resolves the name.
+    #[doc(hidden)]
+    pub fn from_handle_for_authority(
+        final_output_handle: std::fs::File,
+        authority: &CaptureOutputAuthority,
+    ) -> Result<Self, PreviewCaptureError> {
+        let published = Self::from_handle(final_output_handle)?;
+        published.verify_published_output_identity(authority)?;
+        Ok(published)
     }
 
     fn verify_published_output_identity(
@@ -433,6 +450,60 @@ impl PublishedOutput {
             ))
         }
     }
+}
+
+impl CaptureFileIdentity {
+    fn publication_token(&self) -> String {
+        #[cfg(windows)]
+        {
+            return format!("{:08x}:{:016x}", self.volume_serial, self.file_index);
+        }
+        #[cfg(all(not(windows), unix))]
+        {
+            return format!("{:016x}:{:016x}", self.dev, self.inode);
+        }
+        #[cfg(all(not(windows), not(unix)))]
+        {
+            format!("{:032x}:{:016x}", self.modified_nanos, self.length)
+        }
+    }
+}
+
+const PREVIEW_PUBLICATION_RECEIPT_V1: &str = "DEV_MANAGER_PREVIEW_PUBLICATION_RECEIPT_V1";
+
+fn write_preview_publication_receipt(
+    authority: &CaptureOutputAuthority,
+) -> Result<(), PreviewCaptureError> {
+    #[cfg(windows)]
+    {
+        use std::io::Write as _;
+        let retained = authority
+            .published_output
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let published = retained.as_ref().ok_or_else(|| {
+            PreviewCaptureError::OutputFailed(
+                "publication receipt has no retained output owner".into(),
+            )
+        })?;
+        let mut stdout = std::io::stdout().lock();
+        writeln!(
+            stdout,
+            "{PREVIEW_PUBLICATION_RECEIPT_V1} identity={}",
+            published.final_output_identity.publication_token()
+        )
+        .and_then(|_| stdout.flush())
+        .map_err(|error| {
+            PreviewCaptureError::ApplicationFailed(format!(
+                "preview publication receipt could not be delivered ({error})"
+            ))
+        })?;
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = authority;
+    }
+    Ok(())
 }
 
 impl std::fmt::Debug for CaptureOutputAuthority {
@@ -504,6 +575,7 @@ impl CaptureOutputAuthority {
                 root_handle,
                 parent_handle,
                 ancestor_handles,
+                published_output: Arc::new(Mutex::new(None)),
             });
         }
         #[cfg(not(windows))]
@@ -536,6 +608,7 @@ impl CaptureOutputAuthority {
                     root_handle,
                     parent_handle,
                     ancestor_handles,
+                    published_output: Arc::new(Mutex::new(None)),
                 });
             }
             #[cfg(not(unix))]
@@ -555,6 +628,7 @@ impl CaptureOutputAuthority {
                     output_name,
                     root_identity,
                     parent_identity,
+                    published_output: Arc::new(Mutex::new(None)),
                 })
             }
         }
@@ -562,6 +636,49 @@ impl CaptureOutputAuthority {
 
     pub(crate) fn output_path(&self) -> PathBuf {
         self.parent_path.join(&self.output_name)
+    }
+
+    #[doc(hidden)]
+    pub fn retain_published_output(
+        &self,
+        published: PublishedOutput,
+    ) -> Result<(), PreviewCaptureError> {
+        self.try_retain_published_output(published)
+            .map_err(|(_, error)| error)
+    }
+
+    fn try_retain_published_output(
+        &self,
+        published: PublishedOutput,
+    ) -> Result<(), (PublishedOutput, PreviewCaptureError)> {
+        let mut retained = self
+            .published_output
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if retained.is_some() {
+            return Err((
+                published,
+                PreviewCaptureError::OutputFailed(
+                    "published output cleanup ownership was already retained".into(),
+                ),
+            ));
+        }
+        *retained = Some(published);
+        Ok(())
+    }
+
+    fn has_retained_published_output(&self) -> bool {
+        self.published_output
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some()
+    }
+
+    fn take_published_output(&self) -> Option<PublishedOutput> {
+        self.published_output
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
     }
 
     fn verify_parent_descendant(&self) -> Result<(), PreviewCaptureError> {
@@ -2007,6 +2124,80 @@ fn unresolved_published_output_cleanup(
     ))
 }
 
+fn cleanup_retained_published_output(
+    authority: Arc<CaptureOutputAuthority>,
+    published: PublishedOutput,
+    primary: PreviewCaptureError,
+    deadline: CaptureDeadline,
+) -> PreviewCaptureError {
+    // A retained file handle is the ownership proof.  Never perform its
+    // potentially blocking delete synchronously after the caller deadline;
+    // the executor-owned cleanup reaper retains both the handle and authority
+    // until the operation settles, while this ledger keeps residue visible.
+    let outcome = Arc::new(Mutex::new(None));
+    if let Err(error) = register_cleanup_reaper(Arc::clone(&outcome)) {
+        return PreviewCaptureError::CleanupFailed(CleanupFailureContext::from_settlement(
+            primary,
+            "remove output",
+            error,
+        ));
+    }
+    let worker_outcome = Arc::clone(&outcome);
+    let worker_authority = Arc::clone(&authority);
+    let task = match spawn_cleanup_worker(move || {
+        // The closure is the exact cleanup owner after the caller deadline.
+        let result = published.delete_published_output_by_handle(&worker_authority);
+        *worker_outcome
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(result.clone());
+        result
+    }) {
+        Ok(task) => task,
+        Err(error) => {
+            remove_cleanup_reaper(&outcome);
+            return PreviewCaptureError::CleanupFailed(CleanupFailureContext::from_settlement(
+                primary,
+                "remove output",
+                error,
+            ));
+        }
+    };
+
+    let waited = wait_for_worker_result(task, deadline);
+    let settled = cleanup_reaper_outcome(&outcome);
+    match (waited, settled) {
+        (Ok(Ok(())), _) | (Err(PreviewCaptureError::DeadlineExceeded), Some(Ok(()))) => {
+            remove_cleanup_reaper(&outcome);
+            primary
+        }
+        (Ok(Err(error)), _) | (Err(PreviewCaptureError::DeadlineExceeded), Some(Err(error))) => {
+            remove_cleanup_reaper(&outcome);
+            PreviewCaptureError::CleanupFailed(CleanupFailureContext::from_settlement(
+                primary,
+                "remove output",
+                error,
+            ))
+        }
+        (Err(PreviewCaptureError::DeadlineExceeded), None) => {
+            PreviewCaptureError::CleanupFailed(CleanupFailureContext::from_settlement(
+                primary,
+                "remove output",
+                PreviewCaptureError::OutputFailed(
+                    "cleanup reaper retained published output beyond the deadline; residue remains owned".into(),
+                ),
+            ))
+        }
+        (Err(error), _) => {
+            remove_cleanup_reaper(&outcome);
+            PreviewCaptureError::CleanupFailed(CleanupFailureContext::from_settlement(
+                primary,
+                "remove output",
+                error,
+            ))
+        }
+    }
+}
+
 /// Deadline cleanup for a validated capture request deliberately has no
 /// final-name fallback.  The live attempt's `TempOutput` owns the retained
 /// `PublishedOutput` handle and performs the only permitted final cleanup;
@@ -2017,8 +2208,12 @@ fn cleanup_authorized_output_after_deadline(
     primary: PreviewCaptureError,
     deadline: CaptureDeadline,
 ) -> PreviewCaptureError {
-    let _ = (authority, deadline);
-    unresolved_published_output_cleanup(primary, "remove output")
+    match authority.take_published_output() {
+        Some(published) => {
+            cleanup_retained_published_output(authority, published, primary, deadline)
+        }
+        None => unresolved_published_output_cleanup(primary, "remove output"),
+    }
 }
 
 fn preserve_capture_error_after_authorized_cleanup(
@@ -2032,6 +2227,62 @@ fn preserve_capture_error_after_authorized_cleanup(
     } else {
         primary
     }
+}
+
+const MAX_CAPTURE_CLEANUP_REAPERS: usize = 32;
+
+/// A cleanup job that outlives the caller's capture deadline keeps its result
+/// in this bounded ledger.  The executor retains the worker handle; this
+/// ledger makes an unresolved delete visible instead of detaching it.
+struct CleanupReaperLedgerEntry {
+    outcome: Arc<Mutex<Option<Result<(), PreviewCaptureError>>>>,
+}
+
+static CLEANUP_REAPER_LEDGER: OnceLock<Mutex<Vec<CleanupReaperLedgerEntry>>> = OnceLock::new();
+
+fn cleanup_reaper_ledger() -> &'static Mutex<Vec<CleanupReaperLedgerEntry>> {
+    CLEANUP_REAPER_LEDGER.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn register_cleanup_reaper(
+    outcome: Arc<Mutex<Option<Result<(), PreviewCaptureError>>>>,
+) -> Result<(), PreviewCaptureError> {
+    let mut ledger = cleanup_reaper_ledger()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    ledger.retain(|entry| {
+        !matches!(
+            entry
+                .outcome
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_ref(),
+            Some(Ok(()))
+        )
+    });
+    if ledger.len() >= MAX_CAPTURE_CLEANUP_REAPERS {
+        return Err(PreviewCaptureError::OutputFailed(
+            "cleanup reaper ledger is full; output residue is unresolved".into(),
+        ));
+    }
+    ledger.push(CleanupReaperLedgerEntry { outcome });
+    Ok(())
+}
+
+fn remove_cleanup_reaper(outcome: &Arc<Mutex<Option<Result<(), PreviewCaptureError>>>>) {
+    let mut ledger = cleanup_reaper_ledger()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    ledger.retain(|entry| !Arc::ptr_eq(&entry.outcome, outcome));
+}
+
+fn cleanup_reaper_outcome(
+    outcome: &Arc<Mutex<Option<Result<(), PreviewCaptureError>>>>,
+) -> Option<Result<(), PreviewCaptureError>> {
+    outcome
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
 }
 
 fn capture_executor() -> &'static CaptureExecutor {
@@ -2408,6 +2659,23 @@ pub fn settle_capture_result(
     match deadline.remaining() {
         Ok(_) => result,
         Err(error) => Err(cleanup_output_after_deadline(output, error, deadline)),
+    }
+}
+
+/// Settle a capture whose attempt retained its published output handle in the
+/// validated authority.  The generic path-only helper above intentionally
+/// remains fail-closed because it has no inode ownership proof.
+#[doc(hidden)]
+pub fn settle_capture_result_with_authority(
+    authority: Arc<CaptureOutputAuthority>,
+    result: Result<CaptureReport, PreviewCaptureError>,
+    deadline: CaptureDeadline,
+) -> Result<CaptureReport, PreviewCaptureError> {
+    match deadline.remaining() {
+        Ok(_) => result,
+        Err(error) => Err(cleanup_authorized_output_after_deadline(
+            authority, error, deadline,
+        )),
     }
 }
 
@@ -2904,30 +3172,58 @@ fn encode_bgra_png_atomic_sync(
             .map_err(|error| PreviewCaptureError::OutputFailed(error.to_string()))?;
         lease.check(deadline)?;
         lease.publish_with(deadline, || {
+            let retain_for_settlement = publication.is_some();
+            // Enter the publication-attempt state before consuming the source
+            // handle.  If identity inspection itself fails, cleanup must
+            // leave the name unresolved rather than delete a replacement.
+            temp.publication_attempted = true;
+            temp.temp_removed = true;
             let published = PublishedOutput::from_handle(file)?;
-            let publication_result = atomic_publish_temp(
+            temp.final_output = Some(published);
+            atomic_publish_temp(
                 temp_name.as_deref(),
                 &authority,
-                &published.final_output_handle,
+                &temp
+                    .final_output
+                    .as_ref()
+                    .expect("published output retained before publication")
+                    .final_output_handle,
             )
             .map_err(|error| PreviewCaptureError::OutputFailed(error.to_string()))?;
-            temp.final_output = Some(published);
-            temp.renamed = true;
-            temp.temp_removed = matches!(&publication_result, AtomicPublishOutcome::Published);
+            // Once publication has been attempted, the held source handle is
+            // the only cleanup authority.  Do not fall back to removing a
+            // replaceable temporary name after a failed rename; Unix leaves
+            // such residue explicitly unresolved, while Windows deletes the
+            // exact inode by handle.
+            temp.temp_removed = true;
             temp.final_output
                 .as_ref()
                 .expect("published output retained before identity verification")
                 .verify_published_output_identity(&authority)?;
-            if let Some(callback) = publication.take() {
-                callback();
-            }
-            // The callback may publish receipt metadata and external actors
-            // may race the final name while it runs.  Revalidate immediately
-            // before the generation commit can report success.
+            // Revalidate immediately before the child-to-script receipt and
+            // generation result can report success.  The retained output
+            // handle denies final-name write/delete sharing on Windows.
             temp.final_output
                 .as_ref()
                 .expect("published output retained through commit")
                 .verify_published_output_identity(&authority)?;
+            if retain_for_settlement {
+                // Transfer the exact handle before any receipt stdout I/O.
+                // The authority becomes the sole cleanup owner if receipt
+                // delivery fails; TempOutput must not dispose the same inode.
+                let published = temp
+                    .final_output
+                    .take()
+                    .expect("published output retained for ownership transfer");
+                if let Err((published, error)) = authority.try_retain_published_output(published) {
+                    temp.final_output = Some(published);
+                    return Err(error);
+                }
+                write_preview_publication_receipt(&authority)?;
+            }
+            if let Some(callback) = publication.take() {
+                callback();
+            }
             Ok(())
         })?;
         temp.committed = true;
@@ -3317,7 +3613,7 @@ struct TempOutput {
     authority: Arc<CaptureOutputAuthority>,
     cleanup: TempCleanupState,
     final_output: Option<PublishedOutput>,
-    renamed: bool,
+    publication_attempted: bool,
     temp_removed: bool,
     committed: bool,
 }
@@ -3334,7 +3630,7 @@ impl TempOutput {
             authority,
             cleanup,
             final_output: None,
-            renamed: false,
+            publication_attempted: false,
             temp_removed,
             committed: false,
         }
@@ -3366,13 +3662,13 @@ impl Drop for TempOutput {
                 self.temp_removed = true;
             }
         }
-        if self.renamed && !self.committed {
+        if self.publication_attempted && !self.committed {
             if let Some(published) = self.final_output.as_ref() {
                 if let Err(error) = published.delete_published_output_by_handle(&self.authority) {
                     self.cleanup
                         .record_cleanup_failure("remove published output", error);
                 }
-            } else {
+            } else if !self.authority.has_retained_published_output() {
                 self.cleanup.record_cleanup_failure(
                     "remove published output",
                     PreviewCaptureError::OutputFailed("output residue is unresolved".into()),
@@ -4079,7 +4375,13 @@ mod windows_capture_impl {
         })?;
 
         match wait_for_worker_result(task, deadline) {
-            Ok(result) if lease.is_active() => Ok(result),
+            Ok(result) if lease.is_active() => {
+                // A successful generation owns no cleanup obligation after
+                // the result is observed; release the retained handle rather
+                // than keeping an output inode alive for the request lifetime.
+                let _ = authority.take_published_output();
+                Ok(result)
+            }
             Ok(result) => {
                 lease.cancel();
                 let _ = result;

@@ -1264,11 +1264,47 @@ function ConvertTo-PreviewSafeDiagnostic {
     if ($null -eq $ErrorRecord) {
         return 'preview.unknown-failure'
     }
+    $exception = $ErrorRecord.Exception
+    if ($null -ne $exception -and $null -ne $exception.Data) {
+        $primaryCode = if ($exception.Data.Contains('PreviewPrimaryCode')) {
+            [string]$exception.Data['PreviewPrimaryCode']
+        } else { $null }
+        $cleanupCode = if ($exception.Data.Contains('PreviewCleanupCode')) {
+            [string]$exception.Data['PreviewCleanupCode']
+        } else { $null }
+        if ($primaryCode -match '^preview\.[a-z0-9.-]+$' -and
+            $cleanupCode -match '^preview\.[a-z0-9.-]+$') {
+            return "$primaryCode;cleanup=$cleanupCode"
+        }
+        if ($primaryCode -match '^preview\.[a-z0-9.-]+$') {
+            return $primaryCode
+        }
+    }
     $message = [string]$ErrorRecord.Exception.Message
     if ($message -match 'preview\.[a-z0-9.-]+') {
         return $Matches[0]
     }
     'preview.operation-failed'
+}
+
+function New-PreviewComposedFailure {
+    param(
+        [string]$PrimaryCode,
+        [string]$CleanupCode
+    )
+
+    $primary = if ($PrimaryCode -match '^(preview\.[a-z0-9.-]+)') {
+        $Matches[1]
+    } else { 'preview.operation-failed' }
+    $cleanup = if ($CleanupCode -match '^(preview\.[a-z0-9.-]+)') {
+        $Matches[1]
+    } else { 'preview.cleanup.failed' }
+    $exception = [InvalidOperationException]::new('preview.cleanup.composed')
+    # cleanup failure remains secondary: callers can preserve the operation's
+    # primary fixed code while still exposing the cleanup disposition.
+    [void]$exception.Data.Add('PreviewPrimaryCode', $primary)
+    [void]$exception.Data.Add('PreviewCleanupCode', $cleanup)
+    $exception
 }
 
 function New-PreviewProcessStartInfo {
@@ -1382,6 +1418,7 @@ function Add-PreviewExternalCleanupLedger {
     } else {
         $Launch.LedgerEntry.Reason = $Reason
     }
+    $Launch.CleanupOwner = 'cleanup-ledger'
     $Launch.ReaderJoinState = 'unresolved'
 }
 
@@ -1393,6 +1430,7 @@ function Remove-PreviewExternalCleanupLedger {
         $Launch.LedgerEntry = $null
     }
     [void]$activePreviewProcesses.Remove($Launch)
+    $Launch.CleanupOwner = 'released'
 }
 
 function Join-PreviewExternalLaunchBounded {
@@ -1404,21 +1442,29 @@ function Join-PreviewExternalLaunchBounded {
     if ($null -eq $Launch -or $null -eq $Launch.Job) {
         throw 'preview.cleanup.ownership-retained'
     }
-    $cancelFailure = $false
-    try {
-        if ($null -ne $Launch.ReaderCancellation) {
-            $Launch.ReaderCancellation.Cancel()
-        }
-    } catch {
-        $cancelFailure = $true
+    if (Test-PreviewLaunchSettled -Launch $Launch) {
+        # The active owner already disposed the job, readers, and cancellation
+        # source.  Repeated finally/rollback paths must be idempotent.
+        return $true
     }
-
+    $cancelFailure = [bool]$Launch.ReaderCancellationFailed
     $processJoined = $false
     try {
-        [void](Join-PreviewProcessBounded -Launch $Launch -Deadline $Deadline -Label 'external command' -KeepOwnedResources)
+        [void](Join-PreviewProcessBounded -Launch $Launch -Deadline $Deadline -Label 'external command' -KeepOwnedResources -ReaderCancellation $Launch.ReaderCancellation)
         $processJoined = $Launch.JoinState -in @('joined', 'killed-and-joined')
     } catch {
         $processJoined = $false
+    }
+    $cancelFailure = [bool]$Launch.ReaderCancellationFailed
+    if (-not $processJoined -and -not [bool]$Launch.ReaderCancellationRequested) {
+        try {
+            if ($null -ne $Launch.ReaderCancellation) {
+                $Launch.ReaderCancellation.Cancel()
+                $Launch.ReaderCancellationRequested = $true
+            }
+        } catch {
+            $cancelFailure = $true
+        }
     }
     $processWaitJoined = $false
     try {
@@ -1426,11 +1472,40 @@ function Join-PreviewExternalLaunchBounded {
     } catch {
         $processWaitJoined = $false
     }
+    if (-not $processWaitJoined -and -not [bool]$Launch.ReaderCancellationRequested) {
+        try {
+            if ($null -ne $Launch.ReaderCancellation) {
+                $Launch.ReaderCancellation.Cancel()
+                $Launch.ReaderCancellationRequested = $true
+            }
+        } catch {
+            $cancelFailure = $true
+        }
+    }
     $readerJoined = $false
     try {
         $readerJoined = [bool](Join-PreviewReaderTasksBounded -StdoutTask $Launch.StdoutTask -StderrTask $Launch.StderrTask -Deadline $Deadline)
     } catch {
         $readerJoined = $false
+    }
+    if (-not $readerJoined) {
+        if (-not [bool]$Launch.ReaderCancellationRequested) {
+            try {
+                if ($null -ne $Launch.ReaderCancellation) {
+                    $Launch.ReaderCancellation.Cancel()
+                    $Launch.ReaderCancellationRequested = $true
+                }
+            } catch {
+                $cancelFailure = $true
+            }
+        }
+        if (-not $cancelFailure) {
+            try {
+                $readerJoined = [bool](Join-PreviewReaderTasksBounded -StdoutTask $Launch.StdoutTask -StderrTask $Launch.StderrTask -Deadline $Deadline)
+            } catch {
+                $readerJoined = $false
+            }
+        }
     }
     if ($cancelFailure -or -not $processJoined -or -not $processWaitJoined -or -not $readerJoined) {
         Add-PreviewExternalCleanupLedger -Launch $Launch
@@ -1468,6 +1543,9 @@ function Invoke-PreviewExternalCommand {
     $stdoutTask = $null
     $stderrTask = $null
     $processWaitTask = $null
+    $result = $null
+    $primaryCode = $null
+    $cleanupCode = $null
     try {
         $owned = [DevManagerPreviewArtifactNative]::StartProcessInJob($startInfo)
         $launch = [pscustomobject]@{
@@ -1476,11 +1554,14 @@ function Invoke-PreviewExternalCommand {
             JoinState = 'started'
             ExitCode = $null
             Kind = 'external'
+            CleanupOwner = 'active-preview-process'
             ReaderCancellation = [Threading.CancellationTokenSource]::new()
             StdoutTask = $null
             StderrTask = $null
             ProcessWaitTask = $null
             ReaderJoinState = 'pending'
+            ReaderCancellationRequested = $false
+            ReaderCancellationFailed = $false
             ResourcesDisposed = $false
             LedgerEntry = $null
         }
@@ -1531,25 +1612,37 @@ function Invoke-PreviewExternalCommand {
             throw 'preview.command.exit-nonzero'
         }
         $launch.ExitCode = $exitCode
-        [pscustomobject]@{
+        $result = [pscustomobject]@{
             ExitCode = $exitCode
             Output = $stdout
             Error = $null
             AbsoluteDeadline = $Deadline
         }
+    } catch {
+        $primaryCode = ConvertTo-PreviewSafeDiagnostic -ErrorRecord $_
     } finally {
-        $cleanupFailure = $false
         if ($null -ne $launch) {
             try {
                 [void](Join-PreviewExternalLaunchBounded -Launch $launch -Deadline $Deadline)
             } catch {
-                $cleanupFailure = $true
+                $cleanupCode = ConvertTo-PreviewSafeDiagnostic -ErrorRecord $_
+            }
+        } elseif ($null -ne $owned) {
+            try {
+                $owned.Dispose()
+            } catch {
+                $cleanupCode = ConvertTo-PreviewSafeDiagnostic -ErrorRecord $_
             }
         }
-        if ($cleanupFailure) {
-            throw 'preview.cleanup.failed'
-        }
     }
+    if ($null -ne $cleanupCode) {
+        $primaryCode = if ($null -ne $primaryCode) { $primaryCode } else { 'preview.command.cleanup' }
+        throw (New-PreviewComposedFailure -PrimaryCode $primaryCode -CleanupCode $cleanupCode)
+    }
+    if ($null -ne $primaryCode) {
+        throw $primaryCode
+    }
+    $result
 }
 
 function ConvertTo-PreviewSha256 {
@@ -3095,7 +3188,8 @@ function Join-PreviewProcessBounded {
         [object]$Launch,
         [datetime]$Deadline,
         [string]$Label,
-        [switch]$KeepOwnedResources
+        [switch]$KeepOwnedResources,
+        [Threading.CancellationTokenSource]$ReaderCancellation
     )
 
     $process = $Launch.Process
@@ -3113,6 +3207,14 @@ function Join-PreviewProcessBounded {
     }
     $active = $job.ActiveProcessCount()
     if (-not $joined -or $active -gt 0) {
+        if ($null -ne $ReaderCancellation) {
+            try {
+                $ReaderCancellation.Cancel()
+                $Launch.ReaderCancellationRequested = $true
+            } catch {
+                $Launch.ReaderCancellationFailed = $true
+            }
+        }
         try {
             $job.Terminate()
         } catch {
@@ -3365,6 +3467,57 @@ function Wait-PreviewWindowReady {
     throw 'preview window readiness handshake did not complete before its deadline.'
 }
 
+function Read-PreviewPublicationReceipt {
+    param([string]$Text)
+
+    if ([string]::IsNullOrWhiteSpace($Text) -or
+        [Text.Encoding]::UTF8.GetByteCount($Text) -gt $MAX_PREVIEW_RECEIPT_BYTES) {
+        throw 'preview.publication-receipt-missing-or-oversized'
+    }
+    $receipts = [System.Collections.Generic.List[object]]::new()
+    foreach ($line in ($Text -split "`r?`n")) {
+        if ($line -match '^DEV_MANAGER_PREVIEW_PUBLICATION_RECEIPT_V1 identity=(?<identity>[0-9a-f]{8}:[0-9a-f]{16})$') {
+            [void]$receipts.Add([pscustomobject]@{
+                Protocol = 'DEV_MANAGER_PREVIEW_PUBLICATION_RECEIPT_V1'
+                Identity = $Matches['identity'].ToLowerInvariant()
+            })
+        }
+    }
+    if ($receipts.Count -ne 1) {
+        throw 'preview.publication-receipt-missing-or-ambiguous'
+    }
+    $receipts[0]
+}
+
+function Assert-PreviewOutputMatchesPublicationReceipt {
+    param(
+        [object]$Authority,
+        [object]$Receipt,
+        [datetime]$Deadline
+    )
+
+    if ($Deadline -eq [datetime]::MinValue) {
+        $Deadline = New-PreviewIoDeadline
+    }
+    Assert-PreviewDeadline -Deadline $Deadline
+    Assert-PreviewDirectoryAuthorityStable -Authority $Authority.Parent
+    if ($null -eq $Receipt -or
+        [string]$Receipt.Identity -ne ([DevManagerPreviewArtifactNative]::Identity($Authority.Stream.SafeFileHandle)).ToLowerInvariant()) {
+        throw 'preview.output.publication-identity-mismatch'
+    }
+    $name = [IO.Path]::GetFileName($Authority.Path)
+    $reopened = Open-PreviewArtifactRelative -ParentAuthority $Authority.Parent -Name $name
+    try {
+        if ($reopened.FileIdentity -ne $Authority.FileIdentity -or
+            [int64]$reopened.Length -ne [int64]$Authority.Length) {
+            throw 'preview.output.final-name-identity-changed'
+        }
+    } finally {
+        $reopened.Stream.Dispose()
+    }
+    Assert-PreviewDeadline -Deadline $Deadline
+}
+
 function Invoke-TrustedPreview {
     param(
         [object]$ReceiptState,
@@ -3375,10 +3528,41 @@ function Invoke-TrustedPreview {
     )
 
     $launch = Start-TrustedPreview -Path $Path -ReceiptState $ReceiptState -BuildIdentity $BuildIdentity -Arguments $Arguments -Deadline $Deadline
-    [void]$activePreviewProcesses.Add($launch)
-    $script:PreviewLastExitCode = Join-PreviewProcessBounded -Launch $launch -Deadline $Deadline -Label 'regular capture'
-    Close-PreviewLaunchAuthority -Authority $launch.Authority
-    $launch.Authority = $null
+    $primaryCode = $null
+    $cleanupCode = $null
+    try {
+        [void](Join-PreviewExternalLaunchBounded -Launch $launch -Deadline $Deadline)
+        $script:PreviewLastExitCode = $launch.ExitCode
+        if ($script:PreviewLastExitCode -eq 0) {
+            try {
+                $stdout = $launch.StdoutTask.GetAwaiter().GetResult()
+                $launch.PublicationReceipt = Read-PreviewPublicationReceipt -Text $stdout
+                $script:PreviewLastPublicationReceipt = $launch.PublicationReceipt
+            } catch {
+                throw 'preview.publication-receipt-invalid'
+            }
+        } else {
+            $script:PreviewLastPublicationReceipt = $null
+        }
+    } catch {
+        $primaryCode = ConvertTo-PreviewSafeDiagnostic -ErrorRecord $_
+    } finally {
+        if ($null -ne $launch.Authority -and (Test-PreviewLaunchSettled -Launch $launch)) {
+            try {
+                Close-PreviewLaunchAuthority -Authority $launch.Authority
+                $launch.Authority = $null
+            } catch {
+                $cleanupCode = 'preview.cleanup.authority-close-failed'
+            }
+        }
+    }
+    if ($null -ne $cleanupCode) {
+        $primaryCode = if ($null -ne $primaryCode) { $primaryCode } else { 'preview.publication.receipt' }
+        throw (New-PreviewComposedFailure -PrimaryCode $primaryCode -CleanupCode $cleanupCode)
+    }
+    if ($null -ne $primaryCode) {
+        throw $primaryCode
+    }
 }
 
 function Start-TrustedPreview {
@@ -3391,12 +3575,15 @@ function Start-TrustedPreview {
     )
 
     $authority = Open-PreviewLaunchAuthority -Path $Path -ExistingAuthority $script:PreviewArtifactAuthority
+    $owned = $null
     $launch = $null
-    $rollbackError = $null
+    $result = $null
+    $primaryCode = $null
+    $cleanupCode = $null
     try {
         Assert-PreviewLaunchAuthorityStable -Authority $authority -ReceiptState $ReceiptState -BuildIdentity $BuildIdentity -Deadline $Deadline
         Assert-PreviewDeadline -Deadline $Deadline
-        $startInfo = New-PreviewProcessStartInfo -FilePath $authority.Path -Arguments $Arguments -WorkingDirectory $canonicalWorktree -Environment (Get-PreviewToolEnvironment -BuildIdentity $BuildIdentity)
+        $startInfo = New-PreviewProcessStartInfo -FilePath $authority.Path -Arguments $Arguments -WorkingDirectory $canonicalWorktree -Environment (Get-PreviewToolEnvironment -BuildIdentity $BuildIdentity) -RedirectOutput
         $owned = [DevManagerPreviewArtifactNative]::StartProcessInJob($startInfo)
         $launch = [pscustomobject]@{
             Process = $owned.Process
@@ -3404,26 +3591,70 @@ function Start-TrustedPreview {
             Authority = $authority
             JoinState = 'started'
             ReadinessHandshake = 'pending'
+            Kind = 'external'
+            CleanupOwner = 'active-preview-process'
+            ReaderCancellation = [Threading.CancellationTokenSource]::new()
+            StdoutTask = $null
+            StderrTask = $null
+            ProcessWaitTask = $null
+            ReaderJoinState = 'pending'
+            ReaderCancellationRequested = $false
+            ReaderCancellationFailed = $false
             ResourcesDisposed = $false
+            LedgerEntry = $null
         }
+        # Establish the sole process/pipe cleanup owner before any reader
+        # task or receipt stdout I/O can fail.
+        [void]$activePreviewProcesses.Add($launch)
+        $launch.StdoutTask = [DevManagerPreviewArtifactNative]::ReadBoundedUtf8Async(
+            $owned.StandardOutput,
+            $MAX_PREVIEW_RECEIPT_BYTES,
+            $launch.ReaderCancellation.Token)
+        $launch.StderrTask = [DevManagerPreviewArtifactNative]::ReadBoundedUtf8Async(
+            $owned.StandardError,
+            $MAX_PREVIEW_RECEIPT_BYTES,
+            $launch.ReaderCancellation.Token)
+        $launch.ProcessWaitTask = $owned.Process.WaitForExitAsync()
         Assert-PreviewLaunchAuthorityStable -Authority $authority -ReceiptState $ReceiptState -BuildIdentity $BuildIdentity -Deadline $Deadline
-        $launch
+        $result = $launch
         $authority = $null
+    } catch {
+        $primaryCode = ConvertTo-PreviewSafeDiagnostic -ErrorRecord $_
     } finally {
         if ($null -ne $launch -and $null -ne $authority) {
             try {
-                [void](Join-PreviewProcessBounded -Launch $launch -Deadline $Deadline -Label 'launch rollback')
+                if ($launch.Kind -eq 'external') {
+                    [void](Join-PreviewExternalLaunchBounded -Launch $launch -Deadline $Deadline)
+                } else {
+                    [void](Join-PreviewProcessBounded -Launch $launch -Deadline $Deadline -Label 'launch rollback')
+                }
             } catch {
-                $rollbackError = 'preview.cleanup.failed'
+                $cleanupCode = ConvertTo-PreviewSafeDiagnostic -ErrorRecord $_
+            }
+        }
+        if ($null -eq $launch -and $null -ne $owned) {
+            try {
+                $owned.Dispose()
+            } catch {
+                $cleanupCode = ConvertTo-PreviewSafeDiagnostic -ErrorRecord $_
             }
         }
         if ($null -ne $authority) {
-            Close-PreviewLaunchAuthority -Authority $authority
-        }
-        if ($null -ne $rollbackError) {
-            throw $rollbackError
+            try {
+                Close-PreviewLaunchAuthority -Authority $authority
+            } catch {
+                $cleanupCode = 'preview.cleanup.authority-close-failed'
+            }
         }
     }
+    if ($null -ne $cleanupCode) {
+        $primaryCode = if ($null -ne $primaryCode) { $primaryCode } else { 'preview.launch.rollback' }
+        throw (New-PreviewComposedFailure -PrimaryCode $primaryCode -CleanupCode $cleanupCode)
+    }
+    if ($null -ne $primaryCode) {
+        throw $primaryCode
+    }
+    $result
 }
 
 function Get-PngDimensions {
@@ -3509,6 +3740,8 @@ $retainedOutputAuthorities = [System.Collections.Generic.List[object]]::new()
 $activePreviewProcesses = [System.Collections.Generic.List[object]]::new()
 $externalCleanupLedger = [System.Collections.Generic.List[object]]::new()
 $previewDeadline = [datetime]::MinValue
+$script:PreviewPrimaryCode = $null
+$script:PreviewCleanupCode = $null
 try {
     $buildWorktreeAuthority = Open-PreviewDirectoryNoFollow -Path $canonicalWorktree
     $buildTargetRootAuthority = Open-PreviewDirectoryNoFollow -Path $targetRoot
@@ -3669,6 +3902,8 @@ public static class DevManagerPreviewWindow {
         $window = $null
         $exitCode = $null
         $failure = $null
+        $primaryCode = $null
+        $cleanupCode = $null
         $joined = $false
         $outcome = 'probe-failed'
         $holdEvidence = 'probe-lifecycle-failed'
@@ -3676,7 +3911,6 @@ public static class DevManagerPreviewWindow {
         $stateTransitionApplied = $false
         try {
             $launch = Start-TrustedPreview -Path $binary -ReceiptState $artifactReceiptState -BuildIdentity $buildIdentity -Arguments $Arguments -Deadline $Deadline
-            [void]$activePreviewProcesses.Add($launch)
             $probe = $launch.Process
             $readiness = Wait-PreviewWindowReady -Process $probe -Deadline $Deadline
             $window = $readiness.Window
@@ -3697,9 +3931,10 @@ public static class DevManagerPreviewWindow {
                 [DevManagerPreviewWindow]::PostMessage($window, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
                 $stateTransitionApplied = $true
             }
-            # Join-PreviewProcessBounded owns the probe job and applies the
-            # same absolute deadline to natural exit and termination.
-            $exitCode = Join-PreviewProcessBounded -Launch $launch -Deadline $Deadline -Label "isolated $State probe"
+            # The probe uses the same owned readers and absolute deadline as a
+            # regular capture, even though its stdout receipt is not consumed.
+            [void](Join-PreviewExternalLaunchBounded -Launch $launch -Deadline $Deadline)
+            $exitCode = $launch.ExitCode
             $joined = $launch.JoinState -in @('joined', 'killed-and-joined')
             Close-PreviewLaunchAuthority -Authority $launch.Authority
             $launch.Authority = $null
@@ -3720,17 +3955,37 @@ public static class DevManagerPreviewWindow {
                 $holdEvidence = 'output-absent-after-state-transition'
             }
         } catch {
-            $failure = ConvertTo-PreviewSafeDiagnostic -ErrorRecord $_
+            $primaryCode = ConvertTo-PreviewSafeDiagnostic -ErrorRecord $_
         } finally {
             if ($null -ne $launch -and $null -ne $launch.Process -and $launch.JoinState -notin @('joined', 'killed-and-joined')) {
                 try {
-                    [void](Join-PreviewProcessBounded -Launch $launch -Deadline $Deadline -Label "isolated $State probe cleanup")
+                    [void](Join-PreviewExternalLaunchBounded -Launch $launch -Deadline $Deadline)
                 } catch {
                     $holdEvidence = 'preview.cleanup.failed'
-                    $failure = 'preview.cleanup.failed'
+                    $cleanupCode = ConvertTo-PreviewSafeDiagnostic -ErrorRecord $_
                     $outcome = 'probe-failed'
                 }
             }
+            if ($null -ne $launch -and (Test-PreviewLaunchSettled -Launch $launch) -and $null -ne $launch.Authority) {
+                try {
+                    Close-PreviewLaunchAuthority -Authority $launch.Authority
+                    $launch.Authority = $null
+                } catch {
+                    $holdEvidence = 'preview.cleanup.failed'
+                    $cleanupCode = ConvertTo-PreviewSafeDiagnostic -ErrorRecord $_
+                    $outcome = 'probe-failed'
+                }
+            }
+        }
+        if ($null -ne $cleanupCode) {
+            $primaryForOutput = if ($null -ne $primaryCode) { $primaryCode } else { 'preview.window-state.probe' }
+            $failure = ConvertTo-PreviewSafeDiagnostic -ErrorRecord ([System.Management.Automation.ErrorRecord]::new(
+                    (New-PreviewComposedFailure -PrimaryCode $primaryForOutput -CleanupCode $cleanupCode),
+                    'preview.cleanup.composed',
+                    [System.Management.Automation.ErrorCategory]::OperationStopped,
+                    $null))
+        } elseif ($null -ne $primaryCode) {
+            $failure = $primaryCode
         }
         [pscustomobject]@{
             Fixture = 'component-gallery'
@@ -3860,8 +4115,10 @@ public static class DevManagerPreviewWindow {
             }
             try {
                 $validationDeadline = $previewDeadline
+                $publicationReceipt = $script:PreviewLastPublicationReceipt
                 $outputAuthority = Open-PreviewOutputAuthority -Path $output -ParentAuthority $outputRootAuthority -Deadline $validationDeadline
                 [void]$retainedOutputAuthorities.Add($outputAuthority)
+                Assert-PreviewOutputMatchesPublicationReceipt -Authority $outputAuthority -Receipt $publicationReceipt -Deadline $validationDeadline
                 $outputHash = Assert-PreviewOutputAuthorityStable -Authority $outputAuthority -Deadline $validationDeadline
                 $dimensions = Get-PngDimensions -Authority $outputAuthority -Deadline $validationDeadline
                 if ($dimensions.Width -ne 640 -or $dimensions.Height -ne 360) {
@@ -3960,17 +4217,30 @@ public static class DevManagerPreviewWindow {
     }
     Write-Output ("Captured {0} isolated preview page(s)." -f $manifest.Count)
     Write-Output 'Manifest and PNGs are under the process/run-unique native-next evidence root.'
+} catch {
+    $script:PreviewPrimaryCode = ConvertTo-PreviewSafeDiagnostic -ErrorRecord $_
 } finally {
-    Invoke-PreviewFinalCleanup `
-        -Deadline $previewDeadline `
-        -ManifestAuthority $manifestAuthority `
-        -OutputRootAuthority $outputRootAuthority `
-        -RetainedOutputAuthorities $retainedOutputAuthorities `
-        -ArtifactReceiptState $artifactReceiptState `
-        -ArtifactAuthority $artifactAuthority `
-        -BuildIdentity $buildIdentity `
-        -BuildDirectories @($buildTargetRunAuthority, $buildTargetRootAuthority, $buildWorktreeAuthority) `
-        -OldTargetDir $oldTargetDir `
-        -OldBuildJobs $oldBuildJobs `
-        -OldBuildIdentity $oldBuildIdentity
+    try {
+        Invoke-PreviewFinalCleanup `
+            -Deadline $previewDeadline `
+            -ManifestAuthority $manifestAuthority `
+            -OutputRootAuthority $outputRootAuthority `
+            -RetainedOutputAuthorities $retainedOutputAuthorities `
+            -ArtifactReceiptState $artifactReceiptState `
+            -ArtifactAuthority $artifactAuthority `
+            -BuildIdentity $buildIdentity `
+            -BuildDirectories @($buildTargetRunAuthority, $buildTargetRootAuthority, $buildWorktreeAuthority) `
+            -OldTargetDir $oldTargetDir `
+            -OldBuildJobs $oldBuildJobs `
+            -OldBuildIdentity $oldBuildIdentity
+    } catch {
+        $script:PreviewCleanupCode = ConvertTo-PreviewSafeDiagnostic -ErrorRecord $_
+    }
+}
+if ($null -ne $script:PreviewCleanupCode) {
+    $primaryCode = if ($null -ne $script:PreviewPrimaryCode) { $script:PreviewPrimaryCode } else { 'preview.capture.cleanup' }
+    throw (New-PreviewComposedFailure -PrimaryCode $primaryCode -CleanupCode $script:PreviewCleanupCode)
+}
+if ($null -ne $script:PreviewPrimaryCode) {
+    throw $script:PreviewPrimaryCode
 }
