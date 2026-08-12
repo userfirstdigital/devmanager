@@ -2,17 +2,19 @@ use devmanager::providers::capabilities::{
     CapabilitySupport, ProviderCapabilities, ProviderExecutable, ProviderKind,
 };
 use devmanager::providers::conformance::{
-    authenticate_fixture, classify_compatibility, classify_fixture_event, confined_artifact_path,
-    decide_strict_resume, decode_fixture_bytes, dependency_holds, discover_provider_smoke_holds,
+    authenticate_fixture, classify_compatibility, classify_fixture_event,
+    classify_provider_quota_fixture, confined_artifact_path, decide_strict_resume,
+    decode_fixture_bytes, dependency_hold_catalog, dependency_holds, discover_provider_smoke_holds,
     evaluate_provider_smoke, promote_seeded_trace, provider_smoke_environment,
     reject_smoke_sensitive_payload, CompatibilityMode, ConformanceArm, ConformanceError,
     ConformanceHold, ConformanceIndex, DeclaredMetricId, EventDisposition,
     PinnedGenerationContract, ProviderConformanceCaseId, ProviderConformanceLab,
-    ProviderEventClass, ProviderSmokeArm, ProviderSmokeDisposition, ProviderSmokeEvidence,
-    ProviderSmokeHold, ProviderSmokeInvariants, ProviderSmokeRejection, ProviderSmokeRequest,
-    ResumeOutcome, SanitizerRejection, StrictResumeFailure, MAX_CONFORMANCE_ARRAY_ITEMS,
-    MAX_CONFORMANCE_DECODE_BYTES, MAX_CONFORMANCE_DEPTH, MAX_CONFORMANCE_MAP_KEYS,
-    MAX_CONFORMANCE_NODES, MAX_PROVIDER_SMOKE_DEADLINE_MS, PROVIDER_CONFORMANCE_SCHEMA_VERSION,
+    ProviderEventClass, ProviderQuotaFixtureState, ProviderSmokeArm, ProviderSmokeDisposition,
+    ProviderSmokeEvidence, ProviderSmokeHold, ProviderSmokeInvariants, ProviderSmokeRejection,
+    ProviderSmokeRequest, ResumeOutcome, SanitizerRejection, StrictResumeFailure,
+    MAX_CONFORMANCE_ARRAY_ITEMS, MAX_CONFORMANCE_DECODE_BYTES, MAX_CONFORMANCE_DEPTH,
+    MAX_CONFORMANCE_MAP_KEYS, MAX_CONFORMANCE_NODES, MAX_PROVIDER_SMOKE_DEADLINE_MS,
+    PROVIDER_CONFORMANCE_SCHEMA_VERSION,
 };
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -524,36 +526,53 @@ fn identity_and_exact_resume_results_stay_independent() {
 
 #[test]
 fn dependency_holds_are_honest_and_do_not_claim_absent_subsystems() {
-    let holds = dependency_holds();
-    assert_eq!(holds, ConformanceHold::ALL.as_slice());
-    assert!(holds
-        .iter()
-        .any(|hold| *hold == ConformanceHold::ProviderRuntimeSession));
-    assert!(holds
-        .iter()
-        .any(|hold| *hold == ConformanceHold::ProviderJournal));
-    assert!(holds
-        .iter()
-        .any(|hold| *hold == ConformanceHold::ProviderSessionsCompatibilityGate));
-    assert!(holds
-        .iter()
-        .any(|hold| *hold == ConformanceHold::Phase2ConformanceArtifactRunner));
-    assert!(!std::path::Path::new("src/providers/session.rs").exists());
-    assert!(!std::path::Path::new("src/providers/journal.rs").exists());
-    assert!(!std::path::Path::new("tests/provider_sessions.rs").exists());
-    assert!(!std::path::Path::new("src/conformance").exists());
-    assert!(!std::path::Path::new("src/providers/claude.rs").exists());
-    assert!(!std::path::Path::new("src/providers/codex.rs").exists());
-    assert!(!std::path::Path::new("src/providers/cursor.rs").exists());
-    assert!(holds
-        .iter()
-        .any(|hold| *hold == ConformanceHold::ProviderClaudeAdapter));
-    assert!(holds
-        .iter()
-        .any(|hold| *hold == ConformanceHold::ProviderCodexAdapter));
-    assert!(holds
-        .iter()
-        .any(|hold| *hold == ConformanceHold::ProviderCursorAdapter));
+    assert_eq!(dependency_hold_catalog(), ConformanceHold::ALL.as_slice());
+    assert!(std::path::Path::new("src/providers/session.rs").is_file());
+    assert!(std::path::Path::new("src/providers/journal.rs").is_file());
+    assert!(std::path::Path::new("tests/provider_sessions.rs").is_file());
+    assert!(std::path::Path::new("src/providers/conformance.rs").is_file());
+    assert!(std::path::Path::new("src/providers/claude.rs").is_file());
+    assert!(std::path::Path::new("src/providers/codex.rs").is_file());
+    assert!(std::path::Path::new("src/providers/cursor.rs").is_file());
+
+    let root = tempfile::tempdir().unwrap();
+    let empty = root.path().join("empty-worktree");
+    std::fs::create_dir(&empty).unwrap();
+    let empty_holds = dependency_holds(&empty).unwrap();
+    assert!(empty_holds.contains(&ConformanceHold::ProviderRuntimeSession));
+    assert!(empty_holds.contains(&ConformanceHold::ProviderJournal));
+    assert!(empty_holds.contains(&ConformanceHold::ProviderSessionsCompatibilityGate));
+    assert!(empty_holds.contains(&ConformanceHold::Phase2ConformanceArtifactRunner));
+    assert!(empty_holds.contains(&ConformanceHold::ProviderClaudeAdapter));
+    assert!(empty_holds.contains(&ConformanceHold::ProviderCodexAdapter));
+    assert!(empty_holds.contains(&ConformanceHold::ProviderCursorAdapter));
+
+    let present = root.path().join("present-worktree");
+    write_present_provider_sources(&present);
+    let present_holds = dependency_holds(&present).unwrap();
+    assert!(!present_holds.contains(&ConformanceHold::ProviderRuntimeSession));
+    assert!(!present_holds.contains(&ConformanceHold::ProviderJournal));
+    assert!(!present_holds.contains(&ConformanceHold::ProviderSessionsCompatibilityGate));
+    assert!(!present_holds.contains(&ConformanceHold::ProviderClaudeAdapter));
+    assert!(!present_holds.contains(&ConformanceHold::ProviderCodexAdapter));
+    assert!(!present_holds.contains(&ConformanceHold::ProviderCursorAdapter));
+    assert!(present_holds.is_empty());
+}
+
+fn write_present_provider_sources(root: &std::path::Path) {
+    for relative in [
+        "src/providers/session.rs",
+        "src/providers/journal.rs",
+        "src/providers/conformance.rs",
+        "src/providers/claude.rs",
+        "src/providers/codex.rs",
+        "src/providers/cursor.rs",
+        "tests/provider_sessions.rs",
+    ] {
+        let path = root.join(relative);
+        std::fs::create_dir_all(path.parent().expect("parent")).unwrap();
+        std::fs::write(&path, b"// present\n").unwrap();
+    }
 }
 
 #[test]
@@ -1078,4 +1097,57 @@ fn smoke_contract_rejects_unbounded_deadline_inherited_env_and_bodies() {
     let holds = discover_provider_smoke_holds(root.path()).unwrap();
     assert!(holds.contains(&ProviderSmokeHold::FixtureRuntimeUnimplemented));
     assert!(!holds.is_empty());
+}
+
+#[test]
+fn quota_fixture_state_distinguishes_unsupported_from_missing_adapter() {
+    let root = tempfile::tempdir().unwrap();
+    let empty = root.path().join("empty-worktree");
+    std::fs::create_dir(&empty).unwrap();
+    for provider in [
+        ProviderKind::ClaudeCode,
+        ProviderKind::Codex,
+        ProviderKind::Cursor,
+    ] {
+        assert_eq!(
+            classify_provider_quota_fixture(&empty, provider).unwrap(),
+            ProviderQuotaFixtureState::MissingAdapter
+        );
+        assert_eq!(
+            classify_provider_quota_fixture(&empty, provider)
+                .unwrap()
+                .as_str(),
+            "missing_adapter"
+        );
+    }
+
+    let present = root.path().join("present-worktree");
+    write_present_provider_sources(&present);
+    let smoke = discover_provider_smoke_holds(&present).unwrap();
+    assert!(smoke.contains(&ProviderSmokeHold::FixtureRuntimeUnimplemented));
+    assert!(!smoke.contains(&ProviderSmokeHold::Dependency(
+        ConformanceHold::ProviderClaudeAdapter
+    )));
+    assert!(!smoke.contains(&ProviderSmokeHold::Dependency(
+        ConformanceHold::ProviderCodexAdapter
+    )));
+    assert!(!smoke.contains(&ProviderSmokeHold::Dependency(
+        ConformanceHold::ProviderCursorAdapter
+    )));
+    for provider in [
+        ProviderKind::ClaudeCode,
+        ProviderKind::Codex,
+        ProviderKind::Cursor,
+    ] {
+        assert_eq!(
+            classify_provider_quota_fixture(&present, provider).unwrap(),
+            ProviderQuotaFixtureState::Unsupported
+        );
+        assert_eq!(
+            classify_provider_quota_fixture(&present, provider)
+                .unwrap()
+                .as_str(),
+            "unsupported"
+        );
+    }
 }

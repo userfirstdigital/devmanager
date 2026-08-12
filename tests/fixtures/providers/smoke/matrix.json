@@ -54,7 +54,7 @@
         "requiredFixture": "claude/auth_status_required.txt"
       },
       "quota": {
-        "observe": "unknown",
+        "observe": "unsupported",
         "officialProbe": false,
         "record": "unsupported"
       }

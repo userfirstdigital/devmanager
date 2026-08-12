@@ -1580,6 +1580,36 @@ mod authority_seal_tests {
         assert!(!rendered.contains("process_root"));
     }
 
+    #[tokio::test]
+    async fn observe_quota_is_typed_unsupported_without_official_cli_surface() {
+        struct RejectRunner;
+
+        #[async_trait]
+        impl ProviderProbeRunner for RejectRunner {
+            async fn run(
+                &self,
+                _request: crate::providers::adapter::ProviderProbeRequest,
+            ) -> Result<
+                crate::providers::adapter::ProviderProbeResult,
+                crate::providers::adapter::ProviderProbeError,
+            > {
+                Err(crate::providers::adapter::ProviderProbeError::TimedOut)
+            }
+        }
+
+        let adapter = CodexAdapter::new(Arc::new(RejectRunner));
+        let executable = ProviderExecutable::new(r"C:\bin\codex.exe", [0x22; 32])
+            .expect("executable")
+            .open_for_launch()
+            .expect("handle");
+        assert!(matches!(
+            adapter.observe_quota(&executable).await,
+            Err(ProviderError::UnsupportedCapability(
+                ProviderCapability::ObserveQuota
+            ))
+        ));
+    }
+
     #[test]
     fn unused_registry_permit_unregisters_and_cannot_be_forged() {
         let registry = Arc::new(CodexHookRegistry::default());

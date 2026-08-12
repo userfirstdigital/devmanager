@@ -51,7 +51,7 @@ fn cursor_public_adapter_cannot_launch_without_exact_capability() {
 }
 
 #[tokio::test]
-async fn cursor_signals_stop_and_quota_stay_explicitly_unavailable() {
+async fn cursor_signals_stop_and_quota_stay_explicitly_unsupported() {
     let adapter = CursorAdapter::new();
     assert_eq!(
         adapter.cooperative_stop(&ProviderRuntime),
@@ -61,7 +61,12 @@ async fn cursor_signals_stop_and_quota_stay_explicitly_unavailable() {
         .unwrap()
         .open_for_launch()
         .unwrap();
-    assert!(adapter.observe_quota(&executable).await.unwrap().is_none());
+    assert!(matches!(
+        adapter.observe_quota(&executable).await,
+        Err(devmanager::providers::ProviderError::UnsupportedCapability(
+            ProviderCapability::ObserveQuota
+        ))
+    ));
 }
 
 #[tokio::test]

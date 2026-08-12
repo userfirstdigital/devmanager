@@ -3,8 +3,8 @@
 //! This module classifies launch-critical versus enhancement capability, pins
 //! a generation's contract, quarantines unknown or malformed semantic signals,
 //! and records only adapter-declared operational metrics. It does not launch a
-//! provider runtime, own a journal, or stand in for the missing Phase 2
-//! `src/conformance` artifact runner.
+//! provider runtime or own a journal. The fixture artifact runner lives in
+//! this module and remains independent from live provider execution.
 
 use crate::domain::{AgentSessionId, CommandId, ProviderSessionId, TaskId};
 use crate::providers::adapter::MAX_PROVIDER_SIGNAL_BYTES;
@@ -459,7 +459,7 @@ impl ConformanceHold {
                 "tests/provider_sessions.rs is absent; compatibility_ filters cannot run"
             }
             Self::Phase2ConformanceArtifactRunner => {
-                "src/conformance is absent; this lab is not the Phase 2 manifest/trace runner"
+                "src/providers/conformance.rs is absent; the fixture manifest/trace runner is unavailable"
             }
             Self::ProviderClaudeAdapter => {
                 "src/providers/claude.rs is absent; stock Claude sessions are not launched here"
@@ -478,16 +478,84 @@ impl ConformanceHold {
             Self::ProviderRuntimeSession => "src/providers/session.rs",
             Self::ProviderJournal => "src/providers/journal.rs",
             Self::ProviderSessionsCompatibilityGate => "tests/provider_sessions.rs",
-            Self::Phase2ConformanceArtifactRunner => "src/conformance",
+            Self::Phase2ConformanceArtifactRunner => "src/providers/conformance.rs",
             Self::ProviderClaudeAdapter => "src/providers/claude.rs",
             Self::ProviderCodexAdapter => "src/providers/codex.rs",
             Self::ProviderCursorAdapter => "src/providers/cursor.rs",
         }
     }
+
+    const fn adapter_for(provider: ProviderKind) -> Self {
+        match provider {
+            ProviderKind::ClaudeCode => Self::ProviderClaudeAdapter,
+            ProviderKind::Codex => Self::ProviderCodexAdapter,
+            ProviderKind::Cursor => Self::ProviderCursorAdapter,
+        }
+    }
 }
 
-pub fn dependency_holds() -> &'static [ConformanceHold] {
+/// Catalog of hold kinds this lab can report. Presence is discovered from the
+/// worktree; this slice does not claim that every kind is currently absent.
+pub fn dependency_hold_catalog() -> &'static [ConformanceHold] {
     &ConformanceHold::ALL
+}
+
+/// Dependencies whose source files are actually absent under `worktree_root`.
+/// Adapter/runtime holds are omitted once those files exist.
+pub fn dependency_holds(worktree_root: &Path) -> Result<Vec<ConformanceHold>, ConformanceError> {
+    reject_lab_root_form(worktree_root)?;
+    reject_forbidden_root(worktree_root)?;
+    reject_if_reparse(worktree_root)?;
+    let mut holds = Vec::new();
+    for hold in ConformanceHold::ALL {
+        if !smoke_dependency_present(worktree_root, hold)? {
+            holds.push(hold);
+        }
+    }
+    Ok(holds)
+}
+
+/// Fixture-checkable quota surface. This is not a live CLI observation and
+/// never invents a remaining percent or reset time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderQuotaFixtureState {
+    MissingAdapter,
+    Unsupported,
+}
+
+impl ProviderQuotaFixtureState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MissingAdapter => "missing_adapter",
+            Self::Unsupported => "unsupported",
+        }
+    }
+}
+
+/// Distinguish a missing adapter from a present adapter that has no official
+/// local stock-CLI quota command/output in current fixtures.
+pub fn classify_provider_quota_fixture(
+    worktree_root: &Path,
+    provider: ProviderKind,
+) -> Result<ProviderQuotaFixtureState, ConformanceError> {
+    reject_lab_root_form(worktree_root)?;
+    reject_forbidden_root(worktree_root)?;
+    reject_if_reparse(worktree_root)?;
+    let hold = ConformanceHold::adapter_for(provider);
+    if !smoke_dependency_present(worktree_root, hold)? {
+        return Ok(ProviderQuotaFixtureState::MissingAdapter);
+    }
+    // Observation is allowed only when an official stock CLI quota command
+    // and parseable output are represented. Current fixtures have none, so
+    // a present adapter stays typed Unsupported instead of missing/unavailable.
+    let _no_official_surface = official_quota_fixture_path(provider);
+    Ok(ProviderQuotaFixtureState::Unsupported)
+}
+
+fn official_quota_fixture_path(provider: ProviderKind) -> Option<&'static str> {
+    match provider {
+        ProviderKind::ClaudeCode | ProviderKind::Codex | ProviderKind::Cursor => None,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -877,14 +945,9 @@ pub fn provider_smoke_environment() -> BTreeMap<String, String> {
 pub fn discover_provider_smoke_holds(
     worktree_root: &Path,
 ) -> Result<Vec<ProviderSmokeHold>, ConformanceError> {
-    reject_lab_root_form(worktree_root)?;
-    reject_forbidden_root(worktree_root)?;
-    reject_if_reparse(worktree_root)?;
     let mut holds = vec![ProviderSmokeHold::FixtureRuntimeUnimplemented];
-    for hold in ConformanceHold::ALL {
-        if !smoke_dependency_present(worktree_root, hold)? {
-            holds.push(ProviderSmokeHold::Dependency(hold));
-        }
+    for hold in dependency_holds(worktree_root)? {
+        holds.push(ProviderSmokeHold::Dependency(hold));
     }
     Ok(holds)
 }
@@ -955,11 +1018,7 @@ fn smoke_capability_supported(
         return Ok(false);
     }
     for provider in allowlist {
-        let hold = match provider {
-            ProviderKind::ClaudeCode => ConformanceHold::ProviderClaudeAdapter,
-            ProviderKind::Codex => ConformanceHold::ProviderCodexAdapter,
-            ProviderKind::Cursor => ConformanceHold::ProviderCursorAdapter,
-        };
+        let hold = ConformanceHold::adapter_for(*provider);
         if !smoke_dependency_present(worktree_root, hold)? {
             return Ok(false);
         }

@@ -674,7 +674,7 @@ impl ClaudeCodeAdapter {
             build_launch: CapabilitySupport::Supported,
             parse_signal: CapabilitySupport::Unsupported,
             cooperative_stop: CapabilitySupport::Unknown,
-            observe_quota: CapabilitySupport::Unknown,
+            observe_quota: CapabilitySupport::Unsupported,
             evidence: vec![
                 evidence(
                     EvidenceSourceId::ExecutableVersion,
@@ -1005,8 +1005,11 @@ impl ProviderAdapter for ClaudeCodeAdapter {
         &self,
         _executable: &ProviderExecutableHandle,
     ) -> Result<Option<QuotaObservation>, ProviderError> {
-        // No official stock Claude CLI quota/usage surface is wired here.
-        Ok(None)
+        // No official stock Claude CLI quota/usage command is represented by
+        // current fixtures. Do not map that absence to Unavailable.
+        Err(ProviderError::UnsupportedCapability(
+            ProviderCapability::ObserveQuota,
+        ))
     }
 }
 
@@ -1124,7 +1127,22 @@ mod tests {
             CapabilitySupport::Supported
         );
         assert_eq!(capabilities.parse_signal, CapabilitySupport::Unsupported);
+        assert_eq!(capabilities.observe_quota, CapabilitySupport::Unsupported);
         capabilities.validate().expect("auth evidence must match");
+    }
+
+    #[tokio::test]
+    async fn observe_quota_is_typed_unsupported_without_official_cli_surface() {
+        let adapter = ClaudeCodeAdapter::with_clock(FixtureProbeRunner::authenticated(), || {
+            1_700_000_000_100
+        });
+        let executable = fixture_handle();
+        assert!(matches!(
+            adapter.observe_quota(&executable).await,
+            Err(ProviderError::UnsupportedCapability(
+                ProviderCapability::ObserveQuota
+            ))
+        ));
     }
 
     #[tokio::test]
@@ -1331,7 +1349,7 @@ mod tests {
             build_launch: CapabilitySupport::Supported,
             parse_signal: CapabilitySupport::Unsupported,
             cooperative_stop: CapabilitySupport::Unknown,
-            observe_quota: CapabilitySupport::Unknown,
+            observe_quota: CapabilitySupport::Unsupported,
             evidence: vec![],
         };
         ProviderObservation::from_test_parts(

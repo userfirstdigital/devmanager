@@ -2,7 +2,7 @@
 //!
 //! Supported launch is proven only from the pinned interactive default surface.
 //! Exact resume, semantic events, cooperative stop, quota, and auth stay
-//! unavailable unless a provider-native ID and command are both proven.
+//! typed Unsupported unless a provider-native ID and command are both proven.
 //! This adapter never probes Claude/Codex `auth status`, never scrapes local
 //! history, and never infers a conversation id.
 //!
@@ -377,6 +377,12 @@ mod tests {
             CapabilitySupport::Unsupported
         );
         assert_eq!(capabilities.observe_quota, CapabilitySupport::Unsupported);
+        assert!(matches!(
+            adapter.observe_quota(&executable).await,
+            Err(ProviderError::UnsupportedCapability(
+                ProviderCapability::ObserveQuota
+            ))
+        ));
         assert_eq!(capabilities.auth_state, ProviderAuthState::Unknown);
         assert!(capabilities
             .evidence
