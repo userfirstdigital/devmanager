@@ -14,6 +14,7 @@ mod local_actions;
 mod managed;
 mod membership;
 mod persistence;
+mod portal;
 mod publisher;
 mod watcher;
 mod wire;
@@ -55,6 +56,22 @@ pub use persistence::{
     OrganizationHelloRestore, OrganizationStateDocument, OrganizationStateStore,
     OutboxDeliveryState, PersistedOutboxIntent, ORGANIZATION_STATE_FILE_NAME,
     ORGANIZATION_STATE_SCHEMA_VERSION,
+};
+pub use portal::{
+    days_to_ms, hmac_signature, minutes_to_ms, reject_prohibited_fields, validate_iso_timestamp,
+    validate_opaque_id, BoardCardProjection, ConnectHostDto, CreatePromptVersionRequest,
+    EnrollmentPreviewDto, EnrollmentPreviewRequest, EnrollmentViewer, EvidenceImportRequest,
+    EvidenceMetadataBundle, FleetHostDto, FleetLabels, FleetUsageLabels, HostMembershipDto,
+    LiveViewGrant, LocalActionDto, LocalActionReceiptDto, LocalActionReceiptRequest,
+    LocalActionRequestDto, LocalPolicyUnits, LocalTaskProjection,
+    ManagedTaskDto as PortalManagedTaskDto, ManagedTaskLink as PortalManagedTaskLink, MediaBinding,
+    OrgPromptChainDto, OrgPromptChainLinkDto, OrgPromptDiffDto, OrgPromptDto, OrgPromptVersionDto,
+    OrganizationGrant, OrganizationPolicyDto, PortalActionKind, PortalActionRisk,
+    PortalAdapterError, PortalAdmissionStatus, PortalEnrollmentState, PortalGrantAccess, PortalId,
+    PortalManagementClient, PortalMembershipStatus, PortalOrgRole, PortalOutcomeStatus,
+    PortalPromptStatus, PortalRawSharingCeiling, PortalRequestMetadata, PortalUsageSource,
+    PromptChainRequest, PublishPromptRequest, TaskLiveViewDto,
+    TitleConflict as PortalTitleConflict,
 };
 pub use publisher::{OrganizationPublisher, SignedOrganizationEnvelope};
 pub use watcher::{
