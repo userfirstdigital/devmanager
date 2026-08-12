@@ -12,7 +12,10 @@ import {
 } from "../api/types";
 import { EMPTY_WRITER_LEASE } from "../api/types";
 import { useStore } from "../store";
-import type { CapabilityGrant } from "../connect/permissions";
+import {
+  PAIRED_OWNER_ACTIONS,
+  type CapabilityGrant,
+} from "../connect/permissions";
 import { TaskScreen } from "./TaskScreen";
 
 vi.mock("./views/AiSessionView", () => ({
@@ -153,6 +156,7 @@ describe("session slash command integration", () => {
         workspace={workspace("codex")}
         status={{ kind: "open" }}
         onNavigate={() => {}}
+        grant={ownerGrant()}
       />,
     );
 
@@ -196,6 +200,7 @@ describe("session slash command integration", () => {
         workspace={workspace("claude")}
         status={{ kind: "open" }}
         onNavigate={() => {}}
+        grant={ownerGrant()}
       />,
     );
 
@@ -231,6 +236,7 @@ describe("session slash command integration", () => {
         workspace={workspace("codex", "ai-a")}
         status={{ kind: "open" }}
         onNavigate={() => {}}
+        grant={ownerGrant()}
       />,
     );
     await user.click(screen.getByRole("button", { name: /send message/i }));
@@ -241,6 +247,7 @@ describe("session slash command integration", () => {
         workspace={workspace("codex", "ai-b")}
         status={{ kind: "open" }}
         onNavigate={() => {}}
+        grant={ownerGrant("tab:ai-b")}
       />,
     );
     await act(async () => {
@@ -287,6 +294,7 @@ describe("native AI session interactions", () => {
         workspace={workspace("claude", "ai-a", { attention: "needsInput" })}
         status={{ kind: "open" }}
         onNavigate={() => {}}
+        grant={ownerGrant()}
       />,
     );
     expect(
@@ -301,6 +309,7 @@ describe("native AI session interactions", () => {
         workspace={workspace("claude", "ai-a", { attention: "needsInput" })}
         status={{ kind: "open" }}
         onNavigate={() => {}}
+        grant={ownerGrant()}
       />,
     );
     await user.click(screen.getByRole("button", { name: "Continue" }));
@@ -314,6 +323,7 @@ describe("native AI session interactions", () => {
         workspace={workspace("claude", "ai-a", { attention: "none" })}
         status={{ kind: "open" }}
         onNavigate={() => {}}
+        grant={ownerGrant()}
       />,
     );
     expect(
@@ -351,6 +361,7 @@ describe("native AI session interactions", () => {
         workspace={workspace("claude", "ai-a", { attention: "needsInput" })}
         status={{ kind: "open" }}
         onNavigate={() => {}}
+        grant={ownerGrant()}
       />,
     );
 
@@ -391,6 +402,7 @@ describe("native AI session interactions", () => {
         workspace={workspace("claude")}
         status={{ kind: "connecting" }}
         onNavigate={() => {}}
+        grant={ownerGrant()}
       />,
     );
 
@@ -414,6 +426,7 @@ describe("native AI session interactions", () => {
         workspace={workspace("claude")}
         status={{ kind: "open" }}
         onNavigate={() => {}}
+        grant={ownerGrant()}
       />,
     );
     expect(
@@ -426,6 +439,7 @@ describe("native AI session interactions", () => {
         workspace={workspace("claude", "ai-a", { aiActivity: "Thinking" })}
         status={{ kind: "open" }}
         onNavigate={() => {}}
+        grant={ownerGrant()}
       />,
     );
     expect(screen.getByRole("button", { name: /stop/i }).isConnected).toBe(
@@ -439,6 +453,14 @@ const watcherGrant: CapabilityGrant = {
   taskId: "tab:ai-a",
   actions: ["readTask", "readPresence"],
 };
+
+function ownerGrant(taskId = "tab:ai-a"): CapabilityGrant {
+  return {
+    role: "owner",
+    taskId,
+    actions: PAIRED_OWNER_ACTIONS,
+  };
+}
 
 const collaboratorGrant: CapabilityGrant = {
   role: "collaborator",
@@ -561,6 +583,7 @@ describe("connect permission and controller gating", () => {
         workspace={workspace("claude")}
         status={{ kind: "open" }}
         onNavigate={() => {}}
+        grant={ownerGrant()}
       />,
     );
 
