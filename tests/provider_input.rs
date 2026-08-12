@@ -7,10 +7,10 @@ use devmanager::client::action::{
     ACTION_PROVIDER_STOP_TURN,
 };
 use devmanager::domain::{
-    decide, AgentSessionId, ClientId, Command, CommandEnvelope, CommandId, OperationId,
+    decide, AgentSessionId, ApprovalId, ClientId, Command, CommandEnvelope, CommandId, OperationId,
     PresentProviderApprovalIntent, PresentProviderQuestionIntent, ProviderInputAction,
-    ProviderKind, ProviderWaitFence, QuestionId, RejectionCode, SubmitProviderInputIntent, TaskId,
-    TurnId,
+    ProviderKind, ProviderSessionId, ProviderWaitFence, QuestionId, RejectionCode,
+    SubmitProviderInputIntent, TaskId, TurnId,
 };
 
 fn fixed_uuid_v7(tail: u8) -> [u8; 16] {
@@ -177,6 +177,767 @@ fn bound_wait_fence(
         None,
         None,
     )
+}
+
+#[derive(serde::Serialize)]
+struct ProviderEffectWire {
+    schema_version: u32,
+    destination_class: devmanager::kernel::DestinationClass,
+    replay_policy: devmanager::kernel::ReplayPolicy,
+    effect: devmanager::kernel::Effect,
+}
+
+fn overwrite_provider_effect(
+    path: &std::path::Path,
+    operation_id: OperationId,
+    effect: devmanager::kernel::Effect,
+) {
+    use devmanager::kernel::{DestinationClass, ReplayPolicy};
+    use rusqlite::Connection;
+
+    let payload = rmp_serde::to_vec_named(&ProviderEffectWire {
+        schema_version: 1,
+        destination_class: DestinationClass::ProviderInput,
+        replay_policy: ReplayPolicy::NoAutomaticRetry,
+        effect,
+    })
+    .expect("encode tampered provider effect");
+    let conn = Connection::open(path).expect("open provider effect payload");
+    assert_eq!(
+        conn.execute(
+            "UPDATE outbox SET payload = ?1 WHERE operation_id = ?2",
+            rusqlite::params![payload, operation_id.as_bytes().as_slice()],
+        )
+        .expect("tamper provider effect payload"),
+        1
+    );
+}
+
+fn begin_provider_dispatch(
+    path: &std::path::Path,
+    tail: u8,
+) -> (
+    TaskId,
+    AgentSessionId,
+    OperationId,
+    devmanager::kernel::DispatchPermit,
+) {
+    use devmanager::domain::command::CommandReceipt;
+    use devmanager::kernel::{CommandBus, KernelStore};
+
+    let mut bus = CommandBus::open(path).expect("open command bus");
+    let (task_id, agent_session_id, action_epoch, revision, client_id) =
+        seed_open_task_with_agent(&mut bus, tail);
+    let command_id = CommandId::from_bytes(fixed_uuid_v7(tail + 10)).expect("command");
+    let turn_id = TurnId::from_bytes(fixed_uuid_v7(tail + 11)).expect("turn");
+    let accepted = bus
+        .execute(CommandEnvelope {
+            command_id,
+            client_id,
+            task_id: Some(task_id),
+            issued_at_ms: 1_725_003_000_000,
+            expected_task_revision: Some(revision),
+            command: Command::SubmitProviderInput(send_now_intent(
+                agent_session_id,
+                turn_id,
+                action_epoch,
+                "bytes may have crossed",
+                false,
+            )),
+        })
+        .expect("accept provider input");
+    let CommandReceipt::Accepted { operation_id, .. } = accepted else {
+        panic!("provider input must be accepted: {accepted:?}");
+    };
+    drop(bus);
+
+    let mut store = KernelStore::open(path).expect("open kernel store");
+    let claim = store
+        .claim_next_dispatch(std::time::Duration::from_secs(30))
+        .expect("claim provider dispatch")
+        .expect("provider dispatch ready");
+    let permit = store
+        .begin_dispatch(&claim)
+        .expect("begin provider dispatch");
+    assert_eq!(permit.destination_class(), devmanager::kernel::DestinationClass::ProviderInput);
+    assert_eq!(permit.replay_policy(), devmanager::kernel::ReplayPolicy::NoAutomaticRetry);
+    match permit.effect() {
+        devmanager::kernel::Effect::DeliverProviderInput {
+            runtime_generation,
+            provider_session_id,
+            ..
+        } => {
+            assert_eq!(*runtime_generation, 3);
+            let expected_session = format!("codex-session-{tail:02x}");
+            assert_eq!(provider_session_id.as_str(), expected_session.as_str());
+        }
+        effect => panic!("expected typed provider effect, got {effect:?}"),
+    }
+    drop(store);
+    (task_id, agent_session_id, operation_id, permit)
+}
+
+fn register_secondary_agent(path: &std::path::Path, task_id: TaskId, tail: u8) -> AgentSessionId {
+    use devmanager::domain::command::CommandReceipt;
+    use devmanager::domain::{AgentRole, AgentSessionFacts, AgentSessionLifecycle};
+    use devmanager::kernel::CommandBus;
+
+    let mut bus = CommandBus::open(path).expect("open secondary-agent bus");
+    let revision = bus
+        .task_snapshot(task_id)
+        .expect("secondary-agent snapshot")
+        .expect("secondary-agent task")
+        .task
+        .revision;
+    let agent_session_id = AgentSessionId::from_bytes(fixed_uuid_v7(tail)).expect("secondary id");
+    let receipt = bus
+        .execute(CommandEnvelope {
+            command_id: CommandId::from_bytes(fixed_uuid_v7(tail + 1)).expect("secondary cmd"),
+            client_id: ClientId::from_bytes(fixed_uuid_v7(tail + 2)).expect("secondary client"),
+            task_id: Some(task_id),
+            issued_at_ms: 1_725_003_000_500,
+            expected_task_revision: Some(revision),
+            command: Command::RegisterAgentSession {
+                agent: AgentSessionFacts {
+                    id: agent_session_id,
+                    task_id,
+                    role: AgentRole::specialist("reviewer").expect("specialist role"),
+                    provider_kind: "codex".into(),
+                    provider_session_id: Some(
+                        ProviderSessionId::new(format!("codex-secondary-{tail:02x}"))
+                            .expect("secondary provider session"),
+                    ),
+                    lifecycle: AgentSessionLifecycle::Open,
+                    runtime_generation: 7,
+                    revision: 0,
+                },
+            },
+        })
+        .expect("register secondary agent");
+    assert!(matches!(
+        receipt,
+        CommandReceipt::Accepted {
+            task_revision: Some(_),
+            ..
+        }
+    ));
+    agent_session_id
+}
+
+fn rebuild_uncertain_provider_and_reject_payload_tamper(
+    path: &std::path::Path,
+    operation_id: OperationId,
+) {
+    use devmanager::domain::OperationState;
+    use devmanager::kernel::KernelStore;
+    use rusqlite::Connection;
+
+    let mut store = KernelStore::open(path).expect("reopen uncertain provider store");
+    let rebuild = store.rebuild_projections().expect("rebuild uncertain provider state");
+    assert!(rebuild.events_replayed > 0);
+    assert!(rebuild.drift_detected, "projection tamper must be reported");
+    assert!(matches!(
+        store.operation_status(operation_id).expect("rebuilt operation status"),
+        Some(OperationState::Uncertain {
+            code: devmanager::domain::OperationUncertaintyCode::AmbiguousDispatch,
+            ..
+        })
+    ));
+    drop(store);
+
+    let conn = Connection::open(path).expect("open uncertain provider payload");
+    let mut payload: Vec<u8> = conn
+        .query_row(
+            "SELECT payload FROM outbox WHERE operation_id = ?1",
+            [operation_id.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .expect("provider effect payload");
+    assert!(!payload.is_empty());
+    payload[0] ^= 0xff;
+    conn.execute(
+        "UPDATE outbox SET payload = ?1 WHERE operation_id = ?2",
+        rusqlite::params![payload, operation_id.as_bytes().as_slice()],
+    )
+    .expect("tamper provider effect payload");
+    drop(conn);
+
+    let mut store = KernelStore::open(path).expect("reopen tampered provider store");
+    assert!(
+        store.rebuild_projections().is_err(),
+        "rebuild must reject tampered uncertain provider identity"
+    );
+}
+
+#[test]
+fn provider_dispatch_ambiguity_survives_provider_close_after_bytes_may_cross() {
+    use devmanager::domain::OperationState;
+    use devmanager::kernel::{AmbiguityDisposition, KernelStore};
+    use rusqlite::Connection;
+    use tempfile::TempDir;
+
+    let dir = TempDir::new().expect("tempdir");
+    let path = dir.path().join("provider-input-close-ambiguity.sqlite3");
+    let (task_id, agent_session_id, operation_id, permit) = begin_provider_dispatch(&path, 0x11);
+
+    let conn = Connection::open(&path).expect("open sqlite");
+    conn.execute(
+        "UPDATE agent_sessions SET lifecycle = 'closed' WHERE agent_session_id = ?1",
+        [agent_session_id.as_bytes().as_slice()],
+    )
+    .expect("close provider session after dispatch began");
+    drop(conn);
+
+    let mut store = KernelStore::open(&path).expect("reopen kernel store");
+    assert_eq!(
+        store
+            .record_dispatch_ambiguity(&permit, std::time::Duration::from_millis(1))
+            .expect("closed provider attempt must become uncertain"),
+        AmbiguityDisposition::Uncertain,
+    );
+    assert!(matches!(
+        store.operation_status(operation_id).expect("operation status"),
+        Some(OperationState::Uncertain {
+            code: devmanager::domain::OperationUncertaintyCode::AmbiguousDispatch,
+            ..
+        })
+    ));
+    assert!(store
+        .claim_next_dispatch(std::time::Duration::from_secs(30))
+        .expect("no automatic provider retry")
+        .is_none());
+    assert!(store
+        .record_dispatch_completion(
+            &permit,
+            devmanager::kernel::DispatchCompletion::Settled,
+        )
+        .is_err());
+
+    let conn = Connection::open(&path).expect("reopen sqlite");
+    let (outbox_state, attempts, lease, error_class): (String, i64, Option<i64>, Option<String>) =
+        conn.query_row(
+            "SELECT state, attempts, leased_until_ms, last_error_class
+             FROM outbox WHERE operation_id = ?1",
+            [operation_id.as_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("uncertain outbox row");
+    assert_eq!(outbox_state, "uncertain");
+    assert_eq!(attempts, 1);
+    assert!(lease.is_none());
+    assert_eq!(error_class.as_deref(), Some("ambiguous_dispatch"));
+    let (lifecycle, task): (String, Vec<u8>) = conn
+        .query_row(
+            "SELECT lifecycle, task_id FROM agent_sessions WHERE agent_session_id = ?1",
+            [agent_session_id.as_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("provider identity remains closed");
+    assert_eq!(lifecycle, "closed");
+    assert_eq!(task, task_id.as_bytes().to_vec());
+    // Provider generation is intentionally carried by the typed outbox effect;
+    // the generic operation fence is presentation-only for this destination.
+    let generic_generation: Option<i64> = conn
+        .query_row(
+            "SELECT runtime_generation FROM operations WHERE operation_id = ?1",
+            [operation_id.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .expect("generic operation fence");
+    assert!(generic_generation.is_none());
+    drop(store);
+    drop(conn);
+    rebuild_uncertain_provider_and_reject_payload_tamper(&path, operation_id);
+}
+
+#[test]
+fn expired_provider_dispatch_recovery_preserves_g1_after_runtime_replacement() {
+    use devmanager::domain::OperationState;
+    use devmanager::kernel::{AmbiguityDisposition, KernelStore};
+    use rusqlite::Connection;
+    use tempfile::TempDir;
+
+    let dir = TempDir::new().expect("tempdir");
+    let path = dir.path().join("provider-input-replacement-ambiguity.sqlite3");
+    let (task_id, agent_session_id, operation_id, permit) = begin_provider_dispatch(&path, 0x21);
+    let conn = Connection::open(&path).expect("open sqlite");
+    conn.execute(
+        "UPDATE agent_sessions
+         SET provider_session_id = 'codex-session-g2', runtime_generation = 4
+         WHERE agent_session_id = ?1",
+        [agent_session_id.as_bytes().as_slice()],
+    )
+    .expect("replace provider runtime with G2");
+    conn.execute(
+        "UPDATE outbox SET leased_until_ms = 0 WHERE operation_id = ?1",
+        [operation_id.as_bytes().as_slice()],
+    )
+    .expect("expire G1 dispatch lease");
+    drop(conn);
+
+    let mut store = KernelStore::open(&path).expect("reopen kernel store");
+    assert_eq!(
+        store
+            .recover_next_expired_dispatch(std::time::Duration::from_millis(1))
+            .expect("recover exact G1 attempt"),
+        Some(AmbiguityDisposition::Uncertain),
+    );
+    assert!(matches!(
+        store.operation_status(operation_id).expect("operation status"),
+        Some(OperationState::Uncertain {
+            code: devmanager::domain::OperationUncertaintyCode::AmbiguousDispatch,
+            ..
+        })
+    ));
+    assert!(store
+        .claim_next_dispatch(std::time::Duration::from_secs(30))
+        .expect("G1 uncertainty must not authorize resend")
+        .is_none());
+    assert!(store
+        .record_dispatch_completion(
+            &permit,
+            devmanager::kernel::DispatchCompletion::Settled,
+        )
+        .is_err());
+    drop(store);
+
+    let conn = Connection::open(&path).expect("reopen sqlite");
+    let (provider_session, generation, lifecycle, task): (String, i64, String, Vec<u8>) = conn
+        .query_row(
+            "SELECT provider_session_id, runtime_generation, lifecycle, task_id
+             FROM agent_sessions WHERE agent_session_id = ?1",
+            [agent_session_id.as_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("current G2 identity");
+    assert_eq!(provider_session, "codex-session-g2");
+    assert_eq!(generation, 4);
+    assert_eq!(lifecycle, "open");
+    assert_eq!(task, task_id.as_bytes().to_vec());
+    let (outbox_state, attempts, lease): (String, i64, Option<i64>) = conn
+        .query_row(
+            "SELECT state, attempts, leased_until_ms FROM outbox WHERE operation_id = ?1",
+            [operation_id.as_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("G1 outbox state");
+    assert_eq!(outbox_state, "uncertain");
+    assert_eq!(attempts, 1);
+    assert!(lease.is_none());
+    let (destination, replay_policy, payload_len): (String, String, i64) = conn
+        .query_row(
+            "SELECT destination_class, replay_policy, length(payload)
+             FROM outbox WHERE operation_id = ?1",
+            [operation_id.as_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("retained typed provider effect");
+    assert_eq!(destination, "provider_input");
+    assert_eq!(replay_policy, "no_automatic_retry");
+    assert!(payload_len > 0, "uncertainty must retain provider identity payload");
+    match permit.effect() {
+        devmanager::kernel::Effect::DeliverProviderInput {
+            runtime_generation,
+            provider_session_id,
+            ..
+        } => {
+            assert_eq!(*runtime_generation, 3, "uncertainty must audit G1 attempt");
+            assert_eq!(provider_session_id.as_str(), "codex-session-21");
+        }
+        effect => panic!("expected typed provider effect, got {effect:?}"),
+    }
+    let generic_generation: Option<i64> = conn
+        .query_row(
+            "SELECT runtime_generation FROM operations WHERE operation_id = ?1",
+            [operation_id.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .expect("generic operation fence");
+    assert!(generic_generation.is_none());
+    drop(conn);
+    rebuild_uncertain_provider_and_reject_payload_tamper(&path, operation_id);
+}
+
+#[test]
+fn generic_ambiguity_fails_closed_on_tampered_task_fence() {
+    use devmanager::domain::command::CommandReceipt;
+    use devmanager::kernel::{CommandBus, Effect, KernelStore, StoreError};
+    use rusqlite::Connection;
+    use tempfile::TempDir;
+
+    let dir = TempDir::new().expect("tempdir");
+    let path = dir.path().join("generic-ambiguity-stale-fence.sqlite3");
+    let mut bus = CommandBus::open(&path).expect("open command bus");
+    let (task_id, _agent_session_id, _action_epoch, revision, client_id) =
+        seed_open_task_with_agent(&mut bus, 0x31);
+    let accepted = bus
+        .execute(CommandEnvelope {
+            command_id: CommandId::from_bytes(fixed_uuid_v7(0x3b)).expect("close command"),
+            client_id,
+            task_id: Some(task_id),
+            issued_at_ms: 1_725_003_100_000,
+            expected_task_revision: Some(revision),
+            command: Command::BeginCloseTask,
+        })
+        .expect("accept generic close operation");
+    let CommandReceipt::Accepted { operation_id, .. } = accepted else {
+        panic!("generic close must be accepted: {accepted:?}");
+    };
+    drop(bus);
+
+    let mut store = KernelStore::open(&path).expect("open generic store");
+    let claim = store
+        .claim_next_dispatch(std::time::Duration::from_secs(30))
+        .expect("claim generic dispatch")
+        .expect("generic dispatch ready");
+    let permit = store.begin_dispatch(&claim).expect("begin generic dispatch");
+    assert!(matches!(permit.effect(), Effect::BeginTaskTeardown { .. }));
+    drop(store);
+
+    let conn = Connection::open(&path).expect("open generic projection");
+    conn.execute(
+        "UPDATE tasks SET action_epoch = action_epoch + 1 WHERE task_id = ?1",
+        [task_id.as_bytes().as_slice()],
+    )
+    .expect("advance current task fence");
+    drop(conn);
+
+    let mut store = KernelStore::open(&path).expect("reopen stale generic store");
+    assert!(
+        matches!(
+            store.record_dispatch_ambiguity(&permit, std::time::Duration::from_millis(1)),
+            Err(StoreError::Corruption | StoreError::StaleFence)
+        ),
+        "generic effects must retain current ownership validation"
+    );
+    drop(store);
+
+    let conn = Connection::open(&path).expect("expire generic lease");
+    let (operation_state, outbox_state): (String, String) = conn
+        .query_row(
+            "SELECT op.state, o.state
+             FROM operations op JOIN outbox o ON o.operation_id = op.operation_id
+             WHERE op.operation_id = ?1",
+            [operation_id.as_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("generic dispatch remains in flight");
+    assert_eq!(operation_state, "accepted");
+    assert_eq!(outbox_state, "dispatching");
+    conn.execute(
+        "UPDATE outbox SET leased_until_ms = 0 WHERE operation_id = ?1",
+        [operation_id.as_bytes().as_slice()],
+    )
+    .expect("expire generic dispatch");
+    drop(conn);
+    let mut store = KernelStore::open(&path).expect("reopen expired generic store");
+    assert!(
+        matches!(
+            store.recover_next_expired_dispatch(std::time::Duration::from_millis(1)),
+            Err(StoreError::Corruption | StoreError::StaleFence)
+        ),
+        "generic expiry recovery must not use immutable provider escape"
+    );
+}
+
+#[test]
+fn generic_retry_safe_ambiguity_keeps_current_dispatch_path() {
+    use devmanager::domain::command::CommandReceipt;
+    use devmanager::kernel::{AmbiguityDisposition, CommandBus, Effect, KernelStore};
+    use rusqlite::Connection;
+    use tempfile::TempDir;
+
+    let dir = TempDir::new().expect("tempdir");
+    let path = dir.path().join("generic-retry-safe-ambiguity.sqlite3");
+    let mut bus = CommandBus::open(&path).expect("open generic bus");
+    let (task_id, _agent_session_id, _action_epoch, revision, client_id) =
+        seed_open_task_with_agent(&mut bus, 0x37);
+    let accepted = bus
+        .execute(CommandEnvelope {
+            command_id: CommandId::from_bytes(fixed_uuid_v7(0x3d)).expect("close command"),
+            client_id,
+            task_id: Some(task_id),
+            issued_at_ms: 1_725_003_200_000,
+            expected_task_revision: Some(revision),
+            command: Command::BeginCloseTask,
+        })
+        .expect("accept generic close operation");
+    let CommandReceipt::Accepted { operation_id, .. } = accepted else {
+        panic!("generic close must be accepted: {accepted:?}");
+    };
+    drop(bus);
+
+    let mut store = KernelStore::open(&path).expect("open generic store");
+    let claim = store
+        .claim_next_dispatch(std::time::Duration::from_secs(30))
+        .expect("claim generic dispatch")
+        .expect("generic dispatch ready");
+    let permit = store.begin_dispatch(&claim).expect("begin generic dispatch");
+    assert!(matches!(permit.effect(), Effect::BeginTaskTeardown { .. }));
+    assert_eq!(
+        store
+            .record_dispatch_ambiguity(&permit, std::time::Duration::from_millis(1))
+            .expect("generic ambiguity should retain its retry policy"),
+        AmbiguityDisposition::RetryScheduled
+    );
+    drop(store);
+
+    let conn = Connection::open(&path).expect("open generic state");
+    let (state, attempts): (String, i64) = conn
+        .query_row(
+            "SELECT state, attempts FROM outbox WHERE operation_id = ?1",
+            [operation_id.as_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("generic outbox row");
+    assert_eq!(state, "pending");
+    assert_eq!(attempts, 1);
+}
+
+#[test]
+fn expired_provider_recovery_rejects_attempts_behind_lease_generation() {
+    use devmanager::kernel::{KernelStore, StoreError};
+    use rusqlite::Connection;
+    use tempfile::TempDir;
+
+    let dir = TempDir::new().expect("tempdir");
+    let path = dir.path().join("provider-input-recovery-generation.sqlite3");
+    let (_, _, operation_id, _permit) = begin_provider_dispatch(&path, 0x39);
+    let conn = Connection::open(&path).expect("open provider state");
+    conn.execute(
+        "UPDATE outbox SET attempts = 2, leased_until_ms = 0 WHERE operation_id = ?1",
+        [operation_id.as_bytes().as_slice()],
+    )
+    .expect("tamper attempt lineage");
+    drop(conn);
+
+    let mut store = KernelStore::open(&path).expect("reopen provider store");
+    assert!(matches!(
+        store.recover_next_expired_dispatch(std::time::Duration::from_millis(1)),
+        Err(StoreError::Corruption)
+    ));
+    drop(store);
+    let conn = Connection::open(&path).expect("reopen provider state");
+    let (state, attempts): (String, i64) = conn
+        .query_row(
+            "SELECT state, attempts FROM outbox WHERE operation_id = ?1",
+            [operation_id.as_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("provider outbox row");
+    assert_eq!(state, "dispatching");
+    assert_eq!(attempts, 2);
+}
+
+#[test]
+fn uncertain_provider_rebuild_checks_other_agents_and_attempt_generation() {
+    use devmanager::kernel::{AmbiguityDisposition, KernelStore};
+    use rusqlite::Connection;
+    use tempfile::TempDir;
+
+    let dir = TempDir::new().expect("tempdir");
+    let path = dir.path().join("provider-input-rebuild-generation.sqlite3");
+    let (task_id, _agent_session_id, operation_id, permit) = begin_provider_dispatch(&path, 0x3f);
+    let secondary_id = register_secondary_agent(&path, task_id, 0x4f);
+    let mut store = KernelStore::open(&path).expect("reopen provider store");
+    assert_eq!(
+        store
+            .record_dispatch_ambiguity(&permit, std::time::Duration::from_millis(1))
+            .expect("provider ambiguity"),
+        AmbiguityDisposition::Uncertain
+    );
+    drop(store);
+
+    let conn = Connection::open(&path).expect("open provider projection");
+    conn.execute(
+        "UPDATE agent_sessions SET runtime_generation = 8 WHERE agent_session_id = ?1",
+        [secondary_id.as_bytes().as_slice()],
+    )
+    .expect("tamper non-provider agent row");
+    drop(conn);
+    let mut store = KernelStore::open(&path).expect("reopen tampered provider store");
+    assert!(
+        store.rebuild_projections().is_err(),
+        "uncertainty may skip only the immutable provider agent row"
+    );
+    drop(store);
+
+    let conn = Connection::open(&path).expect("reopen provider projection");
+    conn.execute(
+        "UPDATE agent_sessions SET runtime_generation = 7 WHERE agent_session_id = ?1",
+        [secondary_id.as_bytes().as_slice()],
+    )
+    .expect("restore secondary agent row");
+    conn.execute(
+        "UPDATE outbox SET attempts = 2 WHERE operation_id = ?1",
+        [operation_id.as_bytes().as_slice()],
+    )
+    .expect("tamper terminal attempt lineage");
+    drop(conn);
+    let mut store = KernelStore::open(&path).expect("reopen generation-tampered store");
+    assert!(
+        store.rebuild_projections().is_err(),
+        "terminal rebuild must bind attempts to the stored lease generation"
+    );
+}
+
+#[test]
+fn provider_dispatch_ambiguity_rejects_immutable_attempt_tampering() {
+    use devmanager::kernel::{Effect, KernelStore, StoreError};
+    use rusqlite::Connection;
+    use tempfile::TempDir;
+
+    type EffectMutator = fn(Effect) -> Effect;
+
+    let cases: [(&str, u8, EffectMutator); 13] = [
+        ("operation_id", 0x41, |mut effect| {
+            if let Effect::DeliverProviderInput { operation_id, .. } = &mut effect {
+                *operation_id = OperationId::new();
+            }
+            effect
+        }),
+        ("task_id", 0x51, |mut effect| {
+            if let Effect::DeliverProviderInput { task_id, .. } = &mut effect {
+                *task_id = TaskId::new();
+            }
+            effect
+        }),
+        ("agent_session_id", 0x61, |mut effect| {
+            if let Effect::DeliverProviderInput {
+                agent_session_id, ..
+            } = &mut effect
+            {
+                *agent_session_id = AgentSessionId::new();
+            }
+            effect
+        }),
+        ("provider_kind", 0x71, |mut effect| {
+            if let Effect::DeliverProviderInput { provider_kind, .. } = &mut effect {
+                *provider_kind = ProviderKind::new("claude").expect("provider kind");
+            }
+            effect
+        }),
+        ("provider_session_id", 0x81, |mut effect| {
+            if let Effect::DeliverProviderInput {
+                provider_session_id,
+                ..
+            } = &mut effect
+            {
+                *provider_session_id =
+                    ProviderSessionId::new("codex-session-tampered").expect("provider session");
+            }
+            effect
+        }),
+        ("runtime_generation", 0x91, |mut effect| {
+            if let Effect::DeliverProviderInput {
+                runtime_generation,
+                ..
+            } = &mut effect
+            {
+                *runtime_generation = (*runtime_generation).saturating_add(1);
+            }
+            effect
+        }),
+        ("action_epoch", 0xa1, |mut effect| {
+            if let Effect::DeliverProviderInput { action_epoch, .. } = &mut effect {
+                *action_epoch = (*action_epoch).saturating_add(1);
+            }
+            effect
+        }),
+        ("turn_id", 0xb1, |mut effect| {
+            if let Effect::DeliverProviderInput { turn_id, .. } = &mut effect {
+                *turn_id = TurnId::new();
+            }
+            effect
+        }),
+        ("action_payload", 0xc1, |mut effect| {
+            if let Effect::DeliverProviderInput { action, .. } = &mut effect {
+                *action = ProviderInputAction::SendNow {
+                    text: "tampered provider payload".into(),
+                    wait: false,
+                };
+            }
+            effect
+        }),
+        ("command_id", 0xd1, |mut effect| {
+            if let Effect::DeliverProviderInput { command_id, .. } = &mut effect {
+                *command_id = CommandId::new();
+            }
+            effect
+        }),
+        ("client_id", 0xe1, |mut effect| {
+            if let Effect::DeliverProviderInput { client_id, .. } = &mut effect {
+                *client_id = ClientId::new();
+            }
+            effect
+        }),
+        ("question_id", 0xf1, |mut effect| {
+            if let Effect::DeliverProviderInput { question_id, .. } = &mut effect {
+                *question_id = Some(QuestionId::new());
+            }
+            effect
+        }),
+        ("approval_id", 0x32, |mut effect| {
+            if let Effect::DeliverProviderInput { approval_id, .. } = &mut effect {
+                *approval_id = Some(ApprovalId::new());
+            }
+            effect
+        }),
+    ];
+
+    for (label, tail, mutate) in cases {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join(format!("provider-input-tamper-{label}.sqlite3"));
+        let (_, _, operation_id, permit) = begin_provider_dispatch(&path, tail);
+        overwrite_provider_effect(&path, operation_id, mutate(permit.effect().clone()));
+
+        let mut store = KernelStore::open(&path).expect("reopen tampered provider store");
+        let result = store.record_dispatch_ambiguity(
+            &permit,
+            std::time::Duration::from_millis(1),
+        );
+        assert!(
+            result.is_err(),
+            "immutable provider {label} tamper must be rejected: {result:?}"
+        );
+        drop(store);
+
+        let conn = Connection::open(&path).expect("reopen tampered provider state");
+        let (state, attempts): (String, i64) = conn
+            .query_row(
+                "SELECT state, attempts FROM outbox WHERE operation_id = ?1",
+                [operation_id.as_bytes().as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("tampered provider outbox row");
+        assert_eq!(state, "dispatching", "tampered {label} row must stay in flight");
+        assert_eq!(attempts, 1, "tampered {label} row must not advance attempt");
+    }
+
+    let dir = TempDir::new().expect("attempt tempdir");
+    let path = dir.path().join("provider-input-tamper-attempt.sqlite3");
+    let (_, _, operation_id, permit) = begin_provider_dispatch(&path, 0xe1);
+    let conn = Connection::open(&path).expect("open attempt tamper");
+    assert_eq!(
+        conn.execute(
+            "UPDATE outbox SET attempts = 2 WHERE operation_id = ?1",
+            [operation_id.as_bytes().as_slice()],
+        )
+        .expect("tamper dispatch attempt"),
+        1
+    );
+    drop(conn);
+
+    let mut store = KernelStore::open(&path).expect("reopen attempt-tampered provider store");
+    assert!(
+        matches!(
+            store.record_dispatch_ambiguity(&permit, std::time::Duration::from_millis(1)),
+            Err(StoreError::StaleClaim)
+                | Err(StoreError::Corruption)
+                | Err(StoreError::StaleFence)
+        ),
+        "dispatch-attempt tamper must fail closed"
+    );
 }
 
 #[test]

@@ -22,7 +22,8 @@ use crate::domain::operation::{
 };
 use crate::kernel::command_bus::{
     self, effect_document_for_terminal_replay, load_outbox_row_by_id,
-    refuse_archive_with_live_resources, validate_dispatch_candidate_lineage, OutboxRow,
+    refuse_archive_with_live_resources, validate_dispatch_attempt_lineage,
+    validate_dispatch_candidate_lineage, OutboxRow,
 };
 use crate::kernel::dispatch::{
     ambiguity_disposition, decode_absence_receipt, encode_absence_receipt, AbsenceReceiptDocument,
@@ -30,7 +31,9 @@ use crate::kernel::dispatch::{
     ReconciliationFinding, ReconciliationOrigin,
 };
 use crate::kernel::maintenance;
-use crate::kernel::outbox::{external_idempotency_key, Effect, ReplayPolicy};
+use crate::kernel::outbox::{
+    external_idempotency_key, DestinationClass, Effect, ReplayPolicy,
+};
 use crate::kernel::projector;
 use crate::kernel::runtime::RecoveringResource;
 use crate::kernel::schema::{self, Migration, PROJECTION_TABLES};
@@ -1966,6 +1969,57 @@ fn revalidate_outbox_effect(
     validate_dispatch_candidate_lineage(tx, row.operation_id, row.outbox_id)
 }
 
+fn revalidate_outbox_attempt_effect(
+    tx: &Transaction<'_>,
+    row: &OutboxRow,
+) -> Result<
+    (
+        crate::kernel::outbox::PlannedEffectDocument,
+        crate::kernel::outbox::OperationFence,
+    ),
+    StoreError,
+> {
+    validate_dispatch_attempt_lineage(tx, row.operation_id, row.outbox_id)
+}
+
+fn is_provider_uncertainty_effect(
+    effect_doc: &crate::kernel::outbox::PlannedEffectDocument,
+) -> bool {
+    effect_doc.replay_policy == ReplayPolicy::NoAutomaticRetry
+        && matches!(&effect_doc.effect, Effect::DeliverProviderInput { .. })
+}
+
+/// Current ownership is required before an external boundary starts. Once it
+/// has started, only a typed no-retry provider effect may use its immutable
+/// stored identity to record ambiguity after the provider closes or advances.
+fn revalidate_ambiguity_effect(
+    tx: &Transaction<'_>,
+    row: &OutboxRow,
+) -> Result<
+    (
+        crate::kernel::outbox::PlannedEffectDocument,
+        crate::kernel::outbox::OperationFence,
+    ),
+    StoreError,
+> {
+    // Only the durable provider destination is allowed to use immutable
+    // post-boundary identity. Generic RetrySafe and ReconcileBeforeRetry
+    // effects must stay on the strict live-ownership validator; attempting
+    // provider validation first would turn valid generic ambiguity into a
+    // false corruption result (or create an ownership bypass).
+    if row.destination_class == DestinationClass::ProviderInput.as_str()
+        && row.replay_policy == ReplayPolicy::NoAutomaticRetry.as_str()
+    {
+        let immutable = revalidate_outbox_attempt_effect(tx, row)?;
+        if is_provider_uncertainty_effect(&immutable.0) {
+            return Ok(immutable);
+        }
+        return Err(StoreError::Corruption);
+    }
+    // Generic effects retain their pre-existing current-ownership rule.
+    revalidate_outbox_effect(tx, row)
+}
+
 fn parse_outbox_id(bytes: &[u8]) -> Result<OutboxId, StoreError> {
     let array: [u8; 16] = bytes.try_into().map_err(|_| StoreError::Corruption)?;
     OutboxId::from_bytes(array).map_err(|_| StoreError::Corruption)
@@ -2581,7 +2635,7 @@ fn record_dispatch_ambiguity_in_tx(
     delay_ms: i64,
 ) -> Result<AmbiguityDisposition, StoreError> {
     let row = load_outbox_row_by_id(tx, permit.outbox_id())?.ok_or(StoreError::StaleClaim)?;
-    let (effect_doc, fence) = revalidate_outbox_effect(tx, &row)?;
+    let (effect_doc, fence) = revalidate_ambiguity_effect(tx, &row)?;
     validate_dispatch_permit(&row, permit, &effect_doc, fence)?;
     let disposition = ambiguity_disposition(effect_doc.replay_policy);
 
@@ -2711,8 +2765,8 @@ fn recover_next_expired_dispatch_in_tx(
                 Ok(None)
             };
         };
-        let effect_doc = match revalidate_outbox_effect(tx, &row) {
-            Ok((effect_doc, _)) => effect_doc,
+        let (effect_doc, fence) = match revalidate_ambiguity_effect(tx, &row) {
+            Ok(validated) => validated,
             Err(StoreError::StaleFence) => {
                 saw_stale_fence = true;
                 prior_candidate = Some(row);
@@ -2733,7 +2787,7 @@ fn recover_next_expired_dispatch_in_tx(
                 tx,
                 &row,
                 &effect_doc,
-                revalidate_outbox_effect(tx, &row)?.1,
+                fence,
                 now_ms,
             )?;
             return Ok(Some(disposition));

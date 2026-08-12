@@ -113,6 +113,13 @@ pub enum Effect {
 }
 
 /// Accepted-operation fence shared by every planned effect for one command.
+///
+/// `DeliverProviderInput` intentionally leaves `runtime_generation` empty: the
+/// generic operation fence is presentation-only for provider delivery because
+/// its resource/generation pair is reserved for resource ownership. The typed
+/// provider effect is the durable authority for provider session identity and
+/// runtime generation, including ambiguity recovery after replacement. Uncertain
+/// outbox rows retain their payload and are never terminal-payload compacted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct OperationFence {
     pub action_epoch: Option<u64>,

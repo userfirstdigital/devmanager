@@ -47,7 +47,7 @@ use crate::kernel::dispatch::{decode_absence_receipt, DispatchCompletion, Dispat
 use crate::kernel::outbox::{
     decode_effect_document, decode_receipt_document, effect_document_sha256,
     encode_effect_document, encode_receipt_document, external_idempotency_key, plan_effects,
-    Effect, OperationFence, PlannedEffect, PlannedEffectDocument, ReplayPolicy,
+    DestinationClass, Effect, OperationFence, PlannedEffect, PlannedEffectDocument, ReplayPolicy,
 };
 use crate::kernel::projector;
 use crate::kernel::replay::{EventReplaySession, ReplayError};
@@ -790,10 +790,17 @@ pub(crate) fn record_no_retry_dispatch_uncertainty_in_tx(
     ) {
         return Err(StoreError::Corruption);
     }
+    let (stored_effect, stored_fence) =
+        validate_dispatch_attempt_lineage(tx, row.operation_id, row.outbox_id)?;
+    if stored_effect != *effect_doc || stored_fence != fence {
+        return Err(StoreError::StaleClaim);
+    }
     validate_effect_matches_fence(&effect_doc.effect, task_id, fence)?;
     // The dispatch begin transaction already proved live ownership before the
     // external boundary. Recovery must still be able to record uncertainty if
-    // the provider session crashed or closed after bytes may have crossed.
+    // the provider session crashed or closed after bytes may have crossed. The
+    // typed effect remains the provider identity authority; the generic fence
+    // contributes only the action epoch for this provider destination.
     let command_id = load_operation_command_id(tx, row.operation_id)?;
     let (resource_id, runtime_generation) = ResourceFence::into_parts(
         ResourceFence::from_parts(fence.resource_id, fence.runtime_generation)
@@ -1044,6 +1051,85 @@ pub(crate) fn validate_dispatch_candidate_lineage(
     operation_id: OperationId,
     outbox_id: OutboxId,
 ) -> Result<(crate::kernel::outbox::PlannedEffectDocument, OperationFence), StoreError> {
+    validate_dispatch_lineage(tx, operation_id, outbox_id, true)
+}
+
+/// Validate the immutable identity of one dispatch attempt after the external
+/// boundary has started. Provider ownership may have closed or advanced by the
+/// time ambiguity recovery runs, so this deliberately does not require the
+/// current agent row to still match the stored typed effect. Recovery may also
+/// present an expired lease; its state/attempt/clock checks remain mandatory.
+pub(crate) fn validate_dispatch_attempt_lineage(
+    tx: &Transaction<'_>,
+    operation_id: OperationId,
+    outbox_id: OutboxId,
+) -> Result<(crate::kernel::outbox::PlannedEffectDocument, OperationFence), StoreError> {
+    let operation =
+        load_operation_projection_by_id(tx, operation_id)?.ok_or(StoreError::Corruption)?;
+    require_accepted_dispatch_operation(&operation)?;
+    let command_id = load_operation_command_id(tx, operation_id)?;
+    let receipt_row = load_receipt_correlation(tx, command_id)?;
+    let CommandReceipt::Accepted {
+        command_id: receipt_command_id,
+        operation_id: receipt_operation_id,
+        event_ids,
+        task_revision,
+    } = &receipt_row.receipt
+    else {
+        return Err(StoreError::Corruption);
+    };
+    if *receipt_command_id != command_id || *receipt_operation_id != operation_id {
+        return Err(StoreError::Corruption);
+    }
+    let Some(scope) = receipt_row.task_id else {
+        return Err(StoreError::Corruption);
+    };
+    let Some(receipt_final_revision) = *task_revision else {
+        return Err(StoreError::Corruption);
+    };
+    if operation.task_id != Some(scope) {
+        return Err(StoreError::Corruption);
+    }
+    let rows = load_outbox_rows(tx, operation_id)?;
+    if rows.len() != 1 || rows[0].outbox_id != outbox_id {
+        return Err(StoreError::Corruption);
+    }
+    validate_side_effect_accepted_receipt_without_agent_sessions(
+        tx,
+        command_id,
+        operation_id,
+        event_ids,
+        receipt_final_revision,
+        scope,
+        receipt_row
+            .committed_sequence
+            .ok_or(StoreError::Corruption)?,
+        &operation,
+        &rows,
+    )?;
+
+    let row = &rows[0];
+    let task_id = operation.task_id.ok_or(StoreError::Corruption)?;
+    let fence = operation_fence_from_projection(&operation)?;
+    let document = decode_full_outbox_payload(row)?;
+    validate_effect_matches_fence(&document.effect, task_id, fence)?;
+    if !matches!(
+        &document.effect,
+        Effect::DeliverProviderInput { operation_id: effect_operation_id, .. }
+            if *effect_operation_id == operation_id
+    ) || document.replay_policy != ReplayPolicy::NoAutomaticRetry
+    {
+        return Err(StoreError::Corruption);
+    }
+    Ok((document, fence))
+}
+
+fn validate_dispatch_lineage(
+    tx: &Transaction<'_>,
+    operation_id: OperationId,
+    outbox_id: OutboxId,
+    require_current_ownership: bool,
+) -> Result<(crate::kernel::outbox::PlannedEffectDocument, OperationFence), StoreError> {
     let operation =
         load_operation_projection_by_id(tx, operation_id)?.ok_or(StoreError::Corruption)?;
     require_accepted_dispatch_operation(&operation)?;
@@ -1088,7 +1174,9 @@ pub(crate) fn validate_dispatch_candidate_lineage(
     let fence = operation_fence_from_projection(&operation)?;
     let document = decode_full_outbox_payload(row)?;
     validate_effect_matches_fence(&document.effect, task_id, fence)?;
-    require_current_effect_ownership(tx, task_id, &document.effect, fence)?;
+    if require_current_ownership {
+        require_current_effect_ownership(tx, task_id, &document.effect, fence)?;
+    }
     Ok((document, fence))
 }
 
@@ -2081,13 +2169,15 @@ fn transition_outbox(
         "UPDATE outbox
          SET state = ?1, leased_until_ms = NULL, last_error_class = ?2,
              reconciliation_receipt = NULL
-         WHERE outbox_id = ?3 AND state = ?4 AND lease_generation = ?5",
+         WHERE outbox_id = ?3 AND state = ?4 AND lease_generation = ?5
+           AND attempts = ?6",
         rusqlite::params![
             next_state,
             last_error_class,
             outbox.outbox_id.as_bytes().as_slice(),
             expected_state,
             outbox.lease_generation,
+            outbox.attempts,
         ],
     )?;
     if changed != 1 {
@@ -2446,6 +2536,10 @@ fn lookup_receipt_with_digest(
 /// Strict receipt-backed operations are re-correlated end to end so a missing,
 /// extra, or terminally corrupted outbox row cannot survive repair. The final
 /// outbox scan independently rejects orphan rows that have no receipt root.
+/// Uncertain rows are intentionally still decoded through the receipt-backed
+/// terminal validator: their typed provider effect is the durable G1 identity,
+/// so projection repair must reject payload tampering rather than silently
+/// rebuilding an ambiguity with a different provider session.
 pub(crate) fn validate_all_rebuilt_outbox_metadata(tx: &Transaction<'_>) -> Result<(), StoreError> {
     let receipt_backed_commands = {
         let mut stmt = tx.prepare("SELECT command_id FROM operations ORDER BY operation_id")?;
@@ -3435,6 +3529,60 @@ fn validate_side_effect_accepted_receipt(
     operation: &OperationProjectionRow,
     outbox_rows: &[OutboxRow],
 ) -> Result<(), StoreError> {
+    validate_side_effect_accepted_receipt_with_projection(
+        tx,
+        command_id,
+        expected_operation_id,
+        event_ids,
+        receipt_final_revision,
+        scope,
+        committed_sequence,
+        operation,
+        outbox_rows,
+        true,
+        false,
+    )
+}
+
+fn validate_side_effect_accepted_receipt_without_agent_sessions(
+    tx: &Connection,
+    command_id: CommandId,
+    expected_operation_id: OperationId,
+    event_ids: &[EventId],
+    receipt_final_revision: u64,
+    scope: TaskId,
+    committed_sequence: u64,
+    operation: &OperationProjectionRow,
+    outbox_rows: &[OutboxRow],
+) -> Result<(), StoreError> {
+    validate_side_effect_accepted_receipt_with_projection(
+        tx,
+        command_id,
+        expected_operation_id,
+        event_ids,
+        receipt_final_revision,
+        scope,
+        committed_sequence,
+        operation,
+        outbox_rows,
+        false,
+        true,
+    )
+}
+
+fn validate_side_effect_accepted_receipt_with_projection(
+    tx: &Connection,
+    command_id: CommandId,
+    expected_operation_id: OperationId,
+    event_ids: &[EventId],
+    receipt_final_revision: u64,
+    scope: TaskId,
+    committed_sequence: u64,
+    operation: &OperationProjectionRow,
+    outbox_rows: &[OutboxRow],
+    validate_current_agent_sessions: bool,
+    allow_expired_dispatch: bool,
+) -> Result<(), StoreError> {
     // Side-effect path: committed_sequence is operation.accepted. Do not re-plan from
     // the current snapshot — correlate durable decision facts, accepted fence, and rows.
     let decision_count = u64::try_from(event_ids.len()).map_err(|_| StoreError::Corruption)?;
@@ -3506,7 +3654,29 @@ fn validate_side_effect_accepted_receipt(
         fence,
     )?;
     // Durable task mutation chain is the source of truth for revision/lifecycle.
-    let _ = validate_task_history_and_projection(tx, scope)?;
+    // A live claim and every ordinary receipt path must also match the current
+    // projection. Once provider bytes may have crossed, the typed outbox
+    // effect is the immutable attempt authority; the named provider session
+    // row may legitimately have closed or advanced while this operation is
+    // settled as Uncertain. The post-boundary path still compares every other
+    // agent row and every other projection field.
+    let provider_uncertainty = operation.state == "uncertain"
+        && expected_effects.len() == 1
+        && expected_effects[0].document.replay_policy == ReplayPolicy::NoAutomaticRetry
+        && matches!(
+            &expected_effects[0].document.effect,
+            Effect::DeliverProviderInput { .. }
+        );
+    let immutable_provider_agent = if !validate_current_agent_sessions || provider_uncertainty {
+        Some(provider_attempt_agent_session_id(&expected_effects)?)
+    } else {
+        None
+    };
+    let _ = validate_task_history_and_projection_with_agent_sessions(
+        tx,
+        scope,
+        immutable_provider_agent,
+    )?;
 
     match operation.state.as_str() {
         "accepted" => {
@@ -3524,6 +3694,7 @@ fn validate_side_effect_accepted_receipt(
                 operation.accepted_at_ms,
                 scope,
                 fence,
+                allow_expired_dispatch,
             )?;
             let history = load_operation_outcome_history(
                 tx,
@@ -3552,6 +3723,25 @@ fn validate_side_effect_accepted_receipt(
     }
 }
 
+fn provider_attempt_agent_session_id(
+    expected_effects: &[PlannedEffect],
+) -> Result<AgentSessionId, StoreError> {
+    let [planned] = expected_effects else {
+        return Err(StoreError::Corruption);
+    };
+    if planned.document.destination_class != DestinationClass::ProviderInput
+        || planned.document.replay_policy != ReplayPolicy::NoAutomaticRetry
+    {
+        return Err(StoreError::Corruption);
+    }
+    match &planned.document.effect {
+        Effect::DeliverProviderInput {
+            agent_session_id, ..
+        } => Ok(*agent_session_id),
+        _ => Err(StoreError::Corruption),
+    }
+}
+
 fn validate_side_effect_active_outbox(
     outbox_rows: &[OutboxRow],
     expected_effects: &[PlannedEffect],
@@ -3560,6 +3750,7 @@ fn validate_side_effect_active_outbox(
     accepted_at_ms: i64,
     scope: TaskId,
     fence: OperationFence,
+    allow_expired_dispatch: bool,
 ) -> Result<(), StoreError> {
     for (expected_index, (row, planned)) in
         outbox_rows.iter().zip(expected_effects.iter()).enumerate()
@@ -3583,10 +3774,11 @@ fn validate_side_effect_active_outbox(
         }
         match row.state.as_str() {
             "pending" | "claimed" | "dispatching" | "reconcile_required" | "reconciling" => {
-                validate_nonterminal_outbox_dispatch_metadata(
+                validate_nonterminal_outbox_dispatch_metadata_for_attempt(
                     row,
                     accepted_at_ms,
                     decoded.replay_policy,
+                    allow_expired_dispatch,
                 )?;
             }
             _ => return Err(StoreError::Corruption),
@@ -3855,12 +4047,39 @@ fn validate_nonterminal_outbox_dispatch_metadata(
     accepted_at_ms: i64,
     replay_policy: ReplayPolicy,
 ) -> Result<(), StoreError> {
-    if row.lease_generation < 0 {
+    validate_nonterminal_outbox_dispatch_metadata_inner(row, accepted_at_ms, replay_policy, false)
+}
+
+fn validate_nonterminal_outbox_dispatch_metadata_for_attempt(
+    row: &OutboxRow,
+    accepted_at_ms: i64,
+    replay_policy: ReplayPolicy,
+    allow_expired_dispatch: bool,
+) -> Result<(), StoreError> {
+    // Recovery proves the lease is expired against its transaction clock after
+    // this lineage check. Only the immutable typed provider path may therefore
+    // accept a lease that ended before dispatch_started_at; generic/live paths
+    // continue to require an active lease here.
+    if allow_expired_dispatch
+        && (replay_policy != ReplayPolicy::NoAutomaticRetry || row.state != "dispatching")
+    {
         return Err(StoreError::Corruption);
     }
-    if row.attempts < 0 {
-        return Err(StoreError::Corruption);
-    }
+    validate_nonterminal_outbox_dispatch_metadata_inner(
+        row,
+        accepted_at_ms,
+        replay_policy,
+        allow_expired_dispatch,
+    )
+}
+
+fn validate_nonterminal_outbox_dispatch_metadata_inner(
+    row: &OutboxRow,
+    accepted_at_ms: i64,
+    replay_policy: ReplayPolicy,
+    allow_expired_dispatch: bool,
+) -> Result<(), StoreError> {
+    validate_dispatch_attempt_generation(row)?;
     match row.state.as_str() {
         "pending" => {
             if row.attempts == 0 {
@@ -3938,7 +4157,7 @@ fn validate_nonterminal_outbox_dispatch_metadata(
             let Some(lease) = row.leased_until_ms else {
                 return Err(StoreError::Corruption);
             };
-            if lease <= started {
+            if lease < 0 || (!allow_expired_dispatch && lease <= started) {
                 return Err(StoreError::Corruption);
             }
             if row.reconciliation_receipt.is_some() {
@@ -4029,9 +4248,7 @@ fn validate_terminal_outbox_dispatch_metadata(
     dispatch_upper_bound_ms: i64,
     was_reconciled: bool,
 ) -> Result<(), StoreError> {
-    if row.attempts < 0 {
-        return Err(StoreError::Corruption);
-    }
+    validate_dispatch_attempt_generation(row)?;
     if row.attempts == 0 {
         if row.dispatch_started_at_ms.is_some()
             || (row.lease_generation == 0 && row.available_at_ms != accepted_at_ms)
@@ -4053,6 +4270,21 @@ fn validate_terminal_outbox_dispatch_metadata(
         {
             return Err(StoreError::Corruption);
         }
+    }
+    Ok(())
+}
+
+/// A dispatch attempt can only be created in a claim generation at or after
+/// the attempt count: a worker may claim/release before bytes cross, so the
+/// generation may be ahead, but durable recovery/rebuild must never accept an
+/// attempt whose generation trails the number of starts. All state transitions
+/// additionally compare the exact stored generation in their CAS predicate.
+fn validate_dispatch_attempt_generation(row: &OutboxRow) -> Result<(), StoreError> {
+    if row.lease_generation < 0
+        || row.attempts < 0
+        || (row.attempts > 0 && row.lease_generation < row.attempts)
+    {
+        return Err(StoreError::Corruption);
     }
     Ok(())
 }
@@ -4527,6 +4759,14 @@ fn validate_task_history_and_projection(
     tx: &Connection,
     scope: TaskId,
 ) -> Result<(String, u64, u64), StoreError> {
+    validate_task_history_and_projection_with_agent_sessions(tx, scope, None)
+}
+
+fn validate_task_history_and_projection_with_agent_sessions(
+    tx: &Connection,
+    scope: TaskId,
+    immutable_provider_agent: Option<AgentSessionId>,
+) -> Result<(String, u64, u64), StoreError> {
     let mut stmt = tx.prepare(
         "SELECT sequence, event_id, task_revision, event_type, schema_version, payload,
                 occurred_at_ms
@@ -4641,7 +4881,33 @@ fn validate_task_history_and_projection(
         }
         Err(err) => return Err(err),
     };
-    if snap != projected {
+    let agents_match = match immutable_provider_agent {
+        None => snap.agents == projected.agents,
+        Some(exception) => {
+            // The immutable escape is scoped to exactly the provider session
+            // named by the accepted effect. Every other durable agent row,
+            // including additions/removals, remains part of projection
+            // equality; a broad map skip would hide unrelated tampering.
+            snap.agents.len() == projected.agents.len()
+                && snap.agents.iter().all(|(agent_id, durable)| {
+                    let Some(current) = projected.agents.get(agent_id) else {
+                        return false;
+                    };
+                    *agent_id == exception || durable == current
+                })
+        }
+    };
+    let same_projection = snap.task == projected.task
+        && snap.connectivity == projected.connectivity
+        && snap.attention == projected.attention
+        && snap.activity == projected.activity
+        && snap.review_readiness == projected.review_readiness
+        && snap.primary_agent_id == projected.primary_agent_id
+        && agents_match
+        && snap.artifacts == projected.artifacts
+        && snap.resources == projected.resources
+        && snap.provider_sessions == projected.provider_sessions;
+    if !same_projection {
         return Err(StoreError::Corruption);
     }
 
