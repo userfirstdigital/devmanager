@@ -8,7 +8,9 @@ use zeroize::Zeroizing;
 
 use crate::domain::event::DomainEvent;
 use crate::domain::id::SubscriptionId;
-use crate::domain::snapshot::{EventPage, PageLimits, PageLimitsError};
+use crate::domain::snapshot::{
+    canonical_event_page_size, CanonicalPageSizeError, EventPage, PageLimits, PageLimitsError,
+};
 use crate::kernel::store::{
     decode_stored_domain_event, load_event_log_bounds, u64_from_nonnegative_i64, u64_to_sqlite_i64,
     KernelStore, StoreError,
@@ -447,28 +449,26 @@ fn canonical_event_page_encoded_bytes(
     events: &[DomainEvent],
     next_cursor: &Option<Vec<u8>>,
 ) -> Result<u32, ReplayError> {
-    #[derive(Serialize)]
-    struct EventPageWire<'a> {
-        after_sequence: u64,
-        through_sequence: u64,
-        events: &'a [DomainEvent],
-        next_cursor: &'a Option<Vec<u8>>,
-    }
-    let page = EventPageWire {
+    let page = EventPage {
         after_sequence,
         through_sequence,
-        events,
-        next_cursor,
+        events: events.to_vec(),
+        next_cursor: next_cursor.clone(),
     };
-    let bytes = rmp_serde::to_vec_named(&page).map_err(|error| StoreError::CodecMismatch {
-        detail: format!("encode event page: {error}"),
-    })?;
-    u32::try_from(bytes.len())
-        .map_err(|_| StoreError::IntegerOutOfRange {
-            field: "event_page.encoded_bytes",
-            value: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+    canonical_event_page_size(&page).map_err(|error| {
+        ReplayError::Store(match error {
+            CanonicalPageSizeError::Encode { detail } => StoreError::CodecMismatch {
+                detail: format!("encode event page: {detail}"),
+            },
+            CanonicalPageSizeError::TooLarge { encoded_bytes } => StoreError::IntegerOutOfRange {
+                field: "event_page.encoded_bytes",
+                value: u64::try_from(encoded_bytes).unwrap_or(u64::MAX),
+            },
+            CanonicalPageSizeError::DidNotConverge => StoreError::CodecMismatch {
+                detail: "event page encoded length did not converge".into(),
+            },
         })
-        .map_err(Into::into)
+    })
 }
 
 impl Drop for EventReplaySession {

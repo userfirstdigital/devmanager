@@ -960,7 +960,7 @@ fn finish_detach_after_matching_ack(
 }
 
 /// Record an Accepted receipt. Collision with a different CommandId leaves the map unchanged.
-fn track_accepted_receipt(
+pub(crate) fn track_accepted_receipt(
     tracked: &mut BTreeMap<OperationId, TrackedOperation>,
     receipt: &CommandReceipt,
 ) -> Result<(), IpcError> {
