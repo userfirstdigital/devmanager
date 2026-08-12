@@ -36,7 +36,8 @@ $RequiredFiles = @(
     "connect_crypto_bg.wasm"
 )
 $OptionalFiles = @(
-    "connect_crypto.d.ts"
+    "connect_crypto.d.ts",
+    "connect_crypto_bg.wasm.d.ts"
 )
 $ManifestName = "connect_crypto.manifest.json"
 $AllowedOutputFiles = @($RequiredFiles + $OptionalFiles + $ManifestName)

@@ -22,6 +22,7 @@ export const CONNECT_CRYPTO_WASM_REQUIRED_FILES = [
 
 export const CONNECT_CRYPTO_WASM_OPTIONAL_FILES = [
   "connect_crypto.d.ts",
+  "connect_crypto_bg.wasm.d.ts",
 ] as const;
 
 export const CONNECT_CRYPTO_WASM_EXPORTS = [

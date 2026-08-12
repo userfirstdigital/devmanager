@@ -24,6 +24,7 @@ const connectCryptoWasmFiles = [
   "connect_crypto.js",
   "connect_crypto_bg.wasm",
   "connect_crypto.d.ts",
+  "connect_crypto_bg.wasm.d.ts",
   "connect_crypto.manifest.json",
 ] as const;
 

@@ -548,10 +548,11 @@ fn validate_asset_graph(
     referenced
 }
 
-const CONNECT_CRYPTO_ARTIFACT_FILES: [&str; 4] = [
+const CONNECT_CRYPTO_ARTIFACT_FILES: [&str; 5] = [
     "connect_crypto.js",
     "connect_crypto_bg.wasm",
     "connect_crypto.d.ts",
+    "connect_crypto_bg.wasm.d.ts",
     "connect_crypto.manifest.json",
 ];
 

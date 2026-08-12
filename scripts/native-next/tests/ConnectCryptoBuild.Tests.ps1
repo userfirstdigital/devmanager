@@ -7,6 +7,8 @@ $ErrorActionPreference = 'Stop'
 
 $scriptPath = Get-NativeNextScriptPath -Leaf 'Build-ConnectCrypto.ps1'
 $scriptText = Get-Content -LiteralPath $scriptPath -Raw
+$crateManifestPath = Join-Path $script:WorktreeRoot 'crates\connect-crypto\Cargo.toml'
+$crateManifestText = Get-Content -LiteralPath $crateManifestPath -Raw
 $tokens = $null
 $parseErrors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile(
@@ -38,6 +40,35 @@ Assert-Contract `
         $scriptText -notmatch '(?i)rustup\s+(target\s+add|toolchain\s+install)'
     ) `
     -Message 'Packaging must not install toolchains or dependencies.'
+
+Assert-Contract `
+    -Name 'connect-crypto-emits-wasm-cdylib' `
+    -Condition ($crateManifestText -match '(?ms)^\[lib\]\s*crate-type\s*=\s*\[\s*"cdylib"\s*,\s*"rlib"\s*\]') `
+    -Message 'The package must emit both the wasm-bindgen cdylib and the native/test rlib.'
+
+Assert-Contract `
+    -Name 'connect-crypto-wasm-enables-ring-getrandom-browser-backend-only' `
+    -Condition (
+        $crateManifestText -match '(?ms)^\[target\.\''cfg\(all\(target_arch = "wasm32", target_os = "unknown"\)\)\''\.dependencies\]\s*getrandom-02\s*=\s*\{\s*package\s*=\s*"getrandom"\s*,\s*version\s*=\s*"=0\.2\.17"\s*,\s*features\s*=\s*\["js"\]\s*\}'
+    ) `
+    -Message 'The ring/snow getrandom 0.2 browser backend must be an exact wasm32-unknown-unknown-only dependency edge.'
+
+Assert-Contract `
+    -Name 'connect-crypto-keeps-ring-native-and-wasm-pure-rust' `
+    -Condition (
+        $crateManifestText -match '(?ms)^\[target\.\''cfg\(not\(all\(target_arch = "wasm32", target_os = "unknown"\)\)\)\''\.dependencies\].*?snow\s*=.*?"ring-accelerated"' -and
+        $crateManifestText -match '(?ms)^\[target\.\''cfg\(all\(target_arch = "wasm32", target_os = "unknown"\)\)\''\.dependencies\].*?snow\s*=.*?"use-getrandom"' -and
+        $crateManifestText -notmatch '(?m)^snow\s*=.*"ring-accelerated"'
+    ) `
+    -Message 'Native must retain snow/ring acceleration while wasm32-unknown-unknown uses Snow pure-Rust primitives without a clang requirement.'
+
+Assert-Contract `
+    -Name 'connect-crypto-uuid-rng-is-target-specific' `
+    -Condition (
+        $crateManifestText -match '(?ms)^\[target\.\''cfg\(not\(all\(target_arch = "wasm32", target_os = "unknown"\)\)\)\''\.dependencies\].*?uuid\s*=.*?"v7"' -and
+        $crateManifestText -match '(?ms)^\[target\.\''cfg\(all\(target_arch = "wasm32", target_os = "unknown"\)\)\''\.dependencies\].*?uuid\s*=.*?"js"'
+    ) `
+    -Message 'UUID v7 generation must retain the native backend and select its explicit browser backend only on wasm32-unknown-unknown.'
 
 $capture = Invoke-NativeNextScriptCapture -ScriptPath $scriptPath -Arguments @('-PlanOnly')
 $exitCode = $capture.ExitCode
