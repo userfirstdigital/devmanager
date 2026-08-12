@@ -1,0 +1,19 @@
+{
+  "search_page": {
+    "schema_version": 1,
+    "library_revision": 7,
+    "namespace": "personal",
+    "hits": [
+      {
+        "source": "saved_prompt",
+        "prompt_id": "0192f5d0-0000-7000-8000-000000000001",
+        "history_id": null,
+        "title": "Sanitized review prompt",
+        "rank": 1,
+        "namespace": "personal",
+        "privacy_class": "local_only"
+      }
+    ],
+    "next_cursor": null
+  }
+}

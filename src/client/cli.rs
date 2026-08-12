@@ -368,6 +368,9 @@ pub fn actions_json_document() -> Result<String, CliError> {
     let actions: Vec<_> = action::catalog()
         .iter()
         .map(|entry| {
+            // Offline catalog has no Hello grant. Emit disabled_reason on every
+            // row so omission cannot be read as enabled.
+            let reason = action::disabled_reason(entry.id, CapabilitySet::empty());
             json!({
                 "id": entry.id,
                 "title": entry.title,
@@ -383,6 +386,8 @@ pub fn actions_json_document() -> Result<String, CliError> {
                     ActionRisk::Mutating => "mutating",
                 },
                 "argument_schema": argument_schema_json(entry.argument_schema),
+                "enabled": reason.is_none(),
+                "disabled_reason": reason,
             })
         })
         .collect();
@@ -467,27 +472,50 @@ fn argument_schema_json(schema: ActionArgumentSchema) -> serde_json::Value {
             },
             "required": ["task_id", "title"],
         }),
+        ActionArgumentSchema::PromptMetadataPageV1 => json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "namespace": { "enum": ["personal"] },
+                "cursor": { "type": ["string", "null"] },
+                "expected_revision": { "type": ["integer", "null"], "minimum": 0 }
+            },
+            "required": ["namespace"],
+        }),
+        ActionArgumentSchema::PromptVersionPageV1 => json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "version_id": uuid(),
+                "cursor": { "type": ["string", "null"] }
+            },
+            "required": ["version_id"],
+        }),
+        ActionArgumentSchema::PromptDiffV1 => json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "old_version_id": uuid(),
+                "new_version_id": uuid(),
+                "cursor": { "type": ["string", "null"] }
+            },
+            "required": ["old_version_id", "new_version_id"],
+        }),
+        ActionArgumentSchema::PromptChainPageV1 => json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "chain_id": uuid(),
+                "cursor": { "type": ["string", "null"] },
+                "expected_revision": { "type": ["integer", "null"], "minimum": 0 }
+            },
+            "required": ["chain_id"],
+        }),
     }
 }
 
 fn capability_name(capability: crate::protocol::Capability) -> &'static str {
-    use crate::protocol::Capability::*;
-    match capability {
-        PagedSnapshots => "paged_snapshots",
-        EventReplay => "event_replay",
-        OperationSettlement => "operation_settlement",
-        ChunkResume => "chunk_resume",
-        GenericExtensions => "generic_extensions",
-        SemanticConversation => "semantic_conversation",
-        TerminalDeltas => "terminal_deltas",
-        BrowserProjection => "browser_projection",
-        PromptProjection => "prompt_projection",
-        ConnectEncryption => "connect_encryption",
-        Guests => "guests",
-        ManagementMetadata => "management_metadata",
-        ExplicitDetach => "explicit_detach",
-        HostShutdown => "host_shutdown",
-    }
+    capability.wire_name()
 }
 
 /// Execute a parsed ctl command. Writes JSON to stdout on success.
@@ -642,6 +670,11 @@ async fn assemble_task_list(
             Ok(Err(QueryError::ReplayUnavailable { .. })) => {
                 return Err(CliError::new("task.list query replay is unavailable"))
             }
+            Ok(Err(QueryError::Unavailable { reason })) => {
+                return Err(CliError::new(format!(
+                    "task.list query is unavailable: {reason}"
+                )))
+            }
             Err(error) => return Err(CliError::new(format!("task.list query failed: {error}"))),
         };
 
@@ -750,6 +783,11 @@ async fn task_show_json_document_async(profile: &str, task_id: TaskId) -> Result
         Ok(Err(QueryError::ReplayUnavailable { .. })) => {
             return Err(CliError::new("task.show query replay is unavailable"))
         }
+        Ok(Err(QueryError::Unavailable { reason })) => {
+            return Err(CliError::new(format!(
+                "task.show query is unavailable: {reason}"
+            )))
+        }
         Err(error) => return Err(CliError::new(format!("task.show query failed: {error}"))),
     };
     let doc = json!({
@@ -819,7 +857,12 @@ fn invoke_json_document(
                 ))
             }
         }
-        other => Err(CliError::new(format!("unsupported action id: {other}"))),
+        other => {
+            if let Some(reason) = action::disabled_reason(other, CapabilitySet::empty()) {
+                return Err(CliError::new(reason.to_string()));
+            }
+            Err(CliError::new(format!("unsupported action id: {other}")))
+        }
     }
 }
 

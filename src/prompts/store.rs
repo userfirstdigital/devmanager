@@ -238,77 +238,25 @@ impl PromptStore {
         Ok(value)
     }
 
+    /// Store-suite mutation surface. Production host settlement goes through
+    /// [`crate::kernel::CommandBus`]; do not treat this as a product API.
+    #[doc(hidden)]
     pub fn execute(
         &mut self,
         command_id: CommandId,
         command: PromptCommand,
     ) -> Result<PromptMutationReceipt, PromptStoreError> {
-        let command = command.canonicalize()?;
-        match &command {
-            PromptCommand::CreatePrompt(command) => validate_sql_tags(&command.tags)?,
-            PromptCommand::SetPromptTags(command) => validate_sql_tags(&command.tags)?,
-            _ => {}
-        }
-        command.validate()?;
-        let command_payload = command
-            .encode()
-            .map_err(|error| PromptStoreError::Corruption(error.to_string()))?;
-        validate_wire_size("prompt command", &command_payload)?;
-        let command_sha256 = sha256_bytes(&command_payload);
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        validate_prompt_command_state(&tx, &command)?;
-
-        if let Some(receipt) = load_receipt(&tx, command_id, &command, &command_sha256)? {
-            tx.commit()?;
-            return Ok(receipt);
-        }
-
-        let (receipt, event, prompt_id, occurred_at_ms) = apply_command(&tx, command_id, &command)?;
-        let receipt_payload = receipt
-            .encode()
-            .map_err(|error| PromptStoreError::Corruption(error.to_string()))?;
-        validate_wire_size("prompt receipt", &receipt_payload)?;
-        tx.execute(
-            "INSERT INTO prompt_command_receipts(
-                command_id, command_sha256, command_payload, prompt_id, prompt_version_id,
-                revision, receipt, created_at_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            rusqlite::params![
-                command_id.as_bytes().as_slice(),
-                command_sha256.as_slice(),
-                command_payload,
-                receipt.prompt_id.as_bytes().as_slice(),
-                receipt.prompt_version_id.as_bytes().as_slice(),
-                to_i64(receipt.revision)?,
-                receipt_payload,
-                occurred_at_ms,
-            ],
-        )?;
-        if let Some(event) = event {
-            let event_payload = event
-                .encode()
-                .map_err(|error| PromptStoreError::Corruption(error.to_string()))?;
-            validate_wire_size("prompt event", &event_payload)?;
-            tx.execute(
-                "INSERT INTO prompt_events(
-                    prompt_event_id, command_id, prompt_id, event_type, occurred_at_ms, payload
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                rusqlite::params![
-                    EventId::new().as_bytes().as_slice(),
-                    command_id.as_bytes().as_slice(),
-                    prompt_id.as_bytes().as_slice(),
-                    event.event_type(),
-                    occurred_at_ms,
-                    event_payload,
-                ],
-            )?;
-        }
+        let receipt = execute_prompt_command_in_tx(&tx, command_id, command)?;
         tx.commit()?;
         Ok(receipt)
     }
 
+    /// Chain mutations stay on the store until [`PromptChainCommand`] joins
+    /// [`crate::domain::command::Command`]. Not a host settlement API.
+    #[doc(hidden)]
     pub fn execute_chain(
         &mut self,
         command_id: CommandId,
@@ -400,6 +348,7 @@ impl PromptStore {
         Ok(receipt)
     }
 
+    #[doc(hidden)]
     pub fn execute_chain_command(
         &mut self,
         command_id: CommandId,
@@ -509,7 +458,30 @@ impl PromptStore {
         self.with_read_transaction(|tx| list_prompts_tx(tx, offset, limit))
     }
 
-    pub fn snapshot(
+    /// Durable current-state library revision. Sum of prompt and chain row
+    /// revisions is independent of compacted event journals.
+    pub fn library_projection_revision(&self) -> Result<u64, PromptStoreError> {
+        self.with_read_transaction(library_projection_revision_in_tx)
+    }
+
+    pub fn list_prompts_after(
+        &self,
+        after: Option<PromptId>,
+        limit: usize,
+    ) -> Result<Vec<SavedPrompt>, PromptStoreError> {
+        self.with_read_transaction(|tx| list_prompts_after_tx(tx, after, limit))
+    }
+
+    pub fn list_chain_links_after(
+        &self,
+        chain_id: PromptChainId,
+        after: Option<PromptChainLinkId>,
+        limit: usize,
+    ) -> Result<Vec<PromptChainLink>, PromptStoreError> {
+        self.with_read_transaction(|tx| list_chain_links_after_tx(tx, chain_id, after, limit))
+    }
+
+    pub(crate) fn snapshot(
         &self,
         offset: usize,
         limit: usize,
@@ -524,12 +496,12 @@ impl PromptStore {
         })
     }
 
-    pub fn global_snapshot(
+    pub(crate) fn global_snapshot(
         &self,
-        offset: usize,
-        limit: usize,
+        _offset: usize,
+        _limit: usize,
     ) -> Result<PromptSnapshot, PromptStoreError> {
-        self.snapshot(offset, limit)
+        Err(PromptStoreError::InvalidTransition)
     }
 
     pub fn list_versions(
@@ -709,6 +681,100 @@ impl PromptStore {
             })?,
         })
     }
+}
+
+fn list_prompts_after_tx(
+    tx: &Transaction<'_>,
+    after: Option<PromptId>,
+    limit: usize,
+) -> Result<Vec<SavedPrompt>, PromptStoreError> {
+    validate_page(limit)?;
+    let Some(after_id) = after else {
+        return list_prompts_tx(tx, 0, limit);
+    };
+    let Some(after_prompt) = load_prompt(tx, after_id)? else {
+        return Err(PromptStoreError::NotFound);
+    };
+    let archived_rank: i64 = if after_prompt.archived_at_ms.is_some() {
+        1
+    } else {
+        0
+    };
+    let mut statement = tx.prepare(
+        "SELECT prompt_id, title, description, current_version_id, revision,
+                archived_at_ms
+         FROM saved_prompts
+         WHERE (
+            CASE WHEN archived_at_ms IS NULL THEN 0 ELSE 1 END > ?1
+            OR (
+                CASE WHEN archived_at_ms IS NULL THEN 0 ELSE 1 END = ?1
+                AND (
+                    title COLLATE NOCASE > ?2
+                    OR (title COLLATE NOCASE = ?2 AND prompt_id > ?3)
+                )
+            )
+         )
+         ORDER BY CASE WHEN archived_at_ms IS NULL THEN 0 ELSE 1 END,
+                  title COLLATE NOCASE ASC, prompt_id ASC
+         LIMIT ?4",
+    )?;
+    let rows = statement.query_map(
+        rusqlite::params![
+            archived_rank,
+            after_prompt.title,
+            after_id.as_bytes().as_slice(),
+            to_i64(limit)?,
+        ],
+        |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, Option<i64>>(5)?,
+            ))
+        },
+    )?;
+    let mut prompts = Vec::new();
+    for row in rows {
+        let (id, title, description, current_version_id, revision, archived_at_ms) = row?;
+        let prompt = SavedPrompt {
+            id: prompt_id_from_bytes(&id)?,
+            title,
+            description,
+            tags: load_tags(tx, &id)?,
+            current_version_id: version_id_from_bytes(&current_version_id)?,
+            revision: from_i64("saved_prompts.revision", revision)?,
+            archived_at_ms,
+        };
+        validate_saved_prompt_record(tx, &prompt)?;
+        prompts.push(prompt);
+    }
+    Ok(prompts)
+}
+
+fn list_chain_links_after_tx(
+    tx: &Transaction<'_>,
+    chain_id: PromptChainId,
+    after: Option<PromptChainLinkId>,
+    limit: usize,
+) -> Result<Vec<PromptChainLink>, PromptStoreError> {
+    validate_page(limit)?;
+    if load_chain(tx, chain_id)?.is_none() {
+        return Err(PromptStoreError::NotFound);
+    }
+    let links = load_chain_links(tx, chain_id)?;
+    validate_chain_links(tx, chain_id, &links)?;
+    let start = match after {
+        None => 0,
+        Some(after_id) => links
+            .iter()
+            .position(|link| link.id() == after_id)
+            .map(|index| index.saturating_add(1))
+            .ok_or(PromptStoreError::NotFound)?,
+    };
+    Ok(links.into_iter().skip(start).take(limit).collect())
 }
 
 fn list_prompts_tx(
@@ -2084,6 +2150,106 @@ fn load_chain_command_payload(
         ));
     };
     Ok(Some((command_sha256, command_payload)))
+}
+
+pub(crate) fn library_projection_revision_in_tx(
+    tx: &Transaction<'_>,
+) -> Result<u64, PromptStoreError> {
+    let prompt_sum: i64 = tx.query_row(
+        "SELECT COALESCE(SUM(revision), 0) FROM saved_prompts",
+        [],
+        |row| row.get(0),
+    )?;
+    let chain_sum: i64 = tx.query_row(
+        "SELECT COALESCE(SUM(revision), 0) FROM prompt_chains",
+        [],
+        |row| row.get(0),
+    )?;
+    let total = prompt_sum.checked_add(chain_sum).ok_or_else(|| {
+        PromptStoreError::Corruption("library projection revision overflow".into())
+    })?;
+    from_i64("library_projection_revision", total)
+}
+
+pub(crate) fn prompt_mutation_receipt_matching_command(
+    tx: &Transaction<'_>,
+    command_id: CommandId,
+    command: &PromptCommand,
+) -> Result<Option<PromptMutationReceipt>, PromptStoreError> {
+    let command = command.canonicalize()?;
+    command.validate()?;
+    let command_payload = command
+        .encode()
+        .map_err(|error| PromptStoreError::Corruption(error.to_string()))?;
+    validate_wire_size("prompt command", &command_payload)?;
+    let command_sha256 = sha256_bytes(&command_payload);
+    load_receipt(tx, command_id, &command, &command_sha256)
+}
+
+pub(crate) fn execute_prompt_command_in_tx(
+    tx: &Transaction<'_>,
+    command_id: CommandId,
+    command: PromptCommand,
+) -> Result<PromptMutationReceipt, PromptStoreError> {
+    let command = command.canonicalize()?;
+    match &command {
+        PromptCommand::CreatePrompt(command) => validate_sql_tags(&command.tags)?,
+        PromptCommand::SetPromptTags(command) => validate_sql_tags(&command.tags)?,
+        _ => {}
+    }
+    command.validate()?;
+    let command_payload = command
+        .encode()
+        .map_err(|error| PromptStoreError::Corruption(error.to_string()))?;
+    validate_wire_size("prompt command", &command_payload)?;
+    let command_sha256 = sha256_bytes(&command_payload);
+    validate_prompt_command_state(tx, &command)?;
+
+    if let Some(receipt) = load_receipt(tx, command_id, &command, &command_sha256)? {
+        return Ok(receipt);
+    }
+
+    let (receipt, event, prompt_id, occurred_at_ms) = apply_command(tx, command_id, &command)?;
+    let receipt_payload = receipt
+        .encode()
+        .map_err(|error| PromptStoreError::Corruption(error.to_string()))?;
+    validate_wire_size("prompt receipt", &receipt_payload)?;
+    tx.execute(
+        "INSERT INTO prompt_command_receipts(
+            command_id, command_sha256, command_payload, prompt_id, prompt_version_id,
+            revision, receipt, created_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        rusqlite::params![
+            command_id.as_bytes().as_slice(),
+            command_sha256.as_slice(),
+            command_payload,
+            receipt.prompt_id.as_bytes().as_slice(),
+            receipt.prompt_version_id.as_bytes().as_slice(),
+            to_i64(receipt.revision)?,
+            receipt_payload,
+            occurred_at_ms,
+        ],
+    )?;
+    if let Some(event) = event {
+        let event_payload = event
+            .encode()
+            .map_err(|error| PromptStoreError::Corruption(error.to_string()))?;
+        validate_wire_size("prompt event", &event_payload)?;
+        tx.execute(
+            "INSERT INTO prompt_events(
+                prompt_event_id, command_id, prompt_id, event_type, occurred_at_ms, payload
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                EventId::new().as_bytes().as_slice(),
+                command_id.as_bytes().as_slice(),
+                prompt_id.as_bytes().as_slice(),
+                event.event_type(),
+                occurred_at_ms,
+                event_payload,
+            ],
+        )?;
+    }
+    Ok(receipt)
 }
 
 fn apply_command(

@@ -77,6 +77,26 @@ impl Capability {
     pub const fn bit(self) -> u64 {
         1_u64 << (self as u8)
     }
+
+    /// Stable capability name used by Hello/catalog documents.
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::PagedSnapshots => "paged_snapshots",
+            Self::EventReplay => "event_replay",
+            Self::OperationSettlement => "operation_settlement",
+            Self::ChunkResume => "chunk_resume",
+            Self::GenericExtensions => "generic_extensions",
+            Self::SemanticConversation => "semantic_conversation",
+            Self::TerminalDeltas => "terminal_deltas",
+            Self::BrowserProjection => "browser_projection",
+            Self::PromptProjection => "personal_prompt_library",
+            Self::ConnectEncryption => "connect_encryption",
+            Self::Guests => "guests",
+            Self::ManagementMetadata => "management_metadata",
+            Self::ExplicitDetach => "explicit_detach",
+            Self::HostShutdown => "host_shutdown",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,5 +136,10 @@ impl CapabilitySet {
 
     pub const fn intersection(self, peer: Self) -> Self {
         Self::from_bits(self.bits & peer.bits)
+    }
+
+    /// Personal prompt library frames stay on the host / owner-device path.
+    pub const fn grants_personal_prompt_library(self) -> bool {
+        self.contains(Capability::PromptProjection)
     }
 }

@@ -56,6 +56,15 @@ use crate::kernel::store::{
     encode_event_payload, now_ms, u64_from_nonnegative_i64, u64_to_sqlite_i64, KernelStore,
     StoreError,
 };
+use crate::prompts::projection::{
+    project_prompt_store, OwnerDeviceCapability, PromptLibraryRequest, PromptProjectionError,
+    PromptProjectionSubsystem,
+};
+use crate::prompts::store::{
+    execute_prompt_command_in_tx, library_projection_revision_in_tx,
+    prompt_mutation_receipt_matching_command, PromptStore, PromptStoreError,
+};
+use crate::protocol::CapabilitySet;
 
 /// One advancement unit from the Closing host-cleanup journal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,6 +114,7 @@ pub(crate) enum HostRestartDispositionUnit {
 /// Host-facing command facade. Owns the durable store; does not expose SQLite.
 pub struct CommandBus {
     store: KernelStore,
+    prompts: PromptStore,
 }
 
 impl fmt::Debug for CommandBus {
@@ -118,12 +128,28 @@ impl CommandBus {
     pub fn open(path: &Path) -> Result<Self, StoreError> {
         Ok(Self {
             store: KernelStore::open(path)?,
+            prompts: PromptStore::open(path).map_err(map_prompt_store_error)?,
         })
     }
 
     /// Execute a command through the owned store.
     pub fn execute(&mut self, envelope: CommandEnvelope) -> Result<CommandReceipt, StoreError> {
         self.store.execute(envelope)
+    }
+
+    /// Prompt-library mutation that requires a sealed owner or paired-owner grant.
+    /// Hello set intersection cannot mint that grant.
+    pub fn execute_with_owner_grant(
+        &mut self,
+        grant: &OwnerDeviceCapability,
+        envelope: CommandEnvelope,
+    ) -> Result<CommandReceipt, StoreError> {
+        if !matches!(envelope.command, Command::PromptLibrary(_)) {
+            return self.execute(envelope);
+        }
+        self.store.with_immediate_transaction(|tx| {
+            execute_prompt_library_in_tx(tx, Some(grant), envelope)
+        })
     }
 
     /// Query durable operation status without creating operations.
@@ -208,9 +234,75 @@ impl CommandBus {
 
     /// Serve a side-effect-free query through the owned store projections only.
     ///
+    /// Prompt library pages require a sealed owner grant via
+    /// [`Self::query_with_owner_grant`]. Hello bits are a transport fence only.
+    ///
     /// Paged snapshot, event-replay, and artifact-content open/resume/release require
     /// the host executor registry and return [`QueryError::UnsupportedCapability`] here.
     pub fn query(&self, envelope: QueryEnvelope) -> Result<QueryReply, StoreError> {
+        self.query_with_capabilities(CapabilitySet::empty(), envelope)
+    }
+
+    /// Query with the Hello-negotiated grant set. PromptProjection on the wire
+    /// is only a transport fence: it cannot mint owner authority.
+    pub fn query_with_capabilities(
+        &self,
+        granted: CapabilitySet,
+        envelope: QueryEnvelope,
+    ) -> Result<QueryReply, StoreError> {
+        if matches!(envelope.query, Query::PromptLibrary(_)) {
+            let outcome = if granted.grants_personal_prompt_library() {
+                QueryOutcome::Err(QueryError::Unavailable {
+                    reason: prompt_unavailable_reason(
+                        PromptProjectionSubsystem::OwnerDeviceSession,
+                    ),
+                })
+            } else {
+                QueryOutcome::Err(QueryError::UnsupportedCapability)
+            };
+            return Ok(QueryReply {
+                request_id: envelope.request_id,
+                outcome,
+            });
+        }
+        self.query_without_prompt_grant(envelope)
+    }
+
+    /// Prompt-library query that requires a sealed owner or paired-owner grant.
+    pub fn query_with_owner_grant(
+        &self,
+        grant: &OwnerDeviceCapability,
+        max_document_bytes: u32,
+        envelope: QueryEnvelope,
+    ) -> Result<QueryReply, StoreError> {
+        let Query::PromptLibrary(query) = envelope.query else {
+            return self.query(envelope);
+        };
+        if !grant.binds_client(envelope.client_id) {
+            return Ok(QueryReply {
+                request_id: envelope.request_id,
+                outcome: QueryOutcome::Err(QueryError::UnsupportedCapability),
+            });
+        }
+        let outcome = query_prompt_library(
+            &self.prompts,
+            grant,
+            max_document_bytes,
+            envelope.request_id,
+            envelope.client_id,
+            envelope.task_id,
+            query,
+        )?;
+        Ok(QueryReply {
+            request_id: envelope.request_id,
+            outcome,
+        })
+    }
+
+    fn query_without_prompt_grant(
+        &self,
+        envelope: QueryEnvelope,
+    ) -> Result<QueryReply, StoreError> {
         let outcome = match envelope.query {
             Query::OperationStatus { operation_id } => match self.operation_status(operation_id)? {
                 Some(state) => QueryOutcome::Ok(QueryResult::OperationStatus {
@@ -251,6 +343,7 @@ impl CommandBus {
                     inspection: self.inspect_host_quit()?,
                 })
             }
+            Query::PromptLibrary(_) => QueryOutcome::Err(QueryError::UnsupportedCapability),
             Query::SnapshotPage { .. }
             | Query::ReleaseSnapshot { .. }
             | Query::OpenEventReplay { .. }
@@ -304,6 +397,272 @@ impl CommandBus {
             max_physical_frame_bytes,
         )
     }
+}
+
+fn map_prompt_store_error(error: PromptStoreError) -> StoreError {
+    match error {
+        PromptStoreError::Database(message) | PromptStoreError::Corruption(message) => {
+            StoreError::Sqlite(message)
+        }
+        PromptStoreError::ConstraintViolation => StoreError::ConstraintViolation,
+        other => StoreError::Projection(other.to_string()),
+    }
+}
+
+fn prompt_unavailable_reason(subsystem: PromptProjectionSubsystem) -> &'static str {
+    match subsystem {
+        PromptProjectionSubsystem::SearchIndex => "search_index",
+        PromptProjectionSubsystem::HistoryStore => "history_store",
+        PromptProjectionSubsystem::OrganizationNamespace => "organization_namespace",
+        PromptProjectionSubsystem::ChainDirectory => "chain_directory",
+        PromptProjectionSubsystem::OwnerDeviceSession => "owner_device_session",
+        PromptProjectionSubsystem::NegotiatedTransportLimit => "negotiated_transport_limit",
+    }
+}
+
+fn map_prompt_projection_error(error: PromptProjectionError) -> QueryError {
+    match error {
+        PromptProjectionError::Unavailable { subsystem } => QueryError::Unavailable {
+            reason: prompt_unavailable_reason(subsystem),
+        },
+        PromptProjectionError::PermissionDenied | PromptProjectionError::UnsupportedCapability => {
+            QueryError::UnsupportedCapability
+        }
+        PromptProjectionError::NotFound => QueryError::NotFound,
+        _ => QueryError::InvalidRequest,
+    }
+}
+
+fn query_prompt_library(
+    store: &PromptStore,
+    grant: &OwnerDeviceCapability,
+    max_document_bytes: u32,
+    request_id: crate::domain::id::RequestId,
+    client_id: ClientId,
+    task_id: Option<TaskId>,
+    query: crate::prompts::projection::PromptLibraryQuery,
+) -> Result<QueryOutcome, StoreError> {
+    let request = PromptLibraryRequest::from_authenticated_query(
+        request_id, client_id, task_id, query, grant,
+    )
+    .map_err(|error| StoreError::Projection(format!("{error:?}")))?;
+    match project_prompt_store(grant, &request, store, max_document_bytes) {
+        Ok(reply) => Ok(QueryOutcome::Ok(QueryResult::PromptLibrary(reply))),
+        Err(error) => Ok(QueryOutcome::Err(map_prompt_projection_error(error))),
+    }
+}
+
+fn execute_prompt_library_in_tx(
+    tx: &Transaction<'_>,
+    grant: Option<&OwnerDeviceCapability>,
+    envelope: CommandEnvelope,
+) -> Result<CommandReceipt, StoreError> {
+    if let Some(existing) = lookup_receipt(tx, envelope.command_id)? {
+        return replay_prompt_library_receipt(tx, &envelope, existing);
+    }
+    let Some(grant) = grant else {
+        return persist_rejection(
+            tx,
+            &envelope,
+            None,
+            RejectionCode::UnsupportedCapability,
+            None,
+            now_ms()?,
+        );
+    };
+    if !grant.binds_client(envelope.client_id) {
+        return persist_rejection(
+            tx,
+            &envelope,
+            None,
+            RejectionCode::UnsupportedCapability,
+            None,
+            now_ms()?,
+        );
+    }
+    persist_prompt_library(tx, envelope)
+}
+
+fn replay_prompt_library_receipt(
+    tx: &Transaction<'_>,
+    envelope: &CommandEnvelope,
+    existing: CommandReceipt,
+) -> Result<CommandReceipt, StoreError> {
+    let Command::PromptLibrary(command) = &envelope.command else {
+        return Err(StoreError::Projection(
+            "prompt library replay requires PromptLibrary".into(),
+        ));
+    };
+    match prompt_mutation_receipt_matching_command(tx, envelope.command_id, command) {
+        Ok(Some(mutation)) => match existing {
+            CommandReceipt::Accepted {
+                command_id,
+                operation_id,
+                task_revision,
+                event_ids,
+                prompt_mutation: _,
+            } => Ok(CommandReceipt::Accepted {
+                command_id,
+                operation_id,
+                task_revision,
+                event_ids,
+                prompt_mutation: Some(mutation),
+            }),
+            rejected => Ok(rejected),
+        },
+        Ok(None) => match existing {
+            CommandReceipt::Rejected { .. } => Ok(existing),
+            CommandReceipt::Accepted { .. } => Err(StoreError::Corruption),
+        },
+        Err(PromptStoreError::IdempotencyConflict) => {
+            let current = library_projection_revision_in_tx(tx).map_err(map_prompt_store_error)?;
+            Ok(CommandReceipt::Rejected {
+                command_id: envelope.command_id,
+                code: RejectionCode::AlreadyExists,
+                current_revision: Some(current),
+            })
+        }
+        Err(error) => Err(map_prompt_store_error(error)),
+    }
+}
+
+fn persist_prompt_library(
+    tx: &Transaction<'_>,
+    envelope: CommandEnvelope,
+) -> Result<CommandReceipt, StoreError> {
+    let accepted_at_ms = now_ms()?;
+    let Command::PromptLibrary(command) = envelope.command.clone() else {
+        return Err(StoreError::Projection(
+            "persist_prompt_library requires PromptLibrary".into(),
+        ));
+    };
+    if envelope.task_id.is_some() {
+        return persist_rejection(
+            tx,
+            &envelope,
+            None,
+            RejectionCode::InvalidTransition,
+            None,
+            accepted_at_ms,
+        );
+    }
+    let current = library_projection_revision_in_tx(tx).map_err(map_prompt_store_error)?;
+    if let Some(expected) = envelope.expected_task_revision {
+        if expected != current {
+            return persist_rejection(
+                tx,
+                &envelope,
+                None,
+                RejectionCode::RevisionConflict,
+                Some(current),
+                accepted_at_ms,
+            );
+        }
+    }
+    match execute_prompt_command_in_tx(tx, envelope.command_id, command) {
+        Ok(mutation) => persist_prompt_library_acceptance(tx, &envelope, mutation, accepted_at_ms),
+        Err(PromptStoreError::RevisionConflict { actual, .. }) => persist_rejection(
+            tx,
+            &envelope,
+            None,
+            RejectionCode::RevisionConflict,
+            Some(actual),
+            accepted_at_ms,
+        ),
+        Err(PromptStoreError::NotFound) => persist_rejection(
+            tx,
+            &envelope,
+            None,
+            RejectionCode::NotFound,
+            Some(current),
+            accepted_at_ms,
+        ),
+        Err(PromptStoreError::AlreadyExists) => persist_rejection(
+            tx,
+            &envelope,
+            None,
+            RejectionCode::AlreadyExists,
+            Some(current),
+            accepted_at_ms,
+        ),
+        Err(PromptStoreError::InvalidTransition | PromptStoreError::Validation(_)) => {
+            persist_rejection(
+                tx,
+                &envelope,
+                None,
+                RejectionCode::InvalidTransition,
+                Some(current),
+                accepted_at_ms,
+            )
+        }
+        Err(PromptStoreError::IdempotencyConflict) => persist_rejection(
+            tx,
+            &envelope,
+            None,
+            RejectionCode::AlreadyExists,
+            Some(current),
+            accepted_at_ms,
+        ),
+        Err(error) => Err(map_prompt_store_error(error)),
+    }
+}
+
+fn persist_prompt_library_acceptance(
+    tx: &Transaction<'_>,
+    envelope: &CommandEnvelope,
+    mutation: crate::prompts::PromptMutationReceipt,
+    accepted_at_ms: i64,
+) -> Result<CommandReceipt, StoreError> {
+    let operation_id = OperationId::new();
+    let accepted_event_id = EventId::new();
+    let settled_event_id = EventId::new();
+    let receipt = CommandReceipt::Accepted {
+        command_id: envelope.command_id,
+        operation_id,
+        task_revision: None,
+        event_ids: vec![accepted_event_id],
+        prompt_mutation: Some(mutation),
+    };
+    insert_receipt_row(tx, envelope, None, &receipt, None, accepted_at_ms)?;
+
+    let accepted = OperationAcceptedFact::new(
+        envelope.command_id,
+        operation_id,
+        accepted_at_ms,
+        None,
+        None,
+        None,
+    )
+    .map_err(|err| StoreError::Projection(err.to_string()))?;
+    append_and_project(
+        tx,
+        accepted_event_id,
+        None,
+        None,
+        accepted_at_ms,
+        Event::OperationAccepted(accepted),
+    )?;
+
+    let settled = OperationSettledFact::new(
+        envelope.command_id,
+        operation_id,
+        accepted_at_ms,
+        vec![accepted_event_id],
+        None,
+        None,
+        None,
+    )
+    .map_err(|err| StoreError::Projection(err.to_string()))?;
+    let committed_sequence = append_and_project(
+        tx,
+        settled_event_id,
+        None,
+        None,
+        accepted_at_ms,
+        Event::OperationSettled(settled),
+    )?;
+    set_committed_sequence(tx, envelope.command_id, committed_sequence)?;
+    Ok(receipt)
 }
 
 pub(crate) fn execute(
@@ -537,6 +896,7 @@ fn record_outcome_in_tx(
         operation_id: receipt_op,
         event_ids,
         task_revision: receipt_revision,
+        ..
     } = &receipt_row.receipt
     else {
         return Err(StoreError::Corruption);
@@ -977,6 +1337,7 @@ pub(crate) fn validate_dispatch_candidate_lineage(
         operation_id: receipt_operation_id,
         event_ids,
         task_revision,
+        ..
     } = &receipt_row.receipt
     else {
         return Err(StoreError::Corruption);
@@ -1948,6 +2309,7 @@ fn cancel_untouched_begin_close_for_reopen(
         operation_id: receipt_operation_id,
         event_ids,
         task_revision,
+        ..
     } = &receipt_row.receipt
     else {
         return Err(StoreError::Corruption);
@@ -2050,6 +2412,9 @@ fn execute_in_tx(
     tx: &Transaction<'_>,
     envelope: CommandEnvelope,
 ) -> Result<CommandReceipt, StoreError> {
+    if matches!(envelope.command, Command::PromptLibrary(_)) {
+        return execute_prompt_library_in_tx(tx, None, envelope);
+    }
     if let Some(existing) = lookup_receipt(tx, envelope.command_id)? {
         return Ok(existing);
     }
@@ -2551,7 +2916,17 @@ fn validate_accepted_receipt_correlation(
     }
 
     if receipt_task_id.is_none() && receipt_task_revision.is_none() {
-        return validate_host_admission_accepted_receipt(
+        if operation.action_epoch.is_some() {
+            return validate_host_admission_accepted_receipt(
+                tx,
+                command_id,
+                expected_operation_id,
+                event_ids,
+                committed_sequence,
+                &operation,
+            );
+        }
+        return validate_prompt_library_accepted_receipt(
             tx,
             command_id,
             expected_operation_id,
@@ -2600,6 +2975,81 @@ fn validate_accepted_receipt_correlation(
         committed_sequence,
         &operation,
     )
+}
+
+fn validate_prompt_library_accepted_receipt(
+    tx: &Connection,
+    command_id: CommandId,
+    expected_operation_id: OperationId,
+    event_ids: &[EventId],
+    committed_sequence: u64,
+    operation: &OperationProjectionRow,
+) -> Result<(), StoreError> {
+    if event_ids.len() != 1 {
+        return Err(StoreError::Corruption);
+    }
+    if operation.task_id.is_some()
+        || operation.resource_id.is_some()
+        || operation.runtime_generation.is_some()
+        || operation.action_epoch.is_some()
+    {
+        return Err(StoreError::Corruption);
+    }
+    if !load_outbox_rows(tx, expected_operation_id)?.is_empty() {
+        return Err(StoreError::Corruption);
+    }
+    if operation.state != "settled" {
+        return Err(StoreError::Corruption);
+    }
+    let settled_sequence = committed_sequence;
+    let accepted_sequence = settled_sequence
+        .checked_sub(1)
+        .ok_or(StoreError::Corruption)?;
+    let accepted_row = load_event_row_at_sequence(tx, accepted_sequence)?;
+    if accepted_row.event_id != event_ids[0] {
+        return Err(StoreError::Corruption);
+    }
+    validate_accepted_fact_row(
+        &accepted_row,
+        command_id,
+        expected_operation_id,
+        None,
+        operation.accepted_at_ms,
+        OperationFence {
+            action_epoch: None,
+            resource_id: None,
+            runtime_generation: None,
+        },
+    )?;
+    let settled_row = load_event_row_at_sequence(tx, settled_sequence)?;
+    if settled_row.task_id.is_some() || settled_row.task_revision.is_some() {
+        return Err(StoreError::Corruption);
+    }
+    let settled_event = crate::kernel::store::decode_stored_event(
+        &settled_row.event_type,
+        settled_row.schema_version,
+        &settled_row.payload,
+    )?;
+    let Event::OperationSettled(settled) = settled_event else {
+        return Err(StoreError::Corruption);
+    };
+    let Some(outcome_at_ms) = operation.outcome_at_ms else {
+        return Err(StoreError::Corruption);
+    };
+    if settled.command_id != command_id
+        || settled.operation_id != expected_operation_id
+        || settled.result_event_ids != event_ids
+        || settled.action_epoch.is_some()
+        || settled.resource_id.is_some()
+        || settled.runtime_generation.is_some()
+        || settled.source != crate::domain::operation::OutcomeSource::Dispatch
+        || settled_row.occurred_at_ms != settled.settled_at_ms
+        || settled.settled_at_ms != outcome_at_ms
+        || outcome_at_ms != operation.accepted_at_ms
+    {
+        return Err(StoreError::Corruption);
+    }
+    Ok(())
 }
 
 fn validate_host_admission_accepted_receipt(
@@ -3456,6 +3906,7 @@ pub(crate) fn compact_terminal_outbox_payloads_in_tx(
             operation_id: receipt_operation_id,
             event_ids,
             task_revision,
+            ..
         } = &receipt_row.receipt
         else {
             return Err(StoreError::Corruption);
@@ -5554,6 +6005,7 @@ fn persist_pure_acceptance(
         operation_id,
         task_revision: final_task_revision,
         event_ids: decision_event_ids.clone(),
+        prompt_mutation: None,
     };
     insert_receipt_row(
         tx,
@@ -5674,6 +6126,7 @@ fn persist_side_effect_acceptance(
         operation_id,
         task_revision: final_task_revision,
         event_ids: decision_event_ids.clone(),
+        prompt_mutation: None,
     };
     insert_receipt_row(tx, envelope, Some(task_id), &receipt, None, accepted_at_ms)?;
 
@@ -6451,6 +6904,7 @@ fn persist_confirm_host_quit(
         operation_id,
         task_revision: None,
         event_ids: vec![begun_event_id],
+        prompt_mutation: None,
     };
     insert_receipt_row(tx, &envelope, None, &receipt, None, accepted_at_ms)?;
 

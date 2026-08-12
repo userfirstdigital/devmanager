@@ -4,6 +4,8 @@
 //! `task.create`, and `task.rename`. It is intentionally not a dynamic
 //! plugin framework.
 
+use std::sync::OnceLock;
+
 use serde::{Deserialize, Serialize};
 
 use crate::domain::command::{Command, CommandEnvelope, CreateTaskIntent, RenameTaskIntent};
@@ -13,7 +15,11 @@ use crate::domain::task::{
     TaskValidationError, WorkspaceRef,
 };
 use crate::domain::{ClientId, CommandId, EnvironmentId, ProjectId, RequestId, TaskId};
-use crate::protocol::Capability;
+use crate::prompts::projection::{
+    OwnerDeviceCapability, PromptCursor, PromptLibraryRequest, PromptNamespace,
+    PromptProjectionError,
+};
+use crate::protocol::{Capability, CapabilitySet};
 
 /// Stable id for listing the shared action catalog.
 pub const ACTION_HOST_ACTIONS: &str = "host.actions";
@@ -27,6 +33,18 @@ pub const ACTION_TASK_SHOW: &str = "task.show";
 pub const ACTION_TASK_CREATE: &str = "task.create";
 /// Stable id for renaming one Task through the host command boundary.
 pub const ACTION_TASK_RENAME: &str = "task.rename";
+/// Read-only host query for a personal prompt metadata page.
+pub const ACTION_PROMPT_METADATA_PAGE: &str = "prompt.library.metadata_page";
+/// Read-only host query for an exact immutable prompt version page.
+pub const ACTION_PROMPT_VERSION_PAGE: &str = "prompt.library.version_page";
+/// Read-only host query for a bounded prompt version diff page.
+pub const ACTION_PROMPT_DIFF: &str = "prompt.library.diff";
+/// Read-only host query for a bounded personal prompt search page.
+pub const ACTION_PROMPT_SEARCH_PAGE: &str = "prompt.library.search_page";
+/// Read-only host query for a linear prompt chain page.
+pub const ACTION_PROMPT_CHAIN_PAGE: &str = "prompt.library.chain_page";
+/// Read-only host query for a personal prompt history page.
+pub const ACTION_PROMPT_HISTORY_PAGE: &str = "prompt.library.history_page";
 
 /// Where an action applies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +67,10 @@ pub enum ActionArgumentSchema {
     TaskId,
     TaskCreateV1,
     TaskRenameV1,
+    PromptMetadataPageV1,
+    PromptVersionPageV1,
+    PromptDiffV1,
+    PromptChainPageV1,
 }
 
 /// Static metadata for one catalog action.
@@ -147,15 +169,124 @@ pub struct TaskRenameArguments {
     pub title: String,
 }
 
-/// Return the closed catalog for this slice.
+/// Return the single host action registry for this slice.
 pub fn catalog() -> &'static [ActionDescriptor] {
-    ACTIONS
+    static CATALOG: OnceLock<Vec<ActionDescriptor>> = OnceLock::new();
+    CATALOG
+        .get_or_init(|| {
+            let mut entries = Vec::with_capacity(ACTIONS.len() + PROMPT_LIBRARY_EXTENSION.len());
+            entries.extend_from_slice(ACTIONS);
+            entries.extend_from_slice(PROMPT_LIBRARY_EXTENSION);
+            entries
+        })
+        .as_slice()
+}
+
+const PROMPT_LIBRARY_EXTENSION: &[ActionDescriptor] = &[
+    ActionDescriptor {
+        id: ACTION_PROMPT_METADATA_PAGE,
+        title: "Prompt metadata page",
+        description: "Page personal or organization prompt metadata without bodies.",
+        keywords: &["prompt", "library", "metadata", "page"],
+        scope: ActionScope::Host,
+        required_capability: Some(Capability::PromptProjection),
+        risk: ActionRisk::ReadOnly,
+        argument_schema: ActionArgumentSchema::PromptMetadataPageV1,
+    },
+    ActionDescriptor {
+        id: ACTION_PROMPT_VERSION_PAGE,
+        title: "Prompt version page",
+        description: "Read one exact immutable prompt version through bounded chunks.",
+        keywords: &["prompt", "version", "chunk"],
+        scope: ActionScope::Host,
+        required_capability: Some(Capability::PromptProjection),
+        risk: ActionRisk::ReadOnly,
+        argument_schema: ActionArgumentSchema::PromptVersionPageV1,
+    },
+    ActionDescriptor {
+        id: ACTION_PROMPT_DIFF,
+        title: "Prompt version diff",
+        description: "Read a bounded public diff of two immutable prompt versions.",
+        keywords: &["prompt", "diff", "version"],
+        scope: ActionScope::Host,
+        required_capability: Some(Capability::PromptProjection),
+        risk: ActionRisk::ReadOnly,
+        argument_schema: ActionArgumentSchema::PromptDiffV1,
+    },
+    ActionDescriptor {
+        id: ACTION_PROMPT_CHAIN_PAGE,
+        title: "Prompt chain page",
+        description: "Page a linear exact-version prompt chain.",
+        keywords: &["prompt", "chain", "library"],
+        scope: ActionScope::Host,
+        required_capability: Some(Capability::PromptProjection),
+        risk: ActionRisk::ReadOnly,
+        argument_schema: ActionArgumentSchema::PromptChainPageV1,
+    },
+];
+
+/// Single registry consumed by uniqueness and lookup.
+pub fn registered_actions() -> impl Iterator<Item = &'static ActionDescriptor> {
+    catalog().iter()
+}
+
+/// Truthful disabled reason for a catalog id under the negotiated grant set.
+///
+/// Callers must treat a missing catalog `disabled_reason` key as disabled.
+/// Only an explicit JSON `null` together with `enabled: true` may enable.
+pub fn disabled_reason(id: &str, granted: CapabilitySet) -> Option<&'static str> {
+    let Some(action) = action_by_id(id) else {
+        return Some("unknown action");
+    };
+    if let Some(required) = action.required_capability {
+        if !granted.contains(required) {
+            return Some(match required {
+                Capability::PromptProjection => "personal_prompt_library capability not granted",
+                _ => "required capability not granted",
+            });
+        }
+    }
+    match id {
+        ACTION_PROMPT_METADATA_PAGE
+        | ACTION_PROMPT_VERSION_PAGE
+        | ACTION_PROMPT_DIFF
+        | ACTION_PROMPT_CHAIN_PAGE => {
+            Some("owner_device_session unavailable until Phase 9 authenticated pairing")
+        }
+        _ => None,
+    }
+}
+
+/// Fail-closed enablement: omission of `disabled_reason` must not enable.
+pub fn action_enabled(id: &str, granted: CapabilitySet) -> bool {
+    action_by_id(id).is_some() && disabled_reason(id, granted).is_none()
+}
+
+pub fn action_by_id(id: &str) -> Option<&'static ActionDescriptor> {
+    registered_actions().find(|action| action.id == id)
+}
+
+pub fn prompt_metadata_page_request(
+    request_id: RequestId,
+    client_id: ClientId,
+    capability: &OwnerDeviceCapability,
+    expected_library_revision: Option<u64>,
+    cursor: Option<PromptCursor>,
+) -> Result<PromptLibraryRequest, PromptProjectionError> {
+    PromptLibraryRequest::metadata_page(
+        request_id,
+        client_id,
+        capability,
+        PromptNamespace::Personal,
+        expected_library_revision,
+        cursor,
+    )
 }
 
 /// Fail when two descriptors share a stable id.
 pub fn require_unique_ids() -> Result<(), String> {
     let mut seen = Vec::new();
-    for action in catalog() {
+    for action in registered_actions() {
         if seen.contains(&action.id) {
             return Err(format!("duplicate action id: {}", action.id));
         }
@@ -235,8 +366,9 @@ mod tests {
     use super::{
         catalog, require_unique_ids, task_create_command, task_rename_command, task_show_query,
         ActionArgumentSchema, ActionRisk, ActionScope, TaskCreateArguments, TaskRenameArguments,
-        ACTION_HOST_ACTIONS, ACTION_HOST_STATUS, ACTION_TASK_CREATE, ACTION_TASK_LIST,
-        ACTION_TASK_RENAME, ACTION_TASK_SHOW,
+        ACTION_HOST_ACTIONS, ACTION_HOST_STATUS, ACTION_PROMPT_CHAIN_PAGE, ACTION_PROMPT_DIFF,
+        ACTION_PROMPT_METADATA_PAGE, ACTION_PROMPT_VERSION_PAGE, ACTION_TASK_CREATE,
+        ACTION_TASK_LIST, ACTION_TASK_RENAME, ACTION_TASK_SHOW,
     };
     use crate::domain::command::Command;
     use crate::domain::query::Query;
@@ -256,7 +388,7 @@ mod tests {
         assert!(ids.contains(&ACTION_TASK_SHOW));
         assert!(ids.contains(&ACTION_TASK_CREATE));
         assert!(ids.contains(&ACTION_TASK_RENAME));
-        assert_eq!(ids.len(), 6);
+        assert_eq!(ids.len(), catalog().len());
         require_unique_ids().expect("ids must be unique");
         for action in catalog() {
             let (expected_scope, expected_risk, expected_schema, expected_capability) =
@@ -284,6 +416,30 @@ mod tests {
                         ActionRisk::Mutating,
                         ActionArgumentSchema::TaskRenameV1,
                         None,
+                    ),
+                    ACTION_PROMPT_METADATA_PAGE => (
+                        ActionScope::Host,
+                        ActionRisk::ReadOnly,
+                        ActionArgumentSchema::PromptMetadataPageV1,
+                        Some(Capability::PromptProjection),
+                    ),
+                    ACTION_PROMPT_VERSION_PAGE => (
+                        ActionScope::Host,
+                        ActionRisk::ReadOnly,
+                        ActionArgumentSchema::PromptVersionPageV1,
+                        Some(Capability::PromptProjection),
+                    ),
+                    ACTION_PROMPT_DIFF => (
+                        ActionScope::Host,
+                        ActionRisk::ReadOnly,
+                        ActionArgumentSchema::PromptDiffV1,
+                        Some(Capability::PromptProjection),
+                    ),
+                    ACTION_PROMPT_CHAIN_PAGE => (
+                        ActionScope::Host,
+                        ActionRisk::ReadOnly,
+                        ActionArgumentSchema::PromptChainPageV1,
+                        Some(Capability::PromptProjection),
                     ),
                     _ => (
                         ActionScope::Host,

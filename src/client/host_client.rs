@@ -21,6 +21,7 @@ use crate::domain::ClientId;
 use crate::host::{
     pipe_endpoint_for_named_profile, profile_fingerprint_for_named_profile, IpcError,
 };
+use crate::prompts::projection::{PromptLibraryQuery, PromptProjectionReply};
 use crate::protocol::{
     Capability, CapabilitySet, ClientHello, DetachAck, DetachRequest, FrameLimits, ServerHello,
 };
@@ -311,6 +312,48 @@ impl HostClient {
         match reply.outcome {
             QueryOutcome::Err(error) => Ok(Err(error)),
             QueryOutcome::Ok(QueryResult::HostQuitInspection { inspection }) => Ok(Ok(inspection)),
+            QueryOutcome::Ok(_) => {
+                self.retire_connection();
+                Err(IpcError::UnexpectedResponse)
+            }
+        }
+    }
+
+    /// Page the personal prompt library. Requires the active Hello
+    /// [`Capability::PromptProjection`] grant; continuation cursors remint from
+    /// that same live grant rather than a cached bool.
+    pub async fn query_prompt_library(
+        &mut self,
+        query: PromptLibraryQuery,
+    ) -> Result<Result<PromptProjectionReply, QueryError>, IpcError> {
+        if !self.server_hello.granted.grants_personal_prompt_library() {
+            return Err(IpcError::UnsupportedCapability);
+        }
+
+        let request_id = RequestId::new();
+        let client_id = self.config.client_id;
+        let outcome = {
+            let connection = self.live_connection()?;
+            connection
+                .query(QueryEnvelope {
+                    request_id,
+                    client_id,
+                    task_id: None,
+                    query: Query::PromptLibrary(query),
+                })
+                .await
+        };
+        let reply = match outcome {
+            Ok(reply) => reply,
+            Err(error) => {
+                self.retire_connection();
+                return Err(error);
+            }
+        };
+
+        match reply.outcome {
+            QueryOutcome::Err(error) => Ok(Err(error)),
+            QueryOutcome::Ok(QueryResult::PromptLibrary(page)) => Ok(Ok(page)),
             QueryOutcome::Ok(_) => {
                 self.retire_connection();
                 Err(IpcError::UnexpectedResponse)
@@ -912,7 +955,8 @@ fn correlate_operation_status(
         | QueryResult::EventReplayReleased { .. }
         | QueryResult::ArtifactContentPage { .. }
         | QueryResult::ArtifactContentReleased { .. }
-        | QueryResult::HostQuitInspection { .. } => Err(IpcError::UnexpectedResponse),
+        | QueryResult::HostQuitInspection { .. }
+        | QueryResult::PromptLibrary(_) => Err(IpcError::UnexpectedResponse),
     }
 }
 
@@ -1041,6 +1085,7 @@ mod tests {
             operation_id: operation,
             task_revision: Some(1),
             event_ids: vec![event_id(0x90)],
+            prompt_mutation: None,
         }
     }
 

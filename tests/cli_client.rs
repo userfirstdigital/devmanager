@@ -279,8 +279,8 @@ fn action_catalog_ids_are_unique_and_classified() {
     let catalog = action::catalog();
     assert_eq!(
         catalog.len(),
-        6,
-        "slice exposes host.actions, host.status, task.list/show/create/rename"
+        action::registered_actions().count(),
+        "catalog() is the single host action registry"
     );
 
     let mut ids = Vec::new();

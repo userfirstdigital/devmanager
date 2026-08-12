@@ -9,8 +9,8 @@ mod lock;
 mod shutdown;
 
 pub use connection::{
-    HostExecutorOutcome, HostRequestExecutor, HostRequestHandle, PhysicalExitArmRequest,
-    SupervisedHostExecutor, HOST_REQUEST_QUEUE_CAPACITY,
+    dispatch_host_request, HostExecutorOutcome, HostRequestExecutor, HostRequestHandle,
+    PhysicalExitArmRequest, SupervisedHostExecutor, HOST_REQUEST_QUEUE_CAPACITY,
 };
 pub(crate) use ipc::{
     codecs_for_limits, handshake_codecs, handshake_timeout, read_physical_frame,
