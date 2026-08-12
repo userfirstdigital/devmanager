@@ -934,7 +934,7 @@ mod tests {
             DirectInput,
             SelectConversation,
             RestartServer,
-            KillPortRestart,
+            PortConflictRestart,
             RestartAiConversation,
             RestartSsh,
             CloseConversation,
@@ -951,7 +951,7 @@ mod tests {
             Boundary::DirectInput,
             Boundary::SelectConversation,
             Boundary::RestartServer,
-            Boundary::KillPortRestart,
+            Boundary::PortConflictRestart,
             Boundary::RestartAiConversation,
             Boundary::RestartSsh,
             Boundary::CloseConversation,
@@ -1099,7 +1099,7 @@ mod tests {
                 }
                 Boundary::SelectConversation
                 | Boundary::RestartServer
-                | Boundary::KillPortRestart
+                | Boundary::PortConflictRestart
                 | Boundary::RestartAiConversation
                 | Boundary::RestartSsh
                 | Boundary::CloseConversation => bridge.interrupt_workspace(&key),

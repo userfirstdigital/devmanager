@@ -187,7 +187,6 @@ pub fn run() {
 
 #[derive(Debug, Clone)]
 enum ActionableNotice {
-    PortInUse { command_id: String, message: String },
     ForceQuit { message: String },
 }
 
@@ -300,6 +299,8 @@ struct NativeShell {
     last_remote_app_revision: u64,
     last_remote_runtime_revision: u64,
     last_remote_port_hash: u64,
+    last_remote_authority_hash: u64,
+    last_remote_port_snapshot_sequence: u64,
     remote_live_session_generations: HashMap<String, u64>,
     terminal_focus: FocusHandle,
     editor_focus: FocusHandle,
@@ -522,21 +523,12 @@ struct TerminalMousePressOwner {
     button: MouseButton,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PortKillFeedback {
-    Killed,
-    None,
-    Error,
-}
-
 #[derive(Debug, Clone)]
 struct ActivePortState {
     command_id: String,
     port: u16,
     status: Option<PortStatus>,
     last_checked_at: Option<Instant>,
-    kill_feedback: Option<PortKillFeedback>,
-    kill_feedback_until: Option<Instant>,
     refresh_in_flight: bool,
 }
 
@@ -552,10 +544,55 @@ struct AiQuotaState {
 
 #[derive(Debug, Clone, Default)]
 struct ServerPortSnapshotState {
+    inventory: ports_service::PortInventory,
     tracked_ports: Vec<u16>,
     statuses: HashMap<u16, PortStatus>,
+    authorities: HashMap<u16, crate::process::ports::PortStatus>,
+    probe_failures: HashMap<u16, String>,
+    source_observed_at: Option<Instant>,
+    source_freshness_deadline: Option<Instant>,
+    source_publication_sequence: u64,
     last_checked_at: Option<Instant>,
     refresh_in_flight: bool,
+    refresh_generation: u64,
+    task_action_epoch: u64,
+    server_lifecycle_generation: u64,
+    active_refresh: Option<PortRefreshFence>,
+    /// Stable sentinel for a port with no host-verified managed resource.
+    /// This is never a managed authority; it only keeps typed projections
+    /// from minting a new wire identity on every refresh.
+    no_managed_resource: Option<crate::domain::operation::ResourceFence>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct PortRefreshProjection {
+    statuses: HashMap<u16, PortStatus>,
+    authorities: HashMap<u16, crate::process::ports::PortStatus>,
+    probe_failures: HashMap<u16, String>,
+    source_observed_at: Option<Instant>,
+    source_freshness_deadline: Option<Instant>,
+    source_publication_sequence: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PortRefreshFence {
+    generation: u64,
+    ports: Vec<u16>,
+    task_action_epoch: u64,
+    runtime_generation: u64,
+    resource_generation: u64,
+    managed_snapshot_generation: u64,
+    server_lifecycle_generation: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PortUiAuthority {
+    Managed,
+    ManagedUnready,
+    ProvenExternal,
+    Starting,
+    Free,
+    Unknown,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1326,6 +1363,7 @@ impl NativeShell {
             cx,
         );
 
+        let port_inventory = process_manager.port_inventory();
         let shell = Self {
             state,
             session_manager,
@@ -1364,13 +1402,18 @@ impl NativeShell {
             last_remote_app_revision: 0,
             last_remote_runtime_revision: 0,
             last_remote_port_hash: 0,
+            last_remote_authority_hash: 0,
+            last_remote_port_snapshot_sequence: 0,
             remote_live_session_generations: HashMap::new(),
             terminal_focus: cx.focus_handle(),
             editor_focus: cx.focus_handle(),
             did_focus_terminal: false,
             focused_terminal_session_id: None,
             active_port_state: None,
-            server_port_snapshot: ServerPortSnapshotState::default(),
+            server_port_snapshot: ServerPortSnapshotState {
+                inventory: port_inventory,
+                ..ServerPortSnapshotState::default()
+            },
             ssh_password_prompt_state: None,
             editor_needs_focus: false,
             synced_session_id,
@@ -5569,28 +5612,83 @@ impl NativeShell {
         let app_revision = self.state.revision();
         let runtime_revision = self.process_manager.runtime_revision();
         let port_hash = local_stable_hash(&self.server_port_snapshot.statuses);
+        let authority_hash = local_port_authority_hash(&self.server_port_snapshot.authorities);
+        let port_snapshot_sequence = self.server_port_snapshot.source_publication_sequence;
         let forced_sync = self.last_remote_snapshot_sync_at.is_none();
         let app_changed = forced_sync || app_revision != self.last_remote_app_revision;
         let runtime_changed = forced_sync || runtime_revision != self.last_remote_runtime_revision;
         let port_changed = forced_sync || port_hash != self.last_remote_port_hash;
+        let authority_changed = forced_sync || authority_hash != self.last_remote_authority_hash;
+        let source_changed =
+            forced_sync || port_snapshot_sequence != self.last_remote_port_snapshot_sequence;
+        let port_authority_changed = port_changed || authority_changed || source_changed;
         if !forced_sync
             && !app_changed
             && !runtime_changed
             && !port_changed
+            && !authority_changed
+            && !source_changed
             && !has_pending_requests
         {
             self.last_remote_snapshot_sync_at = Some(now);
             return;
         }
 
+        let reference_epoch_ms = now_epoch_ms();
+        let source_observed_at_epoch_ms = self
+            .server_port_snapshot
+            .source_observed_at
+            .map(|observed_at| instant_to_epoch_ms(observed_at, now, reference_epoch_ms))
+            .unwrap_or(reference_epoch_ms);
+        let source_freshness_deadline_epoch_ms = self
+            .server_port_snapshot
+            .source_freshness_deadline
+            .map(|deadline| instant_to_epoch_ms(deadline, now, reference_epoch_ms))
+            .unwrap_or(reference_epoch_ms);
+        let source_publication_sequence = self.server_port_snapshot.source_publication_sequence;
         self.remote_host_service.update_snapshot_parts(
             app_changed.then(|| remote_shared_app_state(&self.state)),
             runtime_changed.then(|| runtime_state.clone()),
-            port_changed.then(|| self.server_port_snapshot.statuses.clone()),
+            port_authority_changed.then(|| self.server_port_snapshot.statuses.clone()),
+            port_authority_changed.then(|| {
+                self.server_port_snapshot
+                    .authorities
+                    .iter()
+                    .map(|(port, authority)| {
+                        let remote_authority =
+                            remote::RemotePortAuthority::from_rich_with_source_metadata(
+                                authority,
+                                source_observed_at_epoch_ms,
+                                source_freshness_deadline_epoch_ms,
+                            )
+                            .with_snapshot_metadata(
+                                source_publication_sequence,
+                                0,
+                                0,
+                            );
+                        let remote_authority = if matches!(
+                            remote_authority.kind(),
+                            remote::RemotePortAuthorityKind::Managed
+                                | remote::RemotePortAuthorityKind::ManagedUnready
+                        ) {
+                            unique_server_session_id(runtime_state, *port)
+                                .map(|session_id| {
+                                    remote_authority.clone().with_session_id(session_id)
+                                })
+                                .unwrap_or(remote_authority)
+                        } else {
+                            remote_authority
+                        };
+                        (*port, remote_authority)
+                    })
+                    .collect()
+            }),
         );
         self.last_remote_app_revision = app_revision;
         self.last_remote_runtime_revision = runtime_revision;
         self.last_remote_port_hash = port_hash;
+        self.last_remote_authority_hash = authority_hash;
+        self.last_remote_port_snapshot_sequence = port_snapshot_sequence;
         self.last_remote_snapshot_sync_at = Some(now);
     }
 
@@ -6348,11 +6446,18 @@ impl NativeShell {
         self.process_manager.session_view(session_id)
     }
 
-    fn current_port_statuses(&self) -> HashMap<u16, PortStatus> {
+    fn current_port_authorities(&self) -> HashMap<u16, crate::process::ports::PortStatus> {
         self.remote_mode
             .as_ref()
-            .map(|remote_mode| remote_mode.snapshot.port_statuses.clone())
-            .unwrap_or_else(|| self.server_port_snapshot.statuses.clone())
+            .map(|_| HashMap::new())
+            .unwrap_or_else(|| self.server_port_snapshot.authorities.clone())
+    }
+
+    fn current_port_probe_failures(&self) -> HashMap<u16, String> {
+        self.remote_mode
+            .as_ref()
+            .map(|_| HashMap::new())
+            .unwrap_or_else(|| self.server_port_snapshot.probe_failures.clone())
     }
 
     fn sync_remote_port_forwards(&mut self) -> bool {
@@ -6901,24 +7006,13 @@ impl NativeShell {
                                 Some("Stopped all running server tabs.".to_string());
                         }
                     }
-                    ProcessOpKind::StartServer
-                    | ProcessOpKind::RestartServer
-                    | ProcessOpKind::KillPortAndRestart => {
+                    ProcessOpKind::StartServer | ProcessOpKind::RestartServer => {
                         if let Some(command_id) = completion.context.session_id.as_deref() {
                             if completion.context.focus {
                                 self.synced_session_id = Some(command_id.to_string());
                             }
                             self.terminal_notice = None;
                             self.terminal_actionable_notice = None;
-                            if completion.kind == ProcessOpKind::KillPortAndRestart {
-                                if let Some(port) = completion.context.port {
-                                    self.record_port_kill_feedback(
-                                        command_id,
-                                        port,
-                                        PortKillFeedback::Killed,
-                                    );
-                                }
-                            }
                         }
                     }
                     ProcessOpKind::StartSsh | ProcessOpKind::RestartSsh => {
@@ -6955,23 +7049,9 @@ impl NativeShell {
                 did_change = true;
             } else if let Err(error) = completion.result {
                 match completion.kind {
-                    ProcessOpKind::StartServer
-                    | ProcessOpKind::RestartServer
-                    | ProcessOpKind::KillPortAndRestart => {
+                    ProcessOpKind::StartServer | ProcessOpKind::RestartServer => {
                         self.terminal_notice =
                             Some(format!("Failed to run server action: {error}"));
-                        if completion.kind == ProcessOpKind::KillPortAndRestart {
-                            if let (Some(command_id), Some(port)) = (
-                                completion.context.session_id.as_deref(),
-                                completion.context.port,
-                            ) {
-                                self.record_port_kill_feedback(
-                                    command_id,
-                                    port,
-                                    PortKillFeedback::Error,
-                                );
-                            }
-                        }
                     }
                     ProcessOpKind::StopServer => {
                         self.terminal_notice = Some(format!(
@@ -7058,6 +7138,11 @@ impl NativeShell {
                     {
                         RemoteActionResult::error(error)
                     } else {
+                        let port = self
+                            .state
+                            .find_command(&command_id)
+                            .and_then(|lookup| lookup.command.port);
+                        self.invalidate_server_port_snapshot(port);
                         if focus {
                             self.interrupt_active_browser_replay_before_route_change(None);
                         }
@@ -7080,6 +7165,11 @@ impl NativeShell {
                     }
                 }
                 RemoteAction::StopServer { command_id } => {
+                    let port = self
+                        .state
+                        .find_command(&command_id)
+                        .and_then(|lookup| lookup.command.port);
+                    self.invalidate_server_port_snapshot(port);
                     match self.process_manager.enqueue_stop_server_and_wait(
                         &command_id,
                         Duration::ZERO,
@@ -7104,6 +7194,11 @@ impl NativeShell {
                     {
                         RemoteActionResult::error(error)
                     } else {
+                        let port = self
+                            .state
+                            .find_command(&command_id)
+                            .and_then(|lookup| lookup.command.port);
+                        self.invalidate_server_port_snapshot(port);
                         self.interrupt_active_browser_replay_before_route_change(None);
                         match self.process_manager.restart_server_with_remote_response(
                             &mut self.state,
@@ -7391,6 +7486,13 @@ impl NativeShell {
                     }
                 }
                 RemoteAction::CloseTab { tab_id } => {
+                    let closes_server = self
+                        .state
+                        .find_tab(&tab_id)
+                        .is_some_and(|tab| matches!(tab.tab_type, TabType::Server));
+                    if closes_server {
+                        self.invalidate_server_port_snapshot(None);
+                    }
                     let workspace_key =
                         browser_workspace_key_for_ai_tab(self.state.find_ai_tab(&tab_id));
                     if let Some(workspace_key) = workspace_key.as_ref() {
@@ -7408,6 +7510,7 @@ impl NativeShell {
                     }
                 }
                 RemoteAction::StopAllServers => {
+                    self.invalidate_server_port_snapshot(None);
                     let stopped = self.process_manager.stop_all_servers();
                     if stopped > 0 {
                         did_change = true;
@@ -7988,6 +8091,7 @@ impl NativeShell {
         if !self.ensure_mutation_control(cx) {
             return;
         }
+        self.invalidate_server_port_snapshot(None);
         if self.remote_mode.is_some() {
             self.remote_send_action(RemoteAction::StopAllServers);
             self.terminal_notice = Some("Stopping remote server tab(s)...".to_string());
@@ -8016,6 +8120,9 @@ impl NativeShell {
 
         if !self.ensure_mutation_control(cx) {
             return;
+        }
+        if matches!(tab.tab_type, TabType::Server) {
+            self.invalidate_server_port_snapshot(None);
         }
         if let Some(workspace_key) = browser_workspace_key_for_ai_tab(Some(&tab)) {
             self.interrupt_browser_workspace_before_teardown(&workspace_key);
@@ -8726,6 +8833,12 @@ impl NativeShell {
 
         let result = match session.session_kind {
             SessionKind::Server => {
+                self.invalidate_server_port_snapshot(
+                    session
+                        .server_launch
+                        .as_ref()
+                        .and_then(|launch| launch.port),
+                );
                 let command_id = session
                     .command_id
                     .clone()
@@ -11730,21 +11843,6 @@ impl NativeShell {
             self.terminal_actionable_notice
                 .as_ref()
                 .and_then(|notice| match notice {
-                    ActionableNotice::PortInUse {
-                        command_id,
-                        message,
-                        ..
-                    } => {
-                        if command_id.as_str() == active_spec.session_id.as_str() {
-                            Some(view::TerminalActionableNotice {
-                                message: message.clone(),
-                                action_label: "Kill process & start server",
-                                action_color: theme::DANGER_TEXT,
-                            })
-                        } else {
-                            None
-                        }
-                    }
                     ActionableNotice::ForceQuit { message } => {
                         Some(view::TerminalActionableNotice {
                             message: message.clone(),
@@ -11984,9 +12082,34 @@ impl NativeShell {
     }
 
     fn sync_server_port_snapshot(&mut self, runtime: &RuntimeState, cx: &mut Context<Self>) {
+        let server_lifecycle_generation = self.process_manager.server_lifecycle_generation();
+        if self.server_port_snapshot.server_lifecycle_generation != server_lifecycle_generation {
+            self.invalidate_server_port_snapshot(None);
+            self.server_port_snapshot.server_lifecycle_generation = server_lifecycle_generation;
+        }
         let (tracked_ports, refresh_interval) = server_port_snapshot_plan(&self.state, runtime);
         if tracked_ports.is_empty() {
-            self.server_port_snapshot = ServerPortSnapshotState::default();
+            // Keep the ProcessManager-owned coordinator even while the
+            // current config has no tracked ports. Replacing the state with a
+            // fresh inventory here would split later starts onto a second
+            // reservation/scan owner after a command is added again.
+            self.server_port_snapshot.tracked_ports.clear();
+            self.server_port_snapshot.statuses.clear();
+            self.server_port_snapshot.authorities.clear();
+            self.server_port_snapshot.probe_failures.clear();
+            clear_server_port_source_metadata(&mut self.server_port_snapshot);
+            self.server_port_snapshot.last_checked_at = None;
+            self.server_port_snapshot.refresh_in_flight = false;
+            self.server_port_snapshot.refresh_generation = self
+                .server_port_snapshot
+                .refresh_generation
+                .saturating_add(1);
+            self.server_port_snapshot.task_action_epoch = self
+                .server_port_snapshot
+                .task_action_epoch
+                .saturating_add(1);
+            self.server_port_snapshot.active_refresh = None;
+            clear_active_port_state_for_untracked_ports(&mut self.active_port_state, &[]);
             return;
         }
 
@@ -11995,24 +12118,87 @@ impl NativeShell {
             self.server_port_snapshot
                 .statuses
                 .retain(|port, _| tracked_ports.binary_search(port).is_ok());
+            self.server_port_snapshot
+                .authorities
+                .retain(|port, _| tracked_ports.binary_search(port).is_ok());
+            self.server_port_snapshot
+                .probe_failures
+                .retain(|port, _| tracked_ports.binary_search(port).is_ok());
+            clear_server_port_source_metadata(&mut self.server_port_snapshot);
             self.server_port_snapshot.last_checked_at = None;
+            self.server_port_snapshot.refresh_generation = self
+                .server_port_snapshot
+                .refresh_generation
+                .saturating_add(1);
+            self.server_port_snapshot.task_action_epoch = self
+                .server_port_snapshot
+                .task_action_epoch
+                .saturating_add(1);
+            self.server_port_snapshot.refresh_in_flight = false;
+            self.server_port_snapshot.active_refresh = None;
+            clear_active_port_state_for_untracked_ports(
+                &mut self.active_port_state,
+                &tracked_ports,
+            );
         }
 
-        let missing_status = tracked_ports
-            .iter()
-            .any(|port| !self.server_port_snapshot.statuses.contains_key(port));
-        let should_refresh = missing_status
-            || self
-                .server_port_snapshot
-                .last_checked_at
-                .map(|checked_at| checked_at.elapsed() >= refresh_interval)
-                .unwrap_or(true);
+        let should_refresh = self
+            .server_port_snapshot
+            .last_checked_at
+            .map(|checked_at| checked_at.elapsed() >= refresh_interval)
+            .unwrap_or(true);
         if !should_refresh || self.server_port_snapshot.refresh_in_flight {
             return;
         }
 
+        stage_server_port_refresh(
+            &mut self.server_port_snapshot.statuses,
+            &mut self.server_port_snapshot.authorities,
+            &mut self.server_port_snapshot.probe_failures,
+            &tracked_ports,
+        );
+        clear_server_port_source_metadata(&mut self.server_port_snapshot);
         self.server_port_snapshot.refresh_in_flight = true;
         let ports = tracked_ports.clone();
+        let runtime_generation = self.process_manager.runtime_revision();
+        let resource_generation = local_stable_hash(&runtime.sessions);
+        let managed_snapshot_generation =
+            local_port_authority_hash(&self.server_port_snapshot.authorities);
+        let no_managed_resource = *self
+            .server_port_snapshot
+            .no_managed_resource
+            .get_or_insert_with(|| {
+                crate::domain::operation::ResourceFence::new(
+                    crate::domain::id::ResourceId::new(),
+                    0,
+                )
+            });
+        let refresh_fence = PortRefreshFence {
+            generation: self
+                .server_port_snapshot
+                .refresh_generation
+                .saturating_add(1),
+            ports: ports.clone(),
+            task_action_epoch: self.server_port_snapshot.task_action_epoch,
+            runtime_generation,
+            resource_generation,
+            managed_snapshot_generation,
+            server_lifecycle_generation,
+        };
+        self.server_port_snapshot.refresh_generation = refresh_fence.generation;
+        self.server_port_snapshot.active_refresh = Some(refresh_fence.clone());
+        let inventory = self.server_port_snapshot.inventory.clone();
+        let managed_candidate_ports = runtime
+            .sessions
+            .values()
+            .filter(|session| session.status.is_live())
+            .filter_map(|session| {
+                session
+                    .server_launch
+                    .as_ref()
+                    .and_then(|launch| launch.port)
+            })
+            .collect::<std::collections::HashSet<_>>();
         let background_executor = cx.background_executor().clone();
         let native_dialog_blockers = self.native_dialog_blockers.clone();
         cx.spawn(
@@ -12020,21 +12206,84 @@ impl NativeShell {
                 let mut async_cx = cx.clone();
                 let native_dialog_blockers = native_dialog_blockers.clone();
                 async move {
-                    let statuses = background_executor
-                        .spawn(async move { ports_service::snapshot_ports(&ports).ok() })
+                    let projection = background_executor
+                        .spawn(async move {
+                            let result = inventory.refresh(&ports);
+                            let cached_snapshot = inventory.cached_snapshot();
+                            project_port_refresh_result(
+                                result,
+                                cached_snapshot,
+                                &ports,
+                                no_managed_resource,
+                                &HashMap::new(),
+                                &managed_candidate_ports,
+                            )
+                        })
                         .await;
                     while native_dialog_blockers.load(Ordering::Acquire) > 0 {
                         background_executor.timer(Duration::from_millis(50)).await;
                     }
                     let _ = this.update(&mut async_cx, |this, cx: &mut Context<'_, Self>| {
+                        let expected_fence = refresh_fence.clone();
+                        if !port_refresh_is_current(
+                            this.server_port_snapshot.active_refresh.as_ref(),
+                            &expected_fence,
+                        ) {
+                            return;
+                        }
+                        if !port_refresh_projection_is_fresh_at(&projection, Instant::now()) {
+                            this.server_port_snapshot.refresh_in_flight = false;
+                            this.server_port_snapshot.active_refresh = None;
+                            this.server_port_snapshot.last_checked_at = None;
+                            clear_server_port_source_metadata(&mut this.server_port_snapshot);
+                            cx.notify();
+                            return;
+                        }
+                        let current_runtime = this.process_manager.runtime_state();
+                        let current_runtime_generation = this.process_manager.runtime_revision();
+                        let current_server_lifecycle_generation =
+                            this.process_manager.server_lifecycle_generation();
+                        let current_resource_generation =
+                            local_stable_hash(&current_runtime.sessions);
+                        let current_managed_snapshot_generation =
+                            local_port_authority_hash(&this.server_port_snapshot.authorities);
+                        if !port_refresh_is_current_for_state(
+                            this.server_port_snapshot.active_refresh.as_ref(),
+                            &expected_fence,
+                            &this.server_port_snapshot.tracked_ports,
+                            this.server_port_snapshot.task_action_epoch,
+                            current_runtime_generation,
+                            current_resource_generation,
+                            current_managed_snapshot_generation,
+                            current_server_lifecycle_generation,
+                        ) {
+                            // The callback is still for this exact refresh, but
+                            // the runtime/resource generations moved while the
+                            // probe was in flight. Release the fence so the
+                            // next sync schedules a fresh authoritative scan.
+                            this.server_port_snapshot.refresh_in_flight = false;
+                            this.server_port_snapshot.active_refresh = None;
+                            this.server_port_snapshot.last_checked_at = None;
+                            clear_server_port_source_metadata(&mut this.server_port_snapshot);
+                            cx.notify();
+                            return;
+                        }
+                        let source_observed_at = projection.source_observed_at;
                         this.server_port_snapshot.refresh_in_flight = false;
-                        this.server_port_snapshot.last_checked_at = Some(Instant::now());
-                        if let Some(statuses) = statuses {
-                            this.server_port_snapshot.statuses = statuses;
-                            let tracked_ports = this.server_port_snapshot.tracked_ports.clone();
-                            this.server_port_snapshot
-                                .statuses
-                                .retain(|port, _| tracked_ports.binary_search(port).is_ok());
+                        this.server_port_snapshot.active_refresh = None;
+                        this.server_port_snapshot.last_checked_at = source_observed_at;
+                        let tracked_ports = this.server_port_snapshot.tracked_ports.clone();
+                        if let Some(notice) = apply_server_port_refresh_with_metadata(
+                            &mut this.server_port_snapshot.statuses,
+                            &mut this.server_port_snapshot.authorities,
+                            &mut this.server_port_snapshot.probe_failures,
+                            &mut this.server_port_snapshot.source_observed_at,
+                            &mut this.server_port_snapshot.source_freshness_deadline,
+                            &mut this.server_port_snapshot.source_publication_sequence,
+                            &tracked_ports,
+                            Ok(projection),
+                        ) {
+                            this.terminal_notice = Some(notice);
                         }
                         cx.notify();
                     });
@@ -12061,20 +12310,11 @@ impl NativeShell {
                 port,
                 status: None,
                 last_checked_at: None,
-                kill_feedback: None,
-                kill_feedback_until: None,
                 refresh_in_flight: false,
             });
         }
 
         if let Some(state) = self.active_port_state.as_mut() {
-            if state
-                .kill_feedback_until
-                .is_some_and(|deadline| Instant::now() >= deadline)
-            {
-                state.kill_feedback = None;
-                state.kill_feedback_until = None;
-            }
             state.status = self.server_port_snapshot.statuses.get(&port).cloned();
             state.last_checked_at = self.server_port_snapshot.last_checked_at;
             state.refresh_in_flight = self.server_port_snapshot.refresh_in_flight
@@ -12086,67 +12326,12 @@ impl NativeShell {
         }
     }
 
-    fn refresh_port_state(&mut self, command_id: String, port: u16, cx: &mut Context<Self>) {
-        let state = self
-            .active_port_state
-            .get_or_insert_with(|| ActivePortState {
-                command_id: command_id.clone(),
-                port,
-                status: None,
-                last_checked_at: None,
-                kill_feedback: None,
-                kill_feedback_until: None,
-                refresh_in_flight: false,
-            });
-        state.command_id = command_id.clone();
-        state.port = port;
-        state.status = None;
-        state.last_checked_at = None;
-        state.refresh_in_flight = true;
-        self.server_port_snapshot.statuses.remove(&port);
-        self.server_port_snapshot.last_checked_at = None;
-        self.server_port_snapshot.refresh_in_flight = false;
-        self.sync_active_port_state(&command_id, Some(port));
-        cx.notify();
-    }
-
     fn invalidate_server_port_snapshot(&mut self, port: Option<u16>) {
-        if let Some(port) = port {
-            self.server_port_snapshot.statuses.remove(&port);
-            if let Some(state) = self.active_port_state.as_mut() {
-                if state.port == port {
-                    state.status = None;
-                    state.last_checked_at = None;
-                    state.refresh_in_flight = true;
-                }
-            }
-        }
-        self.server_port_snapshot.last_checked_at = None;
-        self.server_port_snapshot.refresh_in_flight = false;
-    }
-
-    fn record_port_kill_feedback(
-        &mut self,
-        command_id: &str,
-        port: u16,
-        feedback: PortKillFeedback,
-    ) {
-        let state = self
-            .active_port_state
-            .get_or_insert_with(|| ActivePortState {
-                command_id: command_id.to_string(),
-                port,
-                status: None,
-                last_checked_at: None,
-                kill_feedback: None,
-                kill_feedback_until: None,
-                refresh_in_flight: false,
-            });
-        state.command_id = command_id.to_string();
-        state.port = port;
-        state.kill_feedback = Some(feedback);
-        state.kill_feedback_until = Some(Instant::now() + std::time::Duration::from_secs(2));
-        state.last_checked_at = None;
+        invalidate_server_port_snapshot_state(
+            &mut self.server_port_snapshot,
+            &mut self.active_port_state,
+            port,
+        );
     }
 
     fn maybe_auto_submit_ssh_password(
@@ -12357,10 +12542,7 @@ impl NativeShell {
                 can_stop: false,
                 can_restart: false,
                 can_clear: false,
-                can_kill_port: false,
                 can_open_url: false,
-                kill_label: "kill",
-                kill_color: theme::WARNING_TEXT,
                 prompt_action_label,
                 prompt_action_color,
                 search_active: self.terminal_search.active,
@@ -12389,10 +12571,7 @@ impl NativeShell {
                 can_stop: false,
                 can_restart: false,
                 can_clear: active_session.is_some() && !remote,
-                can_kill_port: false,
                 can_open_url: false,
-                kill_label: "kill",
-                kill_color: theme::WARNING_TEXT,
                 prompt_action_label: None,
                 prompt_action_color: theme::PRIMARY,
                 search_active: self.terminal_search.active,
@@ -12424,92 +12603,107 @@ impl NativeShell {
             && port
                 .and_then(|value| self.remote_port_forward_state(value))
                 .is_some_and(|state| state.listener_active);
+        let remote_authority_allows_url = remote
+            && port.is_some_and(|value| {
+                self.remote_mode
+                    .as_ref()
+                    .and_then(|remote_mode| remote_mode.snapshot.port_authorities.get(&value))
+                    .zip(active_session.map(|session| &session.runtime))
+                    .is_some_and(|(authority, session)| {
+                        can_open_remote_server_url_now(
+                            Some(authority),
+                            Some(session),
+                            value,
+                            remote_url_available,
+                        )
+                    })
+            });
         let remote_forward_state = if remote {
             port.and_then(|value| self.remote_port_forward_state(value))
         } else {
             None
         };
-        let port_status = if remote {
+        let current_port_probe_failures = self.current_port_probe_failures();
+        let port_probe_failure =
+            port.and_then(|value| current_port_probe_failures.get(&value).cloned());
+        if remote {
             self.active_port_state = None;
-            port.and_then(|port| self.current_port_statuses().get(&port).cloned())
         } else {
             self.sync_active_port_state(&command_id, port);
-            self.active_port_state
-                .as_ref()
-                .filter(|state| state.command_id == command_id)
-                .and_then(|state| state.status.clone())
-        };
-
+        }
         let status = active_session
             .map(|session| session.runtime.status)
             .unwrap_or(crate::state::SessionStatus::Stopped);
-        let port_state = self
-            .active_port_state
-            .as_ref()
-            .filter(|state| state.command_id == command_id);
-        let has_port_conflict = port_status
-            .as_ref()
-            .map(|status| !is_managed_port_owner(active_session, status))
-            .unwrap_or(false);
+        let port_authority = if status == crate::state::SessionStatus::Starting {
+            Some(PortUiAuthority::Starting)
+        } else if remote {
+            port.and_then(|port| {
+                self.remote_mode
+                    .as_ref()
+                    .and_then(|remote_mode| remote_mode.snapshot.port_authorities.get(&port))
+            })
+            .and_then(|authority| {
+                remote_port_ui_authority(
+                    Some(authority),
+                    active_session.map(|session| &session.runtime),
+                )
+            })
+        } else {
+            port.and_then(|port| {
+                local_port_ui_authority(
+                    self.server_port_snapshot.authorities.get(&port),
+                    active_session.map(|session| &session.runtime),
+                    self.server_port_snapshot.source_freshness_deadline,
+                )
+            })
+        };
+
         let probe_disagrees_with_live_session = active_session
             .is_some_and(|session| session.runtime.status.is_live())
-            && port_status.as_ref().is_some_and(|status| !status.in_use);
+            && matches!(port_authority, Some(PortUiAuthority::Free));
         let port_label = port.map(|port| {
-            if let Some(status) = port_status.as_ref() {
-                let base = if probe_disagrees_with_live_session {
+            let base = match port_authority {
+                Some(PortUiAuthority::Managed) => format!("port {port} • live"),
+                Some(PortUiAuthority::ManagedUnready) => format!("port {port} • unready"),
+                Some(PortUiAuthority::ProvenExternal) => format!("port {port} • external"),
+                Some(PortUiAuthority::Starting) => format!("port {port} • starting"),
+                Some(PortUiAuthority::Free) if probe_disagrees_with_live_session => {
                     format!("port {port} • probing")
-                } else if status.in_use {
-                    if is_managed_port_owner(active_session, status) {
-                        format!("port {port} • live")
+                }
+                Some(PortUiAuthority::Free) => format!("port {port} • free"),
+                Some(PortUiAuthority::Unknown) => {
+                    if let Some(detail) = port_probe_failure.as_deref() {
+                        format!(
+                            "port {port} • status unknown (probe failed: {})",
+                            bounded_port_probe_detail(detail)
+                        )
                     } else {
-                        let owner = status
-                            .process_name
-                            .clone()
-                            .unwrap_or_else(|| "external process".to_string());
-                        match status.pid {
-                            Some(pid) => format!("port {port} • {owner} ({pid})"),
-                            None => format!("port {port} • {owner}"),
-                        }
+                        format!("port {port} • status unknown (ownership unverified)")
                     }
-                } else {
-                    format!("port {port} • free")
-                };
+                }
+                None => format!("port {port} • checking"),
+            };
 
-                if let Some(forward_state) = remote_forward_state.as_ref() {
-                    if forward_state.listener_active {
-                        format!("{base} • mirrored locally")
-                    } else if forward_state.local_port_busy {
-                        format!("{base} • local port busy")
-                    } else {
-                        base
-                    }
+            if let Some(forward_state) = remote_forward_state.as_ref() {
+                if forward_state.listener_active {
+                    format!("{base} • mirrored locally")
+                } else if forward_state.local_port_busy {
+                    format!("{base} • local port busy")
                 } else {
                     base
                 }
             } else {
-                format!("port {port} • checking")
+                base
             }
         });
-        let port_color = if has_port_conflict {
-            theme::WARNING_TEXT
-        } else if probe_disagrees_with_live_session {
-            theme::TEXT_MUTED
-        } else if port_status
-            .as_ref()
-            .map(|status| status.in_use)
-            .unwrap_or(false)
-        {
-            theme::SUCCESS_TEXT
-        } else {
-            theme::TEXT_DIM
+        let port_color = match port_authority {
+            Some(PortUiAuthority::Managed) => theme::SUCCESS_TEXT,
+            Some(PortUiAuthority::ManagedUnready) => theme::WARNING_TEXT,
+            Some(PortUiAuthority::ProvenExternal) => theme::PRIMARY,
+            Some(PortUiAuthority::Starting) => theme::WARNING_TEXT,
+            Some(PortUiAuthority::Unknown) => theme::TEXT_MUTED,
+            Some(PortUiAuthority::Free) | None => theme::TEXT_DIM,
         };
-        let (kill_label, kill_color) = match port_state.and_then(|state| state.kill_feedback) {
-            Some(PortKillFeedback::Killed) => ("freed", theme::SUCCESS_TEXT),
-            Some(PortKillFeedback::None) => ("none", theme::TEXT_MUTED),
-            Some(PortKillFeedback::Error) => ("error", theme::DANGER_TEXT),
-            None => ("kill", theme::WARNING_TEXT),
-        };
-
         Some(view::TerminalRuntimeControlsModel {
             port_label,
             port_color,
@@ -12517,14 +12711,23 @@ impl NativeShell {
             can_stop: allow_mutation && status.is_live(),
             can_restart: allow_mutation && status.is_live(),
             can_clear: active_session.is_some() && !remote,
-            can_kill_port: !remote && port.is_some() && has_port_conflict,
-            can_open_url: (remote && remote_url_available)
+            can_open_url: (remote
+                && remote_url_available
+                && remote_authority_allows_url
+                && matches!(
+                    port_authority,
+                    Some(PortUiAuthority::Managed | PortUiAuthority::ProvenExternal)
+                ))
                 || (!remote
-                    && port.is_some()
-                    && status == crate::state::SessionStatus::Running
-                    && !has_port_conflict),
-            kill_label,
-            kill_color,
+                    && can_open_local_server_url_now(
+                        status,
+                        active_session.is_some_and(|session| session.runtime.reap_incomplete),
+                        port.and_then(|value| self.server_port_snapshot.authorities.get(&value)),
+                        port_probe_failure.as_deref(),
+                        self.server_port_snapshot.last_checked_at,
+                        self.server_port_snapshot.source_freshness_deadline,
+                        self.server_port_snapshot.refresh_in_flight,
+                    )),
             prompt_action_label: None,
             prompt_action_color: theme::PRIMARY,
             search_active: self.terminal_search.active,
@@ -12868,7 +13071,12 @@ impl NativeShell {
         if !self.ensure_mutation_control(cx) {
             return;
         }
+        let port = self
+            .state
+            .find_command(command_id)
+            .and_then(|lookup| lookup.command.port);
         if self.remote_mode.is_some() {
+            self.invalidate_server_port_snapshot(port);
             let dimensions = self.terminal_dimensions(window);
             self.remote_send_action(RemoteAction::StartServer {
                 command_id: command_id.to_string(),
@@ -12885,140 +13093,29 @@ impl NativeShell {
         }
 
         let dimensions = self.terminal_dimensions(window);
-        let Some(port) = self
-            .state
-            .find_command(command_id)
-            .and_then(|lookup| lookup.command.port)
-        else {
-            if focus_started_server {
-                self.interrupt_active_browser_replay_before_route_change(None);
-            }
-            let result = if focus_started_server {
-                self.process_manager
-                    .start_server(&mut self.state, command_id, dimensions)
-            } else {
-                self.process_manager.start_server_in_background(
-                    &mut self.state,
-                    command_id,
-                    dimensions,
-                )
-            };
-            match result {
-                Ok(()) => {
-                    if focus_started_server {
-                        self.synced_session_id = Some(command_id.to_string());
-                    }
-                    self.terminal_notice = None;
-                    self.terminal_actionable_notice = None;
-                    self.save_session_state();
-                }
-                Err(error) => {
-                    self.terminal_notice = Some(format!("Failed to start server: {error}"));
-                }
-            }
-            cx.notify();
-            return;
-        };
-
-        self.invalidate_server_port_snapshot(Some(port));
-        if let Some(state) = self.active_port_state.as_mut() {
-            if state.command_id == command_id && state.port == port {
-                state.status = None;
-                state.last_checked_at = None;
-                state.refresh_in_flight = true;
-            }
+        if focus_started_server {
+            self.interrupt_active_browser_replay_before_route_change(None);
         }
-
-        let command_id = command_id.to_string();
-        let background_executor = cx.background_executor().clone();
-        let native_dialog_blockers = self.native_dialog_blockers.clone();
-        cx.spawn(
-            move |this: gpui::WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
-                let mut async_cx = cx.clone();
-                let native_dialog_blockers = native_dialog_blockers.clone();
-                async move {
-                    let status = background_executor
-                        .spawn(async move { ports_service::check_port_in_use(port).ok() })
-                        .await;
-                    while native_dialog_blockers.load(Ordering::Acquire) > 0 {
-                        background_executor.timer(Duration::from_millis(50)).await;
-                    }
-                    let _ = this.update(&mut async_cx, |this, cx: &mut Context<'_, Self>| {
-                        if let Err(error) = this
-                            .process_manager
-                            .validate_server_launch(&this.state, &command_id)
-                        {
-                            this.terminal_notice = Some(format!("Failed to start server: {error}"));
-                            cx.notify();
-                            return;
-                        }
-                        if let Some(state) = this.active_port_state.as_mut() {
-                            if state.command_id == command_id && state.port == port {
-                                state.status = status.clone();
-                                state.last_checked_at = Some(Instant::now());
-                                state.refresh_in_flight = false;
-                            }
-                        }
-
-                        if let Some(status) = status.filter(|status| status.in_use) {
-                            let owner = status
-                                .process_name
-                                .clone()
-                                .unwrap_or_else(|| "another process".to_string());
-                            let owner_label = status
-                                .pid
-                                .map(|pid| format!("{owner} ({pid})"))
-                                .unwrap_or(owner);
-                            let message =
-                                format!("Port {port} is already in use by {owner_label}.");
-                            this.terminal_notice = Some(message.clone());
-                            this.terminal_actionable_notice = Some(ActionableNotice::PortInUse {
-                                command_id: command_id.clone(),
-                                message,
-                            });
-                            cx.notify();
-                            return;
-                        }
-
-                        if focus_started_server {
-                            this.interrupt_active_browser_replay_before_route_change(None);
-                        }
-                        let result = if focus_started_server {
-                            this.process_manager.start_server(
-                                &mut this.state,
-                                &command_id,
-                                dimensions,
-                            )
-                        } else {
-                            this.process_manager.start_server_in_background(
-                                &mut this.state,
-                                &command_id,
-                                dimensions,
-                            )
-                        };
-
-                        match result {
-                            Ok(()) => {
-                                if focus_started_server {
-                                    this.synced_session_id = Some(command_id.clone());
-                                }
-                                this.terminal_notice = None;
-                                this.terminal_actionable_notice = None;
-                                this.save_session_state();
-                            }
-                            Err(error) => {
-                                this.terminal_notice =
-                                    Some(format!("Failed to start server: {error}"));
-                            }
-                        }
-                        cx.notify();
-                    });
+        self.invalidate_server_port_snapshot(port);
+        let result = if focus_started_server {
+            self.process_manager
+                .start_server(&mut self.state, command_id, dimensions)
+        } else {
+            self.process_manager
+                .start_server_in_background(&mut self.state, command_id, dimensions)
+        };
+        match result {
+            Ok(()) => {
+                if focus_started_server {
+                    self.synced_session_id = Some(command_id.to_string());
                 }
-            },
-        )
-        .detach();
-        if self.terminal_notice.is_none() {
-            self.terminal_notice = Some(format!("Checking port {port} before starting..."));
+                self.terminal_notice = Some(format!("Starting `{command_id}`..."));
+                self.terminal_actionable_notice = None;
+                self.save_session_state();
+            }
+            Err(error) => {
+                self.terminal_notice = Some(format!("Failed to start server: {error}"));
+            }
         }
         cx.notify();
     }
@@ -13027,7 +13124,12 @@ impl NativeShell {
         if !self.ensure_mutation_control(cx) {
             return;
         }
+        let port = self
+            .state
+            .find_command(command_id)
+            .and_then(|lookup| lookup.command.port);
         if self.remote_mode.is_some() {
+            self.invalidate_server_port_snapshot(port);
             self.remote_send_action(RemoteAction::StopServer {
                 command_id: command_id.to_string(),
             });
@@ -13036,10 +13138,6 @@ impl NativeShell {
             return;
         }
 
-        let port = self
-            .state
-            .find_command(command_id)
-            .and_then(|lookup| lookup.command.port);
         self.invalidate_server_port_snapshot(port);
         let command_id = command_id.to_string();
         if let Some(state) = self.active_port_state.as_mut() {
@@ -13081,7 +13179,12 @@ impl NativeShell {
         if !self.ensure_mutation_control(cx) {
             return;
         }
+        let port = self
+            .state
+            .find_command(command_id)
+            .and_then(|lookup| lookup.command.port);
         if self.remote_mode.is_some() {
+            self.invalidate_server_port_snapshot(port);
             let dimensions = self.terminal_dimensions(window);
             self.remote_send_action(RemoteAction::RestartServer {
                 command_id: command_id.to_string(),
@@ -13094,10 +13197,6 @@ impl NativeShell {
 
         self.interrupt_active_browser_replay_before_route_change(None);
         let dimensions = self.terminal_dimensions(window);
-        let port = self
-            .state
-            .find_command(command_id)
-            .and_then(|lookup| lookup.command.port);
         self.invalidate_server_port_snapshot(port);
         match self
             .process_manager
@@ -13135,6 +13234,26 @@ impl NativeShell {
         };
 
         if self.remote_mode.is_some() {
+            let remote_authority = self
+                .remote_mode
+                .as_ref()
+                .and_then(|remote_mode| remote_mode.snapshot.port_authorities.get(&port));
+            let remote_session = self.remote_mode.as_ref().and_then(|remote_mode| {
+                remote_mode.snapshot.runtime_state.sessions.get(command_id)
+            });
+            if !can_open_remote_server_url_now(
+                remote_authority,
+                remote_session,
+                port,
+                self.remote_port_forward_state(port)
+                    .is_some_and(|state| state.listener_active),
+            ) {
+                self.terminal_notice = Some(format!(
+                    "Could not open localhost:{port} because current host port authority is not fresh and verified."
+                ));
+                cx.notify();
+                return;
+            }
             match self.remote_port_forward_state(port) {
                 Some(state) if state.listener_active => {}
                 Some(state) => {
@@ -13156,6 +13275,29 @@ impl NativeShell {
                     return;
                 }
             }
+        } else {
+            let current_runtime = self.process_manager.runtime_state();
+            let current_session = current_runtime.sessions.get(command_id);
+            if !can_open_local_server_url_now(
+                current_session
+                    .map(|session| session.status)
+                    .unwrap_or(SessionStatus::Stopped),
+                current_session.is_some_and(|session| session.reap_incomplete),
+                self.server_port_snapshot.authorities.get(&port),
+                self.server_port_snapshot
+                    .probe_failures
+                    .get(&port)
+                    .map(String::as_str),
+                self.server_port_snapshot.last_checked_at,
+                self.server_port_snapshot.source_freshness_deadline,
+                self.server_port_snapshot.refresh_in_flight,
+            ) {
+                self.terminal_notice = Some(format!(
+                    "Could not open localhost:{port} because current port authority is not fresh and verified."
+                ));
+                cx.notify();
+                return;
+            }
         }
 
         let url = format!("http://localhost:{port}");
@@ -13163,79 +13305,6 @@ impl NativeShell {
             Ok(()) => self.terminal_notice = Some(format!("Opened {url}")),
             Err(error) => self.terminal_notice = Some(format!("Failed to open {url}: {error}")),
         }
-        cx.notify();
-    }
-
-    fn kill_server_port_action(
-        &mut self,
-        command_id: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if let Err(error) = self
-            .process_manager
-            .validate_server_launch(&self.state, command_id)
-        {
-            self.terminal_notice = Some(format!(
-                "Failed to restart server after freeing port: {error}"
-            ));
-            cx.notify();
-            return;
-        }
-        let Some(lookup) = self
-            .state
-            .find_command(command_id)
-            .map(|lookup| (lookup.project.id.clone(), lookup.command.clone()))
-        else {
-            self.terminal_notice = Some(format!("Unknown command `{command_id}`"));
-            cx.notify();
-            return;
-        };
-        let (project_id, command) = lookup;
-        let Some(port) = command.port else {
-            self.terminal_notice = Some("This command does not define a port.".to_string());
-            cx.notify();
-            return;
-        };
-
-        self.interrupt_active_browser_replay_before_route_change(None);
-        let _ = self.process_manager.write_virtual_text(
-            command_id,
-            &format!("\r\n\x1b[33m--- Resolving port {port} conflict... ---\x1b[0m\r\n"),
-        );
-
-        self.record_port_kill_feedback(command_id, port, PortKillFeedback::None);
-        self.refresh_port_state(command_id.to_string(), port, cx);
-        let dimensions = self.terminal_dimensions(window);
-        let banner = format!("--- Starting after freeing port {port}... ---");
-
-        match self.process_manager.schedule_kill_port_and_restart(
-            &mut self.state,
-            command_id,
-            port,
-            dimensions,
-            &banner,
-            None,
-        ) {
-            Ok(()) => {
-                self.synced_session_id = Some(command_id.to_string());
-                self.terminal_notice = Some(format!("Resolving port {port} conflict..."));
-                self.terminal_actionable_notice = None;
-                self.save_session_state();
-            }
-            Err(error) => {
-                self.record_port_kill_feedback(command_id, port, PortKillFeedback::Error);
-                self.terminal_notice = Some(format!(
-                    "Failed to restart server after freeing port: {error}"
-                ));
-                let _ = self.process_manager.write_virtual_text(
-                    command_id,
-                    &format!("\x1b[31mFailed to resolve port {port} conflict: {error}\x1b[0m\r\n"),
-                );
-            }
-        }
-        let _ = project_id;
-        let _ = command;
         cx.notify();
     }
 
@@ -14788,11 +14857,21 @@ impl Render for NativeShell {
         let runtime_snapshot =
             local_runtime_snapshot.unwrap_or_else(|| self.current_runtime_snapshot());
         self.sync_window_title(window, &runtime_snapshot);
-        let server_indicators = derive_server_indicator_states(
-            &self.state,
-            &runtime_snapshot,
-            &self.current_port_statuses(),
-        );
+        let server_indicators = if let Some(remote_mode) = self.remote_mode.as_ref() {
+            derive_server_indicator_states_from_remote_authority(
+                &self.state,
+                &runtime_snapshot,
+                &remote_mode.snapshot.port_authorities,
+            )
+        } else {
+            derive_server_indicator_states_with_authority(
+                &self.state,
+                &runtime_snapshot,
+                &self.current_port_authorities(),
+                &self.current_port_probe_failures(),
+                self.server_port_snapshot.source_freshness_deadline,
+            )
+        };
         let updater_snapshot = self.updater.snapshot();
         let quota_statuses = self.ai_quota_statuses();
         let remote_status_bar = self.remote_status_bar_state();
@@ -15187,12 +15266,6 @@ impl Render for NativeShell {
                     this.open_server_url_action(&command_id, cx);
                 }))
             };
-        let make_kill_port_handler =
-            |command_id: String| -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
-                Box::new(cx.listener(move |this, _: &MouseDownEvent, window, cx| {
-                    this.kill_server_port_action(&command_id, window, cx);
-                }))
-            };
         let make_force_quit_handler = || -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
             Box::new(cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
                 this.force_quit_action(cx);
@@ -15513,14 +15586,8 @@ impl Render for NativeShell {
                 on_clear_output: controls
                     .filter(|controls| controls.can_clear)
                     .map(|_| make_clear_output_handler(command_id.clone())),
-                on_kill_port: controls
-                    .filter(|controls| controls.can_kill_port)
-                    .map(|_| make_kill_port_handler(command_id.clone())),
                 on_actionable_notice_action: self.terminal_actionable_notice.as_ref().map(
                     |notice| match notice {
-                        ActionableNotice::PortInUse {
-                            command_id: cmd_id, ..
-                        } => make_kill_port_handler(cmd_id.clone()),
                         ActionableNotice::ForceQuit { .. } => make_force_quit_handler(),
                     },
                 ),
@@ -16722,6 +16789,463 @@ fn server_port_snapshot_plan(
     (tracked_server_ports(state), refresh_interval)
 }
 
+#[cfg(test)]
+fn server_start_probe_allowed(refresh_in_flight: bool) -> bool {
+    !refresh_in_flight
+}
+
+fn stage_server_port_refresh(
+    statuses: &mut HashMap<u16, PortStatus>,
+    authorities: &mut HashMap<u16, crate::process::ports::PortStatus>,
+    probe_failures: &mut HashMap<u16, String>,
+    ports: &[u16],
+) {
+    for &port in ports {
+        statuses.remove(&port);
+        authorities.remove(&port);
+        probe_failures.remove(&port);
+    }
+}
+
+fn clear_active_port_state_for_untracked_ports(
+    active_port_state: &mut Option<ActivePortState>,
+    tracked_ports: &[u16],
+) {
+    if active_port_state
+        .as_ref()
+        .is_some_and(|state| tracked_ports.binary_search(&state.port).is_err())
+    {
+        *active_port_state = None;
+    }
+}
+
+fn invalidate_server_port_snapshot_state(
+    snapshot: &mut ServerPortSnapshotState,
+    active_port_state: &mut Option<ActivePortState>,
+    port: Option<u16>,
+) {
+    if let Some(port) = port {
+        snapshot.statuses.remove(&port);
+        snapshot.authorities.remove(&port);
+        snapshot.probe_failures.remove(&port);
+        if let Some(state) = active_port_state.as_mut() {
+            if state.port == port {
+                state.status = None;
+                state.last_checked_at = None;
+                state.refresh_in_flight = true;
+            }
+        }
+    } else {
+        snapshot.statuses.clear();
+        snapshot.authorities.clear();
+        snapshot.probe_failures.clear();
+        *active_port_state = None;
+    }
+    snapshot.last_checked_at = None;
+    clear_server_port_source_metadata(snapshot);
+    snapshot.refresh_generation = snapshot.refresh_generation.saturating_add(1);
+    snapshot.task_action_epoch = snapshot.task_action_epoch.saturating_add(1);
+    snapshot.refresh_in_flight = false;
+    snapshot.active_refresh = None;
+}
+
+fn clear_server_port_source_metadata(snapshot: &mut ServerPortSnapshotState) {
+    snapshot.source_observed_at = None;
+    snapshot.source_freshness_deadline = None;
+    snapshot.source_publication_sequence = 0;
+}
+
+fn port_refresh_is_current(active: Option<&PortRefreshFence>, expected: &PortRefreshFence) -> bool {
+    active == Some(expected)
+}
+
+fn port_refresh_is_current_for_state(
+    active: Option<&PortRefreshFence>,
+    expected: &PortRefreshFence,
+    tracked_ports: &[u16],
+    task_action_epoch: u64,
+    runtime_generation: u64,
+    resource_generation: u64,
+    managed_snapshot_generation: u64,
+    server_lifecycle_generation: u64,
+) -> bool {
+    port_refresh_is_current(active, expected)
+        && expected.ports == tracked_ports
+        && expected.task_action_epoch == task_action_epoch
+        && expected.runtime_generation == runtime_generation
+        && expected.resource_generation == resource_generation
+        && expected.managed_snapshot_generation == managed_snapshot_generation
+        && expected.server_lifecycle_generation == server_lifecycle_generation
+}
+
+fn port_refresh_projection_is_fresh_at(projection: &PortRefreshProjection, now: Instant) -> bool {
+    let (Some(observed_at), Some(deadline)) = (
+        projection.source_observed_at,
+        projection.source_freshness_deadline,
+    ) else {
+        return false;
+    };
+    projection.source_publication_sequence > 0
+        && observed_at <= now
+        && now <= deadline
+        && now
+            .checked_duration_since(observed_at)
+            .is_some_and(|age| age <= crate::process::ports::DEFAULT_FREE_PROOF_MAX_AGE)
+}
+
+const MAX_PORT_PROBE_DETAIL_CHARS: usize = 256;
+const MAX_PORT_PROBE_NOTICE_CHARS: usize = 1024;
+
+fn instant_to_epoch_ms(source: Instant, reference: Instant, reference_epoch_ms: u64) -> u64 {
+    if source <= reference {
+        reference_epoch_ms.saturating_sub(
+            u64::try_from(reference.duration_since(source).as_millis()).unwrap_or(u64::MAX),
+        )
+    } else {
+        reference_epoch_ms.saturating_add(
+            u64::try_from(source.duration_since(reference).as_millis()).unwrap_or(u64::MAX),
+        )
+    }
+}
+
+fn bounded_port_text(text: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let mut sanitized = String::with_capacity(text.len().min(max_chars));
+    let mut characters = text.chars();
+    while sanitized.chars().count() < max_chars.saturating_sub(1) {
+        let Some(character) = characters.next() else {
+            return sanitized;
+        };
+        sanitized.push(if character.is_control() {
+            ' '
+        } else {
+            character
+        });
+    }
+    if characters.next().is_some() {
+        sanitized.push('…');
+    }
+    sanitized
+}
+
+fn bounded_port_probe_detail(detail: &str) -> String {
+    bounded_port_text(detail, MAX_PORT_PROBE_DETAIL_CHARS)
+}
+
+fn project_legacy_port_snapshot(
+    snapshot: &crate::process::ports::PortInventorySnapshot,
+    ports: &[u16],
+) -> PortRefreshProjection {
+    let mut projection = PortRefreshProjection::default();
+    if !snapshot.is_exactly_for(ports) {
+        for &port in ports {
+            projection.probe_failures.insert(
+                port,
+                "listener inventory snapshot does not match the requested port set".to_string(),
+            );
+        }
+        return projection;
+    }
+    if !snapshot.is_fresh_at(
+        Instant::now(),
+        crate::process::ports::DEFAULT_FREE_PROOF_MAX_AGE,
+    ) {
+        for &port in ports {
+            projection
+                .probe_failures
+                .insert(port, "listener inventory snapshot is stale".to_string());
+        }
+        return projection;
+    }
+    for &port in ports {
+        if let Some(issue) = snapshot.issue(port) {
+            projection
+                .probe_failures
+                .insert(port, bounded_port_probe_detail(issue.detail()));
+            continue;
+        }
+        if !snapshot.is_valid() {
+            projection.probe_failures.insert(
+                port,
+                bounded_port_probe_detail(
+                    snapshot
+                        .validation_error()
+                        .unwrap_or("listener inventory snapshot was invalid"),
+                ),
+            );
+            continue;
+        }
+        match snapshot.observation(port) {
+            Some(crate::process::ports::PortObservation::Listeners(listeners)) => {
+                projection.statuses.insert(
+                    port,
+                    PortStatus {
+                        port,
+                        in_use: true,
+                        pid: (listeners.len() == 1).then(|| listeners[0].pid()),
+                        process_name: None,
+                    },
+                );
+            }
+            Some(crate::process::ports::PortObservation::Free) => {
+                projection.statuses.insert(
+                    port,
+                    PortStatus {
+                        port,
+                        in_use: false,
+                        pid: None,
+                        process_name: None,
+                    },
+                );
+            }
+            Some(crate::process::ports::PortObservation::ProbeError(detail)) => {
+                projection
+                    .probe_failures
+                    .insert(port, bounded_port_probe_detail(detail));
+            }
+            None => {
+                projection.probe_failures.insert(
+                    port,
+                    format!("port {port} was not included in listener inventory"),
+                );
+            }
+        }
+    }
+    projection
+}
+
+fn project_typed_port_snapshot(
+    snapshot: &crate::process::ports::PortInventorySnapshot,
+    ports: &[u16],
+    no_managed_resource: crate::domain::operation::ResourceFence,
+    managed: &HashMap<u16, crate::process::ports::ManagedResourceSnapshot>,
+    managed_candidate_ports: &std::collections::HashSet<u16>,
+) -> PortRefreshProjection {
+    let mut projection = project_legacy_port_snapshot(snapshot, ports);
+    let observed_at = snapshot.observed_at();
+    let deadline = snapshot.freshness_deadline();
+    projection.source_observed_at = Some(observed_at);
+    projection.source_freshness_deadline = Some(deadline);
+    projection.source_publication_sequence = snapshot.publication_sequence();
+
+    for &port in ports {
+        let resource = managed
+            .get(&port)
+            .map(crate::process::ports::ManagedResourceSnapshot::resource)
+            .unwrap_or(no_managed_resource);
+        let target = crate::process::ports::PortTarget::new(
+            port,
+            resource,
+            crate::process::ports::ManagedPortHealth::Ready,
+        );
+        let probe_error = matches!(
+            snapshot.observation(port),
+            Some(crate::process::ports::PortObservation::ProbeError(_))
+        ) || matches!(
+            snapshot.issue(port),
+            Some(crate::process::ports::PortObservationIssue::ProbeError(_))
+        );
+        let authority = if probe_error {
+            // A scan fault is authoritative for the affected port even when
+            // a live session is waiting for a managed fence. Do not let the
+            // candidate fallback turn typed ProbeError evidence into an
+            // apparently healthy/merely-unknown authority.
+            crate::process::ports::project_port_status_from_snapshot_with_membership_reconciliation_at(
+                &target,
+                snapshot,
+                None,
+                None,
+                observed_at,
+                deadline,
+            )
+        } else if managed_candidate_ports.contains(&port) && !managed.contains_key(&port) {
+            crate::process::ports::PortStatus {
+                port,
+                resource,
+                kind: crate::process::ports::PortStatusKind::Unknown,
+                listeners: snapshot
+                    .observation(port)
+                    .map(|observation| observation.listeners().to_vec().into())
+                    .unwrap_or_else(|| Arc::from([])),
+                error: Some(
+                    "managed process fence is unavailable for the current runtime generation"
+                        .to_string(),
+                ),
+            }
+        } else {
+            // A single registry read is not enough to settle ownership: the
+            // listener table and managed membership can cross between the
+            // two observations. Until the ProcessRegistry owner supplies a
+            // second equal membership snapshot, managed evidence remains
+            // Unknown. With no managed candidate, both sides are `None` and
+            // a fully identity-proven external listener may still be blue.
+            crate::process::ports::project_port_status_from_snapshot_with_membership_reconciliation_at(
+                &target,
+                snapshot,
+                managed.get(&port),
+                None,
+                observed_at,
+                deadline,
+            )
+        };
+        projection.authorities.insert(port, authority);
+    }
+    projection
+}
+
+fn project_port_refresh_result(
+    result: Result<Arc<crate::process::ports::PortInventorySnapshot>, String>,
+    cached_snapshot: Arc<crate::process::ports::PortInventorySnapshot>,
+    ports: &[u16],
+    no_managed_resource: crate::domain::operation::ResourceFence,
+    managed: &HashMap<u16, crate::process::ports::ManagedResourceSnapshot>,
+    managed_candidate_ports: &std::collections::HashSet<u16>,
+) -> PortRefreshProjection {
+    let snapshot = match result {
+        Ok(snapshot) => snapshot,
+        Err(_)
+            if cached_snapshot.publication_sequence() > 0
+                && cached_snapshot.is_exactly_for(ports)
+                && ports.iter().all(|port| {
+                    matches!(
+                        cached_snapshot.observation(*port),
+                        Some(crate::process::ports::PortObservation::ProbeError(_))
+                    )
+                }) =>
+        {
+            cached_snapshot
+        }
+        Err(error) => {
+            // A request-level failure must have been published by the
+            // PortInventory coordinator before it reaches this projection.
+            // Keep an unsequenced local diagnostic for fail-closed rendering,
+            // but do not mint source timestamps or publication identity here.
+            let snapshot = crate::process::ports::PortInventorySnapshot::probe_failure(
+                ports.iter().copied(),
+                error,
+            );
+            let mut projection = project_typed_port_snapshot(
+                &snapshot,
+                ports,
+                no_managed_resource,
+                managed,
+                managed_candidate_ports,
+            );
+            projection.source_observed_at = None;
+            projection.source_freshness_deadline = None;
+            projection.source_publication_sequence = 0;
+            return projection;
+        }
+    };
+    project_typed_port_snapshot(
+        &snapshot,
+        ports,
+        no_managed_resource,
+        managed,
+        managed_candidate_ports,
+    )
+}
+
+fn port_probe_failure_notice(probe_failures: &HashMap<u16, String>) -> Option<String> {
+    if probe_failures.is_empty() {
+        return None;
+    }
+
+    let mut ports = probe_failures.keys().copied().collect::<Vec<_>>();
+    ports.sort_unstable();
+    let details = ports
+        .iter()
+        .filter_map(|port| {
+            probe_failures.get(port).map(|detail| {
+                format!(
+                    "Port {port} status is unknown (probe failed: {})",
+                    bounded_port_probe_detail(detail)
+                )
+            })
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    Some(format!(
+        "{}. Ownership is unverified; no green or blue ownership state is shown.",
+        bounded_port_text(&details, MAX_PORT_PROBE_NOTICE_CHARS)
+    ))
+}
+
+fn apply_server_port_refresh(
+    current: &mut HashMap<u16, PortStatus>,
+    authorities: &mut HashMap<u16, crate::process::ports::PortStatus>,
+    probe_failures: &mut HashMap<u16, String>,
+    tracked_ports: &[u16],
+    result: Result<PortRefreshProjection, String>,
+) -> Option<String> {
+    let mut source_observed_at = None;
+    let mut source_freshness_deadline = None;
+    let mut source_publication_sequence = 0;
+    apply_server_port_refresh_with_metadata(
+        current,
+        authorities,
+        probe_failures,
+        &mut source_observed_at,
+        &mut source_freshness_deadline,
+        &mut source_publication_sequence,
+        tracked_ports,
+        result,
+    )
+}
+
+fn apply_server_port_refresh_with_metadata(
+    current: &mut HashMap<u16, PortStatus>,
+    authorities: &mut HashMap<u16, crate::process::ports::PortStatus>,
+    probe_failures: &mut HashMap<u16, String>,
+    source_observed_at: &mut Option<Instant>,
+    source_freshness_deadline: &mut Option<Instant>,
+    source_publication_sequence: &mut u64,
+    tracked_ports: &[u16],
+    result: Result<PortRefreshProjection, String>,
+) -> Option<String> {
+    match result {
+        Ok(mut next) => {
+            next.statuses
+                .retain(|port, _| tracked_ports.binary_search(port).is_ok());
+            next.authorities
+                .retain(|port, _| tracked_ports.binary_search(port).is_ok());
+            next.probe_failures
+                .retain(|port, _| tracked_ports.binary_search(port).is_ok());
+            *current = next.statuses;
+            *authorities = next.authorities;
+            *probe_failures = next.probe_failures;
+            *source_observed_at = next.source_observed_at;
+            *source_freshness_deadline = next.source_freshness_deadline;
+            *source_publication_sequence = next.source_publication_sequence;
+            port_probe_failure_notice(probe_failures)
+        }
+        Err(error) => {
+            current.clear();
+            authorities.clear();
+            probe_failures.clear();
+            *source_observed_at = None;
+            *source_freshness_deadline = None;
+            *source_publication_sequence = 0;
+            let detail = bounded_port_probe_detail(&error);
+            for &port in tracked_ports {
+                probe_failures.insert(port, detail.clone());
+            }
+            port_probe_failure_notice(probe_failures)
+        }
+    }
+}
+
+#[cfg(test)]
+fn port_start_error_notice(error: &crate::process::ports::PortStartError) -> String {
+    match error {
+        crate::process::ports::PortStartError::Occupied { .. }
+        | crate::process::ports::PortStartError::OccupiedAmbiguous { .. } => error.to_string(),
+        _ => format!("Failed to start server: {error}"),
+    }
+}
+
 fn live_server_ports(state: &AppState, runtime: &RuntimeState) -> Vec<u16> {
     let mut ports = Vec::new();
     for project in state.projects() {
@@ -16761,6 +17285,23 @@ fn tracked_server_ports(state: &AppState) -> Vec<u16> {
     ports
 }
 
+fn unique_server_session_id(runtime: &RuntimeState, port: u16) -> Option<String> {
+    let mut matching = runtime
+        .sessions
+        .values()
+        .filter(|session| session.status.is_live())
+        .filter(|session| {
+            session
+                .server_launch
+                .as_ref()
+                .and_then(|launch| launch.port)
+                == Some(port)
+        })
+        .map(|session| session.session_id.clone());
+    let session_id = matching.next()?;
+    matching.next().is_none().then_some(session_id)
+}
+
 fn remote_forwardable_ports(snapshot: &remote::RemoteWorkspaceSnapshot) -> Vec<u16> {
     let mut ports = Vec::new();
     for project in snapshot.app_state.projects() {
@@ -16772,10 +17313,15 @@ fn remote_forwardable_ports(snapshot: &remote::RemoteWorkspaceSnapshot) -> Vec<u
                 let Some(session) = snapshot.runtime_state.sessions.get(&command.id) else {
                     continue;
                 };
-                let Some(status) = snapshot.port_statuses.get(&port) else {
+                let Some(authority) = snapshot.port_authorities.get(&port) else {
                     continue;
                 };
-                if session.status.is_live() && status.in_use && runtime_owns_port(session, status) {
+                if session.status == SessionStatus::Running
+                    && !session.reap_incomplete
+                    && authority.kind() == remote::RemotePortAuthorityKind::Managed
+                    && authority.is_fresh_at(now_epoch_ms())
+                    && remote_managed_authority_matches_session(authority, session)
+                {
                     ports.push(port);
                 }
             }
@@ -16842,10 +17388,12 @@ fn remote_port_forward_rows(
         .collect()
 }
 
+#[cfg(test)]
 fn derive_server_indicator_states(
     state: &AppState,
     runtime: &RuntimeState,
     port_statuses: &HashMap<u16, PortStatus>,
+    probe_failures: &HashMap<u16, String>,
 ) -> HashMap<String, sidebar::ServerIndicatorState> {
     let mut indicators = HashMap::new();
     for project in state.projects() {
@@ -16854,7 +17402,7 @@ fn derive_server_indicator_states(
                 let session = runtime.sessions.get(&command.id);
                 indicators.insert(
                     command.id.clone(),
-                    derive_server_indicator(session, command.port, port_statuses),
+                    derive_server_indicator(session, command.port, port_statuses, probe_failures),
                 );
             }
         }
@@ -16862,22 +17410,169 @@ fn derive_server_indicator_states(
     indicators
 }
 
+fn derive_server_indicator_states_with_authority(
+    state: &AppState,
+    runtime: &RuntimeState,
+    authorities: &HashMap<u16, crate::process::ports::PortStatus>,
+    probe_failures: &HashMap<u16, String>,
+    source_freshness_deadline: Option<Instant>,
+) -> HashMap<String, sidebar::ServerIndicatorState> {
+    let mut indicators = HashMap::new();
+    for project in state.projects() {
+        for folder in &project.folders {
+            for command in &folder.commands {
+                let session = runtime.sessions.get(&command.id);
+                indicators.insert(
+                    command.id.clone(),
+                    derive_server_indicator_with_authority(
+                        session,
+                        command.port,
+                        command.port.and_then(|port| authorities.get(&port)),
+                        probe_failures,
+                        source_freshness_deadline,
+                    ),
+                );
+            }
+        }
+    }
+    indicators
+}
+
+fn derive_server_indicator_states_from_remote_authority(
+    state: &AppState,
+    runtime: &RuntimeState,
+    authorities: &HashMap<u16, remote::RemotePortAuthority>,
+) -> HashMap<String, sidebar::ServerIndicatorState> {
+    let mut indicators = HashMap::new();
+    for project in state.projects() {
+        for folder in &project.folders {
+            for command in &folder.commands {
+                let session = runtime.sessions.get(&command.id);
+                let authority = command.port.and_then(|port| authorities.get(&port));
+                indicators.insert(
+                    command.id.clone(),
+                    derive_server_indicator_with_remote_authority(session, authority),
+                );
+            }
+        }
+    }
+    indicators
+}
+
+fn derive_server_indicator_with_remote_authority(
+    session: Option<&SessionRuntimeState>,
+    authority: Option<&remote::RemotePortAuthority>,
+) -> sidebar::ServerIndicatorState {
+    if session.is_some_and(|session| session.reap_incomplete) {
+        return sidebar::ServerIndicatorState::Unknown;
+    }
+    if session.is_some_and(|session| session.status == SessionStatus::Starting) {
+        return sidebar::ServerIndicatorState::Unready;
+    }
+
+    if authority.is_some_and(|authority| !authority.is_fresh_at(now_epoch_ms())) {
+        return sidebar::ServerIndicatorState::Unknown;
+    }
+
+    let Some(session) = session else {
+        return match authority.map(remote::RemotePortAuthority::kind) {
+            Some(remote::RemotePortAuthorityKind::ProvenExternal)
+                if authority.is_some_and(remote_external_authority_is_proven) =>
+            {
+                sidebar::ServerIndicatorState::External
+            }
+            Some(remote::RemotePortAuthorityKind::ProvenExternal) => {
+                sidebar::ServerIndicatorState::Unknown
+            }
+            Some(remote::RemotePortAuthorityKind::Unknown)
+            | Some(remote::RemotePortAuthorityKind::ProbeError)
+            | Some(remote::RemotePortAuthorityKind::Managed)
+            | Some(remote::RemotePortAuthorityKind::ManagedUnready) => {
+                sidebar::ServerIndicatorState::Unknown
+            }
+            Some(remote::RemotePortAuthorityKind::Occupied) => {
+                sidebar::ServerIndicatorState::Unknown
+            }
+            Some(remote::RemotePortAuthorityKind::Free) | None => {
+                sidebar::ServerIndicatorState::Stopped
+            }
+        };
+    };
+
+    match session.status {
+        SessionStatus::Starting => sidebar::ServerIndicatorState::Unready,
+        SessionStatus::Stopping => sidebar::ServerIndicatorState::Stopping,
+        SessionStatus::Running => match authority.map(remote::RemotePortAuthority::kind) {
+            Some(remote::RemotePortAuthorityKind::Managed)
+                if authority.is_some_and(|authority| {
+                    remote_managed_authority_matches_session(authority, session)
+                }) =>
+            {
+                sidebar::ServerIndicatorState::Ready
+            }
+            Some(remote::RemotePortAuthorityKind::ManagedUnready)
+                if authority.is_some_and(|authority| {
+                    remote_managed_authority_matches_session(authority, session)
+                }) =>
+            {
+                sidebar::ServerIndicatorState::Unready
+            }
+            Some(remote::RemotePortAuthorityKind::Managed) => {
+                // A remote Managed label is only a transport hint until its
+                // generation, membership and listener identity match this
+                // live session. Keep the sidebar fail-closed at Unknown.
+                sidebar::ServerIndicatorState::Unknown
+            }
+            Some(remote::RemotePortAuthorityKind::ManagedUnready) => {
+                sidebar::ServerIndicatorState::Unknown
+            }
+            Some(remote::RemotePortAuthorityKind::ProvenExternal)
+                if authority.is_some_and(remote_external_authority_is_proven) =>
+            {
+                sidebar::ServerIndicatorState::External
+            }
+            Some(remote::RemotePortAuthorityKind::ProvenExternal) => {
+                sidebar::ServerIndicatorState::Unknown
+            }
+            Some(remote::RemotePortAuthorityKind::Unknown)
+            | Some(remote::RemotePortAuthorityKind::ProbeError)
+            | None => sidebar::ServerIndicatorState::Unknown,
+            Some(remote::RemotePortAuthorityKind::Free)
+            | Some(remote::RemotePortAuthorityKind::Occupied) => {
+                sidebar::ServerIndicatorState::Unready
+            }
+        },
+        SessionStatus::Stopped => sidebar::ServerIndicatorState::Stopped,
+        SessionStatus::Crashed => sidebar::ServerIndicatorState::Crashed,
+        SessionStatus::Exited => sidebar::ServerIndicatorState::Exited,
+        SessionStatus::Failed => sidebar::ServerIndicatorState::Failed,
+    }
+}
+
+#[cfg(test)]
 fn derive_server_indicator(
     session: Option<&SessionRuntimeState>,
     port: Option<u16>,
     port_statuses: &HashMap<u16, PortStatus>,
+    probe_failures: &HashMap<u16, String>,
 ) -> sidebar::ServerIndicatorState {
+    if session.is_some_and(|session| session.status == SessionStatus::Starting) {
+        // A probe can fail while a process is still establishing its
+        // listener. Keep the launch transition orange until a current
+        // authority snapshot replaces it; never flash red from stale probe
+        // state.
+        return sidebar::ServerIndicatorState::Unready;
+    }
+    if port.is_some_and(|port| probe_failures.contains_key(&port)) {
+        return sidebar::ServerIndicatorState::Failed;
+    }
+
     let port_status = port.and_then(|port| port_statuses.get(&port));
-    let external_listener = port_status.is_some_and(|status| {
-        status.in_use
-            && session
-                .map(|session| !runtime_owns_port(session, status))
-                .unwrap_or(true)
-    });
+    let occupied_listener = port_status.is_some_and(|status| status.in_use);
 
     let Some(session) = session else {
-        return if external_listener {
-            sidebar::ServerIndicatorState::External
+        return if occupied_listener {
+            occupied_indicator_state()
         } else {
             sidebar::ServerIndicatorState::Stopped
         };
@@ -16888,20 +17583,16 @@ fn derive_server_indicator(
         | SessionStatus::Crashed
         | SessionStatus::Exited
         | SessionStatus::Failed
-            if external_listener =>
+            if occupied_listener =>
         {
-            sidebar::ServerIndicatorState::External
+            occupied_indicator_state()
         }
         SessionStatus::Stopped => sidebar::ServerIndicatorState::Stopped,
         SessionStatus::Starting => sidebar::ServerIndicatorState::Unready,
         SessionStatus::Running => match port {
-            Some(port) => {
-                let status = port_statuses.get(&port);
-                if status.is_some_and(|status| status.in_use && runtime_owns_port(session, status))
-                {
-                    sidebar::ServerIndicatorState::Ready
-                } else if external_listener {
-                    sidebar::ServerIndicatorState::External
+            Some(_) => {
+                if occupied_listener {
+                    occupied_indicator_state()
                 } else {
                     sidebar::ServerIndicatorState::Unready
                 }
@@ -16915,25 +17606,338 @@ fn derive_server_indicator(
     }
 }
 
-fn is_managed_port_owner(
-    active_session: Option<&crate::terminal::session::TerminalSessionView>,
-    status: &PortStatus,
-) -> bool {
-    active_session
-        .map(|session| runtime_owns_port(&session.runtime, status))
-        .unwrap_or(false)
-}
-
-fn runtime_owns_port(session: &SessionRuntimeState, status: &PortStatus) -> bool {
-    let Some(pid) = status.pid else {
-        return false;
-    };
-
-    if session.pid == Some(pid) {
-        return true;
+fn derive_server_indicator_with_authority(
+    session: Option<&SessionRuntimeState>,
+    port: Option<u16>,
+    authority: Option<&crate::process::ports::PortStatus>,
+    probe_failures: &HashMap<u16, String>,
+    source_freshness_deadline: Option<Instant>,
+) -> sidebar::ServerIndicatorState {
+    if session.is_some_and(|session| session.reap_incomplete) {
+        return sidebar::ServerIndicatorState::Unknown;
+    }
+    if session.is_some_and(|session| session.status == SessionStatus::Starting) {
+        return sidebar::ServerIndicatorState::Unready;
+    }
+    if session.map_or(true, |session| session.status == SessionStatus::Running)
+        && authority.is_some_and(local_authority_requires_source_freshness)
+        && !local_source_is_fresh(source_freshness_deadline)
+    {
+        return sidebar::ServerIndicatorState::Unknown;
+    }
+    if authority
+        .is_some_and(|authority| authority.kind() == crate::process::ports::PortStatusKind::Unknown)
+    {
+        return sidebar::ServerIndicatorState::Unknown;
+    }
+    if port.is_some_and(|port| probe_failures.contains_key(&port)) {
+        return sidebar::ServerIndicatorState::Failed;
     }
 
-    session.resources.process_ids.contains(&pid)
+    let kind = authority.map(crate::process::ports::PortStatus::kind);
+    let Some(session) = session else {
+        return match kind {
+            Some(crate::process::ports::PortStatusKind::ProvenExternal)
+                if authority.is_some_and(local_external_authority_is_proven) =>
+            {
+                sidebar::ServerIndicatorState::External
+            }
+            Some(crate::process::ports::PortStatusKind::ProvenExternal) => {
+                sidebar::ServerIndicatorState::Unknown
+            }
+            Some(crate::process::ports::PortStatusKind::Unknown) => {
+                sidebar::ServerIndicatorState::Unknown
+            }
+            Some(crate::process::ports::PortStatusKind::ProbeError) => {
+                sidebar::ServerIndicatorState::Unknown
+            }
+            Some(crate::process::ports::PortStatusKind::ManagedHealthy)
+            | Some(crate::process::ports::PortStatusKind::ManagedUnready)
+            | Some(crate::process::ports::PortStatusKind::Starting)
+            | Some(crate::process::ports::PortStatusKind::Occupied) => {
+                sidebar::ServerIndicatorState::Unknown
+            }
+            _ => sidebar::ServerIndicatorState::Stopped,
+        };
+    };
+
+    match session.status {
+        SessionStatus::Starting => sidebar::ServerIndicatorState::Unready,
+        SessionStatus::Stopping => sidebar::ServerIndicatorState::Stopping,
+        SessionStatus::Running => match kind {
+            Some(crate::process::ports::PortStatusKind::ManagedHealthy)
+                if authority.is_some_and(local_managed_authority_is_proven) =>
+            {
+                sidebar::ServerIndicatorState::Ready
+            }
+            Some(crate::process::ports::PortStatusKind::ManagedHealthy) => {
+                sidebar::ServerIndicatorState::Unknown
+            }
+            Some(crate::process::ports::PortStatusKind::ManagedUnready)
+                if authority.is_some_and(local_managed_authority_is_proven) =>
+            {
+                sidebar::ServerIndicatorState::Unready
+            }
+            Some(crate::process::ports::PortStatusKind::ManagedUnready) => {
+                sidebar::ServerIndicatorState::Unknown
+            }
+            Some(crate::process::ports::PortStatusKind::ProvenExternal)
+                if authority.is_some_and(local_external_authority_is_proven) =>
+            {
+                sidebar::ServerIndicatorState::External
+            }
+            Some(crate::process::ports::PortStatusKind::ProvenExternal) => {
+                sidebar::ServerIndicatorState::Unknown
+            }
+            Some(crate::process::ports::PortStatusKind::Unknown)
+            | Some(crate::process::ports::PortStatusKind::ProbeError)
+            | None => sidebar::ServerIndicatorState::Unknown,
+            Some(crate::process::ports::PortStatusKind::Starting)
+            | Some(crate::process::ports::PortStatusKind::Occupied)
+            | Some(crate::process::ports::PortStatusKind::Stopped) => {
+                sidebar::ServerIndicatorState::Unready
+            }
+        },
+        SessionStatus::Stopped
+        | SessionStatus::Crashed
+        | SessionStatus::Exited
+        | SessionStatus::Failed => match kind {
+            Some(crate::process::ports::PortStatusKind::Unknown)
+            | Some(crate::process::ports::PortStatusKind::ProbeError) => {
+                sidebar::ServerIndicatorState::Unknown
+            }
+            _ => match session.status {
+                SessionStatus::Stopped => sidebar::ServerIndicatorState::Stopped,
+                SessionStatus::Crashed => sidebar::ServerIndicatorState::Crashed,
+                SessionStatus::Exited => sidebar::ServerIndicatorState::Exited,
+                SessionStatus::Failed => sidebar::ServerIndicatorState::Failed,
+                SessionStatus::Starting | SessionStatus::Running | SessionStatus::Stopping => {
+                    unreachable!("status arm is exhaustive")
+                }
+            },
+        },
+    }
+}
+
+fn local_port_ui_authority(
+    authority: Option<&crate::process::ports::PortStatus>,
+    session: Option<&SessionRuntimeState>,
+    source_freshness_deadline: Option<Instant>,
+) -> Option<PortUiAuthority> {
+    if session
+        .is_some_and(|session| session.reap_incomplete || session.status != SessionStatus::Running)
+    {
+        return Some(PortUiAuthority::Unknown);
+    }
+    if authority.is_some_and(local_authority_requires_source_freshness)
+        && !local_source_is_fresh(source_freshness_deadline)
+    {
+        return Some(PortUiAuthority::Unknown);
+    }
+    authority.map(|authority| match authority.kind() {
+        crate::process::ports::PortStatusKind::ManagedHealthy
+            if local_managed_authority_is_proven(authority) =>
+        {
+            PortUiAuthority::Managed
+        }
+        crate::process::ports::PortStatusKind::ManagedHealthy => PortUiAuthority::Unknown,
+        crate::process::ports::PortStatusKind::ManagedUnready
+            if local_managed_authority_is_proven(authority) =>
+        {
+            PortUiAuthority::ManagedUnready
+        }
+        crate::process::ports::PortStatusKind::ManagedUnready => PortUiAuthority::Unknown,
+        crate::process::ports::PortStatusKind::ProvenExternal
+            if local_external_authority_is_proven(authority) =>
+        {
+            PortUiAuthority::ProvenExternal
+        }
+        crate::process::ports::PortStatusKind::ProvenExternal => PortUiAuthority::Unknown,
+        crate::process::ports::PortStatusKind::Starting => PortUiAuthority::Starting,
+        crate::process::ports::PortStatusKind::Stopped => PortUiAuthority::Free,
+        crate::process::ports::PortStatusKind::Unknown
+        | crate::process::ports::PortStatusKind::ProbeError
+        | crate::process::ports::PortStatusKind::Occupied => PortUiAuthority::Unknown,
+    })
+}
+
+fn can_open_local_server_url_now(
+    status: SessionStatus,
+    reap_incomplete: bool,
+    authority: Option<&crate::process::ports::PortStatus>,
+    probe_failure: Option<&str>,
+    last_checked_at: Option<Instant>,
+    source_freshness_deadline: Option<Instant>,
+    refresh_in_flight: bool,
+) -> bool {
+    status == SessionStatus::Running
+        && !reap_incomplete
+        && !refresh_in_flight
+        && probe_failure.is_none()
+        && local_source_is_fresh(source_freshness_deadline)
+        && last_checked_at.is_some_and(|checked_at| {
+            Instant::now()
+                .checked_duration_since(checked_at)
+                .is_some_and(|age| age <= crate::process::ports::DEFAULT_FREE_PROOF_MAX_AGE)
+        })
+        && authority.is_some_and(|authority| {
+            (local_managed_authority_is_proven(authority)
+                && authority.kind() == crate::process::ports::PortStatusKind::ManagedHealthy)
+                || (authority.kind() == crate::process::ports::PortStatusKind::ProvenExternal
+                    && local_external_authority_is_proven(authority))
+        })
+}
+
+fn local_authority_requires_source_freshness(
+    authority: &crate::process::ports::PortStatus,
+) -> bool {
+    matches!(
+        authority.kind(),
+        crate::process::ports::PortStatusKind::ManagedHealthy
+            | crate::process::ports::PortStatusKind::ManagedUnready
+            | crate::process::ports::PortStatusKind::ProvenExternal
+    )
+}
+
+fn local_source_is_fresh(source_freshness_deadline: Option<Instant>) -> bool {
+    source_freshness_deadline.is_some_and(|deadline| Instant::now() <= deadline)
+}
+
+fn local_managed_authority_is_proven(authority: &crate::process::ports::PortStatus) -> bool {
+    matches!(
+        authority.kind(),
+        crate::process::ports::PortStatusKind::ManagedHealthy
+            | crate::process::ports::PortStatusKind::ManagedUnready
+    ) && authority.error().is_none()
+        && !authority.listeners().is_empty()
+        && authority
+            .listeners()
+            .iter()
+            .all(|listener| listener.has_executable_proof())
+}
+
+fn local_external_authority_is_proven(authority: &crate::process::ports::PortStatus) -> bool {
+    authority.kind() == crate::process::ports::PortStatusKind::ProvenExternal
+        && authority.error().is_none()
+        && !authority.listeners().is_empty()
+        && authority.listeners().iter().all(|listener| {
+            listener.pid() != 0
+                && listener.creation_time_100ns() != 0
+                && listener.has_executable_proof()
+        })
+}
+
+fn can_open_remote_server_url_now(
+    authority: Option<&remote::RemotePortAuthority>,
+    session: Option<&SessionRuntimeState>,
+    port: u16,
+    listener_active: bool,
+) -> bool {
+    let Some(authority) = authority else {
+        return false;
+    };
+    let Some(session) = session else {
+        return false;
+    };
+    authority.is_fresh_at(now_epoch_ms())
+        && authority.error.is_none()
+        && listener_active
+        && session.status == SessionStatus::Running
+        && !session.reap_incomplete
+        && session
+            .server_launch
+            .as_ref()
+            .and_then(|launch| launch.port)
+            == Some(port)
+        && match authority.kind() {
+            remote::RemotePortAuthorityKind::Managed => {
+                remote_managed_authority_matches_session(authority, session)
+            }
+            remote::RemotePortAuthorityKind::ProvenExternal => {
+                remote_external_authority_is_proven(authority)
+            }
+            _ => false,
+        }
+}
+
+fn remote_external_authority_is_proven(authority: &remote::RemotePortAuthority) -> bool {
+    authority.kind() == remote::RemotePortAuthorityKind::ProvenExternal
+        && authority.diagnostic.is_none()
+        && authority.error.is_none()
+        && !authority.listeners.is_empty()
+        && authority.listeners.iter().all(|listener| {
+            listener.pid != 0
+                && listener.creation_time_100ns != 0
+                && listener.executable_proven
+                && listener
+                    .executable_fingerprint
+                    .is_some_and(|fingerprint| fingerprint != 0)
+        })
+}
+
+fn remote_managed_authority_matches_session(
+    authority: &remote::RemotePortAuthority,
+    session: &SessionRuntimeState,
+) -> bool {
+    authority.is_host_verified()
+        && authority.session_id.as_deref() == Some(session.session_id.as_str())
+}
+
+fn remote_port_ui_authority(
+    authority: Option<&remote::RemotePortAuthority>,
+    session: Option<&SessionRuntimeState>,
+) -> Option<PortUiAuthority> {
+    let authority = authority?;
+    if session
+        .is_some_and(|session| session.reap_incomplete || session.status != SessionStatus::Running)
+    {
+        return Some(PortUiAuthority::Unknown);
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64)
+        .unwrap_or_default();
+    if !authority.is_fresh_at(now) {
+        return Some(PortUiAuthority::Unknown);
+    }
+    Some(match authority.kind() {
+        remote::RemotePortAuthorityKind::Managed => {
+            if session
+                .is_some_and(|session| remote_managed_authority_matches_session(authority, session))
+            {
+                PortUiAuthority::Managed
+            } else {
+                PortUiAuthority::Unknown
+            }
+        }
+        remote::RemotePortAuthorityKind::ManagedUnready => {
+            if session
+                .is_some_and(|session| remote_managed_authority_matches_session(authority, session))
+            {
+                PortUiAuthority::ManagedUnready
+            } else {
+                PortUiAuthority::Unknown
+            }
+        }
+        remote::RemotePortAuthorityKind::ProvenExternal
+            if remote_external_authority_is_proven(authority) =>
+        {
+            PortUiAuthority::ProvenExternal
+        }
+        remote::RemotePortAuthorityKind::ProvenExternal => PortUiAuthority::Unknown,
+        remote::RemotePortAuthorityKind::Free => PortUiAuthority::Free,
+        remote::RemotePortAuthorityKind::Unknown
+        | remote::RemotePortAuthorityKind::ProbeError
+        | remote::RemotePortAuthorityKind::Occupied => PortUiAuthority::Unknown,
+    })
+}
+
+#[cfg(test)]
+fn occupied_indicator_state() -> sidebar::ServerIndicatorState {
+    // Legacy port rows contain only PID-level evidence. Until an exact
+    // generation/executable proof is available, occupied is unknown and must
+    // never be painted as the blue proven-external state.
+    sidebar::ServerIndicatorState::Unknown
 }
 
 fn normalize_optional_string(value: &str) -> Option<String> {
@@ -16946,6 +17950,40 @@ fn local_stable_hash<T: serde::Serialize>(value: &T) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     std::hash::Hash::hash(&bytes, &mut hasher);
     std::hash::Hasher::finish(&hasher)
+}
+
+fn local_port_authority_hash(authorities: &HashMap<u16, crate::process::ports::PortStatus>) -> u64 {
+    let mut rows = authorities
+        .iter()
+        .map(|(port, authority)| {
+            (
+                *port,
+                format!("{:?}", authority.kind()),
+                format!("{:?}", authority.resource),
+                authority
+                    .listeners()
+                    .iter()
+                    .map(|listener| {
+                        (
+                            listener.pid(),
+                            listener.creation_time_100ns(),
+                            listener.has_executable_proof(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                authority.error().map(str::to_string),
+            )
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by_key(|row| row.0);
+    local_stable_hash(&rows)
+}
+
+fn now_epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 fn app_window_title() -> String {
@@ -20300,7 +21338,509 @@ mod tests {
     }
 
     #[test]
-    fn derive_server_indicator_uses_managed_port_ownership() {
+    fn stale_port_refresh_callback_cannot_apply_to_a_new_generation_or_port_set() {
+        let old = PortRefreshFence {
+            generation: 7,
+            ports: vec![5174],
+            task_action_epoch: 2,
+            runtime_generation: 10,
+            resource_generation: 11,
+            managed_snapshot_generation: 12,
+            server_lifecycle_generation: 1,
+        };
+        let current = PortRefreshFence {
+            generation: 8,
+            ports: vec![5174, 3000],
+            task_action_epoch: 3,
+            runtime_generation: 13,
+            resource_generation: 14,
+            managed_snapshot_generation: 15,
+            server_lifecycle_generation: 2,
+        };
+
+        assert!(!port_refresh_is_current(Some(&current), &old));
+        assert!(!port_refresh_is_current(None, &old));
+        assert!(port_refresh_is_current(Some(&current), &current));
+    }
+
+    #[test]
+    fn stale_port_refresh_callback_cannot_cross_action_runtime_or_resource_generation() {
+        let current = PortRefreshFence {
+            generation: 8,
+            ports: vec![5174],
+            task_action_epoch: 4,
+            runtime_generation: 12,
+            resource_generation: 13,
+            managed_snapshot_generation: 14,
+            server_lifecycle_generation: 3,
+        };
+        for changed in [
+            PortRefreshFence {
+                task_action_epoch: 5,
+                ..current.clone()
+            },
+            PortRefreshFence {
+                runtime_generation: 15,
+                ..current.clone()
+            },
+            PortRefreshFence {
+                resource_generation: 16,
+                ..current.clone()
+            },
+            PortRefreshFence {
+                managed_snapshot_generation: 17,
+                ..current.clone()
+            },
+            PortRefreshFence {
+                server_lifecycle_generation: 4,
+                ..current.clone()
+            },
+        ] {
+            assert!(!port_refresh_is_current(Some(&current), &changed));
+        }
+    }
+
+    #[test]
+    fn stale_port_refresh_callback_rejects_changed_current_generation() {
+        let current = PortRefreshFence {
+            generation: 8,
+            ports: vec![5174],
+            task_action_epoch: 4,
+            runtime_generation: 12,
+            resource_generation: 13,
+            managed_snapshot_generation: 14,
+            server_lifecycle_generation: 3,
+        };
+
+        assert!(port_refresh_is_current_for_state(
+            Some(&current),
+            &current,
+            &[5174],
+            4,
+            12,
+            13,
+            14,
+            3,
+        ));
+        assert!(!port_refresh_is_current_for_state(
+            Some(&current),
+            &current,
+            &[5174],
+            4,
+            15,
+            13,
+            14,
+            3,
+        ));
+        assert!(!port_refresh_is_current_for_state(
+            Some(&current),
+            &current,
+            &[5174],
+            4,
+            12,
+            13,
+            14,
+            4,
+        ));
+    }
+
+    #[test]
+    fn local_url_action_requires_fresh_authority_and_current_refresh() {
+        let resource =
+            crate::domain::operation::ResourceFence::new(crate::domain::id::ResourceId::new(), 7);
+        let listener = crate::process::ports::ListenerIdentity::with_executable(
+            42,
+            123,
+            std::env::current_exe().expect("test executable"),
+        )
+        .expect("managed listener identity");
+        let healthy = crate::process::ports::PortStatus {
+            port: 5174,
+            resource,
+            kind: crate::process::ports::PortStatusKind::ManagedHealthy,
+            listeners: Arc::from([listener]),
+            error: None,
+        };
+        let unready = crate::process::ports::PortStatus {
+            kind: crate::process::ports::PortStatusKind::ManagedUnready,
+            ..healthy.clone()
+        };
+
+        assert!(can_open_local_server_url_now(
+            SessionStatus::Running,
+            false,
+            Some(&healthy),
+            None,
+            Some(Instant::now()),
+            Some(Instant::now() + Duration::from_secs(5)),
+            false,
+        ));
+        assert!(!can_open_local_server_url_now(
+            SessionStatus::Running,
+            false,
+            Some(&unready),
+            None,
+            Some(Instant::now()),
+            Some(Instant::now() + Duration::from_secs(5)),
+            false,
+        ));
+        assert!(!can_open_local_server_url_now(
+            SessionStatus::Running,
+            false,
+            Some(&healthy),
+            None,
+            Some(Instant::now()),
+            Some(Instant::now() + Duration::from_secs(5)),
+            true,
+        ));
+        assert!(!can_open_local_server_url_now(
+            SessionStatus::Running,
+            false,
+            None,
+            None,
+            Some(Instant::now()),
+            Some(Instant::now() + Duration::from_secs(5)),
+            false,
+        ));
+        assert!(!can_open_local_server_url_now(
+            SessionStatus::Running,
+            false,
+            Some(&healthy),
+            Some("stale listener inventory"),
+            Some(Instant::now()),
+            Some(Instant::now() + Duration::from_secs(5)),
+            false,
+        ));
+        assert!(!can_open_local_server_url_now(
+            SessionStatus::Running,
+            true,
+            Some(&healthy),
+            None,
+            Some(Instant::now()),
+            Some(Instant::now() + Duration::from_secs(5)),
+            false,
+        ));
+    }
+
+    #[test]
+    fn local_url_action_rejects_evidence_past_source_deadline() {
+        let resource =
+            crate::domain::operation::ResourceFence::new(crate::domain::id::ResourceId::new(), 7);
+        let listener = crate::process::ports::ListenerIdentity::with_executable(
+            42,
+            123,
+            std::env::current_exe().expect("test executable"),
+        )
+        .expect("managed listener identity");
+        let healthy = crate::process::ports::PortStatus {
+            port: 5174,
+            resource,
+            kind: crate::process::ports::PortStatusKind::ManagedHealthy,
+            listeners: Arc::from([listener]),
+            error: None,
+        };
+
+        assert!(!can_open_local_server_url_now(
+            SessionStatus::Running,
+            false,
+            Some(&healthy),
+            None,
+            Some(Instant::now() - Duration::from_secs(3)),
+            Some(Instant::now() - Duration::from_secs(1)),
+            false,
+        ));
+    }
+
+    #[test]
+    fn local_indicator_and_terminal_authority_reject_expired_source_deadline() {
+        let resource =
+            crate::domain::operation::ResourceFence::new(crate::domain::id::ResourceId::new(), 7);
+        let listener = crate::process::ports::ListenerIdentity::with_executable(
+            42,
+            123,
+            std::env::current_exe().expect("test executable"),
+        )
+        .expect("managed listener identity");
+        let healthy = crate::process::ports::PortStatus {
+            port: 5174,
+            resource,
+            kind: crate::process::ports::PortStatusKind::ManagedHealthy,
+            listeners: Arc::from([listener]),
+            error: None,
+        };
+        let mut session = SessionRuntimeState::new(
+            "expired-server",
+            PathBuf::new(),
+            SessionDimensions::default(),
+            TerminalBackend::PortablePtyFeedingAlacritty,
+        );
+        session.status = SessionStatus::Running;
+        let expired = Some(Instant::now() - Duration::from_millis(1));
+
+        assert_eq!(
+            derive_server_indicator_with_authority(
+                Some(&session),
+                Some(5174),
+                Some(&healthy),
+                &HashMap::new(),
+                expired,
+            ),
+            sidebar::ServerIndicatorState::Unknown,
+        );
+        assert_eq!(
+            local_port_ui_authority(Some(&healthy), Some(&session), expired),
+            Some(PortUiAuthority::Unknown),
+        );
+    }
+
+    #[test]
+    fn managed_unready_is_attention_not_ready_and_not_managed_green() {
+        let resource =
+            crate::domain::operation::ResourceFence::new(crate::domain::id::ResourceId::new(), 7);
+        let status = crate::process::ports::PortStatus {
+            port: 5174,
+            resource,
+            kind: crate::process::ports::PortStatusKind::ManagedUnready,
+            listeners: Arc::from([crate::process::ports::ListenerIdentity::with_executable(
+                42,
+                123,
+                std::env::current_exe().expect("test executable"),
+            )
+            .expect("managed listener identity")]),
+            error: None,
+        };
+        let session = SessionRuntimeState::new(
+            "unready-server",
+            PathBuf::new(),
+            SessionDimensions::default(),
+            TerminalBackend::PortablePtyFeedingAlacritty,
+        );
+
+        assert_eq!(
+            derive_server_indicator_with_authority(
+                Some(&session),
+                Some(5174),
+                Some(&status),
+                &HashMap::new(),
+                Some(Instant::now() + Duration::from_secs(5)),
+            ),
+            sidebar::ServerIndicatorState::Unready,
+        );
+        assert_eq!(
+            local_port_ui_authority(
+                Some(&status),
+                None,
+                Some(Instant::now() + Duration::from_secs(5)),
+            ),
+            Some(PortUiAuthority::ManagedUnready),
+        );
+    }
+
+    #[test]
+    fn failed_port_refresh_keeps_unknown_indicator_and_copy() {
+        let mut statuses = HashMap::from([(
+            5174,
+            PortStatus {
+                port: 5174,
+                in_use: true,
+                pid: Some(42),
+                process_name: Some("stale-listener".to_string()),
+            },
+        )]);
+
+        let mut probe_failures = HashMap::new();
+        let notice = apply_server_port_refresh(
+            &mut statuses,
+            &mut HashMap::new(),
+            &mut probe_failures,
+            &[5174],
+            Err("listener inventory unavailable".to_string()),
+        );
+
+        assert!(statuses.is_empty());
+        assert_eq!(
+            probe_failures.get(&5174).map(String::as_str),
+            Some("listener inventory unavailable")
+        );
+        assert!(notice
+            .as_deref()
+            .is_some_and(|message| message.contains("Port 5174 status is unknown")));
+        assert_eq!(
+            derive_server_indicator(None, Some(5174), &statuses, &probe_failures),
+            sidebar::ServerIndicatorState::Failed
+        );
+    }
+
+    #[test]
+    fn applying_port_projection_preserves_source_metadata_without_restamping() {
+        let observed_at = Instant::now() - Duration::from_millis(25);
+        let deadline = observed_at + Duration::from_secs(5);
+        let mut statuses = HashMap::new();
+        let mut authorities = HashMap::new();
+        let mut probe_failures = HashMap::new();
+        let mut applied_observed_at = None;
+        let mut applied_deadline = None;
+        let mut applied_sequence = 0;
+
+        apply_server_port_refresh_with_metadata(
+            &mut statuses,
+            &mut authorities,
+            &mut probe_failures,
+            &mut applied_observed_at,
+            &mut applied_deadline,
+            &mut applied_sequence,
+            &[5174],
+            Ok(PortRefreshProjection {
+                source_observed_at: Some(observed_at),
+                source_freshness_deadline: Some(deadline),
+                source_publication_sequence: 9,
+                ..PortRefreshProjection::default()
+            }),
+        );
+
+        assert_eq!(applied_observed_at, Some(observed_at));
+        assert_eq!(applied_deadline, Some(deadline));
+        assert_eq!(applied_sequence, 9);
+    }
+
+    #[test]
+    fn failed_port_refresh_does_not_override_starting_indicator() {
+        let mut session = SessionRuntimeState::new(
+            "server-cmd",
+            PathBuf::from("."),
+            SessionDimensions::default(),
+            crate::terminal::session::TerminalBackend::PortablePtyFeedingAlacritty,
+        );
+        session.status = SessionStatus::Starting;
+
+        let statuses = HashMap::new();
+        let failures = HashMap::from([(5174, "listener inventory unavailable".to_string())]);
+
+        assert_eq!(
+            derive_server_indicator(Some(&session), Some(5174), &statuses, &failures),
+            sidebar::ServerIndicatorState::Unready
+        );
+    }
+
+    #[test]
+    fn staging_port_refresh_invalidates_old_legacy_statuses_immediately() {
+        let mut statuses = HashMap::from([(
+            5174,
+            PortStatus {
+                port: 5174,
+                in_use: false,
+                pid: None,
+                process_name: None,
+            },
+        )]);
+        let mut authorities = HashMap::from([(
+            5174,
+            crate::process::ports::PortStatus {
+                port: 5174,
+                resource: crate::domain::operation::ResourceFence::new(
+                    crate::domain::id::ResourceId::new(),
+                    1,
+                ),
+                kind: crate::process::ports::PortStatusKind::ProvenExternal,
+                listeners: Arc::from([]),
+                error: None,
+            },
+        )]);
+        let mut failures = HashMap::from([(5174, "old failure".to_string())]);
+
+        stage_server_port_refresh(&mut statuses, &mut authorities, &mut failures, &[5174]);
+
+        assert!(statuses.is_empty());
+        assert!(authorities.is_empty());
+        assert!(failures.is_empty());
+    }
+
+    #[test]
+    fn invalidating_all_server_port_evidence_clears_cached_authority_and_active_state() {
+        let port = 5174;
+        let mut snapshot = ServerPortSnapshotState::default();
+        snapshot.statuses.insert(
+            port,
+            PortStatus {
+                port,
+                in_use: true,
+                pid: Some(42),
+                process_name: None,
+            },
+        );
+        snapshot.authorities.insert(
+            port,
+            crate::process::ports::PortStatus {
+                port,
+                resource: crate::domain::operation::ResourceFence::new(
+                    crate::domain::id::ResourceId::new(),
+                    1,
+                ),
+                kind: crate::process::ports::PortStatusKind::ProvenExternal,
+                listeners: Arc::from([]),
+                error: None,
+            },
+        );
+        snapshot
+            .probe_failures
+            .insert(port, "old failure".to_string());
+        snapshot.source_observed_at = Some(Instant::now());
+        snapshot.source_freshness_deadline = Some(Instant::now() + Duration::from_secs(5));
+        snapshot.source_publication_sequence = 7;
+        snapshot.last_checked_at = Some(Instant::now());
+        snapshot.refresh_in_flight = true;
+        let mut active = Some(ActivePortState {
+            command_id: "server-cmd".to_string(),
+            port,
+            status: snapshot.statuses.get(&port).cloned(),
+            last_checked_at: snapshot.last_checked_at,
+            refresh_in_flight: true,
+        });
+
+        invalidate_server_port_snapshot_state(&mut snapshot, &mut active, None);
+
+        assert!(snapshot.statuses.is_empty());
+        assert!(snapshot.authorities.is_empty());
+        assert!(snapshot.probe_failures.is_empty());
+        assert!(snapshot.source_observed_at.is_none());
+        assert!(snapshot.source_freshness_deadline.is_none());
+        assert_eq!(snapshot.source_publication_sequence, 0);
+        assert!(active.is_none());
+    }
+
+    #[test]
+    fn tracked_port_invalidation_clears_removed_active_port_state() {
+        let mut active = Some(ActivePortState {
+            command_id: "server-cmd".to_string(),
+            port: 5174,
+            status: None,
+            last_checked_at: None,
+            refresh_in_flight: false,
+        });
+
+        clear_active_port_state_for_untracked_ports(&mut active, &[5175]);
+
+        assert!(active.is_none());
+    }
+
+    #[test]
+    fn occupied_start_notice_preserves_exact_listener_identity() {
+        let error = crate::process::ports::PortStartError::Occupied {
+            port: 5174,
+            listener: crate::process::ports::ListenerIdentity::new(42, 9_876_543)
+                .expect("listener identity"),
+        };
+
+        let notice = port_start_error_notice(&error);
+
+        assert!(notice.contains("PID 42"));
+        assert!(notice.contains("creation 9876543"));
+        assert!(notice.contains("ownership is unverified"));
+        assert!(!notice.contains("external"));
+    }
+
+    #[test]
+    fn derive_server_indicator_does_not_claim_managed_port_from_legacy_pid() {
         let mut state = AppState::default();
         let mut project = sample_project();
         project.folders[0].commands[0].port = Some(5174);
@@ -20329,10 +21869,11 @@ mod tests {
                 process_name: None,
             },
         );
-        let indicators = derive_server_indicator_states(&state, &runtime, &port_statuses);
+        let indicators =
+            derive_server_indicator_states(&state, &runtime, &port_statuses, &HashMap::new());
         assert_eq!(
             indicators.get("server-cmd"),
-            Some(&sidebar::ServerIndicatorState::Ready)
+            Some(&occupied_indicator_state())
         );
 
         port_statuses.insert(
@@ -20344,10 +21885,11 @@ mod tests {
                 process_name: None,
             },
         );
-        let indicators = derive_server_indicator_states(&state, &runtime, &port_statuses);
+        let indicators =
+            derive_server_indicator_states(&state, &runtime, &port_statuses, &HashMap::new());
         assert_eq!(
             indicators.get("server-cmd"),
-            Some(&sidebar::ServerIndicatorState::External)
+            Some(&occupied_indicator_state())
         );
 
         port_statuses.insert(
@@ -20359,7 +21901,8 @@ mod tests {
                 process_name: None,
             },
         );
-        let indicators = derive_server_indicator_states(&state, &runtime, &port_statuses);
+        let indicators =
+            derive_server_indicator_states(&state, &runtime, &port_statuses, &HashMap::new());
         assert_eq!(
             indicators.get("server-cmd"),
             Some(&sidebar::ServerIndicatorState::Unready)
@@ -20367,7 +21910,573 @@ mod tests {
     }
 
     #[test]
-    fn derive_server_indicator_detects_external_listener_without_session() {
+    fn typed_proven_external_authority_reaches_blue_indicator() {
+        let status = crate::process::ports::PortStatus {
+            port: 5174,
+            resource: crate::domain::operation::ResourceFence::new(
+                crate::domain::id::ResourceId::new(),
+                1,
+            ),
+            kind: crate::process::ports::PortStatusKind::ProvenExternal,
+            listeners: Arc::from([crate::process::ports::ListenerIdentity::with_executable(
+                42,
+                9,
+                std::env::current_exe().expect("test executable"),
+            )
+            .expect("external listener identity")]),
+            error: None,
+        };
+
+        assert_eq!(
+            derive_server_indicator_with_authority(
+                None,
+                Some(5174),
+                Some(&status),
+                &HashMap::new(),
+                Some(Instant::now() + Duration::from_secs(5)),
+            ),
+            sidebar::ServerIndicatorState::External
+        );
+    }
+
+    #[test]
+    fn remote_external_probe_diagnostic_cannot_paint_native_blue() {
+        let status = crate::process::ports::PortStatus {
+            port: 5174,
+            resource: crate::domain::operation::ResourceFence::new(
+                crate::domain::id::ResourceId::new(),
+                1,
+            ),
+            kind: crate::process::ports::PortStatusKind::ProvenExternal,
+            listeners: Arc::from([crate::process::ports::ListenerIdentity::with_executable(
+                42,
+                9,
+                std::env::current_exe().expect("test executable"),
+            )
+            .expect("external listener identity")]),
+            error: None,
+        };
+        let now_epoch_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock after unix epoch")
+            .as_millis()
+            .min(u64::MAX as u128) as u64;
+        let mut authority = remote::RemotePortAuthority::from_rich(&status, now_epoch_ms);
+        authority.diagnostic = Some(remote::RemotePortDiagnostic::ProbeError);
+        authority.publication_sequence = 1;
+
+        assert!(!remote_external_authority_is_proven(&authority));
+        assert_eq!(
+            remote_port_ui_authority(Some(&authority), None),
+            Some(PortUiAuthority::Unknown)
+        );
+    }
+
+    #[test]
+    fn external_authority_cannot_override_inactive_or_reaping_session() {
+        let status = crate::process::ports::PortStatus {
+            port: 5174,
+            resource: crate::domain::operation::ResourceFence::new(
+                crate::domain::id::ResourceId::new(),
+                1,
+            ),
+            kind: crate::process::ports::PortStatusKind::ProvenExternal,
+            listeners: Arc::from([crate::process::ports::ListenerIdentity::with_executable(
+                42,
+                9,
+                std::env::current_exe().expect("test executable"),
+            )
+            .expect("external listener identity")]),
+            error: None,
+        };
+        let mut session = SessionRuntimeState::new(
+            "inactive-server",
+            PathBuf::new(),
+            SessionDimensions::default(),
+            TerminalBackend::PortablePtyFeedingAlacritty,
+        );
+
+        for (state, expected) in [
+            (
+                SessionStatus::Stopped,
+                sidebar::ServerIndicatorState::Stopped,
+            ),
+            (SessionStatus::Failed, sidebar::ServerIndicatorState::Failed),
+        ] {
+            session.status = state;
+            assert_eq!(
+                derive_server_indicator_with_authority(
+                    Some(&session),
+                    Some(5174),
+                    Some(&status),
+                    &HashMap::new(),
+                    Some(Instant::now() + Duration::from_secs(5)),
+                ),
+                expected,
+            );
+        }
+
+        session.status = SessionStatus::Running;
+        session.reap_incomplete = true;
+        assert_eq!(
+            derive_server_indicator_with_authority(
+                Some(&session),
+                Some(5174),
+                Some(&status),
+                &HashMap::new(),
+                Some(Instant::now() + Duration::from_secs(5)),
+            ),
+            sidebar::ServerIndicatorState::Unknown,
+        );
+    }
+
+    #[test]
+    fn typed_refresh_projection_stays_unknown_until_registry_handoff() {
+        let port = 5174;
+        let listener = crate::process::ports::ListenerIdentity::with_executable(
+            42,
+            9_876_543,
+            std::env::current_exe().expect("test executable"),
+        )
+        .expect("listener identity");
+        let snapshot =
+            crate::process::ports::PortInventorySnapshot::new(std::collections::BTreeMap::from([
+                (
+                    port,
+                    crate::process::ports::PortObservation::from_listeners(vec![listener]),
+                ),
+            ]))
+            .with_publication_sequence(1);
+        let projection = project_typed_port_snapshot(
+            &snapshot,
+            &[port],
+            crate::domain::operation::ResourceFence::new(crate::domain::id::ResourceId::new(), 0),
+            &HashMap::new(),
+            &std::collections::HashSet::new(),
+        );
+
+        assert_eq!(
+            projection
+                .authorities
+                .get(&port)
+                .map(crate::process::ports::PortStatus::kind),
+            Some(crate::process::ports::PortStatusKind::Unknown)
+        );
+        assert_eq!(
+            derive_server_indicator_with_authority(
+                None,
+                Some(port),
+                projection.authorities.get(&port),
+                &HashMap::new(),
+                Some(Instant::now() + Duration::from_secs(5)),
+            ),
+            sidebar::ServerIndicatorState::Unknown
+        );
+    }
+
+    #[test]
+    fn failed_refresh_uses_cached_typed_probe_snapshot_for_every_port() {
+        let ports = [43_201, 43_202];
+        let observed_at = Instant::now();
+        let deadline = observed_at + Duration::from_secs(5);
+        let snapshot = Arc::new(
+            crate::process::ports::PortInventorySnapshot::probe_failure_at(
+                ports,
+                "listener probe failed: [redacted path]",
+                observed_at,
+                deadline,
+            )
+            .with_publication_sequence(7),
+        );
+        let projection = project_port_refresh_result(
+            Err("listener inventory scan failed".to_string()),
+            snapshot.clone(),
+            &ports,
+            crate::domain::operation::ResourceFence::new(crate::domain::id::ResourceId::new(), 0),
+            &HashMap::new(),
+            &std::collections::HashSet::from(ports),
+        );
+
+        for port in ports {
+            assert_eq!(
+                projection
+                    .authorities
+                    .get(&port)
+                    .map(crate::process::ports::PortStatus::kind),
+                Some(crate::process::ports::PortStatusKind::ProbeError)
+            );
+        }
+        assert_eq!(projection.source_observed_at, Some(observed_at));
+        assert_eq!(projection.source_freshness_deadline, Some(deadline));
+        assert_eq!(projection.source_publication_sequence, 7);
+    }
+
+    #[test]
+    fn uncached_refresh_error_preserves_typed_source_metadata_through_remote_authority() {
+        let ports = [43_203, 43_204];
+        let inventory = ports_service::PortInventory::with_scanner_and_timeout(
+            |_ports: &[u16], _cancellation: &crate::process::ports::ScanCancellation| {
+                unreachable!("shutdown admission must not invoke the scanner")
+            },
+            Duration::from_millis(50),
+        );
+        inventory.shutdown();
+
+        let result = inventory.refresh(&ports).map_err(|error| error.to_string());
+        let cached_snapshot = inventory.cached_snapshot();
+        let observed_at = cached_snapshot.observed_at();
+        let deadline = cached_snapshot.freshness_deadline();
+        let sequence = cached_snapshot.publication_sequence();
+        let now = Instant::now();
+        let projection = project_port_refresh_result(
+            result,
+            cached_snapshot,
+            &ports,
+            crate::domain::operation::ResourceFence::new(crate::domain::id::ResourceId::new(), 0),
+            &HashMap::new(),
+            &std::collections::HashSet::from(ports),
+        );
+
+        assert!(sequence > 0);
+        assert_eq!(projection.source_observed_at, Some(observed_at));
+        assert_eq!(projection.source_freshness_deadline, Some(deadline));
+        assert_eq!(projection.source_publication_sequence, sequence);
+        for port in ports {
+            let authority = projection.authorities.get(&port).expect("port authority");
+            assert_eq!(
+                authority.kind(),
+                crate::process::ports::PortStatusKind::ProbeError
+            );
+            let remote = remote::RemotePortAuthority::from_rich_with_source_metadata(
+                authority,
+                instant_to_epoch_ms(observed_at, now, now_epoch_ms()),
+                instant_to_epoch_ms(deadline, now, now_epoch_ms()),
+            )
+            .with_snapshot_metadata(sequence, 0, 0);
+            assert_eq!(remote.kind(), remote::RemotePortAuthorityKind::ProbeError);
+            assert_eq!(
+                remote.diagnostic,
+                Some(remote::RemotePortDiagnostic::ProbeError)
+            );
+            assert!(remote.is_fresh_at(now_epoch_ms()));
+        }
+    }
+
+    #[test]
+    fn dialog_delayed_expired_port_projection_is_rejected_and_rescans() {
+        let observed_at = Instant::now() - Duration::from_secs(2);
+        let projection = PortRefreshProjection {
+            source_observed_at: Some(observed_at),
+            source_freshness_deadline: Some(Instant::now() - Duration::from_millis(1)),
+            ..PortRefreshProjection::default()
+        };
+
+        assert!(!port_refresh_projection_is_fresh_at(
+            &projection,
+            Instant::now()
+        ));
+    }
+
+    #[test]
+    fn unsequenced_port_refresh_projection_is_not_fresh() {
+        let now = Instant::now();
+        let projection = PortRefreshProjection {
+            source_observed_at: Some(now - Duration::from_millis(1)),
+            source_freshness_deadline: Some(now + Duration::from_secs(5)),
+            source_publication_sequence: 0,
+            ..PortRefreshProjection::default()
+        };
+
+        assert!(!port_refresh_projection_is_fresh_at(&projection, now));
+    }
+
+    #[test]
+    fn future_observed_port_refresh_projection_is_not_fresh() {
+        let now = Instant::now();
+        let projection = PortRefreshProjection {
+            source_observed_at: Some(now + Duration::from_millis(1)),
+            source_freshness_deadline: Some(now + Duration::from_secs(5)),
+            source_publication_sequence: 1,
+            ..PortRefreshProjection::default()
+        };
+
+        assert!(!port_refresh_projection_is_fresh_at(&projection, now));
+    }
+
+    #[test]
+    fn no_managed_projection_reuses_stable_sentinel_fence() {
+        let port = 5175;
+        let snapshot =
+            crate::process::ports::PortInventorySnapshot::new(std::collections::BTreeMap::from([
+                (port, crate::process::ports::PortObservation::Free),
+            ]))
+            .with_publication_sequence(1);
+        let sentinel =
+            crate::domain::operation::ResourceFence::new(crate::domain::id::ResourceId::new(), 0);
+        let first = project_typed_port_snapshot(
+            &snapshot,
+            &[port],
+            sentinel,
+            &HashMap::new(),
+            &std::collections::HashSet::new(),
+        );
+        let second = project_typed_port_snapshot(
+            &snapshot,
+            &[port],
+            sentinel,
+            &HashMap::new(),
+            &std::collections::HashSet::new(),
+        );
+
+        assert_eq!(
+            first.authorities.get(&port).map(|status| status.resource),
+            second.authorities.get(&port).map(|status| status.resource)
+        );
+        assert_eq!(
+            first
+                .authorities
+                .get(&port)
+                .map(|status| status.resource.runtime_generation),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn stale_typed_authority_overrides_probe_failure_without_red_indicator() {
+        let authority = crate::process::ports::PortStatus {
+            port: 5174,
+            resource: crate::domain::operation::ResourceFence::new(
+                crate::domain::id::ResourceId::new(),
+                1,
+            ),
+            kind: crate::process::ports::PortStatusKind::Unknown,
+            listeners: Arc::from([]),
+            error: Some("listener inventory snapshot is stale".to_string()),
+        };
+        let probe_failures =
+            HashMap::from([(5174, "listener inventory snapshot is stale".to_string())]);
+
+        assert_eq!(
+            derive_server_indicator_with_authority(
+                None,
+                Some(5174),
+                Some(&authority),
+                &probe_failures,
+                Some(Instant::now() + Duration::from_secs(5)),
+            ),
+            sidebar::ServerIndicatorState::Unknown
+        );
+    }
+
+    #[test]
+    fn stale_remote_external_authority_cannot_reach_blue_indicator() {
+        let now = now_epoch_ms();
+        let authority = remote::RemotePortAuthority {
+            port: 5174,
+            kind: remote::RemotePortAuthorityKind::ProvenExternal,
+            diagnostic: None,
+            resource: None,
+            listeners: Vec::new(),
+            session_id: None,
+            root: None,
+            membership_revision: 0,
+            observation_sequence: 0,
+            publication_sequence: 1,
+            observed_at_epoch_ms: now.saturating_sub(remote::REMOTE_PORT_AUTHORITY_MAX_AGE_MS + 1),
+            freshness_deadline_epoch_ms: now.saturating_sub(1),
+            managed_fence_fingerprint: None,
+            verified: None,
+            error: None,
+        };
+
+        assert_eq!(
+            derive_server_indicator_with_remote_authority(None, Some(&authority)),
+            sidebar::ServerIndicatorState::Unknown
+        );
+    }
+
+    #[test]
+    fn remote_external_authority_cannot_override_inactive_or_reaping_session() {
+        let now = now_epoch_ms();
+        let authority = remote::RemotePortAuthority {
+            port: 5174,
+            kind: remote::RemotePortAuthorityKind::ProvenExternal,
+            diagnostic: None,
+            resource: None,
+            listeners: vec![remote::RemoteListenerIdentity {
+                pid: 42,
+                creation_time_100ns: 9_876_543,
+                executable_proven: true,
+                executable_fingerprint: Some(1),
+            }],
+            session_id: None,
+            root: None,
+            membership_revision: 0,
+            observation_sequence: 0,
+            publication_sequence: 1,
+            observed_at_epoch_ms: now,
+            freshness_deadline_epoch_ms: now + remote::REMOTE_PORT_AUTHORITY_MAX_AGE_MS,
+            managed_fence_fingerprint: None,
+            verified: None,
+            error: None,
+        };
+        let mut session = SessionRuntimeState::new(
+            "remote-inactive-server",
+            PathBuf::new(),
+            SessionDimensions::default(),
+            TerminalBackend::PortablePtyFeedingAlacritty,
+        );
+
+        for (state, expected) in [
+            (
+                SessionStatus::Stopped,
+                sidebar::ServerIndicatorState::Stopped,
+            ),
+            (SessionStatus::Failed, sidebar::ServerIndicatorState::Failed),
+        ] {
+            session.status = state;
+            assert_eq!(
+                derive_server_indicator_with_remote_authority(Some(&session), Some(&authority)),
+                expected,
+            );
+        }
+
+        session.status = SessionStatus::Running;
+        session.reap_incomplete = true;
+        assert_eq!(
+            derive_server_indicator_with_remote_authority(Some(&session), Some(&authority)),
+            sidebar::ServerIndicatorState::Unknown,
+        );
+    }
+
+    #[test]
+    fn remote_managed_indicator_requires_the_exact_fence_and_membership() {
+        let mut session = SessionRuntimeState::new(
+            "remote-server",
+            PathBuf::new(),
+            SessionDimensions::default(),
+            TerminalBackend::PortablePtyFeedingAlacritty,
+        );
+        session.status = SessionStatus::Running;
+        session.pid = Some(4242);
+        let now = now_epoch_ms();
+        let mut authority = remote::RemotePortAuthority {
+            port: 5174,
+            kind: remote::RemotePortAuthorityKind::Managed,
+            diagnostic: None,
+            resource: Some(crate::domain::operation::ResourceFence::new(
+                crate::domain::id::ResourceId::new(),
+                7,
+            )),
+            listeners: vec![remote::RemoteListenerIdentity {
+                pid: 4242,
+                creation_time_100ns: 42_420_000,
+                executable_proven: true,
+                executable_fingerprint: None,
+            }],
+            session_id: None,
+            root: None,
+            membership_revision: 0,
+            observation_sequence: 0,
+            publication_sequence: 1,
+            observed_at_epoch_ms: now,
+            freshness_deadline_epoch_ms: now + remote::REMOTE_PORT_AUTHORITY_MAX_AGE_MS,
+            managed_fence_fingerprint: None,
+            verified: None,
+            error: None,
+        };
+
+        assert_eq!(
+            derive_server_indicator_with_remote_authority(Some(&session), Some(&authority)),
+            sidebar::ServerIndicatorState::Unknown
+        );
+
+        authority.membership_revision = 9;
+        authority.observation_sequence = 11;
+        assert_eq!(
+            derive_server_indicator_with_remote_authority(Some(&session), Some(&authority)),
+            sidebar::ServerIndicatorState::Unknown
+        );
+
+        authority.session_id = Some(session.session_id.clone());
+        authority.root = Some(remote::RemoteListenerIdentity {
+            pid: 4242,
+            creation_time_100ns: 42_420_000,
+            executable_proven: true,
+            executable_fingerprint: None,
+        });
+        authority.managed_fence_fingerprint = Some(42);
+        assert_eq!(
+            derive_server_indicator_with_remote_authority(Some(&session), Some(&authority)),
+            sidebar::ServerIndicatorState::Unknown,
+            "a complete wire-shaped DTO without a host proof must not render Ready"
+        );
+    }
+
+    #[test]
+    fn remote_terminal_authority_requires_wire_session_and_root_identity() {
+        let mut session = SessionRuntimeState::new(
+            "remote-terminal-authority",
+            PathBuf::new(),
+            SessionDimensions::default(),
+            TerminalBackend::PortablePtyFeedingAlacritty,
+        );
+        session.status = SessionStatus::Running;
+        session.pid = Some(4242);
+        let now = now_epoch_ms();
+        let mut authority = remote::RemotePortAuthority {
+            port: 5174,
+            kind: remote::RemotePortAuthorityKind::Managed,
+            diagnostic: None,
+            resource: Some(crate::domain::operation::ResourceFence::new(
+                crate::domain::id::ResourceId::new(),
+                7,
+            )),
+            listeners: vec![remote::RemoteListenerIdentity {
+                pid: 4242,
+                creation_time_100ns: 42_420_000,
+                executable_proven: true,
+                executable_fingerprint: None,
+            }],
+            session_id: None,
+            root: None,
+            membership_revision: 9,
+            observation_sequence: 11,
+            publication_sequence: 1,
+            observed_at_epoch_ms: now,
+            freshness_deadline_epoch_ms: now + remote::REMOTE_PORT_AUTHORITY_MAX_AGE_MS,
+            managed_fence_fingerprint: Some(42),
+            verified: None,
+            error: None,
+        };
+
+        assert_eq!(
+            remote_port_ui_authority(Some(&authority), Some(&session)),
+            Some(PortUiAuthority::Unknown)
+        );
+
+        authority.session_id = Some(session.session_id.clone());
+        authority.root = Some(remote::RemoteListenerIdentity {
+            pid: 4242,
+            creation_time_100ns: 42_420_000,
+            executable_proven: true,
+            executable_fingerprint: None,
+        });
+        assert_eq!(
+            remote_port_ui_authority(Some(&authority), Some(&session)),
+            Some(PortUiAuthority::Unknown),
+            "a complete wire-shaped DTO without a host proof must not render Managed"
+        );
+    }
+
+    #[test]
+    fn server_start_probe_waits_for_existing_snapshot_refresh() {
+        assert!(!server_start_probe_allowed(true));
+        assert!(server_start_probe_allowed(false));
+    }
+
+    #[test]
+    fn derive_server_indicator_detects_occupied_listener_without_session() {
         let statuses = HashMap::from([(
             5174,
             PortStatus {
@@ -20379,13 +22488,38 @@ mod tests {
         )]);
 
         assert_eq!(
-            derive_server_indicator(None, Some(5174), &statuses),
-            sidebar::ServerIndicatorState::External
+            derive_server_indicator(None, Some(5174), &statuses, &HashMap::new()),
+            occupied_indicator_state()
         );
     }
 
     #[test]
-    fn derive_server_indicator_preserves_active_transitions_over_external_listener() {
+    fn derive_server_indicator_keeps_ambiguous_listener_ownership_unverified() {
+        let statuses = HashMap::from([(
+            5174,
+            PortStatus {
+                port: 5174,
+                in_use: true,
+                pid: None,
+                process_name: None,
+            },
+        )]);
+        let mut session = SessionRuntimeState::new(
+            "server-cmd",
+            PathBuf::from("."),
+            SessionDimensions::default(),
+            crate::terminal::session::TerminalBackend::PortablePtyFeedingAlacritty,
+        );
+        session.status = SessionStatus::Running;
+
+        assert_eq!(
+            derive_server_indicator(Some(&session), Some(5174), &statuses, &HashMap::new()),
+            occupied_indicator_state()
+        );
+    }
+
+    #[test]
+    fn derive_server_indicator_preserves_active_transitions_over_occupied_listener() {
         let statuses = HashMap::from([(
             5174,
             PortStatus {
@@ -20404,19 +22538,19 @@ mod tests {
 
         session.status = SessionStatus::Starting;
         assert_eq!(
-            derive_server_indicator(Some(&session), Some(5174), &statuses),
+            derive_server_indicator(Some(&session), Some(5174), &statuses, &HashMap::new(),),
             sidebar::ServerIndicatorState::Unready
         );
 
         session.status = SessionStatus::Stopping;
         assert_eq!(
-            derive_server_indicator(Some(&session), Some(5174), &statuses),
+            derive_server_indicator(Some(&session), Some(5174), &statuses, &HashMap::new(),),
             sidebar::ServerIndicatorState::Stopping
         );
     }
 
     #[test]
-    fn derive_server_indicator_prefers_external_listener_for_inactive_sessions() {
+    fn derive_server_indicator_prefers_occupied_listener_for_inactive_sessions() {
         let statuses = HashMap::from([(
             5174,
             PortStatus {
@@ -20441,8 +22575,8 @@ mod tests {
         ] {
             session.status = status;
             assert_eq!(
-                derive_server_indicator(Some(&session), Some(5174), &statuses),
-                sidebar::ServerIndicatorState::External,
+                derive_server_indicator(Some(&session), Some(5174), &statuses, &HashMap::new(),),
+                occupied_indicator_state(),
                 "status {status:?}"
             );
         }
@@ -20459,7 +22593,7 @@ mod tests {
         session.status = SessionStatus::Running;
 
         assert_eq!(
-            derive_server_indicator(Some(&session), None, &HashMap::new()),
+            derive_server_indicator(Some(&session), None, &HashMap::new(), &HashMap::new()),
             sidebar::ServerIndicatorState::Ready
         );
     }

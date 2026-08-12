@@ -1,6 +1,7 @@
 pub mod identity;
 pub mod job;
-pub(crate) mod launcher;
+pub mod launcher;
+pub mod ports;
 pub mod registry;
 pub mod sampler;
 pub mod teardown;

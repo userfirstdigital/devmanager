@@ -2,6 +2,7 @@ use crate::models::{PortStatus, TabType};
 use crate::remote::presentation::{
     SemanticAdapterHealth, SemanticAttention, SemanticSessionMetadata, StableSessionKey,
 };
+use crate::remote::{RemotePortAuthority, RemotePortAuthorityKind, RemotePortDiagnostic};
 use crate::state::{
     AiActivity, AppState, RuntimeState, SessionDimensions, SessionKind, SessionRuntimeState,
     SessionStatus,
@@ -24,6 +25,9 @@ pub struct WebWorkspaceSnapshot {
     pub tabs: Vec<WebTab>,
     pub sessions: Vec<WebSessionSummary>,
     pub port_statuses: Vec<WebPortStatus>,
+    /// Typed authority is the source of colour/control decisions. The legacy
+    /// status list remains only for older clients.
+    pub port_authorities: Vec<WebPortAuthority>,
     pub writer_lease: WebWriterLeaseState,
 }
 
@@ -202,6 +206,209 @@ pub struct WebPortStatus {
     pub process_name: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WebPortAuthorityKind {
+    Managed,
+    ManagedUnready,
+    ProvenExternal,
+    Unknown,
+    ProbeError,
+    Free,
+    Occupied,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WebPortDiagnostic {
+    ProbeError,
+}
+
+impl From<RemotePortDiagnostic> for WebPortDiagnostic {
+    fn from(value: RemotePortDiagnostic) -> Self {
+        match value {
+            RemotePortDiagnostic::ProbeError => Self::ProbeError,
+        }
+    }
+}
+
+impl From<RemotePortAuthorityKind> for WebPortAuthorityKind {
+    fn from(value: RemotePortAuthorityKind) -> Self {
+        match value {
+            RemotePortAuthorityKind::Managed => Self::Managed,
+            RemotePortAuthorityKind::ManagedUnready => Self::ManagedUnready,
+            RemotePortAuthorityKind::ProvenExternal => Self::ProvenExternal,
+            RemotePortAuthorityKind::Unknown => Self::Unknown,
+            RemotePortAuthorityKind::ProbeError => Self::ProbeError,
+            RemotePortAuthorityKind::Free => Self::Free,
+            RemotePortAuthorityKind::Occupied => Self::Occupied,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WebPortControlReason {
+    ExactManagedFence,
+    ManagedUnready,
+    ProvenExternalNoControl,
+    Starting,
+    Free,
+    Stale,
+    ProbeFault,
+    MixedOrUnverified,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebPortAuthority {
+    pub port: u16,
+    pub kind: WebPortAuthorityKind,
+    pub diagnostic: Option<WebPortDiagnostic>,
+    pub resource_generation: Option<u64>,
+    pub listeners: Vec<WebPortListenerIdentity>,
+    pub session_id: Option<String>,
+    pub root: Option<WebPortListenerIdentity>,
+    pub membership_revision: u64,
+    pub observation_sequence: u64,
+    pub publication_sequence: u64,
+    pub observed_at_epoch_ms: u64,
+    pub freshness_deadline_epoch_ms: u64,
+    pub fresh: bool,
+    /// The matching host session must not still be waiting for exact process
+    /// cleanup before a browser action can use this authority.
+    pub reap_incomplete: bool,
+    pub control_reason: WebPortControlReason,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebPortListenerIdentity {
+    pub pid: u32,
+    pub creation_time_100ns: u64,
+    pub executable_proven: bool,
+}
+
+impl WebPortAuthority {
+    fn from_remote(
+        authority: &RemotePortAuthority,
+        runtime: &RuntimeState,
+        now_epoch_ms: u64,
+    ) -> Self {
+        let inconsistent_probe = matches!(
+            authority.kind,
+            RemotePortAuthorityKind::Managed
+                | RemotePortAuthorityKind::ManagedUnready
+                | RemotePortAuthorityKind::ProvenExternal
+        ) && (authority.diagnostic
+            == Some(RemotePortDiagnostic::ProbeError)
+            || authority.error.is_some());
+        let effective_kind = if inconsistent_probe {
+            RemotePortAuthorityKind::Unknown
+        } else {
+            authority.kind
+        };
+        let kind = WebPortAuthorityKind::from(effective_kind);
+        let fresh = authority.is_fresh_at(now_epoch_ms);
+        let matching_session = authority
+            .session_id
+            .as_deref()
+            .and_then(|session_id| {
+                runtime
+                    .sessions
+                    .values()
+                    .find(|session| session.session_id == session_id)
+            })
+            .or_else(|| {
+                runtime.sessions.values().find(|session| {
+                    session
+                        .server_launch
+                        .as_ref()
+                        .and_then(|launch| launch.port)
+                        == Some(authority.port)
+                })
+            });
+        let host_verified_for_current_session = authority.is_host_verified()
+            && matching_session.is_some_and(|session| {
+                session.status == SessionStatus::Running
+                    && !session.reap_incomplete
+                    && authority.session_id.as_deref() == Some(session.session_id.as_str())
+                    && session
+                        .server_launch
+                        .as_ref()
+                        .and_then(|launch| launch.port)
+                        == Some(authority.port)
+            });
+        let control_reason = if !fresh {
+            WebPortControlReason::Stale
+        } else {
+            match effective_kind {
+                RemotePortAuthorityKind::Managed if host_verified_for_current_session => {
+                    WebPortControlReason::ExactManagedFence
+                }
+                RemotePortAuthorityKind::ManagedUnready if host_verified_for_current_session => {
+                    WebPortControlReason::ManagedUnready
+                }
+                RemotePortAuthorityKind::ProvenExternal => {
+                    WebPortControlReason::ProvenExternalNoControl
+                }
+                RemotePortAuthorityKind::Free => WebPortControlReason::Free,
+                RemotePortAuthorityKind::ProbeError => WebPortControlReason::ProbeFault,
+                RemotePortAuthorityKind::Unknown => WebPortControlReason::MixedOrUnverified,
+                RemotePortAuthorityKind::Occupied => WebPortControlReason::MixedOrUnverified,
+                RemotePortAuthorityKind::Managed | RemotePortAuthorityKind::ManagedUnready => {
+                    WebPortControlReason::MixedOrUnverified
+                }
+            }
+        };
+        let probe_error = effective_kind == RemotePortAuthorityKind::ProbeError;
+        let has_probe_diagnostic = probe_error || authority.error.is_some();
+        Self {
+            port: authority.port,
+            kind,
+            diagnostic: authority
+                .diagnostic
+                .map(WebPortDiagnostic::from)
+                .or_else(|| has_probe_diagnostic.then_some(WebPortDiagnostic::ProbeError)),
+            resource_generation: authority
+                .resource
+                .map(|resource| resource.runtime_generation),
+            listeners: authority
+                .listeners
+                .iter()
+                .map(|listener| WebPortListenerIdentity {
+                    pid: listener.pid,
+                    creation_time_100ns: listener.creation_time_100ns,
+                    executable_proven: listener.executable_proven,
+                })
+                .collect(),
+            session_id: authority.session_id.clone(),
+            root: authority.root.as_ref().map(|root| WebPortListenerIdentity {
+                pid: root.pid,
+                creation_time_100ns: root.creation_time_100ns,
+                executable_proven: root.executable_proven,
+            }),
+            membership_revision: authority.membership_revision,
+            observation_sequence: authority.observation_sequence,
+            publication_sequence: authority.publication_sequence,
+            observed_at_epoch_ms: authority.observed_at_epoch_ms,
+            freshness_deadline_epoch_ms: authority.freshness_deadline_epoch_ms,
+            fresh,
+            reap_incomplete: matching_session
+                .map(|session| session.reap_incomplete)
+                .unwrap_or(matches!(
+                    authority.kind,
+                    RemotePortAuthorityKind::Managed | RemotePortAuthorityKind::ManagedUnready
+                )),
+            control_reason,
+            // Host probe text is never a renderer diagnostic. Keep the
+            // wire-safe enum above and drop any stale/internal error string.
+            error: None,
+        }
+    }
+}
+
 impl From<&PortStatus> for WebPortStatus {
     fn from(status: &PortStatus) -> Self {
         Self {
@@ -220,6 +427,28 @@ impl WebWorkspaceSnapshot {
         app: &AppState,
         runtime: &RuntimeState,
         ports: &HashMap<u16, PortStatus>,
+        lease: &WebWriterLeaseState,
+        semantic_metadata: &HashMap<StableSessionKey, SemanticSessionMetadata>,
+    ) -> Self {
+        Self::from_host_with_authorities(
+            runtime_instance_id,
+            revision,
+            app,
+            runtime,
+            ports,
+            &HashMap::new(),
+            lease,
+            semantic_metadata,
+        )
+    }
+
+    pub fn from_host_with_authorities(
+        runtime_instance_id: impl Into<String>,
+        revision: u64,
+        app: &AppState,
+        runtime: &RuntimeState,
+        ports: &HashMap<u16, PortStatus>,
+        authorities: &HashMap<u16, RemotePortAuthority>,
         lease: &WebWriterLeaseState,
         semantic_metadata: &HashMap<StableSessionKey, SemanticSessionMetadata>,
     ) -> Self {
@@ -302,6 +531,12 @@ impl WebWorkspaceSnapshot {
 
         let mut port_statuses = ports.values().map(WebPortStatus::from).collect::<Vec<_>>();
         port_statuses.sort_by_key(|status| status.port);
+        let now_epoch_ms = crate::remote::now_epoch_ms();
+        let mut port_authorities = authorities
+            .values()
+            .map(|authority| WebPortAuthority::from_remote(authority, runtime, now_epoch_ms))
+            .collect::<Vec<_>>();
+        port_authorities.sort_by_key(|authority| authority.port);
 
         Self {
             web_protocol_version: WEB_PROTOCOL_VERSION,
@@ -313,6 +548,7 @@ impl WebWorkspaceSnapshot {
             tabs,
             sessions,
             port_statuses,
+            port_authorities,
             writer_lease: lease.clone(),
         }
     }
@@ -495,6 +731,166 @@ mod tests {
         assert_eq!(snapshot.sessions[0].oldest_sequence, 1);
         assert_eq!(snapshot.sessions[0].latest_sequence, 1);
         assert_eq!(snapshot.port_statuses[0].port, 43872);
+    }
+
+    #[test]
+    fn browser_managed_authority_requires_host_verified_projection() {
+        let fixture = host_fixture_with_sentinels();
+        let now = crate::remote::now_epoch_ms();
+        let authority = RemotePortAuthority {
+            port: 43872,
+            kind: RemotePortAuthorityKind::Managed,
+            diagnostic: None,
+            resource: Some(crate::domain::operation::ResourceFence::new(
+                crate::domain::id::ResourceId::new(),
+                7,
+            )),
+            listeners: vec![crate::remote::RemoteListenerIdentity {
+                pid: 4242,
+                creation_time_100ns: 42_420_000,
+                executable_proven: true,
+                executable_fingerprint: None,
+            }],
+            session_id: Some("session-1".to_string()),
+            root: Some(crate::remote::RemoteListenerIdentity {
+                pid: 4242,
+                creation_time_100ns: 42_420_000,
+                executable_proven: true,
+                executable_fingerprint: None,
+            }),
+            membership_revision: 9,
+            observation_sequence: 11,
+            publication_sequence: 13,
+            observed_at_epoch_ms: now,
+            freshness_deadline_epoch_ms: now + crate::remote::REMOTE_PORT_AUTHORITY_MAX_AGE_MS,
+            managed_fence_fingerprint: Some(42),
+            verified: None,
+            error: None,
+        };
+        let snapshot = WebWorkspaceSnapshot::from_host_with_authorities(
+            "runtime-1",
+            7,
+            &fixture.app,
+            &fixture.runtime,
+            &fixture.ports,
+            &HashMap::from([(43872, authority)]),
+            &fixture.lease,
+            &fixture.journals.metadata_snapshot(),
+        );
+
+        assert!(
+            matches!(
+                snapshot.port_authorities[0].control_reason,
+                WebPortControlReason::MixedOrUnverified
+            ),
+            "wire-shaped managed metadata cannot mint a Web control projection"
+        );
+    }
+
+    #[test]
+    fn browser_probe_authority_uses_typed_diagnostic_and_drops_raw_error() {
+        let fixture = host_fixture_with_sentinels();
+        let status = crate::process::ports::PortStatus {
+            port: 43872,
+            resource: crate::domain::operation::ResourceFence::new(
+                crate::domain::id::ResourceId::new(),
+                7,
+            ),
+            kind: crate::process::ports::PortStatusKind::ProbeError,
+            listeners: std::sync::Arc::from([]),
+            error: Some("C:\\private\\listener-table.txt".to_string()),
+        };
+        let mut authority = RemotePortAuthority::from_rich(&status, crate::remote::now_epoch_ms());
+        authority.diagnostic = None;
+        authority.error = Some("C:\\private\\listener-table.txt".to_string());
+
+        let snapshot = WebWorkspaceSnapshot::from_host_with_authorities(
+            "runtime-1",
+            7,
+            &fixture.app,
+            &fixture.runtime,
+            &fixture.ports,
+            &HashMap::from([(43872, authority)]),
+            &fixture.lease,
+            &fixture.journals.metadata_snapshot(),
+        );
+        let projected = &snapshot.port_authorities[0];
+
+        assert!(matches!(projected.kind, WebPortAuthorityKind::ProbeError));
+        assert!(matches!(
+            projected.diagnostic,
+            Some(WebPortDiagnostic::ProbeError)
+        ));
+        assert_eq!(projected.error, None);
+        let wire = serde_json::to_string(projected).expect("serialize web authority");
+        assert!(wire.contains("probeError"));
+        assert!(!wire.contains("listener-table.txt"));
+    }
+
+    #[test]
+    fn browser_rejects_proven_external_probe_diagnostic_as_unknown() {
+        let fixture = host_fixture_with_sentinels();
+        let status = crate::process::ports::PortStatus {
+            port: 43872,
+            resource: crate::domain::operation::ResourceFence::new(
+                crate::domain::id::ResourceId::new(),
+                7,
+            ),
+            kind: crate::process::ports::PortStatusKind::ProvenExternal,
+            listeners: std::sync::Arc::from([]),
+            error: None,
+        };
+        let mut authority = RemotePortAuthority::from_rich(&status, crate::remote::now_epoch_ms());
+        authority.diagnostic = Some(crate::remote::RemotePortDiagnostic::ProbeError);
+        authority.publication_sequence = 1;
+
+        let projected = WebPortAuthority::from_remote(
+            &authority,
+            &fixture.runtime,
+            crate::remote::now_epoch_ms(),
+        );
+
+        assert!(matches!(projected.kind, WebPortAuthorityKind::Unknown));
+        assert!(matches!(
+            projected.control_reason,
+            WebPortControlReason::MixedOrUnverified
+        ));
+    }
+
+    #[test]
+    fn browser_starting_authority_uses_typed_diagnostic_and_drops_raw_error() {
+        let fixture = host_fixture_with_sentinels();
+        let status = crate::process::ports::PortStatus {
+            port: 43872,
+            resource: crate::domain::operation::ResourceFence::new(
+                crate::domain::id::ResourceId::new(),
+                7,
+            ),
+            kind: crate::process::ports::PortStatusKind::Starting,
+            listeners: std::sync::Arc::from([]),
+            error: Some("C:\\private\\secret-startup-token.txt".to_string()),
+        };
+        let mut authority = RemotePortAuthority::from_rich(&status, crate::remote::now_epoch_ms());
+        // Simulate a stale/internal status retaining its host-only detail at
+        // the Web boundary. The projection must sanitize it regardless of
+        // which caller supplied the DTO.
+        authority.error = Some("C:\\private\\secret-startup-token.txt".to_string());
+
+        let projected = WebPortAuthority::from_remote(
+            &authority,
+            &fixture.runtime,
+            crate::remote::now_epoch_ms(),
+        );
+
+        assert!(matches!(projected.kind, WebPortAuthorityKind::Unknown));
+        assert!(matches!(
+            projected.diagnostic,
+            Some(WebPortDiagnostic::ProbeError)
+        ));
+        assert_eq!(projected.error, None);
+        let wire = serde_json::to_string(&projected).expect("serialize web authority");
+        assert!(wire.contains("probeError"));
+        assert!(!wire.contains("secret-startup-token.txt"));
     }
 
     #[test]

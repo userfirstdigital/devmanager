@@ -2,6 +2,8 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::domain::id::ResourceId;
@@ -206,7 +208,7 @@ impl JobMembership for crate::process::job::ManagedProcessJob {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ManagedProcessState {
     Starting,
     Running,
@@ -414,7 +416,11 @@ pub struct ManagedProcessFence {
 }
 
 impl ManagedProcessFence {
-    pub fn new(resource: ResourceFence, owner: ProcessOwner, root: ManagedProcessIdentity) -> Self {
+    pub(crate) fn new(
+        resource: ResourceFence,
+        owner: ProcessOwner,
+        root: ManagedProcessIdentity,
+    ) -> Self {
         Self {
             resource,
             owner,
@@ -666,10 +672,30 @@ impl<J: fmt::Debug> std::error::Error for ProcessRegistrationFailure<J> {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CachedMembershipResult {
+    Valid,
+    Failed(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CachedMembershipObservation {
+    fence: ManagedProcessFence,
+    state: ManagedProcessState,
+    members: Vec<ManagedProcessIdentity>,
+    unknown_member_pids: Vec<u32>,
+    result: CachedMembershipResult,
+    membership_revision: u64,
+    observation_sequence: u64,
+}
+
 #[derive(Debug)]
 pub struct ProcessRegistry<J> {
     runtime: RuntimeRegistry,
     current: BTreeMap<ResourceId, RegisteredProcess<J>>,
+    membership_revision: AtomicU64,
+    observation_sequence: AtomicU64,
+    membership_cache: Mutex<BTreeMap<ResourceId, CachedMembershipObservation>>,
 }
 
 impl<J> Default for ProcessRegistry<J> {
@@ -683,6 +709,9 @@ impl<J> ProcessRegistry<J> {
         Self {
             runtime: RuntimeRegistry::new(),
             current: BTreeMap::new(),
+            membership_revision: AtomicU64::new(0),
+            observation_sequence: AtomicU64::new(0),
+            membership_cache: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -728,6 +757,9 @@ impl<J> ProcessRegistry<J> {
             .current
             .remove(&resource_id)
             .expect("exact current registry entry was checked before removal");
+        if let Ok(mut cache) = self.membership_cache.lock() {
+            cache.remove(&resource_id);
+        }
         Ok(UnregisterOutcome::Removed(removed))
     }
 
@@ -888,6 +920,136 @@ impl<J> ProcessRegistry<J> {
 
 #[allow(private_bounds)]
 impl<J: JobMembership> ProcessRegistry<J> {
+    /// Capture the current Job membership and mint a registry-owned snapshot.
+    /// The caller supplies only the observation clock and freshness bound;
+    /// revision, sequence, member identities, and validity come from this
+    /// live registry/Job query.
+    pub fn managed_resource_snapshot(
+        &self,
+        resource: ResourceFence,
+        observed_at: Instant,
+        max_age: Duration,
+    ) -> Option<crate::process::ports::ManagedResourceSnapshot> {
+        let resource_id = resource.resource_id;
+        if self
+            .current(resource_id)
+            .is_none_or(|current| current.fence() != resource)
+        {
+            return None;
+        }
+
+        let current = self.current(resource_id)?;
+        let fence = ManagedProcessFence::from_process(current);
+        let state = current.state();
+        let mut members = Vec::with_capacity(1 + current.known_members().len());
+        let mut unknown_member_pids = Vec::new();
+        let result = match current.job().active_process_ids() {
+            Ok(mut active_pids) => {
+                active_pids.sort_unstable();
+                active_pids.dedup();
+                let root_pid = current.root().id().pid();
+                if !active_pids.contains(&root_pid) {
+                    unknown_member_pids.push(root_pid);
+                }
+                for pid in active_pids {
+                    match current.job().inspect_process(pid) {
+                        Ok(member)
+                            if member.identity().id().pid() == pid
+                                && (pid != root_pid || member.identity() == current.root()) =>
+                        {
+                            members.push(member.identity().clone())
+                        }
+                        Ok(_) | Err(_) => unknown_member_pids.push(pid),
+                    }
+                }
+                if unknown_member_pids.is_empty() {
+                    CachedMembershipResult::Valid
+                } else {
+                    CachedMembershipResult::Failed(format!(
+                        "{} managed Job member PIDs have unverified identity",
+                        unknown_member_pids.len()
+                    ))
+                }
+            }
+            Err(error) => CachedMembershipResult::Failed(error),
+        };
+        members.sort_by(|left, right| {
+            left.id()
+                .pid()
+                .cmp(&right.id().pid())
+                .then_with(|| {
+                    left.id()
+                        .creation_time_100ns()
+                        .cmp(&right.id().creation_time_100ns())
+                })
+                .then_with(|| {
+                    left.canonical_executable()
+                        .cmp(right.canonical_executable())
+                })
+        });
+        members.dedup();
+
+        let candidate = CachedMembershipObservation {
+            fence: fence.clone(),
+            state,
+            members: members.clone(),
+            unknown_member_pids: unknown_member_pids.clone(),
+            result: result.clone(),
+            membership_revision: 0,
+            observation_sequence: 0,
+        };
+        let (membership_revision, observation_sequence) = {
+            let mut cache = self.membership_cache.lock().ok()?;
+            if let Some(previous) = cache.get(&resource_id).filter(|previous| {
+                previous.fence == candidate.fence
+                    && previous.state == candidate.state
+                    && previous.members == candidate.members
+                    && previous.unknown_member_pids == candidate.unknown_member_pids
+                    && previous.result == candidate.result
+            }) {
+                (previous.membership_revision, previous.observation_sequence)
+            } else {
+                let membership_revision = self
+                    .membership_revision
+                    .fetch_add(1, Ordering::AcqRel)
+                    .saturating_add(1);
+                let observation_sequence = self
+                    .observation_sequence
+                    .fetch_add(1, Ordering::AcqRel)
+                    .saturating_add(1);
+                cache.insert(
+                    resource_id,
+                    CachedMembershipObservation {
+                        membership_revision,
+                        observation_sequence,
+                        ..candidate
+                    },
+                );
+                (membership_revision, observation_sequence)
+            }
+        };
+        let membership = match result {
+            CachedMembershipResult::Valid => {
+                crate::process::ports::RegistryMembershipSnapshot::valid(
+                    membership_revision,
+                    observation_sequence,
+                    observed_at,
+                    max_age,
+                )
+            }
+            CachedMembershipResult::Failed(detail) => {
+                crate::process::ports::RegistryMembershipSnapshot::failed(
+                    membership_revision,
+                    observation_sequence,
+                    detail,
+                )
+            }
+        };
+        Some(crate::process::ports::ManagedResourceSnapshot::new(
+            fence, state, members, membership,
+        ))
+    }
+
     pub fn register(
         &mut self,
         mut process: RegisteredProcess<J>,
@@ -1393,7 +1555,10 @@ impl<J: JobMembership> ProcessRegistry<J> {
                 return match current.job.active_process_ids() {
                     Ok(process_ids) if process_ids.contains(&observed.id().pid()) => {
                         match current.job.inspect_process(observed.id().pid()) {
-                            Ok(member) if member.identity() == observed => {
+                            Ok(member)
+                                if member.identity() == observed
+                                    && member.identity() == current.root() =>
+                            {
                                 ProcessClassification::Managed(expected)
                             }
                             Ok(_) => ProcessClassification::ReconciliationFault {

@@ -2,9 +2,16 @@ import { Terminal } from "lucide-react";
 import { useStore } from "../store";
 
 export function EmptyState() {
-  const snapshot = useStore((s) => s.snapshot);
-  const portStatuses = snapshot?.portStatuses ?? {};
-  const runningPorts = Object.values(portStatuses).filter((p) => p.inUse);
+  const workspace = useStore((s) => s.workspace);
+  const authorities = workspace?.portAuthorities ?? [];
+  const visiblePorts = authorities.filter(
+    (authority) =>
+      authority.fresh &&
+      ((authority.kind === "managed" &&
+        authority.controlReason === "exactManagedFence") ||
+        (authority.kind === "provenExternal" &&
+          authority.controlReason === "provenExternalNoControl")),
+  );
   const host = typeof location !== "undefined" ? location.hostname : "localhost";
 
   return (
@@ -22,31 +29,37 @@ export function EmptyState() {
         </p>
       </div>
 
-      {runningPorts.length > 0 && (
+      {visiblePorts.length > 0 && (
         <section className="w-full max-w-md">
           <h3 className="text-[11px] font-semibold uppercase tracking-wide text-zinc-500 mb-2">
             Running dev servers
           </h3>
           <div className="flex flex-col gap-1.5">
-            {runningPorts
+            {visiblePorts
               .sort((a, b) => a.port - b.port)
-              .map((status) => (
+              .map((authority) => (
                 <a
-                  key={status.port}
-                  href={`http://${host}:${status.port}`}
+                  key={authority.port}
+                  href={`http://${host}:${authority.port}`}
                   target="_blank"
                   rel="noopener noreferrer"
                   className="flex items-center gap-3 px-3 py-2 rounded bg-zinc-800 border border-zinc-700 hover:border-indigo-500 transition-colors"
                 >
-                  <span className="text-xs font-mono text-indigo-400">
-                    :{status.port}
+                  <span
+                    className={`text-xs font-mono ${
+                      authority.kind === "managed"
+                        ? "text-emerald-400"
+                        : "text-indigo-400"
+                    }`}
+                  >
+                    :{authority.port}
                   </span>
                   <span className="text-xs text-zinc-300 flex-1 truncate">
-                    {status.processName ?? "running"}
+                    {authority.kind === "managed" ? "managed" : "external"}
                   </span>
-                  {status.pid != null && (
+                  {authority.listeners[0]?.pid != null && (
                     <span className="text-[10px] text-zinc-500">
-                      pid {status.pid}
+                      pid {authority.listeners[0].pid}
                     </span>
                   )}
                 </a>

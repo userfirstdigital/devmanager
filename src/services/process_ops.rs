@@ -1,7 +1,9 @@
 use crate::browser::BrowserAttachmentSessionBinding;
 use crate::process::registry::ManagedProcessFence;
 use crate::remote::RemoteActionResult;
-use crate::services::process_manager::{ManagedShutdownReport, ProcessManagerInner};
+use crate::services::process_manager::{
+    bump_server_lifecycle_generation, ManagedShutdownReport, ProcessManagerInner,
+};
 use crate::state::{AiLaunchSpec, ServerLaunchSpec, SessionDimensions, SshLaunchSpec};
 use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
@@ -23,7 +25,6 @@ pub enum ProcessOpKind {
     StartServer,
     StopServer,
     RestartServer,
-    KillPortAndRestart,
     StartSsh,
     RestartSsh,
     CloseSsh,
@@ -40,7 +41,6 @@ pub enum ProcessOpKind {
 pub struct ProcessOpContext {
     pub message: Option<String>,
     pub session_id: Option<String>,
-    pub port: Option<u16>,
     pub focus: bool,
     pub shutdown_report: Option<ManagedShutdownReport>,
 }
@@ -50,7 +50,6 @@ impl Default for ProcessOpContext {
         Self {
             message: None,
             session_id: None,
-            port: None,
             focus: false,
             shutdown_report: None,
         }
@@ -88,15 +87,6 @@ pub enum ProcessOp {
         dimensions: SessionDimensions,
         banner: String,
         clear_logs: bool,
-        response: Option<Sender<RemoteActionResult>>,
-    },
-    KillPortAndRestart {
-        op_id: u64,
-        command_id: String,
-        port: u16,
-        launch: ServerLaunchSpec,
-        dimensions: SessionDimensions,
-        banner: String,
         response: Option<Sender<RemoteActionResult>>,
     },
     StartSsh {
@@ -178,7 +168,6 @@ fn op_preempts_in_flight(op: &ProcessOp) -> bool {
         op,
         ProcessOp::StopServer { .. }
             | ProcessOp::RestartServer { .. }
-            | ProcessOp::KillPortAndRestart { .. }
             | ProcessOp::RestartSsh { .. }
             | ProcessOp::CloseSsh { .. }
             | ProcessOp::RestartAi { .. }
@@ -220,12 +209,22 @@ fn drain_ready_completions(
 }
 
 impl ProcessOp {
+    fn invalidates_server_lifecycle(&self) -> bool {
+        matches!(
+            self,
+            ProcessOp::StartServer { .. }
+                | ProcessOp::StopServer { .. }
+                | ProcessOp::RestartServer { .. }
+                | ProcessOp::StopAll { .. }
+                | ProcessOp::Shutdown { .. }
+        )
+    }
+
     pub fn op_id(&self) -> u64 {
         match self {
             ProcessOp::StartServer { op_id, .. }
             | ProcessOp::StopServer { op_id, .. }
             | ProcessOp::RestartServer { op_id, .. }
-            | ProcessOp::KillPortAndRestart { op_id, .. }
             | ProcessOp::StartSsh { op_id, .. }
             | ProcessOp::RestartSsh { op_id, .. }
             | ProcessOp::CloseSsh { op_id, .. }
@@ -244,7 +243,6 @@ impl ProcessOp {
             ProcessOp::StartServer { launch, .. } | ProcessOp::RestartServer { launch, .. } => {
                 launch.command_id.clone()
             }
-            ProcessOp::KillPortAndRestart { command_id, .. } => command_id.clone(),
             ProcessOp::StopServer { command_id, .. } => command_id.clone(),
             ProcessOp::StartSsh { session_id, .. }
             | ProcessOp::RestartSsh { session_id, .. }
@@ -272,9 +270,6 @@ impl ProcessOp {
             ProcessOp::StartServer { response, .. } => (ProcessOpKind::StartServer, response),
             ProcessOp::StopServer { response, .. } => (ProcessOpKind::StopServer, response),
             ProcessOp::RestartServer { response, .. } => (ProcessOpKind::RestartServer, response),
-            ProcessOp::KillPortAndRestart { response, .. } => {
-                (ProcessOpKind::KillPortAndRestart, response)
-            }
             ProcessOp::StartSsh { response, .. } => (ProcessOpKind::StartSsh, response),
             ProcessOp::RestartSsh { response, .. } => (ProcessOpKind::RestartSsh, response),
             ProcessOp::CloseSsh { response, .. } => (ProcessOpKind::CloseSsh, response),
@@ -309,6 +304,7 @@ pub struct ProcessOpQueue {
     stop: Arc<AtomicBool>,
     worker: Mutex<Option<JoinHandle<()>>>,
     in_flight: Arc<Mutex<HashMap<String, u64>>>,
+    lifecycle_inner: Weak<ProcessManagerInner>,
     admission_serial: Mutex<()>,
     closing: AtomicBool,
     /// Includes queued, executing, and completed-but-undrained operations.
@@ -323,6 +319,7 @@ pub struct ProcessOpQueue {
 
 impl ProcessOpQueue {
     pub fn new(inner: Weak<ProcessManagerInner>) -> Arc<Self> {
+        let lifecycle_inner = inner.clone();
         let (submit_tx, submit_rx) = mpsc::sync_channel(MAX_PENDING_PROCESS_OPS);
         let (completion_tx, completion_rx) = mpsc::sync_channel(MAX_PENDING_PROCESS_OPS);
         let stop = Arc::new(AtomicBool::new(false));
@@ -352,6 +349,7 @@ impl ProcessOpQueue {
                 stop,
                 worker: Mutex::new(Some(worker)),
                 in_flight,
+                lifecycle_inner,
                 admission_serial: Mutex::new(()),
                 closing: AtomicBool::new(false),
                 pending_ops: AtomicUsize::new(0),
@@ -385,6 +383,7 @@ impl ProcessOpQueue {
         }
         let op_id = op.op_id();
         let target_id = op.target_id();
+        let invalidates_server_lifecycle = op.invalidates_server_lifecycle();
         let tracks_in_flight =
             !matches!(op, ProcessOp::Shutdown { .. } | ProcessOp::StopAll { .. });
         if tracks_in_flight {
@@ -395,6 +394,13 @@ impl ProcessOpQueue {
                     return Err(format!("Operation already in progress for `{target_id}`."));
                 }
                 in_flight.insert(target_id.clone(), op_id);
+            }
+        }
+        if invalidates_server_lifecycle {
+            // Queue admission is the lifecycle fence shared by all producer
+            // paths; publish it before handing the operation to the worker.
+            if let Some(inner) = self.lifecycle_inner.upgrade() {
+                bump_server_lifecycle_generation(&inner);
             }
         }
         self.pending_ops.fetch_add(1, Ordering::AcqRel);

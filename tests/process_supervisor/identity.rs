@@ -118,7 +118,10 @@ fn missing_executable_path_is_rejected_with_context() {
         ManagedProcessIdentity::new(id, missing.clone()).expect_err("missing path must fail");
     assert_eq!(error.path(), missing.as_path());
     assert_eq!(error.kind(), ErrorKind::NotFound);
-    assert!(error.to_string().contains(&missing.display().to_string()));
+    assert!(error
+        .to_string()
+        .contains("failed to canonicalize managed process executable"));
+    assert!(!error.to_string().contains(&missing.display().to_string()));
 }
 
 #[test]

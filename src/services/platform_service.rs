@@ -1,7 +1,17 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::{c_void, OsStr};
-use std::path::Path;
+#[cfg(not(windows))]
+use std::io::{self, Read};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(not(windows))]
+use std::process::Stdio;
+#[cfg(not(windows))]
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 #[cfg(not(windows))]
 use std::thread;
 #[cfg(any(not(windows), test))]
@@ -9,7 +19,8 @@ use std::time::Duration;
 #[cfg(not(windows))]
 use std::time::Instant;
 
-pub(crate) use crate::process::job::{attach_process_to_managed_job, ManagedProcessJob};
+pub use crate::process::job::{attach_process_to_managed_job, ManagedProcessJob};
+use crate::process::ports::TcpEndpointRecord;
 
 const MAX_LISTENER_PORT_BATCH: usize = 4_096;
 #[cfg(windows)]
@@ -24,29 +35,82 @@ const CREATE_SUSPENDED: u32 = 0x00000004;
 #[cfg(windows)]
 pub const MANAGED_PROCESS_CREATION_FLAGS: u32 = CREATE_NO_WINDOW | CREATE_SUSPENDED;
 
-pub fn snapshot_listener_pids(ports: &[u16]) -> Result<HashMap<u16, u32>, String> {
+pub fn snapshot_listener_pids(ports: &[u16]) -> Result<BTreeMap<u16, Vec<u32>>, String> {
+    if ports.len() > MAX_LISTENER_PORT_BATCH {
+        return Err(format!(
+            "listener snapshot exceeds {MAX_LISTENER_PORT_BATCH} ports"
+        ));
+    }
+    let endpoints = snapshot_listener_endpoints(ports)?;
+    let mut listeners = BTreeMap::new();
+    for (port, rows) in endpoints {
+        let pids = listeners.entry(port).or_insert_with(Vec::new);
+        for row in rows {
+            if !pids.contains(&row.pid()) {
+                pids.push(row.pid());
+            }
+        }
+        pids.sort_unstable();
+    }
+    Ok(listeners)
+}
+
+pub fn snapshot_listener_endpoints(
+    ports: &[u16],
+) -> Result<BTreeMap<u16, Vec<TcpEndpointRecord>>, String> {
     if ports.len() > MAX_LISTENER_PORT_BATCH {
         return Err(format!(
             "listener snapshot exceeds {MAX_LISTENER_PORT_BATCH} ports"
         ));
     }
     if ports.is_empty() {
-        return Ok(HashMap::new());
+        return Ok(BTreeMap::new());
     }
 
     #[cfg(windows)]
     {
-        snapshot_listener_pids_windows(ports)
+        snapshot_listener_endpoints_windows(ports)
     }
 
     #[cfg(not(windows))]
     {
-        snapshot_listener_pids_with_lsof(ports)
+        snapshot_listener_endpoints_with_lsof(ports)
     }
 }
 
 pub fn find_pid_on_port(port: u16) -> Result<Option<u32>, String> {
-    Ok(snapshot_listener_pids(&[port])?.remove(&port))
+    Ok(snapshot_listener_pids(&[port])?
+        .remove(&port)
+        .and_then(|pids| pids.into_iter().next()))
+}
+
+#[cfg(windows)]
+fn snapshot_listener_endpoints_windows(
+    ports: &[u16],
+) -> Result<BTreeMap<u16, Vec<TcpEndpointRecord>>, String> {
+    let absolute_deadline = std::time::Instant::now()
+        .checked_add(std::time::Duration::from_secs(1))
+        .ok_or_else(|| "listener snapshot deadline overflow".to_string())?;
+    snapshot_listener_endpoints_windows_until(ports, absolute_deadline)
+}
+
+#[cfg(windows)]
+fn snapshot_listener_endpoints_windows_until(
+    ports: &[u16],
+    absolute_deadline: std::time::Instant,
+) -> Result<BTreeMap<u16, Vec<TcpEndpointRecord>>, String> {
+    check_listener_snapshot_deadline(absolute_deadline, "listener filter allocation")?;
+    let filter: HashSet<u16> = ports.iter().copied().collect();
+    check_listener_snapshot_deadline(absolute_deadline, "listener filter allocation")?;
+    let mut listeners = BTreeMap::new();
+    collect_windows_listener_endpoints(AF_INET, &filter, &mut listeners, absolute_deadline)?;
+    collect_windows_listener_endpoints(AF_INET6, &filter, &mut listeners, absolute_deadline)?;
+    check_listener_snapshot_deadline(absolute_deadline, "listener snapshot completion")?;
+    for rows in listeners.values_mut() {
+        rows.sort_unstable();
+        rows.dedup();
+    }
+    Ok(listeners)
 }
 
 #[cfg(windows)]
@@ -62,22 +126,21 @@ fn snapshot_listener_pids_windows_until(
     ports: &[u16],
     absolute_deadline: std::time::Instant,
 ) -> Result<HashMap<u16, u32>, String> {
-    check_listener_snapshot_deadline(absolute_deadline, "listener filter allocation")?;
-    let filter: HashSet<u16> = ports.iter().copied().collect();
-    check_listener_snapshot_deadline(absolute_deadline, "listener filter allocation")?;
-    let mut listeners = HashMap::with_capacity(filter.len());
-    check_listener_snapshot_deadline(absolute_deadline, "listener result allocation")?;
-    collect_windows_listener_pids(AF_INET, &filter, &mut listeners, absolute_deadline)?;
-    collect_windows_listener_pids(AF_INET6, &filter, &mut listeners, absolute_deadline)?;
-    check_listener_snapshot_deadline(absolute_deadline, "listener snapshot completion")?;
+    let endpoints = snapshot_listener_endpoints_windows_until(ports, absolute_deadline)?;
+    let mut listeners = HashMap::new();
+    for (port, rows) in endpoints {
+        if let Some(row) = rows.first() {
+            listeners.entry(port).or_insert(row.pid());
+        }
+    }
     Ok(listeners)
 }
 
 #[cfg(windows)]
-fn collect_windows_listener_pids(
+fn collect_windows_listener_endpoints(
     address_family: u32,
     filter: &HashSet<u16>,
-    listeners: &mut HashMap<u16, u32>,
+    listeners: &mut BTreeMap<u16, Vec<TcpEndpointRecord>>,
     absolute_deadline: std::time::Instant,
 ) -> Result<(), String> {
     check_listener_snapshot_deadline(absolute_deadline, "TCP table size lookup")?;
@@ -144,7 +207,18 @@ fn collect_windows_listener_pids(
                 check_listener_snapshot_deadline(absolute_deadline, "IPv4 listener projection")?;
                 let port = windows_port(row.dw_local_port);
                 if filter.contains(&port) {
-                    listeners.entry(port).or_insert(row.dw_owning_pid);
+                    let rows = listeners.entry(port).or_default();
+                    rows.push(TcpEndpointRecord::tcp(
+                        IpAddr::V4(Ipv4Addr::from(row.dw_local_addr.to_be())),
+                        port,
+                        row.dw_owning_pid,
+                    ));
+                    if rows.len() > crate::process::ports::MAX_ENDPOINTS_PER_SCAN {
+                        return Err(format!(
+                            "listener endpoint count exceeds {}",
+                            crate::process::ports::MAX_ENDPOINTS_PER_SCAN
+                        ));
+                    }
                 }
                 Ok::<(), String>(())
             })?;
@@ -154,7 +228,18 @@ fn collect_windows_listener_pids(
                 check_listener_snapshot_deadline(absolute_deadline, "IPv6 listener projection")?;
                 let port = windows_port(row.dw_local_port);
                 if filter.contains(&port) {
-                    listeners.entry(port).or_insert(row.dw_owning_pid);
+                    let rows = listeners.entry(port).or_default();
+                    rows.push(TcpEndpointRecord::tcp(
+                        IpAddr::V6(Ipv6Addr::from(row.uc_local_addr)),
+                        port,
+                        row.dw_owning_pid,
+                    ));
+                    if rows.len() > crate::process::ports::MAX_ENDPOINTS_PER_SCAN {
+                        return Err(format!(
+                            "listener endpoint count exceeds {}",
+                            crate::process::ports::MAX_ENDPOINTS_PER_SCAN
+                        ));
+                    }
                 }
                 Ok::<(), String>(())
             })?;
@@ -209,45 +294,199 @@ where
 }
 
 #[cfg(not(windows))]
-fn snapshot_listener_pids_with_lsof(ports: &[u16]) -> Result<HashMap<u16, u32>, String> {
+fn snapshot_listener_endpoints_with_lsof(
+    ports: &[u16],
+) -> Result<BTreeMap<u16, Vec<TcpEndpointRecord>>, String> {
     let filter: HashSet<u16> = ports.iter().copied().collect();
-    let output = Command::new("lsof")
-        .args(["-nP", "-iTCP", "-sTCP:LISTEN", "-F", "pn"])
-        .output()
-        .map_err(|error| format!("Failed to run lsof: {error}"))?;
+    let output = run_bounded_command(
+        trusted_lsof_program(),
+        &["-nP", "-iTCP", "-sTCP:LISTEN", "-F", "pn"],
+    )?;
     if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+        return Err("listener_probe.command_failed".to_string());
     }
 
-    let mut listeners = HashMap::with_capacity(filter.len());
+    let mut listeners = BTreeMap::new();
     let mut current_pid = None;
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
+    let stdout = std::str::from_utf8(&output.stdout)
+        .map_err(|_| "listener_probe.invalid_utf8".to_string())?;
+    for line in stdout.lines() {
         if line.is_empty() {
             continue;
         }
+        if line.len() < 2 {
+            return Err("listener_probe.malformed_record".to_string());
+        }
         let (prefix, value) = line.split_at(1);
         match prefix {
-            "p" => current_pid = value.trim().parse::<u32>().ok(),
+            "p" => {
+                current_pid = Some(
+                    value
+                        .trim()
+                        .parse::<u32>()
+                        .map_err(|_| "listener_probe.invalid_pid".to_string())?,
+                );
+            }
             "n" => {
                 let Some(pid) = current_pid else {
-                    continue;
+                    return Err("listener_probe.endpoint_without_pid".to_string());
                 };
-                let Some(port) = parse_lsof_listener_port(value) else {
-                    continue;
-                };
-                if filter.contains(&port) {
-                    listeners.entry(port).or_insert(pid);
+                let endpoint = parse_lsof_listener_endpoint(value, pid)
+                    .ok_or_else(|| "listener_probe.malformed_endpoint".to_string())?;
+                if filter.contains(&endpoint.port()) {
+                    let rows = listeners.entry(endpoint.port()).or_default();
+                    rows.push(endpoint);
+                    if rows.len() > crate::process::ports::MAX_ENDPOINTS_PER_SCAN {
+                        return Err(format!("listener_probe.endpoint_limit_exceeded"));
+                    }
                 }
             }
-            _ => {}
+            _ => {
+                return Err("listener_probe.unsupported_record_field".to_string());
+            }
         }
     }
 
+    for rows in listeners.values_mut() {
+        rows.sort_unstable();
+        rows.dedup();
+    }
     Ok(listeners)
 }
 
+#[cfg(target_os = "linux")]
+const TRUSTED_LSOF_PATH: &str = "/usr/bin/lsof";
+
+#[cfg(target_os = "macos")]
+const TRUSTED_LSOF_PATH: &str = "/usr/sbin/lsof";
+
 #[cfg(not(windows))]
-fn parse_lsof_listener_port(value: &str) -> Option<u16> {
+fn trusted_lsof_program() -> &'static str {
+    TRUSTED_LSOF_PATH
+}
+
+#[cfg(all(unix, not(target_os = "linux"), not(target_os = "macos")))]
+const TRUSTED_LSOF_PATH: &str = "/usr/sbin/lsof";
+
+#[cfg(not(windows))]
+const MAX_LSOF_OUTPUT_BYTES: usize = 256 * 1024;
+
+#[cfg(not(windows))]
+const MAX_LSOF_RUNTIME: Duration = Duration::from_millis(750);
+
+#[cfg(not(windows))]
+struct BoundedChildOutput {
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+#[cfg(not(windows))]
+fn run_bounded_command(program: &str, args: &[&str]) -> Result<BoundedChildOutput, String> {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|_| "listener_probe.spawn_failed".to_string())?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "listener_probe.stdout_unavailable".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "listener_probe.stderr_unavailable".to_string())?;
+    let output_exceeded = Arc::new(AtomicBool::new(false));
+    let stdout_exceeded = output_exceeded.clone();
+    let stderr_exceeded = output_exceeded.clone();
+    let stdout_reader =
+        thread::spawn(move || read_bounded(stdout, MAX_LSOF_OUTPUT_BYTES, stdout_exceeded));
+    let stderr_reader =
+        thread::spawn(move || read_bounded(stderr, MAX_LSOF_OUTPUT_BYTES, stderr_exceeded));
+
+    let deadline = Instant::now()
+        .checked_add(MAX_LSOF_RUNTIME)
+        .unwrap_or_else(Instant::now);
+    let mut status = None;
+    let mut timed_out = false;
+    loop {
+        if output_exceeded.load(Ordering::Acquire) {
+            let _ = child.kill();
+            break;
+        }
+        match child.try_wait() {
+            Ok(Some(next)) => {
+                status = Some(next);
+                break;
+            }
+            Ok(None) if Instant::now() >= deadline => {
+                timed_out = true;
+                let _ = child.kill();
+                break;
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(2)),
+            Err(_error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err("listener_probe.poll_failed".to_string());
+            }
+        }
+    }
+    let status = match status {
+        Some(status) => status,
+        None => child
+            .wait()
+            .map_err(|_| "listener_probe.wait_failed".to_string())?,
+    };
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| "listener_probe.stdout_reader_panicked".to_string())?
+        .map_err(|_| "listener_probe.stdout_read_failed".to_string())?;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| "listener_probe.stderr_reader_panicked".to_string())?
+        .map_err(|_| "listener_probe.stderr_read_failed".to_string())?;
+
+    if timed_out {
+        return Err("listener_probe.deadline_exceeded".to_string());
+    }
+    if output_exceeded.load(Ordering::Acquire) {
+        return Err("listener_probe.output_limit_exceeded".to_string());
+    }
+    Ok(BoundedChildOutput {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+#[cfg(not(windows))]
+fn read_bounded(
+    mut reader: impl Read,
+    max_bytes: usize,
+    exceeded: Arc<AtomicBool>,
+) -> io::Result<Vec<u8>> {
+    let mut output = Vec::with_capacity(max_bytes.min(8192));
+    let mut chunk = [0u8; 8192];
+    loop {
+        let count = reader.read(&mut chunk)?;
+        if count == 0 {
+            return Ok(output);
+        }
+        if output.len().saturating_add(count) > max_bytes {
+            exceeded.store(true, Ordering::Release);
+            return Ok(output);
+        }
+        output.extend_from_slice(&chunk[..count]);
+    }
+}
+
+#[cfg(not(windows))]
+fn parse_lsof_listener_endpoint(value: &str, pid: u32) -> Option<TcpEndpointRecord> {
     let endpoint = value
         .trim()
         .split("->")
@@ -255,8 +494,24 @@ fn parse_lsof_listener_port(value: &str) -> Option<u16> {
         .unwrap_or(value)
         .trim_end_matches(" (LISTEN)")
         .trim();
-    let port_text = endpoint.rsplit(':').next()?.trim();
-    port_text.parse::<u16>().ok()
+    let (address, port_text) = if let Some(endpoint) = endpoint.strip_prefix('[') {
+        let (address, port_text) = endpoint.split_once("]:")?;
+        (address, port_text)
+    } else {
+        endpoint.rsplit_once(':')?
+    };
+    let port = port_text.trim().parse::<u16>().ok()?;
+    let address = match address.trim() {
+        "*" | "0.0.0.0" => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        "[::]" | "*:*" => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+        address => address.parse().ok()?,
+    };
+    Some(TcpEndpointRecord::tcp(address, port, pid))
+}
+
+#[cfg(not(windows))]
+fn parse_lsof_listener_port(value: &str) -> Option<u16> {
+    parse_lsof_listener_endpoint(value, 1).map(|endpoint| endpoint.port())
 }
 
 #[cfg(windows)]
@@ -566,6 +821,48 @@ pub fn process_identity_with_system(system: &sysinfo::System, pid: u32) -> Optio
     })
 }
 
+/// Return the platform-native executable path without assuming Linux `/proc`.
+/// sysinfo uses `proc_pidpath` on macOS and the native process APIs elsewhere.
+pub fn capture_process_executable(pid: u32) -> Option<PathBuf> {
+    let mut system = sysinfo::System::new();
+    system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    system
+        .process(sysinfo::Pid::from_u32(pid))
+        .and_then(|process| process.exe().map(Path::to_path_buf))
+}
+
+/// Capture a process creation token with more precision than sysinfo's
+/// display-oriented Unix seconds. Linux exposes the kernel start tick in
+/// `/proc`; other Unix platforms retain the verified sysinfo timestamp while
+/// using their native executable lookup above (macOS has no `/proc` tree).
+pub fn capture_process_creation_time_100ns(pid: u32) -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let (_, fields) = stat.rsplit_once(") ")?;
+        let start_ticks = fields.split_whitespace().nth(19)?.parse::<u64>().ok()?;
+        // `_SC_CLK_TCK` is 2 on Linux. Keep the FFI local so the application
+        // does not need to expose libc as a public dependency.
+        unsafe extern "C" {
+            fn sysconf(name: i32) -> i64;
+        }
+        let ticks_per_second = unsafe { sysconf(2) };
+        if ticks_per_second <= 0 {
+            return None;
+        }
+        return start_ticks
+            .checked_mul(10_000_000)
+            .and_then(|ticks| ticks.checked_div(ticks_per_second as u64));
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        capture_process_identity(pid)?
+            .started_at_unix_secs
+            .checked_mul(10_000_000)
+    }
+}
+
 pub fn process_matches_identity(
     pid: u32,
     started_at_unix_secs: u64,
@@ -661,10 +958,8 @@ pub fn get_process_name(pid: u32) -> Result<Option<String>, String> {
 
     #[cfg(not(windows))]
     {
-        let output = Command::new("ps")
-            .args(["-p", &pid.to_string(), "-o", "comm="])
-            .output()
-            .map_err(|error| format!("Failed to run ps: {error}"))?;
+        let pid_text = pid.to_string();
+        let output = run_bounded_command("ps", &["-p", pid_text.as_str(), "-o", "comm="])?;
         if !output.status.success() {
             return Ok(None);
         }
@@ -955,13 +1250,48 @@ mod tests {
 
 #[cfg(all(test, not(windows)))]
 mod non_windows_tests {
-    use super::parse_lsof_listener_port;
+    use super::{parse_lsof_listener_port, run_bounded_command};
+
+    #[test]
+    fn listener_probe_uses_a_pinned_lsof_path() {
+        let path = super::trusted_lsof_program();
+        assert!(path.starts_with('/'));
+        assert_eq!(
+            std::path::Path::new(path)
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("lsof")
+        );
+    }
 
     #[test]
     fn parse_lsof_listener_port_handles_localhost_and_ipv6() {
         assert_eq!(parse_lsof_listener_port("127.0.0.1:3000"), Some(3000));
         assert_eq!(parse_lsof_listener_port("[::1]:5174"), Some(5174));
         assert_eq!(parse_lsof_listener_port("*:8080 (LISTEN)"), Some(8080));
+    }
+
+    #[test]
+    fn lsof_diagnostics_are_fixed_and_path_free() {
+        let error = match run_bounded_command("/definitely/missing/lsof", &[]) {
+            Ok(_) => panic!("missing trusted executable must fail"),
+            Err(error) => error,
+        };
+        assert_eq!(error, "listener_probe.spawn_failed");
+        assert!(!error.contains("/definitely"));
+    }
+
+    #[test]
+    fn lsof_nonzero_stderr_is_not_forwarded() {
+        let error = match run_bounded_command(
+            "/bin/sh",
+            &["-c", "printf 'secret-path-and-diagnostics' >&2; exit 7"],
+        ) {
+            Ok(_) => panic!("nonzero command must fail at the listener boundary"),
+            Err(error) => error,
+        };
+        assert_eq!(error, "listener_probe.command_failed");
+        assert!(!error.contains("secret-path"));
     }
 }
 

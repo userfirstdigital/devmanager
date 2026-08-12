@@ -543,6 +543,7 @@ mod tests {
         server.configure_server(ServerLaunchSpec {
             command_id: "cmd-1".to_string(),
             project_id: "project-1".to_string(),
+            port: None,
             cwd: PathBuf::from("."),
             program: "cmd".to_string(),
             args: Vec::new(),

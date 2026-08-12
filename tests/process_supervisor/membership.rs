@@ -106,6 +106,16 @@ fn registration(
     root: ManagedProcessIdentity,
     job: ScriptedJob,
 ) -> RegisteredProcess<ScriptedJob> {
+    registration_with_owner(resource, generation, root, ProcessOwner::Host, job)
+}
+
+fn registration_with_owner(
+    resource: ResourceId,
+    generation: u64,
+    root: ManagedProcessIdentity,
+    owner: ProcessOwner,
+    job: ScriptedJob,
+) -> RegisteredProcess<ScriptedJob> {
     job.set_snapshot(
         vec![root.id().pid()],
         vec![(
@@ -115,7 +125,7 @@ fn registration(
     );
     RegisteredProcess::new(
         ResourceFence::new(resource, generation),
-        ProcessOwner::Host,
+        owner,
         root,
         ProcessDisplayLabel::new("membership test").expect("display label"),
         job,
@@ -204,6 +214,31 @@ fn membership_classification_rejects_pid_match_with_wrong_job_identity() {
                 "pid-reused",
             )),
         )],
+    );
+
+    assert!(matches!(
+        registry.classify_root(&root),
+        ProcessClassification::ReconciliationFault {
+            reason: OwnershipFault::IdentityMismatch,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn classify_root_rejects_live_job_root_pid_reuse() {
+    let resource = resource_id(200);
+    let root = identity(1_200, 12_000, &executable());
+    let replacement = member(1_200, 12_001, "replacement");
+    let job = ScriptedJob::with_root(root.id().pid());
+    let mut registry = ProcessRegistry::new();
+    registry
+        .register(registration(resource, 1, root.clone(), job.clone()))
+        .expect("registration");
+
+    job.set_snapshot(
+        vec![root.id().pid()],
+        vec![(root.id().pid(), Ok(replacement))],
     );
 
     assert!(matches!(

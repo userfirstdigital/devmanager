@@ -121,6 +121,52 @@ export interface WebPortStatus {
   processName: string | null;
 }
 
+export type WebPortAuthorityKind =
+  | "managed"
+  | "managedUnready"
+  | "provenExternal"
+  | "unknown"
+  | "probeError"
+  | "free"
+  | "occupied";
+
+export type WebPortControlReason =
+  | "exactManagedFence"
+  | "managedUnready"
+  | "provenExternalNoControl"
+  | "starting"
+  | "free"
+  | "stale"
+  | "probeFault"
+  | "mixedOrUnverified";
+
+export interface WebPortListenerIdentity {
+  pid: number;
+  creationTime100ns: number;
+  executableProven: boolean;
+}
+
+export interface WebPortAuthority {
+  port: number;
+  kind: WebPortAuthorityKind;
+  /** Typed, path-free diagnostic; older hosts may omit this additive field. */
+  diagnostic?: "probeError" | null;
+  resourceGeneration: number | null;
+  listeners: WebPortListenerIdentity[];
+  sessionId: string | null;
+  root: WebPortListenerIdentity | null;
+  membershipRevision: number;
+  observationSequence: number;
+  publicationSequence: number;
+  observedAtEpochMs: number;
+  freshnessDeadlineEpochMs: number;
+  fresh: boolean;
+  /** Older hosts may omit this; absence is fail-closed for URL actions. */
+  reapIncomplete?: boolean;
+  controlReason: WebPortControlReason;
+  error: string | null;
+}
+
 export interface WebWorkspaceSnapshot {
   webProtocolVersion: number;
   runtimeInstanceId: string;
@@ -131,6 +177,8 @@ export interface WebWorkspaceSnapshot {
   tabs: WebTab[];
   sessions: WebSessionSummary[];
   portStatuses: WebPortStatus[];
+  /** Typed port authority; older hosts may omit this additive field. */
+  portAuthorities?: WebPortAuthority[];
   writerLease: WebWriterLeaseState;
 }
 
@@ -483,6 +531,7 @@ export interface LegacyWorkspaceProjection {
   };
   runtimeState: { sessions: Record<string, SessionRuntimeState> };
   portStatuses: Record<string, WebPortStatus>;
+  portAuthorities?: Record<string, WebPortAuthority>;
   controllerClientId: string | null;
   youHaveControl: boolean;
   serverId: string;

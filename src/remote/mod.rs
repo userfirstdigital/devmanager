@@ -18,6 +18,7 @@ use web::input_executor::WebInputExecutor;
 use web::lease::{ControllerRequest, ControllerTarget, WebControlState};
 use web::request_executor::WebRequestExecutor;
 
+use crate::domain::operation::ResourceFence;
 use crate::git::git_service::{
     AiCommitMessage, DeviceCodeResponse, GitBranch, GitDiffResult, GitLogEntry, GitStatusResult,
 };
@@ -26,6 +27,9 @@ use crate::models::{
     Settings, TabType,
 };
 use crate::persistence::{self, PersistenceError};
+use crate::process::ports::{
+    ManagedResourceCapability, PortStatus as RichPortStatus, PortStatusKind as RichPortStatusKind,
+};
 use crate::state::{
     AppState, RuntimeState, SessionDimensions, SessionKind, SessionRuntimeState, SessionStatus,
 };
@@ -64,6 +68,7 @@ const CLAUDE_COMPOSER_RECONCILIATION_TTL: Duration = Duration::from_secs(5 * 60)
 const MAX_CLAUDE_COMPOSER_RECONCILIATIONS: usize = 1024;
 const CODEX_COMPOSER_RECONCILIATION_TTL: Duration = Duration::from_secs(5 * 60);
 const MAX_CODEX_COMPOSER_RECONCILIATIONS: usize = 1024;
+pub(crate) const REMOTE_PORT_AUTHORITY_MAX_AGE_MS: u64 = 5_000;
 
 type SessionBootstrapProvider = Arc<dyn Fn(&str) -> Option<RemoteSessionBootstrap> + Send + Sync>;
 type TerminalInputHandler =
@@ -178,6 +183,11 @@ pub struct RemoteWorkspaceSnapshot {
     pub runtime_state: RuntimeState,
     pub session_views: HashMap<String, TerminalSessionView>,
     pub port_statuses: HashMap<u16, PortStatus>,
+    /// Exact, generation-fenced port evidence. `port_statuses` remains only
+    /// as a compatibility projection for older clients; control and colour
+    /// decisions must use this map.
+    #[serde(default)]
+    pub port_authorities: HashMap<u16, RemotePortAuthority>,
     pub controller_client_id: Option<String>,
     pub you_have_control: bool,
     pub server_id: String,
@@ -189,8 +199,462 @@ pub struct RemoteWorkspaceDelta {
     pub app_state: Option<AppState>,
     pub runtime_state: Option<RuntimeState>,
     pub port_statuses: Option<HashMap<u16, PortStatus>>,
+    #[serde(default)]
+    pub port_authorities: Option<HashMap<u16, RemotePortAuthority>>,
     pub controller_client_id: Option<String>,
     pub you_have_control: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "camelCase")]
+pub enum RemotePortAuthorityKind {
+    Managed,
+    ManagedUnready,
+    ProvenExternal,
+    Unknown,
+    ProbeError,
+    Free,
+    Occupied,
+}
+
+/// Wire-safe, path-free diagnostics for an authority that could not be
+/// established. The concrete probe text remains host-local and never crosses
+/// the remote/web boundary.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "camelCase")]
+pub enum RemotePortDiagnostic {
+    ProbeError,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteListenerIdentity {
+    pub pid: u32,
+    pub creation_time_100ns: u64,
+    /// The executable path is intentionally not sent over the remote wire.
+    /// This bit records that the local host captured and canonicalized it.
+    pub executable_proven: bool,
+    /// Path-free identity of the canonical executable. The value is only
+    /// useful when compared with the host's current registry snapshot; it is
+    /// not a path and is never accepted as a standalone authority.
+    #[serde(default)]
+    pub executable_fingerprint: Option<u64>,
+}
+
+/// An in-process capability minted only after the host has correlated the
+/// complete listener and managed-process observations. It intentionally has
+/// no public constructor and is skipped during wire serialization, so a
+/// deserialized or hand-built DTO cannot claim host verification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct VerifiedPortAuthority {
+    projection_fingerprint: u64,
+}
+
+impl VerifiedPortAuthority {
+    fn new(authority: &RemotePortAuthority) -> Self {
+        Self {
+            projection_fingerprint: remote_authority_projection_fingerprint(authority),
+        }
+    }
+
+    fn matches(&self, authority: &RemotePortAuthority) -> bool {
+        self.projection_fingerprint == remote_authority_projection_fingerprint(authority)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RemotePortAuthority {
+    pub port: u16,
+    pub kind: RemotePortAuthorityKind,
+    #[serde(default)]
+    pub diagnostic: Option<RemotePortDiagnostic>,
+    pub resource: Option<ResourceFence>,
+    pub listeners: Vec<RemoteListenerIdentity>,
+    /// The host session that owns this listener authority. This is explicit
+    /// because a PID alone can be recycled between sessions.
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// Redacted root identity from the live managed-process fence. The
+    /// executable is represented only by the proof bit and the authority
+    /// fingerprint; paths never cross the remote wire.
+    #[serde(default)]
+    pub root: Option<RemoteListenerIdentity>,
+    pub membership_revision: u64,
+    pub observation_sequence: u64,
+    pub publication_sequence: u64,
+    pub observed_at_epoch_ms: u64,
+    pub freshness_deadline_epoch_ms: u64,
+    /// Path-free binding to the exact local registry fence. A shape-only
+    /// resource/listener DTO is never enough to authorize forwarding.
+    #[serde(default)]
+    pub managed_fence_fingerprint: Option<u64>,
+    /// Present only on a host-local projection that passed the exact live
+    /// fence check. This marker is deliberately not part of the wire shape.
+    #[serde(skip)]
+    #[serde(default)]
+    pub(crate) verified: Option<VerifiedPortAuthority>,
+    pub error: Option<String>,
+}
+
+impl RemotePortAuthority {
+    pub fn kind(&self) -> RemotePortAuthorityKind {
+        self.kind
+    }
+
+    pub fn from_rich(status: &RichPortStatus, now_epoch_ms: u64) -> Self {
+        Self::from_rich_with_source_metadata(
+            status,
+            now_epoch_ms,
+            now_epoch_ms.saturating_add(REMOTE_PORT_AUTHORITY_MAX_AGE_MS),
+        )
+    }
+
+    pub fn from_rich_with_source_metadata(
+        status: &RichPortStatus,
+        observed_at_epoch_ms: u64,
+        freshness_deadline_epoch_ms: u64,
+    ) -> Self {
+        let projected_kind = match status.kind() {
+            RichPortStatusKind::ManagedHealthy => RemotePortAuthorityKind::Managed,
+            RichPortStatusKind::ManagedUnready => RemotePortAuthorityKind::ManagedUnready,
+            RichPortStatusKind::ProvenExternal => RemotePortAuthorityKind::ProvenExternal,
+            RichPortStatusKind::ProbeError => RemotePortAuthorityKind::ProbeError,
+            RichPortStatusKind::Occupied => RemotePortAuthorityKind::Occupied,
+            RichPortStatusKind::Stopped => RemotePortAuthorityKind::Free,
+            RichPortStatusKind::Starting => RemotePortAuthorityKind::Unknown,
+            RichPortStatusKind::Unknown => RemotePortAuthorityKind::Unknown,
+        };
+        // A positive authority carrying probe detail is internally
+        // inconsistent. Fail closed before it reaches a renderer or control
+        // predicate rather than allowing a blue/green claim with a fault.
+        let kind = if status.error().is_some()
+            && matches!(
+                projected_kind,
+                RemotePortAuthorityKind::Managed
+                    | RemotePortAuthorityKind::ManagedUnready
+                    | RemotePortAuthorityKind::ProvenExternal
+            ) {
+            RemotePortAuthorityKind::Unknown
+        } else {
+            projected_kind
+        };
+        let resource = matches!(
+            kind,
+            RemotePortAuthorityKind::Managed | RemotePortAuthorityKind::ManagedUnready
+        )
+        .then_some(status.resource);
+        // A local Starting status can retain probe detail while its process is
+        // being brought up. That detail is host-only just like an explicit
+        // ProbeError; never let it become a wire error string.
+        let diagnostic = (kind == RemotePortAuthorityKind::ProbeError || status.error().is_some())
+            .then_some(RemotePortDiagnostic::ProbeError);
+        Self {
+            port: status.port,
+            kind,
+            diagnostic,
+            resource,
+            listeners: status
+                .listeners()
+                .iter()
+                .map(|listener| RemoteListenerIdentity {
+                    pid: listener.pid(),
+                    creation_time_100ns: listener.creation_time_100ns(),
+                    executable_proven: listener.has_executable_proof(),
+                    executable_fingerprint: listener
+                        .canonical_executable()
+                        .map(executable_fingerprint),
+                })
+                .collect(),
+            session_id: None,
+            root: None,
+            membership_revision: 0,
+            observation_sequence: 0,
+            publication_sequence: 0,
+            observed_at_epoch_ms,
+            freshness_deadline_epoch_ms,
+            managed_fence_fingerprint: None,
+            verified: None,
+            error: None,
+        }
+    }
+
+    pub(crate) fn with_snapshot_metadata(
+        mut self,
+        publication_sequence: u64,
+        membership_revision: u64,
+        observation_sequence: u64,
+    ) -> Self {
+        self.publication_sequence = publication_sequence;
+        self.membership_revision = membership_revision;
+        self.observation_sequence = observation_sequence;
+        self
+    }
+
+    pub(crate) fn with_session_id(mut self, session_id: impl Into<String>) -> Self {
+        self.session_id = Some(session_id.into());
+        self
+    }
+
+    pub(crate) fn with_managed_capability(
+        mut self,
+        capability: &ManagedResourceCapability,
+    ) -> Self {
+        let managed = capability.snapshot();
+        self.managed_fence_fingerprint = Some(managed.authority_fingerprint());
+        self.root = Some(RemoteListenerIdentity {
+            pid: managed.root().id().pid(),
+            creation_time_100ns: managed.root().id().creation_time_100ns(),
+            executable_proven: true,
+            executable_fingerprint: Some(executable_fingerprint(
+                managed.root().canonical_executable(),
+            )),
+        });
+        for listener in &mut self.listeners {
+            listener.executable_fingerprint = managed
+                .member_identities()
+                .iter()
+                .find(|member| {
+                    member.id().pid() == listener.pid
+                        && member.id().creation_time_100ns() == listener.creation_time_100ns
+                })
+                .map(|member| executable_fingerprint(member.canonical_executable()));
+        }
+        self
+    }
+
+    pub fn is_fresh_at(&self, now_epoch_ms: u64) -> bool {
+        self.publication_sequence > 0
+            && self.observed_at_epoch_ms <= now_epoch_ms
+            && now_epoch_ms.saturating_sub(self.observed_at_epoch_ms)
+                <= REMOTE_PORT_AUTHORITY_MAX_AGE_MS
+            && self.freshness_deadline_epoch_ms >= self.observed_at_epoch_ms
+            && now_epoch_ms <= self.freshness_deadline_epoch_ms
+    }
+
+    pub(crate) fn is_host_verified(&self) -> bool {
+        self.verified
+            .as_ref()
+            .is_some_and(|proof| proof.matches(self))
+    }
+
+    /// Check the path-free fields that must be present before a web client
+    /// may describe a managed authority as exact. Session/root matching is
+    /// checked separately when a local runtime session is available.
+    fn has_complete_wire_authority(&self) -> bool {
+        if !matches!(
+            self.kind,
+            RemotePortAuthorityKind::Managed | RemotePortAuthorityKind::ManagedUnready
+        ) || self.resource.is_none()
+            || self.diagnostic.is_some()
+            || self
+                .resource
+                .is_some_and(|resource| resource.runtime_generation == 0)
+            || self.membership_revision == 0
+            || self.observation_sequence == 0
+            || self.managed_fence_fingerprint.is_none()
+            || self.managed_fence_fingerprint == Some(0)
+            || self.error.is_some()
+            || self
+                .session_id
+                .as_deref()
+                .is_none_or(|session_id| session_id.trim().is_empty())
+        {
+            return false;
+        }
+        let Some(root) = self.root.as_ref() else {
+            return false;
+        };
+        if root.pid == 0 || root.creation_time_100ns == 0 || !root.executable_proven {
+            return false;
+        }
+        let mut listener_ids = HashSet::new();
+        !self.listeners.is_empty()
+            && self.listeners.iter().all(|listener| {
+                listener.pid != 0
+                    && listener.creation_time_100ns != 0
+                    && listener.executable_proven
+                    && listener
+                        .executable_fingerprint
+                        .is_some_and(|fingerprint| fingerprint != 0)
+                    && listener_ids.insert((listener.pid, listener.creation_time_100ns))
+            })
+    }
+
+    /// Prove that this authority is the exact current host projection for a
+    /// running session and one live managed registry membership snapshot.
+    /// Every identity-bearing comparison is made against the caller-owned
+    /// observation timestamp and deadline; no method-local clock read may
+    /// widen the proof window.
+    pub(crate) fn has_exact_managed_fence_for(
+        &self,
+        requested_port: u16,
+        session: &SessionRuntimeState,
+        live: &ManagedResourceCapability,
+        now_epoch_ms: u64,
+        observation_time: Instant,
+        deadline: Instant,
+    ) -> bool {
+        if observation_time > deadline
+            || !self.has_complete_wire_authority()
+            || !self.is_fresh_at(now_epoch_ms)
+            || self.port != requested_port
+            || self.session_id.as_deref() != Some(session.session_id.as_str())
+            || session.status != SessionStatus::Running
+            || session.reap_incomplete
+            || session
+                .server_launch
+                .as_ref()
+                .and_then(|launch| launch.port)
+                != Some(requested_port)
+            || live.snapshot().state() != crate::process::registry::ManagedProcessState::Running
+            || !live.snapshot().is_fresh_at(observation_time)
+            || self.membership_revision != live.snapshot().membership_revision()
+            || self.observation_sequence != live.snapshot().observation_sequence()
+            || self.managed_fence_fingerprint != Some(live.snapshot().authority_fingerprint())
+            || self.resource != Some(live.snapshot().resource())
+        {
+            return false;
+        }
+        let Some(session_pid) = session.pid else {
+            return false;
+        };
+        let Some(root) = self.root.as_ref() else {
+            return false;
+        };
+        let live_root = live.snapshot().root();
+        if session_pid != live_root.id().pid()
+            || root.pid != live_root.id().pid()
+            || root.creation_time_100ns != live_root.id().creation_time_100ns()
+            || root.executable_fingerprint
+                != Some(executable_fingerprint(live_root.canonical_executable()))
+            || self.listeners.is_empty()
+        {
+            return false;
+        }
+        let mut listener_ids = HashSet::new();
+        self.listeners.iter().all(|listener| {
+            let Some(listener_fingerprint) = listener.executable_fingerprint else {
+                return false;
+            };
+            listener_ids.insert((listener.pid, listener.creation_time_100ns))
+                && live.snapshot().member_identities().iter().any(|member| {
+                    member.id().pid() == listener.pid
+                        && member.id().creation_time_100ns() == listener.creation_time_100ns
+                        && executable_fingerprint(member.canonical_executable())
+                            == listener_fingerprint
+                })
+        })
+    }
+}
+
+fn remote_authority_projection_fingerprint(authority: &RemotePortAuthority) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    authority.port.hash(&mut hasher);
+    let kind = match authority.kind {
+        RemotePortAuthorityKind::Managed => 0u8,
+        RemotePortAuthorityKind::ManagedUnready => 1,
+        RemotePortAuthorityKind::ProvenExternal => 2,
+        RemotePortAuthorityKind::Unknown => 3,
+        RemotePortAuthorityKind::ProbeError => 4,
+        RemotePortAuthorityKind::Free => 5,
+        RemotePortAuthorityKind::Occupied => 6,
+    };
+    kind.hash(&mut hasher);
+    authority
+        .resource
+        .map(|resource| (resource.resource_id, resource.runtime_generation))
+        .hash(&mut hasher);
+    authority.listeners.len().hash(&mut hasher);
+    for listener in &authority.listeners {
+        (
+            listener.pid,
+            listener.creation_time_100ns,
+            listener.executable_proven,
+            listener.executable_fingerprint,
+        )
+            .hash(&mut hasher);
+    }
+    authority.session_id.hash(&mut hasher);
+    authority
+        .root
+        .as_ref()
+        .map(|root| {
+            (
+                root.pid,
+                root.creation_time_100ns,
+                root.executable_proven,
+                root.executable_fingerprint,
+            )
+        })
+        .hash(&mut hasher);
+    authority.membership_revision.hash(&mut hasher);
+    authority.observation_sequence.hash(&mut hasher);
+    authority.publication_sequence.hash(&mut hasher);
+    authority.observed_at_epoch_ms.hash(&mut hasher);
+    authority.freshness_deadline_epoch_ms.hash(&mut hasher);
+    authority.managed_fence_fingerprint.hash(&mut hasher);
+    authority.diagnostic.hash(&mut hasher);
+    authority.error.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn executable_fingerprint(path: &Path) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    path.as_os_str().hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Convert only exact, current host evidence into host-local authorities. A
+/// complete-looking map supplied by a client or an older publication remains
+/// unverified; the marker is minted here only after the canonical predicate
+/// correlates the session, requested port, resource generation, root, every
+/// listener executable identity, and the live registry fence.
+pub(crate) fn host_verified_port_authorities_at(
+    authorities: &HashMap<u16, RemotePortAuthority>,
+    runtime: &RuntimeState,
+    managed_snapshots: &HashMap<u16, Arc<ManagedResourceCapability>>,
+    now_epoch_ms: u64,
+    observation_time: Instant,
+    deadline: Instant,
+) -> HashMap<u16, RemotePortAuthority> {
+    authorities
+        .iter()
+        .map(|(port, authority)| {
+            let mut candidate = authority.clone();
+            candidate.verified = None;
+            let verified = matches!(
+                candidate.kind,
+                RemotePortAuthorityKind::Managed | RemotePortAuthorityKind::ManagedUnready
+            )
+            .then(|| {
+                let session = runtime.sessions.values().find(|session| {
+                    session.session_id == candidate.session_id.as_deref().unwrap_or_default()
+                        && session
+                            .server_launch
+                            .as_ref()
+                            .and_then(|launch| launch.port)
+                            == Some(*port)
+                })?;
+                let live = managed_snapshots.get(port)?;
+                candidate
+                    .has_exact_managed_fence_for(
+                        *port,
+                        session,
+                        live,
+                        now_epoch_ms,
+                        observation_time,
+                        deadline,
+                    )
+                    .then(|| {
+                        candidate.verified = Some(VerifiedPortAuthority::new(&candidate));
+                        candidate.clone()
+                    })
+            })
+            .flatten();
+            (*port, verified.unwrap_or(candidate.clone()))
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1639,6 +2103,11 @@ pub(crate) struct RemoteHostInner {
     shared_state: RwLock<AppState>,
     runtime_state: RwLock<RuntimeState>,
     port_statuses: RwLock<HashMap<u16, PortStatus>>,
+    port_authorities: RwLock<HashMap<u16, RemotePortAuthority>>,
+    /// Task3.4 supplies this exact registry snapshot when the host can prove
+    /// a managed forwarding request. Empty is intentional until that union
+    /// seam is wired; it makes every managed wire label fail closed.
+    managed_port_snapshots: RwLock<HashMap<u16, Arc<ManagedResourceCapability>>>,
     semantic_journals: Mutex<SemanticJournalStore>,
     /// Serializes semantic writers while the generation below gives browser
     /// capture a lock-free indication that publication is in progress.
@@ -1872,6 +2341,8 @@ impl RemoteHostService {
             shared_state: RwLock::new(AppState::default()),
             runtime_state: RwLock::new(RuntimeState::default()),
             port_statuses: RwLock::new(HashMap::new()),
+            port_authorities: RwLock::new(HashMap::new()),
+            managed_port_snapshots: RwLock::new(HashMap::new()),
             semantic_journals: Mutex::new(SemanticJournalStore::default()),
             semantic_publication_lock: Mutex::new(()),
             semantic_publication_generation: AtomicU64::new(0),
@@ -2042,7 +2513,25 @@ impl RemoteHostService {
         runtime_state: RuntimeState,
         port_statuses: HashMap<u16, PortStatus>,
     ) {
-        self.update_snapshot_parts(Some(app_state), Some(runtime_state), Some(port_statuses));
+        self.update_snapshot_parts(
+            Some(app_state),
+            Some(runtime_state),
+            Some(port_statuses),
+            Some(HashMap::new()),
+        );
+    }
+
+    /// Inject the current Task3.4 registry authority for forwarding. The
+    /// normal host path leaves this empty until the registry handoff is
+    /// available; tests and the eventual union adapter provide exact,
+    /// independently reconciled snapshots here.
+    pub(crate) fn update_managed_port_capabilities(
+        &self,
+        snapshots: HashMap<u16, Arc<ManagedResourceCapability>>,
+    ) {
+        if let Ok(mut slot) = self.inner.managed_port_snapshots.write() {
+            *slot = snapshots;
+        }
     }
 
     pub fn update_snapshot_parts(
@@ -2050,6 +2539,7 @@ impl RemoteHostService {
         app_state: Option<AppState>,
         runtime_state: Option<RuntimeState>,
         port_statuses: Option<HashMap<u16, PortStatus>>,
+        port_authorities: Option<HashMap<u16, RemotePortAuthority>>,
     ) {
         let semantic_inputs_changed = app_state.is_some() || runtime_state.is_some();
         let _snapshot_guard = self
@@ -2057,6 +2547,13 @@ impl RemoteHostService {
             .snapshot_state_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if runtime_state.is_some() {
+            // Runtime/session generations are part of the managed capability
+            // predicate. A runtime publication invalidates every prior
+            // capability; the registry union must issue a fresh one after
+            // publishing the matching runtime generation.
+            self.update_managed_port_capabilities(HashMap::new());
+        }
         let mut changed = false;
         if let Some(app_state) = app_state {
             if let Ok(mut slot) = self.inner.shared_state.write() {
@@ -2073,6 +2570,12 @@ impl RemoteHostService {
         if let Some(port_statuses) = port_statuses {
             if let Ok(mut slot) = self.inner.port_statuses.write() {
                 *slot = port_statuses;
+                changed = true;
+            }
+        }
+        if let Some(port_authorities) = port_authorities {
+            if let Ok(mut slot) = self.inner.port_authorities.write() {
+                *slot = port_authorities;
                 changed = true;
             }
         }
@@ -4430,9 +4933,16 @@ fn run_broadcaster(inner: Arc<RemoteHostInner>) {
             .read()
             .map(|slot| slot.clone())
             .unwrap_or_default();
+        let port_authorities = inner
+            .port_authorities
+            .read()
+            .map(|slot| slot.clone())
+            .unwrap_or_default();
         let app_hash = stable_hash(&app_state);
         let runtime_hash = stable_hash(&runtime_state);
         let port_hash = stable_hash(&port_statuses);
+        let authority_hash = stable_hash(&port_authorities);
+        let combined_port_hash = port_hash ^ authority_hash;
 
         let Ok(mut clients) = inner.clients.lock() else {
             thread::sleep(SNAPSHOT_BROADCAST_INTERVAL);
@@ -4445,7 +4955,7 @@ fn run_broadcaster(inner: Arc<RemoteHostInner>) {
                 controller_client_id.as_deref() == Some(client.client_id.as_str());
             let app_changed = client.last_app_hash != app_hash;
             let runtime_changed = client.last_runtime_hash != runtime_hash;
-            let port_changed = client.last_port_hash != port_hash;
+            let port_changed = client.last_port_hash != combined_port_hash;
             let controller_changed = client.last_controller_client_id != controller_client_id
                 || client.last_you_have_control != you_have_control;
             let web_revision_changed =
@@ -4464,13 +4974,14 @@ fn run_broadcaster(inner: Arc<RemoteHostInner>) {
                 app_state: app_changed.then_some(app_state.clone()),
                 runtime_state: runtime_changed.then_some(runtime_state.clone()),
                 port_statuses: port_changed.then_some(port_statuses.clone()),
+                port_authorities: port_changed.then_some(port_authorities.clone()),
                 controller_client_id: controller_client_id.clone(),
                 you_have_control,
             };
 
             client.last_app_hash = app_hash;
             client.last_runtime_hash = runtime_hash;
-            client.last_port_hash = port_hash;
+            client.last_port_hash = combined_port_hash;
             client.last_controller_client_id = controller_client_id.clone();
             client.last_you_have_control = you_have_control;
             client.last_snapshot_revision = snapshot_revision;
@@ -4718,6 +5229,7 @@ fn handle_client_connection(
     let app_hash = stable_hash(&snapshot.app_state);
     let runtime_hash = stable_hash(&snapshot.runtime_state);
     let port_hash = stable_hash(&snapshot.port_statuses);
+    let authority_hash = stable_hash(&snapshot.port_authorities);
     if let Ok(mut clients) = inner.clients.lock() {
         clients.insert(
             connection_id,
@@ -4733,7 +5245,7 @@ fn handle_client_connection(
                 focused_session_id: snapshot.runtime_state.active_session_id.clone(),
                 last_app_hash: app_hash,
                 last_runtime_hash: runtime_hash,
-                last_port_hash: port_hash,
+                last_port_hash: port_hash ^ authority_hash,
                 last_controller_client_id: controller_client_id.clone(),
                 last_you_have_control: you_have_control,
                 last_snapshot_revision: inner.snapshot_revision.load(Ordering::Relaxed),
@@ -5160,6 +5672,10 @@ fn native_client_credentials_are_current(
 }
 
 fn host_can_forward_port(inner: &Arc<RemoteHostInner>, requested_port: u16) -> bool {
+    let _snapshot_guard = inner
+        .snapshot_state_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let app_state = inner
         .shared_state
         .read()
@@ -5170,12 +5686,29 @@ fn host_can_forward_port(inner: &Arc<RemoteHostInner>, requested_port: u16) -> b
         .read()
         .map(|slot| slot.clone())
         .unwrap_or_default();
-    let port_statuses = inner
-        .port_statuses
+    let now_epoch_ms = now_epoch_ms();
+    let raw_port_authorities = inner
+        .port_authorities
         .read()
         .map(|slot| slot.clone())
         .unwrap_or_default();
-
+    let managed_port_snapshots = inner
+        .managed_port_snapshots
+        .read()
+        .map(|slot| slot.clone())
+        .unwrap_or_default();
+    let observation_time = Instant::now();
+    let deadline = observation_time
+        .checked_add(crate::process::ports::DEFAULT_MEMBERSHIP_MAX_AGE)
+        .unwrap_or(observation_time);
+    let port_authorities = host_verified_port_authorities_at(
+        &raw_port_authorities,
+        &runtime_state,
+        &managed_port_snapshots,
+        now_epoch_ms,
+        observation_time,
+        deadline,
+    );
     for project in app_state.projects() {
         for folder in &project.folders {
             for command in &folder.commands {
@@ -5185,16 +5718,90 @@ fn host_can_forward_port(inner: &Arc<RemoteHostInner>, requested_port: u16) -> b
                 let Some(session) = runtime_state.sessions.get(&command.id) else {
                     continue;
                 };
-                let Some(status) = port_statuses.get(&requested_port) else {
+                let Some(authority) = port_authorities.get(&requested_port) else {
                     continue;
                 };
-                if session.status.is_live() && status.in_use && runtime_owns_port(session, status) {
+                if session.status.is_live()
+                    && remote_authority_allows_forward_with_live_at(
+                        authority,
+                        requested_port,
+                        session,
+                        now_epoch_ms,
+                        managed_port_snapshots
+                            .get(&requested_port)
+                            .map(|capability| capability.as_ref()),
+                        observation_time,
+                        deadline,
+                    )
+                {
                     return true;
                 }
             }
         }
     }
     false
+}
+
+#[cfg(test)]
+fn remote_authority_allows_forward(
+    authority: &RemotePortAuthority,
+    requested_port: u16,
+    session: &SessionRuntimeState,
+    now_epoch_ms: u64,
+) -> bool {
+    remote_authority_allows_forward_with_live(
+        authority,
+        requested_port,
+        session,
+        now_epoch_ms,
+        None,
+    )
+}
+
+#[cfg(test)]
+fn remote_authority_allows_forward_with_live(
+    authority: &RemotePortAuthority,
+    requested_port: u16,
+    session: &SessionRuntimeState,
+    now_epoch_ms: u64,
+    live: Option<&ManagedResourceCapability>,
+) -> bool {
+    let observation_time = Instant::now();
+    let deadline = observation_time
+        .checked_add(crate::process::ports::DEFAULT_MEMBERSHIP_MAX_AGE)
+        .unwrap_or(observation_time);
+    remote_authority_allows_forward_with_live_at(
+        authority,
+        requested_port,
+        session,
+        now_epoch_ms,
+        live,
+        observation_time,
+        deadline,
+    )
+}
+
+fn remote_authority_allows_forward_with_live_at(
+    authority: &RemotePortAuthority,
+    requested_port: u16,
+    session: &SessionRuntimeState,
+    now_epoch_ms: u64,
+    live: Option<&ManagedResourceCapability>,
+    observation_time: Instant,
+    deadline: Instant,
+) -> bool {
+    authority.kind() == RemotePortAuthorityKind::Managed
+        && authority.is_fresh_at(now_epoch_ms)
+        && live.is_some_and(|live| {
+            authority.has_exact_managed_fence_for(
+                requested_port,
+                session,
+                live,
+                now_epoch_ms,
+                observation_time,
+                deadline,
+            )
+        })
 }
 
 fn bump_host_config_revision(inner: &Arc<RemoteHostInner>) {
@@ -5554,18 +6161,6 @@ pub(crate) fn current_controller_allows(inner: &Arc<RemoteHostInner>, client_id:
         .ok()
         .and_then(|controller| controller.clone())
         .is_some_and(|controller| controller == client_id)
-}
-
-fn runtime_owns_port(session: &SessionRuntimeState, status: &PortStatus) -> bool {
-    let Some(pid) = status.pid else {
-        return false;
-    };
-
-    if session.pid == Some(pid) {
-        return true;
-    }
-
-    session.resources.process_ids.contains(&pid)
 }
 
 pub(crate) fn requires_control(action: &RemoteAction) -> bool {
@@ -5969,6 +6564,28 @@ fn base_snapshot_without_session_views(
         .read()
         .map(|slot| slot.clone())
         .unwrap_or_default();
+    let raw_port_authorities = inner
+        .port_authorities
+        .read()
+        .map(|slot| slot.clone())
+        .unwrap_or_default();
+    let managed_port_snapshots = inner
+        .managed_port_snapshots
+        .read()
+        .map(|slot| slot.clone())
+        .unwrap_or_default();
+    let observation_time = Instant::now();
+    let deadline = observation_time
+        .checked_add(crate::process::ports::DEFAULT_MEMBERSHIP_MAX_AGE)
+        .unwrap_or(observation_time);
+    let port_authorities = host_verified_port_authorities_at(
+        &raw_port_authorities,
+        &runtime_state,
+        &managed_port_snapshots,
+        now_epoch_ms(),
+        observation_time,
+        deadline,
+    );
     let config = inner
         .config
         .read()
@@ -5985,6 +6602,7 @@ fn base_snapshot_without_session_views(
         runtime_state,
         session_views: HashMap::new(),
         port_statuses,
+        port_authorities,
         you_have_control: controller_client_id.as_deref() == Some(client_id),
         controller_client_id,
         server_id: config.server_id,
@@ -5992,6 +6610,21 @@ fn base_snapshot_without_session_views(
 }
 
 pub(crate) fn light_snapshot(
+    inner: &Arc<RemoteHostInner>,
+    client_id: &str,
+) -> RemoteWorkspaceSnapshot {
+    let _snapshot_guard = inner
+        .snapshot_state_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    base_snapshot_without_session_views(inner, client_id)
+}
+
+/// Capture a light snapshot when the caller already owns the snapshot-state
+/// lock. Keeping this seam explicit prevents a reentrant mutex acquisition in
+/// the browser replay capture path while preserving one coherent authority
+/// read for normal callers.
+pub(crate) fn light_snapshot_locked(
     inner: &Arc<RemoteHostInner>,
     client_id: &str,
 ) -> RemoteWorkspaceSnapshot {
@@ -6003,6 +6636,10 @@ pub(crate) fn current_snapshot(
     inner: &Arc<RemoteHostInner>,
     client_id: &str,
 ) -> RemoteWorkspaceSnapshot {
+    let _snapshot_guard = inner
+        .snapshot_state_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut snapshot = base_snapshot_without_session_views(inner, client_id);
     let subscribed_session_ids = session_ids_for_open_tabs(&snapshot.app_state);
     snapshot.session_views = inner
@@ -6038,6 +6675,9 @@ fn apply_workspace_delta(snapshot: &mut RemoteWorkspaceSnapshot, delta: RemoteWo
     }
     if let Some(port_statuses) = delta.port_statuses {
         snapshot.port_statuses = port_statuses;
+    }
+    if let Some(port_authorities) = delta.port_authorities {
+        snapshot.port_authorities = port_authorities;
     }
     snapshot.controller_client_id = delta.controller_client_id;
     snapshot.you_have_control = delta.you_have_control;
@@ -6134,11 +6774,19 @@ mod tests {
         KnownRemoteHost, LocalPortForwardManager, PairedRemoteClient, PairedWebClient,
         PendingRemoteRequest, RemoteAccessActivityEvent, RemoteAccessActivityKind,
         RemoteAccessSource, RemoteAction, RemoteClientHandle, RemoteClientInner, RemoteHostConfig,
-        RemoteHostService, RemoteHostWorkLimiter, RemoteLatencyStats, RemoteMachineState,
-        RemoteSessionBootstrap, RemoteSessionStreamEvent, RemoteTerminalInput,
-        RemoteWorkspaceDelta, RemoteWorkspaceSnapshot, ServerMessage, MAX_PENDING_REMOTE_REQUESTS,
+        RemoteHostService, RemoteHostWorkLimiter, RemoteLatencyStats, RemoteListenerIdentity,
+        RemoteMachineState, RemotePortAuthority, RemotePortAuthorityKind, RemoteSessionBootstrap,
+        RemoteSessionStreamEvent, RemoteTerminalInput, RemoteWorkspaceDelta,
+        RemoteWorkspaceSnapshot, ServerMessage, MAX_PENDING_REMOTE_REQUESTS,
+        REMOTE_PORT_AUTHORITY_MAX_AGE_MS,
     };
+    use crate::domain::operation::ResourceFence;
     use crate::models::{PortStatus, SessionTab, TabType};
+    use crate::process::identity::{ManagedProcessId, ManagedProcessIdentity, ProcessOwner};
+    use crate::process::ports::{
+        test_capability_from_snapshot, ManagedResourceSnapshot, RegistryMembershipSnapshot,
+    };
+    use crate::process::registry::ManagedProcessState;
     use crate::remote::presentation::{
         JournalLimits, SemanticAdapterHealth, SemanticAttention, SemanticEventDraft,
         SemanticEventKind, SemanticJournalStore, SemanticRetention, SemanticSource,
@@ -6159,7 +6807,6 @@ mod tests {
     };
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
     use std::collections::{HashMap, HashSet};
-    use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -7554,6 +8201,7 @@ mod tests {
                 ("keep".to_string(), session_view("keep")),
             ]),
             port_statuses: HashMap::new(),
+            port_authorities: HashMap::new(),
             controller_client_id: None,
             you_have_control: false,
             server_id: "host-1".to_string(),
@@ -8756,7 +9404,7 @@ mod tests {
         next_runtime.active_session_id = Some("server-session".to_string());
 
         let before_revision = service.inner.snapshot_revision.load(Ordering::Relaxed);
-        service.update_snapshot_parts(None, Some(next_runtime.clone()), None);
+        service.update_snapshot_parts(None, Some(next_runtime.clone()), None, None);
 
         let stored_app = service
             .inner
@@ -8787,11 +9435,444 @@ mod tests {
     }
 
     #[test]
+    fn remote_projection_preserves_managed_unready_health() {
+        let status = crate::process::ports::PortStatus {
+            port: 43123,
+            resource: ResourceFence::new(crate::domain::id::ResourceId::new(), 7),
+            kind: crate::process::ports::PortStatusKind::ManagedUnready,
+            listeners: Arc::from([]),
+            error: None,
+        };
+        let authority = RemotePortAuthority::from_rich(&status, now_epoch_ms());
+
+        assert_eq!(authority.kind(), RemotePortAuthorityKind::ManagedUnready);
+        assert_eq!(authority.resource, Some(status.resource));
+    }
+
+    #[test]
+    fn remote_probe_error_is_typed_and_does_not_export_raw_detail() {
+        let status = crate::process::ports::PortStatus {
+            port: 43124,
+            resource: ResourceFence::new(crate::domain::id::ResourceId::new(), 7),
+            kind: crate::process::ports::PortStatusKind::ProbeError,
+            listeners: Arc::from([]),
+            error: Some("C:\\private\\listener-table.txt".to_string()),
+        };
+        let authority = RemotePortAuthority::from_rich(&status, now_epoch_ms());
+
+        assert_eq!(authority.kind(), RemotePortAuthorityKind::ProbeError);
+        assert_eq!(
+            authority.diagnostic,
+            Some(super::RemotePortDiagnostic::ProbeError)
+        );
+        assert_eq!(authority.error, None);
+        let wire = serde_json::to_string(&authority).expect("serialize remote authority");
+        assert!(wire.contains("probeError"));
+        assert!(!wire.contains("listener-table.txt"));
+    }
+
+    #[test]
+    fn remote_probe_error_preserves_source_observation_window() {
+        let status = crate::process::ports::PortStatus {
+            port: 43126,
+            resource: ResourceFence::new(crate::domain::id::ResourceId::new(), 7),
+            kind: crate::process::ports::PortStatusKind::ProbeError,
+            listeners: Arc::from([]),
+            error: Some("listener probe failed".to_string()),
+        };
+        let authority =
+            RemotePortAuthority::from_rich_with_source_metadata(&status, 20_000, 21_000);
+
+        assert_eq!(authority.observed_at_epoch_ms, 20_000);
+        assert_eq!(authority.freshness_deadline_epoch_ms, 21_000);
+        assert!(!authority.is_fresh_at(21_001));
+    }
+
+    #[test]
+    fn remote_rejects_proven_external_probe_diagnostic() {
+        let status = crate::process::ports::PortStatus {
+            port: 43127,
+            resource: ResourceFence::new(crate::domain::id::ResourceId::new(), 7),
+            kind: crate::process::ports::PortStatusKind::ProvenExternal,
+            listeners: Arc::from([]),
+            error: Some("listener probe failed".to_string()),
+        };
+        let authority = RemotePortAuthority::from_rich(&status, now_epoch_ms());
+
+        assert_eq!(authority.kind(), RemotePortAuthorityKind::Unknown);
+        assert_eq!(
+            authority.diagnostic,
+            Some(super::RemotePortDiagnostic::ProbeError)
+        );
+    }
+
+    #[test]
+    fn remote_starting_probe_detail_is_typed_and_does_not_export_raw_detail() {
+        let status = crate::process::ports::PortStatus {
+            port: 43125,
+            resource: ResourceFence::new(crate::domain::id::ResourceId::new(), 8),
+            kind: crate::process::ports::PortStatusKind::Starting,
+            listeners: Arc::from([]),
+            error: Some("C:\\private\\secret-startup-token.txt".to_string()),
+        };
+        let authority = RemotePortAuthority::from_rich(&status, now_epoch_ms());
+
+        assert_eq!(authority.kind(), RemotePortAuthorityKind::Unknown);
+        assert_eq!(
+            authority.diagnostic,
+            Some(super::RemotePortDiagnostic::ProbeError)
+        );
+        assert_eq!(authority.error, None);
+        let wire = serde_json::to_string(&authority).expect("serialize remote authority");
+        assert!(wire.contains("probeError"));
+        assert!(!wire.contains("secret-startup-token.txt"));
+    }
+
+    #[test]
+    fn legacy_pid_only_port_status_cannot_prove_remote_forward_authority() {
+        let mut session = SessionRuntimeState::new(
+            "remote-port-authority",
+            PathBuf::new(),
+            SessionDimensions::default(),
+            TerminalBackend::default(),
+        );
+        session.status = SessionStatus::Running;
+        session.pid = Some(4242);
+        let now = super::now_epoch_ms();
+        let authority = RemotePortAuthority {
+            port: 43123,
+            kind: RemotePortAuthorityKind::Unknown,
+            diagnostic: None,
+            resource: None,
+            listeners: Vec::new(),
+            session_id: None,
+            root: None,
+            membership_revision: 0,
+            observation_sequence: 0,
+            publication_sequence: 0,
+            observed_at_epoch_ms: now,
+            freshness_deadline_epoch_ms: now,
+            managed_fence_fingerprint: None,
+            verified: None,
+            error: Some("legacy PID-only status".to_string()),
+        };
+
+        assert!(!super::remote_authority_allows_forward(
+            &authority, 43123, &session, now
+        ));
+    }
+
+    #[test]
+    fn exact_remote_authority_fence_allows_forwarding() {
+        let mut session = SessionRuntimeState::new(
+            "remote-port-authority",
+            PathBuf::new(),
+            SessionDimensions::default(),
+            TerminalBackend::default(),
+        );
+        session.status = SessionStatus::Running;
+        session.pid = Some(4242);
+        let now = super::now_epoch_ms();
+        let authority = RemotePortAuthority {
+            port: 43123,
+            kind: RemotePortAuthorityKind::Managed,
+            diagnostic: None,
+            resource: Some(ResourceFence::new(crate::domain::id::ResourceId::new(), 7)),
+            listeners: vec![RemoteListenerIdentity {
+                pid: 4242,
+                creation_time_100ns: 42_420_000,
+                executable_proven: true,
+                executable_fingerprint: None,
+            }],
+            session_id: None,
+            root: None,
+            membership_revision: 9,
+            observation_sequence: 11,
+            publication_sequence: 13,
+            observed_at_epoch_ms: now,
+            freshness_deadline_epoch_ms: now + REMOTE_PORT_AUTHORITY_MAX_AGE_MS,
+            managed_fence_fingerprint: None,
+            verified: None,
+            error: None,
+        };
+
+        assert!(!super::remote_authority_allows_forward(
+            &authority, 43123, &session, now
+        ));
+        assert!(!super::remote_authority_allows_forward(
+            &authority, 43124, &session, now
+        ));
+    }
+
+    #[test]
+    fn exact_remote_authority_requires_the_injected_live_registry_fence() {
+        let mut session = SessionRuntimeState::new(
+            "remote-port-authority",
+            PathBuf::new(),
+            SessionDimensions::default(),
+            TerminalBackend::default(),
+        );
+        session.status = SessionStatus::Running;
+        session.pid = Some(4242);
+        session.server_launch = Some(crate::state::ServerLaunchSpec {
+            command_id: "server-command".to_string(),
+            project_id: "server-project".to_string(),
+            port: Some(43123),
+            cwd: PathBuf::new(),
+            program: "test-server".to_string(),
+            args: Vec::new(),
+            env: HashMap::new(),
+            auto_restart: false,
+            log_file_path: None,
+        });
+        let executable = std::env::current_exe().expect("test executable");
+        let root = ManagedProcessIdentity::new(
+            ManagedProcessId::new(4242, 42_420_000).unwrap(),
+            executable,
+        )
+        .unwrap();
+        let resource = ResourceFence::new(crate::domain::id::ResourceId::new(), 7);
+        let live = Arc::new(test_capability_from_snapshot(ManagedResourceSnapshot::new(
+            crate::process::registry::ManagedProcessFence::new(
+                resource,
+                ProcessOwner::Host,
+                root.clone(),
+            ),
+            ManagedProcessState::Running,
+            vec![root],
+            RegistryMembershipSnapshot::valid(9, 11, Instant::now(), Duration::from_secs(5)),
+        )));
+        let now = super::now_epoch_ms();
+        let authority = RemotePortAuthority {
+            port: 43123,
+            kind: RemotePortAuthorityKind::Managed,
+            diagnostic: None,
+            resource: Some(resource),
+            listeners: vec![RemoteListenerIdentity {
+                pid: 4242,
+                creation_time_100ns: 42_420_000,
+                executable_proven: true,
+                executable_fingerprint: None,
+            }],
+            session_id: Some(session.session_id.clone()),
+            root: Some(RemoteListenerIdentity {
+                pid: 4242,
+                creation_time_100ns: 42_420_000,
+                executable_proven: true,
+                executable_fingerprint: None,
+            }),
+            membership_revision: 9,
+            observation_sequence: 11,
+            publication_sequence: 13,
+            observed_at_epoch_ms: now,
+            freshness_deadline_epoch_ms: now + REMOTE_PORT_AUTHORITY_MAX_AGE_MS,
+            managed_fence_fingerprint: Some(live.snapshot().authority_fingerprint()),
+            verified: None,
+            error: None,
+        }
+        .with_managed_capability(live.as_ref());
+
+        let mut runtime = RuntimeState::default();
+        runtime
+            .sessions
+            .insert("server-command".to_string(), session.clone());
+        let observation_time = Instant::now();
+        let projected = super::host_verified_port_authorities_at(
+            &HashMap::from([(43123, authority.clone())]),
+            &runtime,
+            &HashMap::from([(43123, live.clone())]),
+            now,
+            observation_time,
+            observation_time + Duration::from_secs(5),
+        );
+        assert!(
+            projected
+                .get(&43123)
+                .is_some_and(RemotePortAuthority::is_host_verified),
+            "only the host correlation seam may mint the authority marker"
+        );
+        let mut forged_projected = projected.get(&43123).expect("projected authority").clone();
+        forged_projected.port = 43124;
+        assert!(
+            !forged_projected.is_host_verified(),
+            "mutating a verified projection must invalidate its private proof"
+        );
+        let wire_round_trip: RemotePortAuthority = serde_json::from_slice(
+            &serde_json::to_vec(projected.get(&43123).expect("projected authority"))
+                .expect("serialize projected authority"),
+        )
+        .expect("deserialize projected authority");
+        assert!(!wire_round_trip.is_host_verified());
+
+        assert!(super::remote_authority_allows_forward_with_live(
+            &authority,
+            43123,
+            &session,
+            now,
+            Some(live.as_ref()),
+        ));
+        let mut unready = authority.clone();
+        unready.kind = RemotePortAuthorityKind::ManagedUnready;
+        assert!(
+            !super::remote_authority_allows_forward_with_live(
+                &unready,
+                43123,
+                &session,
+                now,
+                Some(live.as_ref()),
+            ),
+            "managed-unready authority may describe health but cannot authorize forwarding"
+        );
+        let mut missing_session = authority.clone();
+        missing_session.session_id = None;
+        assert!(!super::remote_authority_allows_forward_with_live(
+            &missing_session,
+            43123,
+            &session,
+            now,
+            Some(live.as_ref()),
+        ));
+        let mut forged_session = authority.clone();
+        forged_session.session_id = Some("forged-session-id".to_string());
+        assert!(!super::remote_authority_allows_forward_with_live(
+            &forged_session,
+            43123,
+            &session,
+            now,
+            Some(live.as_ref()),
+        ));
+        let mut wrong_root = authority.clone();
+        wrong_root.root.as_mut().expect("root identity").pid += 1;
+        assert!(!super::remote_authority_allows_forward_with_live(
+            &wrong_root,
+            43123,
+            &session,
+            now,
+            Some(live.as_ref()),
+        ));
+        let mut shape_only = authority.clone();
+        shape_only.managed_fence_fingerprint =
+            Some(live.snapshot().authority_fingerprint().wrapping_add(1));
+        assert!(!super::remote_authority_allows_forward_with_live(
+            &shape_only,
+            43123,
+            &session,
+            now,
+            Some(live.as_ref()),
+        ));
+        let mut errored = authority.clone();
+        errored.error = Some("membership probe failed".to_string());
+        assert!(!super::remote_authority_allows_forward_with_live(
+            &errored,
+            43123,
+            &session,
+            now,
+            Some(live.as_ref()),
+        ));
+        let mut forged_listener_executable = authority.clone();
+        forged_listener_executable.listeners[0].executable_fingerprint = Some(
+            forged_listener_executable.listeners[0]
+                .executable_fingerprint
+                .expect("listener executable fingerprint")
+                .wrapping_add(1),
+        );
+        assert!(!super::remote_authority_allows_forward_with_live(
+            &forged_listener_executable,
+            43123,
+            &session,
+            now,
+            Some(live.as_ref()),
+        ));
+        let mut forged_member = authority.clone();
+        forged_member.listeners[0].pid += 1;
+        assert!(!super::remote_authority_allows_forward_with_live(
+            &forged_member,
+            43123,
+            &session,
+            now,
+            Some(live.as_ref()),
+        ));
+        let mut wrong_session_port = session.clone();
+        wrong_session_port
+            .server_launch
+            .as_mut()
+            .expect("server launch")
+            .port = Some(43124);
+        assert!(!super::remote_authority_allows_forward_with_live(
+            &authority,
+            43123,
+            &wrong_session_port,
+            now,
+            Some(live.as_ref()),
+        ));
+        let observation_time = Instant::now();
+        assert!(!authority.has_exact_managed_fence_for(
+            43123,
+            &session,
+            &live,
+            now,
+            observation_time,
+            observation_time - Duration::from_millis(1),
+        ));
+    }
+
+    #[test]
+    fn stale_or_pid_only_remote_authority_cannot_forward() {
+        let mut session = SessionRuntimeState::new(
+            "remote-port-authority",
+            PathBuf::new(),
+            SessionDimensions::default(),
+            TerminalBackend::default(),
+        );
+        session.status = SessionStatus::Running;
+        session.pid = Some(4242);
+        let now = super::now_epoch_ms();
+        let mut authority = RemotePortAuthority {
+            port: 43123,
+            kind: RemotePortAuthorityKind::Managed,
+            diagnostic: None,
+            resource: Some(ResourceFence::new(crate::domain::id::ResourceId::new(), 7)),
+            listeners: vec![RemoteListenerIdentity {
+                pid: 4242,
+                creation_time_100ns: 42_420_000,
+                executable_proven: true,
+                executable_fingerprint: None,
+            }],
+            session_id: None,
+            root: None,
+            membership_revision: 9,
+            observation_sequence: 11,
+            publication_sequence: 13,
+            observed_at_epoch_ms: now.saturating_sub(REMOTE_PORT_AUTHORITY_MAX_AGE_MS + 1),
+            freshness_deadline_epoch_ms: now.saturating_sub(1),
+            managed_fence_fingerprint: None,
+            verified: None,
+            error: None,
+        };
+        assert!(!super::remote_authority_allows_forward(
+            &authority, 43123, &session, now
+        ));
+
+        authority.observed_at_epoch_ms = now;
+        authority.freshness_deadline_epoch_ms = now + REMOTE_PORT_AUTHORITY_MAX_AGE_MS;
+        authority.listeners[0].executable_proven = false;
+        assert!(!super::remote_authority_allows_forward(
+            &authority, 43123, &session, now
+        ));
+
+        authority.listeners[0].executable_proven = true;
+        authority.resource = Some(ResourceFence::new(crate::domain::id::ResourceId::new(), 0));
+        assert!(!super::remote_authority_allows_forward(
+            &authority, 43123, &session, now
+        ));
+    }
+
+    #[test]
     fn update_snapshot_parts_ignores_empty_updates() {
         let service = RemoteHostService::new(RemoteHostConfig::default());
         let before_revision = service.inner.snapshot_revision.load(Ordering::Relaxed);
 
-        service.update_snapshot_parts(None, None, None);
+        service.update_snapshot_parts(None, None, None, None);
 
         assert_eq!(
             service.inner.snapshot_revision.load(Ordering::Relaxed),
@@ -9252,24 +10333,6 @@ mod tests {
             .local_addr()
             .expect("upstream address should be available")
             .port();
-        let (payload_tx, payload_rx) = mpsc::channel();
-        let (closed_tx, closed_rx) = mpsc::channel();
-        let upstream_thread = thread::spawn(move || {
-            let (mut socket, _) = upstream.accept().expect("upstream should accept tunnel");
-            socket
-                .set_read_timeout(Some(Duration::from_secs(3)))
-                .expect("upstream read timeout should apply");
-            let mut payload = [0_u8; 4];
-            socket
-                .read_exact(&mut payload)
-                .expect("upstream should receive tunneled payload");
-            payload_tx
-                .send(payload)
-                .expect("payload signal should send");
-            let mut byte = [0_u8; 1];
-            let closed = matches!(socket.read(&mut byte), Ok(0));
-            closed_tx.send(closed).expect("closed signal should send");
-        });
 
         let mut config = RemoteHostConfig {
             enabled: true,
@@ -9323,55 +10386,22 @@ mod tests {
             },
         )
         .expect("port-forward hello should write");
-        assert!(matches!(
-            read_message::<ServerMessage, _>(&mut stream).expect("host should answer hello"),
-            ServerMessage::PortForwardOk
-        ));
-        stream
-            .write_all(b"ping")
-            .expect("active tunnel should accept payload");
-        assert_eq!(
-            payload_rx
-                .recv_timeout(Duration::from_secs(2))
-                .expect("upstream did not receive tunneled payload"),
-            *b"ping"
-        );
-
-        assert!(service.revoke_paired_client("active-client"));
-        assert!(
-            closed_rx
-                .recv_timeout(Duration::from_secs(1))
-                .expect("active tunnel did not close after revocation"),
-            "upstream did not observe EOF after client revocation"
-        );
-        upstream_thread.join().expect("upstream thread should exit");
+        match read_message::<ServerMessage, _>(&mut stream).expect("host should answer hello") {
+            ServerMessage::HelloErr { message } => {
+                assert!(
+                    message.contains("not a live DevManager server port"),
+                    "{message}"
+                );
+            }
+            other => panic!("legacy PID-only status unexpectedly opened a port forward: {other:?}"),
+        }
+        drop(upstream);
     }
 
     #[test]
     fn port_forward_tunnels_bytes_to_a_live_managed_server_port() {
         let host_port = reserve_free_tcp_port();
         let server_port = reserve_free_tcp_port();
-        let server_ready = Arc::new(AtomicBool::new(false));
-        let server_ready_signal = server_ready.clone();
-        thread::spawn(move || {
-            let listener =
-                TcpListener::bind(("127.0.0.1", server_port)).expect("echo server should bind");
-            server_ready_signal.store(true, Ordering::SeqCst);
-            let (mut socket, _) = listener.accept().expect("echo server should accept");
-            let mut buf = [0_u8; 4];
-            socket
-                .read_exact(&mut buf)
-                .expect("echo server should read ping");
-            assert_eq!(&buf, b"ping");
-            socket
-                .write_all(b"pong")
-                .expect("echo server should write pong");
-        });
-        wait_for(
-            || server_ready.load(Ordering::Relaxed),
-            Duration::from_secs(3),
-            "echo server never started",
-        );
 
         let mut config = RemoteHostConfig {
             enabled: true,
@@ -9410,18 +10440,14 @@ mod tests {
         )
         .expect("remote client should connect");
 
-        let mut forwarded = client
+        let error = client
             .client
             .open_port_forward(server_port)
-            .expect("port forward should open");
-        forwarded
-            .write_all(b"ping")
-            .expect("forwarded stream should write");
-        let mut buf = [0_u8; 4];
-        forwarded
-            .read_exact(&mut buf)
-            .expect("forwarded stream should read");
-        assert_eq!(&buf, b"pong");
+            .expect_err("legacy PID-only status must not authorize a port forward");
+        assert!(
+            error.contains("not a live DevManager server port"),
+            "{error}"
+        );
 
         client.client.disconnect();
         config.enabled = false;
@@ -9432,37 +10458,6 @@ mod tests {
     fn dropping_root_service_stops_an_active_native_port_forward() {
         let host_port = reserve_free_tcp_port();
         let server_port = reserve_free_tcp_port();
-        let server_ready = Arc::new(AtomicBool::new(false));
-        let server_ready_signal = server_ready.clone();
-        let server_thread = thread::spawn(move || {
-            let listener =
-                TcpListener::bind(("127.0.0.1", server_port)).expect("server should bind");
-            server_ready_signal.store(true, Ordering::SeqCst);
-            let (mut socket, _) = listener.accept().expect("server should accept forward");
-            socket
-                .set_read_timeout(Some(Duration::from_millis(40)))
-                .expect("server read timeout");
-            let mut buffer = [0_u8; 64];
-            loop {
-                match socket.read(&mut buffer) {
-                    Ok(0) => return,
-                    Ok(_) => {}
-                    Err(error)
-                        if matches!(
-                            error.kind(),
-                            std::io::ErrorKind::WouldBlock
-                                | std::io::ErrorKind::TimedOut
-                                | std::io::ErrorKind::Interrupted
-                        ) => {}
-                    Err(_) => return,
-                }
-            }
-        });
-        wait_for(
-            || server_ready.load(Ordering::Relaxed),
-            Duration::from_secs(3),
-            "managed server never started",
-        );
 
         let config = RemoteHostConfig {
             enabled: true,
@@ -9498,10 +10493,14 @@ mod tests {
             None,
         )
         .expect("remote client should connect");
-        let forwarded = client
+        let error = client
             .client
             .open_port_forward(server_port)
-            .expect("port forward should open");
+            .expect_err("legacy PID-only status must not authorize a port forward");
+        assert!(
+            error.contains("not a live DevManager server port"),
+            "{error}"
+        );
         let inner = Arc::downgrade(&root.inner);
 
         drop(root);
@@ -9511,9 +10510,7 @@ mod tests {
             Duration::from_secs(2),
             "active native port forward retained the stopped host runtime",
         );
-        drop(forwarded);
         client.client.disconnect();
-        server_thread.join().expect("managed server thread");
     }
 
     #[test]

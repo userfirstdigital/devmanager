@@ -34,6 +34,7 @@ use crate::process::sampler::{
 use crate::process::teardown::{TeardownCompletionStore, MAX_MANAGED_TERMINAL_PORTS};
 use crate::remote::presentation::{SemanticAdapterHealth, SemanticEventDraft, StableSessionKey};
 use crate::remote::{ClaudeSemanticIdentity, CodexSemanticIdentity, RemoteActionResult};
+use crate::services::ports_service::{PortInventory, PortStartReservation};
 use crate::services::process_ops::{
     next_op_id, ProcessOp, ProcessOpCompletion, ProcessOpContext, ProcessOpKind, ProcessOpQueue,
     MAX_PROCESS_OP_BATCH_ITEMS,
@@ -217,6 +218,9 @@ impl Clone for ProcessManager {
 impl Drop for ProcessManager {
     fn drop(&mut self) {
         if self.shutdown_vote && self.handle_lifecycle.release() {
+            // Fence queued and in-flight port refresh callbacks before
+            // shutting down workers and closing managed server sessions.
+            bump_server_lifecycle_generation(&self.inner);
             shutdown_process_manager_workers(&self.inner);
         }
     }
@@ -293,9 +297,17 @@ pub(crate) struct ProcessManagerInner {
     browser_attachment_broker: BrowserAttachmentBroker,
     runtime_state: Arc<RwLock<RuntimeState>>,
     runtime_revision: AtomicU64,
+    /// Monotonic admission epoch for every queued server lifecycle operation.
+    /// Port refresh fences read this value instead of trying to enumerate
+    /// operation paths or sessions.
+    server_lifecycle_generation: AtomicU64,
     observed_runtime_generations: Mutex<HashMap<String, u64>>,
     settings: RwLock<Settings>,
     terminal_backend: TerminalBackend,
+    /// One coordinator owns every managed server start admission. UI,
+    /// restore, remote, and auto-restart paths all share this inventory so a
+    /// reservation cannot be released when an operation is merely queued.
+    port_inventory: PortInventory,
     debug_enabled: bool,
     restart_backoffs: Mutex<HashMap<String, RestartBackoff>>,
     notification_sound: RwLock<Option<String>>,
@@ -581,9 +593,11 @@ impl ProcessManager {
             browser_attachment_broker: BrowserAttachmentBroker::default(),
             runtime_state: Arc::new(RwLock::new(RuntimeState::new(debug_enabled))),
             runtime_revision: AtomicU64::new(1),
+            server_lifecycle_generation: AtomicU64::new(0),
             observed_runtime_generations: Mutex::new(HashMap::new()),
             settings: RwLock::new(Settings::default()),
             terminal_backend: TerminalBackend::PortablePtyFeedingAlacritty,
+            port_inventory: PortInventory::new(),
             debug_enabled,
             restart_backoffs: Mutex::new(HashMap::new()),
             notification_sound: RwLock::new(None),
@@ -799,6 +813,14 @@ impl ProcessManager {
             ProcessOwner::Task(task_id),
             ports.to_vec(),
         )
+    }
+
+    pub fn port_inventory(&self) -> PortInventory {
+        self.inner.port_inventory.clone()
+    }
+
+    pub fn submit_process_op(&self, op: ProcessOp) -> Result<u64, String> {
+        self.op_queue.submit(op)
     }
 
     fn schedule_start_server(
@@ -1122,6 +1144,7 @@ impl ProcessManager {
         let launch_spec = ServerLaunchSpec {
             command_id: command_id.clone(),
             project_id: project_id.clone(),
+            port: lookup.command.port,
             cwd: cwd.clone(),
             program: program.clone(),
             args: args.clone(),
@@ -1186,6 +1209,7 @@ impl ProcessManager {
         let launch_spec = ServerLaunchSpec {
             command_id: command_id.clone(),
             project_id: project_id.clone(),
+            port: lookup.command.port,
             cwd: cwd.clone(),
             program: program.clone(),
             args: args.clone(),
@@ -1362,6 +1386,12 @@ impl ProcessManager {
 
     pub fn runtime_revision(&self) -> u64 {
         self.inner.runtime_revision.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn server_lifecycle_generation(&self) -> u64 {
+        self.inner
+            .server_lifecycle_generation
+            .load(Ordering::Acquire)
     }
 
     pub fn register_runtime_session(&self, session: SessionRuntimeState) {
@@ -3387,6 +3417,23 @@ impl ProcessManager {
     }
 
     fn request_session_close(&self, session_id: &str, closed_by_user: bool) -> Result<(), String> {
+        let closes_server = self
+            .inner
+            .runtime_state
+            .read()
+            .ok()
+            .and_then(|runtime| {
+                runtime
+                    .sessions
+                    .get(session_id)
+                    .map(|session| session.session_kind)
+            })
+            .is_some_and(|kind| matches!(kind, SessionKind::Server));
+        if closes_server {
+            // Direct teardown is also a lifecycle fence for refresh callbacks
+            // that did not pass through the process-op queue.
+            bump_server_lifecycle_generation(&self.inner);
+        }
         match close_exact_session_owner(&self.inner, session_id, closed_by_user) {
             Ok(true) => {
                 // The exact Job/registry release and actor joins completed,
@@ -6873,6 +6920,12 @@ fn bump_runtime_revision(inner: &ProcessManagerInner) {
     inner.runtime_revision.fetch_add(1, Ordering::Relaxed);
 }
 
+pub(crate) fn bump_server_lifecycle_generation(inner: &ProcessManagerInner) {
+    inner
+        .server_lifecycle_generation
+        .fetch_add(1, Ordering::AcqRel);
+}
+
 fn current_runtime_generation(inner: &ProcessManagerInner, session_id: &str) -> Option<u64> {
     inner.runtime_state.read().ok().and_then(|runtime| {
         runtime
@@ -7411,7 +7464,7 @@ pub(crate) fn execute_process_op_inner(
             if activate {
                 manager.set_active_session(launch.command_id.clone());
             }
-            let result = {
+            let result = run_server_launch_with_port_admission(inner, &manager, &launch, || {
                 #[cfg(test)]
                 {
                     let spawner = inner
@@ -7429,7 +7482,7 @@ pub(crate) fn execute_process_op_inner(
                 {
                     spawn_server_session_with_inner(inner, &launch, dimensions)
                 }
-            }
+            })
             .map_err(|error| {
                 manager.update_session_state(&launch.command_id, |state| {
                     state.status = SessionStatus::Failed;
@@ -7511,18 +7564,21 @@ pub(crate) fn execute_process_op_inner(
                 // A restart always creates a fresh terminal process owner.
                 // The old session has already reached ACTIVE_PROCESS_ZERO,
                 // joined its actors, released its exact registry fence, and
-                // dropped before this new authority is minted.
-                spawn_server_session_with_inner(inner, &launch, dimensions)?;
-                if let Some(retained_output) = retained_output.filter(|text| !text.is_empty()) {
-                    manager.write_virtual_text(&command_id, &retained_output)?;
-                    manager.write_virtual_text(&command_id, "\r\n")?;
-                }
-                let _ = manager
-                    .write_virtual_text(&command_id, &format!("\x1b[33m{banner}\x1b[0m\r\n"));
-                manager.update_session_state(&command_id, |state| {
-                    state.configure_server(launch.clone());
-                });
-                Ok(())
+                // dropped before this new authority is minted. Keep the port
+                // reservation through that exact launch boundary.
+                run_server_launch_with_port_admission(inner, &manager, &launch, || {
+                    spawn_server_session_with_inner(inner, &launch, dimensions)?;
+                    if let Some(retained_output) = retained_output.filter(|text| !text.is_empty()) {
+                        manager.write_virtual_text(&command_id, &retained_output)?;
+                        manager.write_virtual_text(&command_id, "\r\n")?;
+                    }
+                    let _ = manager
+                        .write_virtual_text(&command_id, &format!("\x1b[33m{banner}\x1b[0m\r\n"));
+                    manager.update_session_state(&command_id, |state| {
+                        state.configure_server(launch.clone());
+                    });
+                    Ok(())
+                })
             })();
             (
                 ProcessOpKind::RestartServer,
@@ -7825,6 +7881,257 @@ pub(crate) fn execute_process_op_inner(
         context,
         remote_response,
     }
+}
+
+/// Keep the port reservation alive around the actual worker-side spawn or
+/// restart call. A reservation acquired by a UI callback is not sufficient:
+/// queueing only transfers intent, while this seam owns admission until the
+/// operation has returned success or failure.
+fn run_server_launch_with_port_admission<T>(
+    inner: &Arc<ProcessManagerInner>,
+    manager: &ProcessManager,
+    launch: &ServerLaunchSpec,
+    operation: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let Some(port) = launch.port else {
+        return operation();
+    };
+
+    let snapshot = inner
+        .port_inventory
+        .refresh(&[port])
+        .map_err(|error| format!("could not establish whether port {port} is free: {error}"))?;
+    let reservation = inner
+        .port_inventory
+        .reserve_start(&snapshot, port)
+        .map_err(|error| error.to_string())?;
+    let launch_result = crate::process::ports::launch_if_port_free_with_revalidation(
+        &snapshot,
+        port,
+        || {
+            if !reservation.is_active() {
+                Err(crate::process::ports::PortStartError::ReservationConflict { port })
+            } else {
+                let second = inner.port_inventory.refresh(&[port]).map_err(|error| {
+                    crate::process::ports::PortStartError::ProbeFailed {
+                        port,
+                        detail: error.to_string(),
+                    }
+                })?;
+                crate::process::ports::ensure_managed_start_allowed(&second, port)
+            }
+        },
+        operation,
+    )
+    .map_err(|error| error.to_string())?;
+
+    let value = launch_result?;
+    settle_server_port_start(inner, manager, launch, reservation)?;
+    Ok(value)
+}
+
+const PORT_BIND_SETTLEMENT_TIMEOUT: Duration = Duration::from_millis(250);
+const PORT_BIND_SETTLEMENT_POLL: Duration = Duration::from_millis(25);
+
+/// A logical reservation cannot make an arbitrary child bind atomic. Keep the
+/// reservation through the real spawn and a bounded post-launch reconciliation.
+/// A proven foreign listener is reported as EADDRINUSE-like failure; no
+/// unverified or foreign PID is ever terminated.
+fn settle_server_port_start(
+    inner: &Arc<ProcessManagerInner>,
+    manager: &ProcessManager,
+    launch: &ServerLaunchSpec,
+    reservation: PortStartReservation,
+) -> Result<(), String> {
+    let Some(port) = launch.port else {
+        drop(reservation);
+        return Ok(());
+    };
+    let deadline = Instant::now()
+        .checked_add(PORT_BIND_SETTLEMENT_TIMEOUT)
+        .unwrap_or_else(Instant::now);
+
+    loop {
+        let snapshot = match inner.port_inventory.refresh(&[port]) {
+            Ok(snapshot) => snapshot,
+            Err(_error) if Instant::now() < deadline => {
+                thread::sleep(PORT_BIND_SETTLEMENT_POLL);
+                continue;
+            }
+            Err(error) => {
+                let root_fence = launch_root_fence_description(inner, &launch.command_id);
+                let reaped =
+                    manager.stop_server_and_wait(&launch.command_id, Duration::from_secs(2));
+                drop(reservation);
+                return Err(if reaped {
+                    format!(
+                        "port {port} listener settlement probe failed; exact launch root {root_fence} was reaped (diagnostic {error})"
+                    )
+                } else {
+                    format!(
+                        "port {port} listener settlement probe failed; exact launch root {root_fence} reap_incomplete"
+                    )
+                });
+            }
+        };
+        let listeners = snapshot
+            .observation(port)
+            .map(|observation| observation.listeners())
+            .unwrap_or(&[]);
+        match classify_post_launch_listener_settlement(listeners, |listener| {
+            listener_matches_session(inner, &launch.command_id, listener)
+        }) {
+            PostLaunchListenerSettlement::Owned => {
+                drop(reservation);
+                return Ok(());
+            }
+            PostLaunchListenerSettlement::Foreign => {
+                // Stop only the exact launched session. The foreign listener
+                // itself is never selected by this operation.
+                let root_fence = launch_root_fence_description(inner, &launch.command_id);
+                let reaped =
+                    manager.stop_server_and_wait(&launch.command_id, Duration::from_secs(2));
+                drop(reservation);
+                return Err(if reaped {
+                    format!(
+                        "port {port} became occupied by a foreign listener during start (EADDRINUSE); no foreign process was terminated; exact launch root {root_fence} was reaped"
+                    )
+                } else {
+                    format!(
+                        "port {port} became occupied by a foreign listener during start (EADDRINUSE); no foreign process was terminated; exact launch root {root_fence} reap_incomplete"
+                    )
+                });
+            }
+            PostLaunchListenerSettlement::Unverified => {
+                // The listener identity is insufficient to decide whether
+                // the process owns the port. Reap only the exact launch
+                // session so an unrelated listener is never touched.
+                let root_fence = launch_root_fence_description(inner, &launch.command_id);
+                let reaped =
+                    manager.stop_server_and_wait(&launch.command_id, Duration::from_secs(2));
+                drop(reservation);
+                return Err(if reaped {
+                    format!(
+                        "port {port} listener ownership could not be proven after start; exact launch root {root_fence} was reaped"
+                    )
+                } else {
+                    format!(
+                        "port {port} listener ownership could not be proven after start; exact launch root {root_fence} reap_incomplete"
+                    )
+                });
+            }
+            PostLaunchListenerSettlement::Pending => {}
+        }
+        if Instant::now() >= deadline {
+            // A stock command may spawn successfully and bind later, but a
+            // successful operation must not hide an unsettled launch. Reap
+            // only the exact launch session and surface settlement failure.
+            let root_fence = launch_root_fence_description(inner, &launch.command_id);
+            let reaped = manager.stop_server_and_wait(&launch.command_id, Duration::from_secs(2));
+            drop(reservation);
+            return Err(if reaped {
+                format!(
+                    "port {port} listener settlement timed out; exact launch root {root_fence} was reaped"
+                )
+            } else {
+                format!(
+                    "port {port} listener settlement timed out; exact launch root {root_fence} reap_incomplete"
+                )
+            });
+        }
+        thread::sleep(PORT_BIND_SETTLEMENT_POLL);
+    }
+}
+
+fn launch_root_fence_description(inner: &Arc<ProcessManagerInner>, session_id: &str) -> String {
+    let Some(pid) = live_runtime_root_pid(inner, session_id) else {
+        return format!("session {session_id} root unavailable");
+    };
+    let creation = platform_service::capture_process_creation_time_100ns(pid)
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    format!("session {session_id}, pid {pid}, creation {creation}, canonical executable bound")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PostLaunchListenerSettlement {
+    /// No listener is visible yet; keep polling while the reservation remains
+    /// owned by the start operation.
+    Pending,
+    /// Every observed listener was proven to belong to the exact launched
+    /// session generation.
+    Owned,
+    /// At least one listener has complete identity evidence and is not owned
+    /// by the exact launched session. The caller may report EADDRINUSE, but it
+    /// must never terminate that foreign process.
+    Foreign,
+    /// A listener exists but its ownership cannot be proven. Fail closed and
+    /// stop only the exact launch session; no unrelated process is selected.
+    Unverified,
+}
+
+fn classify_post_launch_listener_settlement<F>(
+    listeners: &[crate::process::ports::ListenerIdentity],
+    mut owns: F,
+) -> PostLaunchListenerSettlement
+where
+    F: FnMut(&crate::process::ports::ListenerIdentity) -> bool,
+{
+    if listeners.is_empty() {
+        return PostLaunchListenerSettlement::Pending;
+    }
+    let ownership = listeners
+        .iter()
+        .map(|listener| (listener.has_executable_proof(), owns(listener)))
+        .collect::<Vec<_>>();
+    if ownership.iter().all(|(_, owned)| *owned) {
+        return PostLaunchListenerSettlement::Owned;
+    }
+    if ownership
+        .iter()
+        .any(|(executable_proven, owned)| *executable_proven && !*owned)
+    {
+        return PostLaunchListenerSettlement::Foreign;
+    }
+    PostLaunchListenerSettlement::Unverified
+}
+
+fn listener_matches_session(
+    inner: &Arc<ProcessManagerInner>,
+    session_id: &str,
+    listener: &crate::process::ports::ListenerIdentity,
+) -> bool {
+    if !listener.has_executable_proof() {
+        return false;
+    }
+    let Some(creation_time_100ns) =
+        platform_service::capture_process_creation_time_100ns(listener.pid())
+    else {
+        return false;
+    };
+    let Some(executable) = platform_service::capture_process_executable(listener.pid()) else {
+        return false;
+    };
+    let Ok(executable) = std::fs::canonicalize(executable) else {
+        return false;
+    };
+    let Some(listener_executable) = listener.canonical_executable() else {
+        return false;
+    };
+    if creation_time_100ns != listener.creation_time_100ns() || executable != listener_executable {
+        return false;
+    }
+    let tracked = session_managed_process_ids(inner, session_id);
+    if tracked.contains(&listener.pid()) {
+        return true;
+    }
+    live_runtime_root_pid(inner, session_id) == Some(listener.pid())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KillProcessOutcome {
+    Killed,
+    AlreadyGone,
 }
 
 fn close_managed_process_exact(
@@ -8273,6 +8580,38 @@ mod tests {
         let (program, _) = windows_shell_for(&crate::models::DefaultTerminal::Pwsh, false, None);
         assert_eq!(program, "powershell.exe");
     }
+
+    #[test]
+    fn post_launch_settlement_keeps_unverified_listener_fail_closed() {
+        let listener = crate::process::ports::ListenerIdentity::new(41_001, 41_001).unwrap();
+
+        assert_eq!(
+            classify_post_launch_listener_settlement(&[], |_| false),
+            PostLaunchListenerSettlement::Pending
+        );
+        assert_eq!(
+            classify_post_launch_listener_settlement(std::slice::from_ref(&listener), |_| false),
+            PostLaunchListenerSettlement::Unverified
+        );
+    }
+
+    #[test]
+    fn post_launch_settlement_reports_proven_foreign_race_without_authorizing_kill() {
+        let executable = std::env::current_exe().expect("test executable");
+        let listener =
+            crate::process::ports::ListenerIdentity::with_executable(41_002, 41_002, executable)
+                .expect("listener identity");
+
+        assert_eq!(
+            classify_post_launch_listener_settlement(std::slice::from_ref(&listener), |_| false),
+            PostLaunchListenerSettlement::Foreign
+        );
+        assert_eq!(
+            classify_post_launch_listener_settlement(std::slice::from_ref(&listener), |_| true),
+            PostLaunchListenerSettlement::Owned
+        );
+    }
+
     use crate::services::pid_file;
     use std::fs;
     use std::sync::Condvar;
@@ -8766,6 +9105,7 @@ mod tests {
         let launch = ServerLaunchSpec {
             command_id: command_id.to_string(),
             project_id: "project".to_string(),
+            port: None,
             cwd: std::env::current_dir().unwrap(),
             program: "definitely-not-a-devmanager-server".to_string(),
             args: Vec::new(),
@@ -8846,7 +9186,7 @@ mod tests {
     #[test]
     fn blank_server_launches_leave_tabs_runtime_and_process_queue_untouched() {
         let cwd = temp_test_dir("blank-server-launch-preflight");
-        for operation in ["start", "restart", "kill-port-restart"] {
+        for operation in ["start", "restart"] {
             let manager = ProcessManager::new();
             let mut state = app_state_with_server(&cwd, true);
             state.config.projects[0].folders[0].commands[0].command = " \t ".to_string();
@@ -8862,14 +9202,6 @@ mod tests {
                 "restart" => {
                     manager.restart_server(&mut state, "server-cmd", SessionDimensions::default())
                 }
-                "kill-port-restart" => manager.schedule_kill_port_and_restart(
-                    &mut state,
-                    "server-cmd",
-                    4312,
-                    SessionDimensions::default(),
-                    "must not schedule",
-                    None,
-                ),
                 _ => unreachable!(),
             };
 
@@ -12117,7 +12449,12 @@ mod tests {
             command: command_text,
             args,
             env: None,
-            port: Some(43123),
+            // These lifecycle fixtures exercise process/session ownership,
+            // not port settlement.  The test command is `ping`/`sleep` and
+            // deliberately does not bind a listener; declaring a port would
+            // make the strict post-launch admission path reap it as an
+            // unsettled launch before the lifecycle assertions run.
+            port: None,
             auto_restart: Some(false),
             clear_logs_on_restart: Some(clear_logs_on_restart),
         };
@@ -12186,6 +12523,54 @@ mod tests {
 
         manager.set_active_session("alpha");
         assert_eq!(manager.runtime_revision(), after_active);
+    }
+
+    #[test]
+    fn server_lifecycle_generation_advances_for_queued_server_operations() {
+        let manager = ProcessManager::new();
+        let before = manager.server_lifecycle_generation();
+
+        manager
+            .submit_process_op(ProcessOp::StopAll {
+                op_id: next_op_id(),
+                command_ids: Vec::new(),
+                wait: Duration::ZERO,
+                response: None,
+            })
+            .expect("queue StopAll");
+
+        assert!(manager.server_lifecycle_generation() > before);
+        stop_background_tasks_for_test(&manager);
+    }
+
+    #[test]
+    fn shutdown_queue_admission_invalidates_server_lifecycle_before_worker_runs() {
+        let manager = ProcessManager::new();
+        let before = manager.server_lifecycle_generation();
+
+        manager
+            .submit_process_op(ProcessOp::Shutdown {
+                op_id: next_op_id(),
+                timeout: Duration::ZERO,
+            })
+            .expect("queue Shutdown");
+
+        assert!(manager.server_lifecycle_generation() > before);
+        stop_background_tasks_for_test(&manager);
+    }
+
+    #[test]
+    fn direct_process_manager_drop_bumps_server_lifecycle_before_close() {
+        let manager = ProcessManager::new();
+        let inner = manager.inner.clone();
+        let before = manager.server_lifecycle_generation();
+
+        drop(manager);
+
+        assert!(
+            inner.server_lifecycle_generation.load(Ordering::Acquire) > before,
+            "direct ProcessManager drop must fence late lifecycle callbacks before close"
+        );
     }
 
     #[test]

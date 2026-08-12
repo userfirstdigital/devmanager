@@ -332,6 +332,11 @@ function projectLegacySnapshot(
   const portStatuses = Object.fromEntries(
     workspace.portStatuses.map((status) => [String(status.port), status]),
   );
+  const portAuthorities = workspace.portAuthorities
+    ? Object.fromEntries(
+        workspace.portAuthorities.map((authority) => [String(authority.port), authority]),
+      )
+    : undefined;
   return {
     appState: {
       config: {
@@ -357,6 +362,7 @@ function projectLegacySnapshot(
     },
     runtimeState: { sessions: runtimeSessions },
     portStatuses,
+    portAuthorities,
     controllerClientId: workspace.writerLease.ownerClientInstanceId,
     youHaveControl: workspace.writerLease.youAreOwner,
     serverId: workspace.serverId,

@@ -42,6 +42,7 @@ pub enum ServerIndicatorState {
     Unready,
     Ready,
     External,
+    Unknown,
     Stopping,
     Crashed,
     Exited,
@@ -1416,7 +1417,8 @@ fn server_status_label(state: ServerIndicatorState) -> &'static str {
         ServerIndicatorState::Stopped
         | ServerIndicatorState::Unready
         | ServerIndicatorState::Ready
-        | ServerIndicatorState::External => "",
+        | ServerIndicatorState::External
+        | ServerIndicatorState::Unknown => "",
         ServerIndicatorState::Stopping => "stopping",
         ServerIndicatorState::Crashed => "crashed",
         ServerIndicatorState::Exited => "exited",
@@ -1431,6 +1433,7 @@ fn server_status_indicator(state: ServerIndicatorState) -> Div {
             | ServerIndicatorState::Unready
             | ServerIndicatorState::Ready
             | ServerIndicatorState::External
+            | ServerIndicatorState::Unknown
     ) {
         div()
             .size(px(6.0))
@@ -1448,6 +1451,7 @@ fn server_status_color(state: ServerIndicatorState) -> u32 {
     match state {
         ServerIndicatorState::Ready => theme::SUCCESS_TEXT,
         ServerIndicatorState::External => theme::EXTERNAL_TEXT,
+        ServerIndicatorState::Unknown => theme::WARNING_TEXT,
         ServerIndicatorState::Unready | ServerIndicatorState::Stopping => theme::WARNING_TEXT,
         ServerIndicatorState::Crashed | ServerIndicatorState::Failed => theme::DANGER_TEXT,
         ServerIndicatorState::Stopped | ServerIndicatorState::Exited => theme::TEXT_SUBTLE,

@@ -404,41 +404,7 @@ where
 /// `current_snapshot` when you need the shared state but not the terminal
 /// replay scrollback.
 fn light_snapshot(inner: &Arc<RemoteHostInner>, client_id: &str) -> RemoteWorkspaceSnapshot {
-    let app_state = inner
-        .shared_state
-        .read()
-        .map(|slot| slot.clone())
-        .unwrap_or_default();
-    let runtime_state = inner
-        .runtime_state
-        .read()
-        .map(|slot| slot.clone())
-        .unwrap_or_default();
-    let port_statuses = inner
-        .port_statuses
-        .read()
-        .map(|slot| slot.clone())
-        .unwrap_or_default();
-    let controller_client_id = inner
-        .controller_client_id
-        .read()
-        .map(|slot| slot.clone())
-        .unwrap_or_default();
-    let server_id = inner
-        .config
-        .read()
-        .map(|cfg| cfg.server_id.clone())
-        .unwrap_or_default();
-    let you_have_control = controller_client_id.as_deref() == Some(client_id);
-    RemoteWorkspaceSnapshot {
-        app_state,
-        runtime_state,
-        session_views: HashMap::new(),
-        port_statuses,
-        controller_client_id,
-        you_have_control,
-        server_id,
-    }
+    crate::remote::light_snapshot(inner, client_id)
 }
 
 fn register_browser_client(
@@ -459,6 +425,11 @@ fn register_browser_client(
         .unwrap_or_default();
     let port_statuses = inner
         .port_statuses
+        .read()
+        .map(|slot| slot.clone())
+        .unwrap_or_default();
+    let port_authorities = inner
+        .port_authorities
         .read()
         .map(|slot| slot.clone())
         .unwrap_or_default();
@@ -497,7 +468,7 @@ fn register_browser_client(
             focused_session_id: None,
             last_app_hash: stable_hash(&app_state),
             last_runtime_hash: stable_hash(&runtime_state),
-            last_port_hash: stable_hash(&port_statuses),
+            last_port_hash: stable_hash(&port_statuses) ^ stable_hash(&port_authorities),
             last_controller_client_id: controller_client_id,
             last_you_have_control: you_have_control,
             last_snapshot_revision: inner.snapshot_revision.load(Ordering::Relaxed),
@@ -2508,7 +2479,7 @@ fn capture_resume_projection_raw(
     let replay = desired_session_key
         .and_then(|key| semantic_journals.capture_replay_after(key, semantic_after_sequence));
     (
-        light_snapshot(inner, client_id),
+        crate::remote::light_snapshot_locked(inner, client_id),
         inner.snapshot_revision.load(Ordering::Relaxed),
         semantic_journals.metadata_snapshot(),
         replay,
@@ -4319,7 +4290,7 @@ fn capture_web_snapshot_inner(
             };
             let semantic_metadata = semantic_journals.metadata_snapshot();
             (
-                light_snapshot(inner, client_id),
+                crate::remote::light_snapshot_locked(inner, client_id),
                 inner.snapshot_revision.load(Ordering::Relaxed),
                 semantic_metadata,
             )
@@ -4352,12 +4323,13 @@ fn project_web_snapshot(
     semantic_metadata: &HashMap<StableSessionKey, SemanticSessionMetadata>,
     lease: &WebWriterLeaseState,
 ) -> WebWorkspaceSnapshot {
-    let mut projected = WebWorkspaceSnapshot::from_host(
+    let mut projected = WebWorkspaceSnapshot::from_host_with_authorities(
         inner.runtime_instance_id.clone(),
         revision,
         &snapshot.app_state,
         &snapshot.runtime_state,
         &snapshot.port_statuses,
+        &snapshot.port_authorities,
         lease,
         semantic_metadata,
     );

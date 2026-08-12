@@ -72,8 +72,7 @@ impl fmt::Display for ManagedProcessIdentityError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "failed to canonicalize managed process executable `{}`: {}",
-            self.path.display(),
+            "failed to canonicalize managed process executable: {}",
             self.source
         )
     }
@@ -121,7 +120,7 @@ impl ManagedProcessIdentity {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProcessOwner {
     Task(TaskId),
     Host,
