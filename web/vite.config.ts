@@ -18,6 +18,15 @@ const fingerprintFiles = [
   "vite.config.ts",
 ];
 
+const connectCryptoWasmSourceDirectory = join(webRoot, "src", "connect", "wasm");
+const connectCryptoWasmOutputDirectory = "assets/wasm";
+const connectCryptoWasmFiles = [
+  "connect_crypto.js",
+  "connect_crypto_bg.wasm",
+  "connect_crypto.d.ts",
+  "connect_crypto.manifest.json",
+] as const;
+
 function collectFiles(directory: string): string[] {
   if (!existsSync(directory)) return [];
   return readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
@@ -45,6 +54,34 @@ function sourceFingerprint(): string {
       contents: readFileSync(join(webRoot, path)),
     })),
   );
+}
+
+/**
+ * Copy the explicitly generated Connect leaf into the embedded bundle.
+ *
+ * The import in `web/src/connect/crypto.ts` is intentionally dynamic so a
+ * source checkout without the reviewed artifact remains a typed HOLD.  This
+ * plugin is the packaging bridge for a present artifact; it never builds,
+ * downloads, or synthesizes cryptographic code.  Keeping the source files in
+ * the ignored directory also lets Vite dev mode resolve the same relative
+ * module path as the production bundle.
+ */
+function connectCryptoWasmArtifactPlugin(): Plugin {
+  return {
+    name: "devmanager-connect-crypto-wasm-artifact",
+    apply: "build",
+    generateBundle() {
+      for (const fileName of connectCryptoWasmFiles) {
+        const sourcePath = join(connectCryptoWasmSourceDirectory, fileName);
+        if (!existsSync(sourcePath)) continue;
+        this.emitFile({
+          type: "asset",
+          fileName: `${connectCryptoWasmOutputDirectory}/${fileName}`,
+          source: readFileSync(sourcePath),
+        });
+      }
+    },
+  };
 }
 
 const webBuildId = sourceFingerprint();
@@ -82,6 +119,7 @@ export default defineConfig({
   plugins: [
     react(),
     tailwindcss(),
+    connectCryptoWasmArtifactPlugin(),
     buildFingerprintPlugin(),
     VitePWA({
       strategies: "injectManifest",

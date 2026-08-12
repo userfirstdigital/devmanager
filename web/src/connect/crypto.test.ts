@@ -1,4 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import {
   CONNECT_BROWSER_E2E_HOLD,
@@ -6,6 +9,27 @@ import {
   resolveConnectCrypto,
   type ConnectCryptoRuntime,
 } from "./crypto";
+import {
+  CONNECT_CRYPTO_WASM_ARTIFACT_SCHEMA_VERSION,
+  CONNECT_CRYPTO_WASM_EXPORTS,
+  CONNECT_CRYPTO_WASM_MODULE_PATH,
+  CONNECT_CRYPTO_WASM_PROTOCOL_MAJOR,
+} from "./wasmArtifact";
+
+const webRoot = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
+const runtimeGoldenFixture = JSON.parse(
+  readFileSync(
+    join(webRoot, "..", "tests", "fixtures", "connect", "v1", "crypto-runtime.json"),
+    "utf8",
+  ),
+) as {
+  schemaVersion: number;
+  protocolMajor: number;
+  firstPairingPattern: string;
+  pinnedDevicePattern: string;
+  modulePath: string;
+  requiredExports: string[];
+};
 
 function runtimeFixture(): ConnectCryptoRuntime {
   return {
@@ -23,6 +47,25 @@ function runtimeFixture(): ConnectCryptoRuntime {
 }
 
 describe("Connect Rust/WASM loader", () => {
+  it("shares the non-secret runtime identity fixture with the Rust leaf", () => {
+    expect(runtimeGoldenFixture.schemaVersion).toBe(
+      CONNECT_CRYPTO_WASM_ARTIFACT_SCHEMA_VERSION,
+    );
+    expect(runtimeGoldenFixture.protocolMajor).toBe(
+      CONNECT_CRYPTO_WASM_PROTOCOL_MAJOR,
+    );
+    expect(runtimeGoldenFixture.firstPairingPattern).toBe(
+      "Noise_XX_25519_ChaChaPoly_BLAKE2s",
+    );
+    expect(runtimeGoldenFixture.pinnedDevicePattern).toBe(
+      "Noise_IK_25519_ChaChaPoly_BLAKE2s",
+    );
+    expect(runtimeGoldenFixture.modulePath).toBe(CONNECT_CRYPTO_WASM_MODULE_PATH);
+    expect(runtimeGoldenFixture.requiredExports).toEqual([
+      ...CONNECT_CRYPTO_WASM_EXPORTS,
+    ]);
+  });
+
   it("keeps missing or failed WASM as a typed, redacted HOLD", async () => {
     const secret = "private-key-material";
     const loader = vi.fn(async () => {

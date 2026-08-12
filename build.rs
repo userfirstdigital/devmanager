@@ -264,6 +264,8 @@ fn validate_web_bundle_at(web_dir: &std::path::Path) -> Result<(), Vec<String>> 
         _ => {}
     }
 
+    validate_connect_crypto_artifacts(&bundle, &mut errors);
+
     let references = local_html_references(&index);
     if !references.iter().any(|path| path == "manifest.webmanifest") {
         errors.push("web/bundle/index.html does not reference manifest.webmanifest".to_string());
@@ -529,6 +531,13 @@ fn validate_asset_graph(
         errors.push(error);
     }
     for asset in generated_assets {
+        // Connect's Rust/WASM leaf is loaded by an explicit runtime path, not
+        // by Vite's static graph.  Its manifest and exact file allowlist are
+        // checked separately above, so it is intentionally not required to
+        // be reachable from index.html or the service-worker shell graph.
+        if asset.starts_with("assets/wasm/") {
+            continue;
+        }
         if !referenced.contains(&asset) {
             errors.push(format!(
                 "web/bundle contains unreferenced generated asset {asset}"
@@ -537,6 +546,95 @@ fn validate_asset_graph(
     }
 
     referenced
+}
+
+const CONNECT_CRYPTO_ARTIFACT_FILES: [&str; 4] = [
+    "connect_crypto.js",
+    "connect_crypto_bg.wasm",
+    "connect_crypto.d.ts",
+    "connect_crypto.manifest.json",
+];
+
+fn validate_connect_crypto_artifacts(bundle: &std::path::Path, errors: &mut Vec<String>) {
+    let directory = bundle.join("assets/wasm");
+    if !directory.is_dir() {
+        // A clean checkout deliberately has no browser crypto artifact.  The
+        // TypeScript loader reports a typed HOLD until the explicit pinned
+        // build script produces it.
+        return;
+    }
+
+    let manifest = directory.join("connect_crypto.manifest.json");
+    if !manifest.is_file() {
+        errors.push(
+            "web/bundle/assets/wasm is present but connect_crypto.manifest.json is missing"
+                .to_string(),
+        );
+    } else if let Ok(contents) = std::fs::read_to_string(&manifest) {
+        let compact: String = contents
+            .chars()
+            .filter(|character| !character.is_ascii_whitespace())
+            .collect();
+        for required in [
+            "\"schemaVersion\":1",
+            "\"artifact\":\"connect-crypto\"",
+            "\"protocolMajor\":1",
+            "\"target\":\"wasm32-unknown-unknown\"",
+            "\"wasmBindgenVersion\":\"0.2.114\"",
+            "\"modulePath\":\"./wasm/connect_crypto.js\"",
+        ] {
+            if !compact.contains(required) {
+                errors.push(format!(
+                    "web/bundle/assets/wasm/connect_crypto.manifest.json is missing {required}"
+                ));
+            }
+        }
+    } else {
+        errors
+            .push("web/bundle/assets/wasm/connect_crypto.manifest.json is unreadable".to_string());
+    }
+
+    let entries = match std::fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) => {
+            errors.push(format!("cannot scan web/bundle/assets/wasm: {error}"));
+            return;
+        }
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            errors.push("cannot inspect an entry in web/bundle/assets/wasm".to_string());
+            continue;
+        };
+        let path = entry.path();
+        if !path.is_file() {
+            errors.push(format!(
+                "web/bundle/assets/wasm contains a non-file entry: {}",
+                path.display()
+            ));
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            errors.push(format!(
+                "web/bundle/assets/wasm contains an invalid file name: {}",
+                path.display()
+            ));
+            continue;
+        };
+        if !CONNECT_CRYPTO_ARTIFACT_FILES.contains(&name) {
+            errors.push(format!(
+                "web/bundle/assets/wasm contains unexpected file: {name}"
+            ));
+        }
+    }
+
+    for required in ["connect_crypto.js", "connect_crypto_bg.wasm"] {
+        if !directory.join(required).is_file() {
+            errors.push(format!(
+                "web/bundle/assets/wasm is missing required artifact {required}"
+            ));
+        }
+    }
 }
 
 fn relative_asset_references(current: &str, contents: &str) -> Vec<String> {

@@ -1,7 +1,34 @@
 use connect_crypto::{
-    CredentialPurpose, CryptoPrologue, NoiseHandshakeMessage, SealedFrame, SEALED_FRAME_VERSION,
+    CredentialPurpose, CryptoPrologue, NoiseHandshakeMessage, SealedFrame,
+    NOISE_FIRST_PAIRING_PATTERN, NOISE_PINNED_DEVICE_PATTERN, PROTOCOL_MAJOR, SEALED_FRAME_VERSION,
     SEALED_NONCE_BYTES, SEALED_TAG_BYTES,
 };
+
+#[test]
+fn browser_runtime_golden_fixture_matches_native_identity() {
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../tests/fixtures/connect/v1/crypto-runtime.json"
+    ))
+    .expect("valid Connect browser runtime fixture");
+
+    assert_eq!(fixture["schemaVersion"], 1);
+    assert_eq!(fixture["protocolMajor"], PROTOCOL_MAJOR);
+    assert_eq!(fixture["firstPairingPattern"], NOISE_FIRST_PAIRING_PATTERN);
+    assert_eq!(fixture["pinnedDevicePattern"], NOISE_PINNED_DEVICE_PATTERN);
+    assert_eq!(fixture["modulePath"], "./wasm/connect_crypto.js");
+    assert_eq!(
+        fixture["requiredExports"],
+        serde_json::json!([
+            "WasmConnectHandshake",
+            "connect_protocol_major",
+            "connect_noise_pattern",
+            "encode_connect_envelope_json",
+            "decode_connect_envelope_json",
+            "encode_connect_payload_json",
+            "decode_connect_payload_json"
+        ])
+    );
+}
 
 #[cfg(feature = "wasm")]
 mod wire_contract {

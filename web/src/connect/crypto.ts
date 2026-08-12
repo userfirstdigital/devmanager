@@ -1,3 +1,5 @@
+import { CONNECT_CRYPTO_WASM_MODULE_PATH } from "./wasmArtifact";
+
 /**
  * Rust/WASM Connect crypto boundary.
  *
@@ -59,7 +61,10 @@ export type ConnectCryptoLoader = () => Promise<ConnectCryptoRuntime>;
 // Keep the optional generated module out of Vite's static asset graph. A
 // source checkout may not contain it; the loader must preserve the typed HOLD
 // rather than turning a missing optional module into a build-time import.
-const wasmModulePath = [".", "wasm", "connect_crypto.js"].join("/");
+// Keep this relative path stable: in development it resolves beside the
+// ignored generated source directory; in a production bundle Vite emits the
+// same files beside the hashed entry module under assets/wasm.
+const wasmModulePath = CONNECT_CRYPTO_WASM_MODULE_PATH;
 
 /** Default loader for the wasm-bindgen output produced by the native-next build. */
 export const loadConnectCrypto: ConnectCryptoLoader = async () => {

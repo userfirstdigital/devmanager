@@ -2,8 +2,22 @@
 name = "connect-crypto"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.94"
 description = "Audited DevManager Connect Noise and sealed-frame leaf for native and WASM clients"
 license = "Apache-2.0"
+
+# The native and browser builds must consume this package through the same
+# source and the same pinned toolchain.  Build-ConnectCrypto.ps1 checks these
+# values before it invokes Cargo or wasm-bindgen; it never installs either
+# dependency.
+[package.metadata.connect-crypto-wasm]
+schema-version = 1
+toolchain = "1.94.0"
+target = "wasm32-unknown-unknown"
+wasm-bindgen-cli = "0.2.114"
+module-path = "./wasm/connect_crypto.js"
+output-directory = "web/src/connect/wasm"
+protocol-major = 1
 
 [features]
 default = []

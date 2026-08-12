@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "protocolMajor": 1,
+  "firstPairingPattern": "Noise_XX_25519_ChaChaPoly_BLAKE2s",
+  "pinnedDevicePattern": "Noise_IK_25519_ChaChaPoly_BLAKE2s",
+  "modulePath": "./wasm/connect_crypto.js",
+  "requiredExports": [
+    "WasmConnectHandshake",
+    "connect_protocol_major",
+    "connect_noise_pattern",
+    "encode_connect_envelope_json",
+    "decode_connect_envelope_json",
+    "encode_connect_payload_json",
+    "decode_connect_payload_json"
+  ]
+}
