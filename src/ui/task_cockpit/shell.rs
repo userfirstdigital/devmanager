@@ -277,6 +277,8 @@ impl TaskCockpitShell {
             .is_some_and(|projection| projection.task_id != task_id)
         {
             self.projection = None;
+            self.timeline = None;
+            self.timeline_error = None;
         }
         self.dock.follow_task(task_id);
     }
@@ -310,7 +312,7 @@ impl TaskCockpitShell {
         self.projection.as_ref()
     }
 
-    pub fn follow_projection(&mut self, model: &ClientModel) {
+    pub fn follow_projection(&mut self, model: &ClientModel, capabilities: CapabilitySet) {
         if let Some(task_id) = self.dock.selected_task() {
             if model.tasks().contains_key(&task_id) {
                 if matches!(
@@ -330,10 +332,10 @@ impl TaskCockpitShell {
             }
         }
         self.model = Some(model.clone());
-        self.project_timeline(model);
+        self.project_timeline(model, capabilities);
     }
 
-    fn project_timeline(&mut self, model: &ClientModel) {
+    fn project_timeline(&mut self, model: &ClientModel, capabilities: CapabilitySet) {
         let Some(task_id) = self.dock.selected_task() else {
             self.timeline = None;
             self.timeline_error = None;
@@ -346,7 +348,7 @@ impl TaskCockpitShell {
             Timeline::project(
                 model,
                 task_id,
-                crate::protocol::CapabilitySet::empty(),
+                capabilities,
                 &journal,
                 &registry,
                 TimelineViewport {
@@ -370,6 +372,15 @@ impl TaskCockpitShell {
 
     pub fn timeline(&self) -> Option<&Timeline> {
         self.timeline.as_ref()
+    }
+
+    pub fn timeline_mut(&mut self) -> Option<&mut Timeline> {
+        self.timeline.as_mut()
+    }
+
+    pub fn clear_timeline(&mut self) {
+        self.timeline = None;
+        self.timeline_error = None;
     }
 
     pub fn conversation_surface(

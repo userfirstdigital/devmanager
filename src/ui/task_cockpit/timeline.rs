@@ -185,6 +185,19 @@ impl Timeline {
         self.capture_anchor();
     }
 
+    pub fn scroll_page(&mut self, down: bool) {
+        let step = self.viewport.height.max(1) / 2;
+        if down {
+            self.viewport.scroll_offset = self.viewport.scroll_offset.saturating_add(step);
+        } else {
+            self.viewport.scroll_offset = self.viewport.scroll_offset.saturating_sub(step);
+        }
+        self.clamp_scroll();
+        self.following = self.at_bottom();
+        self.refresh_window();
+        self.capture_anchor();
+    }
+
     pub fn visible_anchor_id(&self) -> Option<TimelineItemId> {
         self.anchor.map(|anchor| anchor.id)
     }

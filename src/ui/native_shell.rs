@@ -44,6 +44,10 @@ use crate::client::{
 };
 use crate::config::paths::{resolve_app_paths, AppProfile, BuildKind};
 use crate::domain::cockpit::TaskCockpitQuery;
+use crate::domain::command::{
+    ArmUpdateInstallIntent, Command as DomainCommand, CommandEnvelope, CommandReceipt,
+    ConfirmUpdateDrainIntent,
+};
 use crate::domain::host::{HostQuitInspection, HostQuitWorktreeInspection};
 use crate::domain::id::SubscriptionId;
 use crate::domain::id::{CommandId, RequestId, TaskId};
@@ -1545,12 +1549,32 @@ pub enum NativeHostCommand {
     Updater {
         request_id: RequestId,
         action: UpdaterAction,
+        handoff_ids: NativeUpdateCommandIds,
     },
     /// Explicitly surfaced typed hold. Visible query actions must never map here.
     Hold {
         action_id: &'static str,
         reason: &'static str,
     },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeUpdateCommandIds {
+    prepare: CommandId,
+    confirm_drain: CommandId,
+    arm_install: CommandId,
+    confirm_quit: CommandId,
+}
+
+impl NativeUpdateCommandIds {
+    fn new() -> Self {
+        Self {
+            prepare: CommandId::new(),
+            confirm_drain: CommandId::new(),
+            arm_install: CommandId::new(),
+            confirm_quit: CommandId::new(),
+        }
+    }
 }
 
 fn native_command_id(command: &NativeHostCommand) -> Option<CommandId> {
@@ -1567,8 +1591,13 @@ fn native_command_id(command: &NativeHostCommand) -> Option<CommandId> {
         | NativeHostCommand::HostActionsQuery { .. }
         | NativeHostCommand::TaskCockpitQuery { .. }
         | NativeHostCommand::PromptLibraryQuery { .. }
-        | NativeHostCommand::Updater { .. }
         | NativeHostCommand::Hold { .. } => None,
+        NativeHostCommand::Updater {
+            action: UpdaterAction::Install,
+            handoff_ids,
+            ..
+        } => Some(handoff_ids.prepare),
+        NativeHostCommand::Updater { .. } => None,
     }
 }
 
@@ -1725,6 +1754,7 @@ pub enum NativeHostQueryBody {
     TaskCockpit(crate::domain::TaskCockpitResult),
     PromptLibrary(PromptProjectionReply),
     Updater(UpdaterSnapshot),
+    UpdaterInstalled(UpdaterSnapshot),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
