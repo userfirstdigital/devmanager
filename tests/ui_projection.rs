@@ -1148,9 +1148,9 @@ fn inbox_fixture_drives_bounded_display_data_and_compact_render_items() {
                 && row.task_id == rich_id
                 && !row.accessible_name.is_empty()
                 && !row.accessible_description.is_empty()
-                && row.accessibility.role == AccessibleRole::Button
-                && !row.accessibility.disabled
-                && row.accessibility.value.as_deref() == Some("Needs answer")
+                && row.accessibility.role() == AccessibleRole::Button
+                && !row.accessibility.disabled()
+                && row.accessibility.value() == Some("Needs answer")
                 && row.accessible_description.contains("Workspace path hidden")
                 && !row.accessible_description.contains(
                     rich["workspace_path"].as_str().expect("workspace path")
@@ -1188,8 +1188,8 @@ fn inbox_accessibility_announces_unread_and_bounded_information() {
             _ => None,
         })
         .expect("bounded task row");
-    assert_eq!(row.accessibility.name, row.accessible_name);
-    assert_eq!(row.accessibility.description, row.accessible_description);
+    assert_eq!(row.accessibility.name(), row.accessible_name);
+    assert_eq!(row.accessibility.description(), row.accessible_description);
     assert!(row.accessible_description.contains("2 unread events"));
     assert!(row
         .accessible_description
