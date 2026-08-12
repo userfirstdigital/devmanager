@@ -16,6 +16,7 @@ mod membership;
 mod persistence;
 mod portal;
 mod publisher;
+mod sync;
 mod watcher;
 mod wire;
 mod workflow;
@@ -60,8 +61,12 @@ pub use persistence::{
 pub use portal::{
     days_to_ms, hmac_signature, minutes_to_ms, reject_prohibited_fields, validate_iso_timestamp,
     validate_opaque_id, BoardCardProjection, ConnectHostDto, CreatePromptVersionRequest,
-    EnrollmentPreviewDto, EnrollmentPreviewRequest, EnrollmentViewer, EvidenceImportRequest,
-    EvidenceMetadataBundle, FleetHostDto, FleetLabels, FleetUsageLabels, HostMembershipDto,
+    CanonicalEvidenceBundle, CanonicalEvidenceImportRequest, EvidenceContentHash,
+    EvidenceMediaRef as PortalEvidenceMediaRef, EvidenceProposedTask, EvidenceRedaction, EvidenceReview,
+    EvidenceSignature, EvidenceSourceIdentity, EvidenceTimeRange, EvidenceTranscriptSegment,
+    EVIDENCE_BUNDLE_SCHEMA_VERSION,
+    EnrollmentPreviewDto, EnrollmentPreviewRequest, EnrollmentViewer, FleetHostDto, FleetLabels,
+    FleetUsageLabels, HostMembershipDto,
     LiveViewGrant, LocalActionDto, LocalActionReceiptDto, LocalActionReceiptRequest,
     LocalActionRequestDto, LocalPolicyUnits, LocalTaskProjection,
     ManagedTaskDto as PortalManagedTaskDto, ManagedTaskLink as PortalManagedTaskLink, MediaBinding,
@@ -71,9 +76,17 @@ pub use portal::{
     PortalGrantAccess, PortalId, PortalManagementClient, PortalMembershipStatus, PortalOrgRole,
     PortalOutcomeStatus, PortalPromptStatus, PortalRawSharingCeiling, PortalRequestMetadata,
     PortalUsageSource, PromptChainRequest, PublishPromptRequest, TaskLiveViewDto,
-    TitleConflict as PortalTitleConflict,
+    TitleConflict as PortalTitleConflict, HostReconcileRequest, HostReconcileResponse,
+    LocalActionCatalogDto, PortalAuthProvider, PortalCredentialHandle, PortalPage,
+    PortalTransport, StaticPortalAuth, TelemetryUploadAck, TelemetryUploadRequest,
+    PORTAL_PAGE_MAX_ITEMS,
 };
 pub use publisher::{OrganizationPublisher, SignedOrganizationEnvelope};
+pub use sync::{
+    PortalReconcileKind, PortalReconcileOutcome, PortalReconcileRequest, PortalSyncCursors,
+    PortalSyncError, PortalSyncFailureKind, PortalSyncRuntime, PortalSyncRuntimeRecord,
+    PORTAL_SYNC_MAX_PAGES, PORTAL_SYNC_PAGE_LIMIT,
+};
 pub use watcher::{
     reject_forbidden_fields, reject_forbidden_label, FleetWatcherView, HostReachability,
     TaskWatcherView, WatcherProjection, ACTIVE_SESSION_RULE, FORBIDDEN_WATCHER_LABELS,
@@ -503,6 +516,17 @@ impl OrganizationProjection {
         Ok(self.local_actions.admission_state(request_id))
     }
 
+    pub fn reconcile_local_action_state(
+        &mut self,
+        request_id: LocalActionId,
+        admission: Admission,
+        outcome: Option<ActionOutcome>,
+    ) -> Result<SyncOutcome, OrgError> {
+        self.require_enrolled()?;
+        self.local_actions
+            .reconcile_remote_state(request_id, admission, outcome)
+    }
+
     pub fn mark_local_action_uncertain(
         &mut self,
         request_id: LocalActionId,
@@ -652,6 +676,51 @@ impl OrganizationProjection {
         self.telemetry_outbox
             .insert(intent.observation_id_hex.clone(), intent);
         Ok(SyncOutcome::Applied)
+    }
+
+    pub fn acknowledge_outbox_intent(
+        &mut self,
+        observation_id_hex: &str,
+    ) -> Result<SyncOutcome, OrgError> {
+        let intent = self
+            .telemetry_outbox
+            .get_mut(observation_id_hex)
+            .ok_or(OrgError::Unlinked)?;
+        if intent.delivery == crate::org::persistence::OutboxDeliveryState::LocallyAcknowledged {
+            return Ok(SyncOutcome::Duplicate);
+        }
+        intent.delivery = crate::org::persistence::OutboxDeliveryState::LocallyAcknowledged;
+        Ok(SyncOutcome::Applied)
+    }
+
+    pub fn mark_outbox_uncertain(
+        &mut self,
+        observation_id_hex: &str,
+    ) -> Result<SyncOutcome, OrgError> {
+        let intent = self
+            .telemetry_outbox
+            .get_mut(observation_id_hex)
+            .ok_or(OrgError::Unlinked)?;
+        if intent.delivery == crate::org::persistence::OutboxDeliveryState::LocallyAcknowledged {
+            return Err(OrgError::LastWriteWinsForbidden);
+        }
+        if intent.delivery == crate::org::persistence::OutboxDeliveryState::Uncertain {
+            return Ok(SyncOutcome::Duplicate);
+        }
+        intent.delivery = crate::org::persistence::OutboxDeliveryState::Uncertain;
+        Ok(SyncOutcome::Applied)
+    }
+
+    pub fn pending_outbox_intents(
+        &self,
+    ) -> impl Iterator<Item = &crate::org::persistence::PersistedOutboxIntent> {
+        self.telemetry_outbox.values().filter(|intent| {
+            matches!(
+                intent.delivery,
+                crate::org::persistence::OutboxDeliveryState::Queued
+                    | crate::org::persistence::OutboxDeliveryState::Uncertain
+            )
+        })
     }
 
     pub fn persist_to(&self, store: &OrganizationStateStore) -> Result<(), OrgError> {
@@ -850,7 +919,20 @@ impl OrganizationProjection {
                 }
                 Ok(SyncOutcome::Applied)
             }
-            MembershipStatus::PendingLocalConfirm | MembershipStatus::Enrolled => {
+            MembershipStatus::PendingLocalConfirm => {
+                if let OperatingMode::HostEnrolled { membership } = &mut self.mode {
+                    membership.status = MembershipStatus::PendingLocalConfirm;
+                    self.sync_state = OrganizationSyncState::Unlinked;
+                    self.policy = None;
+                    self.authenticated_online = false;
+                    self.prompts.purge();
+                    self.prompt_snapshot = None;
+                } else {
+                    self.sync_state = OrganizationSyncState::SignedIn;
+                }
+                Ok(SyncOutcome::Applied)
+            }
+            MembershipStatus::Enrolled => {
                 if !matches!(self.mode, OperatingMode::HostEnrolled { .. }) {
                     self.sync_state = OrganizationSyncState::SignedIn;
                 }

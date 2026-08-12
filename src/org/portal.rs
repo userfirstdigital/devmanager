@@ -23,6 +23,7 @@ pub const OPAQUE_ID_MAX_BYTES: usize = 256;
 pub const MAX_REQUEST_BYTES: usize = 512 * 1024;
 pub const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 pub const PROMPT_BODY_MAX_BYTES: usize = 256 * 1024;
+pub const PORTAL_PAGE_MAX_ITEMS: u32 = 64;
 
 /// A wire id is intentionally not a UUID newtype.  Portal is the issuer and
 /// may migrate its identifier format without requiring a DevManager release.
@@ -909,39 +910,234 @@ pub fn reject_prohibited_fields(value: &Value) -> Result<(), PortalAdapterError>
     walk(value, "")
 }
 
+/// The canonical DevAgent/Portal EvidenceBundle v1 manifest.  This is kept
+/// wire-compatible with `portal/agent/src-tauri/src/evidence/types.rs` and
+/// `portal/api/src/services/devmanagerManagement/evidence.ts`; do not replace
+/// it with a DevManager-specific metadata envelope.
+pub const EVIDENCE_BUNDLE_SCHEMA_VERSION: &str = "evidence-bundle.v1";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct EvidenceMetadataBundle {
-    #[serde(deserialize_with = "deserialize_id")]
-    pub evidence_bundle_id: String,
-    #[serde(deserialize_with = "deserialize_id")]
-    pub organization_id: String,
-    #[serde(deserialize_with = "deserialize_id")]
-    pub host_id: String,
-    #[serde(deserialize_with = "deserialize_id")]
-    pub source_device_id: String,
-    pub created_at: String,
-    pub content_hash: String,
-    pub artifact_refs: Vec<String>,
-    pub metadata: serde_json::Map<String, Value>,
-    pub signature: String,
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EvidenceContentHash {
+    pub algorithm: String,
+    pub hex: String,
 }
 
-impl EvidenceMetadataBundle {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EvidenceTimeRange {
+    pub started_at: String,
+    pub ended_at: String,
+    pub time_zone: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EvidenceSourceIdentity {
+    pub device_id: String,
+    pub device_key_id: String,
+    #[serde(default)]
+    pub user_id: Option<String>,
+    #[serde(default)]
+    pub display_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EvidenceTranscriptSegment {
+    pub id: String,
+    pub started_at: String,
+    pub ended_at: String,
+    pub text: String,
+    #[serde(default)]
+    pub speaker: Option<String>,
+    pub redacted: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EvidenceMediaRef {
+    pub id: String,
+    pub kind: String,
+    pub artifact_id: String,
+    #[serde(default)]
+    pub relative_path: Option<String>,
+    pub content_hash: EvidenceContentHash,
+    #[serde(default)]
+    pub mime_type: Option<String>,
+    #[serde(default)]
+    pub byte_length: Option<u64>,
+    #[serde(default)]
+    pub file_name: Option<String>,
+    #[serde(default)]
+    pub protection: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EvidenceProposedTask {
+    pub title: String,
+    pub summary: String,
+    pub acceptance_criteria: Vec<String>,
+    pub steps: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EvidenceRedaction {
+    pub target: String,
+    pub target_id: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub redacted_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EvidenceReview {
+    pub privacy_reviewed: bool,
+    #[serde(default)]
+    pub reviewed_at: Option<String>,
+    #[serde(default)]
+    pub reviewer_user_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EvidenceSignature {
+    pub algorithm: String,
+    pub key_id: String,
+    pub hex: String,
+    pub signed_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CanonicalEvidenceBundle {
+    pub schema_version: String,
+    pub bundle_id: String,
+    pub exported_at: String,
+    pub time_range: EvidenceTimeRange,
+    pub source: EvidenceSourceIdentity,
+    pub transcript_segments: Vec<EvidenceTranscriptSegment>,
+    pub media: Vec<EvidenceMediaRef>,
+    #[serde(default)]
+    pub windows: Vec<Value>,
+    pub proposed_task: EvidenceProposedTask,
+    #[serde(default)]
+    pub privacy_labels: Vec<String>,
+    #[serde(default)]
+    pub redactions: Vec<EvidenceRedaction>,
+    #[serde(default)]
+    pub review: Option<EvidenceReview>,
+    pub signature: Option<EvidenceSignature>,
+}
+
+impl CanonicalEvidenceBundle {
     pub fn validate(&self) -> Result<(), PortalAdapterError> {
-        validate_iso_timestamp(&self.created_at, "createdAt")?;
-        reject_prohibited_fields(&Value::Object(self.metadata.clone()))
+        if self.schema_version != EVIDENCE_BUNDLE_SCHEMA_VERSION {
+            return Err(PortalAdapterError::InvalidValue {
+                field: "schemaVersion".into(),
+                reason: format!("expected {EVIDENCE_BUNDLE_SCHEMA_VERSION}"),
+            });
+        }
+        validate_opaque_id(&self.bundle_id, "bundleId")?;
+        validate_iso_timestamp(&self.exported_at, "exportedAt")?;
+        validate_iso_timestamp(&self.time_range.started_at, "timeRange.startedAt")?;
+        validate_iso_timestamp(&self.time_range.ended_at, "timeRange.endedAt")?;
+        validate_opaque_id(&self.source.device_id, "source.deviceId")?;
+        validate_opaque_id(&self.source.device_key_id, "source.deviceKeyId")?;
+        if let Some(user_id) = self.source.user_id.as_deref() {
+            validate_opaque_id(user_id, "source.userId")?;
+        }
+        for segment in &self.transcript_segments {
+            validate_opaque_id(&segment.id, "transcriptSegments.id")?;
+            validate_iso_timestamp(&segment.started_at, "transcriptSegments.startedAt")?;
+            validate_iso_timestamp(&segment.ended_at, "transcriptSegments.endedAt")?;
+        }
+        for media in &self.media {
+            validate_opaque_id(&media.id, "media.id")?;
+            validate_opaque_id(&media.artifact_id, "media.artifactId")?;
+            if media.content_hash.algorithm != "sha256"
+                || media.content_hash.hex.len() != 64
+                || !media.content_hash.hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err(PortalAdapterError::InvalidValue {
+                    field: "media.contentHash".into(),
+                    reason: "sha256 content hash required".into(),
+                });
+            }
+        }
+        for redaction in &self.redactions {
+            validate_opaque_id(&redaction.target, "redactions.target")?;
+            validate_opaque_id(&redaction.target_id, "redactions.targetId")?;
+            if let Some(timestamp) = redaction.redacted_at.as_deref() {
+                validate_iso_timestamp(timestamp, "redactions.redactedAt")?;
+            }
+        }
+        if let Some(review) = self.review.as_ref() {
+            if let Some(timestamp) = review.reviewed_at.as_deref() {
+                validate_iso_timestamp(timestamp, "review.reviewedAt")?;
+            }
+            if let Some(user_id) = review.reviewer_user_id.as_deref() {
+                validate_opaque_id(user_id, "review.reviewerUserId")?;
+            }
+        }
+        let signature = self.signature.as_ref().ok_or_else(|| {
+            PortalAdapterError::InvalidValue {
+                field: "signature".into(),
+                reason: "signed canonical bundle required".into(),
+            }
+        })?;
+        if signature.algorithm != "hmac-sha256"
+            || signature.hex.len() != 64
+            || !signature.hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(PortalAdapterError::InvalidValue {
+                field: "signature".into(),
+                reason: "hmac-sha256 signature required".into(),
+            });
+        }
+        validate_opaque_id(&signature.key_id, "signature.keyId")?;
+        validate_iso_timestamp(&signature.signed_at, "signature.signedAt")?;
+        reject_prohibited_fields(&serde_json::to_value(self).map_err(|error| {
+            PortalAdapterError::Serialization(error.to_string())
+        })?)
     }
 }
 
+/// Request envelope accepted by Portal's `/evidence` route.  The `bundle`
+/// member is the canonical manifest above; only explicit media bindings and a
+/// separately signed review receipt may accompany it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct EvidenceImportRequest {
-    pub bundle: EvidenceMetadataBundle,
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CanonicalEvidenceImportRequest {
+    pub bundle: CanonicalEvidenceBundle,
     #[serde(default)]
     pub media_bindings: Vec<MediaBinding>,
     #[serde(default)]
     pub review_receipt: Option<Value>,
+}
+
+impl CanonicalEvidenceImportRequest {
+    pub fn validate(&self) -> Result<(), PortalAdapterError> {
+        self.bundle.validate()?;
+        if self.media_bindings.len() != self.bundle.media.len() {
+            return Err(PortalAdapterError::InvalidValue {
+                field: "mediaBindings".into(),
+                reason: "one explicit binding is required per media reference".into(),
+            });
+        }
+        for binding in &self.media_bindings {
+            validate_opaque_id(&binding.media_id, "mediaBindings.mediaId")?;
+            validate_opaque_id(&binding.server_object_id, "mediaBindings.serverObjectId")?;
+        }
+        if let Some(receipt) = self.review_receipt.as_ref() {
+            reject_prohibited_fields(receipt)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -951,6 +1147,214 @@ pub struct MediaBinding {
     pub media_id: String,
     #[serde(deserialize_with = "deserialize_id")]
     pub server_object_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PortalCredentialHandle {
+    pub vault_ref: String,
+}
+
+impl PortalCredentialHandle {
+    pub fn parse(vault_ref: impl Into<String>) -> Result<Self, PortalAdapterError> {
+        let vault_ref = vault_ref.into();
+        validate_opaque_id(&vault_ref, "vaultRef")?;
+        Ok(Self { vault_ref })
+    }
+}
+
+pub trait PortalAuthProvider {
+    fn bearer_token(&self) -> Result<String, PortalAdapterError>;
+    fn handle(&self) -> Option<&PortalCredentialHandle>;
+}
+
+pub struct StaticPortalAuth {
+    handle: PortalCredentialHandle,
+    token: String,
+}
+
+impl fmt::Debug for StaticPortalAuth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StaticPortalAuth")
+            .field("handle", &self.handle)
+            .field("token", &"<redacted>")
+            .finish()
+    }
+}
+
+impl StaticPortalAuth {
+    pub fn new(
+        handle: PortalCredentialHandle,
+        token: impl Into<String>,
+    ) -> Result<Self, PortalAdapterError> {
+        let token = token.into();
+        if token.trim().is_empty() {
+            return Err(PortalAdapterError::InvalidValue {
+                field: "bearerToken".into(),
+                reason: "must be non-empty".into(),
+            });
+        }
+        Ok(Self { handle, token })
+    }
+}
+
+impl PortalAuthProvider for StaticPortalAuth {
+    fn bearer_token(&self) -> Result<String, PortalAdapterError> {
+        Ok(self.token.clone())
+    }
+
+    fn handle(&self) -> Option<&PortalCredentialHandle> {
+        Some(&self.handle)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PortalPage<T> {
+    pub items: Vec<T>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostReconcileRequest {
+    pub host_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_public_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_handle: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_revision: Option<u64>,
+    pub local_confirmed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostReconcileResponse {
+    pub membership: HostMembershipDto,
+    pub policy: OrganizationPolicyDto,
+    pub membership_revision: u64,
+    pub local_confirmation_required: bool,
+    #[serde(default, deserialize_with = "deserialize_optional_iso")]
+    pub grant_expires_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalActionCatalogDto {
+    pub action_kind: PortalActionKind,
+    pub action_version: u16,
+    pub risk: PortalActionRisk,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TelemetryUploadRequest {
+    pub observation_id: String,
+    pub intent: String,
+    pub content_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_ref: Option<String>,
+    pub metadata: serde_json::Map<String, Value>,
+    #[serde(default)]
+    pub raw_content: bool,
+}
+
+impl TelemetryUploadRequest {
+    pub fn validate(&self) -> Result<(), PortalAdapterError> {
+        if self.raw_content {
+            return Err(PortalAdapterError::InvalidRawDefault);
+        }
+        validate_opaque_id(&self.observation_id, "observationId")?;
+        reject_prohibited_fields(&Value::Object(self.metadata.clone()))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TelemetryUploadAck {
+    pub observation_id: String,
+    pub accepted: bool,
+}
+
+pub trait PortalTransport {
+    fn reconcile_host(
+        &self,
+        request: &HostReconcileRequest,
+    ) -> Result<HostReconcileResponse, PortalAdapterError>;
+    fn get_policy(&self) -> Result<OrganizationPolicyDto, PortalAdapterError>;
+    fn enrollment_preview(
+        &self,
+        request: &EnrollmentPreviewRequest,
+    ) -> Result<EnrollmentPreviewDto, PortalAdapterError>;
+    fn list_tasks_page(
+        &self,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> Result<PortalPage<ManagedTaskDto>, PortalAdapterError>;
+    fn list_prompts_page(
+        &self,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> Result<PortalPage<OrgPromptDto>, PortalAdapterError>;
+    fn get_prompt(&self, prompt_id: &str) -> Result<OrgPromptDto, PortalAdapterError>;
+    fn list_prompt_versions(
+        &self,
+        prompt_id: &str,
+    ) -> Result<Vec<OrgPromptVersionDto>, PortalAdapterError>;
+    fn publish_prompt(&self, request: &PublishPromptRequest) -> Result<Value, PortalAdapterError>;
+    fn list_prompt_chains_page(
+        &self,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> Result<PortalPage<OrgPromptChainDto>, PortalAdapterError>;
+    fn list_action_catalog(
+        &self,
+        host_id: &str,
+    ) -> Result<Vec<LocalActionCatalogDto>, PortalAdapterError>;
+    fn list_actions_page(
+        &self,
+        host_id: Option<&str>,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> Result<PortalPage<LocalActionDto>, PortalAdapterError>;
+    fn receive_action_receipt(
+        &self,
+        request_id: &str,
+        request: &LocalActionReceiptRequest,
+    ) -> Result<LocalActionReceiptDto, PortalAdapterError>;
+    fn upload_telemetry(
+        &self,
+        request: &TelemetryUploadRequest,
+    ) -> Result<TelemetryUploadAck, PortalAdapterError>;
+    fn import_evidence(
+        &self,
+        request: &CanonicalEvidenceImportRequest,
+    ) -> Result<Value, PortalAdapterError>;
+}
+
+fn bound_page_limit(limit: u32) -> Result<u32, PortalAdapterError> {
+    if limit == 0 || limit > PORTAL_PAGE_MAX_ITEMS {
+        return Err(PortalAdapterError::InvalidValue {
+            field: "limit".into(),
+            reason: format!("must be 1..={PORTAL_PAGE_MAX_ITEMS}"),
+        });
+    }
+    Ok(limit)
+}
+
+fn reject_oversized_page<T>(page: PortalPage<T>, limit: u32) -> Result<PortalPage<T>, PortalAdapterError> {
+    if page.items.len() > limit as usize {
+        return Err(PortalAdapterError::InvalidValue {
+            field: "items".into(),
+            reason: "page exceeds the requested bound".into(),
+        });
+    }
+    if let Some(cursor) = page.next_cursor.as_deref() {
+        validate_opaque_id(cursor, "nextCursor")?;
+    }
+    Ok(page)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1316,13 +1720,204 @@ impl PortalManagementClient {
     }
     pub fn import_evidence(
         &self,
-        request: &EvidenceImportRequest,
+        request: &CanonicalEvidenceImportRequest,
     ) -> Result<Value, PortalAdapterError> {
-        request.bundle.validate()?;
+        request.validate()?;
         let value = serde_json::to_value(request)
             .map_err(|e| PortalAdapterError::Serialization(e.to_string()))?;
         reject_prohibited_fields(&value)?;
         self.post_data(&["evidence"], value)
+    }
+
+    pub fn reconcile_host(
+        &self,
+        request: &HostReconcileRequest,
+    ) -> Result<HostReconcileResponse, PortalAdapterError> {
+        validate_opaque_id(&request.host_id, "hostId")?;
+        if let Some(handle) = request.credential_handle.as_deref() {
+            validate_opaque_id(handle, "credentialHandle")?;
+        }
+        self.post_data(
+            &["hosts", "reconcile"],
+            serde_json::to_value(request)
+                .map_err(|e| PortalAdapterError::Serialization(e.to_string()))?,
+        )
+    }
+
+    pub fn get_prompt(&self, prompt_id: &str) -> Result<OrgPromptDto, PortalAdapterError> {
+        validate_opaque_id(prompt_id, "promptId")?;
+        self.get_data(&["prompts", prompt_id], &[])
+    }
+
+    pub fn list_tasks_page(
+        &self,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> Result<PortalPage<ManagedTaskDto>, PortalAdapterError> {
+        self.get_page(&["tasks"], cursor, limit, None)
+    }
+
+    pub fn list_prompts_page(
+        &self,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> Result<PortalPage<OrgPromptDto>, PortalAdapterError> {
+        self.get_page(&["prompts"], cursor, limit, None)
+    }
+
+    pub fn list_prompt_chains_page(
+        &self,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> Result<PortalPage<OrgPromptChainDto>, PortalAdapterError> {
+        self.get_page(&["prompt-chains"], cursor, limit, None)
+    }
+
+    pub fn list_actions_page(
+        &self,
+        host_id: Option<&str>,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> Result<PortalPage<LocalActionDto>, PortalAdapterError> {
+        if let Some(host_id) = host_id {
+            validate_opaque_id(host_id, "hostId")?;
+        }
+        self.get_page(&["actions"], cursor, limit, host_id.map(|id| ("hostId", id)))
+    }
+
+    pub fn list_action_catalog(
+        &self,
+        host_id: &str,
+    ) -> Result<Vec<LocalActionCatalogDto>, PortalAdapterError> {
+        validate_opaque_id(host_id, "hostId")?;
+        self.get_data(&["actions", "catalog"], &[("hostId", host_id)])
+    }
+
+    pub fn upload_telemetry(
+        &self,
+        request: &TelemetryUploadRequest,
+    ) -> Result<TelemetryUploadAck, PortalAdapterError> {
+        request.validate()?;
+        let value = serde_json::to_value(request)
+            .map_err(|e| PortalAdapterError::Serialization(e.to_string()))?;
+        reject_prohibited_fields(&value)?;
+        self.post_data(&["telemetry"], value)
+    }
+
+    fn get_page<T: DeserializeOwned>(
+        &self,
+        segments: &[&str],
+        cursor: Option<&str>,
+        limit: u32,
+        extra: Option<(&str, &str)>,
+    ) -> Result<PortalPage<T>, PortalAdapterError> {
+        let limit = bound_page_limit(limit)?;
+        let limit_owned = limit.to_string();
+        if let Some(cursor) = cursor {
+            validate_opaque_id(cursor, "cursor")?;
+        }
+        let page = match (cursor, extra) {
+            (Some(cursor), Some((key, value))) => self.get_data(
+                segments,
+                &[
+                    ("limit", limit_owned.as_str()),
+                    ("cursor", cursor),
+                    (key, value),
+                ],
+            )?,
+            (Some(cursor), None) => {
+                self.get_data(segments, &[("limit", limit_owned.as_str()), ("cursor", cursor)])?
+            }
+            (None, Some((key, value))) => {
+                self.get_data(segments, &[("limit", limit_owned.as_str()), (key, value)])?
+            }
+            (None, None) => self.get_data(segments, &[("limit", limit_owned.as_str())])?,
+        };
+        reject_oversized_page(page, limit)
+    }
+}
+
+impl PortalTransport for PortalManagementClient {
+    fn reconcile_host(
+        &self,
+        request: &HostReconcileRequest,
+    ) -> Result<HostReconcileResponse, PortalAdapterError> {
+        PortalManagementClient::reconcile_host(self, request)
+    }
+    fn get_policy(&self) -> Result<OrganizationPolicyDto, PortalAdapterError> {
+        PortalManagementClient::get_policy(self)
+    }
+    fn enrollment_preview(
+        &self,
+        request: &EnrollmentPreviewRequest,
+    ) -> Result<EnrollmentPreviewDto, PortalAdapterError> {
+        PortalManagementClient::enrollment_preview(self, request)
+    }
+    fn list_tasks_page(
+        &self,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> Result<PortalPage<ManagedTaskDto>, PortalAdapterError> {
+        PortalManagementClient::list_tasks_page(self, cursor, limit)
+    }
+    fn list_prompts_page(
+        &self,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> Result<PortalPage<OrgPromptDto>, PortalAdapterError> {
+        PortalManagementClient::list_prompts_page(self, cursor, limit)
+    }
+    fn get_prompt(&self, prompt_id: &str) -> Result<OrgPromptDto, PortalAdapterError> {
+        PortalManagementClient::get_prompt(self, prompt_id)
+    }
+    fn list_prompt_versions(
+        &self,
+        prompt_id: &str,
+    ) -> Result<Vec<OrgPromptVersionDto>, PortalAdapterError> {
+        PortalManagementClient::list_prompt_versions(self, prompt_id)
+    }
+    fn publish_prompt(&self, request: &PublishPromptRequest) -> Result<Value, PortalAdapterError> {
+        PortalManagementClient::publish_prompt(self, request)
+    }
+    fn list_prompt_chains_page(
+        &self,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> Result<PortalPage<OrgPromptChainDto>, PortalAdapterError> {
+        PortalManagementClient::list_prompt_chains_page(self, cursor, limit)
+    }
+    fn list_action_catalog(
+        &self,
+        host_id: &str,
+    ) -> Result<Vec<LocalActionCatalogDto>, PortalAdapterError> {
+        PortalManagementClient::list_action_catalog(self, host_id)
+    }
+    fn list_actions_page(
+        &self,
+        host_id: Option<&str>,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> Result<PortalPage<LocalActionDto>, PortalAdapterError> {
+        PortalManagementClient::list_actions_page(self, host_id, cursor, limit)
+    }
+    fn receive_action_receipt(
+        &self,
+        request_id: &str,
+        request: &LocalActionReceiptRequest,
+    ) -> Result<LocalActionReceiptDto, PortalAdapterError> {
+        PortalManagementClient::receive_action_receipt(self, request_id, request)
+    }
+    fn upload_telemetry(
+        &self,
+        request: &TelemetryUploadRequest,
+    ) -> Result<TelemetryUploadAck, PortalAdapterError> {
+        PortalManagementClient::upload_telemetry(self, request)
+    }
+    fn import_evidence(
+        &self,
+        request: &CanonicalEvidenceImportRequest,
+    ) -> Result<Value, PortalAdapterError> {
+        PortalManagementClient::import_evidence(self, request)
     }
 }
 
@@ -1373,5 +1968,96 @@ mod tests {
         assert!(
             reject_prohibited_fields(&serde_json::json!({"metadata":{"terminal":"raw"}})).is_err()
         );
+    }
+
+    #[test]
+    fn telemetry_and_pages_stay_bounded_and_metadata_only() {
+        assert!(bound_page_limit(0).is_err());
+        assert!(bound_page_limit(PORTAL_PAGE_MAX_ITEMS + 1).is_err());
+        assert_eq!(bound_page_limit(8).unwrap(), 8);
+        let too_big = PortalPage {
+            items: vec![1, 2, 3],
+            next_cursor: None,
+        };
+        assert!(reject_oversized_page(too_big, 2).is_err());
+        assert!(TelemetryUploadRequest {
+            observation_id: "obs-1".into(),
+            intent: "watcher".into(),
+            content_hash: "abc".into(),
+            bundle_ref: None,
+            metadata: serde_json::Map::new(),
+            raw_content: true,
+        }
+        .validate()
+        .is_err());
+    }
+
+    #[test]
+    fn canonical_evidence_bundle_v1_matches_portal_wire_shape() {
+        let request: CanonicalEvidenceImportRequest = serde_json::from_value(serde_json::json!({
+            "bundle": {
+                "schemaVersion": "evidence-bundle.v1",
+                "bundleId": "bundle-1",
+                "exportedAt": "2026-08-12T00:00:00.000Z",
+                "timeRange": {
+                    "startedAt": "2026-08-11T23:55:00.000Z",
+                    "endedAt": "2026-08-12T00:00:00.000Z",
+                    "timeZone": "UTC"
+                },
+                "source": {
+                    "deviceId": "device-1",
+                    "deviceKeyId": "key-1",
+                    "userId": null,
+                    "displayName": null
+                },
+                "transcriptSegments": [],
+                "media": [],
+                "windows": [],
+                "proposedTask": {
+                    "title": "Captured session",
+                    "summary": "Metadata only",
+                    "acceptanceCriteria": [],
+                    "steps": []
+                },
+                "privacyLabels": ["internal_only"],
+                "redactions": [],
+                "review": null,
+                "signature": {
+                    "algorithm": "hmac-sha256",
+                    "keyId": "key-1",
+                    "hex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "signedAt": "2026-08-12T00:00:00.000Z"
+                }
+            },
+            "mediaBindings": [],
+            "reviewReceipt": null
+        }))
+        .expect("canonical bundle v1");
+        request.validate().expect("canonical validation");
+        let encoded = serde_json::to_value(&request).expect("canonical serialization");
+        assert_eq!(encoded["bundle"]["schemaVersion"], "evidence-bundle.v1");
+        assert!(encoded["bundle"].get("evidenceBundleId").is_none());
+        assert!(encoded["bundle"].get("metadata").is_none());
+    }
+
+    #[test]
+    fn canonical_evidence_requires_a_signature() {
+        let mut value = serde_json::json!({
+            "schemaVersion": "evidence-bundle.v1",
+            "bundleId": "bundle-1",
+            "exportedAt": "2026-08-12T00:00:00.000Z",
+            "timeRange": {
+                "startedAt": "2026-08-11T23:55:00.000Z",
+                "endedAt": "2026-08-12T00:00:00.000Z",
+                "timeZone": "UTC"
+            },
+            "source": { "deviceId": "device-1", "deviceKeyId": "key-1" },
+            "transcriptSegments": [],
+            "media": [],
+            "proposedTask": { "title": "t", "summary": "s", "acceptanceCriteria": [], "steps": [] },
+            "signature": null
+        });
+        let bundle: CanonicalEvidenceBundle = serde_json::from_value(value.take()).unwrap();
+        assert!(bundle.validate().is_err());
     }
 }

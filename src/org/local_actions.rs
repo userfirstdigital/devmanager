@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::domain::id::{OperationId, ProjectId};
 use crate::org::error::OrgError;
 use crate::org::ids::LocalActionId;
+use crate::org::managed::SyncOutcome;
 use crate::org::membership::{HostMembership, LocalActionApprovalRequirement};
 
 pub const MAX_LOCAL_ACTION_PAYLOAD_BYTES: usize = 16_384;
@@ -309,6 +310,47 @@ impl LocalActionRegistry {
 
     pub fn admission_state(&self, request_id: LocalActionId) -> Option<&LocalActionAdmissionState> {
         self.states.get(&request_id.to_string())
+    }
+
+    /// Apply an authoritative Portal action status to an action already
+    /// admitted locally. Unknown request ids are rejected so a remote tenant
+    /// cannot create local action state by merely appearing in a sync page.
+    pub fn reconcile_remote_state(
+        &mut self,
+        request_id: LocalActionId,
+        admission: Admission,
+        outcome: Option<ActionOutcome>,
+    ) -> Result<SyncOutcome, OrgError> {
+        let state = self
+            .states
+            .get_mut(&request_id.to_string())
+            .ok_or(OrgError::Unlinked)?;
+        if state.outcome.is_some() && state.outcome != outcome {
+            return Err(OrgError::LastWriteWinsForbidden);
+        }
+        let reconcile = match (admission, outcome) {
+            (Admission::Rejected, _) => LocalActionReconcileState::Rejected,
+            (Admission::Accepted, Some(ActionOutcome::Settled)) => {
+                LocalActionReconcileState::Settled
+            }
+            (Admission::Accepted, Some(ActionOutcome::Failed)) => {
+                LocalActionReconcileState::Failed
+            }
+            (Admission::Accepted, Some(ActionOutcome::Cancelled)) => {
+                LocalActionReconcileState::Cancelled
+            }
+            (Admission::Accepted, Some(ActionOutcome::Uncertain)) => {
+                LocalActionReconcileState::Uncertain
+            }
+            (Admission::Accepted, None) => LocalActionReconcileState::AwaitingHostExecution,
+        };
+        if state.admission == admission && state.outcome == outcome && state.reconcile == reconcile {
+            return Ok(SyncOutcome::Duplicate);
+        }
+        state.admission = admission;
+        state.outcome = outcome;
+        state.reconcile = reconcile;
+        Ok(SyncOutcome::Applied)
     }
 
     pub fn settle_ambiguous(&self) -> OrgError {
