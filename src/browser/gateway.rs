@@ -323,9 +323,42 @@ impl BrowserGatewayRegistrar {
         let Some(active) = registrations.by_token.get(token) else {
             return false;
         };
-        *lock(active.surface_binding.as_ref()) =
-            Some((task_id, agent_session_id, context_id, resource_id));
+        let next = (task_id, agent_session_id, context_id, resource_id);
+        let mut binding = lock(active.surface_binding.as_ref());
+        if let Some(existing) = *binding {
+            return existing == next;
+        }
+        *binding = Some(next);
         true
+    }
+
+    pub fn process_session_id_for_workspace(
+        &self,
+        workspace_key: &BrowserWorkspaceKey,
+    ) -> Option<String> {
+        let registrations = lock(&self.inner.registrations);
+        let mut found = None;
+        for active in registrations.by_token.values() {
+            if active.workspace_key != *workspace_key {
+                continue;
+            }
+            if found.is_some() {
+                return None;
+            }
+            found = Some(active.process_session_id.clone());
+        }
+        found
+    }
+
+    #[cfg(test)]
+    fn published_host_surface_binding(
+        &self,
+        process_session_id: &str,
+    ) -> Option<HostSurfaceBinding> {
+        let registrations = lock(&self.inner.registrations);
+        let token = registrations.token_by_process.get(process_session_id)?;
+        let active = registrations.by_token.get(token)?;
+        *lock(active.surface_binding.as_ref())
     }
 
     pub fn clear_host_surface_binding(&self, process_session_id: &str) -> bool {
@@ -831,6 +864,131 @@ mod tests {
             context_id,
             resource,
         ));
+    }
+
+    #[test]
+    fn host_surface_binding_publish_and_clear_fail_closed_on_identity_and_registration() {
+        use crate::domain::id::{AgentSessionId, BrowserContextId, ResourceId, TaskId};
+        let (bridge, _inbox) = browser_command_channel(1);
+        let gateway = BrowserGatewayHandle::start(bridge).expect("start gateway");
+        let registrar = gateway.registrar();
+        let workspace_a = BrowserWorkspaceKey::new("project-a", "conversation-a").unwrap();
+        let workspace_b = BrowserWorkspaceKey::new("project-b", "conversation-b").unwrap();
+        let shared = BrowserWorkspaceKey::new("shared-project", "shared-conversation").unwrap();
+        let registration_a = registrar
+            .register(
+                "process-a",
+                workspace_a.clone(),
+                BrowserWorkspaceSnapshot::default(),
+            )
+            .expect("register a");
+        let registration_b = registrar
+            .register(
+                "process-b",
+                workspace_b.clone(),
+                BrowserWorkspaceSnapshot::default(),
+            )
+            .expect("register b");
+        let shared_a = registrar
+            .register(
+                "shared-a",
+                shared.clone(),
+                BrowserWorkspaceSnapshot::default(),
+            )
+            .expect("register shared a");
+        let shared_b = registrar
+            .register(
+                "shared-b",
+                shared.clone(),
+                BrowserWorkspaceSnapshot::default(),
+            )
+            .expect("register shared b");
+        let task_a = TaskId::new();
+        let task_b = TaskId::new();
+        let session_a = AgentSessionId::new();
+        let session_b = AgentSessionId::new();
+        let context_a = BrowserContextId::new();
+        let context_b = BrowserContextId::new();
+        let resource_a = ResourceId::new();
+        let resource_b = ResourceId::new();
+
+        assert_eq!(
+            registrar
+                .process_session_id_for_workspace(&workspace_a)
+                .as_deref(),
+            Some(registration_a.process_session_id())
+        );
+        assert_eq!(
+            registrar
+                .process_session_id_for_workspace(&workspace_b)
+                .as_deref(),
+            Some(registration_b.process_session_id())
+        );
+        assert_eq!(registrar.process_session_id_for_workspace(&shared), None);
+
+        assert!(gateway.publish_host_surface_binding(
+            registration_a.process_session_id(),
+            task_a,
+            session_a,
+            context_a,
+            resource_a,
+        ));
+        assert_eq!(
+            registrar.published_host_surface_binding(registration_a.process_session_id()),
+            Some((task_a, session_a, context_a, resource_a))
+        );
+        assert!(
+            gateway.publish_host_surface_binding(
+                registration_a.process_session_id(),
+                task_a,
+                session_a,
+                context_a,
+                resource_a,
+            ),
+            "exact republish of the same tuple must remain successful"
+        );
+        assert!(
+            !gateway.publish_host_surface_binding(
+                registration_a.process_session_id(),
+                task_b,
+                session_b,
+                context_b,
+                resource_b,
+            ),
+            "mismatched identity must fail closed without replacing the live tuple"
+        );
+        assert_eq!(
+            registrar.published_host_surface_binding(registration_a.process_session_id()),
+            Some((task_a, session_a, context_a, resource_a))
+        );
+        assert!(gateway.publish_host_surface_binding(
+            registration_b.process_session_id(),
+            task_b,
+            session_b,
+            context_b,
+            resource_b,
+        ));
+        assert_eq!(
+            registrar.published_host_surface_binding(registration_b.process_session_id()),
+            Some((task_b, session_b, context_b, resource_b))
+        );
+        assert!(gateway.clear_host_surface_binding(registration_a.process_session_id()));
+        assert_eq!(
+            registrar.published_host_surface_binding(registration_a.process_session_id()),
+            None
+        );
+        assert_eq!(
+            registrar.published_host_surface_binding(registration_b.process_session_id()),
+            Some((task_b, session_b, context_b, resource_b)),
+            "clearing one registration must not affect another"
+        );
+        assert!(registrar.revoke(&shared_a));
+        assert!(registrar.revoke(&shared_b));
+        assert_eq!(
+            registrar.process_session_id_for_workspace(&shared),
+            None,
+            "revoked shared workspace must not invent a process session"
+        );
     }
 
     #[test]

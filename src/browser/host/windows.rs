@@ -30,8 +30,9 @@ use crate::browser::{
     BrowserAnnotationLifecycle, BrowserAnnotationRoute, BrowserApprovalPolicy,
     BrowserApprovalRequest, BrowserAttachmentProjection, BrowserBounds, BrowserCommand,
     BrowserCommandRequest, BrowserConsoleEntry, BrowserConsoleOperation, BrowserDiagnosticLevel,
-    BrowserDownloadState, BrowserDownloadStore, BrowserError, BrowserHostControl, BrowserHostEvent,
-    BrowserHostStatus, BrowserInvocationActor, BrowserJournalActor, BrowserJournalEntry,
+    BrowserDownloadState, BrowserDownloadStore, BrowserError, BrowserGatewayRegistrar,
+    BrowserHostControl, BrowserHostEvent, BrowserHostStatus, BrowserInvocationActor,
+    BrowserInvocationContext, BrowserJournalActor, BrowserJournalEntry,
     BrowserLocatorFailureTarget, BrowserNetworkEntry, BrowserNetworkOperation,
     BrowserOperationQueue, BrowserOperationTarget, BrowserPageIpcMessage, BrowserPageLoadState,
     BrowserPageRecordingAuthority, BrowserPageRecordingEnvelope, BrowserPageRecordingIngress,
@@ -906,6 +907,26 @@ struct PreparedTaskSurface {
     agent_session_id: crate::domain::id::AgentSessionId,
 }
 
+fn completed_task_aware_identity(
+    prepared: Option<PreparedTaskSurface>,
+    surface_identity: Option<BrowserSurfaceIdentity>,
+    agent_session_id: Option<crate::domain::id::AgentSessionId>,
+) -> Result<
+    Option<(BrowserSurfaceIdentity, crate::domain::id::AgentSessionId)>,
+    BrowserTaskSurfaceBindBlocker,
+> {
+    match (prepared, surface_identity, agent_session_id) {
+        (None, None, None) => Ok(None),
+        (Some(prepared), Some(identity), Some(agent_session_id))
+            if prepared.identity == identity && prepared.agent_session_id == agent_session_id =>
+        {
+            let identity = require_completed_wry_task_identity(Some(identity))?;
+            Ok(Some((identity, agent_session_id)))
+        }
+        _ => Err(BrowserTaskSurfaceBindBlocker::TaskIdentityUnavailableAtBuildCompletion),
+    }
+}
+
 struct BrowserNativeViewBuildSpec {
     build_id: u64,
     key: BrowserViewKey,
@@ -1053,6 +1074,10 @@ pub struct BrowserWebViewHost {
     surface_backend: HostOwnedNativeSurfaceBackend,
     task_surface_bind_blocker: Option<BrowserTaskSurfaceBindBlocker>,
     prepared_task_surfaces: HashMap<BrowserViewKey, PreparedTaskSurface>,
+    pending_task_surface: Option<(BrowserWorkspaceKey, PreparedTaskSurface)>,
+    task_surface_capture_active: bool,
+    gateway_registrar: Option<BrowserGatewayRegistrar>,
+    published_host_bindings: HashMap<BrowserViewKey, String>,
     projects: HashMap<String, BrowserProjectRuntime>,
     views: HashMap<BrowserViewKey, WebView>,
     pending_native_view_teardown: Option<BrowserNativeViewTeardown>,
@@ -1172,6 +1197,10 @@ impl BrowserWebViewHost {
             surface_backend: HostOwnedNativeSurfaceBackend::new(),
             task_surface_bind_blocker: None,
             prepared_task_surfaces: HashMap::new(),
+            pending_task_surface: None,
+            task_surface_capture_active: false,
+            gateway_registrar: None,
+            published_host_bindings: HashMap::new(),
             trusted_app_config_dir,
             projects: HashMap::new(),
             views: HashMap::new(),
@@ -1349,6 +1378,10 @@ impl BrowserWebViewHost {
         self.task_surface_bind_blocker
     }
 
+    pub fn attach_gateway_registrar(&mut self, registrar: BrowserGatewayRegistrar) {
+        self.gateway_registrar = Some(registrar);
+    }
+
     pub fn prepare_task_surface_identity(
         &mut self,
         workspace_key: &BrowserWorkspaceKey,
@@ -1366,6 +1399,57 @@ impl BrowserWebViewHost {
                 agent_session_id,
             },
         );
+    }
+
+    fn capture_request_task_surface_identity(
+        &mut self,
+        workspace_key: &BrowserWorkspaceKey,
+        command: &BrowserCommand,
+        context: &BrowserInvocationContext,
+    ) {
+        self.task_surface_capture_active = true;
+        if self
+            .pending_task_surface
+            .as_ref()
+            .is_some_and(|(pending, _)| pending == workspace_key)
+        {
+            self.pending_task_surface = None;
+        }
+        let Some((task_id, agent_session_id, context_id, resource_id)) =
+            context.exact_surface_binding()
+        else {
+            return;
+        };
+        let identity = BrowserSurfaceIdentity {
+            task_id,
+            context_id,
+            resource_id,
+        };
+        let prepared = PreparedTaskSurface {
+            identity,
+            agent_session_id,
+        };
+        if let Some(tab_id) = command.tab_id() {
+            self.prepare_task_surface_identity(
+                workspace_key,
+                tab_id,
+                prepared.identity,
+                prepared.agent_session_id,
+            );
+            return;
+        }
+        self.pending_task_surface = Some((workspace_key.clone(), prepared));
+    }
+
+    fn finish_request_task_surface_identity(&mut self, workspace_key: &BrowserWorkspaceKey) {
+        self.task_surface_capture_active = false;
+        if self
+            .pending_task_surface
+            .as_ref()
+            .is_some_and(|(pending, _)| pending == workspace_key)
+        {
+            self.pending_task_surface = None;
+        }
     }
 
     fn bind_completed_identity(
@@ -1391,6 +1475,64 @@ impl BrowserWebViewHost {
             dpi,
         )
         .map(|_| ())
+    }
+
+    fn publish_completed_host_binding(
+        &mut self,
+        key: &BrowserViewKey,
+        identity: BrowserSurfaceIdentity,
+        agent_session_id: crate::domain::id::AgentSessionId,
+    ) -> bool {
+        let Some(registrar) = self.gateway_registrar.as_ref() else {
+            return false;
+        };
+        let Some(process_session_id) =
+            registrar.process_session_id_for_workspace(&key.workspace_key)
+        else {
+            return false;
+        };
+        if !registrar.publish_host_surface_binding(
+            &process_session_id,
+            identity.task_id,
+            agent_session_id,
+            identity.context_id,
+            identity.resource_id,
+        ) {
+            return false;
+        }
+        self.published_host_bindings
+            .insert(key.clone(), process_session_id);
+        true
+    }
+
+    fn clear_published_gateway_binding(&mut self, key: &BrowserViewKey) {
+        let Some(process_session_id) = self.published_host_bindings.remove(key) else {
+            return;
+        };
+        if self
+            .published_host_bindings
+            .values()
+            .any(|published| published == &process_session_id)
+        {
+            return;
+        }
+        if let Some(registrar) = &self.gateway_registrar {
+            let _ = registrar.clear_host_surface_binding(&process_session_id);
+        }
+    }
+
+    fn clear_all_published_gateway_bindings(&mut self) {
+        let process_session_ids = self
+            .published_host_bindings
+            .drain()
+            .map(|(_, process_session_id)| process_session_id)
+            .collect::<Vec<_>>();
+        let Some(registrar) = &self.gateway_registrar else {
+            return;
+        };
+        for process_session_id in process_session_ids {
+            let _ = registrar.clear_host_surface_binding(&process_session_id);
+        }
     }
 
     fn ensure_host_parking_hwnd(
@@ -1566,6 +1708,8 @@ impl BrowserWebViewHost {
         }
         let mut retired_projects = Vec::new();
         for key in matching_keys {
+            self.clear_published_gateway_binding(&key);
+            self.prepared_task_surfaces.remove(&key);
             self.views.remove(&key);
             retired_projects.push(key.workspace_key.project_id.clone());
         }
@@ -1638,12 +1782,20 @@ impl BrowserWebViewHost {
             self.recording_views.clear();
             self.recording_ingresses.clear();
             self.document_secret_states.clear();
+            self.clear_all_published_gateway_bindings();
+            self.prepared_task_surfaces.clear();
+            self.pending_task_surface = None;
+            self.task_surface_capture_active = false;
             return BrowserAppExitDisposition::Deferred;
         }
         self.cancel_all_native_view_builds();
         self.recording_views.clear();
         self.recording_ingresses.clear();
         self.document_secret_states.clear();
+        self.clear_all_published_gateway_bindings();
+        self.prepared_task_surfaces.clear();
+        self.pending_task_surface = None;
+        self.task_surface_capture_active = false;
         if !self.views.is_empty() {
             let retired_views = self.views.drain().map(|(_, view)| view).collect::<Vec<_>>();
             if let Some(pending) = self.pending_native_view_teardown.as_mut() {
@@ -1879,12 +2031,19 @@ impl BrowserWebViewHost {
         if context.actor != BrowserInvocationActor::Agent {
             return Ok(());
         }
-        let binding =
-            context
-                .exact_surface_binding()
-                .map(|(task_id, _, context_id, resource_id)| {
-                    (task_id, Some(context_id), Some(resource_id))
-                });
+        let binding = match context.exact_surface_binding() {
+            Some((task_id, _agent_session_id, context_id, resource_id)) => {
+                if let Some(identity) = self.state.normalize_legacy_mcp_task_surface(task_id) {
+                    if identity.context_id != context_id || identity.resource_id != resource_id {
+                        return Err(BrowserError::InvalidInvocation {
+                            field: "agent_session_id".to_string(),
+                        });
+                    }
+                }
+                Some((task_id, Some(context_id), Some(resource_id)))
+            }
+            None => None,
+        };
         self.state
             .require_legacy_mcp_exact_binding(binding)
             .map_err(|_| BrowserError::InvalidInvocation {
@@ -2049,7 +2208,9 @@ impl BrowserWebViewHost {
         }
         let workspace_key = request.workspace_key().clone();
         let command = request.command().clone();
+        self.capture_request_task_surface_identity(&workspace_key, &command, request.context());
         if let Err(error) = self.require_command_view_ready(window, &workspace_key, &command) {
+            self.finish_request_task_surface_identity(&workspace_key);
             request.respond(Err(error));
             return;
         }
@@ -2060,6 +2221,7 @@ impl BrowserWebViewHost {
                 &command,
                 request.context().declared_risk,
             ) {
+                self.finish_request_task_surface_identity(&workspace_key);
                 self.respond_request(request, Err(map_agent_recording_error(error)));
                 return;
             }
@@ -2080,6 +2242,7 @@ impl BrowserWebViewHost {
                 command,
                 capture_user_chrome,
             );
+            self.finish_request_task_surface_identity(&workspace_key);
             self.respond_request(request, result);
             return;
         }
@@ -2092,6 +2255,7 @@ impl BrowserWebViewHost {
         ) {
             self.start_queued_work(window, target, work);
         }
+        self.finish_request_task_surface_identity(&workspace_key);
     }
 
     pub(crate) fn handle_repair_highlight_cleanup(
@@ -2222,9 +2386,16 @@ impl BrowserWebViewHost {
             self.finish_queued_request(window, target, operation_id, request, Err(error));
             return;
         }
+        let workspace_key = request.workspace_key().clone();
+        self.capture_request_task_surface_identity(
+            &workspace_key,
+            request.command(),
+            request.context(),
+        );
         if browser_command_is_automation(request.command()) {
             match self.begin_automation_request(window, &target, &request, None) {
                 BrowserStartResult::Pending(phase) => {
+                    self.finish_request_task_surface_identity(&workspace_key);
                     self.active_requests.insert(
                         target,
                         ActiveBrowserRequest {
@@ -2236,6 +2407,7 @@ impl BrowserWebViewHost {
                     );
                 }
                 BrowserStartResult::Complete(result) => {
+                    self.finish_request_task_surface_identity(&workspace_key);
                     self.finish_queued_request(window, target, operation_id, request, result);
                 }
             }
@@ -2244,6 +2416,7 @@ impl BrowserWebViewHost {
         if matches!(request.command(), BrowserCommand::Annotations { .. }) {
             match self.begin_annotation_request(window, &target, &request, None) {
                 BrowserStartResult::Pending(phase) => {
+                    self.finish_request_task_surface_identity(&workspace_key);
                     self.active_requests.insert(
                         target,
                         ActiveBrowserRequest {
@@ -2255,6 +2428,7 @@ impl BrowserWebViewHost {
                     );
                 }
                 BrowserStartResult::Complete(result) => {
+                    self.finish_request_task_surface_identity(&workspace_key);
                     self.finish_queued_request(window, target, operation_id, request, result);
                 }
             }
@@ -2268,6 +2442,7 @@ impl BrowserWebViewHost {
         ) {
             match self.begin_recording_request(window, &target, &request, None, None) {
                 BrowserStartResult::Pending(phase) => {
+                    self.finish_request_task_surface_identity(&workspace_key);
                     self.active_requests.insert(
                         target,
                         ActiveBrowserRequest {
@@ -2279,14 +2454,15 @@ impl BrowserWebViewHost {
                     );
                 }
                 BrowserStartResult::Complete(result) => {
+                    self.finish_request_task_surface_identity(&workspace_key);
                     self.finish_queued_request(window, target, operation_id, request, result);
                 }
             }
             return;
         }
-        let workspace_key = request.workspace_key().clone();
         let command = request.command().clone();
         let result = self.handle_command_with_user_capture(window, &workspace_key, command, false);
+        self.finish_request_task_surface_identity(&workspace_key);
         self.finish_queued_request(window, target, operation_id, request, result);
     }
 
@@ -4423,6 +4599,8 @@ impl BrowserWebViewHost {
         }
         let _ = self.remove_page_recording_view(&target.workspace_key, &target.tab_id);
         let key = view_key(&target.workspace_key, &target.tab_id);
+        self.clear_published_gateway_binding(&key);
+        self.prepared_task_surfaces.remove(&key);
         self.views.remove(&key);
         self.recording_ingresses.remove(&key);
         self.document_secret_states.remove(&key);
@@ -6423,6 +6601,8 @@ impl BrowserWebViewHost {
                 let _ = self.remove_page_recording_view(workspace_key, &tab_id);
                 let key = view_key(workspace_key, &tab_id);
                 self.cancel_native_view_build(&key);
+                self.clear_published_gateway_binding(&key);
+                self.prepared_task_surfaces.remove(&key);
                 self.views.remove(&key);
                 self.recording_ingresses.remove(&key);
                 self.document_secret_states.remove(&key);
@@ -6560,6 +6740,24 @@ impl BrowserWebViewHost {
                 self.discard_workflow_state(workspace_key);
                 self.terminalize_repair_preview_workspace(workspace_key);
                 self.cancel_native_workspace_builds(workspace_key);
+                let retired_keys = self
+                    .published_host_bindings
+                    .keys()
+                    .chain(self.prepared_task_surfaces.keys())
+                    .filter(|key| key.workspace_key == *workspace_key)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for key in retired_keys {
+                    self.clear_published_gateway_binding(&key);
+                    self.prepared_task_surfaces.remove(&key);
+                }
+                if self
+                    .pending_task_surface
+                    .as_ref()
+                    .is_some_and(|(pending, _)| pending == workspace_key)
+                {
+                    self.pending_task_surface = None;
+                }
                 self.views
                     .retain(|key, _| key.workspace_key != *workspace_key);
                 self.recording_ingresses
@@ -6684,6 +6882,22 @@ impl BrowserWebViewHost {
         retry_failed: bool,
     ) -> Result<BrowserViewReadiness, BrowserError> {
         let key = view_key(workspace_key, tab_id);
+        if self.task_surface_capture_active {
+            if let Some((pending_workspace, prepared)) = self.pending_task_surface.take() {
+                if pending_workspace == *workspace_key {
+                    if !self.prepared_task_surfaces.contains_key(&key) {
+                        self.prepare_task_surface_identity(
+                            workspace_key,
+                            tab_id,
+                            prepared.identity,
+                            prepared.agent_session_id,
+                        );
+                    }
+                } else {
+                    self.pending_task_surface = Some((pending_workspace, prepared));
+                }
+            }
+        }
         if self.views.contains_key(&key) {
             return Ok(BrowserViewReadiness::Ready);
         }
@@ -6873,23 +7087,36 @@ impl BrowserWebViewHost {
                 self.document_secret_states
                     .insert(key.clone(), document_secret_state);
                 self.views.insert(key.clone(), webview);
-                match (prepared, surface_identity) {
-                    (Some(prepared), Some(identity)) if prepared.identity == identity => {
-                        let _ = agent_session_id;
+                match completed_task_aware_identity(prepared, surface_identity, agent_session_id) {
+                    Ok(Some((identity, agent_session_id))) => {
                         match self.bind_completed_identity(&key, identity) {
-                            Ok(()) => self.task_surface_bind_blocker = None,
+                            Ok(()) => {
+                                let published = self.publish_completed_host_binding(
+                                    &key,
+                                    identity,
+                                    agent_session_id,
+                                );
+                                self.task_surface_bind_blocker = if published {
+                                    None
+                                } else {
+                                    Some(
+                                        BrowserTaskSurfaceBindBlocker::TaskIdentityUnavailableAtBuildCompletion,
+                                    )
+                                };
+                            }
+                            Err(BrowserNativeViewError::TaskIdentityUnavailable) => {
+                                self.task_surface_bind_blocker = Some(
+                                    BrowserTaskSurfaceBindBlocker::TaskIdentityUnavailableAtBuildCompletion,
+                                );
+                            }
                             Err(_) => {
                                 self.task_surface_bind_blocker =
                                     Some(BrowserTaskSurfaceBindBlocker::ChildHwndUnobservable)
                             }
                         }
                     }
-                    (None, None) => self.task_surface_bind_blocker = None,
-                    _ => {
-                        self.task_surface_bind_blocker = Some(
-                            BrowserTaskSurfaceBindBlocker::TaskIdentityUnavailableAtBuildCompletion,
-                        );
-                    }
+                    Ok(None) => self.task_surface_bind_blocker = None,
+                    Err(blocker) => self.task_surface_bind_blocker = Some(blocker),
                 }
                 if self
                     .workflow_coordinator
@@ -7157,6 +7384,24 @@ impl BrowserWebViewHost {
 
         self.discard_project_page_recordings(&workspace_key.project_id);
         self.terminalize_repair_preview_project(&workspace_key.project_id);
+        let retired_keys = self
+            .published_host_bindings
+            .keys()
+            .chain(self.prepared_task_surfaces.keys())
+            .filter(|key| key.workspace_key.project_id == workspace_key.project_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in retired_keys {
+            self.clear_published_gateway_binding(&key);
+            self.prepared_task_surfaces.remove(&key);
+        }
+        if self
+            .pending_task_surface
+            .as_ref()
+            .is_some_and(|(pending, _)| pending.project_id == workspace_key.project_id)
+        {
+            self.pending_task_surface = None;
+        }
         self.views
             .retain(|key, _| key.workspace_key.project_id != workspace_key.project_id);
         self.recording_ingresses
@@ -8406,6 +8651,55 @@ mod secret_document_state_tests {
 
     assert_not_impl_any!(BrowserParentWindowLease: Copy, Clone, Send, Sync);
     assert_not_impl_any!(BrowserNativeWindowBuildLease: Copy, Clone, Send, Sync);
+
+    #[test]
+    fn completed_task_aware_identity_preserves_exact_tuple_and_fails_closed() {
+        use super::{completed_task_aware_identity, PreparedTaskSurface};
+        use crate::browser::host::BrowserTaskSurfaceBindBlocker;
+        use crate::domain::id::{AgentSessionId, BrowserContextId, ResourceId, TaskId};
+        use crate::protocol::BrowserSurfaceIdentity;
+
+        let task_id = TaskId::new();
+        let agent_session_id = AgentSessionId::new();
+        let context_id = BrowserContextId::new();
+        let resource_id = ResourceId::new();
+        let identity = BrowserSurfaceIdentity {
+            task_id,
+            context_id,
+            resource_id,
+        };
+        let prepared = PreparedTaskSurface {
+            identity,
+            agent_session_id,
+        };
+
+        assert_eq!(completed_task_aware_identity(None, None, None), Ok(None));
+        assert_eq!(
+            completed_task_aware_identity(Some(prepared), Some(identity), Some(agent_session_id)),
+            Ok(Some((identity, agent_session_id)))
+        );
+        assert_eq!(
+            completed_task_aware_identity(Some(prepared), Some(identity), None),
+            Err(BrowserTaskSurfaceBindBlocker::TaskIdentityUnavailableAtBuildCompletion)
+        );
+        assert_eq!(
+            completed_task_aware_identity(None, Some(identity), Some(agent_session_id)),
+            Err(BrowserTaskSurfaceBindBlocker::TaskIdentityUnavailableAtBuildCompletion)
+        );
+        let other_session = AgentSessionId::new();
+        assert_eq!(
+            completed_task_aware_identity(Some(prepared), Some(identity), Some(other_session)),
+            Err(BrowserTaskSurfaceBindBlocker::TaskIdentityUnavailableAtBuildCompletion)
+        );
+        let mismatched = PreparedTaskSurface {
+            identity,
+            agent_session_id: other_session,
+        };
+        assert_eq!(
+            completed_task_aware_identity(Some(mismatched), Some(identity), Some(other_session)),
+            Err(BrowserTaskSurfaceBindBlocker::TaskIdentityUnavailableAtBuildCompletion)
+        );
+    }
 
     #[derive(Clone, Copy)]
     enum DocumentStateRemoval {
