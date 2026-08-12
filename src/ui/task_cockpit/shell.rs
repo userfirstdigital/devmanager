@@ -4,10 +4,12 @@ use gpui::{div, Context, InteractiveElement, IntoElement, ParentElement, Render,
 
 use crate::client::model::ClientModel;
 use crate::domain::id::{RequestId, TaskId};
+use crate::domain::TaskCockpitResult;
 use crate::ui::actions::{
     DockSelectArtifacts, DockSelectBrowser, DockSelectChanges, DockSelectFiles, DockSelectReview,
     DockSelectServices, DockSelectTerminal, DockToggleRawTerminal,
 };
+use crate::ui::task_cockpit::cockpit_projection::TaskCockpitLiveProjection;
 use crate::ui::task_cockpit::dock::{
     ContextDock, DependencyUnavailable, DockEdge, DockProjectionError, DockTool, PointerPhase,
     PointerPress,
@@ -17,6 +19,7 @@ use crate::ui::tokens::{theme, Density, Scale, ThemeMode};
 pub struct TaskCockpitShell {
     dock: ContextDock,
     model: Option<ClientModel>,
+    projection: Option<TaskCockpitLiveProjection>,
 }
 
 impl TaskCockpitShell {
@@ -24,6 +27,7 @@ impl TaskCockpitShell {
         Self {
             dock: ContextDock::new(edge),
             model: None,
+            projection: None,
         }
     }
 
@@ -42,7 +46,43 @@ impl TaskCockpitShell {
     }
 
     pub fn follow_task(&mut self, task_id: TaskId) {
+        if self
+            .projection
+            .as_ref()
+            .is_some_and(|projection| projection.task_id != task_id)
+        {
+            self.projection = None;
+        }
         self.dock.follow_task(task_id);
+    }
+
+    pub fn begin_cockpit_query(&mut self, task_id: TaskId, action_id: &'static str) {
+        let mut projection = self
+            .projection
+            .take()
+            .filter(|projection| projection.task_id == task_id)
+            .unwrap_or_else(|| TaskCockpitLiveProjection::empty(task_id));
+        projection.begin_query(action_id);
+        self.dock.bind_cockpit_projection(projection.clone());
+        self.projection = Some(projection);
+    }
+
+    pub fn apply_cockpit_result(&mut self, result: &TaskCockpitResult) {
+        let Some(task_id) = self.dock.selected_task() else {
+            return;
+        };
+        let mut projection = self
+            .projection
+            .take()
+            .filter(|projection| projection.task_id == task_id)
+            .unwrap_or_else(|| TaskCockpitLiveProjection::empty(task_id));
+        projection.apply_result(result);
+        self.dock.bind_cockpit_projection(projection.clone());
+        self.projection = Some(projection);
+    }
+
+    pub fn live_projection(&self) -> Option<&TaskCockpitLiveProjection> {
+        self.projection.as_ref()
     }
 
     pub fn follow_projection(&mut self, model: &ClientModel) {

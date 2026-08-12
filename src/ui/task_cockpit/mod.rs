@@ -6,9 +6,10 @@ pub mod inbox;
 pub use bootstrap::NativeNextTaskCockpit;
 pub mod header;
 pub use header::{
-    ActionTarget, AgentIdentity, AgentProjection, AgentResourceField, AgentRoleProjection,
-    ConnectObservation, ConnectObservationIdentity, ConnectState, CpuDiagnostic, CpuInputUnit,
-    CpuProjection, HeaderAction, HeaderField, HeaderFieldKey, HeaderHighWaterLedger, HeaderLayout,
+    one_fresh_quota_observations, update_observation_from_snapshot, ActionTarget, AgentIdentity,
+    AgentProjection, AgentResourceField, AgentRoleProjection, ConnectObservation,
+    ConnectObservationIdentity, ConnectState, CpuDiagnostic, CpuInputUnit, CpuProjection,
+    HeaderAction, HeaderField, HeaderFieldKey, HeaderHighWaterLedger, HeaderLayout,
     HighWaterDecision, HostHealth, HostObservation, HostObservationIdentity,
     HostResourceObservation, HostResourceProjection, OverflowControl, PendingHeaderActionError,
     PendingHeaderActionQueue, PrimaryAgentProjection, ProjectProjection, ProjectedAction,
@@ -46,6 +47,7 @@ pub enum NativeCockpitMount {
 
 pub const NATIVE_COCKPIT_MOUNT: NativeCockpitMount = NativeCockpitMount::Mounted;
 
+pub mod cockpit_projection;
 pub mod composer;
 pub mod dock;
 pub mod shell;
@@ -60,7 +62,10 @@ pub use context_dock::{
 
 pub mod services_panel;
 
+pub use cockpit_projection::{
+    summary_line, surface_query_action_id, CockpitSurfaceLoad, TaskCockpitLiveProjection,
+};
 pub use services_panel::{
-    project_services_panel, ServiceActionAffordance, ServicePanelAction, ServicePanelRow,
-    ServicePanelTone, ServicesPanelProjection,
+    project_services_from_task_projection, project_services_panel, ServiceActionAffordance,
+    ServicePanelAction, ServicePanelRow, ServicePanelTone, ServicesPanelProjection,
 };

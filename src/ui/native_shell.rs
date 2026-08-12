@@ -32,18 +32,22 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::assets::AppAssets;
-use crate::client::action;
+use crate::client::action::{self, CockpitSurfaceKind, UpdaterAction};
 use crate::client::{
     ClientModel, ClientSubscription, HostClient, HostClientConfig, SubscriptionUpdate,
 };
 use crate::config::paths::{resolve_app_paths, AppProfile, BuildKind};
+use crate::domain::cockpit::TaskCockpitQuery;
 use crate::domain::host::{HostQuitInspection, HostQuitWorktreeInspection};
+use crate::domain::id::SubscriptionId;
 use crate::domain::id::{CommandId, RequestId, TaskId};
 use crate::domain::snapshot::SnapshotSection;
 use crate::domain::task::VisibleTaskStatus;
 use crate::domain::ClientId;
 use crate::host::IpcError;
+use crate::prompts::projection::{PromptLibraryQuery, PromptNamespace, PromptProjectionReply};
 use crate::protocol::BrowserSecurityState;
+use crate::protocol::StreamFrame;
 use crate::protocol::{Capability, CapabilitySet, FrameLimits};
 use crate::ui::actions::{
     self, DockTool, HostActions, HostStatus, KeyboardAction, KeyboardModel, KeyboardShortcut,
@@ -57,25 +61,27 @@ use crate::ui::components::{
     AccessibilityMetadata, AccessibleRole, ActionEvent, ActionRequest, ActivationSource,
     InteractionStateModel,
 };
+use crate::ui::prompts::mutation::apply_host_reply_to_session;
 use crate::ui::prompts::{PromptLibraryKey, PromptLibrarySession};
 use crate::ui::shell::{
     ColorScheme, DataFixtureKind, Density, LayoutWidth, NavigationResult, PointerButton,
     PointerOwner, PromptLibraryViewport, ScalePercent, Shell, TerminalPressRejection,
     TerminalRelease,
 };
+use crate::ui::task_cockpit::composer::{ComposerError, TaskComposer};
 use crate::ui::task_cockpit::dock::{DockEdge, DockTool as CockpitDockTool};
 use crate::ui::task_cockpit::shell::TaskCockpitShell;
 use crate::ui::task_cockpit::{
-    project_services_panel, render_task_browser_dock, ServicesPanelProjection, TaskBrowserDockModel,
-};
-use crate::ui::task_cockpit::{
-    Inbox, InboxPresentationWidth, InboxRenderModel, TaskHeaderModel, TaskList,
+    one_fresh_quota_observations, project_services_from_task_projection, project_services_panel,
+    render_task_browser_dock, summary_line, update_observation_from_snapshot, Inbox,
+    InboxPresentationWidth, InboxRenderModel, ServicesPanelProjection, TaskBrowserDockModel,
+    TaskHeaderModel, TaskList, TopBarProjectionController, TopBarProjectionInput, UpdateState,
     DEFAULT_VISIBLE_ROWS, FIXED_VIRTUAL_OVERSCAN,
 };
 use crate::ui::terminal_adapter::TerminalDockAdapter;
 pub use crate::ui::terminal_adapter::{TerminalDockState, TERMINAL_ADAPTER_DEPENDENCY};
 use crate::ui::tokens::RuntimePreferencesSnapshot;
-use crate::updater::UpdaterService;
+use crate::updater::{UpdaterService, UpdaterSnapshot, UpdaterStage};
 
 /// Explicit UI action: acknowledged client detach (host survives in production).
 #[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
@@ -1485,6 +1491,19 @@ pub enum NativeHostCommand {
     HostActionsQuery {
         request_id: RequestId,
     },
+    TaskCockpitQuery {
+        request_id: RequestId,
+        task_id: TaskId,
+        query: TaskCockpitQuery,
+    },
+    PromptLibraryQuery {
+        request_id: RequestId,
+        query: PromptLibraryQuery,
+    },
+    Updater {
+        request_id: RequestId,
+        action: UpdaterAction,
+    },
     /// Explicitly surfaced typed hold. Visible query actions must never map here.
     Hold {
         action_id: &'static str,
@@ -1503,6 +1522,9 @@ fn native_command_id(command: &NativeHostCommand) -> Option<CommandId> {
         | NativeHostCommand::TaskListQuery { .. }
         | NativeHostCommand::HostStatusQuery { .. }
         | NativeHostCommand::HostActionsQuery { .. }
+        | NativeHostCommand::TaskCockpitQuery { .. }
+        | NativeHostCommand::PromptLibraryQuery { .. }
+        | NativeHostCommand::Updater { .. }
         | NativeHostCommand::Hold { .. } => None,
     }
 }
@@ -1512,7 +1534,10 @@ fn native_request_id(command: &NativeHostCommand) -> Option<RequestId> {
         NativeHostCommand::TaskShowQuery { request_id, .. }
         | NativeHostCommand::TaskListQuery { request_id }
         | NativeHostCommand::HostStatusQuery { request_id }
-        | NativeHostCommand::HostActionsQuery { request_id } => Some(*request_id),
+        | NativeHostCommand::HostActionsQuery { request_id }
+        | NativeHostCommand::TaskCockpitQuery { request_id, .. }
+        | NativeHostCommand::PromptLibraryQuery { request_id, .. }
+        | NativeHostCommand::Updater { request_id, .. } => Some(*request_id),
         _ => None,
     }
 }
@@ -1628,6 +1653,7 @@ pub enum NativeHostActionOutcome {
     Queried {
         action: NativeActionRecord,
         detail: String,
+        body: NativeHostQueryBody,
     },
     Failed {
         action: NativeActionRecord,
@@ -1648,6 +1674,14 @@ impl NativeHostActionOutcome {
             | Self::Uncertain { action, .. } => action,
         }
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NativeHostQueryBody {
+    Text,
+    TaskCockpit(crate::domain::TaskCockpitResult),
+    PromptLibrary(PromptProjectionReply),
+    Updater(UpdaterSnapshot),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1967,6 +2001,7 @@ pub(crate) struct NativeHostClientRuntime {
     bootstrapped: Arc<AtomicBool>,
     pending: VecDeque<NativeActionRecord>,
     ready_projections: Arc<Mutex<VecDeque<NativeHostProjection>>>,
+    ready_stream_frames: Arc<Mutex<VecDeque<StreamFrame>>>,
     command_tx: SyncSender<NativeHostWorkerCommand>,
     channel_depth: Arc<AtomicUsize>,
     cancellation: Arc<AtomicBool>,
@@ -2239,6 +2274,9 @@ impl NativeHostClientRuntime {
         let epochs_for_worker = Arc::clone(&epochs);
         let projections_for_worker = Arc::new(Mutex::new(VecDeque::new()));
         let projections_for_worker_thread = Arc::clone(&projections_for_worker);
+        let stream_frames_for_worker = Arc::new(Mutex::new(VecDeque::new()));
+        let stream_frames_for_worker_thread = Arc::clone(&stream_frames_for_worker);
+        let updater_for_worker = updater.clone();
         let deferred_action_outcome = Arc::new(Mutex::new(None));
         let deferred_action_outcome_for_worker = Arc::clone(&deferred_action_outcome);
         let worker_overflow = Arc::new(Mutex::new(VecDeque::new()));
@@ -2270,6 +2308,8 @@ impl NativeHostClientRuntime {
                         command_rx,
                         channel_depth_for_worker,
                         projections_for_worker_thread,
+                        stream_frames_for_worker_thread,
+                        updater_for_worker,
                         deferred_action_outcome_for_worker,
                         worker_overflow_for_worker,
                     )
@@ -2294,6 +2334,7 @@ impl NativeHostClientRuntime {
             bootstrapped,
             pending: VecDeque::new(),
             ready_projections: projections_for_worker,
+            ready_stream_frames: stream_frames_for_worker,
             command_tx,
             channel_depth,
             cancellation,
@@ -2336,6 +2377,24 @@ impl NativeHostClientRuntime {
 
     pub(crate) fn updater(&self) -> &UpdaterService {
         &self.updater
+    }
+
+    pub(crate) fn take_ready_stream_frames(&mut self, max: usize) -> Vec<StreamFrame> {
+        let limit = max.min(MAX_HOST_PROJECTIONS);
+        self.ready_stream_frames
+            .lock()
+            .map(|mut frames| {
+                let count = limit.min(frames.len());
+                frames.drain(..count).collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn subscription_id(&self) -> Option<SubscriptionId> {
+        self.subscription
+            .lock()
+            .ok()
+            .and_then(|subscription| subscription.subscription_id())
     }
 
     fn validate_attachment(&self, profile: &IsolatedDevProfile) -> Result<(), NativeShellError> {
@@ -2954,6 +3013,8 @@ fn native_host_worker_loop(
     command_rx: Receiver<NativeHostWorkerCommand>,
     channel_depth: Arc<AtomicUsize>,
     projections: Arc<Mutex<VecDeque<NativeHostProjection>>>,
+    stream_frames: Arc<Mutex<VecDeque<StreamFrame>>>,
+    updater: UpdaterService,
     deferred_action_outcome: Arc<Mutex<Option<NativeHostActionOutcome>>>,
     worker_overflow: Arc<Mutex<VecDeque<NativeHostActionOutcome>>>,
 ) {
@@ -3032,6 +3093,7 @@ fn native_host_worker_loop(
                             Some(runtime.block_on(execute_native_command_cancellable(
                                 client,
                                 command,
+                                &updater,
                                 &cancellation,
                             )))
                         });
@@ -3056,7 +3118,7 @@ fn native_host_worker_loop(
                                     }),
                                 }
                             }
-                            Some(Ok(NativeHostExecutionResult::Query(detail))) => {
+                            Some(Ok(NativeHostExecutionResult::Query { detail, body })) => {
                                 NativeHostProjection {
                                     kind: NativeHostProjectionKind::Live,
                                     client_model: None,
@@ -3065,6 +3127,7 @@ fn native_host_worker_loop(
                                     action_outcome: Some(NativeHostActionOutcome::Queried {
                                         action,
                                         detail,
+                                        body,
                                     }),
                                 }
                             }
@@ -3165,6 +3228,7 @@ fn native_host_worker_loop(
             &cancellation,
             &epochs,
             &projections,
+            &stream_frames,
         );
     }
 }
@@ -3270,6 +3334,7 @@ fn pump_subscription_once(
     cancellation: &Arc<AtomicBool>,
     epochs: &Arc<Mutex<NativeHostRuntimeEpochs>>,
     projections: &Arc<Mutex<VecDeque<NativeHostProjection>>>,
+    stream_frames: &Arc<Mutex<VecDeque<StreamFrame>>>,
 ) {
     if cancellation.load(Ordering::Acquire) {
         return;
@@ -3443,7 +3508,12 @@ fn pump_subscription_once(
                 }
             }
         }
-        SubscriptionUpdate::Stream(_) => {
+        SubscriptionUpdate::Stream(frame) => {
+            if let Ok(mut frames) = stream_frames.lock() {
+                if frames.len() < MAX_HOST_PROJECTIONS {
+                    frames.push_back(frame);
+                }
+            }
             publish_projection(
                 projections,
                 NativeHostProjection::kind(NativeHostProjectionKind::Live)
@@ -3566,6 +3636,7 @@ fn publish_projection(
 async fn execute_native_command(
     client: &mut HostClient,
     command: NativeHostCommand,
+    updater: &UpdaterService,
 ) -> Result<NativeHostExecutionResult, IpcError> {
     match command {
         NativeHostCommand::Envelope(envelope) => client
@@ -3664,12 +3735,10 @@ async fn execute_native_command(
                     )))
                 }
             };
-            Ok(NativeHostExecutionResult::Query(bounded_host_error(
-                format!(
-                    "task.show · {} · rev {}",
-                    snapshot.task.title, snapshot.task.revision
-                ),
-            )))
+            Ok(query_text(bounded_host_error(format!(
+                "task.show · {} · rev {}",
+                snapshot.task.title, snapshot.task.revision
+            ))))
         }
         NativeHostCommand::TaskListQuery { request_id } => {
             let _ = request_id;
@@ -3690,7 +3759,7 @@ async fn execute_native_command(
                 page.through_sequence
             ));
             match client.release_snapshot(page.snapshot_id).await? {
-                Ok(()) => Ok(NativeHostExecutionResult::Query(detail)),
+                Ok(()) => Ok(query_text(detail)),
                 Err(error) => Ok(NativeHostExecutionResult::QueryFailed(bounded_host_error(
                     format!("task.list snapshot release failed: {error:?}"),
                 ))),
@@ -3698,16 +3767,14 @@ async fn execute_native_command(
         }
         NativeHostCommand::HostStatusQuery { request_id } => {
             let _ = request_id;
-            Ok(NativeHostExecutionResult::Query(bounded_host_error(
-                format!(
-                    "host.status · boot={} · connection={} · build={} · protocol={}.{}",
-                    client.host_boot_id(),
-                    client.connection_id(),
-                    client.server_build(),
-                    client.protocol_major(),
-                    client.protocol_minor()
-                ),
-            )))
+            Ok(query_text(bounded_host_error(format!(
+                "host.status · boot={} · connection={} · build={} · protocol={}.{}",
+                client.host_boot_id(),
+                client.connection_id(),
+                client.server_build(),
+                client.protocol_major(),
+                client.protocol_minor()
+            ))))
         }
         NativeHostCommand::HostActionsQuery { request_id } => {
             let _ = request_id;
@@ -3716,32 +3783,96 @@ async fn execute_native_command(
                 .iter()
                 .filter(|descriptor| action::action_enabled(descriptor.id, granted))
                 .count();
-            Ok(NativeHostExecutionResult::Query(bounded_host_error(
-                format!(
-                    "host.actions · {} catalog · {} enabled under current grants",
-                    action::catalog().len(),
-                    enabled
-                ),
-            )))
+            Ok(query_text(bounded_host_error(format!(
+                "host.actions · {} catalog · {} enabled under current grants",
+                action::catalog().len(),
+                enabled
+            ))))
+        }
+        NativeHostCommand::TaskCockpitQuery {
+            request_id,
+            task_id,
+            query,
+        } => {
+            let _ = request_id;
+            let action_id = action::cockpit_query_action_id(&query);
+            match client.query_task_cockpit(task_id, query).await? {
+                Ok(result) => Ok(NativeHostExecutionResult::Query {
+                    detail: bounded_host_error(format!(
+                        "{} · {:?}",
+                        action_id,
+                        std::mem::discriminant(&result)
+                    )),
+                    body: NativeHostQueryBody::TaskCockpit(result),
+                }),
+                Err(error) => Ok(NativeHostExecutionResult::QueryFailed(bounded_host_error(
+                    format!("task cockpit query failed: {error:?}"),
+                ))),
+            }
+        }
+        NativeHostCommand::PromptLibraryQuery { request_id, query } => {
+            let _ = request_id;
+            match client.query_prompt_library(query).await? {
+                Ok(reply) => Ok(NativeHostExecutionResult::Query {
+                    detail: bounded_host_error("prompt.library query"),
+                    body: NativeHostQueryBody::PromptLibrary(reply),
+                }),
+                Err(error) => Ok(NativeHostExecutionResult::QueryFailed(bounded_host_error(
+                    format!("prompt library query failed: {error:?}"),
+                ))),
+            }
+        }
+        NativeHostCommand::Updater { request_id, action } => {
+            let _ = request_id;
+            let action_error = match action {
+                UpdaterAction::StartBackground => {
+                    updater.start_background_checks();
+                    None
+                }
+                UpdaterAction::Check => updater.check_for_updates().err(),
+                UpdaterAction::Download => updater.download_update().err(),
+                UpdaterAction::Install => None,
+            };
+            let snapshot = updater.snapshot();
+            if let Some(error) = action_error {
+                return Ok(NativeHostExecutionResult::QueryFailed(bounded_host_error(
+                    error,
+                )));
+            }
+            Ok(NativeHostExecutionResult::Query {
+                detail: bounded_host_error(format!("{} · {:?}", action.id(), snapshot.stage)),
+                body: NativeHostQueryBody::Updater(snapshot),
+            })
         }
         NativeHostCommand::Hold { .. } => Err(IpcError::Unavailable),
+    }
+}
+
+fn query_text(detail: String) -> NativeHostExecutionResult {
+    NativeHostExecutionResult::Query {
+        detail,
+        body: NativeHostQueryBody::Text,
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum NativeHostExecutionResult {
     Command(crate::domain::command::CommandReceipt),
-    Query(String),
+    Query {
+        detail: String,
+        body: NativeHostQueryBody,
+    },
     QueryFailed(String),
 }
 
 async fn execute_native_command_cancellable(
     client: &mut HostClient,
     command: NativeHostCommand,
+    updater: &UpdaterService,
     cancellation: &Arc<AtomicBool>,
 ) -> Result<NativeHostExecutionResult, IpcError> {
     tokio::select! {
-        result = execute_native_command(client, command) => result,
+        result = execute_native_command(client, command, updater) => result,
         _ = wait_for_cancellation(Arc::clone(cancellation)) => Err(IpcError::Unavailable),
     }
 }
@@ -3759,6 +3890,20 @@ fn unix_time_ms() -> i64 {
         .ok()
         .and_then(|duration| i64::try_from(duration.as_millis()).ok())
         .unwrap_or(0)
+}
+
+fn update_state_from_stage(stage: UpdaterStage) -> UpdateState {
+    match stage {
+        UpdaterStage::Disabled => UpdateState::Disabled,
+        UpdaterStage::Idle => UpdateState::Idle,
+        UpdaterStage::Checking => UpdateState::Checking,
+        UpdaterStage::UpToDate => UpdateState::UpToDate,
+        UpdaterStage::UpdateAvailable => UpdateState::Available,
+        UpdaterStage::Downloading => UpdateState::Downloading,
+        UpdaterStage::ReadyToInstall => UpdateState::ReadyToInstall,
+        UpdaterStage::Installing => UpdateState::Installing,
+        UpdaterStage::Error => UpdateState::Error,
+    }
 }
 
 pub(crate) enum NativeHostRuntimeAttachment {
@@ -4342,6 +4487,7 @@ impl NativeInteraction {
             ActionRequest::TaskShow { task_id } => Some(*task_id),
             ActionRequest::TaskRename(arguments) => Some(arguments.task_id),
             ActionRequest::ProviderInput(arguments) => Some(arguments.arguments.task_id),
+            ActionRequest::TaskCockpit { task_id, .. } => Some(*task_id),
             _ => None,
         };
         if request_task.is_some() && request_task != selected_task {
@@ -4424,6 +4570,19 @@ impl NativeInteraction {
             ActionRequest::TaskShow { task_id } => NativeHostCommand::TaskShowQuery {
                 request_id,
                 task_id: *task_id,
+            },
+            ActionRequest::TaskCockpit { task_id, query } => NativeHostCommand::TaskCockpitQuery {
+                request_id,
+                task_id: *task_id,
+                query: query.clone(),
+            },
+            ActionRequest::PromptLibrary { query } => NativeHostCommand::PromptLibraryQuery {
+                request_id,
+                query: query.clone(),
+            },
+            ActionRequest::Updater(action) => NativeHostCommand::Updater {
+                request_id,
+                action: *action,
             },
         };
         let event = ActionEvent::new(request, source, focus_epoch);
@@ -5008,6 +5167,10 @@ pub struct NativeShell {
     last_action_failure: Option<NativeHostActionFailure>,
     last_action_receipt: Option<crate::domain::command::CommandReceipt>,
     last_query_detail: Option<String>,
+    top_bar: Option<TopBarProjectionController>,
+    composer: Option<TaskComposer>,
+    composer_error: Option<String>,
+    updater_snapshot: Option<UpdaterSnapshot>,
     pending_preferences: VecDeque<RuntimePreferencesSnapshot>,
     appearance_subscription: Option<Subscription>,
     bounds_subscription: Option<Subscription>,
@@ -5245,6 +5408,10 @@ impl NativeShell {
             last_action_failure: None,
             last_action_receipt: None,
             last_query_detail: None,
+            top_bar: None,
+            composer: None,
+            composer_error: None,
+            updater_snapshot: None,
             pending_preferences: VecDeque::new(),
             appearance_subscription: None,
             bounds_subscription: None,
@@ -5315,6 +5482,167 @@ impl NativeShell {
 
     pub fn last_query_detail(&self) -> Option<&str> {
         self.last_query_detail.as_deref()
+    }
+
+    fn apply_query_body(&mut self, body: NativeHostQueryBody) {
+        match body {
+            NativeHostQueryBody::Text => {}
+            NativeHostQueryBody::TaskCockpit(result) => {
+                self.cockpit.apply_cockpit_result(&result);
+                if let crate::domain::TaskCockpitResult::Services(services) = &result {
+                    self.services_projection = project_services_from_task_projection(services);
+                }
+            }
+            NativeHostQueryBody::PromptLibrary(reply) => {
+                if let Err(error) = apply_host_reply_to_session(&mut self.prompt_library, &reply) {
+                    self.prompt_library.load = crate::ui::prompts::PromptLibraryLoadState::Error {
+                        message: error.to_string(),
+                    };
+                }
+            }
+            NativeHostQueryBody::Updater(snapshot) => {
+                self.updater_snapshot = Some(snapshot);
+                self.sync_top_bar_from_updater();
+            }
+        }
+    }
+
+    fn refresh_selected_cockpit_surfaces(&mut self) {
+        let Some(task_id) = self.interaction.selected_task() else {
+            return;
+        };
+        self.cockpit
+            .begin_cockpit_query(task_id, crate::client::action::ACTION_GIT_STATUS);
+        for action_id in [
+            crate::client::action::ACTION_WORKSPACE_STATUS,
+            crate::client::action::ACTION_GIT_STATUS,
+            crate::client::action::ACTION_FILES_LIST,
+            crate::client::action::ACTION_SSH_STATUS,
+        ] {
+            if let Some(request) = action::task_cockpit_request(task_id, action_id) {
+                let _ = self.dispatch_action(request);
+            }
+        }
+        let _ = self.dispatch_action(ActionRequest::TaskCockpit {
+            task_id,
+            query: TaskCockpitQuery::ServiceSnapshots,
+        });
+    }
+
+    fn hydrate_prompt_library(&mut self) {
+        self.prompt_library.load = crate::ui::prompts::PromptLibraryLoadState::Loading;
+        let _ = self.dispatch_action(ActionRequest::PromptLibrary {
+            query: PromptLibraryQuery::MetadataPage {
+                namespace: PromptNamespace::Personal,
+                cursor: None,
+                expected_revision: self.prompt_library.expected_revision,
+            },
+        });
+        let _ = self.dispatch_action(ActionRequest::PromptLibrary {
+            query: PromptLibraryQuery::ChainPage {
+                chain_id: None,
+                cursor: None,
+                expected_revision: self.prompt_library.expected_revision,
+            },
+        });
+    }
+
+    fn admit_ready_stream_frames(&mut self, max: usize) {
+        let Some(subscription_id) = self
+            .host_runtime
+            .as_ref()
+            .and_then(|runtime| match runtime {
+                NativeHostRuntimeAttachment::Client(runtime) => runtime.subscription_id(),
+                NativeHostRuntimeAttachment::Injected(_) => None,
+            })
+        else {
+            return;
+        };
+        let frames = match self.host_runtime.as_mut() {
+            Some(NativeHostRuntimeAttachment::Client(runtime)) => {
+                runtime.take_ready_stream_frames(max)
+            }
+            _ => Vec::new(),
+        };
+        for frame in frames {
+            let _ = self
+                .cockpit
+                .dock_mut()
+                .admit_subscription_stream(subscription_id, &frame);
+        }
+        self.sync_terminal_from_cockpit();
+    }
+
+    fn sync_top_bar_from_updater(&mut self) {
+        let snapshot = self.updater_snapshot.clone().or_else(|| {
+            self.host_runtime
+                .as_ref()
+                .and_then(|runtime| match runtime {
+                    NativeHostRuntimeAttachment::Client(runtime) => {
+                        Some(runtime.updater().snapshot())
+                    }
+                    NativeHostRuntimeAttachment::Injected(_) => None,
+                })
+        });
+        let Some(snapshot) = snapshot else {
+            return;
+        };
+        self.updater_snapshot = Some(snapshot.clone());
+        let now_ms = unix_time_ms();
+        let generation = self
+            .interaction
+            .host_runtime_epochs()
+            .resource_generation
+            .max(1);
+        let update = update_observation_from_snapshot(
+            &snapshot.current_version,
+            snapshot.target_version.as_deref(),
+            update_state_from_stage(snapshot.stage),
+            now_ms,
+            generation,
+            generation,
+        );
+        let input = TopBarProjectionInput {
+            now_ms,
+            generation,
+            host: None,
+            connect: None,
+            update: Some(update),
+            quotas: one_fresh_quota_observations(&[], now_ms),
+            resources: None,
+        };
+        match self.top_bar.as_mut() {
+            Some(controller) => {
+                let _ = controller.apply(input);
+            }
+            None => {
+                if let Ok(controller) = TopBarProjectionController::new(input) {
+                    self.top_bar = Some(controller);
+                }
+            }
+        }
+        self.sync_header_projection();
+    }
+
+    #[allow(dead_code)]
+    fn dispatch_composer_pending(
+        &mut self,
+        turn_id: Option<crate::domain::TurnId>,
+        question_id: Option<crate::domain::QuestionId>,
+        approval_id: Option<crate::domain::ApprovalId>,
+    ) -> Result<(), ComposerError> {
+        let intent = self
+            .composer
+            .as_ref()
+            .and_then(TaskComposer::pending_intent)
+            .cloned()
+            .ok_or(ComposerError::UnknownTurn)?;
+        let request = intent.to_provider_input_request(turn_id, question_id, approval_id)?;
+        self.composer_error = None;
+        if self.dispatch_action(request).is_some() {
+            self.composer_error = Some("composer action was not accepted by the host lane".into());
+        }
+        Ok(())
     }
 
     pub fn cockpit(&self) -> &TaskCockpitShell {
@@ -5602,11 +5930,23 @@ impl NativeShell {
                     self.last_action_failure = None;
                     self.restore_connected_host_state();
                 }
+                if let Some(composer) = self.composer.as_mut() {
+                    if let Some(pending) = composer.pending_intent().map(|intent| intent.command_id)
+                    {
+                        let _ = composer.settle_pending(pending);
+                    }
+                }
+                self.composer_error = None;
             }
-            NativeHostActionOutcome::Queried { action, detail } => {
+            NativeHostActionOutcome::Queried {
+                action,
+                detail,
+                body,
+            } => {
                 let action_id = action.id;
                 let request_id = native_request_id(&action.command);
                 self.last_query_detail = Some(detail);
+                self.apply_query_body(body);
                 if let Some(request_id) = request_id {
                     self.pending_host_actions
                         .retain(|pending| native_request_id(&pending.command) != Some(request_id));
@@ -5640,6 +5980,7 @@ impl NativeShell {
                 }
             }
             NativeHostActionOutcome::Failed { action, error } => {
+                self.composer_error = Some(error.clone());
                 let retained = self.retain_pending_host_action(action.clone());
                 self.set_execution_failure(&action, error, false);
                 if !retained {
@@ -5778,6 +6119,8 @@ impl NativeShell {
         if had_projections {
             self.last_projection_kinds = accepted_projection_kinds;
         }
+        self.admit_ready_stream_frames(max);
+        self.sync_top_bar_from_updater();
 
         for _ in 0..max.min(MAX_PENDING_HOST_ACTIONS) {
             let Some(has_pending) = self.host_runtime.as_ref().map(|runtime| match runtime {
@@ -6232,6 +6575,23 @@ impl NativeShell {
                         label, ..
                     } => label.clone(),
                 };
+                let quota = self
+                    .top_bar
+                    .as_ref()
+                    .map(|controller| {
+                        let model = controller.model();
+                        if model.quotas.is_empty() {
+                            "quota unavailable".to_string()
+                        } else {
+                            model
+                                .quotas
+                                .iter()
+                                .map(|quota| format!("{} {}", quota.provider, quota.detail))
+                                .collect::<Vec<_>>()
+                                .join(" · ")
+                        }
+                    })
+                    .unwrap_or_else(|| "quota unavailable".to_string());
                 NativeHeaderAttachment::projection(
                     header.title,
                     format!(
@@ -6239,7 +6599,7 @@ impl NativeShell {
                         header.status.label, workspace, header.identity.revision
                     ),
                     format!("Host · {} · {remote}", self.host_state.label()),
-                    header.accessible_description,
+                    format!("{} · {}", header.accessible_description, quota),
                 )
             })
             .unwrap_or_else(|| NativeHeaderAttachment::unavailable("select a task"));
@@ -6257,6 +6617,7 @@ impl NativeShell {
         if let Some(model) = self.client_model.as_ref() {
             self.cockpit.follow_projection(model.as_ref());
         }
+        self.refresh_selected_cockpit_surfaces();
         self.sync_terminal_from_cockpit();
         self.sync_header_projection();
     }
@@ -6304,11 +6665,12 @@ impl NativeShell {
                     // panel becomes active; the panel itself never mints a
                     // supervisor command or bypasses ServiceControl fences.
                     let _ = self.dispatch_action(ActionRequest::HostActions);
+                } else if matches!(
+                    tool,
+                    DockTool::Changes | DockTool::Files | DockTool::Services
+                ) {
+                    self.refresh_selected_cockpit_surfaces();
                 } else if !matches!(tool, DockTool::Terminal) {
-                    // Non-terminal task tabs refresh the same fenced task.show
-                    // projection that supplies their workspace/browser/files
-                    // facts; no dock invents a path or bypasses the typed host
-                    // action catalog.
                     if let Some(task_id) = self.interaction.selected_task() {
                         let _ = self.dispatch_action(ActionRequest::TaskShow { task_id });
                     }
@@ -6330,6 +6692,7 @@ impl NativeShell {
                 let _ = self
                     .prompt_library
                     .handle_key(PromptLibraryKey::LibraryShortcut);
+                self.hydrate_prompt_library();
             }
             KeyboardAction::OpenPalette => {
                 let _ = self.prompt_library.handle_key(PromptLibraryKey::Slash);
@@ -6392,6 +6755,35 @@ impl NativeShell {
             crate::ui::prompts::PromptLibraryLoadState::StaleRevision { .. } => "stale",
         };
         let draft_chars = self.prompt_library.draft.text.chars().count();
+        let next = self
+            .prompt_library
+            .suggested_next
+            .as_ref()
+            .map(|next| format!("next prompt · {}", next.title))
+            .unwrap_or_else(|| "next prompt · none".to_string());
+        let composer = match (
+            self.composer
+                .as_ref()
+                .and_then(TaskComposer::pending_intent),
+            self.composer_error.as_deref(),
+        ) {
+            (_, Some(error)) => format!("Composer · error · {error}"),
+            (Some(intent), None) => format!("Composer · pending · {}", intent.action_id),
+            (None, None) => format!(
+                "Composer · {} character draft · {}",
+                draft_chars,
+                if self.prompt_library.draft.sent {
+                    "sent"
+                } else {
+                    "ready"
+                }
+            ),
+        };
+        let updater = self
+            .updater_snapshot
+            .as_ref()
+            .map(|snapshot| format!("Updater · {:?}", snapshot.stage))
+            .unwrap_or_else(|| "Updater · snapshot unavailable".to_string());
         div()
             .id("native-shell-prompt-composer")
             .w_full()
@@ -6407,15 +6799,9 @@ impl NativeShell {
                 list.total,
                 load
             ))
-            .child(format!(
-                "Composer · {} character draft · {}",
-                draft_chars,
-                if self.prompt_library.draft.sent {
-                    "sent"
-                } else {
-                    "ready"
-                }
-            ))
+            .child(next)
+            .child(composer)
+            .child(updater)
             .into_any_element()
     }
 
@@ -6424,37 +6810,60 @@ impl NativeShell {
         tool: CockpitDockTool,
         tokens: crate::ui::tokens::ThemeTokens,
     ) -> AnyElement {
-        let details = self
-            .interaction
-            .selected_task()
-            .and_then(|task_id| self.client_model.as_ref()?.task(task_id))
-            .map(|snapshot| {
-                let workspace = workspace_projection_label(&snapshot.task.workspace);
-                let resources = snapshot.resources.len();
-                match tool {
-                    CockpitDockTool::Changes => {
-                        format!(
-                            "Git changes · {workspace} · host projection · {resources} resource(s)"
-                        )
+        let details = if let Some(projection) = self.cockpit.live_projection() {
+            let kind = match tool {
+                CockpitDockTool::Changes => Some(CockpitSurfaceKind::Git),
+                CockpitDockTool::Files => Some(CockpitSurfaceKind::Files),
+                CockpitDockTool::Services => Some(CockpitSurfaceKind::Services),
+                _ => None,
+            };
+            if let Some(kind) = kind {
+                summary_line(projection, kind)
+            } else {
+                self.interaction
+                    .selected_task()
+                    .and_then(|task_id| self.client_model.as_ref()?.task(task_id))
+                    .map(|snapshot| match tool {
+                        CockpitDockTool::Artifacts => format!(
+                            "Artifacts · {} bounded metadata item(s) · task-owned",
+                            snapshot.artifacts.len()
+                        ),
+                        CockpitDockTool::Review => format!(
+                            "Review · {} · revision {}",
+                            visible_status_label(snapshot.visible_status()),
+                            snapshot.task.revision
+                        ),
+                        other => other.label().to_string(),
+                    })
+                    .unwrap_or_else(|| format!("{} · select a task", tool.label()))
+            }
+        } else {
+            self.interaction
+                .selected_task()
+                .and_then(|task_id| self.client_model.as_ref()?.task(task_id))
+                .map(|snapshot| {
+                    let workspace = workspace_projection_label(&snapshot.task.workspace);
+                    match tool {
+                        CockpitDockTool::Changes => {
+                            format!("Git changes · {workspace} · loading host projection")
+                        }
+                        CockpitDockTool::Files => {
+                            format!("Files · {workspace} · loading host projection")
+                        }
+                        CockpitDockTool::Artifacts => format!(
+                            "Artifacts · {} bounded metadata item(s) · task-owned",
+                            snapshot.artifacts.len()
+                        ),
+                        CockpitDockTool::Review => format!(
+                            "Review · {} · revision {}",
+                            visible_status_label(snapshot.visible_status()),
+                            snapshot.task.revision
+                        ),
+                        other => other.label().to_string(),
                     }
-                    CockpitDockTool::Files => {
-                        format!("Files · {workspace} · workspace projection · SSH identity fenced")
-                    }
-                    CockpitDockTool::Artifacts => format!(
-                        "Artifacts · {} bounded metadata item(s) · task-owned",
-                        snapshot.artifacts.len()
-                    ),
-                    CockpitDockTool::Review => format!(
-                        "Review · {} · revision {}",
-                        visible_status_label(snapshot.visible_status()),
-                        snapshot.task.revision
-                    ),
-                    CockpitDockTool::Terminal
-                    | CockpitDockTool::Browser
-                    | CockpitDockTool::Services => tool.label().to_string(),
-                }
-            })
-            .unwrap_or_else(|| format!("{} · select a task", tool.label()));
+                })
+                .unwrap_or_else(|| format!("{} · select a task", tool.label()))
+        };
         div()
             .id("native-shell-workspace-dock")
             .w_full()
@@ -8999,6 +9408,42 @@ mod tests {
                 .command,
             super::NativeHostCommand::TaskShowQuery { .. }
         ));
+        assert!(matches!(
+            interaction
+                .action(ActionRequest::TaskCockpit {
+                    task_id: selected,
+                    query: crate::domain::TaskCockpitQuery::GitStatus,
+                })
+                .expect("git.status")
+                .command,
+            super::NativeHostCommand::TaskCockpitQuery { .. }
+        ));
+        assert!(matches!(
+            interaction
+                .action(ActionRequest::PromptLibrary {
+                    query: crate::prompts::projection::PromptLibraryQuery::MetadataPage {
+                        namespace: crate::prompts::projection::PromptNamespace::Personal,
+                        cursor: None,
+                        expected_revision: None,
+                    },
+                })
+                .expect("prompt.library")
+                .command,
+            super::NativeHostCommand::PromptLibraryQuery { .. }
+        ));
+        assert!(matches!(
+            interaction
+                .action(ActionRequest::Updater(
+                    crate::client::action::UpdaterAction::Check
+                ))
+                .expect("updater.check")
+                .command,
+            super::NativeHostCommand::Updater { .. }
+        ));
+        assert_eq!(
+            update_state_from_stage(UpdaterStage::ReadyToInstall),
+            UpdateState::ReadyToInstall
+        );
     }
 
     #[test]

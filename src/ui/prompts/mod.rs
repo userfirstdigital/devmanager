@@ -419,6 +419,13 @@ impl PromptLibrarySession {
         }
     }
 
+    pub fn refresh_suggested_next(&mut self) {
+        self.suggested_next = self
+            .links
+            .iter()
+            .find_map(|link| self.manual_suggested_next(link.id()));
+    }
+
     pub fn chain_projection(
         &self,
         chain_id: PromptChainId,

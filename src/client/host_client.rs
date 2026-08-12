@@ -7,13 +7,13 @@ use std::collections::BTreeMap;
 
 use uuid::Uuid;
 
+use crate::domain::cockpit::TaskCockpitQuery;
 use crate::domain::command::{Command, CommandEnvelope, CommandReceipt, ConfirmHostQuitIntent};
 use crate::domain::host::HostQuitInspection;
 use crate::domain::id::{
     ArtifactId, CommandId, OperationId, RequestId, SnapshotId, SubscriptionId, TaskId,
 };
 use crate::domain::operation::OperationState;
-use crate::domain::cockpit::TaskCockpitQuery;
 use crate::domain::query::{Query, QueryEnvelope, QueryError, QueryOutcome, QueryResult};
 use crate::domain::snapshot::{
     ArtifactContentPage, EventPage, SnapshotPage, SnapshotSection, TaskSnapshotItem,

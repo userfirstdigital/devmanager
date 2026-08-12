@@ -12,9 +12,14 @@
 //! HOLDs until their host commands exist.
 
 use super::super::shell::PromptLibraryUiError;
-use crate::client::action::{catalog, ActionDescriptor};
+use crate::client::action::{
+    catalog, ActionDescriptor, ActionRequest, ProviderInputActionRequest, ProviderInputArguments,
+};
 use crate::domain::id::{PromptChainLinkId, PromptVersionId};
-use crate::domain::{AgentSessionId, ArtifactId, CommandId, RequestId, TaskId};
+use crate::domain::{
+    AgentSessionId, ApprovalId, ArtifactId, CommandId, QuestionId, RequestId, TaskId,
+    TurnId as DomainTurnId,
+};
 use crate::prompts::model::PromptVersion;
 use crate::ui::components::interaction::{
     redacted_bounded_text, AccessibilityMetadata, AccessibleRole, ComponentError, FocusEpoch,
@@ -313,6 +318,75 @@ pub struct ComposerIntent {
 impl ComposerIntent {
     pub fn writes_pty(&self) -> bool {
         false
+    }
+
+    /// Convert a pending composer intent into the existing typed host action.
+    /// Exact resume / new-conversation is never fabricated here.
+    pub fn to_provider_input_request(
+        &self,
+        turn_id: Option<DomainTurnId>,
+        question_id: Option<QuestionId>,
+        approval_id: Option<ApprovalId>,
+    ) -> Result<ActionRequest, ComposerError> {
+        if self.action_id == crate::client::action::ACTION_PROVIDER_NEW_CONVERSATION {
+            return Err(ComposerError::Unavailable {
+                control: ComposerControl::SendNow,
+                reason: bound_reason(
+                    "exact resume failure stays visible; new conversation is not fabricated",
+                )?,
+            });
+        }
+        let Some(turn_id) = turn_id else {
+            return Err(ComposerError::UnknownTurn);
+        };
+        let text = match &self.payload {
+            ComposerPayload::SendNow { text, .. }
+            | ComposerPayload::Steer { text, .. }
+            | ComposerPayload::QueueFollowUp { text, .. }
+            | ComposerPayload::Answer {
+                answer: AnswerPayload::Text(text),
+                ..
+            } => Some(text.clone()),
+            ComposerPayload::StopTurn { .. } | ComposerPayload::Approval { .. } => None,
+            ComposerPayload::SaveDraft { .. }
+            | ComposerPayload::StageAttachment { .. }
+            | ComposerPayload::RemoveAttachment { .. } => {
+                return Err(ComposerError::Unavailable {
+                    control: ComposerControl::SaveDraft,
+                    reason: bound_reason("draft and upload remain typed HOLDs")?,
+                });
+            }
+            ComposerPayload::Answer {
+                answer: AnswerPayload::Option { label, .. },
+                ..
+            } => Some(label.clone()),
+        };
+        let allow = match &self.payload {
+            ComposerPayload::Approval {
+                decision: ApprovalDecision::Approve,
+                ..
+            } => Some(true),
+            ComposerPayload::Approval {
+                decision: ApprovalDecision::Reject { .. },
+                ..
+            } => Some(false),
+            _ => None,
+        };
+        Ok(ActionRequest::ProviderInput(ProviderInputActionRequest {
+            action_id: self.action_id,
+            arguments: ProviderInputArguments {
+                task_id: self.fence.task_id,
+                agent_session_id: self.fence.agent_session_id,
+                runtime_generation: self.fence.runtime_generation,
+                action_epoch: self.fence.action_epoch,
+                turn_id,
+                question_id,
+                approval_id,
+                text,
+                wait: Some(false),
+                allow,
+            },
+        }))
     }
 }
 
@@ -3063,5 +3137,43 @@ mod tests {
             .expect("busy");
         assert!(busy.busy());
         assert!(composer.input_accessibility().busy());
+    }
+
+    #[test]
+    fn pending_send_maps_to_provider_input_and_exact_resume_stays_visible() {
+        let mut composer = bind_granted("ship it");
+        let mut epochs = FocusEpochSource::new();
+        focus(&mut composer, &mut epochs);
+        composer
+            .activate(ComposerControl::SendNow, epochs.current())
+            .expect("pending send");
+        let intent = composer.pending_intent().expect("intent").clone();
+        let turn = DomainTurnId::new();
+        let request = intent
+            .to_provider_input_request(Some(turn), None, None)
+            .expect("typed provider input");
+        match request {
+            ActionRequest::ProviderInput(inner) => {
+                assert_eq!(inner.action_id, EXPECTED_ACTION_SEND_NOW);
+                assert_eq!(inner.arguments.text.as_deref(), Some("ship it"));
+                assert_eq!(inner.arguments.turn_id, turn);
+                assert_eq!(inner.arguments.task_id, intent.fence.task_id);
+            }
+            other => panic!("expected ProviderInput, got {other:?}"),
+        }
+        assert!(matches!(
+            intent.to_provider_input_request(None, None, None),
+            Err(ComposerError::UnknownTurn)
+        ));
+
+        let mut exact_resume = intent.clone();
+        exact_resume.action_id = crate::client::action::ACTION_PROVIDER_NEW_CONVERSATION;
+        assert!(matches!(
+            exact_resume.to_provider_input_request(Some(turn), None, None),
+            Err(ComposerError::Unavailable {
+                control: ComposerControl::SendNow,
+                ..
+            })
+        ));
     }
 }

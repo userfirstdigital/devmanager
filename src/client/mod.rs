@@ -39,8 +39,10 @@ pub use inbox_controller::{
 };
 pub(crate) use model::normalize_bounded_search_text;
 pub use model::{
-    ClientBrowserDockView, ClientModel, ClientModelBuilder, ClientModelError, SearchContinuation,
-    SearchPage, SearchPageStatus, TaskCockpitSurfaceProjection,
+    admit_subscription_stream, one_fresh_quota_per_provider, quota_observation_is_fresh,
+    AdmittedStreamFrame, ClientBrowserDockView, ClientModel, ClientModelBuilder, ClientModelError,
+    SearchContinuation, SearchPage, SearchPageStatus, StreamAdmissionReject,
+    TaskCockpitSurfaceProjection, PROVIDER_QUOTA_MAX_AGE_MS,
 };
 pub use port::{
     ApprovalAnswerCall, HostCommandPort, HostPortError, PromptMetadataItem, PromptMetadataPage,

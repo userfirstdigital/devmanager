@@ -5,11 +5,15 @@ use std::collections::BTreeMap;
 use gpui::{div, rgb, IntoElement, ParentElement, Styled};
 
 use crate::client::action::ActionRequest;
-use crate::client::model::ClientModel;
+use crate::client::action::CockpitSurfaceKind;
+use crate::client::model::{
+    admit_subscription_stream, AdmittedStreamFrame, ClientModel, StreamAdmissionReject,
+};
 use crate::domain::agent::AgentRole;
-use crate::domain::id::{AgentSessionId, RequestId, ResourceId, TaskId};
+use crate::domain::id::{AgentSessionId, RequestId, ResourceId, SubscriptionId, TaskId};
 use crate::domain::resource::{ResourceKind, ResourceLifecycle};
 use crate::domain::snapshot::TaskSnapshot;
+use crate::protocol::StreamFrame;
 use crate::services::ProcessManager;
 use crate::terminal::session::TerminalSessionView;
 use crate::terminal::view::{
@@ -22,6 +26,7 @@ use crate::ui::components::interaction::{
     redacted_bounded_text, AccessibilityMetadata, AccessibleRole, FocusEpoch, FocusEpochSource,
     KeyboardKey,
 };
+use crate::ui::task_cockpit::cockpit_projection::{summary_line, TaskCockpitLiveProjection};
 use crate::ui::tokens::ThemeTokens;
 
 pub const DOCK_MIN_SIZE_RATIO: f32 = 0.18;
@@ -569,6 +574,7 @@ struct RememberedDockState {
     /// Last complete view retained while a bounded reconnect/resync/exit
     /// overlay is shown. It is never used for a different identity.
     last_valid_view: Option<TerminalSessionView>,
+    live_output: String,
 }
 
 impl RememberedDockState {
@@ -585,6 +591,7 @@ impl RememberedDockState {
             exit_summary: None,
             replica_view: None,
             last_valid_view: None,
+            live_output: String::new(),
         }
     }
 }
@@ -604,6 +611,7 @@ pub struct ContextDock {
     terminal_selection_changed: bool,
     terminal_click_completed: bool,
     last_request_id: Option<RequestId>,
+    cockpit_projection: Option<TaskCockpitLiveProjection>,
 }
 
 impl ContextDock {
@@ -622,6 +630,7 @@ impl ContextDock {
             terminal_selection_changed: false,
             terminal_click_completed: false,
             last_request_id: None,
+            cockpit_projection: None,
         }
     }
 
@@ -683,6 +692,13 @@ impl ContextDock {
     pub fn follow_task(&mut self, task_id: TaskId) {
         if self.selected_task == Some(task_id) {
             return;
+        }
+        if self
+            .cockpit_projection
+            .as_ref()
+            .is_some_and(|projection| projection.task_id != task_id)
+        {
+            self.cockpit_projection = None;
         }
         self.selected_task = Some(task_id);
         self.remember_task(task_id);
@@ -765,11 +781,77 @@ impl ContextDock {
                     })
                 }
             }
-            _ => Err(DockUnavailable {
+            DockTool::Changes | DockTool::Files | DockTool::Services => {
+                match self.cockpit_projection.as_ref() {
+                    Some(_) => Ok(()),
+                    None => Err(DockUnavailable {
+                        tool,
+                        reason: DockUnavailableReason::MissingHostProjection,
+                    }),
+                }
+            }
+            DockTool::Browser | DockTool::Artifacts | DockTool::Review => Err(DockUnavailable {
                 tool,
                 reason: DockUnavailableReason::MissingHostProjection,
             }),
         }
+    }
+
+    pub fn bind_cockpit_projection(&mut self, projection: TaskCockpitLiveProjection) {
+        if self.selected_task == Some(projection.task_id) {
+            self.cockpit_projection = Some(projection);
+        }
+    }
+
+    pub fn cockpit_projection(&self) -> Option<&TaskCockpitLiveProjection> {
+        self.cockpit_projection.as_ref()
+    }
+
+    pub fn live_output(&self) -> String {
+        self.current_memory().live_output
+    }
+
+    fn cockpit_surface_summary(&self, tool: DockTool) -> Option<String> {
+        let projection = self.cockpit_projection.as_ref()?;
+        let kind = match tool {
+            DockTool::Changes => CockpitSurfaceKind::Git,
+            DockTool::Files => CockpitSurfaceKind::Files,
+            DockTool::Services => CockpitSurfaceKind::Services,
+            _ => return None,
+        };
+        Some(summary_line(projection, kind))
+    }
+
+    pub fn admit_subscription_stream(
+        &mut self,
+        expected_subscription: SubscriptionId,
+        frame: &StreamFrame,
+    ) -> Result<AdmittedStreamFrame, DockProjectionError> {
+        if self.selected_task.is_none() {
+            return Err(DockProjectionError::NoTaskSelected);
+        }
+        let memory = self.current_memory();
+        let expected = memory.identity.ok_or(DockProjectionError::Unbound)?;
+        let admitted = admit_subscription_stream(
+            expected_subscription,
+            expected.resource_id,
+            expected.resource_generation,
+            memory.last_sequence,
+            frame,
+        )
+        .map_err(dock_stream_reject)?;
+        self.with_memory(|memory| {
+            memory.last_sequence = admitted.sequence;
+            memory.surface_state = TerminalSurfaceState::Live;
+            if let Some(output) = &admitted.output {
+                if !memory.live_output.is_empty() {
+                    memory.live_output.push('\n');
+                }
+                memory.live_output.push_str(output);
+            }
+        });
+        self.needs_resync = false;
+        Ok(admitted)
     }
 
     pub fn bind_from_projection(
@@ -802,6 +884,7 @@ impl ContextDock {
                     memory.terminal_presentation = TerminalPresentation::Semantic;
                     memory.replica_view = None;
                     memory.last_valid_view = None;
+                    memory.live_output.clear();
                 });
                 self.needs_resync = true;
                 self.press_owner = None;
@@ -1422,8 +1505,22 @@ impl ContextDock {
                 )
             },
         );
+        let live_output = self.live_output();
         let body = if self.showing_raw_terminal() && !self.is_collapsed() {
             render_terminal_surface(&self.terminal_pane_model(), None).into_any_element()
+        } else if chrome.active_tool == DockTool::Terminal
+            && !live_output.is_empty()
+            && !self.is_collapsed()
+        {
+            div()
+                .text_color(rgb(tokens.text.primary.to_u32()))
+                .child(live_output)
+                .into_any_element()
+        } else if let Some(summary) = self.cockpit_surface_summary(chrome.active_tool) {
+            div()
+                .text_color(rgb(tokens.text.primary.to_u32()))
+                .child(summary)
+                .into_any_element()
         } else {
             let unavailable = chrome
                 .unavailable
@@ -1562,6 +1659,29 @@ fn snapshot_census(
         pty_readers_before: before_readers,
         pty_readers_after: census.pty_reader_count(),
     })
+}
+
+fn dock_stream_reject(reject: StreamAdmissionReject) -> DockProjectionError {
+    match reject {
+        StreamAdmissionReject::SubscriptionMismatch | StreamAdmissionReject::ResourceMismatch => {
+            DockProjectionError::ForeignIdentity
+        }
+        StreamAdmissionReject::GenerationMismatch { expected, actual } => {
+            DockProjectionError::GenerationMismatch {
+                expected_runtime: expected,
+                actual_runtime: actual,
+                expected_resource: expected,
+                actual_resource: actual,
+            }
+        }
+        StreamAdmissionReject::ZeroSequence => DockProjectionError::ZeroSequence,
+        StreamAdmissionReject::StaleSequence { last, actual } => {
+            DockProjectionError::RegressedSequence { last, actual }
+        }
+        StreamAdmissionReject::SequenceGap { last, actual } => {
+            DockProjectionError::SequenceGap { last, actual }
+        }
+    }
 }
 
 fn overlay_from(state: TerminalSurfaceState, summary: Option<&str>) -> TerminalReplicaOverlay {
@@ -1782,5 +1902,76 @@ mod process_census_tests {
                 .session_id,
             "task-terminal"
         );
+    }
+
+    #[test]
+    fn subscription_stream_admits_live_output_and_rejects_stale_or_foreign() {
+        use crate::domain::id::SubscriptionId;
+        use crate::protocol::{StreamFrame, StreamKey, StreamPayloadKind};
+
+        let (model, task_id) = census_client_model();
+        let resource_id = model
+            .tasks()
+            .get(&task_id)
+            .and_then(|snapshot| snapshot.resources.keys().next().copied())
+            .expect("terminal resource");
+        let mut dock = ContextDock::new(DockEdge::Right);
+        dock.follow_task(task_id);
+        dock.bind_from_model(&model).expect("bind");
+        assert!(dock.tool_availability(DockTool::Files).is_err());
+
+        let mut projection = TaskCockpitLiveProjection::empty(task_id);
+        projection.begin_query(crate::client::action::ACTION_GIT_STATUS);
+        projection.apply_result(&crate::domain::TaskCockpitResult::Git(
+            crate::domain::TaskGitProjection {
+                task_id,
+                branch: Some("codex/final-e2e-ui".into()),
+                ahead: 0,
+                behind: 0,
+                change_count: 1,
+                detached: false,
+            },
+        ));
+        dock.bind_cockpit_projection(projection);
+        assert!(dock.tool_availability(DockTool::Changes).is_ok());
+        assert!(dock.tool_availability(DockTool::Files).is_ok());
+
+        let subscription = SubscriptionId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xe1,
+        ])
+        .expect("subscription");
+        let frame = StreamFrame {
+            subscription_id: subscription,
+            stream: StreamKey::from(resource_id),
+            generation: 1,
+            sequence: 1,
+            payload_kind: StreamPayloadKind::new(3).expect("kind"),
+            schema_version: 1,
+            payload: b"live pty output".to_vec(),
+        };
+        dock.admit_subscription_stream(subscription, &frame)
+            .expect("admit live stream");
+        assert_eq!(dock.live_output(), "live pty output");
+
+        let mut stale = frame.clone();
+        stale.sequence = 1;
+        assert!(matches!(
+            dock.admit_subscription_stream(subscription, &stale),
+            Err(DockProjectionError::RegressedSequence { .. })
+        ));
+
+        let mut foreign = frame.clone();
+        foreign.sequence = 2;
+        foreign.subscription_id = SubscriptionId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xe2,
+        ])
+        .expect("foreign");
+        assert!(matches!(
+            dock.admit_subscription_stream(subscription, &foreign),
+            Err(DockProjectionError::ForeignIdentity)
+        ));
+        assert_eq!(dock.live_output(), "live pty output");
     }
 }

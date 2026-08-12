@@ -12,14 +12,18 @@ use std::fmt;
 
 use crate::client::HostClient;
 use crate::domain::command::{Command, CommandEnvelope, CommandReceipt};
+use crate::domain::id::{PromptId, PromptVersionId};
 use crate::domain::query::QueryError;
 use crate::host::IpcError;
 use crate::kernel::{CommandBus, StoreError};
+use crate::prompts::model::{
+    ArchivePrompt, PromptChain, PromptCommand, PromptVersion, RestorePrompt, SavedPrompt,
+};
 use crate::prompts::projection::{
-    OwnerDeviceCapability, PromptLibraryQuery, PromptProjectionReply,
+    OwnerDeviceCapability, PromptChainLinkRecord, PromptLibraryQuery, PromptProjectionReply,
 };
 
-use super::{PromptLibraryLoadState, PromptLibrarySession};
+use super::{PromptLibraryAction, PromptLibraryLoadState, PromptLibrarySession};
 
 /// Chain link positions stay `0..n-1`. Callers must not treat this as an
 /// indexing implementation.
@@ -149,25 +153,186 @@ pub fn apply_host_reply_to_session(
     match reply {
         PromptProjectionReply::MetadataPage(page) => {
             session.library_revision = page.library_revision();
-            session.load = if page.items().is_empty() {
+            session.saved = page
+                .items()
+                .iter()
+                .filter_map(saved_prompt_from_metadata)
+                .collect();
+            session.load = if session.saved.is_empty() {
                 PromptLibraryLoadState::Empty
             } else {
                 PromptLibraryLoadState::Ready
             };
             Ok(())
         }
-        PromptProjectionReply::VersionPage(_)
-        | PromptProjectionReply::DiffPage(_)
-        | PromptProjectionReply::SearchPage(_)
-        | PromptProjectionReply::ChainPage(_)
-        | PromptProjectionReply::HistoryPage(_) => {
+        PromptProjectionReply::VersionPage(page) => {
+            if let Some(version) = prompt_version_from_page(page) {
+                if !session
+                    .versions
+                    .iter()
+                    .any(|existing| existing.id == version.id)
+                {
+                    session.versions.push(version);
+                }
+            }
             session.load = PromptLibraryLoadState::Ready;
             Ok(())
         }
-        PromptProjectionReply::MutationSettlement(_) => {
-            Err(PromptMutationError::UnsupportedCommand)
+        PromptProjectionReply::SearchPage(_) => {
+            session.load = PromptLibraryLoadState::Ready;
+            Ok(())
+        }
+        PromptProjectionReply::ChainPage(page) => {
+            let (chains, links) = chains_from_page(page);
+            session.chains = chains;
+            session.links = links;
+            session.refresh_suggested_next();
+            session.load = if session.chains.is_empty() && session.links.is_empty() {
+                PromptLibraryLoadState::Empty
+            } else {
+                PromptLibraryLoadState::Ready
+            };
+            Ok(())
+        }
+        PromptProjectionReply::DiffPage(_) | PromptProjectionReply::HistoryPage(_) => {
+            session.load = PromptLibraryLoadState::Ready;
+            Ok(())
+        }
+        PromptProjectionReply::MutationSettlement(settlement) => {
+            if !settlement.settled() {
+                session.load = PromptLibraryLoadState::Error {
+                    message: "prompt mutation settlement was not verified".into(),
+                };
+                return Err(PromptMutationError::Store);
+            }
+            session.load = PromptLibraryLoadState::Ready;
+            Ok(())
         }
     }
+}
+
+/// Map a UI mutation to the existing owner-granted PromptLibrary command.
+/// Chain edits have no Command::PromptLibrary variant and stay explicitly
+/// unavailable instead of reporting local success.
+pub fn prompt_mutation_command(
+    action: &PromptLibraryAction,
+) -> Result<Command, PromptMutationError> {
+    match action {
+        PromptLibraryAction::CreatePrompt { prompt, version } => Ok(Command::PromptLibrary(
+            PromptCommand::CreatePrompt(crate::prompts::model::CreatePrompt {
+                prompt_id: prompt.id,
+                prompt_version_id: version.id,
+                title: prompt.title.clone(),
+                description: prompt.description.clone(),
+                tags: prompt.tags.clone(),
+                variables: version.variables.clone(),
+                body: version.body.clone(),
+                created_at_ms: version.created_at_ms,
+            }),
+        )),
+        PromptLibraryAction::ArchivePrompt {
+            prompt_id,
+            expected_revision,
+            archived_at_ms,
+        } => Ok(Command::PromptLibrary(PromptCommand::ArchivePrompt(
+            ArchivePrompt {
+                prompt_id: *prompt_id,
+                archived_at_ms: *archived_at_ms,
+                expected_revision: *expected_revision,
+            },
+        ))),
+        PromptLibraryAction::RestorePrompt {
+            prompt_id,
+            expected_revision,
+        } => Ok(Command::PromptLibrary(PromptCommand::RestorePrompt(
+            RestorePrompt {
+                prompt_id: *prompt_id,
+                expected_revision: *expected_revision,
+            },
+        ))),
+        PromptLibraryAction::InsertChainLinkBetween { .. }
+        | PromptLibraryAction::ReorderChainLink { .. }
+        | PromptLibraryAction::RemoveChainLink { .. }
+        | PromptLibraryAction::UpdateLinkToCurrent { .. } => {
+            Err(PromptMutationError::UnsupportedCommand)
+        }
+        _ => Err(PromptMutationError::UnsupportedCommand),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct MetadataItemView {
+    id: PromptId,
+    title: String,
+    description: Option<String>,
+    #[serde(default)]
+    tags: Vec<String>,
+    current_version_id: PromptVersionId,
+    revision: u64,
+    archived_at_ms: Option<i64>,
+}
+
+fn saved_prompt_from_metadata(
+    item: &crate::prompts::projection::PromptMetadataItem,
+) -> Option<SavedPrompt> {
+    let value = serde_json::to_value(item).ok()?;
+    let view: MetadataItemView = serde_json::from_value(value).ok()?;
+    Some(SavedPrompt {
+        id: view.id,
+        title: view.title,
+        description: view.description,
+        tags: view.tags,
+        current_version_id: view.current_version_id,
+        revision: view.revision,
+        archived_at_ms: view.archived_at_ms,
+    })
+}
+
+fn prompt_version_from_page(
+    page: &crate::prompts::projection::PromptVersionPage,
+) -> Option<PromptVersion> {
+    #[derive(serde::Deserialize)]
+    struct VersionTimeView {
+        created_at_ms: i64,
+    }
+    let created_at_ms = serde_json::to_value(page)
+        .ok()
+        .and_then(|value| serde_json::from_value::<VersionTimeView>(value).ok())
+        .map(|view| view.created_at_ms)?;
+    let body = String::from_utf8_lossy(page.chunk().bytes()).into_owned();
+    PromptVersion::new(
+        page.version_id(),
+        page.prompt_id(),
+        page.version(),
+        body,
+        created_at_ms,
+    )
+    .ok()
+}
+
+#[derive(serde::Deserialize)]
+struct ChainRecordView {
+    chain: PromptChain,
+    #[serde(default)]
+    links: Vec<PromptChainLinkRecord>,
+}
+
+fn chains_from_page(
+    page: &crate::prompts::projection::PromptChainPage,
+) -> (Vec<PromptChain>, Vec<PromptChainLinkRecord>) {
+    let mut chains = Vec::new();
+    let mut links = Vec::new();
+    for record in page.chains() {
+        let Ok(value) = serde_json::to_value(record) else {
+            continue;
+        };
+        let Ok(view) = serde_json::from_value::<ChainRecordView>(value) else {
+            continue;
+        };
+        chains.push(view.chain);
+        links.extend(view.links);
+    }
+    (chains, links)
 }
 
 fn map_store_error(_error: StoreError) -> PromptMutationError {
@@ -190,5 +355,33 @@ fn map_query_error(error: QueryError) -> PromptMutationError {
             reason: "owner_device_session",
         } => PromptMutationError::Ungranted,
         _ => PromptMutationError::Query,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::id::{PromptChainId, PromptChainLinkId, PromptId};
+    use crate::ui::prompts::PromptLibraryAction;
+
+    #[test]
+    fn prompt_mutations_require_typed_host_commands_and_reject_local_chain_success() {
+        let prompt_id = PromptId::new();
+        let command = prompt_mutation_command(&PromptLibraryAction::ArchivePrompt {
+            prompt_id,
+            expected_revision: 2,
+            archived_at_ms: 1_725_000_000_000,
+        })
+        .expect("archive is a PromptLibrary command");
+        assert!(matches!(
+            command,
+            Command::PromptLibrary(PromptCommand::ArchivePrompt(_))
+        ));
+
+        let err = prompt_mutation_command(&PromptLibraryAction::RemoveChainLink {
+            chain_id: PromptChainId::new(),
+            link_id: PromptChainLinkId::new(),
+        });
+        assert_eq!(err, Err(PromptMutationError::UnsupportedCommand));
     }
 }

@@ -3,6 +3,7 @@
 //! Reads redacted supervisor snapshots only. Never probes ports, processes, or
 //! the filesystem. Ownership phrasing keeps "Managed here" in details.
 
+use crate::domain::cockpit::{TaskServiceProjection, TaskServiceRuntimeState, TaskServiceScope};
 use crate::services::{
     health::{RedactedServiceSnapshot, ServiceState, StatusTone},
     model::ServiceId,
@@ -49,7 +50,6 @@ impl ServicePanelAction {
             Self::Start => Some(SupervisorAction::Start),
             Self::Stop => Some(SupervisorAction::Stop),
             Self::Restart => Some(SupervisorAction::Restart),
-            // Logs/Health stay unbound until typed host operations exist.
             Self::Logs | Self::Health | Self::OpenTerminal => None,
         }
     }
@@ -118,7 +118,7 @@ fn project_row(snapshot: &RedactedServiceSnapshot, dependencies: &[ServiceId]) -
     };
     let port_label = match snapshot.evidence.port {
         crate::services::health::PortEvidenceKind::Owned => Some("managed port".to_owned()),
-        crate::services::health::PortEvidenceKind::External => Some("external port".to_owned()),
+        crate::services::health::PortEvidenceKind::External => Some("port in use".to_owned()),
         crate::services::health::PortEvidenceKind::Free
         | crate::services::health::PortEvidenceKind::Unknown => None,
     };
@@ -185,16 +185,8 @@ fn project_row(snapshot: &RedactedServiceSnapshot, dependencies: &[ServiceId]) -
                 None
             },
         ),
-        affordance(
-            ServicePanelAction::Logs,
-            false,
-            Some("Service log query is not available until a typed host operation exists"),
-        ),
-        affordance(
-            ServicePanelAction::Health,
-            false,
-            Some("Service health query is not available until a typed host operation exists"),
-        ),
+        affordance(ServicePanelAction::Logs, true, None),
+        affordance(ServicePanelAction::Health, true, None),
         // OpenTerminal has no supervisor/host action yet; keep it visible but
         // disabled with a truthful reason rather than advertising a dead path.
         affordance(
@@ -225,5 +217,131 @@ fn affordance(
         action,
         enabled,
         disabled_reason: if enabled { None } else { disabled_reason },
+    }
+}
+
+fn state_from_task(state: TaskServiceRuntimeState) -> ServiceState {
+    match state {
+        TaskServiceRuntimeState::Stopped => ServiceState::Stopped,
+        TaskServiceRuntimeState::Starting => ServiceState::Starting,
+        TaskServiceRuntimeState::Healthy => ServiceState::Healthy,
+        TaskServiceRuntimeState::Unhealthy => ServiceState::Unhealthy,
+        TaskServiceRuntimeState::External => ServiceState::External,
+        TaskServiceRuntimeState::Stopping => ServiceState::Stopping,
+        TaskServiceRuntimeState::Failed => ServiceState::Failed,
+        TaskServiceRuntimeState::Unknown => ServiceState::Unknown,
+    }
+}
+
+/// Project the typed host Task Cockpit service snapshots, including external
+/// blue port-in-use listeners. Logs/health stay query actions, not supervisor
+/// start/stop.
+pub fn project_services_from_task_projection(
+    projection: &TaskServiceProjection,
+) -> ServicesPanelProjection {
+    let mut rows = Vec::with_capacity(projection.snapshots.len());
+    for snapshot in &projection.snapshots {
+        let Ok(service_id) = ServiceId::new(snapshot.service_id.as_str()) else {
+            continue;
+        };
+        let state = state_from_task(snapshot.state);
+        let external = matches!(state, ServiceState::External);
+        let active = matches!(
+            state,
+            ServiceState::Starting | ServiceState::Healthy | ServiceState::Unhealthy
+        );
+        let controllable = state.is_controllable();
+        rows.push(ServicePanelRow {
+            service_id,
+            state,
+            tone: ServicePanelTone::from(state.tone()),
+            ownership_summary: if external {
+                "External listener"
+            } else {
+                "Configured"
+            },
+            ownership_detail: if matches!(snapshot.scope, TaskServiceScope::Task { .. }) {
+                Some("Managed here")
+            } else {
+                None
+            },
+            port_label: external.then(|| "port in use".to_owned()),
+            dependency_summary: "Host service projection".to_owned(),
+            health_summary: format!("{:?}", snapshot.state),
+            actions: vec![
+                affordance(
+                    ServicePanelAction::Start,
+                    controllable && !active && !external,
+                    if external {
+                        Some("External listeners cannot be started from DevManager")
+                    } else {
+                        Some("Service is not startable")
+                    },
+                ),
+                affordance(
+                    ServicePanelAction::Stop,
+                    controllable && active,
+                    Some("Service is not stoppable"),
+                ),
+                affordance(
+                    ServicePanelAction::Restart,
+                    controllable && active,
+                    Some("Service is not restartable"),
+                ),
+                affordance(ServicePanelAction::Logs, true, None),
+                affordance(ServicePanelAction::Health, true, None),
+                affordance(
+                    ServicePanelAction::OpenTerminal,
+                    false,
+                    Some("Service terminal attach is not available"),
+                ),
+            ],
+        });
+    }
+    ServicesPanelProjection {
+        rows,
+        selected_logs: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::cockpit::TaskServiceSnapshot;
+    use crate::domain::id::{ConfiguredServiceId, TaskId};
+
+    #[test]
+    fn host_service_projection_marks_external_blue_port_in_use_and_enables_logs_health() {
+        let task_id = TaskId::new();
+        let projection = project_services_from_task_projection(&TaskServiceProjection {
+            task_id,
+            snapshots: vec![TaskServiceSnapshot {
+                service_id: ConfiguredServiceId::new("api").expect("id"),
+                scope: TaskServiceScope::Task { task_id },
+                state: TaskServiceRuntimeState::External,
+                generation: 2,
+                epoch: 3,
+            }],
+        });
+        assert_eq!(projection.rows.len(), 1);
+        let row = &projection.rows[0];
+        assert_eq!(row.tone, ServicePanelTone::Blue);
+        assert_eq!(row.port_label.as_deref(), Some("port in use"));
+        assert!(!row
+            .actions
+            .iter()
+            .any(|action| action.action == ServicePanelAction::Start && action.enabled));
+        assert!(row
+            .actions
+            .iter()
+            .any(|action| action.action == ServicePanelAction::Logs && action.enabled));
+        assert!(row
+            .actions
+            .iter()
+            .any(|action| action.action == ServicePanelAction::Health && action.enabled));
+        assert!(row
+            .actions
+            .iter()
+            .any(|action| action.action == ServicePanelAction::OpenTerminal && !action.enabled));
     }
 }

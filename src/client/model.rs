@@ -12,7 +12,9 @@ use unicode_normalization::UnicodeNormalization;
 use crate::domain::agent::AgentSessionFacts;
 use crate::domain::artifact::ArtifactSummary;
 use crate::domain::event::{apply, DomainEvent, Event};
-use crate::domain::id::{AgentSessionId, ArtifactId, OperationId, ResourceId, SnapshotId, TaskId};
+use crate::domain::id::{
+    AgentSessionId, ArtifactId, OperationId, ResourceId, SnapshotId, SubscriptionId, TaskId,
+};
 use crate::domain::operation::{OperationFacts, OperationState};
 use crate::domain::resource::{OwnerKind, ResourceFacts};
 use crate::domain::snapshot::{
@@ -1215,11 +1217,9 @@ impl ClientModel {
     ///
     /// Missing tasks return `None`. Absolute workspace paths are never copied
     /// into this projection. ServiceControl start/stop/restart and typed
-    /// TaskCockpit queries are advertised; logs/health/writes stay unavailable.
-    pub fn task_cockpit_surfaces(
-        &self,
-        task_id: TaskId,
-    ) -> Option<TaskCockpitSurfaceProjection> {
+    /// TaskCockpit query ids (including logs/health) are advertised from the
+    /// shared catalog; write/mutate/ssh-action remain catalog-unavailable.
+    pub fn task_cockpit_surfaces(&self, task_id: TaskId) -> Option<TaskCockpitSurfaceProjection> {
         if !self.tasks.contains_key(&task_id) {
             return None;
         }
@@ -2007,6 +2007,117 @@ impl TaskCockpitSurfaceProjection {
                 )
         })
     }
+}
+
+/// One-hour freshness bound shared with the native top-bar quota projection.
+pub const PROVIDER_QUOTA_MAX_AGE_MS: i64 = 60 * 60 * 1_000;
+
+/// Reject unavailable, future, or older-than-one-hour quota observations.
+pub fn quota_observation_is_fresh(observed_at_ms: Option<i64>, now_ms: i64) -> bool {
+    let Some(observed_at_ms) = observed_at_ms else {
+        return false;
+    };
+    match now_ms.checked_sub(observed_at_ms) {
+        Some(age) => age <= PROVIDER_QUOTA_MAX_AGE_MS,
+        None => false,
+    }
+}
+
+/// Keep the newest in-window observation per provider label. Missing detail is
+/// omitted rather than replaced with a placeholder.
+pub fn one_fresh_quota_per_provider(
+    observations: &[(String, Option<String>, i64)],
+    now_ms: i64,
+) -> Vec<(String, String)> {
+    let mut latest = BTreeMap::<String, (i64, String)>::new();
+    for (provider, detail, observed_at_ms) in observations {
+        if !quota_observation_is_fresh(Some(*observed_at_ms), now_ms) {
+            continue;
+        }
+        let Some(detail) = detail.as_ref().filter(|detail| !detail.trim().is_empty()) else {
+            continue;
+        };
+        let replace = latest
+            .get(provider)
+            .is_none_or(|(current, _)| *observed_at_ms >= *current);
+        if replace {
+            latest.insert(provider.clone(), (*observed_at_ms, detail.clone()));
+        }
+    }
+    latest
+        .into_iter()
+        .map(|(provider, (_, detail))| (provider, detail))
+        .collect()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamAdmissionReject {
+    SubscriptionMismatch,
+    ResourceMismatch,
+    GenerationMismatch { expected: u64, actual: u64 },
+    ZeroSequence,
+    StaleSequence { last: u64, actual: u64 },
+    SequenceGap { last: u64, actual: u64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmittedStreamFrame {
+    pub resource_id: ResourceId,
+    pub generation: u64,
+    pub sequence: u64,
+    pub output: Option<String>,
+}
+
+/// Admit a live [`crate::protocol::StreamFrame`] against exact subscription,
+/// resource, generation, and sequence fences. Provider conversation identity
+/// is never inferred from this ephemeral PTY/resource stream.
+pub fn admit_subscription_stream(
+    expected_subscription: SubscriptionId,
+    expected_resource: ResourceId,
+    expected_generation: u64,
+    last_sequence: u64,
+    frame: &crate::protocol::StreamFrame,
+) -> Result<AdmittedStreamFrame, StreamAdmissionReject> {
+    if frame.subscription_id != expected_subscription {
+        return Err(StreamAdmissionReject::SubscriptionMismatch);
+    }
+    if frame.stream.resource_id() != expected_resource {
+        return Err(StreamAdmissionReject::ResourceMismatch);
+    }
+    if frame.generation != expected_generation {
+        return Err(StreamAdmissionReject::GenerationMismatch {
+            expected: expected_generation,
+            actual: frame.generation,
+        });
+    }
+    if frame.sequence == 0 {
+        return Err(StreamAdmissionReject::ZeroSequence);
+    }
+    if last_sequence != 0 && frame.sequence <= last_sequence {
+        return Err(StreamAdmissionReject::StaleSequence {
+            last: last_sequence,
+            actual: frame.sequence,
+        });
+    }
+    if last_sequence != 0 && frame.sequence != last_sequence.saturating_add(1) {
+        return Err(StreamAdmissionReject::SequenceGap {
+            last: last_sequence,
+            actual: frame.sequence,
+        });
+    }
+    if last_sequence == 0 && frame.sequence != 1 {
+        return Err(StreamAdmissionReject::SequenceGap {
+            last: last_sequence,
+            actual: frame.sequence,
+        });
+    }
+    let output = std::str::from_utf8(&frame.payload).ok().map(str::to_owned);
+    Ok(AdmittedStreamFrame {
+        resource_id: expected_resource,
+        generation: frame.generation,
+        sequence: frame.sequence,
+        output,
+    })
 }
 
 #[cfg(test)]
@@ -3464,5 +3575,69 @@ mod tests {
         assert_eq!(projection.unavailable_workspace_surfaces().count(), 2);
         assert!(!format!("{projection:?}").contains('\\'));
         assert!(!format!("{projection:?}").contains("C:"));
+    }
+
+    #[test]
+    fn stream_admission_rejects_stale_foreign_and_mismatched_generation() {
+        use crate::protocol::{StreamFrame, StreamKey, StreamPayloadKind};
+
+        let subscription = crate::domain::id::SubscriptionId::from_bytes(fixed_uuid_v7(0xd1))
+            .expect("subscription");
+        let resource = resource_id(0xd2);
+        let frame = StreamFrame {
+            subscription_id: subscription,
+            stream: StreamKey::from(resource),
+            generation: 4,
+            sequence: 1,
+            payload_kind: StreamPayloadKind::new(3).expect("kind"),
+            schema_version: 1,
+            payload: b"hello terminal".to_vec(),
+        };
+        let admitted = admit_subscription_stream(subscription, resource, 4, 0, &frame)
+            .expect("first live frame");
+        assert_eq!(admitted.output.as_deref(), Some("hello terminal"));
+
+        let mut stale = frame.clone();
+        stale.sequence = 1;
+        assert_eq!(
+            admit_subscription_stream(subscription, resource, 4, 1, &stale),
+            Err(StreamAdmissionReject::StaleSequence { last: 1, actual: 1 })
+        );
+
+        let mut foreign = frame.clone();
+        foreign.subscription_id =
+            crate::domain::id::SubscriptionId::from_bytes(fixed_uuid_v7(0xd3)).expect("foreign");
+        assert_eq!(
+            admit_subscription_stream(subscription, resource, 4, 0, &foreign),
+            Err(StreamAdmissionReject::SubscriptionMismatch)
+        );
+
+        let mut generation = frame.clone();
+        generation.generation = 9;
+        assert_eq!(
+            admit_subscription_stream(subscription, resource, 4, 0, &generation),
+            Err(StreamAdmissionReject::GenerationMismatch {
+                expected: 4,
+                actual: 9
+            })
+        );
+    }
+
+    #[test]
+    fn quota_age_keeps_one_fresh_observation_per_provider() {
+        let now = 1_725_000_000_000;
+        let hour = PROVIDER_QUOTA_MAX_AGE_MS;
+        let visible = one_fresh_quota_per_provider(
+            &[
+                ("claude".into(), Some("55% remaining".into()), now),
+                ("claude".into(), Some("12% remaining".into()), now - 1_000),
+                ("codex".into(), None, now),
+                ("gemini".into(), Some("stale".into()), now - hour - 1),
+            ],
+            now,
+        );
+        assert_eq!(visible, vec![("claude".into(), "55% remaining".into())]);
+        assert!(!quota_observation_is_fresh(None, now));
+        assert!(!quota_observation_is_fresh(Some(now + 5), now));
     }
 }

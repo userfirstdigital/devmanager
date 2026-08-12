@@ -10,14 +10,12 @@ use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
+use crate::domain::cockpit::{TaskCockpitQuery, MAX_COCKPIT_FILE_LIST, MAX_COCKPIT_READ_BYTES};
 use crate::domain::command::{
     Command, CommandEnvelope, CreateTaskIntent, CreateTaskRequestIntent, RenameTaskIntent,
     ServiceControlAction, ServiceControlIntent, SubmitProviderInputIntent,
 };
-use crate::domain::cockpit::TaskCockpitQuery;
-use crate::domain::id::{
-    AgentSessionId, ConfiguredServiceId, PromptChainId, PromptVersionId,
-};
+use crate::domain::id::{AgentSessionId, ConfiguredServiceId, PromptChainId, PromptVersionId};
 use crate::domain::provider_input::{ProviderInputAction, ProviderInputIntentError};
 use crate::domain::query::{Query, QueryEnvelope};
 use crate::domain::task::{
@@ -29,7 +27,7 @@ use crate::domain::{
     TurnId,
 };
 use crate::prompts::projection::{
-    OwnerDeviceCapability, PromptCursor, PromptLibraryRequest, PromptNamespace,
+    OwnerDeviceCapability, PromptCursor, PromptLibraryQuery, PromptLibraryRequest, PromptNamespace,
     PromptProjectionError,
 };
 use crate::prompts::ui::composer::{ComposerInsertionMode, PutPromptVersionInComposer};
@@ -54,17 +52,17 @@ pub const ACTION_TASK_CREATE: &str = "task.create";
 pub const ACTION_TASK_CREATE_V2: &str = "task.create.v2";
 /// Stable id for renaming one Task through the host command boundary.
 pub const ACTION_TASK_RENAME: &str = "task.rename";
-/// Reserved Phase 4.7 id. Not registered in `ACTIONS` until the host command exists.
+/// Canonical composer Send Now. Settles through SubmitProviderInput.
 pub const ACTION_TASK_SEND_NOW: &str = "task.send_now";
-/// Reserved Phase 4.7 id. Not registered in `ACTIONS` until the host command exists.
+/// Canonical composer steer. Settles through SubmitProviderInput.
 pub const ACTION_TASK_STEER_CURRENT_TURN: &str = "task.steer_current_turn";
-/// Reserved Phase 4.7 id. Not registered in `ACTIONS` until the host command exists.
+/// Canonical composer queue follow-up. Settles through SubmitProviderInput.
 pub const ACTION_TASK_QUEUE_FOLLOW_UP: &str = "task.queue_follow_up";
-/// Reserved Phase 4.7 id. Not registered in `ACTIONS` until the host command exists.
+/// Canonical composer answer. Settles through SubmitProviderInput.
 pub const ACTION_TASK_ANSWER_QUESTION: &str = "task.answer_question";
-/// Reserved Phase 4.7 id. Not registered in `ACTIONS` until the host command exists.
+/// Canonical composer approval. Settles through SubmitProviderInput.
 pub const ACTION_TASK_RESOLVE_APPROVAL: &str = "task.resolve_approval";
-/// Reserved Phase 4.7 id. Not registered in `ACTIONS` until the host command exists.
+/// Canonical composer stop. Settles through SubmitProviderInput.
 pub const ACTION_TASK_STOP_TURN: &str = "task.stop_turn";
 /// Reserved Phase 4.7 id. Not registered in `ACTIONS` until the host command exists.
 pub const ACTION_TASK_SAVE_COMPOSER_DRAFT: &str = "task.save_composer_draft";
@@ -132,6 +130,14 @@ pub const ACTION_SSH_STATUS: &str = "ssh.status";
 pub const ACTION_SSH_ACTION: &str = "ssh.action";
 /// Reserved git mutate; stays unpublished until GitHostBinding is issued.
 pub const ACTION_GIT_MUTATE: &str = "git.mutate";
+/// Local updater background-check arm. Never installs or launches.
+pub const ACTION_UPDATER_START_BACKGROUND: &str = "updater.start_background";
+/// Local updater freshness check. Never installs or launches.
+pub const ACTION_UPDATER_CHECK: &str = "updater.check";
+/// Local updater download. Tests must not invoke install.
+pub const ACTION_UPDATER_DOWNLOAD: &str = "updater.download";
+/// Local updater install. Native tests must not dispatch this action.
+pub const ACTION_UPDATER_INSTALL: &str = "updater.install";
 
 /// Where an action applies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -380,6 +386,14 @@ pub enum ActionRequest {
         action: ServiceControlAction,
         arguments: ServiceControlArguments,
     },
+    TaskCockpit {
+        task_id: TaskId,
+        query: TaskCockpitQuery,
+    },
+    PromptLibrary {
+        query: PromptLibraryQuery,
+    },
+    Updater(UpdaterAction),
 }
 
 impl ActionRequest {
@@ -397,6 +411,9 @@ impl ActionRequest {
                 ServiceControlAction::Stop => ACTION_SERVICE_STOP,
                 ServiceControlAction::Restart => ACTION_SERVICE_RESTART,
             },
+            Self::TaskCockpit { query, .. } => cockpit_query_action_id(query),
+            Self::PromptLibrary { query } => prompt_query_action_id(query),
+            Self::Updater(action) => action.id(),
         }
     }
 
@@ -412,6 +429,68 @@ impl ActionRequest {
 pub struct ProviderInputActionRequest {
     pub action_id: &'static str,
     pub arguments: ProviderInputArguments,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdaterAction {
+    StartBackground,
+    Check,
+    Download,
+    Install,
+}
+
+impl UpdaterAction {
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::StartBackground => ACTION_UPDATER_START_BACKGROUND,
+            Self::Check => ACTION_UPDATER_CHECK,
+            Self::Download => ACTION_UPDATER_DOWNLOAD,
+            Self::Install => ACTION_UPDATER_INSTALL,
+        }
+    }
+}
+
+pub const fn cockpit_query_action_id(query: &TaskCockpitQuery) -> &'static str {
+    match query {
+        TaskCockpitQuery::WorkspaceStatus => ACTION_WORKSPACE_STATUS,
+        TaskCockpitQuery::GitStatus | TaskCockpitQuery::GitMutate { .. } => ACTION_GIT_STATUS,
+        TaskCockpitQuery::FilesList { .. } => ACTION_FILES_LIST,
+        TaskCockpitQuery::FilesRead { .. } => ACTION_FILES_READ,
+        TaskCockpitQuery::FilesWrite { .. } => ACTION_FILES_WRITE,
+        TaskCockpitQuery::SshStatus => ACTION_SSH_STATUS,
+        TaskCockpitQuery::SshAction { .. } => ACTION_SSH_ACTION,
+        TaskCockpitQuery::ServiceSnapshots | TaskCockpitQuery::ServiceLogs { .. } => {
+            ACTION_SERVICE_LOGS
+        }
+        TaskCockpitQuery::ServiceHealth { .. } => ACTION_SERVICE_HEALTH,
+    }
+}
+
+pub const fn prompt_query_action_id(query: &PromptLibraryQuery) -> &'static str {
+    match query {
+        PromptLibraryQuery::MetadataPage { .. } => ACTION_PROMPT_METADATA_PAGE,
+        PromptLibraryQuery::ExactVersion { .. } => ACTION_PROMPT_VERSION_PAGE,
+        PromptLibraryQuery::Diff { .. } => ACTION_PROMPT_DIFF,
+        PromptLibraryQuery::Search { .. } => ACTION_PROMPT_SEARCH_PAGE,
+        PromptLibraryQuery::ChainPage { .. } => ACTION_PROMPT_CHAIN_PAGE,
+        PromptLibraryQuery::HistoryPage { .. } => ACTION_PROMPT_HISTORY_PAGE,
+    }
+}
+
+pub fn task_cockpit_request(task_id: TaskId, action_id: &str) -> Option<ActionRequest> {
+    let query = match action_id {
+        ACTION_WORKSPACE_STATUS => TaskCockpitQuery::WorkspaceStatus,
+        ACTION_GIT_STATUS => TaskCockpitQuery::GitStatus,
+        ACTION_FILES_LIST => TaskCockpitQuery::FilesList {
+            relative_directory: None,
+            limit: MAX_COCKPIT_FILE_LIST,
+        },
+        ACTION_FILES_READ => return None,
+        ACTION_SSH_STATUS => TaskCockpitQuery::SshStatus,
+        ACTION_SERVICE_LOGS | ACTION_SERVICE_HEALTH => return None,
+        _ => return None,
+    };
+    Some(ActionRequest::TaskCockpit { task_id, query })
 }
 
 /// Caller-owned configured-service action arguments. The host supervisor
@@ -576,12 +655,16 @@ pub fn catalog() -> &'static [ActionDescriptor] {
                 ACTIONS.len()
                     + PROMPT_LIBRARY_EXTENSION.len()
                     + SERVICE_CONTROL_EXTENSION.len()
-                    + TASK_COCKPIT_EXTENSION.len(),
+                    + TASK_COCKPIT_EXTENSION.len()
+                    + COMPOSER_TURN_EXTENSION.len()
+                    + UPDATER_EXTENSION.len(),
             );
             entries.extend_from_slice(ACTIONS);
             entries.extend_from_slice(PROMPT_LIBRARY_EXTENSION);
             entries.extend_from_slice(SERVICE_CONTROL_EXTENSION);
             entries.extend_from_slice(TASK_COCKPIT_EXTENSION);
+            entries.extend_from_slice(COMPOSER_TURN_EXTENSION);
+            entries.extend_from_slice(UPDATER_EXTENSION);
             entries
         })
         .as_slice()
@@ -739,6 +822,112 @@ const TASK_COCKPIT_EXTENSION: &[ActionDescriptor] = &[
     },
 ];
 
+const COMPOSER_TURN_EXTENSION: &[ActionDescriptor] = &[
+    ActionDescriptor {
+        id: ACTION_TASK_SEND_NOW,
+        title: "Send now",
+        description: "Send composer input on the current provider turn.",
+        keywords: &["send", "composer", "turn"],
+        scope: ActionScope::Task,
+        required_capability: Some(Capability::ProviderInput),
+        risk: ActionRisk::Mutating,
+        argument_schema: ActionArgumentSchema::ProviderInputV1,
+    },
+    ActionDescriptor {
+        id: ACTION_TASK_STEER_CURRENT_TURN,
+        title: "Steer current turn",
+        description: "Steer the current provider turn from the composer.",
+        keywords: &["steer", "composer", "turn"],
+        scope: ActionScope::Task,
+        required_capability: Some(Capability::ProviderInput),
+        risk: ActionRisk::Mutating,
+        argument_schema: ActionArgumentSchema::ProviderInputV1,
+    },
+    ActionDescriptor {
+        id: ACTION_TASK_QUEUE_FOLLOW_UP,
+        title: "Queue follow-up",
+        description: "Queue a follow-up after the current provider turn.",
+        keywords: &["queue", "composer", "turn"],
+        scope: ActionScope::Task,
+        required_capability: Some(Capability::ProviderInput),
+        risk: ActionRisk::Mutating,
+        argument_schema: ActionArgumentSchema::ProviderInputV1,
+    },
+    ActionDescriptor {
+        id: ACTION_TASK_ANSWER_QUESTION,
+        title: "Answer question",
+        description: "Answer the exact projected provider question.",
+        keywords: &["answer", "question", "composer"],
+        scope: ActionScope::Task,
+        required_capability: Some(Capability::ProviderInput),
+        risk: ActionRisk::Mutating,
+        argument_schema: ActionArgumentSchema::ProviderInputV1,
+    },
+    ActionDescriptor {
+        id: ACTION_TASK_RESOLVE_APPROVAL,
+        title: "Resolve approval",
+        description: "Resolve the exact projected provider approval.",
+        keywords: &["approval", "composer"],
+        scope: ActionScope::Task,
+        required_capability: Some(Capability::ProviderInput),
+        risk: ActionRisk::Mutating,
+        argument_schema: ActionArgumentSchema::ProviderInputV1,
+    },
+    ActionDescriptor {
+        id: ACTION_TASK_STOP_TURN,
+        title: "Stop turn",
+        description: "Stop the current provider turn.",
+        keywords: &["stop", "composer", "turn"],
+        scope: ActionScope::Task,
+        required_capability: Some(Capability::ProviderInput),
+        risk: ActionRisk::Mutating,
+        argument_schema: ActionArgumentSchema::ProviderInputV1,
+    },
+];
+
+const UPDATER_EXTENSION: &[ActionDescriptor] = &[
+    ActionDescriptor {
+        id: ACTION_UPDATER_START_BACKGROUND,
+        title: "Start background update checks",
+        description: "Arm the existing updater background-check loop without installing.",
+        keywords: &["updater", "background", "check"],
+        scope: ActionScope::Host,
+        required_capability: None,
+        risk: ActionRisk::ReadOnly,
+        argument_schema: ActionArgumentSchema::None,
+    },
+    ActionDescriptor {
+        id: ACTION_UPDATER_CHECK,
+        title: "Check for updates",
+        description: "Run one updater freshness check without downloading or installing.",
+        keywords: &["updater", "check"],
+        scope: ActionScope::Host,
+        required_capability: None,
+        risk: ActionRisk::ReadOnly,
+        argument_schema: ActionArgumentSchema::None,
+    },
+    ActionDescriptor {
+        id: ACTION_UPDATER_DOWNLOAD,
+        title: "Download update",
+        description: "Download an admitted update package without launching an installer.",
+        keywords: &["updater", "download"],
+        scope: ActionScope::Host,
+        required_capability: None,
+        risk: ActionRisk::Mutating,
+        argument_schema: ActionArgumentSchema::None,
+    },
+    ActionDescriptor {
+        id: ACTION_UPDATER_INSTALL,
+        title: "Install update",
+        description: "Install a downloaded update. Tests must not dispatch this action.",
+        keywords: &["updater", "install"],
+        scope: ActionScope::Host,
+        required_capability: None,
+        risk: ActionRisk::Mutating,
+        argument_schema: ActionArgumentSchema::None,
+    },
+];
+
 pub fn registered_actions() -> impl Iterator<Item = &'static ActionDescriptor> {
     catalog().iter()
 }
@@ -759,19 +948,7 @@ pub fn disabled_reason(id: &str, granted: CapabilitySet) -> Option<&'static str>
             });
         }
     }
-    match id {
-        ACTION_GIT_STATUS => Some("git host authority is not issued for this Task on this host"),
-        ACTION_FILES_LIST | ACTION_FILES_READ => {
-            Some("workspace file authority is not issued for this Task on this host")
-        }
-        ACTION_PROMPT_METADATA_PAGE
-        | ACTION_PROMPT_VERSION_PAGE
-        | ACTION_PROMPT_DIFF
-        | ACTION_PROMPT_CHAIN_PAGE => {
-            Some("owner_device_session unavailable until Phase 9 authenticated pairing")
-        }
-        _ => None,
-    }
+    None
 }
 
 pub fn action_enabled(id: &str, granted: CapabilitySet) -> bool {
@@ -1080,31 +1257,39 @@ pub fn provider_input_command(
     args: ProviderInputArguments,
 ) -> Result<CommandEnvelope, ProviderInputIntentError> {
     let action = match action_id {
-        ACTION_PROVIDER_SEND_NOW => ProviderInputAction::SendNow {
+        ACTION_PROVIDER_SEND_NOW | ACTION_TASK_SEND_NOW => ProviderInputAction::SendNow {
             text: args.text.ok_or(ProviderInputIntentError::EmptyText)?,
             wait: args.wait.unwrap_or(false),
         },
-        ACTION_PROVIDER_STEER_CURRENT_TURN => ProviderInputAction::SteerCurrentTurn {
-            text: args.text.ok_or(ProviderInputIntentError::EmptyText)?,
-        },
-        ACTION_PROVIDER_QUEUE_FOLLOW_UP => ProviderInputAction::QueueFollowUp {
-            text: args.text.ok_or(ProviderInputIntentError::EmptyText)?,
-        },
-        ACTION_PROVIDER_ANSWER_QUESTION => ProviderInputAction::AnswerQuestion {
-            question_id: args
-                .question_id
-                .ok_or(ProviderInputIntentError::InconsistentNestedIds)?,
-            answer: args.text.ok_or(ProviderInputIntentError::EmptyText)?,
-        },
-        ACTION_PROVIDER_RESOLVE_APPROVAL => ProviderInputAction::ResolveApproval {
-            approval_id: args
-                .approval_id
-                .ok_or(ProviderInputIntentError::InconsistentNestedIds)?,
-            allow: args
-                .allow
-                .ok_or(ProviderInputIntentError::InconsistentNestedIds)?,
-        },
-        ACTION_PROVIDER_STOP_TURN => ProviderInputAction::StopTurn,
+        ACTION_PROVIDER_STEER_CURRENT_TURN | ACTION_TASK_STEER_CURRENT_TURN => {
+            ProviderInputAction::SteerCurrentTurn {
+                text: args.text.ok_or(ProviderInputIntentError::EmptyText)?,
+            }
+        }
+        ACTION_PROVIDER_QUEUE_FOLLOW_UP | ACTION_TASK_QUEUE_FOLLOW_UP => {
+            ProviderInputAction::QueueFollowUp {
+                text: args.text.ok_or(ProviderInputIntentError::EmptyText)?,
+            }
+        }
+        ACTION_PROVIDER_ANSWER_QUESTION | ACTION_TASK_ANSWER_QUESTION => {
+            ProviderInputAction::AnswerQuestion {
+                question_id: args
+                    .question_id
+                    .ok_or(ProviderInputIntentError::InconsistentNestedIds)?,
+                answer: args.text.ok_or(ProviderInputIntentError::EmptyText)?,
+            }
+        }
+        ACTION_PROVIDER_RESOLVE_APPROVAL | ACTION_TASK_RESOLVE_APPROVAL => {
+            ProviderInputAction::ResolveApproval {
+                approval_id: args
+                    .approval_id
+                    .ok_or(ProviderInputIntentError::InconsistentNestedIds)?,
+                allow: args
+                    .allow
+                    .ok_or(ProviderInputIntentError::InconsistentNestedIds)?,
+            }
+        }
+        ACTION_PROVIDER_STOP_TURN | ACTION_TASK_STOP_TURN => ProviderInputAction::StopTurn,
         _ => return Err(ProviderInputIntentError::InconsistentNestedIds),
     };
     let intent = SubmitProviderInputIntent::try_new(
@@ -1207,12 +1392,15 @@ mod tests {
         TaskCreateV2Arguments, TaskRenameArguments, ACTION_FILES_LIST, ACTION_FILES_READ,
         ACTION_GIT_STATUS, ACTION_HOST_ACTIONS, ACTION_HOST_STATUS,
         ACTION_PROVIDER_ANSWER_QUESTION, ACTION_PROVIDER_NEW_CONVERSATION,
-        ACTION_PROVIDER_QUEUE_FOLLOW_UP, ACTION_PROVIDER_RESOLVE_APPROVAL, ACTION_PROVIDER_SEND_NOW,
-        ACTION_PROVIDER_STEER_CURRENT_TURN, ACTION_PROVIDER_STOP_TURN, ACTION_SERVICE_HEALTH,
-        ACTION_SERVICE_LOGS, ACTION_SERVICE_RESTART, ACTION_SERVICE_START, ACTION_SERVICE_STOP,
-        ACTION_SSH_ACTION, ACTION_SSH_STATUS, ACTION_TASK_CREATE, ACTION_TASK_CREATE_V2,
-        ACTION_TASK_LIST,
-        ACTION_TASK_RENAME, ACTION_TASK_SHOW, ACTION_WORKSPACE_STATUS,
+        ACTION_PROVIDER_QUEUE_FOLLOW_UP, ACTION_PROVIDER_RESOLVE_APPROVAL,
+        ACTION_PROVIDER_SEND_NOW, ACTION_PROVIDER_STEER_CURRENT_TURN, ACTION_PROVIDER_STOP_TURN,
+        ACTION_SERVICE_HEALTH, ACTION_SERVICE_LOGS, ACTION_SERVICE_RESTART, ACTION_SERVICE_START,
+        ACTION_SERVICE_STOP, ACTION_SSH_ACTION, ACTION_SSH_STATUS, ACTION_TASK_ANSWER_QUESTION,
+        ACTION_TASK_CREATE, ACTION_TASK_CREATE_V2, ACTION_TASK_LIST, ACTION_TASK_QUEUE_FOLLOW_UP,
+        ACTION_TASK_RENAME, ACTION_TASK_RESOLVE_APPROVAL, ACTION_TASK_SEND_NOW, ACTION_TASK_SHOW,
+        ACTION_TASK_STEER_CURRENT_TURN, ACTION_TASK_STOP_TURN, ACTION_UPDATER_CHECK,
+        ACTION_UPDATER_DOWNLOAD, ACTION_UPDATER_INSTALL, ACTION_UPDATER_START_BACKGROUND,
+        ACTION_WORKSPACE_STATUS,
     };
     use crate::{
         domain::{
@@ -1244,7 +1432,17 @@ mod tests {
         assert!(ids.contains(&ACTION_PROVIDER_RESOLVE_APPROVAL));
         assert!(ids.contains(&ACTION_PROVIDER_STOP_TURN));
         assert!(!ids.contains(&ACTION_PROVIDER_NEW_CONVERSATION));
-        assert_eq!(ids.len(), 26);
+        assert!(ids.contains(&ACTION_TASK_SEND_NOW));
+        assert!(ids.contains(&ACTION_TASK_STEER_CURRENT_TURN));
+        assert!(ids.contains(&ACTION_TASK_QUEUE_FOLLOW_UP));
+        assert!(ids.contains(&ACTION_TASK_ANSWER_QUESTION));
+        assert!(ids.contains(&ACTION_TASK_RESOLVE_APPROVAL));
+        assert!(ids.contains(&ACTION_TASK_STOP_TURN));
+        assert!(ids.contains(&ACTION_UPDATER_CHECK));
+        assert!(ids.contains(&ACTION_UPDATER_DOWNLOAD));
+        assert!(ids.contains(&ACTION_UPDATER_START_BACKGROUND));
+        assert!(ids.contains(&ACTION_UPDATER_INSTALL));
+        assert_eq!(ids.len(), 36);
         assert!(ids.contains(&ACTION_SERVICE_START));
         assert!(ids.contains(&ACTION_SERVICE_STOP));
         assert!(ids.contains(&ACTION_SERVICE_RESTART));
@@ -1289,7 +1487,13 @@ mod tests {
                     | ACTION_PROVIDER_QUEUE_FOLLOW_UP
                     | ACTION_PROVIDER_ANSWER_QUESTION
                     | ACTION_PROVIDER_RESOLVE_APPROVAL
-                    | ACTION_PROVIDER_STOP_TURN => (
+                    | ACTION_PROVIDER_STOP_TURN
+                    | ACTION_TASK_SEND_NOW
+                    | ACTION_TASK_STEER_CURRENT_TURN
+                    | ACTION_TASK_QUEUE_FOLLOW_UP
+                    | ACTION_TASK_ANSWER_QUESTION
+                    | ACTION_TASK_RESOLVE_APPROVAL
+                    | ACTION_TASK_STOP_TURN => (
                         ActionScope::Task,
                         ActionRisk::Mutating,
                         ActionArgumentSchema::ProviderInputV1,
@@ -1316,6 +1520,18 @@ mod tests {
                         ActionRisk::ReadOnly,
                         ActionArgumentSchema::ServiceControlV1,
                         Some(Capability::TaskCockpit),
+                    ),
+                    ACTION_UPDATER_START_BACKGROUND | ACTION_UPDATER_CHECK => (
+                        ActionScope::Host,
+                        ActionRisk::ReadOnly,
+                        ActionArgumentSchema::None,
+                        None,
+                    ),
+                    ACTION_UPDATER_DOWNLOAD | ACTION_UPDATER_INSTALL => (
+                        ActionScope::Host,
+                        ActionRisk::Mutating,
+                        ActionArgumentSchema::None,
+                        None,
                     ),
                     _ => (
                         ActionScope::Host,
@@ -1697,5 +1913,73 @@ mod tests {
             result.is_err(),
             "blank rename titles must fail before transport"
         );
+    }
+
+    #[test]
+    fn task_cockpit_and_turn_requests_reuse_typed_host_contracts() {
+        use super::{
+            cockpit_query_action_id, provider_input_command, task_cockpit_request, ActionRequest,
+            ProviderInputArguments, UpdaterAction, ACTION_FILES_WRITE, ACTION_PROMPT_METADATA_PAGE,
+        };
+        use crate::domain::cockpit::MAX_COCKPIT_FILE_LIST;
+        use crate::domain::{AgentSessionId, TurnId};
+        use crate::prompts::projection::PromptLibraryQuery;
+        use crate::prompts::projection::PromptNamespace;
+
+        let task_id = TaskId::new();
+        let request = task_cockpit_request(task_id, ACTION_GIT_STATUS).expect("git route");
+        assert_eq!(request.id(), ACTION_GIT_STATUS);
+        let ActionRequest::TaskCockpit { query, .. } = request else {
+            panic!("git status must stay a TaskCockpit query");
+        };
+        assert_eq!(cockpit_query_action_id(&query), ACTION_GIT_STATUS);
+        let files = task_cockpit_request(task_id, ACTION_FILES_LIST).expect("files");
+        assert!(matches!(
+            files,
+            ActionRequest::TaskCockpit {
+                query: crate::domain::TaskCockpitQuery::FilesList { limit, .. },
+                ..
+            } if limit == MAX_COCKPIT_FILE_LIST
+        ));
+        assert!(task_cockpit_request(task_id, ACTION_FILES_WRITE).is_none());
+
+        let prompt = ActionRequest::PromptLibrary {
+            query: PromptLibraryQuery::MetadataPage {
+                namespace: PromptNamespace::Personal,
+                cursor: None,
+                expected_revision: None,
+            },
+        };
+        assert_eq!(prompt.id(), ACTION_PROMPT_METADATA_PAGE);
+        assert_eq!(
+            ActionRequest::Updater(UpdaterAction::Check).id(),
+            ACTION_UPDATER_CHECK
+        );
+        assert_eq!(
+            ActionRequest::Updater(UpdaterAction::Install).id(),
+            ACTION_UPDATER_INSTALL
+        );
+
+        let envelope = provider_input_command(
+            CommandId::new(),
+            ClientId::new(),
+            1_725_000_000_100,
+            2,
+            ACTION_TASK_SEND_NOW,
+            ProviderInputArguments {
+                task_id,
+                agent_session_id: AgentSessionId::new(),
+                runtime_generation: 3,
+                action_epoch: 4,
+                turn_id: TurnId::new(),
+                question_id: None,
+                approval_id: None,
+                text: Some("ship it".into()),
+                wait: Some(false),
+                allow: None,
+            },
+        )
+        .expect("task.send_now maps to SubmitProviderInput");
+        assert!(matches!(envelope.command, Command::SubmitProviderInput(_)));
     }
 }

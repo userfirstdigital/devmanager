@@ -3419,6 +3419,55 @@ fn title_layout(title: &str, width_px: u16) -> TitleLayout {
     TitleLayout::SingleLine(title.to_string())
 }
 
+/// Keep one fresh quota observation per provider label. Unavailable, future,
+/// and older-than-one-hour details are omitted rather than placeholdered.
+pub fn one_fresh_quota_observations(
+    observations: &[QuotaObservation],
+    now_ms: i64,
+) -> Vec<QuotaObservation> {
+    let tuples: Vec<(String, Option<String>, i64)> = observations
+        .iter()
+        .filter_map(|observation| {
+            Some((
+                observation.identity.provider.clone(),
+                observation.detail.clone(),
+                observation.observed_at_ms?,
+            ))
+        })
+        .collect();
+    let visible = crate::client::one_fresh_quota_per_provider(&tuples, now_ms);
+    observations
+        .iter()
+        .filter(|observation| {
+            visible.iter().any(|(provider, detail)| {
+                provider == &observation.identity.provider
+                    && observation.detail.as_ref() == Some(detail)
+            })
+        })
+        .cloned()
+        .collect()
+}
+
+pub fn update_observation_from_snapshot(
+    current_version: &str,
+    target_version: Option<&str>,
+    state: UpdateState,
+    now_ms: i64,
+    generation: u64,
+    revision: u64,
+) -> UpdateObservation {
+    UpdateObservation {
+        identity: UpdateObservationIdentity {
+            current_version: current_version.to_string(),
+            target_version: target_version.map(str::to_string),
+            revision,
+        },
+        state,
+        observed_at_ms: Some(now_ms),
+        generation: Some(generation),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3677,5 +3726,57 @@ mod tests {
             cockpit_breakpoint(STANDARD_HEADER_WIDTH_PX),
             CockpitBreakpoint::Desktop
         );
+    }
+
+    #[test]
+    fn one_fresh_quota_per_provider_omits_stale_and_duplicate_labels() {
+        let now = 1_000_000_i64;
+        let observations = vec![
+            QuotaObservation {
+                identity: QuotaObservationIdentity {
+                    provider: "claude".into(),
+                    provider_session_id: "a".into(),
+                    observation_id: 1,
+                },
+                detail: Some("12% remaining".into()),
+                observed_at_ms: Some(now - 2_000),
+                generation: Some(1),
+            },
+            QuotaObservation {
+                identity: QuotaObservationIdentity {
+                    provider: "claude".into(),
+                    provider_session_id: "b".into(),
+                    observation_id: 2,
+                },
+                detail: Some("55% remaining".into()),
+                observed_at_ms: Some(now - 1_000),
+                generation: Some(1),
+            },
+            QuotaObservation {
+                identity: QuotaObservationIdentity {
+                    provider: "codex".into(),
+                    provider_session_id: "c".into(),
+                    observation_id: 3,
+                },
+                detail: Some("old".into()),
+                observed_at_ms: Some(now - PROVIDER_QUOTA_MAX_AGE_MS - 1),
+                generation: Some(1),
+            },
+        ];
+        let visible = one_fresh_quota_observations(&observations, now);
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].identity.provider, "claude");
+        assert_eq!(visible[0].detail.as_deref(), Some("55% remaining"));
+        let update = update_observation_from_snapshot(
+            "1.2.3",
+            Some("1.2.4"),
+            UpdateState::Available,
+            now,
+            9,
+            3,
+        );
+        assert_eq!(update.state, UpdateState::Available);
+        assert_eq!(update.identity.current_version, "1.2.3");
+        assert_eq!(update.identity.target_version.as_deref(), Some("1.2.4"));
     }
 }
