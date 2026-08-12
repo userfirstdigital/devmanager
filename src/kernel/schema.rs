@@ -1174,6 +1174,180 @@ BEGIN
 END;\n\
 ";
 
+// V10 is required because V7 (`phase07-prompts-v1`) is already sealed by the
+// V8 corrections and V9 lineage-authority migrations in this branch. V9's
+// `prompt_lineage_migration_commitment.migration_version = 9` check makes
+// folding history into V7 a lineage rewrite, not a safe in-place extension.
+const V10_SQL: &str = "\
+CREATE TABLE prompt_history (\n\
+  history_rowid INTEGER PRIMARY KEY AUTOINCREMENT,\n\
+  prompt_history_id BLOB NOT NULL UNIQUE CHECK(length(prompt_history_id) = 16),\n\
+  request_id BLOB NOT NULL UNIQUE CHECK(length(request_id) = 16),\n\
+  submitted_event_id BLOB NOT NULL UNIQUE CHECK(length(submitted_event_id) = 16),\n\
+  task_id BLOB NOT NULL CHECK(length(task_id) = 16),\n\
+  agent_session_id BLOB NOT NULL CHECK(length(agent_session_id) = 16),\n\
+  provider_kind TEXT NOT NULL CHECK(\n\
+    length(CAST(provider_kind AS BLOB)) BETWEEN 1 AND 32\n\
+    AND provider_kind NOT GLOB '*[^a-zA-Z0-9-]*'\n\
+  ),\n\
+  body TEXT NOT NULL CHECK(length(CAST(body AS BLOB)) <= 262144),\n\
+  body_sha256 BLOB NOT NULL CHECK(length(body_sha256) = 32),\n\
+  submitted_at_ms INTEGER NOT NULL CHECK(submitted_at_ms >= 0),\n\
+  prompt_id BLOB CHECK(prompt_id IS NULL OR length(prompt_id) = 16),\n\
+  prompt_version_id BLOB CHECK(prompt_version_id IS NULL OR length(prompt_version_id) = 16),\n\
+  chain_id BLOB CHECK(chain_id IS NULL OR length(chain_id) = 16),\n\
+  chain_link_id BLOB CHECK(chain_link_id IS NULL OR length(chain_link_id) = 16),\n\
+  CHECK((prompt_id IS NULL) = (prompt_version_id IS NULL)),\n\
+  CHECK((chain_id IS NULL) = (chain_link_id IS NULL)),\n\
+  CHECK(chain_id IS NULL OR prompt_version_id IS NOT NULL)\n\
+);\n\
+CREATE TABLE prompt_history_policy (\n\
+  singleton_key INTEGER PRIMARY KEY CHECK(singleton_key = 1),\n\
+  enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)),\n\
+  retention_days INTEGER NOT NULL CHECK(retention_days BETWEEN 1 AND 365),\n\
+  max_entries INTEGER NOT NULL CHECK(max_entries BETWEEN 100 AND 100000),\n\
+  revision INTEGER NOT NULL CHECK(revision >= 1)\n\
+);\n\
+INSERT INTO prompt_history_policy(\n\
+  singleton_key, enabled, retention_days, max_entries, revision\n\
+) VALUES (1, 1, 90, 10000, 1);\n\
+CREATE TABLE prompt_search_state (\n\
+  singleton_key INTEGER PRIMARY KEY CHECK(singleton_key = 1),\n\
+  dirty INTEGER NOT NULL CHECK(dirty IN (0, 1)),\n\
+  overflow INTEGER NOT NULL CHECK(overflow IN (0, 1)),\n\
+  rebuild_phase TEXT NOT NULL CHECK(\n\
+    rebuild_phase IN ('idle', 'history', 'saved', 'pending')\n\
+  ),\n\
+  rebuild_submitted_at_ms INTEGER,\n\
+  rebuild_source_id BLOB CHECK(\n\
+    rebuild_source_id IS NULL OR length(rebuild_source_id) = 16\n\
+  ),\n\
+  current_seq INTEGER NOT NULL CHECK(current_seq >= 0),\n\
+  high_water_seq INTEGER NOT NULL CHECK(high_water_seq >= 0)\n\
+);\n\
+INSERT INTO prompt_search_state(\n\
+  singleton_key, dirty, overflow, rebuild_phase, current_seq, high_water_seq\n\
+) VALUES (1, 0, 0, 'idle', 0, 0);\n\
+CREATE TABLE prompt_search_pending (\n\
+  source_kind TEXT NOT NULL CHECK(source_kind IN ('history', 'saved')),\n\
+  source_id BLOB NOT NULL CHECK(length(source_id) = 16),\n\
+  enqueue_seq INTEGER NOT NULL CHECK(enqueue_seq > 0),\n\
+  PRIMARY KEY (source_kind, source_id)\n\
+);\n\
+CREATE TRIGGER saved_prompts_enqueue_search_insert\n\
+AFTER INSERT ON saved_prompts\n\
+BEGIN\n\
+  UPDATE prompt_search_state\n\
+  SET current_seq = current_seq + 1,\n\
+      dirty = 1,\n\
+      overflow = CASE\n\
+        WHEN (SELECT COUNT(*) FROM prompt_search_pending) >= 1024\n\
+         AND NOT EXISTS (\n\
+           SELECT 1 FROM prompt_search_pending\n\
+           WHERE source_kind = 'saved' AND source_id = NEW.prompt_id\n\
+         )\n\
+        THEN 1\n\
+        ELSE overflow\n\
+      END\n\
+  WHERE singleton_key = 1;\n\
+  INSERT INTO prompt_search_pending(source_kind, source_id, enqueue_seq)\n\
+  SELECT 'saved', NEW.prompt_id,\n\
+         (SELECT current_seq FROM prompt_search_state WHERE singleton_key = 1)\n\
+  WHERE (\n\
+      (SELECT overflow FROM prompt_search_state WHERE singleton_key = 1) = 0\n\
+      AND (SELECT COUNT(*) FROM prompt_search_pending) < 1024\n\
+    )\n\
+    OR EXISTS (\n\
+      SELECT 1 FROM prompt_search_pending\n\
+      WHERE source_kind = 'saved' AND source_id = NEW.prompt_id\n\
+    )\n\
+  ON CONFLICT(source_kind, source_id) DO UPDATE SET\n\
+    enqueue_seq = excluded.enqueue_seq;\n\
+END;\n\
+CREATE TRIGGER saved_prompts_enqueue_search_update\n\
+AFTER UPDATE OF title, description, current_version_id, revision ON saved_prompts\n\
+BEGIN\n\
+  UPDATE prompt_search_state\n\
+  SET current_seq = current_seq + 1,\n\
+      dirty = 1,\n\
+      overflow = CASE\n\
+        WHEN (SELECT COUNT(*) FROM prompt_search_pending) >= 1024\n\
+         AND NOT EXISTS (\n\
+           SELECT 1 FROM prompt_search_pending\n\
+           WHERE source_kind = 'saved' AND source_id = NEW.prompt_id\n\
+         )\n\
+        THEN 1\n\
+        ELSE overflow\n\
+      END\n\
+  WHERE singleton_key = 1;\n\
+  INSERT INTO prompt_search_pending(source_kind, source_id, enqueue_seq)\n\
+  SELECT 'saved', NEW.prompt_id,\n\
+         (SELECT current_seq FROM prompt_search_state WHERE singleton_key = 1)\n\
+  WHERE (\n\
+      (SELECT overflow FROM prompt_search_state WHERE singleton_key = 1) = 0\n\
+      AND (SELECT COUNT(*) FROM prompt_search_pending) < 1024\n\
+    )\n\
+    OR EXISTS (\n\
+      SELECT 1 FROM prompt_search_pending\n\
+      WHERE source_kind = 'saved' AND source_id = NEW.prompt_id\n\
+    )\n\
+  ON CONFLICT(source_kind, source_id) DO UPDATE SET\n\
+    enqueue_seq = excluded.enqueue_seq;\n\
+END;\n\
+CREATE TRIGGER prompt_versions_enqueue_search_insert\n\
+AFTER INSERT ON prompt_versions\n\
+BEGIN\n\
+  UPDATE prompt_search_state\n\
+  SET current_seq = current_seq + 1,\n\
+      dirty = 1,\n\
+      overflow = CASE\n\
+        WHEN (SELECT COUNT(*) FROM prompt_search_pending) >= 1024\n\
+         AND NOT EXISTS (\n\
+           SELECT 1 FROM prompt_search_pending\n\
+           WHERE source_kind = 'saved' AND source_id = NEW.prompt_id\n\
+         )\n\
+        THEN 1\n\
+        ELSE overflow\n\
+      END\n\
+  WHERE singleton_key = 1;\n\
+  INSERT INTO prompt_search_pending(source_kind, source_id, enqueue_seq)\n\
+  SELECT 'saved', NEW.prompt_id,\n\
+         (SELECT current_seq FROM prompt_search_state WHERE singleton_key = 1)\n\
+  WHERE (\n\
+      (SELECT overflow FROM prompt_search_state WHERE singleton_key = 1) = 0\n\
+      AND (SELECT COUNT(*) FROM prompt_search_pending) < 1024\n\
+    )\n\
+    OR EXISTS (\n\
+      SELECT 1 FROM prompt_search_pending\n\
+      WHERE source_kind = 'saved' AND source_id = NEW.prompt_id\n\
+    )\n\
+  ON CONFLICT(source_kind, source_id) DO UPDATE SET\n\
+    enqueue_seq = excluded.enqueue_seq;\n\
+END;\n\
+INSERT INTO prompt_search_pending(source_kind, source_id, enqueue_seq)\n\
+SELECT 'saved', prompt_id, 1 FROM saved_prompts\n\
+ORDER BY prompt_id\n\
+LIMIT 1024;\n\
+UPDATE prompt_search_state\n\
+SET dirty = CASE WHEN EXISTS (SELECT 1 FROM saved_prompts) THEN 1 ELSE dirty END,\n\
+    overflow = CASE\n\
+      WHEN (SELECT COUNT(*) FROM saved_prompts) > 1024 THEN 1\n\
+      ELSE overflow\n\
+    END,\n\
+    current_seq = (SELECT COUNT(*) FROM saved_prompts)\n\
+WHERE singleton_key = 1;\n\
+CREATE VIRTUAL TABLE prompt_search USING fts5(\n\
+  source_kind UNINDEXED,\n\
+  source_id UNINDEXED,\n\
+  title,\n\
+  body,\n\
+  tags,\n\
+  tokenize = 'unicode61 remove_diacritics 2'\n\
+);\n\
+CREATE INDEX idx_prompt_history_submitted\n\
+  ON prompt_history(submitted_at_ms DESC, prompt_history_id);\n\
+";
+
 /// Compiled SHA-256 of [`V1_SQL`]. Do not change V1_SQL without updating this literal.
 pub(crate) const V1_SHA256: [u8; 32] = [
     0x79, 0xf0, 0xa3, 0x8f, 0x10, 0x92, 0xf7, 0x70, 0xa8, 0x84, 0xef, 0x3a, 0x12, 0x84, 0x81, 0x84,
@@ -1316,6 +1490,12 @@ pub(crate) fn migration_manifest() -> &'static [Migration] {
                     name: "phase07-prompts-lineage-authority-v3",
                     sql: V9_SQL,
                     sha256: sha256_bytes(V9_SQL),
+                },
+                Migration {
+                    version: 10,
+                    name: "phase07-prompt-history-v1",
+                    sql: V10_SQL,
+                    sha256: sha256_bytes(V10_SQL),
                 },
             ];
             verify_manifest(&migrations);
@@ -1525,7 +1705,7 @@ mod tests {
                 .map(|row| row.unwrap())
                 .collect()
         };
-        assert_eq!(history.len(), 9);
+        assert_eq!(history.len(), 10);
         assert_eq!(history[0], (1, "v1_initial".into(), V1_SHA256.to_vec()));
         assert_eq!(
             history[1],
@@ -1552,6 +1732,9 @@ mod tests {
         assert_eq!(history[8].0, 9);
         assert_eq!(history[8].1, "phase07-prompts-lineage-authority-v3");
         assert_eq!(history[8].2.len(), 32);
+        assert_eq!(history[9].0, 10);
+        assert_eq!(history[9].1, "phase07-prompt-history-v1");
+        assert_eq!(history[9].2.len(), 32);
 
         let compacted_column: (String, i64) = conn
             .query_row(
@@ -1571,6 +1754,223 @@ mod tests {
             )
             .expect("V4 cleanup index");
         assert_eq!(cleanup_index, 1);
+    }
+
+    #[test]
+    fn phase07_prompts_v1_cannot_absorb_history_after_v8_v9() {
+        let migrations = migration_manifest();
+        assert_eq!(migrations[6].name, "phase07-prompts-v1");
+        assert_eq!(migrations[7].name, "phase07-prompts-corrections-v2");
+        assert_eq!(migrations[8].name, "phase07-prompts-lineage-authority-v3");
+        assert!(
+            V9_SQL.contains("migration_version INTEGER NOT NULL CHECK(migration_version = 9)"),
+            "V9 pins lineage commitment at version 9, so history cannot fold into V7"
+        );
+        assert_eq!(migrations[9].name, "phase07-prompt-history-v1");
+        assert_eq!(migrations[9].version, 10);
+    }
+
+    #[test]
+    fn v10_upgrade_with_existing_saved_starts_dirty_and_enqueued() {
+        use crate::prompts::PromptHistoryStore;
+
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("prior-saved.sqlite3");
+        let prompt_id: [u8; 16] = [
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x15,
+            0x00, 0x01,
+        ];
+        let version_id: [u8; 16] = [
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x16,
+            0x00, 0x01,
+        ];
+        {
+            let mut conn = Connection::open(&path).expect("raw");
+            for migration in migration_manifest().iter().take(9) {
+                conn.execute_batch(migration.sql).expect("prior sql");
+                conn.execute(
+                    "INSERT INTO schema_migrations(version, name, applied_at_ms, sha256)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![
+                        migration.version,
+                        migration.name,
+                        migration.version,
+                        migration.sha256.as_slice(),
+                    ],
+                )
+                .expect("record");
+            }
+            let tx = conn.transaction().expect("seed tx");
+            let body_sha256 = [0x11_u8; 32];
+            tx.execute(
+                "INSERT INTO prompt_versions(
+                    prompt_version_id, prompt_id, version, body, body_sha256, created_at_ms
+                 ) VALUES (?1, ?2, 1, 'existed before history', ?3, 1000)",
+                rusqlite::params![
+                    version_id.as_slice(),
+                    prompt_id.as_slice(),
+                    body_sha256.as_slice(),
+                ],
+            )
+            .expect("version");
+            tx.execute(
+                "INSERT INTO saved_prompts(
+                    prompt_id, title, description, current_version_id,
+                    revision, created_at_ms, updated_at_ms
+                 ) VALUES (?1, 'Prior', NULL, ?2, 1, 1000, 1000)",
+                rusqlite::params![prompt_id.as_slice(), version_id.as_slice()],
+            )
+            .expect("saved");
+            tx.commit().expect("seed");
+        }
+        let history = PromptHistoryStore::open(&path).expect("upgrade v10");
+        assert!(history.is_search_dirty().expect("dirty after upgrade"));
+        assert!(history.pending_count().expect("enqueued") >= 1);
+    }
+
+    #[test]
+    fn v10_upgrade_with_1025_existing_saved_caps_pending_and_sets_overflow() {
+        use crate::prompts::{PromptHistoryStore, DEFAULT_HISTORY_INDEX_CAPACITY};
+
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("prior-saved-overflow.sqlite3");
+        {
+            let mut conn = Connection::open(&path).expect("raw");
+            for migration in migration_manifest().iter().take(9) {
+                conn.execute_batch(migration.sql).expect("prior sql");
+                conn.execute(
+                    "INSERT INTO schema_migrations(version, name, applied_at_ms, sha256)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![
+                        migration.version,
+                        migration.name,
+                        migration.version,
+                        migration.sha256.as_slice(),
+                    ],
+                )
+                .expect("record");
+            }
+            let tx = conn.transaction().expect("seed tx");
+            let body_sha256 = [0x22_u8; 32];
+            for index in 0_u32..1_025 {
+                let mut prompt_id = [0_u8; 16];
+                prompt_id[0] = 0x01;
+                prompt_id[6] = 0x70;
+                prompt_id[8] = 0x80;
+                prompt_id[9] = 0x15;
+                prompt_id[12..16].copy_from_slice(&index.to_be_bytes());
+                let mut version_id = prompt_id;
+                version_id[9] = 0x16;
+                tx.execute(
+                    "INSERT INTO prompt_versions(
+                        prompt_version_id, prompt_id, version, body, body_sha256, created_at_ms
+                     ) VALUES (?1, ?2, 1, 'existed before history', ?3, 1000)",
+                    rusqlite::params![
+                        version_id.as_slice(),
+                        prompt_id.as_slice(),
+                        body_sha256.as_slice(),
+                    ],
+                )
+                .expect("version");
+                tx.execute(
+                    "INSERT INTO saved_prompts(
+                        prompt_id, title, description, current_version_id,
+                        revision, created_at_ms, updated_at_ms
+                     ) VALUES (?1, 'Prior', NULL, ?2, 1, 1000, 1000)",
+                    rusqlite::params![prompt_id.as_slice(), version_id.as_slice()],
+                )
+                .expect("saved");
+            }
+            tx.commit().expect("seed");
+        }
+        let history = PromptHistoryStore::open(&path).expect("upgrade v10");
+        assert!(history.is_search_dirty().expect("dirty after upgrade"));
+        assert!(history
+            .is_search_overflow()
+            .expect("overflow after upgrade"));
+        assert_eq!(
+            history.pending_count().expect("capped pending"),
+            u64::from(DEFAULT_HISTORY_INDEX_CAPACITY)
+        );
+    }
+
+    #[test]
+    fn partial_v10_objects_without_migration_row_are_interrupted() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("partial-v10.sqlite3");
+        {
+            let conn = Connection::open(&path).expect("raw");
+            for migration in migration_manifest().iter().take(9) {
+                conn.execute_batch(migration.sql).expect("prior sql");
+                conn.execute(
+                    "INSERT INTO schema_migrations(version, name, applied_at_ms, sha256)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![
+                        migration.version,
+                        migration.name,
+                        migration.version,
+                        migration.sha256.as_slice(),
+                    ],
+                )
+                .expect("record");
+            }
+            conn.execute_batch("CREATE TABLE prompt_history (prompt_history_id BLOB);")
+                .expect("partial v10 residue");
+        }
+        let error = crate::kernel::KernelStore::open(&path).expect_err("interrupted v10");
+        assert!(matches!(error, StoreError::MigrationInterrupted));
+    }
+
+    #[test]
+    fn partial_v10_shadow_or_index_without_migration_row_is_interrupted() {
+        let residues = [
+            "CREATE TABLE prompt_search_pending (
+                source_kind TEXT NOT NULL,
+                source_id BLOB NOT NULL,
+                PRIMARY KEY (source_kind, source_id)
+             );",
+            "CREATE TABLE prompt_search_data (id INTEGER PRIMARY KEY, block BLOB);",
+            "CREATE TABLE t_idx (x BLOB);
+             CREATE INDEX idx_prompt_history_submitted ON t_idx(x);",
+        ];
+        for (index, residue) in residues.into_iter().enumerate() {
+            let dir = TempDir::new().expect("tempdir");
+            let path = dir.path().join(format!("partial-v10-{index}.sqlite3"));
+            {
+                let conn = Connection::open(&path).expect("raw");
+                for migration in migration_manifest().iter().take(9) {
+                    conn.execute_batch(migration.sql).expect("prior sql");
+                    conn.execute(
+                        "INSERT INTO schema_migrations(version, name, applied_at_ms, sha256)
+                         VALUES (?1, ?2, ?3, ?4)",
+                        rusqlite::params![
+                            migration.version,
+                            migration.name,
+                            migration.version,
+                            migration.sha256.as_slice(),
+                        ],
+                    )
+                    .expect("record");
+                }
+                conn.execute_batch(residue).expect("partial residue");
+            }
+            let error =
+                crate::kernel::KernelStore::open(&path).expect_err("interrupted v10 variant");
+            assert!(
+                matches!(error, StoreError::MigrationInterrupted),
+                "residue {index} must interrupt"
+            );
+        }
+
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("empty-applied-v10.sqlite3");
+        {
+            let conn = Connection::open(&path).expect("raw");
+            conn.execute_batch("CREATE TABLE prompt_history (prompt_history_id BLOB);")
+                .expect("orphan history table");
+        }
+        let error = crate::kernel::KernelStore::open(&path).expect_err("empty applied");
+        assert!(matches!(error, StoreError::MigrationInterrupted));
     }
 
     #[test]
@@ -1866,7 +2266,7 @@ mod tests {
                     row.get(0)
                 })
                 .expect("migration count");
-            assert_eq!(migration_count, 9, "prior schema V{prior_version}");
+            assert_eq!(migration_count, 10, "prior schema V{prior_version}");
             let missing_prompt_command_payloads: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM prompt_command_receipts
@@ -1881,12 +2281,20 @@ mod tests {
             );
             let latest_name: String = conn
                 .query_row(
+                    "SELECT name FROM schema_migrations WHERE version = 10",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("history migration record");
+            assert_eq!(latest_name, "phase07-prompt-history-v1");
+            let lineage_name: String = conn
+                .query_row(
                     "SELECT name FROM schema_migrations WHERE version = 9",
                     [],
                     |row| row.get(0),
                 )
                 .expect("corrective migration record");
-            assert_eq!(latest_name, "phase07-prompts-lineage-authority-v3");
+            assert_eq!(lineage_name, "phase07-prompts-lineage-authority-v3");
         }
     }
 
