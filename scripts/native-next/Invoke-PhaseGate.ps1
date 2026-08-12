@@ -19,6 +19,91 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'Isolation.ps1')
 . (Join-Path $PSScriptRoot 'PhaseGate.ps1')
 
+$iterations = 2
+$seed = 3403
+if ($Recipe -eq 'phase-03-process-supervisor') {
+    $iterationText = [Environment]::GetEnvironmentVariable('DEVMANAGER_PHASE3_SOAK_ITERATIONS', 'Process')
+    $seedText = [Environment]::GetEnvironmentVariable('DEVMANAGER_PHASE3_SOAK_SEED', 'Process')
+    if (-not [string]::IsNullOrWhiteSpace($iterationText)) {
+        if (-not [int]::TryParse($iterationText, [Globalization.NumberStyles]::Integer, [Globalization.CultureInfo]::InvariantCulture, [ref]$iterations) -or $iterations -lt 1 -or $iterations -gt 100) {
+            throw 'Phase 3 soak Iterations bridge is outside 1..100.'
+        }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($seedText)) {
+        if (-not [int]::TryParse($seedText, [Globalization.NumberStyles]::Integer, [Globalization.CultureInfo]::InvariantCulture, [ref]$seed) -or $seed -lt 0) {
+            throw 'Phase 3 soak Seed bridge is outside its bounded range.'
+        }
+    }
+}
+
+function Repair-DevManagerPhase3SupervisorPlan {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Plan
+    )
+
+    if ([string]$Plan.recipe -ne 'phase-03-process-supervisor') {
+        return
+    }
+
+    # The recipe table was originally registered with a supervisor-module
+    # filter, but the process_supervisor integration target has no such module. Replace
+    # that stale filter at the executable boundary so a zero-test Cargo run
+    # cannot be reported as a green Phase 3 gate.
+    $Plan.arguments = [string[]]@(
+        'test',
+        '--test', 'process_supervisor',
+        '--test', 'process_soak_infrastructure',
+        '--', '--nocapture',
+        '--skip', 'rust_supervisor_100_cycle_summary_is_bounded_and_does_not_retain_listener_tables'
+    )
+}
+
+function Assert-DevManagerPhase3SupervisorHasTests {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Plan
+    )
+
+    if ([string]$Plan.recipe -ne 'phase-03-process-supervisor') {
+        return
+    }
+
+    $harnessRoot = Join-Path ([string]$Plan.workingDirectory) 'target-native-next\debug\deps'
+    $harnesses = @(
+        Get-ChildItem -LiteralPath $harnessRoot -Filter 'process_soak_infrastructure-*.exe' -File -ErrorAction Stop |
+            Where-Object { $_.Name -notmatch '\.d\.exe$' }
+    )
+    if ($harnesses.Count -eq 0) {
+        throw 'typed-unavailable: no prebuilt process soak harness is available.'
+    }
+    $harness = $harnesses | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
+    Assert-DevManagerPathHasNoReparsePoints -LiteralPath $harness.FullName
+    $listInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $listInfo.FileName = [System.IO.Path]::GetFullPath($harness.FullName)
+    $listInfo.UseShellExecute = $false
+    $listInfo.CreateNoWindow = $true
+    $listInfo.RedirectStandardOutput = $true
+    $listInfo.RedirectStandardError = $true
+    $listInfo.WorkingDirectory = [string]$Plan.workingDirectory
+    Set-DevManagerPhaseGateProcessEnvironment -StartInfo $listInfo -Plan $Plan
+    foreach ($argument in [string[]]@('--list')) {
+        [void]$listInfo.ArgumentList.Add($argument)
+    }
+
+    $listResult = Invoke-DevManagerPhaseGateBoundedCommand -StartInfo $listInfo -TimeoutMilliseconds 120000
+    if ($listResult.ExitCode -ne 0) {
+        throw ("phase-03-process-supervisor test-list preflight failed ({0}): {1}" -f $listResult.ExitCode, $listResult.Stderr.Trim())
+    }
+    $testLines = @(
+        $listResult.Stdout -split "`r?`n" |
+            Where-Object { $_ -match ':\s*test$' }
+    )
+    if ($testLines.Count -lt 29) {
+        throw "phase-03-process-supervisor preflight found only $($testLines.Count) tests; expected at least 29."
+    }
+}
+
 $phaseName = Assert-DevManagerPhaseName -Phase $Phase
 $worktreeRoot = Get-DevManagerNativeNextWorktreeRoot -ScriptRoot $PSScriptRoot
 $evidenceRoot = Get-DevManagerNativeNextEvidenceRoot -ScriptRoot $PSScriptRoot
@@ -26,7 +111,9 @@ $protectedRoot = Get-DevManagerProductionRoot
 
 # Reject unknown recipes before any baseline/evidence work.
 $plan = Resolve-DevManagerPhaseGateRecipe -Recipe $Recipe -WorktreeRoot $worktreeRoot
+Repair-DevManagerPhase3SupervisorPlan -Plan $plan
 Assert-DevManagerPhaseGateExecutionPlan -Plan $plan
+Assert-DevManagerPhase3SupervisorHasTests -Plan $plan
 
 $run = New-DevManagerPhaseGateRunDirectory `
     -Phase $phaseName `
@@ -228,6 +315,73 @@ Command: $($plan.executable) $($plan.arguments -join ' ')
     }
     finally {
         $process.Dispose()
+    }
+
+    if ([string]$plan.recipe -eq 'phase-03-process-supervisor' -and $exitCode -eq 0) {
+        # Keep the fixed Rust supervisor inside this same Phase 0 baseline,
+        # identity, and quiet-window guard.  The gate uses two isolated cycles;
+        # the documented 100-cycle default is reserved for the final union.
+        $soakScript = Join-Path $PSScriptRoot 'Invoke-ProcessSoak.ps1'
+        $pwshCommands = @(
+            Get-Command -Name 'pwsh' -All -CommandType Application -ErrorAction SilentlyContinue |
+                Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_.Source) }
+        )
+        if ($pwshCommands.Count -ne 1) {
+            throw "phase-03-process-supervisor requires exactly one pwsh.exe (found $($pwshCommands.Count))."
+        }
+        $pwshPath = [System.IO.Path]::GetFullPath([string]$pwshCommands[0].Source)
+        $systemRoot = [Environment]::GetEnvironmentVariable('SystemRoot', 'Process')
+        if ([string]::IsNullOrWhiteSpace($systemRoot)) {
+            throw 'phase-03-process-supervisor cannot establish SystemRoot for the soak child.'
+        }
+        $soakTemp = [System.IO.Path]::GetFullPath((Join-Path $worktreeRoot '.tmp-phase3-soak'))
+        $pwshDirectory = [System.IO.Path]::GetDirectoryName($pwshPath)
+        $soakInfo = [System.Diagnostics.ProcessStartInfo]::new()
+        $soakInfo.FileName = $pwshPath
+        $soakInfo.UseShellExecute = $false
+        $soakInfo.CreateNoWindow = $true
+        $soakInfo.RedirectStandardOutput = $true
+        $soakInfo.RedirectStandardError = $true
+        $soakInfo.WorkingDirectory = $worktreeRoot
+        $soakInfo.Environment.Clear()
+        $soakInfo.Environment['SystemRoot'] = [string]$systemRoot
+        $soakInfo.Environment['TEMP'] = $soakTemp
+        $soakInfo.Environment['TMP'] = $soakTemp
+        $soakInfo.Environment['PATH'] = @(
+            [System.IO.Path]::Combine([string]$systemRoot, 'System32'),
+            [string]$pwshDirectory
+        ) -join ';'
+        $soakInfo.Environment['DEVMANAGER_PROFILE'] = 'native-next-dev'
+        $soakInfo.Environment['DEVMANAGER_INSTANCE_LABEL'] = 'Next'
+        $soakInfo.Environment['DEVMANAGER_RUNTIME_KIND'] = 'native-next'
+        foreach ($argument in [string[]]@(
+                '-NoProfile',
+                '-NonInteractive',
+                '-File',
+                $soakScript,
+                '-Iterations',
+                [string]$iterations,
+                '-Seed',
+                [string]$seed,
+                '-SyntheticOnly')) {
+            [void]$soakInfo.ArgumentList.Add($argument)
+        }
+        $soakResult = Invoke-DevManagerPhaseGateBoundedCommand `
+            -StartInfo $soakInfo `
+            -TimeoutMilliseconds 120000 `
+            -StdoutBytes 65536 `
+            -StderrBytes 16384
+        $soakLines = @(
+            $soakResult.Stdout -split "`r?`n" |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+        )
+        if ($soakResult.ExitCode -ne 0 -or $soakResult.StderrBytes -ne 0 -or $soakLines.Count -ne 1) {
+            throw "phase-03-process-supervisor soak supervisor failed closed (exit=$($soakResult.ExitCode) stderrBytes=$($soakResult.StderrBytes) lines=$($soakLines.Count))."
+        }
+        $soakResult = $soakLines[0] | ConvertFrom-Json
+        if ([string]$soakResult.status -ne 'passed') {
+            throw 'phase-03-process-supervisor soak supervisor did not report passed.'
+        }
     }
 
     $stopwatch.Stop()
