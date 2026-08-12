@@ -1,26 +1,34 @@
 //! Strict `devmanager-host ctl` parsing and versioned JSON output.
 
-use std::collections::HashSet;
-use std::io::{self, Write};
-use std::process::ExitCode;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{
+    collections::HashSet,
+    io::{self, Write},
+    process::ExitCode,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use serde_json::json;
 
-use super::action::{
-    self, task_create_v2_command, task_rename_command, ActionArgumentSchema, ActionRisk,
-    ActionScope, TaskCreateV2Arguments, TaskRenameArguments, ACTION_HOST_STATUS,
-    ACTION_TASK_CREATE, ACTION_TASK_CREATE_V2, ACTION_TASK_LIST, ACTION_TASK_RENAME,
-    ACTION_TASK_SHOW,
+use super::{
+    action::{
+        self, task_create_v2_command, task_rename_command, ActionArgumentSchema, ActionRisk,
+        ActionScope, TaskCreateV2Arguments, TaskRenameArguments, ACTION_HOST_STATUS,
+        ACTION_TASK_CREATE, ACTION_TASK_CREATE_V2, ACTION_TASK_LIST, ACTION_TASK_RENAME,
+        ACTION_TASK_SHOW,
+    },
+    HostClient, HostClientConfig,
 };
-use super::{HostClient, HostClientConfig};
-use crate::domain::command::{CommandEnvelope, CommandReceipt, RejectionCode};
-use crate::domain::id::SnapshotId;
-use crate::domain::query::QueryError;
-use crate::domain::snapshot::{SnapshotItem, SnapshotSection, TaskSnapshotItem};
-use crate::domain::{ClientId, CommandId, TaskId};
-use crate::host::IpcError;
-use crate::protocol::{Capability, CapabilitySet, FrameLimits};
+use crate::{
+    domain::{
+        command::{CommandEnvelope, CommandReceipt, RejectionCode},
+        id::SnapshotId,
+        query::QueryError,
+        snapshot::{SnapshotItem, SnapshotSection, TaskSnapshotItem},
+        ClientId, CommandId, TaskId,
+    },
+    host::IpcError,
+    protocol::{Capability, CapabilitySet, FrameLimits},
+};
 
 const SCHEMA_VERSION: u16 = 1;
 const STATUS_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -499,6 +507,22 @@ fn argument_schema_json(schema: ActionArgumentSchema) -> serde_json::Value {
                 "title": { "type": "string", "minLength": 1 },
             },
             "required": ["task_id", "title"],
+        }),
+        ActionArgumentSchema::ServiceControlV1 => json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "service_id": { "type": "string", "minLength": 1, "maxLength": 64 },
+                "resource_generation": { "type": "integer", "minimum": 1 },
+                "connection_epoch": { "type": "integer", "minimum": 1 },
+                "action_epoch": { "type": "integer", "minimum": 1 },
+            },
+            "required": [
+                "service_id",
+                "resource_generation",
+                "connection_epoch",
+                "action_epoch"
+            ],
         }),
     }
 }
@@ -1123,8 +1147,7 @@ mod tests {
         parse_ctl_args, CliError, CtlCommand, COMMAND_REPLAY_TIMEOUT, MAX_ARGUMENTS_JSON_BYTES,
         MAX_COMMAND_ATTEMPTS, MAX_DIAGNOSTIC_CHARS, STATUS_CONNECT_TIMEOUT,
     };
-    use crate::client::action::ACTION_TASK_CREATE;
-    use crate::domain::TaskId;
+    use crate::{client::action::ACTION_TASK_CREATE, domain::TaskId};
 
     #[test]
     fn parses_actions_status_and_task_show() {

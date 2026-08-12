@@ -1,10 +1,14 @@
-use std::collections::{BTreeMap, BTreeSet};
-use std::fmt;
-use std::marker::PhantomData;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+    marker::PhantomData,
+};
 
-use serde::de::{Error as _, IgnoredAny, SeqAccess, Visitor};
-use serde::ser::Error as _;
-use serde::{Deserialize, Serialize, Serializer};
+use serde::{
+    de::{Error as _, IgnoredAny, SeqAccess, Visitor},
+    ser::Error as _,
+    Deserialize, Serialize, Serializer,
+};
 use sha2::{Digest, Sha256};
 
 use crate::domain::TaskId;
@@ -1783,6 +1787,10 @@ impl ResourceGeneration {
     pub(crate) const fn new(value: u64) -> Self {
         Self(value)
     }
+
+    pub(crate) const fn get(self) -> u64 {
+        self.0
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -1793,6 +1801,10 @@ impl ConnectionEpoch {
     pub(crate) const fn new(value: u64) -> Self {
         Self(value)
     }
+
+    pub(crate) const fn get(self) -> u64 {
+        self.0
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -1802,6 +1814,10 @@ pub(crate) struct ActionEpoch(u64);
 impl ActionEpoch {
     pub(crate) const fn new(value: u64) -> Self {
         Self(value)
+    }
+
+    pub(crate) const fn get(self) -> u64 {
+        self.0
     }
 }
 
@@ -1825,6 +1841,18 @@ impl AdmissionFence {
             action_epoch: ActionEpoch::new(action_epoch),
         }
     }
+
+    pub(crate) const fn resource_generation(self) -> u64 {
+        self.resource_generation.get()
+    }
+
+    pub(crate) const fn connection_epoch(self) -> u64 {
+        self.connection_epoch.get()
+    }
+
+    pub(crate) const fn action_epoch(self) -> u64 {
+        self.action_epoch.get()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -1839,7 +1867,7 @@ impl HostId {
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 #[allow(dead_code)]
-struct HostAuthority {
+pub(crate) struct HostAuthority {
     host_id: HostId,
 }
 
@@ -1858,7 +1886,7 @@ impl fmt::Debug for HostAuthority {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[allow(dead_code)]
-enum AdmissionRequester {
+pub(crate) enum AdmissionRequester {
     Task(TaskId),
     Host(HostAuthority),
 }

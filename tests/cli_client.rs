@@ -6,36 +6,38 @@
 
 #![cfg(windows)]
 
-use std::fs;
-use std::io::Read;
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command as ProcessCommand, ExitStatus, Output, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::{
+    fs,
+    io::Read,
+    path::{Path, PathBuf},
+    process::{Child, Command as ProcessCommand, ExitStatus, Output, Stdio},
+    thread,
+    time::{Duration, Instant},
+};
 
 use serde_json::Value;
 use tempfile::TempDir;
 use uuid::Uuid;
 
-use devmanager::client::action::{
-    self, ActionRisk, ActionScope, ACTION_HOST_ACTIONS, ACTION_HOST_STATUS, ACTION_TASK_CREATE,
-    ACTION_TASK_CREATE_V2, ACTION_TASK_LIST, ACTION_TASK_RENAME, ACTION_TASK_SHOW,
+use devmanager::{
+    client::action::{
+        self, ActionRisk, ActionScope, ACTION_HOST_ACTIONS, ACTION_HOST_STATUS, ACTION_TASK_CREATE,
+        ACTION_TASK_CREATE_V2, ACTION_TASK_LIST, ACTION_TASK_RENAME, ACTION_TASK_SHOW,
+    },
+    config::paths::{resolve_app_paths, AppProfile, BuildKind, ResolvedAppPaths},
+    domain::{
+        command::{Command, CommandEnvelope, CommandReceipt, CreateTaskRequestIntent},
+        id::{CommandId, EnvironmentId, ProjectId, TaskId},
+        task::{ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity},
+        ClientId,
+    },
+    host::{HostIdentity, HostRequestExecutor},
+    protocol::{
+        Capability, CapabilitySet, ClientRequest, FrameLimits, NegotiatedParameters,
+        ProtocolVersion, ServerMessage,
+    },
+    workspace::WorkspaceRequest,
 };
-use devmanager::config::paths::{resolve_app_paths, AppProfile, BuildKind, ResolvedAppPaths};
-use devmanager::domain::command::{
-    Command, CommandEnvelope, CommandReceipt, CreateTaskRequestIntent,
-};
-use devmanager::domain::id::{CommandId, EnvironmentId, ProjectId, TaskId};
-use devmanager::domain::task::{
-    ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity,
-};
-use devmanager::domain::ClientId;
-use devmanager::host::{HostIdentity, HostRequestExecutor};
-use devmanager::protocol::{
-    Capability, CapabilitySet, ClientRequest, FrameLimits, NegotiatedParameters, ProtocolVersion,
-    ServerMessage,
-};
-use devmanager::workspace::WorkspaceRequest;
 
 const READY_TIMEOUT: Duration = Duration::from_secs(15);
 const CTL_TIMEOUT: Duration = Duration::from_secs(10);
@@ -311,7 +313,7 @@ fn wait_for_identity(host: &mut ChildGuard, lock_path: &Path) -> HostIdentity {
 #[test]
 fn action_catalog_ids_are_unique_and_classified() {
     let catalog = action::catalog();
-    assert_eq!(catalog.len(), 6);
+    assert_eq!(catalog.len(), 11);
 
     let mut ids = Vec::new();
     for action in catalog {
@@ -324,7 +326,12 @@ fn action_catalog_ids_are_unique_and_classified() {
         ids.push(action.id);
         let expected_risk = if matches!(
             action.id,
-            ACTION_TASK_CREATE | ACTION_TASK_CREATE_V2 | ACTION_TASK_RENAME
+            ACTION_TASK_CREATE
+                | ACTION_TASK_CREATE_V2
+                | ACTION_TASK_RENAME
+                | "service.start"
+                | "service.stop"
+                | "service.restart"
         ) {
             ActionRisk::Mutating
         } else {
@@ -386,7 +393,12 @@ fn ctl_actions_json_is_stable_unique_and_offline() {
         ids.push(id.to_string());
         let expected_risk = if matches!(
             id,
-            ACTION_TASK_CREATE | ACTION_TASK_CREATE_V2 | ACTION_TASK_RENAME
+            ACTION_TASK_CREATE
+                | ACTION_TASK_CREATE_V2
+                | ACTION_TASK_RENAME
+                | "service.start"
+                | "service.stop"
+                | "service.restart"
         ) {
             "mutating"
         } else {

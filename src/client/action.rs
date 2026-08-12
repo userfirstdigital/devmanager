@@ -6,17 +6,22 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::domain::command::{
-    Command, CommandEnvelope, CreateTaskIntent, CreateTaskRequestIntent, RenameTaskIntent,
+use crate::{
+    domain::{
+        command::{
+            Command, CommandEnvelope, CreateTaskIntent, CreateTaskRequestIntent, RenameTaskIntent,
+        },
+        query::{Query, QueryEnvelope},
+        task::{
+            ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity,
+            TaskFacts, TaskValidationError, WorkspaceRef,
+        },
+        ClientId, CommandId, EnvironmentId, ProjectId, RequestId, TaskId,
+    },
+    protocol::Capability,
+    services::model::ServiceId,
+    workspace::{WorkspaceError, WorkspaceRequest},
 };
-use crate::domain::query::{Query, QueryEnvelope};
-use crate::domain::task::{
-    ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity, TaskFacts,
-    TaskValidationError, WorkspaceRef,
-};
-use crate::domain::{ClientId, CommandId, EnvironmentId, ProjectId, RequestId, TaskId};
-use crate::protocol::Capability;
-use crate::workspace::{WorkspaceError, WorkspaceRequest};
 
 /// Stable id for listing the shared action catalog.
 pub const ACTION_HOST_ACTIONS: &str = "host.actions";
@@ -35,6 +40,16 @@ pub const ACTION_TASK_CREATE: &str = "task.create";
 pub const ACTION_TASK_CREATE_V2: &str = "task.create.v2";
 /// Stable id for renaming one Task through the host command boundary.
 pub const ACTION_TASK_RENAME: &str = "task.rename";
+/// Stable id for starting one configured service through the host supervisor.
+pub const ACTION_SERVICE_START: &str = "service.start";
+/// Stable id for stopping one configured service through the host supervisor.
+pub const ACTION_SERVICE_STOP: &str = "service.stop";
+/// Stable id for restarting one configured service through the host supervisor.
+pub const ACTION_SERVICE_RESTART: &str = "service.restart";
+/// Stable id for reading bounded redacted service logs.
+pub const ACTION_SERVICE_LOGS: &str = "service.logs";
+/// Stable id for reading the last redacted service health snapshot.
+pub const ACTION_SERVICE_HEALTH: &str = "service.health";
 
 /// Where an action applies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,6 +73,7 @@ pub enum ActionArgumentSchema {
     TaskCreateV1,
     TaskCreateV2,
     TaskRenameV1,
+    ServiceControlV1,
 }
 
 /// Static metadata for one catalog action.
@@ -135,6 +151,56 @@ const ACTIONS: &[ActionDescriptor] = &[
         risk: ActionRisk::Mutating,
         argument_schema: ActionArgumentSchema::TaskRenameV1,
     },
+    ActionDescriptor {
+        id: ACTION_SERVICE_START,
+        title: "Start service",
+        description: "Start one configured command through the managed service supervisor.",
+        keywords: &["service", "start", "command", "server"],
+        scope: ActionScope::Host,
+        required_capability: None,
+        risk: ActionRisk::Mutating,
+        argument_schema: ActionArgumentSchema::ServiceControlV1,
+    },
+    ActionDescriptor {
+        id: ACTION_SERVICE_STOP,
+        title: "Stop service",
+        description: "Stop one managed configured command through the service supervisor.",
+        keywords: &["service", "stop", "command", "server"],
+        scope: ActionScope::Host,
+        required_capability: None,
+        risk: ActionRisk::Mutating,
+        argument_schema: ActionArgumentSchema::ServiceControlV1,
+    },
+    ActionDescriptor {
+        id: ACTION_SERVICE_RESTART,
+        title: "Restart service",
+        description: "Restart one managed configured command through the service supervisor.",
+        keywords: &["service", "restart", "command", "server"],
+        scope: ActionScope::Host,
+        required_capability: None,
+        risk: ActionRisk::Mutating,
+        argument_schema: ActionArgumentSchema::ServiceControlV1,
+    },
+    ActionDescriptor {
+        id: ACTION_SERVICE_LOGS,
+        title: "Service logs",
+        description: "Read bounded redacted logs for one configured service.",
+        keywords: &["service", "logs", "output"],
+        scope: ActionScope::Host,
+        required_capability: None,
+        risk: ActionRisk::ReadOnly,
+        argument_schema: ActionArgumentSchema::ServiceControlV1,
+    },
+    ActionDescriptor {
+        id: ACTION_SERVICE_HEALTH,
+        title: "Service health",
+        description: "Read the last redacted health snapshot for one configured service.",
+        keywords: &["service", "health", "probe"],
+        scope: ActionScope::Host,
+        required_capability: None,
+        risk: ActionRisk::ReadOnly,
+        argument_schema: ActionArgumentSchema::ServiceControlV1,
+    },
 ];
 
 /// Frozen V1 `task.create` arguments. The workspace is already durable; the
@@ -194,6 +260,18 @@ impl From<TaskValidationError> for TaskCreateError {
 pub struct TaskRenameArguments {
     pub task_id: TaskId,
     pub title: String,
+}
+
+/// Caller-owned configured-service action arguments. The host supervisor
+/// admits these against the exact generation fence; they are not a durable
+/// journal command.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceControlArguments {
+    pub service_id: ServiceId,
+    pub resource_generation: u64,
+    pub connection_epoch: u64,
+    pub action_epoch: u64,
 }
 
 /// Return the closed catalog for this slice.
@@ -319,17 +397,23 @@ mod tests {
     use super::{
         catalog, require_unique_ids, task_create_command, task_rename_command, task_show_query,
         ActionArgumentSchema, ActionRisk, ActionScope, TaskCreateArguments, TaskCreateV2Arguments,
-        TaskRenameArguments, ACTION_HOST_ACTIONS, ACTION_HOST_STATUS, ACTION_TASK_CREATE,
-        ACTION_TASK_CREATE_V2, ACTION_TASK_LIST, ACTION_TASK_RENAME, ACTION_TASK_SHOW,
+        TaskRenameArguments, ACTION_HOST_ACTIONS, ACTION_HOST_STATUS, ACTION_SERVICE_HEALTH,
+        ACTION_SERVICE_LOGS, ACTION_SERVICE_RESTART, ACTION_SERVICE_START, ACTION_SERVICE_STOP,
+        ACTION_TASK_CREATE, ACTION_TASK_CREATE_V2, ACTION_TASK_LIST, ACTION_TASK_RENAME,
+        ACTION_TASK_SHOW,
     };
-    use crate::domain::command::Command;
-    use crate::domain::query::Query;
-    use crate::domain::task::{
-        ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity,
-        WorkspaceRef,
+    use crate::{
+        domain::{
+            command::Command,
+            query::Query,
+            task::{
+                ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity,
+                WorkspaceRef,
+            },
+            ClientId, CommandId, EnvironmentId, ProjectId, RequestId, TaskId,
+        },
+        protocol::Capability,
     };
-    use crate::domain::{ClientId, CommandId, EnvironmentId, ProjectId, RequestId, TaskId};
-    use crate::protocol::Capability;
 
     #[test]
     fn catalog_exposes_unique_read_and_create_actions() {
@@ -340,7 +424,12 @@ mod tests {
         assert!(ids.contains(&ACTION_TASK_SHOW));
         assert!(!ids.contains(&ACTION_TASK_CREATE));
         assert!(ids.contains(&ACTION_TASK_RENAME));
-        assert_eq!(ids.len(), 6);
+        assert!(ids.contains(&ACTION_SERVICE_START));
+        assert!(ids.contains(&ACTION_SERVICE_STOP));
+        assert!(ids.contains(&ACTION_SERVICE_RESTART));
+        assert!(ids.contains(&ACTION_SERVICE_LOGS));
+        assert!(ids.contains(&ACTION_SERVICE_HEALTH));
+        assert_eq!(ids.len(), 11);
         require_unique_ids().expect("ids must be unique");
         for action in catalog() {
             let (expected_scope, expected_risk, expected_schema, expected_capability) =
@@ -367,6 +456,18 @@ mod tests {
                         ActionScope::Task,
                         ActionRisk::Mutating,
                         ActionArgumentSchema::TaskRenameV1,
+                        None,
+                    ),
+                    ACTION_SERVICE_START | ACTION_SERVICE_STOP | ACTION_SERVICE_RESTART => (
+                        ActionScope::Host,
+                        ActionRisk::Mutating,
+                        ActionArgumentSchema::ServiceControlV1,
+                        None,
+                    ),
+                    ACTION_SERVICE_LOGS | ACTION_SERVICE_HEALTH => (
+                        ActionScope::Host,
+                        ActionRisk::ReadOnly,
+                        ActionArgumentSchema::ServiceControlV1,
                         None,
                     ),
                     _ => (
