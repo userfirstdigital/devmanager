@@ -1351,7 +1351,7 @@ fn quality_browser_artifact_count_uses_token_contrast_pair() {
             && !source.contains("crate::theme"),
         "browser panel artifact surface must not keep the legacy TEXT_DIM/PANEL_BG pair"
     );
-    for mode in [ThemeMode::Dark, ThemeMode::Light] {
+    for mode in [ThemeMode::Dark, ThemeMode::Light, ThemeMode::HighContrast] {
         let tokens = theme(mode, Density::Comfortable, Scale::Scale100);
         assert!(
             contrast_ratio(tokens.text.muted, tokens.surfaces.canvas) >= 4.5,

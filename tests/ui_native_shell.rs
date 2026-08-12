@@ -12,7 +12,9 @@ use devmanager::ui::native_shell::{
     NativeInteraction, NativeShell, NativeShellError, TerminalDockState,
 };
 use devmanager::ui::shell::{NavigationResult, PointerButton, TerminalPressRejection};
-use devmanager::ui::task_cockpit::inbox::MAX_TASK_SOURCE_IDS;
+use devmanager::ui::task_cockpit::inbox::{
+    InboxPresentationWidth, InboxRenderItem, MAX_TASK_SOURCE_IDS,
+};
 use devmanager::ui::task_cockpit::TaskList;
 use devmanager::ui::tokens::{Density, RuntimePreferencesSnapshot, Scale, ThemeMode};
 use gpui::AppContext;
@@ -660,6 +662,66 @@ fn virtual_shell_uses_full_source_count_and_stable_task_keys() {
     assert!(task_list.rendered_task_ids().len() <= 104);
     assert_ne!(task_list.stable_key_for(0), task_list.stable_key_for(1));
     assert!(task_list.uses_gpui_uniform_list());
+}
+
+#[test]
+fn native_shell_projects_typed_inbox_and_header_from_client_model() {
+    let first = task_id(21);
+    let second = task_id(22);
+    let model = Arc::new(model_with_tasks(&[first, second]));
+    let workspace = tempdir().expect("workspace tempdir");
+    let profile = isolated_dev_profile(workspace.path()).expect("isolated profile");
+    let report_slot = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let report_slot_for_app = std::rc::Rc::clone(&report_slot);
+    gpui::Application::headless().run(move |cx| {
+        devmanager::ui::init(cx);
+        let entity = cx.new(|cx| NativeShell::new_for_headless(profile, cx));
+        let report = entity.update(cx, |shell, _cx| {
+            shell
+                .apply_client_model(Arc::clone(&model))
+                .expect("client model projection");
+            let before = matches!(
+                shell.header_attachment(),
+                NativeHeaderAttachment::Unavailable { .. }
+            );
+            let selected = shell.select_projected_task(first);
+            assert!(selected.consumed);
+            assert!(selected.propagation_stopped);
+            let inbox = shell.inbox_render_model(InboxPresentationWidth::Regular);
+            let titles = inbox
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    InboxRenderItem::Row(row) => Some(row.title.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let header_title = match shell.header_attachment() {
+                NativeHeaderAttachment::Projection { title, .. } => title.clone(),
+                NativeHeaderAttachment::Unavailable { reason } => {
+                    format!("unavailable:{reason}")
+                }
+            };
+            (
+                before,
+                header_title,
+                titles,
+                shell.cockpit().selected_task(),
+            )
+        });
+        *report_slot_for_app.borrow_mut() = Some(report);
+        drop(entity);
+        cx.quit();
+    });
+    let (header_was_unavailable, header_title, titles, selected) = report_slot
+        .borrow_mut()
+        .take()
+        .expect("typed cockpit report");
+    assert!(header_was_unavailable);
+    assert_eq!(header_title, "Task 0");
+    assert!(titles.iter().any(|title| title == "Task 0"));
+    assert!(titles.iter().any(|title| title == "Task 1"));
+    assert_eq!(selected, Some(first));
 }
 
 #[test]

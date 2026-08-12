@@ -701,6 +701,27 @@ fn semantic_action_and_status_surfaces_declare_every_exposed_state() {
 }
 
 #[test]
+fn high_contrast_theme_keeps_wcag_aa_and_visible_focus() {
+    let tokens = build_theme(
+        ThemeMode::HighContrast,
+        Density::Comfortable,
+        Scale::Scale100,
+    );
+    assert_eq!(tokens.mode, ThemeMode::HighContrast);
+    assert_color_contrast(&tokens);
+    assert!(
+        contrast_ratio(tokens.text.primary, tokens.surfaces.canvas) >= 7.0,
+        "high-contrast primary text must meet AAA 7:1, got {:.3}",
+        contrast_ratio(tokens.text.primary, tokens.surfaces.canvas)
+    );
+    assert!(
+        contrast_ratio(tokens.borders.focus, tokens.surfaces.canvas) >= 3.0,
+        "high-contrast focus ring must stay visible"
+    );
+    assert_ne!(tokens.borders.focus, tokens.borders.default);
+}
+
+#[test]
 fn focus_and_selection_are_distinguishable_and_visible() {
     for case in load_theme_matrix().cases {
         let tokens = matrix_case_tokens(&case);

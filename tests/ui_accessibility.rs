@@ -158,6 +158,32 @@ fn icon_button_requires_nonempty_accessible_label_and_tooltip_contract() {
 }
 
 #[test]
+fn high_contrast_status_controls_keep_stable_semantic_labels() {
+    let tokens = theme(
+        ThemeMode::HighContrast,
+        Density::Comfortable,
+        Scale::Scale100,
+    );
+    let badge = Badge::new(
+        "Needs approval",
+        Some("This task is waiting for an explicit approval"),
+        StatusMeaning::Attention,
+    )
+    .expect("high-contrast badge");
+    let light = StatusLight::new(StatusMeaning::Success, "Healthy", "The host is responding")
+        .expect("high-contrast status light");
+
+    assert_eq!(badge.accessibility().role(), AccessibleRole::Status);
+    assert_eq!(badge.accessibility().name(), "Needs approval");
+    assert!(!badge.accessibility().description().is_empty());
+    assert!(!badge.is_interactive());
+    assert_eq!(light.accessibility().role(), AccessibleRole::Status);
+    assert_eq!(light.accessibility().name(), "Healthy");
+    assert!(!light.accessibility().description().is_empty());
+    assert_eq!(light.presentation(tokens).meaning, StatusMeaning::Success);
+}
+
+#[test]
 fn badges_and_status_lights_are_noninteractive_and_use_semantic_status_signals() {
     let badge = Badge::new(
         "Running",

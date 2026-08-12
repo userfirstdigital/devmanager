@@ -8,6 +8,7 @@
 pub enum ThemeMode {
     Dark,
     Light,
+    HighContrast,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1528,6 +1529,25 @@ const LIGHT_TERMINAL_BRIGHT_MAGENTA: Color = Color::from_u32(0xe9d5ff);
 const LIGHT_TERMINAL_BRIGHT_CYAN: Color = Color::from_u32(0xa5f3fc);
 const LIGHT_TERMINAL_BRIGHT_WHITE: Color = Color::from_u32(0xffffff);
 
+const HC_SURFACE_CANVAS: Color = Color::from_u32(0x000000);
+const HC_SURFACE_RAISED: Color = Color::from_u32(0x141414);
+const HC_SURFACE_OVERLAY: Color = Color::from_u32(0x1f1f1f);
+const HC_SURFACE_SUNKEN: Color = Color::from_u32(0x000000);
+const HC_SURFACE_HOVER: Color = Color::from_u32(0x1f1f1f);
+const HC_SURFACE_SELECTION: Color = Color::from_u32(0x2a2a2a);
+const HC_SURFACE_DISABLED: Color = Color::from_u32(0x141414);
+const HC_TEXT_PRIMARY: Color = Color::from_u32(0xffffff);
+const HC_TEXT_SECONDARY: Color = Color::from_u32(0xf5f5f5);
+const HC_TEXT_MUTED: Color = Color::from_u32(0xe8e8e8);
+const HC_TEXT_DISABLED: Color = Color::from_u32(0xd6d6d6);
+const HC_TEXT_INVERSE: Color = Color::from_u32(0x000000);
+const HC_BORDER_FOCUS: Color = Color::from_u32(0xffff00);
+const HC_BORDER_DEFAULT: Color = Color::from_u32(0xd6d6d6);
+const HC_BORDER_STRONG: Color = Color::from_u32(0xffffff);
+const HC_BORDER_SUBTLE: Color = Color::from_u32(0xa3a3a3);
+const HC_BORDER_SELECTION: Color = Color::from_u32(0xffff00);
+const HC_BORDER_DISABLED: Color = Color::from_u32(0xa3a3a3);
+
 fn density_metrics(density: Density, scale: Scale) -> DensityMetrics {
     let compact = density == Density::Compact;
     let spacing = if compact {
@@ -1928,10 +1948,40 @@ fn light_theme(density: Density, scale: Scale) -> ThemeTokens {
     }
 }
 
+fn high_contrast_theme(density: Density, scale: Scale) -> ThemeTokens {
+    let mut tokens = dark_theme(density, scale);
+    tokens.mode = ThemeMode::HighContrast;
+    tokens.text.primary = HC_TEXT_PRIMARY;
+    tokens.text.secondary = HC_TEXT_SECONDARY;
+    tokens.text.muted = HC_TEXT_MUTED;
+    tokens.text.disabled = HC_TEXT_DISABLED;
+    tokens.text.inverse = HC_TEXT_INVERSE;
+    tokens.text.on_selection = HC_TEXT_PRIMARY;
+    tokens.surfaces.canvas = HC_SURFACE_CANVAS;
+    tokens.surfaces.raised = HC_SURFACE_RAISED;
+    tokens.surfaces.overlay = HC_SURFACE_OVERLAY;
+    tokens.surfaces.sunken = HC_SURFACE_SUNKEN;
+    tokens.surfaces.hover = HC_SURFACE_HOVER;
+    tokens.surfaces.selection = HC_SURFACE_SELECTION;
+    tokens.surfaces.disabled = HC_SURFACE_DISABLED;
+    tokens.borders.subtle = HC_BORDER_SUBTLE;
+    tokens.borders.default = HC_BORDER_DEFAULT;
+    tokens.borders.strong = HC_BORDER_STRONG;
+    tokens.borders.focus = HC_BORDER_FOCUS;
+    tokens.borders.selection = HC_BORDER_SELECTION;
+    tokens.borders.disabled = HC_BORDER_DISABLED;
+    tokens.terminal.background = HC_SURFACE_SUNKEN;
+    tokens.terminal.foreground = HC_TEXT_PRIMARY;
+    tokens.terminal.cursor = HC_TEXT_PRIMARY;
+    tokens.terminal.selection = HC_SURFACE_SELECTION;
+    tokens
+}
+
 pub fn theme(mode: ThemeMode, density: Density, scale: Scale) -> ThemeTokens {
     match mode {
         ThemeMode::Dark => dark_theme(density, scale),
         ThemeMode::Light => light_theme(density, scale),
+        ThemeMode::HighContrast => high_contrast_theme(density, scale),
     }
 }
 
@@ -1941,6 +1991,10 @@ pub fn dark(density: Density, scale: Scale) -> ThemeTokens {
 
 pub fn light(density: Density, scale: Scale) -> ThemeTokens {
     light_theme(density, scale)
+}
+
+pub fn high_contrast(density: Density, scale: Scale) -> ThemeTokens {
+    high_contrast_theme(density, scale)
 }
 
 pub type Theme = ThemeTokens;
@@ -2017,6 +2071,7 @@ pub fn visible_dim_text(mode: ThemeMode) -> Color {
     match mode {
         ThemeMode::Dark => Color::from_u32(TEXT_DIM),
         ThemeMode::Light => LIGHT_TEXT_MUTED,
+        ThemeMode::HighContrast => HC_TEXT_MUTED,
     }
 }
 
@@ -2026,6 +2081,7 @@ pub fn visible_dim_panel_surface(mode: ThemeMode) -> Color {
     match mode {
         ThemeMode::Dark => Color::from_u32(PANEL_BG),
         ThemeMode::Light => LIGHT_SURFACE_CANVAS,
+        ThemeMode::HighContrast => HC_SURFACE_CANVAS,
     }
 }
 
@@ -2056,7 +2112,7 @@ mod tests {
 
     #[test]
     fn visible_dim_text_meets_aa_in_both_theme_modes() {
-        for mode in [ThemeMode::Dark, ThemeMode::Light] {
+        for mode in [ThemeMode::Dark, ThemeMode::Light, ThemeMode::HighContrast] {
             let ratio = contrast_ratio(visible_dim_text(mode), visible_dim_panel_surface(mode));
             assert!(
                 ratio >= 4.5,
@@ -2067,7 +2123,7 @@ mod tests {
 
     #[test]
     fn semantic_muted_text_still_meets_aa_on_raised_surfaces() {
-        for mode in [ThemeMode::Dark, ThemeMode::Light] {
+        for mode in [ThemeMode::Dark, ThemeMode::Light, ThemeMode::HighContrast] {
             let tokens = theme(mode, Density::Comfortable, Scale::Scale100);
             let ratio = contrast_ratio(tokens.text.muted, tokens.surfaces.raised);
             assert!(

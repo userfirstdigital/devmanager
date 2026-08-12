@@ -166,7 +166,7 @@ mod tests {
         assert_eq!(light.accessibility().role(), AccessibleRole::Status);
         assert_eq!(light.label(), "Port 8080");
 
-        for mode in [ThemeMode::Dark, ThemeMode::Light] {
+        for mode in [ThemeMode::Dark, ThemeMode::Light, ThemeMode::HighContrast] {
             let tokens = theme(mode, Density::Comfortable, Scale::Scale100);
             let presentation = light.presentation(tokens);
             assert_eq!(presentation.meaning, StatusMeaning::External);

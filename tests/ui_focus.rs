@@ -1,8 +1,14 @@
+use devmanager::client::action::ActionRequest;
 use devmanager::domain::id::TaskId;
+use devmanager::ui::components::interaction::{
+    ActivationSource, InteractionStateModel, KeyboardKey,
+};
+use devmanager::ui::native_shell::NativeInteraction;
 use devmanager::ui::shell::{
     HostEpochSnapshot, InvalidationReason, PointerButton, ReleaseRejection, Shell,
     TerminalPressRejection, TerminalRelease, TransientPriority,
 };
+use devmanager::ui::task_cockpit::TaskList;
 
 fn attached_shell(task: devmanager::domain::id::TaskId) -> Shell {
     Shell::new(
@@ -142,4 +148,81 @@ fn forged_foreign_release_token_is_rejected_and_invalid_mouse_up_is_consumed() {
         receiver.terminal_mouse_up(None),
         TerminalRelease::Rejected(ReleaseRejection::NoOwner)
     );
+}
+
+#[test]
+fn task_selection_click_does_not_activate_an_overlapping_control() {
+    let task = task_id(12);
+    let task_list = TaskList::from_virtual_task_ids(vec![task]).expect("task source");
+    let mut interaction = NativeInteraction::new(None);
+    let mut overlapping = InteractionStateModel::default();
+    let down_epoch = interaction.current_focus_epoch();
+    overlapping.set_focus_epoch(down_epoch);
+    assert!(overlapping.pointer_down(7, down_epoch));
+
+    let outcome = interaction.navigation_mouse_down_for(7, task, &task_list);
+    assert!(outcome.consumed);
+    assert!(outcome.propagation_stopped);
+    assert_eq!(
+        outcome.navigation,
+        devmanager::ui::shell::NavigationResult::Committed {
+            task_id: task,
+            navigation_epoch: interaction.action_epochs().navigation_epoch,
+        }
+    );
+
+    assert!(
+        !interaction.overlapping_control_pointer_up(&mut overlapping, 7, down_epoch),
+        "a task-selecting pointer must not also activate an overlapping control"
+    );
+    assert!(
+        interaction
+            .action_from_source(
+                ActionRequest::HostStatus,
+                ActivationSource::Pointer { pointer_id: 7 },
+            )
+            .is_none(),
+        "the consumed pointer must not dispatch a second catalog action"
+    );
+
+    interaction.release_pointer(7);
+    interaction.begin_control_pointer(7);
+    let next = interaction
+        .action_from_source(
+            ActionRequest::HostStatus,
+            ActivationSource::Pointer { pointer_id: 7 },
+        )
+        .expect("a later exclusive control gesture may activate");
+    assert!(matches!(
+        next.event.source,
+        ActivationSource::Pointer { pointer_id: 7 }
+    ));
+}
+
+#[test]
+fn terminal_click_does_not_activate_an_overlapping_control() {
+    let task = task_id(14);
+    let mut interaction = NativeInteraction::new(Some(task));
+    let mut overlapping = InteractionStateModel::default();
+    let down_epoch = interaction.current_focus_epoch();
+    overlapping.set_focus_epoch(down_epoch);
+    overlapping.focus();
+    assert!(overlapping.pointer_down(3, down_epoch));
+
+    let outcome = interaction.terminal_mouse_down(3, task, PointerButton::Primary, Some(task));
+    assert!(outcome.consumed);
+    assert!(outcome.propagation_stopped);
+    assert!(outcome.capture.is_ok());
+
+    assert!(
+        !interaction.overlapping_control_pointer_up(&mut overlapping, 3, down_epoch),
+        "a terminal-owning pointer must not also activate an overlapping control"
+    );
+    assert!(!overlapping.key_activate(KeyboardKey::Enter, down_epoch));
+    assert!(interaction
+        .action_from_source(
+            ActionRequest::HostStatus,
+            ActivationSource::Pointer { pointer_id: 3 },
+        )
+        .is_none());
 }

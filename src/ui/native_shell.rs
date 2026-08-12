@@ -68,7 +68,10 @@ use crate::ui::task_cockpit::shell::TaskCockpitShell;
 use crate::ui::task_cockpit::{
     project_services_panel, render_task_browser_dock, ServicesPanelProjection, TaskBrowserDockModel,
 };
-use crate::ui::task_cockpit::{Inbox, TaskList, DEFAULT_VISIBLE_ROWS, FIXED_VIRTUAL_OVERSCAN};
+use crate::ui::task_cockpit::{
+    Inbox, InboxPresentationWidth, InboxRenderModel, TaskHeaderModel, TaskList,
+    DEFAULT_VISIBLE_ROWS, FIXED_VIRTUAL_OVERSCAN,
+};
 use crate::ui::terminal_adapter::TerminalDockAdapter;
 pub use crate::ui::terminal_adapter::{TerminalDockState, TERMINAL_ADAPTER_DEPENDENCY};
 use crate::ui::tokens::RuntimePreferencesSnapshot;
@@ -3766,9 +3769,17 @@ pub struct NativeInteraction {
     client_model: Option<Arc<ClientModel>>,
     pointer_owner: Option<PointerOwner>,
     pointer_capture: Option<(u64, PointerButton)>,
+    pointer_gesture: PointerGesture,
     last_handler: Option<HandlerTrace>,
     keyboard_state: NativeKeyboardState,
     pending_keyboard: Option<(FocusEpoch, u64, KeyboardAction)>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PointerGesture {
+    Idle,
+    Down { pointer_id: u64, consumed: bool },
+    Released { pointer_id: u64, consumed: bool },
 }
 
 impl NativeInteraction {
@@ -3786,6 +3797,7 @@ impl NativeInteraction {
             client_model: None,
             pointer_owner: None,
             pointer_capture: None,
+            pointer_gesture: PointerGesture::Idle,
             last_handler: None,
             keyboard_state: NativeKeyboardState::default(),
             pending_keyboard: None,
@@ -3857,6 +3869,7 @@ impl NativeInteraction {
             self.pending_keyboard = None;
             self.pointer_capture = None;
             self.pointer_owner = None;
+            self.pointer_gesture = PointerGesture::Idle;
         }
         changed
     }
@@ -3987,11 +4000,107 @@ impl NativeInteraction {
         (focus_epoch, request_generation)
     }
 
+    fn note_pointer_down(&mut self, pointer_id: u64, consume: bool) {
+        match self.pointer_gesture {
+            PointerGesture::Idle | PointerGesture::Released { .. } => {
+                self.pointer_gesture = PointerGesture::Down {
+                    pointer_id,
+                    consumed: consume,
+                };
+            }
+            PointerGesture::Down {
+                pointer_id: owner,
+                consumed,
+            } => {
+                self.pointer_gesture = PointerGesture::Down {
+                    pointer_id: owner,
+                    consumed: consumed || consume,
+                };
+            }
+        }
+    }
+
+    fn pointer_action_blocked(&self, pointer_id: u64) -> bool {
+        match self.pointer_gesture {
+            PointerGesture::Down {
+                pointer_id: owner,
+                consumed,
+            }
+            | PointerGesture::Released {
+                pointer_id: owner,
+                consumed,
+            } => consumed && owner == pointer_id,
+            PointerGesture::Idle => false,
+        }
+    }
+
+    /// Start a new exclusive control gesture after the previous pointer has
+    /// been released. A consume that already owns this down is preserved so an
+    /// overlapping task/terminal click cannot be rewritten as a toolbar click.
+    pub fn begin_control_pointer(&mut self, pointer_id: u64) {
+        self.note_pointer_down(pointer_id, false);
+    }
+
+    pub fn release_pointer(&mut self, pointer_id: u64) {
+        if let PointerGesture::Down {
+            pointer_id: owner,
+            consumed,
+        } = self.pointer_gesture
+        {
+            if owner == pointer_id {
+                self.pointer_gesture = PointerGesture::Released {
+                    pointer_id,
+                    consumed,
+                };
+            }
+        }
+    }
+
+    /// Selecting a task or terminal consumes the pointer. An overlapping
+    /// [`InteractionStateModel`] must not activate on the same down/up.
+    pub fn overlapping_control_pointer_up(
+        &mut self,
+        control: &mut InteractionStateModel,
+        pointer_id: u64,
+        down_epoch: FocusEpoch,
+    ) -> bool {
+        if self.pointer_action_blocked(pointer_id) {
+            let _ = control.try_set_focus_epoch(self.focus_epochs.current());
+            return false;
+        }
+        control.pointer_up(pointer_id, down_epoch)
+    }
+
+    pub fn bind_projected_model(&mut self, model: Arc<ClientModel>) {
+        self.client_model = Some(Arc::clone(&model));
+        self.client_epoch = model.last_applied_sequence();
+        self.pointer_gesture = PointerGesture::Idle;
+        let selected = self
+            .selected_task()
+            .filter(|task_id| model.tasks().contains_key(task_id));
+        let navigation_epoch = self.shell.navigation_epoch().max(1);
+        self.replace_shell_selection(selected, navigation_epoch);
+    }
+
+    pub fn task_header(&self, model: &ClientModel) -> Option<TaskHeaderModel> {
+        self.shell.task_header(model)
+    }
+
     pub fn navigation_mouse_down(
         &mut self,
         task_id: TaskId,
         task_list: &TaskList,
     ) -> NavigationHandlerOutcome {
+        self.navigation_mouse_down_for(NATIVE_POINTER_ID, task_id, task_list)
+    }
+
+    pub fn navigation_mouse_down_for(
+        &mut self,
+        pointer_id: u64,
+        task_id: TaskId,
+        task_list: &TaskList,
+    ) -> NavigationHandlerOutcome {
+        self.note_pointer_down(pointer_id, true);
         let (focus_epoch, request_generation) = self.begin_handler(Some(task_id));
         let navigation = if task_list
             .task_ids()
@@ -4035,6 +4144,7 @@ impl NativeInteraction {
         projected_selected_task: Option<TaskId>,
     ) -> TerminalHandlerOutcome {
         let (focus_epoch, request_generation) = self.begin_handler(Some(task_id));
+        self.note_pointer_down(pointer_id, true);
         let capture = self.shell.terminal_mouse_down(
             pointer_id,
             task_id,
@@ -4081,6 +4191,7 @@ impl NativeInteraction {
         button: Option<PointerButton>,
     ) -> TerminalReleaseOutcome {
         let task_id = self.selected_task();
+        self.release_pointer(pointer_id);
         let (focus_epoch, request_generation) = self.begin_handler(task_id);
         let release = match (self.pointer_capture, self.pointer_owner.as_ref()) {
             (Some(capture), Some(_)) if button == Some(capture.1) && capture.0 == pointer_id => {
@@ -4191,6 +4302,11 @@ impl NativeInteraction {
             .find(|descriptor| descriptor.id == request.id())?;
         if !self.interaction.state().can_activate() {
             return None;
+        }
+        if let ActivationSource::Pointer { pointer_id } = source {
+            if self.pointer_action_blocked(pointer_id) {
+                return None;
+            }
         }
         let selected_task = self.selected_task();
         let request_task = match &request {
@@ -6021,7 +6137,7 @@ impl NativeShell {
         self.apply_task_list(task_list);
         self.inbox = Inbox::from_model(&model);
         self.client_model = Some(Arc::clone(&model));
-        self.interaction.set_client_model(Some(Arc::clone(&model)));
+        self.interaction.bind_projected_model(Arc::clone(&model));
         self.services_projection = project_services_panel(&[], &[]);
         self.sync_header_projection();
         let client_epoch = self.interaction.action_epochs().client_epoch;
@@ -6030,41 +6146,49 @@ impl NativeShell {
         Ok(())
     }
 
+    pub fn inbox_render_model(&self, width: InboxPresentationWidth) -> InboxRenderModel {
+        self.inbox.render_model(width)
+    }
+
+    pub fn select_projected_task(&mut self, task_id: TaskId) -> NavigationHandlerOutcome {
+        let outcome = self
+            .interaction
+            .navigation_mouse_down(task_id, &self.task_list);
+        self.sync_cockpit_follow();
+        outcome
+    }
+
     fn sync_header_projection(&mut self) {
         let attachment = self
             .client_model
             .as_ref()
-            .and_then(|model| {
-                self.interaction
-                    .selected_task()
-                    .and_then(|task_id| model.task(task_id))
-            })
-            .map(|snapshot| {
-                let workspace = workspace_projection_label(&snapshot.task.workspace);
+            .and_then(|model| self.interaction.task_header(model.as_ref()))
+            .map(|header| {
+                let workspace = match &header.workspace {
+                    crate::ui::task_cockpit::WorkspaceProjection::Main => "main".to_string(),
+                    crate::ui::task_cockpit::WorkspaceProjection::Worktree { branch, .. } => {
+                        format!("worktree · {}", bounded_header_text(branch.clone()))
+                    }
+                    crate::ui::task_cockpit::WorkspaceProjection::External { .. } => {
+                        "external".to_string()
+                    }
+                };
+                let remote = match &header.primary {
+                    crate::ui::task_cockpit::PrimaryAgentProjection::Present(agent) => {
+                        agent.label.clone()
+                    }
+                    crate::ui::task_cockpit::PrimaryAgentProjection::Unavailable {
+                        label, ..
+                    } => label.clone(),
+                };
                 NativeHeaderAttachment::projection(
-                    snapshot.task.title.clone(),
+                    header.title,
                     format!(
                         "{} · {} · rev {}",
-                        visible_status_label(snapshot.visible_status()),
-                        workspace,
-                        snapshot.task.revision
+                        header.status.label, workspace, header.identity.revision
                     ),
-                    format!("Host · {}", self.host_state.label()),
-                    format!(
-                        "{} resource{} · {} artifact{}",
-                        snapshot.resources.len(),
-                        if snapshot.resources.len() == 1 {
-                            ""
-                        } else {
-                            "s"
-                        },
-                        snapshot.artifacts.len(),
-                        if snapshot.artifacts.len() == 1 {
-                            ""
-                        } else {
-                            "s"
-                        }
-                    ),
+                    format!("Host · {} · {remote}", self.host_state.label()),
+                    header.accessible_description,
                 )
             })
             .unwrap_or_else(|| NativeHeaderAttachment::unavailable("select a task"));
@@ -6501,8 +6625,9 @@ impl NativeShell {
                             move |_event: &MouseUpEvent,
                                   _window: &mut Window,
                                   app: &mut gpui::App| {
-                                let _ = shell_for_mouse_up.update(app, |_shell, cx| {
+                                let _ = shell_for_mouse_up.update(app, |shell, cx| {
                                     cx.stop_propagation();
+                                    shell.interaction.release_pointer(NATIVE_POINTER_ID);
                                 });
                             };
                         let key_handler =
@@ -6796,16 +6921,29 @@ impl NativeShell {
                             .child(self.header_attachment.detail()),
                     )
                     .child(
-                        Button::new("native-shell-host-status")
-                            .label("Host status")
-                            .info()
-                            .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
-                                cx.stop_propagation();
-                                shell.dispatch_pointer_action(
-                                    ActionRequest::HostStatus,
-                                    NATIVE_POINTER_ID,
-                                );
-                            })),
+                        div()
+                            .id("native-shell-host-status-hit")
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|shell, _event: &MouseDownEvent, _window, cx| {
+                                    cx.stop_propagation();
+                                    shell.interaction.begin_control_pointer(NATIVE_POINTER_ID);
+                                }),
+                            )
+                            .child(
+                                Button::new("native-shell-host-status")
+                                    .label("Host status")
+                                    .info()
+                                    .on_click(cx.listener(
+                                        |shell, _event: &ClickEvent, _window, cx| {
+                                            cx.stop_propagation();
+                                            shell.dispatch_pointer_action(
+                                                ActionRequest::HostStatus,
+                                                NATIVE_POINTER_ID,
+                                            );
+                                        },
+                                    )),
+                            ),
                     )
                     .child(self.host_status_text()),
             )
