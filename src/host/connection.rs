@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::pin::pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use tokio::sync::{mpsc, oneshot, watch, Notify, OwnedSemaphorePermit, Semaphore};
@@ -21,7 +21,8 @@ use uuid::Uuid;
 
 use crate::config::{ConfigError, ConfigStore};
 use crate::domain::command::{
-    Command, CommandEnvelope, CommandReceipt, CreateTaskIntent, CreateTaskRequestIntent,
+    ArmUpdateInstallIntent, Command, CommandEnvelope, CommandReceipt, ConfirmUpdateDrainIntent,
+    CreateTaskIntent, CreateTaskRequestIntent, PrepareUpdateIntent,
 };
 use crate::domain::event::DomainEvent;
 use crate::domain::id::{ArtifactId, OperationId, RequestId, SnapshotId, SubscriptionId, TaskId};
@@ -478,6 +479,30 @@ enum ExecutorControl {
     UnregisterOutput {
         id: ConnectionOutputId,
     },
+    InspectHostQuitForUpdate {
+        ack: oneshot::Sender<Result<crate::domain::host::HostQuitInspection, String>>,
+    },
+    PrepareUpdate {
+        target_version: String,
+        client_build: String,
+        host_build: String,
+        allow_explicit_confirm_with_active: bool,
+        ack: oneshot::Sender<Result<crate::updater::UpdateHandoffToken, String>>,
+    },
+    ConfirmUpdateDrain {
+        token_id: Uuid,
+        ack: oneshot::Sender<Result<(), String>>,
+    },
+    AbortUpdateHandoff {
+        ack: oneshot::Sender<Result<(), String>>,
+    },
+    ArmUpdateInstall {
+        token_id: Uuid,
+        ack: oneshot::Sender<Result<(), String>>,
+    },
+    SealUpdateAfterDurableStage {
+        ack: oneshot::Sender<Result<(), String>>,
+    },
     #[cfg(test)]
     InspectOutput {
         id: ConnectionOutputId,
@@ -912,18 +937,149 @@ pub struct HostRequestHandle {
     tx: mpsc::Sender<HostRequestJob>,
     control_tx: mpsc::Sender<ExecutorControl>,
     output_id: Option<ConnectionOutputId>,
+    update_gate: Arc<crate::host::update::HostUpdateRuntimeGate>,
 }
 
 impl HostRequestHandle {
+    /// Shared update admission gate (stop-new-launches while draining/installing).
+    pub fn update_runtime_gate(&self) -> Arc<crate::host::update::HostUpdateRuntimeGate> {
+        Arc::clone(&self.update_gate)
+    }
+
+    /// Owned Send+'static probe that runs InspectHostQuit on the executor task.
+    pub fn owned_update_resource_probe(
+        &self,
+        host_boot_id: Uuid,
+    ) -> crate::host::update::OwnedActiveResourceProbe {
+        let handle = self.clone();
+        crate::host::update::OwnedActiveResourceProbe::from_fn(move || {
+            let deadline = Instant::now() + crate::updater::UPDATE_IPC_DEADLINE;
+            let inspection = handle.inspect_host_quit_blocking(deadline)?;
+            Ok(crate::host::update::update_inspection_from_host_quit(
+                &inspection,
+                host_boot_id,
+            ))
+        })
+    }
+
+    /// Bind updater service to this host executor's shared FSM + timed IPC port.
+    pub fn bind_updater_runtime(
+        &self,
+        updater: &crate::updater::UpdaterService,
+        host_boot_id: Uuid,
+        server_build: &str,
+        protocol_major: u16,
+        protocol_minor: u16,
+    ) {
+        updater.bind_live_host_hello(server_build, protocol_major, protocol_minor);
+        updater.bind_host_update_runtime(
+            self.update_runtime_gate(),
+            Box::new(self.clone()),
+            Box::new(self.owned_update_resource_probe(host_boot_id)),
+        );
+    }
+
+    fn control_recv_deadline<T>(
+        &self,
+        enqueue: impl FnOnce(oneshot::Sender<T>) -> ExecutorControl,
+        deadline: Instant,
+    ) -> Result<T, String> {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(|| "update IPC absolute deadline already elapsed".to_string())?;
+        let (ack_tx, ack_rx) = oneshot::channel();
+        self.control_tx
+            .try_send(enqueue(ack_tx))
+            .map_err(|_| "host executor control channel is unavailable".to_string())?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = (|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| format!("failed to build update IPC runtime: {error}"))?;
+                runtime.block_on(async {
+                    tokio::time::timeout(remaining, ack_rx)
+                        .await
+                        .map_err(|_| "update IPC timed out before host ack".to_string())?
+                        .map_err(|_| "host update IPC ack dropped".to_string())
+                })
+            })();
+            let _ = tx.send(result);
+        });
+        rx.recv_timeout(remaining.saturating_add(Duration::from_millis(50)))
+            .map_err(|_| "update IPC worker disconnected or timed out".to_string())?
+    }
+
+    fn inspect_host_quit_blocking(
+        &self,
+        deadline: Instant,
+    ) -> Result<crate::domain::host::HostQuitInspection, String> {
+        self.control_recv_deadline(
+            |ack| ExecutorControl::InspectHostQuitForUpdate { ack },
+            deadline,
+        )?
+    }
+
     /// Bind this handle clone to one duplex connection output.
     pub(crate) fn with_output(&self, output_id: ConnectionOutputId) -> Self {
         Self {
             tx: self.tx.clone(),
             control_tx: self.control_tx.clone(),
             output_id: Some(output_id),
+            update_gate: Arc::clone(&self.update_gate),
         }
     }
+}
 
+impl crate::updater::HostUpdateControlPort for HostRequestHandle {
+    fn prepare_update(
+        &self,
+        target_version: &str,
+        client_build: &str,
+        host_build: &str,
+        allow_explicit_confirm_with_active: bool,
+        deadline: Instant,
+    ) -> Result<crate::updater::UpdateHandoffToken, String> {
+        self.control_recv_deadline(
+            |ack| ExecutorControl::PrepareUpdate {
+                target_version: target_version.to_string(),
+                client_build: client_build.to_string(),
+                host_build: host_build.to_string(),
+                allow_explicit_confirm_with_active,
+                ack,
+            },
+            deadline,
+        )?
+    }
+
+    fn confirm_drain(&self, token_id: Uuid, deadline: Instant) -> Result<(), String> {
+        self.control_recv_deadline(
+            |ack| ExecutorControl::ConfirmUpdateDrain { token_id, ack },
+            deadline,
+        )?
+    }
+
+    fn abort_pre_install(&self, deadline: Instant) -> Result<(), String> {
+        self.control_recv_deadline(|ack| ExecutorControl::AbortUpdateHandoff { ack }, deadline)?
+    }
+
+    fn begin_atomic_install(&self, token_id: Uuid, deadline: Instant) -> Result<(), String> {
+        self.control_recv_deadline(
+            |ack| ExecutorControl::ArmUpdateInstall { token_id, ack },
+            deadline,
+        )?
+    }
+
+    fn seal_after_durable_stage(&self, deadline: Instant) -> Result<(), String> {
+        self.control_recv_deadline(
+            |ack| ExecutorControl::SealUpdateAfterDurableStage { ack },
+            deadline,
+        )?
+    }
+}
+
+impl HostRequestHandle {
     /// Register dual-lane output for live durable delivery on this connection.
     ///
     /// The returned registration guard is armed before the send/await window so
@@ -1132,6 +1288,7 @@ pub struct HostRequestExecutor {
     bus: CommandBus,
     workspace_projects: WorkspaceProjectRoots,
     config_admission: Option<HostWorkspaceAdmission>,
+    update_gate: Arc<crate::host::update::HostUpdateRuntimeGate>,
     rx: mpsc::Receiver<HostRequestJob>,
     control_rx: mpsc::Receiver<ExecutorControl>,
     control_closed: bool,
@@ -1290,15 +1447,18 @@ impl HostRequestExecutor {
         let (tx, rx) = mpsc::channel(HOST_REQUEST_QUEUE_CAPACITY);
         let (control_tx, control_rx) = mpsc::channel(HOST_REQUEST_QUEUE_CAPACITY);
         let (arm_tx, arm_rx) = mpsc::channel(1);
+        let update_gate = crate::host::update::HostUpdateRuntimeGate::new();
         let handle = HostRequestHandle {
             tx,
             control_tx,
             output_id: None,
+            update_gate: Arc::clone(&update_gate),
         };
         let mut executor = Self {
             bus,
             workspace_projects,
             config_admission,
+            update_gate,
             rx,
             control_rx,
             control_closed: false,
@@ -1338,15 +1498,18 @@ impl HostRequestExecutor {
     ) -> (HostRequestHandle, JoinHandle<()>) {
         let (tx, rx) = mpsc::channel(HOST_REQUEST_QUEUE_CAPACITY);
         let (control_tx, control_rx) = mpsc::channel(HOST_REQUEST_QUEUE_CAPACITY);
+        let update_gate = crate::host::update::HostUpdateRuntimeGate::new();
         let handle = HostRequestHandle {
             tx,
             control_tx,
             output_id: None,
+            update_gate: Arc::clone(&update_gate),
         };
         let mut executor = Self {
             bus,
             workspace_projects,
             config_admission,
+            update_gate,
             rx,
             control_rx,
             control_closed: false,
@@ -1474,6 +1637,72 @@ impl HostRequestExecutor {
             }
             ExecutorControl::UnregisterOutput { id } => {
                 self.detach_output(id);
+            }
+            ExecutorControl::InspectHostQuitForUpdate { ack } => {
+                let result = self
+                    .bus
+                    .inspect_host_quit()
+                    .map_err(|error| format!("InspectHostQuit failed: {error}"));
+                let _ = ack.send(result);
+            }
+            ExecutorControl::PrepareUpdate {
+                target_version,
+                client_build,
+                host_build,
+                allow_explicit_confirm_with_active,
+                ack,
+            } => {
+                let result = (|| {
+                    let inspection = self
+                        .bus
+                        .inspect_host_quit()
+                        .map_err(|error| format!("InspectHostQuit failed: {error}"))?;
+                    let mapped = crate::host::update::update_inspection_from_host_quit(
+                        &inspection,
+                        Uuid::nil(),
+                    );
+                    let mut probe = crate::updater::FixedActiveResourceProbe { inspection: mapped };
+                    self.update_gate
+                        .prepare_update(
+                            &mut probe,
+                            &target_version,
+                            &client_build,
+                            &host_build,
+                            SystemTime::now(),
+                            allow_explicit_confirm_with_active,
+                        )
+                        .map_err(|error| error.to_string())
+                })();
+                let _ = ack.send(result);
+            }
+            ExecutorControl::ConfirmUpdateDrain { token_id, ack } => {
+                let result = self
+                    .update_gate
+                    .confirm_drain(token_id, SystemTime::now())
+                    .map_err(|error| error.to_string());
+                let _ = ack.send(result);
+            }
+            ExecutorControl::AbortUpdateHandoff { ack } => {
+                let result = self
+                    .update_gate
+                    .abort_pre_install()
+                    .map(|_| ())
+                    .map_err(|error| error.to_string());
+                let _ = ack.send(result);
+            }
+            ExecutorControl::ArmUpdateInstall { token_id, ack } => {
+                let result = self
+                    .update_gate
+                    .begin_atomic_install(token_id, SystemTime::now())
+                    .map_err(|error| error.to_string());
+                let _ = ack.send(result);
+            }
+            ExecutorControl::SealUpdateAfterDurableStage { ack } => {
+                let result = self
+                    .update_gate
+                    .seal_after_durable_stage()
+                    .map_err(|error| error.to_string());
+                let _ = ack.send(result);
             }
             #[cfg(test)]
             ExecutorControl::InspectOutput { id, ack } => {
@@ -1656,6 +1885,24 @@ impl HostRequestExecutor {
                 }
                 ExecutorControl::UnregisterOutput { id } => {
                     self.detach_output(id);
+                }
+                ExecutorControl::InspectHostQuitForUpdate { ack } => {
+                    let _ = ack.send(Err(
+                        "InspectHostQuit rejected after quit intake quiesce".into()
+                    ));
+                }
+                ExecutorControl::PrepareUpdate { ack, .. } => {
+                    let _ = ack.send(Err(
+                        "update handoff rejected after quit intake quiesce".into()
+                    ));
+                }
+                ExecutorControl::ConfirmUpdateDrain { ack, .. }
+                | ExecutorControl::AbortUpdateHandoff { ack }
+                | ExecutorControl::ArmUpdateInstall { ack, .. }
+                | ExecutorControl::SealUpdateAfterDurableStage { ack } => {
+                    let _ = ack.send(Err(
+                        "update handoff rejected after quit intake quiesce".into()
+                    ));
                 }
                 #[cfg(test)]
                 ExecutorControl::InspectOutput { ack, .. } => {
@@ -1971,6 +2218,16 @@ impl HostRequestExecutor {
                     && !negotiated.capabilities.contains(Capability::HostShutdown)
                 {
                     return Err(IpcError::UnsupportedCapability);
+                }
+                if command_starts_new_launch(&envelope.command)
+                    && self.update_gate.stops_new_launches()
+                {
+                    return Err(IpcError::Unavailable);
+                }
+                if let Some(message) =
+                    self.try_dispatch_update_handoff_command(&negotiated, &envelope)?
+                {
+                    return Ok(message);
                 }
                 let connection_id = output_id
                     .map(ConnectionOutputId::as_uuid)
@@ -2778,6 +3035,101 @@ fn map_store_error(error: StoreError) -> IpcError {
     match error {
         StoreError::Busy => IpcError::Busy,
         _ => IpcError::Unavailable,
+    }
+}
+
+fn command_starts_new_launch(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::CreateTask(_)
+            | Command::CreateTaskV2(_)
+            | Command::RegisterAgentSession { .. }
+            | Command::RegisterArtifact { .. }
+            | Command::RegisterResource { .. }
+            | Command::SetPrimaryAgent { .. }
+    )
+}
+
+impl HostRequestExecutor {
+    fn try_dispatch_update_handoff_command(
+        &mut self,
+        negotiated: &NegotiatedParameters,
+        envelope: &CommandEnvelope,
+    ) -> Result<Option<ServerMessage>, IpcError> {
+        let now = SystemTime::now();
+        let receipt = match &envelope.command {
+            Command::PrepareUpdate(intent) => {
+                if !negotiated.capabilities.contains(Capability::HostShutdown) {
+                    return Err(IpcError::UnsupportedCapability);
+                }
+                let inspection = self.bus.inspect_host_quit().map_err(|error| {
+                    IpcError::Security(format!("InspectHostQuit failed: {error}"))
+                })?;
+                let mapped =
+                    crate::host::update::update_inspection_from_host_quit(&inspection, Uuid::nil());
+                let mut probe = crate::updater::FixedActiveResourceProbe { inspection: mapped };
+                self.update_gate
+                    .prepare_update(
+                        &mut probe,
+                        &intent.target_version,
+                        &intent.client_build,
+                        &intent.host_build,
+                        now,
+                        intent.allow_explicit_confirm_with_active,
+                    )
+                    .map_err(|error| IpcError::Security(error.to_string()))?;
+                CommandReceipt::Accepted {
+                    command_id: envelope.command_id,
+                    operation_id: crate::domain::id::OperationId::new(),
+                    task_revision: None,
+                    event_ids: Vec::new(),
+                }
+            }
+            Command::ConfirmUpdateDrain(intent) => {
+                if !negotiated.capabilities.contains(Capability::HostShutdown) {
+                    return Err(IpcError::UnsupportedCapability);
+                }
+                self.update_gate
+                    .confirm_drain(intent.token_id, now)
+                    .map_err(|error| IpcError::Security(error.to_string()))?;
+                CommandReceipt::Accepted {
+                    command_id: envelope.command_id,
+                    operation_id: crate::domain::id::OperationId::new(),
+                    task_revision: None,
+                    event_ids: Vec::new(),
+                }
+            }
+            Command::AbortUpdateHandoff => {
+                if !negotiated.capabilities.contains(Capability::HostShutdown) {
+                    return Err(IpcError::UnsupportedCapability);
+                }
+                self.update_gate
+                    .abort_pre_install()
+                    .map_err(|error| IpcError::Security(error.to_string()))?;
+                CommandReceipt::Accepted {
+                    command_id: envelope.command_id,
+                    operation_id: crate::domain::id::OperationId::new(),
+                    task_revision: None,
+                    event_ids: Vec::new(),
+                }
+            }
+            Command::ArmUpdateInstall(intent) => {
+                if !negotiated.capabilities.contains(Capability::HostShutdown) {
+                    return Err(IpcError::UnsupportedCapability);
+                }
+                self.update_gate
+                    .begin_atomic_install(intent.token_id, now)
+                    .map_err(|error| IpcError::Security(error.to_string()))?;
+                CommandReceipt::Accepted {
+                    command_id: envelope.command_id,
+                    operation_id: crate::domain::id::OperationId::new(),
+                    task_revision: None,
+                    event_ids: Vec::new(),
+                }
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(ServerMessage::CommandReceipt(receipt)))
     }
 }
 

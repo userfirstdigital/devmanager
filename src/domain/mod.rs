@@ -17,8 +17,9 @@ pub use artifact::{
     PrivacyClass,
 };
 pub use command::{
-    decide, Command, CommandEnvelope, CommandReceipt, ConfirmHostQuitIntent, CreateTaskIntent,
-    CreateTaskRequestIntent, RejectionCode, RenameTaskIntent, SetTaskAttentionIntent,
+    decide, ArmUpdateInstallIntent, Command, CommandEnvelope, CommandReceipt,
+    ConfirmHostQuitIntent, ConfirmUpdateDrainIntent, CreateTaskIntent, CreateTaskRequestIntent,
+    PrepareUpdateIntent, RejectionCode, RenameTaskIntent, SetTaskAttentionIntent,
 };
 pub use event::{
     apply, ApplyError, DomainEvent, Event, EventSerdeError, OperationAcceptedFact,

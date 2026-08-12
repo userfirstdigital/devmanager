@@ -9,6 +9,7 @@ mod lock;
 mod shutdown;
 mod update;
 
+pub use crate::updater::handoff::{HostUpdateAdmission, HostUpdateHandoff};
 pub use connection::{
     HostExecutorOutcome, HostRequestExecutor, HostRequestHandle, PhysicalExitArmRequest,
     SupervisedHostExecutor, HOST_REQUEST_QUEUE_CAPACITY,
@@ -28,6 +29,7 @@ pub use shutdown::{
     ProcessEmptyTeardown, ProcessEmptyTeardownWorker,
 };
 pub use update::{
-    update_inspection_from_host_quit, CommandBusActiveResourceProbe, HostConnectionUpdateProbe,
-    HostQuitInspectionSource, HostUpdateAdmission, HostUpdateHandoff,
+    owned_probe_from_quit_inspection, update_inspection_from_host_quit,
+    HostExecutorActiveResourceProbe, HostQuitInspectionSource, HostUpdateRuntimeGate,
+    OwnedActiveResourceProbe,
 };

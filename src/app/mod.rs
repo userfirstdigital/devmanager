@@ -381,6 +381,7 @@ struct NativeShell {
     pending_shutdown_op_id: Option<u64>,
     pending_window_close: bool,
     pending_install_update: Option<String>,
+    pending_update_handoff_token: Option<uuid::Uuid>,
     pending_app_termination: Option<PendingAppTermination>,
     window_subscriptions: Vec<Subscription>,
 }
@@ -1538,6 +1539,7 @@ impl NativeShell {
             pending_shutdown_op_id: None,
             pending_window_close: false,
             pending_install_update: None,
+            pending_update_handoff_token: None,
             pending_app_termination: None,
             window_subscriptions: Vec::new(),
         };
@@ -7236,7 +7238,30 @@ impl NativeShell {
                             self.pending_window_close = false;
                             self.pending_shutdown_op_id = None;
                             self.terminal_actionable_notice = None;
-                            let termination = if self.pending_install_update.take().is_some() {
+                            let termination = if let Some(token_id) =
+                                self.pending_update_handoff_token.take()
+                            {
+                                match self.updater.launch_verified_installer(token_id) {
+                                    Ok(outcome) => {
+                                        let _ = self.pending_install_update.take();
+                                        self.editor_notice = Some(format!(
+                                            "Installer for {} launched; exiting old process.",
+                                            outcome.version
+                                        ));
+                                        PendingAppTermination::ExitAfterUpdate
+                                    }
+                                    Err(error) => {
+                                        let _ = self.updater.abort_update_handoff();
+                                        let _ = self.pending_install_update.take();
+                                        self.resume_browser_window_after_canceled_shutdown();
+                                        self.editor_notice = Some(format!(
+                                                "Installer launch failed after drain; host resumed for retry: {error}"
+                                            ));
+                                        // Stay interactive; do not force quit after abortable failure.
+                                        continue;
+                                    }
+                                }
+                            } else if self.pending_install_update.take().is_some() {
                                 PendingAppTermination::ExitAfterUpdate
                             } else {
                                 PendingAppTermination::Quit
@@ -8612,20 +8637,29 @@ impl NativeShell {
     }
 
     fn install_update_action(&mut self, cx: &mut Context<Self>) {
-        match self.updater.install_update() {
-            Ok(version) => {
+        // Windows order: host admission/drain first, resource shutdown next,
+        // installer launch last (irreversible). Never assume code runs after packager exits.
+        match self
+            .updater
+            .prepare_update_install(crate::updater::InstallUpdateOptions::default())
+        {
+            Ok(token) => {
                 promote_pending_app_termination_for_update(&mut self.pending_app_termination);
                 let _ = self.begin_browser_window_teardown(cx);
                 self.save_session_state();
                 match self.process_manager.schedule_shutdown(APP_SHUTDOWN_TIMEOUT) {
                     Ok(op_id) => {
                         self.pending_shutdown_op_id = Some(op_id);
-                        self.pending_install_update = Some(version.clone());
+                        self.pending_install_update = Some(token.target_version.clone());
+                        self.pending_update_handoff_token = Some(token.token_id);
                         self.editor_notice = Some(format!(
-                            "Installer for {version} launched. Shutting down managed processes..."
+                            "Update {} admitted. Draining resources before installer launch...",
+                            token.target_version
                         ));
                     }
                     Err(error) => {
+                        let _ = self.updater.abort_update_handoff();
+                        self.pending_update_handoff_token = None;
                         self.resume_browser_window_after_canceled_shutdown();
                         self.editor_notice =
                             Some(format!("Failed to start shutdown before update: {error}"));

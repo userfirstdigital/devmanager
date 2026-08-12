@@ -14,18 +14,24 @@ use std::sync::{
     Arc, Mutex, RwLock,
 };
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub mod handoff;
+pub mod replace;
 
 pub use handoff::{
-    assert_atomic_installer_bundle, classify_user_state_path, extract_build_version,
-    update_state_policy, validate_preservation_checkpoint, ActiveResourceProbe,
+    assert_atomic_installer_bundle, capture_preservation_checkpoint, classify_user_state_path,
+    extract_build_version, inspect_atomic_installer_payload_dir, update_state_policy,
+    validate_preservation_checkpoint, verify_downloaded_artifact_sha256, ActiveResourceProbe,
     ActiveUpdateResource, AtomicBundleError, AtomicInstallerBundle, FixedActiveResourceProbe,
-    HandoffBlockReason, HostUpdateAdmission, HostUpdateHandoff, IdentityPreservationReport,
-    IgnoredUserStateKind, PreservationCheckpoint, PreservationError, PreservedUserStateKind,
-    SilentReplacementDecision, UpdateCutoverKind, UpdateHandoffError, UpdateHandoffMachine,
-    UpdateHandoffPhase, UpdateHandoffToken, UpdateResourceInspection, UserStateClassification,
+    HandoffBlockReason, HostUpdateAdmission, HostUpdateControlPort, HostUpdateHandoff,
+    HostUpdateRuntimeGate, IdentityPreservationReport, IgnoredUserStateKind,
+    PreservationCheckpoint, PreservationError, PreservedUserStateKind, SilentReplacementDecision,
+    UpdateCutoverKind, UpdateHandoffError, UpdateHandoffMachine, UpdateHandoffPhase,
+    UpdateHandoffToken, UpdateResourceInspection, UserStateClassification, UPDATE_IPC_DEADLINE,
+};
+pub use replace::{
+    StagedBinaryReplacement, StagedReplaceError, StagedReplacePhase, StagedReplaceProgress,
 };
 
 const UPDATE_ENDPOINTS_VAR: &str = "DEVMANAGER_UPDATE_ENDPOINTS";
@@ -197,6 +203,16 @@ pub enum UpdateRejection {
         detail: String,
     },
     SignatureNotVerifiedByPackager,
+    ProtocolIncompatible {
+        required: String,
+        local: String,
+    },
+    MissingRequiredSha256,
+    ArtifactHashMismatch {
+        expected: String,
+        actual: String,
+    },
+    MissingBuildIdentity,
 }
 
 impl std::fmt::Display for UpdateRejection {
@@ -231,6 +247,28 @@ impl std::fmt::Display for UpdateRejection {
                 f,
                 "update signature was not verified by cargo_packager_updater"
             ),
+            Self::ProtocolIncompatible { required, local } => write!(
+                f,
+                "release requires protocol {required} but local is {local}"
+            ),
+            Self::MissingRequiredSha256 => {
+                write!(
+                    f,
+                    "release manifest is missing required sha256 artifact hash"
+                )
+            }
+            Self::ArtifactHashMismatch { expected, actual } => {
+                write!(
+                    f,
+                    "downloaded artifact hash mismatch: expected {expected}, actual {actual}"
+                )
+            }
+            Self::MissingBuildIdentity => {
+                write!(
+                    f,
+                    "release manifest is missing required client/host build identity"
+                )
+            }
         }
     }
 }
@@ -245,6 +283,7 @@ pub struct AdmittedUpdate {
     pub platform: String,
     pub url: String,
     pub signature: String,
+    pub format: Option<String>,
     pub hash: Option<String>,
     pub minimum_protocol: Option<String>,
     pub client_build: String,
@@ -309,15 +348,23 @@ struct UpdaterInner {
     config: Option<PackagerUpdaterConfig>,
     background_checks_started: AtomicBool,
     state: RwLock<UpdaterState>,
-    handoff: Mutex<HostUpdateHandoff>,
+    /// Shared host-owned FSM (bound from HostRequestHandle / tests).
+    update_gate: Mutex<Option<Arc<HostUpdateRuntimeGate>>>,
+    /// Timed IPC port that drives the same host gate across the process boundary.
+    control_port: Mutex<Option<Box<dyn HostUpdateControlPort>>>,
     resource_probe: Mutex<Option<Box<dyn ActiveResourceProbe>>>,
+    /// Live Host Hello `server_build` — never fabricated from checkout metadata.
+    live_host_build: Mutex<Option<String>>,
+    live_protocol: Mutex<Option<(u16, u16)>>,
 }
 
 struct DownloadedUpdate {
     update: PackagerUpdate,
     bytes: Vec<u8>,
-    /// Set only after `cargo_packager_updater` download+verify succeeds.
+    /// Set only after packager download+verify and sha256 of actual bytes succeed.
     package_identity: AtomicInstallerBundle,
+    /// Required digest from the signed manifest; hashed against `bytes`.
+    required_hash: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -336,6 +383,21 @@ struct UpdaterState {
     snapshot: UpdaterSnapshot,
     pending_update: Option<PackagerUpdate>,
     ready_update: Option<DownloadedUpdate>,
+    /// Release identity from evaluate_release_candidate; required before ReadyToInstall.
+    pending_release: Option<PendingReleaseIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingReleaseIdentity {
+    required_hash: String,
+    client_build: String,
+    host_build: String,
+    protocol_major: u16,
+    protocol_minor: u16,
+    packager_target: String,
+    download_url: String,
+    signature: String,
+    format: String,
 }
 
 impl UpdaterService {
@@ -423,14 +485,52 @@ impl UpdaterService {
                     snapshot,
                     pending_update: None,
                     ready_update: None,
+                    pending_release: None,
                 }),
-                handoff: Mutex::new(HostUpdateHandoff::default()),
+                update_gate: Mutex::new(None),
+                control_port: Mutex::new(None),
                 resource_probe: Mutex::new(None),
+                live_host_build: Mutex::new(None),
+                live_protocol: Mutex::new(None),
             }),
         }
     }
 
-    /// Inject the live active-resource probe (typically CommandBus InspectHostQuit).
+    /// Bind the shared host-owned update FSM + timed IPC control + owned probe.
+    pub fn bind_host_update_runtime(
+        &self,
+        gate: Arc<HostUpdateRuntimeGate>,
+        control: Box<dyn HostUpdateControlPort>,
+        probe: Box<dyn ActiveResourceProbe>,
+    ) {
+        if let Ok(mut slot) = self.inner.update_gate.lock() {
+            *slot = Some(gate);
+        }
+        if let Ok(mut slot) = self.inner.control_port.lock() {
+            *slot = Some(control);
+        }
+        self.set_active_resource_probe(probe);
+    }
+
+    /// Record live Host Hello identity (protocol + `server_build`).
+    pub fn bind_live_host_hello(
+        &self,
+        server_build: impl Into<String>,
+        protocol_major: u16,
+        protocol_minor: u16,
+    ) {
+        if let Ok(mut slot) = self.inner.live_host_build.lock() {
+            *slot = Some(server_build.into());
+        }
+        if let Ok(mut slot) = self.inner.live_protocol.lock() {
+            *slot = Some((protocol_major, protocol_minor));
+        }
+    }
+
+    /// Inject an owned Send+'static active-resource probe (host IPC / executor).
+    ///
+    /// Borrowed probes must not be stored here. Use
+    /// [`crate::host::update::OwnedActiveResourceProbe`].
     pub fn set_active_resource_probe(&self, probe: Box<dyn ActiveResourceProbe>) {
         if let Ok(mut slot) = self.inner.resource_probe.lock() {
             *slot = Some(probe);
@@ -445,23 +545,286 @@ impl UpdaterService {
 
     pub fn handoff_admission(&self) -> HostUpdateAdmission {
         self.inner
-            .handoff
+            .update_gate
             .lock()
-            .map(|handoff| handoff.admission())
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|gate| gate.admission()))
             .unwrap_or(HostUpdateAdmission::Ready)
     }
 
-    /// Abort a prepared handoff before the irreversible installer launch.
+    /// Abort a prepared handoff before irreversible durable seal.
     pub fn abort_update_handoff(&self) -> Result<(), String> {
-        let mut handoff = self
+        let deadline = Instant::now() + UPDATE_IPC_DEADLINE;
+        if let Ok(port) = self.inner.control_port.lock() {
+            if let Some(port) = port.as_ref() {
+                return port.abort_pre_install(deadline);
+            }
+        }
+        let gate = self
             .inner
-            .handoff
+            .update_gate
             .lock()
-            .map_err(|_| "Update handoff lock is unavailable.".to_string())?;
-        handoff
-            .abort_pre_install()
+            .map_err(|_| "Update gate lock is unavailable.".to_string())?;
+        let gate = gate.as_ref().ok_or_else(|| {
+            "Host update gate is not bound; bind HostRequestHandle / HostUpdateRuntimeGate first."
+                .to_string()
+        })?;
+        gate.abort_pre_install()
             .map(|_| ())
             .map_err(|error| error.to_string())
+    }
+
+    /// Prepare admission only (inspect+token). Confirm drain separately or via full gate.
+    pub fn prepare_update_install(
+        &self,
+        options: InstallUpdateOptions,
+    ) -> Result<UpdateHandoffToken, String> {
+        let ready_meta = {
+            let state = self
+                .inner
+                .state
+                .read()
+                .map_err(|_| "Updater state is unavailable.".to_string())?;
+            let ready = state
+                .ready_update
+                .as_ref()
+                .ok_or_else(|| "No downloaded update is ready to install.".to_string())?;
+            self.inner
+                .validate_ready_update(ready)
+                .map_err(|error| error.to_string())?;
+            (
+                ready.update.version.clone(),
+                ready.package_identity.client_build.clone(),
+                ready.package_identity.host_build.clone(),
+            )
+        };
+        let (version, client_build, host_build) = ready_meta;
+        let deadline = Instant::now() + UPDATE_IPC_DEADLINE;
+
+        if let Ok(port) = self.inner.control_port.lock() {
+            if let Some(port) = port.as_ref() {
+                let token = port.prepare_update(
+                    &version,
+                    &client_build,
+                    &host_build,
+                    options.allow_explicit_confirm_with_active,
+                    deadline,
+                )?;
+                port.confirm_drain(token.token_id, Instant::now() + UPDATE_IPC_DEADLINE)?;
+                return Ok(token);
+            }
+        }
+
+        let mut probe_slot = self
+            .inner
+            .resource_probe
+            .lock()
+            .map_err(|_| "Update resource probe lock is unavailable.".to_string())?;
+        let probe = probe_slot.as_mut().ok_or_else(|| {
+            "Active resource probe is required before install; bind an owned Host IPC/executor probe."
+                .to_string()
+        })?;
+        let gate_slot = self
+            .inner
+            .update_gate
+            .lock()
+            .map_err(|_| "Update gate lock is unavailable.".to_string())?;
+        let gate = gate_slot.as_ref().ok_or_else(|| {
+            "Host update gate is not bound; bind HostRequestHandle / HostUpdateRuntimeGate first."
+                .to_string()
+        })?;
+        let now = SystemTime::now();
+        match gate.prepare_update(
+            probe.as_mut(),
+            &version,
+            &client_build,
+            &host_build,
+            now,
+            options.allow_explicit_confirm_with_active,
+        ) {
+            Ok(token) => {
+                if let Err(error) = gate.confirm_drain(token.token_id, now) {
+                    let _ = gate.abort_pre_install();
+                    return Err(error.to_string());
+                }
+                Ok(token)
+            }
+            Err(error) => {
+                let _ = gate.abort_pre_install();
+                Err(error.to_string())
+            }
+        }
+    }
+
+    /// Final irreversible-capable old-process action: staged two-binary replace.
+    ///
+    /// Call only after host admission/drain and resource shutdown. Durably stages
+    /// backups before sealing irreversibility; launch/stage failure aborts to a
+    /// retryable Ready admission and retains ready bytes.
+    pub fn launch_verified_installer(
+        &self,
+        token_id: uuid::Uuid,
+    ) -> Result<InstallerLaunchOutcome, String> {
+        let now = SystemTime::now();
+        let ready_update = {
+            let state = self
+                .inner
+                .state
+                .read()
+                .map_err(|_| "Updater state is unavailable.".to_string())?;
+            let ready = state
+                .ready_update
+                .as_ref()
+                .ok_or_else(|| "No downloaded update is ready to install.".to_string())?;
+            self.inner.validate_ready_update(ready)?;
+            DownloadedUpdate {
+                update: ready.update.clone(),
+                bytes: ready.bytes.clone(),
+                package_identity: ready.package_identity.clone(),
+                required_hash: ready.required_hash.clone(),
+            }
+        };
+
+        {
+            let deadline = Instant::now() + UPDATE_IPC_DEADLINE;
+            if let Ok(port) = self.inner.control_port.lock() {
+                if let Some(port) = port.as_ref() {
+                    port.begin_atomic_install(token_id, deadline)?;
+                } else {
+                    self.with_bound_gate(|gate| {
+                        gate.begin_atomic_install(token_id, now)
+                            .map_err(|error| error.to_string())
+                    })?;
+                }
+            } else {
+                self.with_bound_gate(|gate| {
+                    gate.begin_atomic_install(token_id, now)
+                        .map_err(|error| error.to_string())
+                })?;
+            }
+        }
+
+        if let Err(error) = self.inner.mark_installing_snapshot(&ready_update) {
+            let _ = self.abort_update_handoff();
+            return Err(error);
+        }
+
+        let install_dir = ready_update
+            .update
+            .extract_path
+            .clone()
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| ready_update.update.extract_path.clone());
+        let staged_dir = install_dir.join(".devmanager-update-stage");
+        if let Err(error) = materialize_staged_binaries(
+            &staged_dir,
+            &ready_update.bytes,
+            &ready_update.package_identity,
+        ) {
+            let _ = self.abort_update_handoff();
+            self.inner.restore_ready_snapshot(Some(format!(
+                "Staging failed; ready update retained for retry: {error}"
+            )));
+            return Err(error);
+        }
+
+        let replacement = StagedBinaryReplacement::new(
+            &install_dir,
+            &staged_dir,
+            ready_update.package_identity.clone(),
+        );
+        if let Err(error) = replacement.validate_staged_payload() {
+            let _ = self.abort_update_handoff();
+            self.inner.restore_ready_snapshot(Some(error.to_string()));
+            return Err(error.to_string());
+        }
+        // Durable recoverable marker + backups before seal.
+        if let Err(error) = replacement.prepare_durable_backups() {
+            let _ = self.abort_update_handoff();
+            self.inner.restore_ready_snapshot(Some(error.to_string()));
+            return Err(error.to_string());
+        }
+        {
+            let deadline = Instant::now() + UPDATE_IPC_DEADLINE;
+            if let Ok(port) = self.inner.control_port.lock() {
+                if let Some(port) = port.as_ref() {
+                    if let Err(error) = port.seal_after_durable_stage(deadline) {
+                        let _ = self.abort_update_handoff();
+                        self.inner.restore_ready_snapshot(Some(error.clone()));
+                        return Err(error);
+                    }
+                } else if let Err(error) = self.with_bound_gate(|gate| {
+                    gate.seal_after_durable_stage()
+                        .map_err(|error| error.to_string())
+                }) {
+                    let _ = self.abort_update_handoff();
+                    self.inner.restore_ready_snapshot(Some(error.clone()));
+                    return Err(error);
+                }
+            } else if let Err(error) = self.with_bound_gate(|gate| {
+                gate.seal_after_durable_stage()
+                    .map_err(|error| error.to_string())
+            }) {
+                let _ = self.abort_update_handoff();
+                self.inner.restore_ready_snapshot(Some(error.clone()));
+                return Err(error);
+            }
+        }
+
+        let version = ready_update.update.version.clone();
+        match replacement.commit_after_durable_backups() {
+            Ok(_) => {
+                let _ = self.inner.consume_ready_after_installer_launch();
+                // Post-install host start/Hello is performed by the new process;
+                // old process must exit and must not assume continued execution.
+                Ok(InstallerLaunchOutcome {
+                    version,
+                    process_must_exit: true,
+                    require_host_hello_resync: true,
+                })
+            }
+            Err(error) => {
+                let _ = replacement.recover_interrupted();
+                let _ = self.abort_update_handoff();
+                self.inner.restore_ready_snapshot(Some(format!(
+                    "Staged replace failed; ready update retained when abortable: {error}"
+                )));
+                Err(error.to_string())
+            }
+        }
+    }
+
+    fn with_bound_gate<T>(
+        &self,
+        f: impl FnOnce(&HostUpdateRuntimeGate) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let gate = self
+            .inner
+            .update_gate
+            .lock()
+            .map_err(|_| "Update gate lock is unavailable.".to_string())?;
+        let gate = gate.as_ref().ok_or_else(|| {
+            "Host update gate is not bound; bind HostRequestHandle / HostUpdateRuntimeGate first."
+                .to_string()
+        })?;
+        f(gate)
+    }
+
+    pub fn install_update(&self) -> Result<String, String> {
+        self.install_update_with_options(InstallUpdateOptions::default())
+    }
+
+    /// Prepare handoff then launch installer. Prefer explicit
+    /// [`Self::prepare_update_install`] + resource shutdown +
+    /// [`Self::launch_verified_installer`] on Windows so shutdown precedes launch.
+    pub fn install_update_with_options(
+        &self,
+        options: InstallUpdateOptions,
+    ) -> Result<String, String> {
+        let token = self.prepare_update_install(options)?;
+        self.launch_verified_installer(token.token_id)
+            .map(|outcome| outcome.version)
     }
 
     pub fn snapshot(&self) -> UpdaterSnapshot {
@@ -521,27 +884,40 @@ impl UpdaterService {
         let current_version = self.inner.current_version.clone();
         thread::spawn(move || {
             let policy = CacheBustingRequestPolicy::for_instant(SystemTime::now());
-            match check_update_with_policy(current_version, config, &policy) {
-                Ok(Some(update)) => match inner.prepare_auto_download(&update) {
-                    Ok(AutoDownloadAction::Start) => {
-                        Self::spawn_download_thread(inner, update);
+            match check_update_with_policy(current_version, config.clone(), &policy) {
+                Ok(Some(update)) => {
+                    if let Err(error) =
+                        arm_pending_identity_from_packager_config(&inner, &config, &policy, &update)
+                    {
+                        inner.finish_check_error(
+                            check_plan,
+                            format!(
+                                "Version {} is available, but release identity could not be verified: {error}",
+                                update.version
+                            ),
+                        );
+                        return;
                     }
-                    Ok(AutoDownloadAction::KeepReady) => {
-                        inner.restore_ready_snapshot(None);
-                    }
-                    Err(error) => inner.finish_check_error(
-                        check_plan,
-                        format!(
-                            "Version {} is available, but the background download could not start: {error}",
-                            update.version
+                    match inner.prepare_auto_download(&update) {
+                        Ok(AutoDownloadAction::Start) => {
+                            Self::spawn_download_thread(inner, update);
+                        }
+                        Ok(AutoDownloadAction::KeepReady) => {
+                            inner.restore_ready_snapshot(None);
+                        }
+                        Err(error) => inner.finish_check_error(
+                            check_plan,
+                            format!(
+                                "Version {} is available, but the background download could not start: {error}",
+                                update.version
+                            ),
                         ),
-                    ),
-                },
+                    }
+                }
                 Ok(None) => inner.finish_check_without_update(),
-                Err(error) => inner.finish_check_error(
-                    check_plan,
-                    format!("Update check failed: {error}"),
-                ),
+                Err(error) => {
+                    inner.finish_check_error(check_plan, format!("Update check failed: {error}"))
+                }
             }
         });
         Ok(())
@@ -552,120 +928,16 @@ impl UpdaterService {
         Self::spawn_download_thread(self.inner.clone(), update);
         Ok(())
     }
+}
 
-    pub fn install_update(&self) -> Result<String, String> {
-        self.install_update_with_options(InstallUpdateOptions::default())
-    }
-
-    /// Install only after bounded handoff + packager-verified signature + atomic bundle checks.
-    ///
-    /// There is no direct `PackagerUpdate::install` bypass from this service.
-    pub fn install_update_with_options(
-        &self,
-        options: InstallUpdateOptions,
-    ) -> Result<String, String> {
-        let ready_meta = {
-            let state = self
-                .inner
-                .state
-                .read()
-                .map_err(|_| "Updater state is unavailable.".to_string())?;
-            let ready = state
-                .ready_update
-                .as_ref()
-                .ok_or_else(|| "No downloaded update is ready to install.".to_string())?;
-            if !ready.package_identity.signature_verified_by_packager {
-                return Err(UpdateRejection::SignatureNotVerifiedByPackager.to_string());
-            }
-            assert_atomic_installer_bundle(&ready.package_identity)
-                .map_err(|error| error.to_string())?;
-            (
-                ready.update.version.clone(),
-                ready.package_identity.client_build.clone(),
-                ready.package_identity.host_build.clone(),
-            )
-        };
-
-        let (version, client_build, host_build) = ready_meta;
-        let now = SystemTime::now();
-
-        let token = {
-            let mut probe_slot = self
-                .inner
-                .resource_probe
-                .lock()
-                .map_err(|_| "Update resource probe lock is unavailable.".to_string())?;
-            let probe = probe_slot.as_mut().ok_or_else(|| {
-                "Active resource probe is required before install; inject InspectHostQuit via set_active_resource_probe."
-                    .to_string()
-            })?;
-            let mut handoff = self
-                .inner
-                .handoff
-                .lock()
-                .map_err(|_| "Update handoff lock is unavailable.".to_string())?;
-            match handoff.run_pre_install_gate(
-                probe.as_mut(),
-                &version,
-                &client_build,
-                &host_build,
-                now,
-                options.allow_explicit_confirm_with_active,
-            ) {
-                Ok(token) => token,
-                Err(error) => {
-                    let _ = handoff.abort_pre_install();
-                    return Err(error.to_string());
-                }
-            }
-        };
-
-        // Handoff drained and still abortable until begin_atomic_install.
-        let ready_update = match self.inner.prepare_install() {
-            Ok(ready) => ready,
-            Err(error) => {
-                let _ = self.abort_update_handoff();
-                return Err(error);
-            }
-        };
-        if !ready_update.package_identity.signature_verified_by_packager {
-            let _ = self.abort_update_handoff();
-            self.inner
-                .set_error(UpdateRejection::SignatureNotVerifiedByPackager.to_string());
-            return Err(UpdateRejection::SignatureNotVerifiedByPackager.to_string());
-        }
-        if let Err(error) = assert_atomic_installer_bundle(&ready_update.package_identity) {
-            let _ = self.abort_update_handoff();
-            self.inner.set_error(error.to_string());
-            return Err(error.to_string());
-        }
-
-        {
-            let mut handoff = self
-                .inner
-                .handoff
-                .lock()
-                .map_err(|_| "Update handoff lock is unavailable.".to_string())?;
-            handoff
-                .begin_atomic_install(token.token_id, now)
-                .map_err(|error| error.to_string())?;
-        }
-
-        match ready_update.update.install(ready_update.bytes) {
-            Ok(()) => {
-                if let Ok(mut handoff) = self.inner.handoff.lock() {
-                    let _ = handoff.complete_matching_host_start(token.token_id, SystemTime::now());
-                    let _ = handoff.finish_resync(token.token_id, SystemTime::now());
-                }
-                Ok(version)
-            }
-            Err(error) => {
-                self.inner
-                    .set_error(format!("Failed to hand off installer: {error}"));
-                Err(error.to_string())
-            }
-        }
-    }
+/// Result of launching the packager installer (final old-process action).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstallerLaunchOutcome {
+    pub version: String,
+    /// Callers must exit; do not assume reconnect runs in this process.
+    pub process_must_exit: bool,
+    /// New process must Hello the matching host and finish snapshot resync.
+    pub require_host_hello_resync: bool,
 }
 
 impl Default for UpdaterService {
@@ -849,11 +1121,86 @@ impl UpdaterInner {
 
     fn set_ready_to_install(&self, update: PackagerUpdate, bytes: Vec<u8>) {
         if let Ok(mut state) = self.state.write() {
-            let package_identity = match AtomicInstallerBundle::for_verified_packager_update(
-                &update.version,
-                crate::protocol::PROTOCOL_MAJOR,
-                crate::protocol::PROTOCOL_MINOR,
-                None,
+            let pending = match state.pending_release.clone() {
+                Some(pending) => pending,
+                None => {
+                    drop(state);
+                    self.set_error(UpdateRejection::MissingRequiredSha256.to_string());
+                    return;
+                }
+            };
+            let actual_hash =
+                match verify_downloaded_artifact_sha256(&bytes, &pending.required_hash) {
+                    Ok(hash) => hash,
+                    Err(error) => {
+                        drop(state);
+                        self.set_error(error.to_string());
+                        return;
+                    }
+                };
+            if pending.packager_target != update.target
+                || pending.download_url != update.download_url.as_str()
+                || pending.signature != update.signature
+                || pending.format != update.format.to_string()
+            {
+                drop(state);
+                self.set_error(
+                    "Packager-selected artifact URL/signature/format/platform drifted from armed release identity"
+                        .to_string(),
+                );
+                return;
+            }
+            let live_host = self
+                .live_host_build
+                .lock()
+                .ok()
+                .and_then(|guard| guard.clone());
+            let host_build = match live_host {
+                Some(live) if live == pending.host_build => live,
+                Some(live) => {
+                    drop(state);
+                    self.set_error(format!(
+                        "live Host Hello server_build `{live}` does not match release host_build `{}`",
+                        pending.host_build
+                    ));
+                    return;
+                }
+                None => {
+                    // Fail closed for production install identity: live Hello required.
+                    // Unit download-path tests may arm without a live host by setting
+                    // the same build into live_host_build first.
+                    drop(state);
+                    self.set_error(
+                        "live Host Hello server_build is required before ReadyToInstall"
+                            .to_string(),
+                    );
+                    return;
+                }
+            };
+            if let Some((major, minor)) = self.live_protocol.lock().ok().and_then(|g| *g) {
+                if major != pending.protocol_major || minor < pending.protocol_minor {
+                    drop(state);
+                    self.set_error(format!(
+                        "live Host Hello protocol {major}.{minor} incompatible with release {}.{}",
+                        pending.protocol_major, pending.protocol_minor
+                    ));
+                    return;
+                }
+            }
+            let proof = handoff::VerifiedPackagerDownload::new(
+                update.version.clone(),
+                actual_hash,
+                pending.packager_target.clone(),
+                pending.download_url.clone(),
+                pending.signature.clone(),
+                pending.format.clone(),
+            );
+            let package_identity = match AtomicInstallerBundle::from_verified_download(
+                proof,
+                pending.protocol_major,
+                pending.protocol_minor,
+                pending.client_build.clone(),
+                host_build,
             ) {
                 Ok(identity) => identity,
                 Err(error) => {
@@ -869,9 +1216,99 @@ impl UpdaterInner {
                 update,
                 bytes,
                 package_identity,
+                required_hash: pending.required_hash,
             });
             restore_ready_snapshot_locked(&mut state, None);
         }
+    }
+
+    /// Record evaluated release identity before download marks ReadyToInstall.
+    pub(crate) fn arm_pending_release_identity(
+        &self,
+        admitted: &AdmittedUpdate,
+    ) -> Result<(), String> {
+        let hash = admitted
+            .hash
+            .clone()
+            .ok_or_else(|| UpdateRejection::MissingRequiredSha256.to_string())?;
+        validate_manifest_artifact_hash_field(&hash).map_err(|error| error.to_string())?;
+        let (protocol_major, protocol_minor) =
+            parse_minimum_protocol(admitted.minimum_protocol.as_deref())?;
+        if admitted.platform.trim().is_empty()
+            || admitted.url.trim().is_empty()
+            || admitted.signature.trim().is_empty()
+        {
+            return Err("admitted release missing packager target/url/signature".into());
+        }
+        let format = admitted
+            .format
+            .clone()
+            .ok_or_else(|| "admitted release missing packager format binding".to_string())?;
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| "Updater state is unavailable.".to_string())?;
+        state.pending_release = Some(PendingReleaseIdentity {
+            required_hash: hash,
+            client_build: admitted.client_build.clone(),
+            host_build: admitted.host_build.clone(),
+            protocol_major,
+            protocol_minor,
+            packager_target: admitted.platform.clone(),
+            download_url: admitted.url.clone(),
+            signature: admitted.signature.clone(),
+            format,
+        });
+        Ok(())
+    }
+
+    fn validate_ready_update(&self, ready: &DownloadedUpdate) -> Result<(), String> {
+        if !ready.package_identity.signature_verified_by_packager {
+            return Err(UpdateRejection::SignatureNotVerifiedByPackager.to_string());
+        }
+        verify_downloaded_artifact_sha256(&ready.bytes, &ready.required_hash)
+            .map_err(|error| error.to_string())?;
+        assert_atomic_installer_bundle(&ready.package_identity)
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    fn mark_installing_snapshot(&self, ready: &DownloadedUpdate) -> Result<(), String> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| "Updater state is unavailable.".to_string())?;
+        if state.snapshot.is_busy()
+            && !matches!(
+                state.snapshot.stage,
+                UpdaterStage::ReadyToInstall | UpdaterStage::Installing
+            )
+        {
+            return Err("Updater is busy. Wait for the current action to finish.".to_string());
+        }
+        if state.ready_update.is_none() {
+            return Err("No downloaded update is ready to install.".to_string());
+        }
+        let version = ready.update.version.clone();
+        let size = ready.bytes.len() as u64;
+        state.snapshot.stage = UpdaterStage::Installing;
+        state.snapshot.target_version = Some(version.clone());
+        state.snapshot.release_notes = ready.update.body.clone();
+        state.snapshot.downloaded_bytes = size;
+        state.snapshot.total_bytes = Some(size);
+        state.snapshot.detail = format!("Launching installer for version {version}...");
+        Ok(())
+    }
+
+    fn consume_ready_after_installer_launch(&self) -> Result<(), String> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| "Updater state is unavailable.".to_string())?;
+        state.ready_update = None;
+        state.pending_update = None;
+        state.pending_release = None;
+        Ok(())
     }
 
     fn restore_ready_after_failed_download(&self, message: String) {
@@ -897,34 +1334,11 @@ impl UpdaterInner {
         }
     }
 
-    fn prepare_install(&self) -> Result<DownloadedUpdate, String> {
-        let mut state = self
-            .state
-            .write()
-            .map_err(|_| "Updater state is unavailable.".to_string())?;
-        if state.snapshot.is_busy() {
-            return Err("Updater is busy. Wait for the current action to finish.".to_string());
-        }
-        let ready_update = state
-            .ready_update
-            .take()
-            .ok_or_else(|| "No downloaded update is ready to install.".to_string())?;
-        let version = ready_update.update.version.clone();
-        let size = ready_update.bytes.len() as u64;
-        state.pending_update = None;
-        state.snapshot.stage = UpdaterStage::Installing;
-        state.snapshot.target_version = Some(version.clone());
-        state.snapshot.release_notes = ready_update.update.body.clone();
-        state.snapshot.downloaded_bytes = size;
-        state.snapshot.total_bytes = Some(size);
-        state.snapshot.detail = format!("Launching installer for version {version}...");
-        Ok(ready_update)
-    }
-
     fn set_error(&self, message: String) {
         if let Ok(mut state) = self.state.write() {
             state.pending_update = None;
             state.ready_update = None;
+            state.pending_release = None;
             state.snapshot.stage = UpdaterStage::Error;
             state.snapshot.last_checked_at = Some(SystemTime::now());
             clear_update_metadata(&mut state.snapshot);
@@ -1060,6 +1474,21 @@ pub fn evaluate_release_candidate(
         Ordering::Greater => {}
     }
 
+    let minimum_protocol = manifest.minimum_protocol.clone().ok_or_else(|| {
+        UpdateRejection::MalformedManifestField {
+            detail: "minimum_protocol is required".into(),
+        }
+    })?;
+    let (required_major, required_minor) = parse_minimum_protocol(Some(&minimum_protocol))
+        .map_err(|detail| UpdateRejection::MalformedManifestField { detail })?;
+    let local = crate::protocol::ProtocolVersion::current();
+    if required_major != local.major || required_minor > local.minor {
+        return Err(UpdateRejection::ProtocolIncompatible {
+            required: minimum_protocol,
+            local: format!("{}.{}", local.major, local.minor),
+        });
+    }
+
     let platform_entry =
         manifest
             .platforms
@@ -1069,18 +1498,25 @@ pub fn evaluate_release_candidate(
             })?;
 
     validate_manifest_signature_field(&platform_entry.signature)?;
-    if let Some(hash) = platform_entry.hash.as_deref() {
-        validate_manifest_artifact_hash_field(hash)?;
+    if platform_entry.format.trim().is_empty() {
+        return Err(UpdateRejection::MalformedManifestField {
+            detail: "format is required".into(),
+        });
     }
+    let hash = platform_entry
+        .hash
+        .clone()
+        .ok_or(UpdateRejection::MissingRequiredSha256)?;
+    validate_manifest_artifact_hash_field(&hash)?;
 
     let client_build = platform_entry
         .client_build
         .clone()
-        .unwrap_or_else(|| format!("devmanager/{remote}"));
+        .ok_or(UpdateRejection::MissingBuildIdentity)?;
     let host_build = platform_entry
         .host_build
         .clone()
-        .unwrap_or_else(|| format!("devmanager-host/{remote}"));
+        .ok_or(UpdateRejection::MissingBuildIdentity)?;
 
     let client_version =
         extract_build_version(&client_build).and_then(|value| parse_version(value).ok());
@@ -1102,11 +1538,31 @@ pub fn evaluate_release_candidate(
         platform: platform.to_string(),
         url: platform_entry.url.clone(),
         signature: platform_entry.signature.clone(),
-        hash: platform_entry.hash.clone(),
-        minimum_protocol: manifest.minimum_protocol.clone(),
+        format: Some(platform_entry.format.clone()),
+        hash: Some(hash),
+        minimum_protocol: Some(minimum_protocol),
         client_build,
         host_build,
     })
+}
+
+fn parse_minimum_protocol(value: Option<&str>) -> Result<(u16, u16), String> {
+    let raw = value.ok_or_else(|| "minimum_protocol is required".to_string())?;
+    let mut parts = raw.trim().split('.');
+    let major = parts
+        .next()
+        .ok_or_else(|| format!("invalid minimum_protocol `{raw}`"))?
+        .parse::<u16>()
+        .map_err(|_| format!("invalid minimum_protocol major in `{raw}`"))?;
+    let minor = parts
+        .next()
+        .unwrap_or("0")
+        .parse::<u16>()
+        .map_err(|_| format!("invalid minimum_protocol minor in `{raw}`"))?;
+    if parts.next().is_some() {
+        return Err(format!("invalid minimum_protocol `{raw}`"));
+    }
+    Ok((major, minor))
 }
 
 /// Reject indefinitely stale local metadata when a fresher signed body is available.
@@ -1213,15 +1669,182 @@ fn check_update_with_policy(
         .map_err(|error| format!("Update check failed: {error}"))
 }
 
+fn arm_pending_identity_from_packager_config(
+    inner: &UpdaterInner,
+    config: &PackagerUpdaterConfig,
+    policy: &CacheBustingRequestPolicy,
+    update: &PackagerUpdate,
+) -> Result<(), String> {
+    let endpoint = config
+        .endpoints
+        .first()
+        .ok_or_else(|| "updater config has no endpoints".to_string())?;
+    let busted = policy.apply_to_endpoint(endpoint.as_str())?;
+    let mut request = ureq::get(&busted);
+    for (key, value) in policy.header_pairs() {
+        request = request.header(key, value);
+    }
+    let body = request
+        .call()
+        .map_err(|error| format!("failed to fetch release manifest: {error}"))?
+        .into_body()
+        .read_to_string()
+        .map_err(|error| format!("failed to read release manifest body: {error}"))?;
+    let manifest = parse_release_manifest(&body)
+        .map_err(|error| format!("failed to parse release manifest: {error}"))?;
+    if manifest.version != update.version {
+        return Err(format!(
+            "packager update version {} does not match manifest version {}",
+            update.version, manifest.version
+        ));
+    }
+    let current = resolve_running_package_identity();
+    let platform = packager_architecture_target()
+        .ok_or_else(|| "unable to derive cargo_packager_updater target key".to_string())?;
+    if update.target != platform {
+        return Err(format!(
+            "packager update target `{}` does not match runtime architecture `{platform}`",
+            update.target
+        ));
+    }
+    let admitted = evaluate_release_candidate(&current, &manifest, &platform)
+        .map_err(|error| error.to_string())?;
+    if admitted.url != update.download_url.as_str()
+        || admitted.signature != update.signature
+        || admitted.format.as_deref() != Some(update.format.to_string().as_str())
+    {
+        return Err(
+            "packager-selected artifact URL/signature/format does not match release manifest"
+                .into(),
+        );
+    }
+    inner.arm_pending_release_identity(&admitted)
+}
+
+/// Exact packager `OS-ARCH` key (`cargo_packager_updater::target()`).
+pub fn packager_architecture_target() -> Option<String> {
+    cargo_packager_updater::target()
+}
+
+/// Materialize both product binaries into `staged_dir` from verified download bytes.
+///
+/// Accepts an uncompressed ZIP containing `devmanager.exe` + `devmanager-host.exe`,
+/// or the compact `DMUP1` dual-exe container used by production-shaped fixtures.
+/// NSIS/WiX installer execution is not performed here (see external packaging note).
+pub fn materialize_staged_binaries(
+    staged_dir: &Path,
+    bytes: &[u8],
+    identity: &AtomicInstallerBundle,
+) -> Result<(), String> {
+    assert_atomic_installer_bundle(identity).map_err(|error| error.to_string())?;
+    if staged_dir.exists() {
+        std::fs::remove_dir_all(staged_dir)
+            .map_err(|error| format!("failed to clear stage dir: {error}"))?;
+    }
+    std::fs::create_dir_all(staged_dir)
+        .map_err(|error| format!("failed to create stage dir: {error}"))?;
+
+    if bytes.starts_with(b"DMUP1") {
+        materialize_dmup1_container(staged_dir, bytes)?;
+    } else if bytes.starts_with(b"PK\x03\x04") {
+        materialize_uncompressed_zip(staged_dir, bytes)?;
+    } else {
+        return Err(
+            "verified update bytes are not a dual-exe ZIP/DMUP1 payload; NSIS/WiX execution is not the in-process Windows replace path"
+                .into(),
+        );
+    }
+    inspect_atomic_installer_payload_dir(staged_dir, identity).map_err(|error| error.to_string())
+}
+
+fn materialize_dmup1_container(staged_dir: &Path, bytes: &[u8]) -> Result<(), String> {
+    if bytes.len() < 13 || &bytes[..5] != b"DMUP1" {
+        return Err("invalid DMUP1 container header".into());
+    }
+    let client_len = u32::from_le_bytes(bytes[5..9].try_into().unwrap()) as usize;
+    let host_len = u32::from_le_bytes(bytes[9..13].try_into().unwrap()) as usize;
+    let client_end = 13usize.checked_add(client_len).ok_or("DMUP1 overflow")?;
+    let host_end = client_end.checked_add(host_len).ok_or("DMUP1 overflow")?;
+    if host_end != bytes.len() {
+        return Err("DMUP1 container length mismatch".into());
+    }
+    std::fs::write(staged_dir.join("devmanager.exe"), &bytes[13..client_end])
+        .map_err(|error| format!("write client: {error}"))?;
+    std::fs::write(
+        staged_dir.join("devmanager-host.exe"),
+        &bytes[client_end..host_end],
+    )
+    .map_err(|error| format!("write host: {error}"))?;
+    Ok(())
+}
+
+fn materialize_uncompressed_zip(staged_dir: &Path, bytes: &[u8]) -> Result<(), String> {
+    // Minimal local-file ZIP reader for store-only (method 0) entries.
+    let mut offset = 0usize;
+    let mut found_client = false;
+    let mut found_host = false;
+    while offset + 30 <= bytes.len() {
+        if &bytes[offset..offset + 4] != b"PK\x03\x04" {
+            break;
+        }
+        let method = u16::from_le_bytes(bytes[offset + 8..offset + 10].try_into().unwrap());
+        let comp_size =
+            u32::from_le_bytes(bytes[offset + 18..offset + 22].try_into().unwrap()) as usize;
+        let name_len =
+            u16::from_le_bytes(bytes[offset + 26..offset + 28].try_into().unwrap()) as usize;
+        let extra_len =
+            u16::from_le_bytes(bytes[offset + 28..offset + 30].try_into().unwrap()) as usize;
+        let name_start = offset + 30;
+        let name_end = name_start
+            .checked_add(name_len)
+            .ok_or("zip name overflow")?;
+        let data_start = name_end
+            .checked_add(extra_len)
+            .ok_or("zip extra overflow")?;
+        let data_end = data_start
+            .checked_add(comp_size)
+            .ok_or("zip data overflow")?;
+        if data_end > bytes.len() {
+            return Err("zip entry truncated".into());
+        }
+        let name = std::str::from_utf8(&bytes[name_start..name_end])
+            .map_err(|_| "zip entry name is not utf8".to_string())?;
+        let file_name = name.rsplit('/').next().unwrap_or(name);
+        if method != 0 {
+            return Err(format!(
+                "zip entry `{file_name}` is compressed; only store-method dual-exe zips are supported in-process"
+            ));
+        }
+        if file_name == "devmanager.exe" {
+            std::fs::write(staged_dir.join(file_name), &bytes[data_start..data_end])
+                .map_err(|error| format!("write {file_name}: {error}"))?;
+            found_client = true;
+        } else if file_name == "devmanager-host.exe" {
+            std::fs::write(staged_dir.join(file_name), &bytes[data_start..data_end])
+                .map_err(|error| format!("write {file_name}: {error}"))?;
+            found_host = true;
+        }
+        offset = data_end;
+    }
+    if !found_client || !found_host {
+        return Err("zip payload missing devmanager.exe and/or devmanager-host.exe".into());
+    }
+    Ok(())
+}
+
 fn read_current_exe_product_version() -> Option<Version> {
     let exe = std::env::current_exe().ok()?;
     read_binary_product_version(&exe)
 }
 
 fn read_binary_product_version(path: &Path) -> Option<Version> {
+    read_binary_product_version_string(path).and_then(|value| parse_version(&value).ok())
+}
+
+pub(crate) fn read_binary_product_version_string(path: &Path) -> Option<String> {
     #[cfg(windows)]
     {
-        read_windows_product_version(path)
+        read_windows_product_version_string(path)
     }
     #[cfg(not(windows))]
     {
@@ -1231,7 +1854,7 @@ fn read_binary_product_version(path: &Path) -> Option<Version> {
 }
 
 #[cfg(windows)]
-fn read_windows_product_version(path: &Path) -> Option<Version> {
+fn read_windows_product_version_string(path: &Path) -> Option<String> {
     use std::os::windows::ffi::OsStrExt;
     use windows::core::PCWSTR;
     use windows::Win32::Storage::FileSystem::{
@@ -1279,7 +1902,7 @@ fn read_windows_product_version(path: &Path) -> Option<Version> {
         let major = u64::from(info.dwProductVersionMS >> 16);
         let minor = u64::from(info.dwProductVersionMS & 0xffff);
         let patch = u64::from(info.dwProductVersionLS >> 16);
-        Some(Version::new(major, minor, patch))
+        Some(format!("{major}.{minor}.{patch}"))
     }
 }
 
@@ -1476,10 +2099,34 @@ mod tests {
                 },
                 pending_update: None,
                 ready_update: None,
+                pending_release: None,
             }),
-            handoff: Mutex::new(HostUpdateHandoff::default()),
+            update_gate: Mutex::new(None),
+            control_port: Mutex::new(None),
             resource_probe: Mutex::new(None),
+            live_host_build: Mutex::new(None),
+            live_protocol: Mutex::new(None),
         }
+    }
+
+    fn arm_ready(inner: &UpdaterInner, update: &PackagerUpdate, bytes: &[u8]) {
+        use sha2::{Digest, Sha256};
+        let hash = format!("sha256:{:x}", Sha256::digest(bytes));
+        let admitted = AdmittedUpdate {
+            version: parse_version(&update.version).unwrap(),
+            notes: update.body.clone(),
+            platform: update.target.clone(),
+            url: update.download_url.to_string(),
+            signature: update.signature.clone(),
+            format: Some(update.format.to_string()),
+            hash: Some(hash),
+            minimum_protocol: Some("1.0".into()),
+            client_build: format!("devmanager/{}", update.version),
+            host_build: format!("devmanager-host/{}", update.version),
+        };
+        *inner.live_host_build.lock().unwrap() = Some(admitted.host_build.clone());
+        *inner.live_protocol.lock().unwrap() = Some((1, 0));
+        inner.arm_pending_release_identity(&admitted).unwrap();
     }
 
     #[test]
@@ -1525,6 +2172,7 @@ mod tests {
         let ready_update = test_update("0.2.1", Some("old release"));
         let newer_update = test_update("0.2.2", Some("new release"));
 
+        arm_ready(&inner, &ready_update, &[1, 2, 3]);
         inner.set_ready_to_install(ready_update.clone(), vec![1, 2, 3]);
         assert_eq!(inner.prepare_check().unwrap(), CheckPlan::PreserveReady);
         {
@@ -1557,6 +2205,7 @@ mod tests {
             BACKGROUND_UPDATE_INTERVAL
         );
 
+        arm_ready(&inner, &test_update("0.2.1", None), &[1, 2, 3]);
         inner.set_ready_to_install(test_update("0.2.1", None), vec![1, 2, 3]);
 
         assert_eq!(
@@ -1571,6 +2220,7 @@ mod tests {
         let ready_update = test_update("0.2.1", Some("old release"));
         let replacement = test_update("0.2.2", Some("new release"));
 
+        arm_ready(&inner, &ready_update, &[1, 2, 3]);
         inner.set_ready_to_install(ready_update, vec![1, 2, 3]);
         assert_eq!(
             inner.prepare_auto_download(&replacement).unwrap(),
@@ -1589,6 +2239,11 @@ mod tests {
     #[test]
     fn authoritative_no_update_discards_ready_update_while_check_error_preserves_it() {
         let error_inner = test_inner();
+        arm_ready(
+            &error_inner,
+            &test_update("0.2.1", Some("recalled release")),
+            &[1, 2, 3],
+        );
         error_inner.set_ready_to_install(
             test_update("0.2.1", Some("recalled release")),
             vec![1, 2, 3],
@@ -1605,6 +2260,11 @@ mod tests {
         }
 
         let no_update_inner = test_inner();
+        arm_ready(
+            &no_update_inner,
+            &test_update("0.2.1", Some("recalled release")),
+            &[1, 2, 3],
+        );
         no_update_inner.set_ready_to_install(
             test_update("0.2.1", Some("recalled release")),
             vec![1, 2, 3],
@@ -1624,6 +2284,11 @@ mod tests {
     #[test]
     fn authoritative_lower_release_discards_recalled_ready_update_before_downloading() {
         let inner = test_inner();
+        arm_ready(
+            &inner,
+            &test_update("0.3.0", Some("recalled release")),
+            &[1, 2, 3],
+        );
         inner.set_ready_to_install(
             test_update("0.3.0", Some("recalled release")),
             vec![1, 2, 3],
@@ -1698,6 +2363,7 @@ mod tests {
         };
         let admitted = evaluate_release_candidate(&current, &manifest, "windows-x86_64").unwrap();
         assert_eq!(admitted.version, Version::new(0, 4, 2));
+        assert!(admitted.hash.is_some());
     }
 
     #[test]

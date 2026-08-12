@@ -39,7 +39,7 @@ struct HostArgs {
 }
 
 #[derive(Debug)]
-struct PreparedDebugPaths {
+struct PreparedHostPaths {
     profile_root: PathBuf,
     database: PathBuf,
     resolved: ResolvedAppPaths,
@@ -79,14 +79,6 @@ fn main() -> ExitCode {
 }
 
 fn run(raw_args: Vec<String>) -> Result<(), HostRunError> {
-    #[cfg(not(debug_assertions))]
-    {
-        let _ = raw_args;
-        return Err(HostRunError::Message(
-            "release host startup is deferred until Phase 11".to_string(),
-        ));
-    }
-
     #[cfg(not(windows))]
     {
         let _ = raw_args;
@@ -95,10 +87,10 @@ fn run(raw_args: Vec<String>) -> Result<(), HostRunError> {
         ));
     }
 
-    #[cfg(all(windows, debug_assertions))]
+    #[cfg(windows)]
     {
         let args = parse_args(raw_args)?;
-        let paths = prepare_debug_paths(&args)?;
+        let paths = prepare_host_paths(&args)?;
         let parent = open_and_validate_parent(args.parent_pid)?;
         let host_lock = acquire_lock(&paths.profile_root, &args.profile)?;
         let host_boot_id = host_lock.identity().boot_id;
@@ -131,7 +123,7 @@ fn run(raw_args: Vec<String>) -> Result<(), HostRunError> {
 
 /// One-way pre-bind ownership gate: only ServeResume/ServeInspection may return
 /// the bus for runtime construction and HelloListener::bind.
-#[cfg(all(windows, debug_assertions))]
+#[cfg(windows)]
 fn prepare_host_bus_before_bind(mut bus: CommandBus) -> Result<Option<CommandBus>, HostRunError> {
     match HostCleanupWorker::restart_disposition(&bus)
         .map_err(|error| format!("failed to read host restart disposition: {error}"))?
@@ -149,7 +141,7 @@ fn prepare_host_bus_before_bind(mut bus: CommandBus) -> Result<Option<CommandBus
     }
 }
 
-#[cfg(all(windows, debug_assertions))]
+#[cfg(windows)]
 fn parse_args(raw: Vec<String>) -> Result<HostArgs, String> {
     let mut foreground = false;
     let mut profile: Option<String> = None;
@@ -230,7 +222,7 @@ fn parse_args(raw: Vec<String>) -> Result<HostArgs, String> {
     }
 
     let profile_raw = profile.ok_or_else(|| "missing required --profile".to_string())?;
-    let profile = validate_debug_profile(&profile_raw)?;
+    let profile = validate_host_profile(&profile_raw)?;
 
     let instance_label_raw =
         instance_label.ok_or_else(|| "missing required --instance-label".to_string())?;
@@ -240,7 +232,7 @@ fn parse_args(raw: Vec<String>) -> Result<HostArgs, String> {
     validate_parent_pid_shape(parent_pid)?;
 
     let config_base = config_base.ok_or_else(|| "missing required --config-base".to_string())?;
-    let config_base = validate_config_base(&config_base)?;
+    let config_base = validate_config_base_for_build(&config_base)?;
 
     if test_slow_durable_reader_client_id.is_some() {
         validate_slow_durable_reader_isolation(&instance_label, &profile, &config_base)?;
@@ -255,23 +247,44 @@ fn parse_args(raw: Vec<String>) -> Result<HostArgs, String> {
     })
 }
 
-fn validate_debug_profile(raw: &str) -> Result<String, String> {
+fn validate_host_profile(raw: &str) -> Result<String, String> {
     if raw.is_empty() {
         return Err("profile must be nonempty".to_string());
     }
-    if raw.eq_ignore_ascii_case("production") {
-        return Err("reserved production profile is forbidden in debug host".to_string());
-    }
-    match AppProfile::named(raw) {
-        Ok(AppProfile::Named(name)) => {
-            if name == "production" {
-                return Err("reserved production profile is forbidden in debug host".to_string());
-            }
-            Ok(name)
+    #[cfg(debug_assertions)]
+    {
+        if raw.eq_ignore_ascii_case("production") {
+            return Err("reserved production profile is forbidden in debug host".to_string());
         }
-        Ok(_) => Err(format!("invalid debug profile: {raw:?}")),
-        Err(error) => Err(error.to_string()),
+        match AppProfile::named(raw) {
+            Ok(AppProfile::Named(name)) => {
+                if name == "production" {
+                    return Err(
+                        "reserved production profile is forbidden in debug host".to_string()
+                    );
+                }
+                Ok(name)
+            }
+            Ok(_) => Err(format!("invalid debug profile: {raw:?}")),
+            Err(error) => Err(error.to_string()),
+        }
     }
+    #[cfg(not(debug_assertions))]
+    {
+        if raw.eq_ignore_ascii_case("production") {
+            return Ok("production".to_string());
+        }
+        match AppProfile::named(raw) {
+            Ok(AppProfile::Named(name)) => Ok(name),
+            Ok(_) => Err(format!("invalid release profile: {raw:?}")),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+}
+
+fn validate_debug_profile(raw: &str) -> Result<String, String> {
+    // Compatibility alias used by existing debug tests.
+    validate_host_profile(raw)
 }
 
 fn validate_instance_label(raw: &str) -> Result<String, String> {
@@ -295,7 +308,7 @@ fn validate_instance_label(raw: &str) -> Result<String, String> {
     Ok(trimmed.to_string())
 }
 
-#[cfg(all(windows, debug_assertions))]
+#[cfg(windows)]
 fn validate_slow_durable_reader_isolation(
     instance_label: &str,
     profile: &str,
@@ -368,6 +381,18 @@ fn path_strictly_beneath(path: &Path, root: &Path) -> bool {
     path.starts_with(root) && path != root
 }
 
+#[cfg(windows)]
+fn validate_config_base_for_build(config_base: &Path) -> Result<PathBuf, String> {
+    #[cfg(debug_assertions)]
+    {
+        validate_config_base(config_base)
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        validate_release_config_base(config_base)
+    }
+}
+
 fn validate_config_base(config_base: &Path) -> Result<PathBuf, String> {
     if !config_base.is_absolute() {
         return Err(format!(
@@ -400,7 +425,29 @@ fn validate_config_base(config_base: &Path) -> Result<PathBuf, String> {
     Ok(canonical)
 }
 
-#[cfg(all(windows, debug_assertions))]
+#[cfg(windows)]
+fn validate_release_config_base(config_base: &Path) -> Result<PathBuf, String> {
+    if !config_base.is_absolute() {
+        return Err(format!(
+            "config base must be an absolute path: {}",
+            config_base.display()
+        ));
+    }
+    if !config_base.is_dir() {
+        return Err(format!(
+            "config base must be an existing directory: {}",
+            config_base.display()
+        ));
+    }
+    config_base.canonicalize().map_err(|error| {
+        format!(
+            "failed to canonicalize config base {}: {error}",
+            config_base.display()
+        )
+    })
+}
+
+#[cfg(windows)]
 fn is_reparse_point(path: &Path) -> Result<bool, String> {
     use std::os::windows::fs::MetadataExt;
     use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
@@ -415,8 +462,20 @@ fn is_reparse_point(path: &Path) -> Result<bool, String> {
     Ok(metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0)
 }
 
-#[cfg(all(windows, debug_assertions))]
-fn prepare_debug_paths(args: &HostArgs) -> Result<PreparedDebugPaths, String> {
+#[cfg(windows)]
+fn prepare_host_paths(args: &HostArgs) -> Result<PreparedHostPaths, String> {
+    #[cfg(debug_assertions)]
+    {
+        prepare_debug_paths(args)
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        prepare_release_paths(args)
+    }
+}
+
+#[cfg(windows)]
+fn prepare_debug_paths(args: &HostArgs) -> Result<PreparedHostPaths, String> {
     let profile = AppProfile::named(&args.profile).map_err(|error| error.to_string())?;
     let paths = resolve_app_paths(&args.config_base, profile, BuildKind::Debug)
         .map_err(|error| error.to_string())?;
@@ -488,14 +547,45 @@ fn prepare_debug_paths(args: &HostArgs) -> Result<PreparedDebugPaths, String> {
         ));
     }
 
-    Ok(PreparedDebugPaths {
+    Ok(PreparedHostPaths {
         profile_root: canonical_root,
         database: paths.database.clone(),
         resolved: paths,
     })
 }
 
-#[cfg(all(windows, debug_assertions))]
+#[cfg(all(windows, not(debug_assertions)))]
+fn prepare_release_paths(args: &HostArgs) -> Result<PreparedHostPaths, String> {
+    let profile = if args.profile.eq_ignore_ascii_case("production") {
+        AppProfile::Production
+    } else {
+        AppProfile::named(&args.profile).map_err(|error| error.to_string())?
+    };
+    let paths = resolve_app_paths(&args.config_base, profile, BuildKind::Release)
+        .map_err(|error| error.to_string())?;
+    let root = paths.root.clone();
+    if !root.exists() {
+        fs::create_dir_all(&root).map_err(|error| {
+            format!(
+                "failed to create release profile root {}: {error}",
+                root.display()
+            )
+        })?;
+    }
+    let canonical_root = root.canonicalize().map_err(|error| {
+        format!(
+            "failed to canonicalize release profile root {}: {error}",
+            root.display()
+        )
+    })?;
+    Ok(PreparedHostPaths {
+        profile_root: canonical_root,
+        database: paths.database.clone(),
+        resolved: paths,
+    })
+}
+
+#[cfg(windows)]
 fn acquire_lock(profile_root: &Path, profile: &str) -> Result<HostLock, HostRunError> {
     match HostLock::acquire(profile_root, profile) {
         Ok(lock) => Ok(lock),
@@ -506,12 +596,12 @@ fn acquire_lock(profile_root: &Path, profile: &str) -> Result<HostLock, HostRunE
     }
 }
 
-#[cfg(all(windows, debug_assertions))]
+#[cfg(windows)]
 struct ParentProcess {
     handle: windows::Win32::Foundation::HANDLE,
 }
 
-#[cfg(all(windows, debug_assertions))]
+#[cfg(windows)]
 impl Drop for ParentProcess {
     fn drop(&mut self) {
         unsafe {
@@ -520,7 +610,7 @@ impl Drop for ParentProcess {
     }
 }
 
-#[cfg(all(windows, debug_assertions))]
+#[cfg(windows)]
 fn actual_parent_pid() -> Result<u32, String> {
     use sysinfo::{Pid, ProcessesToUpdate, System};
 
@@ -536,12 +626,12 @@ fn actual_parent_pid() -> Result<u32, String> {
     Ok(parent.as_u32())
 }
 
-#[cfg(all(windows, debug_assertions))]
+#[cfg(windows)]
 fn filetime_to_ticks(time: windows::Win32::Foundation::FILETIME) -> u64 {
     (u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime)
 }
 
-#[cfg(all(windows, debug_assertions))]
+#[cfg(windows)]
 fn creation_ticks(handle: windows::Win32::Foundation::HANDLE) -> Result<u64, String> {
     use windows::Win32::Foundation::FILETIME;
     use windows::Win32::System::Threading::GetProcessTimes;
@@ -559,7 +649,7 @@ fn creation_ticks(handle: windows::Win32::Foundation::HANDLE) -> Result<u64, Str
     Ok(ticks)
 }
 
-#[cfg(all(windows, debug_assertions))]
+#[cfg(windows)]
 fn open_and_validate_parent(parent_pid: u32) -> Result<ParentProcess, String> {
     use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
     use windows::Win32::System::Threading::{
@@ -613,7 +703,7 @@ fn open_and_validate_parent(parent_pid: u32) -> Result<ParentProcess, String> {
     Ok(parent)
 }
 
-#[cfg(all(windows, debug_assertions))]
+#[cfg(windows)]
 fn parent_has_exited(parent: &ParentProcess) -> Result<bool, String> {
     use windows::Win32::Foundation::{WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
     use windows::Win32::System::Threading::WaitForSingleObject;
@@ -632,7 +722,7 @@ fn parent_has_exited(parent: &ParentProcess) -> Result<bool, String> {
     }
 }
 
-#[cfg(all(windows, debug_assertions))]
+#[cfg(windows)]
 async fn wait_for_parent_exit(parent: &ParentProcess) -> Result<(), String> {
     loop {
         if parent_has_exited(parent)? {
@@ -642,7 +732,7 @@ async fn wait_for_parent_exit(parent: &ParentProcess) -> Result<(), String> {
     }
 }
 
-#[cfg(all(windows, debug_assertions))]
+#[cfg(windows)]
 fn join_error_message(context: &str, error: tokio::task::JoinError) -> String {
     if error.is_panic() {
         format!("{context} panicked")
@@ -653,7 +743,7 @@ fn join_error_message(context: &str, error: tokio::task::JoinError) -> String {
     }
 }
 
-#[cfg(all(windows, debug_assertions))]
+#[cfg(windows)]
 async fn abort_and_drain_connection_tasks(
     tasks: &mut tokio::task::JoinSet<()>,
 ) -> Result<(), String> {
@@ -672,7 +762,7 @@ async fn abort_and_drain_connection_tasks(
     first_error.map_or(Ok(()), Err)
 }
 
-#[cfg(all(windows, debug_assertions))]
+#[cfg(windows)]
 async fn drain_then_abort_connection_tasks(
     tasks: &mut tokio::task::JoinSet<()>,
     drain: Duration,
@@ -705,7 +795,7 @@ async fn drain_then_abort_connection_tasks(
     }
 }
 
-#[cfg(all(windows, debug_assertions))]
+#[cfg(windows)]
 enum HostLoopExit {
     Parent(Result<(), String>),
     Listener(String),
@@ -715,7 +805,7 @@ enum HostLoopExit {
     Connection(tokio::task::JoinError),
 }
 
-#[cfg(all(windows, debug_assertions))]
+#[cfg(windows)]
 async fn finish_supervised_host(
     exit: HostLoopExit,
     connection_tasks: &mut tokio::task::JoinSet<()>,
@@ -791,7 +881,7 @@ async fn finish_supervised_host(
     }
 }
 
-#[cfg(all(windows, debug_assertions))]
+#[cfg(windows)]
 fn spawn_connection_task(
     tasks: &mut tokio::task::JoinSet<()>,
     connection: HostConnection,
@@ -812,7 +902,7 @@ fn spawn_connection_task(
     });
 }
 
-#[cfg(all(windows, debug_assertions))]
+#[cfg(windows)]
 async fn serve_foreground_host(
     profile: &str,
     parent: ParentProcess,
@@ -851,6 +941,9 @@ async fn serve_foreground_host(
         },
     ) = HostRequestExecutor::start_supervised_with_config_store(bus, config_store)
         .map_err(|error| format!("invalid host project configuration: {error}"))?;
+    // Shared HostUpdateRuntimeGate is owned by the executor handle. Clients bind
+    // via HostRequestHandle::bind_updater_runtime (owned probe + timed IPC port).
+    let _update_gate = request_handle.update_runtime_gate();
     let mut connection_tasks = tokio::task::JoinSet::new();
     // `accept_with_successor` owns its listener. Keep the future pinned across
     // unrelated task-completion branches so a normal client disconnect never

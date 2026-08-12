@@ -1,9 +1,13 @@
 //! Host adapters for bounded update handoff.
 //!
-//! [`HostUpdateHandoff`] lives in [`crate::updater::handoff`] so [`crate::updater::UpdaterService`]
-//! can gate installs without a host↔updater cycle. This module maps the existing
-//! Phase 2 [`crate::domain::Query::InspectHostQuit`] seam onto
-//! [`crate::updater::handoff::ActiveResourceProbe`].
+//! [`HostUpdateHandoff`] / [`HostUpdateRuntimeGate`] live in [`crate::updater::handoff`]
+//! so [`crate::updater::UpdaterService`] and the host executor share one FSM without
+//! an updater↔host import cycle. This module maps the existing Phase 2
+//! [`crate::domain::Query::InspectHostQuit`] seam onto an **owned**
+//! [`crate::updater::handoff::ActiveResourceProbe`] (Send + 'static, no borrowed
+//! references, no unsafe Send).
+
+use std::sync::{Arc, Mutex};
 
 use uuid::Uuid;
 
@@ -14,7 +18,7 @@ use crate::updater::handoff::{
     ActiveResourceProbe, ActiveUpdateResource, UpdateResourceInspection,
 };
 
-pub use crate::updater::handoff::{HostUpdateAdmission, HostUpdateHandoff};
+pub use crate::updater::handoff::HostUpdateRuntimeGate;
 
 /// Map a durable host-quit inspection into the updater handoff resource summary.
 pub fn update_inspection_from_host_quit(
@@ -52,35 +56,9 @@ pub fn update_inspection_from_host_quit(
     }
 }
 
-/// Probe that reads live blockers through the existing CommandBus InspectHostQuit path.
-pub struct CommandBusActiveResourceProbe<'a> {
-    bus: &'a CommandBus,
-    host_boot_id: Uuid,
-}
-
-impl<'a> CommandBusActiveResourceProbe<'a> {
-    pub fn new(bus: &'a CommandBus, host_boot_id: Uuid) -> Self {
-        Self { bus, host_boot_id }
-    }
-}
-
-impl ActiveResourceProbe for CommandBusActiveResourceProbe<'_> {
-    fn inspect_for_update(&mut self) -> Result<UpdateResourceInspection, String> {
-        let inspection = self
-            .bus
-            .inspect_host_quit()
-            .map_err(|error| format!("InspectHostQuit failed: {error}"))?;
-        Ok(update_inspection_from_host_quit(
-            &inspection,
-            self.host_boot_id,
-        ))
-    }
-}
-
 /// Trait for host-connection-facing code that can supply a quit inspection.
 ///
-/// Phase 2 did not add PrepareUpdate envelopes; HostConnection speaks requests on
-/// the pipe while the bus owns InspectHostQuit. Implementors bridge that seam.
+/// Implementors need not be Send; owned probes wrap Send sources only.
 pub trait HostQuitInspectionSource {
     fn inspect_host_quit_for_update(&mut self) -> Result<HostQuitInspection, String>;
 }
@@ -92,31 +70,84 @@ impl HostQuitInspectionSource for CommandBus {
     }
 }
 
-/// Probe over any [`HostQuitInspectionSource`] (CommandBus or test double).
-pub struct HostConnectionUpdateProbe<'a, S: HostQuitInspectionSource + ?Sized> {
-    source: &'a mut S,
-    host_boot_id: Uuid,
+/// Owned Send+'static probe built from a closure (host IPC / executor / tests).
+pub struct OwnedActiveResourceProbe {
+    inspect: Box<dyn FnMut() -> Result<UpdateResourceInspection, String> + Send>,
 }
 
-impl<'a, S: HostQuitInspectionSource + ?Sized> HostConnectionUpdateProbe<'a, S> {
-    pub fn new(source: &'a mut S, host_boot_id: Uuid) -> Self {
+impl OwnedActiveResourceProbe {
+    pub fn from_fn(
+        inspect: impl FnMut() -> Result<UpdateResourceInspection, String> + Send + 'static,
+    ) -> Self {
         Self {
-            source,
-            host_boot_id,
+            inspect: Box::new(inspect),
         }
     }
+
+    /// Own a Send [`HostQuitInspectionSource`] so the probe is Send+'static.
+    pub fn from_send_source<S>(source: S, host_boot_id: Uuid) -> Self
+    where
+        S: HostQuitInspectionSource + Send + 'static,
+    {
+        let source = Arc::new(Mutex::new(source));
+        Self::from_fn(move || {
+            let mut guard = source
+                .lock()
+                .map_err(|_| "update probe source lock is poisoned".to_string())?;
+            let inspection = guard.inspect_host_quit_for_update()?;
+            Ok(update_inspection_from_host_quit(&inspection, host_boot_id))
+        })
+    }
 }
 
-impl<S: HostQuitInspectionSource + ?Sized> ActiveResourceProbe
-    for HostConnectionUpdateProbe<'_, S>
-{
+impl ActiveResourceProbe for OwnedActiveResourceProbe {
     fn inspect_for_update(&mut self) -> Result<UpdateResourceInspection, String> {
-        let inspection = self.source.inspect_host_quit_for_update()?;
-        Ok(update_inspection_from_host_quit(
-            &inspection,
-            self.host_boot_id,
-        ))
+        (self.inspect)()
     }
+}
+
+impl std::fmt::Debug for OwnedActiveResourceProbe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OwnedActiveResourceProbe")
+    }
+}
+
+/// Executor/IPC-backed owned probe installed by the host or native client.
+///
+/// Constructed from [`crate::host::HostRequestHandle::owned_update_resource_probe`] or a
+/// client IPC callback — never from a borrowed `&CommandBus`.
+pub struct HostExecutorActiveResourceProbe {
+    inner: OwnedActiveResourceProbe,
+}
+
+impl HostExecutorActiveResourceProbe {
+    pub fn new(inner: OwnedActiveResourceProbe) -> Self {
+        Self { inner }
+    }
+
+    pub fn into_owned(self) -> OwnedActiveResourceProbe {
+        self.inner
+    }
+}
+
+impl ActiveResourceProbe for HostExecutorActiveResourceProbe {
+    fn inspect_for_update(&mut self) -> Result<UpdateResourceInspection, String> {
+        self.inner.inspect_for_update()
+    }
+}
+
+/// Fixed-source probe for contract tests (owned, Send+'static).
+pub fn owned_probe_from_quit_inspection(
+    inspection: HostQuitInspection,
+    host_boot_id: Uuid,
+) -> OwnedActiveResourceProbe {
+    struct FixedQuit(HostQuitInspection);
+    impl HostQuitInspectionSource for FixedQuit {
+        fn inspect_host_quit_for_update(&mut self) -> Result<HostQuitInspection, String> {
+            Ok(self.0.clone())
+        }
+    }
+    OwnedActiveResourceProbe::from_send_source(FixedQuit(inspection), host_boot_id)
 }
 
 #[cfg(test)]
@@ -128,7 +159,10 @@ mod tests {
     use crate::domain::id::{AgentSessionId, ResourceId, TaskId};
     use crate::domain::resource::{OwnerKind, ResourceKind};
     use crate::domain::{AgentRole, AgentSessionLifecycle};
-    use crate::updater::handoff::{FixedActiveResourceProbe, SilentReplacementDecision};
+    use crate::updater::handoff::{
+        FixedActiveResourceProbe, HostUpdateAdmission, HostUpdateHandoff, HostUpdateRuntimeGate,
+        SilentReplacementDecision, UpdateResourceInspection,
+    };
     use std::time::{Duration, SystemTime};
 
     #[test]
@@ -162,22 +196,18 @@ mod tests {
     }
 
     #[test]
-    fn host_connection_probe_trait_feeds_handoff_gate() {
-        struct FixedQuit(HostQuitInspection);
-        impl HostQuitInspectionSource for FixedQuit {
-            fn inspect_host_quit_for_update(&mut self) -> Result<HostQuitInspection, String> {
-                Ok(self.0.clone())
-            }
-        }
-
-        let mut source = FixedQuit(HostQuitInspection {
-            inspection_id: 3,
-            agents: Vec::new(),
-            resources: Vec::new(),
-            worktrees: HostQuitWorktreeInspection::NotInspected,
-            confirmable: true,
-        });
-        let mut probe = HostConnectionUpdateProbe::new(&mut source, Uuid::now_v7());
+    fn owned_source_probe_feeds_handoff_gate() {
+        let boot = Uuid::now_v7();
+        let mut probe = owned_probe_from_quit_inspection(
+            HostQuitInspection {
+                inspection_id: 3,
+                agents: Vec::new(),
+                resources: Vec::new(),
+                worktrees: HostQuitWorktreeInspection::NotInspected,
+                confirmable: true,
+            },
+            boot,
+        );
         let mut handoff = HostUpdateHandoff::default();
         let (inspection, decision) = handoff
             .inspect_with_probe(&mut probe, "devmanager/0.4.2", "devmanager-host/0.4.2")
@@ -188,9 +218,10 @@ mod tests {
     }
 
     #[test]
-    fn abort_before_irreversible_returns_ready() {
+    fn runtime_gate_stops_launches_while_draining() {
+        let gate = HostUpdateRuntimeGate::new();
+        assert!(!gate.stops_new_launches());
         let boot = Uuid::now_v7();
-        let mut handoff = HostUpdateHandoff::default();
         let mut probe = FixedActiveResourceProbe {
             inspection: UpdateResourceInspection {
                 inspection_id: 1,
@@ -199,8 +230,8 @@ mod tests {
                 confirmable: true,
             },
         };
-        let token = handoff
-            .run_pre_install_gate(
+        let token = gate
+            .prepare_update(
                 &mut probe,
                 "0.4.2",
                 "devmanager/0.4.2",
@@ -208,12 +239,13 @@ mod tests {
                 SystemTime::UNIX_EPOCH + Duration::from_secs(1),
                 false,
             )
-            .expect("gate");
-        assert!(!handoff.install_irreversible());
+            .expect("prepare");
+        assert!(gate.stops_new_launches());
         assert_eq!(
-            handoff.abort_pre_install().expect("abort"),
+            gate.abort_pre_install().expect("abort"),
             HostUpdateAdmission::Ready
         );
+        assert!(!gate.stops_new_launches());
         assert_eq!(token.host_boot_id, boot);
     }
 }

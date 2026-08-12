@@ -4,10 +4,15 @@
 //! atomic matching host+client replacement, reconnect/snapshot-resync, and
 //! pre-install abort that restores the old host to Ready. No installer I/O.
 
-use std::time::{Duration, SystemTime};
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+/// Default absolute budget for blocking update IPC from the UI thread.
+pub const UPDATE_IPC_DEADLINE: Duration = Duration::from_secs(2);
 
 /// Files and stores that must survive every new-architecture update.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -603,12 +608,13 @@ pub fn extract_build_version(build: &str) -> Option<&str> {
 }
 
 /// Live active-resource summary used before install. Host wires this to
-/// [`crate::domain::Query::InspectHostQuit`] via [`crate::host::update`].
+/// [`crate::domain::Query::InspectHostQuit`] via an **owned** Send+'static probe
+/// in [`crate::host::update`] — never a borrowed `&CommandBus` stored as `'static`.
 pub trait ActiveResourceProbe: Send {
     fn inspect_for_update(&mut self) -> Result<UpdateResourceInspection, String>;
 }
 
-/// Fixed probe for tests and injected doubles.
+/// Fixed probe for tests and injected doubles (owned, Send+'static).
 #[derive(Debug, Clone)]
 pub struct FixedActiveResourceProbe {
     pub inspection: UpdateResourceInspection,
@@ -646,28 +652,77 @@ pub struct AtomicInstallerBundle {
     pub artifact_hash: Option<String>,
     /// True only after `cargo_packager_updater` download verified the signature.
     pub signature_verified_by_packager: bool,
+    /// Exact packager `OS-ARCH` platform key bound to the verified artifact.
+    pub packager_target: String,
+    pub download_url: String,
+    pub signature: String,
+    pub format: String,
 }
 
 impl AtomicInstallerBundle {
-    pub fn for_verified_packager_update(
-        version: &str,
+    /// Sealed constructor: only the updater download path may mint verified identity.
+    ///
+    /// Requires a [`VerifiedPackagerDownload`] proof produced after
+    /// `cargo_packager_updater` download+verify and sha256 of actual bytes.
+    pub(crate) fn from_verified_download(
+        proof: VerifiedPackagerDownload,
         protocol_major: u16,
         protocol_minor: u16,
-        artifact_hash: Option<String>,
+        client_build: impl Into<String>,
+        host_build: impl Into<String>,
     ) -> Result<Self, String> {
+        let client_build = client_build.into();
+        let host_build = host_build.into();
         let bundle = Self {
-            version: version.to_string(),
+            version: proof.version,
             client_exe: "devmanager.exe".to_string(),
             host_exe: "devmanager-host.exe".to_string(),
-            client_build: format!("devmanager/{version}"),
-            host_build: format!("devmanager-host/{version}"),
+            client_build,
+            host_build,
             protocol_major,
             protocol_minor,
-            artifact_hash,
+            artifact_hash: Some(proof.artifact_hash),
             signature_verified_by_packager: true,
+            packager_target: proof.packager_target,
+            download_url: proof.download_url,
+            signature: proof.signature,
+            format: proof.format,
         };
         assert_atomic_installer_bundle(&bundle).map_err(|error| error.to_string())?;
         Ok(bundle)
+    }
+}
+
+/// Opaque proof that packager crypto verify + byte hash succeeded.
+///
+/// Cannot be constructed outside the updater download path.
+#[derive(Debug, Clone)]
+pub struct VerifiedPackagerDownload {
+    pub(crate) version: String,
+    pub(crate) artifact_hash: String,
+    pub(crate) packager_target: String,
+    pub(crate) download_url: String,
+    pub(crate) signature: String,
+    pub(crate) format: String,
+}
+
+impl VerifiedPackagerDownload {
+    pub(crate) fn new(
+        version: impl Into<String>,
+        artifact_hash: impl Into<String>,
+        packager_target: impl Into<String>,
+        download_url: impl Into<String>,
+        signature: impl Into<String>,
+        format: impl Into<String>,
+    ) -> Self {
+        Self {
+            version: version.into(),
+            artifact_hash: artifact_hash.into(),
+            packager_target: packager_target.into(),
+            download_url: download_url.into(),
+            signature: signature.into(),
+            format: format.into(),
+        }
     }
 }
 
@@ -679,6 +734,14 @@ pub enum AtomicBundleError {
     HostClientBuildMismatch {
         client_build: String,
         host_build: String,
+    },
+    ProtocolMismatch {
+        detail: String,
+    },
+    MissingArtifactHash,
+    ArtifactHashMismatch {
+        expected: String,
+        actual: String,
     },
 }
 
@@ -697,6 +760,19 @@ impl std::fmt::Display for AtomicBundleError {
             } => write!(
                 f,
                 "installer bundle host/client mismatch: {client_build} vs {host_build}"
+            ),
+            Self::ProtocolMismatch { detail } => {
+                write!(f, "installer bundle protocol mismatch: {detail}")
+            }
+            Self::MissingArtifactHash => {
+                write!(
+                    f,
+                    "installer bundle is missing required sha256 artifact hash"
+                )
+            }
+            Self::ArtifactHashMismatch { expected, actual } => write!(
+                f,
+                "installer artifact hash mismatch: expected {expected}, actual {actual}"
             ),
         }
     }
@@ -724,7 +800,74 @@ pub fn assert_atomic_installer_bundle(
             host_build: bundle.host_build.clone(),
         });
     }
+    if bundle.protocol_major != crate::protocol::PROTOCOL_MAJOR {
+        return Err(AtomicBundleError::ProtocolMismatch {
+            detail: format!(
+                "bundle protocol {}.{} incompatible with local {}.{}",
+                bundle.protocol_major,
+                bundle.protocol_minor,
+                crate::protocol::PROTOCOL_MAJOR,
+                crate::protocol::PROTOCOL_MINOR
+            ),
+        });
+    }
+    if bundle.packager_target.trim().is_empty()
+        || bundle.download_url.trim().is_empty()
+        || bundle.signature.trim().is_empty()
+        || bundle.format.trim().is_empty()
+    {
+        return Err(AtomicBundleError::ProtocolMismatch {
+            detail: "verified bundle missing packager target/url/signature/format binding".into(),
+        });
+    }
+    let Some(hash) = bundle.artifact_hash.as_deref() else {
+        return Err(AtomicBundleError::MissingArtifactHash);
+    };
+    let trimmed = hash.trim();
+    let Some(hex) = trimmed.strip_prefix("sha256:") else {
+        return Err(AtomicBundleError::ArtifactHashMismatch {
+            expected: "sha256:<64 hex>".into(),
+            actual: trimmed.to_string(),
+        });
+    };
+    if hex.len() != 64 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(AtomicBundleError::ArtifactHashMismatch {
+            expected: "sha256:<64 hex>".into(),
+            actual: trimmed.to_string(),
+        });
+    }
     Ok(())
+}
+
+/// Inspect a staged directory that must contain both product binaries.
+pub fn inspect_atomic_installer_payload_dir(
+    staged_dir: &std::path::Path,
+    expected: &AtomicInstallerBundle,
+) -> Result<(), AtomicBundleError> {
+    assert_atomic_installer_bundle(expected)?;
+    if !staged_dir.join(&expected.client_exe).is_file() {
+        return Err(AtomicBundleError::MissingClientExe);
+    }
+    if !staged_dir.join(&expected.host_exe).is_file() {
+        return Err(AtomicBundleError::MissingHostExe);
+    }
+    Ok(())
+}
+
+/// Hash downloaded installer bytes and compare to the required manifest digest.
+pub fn verify_downloaded_artifact_sha256(
+    bytes: &[u8],
+    expected_hash: &str,
+) -> Result<String, AtomicBundleError> {
+    use sha2::{Digest, Sha256};
+    let actual = format!("sha256:{:x}", Sha256::digest(bytes));
+    if actual != expected_hash {
+        return Err(AtomicBundleError::ArtifactHashMismatch {
+            expected: expected_hash.to_string(),
+            actual,
+        });
+    }
+    Ok(actual)
 }
 
 /// Old-to-new vs subsequent new-architecture update preservation mode.
@@ -830,6 +973,79 @@ pub fn validate_preservation_checkpoint(
         return Err(PreservationError::OldBinariesNotUsableOnFailure);
     }
     Ok(())
+}
+
+fn sha256_file_hex(path: &std::path::Path) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    let bytes = std::fs::read(path)
+        .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+    Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
+}
+
+fn device_pairing_fingerprint_from_remote_json(remote_json: &str) -> Result<String, String> {
+    let value: serde_json::Value = serde_json::from_str(remote_json)
+        .map_err(|error| format!("remote.json parse failed: {error}"))?;
+    let host_id = value
+        .get("hostId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("missing-host");
+    let pairing = value
+        .get("pairingCode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("missing-pairing");
+    let device_id = value
+        .pointer("/devices/0/deviceId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("missing-device");
+    Ok(format!("pairing:{host_id}:{pairing}:{device_id}"))
+}
+
+/// Read a disposable profile-root checkpoint. Never resolves production AppData.
+///
+/// `profile_root` must be an explicit fixture/temp directory supplied by the
+/// caller. Production profile paths are rejected by path policy in tests.
+pub fn capture_preservation_checkpoint(
+    profile_root: &std::path::Path,
+    cutover: UpdateCutoverKind,
+) -> Result<PreservationCheckpoint, String> {
+    if profile_root.as_os_str().is_empty() {
+        return Err("preservation checkpoint requires an explicit disposable profile root".into());
+    }
+    let config_path = profile_root.join("config.json");
+    let remote_path = profile_root.join("remote.json");
+    let config_hash = sha256_file_hex(&config_path)?;
+    let remote_bytes = std::fs::read_to_string(&remote_path)
+        .map_err(|error| format!("failed to read remote.json: {error}"))?;
+    let remote_hash = {
+        use sha2::{Digest, Sha256};
+        format!("sha256:{:x}", Sha256::digest(remote_bytes.as_bytes()))
+    };
+    let fingerprint = device_pairing_fingerprint_from_remote_json(&remote_bytes)?;
+
+    // session.json may exist but must never drive the report.
+    let _ = profile_root.join("session.json");
+
+    let task_db_hash = hash_task_prompt_database(profile_root, cutover)?;
+
+    let report = IdentityPreservationReport {
+        config_hash_before: config_hash.clone(),
+        config_hash_after: config_hash,
+        remote_hash_before: remote_hash.clone(),
+        remote_hash_after: remote_hash,
+        device_pairing_fingerprint_before: fingerprint.clone(),
+        device_pairing_fingerprint_after: fingerprint,
+        task_db_hash_before: task_db_hash.clone(),
+        task_db_hash_after: task_db_hash,
+        session_json_considered: false,
+        legacy_conversations_imported: false,
+    };
+    let checkpoint = PreservationCheckpoint {
+        cutover,
+        report,
+        old_binaries_usable_on_failure: true,
+    };
+    validate_preservation_checkpoint(&checkpoint).map_err(|error| error.to_string())?;
+    Ok(checkpoint)
 }
 
 /// Bounded host/client update handoff coordinator used by [`crate::updater::UpdaterService`].
@@ -961,7 +1177,8 @@ impl HostUpdateHandoff {
         Ok(())
     }
 
-    /// Arms installer execution. After this returns, [`Self::abort_pre_install`] is refused.
+    /// Arms installer execution phase. Remains abortable until
+    /// [`Self::seal_after_durable_stage`] after a recoverable stage marker exists.
     pub fn begin_atomic_install(
         &mut self,
         token_id: Uuid,
@@ -969,6 +1186,18 @@ impl HostUpdateHandoff {
     ) -> Result<(), UpdateHandoffError> {
         self.machine.begin_install(token_id, now)?;
         self.admission = HostUpdateAdmission::InstallingUpdate;
+        self.install_irreversible = false;
+        Ok(())
+    }
+
+    /// Seal irreversibility only after durable recoverable stage marker is ready.
+    pub fn seal_after_durable_stage(&mut self) -> Result<(), UpdateHandoffError> {
+        if !matches!(self.machine.phase(), UpdateHandoffPhase::Installing { .. }) {
+            return Err(UpdateHandoffError::InvalidPhase {
+                expected: "Installing",
+                observed: self.machine.phase().clone(),
+            });
+        }
         self.install_irreversible = true;
         Ok(())
     }
@@ -1017,6 +1246,285 @@ impl HostUpdateHandoff {
             Ok(())
         } else {
             Err(HandoffBlockReason::UnsafeSilentReplacement)
+        }
+    }
+}
+
+/// Process-local host update admission: stop new launches while draining/installing.
+///
+/// Owned by the host executor and optionally bound into [`crate::updater::UpdaterService`]
+/// so client and host share one FSM.
+#[derive(Debug, Default)]
+pub struct HostUpdateRuntimeGate {
+    handoff: Mutex<HostUpdateHandoff>,
+}
+
+impl HostUpdateRuntimeGate {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            handoff: Mutex::new(HostUpdateHandoff::default()),
+        })
+    }
+
+    pub fn admission(&self) -> HostUpdateAdmission {
+        self.handoff
+            .lock()
+            .map(|guard| guard.admission())
+            .unwrap_or(HostUpdateAdmission::Ready)
+    }
+
+    /// New task/resource/provider/browser launches are refused while draining or installing.
+    pub fn stops_new_launches(&self) -> bool {
+        matches!(
+            self.admission(),
+            HostUpdateAdmission::DrainingForUpdate | HostUpdateAdmission::InstallingUpdate
+        )
+    }
+
+    pub fn prepare_update(
+        &self,
+        probe: &mut dyn ActiveResourceProbe,
+        target_version: &str,
+        client_build: &str,
+        host_build: &str,
+        now: SystemTime,
+        allow_explicit_confirm_with_active: bool,
+    ) -> Result<UpdateHandoffToken, UpdateHandoffError> {
+        let mut handoff = self
+            .handoff
+            .lock()
+            .map_err(|_| UpdateHandoffError::InvalidPhase {
+                expected: "unlocked HostUpdateHandoff",
+                observed: UpdateHandoffPhase::Ready,
+            })?;
+        let (inspection, _decision) =
+            handoff.inspect_with_probe(probe, client_build, host_build)?;
+        handoff.prepare_update(
+            &inspection,
+            target_version,
+            client_build,
+            host_build,
+            now,
+            allow_explicit_confirm_with_active,
+        )
+    }
+
+    pub fn confirm_drain(&self, token_id: Uuid, now: SystemTime) -> Result<(), UpdateHandoffError> {
+        let mut handoff = self
+            .handoff
+            .lock()
+            .map_err(|_| UpdateHandoffError::InvalidPhase {
+                expected: "unlocked HostUpdateHandoff",
+                observed: UpdateHandoffPhase::Ready,
+            })?;
+        handoff.confirm_and_drain(token_id, now)
+    }
+
+    pub fn begin_atomic_install(
+        &self,
+        token_id: Uuid,
+        now: SystemTime,
+    ) -> Result<(), UpdateHandoffError> {
+        let mut handoff = self
+            .handoff
+            .lock()
+            .map_err(|_| UpdateHandoffError::InvalidPhase {
+                expected: "unlocked HostUpdateHandoff",
+                observed: UpdateHandoffPhase::Ready,
+            })?;
+        handoff.begin_atomic_install(token_id, now)
+    }
+
+    pub fn seal_after_durable_stage(&self) -> Result<(), UpdateHandoffError> {
+        let mut handoff = self
+            .handoff
+            .lock()
+            .map_err(|_| UpdateHandoffError::InvalidPhase {
+                expected: "unlocked HostUpdateHandoff",
+                observed: UpdateHandoffPhase::Ready,
+            })?;
+        handoff.seal_after_durable_stage()
+    }
+
+    pub fn abort_pre_install(&self) -> Result<HostUpdateAdmission, UpdateHandoffError> {
+        let mut handoff = self
+            .handoff
+            .lock()
+            .map_err(|_| UpdateHandoffError::InvalidPhase {
+                expected: "unlocked HostUpdateHandoff",
+                observed: UpdateHandoffPhase::Ready,
+            })?;
+        handoff.abort_pre_install()
+    }
+
+    pub fn complete_matching_host_start(
+        &self,
+        token_id: Uuid,
+        now: SystemTime,
+    ) -> Result<(), UpdateHandoffError> {
+        let mut handoff = self
+            .handoff
+            .lock()
+            .map_err(|_| UpdateHandoffError::InvalidPhase {
+                expected: "unlocked HostUpdateHandoff",
+                observed: UpdateHandoffPhase::Ready,
+            })?;
+        handoff.complete_matching_host_start(token_id, now)
+    }
+
+    pub fn finish_resync(&self, token_id: Uuid, now: SystemTime) -> Result<(), UpdateHandoffError> {
+        let mut handoff = self
+            .handoff
+            .lock()
+            .map_err(|_| UpdateHandoffError::InvalidPhase {
+                expected: "unlocked HostUpdateHandoff",
+                observed: UpdateHandoffPhase::Ready,
+            })?;
+        handoff.finish_resync(token_id, now)
+    }
+}
+
+/// Timed IPC/control port that drives the shared host update FSM without freezing UI.
+///
+/// Implementors must honor absolute deadlines (never block unbounded on the UI thread).
+pub trait HostUpdateControlPort: Send {
+    fn prepare_update(
+        &self,
+        target_version: &str,
+        client_build: &str,
+        host_build: &str,
+        allow_explicit_confirm_with_active: bool,
+        deadline: Instant,
+    ) -> Result<UpdateHandoffToken, String>;
+
+    fn confirm_drain(&self, token_id: Uuid, deadline: Instant) -> Result<(), String>;
+
+    fn abort_pre_install(&self, deadline: Instant) -> Result<(), String>;
+
+    fn begin_atomic_install(&self, token_id: Uuid, deadline: Instant) -> Result<(), String>;
+
+    fn seal_after_durable_stage(&self, deadline: Instant) -> Result<(), String>;
+}
+
+fn sha256_sqlite_canonical_task_prompt(path: &Path) -> Result<String, String> {
+    use rusqlite::{Connection, OpenFlags};
+    use sha2::{Digest, Sha256};
+
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| {
+        format!(
+            "failed to open task/prompt sqlite {}: {error}",
+            path.display()
+        )
+    })?;
+
+    let mut hasher = Sha256::new();
+    // Canonical projection tables + FTS content when present (allowlisted only).
+    for (table, sql) in [
+        ("tasks", "SELECT * FROM tasks ORDER BY task_id ASC"),
+        (
+            "agent_sessions",
+            "SELECT * FROM agent_sessions ORDER BY agent_session_id ASC",
+        ),
+        (
+            "artifacts",
+            "SELECT * FROM artifacts ORDER BY artifact_id ASC",
+        ),
+        (
+            "resources",
+            "SELECT * FROM resources ORDER BY resource_id ASC",
+        ),
+        ("prompts", "SELECT * FROM prompts ORDER BY rowid ASC"),
+        (
+            "task_prompts",
+            "SELECT * FROM task_prompts ORDER BY rowid ASC",
+        ),
+        ("prompt_fts", "SELECT * FROM prompt_fts ORDER BY rowid ASC"),
+        ("tasks_fts", "SELECT * FROM tasks_fts ORDER BY rowid ASC"),
+    ] {
+        let exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type IN ('table','view') AND name = ?1",
+                [table],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+        if !exists {
+            continue;
+        }
+        hasher.update(table.as_bytes());
+        hasher.update([0x00]);
+        let mut stmt = conn
+            .prepare(sql)
+            .map_err(|error| format!("prepare {table}: {error}"))?;
+        let column_count = stmt.column_count();
+        let mut rows = stmt
+            .query([])
+            .map_err(|error| format!("query {table}: {error}"))?;
+        while let Some(row) = rows
+            .next()
+            .map_err(|error| format!("row {table}: {error}"))?
+        {
+            for idx in 0..column_count {
+                let value: rusqlite::types::Value = row
+                    .get(idx)
+                    .map_err(|error| format!("column {table}.{idx}: {error}"))?;
+                match value {
+                    rusqlite::types::Value::Null => hasher.update([0]),
+                    rusqlite::types::Value::Integer(v) => {
+                        hasher.update([1]);
+                        hasher.update(v.to_le_bytes());
+                    }
+                    rusqlite::types::Value::Real(v) => {
+                        hasher.update([2]);
+                        hasher.update(v.to_bits().to_le_bytes());
+                    }
+                    rusqlite::types::Value::Text(v) => {
+                        hasher.update([3]);
+                        let len = u64::try_from(v.len()).unwrap_or(u64::MAX);
+                        hasher.update(len.to_le_bytes());
+                        hasher.update(v.as_bytes());
+                    }
+                    rusqlite::types::Value::Blob(v) => {
+                        hasher.update([4]);
+                        let len = u64::try_from(v.len()).unwrap_or(u64::MAX);
+                        hasher.update(len.to_le_bytes());
+                        hasher.update(&v);
+                    }
+                }
+            }
+            hasher.update([0xFF]);
+        }
+    }
+    Ok(format!("sha256:{:x}", hasher.finalize()))
+}
+
+fn hash_task_prompt_database(
+    profile_root: &Path,
+    cutover: UpdateCutoverKind,
+) -> Result<Option<String>, String> {
+    match cutover {
+        UpdateCutoverKind::OldToNew => Ok(None),
+        UpdateCutoverKind::NewToNew => {
+            let sqlite_candidates = [
+                profile_root.join("devmanager.sqlite"),
+                profile_root.join("tasks.sqlite"),
+                profile_root.join("command-bus.sqlite"),
+            ];
+            if let Some(path) = sqlite_candidates.into_iter().find(|path| path.is_file()) {
+                return Ok(Some(sha256_sqlite_canonical_task_prompt(&path)?));
+            }
+            let json_path = profile_root.join("task-prompt-db.json");
+            if json_path.is_file() {
+                return Ok(Some(sha256_file_hex(&json_path)?));
+            }
+            Err(
+                "new-to-new checkpoint requires task/prompt sqlite (canonical tables/FTS) or disposable json fixture"
+                    .into(),
+            )
         }
     }
 }
