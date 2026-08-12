@@ -438,12 +438,6 @@ impl ConnectDispatchSession {
         hello: HelloPayload,
         host_attached: bool,
     ) -> Result<ConnectPayload, DispatchFailure> {
-        if self.negotiated.is_some() {
-            return Err(DispatchFailure::fatal(
-                CONNECT_ERROR_PROTOCOL,
-                "Connect Hello is already complete",
-            ));
-        }
         let binding = envelope.binding().map_err(|_| {
             DispatchFailure::fatal(CONNECT_ERROR_PROTOCOL, "invalid channel binding")
         })?;
@@ -451,6 +445,12 @@ impl ConnectDispatchSession {
             return Err(DispatchFailure::fatal(
                 CONNECT_ERROR_CONFLICT,
                 "Connect sequence replay or inversion is rejected",
+            ));
+        }
+        if self.negotiated.is_some() {
+            return Err(DispatchFailure::fatal(
+                CONNECT_ERROR_PROTOCOL,
+                "Connect Hello is already complete",
             ));
         }
         if hello.capability_grant.is_some() {
