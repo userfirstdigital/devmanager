@@ -817,7 +817,7 @@ $child = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentL
         let resumed = std::cell::Cell::new(false);
         let result = claim_then_resume_suspended_child(
             42,
-            |_| Err("claim failed".to_string()),
+            |_: u32| -> Result<(), String> { Err("claim failed".to_string()) },
             |_| {
                 gated.set(true);
                 Ok(())
