@@ -317,6 +317,7 @@ impl ConfigSidebarProjection {
         div()
             .id("native-config-sidebar")
             .w(px(280.0))
+            .flex_none()
             .h_full()
             .flex()
             .flex_col()

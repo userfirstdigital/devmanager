@@ -52,6 +52,7 @@ pub mod artifacts_panel;
 pub mod changes_panel;
 pub mod cockpit_projection;
 pub mod composer;
+pub mod config_sidebar;
 pub mod dock;
 pub mod files_panel;
 pub mod panel;
@@ -73,6 +74,11 @@ pub use artifacts_panel::{ArtifactPanelRow, ArtifactsPanelProjection};
 pub use changes_panel::ChangesPanelProjection;
 pub use cockpit_projection::{
     summary_line, surface_query_action_id, CockpitSurfaceLoad, TaskCockpitLiveProjection,
+};
+pub use config_sidebar::{
+    ConfigFolderRow, ConfigProjectRow, ConfigProvider, ConfigProviderRow, ConfigServerRow,
+    ConfigSidebarAction, ConfigSidebarActionRequest, ConfigSidebarDisabledReason,
+    ConfigSidebarProjection, ConfigSidebarUnavailableReason, ConfigSshRow,
 };
 pub use files_panel::{FilePanelRow, FilesPanelProjection};
 pub use panel::{
