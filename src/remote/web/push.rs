@@ -1,4 +1,8 @@
 use crate::remote::presentation::StableSessionKey;
+use crate::remote::{
+    settle_remote_worker, settle_unowned_remote_worker, RemoteWorker,
+    REMOTE_WORKER_SHUTDOWN_TIMEOUT,
+};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -6,7 +10,8 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Weak};
-use std::thread::{self, JoinHandle};
+#[cfg(test)]
+use std::thread;
 use std::time::Duration;
 use ureq::http::{Request, Uri};
 use web_push_native::jwt_simple::algorithms::ES256KeyPair;
@@ -312,6 +317,7 @@ type PushTransport = Arc<dyn Fn(Request<Vec<u8>>) -> Result<u16, String> + Send 
 #[derive(Clone)]
 pub(crate) struct PushSender {
     shards: Arc<[SyncSender<PushDelivery>]>,
+    dispatcher_identity: Arc<()>,
 }
 
 impl PushSender {
@@ -319,6 +325,7 @@ impl PushSender {
         debug_assert!(!shards.is_empty());
         Self {
             shards: Arc::from(shards),
+            dispatcher_identity: Arc::new(()),
         }
     }
 
@@ -342,6 +349,10 @@ impl PushSender {
         self.shards[shard].try_send(delivery)
     }
 
+    pub(crate) fn belongs_to_same_dispatcher(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.dispatcher_identity, &other.dispatcher_identity)
+    }
+
     #[cfg(test)]
     pub(crate) fn send(
         &self,
@@ -356,9 +367,10 @@ impl PushSender {
 /// non-blocking `try_send`; slow or unavailable push services can never hold a
 /// terminal, semantic-journal, or browser-control lock.
 pub(crate) struct PushDispatcher {
+    inner: Weak<crate::remote::RemoteHostInner>,
     sender: Option<PushSender>,
     stop: Arc<AtomicBool>,
-    workers: Vec<JoinHandle<()>>,
+    workers: Vec<RemoteWorker>,
 }
 
 impl PushDispatcher {
@@ -396,11 +408,11 @@ impl PushDispatcher {
             let worker_stop = stop.clone();
             let worker_inner = inner.clone();
             let worker_transport = transport.clone();
-            match thread::Builder::new()
-                .name(format!("devmanager-push-{worker_index}"))
-                .spawn(move || {
-                    push_worker_loop(receiver, worker_stop, worker_inner, worker_transport)
-                }) {
+            match RemoteWorker::try_spawn(
+                format!("devmanager-push-{worker_index}"),
+                None,
+                move || push_worker_loop(receiver, worker_stop, worker_inner, worker_transport),
+            ) {
                 Ok(worker) => {
                     workers.push(worker);
                     shard_senders.push(sender);
@@ -409,14 +421,13 @@ impl PushDispatcher {
                     stop.store(true, Ordering::Release);
                     drop(sender);
                     drop(shard_senders);
-                    for worker in workers {
-                        let _ = worker.join();
-                    }
+                    settle_push_workers(&inner, workers);
                     return Err(format!("failed to start Web Push worker: {error}"));
                 }
             }
         }
         Ok(Self {
+            inner,
             sender: Some(PushSender::new(shard_senders)),
             stop,
             workers,
@@ -435,8 +446,19 @@ impl Drop for PushDispatcher {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
         self.sender.take();
-        for worker in self.workers.drain(..) {
-            let _ = worker.join();
+        settle_push_workers(&self.inner, self.workers.drain(..).collect());
+    }
+}
+
+fn settle_push_workers(inner: &Weak<crate::remote::RemoteHostInner>, workers: Vec<RemoteWorker>) {
+    let deadline = std::time::Instant::now() + REMOTE_WORKER_SHUTDOWN_TIMEOUT;
+    if let Some(inner) = inner.upgrade() {
+        for worker in workers {
+            settle_remote_worker(&inner, worker, deadline);
+        }
+    } else {
+        for worker in workers {
+            settle_unowned_remote_worker(worker, deadline);
         }
     }
 }
@@ -811,11 +833,21 @@ pub fn classify_push_status(status: u16) -> PushDeliveryOutcome {
 mod tests {
     use super::*;
     use crate::remote::test_support::TestProfileGuard;
-    use crate::remote::{RemoteHostConfig, RemoteHostService};
+    use crate::remote::{remote_worker_admission_pool, RemoteHostConfig, RemoteHostService};
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use std::sync::atomic::AtomicUsize;
-    use std::sync::{mpsc, Arc, Barrier, Mutex};
+    use std::sync::{mpsc, Arc, Barrier, Mutex, Weak};
     use std::time::Instant;
+
+    struct TestAdmissionPermit(Option<crate::remote::RemoteWorkerPermit>);
+
+    impl Drop for TestAdmissionPermit {
+        fn drop(&mut self) {
+            if let Some(permit) = self.0.take() {
+                permit.release();
+            }
+        }
+    }
 
     fn valid_registration() -> PushRegistrationRequest {
         let application_key = WebPushConfig::default().vapid_public_key_base64;
@@ -1383,7 +1415,11 @@ mod tests {
             config.web.push.subscriptions = vec![subscription];
         }
         let (sender, receiver) = mpsc::sync_channel(2);
-        *service.inner.web_push_sender.write().unwrap() = Some(PushSender::single(sender));
+        *service.inner.web_push_sender.write().unwrap() =
+            Some(crate::remote::RegisteredWebPushSender {
+                listener_generation: 0,
+                sender: PushSender::single(sender),
+            });
 
         service.enqueue_push_attention(
             None,
@@ -1421,7 +1457,11 @@ mod tests {
             config.web.push.subscriptions = vec![old, newest];
         }
         let (sender, receiver) = mpsc::sync_channel(3);
-        *service.inner.web_push_sender.write().unwrap() = Some(PushSender::single(sender));
+        *service.inner.web_push_sender.write().unwrap() =
+            Some(crate::remote::RegisteredWebPushSender {
+                listener_generation: 0,
+                sender: PushSender::single(sender),
+            });
 
         service.enqueue_push_attention(
             None,
@@ -1446,6 +1486,92 @@ mod tests {
         assert_eq!(classify_push_status(410), PushDeliveryOutcome::Expired);
         assert_eq!(classify_push_status(429), PushDeliveryOutcome::Retryable);
         assert_eq!(classify_push_status(500), PushDeliveryOutcome::Retryable);
+    }
+
+    #[test]
+    fn four_thread_push_dispatcher_consumes_and_returns_remote_worker_admission() {
+        let pool = remote_worker_admission_pool();
+        let before = pool.in_use();
+        let dispatcher = PushDispatcher::start_with_transport(
+            Weak::<crate::remote::RemoteHostInner>::new(),
+            1,
+            DELIVERY_WORKERS,
+            Arc::new(|_| Ok(201)),
+        )
+        .expect("the bare four-thread dispatcher should start");
+
+        let during = pool.in_use();
+        drop(dispatcher);
+        let after = pool.in_use();
+
+        assert_eq!(
+            during,
+            before + DELIVERY_WORKERS,
+            "each bare push worker must hold one remote-worker admission permit"
+        );
+        assert_eq!(
+            after, before,
+            "push-worker permits must return only after dispatcher teardown joins"
+        );
+    }
+
+    #[test]
+    fn overlapping_four_thread_push_restarts_reject_after_global_admission_cap() {
+        let pool = remote_worker_admission_pool();
+        let before = pool.in_use();
+        let available = pool.capacity.saturating_sub(before);
+        assert!(
+            available >= DELIVERY_WORKERS,
+            "the serial admission test needs one four-thread dispatcher slot"
+        );
+
+        // Occupy every slot except one complete four-worker dispatcher. This
+        // keeps the test deterministic and bounded while still modeling all old
+        // dispatchers retained during a restart storm.
+        let reserved_count = available - DELIVERY_WORKERS;
+        let mut reserved = Vec::with_capacity(reserved_count);
+        for _ in 0..reserved_count {
+            reserved.push(TestAdmissionPermit(Some(pool.try_acquire().expect(
+                "the serial test should reserve the expected admission slots",
+            ))));
+        }
+
+        let dispatcher = PushDispatcher::start_with_transport(
+            Weak::<crate::remote::RemoteHostInner>::new(),
+            1,
+            DELIVERY_WORKERS,
+            Arc::new(|_| Ok(201)),
+        )
+        .expect("the in-capacity push restart should start");
+        let overflow = PushDispatcher::start_with_transport(
+            Weak::<crate::remote::RemoteHostInner>::new(),
+            1,
+            DELIVERY_WORKERS,
+            Arc::new(|_| Ok(201)),
+        );
+        let overflow_rejected = overflow.is_err();
+        if let Ok(dispatcher) = overflow {
+            drop(dispatcher);
+        }
+
+        drop(dispatcher);
+        let after_join = pool.in_use();
+        drop(reserved);
+        let after = pool.in_use();
+
+        assert!(
+            overflow_rejected,
+            "a restart storm must reject the next four-worker dispatcher when the global admission cap is full"
+        );
+        assert_eq!(
+            after_join,
+            before + reserved_count,
+            "push-worker permits must remain accounted for until their dispatcher joins"
+        );
+        assert_eq!(
+            after, before,
+            "all admitted push-worker permits must return after overlapping dispatchers join"
+        );
     }
 
     #[test]

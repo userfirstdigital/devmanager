@@ -32,9 +32,10 @@ use tokio::sync::oneshot;
 
 use super::{
     now_epoch_ms, remote_worker_admission_pool, ListenerBindFailure, ListenerLease,
-    RemoteAccessActivityEvent, RemoteAccessActivityKind, RemoteAccessSource, RemoteHostInner,
-    RemoteWorkerAdmissionPool, RemoteWorkerPermit,
+    RemoteAccessActivityEvent, RemoteAccessActivityKind, RemoteAccessSource, RemoteHostConfig,
+    RemoteHostInner, RemoteWorkerAdmissionPool, RemoteWorkerPermit,
 };
+use crate::browser::redact_browser_text;
 use crate::remote::presentation::StableSessionKey;
 use crate::state::SessionKind;
 
@@ -45,6 +46,9 @@ pub use auth::{
 
 const WEB_COOKIE_MAX_AGE_SECS: u64 = 60 * 60 * 24 * 365 * 10;
 const PUSH_REGISTRATION_BODY_BYTES: usize = 16 * 1024;
+const MAX_BROWSER_INSTALL_ID_BYTES: usize = 128;
+const MAX_BROWSER_USER_AGENT_BYTES: usize = 512;
+const MAX_BROWSER_NICKNAME_BYTES: usize = 128;
 
 /// Persisted configuration for the web listener. Lives inside `RemoteHostConfig`
 /// and is serialized to `remote.json` via serde defaults.
@@ -128,13 +132,76 @@ struct BrowserClientMetadata {
     device_class: Option<String>,
 }
 
+fn browser_metadata_character_is_forbidden(character: char) -> bool {
+    character.is_control()
+        || matches!(
+            character,
+            '\u{200E}'
+                | '\u{200F}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2066}'..='\u{2069}'
+        )
+}
+
+fn truncate_utf8_bytes(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].trim_end().to_string()
+}
+
+fn sanitize_browser_metadata_text(value: &str, max_bytes: usize) -> Option<String> {
+    let redacted = redact_browser_text(value);
+    let normalized = redacted
+        .chars()
+        .map(|character| {
+            if browser_metadata_character_is_forbidden(character) {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let bounded = truncate_utf8_bytes(&normalized, max_bytes);
+    (!bounded.is_empty()).then_some(bounded)
+}
+
+fn validate_browser_install_id(value: Option<String>) -> Result<Option<String>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if value.len() > MAX_BROWSER_INSTALL_ID_BYTES {
+        return Err(format!(
+            "Browser install ID exceeds {MAX_BROWSER_INSTALL_ID_BYTES} bytes."
+        ));
+    }
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+    {
+        return Err(
+            "Browser install ID must be an opaque ASCII identifier without whitespace or metadata."
+                .to_string(),
+        );
+    }
+    Ok(Some(value))
+}
+
 fn browser_metadata_from_headers(headers: &HeaderMap) -> BrowserClientMetadata {
     let user_agent = headers
         .get(header::USER_AGENT)
         .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned);
+        .and_then(|value| sanitize_browser_metadata_text(value, MAX_BROWSER_USER_AGENT_BYTES));
     let lower = user_agent
         .as_deref()
         .map(|value| value.to_ascii_lowercase())
@@ -261,6 +328,103 @@ fn browser_display_label(client: &PairedWebClient) -> String {
         })
 }
 
+#[derive(Debug, Clone)]
+pub(super) struct BrowserConnectionActivity {
+    client_id: String,
+    client_ip: String,
+    browser_install_id: Option<String>,
+    metadata: BrowserClientMetadata,
+}
+
+pub(super) fn prepare_browser_connection_activity(
+    client_id: &str,
+    client_ip: IpAddr,
+    browser_install_id: Option<String>,
+    headers: &HeaderMap,
+) -> Result<BrowserConnectionActivity, String> {
+    Ok(BrowserConnectionActivity {
+        client_id: client_id.to_string(),
+        client_ip: client_ip.to_string(),
+        browser_install_id: validate_browser_install_id(browser_install_id)?,
+        metadata: browser_metadata_from_headers(headers),
+    })
+}
+
+pub(super) fn apply_browser_connection_activity(
+    config: &mut RemoteHostConfig,
+    activity: &BrowserConnectionActivity,
+    occurred_at_epoch_ms: u64,
+) -> bool {
+    let client_id = activity.client_id.as_str();
+    let had_previous_connect = config.web.activity_log.iter().any(|event| {
+        event.source == RemoteAccessSource::Browser
+            && event.client_id == client_id
+            && matches!(
+                event.event_kind,
+                RemoteAccessActivityKind::Connected | RemoteAccessActivityKind::Reconnected
+            )
+    });
+    let Some(client_index) = config
+        .web
+        .paired_clients
+        .iter()
+        .position(|client| client.client_id == client_id)
+    else {
+        return false;
+    };
+
+    let (event_client_id, event_label, browser_family, browser_version, os_family, device_class) = {
+        let client = &mut config.web.paired_clients[client_index];
+        client.nickname = client.nickname.as_deref().and_then(|nickname| {
+            sanitize_browser_metadata_text(nickname.trim(), MAX_BROWSER_NICKNAME_BYTES)
+        });
+        if let Some(browser_install_id) = activity.browser_install_id.as_ref() {
+            if client.browser_install_id.trim().is_empty()
+                || client.browser_install_id == client.client_id
+            {
+                client.browser_install_id = browser_install_id.clone();
+            }
+        }
+        client.last_seen_epoch_ms = Some(occurred_at_epoch_ms);
+        client.last_seen_ip = Some(activity.client_ip.clone());
+        client.label = activity.metadata.label.clone();
+        client.user_agent = activity.metadata.user_agent.clone();
+        client.browser_family = activity.metadata.browser_family.clone();
+        client.browser_version = activity.metadata.browser_version.clone();
+        client.os_family = activity.metadata.os_family.clone();
+        client.device_class = activity.metadata.device_class.clone();
+        (
+            client.client_id.clone(),
+            browser_display_label(client),
+            client.browser_family.clone(),
+            client.browser_version.clone(),
+            client.os_family.clone(),
+            client.device_class.clone(),
+        )
+    };
+
+    super::append_remote_access_activity_event(
+        config,
+        RemoteAccessActivityEvent {
+            client_id: event_client_id,
+            source: RemoteAccessSource::Browser,
+            event_kind: if had_previous_connect {
+                RemoteAccessActivityKind::Reconnected
+            } else {
+                RemoteAccessActivityKind::Connected
+            },
+            label: event_label,
+            ip_address: Some(activity.client_ip.clone()),
+            event_at_epoch_ms: Some(occurred_at_epoch_ms),
+            browser_family,
+            browser_version,
+            os_family,
+            device_class,
+        },
+    );
+    true
+}
+
 pub(crate) fn record_browser_connection(
     inner: &Arc<RemoteHostInner>,
     client_id: &str,
@@ -268,84 +432,24 @@ pub(crate) fn record_browser_connection(
     browser_install_id: Option<String>,
     headers: &HeaderMap,
 ) -> Result<(), String> {
-    let metadata = browser_metadata_from_headers(headers);
-    let now = now_epoch_ms();
-    let client_ip_string = client_ip.to_string();
-    super::mutate_host_config(inner, |config| {
-        let had_previous_connect = config.web.activity_log.iter().any(|event| {
-            event.source == RemoteAccessSource::Browser
-                && event.client_id == client_id
-                && matches!(
-                    event.event_kind,
-                    RemoteAccessActivityKind::Connected | RemoteAccessActivityKind::Reconnected
-                )
-        });
-        let Some(client_index) = config
-            .web
-            .paired_clients
-            .iter()
-            .position(|client| client.client_id == client_id)
-        else {
-            return;
-        };
-
-        let normalized_browser_install_id = browser_install_id
-            .filter(|value| !value.trim().is_empty())
-            .map(|value| value.trim().to_string());
-        let (
-            event_client_id,
-            event_label,
-            browser_family,
-            browser_version,
-            os_family,
-            device_class,
-        ) = {
-            let client = &mut config.web.paired_clients[client_index];
-            if let Some(browser_install_id) = normalized_browser_install_id {
-                if client.browser_install_id.trim().is_empty()
-                    || client.browser_install_id == client.client_id
-                {
-                    client.browser_install_id = browser_install_id;
-                }
-            }
-            client.last_seen_epoch_ms = Some(now);
-            client.last_seen_ip = Some(client_ip_string.clone());
-            client.label = metadata.label.clone();
-            client.user_agent = metadata.user_agent.clone();
-            client.browser_family = metadata.browser_family.clone();
-            client.browser_version = metadata.browser_version.clone();
-            client.os_family = metadata.os_family.clone();
-            client.device_class = metadata.device_class.clone();
-            (
-                client.client_id.clone(),
-                browser_display_label(client),
-                client.browser_family.clone(),
-                client.browser_version.clone(),
-                client.os_family.clone(),
-                client.device_class.clone(),
-            )
-        };
-
-        super::append_remote_access_activity_event(
-            config,
-            RemoteAccessActivityEvent {
-                client_id: event_client_id,
-                source: RemoteAccessSource::Browser,
-                event_kind: if had_previous_connect {
-                    RemoteAccessActivityKind::Reconnected
-                } else {
-                    RemoteAccessActivityKind::Connected
-                },
-                label: event_label,
-                ip_address: Some(client_ip_string.clone()),
-                event_at_epoch_ms: Some(now),
-                browser_family,
-                browser_version,
-                os_family,
-                device_class,
-            },
-        );
-    })
+    let activity =
+        prepare_browser_connection_activity(client_id, client_ip, browser_install_id, headers)?;
+    super::mutate_host_config_if(
+        inner,
+        |config| {
+            config
+                .web
+                .paired_clients
+                .iter()
+                .any(|client| client.client_id == activity.client_id)
+        },
+        |config| {
+            let applied = apply_browser_connection_activity(config, &activity, now_epoch_ms());
+            debug_assert!(applied, "serialized browser activity client disappeared");
+        },
+    )
+    .map_err(|error| error.to_string())?
+    .ok_or_else(|| "Browser pairing is no longer valid.".to_string())
 }
 
 /// Best-effort LAN IP discovery using the "connect a UDP socket and read
@@ -375,7 +479,40 @@ pub struct WebListenerHandle {
     shutdown_permit: Option<RemoteWorkerPermit>,
     push_inner: std::sync::Weak<RemoteHostInner>,
     push_dispatcher: Option<push::PushDispatcher>,
+    push_sender: Option<push::PushSender>,
+    listener_generation: u64,
     pub bind_info: String,
+}
+
+fn publish_web_push_sender(
+    inner: &Arc<RemoteHostInner>,
+    listener_generation: u64,
+    sender: push::PushSender,
+) {
+    if let Ok(mut slot) = inner.web_push_sender.write() {
+        *slot = Some(super::RegisteredWebPushSender {
+            listener_generation,
+            sender,
+        });
+    }
+}
+
+fn clear_web_push_sender_if_current(
+    inner: &Arc<RemoteHostInner>,
+    listener_generation: u64,
+    expected: &push::PushSender,
+) -> bool {
+    let Ok(mut slot) = inner.web_push_sender.write() else {
+        return false;
+    };
+    let matches = slot.as_ref().is_some_and(|registered| {
+        registered.listener_generation == listener_generation
+            && registered.sender.belongs_to_same_dispatcher(expected)
+    });
+    if matches {
+        *slot = None;
+    }
+    matches
 }
 
 fn reserve_web_listener_shutdown_permit(
@@ -472,24 +609,25 @@ impl WebListenerHandle {
         match bind_result_rx.recv_timeout(std::time::Duration::from_secs(5)) {
             Ok(Ok(())) => {
                 let push_inner = Arc::downgrade(&inner);
-                let push_dispatcher = match push::PushDispatcher::start(push_inner.clone()) {
-                    Ok(dispatcher) => {
-                        if let Ok(mut sender) = inner.web_push_sender.write() {
-                            *sender = Some(dispatcher.sender());
+                let (push_dispatcher, push_sender) =
+                    match push::PushDispatcher::start(push_inner.clone()) {
+                        Ok(dispatcher) => {
+                            let sender = dispatcher.sender();
+                            (Some(dispatcher), Some(sender))
                         }
-                        Some(dispatcher)
-                    }
-                    Err(error) => {
-                        eprintln!("[remote-web] Web Push delivery disabled: {error}");
-                        None
-                    }
-                };
+                        Err(error) => {
+                            eprintln!("[remote-web] Web Push delivery disabled: {error}");
+                            (None, None)
+                        }
+                    };
                 Ok(Self {
                     runtime: Some(runtime),
                     shutdown_tx: Some(shutdown_tx),
                     shutdown_permit: Some(shutdown_permit),
                     push_inner,
                     push_dispatcher,
+                    push_sender,
+                    listener_generation,
                     bind_info,
                 })
             }
@@ -517,6 +655,14 @@ impl WebListenerHandle {
             .expect("active web listener must retain cleanup admission")
     }
 
+    pub(crate) fn publish_push_sender(&self) {
+        let (Some(inner), Some(sender)) = (self.push_inner.upgrade(), self.push_sender.clone())
+        else {
+            return;
+        };
+        publish_web_push_sender(&inner, self.listener_generation, sender);
+    }
+
     pub fn shutdown(mut self) {
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
@@ -535,10 +681,8 @@ impl WebListenerHandle {
     }
 
     fn stop_push_dispatcher(&mut self) {
-        if let Some(inner) = self.push_inner.upgrade() {
-            if let Ok(mut sender) = inner.web_push_sender.write() {
-                *sender = None;
-            }
+        if let (Some(inner), Some(sender)) = (self.push_inner.upgrade(), self.push_sender.take()) {
+            clear_web_push_sender_if_current(&inner, self.listener_generation, &sender);
         }
         self.push_dispatcher.take();
     }
@@ -687,17 +831,15 @@ async fn pair_handler(
 
     let nickname = query
         .label
-        .filter(|l| !l.is_empty())
-        .map(|label| label.trim().to_string())
-        .filter(|label| !label.is_empty());
+        .and_then(|label| sanitize_browser_metadata_text(label.trim(), MAX_BROWSER_NICKNAME_BYTES));
     let metadata = browser_metadata_from_headers(&headers);
     let now = now_epoch_ms();
     let client_ip_string = client_ip.to_string();
 
-    let browser_install_id = query
-        .browser_install_id
-        .filter(|value| !value.trim().is_empty())
-        .map(|value| value.trim().to_string());
+    let browser_install_id = match validate_browser_install_id(query.browser_install_id) {
+        Ok(browser_install_id) => browser_install_id,
+        Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+    };
     let paired = match super::mutate_host_config_if(
         &inner,
         |config| config.web.enabled && provided == config.web.pairing_token,
@@ -717,9 +859,14 @@ async fn pair_handler(
                     existing.browser_version = metadata.browser_version.clone();
                     existing.os_family = metadata.os_family.clone();
                     existing.device_class = metadata.device_class.clone();
-                    if nickname.is_some() {
-                        existing.nickname = nickname.clone();
-                    }
+                    existing.nickname = nickname.clone().or_else(|| {
+                        existing.nickname.as_deref().and_then(|nickname| {
+                            sanitize_browser_metadata_text(
+                                nickname.trim(),
+                                MAX_BROWSER_NICKNAME_BYTES,
+                            )
+                        })
+                    });
                     existing.client_id.clone()
                 } else {
                     let client_id = generate_web_client_id();
@@ -1296,16 +1443,19 @@ async fn push_unsubscribe_handler(
     }
 }
 
-/// Shared helper: authenticates a browser cookie and durably advances the
-/// paired client's `last_seen` timestamp before returning the client id.
-///
-/// A valid signature is not enough to authorize a request: if the host config
-/// cannot be read or the `last_seen` update cannot be persisted, this returns
-/// `WebAuthError::Durability` and callers fail closed with a server error.
-pub(crate) fn authenticate_request(
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ValidatedWebAuthentication {
+    pub(super) client_id: String,
+    pub(super) cookie_secret_hex: String,
+}
+
+/// Validates a browser cookie without mutating durable activity. WebSocket
+/// admission carries this exact cookie-secret generation into its final
+/// lifecycle fence and revalidates it there before recording the connection.
+pub(super) fn validate_authenticated_request(
     state: &WebState,
     headers: &HeaderMap,
-) -> Result<String, WebAuthError> {
+) -> Result<ValidatedWebAuthentication, WebAuthError> {
     let inner = state.upgrade_inner().ok_or(WebAuthError::Durability)?;
     let (_, cookie_value) = request_auth_cookie(&inner, headers)?;
 
@@ -1328,6 +1478,26 @@ pub(crate) fn authenticate_request(
     if !paired_ids.iter().any(|id| id == &client_id) {
         return Err(WebAuthError::Unauthorized);
     }
+    Ok(ValidatedWebAuthentication {
+        client_id,
+        cookie_secret_hex,
+    })
+}
+
+/// Shared HTTP helper: authenticates a browser cookie and durably advances the
+/// paired client's `last_seen` timestamp before returning the client id.
+///
+/// A valid signature is not enough to authorize a request: if the host config
+/// cannot be read or the `last_seen` update cannot be persisted, this returns
+/// `WebAuthError::Durability` and callers fail closed with a server error.
+pub(crate) fn authenticate_request(
+    state: &WebState,
+    headers: &HeaderMap,
+) -> Result<String, WebAuthError> {
+    let inner = state.upgrade_inner().ok_or(WebAuthError::Durability)?;
+    let authentication = validate_authenticated_request(state, headers)?;
+    let client_id = authentication.client_id;
+    let cookie_secret_hex = authentication.cookie_secret_hex;
     let now = now_epoch_ms();
     let updated = super::mutate_host_config_if(
         &inner,
@@ -1425,6 +1595,48 @@ mod tests {
     }
 
     #[test]
+    fn stale_web_listener_cleanup_preserves_newer_push_dispatcher_registration() {
+        let service = test_service("web-push-registration-fence");
+        let (old_tx, _old_rx) = std::sync::mpsc::sync_channel(1);
+        let (new_tx, _new_rx) = std::sync::mpsc::sync_channel(1);
+        let old_sender = push::PushSender::single(old_tx);
+        let new_sender = push::PushSender::single(new_tx);
+        publish_web_push_sender(&service.inner, 7, old_sender.clone());
+        publish_web_push_sender(&service.inner, 8, new_sender.clone());
+
+        assert!(!clear_web_push_sender_if_current(
+            &service.inner,
+            7,
+            &old_sender,
+        ));
+        assert!(!clear_web_push_sender_if_current(
+            &service.inner,
+            8,
+            &old_sender,
+        ));
+        let retained = service
+            .inner
+            .web_push_sender
+            .read()
+            .expect("push sender lock")
+            .clone()
+            .expect("newer push sender should remain");
+        assert_eq!(retained.listener_generation, 8);
+        assert!(retained.sender.belongs_to_same_dispatcher(&new_sender));
+        assert!(clear_web_push_sender_if_current(
+            &service.inner,
+            8,
+            &new_sender,
+        ));
+        assert!(service
+            .inner
+            .web_push_sender
+            .read()
+            .expect("push sender lock")
+            .is_none());
+    }
+
+    #[test]
     fn web_state_does_not_retain_host_runtime_after_listener_shutdown() {
         let service = test_service("web-state-weak");
         let host = Arc::downgrade(&service.inner);
@@ -1496,6 +1708,27 @@ mod tests {
             );
         }
         headers
+    }
+
+    fn assert_persistable_browser_identifier(value: &str, max_bytes: usize) {
+        assert!(
+            value.len() <= max_bytes,
+            "browser identifier exceeded its durable byte bound: {} > {max_bytes}",
+            value.len()
+        );
+        assert!(
+            !value.chars().any(|character| {
+                character.is_control()
+                    || matches!(
+                        character,
+                        '\u{200E}'
+                            | '\u{200F}'
+                            | '\u{202A}'..='\u{202E}'
+                            | '\u{2066}'..='\u{2069}'
+                    )
+            }),
+            "browser identifier retained control or bidi formatting characters: {value:?}"
+        );
     }
 
     async fn route_response(state: Arc<WebState>, uri: &str) -> Response {
@@ -2578,6 +2811,140 @@ mod tests {
         );
         assert_eq!(saved.known_hosts.len(), 1);
         assert_eq!(saved.known_hosts[0].server_id, "other-host");
+    }
+
+    #[test]
+    fn browser_user_agent_is_redacted_and_bounded_before_activity_persistence() {
+        let user_agent = format!(
+            "Mozilla/5.0 Bearer ua-secret token=another-secret {}",
+            "LongAgentSegment/123.456 ".repeat(48)
+        );
+        let activity = prepare_browser_connection_activity(
+            "bounded-browser",
+            "127.0.0.8".parse().expect("browser test address"),
+            Some("exact-browser-install-id".to_string()),
+            &test_headers(Some(&user_agent)),
+        )
+        .expect("valid exact browser install id");
+
+        assert_eq!(
+            activity.browser_install_id.as_deref(),
+            Some("exact-browser-install-id")
+        );
+
+        let persisted_user_agent = activity
+            .metadata
+            .user_agent
+            .as_deref()
+            .expect("non-empty user agent");
+        assert_persistable_browser_identifier(persisted_user_agent, 512);
+        assert!(!persisted_user_agent.contains("ua-secret"));
+        assert!(!persisted_user_agent.contains("another-secret"));
+    }
+
+    #[test]
+    fn browser_install_id_rejects_unsafe_or_oversized_identity_without_truncation() {
+        for invalid in [
+            " leading-space".to_string(),
+            "device?token=install-secret".to_string(),
+            "x".repeat(MAX_BROWSER_INSTALL_ID_BYTES + 1),
+        ] {
+            let error = prepare_browser_connection_activity(
+                "bounded-browser",
+                "127.0.0.8".parse().expect("browser test address"),
+                Some(invalid),
+                &HeaderMap::new(),
+            )
+            .expect_err("unsafe browser identity must be rejected");
+            assert!(error.contains("Browser install ID"), "{error}");
+        }
+    }
+
+    #[test]
+    fn pair_handler_rejects_invalid_browser_identity_without_persisting_a_pair() {
+        let _profile = TestProfileGuard::new("web-pair-invalid-install-id");
+        let service = test_service("invalid-install-id");
+        let state = test_state(&service);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+
+        let response = runtime.block_on(async {
+            pair_handler(
+                State(state),
+                ConnectInfo(test_addr()),
+                HeaderMap::new(),
+                Query(PairQuery {
+                    t: Some("PAIR1234".to_string()),
+                    label: None,
+                    browser_install_id: Some("x".repeat(MAX_BROWSER_INSTALL_ID_BYTES + 1)),
+                }),
+            )
+            .await
+        });
+        drop(runtime);
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let path = crate::remote::remote_state_path().expect("isolated remote state path");
+        if path.exists() {
+            assert!(load_remote_machine_state()
+                .expect("load rejected pair state")
+                .host
+                .web
+                .paired_clients
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn pair_handler_redacts_and_bounds_nickname_and_user_agent() {
+        let _profile = TestProfileGuard::new("web-pair-bounded-metadata");
+        let service = test_service("bounded-metadata");
+        let state = test_state(&service);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let nickname = format!("Phone token=nickname-secret {}", "LongNickname ".repeat(32));
+        let user_agent = format!(
+            "Mozilla/5.0 Bearer pair-ua-secret token=pair-header-secret {}",
+            "PairingAgent/987.654 ".repeat(48)
+        );
+        let response = runtime.block_on(async {
+            pair_handler(
+                State(state),
+                ConnectInfo(test_addr()),
+                test_headers(Some(&user_agent)),
+                Query(PairQuery {
+                    t: Some("PAIR1234".to_string()),
+                    label: Some(nickname),
+                    browser_install_id: Some("exact-pair-install-id".to_string()),
+                }),
+            )
+            .await
+        });
+        drop(runtime);
+
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let saved = load_remote_machine_state().expect("load bounded paired browser state");
+        let paired = saved
+            .host
+            .web
+            .paired_clients
+            .first()
+            .expect("paired browser should persist");
+        assert_eq!(paired.browser_install_id, "exact-pair-install-id");
+        let persisted_nickname = paired.nickname.as_deref().expect("bounded nickname");
+        assert_persistable_browser_identifier(persisted_nickname, MAX_BROWSER_NICKNAME_BYTES);
+        assert!(!persisted_nickname.contains("nickname-secret"));
+        let persisted_user_agent = paired
+            .user_agent
+            .as_deref()
+            .expect("paired browser should persist user agent metadata");
+        assert_persistable_browser_identifier(persisted_user_agent, 512);
+        assert!(!persisted_user_agent.contains("pair-ua-secret"));
+        assert!(!persisted_user_agent.contains("pair-header-secret"));
     }
 
     #[test]

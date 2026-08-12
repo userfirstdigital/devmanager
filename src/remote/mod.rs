@@ -54,7 +54,7 @@ const REMOTE_FILE_NAME: &str = "remote.json";
 const SNAPSHOT_BROADCAST_INTERVAL: Duration = Duration::from_millis(33);
 const IDLE_BROADCAST_INTERVAL: Duration = Duration::from_millis(250);
 const PENDING_BOOTSTRAP_RETRY_INTERVAL: Duration = Duration::from_millis(250);
-const REMOTE_WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(500);
+pub(in crate::remote) const REMOTE_WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(500);
 const REMOTE_CALLBACK_TIMEOUT: Duration = Duration::from_millis(500);
 // Loopback connects normally settle immediately. Keep each OS connect attempt
 // below the lifecycle join budget so cancellation is observed before teardown
@@ -68,6 +68,7 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_OUTBOUND_MESSAGES_PER_TICK: usize = 128;
 pub(crate) const MAX_PENDING_REMOTE_REQUESTS: usize = 256;
 const MAX_CONCURRENT_REMOTE_HOST_WORK: usize = 8;
+const MAX_PENDING_HOST_ADMISSION_ATTEMPTS: usize = 16;
 const CLAUDE_COMPOSER_RECONCILIATION_TTL: Duration = Duration::from_secs(5 * 60);
 const MAX_CLAUDE_COMPOSER_RECONCILIATIONS: usize = 1024;
 const CODEX_COMPOSER_RECONCILIATION_TTL: Duration = Duration::from_secs(5 * 60);
@@ -134,6 +135,10 @@ pub struct RemoteHostConfig {
     pub private_key_pem: String,
     pub certificate_fingerprint: String,
     pub paired_clients: Vec<PairedRemoteClient>,
+    /// Durable, explicitly non-successful admission attempts. A process crash
+    /// after Phase A may leave one of these records behind, but it can never be
+    /// interpreted as a Connected/Reconnected activity event or usable auth.
+    pub pending_admission_attempts: Vec<PendingRemoteAdmissionAttempt>,
     pub web: WebConfig,
 }
 
@@ -150,11 +155,22 @@ impl Default for RemoteHostConfig {
             private_key_pem: String::new(),
             certificate_fingerprint: String::new(),
             paired_clients: Vec::new(),
+            pending_admission_attempts: Vec::new(),
             web: WebConfig::default(),
         };
         let _ = transport::ensure_host_tls_material(&mut config);
         config
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default, rename_all = "camelCase")]
+pub struct PendingRemoteAdmissionAttempt {
+    pub attempt_nonce: String,
+    pub source: RemoteAccessSource,
+    pub client_id: String,
+    pub generation: u64,
+    pub attempted_at_epoch_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1609,7 +1625,9 @@ fn save_remote_machine_state_locked(state: &RemoteMachineState) -> Result<(), Pe
     Ok(())
 }
 
-fn persist_host_config_snapshot(config: &RemoteHostConfig) -> Result<(), PersistenceError> {
+pub(crate) fn persist_host_config_snapshot(
+    config: &RemoteHostConfig,
+) -> Result<(), PersistenceError> {
     #[cfg(test)]
     let test_hook = HOST_CONFIG_PERSISTENCE_TEST_HOOK
         .lock()
@@ -1637,6 +1655,136 @@ fn persist_host_config_snapshot(config: &RemoteHostConfig) -> Result<(), Persist
     Ok(())
 }
 
+/// Restores rejected admission candidates only when the durable host section
+/// is still one of those exact candidates. This compare-and-swap prevents a
+/// late compensation from overwriting a newer same-client transaction.
+fn restore_host_config_snapshot_if_any_current(
+    expected: &[&RemoteHostConfig],
+    restore: &RemoteHostConfig,
+) -> Result<bool, PersistenceError> {
+    #[cfg(test)]
+    let test_hook = HOST_CONFIG_PERSISTENCE_TEST_HOOK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    #[cfg(test)]
+    if let Some(hook) = test_hook.as_ref() {
+        hook(restore, HostConfigPersistenceTestPhase::BeforeWrite).map_err(|source| {
+            PersistenceError::Io {
+                path: remote_state_path().unwrap_or_else(|_| PathBuf::from(REMOTE_FILE_NAME)),
+                source,
+            }
+        })?;
+    }
+    let _guard = REMOTE_STATE_SAVE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut state = load_remote_machine_state_locked()?;
+    if !expected.iter().any(|candidate| state.host == **candidate) {
+        return Ok(false);
+    }
+    state.host = restore.clone();
+    save_remote_machine_state_locked(&state)?;
+    #[cfg(test)]
+    if let Some(hook) = test_hook.as_ref() {
+        let _ = hook(restore, HostConfigPersistenceTestPhase::AfterWrite);
+    }
+    Ok(true)
+}
+
+pub(crate) struct StagedHostConfigMutation<T> {
+    pub(crate) base_revision: u64,
+    pub(crate) base: RemoteHostConfig,
+    pub(crate) candidate: RemoteHostConfig,
+    pub(crate) result: T,
+}
+
+pub(crate) fn stage_host_config_mutation<T>(
+    inner: &Arc<RemoteHostInner>,
+    mutate: impl FnOnce(&mut RemoteHostConfig) -> T,
+) -> Result<StagedHostConfigMutation<T>, String> {
+    let base_revision = inner.config_revision.load(Ordering::Acquire);
+    let base = inner
+        .config
+        .read()
+        .map_err(|_| "host config unavailable".to_string())?
+        .clone();
+    let mut candidate = base.clone();
+    let result = mutate(&mut candidate);
+    Ok(StagedHostConfigMutation {
+        base_revision,
+        base,
+        candidate,
+        result,
+    })
+}
+
+fn commit_staged_host_config_mutation<T>(
+    inner: &Arc<RemoteHostInner>,
+    staged: &StagedHostConfigMutation<T>,
+) -> Result<(), String> {
+    if inner.config_revision.load(Ordering::Acquire) != staged.base_revision {
+        return Err("host config changed during its serialized transaction".to_string());
+    }
+    let mut config = inner
+        .config
+        .write()
+        .map_err(|_| "host config unavailable".to_string())?;
+    if *config != staged.base {
+        return Err("host config changed during its serialized transaction".to_string());
+    }
+    *config = staged.candidate.clone();
+    drop(config);
+    bump_host_config_revision(inner);
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HostConfigAdmissionError {
+    Persistence(String),
+    DurabilityUncertain { attempt_id: u64, detail: String },
+}
+
+impl std::fmt::Display for HostConfigAdmissionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Persistence(detail) => formatter.write_str(detail),
+            Self::DurabilityUncertain { attempt_id, detail } => write!(
+                formatter,
+                "Remote host configuration durability is uncertain for attempt {attempt_id}: {detail}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for HostConfigAdmissionError {}
+
+pub(crate) fn compensate_rejected_host_config_admission<T>(
+    staged: &StagedHostConfigMutation<T>,
+    attempt_id: u64,
+) -> Result<(), HostConfigAdmissionError> {
+    compensate_rejected_host_config_candidates(&[&staged.candidate], &staged.base, attempt_id)
+}
+
+pub(crate) fn compensate_rejected_host_config_candidates(
+    expected: &[&RemoteHostConfig],
+    restore: &RemoteHostConfig,
+    attempt_id: u64,
+) -> Result<(), HostConfigAdmissionError> {
+    match restore_host_config_snapshot_if_any_current(expected, restore) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(HostConfigAdmissionError::DurabilityUncertain {
+            attempt_id,
+            detail: "the durable host config no longer matched the rejected candidate; no newer state was overwritten"
+                .to_string(),
+        }),
+        Err(error) => Err(HostConfigAdmissionError::DurabilityUncertain {
+            attempt_id,
+            detail: format!("conditional compensation failed: {error}"),
+        }),
+    }
+}
+
 pub fn save_remote_known_hosts(known_hosts: &[KnownRemoteHost]) -> Result<(), PersistenceError> {
     let _guard = REMOTE_STATE_SAVE_LOCK
         .lock()
@@ -1650,63 +1798,80 @@ pub(crate) fn mutate_host_config_if<T>(
     inner: &Arc<RemoteHostInner>,
     condition: impl FnOnce(&RemoteHostConfig) -> bool,
     mutate: impl FnOnce(&mut RemoteHostConfig) -> T,
-) -> Result<Option<T>, String> {
-    let _update_guard = inner
-        .config_update_lock
-        .lock()
-        .map_err(|_| "host config update unavailable".to_string())?;
-    let Some((result, snapshot, previous)) = ({
-        let Ok(mut config) = inner.config.write() else {
-            return Err("host config unavailable".to_string());
-        };
-        if !condition(&config) {
-            None
-        } else {
-            let previous = config.clone();
-            let result = mutate(&mut config);
-            Some((result, config.clone(), previous))
-        }
-    }) else {
+) -> Result<Option<T>, HostConfigAdmissionError> {
+    let _update_guard = inner.host_config_tx.lock().map_err(|_| {
+        HostConfigAdmissionError::Persistence("host config update unavailable".to_string())
+    })?;
+    let matches = inner
+        .config
+        .read()
+        .map_err(|_| HostConfigAdmissionError::Persistence("host config unavailable".to_string()))
+        .map(|config| condition(&config))?;
+    if !matches {
         return Ok(None);
-    };
-
-    if let Err(error) = persist_host_config_snapshot(&snapshot) {
-        if let Ok(mut config) = inner.config.write() {
-            *config = previous;
-        }
-        return Err(error.to_string());
     }
-
-    bump_host_config_revision(inner);
-    Ok(Some(result))
+    let attempt_id = inner
+        .next_host_config_attempt_id
+        .fetch_add(1, Ordering::Relaxed);
+    let staged =
+        stage_host_config_mutation(inner, mutate).map_err(HostConfigAdmissionError::Persistence)?;
+    persist_host_config_snapshot(&staged.candidate)
+        .map_err(|error| HostConfigAdmissionError::Persistence(error.to_string()))?;
+    if let Err(error) = commit_staged_host_config_mutation(inner, &staged) {
+        compensate_rejected_host_config_admission(&staged, attempt_id)?;
+        return Err(HostConfigAdmissionError::Persistence(error));
+    }
+    Ok(Some(staged.result))
 }
 
 pub(crate) fn mutate_host_config<T>(
     inner: &Arc<RemoteHostInner>,
     mutate: impl FnOnce(&mut RemoteHostConfig) -> T,
-) -> Result<T, String> {
-    let _update_guard = inner
-        .config_update_lock
-        .lock()
-        .map_err(|_| "host config update unavailable".to_string())?;
-    let (result, snapshot, previous) = {
-        let Ok(mut config) = inner.config.write() else {
-            return Err("host config unavailable".to_string());
-        };
-        let previous = config.clone();
-        let result = mutate(&mut config);
-        (result, config.clone(), previous)
-    };
-
-    if let Err(error) = persist_host_config_snapshot(&snapshot) {
-        if let Ok(mut config) = inner.config.write() {
-            *config = previous;
-        }
-        return Err(error.to_string());
+) -> Result<T, HostConfigAdmissionError> {
+    let _update_guard = inner.host_config_tx.lock().map_err(|_| {
+        HostConfigAdmissionError::Persistence("host config update unavailable".to_string())
+    })?;
+    let attempt_id = inner
+        .next_host_config_attempt_id
+        .fetch_add(1, Ordering::Relaxed);
+    let staged =
+        stage_host_config_mutation(inner, mutate).map_err(HostConfigAdmissionError::Persistence)?;
+    persist_host_config_snapshot(&staged.candidate)
+        .map_err(|error| HostConfigAdmissionError::Persistence(error.to_string()))?;
+    if let Err(error) = commit_staged_host_config_mutation(inner, &staged) {
+        compensate_rejected_host_config_admission(&staged, attempt_id)?;
+        return Err(HostConfigAdmissionError::Persistence(error));
     }
+    Ok(staged.result)
+}
 
-    bump_host_config_revision(inner);
-    Ok(result)
+pub(crate) fn append_pending_admission_attempt(
+    config: &mut RemoteHostConfig,
+    attempt: PendingRemoteAdmissionAttempt,
+) {
+    config
+        .pending_admission_attempts
+        .retain(|existing| existing.attempt_nonce != attempt.attempt_nonce);
+    if config.pending_admission_attempts.len() >= MAX_PENDING_HOST_ADMISSION_ATTEMPTS {
+        let overflow = config
+            .pending_admission_attempts
+            .len()
+            .saturating_add(1)
+            .saturating_sub(MAX_PENDING_HOST_ADMISSION_ATTEMPTS);
+        config.pending_admission_attempts.drain(..overflow);
+    }
+    config.pending_admission_attempts.push(attempt);
+}
+
+pub(crate) fn remove_pending_admission_attempt(
+    config: &mut RemoteHostConfig,
+    attempt_nonce: &str,
+) -> bool {
+    let before = config.pending_admission_attempts.len();
+    config
+        .pending_admission_attempts
+        .retain(|attempt| attempt.attempt_nonce != attempt_nonce);
+    config.pending_admission_attempts.len() != before
 }
 
 fn append_native_connection_activity(
@@ -1714,6 +1879,7 @@ fn append_native_connection_activity(
     client_id: String,
     label: String,
     ip_address: Option<String>,
+    occurred_at_epoch_ms: u64,
 ) {
     let had_previous_connect = config.web.activity_log.iter().any(|event| {
         event.source == RemoteAccessSource::NativeApp
@@ -1735,7 +1901,7 @@ fn append_native_connection_activity(
             },
             label,
             ip_address,
-            event_at_epoch_ms: Some(now_epoch_ms()),
+            event_at_epoch_ms: Some(occurred_at_epoch_ms),
             browser_family: None,
             browser_version: None,
             os_family: None,
@@ -1945,7 +2111,7 @@ impl RemoteWorkerJoinHandle {
 }
 
 #[derive(Debug)]
-enum RemoteWorkerSpawnError {
+pub(in crate::remote) enum RemoteWorkerSpawnError {
     AdmissionUnavailable {
         name: String,
     },
@@ -1992,7 +2158,7 @@ impl Drop for RemoteWorkerCompletion {
 }
 
 impl RemoteWorker {
-    fn try_spawn(
+    pub(in crate::remote) fn try_spawn(
         name: impl Into<String>,
         done: Option<Arc<AtomicBool>>,
         job: impl FnOnce() + Send + 'static,
@@ -2624,7 +2790,11 @@ fn defer_remote_worker(inner: &Arc<RemoteHostInner>, mut worker: RemoteWorker) {
     });
 }
 
-fn settle_remote_worker(inner: &Arc<RemoteHostInner>, mut worker: RemoteWorker, deadline: Instant) {
+pub(in crate::remote) fn settle_remote_worker(
+    inner: &Arc<RemoteHostInner>,
+    mut worker: RemoteWorker,
+    deadline: Instant,
+) {
     let Some(handle) = worker.handle.as_ref() else {
         return;
     };
@@ -3053,9 +3223,20 @@ fn wake_native_listener(inner: &RemoteHostInner) {
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct RegisteredWebPushSender {
+    pub(crate) listener_generation: u64,
+    pub(crate) sender: web::push::PushSender,
+}
+
 pub(crate) struct RemoteHostInner {
     config: RwLock<RemoteHostConfig>,
-    config_update_lock: Mutex<()>,
+    /// Serializes every host-config transaction, including its durable write.
+    /// This is always the first authority lock for a host-config writer. A
+    /// browser transaction may then take `web_control_operation_lock` and a
+    /// lifecycle fence, but no path may acquire this serializer while holding
+    /// either of those locks.
+    host_config_tx: Mutex<()>,
     /// Serializes listener/runtime restarts without holding the config update
     /// lock across worker joins. Native workers may need that config lock while
     /// completing their disconnect cleanup.
@@ -3099,9 +3280,11 @@ pub(crate) struct RemoteHostInner {
     #[cfg(test)]
     client_registration_test_hook:
         RwLock<Option<Arc<dyn Fn(ClientRegistrationTestEvent) + Send + Sync>>>,
+    #[cfg(test)]
+    browser_admission_clock_test_hook: RwLock<Option<Arc<dyn Fn() -> u64 + Send + Sync>>>,
     /// Non-blocking admission handle for the web listener's bounded Push
     /// delivery pool. It is absent whenever the listener is stopped.
-    web_push_sender: RwLock<Option<web::push::PushSender>>,
+    web_push_sender: RwLock<Option<RegisteredWebPushSender>>,
     session_bootstrap_provider: RwLock<Option<SessionBootstrapProvider>>,
     terminal_input_handler: RwLock<Option<TerminalInputHandler>>,
     terminal_resize_handler: RwLock<Option<TerminalResizeHandler>>,
@@ -3130,6 +3313,7 @@ pub(crate) struct RemoteHostInner {
     next_connection_id: AtomicU64,
     next_output_chunk_seq: AtomicU64,
     next_push_event_id: AtomicU64,
+    next_host_config_attempt_id: AtomicU64,
     native_runtime_generation: AtomicU64,
     stop_flag: AtomicBool,
     worker_residue_count: AtomicUsize,
@@ -3181,7 +3365,10 @@ impl Drop for SemanticPublicationEpoch<'_> {
 #[derive(Clone)]
 struct ConnectedRemoteClient {
     client_id: String,
-    sender: Option<mpsc::Sender<ServerMessage>>,
+    /// Arc identity is the native registration token. A stale sender failure
+    /// may remove only the exact map entry from which that sender was cloned,
+    /// never a newer registration that reused the connection id.
+    sender: Option<Arc<mpsc::Sender<ServerMessage>>>,
     /// Present only for browser clients. Browser-only semantic/control frames
     /// must never enter the native MessagePack `ServerMessage` protocol.
     web_sender: Option<BrowserOutboundSender>,
@@ -3201,7 +3388,7 @@ struct ConnectedRemoteClient {
 
 #[derive(Clone)]
 enum ClientDeliveryTarget {
-    Native(mpsc::Sender<ServerMessage>),
+    Native(Arc<mpsc::Sender<ServerMessage>>),
     Browser {
         sender: BrowserOutboundSender,
         client_id: String,
@@ -3251,12 +3438,28 @@ fn revoke_failed_delivery(
         } => {
             web::bridge::revoke_web_connection(inner, connection_id, &client_id, &tombstone, None);
         }
-        ClientDeliveryTarget::Native(_) => {
-            if let Ok(mut clients) = inner.clients.lock() {
-                clients.remove(&connection_id);
-            }
+        ClientDeliveryTarget::Native(sender) => {
+            remove_exact_native_registration(inner, connection_id, &sender);
         }
     }
+}
+
+fn remove_exact_native_registration(
+    inner: &Arc<RemoteHostInner>,
+    connection_id: u64,
+    sender: &Arc<mpsc::Sender<ServerMessage>>,
+) -> bool {
+    inner
+        .clients
+        .lock()
+        .map(|mut clients| {
+            let exact = clients
+                .get(&connection_id)
+                .and_then(|client| client.sender.as_ref())
+                .is_some_and(|registered| Arc::ptr_eq(registered, sender));
+            exact && clients.remove(&connection_id).is_some()
+        })
+        .unwrap_or(false)
 }
 
 #[derive(Clone)]
@@ -3383,7 +3586,7 @@ impl RemoteHostService {
         let _ = transport::ensure_host_tls_material(&mut config);
         let inner = Arc::new(RemoteHostInner {
             config: RwLock::new(config.clone()),
-            config_update_lock: Mutex::new(()),
+            host_config_tx: Mutex::new(()),
             lifecycle_lock: Mutex::new(()),
             config_revision: AtomicU64::new(1),
             snapshot_state_lock: Mutex::new(()),
@@ -3415,6 +3618,8 @@ impl RemoteHostService {
             native_worker_registration_test_hook: RwLock::new(None),
             #[cfg(test)]
             client_registration_test_hook: RwLock::new(None),
+            #[cfg(test)]
+            browser_admission_clock_test_hook: RwLock::new(None),
             web_push_sender: RwLock::new(None),
             session_bootstrap_provider: RwLock::new(None),
             terminal_input_handler: RwLock::new(None),
@@ -3439,6 +3644,7 @@ impl RemoteHostService {
             next_connection_id: AtomicU64::new(1),
             next_output_chunk_seq: AtomicU64::new(1),
             next_push_event_id: AtomicU64::new(1),
+            next_host_config_attempt_id: AtomicU64::new(1),
             native_runtime_generation: AtomicU64::new(1),
             stop_flag: AtomicBool::new(false),
             worker_residue_count: AtomicUsize::new(0),
@@ -3484,7 +3690,7 @@ impl RemoteHostService {
         config.web.ensure_secrets();
         let _ = transport::ensure_host_tls_material(&mut config);
         {
-            let Ok(_update_guard) = self.inner.config_update_lock.lock() else {
+            let Ok(_update_guard) = self.inner.host_config_tx.lock() else {
                 return;
             };
             if let Ok(mut slot) = self.inner.config.write() {
@@ -3520,7 +3726,8 @@ impl RemoteHostService {
                 config.bind_address = bind_address.clone();
                 config.port = port;
             },
-        )?
+        )
+        .map_err(|error| error.to_string())?
         .is_some();
         if changed {
             self.restart_threads();
@@ -3554,7 +3761,8 @@ impl RemoteHostService {
                 config.web.port = port;
                 config.web.ensure_secrets();
             },
-        )?
+        )
+        .map_err(|error| error.to_string())?
         .is_some();
         if changed {
             self.restart_threads();
@@ -3566,7 +3774,8 @@ impl RemoteHostService {
         let token = generate_pairing_token();
         mutate_host_config(&self.inner, |config| {
             config.pairing_token = token.clone();
-        })?;
+        })
+        .map_err(|error| error.to_string())?;
         Ok(token)
     }
 
@@ -3574,7 +3783,8 @@ impl RemoteHostService {
         let token = web::generate_web_pairing_token();
         mutate_host_config(&self.inner, |config| {
             config.web.pairing_token = token.clone();
-        })?;
+        })
+        .map_err(|error| error.to_string())?;
         Ok(token)
     }
 
@@ -4520,7 +4730,7 @@ impl RemoteHostService {
             .web_push_sender
             .read()
             .ok()
-            .and_then(|sender| sender.clone());
+            .and_then(|sender| sender.as_ref().map(|registered| registered.sender.clone()));
         let Some(sender) = sender else {
             return;
         };
@@ -4929,26 +5139,61 @@ impl RemoteHostService {
     }
 
     pub fn revoke_paired_web_client(&self, client_id: &str) -> bool {
-        let _operation = self
-            .inner
-            .web_control_operation_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let removed = match mutate_host_config(&self.inner, |config| {
-            let before = config.web.paired_clients.len();
-            config
-                .web
-                .paired_clients
-                .retain(|client| client.client_id != client_id);
-            config.web.activity_log.retain(|event| {
-                !(event.source == RemoteAccessSource::Browser && event.client_id == client_id)
-            });
-            config.web.push.remove_client(client_id);
-            config.web.paired_clients.len() != before
-        }) {
-            Ok(removed) => removed,
+        let _transaction = match self.inner.host_config_tx.lock() {
+            Ok(transaction) => transaction,
             Err(_) => return false,
         };
+        let attempt_id = self
+            .inner
+            .next_host_config_attempt_id
+            .fetch_add(1, Ordering::Relaxed);
+        let staged = {
+            let _operation = self
+                .inner
+                .web_control_operation_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match stage_host_config_mutation(&self.inner, |config| {
+                let before = config.web.paired_clients.len();
+                config
+                    .web
+                    .paired_clients
+                    .retain(|client| client.client_id != client_id);
+                config.web.activity_log.retain(|event| {
+                    !(event.source == RemoteAccessSource::Browser && event.client_id == client_id)
+                });
+                config.web.push.remove_client(client_id);
+                config.web.paired_clients.len() != before
+            }) {
+                Ok(staged) => staged,
+                Err(_) => return false,
+            }
+        };
+        if persist_host_config_snapshot(&staged.candidate).is_err() {
+            return false;
+        }
+        let commit_result = {
+            let _operation = self
+                .inner
+                .web_control_operation_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            commit_staged_host_config_mutation(&self.inner, &staged)
+        };
+        if let Err(error) = commit_result {
+            let error = match compensate_rejected_host_config_admission(&staged, attempt_id) {
+                Ok(()) => HostConfigAdmissionError::Persistence(error),
+                Err(error) => error,
+            };
+            set_last_connection_note(
+                &self.inner,
+                format!("Browser revoke durability failed: {error}"),
+                true,
+            );
+            return false;
+        };
+        let removed = staged.result;
+        drop(_transaction);
 
         let connections = self
             .inner
@@ -4986,32 +5231,67 @@ impl RemoteHostService {
     }
 
     pub fn reset_browser_access(&self) -> bool {
-        let _operation = self
-            .inner
-            .web_control_operation_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let removed_client_ids = match mutate_host_config(&self.inner, |config| {
-            let removed_ids = config
-                .web
-                .paired_clients
-                .iter()
-                .map(|client| client.client_id.clone())
-                .collect::<Vec<_>>();
-            config.web.paired_clients.clear();
-            config.web.push.enabled_client_ids.clear();
-            config.web.push.subscriptions.clear();
-            config
-                .web
-                .activity_log
-                .retain(|event| event.source != RemoteAccessSource::Browser);
-            config.web.pairing_token = web::generate_web_pairing_token();
-            config.web.cookie_secret_hex = web::generate_cookie_secret_hex();
-            removed_ids
-        }) {
-            Ok(removed_client_ids) => removed_client_ids,
+        let _transaction = match self.inner.host_config_tx.lock() {
+            Ok(transaction) => transaction,
             Err(_) => return false,
         };
+        let attempt_id = self
+            .inner
+            .next_host_config_attempt_id
+            .fetch_add(1, Ordering::Relaxed);
+        let staged = {
+            let _operation = self
+                .inner
+                .web_control_operation_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match stage_host_config_mutation(&self.inner, |config| {
+                let removed_ids = config
+                    .web
+                    .paired_clients
+                    .iter()
+                    .map(|client| client.client_id.clone())
+                    .collect::<Vec<_>>();
+                config.web.paired_clients.clear();
+                config.web.push.enabled_client_ids.clear();
+                config.web.push.subscriptions.clear();
+                config
+                    .web
+                    .activity_log
+                    .retain(|event| event.source != RemoteAccessSource::Browser);
+                config.web.pairing_token = web::generate_web_pairing_token();
+                config.web.cookie_secret_hex = web::generate_cookie_secret_hex();
+                removed_ids
+            }) {
+                Ok(staged) => staged,
+                Err(_) => return false,
+            }
+        };
+        if persist_host_config_snapshot(&staged.candidate).is_err() {
+            return false;
+        }
+        let commit_result = {
+            let _operation = self
+                .inner
+                .web_control_operation_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            commit_staged_host_config_mutation(&self.inner, &staged)
+        };
+        if let Err(error) = commit_result {
+            let error = match compensate_rejected_host_config_admission(&staged, attempt_id) {
+                Ok(()) => HostConfigAdmissionError::Persistence(error),
+                Err(error) => error,
+            };
+            set_last_connection_note(
+                &self.inner,
+                format!("Browser reset durability failed: {error}"),
+                true,
+            );
+            return false;
+        };
+        let removed_client_ids = staged.result;
+        drop(_transaction);
         let removed_client_ids: HashSet<String> = removed_client_ids.into_iter().collect();
         let connections = self
             .inner
@@ -5279,6 +5559,9 @@ impl RemoteHostService {
                             && self.inner.native_runtime_generation.load(Ordering::Acquire)
                                 == generation
                         {
+                            if let Some(handle) = stale_handle.as_ref() {
+                                handle.publish_push_sender();
+                            }
                             *self
                                 .inner
                                 .web_listener
@@ -6188,7 +6471,7 @@ fn settle_local_port_forward_worker(
     }
 }
 
-fn settle_unowned_remote_worker(mut worker: RemoteWorker, deadline: Instant) {
+pub(in crate::remote) fn settle_unowned_remote_worker(mut worker: RemoteWorker, deadline: Instant) {
     let Some(handle) = worker.handle.as_ref() else {
         return;
     };
@@ -7846,14 +8129,12 @@ fn handle_client_connection_with_weak(
         return;
     }
 
-    let (tx, rx) = mpsc::channel::<ServerMessage>();
-
-    let (client_id, client_token, _client_label) = match authenticate_client_and_record_activity(
-        &inner,
-        hello,
-        peer_ip.clone(),
-    ) {
-        Ok(auth) => auth,
+    let authentication = match prepare_native_client_authentication(hello, Some(peer_ip.clone()))
+        .and_then(|authentication| {
+            validate_prepared_native_authentication(&inner, &authentication)?;
+            Ok(authentication)
+        }) {
+        Ok(authentication) => authentication,
         Err(message) => {
             set_last_connection_note(
                 &inner,
@@ -7872,9 +8153,13 @@ fn handle_client_connection_with_weak(
             return;
         }
     };
+    let client_id = authentication.client_id().to_string();
     if native_connection_should_stop(&inner, native_runtime_generation) {
         return;
     }
+
+    let (tx, rx) = mpsc::channel::<ServerMessage>();
+    let native_sender = Arc::new(tx.clone());
 
     let controller_client_id = inner
         .controller_client_id
@@ -7889,64 +8174,60 @@ fn handle_client_connection_with_weak(
     let authority_hash = stable_hash(&snapshot.port_authorities);
     #[cfg(test)]
     notify_client_registration(&inner, ClientRegistrationTestEvent::BeforeFence);
-    let _registered = {
-        // Final admission is linearized with restart/root teardown. The
-        // earlier stop check only avoids snapshot work; without this gate a
-        // generation can be revoked while an authenticated connection is
-        // preparing its client record and then appear after restart drained
-        // the old generation.
-        let _lifecycle = inner
-            .lifecycle_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if native_connection_should_stop(&inner, native_runtime_generation) {
-            false
-        } else if let Ok(mut clients) = inner.clients.lock() {
-            clients.insert(
-                connection_id,
-                ConnectedRemoteClient {
-                    client_id: client_id.clone(),
-                    sender: Some(tx.clone()),
-                    web_sender: None,
-                    web_tombstone: None,
-                    semantic_cursors: HashMap::new(),
-                    subscribed_session_ids: HashSet::new(),
-                    bootstrapped_session_ids: HashSet::new(),
-                    bootstrap_pending_session_ids: HashSet::new(),
-                    focused_session_id: snapshot.runtime_state.active_session_id.clone(),
-                    last_app_hash: app_hash,
-                    last_runtime_hash: runtime_hash,
-                    last_port_hash: port_hash ^ authority_hash,
-                    last_controller_client_id: controller_client_id.clone(),
-                    last_you_have_control: you_have_control,
-                    last_snapshot_revision: inner.snapshot_revision.load(Ordering::Relaxed),
-                },
+    let authenticated = admit_native_client(
+        &inner,
+        native_runtime_generation,
+        connection_id,
+        &authentication,
+        ConnectedRemoteClient {
+            client_id: client_id.clone(),
+            sender: Some(native_sender.clone()),
+            web_sender: None,
+            web_tombstone: None,
+            semantic_cursors: HashMap::new(),
+            subscribed_session_ids: HashSet::new(),
+            bootstrapped_session_ids: HashSet::new(),
+            bootstrap_pending_session_ids: HashSet::new(),
+            focused_session_id: snapshot.runtime_state.active_session_id.clone(),
+            last_app_hash: app_hash,
+            last_runtime_hash: runtime_hash,
+            last_port_hash: port_hash ^ authority_hash,
+            last_controller_client_id: controller_client_id.clone(),
+            last_you_have_control: you_have_control,
+            last_snapshot_revision: inner.snapshot_revision.load(Ordering::Relaxed),
+        },
+    );
+    let (client_id, client_token, _client_label) = match authenticated {
+        Ok(Some(authenticated)) => authenticated,
+        Ok(None) => {
+            #[cfg(test)]
+            notify_client_registration(&inner, ClientRegistrationTestEvent::Rejected);
+            let _ = stream.sock.shutdown(Shutdown::Both);
+            return;
+        }
+        Err(error) => {
+            let message = error.to_string();
+            #[cfg(test)]
+            notify_client_registration(&inner, ClientRegistrationTestEvent::Rejected);
+            set_last_connection_note(
+                &inner,
+                format!("Rejected remote client from {peer_label}: {message}"),
+                true,
             );
-            true
-        } else {
-            false
+            let _ = set_server_handshake_write_deadline(&mut stream, handshake_deadline);
+            let _ = write_message_until_deadline(
+                &mut stream,
+                &ServerMessage::HelloErr { message },
+                handshake_deadline,
+            );
+            return;
         }
     };
     #[cfg(test)]
-    notify_client_registration(
-        &inner,
-        if _registered {
-            ClientRegistrationTestEvent::Registered
-        } else {
-            ClientRegistrationTestEvent::Rejected
-        },
-    );
-    if _registered {
-        notify_broadcaster(&inner);
-    }
+    notify_client_registration(&inner, ClientRegistrationTestEvent::Registered);
+    notify_broadcaster(&inner);
     #[cfg(test)]
-    if _registered {
-        notify_native_lifecycle(&inner, NativeLifecycleTestEvent::ClientRegistered);
-    }
-    if !_registered {
-        let _ = stream.sock.shutdown(Shutdown::Both);
-        return;
-    }
+    notify_native_lifecycle(&inner, NativeLifecycleTestEvent::ClientRegistered);
 
     let hello_ok = ServerMessage::HelloOk {
         protocol_version: PROTOCOL_VERSION,
@@ -7970,16 +8251,13 @@ fn handle_client_connection_with_weak(
         eprintln!(
             "[remote] handshake reply failed for connection {connection_id} ({client_id} from {peer_label}): {error}"
         );
-        if let Ok(mut clients) = inner.clients.lock() {
-            let _removed = clients.remove(&connection_id).is_some();
-            drop(clients);
-            if _removed {
-                notify_broadcaster(&inner);
-            }
-            #[cfg(test)]
-            if _removed {
-                notify_native_lifecycle(&inner, NativeLifecycleTestEvent::ClientRemoved);
-            }
+        let removed = remove_exact_native_registration(&inner, connection_id, &native_sender);
+        if removed {
+            notify_broadcaster(&inner);
+        }
+        #[cfg(test)]
+        if removed {
+            notify_native_lifecycle(&inner, NativeLifecycleTestEvent::ClientRemoved);
         }
         return;
     }
@@ -7995,6 +8273,14 @@ fn handle_client_connection_with_weak(
             format!("Remote native socket could not enter readiness mode: {error}"),
             true,
         );
+        let removed = remove_exact_native_registration(&inner, connection_id, &native_sender);
+        if removed {
+            notify_broadcaster(&inner);
+        }
+        #[cfg(test)]
+        if removed {
+            notify_native_lifecycle(&inner, NativeLifecycleTestEvent::ClientRemoved);
+        }
         return;
     }
 
@@ -8234,17 +8520,15 @@ fn handle_client_connection_with_weak(
         return;
     };
     let _ = stream.sock.shutdown(Shutdown::Both);
-    let _removed = inner
-        .clients
-        .lock()
-        .map(|mut clients| clients.remove(&connection_id).is_some())
-        .unwrap_or(false);
+    let _removed = remove_exact_native_registration(&inner, connection_id, &native_sender);
     if _removed {
         notify_broadcaster(&inner);
     }
-    if let Ok(mut controller) = inner.controller_client_id.write() {
-        if controller.as_deref() == Some(client_id.as_str()) {
-            *controller = None;
+    if _removed {
+        if let Ok(mut controller) = inner.controller_client_id.write() {
+            if controller.as_deref() == Some(client_id.as_str()) {
+                *controller = None;
+            }
         }
     }
     set_last_connection_note(
@@ -8256,7 +8540,7 @@ fn handle_client_connection_with_weak(
     // for an ordinary client disconnect, but do not begin filesystem work after
     // the host generation has been cancelled; root teardown must remain
     // cooperative and bounded under a slow profile filesystem.
-    if !native_connection_should_stop(&inner, native_runtime_generation) {
+    if _removed && !native_connection_should_stop(&inner, native_runtime_generation) {
         if let Err(error) = mutate_host_config_if(
             &inner,
             |config| {
@@ -8289,27 +8573,130 @@ fn handle_client_connection_with_weak(
     }
 }
 
-#[cfg(test)]
-fn authenticate_client(
-    inner: &Arc<RemoteHostInner>,
-    hello: ClientMessage,
-) -> Result<(String, String, String), String> {
-    authenticate_client_with_activity(inner, hello, None)
+enum PreparedNativeClientAuth {
+    PairToken {
+        pairing_token: String,
+        client_id: String,
+        client_token: String,
+    },
+    ClientToken {
+        client_id: String,
+        auth_token: String,
+    },
 }
 
-fn authenticate_client_and_record_activity(
-    inner: &Arc<RemoteHostInner>,
-    hello: ClientMessage,
-    ip_address: Option<String>,
-) -> Result<(String, String, String), String> {
-    authenticate_client_with_activity(inner, hello, Some(ip_address))
+struct PreparedNativeClientAuthentication {
+    auth: PreparedNativeClientAuth,
+    client_label: String,
+    record_activity: bool,
+    activity_ip_address: Option<String>,
 }
 
-fn authenticate_client_with_activity(
-    inner: &Arc<RemoteHostInner>,
+impl PreparedNativeClientAuthentication {
+    fn client_id(&self) -> &str {
+        match &self.auth {
+            PreparedNativeClientAuth::PairToken { client_id, .. }
+            | PreparedNativeClientAuth::ClientToken { client_id, .. } => client_id,
+        }
+    }
+
+    fn matches(&self, config: &RemoteHostConfig) -> bool {
+        match &self.auth {
+            PreparedNativeClientAuth::PairToken { pairing_token, .. } => {
+                pairing_token.trim() == config.pairing_token.trim()
+            }
+            PreparedNativeClientAuth::ClientToken {
+                client_id,
+                auth_token,
+            } => config
+                .paired_clients
+                .iter()
+                .any(|client| client.client_id == *client_id && client.auth_token == *auth_token),
+        }
+    }
+
+    fn rejection_message(&self) -> String {
+        match &self.auth {
+            PreparedNativeClientAuth::PairToken { .. } => {
+                "Pairing token did not match the host.".to_string()
+            }
+            PreparedNativeClientAuth::ClientToken { .. } => {
+                "Saved remote credentials are no longer valid.".to_string()
+            }
+        }
+    }
+
+    fn apply_at(
+        &self,
+        config: &mut RemoteHostConfig,
+        occurred_at_epoch_ms: u64,
+    ) -> (String, String, String) {
+        match &self.auth {
+            PreparedNativeClientAuth::PairToken {
+                client_id,
+                client_token,
+                ..
+            } => {
+                config.paired_clients.push(PairedRemoteClient {
+                    client_id: client_id.clone(),
+                    label: self.client_label.clone(),
+                    auth_token: client_token.clone(),
+                    last_seen_epoch_ms: Some(occurred_at_epoch_ms),
+                });
+                if self.record_activity {
+                    append_native_connection_activity(
+                        config,
+                        client_id.clone(),
+                        self.client_label.clone(),
+                        self.activity_ip_address.clone(),
+                        occurred_at_epoch_ms,
+                    );
+                }
+                (
+                    client_id.clone(),
+                    client_token.clone(),
+                    self.client_label.clone(),
+                )
+            }
+            PreparedNativeClientAuth::ClientToken {
+                client_id,
+                auth_token,
+            } => {
+                let authenticated = {
+                    let client = config
+                        .paired_clients
+                        .iter_mut()
+                        .find(|client| {
+                            client.client_id == *client_id && client.auth_token == *auth_token
+                        })
+                        .expect("serialized native client validation must remain true");
+                    client.label = self.client_label.clone();
+                    client.last_seen_epoch_ms = Some(occurred_at_epoch_ms);
+                    (
+                        client.client_id.clone(),
+                        client.auth_token.clone(),
+                        client.label.clone(),
+                    )
+                };
+                if self.record_activity {
+                    append_native_connection_activity(
+                        config,
+                        authenticated.0.clone(),
+                        authenticated.2.clone(),
+                        self.activity_ip_address.clone(),
+                        occurred_at_epoch_ms,
+                    );
+                }
+                authenticated
+            }
+        }
+    }
+}
+
+fn prepare_native_client_authentication(
     hello: ClientMessage,
     activity_ip_address: Option<Option<String>>,
-) -> Result<(String, String, String), String> {
+) -> Result<PreparedNativeClientAuthentication, String> {
     let ClientMessage::Hello {
         protocol_version,
         client_label,
@@ -8334,74 +8721,231 @@ fn authenticate_client_with_activity(
     let record_activity = activity_ip_address.is_some();
     let activity_ip_address = activity_ip_address.flatten();
 
-    match auth {
-        ClientAuth::PairToken { token } => {
-            let client_id = generate_secret("client");
-            let client_token = generate_secret("auth");
-            mutate_host_config_if(
-                inner,
-                |config| token.trim() == config.pairing_token.trim(),
-                |config| {
-                    config.paired_clients.push(PairedRemoteClient {
-                        client_id: client_id.clone(),
-                        label: client_label.clone(),
-                        auth_token: client_token.clone(),
-                        last_seen_epoch_ms: Some(now_epoch_ms()),
-                    });
-                    if record_activity {
-                        append_native_connection_activity(
-                            config,
-                            client_id.clone(),
-                            client_label.clone(),
-                            activity_ip_address.clone(),
-                        );
-                    }
-                    (client_id, client_token, client_label)
-                },
-            )?
-            .ok_or_else(|| "Pairing token did not match the host.".to_string())
-        }
+    let auth = match auth {
+        ClientAuth::PairToken { token } => PreparedNativeClientAuth::PairToken {
+            pairing_token: token,
+            client_id: generate_secret("client"),
+            client_token: generate_secret("auth"),
+        },
         ClientAuth::ClientToken {
             client_id,
             auth_token,
-        } => mutate_host_config_if(
-            inner,
-            |config| {
-                config
-                    .paired_clients
-                    .iter()
-                    .any(|client| client.client_id == client_id && client.auth_token == auth_token)
-            },
-            |config| {
-                let authenticated = {
-                    let client = config
-                        .paired_clients
-                        .iter_mut()
-                        .find(|client| {
-                            client.client_id == client_id && client.auth_token == auth_token
-                        })
-                        .expect("serialized native client condition must remain true");
-                    client.label = client_label;
-                    client.last_seen_epoch_ms = Some(now_epoch_ms());
-                    (
-                        client.client_id.clone(),
-                        client.auth_token.clone(),
-                        client.label.clone(),
-                    )
-                };
-                if record_activity {
-                    append_native_connection_activity(
-                        config,
-                        authenticated.0.clone(),
-                        authenticated.2.clone(),
-                        activity_ip_address.clone(),
-                    );
-                }
-                authenticated
-            },
-        )?
-        .ok_or_else(|| "Saved remote credentials are no longer valid.".to_string()),
+        } => PreparedNativeClientAuth::ClientToken {
+            client_id,
+            auth_token,
+        },
+    };
+    Ok(PreparedNativeClientAuthentication {
+        auth,
+        client_label,
+        record_activity,
+        activity_ip_address,
+    })
+}
+
+fn validate_prepared_native_authentication(
+    inner: &Arc<RemoteHostInner>,
+    authentication: &PreparedNativeClientAuthentication,
+) -> Result<(), String> {
+    let config = inner
+        .config
+        .read()
+        .map_err(|_| "host config unavailable".to_string())?;
+    authentication
+        .matches(&config)
+        .then_some(())
+        .ok_or_else(|| authentication.rejection_message())
+}
+
+fn admit_native_client(
+    inner: &Arc<RemoteHostInner>,
+    native_runtime_generation: u64,
+    connection_id: u64,
+    authentication: &PreparedNativeClientAuthentication,
+    client: ConnectedRemoteClient,
+) -> Result<Option<(String, String, String)>, HostConfigAdmissionError> {
+    // The host-config transaction is always first. Lifecycle is held only for
+    // short generation/auth fences; persistence and compensation run with
+    // neither lifecycle nor config-memory locks held. Phase A persists only a
+    // non-success attempt marker. Connected/auth state is written only after
+    // the explicit Phase-B admission fence.
+    let _transaction = inner.host_config_tx.lock().map_err(|_| {
+        HostConfigAdmissionError::Persistence("host config transaction unavailable".to_string())
+    })?;
+    let attempt_id = inner
+        .next_host_config_attempt_id
+        .fetch_add(1, Ordering::Relaxed);
+    let attempt_nonce = generate_secret("admission");
+    let pending = {
+        let _lifecycle = inner
+            .lifecycle_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if native_connection_should_stop(inner, native_runtime_generation) {
+            return Ok(None);
+        }
+        validate_prepared_native_authentication(inner, authentication)
+            .map_err(HostConfigAdmissionError::Persistence)?;
+        if inner
+            .clients
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(&connection_id)
+        {
+            return Err(HostConfigAdmissionError::Persistence(
+                "Remote connection identity is already registered.".to_string(),
+            ));
+        }
+        let pending_attempt = PendingRemoteAdmissionAttempt {
+            attempt_nonce: attempt_nonce.clone(),
+            source: RemoteAccessSource::NativeApp,
+            client_id: authentication.client_id().to_string(),
+            generation: native_runtime_generation,
+            attempted_at_epoch_ms: now_epoch_ms(),
+        };
+        stage_host_config_mutation(inner, move |config| {
+            append_pending_admission_attempt(config, pending_attempt)
+        })
+        .map_err(HostConfigAdmissionError::Persistence)?
+    };
+
+    persist_host_config_snapshot(&pending.candidate)
+        .map_err(|error| HostConfigAdmissionError::Persistence(error.to_string()))?;
+
+    let final_staged = {
+        let _lifecycle = inner
+            .lifecycle_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (current_matches, auth_is_current) = inner
+            .config
+            .read()
+            .map(|config| {
+                (
+                    inner.config_revision.load(Ordering::Acquire) == pending.base_revision
+                        && *config == pending.base,
+                    authentication.matches(&config),
+                )
+            })
+            .unwrap_or((false, false));
+        let identity_available = !inner
+            .clients
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(&connection_id);
+        if native_connection_should_stop(inner, native_runtime_generation)
+            || !current_matches
+            || !auth_is_current
+            || !identity_available
+        {
+            None
+        } else {
+            let mut candidate = pending.candidate.clone();
+            if !remove_pending_admission_attempt(&mut candidate, &attempt_nonce) {
+                return Err(HostConfigAdmissionError::Persistence(
+                    "Native admission attempt marker disappeared before Phase B.".to_string(),
+                ));
+            }
+            // `last_seen` and Connected/Reconnected describe this Phase-B
+            // authorization fence. They intentionally do not reuse the
+            // earlier durable attempt-marker timestamp.
+            let result = authentication.apply_at(&mut candidate, now_epoch_ms());
+            Some(StagedHostConfigMutation {
+                base_revision: pending.base_revision,
+                base: pending.base.clone(),
+                candidate,
+                result,
+            })
+        }
+    };
+    let Some(final_staged) = final_staged else {
+        compensate_rejected_host_config_admission(&pending, attempt_id)?;
+        return Ok(None);
+    };
+
+    if let Err(error) = persist_host_config_snapshot(&final_staged.candidate) {
+        compensate_rejected_host_config_candidates(
+            &[&final_staged.candidate, &pending.candidate],
+            &pending.base,
+            attempt_id,
+        )?;
+        return Err(HostConfigAdmissionError::Persistence(error.to_string()));
     }
+
+    let accepted = {
+        let _lifecycle = inner
+            .lifecycle_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (current_matches, auth_is_current) = inner
+            .config
+            .read()
+            .map(|config| {
+                (
+                    inner.config_revision.load(Ordering::Acquire) == final_staged.base_revision
+                        && *config == final_staged.base,
+                    authentication.matches(&config),
+                )
+            })
+            .unwrap_or((false, false));
+        let identity_available = !inner
+            .clients
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(&connection_id);
+        if native_connection_should_stop(inner, native_runtime_generation)
+            || !current_matches
+            || !auth_is_current
+            || !identity_available
+        {
+            false
+        } else {
+            *inner
+                .config
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = final_staged.candidate.clone();
+            inner
+                .clients
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(connection_id, client);
+            bump_host_config_revision(inner);
+            true
+        }
+    };
+    if !accepted {
+        compensate_rejected_host_config_candidates(
+            &[&final_staged.candidate, &pending.candidate],
+            &pending.base,
+            attempt_id,
+        )?;
+        return Ok(None);
+    }
+    Ok(Some(final_staged.result))
+}
+
+#[cfg(test)]
+fn authenticate_client(
+    inner: &Arc<RemoteHostInner>,
+    hello: ClientMessage,
+) -> Result<(String, String, String), String> {
+    authenticate_client_with_activity(inner, hello, None)
+}
+
+#[cfg(test)]
+fn authenticate_client_with_activity(
+    inner: &Arc<RemoteHostInner>,
+    hello: ClientMessage,
+    activity_ip_address: Option<Option<String>>,
+) -> Result<(String, String, String), String> {
+    let authentication = prepare_native_client_authentication(hello, activity_ip_address)?;
+    mutate_host_config_if(
+        inner,
+        |config| authentication.matches(config),
+        |config| authentication.apply_at(config, now_epoch_ms()),
+    )
+    .map_err(|error| error.to_string())?
+    .ok_or_else(|| authentication.rejection_message())
 }
 
 fn handle_port_forward_connection(
@@ -8611,11 +9155,24 @@ fn remote_authority_allows_forward(
         && authority.has_exact_managed_fence_for(requested_port, session)
 }
 
-fn bump_host_config_revision(inner: &Arc<RemoteHostInner>) {
+pub(crate) fn bump_host_config_revision(inner: &Arc<RemoteHostInner>) {
     inner.config_revision.fetch_add(1, Ordering::Relaxed);
 }
 
-fn set_last_connection_note(inner: &Arc<RemoteHostInner>, note: String, is_error: bool) {
+pub(crate) fn browser_admission_now_epoch_ms(inner: &Arc<RemoteHostInner>) -> u64 {
+    #[cfg(test)]
+    if let Some(clock) = inner
+        .browser_admission_clock_test_hook
+        .read()
+        .ok()
+        .and_then(|clock| clock.clone())
+    {
+        return clock();
+    }
+    now_epoch_ms()
+}
+
+pub(crate) fn set_last_connection_note(inner: &Arc<RemoteHostInner>, note: String, is_error: bool) {
     if let Ok(mut slot) = inner.last_connection_note.write() {
         *slot = Some(note);
     }
@@ -9753,28 +10310,30 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::TestProfileGuard;
     use super::{
-        apply_remote_session_output, apply_workspace_delta, authenticate_client,
-        copy_bidirectional, current_controller_allows, current_snapshot,
+        admit_native_client, apply_remote_session_output, apply_workspace_delta,
+        authenticate_client, copy_bidirectional, current_controller_allows, current_snapshot,
         deliver_live_semantic_events, deliver_pending_bootstraps, drain_web_clients_for_restart,
         enqueue_deferred_remote_worker_with_reaper, finish_deferred_remote_worker,
         format_handshake_stage_error, generate_pairing_token, handle_client_connection,
         light_snapshot, load_remote_machine_state, native_connection_should_stop, now_epoch_ms,
-        publish_semantic_event, read_message, read_message_until_cancelled, remote_state_path,
-        remote_worker_reaper_signal, request_timeout_for_action, requires_control,
-        run_bounded_remote_callback, run_broadcaster, save_remote_known_hosts,
-        save_remote_machine_state, set_last_connection_note, spawn_native_connection_worker,
-        try_enqueue_pending_request, upsert_known_host, write_message, ClientAuth, ClientMessage,
-        ClientRegistrationTestEvent, ConnectedRemoteClient, DeferredRemoteWorker,
-        DeferredRemoteWorkerAdmission, DeferredRemoteWorkerOwner, ForwardCancellation,
+        prepare_native_client_authentication, publish_semantic_event, read_message,
+        read_message_until_cancelled, remote_state_path, remote_worker_reaper_signal,
+        request_timeout_for_action, requires_control, run_bounded_remote_callback, run_broadcaster,
+        save_remote_known_hosts, save_remote_machine_state, set_last_connection_note,
+        spawn_native_connection_worker, try_enqueue_pending_request, upsert_known_host,
+        write_message, ClientAuth, ClientMessage, ClientRegistrationTestEvent,
+        ConnectedRemoteClient, DeferredRemoteWorker, DeferredRemoteWorkerAdmission,
+        DeferredRemoteWorkerOwner, ForwardCancellation, HostConfigAdmissionError,
         HostConfigPersistenceTestPhase, KnownRemoteHost, LocalPortForwardLifecycleTestEvent,
         LocalPortForwardManager, PairedRemoteClient, PairedWebClient, PendingRemoteRequest,
-        RemoteAccessActivityEvent, RemoteAccessActivityKind, RemoteAccessSource, RemoteAction,
-        RemoteClientHandle, RemoteClientInner, RemoteHostConfig, RemoteHostService,
-        RemoteHostWorkLimiter, RemoteLatencyStats, RemoteMachineState, RemotePortAuthority,
-        RemoteSessionBootstrap, RemoteSessionStreamEvent, RemoteStatePersistenceIoTestPhase,
-        RemoteTerminalInput, RemoteWorker, RemoteWorkerAdmissionPool, RemoteWorkerReaper,
-        RemoteWorkerSpawnError, RemoteWorkspaceDelta, RemoteWorkspaceSnapshot, ServerMessage,
-        HOST_CONFIG_PERSISTENCE_TEST_HOOK, MAX_PENDING_REMOTE_REQUESTS,
+        RegisteredWebPushSender, RemoteAccessActivityEvent, RemoteAccessActivityKind,
+        RemoteAccessSource, RemoteAction, RemoteClientHandle, RemoteClientInner, RemoteHostConfig,
+        RemoteHostService, RemoteHostWorkLimiter, RemoteLatencyStats, RemoteMachineState,
+        RemotePortAuthority, RemoteSessionBootstrap, RemoteSessionStreamEvent,
+        RemoteStatePersistenceIoTestPhase, RemoteTerminalInput, RemoteWorker,
+        RemoteWorkerAdmissionPool, RemoteWorkerReaper, RemoteWorkerSpawnError,
+        RemoteWorkspaceDelta, RemoteWorkspaceSnapshot, ServerMessage,
+        HOST_CONFIG_PERSISTENCE_TEST_HOOK, MAX_PENDING_REMOTE_REQUESTS, PROTOCOL_VERSION,
         REMOTE_STATE_PERMISSION_VERIFY_TEST_HOOK, REMOTE_STATE_PERSISTENCE_IO_TEST_HOOK,
     };
     use crate::domain::id::ResourceId;
@@ -10785,7 +11344,7 @@ mod tests {
             config.server_id = "new-server".to_string();
         })
         .expect_err("post-rename permission failure must reject the mutation");
-        assert!(error.contains("permission"));
+        assert!(error.to_string().contains("permission"));
         assert_eq!(
             std::fs::read(&path).expect("read restored remote state"),
             old_bytes
@@ -10831,7 +11390,10 @@ mod tests {
                 config.server_id = "new-server".to_string();
             })
             .expect_err("injected durable-save failure must reject mutation");
-            assert!(error.contains(detail), "unexpected error: {error}");
+            assert!(
+                error.to_string().contains(detail),
+                "unexpected error: {error}"
+            );
             assert_eq!(service.config().server_id, "old-server");
             assert_eq!(
                 std::fs::read(&path).expect("read unchanged remote state"),
@@ -10875,7 +11437,10 @@ mod tests {
             config.server_id = "new-server".to_string();
         })
         .expect_err("parent barrier failure must reject mutation");
-        assert!(error.contains("parent sync"), "unexpected error: {error}");
+        assert!(
+            error.to_string().contains("parent sync"),
+            "unexpected error: {error}"
+        );
         assert_eq!(service.config().server_id, "old-server");
         assert_eq!(
             std::fs::read(&path).expect("read restored remote state"),
@@ -10887,6 +11452,117 @@ mod tests {
                 .host
                 .server_id,
             "old-server"
+        );
+    }
+
+    #[test]
+    fn generic_host_config_commit_failure_compensates_only_its_exact_candidate() {
+        let _profile = TestProfileGuard::new("generic-config-commit-compensation");
+        let mut base = RemoteHostConfig::default();
+        base.server_id = "generic-base".to_string();
+        save_remote_machine_state(&RemoteMachineState {
+            host: base.clone(),
+            known_hosts: Vec::new(),
+        })
+        .expect("seed generic compensation state");
+        let service = RemoteHostService::new(base.clone());
+        let injected = Arc::new(AtomicBool::new(false));
+        let _persistence_hook = HostConfigPersistenceHookGuard::install(Arc::new({
+            let inner = Arc::downgrade(&service.inner);
+            let injected = injected.clone();
+            move |snapshot, phase| {
+                if phase == HostConfigPersistenceTestPhase::AfterWrite
+                    && snapshot.server_id == "generic-candidate"
+                    && !injected.swap(true, Ordering::SeqCst)
+                {
+                    inner
+                        .upgrade()
+                        .expect("generic mutation host should remain")
+                        .config_revision
+                        .fetch_add(1, Ordering::SeqCst);
+                }
+                Ok(())
+            }
+        }));
+
+        let error = super::mutate_host_config(&service.inner, |config| {
+            config.server_id = "generic-candidate".to_string();
+        })
+        .expect_err("stale generic memory commit must reject the mutation");
+
+        assert!(matches!(error, HostConfigAdmissionError::Persistence(_)));
+        assert!(injected.load(Ordering::SeqCst));
+        assert_eq!(service.config(), base);
+        assert_eq!(
+            load_remote_machine_state()
+                .expect("load compensated generic state")
+                .host,
+            base,
+            "generic commit compensation must restore only its exact durable candidate"
+        );
+    }
+
+    #[test]
+    fn generic_host_config_commit_failure_reports_typed_uncertainty_when_compensation_fails() {
+        let _profile = TestProfileGuard::new("generic-config-compensation-uncertain");
+        let mut base = RemoteHostConfig::default();
+        base.server_id = "uncertain-base".to_string();
+        save_remote_machine_state(&RemoteMachineState {
+            host: base.clone(),
+            known_hosts: Vec::new(),
+        })
+        .expect("seed generic uncertainty state");
+        let service = RemoteHostService::new(base.clone());
+        let candidate_written = Arc::new(AtomicBool::new(false));
+        let compensation_failed = Arc::new(AtomicBool::new(false));
+        let _persistence_hook = HostConfigPersistenceHookGuard::install(Arc::new({
+            let inner = Arc::downgrade(&service.inner);
+            let candidate_written = candidate_written.clone();
+            let compensation_failed = compensation_failed.clone();
+            move |snapshot, phase| {
+                if phase == HostConfigPersistenceTestPhase::AfterWrite
+                    && snapshot.server_id == "uncertain-candidate"
+                    && !candidate_written.swap(true, Ordering::SeqCst)
+                {
+                    inner
+                        .upgrade()
+                        .expect("generic uncertainty host should remain")
+                        .config_revision
+                        .fetch_add(1, Ordering::SeqCst);
+                }
+                if phase == HostConfigPersistenceTestPhase::BeforeWrite
+                    && snapshot.server_id == "uncertain-base"
+                    && candidate_written.load(Ordering::SeqCst)
+                    && !compensation_failed.swap(true, Ordering::SeqCst)
+                {
+                    return Err(std::io::Error::new(
+                        ErrorKind::Other,
+                        "injected generic conditional compensation failure",
+                    ));
+                }
+                Ok(())
+            }
+        }));
+
+        let error = super::mutate_host_config(&service.inner, |config| {
+            config.server_id = "uncertain-candidate".to_string();
+        })
+        .expect_err("failed generic compensation must not report success");
+
+        assert!(matches!(
+            error,
+            HostConfigAdmissionError::DurabilityUncertain { .. }
+        ));
+        assert!(candidate_written.load(Ordering::SeqCst));
+        assert!(compensation_failed.load(Ordering::SeqCst));
+        assert_eq!(service.config(), base);
+        assert_eq!(
+            load_remote_machine_state()
+                .expect("load uncertain generic state")
+                .host
+                .server_id,
+            "uncertain-candidate",
+            "typed uncertainty must leave the unresolved exact durable candidate visible"
         );
     }
 
@@ -11411,7 +12087,7 @@ mod tests {
                 2,
                 ConnectedRemoteClient {
                     client_id: "client-native-1".to_string(),
-                    sender: Some(native_tx),
+                    sender: Some(Arc::new(native_tx)),
                     web_sender: None,
                     web_tombstone: None,
                     semantic_cursors: HashMap::new(),
@@ -11465,7 +12141,7 @@ mod tests {
                 1,
                 ConnectedRemoteClient {
                     client_id: "client-1".to_string(),
-                    sender: Some(native_tx),
+                    sender: Some(Arc::new(native_tx)),
                     web_sender: None,
                     web_tombstone: None,
                     semantic_cursors: HashMap::new(),
@@ -11587,7 +12263,7 @@ mod tests {
                 1,
                 ConnectedRemoteClient {
                     client_id: "client-1".to_string(),
-                    sender: Some(subscribed_tx),
+                    sender: Some(Arc::new(subscribed_tx)),
                     web_sender: None,
                     web_tombstone: None,
                     semantic_cursors: HashMap::new(),
@@ -11607,7 +12283,7 @@ mod tests {
                 2,
                 ConnectedRemoteClient {
                     client_id: "client-2".to_string(),
-                    sender: Some(idle_tx),
+                    sender: Some(Arc::new(idle_tx)),
                     web_sender: None,
                     web_tombstone: None,
                     semantic_cursors: HashMap::new(),
@@ -11991,7 +12667,10 @@ mod tests {
             .unwrap();
         let service = RemoteHostService::new(config);
         let (sender, receiver) = mpsc::sync_channel(8);
-        *service.inner.web_push_sender.write().unwrap() = Some(PushSender::single(sender));
+        *service.inner.web_push_sender.write().unwrap() = Some(RegisteredWebPushSender {
+            listener_generation: 0,
+            sender: PushSender::single(sender),
+        });
         (service, receiver)
     }
 
@@ -12199,7 +12878,10 @@ mod tests {
         }
         let service = RemoteHostService::new(config);
         let (sender, receiver) = mpsc::sync_channel(8);
-        *service.inner.web_push_sender.write().unwrap() = Some(PushSender::single(sender));
+        *service.inner.web_push_sender.write().unwrap() = Some(RegisteredWebPushSender {
+            listener_generation: 0,
+            sender: PushSender::single(sender),
+        });
 
         let runtime =
             attention_runtime("claude-shared", SessionKind::Claude, SessionStatus::Running);
@@ -12453,7 +13135,7 @@ mod tests {
                 1,
                 ConnectedRemoteClient {
                     client_id: "client-1".to_string(),
-                    sender: Some(tx),
+                    sender: Some(Arc::new(tx)),
                     web_sender: None,
                     web_tombstone: None,
                     semantic_cursors: HashMap::new(),
@@ -12501,7 +13183,7 @@ mod tests {
                 1,
                 ConnectedRemoteClient {
                     client_id: "client-1".to_string(),
-                    sender: Some(tx),
+                    sender: Some(Arc::new(tx)),
                     web_sender: None,
                     web_tombstone: None,
                     semantic_cursors: HashMap::new(),
@@ -12608,7 +13290,7 @@ mod tests {
             1,
             ConnectedRemoteClient {
                 client_id: "client-1".to_string(),
-                sender: Some(tx),
+                sender: Some(Arc::new(tx)),
                 web_sender: None,
                 web_tombstone: None,
                 semantic_cursors: HashMap::new(),
@@ -12661,7 +13343,7 @@ mod tests {
                 1,
                 ConnectedRemoteClient {
                     client_id: "client-1".to_string(),
-                    sender: Some(tx),
+                    sender: Some(Arc::new(tx)),
                     web_sender: None,
                     web_tombstone: None,
                     semantic_cursors: HashMap::new(),
@@ -14393,6 +15075,298 @@ mod tests {
     }
 
     #[test]
+    fn blocked_native_admission_persistence_cannot_block_root_drop_or_commit_after_stop() {
+        let _profile = TestProfileGuard::new("native-admission-persistence-drop-fence");
+        let port = reserve_free_tcp_port();
+        let mut config = RemoteHostConfig {
+            enabled: false,
+            bind_address: "127.0.0.1".to_string(),
+            port,
+            ..RemoteHostConfig::default()
+        };
+        let pair_token = config.pairing_token.clone();
+        let root = RemoteHostService::new(config.clone());
+        let (listener_started_tx, listener_started_rx) = mpsc::sync_channel(1);
+        *root
+            .inner
+            .native_lifecycle_test_hook
+            .write()
+            .expect("native lifecycle hook lock") = Some(Arc::new(move |event| {
+            if event == super::NativeLifecycleTestEvent::ListenerStarted {
+                let _ = listener_started_tx.try_send(());
+            }
+        }));
+        config.enabled = true;
+        root.apply_config(config);
+        listener_started_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("native listener should start");
+        save_remote_machine_state(&RemoteMachineState {
+            host: root.config(),
+            known_hosts: Vec::new(),
+        })
+        .expect("seed isolated native admission state");
+        let memory_before = root.config();
+        let durable_before = load_remote_machine_state()
+            .expect("load isolated native admission state before the attempt");
+
+        let (persistence_entered_tx, persistence_entered_rx) = mpsc::sync_channel(1);
+        let (persistence_release_tx, persistence_release_rx) = mpsc::sync_channel(0);
+        let persistence_release_rx = Arc::new(Mutex::new(persistence_release_rx));
+        let candidate_seen = Arc::new(AtomicBool::new(false));
+        let _persistence_hook = HostConfigPersistenceHookGuard::install(Arc::new({
+            let persistence_release_rx = persistence_release_rx.clone();
+            let candidate_seen = candidate_seen.clone();
+            move |snapshot, phase| {
+                if phase == HostConfigPersistenceTestPhase::AfterWrite
+                    && !snapshot.pending_admission_attempts.is_empty()
+                    && !candidate_seen.swap(true, Ordering::SeqCst)
+                {
+                    persistence_entered_tx.send(snapshot.clone()).map_err(|_| {
+                        std::io::Error::new(
+                            ErrorKind::BrokenPipe,
+                            "native persistence observer disappeared",
+                        )
+                    })?;
+                    persistence_release_rx
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .recv()
+                        .map_err(|_| {
+                            std::io::Error::new(
+                                ErrorKind::BrokenPipe,
+                                "native persistence release disappeared",
+                            )
+                        })?;
+                }
+                Ok(())
+            }
+        }));
+        let (worker_reaped_tx, worker_reaped_rx) = mpsc::sync_channel(1);
+        *root
+            .inner
+            .worker_reaped_test_hook
+            .write()
+            .expect("worker reaped hook lock") = Some(worker_reaped_tx);
+        let host = Arc::downgrade(&root.inner);
+
+        let (client_done_tx, client_done_rx) = mpsc::sync_channel(1);
+        let client = thread::spawn(move || {
+            let result = RemoteClientHandle::connect(
+                "127.0.0.1",
+                port,
+                "Blocked persistence client",
+                ClientAuth::PairToken { token: pair_token },
+                None,
+            );
+            client_done_tx
+                .send(result)
+                .expect("native client result observer should remain");
+        });
+        let durable_attempt = persistence_entered_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("native admission should enter persistence");
+        assert_eq!(durable_attempt.paired_clients, memory_before.paired_clients);
+        assert_eq!(
+            durable_attempt.web.activity_log,
+            memory_before.web.activity_log
+        );
+        assert_eq!(durable_attempt.pending_admission_attempts.len(), 1);
+        assert_eq!(
+            durable_attempt.pending_admission_attempts[0].source,
+            RemoteAccessSource::NativeApp
+        );
+
+        let (drop_done_tx, drop_done_rx) = mpsc::sync_channel(1);
+        let dropper = thread::spawn(move || {
+            drop(root);
+            let _ = drop_done_tx.try_send(());
+        });
+        let drop_returned_while_persistence_blocked = drop_done_rx
+            .recv_timeout(super::REMOTE_WORKER_SHUTDOWN_TIMEOUT + Duration::from_millis(500))
+            .is_ok();
+
+        persistence_release_tx
+            .send(())
+            .expect("native persistence should remain blocked until explicit release");
+        if !drop_returned_while_persistence_blocked {
+            drop_done_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("root drop should finish after releasing the stale writer");
+        }
+        let reaped = worker_reaped_rx.recv_timeout(Duration::from_secs(3)).ok();
+        let client_result = client_done_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("native client should settle after root stop");
+        let admission_rejected = match client_result {
+            Ok(result) => {
+                result.client.disconnect();
+                false
+            }
+            Err(_) => true,
+        };
+        client.join().expect("native client worker should join");
+        dropper.join().expect("root drop worker should join");
+
+        assert!(
+            drop_returned_while_persistence_blocked,
+            "blocked native admission persistence held lifecycle authority across root drop"
+        );
+        assert!(
+            admission_rejected,
+            "a native admission acknowledged success after its root generation stopped"
+        );
+        assert!(
+            reaped.is_some_and(|event| event.name.starts_with("remote-native-")),
+            "the blocked native connection worker was not retained and reaped"
+        );
+        let durable_after = load_remote_machine_state()
+            .expect("load isolated native admission state after root stop");
+        assert_eq!(
+            durable_after.host, durable_before.host,
+            "stale native admission persistence changed the isolated durable host config"
+        );
+        assert_eq!(
+            durable_after.host, memory_before,
+            "stale native admission changed the host config"
+        );
+        assert!(
+            host.upgrade().is_none(),
+            "the reaped native admission worker retained the stopped host runtime"
+        );
+    }
+
+    #[test]
+    fn rejected_native_admission_reports_typed_uncertainty_when_compensation_fails() {
+        let _profile = TestProfileGuard::new("native-admission-compensation-failure");
+        let config = RemoteHostConfig::default();
+        let pair_token = config.pairing_token.clone();
+        let service = RemoteHostService::new(config);
+        save_remote_machine_state(&RemoteMachineState {
+            host: service.config(),
+            known_hosts: Vec::new(),
+        })
+        .expect("seed isolated native compensation state");
+        let durable_before = load_remote_machine_state()
+            .expect("load isolated native compensation state before the attempt");
+        let memory_before = service.config();
+        let revision_before = service.config_revision();
+
+        let (candidate_entered_tx, candidate_entered_rx) = mpsc::sync_channel(1);
+        let (candidate_release_tx, candidate_release_rx) = mpsc::sync_channel(0);
+        let candidate_release_rx = Arc::new(Mutex::new(candidate_release_rx));
+        let candidate_seen = Arc::new(AtomicBool::new(false));
+        let compensation_failed = Arc::new(AtomicBool::new(false));
+        let baseline_host = durable_before.host.clone();
+        let _persistence_hook = HostConfigPersistenceHookGuard::install(Arc::new({
+            let candidate_release_rx = candidate_release_rx.clone();
+            let candidate_seen = candidate_seen.clone();
+            let compensation_failed = compensation_failed.clone();
+            move |snapshot, phase| {
+                if phase != HostConfigPersistenceTestPhase::BeforeWrite {
+                    return Ok(());
+                }
+                if snapshot != &baseline_host && !candidate_seen.swap(true, Ordering::SeqCst) {
+                    candidate_entered_tx.send(()).map_err(|_| {
+                        std::io::Error::new(
+                            ErrorKind::BrokenPipe,
+                            "native compensation observer disappeared",
+                        )
+                    })?;
+                    candidate_release_rx
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .recv()
+                        .map_err(|_| {
+                            std::io::Error::new(
+                                ErrorKind::BrokenPipe,
+                                "native compensation release disappeared",
+                            )
+                        })?;
+                } else if snapshot == &baseline_host
+                    && candidate_seen.load(Ordering::SeqCst)
+                    && !compensation_failed.swap(true, Ordering::SeqCst)
+                {
+                    return Err(std::io::Error::new(
+                        ErrorKind::PermissionDenied,
+                        "injected conditional compensation failure",
+                    ));
+                }
+                Ok(())
+            }
+        }));
+
+        let authentication = prepare_native_client_authentication(
+            ClientMessage::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                client_label: "Uncertain compensation client".to_string(),
+                auth: ClientAuth::PairToken { token: pair_token },
+            },
+            Some(Some("127.0.0.6".to_string())),
+        )
+        .expect("prepare native compensation authentication");
+        let generation = service
+            .inner
+            .native_runtime_generation
+            .load(Ordering::Acquire);
+        let inner = service.inner.clone();
+        let (sender, _receiver) = mpsc::channel();
+        let admission = thread::spawn(move || {
+            admit_native_client(
+                &inner,
+                generation,
+                601,
+                &authentication,
+                test_connected_client("uncertain-native", sender, None),
+            )
+        });
+        candidate_entered_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("native candidate should reach durable persistence");
+        {
+            let _lifecycle = service.inner.lifecycle_lock.lock().expect("lifecycle lock");
+            service
+                .inner
+                .native_runtime_generation
+                .fetch_add(1, Ordering::SeqCst);
+        }
+        candidate_release_tx
+            .send(())
+            .expect("release native candidate persistence");
+
+        let error = admission
+            .join()
+            .expect("native admission worker should join")
+            .expect_err("failed compensation must reject admission");
+        assert!(matches!(
+            error,
+            HostConfigAdmissionError::DurabilityUncertain { .. }
+        ));
+        assert!(compensation_failed.load(Ordering::SeqCst));
+        assert_eq!(service.config(), memory_before);
+        assert_eq!(service.config_revision(), revision_before);
+        assert!(service
+            .inner
+            .clients
+            .lock()
+            .expect("clients lock")
+            .is_empty());
+        let uncertain = load_remote_machine_state()
+            .expect("load uncertain durable state")
+            .host;
+        assert_eq!(uncertain.paired_clients, durable_before.host.paired_clients);
+        assert_eq!(
+            uncertain.web.activity_log,
+            durable_before.host.web.activity_log
+        );
+        assert_eq!(uncertain.pending_admission_attempts.len(), 1);
+        assert_eq!(
+            uncertain.pending_admission_attempts[0].source,
+            RemoteAccessSource::NativeApp
+        );
+    }
+
+    #[test]
     fn native_disconnect_durably_persists_last_seen_before_worker_join() {
         let _profile = TestProfileGuard::new("native-disconnect-durable-last-seen");
         let port = reserve_free_tcp_port();
@@ -15397,6 +16371,14 @@ mod tests {
         listener_started_rx
             .recv_timeout(Duration::from_secs(3))
             .expect("native listener should start");
+        save_remote_machine_state(&RemoteMachineState {
+            host: service.config(),
+            known_hosts: Vec::new(),
+        })
+        .expect("seed durable native registration state");
+        let durable_before = load_remote_machine_state()
+            .expect("load durable native registration state before the attempt");
+        let memory_before = service.config();
 
         let (registration_event_tx, registration_event_rx) = mpsc::sync_channel(3);
         let (registration_release_tx, registration_release_rx) = mpsc::sync_channel(0);
@@ -15495,6 +16477,25 @@ mod tests {
                 .expect("clients lock")
                 .is_empty(),
             "a revoked native generation left a late client registered"
+        );
+        let memory_after = service.config();
+        assert_eq!(
+            memory_after.paired_clients, memory_before.paired_clients,
+            "a rejected native admission changed paired credentials in memory"
+        );
+        assert_eq!(
+            memory_after.web.activity_log, memory_before.web.activity_log,
+            "a rejected native admission recorded connection activity in memory"
+        );
+        let durable_after = load_remote_machine_state()
+            .expect("load durable native registration state after rejection");
+        assert_eq!(
+            durable_after.host.paired_clients, durable_before.host.paired_clients,
+            "a rejected native admission persisted paired credentials"
+        );
+        assert_eq!(
+            durable_after.host.web.activity_log, durable_before.host.web.activity_log,
+            "a rejected native admission persisted connection activity"
         );
     }
 
@@ -16486,7 +17487,7 @@ mod tests {
         web_sender: Option<BrowserOutboundSender>,
     ) -> ConnectedRemoteClient {
         let web_tombstone = web_sender.as_ref().map(BrowserOutboundSender::tombstone);
-        let sender = web_sender.is_none().then_some(sender);
+        let sender = web_sender.is_none().then_some(Arc::new(sender));
         ConnectedRemoteClient {
             client_id: client_id.to_string(),
             sender,
@@ -16504,6 +17505,40 @@ mod tests {
             last_you_have_control: false,
             last_snapshot_revision: 0,
         }
+    }
+
+    #[test]
+    fn native_post_registration_cleanup_preserves_newer_same_client_registration() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let connection_id = 73;
+        let (old_sender, _old_receiver) = mpsc::channel();
+        let old_registration = test_connected_client("same-native-client", old_sender, None);
+        let stale_cleanup = super::client_delivery_target(&old_registration)
+            .expect("native registration should have a delivery target");
+        service
+            .inner
+            .clients
+            .lock()
+            .expect("clients lock")
+            .insert(connection_id, old_registration);
+
+        let (replacement_sender, _replacement_receiver) = mpsc::channel();
+        service.inner.clients.lock().expect("clients lock").insert(
+            connection_id,
+            test_connected_client("same-native-client", replacement_sender, None),
+        );
+
+        super::revoke_failed_delivery(&service.inner, connection_id, stale_cleanup);
+
+        assert!(
+            service
+                .inner
+                .clients
+                .lock()
+                .expect("clients lock")
+                .contains_key(&connection_id),
+            "stale post-registration cleanup removed a newer native registration"
+        );
     }
 
     fn session_view(session_id: &str) -> TerminalSessionView {
