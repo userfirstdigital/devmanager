@@ -56,7 +56,10 @@ export interface ConnectCryptoRuntime {
 
 export type ConnectCryptoLoader = () => Promise<ConnectCryptoRuntime>;
 
-const wasmModuleUrl = new URL("./wasm/connect_crypto.js", import.meta.url);
+// Keep the optional generated module out of Vite's static asset graph. A
+// source checkout may not contain it; the loader must preserve the typed HOLD
+// rather than turning a missing optional module into a build-time import.
+const wasmModulePath = [".", "wasm", "connect_crypto.js"].join("/");
 
 /** Default loader for the wasm-bindgen output produced by the native-next build. */
 export const loadConnectCrypto: ConnectCryptoLoader = async () => {
@@ -64,7 +67,7 @@ export const loadConnectCrypto: ConnectCryptoLoader = async () => {
     // The generated module is intentionally resolved at runtime so source
     // checkouts do not carry a checked-in wasm binary or generated artifact.
     const module = (await import(
-      /* @vite-ignore */ wasmModuleUrl.href
+      /* @vite-ignore */ wasmModulePath
     )) as ConnectCryptoRuntime & {
       default?: (input?: unknown) => Promise<unknown>;
     };

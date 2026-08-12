@@ -17,10 +17,129 @@ import {
   connectBrowserTransportState,
   decodeConnectSealedFrame,
   encodeConnectSealedFrame,
+  ConnectBrowserTransport,
+  createConnectRequestId,
   parseConnectGreeting,
 } from "./transport";
+import type {
+  ConnectCryptoRuntime,
+  ConnectWasmHandshake,
+  ConnectWasmTransport,
+} from "./crypto";
 
 const location = { protocol: "http:", host: "example.test" };
+
+const connectLimits = {
+  max_physical_frame_bytes: 1 * 1024 * 1024,
+  max_reassembled_message_bytes: 16 * 1024 * 1024,
+  max_page_items: 1_000,
+  max_page_encoded_bytes: 512 * 1024,
+  max_chunk_bytes: 256 * 1024,
+  max_cumulative_bytes: 16 * 1024 * 1024,
+};
+
+function fixtureUuidBytes(tail: number): Uint8Array {
+  const bytes = new Uint8Array(16);
+  bytes[0] = 0x01;
+  bytes[1] = 0x23;
+  bytes[2] = 0x45;
+  bytes[3] = 0x67;
+  bytes[4] = 0x89;
+  bytes[5] = 0xab;
+  bytes[6] = 0x70;
+  bytes[8] = 0x80;
+  bytes[15] = tail;
+  return bytes;
+}
+
+function connectGreeting(): Uint8Array {
+  const bytes = new Uint8Array(53);
+  bytes.set(new TextEncoder().encode("DMCN1"));
+  bytes.set(fixtureUuidBytes(0x11), 5);
+  bytes.set(fixtureUuidBytes(0x12), 21);
+  bytes.set(fixtureUuidBytes(0x13), 37);
+  return bytes;
+}
+
+function encodeBase64Json(value: unknown): string {
+  const bytes = new TextEncoder().encode(JSON.stringify(value));
+  return btoa(String.fromCharCode(...bytes));
+}
+
+class FakeConnectSocket {
+  readonly sent: Uint8Array[] = [];
+  readyState = 0;
+  binaryType: BinaryType = "arraybuffer";
+  onopen: ((event: unknown) => void) | null = null;
+  onmessage: ((event: { data: unknown }) => void) | null = null;
+  onclose: ((event: { code?: number; reason?: string }) => void) | null = null;
+  onerror: ((event: unknown) => void) | null = null;
+
+  send(data: Uint8Array): void {
+    this.sent.push(data.slice());
+  }
+
+  close(): void {
+    this.readyState = 3;
+    this.onclose?.({ code: 1000, reason: "closed" });
+  }
+
+  emitOpen(): void {
+    this.readyState = 1;
+    this.onopen?.({});
+  }
+
+  emit(data: Uint8Array): void {
+    this.onmessage?.({ data });
+  }
+}
+
+class FakeConnectWasmTransport implements ConnectWasmTransport {
+  seal(sequence: bigint, nonce: Uint8Array, plaintext: Uint8Array): Uint8Array {
+    return encodeConnectSealedFrame({
+      version: 1,
+      sequence,
+      nonce,
+      ciphertext: plaintext,
+      tag: new Uint8Array(32),
+    });
+  }
+
+  open(encoded: Uint8Array): Uint8Array {
+    return decodeConnectSealedFrame(encoded).ciphertext;
+  }
+}
+
+class FakeConnectWasmHandshake implements ConnectWasmHandshake {
+  private finished = false;
+  write_message(): Uint8Array {
+    return new Uint8Array([0x02]);
+  }
+  read_message(_encoded: Uint8Array): void {
+    this.finished = true;
+  }
+  is_finished(): boolean {
+    return this.finished;
+  }
+  finish(): ConnectWasmTransport {
+    return new FakeConnectWasmTransport();
+  }
+}
+
+function fakeConnectRuntime(): ConnectCryptoRuntime {
+  return {
+    WasmConnectHandshake: FakeConnectWasmHandshake as unknown as ConnectCryptoRuntime["WasmConnectHandshake"],
+    connect_protocol_major: () => 1,
+    connect_noise_pattern: (firstPairing) =>
+      firstPairing
+        ? "Noise_XX_25519_ChaChaPoly_BLAKE2s"
+        : "Noise_IK_25519_ChaChaPoly_BLAKE2s",
+    encode_connect_envelope_json: (input) => new TextEncoder().encode(input),
+    decode_connect_envelope_json: (input) => new TextDecoder().decode(input),
+    encode_connect_payload_json: (input) => new TextEncoder().encode(input),
+    decode_connect_payload_json: (input) => new TextDecoder().decode(input),
+  };
+}
 
 describe("selectConnectRoute", () => {
   beforeEach(() => {
@@ -237,5 +356,117 @@ describe("pending queue bounds and raw-terminal classification", () => {
         stableSessionKey: "tab:a",
       }),
     ).toBe(false);
+  });
+});
+
+describe("Connect channel sequencing and identity fences", () => {
+  it("does not deliver or advance an out-of-order frame before explicit resync", async () => {
+    const socket = new FakeConnectSocket();
+    const envelopes: number[] = [];
+    const transport = new ConnectBrowserTransport({
+      firstPairing: true,
+      privateKey: new Uint8Array(32).fill(1),
+      localPublic: new Uint8Array(32).fill(2),
+      location,
+      cryptoLoader: async () => fakeConnectRuntime(),
+      socketFactory: () => socket,
+      onEnvelope: (envelope) => envelopes.push(envelope.payloadKind),
+    });
+
+    await transport.start();
+    socket.emitOpen();
+    socket.emit(connectGreeting());
+    socket.emit(new Uint8Array([0x03]));
+
+    const helloFrame = decodeConnectSealedFrame(
+      socket.sent[socket.sent.length - 1] as Uint8Array,
+    );
+    const hello = JSON.parse(new TextDecoder().decode(helloFrame.ciphertext)) as {
+      connectionId: string;
+      sessionId: string;
+      channelId: string;
+    };
+    const helloResponse = {
+      protocolMajor: 1,
+      protocolMinor: 0,
+      connectionId: hello.connectionId,
+      sessionId: hello.sessionId,
+      channelId: hello.channelId,
+      channel: "critical",
+      sequence: 1,
+      requestId: null,
+      operationId: null,
+      limits: connectLimits,
+      compression: "none",
+      privacyClass: "local_only",
+      payloadKind: 1,
+      payloadVersion: 1,
+      payloadBase64: encodeBase64Json({
+        capabilities: 0,
+        limits: connectLimits,
+        privacy_class: "local_only",
+        client_id: hello.connectionId,
+      }),
+    };
+    const wasmTransport = new FakeConnectWasmTransport();
+    socket.emit(
+      wasmTransport.seal(
+        1n,
+        new Uint8Array(16).fill(3),
+        new TextEncoder().encode(JSON.stringify(helloResponse)),
+      ),
+    );
+    expect(transport.state()).toEqual({ kind: "ready" });
+
+    const gap = {
+      ...helloResponse,
+      sequence: 3,
+      payloadKind: 18,
+      payloadBase64: encodeBase64Json({ request_id: hello.connectionId }),
+    };
+    socket.emit(
+      wasmTransport.seal(
+        3n,
+        new Uint8Array(16).fill(4),
+        new TextEncoder().encode(JSON.stringify(gap)),
+      ),
+    );
+    expect(transport.state()).toEqual({ kind: "resyncing" });
+    expect(envelopes).toEqual([1]);
+
+    const resyncFrame = decodeConnectSealedFrame(
+      socket.sent[socket.sent.length - 1] as Uint8Array,
+    );
+    const resync = JSON.parse(new TextDecoder().decode(resyncFrame.ciphertext)) as {
+      sequence: number;
+      payloadKind: number;
+    };
+    expect(resync).toMatchObject({ sequence: 2, payloadKind: 15 });
+
+    const completion = {
+      ...helloResponse,
+      sequence: 4,
+      payloadKind: 15,
+      payloadBase64: encodeBase64Json({
+        channel_sequence: 1,
+        newest_sequence: 3,
+        reason: "gap",
+      }),
+    };
+    socket.emit(
+      wasmTransport.seal(
+        4n,
+        new Uint8Array(16).fill(5),
+        new TextEncoder().encode(JSON.stringify(completion)),
+      ),
+    );
+    expect(transport.state()).toEqual({ kind: "ready" });
+    expect(envelopes).toEqual([1, 15]);
+  });
+
+  it("generates protocol-valid v7 request identities", () => {
+    expect(createConnectRequestId()).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+    );
   });
 });

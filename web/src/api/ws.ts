@@ -17,15 +17,19 @@ import {
   MAX_PENDING_OUTBOUND_ITEMS,
   allowsRawTerminal,
   classifyInboundFrame,
+  createConnectRequestId,
   inboundTextByteLength,
   isRawTerminalWriterFrame,
   parseAdvertisedRelayUrl,
   selectConnectRoute,
   CONNECT_BROWSER_E2E_HOLD,
+  ConnectBrowserTransportError,
   type ConnectBrowserTransport,
   type ConnectConnectionState,
+  type ConnectPayloadRequest,
   type ConnectRoute,
   type ConnectRouteSelection,
+  type DecodedConnectEnvelope,
 } from "../connect/transport";
 import {
   parseHostCapabilityGrant,
@@ -81,6 +85,18 @@ export type WsClientOptions = Pick<
   transport?: "legacy" | "connect";
   /** Constructed by the Connect task after Rust/WASM key custody is ready. */
   connectTransport?: ConnectBrowserTransport;
+  /**
+   * Translate an existing web action into the typed Connect command/query
+   * schema. There is intentionally no unsafe default: Connect never sends a
+   * legacy WebAction object as if it were a domain command.
+   */
+  connectRequest?(action: RemoteAction, requestId: string): ConnectPayloadRequest | null;
+  /** Map a typed Connect receipt/reply back to the legacy web projection. */
+  connectResponse?(envelope: DecodedConnectEnvelope, action: RemoteAction): RemoteActionResult | null;
+  /** Optional typed resume projection. The default uses the protocol Resync lane. */
+  connectResume?(context: ResumeContext): ConnectPayloadRequest | null;
+  /** Map live typed Connect envelopes into the existing web projection. */
+  connectMessage?(envelope: DecodedConnectEnvelope): WsOutbound | null;
 };
 
 export type WsHelloFailure =
@@ -300,6 +316,8 @@ export class WsClient {
   private hostAdvertisedRelayUrl: string | null = null;
   private hostCapabilityGrant: CapabilityGrant | null = null;
   private connectUnsubscribe: (() => void) | null = null;
+  private connectEnvelopeUnsubscribe: (() => void) | null = null;
+  private connectResyncInProgress = false;
 
   constructor(
     private readonly cb: WsClientCallbacks,
@@ -514,6 +532,11 @@ export class WsClient {
   }
 
   send(message: WsInbound): boolean {
+    if (this.options.transport === "connect") {
+      // Connect has no plaintext compatibility lane. Resume is represented by
+      // the typed protocol resync; raw WebAction/PTY frames are not sent here.
+      return message.type === "resume" ? this.resume() : false;
+    }
     if (
       !this.handshakeReady ||
       !this.ws ||
@@ -532,6 +555,20 @@ export class WsClient {
   resume(): boolean {
     const context = this.cb.getResumeContext?.() ?? defaultResumeContext();
     this.visible = context.visible;
+    if (this.options.transport === "connect") {
+      const transport = this.options.connectTransport;
+      if (!transport) return false;
+      const descriptor = this.options.connectResume?.(context);
+      if (descriptor) {
+        return transport.sendPayload(descriptor.payloadKind, descriptor.payload, {
+          requestId: descriptor.requestId ?? undefined,
+          operationId: descriptor.operationId,
+          privacyClass: descriptor.privacyClass,
+          payloadVersion: descriptor.payloadVersion,
+        });
+      }
+      return transport.requestResync("replay_unavailable");
+    }
     return this.send({
       type: "resume",
       ...context,
@@ -541,6 +578,9 @@ export class WsClient {
 
   request(action: RemoteAction): Promise<RemoteActionResult> {
     if (this.stopped) return Promise.reject(new Error("websocket stopped"));
+    if (this.options.transport === "connect") {
+      return this.requestConnect(action);
+    }
     const accountedBytes = outboundWorkBytes(action);
     if (!this.reservePendingWork(accountedBytes)) {
       return Promise.reject(new Error(OUTBOUND_CAPACITY_MESSAGE));
@@ -569,6 +609,12 @@ export class WsClient {
    */
   sendWithWriterLease(message: WriterLeaseFrame): boolean {
     if (this.stopped) return false;
+    if (this.options.transport === "connect") {
+      // Raw PTY compatibility frames belong to the host web bridge. A
+      // Connect client must use a typed, capability-authorized terminal
+      // payload adapter instead of queueing plaintext input here.
+      return false;
+    }
     if (
       isRawTerminalWriterFrame(message) &&
       this.route &&
@@ -618,6 +664,13 @@ export class WsClient {
   }
 
   submitComposer(submission: ComposerSubmission): Promise<ComposerAccepted> {
+    if (this.options.transport === "connect") {
+      return Promise.reject(
+        new ConnectBrowserTransportError(
+          "Composer submission requires a typed Connect provider-input adapter",
+        ),
+      );
+    }
     const fingerprint = composerFingerprint(submission);
     const existing = this.pendingComposers.get(submission.mutationId);
     if (existing) {
@@ -665,6 +718,7 @@ export class WsClient {
    */
   ensureWriterLease(): void {
     if (this.stopped || !this.visible || this.writerLease.youAreOwner) return;
+    if (this.options.transport === "connect") return;
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       this.wake();
       return;
@@ -711,6 +765,9 @@ export class WsClient {
     this.hostCapabilityGrant = null;
     this.connectUnsubscribe?.();
     this.connectUnsubscribe = null;
+    this.connectEnvelopeUnsubscribe?.();
+    this.connectEnvelopeUnsubscribe = null;
+    this.connectResyncInProgress = false;
     if (this.options.transport === "connect") {
       this.options.connectTransport?.stop();
     }
@@ -722,6 +779,15 @@ export class WsClient {
    */
   wake(): void {
     if (this.stopped) return;
+    if (this.options.transport === "connect") {
+      const state = this.options.connectTransport?.state().kind;
+      if (state === "ready" || state === "resyncing") {
+        this.resume();
+      } else {
+        void this.start();
+      }
+      return;
+    }
     if (this.reconnectTimer !== null) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
@@ -834,14 +900,90 @@ export class WsClient {
     this.connectUnsubscribe = transport.subscribe((state) => {
       this.observeConnectState(state);
     });
+    this.connectEnvelopeUnsubscribe?.();
+    this.connectEnvelopeUnsubscribe = transport.subscribeEnvelope((envelope) => {
+      this.observeConnectEnvelope(envelope);
+    });
     this.cb.onStatus({ kind: "connecting" });
     await transport.start();
+  }
+
+  private requestConnect(action: RemoteAction): Promise<RemoteActionResult> {
+    const transport = this.options.connectTransport;
+    if (!transport) {
+      return Promise.reject(
+        new ConnectBrowserTransportError(
+          "Connect request unavailable until the Rust/WASM transport is ready",
+        ),
+      );
+    }
+    const requestId = createConnectRequestId();
+    const descriptor = this.options.connectRequest?.(action, requestId);
+    if (!descriptor) {
+      return Promise.reject(
+        new ConnectBrowserTransportError(
+          "This WebAction has no typed Connect command adapter; no plaintext or legacy request was sent",
+        ),
+      );
+    }
+    return transport
+      .request(descriptor.payloadKind, descriptor.payload, {
+        requestId,
+        operationId: descriptor.operationId,
+        privacyClass: descriptor.privacyClass,
+        payloadVersion: descriptor.payloadVersion,
+      })
+      .then((envelope) => {
+        const mapped = this.options.connectResponse?.(envelope, action);
+        if (mapped) return mapped;
+        if (envelope.payloadKind === 16) {
+          const payload = envelope.payload as { message?: unknown };
+          return {
+            ok: false,
+            message:
+              typeof payload?.message === "string"
+                ? payload.message
+                : "Connect request was rejected",
+            payload: null,
+          };
+        }
+        throw new ConnectBrowserTransportError(
+          "Connect response has no web projection adapter",
+        );
+      });
+  }
+
+  private observeConnectEnvelope(envelope: DecodedConnectEnvelope): void {
+    const mapped = this.options.connectMessage?.(envelope);
+    if (mapped) {
+      this.cb.onMessage(mapped);
+      return;
+    }
+    if (envelope.payloadKind === 16) {
+      const payload = envelope.payload as { message?: unknown };
+      this.cb.onMessage({
+        type: "error",
+        message:
+          typeof payload?.message === "string"
+            ? payload.message
+            : "Connect request was rejected",
+      });
+    }
   }
 
   private observeConnectState(state: ConnectConnectionState): void {
     switch (state.kind) {
       case "ready":
         this.cb.onStatus({ kind: "open" });
+        // The Connect Noise channel is ready only after the typed Hello
+        // response. Resume the projection on that authenticated boundary;
+        // requestResync is guarded in the transport so reconnect bursts do
+        // not create duplicate replay requests.
+        if (this.connectResyncInProgress) {
+          this.connectResyncInProgress = false;
+        } else {
+          this.resume();
+        }
         return;
       case "held":
         this.cb.onHelloFailure?.({
@@ -861,8 +1003,11 @@ export class WsClient {
       case "loading":
       case "connecting":
       case "handshaking":
-      case "resyncing":
       case "reconnecting":
+        this.cb.onStatus({ kind: "connecting" });
+        return;
+      case "resyncing":
+        this.connectResyncInProgress = true;
         this.cb.onStatus({ kind: "connecting" });
         return;
     }
