@@ -2628,6 +2628,7 @@ async fn begin_close_rejects_new_runtime_registration_with_closing_before_drain(
             command_id: CommandId::from_bytes(fixed_uuid_v7(0xea)).expect("register command id"),
             code: RejectionCode::Closing,
             current_revision: Some(3),
+            resolution: None,
         }
     );
 
