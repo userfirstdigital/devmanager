@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "title": "Smoke review prompt",
+  "description": "Bounded Phase 7 fixture. Provider send is not exercised.",
+  "tags": ["review", "smoke"],
+  "v1Body": "Review the selected change carefully.\n",
+  "v2Body": "Review the selected change carefully.\nRecord the exact version hash.\n",
+  "chainTitle": "Manual smoke chain",
+  "orgNamespace": "ops",
+  "orgName": "smoke-review",
+  "orgBody": "Published exact organization version. Do not send."
+}
