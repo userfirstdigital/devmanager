@@ -1,0 +1,49 @@
+{
+  "platform": "windows-x86_64",
+  "version": "0.4.2",
+  "protocol": {
+    "major": 1,
+    "minor": 0
+  },
+  "productName": "DevManager",
+  "identifier": "com.userfirst.devmanager",
+  "binaries": [
+    {
+      "path": "devmanager.exe",
+      "name": "devmanager",
+      "role": "client",
+      "main": true,
+      "productName": "DevManager",
+      "fileDescription": "DevManager",
+      "originalFilename": "devmanager.exe",
+      "internalName": "devmanager",
+      "fileVersion": "0.4.2",
+      "productVersion": "0.4.2",
+      "companyName": "UserFirst"
+    },
+    {
+      "path": "devmanager-host.exe",
+      "name": "devmanager-host",
+      "role": "host",
+      "main": false,
+      "productName": "DevManager",
+      "fileDescription": "DevManager Host",
+      "originalFilename": "devmanager-host.exe",
+      "internalName": "devmanager-host",
+      "fileVersion": "0.4.2",
+      "productVersion": "0.4.2",
+      "companyName": "UserFirst"
+    }
+  ],
+  "resources": [
+    "assets",
+    "third_party/ghostty"
+  ],
+  "icons": [
+    "packaging/icons/devmanager.ico"
+  ],
+  "signatures": [
+    "DevManager_0.4.2_x64-setup.exe.sig"
+  ],
+  "forbiddenPaths": []
+}

@@ -1,5 +1,19 @@
 # Third-party notices
 
+## gpui 0.2.2 and gpui-component 0.5.1
+
+- Sources: `https://crates.io/crates/gpui/0.2.2` and `https://crates.io/crates/gpui-component/0.5.1`
+- Declared in `Cargo.toml` as `gpui = "0.2.2"` and `gpui-component = "=0.5.1"`; resolved checksums are in `Cargo.lock`
+- These crates provide the native desktop UI shell packaged as `devmanager.exe`
+- Detailed `gpui-component` provenance remains in the section below
+
+## rusqlite 0.39.0 (bundled SQLite)
+
+- Source: `https://crates.io/crates/rusqlite/0.39.0`
+- Declared in `Cargo.toml` as `rusqlite = { version = "0.39.0", features = ["bundled"] }`
+- The bundled SQLite amalgamation is compiled into the application binaries; no separate SQLite redistributable is packaged
+- Used for durable host/task storage. Packages do not ship user prompt databases or organization content
+
 ## caseless 0.2.2 and unicode-normalization 0.1.24
 
 - Sources: `https://crates.io/crates/caseless/0.2.2` and `https://crates.io/crates/unicode-normalization/0.1.24`

@@ -331,6 +331,13 @@ jobs:
           DEVMANAGER_UPDATE_WINDOWS_INSTALL_MODE: passive
         run: cargo packager --release --formats "${{ matrix.formats }}"
 
+      - name: Assert package contract
+        shell: pwsh
+        run: |
+          ./packaging/Assert-PackageContract.ps1 `
+            -TargetReleaseDir "target/release" `
+            -StageDir "dist/packager"
+
       - name: Collect packaged artifacts
         shell: bash
         env:
@@ -388,6 +395,20 @@ jobs:
               shutil.rmtree(publish_dir)
           publish_dir.mkdir()
 
+          contract = json.loads(
+              pathlib.Path("packaging/package-contract.json").read_text(encoding="utf-8")
+          )
+          if contract["productName"] != "DevManager":
+              raise SystemExit("package contract productName must remain DevManager")
+          expected_names = {entry["name"] for entry in contract["binaries"]}
+          if expected_names != {"devmanager", "devmanager-host"}:
+              raise SystemExit(
+                  f"package contract binaries must be exactly client+host, found {sorted(expected_names)}"
+              )
+          forbidden = {name for name in contract["forbiddenBinaries"]}
+          if "devmanager-next" not in forbidden:
+              raise SystemExit("package contract must forbid devmanager-next")
+
           required_assets = {
               "windows-x86_64": [
                   ("Windows x64 NSIS installer", "*_x64-setup.exe"),
@@ -442,15 +463,21 @@ jobs:
               return signature
 
           selected = []
-          for platform, contract in required_assets.items():
+          for platform, contract_assets in required_assets.items():
               directory = root / platform
               if not directory.is_dir():
                   raise SystemExit(f"Missing packaged artifacts for {platform}: {directory}")
-              for label, pattern in contract:
+              for label, pattern in contract_assets:
                   asset = pick_single_asset(directory, pattern, label)
                   selected.append(asset)
                   if asset.suffix == ".sig":
                       read_signature(asset)
+              for path in directory.rglob("*"):
+                  if not path.is_file():
+                      continue
+                  lowered = path.name.lower()
+                  if any(token in lowered for token in ("devmanager-next", "process-test-helper", "legacy")):
+                      raise SystemExit(f"Forbidden packaged artifact path: {path}")
 
           names = [asset.name for asset in selected]
           if len(selected) != 10 or len(names) != len(set(names)):
@@ -473,6 +500,7 @@ jobs:
                   "url": f"https://github.com/{repo}/releases/download/{tag_name}/{asset.name}",
               }
 
+          # Signed updater metadata is generated only after signatures exist above.
           manifest = {
               "version": version,
               "notes": "See the GitHub release notes for details.",

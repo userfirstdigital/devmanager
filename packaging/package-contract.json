@@ -1,0 +1,75 @@
+{
+  "productName": "DevManager",
+  "identifier": "com.userfirst.devmanager",
+  "publisher": "UserFirst",
+  "versionSource": "Cargo.toml#package.version",
+  "protocol": {
+    "major": 1,
+    "minor": 0,
+    "source": "src/protocol/capabilities.rs"
+  },
+  "binaries": [
+    {
+      "name": "devmanager",
+      "main": true,
+      "role": "client",
+      "windows": {
+        "productName": "DevManager",
+        "fileDescription": "DevManager",
+        "originalFilename": "devmanager.exe",
+        "internalName": "devmanager",
+        "comments": "DevManager desktop client"
+      }
+    },
+    {
+      "name": "devmanager-host",
+      "main": false,
+      "role": "host",
+      "windows": {
+        "productName": "DevManager",
+        "fileDescription": "DevManager Host",
+        "originalFilename": "devmanager-host.exe",
+        "internalName": "devmanager-host",
+        "comments": "DevManager durable host"
+      }
+    }
+  ],
+  "forbiddenBinaries": [
+    "devmanager-next",
+    "devmanager-process-test-helper"
+  ],
+  "resources": [
+    "assets",
+    "third_party/ghostty"
+  ],
+  "excludes": [
+    ".worktrees",
+    "target",
+    "dist",
+    ".devmanager-next",
+    "evidence",
+    "tests/fixtures",
+    "session.json",
+    "dev-profile",
+    "remote.json",
+    "config.json",
+    ".env",
+    "secrets",
+    "Portal"
+  ],
+  "hostCtlSmoke": [
+    "ctl",
+    "actions",
+    "--json"
+  ],
+  "icons": [
+    "packaging/icons/devmanager-32.png",
+    "packaging/icons/devmanager-128.png",
+    "packaging/icons/devmanager-256.png",
+    "packaging/icons/devmanager-512.png",
+    "packaging/icons/devmanager.ico"
+  ],
+  "beforePackagingCommand": "cargo build --release --bin devmanager --bin devmanager-host",
+  "updaterManifest": "latest.json",
+  "notes": "SQLite/FTS and prompt-diff behavior ship only through application binaries; no user prompt database or organization content is packaged."
+}

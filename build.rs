@@ -2,29 +2,7 @@
 fn main() {
     emit_preview_build_identity();
     validate_web_bundle();
-    use winresource::{VersionInfo, WindowsResource};
-
-    let version = std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".to_string());
-    let packed_version = pack_windows_version(&version);
-
-    let mut res = WindowsResource::new();
-    res.set_icon("packaging/icons/devmanager.ico")
-        .set_language(0x0409)
-        .set("ProductName", "DevManager")
-        .set(
-            "FileDescription",
-            "Native GPUI workspace and terminal manager for projects, servers, AI sessions, and SSH.",
-        )
-        .set("CompanyName", "UserFirst")
-        .set("LegalCopyright", "Copyright (c) UserFirst")
-        .set("OriginalFilename", "devmanager.exe")
-        .set("InternalName", "devmanager")
-        .set("Comments", "DevManager desktop application")
-        .set("ProductVersion", &version)
-        .set("FileVersion", &version)
-        .set_version_info(VersionInfo::PRODUCTVERSION, packed_version)
-        .set_version_info(VersionInfo::FILEVERSION, packed_version);
-    res.compile().expect("failed to compile windows resources");
+    stamp_windows_binaries();
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -43,6 +21,125 @@ fn emit_preview_build_identity() {
     }
     println!("cargo:rustc-env=DEV_MANAGER_PREVIEW_BUILD_IDENTITY={identity}");
     println!("cargo:rerun-if-env-changed=DEV_MANAGER_PREVIEW_BUILD_IDENTITY");
+}
+
+#[cfg(target_os = "windows")]
+fn stamp_windows_binaries() {
+    let version = std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".to_string());
+    let (major, minor, patch, build) = windows_file_version_parts(&version);
+    println!("cargo:rerun-if-changed=packaging/icons/devmanager.ico");
+    println!("cargo:rerun-if-changed=packaging/package-contract.json");
+
+    // Keep winresource on the Windows build graph for SDK discovery compatibility.
+    // Per-binary VERSIONINFO must use cargo:rustc-link-arg-bin=<name>=... (via embed-resource).
+    let _ = winresource::WindowsResource::new();
+
+    stamp_windows_binary(
+        "devmanager",
+        "DevManager",
+        "devmanager.exe",
+        "devmanager",
+        "DevManager desktop client",
+        &version,
+        major,
+        minor,
+        patch,
+        build,
+    );
+    stamp_windows_binary(
+        "devmanager-host",
+        "DevManager Host",
+        "devmanager-host.exe",
+        "devmanager-host",
+        "DevManager durable host",
+        &version,
+        major,
+        minor,
+        patch,
+        build,
+    );
+}
+
+#[cfg(target_os = "windows")]
+#[allow(clippy::too_many_arguments)]
+fn stamp_windows_binary(
+    bin_name: &str,
+    file_description: &str,
+    original_filename: &str,
+    internal_name: &str,
+    comments: &str,
+    version: &str,
+    major: u16,
+    minor: u16,
+    patch: u16,
+    build: u16,
+) {
+    use std::path::PathBuf;
+
+    let manifest_dir =
+        PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+    let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
+    let icon = manifest_dir.join("packaging/icons/devmanager.ico");
+    let rc_path = out_dir.join(format!("{bin_name}-version.rc"));
+    let icon_rc = icon.display().to_string().replace('\\', "\\\\");
+
+    let rc = format!(
+        r#"1 VERSIONINFO
+FILEVERSION {major},{minor},{patch},{build}
+PRODUCTVERSION {major},{minor},{patch},{build}
+FILEOS 0x40004
+FILETYPE 0x1
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904B0"
+    BEGIN
+      VALUE "CompanyName", "UserFirst"
+      VALUE "FileDescription", "{file_description}"
+      VALUE "FileVersion", "{version}"
+      VALUE "InternalName", "{internal_name}"
+      VALUE "LegalCopyright", "Copyright (c) UserFirst"
+      VALUE "OriginalFilename", "{original_filename}"
+      VALUE "ProductName", "DevManager"
+      VALUE "ProductVersion", "{version}"
+      VALUE "Comments", "{comments}"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x0409, 0x04B0
+  END
+END
+IDI_ICON1 ICON "{icon_rc}"
+"#
+    );
+    std::fs::write(&rc_path, rc).unwrap_or_else(|error| {
+        panic!("failed to write Windows resource for {bin_name}: {error}");
+    });
+
+    embed_resource::compile_for(&rc_path, [bin_name], embed_resource::NONE)
+        .manifest_required()
+        .unwrap_or_else(|error| {
+            panic!("failed to embed Windows resources for {bin_name}: {error}")
+        });
+    println!("cargo:rerun-if-changed={}", rc_path.display());
+}
+
+#[cfg(target_os = "windows")]
+fn windows_file_version_parts(version: &str) -> (u16, u16, u16, u16) {
+    let mut parts = [0u16; 4];
+    let normalized = version
+        .split_once('-')
+        .map(|(base, _)| base)
+        .unwrap_or(version)
+        .split_once('+')
+        .map(|(base, _)| base)
+        .unwrap_or(version);
+
+    for (index, part) in normalized.split('.').take(4).enumerate() {
+        parts[index] = part.parse::<u16>().unwrap_or(0);
+    }
+    (parts[0], parts[1], parts[2], parts[3])
 }
 
 const WEB_BUNDLE_RECOVERY: &str = "npm --prefix web ci && npm --prefix web run build";
@@ -488,25 +585,4 @@ fn is_hashed_asset(path: &str) -> bool {
         && bytes[bytes.len() - 8..]
             .iter()
             .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_' || *byte == b'-')
-}
-
-#[cfg(target_os = "windows")]
-fn pack_windows_version(version: &str) -> u64 {
-    let mut parts = [0u16; 4];
-    let normalized = version
-        .split_once('-')
-        .map(|(base, _)| base)
-        .unwrap_or(version)
-        .split_once('+')
-        .map(|(base, _)| base)
-        .unwrap_or(version);
-
-    for (index, part) in normalized.split('.').take(4).enumerate() {
-        parts[index] = part.parse::<u16>().unwrap_or(0);
-    }
-
-    ((parts[0] as u64) << 48)
-        | ((parts[1] as u64) << 32)
-        | ((parts[2] as u64) << 16)
-        | (parts[3] as u64)
 }

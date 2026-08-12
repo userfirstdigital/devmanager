@@ -1985,6 +1985,7 @@ dependencies = [
  "cargo-packager-updater",
  "caseless",
  "dirs 6.0.0",
+ "embed-resource",
  "futures-util",
  "getrandom 0.3.4",
  "gpui",
