@@ -2,8 +2,9 @@ use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use devmanager::prompts::{
-    diff_versions, diff_versions_with_budget, encode_public_diff, DiffBudget, DiffStatus,
-    InlineSpanKind, LineChangeKind, MAX_PROMPT_BODY_BYTES, MAX_PROMPT_DIFF_INLINE_SPANS,
+    diff_versions, diff_versions_with_budget, encode_public_diff, DiffBudget, DiffOptions,
+    DiffStatus, InlineSpanKind, LineChangeKind, PromptDiffCache, MAX_PROMPT_BODY_BYTES,
+    MAX_PROMPT_DIFF_GRAPHEME_COUNT, MAX_PROMPT_DIFF_INLINE_SPANS, MAX_PROMPT_DIFF_LINE_COUNT,
     MAX_PROMPT_DIFF_PAYLOAD_BYTES, PROMPT_DIFF_TRUNCATION_MARKER_BYTES,
 };
 
