@@ -35,6 +35,7 @@ use devmanager::providers::orchestrator::{
     validate_specialist_result, OrchestrationHold, SpecialistResult, SpecialistStatus,
 };
 use devmanager::providers::ProviderKind;
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 fn fixed_uuid_v7(tail: u8) -> [u8; 16] {
@@ -70,6 +71,53 @@ fn artifact_id(tail: u8) -> ArtifactId {
 }
 fn resource_id(tail: u8) -> ResourceId {
     ResourceId::from_bytes(fixed_uuid_v7(tail)).expect("resource")
+}
+
+fn sealed_artifact(task_id: TaskId, id: ArtifactId, label: &str, body: &str) -> ArtifactFacts {
+    ArtifactFacts {
+        id,
+        task_id,
+        kind: ArtifactKind::ReviewReport,
+        label: label.to_string(),
+        content_ref: ArtifactContentRef::InlineUtf8(body.to_string()),
+        sha256: Sha256::digest(body.as_bytes()).into(),
+        privacy_class: PrivacyClass::LocalOnly,
+        created_at_ms: 1_725_000_000_300,
+    }
+}
+
+fn empty_client_model() -> ClientModel {
+    let snapshot_id = SnapshotId::from_bytes(fixed_uuid_v7(0x0f)).expect("snapshot");
+    let mut builder = ClientModelBuilder::new();
+    for section in [
+        SnapshotSection::Tasks,
+        SnapshotSection::AgentSessions,
+        SnapshotSection::Artifacts,
+        SnapshotSection::Resources,
+        SnapshotSection::Operations,
+    ] {
+        builder
+            .ingest_page(SnapshotPage {
+                snapshot_id,
+                through_sequence: 0,
+                section,
+                after_item: None,
+                items: Vec::new(),
+                encoded_bytes: 1,
+                next_cursor: None,
+            })
+            .expect("empty snapshot section");
+    }
+    builder.finish().expect("empty client model")
+}
+
+fn accept(bus: &mut CommandBus, envelope: CommandEnvelope) -> CommandReceipt {
+    let receipt = bus.execute(envelope).expect("command bus execution");
+    assert!(
+        matches!(receipt, CommandReceipt::Accepted { .. }),
+        "command must be accepted: {receipt:?}"
+    );
+    receipt
 }
 fn envelope(
     cmd: CommandId,
@@ -254,6 +302,53 @@ fn request_intent(
         resource_id: None,
         max_top_level_runtimes: DEFAULT_MAX_TOP_LEVEL_RUNTIMES,
     }
+}
+
+fn sealed_artifact(task: TaskId, id: ArtifactId, label: &str, body: &str) -> ArtifactFacts {
+    ArtifactFacts {
+        id,
+        task_id: task,
+        kind: ArtifactKind::Finding,
+        label: label.into(),
+        content_ref: ArtifactContentRef::InlineUtf8(body.into()),
+        sha256: [7u8; 32],
+        privacy_class: PrivacyClass::LocalOnly,
+        created_at_ms: 1_725_000_000_280,
+    }
+}
+
+fn empty_client_model() -> ClientModel {
+    let snapshot = SnapshotId::from_bytes(fixed_uuid_v7(0xfe)).expect("snapshot");
+    let mut builder = ClientModelBuilder::new();
+    for section in [
+        SnapshotSection::Tasks,
+        SnapshotSection::AgentSessions,
+        SnapshotSection::Artifacts,
+        SnapshotSection::Resources,
+        SnapshotSection::Operations,
+    ] {
+        builder
+            .ingest_page(SnapshotPage {
+                snapshot_id: snapshot,
+                through_sequence: 0,
+                section,
+                after_item: None,
+                items: vec![],
+                encoded_bytes: 1,
+                next_cursor: None,
+            })
+            .expect("page");
+    }
+    builder.finish().expect("model")
+}
+
+fn accept(bus: &mut CommandBus, envelope: CommandEnvelope) -> CommandReceipt {
+    let receipt = bus.execute(envelope).expect("execute");
+    assert!(
+        matches!(receipt, CommandReceipt::Accepted { .. }),
+        "expected accepted, got {receipt:?}"
+    );
+    receipt
 }
 
 #[test]
