@@ -2270,6 +2270,10 @@ impl NativeHostClientRuntime {
                 client.protocol_minor(),
             );
         }
+        // Start the updater only after the live host identity is bound. The
+        // service owns its polling thread, so this never performs network or
+        // install work on the native UI thread.
+        updater.start_background_checks();
         let endpoint = client.endpoint().to_string();
         let client = Arc::new(Mutex::new(Some(client)));
         let subscription = Arc::new(Mutex::new(ClientSubscription::new()));
