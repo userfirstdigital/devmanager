@@ -8698,9 +8698,53 @@ fn settle_server_port_start(
             .observation(port)
             .map(|observation| observation.listeners())
             .unwrap_or(&[]);
-        match classify_post_launch_listener_settlement(listeners, |listener| {
+        #[cfg(windows)]
+        let settlement = match current_job_members_for_port_settlement(
+            inner,
+            &launch.command_id,
+            deadline,
+        ) {
+            Ok(Some(job_members)) => classify_post_launch_settlement_with_job_authority(
+                listeners,
+                Ok(job_members.as_slice()),
+                true,
+            ),
+            Ok(None) => classify_post_launch_settlement_with_job_authority(
+                listeners,
+                Err("job_authority_unavailable"),
+                true,
+            ),
+            Err(error) => classify_post_launch_settlement_with_job_authority(
+                listeners,
+                Err(error.as_str()),
+                true,
+            ),
+        };
+        #[cfg(not(windows))]
+        let settlement = Ok(classify_post_launch_listener_settlement(listeners, |listener| {
             listener_matches_session(inner, &launch.command_id, listener)
-        }) {
+        }));
+
+        let settlement = match settlement {
+            Ok(settlement) => settlement,
+            Err(error) => {
+                let root_fence = launch_root_fence_description(inner, &launch.command_id);
+                let reaped =
+                    manager.stop_server_and_wait(&launch.command_id, Duration::from_secs(2));
+                drop(reservation);
+                return Err(if reaped {
+                    format!(
+                        "port {port} listener settlement probe failed; exact launch root {root_fence} was reaped (diagnostic {error})"
+                    )
+                } else {
+                    format!(
+                        "port {port} listener settlement probe failed; exact launch root {root_fence} reap_incomplete"
+                    )
+                });
+            }
+        };
+
+        match settlement {
             PostLaunchListenerSettlement::Owned => {
                 drop(reservation);
                 return Ok(());
@@ -8787,6 +8831,62 @@ fn live_runtime_root_pid(inner: &Arc<ProcessManagerInner>, session_id: &str) -> 
     .then_some(root_pid)
 }
 
+/// Capture the exact current teardown-owned Job membership for one settlement
+/// attempt. The background resource projection is intentionally not consulted:
+/// it is allowed to be one sampler tick behind the child that just bound the
+/// port. The TerminalSession API retains the Job handle and returns an identity
+/// snapshot tied to its current generation, without exposing termination
+/// authority or accepting a raw PID as proof.
+#[cfg(windows)]
+fn current_job_members_for_port_settlement(
+    inner: &Arc<ProcessManagerInner>,
+    session_id: &str,
+    deadline: Instant,
+) -> Result<Option<Vec<JobMemberObservation>>, String> {
+    if Instant::now() >= deadline {
+        return Err("settlement observation exceeded deadline".to_string());
+    }
+
+    let session = inner
+        .sessions
+        .lock()
+        .map_err(|_| "Session store poisoned".to_string())?
+        .get(session_id)
+        .cloned();
+    let Some(session) = session else {
+        return Ok(None);
+    };
+
+    let Some(observation) = session
+        .managed_process_observations_until(deadline, RESOURCE_SAMPLE_MAX_MEMBERS_PER_TICK)?
+    else {
+        return Ok(None);
+    };
+    let (capture, members) = observation.into_parts();
+    let members = members?;
+
+    // The Job query captures the fence before inspecting members. Re-read the
+    // fence and map entry before admitting the result so a concurrent restart
+    // cannot turn an old generation's membership into current ownership.
+    let current_fence = session
+        .managed_process_fence()?
+        .ok_or_else(|| "settlement_generation_stale".to_string())?;
+    if current_fence != *capture.fence() {
+        return Err("settlement_generation_stale".to_string());
+    }
+    let current_session = inner
+        .sessions
+        .lock()
+        .map_err(|_| "Session store poisoned".to_string())?
+        .get(session_id)
+        .cloned();
+    if !current_session.is_some_and(|current| Arc::ptr_eq(&current, &session)) {
+        return Err("settlement_generation_stale".to_string());
+    }
+
+    Ok(Some(members))
+}
+
 /// Return only the process IDs from the same current, fenced resource sample
 /// as the runtime root. This is a read-only ownership projection; it never
 /// reconstructs control authority from a PID or from the persistence ledger.
@@ -8851,6 +8951,55 @@ where
         return PostLaunchListenerSettlement::Foreign;
     }
     PostLaunchListenerSettlement::Unverified
+}
+
+fn listener_owned_by_current_job_member(
+    listener: &crate::process::ports::ListenerIdentity,
+    job_members: &[JobMemberObservation],
+) -> bool {
+    let Some(listener_executable) = listener.canonical_executable() else {
+        return false;
+    };
+    job_members.iter().any(|member| match member {
+        JobMemberObservation::Accessible { identity } => {
+            let identity_id = identity.id();
+            identity_id.pid() == listener.pid()
+                && identity_id.creation_time_100ns() == listener.creation_time_100ns()
+                && identity.canonical_executable() == listener_executable
+        }
+        JobMemberObservation::Inaccessible { .. } => false,
+    })
+}
+
+fn classify_post_launch_listener_settlement_against_job(
+    listeners: &[crate::process::ports::ListenerIdentity],
+    job_members: &[JobMemberObservation],
+) -> PostLaunchListenerSettlement {
+    classify_post_launch_listener_settlement(listeners, |listener| {
+        listener_owned_by_current_job_member(listener, job_members)
+    })
+}
+
+/// Resolve one listener snapshot against the exact current Job query. A query
+/// failure is allowed to remain pending while no listener exists, but once a
+/// listener is visible it is surfaced instead of falling back to stale runtime
+/// process IDs. This keeps the ownership decision fail-closed without turning
+/// the sampler's delayed projection into control authority.
+fn classify_post_launch_settlement_with_job_authority(
+    listeners: &[crate::process::ports::ListenerIdentity],
+    job_members: Result<&[JobMemberObservation], &str>,
+    generation_current: bool,
+) -> Result<PostLaunchListenerSettlement, String> {
+    if !generation_current {
+        return Err("settlement_generation_stale".to_string());
+    }
+    match job_members {
+        Ok(job_members) => Ok(classify_post_launch_listener_settlement_against_job(
+            listeners, job_members,
+        )),
+        Err(_error) if listeners.is_empty() => Ok(PostLaunchListenerSettlement::Pending),
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 fn listener_matches_session(
@@ -9346,6 +9495,151 @@ mod tests {
         assert_eq!(
             classify_post_launch_listener_settlement(std::slice::from_ref(&listener), |_| true),
             PostLaunchListenerSettlement::Owned
+        );
+    }
+
+    fn settlement_test_identity(
+        pid: u32,
+        creation_time_100ns: u64,
+    ) -> (
+        crate::process::ports::ListenerIdentity,
+        crate::process::identity::ManagedProcessIdentity,
+    ) {
+        let executable = std::env::current_exe().expect("test executable");
+        let listener = crate::process::ports::ListenerIdentity::with_executable(
+            pid,
+            creation_time_100ns,
+            &executable,
+        )
+        .expect("listener identity");
+        let identity = ManagedProcessIdentity::new(
+            crate::process::identity::ManagedProcessId::new(pid, creation_time_100ns)
+                .expect("test process id"),
+            executable,
+        )
+        .expect("canonical test executable");
+        (listener, identity)
+    }
+
+    #[test]
+    fn post_launch_settlement_owns_listener_from_current_job_even_when_runtime_projection_lacks_pid()
+    {
+        let (listener, identity) = settlement_test_identity(41_010, 41_010);
+        let job_members = [JobMemberObservation::Accessible { identity }];
+        let stale_runtime_process_ids = vec![1_001_u32];
+
+        assert!(
+            !stale_runtime_process_ids.contains(&listener.pid()),
+            "the 1s resource projection still lacks the Job member that bound the port"
+        );
+        assert!(listener_owned_by_current_job_member(&listener, &job_members));
+        assert_eq!(
+            classify_post_launch_listener_settlement_against_job(
+                std::slice::from_ref(&listener),
+                &job_members,
+            ),
+            PostLaunchListenerSettlement::Owned
+        );
+        assert_eq!(
+            classify_post_launch_settlement_with_job_authority(
+                std::slice::from_ref(&listener),
+                Ok(job_members.as_slice()),
+                true,
+            ),
+            Ok(PostLaunchListenerSettlement::Owned)
+        );
+    }
+
+    #[test]
+    fn post_launch_settlement_job_authority_stays_fail_closed_for_foreign_unverified_and_query_loss()
+    {
+        let (owned_shape, _) = settlement_test_identity(41_011, 41_011);
+        let (foreign, _) = settlement_test_identity(41_012, 41_012);
+        let unverified = crate::process::ports::ListenerIdentity::new(41_013, 41_013)
+            .expect("unproven listener");
+        let inaccessible_same_pid = [JobMemberObservation::Inaccessible {
+            pid: owned_shape.pid(),
+            creation_time_100ns: Some(owned_shape.creation_time_100ns()),
+            reason: "access_denied".to_string(),
+        }];
+        let wrong_creation = {
+            let executable = std::env::current_exe().expect("test executable");
+            [JobMemberObservation::Accessible {
+                identity: ManagedProcessIdentity::new(
+                    crate::process::identity::ManagedProcessId::new(owned_shape.pid(), 99_001)
+                        .expect("mismatched creation"),
+                    executable,
+                )
+                .expect("canonical test executable"),
+            }]
+        };
+        let foreign_job = {
+            let executable = std::env::current_exe().expect("test executable");
+            [JobMemberObservation::Accessible {
+                identity: ManagedProcessIdentity::new(
+                    crate::process::identity::ManagedProcessId::new(7_001, 7_001)
+                        .expect("foreign job member"),
+                    executable,
+                )
+                .expect("canonical test executable"),
+            }]
+        };
+
+        assert!(!listener_owned_by_current_job_member(
+            &owned_shape,
+            &inaccessible_same_pid
+        ));
+        assert_eq!(
+            classify_post_launch_listener_settlement_against_job(
+                std::slice::from_ref(&owned_shape),
+                &inaccessible_same_pid,
+            ),
+            PostLaunchListenerSettlement::Unverified
+        );
+        assert_eq!(
+            classify_post_launch_listener_settlement_against_job(
+                std::slice::from_ref(&owned_shape),
+                &wrong_creation,
+            ),
+            PostLaunchListenerSettlement::Unverified
+        );
+        assert_eq!(
+            classify_post_launch_listener_settlement_against_job(
+                std::slice::from_ref(&unverified),
+                &foreign_job,
+            ),
+            PostLaunchListenerSettlement::Unverified
+        );
+        assert_eq!(
+            classify_post_launch_listener_settlement_against_job(
+                std::slice::from_ref(&foreign),
+                &foreign_job,
+            ),
+            PostLaunchListenerSettlement::Foreign
+        );
+        assert_eq!(
+            classify_post_launch_settlement_with_job_authority(
+                std::slice::from_ref(&foreign),
+                Ok(foreign_job.as_slice()),
+                false,
+            ),
+            Err("settlement_generation_stale".to_string())
+        );
+        assert_eq!(
+            classify_post_launch_settlement_with_job_authority(
+                &[],
+                Err("job_authority_unavailable"),
+                true,
+            ),
+            Ok(PostLaunchListenerSettlement::Pending)
+        );
+        assert_eq!(
+            classify_post_launch_settlement_with_job_authority(
+                std::slice::from_ref(&foreign),
+                Err("job_authority_unavailable"),
+                true,
+            ),
+            Err("job_authority_unavailable".to_string())
         );
     }
 
