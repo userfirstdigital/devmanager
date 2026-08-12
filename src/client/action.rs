@@ -27,6 +27,24 @@ pub const ACTION_TASK_SHOW: &str = "task.show";
 pub const ACTION_TASK_CREATE: &str = "task.create";
 /// Stable id for renaming one Task through the host command boundary.
 pub const ACTION_TASK_RENAME: &str = "task.rename";
+/// Reserved Phase 4.7 id. Not registered in `ACTIONS` until the host command exists.
+pub const ACTION_TASK_SEND_NOW: &str = "task.send_now";
+/// Reserved Phase 4.7 id. Not registered in `ACTIONS` until the host command exists.
+pub const ACTION_TASK_STEER_CURRENT_TURN: &str = "task.steer_current_turn";
+/// Reserved Phase 4.7 id. Not registered in `ACTIONS` until the host command exists.
+pub const ACTION_TASK_QUEUE_FOLLOW_UP: &str = "task.queue_follow_up";
+/// Reserved Phase 4.7 id. Not registered in `ACTIONS` until the host command exists.
+pub const ACTION_TASK_ANSWER_QUESTION: &str = "task.answer_question";
+/// Reserved Phase 4.7 id. Not registered in `ACTIONS` until the host command exists.
+pub const ACTION_TASK_RESOLVE_APPROVAL: &str = "task.resolve_approval";
+/// Reserved Phase 4.7 id. Not registered in `ACTIONS` until the host command exists.
+pub const ACTION_TASK_STOP_TURN: &str = "task.stop_turn";
+/// Reserved Phase 4.7 id. Not registered in `ACTIONS` until the host command exists.
+pub const ACTION_TASK_SAVE_COMPOSER_DRAFT: &str = "task.save_composer_draft";
+/// Reserved Phase 4.7 id. Not registered in `ACTIONS` until the host command exists.
+pub const ACTION_TASK_STAGE_COMPOSER_ATTACHMENT: &str = "task.stage_composer_attachment";
+/// Reserved Phase 4.7 id. Not registered in `ACTIONS` until the host command exists.
+pub const ACTION_TASK_REMOVE_COMPOSER_ATTACHMENT: &str = "task.remove_composer_attachment";
 
 /// Where an action applies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
