@@ -26,6 +26,7 @@ use crate::providers::capabilities::{
     ProviderCapabilitiesError, ProviderCapability, ProviderExecutable, ProviderExecutableHandle,
     ProviderKind, ProviderVersion,
 };
+use crate::providers::hook_bridge;
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 use std::fmt;
@@ -350,7 +351,7 @@ impl CodexAdapter {
                 semantic_state,
             },
         )?;
-        Ok(capabilities)
+        Ok(capabilities.stable_projection())
     }
 
     pub fn prepare_correlated_launch(
@@ -485,6 +486,7 @@ impl ProviderAdapter for CodexAdapter {
             let _ = session_id;
         }
         let arguments = stock_arguments(request.provider_session_id())?;
+        let _ = request.input();
         let spec = ProviderLaunchSpec::new(request.executable().clone(), arguments)
             .map_err(|_| ProviderError::UnsupportedCapability(ProviderCapability::BuildLaunch))?;
         reject_forbidden_launch(&spec)?;
@@ -496,6 +498,8 @@ impl ProviderAdapter for CodexAdapter {
         _permit: &AdapterDeliveryPermit,
         _bytes: &[u8],
     ) -> Result<NormalizedAdapterDelivery, JournalNormalizeError> {
+        // Raw bytes cannot bypass authenticated current-generation admission.
+        // Use CodexCorrelatedLaunch::admit_and_normalize_ingest.
         Err(JournalNormalizeError::Unavailable(
             AdapterIngressUnavailable,
         ))
@@ -509,7 +513,9 @@ impl ProviderAdapter for CodexAdapter {
         &self,
         _executable: &ProviderExecutableHandle,
     ) -> Result<Option<QuotaObservation>, ProviderError> {
-        Ok(None)
+        Err(ProviderError::UnsupportedCapability(
+            ProviderCapability::ObserveQuota,
+        ))
     }
 }
 
@@ -653,6 +659,34 @@ impl CodexCorrelatedLaunch {
         body: &[u8],
     ) -> Result<CodexAdmission, CodexIdentityError> {
         self.authority.admit_ingest(observation, body)
+    }
+
+    /// Admit through the authenticated Codex hook registry, then normalize only
+    /// that admitted body into journal content. Stale/wrong-session observations
+    /// are rejected before any journal mapping.
+    pub fn admit_and_normalize_ingest(
+        &mut self,
+        permit: &AdapterDeliveryPermit,
+        observation: CodexRelayIngestObservation,
+        body: &[u8],
+        occurred_at_ms: i64,
+    ) -> Result<(CodexAdmission, NormalizedAdapterDelivery), JournalNormalizeError> {
+        if permit.provider() != ProviderKind::Codex {
+            return Err(JournalNormalizeError::ProviderMismatch);
+        }
+        if !permit.matches_correlation(
+            self.authority.task_id(),
+            self.authority.agent_session_id(),
+            self.authority.runtime_generation(),
+            self.authority.action_epoch(),
+        ) {
+            return Err(JournalNormalizeError::AdmissionRejected);
+        }
+        let admitted = self
+            .admit_ingest(observation, body)
+            .map_err(|_| JournalNormalizeError::AdmissionRejected)?;
+        let delivery = hook_bridge::normalize_codex_hook(body, occurred_at_ms)?;
+        Ok((admitted, delivery))
     }
 }
 

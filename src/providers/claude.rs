@@ -16,14 +16,15 @@ use crate::providers::adapter::{
     NormalizedAdapterDelivery, ProviderAdapter, ProviderArgument, ProviderError,
     ProviderLaunchSpec, ProviderProbeError, ProviderProbeIoError, ProviderProbeKind,
     ProviderProbeRequest, ProviderProbeRunner, ProviderProbeStatus, ProviderRuntime,
-    QuotaObservation, StopStrategy,
+    QuotaObservation, StopStrategy, WindowsProviderProbeRunner,
 };
 use crate::providers::capabilities::{
     CapabilityEvidence, CapabilityEvidenceError, CapabilitySupport, EvidenceSourceId,
     EvidenceStatus, ProviderAuthState, ProviderCapabilities, ProviderCapabilitiesError,
-    ProviderCapability, ProviderExecutable, ProviderExecutableHandle, ProviderKind,
-    ProviderVersion,
+    ProviderCapability, ProviderExecutable, ProviderExecutableHandle, ProviderExecutablePolicy,
+    ProviderKind, ProviderVersion,
 };
+use crate::providers::hook_bridge;
 use crate::providers::registry::ProviderObservation;
 use crate::remote::presentation::StableSessionKey;
 use async_trait::async_trait;
@@ -362,7 +363,24 @@ pub struct ClaudeCodeAdapter {
     state: Mutex<ClaudeAdapterState>,
 }
 
+impl Default for ClaudeCodeAdapter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ClaudeCodeAdapter {
+    /// Production stock Claude adapter. Discovery/probe use the attested
+    /// `claude` entrypoint policy; auth remains a registry receipt flow.
+    pub fn new() -> Self {
+        let policy = ProviderExecutablePolicy::new(["claude"])
+            .expect("claude is a valid provider entrypoint");
+        Self::from_runner(
+            Arc::new(WindowsProviderProbeRunner::new(policy)),
+            default_now_ms,
+        )
+    }
+
     pub fn from_attested_observation(
         observation: ProviderObservation,
     ) -> Result<Self, ProviderError> {
@@ -538,6 +556,63 @@ impl ClaudeCodeAdapter {
         relay
             .validate_hook_session_at(&presented.inner, expected, body, now)
             .map_err(map_correlated_ingest_error)
+    }
+
+    /// Admit a SessionStart through the authenticated Claude relay, then
+    /// normalize only that admitted body into journal content.
+    pub fn admit_and_normalize_session_start(
+        &self,
+        relay: &ClaudeHookRegistry,
+        peer: SocketAddr,
+        presented: &ClaudeLaunchRegistration,
+        expected: &ClaudeCorrelationBinding,
+        permit: &AdapterDeliveryPermit,
+        body: &[u8],
+        now: Instant,
+    ) -> Result<(ClaudeAdmittedDelivery, NormalizedAdapterDelivery), JournalNormalizeError> {
+        if permit.provider() != ProviderKind::ClaudeCode {
+            return Err(JournalNormalizeError::ProviderMismatch);
+        }
+        if !permit.matches_correlation(
+            expected.task_id(),
+            expected.agent_session_id(),
+            expected.runtime_generation(),
+            expected.action_epoch(),
+        ) {
+            return Err(JournalNormalizeError::AdmissionRejected);
+        }
+        let admitted = self
+            .admit_session_start(relay, peer, presented, expected, body, now)
+            .map_err(|_| JournalNormalizeError::AdmissionRejected)?;
+        let delivery = hook_bridge::normalize_claude_hook(body, unix_epoch_ms() as i64)?;
+        Ok((admitted, delivery))
+    }
+
+    /// Validate a non-SessionStart hook against the current-generation relay
+    /// registration, then normalize only that admitted body.
+    pub fn admit_and_normalize_hook(
+        &self,
+        relay: &ClaudeHookRegistry,
+        presented: &ClaudeLaunchRegistration,
+        expected: &ClaudeCorrelationBinding,
+        permit: &AdapterDeliveryPermit,
+        body: &[u8],
+        now: Instant,
+    ) -> Result<NormalizedAdapterDelivery, JournalNormalizeError> {
+        if permit.provider() != ProviderKind::ClaudeCode {
+            return Err(JournalNormalizeError::ProviderMismatch);
+        }
+        if !permit.matches_correlation(
+            expected.task_id(),
+            expected.agent_session_id(),
+            expected.runtime_generation(),
+            expected.action_epoch(),
+        ) {
+            return Err(JournalNormalizeError::AdmissionRejected);
+        }
+        self.admit_hook(relay, presented, expected, body, now)
+            .map_err(|_| JournalNormalizeError::AdmissionRejected)?;
+        hook_bridge::normalize_claude_hook(body, unix_epoch_ms() as i64)
     }
 
     pub fn settle_launch_output(
@@ -846,8 +921,14 @@ impl ProviderAdapter for ClaudeCodeAdapter {
                 crate::providers::adapter::ProviderProbeIoError::WaitFailed,
             ))
         })?;
+        state.identity = Some(AttestedIdentity {
+            executable: executable.executable().clone(),
+            version: capabilities.version.clone(),
+        });
+        // Keep full probe (including auth) for adapter-local decisions; the
+        // registry only accepts the stable non-auth projection.
         state.probed = Some(capabilities.clone());
-        Ok(capabilities)
+        Ok(capabilities.stable_projection())
     }
 
     fn build_launch(
@@ -897,6 +978,9 @@ impl ProviderAdapter for ClaudeCodeAdapter {
         } else {
             Vec::new()
         };
+        // Bounded launch input is retained on the request for the provider
+        // sequencer; stock Claude CLI does not accept a prompt argv here.
+        let _ = request.input();
         ProviderLaunchSpec::new(request.executable().clone(), arguments)
             .map_err(|_| ProviderError::UnsupportedCapability(ProviderCapability::BuildLaunch))
     }
@@ -906,6 +990,8 @@ impl ProviderAdapter for ClaudeCodeAdapter {
         _permit: &AdapterDeliveryPermit,
         _bytes: &[u8],
     ) -> Result<NormalizedAdapterDelivery, JournalNormalizeError> {
+        // Raw bytes cannot bypass authenticated current-generation admission.
+        // Use admit_and_normalize_session_start / admit_and_normalize_hook.
         Err(JournalNormalizeError::Unavailable(
             AdapterIngressUnavailable,
         ))
@@ -919,6 +1005,7 @@ impl ProviderAdapter for ClaudeCodeAdapter {
         &self,
         _executable: &ProviderExecutableHandle,
     ) -> Result<Option<QuotaObservation>, ProviderError> {
+        // No official stock Claude CLI quota/usage surface is wired here.
         Ok(None)
     }
 }

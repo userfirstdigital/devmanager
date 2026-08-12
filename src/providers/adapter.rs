@@ -2846,7 +2846,9 @@ pub trait ProviderAdapter: Send + Sync {
     ) -> Result<ProviderLaunchSpec, ProviderError>;
 
     /// Binding-required normalize seam. Must not mint EventId/sequence.
-    /// Stock adapters return typed unavailability until Tasks 4.3–4.5 exist.
+    /// Free stock adapters return typed unavailability; Claude/Codex require
+    /// authenticated current-generation admission bridges first. Cursor stays
+    /// typed unsupported.
     fn normalize_delivery(
         &self,
         permit: &AdapterDeliveryPermit,

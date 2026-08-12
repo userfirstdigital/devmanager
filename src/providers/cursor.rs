@@ -6,9 +6,10 @@
 //! This adapter never probes Claude/Codex `auth status`, never scrapes local
 //! history, and never infers a conversation id.
 //!
-//! Production stays `Unsupported` until a host `ProviderRegistry::register`s
-//! this adapter **and** a `cursor-agent` probe records
-//! `CapabilitySupport::Supported`. `CursorAdapter::new()` does not self-register.
+//! Production registers this adapter through `startup::register_stock_adapters`.
+//! Launch still requires a successful `cursor-agent` probe that records
+//! `CapabilitySupport::Supported`. Unsupported resume/session IDs/events/quota
+//! remain typed failures.
 
 use crate::providers::adapter::{
     AdapterDeliveryPermit, AdapterIngressUnavailable, JournalNormalizeError, LaunchProviderRequest,
@@ -194,7 +195,9 @@ impl ProviderAdapter for CursorAdapter {
         &self,
         _executable: &ProviderExecutableHandle,
     ) -> Result<Option<QuotaObservation>, ProviderError> {
-        Ok(None)
+        Err(ProviderError::UnsupportedCapability(
+            ProviderCapability::ObserveQuota,
+        ))
     }
 }
 

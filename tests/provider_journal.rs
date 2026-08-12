@@ -1,5 +1,3 @@
-use std::path::Path;
-
 use async_trait::async_trait;
 use devmanager::domain::PageLimits;
 use devmanager::protocol::{query_semantic_journal_page, semantic_journal_query_available};
@@ -67,13 +65,6 @@ impl ProviderAdapter for UnavailableAdapter {
 fn journal_stock_adapter_ingress_is_explicitly_unavailable() {
     assert!(!stock_adapter_ingress_available());
     assert!(stock_adapter_ingress().is_err());
-    assert!(
-        !Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/providers/claude")
-            .join("session_start.json")
-            .exists(),
-        "neutral fixtures must not be mistaken for stock adapter hooks"
-    );
 }
 
 #[test]

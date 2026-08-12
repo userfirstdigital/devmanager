@@ -2,7 +2,9 @@
 //!
 //! Trusted identity comes only from an authenticated adapter-delivery binding.
 //! Provider payload bytes are content. Unknown/malformed facts never enter the
-//! task reducer. Stock adapter ingress is unavailable until Tasks 4.3–4.5 exist.
+//! task reducer. Free stock adapter ingress stays unavailable: Claude/Codex
+//! journal content is produced only after authenticated current-generation hook
+//! registry admission. Cursor remains typed unsupported.
 
 use crate::domain::{
     AgentSessionId, DomainEvent, EventId, PageLimits, PrivacyClass, ResourceId,
@@ -128,13 +130,15 @@ impl fmt::Display for AdapterIngressUnavailable {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "stock Claude/Codex/Cursor adapter ingress is unavailable until Tasks 4.3-4.5 exist"
+            "free stock adapter ingress is unavailable; Claude/Codex require authenticated current-generation hook admission before journal normalize"
         )
     }
 }
 
 impl std::error::Error for AdapterIngressUnavailable {}
 
+/// Free stock ingress remains closed. Claude/Codex use admission-gated adapter
+/// bridges; Cursor has no proven semantic surface.
 pub const fn stock_adapter_ingress_available() -> bool {
     false
 }
@@ -146,18 +150,55 @@ pub fn stock_adapter_ingress() -> Result<std::convert::Infallible, AdapterIngres
 /// Content-only adapter output. It cannot carry EventId/sequence and has no
 /// public constructor, so adapters cannot mint committed journal identity.
 pub struct NormalizedAdapterDelivery {
-    _private: (),
+    content: Vec<u8>,
+}
+
+impl fmt::Debug for NormalizedAdapterDelivery {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NormalizedAdapterDelivery")
+            .field("content_bytes", &self.content.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl NormalizedAdapterDelivery {
+    pub(crate) fn sealed_from_content(content: Vec<u8>) -> Result<Self, JournalNormalizeError> {
+        parse_journal_content(&content).map_err(|error| match error {
+            JournalError::ForgedIdentity => JournalNormalizeError::ForgedIdentity,
+            _ => JournalNormalizeError::InvalidPayload,
+        })?;
+        Ok(Self { content })
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.content
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JournalNormalizeError {
     Unavailable(AdapterIngressUnavailable),
+    InvalidPayload,
+    ForgedIdentity,
+    ProviderMismatch,
+    AdmissionRejected,
 }
 
 impl fmt::Display for JournalNormalizeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Unavailable(error) => error.fmt(f),
+            Self::InvalidPayload => write!(f, "adapter delivery payload is invalid"),
+            Self::ForgedIdentity => write!(f, "adapter delivery forged journal identity"),
+            Self::ProviderMismatch => {
+                write!(f, "adapter delivery permit provider does not match adapter")
+            }
+            Self::AdmissionRejected => {
+                write!(
+                    f,
+                    "hook failed authenticated current-generation registry admission"
+                )
+            }
         }
     }
 }
@@ -502,7 +543,7 @@ impl AdapterDeliveryPermit {
     }
 
     #[cfg(test)]
-    pub(in crate::providers::journal) fn issue_for_test(
+    pub(crate) fn issue_for_test(
         provider: ProviderKind,
         task_id: TaskId,
         agent_session_id: AgentSessionId,
@@ -530,6 +571,25 @@ impl AdapterDeliveryPermit {
 
     pub fn delivery_id(&self) -> &str {
         self.delivery_id.as_str()
+    }
+
+    pub const fn provider(&self) -> ProviderKind {
+        self.authority.provider()
+    }
+
+    /// Match the durable journal permit to an already authenticated provider
+    /// launch correlation before normalized content can be handed to ingest.
+    pub(crate) const fn matches_correlation(
+        &self,
+        task_id: TaskId,
+        agent_session_id: AgentSessionId,
+        runtime_generation: u64,
+        action_epoch: u64,
+    ) -> bool {
+        self.authority.task_id == task_id
+            && self.authority.agent_session_id == agent_session_id
+            && self.authority.runtime_generation == runtime_generation
+            && self.authority.action_epoch == action_epoch
     }
 
     fn validate_against(
@@ -1876,6 +1936,16 @@ impl SemanticJournal {
             Ok(draft) => self.commit(draft),
             Err(outcome) => outcome,
         }
+    }
+
+    /// Ingest adapter-normalized journal content under the same permit rules.
+    pub fn ingest_normalized(
+        &mut self,
+        permit: AdapterDeliveryPermit,
+        delivery: NormalizedAdapterDelivery,
+        now_ms: i64,
+    ) -> JournalIngestOutcome {
+        self.ingest(permit, delivery.as_bytes(), now_ms)
     }
 
     pub fn ingest_until(

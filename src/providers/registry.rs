@@ -195,6 +195,29 @@ impl ProviderObservation {
         Ok(())
     }
 
+    /// Test/bridge helper: seal a registry observation from an already-attested
+    /// launch handle and capability snapshot.
+    #[cfg(test)]
+    pub(crate) fn from_test_parts(
+        kind: ProviderKind,
+        launch_handle: ProviderExecutableHandle,
+        version: ProviderVersion,
+        capabilities: ProviderCapabilities,
+    ) -> Result<Self, ProviderError> {
+        let observation = Self {
+            kind,
+            executable: launch_handle.executable().clone(),
+            launch_handle,
+            version,
+            adapter_revision: TASK_4_1_ADAPTER_REVISION,
+            semantic_schema_version: TASK_4_1_SEMANTIC_SCHEMA_VERSION,
+            capabilities,
+            cache_status: CacheStatus::Miss,
+        };
+        observation.validate()?;
+        Ok(observation)
+    }
+
     /// Returns the registry-issued launch graph, retaining any native target,
     /// interpreter, and script handles discovered for a wrapper.
     pub fn executable_handle(&self) -> &ProviderExecutableHandle {
@@ -837,6 +860,15 @@ impl ProviderRegistry {
         }
         self.adapters.insert(kind, adapter);
         Ok(())
+    }
+
+    /// Registered provider kinds in ascending [`ProviderKind`] order.
+    pub fn registered_kinds(&self) -> Vec<ProviderKind> {
+        self.adapters.keys().copied().collect()
+    }
+
+    pub fn is_registered(&self, kind: ProviderKind) -> bool {
+        self.adapters.contains_key(&kind)
     }
 
     pub async fn resolve_executable(

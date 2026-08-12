@@ -235,7 +235,6 @@ impl ProviderAdapterLaunchSpec {
     /// Registry/Task 3 adapter handoff. The provider registry supplies the
     /// bounded executable graph and exact launch material; callers cannot
     /// construct this value from raw args or environment.
-    #[allow(dead_code)]
     pub(crate) fn from_registry(
         executable: ProviderExecutable,
         arguments: Vec<OsString>,
@@ -330,7 +329,6 @@ struct AdapterLaunchProofDigestWire<'a> {
 }
 
 impl ProviderAdapterLaunchProof {
-    #[allow(dead_code)]
     fn issue(
         spec: ProviderAdapterLaunchSpec,
         mode: ProviderSessionStartMode,
@@ -354,7 +352,6 @@ impl ProviderAdapterLaunchProof {
         })
     }
 
-    #[allow(dead_code)]
     pub(crate) fn from_registry(
         spec: ProviderAdapterLaunchSpec,
         mode: ProviderSessionStartMode,
@@ -1142,7 +1139,6 @@ impl StartProviderSessionRequest {
         }
     }
 
-    #[allow(dead_code)]
     fn with_launch_proof(
         agent: AgentSessionFacts,
         launch_proof: ProviderAdapterLaunchProof,
@@ -1155,6 +1151,16 @@ impl StartProviderSessionRequest {
             launch_proof: Some(launch_proof),
             mode,
         }
+    }
+
+    /// Production registry/adapter handoff. The proof must already cover the
+    /// exact resume intent; this constructor does not invent session IDs.
+    pub(crate) fn from_registry(
+        agent: AgentSessionFacts,
+        launch_proof: ProviderAdapterLaunchProof,
+        mode: ProviderSessionStartMode,
+    ) -> Self {
+        Self::with_launch_proof(agent, launch_proof, mode)
     }
 
     #[cfg(test)]

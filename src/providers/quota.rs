@@ -6,9 +6,9 @@
 //! at least one hour old. This module does not invent provider fields, call
 //! model APIs, or write task snapshots.
 //!
-//! Claude/Codex/Cursor adapter modules are not present in this worktree, so this
-//! crate cannot probe a real subscription CLI/local status surface. The durable
-//! contract is the observer, `AdapterQuotaOutcome`, and `ProviderQuotaHost`.
+//! Stock adapters return typed Unsupported/Unavailable when no official CLI
+//! subscription quota surface is proven. Adapter `observe_quota` remains the
+//! single truth fed into `AdapterQuotaSource` / `ProviderQuotaHost`.
 
 use crate::domain::snapshot::omit_stale_quota_display;
 use crate::providers::adapter::MAX_PROVIDER_PROBE_TIMEOUT;
