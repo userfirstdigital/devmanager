@@ -7945,7 +7945,10 @@ fn bind_runtime_provider_session_id(
         if session.provider_session_id.as_deref() == Some(provider_session_id.as_str()) {
             false
         } else {
-            session.provider_session_id = Some(provider_session_id.to_string());
+            // `Display` intentionally redacts this opaque identity.  The
+            // runtime projection still stores the exact provider-issued value
+            // so resume never receives the redacted diagnostic label.
+            session.provider_session_id = Some(provider_session_id.as_str().to_owned());
             session.mark_dirty();
             true
         }
