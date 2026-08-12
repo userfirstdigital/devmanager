@@ -1419,9 +1419,11 @@ impl super::files::Task6WorkspaceLease for IssuedTask6WorkspaceLease {
 
     fn take_live_lease_guard(&mut self) -> super::files::OpaqueTask6LeaseGuard {
         match self.lease.take() {
-            Some(lease) => super::files::OpaqueTask6LeaseGuard::from_live(Box::new(
-                IssuedTask6LeaseHolder { lease },
-            )),
+            Some(lease) => {
+                super::files::OpaqueTask6LeaseGuard::from_live(Box::new(IssuedTask6LeaseHolder {
+                    lease,
+                }))
+            }
             None => super::files::OpaqueTask6LeaseGuard::default(),
         }
     }
@@ -1805,6 +1807,7 @@ impl WorkspaceService {
             request_id,
             command_id,
             &self.project_root,
+            &self.project_root_identity,
             binding,
             pins,
             action_epoch,
@@ -3426,8 +3429,9 @@ mod cockpit_authority_tests {
         fs::write(root.path().join("blob.bin"), [0u8, 1, 2, 255]).expect("binary");
         let project_id = ProjectId::new();
         let task_id = TaskId::new();
-        let roots = WorkspaceProjectRoots::try_from_pairs([(project_id, root.path().to_path_buf())])
-            .expect("roots");
+        let roots =
+            WorkspaceProjectRoots::try_from_pairs([(project_id, root.path().to_path_buf())])
+                .expect("roots");
         let mut service = WorkspaceService::with_task_coordinator(
             project_id,
             task_id,
@@ -3534,7 +3538,9 @@ mod cockpit_authority_tests {
             .live_resources_for_task_for_test()
             .contains(&WorkspaceResource::File));
         let listed = files.list(None, 16).expect("list");
-        assert!(listed.iter().any(|entry| entry.path.as_str() == "README.md"));
+        assert!(listed
+            .iter()
+            .any(|entry| entry.path.as_str() == "README.md"));
         let read = files
             .read("README.md", ReadOptions::default())
             .expect("read");
@@ -3546,7 +3552,10 @@ mod cockpit_authority_tests {
         let binary = files
             .read("blob.bin", ReadOptions::default())
             .expect("binary");
-        assert_eq!(binary.content_kind, crate::workspace::files::ContentKind::Binary);
+        assert_eq!(
+            binary.content_kind,
+            crate::workspace::files::ContentKind::Binary
+        );
         assert!(files.read("../secret", ReadOptions::default()).is_err());
         drop(files);
         assert!(!service

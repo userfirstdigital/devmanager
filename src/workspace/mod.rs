@@ -11,9 +11,10 @@ pub use model::{
     TaskKind, WorkspaceBinding, WorkspaceKind, WorkspaceProjectRoots, WorkspaceProjectRootsError,
     WorkspaceRequest, WorkspaceResolution, WorkspaceResource,
 };
+pub(crate) use service::issue_file_service;
 pub use service::{
-    issue_file_service, WorkspaceAuthorization, WorkspaceError, WorkspaceLeaseError,
-    WorkspaceResourceCoordinator, WorkspaceResourceLease, WorkspaceService,
+    WorkspaceAuthorization, WorkspaceError, WorkspaceLeaseError, WorkspaceResourceCoordinator,
+    WorkspaceResourceLease, WorkspaceService,
 };
 mod editor_ui;
 
