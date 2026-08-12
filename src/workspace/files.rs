@@ -2042,9 +2042,7 @@ impl WorkspaceFileService {
                 if valid == 0 {
                     None
                 } else {
-                    std::str::from_utf8(&slice[..valid])
-                        .ok()
-                        .map(str::to_owned)
+                    std::str::from_utf8(&slice[..valid]).ok().map(str::to_owned)
                 }
             }
         }

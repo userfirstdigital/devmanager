@@ -1402,12 +1402,9 @@ fn relative_env_file_resolves_under_project_root_and_rejects_traversal() {
         "unexpected resolved path {normalized}"
     );
 
-    let absolute = resolve_configured_env_file_path(
-        "C:/repo",
-        "apps/api",
-        "C:/elsewhere/production.env",
-    )
-    .expect("absolute env file preserved");
+    let absolute =
+        resolve_configured_env_file_path("C:/repo", "apps/api", "C:/elsewhere/production.env")
+            .expect("absolute env file preserved");
     assert_eq!(
         absolute
             .to_string_lossy()
@@ -1445,8 +1442,8 @@ fn task_service_path_context_binds_workspace_root_without_env_values() {
     use std::collections::BTreeMap;
 
     let task_id = TaskId::parse("0198b6b0-0000-7000-8000-000000000001").expect("task");
-    let context = TaskServicePathContext::try_new(task_id, "C:/task-worktree")
-        .expect("absolute task root");
+    let context =
+        TaskServicePathContext::try_new(task_id, "C:/task-worktree").expect("absolute task root");
     let env = context
         .resolve_env_file("apps/api", ".env")
         .expect("task-relative env");
@@ -1556,21 +1553,9 @@ fn task_service_cockpit_projection_excludes_foreign_task_scope() {
         },
     };
     let snapshots = vec![
-        RedactedServiceSnapshot::from_evidence(
-            id("host-db"),
-            ServiceScope::Host,
-            &evidence,
-        ),
-        RedactedServiceSnapshot::from_evidence(
-            id("api-a"),
-            ServiceScope::task(task_a),
-            &evidence,
-        ),
-        RedactedServiceSnapshot::from_evidence(
-            id("api-b"),
-            ServiceScope::task(task_b),
-            &evidence,
-        ),
+        RedactedServiceSnapshot::from_evidence(id("host-db"), ServiceScope::Host, &evidence),
+        RedactedServiceSnapshot::from_evidence(id("api-a"), ServiceScope::task(task_a), &evidence),
+        RedactedServiceSnapshot::from_evidence(id("api-b"), ServiceScope::task(task_b), &evidence),
     ];
     let projection = TaskServiceCockpitProjection::from_host_snapshots(task_a, &snapshots);
     let ids: Vec<_> = projection
