@@ -1,0 +1,137 @@
+{
+  "schemaVersion": 1,
+  "kind": "phase4.provider_smoke.matrix",
+  "mode": "fixture",
+  "launchesProvider": false,
+  "residueCount": 0,
+  "sharedProhibitedTokens": [
+    "exec",
+    "--print",
+    "-p",
+    "create-chat",
+    "--continue",
+    "--last"
+  ],
+  "redact": [
+    "credential",
+    "prompt",
+    "response",
+    "absolute_user_path",
+    "session_id"
+  ],
+  "providers": [
+    {
+      "id": "claude_code",
+      "kind": "ClaudeCode",
+      "entrypoints": ["claude"],
+      "forbiddenEntrypoints": ["cmd.exe", "powershell.exe", "pwsh.exe"],
+      "probes": [
+        { "kind": "version", "argv": ["--version"] },
+        { "kind": "help", "argv": ["--help"] },
+        { "kind": "auth_status", "argv": ["auth", "status"] }
+      ],
+      "liveProbes": ["version", "help", "auth_status"],
+      "exactResume": {
+        "command": ["--resume", "<id>"],
+        "helpToken": "--resume",
+        "helpFixture": "claude/help.txt",
+        "failureFixtures": [
+          "claude/resume_not_found.txt",
+          "claude/resume_incompatible.txt",
+          "claude/resume_auth_failure.txt"
+        ],
+        "failureVisible": true,
+        "freshFallbackForbidden": true,
+        "forbiddenFallbackTokens": ["--continue", "--last"]
+      },
+      "auth": {
+        "subscriptionOnly": true,
+        "apiKeyDoesNotPromote": true,
+        "ambiguousIsUnknown": true,
+        "subscriptionFixture": "claude/auth_status_authenticated.txt",
+        "apiKeyFixture": "claude/auth_api_key.txt",
+        "ambiguousFixture": "claude/auth_ambiguous.txt",
+        "requiredFixture": "claude/auth_status_required.txt"
+      },
+      "quota": {
+        "observe": "unknown",
+        "officialProbe": false,
+        "record": "unsupported"
+      }
+    },
+    {
+      "id": "codex",
+      "kind": "Codex",
+      "entrypoints": ["codex"],
+      "forbiddenEntrypoints": ["cmd.exe", "powershell.exe", "pwsh.exe"],
+      "probes": [
+        { "kind": "version", "argv": ["--version"] },
+        { "kind": "help", "argv": ["--help"] },
+        { "kind": "login_status", "argv": ["login", "status"] },
+        { "kind": "resume_help", "argv": ["resume", "--help"] }
+      ],
+      "liveProbes": ["version", "help", "login_status", "resume_help"],
+      "exactResume": {
+        "command": ["resume", "<id>"],
+        "helpToken": "SESSION_ID",
+        "helpFixture": "codex/resume_help.txt",
+        "unprovenFixture": "codex/resume_help_last_only.txt",
+        "failureVisible": true,
+        "freshFallbackForbidden": true,
+        "forbiddenFallbackTokens": ["--continue", "--last"]
+      },
+      "auth": {
+        "subscriptionOnly": true,
+        "apiKeyDoesNotPromote": true,
+        "ambiguousIsUnknown": true,
+        "subscriptionFixture": "codex/login_status_chatgpt_subscription.txt",
+        "apiKeyFixture": "codex/login_status_api_key.txt",
+        "ambiguousFixture": "codex/login_status_logged_in_only.txt",
+        "requiredFixture": "codex/login_status_not_authenticated.txt"
+      },
+      "quota": {
+        "observe": "unsupported",
+        "officialProbe": false,
+        "record": "unsupported"
+      }
+    },
+    {
+      "id": "cursor",
+      "kind": "Cursor",
+      "entrypoints": ["cursor-agent"],
+      "forbiddenEntrypoints": ["cursor.exe", "cmd.exe", "powershell.exe", "pwsh.exe"],
+      "probes": [
+        { "kind": "version", "argv": ["--version"] },
+        { "kind": "help", "argv": ["--help"] }
+      ],
+      "liveProbes": ["version", "help"],
+      "unsupportedLiveProbes": ["auth_status", "login_status", "resume_help"],
+      "exactResume": {
+        "supported": false,
+        "interactiveBareArgvOnly": true,
+        "error": "UnsupportedCapability(ExactResume)",
+        "failureVisible": true,
+        "freshFallbackForbidden": true,
+        "forbiddenFallbackTokens": ["--continue", "--last", "--resume", "resume"]
+      },
+      "auth": {
+        "supported": false,
+        "state": "unknown",
+        "claimsAuth": false,
+        "contractFixture": "cursor/phase4_11_smoke_contract.json"
+      },
+      "quota": {
+        "observe": "unsupported",
+        "officialProbe": false,
+        "record": "unsupported"
+      },
+      "unsupportedCapabilities": [
+        "exact_resume",
+        "semantic_events",
+        "provider_session_id",
+        "observe_quota",
+        "auth_state"
+      ]
+    }
+  ]
+}
