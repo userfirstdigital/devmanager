@@ -13,7 +13,7 @@ use crate::client::ConnectHostCommandPort;
 use crate::connect::permission::{
     PermissionDecision, PermissionDenyReason, PermissionEvaluator, PermissionRequest,
 };
-use crate::connect::permissions::action_for_client_request;
+use crate::connect::permissions::{action_for_client_request, organization_permission};
 use crate::connect::{
     ChannelBinding, ConnectEnvelope, ConnectIdentityLiveState, ConnectLimits, ConnectPayload,
     ConnectPrivacyClass, ConnectRole, ErrorPayload, HelloPayload, MAX_CONNECT_DIAGNOSTIC_BYTES,
@@ -21,7 +21,7 @@ use crate::connect::{
 use crate::domain::id::{ClientId, RequestId};
 use crate::domain::query::{Query, QueryEnvelope};
 use crate::domain::snapshot::SnapshotSection;
-use crate::host::{HostRequestHandle, IpcError};
+use crate::host::{HostRequestHandle, IpcError, OrganizationRuntime};
 use crate::protocol::{
     Capability, CapabilitySet, ClientRequest, FrameLimits, NegotiatedParameters, ProtocolVersion,
     ServerMessage,
@@ -37,14 +37,17 @@ pub const CONNECT_ERROR_FORBIDDEN: u16 = 403;
 pub const CONNECT_ERROR_CONFLICT: u16 = 409;
 pub const CONNECT_ERROR_EXECUTOR_UNATTACHED: u16 = 500;
 
-const ORG_PROMPT_UNAVAILABLE: &str =
-    "organization projection dispatch is unavailable on this standalone host";
+const ORG_PROMPT_UNAVAILABLE: &str = "organization projection dispatch is unavailable on this host";
+const ORG_EXTENSION_SCHEMA_VERSION: u16 = crate::protocol::ORGANIZATION_SCHEMA_VERSION;
+const ORG_EXTENSION_TYPE: u16 = crate::protocol::organization_extension_type(
+    crate::protocol::OrganizationExtensionKind::OrganizationPrompt,
+);
 
 /// Capabilities advertised on Connect Hello. Event replay / live durable
 /// subscription is omitted: [`HostRequestHandle::register_output`] is not a
 /// public host API, so this route must not pretend a second writer is live.
 pub fn advertised_connect_capabilities() -> CapabilitySet {
-    CapabilitySet::from_capabilities([
+    let mut capabilities = CapabilitySet::from_capabilities([
         Capability::ConnectEncryption,
         Capability::PagedSnapshots,
         Capability::OperationSettlement,
@@ -55,7 +58,20 @@ pub fn advertised_connect_capabilities() -> CapabilitySet {
         Capability::HostShutdown,
         Capability::ExplicitDetach,
         Capability::ManagementMetadata,
-    ])
+    ]);
+    // Organization is advertised only while the host-owned runtime is
+    // enrolled and enabled. A standalone process must not imply a second
+    // organization store or a usable organization request lane.
+    if OrganizationRuntime::bound_connect_runtime()
+        .is_some_and(|runtime| runtime.snapshot().capability == "enabled")
+    {
+        capabilities = CapabilitySet::from_bits(
+            capabilities.bits()
+                | Capability::GenericExtensions.bit()
+                | Capability::OrganizationProjection.bit(),
+        );
+    }
+    capabilities
 }
 
 /// Cloneable attachment for the one existing host executor.
@@ -330,17 +346,9 @@ impl ConnectDispatchSession {
                 self.dispatch_request(envelope, ClientRequest::Command(command), host)
                     .await
             }
-            ConnectPayload::Extension(extension)
-                if extension.type_id
-                    == crate::protocol::organization_extension_type(
-                        crate::protocol::OrganizationExtensionKind::OrganizationPrompt,
-                    ) =>
-            {
-                self.admit_post_hello_frame(envelope)?;
-                Err(DispatchFailure::soft(
-                    CONNECT_ERROR_FORBIDDEN,
-                    ORG_PROMPT_UNAVAILABLE,
-                ))
+            ConnectPayload::Extension(extension) if extension.type_id == ORG_EXTENSION_TYPE => {
+                let negotiated = self.admit_post_hello_frame(envelope)?;
+                self.dispatch_organization_extension(envelope, extension, negotiated)
             }
             ConnectPayload::Resync(resync) => {
                 // The client reports the last durable channel sequence it can
@@ -558,6 +566,143 @@ impl ConnectDispatchSession {
             .await
             .map_err(map_ipc_error)?;
         convert_host_message(message, envelope)
+    }
+
+    fn dispatch_organization_extension(
+        &self,
+        envelope: &ConnectEnvelope,
+        extension: crate::connect::GenericExtensionPayload,
+        negotiated: NegotiatedConnect,
+    ) -> Result<ConnectPayload, DispatchFailure> {
+        let client_id = self.bound_client_id.ok_or_else(|| {
+            DispatchFailure::fatal(
+                CONNECT_ERROR_UNAUTHORIZED,
+                "Connect client identity is not bound",
+            )
+        })?;
+        if !negotiated
+            .capabilities
+            .contains(Capability::OrganizationProjection)
+        {
+            return Err(DispatchFailure::soft(
+                CONNECT_ERROR_FORBIDDEN,
+                "organization projection was not negotiated",
+            ));
+        }
+        if extension.schema_version != ORG_EXTENSION_SCHEMA_VERSION {
+            return Err(DispatchFailure::soft(
+                CONNECT_ERROR_PROTOCOL,
+                "unsupported organization extension schema",
+            ));
+        }
+        // Generic organization requests still require normal Connect request
+        // correlation. The runtime receives the exact operation id below and
+        // owns replay settlement; it never receives tenant identity from the
+        // remote payload.
+        if envelope.request_id.is_none() {
+            return Err(DispatchFailure::soft(
+                CONNECT_ERROR_PROTOCOL,
+                "organization request must carry request_id",
+            ));
+        }
+        negotiated
+            .limits
+            .validate_payload_len(extension.payload.len())
+            .map_err(|_| {
+                DispatchFailure::soft(
+                    CONNECT_ERROR_PROTOCOL,
+                    "organization request exceeds negotiated limits",
+                )
+            })?;
+        let mutating = organization_request_is_mutating(&extension.payload)?;
+        let decision = PermissionEvaluator::default()
+            .evaluate_transport_authenticated_owner(organization_permission(mutating));
+        if let PermissionDecision::Denied(reason) = decision {
+            return Err(DispatchFailure::soft(
+                CONNECT_ERROR_FORBIDDEN,
+                deny_message(reason),
+            ));
+        }
+        if mutating && envelope.operation_id.is_none() {
+            return Err(DispatchFailure::soft(
+                CONNECT_ERROR_PROTOCOL,
+                "organization command must carry operation_id",
+            ));
+        }
+        let Some(runtime) = OrganizationRuntime::bound_connect_runtime() else {
+            return Err(DispatchFailure::soft(
+                CONNECT_ERROR_EXECUTOR_UNATTACHED,
+                ORG_PROMPT_UNAVAILABLE,
+            ));
+        };
+        // `client_id` is deliberately read only after the authenticated Hello
+        // binding and is retained as the local identity fence for this route;
+        // the host runtime owns the enrolled host identity and receives only
+        // the outer operation id, never a tenant supplied by the client.
+        let _authenticated_client_id = client_id;
+        let response = runtime
+            .dispatch_authenticated_connect_payload(envelope.operation_id, &extension.payload)
+            .map_err(map_organization_runtime_error)?;
+        negotiated
+            .limits
+            .validate_payload_len(response.len())
+            .map_err(|_| {
+                DispatchFailure::soft(
+                    CONNECT_ERROR_PROTOCOL,
+                    "organization response exceeds negotiated limits",
+                )
+            })?;
+        Ok(ConnectPayload::Extension(
+            crate::connect::GenericExtensionPayload {
+                type_id: extension.type_id,
+                schema_version: extension.schema_version,
+                payload: response,
+            },
+        ))
+    }
+}
+
+fn organization_request_is_mutating(payload: &[u8]) -> Result<bool, DispatchFailure> {
+    let value: serde_json::Value = serde_json::from_slice(payload).map_err(|_| {
+        DispatchFailure::soft(
+            CONNECT_ERROR_PROTOCOL,
+            "organization request payload is not valid JSON",
+        )
+    })?;
+    let object = value.as_object().ok_or_else(|| {
+        DispatchFailure::soft(
+            CONNECT_ERROR_PROTOCOL,
+            "organization request must be a tagged object",
+        )
+    })?;
+    match (object.get("Query"), object.get("Command")) {
+        (Some(_), None) => Ok(false),
+        (None, Some(_)) => Ok(true),
+        _ => Err(DispatchFailure::soft(
+            CONNECT_ERROR_PROTOCOL,
+            "organization request must contain exactly one operation",
+        )),
+    }
+}
+
+fn map_organization_runtime_error(error: crate::host::OrganizationRuntimeError) -> DispatchFailure {
+    match error {
+        crate::host::OrganizationRuntimeError::Unauthorized => DispatchFailure::soft(
+            CONNECT_ERROR_FORBIDDEN,
+            "organization membership does not authorize this request",
+        ),
+        crate::host::OrganizationRuntimeError::InvalidRequest => {
+            DispatchFailure::soft(CONNECT_ERROR_PROTOCOL, "invalid organization request")
+        }
+        crate::host::OrganizationRuntimeError::Closed => DispatchFailure::soft(
+            CONNECT_ERROR_EXECUTOR_UNATTACHED,
+            "organization runtime is closed",
+        ),
+        crate::host::OrganizationRuntimeError::Org(_)
+        | crate::host::OrganizationRuntimeError::Sync(_) => DispatchFailure::soft(
+            CONNECT_ERROR_EXECUTOR_UNATTACHED,
+            "organization request failed on the host",
+        ),
     }
 }
 

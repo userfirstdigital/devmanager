@@ -207,8 +207,10 @@ async fn connect_resync_returns_a_fresh_bounded_snapshot_through_the_host_lane()
 #[tokio::test(flavor = "current_thread")]
 async fn connect_resync_rejects_an_inverted_cursor_before_host_dispatch() {
     let binding = binding();
-    let mut session =
-        ConnectDispatchSession::bind_paired("web-paired".to_owned(), ConnectIdentityLiveState::Live);
+    let mut session = ConnectDispatchSession::bind_paired(
+        "web-paired".to_owned(),
+        ConnectIdentityLiveState::Live,
+    );
     hello(&mut session, binding).await;
     let payload = ConnectPayload::Resync(devmanager::connect::ResyncPayload {
         channel_sequence: 4,
@@ -228,4 +230,33 @@ async fn connect_resync_rejects_an_inverted_cursor_before_host_dispatch() {
 #[test]
 fn connect_does_not_advertise_live_resync_writer() {
     assert!(!advertised_connect_capabilities().contains(Capability::EventReplay));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn organization_extension_requires_negotiated_capability_and_request_metadata() {
+    let binding = binding();
+    let mut session = ConnectDispatchSession::bind_paired(
+        "web-paired-org".to_owned(),
+        ConnectIdentityLiveState::Live,
+    );
+    hello(&mut session, binding).await;
+    let payload = ConnectPayload::Extension(devmanager::connect::GenericExtensionPayload {
+        type_id: devmanager::protocol::organization_extension_type(
+            devmanager::protocol::OrganizationExtensionKind::OrganizationPrompt,
+        ),
+        schema_version: devmanager::protocol::ORGANIZATION_SCHEMA_VERSION,
+        payload: serde_json::to_vec(&serde_json::json!({
+            "Query": "Snapshot"
+        }))
+        .expect("organization payload"),
+    });
+    let env = envelope(binding, 2, Some(RequestId::new()), payload.clone());
+    let (reply, disposition) = session.handle_payload(&env, payload, None).await;
+    assert_eq!(disposition, ConnectSessionDisposition::Continue);
+    assert!(matches!(
+        reply,
+        ConnectPayload::Error(error)
+            if error.code == CONNECT_ERROR_FORBIDDEN
+                || error.code == devmanager::connect::CONNECT_ERROR_EXECUTOR_UNATTACHED
+    ));
 }

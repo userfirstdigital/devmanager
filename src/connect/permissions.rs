@@ -121,6 +121,23 @@ pub fn action_for_provider_input(call: &ProviderInputCall) -> PermissionRequest 
     }
 }
 
+/// Transport authorization for the organization extension. The host runtime
+/// applies the enrolled membership/policy decision after this paired-session
+/// gate; keeping the transport action here prevents an authenticated frame
+/// from bypassing the normal Connect permission evaluator.
+pub const fn organization_permission(mutating: bool) -> PermissionRequest {
+    PermissionRequest {
+        role: ConnectRole::PairedOwner,
+        task_id: None,
+        action: if mutating {
+            ActionId::MUTATE_TASK
+        } else {
+            ActionId::READ_TASK
+        },
+        credential: None,
+    }
+}
+
 pub fn action_for_approval(call: &ApprovalAnswerCall, dangerous: bool) -> PermissionRequest {
     PermissionRequest {
         role: ConnectRole::PairedOwner,
