@@ -6,8 +6,7 @@ use devmanager::domain::snapshot::omit_stale_quota_display;
 use devmanager::providers::adapter::{
     AdapterDeliveryPermit, AdapterIngressUnavailable, JournalNormalizeError, LaunchProviderRequest,
     NormalizedAdapterDelivery, ProviderAdapter, ProviderError, ProviderLaunchSpec,
-    ProviderQuotaStatus, ProviderRuntime,
-    QuotaObservation as AdapterQuotaSample, StopStrategy,
+    ProviderQuotaStatus, ProviderRuntime, QuotaObservation as AdapterQuotaSample, StopStrategy,
 };
 use devmanager::providers::capabilities::{
     CapabilityEvidence, CapabilitySupport, EvidenceSourceId, EvidenceStatus, ProviderAuthState,
