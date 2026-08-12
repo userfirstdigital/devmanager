@@ -301,10 +301,11 @@ fn native_gpui_smoke_report() -> NativeGpuiSmokeReport {
         });
         cx.quit();
     });
-    report_slot
+    let report = report_slot
         .borrow_mut()
         .take()
-        .expect("native GPUI smoke report")
+        .expect("native GPUI smoke report");
+    report
 }
 
 #[test]
