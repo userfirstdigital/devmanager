@@ -124,6 +124,7 @@ impl ConnectWebPublication {
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
                 Some(generation.saturating_add(1).max(1))
             })
+            .map(|generation| generation.saturating_add(1).max(1))
             .unwrap_or_else(|generation| generation.saturating_add(1).max(1))
     }
 
