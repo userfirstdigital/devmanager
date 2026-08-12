@@ -21,6 +21,9 @@ import {
   isRawTerminalWriterFrame,
   parseAdvertisedRelayUrl,
   selectConnectRoute,
+  CONNECT_BROWSER_E2E_HOLD,
+  type ConnectBrowserTransport,
+  type ConnectConnectionState,
   type ConnectRoute,
   type ConnectRouteSelection,
 } from "../connect/transport";
@@ -73,7 +76,12 @@ export interface WsClientCallbacks {
 export type WsClientOptions = Pick<
   ConnectRouteSelection,
   "preferDirect" | "directAvailable" | "relayUrl"
->;
+> & {
+  /** Explicit Connect tasks must opt in; the default remains legacy `/api/ws`. */
+  transport?: "legacy" | "connect";
+  /** Constructed by the Connect task after Rust/WASM key custody is ready. */
+  connectTransport?: ConnectBrowserTransport;
+};
 
 export type WsHelloFailure =
   | { kind: "missingHello" }
@@ -86,6 +94,10 @@ export type WsHelloFailure =
       kind: "buildMismatch";
       expectedBuildId: string;
       receivedBuildId: string;
+    }
+  | {
+      kind: "connectTransportHeld";
+      code: typeof CONNECT_BROWSER_E2E_HOLD;
     };
 
 interface PendingRequest {
@@ -287,6 +299,7 @@ export class WsClient {
   private route: ConnectRoute | null = null;
   private hostAdvertisedRelayUrl: string | null = null;
   private hostCapabilityGrant: CapabilityGrant | null = null;
+  private connectUnsubscribe: (() => void) | null = null;
 
   constructor(
     private readonly cb: WsClientCallbacks,
@@ -303,6 +316,10 @@ export class WsClient {
   }
 
   async start(): Promise<void> {
+    if (this.options.transport === "connect") {
+      await this.startConnectTransport();
+      return;
+    }
     if (this.stopped || this.starting) return;
     if (this.ws?.readyState === WebSocket.OPEN) return;
     if (this.ws?.readyState === WebSocket.CONNECTING) return;
@@ -692,6 +709,11 @@ export class WsClient {
     this.writerLease = { ...EMPTY_WRITER_LEASE };
     this.hostAdvertisedRelayUrl = null;
     this.hostCapabilityGrant = null;
+    this.connectUnsubscribe?.();
+    this.connectUnsubscribe = null;
+    if (this.options.transport === "connect") {
+      this.options.connectTransport?.stop();
+    }
   }
 
   /**
@@ -791,6 +813,59 @@ export class WsClient {
 
   private isCurrentEpoch(epoch: number): boolean {
     return !this.stopped && this.connectionEpoch === epoch;
+  }
+
+  private async startConnectTransport(): Promise<void> {
+    if (this.stopped) return;
+    const transport = this.options.connectTransport;
+    if (!transport) {
+      const failure: WsHelloFailure = {
+        kind: "connectTransportHeld",
+        code: CONNECT_BROWSER_E2E_HOLD,
+      };
+      this.cb.onHelloFailure?.(failure);
+      this.cb.onStatus({
+        kind: "closed",
+        reason: `${CONNECT_BROWSER_E2E_HOLD}: Rust/WASM Connect transport is unavailable`,
+      });
+      return;
+    }
+    this.connectUnsubscribe?.();
+    this.connectUnsubscribe = transport.subscribe((state) => {
+      this.observeConnectState(state);
+    });
+    this.cb.onStatus({ kind: "connecting" });
+    await transport.start();
+  }
+
+  private observeConnectState(state: ConnectConnectionState): void {
+    switch (state.kind) {
+      case "ready":
+        this.cb.onStatus({ kind: "open" });
+        return;
+      case "held":
+        this.cb.onHelloFailure?.({
+          kind: "connectTransportHeld",
+          code: state.code,
+        });
+        this.cb.onStatus({
+          kind: "closed",
+          reason: `${state.code}: ${state.reason}`,
+        });
+        return;
+      case "closed":
+        this.cb.onStatus({ kind: "closed", reason: state.reason });
+        return;
+      case "idle":
+        return;
+      case "loading":
+      case "connecting":
+      case "handshaking":
+      case "resyncing":
+      case "reconnecting":
+        this.cb.onStatus({ kind: "connecting" });
+        return;
+    }
   }
 
   private isCurrentSocket(socket: WebSocket, epoch: number): boolean {

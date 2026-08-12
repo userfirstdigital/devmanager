@@ -38,6 +38,7 @@ serviceAccountKey.json
 /target-check
 /target-live
 /target-watch
+/web/src/connect/wasm/
 /target-test
 /target-scan
 /target-test-*

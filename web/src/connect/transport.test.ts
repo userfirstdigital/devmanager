@@ -13,6 +13,11 @@ import {
   isRawTerminalWriterFrame,
   parseAdvertisedRelayUrl,
   selectConnectRoute,
+  CONNECT_BROWSER_E2E_HOLD,
+  connectBrowserTransportState,
+  decodeConnectSealedFrame,
+  encodeConnectSealedFrame,
+  parseConnectGreeting,
 } from "./transport";
 
 const location = { protocol: "http:", host: "example.test" };
@@ -111,6 +116,53 @@ describe("browser Connect transport boundary", () => {
     expect(buildConnectWebSocketUrl(location)).toBe(
       "ws://example.test/api/connect",
     );
+  });
+
+  it("keeps Connect visibly held until the Rust/WASM leaf is ready", () => {
+    expect(connectBrowserTransportState()).toEqual({
+      kind: "held",
+      code: CONNECT_BROWSER_E2E_HOLD,
+      reason: expect.stringContaining("will not downgrade to /api/ws"),
+    });
+  });
+
+  it("uses the native sealed-frame wire layout without browser crypto", () => {
+    const encoded = encodeConnectSealedFrame({
+      version: 1,
+      sequence: 7n,
+      nonce: new Uint8Array(16).fill(0x11),
+      ciphertext: new Uint8Array([0x22, 0x33]),
+      tag: new Uint8Array(32).fill(0x44),
+    });
+    expect(Array.from(encoded.slice(0, 9))).toEqual([
+      1,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      7,
+    ]);
+    expect(decodeConnectSealedFrame(encoded)).toMatchObject({
+      version: 1,
+      sequence: 7n,
+    });
+  });
+
+  it("binds the DMCN1 greeting to nonzero fixed-width identifiers", () => {
+    const greeting = new Uint8Array(53);
+    greeting.set(new TextEncoder().encode("DMCN1"));
+    greeting.fill(0x71, 5, 21);
+    greeting.fill(0x72, 21, 37);
+    greeting.fill(0x73, 37, 53);
+    expect(parseConnectGreeting(greeting)).toMatchObject({
+      hostPublicId: expect.any(Uint8Array),
+      routeId: expect.any(Uint8Array),
+      sessionId: expect.any(Uint8Array),
+    });
+    expect(parseConnectGreeting(greeting.slice(0, 52))).toBeNull();
   });
 });
 

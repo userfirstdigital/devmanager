@@ -1996,6 +1996,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "connect-crypto"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "getrandom 0.3.4",
+ "hmac",
+ "rmp-serde",
+ "serde",
+ "serde_json",
+ "sha2",
+ "snow",
+ "uuid",
+ "wasm-bindgen",
+ "zeroize",
+]
+
+[[package]]
 name = "derive_more"
 version = "0.99.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"

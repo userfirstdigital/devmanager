@@ -5,6 +5,10 @@ edition = "2021"
 description = "DevManager native GPUI client and durable local host"
 license = "Apache-2.0"
 
+[workspace]
+members = [".", "crates/connect-crypto"]
+resolver = "2"
+
 [[bin]]
 name = "devmanager"
 path = "src/main.rs"

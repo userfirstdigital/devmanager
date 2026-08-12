@@ -44,6 +44,7 @@ Machine-checked against `Cargo.lock` by `packaging/Assert-ThirdPartyProvenance.p
 | `web-push-native` | `0.4.0` | yes |
 | `getrandom` | `0.3.4` | yes |
 | `base64` | `0.22.1` | yes |
+| `wasm-bindgen` | `0.2.114` | no (WASM leaf feature) |
 
 Connect production Noise is the pinned `snow` 0.10.0 crate listed above. Connect relay TLS uses `tokio-rustls` 0.26.4 plus `webpki-roots` 1.0.6 for `wss://` only. Packaging must not embed private keys, pairing secrets, or OS-vault material.
 
@@ -56,6 +57,13 @@ Connect production Noise is the pinned `snow` 0.10.0 crate listed above. Connect
 - Locked checksum: `599b506ccc4aff8cf7844bc42cf783009a434c1e26c964432560fb6d6ad02d82`
 - RustSec advisory RUSTSEC-2024-0011 (unauthenticated nonce increment on stateful `TransportState`) is patched in `snow >= 0.9.5`. This pin is 0.10.0.
 - This is a security-note/risk record, not an audit. Production Connect uses snow's Noise XX/IK implementation rather than a homemade HMAC substitute.
+
+## connect-crypto 0.1.0 (browser WASM leaf)
+
+- This workspace crate is a thin WASM facade over the native `src/protocol/crypto.rs` implementation; it does not contain a JavaScript crypto reimplementation.
+- The optional `wasm` feature pins `wasm-bindgen = "=0.2.114"`; generated JS/WASM output is a build artifact and must not be committed with private keys or pairing material.
+- The leaf uses the exact locked `snow 0.10.0`, `hmac 0.12.1`, `sha2 0.10.9`, `rmp-serde 1.3.1`, `serde 1.0.228`, `serde_json 1.0.149`, `uuid 1.24.0`, `base64 0.22.1`, `getrandom 0.3.4`, and `zeroize 1.8.2` versions.
+- Release builds must run native/WASM interoperability fixtures before publishing generated artifacts; this source-only change intentionally produces no generated output.
 
 The selected Noise feature graph also includes `chacha20poly1305` 0.10.1,
 `chacha20` 0.9.1, and `poly1305` 0.8.0 (Apache-2.0 OR MIT), plus
