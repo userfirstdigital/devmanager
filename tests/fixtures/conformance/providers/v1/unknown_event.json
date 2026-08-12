@@ -1,0 +1,44 @@
+{
+  "case_id": "unknown_event_type",
+  "provider": "codex",
+  "version": "0.40.0",
+  "task_id": "018f0000-0000-7000-8000-000000000001",
+  "agent_id": "018f0000-0000-7000-8000-000000000002",
+  "generation": 1,
+  "action_id": "018f0000-0000-7000-8000-000000000003",
+  "nonce": "nonce-unknown-event",
+  "cli_launchable": true,
+  "probe_ok": true,
+  "resume_command_proven": true,
+  "provider_session_id": "sess_fixture_unknown",
+  "capabilities": {
+    "kind": "codex",
+    "version": "0.40.0",
+    "auth_state": "unknown",
+    "exact_resume": "supported",
+    "semantic_events": "supported",
+    "provider_session_id": "supported",
+    "build_launch": "supported",
+    "parse_signal": "supported",
+    "cooperative_stop": "unknown",
+    "observe_quota": "unknown",
+    "evidence": [
+      {
+        "source": "capability_probe",
+        "observed_at": 1,
+        "status": "supported"
+      }
+    ]
+  },
+  "events": [
+    { "type": "session_start", "provider_event_id": "e1" },
+    { "type": "future_widget_event", "provider_event_id": "e2", "schema_version": 9 },
+    { "type": "turn_completed", "provider_event_id": "e3" }
+  ],
+  "declared_metrics": [
+    "normalized_event_count",
+    "normalized_event_order",
+    "unknown_event_fallback",
+    "terminal_fallback"
+  ]
+}

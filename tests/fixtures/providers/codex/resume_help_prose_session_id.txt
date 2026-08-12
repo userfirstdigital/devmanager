@@ -1,0 +1,12 @@
+Resume a previous interactive session
+
+Do not pass [SESSION_ID] when using --last to continue the most recent session.
+
+Usage: codex resume [OPTIONS]
+
+Options:
+      --last
+          Continue the most recent session without showing the picker
+
+  -h, --help
+          Print help

@@ -202,7 +202,7 @@ pub(crate) fn apply_event(
                     agent.id.as_bytes().as_slice(),
                     agent.task_id.as_bytes().as_slice(),
                     pack(&agent.role)?,
-                    agent.provider_kind,
+                    agent.provider_kind.wire_name(),
                     agent.provider_session_id,
                     agent_lifecycle_text(agent.lifecycle),
                     u64_to_sqlite_i64(
@@ -213,6 +213,10 @@ pub(crate) fn apply_event(
                 ],
             )?;
             bump_task_revision(tx, shadow, task_id, event)?;
+            upsert_provider_session_state(tx, shadow, task_id, agent.id, |session| {
+                let _ = session;
+                Ok(())
+            })?;
         }
         Event::PrimaryAgentSet { agent_session_id } => {
             let task_id = require_task_id(event)?;
@@ -324,6 +328,370 @@ pub(crate) fn apply_event(
                 event.occurred_at_ms,
             )?;
             bump_task_revision(tx, shadow, task_id, event)?;
+        }
+        Event::ProviderInputAccepted {
+            command_id,
+            client_id,
+            operation_id,
+            agent_session_id,
+            provider_kind,
+            provider_session_id,
+            runtime_generation,
+            turn_id,
+            action_epoch,
+            question_id,
+            approval_id,
+            action,
+            wait,
+            delivery,
+        } => {
+            let task_id = require_task_id(event)?;
+            let (_, epoch) = read_task_lifecycle_epoch(tx, shadow, task_id)?;
+            let stored_epoch = u64_from_nonnegative_i64("tasks.action_epoch", epoch)?;
+            if stored_epoch != *action_epoch {
+                return Err(StoreError::Projection(
+                    "provider input action_epoch does not match task fence".into(),
+                ));
+            }
+            if delivery.is_delivered() {
+                return Err(StoreError::Projection(
+                    "provider input cannot project Delivered without a destination adapter".into(),
+                ));
+            }
+            upsert_provider_session_state(tx, shadow, task_id, *agent_session_id, |session| {
+                let context = read_provider_fence_context(
+                    tx,
+                    shadow,
+                    task_id,
+                    *agent_session_id,
+                    session.current_turn,
+                    false,
+                )?;
+                let fence = crate::domain::provider_input::ProviderFenceIdentity::new_with_identity(
+                    Some(*command_id),
+                    Some(task_id),
+                    *agent_session_id,
+                    provider_kind.clone(),
+                    provider_session_id.clone(),
+                    Some(*operation_id),
+                    *runtime_generation,
+                    *action_epoch,
+                    *turn_id,
+                    *question_id,
+                    *approval_id,
+                );
+                crate::domain::provider_input::validate_provider_fence(
+                    &fence,
+                    Some(action),
+                    Some(*wait),
+                    Some(&context),
+                )
+                .map_err(|err| StoreError::Projection(err.to_string()))?;
+                match action {
+                    crate::domain::ProviderInputAction::AnswerQuestion { question_id, .. } => {
+                        if session.question_winners.contains_key(question_id) {
+                            return Err(StoreError::Projection(
+                                "provider question winner already exists".into(),
+                            ));
+                        }
+                        if session.open_question != Some(*question_id) {
+                            return Err(StoreError::Projection(
+                                "provider question is not open".into(),
+                            ));
+                        }
+                    }
+                    crate::domain::ProviderInputAction::ResolveApproval { approval_id, .. } => {
+                        if session.approval_winners.contains_key(approval_id) {
+                            return Err(StoreError::Projection(
+                                "provider approval winner already exists".into(),
+                            ));
+                        }
+                        if session.open_approval != Some(*approval_id) {
+                            return Err(StoreError::Projection(
+                                "provider approval is not open".into(),
+                            ));
+                        }
+                    }
+                    _ => {}
+                }
+                session.current_turn = Some(*turn_id);
+                session.last_settlement =
+                    Some(crate::domain::provider_input::ProviderInputSettlement {
+                        command_id: *command_id,
+                        operation_id: Some(*operation_id),
+                        intent: crate::domain::provider_input::ProviderIntentPhase::Accepted,
+                        delivery: *delivery,
+                    });
+                let winner = crate::domain::provider_input::ProviderResolutionWinner {
+                    command_id: *command_id,
+                    client_id: *client_id,
+                    accepted_at_ms: event.occurred_at_ms,
+                };
+                match action {
+                    crate::domain::ProviderInputAction::AnswerQuestion {
+                        question_id: qid, ..
+                    } => {
+                        session
+                            .bounded_insert_question_winner(*qid, winner)
+                            .map_err(|err| StoreError::Projection(err.to_string()))?;
+                        session.open_question = None;
+                    }
+                    crate::domain::ProviderInputAction::ResolveApproval {
+                        approval_id: aid,
+                        ..
+                    } => {
+                        session
+                            .bounded_insert_approval_winner(*aid, winner)
+                            .map_err(|err| StoreError::Projection(err.to_string()))?;
+                        session.open_approval = None;
+                    }
+                    _ => {}
+                }
+                if *wait {
+                    session
+                        .bounded_insert_wait(
+                            *command_id,
+                            crate::domain::provider_input::ProviderWaitRecord {
+                                fence: crate::domain::provider_input::ProviderWaitFence::new_with_identity(
+                                    *command_id,
+                                    task_id,
+                                    *operation_id,
+                                    *action_epoch,
+                                    *agent_session_id,
+                                    provider_kind.clone(),
+                                    provider_session_id.clone(),
+                                    *runtime_generation,
+                                    *turn_id,
+                                    *question_id,
+                                    *approval_id,
+                                ),
+                                pending: true,
+                            },
+                        )
+                        .map_err(|err| StoreError::Projection(err.to_string()))?;
+                }
+                Ok(())
+            })?;
+            bump_task_revision(tx, shadow, task_id, event)?;
+        }
+        Event::ProviderQuestionPresented {
+            agent_session_id,
+            provider_kind,
+            provider_session_id,
+            runtime_generation,
+            turn_id,
+            question_id,
+            action_epoch,
+        } => {
+            let task_id = require_task_id(event)?;
+            upsert_provider_session_state(tx, shadow, task_id, *agent_session_id, |session| {
+                let context = read_provider_fence_context(
+                    tx,
+                    shadow,
+                    task_id,
+                    *agent_session_id,
+                    session.current_turn,
+                    false,
+                )?;
+                let fence = crate::domain::provider_input::ProviderFenceIdentity::new_with_identity(
+                    None,
+                    Some(task_id),
+                    *agent_session_id,
+                    provider_kind.clone(),
+                    provider_session_id.clone(),
+                    None,
+                    *runtime_generation,
+                    *action_epoch,
+                    *turn_id,
+                    Some(*question_id),
+                    None,
+                );
+                crate::domain::provider_input::validate_provider_fence(
+                    &fence,
+                    None,
+                    None,
+                    Some(&context),
+                )
+                .map_err(|err| StoreError::Projection(err.to_string()))?;
+                if session.question_winners.contains_key(question_id) {
+                    return Err(StoreError::Projection(
+                        "provider question winner already exists".into(),
+                    ));
+                }
+                if session.open_question.is_some() {
+                    return Err(StoreError::Projection(
+                        "provider question is already open".into(),
+                    ));
+                }
+                session.current_turn = Some(*turn_id);
+                session.open_question = Some(*question_id);
+                Ok(())
+            })?;
+            bump_task_revision(tx, shadow, task_id, event)?;
+        }
+        Event::ProviderApprovalPresented {
+            agent_session_id,
+            provider_kind,
+            provider_session_id,
+            runtime_generation,
+            turn_id,
+            approval_id,
+            action_epoch,
+        } => {
+            let task_id = require_task_id(event)?;
+            upsert_provider_session_state(tx, shadow, task_id, *agent_session_id, |session| {
+                let context = read_provider_fence_context(
+                    tx,
+                    shadow,
+                    task_id,
+                    *agent_session_id,
+                    session.current_turn,
+                    false,
+                )?;
+                let fence = crate::domain::provider_input::ProviderFenceIdentity::new_with_identity(
+                    None,
+                    Some(task_id),
+                    *agent_session_id,
+                    provider_kind.clone(),
+                    provider_session_id.clone(),
+                    None,
+                    *runtime_generation,
+                    *action_epoch,
+                    *turn_id,
+                    None,
+                    Some(*approval_id),
+                );
+                crate::domain::provider_input::validate_provider_fence(
+                    &fence,
+                    None,
+                    None,
+                    Some(&context),
+                )
+                .map_err(|err| StoreError::Projection(err.to_string()))?;
+                if session.approval_winners.contains_key(approval_id) {
+                    return Err(StoreError::Projection(
+                        "provider approval winner already exists".into(),
+                    ));
+                }
+                if session.open_approval.is_some() {
+                    return Err(StoreError::Projection(
+                        "provider approval is already open".into(),
+                    ));
+                }
+                session.current_turn = Some(*turn_id);
+                session.open_approval = Some(*approval_id);
+                Ok(())
+            })?;
+            bump_task_revision(tx, shadow, task_id, event)?;
+        }
+        Event::ProviderWaitSettled { fence } => {
+            let task_id = require_task_id(event)?;
+            upsert_provider_session_state(
+                tx,
+                shadow,
+                task_id,
+                fence.agent_session_id(),
+                |session| {
+                    let context = read_provider_fence_context(
+                        tx,
+                        shadow,
+                        task_id,
+                        fence.agent_session_id(),
+                        session.current_turn,
+                        true,
+                    )?;
+                    crate::domain::provider_input::validate_provider_fence(
+                        &fence.identity(),
+                        None,
+                        None,
+                        Some(&context),
+                    )
+                    .map_err(|err| StoreError::Projection(err.to_string()))?;
+                    let record = session.waits.get_mut(&fence.command_id()).ok_or_else(|| {
+                        StoreError::Projection("provider wait settlement missing wait".into())
+                    })?;
+                    if !record.fence.matches(fence) {
+                        return Err(StoreError::Projection(
+                            "provider wait settlement fence mismatch".into(),
+                        ));
+                    }
+                    if !record.pending {
+                        return Err(StoreError::Projection(
+                            "provider wait settlement is already settled".into(),
+                        ));
+                    }
+                    record.pending = false;
+                    Ok(())
+                },
+            )?;
+            bump_task_revision(tx, shadow, task_id, event)?;
+        }
+        Event::ProviderInputDelivered {
+            command_id,
+            operation_id,
+            agent_session_id,
+            provider_kind,
+            provider_session_id,
+            runtime_generation,
+            turn_id,
+            action_epoch,
+            question_id,
+            approval_id,
+            ..
+        } => {
+            let task_id = require_task_id(event)?;
+            upsert_provider_session_state(tx, shadow, task_id, *agent_session_id, |session| {
+                let context = read_provider_fence_context(
+                    tx,
+                    shadow,
+                    task_id,
+                    *agent_session_id,
+                    session.current_turn,
+                    true,
+                )?;
+                let fence = crate::domain::provider_input::ProviderFenceIdentity::new_with_identity(
+                    Some(*command_id),
+                    Some(task_id),
+                    *agent_session_id,
+                    provider_kind.clone(),
+                    provider_session_id.clone(),
+                    Some(*operation_id),
+                    *runtime_generation,
+                    *action_epoch,
+                    *turn_id,
+                    *question_id,
+                    *approval_id,
+                );
+                crate::domain::provider_input::validate_provider_fence(
+                    &fence,
+                    None,
+                    None,
+                    Some(&context),
+                )
+                .map_err(|err| StoreError::Projection(err.to_string()))?;
+                let Some(settlement) = session.last_settlement else {
+                    return Err(StoreError::Projection(
+                        "provider delivery missing accepted settlement".into(),
+                    ));
+                };
+                if settlement.command_id != *command_id
+                    || settlement.operation_id != Some(*operation_id)
+                    || settlement.delivery.is_delivered()
+                {
+                    return Err(StoreError::Projection(
+                        "provider delivery settlement mismatch".into(),
+                    ));
+                }
+                session.last_settlement =
+                    Some(crate::domain::provider_input::ProviderInputSettlement {
+                        command_id: *command_id,
+                        operation_id: Some(*operation_id),
+                        intent: crate::domain::provider_input::ProviderIntentPhase::Accepted,
+                        delivery:
+                            crate::domain::provider_input::ProviderDeliveryVisibility::delivered(),
+                    });
+                Ok(())
+            })?;
         }
         Event::HostCloseBegun {
             operation_id,
@@ -798,6 +1166,75 @@ fn require_one_change(tx: &Transaction<'_>, context: &str) -> Result<(), StoreEr
         )));
     }
     Ok(())
+}
+
+fn read_provider_fence_context(
+    tx: &Transaction<'_>,
+    shadow: bool,
+    task_id: TaskId,
+    agent_session_id: AgentSessionId,
+    current_turn: Option<crate::domain::id::TurnId>,
+    allow_closing: bool,
+) -> Result<crate::domain::provider_input::ProviderFenceContext, StoreError> {
+    let table = table_name("agent_sessions", shadow);
+    let row: Result<(Vec<u8>, String, String, Option<String>, i64), rusqlite::Error> = tx.query_row(
+        &format!(
+            "SELECT task_id, lifecycle, provider_kind, provider_session_id, runtime_generation FROM {table}
+             WHERE agent_session_id = ?1"
+        ),
+        [agent_session_id.as_bytes().as_slice()],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+    );
+    let (agent_task_bytes, lifecycle, provider_kind, provider_session_id, runtime_generation) =
+        match row {
+            Ok(value) => value,
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                return Err(StoreError::Projection(
+                    "provider fence agent session not found".into(),
+                ))
+            }
+            Err(err) => return Err(err.into()),
+        };
+    let agent_task_bytes: [u8; 16] = agent_task_bytes.try_into().map_err(|bytes: Vec<u8>| {
+        StoreError::Projection(format!(
+            "provider fence agent task id must be 16 bytes, got {}",
+            bytes.len()
+        ))
+    })?;
+    let agent_task_id = TaskId::from_bytes(agent_task_bytes)
+        .map_err(|err| StoreError::Projection(err.to_string()))?;
+    let lifecycle = match lifecycle.as_str() {
+        "open" => crate::domain::agent::AgentSessionLifecycle::Open,
+        "closing" => crate::domain::agent::AgentSessionLifecycle::Closing,
+        "closed" => crate::domain::agent::AgentSessionLifecycle::Closed,
+        other => {
+            return Err(StoreError::Projection(format!(
+                "provider fence agent lifecycle is invalid: {other}"
+            )))
+        }
+    };
+    let provider_kind = crate::domain::provider_input::ProviderKind::new(provider_kind)
+        .map_err(|err| StoreError::Projection(err.to_string()))?;
+    let provider_session_id = provider_session_id
+        .map(crate::domain::agent::ProviderSessionId::new)
+        .transpose()
+        .map_err(|err| StoreError::Projection(err.to_string()))?;
+    let (_, action_epoch) = read_task_lifecycle_epoch(tx, shadow, task_id)?;
+    Ok(crate::domain::provider_input::ProviderFenceContext {
+        task_id,
+        agent_session_id,
+        agent_task_id,
+        provider_kind,
+        provider_session_id,
+        runtime_generation: u64_from_nonnegative_i64(
+            "agent_sessions.runtime_generation",
+            runtime_generation,
+        )?,
+        action_epoch: u64_from_nonnegative_i64("tasks.action_epoch", action_epoch)?,
+        lifecycle,
+        current_turn,
+        allow_closing,
+    })
 }
 
 fn read_task_lifecycle_epoch(
@@ -1326,17 +1763,9 @@ fn load_event_at_sequence(
     tx: &Transaction<'_>,
     sequence: u64,
 ) -> Result<Option<(EventId, Event, Option<u64>, i64, Option<TaskId>)>, StoreError> {
-    let row: Option<(
-        Vec<u8>,
-        Option<Vec<u8>>,
-        Option<i64>,
-        String,
-        i64,
-        Vec<u8>,
-        i64,
-    )> = tx
+    let row: Option<(Vec<u8>, Option<Vec<u8>>, Option<i64>, String, i64, i64, i64)> = tx
         .query_row(
-            "SELECT event_id, task_id, task_revision, event_type, schema_version, payload,
+            "SELECT event_id, task_id, task_revision, event_type, schema_version, length(payload),
                     occurred_at_ms
              FROM events WHERE sequence = ?1",
             [u64_to_sqlite_i64("events.sequence", sequence)?],
@@ -1359,12 +1788,27 @@ fn load_event_at_sequence(
         task_revision,
         event_type,
         schema_version,
-        payload,
+        payload_len,
         occurred_at_ms,
     )) = row
     else {
         return Ok(None);
     };
+    let payload_len = usize::try_from(payload_len).map_err(|_| StoreError::CodecMismatch {
+        detail: "event payload length is invalid".into(),
+    })?;
+    if event_type.starts_with("provider_input.")
+        && payload_len > crate::kernel::store::MAX_PROVIDER_EVENT_PAYLOAD_BYTES
+    {
+        return Err(StoreError::CodecMismatch {
+            detail: "provider event payload exceeds its byte bound".into(),
+        });
+    }
+    let payload: Vec<u8> = tx.query_row(
+        "SELECT payload FROM events WHERE sequence = ?1",
+        [u64_to_sqlite_i64("events.sequence", sequence)?],
+        |row| row.get(0),
+    )?;
     let event_id = event_id_from_bytes_local(&event_id_bytes)?;
     let task_id = match task_bytes {
         Some(bytes) => Some(task_id_from_bytes_local(&bytes)?),
@@ -1437,17 +1881,9 @@ fn load_prior_event_row(
     }
     // Adjacency is the immediately previous *existing* durable row, not sequence-1
     // (AUTOINCREMENT gaps must not hide orphan derived results).
-    let row: Option<(
-        Vec<u8>,
-        Option<Vec<u8>>,
-        Option<i64>,
-        String,
-        i64,
-        Vec<u8>,
-        i64,
-    )> = tx
+    let row: Option<(Vec<u8>, Option<Vec<u8>>, Option<i64>, String, i64, i64, i64)> = tx
         .query_row(
-            "SELECT event_id, task_id, task_revision, event_type, schema_version, payload,
+            "SELECT event_id, task_id, task_revision, event_type, schema_version, length(payload),
                     occurred_at_ms
              FROM events
              WHERE sequence < ?1
@@ -1473,12 +1909,30 @@ fn load_prior_event_row(
         task_revision,
         event_type,
         schema_version,
-        payload,
+        payload_len,
         occurred_at_ms,
     )) = row
     else {
         return Ok(None);
     };
+    let payload_len = usize::try_from(payload_len).map_err(|_| StoreError::CodecMismatch {
+        detail: "event payload length is invalid".into(),
+    })?;
+    if event_type.starts_with("provider_input.")
+        && payload_len > crate::kernel::store::MAX_PROVIDER_EVENT_PAYLOAD_BYTES
+    {
+        return Err(StoreError::CodecMismatch {
+            detail: "provider event payload exceeds its byte bound".into(),
+        });
+    }
+    let payload: Vec<u8> = tx.query_row(
+        "SELECT payload FROM events
+         WHERE sequence < ?1
+         ORDER BY sequence DESC
+         LIMIT 1",
+        [u64_to_sqlite_i64("events.sequence", sequence)?],
+        |row| row.get(0),
+    )?;
     let event_id = event_id_from_bytes_local(&event_id_bytes)?;
     let task_id = match task_bytes {
         Some(bytes) => Some(task_id_from_bytes_local(&bytes)?),
@@ -1500,17 +1954,33 @@ fn load_prior_event_row(
 
 /// Rebuild flush: last durable event must not be an orphan derived result.
 pub(crate) fn ensure_no_trailing_orphan_derived(tx: &Transaction<'_>) -> Result<(), StoreError> {
-    let row: Option<(String, i64, Vec<u8>)> = tx
-        .query_row(
-            "SELECT event_type, schema_version, payload FROM events
-             ORDER BY sequence DESC LIMIT 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .optional()?;
-    let Some((event_type, schema_version, payload)) = row else {
+    let mut statement = tx.prepare(
+        "SELECT event_type, schema_version, payload FROM events
+         ORDER BY sequence DESC LIMIT 1",
+    )?;
+    let mut rows = statement.query([])?;
+    let Some(row) = rows.next()? else {
         return Ok(());
     };
+    let event_type: String = row.get(0)?;
+    let schema_version: i64 = row.get(1)?;
+    let payload_ref = row.get_ref(2)?;
+    let payload_bytes = payload_ref
+        .as_blob()
+        .map_err(|error| StoreError::CodecMismatch {
+            detail: format!("provider event payload is not a BLOB: {error}"),
+        })?;
+    if event_type.starts_with("provider_input.")
+        && payload_bytes.len() > crate::kernel::store::MAX_PROVIDER_EVENT_PAYLOAD_BYTES
+    {
+        return Err(StoreError::CodecMismatch {
+            detail: format!(
+                "provider event payload exceeds {} bytes",
+                crate::kernel::store::MAX_PROVIDER_EVENT_PAYLOAD_BYTES
+            ),
+        });
+    }
+    let payload = payload_bytes.to_vec();
     let decoded = decode_stored_event(&event_type, schema_version, &payload)?;
     if is_derived_lifecycle_result(&decoded) {
         return Err(StoreError::Projection(
@@ -1562,6 +2032,102 @@ fn opt_u64(field: &'static str, value: Option<u64>) -> Result<Option<i64>, Store
         Some(v) => Ok(Some(u64_to_sqlite_i64(field, v)?)),
         None => Ok(None),
     }
+}
+
+fn upsert_provider_session_state(
+    tx: &Transaction<'_>,
+    shadow: bool,
+    task_id: TaskId,
+    agent_session_id: AgentSessionId,
+    mutate: impl FnOnce(
+        &mut crate::domain::provider_input::ProviderSessionProjection,
+    ) -> Result<(), StoreError>,
+) -> Result<(), StoreError> {
+    let table = table_name("provider_input_state", shadow);
+    // Probe lengths before asking rusqlite to materialize either BLOB. This is
+    // the SQL-side half of the projection bound: malformed persisted state must
+    // fail closed without allocating an attacker-sized MessagePack buffer.
+    let lengths: Option<(i64, i64)> = tx
+        .query_row(
+            &format!(
+                "SELECT length(task_id), length(state) FROM {table}
+                 WHERE agent_session_id = ?1"
+            ),
+            [agent_session_id.as_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let had_row = lengths.is_some();
+    let mut session = match lengths {
+        Some((task_id_len, state_len)) => {
+            if task_id_len != 16 {
+                return Err(StoreError::Projection(
+                    "provider_input_state task id must be 16 bytes".into(),
+                ));
+            }
+            let max_state_len = i64::try_from(crate::domain::MAX_PROVIDER_SESSION_STATE_BYTES)
+                .map_err(|_| {
+                    StoreError::Projection("provider state bound is out of range".into())
+                })?;
+            if state_len < 0 || state_len > max_state_len {
+                return Err(StoreError::Projection(
+                    "provider_input_state.state exceeds its byte bound".into(),
+                ));
+            }
+            let (stored_task_bytes, bytes): (Vec<u8>, Vec<u8>) = tx.query_row(
+                &format!("SELECT task_id, state FROM {table} WHERE agent_session_id = ?1"),
+                [agent_session_id.as_bytes().as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            if task_id_from_bytes_local(&stored_task_bytes)? != task_id {
+                return Err(StoreError::Projection(
+                    "provider_input_state task scope mismatch".into(),
+                ));
+            }
+            if i64::try_from(bytes.len()).ok() != Some(state_len) {
+                return Err(StoreError::Projection(
+                    "provider_input_state.state length changed during read".into(),
+                ));
+            }
+            rmp_serde::from_slice(&bytes).map_err(|err| {
+                StoreError::Projection(format!("provider_input_state.state decode: {err}"))
+            })?
+        }
+        None => crate::domain::provider_input::ProviderSessionProjection::default(),
+    };
+    session
+        .validate_bounds()
+        .map_err(|err| StoreError::Projection(err.to_string()))?;
+    mutate(&mut session)?;
+    session
+        .validate_bounds()
+        .map_err(|err| StoreError::Projection(err.to_string()))?;
+    let packed = pack(&session)?;
+    if packed.len() > crate::domain::MAX_PROVIDER_SESSION_STATE_BYTES {
+        return Err(StoreError::Projection(
+            "provider_input_state exceeded its byte bound".into(),
+        ));
+    }
+    if had_row {
+        tx.execute(
+            &format!("UPDATE {table} SET task_id = ?1, state = ?2 WHERE agent_session_id = ?3"),
+            rusqlite::params![
+                task_id.as_bytes().as_slice(),
+                packed,
+                agent_session_id.as_bytes().as_slice(),
+            ],
+        )?;
+    } else {
+        tx.execute(
+            &format!("INSERT INTO {table}(agent_session_id, task_id, state) VALUES (?1, ?2, ?3)"),
+            rusqlite::params![
+                agent_session_id.as_bytes().as_slice(),
+                task_id.as_bytes().as_slice(),
+                packed,
+            ],
+        )?;
+    }
+    Ok(())
 }
 
 /// Pack a projection MessagePack blob. Same encoding the store uses when writing.

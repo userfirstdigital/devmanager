@@ -1740,6 +1740,7 @@ impl ClientModelBuilder {
                     primary_agent_id: item.primary_agent_id,
                     artifacts: BTreeMap::new(),
                     resources: BTreeMap::new(),
+                    provider_sessions: BTreeMap::new(),
                 },
             );
         }
@@ -1897,6 +1898,7 @@ mod tests {
         ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity, TaskFacts,
         TaskLifecycle, WorkspaceRef,
     };
+    use crate::providers::ProviderKind;
 
     fn fixed_uuid_v7(tail: u8) -> [u8; 16] {
         [
@@ -2054,8 +2056,8 @@ mod tests {
                     id: agent,
                     task_id: task,
                     role: AgentRole::Primary,
-                    provider_kind: "claude".into(),
-                    provider_session_id: Some("sess-1".into()),
+                    provider_kind: ProviderKind::ClaudeCode,
+                    provider_session_id: Some("sess-1".parse().unwrap()),
                     lifecycle: AgentSessionLifecycle::Open,
                     runtime_generation: 0,
                     revision: 0,

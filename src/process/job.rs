@@ -1,5 +1,7 @@
 //! Windows Job Object ownership for managed process trees.
 
+use std::time::{Duration, Instant};
+
 #[cfg(windows)]
 use std::ffi::c_void;
 #[cfg(windows)]
@@ -290,6 +292,7 @@ extern "system" {
         size: *mut u32,
     ) -> i32;
     fn IsProcessInJob(process: *mut c_void, job: *mut c_void, result: *mut i32) -> i32;
+    fn TerminateJobObject(job: *mut c_void, exit_code: u32) -> i32;
 }
 
 #[cfg(windows)]
@@ -613,6 +616,27 @@ impl ManagedProcessJob {
         }
     }
 
+    /// Terminates every process currently owned by this Job Object without
+    /// dropping ownership. Callers can then wait for the authoritative
+    /// ACTIVE_PROCESS_ZERO state before releasing the Job handle.
+    pub fn terminate_members(&self) -> Result<(), String> {
+        #[cfg(windows)]
+        unsafe {
+            if TerminateJobObject(self.raw_job_handle(), 1) == 0 {
+                return Err(format!(
+                    "TerminateJobObject failed: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            Ok(())
+        }
+
+        #[cfg(not(windows))]
+        {
+            Ok(())
+        }
+    }
+
     pub(crate) fn terminate_tree_until(
         &self,
         absolute_deadline: std::time::Instant,
@@ -627,7 +651,21 @@ impl ManagedProcessJob {
         Ok(())
     }
 
-    pub(crate) fn inspect_process(&self, pid: u32) -> Result<JobMemberInfo, String> {
+    /// Waits for the Job's authoritative empty state until the deadline.
+    pub fn wait_for_active_process_zero(&self, deadline: Instant) -> Result<bool, String> {
+        loop {
+            if self.active_process_ids()?.is_empty() {
+                return Ok(true);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(false);
+            }
+            std::thread::sleep((deadline - now).min(Duration::from_millis(5)));
+        }
+    }
+
+    pub fn inspect_process(&self, pid: u32) -> Result<JobMemberInfo, String> {
         #[cfg(windows)]
         {
             inspect_windows_process(self.raw_job_handle(), pid)

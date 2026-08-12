@@ -1,0 +1,31 @@
+Usage: agent [options] [command] [prompt...]
+
+Cursor Agent CLI. When no command is specified, starts an interactive
+agent session in the terminal.
+
+Options:
+  -v, --version              Output the version number
+  -h, --help                 Display help for command
+  -p, --print                Print responses (non-interactive; not a TTY session)
+  --output-format <format>   text|json|stream-json (only with --print)
+  --resume [chatId]          Resume a chat session
+  --continue                 Continue the previous session (alias for --resume=-1)
+  --model <model>            Model to use
+  --mode <mode>              Set agent mode: plan or ask
+  --workspace <dir>          Workspace directory to use
+
+Commands:
+  login                      Authenticate with Cursor
+  logout                     Sign out and clear stored authentication
+  status                     View authentication status
+  whoami                     View authentication status
+  about                      Display version, system, and account info
+  ls                         Open previous chats
+  resume                     Resume the latest chat session
+  create-chat                Create a new empty chat and return its ID
+  help [command]             Display help for command
+
+Auth note: subscription login is `agent login` / `agent status`.
+This CLI does not document `auth status`, SessionStart hooks, or a
+host-relayed provider session id for interactive terminal mode.
+Quota is not exposed by a local subscription CLI status command.

@@ -20,6 +20,7 @@ use devmanager::domain::task::{
 };
 use devmanager::host::{ProcessEmptyTeardown, ProcessEmptyTeardownWorker};
 use devmanager::kernel::{CommandBus, KernelStore, StoreError};
+use devmanager::providers::ProviderKind;
 use rusqlite::{Connection, OptionalExtension};
 use tempfile::TempDir;
 
@@ -1378,6 +1379,7 @@ fn fabricated_cleanup_mutation_count(path: &Path) -> i64 {
 fn register_open_agent(bus: &mut CommandBus, task: TaskId, cmd: CommandId, rev: u64) {
     use devmanager::domain::agent::{AgentRole, AgentSessionFacts, AgentSessionLifecycle};
     use devmanager::domain::id::AgentSessionId;
+    use devmanager::providers::ProviderKind;
 
     let receipt = bus
         .execute(envelope(
@@ -1389,8 +1391,10 @@ fn register_open_agent(bus: &mut CommandBus, task: TaskId, cmd: CommandId, rev: 
                     id: AgentSessionId::from_bytes(fixed_uuid_v7(0xA1)).expect("agent id"),
                     task_id: task,
                     role: AgentRole::Primary,
-                    provider_kind: "claude".into(),
-                    provider_session_id: Some("session-sentinel".into()),
+                    provider_kind: ProviderKind::ClaudeCode,
+                    provider_session_id: Some(
+                        "session-sentinel".parse().expect("provider session"),
+                    ),
                     lifecycle: AgentSessionLifecycle::Open,
                     runtime_generation: 0,
                     revision: 0,

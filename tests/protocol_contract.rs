@@ -21,6 +21,7 @@ use devmanager::protocol::{
     VersionNegotiationError, MAX_CLIENT_BUILD_BYTES, MAX_MESSAGEPACK_COLLECTION_ITEMS,
     MAX_MESSAGEPACK_DEPTH, MAX_MESSAGEPACK_VALUES, PROTOCOL_MAJOR, PROTOCOL_MINOR,
 };
+use devmanager::providers::ProviderKind;
 use uuid::Uuid;
 
 #[test]
@@ -40,6 +41,7 @@ fn protocol_capability_bits_are_stable_and_unknown_bits_are_tolerated() {
         (Capability::ManagementMetadata, 11),
         (Capability::ExplicitDetach, 12),
         (Capability::HostShutdown, 13),
+        (Capability::ProviderInput, 14),
     ];
     for (capability, bit_index) in named {
         assert_eq!(capability.bit(), 1_u64 << bit_index);
@@ -996,6 +998,7 @@ fn protocol_command_receipt_preserves_command_and_accepted_operation_correlation
         command_id: protocol_command_id(0x65),
         code: RejectionCode::RevisionConflict,
         current_revision: None,
+        resolution: None,
     };
     assert_eq!(rejected.command_id(), protocol_command_id(0x65));
     assert_eq!(rejected.accepted_operation_id(), None);
@@ -1027,6 +1030,8 @@ fn protocol_command_receipt_preserves_command_and_accepted_operation_correlation
             "unsupported_capability",
         ),
         (RejectionCode::Closing, "closing"),
+        (RejectionCode::IdempotencyConflict, "idempotency_conflict"),
+        (RejectionCode::AlreadyResolved, "already_resolved"),
     ]
     .into_iter()
     .enumerate()
@@ -1035,6 +1040,7 @@ fn protocol_command_receipt_preserves_command_and_accepted_operation_correlation
             command_id: protocol_command_id(0xA0 + u8::try_from(index).unwrap()),
             code,
             current_revision: Some(3),
+            resolution: None,
         };
         assert_eq!(
             codec
@@ -2803,6 +2809,7 @@ fn protocol_server_message_unsolicited_variants_are_strict_named_maps() {
                     command_id: protocol_command_id(0xd8),
                     code: RejectionCode::NotFound,
                     current_revision: None,
+                    resolution: None,
                 },
             )?;
             map.serialize_entry(
@@ -4688,6 +4695,7 @@ fn protocol_inspect_host_quit_is_strict_empty_named_query_and_result() {
 
     let codec = MessagePackCodec::from_limits(FrameLimits::v1_default()).expect("codec");
     assert_eq!(Capability::HostShutdown.bit(), 1_u64 << 13);
+    assert_eq!(Capability::ProviderInput.bit(), 1_u64 << 14);
 
     let inspection = HostQuitInspection {
         inspection_id: 42,
@@ -4696,7 +4704,7 @@ fn protocol_inspect_host_quit_is_strict_empty_named_query_and_result() {
             task_id: protocol_task_id(0x11),
             task_title: "Quit blockers".into(),
             role: AgentRole::Primary,
-            provider_kind: "claude".into(),
+            provider_kind: ProviderKind::ClaudeCode,
             lifecycle: AgentSessionLifecycle::Open,
             runtime_generation: 0,
         }],

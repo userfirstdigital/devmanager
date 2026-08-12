@@ -1972,6 +1972,10 @@ impl HostRequestExecutor {
                 {
                     return Err(IpcError::UnsupportedCapability);
                 }
+                validate_authenticated_command_capability(
+                    negotiated.capabilities,
+                    &envelope.command,
+                )?;
                 let connection_id = output_id
                     .map(ConnectionOutputId::as_uuid)
                     .unwrap_or(Uuid::nil());
@@ -3023,6 +3027,7 @@ fn dispatch_authenticated_request_inner(
             {
                 return Err(IpcError::UnsupportedCapability);
             }
+            validate_authenticated_command_capability(capabilities, &envelope.command)?;
             // The compatibility transport has no resumable connection
             // identity. Keep its receipt unbound so a later registered output
             // can claim the exact same receipt once.
@@ -3077,6 +3082,27 @@ fn dispatch_authenticated_request_inner(
             Ok(ServerMessage::QueryReply(reply))
         }
         ClientRequest::Detach(_) => Err(IpcError::Unavailable),
+    }
+}
+
+/// Capability/source gate shared by both host command dispatch paths.
+/// Journal-only provider facts are never accepted from an authenticated client;
+/// provider input itself requires the negotiated capability bit.
+fn validate_authenticated_command_capability(
+    capabilities: CapabilitySet,
+    command: &Command,
+) -> Result<(), IpcError> {
+    match command {
+        Command::ConfirmHostQuit(_) if !capabilities.contains(Capability::HostShutdown) => {
+            Err(IpcError::UnsupportedCapability)
+        }
+        Command::PresentProviderQuestion(_)
+        | Command::PresentProviderApproval(_)
+        | Command::SettleProviderWait(_) => Err(IpcError::UnsupportedCapability),
+        Command::SubmitProviderInput(_) if !capabilities.contains(Capability::ProviderInput) => {
+            Err(IpcError::UnsupportedCapability)
+        }
+        _ => Ok(()),
     }
 }
 
@@ -5687,6 +5713,7 @@ mod output_tests {
             Capability, CapabilitySet, ClientRequest, FrameLimits, NegotiatedParameters,
             ProtocolVersion, ServerMessage,
         };
+        use crate::providers::ProviderKind;
         use uuid::Uuid;
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -5759,8 +5786,10 @@ mod output_tests {
                         .expect("agent"),
                         task_id: task,
                         role: AgentRole::Primary,
-                        provider_kind: "claude".into(),
-                        provider_session_id: Some("session-fanout".into()),
+                        provider_kind: ProviderKind::ClaudeCode,
+                        provider_session_id: Some(
+                            "session-fanout".parse().expect("provider session"),
+                        ),
                         lifecycle: AgentSessionLifecycle::Open,
                         runtime_generation: 0,
                         revision: 0,
@@ -6224,8 +6253,19 @@ mod output_tests {
                 negotiated,
                 confirm_quit_request(client, reused_command_id, 0),
             )
-            .await;
-        assert!(matches!(collision, Err(crate::host::IpcError::Unavailable)));
+            .await
+            .expect("collision duplex");
+        match collision {
+            DuplexExecuteCompletion::CallerMustWrite(ServerMessage::CommandReceipt(
+                CommandReceipt::Rejected {
+                    code: RejectionCode::IdempotencyConflict,
+                    ..
+                },
+            )) => {}
+            other => panic!(
+                "collision must stay caller-owned non-quit IdempotencyConflict, got {other:?}"
+            ),
+        }
         assert!(ports.try_recv_prioritized().is_none());
         assert!(requests
             .take_pending_quit_receipt_ack(reg.id())
@@ -7114,5 +7154,85 @@ mod output_tests {
         drop(healthy_reg);
         drop(slow_reg);
         drop(requests);
+    }
+
+    #[test]
+    fn authenticated_command_gate_rejects_journal_source_and_requires_provider_capability() {
+        use crate::domain::command::{Command, SubmitProviderInputIntent};
+        use crate::domain::provider_input::SettleProviderWaitIntent;
+        use crate::domain::{
+            AgentSessionId, ApprovalId, CommandId, PresentProviderApprovalIntent,
+            PresentProviderQuestionIntent, ProviderInputAction, ProviderWaitFence, QuestionId,
+            TaskId, TurnId,
+        };
+        use crate::protocol::{Capability, CapabilitySet};
+
+        let question = Command::PresentProviderQuestion(
+            PresentProviderQuestionIntent::try_new(
+                AgentSessionId::new(),
+                1,
+                TurnId::new(),
+                1,
+                QuestionId::new(),
+            )
+            .expect("question intent"),
+        );
+        let approval = Command::PresentProviderApproval(
+            PresentProviderApprovalIntent::try_new(
+                AgentSessionId::new(),
+                1,
+                TurnId::new(),
+                1,
+                ApprovalId::new(),
+            )
+            .expect("approval intent"),
+        );
+        let wait = Command::SettleProviderWait(
+            SettleProviderWaitIntent::try_new(ProviderWaitFence::new(
+                CommandId::new(),
+                TaskId::new(),
+                1,
+                AgentSessionId::new(),
+                1,
+                TurnId::new(),
+                None,
+                None,
+            ))
+            .expect("wait intent"),
+        );
+        for command in [&question, &approval, &wait] {
+            assert!(matches!(
+                super::validate_authenticated_command_capability(
+                    CapabilitySet::from_capabilities([Capability::ProviderInput]),
+                    command,
+                ),
+                Err(crate::host::IpcError::UnsupportedCapability)
+            ));
+        }
+
+        let provider = Command::SubmitProviderInput(
+            SubmitProviderInputIntent::try_new(
+                AgentSessionId::new(),
+                1,
+                TurnId::new(),
+                1,
+                None,
+                None,
+                ProviderInputAction::SendNow {
+                    text: "input".into(),
+                    wait: false,
+                },
+            )
+            .expect("provider intent"),
+        );
+        assert!(matches!(
+            super::validate_authenticated_command_capability(CapabilitySet::empty(), &provider),
+            Err(crate::host::IpcError::UnsupportedCapability)
+        ));
+        assert!(super::validate_authenticated_command_capability(
+            CapabilitySet::from_capabilities([Capability::ProviderInput]),
+            &provider,
+        )
+        .is_ok());
     }
 }

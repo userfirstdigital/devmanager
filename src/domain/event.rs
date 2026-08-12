@@ -5,13 +5,21 @@ use serde::de::{self, Deserializer};
 use serde::ser::{self, Serializer};
 use serde::{Deserialize, Serialize};
 
-use crate::domain::agent::AgentSessionFacts;
+use crate::domain::agent::{AgentSessionFacts, ProviderSessionId};
 use crate::domain::artifact::ArtifactFacts;
 use crate::domain::host::{HostCleanupBranch, HostCleanupBranchOutcome};
-use crate::domain::id::{AgentSessionId, CommandId, EventId, OperationId, ResourceId, TaskId};
+use crate::domain::id::{
+    AgentSessionId, ApprovalId, ClientId, CommandId, EventId, OperationId, QuestionId, ResourceId,
+    TaskId, TurnId,
+};
 use crate::domain::operation::{
     validate_outcome_fence, validate_terminal_fact_source, CancellationReason, OperationErrorCode,
     OperationUncertaintyCode, OutcomeFenceError, OutcomeSource,
+};
+use crate::domain::provider_input::{
+    validate_provider_fence, ProviderDeliveryVisibility, ProviderFenceIdentity,
+    ProviderInputAction, ProviderInputSettlement, ProviderKind, ProviderResolutionWinner,
+    ProviderWaitFence, ProviderWaitRecord,
 };
 use crate::domain::resource::{ResourceFacts, ResourceLifecycle};
 use crate::domain::snapshot::TaskSnapshot;
@@ -592,6 +600,92 @@ pub struct HostCleanupBranchCompletedPayload {
     pub outcome: HostCleanupBranchOutcome,
 }
 
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderInputAcceptedPayload {
+    pub command_id: CommandId,
+    pub client_id: ClientId,
+    pub operation_id: OperationId,
+    pub agent_session_id: AgentSessionId,
+    pub provider_kind: ProviderKind,
+    pub provider_session_id: ProviderSessionId,
+    pub runtime_generation: u64,
+    pub turn_id: TurnId,
+    pub action_epoch: u64,
+    pub question_id: Option<QuestionId>,
+    pub approval_id: Option<ApprovalId>,
+    pub action: ProviderInputAction,
+    pub wait: bool,
+    pub delivery: ProviderDeliveryVisibility,
+}
+
+impl fmt::Debug for ProviderInputAcceptedPayload {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProviderInputAcceptedPayload")
+            .field("command_id", &self.command_id)
+            .field("client_id", &self.client_id)
+            .field("operation_id", &self.operation_id)
+            .field("agent_session_id", &self.agent_session_id)
+            .field("provider_kind", &self.provider_kind)
+            .field("provider_session_id", &self.provider_session_id)
+            .field("runtime_generation", &self.runtime_generation)
+            .field("turn_id", &self.turn_id)
+            .field("action_epoch", &self.action_epoch)
+            .field("question_id", &self.question_id)
+            .field("approval_id", &self.approval_id)
+            .field("action", &self.action)
+            .field("wait", &self.wait)
+            .field("delivery", &self.delivery)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderQuestionPresentedPayload {
+    pub agent_session_id: AgentSessionId,
+    pub provider_kind: ProviderKind,
+    pub provider_session_id: ProviderSessionId,
+    pub runtime_generation: u64,
+    pub turn_id: TurnId,
+    pub action_epoch: u64,
+    pub question_id: QuestionId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderApprovalPresentedPayload {
+    pub agent_session_id: AgentSessionId,
+    pub provider_kind: ProviderKind,
+    pub provider_session_id: ProviderSessionId,
+    pub runtime_generation: u64,
+    pub turn_id: TurnId,
+    pub action_epoch: u64,
+    pub approval_id: ApprovalId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderWaitSettledPayload {
+    pub fence: ProviderWaitFence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderInputDeliveredPayload {
+    pub command_id: CommandId,
+    pub client_id: ClientId,
+    pub operation_id: OperationId,
+    pub agent_session_id: AgentSessionId,
+    pub provider_kind: ProviderKind,
+    pub provider_session_id: ProviderSessionId,
+    pub runtime_generation: u64,
+    pub turn_id: TurnId,
+    pub action_epoch: u64,
+    pub question_id: Option<QuestionId>,
+    pub approval_id: Option<ApprovalId>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     TaskCreated {
@@ -648,6 +742,56 @@ pub enum Event {
     OperationFailed(OperationFailedFact),
     OperationCancelled(OperationCancelledFact),
     OperationUncertain(OperationUncertainFact),
+    ProviderInputAccepted {
+        command_id: CommandId,
+        client_id: ClientId,
+        operation_id: OperationId,
+        agent_session_id: AgentSessionId,
+        provider_kind: ProviderKind,
+        provider_session_id: ProviderSessionId,
+        runtime_generation: u64,
+        turn_id: TurnId,
+        action_epoch: u64,
+        question_id: Option<QuestionId>,
+        approval_id: Option<ApprovalId>,
+        action: ProviderInputAction,
+        wait: bool,
+        delivery: ProviderDeliveryVisibility,
+    },
+    ProviderQuestionPresented {
+        agent_session_id: AgentSessionId,
+        provider_kind: ProviderKind,
+        provider_session_id: ProviderSessionId,
+        runtime_generation: u64,
+        turn_id: TurnId,
+        action_epoch: u64,
+        question_id: QuestionId,
+    },
+    ProviderApprovalPresented {
+        agent_session_id: AgentSessionId,
+        provider_kind: ProviderKind,
+        provider_session_id: ProviderSessionId,
+        runtime_generation: u64,
+        turn_id: TurnId,
+        action_epoch: u64,
+        approval_id: ApprovalId,
+    },
+    ProviderWaitSettled {
+        fence: ProviderWaitFence,
+    },
+    ProviderInputDelivered {
+        command_id: CommandId,
+        client_id: ClientId,
+        operation_id: OperationId,
+        agent_session_id: AgentSessionId,
+        provider_kind: ProviderKind,
+        provider_session_id: ProviderSessionId,
+        runtime_generation: u64,
+        turn_id: TurnId,
+        action_epoch: u64,
+        question_id: Option<QuestionId>,
+        approval_id: Option<ApprovalId>,
+    },
 }
 
 impl Event {
@@ -672,6 +816,11 @@ impl Event {
             Self::OperationFailed(_) => "operation.failed",
             Self::OperationCancelled(_) => "operation.cancelled",
             Self::OperationUncertain(_) => "operation.uncertain",
+            Self::ProviderInputAccepted { .. } => "provider_input.accepted",
+            Self::ProviderQuestionPresented { .. } => "provider_input.question_presented",
+            Self::ProviderApprovalPresented { .. } => "provider_input.approval_presented",
+            Self::ProviderWaitSettled { .. } => "provider_input.wait_settled",
+            Self::ProviderInputDelivered { .. } => "provider_input.delivered",
         }
     }
 
@@ -685,6 +834,7 @@ impl Event {
                 | Self::OperationFailed(_)
                 | Self::OperationCancelled(_)
                 | Self::OperationUncertain(_)
+                | Self::ProviderInputDelivered { .. }
         )
     }
 }
@@ -730,6 +880,16 @@ enum EventBody {
     OperationCancelled(OperationCancelledFact),
     #[serde(rename = "operation.uncertain")]
     OperationUncertain(OperationUncertainFact),
+    #[serde(rename = "provider_input.accepted")]
+    ProviderInputAccepted(ProviderInputAcceptedPayload),
+    #[serde(rename = "provider_input.question_presented")]
+    ProviderQuestionPresented(ProviderQuestionPresentedPayload),
+    #[serde(rename = "provider_input.approval_presented")]
+    ProviderApprovalPresented(ProviderApprovalPresentedPayload),
+    #[serde(rename = "provider_input.wait_settled")]
+    ProviderWaitSettled(ProviderWaitSettledPayload),
+    #[serde(rename = "provider_input.delivered")]
+    ProviderInputDelivered(ProviderInputDeliveredPayload),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -829,6 +989,101 @@ impl From<&Event> for EventDocument {
             Event::OperationFailed(fact) => EventBody::OperationFailed(fact.clone()),
             Event::OperationCancelled(fact) => EventBody::OperationCancelled(fact.clone()),
             Event::OperationUncertain(fact) => EventBody::OperationUncertain(fact.clone()),
+            Event::ProviderInputAccepted {
+                command_id,
+                client_id,
+                operation_id,
+                agent_session_id,
+                provider_kind,
+                provider_session_id,
+                runtime_generation,
+                turn_id,
+                action_epoch,
+                question_id,
+                approval_id,
+                action,
+                wait,
+                delivery,
+            } => EventBody::ProviderInputAccepted(ProviderInputAcceptedPayload {
+                command_id: *command_id,
+                client_id: *client_id,
+                operation_id: *operation_id,
+                agent_session_id: *agent_session_id,
+                provider_kind: provider_kind.clone(),
+                provider_session_id: provider_session_id.clone(),
+                runtime_generation: *runtime_generation,
+                turn_id: *turn_id,
+                action_epoch: *action_epoch,
+                question_id: *question_id,
+                approval_id: *approval_id,
+                action: action.clone(),
+                wait: *wait,
+                delivery: *delivery,
+            }),
+            Event::ProviderQuestionPresented {
+                agent_session_id,
+                provider_kind,
+                provider_session_id,
+                runtime_generation,
+                turn_id,
+                action_epoch,
+                question_id,
+            } => EventBody::ProviderQuestionPresented(ProviderQuestionPresentedPayload {
+                agent_session_id: *agent_session_id,
+                provider_kind: provider_kind.clone(),
+                provider_session_id: provider_session_id.clone(),
+                runtime_generation: *runtime_generation,
+                turn_id: *turn_id,
+                action_epoch: *action_epoch,
+                question_id: *question_id,
+            }),
+            Event::ProviderApprovalPresented {
+                agent_session_id,
+                provider_kind,
+                provider_session_id,
+                runtime_generation,
+                turn_id,
+                action_epoch,
+                approval_id,
+            } => EventBody::ProviderApprovalPresented(ProviderApprovalPresentedPayload {
+                agent_session_id: *agent_session_id,
+                provider_kind: provider_kind.clone(),
+                provider_session_id: provider_session_id.clone(),
+                runtime_generation: *runtime_generation,
+                turn_id: *turn_id,
+                action_epoch: *action_epoch,
+                approval_id: *approval_id,
+            }),
+            Event::ProviderWaitSettled { fence } => {
+                EventBody::ProviderWaitSettled(ProviderWaitSettledPayload {
+                    fence: fence.clone(),
+                })
+            }
+            Event::ProviderInputDelivered {
+                command_id,
+                client_id,
+                operation_id,
+                agent_session_id,
+                provider_kind,
+                provider_session_id,
+                runtime_generation,
+                turn_id,
+                action_epoch,
+                question_id,
+                approval_id,
+            } => EventBody::ProviderInputDelivered(ProviderInputDeliveredPayload {
+                command_id: *command_id,
+                client_id: *client_id,
+                operation_id: *operation_id,
+                agent_session_id: *agent_session_id,
+                provider_kind: provider_kind.clone(),
+                provider_session_id: provider_session_id.clone(),
+                runtime_generation: *runtime_generation,
+                turn_id: *turn_id,
+                action_epoch: *action_epoch,
+                question_id: *question_id,
+                approval_id: *approval_id,
+            }),
         };
         Self {
             schema_version: EVENT_SCHEMA_VERSION,
@@ -928,6 +1183,133 @@ impl TryFrom<EventDocument> for Event {
             EventBody::OperationFailed(fact) => Event::OperationFailed(fact),
             EventBody::OperationCancelled(fact) => Event::OperationCancelled(fact),
             EventBody::OperationUncertain(fact) => Event::OperationUncertain(fact),
+            EventBody::ProviderInputAccepted(p) => {
+                if p.delivery.is_delivered() {
+                    return Err(EventSerdeError::Payload(
+                        "provider input accepted event cannot claim delivery".into(),
+                    ));
+                }
+                let fence = ProviderFenceIdentity::new_with_identity(
+                    Some(p.command_id),
+                    // Event envelopes carry the task identity; the provider payload
+                    // deliberately carries all remaining fence identities.
+                    None,
+                    p.agent_session_id,
+                    p.provider_kind.clone(),
+                    p.provider_session_id.clone(),
+                    Some(p.operation_id),
+                    p.runtime_generation,
+                    p.action_epoch,
+                    p.turn_id,
+                    p.question_id,
+                    p.approval_id,
+                );
+                validate_provider_fence(&fence, Some(&p.action), Some(p.wait), None)
+                    .map_err(|err| EventSerdeError::Payload(err.to_string()))?;
+                Event::ProviderInputAccepted {
+                    command_id: p.command_id,
+                    client_id: p.client_id,
+                    operation_id: p.operation_id,
+                    agent_session_id: p.agent_session_id,
+                    provider_kind: p.provider_kind,
+                    provider_session_id: p.provider_session_id,
+                    runtime_generation: p.runtime_generation,
+                    turn_id: p.turn_id,
+                    action_epoch: p.action_epoch,
+                    question_id: p.question_id,
+                    approval_id: p.approval_id,
+                    action: p.action,
+                    wait: p.wait,
+                    delivery: p.delivery,
+                }
+            }
+            EventBody::ProviderQuestionPresented(p) => {
+                let fence = ProviderFenceIdentity::new_with_identity(
+                    None,
+                    None,
+                    p.agent_session_id,
+                    p.provider_kind.clone(),
+                    p.provider_session_id.clone(),
+                    None,
+                    p.runtime_generation,
+                    p.action_epoch,
+                    p.turn_id,
+                    Some(p.question_id),
+                    None,
+                );
+                validate_provider_fence(&fence, None, None, None)
+                    .map_err(|err| EventSerdeError::Payload(err.to_string()))?;
+                Event::ProviderQuestionPresented {
+                    agent_session_id: p.agent_session_id,
+                    provider_kind: p.provider_kind,
+                    provider_session_id: p.provider_session_id,
+                    runtime_generation: p.runtime_generation,
+                    turn_id: p.turn_id,
+                    action_epoch: p.action_epoch,
+                    question_id: p.question_id,
+                }
+            }
+            EventBody::ProviderApprovalPresented(p) => {
+                let fence = ProviderFenceIdentity::new_with_identity(
+                    None,
+                    None,
+                    p.agent_session_id,
+                    p.provider_kind.clone(),
+                    p.provider_session_id.clone(),
+                    None,
+                    p.runtime_generation,
+                    p.action_epoch,
+                    p.turn_id,
+                    None,
+                    Some(p.approval_id),
+                );
+                validate_provider_fence(&fence, None, None, None)
+                    .map_err(|err| EventSerdeError::Payload(err.to_string()))?;
+                Event::ProviderApprovalPresented {
+                    agent_session_id: p.agent_session_id,
+                    provider_kind: p.provider_kind,
+                    provider_session_id: p.provider_session_id,
+                    runtime_generation: p.runtime_generation,
+                    turn_id: p.turn_id,
+                    action_epoch: p.action_epoch,
+                    approval_id: p.approval_id,
+                }
+            }
+            EventBody::ProviderWaitSettled(p) => {
+                validate_provider_fence(&p.fence.identity(), None, None, None)
+                    .map_err(|err| EventSerdeError::Payload(err.to_string()))?;
+                Event::ProviderWaitSettled { fence: p.fence }
+            }
+            EventBody::ProviderInputDelivered(p) => {
+                let fence = ProviderFenceIdentity::new_with_identity(
+                    Some(p.command_id),
+                    None,
+                    p.agent_session_id,
+                    p.provider_kind.clone(),
+                    p.provider_session_id.clone(),
+                    Some(p.operation_id),
+                    p.runtime_generation,
+                    p.action_epoch,
+                    p.turn_id,
+                    p.question_id,
+                    p.approval_id,
+                );
+                validate_provider_fence(&fence, None, None, None)
+                    .map_err(|err| EventSerdeError::Payload(err.to_string()))?;
+                Event::ProviderInputDelivered {
+                    command_id: p.command_id,
+                    client_id: p.client_id,
+                    operation_id: p.operation_id,
+                    agent_session_id: p.agent_session_id,
+                    provider_kind: p.provider_kind,
+                    provider_session_id: p.provider_session_id,
+                    runtime_generation: p.runtime_generation,
+                    turn_id: p.turn_id,
+                    action_epoch: p.action_epoch,
+                    question_id: p.question_id,
+                    approval_id: p.approval_id,
+                }
+            }
         })
     }
 }
@@ -1190,6 +1572,7 @@ pub fn apply(
                 primary_agent_id: None,
                 artifacts: BTreeMap::new(),
                 resources: BTreeMap::new(),
+                provider_sessions: BTreeMap::new(),
             })
         }
         Event::OperationAccepted(_fact) => {
@@ -1203,7 +1586,8 @@ pub fn apply(
         Event::OperationSettled(_)
         | Event::OperationFailed(_)
         | Event::OperationCancelled(_)
-        | Event::OperationUncertain(_) => {
+        | Event::OperationUncertain(_)
+        | Event::ProviderInputDelivered { .. } => {
             let snap = snapshot.ok_or(ApplyError::MissingSnapshot)?;
             require_matching_task_id(&snap, event)?;
             Ok(snap)
@@ -1240,6 +1624,38 @@ fn require_next_revision(snap: &TaskSnapshot, event: &DomainEvent) -> Result<u64
         return Err(ApplyError::RevisionConflict);
     }
     Ok(expected)
+}
+
+fn validate_snapshot_provider_fence(
+    snap: &TaskSnapshot,
+    agent_session_id: AgentSessionId,
+    fence: &ProviderFenceIdentity,
+    action: Option<&ProviderInputAction>,
+    wait: Option<bool>,
+    current_turn: Option<TurnId>,
+    allow_closing: bool,
+) -> Result<(), ApplyError> {
+    let agent = snap
+        .agents
+        .get(&agent_session_id)
+        .ok_or(ApplyError::NotFound)?;
+    let context = crate::domain::provider_input::ProviderFenceContext {
+        task_id: snap.task.id,
+        agent_session_id,
+        agent_task_id: agent.task_id,
+        provider_kind: crate::domain::provider_input::ProviderKind::new(
+            agent.provider_kind.clone(),
+        )
+        .map_err(|_| ApplyError::InvalidTransition)?,
+        provider_session_id: agent.provider_session_id.clone(),
+        runtime_generation: agent.runtime_generation,
+        action_epoch: snap.task.action_epoch,
+        lifecycle: agent.lifecycle,
+        current_turn,
+        allow_closing,
+    };
+    validate_provider_fence(fence, action, wait, Some(&context))
+        .map_err(|_| ApplyError::InvalidTransition)
 }
 
 fn apply_into(
@@ -1303,6 +1719,7 @@ fn apply_into(
                 return Err(ApplyError::AlreadyExists);
             }
             snap.agents.insert(agent.id, agent.clone());
+            snap.provider_sessions.entry(agent.id).or_default();
         }
         Event::PrimaryAgentSet { agent_session_id } => {
             let Some(agent) = snap.agents.get(agent_session_id) else {
@@ -1385,6 +1802,305 @@ fn apply_into(
             }
             resource.lifecycle = ResourceLifecycle::Released;
             resource.updated_at_ms = occurred_at_ms;
+        }
+        Event::ProviderInputAccepted {
+            command_id,
+            client_id,
+            operation_id,
+            agent_session_id,
+            provider_kind,
+            provider_session_id,
+            runtime_generation,
+            turn_id,
+            action_epoch,
+            question_id,
+            approval_id,
+            action,
+            wait,
+            delivery,
+        } => {
+            if delivery.is_delivered() {
+                return Err(ApplyError::InvalidTransition);
+            }
+            let current_turn = snap
+                .provider_sessions
+                .get(agent_session_id)
+                .and_then(|session| session.current_turn);
+            let fence = ProviderFenceIdentity::new_with_identity(
+                Some(*command_id),
+                Some(snap.task.id),
+                *agent_session_id,
+                provider_kind.clone(),
+                provider_session_id.clone(),
+                Some(*operation_id),
+                *runtime_generation,
+                *action_epoch,
+                *turn_id,
+                *question_id,
+                *approval_id,
+            );
+            validate_snapshot_provider_fence(
+                snap,
+                *agent_session_id,
+                &fence,
+                Some(action),
+                Some(*wait),
+                current_turn,
+                false,
+            )?;
+            let session = snap.provider_sessions.entry(*agent_session_id).or_default();
+            match action {
+                ProviderInputAction::AnswerQuestion { question_id, .. } => {
+                    if session.question_winners.contains_key(question_id) {
+                        return Err(ApplyError::AlreadyExists);
+                    }
+                    if session.open_question != Some(*question_id) {
+                        return Err(ApplyError::InvalidTransition);
+                    }
+                }
+                ProviderInputAction::ResolveApproval { approval_id, .. } => {
+                    if session.approval_winners.contains_key(approval_id) {
+                        return Err(ApplyError::AlreadyExists);
+                    }
+                    if session.open_approval != Some(*approval_id) {
+                        return Err(ApplyError::InvalidTransition);
+                    }
+                }
+                _ => {}
+            }
+            session.current_turn = Some(*turn_id);
+            session.last_settlement = Some(ProviderInputSettlement {
+                command_id: *command_id,
+                operation_id: Some(*operation_id),
+                intent: crate::domain::provider_input::ProviderIntentPhase::Accepted,
+                delivery: *delivery,
+            });
+            let winner = ProviderResolutionWinner {
+                command_id: *command_id,
+                client_id: *client_id,
+                accepted_at_ms: occurred_at_ms,
+            };
+            match action {
+                ProviderInputAction::AnswerQuestion {
+                    question_id: qid, ..
+                } => {
+                    session
+                        .bounded_insert_question_winner(*qid, winner)
+                        .map_err(|_| ApplyError::InvalidTransition)?;
+                    session.open_question = None;
+                }
+                ProviderInputAction::ResolveApproval {
+                    approval_id: aid, ..
+                } => {
+                    session
+                        .bounded_insert_approval_winner(*aid, winner)
+                        .map_err(|_| ApplyError::InvalidTransition)?;
+                    session.open_approval = None;
+                }
+                _ => {}
+            }
+            if *wait {
+                session
+                    .bounded_insert_wait(
+                        *command_id,
+                        ProviderWaitRecord {
+                            fence: ProviderWaitFence::new_with_identity(
+                                *command_id,
+                                snap.task.id,
+                                *operation_id,
+                                *action_epoch,
+                                *agent_session_id,
+                                provider_kind.clone(),
+                                provider_session_id.clone(),
+                                *runtime_generation,
+                                *turn_id,
+                                *question_id,
+                                *approval_id,
+                            ),
+                            pending: true,
+                        },
+                    )
+                    .map_err(|_| ApplyError::InvalidTransition)?;
+            }
+        }
+        Event::ProviderQuestionPresented {
+            agent_session_id,
+            provider_kind,
+            provider_session_id,
+            runtime_generation,
+            turn_id,
+            action_epoch,
+            question_id,
+        } => {
+            let current_turn = snap
+                .provider_sessions
+                .get(agent_session_id)
+                .and_then(|session| session.current_turn);
+            let fence = ProviderFenceIdentity::new_with_identity(
+                None,
+                Some(snap.task.id),
+                *agent_session_id,
+                provider_kind.clone(),
+                provider_session_id.clone(),
+                None,
+                *runtime_generation,
+                *action_epoch,
+                *turn_id,
+                Some(*question_id),
+                None,
+            );
+            validate_snapshot_provider_fence(
+                snap,
+                *agent_session_id,
+                &fence,
+                None,
+                None,
+                current_turn,
+                false,
+            )?;
+            let session = snap.provider_sessions.entry(*agent_session_id).or_default();
+            if session.question_winners.contains_key(question_id) {
+                return Err(ApplyError::AlreadyExists);
+            }
+            if session.open_question.is_some() {
+                return Err(ApplyError::AlreadyExists);
+            }
+            session.current_turn = Some(*turn_id);
+            session.open_question = Some(*question_id);
+        }
+        Event::ProviderApprovalPresented {
+            agent_session_id,
+            provider_kind,
+            provider_session_id,
+            runtime_generation,
+            turn_id,
+            action_epoch,
+            approval_id,
+        } => {
+            let current_turn = snap
+                .provider_sessions
+                .get(agent_session_id)
+                .and_then(|session| session.current_turn);
+            let fence = ProviderFenceIdentity::new_with_identity(
+                None,
+                Some(snap.task.id),
+                *agent_session_id,
+                provider_kind.clone(),
+                provider_session_id.clone(),
+                None,
+                *runtime_generation,
+                *action_epoch,
+                *turn_id,
+                None,
+                Some(*approval_id),
+            );
+            validate_snapshot_provider_fence(
+                snap,
+                *agent_session_id,
+                &fence,
+                None,
+                None,
+                current_turn,
+                false,
+            )?;
+            let session = snap.provider_sessions.entry(*agent_session_id).or_default();
+            if session.approval_winners.contains_key(approval_id) {
+                return Err(ApplyError::AlreadyExists);
+            }
+            if session.open_approval.is_some() {
+                return Err(ApplyError::AlreadyExists);
+            }
+            session.current_turn = Some(*turn_id);
+            session.open_approval = Some(*approval_id);
+        }
+        Event::ProviderWaitSettled { fence } => {
+            let current_turn = snap
+                .provider_sessions
+                .get(&fence.agent_session_id())
+                .and_then(|session| session.current_turn);
+            validate_snapshot_provider_fence(
+                snap,
+                fence.agent_session_id(),
+                &fence.identity(),
+                None,
+                None,
+                current_turn,
+                true,
+            )?;
+            let session = snap
+                .provider_sessions
+                .get_mut(&fence.agent_session_id())
+                .ok_or(ApplyError::NotFound)?;
+            let record = session
+                .waits
+                .get_mut(&fence.command_id())
+                .ok_or(ApplyError::NotFound)?;
+            if !record.fence.matches(fence) {
+                return Err(ApplyError::InvalidTransition);
+            }
+            if !record.pending {
+                return Err(ApplyError::AlreadyExists);
+            }
+            record.pending = false;
+        }
+        Event::ProviderInputDelivered {
+            command_id,
+            operation_id,
+            agent_session_id,
+            provider_kind,
+            provider_session_id,
+            runtime_generation,
+            turn_id,
+            action_epoch,
+            question_id,
+            approval_id,
+            ..
+        } => {
+            let current_turn = snap
+                .provider_sessions
+                .get(agent_session_id)
+                .and_then(|session| session.current_turn);
+            let fence = ProviderFenceIdentity::new_with_identity(
+                Some(*command_id),
+                Some(snap.task.id),
+                *agent_session_id,
+                provider_kind.clone(),
+                provider_session_id.clone(),
+                Some(*operation_id),
+                *runtime_generation,
+                *action_epoch,
+                *turn_id,
+                *question_id,
+                *approval_id,
+            );
+            validate_snapshot_provider_fence(
+                snap,
+                *agent_session_id,
+                &fence,
+                None,
+                None,
+                current_turn,
+                true,
+            )?;
+            let session = snap
+                .provider_sessions
+                .get_mut(agent_session_id)
+                .ok_or(ApplyError::NotFound)?;
+            let Some(settlement) = session.last_settlement else {
+                return Err(ApplyError::InvalidTransition);
+            };
+            if settlement.command_id != *command_id
+                || settlement.operation_id != Some(*operation_id)
+                || settlement.delivery.is_delivered()
+            {
+                return Err(ApplyError::InvalidTransition);
+            }
+            session.last_settlement = Some(ProviderInputSettlement {
+                command_id: *command_id,
+                operation_id: Some(*operation_id),
+                intent: crate::domain::provider_input::ProviderIntentPhase::Accepted,
+                delivery: ProviderDeliveryVisibility::delivered(),
+            });
         }
         Event::TaskCreated { .. }
         | Event::HostCloseBegun { .. }

@@ -2,6 +2,10 @@
 //! to semantic events. The rollout format is Codex-internal: every mapping here
 //! is tolerant, and unknown or malformed records must yield nothing rather than
 //! fail the session.
+//!
+//! Quarantine: the Task 4.4 stock-CLI runtime in `src/providers/codex.rs` must
+//! not use this module for identity or transcript binding. This file remains
+//! on the Phase 11 deletion ledger only.
 
 use crate::remote::presentation::{
     SemanticEventDraft, SemanticEventKind, SemanticRetention, SemanticSource, SemanticStream,
@@ -648,5 +652,17 @@ mod tests {
             }
             other => panic!("expected assistant message, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn new_runtime_must_not_use_rollout_path_as_session_identity() {
+        // Test-only quarantine: identity for src/providers/codex.rs is bound
+        // only from a correlated current-generation SessionStart signal.
+        assert!(matches!(
+            crate::providers::codex::CodexAdapter::session_id_from_rollout_path(
+                std::path::Path::new("/fixture/codex/sessions/rollout-fixture.jsonl")
+            ),
+            Err(crate::providers::codex::CodexIdentityError::RolloutInferenceForbidden)
+        ));
     }
 }

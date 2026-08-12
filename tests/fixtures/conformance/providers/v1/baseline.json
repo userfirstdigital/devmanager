@@ -1,0 +1,58 @@
+{
+  "case_id": "baseline_version",
+  "provider": "claude_code",
+  "version": "1.0.0",
+  "task_id": "018f0000-0000-7000-8000-000000000001",
+  "agent_id": "018f0000-0000-7000-8000-000000000002",
+  "generation": 1,
+  "action_id": "018f0000-0000-7000-8000-000000000003",
+  "nonce": "nonce-baseline-version",
+  "cli_launchable": true,
+  "probe_ok": true,
+  "resume_command_proven": true,
+  "provider_session_id": "sess_fixture_baseline",
+  "capabilities": {
+    "kind": "claude_code",
+    "version": "1.0.0",
+    "auth_state": "unknown",
+    "exact_resume": "supported",
+    "semantic_events": "supported",
+    "provider_session_id": "supported",
+    "build_launch": "supported",
+    "parse_signal": "supported",
+    "cooperative_stop": "unknown",
+    "observe_quota": "unknown",
+    "evidence": [
+      {
+        "source": "capability_probe",
+        "observed_at": 1,
+        "status": "supported"
+      }
+    ]
+  },
+  "events": [
+    { "type": "session_start", "provider_event_id": "e1" },
+    { "type": "user_message", "provider_event_id": "e2" },
+    { "type": "turn_completed", "provider_event_id": "e3" }
+  ],
+  "declared_metrics": [
+    "exact_resume_result",
+    "identity_correlation_result",
+    "normalized_event_count",
+    "normalized_event_order",
+    "unknown_event_fallback",
+    "terminal_fallback",
+    "input_outcome",
+    "launch_latency_ms",
+    "first_output_latency_ms",
+    "first_update_latency_ms",
+    "acknowledgement_latency_ms",
+    "outcome_latency_ms",
+    "stop_latency_ms",
+    "close_latency_ms",
+    "dropped_events",
+    "coalesced_events",
+    "forced_resync",
+    "process_residue"
+  ]
+}

@@ -6,10 +6,14 @@ use serde::ser::{self, SerializeMap, Serializer};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::agent::AgentSessionFacts;
+use crate::domain::artifact::PrivacyClass;
 use crate::domain::artifact::{ArtifactFacts, ArtifactSummary};
 use crate::domain::event::DomainEvent;
-use crate::domain::id::{AgentSessionId, ArtifactId, OperationId, ResourceId, SnapshotId, TaskId};
+use crate::domain::id::{
+    AgentSessionId, ArtifactId, EventId, OperationId, ResourceId, SnapshotId, TaskId,
+};
 use crate::domain::operation::OperationFacts;
+use crate::domain::provider_input::ProviderSessionProjection;
 use crate::domain::resource::ResourceFacts;
 use crate::domain::task::{
     ReviewReadiness, TaskActivity, TaskAttention, TaskConnectivity, TaskFacts, VisibleTaskStatus,
@@ -26,6 +30,7 @@ pub struct TaskSnapshot {
     pub primary_agent_id: Option<AgentSessionId>,
     pub artifacts: BTreeMap<ArtifactId, ArtifactFacts>,
     pub resources: BTreeMap<ResourceId, ResourceFacts>,
+    pub provider_sessions: BTreeMap<AgentSessionId, ProviderSessionProjection>,
 }
 
 impl TaskSnapshot {
@@ -53,6 +58,85 @@ pub enum SnapshotSection {
 
 pub const MAX_SNAPSHOT_PAGE_ITEMS: u32 = 1_000;
 pub const MAX_SNAPSHOT_PAGE_ENCODED_BYTES: u32 = 512 * 1024;
+pub const QUOTA_DISPLAY_TTL_MS: u64 = 60 * 60 * 1000;
+
+/// Client snapshots omit a quota display value when it is at least one hour old,
+/// observed in the future, or observed after a clock rollback (`now < observed_at`).
+///
+/// Display cutover consumes `QuotaStripEntry` only. This helper redacts strip
+/// observations; it must not be applied to semantic replay `Status{usage}` as a
+/// second quota truth.
+pub fn omit_stale_quota_display<T>(observed_at: u64, now_ms: u64, display: T) -> Option<T> {
+    if now_ms < observed_at || now_ms.saturating_sub(observed_at) >= QUOTA_DISPLAY_TTL_MS {
+        None
+    } else {
+        Some(display)
+    }
+}
+
+/// Provider-neutral, bounded semantic payload retained by the journal. Raw
+/// provider envelopes and terminal bytes are deliberately not represented.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SemanticJournalPayload {
+    UserMessage {
+        text: String,
+    },
+    AssistantText {
+        text: String,
+    },
+    ReasoningSummary {
+        text: String,
+    },
+    ToolCall {
+        tool_name: String,
+        call_id: String,
+    },
+    ToolResult {
+        call_id: String,
+        status: String,
+    },
+    ApprovalRequest {
+        request_id: String,
+        summary: String,
+    },
+    ApprovalResult {
+        request_id: String,
+        decision: String,
+    },
+    Question {
+        question_id: String,
+        prompt: String,
+        options: Vec<String>,
+    },
+    PlanStep {
+        step_id: String,
+        title: String,
+        status: String,
+    },
+    UsageObservation {
+        remaining_percent: Option<u8>,
+    },
+    Error {
+        code: String,
+        message: String,
+    },
+    TurnState {
+        state: String,
+    },
+    SessionState {
+        state: String,
+    },
+    ArtifactReference {
+        label: String,
+    },
+    Unknown {
+        provider: String,
+        source_type: String,
+        schema_version: u32,
+        diagnostic_ref: String,
+    },
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PageLimitsError {
@@ -191,6 +275,34 @@ pub struct SnapshotPage {
     /// Exact canonical MessagePack size of this page body.
     pub encoded_bytes: u32,
     pub next_cursor: Option<Vec<u8>>,
+}
+
+/// Bounded semantic-journal projection. This is intentionally not a
+/// `SnapshotSection`: the global Task snapshot must never carry raw provider
+/// payloads, terminal bytes, or unknown event bodies.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticJournalFact {
+    pub id: EventId,
+    pub sequence: u64,
+    pub provider: String,
+    pub schema_version: u32,
+    pub kind: String,
+    pub visibility: String,
+    pub privacy_class: PrivacyClass,
+    pub redacted: bool,
+    pub payload: SemanticJournalPayload,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticJournalPage {
+    pub after_sequence: u64,
+    pub through_sequence: u64,
+    pub high_water: u64,
+    pub encoded_bytes: u32,
+    pub next_sequence: Option<u64>,
+    pub facts: Vec<SemanticJournalFact>,
 }
 
 /// One bounded page from a replay session pinned to a durable high-water mark.

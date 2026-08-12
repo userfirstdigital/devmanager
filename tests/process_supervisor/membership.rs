@@ -477,28 +477,11 @@ fn membership_stale_completion_cannot_mutate_replacement_generation() {
         JobCompletionEvent::NewProcess { pid: 4_002 },
     ));
 
-    let wrong_owner = ManagedProcessFence::new(
-        replacement_fence.resource(),
-        ProcessOwner::Task(TaskId::new()),
-        replacement_fence.root().clone(),
-    );
-    assert!(!registry.apply_job_observation(completion(
-        wrong_owner,
-        JobCompletionEvent::MonitorFailed {
-            detail: "wrong owner".to_string(),
-        },
-    )));
-    let wrong_root = ManagedProcessFence::new(
-        replacement_fence.resource(),
-        replacement_fence.owner(),
-        identity(4_002, 49_999, &executable()),
-    );
-    assert!(!registry.apply_job_observation(completion(
-        wrong_root,
-        JobCompletionEvent::AbnormalExitProcess { pid: 4_002 },
-    )));
-
-    assert!(!registry.apply_job_observation(completion(
+    // A caller cannot construct a wrong-owner or wrong-root fence anymore;
+    // only the registry/Task 3 bridge can mint the sealed capability. The
+    // stale-generation checks below cover the remaining externally observable
+    // rejection path.
+    assert!(!registry.apply_job_completion(completion(
         stale_fence.clone(),
         JobCompletionEvent::ExitProcess { pid: 4_001 },
     )));

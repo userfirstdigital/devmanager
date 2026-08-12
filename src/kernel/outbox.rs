@@ -6,16 +6,22 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::domain::agent::ProviderSessionId;
 use crate::domain::command::{CommandReceipt, RejectionCode};
 use crate::domain::event::Event;
-use crate::domain::id::{CommandId, EventId, OperationId, ResourceId, TaskId};
+use crate::domain::id::{
+    AgentSessionId, ApprovalId, ClientId, CommandId, EventId, OperationId, QuestionId, ResourceId,
+    TaskId, TurnId,
+};
 use crate::domain::operation::ResourceFence;
+use crate::domain::provider_input::{ProviderInputAction, ProviderKind};
 use crate::domain::resource::{OwnerKind, ResourceLifecycle};
 use crate::domain::snapshot::TaskSnapshot;
 use crate::kernel::store::StoreError;
 
 pub(crate) const RECEIPT_SCHEMA_VERSION: u32 = 1;
 pub(crate) const EFFECT_SCHEMA_VERSION: u32 = 1;
+const MAX_EFFECT_DOCUMENT_BYTES: usize = 256 * 1024;
 
 /// Stable destination class stored in `outbox.destination_class`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -23,6 +29,7 @@ pub(crate) const EFFECT_SCHEMA_VERSION: u32 = 1;
 pub enum DestinationClass {
     TaskTeardown,
     ResourceRelease,
+    ProviderInput,
 }
 
 impl DestinationClass {
@@ -30,6 +37,7 @@ impl DestinationClass {
         match self {
             Self::TaskTeardown => "task_teardown",
             Self::ResourceRelease => "resource_release",
+            Self::ProviderInput => "provider_input",
         }
     }
 
@@ -37,6 +45,7 @@ impl DestinationClass {
         match value {
             "task_teardown" => Ok(Self::TaskTeardown),
             "resource_release" => Ok(Self::ResourceRelease),
+            "provider_input" => Ok(Self::ProviderInput),
             other => Err(StoreError::CodecMismatch {
                 detail: format!("unknown destination_class '{other}'"),
             }),
@@ -85,9 +94,32 @@ pub enum Effect {
         action_epoch: u64,
         resource_fence: ResourceFence,
     },
+    DeliverProviderInput {
+        task_id: TaskId,
+        operation_id: OperationId,
+        command_id: CommandId,
+        client_id: ClientId,
+        agent_session_id: AgentSessionId,
+        provider_kind: ProviderKind,
+        provider_session_id: ProviderSessionId,
+        runtime_generation: u64,
+        action_epoch: u64,
+        turn_id: TurnId,
+        question_id: Option<QuestionId>,
+        approval_id: Option<ApprovalId>,
+        action: ProviderInputAction,
+        wait: bool,
+    },
 }
 
 /// Accepted-operation fence shared by every planned effect for one command.
+///
+/// `DeliverProviderInput` intentionally leaves `runtime_generation` empty: the
+/// generic operation fence is presentation-only for provider delivery because
+/// its resource/generation pair is reserved for resource ownership. The typed
+/// provider effect is the durable authority for provider session identity and
+/// runtime generation, including ambiguity recovery after replacement. Uncertain
+/// outbox rows retain their payload and are never terminal-payload compacted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct OperationFence {
     pub action_epoch: Option<u64>,
@@ -215,6 +247,79 @@ pub(crate) fn plan_effects(
                     },
                 });
             }
+            Event::ProviderInputAccepted {
+                operation_id,
+                command_id,
+                client_id,
+                agent_session_id,
+                provider_kind,
+                provider_session_id,
+                runtime_generation,
+                turn_id,
+                action_epoch,
+                question_id,
+                approval_id,
+                action,
+                wait,
+                ..
+            } => {
+                effect_fact_count = effect_fact_count
+                    .checked_add(1)
+                    .ok_or(StoreError::Corruption)?;
+                let Some(snap) = snapshot else {
+                    return Err(StoreError::Projection(
+                        "provider input planning requires a pre-command snapshot".into(),
+                    ));
+                };
+                if snap.task.id != task_id {
+                    return Err(StoreError::Projection(
+                        "provider input planning task scope mismatch".into(),
+                    ));
+                }
+                let Some(agent) = snap.agents.get(agent_session_id) else {
+                    return Err(StoreError::Projection(
+                        "provider input planning missing agent session".into(),
+                    ));
+                };
+                if agent.provider_session_id.as_ref() != Some(provider_session_id)
+                    || agent.provider_kind != provider_kind.as_str()
+                    || agent.runtime_generation != *runtime_generation
+                {
+                    return Err(StoreError::Projection(
+                        "provider input planning provider identity mismatch".into(),
+                    ));
+                }
+                planned.push(PlannedEffect {
+                    document: PlannedEffectDocument::new(
+                        Effect::DeliverProviderInput {
+                            task_id,
+                            operation_id: *operation_id,
+                            command_id: *command_id,
+                            client_id: *client_id,
+                            agent_session_id: *agent_session_id,
+                            provider_kind: provider_kind.clone(),
+                            provider_session_id: provider_session_id.clone(),
+                            runtime_generation: *runtime_generation,
+                            action_epoch: *action_epoch,
+                            turn_id: *turn_id,
+                            question_id: *question_id,
+                            approval_id: *approval_id,
+                            action: action.clone(),
+                            wait: *wait,
+                        },
+                        ReplayPolicy::NoAutomaticRetry,
+                    ),
+                    fence: OperationFence {
+                        action_epoch: Some(*action_epoch),
+                        resource_id: None,
+                        // Provider runtime identity is carried by the typed
+                        // provider effect/fence. The generic operation fence
+                        // only permits a runtime generation when it is paired
+                        // with a resource id.
+                        runtime_generation: None,
+                    },
+                });
+            }
             Event::TaskCreated { .. }
             | Event::TaskRenamed { .. }
             | Event::TaskAttentionSet { .. }
@@ -224,7 +329,10 @@ pub(crate) fn plan_effects(
             | Event::PrimaryAgentSet { .. }
             | Event::ArtifactRegistered { .. }
             | Event::ResourceRegistered { .. }
-            | Event::ResourceReleased { .. } => {
+            | Event::ResourceReleased { .. }
+            | Event::ProviderQuestionPresented { .. }
+            | Event::ProviderApprovalPresented { .. }
+            | Event::ProviderWaitSettled { .. } => {
                 pure_fact_count = pure_fact_count
                     .checked_add(1)
                     .ok_or(StoreError::Corruption)?;
@@ -234,6 +342,7 @@ pub(crate) fn plan_effects(
             | Event::OperationFailed(_)
             | Event::OperationCancelled(_)
             | Event::OperationUncertain(_)
+            | Event::ProviderInputDelivered { .. }
             | Event::HostCloseBegun { .. }
             | Event::HostCleanupBranchCompleted { .. } => {
                 return Err(StoreError::Projection(
@@ -280,6 +389,7 @@ impl Effect {
         match self {
             Self::BeginTaskTeardown { .. } => DestinationClass::TaskTeardown,
             Self::ReleaseResource { .. } => DestinationClass::ResourceRelease,
+            Self::DeliverProviderInput { .. } => DestinationClass::ProviderInput,
         }
     }
 }
@@ -333,9 +443,15 @@ pub(crate) fn encode_effect_document(doc: &PlannedEffectDocument) -> Result<Vec<
         replay_policy: doc.replay_policy,
         effect: doc.effect.clone(),
     };
-    rmp_serde::to_vec_named(&wire).map_err(|err| StoreError::CodecMismatch {
+    let payload = rmp_serde::to_vec_named(&wire).map_err(|err| StoreError::CodecMismatch {
         detail: err.to_string(),
-    })
+    })?;
+    if payload.len() > MAX_EFFECT_DOCUMENT_BYTES {
+        return Err(StoreError::CodecMismatch {
+            detail: format!("effect document exceeds {MAX_EFFECT_DOCUMENT_BYTES} bytes"),
+        });
+    }
+    Ok(payload)
 }
 
 pub(crate) fn effect_document_sha256(doc: &PlannedEffectDocument) -> Result<[u8; 32], StoreError> {
@@ -351,6 +467,11 @@ pub(crate) fn decode_effect_document(
     destination_class_column: &str,
     replay_policy_column: &str,
 ) -> Result<PlannedEffectDocument, StoreError> {
+    if payload.len() > MAX_EFFECT_DOCUMENT_BYTES {
+        return Err(StoreError::CodecMismatch {
+            detail: format!("effect document exceeds {MAX_EFFECT_DOCUMENT_BYTES} bytes"),
+        });
+    }
     let wire: PlannedEffectWire =
         rmp_serde::from_slice(payload).map_err(|err| StoreError::CodecMismatch {
             detail: err.to_string(),
@@ -407,6 +528,8 @@ enum ReceiptBodyWire {
         command_id: CommandId,
         code: RejectionCode,
         current_revision: Option<u64>,
+        #[serde(default)]
+        resolution: Option<crate::domain::ProviderResolutionWinner>,
     },
 }
 
@@ -434,10 +557,12 @@ pub(crate) fn encode_receipt_document(receipt: &CommandReceipt) -> Result<Vec<u8
             command_id,
             code,
             current_revision,
+            resolution,
         } => ReceiptBodyWire::Rejected {
             command_id: *command_id,
             code: *code,
             current_revision: *current_revision,
+            resolution: resolution.clone(),
         },
     };
     let wire = ReceiptDocumentWire {
@@ -478,10 +603,12 @@ pub(crate) fn decode_receipt_document(payload: &[u8]) -> Result<CommandReceipt, 
             command_id,
             code,
             current_revision,
+            resolution,
         } => CommandReceipt::Rejected {
             command_id,
             code,
             current_revision,
+            resolution,
         },
     })
 }
@@ -489,7 +616,7 @@ pub(crate) fn decode_receipt_document(payload: &[u8]) -> Result<CommandReceipt, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::id::{CommandId, EventId, OperationId, ResourceId, TaskId};
+    use crate::domain::id::{AgentSessionId, CommandId, EventId, OperationId, ResourceId, TaskId};
 
     fn fixed_uuid_v7(tail: u8) -> [u8; 16] {
         [
@@ -705,6 +832,7 @@ mod tests {
     fn command_side_effect_planner_close_and_release_shapes() {
         use std::collections::BTreeMap;
 
+        use crate::domain::agent::{AgentRole, AgentSessionFacts, AgentSessionLifecycle};
         use crate::domain::id::{EnvironmentId, ProjectId};
         use crate::domain::resource::{
             OwnerKind, ResourceFacts, ResourceKind, ResourceLifecycle, ResourceRecipe,
@@ -753,6 +881,7 @@ mod tests {
             primary_agent_id: None,
             artifacts: BTreeMap::new(),
             resources,
+            provider_sessions: BTreeMap::new(),
         };
 
         let close = plan_effects(
@@ -847,6 +976,68 @@ mod tests {
         )
         .expect("pure plans nothing");
         assert!(pure.is_empty());
+
+        let agent_session_id = AgentSessionId::from_bytes(fixed_uuid_v7(0x25)).unwrap();
+        let provider_session_id =
+            crate::domain::ProviderSessionId::new("codex-session-25").unwrap();
+        let mut provider_snap = snap.clone();
+        provider_snap.agents.insert(
+            agent_session_id,
+            AgentSessionFacts {
+                id: agent_session_id,
+                task_id,
+                role: AgentRole::Primary,
+                provider_kind: "codex".into(),
+                provider_session_id: Some(provider_session_id.clone()),
+                lifecycle: AgentSessionLifecycle::Open,
+                runtime_generation: 9,
+                revision: 0,
+            },
+        );
+        let provider_operation = OperationId::from_bytes(fixed_uuid_v7(0x26)).unwrap();
+        let provider_command = CommandId::from_bytes(fixed_uuid_v7(0x27)).unwrap();
+        let provider_client = crate::domain::ClientId::from_bytes(fixed_uuid_v7(0x28)).unwrap();
+        let provider_event = Event::ProviderInputAccepted {
+            command_id: provider_command,
+            client_id: provider_client,
+            operation_id: provider_operation,
+            agent_session_id,
+            provider_kind: crate::domain::ProviderKind::new("codex").unwrap(),
+            provider_session_id,
+            runtime_generation: 9,
+            turn_id: crate::domain::TurnId::from_bytes(fixed_uuid_v7(0x29)).unwrap(),
+            action_epoch: 3,
+            question_id: None,
+            approval_id: None,
+            action: crate::domain::ProviderInputAction::SendNow {
+                text: "sealed adapter seam".into(),
+                wait: false,
+            },
+            wait: false,
+            delivery: crate::domain::ProviderDeliveryVisibility::hold_until_destination_adapter(),
+        };
+        let provider = plan_effects(Some(&provider_snap), task_id, &[provider_event])
+            .expect("provider input plans a concrete effect");
+        assert_eq!(provider.len(), 1);
+        assert_eq!(
+            provider[0].document.destination_class,
+            DestinationClass::ProviderInput
+        );
+        assert_eq!(
+            provider[0].document.replay_policy,
+            ReplayPolicy::NoAutomaticRetry
+        );
+        match &provider[0].document.effect {
+            Effect::DeliverProviderInput {
+                operation_id: planned_operation,
+                agent_session_id: planned_agent,
+                ..
+            } => {
+                assert_eq!(*planned_operation, provider_operation);
+                assert_eq!(*planned_agent, agent_session_id);
+            }
+            other => panic!("unexpected provider effect: {other:?}"),
+        }
 
         assert!(plan_effects(
             Some(&snap),

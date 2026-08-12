@@ -18,7 +18,10 @@ use tempfile::TempDir;
 use uuid::Uuid;
 
 use devmanager::client::action::{
-    self, ActionRisk, ActionScope, ACTION_HOST_ACTIONS, ACTION_HOST_STATUS, ACTION_TASK_CREATE,
+    self, ActionRisk, ActionScope, ACTION_HOST_ACTIONS, ACTION_HOST_STATUS,
+    ACTION_PROVIDER_ANSWER_QUESTION, ACTION_PROVIDER_NEW_CONVERSATION,
+    ACTION_PROVIDER_QUEUE_FOLLOW_UP, ACTION_PROVIDER_RESOLVE_APPROVAL, ACTION_PROVIDER_SEND_NOW,
+    ACTION_PROVIDER_STEER_CURRENT_TURN, ACTION_PROVIDER_STOP_TURN, ACTION_TASK_CREATE,
     ACTION_TASK_CREATE_V2, ACTION_TASK_LIST, ACTION_TASK_RENAME, ACTION_TASK_SHOW,
 };
 use devmanager::config::paths::{resolve_app_paths, AppProfile, BuildKind, ResolvedAppPaths};
@@ -311,7 +314,11 @@ fn wait_for_identity(host: &mut ChildGuard, lock_path: &Path) -> HostIdentity {
 #[test]
 fn action_catalog_ids_are_unique_and_classified() {
     let catalog = action::catalog();
-    assert_eq!(catalog.len(), 6);
+    assert_eq!(
+        catalog.len(),
+        12,
+        "slice exposes host/task actions plus executable provider input controls"
+    );
 
     let mut ids = Vec::new();
     for action in catalog {
@@ -324,14 +331,34 @@ fn action_catalog_ids_are_unique_and_classified() {
         ids.push(action.id);
         let expected_risk = if matches!(
             action.id,
-            ACTION_TASK_CREATE | ACTION_TASK_CREATE_V2 | ACTION_TASK_RENAME
+            ACTION_TASK_CREATE
+                | ACTION_TASK_CREATE_V2
+                | ACTION_TASK_RENAME
+                | ACTION_PROVIDER_SEND_NOW
+                | ACTION_PROVIDER_STEER_CURRENT_TURN
+                | ACTION_PROVIDER_QUEUE_FOLLOW_UP
+                | ACTION_PROVIDER_ANSWER_QUESTION
+                | ACTION_PROVIDER_RESOLVE_APPROVAL
+                | ACTION_PROVIDER_STOP_TURN
+                | ACTION_PROVIDER_NEW_CONVERSATION
         ) {
             ActionRisk::Mutating
         } else {
             ActionRisk::ReadOnly
         };
         assert_eq!(action.risk, expected_risk);
-        let expected_scope = if matches!(action.id, ACTION_TASK_SHOW | ACTION_TASK_RENAME) {
+        let expected_scope = if matches!(
+            action.id,
+            ACTION_TASK_SHOW
+                | ACTION_TASK_RENAME
+                | ACTION_PROVIDER_SEND_NOW
+                | ACTION_PROVIDER_STEER_CURRENT_TURN
+                | ACTION_PROVIDER_QUEUE_FOLLOW_UP
+                | ACTION_PROVIDER_ANSWER_QUESTION
+                | ACTION_PROVIDER_RESOLVE_APPROVAL
+                | ACTION_PROVIDER_STOP_TURN
+                | ACTION_PROVIDER_NEW_CONVERSATION
+        ) {
             ActionScope::Task
         } else {
             ActionScope::Host
@@ -386,14 +413,34 @@ fn ctl_actions_json_is_stable_unique_and_offline() {
         ids.push(id.to_string());
         let expected_risk = if matches!(
             id,
-            ACTION_TASK_CREATE | ACTION_TASK_CREATE_V2 | ACTION_TASK_RENAME
+            ACTION_TASK_CREATE
+                | ACTION_TASK_CREATE_V2
+                | ACTION_TASK_RENAME
+                | ACTION_PROVIDER_SEND_NOW
+                | ACTION_PROVIDER_STEER_CURRENT_TURN
+                | ACTION_PROVIDER_QUEUE_FOLLOW_UP
+                | ACTION_PROVIDER_ANSWER_QUESTION
+                | ACTION_PROVIDER_RESOLVE_APPROVAL
+                | ACTION_PROVIDER_STOP_TURN
+                | ACTION_PROVIDER_NEW_CONVERSATION
         ) {
             "mutating"
         } else {
             "read_only"
         };
         assert_eq!(action["risk"], expected_risk);
-        let expected_scope = if matches!(id, ACTION_TASK_SHOW | ACTION_TASK_RENAME) {
+        let expected_scope = if matches!(
+            id,
+            ACTION_TASK_SHOW
+                | ACTION_TASK_RENAME
+                | ACTION_PROVIDER_SEND_NOW
+                | ACTION_PROVIDER_STEER_CURRENT_TURN
+                | ACTION_PROVIDER_QUEUE_FOLLOW_UP
+                | ACTION_PROVIDER_ANSWER_QUESTION
+                | ACTION_PROVIDER_RESOLVE_APPROVAL
+                | ACTION_PROVIDER_STOP_TURN
+                | ACTION_PROVIDER_NEW_CONVERSATION
+        ) {
             "task"
         } else {
             "host"

@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "kind": "codex",
+  "version": "fixture-codex-1",
+  "auth_state": "auth_required",
+  "exact_resume": "unsupported",
+  "semantic_events": "unknown",
+  "provider_session_id": "unknown",
+  "build_launch": "unknown",
+  "parse_signal": "unknown",
+  "cooperative_stop": "unknown",
+  "observe_quota": "unknown",
+  "evidence": [
+    {
+      "source": "auth_status_probe",
+      "observed_at": 1700000000001,
+      "expires_at": 1700000001001,
+      "confidence": "high",
+      "auth_source": "codex_subscription_login",
+      "status": "auth_required",
+      "diagnostic": {
+        "code": "authentication_required",
+        "digest": null
+      }
+    }
+  ]
+}

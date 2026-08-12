@@ -27,3 +27,34 @@ pub use frame::{
 pub use reconnect::ReconnectGrant;
 pub use request::{ClientRequest, ServerMessage};
 pub use stream::{StreamFrame, StreamKey, StreamPayloadKind};
+
+/// Journal pages use the same bounded MessagePack codec as other protocol
+/// documents. Raw provider payloads are never a protocol page field.
+pub use crate::domain::{SemanticJournalFact, SemanticJournalPage, SemanticJournalPayload};
+
+/// Host/protocol journal query is capability-unavailable until a later task
+/// wires `Query`/`ServerMessage` and a kernel subscription. A type re-export
+/// is not an integration seam.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SemanticJournalQueryUnavailable;
+
+impl std::fmt::Display for SemanticJournalQueryUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("semantic journal protocol query is capability-unavailable on this base")
+    }
+}
+
+impl std::error::Error for SemanticJournalQueryUnavailable {}
+
+pub const fn semantic_journal_query_available() -> bool {
+    false
+}
+
+pub fn query_semantic_journal_page(
+    _after_sequence: u64,
+    _limits: crate::domain::PageLimits,
+) -> Result<SemanticJournalPage, SemanticJournalQueryUnavailable> {
+    let _ = _after_sequence;
+    let _ = _limits;
+    Err(SemanticJournalQueryUnavailable)
+}

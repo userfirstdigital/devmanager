@@ -177,6 +177,56 @@ ALTER TABLE command_receipts ADD COLUMN command_fingerprint BLOB CHECK(command_f
 CREATE INDEX idx_command_receipts_scope ON command_receipts(client_id, connection_id, task_id, action_epoch, runtime_generation, created_at_ms);\n\
 ";
 
+/// Provider input authority and durable fenced state are additive to the
+/// scoped receipt ledger. The payload digest lets typed provider retries reject
+/// a reused command id without weakening connection/session scope checks.
+const V8_SQL: &str = "\
+ALTER TABLE command_receipts ADD COLUMN payload_digest BLOB CHECK(payload_digest IS NULL OR length(payload_digest) = 32);\n\
+CREATE TABLE provider_input_state (\n\
+  agent_session_id BLOB PRIMARY KEY CHECK(length(agent_session_id) = 16),\n\
+  task_id BLOB NOT NULL CHECK(length(task_id) = 16) REFERENCES tasks(task_id),\n\
+  state BLOB NOT NULL\n\
+);\n\
+";
+
+/// Semantic provider journal storage follows the immutable receipt and input
+/// migrations so both phase histories remain upgradeable.
+const V9_SQL: &str = "\
+CREATE TABLE semantic_journal_sessions (\n\
+  authority_digest BLOB PRIMARY KEY CHECK(length(authority_digest) = 32),\n\
+  provider_kind TEXT NOT NULL,\n\
+  task_id BLOB NOT NULL CHECK(length(task_id) = 16),\n\
+  agent_session_id BLOB NOT NULL CHECK(length(agent_session_id) = 16),\n\
+  resource_id BLOB NOT NULL CHECK(length(resource_id) = 16),\n\
+  runtime_generation INTEGER NOT NULL CHECK(runtime_generation >= 0),\n\
+  action_epoch INTEGER NOT NULL CHECK(action_epoch >= 0),\n\
+  managed_root BLOB NOT NULL CHECK(length(managed_root) = 32),\n\
+  opened_at_ms INTEGER NOT NULL\n\
+);\n\
+CREATE TABLE semantic_journal_facts (\n\
+  authority_digest BLOB NOT NULL REFERENCES semantic_journal_sessions(authority_digest),\n\
+  sequence INTEGER NOT NULL CHECK(sequence > 0),\n\
+  event_id BLOB NOT NULL CHECK(length(event_id) = 16),\n\
+  delivery_id TEXT NOT NULL,\n\
+  provider_event_id TEXT,\n\
+  content_hash BLOB NOT NULL CHECK(length(content_hash) = 32),\n\
+  kind TEXT NOT NULL,\n\
+  visibility TEXT NOT NULL,\n\
+  privacy_class TEXT NOT NULL,\n\
+  redaction_class TEXT NOT NULL,\n\
+  occurred_at_ms INTEGER NOT NULL,\n\
+  ingested_at_ms INTEGER NOT NULL,\n\
+  schema_version INTEGER NOT NULL,\n\
+  payload BLOB NOT NULL,\n\
+  PRIMARY KEY (authority_digest, sequence),\n\
+  UNIQUE (authority_digest, event_id),\n\
+  UNIQUE (authority_digest, delivery_id),\n\
+  UNIQUE (authority_digest, provider_event_id)\n\
+);\n\
+CREATE INDEX idx_semantic_journal_facts_sequence\n\
+  ON semantic_journal_facts(authority_digest, sequence);\n\
+";
+
 /// Compiled SHA-256 of [`V1_SQL`]. Do not change V1_SQL without updating this literal.
 pub(crate) const V1_SHA256: [u8; 32] = [
     0x79, 0xf0, 0xa3, 0x8f, 0x10, 0x92, 0xf7, 0x70, 0xa8, 0x84, 0xef, 0x3a, 0x12, 0x84, 0x81, 0x84,
@@ -216,6 +266,18 @@ pub(crate) const V6_SHA256: [u8; 32] = [
 pub(crate) const V7_SHA256: [u8; 32] = [
     0x89, 0xdc, 0xdf, 0xf7, 0x34, 0xc6, 0xea, 0x4e, 0x37, 0xda, 0xda, 0x76, 0x67, 0x26, 0x1f, 0x0b,
     0xee, 0xd1, 0x0e, 0x31, 0xe4, 0xcd, 0x78, 0xd3, 0xb9, 0x8f, 0xdc, 0x62, 0x6b, 0x2d, 0x2c, 0x2a,
+];
+
+/// Compiled SHA-256 of [`V8_SQL`]. Do not change V8_SQL without updating this literal.
+pub(crate) const V8_SHA256: [u8; 32] = [
+    0xd1, 0xd0, 0xd1, 0x80, 0xb6, 0x41, 0x1e, 0x65, 0xb8, 0x95, 0xe8, 0xaa, 0x5c, 0x12, 0x55, 0x9c,
+    0x2f, 0x55, 0x02, 0x13, 0xbf, 0x59, 0x9c, 0x67, 0x80, 0x96, 0xb5, 0x6f, 0x26, 0x60, 0x45, 0x17,
+];
+
+/// Compiled SHA-256 of [`V9_SQL`]. Do not change V9_SQL without updating this literal.
+pub(crate) const V9_SHA256: [u8; 32] = [
+    0xe5, 0x15, 0x64, 0xcc, 0x51, 0x8f, 0x00, 0xa8, 0xb2, 0x40, 0x50, 0x6d, 0xda, 0x22, 0x3b, 0x96,
+    0x4f, 0x6f, 0xd5, 0x9e, 0xa6, 0xde, 0xf9, 0xa6, 0x4a, 0x70, 0x26, 0x05, 0x23, 0x41, 0x0e, 0x2c,
 ];
 
 /// Stable hex form of [`V1_SHA256`] for internal diagnostics.
@@ -275,6 +337,16 @@ pub(crate) fn migration_manifest() -> &'static [Migration] {
                 sha256_bytes(V7_SQL),
                 "V7_SHA256 literal must match V7_SQL bytes"
             );
+            assert_eq!(
+                V8_SHA256,
+                sha256_bytes(V8_SQL),
+                "V8_SHA256 literal must match V8_SQL bytes"
+            );
+            assert_eq!(
+                V9_SHA256,
+                sha256_bytes(V9_SQL),
+                "V9_SHA256 literal must match V9_SQL bytes"
+            );
             let migrations = vec![
                 Migration {
                     version: 1,
@@ -317,6 +389,18 @@ pub(crate) fn migration_manifest() -> &'static [Migration] {
                     name: "v7_command_receipt_scope",
                     sql: V7_SQL,
                     sha256: V7_SHA256,
+                },
+                Migration {
+                    version: 8,
+                    name: "v8_provider_input_authority",
+                    sql: V8_SQL,
+                    sha256: V8_SHA256,
+                },
+                Migration {
+                    version: 9,
+                    name: "v9_semantic_journal",
+                    sql: V9_SQL,
+                    sha256: V9_SHA256,
                 },
             ];
             verify_manifest(&migrations);
@@ -361,6 +445,102 @@ fn verify_manifest(migrations: &[Migration]) {
 
 pub(crate) fn latest_migration_version() -> i64 {
     migration_manifest().last().map(|m| m.version).unwrap_or(0)
+}
+
+/// Fail closed when semantic-journal storage is present but structurally
+/// weakened. This keeps the provider journal on the same durable schema
+/// authority as the kernel projections.
+pub(crate) fn validate_semantic_journal_schema(conn: &Connection) -> Result<(), StoreError> {
+    const EXPECTED: &[(&str, &[(&str, &str, i64, i64)])] = &[
+        (
+            "semantic_journal_sessions",
+            &[
+                ("authority_digest", "BLOB", 0, 1),
+                ("provider_kind", "TEXT", 1, 0),
+                ("task_id", "BLOB", 1, 0),
+                ("agent_session_id", "BLOB", 1, 0),
+                ("resource_id", "BLOB", 1, 0),
+                ("runtime_generation", "INTEGER", 1, 0),
+                ("action_epoch", "INTEGER", 1, 0),
+                ("managed_root", "BLOB", 1, 0),
+                ("opened_at_ms", "INTEGER", 1, 0),
+            ],
+        ),
+        (
+            "semantic_journal_facts",
+            &[
+                ("authority_digest", "BLOB", 1, 1),
+                ("sequence", "INTEGER", 1, 2),
+                ("event_id", "BLOB", 1, 0),
+                ("delivery_id", "TEXT", 1, 0),
+                ("provider_event_id", "TEXT", 0, 0),
+                ("content_hash", "BLOB", 1, 0),
+                ("kind", "TEXT", 1, 0),
+                ("visibility", "TEXT", 1, 0),
+                ("privacy_class", "TEXT", 1, 0),
+                ("redaction_class", "TEXT", 1, 0),
+                ("occurred_at_ms", "INTEGER", 1, 0),
+                ("ingested_at_ms", "INTEGER", 1, 0),
+                ("schema_version", "INTEGER", 1, 0),
+                ("payload", "BLOB", 1, 0),
+            ],
+        ),
+    ];
+    for (table, expected) in EXPECTED {
+        let pragma = format!("PRAGMA table_info('{table}')");
+        let mut statement = conn.prepare(&pragma).map_err(StoreError::from)?;
+        let mut rows = statement.query([]).map_err(StoreError::from)?;
+        let mut actual = Vec::new();
+        while let Some(row) = rows.next().map_err(StoreError::from)? {
+            actual.push((
+                row.get::<_, String>(1).map_err(StoreError::from)?,
+                row.get::<_, String>(2).map_err(StoreError::from)?,
+                row.get::<_, i64>(3).map_err(StoreError::from)?,
+                row.get::<_, i64>(5).map_err(StoreError::from)?,
+            ));
+        }
+        if actual.as_slice() != *expected {
+            return Err(StoreError::MigrationInterrupted);
+        }
+    }
+    let facts_sql: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'semantic_journal_facts'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(StoreError::from)?
+        .ok_or(StoreError::MigrationInterrupted)?;
+    let facts_sql = facts_sql
+        .to_ascii_lowercase()
+        .split_whitespace()
+        .collect::<String>();
+    for fragment in [
+        "referencessemantic_journal_sessions(authority_digest)",
+        "check(sequence>0)",
+        "check(length(event_id)=16)",
+        "check(length(content_hash)=32)",
+        "primarykey(authority_digest,sequence)",
+        "unique(authority_digest,event_id)",
+        "unique(authority_digest,delivery_id)",
+        "unique(authority_digest,provider_event_id)",
+    ] {
+        if !facts_sql.contains(fragment) {
+            return Err(StoreError::MigrationInterrupted);
+        }
+    }
+    let index_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'index' AND name = 'idx_semantic_journal_facts_sequence'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(StoreError::from)?;
+    if index_count != 1 {
+        return Err(StoreError::MigrationInterrupted);
+    }
+    Ok(())
 }
 
 pub(crate) const PROJECTION_TABLES: &[&str] = &[
@@ -526,7 +706,7 @@ mod tests {
                 .map(|row| row.unwrap())
                 .collect()
         };
-        assert_eq!(history.len(), 7);
+        assert_eq!(history.len(), 9);
         assert_eq!(history[0], (1, "v1_initial".into(), V1_SHA256.to_vec()));
         assert_eq!(
             history[1],
@@ -547,6 +727,12 @@ mod tests {
         assert_eq!(history[6].0, 7);
         assert_eq!(history[6].1, "v7_command_receipt_scope");
         assert_eq!(history[6].2, V7_SHA256.to_vec());
+        assert_eq!(history[7].0, 8);
+        assert_eq!(history[7].1, "v8_provider_input_authority");
+        assert_eq!(history[7].2, V8_SHA256.to_vec());
+        assert_eq!(history[8].0, 9);
+        assert_eq!(history[8].1, "v9_semantic_journal");
+        assert_eq!(history[8].2, V9_SHA256.to_vec());
 
         let compacted_column: (String, i64) = conn
             .query_row(

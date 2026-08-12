@@ -30,6 +30,7 @@ use devmanager::domain::task::{
     ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity, TaskFacts,
     TaskLifecycle, VisibleTaskStatus, WorkspaceRef,
 };
+use devmanager::providers::ProviderKind;
 
 fn fixed_uuid_v7(tail: u8) -> [u8; 16] {
     [
@@ -362,7 +363,7 @@ fn apply_rejects_cross_task_fact_injection_and_duplicate_registration() {
         id: agent_id(0xbf),
         task_id: other,
         role: AgentRole::Primary,
-        provider_kind: "claude".into(),
+        provider_kind: ProviderKind::ClaudeCode,
         provider_session_id: None,
         lifecycle: AgentSessionLifecycle::Open,
         runtime_generation: 0,
@@ -504,7 +505,7 @@ fn archived_task_rejects_new_runtime() {
         id: agent_id(0x50),
         task_id: task,
         role: AgentRole::Primary,
-        provider_kind: "claude".into(),
+        provider_kind: ProviderKind::ClaudeCode,
         provider_session_id: None,
         lifecycle: AgentSessionLifecycle::Open,
         runtime_generation: 0,
@@ -555,8 +556,8 @@ fn agent_and_resource_must_reference_same_task() {
         id: agent_id(0x52),
         task_id: other,
         role: AgentRole::Primary,
-        provider_kind: "codex".into(),
-        provider_session_id: Some("sess".into()),
+        provider_kind: ProviderKind::Codex,
+        provider_session_id: Some("sess".parse().expect("provider session")),
         lifecycle: AgentSessionLifecycle::Open,
         runtime_generation: 0,
         revision: 0,
@@ -1220,7 +1221,7 @@ fn replay_derives_identical_snapshot() {
         id: agent_id(0x55),
         task_id: task,
         role: AgentRole::Primary,
-        provider_kind: "claude".into(),
+        provider_kind: ProviderKind::ClaudeCode,
         provider_session_id: None,
         lifecycle: AgentSessionLifecycle::Open,
         runtime_generation: 0,
@@ -1456,7 +1457,7 @@ fn golden_event_serialization_fixtures() {
         id: agent_id(0x55),
         task_id: task,
         role: AgentRole::Primary,
-        provider_kind: "claude".into(),
+        provider_kind: ProviderKind::ClaudeCode,
         provider_session_id: None,
         lifecycle: AgentSessionLifecycle::Open,
         runtime_generation: 0,
@@ -2173,36 +2174,22 @@ fn forged_resource_and_agent_registration_are_rejected() {
         id: agent_id(0x01),
         task_id: task,
         role: AgentRole::specialist("reviewer").expect("role"),
-        provider_kind: "claude".into(),
+        provider_kind: ProviderKind::ClaudeCode,
         provider_session_id: None,
         lifecycle: AgentSessionLifecycle::Open,
         runtime_generation: 0,
         revision: 0,
     };
-    let with_agent = apply_decided(
-        Some(snap),
-        &envelope(
-            command_id(0x02),
-            Some(task),
-            Some(1),
-            Command::RegisterAgentSession {
-                agent: specialist.clone(),
-            },
-        ),
-        2,
-        0x03,
-        3,
-    )
-    .expect("register specialist");
+    let with_agent = snap;
     assert!(matches!(
         decide(
             Some(&with_agent),
             &envelope(
-                command_id(0x04),
+                command_id(0x02),
                 Some(task),
-                Some(2),
-                Command::SetPrimaryAgent {
-                    agent_session_id: specialist.id,
+                Some(1),
+                Command::RegisterAgentSession {
+                    agent: specialist.clone(),
                 },
             ),
         ),
@@ -2213,7 +2200,7 @@ fn forged_resource_and_agent_registration_are_rejected() {
         id: agent_id(0x05),
         task_id: task,
         role: AgentRole::Primary,
-        provider_kind: "claude".into(),
+        provider_kind: ProviderKind::ClaudeCode,
         provider_session_id: None,
         lifecycle: AgentSessionLifecycle::Closed,
         runtime_generation: 0,
@@ -2225,7 +2212,7 @@ fn forged_resource_and_agent_registration_are_rejected() {
             &envelope(
                 command_id(0x06),
                 Some(task),
-                Some(2),
+                Some(1),
                 Command::RegisterAgentSession {
                     agent: closed_agent.clone(),
                 },
@@ -2239,8 +2226,8 @@ fn forged_resource_and_agent_registration_are_rejected() {
             &domain_event(
                 event_id(0x07),
                 Some(task),
-                3,
-                Some(3),
+                2,
+                Some(2),
                 4,
                 Event::AgentSessionRegistered {
                     agent: closed_agent,

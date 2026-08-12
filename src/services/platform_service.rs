@@ -703,27 +703,44 @@ pub(crate) fn kill_process_tree(pid: u32) -> Result<(), String> {
     }
 }
 
-fn claim_suspended_process_with<Job, Attach, Resume>(
+pub fn kill_process(pid: u32) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        windows_terminate_pid(pid)
+    }
+
+    #[cfg(not(windows))]
+    {
+        kill_unix_target(pid, false)
+    }
+}
+
+fn claim_suspended_process_with<Job, Attach>(
     pid: u32,
     attach: Attach,
-    resume: Resume,
 ) -> Result<Option<Job>, String>
 where
     Attach: FnOnce(u32) -> Result<Option<Job>, String>,
+{
+    attach(pid)
+}
+
+#[cfg(test)]
+fn resume_suspended_process_with<Resume>(pid: u32, resume: Resume) -> Result<(), String>
+where
     Resume: FnOnce(u32) -> Result<(), String>,
 {
-    let job = attach(pid)?;
-    resume(pid)?;
-    Ok(job)
+    resume(pid)
 }
 
 /// Claims a process created with [`MANAGED_PROCESS_CREATION_FLAGS`] before
 /// allowing any of its code to execute. On Windows the returned job must stay
-/// alive for as long as the process tree is owned.
-pub(crate) fn claim_suspended_process(pid: u32) -> Result<Option<ManagedProcessJob>, String> {
+/// alive for as long as the process tree is owned. The caller must explicitly
+/// resume the process after all identity checks have completed.
+pub fn claim_suspended_process(pid: u32) -> Result<Option<ManagedProcessJob>, String> {
     #[cfg(windows)]
     {
-        claim_suspended_process_with(pid, attach_process_to_managed_job, resume_suspended_process)
+        claim_suspended_process_with(pid, attach_process_to_managed_job)
     }
 
     #[cfg(not(windows))]
@@ -733,7 +750,7 @@ pub(crate) fn claim_suspended_process(pid: u32) -> Result<Option<ManagedProcessJ
 }
 
 #[cfg(windows)]
-fn resume_suspended_process(pid: u32) -> Result<(), String> {
+pub fn resume_suspended_process(pid: u32) -> Result<(), String> {
     unsafe {
         let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
         if snapshot == INVALID_HANDLE_VALUE {
@@ -976,8 +993,8 @@ fn normalize_process_name(name: &OsStr) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        claim_suspended_process_with, snapshot_listener_pids, snapshot_listener_pids_until,
-        terminate_owned_process_group_with, MAX_LISTENER_PORT_BATCH,
+        claim_suspended_process_with, resume_suspended_process_with, snapshot_listener_pids,
+        snapshot_listener_pids_until, terminate_owned_process_group_with, MAX_LISTENER_PORT_BATCH,
     };
     use std::cell::RefCell;
     use std::sync::{
@@ -1066,24 +1083,17 @@ mod tests {
     }
 
     #[test]
-    fn suspended_process_claim_assigns_job_before_resume() {
+    fn suspended_process_claim_only_assigns_job_before_explicit_resume() {
         let events = RefCell::new(Vec::new());
 
-        let job = claim_suspended_process_with(
-            42,
-            |pid| {
-                events.borrow_mut().push(("assign", pid));
-                Ok(Some("job"))
-            },
-            |pid| {
-                events.borrow_mut().push(("resume", pid));
-                Ok(())
-            },
-        )
+        let job = claim_suspended_process_with(42, |pid| {
+            events.borrow_mut().push(("assign", pid));
+            Ok(Some("job"))
+        })
         .unwrap();
 
         assert_eq!(job, Some("job"));
-        assert_eq!(events.into_inner(), [("assign", 42), ("resume", 42)]);
+        assert_eq!(events.into_inner(), [("assign", 42)]);
     }
 
     #[test]
@@ -1092,26 +1102,10 @@ mod tests {
     }
 
     #[test]
-    fn suspended_process_claim_releases_job_when_resume_fails() {
-        #[derive(Debug)]
-        struct DropMarker(Arc<AtomicBool>);
-
-        impl Drop for DropMarker {
-            fn drop(&mut self) {
-                self.0.store(true, Ordering::Release);
-            }
-        }
-
-        let released = Arc::new(AtomicBool::new(false));
-        let marker = released.clone();
-        let result = claim_suspended_process_with(
-            42,
-            move |_| Ok(Some(DropMarker(marker))),
-            |_| Err("resume failed".to_string()),
-        );
+    fn explicit_resume_failure_is_reported_without_claiming_again() {
+        let result = resume_suspended_process_with(42, |_| Err("resume failed".to_string()));
 
         assert_eq!(result.unwrap_err(), "resume failed");
-        assert!(released.load(Ordering::Acquire));
     }
 
     #[cfg(windows)]
@@ -1145,6 +1139,7 @@ mod tests {
         assert!(!marker.exists(), "suspended child must not execute early");
 
         let job = claim_suspended_process(child.id()).unwrap();
+        super::resume_suspended_process(child.id()).unwrap();
         let status = child.wait().unwrap();
         assert!(status.success());
         assert_eq!(std::fs::read_to_string(&marker).unwrap(), "resumed");
@@ -1555,23 +1550,35 @@ where
 
 #[cfg(not(windows))]
 fn send_unix_signal(target: &str, signal: &str) -> Result<(), String> {
-    let output = Command::new("kill")
-        .args([&format!("-{signal}"), "--", target])
-        .output()
-        .map_err(|error| format!("Failed to run kill: {error}"))?;
-    if output.status.success() {
+    let signal = match signal {
+        "TERM" => libc::SIGTERM,
+        "KILL" => libc::SIGKILL,
+        other => return Err(format!("Unsupported Unix signal {other}")),
+    };
+    let target = target
+        .parse::<libc::pid_t>()
+        .map_err(|error| format!("Invalid Unix process target {target}: {error}"))?;
+    if target == 0 {
+        return Err("Unix process target cannot be zero".to_string());
+    }
+    if unsafe { libc::kill(target, signal) } == 0 {
         Ok(())
     } else {
-        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+        Err(std::io::Error::last_os_error().to_string())
     }
 }
 
 #[cfg(not(windows))]
 fn unix_process_group_exists(target: &str) -> bool {
-    Command::new("kill")
-        .args(["-0", "--", target])
-        .status()
-        .is_ok_and(|status| status.success())
+    let Ok(target) = target.parse::<libc::pid_t>() else {
+        return false;
+    };
+    if target == 0 {
+        return false;
+    }
+    let result = unsafe { libc::kill(target, 0) };
+    result == 0
+        || (result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM))
 }
 
 #[cfg(not(windows))]

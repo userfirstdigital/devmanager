@@ -1,0 +1,21 @@
+Resume a previous interactive session (picker by default; use --last to continue the most recent)
+
+Usage: codex resume [OPTIONS] [SESSION_ID] [PROMPT]
+
+Arguments:
+  [SESSION_ID]
+          Session id (UUID) or session name. If omitted, use --last to pick the most recent
+          recorded session.
+
+  [PROMPT]
+          Optional user prompt to start the session
+
+Options:
+      --last
+          Continue the most recent session without showing the picker
+
+      --dangerously-bypass-hook-trust
+          Run enabled hooks without requiring persisted hook trust for this invocation.
+
+  -h, --help
+          Print help

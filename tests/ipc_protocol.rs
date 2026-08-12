@@ -761,6 +761,7 @@ async fn duplex_client_correlates_interleaved_command_and_query_replies() {
             command_id,
             code: devmanager::domain::command::RejectionCode::NotFound,
             current_revision: None,
+            resolution: None,
         }))
         .await
         .expect("write command receipt second");

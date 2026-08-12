@@ -8,10 +8,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde_json::json;
 
 use super::action::{
-    self, task_create_v2_command, task_rename_command, ActionArgumentSchema, ActionRisk,
-    ActionScope, TaskCreateV2Arguments, TaskRenameArguments, ACTION_HOST_STATUS,
-    ACTION_TASK_CREATE, ACTION_TASK_CREATE_V2, ACTION_TASK_LIST, ACTION_TASK_RENAME,
-    ACTION_TASK_SHOW,
+    self, provider_input_command, task_create_v2_command, task_rename_command,
+    ActionArgumentSchema, ActionRisk, ActionScope, ProviderInputArguments, TaskCreateV2Arguments,
+    TaskRenameArguments, ACTION_HOST_STATUS, ACTION_PROVIDER_ANSWER_QUESTION,
+    ACTION_PROVIDER_NEW_CONVERSATION, ACTION_PROVIDER_QUEUE_FOLLOW_UP,
+    ACTION_PROVIDER_RESOLVE_APPROVAL, ACTION_PROVIDER_SEND_NOW, ACTION_PROVIDER_STEER_CURRENT_TURN,
+    ACTION_PROVIDER_STOP_TURN, ACTION_TASK_CREATE, ACTION_TASK_CREATE_V2, ACTION_TASK_LIST,
+    ACTION_TASK_RENAME, ACTION_TASK_SHOW,
 };
 use super::{HostClient, HostClientConfig};
 use crate::domain::command::{CommandEnvelope, CommandReceipt, RejectionCode};
@@ -500,6 +503,33 @@ fn argument_schema_json(schema: ActionArgumentSchema) -> serde_json::Value {
             },
             "required": ["task_id", "title"],
         }),
+        ActionArgumentSchema::ProviderInputV1 => json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "task_id": uuid(),
+                "agent_session_id": uuid(),
+                "runtime_generation": { "type": "integer", "minimum": 0 },
+                "action_epoch": { "type": "integer", "minimum": 0 },
+                "turn_id": uuid(),
+                "question_id": uuid(),
+                "approval_id": uuid(),
+                "text": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 65536
+                },
+                "wait": { "type": "boolean" },
+                "allow": { "type": "boolean" },
+            },
+            "required": [
+                "task_id",
+                "agent_session_id",
+                "runtime_generation",
+                "action_epoch",
+                "turn_id"
+            ],
+        }),
     }
 }
 
@@ -520,6 +550,7 @@ fn capability_name(capability: crate::protocol::Capability) -> &'static str {
         ManagementMetadata => "management_metadata",
         ExplicitDetach => "explicit_detach",
         HostShutdown => "host_shutdown",
+        ProviderInput => "provider_input",
     }
 }
 
@@ -855,6 +886,48 @@ fn invoke_json_document(
                 ))
             }
         }
+        ACTION_PROVIDER_NEW_CONVERSATION => {
+            let reason = crate::providers::input::new_conversation_availability();
+            Err(CliError::new(format!(
+                "{} unavailable: {}",
+                reason.action_id(),
+                reason.reason_code()
+            )))
+        }
+        ACTION_PROVIDER_SEND_NOW
+        | ACTION_PROVIDER_STEER_CURRENT_TURN
+        | ACTION_PROVIDER_QUEUE_FOLLOW_UP
+        | ACTION_PROVIDER_ANSWER_QUESTION
+        | ACTION_PROVIDER_RESOLVE_APPROVAL
+        | ACTION_PROVIDER_STOP_TURN => {
+            let Some(expected_task_revision) = expected_task_revision else {
+                return Err(CliError::new(format!(
+                    "{action_id} requires expected-task-revision"
+                )));
+            };
+            #[cfg(not(windows))]
+            {
+                let _ = profile;
+                let _ = arguments_json;
+                let _ = expected_task_revision;
+                return Err(CliError::new("ctl invoke requires Windows"));
+            }
+            #[cfg(windows)]
+            {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| {
+                        CliError::new(format!("failed to build ctl runtime: {error}"))
+                    })?;
+                runtime.block_on(provider_input_invoke_async(
+                    profile,
+                    action_id,
+                    arguments_json,
+                    expected_task_revision,
+                ))
+            }
+        }
         other => Err(CliError::new(format!("unsupported action id: {other}"))),
     }
 }
@@ -941,6 +1014,71 @@ async fn task_rename_invoke_async(
     }
 }
 
+#[cfg(windows)]
+async fn provider_input_invoke_async(
+    profile: &str,
+    action_id: &str,
+    arguments_json: &str,
+    expected_task_revision: u64,
+) -> Result<String, CliError> {
+    let args: ProviderInputArguments = serde_json::from_str(arguments_json)
+        .map_err(|error| CliError::new(format!("invalid {action_id} arguments JSON: {error}")))?;
+    let task_id = args.task_id;
+    let client_id = ClientId::new();
+    let command_id = CommandId::new();
+    let issued_at_ms = unix_epoch_ms()?;
+    let envelope = provider_input_command(
+        command_id,
+        client_id,
+        issued_at_ms,
+        expected_task_revision,
+        action_id,
+        args,
+    )
+    .map_err(|error| CliError::new(format!("invalid {action_id} arguments: {error}")))?;
+
+    let mut client = connect_profile_client(
+        profile,
+        client_id,
+        CapabilitySet::from_capabilities([Capability::ProviderInput]),
+    )
+    .await?;
+    if !client
+        .granted_capabilities()
+        .contains(Capability::ProviderInput)
+    {
+        return Err(CliError::new(
+            "host did not grant required provider_input capability",
+        ));
+    }
+    let receipt = execute_command_with_reconnect(&mut client, envelope, action_id).await?;
+    match &receipt {
+        CommandReceipt::Accepted { .. } => {
+            let delivery =
+                crate::domain::ProviderDeliveryVisibility::hold_until_destination_adapter();
+            let doc = json!({
+                "schema_version": SCHEMA_VERSION,
+                "action_id": action_id,
+                "profile": profile,
+                "task_id": task_id,
+                "receipt": receipt,
+                "intent": "accepted",
+                "delivery": {
+                    "status": "hold",
+                    "reason": delivery.reason_code(),
+                    "delivered": false,
+                },
+            });
+            serde_json::to_string(&doc)
+                .map_err(|error| CliError::new(format!("failed to encode invoke JSON: {error}")))
+        }
+        CommandReceipt::Rejected { code, .. } => Err(CliError::new(format!(
+            "{action_id} rejected: {}",
+            rejection_code_name(*code)
+        ))),
+    }
+}
+
 fn rejection_code_name(code: RejectionCode) -> &'static str {
     match code {
         RejectionCode::NotFound => "not_found",
@@ -950,6 +1088,8 @@ fn rejection_code_name(code: RejectionCode) -> &'static str {
         RejectionCode::OwnershipConflict => "ownership_conflict",
         RejectionCode::UnsupportedCapability => "unsupported_capability",
         RejectionCode::Closing => "closing",
+        RejectionCode::IdempotencyConflict => "idempotency_conflict",
+        RejectionCode::AlreadyResolved => "already_resolved",
     }
 }
 

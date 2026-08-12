@@ -1,0 +1,40 @@
+{
+  "case_id": "strict_resume_success",
+  "provider": "claude_code",
+  "version": "1.0.0",
+  "task_id": "018f0000-0000-7000-8000-000000000001",
+  "agent_id": "018f0000-0000-7000-8000-000000000002",
+  "generation": 1,
+  "action_id": "018f0000-0000-7000-8000-000000000003",
+  "nonce": "nonce-resume-success",
+  "cli_launchable": true,
+  "probe_ok": true,
+  "resume_command_proven": true,
+  "provider_session_id": "sess_fixture_resume_ok",
+  "capabilities": {
+    "kind": "claude_code",
+    "version": "1.0.0",
+    "auth_state": "unknown",
+    "exact_resume": "supported",
+    "semantic_events": "supported",
+    "provider_session_id": "supported",
+    "build_launch": "supported",
+    "parse_signal": "supported",
+    "cooperative_stop": "unknown",
+    "observe_quota": "unknown",
+    "evidence": [
+      {
+        "source": "capability_probe",
+        "observed_at": 1,
+        "status": "supported"
+      }
+    ]
+  },
+  "events": [
+    { "type": "session_start", "provider_event_id": "e1" }
+  ],
+  "declared_metrics": [
+    "exact_resume_result",
+    "identity_correlation_result"
+  ]
+}

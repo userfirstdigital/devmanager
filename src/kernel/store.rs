@@ -10,9 +10,11 @@ use crate::domain::event::{
     AgentSessionRegisteredPayload, ArtifactRegisteredPayload, DomainEvent, Event,
     HostCleanupBranchCompletedPayload, HostCloseBegunPayload, OperationAcceptedFact,
     OperationCancelledFact, OperationFailedFact, OperationSettledFact, OperationUncertainFact,
-    PrimaryAgentSetPayload, ResourceRegisteredPayload, ResourceReleaseBegunPayload,
-    ResourceReleasedPayload, TaskAttentionSetPayload, TaskCloseBegunPayload, TaskCreatedPayload,
-    TaskRenamedPayload, TaskUnitPayload, EVENT_SCHEMA_VERSION,
+    PrimaryAgentSetPayload, ProviderApprovalPresentedPayload, ProviderInputAcceptedPayload,
+    ProviderInputDeliveredPayload, ProviderQuestionPresentedPayload, ProviderWaitSettledPayload,
+    ResourceRegisteredPayload, ResourceReleaseBegunPayload, ResourceReleasedPayload,
+    TaskAttentionSetPayload, TaskCloseBegunPayload, TaskCreatedPayload, TaskRenamedPayload,
+    TaskUnitPayload, EVENT_SCHEMA_VERSION,
 };
 use crate::domain::id::{EventId, OperationId, OutboxId, TaskId};
 use crate::domain::operation::{
@@ -20,7 +22,8 @@ use crate::domain::operation::{
 };
 use crate::kernel::command_bus::{
     self, effect_document_for_terminal_replay, load_outbox_row_by_id,
-    refuse_archive_with_live_resources, validate_dispatch_candidate_lineage, OutboxRow,
+    refuse_archive_with_live_resources, validate_dispatch_attempt_lineage,
+    validate_dispatch_candidate_lineage, OutboxRow,
 };
 use crate::kernel::dispatch::{
     ambiguity_disposition, decode_absence_receipt, encode_absence_receipt, AbsenceReceiptDocument,
@@ -28,7 +31,7 @@ use crate::kernel::dispatch::{
     ReconciliationFinding, ReconciliationOrigin,
 };
 use crate::kernel::maintenance;
-use crate::kernel::outbox::{external_idempotency_key, Effect, ReplayPolicy};
+use crate::kernel::outbox::{external_idempotency_key, DestinationClass, Effect, ReplayPolicy};
 use crate::kernel::projector;
 use crate::kernel::runtime::RecoveringResource;
 use crate::kernel::schema::{self, Migration, PROJECTION_TABLES};
@@ -37,6 +40,7 @@ use crate::workspace::WorkspaceAuthorization;
 
 const BUSY_TIMEOUT_MS: i64 = 5_000;
 const MAX_DISPATCH_LEASE_MS: i64 = 3_600_000;
+pub(crate) const MAX_PROVIDER_EVENT_PAYLOAD_BYTES: usize = 256 * 1024;
 
 /// Opaque SQLite-backed kernel store. No public connection accessor.
 pub struct KernelStore {
@@ -410,6 +414,175 @@ impl KernelStore {
         Ok(out)
     }
 
+    pub(crate) fn semantic_journal_ensure_session(
+        &mut self,
+        record: &crate::kernel::semantic_journal::SemanticJournalAuthorityRecord,
+    ) -> Result<[u8; 16], StoreError> {
+        self.with_immediate_transaction(|tx| {
+            crate::kernel::semantic_journal::ensure_session(tx, record)
+        })
+    }
+
+    pub(crate) fn semantic_journal_high_water(
+        &self,
+        digest: &[u8; 32],
+    ) -> Result<(u64, Option<i64>), StoreError> {
+        crate::kernel::semantic_journal::high_water(&self.conn, digest)
+    }
+
+    pub(crate) fn semantic_journal_high_water_validated(
+        &self,
+        digest: &[u8; 32],
+        validate_row: impl FnMut(
+            &crate::kernel::semantic_journal::SemanticJournalFactRow,
+        ) -> Result<(), StoreError>,
+    ) -> Result<(u64, Option<i64>), StoreError> {
+        crate::kernel::semantic_journal::high_water_with_validator(&self.conn, digest, validate_row)
+    }
+
+    pub(crate) fn semantic_journal_retained_len(
+        &self,
+        digest: &[u8; 32],
+    ) -> Result<usize, StoreError> {
+        crate::kernel::semantic_journal::retained_len(&self.conn, digest)
+    }
+
+    pub(crate) fn semantic_journal_validate(
+        &self,
+        digest: &[u8; 32],
+        validate_row: impl FnMut(
+            &crate::kernel::semantic_journal::SemanticJournalFactRow,
+        ) -> Result<(), StoreError>,
+    ) -> Result<(u64, Option<i64>, Option<i64>), StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let result = crate::kernel::semantic_journal::validate_facts(&tx, digest, validate_row)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    pub(crate) fn semantic_journal_write_fact(
+        &mut self,
+        digest: &[u8; 32],
+        delivery_id: &str,
+        provider_event_id: Option<&str>,
+        payload_hash: [u8; 32],
+        row: crate::kernel::semantic_journal::SemanticJournalFactRow,
+        max_events: u32,
+        max_dedupe_keys: u32,
+        validate_row: impl FnMut(
+            &crate::kernel::semantic_journal::SemanticJournalFactRow,
+        ) -> Result<(), StoreError>,
+    ) -> Result<crate::kernel::semantic_journal::SemanticJournalWrite, StoreError> {
+        self.with_immediate_transaction(|tx| {
+            crate::kernel::semantic_journal::write_fact(
+                tx,
+                digest,
+                delivery_id,
+                provider_event_id,
+                payload_hash,
+                row,
+                max_events,
+                max_dedupe_keys,
+                validate_row,
+            )
+        })
+    }
+
+    pub(crate) fn semantic_journal_load_fact(
+        &self,
+        digest: &[u8; 32],
+        sequence: i64,
+        validate_row: impl FnMut(
+            &crate::kernel::semantic_journal::SemanticJournalFactRow,
+        ) -> Result<(), StoreError>,
+    ) -> Result<Option<crate::kernel::semantic_journal::SemanticJournalFactRow>, StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        crate::kernel::semantic_journal::validate_facts(&tx, digest, validate_row)?;
+        let fact = crate::kernel::semantic_journal::load_fact(&tx, digest, sequence)?;
+        tx.commit()?;
+        Ok(fact)
+    }
+
+    pub(crate) fn semantic_journal_stream_page(
+        &self,
+        digest: &[u8; 32],
+        after_sequence: i64,
+        requested_high_water: Option<u64>,
+        mut prepare: impl FnMut(
+            u64,
+            &[crate::kernel::semantic_journal::SemanticJournalPageRowMeta],
+        ) -> Result<(), StoreError>,
+        mut validate_metadata: impl for<'a> FnMut(
+            &crate::kernel::semantic_journal::SemanticJournalFactRef<'a>,
+        ) -> Result<(), StoreError>,
+        mut preflight: impl for<'a> FnMut(
+            u64,
+            crate::kernel::semantic_journal::SemanticJournalFactRef<'a>,
+        ) -> Result<
+            crate::kernel::semantic_journal::SemanticJournalPageRowAction,
+            StoreError,
+        >,
+        mut visit: impl FnMut(
+            u64,
+            crate::kernel::semantic_journal::SemanticJournalFactRow,
+        ) -> Result<bool, StoreError>,
+    ) -> Result<u64, StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let (count, _, _) = crate::kernel::semantic_journal::validate_fact_metadata(
+            &tx,
+            digest,
+            &mut validate_metadata,
+        )?;
+        let next_sequence = count.checked_add(1).ok_or(StoreError::Corruption)?;
+        let high_water = next_sequence.checked_sub(1).ok_or(StoreError::Corruption)?;
+        if requested_high_water.is_some_and(|requested| requested != high_water) {
+            return Err(StoreError::ConstraintViolation);
+        }
+        if after_sequence < 0
+            || u64::try_from(after_sequence).map_or(true, |after| after > high_water)
+        {
+            return Err(StoreError::ConstraintViolation);
+        }
+        let high_water_i64 =
+            i64::try_from(high_water).map_err(|_| StoreError::IntegerOutOfRange {
+                field: "semantic_journal.high_water",
+                value: high_water,
+            })?;
+        crate::kernel::semantic_journal::stream_page(
+            &tx,
+            digest,
+            after_sequence,
+            high_water_i64,
+            &mut prepare,
+            &mut preflight,
+            |row| visit(high_water, row),
+        )?;
+        tx.commit()?;
+        Ok(high_water)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_delete_semantic_journal_fact(
+        &mut self,
+        digest: &[u8; 32],
+        sequence: i64,
+    ) -> Result<(), StoreError> {
+        self.with_immediate_transaction(|tx| {
+            crate::kernel::semantic_journal::debug_delete_fact(tx, digest, sequence)
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_zero_semantic_journal_event_id(
+        &mut self,
+        digest: &[u8; 32],
+        sequence: i64,
+    ) -> Result<(), StoreError> {
+        self.with_immediate_transaction(|tx| {
+            crate::kernel::semantic_journal::debug_zero_event_id(tx, digest, sequence)
+        })
+    }
+
     fn migrate(&mut self) -> Result<(), StoreError> {
         let manifest = schema::migration_manifest();
         loop {
@@ -417,6 +590,7 @@ impl KernelStore {
             validate_applied_history(&applied, manifest)?;
 
             if applied.len() >= manifest.len() {
+                detect_interrupted_partial_schema(&self.conn, &applied)?;
                 return Ok(());
             }
 
@@ -443,9 +617,7 @@ impl KernelStore {
                 });
             }
 
-            if applied.is_empty() {
-                detect_interrupted_partial_schema(&self.conn, &applied)?;
-            }
+            detect_interrupted_partial_schema(&self.conn, &applied)?;
 
             // Apply only the next migration inside its own transaction.
             let tx = self.conn.transaction()?;
@@ -706,20 +878,40 @@ fn detect_interrupted_partial_schema(
     conn: &Connection,
     applied: &[AppliedMigration],
 ) -> Result<(), StoreError> {
-    if !applied.is_empty() {
-        return Ok(());
-    }
-    // Empty migration history but projection/event tables already present => interrupted apply.
     let partial: i64 = conn.query_row(
         "SELECT COUNT(*) FROM sqlite_schema
          WHERE type = 'table'
            AND name IN ('events', 'tasks', 'operations', 'command_receipts', 'outbox',
                         'agent_sessions', 'artifacts', 'resources', 'event_retention',
-                        'host_admission', 'host_cleanup_branches')",
+                        'host_admission', 'host_cleanup_branches',
+                        'semantic_journal_sessions', 'semantic_journal_facts')",
         [],
         |row| row.get(0),
     )?;
-    if partial > 0 {
+    let semantic_objects: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_schema
+         WHERE (type = 'table' AND name IN ('semantic_journal_sessions', 'semantic_journal_facts'))
+            OR (type = 'index' AND name = 'idx_semantic_journal_facts_sequence')",
+        [],
+        |row| row.get(0),
+    )?;
+    let applied_version = applied
+        .last()
+        .map(|migration| migration.version)
+        .unwrap_or(0);
+
+    // Empty migration history or a migration that predates V9 with any
+    // semantic-journal object present indicates an interrupted apply. Once V9
+    // is recorded, validate its complete manifest (columns, checks, foreign
+    // key, unique constraints, and explicit index) rather than counting
+    // objects, which cannot detect a weakened or partially rebuilt object.
+    if applied_version < 9 && semantic_objects > 0 {
+        return Err(StoreError::MigrationInterrupted);
+    }
+    if applied_version >= 9 {
+        schema::validate_semantic_journal_schema(conn)?;
+    }
+    if applied.is_empty() && partial > 0 {
         return Err(StoreError::MigrationInterrupted);
     }
     Ok(())
@@ -758,7 +950,25 @@ fn rebuild_projection_tables_tx(tx: &Transaction<'_>) -> Result<ProjectionRebuil
         let event_type: String = row.get(4)?;
         let schema_version: i64 = row.get(5)?;
         let occurred_at_ms: i64 = row.get(6)?;
-        let payload: Vec<u8> = row.get(7)?;
+        // `ValueRef` keeps the SQLite BLOB borrowed until its length has been
+        // checked. Do not materialize an untrusted provider event payload just
+        // to reject it in `decode_stored_event`.
+        let payload_ref = row.get_ref(7)?;
+        let payload_bytes = payload_ref
+            .as_blob()
+            .map_err(|error| StoreError::CodecMismatch {
+                detail: format!("event payload is not a BLOB: {error}"),
+            })?;
+        if event_type.starts_with("provider_input.")
+            && payload_bytes.len() > MAX_PROVIDER_EVENT_PAYLOAD_BYTES
+        {
+            return Err(StoreError::CodecMismatch {
+                detail: format!(
+                    "provider event payload exceeds {MAX_PROVIDER_EVENT_PAYLOAD_BYTES} bytes"
+                ),
+            });
+        }
+        let payload = payload_bytes.to_vec();
 
         let domain = decode_stored_domain_event(
             sequence,
@@ -793,7 +1003,8 @@ fn rebuild_projection_tables_tx(tx: &Transaction<'_>) -> Result<ProjectionRebuil
     // Atomically replace stable projection table contents (never rename tables).
     // Delete children before parents to satisfy foreign keys.
     tx.execute_batch(
-        "DELETE FROM agent_sessions;\n\
+        "DELETE FROM provider_input_state;\n\
+         DELETE FROM agent_sessions;\n\
          DELETE FROM artifacts;\n\
          DELETE FROM resources;\n\
          DELETE FROM operations;\n\
@@ -808,7 +1019,8 @@ fn rebuild_projection_tables_tx(tx: &Transaction<'_>) -> Result<ProjectionRebuil
          INSERT INTO artifacts SELECT * FROM shadow_artifacts;\n\
          INSERT INTO resources SELECT * FROM shadow_resources;\n\
          INSERT INTO host_admission SELECT * FROM shadow_host_admission;\n\
-         INSERT INTO host_cleanup_branches SELECT * FROM shadow_host_cleanup_branches;",
+         INSERT INTO host_cleanup_branches SELECT * FROM shadow_host_cleanup_branches;\n\
+         INSERT INTO provider_input_state SELECT * FROM shadow_provider_input_state;",
     )?;
     for table in PROJECTION_TABLES {
         tx.execute(&format!("DROP TABLE {}", shadow_name(table)), [])?;
@@ -860,6 +1072,12 @@ fn canonical_table_dump(
         }
         ("host_cleanup_branches", true) => {
             "SELECT * FROM shadow_host_cleanup_branches ORDER BY operation_id ASC, branch ASC"
+        }
+        ("provider_input_state", false) => {
+            "SELECT * FROM provider_input_state ORDER BY agent_session_id ASC"
+        }
+        ("provider_input_state", true) => {
+            "SELECT * FROM shadow_provider_input_state ORDER BY agent_session_id ASC"
         }
         _ => {
             return Err(StoreError::Projection(format!(
@@ -1060,8 +1278,108 @@ pub(crate) fn encode_event_payload(event: &Event) -> Result<Vec<u8>, StoreError>
         Event::OperationFailed(fact) => rmp_serde::to_vec(fact),
         Event::OperationCancelled(fact) => rmp_serde::to_vec(fact),
         Event::OperationUncertain(fact) => rmp_serde::to_vec(fact),
+        Event::ProviderInputAccepted {
+            command_id,
+            client_id,
+            operation_id,
+            agent_session_id,
+            provider_kind,
+            provider_session_id,
+            runtime_generation,
+            turn_id,
+            action_epoch,
+            question_id,
+            approval_id,
+            action,
+            wait,
+            delivery,
+        } => rmp_serde::to_vec(&ProviderInputAcceptedPayload {
+            command_id: *command_id,
+            client_id: *client_id,
+            operation_id: *operation_id,
+            agent_session_id: *agent_session_id,
+            provider_kind: provider_kind.clone(),
+            provider_session_id: provider_session_id.clone(),
+            runtime_generation: *runtime_generation,
+            turn_id: *turn_id,
+            action_epoch: *action_epoch,
+            question_id: *question_id,
+            approval_id: *approval_id,
+            action: action.clone(),
+            wait: *wait,
+            delivery: *delivery,
+        }),
+        Event::ProviderQuestionPresented {
+            agent_session_id,
+            provider_kind,
+            provider_session_id,
+            runtime_generation,
+            turn_id,
+            action_epoch,
+            question_id,
+        } => rmp_serde::to_vec(&ProviderQuestionPresentedPayload {
+            agent_session_id: *agent_session_id,
+            provider_kind: provider_kind.clone(),
+            provider_session_id: provider_session_id.clone(),
+            runtime_generation: *runtime_generation,
+            turn_id: *turn_id,
+            action_epoch: *action_epoch,
+            question_id: *question_id,
+        }),
+        Event::ProviderApprovalPresented {
+            agent_session_id,
+            provider_kind,
+            provider_session_id,
+            runtime_generation,
+            turn_id,
+            action_epoch,
+            approval_id,
+        } => rmp_serde::to_vec(&ProviderApprovalPresentedPayload {
+            agent_session_id: *agent_session_id,
+            provider_kind: provider_kind.clone(),
+            provider_session_id: provider_session_id.clone(),
+            runtime_generation: *runtime_generation,
+            turn_id: *turn_id,
+            action_epoch: *action_epoch,
+            approval_id: *approval_id,
+        }),
+        Event::ProviderWaitSettled { fence } => rmp_serde::to_vec(&ProviderWaitSettledPayload {
+            fence: fence.clone(),
+        }),
+        Event::ProviderInputDelivered {
+            command_id,
+            client_id,
+            operation_id,
+            agent_session_id,
+            provider_kind,
+            provider_session_id,
+            runtime_generation,
+            turn_id,
+            action_epoch,
+            question_id,
+            approval_id,
+        } => rmp_serde::to_vec(&ProviderInputDeliveredPayload {
+            command_id: *command_id,
+            client_id: *client_id,
+            operation_id: *operation_id,
+            agent_session_id: *agent_session_id,
+            provider_kind: provider_kind.clone(),
+            provider_session_id: provider_session_id.clone(),
+            runtime_generation: *runtime_generation,
+            turn_id: *turn_id,
+            action_epoch: *action_epoch,
+            question_id: *question_id,
+            approval_id: *approval_id,
+        }),
     }
     .map_err(|e| StoreError::EventDecode(e.to_string()))?;
+    if event.event_type().starts_with("provider_input.")
+        && bytes.len() > MAX_PROVIDER_EVENT_PAYLOAD_BYTES
+    {
+        return Err(StoreError::EventDecode(format!(
+            "provider event payload exceeds {MAX_PROVIDER_EVENT_PAYLOAD_BYTES} bytes"
+        )));
+    }
     Ok(bytes)
 }
 
@@ -1073,6 +1391,14 @@ pub(crate) fn decode_stored_event(
     if schema_version != i64::from(EVENT_SCHEMA_VERSION) {
         return Err(StoreError::CodecMismatch {
             detail: format!("schema_version column {schema_version} != {EVENT_SCHEMA_VERSION}"),
+        });
+    }
+    if event_type.starts_with("provider_input.") && payload.len() > MAX_PROVIDER_EVENT_PAYLOAD_BYTES
+    {
+        return Err(StoreError::CodecMismatch {
+            detail: format!(
+                "provider event payload exceeds {MAX_PROVIDER_EVENT_PAYLOAD_BYTES} bytes"
+            ),
         });
     }
 
@@ -1198,6 +1524,69 @@ pub(crate) fn decode_stored_event(
             let fact: OperationUncertainFact = unpack(payload)?;
             Event::OperationUncertain(fact)
         }
+        "provider_input.accepted" => {
+            let p: ProviderInputAcceptedPayload = unpack(payload)?;
+            Event::ProviderInputAccepted {
+                command_id: p.command_id,
+                client_id: p.client_id,
+                operation_id: p.operation_id,
+                agent_session_id: p.agent_session_id,
+                provider_kind: p.provider_kind,
+                provider_session_id: p.provider_session_id,
+                runtime_generation: p.runtime_generation,
+                turn_id: p.turn_id,
+                action_epoch: p.action_epoch,
+                question_id: p.question_id,
+                approval_id: p.approval_id,
+                action: p.action,
+                wait: p.wait,
+                delivery: p.delivery,
+            }
+        }
+        "provider_input.question_presented" => {
+            let p: ProviderQuestionPresentedPayload = unpack(payload)?;
+            Event::ProviderQuestionPresented {
+                agent_session_id: p.agent_session_id,
+                provider_kind: p.provider_kind,
+                provider_session_id: p.provider_session_id,
+                runtime_generation: p.runtime_generation,
+                turn_id: p.turn_id,
+                action_epoch: p.action_epoch,
+                question_id: p.question_id,
+            }
+        }
+        "provider_input.approval_presented" => {
+            let p: ProviderApprovalPresentedPayload = unpack(payload)?;
+            Event::ProviderApprovalPresented {
+                agent_session_id: p.agent_session_id,
+                provider_kind: p.provider_kind,
+                provider_session_id: p.provider_session_id,
+                runtime_generation: p.runtime_generation,
+                turn_id: p.turn_id,
+                action_epoch: p.action_epoch,
+                approval_id: p.approval_id,
+            }
+        }
+        "provider_input.wait_settled" => {
+            let p: ProviderWaitSettledPayload = unpack(payload)?;
+            Event::ProviderWaitSettled { fence: p.fence }
+        }
+        "provider_input.delivered" => {
+            let p: ProviderInputDeliveredPayload = unpack(payload)?;
+            Event::ProviderInputDelivered {
+                command_id: p.command_id,
+                client_id: p.client_id,
+                operation_id: p.operation_id,
+                agent_session_id: p.agent_session_id,
+                provider_kind: p.provider_kind,
+                provider_session_id: p.provider_session_id,
+                runtime_generation: p.runtime_generation,
+                turn_id: p.turn_id,
+                action_epoch: p.action_epoch,
+                question_id: p.question_id,
+                approval_id: p.approval_id,
+            }
+        }
         other => {
             return Err(StoreError::CodecMismatch {
                 detail: format!("unknown event_type column '{other}'"),
@@ -1214,6 +1603,149 @@ pub(crate) fn decode_stored_event(
             ),
         });
     }
+    match &event {
+        Event::ProviderInputAccepted {
+            command_id,
+            operation_id,
+            agent_session_id,
+            provider_kind,
+            provider_session_id,
+            runtime_generation,
+            turn_id,
+            action_epoch,
+            question_id,
+            approval_id,
+            action,
+            wait,
+            delivery,
+            ..
+        } => {
+            if delivery.is_delivered() {
+                return Err(StoreError::CodecMismatch {
+                    detail: "provider input accepted event cannot claim delivery".into(),
+                });
+            }
+            let fence = crate::domain::provider_input::ProviderFenceIdentity::new_with_identity(
+                Some(*command_id),
+                None,
+                *agent_session_id,
+                provider_kind.clone(),
+                provider_session_id.clone(),
+                Some(*operation_id),
+                *runtime_generation,
+                *action_epoch,
+                *turn_id,
+                *question_id,
+                *approval_id,
+            );
+            crate::domain::provider_input::validate_provider_fence(
+                &fence,
+                Some(action),
+                Some(*wait),
+                None,
+            )
+            .map_err(|err| StoreError::CodecMismatch {
+                detail: err.to_string(),
+            })?;
+        }
+        Event::ProviderQuestionPresented {
+            agent_session_id,
+            provider_kind,
+            provider_session_id,
+            runtime_generation,
+            turn_id,
+            action_epoch,
+            question_id,
+        } => {
+            let fence = crate::domain::provider_input::ProviderFenceIdentity::new_with_identity(
+                None,
+                None,
+                *agent_session_id,
+                provider_kind.clone(),
+                provider_session_id.clone(),
+                None,
+                *runtime_generation,
+                *action_epoch,
+                *turn_id,
+                Some(*question_id),
+                None,
+            );
+            crate::domain::provider_input::validate_provider_fence(&fence, None, None, None)
+                .map_err(|err| StoreError::CodecMismatch {
+                    detail: err.to_string(),
+                })?;
+        }
+        Event::ProviderApprovalPresented {
+            agent_session_id,
+            provider_kind,
+            provider_session_id,
+            runtime_generation,
+            turn_id,
+            action_epoch,
+            approval_id,
+        } => {
+            let fence = crate::domain::provider_input::ProviderFenceIdentity::new_with_identity(
+                None,
+                None,
+                *agent_session_id,
+                provider_kind.clone(),
+                provider_session_id.clone(),
+                None,
+                *runtime_generation,
+                *action_epoch,
+                *turn_id,
+                None,
+                Some(*approval_id),
+            );
+            crate::domain::provider_input::validate_provider_fence(&fence, None, None, None)
+                .map_err(|err| StoreError::CodecMismatch {
+                    detail: err.to_string(),
+                })?;
+        }
+        Event::ProviderWaitSettled { fence } => {
+            crate::domain::provider_input::validate_provider_fence(
+                &fence.identity(),
+                None,
+                None,
+                None,
+            )
+            .map_err(|err| StoreError::CodecMismatch {
+                detail: err.to_string(),
+            })?;
+        }
+        Event::ProviderInputDelivered {
+            command_id,
+            operation_id,
+            agent_session_id,
+            provider_kind,
+            provider_session_id,
+            runtime_generation,
+            turn_id,
+            action_epoch,
+            question_id,
+            approval_id,
+            ..
+        } => {
+            let fence = crate::domain::provider_input::ProviderFenceIdentity::new_with_identity(
+                Some(*command_id),
+                None,
+                *agent_session_id,
+                provider_kind.clone(),
+                provider_session_id.clone(),
+                Some(*operation_id),
+                *runtime_generation,
+                *action_epoch,
+                *turn_id,
+                *question_id,
+                *approval_id,
+            );
+            crate::domain::provider_input::validate_provider_fence(&fence, None, None, None)
+                .map_err(|err| StoreError::CodecMismatch {
+                    detail: err.to_string(),
+                })?;
+        }
+        _ => {}
+    }
     Ok(event)
 }
 
@@ -1228,20 +1760,173 @@ pub(crate) fn decode_stored_domain_event(
     occurred_at_ms: i64,
     payload: &[u8],
 ) -> Result<DomainEvent, StoreError> {
+    let task_id = match task_id_bytes {
+        Some(bytes) => Some(task_id_from_bytes(bytes)?),
+        None => None,
+    };
+    let payload = decode_stored_event(event_type, schema_version, payload)?;
+    validate_provider_event_task_identity(&payload, task_id)?;
     Ok(DomainEvent {
         id: event_id_from_bytes(event_id_bytes)?,
-        task_id: match task_id_bytes {
-            Some(bytes) => Some(task_id_from_bytes(bytes)?),
-            None => None,
-        },
+        task_id,
         sequence: u64_from_nonnegative_i64("events.sequence", sequence)?,
         task_revision: match task_revision {
             Some(value) => Some(u64_from_nonnegative_i64("events.task_revision", value)?),
             None => None,
         },
         occurred_at_ms,
-        payload: decode_stored_event(event_type, schema_version, payload)?,
+        payload,
     })
+}
+
+fn validate_provider_event_task_identity(
+    event: &Event,
+    task_id: Option<TaskId>,
+) -> Result<(), StoreError> {
+    let Some((identity, action, wait)) = (match event {
+        Event::ProviderInputAccepted {
+            command_id,
+            operation_id,
+            agent_session_id,
+            provider_kind,
+            provider_session_id,
+            runtime_generation,
+            turn_id,
+            action_epoch,
+            question_id,
+            approval_id,
+            action,
+            wait,
+            ..
+        } => Some((
+            crate::domain::provider_input::ProviderFenceIdentity::new_with_identity(
+                Some(*command_id),
+                task_id,
+                *agent_session_id,
+                provider_kind.clone(),
+                provider_session_id.clone(),
+                Some(*operation_id),
+                *runtime_generation,
+                *action_epoch,
+                *turn_id,
+                *question_id,
+                *approval_id,
+            ),
+            Some(action),
+            Some(*wait),
+        )),
+        Event::ProviderQuestionPresented {
+            agent_session_id,
+            provider_kind,
+            provider_session_id,
+            runtime_generation,
+            turn_id,
+            action_epoch,
+            question_id,
+        } => Some((
+            crate::domain::provider_input::ProviderFenceIdentity::new_with_identity(
+                None,
+                task_id,
+                *agent_session_id,
+                provider_kind.clone(),
+                provider_session_id.clone(),
+                None,
+                *runtime_generation,
+                *action_epoch,
+                *turn_id,
+                Some(*question_id),
+                None,
+            ),
+            None,
+            None,
+        )),
+        Event::ProviderApprovalPresented {
+            agent_session_id,
+            provider_kind,
+            provider_session_id,
+            runtime_generation,
+            turn_id,
+            action_epoch,
+            approval_id,
+        } => Some((
+            crate::domain::provider_input::ProviderFenceIdentity::new_with_identity(
+                None,
+                task_id,
+                *agent_session_id,
+                provider_kind.clone(),
+                provider_session_id.clone(),
+                None,
+                *runtime_generation,
+                *action_epoch,
+                *turn_id,
+                None,
+                Some(*approval_id),
+            ),
+            None,
+            None,
+        )),
+        Event::ProviderWaitSettled { fence } => {
+            if task_id != Some(fence.task_id()) {
+                return Err(StoreError::CodecMismatch {
+                    detail: "provider wait fence task identity disagrees with event scope".into(),
+                });
+            }
+            Some((fence.identity(), None, None))
+        }
+        Event::ProviderInputDelivered {
+            command_id,
+            operation_id,
+            agent_session_id,
+            provider_kind,
+            provider_session_id,
+            runtime_generation,
+            turn_id,
+            action_epoch,
+            question_id,
+            approval_id,
+            ..
+        } => Some((
+            crate::domain::provider_input::ProviderFenceIdentity::new_with_identity(
+                Some(*command_id),
+                task_id,
+                *agent_session_id,
+                provider_kind.clone(),
+                provider_session_id.clone(),
+                Some(*operation_id),
+                *runtime_generation,
+                *action_epoch,
+                *turn_id,
+                *question_id,
+                *approval_id,
+            ),
+            None,
+            None,
+        )),
+        _ => None,
+    }) else {
+        return Ok(());
+    };
+    if identity.task_id.is_none() {
+        return Err(StoreError::CodecMismatch {
+            detail: "provider event requires a task scope".into(),
+        });
+    }
+    if matches!(
+        event,
+        Event::ProviderInputAccepted { .. }
+            | Event::ProviderWaitSettled { .. }
+            | Event::ProviderInputDelivered { .. }
+    ) && identity.operation_id.is_none()
+    {
+        return Err(StoreError::CodecMismatch {
+            detail: "provider acceptance/wait event requires operation identity".into(),
+        });
+    }
+    crate::domain::provider_input::validate_provider_fence(&identity, action, wait, None).map_err(
+        |err| StoreError::CodecMismatch {
+            detail: err.to_string(),
+        },
+    )
 }
 
 fn unpack<T: serde::de::DeserializeOwned>(payload: &[u8]) -> Result<T, StoreError> {
@@ -1304,6 +1989,57 @@ fn revalidate_outbox_effect(
     StoreError,
 > {
     validate_dispatch_candidate_lineage(tx, row.operation_id, row.outbox_id)
+}
+
+fn revalidate_outbox_attempt_effect(
+    tx: &Transaction<'_>,
+    row: &OutboxRow,
+) -> Result<
+    (
+        crate::kernel::outbox::PlannedEffectDocument,
+        crate::kernel::outbox::OperationFence,
+    ),
+    StoreError,
+> {
+    validate_dispatch_attempt_lineage(tx, row.operation_id, row.outbox_id)
+}
+
+fn is_provider_uncertainty_effect(
+    effect_doc: &crate::kernel::outbox::PlannedEffectDocument,
+) -> bool {
+    effect_doc.replay_policy == ReplayPolicy::NoAutomaticRetry
+        && matches!(&effect_doc.effect, Effect::DeliverProviderInput { .. })
+}
+
+/// Current ownership is required before an external boundary starts. Once it
+/// has started, only a typed no-retry provider effect may use its immutable
+/// stored identity to record ambiguity after the provider closes or advances.
+fn revalidate_ambiguity_effect(
+    tx: &Transaction<'_>,
+    row: &OutboxRow,
+) -> Result<
+    (
+        crate::kernel::outbox::PlannedEffectDocument,
+        crate::kernel::outbox::OperationFence,
+    ),
+    StoreError,
+> {
+    // Only the durable provider destination is allowed to use immutable
+    // post-boundary identity. Generic RetrySafe and ReconcileBeforeRetry
+    // effects must stay on the strict live-ownership validator; attempting
+    // provider validation first would turn valid generic ambiguity into a
+    // false corruption result (or create an ownership bypass).
+    if row.destination_class == DestinationClass::ProviderInput.as_str()
+        && row.replay_policy == ReplayPolicy::NoAutomaticRetry.as_str()
+    {
+        let immutable = revalidate_outbox_attempt_effect(tx, row)?;
+        if is_provider_uncertainty_effect(&immutable.0) {
+            return Ok(immutable);
+        }
+        return Err(StoreError::Corruption);
+    }
+    // Generic effects retain their pre-existing current-ownership rule.
+    revalidate_outbox_effect(tx, row)
 }
 
 fn parse_outbox_id(bytes: &[u8]) -> Result<OutboxId, StoreError> {
@@ -1921,7 +2657,7 @@ fn record_dispatch_ambiguity_in_tx(
     delay_ms: i64,
 ) -> Result<AmbiguityDisposition, StoreError> {
     let row = load_outbox_row_by_id(tx, permit.outbox_id())?.ok_or(StoreError::StaleClaim)?;
-    let (effect_doc, fence) = revalidate_outbox_effect(tx, &row)?;
+    let (effect_doc, fence) = revalidate_ambiguity_effect(tx, &row)?;
     validate_dispatch_permit(&row, permit, &effect_doc, fence)?;
     let disposition = ambiguity_disposition(effect_doc.replay_policy);
 
@@ -1940,6 +2676,17 @@ fn record_dispatch_ambiguity_in_tx(
         return Err(StoreError::Corruption);
     }
 
+    if disposition == AmbiguityDisposition::Uncertain {
+        command_bus::record_no_retry_dispatch_uncertainty_in_tx(
+            tx,
+            &row,
+            &effect_doc,
+            fence,
+            now_ms,
+        )?;
+        return Ok(disposition);
+    }
+
     let started_at = row.dispatch_started_at_ms.ok_or(StoreError::Corruption)?;
     let available_at = lease_deadline(now_ms.max(started_at).max(row.available_at_ms), delay_ms)?;
     let (next_state, last_error_class) = match disposition {
@@ -1947,10 +2694,7 @@ fn record_dispatch_ambiguity_in_tx(
         AmbiguityDisposition::ReconciliationRequired => {
             ("reconcile_required", Some("ambiguous_dispatch"))
         }
-        // There is no production NoAutomaticRetry effect in this phase. The
-        // pure policy mapping is locked now; the first durable uncertain path
-        // is exercised with its real effect in Phase 4.
-        AmbiguityDisposition::Uncertain => return Err(StoreError::InvalidDispatchTransition),
+        AmbiguityDisposition::Uncertain => unreachable!("handled above"),
     };
     let changed = tx.execute(
         "UPDATE outbox
@@ -2043,8 +2787,8 @@ fn recover_next_expired_dispatch_in_tx(
                 Ok(None)
             };
         };
-        let effect_doc = match revalidate_outbox_effect(tx, &row) {
-            Ok((effect_doc, _)) => effect_doc,
+        let (effect_doc, fence) = match revalidate_ambiguity_effect(tx, &row) {
+            Ok(validated) => validated,
             Err(StoreError::StaleFence) => {
                 saw_stale_fence = true;
                 prior_candidate = Some(row);
@@ -2060,14 +2804,22 @@ fn recover_next_expired_dispatch_in_tx(
             return Err(StoreError::InvalidDispatchTransition);
         }
         let disposition = ambiguity_disposition(effect_doc.replay_policy);
+        if disposition == AmbiguityDisposition::Uncertain {
+            command_bus::record_no_retry_dispatch_uncertainty_in_tx(
+                tx,
+                &row,
+                &effect_doc,
+                fence,
+                now_ms,
+            )?;
+            return Ok(Some(disposition));
+        }
         let (next_state, last_error_class) = match disposition {
             AmbiguityDisposition::RetryScheduled => ("pending", None),
             AmbiguityDisposition::ReconciliationRequired => {
                 ("reconcile_required", Some("ambiguous_dispatch"))
             }
-            AmbiguityDisposition::Uncertain => {
-                return Err(StoreError::InvalidDispatchTransition);
-            }
+            AmbiguityDisposition::Uncertain => unreachable!("handled above"),
         };
         let started_at = row.dispatch_started_at_ms.ok_or(StoreError::Corruption)?;
         let available_at =

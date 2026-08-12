@@ -36,6 +36,7 @@ use devmanager::kernel::{
     DispatchPermit, Effect, KernelStore, ProjectionRebuild, ReconciliationFinding,
     ReconciliationOrigin, ReplayPolicy, RuntimePresence, RuntimeRegistry, StoreError,
 };
+use devmanager::providers::ProviderKind;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -530,7 +531,7 @@ fn schema_primary_agent_selection_requires_same_task_primary_role() {
             id: specialist,
             task_id: task,
             role: AgentRole::specialist("reviewer").unwrap(),
-            provider_kind: "claude".into(),
+            provider_kind: ProviderKind::ClaudeCode,
             provider_session_id: None,
             lifecycle: devmanager::domain::agent::AgentSessionLifecycle::Open,
             runtime_generation: 0,
@@ -564,8 +565,8 @@ fn schema_primary_agent_selection_requires_same_task_primary_role() {
     let mut store = KernelStore::open(&path).expect("reopen");
     let err = store.rebuild_projections().expect_err("specialist primary");
     assert!(
-        matches!(err, StoreError::Projection(_)),
-        "expected projection failure for non-primary role, got {err:?}"
+        matches!(err, StoreError::Projection(_) | StoreError::EventDecode(_)),
+        "expected fail-closed projection/decode error for non-primary role, got {err:?}"
     );
 }
 
@@ -2661,8 +2662,8 @@ fn primary_agent_facts(task: TaskId, agent: AgentSessionId) -> AgentSessionFacts
         id: agent,
         task_id: task,
         role: AgentRole::Primary,
-        provider_kind: "claude".into(),
-        provider_session_id: Some("sess-primary".into()),
+        provider_kind: ProviderKind::ClaudeCode,
+        provider_session_id: Some("sess-primary".parse().expect("provider session")),
         lifecycle: AgentSessionLifecycle::Open,
         runtime_generation: 0,
         revision: 0,

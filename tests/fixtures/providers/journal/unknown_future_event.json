@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "source_type": "claude.future_hook.v9",
+  "provider_event_id": "claude_evt_unknown_1",
+  "occurred_at_ms": 1725000001850,
+  "payload": {
+    "kind": "unknown",
+    "raw_preview": "SECRET_SHOULD_NOT_PERSIST"
+  },
+  "extensions": {}
+}

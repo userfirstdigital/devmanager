@@ -48,7 +48,7 @@ use crate::kernel::dispatch::{decode_absence_receipt, DispatchCompletion, Dispat
 use crate::kernel::outbox::{
     decode_effect_document, decode_receipt_document, effect_document_sha256,
     encode_effect_document, encode_receipt_document, external_idempotency_key, plan_effects,
-    Effect, OperationFence, PlannedEffect, PlannedEffectDocument, ReplayPolicy,
+    DestinationClass, Effect, OperationFence, PlannedEffect, PlannedEffectDocument, ReplayPolicy,
 };
 use crate::kernel::projector;
 use crate::kernel::replay::{EventReplaySession, ReplayError};
@@ -58,6 +58,7 @@ use crate::kernel::store::{
     StoreError,
 };
 use crate::kernel::SessionScope;
+use crate::providers::ProviderKind;
 use crate::workspace::{
     WorkspaceAuthorization, WorkspaceError, WorkspaceProjectRoots, WorkspaceResourceCoordinator,
     WorkspaceService,
@@ -1273,6 +1274,16 @@ pub(crate) fn record_dispatch_completion_in_tx(
         _ => return Err(StoreError::Corruption),
     };
 
+    // ProviderInput has no stock adapter yet. A generic dispatch callback is
+    // not proof that bytes crossed the provider boundary, so keeping this
+    // path from manufacturing ProviderInputDelivered is an intentional HOLD.
+    // The future adapter-proof seam must call the typed delivery path instead.
+    if operation.state == "accepted"
+        && matches!(&effect_doc.effect, Effect::DeliverProviderInput { .. })
+    {
+        return Err(StoreError::InvalidDispatchTransition);
+    }
+
     let kind = match completion {
         DispatchCompletion::Settled => OperationOutcomeKind::Settled {
             result_event_ids: settled_result_ids_for_callback(tx, permit.operation_id())?,
@@ -1290,6 +1301,79 @@ pub(crate) fn record_dispatch_completion_in_tx(
     )
     .map_err(|_| StoreError::ConstraintViolation)?;
     record_outcome_in_tx(tx, outcome)
+}
+
+/// Permanently record an ambiguous provider dispatch. NoAutomaticRetry effects
+/// must become durable Uncertain once bytes may have crossed the adapter
+/// boundary; callers never receive a reusable dispatch permit afterward.
+pub(crate) fn record_no_retry_dispatch_uncertainty_in_tx(
+    tx: &Transaction<'_>,
+    row: &OutboxRow,
+    effect_doc: &PlannedEffectDocument,
+    fence: OperationFence,
+    observed_at_ms: i64,
+) -> Result<(), StoreError> {
+    if effect_doc.replay_policy != ReplayPolicy::NoAutomaticRetry
+        || row.state != "dispatching"
+        || row.attempts <= 0
+        || row.reconciliation_receipt.is_some()
+    {
+        return Err(StoreError::InvalidDispatchTransition);
+    }
+    let operation =
+        load_operation_projection_by_id(tx, row.operation_id)?.ok_or(StoreError::Corruption)?;
+    if operation.state != "accepted" {
+        return Err(StoreError::InvalidDispatchTransition);
+    }
+    let task_id = operation.task_id.ok_or(StoreError::Corruption)?;
+    if !matches!(
+        &effect_doc.effect,
+        Effect::DeliverProviderInput { operation_id, .. } if *operation_id == row.operation_id
+    ) {
+        return Err(StoreError::Corruption);
+    }
+    let (stored_effect, stored_fence) =
+        validate_dispatch_attempt_lineage(tx, row.operation_id, row.outbox_id)?;
+    if stored_effect != *effect_doc || stored_fence != fence {
+        return Err(StoreError::StaleClaim);
+    }
+    validate_effect_matches_fence(&effect_doc.effect, task_id, fence)?;
+    // The dispatch begin transaction already proved live ownership before the
+    // external boundary. Recovery must still be able to record uncertainty if
+    // the provider session crashed or closed after bytes may have crossed. The
+    // typed effect remains the provider identity authority; the generic fence
+    // contributes only the action epoch for this provider destination.
+    let command_id = load_operation_command_id(tx, row.operation_id)?;
+    let (resource_id, runtime_generation) = ResourceFence::into_parts(
+        ResourceFence::from_parts(fence.resource_id, fence.runtime_generation)
+            .map_err(|_| StoreError::Corruption)?,
+    );
+    let uncertain = OperationUncertainFact::new(
+        command_id,
+        row.operation_id,
+        observed_at_ms.max(operation.accepted_at_ms),
+        OperationUncertaintyCode::AmbiguousDispatch,
+        fence.action_epoch,
+        resource_id,
+        runtime_generation,
+    )
+    .map_err(|_| StoreError::ConstraintViolation)?;
+    append_and_project(
+        tx,
+        EventId::new(),
+        Some(task_id),
+        None,
+        observed_at_ms.max(operation.accepted_at_ms),
+        Event::OperationUncertain(uncertain),
+    )?;
+    transition_outbox(
+        tx,
+        row,
+        "dispatching",
+        "uncertain",
+        Some("ambiguous_dispatch"),
+    )?;
+    Ok(())
 }
 
 pub(crate) fn validate_dispatch_permit_identity(
@@ -1509,6 +1593,85 @@ pub(crate) fn validate_dispatch_candidate_lineage(
     operation_id: OperationId,
     outbox_id: OutboxId,
 ) -> Result<(crate::kernel::outbox::PlannedEffectDocument, OperationFence), StoreError> {
+    validate_dispatch_lineage(tx, operation_id, outbox_id, true)
+}
+
+/// Validate the immutable identity of one dispatch attempt after the external
+/// boundary has started. Provider ownership may have closed or advanced by the
+/// time ambiguity recovery runs, so this deliberately does not require the
+/// current agent row to still match the stored typed effect. Recovery may also
+/// present an expired lease; its state/attempt/clock checks remain mandatory.
+pub(crate) fn validate_dispatch_attempt_lineage(
+    tx: &Transaction<'_>,
+    operation_id: OperationId,
+    outbox_id: OutboxId,
+) -> Result<(crate::kernel::outbox::PlannedEffectDocument, OperationFence), StoreError> {
+    let operation =
+        load_operation_projection_by_id(tx, operation_id)?.ok_or(StoreError::Corruption)?;
+    require_accepted_dispatch_operation(&operation)?;
+    let command_id = load_operation_command_id(tx, operation_id)?;
+    let receipt_row = load_receipt_correlation(tx, command_id)?;
+    let CommandReceipt::Accepted {
+        command_id: receipt_command_id,
+        operation_id: receipt_operation_id,
+        event_ids,
+        task_revision,
+    } = &receipt_row.receipt
+    else {
+        return Err(StoreError::Corruption);
+    };
+    if *receipt_command_id != command_id || *receipt_operation_id != operation_id {
+        return Err(StoreError::Corruption);
+    }
+    let Some(scope) = receipt_row.task_id else {
+        return Err(StoreError::Corruption);
+    };
+    let Some(receipt_final_revision) = *task_revision else {
+        return Err(StoreError::Corruption);
+    };
+    if operation.task_id != Some(scope) {
+        return Err(StoreError::Corruption);
+    }
+    let rows = load_outbox_rows(tx, operation_id)?;
+    if rows.len() != 1 || rows[0].outbox_id != outbox_id {
+        return Err(StoreError::Corruption);
+    }
+    validate_side_effect_accepted_receipt_without_agent_sessions(
+        tx,
+        command_id,
+        operation_id,
+        event_ids,
+        receipt_final_revision,
+        scope,
+        receipt_row
+            .committed_sequence
+            .ok_or(StoreError::Corruption)?,
+        &operation,
+        &rows,
+    )?;
+
+    let row = &rows[0];
+    let task_id = operation.task_id.ok_or(StoreError::Corruption)?;
+    let fence = operation_fence_from_projection(&operation)?;
+    let document = decode_full_outbox_payload(row)?;
+    validate_effect_matches_fence(&document.effect, task_id, fence)?;
+    if !matches!(
+        &document.effect,
+        Effect::DeliverProviderInput { operation_id: effect_operation_id, .. }
+            if *effect_operation_id == operation_id
+    ) || document.replay_policy != ReplayPolicy::NoAutomaticRetry
+    {
+        return Err(StoreError::Corruption);
+    }
+    Ok((document, fence))
+}
+
+fn validate_dispatch_lineage(
+    tx: &Transaction<'_>,
+    operation_id: OperationId,
+    outbox_id: OutboxId,
+    require_current_ownership: bool,
+) -> Result<(crate::kernel::outbox::PlannedEffectDocument, OperationFence), StoreError> {
     let operation =
         load_operation_projection_by_id(tx, operation_id)?.ok_or(StoreError::Corruption)?;
     require_accepted_dispatch_operation(&operation)?;
@@ -1553,7 +1716,9 @@ pub(crate) fn validate_dispatch_candidate_lineage(
     let fence = operation_fence_from_projection(&operation)?;
     let document = decode_full_outbox_payload(row)?;
     validate_effect_matches_fence(&document.effect, task_id, fence)?;
-    require_current_effect_ownership(tx, task_id, &document.effect, fence)?;
+    if require_current_ownership {
+        require_current_effect_ownership(tx, task_id, &document.effect, fence)?;
+    }
     Ok((document, fence))
 }
 
@@ -1803,6 +1968,23 @@ fn validate_effect_matches_fence(
                 || fence.action_epoch != Some(*action_epoch)
                 || fence.resource_id != Some(resource_fence.resource_id)
                 || fence.runtime_generation != Some(resource_fence.runtime_generation)
+            {
+                return Err(StoreError::Corruption);
+            }
+        }
+        Effect::DeliverProviderInput {
+            task_id: effect_task,
+            action_epoch,
+            runtime_generation: _,
+            ..
+        } => {
+            if *effect_task != task_id
+                || fence.resource_id.is_some()
+                || fence.action_epoch != Some(*action_epoch)
+                // Provider runtime identity is validated from the typed
+                // effect and current ownership fence, not from the generic
+                // resource fence (which must be all-or-nothing).
+                || fence.runtime_generation.is_some()
             {
                 return Err(StoreError::Corruption);
             }
@@ -2202,6 +2384,65 @@ fn require_current_effect_ownership(
                 return Err(StoreError::StaleFence);
             }
         }
+        Effect::DeliverProviderInput {
+            agent_session_id,
+            provider_kind,
+            provider_session_id,
+            action_epoch,
+            runtime_generation,
+            ..
+        } => {
+            let row: Option<(Vec<u8>, String, Option<String>, String, i64)> = tx
+                .query_row(
+                    "SELECT task_id, provider_kind, provider_session_id, lifecycle,
+                            runtime_generation
+                     FROM agent_sessions WHERE agent_session_id = ?1",
+                    [agent_session_id.as_bytes().as_slice()],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((owned_task, current_kind, current_session, lifecycle, generation)) = row
+            else {
+                return Err(StoreError::StaleFence);
+            };
+            let generation =
+                u64_from_nonnegative_i64("agent_sessions.runtime_generation", generation)?;
+            let expected_session = current_session
+                .map(crate::domain::agent::ProviderSessionId::new)
+                .transpose()
+                .map_err(|_| StoreError::Corruption)?;
+            let owned_ok = owned_task == task_id.as_bytes().to_vec();
+            if !owned_ok
+                || lifecycle != "open"
+                || current_kind != provider_kind.as_str()
+                || expected_session.as_ref() != Some(provider_session_id)
+                || generation != *runtime_generation
+            {
+                return Err(StoreError::StaleFence);
+            }
+            let (_task_lifecycle, epoch): (String, i64) = tx
+                .query_row(
+                    "SELECT lifecycle, action_epoch FROM tasks WHERE task_id = ?1",
+                    [task_id.as_bytes().as_slice()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .map_err(|err| match err {
+                    rusqlite::Error::QueryReturnedNoRows => StoreError::StaleFence,
+                    other => other.into(),
+                })?;
+            let epoch = u64_from_nonnegative_i64("tasks.action_epoch", epoch)?;
+            if Some(epoch) != fence.action_epoch || epoch != *action_epoch {
+                return Err(StoreError::StaleFence);
+            }
+        }
     }
     Ok(())
 }
@@ -2256,19 +2497,51 @@ fn apply_new_outcome(
                 refuse_archive_with_live_resources(tx, task_id)?;
             }
             let result_id = require_single_unused_result_id(tx, result_event_ids)?;
-            let result_payload = match effect {
-                Effect::BeginTaskTeardown { .. } => Event::TaskArchived,
-                Effect::ReleaseResource { resource_fence, .. } => Event::ResourceReleased {
-                    resource_id: resource_fence.resource_id,
-                    runtime_generation: resource_fence.runtime_generation,
-                },
+            let (result_revision, result_payload) = match effect {
+                Effect::BeginTaskTeardown { .. } => {
+                    (Some(next_task_revision(tx, task_id)?), Event::TaskArchived)
+                }
+                Effect::ReleaseResource { resource_fence, .. } => (
+                    Some(next_task_revision(tx, task_id)?),
+                    Event::ResourceReleased {
+                        resource_id: resource_fence.resource_id,
+                        runtime_generation: resource_fence.runtime_generation,
+                    },
+                ),
+                Effect::DeliverProviderInput {
+                    operation_id,
+                    client_id,
+                    agent_session_id,
+                    provider_kind,
+                    provider_session_id,
+                    runtime_generation,
+                    action_epoch,
+                    turn_id,
+                    question_id,
+                    approval_id,
+                    ..
+                } => (
+                    None,
+                    Event::ProviderInputDelivered {
+                        command_id,
+                        client_id: *client_id,
+                        operation_id: *operation_id,
+                        agent_session_id: *agent_session_id,
+                        provider_kind: provider_kind.clone(),
+                        provider_session_id: provider_session_id.clone(),
+                        runtime_generation: *runtime_generation,
+                        turn_id: *turn_id,
+                        action_epoch: *action_epoch,
+                        question_id: *question_id,
+                        approval_id: *approval_id,
+                    },
+                ),
             };
-            let next_revision = next_task_revision(tx, task_id)?;
             append_and_project(
                 tx,
                 result_id,
                 Some(task_id),
-                Some(next_revision),
+                result_revision,
                 outcome.occurred_at_ms,
                 result_payload,
             )?;
@@ -2438,13 +2711,15 @@ fn transition_outbox(
         "UPDATE outbox
          SET state = ?1, leased_until_ms = NULL, last_error_class = ?2,
              reconciliation_receipt = NULL
-         WHERE outbox_id = ?3 AND state = ?4 AND lease_generation = ?5",
+         WHERE outbox_id = ?3 AND state = ?4 AND lease_generation = ?5
+           AND attempts = ?6",
         rusqlite::params![
             next_state,
             last_error_class,
             outbox.outbox_id.as_bytes().as_slice(),
             expected_state,
             outbox.lease_generation,
+            outbox.attempts,
         ],
     )?;
     if changed != 1 {
@@ -2629,15 +2904,26 @@ fn execute_in_tx(
     let current_revision = snapshot.as_ref().map(|snap| snap.task.revision);
 
     match decide(snapshot.as_ref(), &envelope) {
-        Err(code) => persist_rejection(
-            tx,
-            &envelope,
-            effective_task_id,
-            code,
-            current_revision,
-            accepted_at_ms,
-            scope,
-        ),
+        Err(code) => {
+            let resolution = provider_resolution_for_rejection(snapshot.as_ref(), &envelope);
+            // A concurrent answer/approval can advance the task revision or close the
+            // request before this command reaches the decision gate. Preserve the typed
+            // first-winner contract instead of leaking a generic rejection to the loser.
+            let code = if resolution.is_some() {
+                RejectionCode::AlreadyResolved
+            } else {
+                code
+            };
+            persist_rejection_with_resolution(
+                tx,
+                &envelope,
+                effective_task_id,
+                code,
+                current_revision,
+                accepted_at_ms,
+                resolution,
+            )
+        }
         Ok(decision) => {
             // Empty authoritative decisions for already Closing/Releasing stay unsupported
             // rather than inventing a duplicate in-flight operation/effect.
@@ -2700,15 +2986,30 @@ fn lookup_receipt(
     tx: &Connection,
     command_id: CommandId,
 ) -> Result<Option<CommandReceipt>, StoreError> {
-    let row: Option<(Vec<u8>, Option<Vec<u8>>, Option<i64>, i64)> = tx
+    Ok(lookup_receipt_with_digest(tx, command_id)?.map(|(receipt, _)| receipt))
+}
+
+fn lookup_receipt_with_digest(
+    tx: &Connection,
+    command_id: CommandId,
+) -> Result<Option<(CommandReceipt, Option<[u8; 32]>)>, StoreError> {
+    let row: Option<(Vec<u8>, Option<Vec<u8>>, Option<i64>, i64, Option<Vec<u8>>)> = tx
         .query_row(
-            "SELECT receipt, task_id, committed_sequence, created_at_ms
+            "SELECT receipt, task_id, committed_sequence, created_at_ms, payload_digest
              FROM command_receipts WHERE command_id = ?1",
             [command_id.as_bytes().as_slice()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
         )
         .optional()?;
-    let Some((payload, row_task_id, committed_sequence, created_at_ms)) = row else {
+    let Some((payload, row_task_id, committed_sequence, created_at_ms, digest_bytes)) = row else {
         return Ok(None);
     };
     let receipt = decode_receipt_document(&payload)?;
@@ -2749,7 +3050,16 @@ fn lookup_receipt(
             validate_rejected_receipt_correlation(tx, command_id, committed_sequence)?;
         }
     }
-    Ok(Some(receipt))
+    let digest = match digest_bytes {
+        None => None,
+        Some(bytes) => {
+            let arr: [u8; 32] = bytes.try_into().map_err(|_| StoreError::CodecMismatch {
+                detail: "command_receipts.payload_digest must be 32 bytes".into(),
+            })?;
+            Some(arr)
+        }
+    };
+    Ok(Some((receipt, digest)))
 }
 
 fn command_fingerprint(envelope: &CommandEnvelope) -> Result<[u8; 32], StoreError> {
@@ -2781,10 +3091,11 @@ fn lookup_receipt_for_scope(
         Option<i64>,
         Option<i64>,
         Option<Vec<u8>>,
+        Option<Vec<u8>>,
     )> = tx
         .query_row(
             "SELECT client_id, task_id, connection_id, request_id,
-                    action_epoch, runtime_generation, command_fingerprint
+                    action_epoch, runtime_generation, command_fingerprint, payload_digest
              FROM command_receipts WHERE command_id = ?1",
             [envelope.command_id.as_bytes().as_slice()],
             |row| {
@@ -2796,6 +3107,7 @@ fn lookup_receipt_for_scope(
                     row.get(4)?,
                     row.get(5)?,
                     row.get(6)?,
+                    row.get(7)?,
                 ))
             },
         )
@@ -2808,6 +3120,7 @@ fn lookup_receipt_for_scope(
         epoch,
         generation,
         fingerprint,
+        payload_digest,
     )) = row
     else {
         return Ok(None);
@@ -2833,15 +3146,69 @@ fn lookup_receipt_for_scope(
             .transpose()?,
     };
     let expected_fingerprint = command_fingerprint(envelope)?;
+    let expected_payload_digest = crate::domain::command::command_payload_digest(envelope)
+        .map_err(|detail| StoreError::CodecMismatch { detail })?;
     // V7 cannot reconstruct the original envelope identity for a pre-V7 row.
     // Treat that row as a conflict instead of returning a receipt whose
     // command/task scope cannot be proven exact.
     let fingerprint_matches = fingerprint
         .as_deref()
         .is_some_and(|bytes| bytes == expected_fingerprint.as_slice());
+    let stored_payload_digest = payload_digest
+        .as_deref()
+        .map(|bytes| {
+            bytes.try_into().map_err(|_| StoreError::CodecMismatch {
+                detail: "command_receipts.payload_digest must be 32 bytes".into(),
+            })
+        })
+        .transpose()?;
+    let payload_matches = stored_payload_digest
+        .as_ref()
+        .is_some_and(|digest| digest == &expected_payload_digest);
     let expected_task_id = effective_task_scope(envelope);
-    if client_id != envelope.client_id || task_id != expected_task_id || !fingerprint_matches {
+    if client_id != envelope.client_id || task_id != expected_task_id {
         return Err(StoreError::CommandIdConflict);
+    }
+    if !fingerprint_matches {
+        if stored_payload_digest.is_some()
+            && !payload_matches
+            && matches!(
+                &envelope.command,
+                Command::ConfirmHostQuit(_) | Command::SubmitProviderInput(_)
+            )
+        {
+            let current_revision = expected_task_id
+                .map(|task_id| load_task_snapshot(tx, task_id))
+                .transpose()?
+                .flatten()
+                .map(|snapshot| snapshot.task.revision);
+            return Ok(Some(CommandReceipt::Rejected {
+                command_id: envelope.command_id,
+                code: RejectionCode::IdempotencyConflict,
+                current_revision,
+                resolution: None,
+            }));
+        }
+        return Err(StoreError::CommandIdConflict);
+    }
+    if stored_payload_digest.is_some()
+        && !payload_matches
+        && matches!(
+            &envelope.command,
+            Command::ConfirmHostQuit(_) | Command::SubmitProviderInput(_)
+        )
+    {
+        let current_revision = expected_task_id
+            .map(|task_id| load_task_snapshot(tx, task_id))
+            .transpose()?
+            .flatten()
+            .map(|snapshot| snapshot.task.revision);
+        return Ok(Some(CommandReceipt::Rejected {
+            command_id: envelope.command_id,
+            code: RejectionCode::IdempotencyConflict,
+            current_revision,
+            resolution: None,
+        }));
     }
 
     // A receipt first persisted without an output connection is a delivery
@@ -2923,6 +3290,10 @@ fn parse_request_receipt_id(field: &'static str, bytes: &[u8]) -> Result<Request
 /// Strict receipt-backed operations are re-correlated end to end so a missing,
 /// extra, or terminally corrupted outbox row cannot survive repair. The final
 /// outbox scan independently rejects orphan rows that have no receipt root.
+/// Uncertain rows are intentionally still decoded through the receipt-backed
+/// terminal validator: their typed provider effect is the durable G1 identity,
+/// so projection repair must reject payload tampering rather than silently
+/// rebuilding an ambiguity with a different provider session.
 pub(crate) fn validate_all_rebuilt_outbox_metadata(tx: &Transaction<'_>) -> Result<(), StoreError> {
     let receipt_backed_commands = {
         let mut stmt = tx.prepare("SELECT command_id FROM operations ORDER BY operation_id")?;
@@ -3912,6 +4283,60 @@ fn validate_side_effect_accepted_receipt(
     operation: &OperationProjectionRow,
     outbox_rows: &[OutboxRow],
 ) -> Result<(), StoreError> {
+    validate_side_effect_accepted_receipt_with_projection(
+        tx,
+        command_id,
+        expected_operation_id,
+        event_ids,
+        receipt_final_revision,
+        scope,
+        committed_sequence,
+        operation,
+        outbox_rows,
+        true,
+        false,
+    )
+}
+
+fn validate_side_effect_accepted_receipt_without_agent_sessions(
+    tx: &Connection,
+    command_id: CommandId,
+    expected_operation_id: OperationId,
+    event_ids: &[EventId],
+    receipt_final_revision: u64,
+    scope: TaskId,
+    committed_sequence: u64,
+    operation: &OperationProjectionRow,
+    outbox_rows: &[OutboxRow],
+) -> Result<(), StoreError> {
+    validate_side_effect_accepted_receipt_with_projection(
+        tx,
+        command_id,
+        expected_operation_id,
+        event_ids,
+        receipt_final_revision,
+        scope,
+        committed_sequence,
+        operation,
+        outbox_rows,
+        false,
+        true,
+    )
+}
+
+fn validate_side_effect_accepted_receipt_with_projection(
+    tx: &Connection,
+    command_id: CommandId,
+    expected_operation_id: OperationId,
+    event_ids: &[EventId],
+    receipt_final_revision: u64,
+    scope: TaskId,
+    committed_sequence: u64,
+    operation: &OperationProjectionRow,
+    outbox_rows: &[OutboxRow],
+    validate_current_agent_sessions: bool,
+    allow_expired_dispatch: bool,
+) -> Result<(), StoreError> {
     // Side-effect path: committed_sequence is operation.accepted. Do not re-plan from
     // the current snapshot — correlate durable decision facts, accepted fence, and rows.
     let decision_count = u64::try_from(event_ids.len()).map_err(|_| StoreError::Corruption)?;
@@ -3929,8 +4354,13 @@ fn validate_side_effect_accepted_receipt(
         is_side_effect_decision_fact,
     )?;
 
-    let expected_effects =
-        effects_from_durable_decision_facts(tx, scope, first_decision_sequence, &decision_facts)?;
+    let expected_effects = effects_from_durable_decision_facts(
+        tx,
+        scope,
+        first_decision_sequence,
+        expected_operation_id,
+        &decision_facts,
+    )?;
     if expected_effects.len() != outbox_rows.len() {
         return Err(StoreError::Corruption);
     }
@@ -3978,7 +4408,29 @@ fn validate_side_effect_accepted_receipt(
         fence,
     )?;
     // Durable task mutation chain is the source of truth for revision/lifecycle.
-    let _ = validate_task_history_and_projection(tx, scope)?;
+    // A live claim and every ordinary receipt path must also match the current
+    // projection. Once provider bytes may have crossed, the typed outbox
+    // effect is the immutable attempt authority; the named provider session
+    // row may legitimately have closed or advanced while this operation is
+    // settled as Uncertain. The post-boundary path still compares every other
+    // agent row and every other projection field.
+    let provider_uncertainty = operation.state == "uncertain"
+        && expected_effects.len() == 1
+        && expected_effects[0].document.replay_policy == ReplayPolicy::NoAutomaticRetry
+        && matches!(
+            &expected_effects[0].document.effect,
+            Effect::DeliverProviderInput { .. }
+        );
+    let immutable_provider_agent = if !validate_current_agent_sessions || provider_uncertainty {
+        Some(provider_attempt_agent_session_id(&expected_effects)?)
+    } else {
+        None
+    };
+    let _ = validate_task_history_and_projection_with_agent_sessions(
+        tx,
+        scope,
+        immutable_provider_agent,
+    )?;
 
     match operation.state.as_str() {
         "accepted" => {
@@ -3996,6 +4448,7 @@ fn validate_side_effect_accepted_receipt(
                 operation.accepted_at_ms,
                 scope,
                 fence,
+                allow_expired_dispatch,
             )?;
             let history = load_operation_outcome_history(
                 tx,
@@ -4024,6 +4477,25 @@ fn validate_side_effect_accepted_receipt(
     }
 }
 
+fn provider_attempt_agent_session_id(
+    expected_effects: &[PlannedEffect],
+) -> Result<AgentSessionId, StoreError> {
+    let [planned] = expected_effects else {
+        return Err(StoreError::Corruption);
+    };
+    if planned.document.destination_class != DestinationClass::ProviderInput
+        || planned.document.replay_policy != ReplayPolicy::NoAutomaticRetry
+    {
+        return Err(StoreError::Corruption);
+    }
+    match &planned.document.effect {
+        Effect::DeliverProviderInput {
+            agent_session_id, ..
+        } => Ok(*agent_session_id),
+        _ => Err(StoreError::Corruption),
+    }
+}
+
 fn validate_side_effect_active_outbox(
     outbox_rows: &[OutboxRow],
     expected_effects: &[PlannedEffect],
@@ -4032,6 +4504,7 @@ fn validate_side_effect_active_outbox(
     accepted_at_ms: i64,
     scope: TaskId,
     fence: OperationFence,
+    allow_expired_dispatch: bool,
 ) -> Result<(), StoreError> {
     for (expected_index, (row, planned)) in
         outbox_rows.iter().zip(expected_effects.iter()).enumerate()
@@ -4055,10 +4528,11 @@ fn validate_side_effect_active_outbox(
         }
         match row.state.as_str() {
             "pending" | "claimed" | "dispatching" | "reconcile_required" | "reconciling" => {
-                validate_nonterminal_outbox_dispatch_metadata(
+                validate_nonterminal_outbox_dispatch_metadata_for_attempt(
                     row,
                     accepted_at_ms,
                     decoded.replay_policy,
+                    allow_expired_dispatch,
                 )?;
             }
             _ => return Err(StoreError::Corruption),
@@ -4327,12 +4801,39 @@ fn validate_nonterminal_outbox_dispatch_metadata(
     accepted_at_ms: i64,
     replay_policy: ReplayPolicy,
 ) -> Result<(), StoreError> {
-    if row.lease_generation < 0 {
+    validate_nonterminal_outbox_dispatch_metadata_inner(row, accepted_at_ms, replay_policy, false)
+}
+
+fn validate_nonterminal_outbox_dispatch_metadata_for_attempt(
+    row: &OutboxRow,
+    accepted_at_ms: i64,
+    replay_policy: ReplayPolicy,
+    allow_expired_dispatch: bool,
+) -> Result<(), StoreError> {
+    // Recovery proves the lease is expired against its transaction clock after
+    // this lineage check. Only the immutable typed provider path may therefore
+    // accept a lease that ended before dispatch_started_at; generic/live paths
+    // continue to require an active lease here.
+    if allow_expired_dispatch
+        && (replay_policy != ReplayPolicy::NoAutomaticRetry || row.state != "dispatching")
+    {
         return Err(StoreError::Corruption);
     }
-    if row.attempts < 0 {
-        return Err(StoreError::Corruption);
-    }
+    validate_nonterminal_outbox_dispatch_metadata_inner(
+        row,
+        accepted_at_ms,
+        replay_policy,
+        allow_expired_dispatch,
+    )
+}
+
+fn validate_nonterminal_outbox_dispatch_metadata_inner(
+    row: &OutboxRow,
+    accepted_at_ms: i64,
+    replay_policy: ReplayPolicy,
+    allow_expired_dispatch: bool,
+) -> Result<(), StoreError> {
+    validate_dispatch_attempt_generation(row)?;
     match row.state.as_str() {
         "pending" => {
             if row.attempts == 0 {
@@ -4410,7 +4911,7 @@ fn validate_nonterminal_outbox_dispatch_metadata(
             let Some(lease) = row.leased_until_ms else {
                 return Err(StoreError::Corruption);
             };
-            if lease <= started {
+            if lease < 0 || (!allow_expired_dispatch && lease <= started) {
                 return Err(StoreError::Corruption);
             }
             if row.reconciliation_receipt.is_some() {
@@ -4501,9 +5002,7 @@ fn validate_terminal_outbox_dispatch_metadata(
     dispatch_upper_bound_ms: i64,
     was_reconciled: bool,
 ) -> Result<(), StoreError> {
-    if row.attempts < 0 {
-        return Err(StoreError::Corruption);
-    }
+    validate_dispatch_attempt_generation(row)?;
     if row.attempts == 0 {
         if row.dispatch_started_at_ms.is_some()
             || (row.lease_generation == 0 && row.available_at_ms != accepted_at_ms)
@@ -4525,6 +5024,21 @@ fn validate_terminal_outbox_dispatch_metadata(
         {
             return Err(StoreError::Corruption);
         }
+    }
+    Ok(())
+}
+
+/// A dispatch attempt can only be created in a claim generation at or after
+/// the attempt count: a worker may claim/release before bytes cross, so the
+/// generation may be ahead, but durable recovery/rebuild must never accept an
+/// attempt whose generation trails the number of starts. All state transitions
+/// additionally compare the exact stored generation in their CAS predicate.
+fn validate_dispatch_attempt_generation(row: &OutboxRow) -> Result<(), StoreError> {
+    if row.lease_generation < 0
+        || row.attempts < 0
+        || (row.attempts > 0 && row.lease_generation < row.attempts)
+    {
+        return Err(StoreError::Corruption);
     }
     Ok(())
 }
@@ -4834,6 +5348,75 @@ fn validate_settled_result_fact(
     if result_task != Some(scope) || occurred_at != settled_at_ms {
         return Err(StoreError::Corruption);
     }
+    if let Effect::DeliverProviderInput {
+        operation_id,
+        command_id,
+        client_id,
+        agent_session_id,
+        provider_kind,
+        provider_session_id,
+        runtime_generation,
+        action_epoch,
+        turn_id,
+        question_id,
+        approval_id,
+        ..
+    } = effect
+    {
+        if task_revision.is_some()
+            || settled_sequence
+                != result_sequence
+                    .checked_add(1)
+                    .ok_or(StoreError::Corruption)?
+        {
+            return Err(StoreError::Corruption);
+        }
+        let decoded =
+            crate::kernel::store::decode_stored_event(&event_type, schema_version, &payload)?;
+        match decoded {
+            Event::ProviderInputDelivered {
+                command_id: result_command,
+                client_id: result_client,
+                operation_id: result_operation,
+                agent_session_id: result_agent,
+                provider_kind: result_kind,
+                provider_session_id: result_session,
+                runtime_generation: result_generation,
+                turn_id: result_turn,
+                action_epoch: result_epoch,
+                question_id: result_question,
+                approval_id: result_approval,
+            } if event_type == "provider_input.delivered"
+                && result_command == *command_id
+                && result_client == *client_id
+                && result_operation == *operation_id
+                && result_agent == *agent_session_id
+                && result_kind == *provider_kind
+                && result_session == *provider_session_id
+                && result_generation == *runtime_generation
+                && result_turn == *turn_id
+                && result_epoch == *action_epoch
+                && result_question == *question_id
+                && result_approval == *approval_id => {}
+            _ => return Err(StoreError::Corruption),
+        }
+        let snapshot = load_task_snapshot(tx, scope)?.ok_or(StoreError::Corruption)?;
+        let session = snapshot
+            .provider_sessions
+            .get(agent_session_id)
+            .ok_or(StoreError::Corruption)?;
+        let Some(settlement) = session.last_settlement else {
+            return Err(StoreError::Corruption);
+        };
+        if settlement.command_id != *command_id
+            || settlement.operation_id != Some(*operation_id)
+            || !settlement.delivery.is_delivered()
+        {
+            return Err(StoreError::Corruption);
+        }
+        let _ = validate_task_history_and_projection(tx, scope)?;
+        return Ok(());
+    }
     let Some(result_revision) = task_revision else {
         return Err(StoreError::Corruption);
     };
@@ -4929,6 +5512,14 @@ fn validate_settled_projections(
 fn validate_task_history_and_projection(
     tx: &Connection,
     scope: TaskId,
+) -> Result<(String, u64, u64), StoreError> {
+    validate_task_history_and_projection_with_agent_sessions(tx, scope, None)
+}
+
+fn validate_task_history_and_projection_with_agent_sessions(
+    tx: &Connection,
+    scope: TaskId,
+    immutable_provider_agent: Option<AgentSessionId>,
 ) -> Result<(String, u64, u64), StoreError> {
     let mut stmt = tx.prepare(
         "SELECT sequence, event_id, task_revision, event_type, schema_version, payload,
@@ -5044,7 +5635,33 @@ fn validate_task_history_and_projection(
         }
         Err(err) => return Err(err),
     };
-    if snap != projected {
+    let agents_match = match immutable_provider_agent {
+        None => snap.agents == projected.agents,
+        Some(exception) => {
+            // The immutable escape is scoped to exactly the provider session
+            // named by the accepted effect. Every other durable agent row,
+            // including additions/removals, remains part of projection
+            // equality; a broad map skip would hide unrelated tampering.
+            snap.agents.len() == projected.agents.len()
+                && snap.agents.iter().all(|(agent_id, durable)| {
+                    let Some(current) = projected.agents.get(agent_id) else {
+                        return false;
+                    };
+                    *agent_id == exception || durable == current
+                })
+        }
+    };
+    let same_projection = snap.task == projected.task
+        && snap.connectivity == projected.connectivity
+        && snap.attention == projected.attention
+        && snap.activity == projected.activity
+        && snap.review_readiness == projected.review_readiness
+        && snap.primary_agent_id == projected.primary_agent_id
+        && agents_match
+        && snap.artifacts == projected.artifacts
+        && snap.resources == projected.resources
+        && snap.provider_sessions == projected.provider_sessions;
+    if !same_projection {
         return Err(StoreError::Corruption);
     }
 
@@ -5178,8 +5795,19 @@ fn enforce_command_decision_lifecycle_gate(
         }
         Event::AgentSessionRegistered { .. }
         | Event::PrimaryAgentSet { .. }
-        | Event::ResourceRegistered { .. } => {
+        | Event::ResourceRegistered { .. }
+        | Event::ProviderInputAccepted { .. }
+        | Event::ProviderQuestionPresented { .. }
+        | Event::ProviderApprovalPresented { .. } => {
             if snap.task.lifecycle != TaskLifecycle::Open {
+                return Err(StoreError::Corruption);
+            }
+        }
+        Event::ProviderWaitSettled { .. } => {
+            if !matches!(
+                snap.task.lifecycle,
+                TaskLifecycle::Open | TaskLifecycle::Closing
+            ) {
                 return Err(StoreError::Corruption);
             }
         }
@@ -5211,6 +5839,7 @@ fn effects_from_durable_decision_facts(
     tx: &Connection,
     scope: TaskId,
     first_decision_sequence: u64,
+    expected_operation_id: OperationId,
     decision_facts: &[(Event, u64)],
 ) -> Result<Vec<PlannedEffect>, StoreError> {
     let mut planned = Vec::new();
@@ -5258,6 +5887,52 @@ fn effects_from_durable_decision_facts(
                         action_epoch: Some(epoch),
                         resource_id: Some(*resource_id),
                         runtime_generation: Some(*runtime_generation),
+                    },
+                });
+            }
+            Event::ProviderInputAccepted {
+                operation_id,
+                command_id,
+                client_id,
+                agent_session_id,
+                provider_kind,
+                provider_session_id,
+                runtime_generation,
+                action_epoch,
+                turn_id,
+                question_id,
+                approval_id,
+                action,
+                wait,
+                ..
+            } => {
+                if *operation_id != expected_operation_id {
+                    return Err(StoreError::Corruption);
+                }
+                planned.push(PlannedEffect {
+                    document: crate::kernel::outbox::PlannedEffectDocument::new(
+                        Effect::DeliverProviderInput {
+                            task_id: scope,
+                            operation_id: *operation_id,
+                            command_id: *command_id,
+                            client_id: *client_id,
+                            agent_session_id: *agent_session_id,
+                            provider_kind: provider_kind.clone(),
+                            provider_session_id: provider_session_id.clone(),
+                            runtime_generation: *runtime_generation,
+                            action_epoch: *action_epoch,
+                            turn_id: *turn_id,
+                            question_id: *question_id,
+                            approval_id: *approval_id,
+                            action: action.clone(),
+                            wait: *wait,
+                        },
+                        crate::kernel::outbox::ReplayPolicy::NoAutomaticRetry,
+                    ),
+                    fence: OperationFence {
+                        action_epoch: Some(*action_epoch),
+                        resource_id: None,
+                        runtime_generation: None,
                     },
                 });
             }
@@ -6153,13 +6828,18 @@ fn is_pure_slice_decision_fact(event: &Event) -> bool {
             | Event::PrimaryAgentSet { .. }
             | Event::ArtifactRegistered { .. }
             | Event::ResourceRegistered { .. }
+            | Event::ProviderQuestionPresented { .. }
+            | Event::ProviderApprovalPresented { .. }
+            | Event::ProviderWaitSettled { .. }
     )
 }
 
 fn is_side_effect_decision_fact(event: &Event) -> bool {
     matches!(
         event,
-        Event::TaskCloseBegun { .. } | Event::ResourceReleaseBegun { .. }
+        Event::TaskCloseBegun { .. }
+            | Event::ResourceReleaseBegun { .. }
+            | Event::ProviderInputAccepted { .. }
     )
 }
 
@@ -6216,10 +6896,31 @@ fn persist_rejection(
     created_at_ms: i64,
     scope: ReceiptScope,
 ) -> Result<CommandReceipt, StoreError> {
+    persist_rejection_with_resolution(
+        tx,
+        envelope,
+        effective_task_id,
+        code,
+        current_revision,
+        created_at_ms,
+        None,
+    )
+}
+
+fn persist_rejection_with_resolution(
+    tx: &Transaction<'_>,
+    envelope: &CommandEnvelope,
+    effective_task_id: Option<TaskId>,
+    code: RejectionCode,
+    current_revision: Option<u64>,
+    created_at_ms: i64,
+    resolution: Option<crate::domain::ProviderResolutionWinner>,
+) -> Result<CommandReceipt, StoreError> {
     let receipt = CommandReceipt::Rejected {
         command_id: envelope.command_id,
         code,
         current_revision,
+        resolution,
     };
     insert_receipt_row(
         tx,
@@ -6233,6 +6934,29 @@ fn persist_rejection(
     Ok(receipt)
 }
 
+fn provider_resolution_for_rejection(
+    snapshot: Option<&TaskSnapshot>,
+    envelope: &CommandEnvelope,
+) -> Option<crate::domain::ProviderResolutionWinner> {
+    let snapshot = snapshot?;
+    let Command::SubmitProviderInput(intent) = &envelope.command else {
+        return None;
+    };
+    let session = snapshot.provider_sessions.get(&intent.agent_session_id())?;
+    match intent.action() {
+        crate::domain::ProviderInputAction::AnswerQuestion { question_id, .. } => {
+            session.question_winners.get(question_id).copied()
+        }
+        crate::domain::ProviderInputAction::ResolveApproval { approval_id, .. } => {
+            session.approval_winners.get(approval_id).copied()
+        }
+        _ => None,
+    }
+}
+
+/// Commits pure decision facts plus OperationAccepted/Settled in one transaction.
+/// Provider input is deliberately excluded: it always requires a concrete
+/// NoAutomaticRetry outbox effect and therefore must use the side-effect path.
 fn persist_pure_acceptance(
     tx: &Transaction<'_>,
     envelope: &CommandEnvelope,
@@ -6242,6 +6966,14 @@ fn persist_pure_acceptance(
     accepted_at_ms: i64,
     scope: ReceiptScope,
 ) -> Result<CommandReceipt, StoreError> {
+    if decision
+        .iter()
+        .any(|event| matches!(event, Event::ProviderInputAccepted { .. }))
+    {
+        return Err(StoreError::Projection(
+            "provider input acceptance requires a durable outbox effect".into(),
+        ));
+    }
     let operation_id = OperationId::new();
     let decision_event_ids: Vec<EventId> = (0..decision.len()).map(|_| EventId::new()).collect();
     let accepted_event_id = EventId::new();
@@ -6364,7 +7096,27 @@ fn persist_side_effect_acceptance(
         }
     }
 
-    let operation_id = OperationId::new();
+    let operation_id = decision
+        .iter()
+        .find_map(|event| match event {
+            Event::ProviderInputAccepted { operation_id, .. } => Some(*operation_id),
+            _ => None,
+        })
+        .unwrap_or_else(OperationId::new);
+    for planned_effect in &planned {
+        if let Effect::DeliverProviderInput {
+            operation_id: effect_operation,
+            ..
+        } = &planned_effect.document.effect
+        {
+            if *effect_operation != operation_id {
+                return Err(StoreError::Projection(
+                    "provider input effect operation identity disagrees with accepted operation"
+                        .into(),
+                ));
+            }
+        }
+    }
     let decision_event_ids: Vec<EventId> = (0..decision.len()).map(|_| EventId::new()).collect();
     let accepted_event_id = EventId::new();
     let outbox_ids: Vec<OutboxId> = (0..planned.len()).map(|_| OutboxId::new()).collect();
@@ -6479,11 +7231,14 @@ fn insert_receipt_row(
 ) -> Result<(), StoreError> {
     let payload = encode_receipt_document(receipt)?;
     let fingerprint = command_fingerprint(envelope)?;
+    let payload_digest = crate::domain::command::command_payload_digest(envelope)
+        .map_err(|detail| StoreError::CodecMismatch { detail })?;
     tx.execute(
         "INSERT INTO command_receipts(
             command_id, client_id, task_id, receipt, committed_sequence, created_at_ms,
-            connection_id, request_id, action_epoch, runtime_generation, command_fingerprint
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            connection_id, request_id, action_epoch, runtime_generation,
+            command_fingerprint, payload_digest
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         rusqlite::params![
             envelope.command_id.as_bytes().as_slice(),
             envelope.client_id.as_bytes().as_slice(),
@@ -6511,6 +7266,7 @@ fn insert_receipt_row(
                 None => None,
             },
             fingerprint.to_vec(),
+            payload_digest.to_vec(),
         ],
     )?;
     trim_receipt_ledger(tx, envelope.command_id)?;
@@ -6672,6 +7428,7 @@ pub(crate) fn load_task_snapshot(
         primary_agent_id: task_row.primary_agent_id,
         artifacts,
         resources,
+        provider_sessions: load_provider_sessions(conn, task_id)?,
     }))
 }
 
@@ -6764,6 +7521,44 @@ fn load_task_row(conn: &Connection, task_id: TaskId) -> Result<Option<LoadedTask
             None => None,
         },
     }))
+}
+
+fn load_provider_sessions(
+    conn: &Connection,
+    task_id: TaskId,
+) -> Result<
+    BTreeMap<AgentSessionId, crate::domain::provider_input::ProviderSessionProjection>,
+    StoreError,
+> {
+    let mut stmt = conn.prepare(
+        "SELECT agent_session_id, state FROM provider_input_state WHERE task_id = ?1
+         ORDER BY agent_session_id ASC",
+    )?;
+    let rows = stmt.query_map([task_id.as_bytes().as_slice()], |row| {
+        Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+    })?;
+    let mut sessions = BTreeMap::new();
+    for row in rows {
+        let (agent_bytes, state) = row?;
+        if state.len() > crate::domain::MAX_PROVIDER_SESSION_STATE_BYTES {
+            return Err(StoreError::Projection(
+                "provider_input_state.state exceeds its byte bound".into(),
+            ));
+        }
+        let agent_session_id =
+            id16::<AgentSessionId>("provider_input_state.agent_session_id", &agent_bytes)?;
+        let projection: crate::domain::provider_input::ProviderSessionProjection =
+            unpack_projection_blob("provider_input_state.state", &state)?;
+        projection
+            .validate_bounds()
+            .map_err(|err| StoreError::Projection(err.to_string()))?;
+        if !sessions.insert(agent_session_id, projection).is_none() {
+            return Err(StoreError::Projection(
+                "duplicate provider_input_state agent_session_id".into(),
+            ));
+        }
+    }
+    Ok(sessions)
 }
 
 fn load_agents(
@@ -6873,6 +7668,13 @@ fn decode_agent_projection(
     runtime_generation: i64,
     revision: i64,
 ) -> Result<AgentSessionFacts, StoreError> {
+    let provider_kind = ProviderKind::parse_wire(&provider_kind).ok_or_else(|| {
+        StoreError::Projection("agent_sessions.provider_kind is not canonical".to_string())
+    })?;
+    let provider_session_id = provider_session_id
+        .map(ProviderSessionId::new)
+        .transpose()
+        .map_err(|error| StoreError::Projection(error.to_string()))?;
     let agent = AgentSessionFacts {
         id,
         task_id,

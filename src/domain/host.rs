@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::domain::agent::{AgentRole, AgentSessionLifecycle};
 use crate::domain::id::{AgentSessionId, ResourceId, TaskId};
 use crate::domain::resource::{OwnerKind, ResourceKind, ResourceLifecycle};
+use crate::providers::ProviderKind;
 
 /// Durable blockers observed by [`crate::domain::Query::InspectHostQuit`].
 ///
@@ -32,7 +33,7 @@ pub struct HostQuitAgentBlocker {
     pub task_id: TaskId,
     pub task_title: String,
     pub role: AgentRole,
-    pub provider_kind: String,
+    pub provider_kind: ProviderKind,
     pub lifecycle: AgentSessionLifecycle,
     pub runtime_generation: u64,
 }

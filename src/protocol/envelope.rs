@@ -1,5 +1,5 @@
 use std::fmt;
-use std::io::Cursor;
+use std::io::{self, Cursor, Write};
 
 use rmp::Marker;
 use serde::de::{self, DeserializeOwned, MapAccess, SeqAccess, Visitor};
@@ -921,6 +921,31 @@ impl MessagePackCodec {
         Ok(encoded)
     }
 
+    /// Count the exact canonical encoding without first allocating an
+    /// oversized buffer. This is the page-budget boundary: callers can stop
+    /// fetching/materializing rows as soon as the writer crosses `max_bytes`.
+    pub fn encoded_len_bounded<T: Serialize + ?Sized>(
+        &self,
+        value: &T,
+        max_bytes: u32,
+    ) -> Result<u32, MessagePackError> {
+        let maximum = max_bytes.min(self.max_document_bytes);
+        let mut writer = CountingWriter::new(maximum);
+        let result =
+            value.serialize(&mut rmp_serde::Serializer::new(&mut writer).with_struct_map());
+        if writer.exceeded {
+            return Err(MessagePackError::Oversized {
+                declared: u64::try_from(writer.written).unwrap_or(u64::MAX),
+                maximum,
+            });
+        }
+        result.map_err(|_| MessagePackError::Encode)?;
+        u32::try_from(writer.written).map_err(|_| MessagePackError::Oversized {
+            declared: writer.written as u64,
+            maximum,
+        })
+    }
+
     pub fn decode<T: DeserializeOwned>(&self, payload: &[u8]) -> Result<T, MessagePackError> {
         self.preflight(payload)?;
 
@@ -956,6 +981,41 @@ impl MessagePackCodec {
             max_scalar_bytes: self.max_document_bytes,
         }
         .scan_document()
+    }
+}
+
+struct CountingWriter {
+    written: usize,
+    maximum: usize,
+    exceeded: bool,
+}
+
+impl CountingWriter {
+    fn new(maximum: u32) -> Self {
+        Self {
+            written: 0,
+            maximum: usize::try_from(maximum).unwrap_or(usize::MAX),
+            exceeded: false,
+        }
+    }
+}
+
+impl Write for CountingWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if self.written.saturating_add(bytes.len()) > self.maximum {
+            self.exceeded = true;
+            self.written = self.maximum.saturating_add(1);
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "encoded page limit",
+            ));
+        }
+        self.written += bytes.len();
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 
