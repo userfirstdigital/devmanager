@@ -151,7 +151,7 @@ fn recovery_marker_round_trip_validates_hello_and_clears() {
     fs::create_dir_all(&root).unwrap();
     let token = UpdateHandoffToken {
         token_id: Uuid::now_v7(),
-        host_boot_id: Uuid::nil(),
+        host_boot_id: Uuid::now_v7(),
         inspection_id: 7,
         target_version: "0.4.2".into(),
         client_build: "devmanager/0.4.2".into(),
@@ -160,6 +160,9 @@ fn recovery_marker_round_trip_validates_hello_and_clears() {
         expires_at: UNIX_EPOCH + Duration::from_secs(120),
     };
     let marker = UpdateHandoffRecoveryMarker::from_token(&token, 1, 0);
+    assert_eq!(marker.token_id, token.token_id);
+    assert_eq!(marker.host_boot_id, token.host_boot_id);
+    assert_eq!(marker.inspection_id, token.inspection_id);
     persist_update_handoff_recovery_marker(&root, &marker).expect("persist");
     let loaded = read_update_handoff_recovery_marker(&root)
         .expect("read")
@@ -181,6 +184,31 @@ fn recovery_marker_round_trip_validates_hello_and_clears() {
         .expect("reread")
         .is_none());
     let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn recovery_marker_rejects_lineage_or_build_mismatch() {
+    let token = UpdateHandoffToken {
+        token_id: Uuid::now_v7(),
+        host_boot_id: Uuid::now_v7(),
+        inspection_id: 19,
+        target_version: "0.4.2".into(),
+        client_build: "devmanager/0.4.2".into(),
+        host_build: "devmanager-host/0.4.2".into(),
+        issued_at: UNIX_EPOCH + Duration::from_secs(1),
+        expires_at: UNIX_EPOCH + Duration::from_secs(120),
+    };
+    let mut marker = UpdateHandoffRecoveryMarker::from_token(&token, 1, 0);
+    marker.host_build = "devmanager-host/0.4.1".into();
+    assert!(marker
+        .validate_live_host_hello("devmanager-host/0.4.1", 1, 0)
+        .is_err());
+
+    let mut marker = UpdateHandoffRecoveryMarker::from_token(&token, 1, 0);
+    marker.protocol_minor = 1;
+    assert!(marker
+        .validate_live_host_hello("devmanager-host/0.4.2", 1, 0)
+        .is_err());
 }
 
 #[test]

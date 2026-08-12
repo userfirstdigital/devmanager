@@ -253,7 +253,13 @@ fn release_draft_id_is_resolved_from_the_authenticated_release_list() {
 #[test]
 fn release_latest_json_includes_protocol_hash_and_build_identity() {
     let workflow = fs::read_to_string(release_workflow_path()).expect("read release workflow");
-    let release_job = workflow.split("\n  release:").nth(1).expect("release job");
+    // Staging owns manifest generation; public publication is a separate
+    // protected job and must not be required for the draft contract.
+    let release_job = workflow
+        .split("\n  stage:")
+        .nth(1)
+        .and_then(|tail| tail.split("\n  publish:").next())
+        .expect("stage job");
     assert!(release_job.contains("\"minimum_protocol\": \"1.0\""));
     assert!(release_job.contains("\"hash\": f\"sha256:{digest}\""));
     assert!(release_job.contains("\"client_build\": f\"devmanager/{version}\""));

@@ -356,6 +356,14 @@ struct UpdaterInner {
     /// Timed IPC port that drives the same host gate across the process boundary.
     control_port: Mutex<Option<Box<dyn HostUpdateControlPort>>>,
     resource_probe: Mutex<Option<Box<dyn ActiveResourceProbe>>>,
+    /// The exact token returned by PrepareUpdate and confirmed for drain.
+    ///
+    /// The public install API intentionally accepts only the token id when the
+    /// irreversible phase begins, so retain the full token here until that
+    /// phase consumes it.  This keeps the durable recovery marker correlated
+    /// to the original host boot and inspection rather than reconstructing
+    /// those fields from defaults.
+    prepared_token: Mutex<Option<UpdateHandoffToken>>,
     /// Live Host Hello `server_build` — never fabricated from checkout metadata.
     live_host_build: Mutex<Option<String>>,
     live_protocol: Mutex<Option<(u16, u16)>>,
@@ -493,6 +501,7 @@ impl UpdaterService {
                 update_gate: Mutex::new(None),
                 control_port: Mutex::new(None),
                 resource_probe: Mutex::new(None),
+                prepared_token: Mutex::new(None),
                 live_host_build: Mutex::new(None),
                 live_protocol: Mutex::new(None),
             }),
@@ -573,6 +582,7 @@ impl UpdaterService {
 
     /// Abort a prepared handoff before irreversible durable seal.
     pub fn abort_update_handoff(&self) -> Result<(), String> {
+        self.inner.clear_prepared_token();
         let deadline = Instant::now() + UPDATE_IPC_DEADLINE;
         if let Ok(port) = self.inner.control_port.lock() {
             if let Some(port) = port.as_ref() {
@@ -630,6 +640,10 @@ impl UpdaterService {
                     deadline,
                 )?;
                 port.confirm_drain(token.token_id, Instant::now() + UPDATE_IPC_DEADLINE)?;
+                if let Err(error) = self.remember_prepared_token(token.clone()) {
+                    let _ = port.abort_pre_install(Instant::now() + UPDATE_IPC_DEADLINE);
+                    return Err(error);
+                }
                 return Ok(token);
             }
         }
@@ -666,6 +680,10 @@ impl UpdaterService {
                     let _ = gate.abort_pre_install();
                     return Err(error.to_string());
                 }
+                if let Err(error) = self.remember_prepared_token(token.clone()) {
+                    let _ = gate.abort_pre_install();
+                    return Err(error);
+                }
                 Ok(token)
             }
             Err(error) => {
@@ -685,6 +703,7 @@ impl UpdaterService {
         token_id: uuid::Uuid,
     ) -> Result<InstallerLaunchOutcome, String> {
         let now = SystemTime::now();
+        let prepared_token = self.inner.take_prepared_token(token_id)?;
         let ready_update = {
             let state = self
                 .inner
@@ -703,6 +722,19 @@ impl UpdaterService {
                 required_hash: ready.required_hash.clone(),
             }
         };
+
+        // Correlate the prepared host token with the ready package before any
+        // stage, seal, or install action can become irreversible.
+        if prepared_token.target_version != ready_update.update.version
+            || prepared_token.client_build != ready_update.package_identity.client_build
+            || prepared_token.host_build != ready_update.package_identity.host_build
+        {
+            let _ = self.abort_update_handoff();
+            self.inner.restore_ready_snapshot(Some(
+                "Prepared update token does not match the ready package identity.".into(),
+            ));
+            return Err("Prepared update token does not match the ready package identity.".into());
+        }
 
         {
             let deadline = Instant::now() + UPDATE_IPC_DEADLINE;
@@ -793,17 +825,11 @@ impl UpdaterService {
 
         // Persist recoverable handoff marker before irreversible binary commit /
         // old-process exit so the new host/client can finish Hello resync.
-        let recovery = UpdateHandoffRecoveryMarker {
-            token_id,
-            host_boot_id: uuid::Uuid::nil(),
-            inspection_id: 0,
-            target_version: ready_update.update.version.clone(),
-            client_build: ready_update.package_identity.client_build.clone(),
-            host_build: ready_update.package_identity.host_build.clone(),
-            protocol_major: ready_update.package_identity.protocol_major,
-            protocol_minor: ready_update.package_identity.protocol_minor,
-            sealed: true,
-        };
+        let recovery = UpdateHandoffRecoveryMarker::from_token(
+            &prepared_token,
+            ready_update.package_identity.protocol_major,
+            ready_update.package_identity.protocol_minor,
+        );
         if let Err(error) = persist_update_handoff_recovery_marker(&install_dir, &recovery) {
             let _ = self.abort_update_handoff();
             self.inner.restore_ready_snapshot(Some(error.clone()));
@@ -965,6 +991,47 @@ impl UpdaterService {
         let update = self.inner.prepare_download()?;
         Self::spawn_download_thread(self.inner.clone(), update);
         Ok(())
+    }
+
+    fn remember_prepared_token(&self, token: UpdateHandoffToken) -> Result<(), String> {
+        let mut slot = self
+            .inner
+            .prepared_token
+            .lock()
+            .map_err(|_| "Prepared update token state is unavailable.".to_string())?;
+        if let Some(existing) = slot.as_ref() {
+            if existing.token_id != token.token_id {
+                return Err("Another update handoff is already prepared.".into());
+            }
+        }
+        *slot = Some(token);
+        Ok(())
+    }
+}
+
+impl UpdaterInner {
+    fn take_prepared_token(&self, token_id: uuid::Uuid) -> Result<UpdateHandoffToken, String> {
+        let mut slot = self
+            .prepared_token
+            .lock()
+            .map_err(|_| "Prepared update token state is unavailable.".to_string())?;
+        let token = slot
+            .as_ref()
+            .ok_or_else(|| "No prepared update handoff token is available.".to_string())?;
+        if token.token_id != token_id {
+            return Err(format!(
+                "Prepared update handoff token mismatch: expected {}, observed {}.",
+                token.token_id, token_id
+            ));
+        }
+        slot.take()
+            .ok_or_else(|| "Prepared update handoff token was consumed concurrently.".into())
+    }
+
+    fn clear_prepared_token(&self) {
+        if let Ok(mut slot) = self.prepared_token.lock() {
+            *slot = None;
+        }
     }
 }
 
