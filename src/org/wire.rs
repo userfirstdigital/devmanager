@@ -28,12 +28,12 @@ use crate::prompts::{
 };
 use crate::protocol::{
     validate_organization_payload, OrganizationCodecError, OrganizationEvidenceMetadataWire,
-    OrganizationFleetWatcherWire, OrganizationLocalActionCatalogEntryWire,
-    OrganizationLocalActionCatalogWire, OrganizationLocalActionStateWire,
-    OrganizationManagedTaskWire, OrganizationMembershipWire, OrganizationPolicyWire,
-    OrganizationPromptChainLinkWire, OrganizationPromptChainWire, OrganizationPromptSnapshotWire,
-    OrganizationPromptVersionWire, OrganizationPromptWire, OrganizationTaskWatcherWire,
-    OrganizationTelemetryIntentWire, OrganizationWirePayload, ORGANIZATION_SCHEMA_VERSION,
+    OrganizationFleetWatcherWire, OrganizationLocalActionCatalogWire,
+    OrganizationLocalActionStateWire, OrganizationManagedTaskWire, OrganizationMembershipWire,
+    OrganizationPolicyWire, OrganizationPromptChainLinkWire, OrganizationPromptChainWire,
+    OrganizationPromptSnapshotWire, OrganizationPromptVersionWire, OrganizationPromptWire,
+    OrganizationTaskWatcherWire, OrganizationTelemetryIntentWire, OrganizationWirePayload,
+    ORGANIZATION_SCHEMA_VERSION,
 };
 
 pub fn codec_error(error: OrganizationCodecError) -> OrgError {
@@ -272,7 +272,14 @@ impl OrganizationProjection {
         let entries = catalog
             .entries
             .iter()
-            .map(catalog_entry_from_wire)
+            .map(|entry| {
+                Ok(LocalActionCatalogEntry {
+                    kind: parse_action_kind(&entry.kind)?,
+                    version: entry.version,
+                    replay_policy: parse_replay(&entry.replay_policy)?,
+                    risk: parse_risk(&entry.risk)?,
+                })
+            })
             .collect::<Result<Vec<_>, _>>()?;
         self.local_actions_mut().bind_server_catalog(entries)
     }
@@ -497,17 +504,6 @@ fn managed_task_from_wire(
             .map_err(|_| OrgError::EmptyIdentity)?,
         tenant_id: PortalTenantId::parse(&task.tenant_id).map_err(|_| OrgError::EmptyIdentity)?,
         portal_title: task.portal_title.clone(),
-    })
-}
-
-fn catalog_entry_from_wire(
-    entry: &OrganizationLocalActionCatalogEntryWire,
-) -> Result<LocalActionCatalogEntry, OrgError> {
-    Ok(LocalActionCatalogEntry {
-        kind: parse_action_kind(&entry.kind)?,
-        version: entry.version,
-        replay_policy: parse_replay(&entry.replay_policy)?,
-        risk: parse_risk(&entry.risk)?,
     })
 }
 

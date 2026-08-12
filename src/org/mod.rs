@@ -66,11 +66,11 @@ pub use portal::{
     LocalActionRequestDto, LocalPolicyUnits, LocalTaskProjection,
     ManagedTaskDto as PortalManagedTaskDto, ManagedTaskLink as PortalManagedTaskLink, MediaBinding,
     OrgPromptChainDto, OrgPromptChainLinkDto, OrgPromptDiffDto, OrgPromptDto, OrgPromptVersionDto,
-    OrganizationGrant, OrganizationPolicyDto, PortalActionKind, PortalActionRisk,
-    PortalAdapterError, PortalAdmissionStatus, PortalEnrollmentState, PortalGrantAccess, PortalId,
-    PortalManagementClient, PortalMembershipStatus, PortalOrgRole, PortalOutcomeStatus,
-    PortalPromptStatus, PortalRawSharingCeiling, PortalRequestMetadata, PortalUsageSource,
-    PromptChainRequest, PublishPromptRequest, TaskLiveViewDto,
+    OrganizationGrant as PortalOrganizationGrant, OrganizationPolicyDto, PortalActionKind,
+    PortalActionRisk, PortalAdapterError, PortalAdmissionStatus, PortalEnrollmentState,
+    PortalGrantAccess, PortalId, PortalManagementClient, PortalMembershipStatus, PortalOrgRole,
+    PortalOutcomeStatus, PortalPromptStatus, PortalRawSharingCeiling, PortalRequestMetadata,
+    PortalUsageSource, PromptChainRequest, PublishPromptRequest, TaskLiveViewDto,
     TitleConflict as PortalTitleConflict,
 };
 pub use publisher::{OrganizationPublisher, SignedOrganizationEnvelope};

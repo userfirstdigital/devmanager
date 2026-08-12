@@ -1031,10 +1031,11 @@ impl PortalManagementClient {
 
     fn url(&self, segments: &[&str], query: &[(&str, &str)]) -> Result<Url, PortalAdapterError> {
         let mut url = self.endpoint.clone();
+        let invalid_url = url.to_string();
         {
             let mut path = url
                 .path_segments_mut()
-                .map_err(|_| PortalAdapterError::InvalidBaseUrl(url.to_string()))?;
+                .map_err(|_| PortalAdapterError::InvalidBaseUrl(invalid_url))?;
             path.pop_if_empty();
             path.extend(segments.iter().copied());
         }
@@ -1094,7 +1095,7 @@ impl PortalManagementClient {
         let bytes = response
             .body_mut()
             .with_config()
-            .limit(MAX_RESPONSE_BYTES)
+            .limit(MAX_RESPONSE_BYTES as u64)
             .read_to_vec()
             .map_err(|error| match error {
                 ureq::Error::BodyExceedsLimit(_) => PortalAdapterError::ResponseTooLarge,

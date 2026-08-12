@@ -173,7 +173,8 @@ fn settle_accepted_browser_hold_gated(
             BrowserIntegrationHold::BrowserServiceAbsent,
         ));
     };
-    let token = grant_browser_service_settler_for_live_surface(hello, authority, intent, proof)?;
+    let token =
+        grant_browser_service_settler_for_live_surface(*hello, authority, intent, proof)?;
     use crate::domain::browser::BrowserHostHoldSettler;
     token
         .settle_accepted_hold(intent)
@@ -367,10 +368,10 @@ mod live_surface_settlement_tests {
 
     #[test]
     fn grant_settler_token_without_live_windows_observation_stays_held() {
-        assert_eq!(
+        assert!(matches!(
             grant_browser_service_settler(hello_with_projection(), None),
             Err(BrowserIntegrationHold::BrowserServiceAbsent)
-        );
+        ));
         let (_state, proof, task_id, context_id, generation) = live_proof();
         let request_id = BrowserRequestId::new();
         let intent = BrowserHostSettleIntent::bind_host_surface(
@@ -384,7 +385,7 @@ mod live_surface_settlement_tests {
             1,
         )
         .expect("surface intent");
-        assert_eq!(
+        assert!(matches!(
             grant_browser_service_settler_for_live_surface(
                 hello_with_projection(),
                 &BrowserServiceAuthority::issue(
@@ -401,6 +402,6 @@ mod live_surface_settlement_tests {
             Err(BrowserHoldSettleError::Hold(
                 BrowserIntegrationHold::WebViewSurfaceAbsent
             ))
-        );
+        ));
     }
 }

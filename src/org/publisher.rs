@@ -273,7 +273,7 @@ mod tests {
     use super::*;
     use crate::protocol::{OrganizationMembershipWire, ORGANIZATION_SCHEMA_VERSION};
 
-    fn publisher() -> OrganizationPublisher {
+    fn new_publisher() -> OrganizationPublisher {
         OrganizationPublisher::new([7u8; 32], "acme", "owner-1", Uuid::now_v7(), "session-1")
             .expect("publisher")
     }
@@ -296,7 +296,7 @@ mod tests {
 
     #[test]
     fn tamper_and_replay_are_rejected() {
-        let publisher = publisher();
+        let publisher = new_publisher();
         let mut signed = publisher
             .sign(1, membership_payload(publisher.host_id))
             .expect("sign");
@@ -308,7 +308,7 @@ mod tests {
             OrgError::TamperedEvidence
         );
 
-        let mut publisher = publisher();
+        let mut publisher = new_publisher();
         let signed = publisher
             .sign(1, membership_payload(publisher.host_id))
             .expect("sign");
@@ -331,7 +331,7 @@ mod tests {
 
     #[test]
     fn outbox_is_bounded_and_never_claims_delivery() {
-        let mut publisher = publisher();
+        let mut publisher = new_publisher();
         let hex = "ab".repeat(32);
         let queued = publisher
             .queue_publication(hex.clone(), "request_delivery")

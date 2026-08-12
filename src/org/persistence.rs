@@ -93,7 +93,7 @@ pub fn validate_outbox_intent(intent: &PersistedOutboxIntent) -> Result<(), OrgE
     Ok(())
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct OrganizationHelloRestore {
     projection: OrganizationProjection,
     diagnostic: Option<String>,
@@ -242,6 +242,9 @@ impl OrganizationProjection {
 
     pub fn restore_from_document(document: OrganizationStateDocument) -> Result<Self, OrgError> {
         validate_document(&document)?;
+        // Resolve the mode while the complete document is still borrowable.
+        // The fields below are then moved into their bounded restorers.
+        let mode = restore_mode(&document)?;
         let local_actions = LocalActionRegistry::restore(
             document.local_action_catalog,
             document.local_action_states,
@@ -286,7 +289,7 @@ impl OrganizationProjection {
         }
         let prompt_snapshot = document.prompt_snapshot.clone();
         let mut projection = Self::restore_parts(
-            restore_mode(&document)?,
+            mode,
             document.policy,
             document.authenticated_online,
             document.membership_revision,
