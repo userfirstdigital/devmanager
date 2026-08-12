@@ -5,13 +5,22 @@
 //! same named-field MessagePack envelope used by the native server.
 
 use base64::Engine;
+use serde::de::{self, Deserializer, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::fmt;
 use uuid::{Uuid, Variant};
 use wasm_bindgen::prelude::*;
 
+// These limits intentionally mirror the native Connect v1 contract in
+// `src/connect/envelope.rs`. Keep the checks in `WireEnvelope::validate` so
+// both JSON input and decoded MessagePack take exactly the same path.
 const MAX_PHYSICAL_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_REASSEMBLED_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_PAGE_ITEMS: usize = 1_000;
+const MAX_PAGE_ENCODED_BYTES: usize = 512 * 1024;
+const MAX_CHUNK_BYTES: usize = 256 * 1024;
+const MAX_CUMULATIVE_BYTES: u64 = MAX_REASSEMBLED_MESSAGE_BYTES as u64;
 const PROTOCOL_MINOR: u16 = 0;
 
 fn wire_error() -> JsValue {
@@ -41,8 +50,13 @@ impl WireLimits {
         if bounded.iter().any(|value| *value == 0)
             || self.max_physical_frame_bytes as usize > MAX_PHYSICAL_FRAME_BYTES
             || self.max_reassembled_message_bytes as usize > MAX_REASSEMBLED_MESSAGE_BYTES
+            || self.max_page_items as usize > MAX_PAGE_ITEMS
+            || self.max_page_encoded_bytes as usize > MAX_PAGE_ENCODED_BYTES
+            || self.max_chunk_bytes as usize > MAX_CHUNK_BYTES
             || self.max_chunk_bytes > self.max_physical_frame_bytes
+            || self.max_chunk_bytes > self.max_reassembled_message_bytes
             || self.max_chunk_bytes as u64 > self.max_cumulative_bytes
+            || self.max_cumulative_bytes > MAX_CUMULATIVE_BYTES
             || self.max_cumulative_bytes > self.max_reassembled_message_bytes as u64
             || payload_len > self.max_reassembled_message_bytes as usize
         {
@@ -52,7 +66,7 @@ impl WireLimits {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum WireChannel {
     Critical,
@@ -60,13 +74,35 @@ enum WireChannel {
     Ephemeral,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+impl WireChannel {
+    const fn for_payload_kind(payload_kind: u16) -> Option<Self> {
+        Some(match payload_kind {
+            // Critical: hello, capabilities, query, query reply, command,
+            // command receipt, operation settlement, resync, and error.
+            1 | 2 | 5 | 18 | 6 | 7 | 8 | 15 | 16 => Self::Critical,
+            // Durable: snapshot/event pages, prompt/browser extensions,
+            // chunks, and the reserved extension kind.
+            3 | 4 | 12 | 13 | 14 | 17 => Self::Durable,
+            // Ephemeral: presence, terminal deltas, and browser frames.
+            9 | 10 | 11 => Self::Ephemeral,
+            // Unknown/future kinds remain inert extension data, just as they
+            // do in the native contract, and are not assigned a channel here.
+            _ => return None,
+        })
+    }
+
+    const fn allows_raw_content(payload_kind: u16) -> bool {
+        matches!(payload_kind, 10 | 11 | 14)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum WireCompression {
     None,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum WirePrivacy {
     LocalOnly,
@@ -75,6 +111,7 @@ enum WirePrivacy {
 }
 
 mod binary_payload {
+    use super::*;
     use serde::ser::Serializer;
 
     pub fn serialize<S>(value: &[u8], serializer: S) -> Result<S::Ok, S::Error>
@@ -83,9 +120,48 @@ mod binary_payload {
     {
         serializer.serialize_bytes(value)
     }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct BytesVisitor;
+
+        impl<'de> Visitor<'de> for BytesVisitor {
+            type Value = Vec<u8>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("MessagePack binary bytes")
+            }
+
+            fn visit_bytes<E>(self, value: &[u8]) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(value.to_vec())
+            }
+
+            fn visit_byte_buf<E>(self, value: Vec<u8>) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(value)
+            }
+
+            fn visit_seq<A>(self, _seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                Err(de::Error::invalid_type(de::Unexpected::Seq, &self))
+            }
+        }
+
+        deserializer.deserialize_bytes(BytesVisitor)
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WireEnvelope {
     protocol_major: u16,
     protocol_minor: u16,
@@ -103,6 +179,42 @@ struct WireEnvelope {
     payload_version: u16,
     #[serde(with = "binary_payload")]
     payload: Vec<u8>,
+}
+
+impl WireEnvelope {
+    fn validate(&self) -> Result<(), JsValue> {
+        if self.protocol_major != crate::PROTOCOL_MAJOR
+            || self.protocol_minor > PROTOCOL_MINOR
+            || self.sequence == 0
+            || self.payload_kind == 0
+            || self.payload_version == 0
+            || !matches!(self.compression, WireCompression::None)
+        {
+            return Err(wire_error());
+        }
+        for identifier in [self.connection_id, self.session_id, self.channel_id] {
+            if identifier.get_version_num() != 7 || identifier.get_variant() != Variant::RFC4122 {
+                return Err(wire_error());
+            }
+        }
+        for identifier in [self.request_id, self.operation_id].into_iter().flatten() {
+            if identifier.get_version_num() != 7 || identifier.get_variant() != Variant::RFC4122 {
+                return Err(wire_error());
+            }
+        }
+        self.limits.validate(self.payload.len())?;
+        if let Some(expected_channel) = WireChannel::for_payload_kind(self.payload_kind) {
+            if expected_channel != self.channel {
+                return Err(wire_error());
+            }
+        }
+        if matches!(self.privacy_class, WirePrivacy::RawContent)
+            && !WireChannel::allows_raw_content(self.payload_kind)
+        {
+            return Err(wire_error());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -154,20 +266,13 @@ fn uuid(value: &str) -> Result<Uuid, JsValue> {
 }
 
 fn envelope_from_json(input: EnvelopeJson) -> Result<WireEnvelope, JsValue> {
-    if input.protocol_major != crate::PROTOCOL_MAJOR
-        || input.protocol_minor > PROTOCOL_MINOR
-        || input.sequence == 0
-        || input.payload_kind == 0
-        || input.payload_version == 0
-        || !matches!(input.compression, WireCompression::None)
-    {
+    if input.payload_kind == 0 {
         return Err(wire_error());
     }
     let payload = base64::engine::general_purpose::STANDARD
         .decode(input.payload_base64)
         .map_err(|_| wire_error())?;
-    input.limits.validate(payload.len())?;
-    Ok(WireEnvelope {
+    let envelope = WireEnvelope {
         protocol_major: input.protocol_major,
         protocol_minor: input.protocol_minor,
         connection_id: uuid(&input.connection_id)?,
@@ -183,7 +288,9 @@ fn envelope_from_json(input: EnvelopeJson) -> Result<WireEnvelope, JsValue> {
         payload_kind: input.payload_kind,
         payload_version: input.payload_version,
         payload,
-    })
+    };
+    envelope.validate()?;
+    Ok(envelope)
 }
 
 fn envelope_to_json(envelope: WireEnvelope) -> EnvelopeJsonOut {
@@ -213,7 +320,7 @@ pub fn encode_connect_envelope_json(input: String) -> Result<Vec<u8>, JsValue> {
     let input: EnvelopeJson = serde_json::from_str(&input).map_err(|_| wire_error())?;
     let envelope = envelope_from_json(input)?;
     let bytes = rmp_serde::to_vec_named(&envelope).map_err(|_| wire_error())?;
-    if bytes.len() > MAX_PHYSICAL_FRAME_BYTES {
+    if bytes.len() > envelope.limits.max_physical_frame_bytes as usize {
         return Err(wire_error());
     }
     Ok(bytes)
@@ -228,14 +335,8 @@ pub fn decode_connect_envelope_json(input: &[u8]) -> Result<String, JsValue> {
         return Err(wire_error());
     }
     let envelope: WireEnvelope = rmp_serde::from_slice(input).map_err(|_| wire_error())?;
-    envelope.limits.validate(envelope.payload.len())?;
-    if envelope.protocol_major != crate::PROTOCOL_MAJOR
-        || envelope.protocol_minor > PROTOCOL_MINOR
-        || envelope.sequence == 0
-        || envelope.payload_kind == 0
-        || envelope.payload_version == 0
-        || !matches!(envelope.compression, WireCompression::None)
-    {
+    envelope.validate()?;
+    if input.len() > envelope.limits.max_physical_frame_bytes as usize {
         return Err(wire_error());
     }
     serde_json::to_string(&envelope_to_json(envelope)).map_err(|_| wire_error())

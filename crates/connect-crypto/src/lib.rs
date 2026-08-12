@@ -18,4 +18,12 @@ mod native_crypto;
 pub use native_crypto::*;
 
 #[cfg(feature = "wasm")]
-mod wasm;
+pub mod wasm;
+
+/// The bounded Connect v1 envelope ABI used by the browser transport.
+///
+/// Keep this behind the WASM feature: the native application continues to use
+/// `src/connect/envelope.rs` as its source of truth, while the browser gets a
+/// deliberately small, redacted JSON-to-MessagePack boundary.
+#[cfg(feature = "wasm")]
+pub mod wire;

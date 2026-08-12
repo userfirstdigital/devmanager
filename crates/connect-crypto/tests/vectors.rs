@@ -3,6 +3,85 @@ use connect_crypto::{
     SEALED_NONCE_BYTES, SEALED_TAG_BYTES,
 };
 
+#[cfg(feature = "wasm")]
+mod wire_contract {
+    use base64::Engine;
+    use connect_crypto::wire::{decode_connect_envelope_json, encode_connect_envelope_json};
+    use serde_json::{json, Value};
+    use uuid::Uuid;
+
+    fn envelope(payload_kind: u16, channel: &str, privacy_class: &str) -> Value {
+        let identifier = || Uuid::now_v7().to_string();
+        json!({
+            "protocolMajor": 1,
+            "protocolMinor": 0,
+            "connectionId": identifier(),
+            "sessionId": identifier(),
+            "channelId": identifier(),
+            "channel": channel,
+            "sequence": 1,
+            "requestId": Value::Null,
+            "operationId": Value::Null,
+            "limits": {
+                "max_physical_frame_bytes": 1024 * 1024,
+                "max_reassembled_message_bytes": 16 * 1024 * 1024,
+                "max_page_items": 1000,
+                "max_page_encoded_bytes": 512 * 1024,
+                "max_chunk_bytes": 256 * 1024,
+                "max_cumulative_bytes": 16 * 1024 * 1024_u64,
+            },
+            "compression": "none",
+            "privacyClass": privacy_class,
+            "payloadKind": payload_kind,
+            "payloadVersion": 1,
+            "payloadBase64": base64::engine::general_purpose::STANDARD.encode([0x01, 0x02]),
+        })
+    }
+
+    fn encode(value: &Value) -> Result<Vec<u8>, wasm_bindgen::JsValue> {
+        encode_connect_envelope_json(serde_json::to_string(value).expect("JSON fixture"))
+    }
+
+    #[test]
+    fn valid_native_envelope_round_trips_through_wasm_abi() {
+        let input = envelope(3, "durable", "managed_metadata");
+        let encoded = encode(&input).expect("valid envelope");
+        let decoded = decode_connect_envelope_json(&encoded).expect("valid MessagePack");
+        let output: Value = serde_json::from_str(&decoded).expect("JSON output");
+
+        assert_eq!(output["protocolMajor"], 1);
+        assert_eq!(output["channel"], "durable");
+        assert_eq!(output["payloadKind"], 3);
+        assert_eq!(output["payloadBase64"], input["payloadBase64"]);
+    }
+
+    #[test]
+    fn page_limits_are_bounded_by_the_native_contract() {
+        let mut too_many_items = envelope(3, "durable", "managed_metadata");
+        too_many_items["limits"]["max_page_items"] = json!(1001);
+        assert!(encode(&too_many_items).is_err());
+
+        let mut too_many_bytes = envelope(3, "durable", "managed_metadata");
+        too_many_bytes["limits"]["max_page_encoded_bytes"] = json!(512 * 1024 + 1);
+        assert!(encode(&too_many_bytes).is_err());
+    }
+
+    #[test]
+    fn channel_and_raw_content_rules_match_native_payload_catalog() {
+        let mismatched_channel = envelope(3, "critical", "managed_metadata");
+        assert!(encode(&mismatched_channel).is_err());
+
+        let raw_page = envelope(3, "durable", "raw_content");
+        assert!(encode(&raw_page).is_err());
+
+        let raw_terminal = envelope(10, "ephemeral", "raw_content");
+        assert!(encode(&raw_terminal).is_ok());
+
+        let raw_unknown = envelope(99, "durable", "raw_content");
+        assert!(encode(&raw_unknown).is_err());
+    }
+}
+
 #[test]
 fn handshake_message_fixture_preserves_the_native_header() {
     let encoded = [1_u8, 2, 0xaa, 0xbb, 0xcc];
