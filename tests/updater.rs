@@ -180,6 +180,14 @@ fn release_packaging_runs_independently_of_verify_but_stage_requires_verify() {
             && build_job.contains("Build signed dual-binary updater payload"),
         "Windows x64 must keep NSIS/MSI for manual install and publish a dual-binary updater ZIP"
     );
+    assert!(
+        stage_job.contains("publish-assets-expected-names.txt"),
+        "stage must declare the exact emitted publish-assets name set for draft verification"
+    );
+    assert!(
+        !stage_job.contains("Expected exactly 11 non-empty staged release assets"),
+        "draft asset verification must not keep the stale 11-asset count"
+    );
 }
 
 #[test]

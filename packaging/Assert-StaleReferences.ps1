@@ -6,9 +6,12 @@
 .DESCRIPTION
   Scans only the roots and forbidden patterns declared by package-contract.json.
   Historical residuals are allowed only by the narrow, reviewed allowlist in
-  packaging/stale-reference-historical-allowlist.txt. This package check is
-  intentionally separate from scripts/native-next/Invoke-CutoverAudit.ps1,
-  which owns the authenticated, bounded cutover parity audit.
+  packaging/stale-reference-historical-allowlist.txt. Intentional safety and
+  compatibility references are recognized only by exact path+token contracts in
+  staleReferenceScan.intentionalSafetyReferences; an unexpected forbidden token
+  in those files still fails. This package check is intentionally separate from
+  scripts/native-next/Invoke-CutoverAudit.ps1, which owns the authenticated,
+  bounded cutover parity audit.
 #>
 [CmdletBinding()]
 param(
@@ -52,6 +55,107 @@ function Test-HistoricalAllowlisted([string]$RelativePath, [string[]]$Allowlist)
     return $false
 }
 
+function Test-IntentionalSafetyReference {
+    param(
+        [Parameter(Mandatory = $true)][string]$RelativePath,
+        [Parameter(Mandatory = $true)][string]$Pattern,
+        [Parameter(Mandatory = $true)]$Intentional
+    )
+
+    $rel = $RelativePath.Replace('\', '/')
+    foreach ($entry in @($Intentional)) {
+        if (-not $entry) { continue }
+        $entryPath = ([string]$entry.path).Replace('\', '/')
+        if ($rel -ne $entryPath) { continue }
+        $tokens = @($entry.tokens | ForEach-Object { [string]$_ })
+        if ($tokens -contains $Pattern) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Assert-IntentionalSafetyContractShape {
+    param(
+        [Parameter(Mandatory = $true)]$Intentional,
+        [Parameter(Mandatory = $true)][string[]]$ForbiddenPatterns,
+        [Parameter(Mandatory = $true)][string]$Root
+    )
+
+    if (@($Intentional).Count -lt 1) {
+        Write-Failure 'staleReferenceScan.intentionalSafetyReferences must declare at least one exact path+token contract'
+    }
+
+    $seenPaths = New-Object 'System.Collections.Generic.HashSet[string]'
+    $byPath = @{}
+    foreach ($entry in @($Intentional)) {
+        $entryPath = ([string]$entry.path).Replace('\', '/').Trim()
+        if (-not $entryPath -or $entryPath.Contains('..') -or $entryPath.StartsWith('/') -or $entryPath.EndsWith('/')) {
+            Write-Failure "intentionalSafetyReferences path must be an exact relative file path, found '$entryPath'"
+        }
+        if (-not $seenPaths.Add($entryPath)) {
+            Write-Failure "intentionalSafetyReferences path must be unique: $entryPath"
+        }
+        $full = Join-Path $Root ($entryPath.Replace('/', [IO.Path]::DirectorySeparatorChar))
+        if (-not (Test-Path -LiteralPath $full -PathType Leaf)) {
+            Write-Failure "intentionalSafetyReferences path missing on disk: $entryPath"
+        }
+        $tokens = @($entry.tokens | ForEach-Object { [string]$_ })
+        if ($tokens.Count -lt 1) {
+            Write-Failure "intentionalSafetyReferences for $entryPath must declare at least one token"
+        }
+        foreach ($token in $tokens) {
+            if (-not $token) {
+                Write-Failure "intentionalSafetyReferences for $entryPath contains an empty token"
+            }
+            if ($ForbiddenPatterns -notcontains $token) {
+                Write-Failure "intentionalSafetyReferences token '$token' for $entryPath is not a forbiddenPatterns entry"
+            }
+        }
+        $byPath[$entryPath] = $tokens
+    }
+
+    # Narrow matching self-check driven by contract values (no hard-coded stale
+    # token literals in this script body): exact path+token passes; same path
+    # with an undeclared forbidden token must not be treated as intentional.
+    $handoffPath = 'src/updater/handoff.rs'
+    if (-not $byPath.ContainsKey($handoffPath)) {
+        Write-Failure "intentional safety contract missing required path $handoffPath"
+    }
+    foreach ($token in @($byPath[$handoffPath])) {
+        if (-not (Test-IntentionalSafetyReference -RelativePath $handoffPath -Pattern $token -Intentional $Intentional)) {
+            Write-Failure "intentional safety contract failed exact path+token recognition for $handoffPath"
+        }
+    }
+    $undeclared = @(
+        $ForbiddenPatterns |
+            Where-Object { @($byPath[$handoffPath]) -notcontains $_ } |
+            Select-Object -First 1
+    )
+    if ($undeclared.Count -ne 1) {
+        Write-Failure "intentional safety contract for $handoffPath must leave at least one forbidden token undeclared"
+    }
+    if (Test-IntentionalSafetyReference -RelativePath $handoffPath -Pattern $undeclared[0] -Intentional $Intentional) {
+        Write-Failure "intentional safety contract must not blanket-allow undeclared tokens in $handoffPath"
+    }
+    if (Test-IntentionalSafetyReference -RelativePath 'src/updater/other.rs' -Pattern $byPath[$handoffPath][0] -Intentional $Intentional) {
+        Write-Failure 'intentional safety contract must not match by token alone without an exact path'
+    }
+
+    $cutoverPath = 'scripts/native-next/Invoke-CutoverAudit.ps1'
+    if (-not $byPath.ContainsKey($cutoverPath)) {
+        Write-Failure "intentional safety contract missing required path $cutoverPath"
+    }
+    if (@($byPath[$cutoverPath]).Count -lt 2) {
+        Write-Failure "intentional safety contract for $cutoverPath must declare multiple protected/forbidden tokens"
+    }
+    foreach ($token in @($byPath[$cutoverPath])) {
+        if (-not (Test-IntentionalSafetyReference -RelativePath $cutoverPath -Pattern $token -Intentional $Intentional)) {
+            Write-Failure "intentional safety contract failed exact path+token recognition for $cutoverPath"
+        }
+    }
+}
+
 $contractPath = Join-Path $RepoRoot 'packaging\package-contract.json'
 $allowlistPath = Join-Path $RepoRoot 'packaging\stale-reference-historical-allowlist.txt'
 if (-not (Test-Path -LiteralPath $contractPath -PathType Leaf)) {
@@ -65,6 +169,7 @@ $contract = Get-Content -LiteralPath $contractPath -Raw | ConvertFrom-Json
 $scan = $contract.staleReferenceScan
 $roots = @($scan.scanRoots | ForEach-Object { [string]$_ })
 $patterns = @($scan.forbiddenPatterns | ForEach-Object { [string]$_ })
+$intentional = @($scan.intentionalSafetyReferences)
 $allowlist = @(
     Get-Content -LiteralPath $allowlistPath |
         Where-Object { $_ -and -not $_.StartsWith('#') } |
@@ -74,8 +179,11 @@ if ($roots.Count -lt 1 -or $patterns.Count -lt 1 -or $allowlist.Count -lt 1) {
     Write-Failure 'staleReferenceScan requires scan roots, forbidden patterns, and allowlist entries'
 }
 
+Assert-IntentionalSafetyContractShape -Intentional $intentional -ForbiddenPatterns $patterns -Root $RepoRoot
+
 $failures = New-Object 'System.Collections.Generic.List[string]'
 $scanned = 0
+$intentionalHits = 0
 foreach ($root in $roots) {
     $path = Join-Path $RepoRoot $root
     if (-not (Test-Path -LiteralPath $path)) {
@@ -101,6 +209,10 @@ foreach ($root in $roots) {
         $scanned += 1
         foreach ($pattern in $patterns) {
             if ($text.Contains($pattern)) {
+                if (Test-IntentionalSafetyReference -RelativePath $relative -Pattern $pattern -Intentional $intentional) {
+                    $intentionalHits += 1
+                    continue
+                }
                 $failures.Add("stale reference '$pattern' in $relative")
             }
         }
@@ -110,4 +222,4 @@ foreach ($root in $roots) {
 if ($failures.Count -gt 0) {
     Write-Failure ("Stale reference scan failed:`n - " + ($failures -join "`n - "))
 }
-Write-Host ("Stale reference scan passed ({0} files scanned; {1} historical allowlist entries)." -f $scanned, $allowlist.Count)
+Write-Host ("Stale reference scan passed ({0} files scanned; {1} historical allowlist entries; {2} intentional path+token hits)." -f $scanned, $allowlist.Count, $intentionalHits)

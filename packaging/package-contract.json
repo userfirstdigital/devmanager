@@ -151,6 +151,28 @@
       "session.json",
       "src/sessions/",
       "web/src/sessions/"
+    ],
+    "intentionalSafetyReferences": [
+      {
+        "path": "src/updater/handoff.rs",
+        "tokens": ["session.json"],
+        "reason": "protected/ignored user-state contract"
+      },
+      {
+        "path": "tests/prompt_ui.rs",
+        "tokens": ["session.json"],
+        "reason": "explicit preservation/ignore contract"
+      },
+      {
+        "path": "tests/update_contract.rs",
+        "tokens": ["session.json"],
+        "reason": "explicit preservation/ignore contract"
+      },
+      {
+        "path": "scripts/native-next/Invoke-CutoverAudit.ps1",
+        "tokens": ["session.json", "devmanager-next"],
+        "reason": "protected-file and forbidden-legacy negative checks"
+      }
     ]
   },
   "notes": "SQLite/FTS and prompt-diff behavior ship only through application binaries; no user prompt database or organization content is packaged. similar 3.1.2 is required only when present in Cargo.lock after dependency union."

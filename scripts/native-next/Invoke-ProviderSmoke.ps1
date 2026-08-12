@@ -206,7 +206,8 @@ if ($DeadlineMs -le 0 -or $DeadlineMs -gt $script:MaxDeadlineMs) {
 }
 
 if ([string]::IsNullOrWhiteSpace($IsolatedProfile)) {
-    $IsolatedProfile = [System.IO.Path]::GetFullPath((Join-Path $worktreeRoot '.devmanager-next\provider-smoke-profile'))
+    # Isolated cutover smoke profile root — not the historical native-next evidence tree.
+    $IsolatedProfile = [System.IO.Path]::GetFullPath((Join-Path $worktreeRoot '.devmanager-cutover-provider-smoke\profile'))
 }
 else {
     if (-not (Test-DevManagerAbsolutePath -LiteralPath $IsolatedProfile)) {

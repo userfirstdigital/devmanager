@@ -681,7 +681,32 @@ jobs:
           )
           if manifest_path.stat().st_size <= 0:
               raise SystemExit("Generated latest.json is empty")
-          print(f"Validated, signature-verified, and staged {len(selected) + 1} required release assets.")
+
+          # Exact emitted publish set: the 14 selected platform artifacts plus latest.json.
+          emitted_paths = sorted(
+              path for path in publish_dir.iterdir() if path.is_file()
+          )
+          emitted_names = [path.name for path in emitted_paths]
+          if "latest.json" not in emitted_names:
+              raise SystemExit("Staged publish-assets must include latest.json")
+          if len(emitted_names) != len(selected) + 1 or len(emitted_names) != len(set(emitted_names)):
+              raise SystemExit(
+                  "Staged publish-assets must be exactly the 14 uniquely named platform "
+                  f"artifacts plus latest.json, found {emitted_names}"
+              )
+          if any(path.stat().st_size <= 0 for path in emitted_paths):
+              raise SystemExit(
+                  f"Staged publish-assets must be non-empty, found empty among {emitted_names}"
+              )
+          # Sidecar for the draft verification step: exact emitted names, not a stale count.
+          pathlib.Path("publish-assets-expected-names.txt").write_text(
+              "\n".join(emitted_names) + "\n",
+              encoding="utf-8",
+          )
+          print(
+              f"Validated, signature-verified, and staged {len(emitted_names)} required release assets: "
+              f"{emitted_names}"
+          )
           PY
 
       - name: Create and validate release tag
@@ -824,6 +849,23 @@ jobs:
           import pathlib
           import subprocess
 
+          declared_path = pathlib.Path("publish-assets-expected-names.txt")
+          if not declared_path.is_file():
+              raise SystemExit(
+                  "Missing publish-assets-expected-names.txt from staging; refusing draft verification"
+              )
+          declared_names = [
+              line.strip()
+              for line in declared_path.read_text(encoding="utf-8").splitlines()
+              if line.strip()
+          ]
+          if len(declared_names) != len(set(declared_names)):
+              raise SystemExit(
+                  f"Declared publish asset names must be unique, found {declared_names}"
+              )
+          if "latest.json" not in declared_names:
+              raise SystemExit("Declared publish assets must include latest.json")
+
           expected_paths = sorted(
               path for path in pathlib.Path("publish-assets").iterdir() if path.is_file()
           )
@@ -834,9 +876,15 @@ jobs:
               }
               for path in expected_paths
           }
-          if len(expected) != 11 or any(metadata["size"] <= 0 for metadata in expected.values()):
+          if sorted(expected) != sorted(declared_names):
               raise SystemExit(
-                  f"Expected exactly 11 non-empty staged release assets, found {sorted(expected)}"
+                  "Staged publish-assets names drifted from the emitted set declared during staging. "
+                  f"Declared {sorted(declared_names)}, found {sorted(expected)}."
+              )
+          if any(metadata["size"] <= 0 for metadata in expected.values()):
+              raise SystemExit(
+                  "Expected non-empty staged release assets matching the emitted publish set, "
+                  f"found empty among {sorted(expected)}"
               )
           assets = json.loads(
               subprocess.check_output(

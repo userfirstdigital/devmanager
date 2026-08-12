@@ -406,6 +406,19 @@ fn package_docs_and_workflows_describe_one_product_two_binaries_without_next_ide
         release.contains("CARGO_PACKAGER_SIGN_PRIVATE_KEY"),
         "release workflow must preserve signed updater artifact generation"
     );
+    assert!(
+        release.contains("publish-assets-expected-names.txt"),
+        "draft verification must derive the exact emitted publish-assets name set"
+    );
+    assert!(
+        !release.contains("Expected exactly 11 non-empty staged release assets"),
+        "draft verification must not keep the stale 11-asset hard-coded expectation"
+    );
+    assert!(
+        release.contains("14 uniquely named platform")
+            && release.contains("plus latest.json"),
+        "staging must document the 14 platform artifacts + latest.json emit contract"
+    );
 
     let notices = read(&repo_root().join("THIRD_PARTY_NOTICES.md"));
     assert!(
@@ -443,5 +456,74 @@ fn package_docs_and_workflows_describe_one_product_two_binaries_without_next_ide
             .expect("publish header")
             .contains("needs:"),
         "publish job must remain independent from stage/prepare"
+    );
+}
+
+#[test]
+fn stale_reference_scan_keeps_forbidden_patterns_and_exact_path_token_safety_contracts() {
+    let contract = package_contract();
+    let scan = &contract["staleReferenceScan"];
+    let patterns = scan["forbiddenPatterns"]
+        .as_array()
+        .expect("forbiddenPatterns");
+    for required in [
+        "devmanager-next",
+        "session.json",
+        "#[tauri::command]",
+        "tauri::command",
+        "src/sessions/",
+        "web/src/sessions/",
+    ] {
+        assert!(
+            patterns.iter().any(|value| value == required),
+            "forbiddenPatterns must retain {required}"
+        );
+    }
+
+    let intentional = scan["intentionalSafetyReferences"]
+        .as_array()
+        .expect("intentionalSafetyReferences");
+    let expected = [
+        ("src/updater/handoff.rs", &["session.json"][..]),
+        ("tests/prompt_ui.rs", &["session.json"][..]),
+        ("tests/update_contract.rs", &["session.json"][..]),
+        (
+            "scripts/native-next/Invoke-CutoverAudit.ps1",
+            &["session.json", "devmanager-next"][..],
+        ),
+    ];
+    assert_eq!(intentional.len(), expected.len());
+    for (path, tokens) in expected {
+        let entry = intentional
+            .iter()
+            .find(|value| value["path"] == path)
+            .unwrap_or_else(|| panic!("missing intentional safety path {path}"));
+        let declared = entry["tokens"].as_array().expect("tokens");
+        assert_eq!(declared.len(), tokens.len(), "token count for {path}");
+        for token in tokens {
+            assert!(
+                declared.iter().any(|value| value == *token),
+                "{path} must intentionally allow exact token {token}"
+            );
+            assert!(
+                patterns.iter().any(|value| value == *token),
+                "intentional token {token} must remain a forbidden pattern"
+            );
+        }
+        assert!(
+            repo_root().join(path).is_file(),
+            "intentional safety path must exist: {path}"
+        );
+    }
+
+    let scanner = read(&repo_root().join("packaging/Assert-StaleReferences.ps1"));
+    assert!(
+        scanner.contains("Test-IntentionalSafetyReference")
+            && scanner.contains("intentionalSafetyReferences"),
+        "stale scanner must enforce exact path+token intentional contracts"
+    );
+    assert!(
+        scanner.contains("must not blanket-allow undeclared tokens"),
+        "stale scanner must self-check that intentional contracts stay path+token narrow"
     );
 }
