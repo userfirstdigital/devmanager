@@ -1,15 +1,23 @@
 //! Production managed-launch authority for configured services.
 //!
 //! Uses the Phase 3 suspended PTY → Job register → resume handoff and exact
-//! Job teardown. No raw PID kill path exists here.
+//! Job teardown. No raw PID kill path exists here. Service PTY output is
+//! drained by a bounded reader into supervisor log projection; waiter exit
+//! feeds `report_exit`.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     sync::{Arc, Mutex},
 };
 
 #[cfg(windows)]
-use std::{ffi::OsString, path::PathBuf, sync::atomic::AtomicBool};
+use std::{
+    ffi::OsString,
+    io::{Read, Write},
+    path::PathBuf,
+    sync::atomic::AtomicBool,
+    thread,
+};
 
 #[cfg(windows)]
 use portable_pty::{native_pty_system, MasterPty, PtySize, SlavePty};
@@ -19,7 +27,8 @@ use crate::{
     process::identity::ProcessOwner,
     process::teardown::TeardownCompletionStore,
     services::supervisor::{
-        ManagedLaunchAuthority, ManagedLaunchSpec, ManagedLaunchStage, SupervisorError,
+        resolve_configured_service_program, ManagedLaunchAuthority, ManagedLaunchSpec,
+        ManagedLaunchStage, SupervisorError,
     },
 };
 
@@ -30,9 +39,7 @@ use crate::{
         resource::ResourceKind,
     },
     process::{
-        job::ManagedProcessJob,
-        launcher::{prepare_suspended_pty, PendingManagedLaunch, RegisteredPendingManagedLaunch},
-        registry::ProcessRegistry,
+        launcher::{prepare_suspended_pty, PendingManagedLaunch},
         teardown::{
             ManagedTerminalActorHandles, ManagedTerminalIo, ManagedTerminalTeardown,
             TeardownOutcome,
@@ -41,20 +48,30 @@ use crate::{
 };
 
 #[cfg(not(windows))]
-use crate::domain::operation::{OperationId, ResourceFence};
+use crate::domain::{
+    operation::{OperationId, ResourceFence},
+    resource::ResourceKind,
+};
 
 const MAX_SERVICE_AUTHORITY_RESOURCES: usize = 256;
+#[cfg(windows)]
+const MAX_SERVICE_PTY_DRAIN_CHUNK: usize = 4_096;
+#[cfg(windows)]
+const MAX_SERVICE_LOG_LINE_BYTES: usize = 256;
+#[cfg(windows)]
+const MAX_SERVICE_OUTPUT_LINES: usize = 64;
 
-#[derive(Debug, Clone, Copy)]
-struct IssuedServiceResource {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct IssuedServiceCapability {
     owner: ProcessOwner,
+    kind: ResourceKind,
     resource_id: ResourceId,
     generation: u64,
 }
 
 struct ServiceAuthorityState {
     next_action_epoch: u64,
-    resources: BTreeMap<String, IssuedServiceResource>,
+    resources: BTreeMap<String, IssuedServiceCapability>,
     completion_store: Option<TeardownCompletionStore>,
 }
 
@@ -75,13 +92,24 @@ impl ServiceLaunchIssuer {
         }
     }
 
-    fn issue(
+    /// Admit one exact owner/kind/resource/generation capability. Arbitrary
+    /// mismatched specs are rejected; the first admit pins the capability.
+    pub fn admit_capability(
         &self,
         session_id: &str,
         owner: ProcessOwner,
+        kind: ResourceKind,
+        resource_id: ResourceId,
+        generation: u64,
     ) -> Result<(u64, TeardownCompletionStore, OperationId), String> {
         if session_id.trim().is_empty() || session_id.len() > 256 {
             return Err("service authority session identity is invalid".to_string());
+        }
+        if generation == 0 {
+            return Err("service runtime generation must be greater than zero".to_string());
+        }
+        if kind != ResourceKind::Service {
+            return Err("service authority requires ResourceKind::Service".to_string());
         }
         let mut state = self
             .state
@@ -92,26 +120,42 @@ impl ServiceLaunchIssuer {
         {
             return Err("service authority retention is full".to_string());
         }
+        match state.resources.get(session_id).copied() {
+            Some(current) => {
+                if current.owner != owner
+                    || current.kind != kind
+                    || current.resource_id != resource_id
+                {
+                    return Err("service launch capability mismatch".to_string());
+                }
+                if generation < current.generation {
+                    return Err("service launch generation is stale".to_string());
+                }
+                state.resources.insert(
+                    session_id.to_string(),
+                    IssuedServiceCapability {
+                        generation,
+                        ..current
+                    },
+                );
+            }
+            None => {
+                state.resources.insert(
+                    session_id.to_string(),
+                    IssuedServiceCapability {
+                        owner,
+                        kind,
+                        resource_id,
+                        generation,
+                    },
+                );
+            }
+        }
         let action_epoch = state.next_action_epoch;
         state.next_action_epoch = state
             .next_action_epoch
             .checked_add(1)
             .ok_or_else(|| "service action epoch space is exhausted".to_string())?;
-        let issued = match state.resources.get(session_id).copied() {
-            Some(current) if current.owner == owner => IssuedServiceResource {
-                generation: current
-                    .generation
-                    .checked_add(1)
-                    .ok_or_else(|| "service runtime generation is exhausted".to_string())?,
-                ..current
-            },
-            _ => IssuedServiceResource {
-                owner,
-                resource_id: ResourceId::new(),
-                generation: 1,
-            },
-        };
-        state.resources.insert(session_id.to_string(), issued);
         if state.completion_store.is_none() {
             #[cfg(windows)]
             {
@@ -145,14 +189,14 @@ enum PendingStage {
         session_id: String,
         completion_store: TeardownCompletionStore,
         io: Arc<ManagedTerminalIo>,
+        writer: Arc<Mutex<Box<dyn Write + Send>>>,
+        actors: Arc<Mutex<ManagedTerminalActorHandles>>,
+        master_slot: Arc<Mutex<Option<Box<dyn MasterPty + Send>>>>,
+        output_lines: Arc<Mutex<VecDeque<String>>>,
+        exit_code: Arc<Mutex<Option<Option<i32>>>>,
         slave: Box<dyn SlavePty + Send>,
         master: Box<dyn MasterPty + Send>,
-    },
-    Registered {
-        pending: RegisteredPendingManagedLaunch,
-        teardown: Arc<ManagedTerminalTeardown>,
-        slave: Box<dyn SlavePty + Send>,
-        master: Box<dyn MasterPty + Send>,
+        registered: bool,
     },
 }
 
@@ -169,11 +213,9 @@ pub struct HostLiveLaunch {
     #[cfg(windows)]
     fence: ResourceFence,
     #[cfg(windows)]
-    _child: Box<dyn portable_pty::Child + Send + Sync>,
+    output_lines: Arc<Mutex<VecDeque<String>>>,
     #[cfg(windows)]
-    _slave: Box<dyn SlavePty + Send>,
-    #[cfg(windows)]
-    _master: Box<dyn MasterPty + Send>,
+    exit_code: Arc<Mutex<Option<Option<i32>>>>,
     #[cfg(not(windows))]
     _private: (),
 }
@@ -227,7 +269,7 @@ impl ManagedLaunchAuthority for HostManagedLaunchAuthority {
         }
         #[cfg(windows)]
         {
-            if spec.generation == 0 {
+            if spec.generation == 0 || spec.kind != ResourceKind::Service {
                 return Err(SupervisorError::Launch {
                     stage: ManagedLaunchStage::Prepare,
                 });
@@ -235,11 +277,18 @@ impl ManagedLaunchAuthority for HostManagedLaunchAuthority {
             let session_id = format!("service:{}", spec.display_label);
             let (action_epoch, completion_store, operation_id) = self
                 .issuer
-                .issue(&session_id, spec.owner)
+                .admit_capability(
+                    &session_id,
+                    spec.owner,
+                    spec.kind,
+                    spec.resource_id,
+                    spec.generation,
+                )
                 .map_err(|_| SupervisorError::Launch {
                     stage: ManagedLaunchStage::Prepare,
                 })?;
 
+            let resolved_program = resolve_configured_service_program(&spec.program)?;
             let pty_system = native_pty_system();
             let pair = pty_system
                 .openpty(PtySize {
@@ -263,6 +312,8 @@ impl ManagedLaunchAuthority for HostManagedLaunchAuthority {
                 Arc::clone(&actors),
                 Arc::clone(&input_admission),
             );
+            let output_lines = Arc::new(Mutex::new(VecDeque::new()));
+            let exit_code = Arc::new(Mutex::new(None));
 
             let mut environment = BTreeMap::new();
             for (key, value) in &spec.environment {
@@ -273,7 +324,7 @@ impl ManagedLaunchAuthority for HostManagedLaunchAuthority {
                 generation: spec.generation,
                 owner: spec.owner,
                 kind: ResourceKind::Service,
-                executable: PathBuf::from(&spec.program),
+                executable: PathBuf::from(resolved_program),
                 args: spec.args.iter().cloned().map(OsString::from).collect(),
                 cwd: PathBuf::from(&spec.cwd),
                 environment,
@@ -292,8 +343,14 @@ impl ManagedLaunchAuthority for HostManagedLaunchAuthority {
                     session_id,
                     completion_store,
                     io,
+                    writer,
+                    actors,
+                    master_slot,
+                    output_lines,
+                    exit_code,
                     slave: pair.slave,
                     master: pair.master,
+                    registered: false,
                 },
             })
         }
@@ -301,7 +358,7 @@ impl ManagedLaunchAuthority for HostManagedLaunchAuthority {
 
     fn register_suspended(
         &mut self,
-        pending: Self::Pending,
+        mut pending: Self::Pending,
     ) -> Result<Self::Pending, SupervisorError> {
         #[cfg(not(windows))]
         {
@@ -313,49 +370,20 @@ impl ManagedLaunchAuthority for HostManagedLaunchAuthority {
         #[cfg(windows)]
         {
             let PendingStage::Prepared {
-                pending,
-                operation_id,
-                action_epoch,
-                session_id,
-                completion_store,
-                io,
-                slave,
-                master,
+                ref mut registered, ..
             } = pending.stage
             else {
                 return Err(SupervisorError::Launch {
                     stage: ManagedLaunchStage::Register,
                 });
             };
-            let mut registry = ProcessRegistry::<ManagedProcessJob>::new();
-            let registered =
-                pending
-                    .register_suspended(&mut registry)
-                    .map_err(|_| SupervisorError::Launch {
-                        stage: ManagedLaunchStage::Register,
-                    })?;
-            let fence = registered.fence().clone();
-            let teardown = ManagedTerminalTeardown::from_registered_for_service(
-                registry,
-                fence,
-                operation_id,
-                action_epoch,
-                completion_store,
-                session_id,
-                Vec::new(),
-                io,
-            )
-            .map_err(|_| SupervisorError::Launch {
-                stage: ManagedLaunchStage::Register,
-            })?;
-            Ok(HostPendingLaunch {
-                stage: PendingStage::Registered {
-                    pending: registered,
-                    teardown,
-                    slave,
-                    master,
-                },
-            })
+            if *registered {
+                return Err(SupervisorError::Launch {
+                    stage: ManagedLaunchStage::Register,
+                });
+            }
+            *registered = true;
+            Ok(pending)
         }
     }
 
@@ -369,31 +397,87 @@ impl ManagedLaunchAuthority for HostManagedLaunchAuthority {
         }
         #[cfg(windows)]
         {
-            let PendingStage::Registered {
+            let PendingStage::Prepared {
                 pending,
-                teardown,
+                operation_id,
+                action_epoch,
+                session_id,
+                completion_store,
+                io,
+                writer,
+                actors,
+                master_slot,
+                output_lines,
+                exit_code,
                 slave,
                 master,
+                registered,
             } = pending.stage
             else {
                 return Err(SupervisorError::Launch {
                     stage: ManagedLaunchStage::Resume,
                 });
             };
-            teardown.arm_before_resume();
-            let child = ManagedTerminalTeardown::resume_registered_for_service(&teardown, pending)
+            if !registered {
+                return Err(SupervisorError::Launch {
+                    stage: ManagedLaunchStage::Resume,
+                });
+            }
+            let (teardown, child) = ManagedTerminalTeardown::from_pending_launch(
+                pending,
+                operation_id,
+                action_epoch,
+                completion_store,
+                session_id,
+                Vec::new(),
+                Arc::clone(&io),
+            )
+            .map_err(|_| SupervisorError::Launch {
+                stage: ManagedLaunchStage::Resume,
+            })?;
+            drop(slave);
+
+            let acquired_writer = master.take_writer().map_err(|_| SupervisorError::Launch {
+                stage: ManagedLaunchStage::Resume,
+            })?;
+            {
+                let mut writer_slot = writer.lock().map_err(|_| SupervisorError::Launch {
+                    stage: ManagedLaunchStage::Resume,
+                })?;
+                *writer_slot = acquired_writer;
+            }
+            let reader = master
+                .try_clone_reader()
                 .map_err(|_| SupervisorError::Launch {
                     stage: ManagedLaunchStage::Resume,
                 })?;
+            {
+                let mut slot = master_slot.lock().map_err(|_| SupervisorError::Launch {
+                    stage: ManagedLaunchStage::Resume,
+                })?;
+                *slot = Some(master);
+            }
+
+            let reader_handle = spawn_service_pty_reader(reader, Arc::clone(&output_lines))?;
             let fence = child.fence().resource();
+            let waiter_handle =
+                spawn_service_pty_waiter(child.into_child(), Arc::clone(&exit_code))?;
+            {
+                let mut handles = actors.lock().map_err(|_| SupervisorError::Launch {
+                    stage: ManagedLaunchStage::Resume,
+                })?;
+                handles.reader = Some(reader_handle);
+                handles.waiter = Some(waiter_handle);
+            }
+            let _ = io;
+
             self.live
                 .insert(fence.resource_id, fence.runtime_generation);
             Ok(HostLiveLaunch {
                 teardown,
                 fence,
-                _child: child.into_child(),
-                _slave: slave,
-                _master: master,
+                output_lines,
+                exit_code,
             })
         }
     }
@@ -430,6 +514,48 @@ impl ManagedLaunchAuthority for HostManagedLaunchAuthority {
         }
     }
 
+    fn drain_output_lines(&self, live: &Self::Live) -> Vec<String> {
+        #[cfg(not(windows))]
+        {
+            let _ = live;
+            Vec::new()
+        }
+        #[cfg(windows)]
+        {
+            let Ok(mut queue) = live.output_lines.lock() else {
+                return Vec::new();
+            };
+            queue.drain(..).collect()
+        }
+    }
+
+    fn take_exit(&self, live: &Self::Live) -> Option<Option<i32>> {
+        #[cfg(not(windows))]
+        {
+            let _ = live;
+            None
+        }
+        #[cfg(windows)]
+        {
+            let Ok(mut slot) = live.exit_code.lock() else {
+                return None;
+            };
+            slot.take()
+        }
+    }
+
+    fn live_generation(live: &Self::Live) -> u64 {
+        #[cfg(not(windows))]
+        {
+            let _ = live;
+            0
+        }
+        #[cfg(windows)]
+        {
+            live.fence.runtime_generation
+        }
+    }
+
     fn live_count(&self) -> usize {
         self.live.len()
     }
@@ -437,4 +563,92 @@ impl ManagedLaunchAuthority for HostManagedLaunchAuthority {
     fn residue_count(&self) -> usize {
         self.live.len()
     }
+}
+
+#[cfg(windows)]
+fn spawn_service_pty_reader(
+    mut reader: Box<dyn Read + Send>,
+    output_lines: Arc<Mutex<VecDeque<String>>>,
+) -> Result<thread::JoinHandle<()>, SupervisorError> {
+    thread::Builder::new()
+        .name("service-pty-reader".to_owned())
+        .spawn(move || {
+            let mut buffer = [0_u8; MAX_SERVICE_PTY_DRAIN_CHUNK];
+            let mut pending = String::new();
+            loop {
+                match reader.read(&mut buffer) {
+                    Ok(0) => {
+                        flush_service_output_line(&output_lines, &mut pending);
+                        break;
+                    }
+                    Ok(count) => {
+                        pending.push_str(&String::from_utf8_lossy(&buffer[..count]));
+                        while let Some(index) = pending.find('\n') {
+                            let mut line = pending[..index].to_owned();
+                            pending.drain(..=index);
+                            if line.ends_with('\r') {
+                                line.pop();
+                            }
+                            push_service_output_line(&output_lines, line);
+                        }
+                        if pending.len() > MAX_SERVICE_LOG_LINE_BYTES {
+                            let line: String =
+                                pending.chars().take(MAX_SERVICE_LOG_LINE_BYTES).collect();
+                            pending.clear();
+                            push_service_output_line(&output_lines, line);
+                        }
+                    }
+                    Err(_) => {
+                        flush_service_output_line(&output_lines, &mut pending);
+                        break;
+                    }
+                }
+            }
+        })
+        .map_err(|_| SupervisorError::Launch {
+            stage: ManagedLaunchStage::Resume,
+        })
+}
+
+#[cfg(windows)]
+fn push_service_output_line(output_lines: &Mutex<VecDeque<String>>, mut line: String) {
+    if line.len() > MAX_SERVICE_LOG_LINE_BYTES {
+        line.truncate(MAX_SERVICE_LOG_LINE_BYTES);
+    }
+    if let Ok(mut queue) = output_lines.lock() {
+        if queue.len() >= MAX_SERVICE_OUTPUT_LINES {
+            queue.pop_front();
+        }
+        queue.push_back(line);
+    }
+}
+
+#[cfg(windows)]
+fn flush_service_output_line(output_lines: &Mutex<VecDeque<String>>, pending: &mut String) {
+    if pending.is_empty() {
+        return;
+    }
+    let line = std::mem::take(pending);
+    push_service_output_line(output_lines, line);
+}
+
+#[cfg(windows)]
+fn spawn_service_pty_waiter(
+    mut child: Box<dyn portable_pty::Child + Send + Sync>,
+    exit_code: Arc<Mutex<Option<Option<i32>>>>,
+) -> Result<thread::JoinHandle<()>, SupervisorError> {
+    thread::Builder::new()
+        .name("service-pty-waiter".to_owned())
+        .spawn(move || {
+            let code = match child.wait() {
+                Ok(status) => Some(status.exit_code() as i32),
+                Err(_) => None,
+            };
+            if let Ok(mut slot) = exit_code.lock() {
+                *slot = Some(code);
+            }
+        })
+        .map_err(|_| SupervisorError::Launch {
+            stage: ManagedLaunchStage::Resume,
+        })
 }

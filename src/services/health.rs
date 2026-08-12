@@ -193,13 +193,11 @@ pub fn reduce_service(evidence: &ServiceEvidence) -> ServiceState {
         && owned
     {
         return match evidence.health {
-            HealthAxis::Healthy { .. } => ServiceState::Healthy,
+            HealthAxis::Healthy { .. } | HealthAxis::Disabled => ServiceState::Healthy,
             HealthAxis::Unhealthy { .. } => ServiceState::Unhealthy,
             HealthAxis::Pending { .. } => ServiceState::Starting,
             HealthAxis::Cancelled | HealthAxis::Crashed => ServiceState::Failed,
-            HealthAxis::Disabled | HealthAxis::Unknown | HealthAxis::Stale { .. } => {
-                ServiceState::Unknown
-            }
+            HealthAxis::Unknown | HealthAxis::Stale { .. } => ServiceState::Unknown,
         };
     }
     ServiceState::Unknown

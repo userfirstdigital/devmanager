@@ -335,6 +335,7 @@ pub(crate) struct ProcessManagerInner {
     auto_restart_workers: Mutex<Vec<thread::JoinHandle<()>>>,
     terminal_authority_issuer: TerminalAuthorityIssuer,
     service_launch_issuer: Arc<crate::services::launch_authority::ServiceLaunchIssuer>,
+    configured_supervisor: Mutex<Option<crate::services::supervisor::ConfiguredServiceSupervisor>>,
     op_queue: Mutex<Weak<ProcessOpQueue>>,
     handle_lifecycle: Arc<ProcessManagerHandleLifecycle>,
     #[cfg(test)]
@@ -628,6 +629,7 @@ impl ProcessManager {
             service_launch_issuer: Arc::new(
                 crate::services::launch_authority::ServiceLaunchIssuer::new(),
             ),
+            configured_supervisor: Mutex::new(None),
             op_queue: Mutex::new(Weak::new()),
             handle_lifecycle: handle_lifecycle.clone(),
             #[cfg(test)]
@@ -819,15 +821,127 @@ impl ProcessManager {
         )
     }
 
-    /// Narrow host seam for the configured-service supervisor. Shares one
-    /// service launch issuer so prepare/register/resume stay on the Phase 3
-    /// suspended Job path owned by this process manager.
+    /// Narrow host seam: one shared issuer for the single configured-service
+    /// supervisor lifecycle owned by this process manager.
     pub(crate) fn configured_service_launch_authority(
         &self,
     ) -> crate::services::launch_authority::HostManagedLaunchAuthority {
         crate::services::launch_authority::HostManagedLaunchAuthority::with_issuer(Arc::clone(
             &self.inner.service_launch_issuer,
         ))
+    }
+
+    /// Open (or reuse) the one configured-service supervisor lifecycle.
+    /// Fresh authority/live maps are not created per call.
+    pub(crate) fn ensure_configured_service_supervisor(
+        &self,
+        sources: impl IntoIterator<Item = crate::services::binding::ConfiguredServiceSource<'_>>,
+        host_id: crate::services::model::HostId,
+        now_ms: u64,
+    ) -> Result<(), crate::services::supervisor::SupervisorError> {
+        let mut guard = self
+            .inner
+            .configured_supervisor
+            .lock()
+            .map_err(|_| crate::services::supervisor::SupervisorError::TeardownFailed)?;
+        if guard.is_some() {
+            return Ok(());
+        }
+        let bindings = crate::services::binding::bind_configured_services(sources)
+            .map_err(crate::services::supervisor::SupervisorError::from)?;
+        let supervisor = crate::services::supervisor::ConfiguredServiceSupervisor::from_bindings(
+            bindings,
+            self.configured_service_launch_authority(),
+            host_id,
+            now_ms,
+        )?;
+        *guard = Some(supervisor);
+        Ok(())
+    }
+
+    /// Typed control path against the owned configured-service supervisor.
+    pub(crate) fn configured_service_control(
+        &self,
+        action: crate::services::supervisor::SupervisorAction,
+        service_id: &crate::services::model::ServiceId,
+        fence: crate::services::model::AdmissionFence,
+        requester: crate::services::model::AdmissionRequester,
+    ) -> Result<
+        crate::services::supervisor::SupervisorOutcome,
+        crate::services::supervisor::SupervisorError,
+    > {
+        let mut guard = self
+            .inner
+            .configured_supervisor
+            .lock()
+            .map_err(|_| crate::services::supervisor::SupervisorError::TeardownFailed)?;
+        let supervisor = guard
+            .as_mut()
+            .ok_or(crate::services::supervisor::SupervisorError::TeardownFailed)?;
+        supervisor.handle(action, service_id, fence, requester)
+    }
+
+    /// Redacted projection for the owned configured-service supervisor.
+    pub(crate) fn configured_service_snapshots(
+        &self,
+    ) -> Result<
+        Vec<crate::services::health::RedactedServiceSnapshot>,
+        crate::services::supervisor::SupervisorError,
+    > {
+        let mut guard = self
+            .inner
+            .configured_supervisor
+            .lock()
+            .map_err(|_| crate::services::supervisor::SupervisorError::TeardownFailed)?;
+        let supervisor = guard
+            .as_mut()
+            .ok_or(crate::services::supervisor::SupervisorError::TeardownFailed)?;
+        supervisor.pump_io();
+        let mut snapshots = Vec::new();
+        for service_id in supervisor.service_ids() {
+            snapshots.push(supervisor.snapshot(&service_id)?);
+        }
+        Ok(snapshots)
+    }
+
+    /// Additive services panel projection from the owned supervisor.
+    pub(crate) fn configured_services_panel(
+        &self,
+    ) -> Result<crate::ui::ServicesPanelProjection, crate::services::supervisor::SupervisorError>
+    {
+        let snapshots = self.configured_service_snapshots()?;
+        let dependencies = self.configured_service_dependency_labels()?;
+        Ok(crate::ui::project_services_panel(&snapshots, &dependencies))
+    }
+
+    fn configured_service_dependency_labels(
+        &self,
+    ) -> Result<
+        Vec<(
+            crate::services::model::ServiceId,
+            Vec<crate::services::model::ServiceId>,
+        )>,
+        crate::services::supervisor::SupervisorError,
+    > {
+        let guard = self
+            .inner
+            .configured_supervisor
+            .lock()
+            .map_err(|_| crate::services::supervisor::SupervisorError::TeardownFailed)?;
+        let supervisor = guard
+            .as_ref()
+            .ok_or(crate::services::supervisor::SupervisorError::TeardownFailed)?;
+        Ok(supervisor.dependency_labels())
+    }
+
+    /// Legacy alias kept for call sites that still say "open"; reuses one lifecycle.
+    pub(crate) fn open_configured_service_supervisor(
+        &self,
+        sources: impl IntoIterator<Item = crate::services::binding::ConfiguredServiceSource<'_>>,
+        host_id: crate::services::model::HostId,
+        now_ms: u64,
+    ) -> Result<(), crate::services::supervisor::SupervisorError> {
+        self.ensure_configured_service_supervisor(sources, host_id, now_ms)
     }
 
     pub fn port_inventory(&self) -> PortInventory {

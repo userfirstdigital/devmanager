@@ -95,11 +95,16 @@ fn supervisor_from_catalog(
     definitions: Vec<ServiceDefinition>,
     authority: FakeLaunchAuthority,
 ) -> ServiceSupervisor<FakeLaunchAuthority> {
+    let workspace_roots = definitions
+        .iter()
+        .map(|definition| (definition.id.clone(), "C:/configured/workspace".to_owned()))
+        .collect();
     let catalog = ServiceCatalog::new(definitions).expect("catalog");
-    ServiceSupervisor::from_catalog(
+    ServiceSupervisor::from_catalog_with_workspace_roots(
         catalog,
         BTreeMap::new(),
         BTreeMap::new(),
+        workspace_roots,
         authority,
         host(),
         1_000,

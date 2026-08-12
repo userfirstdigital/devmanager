@@ -104,13 +104,11 @@ pub fn project_services_panel(
 
 fn project_row(snapshot: &RedactedServiceSnapshot, dependencies: &[ServiceId]) -> ServicePanelRow {
     let controllable = snapshot.state.is_controllable();
-    let running = matches!(
+    let active = matches!(
         snapshot.state,
-        ServiceState::Starting
-            | ServiceState::Healthy
-            | ServiceState::Unhealthy
-            | ServiceState::Stopping
+        ServiceState::Starting | ServiceState::Healthy | ServiceState::Unhealthy
     );
+    let stopping = matches!(snapshot.state, ServiceState::Stopping);
     let external = matches!(snapshot.state, ServiceState::External);
     let (ownership_summary, ownership_detail) = match snapshot.state {
         ServiceState::External => ("External listener", None),
@@ -149,10 +147,10 @@ fn project_row(snapshot: &RedactedServiceSnapshot, dependencies: &[ServiceId]) -
     let actions = vec![
         affordance(
             ServicePanelAction::Start,
-            controllable && !running && !external,
+            controllable && !active && !stopping && !external,
             if external {
                 Some("External listeners cannot be started from DevManager")
-            } else if running {
+            } else if active || stopping {
                 Some("Service is already running")
             } else if !controllable {
                 Some("Service state is not controllable")
@@ -162,10 +160,12 @@ fn project_row(snapshot: &RedactedServiceSnapshot, dependencies: &[ServiceId]) -
         ),
         affordance(
             ServicePanelAction::Stop,
-            controllable && running,
+            controllable && active,
             if external {
                 Some("External listeners cannot be stopped from DevManager")
-            } else if !running {
+            } else if stopping {
+                Some("Service is already stopping")
+            } else if !active {
                 Some("Service is not running")
             } else if !controllable {
                 Some("Service state is not controllable")
@@ -175,10 +175,12 @@ fn project_row(snapshot: &RedactedServiceSnapshot, dependencies: &[ServiceId]) -
         ),
         affordance(
             ServicePanelAction::Restart,
-            controllable && running,
+            controllable && active,
             if external {
                 Some("External listeners cannot be restarted from DevManager")
-            } else if !running {
+            } else if stopping {
+                Some("Service is already stopping")
+            } else if !active {
                 Some("Service is not running")
             } else {
                 None
@@ -186,16 +188,12 @@ fn project_row(snapshot: &RedactedServiceSnapshot, dependencies: &[ServiceId]) -
         ),
         affordance(ServicePanelAction::Logs, true, None),
         affordance(ServicePanelAction::Health, true, None),
+        // OpenTerminal has no supervisor/host action yet; keep it visible but
+        // disabled with a truthful reason rather than advertising a dead path.
         affordance(
             ServicePanelAction::OpenTerminal,
-            running && !external,
-            if external {
-                Some("External listeners have no managed terminal")
-            } else if !running {
-                Some("Start the service to open its terminal")
-            } else {
-                None
-            },
+            false,
+            Some("Service terminal attach is not available; use Logs"),
         ),
     ];
     ServicePanelRow {

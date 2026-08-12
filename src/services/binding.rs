@@ -91,6 +91,9 @@ pub struct ConfiguredServiceBinding {
     pub project_id: String,
     pub folder_id: String,
     pub command_id: String,
+    /// Absolute project/workspace root used to resolve relative command cwd at
+    /// launch. Never the DevManager process working directory.
+    pub workspace_root: String,
     pub definition: ServiceDefinition,
     pub environment: EnvironmentOverlay,
 }
@@ -100,6 +103,7 @@ pub enum BindingError {
     TooManyServices { limit: usize },
     DuplicateCommand { command_id: String },
     ArchivedCommand,
+    InvalidWorkspaceRoot,
     Validation(ValidationError),
 }
 
@@ -111,6 +115,9 @@ impl fmt::Display for BindingError {
             }
             Self::DuplicateCommand { .. } => formatter.write_str("duplicate configured command id"),
             Self::ArchivedCommand => formatter.write_str("archived configured command"),
+            Self::InvalidWorkspaceRoot => {
+                formatter.write_str("configured workspace root must be absolute")
+            }
             Self::Validation(error) => error.fmt(formatter),
         }
     }
@@ -210,9 +217,20 @@ pub fn bind_configured_command(
         project_id: source.project.id.clone(),
         folder_id: source.folder.id.clone(),
         command_id: source.command.id.clone(),
+        workspace_root: validate_absolute_workspace_root(&source.project.root_path)?,
         definition,
         environment: EnvironmentOverlay { values: overlay },
     })
+}
+
+/// Replace the binding workspace root with a task-specific absolute root.
+/// Relative or empty roots fail closed; process cwd is never consulted.
+pub fn with_task_workspace_root(
+    mut binding: ConfiguredServiceBinding,
+    absolute_root: impl AsRef<str>,
+) -> Result<ConfiguredServiceBinding, BindingError> {
+    binding.workspace_root = validate_absolute_workspace_root(absolute_root.as_ref())?;
+    Ok(binding)
 }
 
 pub fn bind_configured_services(
@@ -240,6 +258,14 @@ pub fn bind_configured_services(
     Ok(bindings)
 }
 
+fn validate_absolute_workspace_root(root: &str) -> Result<String, BindingError> {
+    let root = root.trim();
+    if root.is_empty() || !is_absolute_path(root) {
+        return Err(BindingError::InvalidWorkspaceRoot);
+    }
+    Ok(root.to_owned())
+}
+
 fn derive_workspace_cwd(project: &Project, folder: &ProjectFolder) -> Option<String> {
     let folder_path = folder.folder_path.trim();
     if folder_path.is_empty() {
@@ -256,10 +282,14 @@ fn derive_workspace_cwd(project: &Project, folder: &ProjectFolder) -> Option<Str
 }
 
 fn is_absolute_path(path: &str) -> bool {
-    Path::new(path).is_absolute()
-        || path.starts_with('/')
-        || path.starts_with('\\')
-        || path.chars().nth(1) == Some(':')
+    if Path::new(path).is_absolute() || path.starts_with('/') || path.starts_with('\\') {
+        return true;
+    }
+    // A drive-relative path such as `C:folder` is not rooted.  It resolves
+    // against the caller's current directory on that drive and would defeat
+    // the configured-workspace containment boundary.
+    let bytes = path.as_bytes();
+    bytes.len() >= 3 && bytes[1] == b':' && (bytes[2] == b'/' || bytes[2] == b'\\')
 }
 
 fn strip_root_prefix(path: &str, root: &str) -> Option<String> {
