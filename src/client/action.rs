@@ -29,6 +29,7 @@ use crate::prompts::projection::{
 };
 use crate::prompts::ui::composer::{ComposerInsertionMode, PutPromptVersionInComposer};
 use crate::protocol::{Capability, CapabilitySet};
+use crate::services::model::ServiceId;
 use crate::workspace::{WorkspaceError, WorkspaceRequest};
 
 /// Stable id for listing the shared action catalog.
@@ -99,6 +100,17 @@ pub const ACTION_PROMPT_CHAIN_PAGE: &str = "prompt.library.chain_page";
 pub const ACTION_PROMPT_HISTORY_PAGE: &str = "prompt.library.history_page";
 /// Client-local composer insertion. Not a host catalog action and never sends.
 pub const ACTION_PROMPT_PUT_IN_COMPOSER: &str = "prompt.library.put_in_composer";
+/// Reserved control ids for the configured-service supervisor. They are not
+/// advertised in the shared catalog until a host dispatch path exists.
+pub const ACTION_SERVICE_START: &str = "service.start";
+/// Reserved stop id; not advertised until host dispatch is wired.
+pub const ACTION_SERVICE_STOP: &str = "service.stop";
+/// Reserved restart id; not advertised until host dispatch is wired.
+pub const ACTION_SERVICE_RESTART: &str = "service.restart";
+/// Reserved logs id; not advertised until host dispatch is wired.
+pub const ACTION_SERVICE_LOGS: &str = "service.logs";
+/// Reserved health id; not advertised until host dispatch is wired.
+pub const ACTION_SERVICE_HEALTH: &str = "service.health";
 
 /// Where an action applies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,6 +139,7 @@ pub enum ActionArgumentSchema {
     PromptVersionPageV1,
     PromptDiffV1,
     PromptChainPageV1,
+    ServiceControlV1,
 }
 
 /// Static metadata for one catalog action.
@@ -355,6 +368,18 @@ impl ActionRequest {
     pub fn descriptor(&self) -> &'static ActionDescriptor {
         descriptor(self.id()).expect("every ActionRequest must have a catalog descriptor")
     }
+}
+
+/// Caller-owned configured-service action arguments. The host supervisor
+/// admits these against the exact generation fence; they are not a durable
+/// journal command.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceControlArguments {
+    pub service_id: ServiceId,
+    pub resource_generation: u64,
+    pub connection_epoch: u64,
+    pub action_epoch: u64,
 }
 
 /// Return the closed catalog for this slice.
@@ -753,17 +778,23 @@ mod tests {
         ACTION_PROVIDER_ANSWER_QUESTION, ACTION_PROVIDER_NEW_CONVERSATION,
         ACTION_PROVIDER_QUEUE_FOLLOW_UP, ACTION_PROVIDER_RESOLVE_APPROVAL,
         ACTION_PROVIDER_SEND_NOW, ACTION_PROVIDER_STEER_CURRENT_TURN, ACTION_PROVIDER_STOP_TURN,
+        ACTION_SERVICE_HEALTH, ACTION_SERVICE_LOGS, ACTION_SERVICE_RESTART, ACTION_SERVICE_START,
+        ACTION_SERVICE_STOP,
         ACTION_TASK_CREATE, ACTION_TASK_CREATE_V2, ACTION_TASK_LIST, ACTION_TASK_RENAME,
         ACTION_TASK_SHOW,
     };
-    use crate::domain::command::Command;
-    use crate::domain::query::Query;
-    use crate::domain::task::{
-        ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity,
-        WorkspaceRef,
+    use crate::{
+        domain::{
+            command::Command,
+            query::Query,
+            task::{
+                ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity,
+                WorkspaceRef,
+            },
+            ClientId, CommandId, EnvironmentId, ProjectId, RequestId, TaskId,
+        },
+        protocol::Capability,
     };
-    use crate::domain::{ClientId, CommandId, EnvironmentId, ProjectId, RequestId, TaskId};
-    use crate::protocol::Capability;
 
     #[test]
     fn catalog_exposes_unique_read_and_create_actions() {
@@ -782,6 +813,11 @@ mod tests {
         assert!(ids.contains(&ACTION_PROVIDER_STOP_TURN));
         assert!(!ids.contains(&ACTION_PROVIDER_NEW_CONVERSATION));
         assert_eq!(ids.len(), 16);
+        assert!(!ids.contains(&ACTION_SERVICE_START));
+        assert!(!ids.contains(&ACTION_SERVICE_STOP));
+        assert!(!ids.contains(&ACTION_SERVICE_RESTART));
+        assert!(!ids.contains(&ACTION_SERVICE_LOGS));
+        assert!(!ids.contains(&ACTION_SERVICE_HEALTH));
         require_unique_ids().expect("ids must be unique");
         for action in catalog() {
             let (expected_scope, expected_risk, expected_schema, expected_capability) =

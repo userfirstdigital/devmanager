@@ -6,39 +6,41 @@
 
 #![cfg(windows)]
 
-use std::fs;
-use std::io::Read;
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command as ProcessCommand, ExitStatus, Output, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::{
+    fs,
+    io::Read,
+    path::{Path, PathBuf},
+    process::{Child, Command as ProcessCommand, ExitStatus, Output, Stdio},
+    thread,
+    time::{Duration, Instant},
+};
 
 use serde_json::Value;
 use tempfile::TempDir;
 use uuid::Uuid;
 
-use devmanager::client::action::{
+use devmanager::{
+    client::action::{
     self, ActionRisk, ActionScope, ACTION_HOST_ACTIONS, ACTION_HOST_STATUS,
     ACTION_PROVIDER_ANSWER_QUESTION, ACTION_PROVIDER_NEW_CONVERSATION,
     ACTION_PROVIDER_QUEUE_FOLLOW_UP, ACTION_PROVIDER_RESOLVE_APPROVAL, ACTION_PROVIDER_SEND_NOW,
     ACTION_PROVIDER_STEER_CURRENT_TURN, ACTION_PROVIDER_STOP_TURN, ACTION_TASK_CREATE,
     ACTION_TASK_CREATE_V2, ACTION_TASK_LIST, ACTION_TASK_RENAME, ACTION_TASK_SHOW,
+    },
+    config::paths::{resolve_app_paths, AppProfile, BuildKind, ResolvedAppPaths},
+    domain::{
+        command::{Command, CommandEnvelope, CommandReceipt, CreateTaskRequestIntent},
+        id::{CommandId, EnvironmentId, ProjectId, TaskId},
+        task::{ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity},
+        ClientId,
+    },
+    host::{HostIdentity, HostRequestExecutor},
+    protocol::{
+        Capability, CapabilitySet, ClientRequest, FrameLimits, NegotiatedParameters,
+        ProtocolVersion, ServerMessage,
+    },
+    workspace::WorkspaceRequest,
 };
-use devmanager::config::paths::{resolve_app_paths, AppProfile, BuildKind, ResolvedAppPaths};
-use devmanager::domain::command::{
-    Command, CommandEnvelope, CommandReceipt, CreateTaskRequestIntent,
-};
-use devmanager::domain::id::{CommandId, EnvironmentId, ProjectId, TaskId};
-use devmanager::domain::task::{
-    ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity,
-};
-use devmanager::domain::ClientId;
-use devmanager::host::{HostIdentity, HostRequestExecutor};
-use devmanager::protocol::{
-    Capability, CapabilitySet, ClientRequest, FrameLimits, NegotiatedParameters, ProtocolVersion,
-    ServerMessage,
-};
-use devmanager::workspace::WorkspaceRequest;
 
 const READY_TIMEOUT: Duration = Duration::from_secs(15);
 const CTL_TIMEOUT: Duration = Duration::from_secs(10);

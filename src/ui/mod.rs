@@ -56,3 +56,7 @@ pub use shell::{
     PromptLibraryViewport, SyncOrgHooks,
 };
 pub use task_cockpit::composer;
+pub use task_cockpit::{
+    project_services_panel, ServiceActionAffordance, ServicePanelAction, ServicePanelRow,
+    ServicePanelTone, ServicesPanelProjection,
+};

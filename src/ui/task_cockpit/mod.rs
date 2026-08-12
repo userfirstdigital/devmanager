@@ -58,3 +58,10 @@ pub use browser_panel::{render_task_browser_dock, TaskBrowserDockModel};
 pub use context_dock::{
     BrowserContextDock, BrowserContextDockError, ContextDockFocus, ContextDockLayout,
 };
+
+pub mod services_panel;
+
+pub use services_panel::{
+    project_services_panel, ServiceActionAffordance, ServicePanelAction, ServicePanelRow,
+    ServicePanelTone, ServicesPanelProjection,
+};

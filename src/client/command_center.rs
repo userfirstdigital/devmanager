@@ -44,11 +44,12 @@
 
 use std::fmt;
 
-use crate::client::action::ActionDescriptor;
-use crate::client::model::ClientModel;
-use crate::process::registry::MAX_PROCESS_DISPLAY_LABEL_BYTES;
-use crate::protocol::ClientRequest;
-use crate::services::model::{ServiceId, MAX_SERVICE_COUNT};
+use crate::{
+    client::{action::ActionDescriptor, model::ClientModel},
+    process::registry::MAX_PROCESS_DISPLAY_LABEL_BYTES,
+    protocol::ClientRequest,
+    services::model::{ServiceId, MAX_SERVICE_COUNT},
+};
 
 /// Deterministic process-row cap for one Command Center projection.
 pub const MAX_COMMAND_CENTER_PROCESS_ROWS: usize = MAX_SERVICE_COUNT;
@@ -314,7 +315,8 @@ pub fn project_command_center(input: &CommandCenterInput<'_>) -> CommandCenterVi
 }
 
 /// Canonical action output is `ClientRequest` (Phase 2.4). This view does not
-/// mint envelopes; git/service ActionIds do not exist on the catalog yet.
+/// mint envelopes. Reserved service ActionIds are not catalogued until a host
+/// factory exists; unknown ids remain HostFactMissing.
 pub fn request_action(
     actions: Option<&[ActionDescriptor]>,
     action_id: &str,

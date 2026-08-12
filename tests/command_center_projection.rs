@@ -3,19 +3,22 @@
 //! Consumes ClientModel + ActionCatalog only. ServiceCatalog is not live health.
 //! Does not probe Git, accept a caller path, or take ServiceEvidence.
 
-use std::cell::Cell;
-use std::rc::Rc;
+use std::{cell::Cell, rc::Rc};
 
-use devmanager::client::action::{
-    catalog, ACTION_HOST_ACTIONS, ACTION_HOST_STATUS, ACTION_TASK_CREATE, ACTION_TASK_LIST,
-    ACTION_TASK_RENAME, ACTION_TASK_SHOW,
+use devmanager::{
+    client::{
+        action::{
+            catalog, ACTION_HOST_ACTIONS, ACTION_HOST_STATUS, ACTION_TASK_CREATE, ACTION_TASK_LIST,
+            ACTION_TASK_RENAME, ACTION_TASK_SHOW,
+        },
+        command_center::{
+            collect_unique, project_command_center, request_action, CanonicalProcessLabel,
+            CommandCenterBoundError, CommandCenterInput, HoldDependency, ProcessFactError,
+            UnavailableReason, MAX_COMMAND_CENTER_LABEL_BYTES, MAX_COMMAND_CENTER_SERVICE_ROWS,
+        },
+    },
+    services::model::{ServiceCatalog, ServiceId},
 };
-use devmanager::client::command_center::{
-    collect_unique, project_command_center, request_action, CanonicalProcessLabel,
-    CommandCenterBoundError, CommandCenterInput, HoldDependency, ProcessFactError,
-    UnavailableReason, MAX_COMMAND_CENTER_LABEL_BYTES, MAX_COMMAND_CENTER_SERVICE_ROWS,
-};
-use devmanager::services::model::{ServiceCatalog, ServiceId};
 
 fn valid_catalog() -> ServiceCatalog {
     ServiceCatalog::decode_json(include_bytes!("fixtures/services/valid.json"))

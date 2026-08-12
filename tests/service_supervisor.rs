@@ -661,3 +661,669 @@ fn catalog_decode_preflights_malicious_field_names_arrays_and_depth() {
         + &"]".repeat(MAX_SERVICE_CATALOG_JSON_DEPTH + 1);
     assert!(ServiceCatalog::decode_json(nested.as_bytes()).is_err());
 }
+
+#[test]
+fn public_supervisor_api_exposes_production_authority_without_private_errors() {
+    use devmanager::services::{
+        HostManagedLaunchAuthority, ManagedLaunchAuthority, ManagedLaunchStage, SupervisorError,
+        SupervisorRefusal,
+    };
+    use devmanager::ui::{project_services_panel, ServicePanelTone};
+
+    let authority = HostManagedLaunchAuthority::new();
+    assert_eq!(ManagedLaunchAuthority::live_count(&authority), 0);
+    assert_eq!(ManagedLaunchAuthority::residue_count(&authority), 0);
+    let _ = ManagedLaunchStage::Prepare;
+    let refusal = SupervisorError::Refused(SupervisorRefusal::External);
+    assert!(!format!("{refusal}").contains("AdmissionRejection"));
+    let panel = project_services_panel(&[], &[]);
+    assert!(panel.rows.is_empty());
+    assert_eq!(
+        ServicePanelTone::from(devmanager::services::StatusTone::Green),
+        ServicePanelTone::Green
+    );
+}
+
+#[test]
+fn disabled_health_finishes_start_as_healthy_and_allows_stop_restart() {
+    use devmanager::services::model::{
+        AdmissionFence, AdmissionRequester, CommandSpec, HealthSpec, HostId, ServiceCatalog,
+        ServiceDefinition, ServiceScope, StartupPolicy, StopPolicy,
+    };
+    use devmanager::services::{FakeLaunchAuthority, ServiceSupervisor, SupervisorAction};
+    use std::collections::BTreeMap;
+
+    let definition = ServiceDefinition {
+        id: id("worker"),
+        scope: ServiceScope::Host,
+        command: CommandSpec::new("node")
+            .unwrap()
+            .with_arg("worker.js")
+            .unwrap(),
+        dependencies: Vec::new(),
+        health: HealthSpec::None,
+        startup: StartupPolicy::manual(),
+        stop: StopPolicy::default(),
+        expected_port: None,
+    };
+    let catalog = ServiceCatalog::new(vec![definition]).unwrap();
+    let authority = FakeLaunchAuthority::new();
+    let inspect = authority.clone();
+    let mut roots = BTreeMap::new();
+    roots.insert(id("worker"), "C:/configured/workspace".to_owned());
+    let mut supervisor = ServiceSupervisor::from_catalog_with_workspace_roots(
+        catalog,
+        BTreeMap::new(),
+        BTreeMap::new(),
+        roots,
+        authority,
+        HostId::new(1),
+        1_000,
+    )
+    .unwrap();
+    supervisor
+        .handle(
+            SupervisorAction::Start,
+            &id("worker"),
+            AdmissionFence::new(1, 1, 1),
+            AdmissionRequester::Host(devmanager::services::model::HostAuthority::new(
+                HostId::new(1),
+            )),
+        )
+        .expect("disabled-health start");
+    assert_eq!(supervisor.state(&id("worker")), ServiceState::Healthy);
+    let fence = supervisor.fence(&id("worker")).unwrap();
+    supervisor
+        .handle(
+            SupervisorAction::Stop,
+            &id("worker"),
+            fence,
+            AdmissionRequester::Host(devmanager::services::model::HostAuthority::new(
+                HostId::new(1),
+            )),
+        )
+        .expect("disabled-health stop");
+    assert_eq!(supervisor.state(&id("worker")), ServiceState::Stopped);
+    assert_eq!(inspect.torn_down(), 1);
+}
+
+#[test]
+fn stop_tears_down_live_generation_before_advancing_projected_fence() {
+    use devmanager::services::model::{
+        AdmissionFence, AdmissionRequester, CommandSpec, ExpectedPort, HealthPolicy, HealthSpec,
+        HostAuthority, HostId, PortProtocol, ServiceCatalog, ServiceDefinition, ServiceScope,
+        StartupPolicy, StopPolicy,
+    };
+    use devmanager::services::{FakeLaunchAuthority, ServiceSupervisor, SupervisorAction};
+    use std::collections::BTreeMap;
+
+    let policy = HealthPolicy {
+        startup_deadline_ms: 5_000,
+        probe_interval_ms: 1_000,
+        max_probe_interval_ms: 4_000,
+        backoff_multiplier: 2,
+        success_threshold: 1,
+        failure_threshold: 2,
+        stale_after_ms: 2_500,
+    };
+    let definition = ServiceDefinition {
+        id: id("api"),
+        scope: ServiceScope::Host,
+        command: CommandSpec::new("node")
+            .unwrap()
+            .with_arg("server.js")
+            .unwrap(),
+        dependencies: Vec::new(),
+        health: HealthSpec::Tcp { port: 8080, policy },
+        startup: StartupPolicy::manual(),
+        stop: StopPolicy::default(),
+        expected_port: Some(ExpectedPort {
+            protocol: PortProtocol::Tcp,
+            port: 8080,
+        }),
+    };
+    let catalog = ServiceCatalog::new(vec![definition]).unwrap();
+    let authority = FakeLaunchAuthority::new();
+    let inspect = authority.clone();
+    let mut roots = BTreeMap::new();
+    roots.insert(id("api"), "C:/configured/workspace".to_owned());
+    let mut supervisor = ServiceSupervisor::from_catalog_with_workspace_roots(
+        catalog,
+        BTreeMap::new(),
+        BTreeMap::new(),
+        roots,
+        authority,
+        HostId::new(1),
+        1_000,
+    )
+    .unwrap();
+    let host = AdmissionRequester::Host(HostAuthority::new(HostId::new(1)));
+    supervisor
+        .handle(
+            SupervisorAction::Start,
+            &id("api"),
+            AdmissionFence::new(1, 1, 1),
+            host.clone(),
+        )
+        .expect("start");
+    let live_fence = supervisor.fence(&id("api")).unwrap();
+    assert_eq!(live_fence.resource_generation(), 2);
+    supervisor
+        .apply_probe(&id("api"), 2, ProbeOutcome::Success)
+        .unwrap();
+    assert_eq!(supervisor.state(&id("api")), ServiceState::Healthy);
+    supervisor
+        .handle(SupervisorAction::Stop, &id("api"), live_fence, host)
+        .expect("stop must tear down using live generation");
+    assert_eq!(inspect.torn_down(), 1);
+    assert_eq!(supervisor.live_count(), 0);
+    assert_eq!(
+        supervisor.fence(&id("api")).unwrap().resource_generation(),
+        3
+    );
+    assert_eq!(supervisor.state(&id("api")), ServiceState::Stopped);
+}
+
+#[test]
+fn resume_failure_settles_without_orphan_and_projects_failed_fence() {
+    use devmanager::services::model::{
+        AdmissionFence, AdmissionRequester, CommandSpec, HealthSpec, HostAuthority, HostId,
+        ServiceCatalog, ServiceDefinition, ServiceScope, StartupPolicy, StopPolicy,
+    };
+    use devmanager::services::{
+        FakeFailStage, FakeLaunchAuthority, ServiceSupervisor, SupervisorAction, SupervisorError,
+    };
+    use std::collections::BTreeMap;
+
+    let definition = ServiceDefinition {
+        id: id("api"),
+        scope: ServiceScope::Host,
+        command: CommandSpec::new("node").unwrap(),
+        dependencies: Vec::new(),
+        health: HealthSpec::None,
+        startup: StartupPolicy::manual(),
+        stop: StopPolicy::default(),
+        expected_port: None,
+    };
+    let catalog = ServiceCatalog::new(vec![definition]).unwrap();
+    let authority = FakeLaunchAuthority::new();
+    let inspect = authority.clone();
+    inspect.fail_at(FakeFailStage::Resume);
+    let mut roots = BTreeMap::new();
+    roots.insert(id("api"), "C:/configured/workspace".to_owned());
+    let mut supervisor = ServiceSupervisor::from_catalog_with_workspace_roots(
+        catalog,
+        BTreeMap::new(),
+        BTreeMap::new(),
+        roots,
+        authority,
+        HostId::new(1),
+        1_000,
+    )
+    .unwrap();
+    let err = supervisor
+        .handle(
+            SupervisorAction::Start,
+            &id("api"),
+            AdmissionFence::new(1, 1, 1),
+            AdmissionRequester::Host(HostAuthority::new(HostId::new(1))),
+        )
+        .expect_err("resume failure");
+    assert!(matches!(
+        err,
+        SupervisorError::Launch {
+            stage: devmanager::services::ManagedLaunchStage::Resume
+        }
+    ));
+    assert!(inspect.aborted() >= 1);
+    assert_eq!(supervisor.live_count(), 0);
+    assert_eq!(supervisor.residue_count(), 0);
+    assert_eq!(supervisor.state(&id("api")), ServiceState::Failed);
+    assert_eq!(
+        supervisor.fence(&id("api")).unwrap().resource_generation(),
+        2
+    );
+}
+
+#[test]
+fn unknown_and_probe_error_ports_fail_closed_and_port_busy_projects_fence() {
+    use devmanager::process::ports::PortAuthority;
+    use devmanager::services::model::{
+        AdmissionFence, AdmissionRequester, CommandSpec, ExpectedPort, HealthPolicy, HealthSpec,
+        HostAuthority, HostId, PortProtocol, ServiceCatalog, ServiceDefinition, ServiceScope,
+        StartupPolicy, StopPolicy,
+    };
+    use devmanager::services::{
+        FakeLaunchAuthority, PortClaimView, ServiceSupervisor, SupervisorAction, SupervisorError,
+        SupervisorRefusal,
+    };
+    use std::collections::BTreeMap;
+
+    let policy = HealthPolicy::default();
+    let definition = ServiceDefinition {
+        id: id("api"),
+        scope: ServiceScope::Host,
+        command: CommandSpec::new("node").unwrap(),
+        dependencies: Vec::new(),
+        health: HealthSpec::Tcp { port: 8080, policy },
+        startup: StartupPolicy::manual(),
+        stop: StopPolicy::default(),
+        expected_port: Some(ExpectedPort {
+            protocol: PortProtocol::Tcp,
+            port: 8080,
+        }),
+    };
+    let catalog = ServiceCatalog::new(vec![definition]).unwrap();
+    let mut roots = BTreeMap::new();
+    roots.insert(id("api"), "C:/configured/workspace".to_owned());
+    let mut supervisor = ServiceSupervisor::from_catalog_with_workspace_roots(
+        catalog,
+        BTreeMap::new(),
+        BTreeMap::new(),
+        roots,
+        FakeLaunchAuthority::new(),
+        HostId::new(1),
+        1_000,
+    )
+    .unwrap();
+    supervisor.observe_port(8080, PortAuthority::Unknown, None);
+    assert_eq!(
+        supervisor.port_claim(8080),
+        Some(PortClaimView::Indeterminate)
+    );
+    assert_eq!(supervisor.state(&id("api")), ServiceState::Unknown);
+    let fence_before = supervisor.fence(&id("api")).unwrap();
+    let err = supervisor
+        .handle(
+            SupervisorAction::Start,
+            &id("api"),
+            fence_before,
+            AdmissionRequester::Host(HostAuthority::new(HostId::new(1))),
+        )
+        .expect_err("indeterminate port fails closed");
+    assert!(matches!(
+        err,
+        SupervisorError::Refused(SupervisorRefusal::EvidenceUnknown)
+    ));
+    assert_eq!(supervisor.fence(&id("api")).unwrap(), fence_before);
+
+    supervisor.observe_port(8080, PortAuthority::Free, None);
+    assert_eq!(supervisor.state(&id("api")), ServiceState::Stopped);
+    supervisor.observe_port(8080, PortAuthority::ProbeError, None);
+    assert_eq!(
+        supervisor.port_claim(8080),
+        Some(PortClaimView::Indeterminate)
+    );
+}
+
+#[test]
+fn launch_cwd_resolves_from_configured_workspace_root_not_process_cwd() {
+    use devmanager::config::{Nullable, Project, ProjectFolder, RunCommand};
+    use devmanager::services::binding::{
+        bind_configured_command, ConfiguredServiceOwner, ConfiguredServiceSource,
+    };
+    use devmanager::services::model::{AdmissionFence, AdmissionRequester, HostAuthority, HostId};
+    use devmanager::services::{FakeLaunchAuthority, ServiceSupervisor, SupervisorAction};
+    use std::collections::BTreeMap;
+
+    let command = RunCommand {
+        id: "api".to_owned(),
+        label: "API".to_owned(),
+        command: "node".to_owned(),
+        args: vec!["server.js".to_owned()],
+        env: Nullable::Absent,
+        port: Nullable::Absent,
+        auto_restart: Nullable::Value(false),
+        ..RunCommand::default()
+    };
+    let folder = ProjectFolder {
+        id: "web".to_owned(),
+        name: "web".to_owned(),
+        folder_path: "apps/api".to_owned(),
+        commands: vec![command.clone()],
+        ..ProjectFolder::default()
+    };
+    let project = Project {
+        id: "proj".to_owned(),
+        name: "proj".to_owned(),
+        root_path: "C:/configured/workspace".to_owned(),
+        folders: vec![folder.clone()],
+        ..Project::default()
+    };
+    let binding = bind_configured_command(ConfiguredServiceSource {
+        project: &project,
+        folder: &folder,
+        command: &command,
+        owner: ConfiguredServiceOwner::Project {
+            project_id: project.id.clone(),
+        },
+        folder_env_file: None,
+    })
+    .expect("binding");
+    assert_eq!(binding.workspace_root, "C:/configured/workspace");
+    assert_eq!(
+        binding.definition.command.cwd().map(|cwd| cwd.as_str()),
+        Some("apps/api")
+    );
+    let authority = FakeLaunchAuthority::new();
+    let inspect = authority.clone();
+    let mut supervisor =
+        ServiceSupervisor::from_bindings(vec![binding], authority, HostId::new(1), 1_000).unwrap();
+    supervisor
+        .handle(
+            SupervisorAction::Start,
+            &id("api"),
+            AdmissionFence::new(1, 1, 1),
+            AdmissionRequester::Host(HostAuthority::new(HostId::new(1))),
+        )
+        .expect("start");
+    let cwd = inspect.last_cwd().expect("launch cwd");
+    assert!(
+        cwd.contains("configured") && cwd.contains("apps"),
+        "cwd must resolve under workspace root, got {cwd}"
+    );
+    assert!(
+        !cwd.starts_with("apps/api") || cwd.starts_with("C:"),
+        "must not use bare relative process cwd"
+    );
+}
+
+#[test]
+fn services_panel_disables_open_terminal_with_truthful_reason() {
+    use devmanager::services::health::{
+        EvidenceProvenance, EvidenceSource, HealthAxis, LifecycleAxis, OwnershipAxis, PortAxis,
+        ProcessAxis, RedactedServiceSnapshot, ServiceEvidence,
+    };
+    use devmanager::services::model::ServiceScope;
+    use devmanager::ui::{project_services_panel, ServicePanelAction};
+
+    let evidence = ServiceEvidence {
+        lifecycle: LifecycleAxis::Running,
+        process: ProcessAxis::Running { generation: 2 },
+        health: HealthAxis::Disabled,
+        port: PortAxis::Free,
+        ownership: OwnershipAxis::Host,
+        generation: 2,
+        epoch: 2,
+        observed_at_ms: 1_000,
+        provenance: EvidenceProvenance {
+            source: EvidenceSource::ProcessRegistry,
+            observed_at_ms: 1_000,
+            generation: Some(2),
+            epoch: Some(2),
+        },
+    };
+    let snapshot = RedactedServiceSnapshot::from_evidence(id("api"), ServiceScope::Host, &evidence);
+    assert_eq!(snapshot.state, ServiceState::Healthy);
+    let panel = project_services_panel(&[snapshot], &[]);
+    let open = panel.rows[0]
+        .actions
+        .iter()
+        .find(|action| action.action == ServicePanelAction::OpenTerminal)
+        .expect("OpenTerminal affordance");
+    assert!(!open.enabled);
+    assert_eq!(
+        open.disabled_reason,
+        Some("Service terminal attach is not available; use Logs")
+    );
+    assert!(ServicePanelAction::OpenTerminal
+        .as_supervisor_action()
+        .is_none());
+}
+
+#[test]
+fn bare_program_resolution_pins_canonical_path_from_path_authority() {
+    use devmanager::services::resolve_configured_service_program_with;
+    use std::ffi::OsString;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("devmanager-service-path-{stamp}"));
+    fs::create_dir_all(&dir).unwrap();
+    let exe_name = if cfg!(windows) { "node.EXE" } else { "node" };
+    let exe_path = dir.join(exe_name);
+    fs::write(&exe_path, b"fake").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&exe_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&exe_path, perms).unwrap();
+    }
+    let path_var = OsString::from(dir.as_os_str());
+    let resolved = resolve_configured_service_program_with(
+        "node",
+        Some(path_var.as_os_str()),
+        Some(".COM;.EXE;.BAT;.CMD"),
+    )
+    .expect("bare node resolves through PATH");
+    assert!(
+        std::path::Path::new(&resolved).is_absolute(),
+        "resolved program must be absolute: {resolved}"
+    );
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn empty_or_relative_workspace_root_fails_closed_at_bind_and_task_override() {
+    use devmanager::config::{Nullable, Project, ProjectFolder, RunCommand};
+    use devmanager::services::binding::{
+        bind_configured_command, with_task_workspace_root, BindingError, ConfiguredServiceOwner,
+        ConfiguredServiceSource,
+    };
+
+    let command = RunCommand {
+        id: "api".to_owned(),
+        label: "API".to_owned(),
+        command: "node".to_owned(),
+        args: vec![],
+        env: Nullable::Absent,
+        port: Nullable::Absent,
+        auto_restart: Nullable::Value(false),
+        ..RunCommand::default()
+    };
+    let folder = ProjectFolder {
+        id: "web".to_owned(),
+        name: "web".to_owned(),
+        folder_path: "apps/api".to_owned(),
+        commands: vec![command.clone()],
+        ..ProjectFolder::default()
+    };
+    let mut project = Project {
+        id: "proj".to_owned(),
+        name: "proj".to_owned(),
+        root_path: "relative/root".to_owned(),
+        folders: vec![folder.clone()],
+        ..Project::default()
+    };
+    let err = bind_configured_command(ConfiguredServiceSource {
+        project: &project,
+        folder: &folder,
+        command: &command,
+        owner: ConfiguredServiceOwner::Project {
+            project_id: project.id.clone(),
+        },
+        folder_env_file: None,
+    })
+    .expect_err("relative root");
+    assert!(matches!(err, BindingError::InvalidWorkspaceRoot));
+
+    project.root_path = String::new();
+    assert!(matches!(
+        bind_configured_command(ConfiguredServiceSource {
+            project: &project,
+            folder: &folder,
+            command: &command,
+            owner: ConfiguredServiceOwner::Project {
+                project_id: project.id.clone(),
+            },
+            folder_env_file: None,
+        }),
+        Err(BindingError::InvalidWorkspaceRoot)
+    ));
+
+    project.root_path = "C:/configured/workspace".to_owned();
+    let binding = bind_configured_command(ConfiguredServiceSource {
+        project: &project,
+        folder: &folder,
+        command: &command,
+        owner: ConfiguredServiceOwner::Task { task_id: task_a() },
+        folder_env_file: None,
+    })
+    .expect("absolute project root");
+    let overridden =
+        with_task_workspace_root(binding, "C:/task/workspace").expect("absolute task root");
+    assert_eq!(overridden.workspace_root, "C:/task/workspace");
+    assert!(matches!(
+        with_task_workspace_root(overridden, "relative/task"),
+        Err(BindingError::InvalidWorkspaceRoot)
+    ));
+}
+
+#[test]
+fn pump_io_connects_reader_output_and_waiter_exit_to_logs_and_failed_state() {
+    use devmanager::services::model::{
+        AdmissionFence, AdmissionRequester, CommandSpec, HealthSpec, HostAuthority, HostId,
+        ServiceCatalog, ServiceDefinition, ServiceScope, StartupPolicy, StopPolicy,
+    };
+    use devmanager::services::{FakeLaunchAuthority, ServiceSupervisor, SupervisorAction};
+    use std::collections::BTreeMap;
+
+    let definition = ServiceDefinition {
+        id: id("api"),
+        scope: ServiceScope::Host,
+        command: CommandSpec::new("node").unwrap(),
+        dependencies: Vec::new(),
+        health: HealthSpec::None,
+        startup: StartupPolicy::manual(),
+        stop: StopPolicy::default(),
+        expected_port: None,
+    };
+    let catalog = ServiceCatalog::new(vec![definition]).unwrap();
+    let authority = FakeLaunchAuthority::new();
+    let inspect = authority.clone();
+    let mut roots = BTreeMap::new();
+    roots.insert(id("api"), "C:/configured/workspace".to_owned());
+    let mut supervisor = ServiceSupervisor::from_catalog_with_workspace_roots(
+        catalog,
+        BTreeMap::new(),
+        BTreeMap::new(),
+        roots,
+        authority,
+        HostId::new(1),
+        1_000,
+    )
+    .unwrap();
+    supervisor
+        .handle(
+            SupervisorAction::Start,
+            &id("api"),
+            AdmissionFence::new(1, 1, 1),
+            AdmissionRequester::Host(HostAuthority::new(HostId::new(1))),
+        )
+        .expect("start");
+    assert_eq!(supervisor.state(&id("api")), ServiceState::Healthy);
+    let token = inspect.live_token().expect("live token");
+    inspect.push_output(token, "hello from service");
+    inspect.push_exit(token, Some(7));
+    supervisor.pump_io();
+    let fence = supervisor.fence(&id("api")).unwrap();
+    let logs = supervisor.logs(&id("api"), fence).unwrap();
+    assert!(
+        logs.lines
+            .iter()
+            .any(|line| line.text.contains("hello from service")),
+        "reader output must reach bounded logs"
+    );
+    assert_eq!(supervisor.state(&id("api")), ServiceState::Failed);
+    assert_eq!(supervisor.live_count(), 0);
+    assert_eq!(inspect.torn_down(), 1);
+}
+
+#[test]
+fn stopping_state_disables_stop_and_restart_affordance() {
+    use devmanager::services::health::{
+        EvidenceProvenance, EvidenceSource, HealthAxis, LifecycleAxis, OwnershipAxis, PortAxis,
+        ProcessAxis, RedactedServiceSnapshot, ServiceEvidence,
+    };
+    use devmanager::services::model::ServiceScope;
+    use devmanager::ui::{project_services_panel, ServicePanelAction};
+
+    let evidence = ServiceEvidence {
+        lifecycle: LifecycleAxis::Stopping,
+        process: ProcessAxis::Running { generation: 2 },
+        health: HealthAxis::Cancelled,
+        port: PortAxis::Owned { port: 8080 },
+        ownership: OwnershipAxis::Host,
+        generation: 2,
+        epoch: 2,
+        observed_at_ms: 1_000,
+        provenance: EvidenceProvenance {
+            source: EvidenceSource::ProcessRegistry,
+            observed_at_ms: 1_000,
+            generation: Some(2),
+            epoch: Some(2),
+        },
+    };
+    let snapshot = RedactedServiceSnapshot::from_evidence(id("api"), ServiceScope::Host, &evidence);
+    assert_eq!(snapshot.state, ServiceState::Stopping);
+    let panel = project_services_panel(&[snapshot], &[]);
+    let stop = panel.rows[0]
+        .actions
+        .iter()
+        .find(|action| action.action == ServicePanelAction::Stop)
+        .unwrap();
+    let restart = panel.rows[0]
+        .actions
+        .iter()
+        .find(|action| action.action == ServicePanelAction::Restart)
+        .unwrap();
+    assert!(!stop.enabled);
+    assert_eq!(stop.disabled_reason, Some("Service is already stopping"));
+    assert!(!restart.enabled);
+    assert_eq!(restart.disabled_reason, Some("Service is already stopping"));
+}
+
+#[test]
+fn service_launch_issuer_rejects_mismatched_capability() {
+    use devmanager::domain::id::ResourceId;
+    use devmanager::domain::resource::ResourceKind;
+    use devmanager::process::identity::ProcessOwner;
+    use devmanager::services::ServiceLaunchIssuer;
+
+    let issuer = ServiceLaunchIssuer::new();
+    let resource = ResourceId::new();
+    issuer
+        .admit_capability(
+            "service:api",
+            ProcessOwner::Host,
+            ResourceKind::Service,
+            resource,
+            2,
+        )
+        .expect("first admit");
+    let err = issuer
+        .admit_capability(
+            "service:api",
+            ProcessOwner::Host,
+            ResourceKind::Service,
+            ResourceId::new(),
+            3,
+        )
+        .expect_err("foreign resource id");
+    assert!(err.contains("capability mismatch"));
+    let err = issuer
+        .admit_capability(
+            "service:api",
+            ProcessOwner::Host,
+            ResourceKind::Service,
+            resource,
+            1,
+        )
+        .expect_err("stale generation");
+    assert!(err.contains("stale"));
+}

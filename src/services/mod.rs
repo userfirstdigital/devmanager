@@ -1,5 +1,7 @@
+pub mod binding;
 pub mod env_service;
 pub mod health;
+pub mod launch_authority;
 pub mod model;
 pub mod pid_file;
 pub mod platform_service;
@@ -9,9 +11,17 @@ mod process_ops;
 pub mod pwsh_probe;
 pub mod scanner_service;
 mod session_manager;
+pub mod supervisor;
 
+pub use binding::{
+    bind_configured_command, bind_configured_services, with_task_workspace_root, BindingError,
+    ConfiguredServiceBinding, ConfiguredServiceOwner, ConfiguredServiceSource, EnvironmentOverlay,
+};
 pub use env_service::*;
 pub use health::*;
+pub use launch_authority::{
+    HostLiveLaunch, HostManagedLaunchAuthority, HostPendingLaunch, ServiceLaunchIssuer,
+};
 pub use model::*;
 pub use pid_file::*;
 pub use platform_service::*;
@@ -21,3 +31,14 @@ pub use process_manager::{ManagedShutdownReport, ProcessManager, RemoteSessionEv
 pub use process_ops::{ProcessOpCompletion, ProcessOpKind};
 pub use scanner_service::*;
 pub use session_manager::{ConfigImportMode, SessionManager};
+pub use supervisor::{
+    resolve_configured_service_program, resolve_configured_service_program_with,
+    session_status_for_ui, BoundedServiceLog, ConfiguredServiceSupervisor, DueProbe, FakeFailStage,
+    FakeLaunchAuthority, ManagedLaunchAuthority, ManagedLaunchSpec, ManagedLaunchStage,
+    PortClaimView, ProbeKind, RedactedSupervisorEvent, ServiceSupervisor, SupervisorAction,
+    SupervisorError, SupervisorEventKind, SupervisorOutcome, SupervisorRefusal,
+};
+
+#[cfg(test)]
+#[path = "../../tests/configured_service_supervisor/runtime.rs"]
+mod supervisor_runtime_acceptance;
