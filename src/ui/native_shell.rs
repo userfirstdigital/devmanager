@@ -5635,19 +5635,21 @@ impl NativeShell {
                 field: "browserCommand".to_string(),
             });
         }
-        let workspace_key = command.workspace_key().ok_or_else(|| {
-            BrowserError::InvalidInvocation {
-                field: "workspaceKey".to_string(),
-            }
-        })?;
-        let browser_command = command.browser_command().ok_or_else(|| {
-            BrowserError::InvalidInvocation {
-                field: "browserCommand".to_string(),
-            }
-        })?;
-        let response = self
-            .browser_host
-            .handle_command(window, workspace_key, browser_command.clone())?;
+        let workspace_key =
+            command
+                .workspace_key()
+                .ok_or_else(|| BrowserError::InvalidInvocation {
+                    field: "workspaceKey".to_string(),
+                })?;
+        let browser_command =
+            command
+                .browser_command()
+                .ok_or_else(|| BrowserError::InvalidInvocation {
+                    field: "browserCommand".to_string(),
+                })?;
+        let response =
+            self.browser_host
+                .handle_command(window, workspace_key, browser_command.clone())?;
         self.forward_browser_host_events();
         Ok(response)
     }
@@ -8223,13 +8225,14 @@ mod tests {
         acquire_reaper_permit, authorize_full_host_quit, dispatch_pending_action,
         enqueue_pending_preference, ensure_isolated_host_config_base, isolated_dev_profile,
         publish_projection, reap_retained_children, reap_retained_workers, retain_child,
-        retain_worker, retained_children, take_retained_action_outcomes, wait_for_cancellation,
-        AccessibilityTree, ClientId, CommandId, IsolatedDevProfile, NativeActionRecord,
-        NativeHostActionFailure, NativeHostActionOutcome, NativeHostActionResult,
-        NativeHostChildOwnership, NativeHostLaunchMode, NativeHostLaunchSpec, NativeHostProjection,
-        NativeHostProjectionKind, NativeHostRuntimeEpochs, NativeHostRuntimePort,
-        NativeHostWorkerCommand, NativeInteraction, NativePlatformAccessibilityBridge, NativeShell,
-        NativeShellMode, NativeShutdownDeadline, OwnedChild, OwnedWorker, ReaperKind, TaskId,
+        retain_worker, retained_children, take_retained_action_outcomes, update_state_from_stage,
+        wait_for_cancellation, AccessibilityTree, ClientId, CommandId, IsolatedDevProfile,
+        NativeActionRecord, NativeHostActionFailure, NativeHostActionOutcome,
+        NativeHostActionResult, NativeHostChildOwnership, NativeHostLaunchMode,
+        NativeHostLaunchSpec, NativeHostProjection, NativeHostProjectionKind,
+        NativeHostRuntimeEpochs, NativeHostRuntimePort, NativeHostWorkerCommand, NativeInteraction,
+        NativePlatformAccessibilityBridge, NativeShell, NativeShellMode, NativeShutdownDeadline,
+        OwnedChild, OwnedWorker, ReaperKind, TaskId, UpdateState, UpdaterStage,
         MAX_ACTION_LANE_RECORDS, MAX_ACTION_OUTCOME_PROJECTIONS, MAX_HOST_PROJECTIONS,
         MAX_PENDING_HOST_ACTIONS, MAX_PENDING_PREFERENCES, MAX_RETAINED_CHILDREN,
         MAX_RETAINED_WORKERS, MAX_RETRY_HOST_ACTIONS, PRODUCTION_HOST_PROFILE,
