@@ -1,7 +1,13 @@
-import { isLiveStatus, type WebSessionSummary, type WebWorkspaceSnapshot } from "../api/types";
-import { routeForSessionKey, type AppRoute } from "../app/router";
+import {
+  isLiveStatus,
+  type WebSessionSummary,
+  type WebWorkspaceSnapshot,
+} from "../api/types";
+import { routeForStableSessionKey, type AppRoute } from "../app/router";
+import { taskIdFromStableSessionKey, type TaskId } from "./taskId";
 
-export interface SessionListItem {
+export interface TaskListItem {
+  taskId: TaskId;
   stableSessionKey: string;
   label: string;
   projectName: string;
@@ -16,22 +22,27 @@ export interface SessionListItem {
   session: WebSessionSummary;
 }
 
-export interface SessionGroups {
-  live: SessionListItem[];
-  recent: SessionListItem[];
+export interface TaskGroups {
+  live: TaskListItem[];
+  recent: TaskListItem[];
 }
 
 function titleCase(value: string): string {
   return value.length ? `${value[0]?.toUpperCase()}${value.slice(1)}` : value;
 }
 
-function isMeaningfulRuntimeTitle(title: string | null | undefined): title is string {
+function isMeaningfulRuntimeTitle(
+  title: string | null | undefined,
+): title is string {
   const trimmed = title?.trim() ?? "";
   if (!trimmed) return false;
   // Provider spinner glyphs / braille throbbers are not task titles.
   if (/^[✳✻✓…·•●○◌⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]+$/u.test(trimmed)) return false;
   if (/^[\u2800-\u28ff]/u.test(trimmed)) return false;
-  if (/^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✳✻]/.test(trimmed) && /thinking|working|loading/i.test(trimmed)) {
+  if (
+    /^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✳✻]/.test(trimmed) &&
+    /thinking|working|loading/i.test(trimmed)
+  ) {
     return false;
   }
   // Shell prompt chrome: user@host:path$ or trailing shell markers.
@@ -43,18 +54,25 @@ function isMeaningfulRuntimeTitle(title: string | null | undefined): title is st
   ) {
     return false;
   }
-  if (trimmed.endsWith(".exe") && (trimmed.includes("\\") || trimmed.includes("/"))) {
+  if (
+    trimmed.endsWith(".exe") &&
+    (trimmed.includes("\\") || trimmed.includes("/"))
+  ) {
     return false;
   }
   // Absolute/home path titles without a real task phrase.
-  if (/^(?:[A-Za-z]:\\|~\/|\/)/.test(trimmed) && !/\s/.test(trimmed)) return false;
+  if (/^(?:[A-Za-z]:\\|~\/|\/)/.test(trimmed) && !/\s/.test(trimmed))
+    return false;
   // MSYS/Git Bash titles commonly look like `MINGW64:/c/Code/...`.
   if (/^[^:\s]+:[/\\]/.test(trimmed)) return false;
   return true;
 }
 
 /** Bare provider, session/numbered labels, and decorated provider chrome are not task titles. */
-function isGenericAiLabel(label: string, kind: WebSessionSummary["kind"]): boolean {
+function isGenericAiLabel(
+  label: string,
+  kind: WebSessionSummary["kind"],
+): boolean {
   if (kind !== "claude" && kind !== "codex") return false;
   const trimmed = label.trim();
   if (kind === "claude") {
@@ -63,10 +81,9 @@ function isGenericAiLabel(label: string, kind: WebSessionSummary["kind"]): boole
   return /^(?:openai\s+)?codex(?:\s+session|\s+\d+)?$/i.test(trimmed);
 }
 
-function statePresentation(session: WebSessionSummary): Pick<
-  SessionListItem,
-  "stateLabel" | "statusTone"
-> {
+function statePresentation(
+  session: WebSessionSummary,
+): Pick<TaskListItem, "stateLabel" | "statusTone"> {
   if (!isLiveStatus(session.status)) {
     if (session.status === "Failed") {
       return { stateLabel: "Needs attention", statusTone: "danger" };
@@ -90,8 +107,10 @@ function statePresentation(session: WebSessionSummary): Pick<
     return { stateLabel: "Needs attention", statusTone: "danger" };
   }
   if (session.kind === "ssh") {
-    if (session.status === "Running") return { stateLabel: "Connected", statusTone: "active" };
-    if (session.status === "Starting") return { stateLabel: "Connecting", statusTone: "active" };
+    if (session.status === "Running")
+      return { stateLabel: "Connected", statusTone: "active" };
+    if (session.status === "Starting")
+      return { stateLabel: "Connecting", statusTone: "active" };
     return { stateLabel: "Disconnected", statusTone: "neutral" };
   }
   if (session.kind === "claude" || session.kind === "codex") {
@@ -104,14 +123,20 @@ function statePresentation(session: WebSessionSummary): Pick<
     if (session.adapterHealth === "degraded") {
       return { stateLabel: "Live text", statusTone: "active" };
     }
-    if (session.status === "Starting") return { stateLabel: "Starting", statusTone: "active" };
-    if (session.status === "Stopping") return { stateLabel: "Stopping", statusTone: "active" };
-    if (session.status === "Running") return { stateLabel: "Idle", statusTone: "active" };
+    if (session.status === "Starting")
+      return { stateLabel: "Starting", statusTone: "active" };
+    if (session.status === "Stopping")
+      return { stateLabel: "Stopping", statusTone: "active" };
+    if (session.status === "Running")
+      return { stateLabel: "Idle", statusTone: "active" };
     return { stateLabel: "Ready to reopen", statusTone: "neutral" };
   }
-  if (session.status === "Running") return { stateLabel: "Running", statusTone: "active" };
-  if (session.status === "Starting") return { stateLabel: "Starting", statusTone: "active" };
-  if (session.status === "Stopping") return { stateLabel: "Stopping", statusTone: "active" };
+  if (session.status === "Running")
+    return { stateLabel: "Running", statusTone: "active" };
+  if (session.status === "Starting")
+    return { stateLabel: "Starting", statusTone: "active" };
+  if (session.status === "Stopping")
+    return { stateLabel: "Stopping", statusTone: "active" };
   return { stateLabel: titleCase(session.status), statusTone: "neutral" };
 }
 
@@ -119,42 +144,51 @@ function commandForSession(
   workspace: WebWorkspaceSnapshot,
   session: WebSessionSummary,
 ) {
-  const commandId = session.commandId ??
+  const commandId =
+    session.commandId ??
     (session.stableSessionKey?.startsWith("server:")
       ? session.stableSessionKey.slice("server:".length)
       : null);
   if (!commandId) return null;
   for (const project of workspace.projects) {
     for (const folder of project.folders) {
-      const command = folder.commands.find((candidate) => candidate.id === commandId);
+      const command = folder.commands.find(
+        (candidate) => candidate.id === commandId,
+      );
       if (command) return command;
     }
   }
   return null;
 }
 
-export function describeSession(
+export function describeTask(
   workspace: WebWorkspaceSnapshot,
   session: WebSessionSummary,
-): SessionListItem {
-  const stableSessionKey = session.stableSessionKey ?? `unavailable:${session.sessionId}`;
+): TaskListItem {
+  const stableSessionKey =
+    session.stableSessionKey ?? `unavailable:${session.sessionId}`;
+  const taskId = taskIdFromStableSessionKey(stableSessionKey);
   const tab = workspace.tabs.find(
     (candidate) =>
       candidate.id === session.tabId ||
       stableSessionKey === `tab:${candidate.id}`,
   );
   const projectId = session.projectId ?? tab?.projectId ?? null;
-  const project = workspace.projects.find((candidate) => candidate.id === projectId);
+  const project = workspace.projects.find(
+    (candidate) => candidate.id === projectId,
+  );
   const command = commandForSession(workspace, session);
   const connection = tab?.connectionId
-    ? workspace.sshConnections.find((candidate) => candidate.id === tab.connectionId)
+    ? workspace.sshConnections.find(
+        (candidate) => candidate.id === tab.connectionId,
+      )
     : null;
 
   let label: string;
   if (session.kind === "ssh") {
-    label = connection?.label?.trim() || tab?.label?.trim() || "SSH session";
+    label = connection?.label?.trim() || tab?.label?.trim() || "SSH task";
   } else if (session.kind === "server" || session.kind === "shell") {
-    label = command?.label?.trim() || tab?.label?.trim() || "Server session";
+    label = command?.label?.trim() || tab?.label?.trim() || "Server task";
   } else {
     const taskTitle = session.taskTitle?.trim() ?? "";
     if (taskTitle) {
@@ -171,7 +205,7 @@ export function describeSession(
         if (tabLabel && !isGenericAiLabel(tabLabel, session.kind)) {
           label = tabLabel;
         } else {
-          label = `${titleCase(session.kind)} session`;
+          label = `${titleCase(session.kind)} task`;
         }
       }
     }
@@ -180,6 +214,7 @@ export function describeSession(
   const state = statePresentation(session);
 
   return {
+    taskId,
     stableSessionKey,
     label,
     projectName: project?.name ?? "Project unavailable",
@@ -194,19 +229,19 @@ export function describeSession(
     lastActivityEpochMs: session.lastActivityEpochMs,
     attention: session.attention,
     attentionCount: session.attentionCount,
-    route: routeForSessionKey(stableSessionKey),
+    route: routeForStableSessionKey(stableSessionKey),
     session,
   };
 }
 
-function newestFirst(left: SessionListItem, right: SessionListItem): number {
+function newestFirst(left: TaskListItem, right: TaskListItem): number {
   const activity =
     (right.lastActivityEpochMs ?? Number.NEGATIVE_INFINITY) -
     (left.lastActivityEpochMs ?? Number.NEGATIVE_INFINITY);
   return activity || left.label.localeCompare(right.label);
 }
 
-function livePriority(item: SessionListItem): number {
+function livePriority(item: TaskListItem): number {
   if (item.attention === "needsInput") return 0;
   if (item.attention === "failed") return 1;
   if (item.attention === "unread") return 2;
@@ -214,19 +249,19 @@ function livePriority(item: SessionListItem): number {
   return 4;
 }
 
-function liveSort(left: SessionListItem, right: SessionListItem): number {
+function liveSort(left: TaskListItem, right: TaskListItem): number {
   const priority = livePriority(left) - livePriority(right);
   return priority || newestFirst(left, right);
 }
 
-export function groupSessions(workspace: WebWorkspaceSnapshot): SessionGroups {
-  const groups: SessionGroups = {
+export function groupTasks(workspace: WebWorkspaceSnapshot): TaskGroups {
+  const groups: TaskGroups = {
     live: [],
     recent: [],
   };
   for (const session of workspace.sessions) {
     if (!session.stableSessionKey) continue;
-    const item = describeSession(workspace, session);
+    const item = describeTask(workspace, session);
     if (isLiveStatus(session.status)) {
       groups.live.push(item);
     } else {
@@ -239,7 +274,9 @@ export function groupSessions(workspace: WebWorkspaceSnapshot): SessionGroups {
 }
 
 /** Count live non-none attention — never ended/stale historical attention. */
-export function countActionableAttention(workspace: WebWorkspaceSnapshot | null | undefined): number {
+export function countActionableAttention(
+  workspace: WebWorkspaceSnapshot | null | undefined,
+): number {
   if (!workspace) return 0;
   return workspace.sessions.filter(
     (session) => isLiveStatus(session.status) && session.attention !== "none",

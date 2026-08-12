@@ -186,12 +186,7 @@ export interface WebWorkspaceSnapshot {
 export type WebWorkspaceDelta = WebWorkspaceSnapshot;
 
 export type SemanticSource =
-  | "claude"
-  | "codex"
-  | "shell"
-  | "server"
-  | "ssh"
-  | "system";
+  "claude" | "codex" | "shell" | "server" | "ssh" | "system";
 export type SemanticStream = "stdout" | "stderr";
 export type SemanticToolState = "pending" | "running" | "completed" | "failed";
 
@@ -360,7 +355,10 @@ export type WsInbound =
       visible: boolean;
     }
   | { type: "setVisibility"; clientInstanceId: string; visible: boolean }
-  | ({ type: "composerSubmit"; expectedLeaseGeneration: number } & ComposerSubmission)
+  | ({
+      type: "composerSubmit";
+      expectedLeaseGeneration: number;
+    } & ComposerSubmission)
   | {
       type: "subscribeSemantic";
       stableSessionKey: StableSessionKey;
@@ -537,7 +535,7 @@ export interface LegacyWorkspaceProjection {
   serverId: string;
 }
 
-// Compatibility aliases retained only while Tasks 5-6 replace the old views.
+// Wire action aliases used by the live store/ws client.
 export type RemoteAction = WebAction;
 export type RemoteActionResult = WebActionResult;
 export type RemoteAiTabPayload = WebActionPayload;

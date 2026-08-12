@@ -39,7 +39,10 @@ type WithoutExpectedLeaseGeneration<T> = T extends unknown
   : never;
 
 export type WriterLeaseFrame = WithoutExpectedLeaseGeneration<
-  Extract<WsInbound, { type: "input" | "pasteImage" | "resize" | "interruptSession" }>
+  Extract<
+    WsInbound,
+    { type: "input" | "pasteImage" | "resize" | "interruptSession" }
+  >
 >;
 
 export interface WsClientCallbacks {
@@ -160,12 +163,14 @@ function currentRoute(): string {
   const locationLike = globalThis.location as
     | (Location & { pathname?: string; search?: string; hash?: string })
     | undefined;
-  const pathname = locationLike?.pathname || "/sessions";
+  const pathname = locationLike?.pathname || "/tasks";
   return `${pathname}${locationLike?.search ?? ""}${locationLike?.hash ?? ""}`;
 }
 
 function currentVisibility(): boolean {
-  return typeof document === "undefined" || document.visibilityState !== "hidden";
+  return (
+    typeof document === "undefined" || document.visibilityState !== "hidden"
+  );
 }
 
 function defaultResumeContext(): ResumeContext {
@@ -237,10 +242,13 @@ export class WsClient {
   private stopped = false;
   private starting = false;
   private reconnectDelayMs = 1000;
-  private reconnectTimer: ReturnType<typeof globalThis.setTimeout> | null = null;
-  private heartbeatTimer: ReturnType<typeof globalThis.setInterval> | null = null;
+  private reconnectTimer: ReturnType<typeof globalThis.setTimeout> | null =
+    null;
+  private heartbeatTimer: ReturnType<typeof globalThis.setInterval> | null =
+    null;
   private helloTimer: ReturnType<typeof globalThis.setTimeout> | null = null;
-  private composerRetryTimer: ReturnType<typeof globalThis.setTimeout> | null = null;
+  private composerRetryTimer: ReturnType<typeof globalThis.setTimeout> | null =
+    null;
   private composerRetryDelayMs = COMPOSER_RETRY_MIN_MS;
   private lastWriterLeaseRequestAt = Number.NEGATIVE_INFINITY;
   private lastForegroundWakeAt = Number.NEGATIVE_INFINITY;
@@ -512,7 +520,9 @@ export class WsClient {
     if (existing) {
       if (existing.fingerprint === fingerprint) return existing.promise;
       return Promise.reject(
-        new Error("This mutation ID is already pending with different content."),
+        new Error(
+          "This mutation ID is already pending with different content.",
+        ),
       );
     }
     if (this.stopped) return Promise.reject(new Error("websocket stopped"));
@@ -559,7 +569,10 @@ export class WsClient {
     this.requestWriterLease();
   }
 
-  cancelComposer(mutationId: string, reason = "composer mutation superseded"): void {
+  cancelComposer(
+    mutationId: string,
+    reason = "composer mutation superseded",
+  ): void {
     const pending = this.pendingComposers.get(mutationId);
     if (!pending) return;
     this.pendingComposers.delete(mutationId);
@@ -637,9 +650,7 @@ export class WsClient {
     const now = Date.now();
     if (now - this.lastForegroundWakeAt <= FOREGROUND_WAKE_COALESCE_MS) return;
     this.wake();
-    this.lastForegroundWakeAt = this.visible
-      ? now
-      : Number.NEGATIVE_INFINITY;
+    this.lastForegroundWakeAt = this.visible ? now : Number.NEGATIVE_INFINITY;
   }
 
   setVisibility(visible: boolean): void {
@@ -668,7 +679,11 @@ export class WsClient {
     sessionId: string,
     stableSessionKey: string | null = null,
   ): void {
-    for (let index = this.pendingWriterFrames.length - 1; index >= 0; index -= 1) {
+    for (
+      let index = this.pendingWriterFrames.length - 1;
+      index >= 0;
+      index -= 1
+    ) {
       const pending = this.pendingWriterFrames[index];
       const matches =
         pending.message.type === "interruptSession"
@@ -911,10 +926,7 @@ export class WsClient {
     const delay = this.composerRetryDelayMs;
     this.composerRetryTimer = globalThis.setTimeout(() => {
       this.composerRetryTimer = null;
-      this.composerRetryDelayMs = Math.min(
-        delay * 2,
-        COMPOSER_RETRY_MAX_MS,
-      );
+      this.composerRetryDelayMs = Math.min(delay * 2, COMPOSER_RETRY_MAX_MS);
       this.driveComposerRetries();
     }, delay);
   }

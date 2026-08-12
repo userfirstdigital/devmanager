@@ -29,7 +29,9 @@ function collectFiles(directory: string): string[] {
 }
 
 function listSourceFiles(): string[] {
-  const files = fingerprintFiles.filter((path) => existsSync(join(webRoot, path)));
+  const files = fingerprintFiles.filter((path) =>
+    existsSync(join(webRoot, path)),
+  );
   files.push(
     ...fingerprintRoots.flatMap((path) => collectFiles(join(webRoot, path))),
   );
@@ -91,11 +93,11 @@ export default defineConfig({
       manifest: {
         id: "/",
         scope: "/",
-        start_url: "/sessions?source=pwa",
+        start_url: "/tasks?source=pwa",
         display: "standalone",
         name: "DevManager",
         short_name: "DevManager",
-        description: "Secure remote control for DevManager sessions.",
+        description: "Secure remote control for DevManager tasks.",
         background_color: "#09090b",
         theme_color: "#09090b",
         icons: [

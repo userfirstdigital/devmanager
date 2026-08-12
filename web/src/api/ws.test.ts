@@ -8,7 +8,7 @@ import { WsClient } from "./ws";
 const resumeContext = {
   seenRuntimeInstanceId: "runtime-1",
   seenRevision: 7,
-  route: "/session/tab/tab-1",
+  route: "/tasks/tab%3Atab-1",
   desiredSessionKey: "tab:tab-1",
   rawSessionId: "pty-tab-1",
   semanticAfterSequence: 12,
@@ -17,7 +17,9 @@ const resumeContext = {
 };
 
 function jsonFrames(socket: FakeWebSocket): Array<Record<string, unknown>> {
-  return socket.sent.map((frame) => JSON.parse(frame) as Record<string, unknown>);
+  return socket.sent.map(
+    (frame) => JSON.parse(frame) as Record<string, unknown>,
+  );
 }
 
 function clientCallbacks(overrides: Record<string, unknown> = {}) {
@@ -141,7 +143,7 @@ describe("WsClient request handling", () => {
     expect(callbacks.onMessage).not.toHaveBeenCalled();
   });
 
-  it.each(["null", '{"type":"hello","protocolVersion":"2"}']) (
+  it.each(["null", '{"type":"hello","protocolVersion":"2"}'])(
     "closes safely for a malformed first frame: %s",
     async (frame) => {
       const callbacks = clientCallbacks();
@@ -276,7 +278,9 @@ describe("WsClient request handling", () => {
       client as unknown as { request(action: RemoteAction): Promise<unknown> }
     ).request(action);
 
-    expect(jsonFrames(socket).filter((frame) => frame.type === "resume")).toHaveLength(1);
+    expect(
+      jsonFrames(socket).filter((frame) => frame.type === "resume"),
+    ).toHaveLength(1);
     const frames = jsonFrames(socket);
     expect(frames[frames.length - 1]).toEqual({
       type: "request",
@@ -314,7 +318,9 @@ describe("WsClient request handling", () => {
         inputKind: "paste",
       }),
     ).toBe(true);
-    expect(jsonFrames(socket).filter((frame) => frame.type === "input")).toEqual([]);
+    expect(
+      jsonFrames(socket).filter((frame) => frame.type === "input"),
+    ).toEqual([]);
 
     socket.emitMessage(
       JSON.stringify({
@@ -339,7 +345,9 @@ describe("WsClient request handling", () => {
       }),
     );
 
-    expect(jsonFrames(socket).filter((frame) => frame.type === "input")).toEqual([
+    expect(
+      jsonFrames(socket).filter((frame) => frame.type === "input"),
+    ).toEqual([
       {
         type: "input",
         sessionId: "pty-a",
@@ -374,7 +382,9 @@ describe("WsClient request handling", () => {
       }),
     );
 
-    expect(jsonFrames(socket).filter((frame) => frame.type === "input")).toEqual([]);
+    expect(
+      jsonFrames(socket).filter((frame) => frame.type === "input"),
+    ).toEqual([]);
   });
 
   it("sends exactly one atomic resume frame whenever a socket opens", async () => {
@@ -430,8 +440,12 @@ describe("WsClient request handling", () => {
     await second.start();
     FakeWebSocket.instances[1]?.emitOpen();
 
-    const firstResume = jsonFrames(FakeWebSocket.instances[0] ?? ({} as FakeWebSocket))[0];
-    const secondResume = jsonFrames(FakeWebSocket.instances[1] ?? ({} as FakeWebSocket))[0];
+    const firstResume = jsonFrames(
+      FakeWebSocket.instances[0] ?? ({} as FakeWebSocket),
+    )[0];
+    const secondResume = jsonFrames(
+      FakeWebSocket.instances[1] ?? ({} as FakeWebSocket),
+    )[0];
     expect(firstResume?.clientInstanceId).toBe(secondResume?.clientInstanceId);
     expect(storage.setItem).toHaveBeenCalledTimes(1);
   });
@@ -457,8 +471,12 @@ describe("WsClient request handling", () => {
     await second.start();
     FakeWebSocket.instances[1]?.emitOpen();
 
-    const firstResume = jsonFrames(FakeWebSocket.instances[0] ?? ({} as FakeWebSocket))[0];
-    const secondResume = jsonFrames(FakeWebSocket.instances[1] ?? ({} as FakeWebSocket))[0];
+    const firstResume = jsonFrames(
+      FakeWebSocket.instances[0] ?? ({} as FakeWebSocket),
+    )[0];
+    const secondResume = jsonFrames(
+      FakeWebSocket.instances[1] ?? ({} as FakeWebSocket),
+    )[0];
     expect(firstResume?.clientInstanceId).toBe(secondResume?.clientInstanceId);
   });
 
@@ -586,11 +604,9 @@ describe("WsClient request handling", () => {
 
     let actionRejected = false;
     let composerRejected = false;
-    void client
-      .request({ type: "stopAllServers" })
-      .catch(() => {
-        actionRejected = true;
-      });
+    void client.request({ type: "stopAllServers" }).catch(() => {
+      actionRejected = true;
+    });
     void client
       .submitComposer({
         mutationId: "mutation-reset",
@@ -627,7 +643,7 @@ describe("WsClient request handling", () => {
         runtimeInstanceId: "runtime-new",
         revision: 1,
         hardReset: true,
-        route: "/sessions",
+        route: "/tasks",
         desiredSessionKey: null,
         workspace: null,
         semanticReplay: null,
@@ -762,7 +778,9 @@ describe("WsClient request handling", () => {
       }),
     );
 
-    expect(jsonFrames(socket).filter((frame) => frame.type === "resize")).toEqual([
+    expect(
+      jsonFrames(socket).filter((frame) => frame.type === "resize"),
+    ).toEqual([
       {
         type: "resize",
         sessionId: "pty-a",
@@ -802,7 +820,9 @@ describe("WsClient request handling", () => {
       }),
     );
 
-    expect(jsonFrames(socket).filter((frame) => frame.type === "input")).toEqual([
+    expect(
+      jsonFrames(socket).filter((frame) => frame.type === "input"),
+    ).toEqual([
       {
         type: "input",
         sessionId: "pty-b",
@@ -941,7 +961,8 @@ describe("WsClient reconnect wake handling", () => {
   it("wake retries immediately instead of waiting for reconnect backoff", async () => {
     vi.stubGlobal(
       "fetch",
-      vi.fn()
+      vi
+        .fn()
         .mockRejectedValueOnce(new Error("offline"))
         .mockResolvedValue({ ok: true, status: 200 }),
     );
@@ -958,7 +979,10 @@ describe("WsClient reconnect wake handling", () => {
   });
 
   it("does not create duplicate sockets while a start is already in flight", async () => {
-    let resolveFetch: (value: { ok: boolean; status: number }) => void = () => {};
+    let resolveFetch: (value: {
+      ok: boolean;
+      status: number;
+    }) => void = () => {};
     const fetchMock = vi.fn(
       () =>
         new Promise((resolve) => {
@@ -1092,9 +1116,14 @@ describe("WsClient reconnect wake handling", () => {
     visible = true;
     client.setVisibility(true);
 
-    const resumes = jsonFrames(socket).filter((frame) => frame.type === "resume");
+    const resumes = jsonFrames(socket).filter(
+      (frame) => frame.type === "resume",
+    );
     expect(resumes).toHaveLength(2);
-    expect(resumes[0]).toMatchObject({ visible: false, wantsWriterLease: false });
+    expect(resumes[0]).toMatchObject({
+      visible: false,
+      wantsWriterLease: false,
+    });
     expect(resumes[1]).toMatchObject({ visible: true, wantsWriterLease: true });
   });
 
@@ -1192,79 +1221,82 @@ describe("WsClient reconnect wake handling", () => {
     "staleGeneration",
     "nativeControllerActive",
     "mutationInFlight",
-  ] as const)("keeps the same promise for transient %s rejection", async (code) => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn().mockResolvedValue({ ok: true, status: 200 }),
-    );
-    const client = new WsClient(clientCallbacks());
-    await client.start();
-    const socket = FakeWebSocket.instances[0];
-    socket.emitOpen();
-    socket.emitMessage(
-      JSON.stringify({
-        type: "writerLeaseState",
-        writerLease: {
-          ownerClientInstanceId: "browser-install-uuid",
-          generation: 7,
-          expiresAtEpochMs: 8_000,
-          youAreOwner: true,
-        },
-      }),
-    );
-    let rejected = false;
-    const submission = client
-      .submitComposer({
-        mutationId: `mutation-${code}`,
-        stableSessionKey: "tab:tab-1",
-        text: code,
-        attachments: [],
-      })
-      .catch((error: unknown) => {
-        rejected = true;
-        throw error;
-      });
-    socket.emitMessage(
-      JSON.stringify({
-        type: "composerRejected",
-        mutationId: `mutation-${code}`,
-        code,
-        message: "retry",
-        writerLease: {
-          ownerClientInstanceId: "browser-install-uuid",
-          generation: 8,
-          expiresAtEpochMs: 9_000,
-          youAreOwner: true,
-        },
-      }),
-    );
-    await Promise.resolve();
-    expect(rejected).toBe(false);
+  ] as const)(
+    "keeps the same promise for transient %s rejection",
+    async (code) => {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn().mockResolvedValue({ ok: true, status: 200 }),
+      );
+      const client = new WsClient(clientCallbacks());
+      await client.start();
+      const socket = FakeWebSocket.instances[0];
+      socket.emitOpen();
+      socket.emitMessage(
+        JSON.stringify({
+          type: "writerLeaseState",
+          writerLease: {
+            ownerClientInstanceId: "browser-install-uuid",
+            generation: 7,
+            expiresAtEpochMs: 8_000,
+            youAreOwner: true,
+          },
+        }),
+      );
+      let rejected = false;
+      const submission = client
+        .submitComposer({
+          mutationId: `mutation-${code}`,
+          stableSessionKey: "tab:tab-1",
+          text: code,
+          attachments: [],
+        })
+        .catch((error: unknown) => {
+          rejected = true;
+          throw error;
+        });
+      socket.emitMessage(
+        JSON.stringify({
+          type: "composerRejected",
+          mutationId: `mutation-${code}`,
+          code,
+          message: "retry",
+          writerLease: {
+            ownerClientInstanceId: "browser-install-uuid",
+            generation: 8,
+            expiresAtEpochMs: 9_000,
+            youAreOwner: true,
+          },
+        }),
+      );
+      await Promise.resolve();
+      expect(rejected).toBe(false);
 
-    expect(
-      jsonFrames(socket).filter((frame) => frame.type === "composerSubmit"),
-    ).toHaveLength(1);
-    await vi.advanceTimersByTimeAsync(249);
-    expect(
-      jsonFrames(socket).filter((frame) => frame.type === "composerSubmit"),
-    ).toHaveLength(1);
-    await vi.advanceTimersByTimeAsync(1);
-    const sends = jsonFrames(socket).filter(
-      (frame) => frame.type === "composerSubmit",
-    );
-    expect(sends).toHaveLength(2);
-    expect(sends[1]?.mutationId).toBe(`mutation-${code}`);
-    socket.emitMessage(
-      JSON.stringify({
-        type: "composerAccepted",
-        mutationId: `mutation-${code}`,
-        stableSessionKey: "tab:tab-1",
-        acceptedSequence: 21,
-        leaseGeneration: 8,
-      }),
-    );
-    await expect(submission).resolves.toMatchObject({ acceptedSequence: 21 });
-  });
+      expect(
+        jsonFrames(socket).filter((frame) => frame.type === "composerSubmit"),
+      ).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(249);
+      expect(
+        jsonFrames(socket).filter((frame) => frame.type === "composerSubmit"),
+      ).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(1);
+      const sends = jsonFrames(socket).filter(
+        (frame) => frame.type === "composerSubmit",
+      );
+      expect(sends).toHaveLength(2);
+      expect(sends[1]?.mutationId).toBe(`mutation-${code}`);
+      socket.emitMessage(
+        JSON.stringify({
+          type: "composerAccepted",
+          mutationId: `mutation-${code}`,
+          stableSessionKey: "tab:tab-1",
+          acceptedSequence: 21,
+          leaseGeneration: 8,
+        }),
+      );
+      await expect(submission).resolves.toMatchObject({ acceptedSequence: 21 });
+    },
+  );
 
   it("resends an unacknowledged composer mutation after reconnect Resume ownership", async () => {
     vi.stubGlobal(
@@ -1313,7 +1345,7 @@ describe("WsClient reconnect wake handling", () => {
         runtimeInstanceId: "runtime-1",
         revision: 7,
         hardReset: false,
-        route: "/session/tab/tab-1",
+        route: "/tasks/tab%3Atab-1",
         desiredSessionKey: "tab:tab-1",
         workspace: null,
         semanticReplay: null,
@@ -1378,7 +1410,7 @@ describe("WsClient reconnect wake handling", () => {
         runtimeInstanceId: "runtime-1",
         revision: 7,
         hardReset: false,
-        route: "/sessions",
+        route: "/tasks",
         desiredSessionKey: null,
         workspace: null,
         semanticReplay: null,

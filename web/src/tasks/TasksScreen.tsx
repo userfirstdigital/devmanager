@@ -12,16 +12,16 @@ import type { WebWorkspaceSnapshot } from "../api/types";
 import type { AppRoute } from "../app/router";
 import {
   formatRelativeActivity,
-  groupSessions,
-  type SessionListItem,
-} from "./sessionModel";
+  groupTasks,
+  type TaskListItem,
+} from "./taskModel";
 
-interface SessionsScreenProps {
+interface TasksScreenProps {
   workspace: WebWorkspaceSnapshot;
   onNavigate(route: AppRoute): void;
 }
 
-function SessionIcon({ item }: { item: SessionListItem }) {
+function TaskIcon({ item }: { item: TaskListItem }) {
   if (item.session.kind === "server") return <Server size={18} />;
   if (item.session.kind === "claude" || item.session.kind === "codex") {
     return <Bot size={18} />;
@@ -29,12 +29,12 @@ function SessionIcon({ item }: { item: SessionListItem }) {
   return <TerminalSquare size={18} />;
 }
 
-function SessionRow({
+function TaskRow({
   item,
   now,
   onNavigate,
 }: {
-  item: SessionListItem;
+  item: TaskListItem;
   now: number;
   onNavigate(route: AppRoute): void;
 }) {
@@ -46,7 +46,8 @@ function SessionRow({
     item.stateLabel,
     activity,
   ].join(", ");
-  const showUnreadBadge = item.attention === "unread" && item.attentionCount > 0;
+  const showUnreadBadge =
+    item.attention === "unread" && item.attentionCount > 0;
 
   return (
     <button
@@ -55,8 +56,12 @@ function SessionRow({
       aria-label={accessibleName}
       onClick={() => onNavigate(item.route)}
     >
-      <span className="dm-session-kind-icon" data-tone={item.statusTone} aria-hidden="true">
-        <SessionIcon item={item} />
+      <span
+        className="dm-session-kind-icon"
+        data-tone={item.statusTone}
+        aria-hidden="true"
+      >
+        <TaskIcon item={item} />
       </span>
       <span className="dm-session-copy">
         <span className="dm-session-primary">
@@ -65,7 +70,10 @@ function SessionRow({
         </span>
         <span className="dm-session-secondary">
           {item.projectColor ? (
-            <i style={{ backgroundColor: item.projectColor }} aria-hidden="true" />
+            <i
+              style={{ backgroundColor: item.projectColor }}
+              aria-hidden="true"
+            />
           ) : null}
           <span>{item.projectName}</span>
           <span aria-hidden="true">·</span>
@@ -77,7 +85,10 @@ function SessionRow({
         </span>
       </span>
       {showUnreadBadge ? (
-        <span className="dm-attention-count" aria-label={`${item.attentionCount} unread updates`}>
+        <span
+          className="dm-attention-count"
+          aria-label={`${item.attentionCount} unread updates`}
+        >
           {Math.min(item.attentionCount, 99)}
         </span>
       ) : null}
@@ -86,9 +97,9 @@ function SessionRow({
   );
 }
 
-export function SessionsScreen({ workspace, onNavigate }: SessionsScreenProps) {
+export function TasksScreen({ workspace, onNavigate }: TasksScreenProps) {
   const [now, setNow] = useState(() => Date.now());
-  const groups = useMemo(() => groupSessions(workspace), [workspace]);
+  const groups = useMemo(() => groupTasks(workspace), [workspace]);
 
   useEffect(() => {
     const timer = window.setInterval(() => setNow(Date.now()), 30_000);
@@ -109,25 +120,32 @@ export function SessionsScreen({ workspace, onNavigate }: SessionsScreenProps) {
       items: groups.recent,
     },
   ];
-  const hasSessions = sections.some((section) => section.items.length > 0);
+  const hasTasks = sections.some((section) => section.items.length > 0);
 
   return (
-    <section className="dm-screen" aria-labelledby="sessions-title">
+    <section className="dm-screen" aria-labelledby="tasks-title">
       <header className="dm-large-title-header">
         <div>
           <p className="dm-eyebrow">Your workspace</p>
-          <h1 id="sessions-title">Sessions</h1>
+          <h1 id="tasks-title">Tasks</h1>
         </div>
       </header>
       <div className="dm-screen-scroll">
-        {!hasSessions ? (
+        {!hasTasks ? (
           <div className="dm-native-empty">
             <span className="dm-native-empty-icon" aria-hidden="true">
               <TerminalSquare size={28} />
             </span>
-            <h2>No sessions yet</h2>
-            <p>Start Claude, Codex, or a server from Projects. New activity appears here automatically.</p>
-            <button type="button" className="dm-primary-button" onClick={() => onNavigate({ name: "projects" })}>
+            <h2>No tasks yet</h2>
+            <p>
+              Start Claude, Codex, or a server from Projects. New activity
+              appears here automatically.
+            </p>
+            <button
+              type="button"
+              className="dm-primary-button"
+              onClick={() => onNavigate({ name: "projects" })}
+            >
               Open Projects
             </button>
           </div>
@@ -144,8 +162,8 @@ export function SessionsScreen({ workspace, onNavigate }: SessionsScreenProps) {
               </h2>
               <div className="dm-grouped-list">
                 {section.items.map((item) => (
-                  <SessionRow
-                    key={item.stableSessionKey}
+                  <TaskRow
+                    key={item.taskId}
                     item={item}
                     now={now}
                     onNavigate={onNavigate}

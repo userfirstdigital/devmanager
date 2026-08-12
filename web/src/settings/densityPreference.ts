@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 
-import type { InterfaceDensity } from "../sessions/timeline/eventRenderers";
+import type { InterfaceDensity } from "../tasks/timeline/eventRenderers";
 
 const STORAGE_KEY = "devmanager-interface-density:v1";
 const CHANGE_EVENT = "devmanager-interface-density-change";
@@ -24,10 +24,15 @@ export function saveDensity(density: InterfaceDensity): void {
   } catch {
     // Presentation preferences are best effort.
   }
-  globalThis.dispatchEvent?.(new CustomEvent(CHANGE_EVENT, { detail: density }));
+  globalThis.dispatchEvent?.(
+    new CustomEvent(CHANGE_EVENT, { detail: density }),
+  );
 }
 
-export function useDensityPreference(): [InterfaceDensity, (density: InterfaceDensity) => void] {
+export function useDensityPreference(): [
+  InterfaceDensity,
+  (density: InterfaceDensity) => void,
+] {
   const [density, setDensity] = useState<InterfaceDensity>(() => loadDensity());
   useEffect(() => {
     const onChange = (event: Event) => {

@@ -40,7 +40,7 @@ export function isInstalledLaunchEligible(
   search: string,
 ): boolean {
   if (pathname === "/") return true;
-  if (pathname !== "/sessions") return false;
+  if (pathname !== "/tasks") return false;
   return new URLSearchParams(search).get("source") === "pwa";
 }
 
@@ -82,9 +82,7 @@ export function writeSavedRoute(
   }
 }
 
-export function clearSavedRoute(
-  storage?: Pick<Storage, "removeItem">,
-): void {
+export function clearSavedRoute(storage?: Pick<Storage, "removeItem">): void {
   try {
     (storage ?? defaultStorage())?.removeItem(ROUTE_STORAGE_KEY);
   } catch {
@@ -92,10 +90,7 @@ export function clearSavedRoute(
   }
 }
 
-function routeExists(
-  route: AppRoute,
-  snapshot: WebWorkspaceSnapshot,
-): boolean {
+function routeExists(route: AppRoute, snapshot: WebWorkspaceSnapshot): boolean {
   const sessionKey = stableSessionKeyForRoute(route);
   if (sessionKey) {
     return snapshot.sessions.some(
@@ -127,22 +122,22 @@ export function resolveColdStart(
       context.notificationRuntimeInstanceId !==
       context.snapshot.runtimeInstanceId
     ) {
-      return { name: "sessions" };
+      return { name: "tasks" };
     }
     const notificationRoute = context.notificationRoute ?? {
-      name: "sessions",
+      name: "tasks",
     };
     return routeExists(notificationRoute, context.snapshot)
       ? notificationRoute
-      : { name: "sessions" };
+      : { name: "tasks" };
   }
   if (!context.standalone || !context.launchEligible || !saved) {
     return initialRoute;
   }
   if (saved.runtimeInstanceId !== context.snapshot.runtimeInstanceId) {
-    return { name: "sessions" };
+    return { name: "tasks" };
   }
   return routeExists(saved.route, context.snapshot)
     ? saved.route
-    : { name: "sessions" };
+    : { name: "tasks" };
 }

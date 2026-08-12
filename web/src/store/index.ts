@@ -66,10 +66,7 @@ export interface PendingSemanticReplay extends SemanticReplayDescriptor {
 export interface RawTerminalSlice {
   activeStreamSessionId: string | null;
   streamSessionIdByStableKey: Record<StableSessionKey, string>;
-  terminalSubscribers: Map<
-    string,
-    Set<(frame: SessionOutputFrame) => void>
-  >;
+  terminalSubscribers: Map<string, Set<(frame: SessionOutputFrame) => void>>;
   pendingTerminalFrames: Map<string, SessionOutputFrame[]>;
   bootstrapSubscribers: Map<
     string,
@@ -152,7 +149,11 @@ export interface StoreState {
   refreshActiveConnection(): void;
   prepareComposer(): void;
   interruptSession(stableSessionKey: StableSessionKey): void;
-  sendInput(sessionId: string, text: string, inputKind?: WebTerminalInputKind): void;
+  sendInput(
+    sessionId: string,
+    text: string,
+    inputKind?: WebTerminalInputKind,
+  ): void;
   pasteImage(sessionId: string, payload: WebImagePastePayload): void;
   sendResize(sessionId: string, rows: number, cols: number): void;
   launchAiTab(projectId: string, tabType: "claude" | "codex"): Promise<void>;
@@ -176,7 +177,8 @@ export function selectAggregateBadgeCount(
   if (state.compatibilityDiagnostic !== null) return 0;
   if (state.runtimeInstanceId === null) return null;
   return Object.values(state.sessions).reduce((total, session) => {
-    if (!isLiveStatus(session.status) || session.attention === "none") return total;
+    if (!isLiveStatus(session.status) || session.attention === "none")
+      return total;
     return Math.min(99, total + Math.max(1, session.attentionCount));
   }, 0);
 }
@@ -236,7 +238,9 @@ function loadCollapsedProjects(): Set<string> {
     if (!raw) return new Set();
     const parsed = JSON.parse(raw) as unknown;
     return Array.isArray(parsed)
-      ? new Set(parsed.filter((value): value is string => typeof value === "string"))
+      ? new Set(
+          parsed.filter((value): value is string => typeof value === "string"),
+        )
       : new Set();
   } catch {
     return new Set();
@@ -263,17 +267,13 @@ function loadActiveProjectId(): string | null {
 }
 
 function routeForStableKey(stableSessionKey: StableSessionKey): string {
-  if (stableSessionKey.startsWith("tab:")) {
-    return `/session/tab/${stableSessionKey.slice("tab:".length)}`;
-  }
-  if (stableSessionKey.startsWith("server:")) {
-    return `/session/server/${stableSessionKey.slice("server:".length)}`;
-  }
-  return "/sessions";
+  return `/tasks/${encodeURIComponent(stableSessionKey)}`;
 }
 
 function isVisible(): boolean {
-  return typeof document === "undefined" || document.visibilityState !== "hidden";
+  return (
+    typeof document === "undefined" || document.visibilityState !== "hidden"
+  );
 }
 
 function sessionIndex(
@@ -313,7 +313,8 @@ function unreadIndex(
 function projectLegacySnapshot(
   workspace: WebWorkspaceSnapshot,
 ): LegacyWorkspaceProjection {
-  const runtimeSessions: LegacyWorkspaceProjection["runtimeState"]["sessions"] = {};
+  const runtimeSessions: LegacyWorkspaceProjection["runtimeState"]["sessions"] =
+    {};
   for (const session of workspace.sessions) {
     runtimeSessions[session.sessionId] = {
       session_id: session.sessionId,
@@ -334,7 +335,10 @@ function projectLegacySnapshot(
   );
   const portAuthorities = workspace.portAuthorities
     ? Object.fromEntries(
-        workspace.portAuthorities.map((authority) => [String(authority.port), authority]),
+        workspace.portAuthorities.map((authority) => [
+          String(authority.port),
+          authority,
+        ]),
       )
     : undefined;
   return {
@@ -416,8 +420,10 @@ function sameSubmission(
   text: string,
   attachments: ComposerAttachment[],
 ): boolean {
-  return pending.text === text &&
-    JSON.stringify(pending.attachments) === JSON.stringify(attachments);
+  return (
+    pending.text === text &&
+    JSON.stringify(pending.attachments) === JSON.stringify(attachments)
+  );
 }
 
 interface BoundedSemanticEvents {
@@ -435,10 +441,7 @@ function semanticEventBytes(event: SemanticEvent): number {
 function capSemanticEvents(events: SemanticEvent[]): BoundedSemanticEvents {
   let start = events.length;
   let retainedBytes = 0;
-  while (
-    start > 0 &&
-    events.length - start < MAX_SEMANTIC_EVENTS_PER_SESSION
-  ) {
+  while (start > 0 && events.length - start < MAX_SEMANTIC_EVENTS_PER_SESSION) {
     const nextBytes = semanticEventBytes(events[start - 1]);
     if (retainedBytes + nextBytes > MAX_SEMANTIC_BYTES_PER_SESSION) break;
     retainedBytes += nextBytes;
@@ -483,7 +486,10 @@ function filterRecord<T>(
   );
 }
 
-function filterSessionMap<T>(map: Map<string, T>, validIds: Set<string>): Map<string, T> {
+function filterSessionMap<T>(
+  map: Map<string, T>,
+  validIds: Set<string>,
+): Map<string, T> {
   return new Map([...map].filter(([sessionId]) => validIds.has(sessionId)));
 }
 
@@ -491,13 +497,14 @@ function stableKeyForStreamSession(
   state: Pick<StoreState, "rawTerminal" | "sessions">,
   sessionId: string,
 ): StableSessionKey | null {
-  const mapped = Object.entries(state.rawTerminal.streamSessionIdByStableKey).find(
-    ([, streamSessionId]) => streamSessionId === sessionId,
-  )?.[0];
+  const mapped = Object.entries(
+    state.rawTerminal.streamSessionIdByStableKey,
+  ).find(([, streamSessionId]) => streamSessionId === sessionId)?.[0];
   if (mapped) return mapped;
   return (
-    Object.values(state.sessions).find((session) => session.sessionId === sessionId)
-      ?.stableSessionKey ?? null
+    Object.values(state.sessions).find(
+      (session) => session.sessionId === sessionId,
+    )?.stableSessionKey ?? null
   );
 }
 
@@ -533,8 +540,13 @@ function rawTerminalWithoutSession(
   };
 }
 
-function knowsRawSession(rawTerminal: RawTerminalSlice, sessionId: string): boolean {
-  return Object.values(rawTerminal.streamSessionIdByStableKey).includes(sessionId);
+function knowsRawSession(
+  rawTerminal: RawTerminalSlice,
+  sessionId: string,
+): boolean {
+  return Object.values(rawTerminal.streamSessionIdByStableKey).includes(
+    sessionId,
+  );
 }
 
 function reconcileJournals(
@@ -560,9 +572,12 @@ function reconcileJournals(
       reconciled[stableSessionKey] = journal;
       continue;
     }
-    const hostRetained = session.oldestSequence > 0
-      ? journal.events.filter((event) => event.sequence >= session.oldestSequence)
-      : journal.events;
+    const hostRetained =
+      session.oldestSequence > 0
+        ? journal.events.filter(
+            (event) => event.sequence >= session.oldestSequence,
+          )
+        : journal.events;
     const bounded = capSemanticEvents(hostRetained);
     const trimmed = bounded.events.length !== journal.events.length;
     reconciled[stableSessionKey] = {
@@ -629,7 +644,9 @@ function decodeBootstrap(message: {
   }
 }
 
-function isAiTabPayload(payload: WebActionPayload | null | undefined): payload is WebActionPayload {
+function isAiTabPayload(
+  payload: WebActionPayload | null | undefined,
+): payload is WebActionPayload {
   return payload?.type === "aiTab";
 }
 
@@ -787,9 +804,11 @@ export const useStore = create<StoreState>((set, get) => {
         };
     const activeProjectId =
       current.activeProjectId &&
-      snapshot.projects.some((project) => project.id === current.activeProjectId)
+      snapshot.projects.some(
+        (project) => project.id === current.activeProjectId,
+      )
         ? current.activeProjectId
-        : snapshot.projects[0]?.id ?? null;
+        : (snapshot.projects[0]?.id ?? null);
 
     set({
       workspace: snapshot,
@@ -800,7 +819,9 @@ export const useStore = create<StoreState>((set, get) => {
       writerLease: snapshot.writerLease,
       activeSessionKey,
       activeProjectId,
-      journals: runtimeChanged ? {} : reconcileJournals(current.journals, nextSessions),
+      journals: runtimeChanged
+        ? {}
+        : reconcileJournals(current.journals, nextSessions),
       semanticReplay:
         runtimeChanged ||
         !current.semanticReplay ||
@@ -810,12 +831,16 @@ export const useStore = create<StoreState>((set, get) => {
       semanticGapKeys: runtimeChanged
         ? new Set()
         : new Set(
-            [...current.semanticGapKeys].filter((key) => validStableKeys.has(key)),
+            [...current.semanticGapKeys].filter((key) =>
+              validStableKeys.has(key),
+            ),
           ),
       semanticGapSequences: runtimeChanged
         ? {}
         : filterRecord(current.semanticGapSequences, validStableKeys),
-      drafts: runtimeChanged ? {} : filterRecord(current.drafts, validStableKeys),
+      drafts: runtimeChanged
+        ? {}
+        : filterRecord(current.drafts, validStableKeys),
       compatibleDraftHandoffTargetBuildId: null,
       composerSafety: runtimeChanged
         ? {}
@@ -824,7 +849,7 @@ export const useStore = create<StoreState>((set, get) => {
       pendingRoute: runtimeChanged
         ? null
         : current.activeSessionKey && !activeSessionKey
-          ? "/sessions"
+          ? "/tasks"
           : current.pendingRoute,
       pendingMutations: runtimeChanged
         ? {}
@@ -884,7 +909,8 @@ export const useStore = create<StoreState>((set, get) => {
 
     if (!resumeState.hardReset) {
       const desiredSessionKey =
-        resumeState.desiredSessionKey && get().sessions[resumeState.desiredSessionKey]
+        resumeState.desiredSessionKey &&
+        get().sessions[resumeState.desiredSessionKey]
           ? resumeState.desiredSessionKey
           : null;
       set({
@@ -969,7 +995,9 @@ export const useStore = create<StoreState>((set, get) => {
         if (!knowsRawSession(get().rawTerminal, message.sessionId)) break;
         const bootstrap = decodeBootstrap(message);
         if (!bootstrap) break;
-        const subscribers = get().rawTerminal.bootstrapSubscribers.get(message.sessionId);
+        const subscribers = get().rawTerminal.bootstrapSubscribers.get(
+          message.sessionId,
+        );
         if (subscribers?.size) {
           subscribers.forEach((listener) => listener(bootstrap));
         } else {
@@ -986,7 +1014,10 @@ export const useStore = create<StoreState>((set, get) => {
         break;
       }
       case "sessionClosed": {
-        const stableSessionKey = stableKeyForStreamSession(get(), message.sessionId);
+        const stableSessionKey = stableKeyForStreamSession(
+          get(),
+          message.sessionId,
+        );
         get().client?.discardWriterFramesForSession(
           message.sessionId,
           stableSessionKey,
@@ -1004,7 +1035,10 @@ export const useStore = create<StoreState>((set, get) => {
       }
       case "sessionRemoved": {
         const before = get();
-        const stableSessionKey = stableKeyForStreamSession(before, message.sessionId);
+        const stableSessionKey = stableKeyForStreamSession(
+          before,
+          message.sessionId,
+        );
         const pendingMutation = stableSessionKey
           ? before.pendingMutations[stableSessionKey]
           : undefined;
@@ -1050,12 +1084,15 @@ export const useStore = create<StoreState>((set, get) => {
             delete semanticGapSequences[stableSessionKey];
             delete pendingMutations[stableSessionKey];
           }
-          const removedActiveSession = state.activeSessionKey === stableSessionKey;
+          const removedActiveSession =
+            state.activeSessionKey === stableSessionKey;
           return {
             workspace,
             snapshot: workspace ? projectLegacySnapshot(workspace) : null,
             sessions,
-            activeSessionKey: removedActiveSession ? null : state.activeSessionKey,
+            activeSessionKey: removedActiveSession
+              ? null
+              : state.activeSessionKey,
             journals,
             semanticReplay:
               state.semanticReplay?.stableSessionKey === stableSessionKey
@@ -1066,7 +1103,7 @@ export const useStore = create<StoreState>((set, get) => {
             drafts,
             composerSafety,
             unread,
-            pendingRoute: removedActiveSession ? "/sessions" : state.pendingRoute,
+            pendingRoute: removedActiveSession ? "/tasks" : state.pendingRoute,
             pendingMutations,
             rawTerminal: rawTerminalWithoutSession(
               state.rawTerminal,
@@ -1263,7 +1300,8 @@ export const useStore = create<StoreState>((set, get) => {
         }
         set({
           status: { kind: "closed", reason: "invalid websocket handshake" },
-          lastError: "The host did not send a valid web hello before session data.",
+          lastError:
+            "The host did not send a valid web hello before session data.",
         });
       };
       const client = new WsClient({
@@ -1294,11 +1332,13 @@ export const useStore = create<StoreState>((set, get) => {
             seenRevision: state.revision,
             route:
               state.pendingRoute ??
-              (stableSessionKey ? routeForStableKey(stableSessionKey) : "/sessions"),
+              (stableSessionKey
+                ? routeForStableKey(stableSessionKey)
+                : "/tasks"),
             desiredSessionKey: stableSessionKey,
             rawSessionId: state.rawTerminal.activeStreamSessionId,
             semanticAfterSequence: stableSessionKey
-              ? state.journals[stableSessionKey]?.latestSequence ?? null
+              ? (state.journals[stableSessionKey]?.latestSequence ?? null)
               : null,
             visible,
             wantsWriterLease: visible,
@@ -1354,15 +1394,20 @@ export const useStore = create<StoreState>((set, get) => {
     applySemanticReplayPage(page) {
       const replayAtStart = get().semanticReplay;
       const completedBufferedEvents =
-        page.complete && replayAtStart && pageContinuesReplay(replayAtStart, page)
-          ? replayAtStart.bufferedLiveEvents ?? []
+        page.complete &&
+        replayAtStart &&
+        pageContinuesReplay(replayAtStart, page)
+          ? (replayAtStart.bufferedLiveEvents ?? [])
           : [];
       set((state) => {
         const replay = state.semanticReplay;
         if (!replay || !pageContinuesReplay(replay, page)) return state;
 
         const existing = state.journals[page.stableSessionKey];
-        const mergedEvents = mergeOrderedEvents(existing?.events ?? [], page.events);
+        const mergedEvents = mergeOrderedEvents(
+          existing?.events ?? [],
+          page.events,
+        );
         const bounded = capSemanticEvents(mergedEvents);
         const journal: BoundedSemanticJournalState = {
           stableSessionKey: page.stableSessionKey,
@@ -1396,15 +1441,19 @@ export const useStore = create<StoreState>((set, get) => {
           semanticGapSequences,
         };
       });
-      completedBufferedEvents.forEach((event) => get().appendSemanticEvent(event));
+      completedBufferedEvents.forEach((event) =>
+        get().appendSemanticEvent(event),
+      );
     },
 
     appendSemanticEvent(event) {
       let requestReplay = false;
       set((state) => {
         const existing = state.journals[event.stableSessionKey];
-        const retainedStart = state.sessions[event.stableSessionKey]?.oldestSequence ?? 1;
-        const contiguousCursor = existing?.latestSequence ?? Math.max(0, retainedStart - 1);
+        const retainedStart =
+          state.sessions[event.stableSessionKey]?.oldestSequence ?? 1;
+        const contiguousCursor =
+          existing?.latestSequence ?? Math.max(0, retainedStart - 1);
         if (event.sequence <= contiguousCursor) return state;
         if (state.semanticReplay?.stableSessionKey === event.stableSessionKey) {
           const replay = state.semanticReplay;
@@ -1460,10 +1509,12 @@ export const useStore = create<StoreState>((set, get) => {
         const journal: BoundedSemanticJournalState = {
           stableSessionKey: event.stableSessionKey,
           oldestSequence: bounded.events[0]?.sequence ?? 0,
-          latestSequence: Math.max(existing?.latestSequence ?? 0, event.sequence),
+          latestSequence: Math.max(
+            existing?.latestSequence ?? 0,
+            event.sequence,
+          ),
           cursorRolledOver:
-            (existing?.cursorRolledOver ?? false) ||
-            bounded.evicted,
+            (existing?.cursorRolledOver ?? false) || bounded.evicted,
           events: bounded.events,
           retainedBytes: bounded.retainedBytes,
         };
@@ -1590,7 +1641,7 @@ export const useStore = create<StoreState>((set, get) => {
               [stableSessionKey]:
                 current.drafts[stableSessionKey] === pending.text
                   ? ""
-                  : current.drafts[stableSessionKey] ?? "",
+                  : (current.drafts[stableSessionKey] ?? ""),
             },
             lastError: null,
           };
@@ -1610,7 +1661,9 @@ export const useStore = create<StoreState>((set, get) => {
           return {
             pendingMutations,
             lastError:
-              error instanceof Error ? error.message : "Composer submission failed.",
+              error instanceof Error
+                ? error.message
+                : "Composer submission failed.",
           };
         });
         throw error;
@@ -1631,7 +1684,7 @@ export const useStore = create<StoreState>((set, get) => {
           set({
             lastError: result.ok
               ? null
-              : result.message ?? "Remote action failed.",
+              : (result.message ?? "Remote action failed."),
           });
         })
         .catch((error: unknown) => {
@@ -1650,7 +1703,8 @@ export const useStore = create<StoreState>((set, get) => {
     setActiveProject(projectId) {
       set({ activeProjectId: projectId });
       try {
-        if (projectId) globalThis.localStorage?.setItem(ACTIVE_PROJECT_KEY, projectId);
+        if (projectId)
+          globalThis.localStorage?.setItem(ACTIVE_PROJECT_KEY, projectId);
         else globalThis.localStorage?.removeItem(ACTIVE_PROJECT_KEY);
       } catch {
         // UI preference only.
@@ -1666,7 +1720,7 @@ export const useStore = create<StoreState>((set, get) => {
         activeSessionKey: stableSessionKey,
         pendingRoute: stableSessionKey
           ? routeForStableKey(stableSessionKey)
-          : "/sessions",
+          : "/tasks",
       });
       get().client?.wake();
     },
@@ -1766,7 +1820,8 @@ export const useStore = create<StoreState>((set, get) => {
     },
 
     drainTerminalFrames(sessionId) {
-      const frames = get().rawTerminal.pendingTerminalFrames.get(sessionId) ?? [];
+      const frames =
+        get().rawTerminal.pendingTerminalFrames.get(sessionId) ?? [];
       if (!frames.length) return [];
       set((state) => {
         const pendingTerminalFrames = new Map(
@@ -1820,7 +1875,9 @@ export const useStore = create<StoreState>((set, get) => {
       });
       set({
         lastError:
-          accepted === false ? "Too much terminal input is waiting to be sent." : null,
+          accepted === false
+            ? "Too much terminal input is waiting to be sent."
+            : null,
       });
     },
 

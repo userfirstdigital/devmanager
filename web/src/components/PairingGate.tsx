@@ -35,7 +35,7 @@ export function PairingGate() {
         );
         return;
       }
-      window.location.href = "/sessions";
+      window.location.href = "/tasks";
     } catch (reason) {
       setSubmitting(false);
       setError(

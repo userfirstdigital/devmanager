@@ -30,9 +30,9 @@ import {
   NOTIFICATION_RUNTIME_QUERY,
   reconcilePushNotificationsOnForeground,
 } from "./pwa/notifications";
-import { SessionScreen } from "./sessions/SessionScreen";
-import { SessionsScreen } from "./sessions/SessionsScreen";
-import { countActionableAttention } from "./sessions/sessionModel";
+import { TaskScreen } from "./tasks/TaskScreen";
+import { TasksScreen } from "./tasks/TasksScreen";
+import { countActionableAttention } from "./tasks/taskModel";
 import { SettingsScreen } from "./settings/SettingsScreen";
 import { useStore } from "./store";
 
@@ -47,7 +47,10 @@ function routeExists(
   workspace: NonNullable<ReturnType<typeof useStore.getState>["workspace"]>,
 ): boolean {
   const key = stableSessionKeyForRoute(route);
-  if (key) return workspace.sessions.some((session) => session.stableSessionKey === key);
+  if (key)
+    return workspace.sessions.some(
+      (session) => session.stableSessionKey === key,
+    );
   if (route.name === "project") {
     return workspace.projects.some((project) => project.id === route.projectId);
   }
@@ -57,9 +60,15 @@ function routeExists(
 function LoadingHost({ offline }: { offline: boolean }) {
   return (
     <main className="dm-launch-state">
-      <span className="dm-launch-logo" aria-hidden="true"><TerminalSquare size={30} /></span>
+      <span className="dm-launch-logo" aria-hidden="true">
+        <TerminalSquare size={30} />
+      </span>
       <h1>DevManager</h1>
-      <p>{offline ? "Waiting for the DevManager host…" : "Connecting to your workspace…"}</p>
+      <p>
+        {offline
+          ? "Waiting for the DevManager host…"
+          : "Connecting to your workspace…"}
+      </p>
       <span className="dm-native-spinner" aria-hidden="true" />
     </main>
   );
@@ -70,7 +79,9 @@ export function App() {
   const hostStatus = useStore((state) => state.status);
   const hostWorkspace = useStore((state) => state.workspace);
   const foregroundConnection = useStore((state) => state.foregroundConnection);
-  const setConnectionVisibility = useStore((state) => state.setConnectionVisibility);
+  const setConnectionVisibility = useStore(
+    (state) => state.setConnectionVisibility,
+  );
   const setActiveSession = useStore((state) => state.setActiveSession);
   const activeSessionKey = useStore((state) => state.activeSessionKey);
   const pendingRoute = useStore((state) => state.pendingRoute);
@@ -82,7 +93,10 @@ export function App() {
   const standalone = useRef(isStandaloneDisplayMode());
   const launchEligible = useRef(
     typeof window !== "undefined" &&
-      isInstalledLaunchEligible(window.location.pathname, window.location.search),
+      isInstalledLaunchEligible(
+        window.location.pathname,
+        window.location.search,
+      ),
   );
   const notificationRuntimeInstanceId = useRef(
     typeof window === "undefined"
@@ -99,7 +113,7 @@ export function App() {
       );
       if (!encodedRoute) return null;
       const parsed = parseRoute(encodedRoute);
-      return parsed.name === "session" ? parsed : null;
+      return parsed.name === "task" ? parsed : null;
     })(),
   );
   const resolvedRuntime = useRef<string | null>(null);
@@ -125,7 +139,10 @@ export function App() {
   }, [foregroundConnection, setConnectionVisibility]);
 
   useEffect(() => {
-    const onPopState = () => setRoute(parseRoute(`${window.location.pathname}${window.location.search}`));
+    const onPopState = () =>
+      setRoute(
+        parseRoute(`${window.location.pathname}${window.location.search}`),
+      );
     window.addEventListener("popstate", onPopState);
     return () => window.removeEventListener("popstate", onPopState);
   }, []);
@@ -153,14 +170,20 @@ export function App() {
     );
 
     if (resolvedRuntime.current === null) {
-      const resolved = resolveColdStart(initialRoute.current, savedRoute.current, {
-        standalone: standalone.current,
-        launchEligible: launchEligible.current,
-        snapshot: workspace,
-        notificationRuntimeInstanceId: notificationRuntimeInstanceId.current,
-        notificationRoute: notificationRoute.current,
-      });
-      const validated = routeExists(resolved, workspace) ? resolved : { name: "sessions" } as AppRoute;
+      const resolved = resolveColdStart(
+        initialRoute.current,
+        savedRoute.current,
+        {
+          standalone: standalone.current,
+          launchEligible: launchEligible.current,
+          snapshot: workspace,
+          notificationRuntimeInstanceId: notificationRuntimeInstanceId.current,
+          notificationRoute: notificationRoute.current,
+        },
+      );
+      const validated = routeExists(resolved, workspace)
+        ? resolved
+        : ({ name: "tasks" } as AppRoute);
       resolvedRuntime.current = workspace.runtimeInstanceId;
       const browserLocation = `${window.location.pathname}${window.location.search}`;
       if (
@@ -168,10 +191,12 @@ export function App() {
         !isCanonicalRouteLocation(validated, browserLocation)
       ) {
         moveTo(validated, { replace: true });
-      }
-      else setActiveSession(stableSessionKeyForRoute(validated));
+      } else setActiveSession(stableSessionKeyForRoute(validated));
       if (standalone.current) {
-        writeSavedRoute({ runtimeInstanceId: workspace.runtimeInstanceId, route: validated });
+        writeSavedRoute({
+          runtimeInstanceId: workspace.runtimeInstanceId,
+          route: validated,
+        });
       }
       return;
     }
@@ -179,10 +204,14 @@ export function App() {
     if (resolvedRuntime.current !== workspace.runtimeInstanceId) {
       resolvedRuntime.current = workspace.runtimeInstanceId;
       lastPersistedRoute.current = null;
-      const freshRoute: AppRoute = { name: "sessions" };
-      if (!routesEqual(route, freshRoute)) moveTo(freshRoute, { replace: true });
+      const freshRoute: AppRoute = { name: "tasks" };
+      if (!routesEqual(route, freshRoute))
+        moveTo(freshRoute, { replace: true });
       if (standalone.current) {
-        writeSavedRoute({ runtimeInstanceId: workspace.runtimeInstanceId, route: freshRoute });
+        writeSavedRoute({
+          runtimeInstanceId: workspace.runtimeInstanceId,
+          route: freshRoute,
+        });
       }
       return;
     }
@@ -191,12 +220,16 @@ export function App() {
       !routeExists(route, workspace) &&
       pendingRoute !== hrefForRoute(route)
     ) {
-      moveTo(route.name === "project" ? { name: "projects" } : { name: "sessions" }, { replace: true });
+      moveTo(
+        route.name === "project" ? { name: "projects" } : { name: "tasks" },
+        { replace: true },
+      );
     }
   }, [moveTo, pendingRoute, route, setActiveSession, workspace]);
 
   useEffect(() => {
-    if (!workspace || resolvedRuntime.current !== workspace.runtimeInstanceId) return;
+    if (!workspace || resolvedRuntime.current !== workspace.runtimeInstanceId)
+      return;
     const desiredSessionKey = stableSessionKeyForRoute(route);
     if (
       (desiredSessionKey === null || routeExists(route, workspace)) &&
@@ -208,7 +241,10 @@ export function App() {
       const persistenceKey = `${workspace.runtimeInstanceId}:${hrefForRoute(route)}`;
       if (lastPersistedRoute.current !== persistenceKey) {
         lastPersistedRoute.current = persistenceKey;
-        writeSavedRoute({ runtimeInstanceId: workspace.runtimeInstanceId, route });
+        writeSavedRoute({
+          runtimeInstanceId: workspace.runtimeInstanceId,
+          route,
+        });
       }
     }
   }, [activeSessionKey, route, setActiveSession, workspace]);
@@ -223,8 +259,8 @@ export function App() {
 
   let screen;
   switch (route.name) {
-    case "sessions":
-      screen = <SessionsScreen workspace={workspace} onNavigate={moveTo} />;
+    case "tasks":
+      screen = <TasksScreen workspace={workspace} onNavigate={moveTo} />;
       break;
     case "projects":
       screen = <ProjectsScreen workspace={workspace} onNavigate={moveTo} />;
@@ -242,9 +278,9 @@ export function App() {
     case "settings":
       screen = <SettingsScreen status={status} />;
       break;
-    case "session":
+    case "task":
       screen = (
-        <SessionScreen
+        <TaskScreen
           route={route}
           workspace={workspace}
           status={status}

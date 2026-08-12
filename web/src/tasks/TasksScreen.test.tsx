@@ -8,7 +8,7 @@ import {
   type WebSessionSummary,
   type WebWorkspaceSnapshot,
 } from "../api/types";
-import { SessionsScreen } from "./SessionsScreen";
+import { TasksScreen } from "./TasksScreen";
 
 afterEach(() => {
   cleanup();
@@ -92,7 +92,7 @@ function workspace(sessions: WebSessionSummary[]): WebWorkspaceSnapshot {
   };
 }
 
-describe("SessionsScreen", () => {
+describe("TasksScreen", () => {
   it("renders Live now before Recent and exposes title, project, provider, state, and activity", () => {
     const onNavigate = vi.fn();
     const live = session("tab:live-ai", {
@@ -113,18 +113,26 @@ describe("SessionsScreen", () => {
     });
 
     render(
-      <SessionsScreen
+      <TasksScreen
         workspace={workspace([endedFailed, stoppedServer, live])}
         onNavigate={onNavigate}
       />,
     );
 
-    const headings = screen.getAllByRole("heading", { level: 2 }).map((node) => node.textContent);
+    const headings = screen
+      .getAllByRole("heading", { level: 2 })
+      .map((node) => node.textContent);
     expect(headings[0]).toMatch(/live now/i);
-    expect(headings.indexOf(headings.find((text) => /recent/i.test(text ?? "")) ?? "")).toBeGreaterThan(
+    expect(
+      headings.indexOf(
+        headings.find((text) => /recent/i.test(text ?? "")) ?? "",
+      ),
+    ).toBeGreaterThan(
       headings.findIndex((text) => /live now/i.test(text ?? "")),
     );
-    expect(screen.queryByRole("heading", { name: /needs attention/i })).toBeNull();
+    expect(
+      screen.queryByRole("heading", { name: /needs attention/i }),
+    ).toBeNull();
 
     const liveRow = screen.getByRole("button", {
       name: /Fix sessions ordering, DevManager, Claude, Needs input,/i,
@@ -136,12 +144,20 @@ describe("SessionsScreen", () => {
     expect(copy?.children[1]?.textContent).toMatch(/DevManager/);
     expect(copy?.children[1]?.textContent).toMatch(/Claude/);
     expect(copy?.children[1]?.textContent).toMatch(/Needs input/);
-    expect(within(liveRow).getByText("DevManager").closest(".dm-session-secondary")).not.toBeNull();
+    expect(
+      within(liveRow).getByText("DevManager").closest(".dm-session-secondary"),
+    ).not.toBeNull();
 
-    const recentSection = screen.getByRole("heading", { name: /recent/i }).closest("section");
+    const recentSection = screen
+      .getByRole("heading", { name: /recent/i })
+      .closest("section");
     expect(recentSection).not.toBeNull();
-    expect(within(recentSection as HTMLElement).getByText("Old crash").isConnected).toBe(true);
-    expect(within(recentSection as HTMLElement).getByText("Web app").isConnected).toBe(true);
+    expect(
+      within(recentSection as HTMLElement).getByText("Old crash").isConnected,
+    ).toBe(true);
+    expect(
+      within(recentSection as HTMLElement).getByText("Web app").isConnected,
+    ).toBe(true);
     expect(
       within(recentSection as HTMLElement).queryByLabelText(/unread updates/i),
     ).toBeNull();
