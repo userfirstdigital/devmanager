@@ -202,7 +202,7 @@ fn requested_relative_path(target: &str) -> Result<String, u16> {
     if path.contains('\\') || path.contains('\0') {
         return Err(400);
     }
-    let decoded = percent_decode(path).map_err(|_| 400)?;
+    let decoded = percent_decode(path).map_err(|_| 400_u16)?;
     if decoded.contains('\0') || decoded.contains('\\') {
         return Err(400);
     }
@@ -231,7 +231,7 @@ fn resolve_static_file(root: &Path, target: &str) -> Result<PathBuf, u16> {
     if !joined.is_file() {
         return Err(404);
     }
-    let canon = joined.canonicalize().map_err(|_| 404)?;
+    let canon = joined.canonicalize().map_err(|_| 404_u16)?;
     if !path_is_within(root, &canon) {
         return Err(400);
     }
@@ -267,7 +267,7 @@ async fn read_request(stream: &mut TcpStream) -> Result<ParsedRequest, u16> {
     let mut buffer = Vec::new();
     let mut chunk = [0u8; 1024];
     loop {
-        let read = stream.read(&mut chunk).await.map_err(|_| 400)?;
+        let read = stream.read(&mut chunk).await.map_err(|_| 400_u16)?;
         if read == 0 {
             return Err(400);
         }
@@ -288,7 +288,7 @@ async fn read_request(stream: &mut TcpStream) -> Result<ParsedRequest, u16> {
                 let read = stream
                     .read(&mut chunk[..remaining.min(chunk.len())])
                     .await
-                    .map_err(|_| 400)?;
+                    .map_err(|_| 400_u16)?;
                 if read == 0 {
                     return Err(400);
                 }
@@ -307,16 +307,16 @@ fn find_header_end(buffer: &[u8]) -> Option<usize> {
 }
 
 fn parse_headers(block: &[u8]) -> Result<ParsedRequest, u16> {
-    let text = std::str::from_utf8(block).map_err(|_| 400)?;
+    let text = std::str::from_utf8(block).map_err(|_| 400_u16)?;
     let mut lines = text.split("\r\n");
-    let request_line = lines.next().ok_or(400)?;
+    let request_line = lines.next().ok_or(400_u16)?;
     if request_line.len() > MAX_REQUEST_LINE_BYTES {
         return Err(413);
     }
     let mut parts = request_line.split_whitespace();
-    let method = parts.next().ok_or(400)?.to_ascii_uppercase();
-    let target = parts.next().ok_or(400)?.to_string();
-    let version = parts.next().ok_or(400)?;
+    let method = parts.next().ok_or(400_u16)?.to_ascii_uppercase();
+    let target = parts.next().ok_or(400_u16)?.to_string();
+    let version = parts.next().ok_or(400_u16)?;
     if parts.next().is_some() || !matches!(version, "HTTP/1.0" | "HTTP/1.1") {
         return Err(400);
     }
@@ -335,9 +335,9 @@ fn parse_headers(block: &[u8]) -> Result<ParsedRequest, u16> {
         {
             return Err(413);
         }
-        let (name, value) = line.split_once(':').ok_or(400)?;
+        let (name, value) = line.split_once(':').ok_or(400_u16)?;
         if name.eq_ignore_ascii_case("content-length") {
-            content_length = value.trim().parse::<usize>().map_err(|_| 400)?;
+            content_length = value.trim().parse::<usize>().map_err(|_| 400_u16)?;
             if content_length > MAX_BODY_BYTES {
                 return Err(413);
             }
@@ -450,7 +450,7 @@ async fn serve_request(
     let body = if request.method == "HEAD" {
         Vec::new()
     } else {
-        std::fs::read(&path).map_err(|_| 404)?
+        std::fs::read(&path).map_err(|_| 404_u16)?
     };
     Ok((content_type_for(&path), body))
 }
