@@ -2238,6 +2238,7 @@ mod tests {
             resource_probe: Mutex::new(None),
             live_host_build: Mutex::new(None),
             live_protocol: Mutex::new(None),
+            prepared_token: Mutex::new(None),
         }
     }
 
