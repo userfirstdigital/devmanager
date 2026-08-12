@@ -417,10 +417,21 @@ impl OrganizationRuntimeHandle {
                     }));
                 }
                 let outcome = {
-                    let sync = state.sync.as_mut().expect("sync checked above");
+                    // Split the state into disjoint field borrows before calling the
+                    // driver. The driver mutates the projection while it needs the
+                    // store immutably, and also owns mutable access to the sync
+                    // runtime. Keeping those borrows explicit avoids borrowing the
+                    // whole `MutexGuard` through `state.sync` first.
+                    let OrganizationRuntimeState {
+                        sync,
+                        projection,
+                        store,
+                        ..
+                    } = &mut *state;
+                    let sync = sync.as_mut().expect("sync checked above");
                     sync.reconcile(
-                        &mut state.projection,
-                        &state.store,
+                        projection,
+                        store,
                         PortalReconcileRequest {
                             host_id,
                             local_confirmation,
