@@ -712,6 +712,9 @@ fn capability_for(state: &OrganizationRuntimeState) -> OrganizationCapabilitySta
 }
 
 fn snapshot_for(state: &OrganizationRuntimeState) -> OrganizationSnapshot {
+    if state.closed {
+        return OrganizationSnapshot::closed();
+    }
     let membership = state.projection.membership();
     OrganizationSnapshot {
         sync_state: state.projection.sync_state(),
