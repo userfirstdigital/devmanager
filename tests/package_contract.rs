@@ -334,7 +334,8 @@ fn package_contract_windows_metadata_is_stamped_per_shipping_binary() {
 #[test]
 fn package_manifest_fixture_accepts_sibling_identity_and_rejects_legacy_or_missing_host() {
     let contract = package_contract();
-    let version = cargo_package_version(&cargo_toml());
+    let cargo_toml = cargo_toml();
+    let version = cargo_package_version(&cargo_toml);
     let fixtures = repo_root().join("tests/fixtures/package");
 
     validate_manifest(
