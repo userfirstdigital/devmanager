@@ -672,6 +672,7 @@ fn accepted_side_effect_is_not_settled() {
         QueryOutcome::Ok(QueryResult::OperationStatus { state, .. }) => {
             assert!(matches!(state, OperationState::Accepted));
         }
+        QueryOutcome::Ok(other) => panic!("expected operation status, got {other:?}"),
         QueryOutcome::Err(_) => panic!("expected ok"),
     }
     let _query = QueryEnvelope {
