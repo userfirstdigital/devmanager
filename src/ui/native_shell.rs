@@ -57,6 +57,7 @@ use crate::ui::actions::{
     TaskCreate, TaskListAction, TaskRename, TaskShow,
 };
 use crate::ui::components::interaction::{FocusEpoch, FocusEpochSource};
+use crate::ui::components::status_light::{ExternalPortStatus, StatusLight};
 use crate::ui::components::{
     AccessibilityMetadata, AccessibleRole, ActionEvent, ActionRequest, ActivationSource,
     InteractionStateModel,
@@ -74,13 +75,14 @@ use crate::ui::task_cockpit::shell::TaskCockpitShell;
 use crate::ui::task_cockpit::{
     one_fresh_quota_observations, project_services_from_task_projection, project_services_panel,
     render_task_browser_dock, summary_line, update_observation_from_snapshot, Inbox,
-    InboxPresentationWidth, InboxRenderModel, ServicesPanelProjection, TaskBrowserDockModel,
-    TaskHeaderModel, TaskList, TopBarProjectionController, TopBarProjectionInput, UpdateState,
-    DEFAULT_VISIBLE_ROWS, FIXED_VIRTUAL_OVERSCAN,
+    InboxPresentationWidth, InboxRenderModel, ServicePanelAction, ServicePanelTone,
+    ServicesPanelProjection, TaskBrowserDockModel, TaskHeaderModel, TaskList,
+    TopBarProjectionController, TopBarProjectionInput, UpdateState, DEFAULT_VISIBLE_ROWS,
+    FIXED_VIRTUAL_OVERSCAN,
 };
 use crate::ui::terminal_adapter::TerminalDockAdapter;
 pub use crate::ui::terminal_adapter::{TerminalDockState, TERMINAL_ADAPTER_DEPENDENCY};
-use crate::ui::tokens::RuntimePreferencesSnapshot;
+use crate::ui::tokens::{RuntimePreferencesSnapshot, StatusMeaning};
 use crate::updater::{UpdaterService, UpdaterSnapshot, UpdaterStage};
 
 /// Explicit UI action: acknowledged client detach (host survives in production).
@@ -3906,6 +3908,17 @@ fn update_state_from_stage(stage: UpdaterStage) -> UpdateState {
     }
 }
 
+fn service_panel_action_label(action: ServicePanelAction) -> &'static str {
+    match action {
+        ServicePanelAction::Start => "Start",
+        ServicePanelAction::Stop => "Stop",
+        ServicePanelAction::Restart => "Restart",
+        ServicePanelAction::Logs => "Logs",
+        ServicePanelAction::Health => "Health",
+        ServicePanelAction::OpenTerminal => "Terminal",
+    }
+}
+
 pub(crate) enum NativeHostRuntimeAttachment {
     Client(NativeHostClientRuntime),
     Injected(Box<dyn NativeHostRuntimePort>),
@@ -6873,27 +6886,240 @@ impl NativeShell {
             .into_any_element()
     }
 
-    fn services_dock_surface(&self, tokens: crate::ui::tokens::ThemeTokens) -> AnyElement {
-        let action_count = self
+    fn service_action_request(
+        &self,
+        task_id: TaskId,
+        service_id: &crate::services::model::ServiceId,
+        action: ServicePanelAction,
+        epochs: NativeActionEpochs,
+    ) -> Option<ActionRequest> {
+        let arguments = crate::client::action::ServiceControlArguments {
+            service_id: service_id.clone(),
+            resource_generation: epochs.resource_generation,
+            connection_epoch: epochs.connection_epoch,
+            action_epoch: epochs.action_epoch,
+        };
+        match action {
+            ServicePanelAction::Start => Some(ActionRequest::ServiceControl {
+                action: crate::domain::command::ServiceControlAction::Start,
+                arguments,
+            }),
+            ServicePanelAction::Stop => Some(ActionRequest::ServiceControl {
+                action: crate::domain::command::ServiceControlAction::Stop,
+                arguments,
+            }),
+            ServicePanelAction::Restart => Some(ActionRequest::ServiceControl {
+                action: crate::domain::command::ServiceControlAction::Restart,
+                arguments,
+            }),
+            ServicePanelAction::Logs | ServicePanelAction::Health => {
+                let service_id =
+                    crate::domain::id::ConfiguredServiceId::new(service_id.as_str()).ok()?;
+                let query = if action == ServicePanelAction::Logs {
+                    TaskCockpitQuery::ServiceLogs {
+                        service_id,
+                        resource_generation: epochs.resource_generation,
+                        connection_epoch: epochs.connection_epoch,
+                        action_epoch: epochs.action_epoch,
+                    }
+                } else {
+                    TaskCockpitQuery::ServiceHealth {
+                        service_id,
+                        resource_generation: epochs.resource_generation,
+                        connection_epoch: epochs.connection_epoch,
+                        action_epoch: epochs.action_epoch,
+                    }
+                };
+                Some(ActionRequest::TaskCockpit { task_id, query })
+            }
+            ServicePanelAction::OpenTerminal => None,
+        }
+    }
+
+    fn service_action_is_current(
+        &self,
+        task_id: TaskId,
+        service_id: &crate::services::model::ServiceId,
+        epochs: NativeActionEpochs,
+    ) -> bool {
+        self.interaction.selected_task() == Some(task_id)
+            && self.interaction.action_epochs() == epochs
+            && self
+                .services_projection
+                .rows
+                .iter()
+                .any(|row| row.service_id == *service_id)
+    }
+
+    fn services_dock_surface(
+        &self,
+        tokens: crate::ui::tokens::ThemeTokens,
+        shell_entity: Option<gpui::WeakEntity<NativeShell>>,
+    ) -> AnyElement {
+        let epochs = self.interaction.action_epochs();
+        let task_id = self.interaction.selected_task();
+        let rows = self
             .services_projection
             .rows
             .iter()
-            .map(|row| row.actions.len())
-            .sum::<usize>();
+            .map(|row| {
+                let tone = match row.tone {
+                    ServicePanelTone::Blue => StatusMeaning::External,
+                    ServicePanelTone::Green => StatusMeaning::Success,
+                    ServicePanelTone::Orange => StatusMeaning::Warning,
+                    ServicePanelTone::Red => StatusMeaning::Destructive,
+                    ServicePanelTone::Gray | ServicePanelTone::Neutral => {
+                        StatusMeaning::Inactive
+                    }
+                };
+                let state_label = format!("{:?}", row.state);
+                let description = format!(
+                    "{} · {} · {}",
+                    row.ownership_summary, row.health_summary, row.dependency_summary
+                );
+                let status = if row.tone == ServicePanelTone::Blue {
+                    let port = row
+                        .port_label
+                        .clone()
+                        .unwrap_or_else(|| "external listener".to_string());
+                    StatusLight::external_port(
+                        ExternalPortStatus::new(
+                            format!("{} · {}", row.service_id, port),
+                            description.clone(),
+                        )
+                        .expect("projected external service status is bounded"),
+                    )
+                    .expect("projected external service status is bounded")
+                } else {
+                    StatusLight::new(tone, state_label.clone(), description.clone())
+                        .expect("projected service status is bounded")
+                };
+                let service_id = row.service_id.clone();
+                let controls = row
+                    .actions
+                    .iter()
+                    .map(|affordance| {
+                        let label = service_panel_action_label(affordance.action);
+                        let action = affordance.action;
+                        let control_id = format!(
+                            "native-service-{}-{}",
+                            service_id.as_str(),
+                            label.to_ascii_lowercase()
+                        );
+                        let mut control = div()
+                            .id(control_id)
+                            .px(px(tokens.density.spacing.sm))
+                            .py(px(tokens.density.spacing.xs))
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(tokens.borders.subtle.to_gpui())
+                            .child(label);
+                        if affordance.enabled {
+                            if let Some(task_id) = task_id {
+                                if let Some(shell_entity) = shell_entity.clone() {
+                                    let service_id_for_action = service_id.clone();
+                                    control = control
+                                        .cursor_pointer()
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            move |event, _window, app| {
+                                                if event.button != MouseButton::Left {
+                                                    return;
+                                                }
+                                                let service_id = service_id_for_action.clone();
+                                                let _ = shell_entity.update(app, |shell, cx| {
+                                                    cx.stop_propagation();
+                                                    if !shell.service_action_is_current(
+                                                        task_id,
+                                                        &service_id,
+                                                        epochs,
+                                                    ) {
+                                                        shell.last_query_detail = Some(
+                                                            "Service action expired; refresh the host projection and try again."
+                                                                .to_string(),
+                                                        );
+                                                        return;
+                                                    }
+                                                    shell
+                                                        .interaction
+                                                        .begin_control_pointer(NATIVE_POINTER_ID);
+                                                    if let Some(request) = shell
+                                                        .service_action_request(
+                                                            task_id,
+                                                            &service_id,
+                                                            action,
+                                                            epochs,
+                                                        )
+                                                    {
+                                                        let _ = shell.dispatch_pointer_action(
+                                                            request,
+                                                            NATIVE_POINTER_ID,
+                                                        );
+                                                    }
+                                                    shell
+                                                        .interaction
+                                                        .release_pointer(NATIVE_POINTER_ID);
+                                                });
+                                            },
+                                        );
+                                }
+                            }
+                        } else {
+                            control = control
+                                .text_color(tokens.text.disabled.to_gpui())
+                                .child(
+                                    affordance
+                                        .disabled_reason
+                                        .unwrap_or("Unavailable"),
+                                );
+                        }
+                        control.into_any_element()
+                    })
+                    .collect::<Vec<_>>();
+                div()
+                    .id(format!("native-service-row-{}", row.service_id.as_str()))
+                    .w_full()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap(px(tokens.density.spacing.sm))
+                    .p(px(tokens.density.physical().row_padding as f32))
+                    .border_b_1()
+                    .border_color(tokens.borders.subtle.to_gpui())
+                    .child(status.element(tokens))
+                    .child(
+                        div()
+                            .flex_col()
+                            .flex_grow()
+                            .child(row.service_id.to_string())
+                            .child(description),
+                    )
+                    .children(controls)
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
+        let body = if rows.is_empty() {
+            div()
+                .text_color(tokens.text.secondary.to_gpui())
+                .child("No configured services in the selected task.")
+                .into_any_element()
+        } else {
+            div().flex_col().children(rows).into_any_element()
+        };
         div()
             .id("native-shell-services-dock")
             .w_full()
             .p(px(tokens.density.physical().control_padding as f32))
             .bg(tokens.surfaces.sunken.to_gpui())
-            .child(format!(
-                "Services · {} projected row(s) · {} typed control(s) · host supervisor",
-                self.services_projection.rows.len(),
-                action_count
-            ))
+            .child(body)
             .into_any_element()
     }
 
-    fn context_dock_surface(&self, tokens: crate::ui::tokens::ThemeTokens) -> AnyElement {
+    fn context_dock_surface(
+        &self,
+        tokens: crate::ui::tokens::ThemeTokens,
+        shell_entity: Option<gpui::WeakEntity<NativeShell>>,
+    ) -> AnyElement {
         match self.cockpit.active_tool() {
             CockpitDockTool::Terminal => self
                 .cockpit
@@ -6904,7 +7130,7 @@ impl NativeShell {
                 .selected_browser_dock_model()
                 .map(|model| render_task_browser_dock(model, tokens).into_any_element())
                 .unwrap_or_else(|| self.workspace_dock_surface(CockpitDockTool::Browser, tokens)),
-            CockpitDockTool::Services => self.services_dock_surface(tokens),
+            CockpitDockTool::Services => self.services_dock_surface(tokens, shell_entity),
             tool => self.workspace_dock_surface(tool, tokens),
         }
     }
@@ -7008,7 +7234,7 @@ impl NativeShell {
         let context_dock = div()
             .id("native-shell-context-dock")
             .w_full()
-            .child(self.context_dock_surface(tokens));
+            .child(self.context_dock_surface(tokens, None));
         let terminal = div()
             .id("native-shell-terminal-dock")
             .w_full()
@@ -7041,6 +7267,7 @@ impl NativeShell {
                 .collect::<std::collections::HashMap<_, _>>(),
         );
         let shell_entity = cx.entity().downgrade();
+        let services_shell_entity = shell_entity.clone();
         let task_list_element = uniform_list(
             "native-task-uniform-list",
             task_ids.len(),
@@ -7444,7 +7671,7 @@ impl NativeShell {
                 div()
                     .id("native-shell-context-dock")
                     .w_full()
-                    .child(self.context_dock_surface(tokens)),
+                    .child(self.context_dock_surface(tokens, Some(services_shell_entity))),
             )
             .child(
                 div()
