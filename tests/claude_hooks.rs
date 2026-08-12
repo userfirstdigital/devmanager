@@ -632,25 +632,25 @@ fn registry_authenticates_loopback_nonce_caps_bodies_and_expires_entries() {
         reducer: ClaudeReducerLimits::default(),
     });
     let registration = registry
-        .register_at(StableSessionKey::from_tab("claude-tab"), now)
+        .test_register_at(StableSessionKey::from_tab("claude-tab"), now)
         .expect("registration");
     let loopback = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5000);
     let remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 5000);
 
     assert_eq!(
-        registry.ingest_at(remote, &registration.nonce, fixture("prompt"), now, 1_000),
+        registry.test_ingest_at(remote, &registration.nonce, fixture("prompt"), now, 1_000),
         RelayIngestStatus::Rejected
     );
     assert_eq!(
-        registry.ingest_at(loopback, "wrong-nonce", fixture("prompt"), now, 1_000),
+        registry.test_ingest_at(loopback, "wrong-nonce", fixture("prompt"), now, 1_000),
         RelayIngestStatus::Rejected
     );
     assert_eq!(
-        registry.ingest_at(loopback, &registration.nonce, &vec![b'x'; 1025], now, 1_000,),
+        registry.test_ingest_at(loopback, &registration.nonce, &vec![b'x'; 1025], now, 1_000,),
         RelayIngestStatus::BodyTooLarge
     );
     assert!(matches!(
-        registry.ingest_at(
+        registry.test_ingest_at(
             loopback,
             &registration.nonce,
             fixture("session_start"),
@@ -660,7 +660,7 @@ fn registry_authenticates_loopback_nonce_caps_bodies_and_expires_entries() {
         RelayIngestStatus::Accepted(_)
     ));
     assert!(matches!(
-        registry.ingest_at(
+        registry.test_ingest_at(
             loopback,
             &registration.nonce,
             fixture("notification"),
@@ -670,7 +670,7 @@ fn registry_authenticates_loopback_nonce_caps_bodies_and_expires_entries() {
         RelayIngestStatus::Accepted(_)
     ));
     assert_eq!(
-        registry.ingest_at(
+        registry.test_ingest_at(
             loopback,
             &registration.nonce,
             fixture("prompt"),
@@ -687,11 +687,11 @@ fn registry_uses_injected_unix_epoch_for_semantic_drafts() {
     let now = Instant::now();
     let registry = ClaudeHookRegistry::default();
     let registration = registry
-        .register_at(StableSessionKey::from_tab("claude-tab"), now)
+        .test_register_at(StableSessionKey::from_tab("claude-tab"), now)
         .unwrap();
     let loopback = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5000);
 
-    let RelayIngestStatus::Accepted(outcome) = registry.ingest_at(
+    let RelayIngestStatus::Accepted(outcome) = registry.test_ingest_at(
         loopback,
         &registration.nonce,
         fixture("prompt"),
@@ -812,9 +812,9 @@ fn prebound_registration(
     provider_session_id: &str,
 ) -> devmanager::ai::claude_hooks::ClaudeCorrelatedRegistration {
     registry
-        .register_correlated_at(
+        .test_register_correlated_at(
             StableSessionKey::from_tab(tab),
-            ClaudeCorrelationBinding::new(
+            ClaudeCorrelationBinding::test_new(
                 TaskId::new(),
                 AgentSessionId::new(),
                 1,
@@ -871,7 +871,7 @@ fn cleanup_paths_are_bounded_and_oldest_paths_are_evicted() {
         ..ClaudeRegistryLimits::default()
     });
     let registration = registry
-        .register_at(
+        .test_register_at(
             StableSessionKey::from_tab("cleanup-bound-tab"),
             Instant::now(),
         )
@@ -896,6 +896,31 @@ fn cleanup_paths_are_bounded_and_oldest_paths_are_evicted() {
     registry.unregister(&registration.nonce);
     assert!(!second.exists());
     assert!(!third.exists());
+}
+
+#[test]
+fn ingress_limits_cannot_panic_semaphores_with_untrusted_capacities() {
+    let limits = ClaudeIngressLimits {
+        max_critical_events: usize::MAX,
+        max_optional_events: usize::MAX,
+        max_critical_bytes: usize::MAX,
+        max_optional_bytes: usize::MAX,
+        max_connections: usize::MAX,
+        max_in_flight: usize::MAX,
+    };
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ClaudeHookRelayListener::start_with_ingress_limits(
+            Arc::new(ClaudeHookRegistry::default()),
+            limits,
+        )
+    }));
+    assert!(
+        result.is_ok(),
+        "untrusted ingress capacities must be clamped before semaphore construction"
+    );
+    if let Ok(Ok(listener)) = result {
+        drop(listener);
+    }
 }
 
 #[test]
@@ -924,7 +949,7 @@ fn registry_capacity_eviction_removes_ephemeral_settings_and_reports_the_nonce()
     let settings_path = overlay.settings_path.expect("first settings path");
 
     registry
-        .register_at(StableSessionKey::from_tab("second-tab"), Instant::now())
+        .test_register_at(StableSessionKey::from_tab("second-tab"), Instant::now())
         .unwrap();
 
     assert!(!settings_path.exists());
@@ -943,7 +968,7 @@ fn adapter_health_promotes_only_after_current_session_start_handshake() {
         observed.lock().unwrap().push(event);
     })));
     let listener = ClaudeHookRelayListener::start(registry.clone()).expect("listener");
-    let binding = ClaudeCorrelationBinding::new(
+    let binding = ClaudeCorrelationBinding::test_new(
         TaskId::new(),
         AgentSessionId::new(),
         1,
@@ -951,7 +976,7 @@ fn adapter_health_promotes_only_after_current_session_start_handshake() {
         ResourceId::new(),
     );
     let registration = registry
-        .register_correlated_at(
+        .test_register_correlated_at(
             StableSessionKey::from_tab("activation-tab"),
             binding,
             None,
@@ -1034,7 +1059,7 @@ fn registration_without_session_start_expires_after_bounded_activation_grace() {
     let registry = ClaudeHookRegistry::default();
     let now = Instant::now();
     registry
-        .register_at(StableSessionKey::from_tab("never-activated"), now)
+        .test_register_at(StableSessionKey::from_tab("never-activated"), now)
         .unwrap();
 
     assert_eq!(
@@ -1054,7 +1079,7 @@ fn superseded_registration_is_rejected_and_cannot_publish_to_replacement_key() {
     })));
     let listener = ClaudeHookRelayListener::start(registry.clone()).expect("listener");
     let stable_key = StableSessionKey::from_tab("shared-tab");
-    let binding = ClaudeCorrelationBinding::new(
+    let binding = ClaudeCorrelationBinding::test_new(
         TaskId::new(),
         AgentSessionId::new(),
         1,
@@ -1062,7 +1087,7 @@ fn superseded_registration_is_rejected_and_cannot_publish_to_replacement_key() {
         ResourceId::new(),
     );
     let old = registry
-        .register_correlated_at(
+        .test_register_correlated_at(
             stable_key.clone(),
             binding.clone(),
             None,
@@ -1071,7 +1096,7 @@ fn superseded_registration_is_rejected_and_cannot_publish_to_replacement_key() {
         )
         .unwrap();
     let replacement = registry
-        .register_correlated_at(
+        .test_register_correlated_at(
             stable_key,
             binding,
             None,
@@ -1138,7 +1163,7 @@ fn superseded_posts_do_not_consume_replacement_ingress_capacity() {
     )
     .unwrap();
     let stable_key = StableSessionKey::from_tab("shared-capacity-tab");
-    let binding = ClaudeCorrelationBinding::new(
+    let binding = ClaudeCorrelationBinding::test_new(
         TaskId::new(),
         AgentSessionId::new(),
         1,
@@ -1146,7 +1171,7 @@ fn superseded_posts_do_not_consume_replacement_ingress_capacity() {
         ResourceId::new(),
     );
     let old = registry
-        .register_correlated_at(
+        .test_register_correlated_at(
             stable_key.clone(),
             binding.clone(),
             None,
@@ -1155,7 +1180,7 @@ fn superseded_posts_do_not_consume_replacement_ingress_capacity() {
         )
         .unwrap();
     let replacement = registry
-        .register_correlated_at(
+        .test_register_correlated_at(
             stable_key,
             binding,
             None,

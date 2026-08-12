@@ -1074,7 +1074,7 @@ pub struct ClaudeCorrelationBinding {
 }
 
 impl ClaudeCorrelationBinding {
-    pub fn new(
+    pub(crate) fn new(
         task_id: TaskId,
         agent_session_id: AgentSessionId,
         runtime_generation: u64,
@@ -1088,6 +1088,26 @@ impl ClaudeCorrelationBinding {
             action_epoch,
             process_root,
         }
+    }
+
+    // Cargo integration tests compile this crate without `cfg(test)`; keep the
+    // fixture-only constructor out of release builds while preserving those tests.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn test_new(
+        task_id: TaskId,
+        agent_session_id: AgentSessionId,
+        runtime_generation: u64,
+        action_epoch: u64,
+        process_root: ResourceId,
+    ) -> Self {
+        Self::new(
+            task_id,
+            agent_session_id,
+            runtime_generation,
+            action_epoch,
+            process_root,
+        )
     }
 
     pub fn task_id(&self) -> TaskId {
@@ -1425,7 +1445,7 @@ impl ClaudeHookRegistry {
         }
     }
 
-    pub fn register_at(
+    fn register_at(
         &self,
         stable_session_key: StableSessionKey,
         now: Instant,
@@ -1500,7 +1520,19 @@ impl ClaudeHookRegistry {
         Ok(registration)
     }
 
-    pub fn register_correlated_at(
+    // These raw registry calls are fixture-only for the same integration-test
+    // constraint; release callers can reach only the authenticated adapter seam.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn test_register_at(
+        &self,
+        stable_session_key: StableSessionKey,
+        now: Instant,
+    ) -> Result<ClaudeHookRegistration, String> {
+        self.register_at(stable_session_key, now)
+    }
+
+    pub(crate) fn register_correlated_at(
         &self,
         stable_session_key: StableSessionKey,
         binding: ClaudeCorrelationBinding,
@@ -1582,6 +1614,25 @@ impl ClaudeHookRegistry {
         })
     }
 
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn test_register_correlated_at(
+        &self,
+        stable_session_key: StableSessionKey,
+        binding: ClaudeCorrelationBinding,
+        expected_provider_session_id: Option<ProviderSessionId>,
+        carry_bound_provider_session_id: Option<String>,
+        now: Instant,
+    ) -> Result<ClaudeCorrelatedRegistration, String> {
+        self.register_correlated_at(
+            stable_session_key,
+            binding,
+            expected_provider_session_id,
+            carry_bound_provider_session_id,
+            now,
+        )
+    }
+
     pub fn bound_provider_session_id(&self, nonce: &str) -> Option<String> {
         self.state.lock().ok().and_then(|state| {
             state
@@ -1592,7 +1643,7 @@ impl ClaudeHookRegistry {
         })
     }
 
-    pub fn ingest_correlated_at(
+    pub(crate) fn ingest_correlated_at(
         &self,
         peer: SocketAddr,
         presented: &ClaudeCorrelatedRegistration,
@@ -1716,7 +1767,7 @@ impl ClaudeHookRegistry {
         }
     }
 
-    pub fn validate_hook_session_at(
+    pub(crate) fn validate_hook_session_at(
         &self,
         presented: &ClaudeCorrelatedRegistration,
         expected: &ClaudeCorrelationBinding,
@@ -1779,7 +1830,7 @@ impl ClaudeHookRegistry {
         Ok(())
     }
 
-    pub fn ingest_at(
+    fn ingest_at(
         &self,
         peer: SocketAddr,
         nonce: &str,
@@ -1789,6 +1840,19 @@ impl ClaudeHookRegistry {
     ) -> RelayIngestStatus {
         self.ingest_captured_at(peer, nonce, body, now, occurred_at_epoch_ms)
             .status
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn test_ingest_at(
+        &self,
+        peer: SocketAddr,
+        nonce: &str,
+        body: &[u8],
+        now: Instant,
+        occurred_at_epoch_ms: u64,
+    ) -> RelayIngestStatus {
+        self.ingest_at(peer, nonce, body, now, occurred_at_epoch_ms)
     }
 
     fn ingest_captured_at(
@@ -2473,7 +2537,13 @@ fn reject_uncorrelated_or_mismatched_http_event(
     let Some(sealed) = registration.sealed.as_ref() else {
         return Err(RelayIngestStatus::Rejected);
     };
-    let event_name = value.get("hook_event_name").and_then(Value::as_str);
+    let Some(event_name) = value
+        .get("hook_event_name")
+        .and_then(Value::as_str)
+        .filter(|event| CLAUDE_HOOK_EVENTS.contains(event))
+    else {
+        return Err(RelayIngestStatus::Rejected);
+    };
     let raw = match official_session_id_str(&value) {
         Ok(Some(raw)) => raw,
         Ok(None) | Err(OfficialSessionIdError::TooLong) => {
@@ -2483,7 +2553,7 @@ fn reject_uncorrelated_or_mismatched_http_event(
     if ProviderSessionId::new(raw.to_string()).is_err() {
         return Err(RelayIngestStatus::Rejected);
     }
-    if event_name == Some("SessionStart") {
+    if event_name == "SessionStart" {
         if let Some(expected) = sealed.expected_provider_session_id.as_ref() {
             if expected.as_str() != raw {
                 return Err(RelayIngestStatus::Rejected);
@@ -2626,16 +2696,58 @@ pub struct ClaudeIngressLimits {
     pub max_in_flight: usize,
 }
 
+const MAX_CLAUDE_INGRESS_CRITICAL_EVENTS: usize = 4 * 1024;
+const MAX_CLAUDE_INGRESS_OPTIONAL_EVENTS: usize = 1024;
+const MAX_CLAUDE_INGRESS_CRITICAL_BYTES: usize = 16 * 1024 * 1024;
+const MAX_CLAUDE_INGRESS_OPTIONAL_BYTES: usize = 4 * 1024 * 1024;
+const MAX_CLAUDE_INGRESS_CONNECTIONS: usize = 1024;
+const MAX_CLAUDE_INGRESS_IN_FLIGHT: usize = 1024;
+
+impl ClaudeIngressLimits {
+    pub fn new(
+        max_critical_events: usize,
+        max_optional_events: usize,
+        max_critical_bytes: usize,
+        max_optional_bytes: usize,
+        max_connections: usize,
+        max_in_flight: usize,
+    ) -> Self {
+        Self {
+            max_critical_events,
+            max_optional_events,
+            max_critical_bytes,
+            max_optional_bytes,
+            max_connections,
+            max_in_flight,
+        }
+        .bounded()
+    }
+
+    fn bounded(self) -> Self {
+        Self {
+            max_critical_events: self
+                .max_critical_events
+                .clamp(1, MAX_CLAUDE_INGRESS_CRITICAL_EVENTS),
+            max_optional_events: self
+                .max_optional_events
+                .clamp(1, MAX_CLAUDE_INGRESS_OPTIONAL_EVENTS),
+            max_critical_bytes: self
+                .max_critical_bytes
+                .clamp(1, MAX_CLAUDE_INGRESS_CRITICAL_BYTES),
+            max_optional_bytes: self
+                .max_optional_bytes
+                .clamp(1, MAX_CLAUDE_INGRESS_OPTIONAL_BYTES),
+            max_connections: self
+                .max_connections
+                .clamp(1, MAX_CLAUDE_INGRESS_CONNECTIONS),
+            max_in_flight: self.max_in_flight.clamp(1, MAX_CLAUDE_INGRESS_IN_FLIGHT),
+        }
+    }
+}
+
 impl Default for ClaudeIngressLimits {
     fn default() -> Self {
-        Self {
-            max_critical_events: 256,
-            max_optional_events: 64,
-            max_critical_bytes: 4 * 1024 * 1024,
-            max_optional_bytes: 1024 * 1024,
-            max_connections: 64,
-            max_in_flight: 64,
-        }
+        Self::new(256, 64, 4 * 1024 * 1024, 1024 * 1024, 64, 64)
     }
 }
 
@@ -2777,6 +2889,7 @@ impl ClaudeHookRelayListener {
         registry: Arc<ClaudeHookRegistry>,
         limits: ClaudeIngressLimits,
     ) -> Result<Self, String> {
+        let limits = limits.bounded();
         let listener = TcpListener::bind(("127.0.0.1", 0))
             .map_err(|error| format!("bind Claude hook relay: {error}"))?;
         listener
