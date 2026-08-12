@@ -299,7 +299,7 @@ fn validate_web_bundle_at(web_dir: &std::path::Path) -> Result<(), Vec<String>> 
     for needle in [
         "\"id\":\"/\"",
         "\"scope\":\"/\"",
-        "\"start_url\":\"/sessions?source=pwa\"",
+        "\"start_url\":\"/tasks?source=pwa\"",
         "\"display\":\"standalone\"",
     ] {
         if !manifest.contains(needle) {
