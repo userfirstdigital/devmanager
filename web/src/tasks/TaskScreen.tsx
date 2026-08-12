@@ -2,7 +2,7 @@ import { ArrowLeft, Columns3, Text, WifiOff } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import type { AppRoute } from "../app/router";
-import { stableSessionKeyForRoute } from "../app/router";
+import { routeForTaskId, stableSessionKeyForRoute } from "../app/router";
 import {
   isLiveStatus,
   type SemanticEvent,
@@ -10,15 +10,23 @@ import {
   type WebWorkspaceSnapshot,
 } from "../api/types";
 import type { WsStatus } from "../api/ws";
-import { clearOtherRuntimes, loadDraft, removeDraft, saveDraft } from "../drafts/draftStore";
+import { BrowserView } from "../browser/BrowserView";
+import type { BrowserProjection } from "../browser/model";
+import {
+  clearOtherRuntimes,
+  loadDraft,
+  removeDraft,
+  saveDraft,
+} from "../drafts/draftStore";
 import { useDensityPreference } from "../settings/densityPreference";
 import {
   useReturnBehavior,
   useTerminalPreference,
 } from "../settings/inputPreference";
 import { useStore } from "../store";
+import { DEFAULT_TASK_RESOURCE } from "./taskId";
 import { Composer } from "./Composer";
-import { describeSession } from "./sessionModel";
+import { describeTask } from "./taskModel";
 import { resolveNativeSessionView, resolveViewMode } from "./viewMode";
 import { AiSessionView } from "./views/AiSessionView";
 import { CommandSessionView } from "./views/CommandSessionView";
@@ -32,39 +40,49 @@ function commandForSession(
   if (!commandId) return null;
   for (const project of workspace.projects) {
     for (const folder of project.folders) {
-      const command = folder.commands.find((candidate) => candidate.id === commandId);
+      const command = folder.commands.find(
+        (candidate) => candidate.id === commandId,
+      );
       if (command) return command;
     }
   }
   return null;
 }
 
-function SessionUnavailable({ onNavigate }: { onNavigate(route: AppRoute): void }) {
+function TaskUnavailable({
+  onNavigate,
+}: {
+  onNavigate(route: AppRoute): void;
+}) {
   return (
     <section className="dm-screen">
       <header className="dm-compact-header">
-        <button type="button" className="dm-nav-back" onClick={() => onNavigate({ name: "sessions" })}>
-          <ArrowLeft size={21} aria-hidden="true" /> Sessions
+        <button
+          type="button"
+          className="dm-nav-back"
+          onClick={() => onNavigate({ name: "tasks" })}
+        >
+          <ArrowLeft size={21} aria-hidden="true" /> Tasks
         </button>
       </header>
       <div className="dm-screen-scroll">
         <div className="dm-native-empty">
-          <h2>Session unavailable</h2>
-          <p>The DevManager host no longer includes this session.</p>
+          <h2>Task unavailable</h2>
+          <p>The DevManager host no longer includes this task.</p>
         </div>
       </div>
     </section>
   );
 }
 
-export function SessionScreen({
+export function TaskScreen({
   route,
   workspace,
   status,
   onNavigate,
   demoEvents,
 }: {
-  route: Extract<AppRoute, { name: "session" }>;
+  route: Extract<AppRoute, { name: "task" }>;
   workspace: WebWorkspaceSnapshot;
   status: WsStatus;
   onNavigate(route: AppRoute): void;
@@ -81,7 +99,9 @@ export function SessionScreen({
     stableSessionKey ? state.drafts[stableSessionKey] : undefined,
   );
   const mutationPending = useStore((state) =>
-    stableSessionKey ? Boolean(state.pendingMutations[stableSessionKey]) : false,
+    stableSessionKey
+      ? Boolean(state.pendingMutations[stableSessionKey])
+      : false,
   );
   const writerLease = useStore((state) => state.writerLease);
   const setDraft = useStore((state) => state.setDraft);
@@ -100,15 +120,18 @@ export function SessionScreen({
   const [density] = useDensityPreference();
   const [returnBehavior] = useReturnBehavior();
   const [terminalPreference] = useTerminalPreference();
+  const resource = route.resource ?? DEFAULT_TASK_RESOURCE;
   const [terminalPinned, setTerminalPinned] = useState(
-    terminalPreference === "raw",
+    terminalPreference === "raw" || resource === "terminal",
   );
-  const [providerInteractionLabel, setProviderInteractionLabel] = useState<string | null>(null);
+  const [providerInteractionLabel, setProviderInteractionLabel] = useState<
+    string | null
+  >(null);
   const latestDraft = useRef("");
   const loadedDraftKey = useRef<string | null>(null);
 
   const item = useMemo(
-    () => (summary ? describeSession(workspace, summary) : null),
+    () => (summary ? describeTask(workspace, summary) : null),
     [summary, workspace],
   );
   const events = demoEvents ?? journal?.events ?? [];
@@ -122,7 +145,10 @@ export function SessionScreen({
     loadedDraftKey.current = loadKey;
     clearOtherRuntimes(workspace.runtimeInstanceId);
     const persisted = loadDraft(workspace.runtimeInstanceId, stableSessionKey);
-    if (persisted !== null && useStore.getState().drafts[stableSessionKey] === undefined) {
+    if (
+      persisted !== null &&
+      useStore.getState().drafts[stableSessionKey] === undefined
+    ) {
       setDraft(stableSessionKey, persisted);
     }
   }, [setDraft, stableSessionKey, workspace.runtimeInstanceId]);
@@ -135,18 +161,27 @@ export function SessionScreen({
   useEffect(() => {
     if (!stableSessionKey) return;
     const onPageHide = () =>
-      saveDraft(workspace.runtimeInstanceId, stableSessionKey, latestDraft.current);
+      saveDraft(
+        workspace.runtimeInstanceId,
+        stableSessionKey,
+        latestDraft.current,
+      );
     globalThis.addEventListener?.("pagehide", onPageHide);
     return () => globalThis.removeEventListener?.("pagehide", onPageHide);
   }, [stableSessionKey, workspace.runtimeInstanceId]);
 
   useEffect(() => {
-    setTerminalPinned(terminalPreference === "raw");
+    setTerminalPinned(terminalPreference === "raw" || resource === "terminal");
     setProviderInteractionLabel(null);
-  }, [stableSessionKey, terminalPreference, workspace.runtimeInstanceId]);
+  }, [
+    resource,
+    stableSessionKey,
+    terminalPreference,
+    workspace.runtimeInstanceId,
+  ]);
 
   if (!stableSessionKey || !summary || !item) {
-    return <SessionUnavailable onNavigate={onNavigate} />;
+    return <TaskUnavailable onNavigate={onNavigate} />;
   }
 
   const connected = status.kind === "open";
@@ -161,17 +196,27 @@ export function SessionScreen({
     adapterHealth: summary.adapterHealth,
     ai,
     gridInteractionRequired: summary.rawRequired,
-    pinned: terminalPinned,
+    pinned: terminalPinned || resource === "terminal",
   });
-  const viewMode = providerInteractionLabel ? "terminal" : resolvedViewMode;
-  const commandId = summary.commandId ??
-    (stableSessionKey.startsWith("server:") ? stableSessionKey.slice("server:".length) : null);
+  const viewMode =
+    resource === "terminal" || providerInteractionLabel
+      ? "terminal"
+      : resolvedViewMode;
+  const commandId =
+    summary.commandId ??
+    (stableSessionKey.startsWith("server:")
+      ? stableSessionKey.slice("server:".length)
+      : null);
   const command = commandForSession(workspace, commandId);
   const port = command?.port
-    ? workspace.portStatuses.find((candidate) => candidate.port === command.port) ?? null
+    ? (workspace.portStatuses.find(
+        (candidate) => candidate.port === command.port,
+      ) ?? null)
     : null;
   const tab = workspace.tabs.find(
-    (candidate) => candidate.id === summary.tabId || `tab:${candidate.id}` === stableSessionKey,
+    (candidate) =>
+      candidate.id === summary.tabId ||
+      `tab:${candidate.id}` === stableSessionKey,
   );
   const controlNote =
     connected && writerLease.ownerClientInstanceId && !writerLease.youAreOwner
@@ -189,7 +234,11 @@ export function SessionScreen({
       provider={provider ?? undefined}
       catalogSessionKey={stableSessionKey}
       returnBehavior={returnBehavior}
-      placeholder={ai ? `Message ${summary.kind === "claude" ? "Claude" : "Codex"}` : "Enter a command"}
+      placeholder={
+        ai
+          ? `Message ${summary.kind === "claude" ? "Claude" : "Codex"}`
+          : "Enter a command"
+      }
       note={controlNote}
       thinking={ai && summary.aiActivity === "Thinking"}
       onStop={() => interruptSession(stableSessionKey)}
@@ -211,12 +260,25 @@ export function SessionScreen({
           `${provider === "claude" ? "Claude" : "Codex"} · ${command.name}`,
         );
         setTerminalPinned(true);
+        onNavigate(routeForTaskId(route.taskId, "terminal"));
       }}
     />
   );
 
   let content;
-  if (viewMode === "terminal") {
+  if (resource === "browser") {
+    const projection: BrowserProjection = {
+      taskId: route.taskId,
+      contextId: route.taskId,
+      generation: 0,
+      boundsEpoch: 0,
+      focusEpoch: 0,
+      frameId: 0,
+      tabs: [],
+      interactionMode: "observe",
+    };
+    content = <BrowserView projection={projection} />;
+  } else if (viewMode === "terminal") {
     content = (
       <RawTerminalView
         sessionId={summary.sessionId}
@@ -249,7 +311,11 @@ export function SessionScreen({
           useStore.setState((state) => ({
             drafts: { ...state.drafts, [stableSessionKey]: draftSnapshot },
           }));
-          saveDraft(workspace.runtimeInstanceId, stableSessionKey, draftSnapshot);
+          saveDraft(
+            workspace.runtimeInstanceId,
+            stableSessionKey,
+            draftSnapshot,
+          );
           void submission.catch(() => {
             // Store already records lastError for the rejected submission.
           });
@@ -265,9 +331,17 @@ export function SessionScreen({
         events={events}
         density={density}
         actionsDisabled={!connected}
-        onStart={() => commandId && sendAction({ type: "startServer", command_id: commandId })}
-        onStop={() => commandId && sendAction({ type: "stopServer", command_id: commandId })}
-        onRestart={() => commandId && sendAction({ type: "restartServer", command_id: commandId })}
+        onStart={() =>
+          commandId &&
+          sendAction({ type: "startServer", command_id: commandId })
+        }
+        onStop={() =>
+          commandId && sendAction({ type: "stopServer", command_id: commandId })
+        }
+        onRestart={() =>
+          commandId &&
+          sendAction({ type: "restartServer", command_id: commandId })
+        }
       />
     );
   } else {
@@ -289,7 +363,8 @@ export function SessionScreen({
           summary.kind === "ssh" && tab?.connectionId
             ? () => restartSsh(tab.connectionId as string)
             : summary.kind === "server" && commandId
-              ? () => sendAction({ type: "restartServer", command_id: commandId })
+              ? () =>
+                  sendAction({ type: "restartServer", command_id: commandId })
               : undefined
         }
         onDisconnect={
@@ -305,21 +380,42 @@ export function SessionScreen({
   }
 
   return (
-    <section className="dm-screen dm-session-detail-screen" aria-labelledby="session-title">
+    <section
+      className="dm-screen dm-session-detail-screen"
+      aria-labelledby="task-title"
+    >
       <header className="dm-session-header">
-        <button type="button" className="dm-nav-back dm-session-back" onClick={() => onNavigate({ name: "sessions" })}>
-          <ArrowLeft size={21} aria-hidden="true" /> Sessions
+        <button
+          type="button"
+          className="dm-nav-back dm-session-back"
+          onClick={() => onNavigate({ name: "tasks" })}
+        >
+          <ArrowLeft size={21} aria-hidden="true" /> Tasks
         </button>
         <div className="dm-session-title-block">
-          <h1 id="session-title">{item.label}</h1>
-          <p>{item.projectName} · {item.stateLabel}</p>
+          <h1 id="task-title">{item.label}</h1>
+          <p>
+            {item.projectName} · {item.stateLabel}
+          </p>
         </div>
         <button
           type="button"
           className="dm-session-mode-button"
-          aria-label={summary.rawRequired ? "Terminal grid required" : providerInteractionLabel ? "Return to native conversation" : viewMode === "terminal" ? "Use native text view" : "Use raw terminal"}
+          aria-label={
+            summary.rawRequired
+              ? "Terminal grid required"
+              : providerInteractionLabel
+                ? "Return to native conversation"
+                : viewMode === "terminal"
+                  ? "Use native text view"
+                  : "Use raw terminal"
+          }
           disabled={summary.rawRequired}
           onClick={() => {
+            if (resource === "browser") {
+              onNavigate(routeForTaskId(route.taskId, "chat"));
+              return;
+            }
             if (viewMode === "terminal") {
               if (provider === "claude" && providerInteractionLabel) {
                 // Claude keeps provider menus open after the web view returns
@@ -329,16 +425,24 @@ export function SessionScreen({
               }
               setProviderInteractionLabel(null);
               setTerminalPinned(false);
+              onNavigate(routeForTaskId(route.taskId, "chat"));
               // Resume from the latest semantic cursor so output produced
               // while xterm was visible is reconciled before native render.
               foregroundConnection();
             } else {
               setProviderInteractionLabel(null);
               setTerminalPinned(true);
+              onNavigate(routeForTaskId(route.taskId, "terminal"));
             }
           }}
         >
-          {summary.rawRequired ? <WifiOff size={19} /> : viewMode === "terminal" ? <Text size={19} /> : <Columns3 size={19} />}
+          {summary.rawRequired ? (
+            <WifiOff size={19} />
+          ) : viewMode === "terminal" ? (
+            <Text size={19} />
+          ) : (
+            <Columns3 size={19} />
+          )}
         </button>
       </header>
       {content}

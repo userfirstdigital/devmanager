@@ -9,7 +9,7 @@ describe("isNetworkOnlyPath", () => {
     },
   );
 
-  it.each(["/", "/sessions", "/session/tab/test", "/pairing-help"])(
+  it.each(["/", "/tasks", "/tasks/tab%3Atest", "/pairing-help"])(
     "allows app-shell handling for %s",
     (path) => {
       expect(isNetworkOnlyPath(path)).toBe(false);

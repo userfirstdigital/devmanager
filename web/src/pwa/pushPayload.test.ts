@@ -14,7 +14,7 @@ describe("parsePushPayload", () => {
       parsePushPayload({
         title: "Build finished",
         body: "Ready for review",
-        route: "/sessions?filter=attention",
+        route: "/tasks?filter=attention",
         tag: "session-alert",
         eventId: "event-12",
         runtimeInstanceId: "runtime-3",
@@ -27,7 +27,7 @@ describe("parsePushPayload", () => {
     ).toEqual({
       title: "Build finished",
       body: "Ready for review",
-      route: "/sessions?filter=attention",
+      route: "/tasks?filter=attention",
       tag: "session-alert",
       eventId: "event-12",
       runtimeInstanceId: "runtime-3",

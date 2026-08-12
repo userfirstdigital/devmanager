@@ -12,7 +12,7 @@ import {
 } from "../api/types";
 import { EMPTY_WRITER_LEASE } from "../api/types";
 import { useStore } from "../store";
-import { SessionScreen } from "./SessionScreen";
+import { TaskScreen } from "./TaskScreen";
 
 vi.mock("./views/AiSessionView", () => ({
   AiSessionView: ({
@@ -39,7 +39,9 @@ vi.mock("./views/AiSessionView", () => ({
 
 vi.mock("./views/RawTerminalView", () => ({
   RawTerminalView: ({ interactionLabel }: { interactionLabel?: string }) => (
-    <div aria-label="Raw provider interaction">{interactionLabel ?? "Raw terminal"}</div>
+    <div aria-label="Raw provider interaction">
+      {interactionLabel ?? "Raw terminal"}
+    </div>
   ),
 }));
 
@@ -145,8 +147,8 @@ describe("session slash command integration", () => {
       submitComposer,
     });
     render(
-      <SessionScreen
-        route={{ name: "session", kind: "tab", id: "ai-a" }}
+      <TaskScreen
+        route={{ name: "task", taskId: "tab:ai-a" }}
         workspace={workspace("codex")}
         status={{ kind: "open" }}
         onNavigate={() => {}}
@@ -167,9 +169,9 @@ describe("session slash command integration", () => {
       await accepted.promise;
     });
     await waitFor(() =>
-      expect(screen.getByLabelText("Raw provider interaction").textContent).toMatch(
-        /Codex.*\/model/i,
-      ),
+      expect(
+        screen.getByLabelText("Raw provider interaction").textContent,
+      ).toMatch(/Codex.*\/model/i),
     );
   });
 
@@ -188,8 +190,8 @@ describe("session slash command integration", () => {
       sendInput,
     });
     render(
-      <SessionScreen
-        route={{ name: "session", kind: "tab", id: "ai-a" }}
+      <TaskScreen
+        route={{ name: "task", taskId: "tab:ai-a" }}
         workspace={workspace("claude")}
         status={{ kind: "open" }}
         onNavigate={() => {}}
@@ -198,7 +200,9 @@ describe("session slash command integration", () => {
 
     await user.click(screen.getByRole("button", { name: /send message/i }));
     await screen.findByLabelText("Raw provider interaction");
-    await user.click(screen.getByRole("button", { name: /return to native conversation/i }));
+    await user.click(
+      screen.getByRole("button", { name: /return to native conversation/i }),
+    );
 
     expect(sendInput).toHaveBeenCalledWith("pty-ai-a", "\u{1b}", "bytes");
     expect(screen.getByLabelText("Native AI conversation")).toBeTruthy();
@@ -221,8 +225,8 @@ describe("session slash command integration", () => {
       submitComposer,
     });
     const { rerender } = render(
-      <SessionScreen
-        route={{ name: "session", kind: "tab", id: "ai-a" }}
+      <TaskScreen
+        route={{ name: "task", taskId: "tab:ai-a" }}
         workspace={workspace("codex", "ai-a")}
         status={{ kind: "open" }}
         onNavigate={() => {}}
@@ -231,8 +235,8 @@ describe("session slash command integration", () => {
     await user.click(screen.getByRole("button", { name: /send message/i }));
 
     rerender(
-      <SessionScreen
-        route={{ name: "session", kind: "tab", id: "ai-b" }}
+      <TaskScreen
+        route={{ name: "task", taskId: "tab:ai-b" }}
         workspace={workspace("codex", "ai-b")}
         status={{ kind: "open" }}
         onNavigate={() => {}}
@@ -277,21 +281,22 @@ describe("native AI session interactions", () => {
       },
     });
     const { rerender } = render(
-      <SessionScreen
-        route={{ name: "session", kind: "tab", id: "ai-a" }}
+      <TaskScreen
+        route={{ name: "task", taskId: "tab:ai-a" }}
         workspace={workspace("claude", "ai-a", { attention: "needsInput" })}
         status={{ kind: "open" }}
         onNavigate={() => {}}
       />,
     );
-    expect((screen.getByRole("button", { name: "Continue" }) as HTMLButtonElement).disabled).toBe(
-      true,
-    );
+    expect(
+      (screen.getByRole("button", { name: "Continue" }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(true);
 
     useStore.setState({ pendingMutations: {} });
     rerender(
-      <SessionScreen
-        route={{ name: "session", kind: "tab", id: "ai-a" }}
+      <TaskScreen
+        route={{ name: "task", taskId: "tab:ai-a" }}
         workspace={workspace("claude", "ai-a", { attention: "needsInput" })}
         status={{ kind: "open" }}
         onNavigate={() => {}}
@@ -303,16 +308,17 @@ describe("native AI session interactions", () => {
 
   it("keeps historical question choices disabled unless attention is needsInput", () => {
     render(
-      <SessionScreen
-        route={{ name: "session", kind: "tab", id: "ai-a" }}
+      <TaskScreen
+        route={{ name: "task", taskId: "tab:ai-a" }}
         workspace={workspace("claude", "ai-a", { attention: "none" })}
         status={{ kind: "open" }}
         onNavigate={() => {}}
       />,
     );
-    expect((screen.getByRole("button", { name: "Continue" }) as HTMLButtonElement).disabled).toBe(
-      true,
-    );
+    expect(
+      (screen.getByRole("button", { name: "Continue" }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(true);
   });
 
   it("preserves an unsent composer draft when a quick choice is submitted", async () => {
@@ -339,8 +345,8 @@ describe("native AI session interactions", () => {
     });
 
     render(
-      <SessionScreen
-        route={{ name: "session", kind: "tab", id: "ai-a" }}
+      <TaskScreen
+        route={{ name: "task", taskId: "tab:ai-a" }}
         workspace={workspace("claude", "ai-a", { attention: "needsInput" })}
         status={{ kind: "open" }}
         onNavigate={() => {}}
@@ -348,13 +354,15 @@ describe("native AI session interactions", () => {
     );
 
     expect(
-      (screen.getByRole("textbox", { name: /message/i }) as HTMLTextAreaElement).value,
+      (screen.getByRole("textbox", { name: /message/i }) as HTMLTextAreaElement)
+        .value,
     ).toBe("unsent draft notes");
 
     await user.click(screen.getByRole("button", { name: "Continue" }));
     expect(submitComposer).toHaveBeenCalledWith("tab:ai-a", "Continue", []);
     expect(
-      (screen.getByRole("textbox", { name: /message/i }) as HTMLTextAreaElement).value,
+      (screen.getByRole("textbox", { name: /message/i }) as HTMLTextAreaElement)
+        .value,
     ).toBe("unsent draft notes");
     expect(useStore.getState().drafts["tab:ai-a"]).toBe("unsent draft notes");
 
@@ -369,48 +377,58 @@ describe("native AI session interactions", () => {
     });
 
     expect(
-      (screen.getByRole("textbox", { name: /message/i }) as HTMLTextAreaElement).value,
+      (screen.getByRole("textbox", { name: /message/i }) as HTMLTextAreaElement)
+        .value,
     ).toBe("unsent draft notes");
     expect(useStore.getState().drafts["tab:ai-a"]).toBe("unsent draft notes");
   });
 
   it("keeps the composer editable during a transient disconnect", () => {
     render(
-      <SessionScreen
-        route={{ name: "session", kind: "tab", id: "ai-a" }}
+      <TaskScreen
+        route={{ name: "task", taskId: "tab:ai-a" }}
         workspace={workspace("claude")}
         status={{ kind: "connecting" }}
         onNavigate={() => {}}
       />,
     );
 
-    const textarea = screen.getByRole("textbox", { name: /message/i }) as HTMLTextAreaElement;
+    const textarea = screen.getByRole("textbox", {
+      name: /message/i,
+    }) as HTMLTextAreaElement;
     expect(textarea.disabled).toBe(false);
     expect(screen.getByText(/reconnecting/i).isConnected).toBe(true);
-    expect((screen.getByRole("button", { name: /send/i }) as HTMLButtonElement).disabled).toBe(true);
+    expect(
+      (screen.getByRole("button", { name: /send/i }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(true);
   });
 
   it("shows Stop from Thinking activity, not merely because the PTY is live", () => {
     const interruptSession = vi.fn();
     useStore.setState({ interruptSession });
     const { rerender } = render(
-      <SessionScreen
-        route={{ name: "session", kind: "tab", id: "ai-a" }}
+      <TaskScreen
+        route={{ name: "task", taskId: "tab:ai-a" }}
         workspace={workspace("claude")}
         status={{ kind: "open" }}
         onNavigate={() => {}}
       />,
     );
-    expect(screen.getByRole("button", { name: /send message/i }).isConnected).toBe(true);
+    expect(
+      screen.getByRole("button", { name: /send message/i }).isConnected,
+    ).toBe(true);
 
     rerender(
-      <SessionScreen
-        route={{ name: "session", kind: "tab", id: "ai-a" }}
+      <TaskScreen
+        route={{ name: "task", taskId: "tab:ai-a" }}
         workspace={workspace("claude", "ai-a", { aiActivity: "Thinking" })}
         status={{ kind: "open" }}
         onNavigate={() => {}}
       />,
     );
-    expect(screen.getByRole("button", { name: /stop/i }).isConnected).toBe(true);
+    expect(screen.getByRole("button", { name: /stop/i }).isConnected).toBe(
+      true,
+    );
   });
 });

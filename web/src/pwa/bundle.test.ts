@@ -26,7 +26,7 @@ describe("production PWA bundle", () => {
     expect(manifest).toMatchObject({
       id: "/",
       scope: "/",
-      start_url: "/sessions?source=pwa",
+      start_url: "/tasks?source=pwa",
       display: "standalone",
     });
     expect(manifest).not.toHaveProperty("orientation");
@@ -108,11 +108,10 @@ describe("tracked bundle determinism", () => {
     const attributes = readFileSync(join(repoRoot, ".gitattributes"), "utf8");
     expect(attributes).toMatch(/^web\/bundle\/\*\*\s+-text$/m);
 
-    const tracked = execFileSync(
-      "git",
-      ["ls-files", "web/bundle"],
-      { cwd: repoRoot, encoding: "utf8" },
-    )
+    const tracked = execFileSync("git", ["ls-files", "web/bundle"], {
+      cwd: repoRoot,
+      encoding: "utf8",
+    })
       .trim()
       .split(/\r?\n/)
       .filter(Boolean);

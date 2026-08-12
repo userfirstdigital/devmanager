@@ -48,26 +48,26 @@ function snapshot(
   };
 }
 
-const sessions: AppRoute = { name: "sessions" };
+const tasks: AppRoute = { name: "tasks" };
 const saved: SavedRoute = {
   runtimeInstanceId: "runtime-a",
-  route: { name: "session", kind: "tab", id: "tab-a" },
+  route: { name: "task", taskId: "tab:tab-a" },
 };
 
 describe("installed route restoration", () => {
   it("never restores in a normal browser tab", () => {
     expect(
-      resolveColdStart(sessions, saved, {
+      resolveColdStart(tasks, saved, {
         standalone: false,
         snapshot: snapshot(),
         launchEligible: true,
       }),
-    ).toEqual(sessions);
+    ).toEqual(tasks);
   });
 
   it("restores a valid session only for an eligible installed cold launch", () => {
     expect(
-      resolveColdStart(sessions, saved, {
+      resolveColdStart(tasks, saved, {
         standalone: true,
         snapshot: snapshot(),
         launchEligible: true,
@@ -77,9 +77,8 @@ describe("installed route restoration", () => {
 
   it("lets an explicit deep link win over saved state", () => {
     const deepLink: AppRoute = {
-      name: "session",
-      kind: "server",
-      id: "server-a",
+      name: "task",
+      taskId: "server:server-a",
     };
     expect(
       resolveColdStart(deepLink, saved, {
@@ -92,12 +91,11 @@ describe("installed route restoration", () => {
 
   it("accepts a pushed deep link only for the runtime that created it", () => {
     const deepLink: AppRoute = {
-      name: "session",
-      kind: "tab",
-      id: "tab-a",
+      name: "task",
+      taskId: "tab:tab-a",
     };
     expect(
-      resolveColdStart(sessions, saved, {
+      resolveColdStart(tasks, saved, {
         standalone: true,
         snapshot: snapshot("runtime-a"),
         launchEligible: false,
@@ -106,30 +104,30 @@ describe("installed route restoration", () => {
       }),
     ).toEqual(deepLink);
     expect(
-      resolveColdStart(sessions, saved, {
+      resolveColdStart(tasks, saved, {
         standalone: true,
         snapshot: snapshot("runtime-new", "tab:tab-a"),
         launchEligible: false,
         notificationRuntimeInstanceId: "runtime-a",
         notificationRoute: deepLink,
       }),
-    ).toEqual(sessions);
+    ).toEqual(tasks);
   });
 
   it("rejects a route from an old runtime or a removed session", () => {
     expect(
-      resolveColdStart(sessions, saved, {
+      resolveColdStart(tasks, saved, {
         standalone: true,
         snapshot: snapshot("runtime-new"),
         launchEligible: true,
       }),
-    ).toEqual(sessions);
+    ).toEqual(tasks);
     expect(
-      resolveColdStart(sessions, saved, {
+      resolveColdStart(tasks, saved, {
         standalone: true,
         snapshot: snapshot("runtime-a", null),
         launchEligible: true,
       }),
-    ).toEqual(sessions);
+    ).toEqual(tasks);
   });
 });

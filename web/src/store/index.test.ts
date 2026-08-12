@@ -25,9 +25,10 @@ const { wsClientState, MockWsClient } = vi.hoisted(() => {
     readonly stop = vi.fn();
     readonly send = vi.fn((_frame: { type: string }) => true);
     readonly sendWithWriterLease = vi.fn((_frame: { type: string }) => true);
-    readonly request = vi.fn(
-      async (): Promise<WebActionResult> => ({ ok: true, payload: null }),
-    );
+    readonly request = vi.fn(async (): Promise<WebActionResult> => ({
+      ok: true,
+      payload: null,
+    }));
     readonly wake = vi.fn();
     readonly foreground = vi.fn();
     readonly setVisibility = vi.fn();
@@ -41,12 +42,14 @@ const { wsClientState, MockWsClient } = vi.hoisted(() => {
       expiresAtEpochMs: null,
       youAreOwner: false,
     }));
-    readonly submitComposer = vi.fn(async (submission: { mutationId: string }) => ({
-      mutationId: submission.mutationId,
-      stableSessionKey: "tab:a",
-      acceptedSequence: 1,
-      leaseGeneration: 1,
-    }));
+    readonly submitComposer = vi.fn(
+      async (submission: { mutationId: string }) => ({
+        mutationId: submission.mutationId,
+        stableSessionKey: "tab:a",
+        acceptedSequence: 1,
+        leaseGeneration: 1,
+      }),
+    );
 
     constructor(callbacks: MockWsClient["callbacks"]) {
       this.callbacks = callbacks;
@@ -169,15 +172,16 @@ function makeSnapshot(
         latestSequence: 2,
       },
     ],
-    portStatuses: [
-      { port: 3000, inUse: true, pid: 123, processName: "node" },
-    ],
+    portStatuses: [{ port: 3000, inUse: true, pid: 123, processName: "node" }],
     writerLease,
     ...overrides,
   };
 }
 
-function outputEvent(sequence: number, text = `event-${sequence}`): SemanticEvent {
+function outputEvent(
+  sequence: number,
+  text = `event-${sequence}`,
+): SemanticEvent {
   return {
     stableSessionKey: "tab:a",
     sequence,
@@ -418,7 +422,10 @@ describe("aggregate app badge", () => {
       sessions: {},
     });
 
-    expect(connected).toEqual({ count: 0, authorityKey: "runtime:runtime-old" });
+    expect(connected).toEqual({
+      count: 0,
+      authorityKey: "runtime:runtime-old",
+    });
     expect(revoked).toEqual({ count: 0, authorityKey: "unauthorized" });
   });
 
@@ -475,7 +482,7 @@ describe("host runtime reconciliation", () => {
       },
       drafts: { "tab:old": "unfinished" },
       unread: { "tab:old": 4 },
-      pendingRoute: "/session/tab/old",
+      pendingRoute: "/tasks/tab%3Aold",
       pendingMutations: {
         "tab:old": {
           mutationId: "mutation-old",
@@ -492,9 +499,15 @@ describe("host runtime reconciliation", () => {
       },
     });
 
-    useStore.getState().applySnapshot(
-      makeSnapshot({ runtimeInstanceId: "runtime-new", revision: 1, sessions: [] }),
-    );
+    useStore
+      .getState()
+      .applySnapshot(
+        makeSnapshot({
+          runtimeInstanceId: "runtime-new",
+          revision: 1,
+          sessions: [],
+        }),
+      );
 
     const state = useStore.getState();
     expect(state.runtimeInstanceId).toBe("runtime-new");
@@ -520,7 +533,7 @@ describe("host runtime reconciliation", () => {
       journals: { "tab:a": journal([outputEvent(1), outputEvent(2)]) },
       drafts: { "tab:a": "do not render" },
       unread: { "tab:a": 2 },
-      pendingRoute: "/session/tab/a",
+      pendingRoute: "/tasks/tab%3Aa",
       pendingMutations: {
         "tab:a": {
           mutationId: "mutation-old-protocol",
@@ -648,9 +661,15 @@ describe("host runtime reconciliation", () => {
     expect(state.semanticReplay).toBeNull();
     expect(state.activeSessionKey).toBeNull();
     expect(state.rawTerminal.activeStreamSessionId).toBeNull();
-    expect([...state.rawTerminal.terminalSubscribers.keys()]).toEqual(["pty-a"]);
-    expect([...state.rawTerminal.pendingTerminalFrames.keys()]).toEqual(["pty-a"]);
-    expect([...state.rawTerminal.bootstrapSubscribers.keys()]).toEqual(["pty-a"]);
+    expect([...state.rawTerminal.terminalSubscribers.keys()]).toEqual([
+      "pty-a",
+    ]);
+    expect([...state.rawTerminal.pendingTerminalFrames.keys()]).toEqual([
+      "pty-a",
+    ]);
+    expect([...state.rawTerminal.bootstrapSubscribers.keys()]).toEqual([
+      "pty-a",
+    ]);
     expect([...state.rawTerminal.pendingBootstraps.keys()]).toEqual(["pty-a"]);
     expect(wsClientState.instance?.cancelComposer).toHaveBeenCalledWith(
       "gone-mutation",
@@ -752,8 +771,11 @@ describe("host runtime reconciliation", () => {
         removedSessionWasActive ? null : "tab:a",
       );
       expect(state.sessions["tab:b"]).toBeUndefined();
-      expect(state.workspace?.sessions.some((session) => session.sessionId === "pty-b"))
-        .toBe(false);
+      expect(
+        state.workspace?.sessions.some(
+          (session) => session.sessionId === "pty-b",
+        ),
+      ).toBe(false);
       expect(state.journals["tab:b"]).toBeUndefined();
       expect(state.drafts["tab:b"]).toBeUndefined();
       expect(state.unread["tab:b"]).toBeUndefined();
@@ -761,7 +783,9 @@ describe("host runtime reconciliation", () => {
       expect(state.semanticGapSequences["tab:b"]).toBeUndefined();
       expect(state.semanticReplay).toBeNull();
       expect(state.pendingMutations["tab:b"]).toBeUndefined();
-      expect(state.rawTerminal.streamSessionIdByStableKey["tab:b"]).toBeUndefined();
+      expect(
+        state.rawTerminal.streamSessionIdByStableKey["tab:b"],
+      ).toBeUndefined();
       expect(state.rawTerminal.terminalSubscribers.has("pty-b")).toBe(false);
       expect(state.rawTerminal.pendingTerminalFrames.has("pty-b")).toBe(false);
       expect(state.rawTerminal.bootstrapSubscribers.has("pty-b")).toBe(false);
@@ -813,7 +837,9 @@ describe("host runtime reconciliation", () => {
     expect(state.drafts["tab:a"]).toBe("keep final draft");
     expect(state.pendingMutations["tab:a"]?.mutationId).toBe("mutation-a");
     expect(state.rawTerminal.activeStreamSessionId).toBeNull();
-    expect(state.rawTerminal.streamSessionIdByStableKey["tab:a"]).toBeUndefined();
+    expect(
+      state.rawTerminal.streamSessionIdByStableKey["tab:a"],
+    ).toBeUndefined();
     expect(state.rawTerminal.terminalSubscribers.has("pty-a")).toBe(false);
     expect(state.rawTerminal.pendingTerminalFrames.has("pty-a")).toBe(false);
     expect(state.rawTerminal.bootstrapSubscribers.has("pty-a")).toBe(false);
@@ -828,7 +854,9 @@ describe("host runtime reconciliation", () => {
     useStore.getState().applySnapshot(makeSnapshot());
     useStore.setState({
       journals: {
-        "tab:a": journal(Array.from({ length: 6 }, (_, index) => outputEvent(index + 1))),
+        "tab:a": journal(
+          Array.from({ length: 6 }, (_, index) => outputEvent(index + 1)),
+        ),
       },
     });
     useStore.getState().applySnapshot(
@@ -844,7 +872,9 @@ describe("host runtime reconciliation", () => {
       }),
     );
     expect(
-      useStore.getState().journals["tab:a"]?.events.map((event) => event.sequence),
+      useStore
+        .getState()
+        .journals["tab:a"]?.events.map((event) => event.sequence),
     ).toEqual([4, 5, 6]);
 
     const total = MAX_SEMANTIC_EVENTS_PER_SESSION + 25;
@@ -876,7 +906,9 @@ describe("host runtime reconciliation", () => {
     expect(events).toHaveLength(MAX_SEMANTIC_EVENTS_PER_SESSION);
     expect(events[0]?.sequence).toBe(27);
     expect(useStore.getState().journals["tab:a"]?.oldestSequence).toBe(27);
-    expect(useStore.getState().journals["tab:a"]?.latestSequence).toBe(total + 1);
+    expect(useStore.getState().journals["tab:a"]?.latestSequence).toBe(
+      total + 1,
+    );
   });
 
   it("reuses a bounded journal when host retention has not advanced", () => {
@@ -917,7 +949,8 @@ describe("host runtime reconciliation", () => {
 
     let journalState = useStore.getState().journals["tab:a"];
     const retainedBytes = journalState?.events.reduce(
-      (total, event) => total + new TextEncoder().encode(JSON.stringify(event)).byteLength,
+      (total, event) =>
+        total + new TextEncoder().encode(JSON.stringify(event)).byteLength,
       0,
     );
     expect(retainedBytes).toBeLessThanOrEqual(MAX_SEMANTIC_BYTES_PER_SESSION);
@@ -928,10 +961,13 @@ describe("host runtime reconciliation", () => {
     expect(journalState?.latestSequence).toBe(eventCount);
 
     const oldestBeforeAppend = journalState?.oldestSequence ?? 0;
-    useStore.getState().appendSemanticEvent(outputEvent(eventCount + 1, largeText));
+    useStore
+      .getState()
+      .appendSemanticEvent(outputEvent(eventCount + 1, largeText));
     journalState = useStore.getState().journals["tab:a"];
     const appendedBytes = journalState?.events.reduce(
-      (total, event) => total + new TextEncoder().encode(JSON.stringify(event)).byteLength,
+      (total, event) =>
+        total + new TextEncoder().encode(JSON.stringify(event)).byteLength,
       0,
     );
     expect(appendedBytes).toBeLessThanOrEqual(MAX_SEMANTIC_BYTES_PER_SESSION);
@@ -985,9 +1021,11 @@ describe("host runtime reconciliation", () => {
     vi.stubGlobal("localStorage", storage);
     useStore.getState().applySnapshot(makeSnapshot());
     useStore.getState().setDraft("tab:a", "draft");
-    useStore.getState().beginSemanticReplay(
-      replayDescriptor({ fromSequence: 0, throughSequence: 1 }),
-    );
+    useStore
+      .getState()
+      .beginSemanticReplay(
+        replayDescriptor({ fromSequence: 0, throughSequence: 1 }),
+      );
     useStore.getState().applySemanticReplayPage(
       replayPage({
         fromSequence: 0,
@@ -1015,11 +1053,14 @@ describe("host runtime reconciliation", () => {
       .mockReturnValueOnce(newRuntime.promise);
 
     const oldSubmission = useStore.getState().submitComposer("tab:a", "old");
-    useStore.getState().applySnapshot(
-      makeSnapshot({ runtimeInstanceId: "runtime-2", revision: 1 }),
-    );
+    useStore
+      .getState()
+      .applySnapshot(
+        makeSnapshot({ runtimeInstanceId: "runtime-2", revision: 1 }),
+      );
     const newSubmission = useStore.getState().submitComposer("tab:a", "new");
-    const collidedId = client?.submitComposer.mock.calls[1]?.[0].mutationId ?? "";
+    const collidedId =
+      client?.submitComposer.mock.calls[1]?.[0].mutationId ?? "";
 
     oldRuntime.resolve({
       mutationId: collidedId,
@@ -1047,13 +1088,19 @@ describe("host runtime reconciliation", () => {
     useStore.getState().init();
     useStore.getState().applySnapshot(makeSnapshot());
     const client = wsClientState.instance;
-    const resolved = deferred<{ ok: boolean; message: string; payload: null }>();
+    const resolved = deferred<{
+      ok: boolean;
+      message: string;
+      payload: null;
+    }>();
     client?.request.mockReturnValueOnce(resolved.promise);
 
     useStore.getState().sendAction({ type: "stopAllServers" });
-    useStore.getState().applySnapshot(
-      makeSnapshot({ runtimeInstanceId: "runtime-2", revision: 1 }),
-    );
+    useStore
+      .getState()
+      .applySnapshot(
+        makeSnapshot({ runtimeInstanceId: "runtime-2", revision: 1 }),
+      );
     resolved.resolve({ ok: false, message: "old failure", payload: null });
     await resolved.promise;
     await Promise.resolve();
@@ -1062,9 +1109,11 @@ describe("host runtime reconciliation", () => {
     const rejected = deferred<{ ok: boolean; payload: null }>();
     client?.request.mockReturnValueOnce(rejected.promise);
     useStore.getState().sendAction({ type: "stopAllServers" });
-    useStore.getState().applySnapshot(
-      makeSnapshot({ runtimeInstanceId: "runtime-3", revision: 1 }),
-    );
+    useStore
+      .getState()
+      .applySnapshot(
+        makeSnapshot({ runtimeInstanceId: "runtime-3", revision: 1 }),
+      );
     rejected.reject(new Error("stale rejection"));
     await rejected.promise.catch(() => {});
     await Promise.resolve();
@@ -1090,9 +1139,15 @@ describe("host runtime reconciliation", () => {
     client?.request.mockReturnValueOnce(result.promise);
 
     const launch = useStore.getState().launchAiTab("project-1", "claude");
-    useStore.getState().applySnapshot(
-      makeSnapshot({ runtimeInstanceId: "runtime-2", sessions: [], tabs: [] }),
-    );
+    useStore
+      .getState()
+      .applySnapshot(
+        makeSnapshot({
+          runtimeInstanceId: "runtime-2",
+          sessions: [],
+          tabs: [],
+        }),
+      );
     result.resolve({
       ok: true,
       message: null,
@@ -1136,7 +1191,9 @@ describe("semantic journal reconciliation", () => {
 
   it("applies immutable pages in order and trusts their authoritative cursor", () => {
     useStore.getState().applySnapshot(makeSnapshot());
-    useStore.setState({ journals: { "tab:a": journal([outputEvent(1), outputEvent(2)]) } });
+    useStore.setState({
+      journals: { "tab:a": journal([outputEvent(1), outputEvent(2)]) },
+    });
 
     useStore.getState().beginSemanticReplay(replayDescriptor());
     const first = replayPage({
@@ -1163,11 +1220,15 @@ describe("semantic journal reconciliation", () => {
   });
 
   it("clears stale local history as soon as the descriptor reports rollover", () => {
-    useStore.setState({ journals: { "tab:a": journal([outputEvent(1), outputEvent(2)]) } });
+    useStore.setState({
+      journals: { "tab:a": journal([outputEvent(1), outputEvent(2)]) },
+    });
 
-    useStore.getState().beginSemanticReplay(
-      replayDescriptor({ throughSequence: 6, rollover: true }),
-    );
+    useStore
+      .getState()
+      .beginSemanticReplay(
+        replayDescriptor({ throughSequence: 6, rollover: true }),
+      );
     expect(useStore.getState().journals["tab:a"]?.events).toEqual([]);
     useStore.getState().applySemanticReplayPage(
       replayPage({
@@ -1193,15 +1254,21 @@ describe("semantic journal reconciliation", () => {
     });
 
     useStore.getState().beginSemanticReplay(replayDescriptor());
-    useStore.getState().applySemanticReplayPage(
-      replayPage({ replayId: 9, events: [outputEvent(3)] }),
-    );
-    useStore.getState().applySemanticReplayPage(
-      replayPage({ fromSequence: 4, events: [outputEvent(5)] }),
-    );
+    useStore
+      .getState()
+      .applySemanticReplayPage(
+        replayPage({ replayId: 9, events: [outputEvent(3)] }),
+      );
+    useStore
+      .getState()
+      .applySemanticReplayPage(
+        replayPage({ fromSequence: 4, events: [outputEvent(5)] }),
+      );
 
     expect(
-      useStore.getState().journals["tab:a"]?.events.map((event) => event.sequence),
+      useStore
+        .getState()
+        .journals["tab:a"]?.events.map((event) => event.sequence),
     ).toEqual([1, 2]);
     expect(useStore.getState().semanticReplay?.nextSequence).toBe(2);
   });
@@ -1216,7 +1283,7 @@ describe("semantic journal reconciliation", () => {
       runtimeInstanceId: "runtime-1",
       revision: 1,
       hardReset: false,
-      route: "/session/tab/a",
+      route: "/tasks/tab%3Aa",
       desiredSessionKey: "tab:a",
       workspace: null,
       semanticReplay: replayDescriptor({ fromSequence: 0, throughSequence: 2 }),
@@ -1234,7 +1301,9 @@ describe("semantic journal reconciliation", () => {
       }),
     });
     expect(
-      useStore.getState().journals["tab:a"]?.events.map((event) => event.sequence),
+      useStore
+        .getState()
+        .journals["tab:a"]?.events.map((event) => event.sequence),
     ).toEqual([1, 2]);
     expect(useStore.getState().semanticReplay).toBeNull();
   });
@@ -1245,9 +1314,11 @@ describe("semantic journal reconciliation", () => {
       activeSessionKey: "tab:a",
       journals: { "tab:a": journal([outputEvent(1), outputEvent(2)]) },
     });
-    useStore.getState().beginSemanticReplay(
-      replayDescriptor({ fromSequence: 2, throughSequence: 4 }),
-    );
+    useStore
+      .getState()
+      .beginSemanticReplay(
+        replayDescriptor({ fromSequence: 2, throughSequence: 4 }),
+      );
     useStore.getState().applySemanticReplayPage(
       replayPage({
         fromSequence: 2,
@@ -1262,7 +1333,9 @@ describe("semantic journal reconciliation", () => {
     useStore.getState().appendSemanticEvent(outputEvent(5, "duplicate-five"));
     useStore.getState().appendSemanticEvent(outputEvent(6, "live-six"));
     expect(
-      useStore.getState().journals["tab:a"]?.events.map((event) => event.sequence),
+      useStore
+        .getState()
+        .journals["tab:a"]?.events.map((event) => event.sequence),
     ).toEqual([1, 2, 3]);
 
     useStore.getState().applySemanticReplayPage(
@@ -1298,7 +1371,9 @@ describe("semantic journal reconciliation", () => {
     });
 
     expect(
-      useStore.getState().journals["tab:a"]?.events.map((event) => event.sequence),
+      useStore
+        .getState()
+        .journals["tab:a"]?.events.map((event) => event.sequence),
     ).toEqual([1, 3, 4]);
   });
 
@@ -1308,9 +1383,11 @@ describe("semantic journal reconciliation", () => {
       activeSessionKey: "tab:a",
       journals: { "tab:a": journal([outputEvent(1), outputEvent(2)]) },
     });
-    useStore.getState().beginSemanticReplay(
-      replayDescriptor({ fromSequence: 2, throughSequence: 4 }),
-    );
+    useStore
+      .getState()
+      .beginSemanticReplay(
+        replayDescriptor({ fromSequence: 2, throughSequence: 4 }),
+      );
 
     useStore.getState().applySemanticReplayPage(
       replayPage({
@@ -1326,7 +1403,9 @@ describe("semantic journal reconciliation", () => {
     );
 
     expect(
-      useStore.getState().journals["tab:a"]?.events.map((event) => event.sequence),
+      useStore
+        .getState()
+        .journals["tab:a"]?.events.map((event) => event.sequence),
     ).toEqual([1, 3, 4]);
   });
 
@@ -1344,7 +1423,9 @@ describe("semantic journal reconciliation", () => {
     useStore.getState().appendSemanticEvent(outputEvent(5));
 
     expect(
-      useStore.getState().journals["tab:a"]?.events.map((event) => event.sequence),
+      useStore
+        .getState()
+        .journals["tab:a"]?.events.map((event) => event.sequence),
     ).toEqual([1, 2]);
     expect(useStore.getState().journals["tab:a"]?.latestSequence).toBe(2);
     expect(client?.callbacks.getResumeContext?.()).toMatchObject({
@@ -1356,7 +1437,7 @@ describe("semantic journal reconciliation", () => {
       runtimeInstanceId: "runtime-1",
       revision: 1,
       hardReset: false,
-      route: "/session/tab/a",
+      route: "/tasks/tab%3Aa",
       desiredSessionKey: "tab:a",
       workspace: null,
       semanticReplay: null,
@@ -1389,7 +1470,7 @@ describe("semantic journal reconciliation", () => {
       runtimeInstanceId: "runtime-1",
       revision: 1,
       hardReset: false,
-      route: "/session/tab/a",
+      route: "/tasks/tab%3Aa",
       desiredSessionKey: "tab:a",
       workspace: null,
       semanticReplay: null,
@@ -1422,7 +1503,7 @@ describe("resume ownership and stable session identity", () => {
     expect(client?.callbacks.getResumeContext?.()).toMatchObject({
       seenRuntimeInstanceId: "runtime-1",
       seenRevision: 1,
-      route: "/session/tab/a",
+      route: "/tasks/tab%3Aa",
       desiredSessionKey: "tab:a",
       rawSessionId: null,
       semanticAfterSequence: 12,
@@ -1431,7 +1512,9 @@ describe("resume ownership and stable session identity", () => {
     expect(client?.wake).toHaveBeenCalledTimes(1);
     expect(client?.send).not.toHaveBeenCalledWith(
       expect.objectContaining({
-        type: expect.stringMatching(/focus|subscribe|takeControl|claimControl/i),
+        type: expect.stringMatching(
+          /focus|subscribe|takeControl|claimControl/i,
+        ),
       }),
     );
   });
@@ -1473,7 +1556,8 @@ describe("resume ownership and stable session identity", () => {
     expect(client?.wake).toHaveBeenCalledTimes(1);
     expect(client?.foreground).toHaveBeenCalledTimes(1);
     expect(client?.setVisibility).not.toHaveBeenCalledWith(false);
-    const sentTypes = client?.send.mock.calls.map(([frame]) => frame.type) ?? [];
+    const sentTypes =
+      client?.send.mock.calls.map(([frame]) => frame.type) ?? [];
     expect(sentTypes).not.toEqual(
       expect.arrayContaining([
         "focusSession",
@@ -1527,7 +1611,8 @@ describe("composer acknowledgement and retries", () => {
       .mockReturnValueOnce(second.promise);
 
     const firstAttempt = useStore.getState().submitComposer("tab:a", "hello");
-    const firstMutationId = client?.submitComposer.mock.calls[0]?.[0].mutationId;
+    const firstMutationId =
+      client?.submitComposer.mock.calls[0]?.[0].mutationId;
     expect(useStore.getState().drafts["tab:a"]).toBe("hello");
 
     first.reject(new Error("websocket closed"));
@@ -1536,7 +1621,8 @@ describe("composer acknowledgement and retries", () => {
     expect(useStore.getState().pendingMutations["tab:a"]).toBeUndefined();
 
     const retry = useStore.getState().submitComposer("tab:a", "hello");
-    const retryMutationId = client?.submitComposer.mock.calls[1]?.[0].mutationId;
+    const retryMutationId =
+      client?.submitComposer.mock.calls[1]?.[0].mutationId;
     expect(retryMutationId).not.toBe(firstMutationId);
     second.resolve({
       mutationId: retryMutationId ?? "",
@@ -1558,7 +1644,8 @@ describe("composer acknowledgement and retries", () => {
 
     const submission = useStore.getState().submitComposer("tab:a", "original");
     useStore.getState().setDraft("tab:a", "edited");
-    const mutationId = client?.submitComposer.mock.calls[0]?.[0].mutationId ?? "";
+    const mutationId =
+      client?.submitComposer.mock.calls[0]?.[0].mutationId ?? "";
     accepted.resolve({
       mutationId,
       stableSessionKey: "tab:a",
@@ -1611,7 +1698,8 @@ describe("composer acknowledgement and retries", () => {
       .mockReturnValueOnce(second.promise);
 
     const firstAttempt = useStore.getState().submitComposer("tab:a", "first");
-    const firstMutationId = client?.submitComposer.mock.calls[0]?.[0].mutationId;
+    const firstMutationId =
+      client?.submitComposer.mock.calls[0]?.[0].mutationId;
     useStore.getState().setDraft("tab:a", "edited");
     expect(client?.cancelComposer).toHaveBeenCalledWith(
       firstMutationId,
@@ -1620,7 +1708,8 @@ describe("composer acknowledgement and retries", () => {
     expect(useStore.getState().pendingMutations["tab:a"]).toBeUndefined();
 
     const secondAttempt = useStore.getState().submitComposer("tab:a", "edited");
-    const secondMutationId = client?.submitComposer.mock.calls[1]?.[0].mutationId;
+    const secondMutationId =
+      client?.submitComposer.mock.calls[1]?.[0].mutationId;
 
     expect(secondMutationId).not.toBe(firstMutationId);
 
@@ -1647,12 +1736,14 @@ describe("safe compatibility and raw terminal IO", () => {
     useStore.getState().applySnapshot(makeSnapshot());
 
     const state = useStore.getState();
-    expect(state.workspace?.projects[0]?.folders[0]?.commands[0]?.label).toBe("Server");
-    expect(state.snapshot?.appState.config.projects[0]?.name).toBe("Project");
-    expect(state.snapshot?.runtimeState.sessions["pty-a"]?.stable_session_key).toBe(
-      "tab:a",
+    expect(state.workspace?.projects[0]?.folders[0]?.commands[0]?.label).toBe(
+      "Server",
     );
-    expect(JSON.stringify(state.snapshot)).not.toContain("command\"");
+    expect(state.snapshot?.appState.config.projects[0]?.name).toBe("Project");
+    expect(
+      state.snapshot?.runtimeState.sessions["pty-a"]?.stable_session_key,
+    ).toBe("tab:a");
+    expect(JSON.stringify(state.snapshot)).not.toContain('command"');
     expect(JSON.stringify(state.snapshot)).not.toContain("password");
   });
 
@@ -1697,7 +1788,9 @@ describe("safe compatibility and raw terminal IO", () => {
       dataBase64: "aGVsbG8=",
     });
     useStore.getState().sendResize("pty-a", 30, 100);
-    useStore.getState().sendAction({ type: "startServer", command_id: "command-1" });
+    useStore
+      .getState()
+      .sendAction({ type: "startServer", command_id: "command-1" });
 
     expect(client?.sendWithWriterLease).toHaveBeenNthCalledWith(1, {
       type: "input",
@@ -1788,9 +1881,7 @@ describe("safe compatibility and raw terminal IO", () => {
       },
     );
     expect(requestCompatibleBuild).not.toHaveBeenCalled();
-    expect(
-      useStore.getState().compatibleDraftHandoffTargetBuildId,
-    ).toBeNull();
+    expect(useStore.getState().compatibleDraftHandoffTargetBuildId).toBeNull();
     expect(useStore.getState().lastError).toMatch(/preserve.*draft/i);
   });
 });

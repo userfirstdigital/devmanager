@@ -1,15 +1,12 @@
 import { describe, expect, it } from "vitest";
 
-import type {
-  WebSessionSummary,
-  WebWorkspaceSnapshot,
-} from "../api/types";
+import type { WebSessionSummary, WebWorkspaceSnapshot } from "../api/types";
 import { WEB_PROTOCOL_VERSION } from "../api/types";
 import {
   countActionableAttention,
-  describeSession,
-  groupSessions,
-} from "./sessionModel";
+  describeTask,
+  groupTasks,
+} from "./taskModel";
 
 function session(
   stableSessionKey: string,
@@ -127,7 +124,7 @@ describe("session presentation", () => {
       title: "Ship live-first sessions",
       tabId: "claude-generic",
     });
-    expect(describeSession(workspace([withTitle]), withTitle)).toMatchObject({
+    expect(describeTask(workspace([withTitle]), withTitle)).toMatchObject({
       label: "Ship live-first sessions",
       projectName: "DevManager",
       kindLabel: "Claude",
@@ -136,12 +133,12 @@ describe("session presentation", () => {
     const genericOnly = session("tab:claude-generic", {
       tabId: "claude-generic",
     });
-    expect(describeSession(workspace([genericOnly]), genericOnly).label).toBe(
-      "Claude session",
+    expect(describeTask(workspace([genericOnly]), genericOnly).label).toBe(
+      "Claude task",
     );
 
     const namedTab = session("tab:claude-a");
-    expect(describeSession(workspace([namedTab]), namedTab).label).toBe(
+    expect(describeTask(workspace([namedTab]), namedTab).label).toBe(
       "Native mobile UI",
     );
   });
@@ -152,7 +149,7 @@ describe("session presentation", () => {
       taskTitle: "Investigate househunter listing sync",
       tabId: "claude-generic",
     });
-    expect(describeSession(workspace([decorated]), decorated).label).toBe(
+    expect(describeTask(workspace([decorated]), decorated).label).toBe(
       "Investigate househunter listing sync",
     );
 
@@ -161,9 +158,9 @@ describe("session presentation", () => {
       taskTitle: "Ship live-first sessions",
       tabId: "claude-generic",
     });
-    expect(describeSession(workspace([bareClaudeCode]), bareClaudeCode).label).toBe(
-      "Ship live-first sessions",
-    );
+    expect(
+      describeTask(workspace([bareClaudeCode]), bareClaudeCode).label,
+    ).toBe("Ship live-first sessions");
 
     const openaiCodex = session("tab:codex-generic", {
       kind: "codex",
@@ -172,7 +169,7 @@ describe("session presentation", () => {
       tabId: "codex-generic",
     });
     expect(
-      describeSession(
+      describeTask(
         workspace([openaiCodex], {
           tabs: [
             {
@@ -196,8 +193,10 @@ describe("session presentation", () => {
       tabId: "claude-generic",
     });
     expect(
-      describeSession(workspace([taskTitleWinsOverRuntime]), taskTitleWinsOverRuntime)
-        .label,
+      describeTask(
+        workspace([taskTitleWinsOverRuntime]),
+        taskTitleWinsOverRuntime,
+      ).label,
     ).toBe("Investigate househunter listing sync");
 
     const taskTitleBeatsMeaningfulRuntime = session("tab:claude-generic", {
@@ -206,7 +205,7 @@ describe("session presentation", () => {
       tabId: "claude-generic",
     });
     expect(
-      describeSession(
+      describeTask(
         workspace([taskTitleBeatsMeaningfulRuntime]),
         taskTitleBeatsMeaningfulRuntime,
       ).label,
@@ -217,7 +216,7 @@ describe("session presentation", () => {
       tabId: "claude-a",
     });
     expect(
-      describeSession(workspace([customTabFallback]), customTabFallback).label,
+      describeTask(workspace([customTabFallback]), customTabFallback).label,
     ).toBe("Native mobile UI");
 
     const realTaskMentionsClaude = session("tab:claude-generic", {
@@ -225,7 +224,7 @@ describe("session presentation", () => {
       tabId: "claude-generic",
     });
     expect(
-      describeSession(workspace([realTaskMentionsClaude]), realTaskMentionsClaude)
+      describeTask(workspace([realTaskMentionsClaude]), realTaskMentionsClaude)
         .label,
     ).toBe("Ask Claude about the listing sync");
   });
@@ -235,47 +234,49 @@ describe("session presentation", () => {
       title: "Ship live-first sessions",
       tabId: "claude-generic",
     });
-    expect(describeSession(workspace([meaningfulRuntime]), meaningfulRuntime).label).toBe(
-      "Ship live-first sessions",
-    );
+    expect(
+      describeTask(workspace([meaningfulRuntime]), meaningfulRuntime).label,
+    ).toBe("Ship live-first sessions");
 
     const spinnerGlyph = session("tab:claude-generic", {
       title: "✳",
       tabId: "claude-generic",
     });
-    expect(describeSession(workspace([spinnerGlyph]), spinnerGlyph).label).toBe(
-      "Claude session",
+    expect(describeTask(workspace([spinnerGlyph]), spinnerGlyph).label).toBe(
+      "Claude task",
     );
 
     const shellPrompt = session("tab:claude-generic", {
       title: "user@host:~/devmanager$",
       tabId: "claude-generic",
     });
-    expect(describeSession(workspace([shellPrompt]), shellPrompt).label).toBe(
-      "Claude session",
+    expect(describeTask(workspace([shellPrompt]), shellPrompt).label).toBe(
+      "Claude task",
     );
 
     const pathLike = session("tab:claude-generic", {
       title: "C:\\Windows\\system32\\cmd.exe",
       tabId: "claude-generic",
     });
-    expect(describeSession(workspace([pathLike]), pathLike).label).toBe("Claude session");
+    expect(describeTask(workspace([pathLike]), pathLike).label).toBe(
+      "Claude task",
+    );
 
     const mingwPrompt = session("tab:claude-generic", {
       title: "MINGW64:/c/Code/personal/househunter",
       tabId: "claude-generic",
     });
-    expect(describeSession(workspace([mingwPrompt]), mingwPrompt).label).toBe(
-      "Claude session",
+    expect(describeTask(workspace([mingwPrompt]), mingwPrompt).label).toBe(
+      "Claude task",
     );
 
     const brailleSpinner = session("tab:claude-generic", {
       title: "⠐ Working",
       tabId: "claude-generic",
     });
-    expect(describeSession(workspace([brailleSpinner]), brailleSpinner).label).toBe(
-      "Claude session",
-    );
+    expect(
+      describeTask(workspace([brailleSpinner]), brailleSpinner).label,
+    ).toBe("Claude task");
 
     const spinnerDoesNotReplaceTask = session("tab:claude-generic", {
       title: "⠋ Thinking…",
@@ -283,19 +284,26 @@ describe("session presentation", () => {
       tabId: "claude-generic",
     });
     expect(
-      describeSession(workspace([spinnerDoesNotReplaceTask]), spinnerDoesNotReplaceTask)
-        .label,
+      describeTask(
+        workspace([spinnerDoesNotReplaceTask]),
+        spinnerDoesNotReplaceTask,
+      ).label,
     ).toBe("Normalize session titles");
   });
 
   it("rejects bare, session-suffixed, and numbered generic AI labels for title and tab", () => {
-    const forms = ["Claude", "claude session", "Claude 6", "CLAUDE 12"] as const;
+    const forms = [
+      "Claude",
+      "claude session",
+      "Claude 6",
+      "CLAUDE 12",
+    ] as const;
     for (const form of forms) {
       const fromTitle = session("tab:claude-a", {
         title: form,
         tabId: "claude-a",
       });
-      expect(describeSession(workspace([fromTitle]), fromTitle).label).toBe(
+      expect(describeTask(workspace([fromTitle]), fromTitle).label).toBe(
         "Native mobile UI",
       );
 
@@ -303,8 +311,8 @@ describe("session presentation", () => {
         title: form,
         tabId: "claude-generic",
       });
-      expect(describeSession(workspace([genericTab]), genericTab).label).toBe(
-        "Claude session",
+      expect(describeTask(workspace([genericTab]), genericTab).label).toBe(
+        "Claude task",
       );
     }
 
@@ -316,7 +324,7 @@ describe("session presentation", () => {
         tabId: "codex-generic",
       });
       expect(
-        describeSession(
+        describeTask(
           workspace([codex], {
             tabs: [
               {
@@ -332,7 +340,7 @@ describe("session presentation", () => {
           }),
           codex,
         ).label,
-      ).toBe("Codex session");
+      ).toBe("Codex task");
     }
   });
 
@@ -340,7 +348,7 @@ describe("session presentation", () => {
     const server = session("server:web", {
       title: "node server.js",
     });
-    expect(describeSession(workspace([server]), server)).toMatchObject({
+    expect(describeTask(workspace([server]), server)).toMatchObject({
       label: "Web app",
       kindLabel: "Server",
     });
@@ -350,7 +358,7 @@ describe("session presentation", () => {
       title: "ssh lab.local",
       tabId: "ssh-home",
     });
-    expect(describeSession(workspace([ssh]), ssh)).toMatchObject({
+    expect(describeTask(workspace([ssh]), ssh)).toMatchObject({
       label: "Home lab",
       kindLabel: "SSH",
       stateLabel: "Connected",
@@ -359,13 +367,16 @@ describe("session presentation", () => {
 
   it("exposes Thinking, Ready, Needs input, terminal fallback, and live failure states", () => {
     const thinking = session("tab:claude-a", { aiActivity: "Thinking" });
-    expect(describeSession(workspace([thinking]), thinking)).toMatchObject({
+    expect(describeTask(workspace([thinking]), thinking)).toMatchObject({
       stateLabel: "Thinking",
       statusTone: "active",
     });
 
-    const ready = session("tab:claude-a", { attention: "unread", attentionCount: 2 });
-    expect(describeSession(workspace([ready]), ready)).toMatchObject({
+    const ready = session("tab:claude-a", {
+      attention: "unread",
+      attentionCount: 2,
+    });
+    expect(describeTask(workspace([ready]), ready)).toMatchObject({
       stateLabel: "Ready",
       statusTone: "attention",
     });
@@ -376,14 +387,14 @@ describe("session presentation", () => {
       aiActivity: "Thinking",
     });
     expect(
-      describeSession(workspace([readyBeatsThinking]), readyBeatsThinking),
+      describeTask(workspace([readyBeatsThinking]), readyBeatsThinking),
     ).toMatchObject({
       stateLabel: "Ready",
       statusTone: "attention",
     });
 
     const needsInput = session("tab:claude-a", { attention: "needsInput" });
-    expect(describeSession(workspace([needsInput]), needsInput)).toMatchObject({
+    expect(describeTask(workspace([needsInput]), needsInput)).toMatchObject({
       stateLabel: "Needs input",
       statusTone: "attention",
     });
@@ -393,7 +404,7 @@ describe("session presentation", () => {
       attention: "needsInput",
     });
     expect(
-      describeSession(workspace([endedNeedsInputStale]), endedNeedsInputStale),
+      describeTask(workspace([endedNeedsInputStale]), endedNeedsInputStale),
     ).toMatchObject({
       stateLabel: "Needs attention",
       statusTone: "danger",
@@ -404,7 +415,7 @@ describe("session presentation", () => {
       attention: "needsInput",
     });
     expect(
-      describeSession(workspace([endedCrashedNeedsInput]), endedCrashedNeedsInput),
+      describeTask(workspace([endedCrashedNeedsInput]), endedCrashedNeedsInput),
     ).toMatchObject({
       stateLabel: "Crashed",
       statusTone: "danger",
@@ -415,14 +426,14 @@ describe("session presentation", () => {
       rawRequired: true,
     });
     expect(
-      describeSession(workspace([terminalFallback]), terminalFallback),
+      describeTask(workspace([terminalFallback]), terminalFallback),
     ).toMatchObject({
       stateLabel: "Live text",
       statusTone: "active",
     });
 
     const liveFailed = session("tab:claude-a", { attention: "failed" });
-    expect(describeSession(workspace([liveFailed]), liveFailed)).toMatchObject({
+    expect(describeTask(workspace([liveFailed]), liveFailed)).toMatchObject({
       stateLabel: "Needs attention",
       statusTone: "danger",
     });
@@ -434,7 +445,7 @@ describe("session presentation", () => {
       attention: "needsInput",
     });
     expect(
-      describeSession(workspace([stoppedNeedsInput]), stoppedNeedsInput),
+      describeTask(workspace([stoppedNeedsInput]), stoppedNeedsInput),
     ).toMatchObject({
       stateLabel: "Ready to reopen",
       statusTone: "neutral",
@@ -444,10 +455,12 @@ describe("session presentation", () => {
       status: "Exited",
       attention: "failed",
     });
-    expect(describeSession(workspace([exitedFailed]), exitedFailed)).toMatchObject({
-      stateLabel: "Ready to reopen",
-      statusTone: "neutral",
-    });
+    expect(describeTask(workspace([exitedFailed]), exitedFailed)).toMatchObject(
+      {
+        stateLabel: "Ready to reopen",
+        statusTone: "neutral",
+      },
+    );
 
     const sshStoppedFailed = session("tab:ssh-home", {
       kind: "ssh",
@@ -456,7 +469,7 @@ describe("session presentation", () => {
       tabId: "ssh-home",
     });
     expect(
-      describeSession(workspace([sshStoppedFailed]), sshStoppedFailed),
+      describeTask(workspace([sshStoppedFailed]), sshStoppedFailed),
     ).toMatchObject({
       stateLabel: "Disconnected",
       statusTone: "neutral",
@@ -467,7 +480,7 @@ describe("session presentation", () => {
       attention: "needsInput",
     });
     expect(
-      describeSession(workspace([serverExitedNeedsInput]), serverExitedNeedsInput),
+      describeTask(workspace([serverExitedNeedsInput]), serverExitedNeedsInput),
     ).toMatchObject({
       stateLabel: "Exited",
       statusTone: "neutral",
@@ -521,7 +534,7 @@ describe("session presentation", () => {
       lastActivityEpochMs: 1_000,
     });
 
-    const groups = groupSessions(
+    const groups = groupTasks(
       workspace([
         recent,
         idleLive,
@@ -559,8 +572,8 @@ describe("session presentation", () => {
       projectId: "gone",
       kind: "ssh",
     });
-    expect(describeSession(workspace([orphan]), orphan)).toMatchObject({
-      label: "SSH session",
+    expect(describeTask(workspace([orphan]), orphan)).toMatchObject({
+      label: "SSH task",
       projectName: "Project unavailable",
       stateLabel: "Connected",
     });
