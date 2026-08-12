@@ -65,6 +65,7 @@ use crate::ui::actions::{
 };
 use crate::ui::components::interaction::{FocusEpoch, FocusEpochSource};
 use crate::ui::components::status_light::{ExternalPortStatus, StatusLight};
+use crate::ui::components::text_field::TextFieldKey;
 use crate::ui::components::{
     AccessibilityMetadata, AccessibleRole, ActionEvent, ActionRequest, ActivationSource,
     InteractionStateModel,
@@ -77,7 +78,8 @@ use crate::ui::shell::{
     TerminalRelease,
 };
 use crate::ui::task_cockpit::composer::{
-    ComposerDraftProjection, ComposerError, ComposerFence, ComposerHostProjection, TaskComposer,
+    ApprovalDecision, ComposerControl, ComposerDraftProjection, ComposerError, ComposerFence,
+    ComposerHostProjection, ComposerIntent, TaskComposer,
 };
 use crate::ui::task_cockpit::dock::{DockEdge, DockTool as CockpitDockTool};
 use crate::ui::task_cockpit::shell::TaskCockpitShell;
@@ -85,6 +87,7 @@ use crate::ui::task_cockpit::{
     action_is_current, one_fresh_quota_observations, project_services_from_task_projection,
     project_services_panel, render_panel_action, render_panel_frame, render_task_browser_dock,
     update_observation_from_snapshot, ArtifactsPanelProjection, ChangesPanelProjection,
+    ConfigSidebarActionRequest, ConfigSidebarProjection, ConfigSidebarUnavailableReason,
     FilesPanelProjection, Inbox, InboxPresentationWidth, InboxRenderModel, PanelAction,
     ReviewPanelProjection, ServicePanelAction, ServicePanelTone, ServicesPanelProjection,
     TaskBrowserDockModel, TaskHeaderModel, TaskList, TopBarProjectionController,
@@ -2078,6 +2081,9 @@ mod native_host_runtime_sealed {
 pub(crate) trait NativeHostRuntimePort: native_host_runtime_sealed::Sealed + Send {
     fn endpoint(&self) -> &str;
     fn host_state(&self) -> NativeHostState;
+    fn granted_capabilities(&self) -> CapabilitySet {
+        CapabilitySet::empty()
+    }
     fn epochs(&self) -> NativeHostRuntimeEpochs;
     fn enqueue(&mut self, action: NativeActionRecord) -> NativeHostActionResult;
     fn drain_projection_messages(&mut self, max: usize) -> Vec<NativeHostProjection>;
@@ -2120,6 +2126,14 @@ impl std::fmt::Debug for NativeHostClientRuntime {
 }
 
 impl NativeHostClientRuntime {
+    pub(crate) fn granted_capabilities(&self) -> CapabilitySet {
+        self.client
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(HostClient::granted_capabilities))
+            .unwrap_or_else(CapabilitySet::empty)
+    }
+
     /// Connect once to the explicitly named isolated development host.
     ///
     /// The caller is responsible for launching that host with this profile's
@@ -2867,6 +2881,10 @@ impl NativeHostRuntimePort for NativeHostClientRuntime {
         } else {
             NativeHostState::Disconnected
         }
+    }
+
+    fn granted_capabilities(&self) -> CapabilitySet {
+        NativeHostClientRuntime::granted_capabilities(self)
     }
 
     fn epochs(&self) -> NativeHostRuntimeEpochs {
@@ -5223,6 +5241,11 @@ pub struct NativeShell {
     browser_host: BrowserWebViewHost,
     prompt_library: PromptLibrarySession,
     services_projection: ServicesPanelProjection,
+    /// Visible left configuration rail. The native shell receives an
+    /// authoritative ConfigSnapshot through a future host projection seam;
+    /// until then it stays explicitly read-only instead of reading a second
+    /// config file or synthesizing defaults.
+    config_sidebar: ConfigSidebarProjection,
     interaction: NativeInteraction,
     keyboard: KeyboardModel,
     last_keyboard_action: Option<KeyboardAction>,
@@ -5476,6 +5499,9 @@ impl NativeShell {
             data: DataFixtureKind::Empty,
         });
         let services_projection = ServicesPanelProjection::default();
+        let config_sidebar = ConfigSidebarProjection::unavailable(
+            ConfigSidebarUnavailableReason::StoreRecoveryRequired,
+        );
         let header_attachment = NativeHeaderAttachment::default();
         let accessibility_tree =
             AccessibilityTree::for_task_list_with_header(&task_list, None, &header_attachment);
@@ -5515,6 +5541,7 @@ impl NativeShell {
             },
             prompt_library,
             services_projection,
+            config_sidebar,
             interaction,
             keyboard: KeyboardModel::default(),
             last_keyboard_action: None,
@@ -6796,14 +6823,254 @@ impl NativeShell {
         };
         self.cockpit.follow_task(task_id);
         if let Some(model) = self.client_model.as_ref() {
-            self.cockpit.follow_projection(model.as_ref());
+            self.cockpit
+                .follow_projection(model.as_ref(), self.granted_capabilities());
             self.sync_task_composer(model.as_ref(), task_id);
         } else {
             self.composer = None;
+            self.cockpit.clear_timeline();
         }
         self.refresh_selected_cockpit_surfaces();
         self.sync_terminal_from_cockpit();
         self.sync_header_projection();
+    }
+
+    fn granted_capabilities(&self) -> CapabilitySet {
+        match self.host_runtime.as_ref() {
+            Some(NativeHostRuntimeAttachment::Client(runtime)) => runtime.granted_capabilities(),
+            Some(NativeHostRuntimeAttachment::Injected(runtime)) => runtime.granted_capabilities(),
+            None => CapabilitySet::empty(),
+        }
+    }
+
+    fn handle_composer_key(&mut self, event: &KeyDownEvent, window: &mut Window) {
+        let epoch = self.interaction.current_focus_epoch();
+        let focused = self
+            .composer
+            .as_mut()
+            .map(|composer| composer.focus_input(epoch).is_ok())
+            .unwrap_or(false);
+        if !focused {
+            return;
+        }
+        let key = event.keystroke.key.as_str();
+        if key == "enter" && !event.keystroke.modifiers.shift {
+            window.prevent_default();
+            self.activate_composer_control(ComposerControl::SendNow);
+            return;
+        }
+        let input = match key {
+            "backspace" => Some(TextFieldKey::Backspace),
+            "delete" => Some(TextFieldKey::Delete),
+            "left" => Some(TextFieldKey::Left),
+            "right" => Some(TextFieldKey::Right),
+            "home" => Some(TextFieldKey::Home),
+            "end" => Some(TextFieldKey::End),
+            "space" => Some(TextFieldKey::Character(' ')),
+            _ if !event.keystroke.modifiers.control
+                && !event.keystroke.modifiers.platform
+                && !event.keystroke.modifiers.alt =>
+            {
+                event.keystroke.key_char.as_deref().and_then(|text| {
+                    (text.chars().count() == 1)
+                        .then(|| TextFieldKey::Character(text.chars().next().unwrap()))
+                })
+            }
+            _ => None,
+        };
+        if let Some(input) = input {
+            let handled = self
+                .composer
+                .as_mut()
+                .and_then(|composer| composer.handle_key(input, epoch).ok())
+                .unwrap_or(false);
+            if handled {
+                window.prevent_default();
+            }
+        }
+    }
+
+    fn activate_composer_control(&mut self, control: ComposerControl) {
+        let epoch = self.interaction.current_focus_epoch();
+        let intent = {
+            let Some(composer) = self.composer.as_mut() else {
+                return;
+            };
+            match composer
+                .focus_control(control, epoch)
+                .and_then(|_| composer.activate(control, epoch))
+            {
+                Ok(intent) => intent,
+                Err(error) => {
+                    self.composer_error = Some(error.to_string());
+                    return;
+                }
+            }
+        };
+        self.dispatch_composer_intent(intent);
+    }
+
+    fn activate_composer_approval(&mut self, decision: ApprovalDecision) {
+        let epoch = self.interaction.current_focus_epoch();
+        let intent = {
+            let Some(composer) = self.composer.as_mut() else {
+                return;
+            };
+            let Some((request_id, revision)) = composer.pending_approval_identity() else {
+                self.composer_error = Some("approval identity unavailable".into());
+                return;
+            };
+            let fence = composer.fence();
+            match composer
+                .focus_control(ComposerControl::Approval, epoch)
+                .and_then(|_| {
+                    composer.activate_approval(request_id, revision, fence, decision, epoch)
+                }) {
+                Ok(intent) => intent,
+                Err(error) => {
+                    self.composer_error = Some(error.to_string());
+                    return;
+                }
+            }
+        };
+        self.dispatch_composer_intent(intent);
+    }
+
+    fn dispatch_composer_intent(&mut self, intent: ComposerIntent) {
+        let fence = intent.fence;
+        let provider_identity = {
+            let Some(model) = self.client_model.as_ref() else {
+                self.composer_error = Some("host model unavailable".into());
+                return;
+            };
+            let Some(snapshot) = model.task(fence.task_id) else {
+                self.composer_error = Some("task projection unavailable".into());
+                return;
+            };
+            let Some(provider) = snapshot.provider_sessions.get(&fence.agent_session_id) else {
+                self.composer_error = Some("provider projection unavailable".into());
+                return;
+            };
+            (
+                provider.current_turn,
+                provider.open_question,
+                provider.open_approval,
+            )
+        };
+        let request = intent.to_provider_input_request(
+            provider_identity.0,
+            provider_identity.1,
+            provider_identity.2,
+        );
+        match request.and_then(|request| {
+            if self.dispatch_action(request).is_some() {
+                Err(ComposerError::Unavailable {
+                    control: ComposerControl::SendNow,
+                    reason: "host action lane rejected composer intent".into(),
+                })
+            } else {
+                Ok(())
+            }
+        }) {
+            Ok(()) => self.composer_error = None,
+            Err(error) => self.composer_error = Some(error.to_string()),
+        }
+    }
+
+    fn task_conversation_surface(
+        &mut self,
+        tokens: crate::ui::tokens::ThemeTokens,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let conversation = self
+            .cockpit
+            .conversation_surface(tokens, self.composer.as_ref());
+        let focus = cx.listener(|shell, _event: &MouseDownEvent, window, cx| {
+            cx.stop_propagation();
+            shell.focus_handle.focus(window);
+            let epoch = shell.interaction.current_focus_epoch();
+            if let Some(composer) = shell.composer.as_mut() {
+                let _ = composer.focus_input(epoch);
+            }
+        });
+        let key = cx.listener(|shell, event: &KeyDownEvent, window, cx| {
+            cx.stop_propagation();
+            shell.handle_composer_key(event, window);
+        });
+        let send = cx.listener(|shell, _event: &MouseDownEvent, _window, cx| {
+            cx.stop_propagation();
+            shell.activate_composer_control(ComposerControl::SendNow);
+        });
+        let answer = cx.listener(|shell, _event: &MouseDownEvent, _window, cx| {
+            cx.stop_propagation();
+            shell.activate_composer_control(ComposerControl::Answer);
+        });
+        let approve = cx.listener(|shell, _event: &MouseDownEvent, _window, cx| {
+            cx.stop_propagation();
+            shell.activate_composer_approval(ApprovalDecision::Approve);
+        });
+        let reject = cx.listener(|shell, _event: &MouseDownEvent, _window, cx| {
+            cx.stop_propagation();
+            shell.activate_composer_approval(ApprovalDecision::Reject { reason: None });
+        });
+        let scroll = cx.listener(|shell, event: &ScrollWheelEvent, _window, cx| {
+            cx.stop_propagation();
+            let down = event.delta.pixel_delta(px(64.0)).y > px(0.0);
+            if let Some(timeline) = shell.cockpit.timeline_mut() {
+                timeline.scroll_page(down);
+                cx.notify();
+            }
+        });
+        let draft = self
+            .composer
+            .as_ref()
+            .map(|composer| composer.draft_text().chars().take(256).collect::<String>())
+            .unwrap_or_default();
+        div()
+            .id("native-task-conversation-interactive")
+            .w_full()
+            .tab_stop(true)
+            .on_mouse_down(focus)
+            .on_key_down(key)
+            .on_scroll_wheel(scroll)
+            .child(conversation)
+            .child(
+                div()
+                    .id("native-task-composer-input")
+                    .w_full()
+                    .p(px(tokens.density.physical().control_padding as f32))
+                    .bg(tokens.surfaces.sunken.to_gpui())
+                    .child(if draft.is_empty() {
+                        "Prompt input · click and type"
+                    } else {
+                        draft.as_str()
+                    }),
+            )
+            .child(
+                div()
+                    .id("native-task-composer-send")
+                    .on_mouse_down(send)
+                    .child("Send"),
+            )
+            .child(
+                div()
+                    .id("native-task-composer-answer")
+                    .on_mouse_down(answer)
+                    .child("Answer"),
+            )
+            .child(
+                div()
+                    .id("native-task-composer-approve")
+                    .on_mouse_down(approve)
+                    .child("Approve"),
+            )
+            .child(
+                div()
+                    .id("native-task-composer-reject")
+                    .on_mouse_down(reject)
+                    .child("Reject"),
+            )
+            .into_any_element()
     }
 
     fn sync_task_composer(&mut self, model: &ClientModel, task_id: TaskId) {
@@ -7071,10 +7338,55 @@ impl NativeShell {
             .into_any_element()
     }
 
+    fn panel_action_element(
+        action: PanelAction,
+        target: &str,
+        tokens: crate::ui::tokens::ThemeTokens,
+        shell_entity: Option<gpui::WeakEntity<NativeShell>>,
+    ) -> AnyElement {
+        let element = render_panel_action(&action, target, tokens);
+        if !action.is_enabled() {
+            return element;
+        }
+        let Some(shell_entity) = shell_entity else {
+            return element;
+        };
+
+        div()
+            .id(("native-panel-control", action.element_key(target)))
+            .cursor_pointer()
+            .on_mouse_down(MouseButton::Left, move |event, _window, app| {
+                if event.button != MouseButton::Left {
+                    return;
+                }
+                let action = action.clone();
+                let _ = shell_entity.update(app, |shell, cx| {
+                    cx.stop_propagation();
+                    let revision = shell
+                        .client_model
+                        .as_ref()
+                        .and_then(|model| model.task(action.identity.task_id))
+                        .map(|snapshot| snapshot.task.revision);
+                    if !action_is_current(&action, shell.interaction.selected_task(), revision) {
+                        shell.last_query_detail =
+                            Some("Panel action expired; refresh the selected task.".to_owned());
+                        return;
+                    }
+                    shell.interaction.begin_control_pointer(NATIVE_POINTER_ID);
+                    let _ =
+                        shell.dispatch_pointer_action(action.request.clone(), NATIVE_POINTER_ID);
+                    shell.interaction.release_pointer(NATIVE_POINTER_ID);
+                });
+            })
+            .child(element)
+            .into_any_element()
+    }
+
     fn workspace_dock_surface(
         &self,
         tool: CockpitDockTool,
         tokens: crate::ui::tokens::ThemeTokens,
+        shell_entity: Option<gpui::WeakEntity<NativeShell>>,
     ) -> AnyElement {
         let Some(task_id) = self.interaction.selected_task() else {
             return render_panel_frame(
@@ -7099,12 +7411,22 @@ impl NativeShell {
             Vec<AnyElement>,
         ) = match tool {
             CockpitDockTool::Changes => {
-                let panel = ChangesPanelProjection::from_host(
+                let changes = ChangesPanelProjection::from_host(
                     live.and_then(|projection| projection.git.as_ref()),
                     task_id,
                     revision,
                 );
-                ("Changes", panel.summary(), vec![panel.refresh], Vec::new())
+                let workspace = WorkspacePanelProjection::from_host(
+                    live.and_then(|projection| projection.workspace.as_ref()),
+                    task_id,
+                    revision,
+                );
+                (
+                    "Changes",
+                    format!("{} · {}", workspace.summary(), changes.summary()),
+                    vec![workspace.refresh, changes.refresh],
+                    Vec::new(),
+                )
             }
             CockpitDockTool::Files => {
                 let panel = FilesPanelProjection::from_host(
@@ -7137,7 +7459,13 @@ impl NativeShell {
                 let summaries = self
                     .client_model
                     .as_ref()
-                    .map(|model| model.artifact_summaries().values().cloned().collect())
+                    .map(|model| {
+                        model
+                            .artifact_summaries()
+                            .values()
+                            .cloned()
+                            .collect::<Vec<_>>()
+                    })
                     .unwrap_or_default();
                 let panel = ArtifactsPanelProjection::from_model(snapshot, summaries, task_id);
                 let rows = panel
@@ -7155,7 +7483,13 @@ impl NativeShell {
                 let summaries = self
                     .client_model
                     .as_ref()
-                    .map(|model| model.artifact_summaries().values().cloned().collect())
+                    .map(|model| {
+                        model
+                            .artifact_summaries()
+                            .values()
+                            .cloned()
+                            .collect::<Vec<_>>()
+                    })
                     .unwrap_or_default();
                 let panel = ReviewPanelProjection::from_model(snapshot, summaries, task_id);
                 let rows = panel
@@ -7165,23 +7499,25 @@ impl NativeShell {
                     .collect();
                 ("Review", panel.summary(), vec![panel.refresh], rows)
             }
-            _ => {
-                let panel = WorkspacePanelProjection::from_host(
-                    live.and_then(|projection| projection.workspace.as_ref()),
-                    task_id,
-                    revision,
-                );
-                (
-                    "Workspace",
-                    panel.summary(),
-                    vec![panel.refresh],
-                    Vec::new(),
-                )
+            CockpitDockTool::Browser => (
+                "Browser",
+                "No browser session is attached to this task".to_owned(),
+                Vec::new(),
+                Vec::new(),
+            ),
+            CockpitDockTool::Terminal | CockpitDockTool::Services => {
+                unreachable!("terminal and services use dedicated context-dock surfaces")
             }
         };
+        let controls = actions.into_iter().map(|action| {
+            Self::panel_action_element(action, "refresh", tokens, shell_entity.clone())
+        });
         div()
             .id("native-shell-workspace-dock")
             .w_full()
+            .flex()
+            .flex_col()
+            .gap(px(tokens.density.spacing.xs))
             .p(px(tokens.density.physical().control_padding as f32))
             .bg(tokens.surfaces.sunken.to_gpui())
             .child(div().child(format!("{title} · {summary}")))
@@ -7370,55 +7706,10 @@ impl NativeShell {
                                 }
                             }
                         } else {
-    fn panel_action_element(
-        action: PanelAction,
-        target: &str,
-        tokens: crate::ui::tokens::ThemeTokens,
-        shell_entity: Option<gpui::WeakEntity<NativeShell>>,
-    ) -> AnyElement {
-        let element = render_panel_action(&action, target, tokens);
-        if !action.is_enabled() {
-            return element;
-        }
-        let Some(shell_entity) = shell_entity else {
-            return element;
-        };
-
-        div()
-            .id(("native-panel-control", action.element_key(target)))
-            .cursor_pointer()
-            .on_mouse_down(MouseButton::Left, move |event, _window, app| {
-                if event.button != MouseButton::Left {
-                    return;
-                }
-                let action = action.clone();
-                let _ = shell_entity.update(app, |shell, cx| {
-                    cx.stop_propagation();
-                    let revision = shell
-                        .client_model
-                        .as_ref()
-                        .and_then(|model| model.task(action.identity.task_id))
-                        .map(|snapshot| snapshot.task.revision);
-                    if !action_is_current(&action, shell.interaction.selected_task(), revision) {
-                        shell.last_query_detail =
-                            Some("Panel action expired; refresh the selected task.".to_owned());
-                        return;
-                    }
-                    shell.interaction.begin_control_pointer(NATIVE_POINTER_ID);
-                    let _ =
-                        shell.dispatch_pointer_action(action.request.clone(), NATIVE_POINTER_ID);
-                    shell.interaction.release_pointer(NATIVE_POINTER_ID);
-                });
-            })
-            .child(element)
-            .into_any_element()
-    }
-
                             control = control
                                 .text_color(tokens.text.disabled.to_gpui())
                                 .child(
                                     affordance
-        shell_entity: Option<gpui::WeakEntity<NativeShell>>,
                                         .disabled_reason
                                         .unwrap_or("Unavailable"),
                                 );
@@ -7474,15 +7765,9 @@ impl NativeShell {
         shell_entity: Option<gpui::WeakEntity<NativeShell>>,
     ) -> AnyElement {
         match self.cockpit.active_tool() {
-        let controls = actions.into_iter().map(|action| {
-            Self::panel_action_element(action, "refresh", tokens, shell_entity.clone())
-        });
             CockpitDockTool::Terminal => self
                 .cockpit
                 .dock()
-            .flex()
-            .flex_col()
-            .gap(px(tokens.density.spacing.xs))
                 .render_context_dock(tokens)
                 .into_any_element(),
             CockpitDockTool::Browser => self
@@ -7498,6 +7783,38 @@ impl NativeShell {
 
     pub fn client_model_snapshot(&self) -> Option<Arc<ClientModel>> {
         self.client_model.clone()
+    }
+
+    pub fn config_sidebar_projection(&self) -> &ConfigSidebarProjection {
+        &self.config_sidebar
+    }
+
+    /// Typed selection seam for the mounted configuration rail. Selection is
+    /// intentionally handed to the existing app/config navigation boundary;
+    /// this method never edits `AppConfig` or opens a second ConfigStore.
+    pub fn dispatch_config_sidebar_request(&mut self, request: ConfigSidebarActionRequest) -> bool {
+        self.last_query_detail = Some(match request {
+            ConfigSidebarActionRequest::SelectProject { config_id } => {
+                format!("Configuration project selected: {config_id}")
+            }
+            ConfigSidebarActionRequest::SelectFolder {
+                project_id,
+                folder_id,
+            } => format!("Configuration folder selected: {project_id}/{folder_id}"),
+            ConfigSidebarActionRequest::SelectServer {
+                project_id,
+                folder_id,
+                command_id,
+            } => format!("Configuration server selected: {project_id}/{folder_id}/{command_id}"),
+            ConfigSidebarActionRequest::SelectSsh { config_id } => {
+                format!("Remote connection selected: {config_id}")
+            }
+            ConfigSidebarActionRequest::SelectProvider { provider } => {
+                format!("LLM provider selected: {}", provider.label())
+            }
+            ConfigSidebarActionRequest::OpenSettings => "Configuration settings selected".into(),
+        });
+        true
     }
 
     pub fn task_list(&self) -> &TaskList {
@@ -7602,6 +7919,27 @@ impl NativeShell {
             .flex_grow()
             .bg(tokens.surfaces.sunken.to_gpui())
             .child(self.terminal.element());
+        let config_sidebar = self.config_sidebar.surface(tokens);
+        let main_content = div()
+            .id("native-shell-main-content")
+            .flex()
+            .flex_col()
+            .flex_grow()
+            .child(inbox)
+            .children(details)
+            .child(prompt_composer)
+            .child(
+                self.cockpit
+                    .conversation_surface(tokens, self.composer.as_ref()),
+            )
+            .child(context_dock)
+            .child(terminal);
+        let content = div()
+            .id("native-shell-content")
+            .flex()
+            .flex_grow()
+            .child(config_sidebar)
+            .child(main_content);
         div()
             .id("native-shell-root")
             .size_full()
@@ -7610,11 +7948,7 @@ impl NativeShell {
             .bg(tokens.surfaces.canvas.to_gpui())
             .text_color(tokens.text.primary.to_gpui())
             .child(toolbar)
-            .child(inbox)
-            .children(details)
-            .child(prompt_composer)
-            .child(context_dock)
-            .child(terminal)
+            .child(content)
     }
 
     fn element_with_handlers(&mut self, cx: &Context<Self>) -> impl IntoElement {
@@ -7997,56 +8331,64 @@ impl NativeShell {
             )
             .child(
                 div()
-                    .id("native-shell-task-inbox")
-                    .w_full()
-                    .flex_col()
-                    .gap(px(tokens.density.spacing.xs))
-                    .on_scroll_wheel(inbox_scroll)
+                    .id("native-shell-content")
+                    .flex()
+                    .flex_grow()
+                    .child(self.config_sidebar.surface(tokens))
                     .child(
                         div()
-                            .id("native-task-inbox-label")
-                            .text_color(tokens.text.secondary.to_gpui())
-                            .child("Task Inbox"),
-                    )
-                    .child(task_list_element),
-            )
-            .children(
-                self.interaction
-                    .keyboard_state()
-                    .task_details_open
-                    .then(|| {
-                        let selected = self.interaction.selected_task();
-                        let body = selected
-                            .map(|task_id| self.task_row_label(task_id))
-                            .unwrap_or_else(|| "No task selected".to_string());
-                        div()
-                            .id("native-shell-task-details")
-                            .w_full()
-                            .p(px(metrics.control_padding as f32))
-                            .bg(tokens.surfaces.raised.to_gpui())
-                            .child(format!("Task details · {body}"))
-                    }),
-            )
-            .child(div().w_full().child(self.prompt_library_surface(tokens)))
-            .child(
-                self.cockpit
-                    .conversation_surface(tokens, self.composer.as_ref()),
-            )
-            .child(
-                div()
-                    .id("native-shell-context-dock")
-                    .w_full()
-                    .child(self.context_dock_surface(tokens, Some(services_shell_entity))),
-            )
-            .child(
-                div()
-                    .id("native-shell-terminal-dock")
-                    .w_full()
-                    .flex_grow()
-                    .capture_any_mouse_down(terminal_down)
-                    .capture_any_mouse_up(terminal_up)
-                    .bg(tokens.surfaces.sunken.to_gpui())
-                    .child(self.terminal.element()),
+                            .id("native-shell-main-content")
+                            .flex()
+                            .flex_col()
+                            .flex_grow()
+                            .child(
+                                div()
+                                    .id("native-shell-task-inbox")
+                                    .w_full()
+                                    .flex_col()
+                                    .gap(px(tokens.density.spacing.xs))
+                                    .on_scroll_wheel(inbox_scroll)
+                                    .child(
+                                        div()
+                                            .id("native-task-inbox-label")
+                                            .text_color(tokens.text.secondary.to_gpui())
+                                            .child("Task Inbox"),
+                                    )
+                                    .child(task_list_element),
+                            )
+                            .children(self.interaction.keyboard_state().task_details_open.then(
+                                || {
+                                    let selected = self.interaction.selected_task();
+                                    let body = selected
+                                        .map(|task_id| self.task_row_label(task_id))
+                                        .unwrap_or_else(|| "No task selected".to_string());
+                                    div()
+                                        .id("native-shell-task-details")
+                                        .w_full()
+                                        .p(px(metrics.control_padding as f32))
+                                        .bg(tokens.surfaces.raised.to_gpui())
+                                        .child(format!("Task details · {body}"))
+                                },
+                            ))
+                            .child(div().w_full().child(self.prompt_library_surface(tokens)))
+                            .child(
+                                self.cockpit
+                                    .conversation_surface(tokens, self.composer.as_ref()),
+                            )
+                            .child(div().id("native-shell-context-dock").w_full().child(
+                                self.context_dock_surface(tokens, Some(services_shell_entity)),
+                            ))
+                            .child(
+                                div()
+                                    .id("native-shell-terminal-dock")
+                                    .w_full()
+                                    .flex_grow()
+                                    .capture_any_mouse_down(terminal_down)
+                                    .capture_any_mouse_up(terminal_up)
+                                    .bg(tokens.surfaces.sunken.to_gpui())
+                                    .child(self.terminal.element()),
+                            ),
+                    ),
             )
     }
 
