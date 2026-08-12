@@ -18,6 +18,9 @@ const FIXTURE_ROOT: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/cutover-contract"
 );
+const FIXTURE_PARITY_SOURCE: &[u8] = b"fn fixture_parity() {}\n";
+const FIXTURE_PARITY_SHA256: &str =
+    "10f605c7336736cd83db7782a20ee720e4c963befdd96c2447aaef83fb0e8750";
 struct FixtureRepo {
     _temp: TempDir,
     root: PathBuf,
@@ -65,6 +68,22 @@ fn base_row(
             "commands": [format!("pwsh -NoProfile -File evidence/{id}.ps1")],
             "artifacts": [format!("evidence/{id}.json")]
         },
+        "tests": [{
+            "kind": "cargo-test",
+            "path": "tests/fixture_parity.rs",
+            "filter": "fixture_parity",
+            "evidence": format!("evidence/{id}.json")
+        }],
+        "e2eProof": {
+            "artifact": format!("evidence/{id}.json"),
+            "kind": "phase-gate"
+        },
+        "productionImpact": {
+            "profile": "isolated-fixture",
+            "preserves": ["config.json", "remote.json"],
+            "neverTouches": ["session.json", "production-profile", "provider-sessions"]
+        },
+        "deletionSet": [legacy_path],
         "status": status,
         "approvalRequired": true,
         "approvalRequirement": "Explicit Phase 11 cutover approval"
@@ -144,6 +163,9 @@ fn fixture_repo(document: Value, extra_files: &[(&str, &[u8])]) -> FixtureRepo {
         )
         .expect("copy fixture file");
     }
+    fs::create_dir_all(root.join("tests")).expect("fixture tests");
+    fs::write(root.join("tests/fixture_parity.rs"), FIXTURE_PARITY_SOURCE)
+        .expect("fixture parity source");
     for (name, contents) in extra_files {
         let path = root.join(name);
         if let Some(parent) = path.parent() {
@@ -173,6 +195,59 @@ fn git(root: &Path, args: &[&str]) -> Output {
     output
 }
 
+fn bounded_fixture_tool_path() -> std::ffi::OsString {
+    let mut directories = Vec::new();
+    let mut push_directory = |path: PathBuf| {
+        if !path.is_dir() {
+            return;
+        }
+        let text = path.to_string_lossy();
+        if text.len() < 3 || text.as_bytes().get(1) != Some(&b':') || text.as_bytes()[2] != b'\\' {
+            return;
+        }
+        if !directories.iter().any(|existing| existing == &path) {
+            directories.push(path);
+        }
+    };
+    for candidate in [
+        r"C:\Program Files\Git\cmd",
+        r"C:\Program Files\Git\bin",
+        r"C:\Program Files\Git\mingw64\bin",
+        r"C:\Windows\System32",
+    ] {
+        push_directory(PathBuf::from(candidate));
+    }
+    assert!(
+        !directories.is_empty(),
+        "fixture audits need at least one drive-absolute git directory"
+    );
+    std::env::join_paths(directories).expect("bounded fixture PATH")
+}
+
+fn fixture_path_with_shim(shim_root: &Path) -> std::ffi::OsString {
+    let mut directories = vec![shim_root.to_path_buf()];
+    directories.extend(std::env::split_paths(&bounded_fixture_tool_path()));
+    std::env::join_paths(directories).expect("fixture PATH with shim")
+}
+
+fn apply_modify_without_delete_child(path: &Path) {
+    let output = Command::new("pwsh")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "$target = Get-Item -LiteralPath $env:CUTOVER_ACL_TARGET; $acl = New-Object System.Security.AccessControl.DirectorySecurity; $acl.SetAccessRuleProtection($true, $false); $id = [System.Security.Principal.WindowsIdentity]::GetCurrent().User; $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($id, [System.Security.AccessControl.FileSystemRights]::Modify, [System.Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit', [System.Security.AccessControl.PropagationFlags]::None, [System.Security.AccessControl.AccessControlType]::Allow); $acl.AddAccessRule($rule); Set-Acl -LiteralPath $target.FullName -AclObject $acl",
+        ])
+        .env("CUTOVER_ACL_TARGET", path)
+        .output()
+        .expect("apply Modify-only ACL");
+    assert!(
+        output.status.success(),
+        "Modify-only ACL failed\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 fn spawn_audit(root: &Path, output_path: &Path) -> Output {
     Command::new("pwsh")
         .args([
@@ -188,8 +263,31 @@ fn spawn_audit(root: &Path, output_path: &Path) -> Output {
         ])
         .env("APPDATA", root.join("protected-appdata"))
         .env("DEVMANAGER_CUTOVER_FIXTURE_AUTH", fixture_auth_token(root))
+        .env("PATH", bounded_fixture_tool_path())
+        .env_remove("DEVMANAGER_PROFILE")
         .output()
         .expect("spawn cutover audit")
+}
+
+fn spawn_audit_with_profile(root: &Path, output_path: &Path, profile: &str) -> Output {
+    Command::new("pwsh")
+        .args([
+            "-NoProfile",
+            "-File",
+            AUDIT_SCRIPT,
+            "-Mode",
+            "Parity",
+            "-Root",
+            root.to_str().expect("fixture root utf8"),
+            "-OutputPath",
+            output_path.to_str().expect("output path utf8"),
+        ])
+        .env("APPDATA", root.join("protected-appdata"))
+        .env("DEVMANAGER_CUTOVER_FIXTURE_AUTH", fixture_auth_token(root))
+        .env("PATH", bounded_fixture_tool_path())
+        .env("DEVMANAGER_PROFILE", profile)
+        .output()
+        .expect("spawn cutover audit with profile")
 }
 
 fn spawn_audit_with_remote_change(
@@ -216,7 +314,9 @@ fn spawn_audit_with_remote_change(
                 .expect("remote change evidence path utf8"),
         ])
         .env("APPDATA", root.join("protected-appdata"))
-        .env("DEVMANAGER_CUTOVER_FIXTURE_AUTH", fixture_auth_token(root));
+        .env("DEVMANAGER_CUTOVER_FIXTURE_AUTH", fixture_auth_token(root))
+        .env("PATH", bounded_fixture_tool_path())
+        .env_remove("DEVMANAGER_PROFILE");
     if let Some(limit) = human_report_limit {
         command.env("DEVMANAGER_CUTOVER_TEST_HUMAN_BYTES", limit.to_string());
     }
@@ -607,10 +707,7 @@ fn spawn_fake_audit(
     shim_root: &Path,
     outside: Option<&Path>,
 ) -> (Output, Duration) {
-    let original_path = std::env::var_os("PATH").expect("PATH");
-    let mut path_entries = vec![shim_root.to_path_buf()];
-    path_entries.extend(std::env::split_paths(&original_path));
-    let isolated_path = std::env::join_paths(path_entries).expect("isolated PATH");
+    let isolated_path = fixture_path_with_shim(shim_root);
     let mut command = Command::new("pwsh");
     command
         .args([
@@ -767,6 +864,935 @@ fn strings_at<'a>(value: &'a Value, path: &[&str]) -> Vec<&'a str> {
         .collect()
 }
 
+fn strip_parity_verifiable_fields(mut row: Value) -> Value {
+    if let Some(object) = row.as_object_mut() {
+        object.remove("tests");
+        object.remove("e2eProof");
+        object.remove("productionImpact");
+        object.remove("deletionSet");
+    }
+    row
+}
+
+#[test]
+fn parity_row_requires_machine_verifiable_owners_tests_e2e_impact_and_deletion_set() {
+    let missing = run_audit(
+        contract(
+            vec![strip_parity_verifiable_fields(base_row(
+                "missing-verifiable-fields",
+                "src/legacy.rs",
+                &["LegacyFixture"],
+                "src/replacement.rs",
+                &["gate-parity"],
+                "HOLD",
+            ))],
+            vec![base_node("gate-parity", "gate", "HOLD")],
+        ),
+        &[],
+    );
+    assert!(
+        !missing.output.status.success(),
+        "incomplete parity rows must not exit green"
+    );
+    assert_eq!(missing.report["contractStatus"], "HOLD");
+    assert!(
+        strings_at(
+            &row(&missing.report, "missing-verifiable-fields"),
+            &["blockers"]
+        )
+        .iter()
+        .any(|blocker| *blocker == "audit[unverified]"),
+        "missing tests/e2eProof/productionImpact must stay unverified HOLD: {}",
+        missing.report
+    );
+}
+
+#[test]
+fn parity_row_rejects_assumed_partial_or_compile_only_claims() {
+    let mut compile_only = base_row(
+        "compile-only-claim",
+        "src/legacy.rs",
+        &["LegacyFixture"],
+        "src/replacement.rs",
+        &["gate-parity"],
+        "HOLD",
+    );
+    compile_only["tests"] = json!(["compile-only cargo check"]);
+    compile_only["e2eProof"]["kind"] = json!("assumed");
+    compile_only["productionImpact"]["profile"] = json!("partial");
+
+    let run = run_audit(
+        contract(
+            vec![compile_only],
+            vec![base_node("gate-parity", "gate", "HOLD")],
+        ),
+        &[],
+    );
+    assert!(!run.output.status.success());
+    assert_eq!(run.report["contractStatus"], "HOLD");
+    assert!(
+        strings_at(&run.report, &["contractErrors"])
+            .iter()
+            .any(|error| *error == "audit[contract_invalid]"),
+        "assumed/partial/compile-only claims must fail closed: {}",
+        run.report
+    );
+    assert_eq!(row(&run.report, "compile-only-claim")["status"], "HOLD");
+}
+
+#[test]
+fn parity_ready_row_rejects_stale_or_compile_only_evidence() {
+    let stale = run_audit(
+        contract(
+            vec![base_row(
+                "stale-evidence",
+                "src/legacy.rs",
+                &["LegacyFixture"],
+                "src/replacement.rs",
+                &["gate-ready"],
+                "READY",
+            )],
+            vec![base_node("gate-ready", "gate", "READY")],
+        ),
+        &[
+            ("evidence/gate-ready.json", br#"{"ok":true}"#),
+            ("evidence/stale-evidence.json", br#"{"status":"stale"}"#),
+        ],
+    );
+    assert!(!stale.output.status.success());
+    assert_eq!(row(&stale.report, "stale-evidence")["status"], "READY");
+    assert!(
+        strings_at(&row(&stale.report, "stale-evidence"), &["blockers"])
+            .iter()
+            .any(|blocker| *blocker == "audit[evidence_invalid]"),
+        "stale evidence must keep the authored READY row blocked: {}",
+        stale.report
+    );
+
+    let compile_only = run_audit(
+        contract(
+            vec![base_row(
+                "compile-only-evidence",
+                "src/legacy.rs",
+                &["LegacyFixture"],
+                "src/replacement.rs",
+                &["gate-ready"],
+                "READY",
+            )],
+            vec![base_node("gate-ready", "gate", "READY")],
+        ),
+        &[
+            ("evidence/gate-ready.json", br#"{"ok":true}"#),
+            (
+                "evidence/compile-only-evidence.json",
+                br#"{"status":"compile-only"}"#,
+            ),
+        ],
+    );
+    assert!(!compile_only.output.status.success());
+    assert_eq!(
+        row(&compile_only.report, "compile-only-evidence")["status"],
+        "READY"
+    );
+    assert!(
+        strings_at(
+            &row(&compile_only.report, "compile-only-evidence"),
+            &["blockers"]
+        )
+        .iter()
+        .any(|blocker| *blocker == "audit[evidence_invalid]"),
+        "compile-only evidence must not turn a READY row green: {}",
+        compile_only.report
+    );
+}
+
+#[test]
+fn parity_production_profile_and_impact_fail_closed() {
+    let mut production_impact = base_row(
+        "production-impact",
+        "src/legacy.rs",
+        &["LegacyFixture"],
+        "src/replacement.rs",
+        &["gate-parity"],
+        "HOLD",
+    );
+    production_impact["productionImpact"]["profile"] = json!("production");
+    let impact = run_audit(
+        contract(
+            vec![production_impact],
+            vec![base_node("gate-parity", "gate", "HOLD")],
+        ),
+        &[],
+    );
+    assert!(!impact.output.status.success());
+    assert!(
+        strings_at(&impact.report, &["contractErrors"])
+            .iter()
+            .any(|error| *error == "audit[contract_invalid]")
+            || strings_at(&impact.report, &["blockers"])
+                .iter()
+                .any(|blocker| *blocker == "audit[production_profile]"),
+        "production impact profile must fail closed: {}",
+        impact.report
+    );
+
+    let document = contract(
+        vec![base_row(
+            "production-env",
+            "src/legacy.rs",
+            &["LegacyFixture"],
+            "src/replacement.rs",
+            &["gate-parity"],
+            "HOLD",
+        )],
+        vec![base_node("gate-parity", "gate", "HOLD")],
+    );
+    let fixture = fixture_repo(document, &[]);
+    let output_path = fixture
+        .root
+        .join(".devmanager-next/evidence/current/cutover-audit.json");
+    let output = spawn_audit_with_profile(&fixture.root, &output_path, "production");
+    let report: Value = serde_json::from_slice(&fs::read(&output_path).expect("audit JSON"))
+        .expect("valid audit JSON");
+    assert!(!output.status.success());
+    assert!(
+        strings_at(&report, &["blockers"])
+            .iter()
+            .any(|blocker| *blocker == "audit[production_profile]"),
+        "DEVMANAGER_PROFILE=production must fail closed: {report}"
+    );
+}
+
+#[test]
+fn parity_deleted_row_requires_entire_deletion_set_absent() {
+    let mut deleted = base_row(
+        "leftover-deletion",
+        "src/legacy.rs",
+        &["LegacyFixture"],
+        "src/replacement.rs",
+        &["gate-parity"],
+        "DELETED",
+    );
+    deleted["deletionSet"] = json!(["src/legacy.rs", "src/reference.rs"]);
+    let run = run_audit(
+        contract(
+            vec![deleted],
+            vec![base_node("gate-parity", "gate", "READY")],
+        ),
+        &[
+            ("evidence/gate-parity.json", br#"{"ok":true}"#),
+            ("evidence/leftover-deletion.json", br#"{"ok":true}"#),
+        ],
+    );
+    let report_row = row(&run.report, "leftover-deletion");
+    assert!(!run.output.status.success());
+    assert_eq!(report_row["status"], "DELETED");
+    assert!(
+        strings_at(report_row, &["blockers"])
+            .iter()
+            .any(|blocker| *blocker == "audit[contract_invalid]"),
+        "a leftover deletion-set path must keep DELETED blocked: {}",
+        run.report
+    );
+}
+
+fn recognized_evidence(gate_id: &str, test_id: &str, content_sha256: &str) -> Vec<u8> {
+    serde_json::to_vec(&json!({
+        "schemaVersion": 1,
+        "kind": "phase-gate",
+        "verdict": "pass",
+        "gateId": gate_id,
+        "testId": test_id,
+        "recipe": test_id,
+        "source": {
+            "path": "tests/fixture_parity.rs",
+            "contentSha256": content_sha256
+        },
+        "completedAtUtc": "2026-08-11T08:00:00.0000000Z",
+        "freshnessSeconds": 315360000
+    }))
+    .expect("serialize recognized evidence")
+}
+
+#[test]
+fn parity_empty_or_ok_true_evidence_is_not_successful() {
+    for (id, body) in [
+        ("empty-object", &b"{}"[..]),
+        ("ok-true", &br#"{"ok":true}"#[..]),
+        ("status-failed", &br#"{"status":"failed"}"#[..]),
+        (
+            "unknown-schema",
+            &br#"{"schemaVersion":99,"verdict":"pass"}"#[..],
+        ),
+    ] {
+        let run = run_audit(
+            contract(
+                vec![base_row(
+                    id,
+                    "src/legacy.rs",
+                    &["LegacyFixture"],
+                    "src/replacement.rs",
+                    &["gate-ready"],
+                    "READY",
+                )],
+                vec![base_node("gate-ready", "gate", "READY")],
+            ),
+            &[
+                ("evidence/gate-ready.json", body),
+                (&format!("evidence/{id}.json"), body),
+            ],
+        );
+        assert!(!run.output.status.success(), "{id} must not exit green");
+        assert_eq!(row(&run.report, id)["status"], "READY");
+        assert!(
+            strings_at(&row(&run.report, id), &["blockers"])
+                .iter()
+                .any(|blocker| *blocker == "audit[evidence_invalid]"),
+            "{id} existence is not proof: {}",
+            run.report
+        );
+    }
+}
+
+#[test]
+fn parity_evidence_requires_identity_attestation_and_freshness() {
+    let missing_source = run_audit(
+        contract(
+            vec![base_row(
+                "missing-source",
+                "src/legacy.rs",
+                &["LegacyFixture"],
+                "src/replacement.rs",
+                &["gate-ready"],
+                "READY",
+            )],
+            vec![base_node("gate-ready", "gate", "READY")],
+        ),
+        &[
+            (
+                "evidence/gate-ready.json",
+                br#"{"schemaVersion":1,"kind":"phase-gate","verdict":"pass","gateId":"gate-ready","testId":"missing-source","recipe":"missing-source","completedAtUtc":"2026-08-11T08:00:00.0000000Z","freshnessSeconds":315360000}"#,
+            ),
+            (
+                "evidence/missing-source.json",
+                br#"{"schemaVersion":1,"kind":"phase-gate","verdict":"pass","gateId":"gate-ready","testId":"missing-source","recipe":"missing-source","completedAtUtc":"2026-08-11T08:00:00.0000000Z","freshnessSeconds":315360000}"#,
+            ),
+        ],
+    );
+    assert!(
+        strings_at(
+            &row(&missing_source.report, "missing-source"),
+            &["blockers"]
+        )
+        .iter()
+        .any(|blocker| *blocker == "audit[evidence_invalid]"),
+        "missing source attestation must fail closed: {}",
+        missing_source.report
+    );
+
+    let mismatched = run_audit(
+        contract(
+            vec![base_row(
+                "mismatched-gate",
+                "src/legacy.rs",
+                &["LegacyFixture"],
+                "src/replacement.rs",
+                &["gate-ready"],
+                "READY",
+            )],
+            vec![base_node("gate-ready", "gate", "READY")],
+        ),
+        &[
+            (
+                "evidence/gate-ready.json",
+                recognized_evidence("other-gate", "mismatched-gate", FIXTURE_PARITY_SHA256)
+                    .as_slice(),
+            ),
+            (
+                "evidence/mismatched-gate.json",
+                recognized_evidence("other-gate", "mismatched-gate", FIXTURE_PARITY_SHA256)
+                    .as_slice(),
+            ),
+            ("tests/fixture_parity.rs", FIXTURE_PARITY_SOURCE),
+        ],
+    );
+    assert!(
+        strings_at(&row(&mismatched.report, "mismatched-gate"), &["blockers"])
+            .iter()
+            .any(|blocker| *blocker == "audit[evidence_invalid]"),
+        "mismatched gate identity must fail closed: {}",
+        mismatched.report
+    );
+
+    let duplicate = run_audit(
+        contract(
+            vec![base_row(
+                "duplicate-key",
+                "src/legacy.rs",
+                &["LegacyFixture"],
+                "src/replacement.rs",
+                &["gate-ready"],
+                "READY",
+            )],
+            vec![base_node("gate-ready", "gate", "READY")],
+        ),
+        &[(
+            "evidence/duplicate-key.json",
+            br#"{"schemaVersion":1,"schemaVersion":1,"kind":"phase-gate","verdict":"pass","gateId":"gate-ready","testId":"duplicate-key","recipe":"duplicate-key","source":{"path":"tests/fixture_parity.rs","contentSha256":"10f605c7336736cd83db7782a20ee720e4c963befdd96c2447aaef83fb0e8750"},"completedAtUtc":"2026-08-11T08:00:00.0000000Z","freshnessSeconds":315360000}"#,
+        )],
+    );
+    assert!(
+        strings_at(&row(&duplicate.report, "duplicate-key"), &["blockers"])
+            .iter()
+            .any(|blocker| *blocker == "audit[evidence_invalid]"),
+        "duplicate JSON keys must fail closed: {}",
+        duplicate.report
+    );
+}
+
+#[test]
+fn parity_commit_only_source_is_not_attestation() {
+    let commit_only = br#"{
+        "schemaVersion":1,
+        "kind":"phase-gate",
+        "verdict":"pass",
+        "gateId":"gate-ready",
+        "testId":"commit-only",
+        "recipe":"commit-only",
+        "source":{
+            "path":"tests/fixture_parity.rs",
+            "commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "completedAtUtc":"2026-08-11T08:00:00.0000000Z",
+        "freshnessSeconds":315360000
+    }"#;
+    let run = run_audit(
+        contract(
+            vec![base_row(
+                "commit-only",
+                "src/legacy.rs",
+                &["LegacyFixture"],
+                "src/replacement.rs",
+                &["gate-ready"],
+                "READY",
+            )],
+            vec![base_node("gate-ready", "gate", "READY")],
+        ),
+        &[
+            ("evidence/gate-ready.json", commit_only),
+            ("evidence/commit-only.json", commit_only),
+            ("tests/fixture_parity.rs", FIXTURE_PARITY_SOURCE),
+        ],
+    );
+    assert!(
+        !run.output.status.success(),
+        "commit-only attestation must not exit green"
+    );
+    assert_eq!(run.report["contractStatus"], "HOLD");
+    assert_ne!(run.report["contractStatus"], "READY");
+    assert!(
+        strings_at(&row(&run.report, "commit-only"), &["blockers"])
+            .iter()
+            .any(|blocker| *blocker == "audit[evidence_invalid]"),
+        "an unbound commit string is not identity attestation: {}",
+        run.report
+    );
+    let artifacts = row(&run.report, "commit-only")["evidence"]["artifacts"]
+        .as_array()
+        .expect("artifact list");
+    assert!(
+        artifacts.iter().all(|artifact| artifact["present"] != true),
+        "commit-only JSON must not be reported present: {}",
+        run.report
+    );
+}
+
+#[test]
+fn parity_ledger_recipe_command_is_not_executed_proof() {
+    let run = run_audit(
+        contract(
+            vec![base_row(
+                "recipe-only",
+                "src/legacy.rs",
+                &["LegacyFixture"],
+                "src/replacement.rs",
+                &["gate-ready"],
+                "READY",
+            )],
+            vec![base_node("gate-ready", "gate", "READY")],
+        ),
+        &[
+            (
+                "evidence/gate-ready.json",
+                recognized_evidence("gate-ready", "recipe-only", FIXTURE_PARITY_SHA256).as_slice(),
+            ),
+            (
+                "evidence/recipe-only.json",
+                recognized_evidence("gate-ready", "recipe-only", FIXTURE_PARITY_SHA256).as_slice(),
+            ),
+            ("tests/fixture_parity.rs", FIXTURE_PARITY_SOURCE),
+        ],
+    );
+    assert!(
+        !run.output.status.success(),
+        "a ledger recipe string must not exit green"
+    );
+    assert_eq!(run.report["contractStatus"], "HOLD");
+    assert_ne!(run.report["contractStatus"], "READY");
+    assert!(
+        strings_at(&row(&run.report, "recipe-only"), &["blockers"])
+            .iter()
+            .any(|blocker| *blocker == "audit[evidence_invalid]"),
+        "ledger evidence.commands is not captured execution authority: {}",
+        run.report
+    );
+    let artifacts = row(&run.report, "recipe-only")["evidence"]["artifacts"]
+        .as_array()
+        .expect("artifact list");
+    assert!(
+        artifacts.iter().all(|artifact| artifact["present"] != true),
+        "recipe-only evidence must stay absent: {}",
+        run.report
+    );
+    let published = serde_json::to_string(&run.report).expect("publish JSON");
+    assert!(
+        !published.contains("pwsh -NoProfile -File evidence/"),
+        "report must not echo ledger recipe commands as proof: {published}"
+    );
+}
+
+#[test]
+fn parity_uncorrelated_execution_is_not_present() {
+    let uncorrelated = serde_json::to_vec(&json!({
+        "schemaVersion": 1,
+        "kind": "phase-gate",
+        "verdict": "pass",
+        "gateId": "gate-ready",
+        "testId": "uncorrelated-run",
+        "recipe": "uncorrelated-run",
+        "source": {
+            "path": "tests/fixture_parity.rs",
+            "contentSha256": FIXTURE_PARITY_SHA256
+        },
+        "execution": {
+            "command": "pwsh -NoProfile -File evidence/uncorrelated-run.ps1",
+            "resultSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+            "exitCode": 0,
+            "completedAtUtc": "2026-08-11T08:00:00.0000000Z",
+            "sourceSha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            "runSha256": "0000000000000000000000000000000000000000000000000000000000000000"
+        },
+        "completedAtUtc": "2026-08-11T08:00:00.0000000Z",
+        "freshnessSeconds": 315360000
+    }))
+    .expect("serialize uncorrelated execution");
+    let run = run_audit(
+        contract(
+            vec![base_row(
+                "uncorrelated-run",
+                "src/legacy.rs",
+                &["LegacyFixture"],
+                "src/replacement.rs",
+                &["gate-ready"],
+                "READY",
+            )],
+            vec![base_node("gate-ready", "gate", "READY")],
+        ),
+        &[
+            ("evidence/gate-ready.json", uncorrelated.as_slice()),
+            ("evidence/uncorrelated-run.json", uncorrelated.as_slice()),
+            ("tests/fixture_parity.rs", FIXTURE_PARITY_SOURCE),
+        ],
+    );
+    assert!(
+        !run.output.status.success(),
+        "uncorrelated execution must not exit green"
+    );
+    assert_eq!(run.report["contractStatus"], "HOLD");
+    assert!(
+        strings_at(&row(&run.report, "uncorrelated-run"), &["blockers"])
+            .iter()
+            .any(|blocker| *blocker == "audit[evidence_invalid]"),
+        "command/result/hash/exit/time must share one source/run digest: {}",
+        run.report
+    );
+    let artifacts = row(&run.report, "uncorrelated-run")["evidence"]["artifacts"]
+        .as_array()
+        .expect("artifact list");
+    assert!(
+        artifacts.iter().all(|artifact| artifact["present"] != true),
+        "uncorrelated execution must not be present: {}",
+        run.report
+    );
+}
+
+#[test]
+fn parity_named_test_must_bind_tracked_path_filter_and_evidence() {
+    let mut invented = base_row(
+        "invented-test",
+        "src/legacy.rs",
+        &["LegacyFixture"],
+        "src/replacement.rs",
+        &["gate-parity"],
+        "HOLD",
+    );
+    invented["tests"] = json!([{
+        "kind": "cargo-test",
+        "path": "tests/does_not_exist.rs",
+        "filter": "no_such_filter",
+        "evidence": "evidence/invented-test.json"
+    }]);
+    let run = run_audit(
+        contract(
+            vec![invented],
+            vec![base_node("gate-parity", "gate", "HOLD")],
+        ),
+        &[],
+    );
+    assert_eq!(run.report["contractStatus"], "HOLD");
+    assert!(
+        strings_at(&row(&run.report, "invented-test"), &["blockers"])
+            .iter()
+            .any(|blocker| *blocker == "audit[unverified]"),
+        "invented test targets must stay unverified HOLD: {}",
+        run.report
+    );
+    let report_text = run.report.to_string();
+    assert!(
+        !report_text.contains("cargo test") && !report_text.contains("does_not_exist.rs"),
+        "report must not echo raw invented commands or untrusted paths: {report_text}"
+    );
+}
+
+#[test]
+fn parity_missing_tests_or_impact_are_unverified_hold() {
+    let mut stripped = base_row(
+        "unverified-hold",
+        "src/legacy.rs",
+        &["LegacyFixture"],
+        "src/replacement.rs",
+        &["gate-parity"],
+        "HOLD",
+    );
+    stripped.as_object_mut().unwrap().remove("tests");
+    stripped.as_object_mut().unwrap().remove("e2eProof");
+    stripped.as_object_mut().unwrap().remove("productionImpact");
+    let run = run_audit(
+        contract(
+            vec![stripped],
+            vec![base_node("gate-parity", "gate", "HOLD")],
+        ),
+        &[],
+    );
+    assert_eq!(run.report["contractStatus"], "HOLD");
+    assert_eq!(row(&run.report, "unverified-hold")["status"], "HOLD");
+    assert!(
+        strings_at(&row(&run.report, "unverified-hold"), &["blockers"])
+            .iter()
+            .any(|blocker| *blocker == "audit[unverified]"),
+        "missing tests/e2e/impact must be an unverified HOLD blocker, not a fabricated claim: {}",
+        run.report
+    );
+}
+
+#[test]
+fn parity_directory_owner_uses_prefix_boundary() {
+    let present = run_audit(
+        contract(
+            vec![base_row(
+                "state-dir",
+                "src/state/",
+                &["RuntimeState"],
+                "src/replacement.rs",
+                &["gate-parity"],
+                "HOLD",
+            )],
+            vec![base_node("gate-parity", "gate", "HOLD")],
+        ),
+        &[
+            ("src/state/mod.rs", b"mod state\n"),
+            ("src/statement.rs", b"not a descendant\n"),
+        ],
+    );
+    assert_eq!(
+        row(&present.report, "state-dir")["legacy"]["pathPresent"],
+        true
+    );
+    assert_eq!(row(&present.report, "state-dir")["status"], "HOLD");
+
+    let boundary = run_audit(
+        contract(
+            vec![base_row(
+                "state-boundary",
+                "src/state/",
+                &["RuntimeState"],
+                "src/replacement.rs",
+                &["gate-parity"],
+                "HOLD",
+            )],
+            vec![base_node("gate-parity", "gate", "HOLD")],
+        ),
+        &[("src/statement.rs", b"not a descendant\n")],
+    );
+    assert_eq!(
+        row(&boundary.report, "state-boundary")["legacy"]["pathPresent"],
+        false,
+        "src/statement.rs must not satisfy src/state/: {}",
+        boundary.report
+    );
+
+    let file_not_dir = run_audit(
+        contract(
+            vec![base_row(
+                "state-file",
+                "src/state/",
+                &["RuntimeState"],
+                "src/replacement.rs",
+                &["gate-parity"],
+                "HOLD",
+            )],
+            vec![base_node("gate-parity", "gate", "HOLD")],
+        ),
+        &[("src/state", b"file not directory\n")],
+    );
+    assert_eq!(
+        row(&file_not_dir.report, "state-file")["legacy"]["pathPresent"],
+        false,
+        "a file named src/state must not satisfy directory owner src/state/: {}",
+        file_not_dir.report
+    );
+
+    let wrong_case = run_audit(
+        contract(
+            vec![base_row(
+                "state-case",
+                "src/state/",
+                &["RuntimeState"],
+                "src/replacement.rs",
+                &["gate-parity"],
+                "HOLD",
+            )],
+            vec![base_node("gate-parity", "gate", "HOLD")],
+        ),
+        &[("src/State/mod.rs", b"wrong case descendant\n")],
+    );
+    assert_eq!(
+        row(&wrong_case.report, "state-case")["legacy"]["pathPresent"],
+        false,
+        "src/State/mod.rs must not satisfy ordinal directory prefix src/state/: {}",
+        wrong_case.report
+    );
+
+    let mut deleted = base_row(
+        "state-deleted",
+        "src/state/",
+        &["RuntimeState"],
+        "src/replacement.rs",
+        &["gate-parity"],
+        "DELETED",
+    );
+    deleted["deletionSet"] = json!(["src/state/"]);
+    let leftover = run_audit(
+        contract(
+            vec![deleted],
+            vec![base_node("gate-parity", "gate", "READY")],
+        ),
+        &[("src/state/mod.rs", b"mod state\n")],
+    );
+    assert_eq!(row(&leftover.report, "state-deleted")["status"], "DELETED");
+    assert!(
+        strings_at(&row(&leftover.report, "state-deleted"), &["blockers"])
+            .iter()
+            .any(|blocker| *blocker == "audit[contract_invalid]"),
+        "DELETED must require directory descendants absent: {}",
+        leftover.report
+    );
+}
+
+#[test]
+fn parity_candidate_scanner_does_not_resolve_rg_from_path_or_where() {
+    let source = fs::read_to_string(AUDIT_SCRIPT).expect("read audit script");
+    assert!(
+        source.contains("Invoke-CutoverInternalReferenceScan")
+            || source.contains("internal reference scan"),
+        "candidate mode needs a bounded internal scanner"
+    );
+    assert!(
+        !source.to_ascii_lowercase().contains("where.exe")
+            && !source.contains("where rg")
+            && !source.contains("where git"),
+        "audit must not PATH-resolve where/rg"
+    );
+    assert!(
+        !source.contains("Contains('rg')") && !source.contains("Contains(\"rg\")"),
+        "bare rg substring classification false-greens messages such as argument-binding failures"
+    );
+    assert!(
+        source.contains("536870912"),
+        "directory handles must request GENERIC_EXECUTE/FILE_TRAVERSE for relative evidence opens"
+    );
+    assert!(
+        source.contains("0x001201BF") && !source.contains("0x001201FF"),
+        "relative directory opens must not demand FILE_DELETE_CHILD on Modify-only worktrees"
+    );
+    assert!(
+        source.contains("authenticated-fixture") && source.contains("candidate-worktree"),
+        "rg shims stay fixture-only"
+    );
+    assert!(
+        source.contains("$script:reportDirectoryHandle")
+            && source.contains("Close-CutoverPublicationHandles"),
+        "publication handles must stay script-owned and joined on close"
+    );
+    assert!(
+        !source.contains("Contains('identity')")
+            && !source.contains("Contains('common')")
+            && !source.contains("Contains('content')")
+            && !source.contains("Contains('changed')")
+            && !source.contains("Contains('row')")
+            && !source.contains("Contains('node')"),
+        "diagnostic classification must use exact recognized phrases, not broad substrings"
+    );
+    assert!(
+        source.contains("recognizedDiagnosticCategories"),
+        "already-redacted audit[category] tokens must pass through an exact recognized-state allowlist"
+    );
+    assert!(
+        source.contains("Copy-CutoverRedactedBlockers")
+            && !source.contains("Add-GlobalBlocker \"row '$($model.id)': $blocker\""),
+        "row-blocker promotion must copy redacted tokens under the deadline, not re-parse prefixed prose"
+    );
+    assert!(
+        source.contains("ExpectedCommands")
+            && source.contains("resultSha256")
+            && source.contains("exitCode")
+            && source.contains("sourceSha256")
+            && source.contains("runSha256")
+            && source.contains("sourceVolume")
+            && source.contains("sourceIndex")
+            && source.contains("0000000000000000000000000000000000000000000000000000000000000000"),
+        "accepted evidence must bind command/result/hash/exit/time to the current source identity and reject zero/foreign run digests"
+    );
+    assert!(
+        source.contains("Equals($capturedCommand, $recipe"),
+        "a ledger/artifact recipe string must never be accepted as the captured command"
+    );
+    assert!(
+        source.contains("Get-CutoverHandleIdentity -Stream $openedSource.stream")
+            && source.contains("Equals($claimedVolume, $sourceVolume")
+            && source.contains("Equals($claimedIndex, $sourceIndex"),
+        "stale-run replay must fail when the captured volume/index is not the current source identity"
+    );
+    assert!(
+        source.contains("$sourceDigest + \"`n\" + $sourceVolume + \"`n\" + $sourceIndex"),
+        "tampering with command/result/exit/time/source/identity must invalidate runSha256"
+    );
+}
+
+#[test]
+fn parity_modify_only_acl_still_publishes_hold() {
+    let document = contract(
+        vec![base_row(
+            "modify-only",
+            "src/legacy.rs",
+            &["LegacyFixture"],
+            "src/replacement.rs",
+            &["gate-parity"],
+            "HOLD",
+        )],
+        vec![base_node("gate-parity", "gate", "HOLD")],
+    );
+    let fixture = fixture_repo(document, &[]);
+    let evidence_chain = fixture.root.join(".devmanager-next");
+    fs::create_dir_all(evidence_chain.join("evidence/current")).expect("precreate evidence chain");
+    apply_modify_without_delete_child(&evidence_chain);
+    let output_path = evidence_chain.join("evidence/current/cutover-audit.json");
+    let output = spawn_audit(&fixture.root, &output_path);
+    assert!(
+        output_path.is_file(),
+        "Modify-only ACL must still publish a report\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&fs::read(&output_path).expect("modify-only JSON"))
+        .expect("valid modify-only JSON");
+    assert!(!output.status.success(), "Modify-only HOLD must not exit 0");
+    assert_eq!(report["contractStatus"], "HOLD");
+    assert_ne!(report["contractStatus"], "READY");
+}
+
+#[test]
+fn parity_vacuous_ready_evidence_cannot_publish_success() {
+    let run = run_audit(
+        contract(
+            vec![base_row(
+                "vacuous-ready",
+                "src/legacy.rs",
+                &["LegacyFixture"],
+                "src/replacement.rs",
+                &["gate-ready"],
+                "READY",
+            )],
+            vec![base_node("gate-ready", "gate", "READY")],
+        ),
+        &[
+            ("evidence/gate-ready.json", b"{}"),
+            ("evidence/vacuous-ready.json", br#"{"ok":true}"#),
+        ],
+    );
+    assert!(
+        !run.output.status.success(),
+        "vacuous evidence must not exit green"
+    );
+    assert_eq!(run.report["contractStatus"], "HOLD");
+    assert_ne!(run.report["contractStatus"], "READY");
+    assert_eq!(row(&run.report, "vacuous-ready")["status"], "READY");
+    assert!(
+        strings_at(&row(&run.report, "vacuous-ready"), &["blockers"])
+            .iter()
+            .any(|blocker| *blocker == "audit[evidence_invalid]"),
+        "vacuous READY evidence must stay blocked: {}",
+        run.report
+    );
+    let artifacts = row(&run.report, "vacuous-ready")["evidence"]["artifacts"]
+        .as_array()
+        .expect("artifact list");
+    assert!(
+        artifacts.iter().all(|artifact| artifact["present"] != true),
+        "vacuous JSON must not be reported present: {}",
+        run.report
+    );
+}
+
+#[test]
+fn parity_report_omits_raw_commands() {
+    let run = run_audit(
+        contract(
+            vec![base_row(
+                "no-raw-command",
+                "src/legacy.rs",
+                &["LegacyFixture"],
+                "src/replacement.rs",
+                &["gate-parity"],
+                "HOLD",
+            )],
+            vec![base_node("gate-parity", "gate", "HOLD")],
+        ),
+        &[],
+    );
+    let published = format!(
+        "{}{}{}",
+        run.report,
+        run.human,
+        String::from_utf8_lossy(&run.output.stdout)
+    );
+    assert!(
+        !published.contains("pwsh -NoProfile -File evidence/")
+            && !published.contains("cargo test --test"),
+        "published report leaked raw commands: {published}"
+    );
+}
+
 #[test]
 fn fixture_audit_detects_legacy_path_symbol_and_external_references() {
     let document = contract(
@@ -788,7 +1814,20 @@ fn fixture_audit_detects_legacy_path_symbol_and_external_references() {
         "HOLD evidence must not be green"
     );
     assert_eq!(legacy["legacy"]["pathPresent"], true);
-    assert!(strings_at(legacy, &["references", "path"]).contains(&"src/reference.rs"));
+    assert_eq!(legacy["tests"][0]["path"], "tests/fixture_parity.rs");
+    assert_eq!(legacy["tests"][0]["filter"], "fixture_parity");
+    assert_eq!(
+        legacy["e2eProof"]["artifact"],
+        "evidence/legacy-fixture.json"
+    );
+    assert_eq!(legacy["e2eProof"]["kind"], "phase-gate");
+    assert_eq!(legacy["productionImpact"]["profile"], "isolated-fixture");
+    assert_eq!(legacy["deletionSet"]["paths"], json!(["src/legacy.rs"]));
+    assert!(
+        strings_at(legacy, &["references", "path"]).contains(&"src/reference.rs"),
+        "missing path reference: {}",
+        run.report
+    );
     assert!(strings_at(legacy, &["references", "symbol"]).contains(&"src/reference.rs"));
     assert!(!strings_at(legacy, &["references", "path"])
         .contains(&"docs/replacement-deletion-ledger.md"));
@@ -1121,7 +2160,17 @@ fn ledger_paths_reject_trailing_separators_without_trimming() {
         .iter()
         .all(|error| *error == "audit[contract_invalid]"));
     assert!(!errors.is_empty());
-    assert!(row(&run.report, "trailing-slash")["legacy"]["path"].is_null());
+    assert_eq!(
+        row(&run.report, "trailing-slash")["legacy"]["path"],
+        "src/legacy.rs/",
+        "a single trailing slash is the directory-owner spelling: {}",
+        run.report
+    );
+    assert!(
+        row(&run.report, "trailing-backslash")["legacy"]["path"].is_null(),
+        "backslashes remain rejected without trimming: {}",
+        run.report
+    );
 }
 
 #[test]
@@ -1826,10 +2875,7 @@ fn path_isolated_rg_shim_proves_reference_scan_uses_original_handle_bytes() {
     let output_path = fixture
         .root
         .join(".devmanager-next/evidence/current/cutover-audit.json");
-    let original_path = std::env::var_os("PATH").expect("PATH");
-    let mut path_entries = vec![shim_root.clone()];
-    path_entries.extend(std::env::split_paths(&original_path));
-    let isolated_path = std::env::join_paths(path_entries).expect("isolated PATH");
+    let isolated_path = fixture_path_with_shim(&shim_root);
     let output = Command::new("pwsh")
         .args([
             "-NoProfile",
@@ -2063,9 +3109,14 @@ fn concurrent_junction_path_swap_stays_confined_and_does_not_read_outside() {
     let report: Value = serde_json::from_slice(&fs::read(&output_path).expect("junction JSON"))
         .expect("valid junction JSON");
     assert!(!output.status.success());
-    assert!(strings_at(&report, &["blockers"])
-        .iter()
-        .any(|blocker| *blocker == "audit[path_reparse_rejected]"));
+    assert!(
+        strings_at(&report, &["blockers"])
+            .iter()
+            .any(|blocker| *blocker == "audit[path_reparse_rejected]"),
+        "junction swap blockers: {}\nstderr={}",
+        report,
+        String::from_utf8_lossy(&output.stderr)
+    );
     let human = fs::read_to_string(output_path.with_extension("txt")).expect("junction human");
     for channel in [
         report.to_string(),
@@ -2168,10 +3219,7 @@ fn git_enumeration_uses_the_bounded_wrapper_for_all_failure_modes() {
         let output_path = fixture
             .root
             .join(".devmanager-next/evidence/current/cutover-audit.json");
-        let original_path = std::env::var_os("PATH").expect("PATH");
-        let mut path_entries = vec![shim_root.clone()];
-        path_entries.extend(std::env::split_paths(&original_path));
-        let isolated_path = std::env::join_paths(path_entries).expect("isolated PATH");
+        let isolated_path = fixture_path_with_shim(&shim_root);
         let started = Instant::now();
         let output = Command::new("pwsh")
             .args([
@@ -2268,10 +3316,7 @@ fn retained_root_blocks_replacement_during_git_resolution_and_reports_hold() {
         .root
         .join(".devmanager-next/evidence/current/cutover-audit.json");
     let moved_output = moved_root.join(".devmanager-next/evidence/current/cutover-audit.json");
-    let original_path = std::env::var_os("PATH").expect("PATH");
-    let mut path_entries = vec![shim_root];
-    path_entries.extend(std::env::split_paths(&original_path));
-    let isolated_path = std::env::join_paths(path_entries).expect("isolated PATH");
+    let isolated_path = fixture_path_with_shim(&shim_root);
     let output = Command::new("pwsh")
         .args([
             "-NoProfile",
@@ -2605,10 +3650,7 @@ fn unauthorized_root_is_rejected_before_git_or_fixture_read() {
     let probe_log = temp.path().join("git-probe.log");
     let shim = write_git_probe_shim(&shim_root, &probe_log);
     assert!(shim.is_file(), "git probe shim must compile");
-    let original_path = std::env::var_os("PATH").expect("PATH");
-    let mut path_entries = vec![shim_root];
-    path_entries.extend(std::env::split_paths(&original_path));
-    let isolated_path = std::env::join_paths(path_entries).expect("isolated PATH");
+    let isolated_path = fixture_path_with_shim(&shim_root);
     let output_path = root.join(".devmanager-next/evidence/current/report.json");
     let output = Command::new("pwsh")
         .args([

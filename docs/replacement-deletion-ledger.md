@@ -4,14 +4,18 @@ This ledger is the dependency-safe Phase 11.1 cutover contract. The fenced JSON
 document is canonical and is consumed by
 `scripts/native-next/Invoke-CutoverAudit.ps1` and `tests/cutover_contract.rs`.
 Every row remains `HOLD` until its prerequisite phase/gates and evidence are
-actually green. `READY` means the replacement is approved for the deletion
-slice; `DELETED` additionally requires the legacy path and all tracked
-references to be absent. This foundation makes no deletion claim.
+actually green. Declared tests, E2E proof, and production impact are included only when an
+exact tracked binding exists. Missing or unverified fields stay HOLD blockers.
+No row may claim assumed, partial, or compile-only evidence.
+`READY` means the replacement is approved for the deletion slice; `DELETED`
+additionally requires the legacy path and the full deletion set to be absent.
+This foundation makes no deletion claim.
 
-The audit uses `git ls-files` as the tracked universe and `rg` fixed-string line
-scans for source/package/document references. Only this ledger is an allowed
-self-reference. An exact `session.json` file is path-only evidence and is never
-opened or hashed by the audit.
+The audit uses `git ls-files` as the tracked universe. Candidate mode uses a
+bounded internal fixed-string scanner; fixture mode may use a PATH-confined `rg`
+shim after fixture authority. Only this ledger is an allowed self-reference. An
+exact `session.json` file is path-only evidence and is never opened or hashed by
+the audit.
 
 ```json cutover-contract
 {
@@ -216,6 +220,9 @@ opened or hashed by the audit.
           ".devmanager-next/evidence/phase-10/verification.json"
         ]
       },
+      "deletionSet": [
+        "src/app/mod.rs"
+      ],
       "status": "HOLD",
       "approvalRequired": true,
       "approvalRequirement": "Explicit Phase 11 cutover approval after merged-tree parity evidence"
@@ -253,6 +260,9 @@ opened or hashed by the audit.
           ".devmanager-next/evidence/phase-11/approval.json"
         ]
       },
+      "deletionSet": [
+        "src/bin/devmanager-next.rs"
+      ],
       "status": "HOLD",
       "approvalRequired": true,
       "approvalRequirement": "Explicit approval is required before removing the development entry identity"
@@ -288,6 +298,9 @@ opened or hashed by the audit.
           ".devmanager-next/evidence/phase-08/verification.json"
         ]
       },
+      "deletionSet": [
+        "src/services/process_manager.rs"
+      ],
       "status": "HOLD",
       "approvalRequired": true,
       "approvalRequirement": "Process and provider/browser zero-orphan evidence plus explicit cutover approval"
@@ -322,6 +335,9 @@ opened or hashed by the audit.
           ".devmanager-next/evidence/phase-03/verification.json"
         ]
       },
+      "deletionSet": [
+        "src/terminal/session.rs"
+      ],
       "status": "HOLD",
       "approvalRequired": true,
       "approvalRequirement": "Host ownership, attach/detach, and zero-orphan gates must be approved"
@@ -353,6 +369,9 @@ opened or hashed by the audit.
           ".devmanager-next/evidence/phase-04/verification.json"
         ]
       },
+      "deletionSet": [
+        "src/ai/codex_cli.rs"
+      ],
       "status": "HOLD",
       "approvalRequired": true,
       "approvalRequirement": "Provider-native identity and launch conformance must be green before deletion"
@@ -387,6 +406,9 @@ opened or hashed by the audit.
           ".devmanager-next/evidence/phase-11/approval.json"
         ]
       },
+      "deletionSet": [
+        "src/ai/codex_rollout.rs"
+      ],
       "status": "HOLD",
       "approvalRequired": true,
       "approvalRequirement": "Correlated current-generation provider identity evidence and explicit approval"
@@ -422,6 +444,9 @@ opened or hashed by the audit.
           ".devmanager-next/evidence/phase-08/verification.json"
         ]
       },
+      "deletionSet": [
+        "src/browser/pane.rs"
+      ],
       "status": "HOLD",
       "approvalRequired": true,
       "approvalRequirement": "Task-scoped browser ownership and replay evidence must be approved"
@@ -457,6 +482,9 @@ opened or hashed by the audit.
           ".devmanager-next/evidence/phase-05/verification.json"
         ]
       },
+      "deletionSet": [
+        "src/state/"
+      ],
       "status": "HOLD",
       "approvalRequired": true,
       "approvalRequirement": "Single-source Task/runtime projection evidence and explicit approval"
@@ -491,6 +519,9 @@ opened or hashed by the audit.
           ".devmanager-next/evidence/phase-11/approval.json"
         ]
       },
+      "deletionSet": [
+        "src/models/config.rs"
+      ],
       "status": "HOLD",
       "approvalRequired": true,
       "approvalRequirement": "Supported config/remote preservation and intentional session omission require explicit approval"
@@ -527,6 +558,9 @@ opened or hashed by the audit.
           ".devmanager-next/evidence/phase-11/approval.json"
         ]
       },
+      "deletionSet": [
+        "src/persistence/mod.rs"
+      ],
       "status": "HOLD",
       "approvalRequired": true,
       "approvalRequirement": "The exact session.json omission contract and fresh-start evidence require explicit approval"
@@ -562,6 +596,9 @@ opened or hashed by the audit.
           ".devmanager-next/evidence/phase-11/approval.json"
         ]
       },
+      "deletionSet": [
+        "src/services/session_manager.rs"
+      ],
       "status": "HOLD",
       "approvalRequired": true,
       "approvalRequirement": "Runtime ownership and no-session-write proof require explicit approval"
@@ -594,6 +631,9 @@ opened or hashed by the audit.
           ".devmanager-next/evidence/phase-09/verification.json"
         ]
       },
+      "deletionSet": [
+        "src/remote/mod.rs"
+      ],
       "status": "HOLD",
       "approvalRequired": true,
       "approvalRequirement": "Realtime snapshot/event ownership and explicit cutover approval"
@@ -628,6 +668,9 @@ opened or hashed by the audit.
           ".devmanager-next/evidence/phase-10/verification.json"
         ]
       },
+      "deletionSet": [
+        "src/remote/web/bridge.rs"
+      ],
       "status": "HOLD",
       "approvalRequired": true,
       "approvalRequirement": "Connect authorization/realtime parity and explicit approval"
@@ -662,6 +705,9 @@ opened or hashed by the audit.
           ".devmanager-next/evidence/phase-10/verification.json"
         ]
       },
+      "deletionSet": [
+        "src/remote/web/lease.rs"
+      ],
       "status": "HOLD",
       "approvalRequired": true,
       "approvalRequirement": "Authorization and identity-preserving Connect evidence require explicit approval"
@@ -694,6 +740,9 @@ opened or hashed by the audit.
           ".devmanager-next/evidence/phase-05/verification.json"
         ]
       },
+      "deletionSet": [
+        "src/sidebar/"
+      ],
       "status": "HOLD",
       "approvalRequired": true,
       "approvalRequirement": "Task Cockpit navigation parity and explicit approval"
@@ -725,6 +774,9 @@ opened or hashed by the audit.
           ".devmanager-next/evidence/phase-06/verification.json"
         ]
       },
+      "deletionSet": [
+        "src/workspace/editor_ui.rs"
+      ],
       "status": "HOLD",
       "approvalRequired": true,
       "approvalRequirement": "Configuration/sidebar behavior parity and explicit approval"
@@ -759,6 +811,9 @@ opened or hashed by the audit.
           ".devmanager-next/evidence/phase-07/verification.json"
         ]
       },
+      "deletionSet": [
+        "src/ai/claude_hooks.rs"
+      ],
       "status": "HOLD",
       "approvalRequired": true,
       "approvalRequirement": "Provider prompt identity, personal prompt, and manual-chain evidence require approval"
@@ -803,6 +858,9 @@ opened or hashed by the audit.
           ".devmanager-next/evidence/phase-10/verification.json"
         ]
       },
+      "deletionSet": [
+        "src/workspace/mod.rs"
+      ],
       "status": "HOLD",
       "approvalRequired": true,
       "approvalRequirement": "Personal/organization prompt, manual chain, Connect identity, and Command Center parity approval"
@@ -837,6 +895,9 @@ opened or hashed by the audit.
           ".devmanager-next/evidence/phase-09/verification.json"
         ]
       },
+      "deletionSet": [
+        "web/src/sessions/"
+      ],
       "status": "HOLD",
       "approvalRequired": true,
       "approvalRequirement": "Task/Connect web route parity and explicit deletion approval"
@@ -870,6 +931,9 @@ opened or hashed by the audit.
           ".devmanager-next/evidence/phase-11/approval.json"
         ]
       },
+      "deletionSet": [
+        "tests/legacy_loader.rs"
+      ],
       "status": "HOLD",
       "approvalRequired": true,
       "approvalRequirement": "Legacy import coverage must be replaced by an explicit fresh-start negative contract"
@@ -903,6 +967,9 @@ opened or hashed by the audit.
           ".devmanager-next/evidence/phase-11/approval.json"
         ]
       },
+      "deletionSet": [
+        "tests/fixtures/legacy-session.json"
+      ],
       "status": "HOLD",
       "approvalRequired": true,
       "approvalRequirement": "The old session fixture remains HOLD until deletion evidence is approved"
@@ -911,7 +978,7 @@ opened or hashed by the audit.
       "id": "legacy-tauri-archive",
       "area": "archived-desktop-implementation",
       "legacy": {
-        "path": "zz-archive/tauri-react-v0.1.11",
+        "path": "zz-archive/tauri-react-v0.1.11/",
         "symbols": [
           "tauri-react-v0.1.11",
           "src-tauri"
@@ -936,6 +1003,9 @@ opened or hashed by the audit.
           ".devmanager-next/evidence/phase-11/release-candidate.json"
         ]
       },
+      "deletionSet": [
+        "zz-archive/tauri-react-v0.1.11/"
+      ],
       "status": "HOLD",
       "approvalRequired": true,
       "approvalRequirement": "Archive deletion is allowed only after release-candidate evidence and explicit approval"
@@ -968,6 +1038,9 @@ opened or hashed by the audit.
           ".devmanager-next/evidence/phase-11/release-candidate.json"
         ]
       },
+      "deletionSet": [
+        "src/updater/mod.rs"
+      ],
       "status": "HOLD",
       "approvalRequired": true,
       "approvalRequirement": "Signed metadata, client/host identity, rollback, and update matrix approval"
@@ -1000,6 +1073,9 @@ opened or hashed by the audit.
           ".devmanager-next/evidence/phase-11/release-candidate.json"
         ]
       },
+      "deletionSet": [
+        "tests/updater.rs"
+      ],
       "status": "HOLD",
       "approvalRequired": true,
       "approvalRequirement": "Update-contract replacement evidence and explicit approval"

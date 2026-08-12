@@ -121,10 +121,51 @@ function Add-SafetyBound {
     }
 }
 
+$script:recognizedDiagnosticCategories = @(
+    'report_parent_changed',
+    'report_temp_invalid',
+    'report_replacement_invalid',
+    'handle_escape',
+    'filesystem_identity_unavailable',
+    'root_identity_changed',
+    'remote_change_protected',
+    'remote_change_unattributed',
+    'unsupported_runtime',
+    'unverified',
+    'production_profile',
+    'root_unauthorized',
+    'git_identity_invalid',
+    'protected_filename',
+    'output_path_rejected',
+    'path_hardlink_rejected',
+    'path_reparse_rejected',
+    'file_identity_changed',
+    'contract_invalid',
+    'process_stdout_overflow',
+    'process_stderr_overflow',
+    'process_error',
+    'process_nonzero',
+    'process_deadline_exceeded',
+    'scanner_failed',
+    'git_enumeration_failed',
+    'evidence_invalid',
+    'prerequisite_invalid',
+    'ledger_invalid',
+    'safety_bound',
+    'audit_internal_error'
+)
+
 function Get-CutoverDiagnosticCategory {
     param([AllowEmptyString()][string]$Message)
 
     $text = ([string]$Message).ToLowerInvariant()
+    if ($text -match '^audit\[([a-z0-9_]+)\](?:;path=.*)?$') {
+        $category = [string]$Matches[1]
+        if ($script:recognizedDiagnosticCategories -contains $category) {
+            return $category
+        }
+        return 'audit_internal_error'
+    }
     if ($text.Contains('report parent')) { return 'report_parent_changed' }
     if ($text.Contains('relative report')) { return 'report_temp_invalid' }
     if ($text.Contains('temporary report')) { return 'report_temp_invalid' }
@@ -132,17 +173,22 @@ function Get-CutoverDiagnosticCategory {
     if ($text.Contains('opened handle escaped')) { return 'handle_escape' }
     if ($text.Contains('stable windows filesystem identity')) { return 'filesystem_identity_unavailable' }
     if ($text.Contains('repository root changed')) { return 'root_identity_changed' }
+    if ($text.Contains('repository root retained handle changed')) { return 'root_identity_changed' }
     if ($text.Contains('remote change protected')) { return 'remote_change_protected' }
     if ($text.Contains('remote change unattributed')) { return 'remote_change_unattributed' }
     if ($text.Contains('unsupported_runtime') -or $text.Contains('powershell 7')) { return 'unsupported_runtime' }
+    if ($text.Contains('unverified') -or $text.Contains('not bound')) { return 'unverified' }
+    if ($text.Contains('production profile') -or $text.Contains('devmanager_profile')) { return 'production_profile' }
     if ($text.Contains('unauthorized') -or $text.Contains('authenticated fixture')) { return 'root_unauthorized' }
-    if ($text.Contains('common') -or $text.Contains('git identity') -or $text.Contains('worktree')) { return 'git_identity_invalid' }
+    if ($text.Contains('git identity') -or $text.Contains('git worktree identity') -or $text.Contains('git common directory') -or $text.Contains('git repository identity')) { return 'git_identity_invalid' }
     if ($text.Contains('session.json')) { return 'protected_filename' }
     if ($text.Contains('output path') -or $text.Contains('report path')) { return 'output_path_rejected' }
     if ($text.Contains('hard link') -or $text.Contains('hardlink')) { return 'path_hardlink_rejected' }
     if ($text.Contains('reparse') -or $text.Contains('junction') -or $text.Contains('symlink')) { return 'path_reparse_rejected' }
-    if ($text.Contains('content') -or $text.Contains('changed') -or $text.Contains('identity')) { return 'file_identity_changed' }
-    if ($text.Contains('legacy ')) { return 'contract_invalid' }
+    if ($text.Contains('relative evidence directory')) { return 'report_parent_changed' }
+    if ($text.Contains('publication handle') -or $text.Contains('parenthandle')) { return 'report_parent_changed' }
+    if ($text.Contains('opened-handle identity changed') -or $text.Contains('opened-handle content changed') -or $text.Contains('pathname identity changed') -or $text.Contains('content changed during') -or $text.Contains('handle identity changed')) { return 'file_identity_changed' }
+    if ($text.Contains('legacy path') -or $text.Contains('deletion set') -or $text.Contains('duplicate ledger')) { return 'contract_invalid' }
     if ($text.Contains('stdout') -and $text.Contains('overflow')) { return 'process_stdout_overflow' }
     if ($text.Contains('stderr') -and $text.Contains('overflow')) { return 'process_stderr_overflow' }
     if ($text.Contains('stdout-overflow')) { return 'process_stdout_overflow' }
@@ -150,13 +196,38 @@ function Get-CutoverDiagnosticCategory {
     if ($text.Contains('process-error') -or $text.Contains('process-resolve') -or $text.Contains('process-create')) { return 'process_error' }
     if ($text.Contains('nonzero') -or $text.Contains('exit code')) { return 'process_nonzero' }
     if ($text.Contains('timeout') -or $text.Contains('deadline')) { return 'process_deadline_exceeded' }
-    if ($text.Contains('scanner') -or $text.Contains('rg')) { return 'scanner_failed' }
-    if ($text.Contains('git')) { return 'git_enumeration_failed' }
-    if ($text.Contains('evidence')) { return 'evidence_invalid' }
-    if ($text.Contains('prerequisite') -or $text.Contains('dependency')) { return 'prerequisite_invalid' }
+    if ($text.Contains('rg.exe') -or $text.Contains('ripgrep') -or $text.Contains('reference scan') -or $text.Contains('scanner')) { return 'scanner_failed' }
+    if ($text.Contains('git enumeration') -or $text.Contains('git ls-files') -or $text.Contains('git path')) { return 'git_enumeration_failed' }
+    if ($text.Contains('evidence artifact') -or $text.Contains('missing evidence')) { return 'evidence_invalid' }
+    if ($text.Contains('prerequisite') -or $text.Contains('dependency is not ready')) { return 'prerequisite_invalid' }
     if ($text.Contains('ledger')) { return 'ledger_invalid' }
-    if ($text.Contains('contract') -or $text.Contains('row') -or $text.Contains('node')) { return 'contract_invalid' }
     return 'audit_internal_error'
+}
+
+function Copy-CutoverRedactedBlockers {
+    param(
+        [AllowEmptyCollection()][System.Collections.IEnumerable]$Blockers
+    )
+
+    foreach ($blocker in @($Blockers)) {
+        Assert-CutoverWorkDeadline
+        $token = [string]$blocker
+        if ([string]::IsNullOrWhiteSpace($token)) {
+            continue
+        }
+        if ($globalBlockers.Count -ge $maxErrorCount) {
+            Add-SafetyBound
+            return
+        }
+        if ($token -match '^audit\[([a-z0-9_]+)\](?:;path=.*)?$' -and
+            $script:recognizedDiagnosticCategories -contains [string]$Matches[1]) {
+            if (-not $globalBlockers.Contains($token)) {
+                $globalBlockers.Add($token)
+            }
+            continue
+        }
+        Add-GlobalBlocker -Message $token
+    }
 }
 
 function Format-CutoverDiagnostic {
@@ -313,7 +384,8 @@ function Assert-CutoverPublicationAuthority {
 function Assert-CutoverRelativePath {
     param(
         [object]$Value,
-        [Parameter(Mandatory = $true)][string]$Label
+        [Parameter(Mandatory = $true)][string]$Label,
+        [switch]$AllowDirectory
     )
 
     if ($Value -isnot [string] -or [string]::IsNullOrEmpty([string]$Value)) {
@@ -322,6 +394,11 @@ function Assert-CutoverRelativePath {
     }
 
     $raw = [string]$Value
+    $directoryOwner = $false
+    if ($AllowDirectory -and $raw.EndsWith('/') -and -not $raw.EndsWith('//')) {
+        $directoryOwner = $true
+        $raw = $raw.Substring(0, $raw.Length - 1)
+    }
     if ($raw -ne $raw.Trim() -or $raw.Contains('\') -or $raw.EndsWith('/')) {
         Add-ContractError "${Label} must use its exact repository-relative spelling."
         return $null
@@ -354,6 +431,9 @@ function Assert-CutoverRelativePath {
     if ([string]::IsNullOrEmpty($raw) -or $raw -eq '.') {
         Add-ContractError "${Label} must be a normalized repository-relative path."
         return $null
+    }
+    if ($directoryOwner) {
+        return "$raw/"
     }
     return $raw
 }
@@ -635,7 +715,7 @@ public static class CutoverNativeMethods
             IoStatusBlock status;
             return NtCreateFile(
                 out directoryHandle,
-                0x001201FF,
+                0x001201BF,
                 ref attributes,
                 out status,
                 IntPtr.Zero,
@@ -801,8 +881,15 @@ function Open-CutoverConfinedFile {
     $flags = 0x00200000 -bor 0x02000000 # OPEN_REPARSE_POINT | BACKUP_SEMANTICS
     try {
         $desiredAccess = [uint32]2147483648
+        if ($AllowDirectory) {
+            # GENERIC_EXECUTE maps to FILE_TRAVERSE on directories. Relative
+            # NtCreateFile opens of .devmanager-next/evidence require that
+            # right on the retained root handle; Modify-only worktree ACLs
+            # do not invent it when the handle was opened read/write only.
+            $desiredAccess = [uint32]($desiredAccess -bor 536870912)
+        }
         if ($AllowDirectoryWrite) {
-            $desiredAccess = [uint32](2147483648 -bor 1073741824)
+            $desiredAccess = [uint32]($desiredAccess -bor 1073741824)
             if (-not $DenyDeleteShare) {
                 $desiredAccess = [uint32]($desiredAccess -bor 65536)
             }
@@ -989,7 +1076,7 @@ function Open-CutoverRelativeDirectory {
         if ($rawHandle -ne [IntPtr]::Zero -and $rawHandle -ne [IntPtr](-1)) {
             [Microsoft.Win32.SafeHandles.SafeFileHandle]::new($rawHandle, $true).Dispose()
         }
-        throw 'relative evidence directory open failed.'
+        throw ("relative evidence directory open failed (status={0})." -f $status)
     }
 
     $safeHandle = [Microsoft.Win32.SafeHandles.SafeFileHandle]::new($rawHandle, $true)
@@ -1077,15 +1164,15 @@ function Open-CutoverRelativeDirectoryChain {
 }
 
 function Close-CutoverPublicationHandles {
-    if ($null -ne $reportDirectoryHandle) {
-        $chain = @($reportDirectoryHandle.chainHandles)
+    if ($null -ne $script:reportDirectoryHandle) {
+        $chain = @($script:reportDirectoryHandle.chainHandles)
         for ($index = $chain.Count - 1; $index -ge 0; $index--) {
             try { $chain[$index].stream.Dispose() } catch { }
         }
         $script:reportDirectoryHandle = $null
     }
-    if ($null -ne $rootDirectoryHandle) {
-        try { $rootDirectoryHandle.stream.Dispose() } catch { }
+    if ($null -ne $script:rootDirectoryHandle) {
+        try { $script:rootDirectoryHandle.stream.Dispose() } catch { }
         $script:rootDirectoryHandle = $null
     }
 }
@@ -2010,6 +2097,355 @@ function Get-BoundedContractStringArray {
     return @($result.ToArray())
 }
 
+function Test-CutoverForbiddenEvidenceClaim {
+    param([AllowEmptyString()][string]$Text)
+
+    $lower = ([string]$Text).ToLowerInvariant()
+    if ([string]::IsNullOrEmpty($lower)) {
+        return $false
+    }
+    return $lower.Contains('assumed') -or
+        $lower.Contains('partial') -or
+        $lower.Contains('compile-only') -or
+        $lower.Contains('compile only') -or
+        $lower.Contains('compile_only')
+}
+
+function Assert-CutoverVerifiableClaimText {
+    param(
+        [AllowEmptyString()][string]$Text,
+        [Parameter(Mandatory = $true)][string]$Label
+    )
+
+    if (Test-CutoverForbiddenEvidenceClaim -Text $Text) {
+        Add-ContractError "${Label} must not claim assumed, partial, or compile-only evidence."
+        return $false
+    }
+    return $true
+}
+
+function Get-CutoverJsonObjectKeys {
+    param(
+        [Parameter(Mandatory = $true)][string]$Json,
+        [Parameter(Mandatory = $true)][string]$Label
+    )
+
+    $keys = New-Object 'System.Collections.Generic.List[string]'
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+    $index = 0
+    $length = $Json.Length
+    while ($index -lt $length -and [char]::IsWhiteSpace($Json[$index])) { $index++ }
+    if ($index -ge $length -or $Json[$index] -ne '{') {
+        throw "${Label} is not a JSON object."
+    }
+    $index++
+    while ($index -lt $length -and [char]::IsWhiteSpace($Json[$index])) { $index++ }
+    if ($index -lt $length -and $Json[$index] -eq '}') {
+        return @()
+    }
+    while ($index -lt $length) {
+        Assert-CutoverWorkDeadline
+        while ($index -lt $length -and [char]::IsWhiteSpace($Json[$index])) { $index++ }
+        if ($index -ge $length -or $Json[$index] -ne '"') {
+            throw "${Label} has a malformed object key."
+        }
+        $index++
+        $keyChars = New-Object 'System.Text.StringBuilder'
+        while ($index -lt $length) {
+            $character = $Json[$index]
+            if ($character -eq '"') { break }
+            if ($character -eq '\') {
+                $index++
+                if ($index -ge $length) { throw "${Label} has a truncated escape." }
+                $null = $keyChars.Append($Json[$index])
+            }
+            else {
+                $null = $keyChars.Append($character)
+            }
+            $index++
+        }
+        if ($index -ge $length -or $Json[$index] -ne '"') {
+            throw "${Label} has an unterminated object key."
+        }
+        $index++
+        $key = $keyChars.ToString()
+        if (-not $seen.Add($key)) {
+            throw "${Label} has a duplicate key."
+        }
+        $keys.Add($key)
+        while ($index -lt $length -and [char]::IsWhiteSpace($Json[$index])) { $index++ }
+        if ($index -ge $length -or $Json[$index] -ne ':') {
+            throw "${Label} is missing a key separator."
+        }
+        $index++
+        while ($index -lt $length -and [char]::IsWhiteSpace($Json[$index])) { $index++ }
+        if ($index -ge $length) { throw "${Label} is truncated." }
+        $depth = 0
+        $inString = $false
+        $escape = $false
+        while ($index -lt $length) {
+            $character = $Json[$index]
+            if ($inString) {
+                if ($escape) { $escape = $false }
+                elseif ($character -eq '\') { $escape = $true }
+                elseif ($character -eq '"') { $inString = $false }
+            }
+            else {
+                if ($character -eq '"') { $inString = $true }
+                elseif ($character -eq '{' -or $character -eq '[') { $depth++ }
+                elseif ($character -eq '}' -or $character -eq ']') {
+                    if ($depth -eq 0) { break }
+                    $depth--
+                }
+                elseif ($character -eq ',' -and $depth -eq 0) { break }
+            }
+            $index++
+        }
+        while ($index -lt $length -and [char]::IsWhiteSpace($Json[$index])) { $index++ }
+        if ($index -ge $length) { throw "${Label} is truncated." }
+        if ($Json[$index] -eq ',') {
+            $index++
+            continue
+        }
+        if ($Json[$index] -eq '}') {
+            return @($keys.ToArray())
+        }
+        throw "${Label} has malformed object punctuation."
+    }
+    throw "${Label} is truncated."
+}
+
+function Get-CutoverEvidenceArtifactVerdict {
+    param(
+        [AllowEmptyString()][string]$ArtifactPath,
+        [Parameter(Mandatory = $true)][string]$RowId,
+        [AllowEmptyCollection()][string[]]$ExpectedGateIds,
+        [AllowEmptyCollection()][string[]]$ExpectedTestIds,
+        [AllowEmptyCollection()][string[]]$ExpectedCommands
+    )
+
+    if ([string]::IsNullOrWhiteSpace($ArtifactPath)) {
+        return 'missing'
+    }
+    $leaf = [System.IO.Path]::GetFileName($ArtifactPath)
+    if ($leaf.Equals('session.json', [System.StringComparison]::OrdinalIgnoreCase)) {
+        return 'protected'
+    }
+    $literal = Join-Path $rootPath ($ArtifactPath.Replace('/', '\'))
+    $present = $false
+    try {
+        $present = Test-CutoverConfinedFilePresent -LiteralPath $literal
+    }
+    catch {
+        return 'rejected'
+    }
+    if (-not $present) {
+        return 'missing'
+    }
+
+    try {
+        $raw = Read-CutoverConfinedUtf8 `
+            -LiteralPath $literal `
+            -MaxBytes 8192 `
+            -Label "row '$RowId' evidence artifact"
+        $null = Get-CutoverJsonObjectKeys -Json $raw -Label "row '$RowId' evidence artifact"
+        $parsed = $raw | ConvertFrom-Json -Depth 8
+    }
+    catch {
+        $message = [string]$_.Exception.Message
+        if ($message.Contains('duplicate key')) { return 'malformed' }
+        if ($message.Contains('exceeds the bounded') -or $message.Contains('exceeded')) { return 'oversized' }
+        return 'malformed'
+    }
+
+    $required = @(
+        'schemaVersion', 'kind', 'verdict', 'gateId', 'testId', 'recipe',
+        'source', 'completedAtUtc', 'freshnessSeconds'
+    )
+    foreach ($field in $required) {
+        if ($null -eq (Get-ContractProperty -Object $parsed -Name $field)) {
+            return 'unknown'
+        }
+    }
+    if ((Get-ContractProperty -Object $parsed -Name 'schemaVersion') -ne 1) {
+        return 'unknown'
+    }
+    $kind = [string](Get-ContractProperty -Object $parsed -Name 'kind')
+    $verdict = [string](Get-ContractProperty -Object $parsed -Name 'verdict')
+    $gateId = [string](Get-ContractProperty -Object $parsed -Name 'gateId')
+    $testId = [string](Get-ContractProperty -Object $parsed -Name 'testId')
+    $recipe = [string](Get-ContractProperty -Object $parsed -Name 'recipe')
+    foreach ($claim in @($kind, $verdict, $gateId, $testId, $recipe)) {
+        if (Test-CutoverForbiddenEvidenceClaim -Text $claim) {
+            return 'compile-only'
+        }
+        if ($claim.Equals('stale', [System.StringComparison]::OrdinalIgnoreCase)) {
+            return 'stale'
+        }
+    }
+    if ($kind -notin @('phase-gate', 'focused-e2e', 'soak')) {
+        return 'unknown'
+    }
+    if ($verdict -in @('failed', 'cancelled', 'pending')) {
+        return 'failed'
+    }
+    if (-not [string]::Equals($verdict, 'pass', [System.StringComparison]::Ordinal)) {
+        return 'unknown'
+    }
+    if (@($ExpectedGateIds | Where-Object { [string]::Equals([string]$_, $gateId, [System.StringComparison]::Ordinal) }).Count -eq 0) {
+        return 'mismatched'
+    }
+    if (@($ExpectedTestIds).Count -gt 0 -and
+        @($ExpectedTestIds | Where-Object { [string]::Equals([string]$_, $testId, [System.StringComparison]::Ordinal) }).Count -eq 0) {
+        return 'mismatched'
+    }
+
+    $source = Get-ContractProperty -Object $parsed -Name 'source'
+    $commit = [string](Get-ContractProperty -Object $source -Name 'commit')
+    $digest = [string](Get-ContractProperty -Object $source -Name 'contentSha256')
+    $sourcePath = Get-ContractProperty -Object $source -Name 'path'
+    $attested = $false
+    $sourceVolume = ''
+    $sourceIndex = ''
+    if (-not [string]::IsNullOrWhiteSpace($digest)) {
+        if ($digest -notmatch '^[0-9a-fA-F]{64}$') {
+            return 'malformed'
+        }
+        $attestedPath = Normalize-ContractRelativePath -Value $sourcePath -Label "row '$RowId' evidence source.path"
+        if ($null -eq $attestedPath) {
+            return 'mismatched'
+        }
+        $openedSource = $null
+        try {
+            $attestedLiteral = Assert-CutoverConfinedPath `
+                -LiteralPath (Join-Path $rootPath ($attestedPath.Replace('/', '\'))) `
+                -AncestorPath $rootPath
+            $openedSource = Open-CutoverConfinedFile -LiteralPath $attestedLiteral
+            $attestedBytes = Read-CutoverScanBytes -Opened $openedSource -MaxBytes $maxScanBytesPerFile
+            $actual = Get-CutoverSha256Hex -Bytes $attestedBytes
+            if (-not [string]::Equals($actual, $digest, [System.StringComparison]::OrdinalIgnoreCase)) {
+                return 'mismatched'
+            }
+            $sourceIdentity = Get-CutoverHandleIdentity -Stream $openedSource.stream
+            $sourceVolume = [string]$sourceIdentity.volume
+            $sourceIndex = [string]$sourceIdentity.index
+            if ([string]::IsNullOrWhiteSpace($sourceVolume) -or [string]::IsNullOrWhiteSpace($sourceIndex)) {
+                return 'mismatched'
+            }
+            $attested = $true
+        }
+        catch {
+            return 'mismatched'
+        }
+        finally {
+            if ($null -ne $openedSource) { $openedSource.stream.Dispose() }
+        }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($commit)) {
+        if ($commit -notmatch '^[0-9a-fA-F]{40}$') {
+            return 'malformed'
+        }
+    }
+    if (-not $attested) {
+        return 'unknown'
+    }
+
+    $completedRaw = [string](Get-ContractProperty -Object $parsed -Name 'completedAtUtc')
+    try {
+        $completed = [DateTimeOffset]::Parse(
+            $completedRaw,
+            [System.Globalization.CultureInfo]::InvariantCulture,
+            [System.Globalization.DateTimeStyles]::RoundtripKind
+        )
+    }
+    catch {
+        return 'malformed'
+    }
+    $freshness = Get-ContractProperty -Object $parsed -Name 'freshnessSeconds'
+    if ($freshness -isnot [int] -and $freshness -isnot [long] -and $freshness -isnot [decimal]) {
+        try { $freshness = [int]$freshness } catch { return 'malformed' }
+    }
+    $maxAge = [int]$freshness
+    if ($maxAge -le 0 -or $maxAge -gt 315360000) {
+        return 'malformed'
+    }
+    $ageSeconds = ([DateTimeOffset]::UtcNow - $completed.ToUniversalTime()).TotalSeconds
+    if ($ageSeconds -gt $maxAge -or $ageSeconds -lt -300) {
+        return 'stale'
+    }
+
+    $execution = Get-ContractProperty -Object $parsed -Name 'execution'
+    $capturedCommand = [string](Get-ContractProperty -Object $execution -Name 'command')
+    $resultDigest = [string](Get-ContractProperty -Object $execution -Name 'resultSha256')
+    $exitCode = Get-ContractProperty -Object $execution -Name 'exitCode'
+    $capturedAt = [string](Get-ContractProperty -Object $execution -Name 'completedAtUtc')
+    if ([string]::IsNullOrWhiteSpace($capturedCommand) -or
+        $capturedCommand.Length -gt $maxNeedleChars -or
+        $capturedCommand.IndexOfAny([char[]](0..31 + 127)) -ge 0) {
+        return 'unknown'
+    }
+    if (Test-CutoverForbiddenEvidenceClaim -Text $capturedCommand) {
+        return 'compile-only'
+    }
+    if ([string]::Equals($capturedCommand, $recipe, [System.StringComparison]::Ordinal)) {
+        return 'unknown'
+    }
+    if ($resultDigest -notmatch '^[0-9a-fA-F]{64}$') {
+        return 'unknown'
+    }
+    if ($exitCode -isnot [int] -and $exitCode -isnot [long]) {
+        try { $exitCode = [int]$exitCode } catch { return 'malformed' }
+    }
+    if ([int]$exitCode -ne 0) {
+        return 'failed'
+    }
+    if (-not [string]::Equals($capturedAt, $completedRaw, [System.StringComparison]::Ordinal)) {
+        return 'unknown'
+    }
+    $executionSource = [string](Get-ContractProperty -Object $execution -Name 'sourceSha256')
+    $runClaim = [string](Get-ContractProperty -Object $execution -Name 'runSha256')
+    if ($executionSource -notmatch '^[0-9a-fA-F]{64}$' -or $runClaim -notmatch '^[0-9a-fA-F]{64}$') {
+        return 'unknown'
+    }
+    $sourceDigest = $digest.ToLowerInvariant()
+    $resultNorm = $resultDigest.ToLowerInvariant()
+    $runNorm = $runClaim.ToLowerInvariant()
+    $zeroDigest = '0000000000000000000000000000000000000000000000000000000000000000'
+    if ($resultNorm -eq $zeroDigest -or $sourceDigest -eq $zeroDigest -or $runNorm -eq $zeroDigest) {
+        return 'malformed'
+    }
+    if (-not [string]::Equals($executionSource, $sourceDigest, [System.StringComparison]::OrdinalIgnoreCase)) {
+        return 'mismatched'
+    }
+    $claimedVolume = [string](Get-ContractProperty -Object $execution -Name 'sourceVolume')
+    $claimedIndex = [string](Get-ContractProperty -Object $execution -Name 'sourceIndex')
+    if ([string]::IsNullOrWhiteSpace($claimedVolume) -or [string]::IsNullOrWhiteSpace($claimedIndex) -or
+        -not [string]::Equals($claimedVolume, $sourceVolume, [System.StringComparison]::Ordinal) -or
+        -not [string]::Equals($claimedIndex, $sourceIndex, [System.StringComparison]::Ordinal)) {
+        return 'mismatched'
+    }
+    $runMaterial = [System.Text.UTF8Encoding]::new($false, $true).GetBytes(
+        ($capturedCommand + "`n" + $resultNorm + "`n" + [string]([int]$exitCode) + "`n" + $capturedAt + "`n" + $sourceDigest + "`n" + $sourceVolume + "`n" + $sourceIndex)
+    )
+    $actualRun = Get-CutoverSha256Hex -Bytes $runMaterial
+    if (-not [string]::Equals($actualRun, $runNorm, [System.StringComparison]::OrdinalIgnoreCase)) {
+        return 'mismatched'
+    }
+    if (@($ExpectedCommands).Count -gt 0) {
+        $commandBound = $false
+        foreach ($declared in @($ExpectedCommands)) {
+            if ([string]::Equals([string]$declared, $capturedCommand, [System.StringComparison]::Ordinal)) {
+                $commandBound = $true
+                break
+            }
+        }
+        if (-not $commandBound) {
+            return 'mismatched'
+        }
+    }
+    return 'present'
+}
+
 function Sort-CutoverOrdinalStrings {
     param([AllowEmptyCollection()][object[]]$Values)
 
@@ -2058,10 +2494,11 @@ function Sort-CutoverOrdinalObjects {
 function Normalize-ContractRelativePath {
     param(
         [object]$Value,
-        [Parameter(Mandatory = $true)][string]$Label
+        [Parameter(Mandatory = $true)][string]$Label,
+        [switch]$AllowDirectory
     )
 
-    return Assert-CutoverRelativePath -Value $Value -Label $Label
+    return Assert-CutoverRelativePath -Value $Value -Label $Label -AllowDirectory:$AllowDirectory
 }
 
 function Normalize-TrackedPath {
@@ -2084,8 +2521,18 @@ function Test-TrackedPathPresent {
         [Parameter(Mandatory = $true)][string[]]$Tracked
     )
 
+    $directoryOwner = $Path.EndsWith('/')
+    $normalized = if ($directoryOwner) { $Path.Substring(0, $Path.Length - 1) } else { $Path }
+    if ([string]::IsNullOrEmpty($normalized)) {
+        return $false
+    }
+    $prefix = "$normalized/"
     foreach ($tracked in $Tracked) {
-        if ([string]::Equals([string]$tracked, $Path, [System.StringComparison]::Ordinal)) {
+        $candidate = [string]$tracked
+        if (-not $directoryOwner -and [string]::Equals($candidate, $normalized, [System.StringComparison]::Ordinal)) {
+            return $true
+        }
+        if ($directoryOwner -and $candidate.StartsWith($prefix, [System.StringComparison]::Ordinal)) {
             return $true
         }
     }
@@ -2298,6 +2745,94 @@ function Add-Needle {
     })
 }
 
+function Invoke-CutoverInternalReferenceScan {
+    param(
+        [AllowEmptyString()][string]$ScanText,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][byte[]]$ScanBytes,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Needles,
+        [Parameter(Mandatory = $true)][string]$RelativePath,
+        [Parameter(Mandatory = $true)][int]$MaxMatches,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][System.Collections.IDictionary]$Counts,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][System.Collections.Generic.List[object]]$Matches
+    )
+
+    $lines = New-Object 'System.Collections.Generic.List[string]'
+    if (-not [string]::IsNullOrEmpty($ScanText)) {
+        $buffer = [System.Text.UTF8Encoding]::new($false, $true).GetBytes($ScanText)
+        foreach ($line in @(Read-CutoverUtf8Lines -Bytes $buffer -MaxBytes $maxScannerOutputBytes -MaxLines $maxScannerOutputLines -MaxLineChars $maxScannerOutputLineChars)) {
+            Assert-CutoverWorkDeadline
+            $lines.Add([string]$line)
+        }
+    }
+    $lineNumber = 0
+    foreach ($line in $lines) {
+        Assert-CutoverWorkDeadline
+        $lineNumber++
+        foreach ($needle in $Needles) {
+            Assert-CutoverWorkDeadline
+            $needleText = [string]$needle.needle
+            if ([string]::IsNullOrEmpty($needleText)) { continue }
+            if (-not [string]::IsNullOrEmpty([string]$needle.contextPath) -and
+                -not [string]::Equals($RelativePath, [string]$needle.contextPath, [System.StringComparison]::Ordinal)) {
+                continue
+            }
+            if ($line.IndexOf($needleText, [System.StringComparison]::Ordinal) -lt 0) { continue }
+            $key = "$($needle.ownerId)|$($needle.kind)"
+            if (-not $Counts.ContainsKey($key)) { $Counts[$key] = 0 }
+            if ($Counts[$key] -ge [Math]::Min($MaxMatches, $maxMatchesPerOwner)) {
+                Add-SafetyBound
+                continue
+            }
+            $Counts[$key]++
+            $Matches.Add([pscustomobject]@{
+                    ownerId = [string]$needle.ownerId
+                    kind = [string]$needle.kind
+                    path = $RelativePath
+                    line = $lineNumber
+                })
+        }
+    }
+    if ($lines.Count -gt 0) {
+        return
+    }
+    foreach ($needle in $Needles) {
+        Assert-CutoverWorkDeadline
+        $needleBytes = [System.Text.UTF8Encoding]::new($false, $true).GetBytes([string]$needle.needle)
+        if ($needleBytes.Length -eq 0 -or $needleBytes.Length -gt $ScanBytes.Length) { continue }
+        if (-not [string]::IsNullOrEmpty([string]$needle.contextPath) -and
+            -not [string]::Equals($RelativePath, [string]$needle.contextPath, [System.StringComparison]::Ordinal)) {
+            continue
+        }
+        $found = $false
+        $last = $ScanBytes.Length - $needleBytes.Length
+        for ($offset = 0; $offset -le $last; $offset++) {
+            Assert-CutoverWorkDeadline
+            $matched = $true
+            for ($needleIndex = 0; $needleIndex -lt $needleBytes.Length; $needleIndex++) {
+                if ($ScanBytes[$offset + $needleIndex] -ne $needleBytes[$needleIndex]) {
+                    $matched = $false
+                    break
+                }
+            }
+            if ($matched) { $found = $true; break }
+        }
+        if (-not $found) { continue }
+        $key = "$($needle.ownerId)|$($needle.kind)"
+        if (-not $Counts.ContainsKey($key)) { $Counts[$key] = 0 }
+        if ($Counts[$key] -ge [Math]::Min($MaxMatches, $maxMatchesPerOwner)) {
+            Add-SafetyBound
+            continue
+        }
+        $Counts[$key]++
+        $Matches.Add([pscustomobject]@{
+                ownerId = [string]$needle.ownerId
+                kind = [string]$needle.kind
+                path = $RelativePath
+                line = 0
+            })
+    }
+}
+
 function Invoke-ReferenceScan {
     param(
         [Parameter(Mandatory = $true)][string]$RepositoryRoot,
@@ -2352,7 +2887,26 @@ function Invoke-ReferenceScan {
             }
             $scanNeedles = @($scanNeedleList.ToArray())
             $scan = [pscustomobject]@{ lines = @(); exitCode = 0; boundHit = $false }
-            if ($scanNeedles.Count -gt 0) {
+            $useExternalRg = $authorizedRootKind -eq 'authenticated-fixture'
+            if ($useExternalRg) {
+                try {
+                    $null = Resolve-CutoverExecutable -FileName 'rg'
+                }
+                catch {
+                    $useExternalRg = $false
+                }
+            }
+            if ($scanNeedles.Count -gt 0 -and -not $useExternalRg) {
+                Invoke-CutoverInternalReferenceScan `
+                    -ScanText $scanText `
+                    -ScanBytes $scanBytes `
+                    -Needles $scanNeedles `
+                    -RelativePath $relativePath `
+                    -MaxMatches $MaxMatches `
+                    -Counts $counts `
+                    -Matches $matches
+            }
+            elseif ($scanNeedles.Count -gt 0) {
                 $arguments = @(
                     '--json', '--fixed-strings', '--line-number', '--no-heading', '--color', 'never',
                     '--no-messages', '--text', '--hidden', '--no-ignore', '--max-count', [string]$MaxMatches,
@@ -4203,6 +4757,22 @@ function Assert-CutoverReportBounds {
         & $addString ([string]$row.status)
         & $addString ([string]$row.legacy.path)
         & $addString ([string]$row.replacementOwner.path)
+        & $addString ([string]$row.replacementOwner.symbol)
+        foreach ($testClaim in @($row.tests)) {
+            if ($testClaim -is [string]) {
+                continue
+            }
+            & $addString ([string](Get-ContractProperty -Object $testClaim -Name 'kind'))
+            & $addString ([string](Get-ContractProperty -Object $testClaim -Name 'path'))
+            & $addString ([string](Get-ContractProperty -Object $testClaim -Name 'filter'))
+        }
+        & $addString ([string]$row.e2eProof.artifact)
+        & $addString ([string]$row.e2eProof.kind)
+        & $addString ([string]$row.productionImpact.profile)
+        foreach ($preserve in @($row.productionImpact.preserves)) { & $addString ([string]$preserve) }
+        foreach ($neverTouches in @($row.productionImpact.neverTouches)) { & $addString ([string]$neverTouches) }
+        foreach ($deletionPath in @($row.deletionSet.paths)) { & $addString ([string]$deletionPath) }
+        foreach ($deletionPath in @($row.deletionSet.present)) { & $addString ([string]$deletionPath) }
         foreach ($prerequisite in @($row.prerequisites)) { & $addString ([string]$prerequisite) }
         foreach ($kind in @('path', 'symbol', 'token')) {
             foreach ($reference in @($row.references[$kind])) { & $addString ([string]$reference) }
@@ -4371,6 +4941,11 @@ function Write-AuditReports {
 
 try {
     $rootPath = Assert-CutoverAuthorizedRoot -RequestedRoot $Root
+    $requestedProfile = [Environment]::GetEnvironmentVariable('DEVMANAGER_PROFILE')
+    if (-not [string]::IsNullOrWhiteSpace([string]$requestedProfile) -and
+        [string]::Equals([string]$requestedProfile, 'production', [System.StringComparison]::OrdinalIgnoreCase)) {
+        Add-GlobalBlocker 'production profile is forbidden'
+    }
     if ($authorizedRootKind -eq 'authenticated-fixture') {
         # Executable contract tests can lower only the human-output ceiling to
         # exercise the real bounded fallback. Candidate audits never read or
@@ -4405,12 +4980,12 @@ try {
     $reportParentPath = Normalize-CutoverAbsolutePath `
         -LiteralPath (Split-Path -Parent $reportPath) `
         -Label 'report parent'
-    $reportDirectoryHandle = Open-CutoverRelativeDirectoryChain `
+    $script:reportDirectoryHandle = Open-CutoverRelativeDirectoryChain `
         -RootHandle $rootDirectoryHandle `
         -RootPath $rootPath `
         -LiteralPath $reportParentPath
     Assert-CutoverPublicationAuthority `
-        -ParentHandle $reportDirectoryHandle `
+        -ParentHandle $script:reportDirectoryHandle `
         -ExpectedParentPath $reportParentPath
 
     if (-not [string]::IsNullOrWhiteSpace($RemoteChangeEvidencePath)) {
@@ -4514,15 +5089,19 @@ try {
             $artifactPath = Normalize-ContractRelativePath -Value $artifact -Label "prerequisite node '$nodeId' evidence artifact"
             $artifactPresent = $false
             if ($null -ne $artifactPath) {
-                try {
-                    $artifactPresent = Test-CutoverConfinedFilePresent -LiteralPath (Join-Path $rootPath ($artifactPath.Replace('/', '\')))
+                $verdict = Get-CutoverEvidenceArtifactVerdict `
+                    -ArtifactPath $artifactPath `
+                    -RowId $nodeId `
+                    -ExpectedGateIds @($nodeId) `
+                    -ExpectedTestIds @($nodeId)
+                if ($verdict -eq 'present') {
+                    $artifactPresent = $true
                 }
-                catch {
-                    Add-GlobalBlocker "prerequisite evidence artifact was rejected by filesystem safety: $artifactPath"
-                    $artifactPresent = $false
-                }
-                if (-not $artifactPresent) {
+                elseif ($verdict -eq 'missing') {
                     Add-GlobalBlocker "prerequisite node '$nodeId' missing evidence artifact: $artifactPath"
+                }
+                else {
+                    Add-GlobalBlocker "prerequisite node '$nodeId' evidence artifact is $verdict"
                 }
             }
             $nodeEvidenceReports.Add([pscustomobject]@{
@@ -4583,7 +5162,8 @@ try {
         $legacy = Get-ContractProperty -Object $row -Name 'legacy'
         $legacyPath = Normalize-ContractRelativePath `
             -Value (Get-ContractProperty -Object $legacy -Name 'path') `
-            -Label "row '$rowId' legacy.path"
+            -Label "row '$rowId' legacy.path" `
+            -AllowDirectory
         $replacement = Get-ContractProperty -Object $row -Name 'replacementOwner'
         $replacementPath = Normalize-ContractRelativePath `
             -Value (Get-ContractProperty -Object $replacement -Name 'path') `
@@ -4632,6 +5212,112 @@ try {
         if ([string]::IsNullOrWhiteSpace([string](Get-ContractProperty -Object $row -Name 'approvalRequirement'))) {
             Add-ContractError "row '$rowId' approvalRequirement is empty."
         }
+        $null = Assert-CutoverVerifiableClaimText `
+            -Text ([string](Get-ContractProperty -Object $row -Name 'approvalRequirement')) `
+            -Label "row '$rowId' approvalRequirement"
+
+        $replacementSymbol = [string](Get-ContractProperty -Object $replacement -Name 'symbol')
+        if ([string]::IsNullOrWhiteSpace($replacementSymbol)) {
+            Add-ContractError "row '$rowId' replacementOwner.symbol is empty."
+        }
+        $null = Assert-CutoverVerifiableClaimText -Text $replacementSymbol -Label "row '$rowId' replacementOwner.symbol"
+
+        $declaredTests = New-Object 'System.Collections.Generic.List[object]'
+        $testsMissing = $false
+        $testsValue = Get-ContractProperty -Object $row -Name 'tests'
+        if ($null -eq $testsValue) {
+            $testsMissing = $true
+        }
+        else {
+            foreach ($item in Get-ContractArray $testsValue) {
+                Assert-CutoverWorkDeadline
+                if ($item -is [string]) {
+                    $null = Assert-CutoverVerifiableClaimText -Text ([string]$item) -Label "row '$rowId' tests"
+                    $declaredTests.Add([pscustomobject]@{ unbound = $true; kind = ''; path = $null; filter = '' })
+                    continue
+                }
+                $testKind = [string](Get-ContractProperty -Object $item -Name 'kind')
+                $testPath = Normalize-ContractRelativePath `
+                    -Value (Get-ContractProperty -Object $item -Name 'path') `
+                    -Label "row '$rowId' tests.path"
+                $testFilter = [string](Get-ContractProperty -Object $item -Name 'filter')
+                $testEvidence = Normalize-ContractRelativePath `
+                    -Value (Get-ContractProperty -Object $item -Name 'evidence') `
+                    -Label "row '$rowId' tests.evidence"
+                $null = Assert-CutoverVerifiableClaimText -Text $testKind -Label "row '$rowId' tests.kind"
+                $null = Assert-CutoverVerifiableClaimText -Text $testFilter -Label "row '$rowId' tests.filter"
+                if ($testKind -notin @('cargo-test', 'pwsh', 'node-test')) {
+                    $declaredTests.Add([pscustomobject]@{ unbound = $true; kind = $testKind; path = $testPath; filter = $testFilter })
+                    continue
+                }
+                $declaredTests.Add([pscustomobject]@{
+                        unbound = $false
+                        kind = $testKind
+                        path = $testPath
+                        filter = $testFilter
+                        evidence = $testEvidence
+                    })
+            }
+        }
+
+        $e2eProof = Get-ContractProperty -Object $row -Name 'e2eProof'
+        $e2eMissing = $false
+        $e2eArtifact = $null
+        $e2eKind = ''
+        if ($null -eq $e2eProof) {
+            $e2eMissing = $true
+        }
+        else {
+            $e2eArtifact = Normalize-ContractRelativePath `
+                -Value (Get-ContractProperty -Object $e2eProof -Name 'artifact') `
+                -Label "row '$rowId' e2eProof.artifact"
+            $e2eKind = [string](Get-ContractProperty -Object $e2eProof -Name 'kind')
+            if (-not [string]::IsNullOrWhiteSpace($e2eKind) -and $e2eKind -notin @('phase-gate', 'focused-e2e', 'soak')) {
+                Add-ContractError "row '$rowId' e2eProof.kind is not a machine-verifiable proof kind."
+            }
+            $null = Assert-CutoverVerifiableClaimText -Text $e2eKind -Label "row '$rowId' e2eProof.kind"
+        }
+
+        $productionImpact = Get-ContractProperty -Object $row -Name 'productionImpact'
+        $impactMissing = $false
+        $impactProfile = ''
+        $impactPreserves = @()
+        $impactNeverTouches = @()
+        if ($null -eq $productionImpact) {
+            $impactMissing = $true
+        }
+        else {
+            $impactProfile = [string](Get-ContractProperty -Object $productionImpact -Name 'profile')
+            if (-not [string]::IsNullOrWhiteSpace($impactProfile) -and $impactProfile -notin @('isolated-fixture', 'isolated', 'none')) {
+                Add-ContractError "row '$rowId' productionImpact.profile must be isolated-fixture, isolated, or none."
+            }
+            if ([string]::Equals($impactProfile, 'production', [System.StringComparison]::OrdinalIgnoreCase)) {
+                Add-GlobalBlocker 'production profile is forbidden'
+            }
+            $null = Assert-CutoverVerifiableClaimText -Text $impactProfile -Label "row '$rowId' productionImpact.profile"
+            $impactPreserves = @(Get-BoundedContractStringArray -Value (Get-ContractProperty -Object $productionImpact -Name 'preserves') -Label "row '$rowId' productionImpact.preserves")
+            $impactNeverTouches = @(Get-BoundedContractStringArray -Value (Get-ContractProperty -Object $productionImpact -Name 'neverTouches') -Label "row '$rowId' productionImpact.neverTouches")
+            if ($impactNeverTouches.Count -gt 0 -and -not ($impactNeverTouches -contains 'session.json')) {
+                Add-ContractError "row '$rowId' productionImpact.neverTouches must include session.json."
+            }
+            foreach ($impactClaim in @($impactPreserves + $impactNeverTouches)) {
+                $null = Assert-CutoverVerifiableClaimText -Text $impactClaim -Label "row '$rowId' productionImpact"
+            }
+        }
+
+        $deletionSet = @()
+        foreach ($deletionPath in @(Get-BoundedContractStringArray -Value (Get-ContractProperty -Object $row -Name 'deletionSet') -Label "row '$rowId' deletionSet")) {
+            $normalizedDeletion = Normalize-ContractRelativePath -Value $deletionPath -Label "row '$rowId' deletionSet" -AllowDirectory
+            if ($null -ne $normalizedDeletion) {
+                $deletionSet += $normalizedDeletion
+            }
+        }
+        if ($deletionSet.Count -eq 0) {
+            Add-ContractError "row '$rowId' deletionSet is empty."
+        }
+        elseif ($null -ne $legacyPath -and -not ($deletionSet -contains $legacyPath)) {
+            Add-ContractError "row '$rowId' deletionSet must include the legacy owner path."
+        }
 
         $rowModels.Add([pscustomobject]@{
                 source         = $row
@@ -4641,9 +5327,20 @@ try {
                 symbols        = $symbols
                 tokens         = $tokens
                 replacementPath = $replacementPath
+                replacementSymbol = $replacementSymbol
                 prerequisites  = $prerequisites
                 commands       = $commands
                 artifacts      = $artifacts
+                declaredTests  = @($declaredTests.ToArray())
+                testsMissing   = $testsMissing
+                e2eArtifact    = $e2eArtifact
+                e2eKind        = $e2eKind
+                e2eMissing     = $e2eMissing
+                impactMissing  = $impactMissing
+                impactProfile  = $impactProfile
+                impactPreserves = $impactPreserves
+                impactNeverTouches = $impactNeverTouches
+                deletionSet    = $deletionSet
                 status         = $status
             })
     }
@@ -4745,21 +5442,107 @@ try {
         }
 
         $artifactReports = New-Object 'System.Collections.Generic.List[object]'
+        $evidencePaths = New-Object 'System.Collections.Generic.List[string]'
         foreach ($artifact in $model.artifacts) {
             $artifactPath = Normalize-ContractRelativePath -Value $artifact -Label "row '$($model.id)' evidence artifact"
-            $artifactPresent = $false
             if ($null -ne $artifactPath) {
-                try {
-                    $artifactPresent = Test-CutoverConfinedFilePresent -LiteralPath (Join-Path $rootPath ($artifactPath.Replace('/', '\')))
-                }
-                catch {
-                    Add-RowBlocker -Blockers ([ref]$rowBlockers) -Message "evidence artifact rejected by filesystem safety: $artifactPath"
-                }
-                if (-not $artifactPresent) {
-                    Add-RowBlocker -Blockers ([ref]$rowBlockers) -Message "missing evidence artifact: $artifactPath"
-                }
+                $evidencePaths.Add($artifactPath)
+            }
+        }
+        if ($null -ne $model.e2eArtifact -and -not ($evidencePaths -contains $model.e2eArtifact)) {
+            $evidencePaths.Add([string]$model.e2eArtifact)
+        }
+        $expectedTestIds = New-Object 'System.Collections.Generic.List[string]'
+        $expectedTestIds.Add([string]$model.id)
+        foreach ($declared in @($model.declaredTests)) {
+            if (-not [string]::IsNullOrWhiteSpace([string]$declared.filter)) {
+                $expectedTestIds.Add([string]$declared.filter)
+            }
+        }
+        foreach ($artifactPath in $evidencePaths) {
+            $artifactPresent = $false
+                $verdict = Get-CutoverEvidenceArtifactVerdict `
+                    -ArtifactPath $artifactPath `
+                    -RowId $model.id `
+                    -ExpectedGateIds @($model.prerequisites) `
+                    -ExpectedTestIds @($expectedTestIds.ToArray()) `
+                    -ExpectedCommands @($model.commands)
+            if ($verdict -eq 'present') {
+                $artifactPresent = $true
+            }
+            elseif ($verdict -eq 'missing') {
+                Add-RowBlocker -Blockers ([ref]$rowBlockers) -Message "missing evidence artifact: $artifactPath"
+            }
+            elseif ($verdict -eq 'protected') {
+                Add-RowBlocker -Blockers ([ref]$rowBlockers) -Message "evidence artifact uses protected session.json"
+            }
+            elseif ($verdict -eq 'rejected') {
+                Add-RowBlocker -Blockers ([ref]$rowBlockers) -Message "evidence artifact rejected by filesystem safety: $artifactPath"
+            }
+            elseif ($verdict -eq 'compile-only') {
+                Add-RowBlocker -Blockers ([ref]$rowBlockers) -Message "compile-only evidence artifact: $artifactPath"
+            }
+            elseif ($verdict -eq 'stale') {
+                Add-RowBlocker -Blockers ([ref]$rowBlockers) -Message "stale evidence artifact: $artifactPath"
+            }
+            else {
+                Add-RowBlocker -Blockers ([ref]$rowBlockers) -Message "evidence artifact is $verdict"
             }
             $artifactReports.Add([pscustomobject]@{ path = $artifactPath; present = $artifactPresent })
+        }
+
+        $testReports = New-Object 'System.Collections.Generic.List[object]'
+        if ($model.testsMissing -eq $true) {
+            Add-RowBlocker -Blockers ([ref]$rowBlockers) -Message 'unverified missing tests'
+        }
+        elseif (@($model.declaredTests).Count -eq 0) {
+            Add-RowBlocker -Blockers ([ref]$rowBlockers) -Message 'unverified empty tests'
+        }
+        foreach ($declared in @($model.declaredTests)) {
+            Assert-CutoverWorkDeadline
+            if ($declared.unbound -eq $true -or [string]::IsNullOrWhiteSpace([string]$declared.path)) {
+                Add-RowBlocker -Blockers ([ref]$rowBlockers) -Message 'unverified unbound test declaration'
+                continue
+            }
+            $testPathPresent = Test-TrackedPathPresent -Path ([string]$declared.path) -Tracked $trackedFiles
+            $filterPresent = $false
+            if ($testPathPresent -and -not [string]::IsNullOrWhiteSpace([string]$declared.filter)) {
+                try {
+                    $testLiteral = Assert-CutoverConfinedPath `
+                        -LiteralPath (Join-Path $rootPath ([string]$declared.path).Replace('/', '\')) `
+                        -AncestorPath $rootPath
+                    $testSource = Read-CutoverConfinedUtf8 -LiteralPath $testLiteral -MaxBytes $maxScanBytesPerFile -Label "row '$($model.id)' test source"
+                    $filterPresent = $testSource.IndexOf("fn $([string]$declared.filter)", [System.StringComparison]::Ordinal) -ge 0
+                }
+                catch {
+                    $filterPresent = $false
+                }
+            }
+            elseif ([string]::IsNullOrWhiteSpace([string]$declared.filter)) {
+                $filterPresent = $true
+            }
+            $evidenceBound = $false
+            foreach ($artifactPath in $evidencePaths) {
+                if ([string]::Equals([string]$declared.evidence, [string]$artifactPath, [System.StringComparison]::Ordinal)) {
+                    $evidenceBound = $true
+                    break
+                }
+            }
+            if (-not $testPathPresent -or -not $filterPresent -or -not $evidenceBound) {
+                Add-RowBlocker -Blockers ([ref]$rowBlockers) -Message 'unverified test path, filter, or evidence binding'
+                continue
+            }
+            $testReports.Add([ordered]@{
+                    kind = Get-CutoverSafeReportIdentifier -Value $declared.kind
+                    path = [string]$declared.path
+                    filter = Get-CutoverSafeReportIdentifier -Value $declared.filter
+                })
+        }
+        if ($model.e2eMissing -eq $true) {
+            Add-RowBlocker -Blockers ([ref]$rowBlockers) -Message 'unverified missing e2e proof'
+        }
+        if ($model.impactMissing -eq $true) {
+            Add-RowBlocker -Blockers ([ref]$rowBlockers) -Message 'unverified missing production impact'
         }
 
         foreach ($prerequisite in $model.prerequisites) {
@@ -4781,9 +5564,18 @@ try {
             }
             $references[$kind] = @(Sort-CutoverOrdinalStrings -Values @($referenceSet | ForEach-Object { [string]$_ }))
         }
+        $deletionPresent = New-Object 'System.Collections.Generic.List[string]'
+        foreach ($deletionPath in @($model.deletionSet)) {
+            if (Test-TrackedPathPresent -Path $deletionPath -Tracked $trackedFiles) {
+                $deletionPresent.Add([string]$deletionPath)
+            }
+        }
         if ($model.status -eq 'DELETED') {
             if ($pathPresent) {
                 Add-RowBlocker -Blockers ([ref]$rowBlockers) -Message "legacy path still present: $($model.legacyPath)"
+            }
+            foreach ($remaining in $deletionPresent) {
+                Add-RowBlocker -Blockers ([ref]$rowBlockers) -Message "row deletion set still present: $remaining"
             }
             foreach ($kind in @('path', 'symbol', 'token')) {
                 if (@($references[$kind]).Count -gt 0) {
@@ -4806,7 +5598,22 @@ try {
                     }
                     replacementOwner = [ordered]@{
                         path = $model.replacementPath
+                        symbol = $model.replacementSymbol
                         present = $replacementPresent
+                    }
+                    tests = @($testReports.ToArray())
+                    e2eProof = [ordered]@{
+                        artifact = $model.e2eArtifact
+                        kind = $model.e2eKind
+                    }
+                    productionImpact = [ordered]@{
+                        profile = $model.impactProfile
+                        preserves = @($model.impactPreserves)
+                        neverTouches = @($model.impactNeverTouches)
+                    }
+                    deletionSet = [ordered]@{
+                        paths = @($model.deletionSet)
+                        present = @($deletionPresent.ToArray())
                     }
                     prerequisites = @($model.prerequisites | ForEach-Object {
                             Get-CutoverSafeReportIdentifier -Value $_
@@ -4819,9 +5626,7 @@ try {
                     blockers = @(Sort-CutoverOrdinalStrings -Values @($rowBlockers.ToArray()))
                 })
         $rowReports.Add($rowDocument)
-        foreach ($blocker in @($rowBlockers)) {
-            Add-GlobalBlocker "row '$($model.id)': $blocker"
-        }
+        Copy-CutoverRedactedBlockers -Blockers $rowBlockers
     }
 
     $sortedEntrypointFindings = @(Sort-CutoverOrdinalStrings -Values @($entrypointFindings.ToArray()))
@@ -4943,12 +5748,30 @@ try {
     # Always revalidate the authorized root before report publication, even when Git identity failed.
     Assert-CutoverAuthorizedRootIdentityStable
     if ($null -ne $gitIdentity) { Assert-CutoverRootStable }
+    if ($null -eq $script:reportDirectoryHandle) {
+        if ((Get-CutoverDeadlineRemainingMilliseconds) -le 0) {
+            throw 'audit deadline exceeded before a publication handle was retained.'
+        }
+        if ($null -eq $rootDirectoryHandle -or [string]::IsNullOrWhiteSpace([string]$reportPath) -or [string]::IsNullOrWhiteSpace([string]$rootPath)) {
+            throw 'publication handle was not retained.'
+        }
+        $reportParentPath = Normalize-CutoverAbsolutePath `
+            -LiteralPath (Split-Path -Parent $reportPath) `
+            -Label 'report parent'
+        $script:reportDirectoryHandle = Open-CutoverRelativeDirectoryChain `
+            -RootHandle $rootDirectoryHandle `
+            -RootPath $rootPath `
+            -LiteralPath $reportParentPath
+        Assert-CutoverPublicationAuthority `
+            -ParentHandle $script:reportDirectoryHandle `
+            -ExpectedParentPath $reportParentPath
+    }
     Write-AuditReports `
         -Report $report `
         -JsonPath $reportPath `
         -TextPath $humanPath `
         -EvidenceRoot $evidenceRoot `
-        -ParentHandle $reportDirectoryHandle `
+        -ParentHandle $script:reportDirectoryHandle `
         -ContractStatus ([ref]$contractStatus)
     Write-Host ("Wrote cutover audit JSON -> {0}" -f (Get-RelativeReportPath -RepositoryRoot $rootPath -Path $reportPath))
     Write-Host ("Wrote cutover audit report -> {0}" -f (Get-RelativeReportPath -RepositoryRoot $rootPath -Path $humanPath))
