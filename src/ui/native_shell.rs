@@ -637,6 +637,7 @@ impl IsolatedDevProfile {
                 Capability::EventReplay,
                 Capability::ExplicitDetach,
                 Capability::HostShutdown,
+                Capability::UpdateHandoff,
                 Capability::ServiceSupervisor,
             ]),
             limits: FrameLimits::v1_default(),
@@ -3918,8 +3919,15 @@ async fn execute_native_command(
                 ))),
             }
         }
-        NativeHostCommand::Updater { request_id, action } => {
+        NativeHostCommand::Updater {
+            request_id,
+            action,
+            handoff_ids,
+        } => {
             let _ = request_id;
+            if action == UpdaterAction::Install {
+                return execute_native_update_install(client, updater, handoff_ids).await;
+            }
             let action_error = match action {
                 UpdaterAction::StartBackground => {
                     updater.start_background_checks();
@@ -3927,7 +3935,7 @@ async fn execute_native_command(
                 }
                 UpdaterAction::Check => updater.check_for_updates().err(),
                 UpdaterAction::Download => updater.download_update().err(),
-                UpdaterAction::Install => None,
+                UpdaterAction::Install => unreachable!("install returned above"),
             };
             let snapshot = updater.snapshot();
             if let Some(error) = action_error {
@@ -3942,6 +3950,95 @@ async fn execute_native_command(
         }
         NativeHostCommand::Hold { .. } => Err(IpcError::Unavailable),
     }
+}
+
+async fn execute_native_update_install(
+    client: &mut HostClient,
+    updater: &UpdaterService,
+    ids: NativeUpdateCommandIds,
+) -> Result<NativeHostExecutionResult, IpcError> {
+    let identity = updater
+        .ready_update_identity()
+        .map_err(IpcError::Security)?;
+    let token = client
+        .prepare_update(
+            ids.prepare,
+            &identity.target_version,
+            &identity.client_build,
+            &identity.host_build,
+            false,
+        )
+        .await?;
+    updater
+        .accept_authenticated_handoff_token(token.clone())
+        .map_err(IpcError::Security)?;
+
+    for (command_id, command) in [
+        (
+            ids.confirm_drain,
+            DomainCommand::ConfirmUpdateDrain(ConfirmUpdateDrainIntent {
+                token_id: token.token_id,
+            }),
+        ),
+        (
+            ids.arm_install,
+            DomainCommand::ArmUpdateInstall(ArmUpdateInstallIntent {
+                token_id: token.token_id,
+            }),
+        ),
+    ] {
+        let receipt = client
+            .execute_command(CommandEnvelope {
+                command_id,
+                client_id: client.client_id(),
+                task_id: None,
+                issued_at_ms: unix_time_ms(),
+                expected_task_revision: None,
+                command,
+            })
+            .await?;
+        match receipt {
+            CommandReceipt::Accepted {
+                command_id: observed,
+                ..
+            } if observed == command_id => {}
+            CommandReceipt::Rejected { .. } => {
+                return Err(IpcError::Security(
+                    "Host rejected the authenticated update handoff.".into(),
+                ));
+            }
+            _ => return Err(IpcError::CorrelationMismatch),
+        }
+    }
+
+    let inspection = client
+        .inspect_host_quit()
+        .await?
+        .map_err(|error| IpcError::Security(format!("update host quit rejected: {error:?}")))?;
+    authorize_full_host_quit(&inspection, true).map_err(IpcError::Security)?;
+    let joined = client
+        .confirm_host_quit(ids.confirm_quit, inspection.inspection_id, true)
+        .await?;
+    if !matches!(joined, CommandReceipt::Accepted { command_id, .. } if command_id == ids.confirm_quit)
+    {
+        return Err(IpcError::CorrelationMismatch);
+    }
+
+    let outcome = updater
+        .launch_verified_installer_after_host_join(token.token_id)
+        .map_err(IpcError::Security)?;
+    if !outcome.process_must_exit {
+        return Err(IpcError::Security(
+            "Verified installer did not require old-process exit.".into(),
+        ));
+    }
+    Ok(NativeHostExecutionResult::Query {
+        detail: bounded_host_error(format!(
+            "Installer for {} launched; exiting old process",
+            outcome.version
+        )),
+        body: NativeHostQueryBody::UpdaterInstalled(updater.snapshot()),
+    })
 }
 
 fn query_text(detail: String) -> NativeHostExecutionResult {
@@ -4694,6 +4791,7 @@ impl NativeInteraction {
             ActionRequest::Updater(action) => NativeHostCommand::Updater {
                 request_id,
                 action: *action,
+                handoff_ids: NativeUpdateCommandIds::new(),
             },
         };
         let event = ActionEvent::new(request, source, focus_epoch);
@@ -5295,6 +5393,7 @@ pub struct NativeShell {
     composer: Option<TaskComposer>,
     composer_error: Option<String>,
     updater_snapshot: Option<UpdaterSnapshot>,
+    exit_after_update: bool,
     pending_preferences: VecDeque<RuntimePreferencesSnapshot>,
     appearance_subscription: Option<Subscription>,
     bounds_subscription: Option<Subscription>,
@@ -5507,6 +5606,7 @@ impl NativeShell {
                 Capability::ProviderInput,
                 Capability::TaskCockpit,
                 Capability::HostShutdown,
+                Capability::UpdateHandoff,
                 Capability::ExplicitDetach,
                 Capability::ServiceSupervisor,
             ]);
@@ -5591,6 +5691,7 @@ impl NativeShell {
             composer: None,
             composer_error: None,
             updater_snapshot: None,
+            exit_after_update: false,
             pending_preferences: VecDeque::new(),
             appearance_subscription: None,
             bounds_subscription: None,
@@ -5739,6 +5840,11 @@ impl NativeShell {
             }
             NativeHostQueryBody::Updater(snapshot) => {
                 self.updater_snapshot = Some(snapshot);
+                self.sync_top_bar_from_updater();
+            }
+            NativeHostQueryBody::UpdaterInstalled(snapshot) => {
+                self.updater_snapshot = Some(snapshot);
+                self.exit_after_update = true;
                 self.sync_top_bar_from_updater();
             }
         }
@@ -8404,10 +8510,7 @@ impl NativeShell {
                                 },
                             ))
                             .child(div().w_full().child(self.prompt_library_surface(tokens)))
-                            .child(
-                                self.cockpit
-                                    .conversation_surface(tokens, self.composer.as_ref()),
-                            )
+                            .child(self.task_conversation_surface(tokens, cx))
                             .child(div().id("native-shell-context-dock").w_full().child(
                                 self.context_dock_surface(tokens, Some(services_shell_entity)),
                             ))

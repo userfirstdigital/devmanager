@@ -346,6 +346,14 @@ pub struct InstallUpdateOptions {
     pub allow_explicit_confirm_with_active: bool,
 }
 
+/// Exact signed package identity required by the authenticated host handoff.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadyUpdateIdentity {
+    pub target_version: String,
+    pub client_build: String,
+    pub host_build: String,
+}
+
 struct UpdaterInner {
     current_version: Version,
     config: Option<PackagerUpdaterConfig>,
@@ -603,6 +611,45 @@ impl UpdaterService {
             .map_err(|error| error.to_string())
     }
 
+    /// Return the exact verified package identity used to request a host token.
+    pub fn ready_update_identity(&self) -> Result<ReadyUpdateIdentity, String> {
+        let state = self
+            .inner
+            .state
+            .read()
+            .map_err(|_| "Updater state is unavailable.".to_string())?;
+        let ready = state
+            .ready_update
+            .as_ref()
+            .ok_or_else(|| "No downloaded update is ready to install.".to_string())?;
+        self.inner.validate_ready_update(ready)?;
+        Ok(ReadyUpdateIdentity {
+            target_version: ready.update.version.clone(),
+            client_build: ready.package_identity.client_build.clone(),
+            host_build: ready.package_identity.host_build.clone(),
+        })
+    }
+
+    /// Retain the exact token returned by the authenticated HostClient lane.
+    pub fn accept_authenticated_handoff_token(
+        &self,
+        token: UpdateHandoffToken,
+    ) -> Result<(), String> {
+        if token.host_boot_id.is_nil() || token.is_expired_at(SystemTime::now()) {
+            return Err("Authenticated update handoff token is invalid or expired.".into());
+        }
+        let ready = self.ready_update_identity()?;
+        if token.target_version != ready.target_version
+            || token.client_build != ready.client_build
+            || token.host_build != ready.host_build
+        {
+            return Err(
+                "Authenticated update handoff token does not match the ready package.".into(),
+            );
+        }
+        self.remember_prepared_token(token)
+    }
+
     /// Prepare admission only (inspect+token). Confirm drain separately or via full gate.
     pub fn prepare_update_install(
         &self,
@@ -702,6 +749,23 @@ impl UpdaterService {
         &self,
         token_id: uuid::Uuid,
     ) -> Result<InstallerLaunchOutcome, String> {
+        self.launch_verified_installer_inner(token_id, true)
+    }
+
+    /// Commit only after the authenticated host acknowledged install arm and
+    /// its intentional-exit cleanup. The caller must have awaited both replies.
+    pub fn launch_verified_installer_after_host_join(
+        &self,
+        token_id: uuid::Uuid,
+    ) -> Result<InstallerLaunchOutcome, String> {
+        self.launch_verified_installer_inner(token_id, false)
+    }
+
+    fn launch_verified_installer_inner(
+        &self,
+        token_id: uuid::Uuid,
+        drive_bound_host: bool,
+    ) -> Result<InstallerLaunchOutcome, String> {
         let now = SystemTime::now();
         let prepared_token = self.inner.take_prepared_token(token_id)?;
         let ready_update = {
@@ -736,7 +800,7 @@ impl UpdaterService {
             return Err("Prepared update token does not match the ready package identity.".into());
         }
 
-        {
+        if drive_bound_host {
             let deadline = Instant::now() + UPDATE_IPC_DEADLINE;
             if let Ok(port) = self.inner.control_port.lock() {
                 if let Some(port) = port.as_ref() {
@@ -796,7 +860,7 @@ impl UpdaterService {
             self.inner.restore_ready_snapshot(Some(error.to_string()));
             return Err(error.to_string());
         }
-        {
+        if drive_bound_host {
             let deadline = Instant::now() + UPDATE_IPC_DEADLINE;
             if let Ok(port) = self.inner.control_port.lock() {
                 if let Some(port) = port.as_ref() {
@@ -1019,10 +1083,9 @@ impl UpdaterInner {
             .as_ref()
             .ok_or_else(|| "No prepared update handoff token is available.".to_string())?;
         if token.token_id != token_id {
-            return Err(format!(
-                "Prepared update handoff token mismatch: expected {}, observed {}.",
-                token.token_id, token_id
-            ));
+            return Err(
+                "Prepared update handoff token did not match the requested handoff.".into(),
+            );
         }
         slot.take()
             .ok_or_else(|| "Prepared update handoff token was consumed concurrently.".into())
