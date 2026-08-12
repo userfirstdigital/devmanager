@@ -1,12 +1,12 @@
 use devmanager::domain::ProviderSessionId;
 use devmanager::providers::adapter::{
-    LaunchProviderRequest, ProviderAdapter, ProviderRuntime, ProviderSignal, StopStrategy,
+    LaunchProviderRequest, ProviderAdapter, ProviderRuntime, StopStrategy,
 };
 use devmanager::providers::capabilities::{ProviderCapability, ProviderExecutable, ProviderKind};
 use devmanager::providers::cursor::CursorAdapter;
 use devmanager::providers::registry::{ProviderDiscoveryConfig, ProviderRegistry};
 use serde_json::Value;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tempfile::tempdir;
 
@@ -39,7 +39,11 @@ fn cursor_public_adapter_cannot_launch_without_exact_capability() {
     let executable =
         ProviderExecutable::new(PathBuf::from("C:/bin/cursor-agent"), [0x44; 32]).unwrap();
     assert!(matches!(
-        adapter.build_launch(LaunchProviderRequest::new(executable, None, None)),
+        adapter.build_launch(LaunchProviderRequest::new(
+            executable.open_for_launch().unwrap(),
+            None,
+            None,
+        )),
         Err(devmanager::providers::ProviderError::UnsupportedCapability(
             ProviderCapability::BuildLaunch
         ))
@@ -49,20 +53,15 @@ fn cursor_public_adapter_cannot_launch_without_exact_capability() {
 #[tokio::test]
 async fn cursor_signals_stop_and_quota_stay_explicitly_unavailable() {
     let adapter = CursorAdapter::new();
-    assert!(adapter
-        .parse_signal(ProviderSignal::SessionStarted(
-            ProviderSessionId::new("chat-id-must-not-be-inferred").unwrap()
-        ))
-        .is_empty());
     assert_eq!(
         adapter.cooperative_stop(&ProviderRuntime),
         StopStrategy::Unsupported
     );
-    assert!(adapter
-        .observe_quota(Path::new("C:/bin/cursor-agent"))
-        .await
+    let executable = ProviderExecutable::new(PathBuf::from("C:/bin/cursor-agent"), [0x44; 32])
         .unwrap()
-        .is_none());
+        .open_for_launch()
+        .unwrap();
+    assert!(adapter.observe_quota(&executable).await.unwrap().is_none());
 }
 
 #[tokio::test]
@@ -144,10 +143,11 @@ fn cursor_phase4_11_smoke_contract_is_fixture_only_and_does_not_claim_auth() {
     let adapter = CursorAdapter::new();
     let executable =
         ProviderExecutable::new(PathBuf::from("C:/bin/cursor-agent"), [0x44; 32]).unwrap();
+    let executable_handle = executable.open_for_launch().unwrap();
     let session = ProviderSessionId::new("chat-id-must-not-be-inferred").unwrap();
     assert!(matches!(
         adapter.build_launch(LaunchProviderRequest::new(
-            executable.clone(),
+            executable_handle.clone(),
             None,
             Some(session)
         )),
@@ -157,18 +157,13 @@ fn cursor_phase4_11_smoke_contract_is_fixture_only_and_does_not_claim_auth() {
     ));
     assert!(
         matches!(
-            adapter.build_launch(LaunchProviderRequest::new(executable, None, None)),
+            adapter.build_launch(LaunchProviderRequest::new(executable_handle, None, None)),
             Err(devmanager::providers::ProviderError::UnsupportedCapability(
                 ProviderCapability::BuildLaunch
             ))
         ),
         "fixture contract must not mint a fresh conversation when resume is unsupported"
     );
-    assert!(adapter
-        .parse_signal(ProviderSignal::SessionStarted(
-            ProviderSessionId::new("chat-id-must-not-be-inferred").unwrap()
-        ))
-        .is_empty());
     assert_eq!(
         adapter.cooperative_stop(&ProviderRuntime),
         StopStrategy::Unsupported
