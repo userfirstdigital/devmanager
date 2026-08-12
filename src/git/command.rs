@@ -12,7 +12,7 @@ use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -1057,6 +1057,8 @@ const FILE_SHARE_DELETE: u32 = 0x0000_0004;
 const OPEN_EXISTING: u32 = 3;
 #[cfg(windows)]
 const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+#[cfg(windows)]
+const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 
 #[cfg(windows)]
 extern "system" {
@@ -4342,14 +4344,54 @@ fn read_file_bounded_with_deadline(
             "bounded file read exceeded the operation deadline",
         ));
     }
-    let metadata = fs::metadata(path)?;
+    // Open every path component without following symlink/junction/reparse
+    // aliases so a TOCTOU swap of an intermediate directory after earlier
+    // validation cannot redirect the read outside the validated tree. The
+    // opened handle is the only source of metadata and bytes for this read,
+    // and retained ancestor handles stay alive for the duration of the read.
+    let mut opened = open_regular_file_no_follow(path)?;
+    read_open_file_bounded_with_deadline(opened.file_mut(), max_bytes, deadline)
+}
+
+/// A no-follow opened file together with the ancestor directory handles that
+/// kept the path chain replacement-resistant through the final open. The
+/// ancestor handles must remain live for identity checks and the bounded read
+/// so an intermediate directory cannot be renamed onto a new target.
+struct NoFollowOpenedFile {
+    file: fs::File,
+    _ancestors: Vec<fs::File>,
+}
+
+impl NoFollowOpenedFile {
+    fn file_mut(&mut self) -> &mut fs::File {
+        &mut self.file
+    }
+}
+
+fn read_open_file_bounded_with_deadline(
+    file: &mut fs::File,
+    max_bytes: usize,
+    deadline: Option<OperationDeadline>,
+) -> io::Result<Vec<u8>> {
+    if deadline.is_some_and(OperationDeadline::is_expired) {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "bounded file read exceeded the operation deadline",
+        ));
+    }
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "bounded file read target is not a regular file",
+        ));
+    }
     if metadata.len() > max_bytes as u64 {
         return Err(io::Error::new(
             io::ErrorKind::FileTooLarge,
             "file exceeds bounded read size",
         ));
     }
-    let mut file = fs::File::open(path)?;
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
     let mut buffer = [0u8; 64 * 1024];
     loop {
@@ -4384,6 +4426,275 @@ fn read_file_bounded_with_deadline(
         ));
     }
     Ok(bytes)
+}
+
+fn data_file_identity_from_open_handle(
+    file: &mut fs::File,
+    deadline: OperationDeadline,
+) -> Result<FileIdentity, String> {
+    if deadline.is_expired() {
+        return Err("Git executable identity exceeded the operation deadline".to_string());
+    }
+    let metadata = file
+        .metadata()
+        .map_err(|_| "Git executable metadata is unavailable".to_string())?;
+    if !metadata.is_file() {
+        return Err("Git executable is not a regular file".to_string());
+    }
+    if metadata.len() > HARD_MAX_GRAPH_FILE_BYTES {
+        return Err("Git graph file exceeds the immutable size limit".to_string());
+    }
+    file.seek(SeekFrom::Start(0))
+        .map_err(|_| "Git executable cannot be opened for identity".to_string())?;
+    let content_digest = digest_file(file, Some(deadline), Some(HARD_MAX_GRAPH_FILE_BYTES))?;
+
+    #[cfg(windows)]
+    {
+        let identity = windows_handle_identity(file, content_digest)?;
+        if identity.number_of_links != 1 {
+            return Err("Git graph file hard-link ambiguity is not allowed".to_string());
+        }
+        return Ok(identity);
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() != 1 {
+            return Err("Git graph file hard-link ambiguity is not allowed".to_string());
+        }
+        return Ok(FileIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            number_of_links: metadata.nlink(),
+            file_size: metadata.size(),
+            modified_seconds: metadata.mtime(),
+            modified_nanos: metadata.mtime_nsec(),
+            content_digest,
+        });
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        Ok(FileIdentity { content_digest })
+    }
+}
+
+#[cfg(windows)]
+fn open_regular_file_no_follow(path: &Path) -> io::Result<NoFollowOpenedFile> {
+    // Windows has no openat analogue. Open and retain every ancestor with
+    // OPEN_REPARSE_POINT and delete-sharing denied so a junction/symlink
+    // swapped onto an intermediate component is visible and cannot rename the
+    // held directory before the leaf is opened and read.
+    if !path.is_absolute() || path.as_os_str().is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "bounded file read requires an absolute path",
+        ));
+    }
+    let mut chain = path.ancestors().collect::<Vec<_>>();
+    chain.reverse();
+    let mut retained_ancestors = Vec::new();
+    let mut depth = 0usize;
+    for (index, ancestor) in chain.iter().enumerate() {
+        if ancestor.as_os_str().is_empty() {
+            continue;
+        }
+        depth = depth.saturating_add(1);
+        if depth > HARD_MAX_GRAPH_DEPTH {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "bounded file read path is too deep",
+            ));
+        }
+        let is_final = index + 1 == chain.len();
+        let share_mode = if is_final {
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+        } else {
+            // Match retained graph pins: allow in-directory mutation, but deny
+            // rename/delete of the directory container itself.
+            FILE_SHARE_READ | FILE_SHARE_WRITE
+        };
+        let file = open_windows_component_no_follow(ancestor, !is_final, share_mode)?;
+        let metadata = file.metadata()?;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "bounded file read refuses a reparse point",
+            ));
+        }
+        if is_final {
+            if !metadata.is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "bounded file read target is not a regular file",
+                ));
+            }
+            return Ok(NoFollowOpenedFile {
+                file,
+                _ancestors: retained_ancestors,
+            });
+        }
+        if !metadata.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotADirectory,
+                "bounded file read ancestor is not a directory",
+            ));
+        }
+        retained_ancestors.push(file);
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "bounded file read path has no final component",
+    ))
+}
+
+#[cfg(windows)]
+fn open_windows_component_no_follow(
+    path: &Path,
+    directory: bool,
+    share_mode: u32,
+) -> io::Result<fs::File> {
+    let mut wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    wide.push(0);
+    let flags = if directory {
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT
+    } else {
+        FILE_FLAG_OPEN_REPARSE_POINT
+    };
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            GENERIC_READ | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            share_mode,
+            std::ptr::null_mut(),
+            OPEN_EXISTING,
+            flags,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { fs::File::from_raw_handle(handle) })
+}
+
+#[cfg(unix)]
+fn open_regular_file_no_follow(path: &Path) -> io::Result<NoFollowOpenedFile> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Component;
+
+    // openat relative to each retained directory fd with O_NOFOLLOW so neither
+    // an intermediate nor final symlink can redirect the bounded read.
+    if !path.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "bounded file read requires an absolute path",
+        ));
+    }
+    let components = path
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(name) => Some(name.as_bytes()),
+            Component::RootDir | Component::Prefix(_) | Component::CurDir => None,
+            Component::ParentDir => None,
+        })
+        .collect::<Vec<_>>();
+    if components.len() > HARD_MAX_GRAPH_DEPTH {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "bounded file read path is too deep",
+        ));
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "bounded file read path must not contain parent components",
+        ));
+    }
+
+    let root = CString::new(Path::new("/").as_os_str().as_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "bounded file read root contains NUL",
+        )
+    })?;
+    let root_fd = unsafe {
+        libc::openat(
+            libc::AT_FDCWD,
+            root.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if root_fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: root_fd was returned by openat and is owned by this File.
+    let mut current = unsafe { fs::File::from_raw_fd(root_fd as RawFd) };
+    if components.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "bounded file read target is not a regular file",
+        ));
+    }
+
+    let mut ancestors = Vec::new();
+    for (index, component) in components.iter().enumerate() {
+        let name = CString::new(*component).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "bounded file read path contains NUL",
+            )
+        })?;
+        let final_component = index + 1 == components.len();
+        let flags = libc::O_RDONLY
+            | libc::O_NOFOLLOW
+            | libc::O_CLOEXEC
+            | if final_component {
+                0
+            } else {
+                libc::O_DIRECTORY
+            };
+        let fd = unsafe { libc::openat(current.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: fd was returned by openat and is owned by this File.
+        let opened = unsafe { fs::File::from_raw_fd(fd as RawFd) };
+        if final_component {
+            let metadata = opened.metadata()?;
+            if !metadata.is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "bounded file read target is not a regular file",
+                ));
+            }
+            ancestors.push(current);
+            return Ok(NoFollowOpenedFile {
+                file: opened,
+                _ancestors: ancestors,
+            });
+        }
+        ancestors.push(current);
+        current = opened;
+    }
+    unreachable!("non-empty path must return its final component")
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_regular_file_no_follow(path: &Path) -> io::Result<NoFollowOpenedFile> {
+    // Platforms without a no-follow open primitive stay fail-closed for this
+    // authority boundary rather than falling back to a following open.
+    let _ = path;
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "bounded file read requires a no-follow open primitive",
+    ))
 }
 
 #[derive(Clone, Copy)]
@@ -6935,27 +7246,44 @@ impl GitRepository {
                     reason: "repository path is not a regular file".to_string(),
                 });
             }
-            let _ = data_file_identity_with_deadline(&candidate, permit.deadline).map_err(
-                |reason| GitError::InvalidPath {
+            // Open once without following reparse/symlink aliases, validate the
+            // exact opened handle, then read from that same handle so a swap
+            // between identity checks and open cannot redirect the bytes.
+            let mut opened =
+                open_regular_file_no_follow(&candidate).map_err(|_| GitError::InvalidPath {
+                    path: path.display_lossy().into_owned(),
+                    reason: "repository file cannot be opened safely".to_string(),
+                })?;
+            let _ = data_file_identity_from_open_handle(opened.file_mut(), permit.deadline)
+                .map_err(|reason| GitError::InvalidPath {
                     path: path.display_lossy().into_owned(),
                     reason,
-                },
-            )?;
-            let bytes =
-                read_file_bounded_with_deadline(&candidate, max_bytes, Some(permit.deadline))
-                    .map_err(|error| {
-                        if error.kind() == io::ErrorKind::FileTooLarge {
-                            GitError::OutputLimitExceeded {
-                                stream: "file",
-                                limit: max_bytes,
-                            }
-                        } else {
-                            GitError::InvalidPath {
-                                path: path.display_lossy().into_owned(),
-                                reason: "repository file cannot be read safely".to_string(),
-                            }
-                        }
-                    })?;
+                })?;
+            opened
+                .file_mut()
+                .seek(SeekFrom::Start(0))
+                .map_err(|_| GitError::InvalidPath {
+                    path: path.display_lossy().into_owned(),
+                    reason: "repository file cannot be rewound safely".to_string(),
+                })?;
+            let bytes = read_open_file_bounded_with_deadline(
+                opened.file_mut(),
+                max_bytes,
+                Some(permit.deadline),
+            )
+            .map_err(|error| {
+                if error.kind() == io::ErrorKind::FileTooLarge {
+                    GitError::OutputLimitExceeded {
+                        stream: "file",
+                        limit: max_bytes,
+                    }
+                } else {
+                    GitError::InvalidPath {
+                        path: path.display_lossy().into_owned(),
+                        reason: "repository file cannot be read safely".to_string(),
+                    }
+                }
+            })?;
             if permit.deadline.is_expired() {
                 return Err(GitError::TimedOut {
                     operation: "file read".to_string(),
@@ -8705,6 +9033,88 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::{Mutex, OnceLock};
+
+    #[test]
+    fn bounded_file_read_refuses_final_symlink_alias() {
+        let temp = tempfile::tempdir().expect("bounded read alias tempdir");
+        let target = temp.path().join("target.txt");
+        let alias = temp.path().join("alias.txt");
+        fs::write(&target, b"secret-bytes").expect("write target");
+
+        #[cfg(windows)]
+        {
+            if std::os::windows::fs::symlink_file(&target, &alias).is_err() {
+                // Creating file symlinks requires Developer Mode or elevation on
+                // some Windows hosts; skip rather than falsely fail closed.
+                return;
+            }
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&target, &alias)
+                .expect("create final-component file symlink");
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = alias;
+            return;
+        }
+
+        let error = read_file_bounded_with_deadline(&alias, 1024, None)
+            .expect_err("symlink alias must fail closed without following");
+        assert_ne!(
+            error.kind(),
+            io::ErrorKind::NotFound,
+            "symlink refusal must not look like a missing path: {error}"
+        );
+        let opened = open_regular_file_no_follow(&alias)
+            .expect_err("no-follow open must refuse the symlink alias");
+        assert_ne!(opened.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn bounded_file_read_refuses_intermediate_symlink_ancestor() {
+        let temp = tempfile::tempdir().expect("bounded read ancestor tempdir");
+        let outside = temp.path().join("outside");
+        let repo = temp.path().join("repo");
+        let nested = repo.join("nested");
+        fs::create_dir_all(&outside).expect("outside dir");
+        fs::create_dir_all(&nested).expect("nested dir");
+        fs::write(outside.join("secret.txt"), b"outside-secret").expect("outside file");
+        fs::write(nested.join("secret.txt"), b"inside-secret").expect("inside file");
+
+        let redirected = repo.join("nested");
+        fs::remove_dir_all(&redirected).expect("remove nested before alias");
+        #[cfg(windows)]
+        {
+            if std::os::windows::fs::symlink_dir(&outside, &redirected).is_err() {
+                // Directory symlinks / junctions may be unavailable without
+                // Developer Mode; skip rather than falsely fail closed.
+                return;
+            }
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&outside, &redirected)
+                .expect("create intermediate directory symlink");
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            return;
+        }
+
+        let alias = redirected.join("secret.txt");
+        let error = open_regular_file_no_follow(&alias)
+            .expect_err("intermediate ancestor symlink must fail closed");
+        assert_ne!(
+            error.kind(),
+            io::ErrorKind::NotFound,
+            "ancestor symlink refusal must not look like a missing path: {error}"
+        );
+        let escaped = read_file_bounded_with_deadline(&alias, 1024, None)
+            .expect_err("bounded read must not follow an intermediate symlink");
+        assert_ne!(escaped.kind(), io::ErrorKind::NotFound);
+    }
 
     #[test]
     fn read_only_policy_blocks_interactive_git_surfaces_without_removing_mutation_helpers() {

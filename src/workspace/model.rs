@@ -10,11 +10,32 @@ use crate::domain::ProjectId;
 /// Host-owned mapping from the authenticated ProjectId to its configured root.
 ///
 /// The client may select a project id, but never supplies the root used to
-/// resolve its workspace request.
+/// resolve its workspace request. Each admitted root retains the filesystem
+/// identity captured during ConfigStore/root validation so a later directory
+/// replacement at the same path fails closed.
 #[derive(Clone, PartialEq, Eq)]
 pub struct WorkspaceProjectRoots {
-    roots: BTreeMap<ProjectId, PathBuf>,
+    roots: BTreeMap<ProjectId, ConfiguredProjectRoot>,
     config_ids: BTreeMap<String, ProjectId>,
+}
+
+/// One host-configured project root together with the stable filesystem
+/// identity captured when that root was admitted. The path is only a locator;
+/// authorization compares the retained identity, never a caller-supplied root.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct ConfiguredProjectRoot {
+    path: PathBuf,
+    identity: String,
+}
+
+impl ConfiguredProjectRoot {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn identity(&self) -> &str {
+        &self.identity
+    }
 }
 
 impl fmt::Debug for WorkspaceProjectRoots {
@@ -121,19 +142,25 @@ impl WorkspaceProjectRoots {
                 return Err(WorkspaceProjectRootsError::MalformedProjectRoot(root));
             }
 
-            let root = crate::workspace::service::validate_host_workspace_path(&root, true)
+            let validated = crate::workspace::service::validate_host_workspace_path(&root, true)
                 .map_err(|_| WorkspaceProjectRootsError::MalformedProjectRoot(root.clone()))?;
+            let configured = ConfiguredProjectRoot {
+                path: validated.path,
+                identity: validated.identity,
+            };
 
-            roots.insert(project_id, root.clone());
-            let identity = path_identity_key(&root);
-            if let Some((first, first_root)) = identities.get(&identity) {
+            if let Some((first, first_root)) = identities.get(&configured.identity) {
                 return Err(WorkspaceProjectRootsError::AmbiguousProjectRoot {
                     root: first_root.clone(),
                     first: *first,
                     second: project_id,
                 });
             }
-            identities.insert(identity, (project_id, root));
+            identities.insert(
+                configured.identity.clone(),
+                (project_id, configured.path.clone()),
+            );
+            roots.insert(project_id, configured);
         }
         Ok(Self {
             roots,
@@ -215,7 +242,14 @@ impl WorkspaceProjectRoots {
     }
 
     pub(crate) fn root_for(&self, project_id: ProjectId) -> Option<&Path> {
-        self.roots.get(&project_id).map(PathBuf::as_path)
+        self.roots.get(&project_id).map(|root| root.path.as_path())
+    }
+
+    pub(crate) fn configured_root_for(
+        &self,
+        project_id: ProjectId,
+    ) -> Option<&ConfiguredProjectRoot> {
+        self.roots.get(&project_id)
     }
 }
 
@@ -416,6 +450,60 @@ mod project_root_tests {
         assert_eq!(
             roots.root_for(project_id).map(path_identity_key),
             Some(path_identity_key(&root))
+        );
+        let configured = roots
+            .configured_root_for(project_id)
+            .expect("configured root");
+        assert!(!configured.identity().is_empty());
+        assert_eq!(
+            path_identity_key(configured.path()),
+            path_identity_key(&root)
+        );
+    }
+
+    #[test]
+    fn replaced_directory_at_configured_root_path_fails_closed_on_resolve() {
+        use crate::workspace::model::WorkspaceRequest;
+        use crate::workspace::service::WorkspaceService;
+
+        let project_id = ProjectId::new();
+        let temp = tempfile::tempdir().expect("replaceable root tempdir");
+        let root = temp.path().join("project");
+        fs::create_dir(&root).expect("project root");
+        fs::create_dir(root.join(".git")).expect("repository marker");
+        fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/main\n")
+            .expect("repository HEAD");
+        let roots = WorkspaceProjectRoots::try_from_pairs([(project_id, root.clone())])
+            .expect("project roots");
+        let admitted_identity = roots
+            .configured_root_for(project_id)
+            .expect("configured root")
+            .identity()
+            .to_string();
+        let service = WorkspaceService::for_project(project_id, &roots).expect("workspace service");
+
+        fs::remove_dir_all(&root).expect("remove admitted root");
+        fs::create_dir(&root).expect("replacement root");
+        fs::create_dir(root.join(".git")).expect("replacement repository marker");
+        fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/main\n")
+            .expect("replacement HEAD");
+
+        let error = service
+            .resolve(WorkspaceRequest::main())
+            .expect_err("replaced configured root must fail closed");
+        assert!(
+            matches!(
+                error,
+                crate::workspace::service::WorkspaceError::PathResolution { ref reason, .. }
+                    if reason.contains("configured project root identity changed")
+            ),
+            "unexpected resolve error: {error:?}"
+        );
+        let replacement = crate::workspace::service::validate_host_workspace_path(&root, true)
+            .expect("replacement path still validates as a directory");
+        assert_ne!(
+            replacement.identity, admitted_identity,
+            "replacement at the same path must not reuse the admitted identity"
         );
     }
 

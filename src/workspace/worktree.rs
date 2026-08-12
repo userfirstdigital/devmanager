@@ -1911,6 +1911,30 @@ fn process_owner_identity(fence: &RegistryManagedProcessFence) -> [u8; 16] {
     identity
 }
 
+/// Restore the exact current Host execution-lease process fence onto a freshly
+/// resolved workspace. `resolved_workspace` intentionally leaves process
+/// ownership unset; production admission and every post-admission revalidation
+/// must reattach the live lease fence so comparisons reject changed/stale
+/// fences without synthesizing one from task/path scalars. Test admissions that
+/// already supply a fence under `WorktreeAuthority::Test` are left intact.
+fn apply_live_process_owner_fence(
+    workspace: &mut ResolvedWorkspace,
+    lease: &WorktreeExecutionLease,
+) -> Result<(), WorktreeError> {
+    match &lease.authority {
+        WorktreeAuthority::Host { .. } => {
+            let Some(process_fence) = lease.process_owner.clone() else {
+                return Err(WorktreeError::Hold(WorktreeHold::ProcessOwnerUnavailable));
+            };
+            workspace.process_fence = Some(process_fence.clone());
+            workspace.scope.process_owner = process_owner_identity(&process_fence);
+            Ok(())
+        }
+        #[cfg(test)]
+        WorktreeAuthority::Test { .. } => Ok(()),
+    }
+}
+
 /// Reports restart recovery without exposing operation IDs or paths.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RecoveryReport {
@@ -2007,13 +2031,7 @@ impl WorktreeService {
         {
             return Err(WorktreeError::StaleAuthority);
         }
-        if let WorktreeAuthority::Host { .. } = &lease.authority {
-            let Some(process_fence) = lease.process_owner.clone() else {
-                return Err(WorktreeError::Hold(WorktreeHold::ProcessOwnerUnavailable));
-            };
-            workspace.process_fence = Some(process_fence.clone());
-            workspace.scope.process_owner = process_owner_identity(&process_fence);
-        }
+        apply_live_process_owner_fence(&mut workspace, lease)?;
         workspace.scope.execution_lease = lease.identity();
         workspace.execution_lease = Some(Arc::clone(lease));
         Ok(workspace)
@@ -3503,6 +3521,9 @@ fn revalidate_same<A: Admission>(
     let mut current = admission.revalidate()?;
     current.scope.execution_lease = expected.scope.execution_lease;
     current.execution_lease = expected.execution_lease.clone();
+    if let Some(lease) = expected.execution_lease.as_ref() {
+        apply_live_process_owner_fence(&mut current, lease)?;
+    }
     if current.scope == expected.scope
         && current.identity == expected.identity
         && current.linked == expected.linked
@@ -3528,6 +3549,9 @@ fn revalidate_stable<A: Admission>(
     let mut current = admission.revalidate()?;
     current.scope.execution_lease = expected.scope.execution_lease;
     current.execution_lease = expected.execution_lease.clone();
+    if let Some(lease) = expected.execution_lease.as_ref() {
+        apply_live_process_owner_fence(&mut current, lease)?;
+    }
     if current.scope.stable_eq(&expected.scope)
         && current.identity == expected.identity
         && current.linked == expected.linked
@@ -3744,6 +3768,20 @@ fn test_process_fence(state: &TestAuthorityState) -> RegistryManagedProcessFence
         ProcessOwner::Task(state.task_id),
         root,
     )
+}
+
+#[cfg(test)]
+#[test]
+fn apply_live_process_owner_fence_leaves_test_admission_fence_intact() {
+    let (authorization, _control) = TestWorkspaceAuthorization::new();
+    let mut workspace = authorization.revalidate().expect("test admission");
+    let expected_fence = workspace.process_fence.clone();
+    let lease = WorktreeExecutionLease::for_test();
+    apply_live_process_owner_fence(&mut workspace, &lease).expect("test authority");
+    assert_eq!(
+        workspace.process_fence, expected_fence,
+        "Test authority must keep the admission-supplied process fence"
+    );
 }
 
 #[cfg(test)]

@@ -183,6 +183,7 @@ pub struct WorkspaceAuthorization {
     action_epoch: u64,
     runtime_generation: u64,
     project_root: PathBuf,
+    project_root_identity: String,
     binding: WorkspaceBinding,
     pins: Vec<PinnedPath>,
 }
@@ -202,6 +203,7 @@ impl WorkspaceAuthorization {
         request_id: RequestId,
         command_id: CommandId,
         project_root: &Path,
+        project_root_identity: &str,
         binding: &WorkspaceBinding,
         pins: Vec<PinnedPath>,
     ) -> Self {
@@ -213,6 +215,7 @@ impl WorkspaceAuthorization {
             request_id,
             command_id,
             project_root,
+            project_root_identity,
             binding,
             pins,
             0,
@@ -228,6 +231,7 @@ impl WorkspaceAuthorization {
         request_id: RequestId,
         command_id: CommandId,
         project_root: &Path,
+        project_root_identity: &str,
         binding: &WorkspaceBinding,
         pins: Vec<PinnedPath>,
         action_epoch: u64,
@@ -250,6 +254,7 @@ impl WorkspaceAuthorization {
             action_epoch,
             runtime_generation,
             project_root: project_root.to_path_buf(),
+            project_root_identity: project_root_identity.to_string(),
             binding: binding.clone(),
             pins,
         }
@@ -375,6 +380,7 @@ impl WorkspaceAuthorization {
         expected.validate().is_ok()
             && self.pins.iter().all(PinnedPath::matches_current_path)
             && pins_match_fact(&self.pins, expected)
+            && configured_root_identity_matches(&self.project_root, &self.project_root_identity)
             && capture_binding_fact(
                 self.binding.kind(),
                 &self.project_root,
@@ -1322,6 +1328,7 @@ pub struct WorkspaceService {
     task_id: TaskId,
     project_id: ProjectId,
     project_root: PathBuf,
+    project_root_identity: String,
     binding: Option<WorkspaceBinding>,
     coordinator: WorkspaceResourceCoordinator,
 }
@@ -1380,13 +1387,14 @@ impl WorkspaceService {
         workspace_projects: &WorkspaceProjectRoots,
         coordinator: WorkspaceResourceCoordinator,
     ) -> Result<Self, WorkspaceError> {
-        let project_root = workspace_projects
-            .root_for(project_id)
+        let configured = workspace_projects
+            .configured_root_for(project_id)
             .ok_or(WorkspaceError::ProjectNotConfigured(project_id))?;
         Ok(Self {
             task_id,
             project_id,
-            project_root: project_root.to_path_buf(),
+            project_root: configured.path().to_path_buf(),
+            project_root_identity: configured.identity().to_string(),
             binding: None,
             coordinator,
         })
@@ -1440,7 +1448,7 @@ impl WorkspaceService {
         &self,
         request: WorkspaceRequest,
     ) -> Result<WorkspaceResolution, WorkspaceError> {
-        let project_root = canonical_existing_dir(&self.project_root)?;
+        let project_root = self.canonical_configured_project_root()?;
         match request.choice {
             WorkspaceChoice::Main => {
                 let repository = discover_repository(&project_root)
@@ -1620,6 +1628,7 @@ impl WorkspaceService {
             request_id,
             command_id,
             &self.project_root,
+            &self.project_root_identity,
             &binding,
             pins,
             action_epoch,
@@ -1676,6 +1685,9 @@ impl WorkspaceService {
     ) -> Result<WorkspaceLeaseAdmission, WorkspaceLeaseError> {
         if task_id != self.task_id {
             return Err(WorkspaceLeaseError::ScopeMismatch);
+        }
+        if !configured_root_identity_matches(&self.project_root, &self.project_root_identity) {
+            return Err(WorkspaceLeaseError::InvalidAdmission);
         }
         let workspace_identity = workspace_identity_token(&self.project_root)
             .ok_or(WorkspaceLeaseError::InvalidAdmission)?;
@@ -2093,6 +2105,40 @@ fn canonical_existing_dir(path: &Path) -> Result<PathBuf, WorkspaceError> {
     Ok(pinned.path)
 }
 
+fn configured_root_identity_matches(path: &Path, expected_identity: &str) -> bool {
+    PinnedPath::open(path).is_ok_and(|pinned| {
+        pinned.is_dir && pinned.identity == expected_identity && pinned.matches_current_path()
+    })
+}
+
+impl WorkspaceService {
+    /// Re-open the configured project root and require the exact filesystem
+    /// identity retained at ConfigStore/root admission. A replacement directory
+    /// at the same path must fail closed.
+    fn canonical_configured_project_root(&self) -> Result<PathBuf, WorkspaceError> {
+        let pinned = PinnedPath::open(&self.project_root).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                WorkspaceError::PathDoesNotExist(self.project_root.clone())
+            } else {
+                WorkspaceError::PathResolution {
+                    path: self.project_root.clone(),
+                    reason: error.to_string(),
+                }
+            }
+        })?;
+        if !pinned.is_dir {
+            return Err(WorkspaceError::NotDirectory(pinned.path));
+        }
+        if pinned.identity != self.project_root_identity || !pinned.matches_current_path() {
+            return Err(WorkspaceError::PathResolution {
+                path: pinned.path,
+                reason: "configured project root identity changed".into(),
+            });
+        }
+        Ok(pinned.path)
+    }
+}
+
 const MAX_PINNED_FILE_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug)]
@@ -2297,7 +2343,16 @@ impl PinnedPath {
 /// traversal used by live workspace authorities. The returned path is only a
 /// lexical absolute locator for host-private use; its authority is the handle
 /// identity captured during this call.
-pub(crate) fn validate_host_workspace_path(path: &Path, require_dir: bool) -> io::Result<PathBuf> {
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct ValidatedHostWorkspacePath {
+    pub(crate) path: PathBuf,
+    pub(crate) identity: String,
+}
+
+pub(crate) fn validate_host_workspace_path(
+    path: &Path,
+    require_dir: bool,
+) -> io::Result<ValidatedHostWorkspacePath> {
     let pinned = PinnedPath::open(path)?;
     if require_dir && !pinned.is_dir {
         return Err(io::Error::new(
@@ -2311,7 +2366,10 @@ pub(crate) fn validate_host_workspace_path(path: &Path, require_dir: bool) -> io
             "workspace path changed during validation",
         ));
     }
-    Ok(pinned.path)
+    Ok(ValidatedHostWorkspacePath {
+        path: pinned.path,
+        identity: pinned.identity,
+    })
 }
 
 #[cfg(windows)]
