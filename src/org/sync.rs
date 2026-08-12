@@ -771,7 +771,7 @@ fn prompt_snapshot_from_portal(
             Ok(OrgPromptChain {
                 chain_id: OrgPromptChainId::parse(&chain.id).map_err(|_| OrgError::EmptyIdentity)?,
                 tenant_id: tenant_id.clone(),
-                revision: chain.revision,
+                revision: u32::try_from(chain.revision).map_err(|_| OrgError::BoundExceeded)?,
                 links: chain
                     .links
                     .into_iter()
