@@ -4,11 +4,10 @@ use devmanager::domain::{
     MAX_PROVIDER_SESSION_ID_BYTES,
 };
 use devmanager::providers::adapter::{
-    AdapterDeliveryPermit, AdapterIngressUnavailable, JournalEvent, JournalNormalizeError,
-    LaunchProviderRequest, NormalizedAdapterDelivery, ProviderAdapter, ProviderArgument,
-    ProviderError, ProviderInput, ProviderLaunchSpec, ProviderProbeError, ProviderProbeRequest,
-    ProviderProbeResult, ProviderProbeRunner, ProviderRuntime, ProviderSignal, QuotaObservation,
-    StopStrategy,
+    AdapterDeliveryPermit, AdapterIngressUnavailable, JournalNormalizeError, LaunchProviderRequest,
+    NormalizedAdapterDelivery, ProviderAdapter, ProviderArgument, ProviderError, ProviderInput,
+    ProviderLaunchSpec, ProviderProbeError, ProviderProbeRequest, ProviderProbeResult,
+    ProviderProbeRunner, ProviderRuntime, QuotaObservation, StopStrategy,
 };
 use devmanager::providers::capabilities::{
     AdapterRevision, CapabilityEvidence, CapabilityEvidenceError, CapabilitySupport,
@@ -941,8 +940,14 @@ impl ProviderAdapter for PausedNativeAdapter {
         ))
     }
 
-    fn parse_signal(&self, _signal: ProviderSignal) -> Vec<JournalEvent> {
-        Vec::new()
+    fn normalize_delivery(
+        &self,
+        _permit: &AdapterDeliveryPermit,
+        _bytes: &[u8],
+    ) -> Result<NormalizedAdapterDelivery, JournalNormalizeError> {
+        Err(JournalNormalizeError::Unavailable(
+            AdapterIngressUnavailable,
+        ))
     }
 
     fn cooperative_stop(&self, _session: &ProviderRuntime) -> StopStrategy {
