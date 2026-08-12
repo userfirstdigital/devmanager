@@ -35,3 +35,15 @@ pub use inbox::{
     MAX_SECONDARY_LABEL_CHARS, MAX_TASK_LIST_ITEMS, MAX_TASK_SOURCE_IDS, MAX_VIRTUAL_WINDOW_ROWS,
     MAX_WORKTREE_LABEL_CHARS,
 };
+
+
+/// Shared semantic renderer surfaces for task-cockpit messages.
+ pub mod renderers;
+ pub mod timeline;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub enum NativeCockpitMount {
+     HoldMissingShell,
+ }
+
+ pub const NATIVE_COCKPIT_MOUNT: NativeCockpitMount = NativeCockpitMount::HoldMissingShell;
