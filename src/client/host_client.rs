@@ -616,10 +616,12 @@ impl HostClient {
                 Ok(Ok(()))
             }
             QueryOutcome::Ok(QueryResult::EventReplayReleased { .. }) => {
+                let _ = self.fence_retired_subscription(subscription_id).await;
                 self.retire_connection();
                 Err(IpcError::CorrelationMismatch)
             }
             QueryOutcome::Ok(_) => {
+                let _ = self.fence_retired_subscription(subscription_id).await;
                 self.retire_connection();
                 Err(IpcError::UnexpectedResponse)
             }
@@ -872,7 +874,7 @@ impl HostClient {
     }
 
     #[cfg(test)]
-    fn from_parts_for_test(
+    pub(crate) fn from_parts_for_test(
         config: HostClientConfig,
         server_hello: ServerHello,
         connection: Option<ClientConnection>,
@@ -1762,7 +1764,7 @@ mod tests {
             ScriptedDetachBehavior::ClosedWriteQueue,
         );
         transport_connection
-            .push_durable_for_test(old_frame)
+            .push_durable_for_test(old_frame.clone())
             .expect("queue old frame before transport failure");
         let mut transport_client = HostClient::from_parts_for_test(
             HostClientConfig {
@@ -1772,7 +1774,7 @@ mod tests {
                 requested: CapabilitySet::from_capabilities([Capability::EventReplay]),
                 limits: FrameLimits::v1_default(),
             },
-            hello,
+            hello.clone(),
             Some(transport_connection.clone()),
             BTreeMap::new(),
         );
@@ -1788,6 +1790,43 @@ mod tests {
             .await
             .is_err(),
             "transport release failures must fence queued old frames before replacement"
+        );
+
+        let wrong_connection = ClientConnection::scripted_for_test(
+            client_id,
+            hello,
+            ScriptedDetachBehavior::ReleaseWrongSubscriptionAck,
+        );
+        wrong_connection
+            .push_durable_for_test(old_frame)
+            .expect("queue old frame before wrong release acknowledgement");
+        let mut wrong_client = HostClient::from_parts_for_test(
+            HostClientConfig {
+                named_profile: "release-wrong-ack-unit".into(),
+                client_build: "devmanager/test".into(),
+                client_id,
+                requested: CapabilitySet::from_capabilities([Capability::EventReplay]),
+                limits: FrameLimits::v1_default(),
+            },
+            test_server_hello(
+                CapabilitySet::from_capabilities([Capability::EventReplay]),
+                connection_id,
+            ),
+            Some(wrong_connection.clone()),
+            BTreeMap::new(),
+        );
+        assert!(matches!(
+            wrong_client.release_event_replay(subscription_id).await,
+            Err(IpcError::CorrelationMismatch)
+        ));
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                wrong_connection.recv_unsolicited()
+            )
+            .await
+            .is_err(),
+            "wrong release acknowledgements must fence queued old frames before replacement"
         );
     }
 }

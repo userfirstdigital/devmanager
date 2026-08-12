@@ -6,7 +6,7 @@ use std::ops::Range;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{
     atomic::{AtomicU64, Ordering as AtomicOrdering},
-    Arc, Mutex, TryLockError,
+    Arc, Mutex, OnceLock, TryLockError,
 };
 use std::thread;
 use std::time::{Duration, Instant};
@@ -17,6 +17,7 @@ use gpui::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::client::model::MAX_INDEXED_TITLE_CHARS;
 use crate::client::{normalize_bounded_search_text, ClientModel, SearchContinuation, SearchPage};
 use crate::client::{
     ClientSubscription, InboxHostController, SubscriptionError, SubscriptionUpdate,
@@ -338,8 +339,10 @@ pub struct InboxFilter {
 
 impl InboxFilter {
     pub fn new(query: impl AsRef<str>) -> Self {
+        // Keep the UI query on the same 160-char caseless bound as the index
+        // search path. Presentation sanitizing (ellipsis, path-sep folding)
+        // would diverge from indexed title truth at expanding Unicode edges.
         let query = normalize_bounded_search_text(query.as_ref(), MAX_SEARCH_CHARS).0;
-        let query = sanitize_bounded_text(&query, MAX_SEARCH_CHARS);
         Self {
             query,
             include_archived: false,
@@ -364,7 +367,7 @@ impl InboxFilter {
             return false;
         }
         let query = self.query.trim();
-        let title = normalize_bounded_search_text(title, MAX_SEARCH_CHARS).0;
+        let title = normalize_bounded_search_text(title, MAX_INDEXED_TITLE_CHARS).0;
         query.is_empty() || title.contains(query)
     }
 
@@ -519,6 +522,7 @@ pub enum InboxItemKey {
 pub struct InboxRenderRow {
     pub key: InboxItemKey,
     pub task_id: TaskId,
+    pub revision: u64,
     pub title: String,
     pub secondary_text: String,
     pub accessible_name: String,
@@ -557,12 +561,67 @@ pub struct InboxRenderModel {
     pub items: Vec<InboxRenderItem>,
 }
 
-/// Native-shell row action bridge. The row identity is supplied by the
-/// renderer, while the shell callback performs the generation/epoch checks at
-/// execution time. The callback is optional so the pure projection renderer
-/// remains usable by previews and tests without an application entity.
+/// Epochs captured by the shell at render/input handoff time. They are copied
+/// into every row action token so a callback cannot accidentally dispatch a
+/// row from an older navigation or focus generation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct InboxActionEpochs {
+    pub navigation_epoch: u64,
+    pub focus_epoch: u64,
+}
+
+/// Immutable row facts captured by the renderer. The shell must revalidate all
+/// of these facts before executing the action; a `TaskId` alone is not an
+/// adequate fence after reorder, resync, or archive transitions.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InboxRowActionCapture {
+    pub task_id: TaskId,
+    pub row_revision: u64,
+    pub runtime_generation: Option<u64>,
+    pub navigation_epoch: u64,
+    pub focus_epoch: u64,
+    pub read_only: bool,
+}
+
+#[cfg(test)]
+fn capture_row_action(row: &TaskRowModel, epochs: InboxActionEpochs) -> InboxRowActionCapture {
+    let runtime_generation = match row.display.runtime {
+        RuntimeSummary::Present { generation, .. } => Some(generation),
+        RuntimeSummary::Missing => None,
+    };
+    InboxRowActionCapture {
+        task_id: row.task_id,
+        row_revision: row.revision,
+        runtime_generation,
+        navigation_epoch: epochs.navigation_epoch,
+        focus_epoch: epochs.focus_epoch,
+        read_only: row.read_only,
+    }
+}
+
+fn capture_render_row_action(
+    row: &InboxRenderRow,
+    epochs: InboxActionEpochs,
+) -> InboxRowActionCapture {
+    let runtime_generation = match row.display.runtime {
+        RuntimeSummary::Present { generation, .. } => Some(generation),
+        RuntimeSummary::Missing => None,
+    };
+    InboxRowActionCapture {
+        task_id: row.task_id,
+        row_revision: row.revision,
+        runtime_generation,
+        navigation_epoch: epochs.navigation_epoch,
+        focus_epoch: epochs.focus_epoch,
+        read_only: row.read_only,
+    }
+}
+
+/// Native-shell row action bridge. The callback receives the complete row
+/// identity/fence captured at render time. The callback is optional so the
+/// pure projection renderer remains usable by previews and tests.
 pub type InboxRowMouseDownHandler =
-    Arc<dyn Fn(TaskId, &MouseDownEvent, &mut Window, &mut App) + 'static>;
+    Arc<dyn Fn(InboxRowActionCapture, &MouseDownEvent, &mut Window, &mut App) + 'static>;
 
 pub type LiveClientSubscription = Arc<Mutex<ClientSubscription>>;
 
@@ -582,6 +641,46 @@ struct BackgroundSearchRequest {
 }
 
 const BACKGROUND_WORKER_JOIN_BUDGET: Duration = Duration::from_millis(25);
+const BACKGROUND_WORKER_REAPER_CAPACITY: usize = 8;
+static BACKGROUND_WORKER_REAPER: OnceLock<mpsc::SyncSender<thread::JoinHandle<()>>> =
+    OnceLock::new();
+static BACKGROUND_WORKER_REAPER_PENDING: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+fn background_worker_reaper() -> &'static mpsc::SyncSender<thread::JoinHandle<()>> {
+    BACKGROUND_WORKER_REAPER.get_or_init(|| {
+        let (sender, receiver) =
+            mpsc::sync_channel::<thread::JoinHandle<()>>(BACKGROUND_WORKER_REAPER_CAPACITY);
+        thread::Builder::new()
+            .name("devmanager-inbox-worker-reaper".to_string())
+            .spawn(move || {
+                while let Ok(join) = receiver.recv() {
+                    let _ = join.join();
+                    BACKGROUND_WORKER_REAPER_PENDING.fetch_sub(1, AtomicOrdering::AcqRel);
+                }
+            })
+            .expect("spawn inbox worker reaper");
+        sender
+    })
+}
+
+fn settle_background_worker(join: thread::JoinHandle<()>) {
+    if join.is_finished() {
+        let _ = join.join();
+        return;
+    }
+    let sender = background_worker_reaper();
+    BACKGROUND_WORKER_REAPER_PENDING.fetch_add(1, AtomicOrdering::AcqRel);
+    if let Err(error) = sender.send(join) {
+        BACKGROUND_WORKER_REAPER_PENDING.fetch_sub(1, AtomicOrdering::AcqRel);
+        let _ = error.0.join();
+    }
+}
+
+#[cfg(test)]
+fn background_reaper_pending_for_test() -> usize {
+    BACKGROUND_WORKER_REAPER_PENDING.load(AtomicOrdering::Acquire)
+}
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 pub enum SearchWorkerState {
@@ -1296,6 +1395,11 @@ impl Drop for InboxRuntime {
                 }
                 if join.is_finished() {
                     let _ = join.join();
+                } else {
+                    // The UI drop budget bounds the caller, not worker
+                    // lifetime. Transfer unfinished ownership to the bounded
+                    // reaper; dropping JoinHandle would detach the worker.
+                    settle_background_worker(join);
                 }
             }
         }
@@ -1306,11 +1410,12 @@ impl Drop for InboxRuntime {
 /// render model, so it cannot reach back into a provider, runtime, path, or
 /// terminal while painting a frame.
 pub fn render_native_inbox(model: &InboxRenderModel) -> AnyElement {
-    render_native_inbox_with_actions(model, None)
+    render_native_inbox_with_actions(model, InboxActionEpochs::default(), None)
 }
 
 pub fn render_native_inbox_with_actions(
     model: &InboxRenderModel,
+    epochs: InboxActionEpochs,
     row_handler: Option<InboxRowMouseDownHandler>,
 ) -> AnyElement {
     let mut items = Vec::with_capacity(model.items.len());
@@ -1337,14 +1442,14 @@ pub fn render_native_inbox_with_actions(
                     .child(row.title.clone())
                     .child(row.secondary_text.clone());
                 if let Some(handler) = row_handler.clone() {
-                    let task_id = row.task_id;
+                    let action = capture_render_row_action(row, epochs);
                     element = element.on_mouse_down(MouseButton::Left, move |event, window, cx| {
                         // A task row owns the pointer gesture. Stopping
                         // propagation here prevents the shell's terminal
                         // surface from interpreting the same click after a
                         // row was reordered or rejected by its action fence.
                         cx.stop_propagation();
-                        handler(task_id, event, window, cx);
+                        handler(action, event, window, cx);
                     });
                 }
                 element.into_any_element()
@@ -2184,6 +2289,7 @@ fn render_row(row: &TaskRowModel, width: InboxPresentationWidth) -> InboxRenderR
             InboxItemKey::Row(row.task_id)
         },
         task_id: row.task_id,
+        revision: row.revision,
         title,
         secondary_text: sanitize_bounded_text(&secondary_text, MAX_SECONDARY_LABEL_CHARS),
         accessible_name,
@@ -2362,6 +2468,31 @@ mod tests {
                 .expect("snapshot page");
         }
         builder.finish().expect("client model")
+    }
+
+    #[test]
+    fn row_action_capture_retains_revision_runtime_epochs_and_read_only_facts() {
+        let model = search_model(1);
+        let snapshot = model.tasks().values().next().expect("task snapshot");
+        let mut row = row_from_snapshot(snapshot, 7, &UnreadCursor::default(), true);
+        row.display.runtime = RuntimeSummary::Present {
+            lifecycle: crate::domain::agent::AgentSessionLifecycle::Open,
+            generation: 17,
+        };
+        let capture = capture_row_action(
+            &row,
+            InboxActionEpochs {
+                navigation_epoch: 11,
+                focus_epoch: 12,
+            },
+        );
+
+        assert_eq!(capture.task_id, row.task_id);
+        assert_eq!(capture.row_revision, row.revision);
+        assert_eq!(capture.runtime_generation, Some(17));
+        assert_eq!(capture.navigation_epoch, 11);
+        assert_eq!(capture.focus_epoch, 12);
+        assert!(capture.read_only);
     }
 
     #[test]
@@ -2586,6 +2717,42 @@ mod tests {
             "Drop must not wait on a borrowed subscription lock"
         );
         drop(guard);
+    }
+
+    #[test]
+    fn dropping_runtime_hands_an_unfinished_worker_to_the_owned_reaper() {
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        let settled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let settled_for_worker = Arc::clone(&settled);
+        let join = thread::spawn(move || {
+            let _ = release_rx.recv();
+            settled_for_worker.store(true, AtomicOrdering::Release);
+        });
+        let baseline = background_reaper_pending_for_test();
+        let mut runtime = InboxRuntime::new();
+        runtime.background_worker = Some(BackgroundSearchWorker {
+            cancellation: Arc::new(AtomicU64::new(0)),
+            results: mpsc::sync_channel(1).1,
+            join: Some(join),
+            retiring: false,
+        });
+
+        drop(runtime);
+        assert!(
+            background_reaper_pending_for_test() > baseline,
+            "an unfinished worker must remain owned by the bounded reaper after runtime drop"
+        );
+
+        release_tx.send(()).expect("release worker");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while background_reaper_pending_for_test() > baseline {
+            assert!(
+                Instant::now() < deadline,
+                "owned reaper must settle the worker"
+            );
+            thread::yield_now();
+        }
+        assert!(settled.load(AtomicOrdering::Acquire));
     }
 
     #[test]

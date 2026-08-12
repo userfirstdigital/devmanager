@@ -165,15 +165,19 @@ impl ClientSubscription {
         }
 
         // A transport failure or a server resync request leaves the prior
-        // subscription generation unusable. Re-open a fresh snapshot/replay
-        // pair, while preserving the caller-owned unread cursor outside this
-        // transport object. The old replay release is best effort because a
-        // disconnect may have already retired its server-side owner.
+        // subscription generation unusable. Release each owned remote handle
+        // before opening a replacement. Failed release remains visible and
+        // retains the exact id so the next caller can retry instead of leaking
+        // a live replay/snapshot session.
         self.state = ClientSubscriptionState::Pending;
-        if let Some(subscription_id) = self.subscription_id.take() {
-            let _ = client.release_event_replay(subscription_id).await;
+        if let Err(error) = self.release_event_replay_if_owned(client).await {
+            self.state = ClientSubscriptionState::NeedsResync;
+            return Err(error);
         }
-        self.snapshot_id = None;
+        if let Err(error) = self.release_snapshot_if_owned(client).await {
+            self.state = ClientSubscriptionState::NeedsResync;
+            return Err(error);
+        }
         self.seen_event_ids.clear();
         self.seen_event_order.clear();
         self.pending_replay_events.clear();
@@ -183,7 +187,9 @@ impl ClientSubscription {
             Err(error) => {
                 self.state = ClientSubscriptionState::NeedsResync;
                 self.pending_replay_events.clear();
-                self.best_effort_cleanup(client).await;
+                if let Some(cleanup_error) = self.best_effort_cleanup(client).await {
+                    return Err(cleanup_error);
+                }
                 Err(error)
             }
         }
@@ -257,12 +263,8 @@ impl ClientSubscription {
         };
         self.subscription_id = Some(open.subscription_id);
 
-        if let Some(snapshot_id) = self.snapshot_id.take() {
-            match client.release_snapshot(snapshot_id).await {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => return Err(SubscriptionError::Query(error)),
-                Err(error) => return Err(SubscriptionError::Transport(error)),
-            }
+        if self.snapshot_id.is_some() {
+            self.release_snapshot_if_owned(client).await?;
         }
 
         let mut model = model;
@@ -440,24 +442,19 @@ impl ClientSubscription {
 
     /// Idempotent explicit release of any retained event-replay subscription.
     pub async fn release(&mut self, client: &mut HostClient) -> Result<(), SubscriptionError> {
-        if self.state == ClientSubscriptionState::Released && self.subscription_id.is_none() {
+        if self.state == ClientSubscriptionState::Released
+            && self.subscription_id.is_none()
+            && self.snapshot_id.is_none()
+        {
             return Ok(());
         }
-        if let Some(subscription_id) = self.subscription_id.take() {
-            match client.release_event_replay(subscription_id).await {
-                Ok(Ok(())) | Ok(Err(QueryError::NotFound)) => {}
-                Ok(Err(error)) => {
-                    self.retire_without_transport();
-                    return Err(SubscriptionError::Query(error));
-                }
-                Err(error) => {
-                    self.retire_without_transport();
-                    return Err(SubscriptionError::Transport(error));
-                }
-            }
+        if let Err(error) = self.release_event_replay_if_owned(client).await {
+            self.state = ClientSubscriptionState::NeedsResync;
+            return Err(error);
         }
-        if let Some(snapshot_id) = self.snapshot_id.take() {
-            let _ = client.release_snapshot(snapshot_id).await;
+        if let Err(error) = self.release_snapshot_if_owned(client).await {
+            self.state = ClientSubscriptionState::NeedsResync;
+            return Err(error);
         }
         self.state = ClientSubscriptionState::Released;
         Ok(())
@@ -479,12 +476,54 @@ impl ClientSubscription {
         self.state = ClientSubscriptionState::Released;
     }
 
-    async fn best_effort_cleanup(&mut self, client: &mut HostClient) {
-        if let Some(subscription_id) = self.subscription_id.take() {
-            let _ = client.release_event_replay(subscription_id).await;
+    async fn best_effort_cleanup(&mut self, client: &mut HostClient) -> Option<SubscriptionError> {
+        // Cleanup is deliberately best effort for the original synchronization
+        // error, but each failed release keeps its id in the object for the
+        // next caller-driven retry. Never turn an unknown remote owner into a
+        // silently lost local handle.
+        let mut first_error = None;
+        if let Err(error) = self.release_event_replay_if_owned(client).await {
+            first_error = Some(error);
         }
-        if let Some(snapshot_id) = self.snapshot_id.take() {
-            let _ = client.release_snapshot(snapshot_id).await;
+        if let Err(error) = self.release_snapshot_if_owned(client).await {
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
+        }
+        first_error
+    }
+
+    async fn release_event_replay_if_owned(
+        &mut self,
+        client: &mut HostClient,
+    ) -> Result<(), SubscriptionError> {
+        let Some(subscription_id) = self.subscription_id else {
+            return Ok(());
+        };
+        match client.release_event_replay(subscription_id).await {
+            Ok(Ok(())) | Ok(Err(QueryError::NotFound)) => {
+                self.subscription_id = None;
+                Ok(())
+            }
+            Ok(Err(error)) => Err(SubscriptionError::Query(error)),
+            Err(error) => Err(SubscriptionError::Transport(error)),
+        }
+    }
+
+    async fn release_snapshot_if_owned(
+        &mut self,
+        client: &mut HostClient,
+    ) -> Result<(), SubscriptionError> {
+        let Some(snapshot_id) = self.snapshot_id else {
+            return Ok(());
+        };
+        match client.release_snapshot(snapshot_id).await {
+            Ok(Ok(())) | Ok(Err(QueryError::NotFound)) => {
+                self.snapshot_id = None;
+                Ok(())
+            }
+            Ok(Err(error)) => Err(SubscriptionError::Query(error)),
+            Err(error) => Err(SubscriptionError::Transport(error)),
         }
     }
 }
@@ -567,6 +606,62 @@ mod tests {
             seen_event_order: std::collections::VecDeque::new(),
             pending_replay_events: std::collections::VecDeque::new(),
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn release_query_failure_keeps_the_replay_id_for_retry() {
+        use crate::client::connection::{ClientConnection, ScriptedDetachBehavior};
+        use crate::client::host_client::{HostClient, HostClientConfig};
+        use crate::domain::ClientId;
+        use crate::protocol::{
+            Capability, CapabilitySet, FrameLimits, ProfileFingerprint, ServerHello,
+            PROTOCOL_MAJOR, PROTOCOL_MINOR,
+        };
+        use std::collections::BTreeMap;
+
+        let client_id = ClientId::from_bytes(fixed_uuid_v7(0xd1)).expect("client");
+        let connection_id = uuid::Uuid::from_bytes(fixed_uuid_v7(0xd2));
+        let hello = ServerHello {
+            protocol_major: PROTOCOL_MAJOR,
+            protocol_minor: PROTOCOL_MINOR,
+            server_build: "subscription-release-test".into(),
+            host_boot_id: uuid::Uuid::from_bytes(fixed_uuid_v7(0xd3)),
+            connection_id,
+            profile_fingerprint: ProfileFingerprint::hash_normalized("subscription-release"),
+            granted: CapabilitySet::from_capabilities([Capability::EventReplay]),
+            limits: FrameLimits::v1_default(),
+        };
+        let connection = ClientConnection::scripted_for_test(
+            client_id,
+            hello.clone(),
+            ScriptedDetachBehavior::ReleaseQueryError,
+        );
+        let mut client = HostClient::from_parts_for_test(
+            HostClientConfig {
+                named_profile: "subscription-release-test".into(),
+                client_build: "devmanager/test".into(),
+                client_id,
+                requested: CapabilitySet::from_capabilities([Capability::EventReplay]),
+                limits: FrameLimits::v1_default(),
+            },
+            hello,
+            Some(connection),
+            BTreeMap::new(),
+        );
+        let mut subscription = ready_subscription();
+        let expected_id = subscription.subscription_id();
+
+        let error = subscription
+            .release(&mut client)
+            .await
+            .expect_err("release failure must remain visible");
+
+        assert!(matches!(
+            error,
+            SubscriptionError::Query(QueryError::Unauthorized)
+        ));
+        assert_eq!(subscription.subscription_id(), expected_id);
+        assert_ne!(subscription.state(), ClientSubscriptionState::Released);
     }
 
     #[test]

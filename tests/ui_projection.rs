@@ -1,4 +1,4 @@
-use devmanager::client::model::MAX_CLIENT_SEARCH_POSTING_BYTES;
+use devmanager::client::model::{MAX_CLIENT_SEARCH_CHARS, MAX_CLIENT_SEARCH_POSTING_BYTES};
 use devmanager::client::{
     ClientModel, ClientModelBuilder, InboxHostController, InboxPreferenceStore,
 };
@@ -1590,6 +1590,44 @@ fn indexed_search_does_not_treat_a_prefix_posting_as_exhaustive_past_the_source_
     assert_eq!(page.ids.len(), 2);
     assert!(page.ids.contains(&inbox_task_id(0)));
     assert!(page.ids.contains(&inbox_task_id(1)));
+}
+
+#[test]
+fn indexed_search_keeps_truthful_matches_after_the_query_bound() {
+    let target = inbox_task_id(0);
+    let title = format!(
+        "{} StraßeNeedle",
+        "界".repeat(MAX_CLIENT_SEARCH_CHARS.saturating_add(8))
+    );
+    let model = inbox_model(vec![inbox_task_item(
+        target,
+        &title,
+        TaskLifecycle::Open,
+        TaskConnectivity::Connected,
+        TaskAttention::None,
+        TaskActivity::Idle,
+        ReviewReadiness::NotReady,
+        0,
+    )]);
+
+    let page = model.search_task_ids_page("strasseneedle", false, None);
+    assert_eq!(page.exact_total, Some(1));
+    assert_eq!(page.ids, vec![target]);
+    assert!(page.work <= 5_000);
+
+    let inbox = Inbox::from_model_with_filter(
+        &model,
+        &InboxFilter::new("strasseneedle"),
+        &Default::default(),
+    );
+    assert_eq!(
+        inbox
+            .active_rows()
+            .iter()
+            .map(|row| row.task_id)
+            .collect::<Vec<_>>(),
+        vec![target]
+    );
 }
 
 #[test]

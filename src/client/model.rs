@@ -32,9 +32,11 @@ pub const MAX_CLIENT_REPLAY_PAGES: usize = 1_024;
 pub const MAX_CLIENT_REPLAY_CURSORS: usize = 1_024;
 /// Search input is client-local presentation data, not an unbounded query.
 pub const MAX_CLIENT_SEARCH_CHARS: usize = 160;
-/// Only this bounded title prefix is retained by the client search index.
-/// The host remains authoritative for the complete title.
-pub const MAX_INDEXED_TITLE_CHARS: usize = MAX_CLIENT_SEARCH_CHARS;
+/// Full bounded title truth retained by the client search index. Search input
+/// remains capped at [`MAX_CLIENT_SEARCH_CHARS`], but a title suffix after the
+/// input bound must still be searchable without consulting the host or doing
+/// unbounded work.
+pub const MAX_INDEXED_TITLE_CHARS: usize = MAX_CLIENT_SEARCH_CHARS * 4;
 /// Maximum indexed search identities handed to one bounded UI projection.
 /// The index still reports the complete truthful match count separately.
 pub const MAX_CLIENT_SEARCH_RESULTS: usize = 5_000;
@@ -46,9 +48,9 @@ pub const MAX_CLIENT_SEARCH_WORK: usize = MAX_CLIENT_SEARCH_RESULTS;
 pub const MAX_CLIENT_SEARCH_POSTING_IDS: usize = MAX_CLIENT_MODEL_ITEMS;
 /// Exact postings cover common longer queries without a candidate scan.
 const MAX_INDEXED_GRAM_CHARS: usize = 8;
-/// Index only a bounded title prefix for substring candidates. Titles beyond
-/// this bound remain searchable through the canonical continuation scan, so
-/// this is an allocation/performance bound, never a correctness bound.
+/// Index only a bounded title prefix for substring candidates. The complete
+/// bounded title in [`MAX_INDEXED_TITLE_CHARS`] remains the canonical matching
+/// source; titles beyond that explicit client bound are not retained here.
 const MAX_INDEXED_SUBSTRING_SOURCE_CHARS: usize = 32;
 /// Exact one-scalar totals are kept separately so short substring queries do
 /// not mistake prefix-only postings for exhaustive candidates.
@@ -730,11 +732,15 @@ impl TaskProjectionIndex {
         };
 
         // A small complete posting can be materialized and sorted by the
-        // canonical order key without exceeding the page work bound. Longer
-        // or saturated postings use the bounded canonical-order scan below.
+        // canonical order key without exceeding the page work bound. Common
+        // 9+ character queries over a 100k identical-title posting are not
+        // exact indexed tokens; they stay on the bounded continuation scan
+        // instead of sorting or cloning the saturated posting.
         if continuation.is_none()
             && first.is_some_and(|first| {
-                first.len(archived) <= MAX_CLIENT_SEARCH_WORK && first.ids_complete(archived)
+                first.len(archived) <= MAX_CLIENT_SEARCH_WORK
+                    && first.ids(archived).len() <= MAX_CLIENT_SEARCH_WORK
+                    && first.ids_complete(archived)
             })
         {
             let first = first.expect("small posting candidate");
@@ -781,6 +787,10 @@ impl TaskProjectionIndex {
             };
         let exact_single_posting_total = exact_indexed_total;
         let mut work = 0usize;
+        // A range iterator does not provide a reliable exact size. Scan only
+        // the page budget and treat a full budget as conservatively partial;
+        // the next bounded continuation can prove exhaustion without ever
+        // inspecting a 5,001st candidate.
         for key in candidates.by_ref().take(MAX_CLIENT_SEARCH_WORK) {
             work = work.saturating_add(1);
             last_cursor = Some(key.clone());
@@ -796,7 +806,7 @@ impl TaskProjectionIndex {
                 ids.push(key.task_id);
             }
         }
-        let exhausted = candidates.next().is_none();
+        let exhausted = work < MAX_CLIENT_SEARCH_WORK;
         if exhausted {
             SearchPage {
                 ids,
@@ -975,11 +985,12 @@ fn next_posting_capacity(capacity: usize) -> usize {
 
 /// Apply bounded Unicode compatibility caseless matching semantics: the same
 /// NFD/default-fold/NFKD/default-fold/NFKD sequence used by the pinned
-/// `caseless` crate. The source scalar bound prevents hostile input work,
-/// while the output bound is enforced while consuming the streaming
-/// iterators so an expanding fold never performs an unbounded pre-allocation.
-/// The same representation is used for index keys, queries, filtering, and
-/// ordering.
+/// `caseless` crate. Source scalars are admitted first so hostile input never
+/// starts an unbounded fold; the fold then expands (for example `İ` → `i` +
+/// combining dot) and the same caller bound is applied to that expanded
+/// output. Title indexing and UI query input therefore share one
+/// representation at the 160-char search boundary when they use the same
+/// `max_chars`.
 pub fn normalize_bounded_search_text(value: &str, max_chars: usize) -> (String, bool) {
     if max_chars == 0 {
         return (String::new(), value.chars().next().is_some());
@@ -994,6 +1005,7 @@ pub fn normalize_bounded_search_text(value: &str, max_chars: usize) -> (String, 
         .default_case_fold()
         .nfkd();
     let mut output = String::new();
+    output.reserve(max_chars);
     for ch in normalized.by_ref().take(max_chars) {
         output.push(ch);
     }

@@ -15,7 +15,7 @@ use crate::domain::command::{CommandEnvelope, CommandReceipt};
 use crate::domain::event::DomainEvent;
 use crate::domain::id::{CommandId, RequestId, SubscriptionId};
 #[cfg(test)]
-use crate::domain::query::{Query, QueryError, QueryOutcome};
+use crate::domain::query::{Query, QueryError, QueryOutcome, QueryResult};
 use crate::domain::query::{QueryEnvelope, QueryReply};
 use crate::domain::{ClientId, MAX_SNAPSHOT_PAGE_ENCODED_BYTES, MAX_SNAPSHOT_PAGE_ITEMS};
 use crate::host::{
@@ -48,6 +48,8 @@ pub(crate) enum ScriptedDetachBehavior {
     ClosedWriteQueue,
     /// Return a correlated application error for ReleaseEventReplay.
     ReleaseQueryError,
+    /// Return a release acknowledgement for a different subscription id.
+    ReleaseWrongSubscriptionAck,
 }
 
 /// Unsolicited server→client messages (not correlated replies).
@@ -70,6 +72,26 @@ enum UnsolicitedLane {
     Durable,
     Retained,
     Stream,
+}
+
+fn durable_message_subscription_id(message: &UnsolicitedServerMessage) -> Option<SubscriptionId> {
+    match message {
+        UnsolicitedServerMessage::DurableEvent {
+            subscription_id, ..
+        }
+        | UnsolicitedServerMessage::ResyncRequired {
+            subscription_id, ..
+        } => Some(*subscription_id),
+        UnsolicitedServerMessage::Stream(_) => None,
+    }
+}
+
+fn durable_message_is_retired(
+    retired_subscription_ids: &HashSet<SubscriptionId>,
+    message: &UnsolicitedServerMessage,
+) -> bool {
+    durable_message_subscription_id(message)
+        .is_some_and(|subscription_id| retired_subscription_ids.contains(&subscription_id))
 }
 
 impl UnsolicitedLane {
@@ -201,7 +223,7 @@ impl UnsolicitedInbox {
             entered.wait();
             release.wait();
         }
-        if durable.retired_subscription_ids.contains(&subscription_id) {
+        if durable_message_is_retired(&durable.retired_subscription_ids, &message) {
             // A late exact old-generation tail is fenced at admission. Do not
             // notify a consumer when there is no message to receive.
             return Ok(());
@@ -226,6 +248,15 @@ impl UnsolicitedInbox {
             durable.retired_subscription_ids.insert(subscription_id);
         }
 
+        // A frame for another live generation may have been retained while an
+        // earlier generation was fenced. Re-check that bounded retained lane
+        // whenever its own generation retires; otherwise a later replacement
+        // could receive a frame that was already obsolete at the time of its
+        // release.
+        durable
+            .retained_durable
+            .retain(|message| durable_message_subscription_id(message) != Some(subscription_id));
+
         if durable
             .retained_durable
             .len()
@@ -246,18 +277,7 @@ impl UnsolicitedInbox {
                 }
             };
             work = work.saturating_add(1);
-            let exact_retired = matches!(
-                &message,
-                UnsolicitedServerMessage::DurableEvent {
-                    subscription_id: observed,
-                    ..
-                }
-                    | UnsolicitedServerMessage::ResyncRequired {
-                        subscription_id: observed,
-                        ..
-                    } if *observed == subscription_id
-            );
-            if !exact_retired {
+            if durable_message_subscription_id(&message) != Some(subscription_id) {
                 durable.retained_durable.push_back(message);
             }
         }
@@ -297,26 +317,35 @@ impl UnsolicitedInbox {
                 1 => first_lane.next(),
                 _ => first_lane.next().next(),
             };
-            let message = match lane {
-                UnsolicitedLane::Retained => durable.retained_durable.pop_front(),
-                // Retirement moves still-valid older durable frames into the
-                // retained lane. Do not let a newer wire frame leapfrog that
-                // retained truth, even when round-robin currently starts on
-                // the durable lane.
-                UnsolicitedLane::Durable if durable.retained_durable.is_empty() => {
-                    durable.durable_rx.try_recv().ok()
+            loop {
+                let message = match lane {
+                    UnsolicitedLane::Retained => durable.retained_durable.pop_front(),
+                    // Retirement moves still-valid older durable frames into the
+                    // retained lane. Do not let a newer wire frame leapfrog that
+                    // retained truth, even when round-robin currently starts on
+                    // the durable lane.
+                    UnsolicitedLane::Durable if durable.retained_durable.is_empty() => {
+                        durable.durable_rx.try_recv().ok()
+                    }
+                    UnsolicitedLane::Durable => None,
+                    UnsolicitedLane::Stream => {
+                        let mut streams = streams.lock().expect("stream inbox");
+                        let key = streams.keys().next().copied();
+                        key.and_then(|key| streams.remove(&key))
+                            .map(UnsolicitedServerMessage::Stream)
+                    }
+                };
+                let Some(message) = message else {
+                    break;
+                };
+                if durable_message_is_retired(&durable.retired_subscription_ids, &message) {
+                    // A drain flood can leave already-queued retired ids in
+                    // the real host lanes. Drop them here so a replacement
+                    // generation cannot observe that tail.
+                    continue;
                 }
-                UnsolicitedLane::Durable => None,
-                UnsolicitedLane::Stream => {
-                    let mut streams = streams.lock().expect("stream inbox");
-                    let key = streams.keys().next().copied();
-                    key.and_then(|key| streams.remove(&key))
-                        .map(UnsolicitedServerMessage::Stream)
-                }
-            };
-            if message.is_some() {
                 *next_lane = lane.next();
-                return message;
+                return Some(message);
             }
         }
         None
@@ -589,7 +618,8 @@ impl ClientConnection {
             }
             ScriptedDetachBehavior::MatchingAck
             | ScriptedDetachBehavior::WrongConnectionAck
-            | ScriptedDetachBehavior::ReleaseQueryError => {
+            | ScriptedDetachBehavior::ReleaseQueryError
+            | ScriptedDetachBehavior::ReleaseWrongSubscriptionAck => {
                 let reader_state = Arc::clone(&state);
                 let terminal_state = Arc::clone(&state);
                 let reader_unsolicited = Arc::clone(&unsolicited);
@@ -597,6 +627,10 @@ impl ClientConnection {
                     matches!(behavior, ScriptedDetachBehavior::WrongConnectionAck);
                 let release_query_error =
                     matches!(behavior, ScriptedDetachBehavior::ReleaseQueryError);
+                let release_wrong_subscription = matches!(
+                    behavior,
+                    ScriptedDetachBehavior::ReleaseWrongSubscriptionAck
+                );
                 Some(tokio::spawn(async move {
                     let mut write_rx = write_rx;
                     while let Some(job) = write_rx.recv().await {
@@ -637,6 +671,31 @@ impl ClientConnection {
                                     ServerMessage::QueryReply(QueryReply {
                                         request_id: request.request_id,
                                         outcome: QueryOutcome::Err(QueryError::Unauthorized),
+                                    }),
+                                )
+                                .await
+                                .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            ClientRequest::Query(request)
+                                if release_wrong_subscription
+                                    && matches!(
+                                        request.query,
+                                        Query::ReleaseEventReplay { .. }
+                                    ) =>
+                            {
+                                if dispatch_server_message(
+                                    &reader_state,
+                                    &reader_unsolicited,
+                                    ServerMessage::QueryReply(QueryReply {
+                                        request_id: request.request_id,
+                                        outcome: QueryOutcome::Ok(
+                                            QueryResult::EventReplayReleased {
+                                                subscription_id: SubscriptionId::new(),
+                                            },
+                                        ),
                                     }),
                                 )
                                 .await
@@ -1885,6 +1944,107 @@ mod tests {
 
         assert_eq!(inbox.recv().await.expect("retained frame"), retained);
         assert_eq!(inbox.recv().await.expect("new frame"), newer);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retiring_a_later_generation_also_purges_frames_retained_for_it() {
+        use super::UnsolicitedInbox;
+        use crate::domain::event::{DomainEvent, Event};
+        use crate::domain::id::{EventId, SubscriptionId};
+
+        let inbox = UnsolicitedInbox::new_for_test(4, 1);
+        let first_id = SubscriptionId::new();
+        let second_id = SubscriptionId::new();
+        let retained_for_second = UnsolicitedServerMessage::DurableEvent {
+            subscription_id: second_id,
+            event: DomainEvent {
+                id: EventId::new(),
+                task_id: None,
+                sequence: 1,
+                task_revision: None,
+                occurred_at_ms: 1,
+                payload: Event::TaskReopened,
+            },
+        };
+
+        inbox
+            .push_durable(retained_for_second)
+            .expect("second-generation frame");
+        inbox
+            .retire_subscription_id(first_id)
+            .expect("first-generation retirement");
+        inbox
+            .retire_subscription_id(second_id)
+            .expect("second-generation retirement");
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), inbox.recv())
+                .await
+                .is_err(),
+            "a frame retained while retiring one generation must be purged when its own generation retires"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn leftover_retired_ids_after_drain_flood_cannot_poison_recv() {
+        use super::UnsolicitedInbox;
+        use crate::domain::event::{DomainEvent, Event};
+        use crate::domain::id::{EventId, SubscriptionId};
+
+        let inbox = UnsolicitedInbox::new_for_test(128, 1);
+        let retired_id = SubscriptionId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xe6,
+        ])
+        .expect("retired subscription");
+        let live_id = SubscriptionId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xe7,
+        ])
+        .expect("live subscription");
+        let durable =
+            |subscription_id: SubscriptionId, tail: u8| UnsolicitedServerMessage::DurableEvent {
+                subscription_id,
+                event: DomainEvent {
+                    id: EventId::from_bytes([
+                        0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00,
+                        0x00, 0x00, 0x00, tail,
+                    ])
+                    .expect("event"),
+                    task_id: None,
+                    sequence: u64::from(tail),
+                    task_revision: None,
+                    occurred_at_ms: i64::from(tail),
+                    payload: Event::TaskReopened,
+                },
+            };
+
+        for tail in 0..=MAX_RETIRED_DRAIN_WORK as u8 {
+            inbox
+                .push_durable(durable(retired_id, tail))
+                .expect("queue retired-generation frames past one drain quantum");
+        }
+        let flood = inbox
+            .retire_subscription_id(retired_id)
+            .expect_err("already-queued retired ids past the drain quantum force typed resync");
+        assert!(matches!(
+            flood,
+            IpcError::RetiredSubscriptionFlood { limit } if limit == MAX_RETIRED_DRAIN_WORK
+        ));
+
+        inbox
+            .push_durable(durable(live_id, 0xf0))
+            .expect("replacement generation still admits live frames");
+        assert_eq!(
+            inbox.recv().await.expect("live replacement frame"),
+            durable(live_id, 0xf0)
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), inbox.recv())
+                .await
+                .is_err(),
+            "leftover retired ids must not poison the replacement generation"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
