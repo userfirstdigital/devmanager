@@ -24,7 +24,6 @@ use crate::providers::capabilities::{
     ProviderCapability, ProviderExecutable, ProviderExecutableHandle, ProviderKind,
     ProviderVersion,
 };
-use crate::providers::journal::JournalEvent;
 use crate::providers::registry::ProviderObservation;
 use crate::remote::presentation::StableSessionKey;
 use async_trait::async_trait;
@@ -32,7 +31,6 @@ use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::net::SocketAddr;
-use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -434,7 +432,7 @@ impl ClaudeCodeAdapter {
         let identity = self
             .attested_identity()
             .ok_or(ClaudeAdapterError::RelayUnavailable)?;
-        if launch.executable() != &identity.executable {
+        if launch.executable().executable() != &identity.executable {
             return Err(ClaudeAdapterError::RelayUnavailable);
         }
         let expected_resume = launch.provider_session_id().cloned();
@@ -540,21 +538,6 @@ impl ClaudeCodeAdapter {
         relay
             .validate_hook_session_at(&presented.inner, expected, body, now)
             .map_err(map_correlated_ingest_error)
-    }
-
-    pub fn parse_admitted_delivery(&self, delivery: &ClaudeAdmittedDelivery) -> Vec<JournalEvent> {
-        let Ok(state) = self.state.lock() else {
-            return Vec::new();
-        };
-        let Some(identity) = state.identity.as_ref() else {
-            return Vec::new();
-        };
-        let key = BoundKey::from_registration(delivery.registration(), identity);
-        if state.bound.get(&key) == Some(delivery.provider_session_id()) {
-            vec![JournalEvent]
-        } else {
-            Vec::new()
-        }
     }
 
     pub fn settle_launch_output(
@@ -887,11 +870,12 @@ impl ProviderAdapter for ClaudeCodeAdapter {
             .ok_or(ProviderError::UnsupportedCapability(
                 ProviderCapability::BuildLaunch,
             ))?;
-        if request.executable() != &identity.executable || capabilities.version != identity.version
+        if request.executable().executable() != &identity.executable
+            || capabilities.version != identity.version
         {
             return Err(ProviderError::ExecutableChanged {
                 before: identity.executable,
-                after: request.executable().clone(),
+                after: request.executable().executable().clone(),
             });
         }
         let arguments = if let Some(session_id) = request.provider_session_id() {
@@ -1016,6 +1000,12 @@ mod tests {
                     self.auth.to_vec(),
                     self.auth_stderr.to_vec(),
                 ),
+                // These probe kinds belong to the shared request contract;
+                // Claude's adapter still uses its stock auth-status command
+                // and does not need a separate login/resume probe here.
+                ProviderProbeKind::LoginStatus | ProviderProbeKind::ResumeHelp => {
+                    (0, Vec::new(), Vec::new())
+                }
             };
             ProviderProbeResult::from_bounded_output(&request, Some(exit), stdout, stderr)
         }

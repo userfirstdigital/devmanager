@@ -327,11 +327,19 @@ impl ConnectLimits {
     }
 
     pub const fn max_cursor_bytes(self) -> u32 {
-        MAX_CONNECT_CURSOR_BYTES.min(self.max_reassembled_message_bytes)
+        if MAX_CONNECT_CURSOR_BYTES < self.max_reassembled_message_bytes {
+            MAX_CONNECT_CURSOR_BYTES
+        } else {
+            self.max_reassembled_message_bytes
+        }
     }
 
     pub const fn max_diagnostic_bytes(self) -> u32 {
-        MAX_CONNECT_DIAGNOSTIC_BYTES.min(self.max_reassembled_message_bytes)
+        if MAX_CONNECT_DIAGNOSTIC_BYTES < self.max_reassembled_message_bytes {
+            MAX_CONNECT_DIAGNOSTIC_BYTES
+        } else {
+            self.max_reassembled_message_bytes
+        }
     }
 
     pub fn try_new(

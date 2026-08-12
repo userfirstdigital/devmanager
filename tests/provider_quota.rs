@@ -4,8 +4,9 @@
 use async_trait::async_trait;
 use devmanager::domain::snapshot::omit_stale_quota_display;
 use devmanager::providers::adapter::{
-    AdapterQuotaOutcome, JournalEvent, LaunchProviderRequest, ProviderAdapter, ProviderError,
-    ProviderLaunchSpec, ProviderQuotaStatus, ProviderRuntime, ProviderSignal,
+    AdapterDeliveryPermit, AdapterIngressUnavailable, JournalNormalizeError, LaunchProviderRequest,
+    NormalizedAdapterDelivery, ProviderAdapter, ProviderError, ProviderExecutableHandle,
+    ProviderLaunchSpec, ProviderQuotaStatus, ProviderRuntime,
     QuotaObservation as AdapterQuotaSample, StopStrategy,
 };
 use devmanager::providers::capabilities::{
@@ -16,7 +17,6 @@ use devmanager::providers::quota::{
     AdapterQuotaSource, ProductionJitter, QuotaObservation, QuotaObserverConfig,
     QuotaObserverSource, QuotaRng, QuotaSourceOutcome, QuotaWindow, QUOTA_DISPLAY_TTL_MS,
 };
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -110,7 +110,7 @@ async fn adapter_source_maps_documented_sample_without_fabricating_fields() {
     let source = AdapterQuotaSource::new(adapter);
     let outcome = source
         .observe_quota(
-            Path::new("C:/bin/claude.exe"),
+            std::env::current_exe().expect("test executable").as_path(),
             &ProviderVersion::new("1").unwrap(),
         )
         .await
@@ -127,27 +127,28 @@ async fn adapter_source_maps_documented_sample_without_fabricating_fields() {
 }
 
 #[tokio::test]
-async fn adapter_source_maps_auth_required_and_unsupported_without_fabricating_windows() {
-    let auth = AdapterQuotaSource::new(Arc::new(OutcomeAdapter {
-        outcome: AdapterQuotaOutcome::AuthRequired,
+async fn adapter_source_maps_unavailable_and_unsupported_without_fabricating_windows() {
+    let unavailable = AdapterQuotaSource::new(Arc::new(OutcomeAdapter {
+        outcome: Outcome::Unavailable,
     }));
     assert_eq!(
-        auth.observe_quota(
-            Path::new("C:/bin/claude.exe"),
-            &ProviderVersion::new("1").unwrap()
-        )
-        .await
-        .unwrap(),
-        QuotaSourceOutcome::AuthRequired
+        unavailable
+            .observe_quota(
+                std::env::current_exe().expect("test executable").as_path(),
+                &ProviderVersion::new("1").unwrap()
+            )
+            .await
+            .unwrap(),
+        QuotaSourceOutcome::Unavailable
     );
 
     let unsupported = AdapterQuotaSource::new(Arc::new(OutcomeAdapter {
-        outcome: AdapterQuotaOutcome::Unsupported,
+        outcome: Outcome::Unsupported,
     }));
     assert_eq!(
         unsupported
             .observe_quota(
-                Path::new("C:/bin/claude.exe"),
+                std::env::current_exe().expect("test executable").as_path(),
                 &ProviderVersion::new("1").unwrap()
             )
             .await
@@ -177,7 +178,10 @@ impl ProviderAdapter for SampleAdapter {
         ProviderKind::ClaudeCode
     }
 
-    async fn probe(&self, _executable: &Path) -> Result<ProviderCapabilities, ProviderError> {
+    async fn probe(
+        &self,
+        _executable: &ProviderExecutableHandle,
+    ) -> Result<ProviderCapabilities, ProviderError> {
         Ok(ProviderCapabilities {
             kind: ProviderKind::ClaudeCode,
             version: ProviderVersion::new("1").unwrap(),
@@ -202,8 +206,14 @@ impl ProviderAdapter for SampleAdapter {
         ))
     }
 
-    fn parse_signal(&self, _signal: ProviderSignal) -> Vec<JournalEvent> {
-        Vec::new()
+    fn normalize_delivery(
+        &self,
+        _permit: &AdapterDeliveryPermit,
+        _bytes: &[u8],
+    ) -> Result<NormalizedAdapterDelivery, JournalNormalizeError> {
+        Err(JournalNormalizeError::Unavailable(
+            AdapterIngressUnavailable,
+        ))
     }
 
     fn cooperative_stop(&self, _session: &ProviderRuntime) -> StopStrategy {
@@ -212,14 +222,20 @@ impl ProviderAdapter for SampleAdapter {
 
     async fn observe_quota(
         &self,
-        _executable: &Path,
-    ) -> Result<AdapterQuotaOutcome, ProviderError> {
-        Ok(AdapterQuotaOutcome::Observed(self.sample))
+        _executable: &ProviderExecutableHandle,
+    ) -> Result<Option<AdapterQuotaSample>, ProviderError> {
+        Ok(Some(self.sample))
     }
 }
 
+#[derive(Clone, Copy)]
+enum Outcome {
+    Unavailable,
+    Unsupported,
+}
+
 struct OutcomeAdapter {
-    outcome: AdapterQuotaOutcome,
+    outcome: Outcome,
 }
 
 #[async_trait]
@@ -228,7 +244,10 @@ impl ProviderAdapter for OutcomeAdapter {
         ProviderKind::ClaudeCode
     }
 
-    async fn probe(&self, _executable: &Path) -> Result<ProviderCapabilities, ProviderError> {
+    async fn probe(
+        &self,
+        _executable: &ProviderExecutableHandle,
+    ) -> Result<ProviderCapabilities, ProviderError> {
         Ok(ProviderCapabilities {
             kind: ProviderKind::ClaudeCode,
             version: ProviderVersion::new("1").unwrap(),
@@ -259,8 +278,14 @@ impl ProviderAdapter for OutcomeAdapter {
         ))
     }
 
-    fn parse_signal(&self, _signal: ProviderSignal) -> Vec<JournalEvent> {
-        Vec::new()
+    fn normalize_delivery(
+        &self,
+        _permit: &AdapterDeliveryPermit,
+        _bytes: &[u8],
+    ) -> Result<NormalizedAdapterDelivery, JournalNormalizeError> {
+        Err(JournalNormalizeError::Unavailable(
+            AdapterIngressUnavailable,
+        ))
     }
 
     fn cooperative_stop(&self, _session: &ProviderRuntime) -> StopStrategy {
@@ -269,8 +294,13 @@ impl ProviderAdapter for OutcomeAdapter {
 
     async fn observe_quota(
         &self,
-        _executable: &Path,
-    ) -> Result<AdapterQuotaOutcome, ProviderError> {
-        Ok(self.outcome)
+        _executable: &ProviderExecutableHandle,
+    ) -> Result<Option<AdapterQuotaSample>, ProviderError> {
+        match self.outcome {
+            Outcome::Unavailable => Ok(None),
+            Outcome::Unsupported => Err(ProviderError::UnsupportedCapability(
+                ProviderCapability::ObserveQuota,
+            )),
+        }
     }
 }

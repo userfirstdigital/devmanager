@@ -1157,6 +1157,7 @@ impl HostPolicyBridge {
             role: admission.role.connect_role(admission.binding.task_id),
             task_id: Some(admission.binding.task_id),
             action: admission.binding.action,
+            credential: None,
         };
         if !self.evaluator.authorize(request) {
             return Err(HostPolicyError::PermissionDenied);
@@ -1437,6 +1438,10 @@ fn canonical_command_action(command: &Command) -> Option<ActionId> {
         | Command::ReleaseResource { .. }
         | Command::ServiceControl(_) => Some(ActionId::MUTATE_TASK),
         Command::CreateTask(_) | Command::ConfirmHostQuit(_) => None,
+        // Commands outside the task-management evidence contract are denied
+        // here. In particular, never infer a policy action for a newly added
+        // command just because it is structurally a mutation.
+        _ => None,
     }
 }
 

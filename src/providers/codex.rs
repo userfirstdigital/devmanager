@@ -360,7 +360,7 @@ impl CodexAdapter {
         endpoint: &str,
         relay_executable: &Path,
     ) -> Result<CodexCorrelatedLaunch, ProviderError> {
-        require_pinned(&self.pinned, request.executable())?;
+        require_pinned(&self.pinned, request.executable().executable())?;
         let registry = permit.registry();
         let issued = permit.registration();
         if registry
@@ -387,7 +387,7 @@ impl CodexAdapter {
         let surface = probed
             .as_mut()
             .ok_or_else(|| dependency(ProviderCapability::BuildLaunch))?;
-        require_same_executable(surface, request.executable())?;
+        require_same_executable(surface, request.executable().executable())?;
         if !surface.hooks_advertised {
             return Err(dependency(ProviderCapability::SemanticEvents));
         }
@@ -420,7 +420,7 @@ impl CodexAdapter {
         let registration = permit.into_registration();
         Ok(CodexCorrelatedLaunch {
             spec,
-            identity: request.executable().clone(),
+            identity: request.executable().executable().clone(),
             resume_session: request.provider_session_id().cloned(),
             authority: CodexIdentityAuthority {
                 correlation,
@@ -462,7 +462,7 @@ impl ProviderAdapter for CodexAdapter {
         &self,
         request: LaunchProviderRequest,
     ) -> Result<ProviderLaunchSpec, ProviderError> {
-        require_pinned(&self.pinned, request.executable())?;
+        require_pinned(&self.pinned, request.executable().executable())?;
         let probed = self
             .probed
             .lock()
@@ -470,7 +470,7 @@ impl ProviderAdapter for CodexAdapter {
         let surface = probed
             .as_ref()
             .ok_or_else(|| dependency(ProviderCapability::BuildLaunch))?;
-        require_same_executable(surface, request.executable())?;
+        require_same_executable(surface, request.executable().executable())?;
         if let Some(session_id) = request.provider_session_id() {
             if !surface.capabilities.exact_resume.is_supported() {
                 return Err(ProviderError::UnsupportedCapability(
@@ -934,7 +934,7 @@ fn require_request_identity(
     } else {
         Err(ProviderError::ExecutableChanged {
             before: identity.clone(),
-            after: identity.clone(),
+            after: request.executable().executable().clone(),
         })
     }
 }
@@ -1131,9 +1131,9 @@ impl BoundedSessionId {
             .map_err(|_| CodexIdentityError::Rejected)?;
         ProviderSessionId::new(raw).map_err(|error| match error {
             ProviderSessionIdError::Empty => CodexIdentityError::MissingSessionId,
-            ProviderSessionIdError::TooLong | ProviderSessionIdError::ContainsControlCharacter => {
-                CodexIdentityError::Rejected
-            }
+            ProviderSessionIdError::TooLong
+            | ProviderSessionIdError::ContainsControlCharacter
+            | ProviderSessionIdError::NonCanonical => CodexIdentityError::Rejected,
         })
     }
 }

@@ -8,14 +8,14 @@ use std::fmt;
 
 use super::envelope::{ChannelBinding, ConnectEnvelope, SessionId};
 use super::transport::ConnectRoute;
-use crate::protocol::crypto::{
+use crate::protocol::{
     instantiate_noise_channel, validate_noise_pattern, ChannelKey, ChannelRole, CredentialPurpose,
     CryptoError, CryptoHold, CryptoHoldReason, CryptoPrologue, ReplayWindow, SealedFrame,
-    SourceLevelSealer, CRYPTO_PRODUCTION_READY, MAX_SESSION_AGE_SECS, SEALED_NONCE_BYTES,
+    SourceLevelSealer, CRYPTO_PRODUCTION_READY, MAX_SESSION_AGE_SECS, PROTOCOL_MAJOR,
+    SEALED_NONCE_BYTES,
 };
-use crate::protocol::PROTOCOL_MAJOR;
 
-pub use crate::protocol::crypto::{
+pub use crate::protocol::{
     ChannelKey as ConnectChannelKey, ChannelRole as ConnectChannelRole,
     CredentialPurpose as ConnectCredentialPurpose, CryptoError as ConnectCryptoError,
     CryptoHold as ConnectCryptoHold, CryptoHoldReason as ConnectCryptoHoldReason,

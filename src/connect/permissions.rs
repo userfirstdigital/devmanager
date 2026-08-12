@@ -47,12 +47,14 @@ pub fn action_for_client_request(request: &ClientRequest) -> Option<(ActionId, O
                 | Query::ReleaseArtifactContent { .. } => ActionId::READ_TASK,
                 Query::OperationStatus { .. } => ActionId::READ_OPERATION,
                 Query::InspectHostQuit => ActionId::READ_OPERATION,
+                Query::PromptLibrary(_) => ActionId::READ_PERSONAL_PROMPTS,
             };
             Some((action, envelope.task_id))
         }
         ClientRequest::Command(envelope) => {
-            let action = match envelope.command {
+            let action = match &envelope.command {
                 Command::CreateTask(_)
+                | Command::CreateTaskV2(_)
                 | Command::RenameTask(_)
                 | Command::SetTaskAttention(_)
                 | Command::BeginCloseTask
@@ -62,11 +64,29 @@ pub fn action_for_client_request(request: &ClientRequest) -> Option<(ActionId, O
                 | Command::RegisterArtifact { .. }
                 | Command::RegisterResource { .. }
                 | Command::ReleaseResource { .. }
-                | Command::ServiceControl(_) => ActionId::MUTATE_TASK,
-                Command::ConfirmHostQuit(_) => ActionId::MUTATE_TASK,
+                | Command::RequestSpecialist(_)
+                | Command::PromotePrimary(_)
+                | Command::CancelSpecialist(_)
+                | Command::AcceptSpecialistHandoff(_)
+                | Command::ServiceControl(_)
+                | Command::PrepareUpdate(_)
+                | Command::ConfirmUpdateDrain(_)
+                | Command::AbortUpdateHandoff
+                | Command::ArmUpdateInstall(_)
+                | Command::ConfirmHostQuit(_) => ActionId::MUTATE_TASK,
+                Command::SubmitProviderInput(_) => ActionId::SEND_PROMPT,
+                Command::PromptLibrary(_) => ActionId::READ_PERSONAL_PROMPTS,
+                Command::Browser(_) => ActionId::BROWSER_COMMAND,
+                // These variants are journal ingress only. Keep them outside
+                // the client action map so an authenticated client cannot
+                // accidentally turn an internal fact into a host action.
+                Command::PresentProviderQuestion(_)
+                | Command::PresentProviderApproval(_)
+                | Command::SettleProviderWait(_) => return None,
             };
             let task_id = match &envelope.command {
                 Command::CreateTask(intent) => Some(intent.id),
+                Command::CreateTaskV2(intent) => Some(intent.id),
                 _ => envelope.task_id,
             };
             Some((action, task_id))
@@ -80,6 +100,7 @@ pub fn action_for_provider_input(call: &ProviderInputCall) -> PermissionRequest 
         role: ConnectRole::PairedOwner,
         task_id: Some(call.task_id),
         action: ActionId::SEND_PROMPT,
+        credential: None,
     }
 }
 
@@ -92,6 +113,7 @@ pub fn action_for_approval(call: &ApprovalAnswerCall, dangerous: bool) -> Permis
         } else {
             ActionId::ANSWER_REQUEST
         },
+        credential: None,
     }
 }
 
@@ -100,6 +122,7 @@ pub fn action_for_prompt_query(_call: &PromptQueryCall) -> PermissionRequest {
         role: ConnectRole::PairedOwner,
         task_id: None,
         action: ActionId::READ_PERSONAL_PROMPTS,
+        credential: None,
     }
 }
 
@@ -127,13 +150,20 @@ impl SessionAuthorizer {
     }
 
     pub fn authorize_request(&self, request: &ClientRequest) -> PermissionDecision {
-        let Some((action, task_id)) = action_for_client_request(request) else {
+        // Detach is the authenticated connection teardown handshake, not an
+        // application action. Every other request must map to a known action;
+        // an unmapped/new command is denied rather than treated as harmless.
+        if matches!(request, ClientRequest::Detach(_)) {
             return PermissionDecision::Allow;
+        }
+        let Some((action, task_id)) = action_for_client_request(request) else {
+            return PermissionDecision::Denied(PermissionDenyReason::UnknownAction);
         };
         self.evaluate(PermissionRequest {
             role: self.context.role,
             task_id,
             action,
+            credential: None,
         })
     }
 
@@ -152,6 +182,7 @@ impl SessionAuthorizer {
             role: self.context.role,
             task_id: None,
             action: ActionId::READ_PERSONAL_PROMPTS,
+            credential: None,
         })
     }
 

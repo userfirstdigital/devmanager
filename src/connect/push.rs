@@ -34,7 +34,7 @@ pub enum AttentionKind {
     Degraded,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SanitizedPush {
     pub host_id: PinnedHostPublicId,

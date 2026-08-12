@@ -17,7 +17,7 @@ use zeroize::Zeroizing;
 use super::crypto::preferred_connect_route;
 use super::envelope::ConnectIdError;
 use super::transport::ConnectRoute;
-use crate::protocol::crypto::{SealedFrame, MAX_SEALED_FRAME_BYTES};
+use crate::protocol::{SealedFrame, MAX_SEALED_FRAME_BYTES};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -92,7 +92,7 @@ impl_connect_uuid!(HostPublicId);
 impl_connect_uuid!(DevicePublicId);
 impl_connect_uuid!(AccountId);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TicketAudience {
     HostSocket,

@@ -2698,6 +2698,9 @@ pub enum ProviderError {
     InvalidCapabilities(ProviderCapabilitiesError),
     InvalidExecutablePolicy(ProviderExecutablePolicyError),
     UnsupportedCapability(ProviderCapability),
+    DependencyUnavailable {
+        capability: ProviderCapability,
+    },
     Discovery(ProviderDiscoveryError),
     AuthEvidence(ProviderAuthEvidenceError),
     UntrustedAuthenticationEvidence,
@@ -2720,6 +2723,7 @@ impl fmt::Debug for ProviderError {
             Self::InvalidCapabilities(_) => "invalid_capabilities",
             Self::InvalidExecutablePolicy(_) => "invalid_executable_policy",
             Self::UnsupportedCapability(_) => "unsupported_capability",
+            Self::DependencyUnavailable { .. } => "dependency_unavailable",
             Self::Discovery(_) => "discovery",
             Self::AuthEvidence(_) => "auth_evidence",
             Self::UntrustedAuthenticationEvidence => "untrusted_authentication_evidence",
@@ -2774,6 +2778,12 @@ impl fmt::Display for ProviderError {
             }
             Self::UnsupportedCapability(capability) => {
                 write!(f, "provider capability is unsupported: {capability:?}")
+            }
+            Self::DependencyUnavailable { capability } => {
+                write!(
+                    f,
+                    "provider capability dependency is unavailable: {capability:?}"
+                )
             }
             Self::Discovery(error) => error.fmt(f),
             Self::AuthEvidence(error) => error.fmt(f),

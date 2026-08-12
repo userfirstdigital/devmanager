@@ -24,7 +24,6 @@ use crate::providers::capabilities::{
     ProviderVersion, ProviderVersionError,
 };
 use async_trait::async_trait;
-use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -251,11 +250,7 @@ fn evidence(
     status: EvidenceStatus,
 ) -> Result<CapabilityEvidence, ProviderError> {
     CapabilityEvidence::new(source, observed_at, status, None).map_err(|error| {
-        ProviderError::InvalidCapabilities(match error {
-            CapabilityEvidenceError::ObservedAtZero => {
-                ProviderCapabilitiesError::InvalidEvidence(error)
-            }
-        })
+        ProviderError::InvalidCapabilities(ProviderCapabilitiesError::InvalidEvidence(error))
     })
 }
 

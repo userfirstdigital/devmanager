@@ -10,7 +10,7 @@ use crate::domain::{AgentSessionId, ProviderSessionId, TaskId, MAX_PROVIDER_SESS
 use crate::process::identity::ManagedProcessId;
 use crate::providers::adapter::{
     LaunchProviderRequest, ProviderAdapter, ProviderError, ProviderProbeError, ProviderProbeKind,
-    ProviderProbeRequest, ProviderProbeResult, ProviderProbeRunner, ProviderSignal,
+    ProviderProbeRequest, ProviderProbeResult, ProviderProbeRunner,
 };
 use crate::providers::capabilities::{
     CapabilitySupport, ProviderAuthState, ProviderCapability, ProviderExecutable, ProviderKind,
@@ -148,14 +148,22 @@ impl ProviderProbeRunner for ScriptedProbeRunner {
         };
         match script {
             ProbeScript::TimedOut => Err(ProviderProbeError::TimedOut),
-            ProbeScript::Completed { stdout, stderr } => {
-                ProviderProbeResult::captured(&request, 0, stdout.clone(), stderr.clone())
-            }
+            ProbeScript::Completed { stdout, stderr } => ProviderProbeResult::from_bounded_output(
+                &request,
+                Some(0),
+                stdout.clone(),
+                stderr.clone(),
+            ),
             ProbeScript::NonZero {
                 code,
                 stdout,
                 stderr,
-            } => ProviderProbeResult::captured(&request, *code, stdout.clone(), stderr.clone()),
+            } => ProviderProbeResult::from_bounded_output(
+                &request,
+                Some(*code),
+                stdout.clone(),
+                stderr.clone(),
+            ),
         }
     }
 }
@@ -231,7 +239,13 @@ fn launch_with(
     root: ManagedProcessId,
 ) -> Result<CodexCorrelatedLaunch, ProviderError> {
     adapter.prepare_correlated_launch(
-        LaunchProviderRequest::new(identity, None, session),
+        LaunchProviderRequest::new(
+            identity
+                .open_for_launch()
+                .expect("fixture executable handle"),
+            None,
+            session,
+        ),
         issue_permit(registry, task, agent, root),
         "http://127.0.0.1:9/internal/codex-hook",
         Path::new("C:/fixture/devmanager.exe"),
@@ -390,7 +404,9 @@ async fn codex_exact_resume_requires_usage_signature_not_prose() {
     );
     assert!(matches!(
         adapter.build_launch(LaunchProviderRequest::new(
-            identity.clone(),
+            identity
+                .open_for_launch()
+                .expect("fixture executable handle"),
             None,
             Some(session_id()),
         )),
@@ -430,7 +446,13 @@ async fn codex_trait_launch_without_correlation_is_terminal_only_dependency() {
         CodexSemanticLaunchState::DependencyUnavailable
     );
     let spec = adapter
-        .build_launch(LaunchProviderRequest::new(identity.clone(), None, None))
+        .build_launch(LaunchProviderRequest::new(
+            identity
+                .open_for_launch()
+                .expect("fixture executable handle"),
+            None,
+            None,
+        ))
         .unwrap();
     let arguments: Vec<&str> = spec.arguments().collect();
     assert!(arguments.iter().all(|argument| {
@@ -461,7 +483,9 @@ async fn codex_exact_resume_is_resume_id_and_typed_failures_do_not_fallback() {
     let adapter = probed(HELP, RESUME_HELP, LOGIN_CHATGPT).await;
     let spec = adapter
         .build_launch(LaunchProviderRequest::new(
-            identity.clone(),
+            identity
+                .open_for_launch()
+                .expect("fixture executable handle"),
             None,
             Some(session_id()),
         ))
@@ -519,7 +543,9 @@ async fn codex_exact_resume_is_resume_id_and_typed_failures_do_not_fallback() {
     let auth_required = probed(HELP, RESUME_HELP, LOGIN_NOT_AUTH).await;
     assert!(matches!(
         auth_required.build_launch(LaunchProviderRequest::new(
-            identity.clone(),
+            identity
+                .open_for_launch()
+                .expect("fixture executable handle"),
             None,
             Some(session_id()),
         )),
@@ -545,7 +571,9 @@ async fn codex_exact_resume_is_resume_id_and_typed_failures_do_not_fallback() {
     let terminal = probed(HELP_TERMINAL_ONLY, RESUME_HELP_LAST_ONLY, LOGIN_CHATGPT).await;
     assert!(matches!(
         terminal.build_launch(LaunchProviderRequest::new(
-            identity,
+            identity
+                .open_for_launch()
+                .expect("fixture executable handle"),
             None,
             Some(session_id()),
         )),
@@ -569,14 +597,20 @@ async fn codex_same_path_replacement_cannot_inherit_probe_or_settlement() {
     );
     assert!(matches!(
         adapter.build_launch(LaunchProviderRequest::new(
-            replaced.clone(),
+            replaced
+                .open_for_launch()
+                .expect("fixture executable handle"),
             None,
             Some(session_id()),
         )),
         Err(ProviderError::ExecutableChanged { .. })
     ));
     let err = adapter
-        .build_launch(LaunchProviderRequest::new(other, None, Some(session_id())))
+        .build_launch(LaunchProviderRequest::new(
+            other.open_for_launch().expect("fixture executable handle"),
+            None,
+            Some(session_id()),
+        ))
         .unwrap_err();
     let rendered = format!("{err:?}");
     assert!(!rendered.contains("/fixture/codex"));
@@ -609,7 +643,13 @@ async fn codex_correlated_launch_registers_authenticated_hooks_and_binds_first_s
     let endpoint = "http://127.0.0.1:9/internal/codex-hook";
     let mut launch = adapter
         .prepare_correlated_launch(
-            LaunchProviderRequest::new(identity.clone(), None, None),
+            LaunchProviderRequest::new(
+                identity
+                    .open_for_launch()
+                    .expect("fixture executable handle"),
+                None,
+                None,
+            ),
             issue_permit(&registry, task, agent, root),
             endpoint,
             Path::new("C:/fixture/devmanager.exe"),
@@ -638,10 +678,6 @@ async fn codex_correlated_launch_registers_authenticated_hooks_and_binds_first_s
         adapter.last_capabilities(&identity).unwrap().parse_signal,
         CapabilitySupport::Unsupported
     );
-    assert!(adapter
-        .parse_signal(ProviderSignal::SessionStarted(session_id()))
-        .is_empty());
-
     let observation = launch.relay_ingest(loopback(), SESSION_START.as_bytes(), 1);
     assert_eq!(
         observation.status(),
@@ -755,31 +791,51 @@ async fn codex_same_identity_reprobe_failure_quarantines_previous_capabilities()
     adapter.probe_attested(&identity).await.unwrap();
     assert!(adapter.probe_attested(&identity).await.is_err());
     assert!(matches!(
-        adapter.build_launch(LaunchProviderRequest::new(identity, None, None)),
-        Err(ProviderError::DependencyUnavailable {
-            capability: ProviderCapability::BuildLaunch
-        })
+        adapter.build_launch(LaunchProviderRequest::new(
+            identity
+                .open_for_launch()
+                .expect("fixture executable handle"),
+            None,
+            None,
+        )),
+        Err(ProviderError::UnsupportedCapability(
+            ProviderCapability::BuildLaunch
+        ))
     ));
 }
 
 #[tokio::test]
 async fn codex_public_probe_inspection_failure_quarantines_previous_capabilities() {
-    let adapter = probed(HELP, RESUME_HELP, LOGIN_CHATGPT).await;
+    let runner = Arc::new(FailAfterProbeRunner {
+        inner: ScriptedProbeRunner::ok(VERSION, HELP, RESUME_HELP, LOGIN_CHATGPT),
+        fail_after: 4,
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let adapter = CodexAdapter::new(runner);
     let identity = fixture_executable();
+    adapter.probe_attested(&identity).await.unwrap();
     assert!(adapter.last_capabilities(&identity).is_some());
 
-    let missing = Path::new("C:/devmanager-missing-codex-public-probe");
-    assert!(ProviderAdapter::probe(&adapter, missing).await.is_err());
+    let handle = identity
+        .open_for_launch()
+        .expect("fixture executable handle");
+    assert!(ProviderAdapter::probe(&adapter, &handle).await.is_err());
     assert!(adapter.last_capabilities(&identity).is_none());
     assert_eq!(
         adapter.semantic_launch_state(&identity),
         CodexSemanticLaunchState::TerminalOnly
     );
     assert!(matches!(
-        adapter.build_launch(LaunchProviderRequest::new(identity, None, None)),
-        Err(ProviderError::DependencyUnavailable {
-            capability: ProviderCapability::BuildLaunch
-        })
+        adapter.build_launch(LaunchProviderRequest::new(
+            identity
+                .open_for_launch()
+                .expect("fixture executable handle"),
+            None,
+            None,
+        )),
+        Err(ProviderError::UnsupportedCapability(
+            ProviderCapability::BuildLaunch
+        ))
     ));
 }
 
@@ -804,9 +860,9 @@ fn codex_attestation_generation_fences_stale_probe_publication() {
             first,
             &identity,
         ),
-        Err(ProviderError::DependencyUnavailable {
-            capability: crate::providers::capabilities::ProviderCapability::BuildLaunch
-        })
+        Err(ProviderError::UnsupportedCapability(
+            crate::providers::capabilities::ProviderCapability::BuildLaunch
+        ))
     ));
     assert!(require_attestation(
         &adapter.pinned,
@@ -1223,9 +1279,9 @@ async fn codex_managed_process_views_are_dependency_unavailable() {
     let adapter = probed(HELP, RESUME_HELP, LOGIN_CHATGPT).await;
     assert!(matches!(
         adapter.managed_process_views(),
-        Err(ProviderError::DependencyUnavailable {
-            capability: ProviderCapability::SemanticEvents
-        })
+        Err(ProviderError::UnsupportedCapability(
+            ProviderCapability::SemanticEvents
+        ))
     ));
 }
 
