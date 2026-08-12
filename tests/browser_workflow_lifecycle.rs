@@ -191,11 +191,14 @@ async fn assert_boundary_terminalizes_before_late_response(boundary: LifecycleBo
                 .await
                 .unwrap();
         }
-        LifecycleBoundary::DirectInput => bridge.observe_host_event(&BrowserHostEvent::user_input(
-            key.clone(),
-            "runtime-tab",
-            BrowserUserInputKind::Keyboard,
-        )),
+        LifecycleBoundary::DirectInput => bridge.observe_host_event(
+            &BrowserHostEvent::user_input(
+                key.clone(),
+                "runtime-tab",
+                BrowserUserInputKind::Keyboard,
+            )
+            .expect("interaction epoch"),
+        ),
         LifecycleBoundary::SelectConversation
         | LifecycleBoundary::RestartServer
         | LifecycleBoundary::PortConflictRestart
@@ -1274,11 +1277,10 @@ async fn browser_direct_input_and_each_lifecycle_command_cancel_before_late_work
     let isolated = coordinator
         .start(isolated_key, replay_plan("direct-input-isolated"))
         .unwrap();
-    bridge.observe_host_event(&BrowserHostEvent::user_input(
-        key.clone(),
-        "runtime-tab",
-        BrowserUserInputKind::Pointer,
-    ));
+    bridge.observe_host_event(
+        &BrowserHostEvent::user_input(key.clone(), "runtime-tab", BrowserUserInputKind::Pointer)
+            .expect("interaction epoch"),
+    );
     assert_cancelled(&coordinator, started.instance.id(), &key);
     assert_eq!(
         coordinator.status(&isolated.instance).unwrap().status,

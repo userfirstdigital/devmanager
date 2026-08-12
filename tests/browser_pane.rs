@@ -942,7 +942,8 @@ fn pane_model_projects_the_latest_bounded_agent_journal_entries() {
 #[test]
 fn pane_model_tracks_default_open_collapse_and_control_vocabulary() {
     let key = BrowserWorkspaceKey::new("project-a", "conversation-a").unwrap();
-    let mut host = BrowserHostState::new(PathBuf::from("pane-model-test"));
+    let mut host =
+        BrowserHostState::new(PathBuf::from("pane-model-test")).expect("browser host state");
     let initial = host
         .ensure_workspace(key.clone(), BrowserWorkspaceSnapshot::default())
         .unwrap();
@@ -1366,7 +1367,8 @@ fn user_input_and_new_window_events_stay_in_the_matching_conversation() {
     let open = vec![active.clone(), other.clone()];
 
     let user_input =
-        BrowserHostEvent::user_input(active.clone(), "tab-a", BrowserUserInputKind::Keyboard);
+        BrowserHostEvent::user_input(active.clone(), "tab-a", BrowserUserInputKind::Keyboard)
+            .expect("interaction epoch");
     assert_eq!(
         browser_event_plan(&open, &user_input),
         Some(BrowserPaneEventPlan::SyncSnapshot {

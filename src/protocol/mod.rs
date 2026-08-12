@@ -1,5 +1,6 @@
 //! Transport-neutral protocol compatibility and wire framing contracts.
 
+mod browser;
 mod capabilities;
 mod control;
 mod envelope;
@@ -7,6 +8,7 @@ mod frame;
 mod request;
 mod stream;
 
+pub use browser::*;
 pub use capabilities::{
     Capability, CapabilitySet, ProtocolVersion, VersionNegotiationError, PROTOCOL_MAJOR,
     PROTOCOL_MINOR,

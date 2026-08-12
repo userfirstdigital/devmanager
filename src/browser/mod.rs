@@ -2,6 +2,7 @@ mod annotations;
 mod attachments;
 mod automation;
 mod commands;
+pub mod domain;
 mod downloads;
 mod gateway;
 mod host;
@@ -10,6 +11,7 @@ mod model;
 mod operation_queue;
 mod pane;
 mod policy;
+pub mod protocol;
 mod provider;
 mod recipes;
 mod recording;
@@ -24,6 +26,7 @@ mod replay_repair;
 mod replay_secrets;
 mod resources;
 mod storage;
+mod surface;
 mod workflow_mcp;
 
 pub(crate) use annotations::redacted_browser_annotation;
@@ -77,9 +80,10 @@ pub use host::{
     acknowledge_attachment_projection_and_reconcile_pins, browser_user_input_initialization_script,
     unique_download_path, unsupported_command_response, unsupported_host_status,
     unsupported_platform_error, validate_browser_url, BrowserAnnotationMutationResult,
-    BrowserHostState, BrowserMemoryTarget, BrowserProfileClearPlan, BrowserProjectContextKey,
-    BrowserViewCreationPlan, BrowserViewVisibilityPlan, BrowserWebViewHost,
-    BrowserWorkspaceMutation,
+    BrowserHostState, BrowserMemoryTarget, BrowserNativeSurfaceBackend, BrowserNativeViewError,
+    BrowserNativeViewReceipt, BrowserNativeViewRegistration, BrowserProfileClearPlan,
+    BrowserProjectContextKey, BrowserTeardownObserver, BrowserViewCreationPlan,
+    BrowserViewVisibilityPlan, BrowserWebViewHost, BrowserWorkspaceMutation,
 };
 pub use model::{
     BrowserAnnotation, BrowserAnnotationKind, BrowserAttachmentRevision, BrowserBounds,
@@ -173,6 +177,22 @@ pub use resources::{
     BrowserResourceKind, BrowserResourceLimits, BrowserResourceMetadata, BrowserResourceStore,
 };
 pub use storage::BrowserStorageLayout;
+pub use surface::{
+    BoundsEpoch, BrowserSurfaceDescriptor, BrowserSurfaceFixture, BrowserSurfaceFixtureError,
+    BrowserSurfaceFixtureSnapshot, BrowserSurfaceHost, BrowserSurfaceIdentity,
+    BrowserSurfaceRegistration, BrowserSurfaceSnapshot, ClientBinding, DpiScale, DpiScaleError,
+    FocusEpoch, HostProcessIdentity, HostSurfaceRequest, HostTeardownProof, PhysicalBounds,
+    PhysicalBoundsError, ProcessIdentity, ProcessIdentityError, RuntimeGeneration,
+    SurfaceAttachRequest, SurfaceAuthorization, SurfaceBoundsUpdate, SurfaceClientRequest,
+    SurfaceDescriptorField, SurfaceDetachReason, SurfaceEpochError, SurfaceError,
+    SurfaceFocusUpdate, SurfaceInputAction, SurfaceInputReceipt, SurfaceInputRequest,
+    SurfaceLifecycle, SurfaceNonce, SurfaceNonceError, SurfaceOwner, SurfaceParkReason,
+    SurfacePermission, SurfacePermissions, SurfaceReceipt, SurfaceTaskSwitchReceipt,
+    SurfaceTaskSwitchRequest, SurfaceTeardownReason, SurfaceWindowHandle, SurfaceWindowHandleError,
+    TextInputError, BROWSER_SURFACE_FIXTURE_CLICK_TOKEN, BROWSER_SURFACE_FIXTURE_RETAINED_STATE,
+    BROWSER_SURFACE_FIXTURE_VISIBLE_TOKEN, MAX_SURFACE_TARGET_TOKEN_BYTES,
+    MAX_SURFACE_TEXT_INPUT_BYTES,
+};
 pub use workflow_mcp::{
     get_browser_workflow_recipe, list_browser_workflow_recipes, BrowserWorkflowRecipeGet,
     BrowserWorkflowRecipeInputSummary, BrowserWorkflowRecipeSummary,
