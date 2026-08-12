@@ -398,7 +398,7 @@ mod workspace_security_tests {
             }),
         };
         let (normalized, authorization, request_id) =
-            normalize_task_create_at_host(envelope, Some(&project_roots), None, connection_id)
+            normalize_task_create_at_host(envelope, Some(&project_roots), None, connection_id, None)
                 .expect("host normalization");
         let Some(authorization) = authorization else {
             panic!("CreateTaskV2 must receive host authorization");
@@ -590,6 +590,140 @@ mod workspace_security_tests {
                     crate::domain::TaskCockpitResult::Denied {
                         surface: crate::domain::TaskCockpitSurface::Files,
                         reason: crate::domain::TaskCockpitDeniedReason::PathTraversal,
+                    }
+                )
+            )
+        ));
+
+        let git = dispatch_authenticated_request_with_workspace_projects(
+            client_id,
+            granted,
+            &mut bus,
+            &project_roots,
+            ClientRequest::Query(crate::domain::query::QueryEnvelope {
+                request_id: crate::domain::RequestId::new(),
+                client_id,
+                task_id: Some(task_id),
+                query: crate::domain::query::Query::TaskCockpit(
+                    crate::domain::TaskCockpitQuery::GitStatus,
+                ),
+            }),
+        )
+        .expect("git");
+        let crate::protocol::ServerMessage::QueryReply(reply) = git else {
+            panic!("expected query reply");
+        };
+        assert!(matches!(
+            reply.outcome,
+            crate::domain::query::QueryOutcome::Ok(
+                crate::domain::query::QueryResult::TaskCockpit(
+                    crate::domain::TaskCockpitResult::Unavailable {
+                        surface: crate::domain::TaskCockpitSurface::Git,
+                        reason: crate::domain::TaskCockpitUnavailableReason::WorkspaceAuthorityUnavailable,
+                    }
+                )
+            )
+        ));
+
+        let health = dispatch_authenticated_request_with_workspace_projects(
+            client_id,
+            granted,
+            &mut bus,
+            &project_roots,
+            ClientRequest::Query(crate::domain::query::QueryEnvelope {
+                request_id: crate::domain::RequestId::new(),
+                client_id,
+                task_id: Some(task_id),
+                query: crate::domain::query::Query::TaskCockpit(
+                    crate::domain::TaskCockpitQuery::ServiceHealth {
+                        service_id: crate::domain::id::ConfiguredServiceId::new("api")
+                            .expect("catalog"),
+                        resource_generation: 1,
+                        connection_epoch: 1,
+                        action_epoch: 1,
+                    },
+                ),
+            }),
+        )
+        .expect("health");
+        let crate::protocol::ServerMessage::QueryReply(reply) = health else {
+            panic!("expected query reply");
+        };
+        assert!(matches!(
+            reply.outcome,
+            crate::domain::query::QueryOutcome::Ok(
+                crate::domain::query::QueryResult::TaskCockpit(
+                    crate::domain::TaskCockpitResult::Unavailable {
+                        surface: crate::domain::TaskCockpitSurface::Services,
+                        reason: crate::domain::TaskCockpitUnavailableReason::HealthUnsupported,
+                    }
+                )
+            )
+        ));
+
+        let logs = dispatch_authenticated_request_with_workspace_projects(
+            client_id,
+            granted,
+            &mut bus,
+            &project_roots,
+            ClientRequest::Query(crate::domain::query::QueryEnvelope {
+                request_id: crate::domain::RequestId::new(),
+                client_id,
+                task_id: Some(task_id),
+                query: crate::domain::query::Query::TaskCockpit(
+                    crate::domain::TaskCockpitQuery::ServiceLogs {
+                        service_id: crate::domain::id::ConfiguredServiceId::new("api")
+                            .expect("catalog"),
+                        resource_generation: 1,
+                        connection_epoch: 1,
+                        action_epoch: 1,
+                    },
+                ),
+            }),
+        )
+        .expect("logs");
+        let crate::protocol::ServerMessage::QueryReply(reply) = logs else {
+            panic!("expected query reply");
+        };
+        assert!(matches!(
+            reply.outcome,
+            crate::domain::query::QueryOutcome::Ok(
+                crate::domain::query::QueryResult::TaskCockpit(
+                    crate::domain::TaskCockpitResult::Unavailable {
+                        surface: crate::domain::TaskCockpitSurface::Services,
+                        reason: crate::domain::TaskCockpitUnavailableReason::LogsUnsupported,
+                    }
+                )
+            )
+        ));
+
+        let ssh = dispatch_authenticated_request_with_workspace_projects(
+            client_id,
+            granted,
+            &mut bus,
+            &project_roots,
+            ClientRequest::Query(crate::domain::query::QueryEnvelope {
+                request_id: crate::domain::RequestId::new(),
+                client_id,
+                task_id: Some(task_id),
+                query: crate::domain::query::Query::TaskCockpit(
+                    crate::domain::TaskCockpitQuery::SshAction {
+                        endpoint_id: "deploy@secret.example".into(),
+                    },
+                ),
+            }),
+        )
+        .expect("ssh");
+        let crate::protocol::ServerMessage::QueryReply(reply) = ssh else {
+            panic!("expected query reply");
+        };
+        assert!(matches!(
+            reply.outcome,
+            crate::domain::query::QueryOutcome::Ok(
+                crate::domain::query::QueryResult::TaskCockpit(
+                    crate::domain::TaskCockpitResult::Unavailable {
+                        surface: crate::domain::TaskCockpitSurface::Ssh,
+                        reason: crate::domain::TaskCockpitUnavailableReason::SshOperationUnsupported,
                     }
                 )
             )
@@ -1570,6 +1704,9 @@ pub struct HostRequestExecutor {
     pending_quit_receipt_acks: HashMap<ConnectionOutputId, PendingQuitReceiptAck>,
     /// Supervised foreground only: capacity-one arm sender to the host supervisor.
     arm_tx: Option<mpsc::Sender<PhysicalExitArmRequest>>,
+    /// One host-owned workspace resource coordinator. CreateTask and Task
+    /// Cockpit Git/file leases share this instance; queries never mint another.
+    workspace_coordinator: WorkspaceResourceCoordinator,
 }
 
 impl HostRequestExecutor {
@@ -1744,6 +1881,7 @@ impl HostRequestExecutor {
             outputs: HashMap::with_capacity(MAX_SNAPSHOT_SESSIONS),
             pending_quit_receipt_acks: HashMap::with_capacity(MAX_SNAPSHOT_SESSIONS),
             arm_tx: Some(arm_tx),
+            workspace_coordinator: WorkspaceResourceCoordinator::new(),
         };
         let join = tokio::spawn(async move {
             executor
@@ -1801,6 +1939,7 @@ impl HostRequestExecutor {
             outputs: HashMap::with_capacity(MAX_SNAPSHOT_SESSIONS),
             pending_quit_receipt_acks: HashMap::with_capacity(MAX_SNAPSHOT_SESSIONS),
             arm_tx: None,
+            workspace_coordinator: WorkspaceResourceCoordinator::new(),
         };
         let join = tokio::spawn(async move {
             executor.run(schedule_automatic_maintenance).await;
@@ -2539,6 +2678,7 @@ impl HostRequestExecutor {
                     Some(&self.workspace_projects),
                     self.config_admission.as_ref(),
                     connection_id,
+                    Some(&self.workspace_coordinator),
                 )?;
                 let receipt = self
                     .bus
@@ -2793,16 +2933,38 @@ impl HostRequestExecutor {
                     .config_admission
                     .as_ref()
                     .map(HostWorkspaceAdmission::redacted_ssh_endpoints);
-                let outcome = super::cockpit::serve_task_cockpit(
-                    negotiated.capabilities,
-                    envelope.task_id,
-                    &query,
-                    &self.bus,
-                    self.configured_service_runtime
+                let (action_epoch, runtime_generation) = self
+                    .config_admission
+                    .as_ref()
+                    .and_then(|admission| {
+                        admission.validate_current().ok()?;
+                        Some((admission.action_epoch(), admission.runtime_generation()))
+                    })
+                    .map(|(action_epoch, runtime_generation)| {
+                        (Some(action_epoch), Some(runtime_generation))
+                    })
+                    .unwrap_or((None, None));
+                let connection_id = output_id
+                    .map(ConnectionOutputId::as_uuid)
+                    .unwrap_or(Uuid::nil());
+                let outcome = super::cockpit::serve_task_cockpit(super::cockpit::TaskCockpitDispatch {
+                    capabilities: negotiated.capabilities,
+                    envelope_task_id: envelope.task_id,
+                    client_id: envelope.client_id,
+                    connection_id,
+                    request_id: envelope.request_id,
+                    query: &query,
+                    bus: &self.bus,
+                    service_runtime: self
+                        .configured_service_runtime
                         .as_ref()
                         .map(|runtime| &runtime.manager),
-                    ssh_endpoints.as_deref(),
-                );
+                    ssh_endpoints: ssh_endpoints.as_deref(),
+                    workspace_projects: Some(&self.workspace_projects),
+                    coordinator: Some(&self.workspace_coordinator),
+                    action_epoch,
+                    runtime_generation,
+                });
                 Ok(QueryReply {
                     request_id: envelope.request_id,
                     outcome,
@@ -3555,6 +3717,7 @@ fn normalize_task_create_at_host(
     workspace_projects: Option<&WorkspaceProjectRoots>,
     config_admission: Option<&HostWorkspaceAdmission>,
     connection_id: Uuid,
+    coordinator: Option<&WorkspaceResourceCoordinator>,
 ) -> Result<
     (
         CommandEnvelope,
@@ -3616,11 +3779,14 @@ fn normalize_task_create_at_host(
                 _ => workspace,
             };
             let request_id = RequestId::new();
+            let coordinator = coordinator
+                .cloned()
+                .unwrap_or_else(WorkspaceResourceCoordinator::new);
             let mut service = WorkspaceService::with_task_coordinator(
                 project_id,
                 id,
                 workspace_projects,
-                WorkspaceResourceCoordinator::new(),
+                coordinator,
             )
             .map_err(|_| IpcError::Security("configured project is unavailable".into()))?;
             let (binding, authorization) = service
@@ -3816,7 +3982,7 @@ fn dispatch_authenticated_request_inner(
             // can claim the exact same receipt once.
             let connection_id = Uuid::nil();
             let (envelope, authorization, request_id) =
-                normalize_task_create_at_host(envelope, workspace_projects, None, connection_id)?;
+                normalize_task_create_at_host(envelope, workspace_projects, None, connection_id, None)?;
             let receipt = bus
                 .execute_host_authorized(
                     envelope,
@@ -3872,14 +4038,21 @@ fn dispatch_authenticated_request_inner(
                     return Ok(ServerMessage::QueryReply(reply));
                 }
                 Query::TaskCockpit(query) => {
-                    let outcome = super::cockpit::serve_task_cockpit(
+                    let outcome = super::cockpit::serve_task_cockpit(super::cockpit::TaskCockpitDispatch {
                         capabilities,
-                        envelope.task_id,
+                        envelope_task_id: envelope.task_id,
+                        client_id: envelope.client_id,
+                        connection_id: Uuid::nil(),
+                        request_id: envelope.request_id,
                         query,
                         bus,
-                        None,
-                        None,
-                    );
+                        service_runtime: None,
+                        ssh_endpoints: None,
+                        workspace_projects,
+                        coordinator: None,
+                        action_epoch: None,
+                        runtime_generation: None,
+                    });
                     return Ok(ServerMessage::QueryReply(QueryReply {
                         request_id: envelope.request_id,
                         outcome,

@@ -12,8 +12,8 @@ pub use model::{
     WorkspaceRequest, WorkspaceResolution, WorkspaceResource,
 };
 pub use service::{
-    WorkspaceAuthorization, WorkspaceError, WorkspaceLeaseError, WorkspaceResourceCoordinator,
-    WorkspaceResourceLease, WorkspaceService,
+    issue_file_service, WorkspaceAuthorization, WorkspaceError, WorkspaceLeaseError,
+    WorkspaceResourceCoordinator, WorkspaceResourceLease, WorkspaceService,
 };
 mod editor_ui;
 

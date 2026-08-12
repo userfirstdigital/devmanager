@@ -5,12 +5,16 @@
 //! on the existing ServiceControl / ConfiguredServiceSupervisor path.
 
 use crate::domain::cockpit::{
-    TaskServiceProjection, TaskServiceRuntimeState, TaskServiceScope, TaskServiceSnapshot,
+    TaskServiceHealth, TaskServiceLogLine, TaskServiceLogs, TaskServiceProjection,
+    TaskServiceRuntimeState, TaskServiceScope, TaskServiceSnapshot,
 };
 use crate::domain::id::ConfiguredServiceId;
 use crate::domain::TaskId;
 use crate::services::health::{RedactedServiceSnapshot, ServiceState};
 use crate::services::model::{ServiceId, ServiceScope, ValidationError};
+use crate::services::supervisor::{
+    BoundedServiceLog, MAX_SERVICE_LOG_LINE_BYTES, MAX_SERVICE_LOG_LINES,
+};
 
 /// Fail-closed visibility rule for one selected Task cockpit.
 ///
@@ -76,6 +80,50 @@ pub fn to_wire_projection(
     })
 }
 
+pub fn to_wire_logs(
+    task_id: TaskId,
+    service_id: ConfiguredServiceId,
+    log: BoundedServiceLog,
+) -> Result<TaskServiceLogs, crate::domain::id::ConfiguredServiceIdError> {
+    if service_id.as_str() != log.service_id.as_str() {
+        return Err(crate::domain::id::ConfiguredServiceIdError::InvalidIdentifier);
+    }
+    let truncated = log.truncated || log.lines.len() > MAX_SERVICE_LOG_LINES;
+    let lines = log
+        .lines
+        .into_iter()
+        .take(MAX_SERVICE_LOG_LINES)
+        .map(|line| {
+            let text = crate::domain::cockpit::truncate_to_max_bytes(
+                &line.text,
+                MAX_SERVICE_LOG_LINE_BYTES,
+            );
+            TaskServiceLogLine {
+                observed_at_ms: line.observed_at_ms,
+                generation: line.generation,
+                text,
+            }
+        })
+        .collect();
+    Ok(TaskServiceLogs {
+        task_id,
+        service_id,
+        generation: log.generation,
+        lines,
+        truncated,
+    })
+}
+
+pub fn to_wire_health(
+    task_id: TaskId,
+    snapshot: RedactedServiceSnapshot,
+) -> Result<TaskServiceHealth, crate::domain::id::ConfiguredServiceIdError> {
+    Ok(TaskServiceHealth {
+        task_id,
+        snapshot: to_wire_snapshot(snapshot)?,
+    })
+}
+
 fn to_wire_snapshot(
     snapshot: RedactedServiceSnapshot,
 ) -> Result<TaskServiceSnapshot, crate::domain::id::ConfiguredServiceIdError> {
@@ -137,6 +185,71 @@ mod tests {
         assert_eq!(wire.task_id, selected);
         assert_eq!(wire.snapshots.len(), 2);
         assert_eq!(wire.snapshots[0].service_id.as_str(), "api");
+    }
+
+    #[test]
+    fn wire_logs_reuse_supervisor_bounds_and_exact_configured_id() {
+        use crate::services::supervisor::RedactedLogLine;
+
+        let task_id = TaskId::new();
+        let service_id = ConfiguredServiceId::new("api").expect("catalog");
+        let mut lines = Vec::new();
+        for index in 0..(MAX_SERVICE_LOG_LINES + 4) {
+            lines.push(RedactedLogLine {
+                observed_at_ms: index as u64,
+                generation: 1,
+                text: "x".repeat(MAX_SERVICE_LOG_LINE_BYTES + 8),
+            });
+        }
+        let logs = to_wire_logs(
+            task_id,
+            service_id.clone(),
+            BoundedServiceLog {
+                service_id: ServiceId::new("api").expect("id"),
+                generation: 7,
+                lines,
+                truncated: false,
+            },
+        )
+        .expect("wire logs");
+        assert_eq!(logs.task_id, task_id);
+        assert_eq!(logs.service_id.as_str(), "api");
+        assert_eq!(logs.lines.len(), MAX_SERVICE_LOG_LINES);
+        assert!(logs.truncated);
+        assert!(logs
+            .lines
+            .iter()
+            .all(|line| line.text.len() <= MAX_SERVICE_LOG_LINE_BYTES));
+        let unicode = to_wire_logs(
+            task_id,
+            service_id.clone(),
+            BoundedServiceLog {
+                service_id: ServiceId::new("api").expect("id"),
+                generation: 1,
+                lines: vec![RedactedLogLine {
+                    observed_at_ms: 1,
+                    generation: 1,
+                    text: "é".repeat(200),
+                }],
+                truncated: false,
+            },
+        )
+        .expect("unicode logs");
+        assert!(unicode.lines[0].text.len() <= MAX_SERVICE_LOG_LINE_BYTES);
+        assert!(unicode.lines[0]
+            .text
+            .is_char_boundary(unicode.lines[0].text.len()));
+        assert!(to_wire_logs(
+            task_id,
+            ConfiguredServiceId::new("other").expect("other"),
+            BoundedServiceLog {
+                service_id: ServiceId::new("api").expect("id"),
+                generation: 1,
+                lines: Vec::new(),
+                truncated: false,
+            },
+        )
+        .is_err());
     }
 
     fn redacted(id: &str, scope: ServiceScope) -> RedactedServiceSnapshot {

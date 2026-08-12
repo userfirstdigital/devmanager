@@ -586,6 +586,7 @@ impl fmt::Debug for WriteResult {
 pub enum FileServiceError {
     RootUnavailable,
     AuthorityUnavailable,
+    SecretLikePath,
     InvalidPath {
         path: String,
         reason: &'static str,
@@ -677,6 +678,7 @@ impl fmt::Debug for FileServiceError {
         let name = match self {
             Self::RootUnavailable => "RootUnavailable",
             Self::AuthorityUnavailable => "AuthorityUnavailable",
+            Self::SecretLikePath => "SecretLikePath",
             Self::InvalidPath { .. } => "InvalidPath",
             Self::NotFound { .. } => "NotFound",
             Self::NotDirectory { .. } => "NotDirectory",
@@ -716,6 +718,7 @@ impl fmt::Display for FileServiceError {
         match self {
             Self::RootUnavailable => write!(formatter, "workspace root is unavailable"),
             Self::AuthorityUnavailable => write!(formatter, "workspace authority is unavailable"),
+            Self::SecretLikePath => write!(formatter, "workspace path is secret-like"),
             Self::InvalidPath { reason, .. } => {
                 write!(formatter, "invalid workspace-relative path: {reason}")
             }
@@ -1099,6 +1102,40 @@ pub(crate) mod task6_bridge {
     pub(crate) trait Sealed {}
 }
 
+/// Opaque production resource-lease holder. Test fixtures omit it.
+pub(crate) trait Task6LiveLeaseGuard: Send + Sync {
+    fn ensure_active(&self) -> bool;
+}
+
+pub(crate) struct OpaqueTask6LeaseGuard {
+    inner: Option<Box<dyn Task6LiveLeaseGuard>>,
+}
+
+impl Default for OpaqueTask6LeaseGuard {
+    fn default() -> Self {
+        Self { inner: None }
+    }
+}
+
+impl fmt::Debug for OpaqueTask6LeaseGuard {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("OpaqueTask6LeaseGuard(REDACTED)")
+    }
+}
+
+impl OpaqueTask6LeaseGuard {
+    pub(crate) fn from_live(guard: Box<dyn Task6LiveLeaseGuard>) -> Self {
+        Self { inner: Some(guard) }
+    }
+
+    fn is_live(&self) -> bool {
+        self.inner
+            .as_ref()
+            .map(|guard| guard.ensure_active())
+            .unwrap_or(true)
+    }
+}
+
 /// Crate-private integration seam owned by the future Task 6.2 workspace
 /// binder. The issuer passes the retained final handle it verified while
 /// binding the workspace; this service never reopens the root by path. The
@@ -1118,10 +1155,15 @@ pub(crate) trait Task6WorkspaceLease: task6_bridge::Sealed {
     fn connection_id(&self) -> [u8; 16];
     fn action_epoch(&self) -> u64;
 
-    fn into_file_binding(self) -> Result<Task6FileBinding, FileServiceError>
+    fn take_live_lease_guard(&mut self) -> OpaqueTask6LeaseGuard {
+        OpaqueTask6LeaseGuard::default()
+    }
+
+    fn into_file_binding(mut self) -> Result<Task6FileBinding, FileServiceError>
     where
         Self: Sized,
     {
+        let lease_guard = self.take_live_lease_guard();
         let path = self.retained_root_path().to_path_buf();
         let handle = self
             .retained_root_handle()
@@ -1170,6 +1212,7 @@ pub(crate) trait Task6WorkspaceLease: task6_bridge::Sealed {
                 connection_id: self.connection_id(),
                 action_epoch: self.action_epoch(),
             },
+            lease_guard,
         })
     }
 }
@@ -1177,6 +1220,7 @@ pub(crate) trait Task6WorkspaceLease: task6_bridge::Sealed {
 pub(crate) struct Task6FileBinding {
     root: ApprovedWorkspaceRoot,
     authority: WorkspaceFileAuthority,
+    lease_guard: OpaqueTask6LeaseGuard,
 }
 
 #[cfg(test)]
@@ -1657,6 +1701,7 @@ pub struct WorkspaceFileService {
     directory_identities: DeadlineMutex<HashMap<String, FileIdentity>>,
     directory_identity_order: DeadlineMutex<VecDeque<String>>,
     cleanup: Arc<CleanupLedger>,
+    lease_guard: OpaqueTask6LeaseGuard,
     #[cfg(test)]
     test_budget_mode: AtomicUsize,
 }
@@ -1732,6 +1777,7 @@ impl WorkspaceFileService {
             directory_identities: DeadlineMutex::new(HashMap::new()),
             directory_identity_order: DeadlineMutex::new(VecDeque::new()),
             cleanup: Arc::new(CleanupLedger::new()),
+            lease_guard: binding.lease_guard,
             #[cfg(test)]
             test_budget_mode: AtomicUsize::new(0),
         };
@@ -1787,6 +1833,13 @@ impl WorkspaceFileService {
     }
 
     pub fn try_acquire_operation(&self) -> Result<FileOperationPermit, FileServiceError> {
+        // Every public file operation must retain the live Task6 resource
+        // lease for its entire duration. Test fixtures use the no-op guard;
+        // production bindings fail closed as soon as the host lease is
+        // revoked or released.
+        if !self.lease_guard.is_live() {
+            return Err(FileServiceError::AuthorityUnavailable);
+        }
         let mut active = self.active_operations.load(Ordering::Acquire);
         loop {
             if active >= MAX_CONCURRENT_OPERATIONS {
@@ -1975,6 +2028,28 @@ impl WorkspaceFileService {
         self.read_inner_with_deadline(raw_path, options, &deadline)
     }
 
+    pub(crate) fn classify_secret_path(path: &str) -> SecretClassification {
+        classify_secret(path)
+    }
+
+    pub(crate) fn bounded_utf8_prefix(bytes: &[u8], max_bytes: usize) -> Option<String> {
+        let end = bytes.len().min(max_bytes);
+        let slice = &bytes[..end];
+        match std::str::from_utf8(slice) {
+            Ok(text) => Some(text.to_owned()),
+            Err(error) => {
+                let valid = error.valid_up_to();
+                if valid == 0 {
+                    None
+                } else {
+                    std::str::from_utf8(&slice[..valid])
+                        .ok()
+                        .map(str::to_owned)
+                }
+            }
+        }
+    }
+
     fn read_inner_with_deadline(
         &self,
         raw_path: &str,
@@ -1990,7 +2065,16 @@ impl WorkspaceFileService {
             return Err(FileServiceError::InvalidReadOptions);
         }
         self.revalidate_root_with_deadline(deadline)?;
+        if !self.lease_guard.is_live() {
+            return Err(FileServiceError::AuthorityUnavailable);
+        }
+        if classify_secret(raw_path) == SecretClassification::SecretLike {
+            return Err(FileServiceError::SecretLikePath);
+        }
         let path = normalize_relative_path(raw_path)?;
+        if classify_secret(path.as_str()) == SecretClassification::SecretLike {
+            return Err(FileServiceError::SecretLikePath);
+        }
         deadline.check()?;
         let resolved = self.resolve_existing_with_deadline(&path, deadline)?;
         let metadata = resolved.metadata.as_ref().expect("resolved metadata");
@@ -9212,4 +9296,39 @@ pub(crate) fn test_temporary_name(
         .expect("test temporary identity")
         .0;
     bound_temporary_name(parent_identity, expected_target_identity, identity, &nonce)
+}
+
+#[cfg(test)]
+mod secret_and_utf8_tests {
+    use super::{SecretClassification, WorkspaceFileService};
+
+    #[test]
+    fn classify_secret_path_matches_existing_policy() {
+        assert_eq!(
+            WorkspaceFileService::classify_secret_path("README.md"),
+            SecretClassification::Ordinary
+        );
+        assert_eq!(
+            WorkspaceFileService::classify_secret_path(".env"),
+            SecretClassification::SecretLike
+        );
+        assert_eq!(
+            WorkspaceFileService::classify_secret_path("id_rsa"),
+            SecretClassification::SecretLike
+        );
+        assert_eq!(
+            WorkspaceFileService::classify_secret_path("tokens/prod.pem"),
+            SecretClassification::SecretLike
+        );
+    }
+
+    #[test]
+    fn bounded_utf8_prefix_does_not_split_characters() {
+        let bytes = "aé🎉".as_bytes();
+        let prefix = WorkspaceFileService::bounded_utf8_prefix(bytes, 3).expect("prefix");
+        assert!(prefix.len() <= 3);
+        assert!(prefix.is_char_boundary(prefix.len()));
+        assert!(!prefix.contains('🎉'));
+        assert!(WorkspaceFileService::bounded_utf8_prefix(&[0x80, 0xFF], 8).is_none());
+    }
 }

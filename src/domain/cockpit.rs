@@ -31,6 +31,9 @@ pub enum TaskCockpitDeniedReason {
     PathTraversal,
     OutsideWorkspace,
     CapabilityDenied,
+    StaleFence,
+    UnknownService,
+    ForeignScope,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,10 +42,12 @@ pub enum TaskCockpitUnavailableReason {
     GitAuthorityNotIssued,
     FileAuthorityNotIssued,
     SshOperationUnsupported,
+    SshTaskSupervisorAdapterMissing,
     ServiceSupervisorUnavailable,
     WriteUnsupported,
     LogsUnsupported,
     HealthUnsupported,
+    WorkspaceAuthorityUnavailable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,10 +66,22 @@ pub enum TaskCockpitQuery {
     FilesWrite,
     GitMutate,
     SshStatus,
-    SshAction,
+    SshAction {
+        endpoint_id: String,
+    },
     ServiceSnapshots,
-    ServiceLogs,
-    ServiceHealth,
+    ServiceLogs {
+        service_id: ConfiguredServiceId,
+        resource_generation: u64,
+        connection_epoch: u64,
+        action_epoch: u64,
+    },
+    ServiceHealth {
+        service_id: ConfiguredServiceId,
+        resource_generation: u64,
+        connection_epoch: u64,
+        action_epoch: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -177,6 +194,31 @@ pub struct TaskServiceProjection {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskServiceLogLine {
+    pub observed_at_ms: u64,
+    pub generation: u64,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskServiceLogs {
+    pub task_id: TaskId,
+    pub service_id: ConfiguredServiceId,
+    pub generation: u64,
+    pub lines: Vec<TaskServiceLogLine>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskServiceHealth {
+    pub task_id: TaskId,
+    pub snapshot: TaskServiceSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum TaskCockpitResult {
     Workspace(TaskWorkspaceProjection),
@@ -185,6 +227,8 @@ pub enum TaskCockpitResult {
     FilesRead(TaskFilesReadProjection),
     Ssh(TaskSshProjection),
     Services(TaskServiceProjection),
+    ServiceLogs(TaskServiceLogs),
+    ServiceHealth(TaskServiceHealth),
     Denied {
         surface: TaskCockpitSurface,
         reason: TaskCockpitDeniedReason,
@@ -193,6 +237,18 @@ pub enum TaskCockpitResult {
         surface: TaskCockpitSurface,
         reason: TaskCockpitUnavailableReason,
     },
+}
+
+/// Truncate `text` to at most `max_bytes` without splitting a UTF-8 character.
+pub fn truncate_to_max_bytes(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_owned();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_owned()
 }
 
 pub fn relative_path_is_safe(path: &str) -> bool {
@@ -272,10 +328,10 @@ pub fn cockpit_surface(query: &TaskCockpitQuery) -> TaskCockpitSurface {
         TaskCockpitQuery::FilesList { .. }
         | TaskCockpitQuery::FilesRead { .. }
         | TaskCockpitQuery::FilesWrite => TaskCockpitSurface::Files,
-        TaskCockpitQuery::SshStatus | TaskCockpitQuery::SshAction => TaskCockpitSurface::Ssh,
+        TaskCockpitQuery::SshStatus | TaskCockpitQuery::SshAction { .. } => TaskCockpitSurface::Ssh,
         TaskCockpitQuery::ServiceSnapshots
-        | TaskCockpitQuery::ServiceLogs
-        | TaskCockpitQuery::ServiceHealth => TaskCockpitSurface::Services,
+        | TaskCockpitQuery::ServiceLogs { .. }
+        | TaskCockpitQuery::ServiceHealth { .. } => TaskCockpitSurface::Services,
     }
 }
 
@@ -286,6 +342,15 @@ mod tests {
     use crate::domain::query::{Query, QueryResult};
 
     #[test]
+    fn truncate_to_max_bytes_stays_on_utf8_boundaries() {
+        let text = "aé🎉";
+        assert_eq!(truncate_to_max_bytes(text, text.len()), text);
+        let truncated = truncate_to_max_bytes(text, 3);
+        assert!(truncated.len() <= 3);
+        assert!(truncated.is_char_boundary(truncated.len()));
+        assert!(!truncated.contains('🎉'));
+    }
+
     fn relative_paths_reject_traversal_and_absolute_forms() {
         assert!(relative_path_is_safe("src/lib.rs"));
         assert!(!relative_path_is_safe("../secret"));
@@ -355,6 +420,23 @@ mod tests {
     }
 
     #[test]
+    fn service_logs_query_wires_configured_string_not_uuid() {
+        let query = Query::TaskCockpit(TaskCockpitQuery::ServiceLogs {
+            service_id: ConfiguredServiceId::new("api").expect("catalog"),
+            resource_generation: 1,
+            connection_epoch: 2,
+            action_epoch: 3,
+        });
+        let encoded = serde_json::to_value(&query).expect("encode");
+        let payload = encoded
+            .get("task_cockpit")
+            .and_then(|value| value.get("service_logs"))
+            .expect("service logs");
+        assert_eq!(payload.get("service_id").and_then(|value| value.as_str()), Some("api"));
+        let text = payload.to_string();
+        assert!(!text.contains("019"), "must not look like a UUIDv7 service id: {text}");
+    }
+
     fn workspace_projection_omits_raw_paths() {
         let task_id = TaskId::new();
         let projection = workspace_projection(task_id, &WorkspaceRef::Main);

@@ -1723,10 +1723,7 @@ fn redact_log_text(text: &str, overlay: &EnvironmentOverlay) -> String {
             }
         }
     }
-    if redacted.len() > MAX_SERVICE_LOG_LINE_BYTES {
-        redacted.truncate(MAX_SERVICE_LOG_LINE_BYTES);
-    }
-    redacted
+    crate::domain::cockpit::truncate_to_max_bytes(&redacted, MAX_SERVICE_LOG_LINE_BYTES)
 }
 
 #[cfg(windows)]

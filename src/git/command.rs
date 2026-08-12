@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering}
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use uuid::Uuid;
 
 #[cfg(windows)]
 use crate::services::platform_service::{
@@ -266,6 +267,7 @@ struct GitAuthorityCapability {
     approved_external_roots: Vec<PathBuf>,
     authority_deadline: Instant,
     limits: GitLimits,
+    workspace_resource_lease: Option<std::sync::Arc<crate::workspace::WorkspaceResourceLease>>,
 }
 
 impl GitAuthorityCapability {
@@ -282,13 +284,17 @@ impl GitAuthorityCapability {
             && Instant::now() < self.authority_deadline
             && Arc::strong_count(&self.root_handle) >= 1
             && !self.graph_handles.is_empty()
+            && self
+                .workspace_resource_lease
+                .as_ref()
+                .map(|lease| lease.ensure_active().is_ok())
+                .unwrap_or(true)
     }
 }
 
-/// Opaque host-issued Git authority.  The production app currently carries
-/// `Option<GitHostBinding>` and deliberately supplies `None` until the
-/// Config/Workspace union can issue the complete capability.  The only
-/// issuer in this revision is `#[cfg(test)]`.
+/// Opaque host-issued Git authority. Production issuance requires a live
+/// [`crate::workspace::WorkspaceAuthorization`] plus an active Git resource
+/// lease. The test-only constructor remains available only under `cfg(test)`.
 #[derive(Clone)]
 pub(crate) struct GitHostBinding {
     capability: Arc<GitAuthorityCapability>,
@@ -365,6 +371,119 @@ pub(crate) fn test_issue_git_host_binding(
             approved_external_roots,
             authority_deadline: Instant::now() + Duration::from_secs(30),
             limits: GitLimits::default(),
+            workspace_resource_lease: None,
+        }),
+    })
+}
+
+/// Issue a production Git host binding from a revalidated workspace
+/// authorization and an active Git resource lease. The live
+/// [`crate::workspace::WorkspaceResourceLease`] is retained on the binding
+/// for the whole derived Git operation. Path strings never authorize.
+pub(crate) fn issue_git_host_binding(
+    authorization: &crate::workspace::WorkspaceAuthorization,
+    lease: crate::workspace::WorkspaceResourceLease,
+    task_id: crate::domain::TaskId,
+    project_id: crate::domain::ProjectId,
+    client_id: crate::domain::ClientId,
+    connection_id: Uuid,
+    request_id: crate::domain::RequestId,
+    command_id: crate::domain::CommandId,
+    workspace: &crate::domain::task::WorkspaceRef,
+    action_epoch: u64,
+    runtime_generation: u64,
+) -> Result<GitHostBinding, GitError> {
+    if lease.resource() != crate::workspace::WorkspaceResource::Git {
+        return Err(GitError::AuthorityUnavailable);
+    }
+    lease
+        .ensure_active()
+        .map_err(|_| GitError::AuthorityUnavailable)?;
+    let binding = authorization
+        .validated_binding(
+            task_id,
+            project_id,
+            client_id,
+            connection_id,
+            request_id,
+            command_id,
+            workspace,
+            action_epoch,
+            runtime_generation,
+        )
+        .ok_or(GitError::AuthorityUnavailable)?;
+    let fact = binding
+        .durable_ref()
+        .host_binding()
+        .ok_or(GitError::AuthorityUnavailable)?;
+    let root_pin = authorization
+        .retained_pin_for_fact(fact.workspace_root())
+        .ok_or(GitError::AuthorityUnavailable)?;
+    if !root_pin.is_dir() {
+        return Err(GitError::AuthorityUnavailable);
+    }
+    let mut approved_external_roots = Vec::new();
+    for path_fact in [
+        fact.repository_root(),
+        fact.common_git_dir(),
+        fact.admin_dir(),
+        fact.gitdir(),
+        fact.commondir(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if path_fact.path() != root_pin.path() {
+            approved_external_roots.push(path_fact.path().to_path_buf());
+        }
+    }
+    let root = RepositoryRoot::open_with_approved_external_roots(
+        root_pin.path(),
+        &approved_external_roots,
+    )
+    .map_err(|reason| GitError::InvalidRepositoryRoot {
+        path: "<bound-root>".to_string(),
+        reason,
+    })?;
+    let approved_external_roots = canonicalize_approved_graph_roots(
+        &root.path,
+        &approved_external_roots,
+    )
+    .map_err(|reason| GitError::InvalidRepositoryRoot {
+        path: "<bound-root>".to_string(),
+        reason,
+    })?;
+    let repository_identity = repository_graph_identity(&root);
+    let repository_static_identity = repository_static_graph_identity(&root);
+    let workspace_identity = WorkspaceIdentity::from_canonical_root(root.path.clone());
+    let identity = AuthorityIdentity {
+        task_id: task_id.to_string(),
+        workspace: workspace_identity,
+        repository_static_identity: repository_static_identity.clone(),
+        controller_id: client_id.to_string(),
+        connection_id: connection_id.to_string(),
+    };
+    let state = Arc::new(AuthorityState::new(identity.clone()));
+    Ok(GitHostBinding {
+        capability: Arc::new(GitAuthorityCapability {
+            workspace_authorization: WorkspaceAuthorization(Arc::clone(&state)),
+            resource_lease: ResourceLease(Arc::clone(&state)),
+            controller: ControllerHandle(Arc::clone(&state)),
+            connection: ConnectionHandle(Arc::clone(&state)),
+            action_generation: ActionGeneration {
+                current: Arc::new(AtomicU64::new(1)),
+                issued: 1,
+            },
+            identity,
+            root: root.path,
+            root_handle: Arc::clone(&root.handle),
+            graph_handles: Arc::clone(&root.pinned_handles),
+            repository_identity: Arc::new(Mutex::new(repository_identity)),
+            repository_static_identity,
+            approved_external_roots,
+            authority_deadline: Instant::now() + Duration::from_secs(30),
+            limits: GitLimits::default(),
+            workspace_resource_lease: Some(Arc::new(lease)),
         }),
     })
 }

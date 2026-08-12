@@ -3460,8 +3460,8 @@ mod tests {
         assert_eq!(projection.task_id, task);
         let controls: Vec<_> = projection.available_service_controls().collect();
         assert!(controls.contains(&crate::client::action::ACTION_SERVICE_START));
-        assert!(!controls.contains(&crate::client::action::ACTION_SERVICE_LOGS));
-        assert_eq!(projection.unavailable_workspace_surfaces().count(), 7);
+        assert!(controls.contains(&crate::client::action::ACTION_SERVICE_LOGS));
+        assert_eq!(projection.unavailable_workspace_surfaces().count(), 2);
         assert!(!format!("{projection:?}").contains('\\'));
         assert!(!format!("{projection:?}").contains("C:"));
     }

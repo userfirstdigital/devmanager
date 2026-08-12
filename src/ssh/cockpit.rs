@@ -39,6 +39,46 @@ fn redacted_endpoint(connection: &SSHConnection) -> Option<TaskSshEndpoint> {
     })
 }
 
+/// Exact catalog endpoint identity. Host/user/path/credential spellings are
+/// rejected before any runtime call.
+pub fn accept_exact_endpoint<'a>(
+    endpoints: &'a [TaskSshEndpoint],
+    endpoint_id: &str,
+) -> Result<&'a TaskSshEndpoint, SshEndpointDenial> {
+    if !endpoint_id_is_catalog_form(endpoint_id) {
+        return Err(SshEndpointDenial::ForeignInput);
+    }
+    endpoints
+        .iter()
+        .find(|endpoint| endpoint.id == endpoint_id && !endpoint.archived)
+        .ok_or(SshEndpointDenial::UnknownEndpoint)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SshEndpointDenial {
+    ForeignInput,
+    UnknownEndpoint,
+}
+
+fn endpoint_id_is_catalog_form(endpoint_id: &str) -> bool {
+    if endpoint_id.is_empty() || endpoint_id.len() > 64 {
+        return false;
+    }
+    if endpoint_id.contains('\0')
+        || endpoint_id.contains('@')
+        || endpoint_id.contains(':')
+        || endpoint_id.contains('/')
+        || endpoint_id.contains('\\')
+        || endpoint_id.contains(' ')
+    {
+        return false;
+    }
+    endpoint_id
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.'))
+        && !endpoint_id.starts_with('.')
+}
+
 fn has_credential(connection: &SSHConnection) -> bool {
     connection.auth.as_ref().is_some_and(|auth| {
         auth.credential_ref.as_ref().is_some()
@@ -77,5 +117,43 @@ mod tests {
         assert!(!encoded.contains("deploy"));
         assert!(!encoded.contains("vault:ssh/jump"));
         assert!(encoded.contains("\"has_credential\":true"));
+    }
+
+    #[test]
+    fn exact_endpoint_rejects_host_user_path_and_credential_inputs() {
+        let endpoints = redacted_endpoints(&[SSHConnection {
+            id: "jump".into(),
+            label: "Jump box".into(),
+            host: "secret.example".into(),
+            port: 22,
+            username: "deploy".into(),
+            auth: Nullable::Value(SshAuth {
+                mode: SshAuthMode::PrivateKey,
+                credential_ref: Nullable::Value("vault:ssh/jump".into()),
+                extra: Default::default(),
+            }),
+            archived: Nullable::Value(false),
+            extra: Default::default(),
+        }]);
+        assert_eq!(
+            accept_exact_endpoint(&endpoints, "jump").map(|endpoint| endpoint.id.as_str()),
+            Ok("jump")
+        );
+        assert_eq!(
+            accept_exact_endpoint(&endpoints, "deploy@secret.example"),
+            Err(SshEndpointDenial::ForeignInput)
+        );
+        assert_eq!(
+            accept_exact_endpoint(&endpoints, "C:/Users/deploy/.ssh/id_rsa"),
+            Err(SshEndpointDenial::ForeignInput)
+        );
+        assert_eq!(
+            accept_exact_endpoint(&endpoints, "vault:ssh/jump"),
+            Err(SshEndpointDenial::ForeignInput)
+        );
+        assert_eq!(
+            accept_exact_endpoint(&endpoints, "other"),
+            Err(SshEndpointDenial::UnknownEndpoint)
+        );
     }
 }

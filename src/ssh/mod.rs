@@ -8,5 +8,5 @@ mod cockpit;
 mod credentials;
 mod launch;
 
-pub(crate) use cockpit::redacted_endpoints;
+pub(crate) use cockpit::{accept_exact_endpoint, redacted_endpoints, SshEndpointDenial};
 pub use launch::{ssh_runtime_outcome, SshRuntimeOutcome, SshUnavailableReason};

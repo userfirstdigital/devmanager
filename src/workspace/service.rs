@@ -1361,6 +1361,132 @@ impl Drop for WorkspaceResourceLease {
     }
 }
 
+struct IssuedTask6WorkspaceLease {
+    pin: WorkspacePinnedPath,
+    handle: fs::File,
+    lease: Option<WorkspaceResourceLease>,
+    workspace_lease: [u8; 16],
+    task_id: [u8; 16],
+    client_id: [u8; 16],
+    connection_id: [u8; 16],
+    action_epoch: u64,
+}
+
+struct IssuedTask6LeaseHolder {
+    lease: WorkspaceResourceLease,
+}
+
+impl super::files::Task6LiveLeaseGuard for IssuedTask6LeaseHolder {
+    fn ensure_active(&self) -> bool {
+        self.lease.ensure_active().is_ok()
+    }
+}
+
+impl super::files::task6_bridge::Sealed for IssuedTask6WorkspaceLease {}
+
+impl super::files::Task6WorkspaceLease for IssuedTask6WorkspaceLease {
+    fn retained_root_path(&self) -> &Path {
+        self.pin.path()
+    }
+
+    fn retained_root_handle(&self) -> &fs::File {
+        &self.handle
+    }
+
+    fn retained_root_write_handle(&self) -> Option<&fs::File> {
+        None
+    }
+
+    fn workspace_lease(&self) -> [u8; 16] {
+        self.workspace_lease
+    }
+
+    fn task_id(&self) -> [u8; 16] {
+        self.task_id
+    }
+
+    fn client_id(&self) -> [u8; 16] {
+        self.client_id
+    }
+
+    fn connection_id(&self) -> [u8; 16] {
+        self.connection_id
+    }
+
+    fn action_epoch(&self) -> u64 {
+        self.action_epoch
+    }
+
+    fn take_live_lease_guard(&mut self) -> super::files::OpaqueTask6LeaseGuard {
+        match self.lease.take() {
+            Some(lease) => super::files::OpaqueTask6LeaseGuard::from_live(Box::new(
+                IssuedTask6LeaseHolder { lease },
+            )),
+            None => super::files::OpaqueTask6LeaseGuard::default(),
+        }
+    }
+}
+
+/// Issue a production [`WorkspaceFileService`] from a live File lease and
+/// revalidated workspace authorization. Path-only construction is rejected.
+pub(crate) fn issue_file_service(
+    authorization: &WorkspaceAuthorization,
+    lease: WorkspaceResourceLease,
+    task_id: TaskId,
+    project_id: ProjectId,
+    client_id: ClientId,
+    connection_id: Uuid,
+    request_id: RequestId,
+    command_id: CommandId,
+    workspace: &WorkspaceRef,
+    action_epoch: u64,
+    runtime_generation: u64,
+) -> Result<super::files::WorkspaceFileService, super::files::FileServiceError> {
+    if lease.resource() != WorkspaceResource::File {
+        return Err(super::files::FileServiceError::AuthorityUnavailable);
+    }
+    lease
+        .ensure_active()
+        .map_err(|_| super::files::FileServiceError::AuthorityUnavailable)?;
+    let binding = authorization
+        .validated_binding(
+            task_id,
+            project_id,
+            client_id,
+            connection_id,
+            request_id,
+            command_id,
+            workspace,
+            action_epoch,
+            runtime_generation,
+        )
+        .ok_or(super::files::FileServiceError::AuthorityUnavailable)?;
+    let fact = binding
+        .durable_ref()
+        .host_binding()
+        .ok_or(super::files::FileServiceError::AuthorityUnavailable)?;
+    let pin = authorization
+        .retained_pin_for_fact(fact.workspace_root())
+        .ok_or(super::files::FileServiceError::RootUnavailable)?;
+    if !pin.is_dir() {
+        return Err(super::files::FileServiceError::RootUnavailable);
+    }
+    let handle = pin
+        .handle()
+        .try_clone()
+        .map_err(|_| super::files::FileServiceError::RootUnavailable)?;
+    super::files::WorkspaceFileService::from_task6_workspace(IssuedTask6WorkspaceLease {
+        pin,
+        handle,
+        lease: Some(lease),
+        workspace_lease: *request_id.as_bytes(),
+        task_id: *task_id.as_bytes(),
+        client_id: *client_id.as_bytes(),
+        connection_id: *connection_id.as_bytes(),
+        action_epoch,
+    })
+}
+
 impl WorkspaceService {
     pub fn for_project(
         project_id: ProjectId,
@@ -1643,6 +1769,66 @@ impl WorkspaceService {
         Ok((binding, authorization))
     }
 
+    /// Revalidate the currently bound workspace against the exact Task
+    /// snapshot and host admission identity. Path strings never authorize.
+    pub(crate) fn authorize_current_with_generation(
+        &self,
+        expected_workspace: &WorkspaceRef,
+        task_id: TaskId,
+        client_id: ClientId,
+        connection_id: Uuid,
+        request_id: RequestId,
+        command_id: CommandId,
+        action_epoch: u64,
+        runtime_generation: u64,
+    ) -> Result<WorkspaceAuthorization, WorkspaceError> {
+        if task_id != self.task_id {
+            return Err(WorkspaceError::PathResolution {
+                path: self.project_root.clone(),
+                reason: "task admission does not belong to this service".into(),
+            });
+        }
+        let binding = self.current().ok_or(WorkspaceError::RebindRequired)?;
+        if binding.durable_ref() != expected_workspace {
+            return Err(WorkspaceError::RebindRequired);
+        }
+        let fact = binding
+            .durable_ref()
+            .host_binding()
+            .ok_or(WorkspaceError::RebindRequired)?;
+        let pins = open_fact_pins(fact)?;
+        let authorization = WorkspaceAuthorization::new_with_generation(
+            self.project_id,
+            task_id,
+            client_id,
+            connection_id,
+            request_id,
+            command_id,
+            &self.project_root,
+            binding,
+            pins,
+            action_epoch,
+            runtime_generation,
+        );
+        if authorization
+            .validated_binding(
+                task_id,
+                self.project_id,
+                client_id,
+                connection_id,
+                request_id,
+                command_id,
+                expected_workspace,
+                action_epoch,
+                runtime_generation,
+            )
+            .is_none()
+        {
+            return Err(WorkspaceError::RebindRequired);
+        }
+        Ok(authorization)
+    }
+
     pub fn current(&self) -> Option<&WorkspaceBinding> {
         self.binding.as_ref()
     }
@@ -1748,12 +1934,43 @@ impl WorkspaceService {
         self.coordinator.acquire(admission)
     }
 
+    /// Issue and acquire one live resource lease for the exact Task, client,
+    /// connection, request, command, and generation tuple.
+    pub(crate) fn acquire_task_resource(
+        &self,
+        task_id: TaskId,
+        resource: WorkspaceResource,
+        client_id: ClientId,
+        connection_id: Uuid,
+        request_id: RequestId,
+        command_id: CommandId,
+        action_epoch: u64,
+        runtime_generation: u64,
+    ) -> Result<WorkspaceResourceLease, WorkspaceLeaseError> {
+        let admission = self.issue_resource_admission_with_generation(
+            task_id,
+            resource,
+            client_id,
+            connection_id,
+            request_id,
+            command_id,
+            action_epoch,
+            runtime_generation,
+        )?;
+        self.acquire_resource(admission)
+    }
+
     fn revoke_resource(&self, admission: WorkspaceLeaseAdmission) {
         if admission.scope.coordinator_id == self.coordinator.coordinator_id
             && admission.scope.generation_key.task_id == self.task_id
         {
             self.coordinator.revoke(admission.scope);
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn live_resources_for_task_for_test(&self) -> Vec<WorkspaceResource> {
+        self.coordinator.live_resources_for_task(self.task_id)
     }
 
     fn ensure_no_live_resources(&self) -> Result<(), WorkspaceError> {
@@ -3183,4 +3400,269 @@ fn repository_fingerprint_for_pins(pins: &[&PinnedPath]) -> Option<RepositoryFin
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     RepositoryFingerprint::from_host_token(format!("sha256:{token}")).ok()
+}
+
+#[cfg(test)]
+mod cockpit_authority_tests {
+    use super::{issue_file_service, WorkspaceService};
+    use crate::domain::{ClientId, CommandId, ProjectId, RequestId, TaskId};
+    use crate::git::command::{issue_git_host_binding, GitCancellation, GitRepository};
+    use crate::workspace::files::ReadOptions;
+    use crate::workspace::model::{WorkspaceProjectRoots, WorkspaceRequest, WorkspaceResource};
+    use std::fs;
+    use std::process::Command as ProcessCommand;
+    use uuid::Uuid;
+
+    fn bound_service() -> (tempfile::TempDir, WorkspaceService, TaskId) {
+        let root = tempfile::tempdir().expect("workspace root");
+        let output = ProcessCommand::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(root.path())
+            .output()
+            .expect("git init");
+        assert!(output.status.success());
+        fs::write(root.path().join("README.md"), "ok\n").expect("readme");
+        fs::write(root.path().join(".env"), "SECRET=1\n").expect("env");
+        fs::write(root.path().join("blob.bin"), [0u8, 1, 2, 255]).expect("binary");
+        let project_id = ProjectId::new();
+        let task_id = TaskId::new();
+        let roots = WorkspaceProjectRoots::try_from_pairs([(project_id, root.path().to_path_buf())])
+            .expect("roots");
+        let mut service = WorkspaceService::with_task_coordinator(
+            project_id,
+            task_id,
+            &roots,
+            super::WorkspaceResourceCoordinator::new(),
+        )
+        .expect("service");
+        let client_id = ClientId::new();
+        let request_id = RequestId::new();
+        let command_id = CommandId::new();
+        service
+            .bind_authorized_with_generation(
+                WorkspaceRequest::main(),
+                task_id,
+                client_id,
+                Uuid::now_v7(),
+                request_id,
+                command_id,
+                1,
+                1,
+            )
+            .expect("bind");
+        (root, service, task_id)
+    }
+
+    #[test]
+    fn admitted_git_status_and_file_list_read_use_live_leases() {
+        let (_root, service, task_id) = bound_service();
+        let binding = service.current().expect("binding").durable_ref().clone();
+        let client_id = ClientId::new();
+        let connection_id = Uuid::now_v7();
+        let request_id = RequestId::new();
+        let command_id = CommandId::from_bytes(*request_id.as_bytes()).expect("command");
+        let authorization = service
+            .authorize_current_with_generation(
+                &binding,
+                task_id,
+                client_id,
+                connection_id,
+                request_id,
+                command_id,
+                1,
+                1,
+            )
+            .expect("authorize");
+        let git_lease = service
+            .acquire_task_resource(
+                task_id,
+                WorkspaceResource::Git,
+                client_id,
+                connection_id,
+                request_id,
+                command_id,
+                1,
+                1,
+            )
+            .expect("git lease");
+        let git_binding = issue_git_host_binding(
+            &authorization,
+            git_lease,
+            task_id,
+            service.project_id,
+            client_id,
+            connection_id,
+            request_id,
+            command_id,
+            &binding,
+            1,
+            1,
+        )
+        .expect("git binding");
+        let repository =
+            GitRepository::from_host_binding(git_binding, GitCancellation::new()).expect("repo");
+        let status = repository.status().expect("status");
+        assert!(!status.is_detached);
+
+        let file_lease = service
+            .acquire_task_resource(
+                task_id,
+                WorkspaceResource::File,
+                client_id,
+                connection_id,
+                request_id,
+                command_id,
+                1,
+                1,
+            )
+            .expect("file lease");
+        let files = issue_file_service(
+            &authorization,
+            file_lease,
+            task_id,
+            service.project_id,
+            client_id,
+            connection_id,
+            request_id,
+            command_id,
+            &binding,
+            1,
+            1,
+        )
+        .expect("files");
+        assert!(service
+            .live_resources_for_task_for_test()
+            .contains(&WorkspaceResource::File));
+        let listed = files.list(None, 16).expect("list");
+        assert!(listed.iter().any(|entry| entry.path.as_str() == "README.md"));
+        let read = files
+            .read("README.md", ReadOptions::default())
+            .expect("read");
+        assert!(read.total_bytes > 0);
+        assert!(matches!(
+            files.read(".env", ReadOptions::default()),
+            Err(crate::workspace::files::FileServiceError::SecretLikePath)
+        ));
+        let binary = files
+            .read("blob.bin", ReadOptions::default())
+            .expect("binary");
+        assert_eq!(binary.content_kind, crate::workspace::files::ContentKind::Binary);
+        assert!(files.read("../secret", ReadOptions::default()).is_err());
+        drop(files);
+        assert!(!service
+            .live_resources_for_task_for_test()
+            .contains(&WorkspaceResource::File));
+    }
+
+    #[test]
+    fn stale_foreign_and_mismatched_workspace_authority_fail_closed() {
+        let (_root, service, task_id) = bound_service();
+        let binding = service.current().expect("binding").durable_ref().clone();
+        let client_id = ClientId::new();
+        let connection_id = Uuid::now_v7();
+        let request_id = RequestId::new();
+        let command_id = CommandId::from_bytes(*request_id.as_bytes()).expect("command");
+        assert!(service
+            .authorize_current_with_generation(
+                &binding,
+                TaskId::new(),
+                client_id,
+                connection_id,
+                request_id,
+                command_id,
+                1,
+                1,
+            )
+            .is_err());
+        let authorization = service
+            .authorize_current_with_generation(
+                &binding,
+                task_id,
+                client_id,
+                connection_id,
+                request_id,
+                command_id,
+                1,
+                1,
+            )
+            .expect("auth");
+        let lease = service
+            .acquire_task_resource(
+                task_id,
+                WorkspaceResource::Git,
+                client_id,
+                connection_id,
+                request_id,
+                command_id,
+                1,
+                1,
+            )
+            .expect("lease");
+        assert!(issue_git_host_binding(
+            &authorization,
+            lease,
+            task_id,
+            service.project_id,
+            client_id,
+            connection_id,
+            request_id,
+            command_id,
+            &binding,
+            9,
+            1,
+        )
+        .is_err());
+        let lease = service
+            .acquire_task_resource(
+                task_id,
+                WorkspaceResource::Git,
+                client_id,
+                connection_id,
+                request_id,
+                command_id,
+                1,
+                1,
+            )
+            .expect("lease");
+        assert!(issue_git_host_binding(
+            &authorization,
+            lease,
+            task_id,
+            service.project_id,
+            ClientId::new(),
+            connection_id,
+            request_id,
+            command_id,
+            &binding,
+            1,
+            1,
+        )
+        .is_err());
+        let file_lease = service
+            .acquire_task_resource(
+                task_id,
+                WorkspaceResource::File,
+                client_id,
+                connection_id,
+                request_id,
+                command_id,
+                1,
+                1,
+            )
+            .expect("file lease");
+        assert!(issue_git_host_binding(
+            &authorization,
+            file_lease,
+            task_id,
+            service.project_id,
+            client_id,
+            connection_id,
+            request_id,
+            command_id,
+            &binding,
+            1,
+            1,
+        )
+        .is_err());
+    }
 }

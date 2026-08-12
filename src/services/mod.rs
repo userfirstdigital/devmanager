@@ -21,8 +21,8 @@ pub use binding::{
     ConfiguredServiceSource, EnvironmentOverlay, TaskServicePathContext,
 };
 pub use cockpit::{
-    filter_snapshots_for_task, snapshot_visible_to_task, supervisor_service_id, to_wire_projection,
-    TaskServiceCockpitProjection,
+    filter_snapshots_for_task, snapshot_visible_to_task, supervisor_service_id, to_wire_health,
+    to_wire_logs, to_wire_projection, TaskServiceCockpitProjection,
 };
 pub use env_service::*;
 pub use health::*;

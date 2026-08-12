@@ -112,9 +112,9 @@ pub const ACTION_SERVICE_START: &str = "service.start";
 pub const ACTION_SERVICE_STOP: &str = "service.stop";
 /// Stable restart id; capability-gated by the host supervisor.
 pub const ACTION_SERVICE_RESTART: &str = "service.restart";
-/// Reserved logs id; not advertised until host dispatch is wired.
+/// Typed Task Cockpit logs query through the configured-service supervisor.
 pub const ACTION_SERVICE_LOGS: &str = "service.logs";
-/// Reserved health id; not advertised until host dispatch is wired.
+/// Typed Task Cockpit health query through the configured-service supervisor.
 pub const ACTION_SERVICE_HEALTH: &str = "service.health";
 /// Task-scoped workspace identity projection.
 pub const ACTION_WORKSPACE_STATUS: &str = "workspace.status";
@@ -128,7 +128,7 @@ pub const ACTION_FILES_READ: &str = "files.read";
 pub const ACTION_FILES_WRITE: &str = "files.write";
 /// Task-scoped SSH status query through host SSH catalog authority.
 pub const ACTION_SSH_STATUS: &str = "ssh.status";
-/// Reserved SSH action; stays unpublished until a safe runtime operation exists.
+/// Typed SSH action query. Not advertised until a Task supervisor adapter exists.
 pub const ACTION_SSH_ACTION: &str = "ssh.action";
 /// Reserved git mutate; stays unpublished until GitHostBinding is issued.
 pub const ACTION_GIT_MUTATE: &str = "git.mutate";
@@ -449,9 +449,9 @@ pub struct CockpitSurfaceDescriptor {
 /// Closed cockpit surface catalog for workspace/git/files/ssh/services.
 ///
 /// Service start/stop/restart remain on the capability-gated ServiceControl
-/// path. Workspace/git/ssh status and files list/read are typed TaskCockpit
-/// queries. Logs/health, file writes, git mutate, and SSH actions stay
-/// explicitly unavailable.
+/// path. Workspace/git/files list+read, SSH status, and service logs/health
+/// are typed TaskCockpit queries. File writes, git mutate, and SSH actions stay
+/// explicitly unavailable until their production authority exists.
 pub fn cockpit_surface_descriptors() -> &'static [CockpitSurfaceDescriptor] {
     const SURFACES: &[CockpitSurfaceDescriptor] = &[
         CockpitSurfaceDescriptor {
@@ -481,22 +481,18 @@ pub fn cockpit_surface_descriptors() -> &'static [CockpitSurfaceDescriptor] {
         CockpitSurfaceDescriptor {
             kind: CockpitSurfaceKind::Services,
             action_id: Some(ACTION_SERVICE_LOGS),
-            available: false,
+            available: true,
             access: CockpitSurfaceAccess::ReadOnly,
             redacts_secrets: true,
-            disabled_reason: Some(
-                "service log query is not available until a typed host operation exists",
-            ),
+            disabled_reason: None,
         },
         CockpitSurfaceDescriptor {
             kind: CockpitSurfaceKind::Services,
             action_id: Some(ACTION_SERVICE_HEALTH),
-            available: false,
+            available: true,
             access: CockpitSurfaceAccess::ReadOnly,
             redacts_secrets: true,
-            disabled_reason: Some(
-                "service health query is not available until a typed host operation exists",
-            ),
+            disabled_reason: None,
         },
         CockpitSurfaceDescriptor {
             kind: CockpitSurfaceKind::Workspace,
@@ -509,30 +505,26 @@ pub fn cockpit_surface_descriptors() -> &'static [CockpitSurfaceDescriptor] {
         CockpitSurfaceDescriptor {
             kind: CockpitSurfaceKind::Git,
             action_id: Some(ACTION_GIT_STATUS),
-            available: false,
+            available: true,
             access: CockpitSurfaceAccess::ReadOnly,
             redacts_secrets: true,
-            disabled_reason: Some("git host authority is not issued for this Task on this host"),
+            disabled_reason: None,
         },
         CockpitSurfaceDescriptor {
             kind: CockpitSurfaceKind::Files,
             action_id: Some(ACTION_FILES_LIST),
-            available: false,
+            available: true,
             access: CockpitSurfaceAccess::ReadOnly,
             redacts_secrets: true,
-            disabled_reason: Some(
-                "workspace file authority is not issued for this Task on this host",
-            ),
+            disabled_reason: None,
         },
         CockpitSurfaceDescriptor {
             kind: CockpitSurfaceKind::Files,
             action_id: Some(ACTION_FILES_READ),
-            available: false,
+            available: true,
             access: CockpitSurfaceAccess::ReadOnly,
             redacts_secrets: true,
-            disabled_reason: Some(
-                "workspace file authority is not issued for this Task on this host",
-            ),
+            disabled_reason: None,
         },
         CockpitSurfaceDescriptor {
             kind: CockpitSurfaceKind::Files,
@@ -549,6 +541,16 @@ pub fn cockpit_surface_descriptors() -> &'static [CockpitSurfaceDescriptor] {
             access: CockpitSurfaceAccess::ReadOnly,
             redacts_secrets: true,
             disabled_reason: None,
+        },
+        CockpitSurfaceDescriptor {
+            kind: CockpitSurfaceKind::Ssh,
+            action_id: Some(ACTION_SSH_ACTION),
+            available: false,
+            access: CockpitSurfaceAccess::ReadOnly,
+            redacts_secrets: true,
+            disabled_reason: Some(
+                "ssh launch/stop is unavailable until a Task supervisor adapter is issued",
+            ),
         },
     ];
     SURFACES
@@ -703,6 +705,26 @@ const TASK_COCKPIT_EXTENSION: &[ActionDescriptor] = &[
         required_capability: Some(Capability::TaskCockpit),
         risk: ActionRisk::ReadOnly,
         argument_schema: ActionArgumentSchema::TaskCockpitV1,
+    },
+    ActionDescriptor {
+        id: ACTION_SERVICE_LOGS,
+        title: "Service logs",
+        description: "Read bounded redacted logs for one configured service in the selected Task.",
+        keywords: &["service", "logs", "cockpit"],
+        scope: ActionScope::Task,
+        required_capability: Some(Capability::TaskCockpit),
+        risk: ActionRisk::ReadOnly,
+        argument_schema: ActionArgumentSchema::ServiceControlV1,
+    },
+    ActionDescriptor {
+        id: ACTION_SERVICE_HEALTH,
+        title: "Service health",
+        description: "Read redacted health for one configured service in the selected Task.",
+        keywords: &["service", "health", "cockpit"],
+        scope: ActionScope::Task,
+        required_capability: Some(Capability::TaskCockpit),
+        risk: ActionRisk::ReadOnly,
+        argument_schema: ActionArgumentSchema::ServiceControlV1,
     },
 ];
 
@@ -1177,7 +1199,8 @@ mod tests {
         ACTION_PROVIDER_QUEUE_FOLLOW_UP, ACTION_PROVIDER_RESOLVE_APPROVAL, ACTION_PROVIDER_SEND_NOW,
         ACTION_PROVIDER_STEER_CURRENT_TURN, ACTION_PROVIDER_STOP_TURN, ACTION_SERVICE_HEALTH,
         ACTION_SERVICE_LOGS, ACTION_SERVICE_RESTART, ACTION_SERVICE_START, ACTION_SERVICE_STOP,
-        ACTION_SSH_STATUS, ACTION_TASK_CREATE, ACTION_TASK_CREATE_V2, ACTION_TASK_LIST,
+        ACTION_SSH_ACTION, ACTION_SSH_STATUS, ACTION_TASK_CREATE, ACTION_TASK_CREATE_V2,
+        ACTION_TASK_LIST,
         ACTION_TASK_RENAME, ACTION_TASK_SHOW, ACTION_WORKSPACE_STATUS,
     };
     use crate::{
@@ -1210,12 +1233,13 @@ mod tests {
         assert!(ids.contains(&ACTION_PROVIDER_RESOLVE_APPROVAL));
         assert!(ids.contains(&ACTION_PROVIDER_STOP_TURN));
         assert!(!ids.contains(&ACTION_PROVIDER_NEW_CONVERSATION));
-        assert_eq!(ids.len(), 24);
+        assert_eq!(ids.len(), 26);
         assert!(ids.contains(&ACTION_SERVICE_START));
         assert!(ids.contains(&ACTION_SERVICE_STOP));
         assert!(ids.contains(&ACTION_SERVICE_RESTART));
-        assert!(!ids.contains(&ACTION_SERVICE_LOGS));
-        assert!(!ids.contains(&ACTION_SERVICE_HEALTH));
+        assert!(ids.contains(&ACTION_SERVICE_LOGS));
+        assert!(ids.contains(&ACTION_SERVICE_HEALTH));
+        assert!(!ids.contains(&ACTION_SSH_ACTION));
         assert!(ids.contains(&ACTION_WORKSPACE_STATUS));
         assert!(ids.contains(&ACTION_GIT_STATUS));
         assert!(ids.contains(&ACTION_FILES_LIST));
@@ -1274,6 +1298,12 @@ mod tests {
                         ActionScope::Task,
                         ActionRisk::ReadOnly,
                         ActionArgumentSchema::TaskCockpitV1,
+                        Some(Capability::TaskCockpit),
+                    ),
+                    ACTION_SERVICE_LOGS | ACTION_SERVICE_HEALTH => (
+                        ActionScope::Task,
+                        ActionRisk::ReadOnly,
+                        ActionArgumentSchema::ServiceControlV1,
                         Some(Capability::TaskCockpit),
                     ),
                     _ => (
@@ -1404,20 +1434,38 @@ mod tests {
         let surfaces = cockpit_surface_descriptors();
         assert!(surfaces.iter().any(|surface| {
             surface.kind == CockpitSurfaceKind::Git
-                && !surface.available
+                && surface.available
                 && surface.action_id == Some(ACTION_GIT_STATUS)
-                && surface.disabled_reason.is_some()
+                && surface.disabled_reason.is_none()
         }));
         assert!(surfaces.iter().any(|surface| {
             surface.kind == CockpitSurfaceKind::Files
-                && !surface.available
+                && surface.available
                 && surface.action_id == Some(ACTION_FILES_LIST)
-                && surface.disabled_reason.is_some()
+                && surface.disabled_reason.is_none()
         }));
         assert!(surfaces.iter().any(|surface| {
             surface.kind == CockpitSurfaceKind::Ssh
                 && surface.available
                 && surface.action_id == Some(ACTION_SSH_STATUS)
+        }));
+        assert!(surfaces.iter().any(|surface| {
+            surface.kind == CockpitSurfaceKind::Ssh
+                && !surface.available
+                && surface.action_id == Some(ACTION_SSH_ACTION)
+                && surface.disabled_reason
+                    == Some(
+                        "ssh launch/stop is unavailable until a Task supervisor adapter is issued",
+                    )
+        }));
+        assert_eq!(
+            surfaces.iter().filter(|surface| surface.available).count(),
+            10
+        );
+        assert!(surfaces.iter().any(|surface| {
+            surface.kind == CockpitSurfaceKind::Services
+                && surface.available
+                && surface.action_id == Some(ACTION_SERVICE_LOGS)
         }));
         assert!(surfaces.iter().any(|surface| {
             surface.kind == CockpitSurfaceKind::Workspace
@@ -1462,6 +1510,22 @@ mod tests {
             envelope.query,
             Query::TaskCockpit(crate::domain::TaskCockpitQuery::WorkspaceStatus)
         );
+        let logs = task_cockpit_query(
+            request_id,
+            client_id,
+            task_id,
+            crate::domain::TaskCockpitQuery::ServiceLogs {
+                service_id: crate::domain::id::ConfiguredServiceId::new("api").expect("catalog"),
+                resource_generation: 1,
+                connection_epoch: 2,
+                action_epoch: 3,
+            },
+        );
+        assert_eq!(logs.task_id, Some(task_id));
+        assert!(matches!(
+            logs.query,
+            Query::TaskCockpit(crate::domain::TaskCockpitQuery::ServiceLogs { .. })
+        ));
     }
 
     #[test]

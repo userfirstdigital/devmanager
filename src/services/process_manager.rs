@@ -891,6 +891,50 @@ impl ProcessManager {
         Ok(())
     }
 
+    /// Observe Logs/Health for one Task through the owned configured-service
+    /// supervisor. Exact Task-scoped services must match; host-scoped services
+    /// remain visible. Mutating actions are rejected here.
+    pub(crate) fn configured_service_observe_for_task(
+        &self,
+        action: crate::services::supervisor::SupervisorAction,
+        service_id: &crate::services::model::ServiceId,
+        fence: crate::services::model::AdmissionFence,
+        task_id: crate::domain::TaskId,
+    ) -> Result<
+        crate::services::supervisor::SupervisorOutcome,
+        crate::services::supervisor::SupervisorError,
+    > {
+        match action {
+            crate::services::supervisor::SupervisorAction::Logs
+            | crate::services::supervisor::SupervisorAction::Health => {}
+            crate::services::supervisor::SupervisorAction::Start
+            | crate::services::supervisor::SupervisorAction::Stop
+            | crate::services::supervisor::SupervisorAction::Restart => {
+                return Err(crate::services::supervisor::SupervisorError::Refused(
+                    crate::services::supervisor::SupervisorRefusal::Other,
+                ));
+            }
+        }
+        let scope = self.configured_service_scope(service_id)?;
+        match scope {
+            crate::services::model::ServiceScope::Host => {}
+            crate::services::model::ServiceScope::Task {
+                task_id: scoped_task,
+            } if scoped_task == task_id => {}
+            crate::services::model::ServiceScope::Task { .. } => {
+                return Err(crate::services::supervisor::SupervisorError::Refused(
+                    crate::services::supervisor::SupervisorRefusal::Ownership,
+                ));
+            }
+        }
+        self.configured_service_control(
+            action,
+            service_id,
+            fence,
+            crate::services::model::AdmissionRequester::Task(task_id),
+        )
+    }
+
     /// Typed control path against the owned configured-service supervisor.
     pub(crate) fn configured_service_control(
         &self,
