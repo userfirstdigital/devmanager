@@ -36,6 +36,23 @@ impl ProcessManagerProviderLauncher {
             }),
         )
     }
+
+    /// Bind a write capability to the currently live stock runtime. The
+    /// identity is looked up by the ProcessManager-owned session authority;
+    /// callers cannot manufacture a fence from durable metadata alone.
+    pub(crate) fn write_handle_for_identity(
+        &self,
+        identity: &ProviderInputDeliveryIdentity,
+    ) -> Result<ProviderRuntimeWriteHandle, ProviderInputDeliveryError> {
+        let fence = self.manager.live_provider_write_fence(identity)?;
+        ProviderRuntimeWriteHandle::bind(
+            identity.clone(),
+            fence,
+            Box::new(ProcessManagerByteWriter {
+                manager: self.manager.clone(),
+            }),
+        )
+    }
 }
 
 struct ProcessManagerByteWriter {

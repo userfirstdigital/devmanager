@@ -375,6 +375,7 @@ pub enum ActionRequest {
     },
     TaskCreate(TaskCreateArguments),
     TaskRename(TaskRenameArguments),
+    ProviderInput(ProviderInputActionRequest),
     ServiceControl {
         action: ServiceControlAction,
         arguments: ServiceControlArguments,
@@ -390,6 +391,7 @@ impl ActionRequest {
             Self::TaskShow { .. } => ACTION_TASK_SHOW,
             Self::TaskCreate(_) => ACTION_TASK_CREATE,
             Self::TaskRename(_) => ACTION_TASK_RENAME,
+            Self::ProviderInput(arguments) => arguments.action_id,
             Self::ServiceControl { action, .. } => match action {
                 ServiceControlAction::Start => ACTION_SERVICE_START,
                 ServiceControlAction::Stop => ACTION_SERVICE_STOP,
@@ -401,6 +403,15 @@ impl ActionRequest {
     pub fn descriptor(&self) -> &'static ActionDescriptor {
         descriptor(self.id()).expect("every ActionRequest must have a catalog descriptor")
     }
+}
+
+/// A typed provider action captured by the native shell. The host receives it
+/// as the existing durable SubmitProviderInput command; no raw PTY bytes are
+/// exposed to the UI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderInputActionRequest {
+    pub action_id: &'static str,
+    pub arguments: ProviderInputArguments,
 }
 
 /// Caller-owned configured-service action arguments. The host supervisor

@@ -232,7 +232,23 @@ impl KernelStore {
         lease: Duration,
     ) -> Result<Option<DispatchClaim>, StoreError> {
         let lease_ms = validate_dispatch_lease_ms(lease)?;
-        self.with_immediate_transaction(|tx| claim_next_dispatch_in_tx(tx, now_ms()?, lease_ms))
+        self.with_immediate_transaction(|tx| {
+            claim_next_dispatch_in_tx(tx, now_ms()?, lease_ms, None)
+        })
+    }
+
+    /// Claim only one destination class. Maintenance lanes must not consume a
+    /// durable effect owned by another authority (for example, the provider
+    /// lane must never claim browser or teardown work).
+    pub(crate) fn claim_next_dispatch_for_destination(
+        &mut self,
+        destination: DestinationClass,
+        lease: Duration,
+    ) -> Result<Option<DispatchClaim>, StoreError> {
+        let lease_ms = validate_dispatch_lease_ms(lease)?;
+        self.with_immediate_transaction(|tx| {
+            claim_next_dispatch_in_tx(tx, now_ms()?, lease_ms, Some(destination))
+        })
     }
 
     /// Settle the next eligible process-empty task teardown under a bounded lease.
@@ -2328,6 +2344,7 @@ fn load_next_dispatch_candidate(
     tx: &Transaction<'_>,
     now_ms: i64,
     after: Option<&OutboxRow>,
+    destination: Option<DestinationClass>,
 ) -> Result<Option<OutboxRow>, StoreError> {
     let after_available_at = after.map(|row| row.available_at_ms);
     let after_event_sequence = after
@@ -2364,12 +2381,13 @@ fn load_next_dispatch_candidate(
              WHERE op.state = 'accepted'
                AND (
                  (o.state = 'pending' AND o.available_at_ms <= ?1)
-                 OR (
+               OR (
                    o.state = 'claimed'
                    AND o.available_at_ms <= ?1
                    AND (o.leased_until_ms IS NULL OR o.leased_until_ms <= ?1)
                  )
                )
+               AND (?6 IS NULL OR o.destination_class = ?6)
                AND (
                  ?2 IS NULL
                  OR o.available_at_ms > ?2
@@ -2392,6 +2410,7 @@ fn load_next_dispatch_candidate(
                 after_event_sequence,
                 after_effect_index,
                 after_outbox_id,
+                destination.map(DestinationClass::as_str),
             ],
             |row| {
                 Ok((
@@ -2724,11 +2743,17 @@ fn claim_next_dispatch_in_tx(
     tx: &Transaction<'_>,
     now_ms: i64,
     lease_ms: i64,
+    destination: Option<DestinationClass>,
 ) -> Result<Option<DispatchClaim>, StoreError> {
     let mut prior_candidate = None;
     let mut saw_stale_fence = false;
     loop {
-        let Some(row) = load_next_dispatch_candidate(tx, now_ms, prior_candidate.as_ref())? else {
+        let Some(row) = load_next_dispatch_candidate(
+            tx,
+            now_ms,
+            prior_candidate.as_ref(),
+            destination,
+        )? else {
             return if saw_stale_fence {
                 Err(StoreError::StaleFence)
             } else {

@@ -6,6 +6,7 @@ pub mod capabilities;
 pub mod claude;
 pub mod codex;
 pub mod conformance;
+pub mod dispatch;
 pub mod cursor;
 pub mod hook_bridge;
 pub mod host;

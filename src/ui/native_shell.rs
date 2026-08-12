@@ -1461,6 +1461,13 @@ pub enum NativeHostCommand {
         command_id: CommandId,
         issued_at_ms: i64,
     },
+    ProviderInput {
+        action_id: &'static str,
+        arguments: crate::client::action::ProviderInputArguments,
+        expected_task_revision: u64,
+        command_id: CommandId,
+        issued_at_ms: i64,
+    },
     /// Canonical `task.show` query via [`crate::client::action::task_show_query`].
     TaskShowQuery {
         request_id: RequestId,
@@ -1491,6 +1498,7 @@ fn native_command_id(command: &NativeHostCommand) -> Option<CommandId> {
         NativeHostCommand::TaskCreate { command_id, .. }
         | NativeHostCommand::TaskRename { command_id, .. } => Some(*command_id),
         NativeHostCommand::ServiceControl { command_id, .. } => Some(*command_id),
+        NativeHostCommand::ProviderInput { command_id, .. } => Some(*command_id),
         NativeHostCommand::TaskShowQuery { .. }
         | NativeHostCommand::TaskListQuery { .. }
         | NativeHostCommand::HostStatusQuery { .. }
@@ -3619,6 +3627,27 @@ async fn execute_native_command(
                 .await
                 .map(NativeHostExecutionResult::Command)
         }
+        NativeHostCommand::ProviderInput {
+            action_id,
+            arguments,
+            expected_task_revision,
+            command_id,
+            issued_at_ms,
+        } => {
+            let envelope = crate::client::action::provider_input_command(
+                command_id,
+                client.client_id(),
+                issued_at_ms,
+                expected_task_revision,
+                action_id,
+                arguments,
+            )
+            .map_err(|_| IpcError::Unavailable)?;
+            client
+                .execute_command(envelope)
+                .await
+                .map(NativeHostExecutionResult::Command)
+        }
         NativeHostCommand::TaskShowQuery {
             request_id,
             task_id,
@@ -4312,6 +4341,7 @@ impl NativeInteraction {
         let request_task = match &request {
             ActionRequest::TaskShow { task_id } => Some(*task_id),
             ActionRequest::TaskRename(arguments) => Some(arguments.task_id),
+            ActionRequest::ProviderInput(arguments) => Some(arguments.arguments.task_id),
             _ => None,
         };
         if request_task.is_some() && request_task != selected_task {
@@ -4324,6 +4354,19 @@ impl NativeInteraction {
                 // A valid host mutation must always carry a real durable
                 // revision. Revision zero is an invalid/unfenced sentinel.
                 if task.task.revision == 0 {
+                    return None;
+                }
+                (Some(task.task.revision), Some(task.task.action_epoch))
+            }
+            ActionRequest::ProviderInput(arguments) => {
+                let model = self.client_model.as_ref()?;
+                let task = model.tasks().get(&arguments.arguments.task_id)?;
+                if task.task.revision == 0
+                    || arguments.arguments.runtime_generation == 0
+                    || arguments.arguments.action_epoch == 0
+                    || arguments.arguments.action_epoch != task.task.action_epoch
+                    || arguments.arguments.runtime_generation != self.runtime_generation
+                {
                     return None;
                 }
                 (Some(task.task.revision), Some(task.task.action_epoch))
@@ -4364,6 +4407,14 @@ impl NativeInteraction {
             ActionRequest::ServiceControl { arguments, .. } => NativeHostCommand::ServiceControl {
                 action_id: request.id(),
                 arguments: arguments.clone(),
+                command_id,
+                issued_at_ms,
+            },
+            ActionRequest::ProviderInput(arguments) => NativeHostCommand::ProviderInput {
+                action_id: arguments.action_id,
+                arguments: arguments.arguments.clone(),
+                expected_task_revision: expected_task_revision
+                    .expect("provider input revision was validated above"),
                 command_id,
                 issued_at_ms,
             },

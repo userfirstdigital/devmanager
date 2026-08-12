@@ -1568,6 +1568,7 @@ struct HostWorkspaceAdmission {
 struct ConfiguredServiceRuntime {
     manager: crate::services::ProcessManager,
     host_id: crate::services::model::HostId,
+    provider_dispatch: crate::providers::dispatch::ProviderDispatchRuntime,
 }
 
 impl ConfiguredServiceRuntime {
@@ -1632,7 +1633,11 @@ impl ConfiguredServiceRuntime {
         manager
             .ensure_configured_service_supervisor(sources, host_id, unix_time_ms_u64())
             .ok()
-            .map(|()| Self { manager, host_id })
+            .map(|()| Self {
+                provider_dispatch: crate::providers::dispatch::ProviderDispatchRuntime::from_process_manager(manager.clone()),
+                manager,
+                host_id,
+            })
     }
 }
 
@@ -2161,6 +2166,7 @@ impl HostRequestExecutor {
     /// evidence without doing probes or process work in request dispatch.
     fn reconcile_configured_services(&mut self) {
         if let Some(runtime) = self.configured_service_runtime.as_mut() {
+            let _ = self.bus.run_provider_dispatch(&runtime.provider_dispatch);
             let _ = runtime.manager.configured_service_snapshots();
         }
     }

@@ -194,6 +194,14 @@ impl CommandBus {
         })
     }
 
+    /// Run one provider-input outbox pass on the host maintenance lane.
+    pub(crate) fn run_provider_dispatch(
+        &mut self,
+        runtime: &crate::providers::dispatch::ProviderDispatchRuntime,
+    ) -> Result<crate::providers::dispatch::ProviderDispatchOutcome, StoreError> {
+        runtime.run_once(&mut self.store)
+    }
+
     /// Execute a command through the owned store.
     pub fn execute(&mut self, envelope: CommandEnvelope) -> Result<CommandReceipt, StoreError> {
         if matches!(envelope.command, Command::PromptLibrary(_)) {

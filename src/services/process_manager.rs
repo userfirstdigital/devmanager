@@ -2760,6 +2760,31 @@ impl ProcessManager {
             .map_err(|_| ProviderInputDeliveryError::RuntimeAuthorityAbsent)
     }
 
+    pub(crate) fn live_provider_write_fence(
+        &self,
+        identity: &crate::providers::input::ProviderInputDeliveryIdentity,
+    ) -> Result<ManagedProcessFence, crate::providers::input::ProviderInputDeliveryError> {
+        use crate::providers::input::ProviderInputDeliveryError;
+        let book = self
+            .inner
+            .provider_runtime
+            .lock()
+            .map_err(|_| ProviderInputDeliveryError::RuntimeAuthorityAbsent)?;
+        let Some(live) = book.live.values().find(|live| {
+            live.task_id == identity.task_id
+                && live.agent_session_id == identity.agent_session_id
+                && live.provider_kind == identity.provider_kind
+                && live.provider_session_id.as_ref() == Some(&identity.provider_session_id)
+                && live.fence.resource().runtime_generation == identity.runtime_generation
+        }) else {
+            return Err(ProviderInputDeliveryError::SessionNotBound);
+        };
+        if live.fence.resource().runtime_generation != identity.runtime_generation {
+            return Err(ProviderInputDeliveryError::StaleGeneration);
+        }
+        Ok(live.fence.clone())
+    }
+
     pub fn paste_to_session(&self, session_id: &str, text: &str) -> Result<(), String> {
         let session = self.get_session(session_id)?;
         session.paste_text(text)
