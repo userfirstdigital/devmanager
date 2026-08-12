@@ -4494,6 +4494,10 @@ mod auth_timestamp_tests {
     #[test]
     fn retired_generation_survives_receipt_body_eviction_and_rejects_older_pending_probe() {
         let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let target_root = std::env::var_os("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .unwrap_or_else(|| manifest.join("target"));
         let fixture_name = if cfg!(windows) {
             "devmanager_provider_probe_fixture.exe"
         } else {
@@ -4505,15 +4509,8 @@ mod auth_timestamp_tests {
             "devmanager-provider-probe-fixture"
         };
         let source = [
-            manifest
-                .join("target")
-                .join("debug")
-                .join("deps")
-                .join(fixture_name),
-            manifest
-                .join("target")
-                .join("debug")
-                .join(root_fixture_name),
+            target_root.join("debug").join("deps").join(fixture_name),
+            target_root.join("debug").join(root_fixture_name),
         ]
         .into_iter()
         .find(|path| path.is_file())
