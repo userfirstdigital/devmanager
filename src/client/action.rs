@@ -1593,6 +1593,12 @@ mod tests {
                         ActionArgumentSchema::ProviderInputV1,
                         Some(Capability::ProviderInput),
                     ),
+                    ACTION_PROVIDER_START_SESSION => (
+                        ActionScope::Task,
+                        ActionRisk::Mutating,
+                        ActionArgumentSchema::TaskCockpitV1,
+                        Some(Capability::ProviderInput),
+                    ),
                     ACTION_SERVICE_START | ACTION_SERVICE_STOP | ACTION_SERVICE_RESTART => (
                         ActionScope::Host,
                         ActionRisk::Mutating,
