@@ -1,0 +1,14 @@
+{
+  "mutation_settlement": {
+    "schema_version": 1,
+    "receipt": {
+      "command_id": "0192f5d0-0000-7000-8000-000000000040",
+      "prompt_id": "0192f5d0-0000-7000-8000-000000000001",
+      "prompt_version_id": "0192f5d0-0000-7000-8000-000000000002",
+      "revision": 3
+    },
+    "library_revision": 7,
+    "request_id": "0192f5d0-0000-7000-8000-000000000070",
+    "settled": true
+  }
+}

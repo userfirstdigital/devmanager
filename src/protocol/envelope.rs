@@ -448,6 +448,12 @@ pub struct NegotiatedParameters {
     pub limits: FrameLimits,
 }
 
+/// Personal prompt library frames ride the existing owner-device session.
+/// This is not a Connect persistence or upload DTO.
+pub fn personal_prompt_library_granted(granted: CapabilitySet) -> bool {
+    granted.grants_personal_prompt_library()
+}
+
 pub const MAX_SERVER_BUILD_BYTES: u32 = MAX_CLIENT_BUILD_BYTES;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

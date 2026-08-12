@@ -20,6 +20,7 @@ use crate::domain::task::{
     ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity, TaskFacts,
     TaskLifecycle, WorkspaceRef,
 };
+use crate::prompts::{PromptCommand, PromptMutationReceipt};
 use crate::workspace::WorkspaceRequest;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -254,6 +255,7 @@ pub enum CommandReceipt {
         operation_id: OperationId,
         task_revision: Option<u64>,
         event_ids: Vec<EventId>,
+        prompt_mutation: Option<PromptMutationReceipt>,
     },
     Rejected {
         command_id: CommandId,
@@ -283,6 +285,7 @@ struct AcceptedReceiptRef<'a> {
     operation_id: &'a OperationId,
     task_revision: &'a Option<u64>,
     event_ids: &'a [EventId],
+    prompt_mutation: &'a Option<PromptMutationReceipt>,
 }
 
 impl Serialize for AcceptedReceiptRef<'_> {
@@ -290,11 +293,15 @@ impl Serialize for AcceptedReceiptRef<'_> {
     where
         S: Serializer,
     {
-        let mut map = serializer.serialize_map(Some(4))?;
+        let fields = 4 + usize::from(self.prompt_mutation.is_some());
+        let mut map = serializer.serialize_map(Some(fields))?;
         map.serialize_entry("command_id", self.command_id)?;
         map.serialize_entry("operation_id", self.operation_id)?;
         map.serialize_entry("task_revision", self.task_revision)?;
         map.serialize_entry("event_ids", self.event_ids)?;
+        if let Some(mutation) = self.prompt_mutation {
+            map.serialize_entry("prompt_mutation", mutation)?;
+        }
         map.end()
     }
 }
@@ -335,6 +342,7 @@ impl Serialize for CommandReceipt {
                 operation_id,
                 task_revision,
                 event_ids,
+                prompt_mutation,
             } => map.serialize_entry(
                 "accepted",
                 &AcceptedReceiptRef {
@@ -342,6 +350,7 @@ impl Serialize for CommandReceipt {
                     operation_id,
                     task_revision,
                     event_ids,
+                    prompt_mutation,
                 },
             )?,
             Self::Rejected {
@@ -411,14 +420,20 @@ impl<'de> DeserializeSeed<'de> for AcceptedReceiptSeed {
     }
 }
 
-const ACCEPTED_RECEIPT_FIELDS: &[&str] =
-    &["command_id", "operation_id", "task_revision", "event_ids"];
+const ACCEPTED_RECEIPT_FIELDS: &[&str] = &[
+    "command_id",
+    "operation_id",
+    "task_revision",
+    "event_ids",
+    "prompt_mutation",
+];
 
 enum AcceptedReceiptField {
     CommandId,
     OperationId,
     TaskRevision,
     EventIds,
+    PromptMutation,
 }
 
 impl<'de> Deserialize<'de> for AcceptedReceiptField {
@@ -444,6 +459,7 @@ impl<'de> Deserialize<'de> for AcceptedReceiptField {
                     "operation_id" => Ok(AcceptedReceiptField::OperationId),
                     "task_revision" => Ok(AcceptedReceiptField::TaskRevision),
                     "event_ids" => Ok(AcceptedReceiptField::EventIds),
+                    "prompt_mutation" => Ok(AcceptedReceiptField::PromptMutation),
                     _ => Err(de::Error::unknown_field(value, ACCEPTED_RECEIPT_FIELDS)),
                 }
             }
@@ -470,6 +486,7 @@ impl<'de> Visitor<'de> for AcceptedReceiptVisitor {
         let mut operation_id = None;
         let mut task_revision: Option<Option<u64>> = None;
         let mut event_ids = None;
+        let mut prompt_mutation = None;
 
         while let Some(field) = map.next_key()? {
             match field {
@@ -497,6 +514,12 @@ impl<'de> Visitor<'de> for AcceptedReceiptVisitor {
                     }
                     event_ids = Some(map.next_value()?);
                 }
+                AcceptedReceiptField::PromptMutation => {
+                    if prompt_mutation.is_some() {
+                        return Err(de::Error::duplicate_field("prompt_mutation"));
+                    }
+                    prompt_mutation = Some(map.next_value()?);
+                }
             }
         }
 
@@ -506,6 +529,7 @@ impl<'de> Visitor<'de> for AcceptedReceiptVisitor {
             task_revision: task_revision
                 .ok_or_else(|| de::Error::missing_field("task_revision"))?,
             event_ids: event_ids.ok_or_else(|| de::Error::missing_field("event_ids"))?,
+            prompt_mutation,
         })
     }
 }
@@ -931,6 +955,7 @@ pub enum Command {
     PresentProviderApproval(PresentProviderApprovalIntent),
     /// Journal ingress only. Host `ClientRequest` rejects this variant.
     SettleProviderWait(SettleProviderWaitIntent),
+    PromptLibrary(PromptCommand),
 }
 
 /// Canonical SHA-256 over client, task, expected revision, and command.
@@ -1100,6 +1125,7 @@ pub fn decide(
         Command::SettleProviderWait(intent) => {
             decide_settle_provider_wait(snapshot, envelope, intent)
         }
+        Command::PromptLibrary(_) => Err(RejectionCode::InvalidTransition),
     }
 }
 

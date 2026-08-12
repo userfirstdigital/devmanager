@@ -40,8 +40,9 @@ pub use host::{
 };
 pub use id::{
     AgentSessionId, ApprovalId, ArtifactId, BrowserContextId, ClientId, CommandId, EnvironmentId,
-    EventId, IdError, OperationId, OutboxId, ProjectId, QuestionId, RequestId, ResourceId,
-    ServiceId, SnapshotId, SubscriptionId, TaskId, TerminalId, TransferId, TurnId,
+    EventId, IdError, OperationId, OutboxId, ProjectId, PromptChainId, PromptChainLinkId,
+    PromptHistoryId, PromptId, PromptVersionId, QuestionId, RequestId, ResourceId, ServiceId,
+    SnapshotId, SubscriptionId, TaskId, TerminalId, TransferId, TurnId,
 };
 pub use operation::{
     validate_outcome_fence, validate_source_for_kind, validate_terminal_fact_source,

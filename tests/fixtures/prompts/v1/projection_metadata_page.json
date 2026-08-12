@@ -1,0 +1,26 @@
+{
+  "metadata_page": {
+    "schema_version": 1,
+    "library_revision": 7,
+    "namespace": "personal",
+    "items": [
+      {
+        "id": "0192f5d0-0000-7000-8000-000000000001",
+        "title": "Sanitized review prompt",
+        "description": "Metadata-only fixture for prompt projection tests.",
+        "tags": [
+          "rust",
+          "review"
+        ],
+        "current_version_id": "0192f5d0-0000-7000-8000-000000000002",
+        "revision": 1,
+        "archived_at_ms": null,
+        "namespace": "personal",
+        "privacy_class": "local_only",
+        "unknown_fields": []
+      }
+    ],
+    "next_cursor": null,
+    "encoded_bytes": 450
+  }
+}

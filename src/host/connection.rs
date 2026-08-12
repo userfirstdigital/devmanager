@@ -1976,6 +1976,11 @@ impl HostRequestExecutor {
                     negotiated.capabilities,
                     &envelope.command,
                 )?;
+                if matches!(envelope.command, Command::PromptLibrary(_))
+                    && !negotiated.capabilities.grants_personal_prompt_library()
+                {
+                    return Err(IpcError::UnsupportedCapability);
+                }
                 let connection_id = output_id
                     .map(ConnectionOutputId::as_uuid)
                     .unwrap_or(Uuid::nil());
@@ -2221,6 +2226,17 @@ impl HostRequestExecutor {
                     });
                 }
                 self.bus.query(envelope).map_err(map_store_error)
+            }
+            Query::PromptLibrary(_) => {
+                if !negotiated.capabilities.grants_personal_prompt_library() {
+                    return Ok(QueryReply {
+                        request_id: envelope.request_id,
+                        outcome: QueryOutcome::Err(QueryError::UnsupportedCapability),
+                    });
+                }
+                self.bus
+                    .query_with_capabilities(negotiated.capabilities, envelope)
+                    .map_err(map_store_error)
             }
             Query::OperationStatus { .. } | Query::TaskSnapshot => {
                 self.bus.query(envelope).map_err(map_store_error)
@@ -2975,6 +2991,16 @@ fn map_artifact_content_error(error: ArtifactContentError) -> Result<QueryOutcom
     }
 }
 
+/// Authenticated host request seam used by tests and the compatibility path.
+pub fn dispatch_host_request(
+    authenticated_client_id: ClientId,
+    capabilities: CapabilitySet,
+    bus: &mut CommandBus,
+    request: ClientRequest,
+) -> Result<ServerMessage, IpcError> {
+    dispatch_authenticated_request(authenticated_client_id, capabilities, bus, request)
+}
+
 /// Authenticated client_id check plus CommandBus execute/query dispatch.
 ///
 /// Used by the exclusive [`super::ipc::HostConnection::serve_request`]
@@ -2982,8 +3008,9 @@ fn map_artifact_content_error(error: ArtifactContentError) -> Result<QueryOutcom
 /// unsupported here; the single executor owns those registries.
 ///
 /// `capabilities` are the negotiated grant set from Hello; capability-gated
-/// bus queries (currently [`Query::InspectHostQuit`]) fail closed here the
-/// same way [`HostRequestExecutor`] does.
+/// bus queries (currently [`Query::InspectHostQuit`] and
+/// [`Query::PromptLibrary`]) fail closed here the same way
+/// [`HostRequestExecutor`] does.
 pub(crate) fn dispatch_authenticated_request(
     authenticated_client_id: ClientId,
     capabilities: CapabilitySet,
@@ -3028,6 +3055,11 @@ fn dispatch_authenticated_request_inner(
                 return Err(IpcError::UnsupportedCapability);
             }
             validate_authenticated_command_capability(capabilities, &envelope.command)?;
+            if matches!(envelope.command, Command::PromptLibrary(_))
+                && !capabilities.grants_personal_prompt_library()
+            {
+                return Err(IpcError::UnsupportedCapability);
+            }
             // The compatibility transport has no resumable connection
             // identity. Keep its receipt unbound so a later registered output
             // can claim the exact same receipt once.
@@ -3075,6 +3107,18 @@ fn dispatch_authenticated_request_inner(
                             outcome: QueryOutcome::Err(QueryError::UnsupportedCapability),
                         }));
                     }
+                }
+                Query::PromptLibrary(_) => {
+                    if !capabilities.grants_personal_prompt_library() {
+                        return Ok(ServerMessage::QueryReply(QueryReply {
+                            request_id: envelope.request_id,
+                            outcome: QueryOutcome::Err(QueryError::UnsupportedCapability),
+                        }));
+                    }
+                    let reply = bus
+                        .query_with_capabilities(capabilities, envelope)
+                        .map_err(map_store_error)?;
+                    return Ok(ServerMessage::QueryReply(reply));
                 }
                 Query::OperationStatus { .. } | Query::TaskSnapshot => {}
             }

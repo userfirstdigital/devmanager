@@ -180,3 +180,8 @@ define_id!(OutboxId);
 define_id!(TurnId);
 define_id!(QuestionId);
 define_id!(ApprovalId);
+define_id!(PromptId);
+define_id!(PromptVersionId);
+define_id!(PromptChainId);
+define_id!(PromptChainLinkId);
+define_id!(PromptHistoryId);

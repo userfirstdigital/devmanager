@@ -829,6 +829,7 @@ async fn serve_foreground_host(
             Capability::EventReplay,
             Capability::OperationSettlement,
             Capability::ChunkResume,
+            Capability::PromptProjection,
             Capability::ExplicitDetach,
             Capability::HostShutdown,
         ]),

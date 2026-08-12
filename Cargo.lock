@@ -2020,6 +2020,7 @@ dependencies = [
  "tower",
  "tower-http",
  "unicode-normalization",
+ "unicode-segmentation",
  "ureq",
  "url",
  "uuid",

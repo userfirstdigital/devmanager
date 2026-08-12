@@ -4,6 +4,7 @@
 pub mod action;
 pub mod cli;
 pub mod command_center;
+pub mod composer;
 mod connection;
 mod host_client;
 pub mod inbox_controller;
@@ -12,11 +13,15 @@ pub mod preferences;
 pub mod subscription;
 
 pub use action::{
-    catalog, require_unique_ids, task_show_query, ActionDescriptor, ActionRisk, ActionScope,
-    ACTION_HOST_ACTIONS, ACTION_HOST_STATUS, ACTION_TASK_SHOW,
+    ACTION_HOST_ACTIONS, ACTION_HOST_STATUS, ACTION_TASK_SHOW, ActionDescriptor, ActionRisk,
+    ActionScope, catalog, require_unique_ids, task_show_query,
 };
-pub use cli::{dispatch_ctl_from_args, parse_ctl_args, run_ctl, CliError, CtlCommand};
-pub use connection::{connect, perform_client_hello, ClientConnection, UnsolicitedServerMessage};
+pub use cli::{CliError, CtlCommand, dispatch_ctl_from_args, parse_ctl_args, run_ctl};
+pub use composer::{
+    ComposerDraft, ComposerInsertionMode, ExactPromptPayload, ProviderCommandSuggestion,
+    PutPromptVersionInComposer, apply_put_prompt_version, put_prompt_version_in_composer,
+};
+pub use connection::{ClientConnection, UnsolicitedServerMessage, connect, perform_client_hello};
 pub use host_client::{
     ArtifactContentBatch, EventReplayBatch, HostClient, HostClientConfig, TrackedOperation,
 };

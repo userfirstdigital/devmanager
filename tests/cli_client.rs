@@ -217,7 +217,7 @@ impl ChildGuard {
                 Ok(Some(status)) => return Ok(status),
                 Ok(None) if started.elapsed() < deadline => thread::sleep(POLL),
                 Ok(None) => {
-                    return Err(format!("exact pid {pid} did not exit within {deadline:?}"))
+                    return Err(format!("exact pid {pid} did not exit within {deadline:?}"));
                 }
                 Err(error) => return Err(format!("wait exact pid {pid}: {error}")),
             }
@@ -316,8 +316,8 @@ fn action_catalog_ids_are_unique_and_classified() {
     let catalog = action::catalog();
     assert_eq!(
         catalog.len(),
-        12,
-        "slice exposes host/task actions plus executable provider input controls"
+        action::registered_actions().count(),
+        "catalog() is the single host action registry"
     );
 
     let mut ids = Vec::new();

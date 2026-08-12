@@ -12,6 +12,10 @@ use crate::domain::snapshot::{
     ArtifactContentPage as ArtifactContentPageBody, EventPage, SnapshotPage, SnapshotSection,
     TaskSnapshotItem,
 };
+use crate::prompts::projection::{
+    decode_prompt_projection_document, encode_prompt_projection_document, PromptLibraryQuery,
+    PromptProjectionReply,
+};
 
 struct QueryBinaryRef<'a>(&'a [u8]);
 
@@ -217,6 +221,8 @@ pub enum Query {
     },
     /// Global host-quit inspection over durable projections only.
     InspectHostQuit,
+    /// Bounded personal prompt library projection.
+    PromptLibrary(PromptLibraryQuery),
 }
 
 struct OperationStatusQueryRef<'a> {
@@ -439,6 +445,7 @@ impl Serialize for Query {
                 &ReleaseArtifactContentQueryRef { subscription_id },
             )?,
             Self::InspectHostQuit => map.serialize_entry("inspect_host_quit", &EmptyNamedMap)?,
+            Self::PromptLibrary(query) => map.serialize_entry("prompt_library", query)?,
         }
         map.end()
     }
@@ -456,6 +463,7 @@ enum QueryVariant {
     ContinueArtifactContent,
     ReleaseArtifactContent,
     InspectHostQuit,
+    PromptLibrary,
 }
 
 impl<'de> Deserialize<'de> for QueryVariant {
@@ -470,7 +478,7 @@ impl<'de> Deserialize<'de> for QueryVariant {
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 formatter.write_str(
-                    "operation_status, task_snapshot, snapshot_page, release_snapshot, open_event_replay, continue_event_replay, release_event_replay, open_artifact_content, continue_artifact_content, release_artifact_content, or inspect_host_quit",
+                    "operation_status, task_snapshot, snapshot_page, release_snapshot, open_event_replay, continue_event_replay, release_event_replay, open_artifact_content, continue_artifact_content, release_artifact_content, inspect_host_quit, or prompt_library",
                 )
             }
 
@@ -490,6 +498,7 @@ impl<'de> Deserialize<'de> for QueryVariant {
                     "continue_artifact_content" => Ok(QueryVariant::ContinueArtifactContent),
                     "release_artifact_content" => Ok(QueryVariant::ReleaseArtifactContent),
                     "inspect_host_quit" => Ok(QueryVariant::InspectHostQuit),
+                    "prompt_library" => Ok(QueryVariant::PromptLibrary),
                     _ => Err(de::Error::unknown_variant(
                         value,
                         &[
@@ -504,6 +513,7 @@ impl<'de> Deserialize<'de> for QueryVariant {
                             "continue_artifact_content",
                             "release_artifact_content",
                             "inspect_host_quit",
+                            "prompt_library",
                         ],
                     )),
                 }
@@ -1383,6 +1393,13 @@ impl<'de> Deserialize<'de> for Query {
                         let _: EmptyNamedMap = map.next_value()?;
                         Query::InspectHostQuit
                     }
+                    QueryVariant::PromptLibrary => {
+                        let query: PromptLibraryQuery = map.next_value()?;
+                        query
+                            .validate_bounds()
+                            .map_err(|error| de::Error::custom(format!("{error:?}")))?;
+                        Query::PromptLibrary(query)
+                    }
                 };
                 if map.next_key::<de::IgnoredAny>()?.is_some() {
                     return Err(de::Error::custom("Query must contain exactly one variant"));
@@ -1427,6 +1444,7 @@ pub enum QueryResult {
     HostQuitInspection {
         inspection: HostQuitInspection,
     },
+    PromptLibrary(PromptProjectionReply),
 }
 
 struct OperationStatusResultRef<'a> {
@@ -1629,6 +1647,14 @@ impl Serialize for QueryResult {
                 "host_quit_inspection",
                 &HostQuitInspectionResultRef { inspection },
             )?,
+            Self::PromptLibrary(reply) => {
+                let packed = encode_prompt_projection_document(reply).map_err(|error| {
+                    serde::ser::Error::custom(format!(
+                        "sealed prompt_library encode failed: {error:?}"
+                    ))
+                })?;
+                map.serialize_entry("prompt_library", &QueryBinaryRef(&packed))?;
+            }
         }
         map.end()
     }
@@ -1644,6 +1670,7 @@ enum QueryResultVariant {
     ArtifactContentPage,
     ArtifactContentReleased,
     HostQuitInspection,
+    PromptLibrary,
 }
 
 impl<'de> Deserialize<'de> for QueryResultVariant {
@@ -1658,7 +1685,7 @@ impl<'de> Deserialize<'de> for QueryResultVariant {
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 formatter.write_str(
-                    "operation_status, task_snapshot, snapshot_page, snapshot_released, event_replay_page, event_replay_released, artifact_content_page, artifact_content_released, or host_quit_inspection",
+                    "operation_status, task_snapshot, snapshot_page, snapshot_released, event_replay_page, event_replay_released, artifact_content_page, artifact_content_released, host_quit_inspection, or prompt_library",
                 )
             }
 
@@ -1676,6 +1703,7 @@ impl<'de> Deserialize<'de> for QueryResultVariant {
                     "artifact_content_page" => Ok(QueryResultVariant::ArtifactContentPage),
                     "artifact_content_released" => Ok(QueryResultVariant::ArtifactContentReleased),
                     "host_quit_inspection" => Ok(QueryResultVariant::HostQuitInspection),
+                    "prompt_library" => Ok(QueryResultVariant::PromptLibrary),
                     _ => Err(de::Error::unknown_variant(
                         value,
                         &[
@@ -1688,6 +1716,7 @@ impl<'de> Deserialize<'de> for QueryResultVariant {
                             "artifact_content_page",
                             "artifact_content_released",
                             "host_quit_inspection",
+                            "prompt_library",
                         ],
                     )),
                 }
@@ -2506,6 +2535,14 @@ impl<'de> Deserialize<'de> for QueryResult {
                             inspection: payload.inspection,
                         }
                     }
+                    QueryResultVariant::PromptLibrary => {
+                        let QueryBinary(packed) = map.next_value()?;
+                        QueryResult::PromptLibrary(
+                            decode_prompt_projection_document(&packed).map_err(|_| {
+                                de::Error::custom("invalid sealed prompt_library query result")
+                            })?,
+                        )
+                    }
                 };
                 if map.next_key::<de::IgnoredAny>()?.is_some() {
                     return Err(de::Error::custom(
@@ -2530,11 +2567,29 @@ pub enum QueryError {
         oldest_sequence: u64,
         newest_sequence: u64,
     },
+    Unavailable {
+        reason: &'static str,
+    },
 }
 
 struct ReplayUnavailableErrorRef {
     oldest_sequence: u64,
     newest_sequence: u64,
+}
+
+struct UnavailableErrorRef {
+    reason: &'static str,
+}
+
+impl Serialize for UnavailableErrorRef {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(1))?;
+        map.serialize_entry("reason", &self.reason)?;
+        map.end()
+    }
 }
 
 impl Serialize for ReplayUnavailableErrorRef {
@@ -2573,12 +2628,18 @@ impl Serialize for QueryError {
                 )?;
                 map.end()
             }
+            Self::Unavailable { reason } => {
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry("unavailable", &UnavailableErrorRef { reason })?;
+                map.end()
+            }
         }
     }
 }
 
 enum QueryErrorMapVariant {
     ReplayUnavailable,
+    Unavailable,
 }
 
 impl<'de> Deserialize<'de> for QueryErrorMapVariant {
@@ -2592,7 +2653,7 @@ impl<'de> Deserialize<'de> for QueryErrorMapVariant {
             type Value = QueryErrorMapVariant;
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str("replay_unavailable")
+                formatter.write_str("replay_unavailable or unavailable")
             }
 
             fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
@@ -2601,6 +2662,7 @@ impl<'de> Deserialize<'de> for QueryErrorMapVariant {
             {
                 match value {
                     "replay_unavailable" => Ok(QueryErrorMapVariant::ReplayUnavailable),
+                    "unavailable" => Ok(QueryErrorMapVariant::Unavailable),
                     _ => Err(de::Error::unknown_variant(
                         value,
                         &[
@@ -2609,6 +2671,7 @@ impl<'de> Deserialize<'de> for QueryErrorMapVariant {
                             "invalid_request",
                             "unsupported_capability",
                             "replay_unavailable",
+                            "unavailable",
                         ],
                     )),
                 }
@@ -2711,6 +2774,96 @@ impl<'de> Deserialize<'de> for ReplayUnavailableErrorPayload {
     }
 }
 
+struct UnavailableErrorPayload {
+    reason: &'static str,
+}
+
+enum UnavailableErrorField {
+    Reason,
+}
+
+impl<'de> Deserialize<'de> for UnavailableErrorField {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct FieldVisitor;
+
+        impl Visitor<'_> for FieldVisitor {
+            type Value = UnavailableErrorField;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("reason")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                match value {
+                    "reason" => Ok(UnavailableErrorField::Reason),
+                    _ => Err(de::Error::unknown_field(value, &["reason"])),
+                }
+            }
+        }
+
+        deserializer.deserialize_identifier(FieldVisitor)
+    }
+}
+
+fn intern_unavailable_reason(reason: &str) -> Option<&'static str> {
+    match reason {
+        "search_index" => Some("search_index"),
+        "history_store" => Some("history_store"),
+        "organization_namespace" => Some("organization_namespace"),
+        "chain_directory" => Some("chain_directory"),
+        "owner_device_session" => Some("owner_device_session"),
+        _ => None,
+    }
+}
+
+impl<'de> Deserialize<'de> for UnavailableErrorPayload {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct PayloadVisitor;
+
+        impl<'de> Visitor<'de> for PayloadVisitor {
+            type Value = UnavailableErrorPayload;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a named unavailable error payload map")
+            }
+
+            fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                let mut reason = None;
+                while let Some(field) = map.next_key()? {
+                    match field {
+                        UnavailableErrorField::Reason => {
+                            if reason.is_some() {
+                                return Err(de::Error::duplicate_field("reason"));
+                            }
+                            let value: String = map.next_value()?;
+                            reason = Some(intern_unavailable_reason(&value).ok_or_else(|| {
+                                de::Error::unknown_variant(&value, &["search_index"])
+                            })?);
+                        }
+                    }
+                }
+                Ok(UnavailableErrorPayload {
+                    reason: reason.ok_or_else(|| de::Error::missing_field("reason"))?,
+                })
+            }
+        }
+
+        deserializer.deserialize_map(PayloadVisitor)
+    }
+}
+
 impl<'de> Deserialize<'de> for QueryError {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -2760,6 +2913,12 @@ impl<'de> Deserialize<'de> for QueryError {
                         QueryError::ReplayUnavailable {
                             oldest_sequence: payload.oldest_sequence,
                             newest_sequence: payload.newest_sequence,
+                        }
+                    }
+                    QueryErrorMapVariant::Unavailable => {
+                        let payload: UnavailableErrorPayload = map.next_value()?;
+                        QueryError::Unavailable {
+                            reason: payload.reason,
                         }
                     }
                 };

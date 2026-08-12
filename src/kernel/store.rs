@@ -882,9 +882,15 @@ fn detect_interrupted_partial_schema(
         "SELECT COUNT(*) FROM sqlite_schema
          WHERE type = 'table'
            AND name IN ('events', 'tasks', 'operations', 'command_receipts', 'outbox',
-                        'agent_sessions', 'artifacts', 'resources', 'event_retention',
-                        'host_admission', 'host_cleanup_branches',
-                        'semantic_journal_sessions', 'semantic_journal_facts')",
+                         'agent_sessions', 'artifacts', 'resources', 'event_retention',
+                         'host_admission', 'host_cleanup_branches',
+                         'semantic_journal_sessions', 'semantic_journal_facts',
+                         'saved_prompts', 'prompt_versions', 'prompt_tags',
+                         'prompt_version_variables', 'prompt_chains',
+                         'prompt_chain_links', 'prompt_chain_command_receipts',
+                         'prompt_chain_events', 'prompt_command_receipts',
+                         'prompt_events', 'prompt_history', 'prompt_history_policy',
+                         'prompt_search_state', 'prompt_search_pending')",
         [],
         |row| row.get(0),
     )?;
@@ -913,6 +919,23 @@ fn detect_interrupted_partial_schema(
     }
     if applied.is_empty() && partial > 0 {
         return Err(StoreError::MigrationInterrupted);
+    }
+    let latest = applied.last().map(|row| row.version).unwrap_or(0);
+    if latest < 13 {
+        let v10_partial: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_schema
+             WHERE name IN (
+                'prompt_history', 'prompt_history_policy', 'prompt_search_state',
+                'prompt_search_pending', 'prompt_search', 'idx_prompt_history_submitted',
+                'prompt_search_data', 'prompt_search_idx', 'prompt_search_content',
+                'prompt_search_docsize', 'prompt_search_config'
+             )",
+            [],
+            |row| row.get(0),
+        )?;
+        if v10_partial > 0 {
+            return Err(StoreError::MigrationInterrupted);
+        }
     }
     Ok(())
 }
