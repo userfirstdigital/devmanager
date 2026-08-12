@@ -8,7 +8,8 @@
 
 use crate::domain::operation::ResourceFence;
 use crate::domain::{
-    AgentRole, AgentSessionFacts, AgentSessionId, ProviderSessionId, ResourceId, TaskId, TerminalId,
+    AgentResourceBinding, AgentRole, AgentSessionFacts, AgentSessionId, ProviderSessionId,
+    ResourceId, TaskId, TerminalId,
 };
 use crate::process::identity::{ManagedProcessId, ProcessOwner};
 use crate::process::registry::ManagedProcessFence;
@@ -4986,8 +4987,58 @@ impl<L: ProviderProcessLauncher, S: ProviderSessionStateStore> ProviderSessionMa
         &mut self,
         request: StartProviderSessionRequest,
     ) -> Result<ProviderRuntime, ProviderSessionError> {
+        self.start_internal(request, None)
+    }
+
+    /// Start one stock runtime against the exact durable task/resource claim.
+    ///
+    /// The binding is issued by the kernel after joining the current agent and
+    /// task-owned terminal projections.  Production callers use this method so
+    /// the provider session manager does not allocate a substitute resource or
+    /// generation while launching the native terminal.
+    pub fn start_with_resource_binding(
+        &mut self,
+        request: StartProviderSessionRequest,
+        binding: AgentResourceBinding,
+    ) -> Result<ProviderRuntime, ProviderSessionError> {
+        self.start_internal(request, Some(binding))
+    }
+
+    fn start_internal(
+        &mut self,
+        request: StartProviderSessionRequest,
+        binding: Option<AgentResourceBinding>,
+    ) -> Result<ProviderRuntime, ProviderSessionError> {
         self.ensure_request_admissible(&request)?;
         let agent_id = request.agent.id;
+        if let Some(binding) = binding {
+            if binding.task_id != request.agent.task_id {
+                return Err(ProviderSessionError::WrongTask {
+                    expected: binding.task_id,
+                    actual: request.agent.task_id,
+                });
+            }
+            if binding.agent_session_id != agent_id {
+                return Err(ProviderSessionError::WrongAgentSession {
+                    expected: binding.agent_session_id,
+                    actual: agent_id,
+                });
+            }
+            if binding.provider_kind != request.agent.provider_kind {
+                return Err(ProviderSessionError::WrongProviderKind {
+                    expected: binding.provider_kind,
+                    actual: request.agent.provider_kind,
+                });
+            }
+            if binding.runtime_generation == 0
+                || binding.runtime_generation != request.agent.runtime_generation
+            {
+                return Err(ProviderSessionError::StaleGeneration {
+                    expected: binding.runtime_generation,
+                    actual: request.agent.runtime_generation,
+                });
+            }
+        }
         self.retry_recovery_releases(Some(agent_id))?;
         let persisted = self.load_state(agent_id)?;
         let provider_session_id = provider_session_id_for_request(&request, persisted.as_ref())?;
@@ -5066,11 +5117,29 @@ impl<L: ProviderProcessLauncher, S: ProviderSessionStateStore> ProviderSessionMa
                 self.recover_persisted_state(state)?;
             }
         }
-        let generation = self.allocate_generation(
-            agent_id,
-            request.agent.runtime_generation,
-            persisted.as_ref().map(ProviderSessionState::generation),
-        )?;
+        let generation = if let Some(binding) = binding {
+            if persisted
+                .as_ref()
+                .is_some_and(|state| state.generation >= binding.runtime_generation)
+            {
+                return Err(ProviderSessionError::StaleGeneration {
+                    expected: persisted
+                        .as_ref()
+                        .map(ProviderSessionState::generation)
+                        .unwrap_or(binding.runtime_generation),
+                    actual: binding.runtime_generation,
+                });
+            }
+            self.next_generation
+                .insert(agent_id, binding.runtime_generation.saturating_add(1));
+            binding.runtime_generation
+        } else {
+            self.allocate_generation(
+                agent_id,
+                request.agent.runtime_generation,
+                persisted.as_ref().map(ProviderSessionState::generation),
+            )?
+        };
         let action_epoch = self.allocate_action_epoch(
             agent_id,
             persisted.as_ref().map(ProviderSessionState::action_epoch),
@@ -5083,7 +5152,7 @@ impl<L: ProviderProcessLauncher, S: ProviderSessionStateStore> ProviderSessionMa
             action_epoch,
             launch_nonce: LaunchNonce::new(),
         };
-        let resource_id = ResourceId::new();
+        let resource_id = binding.map_or_else(ResourceId::new, |binding| binding.resource_id);
         let terminal_id = TerminalId::new();
         let launch_spec = ProviderLaunchSpec {
             provider_kind: request.agent.provider_kind,

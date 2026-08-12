@@ -1688,6 +1688,87 @@ impl ProcessManager {
             .start(request)
     }
 
+    /// Start one stock Claude/Codex/Cursor runtime through the provider-owned
+    /// controller and the exact durable task/resource binding. The controller
+    /// performs subscription admission and exact-resume validation before the
+    /// ProcessManager creates the single native terminal process.
+    pub fn start_production_stock_provider_session(
+        &self,
+        binding: crate::domain::AgentResourceBinding,
+        agent: crate::domain::AgentSessionFacts,
+        observation: &crate::providers::registry::ProviderObservation,
+        input: Option<crate::providers::adapter::ProviderInput>,
+        cwd: PathBuf,
+        environment: std::collections::BTreeMap<
+            std::ffi::OsString,
+            std::ffi::OsString,
+        >,
+        mode: crate::providers::session::ProviderSessionStartMode,
+    ) -> Result<
+        crate::providers::session::ProviderRuntime,
+        crate::providers::controller::StockProviderSessionError,
+    > {
+        let adapter = self
+            .inner
+            .provider_host
+            .adapter(agent.provider_kind)
+            .ok_or(crate::providers::controller::StockProviderSessionError::Adapter(
+                crate::providers::adapter::ProviderError::ProviderNotRegistered(
+                    agent.provider_kind,
+                ),
+            ))?;
+        let mut slot = self.inner.provider_sessions.lock().map_err(|_| {
+            crate::providers::controller::StockProviderSessionError::Session(
+                crate::providers::session::ProviderSessionError::StateStore(
+                    "provider session manager lock poisoned".to_string(),
+                ),
+            )
+        })?;
+        if slot.is_none() {
+            let root = crate::persistence::app_config_dir().map_err(|error| {
+                crate::providers::controller::StockProviderSessionError::Session(
+                    crate::providers::session::ProviderSessionError::StateStore(
+                        error.to_string(),
+                    ),
+                )
+            })?;
+            std::fs::create_dir_all(&root).map_err(|error| {
+                crate::providers::controller::StockProviderSessionError::Session(
+                    crate::providers::session::ProviderSessionError::StateStore(
+                        error.to_string(),
+                    ),
+                )
+            })?;
+            let store = crate::providers::session::SqliteProviderSessionStateStore::open(
+                root.join("provider-sessions.sqlite3"),
+            )
+            .map_err(|error| {
+                crate::providers::controller::StockProviderSessionError::Session(
+                    crate::providers::session::ProviderSessionError::StateStore(error),
+                )
+            })?;
+            *slot = Some(
+                crate::providers::session::ProviderSessionManager::with_state_store(
+                    self.provider_process_launcher(),
+                    store,
+                ),
+            );
+        }
+        crate::providers::controller::StockProviderSessionController::new()
+            .start_with_resource_binding(
+                slot.as_mut()
+                    .expect("production provider manager initialized"),
+                binding,
+                agent,
+                observation,
+                adapter.as_ref(),
+                input,
+                cwd,
+                environment,
+                mode,
+            )
+    }
+
     pub fn admit_stock_provider_launch(
         &self,
         kind: ProviderKind,
@@ -2446,8 +2527,14 @@ impl ProcessManager {
                 None,
                 self.inner.runtime_state.clone(),
                 self.inner.debug_enabled,
-                None,
-                None,
+                Some(session_change_notifier(
+                    self.inner.clone(),
+                    session_id.clone(),
+                )),
+                Some(session_output_notifier(
+                    self.inner.clone(),
+                    session_id.clone(),
+                )),
                 authority,
             )
             .map_err(|_| match request.launch_spec().mode() {

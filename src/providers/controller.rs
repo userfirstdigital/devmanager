@@ -7,7 +7,7 @@
 //! auth receipt). Unknown, API-key, and auth-required snapshots fail closed
 //! and never open a fresh conversation.
 
-use crate::domain::{AgentSessionFacts, ProviderSessionId};
+use crate::domain::{AgentResourceBinding, AgentSessionFacts, ProviderSessionId};
 use crate::providers::adapter::{ProviderAdapter, ProviderError, ProviderInput};
 use crate::providers::capabilities::{ProviderAuthState, ProviderKind};
 use crate::providers::registry::ProviderObservation;
@@ -57,6 +57,34 @@ impl StockProviderSessionController {
             start_request_from_adapter(agent, observation, adapter, input, cwd, environment, mode)?;
         manager
             .start(request)
+            .map_err(StockProviderSessionError::from)
+    }
+
+    /// Start through the exact durable task/resource binding. This is the
+    /// production path for a task-owned native terminal; it cannot allocate a
+    /// replacement resource or silently advance to a different generation.
+    pub fn start_with_resource_binding<L, S>(
+        &self,
+        manager: &mut ProviderSessionManager<L, S>,
+        binding: AgentResourceBinding,
+        agent: AgentSessionFacts,
+        observation: &ProviderObservation,
+        adapter: &dyn ProviderAdapter,
+        input: Option<ProviderInput>,
+        cwd: PathBuf,
+        environment: BTreeMap<OsString, OsString>,
+        mode: ProviderSessionStartMode,
+    ) -> Result<ProviderRuntime, StockProviderSessionError>
+    where
+        L: ProviderProcessLauncher,
+        S: ProviderSessionStateStore,
+    {
+        reject_cursor_exact_resume(observation.kind(), mode, agent.provider_session_id.as_ref())?;
+        reject_unauthenticated_observation(observation, mode, agent.provider_session_id.as_ref())?;
+        let request =
+            start_request_from_adapter(agent, observation, adapter, input, cwd, environment, mode)?;
+        manager
+            .start_with_resource_binding(request, binding)
             .map_err(StockProviderSessionError::from)
     }
 }
