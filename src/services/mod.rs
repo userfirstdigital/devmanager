@@ -9,6 +9,7 @@ pub mod platform_service;
 pub mod ports_service;
 mod process_manager;
 mod process_ops;
+mod provider_process_launcher;
 pub mod pwsh_probe;
 pub mod scanner_service;
 mod session_manager;
@@ -35,6 +36,7 @@ pub use ports_service::*;
 pub(crate) use process_manager::ai_session_needs_restore;
 pub use process_manager::{ManagedShutdownReport, ProcessManager, RemoteSessionEvent};
 pub use process_ops::{ProcessOpCompletion, ProcessOpKind};
+pub use provider_process_launcher::ProcessManagerProviderLauncher;
 pub use scanner_service::*;
 pub use session_manager::{ConfigImportMode, SessionManager};
 pub use supervisor::{

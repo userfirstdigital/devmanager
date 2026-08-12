@@ -3,7 +3,7 @@
 //! This module does not own task state, roles, or a RAM journal. Durable
 //! primary/specialist transitions live in `domain::command::decide` and
 //! `domain::event::apply`. Session launch and destination input settlement
-//! remain typed HOLDs when the missing authority is outside provider scope.
+//! use ProcessManager Job/PTY authority and journal lineage when present.
 //!
 //! The approved task model is exactly one Primary plus optional Specialists.
 //! Native-child observation is not a second harness; subprocess evidence stays
@@ -26,13 +26,14 @@ pub enum OrchestrationHold {
 }
 
 pub fn specialist_cancel_hold() -> OrchestrationHold {
-    // Cancel still requires process/runtime authority owned outside providers.
+    // Returned when exact Job/PTY cancel cannot be bound to this specialist
+    // generation (stale facts, fence mismatch, or teardown failure).
     OrchestrationHold::ProviderRuntimeAuthorityAbsent
 }
 
 pub fn specialist_write_hold() -> OrchestrationHold {
-    // Writable specialist workspaces need process capability binding outside
-    // the provider-owned policy seam.
+    // Returned when the live provider write handle is missing or does not
+    // match this specialist generation/session fence.
     OrchestrationHold::ProcessCapabilityUnbound
 }
 

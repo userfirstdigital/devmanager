@@ -311,6 +311,16 @@ impl KernelStore {
         command_bus::record_dispatch_completion(self, permit, completion)
     }
 
+    /// Settle DeliverProviderInput only after a live managed-session write
+    /// receipt matches the exact Effect identity, action, and bounded bytes.
+    pub fn settle_provider_input_delivery(
+        &mut self,
+        permit: &DispatchPermit,
+        receipt: &crate::providers::input::ProviderInputWriteReceipt,
+    ) -> Result<OperationState, StoreError> {
+        command_bus::settle_provider_input_delivery(self, permit, receipt)
+    }
+
     /// Conservatively recover one started attempt whose external result is ambiguous.
     pub fn record_dispatch_ambiguity(
         &mut self,

@@ -8,6 +8,7 @@ pub mod codex;
 pub mod conformance;
 pub mod cursor;
 pub mod hook_bridge;
+pub mod host;
 pub mod input;
 pub mod journal;
 pub mod orchestrator;
@@ -34,13 +35,12 @@ pub use capabilities::{
     ProviderAuthEvidenceSource, ProviderAuthProbeInvocation, ProviderAuthProbeResult,
     ProviderAuthState, ProviderCapabilities, ProviderCapabilitiesError, ProviderCapability,
     ProviderDiscoveryCandidate, ProviderDiscoveryCandidateInput, ProviderDiscoveryContract,
-    ProviderDiscoveryError, ProviderDiscoveryOrigin, ProviderExecutable, ProviderExecutableError,
-    ProviderExecutableForm, ProviderExecutableHandle, ProviderExecutablePolicy,
-    ProviderExecutablePolicyError, ProviderExecutablePolicyViolation, ProviderFileIdentity,
-    ProviderKind, ProviderPathSnapshot, ProviderVersion, ProviderVersionError,
-    SemanticSchemaVersion, SystemProviderAuthClock, MAX_CAPABILITY_EVIDENCE_ITEMS,
-    MAX_EXECUTABLE_ENTRYPOINT_BYTES, MAX_PROVIDER_AUTH_ACCEPTED_ENTRIES,
-    MAX_PROVIDER_AUTH_PENDING_ENTRIES, MAX_PROVIDER_AUTH_TTL,
+    ProviderDiscoveryError, ProviderExecutable, ProviderExecutableError, ProviderExecutableForm,
+    ProviderExecutableHandle, ProviderExecutablePolicy, ProviderExecutablePolicyError,
+    ProviderExecutablePolicyViolation, ProviderFileIdentity, ProviderKind, ProviderPathSnapshot,
+    ProviderVersion, ProviderVersionError, SemanticSchemaVersion, SystemProviderAuthClock,
+    MAX_CAPABILITY_EVIDENCE_ITEMS, MAX_EXECUTABLE_ENTRYPOINT_BYTES,
+    MAX_PROVIDER_AUTH_ACCEPTED_ENTRIES, MAX_PROVIDER_AUTH_PENDING_ENTRIES, MAX_PROVIDER_AUTH_TTL,
     MAX_PROVIDER_CAPABILITY_CACHE_ENTRIES, MAX_PROVIDER_PATH_BYTES, MAX_PROVIDER_PATH_ENTRIES,
     MAX_PROVIDER_PATH_VALUE_BYTES, MAX_PROVIDER_SHIM_BYTES, MAX_PROVIDER_VERSION_BYTES,
     PROVIDER_AUTH_ADAPTER_REVISION, PROVIDER_AUTH_NONCE_BYTES,
@@ -52,6 +52,17 @@ pub use capabilities::{
 pub use claude::ClaudeCodeAdapter;
 pub use codex::CodexAdapter;
 pub use cursor::CursorAdapter;
+pub use host::{
+    admit_specialist_start, cancel_specialist_with_authority, correlate_specialist_authority,
+    deliver_claimed_provider_input, deliver_live_provider_input, HostAiLaunchAdmission,
+    HostLaunchError, ProviderHost, SpecialistLifecycleLineage, SpecialistProcessAuthority,
+    SpecialistResultLineage,
+};
+pub use input::{
+    BoundProviderInputPort, ProviderInputBridgeHold, ProviderInputDeliveryError,
+    ProviderInputDeliveryIdentity, ProviderInputDeliveryPlan, ProviderInputWriteReceipt,
+    ProviderRuntimeWriteHandle,
+};
 pub use journal::{
     stock_adapter_ingress, stock_adapter_ingress_available, JournalBackpressure, JournalEvent,
     JournalIngestOutcome, JournalLimits, JournalRedactionClass, JournalRejectReason,
@@ -65,6 +76,9 @@ pub use quota::{
 pub use registry::{
     CacheStatus, CapabilityCacheKey, ExecutableInspector, FileSystemExecutableInspector,
     ProviderDiscoveryConfig, ProviderObservation, ProviderRegistry,
+};
+pub use session::{
+    ProviderSessionManager, ProviderSessionStartMode, UnavailableProviderProcessLauncher,
 };
 pub use startup::{
     register_stock_adapters, registered_stock_kinds, start_request_from_adapter,

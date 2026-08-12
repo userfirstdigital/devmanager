@@ -1,10 +1,12 @@
 //! Provider-owned stock adapter factory and launch-proof bridge.
 //!
-//! This module registers one adapter per [`ProviderKind`] and seals
-//! observation + adapter `build_launch` into durable session start proofs.
-//! It is **not** invoked by app/native_shell/process_manager today; hosts must
-//! call these seams explicitly. Until that host wiring exists, treat this as a
-//! provider-owned construction boundary, not live production startup.
+//! [`crate::providers::host::ProviderHost::stock`] and ProcessManager startup
+//! invoke [`stock_provider_registry`] / [`register_stock_adapters`] exactly
+//! once. The adapter-sealed [`start_request_from_adapter`] seam is available
+//! when a host has a real provider process launcher. ProcessManager exposes
+//! `start_adapter_sealed_provider_session` so App code can start through
+//! `ProviderSessionManager` with the Job/PTY launcher. Legacy Claude/Codex
+//! hook overlays remain available for UI tabs that still inject a shell.
 
 use crate::domain::{AgentSessionFacts, ProviderSessionId};
 use crate::providers::adapter::{
@@ -50,9 +52,20 @@ impl From<ProviderLaunchSpecError> for ProviderBridgeError {
     }
 }
 
+impl std::fmt::Display for ProviderBridgeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Adapter(error) => write!(formatter, "{error}"),
+            Self::LaunchSpec(error) => write!(formatter, "{error:?}"),
+        }
+    }
+}
+
+impl std::error::Error for ProviderBridgeError {}
+
 /// Build an empty registry and register the three stock adapters exactly once.
 ///
-/// Host/session wiring must call this; it is not auto-invoked by app startup.
+/// Production hosts call this through [`crate::providers::host::ProviderHost::stock`].
 pub fn stock_provider_registry() -> Result<ProviderRegistry, ProviderError> {
     let mut registry = ProviderRegistry::new();
     register_stock_adapters(&mut registry)?;

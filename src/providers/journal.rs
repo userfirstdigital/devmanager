@@ -1408,6 +1408,52 @@ impl JournalEvent {
         self.runtime_generation
     }
 
+    pub const fn resource_id(&self) -> ResourceId {
+        self.resource_id
+    }
+
+    pub const fn action_epoch(&self) -> u64 {
+        self.action_epoch
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_correlated_test(
+        provider: ProviderKind,
+        task_id: TaskId,
+        agent_session_id: AgentSessionId,
+        resource_id: ResourceId,
+        runtime_generation: u64,
+        action_epoch: u64,
+    ) -> Self {
+        Self {
+            id: EventId::new(),
+            schema_version: JOURNAL_SCHEMA_VERSION,
+            provider,
+            provider_event_id: None,
+            delivery_id: RelayDeliveryId::new("specialist-lineage").expect("delivery"),
+            task_id,
+            agent_session_id,
+            resource_id,
+            runtime_generation,
+            action_epoch,
+            sequence: 1,
+            kind: JournalSemanticKind::ToolResult,
+            occurred_at_ms: 1,
+            ingested_at_ms: 1,
+            visibility: JournalVisibility::Semantic,
+            redaction_class: JournalRedactionClass::Persistable,
+            privacy_class: PrivacyClass::LocalOnly,
+            text: Some("specialist complete".into()),
+            extensions: BTreeMap::new(),
+            unknown: None,
+            payload: crate::domain::snapshot::SemanticJournalPayload::ToolResult {
+                call_id: "specialist-result".into(),
+                status: "completed".into(),
+            },
+            payload_hash: [0x51; 32],
+        }
+    }
+
     pub const fn sequence(&self) -> u64 {
         self.sequence
     }

@@ -32,6 +32,8 @@ use crate::process::sampler::{
     InaccessibleProcess, ProcessMemberObservation, ProcessSampler, SamplerError, SamplingBudget,
 };
 use crate::process::teardown::{TeardownCompletionStore, MAX_MANAGED_TERMINAL_PORTS};
+use crate::providers::host::ProviderHost;
+use crate::providers::ProviderKind;
 use crate::remote::presentation::{SemanticAdapterHealth, SemanticEventDraft, StableSessionKey};
 use crate::remote::{ClaudeSemanticIdentity, CodexSemanticIdentity, RemoteActionResult};
 use crate::services::ports_service::{PortInventory, PortStartReservation};
@@ -338,6 +340,9 @@ pub(crate) struct ProcessManagerInner {
     configured_supervisor: Mutex<Option<crate::services::supervisor::ConfiguredServiceSupervisor>>,
     op_queue: Mutex<Weak<ProcessOpQueue>>,
     handle_lifecycle: Arc<ProcessManagerHandleLifecycle>,
+    provider_host: ProviderHost,
+    provider_runtime: Mutex<ProviderRuntimeBook>,
+    provider_sessions: Mutex<Option<ProductionProviderSessionManager>>,
     #[cfg(test)]
     background_test_hook: RwLock<Option<ProcessManagerBackgroundTestHook>>,
     #[cfg(test)]
@@ -577,6 +582,11 @@ const PROCESS_MANAGER_HELPER_JOIN_BUDGET: Duration = Duration::from_secs(5);
 const MAX_AUTO_RESTART_WORKERS: usize = 256;
 const MAX_TERMINAL_AUTHORITY_RESOURCES: usize = 1_024;
 
+type ProductionProviderSessionManager = crate::providers::session::ProviderSessionManager<
+    crate::services::provider_process_launcher::ProcessManagerProviderLauncher,
+    crate::providers::session::SqliteProviderSessionStateStore,
+>;
+
 impl Default for ProcessManager {
     fn default() -> Self {
         Self::new()
@@ -632,6 +642,10 @@ impl ProcessManager {
             configured_supervisor: Mutex::new(None),
             op_queue: Mutex::new(Weak::new()),
             handle_lifecycle: handle_lifecycle.clone(),
+            provider_host: ProviderHost::stock()
+                .expect("stock provider adapters register deterministically"),
+            provider_runtime: Mutex::new(ProviderRuntimeBook::default()),
+            provider_sessions: Mutex::new(None),
             #[cfg(test)]
             background_test_hook: RwLock::new(None),
             #[cfg(test)]
@@ -818,6 +832,24 @@ impl ProcessManager {
             session_id,
             ProcessOwner::Task(task_id),
             ports.to_vec(),
+        )
+    }
+
+    pub(crate) fn issue_exact_provider_terminal_authority(
+        &self,
+        session_id: &str,
+        task_id: TaskId,
+        resource_id: ResourceId,
+        generation: u64,
+        action_epoch: u64,
+    ) -> Result<TerminalLaunchAuthority, String> {
+        self.inner.terminal_authority_issuer.issue_exact(
+            session_id,
+            ProcessOwner::Task(task_id),
+            resource_id,
+            generation,
+            action_epoch,
+            Vec::new(),
         )
     }
 
@@ -1546,6 +1578,86 @@ impl ProcessManager {
         self.inner.browser_attachment_broker.clone()
     }
 
+    pub fn provider_host(&self) -> &ProviderHost {
+        &self.inner.provider_host
+    }
+
+    pub fn provider_process_launcher(
+        &self,
+    ) -> crate::services::provider_process_launcher::ProcessManagerProviderLauncher {
+        crate::services::provider_process_launcher::ProcessManagerProviderLauncher::new(
+            self.clone(),
+        )
+    }
+
+    pub fn start_adapter_sealed_provider_session<S>(
+        &self,
+        store: S,
+        request: crate::providers::session::StartProviderSessionRequest,
+    ) -> Result<
+        crate::providers::session::ProviderRuntime,
+        crate::providers::session::ProviderSessionError,
+    >
+    where
+        S: crate::providers::session::ProviderSessionStateStore,
+    {
+        let mut manager = crate::providers::host::ProviderHost::session_manager(
+            self.provider_process_launcher(),
+            store,
+        );
+        manager.start(request)
+    }
+
+    /// Start through the durable production ProviderSessionManager owned by
+    /// this ProcessManager. The manager and its SQLite state store live for
+    /// the host lifetime; a temporary manager must never drop the lease after
+    /// returning a runtime handle.
+    pub fn start_production_provider_session(
+        &self,
+        request: crate::providers::session::StartProviderSessionRequest,
+    ) -> Result<
+        crate::providers::session::ProviderRuntime,
+        crate::providers::session::ProviderSessionError,
+    > {
+        let mut slot = self.inner.provider_sessions.lock().map_err(|_| {
+            crate::providers::session::ProviderSessionError::StateStore(
+                "provider session manager lock poisoned".to_string(),
+            )
+        })?;
+        if slot.is_none() {
+            let root = crate::persistence::app_config_dir().map_err(|error| {
+                crate::providers::session::ProviderSessionError::StateStore(error.to_string())
+            })?;
+            std::fs::create_dir_all(&root).map_err(|error| {
+                crate::providers::session::ProviderSessionError::StateStore(error.to_string())
+            })?;
+            let store = crate::providers::session::SqliteProviderSessionStateStore::open(
+                root.join("provider-sessions.sqlite3"),
+            )
+            .map_err(crate::providers::session::ProviderSessionError::StateStore)?;
+            *slot = Some(
+                crate::providers::session::ProviderSessionManager::with_state_store(
+                    self.provider_process_launcher(),
+                    store,
+                ),
+            );
+        }
+        slot.as_mut()
+            .expect("production provider manager initialized")
+            .start(request)
+    }
+
+    pub fn admit_stock_provider_launch(
+        &self,
+        kind: ProviderKind,
+        provider_session_id: Option<&str>,
+    ) -> Result<crate::providers::host::HostAiLaunchAdmission, String> {
+        self.inner
+            .provider_host
+            .admit_production_ai_session(kind, provider_session_id)
+            .map_err(|error| error.to_string())
+    }
+
     pub fn browser_diagnostic(&self, ai_tab_id: &str) -> Option<String> {
         self.inner
             .browser_diagnostics
@@ -2188,6 +2300,397 @@ impl ProcessManager {
     pub fn write_bytes_to_session(&self, session_id: &str, bytes: &[u8]) -> Result<(), String> {
         let session = self.get_session(session_id)?;
         session.write_bytes(bytes)
+    }
+
+    pub(crate) fn launch_sealed_provider_runtime(
+        &self,
+        request: &crate::providers::session::ProviderRuntimeLaunchRequest,
+    ) -> Result<
+        crate::process::registry::ProviderManagedProcessPermit,
+        crate::providers::session::ProviderLaunchError,
+    > {
+        use crate::process::registry::{
+            ProviderManagedProcessPermit, RegistryIssuedTerminalOwnership,
+        };
+        use crate::providers::session::ProviderLaunchError;
+        use crate::providers::ProviderKind;
+        use crate::state::SessionDimensions;
+        use std::collections::HashMap;
+        use std::time::Duration;
+
+        match request.provider_kind() {
+            ProviderKind::ClaudeCode | ProviderKind::Codex => {}
+            ProviderKind::Cursor => return Err(ProviderLaunchError::Unsupported),
+        }
+        if request.launch_spec().generation() == 0
+            || request.correlation().action_epoch() == 0
+            || matches!(
+                request.launch_spec().mode(),
+                crate::providers::session::ProviderLaunchMode::ResumeExact(_)
+            ) && request.provider_kind() == ProviderKind::Cursor
+        {
+            return Err(ProviderLaunchError::ZeroProcessId);
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = request;
+            return Err(ProviderLaunchError::Unsupported);
+        }
+        #[cfg(windows)]
+        {
+            let session_id = format!("provider-{}", request.terminal_id());
+            let program = request
+                .launch_spec()
+                .executable()
+                .canonical_path()
+                .to_str()
+                .ok_or(ProviderLaunchError::SpawnFailed)?
+                .to_string();
+            let args = request
+                .launch_spec()
+                .arguments()
+                .map(|argument| os_to_launch_string(argument))
+                .collect::<Result<Vec<_>, _>>()?;
+            let env = request
+                .launch_spec()
+                .environment()
+                .iter()
+                .map(|(key, value)| Ok((os_to_launch_string(key)?, os_to_launch_string(value)?)))
+                .collect::<Result<HashMap<String, String>, ProviderLaunchError>>()?;
+            ensure_prior_session_teardown_settled(&self.inner, &session_id, Duration::from_secs(2))
+                .map_err(|_| ProviderLaunchError::SpawnFailed)?;
+            self.ensure_runtime_entry(
+                &session_id,
+                request.launch_spec().cwd().to_path_buf(),
+                SessionDimensions::default(),
+            );
+            let authority = self
+                .issue_exact_provider_terminal_authority(
+                    &session_id,
+                    request.launch_spec().task_id(),
+                    request.resource_id(),
+                    request.launch_spec().generation(),
+                    request.correlation().action_epoch(),
+                )
+                .map_err(|_| ProviderLaunchError::SpawnFailed)?;
+            let session = TerminalSession::spawn_command(
+                session_id.clone(),
+                request.launch_spec().cwd().to_path_buf(),
+                SessionDimensions::default(),
+                program,
+                args,
+                env,
+                self.inner
+                    .scrollback_lines
+                    .read()
+                    .map(|lines| *lines)
+                    .unwrap_or(10_000),
+                None,
+                self.inner.runtime_state.clone(),
+                self.inner.debug_enabled,
+                None,
+                None,
+                authority,
+            )
+            .map_err(|_| match request.launch_spec().mode() {
+                crate::providers::session::ProviderLaunchMode::ResumeExact(_) => {
+                    ProviderLaunchError::ExactResumeFailed(
+                        crate::providers::session::ExactResumeFailure::ProviderRejected,
+                    )
+                }
+                crate::providers::session::ProviderLaunchMode::NewConversation => {
+                    ProviderLaunchError::SpawnFailed
+                }
+            })?;
+            let fence = match session.managed_process_fence() {
+                Ok(Some(fence)) => fence,
+                _ => {
+                    let _ = session.close(false);
+                    return Err(ProviderLaunchError::ProcessFenceMismatch);
+                }
+            };
+            if fence.resource()
+                != crate::domain::operation::ResourceFence::new(
+                    request.resource_id(),
+                    request.launch_spec().generation(),
+                )
+                || fence.owner() != ProcessOwner::Task(request.launch_spec().task_id())
+                || fence.root().id().pid() == 0
+                || fence.root().id().creation_time_100ns() == 0
+                || fence.root().canonical_executable()
+                    != request.launch_spec().executable().canonical_path()
+            {
+                let _ = session.close_managed_process_exact(&fence, false);
+                return Err(ProviderLaunchError::ProcessFenceMismatch);
+            }
+            if let Ok(mut sessions) = self.inner.sessions.lock() {
+                sessions.insert(session_id.clone(), Arc::new(session));
+            } else {
+                let _ = session.close_managed_process_exact(&fence, false);
+                return Err(ProviderLaunchError::SpawnFailed);
+            }
+            if self
+                .inner
+                .provider_runtime
+                .lock()
+                .map(|mut book| {
+                    book.live.insert(
+                        (request.resource_id(), request.launch_spec().generation()),
+                        ProviderLiveSession {
+                            session_id: session_id.clone(),
+                            fence: fence.clone(),
+                            task_id: request.correlation().task_id(),
+                            agent_session_id: request.correlation().agent_session_id(),
+                            provider_kind: request.provider_kind(),
+                            provider_session_id: match request.launch_spec().mode() {
+                                crate::providers::session::ProviderLaunchMode::ResumeExact(id) => {
+                                    Some(id.clone())
+                                }
+                                crate::providers::session::ProviderLaunchMode::NewConversation => {
+                                    None
+                                }
+                            },
+                        },
+                    );
+                })
+                .is_err()
+            {
+                let _ = close_managed_process_exact(
+                    &self.inner,
+                    &session_id,
+                    &fence,
+                    fence.root().id().pid(),
+                    true,
+                );
+                return Err(ProviderLaunchError::BridgeUnavailable);
+            }
+            Ok(ProviderManagedProcessPermit::from_registry(
+                fence,
+                RegistryIssuedTerminalOwnership::new(session_id),
+            ))
+        }
+    }
+
+    pub(crate) fn stop_sealed_provider_runtime(
+        &self,
+        lease: &crate::process::registry::ProviderManagedProcessPermit,
+    ) -> Result<
+        crate::process::registry::JoinedActiveProcessZeroProof,
+        crate::providers::session::ProviderLaunchError,
+    > {
+        use crate::process::registry::{JoinedActiveProcessZeroProof, RegistryIssuedZeroReceipt};
+        use crate::providers::session::ProviderLaunchError;
+
+        #[cfg(not(windows))]
+        {
+            let _ = lease;
+            return Err(ProviderLaunchError::Unsupported);
+        }
+        #[cfg(windows)]
+        {
+            let key = (
+                lease.fence().resource().resource_id,
+                lease.fence().resource().runtime_generation,
+            );
+            let live = self
+                .inner
+                .provider_runtime
+                .lock()
+                .ok()
+                .and_then(|book| book.live.get(&key).cloned());
+            let Some(live) = live else {
+                return Err(ProviderLaunchError::ActiveProcessZeroRequired);
+            };
+            if live.fence != *lease.fence() {
+                return Err(ProviderLaunchError::ProcessFenceMismatch);
+            }
+            close_managed_process_exact(
+                &self.inner,
+                &live.session_id,
+                lease.fence(),
+                lease.process_id().pid(),
+                true,
+            )
+            .map_err(|_| ProviderLaunchError::StopFailed)?;
+            if let Ok(mut book) = self.inner.provider_runtime.lock() {
+                book.live.remove(&key);
+            }
+            Ok(JoinedActiveProcessZeroProof::from_registry(
+                lease.fence().clone(),
+                RegistryIssuedZeroReceipt::new(live.session_id),
+            ))
+        }
+    }
+
+    pub(crate) fn observe_sealed_provider_zero(
+        &self,
+        lease: &crate::process::registry::ProviderManagedProcessPermit,
+    ) -> Result<
+        Option<crate::process::registry::JoinedActiveProcessZeroProof>,
+        crate::providers::session::ProviderLaunchError,
+    > {
+        use crate::providers::session::ProviderLaunchError;
+
+        #[cfg(not(windows))]
+        {
+            let _ = lease;
+            return Err(ProviderLaunchError::Unsupported);
+        }
+        #[cfg(windows)]
+        {
+            let key = (
+                lease.fence().resource().resource_id,
+                lease.fence().resource().runtime_generation,
+            );
+            let live = match self.inner.provider_runtime.lock() {
+                Ok(book) => book.live.get(&key).cloned(),
+                Err(_) => return Err(ProviderLaunchError::BridgeUnavailable),
+            };
+            let Some(live) = live else {
+                return Ok(None);
+            };
+            if live.fence != *lease.fence() {
+                return Err(ProviderLaunchError::ProcessFenceMismatch);
+            }
+            let session = self
+                .get_session(&live.session_id)
+                .map_err(|_| ProviderLaunchError::ActiveProcessZeroRequired)?;
+            let deadline = Instant::now() + Duration::from_millis(250);
+            let Some(observation) = session
+                .managed_process_observations_until(deadline, 64)
+                .map_err(|_| ProviderLaunchError::ActiveProcessZeroRequired)?
+            else {
+                return Err(ProviderLaunchError::ActiveProcessZeroRequired);
+            };
+            let (capture, members) = observation.into_parts();
+            if capture.fence() != lease.fence() {
+                return Err(ProviderLaunchError::ProcessFenceMismatch);
+            }
+            if !members
+                .map_err(|_| ProviderLaunchError::ActiveProcessZeroRequired)?
+                .is_empty()
+            {
+                return Ok(None);
+            }
+            Ok(Some(
+                crate::process::registry::JoinedActiveProcessZeroProof::from_registry(
+                    lease.fence().clone(),
+                    crate::process::registry::RegistryIssuedZeroReceipt::new(live.session_id),
+                ),
+            ))
+        }
+    }
+
+    pub(crate) fn retain_sealed_provider_runtime(
+        &self,
+        state: &crate::providers::session::ProviderSessionState,
+        lease: crate::process::registry::ProviderManagedProcessPermit,
+    ) -> Result<(), crate::providers::session::ProviderRecoveryHandoffFailure> {
+        use crate::providers::session::{ProviderLaunchError, ProviderRecoveryHandoffFailure};
+
+        if lease.fence().resource().runtime_generation != state.generation()
+            || lease.fence().resource().resource_id != state.launch_spec().resource_id()
+            || lease.fence().owner() != ProcessOwner::Task(state.task_id())
+        {
+            return Err(ProviderRecoveryHandoffFailure::new(
+                ProviderLaunchError::ProcessFenceMismatch,
+                lease,
+            ));
+        }
+        match self.inner.provider_runtime.lock() {
+            Ok(mut book) => {
+                book.recovery.insert(
+                    crate::providers::session::RecoveryKey::from_state(state),
+                    lease,
+                );
+                Ok(())
+            }
+            Err(_) => Err(ProviderRecoveryHandoffFailure::new(
+                ProviderLaunchError::BridgeUnavailable,
+                lease,
+            )),
+        }
+    }
+
+    pub(crate) fn recover_sealed_provider_runtime(
+        &self,
+        state: &crate::providers::session::ProviderSessionState,
+    ) -> Result<
+        Option<crate::process::registry::ProviderManagedProcessPermit>,
+        crate::providers::session::ProviderLaunchError,
+    > {
+        use crate::process::registry::{
+            ProviderManagedProcessPermit, RegistryIssuedTerminalOwnership,
+        };
+        use crate::providers::session::ProviderLaunchError;
+
+        let key = crate::providers::session::RecoveryKey::from_state(state);
+        if let Ok(mut book) = self.inner.provider_runtime.lock() {
+            if let Some(lease) = book.recovery.remove(&key) {
+                return Ok(Some(lease));
+            }
+            let live_key = (state.launch_spec().resource_id(), state.generation());
+            if let Some(live) = book.live.get(&live_key).cloned() {
+                if live.fence.resource().runtime_generation == state.generation()
+                    && live.fence.owner() == ProcessOwner::Task(state.task_id())
+                    && live.fence.root().id().pid() != 0
+                {
+                    return Ok(Some(ProviderManagedProcessPermit::from_registry(
+                        live.fence,
+                        RegistryIssuedTerminalOwnership::new(live.session_id),
+                    )));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn write_sealed_provider_bytes(
+        &self,
+        fence: &ManagedProcessFence,
+        identity: &crate::providers::input::ProviderInputDeliveryIdentity,
+        bytes: &[u8],
+    ) -> Result<(), crate::providers::input::ProviderInputDeliveryError> {
+        use crate::providers::input::ProviderInputDeliveryError;
+
+        let key = (
+            fence.resource().resource_id,
+            fence.resource().runtime_generation,
+        );
+        let live = self
+            .inner
+            .provider_runtime
+            .lock()
+            .ok()
+            .and_then(|book| book.live.get(&key).cloned())
+            .ok_or(ProviderInputDeliveryError::SessionNotBound)?;
+        if live.fence != *fence {
+            return Err(ProviderInputDeliveryError::StaleFence);
+        }
+        if live.provider_session_id.as_ref() != Some(&identity.provider_session_id)
+            || identity.agent_session_id != live.agent_session_id
+            || identity.task_id != live.task_id
+            || identity.provider_kind != live.provider_kind
+            || identity.runtime_generation != fence.resource().runtime_generation
+        {
+            return Err(ProviderInputDeliveryError::ProviderMismatch);
+        }
+        let session = self
+            .get_session(&live.session_id)
+            .map_err(|_| ProviderInputDeliveryError::SessionNotBound)?;
+        #[cfg(windows)]
+        {
+            let current = session
+                .managed_process_fence()
+                .map_err(|_| ProviderInputDeliveryError::SessionNotBound)?
+                .ok_or(ProviderInputDeliveryError::SessionNotBound)?;
+            if current != *fence {
+                return Err(ProviderInputDeliveryError::StaleFence);
+            }
+        }
+        session
+            .write_bytes(bytes)
+            .map_err(|_| ProviderInputDeliveryError::RuntimeAuthorityAbsent)
     }
 
     pub fn paste_to_session(&self, session_id: &str, text: &str) -> Result<(), String> {
@@ -5791,6 +6294,25 @@ struct TerminalAuthorityIssuer {
     state: Mutex<TerminalAuthorityState>,
 }
 
+#[derive(Debug, Default)]
+struct ProviderRuntimeBook {
+    live: HashMap<(ResourceId, u64), ProviderLiveSession>,
+    recovery: HashMap<
+        crate::providers::session::RecoveryKey,
+        crate::process::registry::ProviderManagedProcessPermit,
+    >,
+}
+
+#[derive(Debug, Clone)]
+struct ProviderLiveSession {
+    session_id: String,
+    fence: ManagedProcessFence,
+    task_id: TaskId,
+    agent_session_id: crate::domain::AgentSessionId,
+    provider_kind: ProviderKind,
+    provider_session_id: Option<crate::domain::ProviderSessionId>,
+}
+
 impl TerminalAuthorityIssuer {
     fn new() -> Self {
         Self {
@@ -5873,6 +6395,77 @@ impl TerminalAuthorityIssuer {
             issued.owner,
             issued.resource_id,
             issued.generation,
+            OperationId::new(),
+            action_epoch,
+            ports,
+            completion_store,
+        )
+    }
+
+    fn issue_exact(
+        &self,
+        session_id: &str,
+        owner: ProcessOwner,
+        resource_id: ResourceId,
+        generation: u64,
+        action_epoch: u64,
+        ports: Vec<u16>,
+    ) -> Result<TerminalLaunchAuthority, String> {
+        if session_id.trim().is_empty() || session_id.len() > 256 {
+            return Err("terminal authority session identity is invalid".to_string());
+        }
+        if generation == 0 || action_epoch == 0 {
+            return Err("terminal launch generation and action epoch must be non-zero".to_string());
+        }
+        if ports.len() > MAX_MANAGED_TERMINAL_PORTS {
+            return Err(format!(
+                "terminal launch port set exceeds {MAX_MANAGED_TERMINAL_PORTS} entries"
+            ));
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "terminal authority issuer poisoned".to_string())?;
+        state
+            .resource_order
+            .retain(|retained| retained != session_id);
+        if !state.resources.contains_key(session_id) {
+            while state.resources.len() >= MAX_TERMINAL_AUTHORITY_RESOURCES {
+                let Some(evicted) = state.resource_order.pop_front() else {
+                    return Err("terminal authority retention index is inconsistent".to_string());
+                };
+                state.resources.remove(&evicted);
+            }
+        }
+        state.resource_order.push_back(session_id.to_string());
+        state.next_action_epoch = state.next_action_epoch.max(action_epoch.saturating_add(1));
+        state.resources.insert(
+            session_id.to_string(),
+            IssuedTerminalResource {
+                owner,
+                resource_id,
+                generation,
+            },
+        );
+        if state.completion_store.is_none() {
+            #[cfg(windows)]
+            {
+                state.completion_store = Some(TeardownCompletionStore::for_terminal_host()?);
+            }
+            #[cfg(not(windows))]
+            {
+                state.completion_store = Some(TeardownCompletionStore::new());
+            }
+        }
+        let completion_store = state
+            .completion_store
+            .as_ref()
+            .expect("terminal completion store initialized")
+            .clone();
+        TerminalLaunchAuthority::new(
+            owner,
+            resource_id,
+            generation,
             OperationId::new(),
             action_epoch,
             ports,
@@ -6830,6 +7423,15 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
+fn os_to_launch_string(
+    value: &std::ffi::OsStr,
+) -> Result<String, crate::providers::session::ProviderLaunchError> {
+    value
+        .to_str()
+        .map(str::to_string)
+        .ok_or(crate::providers::session::ProviderLaunchError::SpawnFailed)
+}
+
 fn issue_host_terminal_authority(
     inner: &ProcessManagerInner,
     session_id: &str,
@@ -7236,6 +7838,17 @@ fn bind_runtime_provider_session_id(
     pty_session_id: &str,
     provider_session_id: String,
 ) {
+    if let Ok(provider_session_id) =
+        crate::domain::ProviderSessionId::new(provider_session_id.clone())
+    {
+        if let Ok(mut book) = inner.provider_runtime.lock() {
+            for live in book.live.values_mut() {
+                if live.session_id == pty_session_id {
+                    live.provider_session_id = Some(provider_session_id.clone());
+                }
+            }
+        }
+    }
     let changed = {
         let Ok(mut runtime) = inner.runtime_state.write() else {
             return;

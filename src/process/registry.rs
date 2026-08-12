@@ -511,10 +511,49 @@ pub fn test_managed_resource_snapshot(
 /// Private ownership receipt embedded in a provider permit. The trait is
 /// deliberately crate-private: an external caller can hold a permit returned
 /// by the registry, but cannot implement or construct the authority seam.
-/// There is intentionally no production implementation on this branch; the
-/// Task 3 union must supply the real suspended Job-root/PTY receipt. Fixtures
-/// implement it only under `cfg(test)`.
+/// Production receipts are minted only after the managed Job/PTY launcher
+/// registers an exact terminal generation.
 pub(crate) trait ProviderPermitOwnership: fmt::Debug + Send {}
+
+/// Registry-issued Job/PTY ownership for one live provider terminal generation.
+#[derive(Debug)]
+pub(crate) struct RegistryIssuedTerminalOwnership {
+    session_id: String,
+}
+
+impl RegistryIssuedTerminalOwnership {
+    pub(crate) fn new(session_id: impl Into<String>) -> Self {
+        Self {
+            session_id: session_id.into(),
+        }
+    }
+
+    pub(crate) fn session_id(&self) -> &str {
+        &self.session_id
+    }
+}
+
+impl ProviderPermitOwnership for RegistryIssuedTerminalOwnership {}
+
+/// Registry-issued ACTIVE_PROCESS_ZERO receipt for one exact terminal teardown.
+#[derive(Debug)]
+pub(crate) struct RegistryIssuedZeroReceipt {
+    session_id: String,
+}
+
+impl RegistryIssuedZeroReceipt {
+    pub(crate) fn new(session_id: impl Into<String>) -> Self {
+        Self {
+            session_id: session_id.into(),
+        }
+    }
+
+    pub(crate) fn session_id(&self) -> &str {
+        &self.session_id
+    }
+}
+
+impl ProviderPermitOwnership for RegistryIssuedZeroReceipt {}
 
 /// Opaque, non-Clone authority for one exact process/PTY Job registration.
 ///

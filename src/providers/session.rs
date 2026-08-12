@@ -1,11 +1,10 @@
 //! Provider runtime generations and presentation views.
 //!
-//! This module owns the host-side provider session contract.  It deliberately
-//! does not spawn a provider executable.  A production launcher must adapt the
-//! Task 3.4 managed process/PTY service and return an authenticated lease for
-//! the exact Job/fence it registered.  The fake launchers in tests implement
-//! the same lease and settlement traits; they do not bypass the contract with
-//! a caller-selected PID.
+//! This module owns the host-side provider session contract.  It does not
+//! spawn a provider executable itself. Production hosts inject the
+//! ProcessManager Job/PTY launcher, which returns a registry-issued permit
+//! for the exact generation it registered. Test fixtures implement the same
+//! sealed traits and cannot mint a caller-selected PID.
 
 use crate::domain::operation::ResourceFence;
 use crate::domain::{
@@ -111,6 +110,24 @@ impl fmt::Debug for RuntimeCorrelation {
 }
 
 impl RuntimeCorrelation {
+    pub(crate) const fn sealed(
+        task_id: TaskId,
+        agent_session_id: AgentSessionId,
+        provider_kind: ProviderKind,
+        generation: u64,
+        action_epoch: u64,
+        launch_nonce: LaunchNonce,
+    ) -> Self {
+        Self {
+            task_id,
+            agent_session_id,
+            provider_kind,
+            generation,
+            action_epoch,
+            launch_nonce,
+        }
+    }
+
     pub const fn task_id(self) -> TaskId {
         self.task_id
     }
@@ -539,6 +556,36 @@ impl ProviderLaunchSpec {
     pub const fn terminal_id(&self) -> TerminalId {
         self.terminal_id
     }
+
+    pub(crate) fn sealed(
+        provider_kind: ProviderKind,
+        executable: ProviderExecutable,
+        mode: ProviderLaunchMode,
+        arguments: Vec<OsString>,
+        cwd: PathBuf,
+        environment: BTreeMap<OsString, OsString>,
+        capabilities: ProviderCapabilities,
+        task_id: TaskId,
+        resource_id: ResourceId,
+        terminal_id: TerminalId,
+        generation: u64,
+        launch_nonce: LaunchNonce,
+    ) -> Self {
+        Self {
+            provider_kind,
+            executable,
+            mode,
+            arguments,
+            cwd,
+            environment,
+            capabilities,
+            task_id,
+            resource_id,
+            terminal_id,
+            generation,
+            launch_nonce,
+        }
+    }
 }
 
 /// Launch request passed to the injected managed-process launcher.
@@ -583,6 +630,13 @@ impl ProviderRuntimeLaunchRequest {
     pub const fn terminal_id(&self) -> TerminalId {
         self.launch_spec.terminal_id
     }
+
+    pub(crate) fn sealed(correlation: RuntimeCorrelation, launch_spec: ProviderLaunchSpec) -> Self {
+        Self {
+            correlation,
+            launch_spec,
+        }
+    }
 }
 
 /// Managed process identity exposed to views and diagnostics.  It contains a
@@ -621,15 +675,15 @@ pub struct ProviderRecoveryHandoffFailure {
 }
 
 impl ProviderRecoveryHandoffFailure {
-    fn new(error: ProviderLaunchError, lease: ProviderProcessLease) -> Self {
+    pub(crate) fn new(error: ProviderLaunchError, lease: ProviderProcessLease) -> Self {
         Self { error, lease }
     }
 
-    fn error(&self) -> ProviderLaunchError {
+    pub(crate) fn error(&self) -> ProviderLaunchError {
         self.error
     }
 
-    fn into_lease(self) -> ProviderProcessLease {
+    pub(crate) fn into_lease(self) -> ProviderProcessLease {
         self.lease
     }
 }
@@ -659,9 +713,9 @@ pub enum ProviderLaunchError {
 }
 
 /// Explicit integration seam for Task 3.4/4.1b. The public trait is sealed so
-/// callers cannot provide a fake lease or zero proof by implementing it. The
-/// production implementation remains [`UnavailableProviderProcessLauncher`]
-/// until the Task 3 suspended Job-root/PTY bridge is joined.
+/// callers cannot provide a fake lease or zero proof by implementing it.
+/// Production hosts inject the ProcessManager-backed Job/PTY launcher, which
+/// returns a registry-issued permit for one exact stock Claude/Codex CLI.
 pub trait ProviderProcessLauncher: sealed::ProviderProcessLauncher {
     fn launch(&mut self, request: &ProviderRuntimeLaunchRequest) -> ProviderLaunchOutcome;
 
@@ -4836,18 +4890,16 @@ struct LeaseSlot {
     settled: bool,
 }
 
-#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct RecoveryKey {
+pub(crate) struct RecoveryKey {
     agent_session_id: AgentSessionId,
     generation: u64,
     action_epoch: u64,
     launch_nonce: LaunchNonce,
 }
 
-#[cfg(test)]
 impl RecoveryKey {
-    fn from_state(state: &ProviderSessionState) -> Self {
+    pub(crate) fn from_state(state: &ProviderSessionState) -> Self {
         Self {
             agent_session_id: state.agent_session_id,
             generation: state.generation,
