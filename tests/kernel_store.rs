@@ -1206,6 +1206,7 @@ fn command_pure_create_persists_decision_operation_receipt_and_sequence() {
         operation_id,
         task_revision,
         event_ids,
+        prompt_mutation: _,
     } = receipt
     else {
         panic!("expected accepted receipt, got {receipt:?}");
@@ -1462,6 +1463,7 @@ fn command_pure_revision_conflict_persists_rejected_receipt() {
             command_id: conflict_cmd,
             code: RejectionCode::RevisionConflict,
             current_revision: Some(1),
+            resolution: None,
         }
     );
 
@@ -1620,6 +1622,7 @@ fn command_pure_effectful_empty_decision_stays_unsupported() {
             command_id: close_cmd,
             code: RejectionCode::UnsupportedCapability,
             current_revision: Some(1),
+            resolution: None,
         }
     );
     drop(store);
@@ -2967,6 +2970,7 @@ fn command_pure_already_closing_begin_close_unsupported() {
             command_id: close_cmd,
             code: RejectionCode::UnsupportedCapability,
             current_revision: Some(1),
+            resolution: None,
         }
     );
     let retry = store
@@ -3032,6 +3036,7 @@ fn command_pure_already_releasing_release_resource_unsupported() {
             command_id: release_cmd,
             code: RejectionCode::UnsupportedCapability,
             current_revision: Some(1),
+            resolution: None,
         }
     );
     drop(store);
@@ -3064,6 +3069,7 @@ fn command_pure_effectful_domain_rejection_still_wins() {
             command_id: command_id(0xFA),
             code: RejectionCode::RevisionConflict,
             current_revision: Some(1),
+            resolution: None,
         }
     );
 }
@@ -3626,6 +3632,7 @@ fn command_side_effect_begin_close_accepts_pending_outbox_without_settlement() {
         operation_id,
         task_revision,
         event_ids,
+        prompt_mutation: _,
     } = receipt.clone()
     else {
         panic!("expected accepted begin close, got {receipt:?}");
