@@ -1,9 +1,8 @@
-//! Development foreground `devmanager-host` entry for Phase 2 ownership.
+//! Durable `devmanager-host` entry.
 //!
-//! This binary owns one profile lock and one writable command bus executor,
-//! accepts authenticated clients concurrently on tracked tasks, and remains
-//! bound to its exact parent process. It does not yet own Phase 3 supervised
-//! resources.
+//! `ctl` dispatches before any HostLock/server bootstrap. Debug builds remain
+//! parent-bound under an isolated config base. Release builds own the
+//! Production profile at the exact installed app root and survive client detach.
 
 use std::fs;
 use std::io::{self, Write};
@@ -27,7 +26,11 @@ const MAX_INSTANCE_LABEL_CHARS: usize = 64;
 const PARENT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// Short bounded normal drain for connection tasks after intentional quit.
 const INTENTIONAL_CONNECTION_DRAIN: Duration = Duration::from_millis(500);
+/// Stable pipe/lock profile for the packaged production host.
+#[cfg(all(windows, not(debug_assertions)))]
+const PRODUCTION_HOST_PROFILE: &str = "production";
 
+#[cfg(all(windows, debug_assertions))]
 #[derive(Debug)]
 struct HostArgs {
     profile: String,
@@ -38,8 +41,17 @@ struct HostArgs {
     test_slow_durable_reader_client_id: Option<ClientId>,
 }
 
+#[cfg(all(windows, debug_assertions))]
 #[derive(Debug)]
 struct PreparedDebugPaths {
+    profile_root: PathBuf,
+    database: PathBuf,
+    resolved: ResolvedAppPaths,
+}
+
+#[cfg(all(windows, not(debug_assertions)))]
+#[derive(Debug)]
+struct PreparedProductionPaths {
     profile_root: PathBuf,
     database: PathBuf,
     resolved: ResolvedAppPaths,
@@ -79,14 +91,6 @@ fn main() -> ExitCode {
 }
 
 fn run(raw_args: Vec<String>) -> Result<(), HostRunError> {
-    #[cfg(not(debug_assertions))]
-    {
-        let _ = raw_args;
-        return Err(HostRunError::Message(
-            "release host startup is deferred until Phase 11".to_string(),
-        ));
-    }
-
     #[cfg(not(windows))]
     {
         let _ = raw_args;
@@ -118,7 +122,7 @@ fn run(raw_args: Vec<String>) -> Result<(), HostRunError> {
         let _ = &args.instance_label;
         runtime.block_on(serve_foreground_host(
             &args.profile,
-            parent,
+            Some(parent),
             host_boot_id,
             bus,
             config_store,
@@ -127,11 +131,40 @@ fn run(raw_args: Vec<String>) -> Result<(), HostRunError> {
         drop(host_lock);
         Ok(())
     }
+
+    #[cfg(all(windows, not(debug_assertions)))]
+    {
+        parse_production_args(raw_args)?;
+        let paths = prepare_production_paths()?;
+        let host_lock = acquire_lock(&paths.profile_root, PRODUCTION_HOST_PROFILE)?;
+        let host_boot_id = host_lock.identity().boot_id;
+        let bus = CommandBus::open(&paths.database)
+            .map_err(|error| format!("failed to open host command bus: {error}"))?;
+        let Some(bus) = prepare_host_bus_before_bind(bus)? else {
+            return Ok(());
+        };
+        let config_store = ConfigStore::open_host(&paths.resolved)
+            .map_err(|error| format!("failed to open host configuration store: {error}"))?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| format!("failed to build host async runtime: {error}"))?;
+        runtime.block_on(serve_foreground_host(
+            PRODUCTION_HOST_PROFILE,
+            None,
+            host_boot_id,
+            bus,
+            config_store,
+            None,
+        ))?;
+        drop(host_lock);
+        Ok(())
+    }
 }
 
 /// One-way pre-bind ownership gate: only ServeResume/ServeInspection may return
 /// the bus for runtime construction and HelloListener::bind.
-#[cfg(all(windows, debug_assertions))]
+#[cfg(windows)]
 fn prepare_host_bus_before_bind(mut bus: CommandBus) -> Result<Option<CommandBus>, HostRunError> {
     match HostCleanupWorker::restart_disposition(&bus)
         .map_err(|error| format!("failed to read host restart disposition: {error}"))?
@@ -400,6 +433,120 @@ fn validate_config_base(config_base: &Path) -> Result<PathBuf, String> {
     Ok(canonical)
 }
 
+#[cfg(all(windows, not(debug_assertions)))]
+fn parse_production_args(raw: Vec<String>) -> Result<(), String> {
+    if std::env::var_os("DEVMANAGER_PROFILE").is_some() {
+        return Err("DEVMANAGER_PROFILE is forbidden for production host".to_string());
+    }
+    let mut foreground = false;
+    for arg in raw {
+        match arg.as_str() {
+            "--foreground" => {
+                if foreground {
+                    return Err("duplicate --foreground".to_string());
+                }
+                foreground = true;
+            }
+            "--parent-pid"
+            | "--config-base"
+            | "--profile"
+            | "--instance-label"
+            | "--test-slow-durable-reader-client-id" => {
+                return Err(format!("{arg} is forbidden for production host"));
+            }
+            other if other.starts_with('-') => {
+                return Err(format!("unknown flag: {other}"));
+            }
+            other => return Err(format!("unexpected argument: {other}")),
+        }
+    }
+    if !foreground {
+        return Err("missing required --foreground".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(all(windows, not(debug_assertions)))]
+fn prepare_production_paths() -> Result<PreparedProductionPaths, String> {
+    if std::env::var_os("DEVMANAGER_PROFILE").is_some() {
+        return Err("DEVMANAGER_PROFILE is forbidden for production host".to_string());
+    }
+    let config_dir = dirs::config_dir().ok_or_else(|| {
+        "unable to resolve normal config directory for production host".to_string()
+    })?;
+    let config_dir = config_dir.canonicalize().map_err(|error| {
+        format!("unable to canonicalize normal config directory {config_dir:?}: {error}")
+    })?;
+    let resolved = resolve_app_paths(&config_dir, AppProfile::Production, BuildKind::Release)
+        .map_err(|error| error.to_string())?;
+    let expected_root = config_dir.join("com.userfirst.devmanager");
+    if resolved.root != expected_root {
+        return Err(format!(
+            "production profile root mismatch: {} != {}",
+            resolved.root.display(),
+            expected_root.display()
+        ));
+    }
+    match fs::symlink_metadata(&resolved.root) {
+        Ok(metadata) => {
+            use std::os::windows::fs::MetadataExt;
+            use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+            if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+                return Err(format!(
+                    "production profile root must not be a reparse point: {}",
+                    resolved.root.display()
+                ));
+            }
+            if !resolved.root.is_dir() {
+                return Err(format!(
+                    "production profile root exists and is not a directory: {}",
+                    resolved.root.display()
+                ));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(&resolved.root).map_err(|create_error| {
+                format!(
+                    "failed to create production profile root {}: {create_error}",
+                    resolved.root.display()
+                )
+            })?;
+        }
+        Err(error) => {
+            return Err(format!(
+                "failed to inspect production profile root {}: {error}",
+                resolved.root.display()
+            ));
+        }
+    }
+    let canonical_root = resolved.root.canonicalize().map_err(|error| {
+        format!(
+            "failed to canonicalize production profile root {}: {error}",
+            resolved.root.display()
+        )
+    })?;
+    let expected = installed_production_root()?;
+    if canonical_root != expected {
+        return Err(format!(
+            "production profile root redirected away from exact app path: {}",
+            canonical_root.display()
+        ));
+    }
+    let resolved = ResolvedAppPaths {
+        config: canonical_root.join("config.json"),
+        remote: canonical_root.join("remote.json"),
+        database: canonical_root.join("kernel.sqlite3"),
+        browser_root: canonical_root.join("browser"),
+        logs: canonical_root.join("logs"),
+        root: canonical_root.clone(),
+    };
+    Ok(PreparedProductionPaths {
+        profile_root: canonical_root,
+        database: resolved.database.clone(),
+        resolved,
+    })
+}
+
 #[cfg(all(windows, debug_assertions))]
 fn is_reparse_point(path: &Path) -> Result<bool, String> {
     use std::os::windows::fs::MetadataExt;
@@ -495,7 +642,7 @@ fn prepare_debug_paths(args: &HostArgs) -> Result<PreparedDebugPaths, String> {
     })
 }
 
-#[cfg(all(windows, debug_assertions))]
+#[cfg(windows)]
 fn acquire_lock(profile_root: &Path, profile: &str) -> Result<HostLock, HostRunError> {
     match HostLock::acquire(profile_root, profile) {
         Ok(lock) => Ok(lock),
@@ -506,12 +653,12 @@ fn acquire_lock(profile_root: &Path, profile: &str) -> Result<HostLock, HostRunE
     }
 }
 
-#[cfg(all(windows, debug_assertions))]
+#[cfg(windows)]
 struct ParentProcess {
     handle: windows::Win32::Foundation::HANDLE,
 }
 
-#[cfg(all(windows, debug_assertions))]
+#[cfg(windows)]
 impl Drop for ParentProcess {
     fn drop(&mut self) {
         unsafe {
@@ -613,7 +760,7 @@ fn open_and_validate_parent(parent_pid: u32) -> Result<ParentProcess, String> {
     Ok(parent)
 }
 
-#[cfg(all(windows, debug_assertions))]
+#[cfg(windows)]
 fn parent_has_exited(parent: &ParentProcess) -> Result<bool, String> {
     use windows::Win32::Foundation::{WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
     use windows::Win32::System::Threading::WaitForSingleObject;
@@ -632,7 +779,7 @@ fn parent_has_exited(parent: &ParentProcess) -> Result<bool, String> {
     }
 }
 
-#[cfg(all(windows, debug_assertions))]
+#[cfg(windows)]
 async fn wait_for_parent_exit(parent: &ParentProcess) -> Result<(), String> {
     loop {
         if parent_has_exited(parent)? {
@@ -642,7 +789,7 @@ async fn wait_for_parent_exit(parent: &ParentProcess) -> Result<(), String> {
     }
 }
 
-#[cfg(all(windows, debug_assertions))]
+#[cfg(windows)]
 fn join_error_message(context: &str, error: tokio::task::JoinError) -> String {
     if error.is_panic() {
         format!("{context} panicked")
@@ -653,7 +800,7 @@ fn join_error_message(context: &str, error: tokio::task::JoinError) -> String {
     }
 }
 
-#[cfg(all(windows, debug_assertions))]
+#[cfg(windows)]
 async fn abort_and_drain_connection_tasks(
     tasks: &mut tokio::task::JoinSet<()>,
 ) -> Result<(), String> {
@@ -672,7 +819,7 @@ async fn abort_and_drain_connection_tasks(
     first_error.map_or(Ok(()), Err)
 }
 
-#[cfg(all(windows, debug_assertions))]
+#[cfg(windows)]
 async fn drain_then_abort_connection_tasks(
     tasks: &mut tokio::task::JoinSet<()>,
     drain: Duration,
@@ -705,7 +852,7 @@ async fn drain_then_abort_connection_tasks(
     }
 }
 
-#[cfg(all(windows, debug_assertions))]
+#[cfg(windows)]
 enum HostLoopExit {
     Parent(Result<(), String>),
     Listener(String),
@@ -715,7 +862,7 @@ enum HostLoopExit {
     Connection(tokio::task::JoinError),
 }
 
-#[cfg(all(windows, debug_assertions))]
+#[cfg(windows)]
 async fn finish_supervised_host(
     exit: HostLoopExit,
     connection_tasks: &mut tokio::task::JoinSet<()>,
@@ -791,7 +938,7 @@ async fn finish_supervised_host(
     }
 }
 
-#[cfg(all(windows, debug_assertions))]
+#[cfg(windows)]
 fn spawn_connection_task(
     tasks: &mut tokio::task::JoinSet<()>,
     connection: HostConnection,
@@ -812,10 +959,10 @@ fn spawn_connection_task(
     });
 }
 
-#[cfg(all(windows, debug_assertions))]
+#[cfg(windows)]
 async fn serve_foreground_host(
     profile: &str,
-    parent: ParentProcess,
+    parent: Option<ParentProcess>,
     host_boot_id: Uuid,
     bus: CommandBus,
     config_store: ConfigStore,
@@ -861,7 +1008,12 @@ async fn serve_foreground_host(
     let exit = loop {
         tokio::select! {
             biased;
-            parent_result = wait_for_parent_exit(&parent) => {
+            parent_result = async {
+                match &parent {
+                    Some(parent) => wait_for_parent_exit(parent).await,
+                    None => std::future::pending::<Result<(), String>>().await,
+                }
+            } => {
                 break HostLoopExit::Parent(parent_result);
             }
             executor_result = &mut join => {

@@ -97,3 +97,53 @@ fn entry_host_binary_remains_alongside_product_main() {
         "sole product client entry must be src/main.rs"
     );
 }
+
+#[test]
+fn entry_production_host_is_not_deferred_and_omits_parent_pid() {
+    let host = read_source("src/bin/devmanager-host.rs");
+    assert!(
+        !host.contains("release host startup is deferred until Phase 11"),
+        "production host startup must not remain deferred"
+    );
+    assert!(
+        host.contains("parse_production_args") && host.contains("prepare_production_paths"),
+        "production host must resolve Production profile paths"
+    );
+    assert!(
+        host.contains("PRODUCTION_HOST_PROFILE"),
+        "production host must use a stable production pipe/lock profile"
+    );
+    let shell = read_source("src/ui/native_shell.rs");
+    assert!(
+        shell.contains("try_attach_existing_host"),
+        "client must attach-first before launching the sibling host"
+    );
+    assert!(
+        shell.contains("DetachOnClientClose"),
+        "production client close must detach without killing the durable host"
+    );
+    assert!(
+        shell.contains("\"devmanager/\"")
+            || shell.contains("CLIENT_BUILD_PREFIX: &str = \"devmanager\""),
+        "client identity must be stable devmanager/<version>"
+    );
+    assert!(
+        !shell.contains("\"devmanager-next/"),
+        "product runtime must not advertise devmanager-next client builds"
+    );
+    let production_args_slice = shell
+        .split("NativeHostLaunchMode::Production =>")
+        .nth(1)
+        .unwrap_or_default();
+    assert!(
+        production_args_slice.contains("--foreground"),
+        "production launch must still pass --foreground"
+    );
+    assert!(
+        !production_args_slice
+            .lines()
+            .take(8)
+            .any(|line| line.contains("--parent-pid")),
+        "production launch must not pass --parent-pid"
+    );
+}
