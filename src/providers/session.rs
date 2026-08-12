@@ -6286,18 +6286,18 @@ impl<L: ProviderProcessLauncher, S: ProviderSessionStateStore> ProviderSessionMa
                         settled,
                     },
                 );
-                let release_error = self.state_store.release_recovery(state, claim).err();
+                // The durable handoff intent is still unconfirmed. Retaining
+                // the original recovery claim prevents another owner from
+                // treating this same receipt as an independent generation
+                // while the opaque lease remains local and retryable.
                 self.remember_release_residue(receipt);
-                return Err(release_error.map_or(
-                    ProviderSessionError::StopFailed(error),
-                    |release_error| ProviderSessionError::RecoveryReleaseFailed {
-                        agent_session_id: state.agent_session_id,
-                        generation: state.generation,
-                        error: format!(
-                            "handoff failed: {error:?}; recovery claim release failed: {release_error}"
-                        ),
-                    },
-                ));
+                return Err(ProviderSessionError::RecoveryReleaseFailed {
+                    agent_session_id: state.agent_session_id,
+                    generation: state.generation,
+                    error: format!(
+                        "handoff failed while the unconfirmed recovery claim was retained: {error:?}"
+                    ),
+                });
             }
         };
         #[cfg(test)]
@@ -8454,6 +8454,46 @@ mod tests {
         ));
         assert_eq!(launcher.snapshot().lease_drops(), 0);
         drop(reopened);
+    }
+
+    #[test]
+    fn failed_external_handoff_retains_claim_while_receipt_is_unconfirmed() {
+        let launcher = FixtureProviderProcessLauncher::new();
+        let agent = AgentSessionFacts::new(
+            TaskId::new(),
+            AgentRole::Primary,
+            ProviderKind::ClaudeCode,
+            None,
+        )
+        .unwrap();
+        let path = tempfile::NamedTempFile::new().unwrap();
+        let mut manager = ProviderSessionManager::with_state_store(
+            launcher.clone(),
+            SqliteProviderSessionStateStore::open(path.path()).unwrap(),
+        );
+        let runtime = manager.start(test_request(agent.clone())).unwrap();
+        launcher.set_recovery_error_permanently(Some(ProviderLaunchError::BridgeUnavailable));
+
+        assert!(matches!(
+            manager.prepare_for_shutdown(),
+            Err(ProviderSessionError::RecoveryReleaseFailed { .. })
+        ));
+        drop(runtime);
+        let pending = SqliteProviderSessionStateStore::open(path.path())
+            .unwrap()
+            .list_recovery_releases()
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].handoff_receipt.is_some());
+        assert!(!pending[0].handoff_confirmed);
+
+        let mut foreign_store = SqliteProviderSessionStateStore::open(path.path()).unwrap();
+        assert!(foreign_store
+            .claim_recovery(&pending[0].state, Uuid::now_v7(), recovery_now_ms())
+            .unwrap()
+            .is_none());
+        assert_eq!(launcher.snapshot().lease_drops(), 0);
+        std::mem::forget(manager);
     }
 
     #[test]
