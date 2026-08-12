@@ -1,0 +1,34 @@
+{
+  "schema": "devmanager.ui.quality/v1",
+  "id": "quality-keyboard",
+  "title": "Keyboard navigation",
+  "surface": "isolated_preview",
+  "visual_gate": {
+    "kind": "requires_canonical_shell",
+    "reason": "HOLD: isolated preview is not Phase 5 PASS. Authority: tests/fixtures/ui/phase5-promotion-contract.json. A typed HOLD is not PASS.",
+    "missing": ["phase5-promotion-contract"]
+  },
+  "controls": [
+    {
+      "id": "save",
+      "kind": "button",
+      "name": "Save changes",
+      "action": "task.list"
+    },
+    {
+      "id": "retry",
+      "kind": "button",
+      "name": "Retry load",
+      "action": "host.status"
+    },
+    {
+      "id": "inspect",
+      "kind": "button",
+      "name": "Inspect host",
+      "action": "host.actions"
+    }
+  ],
+  "keyboard": {
+    "order": ["save", "retry", "inspect"]
+  }
+}

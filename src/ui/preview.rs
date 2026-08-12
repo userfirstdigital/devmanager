@@ -726,7 +726,7 @@ fn checked_path(path: &Path) -> Result<PathBuf, PreviewError> {
     Ok(checked)
 }
 
-fn is_within(path: &Path, root: &Path) -> bool {
+pub(crate) fn is_within(path: &Path, root: &Path) -> bool {
     if path.starts_with(root) {
         return true;
     }
@@ -746,7 +746,7 @@ fn is_within(path: &Path, root: &Path) -> bool {
     }
 }
 
-fn is_sensitive_path(path: &Path) -> bool {
+pub(crate) fn is_sensitive_path(path: &Path) -> bool {
     let sensitive_components = [
         "appdata",
         "programdata",

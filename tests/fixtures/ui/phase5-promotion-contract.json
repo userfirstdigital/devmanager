@@ -1,0 +1,289 @@
+{
+  "schema": "devmanager.ui.quality.promotion/v1",
+  "id": "phase5-promotion-contract",
+  "rule": "A typed HOLD is not PASS. Synthetic fixtures, private booleans, stale screenshots, and disconnected models cannot promote a gate.",
+  "authority": "tests/fixtures/ui/phase5-promotion-contract.json",
+  "fixture_sentinel": "phase5-promotion-contract",
+  "verification_order": [
+    "cargo test --test ui_quality_gates quality_phase5_promotion_contract_rejects_hold_proxies_and_disconnected_models -- --exact",
+    "cargo test --test ui_quality_gates -- --test-threads=1",
+    "rerun exact promotion test after shell/virtual_list/renderers/ui_focus/Capture exist; must RED until measurements exist. Do not run --lib."
+  ],
+  "forbidden_siblings": [
+    "tests/fixtures/ui/quality/hold-union.json"
+  ],
+  "shared_absent": [
+    "src/ui/shell.rs",
+    "src/ui/task_cockpit",
+    "src/ui/renderers",
+    "src/ui/virtual_list.rs",
+    "tests/ui_focus.rs",
+    "tests/ui_actions.rs",
+    "tests/renderer_registry.rs",
+    "scripts/native-next/Capture-UiPreviews.ps1"
+  ],
+  "stale_screenshot_roots": [
+    ".devmanager-next/evidence/phase-05/screenshots"
+  ],
+  "surfaces": [
+    {
+      "id": "manifest",
+      "fixture_id": "quality-manifest",
+      "file": "tests/fixtures/ui/quality/manifest.json",
+      "role": "isolated_preview_declaration",
+      "owning_test": "quality_fixtures_stay_on_the_isolated_preview_surface_and_refuse_production_paths",
+      "owning_gate": "anatomy"
+    },
+    {
+      "id": "accessibility",
+      "fixture_id": "quality-accessibility",
+      "file": "tests/fixtures/ui/quality/accessibility.json",
+      "role": "named_roles_not_accesskit",
+      "owning_test": "quality_accessibility_fixture_projects_named_roles_states_and_color_independent_status",
+      "owning_gate": "accesskit_actions"
+    },
+    {
+      "id": "focus_epochs",
+      "fixture_id": "quality-focus-epochs",
+      "file": "tests/fixtures/ui/quality/focus-epochs.json",
+      "role": "epoch_fencing_not_click_through",
+      "owning_test": "quality_focus_epoch_uses_shared_interaction_state_model",
+      "owning_gate": "focus_click_through"
+    },
+    {
+      "id": "keyboard_wrap",
+      "fixture_id": "quality-keyboard",
+      "file": "tests/fixtures/ui/quality/keyboard.json",
+      "role": "enter_space_not_shell_tab_wrap",
+      "owning_test": "quality_keyboard_activation_uses_shared_interaction_state_model",
+      "owning_gate": "accesskit_actions"
+    },
+    {
+      "id": "virtualization",
+      "fixture_id": "quality-virtualization",
+      "file": "tests/fixtures/ui/quality/virtualization.json",
+      "role": "client_model_inbox_not_timeline",
+      "owning_test": "quality_inbox_window_replays_client_model_task_ids",
+      "owning_gate": "semantic_timeline_20k"
+    },
+    {
+      "id": "scales",
+      "fixture_id": "quality-scales",
+      "file": "tests/fixtures/ui/quality/scales.json",
+      "role": "token_math_not_dpi_png",
+      "owning_test": "quality_scale_contracts_cover_100_125_150_and_200_percent",
+      "owning_gate": "dpi_200"
+    },
+    {
+      "id": "cancellation",
+      "fixture_id": "quality-cancellation",
+      "file": "tests/fixtures/ui/quality/cancellation.json",
+      "role": "cleanup_type_not_command_bus",
+      "owning_test": "quality_host_cleanup_and_shutdown_hold_without_command_bus",
+      "owning_gate": "shutdown_5s"
+    },
+    {
+      "id": "content_states",
+      "fixture_id": "quality-content-states",
+      "file": "tests/fixtures/ui/quality/content-states.json",
+      "role": "empty_error_not_anatomy_png",
+      "owning_test": "quality_content_states_consume_canonical_empty_error_and_hold_partial",
+      "owning_gate": "anatomy"
+    }
+  ],
+  "shell_union": {
+    "delete": [
+      "tests/fixtures/ui/quality/hold-union.json",
+      "tests/fixtures/ui/quality/manifest.json",
+      "src/ui/quality.rs"
+    ],
+    "port": [
+      "tests/fixtures/ui/phase5-promotion-contract.json",
+      "tests/ui_quality_gates.rs",
+      "tests/fixtures/ui/quality/accessibility.json",
+      "tests/fixtures/ui/quality/focus-epochs.json",
+      "tests/fixtures/ui/quality/keyboard.json",
+      "tests/fixtures/ui/quality/virtualization.json",
+      "tests/fixtures/ui/quality/scales.json",
+      "tests/fixtures/ui/quality/cancellation.json",
+      "tests/fixtures/ui/quality/content-states.json"
+    ]
+  },
+  "gates": [
+    {
+      "id": "focus_click_through",
+      "hold_ids": [
+        "focus_click_through_shell_questions_approvals_terminal",
+        "ui_focus_tests"
+      ],
+      "measurement": "FocusCoordinator consume on task switch, question, approval, and terminal mouse; stale FocusEpoch pointer_up must not activate",
+      "artifacts": [
+        { "path": "tests/ui_focus.rs", "kind": "absent", "sha256": "ABSENT", "run_identity": "cargo test --test ui_quality_gates quality_phase5_promotion_contract_rejects_hold_proxies_and_disconnected_models -- --exact" },
+        { "path": "src/ui/shell.rs", "kind": "absent", "sha256": "ABSENT", "run_identity": "cargo test --test ui_quality_gates quality_phase5_promotion_contract_rejects_hold_proxies_and_disconnected_models -- --exact" },
+        { "path": "src/ui/components/interaction.rs", "kind": "present_insufficient", "sha256": "LIVE", "run_identity": "cargo test --test ui_quality_gates quality_phase5_promotion_contract_rejects_hold_proxies_and_disconnected_models -- --exact" }
+      ],
+      "rejects": [
+        "HOLD",
+        "synthetic fixture",
+        "private boolean",
+        "disconnected InteractionStateModel without shell"
+      ]
+    },
+    {
+      "id": "raw_terminal_preservation",
+      "hold_ids": ["raw_terminal_shared_provider_session"],
+      "measurement": "100 semantic/raw switches leave provider process count and PTY reader count unchanged",
+      "artifacts": [
+        { "path": "src/ui/task_cockpit", "kind": "absent", "sha256": "ABSENT", "run_identity": "cargo test --test ui_quality_gates quality_phase5_promotion_contract_rejects_hold_proxies_and_disconnected_models -- --exact" },
+        { "path": "src/ui/shell.rs", "kind": "absent", "sha256": "ABSENT", "run_identity": "cargo test --test ui_quality_gates quality_phase5_promotion_contract_rejects_hold_proxies_and_disconnected_models -- --exact" }
+      ],
+      "rejects": [
+        "HOLD",
+        "synthetic fixture",
+        "private boolean",
+        "disconnected ClientModel TaskCreated as terminal"
+      ]
+    },
+    {
+      "id": "semantic_timeline_20k",
+      "hold_ids": [
+        "timeline",
+        "semantic_timeline_event_journal_not_terminal",
+        "renderer_registry"
+      ],
+      "measurement": "20000 DomainEvent journal items through src/ui/renderers and src/ui/virtual_list.rs; not PTY or raw terminal",
+      "artifacts": [
+        { "path": "src/ui/renderers", "kind": "absent", "sha256": "ABSENT", "run_identity": "cargo test --test ui_quality_gates quality_phase5_promotion_contract_rejects_hold_proxies_and_disconnected_models -- --exact" },
+        { "path": "src/ui/virtual_list.rs", "kind": "absent", "sha256": "ABSENT", "run_identity": "cargo test --test ui_quality_gates quality_phase5_promotion_contract_rejects_hold_proxies_and_disconnected_models -- --exact" },
+        { "path": "tests/renderer_registry.rs", "kind": "absent", "sha256": "ABSENT", "run_identity": "cargo test --test ui_quality_gates quality_phase5_promotion_contract_rejects_hold_proxies_and_disconnected_models -- --exact" }
+      ],
+      "rejects": [
+        "HOLD",
+        "synthetic fixture",
+        "private boolean",
+        "disconnected ClientModel TaskCreated replay"
+      ]
+    },
+    {
+      "id": "inbox_5k",
+      "hold_ids": ["inbox", "virtual_list_5k_inbox"],
+      "measurement": "5000 ClientModel tasks through src/ui/virtual_list.rs at 60fps with window <= 24",
+      "artifacts": [
+        { "path": "src/ui/virtual_list.rs", "kind": "absent", "sha256": "ABSENT", "run_identity": "cargo test --test ui_quality_gates quality_phase5_promotion_contract_rejects_hold_proxies_and_disconnected_models -- --exact" }
+      ],
+      "rejects": [
+        "HOLD",
+        "synthetic fixture",
+        "private boolean",
+        "inbox-NNNN stand-in ids"
+      ]
+    },
+    {
+      "id": "dpi_200",
+      "hold_ids": ["windows_200pct_uia_walkthrough"],
+      "measurement": "200 percent Windows scale UIA walkthrough of inbox, timeline, question, approval, composer, dock, terminal with no clip",
+      "artifacts": [
+        { "path": "scripts/native-next/Capture-UiPreviews.ps1", "kind": "absent", "sha256": "ABSENT", "run_identity": "cargo test --test ui_quality_gates quality_phase5_promotion_contract_rejects_hold_proxies_and_disconnected_models -- --exact" }
+      ],
+      "rejects": [
+        "HOLD",
+        "synthetic fixture",
+        "private boolean",
+        "token physical math as 200 percent proof"
+      ]
+    },
+    {
+      "id": "accesskit_actions",
+      "hold_ids": ["accesskit_shell_actions"],
+      "measurement": "AccessKit Default action activates the named focused shell control on inbox, timeline, question, approval, composer, dock, and terminal",
+      "artifacts": [
+        { "path": "src/ui/shell.rs", "kind": "absent", "sha256": "ABSENT", "run_identity": "cargo test --test ui_quality_gates quality_phase5_promotion_contract_rejects_hold_proxies_and_disconnected_models -- --exact" },
+        { "path": "tests/ui_accessibility.rs", "kind": "present_insufficient", "sha256": "LIVE", "run_identity": "cargo test --test ui_quality_gates quality_phase5_promotion_contract_rejects_hold_proxies_and_disconnected_models -- --exact" }
+      ],
+      "rejects": [
+        "HOLD",
+        "synthetic fixture",
+        "private boolean",
+        "AccessibleRole on isolated Button"
+      ]
+    },
+    {
+      "id": "preview_pixels",
+      "hold_ids": ["gpui_png_readback", "capture_ui_previews_png_matrix"],
+      "measurement": "Capture-UiPreviews.ps1 writes inspected IHDR PNGs after render_to_output success; VisualGate has no success arm until then",
+      "artifacts": [
+        { "path": "scripts/native-next/Capture-UiPreviews.ps1", "kind": "absent", "sha256": "ABSENT", "run_identity": "cargo test --test ui_quality_gates quality_phase5_promotion_contract_rejects_hold_proxies_and_disconnected_models -- --exact" }
+      ],
+      "rejects": [
+        "HOLD",
+        "synthetic fixture",
+        "private boolean",
+        "stale screenshot"
+      ]
+    },
+    {
+      "id": "shutdown_5s",
+      "hold_ids": ["host_cleanup_worker_command_bus_5s_deadline"],
+      "measurement": "HostCleanupWorker::run_once(&mut CommandBus) under QUIT_TERMINAL_ACK_TIMEOUT Duration::from_secs(5)",
+      "artifacts": [
+        { "path": "src/host/connection.rs", "kind": "present_insufficient", "sha256": "LIVE", "run_identity": "cargo test --test ui_quality_gates quality_phase5_promotion_contract_rejects_hold_proxies_and_disconnected_models -- --exact" }
+      ],
+      "rejects": [
+        "HOLD",
+        "synthetic fixture",
+        "private boolean",
+        "quality shutdown bool"
+      ]
+    },
+    {
+      "id": "perf_p95_idle",
+      "hold_ids": [
+        "performance_budgets",
+        "perf_host_event_p95_100ms",
+        "perf_nav_p95_50ms",
+        "perf_typing_p95_16ms",
+        "perf_scroll_60fps",
+        "perf_idle_cpu_below_1pct"
+      ],
+      "measurement": "host event p95<=100ms, nav p95<=50ms, typing p95<=16ms, scroll 60fps, idle CPU<1%, no sync fs/process/port/network on paint/input",
+      "artifacts": [
+        { "path": "src/ui/shell.rs", "kind": "absent", "sha256": "ABSENT", "run_identity": "cargo test --test ui_quality_gates quality_phase5_promotion_contract_rejects_hold_proxies_and_disconnected_models -- --exact" }
+      ],
+      "rejects": [
+        "HOLD",
+        "synthetic fixture",
+        "private boolean",
+        "synthetic timing fixture"
+      ]
+    },
+    {
+      "id": "anatomy",
+      "hold_ids": ["desktop_mobile_anatomy", "task_cockpit_shell"],
+      "measurement": "desktop and mobile Task Cockpit anatomy PNGs at dark/light and compact/comfortable",
+      "artifacts": [
+        { "path": "src/ui/shell.rs", "kind": "absent", "sha256": "ABSENT", "run_identity": "cargo test --test ui_quality_gates quality_phase5_promotion_contract_rejects_hold_proxies_and_disconnected_models -- --exact" },
+        { "path": "src/ui/task_cockpit", "kind": "absent", "sha256": "ABSENT", "run_identity": "cargo test --test ui_quality_gates quality_phase5_promotion_contract_rejects_hold_proxies_and_disconnected_models -- --exact" }
+      ],
+      "rejects": [
+        "HOLD",
+        "synthetic fixture",
+        "private boolean",
+        "stale screenshot"
+      ]
+    },
+    {
+      "id": "actions",
+      "hold_ids": ["ui_actions_tests"],
+      "measurement": "tests/ui_actions.rs GPUI dispatch of ActionCatalog create/rename on the shell",
+      "artifacts": [
+        { "path": "tests/ui_actions.rs", "kind": "absent", "sha256": "ABSENT", "run_identity": "cargo test --test ui_quality_gates quality_phase5_promotion_contract_rejects_hold_proxies_and_disconnected_models -- --exact" }
+      ],
+      "rejects": [
+        "HOLD",
+        "synthetic fixture",
+        "private boolean",
+        "disconnected catalog request without GPUI"
+      ]
+    }
+  ]
+}

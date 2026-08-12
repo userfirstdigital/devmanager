@@ -8,6 +8,7 @@ use gpui::{App, Global};
 
 pub mod components;
 pub mod preview;
+pub mod quality;
 pub mod tokens;
 
 pub use preview::PreviewInitReport;
