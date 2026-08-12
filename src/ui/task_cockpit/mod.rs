@@ -50,3 +50,5 @@ pub use inbox::{
 
 
  pub mod composer;
+pub mod dock;
+pub mod shell;

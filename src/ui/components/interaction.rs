@@ -334,6 +334,8 @@ pub enum AccessibleRole {
     Status,
     Alert,
     Region,
+    Tab,
+    TabList,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

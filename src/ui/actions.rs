@@ -11,6 +11,151 @@ use crate::client::action::{
 use crate::domain::id::TaskId;
 use crate::ui::components::interaction::FocusEpoch;
 use crate::ui::components::{AccessibilityMetadata, AccessibleRole, InteractionStateModel};
+use gpui::KeyBinding;
+
+// GPUI adapters are the single native dispatch surface for the shared client
+// action catalog. They carry no host state and do not mint additional IDs.
+#[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
+#[action(name = "host.actions")]
+pub struct HostActions;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
+#[action(name = "host.status")]
+pub struct HostStatus;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
+#[action(name = "task.list")]
+pub struct TaskListAction;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
+#[action(name = "task.show")]
+pub struct TaskShow;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
+#[action(name = "task.create")]
+pub struct TaskCreate;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
+#[action(name = "task.rename")]
+pub struct TaskRename;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
+#[action(name = "native.open_palette")]
+pub struct NativeOpenPalette;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
+#[action(name = "native.open_task_switcher")]
+pub struct NativeOpenTaskSwitcher;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
+#[action(name = "native.open_command_palette")]
+pub struct NativeOpenCommandPalette;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
+#[action(name = "native.dock_changes")]
+pub struct NativeDockChanges;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
+#[action(name = "native.dock_files")]
+pub struct NativeDockFiles;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
+#[action(name = "native.dock_terminal")]
+pub struct NativeDockTerminal;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
+#[action(name = "native.dock_browser")]
+pub struct NativeDockBrowser;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
+#[action(name = "native.dock_services")]
+pub struct NativeDockServices;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
+#[action(name = "native.dock_artifacts")]
+pub struct NativeDockArtifacts;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
+#[action(name = "native.dock_review")]
+pub struct NativeDockReview;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
+#[action(name = "native.open_terminal")]
+pub struct NativeOpenTerminal;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
+#[action(name = "native.dismiss_transient")]
+pub struct NativeDismissTransient;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
+#[action(name = "dock.tool.changes")]
+pub struct DockSelectChanges;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
+#[action(name = "dock.tool.files")]
+pub struct DockSelectFiles;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
+#[action(name = "dock.tool.terminal")]
+pub struct DockSelectTerminal;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
+#[action(name = "dock.tool.browser")]
+pub struct DockSelectBrowser;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
+#[action(name = "dock.tool.services")]
+pub struct DockSelectServices;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
+#[action(name = "dock.tool.artifacts")]
+pub struct DockSelectArtifacts;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
+#[action(name = "dock.tool.review")]
+pub struct DockSelectReview;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
+#[action(name = "dock.terminal.toggle")]
+pub struct DockToggleRawTerminal;
+
+pub const TASK_COCKPIT_ACTION_NAMES: [&str; 6] = [
+    ACTION_HOST_ACTIONS,
+    ACTION_HOST_STATUS,
+    ACTION_TASK_LIST,
+    ACTION_TASK_SHOW,
+    ACTION_TASK_CREATE,
+    ACTION_TASK_RENAME,
+];
+
+pub fn register_task_cockpit_bindings(cx: &mut gpui::App) {
+    cx.bind_keys([
+        KeyBinding::new("ctrl-alt-1", HostActions, None),
+        KeyBinding::new("ctrl-alt-2", HostStatus, None),
+        KeyBinding::new("ctrl-alt-3", TaskListAction, None),
+        KeyBinding::new("ctrl-alt-4", TaskShow, None),
+        KeyBinding::new("ctrl-alt-5", TaskCreate, None),
+        KeyBinding::new("ctrl-alt-6", TaskRename, None),
+    ]);
+}
+
+pub fn register_native_keyboard_bindings(cx: &mut gpui::App) {
+    register_task_cockpit_bindings(cx);
+    cx.bind_keys([
+        KeyBinding::new("ctrl-k", NativeOpenPalette, None),
+        KeyBinding::new("ctrl-p", NativeOpenTaskSwitcher, None),
+        KeyBinding::new("ctrl-shift-p", NativeOpenCommandPalette, None),
+        KeyBinding::new("alt-1", NativeDockChanges, None),
+        KeyBinding::new("alt-2", NativeDockFiles, None),
+        KeyBinding::new("alt-3", NativeDockTerminal, None),
+        KeyBinding::new("alt-4", NativeDockBrowser, None),
+        KeyBinding::new("alt-5", NativeDockServices, None),
+        KeyBinding::new("alt-6", NativeDockArtifacts, None),
+        KeyBinding::new("alt-7", NativeDockReview, None),
+        KeyBinding::new("ctrl-`", NativeOpenTerminal, None),
+        KeyBinding::new("escape", NativeDismissTransient, None),
+    ]);
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ActionPresentationKind {

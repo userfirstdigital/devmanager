@@ -209,6 +209,86 @@ pub struct TerminalScrollbarModel {
     pub thumb_height_ratio: f32,
 }
 
+/// Overlay painted over the last valid replica grid. The cockpit never owns a
+/// `TerminalSession`; it only projects a `TerminalReplica` snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TerminalReplicaOverlay {
+    None,
+    Reconnecting,
+    Resyncing,
+    Exited { summary: String },
+}
+
+/// Borrowed replica snapshot plus client-local viewport/overlay state.
+pub struct ReplicaPaneRequest<'a> {
+    pub active_project: &'a str,
+    pub session_label: &'a str,
+    pub replica_view: Option<&'a TerminalSessionView>,
+    pub last_valid_view: Option<&'a TerminalSessionView>,
+    pub overlay: TerminalReplicaOverlay,
+    pub selection: Option<TerminalSelectionSnapshot>,
+    pub search: Option<TerminalSearchUiModel>,
+    pub search_highlight: Option<TerminalSearchHighlight>,
+    pub scrollbar: Option<TerminalScrollbarModel>,
+}
+
+/// Map a Phase 3 replica snapshot onto the existing native terminal surface.
+///
+/// Overlay states use only the last valid grid. They never fall back to an
+/// uncorrelated optional replica view.
+pub fn terminal_pane_from_replica(request: ReplicaPaneRequest<'_>) -> TerminalPaneModel {
+    let session = match &request.overlay {
+        TerminalReplicaOverlay::None => request.replica_view.cloned(),
+        _ => request.last_valid_view.cloned(),
+    };
+    let blocking_notice = match &request.overlay {
+        TerminalReplicaOverlay::Reconnecting => Some(String::from("Reconnecting to terminal")),
+        TerminalReplicaOverlay::Resyncing => Some(String::from("Resynchronizing terminal")),
+        TerminalReplicaOverlay::Exited { summary } => Some(bound_overlay_summary(summary)),
+        TerminalReplicaOverlay::None => None,
+    };
+    let cell_width = session
+        .as_ref()
+        .map(|view| f32::from(view.runtime.dimensions.cell_width))
+        .filter(|width| *width > 0.0)
+        .unwrap_or(8.0);
+    let line_height = session
+        .as_ref()
+        .map(|view| f32::from(view.runtime.dimensions.cell_height))
+        .filter(|height| *height > 0.0)
+        .unwrap_or_else(|| terminal_line_height(TERMINAL_FONT_SIZE));
+    TerminalPaneModel {
+        active_project: request.active_project.to_string(),
+        session_label: request.session_label.to_string(),
+        active_tab_type: None,
+        session,
+        startup_notice: None,
+        blocking_notice,
+        actionable_notice: None,
+        pending_annotations: Vec::new(),
+        debug_enabled: false,
+        font_size: TERMINAL_FONT_SIZE,
+        cell_width,
+        line_height,
+        selection: request.selection,
+        search: request.search,
+        search_highlight: request.search_highlight,
+        scrollbar: request.scrollbar,
+        runtime_controls: None,
+        splash_image: None,
+    }
+}
+
+fn bound_overlay_summary(summary: &str) -> String {
+    crate::ui::components::interaction::redacted_bounded_text(
+        "terminal exit summary",
+        summary,
+        160,
+        640,
+    )
+    .unwrap_or_else(|_| String::from("Terminal exited"))
+}
+
 pub fn render_terminal_surface(
     model: &TerminalPaneModel,
     actions: Option<TerminalPaneActions>,
