@@ -8,6 +8,7 @@ use gpui::{App, Global};
 
 pub mod preview;
 pub mod preview_capture;
+pub mod tokens;
 
 pub use preview::PreviewInitReport;
 

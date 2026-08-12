@@ -1,3 +1,11 @@
+//! Compatibility surface for legacy callers.
+//!
+//! New native cockpit code imports `crate::ui::tokens`. The legacy GPUI
+//! surface remains byte-for-byte on its existing dark palette until the
+//! explicit cutover, so adding the token contract cannot recolor it early.
+
+pub use crate::ui::tokens::*;
+
 // Backgrounds — zinc scale
 pub const APP_BG: u32 = 0x18181b; // zinc-900
 pub const SIDEBAR_BG: u32 = 0x27272a; // zinc-800
@@ -50,14 +58,3 @@ pub const PRIMARY_MUTED: u32 = 0x2c266b; // indigo-900 tint for subtle highlight
 // Hover variants
 pub const ROW_HOVER_BG: u32 = 0x323238; // zinc-700/30 approximation
 pub const BUTTON_HOVER_BG: u32 = 0x52525b; // zinc-600
-
-pub fn parse_hex_color(value: Option<&str>, fallback: u32) -> u32 {
-    let Some(value) = value.map(str::trim) else {
-        return fallback;
-    };
-    let hex = value.strip_prefix('#').unwrap_or(value);
-    if hex.len() != 6 {
-        return fallback;
-    }
-    u32::from_str_radix(hex, 16).unwrap_or(fallback)
-}
