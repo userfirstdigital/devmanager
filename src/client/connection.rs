@@ -5,7 +5,7 @@
 //! waiters before enqueueing writes. Unsolicited durable messages land in a
 //! bounded inbox for later subscription consumers.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -14,6 +14,8 @@ use tokio::sync::{mpsc, oneshot};
 use crate::domain::command::{CommandEnvelope, CommandReceipt};
 use crate::domain::event::DomainEvent;
 use crate::domain::id::{CommandId, RequestId, SubscriptionId};
+#[cfg(test)]
+use crate::domain::query::{Query, QueryError, QueryOutcome};
 use crate::domain::query::{QueryEnvelope, QueryReply};
 use crate::domain::{ClientId, MAX_SNAPSHOT_PAGE_ENCODED_BYTES, MAX_SNAPSHOT_PAGE_ITEMS};
 use crate::host::{
@@ -30,6 +32,9 @@ use crate::protocol::{
 const WRITE_QUEUE_CAPACITY: usize = 32;
 const UNSOLICITED_QUEUE_CAPACITY: usize = 64;
 const UNSOLICITED_STREAM_CAPACITY: usize = 16;
+const MAX_RETIRED_SUBSCRIPTION_IDS: usize = 64;
+const MAX_RETIRED_DRAIN_WORK: usize = UNSOLICITED_QUEUE_CAPACITY;
+const MAX_RETAINED_DURABLE_MESSAGES: usize = UNSOLICITED_QUEUE_CAPACITY * 2;
 
 /// Scripted detach I/O behavior for unit tests.
 #[cfg(test)]
@@ -41,6 +46,8 @@ pub(crate) enum ScriptedDetachBehavior {
     WrongConnectionAck,
     /// Reject enqueue immediately (closed write queue / transport unavailable).
     ClosedWriteQueue,
+    /// Return a correlated application error for ReleaseEventReplay.
+    ReleaseQueryError,
 }
 
 /// Unsolicited server→client messages (not correlated replies).
@@ -58,30 +65,80 @@ pub enum UnsolicitedServerMessage {
     Stream(StreamFrame),
 }
 
-/// Durable-priority unsolicited inbox with a separate coalescing stream lane.
-struct UnsolicitedInbox {
+#[derive(Clone, Copy)]
+enum UnsolicitedLane {
+    Durable,
+    Retained,
+    Stream,
+}
+
+impl UnsolicitedLane {
+    fn next(self) -> Self {
+        match self {
+            Self::Durable => Self::Retained,
+            Self::Retained => Self::Stream,
+            Self::Stream => Self::Durable,
+        }
+    }
+}
+
+/// Bounded fair unsolicited inbox with separate retained, durable, and
+/// coalescing current-stream lanes.
+struct DurableInboxState {
     durable_tx: mpsc::Sender<UnsolicitedServerMessage>,
-    durable_rx: tokio::sync::Mutex<mpsc::Receiver<UnsolicitedServerMessage>>,
+    durable_rx: mpsc::Receiver<UnsolicitedServerMessage>,
+    /// Non-retired durable messages removed while fencing an old generation.
+    /// They are drained before newly queued messages to preserve wire order.
+    retained_durable: VecDeque<UnsolicitedServerMessage>,
+    /// Subscription ids fenced at release. This set is deliberately bounded;
+    /// exhausting it forces a typed reconnect instead of allowing an old tail
+    /// to poison a replacement generation.
+    retired_subscription_ids: HashSet<SubscriptionId>,
+}
+
+struct UnsolicitedInbox {
+    /// Admission, retirement, and dequeue share one short synchronous fence.
+    /// This makes the retired check plus nonblocking send atomic with the
+    /// retirement mark plus queue drain: an old frame is either linearized
+    /// before retirement and drained, or observes the retired id.
+    durable: Mutex<DurableInboxState>,
+    next_lane: Mutex<UnsolicitedLane>,
     stream_capacity: usize,
     streams: Mutex<std::collections::HashMap<crate::protocol::StreamKey, StreamFrame>>,
     notify: tokio::sync::Notify,
     closed: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     close_gap_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    admission_barrier: Mutex<
+        Option<(
+            std::sync::Arc<std::sync::Barrier>,
+            std::sync::Arc<std::sync::Barrier>,
+        )>,
+    >,
 }
 
 impl UnsolicitedInbox {
     fn new(durable_capacity: usize, stream_capacity: usize) -> Self {
         let (durable_tx, durable_rx) = mpsc::channel(durable_capacity.max(1));
         Self {
-            durable_tx,
-            durable_rx: tokio::sync::Mutex::new(durable_rx),
+            durable: Mutex::new(DurableInboxState {
+                durable_tx,
+                durable_rx,
+                retained_durable: VecDeque::new(),
+                retired_subscription_ids: HashSet::new(),
+            }),
+            // Preserve the durable-first admission behavior, then rotate
+            // retained and current-stream work before another durable turn.
+            next_lane: Mutex::new(UnsolicitedLane::Durable),
             stream_capacity: stream_capacity.max(1),
             streams: Mutex::new(std::collections::HashMap::new()),
             notify: tokio::sync::Notify::new(),
             closed: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             close_gap_hook: Mutex::new(None),
+            #[cfg(test)]
+            admission_barrier: Mutex::new(None),
         }
     }
 
@@ -93,6 +150,15 @@ impl UnsolicitedInbox {
     #[cfg(test)]
     fn install_close_gap_hook(&self, hook: Box<dyn FnOnce() + Send>) {
         *self.close_gap_hook.lock().expect("close gap hook") = Some(hook);
+    }
+
+    #[cfg(test)]
+    fn install_admission_barrier(
+        &self,
+        entered: std::sync::Arc<std::sync::Barrier>,
+        release: std::sync::Arc<std::sync::Barrier>,
+    ) {
+        *self.admission_barrier.lock().expect("admission barrier") = Some((entered, release));
     }
 
     fn close(&self) {
@@ -112,10 +178,95 @@ impl UnsolicitedInbox {
             | UnsolicitedServerMessage::ResyncRequired { .. } => {}
             UnsolicitedServerMessage::Stream(_) => return Err(IpcError::Unavailable),
         }
-        self.durable_tx
+        let subscription_id = match &message {
+            UnsolicitedServerMessage::DurableEvent {
+                subscription_id, ..
+            }
+            | UnsolicitedServerMessage::ResyncRequired {
+                subscription_id, ..
+            } => *subscription_id,
+            UnsolicitedServerMessage::Stream(_) => return Err(IpcError::Unavailable),
+        };
+        let durable = self.durable.lock().expect("durable inbox");
+        #[cfg(test)]
+        if let Some((entered, release)) = self
+            .admission_barrier
+            .lock()
+            .expect("admission barrier")
+            .take()
+        {
+            // The barrier is deliberately inside the durable fence. Tests can
+            // then start retirement and prove it cannot interleave between the
+            // retired check and the nonblocking send.
+            entered.wait();
+            release.wait();
+        }
+        if durable.retired_subscription_ids.contains(&subscription_id) {
+            // A late exact old-generation tail is fenced at admission. Do not
+            // notify a consumer when there is no message to receive.
+            return Ok(());
+        }
+        durable
+            .durable_tx
             .try_send(message)
             .map_err(|_| IpcError::Unavailable)?;
+        drop(durable);
         self.notify.notify_one();
+        Ok(())
+    }
+
+    fn retire_subscription_id(&self, subscription_id: SubscriptionId) -> Result<(), IpcError> {
+        let mut durable = self.durable.lock().expect("durable inbox");
+        if !durable.retired_subscription_ids.contains(&subscription_id) {
+            if durable.retired_subscription_ids.len() >= MAX_RETIRED_SUBSCRIPTION_IDS {
+                return Err(IpcError::RetiredSubscriptionFlood {
+                    limit: MAX_RETIRED_SUBSCRIPTION_IDS,
+                });
+            }
+            durable.retired_subscription_ids.insert(subscription_id);
+        }
+
+        if durable
+            .retained_durable
+            .len()
+            .saturating_add(durable.durable_rx.len())
+            > MAX_RETAINED_DURABLE_MESSAGES
+        {
+            return Err(IpcError::RetiredSubscriptionFlood {
+                limit: MAX_RETAINED_DURABLE_MESSAGES,
+            });
+        }
+
+        let mut work = 0usize;
+        while work < MAX_RETIRED_DRAIN_WORK {
+            let message = match durable.durable_rx.try_recv() {
+                Ok(message) => message,
+                Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {
+                    break;
+                }
+            };
+            work = work.saturating_add(1);
+            let exact_retired = matches!(
+                &message,
+                UnsolicitedServerMessage::DurableEvent {
+                    subscription_id: observed,
+                    ..
+                }
+                    | UnsolicitedServerMessage::ResyncRequired {
+                        subscription_id: observed,
+                        ..
+                    } if *observed == subscription_id
+            );
+            if !exact_retired {
+                durable.retained_durable.push_back(message);
+            }
+        }
+
+        if !durable.durable_rx.is_empty() {
+            return Err(IpcError::RetiredSubscriptionFlood {
+                limit: MAX_RETIRED_DRAIN_WORK,
+            });
+        }
         Ok(())
     }
 
@@ -134,26 +285,46 @@ impl UnsolicitedInbox {
         Ok(())
     }
 
-    fn try_dequeue(
-        durable: &mut mpsc::Receiver<UnsolicitedServerMessage>,
+    fn try_dequeue_from_state(
+        durable: &mut DurableInboxState,
         streams: &Mutex<std::collections::HashMap<crate::protocol::StreamKey, StreamFrame>>,
+        next_lane: &mut UnsolicitedLane,
     ) -> Option<UnsolicitedServerMessage> {
-        if let Ok(message) = durable.try_recv() {
-            return Some(message);
+        let first_lane = *next_lane;
+        for offset in 0..3 {
+            let lane = match offset {
+                0 => first_lane,
+                1 => first_lane.next(),
+                _ => first_lane.next().next(),
+            };
+            let message = match lane {
+                UnsolicitedLane::Retained => durable.retained_durable.pop_front(),
+                // Retirement moves still-valid older durable frames into the
+                // retained lane. Do not let a newer wire frame leapfrog that
+                // retained truth, even when round-robin currently starts on
+                // the durable lane.
+                UnsolicitedLane::Durable if durable.retained_durable.is_empty() => {
+                    durable.durable_rx.try_recv().ok()
+                }
+                UnsolicitedLane::Durable => None,
+                UnsolicitedLane::Stream => {
+                    let mut streams = streams.lock().expect("stream inbox");
+                    let key = streams.keys().next().copied();
+                    key.and_then(|key| streams.remove(&key))
+                        .map(UnsolicitedServerMessage::Stream)
+                }
+            };
+            if message.is_some() {
+                *next_lane = lane.next();
+                return message;
+            }
         }
-        let mut streams = streams.lock().expect("stream inbox");
-        let key = streams.keys().next().copied();
-        key.and_then(|key| streams.remove(&key))
-            .map(UnsolicitedServerMessage::Stream)
+        None
     }
 
     async fn recv(&self) -> Result<UnsolicitedServerMessage, IpcError> {
-        // Serialize durable-receiver ownership across the whole recv loop so a
-        // concurrent caller cannot miss a queued durable via try_lock and then
-        // sleep on a consumed Notify permit.
-        let mut durable = self.durable_rx.lock().await;
         loop {
-            if let Some(message) = Self::try_dequeue(&mut durable, &self.streams) {
+            if let Some(message) = self.try_dequeue() {
                 return Ok(message);
             }
 
@@ -162,7 +333,7 @@ impl UnsolicitedInbox {
             tokio::pin!(notified);
             notified.as_mut().enable();
 
-            if let Some(message) = Self::try_dequeue(&mut durable, &self.streams) {
+            if let Some(message) = self.try_dequeue() {
                 return Ok(message);
             }
 
@@ -172,7 +343,7 @@ impl UnsolicitedInbox {
             }
 
             if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
-                if let Some(message) = Self::try_dequeue(&mut durable, &self.streams) {
+                if let Some(message) = self.try_dequeue() {
                     return Ok(message);
                 }
                 return Err(IpcError::Unavailable);
@@ -180,6 +351,12 @@ impl UnsolicitedInbox {
 
             notified.await;
         }
+    }
+
+    fn try_dequeue(&self) -> Option<UnsolicitedServerMessage> {
+        let mut next_lane = self.next_lane.lock().expect("unsolicited lane");
+        let mut durable = self.durable.lock().expect("durable inbox");
+        Self::try_dequeue_from_state(&mut durable, &self.streams, &mut next_lane)
     }
 }
 
@@ -410,38 +587,65 @@ impl ClientConnection {
                 drop(write_rx);
                 None
             }
-            ScriptedDetachBehavior::MatchingAck | ScriptedDetachBehavior::WrongConnectionAck => {
+            ScriptedDetachBehavior::MatchingAck
+            | ScriptedDetachBehavior::WrongConnectionAck
+            | ScriptedDetachBehavior::ReleaseQueryError => {
                 let reader_state = Arc::clone(&state);
                 let terminal_state = Arc::clone(&state);
                 let reader_unsolicited = Arc::clone(&unsolicited);
                 let wrong_connection =
                     matches!(behavior, ScriptedDetachBehavior::WrongConnectionAck);
+                let release_query_error =
+                    matches!(behavior, ScriptedDetachBehavior::ReleaseQueryError);
                 Some(tokio::spawn(async move {
                     let mut write_rx = write_rx;
                     while let Some(job) = write_rx.recv().await {
-                        let ClientRequest::Detach(request) = job.request else {
-                            continue;
-                        };
-                        let connection_id = if wrong_connection {
-                            uuid::Uuid::from_bytes([
-                                0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00,
-                                0x00, 0x00, 0x00, 0x00, 0xff,
-                            ])
-                        } else {
-                            request.connection_id
-                        };
-                        if dispatch_server_message(
-                            &reader_state,
-                            &reader_unsolicited,
-                            ServerMessage::Detached(DetachAck {
-                                request_id: request.request_id,
-                                connection_id,
-                            }),
-                        )
-                        .await
-                        .is_err()
-                        {
-                            break;
+                        match job.request {
+                            ClientRequest::Detach(request) => {
+                                let connection_id = if wrong_connection {
+                                    uuid::Uuid::from_bytes([
+                                        0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00,
+                                        0x00, 0x00, 0x00, 0x00, 0x00, 0xff,
+                                    ])
+                                } else {
+                                    request.connection_id
+                                };
+                                if dispatch_server_message(
+                                    &reader_state,
+                                    &reader_unsolicited,
+                                    ServerMessage::Detached(DetachAck {
+                                        request_id: request.request_id,
+                                        connection_id,
+                                    }),
+                                )
+                                .await
+                                .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            ClientRequest::Query(request)
+                                if release_query_error
+                                    && matches!(
+                                        request.query,
+                                        Query::ReleaseEventReplay { .. }
+                                    ) =>
+                            {
+                                if dispatch_server_message(
+                                    &reader_state,
+                                    &reader_unsolicited,
+                                    ServerMessage::QueryReply(QueryReply {
+                                        request_id: request.request_id,
+                                        outcome: QueryOutcome::Err(QueryError::Unauthorized),
+                                    }),
+                                )
+                                .await
+                                .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            _ => {}
                         }
                     }
                     reader_unsolicited.close();
@@ -465,6 +669,14 @@ impl ClientConnection {
     #[cfg(test)]
     pub(crate) fn shares_state_with(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.shared, &other.shared)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn push_durable_for_test(
+        &self,
+        message: UnsolicitedServerMessage,
+    ) -> Result<(), IpcError> {
+        self.shared.unsolicited.push_durable(message)
     }
 
     #[cfg(test)]
@@ -567,6 +779,17 @@ impl ClientConnection {
     /// Receive the next unsolicited message, preferring durable/resync over streams.
     pub async fn recv_unsolicited(&self) -> Result<UnsolicitedServerMessage, IpcError> {
         self.shared.unsolicited.recv().await
+    }
+
+    /// Fence a released durable subscription and drain only its exact queued
+    /// tail. Other durable frames remain ordered for the next generation.
+    pub(crate) async fn retire_subscription_id(
+        &self,
+        subscription_id: SubscriptionId,
+    ) -> Result<(), IpcError> {
+        self.shared
+            .unsolicited
+            .retire_subscription_id(subscription_id)
     }
 
     fn register_waiter(
@@ -989,6 +1212,7 @@ mod tests {
 
     use super::{
         PendingKey, PendingRegistration, PendingReply, SharedState, UnsolicitedServerMessage,
+        MAX_RETIRED_DRAIN_WORK, MAX_RETIRED_SUBSCRIPTION_IDS,
     };
     use crate::domain::command::CommandReceipt;
     use crate::domain::id::CommandId;
@@ -1524,6 +1748,145 @@ mod tests {
         assert_eq!(got[1], second);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn continuous_durable_producer_cannot_starve_current_stream_lane() {
+        use super::UnsolicitedInbox;
+        use crate::domain::event::{DomainEvent, Event};
+        use crate::domain::id::{EventId, ResourceId, SubscriptionId};
+        use crate::protocol::{StreamFrame, StreamKey, StreamPayloadKind};
+        use std::sync::{Arc, Barrier};
+
+        let inbox = Arc::new(UnsolicitedInbox::new_for_test(128, 1));
+        let subscription = SubscriptionId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xa1,
+        ])
+        .expect("subscription");
+        let stream = StreamKey::from(
+            ResourceId::from_bytes([
+                0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0xa2,
+            ])
+            .expect("stream resource"),
+        );
+        let step = Arc::new(Barrier::new(2));
+        let producer = {
+            let inbox = Arc::clone(&inbox);
+            let step = Arc::clone(&step);
+            std::thread::spawn(move || {
+                for marker in 0..64u8 {
+                    inbox
+                        .push_durable(UnsolicitedServerMessage::DurableEvent {
+                            subscription_id: subscription,
+                            event: DomainEvent {
+                                id: EventId::from_bytes([
+                                    0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00,
+                                    0x00, 0x00, 0x00, 0x00, 0x00, marker,
+                                ])
+                                .expect("event"),
+                                task_id: None,
+                                sequence: u64::from(marker),
+                                task_revision: None,
+                                occurred_at_ms: i64::from(marker),
+                                payload: Event::TaskReopened,
+                            },
+                        })
+                        .expect("durable admission");
+                    inbox
+                        .push_stream(StreamFrame {
+                            subscription_id: subscription,
+                            stream,
+                            generation: 1,
+                            sequence: u64::from(marker),
+                            payload_kind: StreamPayloadKind::new(1).expect("payload kind"),
+                            schema_version: 1,
+                            payload: vec![marker],
+                        })
+                        .expect("stream admission");
+                    step.wait();
+                    step.wait();
+                }
+            })
+        };
+
+        let mut stream_count = 0usize;
+        for _ in 0..64 {
+            step.wait();
+            let message = tokio::time::timeout(Duration::from_millis(250), inbox.recv())
+                .await
+                .expect("continuous producer must not leave recv waiting")
+                .expect("recv");
+            if matches!(message, UnsolicitedServerMessage::Stream(_)) {
+                stream_count += 1;
+            }
+            step.wait();
+        }
+        producer.join().expect("producer join");
+        assert!(
+            stream_count >= 32,
+            "current stream lane must receive a fair share while durables stay continuous; got {stream_count}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retained_durable_truth_is_delivered_before_newer_durable_frames() {
+        use super::UnsolicitedInbox;
+        use crate::domain::event::{DomainEvent, Event};
+        use crate::domain::id::{EventId, SubscriptionId};
+
+        let inbox = UnsolicitedInbox::new_for_test(4, 1);
+        let old_id = SubscriptionId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x11,
+        ])
+        .expect("old subscription");
+        let new_id = SubscriptionId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x12,
+        ])
+        .expect("new subscription");
+        let durable = |subscription_id, sequence| UnsolicitedServerMessage::DurableEvent {
+            subscription_id,
+            event: DomainEvent {
+                id: EventId::from_bytes([
+                    0x01,
+                    0x8f,
+                    0x60,
+                    0xb0,
+                    0x9c,
+                    0x1a,
+                    0x70,
+                    0x01,
+                    0x80,
+                    0x00,
+                    0x00,
+                    0x00,
+                    0x00,
+                    0x00,
+                    0x00,
+                    sequence as u8,
+                ])
+                .expect("event"),
+                task_id: None,
+                sequence,
+                task_revision: None,
+                occurred_at_ms: sequence as i64,
+                payload: Event::TaskReopened,
+            },
+        };
+        let retained = durable(new_id, 1);
+        let newer = durable(new_id, 2);
+
+        inbox.push_durable(retained.clone()).expect("old frame");
+        inbox
+            .retire_subscription_id(old_id)
+            .expect("retire old generation");
+        inbox.push_durable(newer.clone()).expect("new frame");
+
+        assert_eq!(inbox.recv().await.expect("retained frame"), retained);
+        assert_eq!(inbox.recv().await.expect("new frame"), newer);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn stream_close_during_recv_wait_returns_unavailable_without_hang() {
         // Catches: close between empty-queue check and waiter registration must not
@@ -1543,5 +1906,168 @@ mod tests {
             Ok(Err(other)) => panic!("expected Unavailable, got {other:?}"),
             Err(_) => panic!("recv hung after close in the former check/wait gap"),
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retirement_admission_barrier_never_leaks_an_old_generation_frame() {
+        use super::UnsolicitedInbox;
+        use crate::domain::event::{DomainEvent, Event};
+        use crate::domain::id::{EventId, SubscriptionId};
+        use std::sync::{Arc, Barrier};
+
+        let inbox = Arc::new(UnsolicitedInbox::new_for_test(4, 1));
+        let subscription_id = SubscriptionId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x01,
+        ])
+        .expect("subscription id");
+        let event = DomainEvent {
+            id: EventId::from_bytes([
+                0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x02,
+            ])
+            .expect("event id"),
+            task_id: None,
+            sequence: 1,
+            task_revision: None,
+            occurred_at_ms: 1,
+            payload: Event::TaskReopened,
+        };
+        let frame = UnsolicitedServerMessage::DurableEvent {
+            subscription_id,
+            event,
+        };
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        inbox.install_admission_barrier(Arc::clone(&entered), Arc::clone(&release));
+
+        let producer = {
+            let inbox = Arc::clone(&inbox);
+            let frame = frame.clone();
+            tokio::task::spawn_blocking(move || inbox.push_durable(frame))
+        };
+        entered.wait();
+        let retire = {
+            let inbox = Arc::clone(&inbox);
+            tokio::task::spawn_blocking(move || inbox.retire_subscription_id(subscription_id))
+        };
+        // The producer is paused while holding the same fence as retirement.
+        // Releasing the barrier chooses a deterministic linearization point:
+        // either the old frame is queued and drained, or it sees retired.
+        release.wait();
+        producer
+            .await
+            .expect("producer join")
+            .expect("admission must remain bounded");
+        retire
+            .await
+            .expect("retirement join")
+            .expect("retirement must remain bounded");
+
+        let next = tokio::time::timeout(Duration::from_millis(50), inbox.recv()).await;
+        assert!(next.is_err(), "retired old frame must not reach a consumer");
+        assert!(
+            inbox.push_durable(frame).is_ok(),
+            "late old frame is fenced"
+        );
+        let next = tokio::time::timeout(Duration::from_millis(50), inbox.recv()).await;
+        assert!(next.is_err(), "late retired frame must be dropped");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retired_id_and_queued_frame_floods_are_typed_and_streams_survive() {
+        use super::UnsolicitedInbox;
+        use crate::domain::event::{DomainEvent, Event};
+        use crate::domain::id::{EventId, ResourceId, SubscriptionId};
+        use crate::protocol::{StreamFrame, StreamKey, StreamPayloadKind};
+
+        let subscription = |tail: u8| {
+            SubscriptionId::from_bytes([
+                0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, tail,
+            ])
+            .expect("subscription id")
+        };
+        let durable =
+            |subscription_id: SubscriptionId, tail: u8| UnsolicitedServerMessage::DurableEvent {
+                subscription_id,
+                event: DomainEvent {
+                    id: EventId::from_bytes([
+                        0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00,
+                        0x00, 0x00, 0x00, tail,
+                    ])
+                    .expect("event id"),
+                    task_id: None,
+                    sequence: u64::from(tail),
+                    task_revision: None,
+                    occurred_at_ms: i64::from(tail),
+                    payload: Event::TaskReopened,
+                },
+            };
+
+        let ids = UnsolicitedInbox::new_for_test(128, 1);
+        for tail in 0..MAX_RETIRED_SUBSCRIPTION_IDS as u8 {
+            ids.retire_subscription_id(subscription(tail))
+                .expect("the bounded retired-id set admits its limit");
+        }
+        let retired_overflow = ids
+            .retire_subscription_id(subscription(MAX_RETIRED_SUBSCRIPTION_IDS as u8))
+            .expect_err("the 65th retired id must force typed resync");
+        assert!(matches!(
+            retired_overflow,
+            IpcError::RetiredSubscriptionFlood { limit } if limit == MAX_RETIRED_SUBSCRIPTION_IDS
+        ));
+        ids.push_durable(durable(subscription(0), 0xf1))
+            .expect("old ids remain harmless after the typed flood");
+        let dropped = tokio::time::timeout(Duration::from_millis(25), ids.recv()).await;
+        assert!(dropped.is_err(), "retired ids must not reach the consumer");
+
+        let flood = UnsolicitedInbox::new_for_test(128, 1);
+        let queued_id = subscription(0xe1);
+        for tail in 0..(MAX_RETIRED_DRAIN_WORK as u8 + 1) {
+            flood
+                .push_durable(durable(queued_id, tail))
+                .expect("test queue admits more than one drain quantum");
+        }
+        let queue_overflow = flood
+            .retire_subscription_id(subscription(0xe2))
+            .expect_err("more than one drain quantum must force typed resync");
+        assert!(matches!(
+            queue_overflow,
+            IpcError::RetiredSubscriptionFlood { limit } if limit == MAX_RETIRED_DRAIN_WORK
+        ));
+
+        let stream_key = StreamKey::from(
+            ResourceId::from_bytes([
+                0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0xe3,
+            ])
+            .expect("stream resource"),
+        );
+        flood
+            .push_stream(StreamFrame {
+                subscription_id: queued_id,
+                stream: stream_key,
+                generation: 2,
+                sequence: 1,
+                payload_kind: StreamPayloadKind::new(1).expect("payload kind"),
+                schema_version: 1,
+                payload: vec![0xe3],
+            })
+            .expect("current stream must remain admissible after durable flood");
+        let mut stream_survived = false;
+        for _ in 0..=MAX_RETIRED_DRAIN_WORK + 1 {
+            if matches!(
+                flood.recv().await.expect("flooded frame"),
+                UnsolicitedServerMessage::Stream(frame) if frame.stream == stream_key
+            ) {
+                stream_survived = true;
+                break;
+            }
+        }
+        assert!(
+            stream_survived,
+            "fair dispatch must preserve a current stream during a retired durable flood"
+        );
     }
 }

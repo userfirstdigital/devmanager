@@ -9,6 +9,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as ProcessCommand, ExitStatus, Stdio};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -18,13 +19,15 @@ use uuid::Uuid;
 
 use devmanager::client::{
     connect, perform_client_hello, ClientSubscription, ClientSubscriptionState, HostClient,
-    HostClientConfig, SubscriptionUpdate, TrackedOperation, UnsolicitedServerMessage,
+    HostClientConfig, InboxHostController, InboxPreferenceStore, SubscriptionError,
+    SubscriptionUpdate, TrackedOperation, UnsolicitedServerMessage,
 };
 use devmanager::config::paths::{resolve_app_paths, AppProfile, BuildKind, ResolvedAppPaths};
 use devmanager::domain::command::{
     Command, CommandEnvelope, CommandReceipt, ConfirmHostQuitIntent, CreateTaskIntent,
     RejectionCode,
 };
+use devmanager::domain::event::{DomainEvent, Event};
 use devmanager::domain::id::{
     AgentSessionId, ArtifactId, CommandId, EnvironmentId, EventId, OperationId, ProjectId,
     RequestId, ResourceId, TaskId,
@@ -48,6 +51,10 @@ use devmanager::host::{
     HOST_EXIT_ALREADY_RUNNING,
 };
 use devmanager::protocol::{Capability, CapabilitySet, ClientHello, FrameLimits};
+use devmanager::ui::shell::{InboxActionKind, Shell};
+use devmanager::ui::task_cockpit::{
+    InboxFilter, InboxPresentationWidth, InboxRenderItem, NativeNextTaskCockpit,
+};
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 
@@ -456,6 +463,202 @@ async fn foreground_host_retains_lock_and_bus_across_client_reconnect() {
         .expect("terminate exact foreground host");
     assert!(!status.success(), "test termination should stop the host");
     assert!(host.try_wait().expect("final host poll").is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_next_bootstrap_drives_visible_inbox_from_fixture_host() {
+    let config_base = TempDir::new().expect("process-unique config base");
+    let profile = unique_profile();
+    let paths = isolated_paths(&config_base, &profile);
+    let lock_path = paths.root.join("host.lock");
+
+    let mut host = ChildGuard::spawn(host_command(config_base.path(), &profile));
+    let _identity = wait_for_identity(&mut host, &lock_path).await;
+
+    let client_id = ClientId::from_bytes(fixed_uuid_v7(0x76)).expect("client id");
+    let command_config = HostClientConfig {
+        named_profile: profile.clone(),
+        client_build: "native-next-inbox-fixture".to_string(),
+        client_id,
+        requested: CapabilitySet::from_capabilities([Capability::OperationSettlement]),
+        limits: FrameLimits::v1_default(),
+    };
+    let mut command_client = connect_bounded(&command_config, &mut host).await;
+    let (create, _, task_id) = create_task_named(
+        client_id,
+        0x77,
+        0x78,
+        0x79,
+        0x7a,
+        "Native-next fixture inbox",
+    );
+    command_client
+        .execute_command(create)
+        .await
+        .expect("fixture task command");
+    command_client.disconnect();
+
+    let subscription_config = HostClientConfig {
+        named_profile: profile,
+        client_build: "native-next-inbox-fixture".to_string(),
+        client_id: ClientId::from_bytes(fixed_uuid_v7(0x7b)).expect("subscription client id"),
+        requested: CapabilitySet::from_capabilities([
+            Capability::PagedSnapshots,
+            Capability::EventReplay,
+        ]),
+        limits: FrameLimits::v1_default(),
+    };
+    let mut subscription_client = connect_bounded(&subscription_config, &mut host).await;
+    let controller = InboxHostController::new(InboxPreferenceStore::at_profile_root(
+        config_base.path().join("client-preferences"),
+    ));
+    let mut cockpit = NativeNextTaskCockpit::from_controller(controller)
+        .expect("native-next bootstrap must load isolated preferences");
+    cockpit
+        .synchronize(&mut subscription_client)
+        .await
+        .expect("native-next controller must synchronize fixture host");
+
+    let model = cockpit.render_model(InboxPresentationWidth::Regular);
+    assert!(model.items.iter().any(|item| {
+        matches!(
+            item,
+            InboxRenderItem::Row(row)
+                if row.task_id == task_id && row.title == "Native-next fixture inbox"
+        )
+    }));
+
+    let first_subscription = cockpit
+        .controller()
+        .expect("controller owner")
+        .subscription();
+    cockpit
+        .reconnect_and_synchronize(&mut subscription_client)
+        .await
+        .expect("reconnect must resynchronize from an authoritative snapshot");
+    let second_subscription = cockpit
+        .controller()
+        .expect("controller owner")
+        .subscription();
+    assert!(
+        !Arc::ptr_eq(&first_subscription, &second_subscription),
+        "reconnect must replace the stale subscription generation"
+    );
+    assert!(cockpit
+        .render_model(InboxPresentationWidth::Regular)
+        .items
+        .iter()
+        .any(|item| matches!(item, InboxRenderItem::Row(row) if row.task_id == task_id)));
+
+    cockpit
+        .runtime_mut()
+        .set_filter(InboxFilter::new("").including_archived());
+    let shell = Shell::new(Some(task_id));
+    let inbox = cockpit
+        .runtime()
+        .projection()
+        .expect("visible inbox projection");
+    let captured = shell
+        .capture_inbox_row_action(
+            inbox.active_row(task_id).expect("active fixture row"),
+            shell.navigation_epoch(),
+            shell.focus_navigation_epoch(),
+            InboxActionKind::Archive,
+        )
+        .expect("shell captures the current archive row");
+    assert!(shell.dispatch_inbox_action(captured, inbox).is_ok());
+    let archive = captured
+        .host_command(
+            CommandId::from_bytes(fixed_uuid_v7(0x7c)).expect("archive command id"),
+            ClientId::from_bytes(fixed_uuid_v7(0x7b)).expect("subscription client id"),
+            1_725_000_001_000,
+        )
+        .expect("archive action is a real host command");
+    assert!(matches!(
+        cockpit
+            .execute_command(&mut subscription_client, archive)
+            .await
+            .expect("archive command"),
+        CommandReceipt::Accepted { .. }
+    ));
+
+    let _ = host.terminate_and_wait_bounded(TERMINATE_TIMEOUT);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repeated_native_next_synchronize_retires_old_tails_without_busy_leaks() {
+    let config_base = TempDir::new().expect("process-unique config base");
+    let profile = unique_profile();
+    let paths = isolated_paths(&config_base, &profile);
+    let lock_path = paths.root.join("host.lock");
+
+    let mut host = ChildGuard::spawn(host_command(config_base.path(), &profile));
+    let _identity = wait_for_identity(&mut host, &lock_path).await;
+    let controller_config = HostClientConfig {
+        named_profile: profile,
+        client_build: "native-next-repeated-sync-fixture".to_string(),
+        client_id: ClientId::from_bytes(fixed_uuid_v7(0x7d)).expect("client id"),
+        requested: CapabilitySet::from_capabilities([
+            Capability::PagedSnapshots,
+            Capability::EventReplay,
+        ]),
+        limits: FrameLimits::v1_default(),
+    };
+    let mut controller_client = connect_bounded(&controller_config, &mut host).await;
+    let mut controller = InboxHostController::new(InboxPreferenceStore::at_profile_root(
+        config_base.path().join("client-preferences"),
+    ));
+    controller.attach_runtime();
+    controller
+        .synchronize(&mut controller_client)
+        .await
+        .expect("initial synchronize");
+    let old_subscription = controller.subscription();
+    let old_subscription_id = old_subscription
+        .lock()
+        .expect("old subscription lock")
+        .subscription_id()
+        .expect("old replay subscription id");
+
+    for _ in 0..40 {
+        controller
+            .synchronize(&mut controller_client)
+            .await
+            .expect("repeated synchronize must not leak replay sessions");
+        assert_eq!(
+            controller.subscription_state(),
+            ClientSubscriptionState::Ready,
+            "every replacement must settle as ready"
+        );
+    }
+
+    assert_eq!(
+        old_subscription
+            .lock()
+            .expect("old subscription lock after replacement")
+            .state(),
+        ClientSubscriptionState::Released,
+        "old subscription must be explicitly released before replacement"
+    );
+    let late_tail = DomainEvent {
+        id: EventId::from_bytes(fixed_uuid_v7(0x7e)).expect("late event id"),
+        task_id: None,
+        sequence: 1,
+        task_revision: None,
+        occurred_at_ms: 1,
+        payload: Event::TaskReopened,
+    };
+    let late_error = old_subscription
+        .lock()
+        .expect("old subscription lock for late tail")
+        .handle_unsolicited_message(UnsolicitedServerMessage::DurableEvent {
+            subscription_id: old_subscription_id,
+            event: late_tail,
+        })
+        .expect_err("late old-tail delivery must be fenced");
+    assert!(matches!(late_error, SubscriptionError::Released));
+
+    let _ = host.terminate_and_wait_bounded(TERMINATE_TIMEOUT);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1102,6 +1305,115 @@ async fn durable_event_replay_transitions_to_live_without_gap_or_duplicate() {
         .expect("terminate exact foreground host");
     assert!(!status.success(), "test termination should stop the host");
     assert!(host.try_wait().expect("final host poll").is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replacing_real_subscription_drains_only_retired_queued_frames() {
+    let config_base = TempDir::new().expect("process-unique config base");
+    let profile = unique_profile();
+    let paths = isolated_paths(&config_base, &profile);
+    let lock_path = paths.root.join("host.lock");
+
+    let mut host = ChildGuard::spawn(host_command(config_base.path(), &profile));
+    let _identity = wait_for_identity(&mut host, &lock_path).await;
+
+    let writer_id = ClientId::from_bytes(fixed_uuid_v7(0xc2)).expect("writer client id");
+    let reader_id = ClientId::from_bytes(fixed_uuid_v7(0xc3)).expect("reader client id");
+    let requested =
+        CapabilitySet::from_capabilities([Capability::PagedSnapshots, Capability::EventReplay]);
+    let config = |client_id| HostClientConfig {
+        named_profile: profile.clone(),
+        client_build: format!("devmanager/{}", env!("CARGO_PKG_VERSION")),
+        client_id,
+        requested,
+        limits: FrameLimits::v1_default(),
+    };
+    let mut writer = connect_bounded(&config(writer_id), &mut host).await;
+    let mut reader = connect_bounded(&config(reader_id), &mut host).await;
+
+    let mut old = ClientSubscription::new();
+    old.synchronize(&mut reader)
+        .await
+        .expect("old subscription synchronize");
+
+    let (first_create, _, first_task_id) =
+        create_task_named(writer_id, 0xc4, 0xc5, 0xc6, 0xc7, "Retired first");
+    assert!(matches!(
+        writer
+            .execute_command(first_create)
+            .await
+            .expect("first event-producing command"),
+        CommandReceipt::Accepted { .. }
+    ));
+    let first_update = timeout(READY_TIMEOUT, old.recv_and_apply(&reader))
+        .await
+        .expect("old subscription receives first event")
+        .expect("old subscription first event apply");
+    assert!(matches!(
+        first_update,
+        SubscriptionUpdate::DurableEvent(event) if event.task_id == Some(first_task_id)
+    ));
+
+    // Keep the rest of the first command's three durable events queued, and
+    // add more old-generation events while the caller does not drain them.
+    for (offset, title) in [(0xc8, "Retired second"), (0xcc, "Retired third")] {
+        let (create, _, _) =
+            create_task_named(writer_id, offset, offset + 1, offset + 2, offset + 3, title);
+        assert!(matches!(
+            writer
+                .execute_command(create)
+                .await
+                .expect("queued old-generation command"),
+            CommandReceipt::Accepted { .. }
+        ));
+    }
+
+    old.release(&mut reader)
+        .await
+        .expect("retire old subscription and drain its queue");
+
+    let mut replacement = ClientSubscription::new();
+    replacement
+        .synchronize(&mut reader)
+        .await
+        .expect("replacement subscription synchronize");
+
+    let (replacement_create, _, replacement_task_id) =
+        create_task_named(writer_id, 0xd0, 0xd1, 0xd2, 0xd3, "Replacement event");
+    assert!(matches!(
+        writer
+            .execute_command(replacement_create)
+            .await
+            .expect("replacement event-producing command"),
+        CommandReceipt::Accepted { .. }
+    ));
+
+    while !replacement
+        .model()
+        .expect("replacement model")
+        .tasks()
+        .contains_key(&replacement_task_id)
+    {
+        let update = timeout(READY_TIMEOUT, replacement.recv_and_apply(&reader))
+            .await
+            .expect("replacement receives live event")
+            .expect("replacement live event apply");
+        assert!(
+            matches!(update, SubscriptionUpdate::DurableEvent(_)),
+            "retired frames must not surface as replacement errors: {update:?}"
+        );
+    }
+
+    replacement
+        .release(&mut reader)
+        .await
+        .expect("release replacement subscription");
+    writer.disconnect();
+    reader.disconnect();
+    let status = host
+        .terminate_and_wait_bounded(TERMINATE_TIMEOUT)
+        .expect("terminate exact foreground host");
+    assert!(!status.success(), "test termination should stop the host");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

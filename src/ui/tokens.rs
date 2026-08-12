@@ -1858,3 +1858,49 @@ pub fn parse_hex_color(value: Option<&str>, fallback: u32) -> u32 {
     }
     u32::from_str_radix(hex, 16).unwrap_or(fallback)
 }
+
+pub const PREVIEW_BACKGROUND: Color = Color::from_u32(0x202124);
+pub const PREVIEW_FOREGROUND: Color = Color::from_u32(0xf1f3f4);
+
+// Legacy GPUI palette names remain in this canonical token module so
+// `crate::theme` can stay a compatibility re-export without a second source
+// of visual values.
+pub const APP_BG: u32 = 0x18181b;
+pub const SIDEBAR_BG: u32 = 0x27272a;
+pub const PANEL_BG: u32 = 0x18181b;
+pub const PANEL_HEADER_BG: u32 = 0x27272a;
+pub const PANEL_CARD_BG: u32 = 0x18181b;
+pub const EDITOR_CARD_BG: u32 = 0x202127;
+pub const EDITOR_FIELD_BG: u32 = 0x121318;
+pub const EDITOR_NOTICE_BG: u32 = 0x1a202a;
+pub const TOPBAR_BG: u32 = 0x27272a;
+pub const TAB_BAR_BG: u32 = 0x27272a;
+pub const TAB_ACTIVE_BG: u32 = 0x18181b;
+pub const TAB_HOVER_BG: u32 = 0x323238;
+pub const STATUS_BAR_BG: u32 = 0x09090b;
+pub const TERMINAL_BG: u32 = 0x09090b;
+pub const PROJECT_ROW_BG: u32 = 0x3f3f46;
+pub const AGENT_ROW_BG: u32 = 0x27272a;
+pub const BORDER_PRIMARY: u32 = 0x3f3f46;
+pub const BORDER_SECONDARY: u32 = 0x27272a;
+pub const BORDER_ACCENT: u32 = 0x243040;
+pub const TEXT_PRIMARY: u32 = 0xe4e4e7;
+pub const TEXT_MUTED: u32 = 0xa1a1aa;
+pub const TEXT_SUBTLE: u32 = 0x71717a;
+pub const TEXT_DIM: u32 = 0x52525b;
+pub const SELECTION_BG: u32 = 0x22364d;
+pub const SELECTION_TEXT: u32 = 0xf8fafc;
+pub const PROJECT_DOT: u32 = 0x6366f1;
+pub const AI_DOT: u32 = 0xf59e0b;
+pub const SSH_DOT: u32 = 0x06b6d4;
+pub const SUCCESS_BG: u32 = 0x142117;
+pub const SUCCESS_TEXT: u32 = 0x4ade80;
+pub const WARNING_TEXT: u32 = 0xfacc15;
+pub const EXTERNAL_TEXT: u32 = 0x60a5fa;
+pub const DANGER_TEXT: u32 = 0xfb7185;
+pub const DANGER_BG_SUBTLE: u32 = 0x2a1517;
+pub const PRIMARY: u32 = 0x4f46e5;
+pub const PRIMARY_HOVER: u32 = 0x4338ca;
+pub const PRIMARY_MUTED: u32 = 0x2c266b;
+pub const ROW_HOVER_BG: u32 = 0x323238;
+pub const BUTTON_HOVER_BG: u32 = 0x52525b;

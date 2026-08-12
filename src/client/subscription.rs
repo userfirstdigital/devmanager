@@ -1,5 +1,7 @@
 //! Caller-driven initial synchronization and live durable subscription.
 
+use std::collections::{HashSet, VecDeque};
+
 use crate::client::connection::UnsolicitedServerMessage;
 use crate::client::host_client::HostClient;
 use crate::client::model::{ClientModel, ClientModelBuilder, ClientModelError};
@@ -17,6 +19,8 @@ const SNAPSHOT_SECTIONS: [SnapshotSection; 5] = [
     SnapshotSection::Resources,
     SnapshotSection::Operations,
 ];
+const MAX_SEEN_EVENT_IDS: usize = 8_192;
+const MAX_PENDING_REPLAY_EVENTS: usize = 8_192;
 
 /// Explicit subscription lifecycle visible to the caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,6 +50,12 @@ pub enum SubscriptionError {
     Model(ClientModelError),
     /// Foreign unsolicited frame preserved for the caller; subscription needs resync.
     ForeignSubscription(UnsolicitedServerMessage),
+    /// The caller failed to drain race-closing replay before the bounded
+    /// handoff filled. Dropping history would make unread/replay state false,
+    /// so synchronization must restart from a fresh authoritative snapshot.
+    ReplayOverflow {
+        limit: usize,
+    },
     InvalidResync,
     Transport(IpcError),
     Query(QueryError),
@@ -62,6 +72,9 @@ impl std::fmt::Display for SubscriptionError {
             Self::Model(error) => write!(f, "client model error: {error}"),
             Self::ForeignSubscription(_) => {
                 write!(f, "unsolicited message for a foreign subscription")
+            }
+            Self::ReplayOverflow { limit } => {
+                write!(f, "replay handoff exceeded bounded limit of {limit} events")
             }
             Self::InvalidResync => write!(f, "resync required fields are inconsistent"),
             Self::Transport(error) => write!(f, "subscription transport error: {error}"),
@@ -92,6 +105,9 @@ pub struct ClientSubscription {
     subscription_id: Option<SubscriptionId>,
     model: Option<ClientModel>,
     snapshot_id: Option<SnapshotId>,
+    seen_event_ids: HashSet<crate::domain::id::EventId>,
+    seen_event_order: VecDeque<crate::domain::id::EventId>,
+    pending_replay_events: VecDeque<DomainEvent>,
 }
 
 impl Default for ClientSubscription {
@@ -107,6 +123,9 @@ impl ClientSubscription {
             subscription_id: None,
             model: None,
             snapshot_id: None,
+            seen_event_ids: HashSet::new(),
+            seen_event_order: VecDeque::new(),
+            pending_replay_events: VecDeque::new(),
         }
     }
 
@@ -122,13 +141,17 @@ impl ClientSubscription {
         self.model.as_ref()
     }
 
+    /// Drain events delivered by the snapshot race-closing replay. The caller
+    /// owns presentation semantics (for example, unread state) and therefore
+    /// must consume this bounded handoff after every successful synchronize.
+    pub fn take_replay_events(&mut self) -> Vec<DomainEvent> {
+        self.pending_replay_events.drain(..).collect()
+    }
+
     /// Snapshot through N → open replay after N → release snapshot → apply frozen
     /// replay → retain live subscription metadata. Caller-driven only.
     pub async fn synchronize(&mut self, client: &mut HostClient) -> Result<(), SubscriptionError> {
-        if matches!(
-            self.state,
-            ClientSubscriptionState::Ready | ClientSubscriptionState::NeedsResync
-        ) {
+        if self.state == ClientSubscriptionState::Ready {
             return Err(SubscriptionError::NotReady);
         }
         if self.state == ClientSubscriptionState::Released {
@@ -141,9 +164,25 @@ impl ClientSubscription {
             return Err(SubscriptionError::MissingCapabilities);
         }
 
+        // A transport failure or a server resync request leaves the prior
+        // subscription generation unusable. Re-open a fresh snapshot/replay
+        // pair, while preserving the caller-owned unread cursor outside this
+        // transport object. The old replay release is best effort because a
+        // disconnect may have already retired its server-side owner.
+        self.state = ClientSubscriptionState::Pending;
+        if let Some(subscription_id) = self.subscription_id.take() {
+            let _ = client.release_event_replay(subscription_id).await;
+        }
+        self.snapshot_id = None;
+        self.seen_event_ids.clear();
+        self.seen_event_order.clear();
+        self.pending_replay_events.clear();
+
         match self.synchronize_inner(client).await {
             Ok(()) => Ok(()),
             Err(error) => {
+                self.state = ClientSubscriptionState::NeedsResync;
+                self.pending_replay_events.clear();
                 self.best_effort_cleanup(client).await;
                 Err(error)
             }
@@ -230,6 +269,9 @@ impl ClientSubscription {
         let mut batch = open;
         loop {
             let next = batch.page.next_cursor.clone();
+            for event in &batch.page.events {
+                self.queue_replay_event(event.clone())?;
+            }
             model.apply_replay_page(&batch.page)?;
             let Some(cursor) = next else {
                 break;
@@ -301,6 +343,26 @@ impl ClientSubscription {
                         },
                     ));
                 }
+                if self.seen_event_ids.contains(&event.id) {
+                    // An exact replay of a previously delivered event is
+                    // idempotent. Keep the event visible to the caller so its
+                    // durable cursor can remain monotonic without mutating the
+                    // model a second time.
+                    return Ok(SubscriptionUpdate::DurableEvent(event));
+                }
+                if event.sequence
+                    <= self
+                        .model
+                        .as_ref()
+                        .ok_or(SubscriptionError::IncompleteSnapshot)?
+                        .last_applied_sequence()
+                {
+                    self.state = ClientSubscriptionState::NeedsResync;
+                    return Err(SubscriptionError::Model(
+                        ClientModelError::DuplicateOrRegression,
+                    ));
+                }
+                self.remember_event_id(event.id);
                 let model = self
                     .model
                     .as_mut()
@@ -346,6 +408,29 @@ impl ClientSubscription {
         }
     }
 
+    fn remember_event_id(&mut self, event_id: crate::domain::id::EventId) {
+        if self.seen_event_ids.insert(event_id) {
+            self.seen_event_order.push_back(event_id);
+            if self.seen_event_order.len() > MAX_SEEN_EVENT_IDS {
+                if let Some(evicted) = self.seen_event_order.pop_front() {
+                    self.seen_event_ids.remove(&evicted);
+                }
+            }
+        }
+    }
+
+    fn queue_replay_event(&mut self, event: DomainEvent) -> Result<(), SubscriptionError> {
+        if self.pending_replay_events.len() >= MAX_PENDING_REPLAY_EVENTS {
+            self.state = ClientSubscriptionState::NeedsResync;
+            return Err(SubscriptionError::ReplayOverflow {
+                limit: MAX_PENDING_REPLAY_EVENTS,
+            });
+        }
+        self.remember_event_id(event.id);
+        self.pending_replay_events.push_back(event);
+        Ok(())
+    }
+
     /// Mark Ready → NeedsResync when the unsolicited inbox/transport fails.
     pub fn observe_recv_transport_failure(&mut self) {
         if self.state == ClientSubscriptionState::Ready {
@@ -362,11 +447,11 @@ impl ClientSubscription {
             match client.release_event_replay(subscription_id).await {
                 Ok(Ok(())) | Ok(Err(QueryError::NotFound)) => {}
                 Ok(Err(error)) => {
-                    self.subscription_id = Some(subscription_id);
+                    self.retire_without_transport();
                     return Err(SubscriptionError::Query(error));
                 }
                 Err(error) => {
-                    self.subscription_id = Some(subscription_id);
+                    self.retire_without_transport();
                     return Err(SubscriptionError::Transport(error));
                 }
             }
@@ -376,6 +461,22 @@ impl ClientSubscription {
         }
         self.state = ClientSubscriptionState::Released;
         Ok(())
+    }
+
+    /// Fence this generation after its transport has already disappeared.
+    ///
+    /// There is no remote release to send in this path, but callers still
+    /// retain `Arc` handles to the old subscription while replacing it.  Mark
+    /// those handles Released and drop their bounded queues/model so a late
+    /// tail can never mutate the replacement generation.
+    pub fn retire_without_transport(&mut self) {
+        self.subscription_id = None;
+        self.snapshot_id = None;
+        self.model = None;
+        self.seen_event_ids.clear();
+        self.seen_event_order.clear();
+        self.pending_replay_events.clear();
+        self.state = ClientSubscriptionState::Released;
     }
 
     async fn best_effort_cleanup(&mut self, client: &mut HostClient) {
@@ -462,6 +563,9 @@ mod tests {
             subscription_id: Some(SubscriptionId::from_bytes(fixed_uuid_v7(0xb4)).expect("sub")),
             model: Some(model),
             snapshot_id: None,
+            seen_event_ids: std::collections::HashSet::new(),
+            seen_event_order: std::collections::VecDeque::new(),
+            pending_replay_events: std::collections::VecDeque::new(),
         }
     }
 
@@ -534,5 +638,216 @@ mod tests {
             sub.model().expect("model").last_applied_sequence(),
             cursor_before
         );
+    }
+
+    #[test]
+    fn inbox_runtime_projects_one_subscription_and_fences_replay_duplicates_and_foreign_events() {
+        use crate::ui::task_cockpit::InboxRuntime;
+
+        let mut runtime = InboxRuntime::new();
+        runtime.attach_subscription(ready_subscription());
+        let own = runtime
+            .subscription()
+            .and_then(|subscription| subscription.subscription_id())
+            .expect("ready subscription id");
+        let task = runtime
+            .subscription()
+            .and_then(|subscription| subscription.model())
+            .and_then(|model| model.tasks().keys().next().copied())
+            .expect("ready task");
+        assert_eq!(
+            runtime
+                .projection()
+                .and_then(|projection| projection.row(task))
+                .map(|row| row.title.as_str()),
+            Some("Sub")
+        );
+
+        let event = DomainEvent {
+            id: EventId::from_bytes(fixed_uuid_v7(0xc2)).expect("event"),
+            task_id: Some(task),
+            sequence: 2,
+            task_revision: Some(2),
+            occurred_at_ms: 22,
+            payload: Event::TaskRenamed {
+                title: "Renamed".into(),
+            },
+        };
+        let message = UnsolicitedServerMessage::DurableEvent {
+            subscription_id: own,
+            event: event.clone(),
+        };
+        let update = runtime
+            .subscription_mut()
+            .expect("subscription")
+            .handle_unsolicited_message(message.clone())
+            .expect("live event");
+        assert!(runtime
+            .apply_subscription_update(update)
+            .expect("projection update"));
+        assert_eq!(runtime.unread_cursor().last_seen_sequence(), 2);
+        assert_eq!(runtime.unread_cursor().unread_count(task), 1);
+        assert_eq!(
+            runtime
+                .projection()
+                .and_then(|projection| projection.row(task))
+                .map(|row| (row.title.as_str(), row.occurred_at_ms)),
+            Some(("Renamed", 22))
+        );
+        assert_eq!(
+            runtime
+                .subscription()
+                .and_then(|subscription| subscription.model())
+                .map(|model| model.task_projection_index_incremental_updates()),
+            Some(1),
+            "one durable event updates one keyed index entry"
+        );
+        assert!(runtime.mark_read(task));
+        assert_eq!(runtime.unread_cursor().unread_count(task), 0);
+        assert_eq!(
+            runtime
+                .projection()
+                .and_then(|projection| projection.row(task))
+                .map(|row| row.unread_event_count),
+            Some(0)
+        );
+
+        let duplicate = runtime
+            .subscription_mut()
+            .expect("subscription")
+            .handle_unsolicited_message(message)
+            .expect("duplicate event is idempotent");
+        assert!(!runtime
+            .apply_subscription_update(duplicate)
+            .expect("duplicate projection update"));
+        assert_eq!(
+            runtime.unread_cursor().unread_count(task),
+            0,
+            "a replayed event must not undo the local mark-read cursor"
+        );
+        assert_eq!(runtime.projection_updates(), 2);
+
+        let lower = DomainEvent {
+            id: EventId::from_bytes(fixed_uuid_v7(0xc3)).expect("lower event"),
+            task_id: Some(task),
+            sequence: 1,
+            task_revision: Some(2),
+            occurred_at_ms: 11,
+            payload: Event::TaskRenamed {
+                title: "Out of order".into(),
+            },
+        };
+        let error = runtime
+            .subscription_mut()
+            .expect("subscription")
+            .handle_unsolicited_message(UnsolicitedServerMessage::DurableEvent {
+                subscription_id: own,
+                event: lower,
+            })
+            .expect_err("unknown out-of-order event must require resync");
+        assert!(matches!(error, SubscriptionError::Model(_)));
+        assert_eq!(
+            runtime
+                .subscription()
+                .map(|subscription| subscription.state()),
+            Some(ClientSubscriptionState::NeedsResync)
+        );
+
+        let mut foreign = ready_subscription();
+        let foreign_id = SubscriptionId::from_bytes(fixed_uuid_v7(0xc5)).expect("foreign id");
+        assert_ne!(foreign_id, own);
+        let foreign_error = foreign
+            .handle_unsolicited_message(UnsolicitedServerMessage::DurableEvent {
+                subscription_id: foreign_id,
+                event: DomainEvent {
+                    id: EventId::from_bytes(fixed_uuid_v7(0xc4)).expect("foreign event"),
+                    task_id: None,
+                    sequence: 2,
+                    task_revision: None,
+                    occurred_at_ms: 23,
+                    payload: Event::TaskReopened,
+                },
+            })
+            .expect_err("foreign event must fail closed");
+        assert!(matches!(
+            foreign_error,
+            SubscriptionError::ForeignSubscription(_)
+        ));
+    }
+
+    #[test]
+    fn inbox_runtime_consumes_snapshot_race_replay_for_unread_cursor_on_attach() {
+        use crate::ui::task_cockpit::InboxRuntime;
+
+        let mut subscription = ready_subscription();
+        let task = subscription
+            .model()
+            .and_then(|model| model.tasks().keys().next().copied())
+            .expect("ready task");
+        subscription.pending_replay_events.push_back(DomainEvent {
+            id: EventId::from_bytes(fixed_uuid_v7(0xc6)).expect("replay event"),
+            task_id: Some(task),
+            sequence: 2,
+            task_revision: Some(2),
+            occurred_at_ms: 22,
+            payload: Event::TaskReopened,
+        });
+
+        let mut runtime = InboxRuntime::new();
+        runtime.attach_subscription(subscription);
+        assert_eq!(runtime.unread_cursor().last_seen_sequence(), 2);
+        assert_eq!(runtime.unread_cursor().unread_count(task), 1);
+        assert!(runtime
+            .projection()
+            .and_then(|projection| projection.row(task))
+            .is_some());
+    }
+
+    #[test]
+    fn inbox_runtime_stale_blocks_visible_rows_after_resync_until_authoritative_attach() {
+        use crate::ui::task_cockpit::InboxRuntime;
+
+        let mut runtime = InboxRuntime::new();
+        runtime.attach_subscription(ready_subscription());
+        assert!(runtime.projection().is_some());
+        runtime
+            .apply_subscription_update(SubscriptionUpdate::ResyncRequired {
+                last_delivered_sequence: 1,
+                newest_sequence: 2,
+            })
+            .expect("resync transition is observable");
+        assert!(runtime.projection().is_none());
+        runtime.attach_subscription(ready_subscription());
+        assert!(runtime.projection().is_some());
+    }
+
+    #[test]
+    fn replay_queue_overflow_is_typed_and_never_silently_evicts_history() {
+        let mut sub = ready_subscription();
+        for sequence in 0..MAX_PENDING_REPLAY_EVENTS {
+            sub.queue_replay_event(DomainEvent {
+                id: EventId::new(),
+                task_id: None,
+                sequence: sequence as u64,
+                task_revision: None,
+                occurred_at_ms: sequence as i64,
+                payload: Event::TaskReopened,
+            })
+            .expect("queue remains bounded before limit");
+        }
+        let err = sub
+            .queue_replay_event(DomainEvent {
+                id: EventId::new(),
+                task_id: None,
+                sequence: MAX_PENDING_REPLAY_EVENTS as u64,
+                task_revision: None,
+                occurred_at_ms: MAX_PENDING_REPLAY_EVENTS as i64,
+                payload: Event::TaskReopened,
+            })
+            .expect_err("overflow must force typed resync");
+        assert!(
+            matches!(err, SubscriptionError::ReplayOverflow { limit } if limit == MAX_PENDING_REPLAY_EVENTS)
+        );
+        assert_eq!(sub.pending_replay_events.len(), MAX_PENDING_REPLAY_EVENTS);
     }
 }

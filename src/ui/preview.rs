@@ -21,7 +21,9 @@ use crate::ui::preview_capture;
 pub const PREVIEW_SCHEMA: &str = "devmanager.ui.preview/v1";
 pub const MAX_FIXTURE_BYTES: u64 = 256 * 1024;
 pub const PREVIEW_SENTINEL_RGBA: [u8; 4] = [0x91, 0x2b, 0xd4, 0xff];
-const PREVIEW_SENTINEL_RGB: u32 = 0x912bd4;
+const PREVIEW_SENTINEL_RGB: u32 = ((PREVIEW_SENTINEL_RGBA[0] as u32) << 16)
+    | ((PREVIEW_SENTINEL_RGBA[1] as u32) << 8)
+    | PREVIEW_SENTINEL_RGBA[2] as u32;
 const PREVIEW_SENTINEL_SIZE: f32 = 32.0;
 const PREVIEW_USAGE: &str =
     "usage: devmanager-next --ui-preview <fixture.json> --output <preview.png>";
@@ -67,17 +69,19 @@ pub struct PreviewFixture {
     pub schema: String,
     pub id: String,
     pub title: String,
+    #[serde(default)]
     pub capture: PreviewCaptureFixture,
     pub root: PreviewRootFixture,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PreviewCaptureSetting {
+    #[default]
     Excluded,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PreviewCaptureFixture {
     pub cursor: PreviewCaptureSetting,
@@ -682,8 +686,8 @@ impl PreviewRoot {
         div()
             .size_full()
             .p(px(16.0))
-            .bg(gpui::rgb(0x202124))
-            .text_color(gpui::rgb(0xf1f3f4))
+            .bg(gpui::rgb(crate::ui::tokens::PREVIEW_BACKGROUND.to_u32()))
+            .text_color(gpui::rgb(crate::ui::tokens::PREVIEW_FOREGROUND.to_u32()))
             .on_action::<PreviewDismiss>(|_, _, cx: &mut gpui::App| cx.quit())
             .child(
                 div()
