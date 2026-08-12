@@ -17,6 +17,7 @@ pub mod task_cockpit;
 pub mod terminal_adapter;
 pub mod tokens;
 
+pub use native_shell::{NativeClientDetach, NativeHostFullQuit};
 pub use preview::PreviewInitReport;
 
 static COMPONENT_INIT_COUNT: AtomicUsize = AtomicUsize::new(0);

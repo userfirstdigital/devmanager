@@ -147,3 +147,101 @@ fn entry_production_host_is_not_deferred_and_omits_parent_pid() {
         "production launch must not pass --parent-pid"
     );
 }
+
+#[test]
+fn entry_missing_pipe_normalizes_to_unavailable_then_spawns_host() {
+    let connection = read_source("src/client/connection.rs");
+    assert!(
+        connection.contains("map_named_pipe_open_error"),
+        "named-pipe open must normalize absence through a dedicated mapper"
+    );
+    assert!(
+        connection.contains("ERROR_FILE_NOT_FOUND")
+            || connection.contains("raw_os_error() == Some(2)"),
+        "missing pipe must map ERROR_FILE_NOT_FOUND/NotFound to Unavailable"
+    );
+    assert!(
+        connection.contains("ERROR_PIPE_BUSY")
+            || connection.contains("raw_os_error() == Some(231)"),
+        "pipe busy must stay Busy for bounded attach retry"
+    );
+    let shell = read_source("src/ui/native_shell.rs");
+    assert!(
+        shell.contains("Err(IpcError::Unavailable) => break"),
+        "Unavailable (missing pipe) must fall through to host spawn"
+    );
+    assert!(
+        shell.contains("Err(IpcError::Timeout)") && shell.contains("return Err(IpcError::Timeout)"),
+        "present-but-slow attach must preserve Timeout and must not become Unavailable"
+    );
+    assert!(
+        shell.contains("sanitize_spawned_host_environment"),
+        "spawned host environment must be sanitized"
+    );
+}
+
+#[test]
+fn entry_hook_relay_dispatch_remains_before_shell_and_preview() {
+    let main = read_source("src/main.rs");
+    let main_fn = main.split("fn main()").nth(1).expect("main function body");
+    let claude = main_fn
+        .find("run_hook_relay_subcommand")
+        .expect("claude hook relay");
+    let codex = main_fn
+        .find("run_codex_hook_relay_subcommand")
+        .expect("codex hook relay");
+    let preview = main_fn.find("--ui-preview").expect("preview gate");
+    let product = main_fn
+        .find("run_product_shell")
+        .expect("product shell dispatch");
+    assert!(
+        claude < codex && codex < preview.min(product),
+        "hook relays must remain ahead of product shell and preview dispatch"
+    );
+}
+
+#[test]
+fn entry_host_ctl_json_dispatch_remains_before_host_lock() {
+    let host = read_source("src/bin/devmanager-host.rs");
+    let ctl = host.find("\"ctl\"").expect("ctl dispatch");
+    let lock = host.find("acquire_lock").expect("host lock acquisition");
+    assert!(
+        ctl < lock,
+        "devmanager-host ctl JSON automation must dispatch before HostLock"
+    );
+    assert!(
+        host.contains("dispatch_ctl_from_args"),
+        "ctl must remain the typed JSON automation entry"
+    );
+}
+
+#[test]
+fn entry_preview_identity_uses_devmanager_binary_not_next() {
+    let preview = read_source("src/ui/preview.rs");
+    assert!(
+        preview.contains("usage: devmanager --ui-preview"),
+        "preview CLI usage must advertise the sole devmanager binary"
+    );
+    assert!(
+        !preview.contains("devmanager-next --ui-preview")
+            && !preview.contains("gpui::actions!(devmanager_next"),
+        "preview must not retain devmanager-next identity"
+    );
+    let main = read_source("src/main.rs");
+    assert!(
+        main.contains("debug builds") || main.contains("debug_assertions"),
+        "release product must not rely on CARGO_MANIFEST_DIR for preview"
+    );
+    let script = read_source("scripts/native-next/Capture-UiPreviews.ps1");
+    assert!(
+        script.contains("$artifactName = 'devmanager'")
+            && script.contains("$artifactBinaryName = 'devmanager.exe'")
+            && script.contains("'--bin', 'devmanager'"),
+        "Capture-UiPreviews must build and use the sole devmanager binary"
+    );
+    assert!(
+        !script.contains("$artifactName = 'devmanager-next'")
+            && !script.contains("'--bin', 'devmanager-next'"),
+        "Capture-UiPreviews must not target the deleted next binary"
+    );
+}
