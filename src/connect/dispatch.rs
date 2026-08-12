@@ -1,0 +1,1276 @@
+//! Authenticated Connect application dispatch onto the one host executor.
+//!
+//! The route retains the paired identity captured at admission. Query/Command
+//! frames become [`ClientRequest`] values and go through
+//! [`HostRequestHandle::execute`]. This module never opens a second CommandBus
+//! and never translates into the legacy JSON action protocol.
+
+use std::sync::{Arc, OnceLock, RwLock};
+
+use crate::connect::permissions::action_for_client_request;
+use crate::connect::permission::{
+    PermissionDecision, PermissionDenyReason, PermissionEvaluator, PermissionRequest,
+};
+use crate::connect::{
+    ChannelBinding, ConnectEnvelope, ConnectIdentityLiveState, ConnectLimits, ConnectPayload,
+    ConnectPrivacyClass, ConnectRole, ErrorPayload, HelloPayload, MAX_CONNECT_DIAGNOSTIC_BYTES,
+};
+use crate::domain::id::ClientId;
+use crate::host::{HostRequestHandle, IpcError};
+use crate::protocol::{
+    Capability, CapabilitySet, ClientRequest, FrameLimits, NegotiatedParameters, ProtocolVersion,
+    ServerMessage,
+};
+
+/// Former production HOLD text. New dispatch must never emit this fragment.
+pub const CONNECT_HOLD_CALLBACK_FRAGMENT: &str =
+    "unavailable until the host executor callback is bound";
+
+pub const CONNECT_ERROR_PROTOCOL: u16 = 400;
+pub const CONNECT_ERROR_UNAUTHORIZED: u16 = 401;
+pub const CONNECT_ERROR_FORBIDDEN: u16 = 403;
+pub const CONNECT_ERROR_CONFLICT: u16 = 409;
+pub const CONNECT_ERROR_EXECUTOR_UNATTACHED: u16 = 500;
+
+const ORG_PROMPT_UNAVAILABLE: &str =
+    "organization projection dispatch is unavailable on this standalone host";
+
+/// Capabilities advertised on Connect Hello. Event replay / live durable
+/// subscription is omitted: [`HostRequestHandle::register_output`] is not a
+/// public host API, so this route must not pretend a second writer is live.
+pub fn advertised_connect_capabilities() -> CapabilitySet {
+    CapabilitySet::from_capabilities([
+        Capability::ConnectEncryption,
+        Capability::PagedSnapshots,
+        Capability::OperationSettlement,
+        Capability::ChunkResume,
+        Capability::PromptProjection,
+        Capability::ProviderInput,
+        Capability::TaskCockpit,
+        Capability::HostShutdown,
+        Capability::ExplicitDetach,
+        Capability::ManagementMetadata,
+    ])
+}
+
+/// Cloneable attachment for the one existing [`HostRequestHandle`].
+///
+/// Lock ordering: acquire only to clone the handle, then release before any
+/// await (including [`HostRequestHandle::execute`]).
+#[derive(Clone, Debug)]
+pub struct ConnectHostRequestSlot {
+    inner: Arc<RwLock<Option<HostRequestHandle>>>,
+}
+
+impl Default for ConnectHostRequestSlot {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ConnectHostRequestSlot {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(None)),
+        }
+    }
+
+    pub fn attach(&self, handle: HostRequestHandle) {
+        let mut slot = self
+            .inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *slot = Some(handle);
+    }
+
+    pub fn get(&self) -> Option<HostRequestHandle> {
+        self.inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    pub fn clear(&self) {
+        let mut slot = self
+            .inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *slot = None;
+    }
+}
+
+fn process_host_request_slot() -> &'static ConnectHostRequestSlot {
+    static SLOT: OnceLock<ConnectHostRequestSlot> = OnceLock::new();
+    SLOT.get_or_init(ConnectHostRequestSlot::new)
+}
+
+/// Durable-host seam: attach the one executor handle for in-process Connect.
+pub fn bind_host_request_handle(handle: HostRequestHandle) {
+    process_host_request_slot().attach(handle);
+}
+
+pub fn bound_host_request_handle() -> Option<HostRequestHandle> {
+    process_host_request_slot().get()
+}
+
+/// Drop the process-wide executor binding before the host handle is dropped.
+/// Same-process only; does not create a cross-process HostClient path.
+pub fn unbind_host_request_handle() {
+    process_host_request_slot().clear();
+}
+
+pub fn process_connect_host_request_slot() -> ConnectHostRequestSlot {
+    process_host_request_slot().clone()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectSessionDisposition {
+    Continue,
+    Disconnect,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NegotiatedConnect {
+    limits: ConnectLimits,
+    capabilities: CapabilitySet,
+    privacy_class: ConnectPrivacyClass,
+}
+
+/// One authenticated Connect application session after Noise.
+///
+/// Hello capability/limits intersection is the complete negotiation. A later
+/// Capabilities payload is optional confirmation and must match exactly.
+pub struct ConnectDispatchSession {
+    paired_web_client_id: String,
+    bound_client_id: Option<ClientId>,
+    identity_live: ConnectIdentityLiveState,
+    binding: Option<ChannelBinding>,
+    last_recv_sequence: u64,
+    negotiated: Option<NegotiatedConnect>,
+    active: bool,
+}
+
+impl ConnectDispatchSession {
+    pub fn bind_paired(
+        paired_web_client_id: String,
+        identity_live: ConnectIdentityLiveState,
+    ) -> Self {
+        Self {
+            paired_web_client_id,
+            bound_client_id: None,
+            identity_live,
+            binding: None,
+            last_recv_sequence: 0,
+            negotiated: None,
+            active: true,
+        }
+    }
+
+    pub fn bound_client_id(&self) -> Option<ClientId> {
+        if self.active {
+            self.bound_client_id
+        } else {
+            None
+        }
+    }
+
+    pub fn paired_identity_bound(&self) -> bool {
+        self.active && !self.paired_web_client_id.is_empty()
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.active
+    }
+
+    pub fn negotiated_capabilities(&self) -> Option<CapabilitySet> {
+        self.negotiated.map(|negotiated| negotiated.capabilities)
+    }
+
+    pub fn negotiated_limits(&self) -> Option<ConnectLimits> {
+        self.negotiated.map(|negotiated| negotiated.limits)
+    }
+
+    pub fn channel_binding(&self) -> Option<ChannelBinding> {
+        self.binding
+    }
+
+    pub fn disconnect(&mut self) {
+        self.active = false;
+        self.binding = None;
+        self.negotiated = None;
+        self.bound_client_id = None;
+        self.last_recv_sequence = 0;
+        self.paired_web_client_id.clear();
+    }
+
+    pub async fn handle_payload(
+        &mut self,
+        envelope: &ConnectEnvelope,
+        payload: ConnectPayload,
+        host: Option<&HostRequestHandle>,
+    ) -> (ConnectPayload, ConnectSessionDisposition) {
+        match self.dispatch(envelope, payload, host).await {
+            Ok(payload) => (payload, ConnectSessionDisposition::Continue),
+            Err(failure) => {
+                if failure.disconnect {
+                    self.disconnect();
+                }
+                (
+                    typed_error(
+                        failure.code,
+                        failure.message,
+                        envelope.request_id,
+                        envelope.operation_id,
+                    ),
+                    if failure.disconnect {
+                        ConnectSessionDisposition::Disconnect
+                    } else {
+                        ConnectSessionDisposition::Continue
+                    },
+                )
+            }
+        }
+    }
+
+    async fn dispatch(
+        &mut self,
+        envelope: &ConnectEnvelope,
+        payload: ConnectPayload,
+        host: Option<&HostRequestHandle>,
+    ) -> Result<ConnectPayload, DispatchFailure> {
+        if !self.active {
+            return Err(DispatchFailure::fatal(
+                CONNECT_ERROR_UNAUTHORIZED,
+                "Connect session is closed",
+            ));
+        }
+        if !matches!(self.identity_live, ConnectIdentityLiveState::Live) {
+            return Err(DispatchFailure::fatal(
+                CONNECT_ERROR_UNAUTHORIZED,
+                "Connect identity is not live",
+            ));
+        }
+
+        match payload {
+            ConnectPayload::Hello(hello) => self.accept_hello(envelope, hello),
+            payload if self.negotiated.is_none() => {
+                let _ = payload;
+                Err(DispatchFailure::fatal(
+                    CONNECT_ERROR_PROTOCOL,
+                    "Connect Hello is required before Query or Command",
+                ))
+            }
+            ConnectPayload::Capabilities(capabilities) => {
+                if !self.capabilities_match_negotiated(capabilities) {
+                    return Err(DispatchFailure::fatal(
+                        CONNECT_ERROR_FORBIDDEN,
+                        "capability set does not match the negotiated intersection",
+                    ));
+                }
+                self.admit_post_hello_frame(envelope)?;
+                Ok(ConnectPayload::Capabilities(
+                    self.require_ready()?.capabilities,
+                ))
+            }
+            ConnectPayload::Query(query) => {
+                let Some(request_id) = envelope.request_id else {
+                    return Err(DispatchFailure::fatal(
+                        CONNECT_ERROR_PROTOCOL,
+                        "Query envelope must carry request_id",
+                    ));
+                };
+                if query.request_id != request_id {
+                    return Err(DispatchFailure::fatal(
+                        CONNECT_ERROR_PROTOCOL,
+                        "Query request_id does not match the envelope",
+                    ));
+                }
+                self.admit_post_hello_frame(envelope)?;
+                self.dispatch_request(envelope, ClientRequest::Query(query), host)
+                    .await
+            }
+            ConnectPayload::Command(command) => {
+                self.admit_post_hello_frame(envelope)?;
+                self.dispatch_request(envelope, ClientRequest::Command(command), host)
+                    .await
+            }
+            ConnectPayload::Extension(extension)
+                if extension.type_id
+                    == crate::protocol::organization_extension_type(
+                        crate::protocol::OrganizationExtensionKind::OrganizationPrompt,
+                    ) =>
+            {
+                self.admit_post_hello_frame(envelope)?;
+                Err(DispatchFailure::soft(
+                    CONNECT_ERROR_FORBIDDEN,
+                    ORG_PROMPT_UNAVAILABLE,
+                ))
+            }
+            ConnectPayload::Resync(_)
+            | ConnectPayload::EventPage(_)
+            | ConnectPayload::SnapshotPage(_) => {
+                self.admit_post_hello_frame(envelope)?;
+                Err(DispatchFailure::soft(
+                    CONNECT_ERROR_FORBIDDEN,
+                    "Connect durable subscription is not advertised on this host",
+                ))
+            }
+            ConnectPayload::QueryReply(_)
+            | ConnectPayload::CommandReceipt(_)
+            | ConnectPayload::OperationSettlement(_)
+            | ConnectPayload::Presence(_)
+            | ConnectPayload::TerminalDelta(_)
+            | ConnectPayload::BrowserFrame(_)
+            | ConnectPayload::PromptExtension(_)
+            | ConnectPayload::BrowserExtension(_)
+            | ConnectPayload::Chunk(_)
+            | ConnectPayload::Error(_)
+            | ConnectPayload::Extension(_) => {
+                self.admit_post_hello_frame(envelope)?;
+                Err(DispatchFailure::soft(
+                    CONNECT_ERROR_PROTOCOL,
+                    "Connect payload kind is not accepted on the application request lane",
+                ))
+            }
+        }
+    }
+
+    fn accept_hello(
+        &mut self,
+        envelope: &ConnectEnvelope,
+        hello: HelloPayload,
+    ) -> Result<ConnectPayload, DispatchFailure> {
+        if self.negotiated.is_some() {
+            return Err(DispatchFailure::fatal(
+                CONNECT_ERROR_PROTOCOL,
+                "Connect Hello is already complete",
+            ));
+        }
+        let binding = envelope.binding().map_err(|_| {
+            DispatchFailure::fatal(CONNECT_ERROR_PROTOCOL, "invalid channel binding")
+        })?;
+        if envelope.sequence == 0 || envelope.sequence <= self.last_recv_sequence {
+            return Err(DispatchFailure::fatal(
+                CONNECT_ERROR_CONFLICT,
+                "Connect sequence replay or inversion is rejected",
+            ));
+        }
+        if hello.capability_grant.is_some() {
+            return Err(DispatchFailure::fatal(
+                CONNECT_ERROR_FORBIDDEN,
+                "client Hello cannot carry a host capability grant",
+            ));
+        }
+        if let (Some(bound), Some(supplied)) = (self.bound_client_id, hello.client_id) {
+            if bound != supplied {
+                return Err(DispatchFailure::fatal(
+                    CONNECT_ERROR_UNAUTHORIZED,
+                    "Hello client_id does not match the bound Connect identity",
+                ));
+            }
+        }
+        hello.limits.validate().map_err(|_| {
+            DispatchFailure::fatal(CONNECT_ERROR_PROTOCOL, "Hello limits are invalid")
+        })?;
+        if matches!(hello.privacy_class, ConnectPrivacyClass::RawContent) {
+            return Err(DispatchFailure::fatal(
+                CONNECT_ERROR_PROTOCOL,
+                "Hello cannot advertise RawContent as the default privacy class",
+            ));
+        }
+        let limits = ConnectLimits::v1_default()
+            .negotiate(hello.limits)
+            .map_err(|_| {
+                DispatchFailure::fatal(CONNECT_ERROR_PROTOCOL, "Hello limits cannot be negotiated")
+            })?;
+        let capabilities = advertised_connect_capabilities().intersection(hello.capabilities);
+        let client_id = hello.client_id.unwrap_or_else(ClientId::new);
+        self.binding = Some(binding);
+        self.last_recv_sequence = envelope.sequence;
+        self.bound_client_id = Some(client_id);
+        self.negotiated = Some(NegotiatedConnect {
+            limits,
+            capabilities,
+            privacy_class: hello.privacy_class,
+        });
+        Ok(ConnectPayload::Hello(HelloPayload {
+            capabilities,
+            limits,
+            privacy_class: hello.privacy_class,
+            relay_url: None,
+            capability_grant: None,
+            client_id: Some(client_id),
+        }))
+    }
+
+    fn capabilities_match_negotiated(&self, capabilities: CapabilitySet) -> bool {
+        self.negotiated
+            .is_some_and(|negotiated| capabilities == negotiated.capabilities)
+    }
+
+    fn admit_post_hello_frame(
+        &mut self,
+        envelope: &ConnectEnvelope,
+    ) -> Result<NegotiatedConnect, DispatchFailure> {
+        let negotiated = self.require_ready()?;
+        let binding = envelope.binding().map_err(|_| {
+            DispatchFailure::fatal(CONNECT_ERROR_PROTOCOL, "invalid channel binding")
+        })?;
+        if self.binding != Some(binding) {
+            return Err(DispatchFailure::fatal(
+                CONNECT_ERROR_PROTOCOL,
+                "channel binding does not match the authenticated session",
+            ));
+        }
+        if envelope.sequence == 0 || envelope.sequence <= self.last_recv_sequence {
+            return Err(DispatchFailure::fatal(
+                CONNECT_ERROR_CONFLICT,
+                "Connect sequence replay or inversion is rejected",
+            ));
+        }
+        if envelope.limits != negotiated.limits {
+            return Err(DispatchFailure::fatal(
+                CONNECT_ERROR_PROTOCOL,
+                "envelope limits do not match negotiated Connect limits",
+            ));
+        }
+        self.last_recv_sequence = envelope.sequence;
+        Ok(negotiated)
+    }
+
+    fn require_ready(&self) -> Result<NegotiatedConnect, DispatchFailure> {
+        self.negotiated.ok_or_else(|| {
+            DispatchFailure::fatal(
+                CONNECT_ERROR_PROTOCOL,
+                "Connect Hello is required before Query or Command",
+            )
+        })
+    }
+
+    async fn dispatch_request(
+        &mut self,
+        envelope: &ConnectEnvelope,
+        request: ClientRequest,
+        host: Option<&HostRequestHandle>,
+    ) -> Result<ConnectPayload, DispatchFailure> {
+        let negotiated = self.require_ready()?;
+        let bound = self.bound_client_id.ok_or_else(|| {
+            DispatchFailure::fatal(
+                CONNECT_ERROR_UNAUTHORIZED,
+                "Connect client identity is not bound",
+            )
+        })?;
+        bind_request_identity(&request, bound)?;
+        deny_if_capability_missing(&request, negotiated.capabilities)?;
+        authorize_established_request(&request)?;
+
+        let Some(host) = host else {
+            return Err(DispatchFailure::soft(
+                CONNECT_ERROR_EXECUTOR_UNATTACHED,
+                "Connect host executor is not attached",
+            ));
+        };
+
+        let parameters = NegotiatedParameters {
+            version: ProtocolVersion::current(),
+            client_id: bound,
+            capabilities: negotiated.capabilities,
+            limits: frame_limits_or_default(negotiated.limits),
+        };
+        let message = host.execute(parameters, request).await.map_err(map_ipc_error)?;
+        convert_host_message(message, envelope)
+    }
+}
+
+struct DispatchFailure {
+    code: u16,
+    message: &'static str,
+    disconnect: bool,
+}
+
+impl DispatchFailure {
+    fn fatal(code: u16, message: &'static str) -> Self {
+        Self {
+            code,
+            message,
+            disconnect: true,
+        }
+    }
+
+    fn soft(code: u16, message: &'static str) -> Self {
+        Self {
+            code,
+            message,
+            disconnect: false,
+        }
+    }
+}
+
+fn bind_request_identity(
+    request: &ClientRequest,
+    bound: ClientId,
+) -> Result<(), DispatchFailure> {
+    match request {
+        ClientRequest::Query(envelope) => {
+            if envelope.client_id != bound {
+                return Err(DispatchFailure::soft(
+                    CONNECT_ERROR_UNAUTHORIZED,
+                    "request client_id is not the authenticated paired identity",
+                ));
+            }
+        }
+        ClientRequest::Command(envelope) => {
+            if envelope.client_id != bound {
+                return Err(DispatchFailure::soft(
+                    CONNECT_ERROR_UNAUTHORIZED,
+                    "request client_id is not the authenticated paired identity",
+                ));
+            }
+        }
+        ClientRequest::Detach(_) => {}
+    }
+    Ok(())
+}
+
+fn deny_if_capability_missing(
+    request: &ClientRequest,
+    granted: CapabilitySet,
+) -> Result<(), DispatchFailure> {
+    let required = match request {
+        ClientRequest::Query(envelope) => match envelope.query {
+            crate::domain::query::Query::SnapshotPage { .. }
+            | crate::domain::query::Query::ReleaseSnapshot { .. } => {
+                Some(Capability::PagedSnapshots)
+            }
+            crate::domain::query::Query::OpenEventReplay { .. }
+            | crate::domain::query::Query::ContinueEventReplay { .. }
+            | crate::domain::query::Query::ReleaseEventReplay { .. } => {
+                Some(Capability::EventReplay)
+            }
+            crate::domain::query::Query::OpenArtifactContent { .. }
+            | crate::domain::query::Query::ContinueArtifactContent { .. }
+            | crate::domain::query::Query::ReleaseArtifactContent { .. } => {
+                Some(Capability::ChunkResume)
+            }
+            crate::domain::query::Query::InspectHostQuit => Some(Capability::HostShutdown),
+            crate::domain::query::Query::PromptLibrary(_) => Some(Capability::PromptProjection),
+            crate::domain::query::Query::TaskCockpit(_) => Some(Capability::TaskCockpit),
+            crate::domain::query::Query::OperationStatus { .. }
+            | crate::domain::query::Query::TaskSnapshot => None,
+        },
+        ClientRequest::Command(envelope) => match &envelope.command {
+            crate::domain::command::Command::SubmitProviderInput(_) => {
+                Some(Capability::ProviderInput)
+            }
+            crate::domain::command::Command::ConfirmHostQuit(_) => Some(Capability::HostShutdown),
+            crate::domain::command::Command::PromptLibrary(_) => Some(Capability::PromptProjection),
+            crate::domain::command::Command::ServiceControl(_) => {
+                Some(Capability::ServiceSupervisor)
+            }
+            crate::domain::command::Command::Browser(_) => Some(Capability::BrowserProjection),
+            _ => None,
+        },
+        ClientRequest::Detach(_) => Some(Capability::ExplicitDetach),
+    };
+    if let Some(capability) = required {
+        if !granted.contains(capability) {
+            return Err(DispatchFailure::soft(
+                CONNECT_ERROR_FORBIDDEN,
+                "request requires a capability that was not negotiated",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn authorize_established_request(request: &ClientRequest) -> Result<(), DispatchFailure> {
+    if matches!(request, ClientRequest::Detach(_)) {
+        return Ok(());
+    }
+    let Some((action, task_id)) = action_for_client_request(request) else {
+        return Err(DispatchFailure::soft(
+            CONNECT_ERROR_FORBIDDEN,
+            "unauthorized Connect command",
+        ));
+    };
+    let decision = PermissionEvaluator::default().evaluate_transport_authenticated_owner(
+        PermissionRequest {
+            role: ConnectRole::PairedOwner,
+            task_id,
+            action,
+            credential: None,
+        },
+    );
+    match decision {
+        PermissionDecision::Allow => Ok(()),
+        PermissionDecision::Denied(reason) => Err(DispatchFailure::soft(
+            CONNECT_ERROR_FORBIDDEN,
+            deny_message(reason),
+        )),
+    }
+}
+
+fn deny_message(reason: PermissionDenyReason) -> &'static str {
+    match reason {
+        PermissionDenyReason::UnknownAction => "unauthorized Connect command",
+        PermissionDenyReason::WatcherReadOnly => "Watcher grants are read-only",
+        PermissionDenyReason::OwnerOnly => "the action is Owner-only",
+        PermissionDenyReason::DeviceCredentialRequired => {
+            "PairedOwner actions require a verified device credential"
+        }
+        PermissionDenyReason::AnonymousPairingOnly => {
+            "anonymous pairing may only redeem a bounded pairing capability"
+        }
+        PermissionDenyReason::IdentityNotLive => "Connect identity is not live",
+        _ => "Connect permission denied",
+    }
+}
+
+fn convert_host_message(
+    message: ServerMessage,
+    envelope: &ConnectEnvelope,
+) -> Result<ConnectPayload, DispatchFailure> {
+    let payload = ConnectPayload::from_host_server_message(message).map_err(|_| {
+        DispatchFailure::soft(
+            CONNECT_ERROR_PROTOCOL,
+            "host reply is not a Connect request-lane payload",
+        )
+    })?;
+    match &payload {
+        ConnectPayload::QueryReply(reply) => {
+            if let Some(request_id) = envelope.request_id {
+                if reply.request_id != request_id {
+                    return Err(DispatchFailure::soft(
+                        CONNECT_ERROR_PROTOCOL,
+                        "QueryReply request_id does not match the envelope",
+                    ));
+                }
+            }
+        }
+        ConnectPayload::CommandReceipt(receipt) => {
+            correlate_command_receipt(receipt, envelope)?;
+        }
+        _ => {}
+    }
+    Ok(payload)
+}
+
+/// Accepted receipts must match a supplied envelope operation_id.
+/// Rejected receipts have no operation_id; the envelope field is the authority
+/// and is preserved on the sealed response envelope.
+fn correlate_command_receipt(
+    receipt: &crate::domain::command::CommandReceipt,
+    envelope: &ConnectEnvelope,
+) -> Result<(), DispatchFailure> {
+    match receipt {
+        crate::domain::command::CommandReceipt::Accepted { operation_id, .. } => {
+            if let Some(expected) = envelope.operation_id {
+                if *operation_id != expected {
+                    return Err(DispatchFailure::soft(
+                        CONNECT_ERROR_PROTOCOL,
+                        "CommandReceipt operation_id does not match the envelope",
+                    ));
+                }
+            }
+        }
+        crate::domain::command::CommandReceipt::Rejected { .. } => {}
+    }
+    Ok(())
+}
+
+fn map_ipc_error(error: IpcError) -> DispatchFailure {
+    match error {
+        IpcError::Unauthorized => DispatchFailure::soft(
+            CONNECT_ERROR_UNAUTHORIZED,
+            "request client_id is not the authenticated paired identity",
+        ),
+        IpcError::UnsupportedCapability => DispatchFailure::soft(
+            CONNECT_ERROR_FORBIDDEN,
+            "request requires a capability that was not negotiated",
+        ),
+        IpcError::Unavailable | IpcError::Busy => DispatchFailure::soft(
+            CONNECT_ERROR_EXECUTOR_UNATTACHED,
+            "Connect host executor is not attached",
+        ),
+        _ => DispatchFailure::soft(CONNECT_ERROR_PROTOCOL, "host request failed closed"),
+    }
+}
+
+fn frame_limits_or_default(limits: ConnectLimits) -> FrameLimits {
+    limits.frame_limits()
+}
+
+fn typed_error(
+    code: u16,
+    message: &str,
+    request_id: Option<crate::domain::id::RequestId>,
+    operation_id: Option<crate::domain::id::OperationId>,
+) -> ConnectPayload {
+    let max = usize::try_from(MAX_CONNECT_DIAGNOSTIC_BYTES).unwrap_or(8 * 1024);
+    let mut bounded = message.to_string();
+    if bounded.len() > max {
+        bounded.truncate(max);
+    }
+    if bounded.is_empty() {
+        bounded.push_str("Connect error");
+    }
+    debug_assert!(
+        !bounded.contains(CONNECT_HOLD_CALLBACK_FRAGMENT),
+        "production Connect must not emit the former 503 HOLD"
+    );
+    ConnectPayload::Error(ErrorPayload {
+        code,
+        message: bounded,
+        request_id,
+        operation_id,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::connect::{ConnectEnvelope, SessionId};
+    use crate::domain::command::{Command, CommandEnvelope, CommandReceipt, RejectionCode};
+    use crate::domain::id::{CommandId, EventId, OperationId, RequestId, TaskId};
+    use crate::domain::query::{Query, QueryEnvelope, QueryReply};
+    use crate::host::HostRequestExecutor;
+    use crate::kernel::CommandBus;
+    use crate::protocol::CapabilitySet;
+
+    fn binding() -> ChannelBinding {
+        ChannelBinding::new(
+            crate::connect::ConnectionId::new(),
+            SessionId::new(),
+            crate::connect::ChannelId::new(),
+        )
+    }
+
+    fn hello_payload(capabilities: CapabilitySet, limits: ConnectLimits) -> HelloPayload {
+        HelloPayload {
+            capabilities,
+            limits,
+            privacy_class: ConnectPrivacyClass::LocalOnly,
+            relay_url: None,
+            capability_grant: None,
+            client_id: None,
+        }
+    }
+
+    fn envelope(
+        binding: ChannelBinding,
+        sequence: u64,
+        request_id: Option<RequestId>,
+        operation_id: Option<OperationId>,
+        limits: ConnectLimits,
+        payload: ConnectPayload,
+    ) -> ConnectEnvelope {
+        ConnectEnvelope::new(
+            binding,
+            payload.channel(),
+            sequence,
+            request_id,
+            operation_id,
+            limits,
+            ConnectPrivacyClass::LocalOnly,
+            payload,
+        )
+        .expect("envelope")
+    }
+
+    fn assert_not_hold(payload: &ConnectPayload) {
+        if let ConnectPayload::Error(error) = payload {
+            assert_ne!(error.code, 503, "production Connect must not return 503 HOLD");
+            assert!(
+                !error.message.contains(CONNECT_HOLD_CALLBACK_FRAGMENT),
+                "must not emit former callback HOLD: {}",
+                error.message
+            );
+            assert!(
+                !error.message.contains("unavailable until"),
+                "must not emit former HOLD phrasing: {}",
+                error.message
+            );
+        }
+    }
+
+    async fn complete_hello(
+        session: &mut ConnectDispatchSession,
+        binding: ChannelBinding,
+    ) -> (ConnectLimits, ClientId) {
+        let limits = ConnectLimits::v1_default();
+        let payload = ConnectPayload::Hello(hello_payload(
+            advertised_connect_capabilities(),
+            limits,
+        ));
+        let env = envelope(binding, 1, None, None, limits, payload.clone());
+        let (reply, disposition) = session.handle_payload(&env, payload, None).await;
+        assert_eq!(disposition, ConnectSessionDisposition::Continue);
+        match reply {
+            ConnectPayload::Hello(hello) => {
+                assert!(!hello.capabilities.contains(Capability::EventReplay));
+                let client_id = hello.client_id.expect("Hello reply assigns client_id");
+                assert_eq!(session.bound_client_id(), Some(client_id));
+                (hello.limits, client_id)
+            }
+            other => panic!("expected Hello reply, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn query_reaches_host_request_handle_and_returns_typed_query_reply() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let bus = CommandBus::open(&directory.path().join("connect-query.db")).expect("bus");
+        let (handle, executor) = HostRequestExecutor::start(bus);
+        let binding = binding();
+        let mut session =
+            ConnectDispatchSession::bind_paired("web-paired-owner".to_owned(), ConnectIdentityLiveState::Live);
+        let (limits, client_id) = complete_hello(&mut session, binding).await;
+        let request_id = RequestId::new();
+        let query = QueryEnvelope {
+            request_id,
+            client_id,
+            task_id: None,
+            query: Query::OperationStatus {
+                operation_id: OperationId::new(),
+            },
+        };
+        let payload = ConnectPayload::Query(query);
+        let env = envelope(binding, 2, Some(request_id), None, limits, payload.clone());
+        let (reply, disposition) = session
+            .handle_payload(&env, payload, Some(&handle))
+            .await;
+        assert_eq!(disposition, ConnectSessionDisposition::Continue);
+        assert_not_hold(&reply);
+        let ConnectPayload::QueryReply(QueryReply {
+            request_id: reply_id,
+            ..
+        }) = reply
+        else {
+            panic!("expected QueryReply, got {reply:?}");
+        };
+        assert_eq!(reply_id, request_id);
+        drop(handle);
+        executor.abort();
+        let _ = executor.await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn command_reaches_host_request_handle_and_returns_typed_command_receipt() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let bus = CommandBus::open(&directory.path().join("connect-command.db")).expect("bus");
+        let (handle, executor) = HostRequestExecutor::start(bus);
+        let binding = binding();
+        let mut session =
+            ConnectDispatchSession::bind_paired("web-paired-owner".to_owned(), ConnectIdentityLiveState::Live);
+        let (limits, client_id) = complete_hello(&mut session, binding).await;
+        let command_id = CommandId::new();
+        let request_id = RequestId::new();
+        let command = CommandEnvelope {
+            command_id,
+            client_id,
+            task_id: Some(TaskId::new()),
+            issued_at_ms: 1,
+            expected_task_revision: None,
+            command: Command::BeginCloseTask,
+        };
+        let payload = ConnectPayload::Command(command);
+        let env = envelope(binding, 2, Some(request_id), None, limits, payload.clone());
+        let (reply, disposition) = session
+            .handle_payload(&env, payload, Some(&handle))
+            .await;
+        assert_eq!(disposition, ConnectSessionDisposition::Continue);
+        assert_not_hold(&reply);
+        let ConnectPayload::CommandReceipt(receipt) = reply else {
+            panic!("expected CommandReceipt, got {reply:?}");
+        };
+        assert_eq!(receipt.command_id(), command_id);
+        let _ = CommandReceipt::command_id(&receipt);
+        drop(handle);
+        executor.abort();
+        let _ = executor.await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn missing_hello_fails_closed_without_dispatch() {
+        let mut session =
+            ConnectDispatchSession::bind_paired("web-paired-owner".to_owned(), ConnectIdentityLiveState::Live);
+        assert!(session.bound_client_id().is_none());
+        let request_id = RequestId::new();
+        let payload = ConnectPayload::Query(QueryEnvelope {
+            request_id,
+            client_id: ClientId::new(),
+            task_id: None,
+            query: Query::TaskSnapshot,
+        });
+        let env = envelope(
+            binding(),
+            1,
+            Some(request_id),
+            None,
+            ConnectLimits::v1_default(),
+            payload.clone(),
+        );
+        let (reply, disposition) = session.handle_payload(&env, payload, None).await;
+        assert_eq!(disposition, ConnectSessionDisposition::Disconnect);
+        assert_not_hold(&reply);
+        let ConnectPayload::Error(error) = reply else {
+            panic!("expected typed error");
+        };
+        assert_eq!(error.code, CONNECT_ERROR_PROTOCOL);
+        assert!(error.message.contains("Hello"));
+        assert_eq!(error.request_id, Some(request_id));
+        assert!(session.bound_client_id().is_none());
+        assert!(session.channel_binding().is_none());
+        assert!(session.negotiated_limits().is_none());
+        assert!(!session.is_active());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn invalid_hello_grant_and_capability_mismatch_fail_closed() {
+        let binding = binding();
+        let mut session =
+            ConnectDispatchSession::bind_paired("web-paired-owner".to_owned(), ConnectIdentityLiveState::Live);
+        let mut hello = hello_payload(advertised_connect_capabilities(), ConnectLimits::v1_default());
+        hello.capability_grant = Some(crate::connect::HostCapabilityGrant {
+            role: crate::connect::HostConnectRole::Owner,
+            task_id: "task-1".to_owned(),
+            actions: vec![crate::connect::HostConnectAction::MutateTask],
+        });
+        let payload = ConnectPayload::Hello(hello);
+        let env = envelope(binding, 1, None, None, ConnectLimits::v1_default(), payload.clone());
+        let (reply, disposition) = session.handle_payload(&env, payload, None).await;
+        assert_eq!(disposition, ConnectSessionDisposition::Disconnect);
+        assert_not_hold(&reply);
+        let ConnectPayload::Error(error) = reply else {
+            panic!("expected typed error");
+        };
+        assert_eq!(error.code, CONNECT_ERROR_FORBIDDEN);
+
+        let mut session =
+            ConnectDispatchSession::bind_paired("web-paired-owner".to_owned(), ConnectIdentityLiveState::Live);
+        let (limits, _) = complete_hello(&mut session, binding).await;
+        let payload = ConnectPayload::Capabilities(CapabilitySet::from_capabilities([
+            Capability::OrganizationProjection,
+        ]));
+        let env = envelope(binding, 2, None, None, limits, payload.clone());
+        let (reply, disposition) = session.handle_payload(&env, payload, None).await;
+        assert_eq!(disposition, ConnectSessionDisposition::Disconnect);
+        assert_not_hold(&reply);
+        let ConnectPayload::Error(error) = reply else {
+            panic!("expected typed error");
+        };
+        assert_eq!(error.code, CONNECT_ERROR_FORBIDDEN);
+        assert!(!session.is_active());
+        assert!(session.negotiated_limits().is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn limits_mismatch_wrong_binding_and_replay_fail_closed() {
+        let binding = binding();
+        let mut session =
+            ConnectDispatchSession::bind_paired("web-paired-owner".to_owned(), ConnectIdentityLiveState::Live);
+        let (limits, client_id) = complete_hello(&mut session, binding).await;
+        let other_limits = ConnectLimits::try_new(
+            limits.max_physical_frame_bytes,
+            limits.max_reassembled_message_bytes,
+            1,
+            limits.max_page_encoded_bytes,
+            limits.max_chunk_bytes,
+            limits.max_cumulative_bytes,
+        )
+        .expect("smaller valid limits");
+        let request_id = RequestId::new();
+        let query = ConnectPayload::Query(QueryEnvelope {
+            request_id,
+            client_id,
+            task_id: None,
+            query: Query::TaskSnapshot,
+        });
+        let env = envelope(binding, 2, Some(request_id), None, other_limits, query.clone());
+        let (reply, disposition) = session.handle_payload(&env, query, None).await;
+        assert_eq!(disposition, ConnectSessionDisposition::Disconnect);
+        assert_not_hold(&reply);
+        assert!(matches!(reply, ConnectPayload::Error(error) if error.code == CONNECT_ERROR_PROTOCOL));
+
+        let mut session =
+            ConnectDispatchSession::bind_paired("web-paired-owner".to_owned(), ConnectIdentityLiveState::Live);
+        let (limits, client_id) = complete_hello(&mut session, binding).await;
+        let query = ConnectPayload::Query(QueryEnvelope {
+            request_id,
+            client_id,
+            task_id: None,
+            query: Query::TaskSnapshot,
+        });
+        let env = envelope(binding(), 2, Some(request_id), None, limits, query.clone());
+        let (reply, disposition) = session.handle_payload(&env, query, None).await;
+        assert_eq!(disposition, ConnectSessionDisposition::Disconnect);
+        assert_not_hold(&reply);
+        assert!(matches!(reply, ConnectPayload::Error(error) if error.code == CONNECT_ERROR_PROTOCOL));
+
+        let mut session =
+            ConnectDispatchSession::bind_paired("web-paired-owner".to_owned(), ConnectIdentityLiveState::Live);
+        let (limits, _) = complete_hello(&mut session, binding).await;
+        let hello = ConnectPayload::Hello(hello_payload(advertised_connect_capabilities(), limits));
+        let env = envelope(binding, 1, None, None, limits, hello.clone());
+        let (reply, disposition) = session.handle_payload(&env, hello, None).await;
+        assert_eq!(disposition, ConnectSessionDisposition::Disconnect);
+        assert_not_hold(&reply);
+        assert!(matches!(reply, ConnectPayload::Error(error) if error.code == CONNECT_ERROR_CONFLICT));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unauthorized_command_and_unadvertised_replay_do_not_dispatch() {
+        let binding = binding();
+        let mut session =
+            ConnectDispatchSession::bind_paired("web-paired-owner".to_owned(), ConnectIdentityLiveState::Live);
+        let (limits, bound) = complete_hello(&mut session, binding).await;
+        let request_id = RequestId::new();
+        let payload = ConnectPayload::Command(CommandEnvelope {
+            command_id: CommandId::new(),
+            client_id: ClientId::new(),
+            task_id: Some(TaskId::new()),
+            issued_at_ms: 1,
+            expected_task_revision: None,
+            command: Command::BeginCloseTask,
+        });
+        let env = envelope(binding, 2, Some(request_id), None, limits, payload.clone());
+        let (reply, disposition) = session.handle_payload(&env, payload, None).await;
+        assert_eq!(disposition, ConnectSessionDisposition::Continue);
+        assert_not_hold(&reply);
+        let ConnectPayload::Error(error) = reply else {
+            panic!("expected typed error");
+        };
+        assert_eq!(error.code, CONNECT_ERROR_UNAUTHORIZED);
+        assert_eq!(error.request_id, Some(request_id));
+        assert!(!error.message.contains("web-paired-owner"));
+        assert!(!error.message.contains("secret"));
+
+        let payload = ConnectPayload::Query(QueryEnvelope {
+            request_id,
+            client_id: bound,
+            task_id: None,
+            query: Query::OpenEventReplay { after_sequence: 0 },
+        });
+        let env = envelope(binding, 3, Some(request_id), None, limits, payload.clone());
+        let (reply, disposition) = session.handle_payload(&env, payload, None).await;
+        assert_eq!(disposition, ConnectSessionDisposition::Continue);
+        assert_not_hold(&reply);
+        let ConnectPayload::Error(error) = reply else {
+            panic!("expected typed error");
+        };
+        assert_eq!(error.code, CONNECT_ERROR_FORBIDDEN);
+        assert!(error.message.contains("capability"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn production_path_never_returns_callback_hold_and_keeps_paired_identity() {
+        let mut session =
+            ConnectDispatchSession::bind_paired("web-paired-owner".to_owned(), ConnectIdentityLiveState::Live);
+        assert!(session.bound_client_id().is_none());
+        assert!(session.paired_identity_bound());
+        let binding = binding();
+        let (_, assigned) = complete_hello(&mut session, binding).await;
+        assert_eq!(session.bound_client_id(), Some(assigned));
+        assert!(session.paired_identity_bound());
+        session.disconnect();
+        assert!(!session.paired_identity_bound());
+        assert!(session.bound_client_id().is_none());
+        assert!(session.channel_binding().is_none());
+        assert!(session.negotiated_limits().is_none());
+        assert!(!session.is_active());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn hello_assigns_or_binds_supplied_client_id_and_rejects_mismatch() {
+        let binding = binding();
+        let mut session =
+            ConnectDispatchSession::bind_paired("web-paired-owner".to_owned(), ConnectIdentityLiveState::Live);
+        let supplied = ClientId::new();
+        let mut hello = hello_payload(advertised_connect_capabilities(), ConnectLimits::v1_default());
+        hello.client_id = Some(supplied);
+        let payload = ConnectPayload::Hello(hello);
+        let env = envelope(binding, 1, None, None, ConnectLimits::v1_default(), payload.clone());
+        let (reply, disposition) = session.handle_payload(&env, payload, None).await;
+        assert_eq!(disposition, ConnectSessionDisposition::Continue);
+        let ConnectPayload::Hello(hello) = reply else {
+            panic!("expected Hello reply");
+        };
+        assert_eq!(hello.client_id, Some(supplied));
+        assert_eq!(session.bound_client_id(), Some(supplied));
+
+        let request_id = RequestId::new();
+        let limits = session.negotiated_limits().expect("negotiated");
+        let query = ConnectPayload::Query(QueryEnvelope {
+            request_id,
+            client_id: ClientId::new(),
+            task_id: None,
+            query: Query::TaskSnapshot,
+        });
+        let env = envelope(binding, 2, Some(request_id), None, limits, query.clone());
+        let (reply, disposition) = session.handle_payload(&env, query, None).await;
+        assert_eq!(disposition, ConnectSessionDisposition::Continue);
+        let ConnectPayload::Error(error) = reply else {
+            panic!("expected typed error");
+        };
+        assert_eq!(error.code, CONNECT_ERROR_UNAUTHORIZED);
+        assert_eq!(error.request_id, Some(request_id));
+        assert_eq!(session.bound_client_id(), Some(supplied));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn duplicate_hello_and_matching_capabilities_confirmation() {
+        let binding = binding();
+        let mut session =
+            ConnectDispatchSession::bind_paired("web-paired-owner".to_owned(), ConnectIdentityLiveState::Live);
+        let (limits, _) = complete_hello(&mut session, binding).await;
+        let duplicate = ConnectPayload::Hello(hello_payload(
+            advertised_connect_capabilities(),
+            limits,
+        ));
+        let env = envelope(binding, 2, None, None, limits, duplicate.clone());
+        let (reply, disposition) = session.handle_payload(&env, duplicate, None).await;
+        assert_eq!(disposition, ConnectSessionDisposition::Disconnect);
+        assert_not_hold(&reply);
+        assert!(matches!(
+            reply,
+            ConnectPayload::Error(error) if error.code == CONNECT_ERROR_PROTOCOL
+        ));
+        assert!(!session.is_active());
+        assert!(session.bound_client_id().is_none());
+
+        let mut session =
+            ConnectDispatchSession::bind_paired("web-paired-owner".to_owned(), ConnectIdentityLiveState::Live);
+        let (limits, client_id) = complete_hello(&mut session, binding).await;
+        let negotiated = session.negotiated_capabilities().expect("negotiated");
+        let confirm = ConnectPayload::Capabilities(negotiated);
+        let env = envelope(binding, 2, None, None, limits, confirm.clone());
+        let (reply, disposition) = session.handle_payload(&env, confirm, None).await;
+        assert_eq!(disposition, ConnectSessionDisposition::Continue);
+        assert!(matches!(reply, ConnectPayload::Capabilities(_)));
+
+        let request_id = RequestId::new();
+        let query = ConnectPayload::Query(QueryEnvelope {
+            request_id,
+            client_id,
+            task_id: None,
+            query: Query::TaskSnapshot,
+        });
+        let env = envelope(binding, 3, Some(request_id), None, limits, query.clone());
+        let (reply, disposition) = session.handle_payload(&env, query, None).await;
+        assert_eq!(disposition, ConnectSessionDisposition::Continue);
+        assert_not_hold(&reply);
+        assert!(matches!(
+            reply,
+            ConnectPayload::Error(error) if error.code == CONNECT_ERROR_EXECUTOR_UNATTACHED
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn attach_after_start_slot_clone_is_observed_and_cleared() {
+        let live = ConnectHostRequestSlot::new();
+        let stored = live.clone();
+        assert!(live.get().is_none());
+        let directory = tempfile::tempdir().expect("tempdir");
+        let bus = CommandBus::open(&directory.path().join("connect-slot-clone.db")).expect("bus");
+        let (handle, executor) = HostRequestExecutor::start(bus);
+        stored.attach(handle.clone());
+        assert!(
+            live.get().is_some(),
+            "attach on a cloned slot must update the live WebState slot"
+        );
+        stored.clear();
+        assert!(live.get().is_none());
+        drop(handle);
+        executor.abort();
+        let _ = executor.await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn process_slot_unbind_clears_clones_and_cannot_reuse_stale_handle() {
+        let observed = process_connect_host_request_slot();
+        let directory = tempfile::tempdir().expect("tempdir");
+        let bus = CommandBus::open(&directory.path().join("connect-process-slot.db")).expect("bus");
+        let (handle, executor) = HostRequestExecutor::start(bus);
+        bind_host_request_handle(handle.clone());
+        assert!(observed.get().is_some());
+        assert!(bound_host_request_handle().is_some());
+        unbind_host_request_handle();
+        assert!(observed.get().is_none());
+        assert!(bound_host_request_handle().is_none());
+        drop(handle);
+        executor.abort();
+        let _ = executor.await;
+    }
+
+    #[test]
+    fn command_receipt_correlation_accepted_mismatch_and_rejected_envelope_authority() {
+        let binding = binding();
+        let expected = OperationId::new();
+        let other = OperationId::new();
+        let accepted = CommandReceipt::Accepted {
+            command_id: CommandId::new(),
+            operation_id: other,
+            task_revision: Some(1),
+            event_ids: vec![EventId::new()],
+            prompt_mutation: None,
+        };
+        let payload = ConnectPayload::CommandReceipt(accepted.clone());
+        let env = envelope(binding, 1, None, Some(expected), ConnectLimits::v1_default(), payload);
+        assert!(correlate_command_receipt(&accepted, &env).is_err());
+
+        let rejected = CommandReceipt::Rejected {
+            command_id: CommandId::new(),
+            code: RejectionCode::NotFound,
+            current_revision: None,
+            resolution: None,
+        };
+        let payload = ConnectPayload::CommandReceipt(rejected.clone());
+        let env = envelope(binding, 1, None, Some(expected), ConnectLimits::v1_default(), payload);
+        assert!(
+            correlate_command_receipt(&rejected, &env).is_ok(),
+            "rejected receipts have no operation_id; envelope correlation is the authority"
+        );
+        assert!(rejected.accepted_operation_id().is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn typed_error_preserves_envelope_request_and_operation_ids() {
+        let mut session =
+            ConnectDispatchSession::bind_paired("web-paired-owner".to_owned(), ConnectIdentityLiveState::Live);
+        let request_id = RequestId::new();
+        let operation_id = OperationId::new();
+        let payload = ConnectPayload::Command(CommandEnvelope {
+            command_id: CommandId::new(),
+            client_id: ClientId::new(),
+            task_id: Some(TaskId::new()),
+            issued_at_ms: 1,
+            expected_task_revision: None,
+            command: Command::BeginCloseTask,
+        });
+        let env = envelope(
+            binding(),
+            1,
+            Some(request_id),
+            Some(operation_id),
+            ConnectLimits::v1_default(),
+            payload.clone(),
+        );
+        let (reply, disposition) = session.handle_payload(&env, payload, None).await;
+        assert_eq!(disposition, ConnectSessionDisposition::Disconnect);
+        let ConnectPayload::Error(error) = reply else {
+            panic!("expected typed error");
+        };
+        assert_eq!(error.code, CONNECT_ERROR_PROTOCOL);
+        assert_eq!(error.request_id, Some(request_id));
+        assert_eq!(error.operation_id, Some(operation_id));
+    }
+
+    #[test]
+    fn advertised_capabilities_do_not_claim_live_event_replay() {
+        let advertised = advertised_connect_capabilities();
+        assert!(advertised.contains(Capability::ConnectEncryption));
+        assert!(!advertised.contains(Capability::EventReplay));
+        assert!(!advertised.contains(Capability::TerminalDeltas));
+        assert!(!advertised.contains(Capability::OrganizationProjection));
+    }
+}

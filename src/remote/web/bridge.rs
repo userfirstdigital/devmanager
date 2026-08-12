@@ -169,9 +169,10 @@ pub(crate) async fn connect_ws_handler(
     headers: HeaderMap,
 ) -> Response {
     let _ = addr;
-    if let Err(response) = admit_connect_ws_request(&state, &headers) {
-        return response;
-    }
+    let authentication = match admit_connect_ws_request(&state, &headers) {
+        Ok(authentication) => authentication,
+        Err(response) => return response,
+    };
     let Some(inner) = state.upgrade_inner() else {
         return (StatusCode::INTERNAL_SERVER_ERROR, "host unavailable").into_response();
     };
@@ -227,17 +228,30 @@ pub(crate) async fn connect_ws_handler(
         }
     }
     let inner = Arc::downgrade(&inner);
+    let host_requests = state.host_requests.clone();
+    let paired_client_id = authentication.client_id;
     ws.max_message_size(CONNECT_WS_MAX_FRAME_BYTES)
         .max_frame_size(CONNECT_WS_MAX_FRAME_BYTES)
-        .on_upgrade(move |socket| run_connect_session(socket, inner, connect_startup))
+        .on_upgrade(move |socket| {
+            run_connect_session(
+                socket,
+                inner,
+                connect_startup,
+                host_requests,
+                paired_client_id,
+            )
+        })
 }
 
-fn admit_connect_ws_request(state: &WebState, headers: &HeaderMap) -> Result<(), Response> {
+fn admit_connect_ws_request(
+    state: &WebState,
+    headers: &HeaderMap,
+) -> Result<ValidatedWebAuthentication, Response> {
     // The Noise handshake authenticates the peer, but it is not a substitute
     // for the host's paired-browser admission.  Keep the cookie check in the
     // HTTP upgrade path so an unauthenticated socket can never reach the
     // handshake or payload dispatcher.
-    authorize_ws_request(state, headers).map_err(|status| match status {
+    let authentication = authorize_ws_request(state, headers).map_err(|status| match status {
         StatusCode::FORBIDDEN => {
             (StatusCode::FORBIDDEN, "cross-origin websocket rejected").into_response()
         }
@@ -293,7 +307,7 @@ fn admit_connect_ws_request(state: &WebState, headers: &HeaderMap) -> Result<(),
         (status, error.to_string()).into_response()
     })?;
     let _ = inner;
-    Ok(())
+    Ok(authentication)
 }
 
 /// Determine the HTTP scheme that was used for the WebSocket upgrade.
@@ -352,6 +366,8 @@ async fn run_connect_session(
     mut socket: WebSocket,
     inner: Weak<RemoteHostInner>,
     connect_startup: std::sync::Arc<crate::connect::ConnectProductionStartup>,
+    host_requests: crate::connect::ConnectHostRequestSlot,
+    paired_client_id: String,
 ) {
     let Some(inner) = inner.upgrade() else {
         return;
@@ -479,10 +495,13 @@ async fn run_connect_session(
             return;
         }
     };
+    let mut dispatch = crate::connect::ConnectDispatchSession::bind_paired(
+        paired_client_id,
+        crate::connect::ConnectIdentityLiveState::Live,
+    );
     while let Some(bytes) = recv_connect_binary(&mut socket, CONNECT_WS_MAX_FRAME_BYTES).await {
         let Ok(frame) = crate::protocol::SealedFrame::decode(&bytes) else {
-            let _ = socket.close().await;
-            return;
+            break;
         };
         let now_unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -490,123 +509,81 @@ async fn run_connect_session(
             .unwrap_or(1);
         let plaintext = match channel.open_bytes(&frame, now_unix) {
             Ok(plaintext) => plaintext,
-            Err(_) => {
-                let _ = socket.close().await;
-                return;
-            }
+            Err(_) => break,
         };
-        let envelope = match crate::connect::ConnectEnvelope::decode(&plaintext) {
+        let envelope = match dispatch.negotiated_limits() {
+            Some(limits) => crate::connect::ConnectEnvelope::decode_with_limits(&plaintext, limits),
+            None => crate::connect::ConnectEnvelope::decode(&plaintext),
+        };
+        let envelope = match envelope {
             Ok(envelope) => envelope,
-            Err(_) => {
-                let _ = socket.close().await;
-                return;
-            }
+            Err(_) => break,
         };
         let payload = match envelope.decode_payload() {
             Ok(payload) => payload,
-            Err(_) => {
-                let _ = socket.close().await;
-                return;
-            }
+            Err(_) => break,
         };
-        // A valid, authenticated application frame is never silently
-        // discarded. Until the app's host executor is exposed through a
-        // bounded callback, reply with a typed capability-unavailable
-        // envelope and retain the same authenticated channel/binding.
-        let reply = connect_dispatch_hold_reply(&envelope, payload);
+        // Clone the handle then drop the slot lock before execute awaits.
+        let host = host_requests.get();
+        let (reply, disposition) = dispatch
+            .handle_payload(&envelope, payload, host.as_ref())
+            .await;
+        debug_assert!(
+            !matches!(
+                &reply,
+                crate::connect::ConnectPayload::Error(error)
+                    if error.code == 503
+                        || error
+                            .message
+                            .contains(crate::connect::CONNECT_HOLD_CALLBACK_FRAGMENT)
+            ),
+            "Connect production must not emit the former 503 HOLD"
+        );
         let mut nonce = [0_u8; crate::protocol::SEALED_NONCE_BYTES];
         if getrandom::fill(&mut nonce).is_err() {
-            let _ = socket.close().await;
-            return;
+            break;
         }
-        let binding = match envelope.binding() {
-            Ok(binding) => binding,
-            Err(_) => {
-                let _ = socket.close().await;
-                return;
-            }
+        let binding = dispatch
+            .channel_binding()
+            .or_else(|| envelope.binding().ok());
+        let Some(binding) = binding else {
+            break;
         };
+        let limits = dispatch
+            .negotiated_limits()
+            .unwrap_or(envelope.limits);
         let response = match crate::connect::ConnectEnvelope::new(
             binding,
-            crate::connect::ChannelKind::Critical,
+            reply.channel(),
             channel.next_send_sequence(),
             envelope.request_id,
             envelope.operation_id,
-            envelope.limits,
+            limits,
             crate::connect::ConnectPrivacyClass::LocalOnly,
             reply,
         ) {
             Ok(response) => response,
-            Err(_) => {
-                let _ = socket.close().await;
-                return;
-            }
+            Err(_) => break,
         };
         let Ok(sealed) = channel.seal(&response, nonce, now_unix) else {
-            let _ = socket.close().await;
-            return;
+            break;
         };
         let Ok(encoded) = sealed.encode() else {
-            let _ = socket.close().await;
-            return;
+            break;
         };
         if socket.send(WsMessage::Binary(encoded)).await.is_err() {
+            dispatch.disconnect();
             return;
         }
+        if matches!(
+            disposition,
+            crate::connect::ConnectSessionDisposition::Disconnect
+        ) {
+            break;
+        }
     }
-}
-
-/// Typed production boundary for Connect application payloads.
-///
-/// The web listener currently has no safe ownership of the app's single
-/// CommandBus executor. Keep this explicit HOLD here rather than translating
-/// Connect commands into the legacy JSON action protocol or dropping decrypted
-/// bytes. Organization extensions are recognized and rejected with the same
-/// bounded response until the organization projection callback is installed.
-fn connect_dispatch_hold_reply(
-    envelope: &crate::connect::ConnectEnvelope,
-    payload: crate::connect::ConnectPayload,
-) -> crate::connect::ConnectPayload {
-    let message = match payload {
-        crate::connect::ConnectPayload::Query(_) => {
-            "Connect query dispatch is unavailable until the host executor callback is bound"
-        }
-        crate::connect::ConnectPayload::Command(_) => {
-            "Connect command dispatch is unavailable until the host executor callback is bound"
-        }
-        crate::connect::ConnectPayload::Extension(extension)
-            if extension.type_id
-                == crate::protocol::organization_extension_type(
-                    crate::protocol::OrganizationExtensionKind::OrganizationPrompt,
-                ) =>
-        {
-            "organization projection dispatch is unavailable on this standalone host"
-        }
-        crate::connect::ConnectPayload::Hello(_)
-        | crate::connect::ConnectPayload::Capabilities(_)
-        | crate::connect::ConnectPayload::SnapshotPage(_)
-        | crate::connect::ConnectPayload::EventPage(_)
-        | crate::connect::ConnectPayload::CommandReceipt(_)
-        | crate::connect::ConnectPayload::OperationSettlement(_)
-        | crate::connect::ConnectPayload::Presence(_)
-        | crate::connect::ConnectPayload::TerminalDelta(_)
-        | crate::connect::ConnectPayload::BrowserFrame(_)
-        | crate::connect::ConnectPayload::PromptExtension(_)
-        | crate::connect::ConnectPayload::BrowserExtension(_)
-        | crate::connect::ConnectPayload::Chunk(_)
-        | crate::connect::ConnectPayload::Resync(_)
-        | crate::connect::ConnectPayload::Error(_) => {
-            "Connect payload kind is not accepted on the application request lane"
-        }
-        crate::connect::ConnectPayload::Extension(_) => {
-            "Connect extension dispatch is unavailable until its host callback is bound"
-        }
-    };
-    let _ = envelope;
-    crate::connect::ConnectPayload::Error(crate::connect::ErrorPayload {
-        code: 503,
-        message: message.to_string(),
-    })
+    dispatch.disconnect();
+    let _ = socket.close().await;
 }
 
 async fn recv_connect_binary(socket: &mut WebSocket, max_bytes: usize) -> Option<Vec<u8>> {
@@ -5547,6 +5524,7 @@ mod tests {
                 .load(Ordering::Acquire),
             pairing_attempts: Arc::new(std::sync::Mutex::new(Default::default())),
             connect_startup: None,
+            host_requests: crate::connect::ConnectHostRequestSlot::new(),
         };
         let config = service.config();
         let signed = super::super::sign_cookie(&config.web.cookie_secret_hex, "paired-browser")
@@ -5606,6 +5584,7 @@ mod tests {
                 .load(Ordering::Acquire),
             pairing_attempts: Arc::new(std::sync::Mutex::new(Default::default())),
             connect_startup: None,
+            host_requests: crate::connect::ConnectHostRequestSlot::new(),
         };
         let response = admit_connect_ws_request(&state, &HeaderMap::new())
             .expect_err("Connect must not reach Noise without browser admission");

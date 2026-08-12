@@ -418,6 +418,21 @@ impl PermissionEvaluator {
         self.evaluate_roles(request, false, false)
     }
 
+    /// Authorize a live paired owner after transport authentication.
+    ///
+    /// Cookie admission plus production Noise plus required Hello bind the
+    /// identity. This is not a raw DeviceId self-assertion and does not
+    /// replace scoped grants for guest roles.
+    pub fn evaluate_transport_authenticated_owner(
+        &self,
+        request: PermissionRequest,
+    ) -> PermissionDecision {
+        if !matches!(request.role, ConnectRole::PairedOwner) {
+            return self.evaluate(request);
+        }
+        self.evaluate_roles(request, true, false)
+    }
+
     /// Evaluate a request after reloading and validating its credential
     /// through the authoritative identity store and active session. A public
     /// evaluator must not accept a caller-supplied identity snapshot.

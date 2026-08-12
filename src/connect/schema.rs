@@ -11,9 +11,9 @@ use crate::domain::id::{
     ClientId, CommandId, EventId, OperationId, RequestId, SnapshotId, TaskId, TransferId,
 };
 use crate::domain::operation::OperationState;
-use crate::domain::query::{Query, QueryEnvelope};
+use crate::domain::query::{Query, QueryEnvelope, QueryError, QueryOutcome, QueryReply};
 use crate::domain::snapshot::{EventPage, SnapshotPage, SnapshotSection};
-use crate::protocol::{CapabilitySet, MessagePackCodec, MessagePackError};
+use crate::protocol::{CapabilitySet, MessagePackCodec, MessagePackError, ServerMessage};
 
 use super::envelope::{
     binary_payload, ChannelKind, ConnectLimitError, ConnectLimits, ConnectPrivacyClass,
@@ -77,6 +77,14 @@ static PAYLOAD_CATALOG: &[PayloadDescriptor] = &[
     descriptor(
         PayloadKind::QUERY,
         "query",
+        ChannelKind::Critical,
+        false,
+        false,
+        MAX_CONNECT_REASSEMBLED_MESSAGE_BYTES,
+    ),
+    descriptor(
+        PayloadKind::QUERY_REPLY,
+        "query_reply",
         ChannelKind::Critical,
         false,
         false,
@@ -220,6 +228,10 @@ pub struct HelloPayload {
     /// Optional explicit host grant. Omission is no authority.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capability_grant: Option<HostCapabilityGrant>,
+    /// Optional Connect client identity. Omission asks the host to assign one
+    /// and return it on the Hello reply. A supplied UUIDv7 is bound as-is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<ClientId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -275,6 +287,12 @@ pub enum ResyncReason {
 pub struct ErrorPayload {
     pub code: u16,
     pub message: String,
+    /// Envelope/request correlation. Omission is no request identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<RequestId>,
+    /// Envelope/operation correlation. Omission is no operation identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<OperationId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -293,6 +311,7 @@ pub enum ConnectPayload {
     SnapshotPage(SnapshotPage),
     EventPage(EventPage),
     Query(QueryEnvelope),
+    QueryReply(QueryReply),
     Command(CommandEnvelope),
     CommandReceipt(CommandReceipt),
     OperationSettlement(OperationSettlementPayload),
@@ -368,6 +387,7 @@ impl ConnectPayload {
             Self::SnapshotPage(_) => PayloadKind::SNAPSHOT_PAGE,
             Self::EventPage(_) => PayloadKind::EVENT_PAGE,
             Self::Query(_) => PayloadKind::QUERY,
+            Self::QueryReply(_) => PayloadKind::QUERY_REPLY,
             Self::Command(_) => PayloadKind::COMMAND,
             Self::CommandReceipt(_) => PayloadKind::COMMAND_RECEIPT,
             Self::OperationSettlement(_) => PayloadKind::OPERATION_SETTLEMENT,
@@ -397,6 +417,7 @@ impl ConnectPayload {
             Self::Hello(_)
             | Self::Capabilities(_)
             | Self::Query(_)
+            | Self::QueryReply(_)
             | Self::Command(_)
             | Self::CommandReceipt(_)
             | Self::OperationSettlement(_)
@@ -432,6 +453,31 @@ impl ConnectPayload {
         }
     }
 
+    /// Canonical request-lane conversion from the shared host executor.
+    ///
+    /// Live durable events, streams, and detach acks are not request replies.
+    /// Connect must not pretend an unattached output writer delivered them.
+    pub fn from_host_server_message(message: ServerMessage) -> Result<Self, PayloadDecodeError> {
+        match message {
+            ServerMessage::QueryReply(reply) => Ok(Self::QueryReply(reply)),
+            ServerMessage::CommandReceipt(receipt) => Ok(Self::CommandReceipt(receipt)),
+            ServerMessage::ResyncRequired {
+                last_delivered_sequence,
+                newest_sequence,
+                ..
+            } => Ok(Self::Resync(ResyncPayload {
+                channel_sequence: last_delivered_sequence,
+                newest_sequence,
+                reason: ResyncReason::Gap,
+            })),
+            ServerMessage::DurableEvent { .. }
+            | ServerMessage::Stream(_)
+            | ServerMessage::Detached(_) => Err(PayloadDecodeError::Ambiguous {
+                reason: "host output is not a Connect request-lane payload",
+            }),
+        }
+    }
+
     pub fn encode(&self, limits: ConnectLimits) -> Result<Vec<u8>, PayloadDecodeError> {
         self.validate(limits)?;
         let bytes = match self {
@@ -446,6 +492,7 @@ impl ConnectPayload {
             Self::SnapshotPage(value) => encode_named(value, limits)?,
             Self::EventPage(value) => encode_named(value, limits)?,
             Self::Query(value) => encode_named(value, limits)?,
+            Self::QueryReply(value) => encode_named(value, limits)?,
             Self::Command(value) => encode_named(value, limits)?,
             Self::CommandReceipt(value) => encode_named(value, limits)?,
             Self::OperationSettlement(value) => encode_named(value, limits)?,
@@ -514,6 +561,7 @@ impl ConnectPayload {
             KnownPayloadKind::SnapshotPage => Self::SnapshotPage(codec.decode(bytes)?),
             KnownPayloadKind::EventPage => Self::EventPage(codec.decode(bytes)?),
             KnownPayloadKind::Query => Self::Query(codec.decode(bytes)?),
+            KnownPayloadKind::QueryReply => Self::QueryReply(codec.decode(bytes)?),
             KnownPayloadKind::Command => Self::Command(codec.decode(bytes)?),
             KnownPayloadKind::CommandReceipt => Self::CommandReceipt(codec.decode(bytes)?),
             KnownPayloadKind::OperationSettlement => {
@@ -610,6 +658,7 @@ impl ConnectPayload {
             }
             Self::Capabilities(_)
             | Self::Query(_)
+            | Self::QueryReply(_)
             | Self::Command(_)
             | Self::CommandReceipt(_)
             | Self::OperationSettlement(_)
@@ -688,6 +737,7 @@ pub fn canonical_schema_fixtures() -> Vec<CanonicalSchemaFixture> {
                 privacy_class: ConnectPrivacyClass::LocalOnly,
                 relay_url: None,
                 capability_grant: None,
+                client_id: None,
             }),
         },
         CanonicalSchemaFixture {
@@ -722,6 +772,13 @@ pub fn canonical_schema_fixtures() -> Vec<CanonicalSchemaFixture> {
                 client_id: fixture_client(0x42),
                 task_id: Some(fixture_task(0x43)),
                 query: Query::TaskSnapshot,
+            }),
+        },
+        CanonicalSchemaFixture {
+            name: "query_reply",
+            payload: ConnectPayload::QueryReply(QueryReply {
+                request_id: fixture_request(0x41),
+                outcome: QueryOutcome::Err(QueryError::NotFound),
             }),
         },
         CanonicalSchemaFixture {
@@ -819,6 +876,8 @@ pub fn canonical_schema_fixtures() -> Vec<CanonicalSchemaFixture> {
             payload: ConnectPayload::Error(ErrorPayload {
                 code: 1,
                 message: "unavailable".to_owned(),
+                request_id: None,
+                operation_id: None,
             }),
         },
         CanonicalSchemaFixture {
@@ -899,6 +958,7 @@ mod tests {
             privacy_class: ConnectPrivacyClass::LocalOnly,
             relay_url,
             capability_grant,
+            client_id: None,
         }
     }
 
@@ -907,12 +967,59 @@ mod tests {
         let encoded = serde_json::to_string(&hello(None, None)).expect("encode");
         assert!(!encoded.contains("relay_url"));
         assert!(!encoded.contains("capability_grant"));
+        assert!(!encoded.contains("client_id"));
         let decoded: HelloPayload = serde_json::from_str(&encoded).expect("decode");
         assert_eq!(decoded.relay_url, None);
         assert_eq!(decoded.capability_grant, None);
+        assert_eq!(decoded.client_id, None);
         ConnectPayload::Hello(decoded)
             .validate(ConnectLimits::v1_default())
             .expect("omitted optional authority is valid");
+
+        let mut with_client = hello(None, None);
+        let supplied = ClientId::new();
+        with_client.client_id = Some(supplied);
+        let encoded = serde_json::to_string(&with_client).expect("encode");
+        assert!(encoded.contains("client_id"));
+        let decoded: HelloPayload = serde_json::from_str(&encoded).expect("decode");
+        assert_eq!(decoded.client_id, Some(supplied));
+    }
+
+    #[test]
+    fn error_correlation_fields_are_additive_and_fail_closed() {
+        let encoded = serde_json::to_string(&ErrorPayload {
+            code: 400,
+            message: "bad".to_owned(),
+            request_id: None,
+            operation_id: None,
+        })
+        .expect("encode");
+        assert!(!encoded.contains("request_id"));
+        assert!(!encoded.contains("operation_id"));
+        let decoded: ErrorPayload = serde_json::from_str(&encoded).expect("decode");
+        assert_eq!(decoded.request_id, None);
+        assert_eq!(decoded.operation_id, None);
+    }
+
+    #[test]
+    fn query_reply_round_trips_and_converts_from_host_server_message() {
+        let reply = QueryReply {
+            request_id: fixture_request(0x41),
+            outcome: QueryOutcome::Err(QueryError::NotFound),
+        };
+        let payload = ConnectPayload::QueryReply(reply.clone());
+        let limits = ConnectLimits::v1_default();
+        let bytes = payload.encode(limits).expect("encode");
+        let decoded = ConnectPayload::decode(payload.kind(), payload.version(), &bytes, limits)
+            .expect("decode");
+        assert_eq!(decoded, payload);
+        assert_eq!(
+            ConnectPayload::from_host_server_message(crate::protocol::ServerMessage::QueryReply(
+                reply
+            ))
+            .expect("convert"),
+            payload
+        );
     }
 
     #[test]

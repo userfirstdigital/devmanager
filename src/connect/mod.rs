@@ -5,6 +5,7 @@
 mod crypto;
 mod deletion_ledger;
 mod direct;
+mod dispatch;
 mod envelope;
 mod epoch;
 mod evidence;
@@ -46,6 +47,13 @@ pub use direct::{
     referer_contains_pairing_secret, security_headers, DirectAdmitError, DirectBindMode,
     DirectBindPolicy, DirectPairingExchange, DirectPairingLimiter, DirectPairingThrottle,
     DirectRequestView, MAX_DIRECT_FRAME_BYTES, MAX_DIRECT_PAIRING_BODY_BYTES,
+};
+pub use dispatch::{
+    advertised_connect_capabilities, bind_host_request_handle, bound_host_request_handle,
+    process_connect_host_request_slot, unbind_host_request_handle, ConnectDispatchSession,
+    ConnectHostRequestSlot, ConnectSessionDisposition, CONNECT_ERROR_CONFLICT,
+    CONNECT_ERROR_EXECUTOR_UNATTACHED, CONNECT_ERROR_FORBIDDEN, CONNECT_ERROR_PROTOCOL,
+    CONNECT_ERROR_UNAUTHORIZED, CONNECT_HOLD_CALLBACK_FRAGMENT,
 };
 pub use envelope::{
     ChannelBinding, ChannelId, ChannelKind, ChunkContext, Compression, ConnectEnvelope,

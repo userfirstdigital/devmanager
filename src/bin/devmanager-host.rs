@@ -929,6 +929,9 @@ async fn finish_supervised_host(
         errors.push(error);
     }
 
+    // Clear the same-process Connect slot before this handle is dropped so a
+    // later in-process listener cannot reuse a dead HostRequestHandle.
+    devmanager::connect::unbind_host_request_handle();
     drop(request_handle);
     if executor_already_joined {
         drop(executor_task);
@@ -992,6 +995,10 @@ async fn serve_foreground_host(
         },
     ) = HostRequestExecutor::start_supervised_with_config_store(bus, config_store)
         .map_err(|error| format!("invalid host project configuration: {error}"))?;
+    // Narrow same-process attach seam for /api/connect. The web listener is
+    // started from remote/mod.rs (not owned here); it clones this slot after
+    // bind. Cross-process HostClient wiring is the remaining external blocker.
+    devmanager::connect::bind_host_request_handle(request_handle.clone());
 
     let organization_hello = OrganizationStateStore::restore_hello(profile_root);
     if let Some(diagnostic) = organization_hello.diagnostic() {
@@ -1031,6 +1038,7 @@ async fn serve_foreground_host(
     let listener = match HelloListener::bind(profile, hello_config) {
         Ok(listener) => listener,
         Err(error) => {
+            devmanager::connect::unbind_host_request_handle();
             drop(request_handle);
             join.abort();
             let _ = join.await;
@@ -1070,6 +1078,7 @@ async fn serve_foreground_host(
     if let Err(error) =
         complete_update_handoff_recovery_if_present(&request_handle, &server_build, &bound_updater)
     {
+        devmanager::connect::unbind_host_request_handle();
         return Err(error);
     }
     let _bound_updater = bound_updater;

@@ -9,6 +9,7 @@ use std::fmt;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use sha2::{Digest, Sha256};
@@ -515,6 +516,7 @@ impl std::error::Error for ConnectStartupError {
 pub struct ConnectProductionStartup {
     session: ConnectProductionSession,
     bind_policy: DirectBindPolicy,
+    listener_bound: AtomicBool,
 }
 
 impl fmt::Debug for ConnectProductionStartup {
@@ -540,6 +542,7 @@ impl ConnectProductionStartup {
         Ok(Self {
             session,
             bind_policy: policy,
+            listener_bound: AtomicBool::new(false),
         })
     }
 
@@ -555,14 +558,21 @@ impl ConnectProductionStartup {
         ConnectListenerKind::ProductionDirect
     }
 
-    /// Session/custody factory only. A bound `/api/connect` listener is a
-    /// separate remote/web step and must not be inferred from this result.
-    pub const fn listener_is_bound(&self) -> bool {
-        false
+    /// Session/custody factory only. Prepare does not imply a bound listener.
+    pub fn listener_is_bound(&self) -> bool {
+        self.listener_bound.load(Ordering::Acquire)
+    }
+
+    pub fn mark_listener_bound(&self) {
+        self.listener_bound.store(true, Ordering::Release);
     }
 
     pub fn require_bound_listener(&self) -> Result<(), ConnectStartupError> {
-        Err(ConnectStartupError::ListenerNotBound)
+        if self.listener_is_bound() {
+            Ok(())
+        } else {
+            Err(ConnectStartupError::ListenerNotBound)
+        }
     }
 
     pub fn reject_legacy_remote_web_as_connect() -> Result<(), ConnectStartupError> {
@@ -3401,6 +3411,9 @@ mod tests {
                 );
                 assert!(!startup.listener_is_bound());
                 assert!(startup.require_bound_listener().is_err());
+                startup.mark_listener_bound();
+                assert!(startup.listener_is_bound());
+                assert!(startup.require_bound_listener().is_ok());
             }
             Err(ConnectStartupError::Production(ConnectProductionError::Custody(
                 OsNoiseCustodyError::UnsupportedPlatform,

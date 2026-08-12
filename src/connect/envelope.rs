@@ -749,6 +749,7 @@ impl PayloadKind {
     pub const SNAPSHOT_PAGE: Self = Self(NonZeroU16::new(3).unwrap());
     pub const EVENT_PAGE: Self = Self(NonZeroU16::new(4).unwrap());
     pub const QUERY: Self = Self(NonZeroU16::new(5).unwrap());
+    pub const QUERY_REPLY: Self = Self(NonZeroU16::new(18).unwrap());
     pub const COMMAND: Self = Self(NonZeroU16::new(6).unwrap());
     pub const COMMAND_RECEIPT: Self = Self(NonZeroU16::new(7).unwrap());
     pub const OPERATION_SETTLEMENT: Self = Self(NonZeroU16::new(8).unwrap());
@@ -780,6 +781,7 @@ impl PayloadKind {
             3 => KnownPayloadKind::SnapshotPage,
             4 => KnownPayloadKind::EventPage,
             5 => KnownPayloadKind::Query,
+            18 => KnownPayloadKind::QueryReply,
             6 => KnownPayloadKind::Command,
             7 => KnownPayloadKind::CommandReceipt,
             8 => KnownPayloadKind::OperationSettlement,
@@ -823,6 +825,7 @@ pub enum KnownPayloadKind {
     SnapshotPage,
     EventPage,
     Query,
+    QueryReply,
     Command,
     CommandReceipt,
     OperationSettlement,
@@ -1248,6 +1251,7 @@ impl KnownPayloadKind {
             Self::Hello
             | Self::Capabilities
             | Self::Query
+            | Self::QueryReply
             | Self::Command
             | Self::CommandReceipt
             | Self::OperationSettlement

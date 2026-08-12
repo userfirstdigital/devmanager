@@ -487,6 +487,7 @@ pub struct WebListenerHandle {
     /// Keeping it here prevents startup custody from being prepared and then
     /// immediately dropped while the route opens a second, untracked session.
     connect_startup: Option<std::sync::Arc<crate::connect::ConnectProductionStartup>>,
+    host_requests: crate::connect::ConnectHostRequestSlot,
     listener_generation: u64,
     pub bind_info: String,
 }
@@ -582,11 +583,13 @@ impl WebListenerHandle {
                 None
             }
         };
+        let host_requests = crate::connect::process_connect_host_request_slot();
         let router_state = Arc::new(WebState {
             inner: Arc::downgrade(&inner),
             listener_generation,
             pairing_attempts: Arc::new(std::sync::Mutex::new(PairingAttemptTracker::default())),
             connect_startup: connect_startup.clone(),
+            host_requests: host_requests.clone(),
         });
 
         // /api/ws remains the legacy same-origin UI. /api/connect is the
@@ -643,6 +646,9 @@ impl WebListenerHandle {
                             (None, None)
                         }
                     };
+                if let Some(startup) = connect_startup.as_ref() {
+                    startup.mark_listener_bound();
+                }
                 Ok(Self {
                     runtime: Some(runtime),
                     shutdown_tx: Some(shutdown_tx),
@@ -651,6 +657,7 @@ impl WebListenerHandle {
                     push_dispatcher,
                     push_sender,
                     connect_startup,
+                    host_requests,
                     listener_generation,
                     bind_info,
                 })
@@ -685,6 +692,14 @@ impl WebListenerHandle {
             return;
         };
         publish_web_push_sender(&inner, self.listener_generation, sender);
+    }
+
+    /// Attach the durable host's one [`crate::host::HostRequestHandle`].
+    /// `start` clones the process slot into both this handle and live
+    /// [`WebState`]; attach writes that shared slot so `/api/connect` observes
+    /// it after start. Same-process only.
+    pub fn attach_host_requests(&self, handle: crate::host::HostRequestHandle) {
+        self.host_requests.attach(handle);
     }
 
     pub fn shutdown(mut self) {
@@ -733,6 +748,7 @@ pub(crate) struct WebState {
     pub(crate) listener_generation: u64,
     pub(crate) pairing_attempts: Arc<std::sync::Mutex<PairingAttemptTracker>>,
     pub(crate) connect_startup: Option<std::sync::Arc<crate::connect::ConnectProductionStartup>>,
+    pub(crate) host_requests: crate::connect::ConnectHostRequestSlot,
 }
 
 impl WebState {
@@ -1719,6 +1735,7 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Acquire),
             pairing_attempts: Arc::new(std::sync::Mutex::new(PairingAttemptTracker::default())),
             connect_startup: None,
+            host_requests: crate::connect::ConnectHostRequestSlot::new(),
         })
     }
 
