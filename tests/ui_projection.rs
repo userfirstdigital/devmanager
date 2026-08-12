@@ -345,3 +345,65 @@ fn task_cockpit_actions_are_registered_and_dispatch_through_gpui() {
         cx.quit();
     });
 }
+
+#[test]
+fn components_gallery_fixture_is_consumed_and_validated_structurally() {
+    let policy = repository_policy();
+    let request = PreviewRequest::validate(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ui/component-gallery.json"),
+        repository_output("component-gallery-structural.png"),
+        &policy,
+    )
+    .expect("component gallery path should be accepted");
+    let preview = PreviewApplication::load(request, &policy).expect("gallery should load");
+    let gallery = preview
+        .component_gallery()
+        .expect("component gallery must be present in the preview projection");
+
+    assert_eq!(gallery.themes.len(), 2);
+    assert_eq!(gallery.densities.len(), 2);
+    assert_eq!(gallery.scales, vec![100, 125, 150, 200]);
+    assert!(gallery.states.len() >= 7);
+    assert!(gallery.samples.long_text.chars().count() > 256);
+    assert!(gallery.samples.unicode.contains('界'));
+    assert!(!gallery.samples.missing.is_empty());
+    assert!(!gallery.samples.error.is_empty());
+    assert!(!gallery.samples.loading.is_empty());
+    assert!(!gallery.samples.empty.is_empty());
+    assert!(!gallery.samples.overflow.is_empty());
+}
+
+#[test]
+fn components_gallery_fixture_rejects_missing_state_coverage() {
+    let (_root, policy) = temporary_policy();
+    let fixture = write_fixture(
+        &policy,
+        "component-gallery-missing-state.json",
+        &include_str!("fixtures/ui/component-gallery.json")
+            .replace("\"destructive\"", "\"not-a-state\""),
+    );
+    let request = PreviewRequest::validate(
+        fixture,
+        policy
+            .output_root()
+            .join("component-gallery-missing-state.png"),
+        &policy,
+    )
+    .expect("path validation should precede fixture parsing");
+    let error = PreviewApplication::load(request, &policy)
+        .expect_err("unknown component state must fail closed");
+    assert!(matches!(error, PreviewError::MalformedFixture { .. }));
+}
+
+#[test]
+fn components_models_project_deterministically_for_both_token_themes() {
+    use devmanager::client::action::ActionRequest;
+    use devmanager::ui::components::button::Button;
+    use devmanager::ui::tokens::{theme, Density, Scale, ThemeMode};
+    let button = Button::new("Inspect", ActionRequest::TaskList).expect("button");
+    let dark = button.presentation(theme(ThemeMode::Dark, Density::Compact, Scale::Scale100));
+    let light = button.presentation(theme(ThemeMode::Light, Density::Compact, Scale::Scale100));
+    assert_ne!(dark.background, light.background);
+    assert_eq!(dark.focus_ring, None);
+    assert_eq!(light.focus_ring, None);
+}

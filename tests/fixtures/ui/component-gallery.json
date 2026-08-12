@@ -1,0 +1,24 @@
+{
+  "schema": "devmanager.ui.preview/v1",
+  "id": "component-gallery",
+  "title": "Reusable Component Gallery",
+  "root": {
+    "kind": "component_gallery",
+    "label": "DevManager native component vocabulary",
+    "gallery": {
+      "themes": ["dark", "light"],
+      "densities": ["compact", "comfortable"],
+      "scales": [100, 125, 150, 200],
+      "states": ["default", "hover", "pressed", "focused", "disabled", "loading", "destructive"],
+      "samples": {
+        "long_text": "This intentionally long component-gallery label exercises bounded wrapping without clipping across the full native preview surface. It includes enough content to verify that controls remain readable at every supported Windows scale, including a second sentence with a project name, task title, provider description, and recovery guidance that must wrap instead of escaping its semantic container.",
+        "unicode": "界面 • Привет • مرحبا • हिन्दी • emoji 🙂",
+        "missing": "No provider description supplied",
+        "error": "The task could not be loaded. Try again.",
+        "loading": "Loading task details",
+        "empty": "No tasks match this view",
+        "overflow": "overflow-marker-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    }
+  }
+}
