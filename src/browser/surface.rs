@@ -4,8 +4,15 @@
 //! attach a GPUI window. It records the facts that a future host bridge must
 //! prove before it may do those things. In particular, the client receives an
 //! opaque window token, never a raw pointer or an unvalidated platform handle.
+//!
+//! Authority is the exact task, agent session, and runtime generation captured at
+//! registration. HWND parentage is captured once on the host UI/COM thread and
+//! reused; attach, input, bounds, focus, and task-follow never probe processes or
+//! windows. Automation stays outside this catalog and must be authorized separately.
 
-use crate::domain::id::{BrowserContextId, ClientId, ResourceId, TaskId};
+use crate::domain::id::{
+    AgentSessionId, BrowserContextId, ClientId, RequestId, ResourceId, TaskId,
+};
 use serde::de::Error as DeError;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{BTreeMap, BTreeSet};
@@ -17,6 +24,7 @@ pub const BROWSER_SURFACE_FIXTURE_CLICK_TOKEN: &str = "dm-surface-trusted-click-
 pub const BROWSER_SURFACE_FIXTURE_RETAINED_STATE: &str = "dm-surface-retained-state-v1";
 pub const MAX_SURFACE_TEXT_INPUT_BYTES: usize = 4096;
 pub const MAX_SURFACE_TARGET_TOKEN_BYTES: usize = 256;
+pub const MAX_SURFACE_EVENTS: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessIdentityError {
@@ -153,6 +161,106 @@ impl SurfaceWindowHandle {
 impl fmt::Display for SurfaceWindowHandle {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostHwndOwnershipError {
+    ChildEqualsParking,
+    NotParentedToParking,
+    WrongThreadAffinity,
+}
+
+impl fmt::Display for HostHwndOwnershipError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ChildEqualsParking => {
+                write!(
+                    f,
+                    "WebView2 child HWND must not equal the host parking HWND"
+                )
+            }
+            Self::NotParentedToParking => {
+                write!(
+                    f,
+                    "WebView2 child HWND must be parented to the host parking HWND"
+                )
+            }
+            Self::WrongThreadAffinity => {
+                write!(
+                    f,
+                    "WebView2 HWND ownership must be captured on the host UI/COM thread"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for HostHwndOwnershipError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SurfaceThreadAffinity {
+    HostUiComThread,
+}
+
+/// Host-captured WebView2 HWND ownership. Parking HWND stays host-registry
+/// state; only the child token is later copied onto a client descriptor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostHwndOwnership {
+    child_hwnd: SurfaceWindowHandle,
+    parking_hwnd: SurfaceWindowHandle,
+    child_parented_to_parking: bool,
+    thread_affinity: SurfaceThreadAffinity,
+}
+
+impl HostHwndOwnership {
+    pub fn new(
+        child_hwnd: SurfaceWindowHandle,
+        parking_hwnd: SurfaceWindowHandle,
+        child_parented_to_parking: bool,
+        on_host_ui_com_thread: bool,
+    ) -> Result<Self, HostHwndOwnershipError> {
+        if child_hwnd == parking_hwnd {
+            return Err(HostHwndOwnershipError::ChildEqualsParking);
+        }
+        if !child_parented_to_parking {
+            return Err(HostHwndOwnershipError::NotParentedToParking);
+        }
+        if !on_host_ui_com_thread {
+            return Err(HostHwndOwnershipError::WrongThreadAffinity);
+        }
+        Ok(Self {
+            child_hwnd,
+            parking_hwnd,
+            child_parented_to_parking: true,
+            thread_affinity: SurfaceThreadAffinity::HostUiComThread,
+        })
+    }
+
+    pub fn child_hwnd(&self) -> &SurfaceWindowHandle {
+        &self.child_hwnd
+    }
+
+    pub fn parking_hwnd(&self) -> &SurfaceWindowHandle {
+        &self.parking_hwnd
+    }
+
+    pub fn child_parented_to_parking(&self) -> bool {
+        self.child_parented_to_parking
+    }
+
+    pub fn thread_affinity(&self) -> SurfaceThreadAffinity {
+        self.thread_affinity
+    }
+
+    fn validate(&self) -> Result<(), SurfaceError> {
+        if self.child_hwnd == self.parking_hwnd
+            || !self.child_parented_to_parking
+            || self.thread_affinity != SurfaceThreadAffinity::HostUiComThread
+        {
+            return Err(SurfaceError::InvalidHwndOwnership);
+        }
+        Ok(())
     }
 }
 
@@ -350,6 +458,7 @@ impl DpiScale {
 #[serde(rename_all = "camelCase")]
 pub struct BrowserSurfaceIdentity {
     pub task_id: TaskId,
+    pub session_id: AgentSessionId,
     pub context_id: BrowserContextId,
     pub resource_id: ResourceId,
 }
@@ -357,15 +466,25 @@ pub struct BrowserSurfaceIdentity {
 impl BrowserSurfaceIdentity {
     pub const fn new(
         task_id: TaskId,
+        session_id: AgentSessionId,
         context_id: BrowserContextId,
         resource_id: ResourceId,
     ) -> Self {
         Self {
             task_id,
+            session_id,
             context_id,
             resource_id,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SurfaceAuthority {
+    pub task_id: TaskId,
+    pub session_id: AgentSessionId,
+    pub runtime_generation: RuntimeGeneration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -420,6 +539,10 @@ impl SurfaceAuthorization {
             permissions: SurfacePermissions::host_default(),
         }
     }
+
+    pub fn automation_granted(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -446,8 +569,20 @@ impl BrowserSurfaceDescriptor {
         self.authorization.permissions.contains(permission)
     }
 
+    pub fn allows_automation(&self) -> bool {
+        self.authorization.automation_granted()
+    }
+
     pub fn permissions(&self) -> impl Iterator<Item = &SurfacePermission> {
         self.authorization.permissions.iter()
+    }
+
+    pub fn authority(&self) -> SurfaceAuthority {
+        SurfaceAuthority {
+            task_id: self.identity.task_id,
+            session_id: self.identity.session_id,
+            runtime_generation: self.runtime_generation,
+        }
     }
 }
 
@@ -535,6 +670,17 @@ pub enum SurfaceError {
     InvalidTeardownProof {
         field: &'static str,
     },
+    InvalidHwndOwnership,
+    DuplicateHwnd {
+        hwnd: SurfaceWindowHandle,
+    },
+    TaskSurfaceConflict {
+        task_id: TaskId,
+    },
+    DuplicateRequest {
+        request_id: RequestId,
+    },
+    AutomationSeparatelyAuthorized,
     EpochExhausted,
 }
 
@@ -590,6 +736,24 @@ impl fmt::Display for SurfaceError {
             Self::InvalidTeardownProof { field } => {
                 write!(f, "host teardown proof is missing {field}")
             }
+            Self::InvalidHwndOwnership => {
+                write!(f, "WebView2 host HWND ownership evidence is invalid")
+            }
+            Self::DuplicateHwnd { hwnd } => {
+                write!(f, "surface HWND {hwnd} is already owned by the host")
+            }
+            Self::TaskSurfaceConflict { task_id } => {
+                write!(f, "task {task_id} already owns a live browser surface")
+            }
+            Self::DuplicateRequest { request_id } => {
+                write!(f, "surface request {request_id} was already admitted")
+            }
+            Self::AutomationSeparatelyAuthorized => {
+                write!(
+                    f,
+                    "browser automation remains separately authorized from the surface"
+                )
+            }
             Self::EpochExhausted => write!(f, "surface epoch space is exhausted"),
         }
     }
@@ -600,12 +764,84 @@ impl std::error::Error for SurfaceError {}
 #[derive(Debug, Clone)]
 pub struct BrowserSurfaceRegistration {
     pub identity: BrowserSurfaceIdentity,
-    pub child_hwnd: SurfaceWindowHandle,
-    pub parking_hwnd: SurfaceWindowHandle,
+    pub hwnd_ownership: HostHwndOwnership,
     pub nonce: SurfaceNonce,
     pub runtime_generation: RuntimeGeneration,
     pub physical_bounds: PhysicalBounds,
     pub dpi: DpiScale,
+}
+
+#[derive(Debug, Clone)]
+pub enum SurfaceAction {
+    Attach {
+        client: ClientBinding,
+    },
+    Reattach {
+        client: ClientBinding,
+    },
+    Park,
+    Detach {
+        client_id: ClientId,
+    },
+    TaskSwitch {
+        incoming: BrowserSurfaceDescriptor,
+        client: ClientBinding,
+    },
+    UpdateBounds {
+        client_id: ClientId,
+        client_sequence: u64,
+        physical_bounds: PhysicalBounds,
+        dpi: DpiScale,
+    },
+    UpdateFocus {
+        client_id: ClientId,
+        client_sequence: u64,
+        focused: bool,
+    },
+    TrustedClick {
+        client_id: ClientId,
+        x: i32,
+        y: i32,
+        target_token: String,
+    },
+    TextInput {
+        client_id: ClientId,
+        text: String,
+    },
+    CloseContext {
+        proof: HostTeardownProof,
+    },
+    Automate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SurfaceEventKind {
+    Registered,
+    Attached,
+    Parked,
+    Detached,
+    TaskFollowed,
+    BoundsUpdated,
+    FocusUpdated,
+    InputAccepted,
+    Closed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SurfaceEvent {
+    pub request_id: RequestId,
+    pub kind: SurfaceEventKind,
+    pub authority: SurfaceAuthority,
+    pub resource_id: ResourceId,
+    pub descriptor: BrowserSurfaceDescriptor,
+}
+
+#[derive(Debug, Clone)]
+pub struct SurfaceCommand {
+    pub request_id: RequestId,
+    pub descriptor: BrowserSurfaceDescriptor,
+    pub action: SurfaceAction,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -731,10 +967,16 @@ pub struct HostTeardownProof {
 #[derive(Debug, Clone)]
 struct SurfaceRecord {
     descriptor: BrowserSurfaceDescriptor,
-    parking_hwnd: SurfaceWindowHandle,
+    hwnd_ownership: HostHwndOwnership,
     lifecycle: SurfaceLifecycle,
     client: Option<ClientBinding>,
     focused: bool,
+}
+
+#[derive(Debug)]
+struct RecordedSurfaceEvent {
+    request_id: RequestId,
+    event: SurfaceEvent,
 }
 
 /// Host-side registry for browser surfaces. The registry owns all mutable
@@ -743,15 +985,23 @@ struct SurfaceRecord {
 pub struct BrowserSurfaceHost {
     host_process: ProcessIdentity,
     surfaces: BTreeMap<ResourceId, SurfaceRecord>,
+    live_task_surfaces: BTreeMap<TaskId, ResourceId>,
     active_resource_id: Option<ResourceId>,
+    events: Vec<RecordedSurfaceEvent>,
+    hot_path_probed: bool,
 }
 
 impl BrowserSurfaceHost {
+    pub const HOT_PATH_PROBES_PERMITTED: bool = false;
+
     pub fn new(host_process: ProcessIdentity) -> Self {
         Self {
             host_process,
             surfaces: BTreeMap::new(),
+            live_task_surfaces: BTreeMap::new(),
             active_resource_id: None,
+            events: Vec::new(),
+            hot_path_probed: false,
         }
     }
 
@@ -764,18 +1014,23 @@ impl BrowserSurfaceHost {
         registration: BrowserSurfaceRegistration,
     ) -> Result<BrowserSurfaceDescriptor, SurfaceError> {
         let resource_id = registration.identity.resource_id;
+        let task_id = registration.identity.task_id;
         if self.surfaces.contains_key(&resource_id) {
             return Err(SurfaceError::DuplicateResource { resource_id });
         }
-        if registration.child_hwnd == registration.parking_hwnd {
-            return Err(SurfaceError::ForeignDescriptor {
-                field: SurfaceDescriptorField::ChildWindow,
-            });
+        if let Some(existing) = self.live_task_surfaces.get(&task_id) {
+            if self.surfaces.get(existing).is_some_and(|record| {
+                !matches!(record.lifecycle, SurfaceLifecycle::Terminal { .. })
+            }) {
+                return Err(SurfaceError::TaskSurfaceConflict { task_id });
+            }
         }
+        registration.hwnd_ownership.validate()?;
+        self.reject_duplicate_hwnd(&registration.hwnd_ownership)?;
         let descriptor = BrowserSurfaceDescriptor {
             identity: registration.identity,
             host_process: self.host_process.clone(),
-            child_hwnd: registration.child_hwnd,
+            child_hwnd: registration.hwnd_ownership.child_hwnd().clone(),
             nonce: registration.nonce,
             runtime_generation: registration.runtime_generation,
             bounds_epoch: BoundsEpoch::initial(),
@@ -788,7 +1043,7 @@ impl BrowserSurfaceHost {
             resource_id,
             SurfaceRecord {
                 descriptor: descriptor.clone(),
-                parking_hwnd: registration.parking_hwnd,
+                hwnd_ownership: registration.hwnd_ownership,
                 lifecycle: SurfaceLifecycle::Parked {
                     reason: SurfaceParkReason::Initial,
                 },
@@ -796,6 +1051,8 @@ impl BrowserSurfaceHost {
                 focused: false,
             },
         );
+        self.live_task_surfaces.insert(task_id, resource_id);
+        self.record_event(RequestId::new(), SurfaceEventKind::Registered, &descriptor)?;
         Ok(descriptor)
     }
 
@@ -818,6 +1075,145 @@ impl BrowserSurfaceHost {
 
     pub fn active_resource_id(&self) -> Option<ResourceId> {
         self.active_resource_id
+    }
+
+    pub fn active_task_id(&self) -> Option<TaskId> {
+        self.active_resource_id.and_then(|resource_id| {
+            self.surfaces
+                .get(&resource_id)
+                .map(|record| record.descriptor.identity.task_id)
+        })
+    }
+
+    pub fn task_surface(&self, task_id: TaskId) -> Option<ResourceId> {
+        self.live_task_surfaces.get(&task_id).copied()
+    }
+
+    pub fn parking_hwnd(&self, resource_id: ResourceId) -> Option<&SurfaceWindowHandle> {
+        self.surfaces
+            .get(&resource_id)
+            .map(|record| record.hwnd_ownership.parking_hwnd())
+    }
+
+    pub fn hwnd_ownership(&self, resource_id: ResourceId) -> Option<&HostHwndOwnership> {
+        self.surfaces
+            .get(&resource_id)
+            .map(|record| &record.hwnd_ownership)
+    }
+
+    pub fn events(&self) -> Vec<SurfaceEvent> {
+        self.events
+            .iter()
+            .map(|recorded| recorded.event.clone())
+            .collect()
+    }
+
+    pub fn hot_path_probed(&self) -> bool {
+        self.hot_path_probed
+    }
+
+    pub fn apply_action(&mut self, command: SurfaceCommand) -> Result<SurfaceEvent, SurfaceError> {
+        if matches!(command.action, SurfaceAction::Automate) {
+            return Err(SurfaceError::AutomationSeparatelyAuthorized);
+        }
+        if self
+            .events
+            .iter()
+            .any(|recorded| recorded.request_id == command.request_id)
+        {
+            return Err(SurfaceError::DuplicateRequest {
+                request_id: command.request_id,
+            });
+        }
+        match command.action {
+            SurfaceAction::Attach { client } => {
+                self.attach(SurfaceAttachRequest {
+                    descriptor: command.descriptor,
+                    client,
+                })?;
+            }
+            SurfaceAction::Reattach { client } => {
+                self.reattach(SurfaceAttachRequest {
+                    descriptor: command.descriptor,
+                    client,
+                })?;
+            }
+            SurfaceAction::Park => {
+                self.park(HostSurfaceRequest {
+                    descriptor: command.descriptor,
+                })?;
+            }
+            SurfaceAction::Detach { client_id } => {
+                self.detach(SurfaceClientRequest {
+                    descriptor: command.descriptor,
+                    client_id,
+                })?;
+            }
+            SurfaceAction::TaskSwitch { incoming, client } => {
+                self.task_switch(SurfaceTaskSwitchRequest {
+                    outgoing: command.descriptor,
+                    incoming,
+                    client,
+                })?;
+            }
+            SurfaceAction::UpdateBounds {
+                client_id,
+                client_sequence,
+                physical_bounds,
+                dpi,
+            } => {
+                self.receive_bounds(SurfaceBoundsUpdate {
+                    descriptor: command.descriptor,
+                    client_id,
+                    client_sequence,
+                    physical_bounds,
+                    dpi,
+                })?;
+            }
+            SurfaceAction::UpdateFocus {
+                client_id,
+                client_sequence,
+                focused,
+            } => {
+                self.receive_focus(SurfaceFocusUpdate {
+                    descriptor: command.descriptor,
+                    client_id,
+                    client_sequence,
+                    focused,
+                })?;
+            }
+            SurfaceAction::TrustedClick {
+                client_id,
+                x,
+                y,
+                target_token,
+            } => {
+                self.receive_input(SurfaceInputRequest {
+                    descriptor: command.descriptor,
+                    client_id,
+                    action: SurfaceInputAction::TrustedClick { x, y, target_token },
+                })?;
+            }
+            SurfaceAction::TextInput { client_id, text } => {
+                self.receive_input(SurfaceInputRequest {
+                    descriptor: command.descriptor,
+                    client_id,
+                    action: SurfaceInputAction::TextInput { text },
+                })?;
+            }
+            SurfaceAction::CloseContext { proof } => {
+                if proof.descriptor.identity != command.descriptor.identity {
+                    return Err(SurfaceError::ForeignDescriptor {
+                        field: SurfaceDescriptorField::Identity,
+                    });
+                }
+                self.close_context(proof)?;
+            }
+            SurfaceAction::Automate => {
+                return Err(SurfaceError::AutomationSeparatelyAuthorized);
+            }
+        }
+        self.replace_last_request_id(command.request_id)
     }
 
     pub fn attach(
@@ -862,7 +1258,13 @@ impl BrowserSurfaceHost {
                 }
             }
         }
-        Ok(self.receipt(resource_id))
+        let receipt = self.receipt(resource_id);
+        self.record_event(
+            RequestId::new(),
+            SurfaceEventKind::Parked,
+            &receipt.descriptor,
+        )?;
+        Ok(receipt)
     }
 
     pub fn detach(
@@ -900,7 +1302,13 @@ impl BrowserSurfaceHost {
         if self.active_resource_id == Some(resource_id) {
             self.active_resource_id = None;
         }
-        Ok(self.receipt(resource_id))
+        let receipt = self.receipt(resource_id);
+        self.record_event(
+            RequestId::new(),
+            SurfaceEventKind::Detached,
+            &receipt.descriptor,
+        )?;
+        Ok(receipt)
     }
 
     pub fn client_crashed(
@@ -952,7 +1360,9 @@ impl BrowserSurfaceHost {
     ) -> Result<SurfaceTaskSwitchReceipt, SurfaceError> {
         let outgoing_id = self.validate_descriptor(&request.outgoing)?;
         let incoming_id = self.validate_descriptor(&request.incoming)?;
-        if outgoing_id == incoming_id {
+        if outgoing_id == incoming_id
+            || request.outgoing.identity.task_id == request.incoming.identity.task_id
+        {
             return Err(SurfaceError::ActiveSurfaceConflict {
                 resource_id: incoming_id,
             });
@@ -974,11 +1384,11 @@ impl BrowserSurfaceHost {
                 client_id: request.client.id,
             });
         }
-        let incoming_lifecycle = self
-            .surfaces
-            .get(&incoming_id)
-            .expect("surface exists")
-            .lifecycle;
+        let incoming_lifecycle = {
+            let incoming = self.surfaces.get(&incoming_id).expect("surface exists");
+            incoming.hwnd_ownership.validate()?;
+            incoming.lifecycle
+        };
         if !matches!(incoming_lifecycle, SurfaceLifecycle::Parked { .. }) {
             return Err(SurfaceError::InvalidLifecycle {
                 operation: "task switch",
@@ -1005,9 +1415,15 @@ impl BrowserSurfaceHost {
             incoming.focused = false;
         }
         self.active_resource_id = Some(incoming_id);
+        let incoming_receipt = self.receipt(incoming_id);
+        self.record_event(
+            RequestId::new(),
+            SurfaceEventKind::TaskFollowed,
+            &incoming_receipt.descriptor,
+        )?;
         Ok(SurfaceTaskSwitchReceipt {
             outgoing: self.receipt(outgoing_id),
-            incoming: self.receipt(incoming_id),
+            incoming: incoming_receipt,
             pointer_consumed: true,
         })
     }
@@ -1034,7 +1450,13 @@ impl BrowserSurfaceHost {
         record.descriptor.physical_bounds = update.physical_bounds;
         record.descriptor.dpi = update.dpi;
         record.descriptor.bounds_epoch = next_bounds;
-        Ok(self.receipt(resource_id))
+        let receipt = self.receipt(resource_id);
+        self.record_event(
+            RequestId::new(),
+            SurfaceEventKind::BoundsUpdated,
+            &receipt.descriptor,
+        )?;
+        Ok(receipt)
     }
 
     pub fn receive_focus(
@@ -1058,7 +1480,13 @@ impl BrowserSurfaceHost {
         let record = self.surfaces.get_mut(&resource_id).expect("surface exists");
         record.descriptor.focus_epoch = next_focus;
         record.focused = update.focused;
-        Ok(self.receipt(resource_id))
+        let receipt = self.receipt(resource_id);
+        self.record_event(
+            RequestId::new(),
+            SurfaceEventKind::FocusUpdated,
+            &receipt.descriptor,
+        )?;
+        Ok(receipt)
     }
 
     pub fn receive_input(
@@ -1103,10 +1531,16 @@ impl BrowserSurfaceHost {
                 }
             }
         }
-        Ok(SurfaceInputReceipt {
-            descriptor: request.descriptor,
+        let receipt = SurfaceInputReceipt {
+            descriptor: record.descriptor.clone(),
             action: request.action,
-        })
+        };
+        self.record_event(
+            RequestId::new(),
+            SurfaceEventKind::InputAccepted,
+            &receipt.descriptor,
+        )?;
+        Ok(receipt)
     }
 
     pub fn close_context(
@@ -1130,7 +1564,7 @@ impl BrowserSurfaceHost {
                 lifecycle,
             });
         }
-        if matches!(lifecycle, SurfaceLifecycle::Attached { .. }) {
+        if !matches!(lifecycle, SurfaceLifecycle::Parked { .. }) {
             return Err(SurfaceError::InvalidLifecycle {
                 operation: "close context",
                 lifecycle,
@@ -1154,6 +1588,7 @@ impl BrowserSurfaceHost {
         if self.active_resource_id == Some(resource_id) {
             self.active_resource_id = None;
         }
+        let task_id = proof.descriptor.identity.task_id;
         self.advance_attachment_epochs(resource_id)?;
         let record = self.surfaces.get_mut(&resource_id).expect("surface exists");
         record.lifecycle = SurfaceLifecycle::Terminal {
@@ -1161,7 +1596,16 @@ impl BrowserSurfaceHost {
         };
         record.client = None;
         record.focused = false;
-        Ok(self.receipt(resource_id))
+        if self.live_task_surfaces.get(&task_id) == Some(&resource_id) {
+            self.live_task_surfaces.remove(&task_id);
+        }
+        let receipt = self.receipt(resource_id);
+        self.record_event(
+            RequestId::new(),
+            SurfaceEventKind::Closed,
+            &receipt.descriptor,
+        )?;
+        Ok(receipt)
     }
 
     fn bind_client(
@@ -1176,8 +1620,16 @@ impl BrowserSurfaceHost {
                 return Err(SurfaceError::ActiveSurfaceConflict { resource_id });
             }
         }
-        let record = self.surfaces.get(&resource_id).expect("surface exists");
-        let lifecycle = record.lifecycle;
+        let lifecycle = {
+            let record = self.surfaces.get(&resource_id).expect("surface exists");
+            record.hwnd_ownership.validate()?;
+            if !record.descriptor.allows(SurfacePermission::Attach) {
+                return Err(SurfaceError::PermissionDenied {
+                    permission: SurfacePermission::Attach,
+                });
+            }
+            record.lifecycle
+        };
         let allowed = if detached_only {
             matches!(lifecycle, SurfaceLifecycle::Detached { .. })
         } else {
@@ -1189,11 +1641,6 @@ impl BrowserSurfaceHost {
                 lifecycle,
             });
         }
-        if !record.descriptor.allows(SurfacePermission::Attach) {
-            return Err(SurfaceError::PermissionDenied {
-                permission: SurfacePermission::Attach,
-            });
-        }
         self.advance_attachment_epochs(resource_id)?;
         let record = self.surfaces.get_mut(&resource_id).expect("surface exists");
         record.lifecycle = SurfaceLifecycle::Attached {
@@ -1202,7 +1649,13 @@ impl BrowserSurfaceHost {
         record.client = Some(request.client);
         record.focused = false;
         self.active_resource_id = Some(resource_id);
-        Ok(self.receipt(resource_id))
+        let receipt = self.receipt(resource_id);
+        self.record_event(
+            RequestId::new(),
+            SurfaceEventKind::Attached,
+            &receipt.descriptor,
+        )?;
+        Ok(receipt)
     }
 
     fn validate_descriptor(
@@ -1315,12 +1768,63 @@ impl BrowserSurfaceHost {
         }
     }
 
+    fn reject_duplicate_hwnd(&self, ownership: &HostHwndOwnership) -> Result<(), SurfaceError> {
+        for record in self.surfaces.values() {
+            if matches!(record.lifecycle, SurfaceLifecycle::Terminal { .. }) {
+                continue;
+            }
+            if record.hwnd_ownership.child_hwnd() == ownership.child_hwnd()
+                || record.hwnd_ownership.parking_hwnd() == ownership.parking_hwnd()
+                || record.hwnd_ownership.child_hwnd() == ownership.parking_hwnd()
+                || record.hwnd_ownership.parking_hwnd() == ownership.child_hwnd()
+            {
+                return Err(SurfaceError::DuplicateHwnd {
+                    hwnd: ownership.child_hwnd().clone(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn record_event(
+        &mut self,
+        request_id: RequestId,
+        kind: SurfaceEventKind,
+        descriptor: &BrowserSurfaceDescriptor,
+    ) -> Result<(), SurfaceError> {
+        let event = SurfaceEvent {
+            request_id,
+            kind,
+            authority: descriptor.authority(),
+            resource_id: descriptor.identity.resource_id,
+            descriptor: descriptor.clone(),
+        };
+        if self.events.len() >= MAX_SURFACE_EVENTS {
+            self.events.remove(0);
+        }
+        self.events.push(RecordedSurfaceEvent { request_id, event });
+        Ok(())
+    }
+
+    fn replace_last_request_id(
+        &mut self,
+        request_id: RequestId,
+    ) -> Result<SurfaceEvent, SurfaceError> {
+        let last = self
+            .events
+            .last_mut()
+            .expect("successful surface action records an event");
+        last.request_id = request_id;
+        last.event.request_id = request_id;
+        Ok(last.event.clone())
+    }
+
     fn snapshot_for(
         &self,
         resource_id: ResourceId,
         record: &SurfaceRecord,
     ) -> BrowserSurfaceSnapshot {
-        let _parking_hwnd_is_host_only = &record.parking_hwnd;
+        let _parking_hwnd_is_host_only = record.hwnd_ownership.parking_hwnd();
         BrowserSurfaceSnapshot {
             descriptor: record.descriptor.clone(),
             lifecycle: record.lifecycle,

@@ -1,13 +1,16 @@
 use devmanager::browser::{
     BrowserSurfaceFixture, BrowserSurfaceFixtureSnapshot, BrowserSurfaceHost,
-    BrowserSurfaceIdentity, BrowserSurfaceRegistration, ClientBinding, DpiScale, HostTeardownProof,
-    PhysicalBounds, ProcessIdentity, RuntimeGeneration, SurfaceBoundsUpdate, SurfaceClientRequest,
+    BrowserSurfaceIdentity, BrowserSurfaceRegistration, ClientBinding, DpiScale, HostHwndOwnership,
+    HostTeardownProof, PhysicalBounds, ProcessIdentity, RuntimeGeneration, SurfaceAction,
+    SurfaceBoundsUpdate, SurfaceClientRequest, SurfaceCommand, SurfaceError, SurfaceEventKind,
     SurfaceFocusUpdate, SurfaceInputAction, SurfaceInputRequest, SurfaceLifecycle, SurfaceNonce,
     SurfaceOwner, SurfacePermission, SurfaceTaskSwitchRequest, SurfaceTeardownReason,
     SurfaceWindowHandle, TextInputError, BROWSER_SURFACE_FIXTURE_CLICK_TOKEN,
-    BROWSER_SURFACE_FIXTURE_VISIBLE_TOKEN,
+    BROWSER_SURFACE_FIXTURE_VISIBLE_TOKEN, MAX_SURFACE_EVENTS,
 };
-use devmanager::domain::id::{BrowserContextId, ClientId, ResourceId, TaskId};
+use devmanager::domain::id::{
+    AgentSessionId, BrowserContextId, ClientId, RequestId, ResourceId, TaskId,
+};
 
 fn process(pid: u32) -> ProcessIdentity {
     ProcessIdentity::new(
@@ -18,15 +21,38 @@ fn process(pid: u32) -> ProcessIdentity {
     .expect("valid process identity")
 }
 
+fn hwnd_ownership(nonce_byte: u8) -> HostHwndOwnership {
+    HostHwndOwnership::new(
+        SurfaceWindowHandle::from_raw(100 + u64::from(nonce_byte)).unwrap(),
+        SurfaceWindowHandle::from_raw(200 + u64::from(nonce_byte)).unwrap(),
+        true,
+        true,
+    )
+    .expect("valid host HWND ownership")
+}
+
 fn registration(
     task_id: TaskId,
     resource_id: ResourceId,
     nonce_byte: u8,
 ) -> BrowserSurfaceRegistration {
+    registration_with_session(task_id, AgentSessionId::new(), resource_id, nonce_byte)
+}
+
+fn registration_with_session(
+    task_id: TaskId,
+    session_id: AgentSessionId,
+    resource_id: ResourceId,
+    nonce_byte: u8,
+) -> BrowserSurfaceRegistration {
     BrowserSurfaceRegistration {
-        identity: BrowserSurfaceIdentity::new(task_id, BrowserContextId::new(), resource_id),
-        child_hwnd: SurfaceWindowHandle::from_raw(100 + u64::from(nonce_byte)).unwrap(),
-        parking_hwnd: SurfaceWindowHandle::from_raw(200 + u64::from(nonce_byte)).unwrap(),
+        identity: BrowserSurfaceIdentity::new(
+            task_id,
+            session_id,
+            BrowserContextId::new(),
+            resource_id,
+        ),
+        hwnd_ownership: hwnd_ownership(nonce_byte),
         nonce: SurfaceNonce::new([nonce_byte; 16]).unwrap(),
         runtime_generation: RuntimeGeneration::new(1).unwrap(),
         physical_bounds: PhysicalBounds::new(0, 0, 800, 600).unwrap(),
@@ -55,10 +81,21 @@ fn descriptor_is_host_bound_and_window_handle_is_an_opaque_nonzero_token() {
     assert_eq!(descriptor.owner(), SurfaceOwner::Host);
     assert!(descriptor.allows(SurfacePermission::TrustedClick));
     assert!(descriptor.allows(SurfacePermission::TextInput));
+    assert!(!descriptor.allows_automation());
+    assert_eq!(
+        descriptor.authority().session_id,
+        descriptor.identity.session_id
+    );
+    assert_eq!(
+        descriptor.authority().runtime_generation,
+        descriptor.runtime_generation
+    );
 
     let wire = serde_json::to_string(&descriptor).unwrap();
     assert!(wire.contains("hwnd:107"));
+    assert!(!wire.contains("hwnd:207"));
     assert!(!wire.contains("0x"));
+    assert!(!wire.contains("parking"));
 }
 
 #[test]
@@ -355,9 +392,29 @@ fn terminal_state_requires_host_context_teardown_proof_not_client_drop() {
             client_id: attached_client.id,
         })
         .unwrap();
+    assert!(
+        host.close_context(HostTeardownProof {
+            descriptor: detached.descriptor.clone(),
+            host_process: host_process.clone(),
+            surface_parked: true,
+            controller_closed: true,
+            environment_closed: true,
+            helper_processes_remaining: 0,
+            context_closed: true,
+            reason: SurfaceTeardownReason::ContextClosed,
+        })
+        .is_err(),
+        "teardown must fail closed until the host actually parks the surface"
+    );
+
+    let parked = host
+        .park(devmanager::browser::HostSurfaceRequest {
+            descriptor: detached.descriptor,
+        })
+        .unwrap();
 
     let incomplete = HostTeardownProof {
-        descriptor: detached.descriptor.clone(),
+        descriptor: parked.descriptor.clone(),
         host_process: host_process.clone(),
         surface_parked: true,
         controller_closed: false,
@@ -368,12 +425,12 @@ fn terminal_state_requires_host_context_teardown_proof_not_client_drop() {
     };
     assert!(host.close_context(incomplete).is_err());
     assert!(!host
-        .snapshot(detached.descriptor.identity.resource_id)
+        .snapshot(parked.descriptor.identity.resource_id)
         .unwrap()
         .is_terminal());
 
     let complete = HostTeardownProof {
-        descriptor: detached.descriptor,
+        descriptor: parked.descriptor,
         host_process,
         surface_parked: true,
         controller_closed: true,
@@ -468,4 +525,266 @@ fn input_requires_current_focus_and_bounds_epochs() {
             ..click
         })
         .is_ok());
+}
+
+#[test]
+fn identity_requires_exact_task_session_and_generation_authority() {
+    let mut host = BrowserSurfaceHost::new(process(10));
+    let task_id = TaskId::new();
+    let session_id = AgentSessionId::new();
+    let descriptor = host
+        .register(registration_with_session(
+            task_id,
+            session_id,
+            ResourceId::new(),
+            7,
+        ))
+        .unwrap();
+    let authority = descriptor.authority();
+    assert_eq!(authority.task_id, task_id);
+    assert_eq!(authority.session_id, session_id);
+    assert_eq!(authority.runtime_generation, descriptor.runtime_generation);
+
+    let mut foreign_session = descriptor.clone();
+    foreign_session.identity.session_id = AgentSessionId::new();
+    assert!(matches!(
+        host.park(devmanager::browser::HostSurfaceRequest {
+            descriptor: foreign_session
+        }),
+        Err(SurfaceError::ForeignDescriptor { .. })
+    ));
+
+    let mut stale_generation = descriptor.clone();
+    stale_generation.runtime_generation = RuntimeGeneration::new(9).unwrap();
+    assert!(matches!(
+        host.park(devmanager::browser::HostSurfaceRequest {
+            descriptor: stale_generation
+        }),
+        Err(SurfaceError::StaleDescriptor { .. })
+    ));
+}
+
+#[test]
+fn hwnd_ownership_is_host_parking_parent_on_ui_com_thread_and_unique() {
+    assert!(HostHwndOwnership::new(
+        SurfaceWindowHandle::from_raw(1).unwrap(),
+        SurfaceWindowHandle::from_raw(1).unwrap(),
+        true,
+        true,
+    )
+    .is_err());
+    assert!(HostHwndOwnership::new(
+        SurfaceWindowHandle::from_raw(1).unwrap(),
+        SurfaceWindowHandle::from_raw(2).unwrap(),
+        false,
+        true,
+    )
+    .is_err());
+    assert!(HostHwndOwnership::new(
+        SurfaceWindowHandle::from_raw(1).unwrap(),
+        SurfaceWindowHandle::from_raw(2).unwrap(),
+        true,
+        false,
+    )
+    .is_err());
+
+    let mut host = BrowserSurfaceHost::new(process(10));
+    let first = host
+        .register(registration(TaskId::new(), ResourceId::new(), 7))
+        .unwrap();
+    assert_eq!(
+        host.parking_hwnd(first.identity.resource_id)
+            .unwrap()
+            .raw_value(),
+        207
+    );
+    assert_eq!(
+        host.hwnd_ownership(first.identity.resource_id)
+            .unwrap()
+            .child_hwnd(),
+        &first.child_hwnd
+    );
+
+    let mut duplicate_child = registration(TaskId::new(), ResourceId::new(), 8);
+    duplicate_child.hwnd_ownership = HostHwndOwnership::new(
+        first.child_hwnd.clone(),
+        SurfaceWindowHandle::from_raw(208).unwrap(),
+        true,
+        true,
+    )
+    .unwrap();
+    assert!(matches!(
+        host.register(duplicate_child),
+        Err(SurfaceError::DuplicateHwnd { .. })
+    ));
+}
+
+#[test]
+fn one_live_surface_follows_its_owning_task_and_rejects_same_task_switch() {
+    let mut host = BrowserSurfaceHost::new(process(10));
+    let outgoing_task = TaskId::new();
+    let incoming_task = TaskId::new();
+    let outgoing = host
+        .register(registration(outgoing_task, ResourceId::new(), 7))
+        .unwrap();
+    assert_eq!(
+        host.task_surface(outgoing_task),
+        Some(outgoing.identity.resource_id)
+    );
+    assert!(matches!(
+        host.register(registration(outgoing_task, ResourceId::new(), 9)),
+        Err(SurfaceError::TaskSurfaceConflict { task_id }) if task_id == outgoing_task
+    ));
+
+    let incoming = host
+        .register(registration(incoming_task, ResourceId::new(), 8))
+        .unwrap();
+    let attached_client = client(ClientId::new(), 11);
+    let attached = host
+        .attach(devmanager::browser::SurfaceAttachRequest {
+            descriptor: outgoing,
+            client: attached_client.clone(),
+        })
+        .unwrap();
+    assert_eq!(
+        host.active_task_id(),
+        Some(attached.descriptor.identity.task_id)
+    );
+
+    assert!(matches!(
+        host.task_switch(SurfaceTaskSwitchRequest {
+            outgoing: attached.descriptor.clone(),
+            incoming: attached.descriptor.clone(),
+            client: attached_client.clone(),
+        }),
+        Err(SurfaceError::ActiveSurfaceConflict { .. })
+    ));
+
+    let switched = host
+        .task_switch(SurfaceTaskSwitchRequest {
+            outgoing: attached.descriptor,
+            incoming,
+            client: attached_client,
+        })
+        .unwrap();
+    assert!(switched.pointer_consumed);
+    assert_eq!(
+        host.active_task_id(),
+        Some(switched.incoming.descriptor.identity.task_id)
+    );
+    assert_eq!(
+        host.active_resource_id(),
+        Some(switched.incoming.descriptor.identity.resource_id)
+    );
+}
+
+#[test]
+fn bounded_actions_and_events_are_catalogued_capped_and_request_fenced() {
+    let mut host = BrowserSurfaceHost::new(process(10));
+    let descriptor = host
+        .register(registration(TaskId::new(), ResourceId::new(), 7))
+        .unwrap();
+    let attached_client = client(ClientId::new(), 11);
+    let request_id = RequestId::new();
+    let attached = host
+        .apply_action(SurfaceCommand {
+            request_id,
+            descriptor,
+            action: SurfaceAction::Attach {
+                client: attached_client.clone(),
+            },
+        })
+        .unwrap();
+    assert_eq!(attached.kind, SurfaceEventKind::Attached);
+    assert_eq!(attached.request_id, request_id);
+    assert!(matches!(
+        host.apply_action(SurfaceCommand {
+            request_id,
+            descriptor: attached.descriptor.clone(),
+            action: SurfaceAction::UpdateFocus {
+                client_id: attached_client.id,
+                client_sequence: 1,
+                focused: true,
+            },
+        }),
+        Err(SurfaceError::DuplicateRequest { .. })
+    ));
+
+    for index in 0..MAX_SURFACE_EVENTS {
+        host.apply_action(SurfaceCommand {
+            request_id: RequestId::new(),
+            descriptor: host
+                .descriptor(attached.descriptor.identity.resource_id)
+                .unwrap()
+                .clone(),
+            action: SurfaceAction::UpdateFocus {
+                client_id: attached_client.id,
+                client_sequence: u64::from(index as u32),
+                focused: index % 2 == 0,
+            },
+        })
+        .unwrap();
+    }
+    assert_eq!(host.events().len(), MAX_SURFACE_EVENTS);
+    assert!(host
+        .events()
+        .iter()
+        .all(|event| event.kind != SurfaceEventKind::Attached));
+}
+
+#[test]
+fn hot_path_never_admits_process_or_window_probes() {
+    assert!(!BrowserSurfaceHost::HOT_PATH_PROBES_PERMITTED);
+    let mut host = BrowserSurfaceHost::new(process(10));
+    let descriptor = host
+        .register(registration(TaskId::new(), ResourceId::new(), 7))
+        .unwrap();
+    let attached_client = client(ClientId::new(), 11);
+    let attached = host
+        .attach(devmanager::browser::SurfaceAttachRequest {
+            descriptor,
+            client: attached_client.clone(),
+        })
+        .unwrap();
+    let focused = host
+        .receive_focus(SurfaceFocusUpdate {
+            descriptor: attached.descriptor,
+            client_id: attached_client.id,
+            client_sequence: 1,
+            focused: true,
+        })
+        .unwrap();
+    assert!(host
+        .receive_input(SurfaceInputRequest {
+            descriptor: focused.descriptor,
+            client_id: attached_client.id,
+            action: SurfaceInputAction::TrustedClick {
+                x: 10,
+                y: 10,
+                target_token: BROWSER_SURFACE_FIXTURE_CLICK_TOKEN.to_string(),
+            },
+        })
+        .is_ok());
+    assert!(!host.hot_path_probed());
+}
+
+#[test]
+fn automation_remains_separately_authorized_from_the_surface() {
+    let mut host = BrowserSurfaceHost::new(process(10));
+    let descriptor = host
+        .register(registration(TaskId::new(), ResourceId::new(), 7))
+        .unwrap();
+    assert!(!descriptor.allows_automation());
+    assert!(matches!(
+        host.apply_action(SurfaceCommand {
+            request_id: RequestId::new(),
+            descriptor,
+            action: SurfaceAction::Automate,
+        }),
+        Err(SurfaceError::AutomationSeparatelyAuthorized)
+    ));
+    assert!(host
+        .events()
+        .iter()
+        .all(|event| event.kind == SurfaceEventKind::Registered));
 }
