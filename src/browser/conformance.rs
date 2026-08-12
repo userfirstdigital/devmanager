@@ -10,6 +10,53 @@ use crate::domain::browser::BrowserIntegrationHold;
 
 pub const BROWSER_E2E_VERIFICATION_TOKEN: &str = "DM-BROWSER-E2E-OK";
 pub const BROWSER_E2E_SCHEMA_VERSION: u32 = 1;
+pub const BROWSER_VISIBLE_WEBVIEW2_OPT_IN_ENV: &str = "DEVMANAGER_BROWSER_WEBVIEW2_E2E";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowserVisibleHostProofClass {
+    FixtureProtocolOnly,
+    VisibleHold,
+    VisibleGreen,
+}
+
+impl BrowserVisibleHostProofClass {
+    pub fn is_visible_green(self) -> bool {
+        matches!(self, Self::VisibleGreen)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BrowserVisibleHostProofClaim {
+    pub fixture_only: bool,
+    pub visible_claimed: bool,
+    pub opt_in_marker: bool,
+    pub observed_host_owned_webview2: bool,
+    pub observed_window_lifecycle: bool,
+    pub observed_helper_lifecycle: bool,
+}
+
+/// Classify a visible-host proof claim.
+///
+/// Fixture-only runs may prove protocol/admission. They never become
+/// [`BrowserVisibleHostProofClass::VisibleGreen`], even if a caller marks
+/// every observation flag. A visible claim without the opt-in marker and a
+/// complete host-owned WebView2/window/helper observation is a HOLD.
+pub fn classify_visible_host_proof(
+    claim: BrowserVisibleHostProofClaim,
+) -> BrowserVisibleHostProofClass {
+    if claim.fixture_only || !claim.visible_claimed {
+        return BrowserVisibleHostProofClass::FixtureProtocolOnly;
+    }
+    if claim.opt_in_marker
+        && claim.observed_host_owned_webview2
+        && claim.observed_window_lifecycle
+        && claim.observed_helper_lifecycle
+    {
+        BrowserVisibleHostProofClass::VisibleGreen
+    } else {
+        BrowserVisibleHostProofClass::VisibleHold
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BrowserProviderArm {

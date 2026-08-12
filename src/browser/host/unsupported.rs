@@ -4,11 +4,12 @@ use super::super::BrowserCommandRequest;
 use super::super::{
     apply_browser_workflow_review_mutation, browser_workflow_review_projection,
     discard_browser_workflow_review, preview_browser_workflow_review, save_browser_workflow_review,
-    BrowserBounds, BrowserHostControl, BrowserHostEvent, BrowserPageRecordingIpcError,
+    BrowserBounds, BrowserGatewayRegistrar, BrowserHostControl, BrowserHostEvent,
+    BrowserNativeHostCommand, BrowserNativeHostOutcome, BrowserPageRecordingIpcError,
     BrowserPaneSurface, BrowserRecipeV1, BrowserRecordingError, BrowserRecordingInstance,
     BrowserRecordingReview, BrowserRecordingStatus, BrowserReplayRepairCleanupWork,
-    BrowserGatewayRegistrar, BrowserWorkflowCoordinator, BrowserWorkflowReviewMutation,
-    BrowserWorkflowReviewProjection, BrowserWorkspaceKey,
+    BrowserWorkflowCoordinator, BrowserWorkflowReviewMutation, BrowserWorkflowReviewProjection,
+    BrowserWorkspaceKey,
 };
 use super::super::{
     validate_direct_repair_preview_command, validate_direct_secret_command, BrowserCommand,
@@ -165,6 +166,16 @@ impl BrowserWebViewHost {
     pub fn attach_gateway_registrar(&mut self, _registrar: BrowserGatewayRegistrar) {}
 
     pub fn detach_gateway_registrar(&mut self) {}
+
+    pub fn apply_native_shell_command(
+        &mut self,
+        command: &BrowserNativeHostCommand,
+    ) -> Result<BrowserNativeHostOutcome, BrowserError> {
+        match command {
+            BrowserNativeHostCommand::Detach { .. } => Ok(BrowserNativeHostOutcome::Idempotent),
+            _ => Err(unsupported_platform_error(std::env::consts::OS)),
+        }
+    }
 
     pub(crate) fn window_lifetime_fence(&self) -> BrowserNativeWindowLifetime {
         self.native_window_lifetime.clone()

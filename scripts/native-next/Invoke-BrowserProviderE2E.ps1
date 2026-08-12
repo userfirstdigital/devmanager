@@ -66,6 +66,25 @@ function Resolve-BrowserProviderAllowlist {
     return ,([string[]]$resolved.ToArray())
 }
 
+function Get-BrowserVisibleHostProofClass {
+    param(
+        [bool]$FixtureOnly,
+        [bool]$VisibleClaimed,
+        [bool]$OptInMarker,
+        [bool]$ObservedHostOwnedWebView2,
+        [bool]$ObservedWindowLifecycle,
+        [bool]$ObservedHelperLifecycle
+    )
+
+    if ($FixtureOnly -or -not $VisibleClaimed) {
+        return 'FixtureProtocolOnly'
+    }
+    if ($OptInMarker -and $ObservedHostOwnedWebView2 -and $ObservedWindowLifecycle -and $ObservedHelperLifecycle) {
+        return 'VisibleGreen'
+    }
+    return 'VisibleHold'
+}
+
 function Test-BrowserProductionConfigRoot {
     param([Parameter(Mandatory = $true)][string]$LiteralPath)
 
@@ -241,6 +260,8 @@ try {
         fixtureServer            = $serverEvidence
         authenticated            = $(if ($authenticatedHold) { $authenticatedHold } else { [ordered]@{ requested = $false; launched = $false; hold = 'not-requested' } })
         launchedStockProvider    = $false
+        visibleWebView2Proven    = $false
+        visibleHostProofClass    = 'FixtureProtocolOnly'
         productionProfileTouched = $false
         persistedPromptBody      = $false
         persistedBearerToken     = $false
@@ -256,6 +277,18 @@ try {
     }
     if ($IncludeRecovery) {
         $evidence['recovery'] = 'fixture recovery pages exist; live renderer/provider crash is NOT executed'
+    }
+
+    $visibleOptIn = [string]$env:DEVMANAGER_BROWSER_WEBVIEW2_E2E -eq '1'
+    $evidence.visibleHostProofClass = Get-BrowserVisibleHostProofClass `
+        -FixtureOnly $true `
+        -VisibleClaimed ([bool]$evidence.visibleWebView2Proven) `
+        -OptInMarker $visibleOptIn `
+        -ObservedHostOwnedWebView2 $false `
+        -ObservedWindowLifecycle $false `
+        -ObservedHelperLifecycle $false
+    if ($evidence.visibleHostProofClass -eq 'VisibleGreen' -or [bool]$evidence.visibleWebView2Proven) {
+        throw 'Fixture/provider proof cannot claim visible WebView2 success. Fixture-only runs stay FixtureProtocolOnly.'
     }
 
     $evidencePath = Join-Path $resolvedOutput 'browser-provider-e2e.json'

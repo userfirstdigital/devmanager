@@ -45,12 +45,13 @@ use crate::browser::{
     BrowserResourceStore, BrowserResponse, BrowserRevision, BrowserRuntimeTarget,
     BrowserScreenshotMode, BrowserSnapshotSummary, BrowserStorageLayout, BrowserUploadResult,
     BrowserWaitResult, BrowserWorkflowCoordinator, BrowserWorkflowReviewMutation,
-    BrowserWorkflowReviewProjection, BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
-    MAX_BROWSER_ACTIONS, MAX_BROWSER_RECIPE_WAIT_MS,
+    BrowserNativeHostCommand, BrowserNativeHostOutcome, BrowserWorkflowReviewProjection,
+    BrowserWorkspaceKey, BrowserWorkspaceSnapshot, MAX_BROWSER_ACTIONS, MAX_BROWSER_RECIPE_WAIT_MS,
 };
+use crate::domain::id::ClientId;
 use crate::protocol::{
-    BrowserDpi, BrowserHostProcessIdentity, BrowserPhysicalBounds, BrowserSurfaceDescriptor,
-    BrowserSurfaceIdentity, BrowserWindowHandle,
+    BrowserAttachRequest, BrowserDpi, BrowserHostProcessIdentity, BrowserPhysicalBounds,
+    BrowserSurfaceDescriptor, BrowserSurfaceIdentity, BrowserSurfaceLifecycle, BrowserWindowHandle,
 };
 use base64::Engine as _;
 use gpui::{ForegroundExecutor, Task};
@@ -1609,6 +1610,181 @@ impl BrowserWebViewHost {
         )?;
         self.state
             .attach_native_view_with_backend(request, destination, &mut self.surface_backend)
+    }
+
+    pub fn reattach_task_surface(
+        &mut self,
+        request: crate::protocol::BrowserAttachRequest,
+        destination: BrowserWindowHandle,
+    ) -> Result<BrowserNativeViewReceipt, BrowserNativeViewError> {
+        self.reparent_exact_wry_view(
+            &request.descriptor.identity,
+            &request.descriptor.child_hwnd,
+            &destination,
+        )?;
+        self.state
+            .reattach_native_view_with_backend(request, destination, &mut self.surface_backend)
+    }
+
+    /// NativeShell-facing apply for an already-admitted controller command.
+    /// Rejects mismatched gateway or identity refs; never invents a second host.
+    pub fn apply_native_shell_command(
+        &mut self,
+        command: &BrowserNativeHostCommand,
+    ) -> Result<BrowserNativeHostOutcome, BrowserError> {
+        match command {
+            BrowserNativeHostCommand::Attach {
+                identity,
+                workspace_key,
+                gateway,
+                destination,
+                bounds,
+                ..
+            } => {
+                self.apply_controller_gateway_binding(identity, workspace_key, gateway)?;
+                let destination = window_handle_from_destination(*destination)?;
+                let Some(receipt) = self.native_view(&identity.protocol_surface()) else {
+                    return Err(native_shell_missing_view());
+                };
+                if receipt.attached_parent.as_ref().is_some_and(|parent| {
+                    parent.raw_value() == destination.raw_value()
+                }) {
+                    self.set_bounds(*bounds)?;
+                    return Ok(BrowserNativeHostOutcome::Idempotent);
+                }
+                let request = BrowserAttachRequest::new(receipt.descriptor, ClientId::new());
+                if matches!(receipt.lifecycle, BrowserSurfaceLifecycle::Attached { .. }) {
+                    self.reattach_task_surface(request, destination)
+                        .map_err(native_shell_view_error)?;
+                } else {
+                    self.attach_task_surface(request, destination)
+                        .map_err(native_shell_view_error)?;
+                }
+                self.set_bounds(*bounds)?;
+                Ok(BrowserNativeHostOutcome::Applied)
+            }
+            BrowserNativeHostCommand::Reattach {
+                identity,
+                workspace_key,
+                gateway,
+                destination,
+                bounds,
+                ..
+            } => {
+                self.apply_controller_gateway_binding(identity, workspace_key, gateway)?;
+                let destination = window_handle_from_destination(*destination)?;
+                let receipt = self
+                    .native_view(&identity.protocol_surface())
+                    .ok_or_else(native_shell_missing_view)?;
+                let request = BrowserAttachRequest::new(receipt.descriptor, ClientId::new());
+                self.reattach_task_surface(request, destination)
+                    .map_err(native_shell_view_error)?;
+                self.set_bounds(*bounds)?;
+                Ok(BrowserNativeHostOutcome::Applied)
+            }
+            BrowserNativeHostCommand::BindGateway {
+                identity,
+                workspace_key,
+                gateway,
+                ..
+            } => {
+                self.apply_controller_gateway_binding(identity, workspace_key, gateway)?;
+                Ok(BrowserNativeHostOutcome::Applied)
+            }
+            BrowserNativeHostCommand::SubmitCommand { identity, .. } => {
+                if self.native_view(&identity.protocol_surface()).is_none() {
+                    return Err(native_shell_missing_view());
+                }
+                Ok(BrowserNativeHostOutcome::CommandHandoff)
+            }
+            BrowserNativeHostCommand::Resize { identity, bounds, .. } => {
+                if self.native_view(&identity.protocol_surface()).is_none() {
+                    return Err(native_shell_missing_view());
+                }
+                self.set_bounds(*bounds)?;
+                Ok(BrowserNativeHostOutcome::Applied)
+            }
+            BrowserNativeHostCommand::Focus {
+                identity, focused, ..
+            } => {
+                let receipt = self
+                    .native_view(&identity.protocol_surface())
+                    .ok_or_else(native_shell_missing_view)?;
+                self.surface_backend
+                    .set_surface_focus(&receipt.descriptor.child_hwnd, *focused)
+                    .map_err(|_| BrowserError::CrashedView {
+                        message: "browser native focus failed".to_string(),
+                    })?;
+                Ok(BrowserNativeHostOutcome::Applied)
+            }
+            BrowserNativeHostCommand::Detach {
+                identity,
+                workspace_key,
+                ..
+            } => {
+                if let Some(receipt) = self.native_view(&identity.protocol_surface()) {
+                    if !matches!(receipt.lifecycle, BrowserSurfaceLifecycle::Parked) {
+                        let request = self
+                            .state
+                            .host_request(&receipt.descriptor.identity)
+                            .map_err(native_shell_view_error)?;
+                        self.park_task_surface(request)
+                            .map_err(native_shell_view_error)?;
+                    }
+                }
+                let key = BrowserViewKey {
+                    workspace_key: workspace_key.clone(),
+                    tab_id: workspace_key.ai_tab_id.clone(),
+                };
+                self.clear_published_gateway_binding(&key);
+                Ok(BrowserNativeHostOutcome::Parked)
+            }
+        }
+    }
+
+    fn apply_controller_gateway_binding(
+        &mut self,
+        identity: &crate::browser::BrowserNativeIdentity,
+        workspace_key: &BrowserWorkspaceKey,
+        gateway: &crate::browser::BrowserGatewayBindingRef,
+    ) -> Result<(), BrowserError> {
+        let registrar = self.gateway_registrar.clone().ok_or_else(|| {
+            BrowserError::InvalidInvocation {
+                field: "gateway".to_string(),
+            }
+        })?;
+        let expected = gateway.process_session_id();
+        let found = registrar.process_session_id_for_workspace(workspace_key);
+        if found.as_deref() != Some(expected) {
+            return Err(BrowserError::InvalidInvocation {
+                field: "gateway".to_string(),
+            });
+        }
+        if !registrar.publish_host_surface_binding(
+            expected,
+            identity.task_id(),
+            identity.agent_session_id(),
+            identity.context_id(),
+            identity.resource_id(),
+        ) {
+            return Err(BrowserError::InvalidInvocation {
+                field: "gateway".to_string(),
+            });
+        }
+        self.prepare_task_surface_identity(
+            workspace_key,
+            &workspace_key.ai_tab_id,
+            identity.protocol_surface(),
+            identity.agent_session_id(),
+        );
+        self.published_host_bindings.insert(
+            BrowserViewKey {
+                workspace_key: workspace_key.clone(),
+                tab_id: workspace_key.ai_tab_id.clone(),
+            },
+            expected.to_string(),
+        );
+        Ok(())
     }
 
     fn park_wry_and_state(
@@ -8419,6 +8595,26 @@ fn random_annotation_capture_id() -> Result<String, BrowserError> {
         let _ = write!(id, "{byte:02x}");
     }
     Ok(id)
+}
+
+fn window_handle_from_destination(
+    destination: crate::browser::BrowserNativeDestination,
+) -> Result<BrowserWindowHandle, BrowserError> {
+    BrowserWindowHandle::from_raw(destination.raw()).map_err(|_| BrowserError::InvalidInvocation {
+        field: "destination".to_string(),
+    })
+}
+
+fn native_shell_missing_view() -> BrowserError {
+    BrowserError::CrashedView {
+        message: "browser native view is not registered".to_string(),
+    }
+}
+
+fn native_shell_view_error(error: BrowserNativeViewError) -> BrowserError {
+    BrowserError::CrashedView {
+        message: error.to_string(),
+    }
 }
 
 fn current_host_process_identity() -> Result<BrowserHostProcessIdentity, BrowserNativeViewError> {

@@ -10,6 +10,7 @@ mod generation;
 mod host;
 mod mcp;
 mod model;
+mod native_shell_controller;
 mod operation_queue;
 mod pane;
 mod policy;
@@ -76,11 +77,19 @@ pub(crate) use commands::{
     BrowserReplayRepairCleanupWork,
 };
 pub use conformance::{
-    browser_fixture_root, hold_authenticated_provider_launch, real_provider_launch_is_forbidden,
-    validate_browser_fixture_site, BrowserFixtureAction, BrowserFixtureCase,
-    BrowserFixtureRecoveryCase, BrowserFixtureValidation, BrowserFixtureValidationError,
-    BrowserProviderArm, BrowserProviderE2EHold, BrowserProviderHoldRecord,
+    browser_fixture_root, classify_visible_host_proof, hold_authenticated_provider_launch,
+    real_provider_launch_is_forbidden, validate_browser_fixture_site, BrowserFixtureAction,
+    BrowserFixtureCase, BrowserFixtureRecoveryCase, BrowserFixtureValidation,
+    BrowserFixtureValidationError, BrowserProviderArm, BrowserProviderE2EHold,
+    BrowserProviderHoldRecord, BrowserVisibleHostProofClaim, BrowserVisibleHostProofClass,
     BROWSER_E2E_SCHEMA_VERSION, BROWSER_E2E_VERIFICATION_TOKEN, BROWSER_FIXTURE_CASES,
+    BROWSER_VISIBLE_WEBVIEW2_OPT_IN_ENV,
+};
+pub use native_shell_controller::{
+    BrowserGatewayBindingRef, BrowserNativeCallback, BrowserNativeCallbackKind,
+    BrowserNativeControllerError, BrowserNativeDestination, BrowserNativeHostCommand,
+    BrowserNativeHostOutcome, BrowserNativeIdentity, BrowserNativeLease,
+    BrowserNativeShellController,
 };
 pub use downloads::{
     prepare_verified_download_root, prepare_verified_profile_root, remove_verified_profile,

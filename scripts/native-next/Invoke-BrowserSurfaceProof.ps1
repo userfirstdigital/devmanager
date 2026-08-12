@@ -66,6 +66,26 @@ foreach ($token in $forbidden) {
     }
 }
 
+function Get-BrowserVisibleHostProofClass {
+    param(
+        [bool]$FixtureOnly,
+        [bool]$VisibleClaimed,
+        [bool]$OptInMarker,
+        [bool]$ObservedHostOwnedWebView2,
+        [bool]$ObservedWindowLifecycle,
+        [bool]$ObservedHelperLifecycle
+    )
+
+    if ($FixtureOnly -or -not $VisibleClaimed) {
+        return 'FixtureProtocolOnly'
+    }
+    if ($OptInMarker -and $ObservedHostOwnedWebView2 -and $ObservedWindowLifecycle -and $ObservedHelperLifecycle) {
+        return 'VisibleGreen'
+    }
+    return 'VisibleHold'
+}
+
+$visibleOptIn = [string]$env:DEVMANAGER_BROWSER_WEBVIEW2_E2E -eq '1'
 $redChecks = [ordered]@{
     worktreeRoot              = $worktreeRoot
     surfaceTestPresent        = Test-Path -LiteralPath $surfaceTest
@@ -151,6 +171,7 @@ $evidence = [ordered]@{
         hostRecovery = [bool]$HostRecovery
     }
     visibleWebView2Proven   = $false
+    visibleHostProofClass   = 'FixtureProtocolOnly'
     productionProfileTouched = $false
     residue                 = [ordered]@{
         launchedInstalledApp = $false
@@ -178,6 +199,17 @@ if ($Stage -in @('Green', 'All')) {
     foreach ($filter in $scenarioFilters) {
         Invoke-PortableSurfaceScenario -Filter $filter
     }
+}
+
+$evidence.visibleHostProofClass = Get-BrowserVisibleHostProofClass `
+    -FixtureOnly $true `
+    -VisibleClaimed ([bool]$evidence.visibleWebView2Proven -or [bool]$redChecks.visibleWebView2Claimed) `
+    -OptInMarker $visibleOptIn `
+    -ObservedHostOwnedWebView2 $false `
+    -ObservedWindowLifecycle $false `
+    -ObservedHelperLifecycle $false
+if ($evidence.visibleHostProofClass -eq 'VisibleGreen' -or [bool]$evidence.visibleWebView2Proven -or [bool]$redChecks.visibleWebView2Claimed) {
+    throw 'Portable surface proof cannot claim visible WebView2 success. Fixture-only runs stay FixtureProtocolOnly.'
 }
 
 $evidencePath = Join-Path $resolvedOutput 'browser-surface-proof.json'
