@@ -17,8 +17,9 @@ use crate::domain::task::{
 use crate::kernel::lineage::{
     classify_operation_settled_fact, classify_settled_lineage_fence, is_derived_lifecycle_result,
     reject_pure_non_settled_terminal, validate_host_admission_cleanup_failed_lineage,
-    validate_host_admission_settled_lineage, validate_pure_settled_lineage,
-    validate_side_effect_settled_has_prior_derived, SettledLineageKind,
+    validate_host_admission_settled_lineage, validate_prompt_library_settled_lineage,
+    validate_pure_settled_lineage, validate_side_effect_settled_has_prior_derived,
+    SettledLineageKind,
 };
 use crate::kernel::store::{
     decode_stored_event, u64_from_nonnegative_i64, u64_to_sqlite_i64, StoreError,
@@ -590,7 +591,9 @@ pub(crate) fn apply_event(
                 None,
                 fact.settled_at_ms,
             )?;
-            if matches!(kind, SettledLineageKind::Pure) {
+            if matches!(kind, SettledLineageKind::PromptLibrary) {
+                validate_prompt_library_settled_against_history(tx, shadow, event, fact)?;
+            } else if matches!(kind, SettledLineageKind::Pure) {
                 validate_pure_settled_against_history(tx, shadow, event, fact)?;
             }
         }
@@ -1264,6 +1267,33 @@ fn validate_verified_reconciliation_outbox(
     Ok(())
 }
 
+fn validate_prompt_library_settled_against_history(
+    tx: &Transaction<'_>,
+    shadow: bool,
+    event: &DomainEvent,
+    fact: &crate::domain::event::OperationSettledFact,
+) -> Result<(), StoreError> {
+    let table = table_name("operations", shadow);
+    let accepted_at_ms: i64 = tx.query_row(
+        &format!("SELECT accepted_at_ms FROM {table} WHERE operation_id = ?1"),
+        [fact.operation_id.as_bytes().as_slice()],
+        |row| row.get(0),
+    )?;
+    let prior = load_prior_event_row(tx, event.sequence)?;
+    let accepted_arg = prior
+        .as_ref()
+        .map(|(id, payload, rev, at, task)| (*id, payload, *rev, *at, *task));
+    validate_prompt_library_settled_lineage(
+        fact,
+        event.occurred_at_ms,
+        event.task_id,
+        event.task_revision,
+        accepted_at_ms,
+        accepted_arg,
+        true,
+    )
+}
+
 fn validate_pure_settled_against_history(
     tx: &Transaction<'_>,
     shadow: bool,
@@ -1402,7 +1432,10 @@ fn enforce_derived_result_lineage(
                 prior_arg,
                 true,
             )?;
-            if matches!(kind, SettledLineageKind::Pure) {
+            if matches!(
+                kind,
+                SettledLineageKind::Pure | SettledLineageKind::PromptLibrary
+            ) {
                 if let Some((_, payload, _, _, _)) = &prior {
                     if is_derived_lifecycle_result(payload) {
                         return Err(StoreError::Projection(

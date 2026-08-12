@@ -18,10 +18,11 @@ use tempfile::TempDir;
 use uuid::Uuid;
 
 use devmanager::client::action::{
-    self, ActionRisk, ActionScope, ACTION_HOST_ACTIONS, ACTION_HOST_STATUS, ACTION_TASK_CREATE,
-    ACTION_TASK_CREATE_V2, ACTION_TASK_LIST, ACTION_TASK_RENAME, ACTION_TASK_SHOW,
+    self, ACTION_HOST_ACTIONS, ACTION_HOST_STATUS, ACTION_TASK_CREATE, ACTION_TASK_CREATE_V2,
+    ACTION_TASK_LIST, ACTION_TASK_RENAME, ACTION_TASK_SHOW, ActionRisk, ActionScope,
 };
-use devmanager::config::paths::{resolve_app_paths, AppProfile, BuildKind, ResolvedAppPaths};
+use devmanager::config::paths::{AppProfile, BuildKind, ResolvedAppPaths, resolve_app_paths};
+use devmanager::domain::ClientId;
 use devmanager::domain::command::{
     Command, CommandEnvelope, CommandReceipt, CreateTaskRequestIntent,
 };
@@ -29,7 +30,6 @@ use devmanager::domain::id::{CommandId, EnvironmentId, ProjectId, TaskId};
 use devmanager::domain::task::{
     ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity,
 };
-use devmanager::domain::ClientId;
 use devmanager::host::{HostIdentity, HostRequestExecutor};
 use devmanager::protocol::{
     Capability, CapabilitySet, ClientRequest, FrameLimits, NegotiatedParameters, ProtocolVersion,
@@ -214,7 +214,7 @@ impl ChildGuard {
                 Ok(Some(status)) => return Ok(status),
                 Ok(None) if started.elapsed() < deadline => thread::sleep(POLL),
                 Ok(None) => {
-                    return Err(format!("exact pid {pid} did not exit within {deadline:?}"))
+                    return Err(format!("exact pid {pid} did not exit within {deadline:?}"));
                 }
                 Err(error) => return Err(format!("wait exact pid {pid}: {error}")),
             }
@@ -311,7 +311,11 @@ fn wait_for_identity(host: &mut ChildGuard, lock_path: &Path) -> HostIdentity {
 #[test]
 fn action_catalog_ids_are_unique_and_classified() {
     let catalog = action::catalog();
-    assert_eq!(catalog.len(), 6);
+    assert_eq!(
+        catalog.len(),
+        action::registered_actions().count(),
+        "catalog() is the single host action registry"
+    );
 
     let mut ids = Vec::new();
     for action in catalog {
@@ -563,10 +567,11 @@ fn ctl_task_show_queries_seeded_task_without_taking_host_lock() {
     let after = read_identity(&lock_path).expect("host lock after task-show");
     assert_eq!(after.pid, original.pid);
     assert_eq!(after.boot_id, original.boot_id);
-    assert!(host
-        .try_wait()
-        .expect("poll host after task-show")
-        .is_none());
+    assert!(
+        host.try_wait()
+            .expect("poll host after task-show")
+            .is_none()
+    );
 
     let missing_id = TaskId::from_bytes(fixed_uuid_v7(0x69)).expect("missing task id");
     let missing = run_ctl_bounded(&[
@@ -584,10 +589,11 @@ fn ctl_task_show_queries_seeded_task_without_taking_host_lock() {
     let after_missing = read_identity(&lock_path).expect("host lock after missing task query");
     assert_eq!(after_missing.pid, original.pid);
     assert_eq!(after_missing.boot_id, original.boot_id);
-    assert!(host
-        .try_wait()
-        .expect("poll host after missing task query")
-        .is_none());
+    assert!(
+        host.try_wait()
+            .expect("poll host after missing task query")
+            .is_none()
+    );
 
     let status = host
         .terminate_and_wait_bounded(TERMINATE_TIMEOUT)
@@ -637,10 +643,11 @@ fn ctl_tasks_lists_seeded_tasks_through_paged_snapshot_without_taking_host_lock(
     let after = read_identity(&lock_path).expect("host lock after ctl tasks");
     assert_eq!(after.pid, original.pid);
     assert_eq!(after.boot_id, original.boot_id);
-    assert!(host
-        .try_wait()
-        .expect("poll host after ctl tasks")
-        .is_none());
+    assert!(
+        host.try_wait()
+            .expect("poll host after ctl tasks")
+            .is_none()
+    );
 
     let status = host
         .terminate_and_wait_bounded(TERMINATE_TIMEOUT)
@@ -716,9 +723,11 @@ fn ctl_invoke_task_create_uses_shared_mutation_without_taking_host_lock() {
     assert_eq!(doc["task_id"], task_id.to_string());
     assert_eq!(doc["receipt"]["accepted"]["task_revision"], 1);
     assert!(doc["receipt"]["accepted"]["command_id"].as_str().is_some());
-    assert!(doc["receipt"]["accepted"]["operation_id"]
-        .as_str()
-        .is_some());
+    assert!(
+        doc["receipt"]["accepted"]["operation_id"]
+            .as_str()
+            .is_some()
+    );
 
     let after = read_identity(&lock_path).expect("host lock after task.create");
     assert_eq!(after.pid, original.pid);
@@ -776,10 +785,11 @@ fn ctl_invoke_task_create_uses_shared_mutation_without_taking_host_lock() {
     );
     assert!(duplicate.stdout.is_empty());
     assert!(String::from_utf8_lossy(&duplicate.stderr).contains("already_exists"));
-    assert!(host
-        .try_wait()
-        .expect("poll host after rejection")
-        .is_none());
+    assert!(
+        host.try_wait()
+            .expect("poll host after rejection")
+            .is_none()
+    );
 
     let status = host
         .terminate_and_wait_bounded(TERMINATE_TIMEOUT)
@@ -970,8 +980,10 @@ fn ctl_rejects_unknown_commands_and_invalid_profiles() {
     ]);
     assert!(!create_revision.status.success());
     assert!(create_revision.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&create_revision.stderr)
-        .contains("requires expected-task-revision"));
+    assert!(
+        String::from_utf8_lossy(&create_revision.stderr)
+            .contains("requires expected-task-revision")
+    );
 
     let rename_without_revision = run_ctl_bounded(&[
         "ctl",
@@ -986,8 +998,10 @@ fn ctl_rejects_unknown_commands_and_invalid_profiles() {
     ]);
     assert!(!rename_without_revision.status.success());
     assert!(rename_without_revision.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&rename_without_revision.stderr)
-        .contains("requires expected-task-revision"));
+    assert!(
+        String::from_utf8_lossy(&rename_without_revision.stderr)
+            .contains("requires expected-task-revision")
+    );
 
     let junk = run_ctl_bounded(&["ctl", "actions", "--json", "--extra"]);
     assert!(!junk.status.success());

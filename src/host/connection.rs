@@ -14,12 +14,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures_util::stream::{FuturesUnordered, StreamExt};
-use tokio::sync::{mpsc, oneshot, watch, Notify, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
-use tokio::time::{interval_at, MissedTickBehavior};
+use tokio::time::{MissedTickBehavior, interval_at};
 use uuid::Uuid;
 
 use crate::config::{ConfigError, ConfigStore};
+use crate::domain::ClientId;
 use crate::domain::command::{
     Command, CommandEnvelope, CommandReceipt, CreateTaskIntent, CreateTaskRequestIntent,
 };
@@ -29,7 +30,6 @@ use crate::domain::query::{
     Query, QueryEnvelope, QueryError, QueryOutcome, QueryReply, QueryResult,
 };
 use crate::domain::snapshot::{PageLimits, SnapshotSection};
-use crate::domain::ClientId;
 use crate::kernel::{
     ArtifactContentError, ArtifactContentRegistry, CommandBus, EventReplaySession, ReplayError,
     SessionScope, SnapshotError, SnapshotSession, StoreError,
@@ -350,10 +350,11 @@ mod workspace_security_tests {
             !message.contains(&repository.path().to_string_lossy().to_string()),
             "security error must not echo a filesystem path"
         );
-        assert!(bus
-            .task_snapshot(task_id)
-            .expect("task lookup after rejected request")
-            .is_none());
+        assert!(
+            bus.task_snapshot(task_id)
+                .expect("task lookup after rejected request")
+                .is_none()
+        );
     }
 
     #[test]
@@ -415,10 +416,11 @@ mod workspace_security_tests {
             ),
             Err(crate::kernel::StoreError::HostAuthorityRequired)
         );
-        assert!(bus
-            .task_snapshot(task_id)
-            .expect("task lookup after substitution")
-            .is_none());
+        assert!(
+            bus.task_snapshot(task_id)
+                .expect("task lookup after substitution")
+                .is_none()
+        );
     }
 }
 
@@ -1972,6 +1974,11 @@ impl HostRequestExecutor {
                 {
                     return Err(IpcError::UnsupportedCapability);
                 }
+                if matches!(envelope.command, Command::PromptLibrary(_))
+                    && !negotiated.capabilities.grants_personal_prompt_library()
+                {
+                    return Err(IpcError::UnsupportedCapability);
+                }
                 let connection_id = output_id
                     .map(ConnectionOutputId::as_uuid)
                     .unwrap_or(Uuid::nil());
@@ -2217,6 +2224,17 @@ impl HostRequestExecutor {
                     });
                 }
                 self.bus.query(envelope).map_err(map_store_error)
+            }
+            Query::PromptLibrary(_) => {
+                if !negotiated.capabilities.grants_personal_prompt_library() {
+                    return Ok(QueryReply {
+                        request_id: envelope.request_id,
+                        outcome: QueryOutcome::Err(QueryError::UnsupportedCapability),
+                    });
+                }
+                self.bus
+                    .query_with_capabilities(negotiated.capabilities, envelope)
+                    .map_err(map_store_error)
             }
             Query::OperationStatus { .. } | Query::TaskSnapshot => {
                 self.bus.query(envelope).map_err(map_store_error)
@@ -2971,6 +2989,16 @@ fn map_artifact_content_error(error: ArtifactContentError) -> Result<QueryOutcom
     }
 }
 
+/// Authenticated host request seam used by tests and the compatibility path.
+pub fn dispatch_host_request(
+    authenticated_client_id: ClientId,
+    capabilities: CapabilitySet,
+    bus: &mut CommandBus,
+    request: ClientRequest,
+) -> Result<ServerMessage, IpcError> {
+    dispatch_authenticated_request(authenticated_client_id, capabilities, bus, request)
+}
+
 /// Authenticated client_id check plus CommandBus execute/query dispatch.
 ///
 /// Used by the exclusive [`super::ipc::HostConnection::serve_request`]
@@ -2978,8 +3006,9 @@ fn map_artifact_content_error(error: ArtifactContentError) -> Result<QueryOutcom
 /// unsupported here; the single executor owns those registries.
 ///
 /// `capabilities` are the negotiated grant set from Hello; capability-gated
-/// bus queries (currently [`Query::InspectHostQuit`]) fail closed here the
-/// same way [`HostRequestExecutor`] does.
+/// bus queries (currently [`Query::InspectHostQuit`] and
+/// [`Query::PromptLibrary`]) fail closed here the same way
+/// [`HostRequestExecutor`] does.
 pub(crate) fn dispatch_authenticated_request(
     authenticated_client_id: ClientId,
     capabilities: CapabilitySet,
@@ -3020,6 +3049,11 @@ fn dispatch_authenticated_request_inner(
             }
             if matches!(envelope.command, Command::ConfirmHostQuit(_))
                 && !capabilities.contains(Capability::HostShutdown)
+            {
+                return Err(IpcError::UnsupportedCapability);
+            }
+            if matches!(envelope.command, Command::PromptLibrary(_))
+                && !capabilities.grants_personal_prompt_library()
             {
                 return Err(IpcError::UnsupportedCapability);
             }
@@ -3070,6 +3104,18 @@ fn dispatch_authenticated_request_inner(
                             outcome: QueryOutcome::Err(QueryError::UnsupportedCapability),
                         }));
                     }
+                }
+                Query::PromptLibrary(_) => {
+                    if !capabilities.grants_personal_prompt_library() {
+                        return Ok(ServerMessage::QueryReply(QueryReply {
+                            request_id: envelope.request_id,
+                            outcome: QueryOutcome::Err(QueryError::UnsupportedCapability),
+                        }));
+                    }
+                    let reply = bus
+                        .query_with_capabilities(capabilities, envelope)
+                        .map_err(map_store_error)?;
+                    return Ok(ServerMessage::QueryReply(reply));
                 }
                 Query::OperationStatus { .. } | Query::TaskSnapshot => {}
             }
@@ -3912,6 +3958,7 @@ mod output_tests {
         EphemeralAdmitResult, EventReplayRegistry, HostRequestExecutor, HostRequestHandle,
         LiveStreamState, LiveTail, PhysicalWriteAckStatus, PrioritizedOutbound, StreamMaterializer,
     };
+    use crate::domain::ClientId;
     use crate::domain::command::{Command, CommandEnvelope, CreateTaskIntent};
     use crate::domain::event::{DomainEvent, Event};
     use crate::domain::id::{
@@ -3923,7 +3970,6 @@ mod output_tests {
         ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity,
         WorkspaceRef,
     };
-    use crate::domain::ClientId;
     use crate::kernel::SessionScope;
     use crate::protocol::{
         ClientRequest, NegotiatedParameters, ServerMessage, StreamFrame, StreamKey,
@@ -4824,13 +4870,13 @@ mod output_tests {
     #[tokio::test(flavor = "current_thread")]
     async fn detach_removes_exact_output_and_live_binding_before_ack_shutdown() {
         use super::{ConnectionOutputId, HostRequestExecutor, OutputInspection};
+        use crate::domain::ClientId;
         use crate::domain::command::{Command, CommandEnvelope, CreateTaskRequestIntent};
         use crate::domain::id::{CommandId, EnvironmentId, ProjectId, RequestId, TaskId};
         use crate::domain::query::{Query, QueryEnvelope};
         use crate::domain::task::{
             ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity,
         };
-        use crate::domain::ClientId;
         use crate::kernel::CommandBus;
         use crate::protocol::{
             Capability, CapabilitySet, ClientRequest, DetachRequest, FrameLimits,
@@ -5188,9 +5234,9 @@ mod output_tests {
     #[test]
     fn dispatch_authenticated_inspect_host_quit_without_host_shutdown_rejects_before_bus_query() {
         use super::dispatch_authenticated_request;
+        use crate::domain::ClientId;
         use crate::domain::id::{RequestId, TaskId};
         use crate::domain::query::{Query, QueryEnvelope, QueryError, QueryOutcome, QueryReply};
-        use crate::domain::ClientId;
         use crate::kernel::CommandBus;
         use crate::protocol::{Capability, CapabilitySet, ClientRequest, ServerMessage};
 
@@ -5283,11 +5329,11 @@ mod output_tests {
     #[test]
     fn dispatch_authenticated_confirm_host_quit_capability_and_scope_gates() {
         use super::dispatch_authenticated_request;
+        use crate::domain::ClientId;
         use crate::domain::command::{
             Command, CommandEnvelope, CommandReceipt, ConfirmHostQuitIntent, RejectionCode,
         };
         use crate::domain::id::{CommandId, TaskId};
-        use crate::domain::ClientId;
         use crate::kernel::CommandBus;
         use crate::protocol::{Capability, CapabilitySet, ClientRequest, ServerMessage};
 
@@ -5413,11 +5459,11 @@ mod output_tests {
     #[tokio::test(flavor = "current_thread")]
     async fn host_request_executor_confirm_host_quit_capability_gate() {
         use super::HostRequestExecutor;
+        use crate::domain::ClientId;
         use crate::domain::command::{
             Command, CommandEnvelope, CommandReceipt, ConfirmHostQuitIntent,
         };
         use crate::domain::id::CommandId;
-        use crate::domain::ClientId;
         use crate::kernel::CommandBus;
         use crate::protocol::{
             Capability, CapabilitySet, ClientRequest, FrameLimits, NegotiatedParameters,
@@ -5507,12 +5553,12 @@ mod output_tests {
     #[tokio::test(flavor = "current_thread")]
     async fn host_cleanup_one_unit_per_maintenance_tick_with_two_registered_outputs() {
         use super::{ConnectionOutputId, HostRequestExecutor, OutputInspection};
+        use crate::domain::ClientId;
         use crate::domain::command::{
             Command, CommandEnvelope, CommandReceipt, ConfirmHostQuitIntent,
         };
         use crate::domain::host::HostCleanupBranch;
         use crate::domain::id::CommandId;
-        use crate::domain::ClientId;
         use crate::kernel::CommandBus;
         use crate::protocol::{
             Capability, CapabilitySet, ClientRequest, FrameLimits, NegotiatedParameters,
@@ -5667,6 +5713,7 @@ mod output_tests {
         use super::{
             ConnectionOutputId, HostRequestExecutor, OutputInspection, PrioritizedOutbound,
         };
+        use crate::domain::ClientId;
         use crate::domain::agent::{AgentRole, AgentSessionFacts, AgentSessionLifecycle};
         use crate::domain::command::{
             Command, CommandEnvelope, CommandReceipt, ConfirmHostQuitIntent, CreateTaskIntent,
@@ -5681,7 +5728,6 @@ mod output_tests {
             ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity,
             TaskLifecycle, WorkspaceRef,
         };
-        use crate::domain::ClientId;
         use crate::kernel::CommandBus;
         use crate::protocol::{
             Capability, CapabilitySet, ClientRequest, FrameLimits, NegotiatedParameters,
@@ -6045,11 +6091,13 @@ mod output_tests {
             ServerMessage::CommandReceipt(CommandReceipt::Accepted { .. })
         ));
         assert!(ports.try_recv_prioritized().is_none());
-        assert!(requests
-            .take_pending_quit_receipt_ack(reg.id())
-            .await
-            .expect("take")
-            .is_none());
+        assert!(
+            requests
+                .take_pending_quit_receipt_ack(reg.id())
+                .await
+                .expect("take")
+                .is_none()
+        );
 
         drop(reg);
         drop(requests);
@@ -6227,11 +6275,13 @@ mod output_tests {
             .await;
         assert!(matches!(collision, Err(crate::host::IpcError::Unavailable)));
         assert!(ports.try_recv_prioritized().is_none());
-        assert!(requests
-            .take_pending_quit_receipt_ack(reg.id())
-            .await
-            .expect("take")
-            .is_none());
+        assert!(
+            requests
+                .take_pending_quit_receipt_ack(reg.id())
+                .await
+                .expect("take")
+                .is_none()
+        );
 
         drop(reg);
         drop(requests);
@@ -6325,11 +6375,13 @@ mod output_tests {
             .await;
         assert!(matches!(full, Err(crate::host::IpcError::Unavailable)));
         assert!(out.is_shutdown_requested());
-        assert!(requests
-            .take_pending_quit_receipt_ack(output_id)
-            .await
-            .expect("take")
-            .is_none());
+        assert!(
+            requests
+                .take_pending_quit_receipt_ack(output_id)
+                .await
+                .expect("take")
+                .is_none()
+        );
         assert!(matches!(
             ports.try_recv_prioritized().expect("filler").message(),
             ServerMessage::QueryReply(_)
@@ -6353,11 +6405,13 @@ mod output_tests {
         assert!(healthy_ports.try_recv_prioritized().is_none());
         // Detach clears the pending map without requiring a take first.
         drop(reg);
-        assert!(requests
-            .take_pending_quit_receipt_ack(healthy_id)
-            .await
-            .expect("cleared")
-            .is_none());
+        assert!(
+            requests
+                .take_pending_quit_receipt_ack(healthy_id)
+                .await
+                .expect("cleared")
+                .is_none()
+        );
 
         drop(requests);
         executor.abort();
@@ -6601,11 +6655,13 @@ mod output_tests {
                 std::time::Instant::now(),
             )
             .expect("new connection scope");
-        assert!(!resumed
-            .page(Some(&cursor))
-            .expect("cursor continuation")
-            .events
-            .is_empty());
+        assert!(
+            !resumed
+                .page(Some(&cursor))
+                .expect("cursor continuation")
+                .events
+                .is_empty()
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -6898,8 +6954,8 @@ mod output_tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn supervised_terminal_flushes_ordered_durables_before_settlement_with_slow_output_isolation(
-    ) {
+    async fn supervised_terminal_flushes_ordered_durables_before_settlement_with_slow_output_isolation()
+     {
         use crate::domain::event::Event;
         use crate::domain::host::HostCleanupBranch;
         use crate::domain::id::CommandId;

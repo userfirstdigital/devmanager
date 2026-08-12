@@ -11,13 +11,17 @@
 //! `tests/ui_composer_production_union.rs`. Save-draft and upload stay typed
 //! HOLDs until their host commands exist.
 
-use crate::client::action::{catalog, ActionDescriptor};
+use super::super::shell::PromptLibraryUiError;
+use crate::client::action::{ActionDescriptor, catalog};
+use crate::domain::id::{PromptChainLinkId, PromptVersionId};
 use crate::domain::{AgentSessionId, ArtifactId, CommandId, RequestId, TaskId};
+use crate::prompts::model::PromptVersion;
 use crate::ui::components::interaction::{
-    redacted_bounded_text, AccessibilityMetadata, AccessibleRole, ComponentError, FocusEpoch,
-    InteractionStateModel, MAX_ACCESSIBLE_DESCRIPTION_SCALARS, MAX_ACCESSIBLE_NAME_SCALARS,
+    AccessibilityMetadata, AccessibleRole, ComponentError, FocusEpoch, InteractionStateModel,
+    MAX_ACCESSIBLE_DESCRIPTION_SCALARS, MAX_ACCESSIBLE_NAME_SCALARS, redacted_bounded_text,
 };
 use crate::ui::components::text_field::{TextField, TextFieldError, TextFieldKey, TextFieldLimits};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt::{Debug, Display, Formatter};
 
@@ -46,6 +50,142 @@ pub enum ComposerTurnMode {
     SendNow,
     Steer,
     QueueFollowUp,
+}
+
+/// Client-local insertion mode for an exact immutable prompt version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComposerInsertionMode {
+    ReplaceDraft,
+    InsertAtCursor,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PutPromptVersionInComposer {
+    pub task_id: TaskId,
+    pub agent_session_id: AgentSessionId,
+    pub prompt_version_id: PromptVersionId,
+    pub insertion: ComposerInsertionMode,
+    pub chain_link_id: Option<PromptChainLinkId>,
+    pub sends_provider_input: bool,
+    pub advances_chain: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExactPromptPayload {
+    pub version_id: PromptVersionId,
+    pub body: String,
+    pub body_sha256: [u8; 32],
+}
+
+impl ExactPromptPayload {
+    pub fn from_version(version: &PromptVersion) -> Self {
+        Self {
+            version_id: version.id,
+            body: version.body.clone(),
+            body_sha256: version.body_sha256,
+        }
+    }
+
+    pub fn matches(&self, version_id: PromptVersionId) -> bool {
+        if self.version_id != version_id {
+            return false;
+        }
+        let digest: [u8; 32] = Sha256::digest(self.body.as_bytes()).into();
+        digest == self.body_sha256
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DraftProvenance {
+    pub prompt_version_id: PromptVersionId,
+    pub chain_link_id: Option<PromptChainLinkId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComposerDraft {
+    pub task_id: Option<TaskId>,
+    pub agent_session_id: Option<AgentSessionId>,
+    pub text: String,
+    pub cursor: usize,
+    pub provenance: Option<DraftProvenance>,
+    pub sent: bool,
+}
+
+impl Default for ComposerDraft {
+    fn default() -> Self {
+        Self {
+            task_id: None,
+            agent_session_id: None,
+            text: String::new(),
+            cursor: 0,
+            provenance: None,
+            sent: false,
+        }
+    }
+}
+
+impl ComposerDraft {
+    pub fn edit(&mut self, text: String, cursor: usize) {
+        self.text = text;
+        self.cursor = cursor.min(self.text.len());
+        self.provenance = None;
+        self.sent = false;
+    }
+
+    pub fn mark_sent(&mut self) {
+        self.sent = true;
+        self.provenance = None;
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderCommandSuggestion {
+    pub label: String,
+    pub command: String,
+    pub provider_kind: String,
+}
+
+pub fn suggest_provider_commands<'a>(
+    prefix: &str,
+    catalog: &'a [ProviderCommandSuggestion],
+) -> Vec<&'a ProviderCommandSuggestion> {
+    let needle = prefix.trim();
+    catalog
+        .iter()
+        .filter(|suggestion| needle.is_empty() || suggestion.command.starts_with(needle))
+        .collect()
+}
+
+pub fn apply_put_prompt_version(
+    draft: &mut ComposerDraft,
+    action: &PutPromptVersionInComposer,
+    payload: &ExactPromptPayload,
+) -> Result<(), PromptLibraryUiError> {
+    if action.sends_provider_input || action.advances_chain {
+        return Err(PromptLibraryUiError::PayloadMismatch);
+    }
+    if !payload.matches(action.prompt_version_id) {
+        return Err(PromptLibraryUiError::PayloadMismatch);
+    }
+    match action.insertion {
+        ComposerInsertionMode::ReplaceDraft => {
+            draft.text = payload.body.clone();
+            draft.cursor = draft.text.len();
+        }
+        ComposerInsertionMode::InsertAtCursor => {
+            let cursor = draft.cursor.min(draft.text.len());
+            draft.text.insert_str(cursor, &payload.body);
+            draft.cursor = cursor.saturating_add(payload.body.len());
+        }
+    }
+    draft.task_id = Some(action.task_id);
+    draft.agent_session_id = Some(action.agent_session_id);
+    draft.provenance = Some(DraftProvenance {
+        prompt_version_id: action.prompt_version_id,
+        chain_link_id: action.chain_link_id,
+    });
+    draft.sent = false;
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -2313,10 +2453,12 @@ mod tests {
         let mut epochs = FocusEpochSource::new();
         focus(&mut composer, &mut epochs);
         let epoch = epochs.current();
-        assert!(composer
-            .availability(ComposerControl::SendNow)
-            .expect("availability")
-            .is_available());
+        assert!(
+            composer
+                .availability(ComposerControl::SendNow)
+                .expect("availability")
+                .is_available()
+        );
         let mut refreshed = projection_with(composer.fence(), "still typing");
         refreshed.disabled_reasons.push((
             ComposerControl::SendNow,
@@ -2380,10 +2522,12 @@ mod tests {
         let mut epochs = FocusEpochSource::new();
         focus(&mut composer, &mut epochs);
         let epoch = epochs.current();
-        assert!(composer
-            .availability(ComposerControl::StageAttachment)
-            .expect("stage")
-            .is_available());
+        assert!(
+            composer
+                .availability(ComposerControl::StageAttachment)
+                .expect("stage")
+                .is_available()
+        );
         let staged = composer.activate_stage(owned, epoch).expect("stage owned");
         assert!(matches!(
             staged.payload,
@@ -2457,10 +2601,12 @@ mod tests {
         let mut epochs = FocusEpochSource::new();
         focus(&mut composer, &mut epochs);
         let epoch = epochs.current();
-        assert!(!composer
-            .availability(ComposerControl::SendNow)
-            .expect("disabled at arm")
-            .is_available());
+        assert!(
+            !composer
+                .availability(ComposerControl::SendNow)
+                .expect("disabled at arm")
+                .is_available()
+        );
         assert!(matches!(
             composer
                 .pointer_down(ComposerControl::SendNow, 4, epoch)
@@ -2471,10 +2617,12 @@ mod tests {
         composer
             .apply_projection(projection_with(composer.fence(), "do not fire"), epoch)
             .expect("same-fence enable refresh");
-        assert!(composer
-            .availability(ComposerControl::SendNow)
-            .expect("now enabled")
-            .is_available());
+        assert!(
+            composer
+                .availability(ComposerControl::SendNow)
+                .expect("now enabled")
+                .is_available()
+        );
         let rejected = composer
             .pointer_up(ComposerControl::SendNow, 4, epoch)
             .expect_err("disabled-at-arm release cannot fire");
@@ -2601,9 +2749,11 @@ mod tests {
             .availability(ComposerControl::Steer)
             .expect("steer");
         assert!(!availability.is_available());
-        assert!(availability
-            .reason()
-            .is_some_and(|reason| reason.contains("no current turn")));
+        assert!(
+            availability
+                .reason()
+                .is_some_and(|reason| reason.contains("no current turn"))
+        );
     }
 
     #[test]

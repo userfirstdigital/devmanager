@@ -402,6 +402,8 @@ enum ReceiptBodyWire {
         operation_id: OperationId,
         task_revision: Option<u64>,
         event_ids: Vec<EventId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt_mutation: Option<Vec<u8>>,
     },
     Rejected {
         command_id: CommandId,
@@ -424,11 +426,20 @@ pub(crate) fn encode_receipt_document(receipt: &CommandReceipt) -> Result<Vec<u8
             operation_id,
             task_revision,
             event_ids,
+            prompt_mutation,
         } => ReceiptBodyWire::Accepted {
             command_id: *command_id,
             operation_id: *operation_id,
             task_revision: *task_revision,
             event_ids: event_ids.clone(),
+            prompt_mutation: prompt_mutation
+                .as_ref()
+                .map(|mutation| {
+                    mutation.encode().map_err(|err| StoreError::CodecMismatch {
+                        detail: err.to_string(),
+                    })
+                })
+                .transpose()?,
         },
         CommandReceipt::Rejected {
             command_id,
@@ -468,11 +479,21 @@ pub(crate) fn decode_receipt_document(payload: &[u8]) -> Result<CommandReceipt, 
             operation_id,
             task_revision,
             event_ids,
+            prompt_mutation,
         } => CommandReceipt::Accepted {
             command_id,
             operation_id,
             task_revision,
             event_ids,
+            prompt_mutation: prompt_mutation
+                .map(|payload| {
+                    crate::prompts::PromptMutationReceipt::decode(&payload).map_err(|err| {
+                        StoreError::CodecMismatch {
+                            detail: err.to_string(),
+                        }
+                    })
+                })
+                .transpose()?,
         },
         ReceiptBodyWire::Rejected {
             command_id,
@@ -505,6 +526,7 @@ mod tests {
             operation_id: OperationId::from_bytes(fixed_uuid_v7(0x02)).unwrap(),
             task_revision: Some(3),
             event_ids: vec![EventId::from_bytes(fixed_uuid_v7(0x03)).unwrap()],
+            prompt_mutation: None,
         };
         let bytes = encode_receipt_document(&receipt).expect("encode");
         let decoded = decode_receipt_document(&bytes).expect("decode");

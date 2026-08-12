@@ -232,9 +232,27 @@ fn schema_open_applies_v1_tables_indexes_and_settings() {
             "command_receipts".to_string(),
             "event_retention".to_string(),
             "events".to_string(),
+            "host_admission".to_string(),
+            "host_cleanup_branches".to_string(),
             "operations".to_string(),
             "outbox".to_string(),
+            "prompt_chain_command_receipts".to_string(),
+            "prompt_chain_events".to_string(),
+            "prompt_chain_links".to_string(),
+            "prompt_chains".to_string(),
+            "prompt_command_receipts".to_string(),
+            "prompt_events".to_string(),
+            "prompt_lineage_migration_commitment".to_string(),
+            "prompt_lineage_migration_state".to_string(),
+            "prompt_lineage_quarantine".to_string(),
+            "prompt_lineage_quarantine_creation".to_string(),
+            "prompt_lineage_quarantine_ledger".to_string(),
+            "prompt_lineage_quarantine_repair_audit".to_string(),
+            "prompt_tags".to_string(),
+            "prompt_version_variables".to_string(),
+            "prompt_versions".to_string(),
             "resources".to_string(),
+            "saved_prompts".to_string(),
             "schema_migrations".to_string(),
             "tasks".to_string(),
         ]
@@ -248,6 +266,12 @@ fn schema_open_applies_v1_tables_indexes_and_settings() {
             "idx_outbox_claim_ready".to_string(),
             "idx_outbox_cleanup_ready".to_string(),
             "idx_outbox_delivery_state".to_string(),
+            "idx_prompt_chain_events_chain_sequence".to_string(),
+            "idx_prompt_chain_links_chain_position".to_string(),
+            "idx_prompt_events_prompt_sequence".to_string(),
+            "idx_prompt_tags_prompt_position".to_string(),
+            "idx_prompt_version_variables_version_position".to_string(),
+            "idx_prompt_versions_prompt_version".to_string(),
             "idx_resources_active".to_string(),
         ]
     );
@@ -269,7 +293,7 @@ fn schema_open_applies_v1_tables_indexes_and_settings() {
             .map(|r| r.unwrap())
             .collect()
     };
-    assert_eq!(rows.len(), 4);
+    assert_eq!(rows.len(), 9);
     assert_eq!(rows[0].0, 1);
     assert_eq!(rows[0].1, "v1_initial");
     assert_eq!(rows[0].2.len(), 32);
@@ -282,6 +306,21 @@ fn schema_open_applies_v1_tables_indexes_and_settings() {
     assert_eq!(rows[3].0, 4);
     assert_eq!(rows[3].1, "v4_terminal_outbox_payload_compaction");
     assert_eq!(rows[3].2.len(), 32);
+    assert_eq!(rows[4].0, 5);
+    assert_eq!(rows[4].1, "v5_host_admission");
+    assert_eq!(rows[4].2.len(), 32);
+    assert_eq!(rows[5].0, 6);
+    assert_eq!(rows[5].1, "v6_host_cleanup_branches");
+    assert_eq!(rows[5].2.len(), 32);
+    assert_eq!(rows[6].0, 7);
+    assert_eq!(rows[6].1, "phase07-prompts-v1");
+    assert_eq!(rows[6].2.len(), 32);
+    assert_eq!(rows[7].0, 8);
+    assert_eq!(rows[7].1, "phase07-prompts-corrections-v2");
+    assert_eq!(rows[7].2.len(), 32);
+    assert_eq!(rows[8].0, 9);
+    assert_eq!(rows[8].1, "phase07-prompts-lineage-authority-v3");
+    assert_eq!(rows[8].2.len(), 32);
 
     let compacted_digest_column: (String, i64) = conn
         .query_row(
@@ -364,7 +403,7 @@ fn schema_rejects_newer_changed_and_gapped_migrations() {
         let conn = open_raw(&path);
         conn.execute(
             "INSERT INTO schema_migrations(version, name, applied_at_ms, sha256)
-             VALUES (5, 'v5_future', 1, ?1)",
+             VALUES (10, 'v10_future', 1, ?1)",
             rusqlite::params![vec![0u8; 32]],
         )
         .expect("insert newer");

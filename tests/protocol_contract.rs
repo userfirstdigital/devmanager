@@ -985,6 +985,7 @@ fn protocol_command_receipt_preserves_command_and_accepted_operation_correlation
         operation_id: protocol_operation_id(0x62),
         task_revision: None,
         event_ids: vec![protocol_event_id(0x63), protocol_event_id(0x64)],
+        prompt_mutation: None,
     };
     assert_eq!(accepted.command_id(), protocol_command_id(0x61));
     assert_eq!(
@@ -2608,6 +2609,7 @@ fn protocol_client_request_and_server_response_are_one_strict_named_variant() {
         operation_id: protocol_operation_id(0xb7),
         task_revision: Some(1),
         event_ids: vec![protocol_event_id(0xb8)],
+        prompt_mutation: None,
     });
     let reply = ServerMessage::QueryReply(QueryReply {
         request_id: protocol_request_id(0xb9),

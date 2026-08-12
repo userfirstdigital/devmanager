@@ -20,6 +20,7 @@ fn mismatch(as_projection: bool, detail: &str) -> StoreError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SettledLineageKind {
     Pure,
+    PromptLibrary,
     TaskTeardown,
     HostAdmission,
     Release {
@@ -28,7 +29,9 @@ pub(crate) enum SettledLineageKind {
     },
 }
 
-/// Pure = all-none; teardown = action + task scope; host admission = action + global scope;
+/// Pure = task-scoped all-none fence (task-mutation adjacency).
+/// PromptLibrary = host-scoped all-none fence (accepted+settled only; never task decisions).
+/// Teardown = action + task scope; host admission = action + global scope;
 /// release = action + both resource fields. Any other combination fails closed.
 pub(crate) fn classify_settled_lineage_fence(
     action_epoch: Option<u64>,
@@ -38,7 +41,8 @@ pub(crate) fn classify_settled_lineage_fence(
     as_projection: bool,
 ) -> Result<SettledLineageKind, StoreError> {
     match (action_epoch, resource_id, runtime_generation, task_id) {
-        (None, None, None, _) => Ok(SettledLineageKind::Pure),
+        (None, None, None, Some(_)) => Ok(SettledLineageKind::Pure),
+        (None, None, None, None) => Ok(SettledLineageKind::PromptLibrary),
         (Some(_), None, None, Some(_)) => Ok(SettledLineageKind::TaskTeardown),
         (Some(_), None, None, None) => Ok(SettledLineageKind::HostAdmission),
         (Some(_), Some(resource_id), Some(runtime_generation), Some(_)) => {
@@ -99,7 +103,9 @@ pub(crate) fn validate_derived_settled_adjacency(
     let kind = classify_operation_settled_fact(fact, next_task_id, as_projection)?;
     if matches!(
         kind,
-        SettledLineageKind::Pure | SettledLineageKind::HostAdmission
+        SettledLineageKind::Pure
+            | SettledLineageKind::PromptLibrary
+            | SettledLineageKind::HostAdmission
     ) {
         return Err(mismatch(
             as_projection,
@@ -139,7 +145,10 @@ pub(crate) fn validate_side_effect_settled_against_derived(
     as_projection: bool,
 ) -> Result<(), StoreError> {
     let kind = classify_operation_settled_fact(fact, settled_task_id, as_projection)?;
-    if matches!(kind, SettledLineageKind::Pure) {
+    if matches!(
+        kind,
+        SettledLineageKind::Pure | SettledLineageKind::PromptLibrary
+    ) {
         return Ok(());
     }
     if matches!(kind, SettledLineageKind::HostAdmission) {
@@ -196,8 +205,13 @@ pub(crate) fn validate_side_effect_settled_against_derived(
             as_projection,
             "resource release settle requires matching immediately preceding resource.released",
         )),
-        (SettledLineageKind::Pure | SettledLineageKind::HostAdmission, _) => {
-            unreachable!("pure returned early; host admission rejected above")
+        (
+            SettledLineageKind::Pure
+            | SettledLineageKind::PromptLibrary
+            | SettledLineageKind::HostAdmission,
+            _,
+        ) => {
+            unreachable!("pure/prompt-library returned early; host admission rejected above")
         }
     }
 }
@@ -212,7 +226,10 @@ pub(crate) fn validate_side_effect_settled_has_prior_derived(
     as_projection: bool,
 ) -> Result<(), StoreError> {
     let kind = classify_operation_settled_fact(fact, settled_task_id, as_projection)?;
-    if matches!(kind, SettledLineageKind::Pure) {
+    if matches!(
+        kind,
+        SettledLineageKind::Pure | SettledLineageKind::PromptLibrary
+    ) {
         return Ok(());
     }
     if matches!(kind, SettledLineageKind::HostAdmission) {
@@ -253,10 +270,13 @@ pub(crate) fn reject_pure_non_settled_terminal(
     kind: SettledLineageKind,
     as_projection: bool,
 ) -> Result<(), StoreError> {
-    if matches!(kind, SettledLineageKind::Pure) {
+    if matches!(
+        kind,
+        SettledLineageKind::Pure | SettledLineageKind::PromptLibrary
+    ) {
         return Err(mismatch(
             as_projection,
-            "pure operation cannot become failed, cancelled, or uncertain",
+            "pure/prompt-library operation cannot become failed, cancelled, or uncertain",
         ));
     }
     if matches!(kind, SettledLineageKind::HostAdmission) {
@@ -501,6 +521,85 @@ fn is_pure_decision_fact(event: &Event) -> bool {
             | Event::ArtifactRegistered { .. }
             | Event::ResourceRegistered { .. }
     )
+}
+
+/// Validate a host-scoped prompt-library OperationSettled.
+///
+/// This path never inspects task-mutation decision facts. The only legal
+/// predecessor is OperationAccepted; `result_event_ids` is that accepted id.
+pub(crate) fn validate_prompt_library_settled_lineage(
+    fact: &OperationSettledFact,
+    settled_occurred_at_ms: i64,
+    settled_task_id: Option<TaskId>,
+    settled_task_revision: Option<u64>,
+    accepted_at_ms: i64,
+    accepted: Option<(EventId, &Event, Option<u64>, i64, Option<TaskId>)>,
+    as_projection: bool,
+) -> Result<(), StoreError> {
+    let kind = classify_operation_settled_fact(fact, settled_task_id, as_projection)?;
+    if !matches!(kind, SettledLineageKind::PromptLibrary) {
+        return Err(mismatch(
+            as_projection,
+            "prompt-library settle validator cannot accept a task-mutation fence",
+        ));
+    }
+    if settled_task_id.is_some() || settled_task_revision.is_some() {
+        return Err(mismatch(
+            as_projection,
+            "prompt-library operation.settled requires NULL task_id and task_revision",
+        ));
+    }
+    if !fact.source.is_dispatch()
+        || fact.action_epoch.is_some()
+        || fact.resource_id.is_some()
+        || fact.runtime_generation.is_some()
+    {
+        return Err(mismatch(
+            as_projection,
+            "prompt-library operation.settled requires Dispatch and an all-none fence",
+        ));
+    }
+    if settled_occurred_at_ms != fact.settled_at_ms || fact.settled_at_ms != accepted_at_ms {
+        return Err(mismatch(
+            as_projection,
+            "prompt-library operation.settled must equal accepted_at_ms",
+        ));
+    }
+    let Some((
+        accepted_id,
+        Event::OperationAccepted(accepted_fact),
+        accepted_revision,
+        accepted_occurred,
+        accepted_task,
+    )) = accepted
+    else {
+        return Err(mismatch(
+            as_projection,
+            "prompt-library operation.settled requires immediately preceding operation.accepted",
+        ));
+    };
+    if fact.result_event_ids.len() != 1 || fact.result_event_ids[0] != accepted_id {
+        return Err(mismatch(
+            as_projection,
+            "prompt-library operation.settled result_event_ids must be the accepted event",
+        ));
+    }
+    if accepted_revision.is_some()
+        || accepted_task.is_some()
+        || accepted_occurred != accepted_at_ms
+        || accepted_fact.operation_id != fact.operation_id
+        || accepted_fact.command_id != fact.command_id
+        || accepted_fact.accepted_at_ms != accepted_at_ms
+        || accepted_fact.action_epoch.is_some()
+        || accepted_fact.resource_id.is_some()
+        || accepted_fact.runtime_generation.is_some()
+    {
+        return Err(mismatch(
+            as_projection,
+            "prompt-library operation.accepted fence/time/scope mismatch",
+        ));
+    }
+    Ok(())
 }
 
 /// Validate a Pure OperationSettled against the contiguous decision facts immediately
