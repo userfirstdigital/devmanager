@@ -5,7 +5,7 @@
 //! task refresh action; it never copies an artifact body into a GPUI render.
 
 use crate::client::action::{self, ActionRequest};
-use crate::domain::artifact::{ArtifactFacts, ArtifactKind, PrivacyClass};
+use crate::domain::artifact::{ArtifactKind, ArtifactSummary, PrivacyClass};
 use crate::domain::id::{ArtifactId, TaskId};
 use crate::domain::snapshot::TaskSnapshot;
 
@@ -29,7 +29,11 @@ pub struct ArtifactsPanelProjection {
 }
 
 impl ArtifactsPanelProjection {
-    pub fn from_snapshot(snapshot: Option<&TaskSnapshot>, task_id: TaskId) -> Self {
+    pub fn from_model(
+        snapshot: Option<&TaskSnapshot>,
+        summaries: impl IntoIterator<Item = ArtifactSummary>,
+        task_id: TaskId,
+    ) -> Self {
         let Some(snapshot) = snapshot.filter(|snapshot| snapshot.task.id == task_id) else {
             let identity = task_identity(task_id, None);
             return Self {
@@ -44,13 +48,16 @@ impl ArtifactsPanelProjection {
             };
         };
         let identity = task_identity(task_id, Some(snapshot.task.revision));
-        let mut artifacts = snapshot.artifacts.values().collect::<Vec<_>>();
+        let mut artifacts = summaries
+            .into_iter()
+            .filter(|artifact| artifact.task_id == task_id)
+            .collect::<Vec<_>>();
         artifacts.sort_by_key(|artifact| (artifact.created_at_ms, artifact.id));
         let truncated = artifacts.len() > MAX_PANEL_ROWS;
         let rows = artifacts
             .into_iter()
             .take(MAX_PANEL_ROWS)
-            .map(artifact_row)
+            .map(|artifact| artifact_row(&artifact))
             .collect();
         Self {
             identity,
@@ -69,10 +76,13 @@ impl ArtifactsPanelProjection {
     }
 }
 
-fn artifact_row(artifact: &ArtifactFacts) -> ArtifactPanelRow {
+fn artifact_row(artifact: &ArtifactSummary) -> ArtifactPanelRow {
     ArtifactPanelRow {
         id: artifact.id,
-        label: artifact.label.clone(),
+        label: crate::domain::cockpit::truncate_to_max_bytes(
+            &artifact.label,
+            super::panel::MAX_PANEL_LABEL_BYTES,
+        ),
         kind: artifact.kind,
         privacy_class: artifact.privacy_class,
         created_at_ms: artifact.created_at_ms,
@@ -122,19 +132,19 @@ mod tests {
     #[test]
     fn artifacts_panel_is_metadata_only_and_fenced_to_snapshot_revision() {
         let task_id = TaskId::new();
-        let mut snapshot = snapshot(task_id);
+        let snapshot = snapshot(task_id);
         let artifact = ArtifactFacts::new(
             task_id,
             ArtifactKind::Evidence,
             "build log",
-            ArtifactContentRef::inline_utf8("body").expect("content"),
+            ArtifactContentRef::content_addressed("sha256:fixture").expect("content"),
             [0; 32],
             PrivacyClass::LocalOnly,
             2,
         )
         .expect("artifact");
-        snapshot.artifacts.insert(artifact.id, artifact);
-        let panel = ArtifactsPanelProjection::from_snapshot(Some(&snapshot), task_id);
+        let summary = ArtifactSummary::from_facts(&artifact).expect("summary");
+        let panel = ArtifactsPanelProjection::from_model(Some(&snapshot), [summary], task_id);
         assert_eq!(panel.rows.len(), 1);
         assert_eq!(panel.identity.revision, Some(7));
         assert_eq!(panel.refresh.action_id, action::ACTION_TASK_SHOW);

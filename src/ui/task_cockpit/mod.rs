@@ -76,8 +76,8 @@ pub use cockpit_projection::{
 };
 pub use files_panel::{FilePanelRow, FilesPanelProjection};
 pub use panel::{
-    action_label, render_panel_action, render_panel_frame, task_identity, PanelAction,
-    PanelDisabledReason, PanelIdentity, MAX_PANEL_LABEL_BYTES, MAX_PANEL_ROWS,
+    action_is_current, action_label, render_panel_action, render_panel_frame, task_identity,
+    PanelAction, PanelDisabledReason, PanelIdentity, MAX_PANEL_LABEL_BYTES, MAX_PANEL_ROWS,
 };
 pub use review_panel::{ReviewArtifactRow, ReviewPanelProjection};
 pub use services_panel::{

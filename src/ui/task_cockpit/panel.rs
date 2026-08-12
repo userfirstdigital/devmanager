@@ -10,6 +10,7 @@ use gpui::{div, px, rgb, AnyElement, IntoElement, ParentElement, Styled};
 use crate::client::action::ActionRequest;
 use crate::domain::id::TaskId;
 use crate::ui::tokens::ThemeTokens;
+use sha2::{Digest, Sha256};
 
 /// Hard cap for all panel rows.  The host already bounds the source payload;
 /// keeping the UI cap here prevents a stale or malicious projection from
@@ -60,6 +61,21 @@ pub struct PanelAction {
 }
 
 impl PanelAction {
+    /// Stable GPUI key scoped to the task, revision, catalog action, and row
+    /// target.  The target is hashed so secret/path text never appears in the
+    /// element identity or diagnostics.
+    pub fn element_key(&self, target: &str) -> u64 {
+        let mut hasher = Sha256::new();
+        hasher.update(self.identity.task_id.as_bytes());
+        hasher.update([u8::from(self.identity.revision.is_some())]);
+        hasher.update(self.identity.revision.unwrap_or_default().to_le_bytes());
+        hasher.update(self.action_id.as_bytes());
+        hasher.update(target.as_bytes());
+        u64::from_le_bytes(hasher.finalize()[..8].try_into().expect("digest prefix"))
+    }
+}
+
+impl PanelAction {
     pub fn enabled(identity: PanelIdentity, request: ActionRequest) -> Self {
         let action_id = request.id();
         Self {
@@ -96,13 +112,13 @@ pub fn task_identity(task_id: TaskId, revision: Option<u64>) -> PanelIdentity {
 /// Render a small action affordance.  The action request stays on the typed
 /// projection for the owning shell to dispatch; this renderer intentionally
 /// does not invent a click handler or bypass the host action boundary.
-pub fn render_panel_action(action: &PanelAction, tokens: ThemeTokens) -> AnyElement {
+pub fn render_panel_action(action: &PanelAction, target: &str, tokens: ThemeTokens) -> AnyElement {
     let label = action.disabled_reason.map_or_else(
         || action_label(action.action_id),
         PanelDisabledReason::label,
     );
     let mut element = div()
-        .id(("task-cockpit-panel-action", action.action_id))
+        .id(("task-cockpit-panel-action", action.element_key(target)))
         .px(px(tokens.density.spacing.sm))
         .py(px(tokens.density.spacing.xs))
         .border_1()
@@ -129,7 +145,7 @@ pub fn render_panel_frame(
 ) -> AnyElement {
     let controls = actions
         .into_iter()
-        .map(|action| render_panel_action(&action, tokens));
+        .map(|action| render_panel_action(&action, "panel", tokens));
     div()
         .id(id)
         .w_full()
@@ -166,6 +182,17 @@ pub fn action_label(action_id: &str) -> &'static str {
         crate::client::action::ACTION_TASK_SHOW => "Refresh task",
         _ => "Open",
     }
+}
+
+/// Accept an action only while its captured task and optional revision remain
+/// the selected durable snapshot.  This is the UI capture fence; the host
+/// still performs its own task/capability/path admission.
+pub fn action_is_current(
+    action: &PanelAction,
+    selected_task: Option<TaskId>,
+    current_revision: Option<u64>,
+) -> bool {
+    selected_task == Some(action.identity.task_id) && action.identity.revision == current_revision
 }
 
 #[cfg(test)]
@@ -209,5 +236,53 @@ mod tests {
             action.disabled_reason.map(PanelDisabledReason::label),
             Some("Host projection unavailable")
         );
+    }
+
+    #[test]
+    fn element_key_is_unique_for_task_revision_action_and_row_target() {
+        let task_id = TaskId::new();
+        let first = PanelAction::enabled(
+            task_identity(task_id, Some(1)),
+            ActionRequest::TaskCockpit {
+                task_id,
+                query: TaskCockpitQuery::FilesRead {
+                    relative_path: "src/a.rs".into(),
+                    max_bytes: 16,
+                },
+            },
+        );
+        let second = PanelAction::enabled(
+            task_identity(task_id, Some(1)),
+            ActionRequest::TaskCockpit {
+                task_id,
+                query: TaskCockpitQuery::FilesRead {
+                    relative_path: "src/b.rs".into(),
+                    max_bytes: 16,
+                },
+            },
+        );
+        assert_ne!(
+            first.element_key("src/a.rs"),
+            second.element_key("src/b.rs")
+        );
+        assert_ne!(first.element_key("src/a.rs"), first.element_key("src/b.rs"));
+    }
+
+    #[test]
+    fn current_action_rejects_task_or_revision_drift() {
+        let task_id = TaskId::new();
+        let action = PanelAction::enabled(
+            task_identity(task_id, Some(4)),
+            ActionRequest::TaskShow { task_id },
+        );
+        assert!(action_is_current(&action, Some(task_id), Some(4)));
+        assert!(!action_is_current(&action, Some(TaskId::new()), Some(4)));
+        assert!(!action_is_current(&action, Some(task_id), Some(5)));
+        let unfenced = PanelAction::enabled(
+            task_identity(task_id, None),
+            ActionRequest::TaskShow { task_id },
+        );
+        assert!(action_is_current(&unfenced, Some(task_id), None));
+        assert!(!action_is_current(&unfenced, Some(task_id), Some(4)));
     }
 }

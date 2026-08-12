@@ -37,7 +37,7 @@ use crate::browser::{
     BrowserError, BrowserNativeHostCommand, BrowserNativeHostOutcome, BrowserResponse,
     BrowserWebViewHost,
 };
-use crate::client::action::{self, BrowserActionRequest, CockpitSurfaceKind, UpdaterAction};
+use crate::client::action::{self, BrowserActionRequest, UpdaterAction};
 use crate::client::{
     ClientModel, ClientSubscription, HostClient, HostClientConfig, HostClientConnectPort,
     SubscriptionUpdate,
@@ -82,11 +82,13 @@ use crate::ui::task_cockpit::composer::{
 use crate::ui::task_cockpit::dock::{DockEdge, DockTool as CockpitDockTool};
 use crate::ui::task_cockpit::shell::TaskCockpitShell;
 use crate::ui::task_cockpit::{
-    one_fresh_quota_observations, project_services_from_task_projection, project_services_panel,
-    render_task_browser_dock, summary_line, update_observation_from_snapshot, Inbox,
-    InboxPresentationWidth, InboxRenderModel, ServicePanelAction, ServicePanelTone,
-    ServicesPanelProjection, TaskBrowserDockModel, TaskHeaderModel, TaskList,
-    TopBarProjectionController, TopBarProjectionInput, UpdateState, DEFAULT_VISIBLE_ROWS,
+    action_is_current, one_fresh_quota_observations, project_services_from_task_projection,
+    project_services_panel, render_panel_action, render_panel_frame, render_task_browser_dock,
+    update_observation_from_snapshot, ArtifactsPanelProjection, ChangesPanelProjection,
+    FilesPanelProjection, Inbox, InboxPresentationWidth, InboxRenderModel, PanelAction,
+    ReviewPanelProjection, ServicePanelAction, ServicePanelTone, ServicesPanelProjection,
+    TaskBrowserDockModel, TaskHeaderModel, TaskList, TopBarProjectionController,
+    TopBarProjectionInput, UpdateState, WorkspacePanelProjection, DEFAULT_VISIBLE_ROWS,
     FIXED_VIRTUAL_OVERSCAN,
 };
 use crate::ui::terminal_adapter::TerminalDockAdapter;
@@ -7074,66 +7076,117 @@ impl NativeShell {
         tool: CockpitDockTool,
         tokens: crate::ui::tokens::ThemeTokens,
     ) -> AnyElement {
-        let details = if let Some(projection) = self.cockpit.live_projection() {
-            let kind = match tool {
-                CockpitDockTool::Changes => Some(CockpitSurfaceKind::Git),
-                CockpitDockTool::Files => Some(CockpitSurfaceKind::Files),
-                CockpitDockTool::Services => Some(CockpitSurfaceKind::Services),
-                _ => None,
-            };
-            if let Some(kind) = kind {
-                summary_line(projection, kind)
-            } else {
-                self.interaction
-                    .selected_task()
-                    .and_then(|task_id| self.client_model.as_ref()?.task(task_id))
-                    .map(|snapshot| match tool {
-                        CockpitDockTool::Artifacts => format!(
-                            "Artifacts · {} bounded metadata item(s) · task-owned",
-                            snapshot.artifacts.len()
-                        ),
-                        CockpitDockTool::Review => format!(
-                            "Review · {} · revision {}",
-                            visible_status_label(snapshot.visible_status()),
-                            snapshot.task.revision
-                        ),
-                        other => other.label().to_string(),
-                    })
-                    .unwrap_or_else(|| format!("{} · select a task", tool.label()))
+        let Some(task_id) = self.interaction.selected_task() else {
+            return render_panel_frame(
+                "native-shell-workspace-dock",
+                tool.label(),
+                "Select a task first",
+                Vec::new(),
+                div(),
+                tokens,
+            );
+        };
+        let snapshot = self
+            .client_model
+            .as_ref()
+            .and_then(|model| model.task(task_id));
+        let revision = snapshot.map(|snapshot| snapshot.task.revision);
+        let live = self.cockpit.live_projection();
+        let (title, summary, actions, rows): (
+            &'static str,
+            String,
+            Vec<PanelAction>,
+            Vec<AnyElement>,
+        ) = match tool {
+            CockpitDockTool::Changes => {
+                let panel = ChangesPanelProjection::from_host(
+                    live.and_then(|projection| projection.git.as_ref()),
+                    task_id,
+                    revision,
+                );
+                ("Changes", panel.summary(), vec![panel.refresh], Vec::new())
             }
-        } else {
-            self.interaction
-                .selected_task()
-                .and_then(|task_id| self.client_model.as_ref()?.task(task_id))
-                .map(|snapshot| {
-                    let workspace = workspace_projection_label(&snapshot.task.workspace);
-                    match tool {
-                        CockpitDockTool::Changes => {
-                            format!("Git changes · {workspace} · loading host projection")
-                        }
-                        CockpitDockTool::Files => {
-                            format!("Files · {workspace} · loading host projection")
-                        }
-                        CockpitDockTool::Artifacts => format!(
-                            "Artifacts · {} bounded metadata item(s) · task-owned",
-                            snapshot.artifacts.len()
-                        ),
-                        CockpitDockTool::Review => format!(
-                            "Review · {} · revision {}",
-                            visible_status_label(snapshot.visible_status()),
-                            snapshot.task.revision
-                        ),
-                        other => other.label().to_string(),
-                    }
-                })
-                .unwrap_or_else(|| format!("{} · select a task", tool.label()))
+            CockpitDockTool::Files => {
+                let panel = FilesPanelProjection::from_host(
+                    live.and_then(|projection| projection.files.as_ref()),
+                    task_id,
+                    revision,
+                    None,
+                );
+                let rows = panel
+                    .rows
+                    .iter()
+                    .map(|row| {
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(tokens.density.spacing.sm))
+                            .child(row.label.clone())
+                            .child(Self::panel_action_element(
+                                row.read.clone(),
+                                &row.relative_path,
+                                tokens,
+                                shell_entity.clone(),
+                            ))
+                            .into_any_element()
+                    })
+                    .collect();
+                ("Files", panel.summary(), vec![panel.refresh], rows)
+            }
+            CockpitDockTool::Artifacts => {
+                let summaries = self
+                    .client_model
+                    .as_ref()
+                    .map(|model| model.artifact_summaries().values().cloned().collect())
+                    .unwrap_or_default();
+                let panel = ArtifactsPanelProjection::from_model(snapshot, summaries, task_id);
+                let rows = panel
+                    .rows
+                    .iter()
+                    .map(|row| {
+                        div()
+                            .child(format!("{:?} · {}", row.kind, row.label))
+                            .into_any_element()
+                    })
+                    .collect();
+                ("Artifacts", panel.summary(), vec![panel.refresh], rows)
+            }
+            CockpitDockTool::Review => {
+                let summaries = self
+                    .client_model
+                    .as_ref()
+                    .map(|model| model.artifact_summaries().values().cloned().collect())
+                    .unwrap_or_default();
+                let panel = ReviewPanelProjection::from_model(snapshot, summaries, task_id);
+                let rows = panel
+                    .artifacts
+                    .iter()
+                    .map(|row| div().child(row.label.clone()).into_any_element())
+                    .collect();
+                ("Review", panel.summary(), vec![panel.refresh], rows)
+            }
+            _ => {
+                let panel = WorkspacePanelProjection::from_host(
+                    live.and_then(|projection| projection.workspace.as_ref()),
+                    task_id,
+                    revision,
+                );
+                (
+                    "Workspace",
+                    panel.summary(),
+                    vec![panel.refresh],
+                    Vec::new(),
+                )
+            }
         };
         div()
             .id("native-shell-workspace-dock")
             .w_full()
             .p(px(tokens.density.physical().control_padding as f32))
             .bg(tokens.surfaces.sunken.to_gpui())
-            .child(details)
+            .child(div().child(format!("{title} · {summary}")))
+            .child(div().flex().children(controls))
+            .children(rows)
             .into_any_element()
     }
 
@@ -7317,10 +7370,55 @@ impl NativeShell {
                                 }
                             }
                         } else {
+    fn panel_action_element(
+        action: PanelAction,
+        target: &str,
+        tokens: crate::ui::tokens::ThemeTokens,
+        shell_entity: Option<gpui::WeakEntity<NativeShell>>,
+    ) -> AnyElement {
+        let element = render_panel_action(&action, target, tokens);
+        if !action.is_enabled() {
+            return element;
+        }
+        let Some(shell_entity) = shell_entity else {
+            return element;
+        };
+
+        div()
+            .id(("native-panel-control", action.element_key(target)))
+            .cursor_pointer()
+            .on_mouse_down(MouseButton::Left, move |event, _window, app| {
+                if event.button != MouseButton::Left {
+                    return;
+                }
+                let action = action.clone();
+                let _ = shell_entity.update(app, |shell, cx| {
+                    cx.stop_propagation();
+                    let revision = shell
+                        .client_model
+                        .as_ref()
+                        .and_then(|model| model.task(action.identity.task_id))
+                        .map(|snapshot| snapshot.task.revision);
+                    if !action_is_current(&action, shell.interaction.selected_task(), revision) {
+                        shell.last_query_detail =
+                            Some("Panel action expired; refresh the selected task.".to_owned());
+                        return;
+                    }
+                    shell.interaction.begin_control_pointer(NATIVE_POINTER_ID);
+                    let _ =
+                        shell.dispatch_pointer_action(action.request.clone(), NATIVE_POINTER_ID);
+                    shell.interaction.release_pointer(NATIVE_POINTER_ID);
+                });
+            })
+            .child(element)
+            .into_any_element()
+    }
+
                             control = control
                                 .text_color(tokens.text.disabled.to_gpui())
                                 .child(
                                     affordance
+        shell_entity: Option<gpui::WeakEntity<NativeShell>>,
                                         .disabled_reason
                                         .unwrap_or("Unavailable"),
                                 );
@@ -7376,17 +7474,25 @@ impl NativeShell {
         shell_entity: Option<gpui::WeakEntity<NativeShell>>,
     ) -> AnyElement {
         match self.cockpit.active_tool() {
+        let controls = actions.into_iter().map(|action| {
+            Self::panel_action_element(action, "refresh", tokens, shell_entity.clone())
+        });
             CockpitDockTool::Terminal => self
                 .cockpit
                 .dock()
+            .flex()
+            .flex_col()
+            .gap(px(tokens.density.spacing.xs))
                 .render_context_dock(tokens)
                 .into_any_element(),
             CockpitDockTool::Browser => self
                 .selected_browser_dock_model()
                 .map(|model| render_task_browser_dock(model, tokens).into_any_element())
-                .unwrap_or_else(|| self.workspace_dock_surface(CockpitDockTool::Browser, tokens)),
+                .unwrap_or_else(|| {
+                    self.workspace_dock_surface(CockpitDockTool::Browser, tokens, shell_entity)
+                }),
             CockpitDockTool::Services => self.services_dock_surface(tokens, shell_entity),
-            tool => self.workspace_dock_surface(tool, tokens),
+            tool => self.workspace_dock_surface(tool, tokens, shell_entity),
         }
     }
 

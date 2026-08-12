@@ -1,7 +1,7 @@
 //! Review readiness and review-artifact panel projection.
 
 use crate::client::action::{self, ActionRequest};
-use crate::domain::artifact::{ArtifactKind, PrivacyClass};
+use crate::domain::artifact::{ArtifactKind, ArtifactSummary, PrivacyClass};
 use crate::domain::id::{ArtifactId, TaskId};
 use crate::domain::snapshot::TaskSnapshot;
 use crate::domain::task::{ReviewReadiness, VisibleTaskStatus};
@@ -29,7 +29,11 @@ pub struct ReviewPanelProjection {
 }
 
 impl ReviewPanelProjection {
-    pub fn from_snapshot(snapshot: Option<&TaskSnapshot>, task_id: TaskId) -> Self {
+    pub fn from_model(
+        snapshot: Option<&TaskSnapshot>,
+        summaries: impl IntoIterator<Item = ArtifactSummary>,
+        task_id: TaskId,
+    ) -> Self {
         let Some(snapshot) = snapshot.filter(|snapshot| snapshot.task.id == task_id) else {
             let identity = task_identity(task_id, None);
             return Self {
@@ -47,13 +51,16 @@ impl ReviewPanelProjection {
             };
         };
         let identity = task_identity(task_id, Some(snapshot.task.revision));
-        let mut artifacts = snapshot
-            .artifacts
-            .values()
+        let mut artifacts = summaries
+            .into_iter()
+            .filter(|artifact| artifact.task_id == task_id)
             .filter(|artifact| artifact.kind == ArtifactKind::ReviewReport)
             .map(|artifact| ReviewArtifactRow {
                 id: artifact.id,
-                label: artifact.label.clone(),
+                label: crate::domain::cockpit::truncate_to_max_bytes(
+                    &artifact.label,
+                    super::panel::MAX_PANEL_LABEL_BYTES,
+                ),
                 privacy_class: artifact.privacy_class,
             })
             .collect::<Vec<_>>();
@@ -91,7 +98,7 @@ mod tests {
 
     #[test]
     fn missing_review_snapshot_disables_refresh_without_guessing_readiness() {
-        let panel = ReviewPanelProjection::from_snapshot(None, TaskId::new());
+        let panel = ReviewPanelProjection::from_model(None, Vec::new(), TaskId::new());
         assert_eq!(panel.readiness, ReviewReadiness::NotReady);
         assert_eq!(
             panel.disabled_reason,
