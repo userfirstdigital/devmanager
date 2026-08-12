@@ -440,17 +440,35 @@ describe("Connect channel sequencing and identity fences", () => {
     const resync = JSON.parse(new TextDecoder().decode(resyncFrame.ciphertext)) as {
       sequence: number;
       payloadKind: number;
+      requestId: string;
     };
     expect(resync).toMatchObject({ sequence: 2, payloadKind: 15 });
+    expect(resync.requestId).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+    );
 
     const completion = {
       ...helloResponse,
       sequence: 4,
-      payloadKind: 15,
+      requestId: resync.requestId,
+      payloadKind: 18,
       payloadBase64: encodeBase64Json({
-        channel_sequence: 1,
-        newest_sequence: 3,
-        reason: "gap",
+        request_id: resync.requestId,
+        outcome: {
+          ok: {
+            snapshot_page: {
+              page: {
+                snapshot_id: "01234567-89ab-7012-8000-000000000013",
+                through_sequence: 3,
+                section: "tasks",
+                after_item: null,
+                items: [],
+                encoded_bytes: 1,
+                next_cursor: null,
+              },
+            },
+          },
+        },
       }),
     };
     socket.emit(
@@ -461,7 +479,125 @@ describe("Connect channel sequencing and identity fences", () => {
       ),
     );
     expect(transport.state()).toEqual({ kind: "ready" });
-    expect(envelopes).toEqual([1, 15]);
+    expect(envelopes).toEqual([1, 18]);
+  });
+
+  it("does not treat an unrelated QueryReply as the resync snapshot", async () => {
+    const socket = new FakeConnectSocket();
+    const envelopes: number[] = [];
+    const transport = new ConnectBrowserTransport({
+      firstPairing: true,
+      privateKey: new Uint8Array(32).fill(1),
+      localPublic: new Uint8Array(32).fill(2),
+      location,
+      cryptoLoader: async () => fakeConnectRuntime(),
+      socketFactory: () => socket,
+      onEnvelope: (envelope) => envelopes.push(envelope.payloadKind),
+    });
+
+    await transport.start();
+    socket.emitOpen();
+    socket.emit(connectGreeting());
+    socket.emit(new Uint8Array([0x03]));
+
+    const helloFrame = decodeConnectSealedFrame(
+      socket.sent[socket.sent.length - 1] as Uint8Array,
+    );
+    const hello = JSON.parse(new TextDecoder().decode(helloFrame.ciphertext)) as {
+      connectionId: string;
+      sessionId: string;
+      channelId: string;
+    };
+    const helloResponse = {
+      protocolMajor: 1,
+      protocolMinor: 0,
+      connectionId: hello.connectionId,
+      sessionId: hello.sessionId,
+      channelId: hello.channelId,
+      channel: "critical",
+      sequence: 1,
+      requestId: null,
+      operationId: null,
+      limits: connectLimits,
+      compression: "none",
+      privacyClass: "local_only",
+      payloadKind: 1,
+      payloadVersion: 1,
+      payloadBase64: encodeBase64Json({
+        capabilities: 0,
+        limits: connectLimits,
+        privacy_class: "local_only",
+        client_id: hello.connectionId,
+      }),
+    };
+    const wasmTransport = new FakeConnectWasmTransport();
+    socket.emit(
+      wasmTransport.seal(
+        1n,
+        new Uint8Array(16).fill(3),
+        new TextEncoder().encode(JSON.stringify(helloResponse)),
+      ),
+    );
+
+    const gap = {
+      ...helloResponse,
+      sequence: 3,
+      payloadKind: 18,
+      payloadBase64: encodeBase64Json({
+        request_id: "01234567-89ab-7012-8000-000000000099",
+        outcome: { err: { unavailable: { reason: "not-the-resync" } } },
+      }),
+    };
+    socket.emit(
+      wasmTransport.seal(
+        3n,
+        new Uint8Array(16).fill(4),
+        new TextEncoder().encode(JSON.stringify(gap)),
+      ),
+    );
+    expect(transport.state()).toEqual({ kind: "resyncing" });
+    expect(envelopes).toEqual([1]);
+
+    const resyncFrame = decodeConnectSealedFrame(
+      socket.sent[socket.sent.length - 1] as Uint8Array,
+    );
+    const resync = JSON.parse(new TextDecoder().decode(resyncFrame.ciphertext)) as {
+      requestId: string;
+    };
+    const unrelated = {
+      ...helloResponse,
+      sequence: 4,
+      requestId: "01234567-89ab-7012-8000-000000000099",
+      payloadKind: 18,
+      payloadBase64: encodeBase64Json({
+        request_id: "01234567-89ab-7012-8000-000000000099",
+        outcome: {
+          ok: {
+            snapshot_page: {
+              page: {
+                snapshot_id: "01234567-89ab-7012-8000-000000000013",
+                through_sequence: 3,
+                section: "tasks",
+                after_item: null,
+                items: [],
+                encoded_bytes: 1,
+                next_cursor: null,
+              },
+            },
+          },
+        },
+      }),
+    };
+    socket.emit(
+      wasmTransport.seal(
+        4n,
+        new Uint8Array(16).fill(5),
+        new TextEncoder().encode(JSON.stringify(unrelated)),
+      ),
+    );
+    expect(transport.state()).toEqual({ kind: "resyncing" });
+    expect(envelopes).toEqual([1]);
+    expect(resync.requestId).not.toBe(unrelated.requestId);
   });
 
   it("generates protocol-valid v7 request identities", () => {

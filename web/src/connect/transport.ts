@@ -419,6 +419,7 @@ const CONNECT_QUERY_KIND = 5;
 const CONNECT_COMMAND_KIND = 6;
 const CONNECT_RESYNC_KIND = 15;
 const CONNECT_ERROR_KIND = 16;
+const CONNECT_QUERY_REPLY_KIND = 18;
 
 const CRITICAL_PAYLOAD_KINDS = new Set([
   CONNECT_HELLO_KIND,
@@ -481,6 +482,84 @@ function isConnectLimits(value: unknown): value is ConnectEnvelopeLimits {
         Number.isSafeInteger(record[key]) &&
         (record[key] as number) > 0,
     )
+  );
+}
+
+function hasExactKeys(
+  record: Record<string, unknown>,
+  keys: readonly string[],
+): boolean {
+  return (
+    Object.keys(record).length === keys.length &&
+    keys.every((key) => Object.prototype.hasOwnProperty.call(record, key))
+  );
+}
+
+/**
+ * Resync is completed only by the host's exact bounded snapshot contract.
+ * This deliberately validates the wire shape here instead of treating any
+ * QueryReply as an authoritative stream reset.
+ */
+function isBoundedResyncSnapshot(
+  payload: unknown,
+  requestId: string | null,
+  limits: ConnectEnvelopeLimits,
+): boolean {
+  if (requestId === null || typeof payload !== "object" || payload === null) {
+    return false;
+  }
+  const reply = payload as Record<string, unknown>;
+  if (!hasExactKeys(reply, ["request_id", "outcome"]) || reply.request_id !== requestId) {
+    return false;
+  }
+  if (typeof reply.outcome !== "object" || reply.outcome === null) return false;
+  const outcome = reply.outcome as Record<string, unknown>;
+  if (!hasExactKeys(outcome, ["ok"])) return false;
+  if (typeof outcome.ok !== "object" || outcome.ok === null) return false;
+  const ok = outcome.ok as Record<string, unknown>;
+  if (!hasExactKeys(ok, ["snapshot_page"])) return false;
+  if (typeof ok.snapshot_page !== "object" || ok.snapshot_page === null) {
+    return false;
+  }
+  const snapshotResult = ok.snapshot_page as Record<string, unknown>;
+  if (!hasExactKeys(snapshotResult, ["page"])) return false;
+  if (typeof snapshotResult.page !== "object" || snapshotResult.page === null) {
+    return false;
+  }
+  const page = snapshotResult.page as Record<string, unknown>;
+  if (
+    !hasExactKeys(page, [
+      "snapshot_id",
+      "through_sequence",
+      "section",
+      "after_item",
+      "items",
+      "encoded_bytes",
+      "next_cursor",
+    ]) ||
+    !isUuidV7(page.snapshot_id) ||
+    page.section !== "tasks" ||
+    typeof page.through_sequence !== "number" ||
+    !Number.isSafeInteger(page.through_sequence) ||
+    page.through_sequence < 0 ||
+    page.after_item !== null ||
+    !Array.isArray(page.items) ||
+    page.items.length > limits.max_page_items ||
+    typeof page.encoded_bytes !== "number" ||
+    !Number.isSafeInteger(page.encoded_bytes) ||
+    page.encoded_bytes <= 0 ||
+    page.encoded_bytes > limits.max_page_encoded_bytes
+  ) {
+    return false;
+  }
+  const nextCursor = page.next_cursor;
+  if (nextCursor === null) return true;
+  if (Array.isArray(nextCursor)) {
+    return nextCursor.length <= limits.max_cumulative_bytes;
+  }
+  return (
+    typeof nextCursor === "string" &&
+    new TextEncoder().encode(nextCursor).byteLength <= limits.max_cumulative_bytes
   );
 }
 
@@ -571,6 +650,7 @@ export class ConnectBrowserTransport {
   private negotiatedLimits: ConnectEnvelopeLimits | null = null;
   private helloAccepted = false;
   private resyncInFlight = false;
+  private resyncRequestId: string | null = null;
   private stopped = false;
   private reconnectTimer: ReturnType<typeof globalThis.setTimeout> | null = null;
   private reconnectDelayMs = CONNECT_RECONNECT_MIN_MS;
@@ -653,6 +733,7 @@ export class ConnectBrowserTransport {
     this.rejectPendingRequests("Connect transport stopped");
     this.helloAccepted = false;
     this.resyncInFlight = false;
+    this.resyncRequestId = null;
     this.setState({ kind: "closed", reason: "Connect transport stopped" });
   }
 
@@ -663,12 +744,15 @@ export class ConnectBrowserTransport {
     }
     if (this.resyncInFlight) return true;
     this.setState({ kind: "resyncing" });
+    const requestId = uuidV7();
+    this.resyncRequestId = requestId;
     const sent = this.sendEnvelope(CONNECT_RESYNC_KIND, {
       channel_sequence: this.inboundSequence,
       newest_sequence: this.inboundSequence,
       reason,
-    });
+    }, { requestId });
     this.resyncInFlight = sent;
+    if (!sent) this.resyncRequestId = null;
     return sent;
   }
 
@@ -762,6 +846,7 @@ export class ConnectBrowserTransport {
     this.negotiatedLimits = null;
     this.helloAccepted = false;
     this.resyncInFlight = false;
+    this.resyncRequestId = null;
     socket.binaryType = "arraybuffer";
     this.setState({ kind: "connecting" });
     socket.onopen = () => {
@@ -781,6 +866,7 @@ export class ConnectBrowserTransport {
       this.helloAccepted = false;
       this.negotiatedLimits = null;
       this.resyncInFlight = false;
+      this.resyncRequestId = null;
       this.rejectPendingRequests("Connect socket closed");
       if (!this.stopped) this.scheduleReconnect();
     };
@@ -1037,13 +1123,30 @@ export class ConnectBrowserTransport {
       throw new Error("Connect negotiated limits changed");
     }
     if (envelope.sequence <= this.inboundSequence) return;
+    const isResyncSnapshotFrame =
+      this.stateValue.kind === "resyncing" &&
+      this.resyncInFlight &&
+      envelope.payloadKind === CONNECT_QUERY_REPLY_KIND &&
+      envelope.requestId !== null &&
+      envelope.requestId === this.resyncRequestId &&
+      envelope.operationId === null &&
+      envelope.payloadVersion === 1 &&
+      envelope.privacyClass === "local_only";
+    if (this.stateValue.kind === "resyncing" && !isResyncSnapshotFrame) {
+      // Resync is an authoritative snapshot boundary. Do not deliver a frame
+      // from the old stream, even when it happens to be the next sequence.
+      // A query reply from another request is never a resync completion.
+      this.requestResync("gap");
+      return;
+    }
     if (
       envelope.sequence > this.inboundSequence + 1 &&
-      envelope.payloadKind !== CONNECT_RESYNC_KIND
+      !isResyncSnapshotFrame
     ) {
       // Do not decode, advance, or deliver a frame beyond the first missing
-      // sequence. The resync response is the only legal way to close this
-      // gap, and completion is handled explicitly below.
+      // sequence. The authenticated bounded snapshot response is the only
+      // legal way to close this gap, and completion is handled explicitly
+      // below.
       this.requestResync("gap");
       return;
     }
@@ -1081,28 +1184,17 @@ export class ConnectBrowserTransport {
       this.helloAccepted = true;
       this.inboundSequence = envelope.sequence;
       this.setState({ kind: "ready" });
-    } else if (envelope.payloadKind === CONNECT_RESYNC_KIND) {
-      if (this.stateValue.kind !== "resyncing" || !this.resyncInFlight) {
-        throw new Error("unexpected Connect resync completion");
+    } else if (isResyncSnapshotFrame) {
+      if (!isBoundedResyncSnapshot(payload, envelope.requestId, limits)) {
+        throw new Error("Connect resync snapshot rejected");
       }
-      if (typeof payload !== "object" || payload === null) {
-        throw new Error("Connect resync completion rejected");
-      }
-      const resync = payload as Record<string, unknown>;
-      const channelSequence = resync.channel_sequence;
-      const newestSequence = resync.newest_sequence;
-      if (
-        typeof channelSequence !== "number" ||
-        !Number.isSafeInteger(channelSequence) ||
-        typeof newestSequence !== "number" ||
-        !Number.isSafeInteger(newestSequence) ||
-        channelSequence < this.inboundSequence ||
-        newestSequence < channelSequence
-      ) {
-        throw new Error("Connect resync completion rejected");
-      }
-      this.inboundSequence = Math.max(envelope.sequence, channelSequence);
+      // The snapshot is authoritative for the missing interval. Its
+      // through_sequence belongs to the host snapshot journal, not this
+      // Connect channel, so only the authenticated envelope sequence advances
+      // the channel cursor.
+      this.inboundSequence = envelope.sequence;
       this.resyncInFlight = false;
+      this.resyncRequestId = null;
       this.setState({ kind: "ready" });
     } else {
       if (envelope.sequence !== this.inboundSequence + 1) {
@@ -1157,6 +1249,7 @@ export class ConnectBrowserTransport {
     this.helloAccepted = false;
     this.negotiatedLimits = null;
     this.resyncInFlight = false;
+    this.resyncRequestId = null;
     this.rejectPendingRequests("Connect protocol rejected");
     try {
       socket?.close();
