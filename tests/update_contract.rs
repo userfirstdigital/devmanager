@@ -20,7 +20,7 @@ use devmanager::updater::{
     capture_preservation_checkpoint, classify_user_state_path,
     clear_update_handoff_recovery_marker, evaluate_release_candidate, extract_build_version,
     inspect_atomic_installer_payload_dir, is_remote_version_newer, package_identity_for_version,
-    packager_architecture_target, packager_os_target, parse_release_manifest, parse_semver,
+    packager_architecture_target, packager_os_target, parse_release_manifest,
     persist_update_handoff_recovery_marker, prefer_signed_manifest_over_stale_cache,
     read_update_handoff_recovery_marker, resolve_running_package_identity, update_state_policy,
     validate_preservation_checkpoint, verify_downloaded_artifact_sha256, ActiveUpdateResource,
@@ -106,10 +106,8 @@ fn prerelease_and_build_metadata_ordering_matches_one_semver_impl() {
     let file: CaseFile =
         serde_json::from_str(&read_fixture("prerelease-ordering.json")).expect("cases");
     for case in file.cases {
-        let current = parse_semver(&case.current).expect("current");
-        let remote = parse_semver(&case.remote).expect("remote");
         assert_eq!(
-            is_remote_version_newer(&current, &remote),
+            is_remote_version_newer(&case.current, &case.remote).expect("compare versions"),
             case.newer,
             "{} vs {}",
             case.current,
@@ -216,10 +214,8 @@ fn updater_check_path_applies_cache_busting_to_packager_endpoints() {
         "UpdaterService check path must mutate endpoint URLs: {url}"
     );
     for (key, expected) in &fixture.required_request_headers {
-        let found = policy
-            .header_pairs()
-            .iter()
-            .find(|(name, _)| *name == key.as_str());
+        let header_pairs = policy.header_pairs();
+        let found = header_pairs.iter().find(|(name, _)| *name == key.as_str());
         assert_eq!(found.map(|(_, value)| *value), Some(expected.as_str()));
     }
 }
