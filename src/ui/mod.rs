@@ -6,8 +6,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use gpui::{App, Global};
 
+pub mod actions;
 pub mod components;
 pub mod preview;
+pub mod task_cockpit;
 pub mod tokens;
 
 pub use preview::PreviewInitReport;
@@ -25,6 +27,7 @@ impl Global for ComponentInitialized {}
 pub fn init(cx: &mut App) {
     if cx.try_global::<ComponentInitialized>().is_none() {
         gpui_component::init(cx);
+        actions::register(cx);
         cx.set_global(ComponentInitialized);
         COMPONENT_INIT_COUNT.fetch_add(1, Ordering::SeqCst);
     }

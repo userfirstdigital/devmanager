@@ -541,3 +541,120 @@ fn error_label_redaction_normalizes_key_separators_without_redacting_unrelated_p
     }
     assert!(rendered.contains("The AccessKeyId field is documented here."));
 }
+
+#[test]
+fn dock_tabs_are_named_keyboard_reachable_and_do_not_trap_focus() {
+    use devmanager::client::model::ClientModelBuilder;
+    use devmanager::domain::{
+        AgentRole, AgentSessionFacts, AgentSessionLifecycle, EnvironmentId, OwnerKind, ProjectId,
+        RequestId, ResourceFacts, ResourceKind, ResourceLifecycle, ResourceRecipe, ReviewReadiness,
+        SnapshotId, SnapshotItem, SnapshotPage, SnapshotSection, TaskActivity, TaskAssignment,
+        TaskAttention, TaskConnectivity, TaskFacts, TaskLifecycle, TaskSnapshotItem, WorkspaceRef,
+    };
+    use devmanager::ui::components::interaction::{AccessibleRole, KeyboardKey};
+    use devmanager::ui::task_cockpit::dock::{ContextDock, DockEdge, DockShortcut, DockTool};
+    use devmanager::ui::task_cockpit::shell::TaskCockpitShell;
+
+    let uuid = |tail: u8| {
+        [
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, tail,
+        ]
+    };
+    let task_id = devmanager::domain::TaskId::from_bytes(uuid(0xd1)).expect("task");
+    let agent_id = devmanager::domain::AgentSessionId::from_bytes(uuid(0xd1)).expect("agent");
+    let resource_id = devmanager::domain::ResourceId::from_bytes(uuid(0xd1)).expect("resource");
+    let snap = SnapshotId::from_bytes(uuid(0x10)).expect("snapshot");
+    let page = |section, items| SnapshotPage {
+        snapshot_id: snap,
+        through_sequence: 1,
+        section,
+        after_item: None,
+        items,
+        encoded_bytes: 1,
+        next_cursor: None,
+    };
+    let mut builder = ClientModelBuilder::new();
+    builder
+        .ingest_page(page(
+            SnapshotSection::Tasks,
+            vec![SnapshotItem::Task(TaskSnapshotItem {
+                task: TaskFacts {
+                    id: task_id,
+                    environment_id: EnvironmentId::from_bytes(uuid(0x01)).expect("env"),
+                    title: "A11y dock".into(),
+                    description: None,
+                    project_id: ProjectId::from_bytes(uuid(0x02)).expect("project"),
+                    workspace: WorkspaceRef::Main,
+                    assignment: TaskAssignment::LocalOwner,
+                    lifecycle: TaskLifecycle::Open,
+                    action_epoch: 0,
+                    revision: 1,
+                    created_at_ms: 1,
+                },
+                connectivity: TaskConnectivity::Connected,
+                attention: TaskAttention::None,
+                activity: TaskActivity::Idle,
+                review_readiness: ReviewReadiness::NotReady,
+                primary_agent_id: Some(agent_id),
+            })],
+        ))
+        .expect("tasks");
+    builder
+        .ingest_page(page(
+            SnapshotSection::AgentSessions,
+            vec![SnapshotItem::AgentSession(AgentSessionFacts {
+                id: agent_id,
+                task_id,
+                role: AgentRole::Primary,
+                provider_kind: "claude".into(),
+                provider_session_id: None,
+                lifecycle: AgentSessionLifecycle::Open,
+                runtime_generation: 1,
+                revision: 0,
+            })],
+        ))
+        .expect("agents");
+    builder
+        .ingest_page(page(SnapshotSection::Artifacts, Vec::new()))
+        .expect("artifacts");
+    builder
+        .ingest_page(page(
+            SnapshotSection::Resources,
+            vec![SnapshotItem::Resource(ResourceFacts {
+                id: resource_id,
+                task_id: Some(task_id),
+                owner_kind: OwnerKind::Task,
+                resource_kind: ResourceKind::Terminal,
+                recipe: ResourceRecipe::Terminal { cols: 40, rows: 8 },
+                lifecycle: ResourceLifecycle::Active,
+                runtime_generation: 1,
+                updated_at_ms: 1,
+            })],
+        ))
+        .expect("resources");
+    builder
+        .ingest_page(page(SnapshotSection::Operations, Vec::new()))
+        .expect("operations");
+    let model = builder.finish().expect("client model");
+
+    let shell = TaskCockpitShell::new(DockEdge::Right);
+    let _mounted = shell.dock();
+    let mut dock = ContextDock::new(DockEdge::Right);
+    dock.follow_task(task_id);
+    let chrome = dock.chrome();
+    assert_eq!(chrome.tabs.len(), 7);
+    assert_eq!(chrome.tab_list.role, AccessibleRole::TabList);
+    for (index, tab) in chrome.tabs.iter().enumerate() {
+        assert_eq!(tab.accessibility.role, AccessibleRole::Tab);
+        assert!(!tab.accessibility.name.is_empty());
+        assert_eq!(tab.shortcut, DockShortcut::AltTool((index + 1) as u8));
+    }
+    dock.focus_tab_index(0);
+    dock.handle_key(KeyboardKey::Tab);
+    assert_eq!(dock.focused_tab_index(), Some(1));
+    dock.dispatch_shortcut(DockShortcut::Escape, RequestId::new(), &model)
+        .expect("escape");
+    assert_eq!(dock.focused_tab_index(), None);
+    assert_eq!(dock.active_tool(), DockTool::Files);
+}
