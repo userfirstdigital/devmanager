@@ -8,9 +8,8 @@ use devmanager::domain::task::{
 use devmanager::ui::actions::{KeyboardShortcut, ShortcutKey};
 use devmanager::ui::components::{ActionRequest, ActivationSource};
 use devmanager::ui::native_shell::{
-    headless_render_smoke, isolated_dev_profile, AccessibilityTree, NativeHeaderAttachment,
-    NativeHostLaunchSpec, NativeHostState, NativeInteraction, NativeShell, NativeShellError,
-    TerminalDockState,
+    isolated_dev_profile, AccessibilityTree, NativeHeaderAttachment, NativeHostState,
+    NativeInteraction, NativeShell, NativeShellError, TerminalDockState,
 };
 use devmanager::ui::shell::{NavigationResult, PointerButton, TerminalPressRejection};
 use devmanager::ui::task_cockpit::inbox::MAX_TASK_SOURCE_IDS;
@@ -180,36 +179,65 @@ fn native_semantic_tree_and_virtual_rows_are_bounded() {
         .contains("src/terminal/view.rs::render_terminal_surface"));
 }
 
-#[test]
-fn native_headless_render_smoke_constructs_the_real_gpui_shell() {
-    let workspace = tempdir().expect("workspace tempdir");
-    let report = headless_render_smoke(workspace.path()).expect("headless native shell render");
-
-    assert!(report.root_constructed);
-    assert!(report.semantic_nodes > 0);
-    assert!(report.rendered_task_rows <= 104);
-    assert_eq!(report.host_profile, report.profile_root);
-    assert_eq!(report.host_state, NativeHostState::Disconnected);
-    assert!(report
-        .gpui_accessibility_nodes
-        .iter()
-        .any(|node| node.element_id == "native-shell-root" && node.focusable));
-    assert!(report
-        .gpui_accessibility_nodes
-        .iter()
-        .any(|node| node.element_id == "native-task-inbox" && node.label == "Task inbox"));
+struct NativeGpuiSmokeReport {
+    root_constructed: bool,
+    semantic_nodes: usize,
+    rendered_task_rows: usize,
+    host_profile: std::path::PathBuf,
+    profile_root: std::path::PathBuf,
+    host_state: NativeHostState,
+    root_focusable: bool,
+    inbox_label: bool,
+    header_projection: bool,
+    model_sequence: Option<u64>,
+    model_rendered: usize,
+    preferences: RuntimePreferencesSnapshot,
+    platform_bridge: bool,
+    platform_nodes: usize,
+    platform_roles: Vec<accesskit::Role>,
+    platform_focus_is_root: bool,
 }
 
-#[test]
-fn native_shell_header_uses_typed_attachment_and_explicit_unavailable_state() {
+fn native_gpui_smoke_report() -> NativeGpuiSmokeReport {
     let workspace = tempdir().expect("workspace tempdir");
     let profile = isolated_dev_profile(workspace.path()).expect("isolated profile");
+    let model = Arc::new(model_with_tasks(&[task_id(21), task_id(22)]));
     let report_slot = std::rc::Rc::new(std::cell::RefCell::new(None));
     let report_slot_for_app = std::rc::Rc::clone(&report_slot);
     gpui::Application::headless().run(move |cx| {
         devmanager::ui::init(cx);
-        let entity = cx.new(|cx| NativeShell::new_for_headless(profile, cx));
-        let result = entity.update(cx, |shell, _cx| {
+        let first = cx.new(|cx| NativeShell::new_for_headless(profile.clone(), cx));
+        let first_report = first.update(cx, |shell, _cx| {
+            let _root = shell.element_without_handlers();
+            let platform_tree = shell.platform_accessibility_tree_for_test();
+            (
+                shell.accessibility_tree().nodes().len(),
+                shell.rendered_task_count(),
+                shell.host_connection().profile_root().to_path_buf(),
+                shell.profile().root().to_path_buf(),
+                shell.host_state().clone(),
+                shell
+                    .accessibility_tree()
+                    .gpui_nodes()
+                    .iter()
+                    .any(|node| node.element_id == "native-shell-root" && node.focusable),
+                shell.accessibility_tree().gpui_nodes().iter().any(|node| {
+                    node.element_id == "native-task-inbox" && node.label == "Task inbox"
+                }),
+                shell.platform_accessibility_available(),
+                shell.platform_accessibility_node_count(),
+                platform_tree
+                    .nodes
+                    .iter()
+                    .map(|(_, node)| node.role())
+                    .collect::<Vec<_>>(),
+                platform_tree.focus == accesskit::NodeId::from(0),
+            )
+        });
+        drop(first);
+
+        let header = cx.new(|cx| NativeShell::new_for_headless(profile.clone(), cx));
+        let header_projection = header.update(cx, |shell, _cx| {
             assert!(matches!(
                 shell.header_attachment(),
                 NativeHeaderAttachment::Unavailable { .. }
@@ -220,16 +248,88 @@ fn native_shell_header_uses_typed_attachment_and_explicit_unavailable_state() {
                 "Remote unavailable",
                 "Quota unavailable",
             ));
-            shell.header_attachment().clone()
+            matches!(
+                shell.header_attachment(),
+                NativeHeaderAttachment::Projection { .. }
+            )
         });
-        *report_slot_for_app.borrow_mut() = Some(result);
-        drop(entity);
+        drop(header);
+
+        let projected = cx.new(|cx| NativeShell::new_for_headless(profile.clone(), cx));
+        let model_report = projected.update(cx, |shell, _cx| {
+            shell
+                .apply_client_model(Arc::clone(&model))
+                .expect("client model projection");
+            (
+                shell
+                    .client_model_snapshot()
+                    .map(|model| model.last_applied_sequence()),
+                shell.rendered_task_count(),
+            )
+        });
+        drop(projected);
+
+        let preferences_shell = cx.new(|cx| NativeShell::new_for_headless(profile, cx));
+        let preferences = preferences_shell.update(cx, |shell, _cx| {
+            let next = RuntimePreferencesSnapshot::new(
+                ThemeMode::Light,
+                Density::Compact,
+                Scale::Scale150,
+            );
+            shell.queue_preferences_for_test(next);
+            shell.controller_tick_for_test(32);
+            shell.preferences()
+        });
+        drop(preferences_shell);
+
+        *report_slot_for_app.borrow_mut() = Some(NativeGpuiSmokeReport {
+            root_constructed: true,
+            semantic_nodes: first_report.0,
+            rendered_task_rows: first_report.1,
+            host_profile: first_report.2,
+            profile_root: first_report.3,
+            host_state: first_report.4,
+            root_focusable: first_report.5,
+            inbox_label: first_report.6,
+            header_projection,
+            model_sequence: model_report.0,
+            model_rendered: model_report.1,
+            preferences,
+            platform_bridge: first_report.7,
+            platform_nodes: first_report.8,
+            platform_roles: first_report.9,
+            platform_focus_is_root: first_report.10,
+        });
         cx.quit();
     });
-    assert!(matches!(
-        report_slot.borrow_mut().take().expect("header attachment"),
-        NativeHeaderAttachment::Projection { .. }
-    ));
+    report_slot
+        .borrow_mut()
+        .take()
+        .expect("native GPUI smoke report")
+}
+
+#[test]
+fn native_gpui_smokes_share_one_headless_lifetime_authority() {
+    let report = native_gpui_smoke_report();
+    assert!(report.root_constructed);
+    assert!(report.semantic_nodes > 0);
+    assert!(report.rendered_task_rows <= 104);
+    assert_eq!(report.host_profile, report.profile_root);
+    assert_eq!(report.host_state, NativeHostState::Disconnected);
+    assert!(report.root_focusable);
+    assert!(report.inbox_label);
+    assert!(report.header_projection);
+    assert_eq!(report.model_sequence, Some(7));
+    assert_eq!(report.model_rendered, 2);
+    assert_eq!(
+        report.preferences,
+        RuntimePreferencesSnapshot::new(ThemeMode::Light, Density::Compact, Scale::Scale150)
+    );
+    assert!(!report.platform_bridge);
+    assert!(report.platform_nodes >= report.semantic_nodes);
+    assert!(report.platform_roles.contains(&accesskit::Role::Region));
+    assert!(report.platform_roles.contains(&accesskit::Role::Status));
+    assert!(report.platform_focus_is_root);
 }
 
 #[test]
@@ -517,58 +617,31 @@ fn isolated_profile_exposes_one_explicit_native_host_client_config() {
     let profile = isolated_dev_profile(workspace.path()).expect("isolated profile");
     let config = profile.host_client_config();
 
-    assert_eq!(profile.named_profile(), "native-next-dev");
+    assert_ne!(profile.named_profile(), "native-next-dev");
+    assert!(profile.named_profile().starts_with("native-next-"));
     assert_eq!(config.named_profile, profile.named_profile());
     assert!(config.client_build.starts_with("devmanager-next/"));
 }
 
 #[test]
-fn native_host_launch_spec_is_explicitly_isolated_and_single_owner() {
+fn native_host_launch_is_pinned_and_has_no_path_fallback() {
     let workspace = tempdir().expect("workspace tempdir");
     let profile = isolated_dev_profile(workspace.path()).expect("isolated profile");
-    let spec = NativeHostLaunchSpec::for_profile(&profile, 42).expect("launch spec");
-
-    assert_eq!(spec.profile, "native-next-dev");
-    assert_eq!(spec.config_base, profile.root());
-    assert_eq!(spec.parent_pid, 42);
-    assert!(spec
-        .arguments()
-        .windows(2)
-        .any(|pair| pair == ["--profile", "native-next-dev"]));
-    assert!(!spec.arguments().iter().any(|arg| arg == "production"));
-}
-
-#[test]
-fn immutable_client_model_projection_drives_shell_rows_and_sequence() {
-    let workspace = tempdir().expect("workspace tempdir");
-    let profile = isolated_dev_profile(workspace.path()).expect("isolated profile");
-    let model = Arc::new(model_with_tasks(&[task_id(21), task_id(22)]));
-    let report_slot = std::rc::Rc::new(std::cell::RefCell::new(None));
-    let report_slot_for_app = std::rc::Rc::clone(&report_slot);
-    gpui::Application::headless().run(move |cx| {
-        devmanager::ui::init(cx);
-        let entity = cx.new(|cx| NativeShell::new_for_headless(profile, cx));
-        let result = entity.update(cx, |shell, _cx| {
-            shell
-                .apply_client_model(Arc::clone(&model))
-                .expect("client model projection");
-            (
-                shell
-                    .client_model_snapshot()
-                    .map(|model| model.last_applied_sequence()),
-                shell.rendered_task_count(),
-            )
-        });
-        *report_slot_for_app.borrow_mut() = Some(result);
-        drop(entity);
-        cx.quit();
-    });
-    let (sequence, rendered) = report_slot
-        .borrow_mut()
-        .take()
-        .expect("model projection report");
-    assert_eq!(sequence, Some(7));
-    assert_eq!(rendered, 2);
+    assert_eq!(
+        profile.host_client_config().named_profile,
+        profile.named_profile()
+    );
+    assert!(!profile
+        .host_connection()
+        .endpoint()
+        .contains("native-next-dev"));
+    let source = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/ui/native_shell.rs"
+    ))
+    .expect("native shell source");
+    assert!(source.contains("current_exe"));
+    assert!(!source.contains("PathBuf::from(if cfg!(windows)"));
 }
 
 #[test]
@@ -579,53 +652,6 @@ fn virtual_shell_uses_full_source_count_and_stable_task_keys() {
     assert!(task_list.rendered_task_ids().len() <= 104);
     assert_ne!(task_list.stable_key_for(0), task_list.stable_key_for(1));
     assert!(task_list.uses_gpui_uniform_list());
-}
-
-#[test]
-fn appearance_and_scale_preferences_are_applied_by_controller_not_paint() {
-    let workspace = tempdir().expect("workspace tempdir");
-    let profile = isolated_dev_profile(workspace.path()).expect("isolated profile");
-    let report_slot = std::rc::Rc::new(std::cell::RefCell::new(None));
-    let report_slot_for_app = std::rc::Rc::clone(&report_slot);
-    gpui::Application::headless().run(move |cx| {
-        devmanager::ui::init(cx);
-        let entity = cx.new(|cx| NativeShell::new_for_headless(profile, cx));
-        let result = entity.update(cx, |shell, _cx| {
-            let next = RuntimePreferencesSnapshot::new(
-                ThemeMode::Light,
-                Density::Compact,
-                Scale::Scale150,
-            );
-            shell.queue_preferences_for_test(next);
-            shell.controller_tick_for_test(32);
-            shell.preferences()
-        });
-        *report_slot_for_app.borrow_mut() = Some(result);
-        drop(entity);
-        cx.quit();
-    });
-    assert_eq!(
-        report_slot.borrow_mut().take().expect("preferences"),
-        RuntimePreferencesSnapshot::new(ThemeMode::Light, Density::Compact, Scale::Scale150)
-    );
-}
-
-#[test]
-fn platform_accessibility_bridge_reports_actual_window_tree_contract() {
-    let workspace = tempdir().expect("workspace tempdir");
-    let report = headless_render_smoke(workspace.path()).expect("headless native shell render");
-    // Headless GPUI has the same rendered AccessKit tree, but no OS window is
-    // attached. The bridge must not claim availability until the real window
-    // adapter is installed.
-    assert!(!report.platform_accessibility_bridge);
-    assert!(report.platform_accessibility_nodes >= report.semantic_nodes);
-    assert!(report
-        .platform_accessibility_roles
-        .contains(&accesskit::Role::Region));
-    assert!(report
-        .platform_accessibility_roles
-        .contains(&accesskit::Role::Status));
-    assert!(report.platform_accessibility_focus_is_root);
 }
 
 #[test]
