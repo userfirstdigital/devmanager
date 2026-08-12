@@ -6318,8 +6318,7 @@ impl NativeShell {
                 .into_any_element(),
             CockpitDockTool::Browser => self
                 .selected_browser_dock_model()
-                .map(|model| render_task_browser_dock(model, tokens))
-                .map(|element| element.into_any_element())
+                .map(|model| render_task_browser_dock(model, tokens).into_any_element())
                 .unwrap_or_else(|| self.workspace_dock_surface(CockpitDockTool::Browser, tokens)),
             CockpitDockTool::Services => self.services_dock_surface(tokens),
             tool => self.workspace_dock_surface(tool, tokens),
