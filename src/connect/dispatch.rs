@@ -43,10 +43,19 @@ const ORG_EXTENSION_TYPE: u16 = crate::protocol::organization_extension_type(
     crate::protocol::OrganizationExtensionKind::OrganizationPrompt,
 );
 
-/// Capabilities advertised on Connect Hello. Event replay / live durable
-/// subscription is omitted: [`HostRequestHandle::register_output`] is not a
-/// public host API, so this route must not pretend a second writer is live.
+/// Capabilities advertised on Connect Hello.
+///
+/// Event replay is advertised only while the one host request lane is bound.
+/// The query path then uses the host's existing bounded replay registry and
+/// journal; Connect never creates a second store. Live unsolicited delivery is
+/// intentionally not implied by this bit: it remains the host IPC output
+/// lane's responsibility and a reconnect/resync is required when that lane is
+/// unavailable.
 pub fn advertised_connect_capabilities() -> CapabilitySet {
+    advertised_connect_capabilities_for_host(bound_host_request_handle().is_some())
+}
+
+fn advertised_connect_capabilities_for_host(host_attached: bool) -> CapabilitySet {
     let mut capabilities = CapabilitySet::from_capabilities([
         Capability::ConnectEncryption,
         Capability::PagedSnapshots,
@@ -59,6 +68,10 @@ pub fn advertised_connect_capabilities() -> CapabilitySet {
         Capability::ExplicitDetach,
         Capability::ManagementMetadata,
     ]);
+    if host_attached {
+        capabilities =
+            CapabilitySet::from_bits(capabilities.bits() | Capability::EventReplay.bit());
+    }
     // Organization is advertised only while the host-owned runtime is
     // enrolled and enabled. A standalone process must not imply a second
     // organization store or a usable organization request lane.
@@ -304,7 +317,7 @@ impl ConnectDispatchSession {
         }
 
         match payload {
-            ConnectPayload::Hello(hello) => self.accept_hello(envelope, hello),
+            ConnectPayload::Hello(hello) => self.accept_hello(envelope, hello, host.is_some()),
             payload if self.negotiated.is_none() => {
                 let _ = payload;
                 Err(DispatchFailure::fatal(
@@ -423,6 +436,7 @@ impl ConnectDispatchSession {
         &mut self,
         envelope: &ConnectEnvelope,
         hello: HelloPayload,
+        host_attached: bool,
     ) -> Result<ConnectPayload, DispatchFailure> {
         if self.negotiated.is_some() {
             return Err(DispatchFailure::fatal(
@@ -467,7 +481,8 @@ impl ConnectDispatchSession {
             .map_err(|_| {
                 DispatchFailure::fatal(CONNECT_ERROR_PROTOCOL, "Hello limits cannot be negotiated")
             })?;
-        let capabilities = advertised_connect_capabilities().intersection(hello.capabilities);
+        let capabilities = advertised_connect_capabilities_for_host(host_attached)
+            .intersection(hello.capabilities);
         let client_id = hello.client_id.unwrap_or_else(ClientId::new);
         self.binding = Some(binding);
         self.last_recv_sequence = envelope.sequence;

@@ -13,7 +13,7 @@ use devmanager::domain::query::{Query, QueryEnvelope, QueryOutcome, QueryReply, 
 use devmanager::domain::snapshot::SnapshotSection;
 use devmanager::host::HostRequestExecutor;
 use devmanager::kernel::CommandBus;
-use devmanager::protocol::Capability;
+use devmanager::protocol::{Capability, CapabilitySet};
 
 fn binding() -> ChannelBinding {
     ChannelBinding::new(ConnectionId::new(), SessionId::new(), ChannelId::new())
@@ -119,6 +119,68 @@ async fn connect_query_and_command_reach_existing_host_request_handle() {
         panic!("expected CommandReceipt {reply:?}");
     };
     assert_eq!(receipt.command_id(), command_id);
+    drop(handle);
+    executor.abort();
+    let _ = executor.await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn connected_host_advertises_and_serves_bounded_event_replay() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let bus = CommandBus::open(&directory.path().join("e2e-connect-event-replay.db")).expect("bus");
+    let (handle, executor) = HostRequestExecutor::start(bus);
+    let slot = ConnectHostRequestSlot::new();
+    slot.attach(handle.clone());
+    let host = slot.get();
+    let binding = binding();
+    let mut session = ConnectDispatchSession::bind_paired(
+        "web-paired".to_owned(),
+        ConnectIdentityLiveState::Live,
+    );
+    let requested = CapabilitySet::from_bits(
+        advertised_connect_capabilities().bits() | Capability::EventReplay.bit(),
+    );
+    let hello_payload = ConnectPayload::Hello(HelloPayload {
+        capabilities: requested,
+        limits: ConnectLimits::v1_default(),
+        privacy_class: ConnectPrivacyClass::LocalOnly,
+        relay_url: None,
+        capability_grant: None,
+        client_id: None,
+    });
+    let hello_envelope = envelope(binding, 1, None, hello_payload.clone());
+    let (reply, disposition) = session
+        .handle_payload(&hello_envelope, hello_payload, host.as_deref())
+        .await;
+    assert_eq!(disposition, ConnectSessionDisposition::Continue);
+    let ConnectPayload::Hello(hello) = reply else {
+        panic!("expected Hello reply");
+    };
+    assert!(hello.capabilities.contains(Capability::EventReplay));
+    let client_id = hello.client_id.expect("assigned client id");
+
+    let request_id = RequestId::new();
+    let query = ConnectPayload::Query(QueryEnvelope {
+        request_id,
+        client_id,
+        task_id: None,
+        query: Query::OpenEventReplay { after_sequence: 0 },
+    });
+    let query_envelope = envelope(binding, 2, Some(request_id), query.clone());
+    let (reply, disposition) = session
+        .handle_payload(&query_envelope, query, host.as_deref())
+        .await;
+    assert_eq!(disposition, ConnectSessionDisposition::Continue);
+    let ConnectPayload::QueryReply(reply) = reply else {
+        panic!("expected replay QueryReply");
+    };
+    assert!(matches!(
+        reply.outcome,
+        QueryOutcome::Ok(QueryResult::EventReplayPage { page, .. })
+            if page.after_sequence == 0
+    ));
+
+    drop(host);
     drop(handle);
     executor.abort();
     let _ = executor.await;
