@@ -1,21 +1,38 @@
 # Replacement Deletion Ledger
 
-This ledger is the dependency-safe Phase 11.1 cutover contract. The fenced JSON
-document is canonical and is consumed by
+This ledger is the dependency-safe Phase 11.1 source-level rip-and-replace
+cutover contract. The fenced JSON document is canonical and is consumed by
 `scripts/native-next/Invoke-CutoverAudit.ps1` and `tests/cutover_contract.rs`.
+This is a deletion cutover, not a permanent dual-UI or compatibility layer:
+one GPUI desktop entry (`src/main.rs`) plus one durable host
+(`src/bin/devmanager-host.rs`) are the only product processes after approval.
+Final semantics: sole `devmanager` GPUI entry; durable `devmanager-host`
+attach/detach/full quit; no `devmanager-next` binary; no backward-compatibility
+shell; production profile only on the signed release path; atomic two-binary
+updater/package identity; and explicit manual publication approval.
+
 Every row remains `HOLD` until its prerequisite phase/gates and evidence are
 actually green. Declared tests, E2E proof, and production impact are included only when an
 exact tracked binding exists. Missing or unverified fields stay HOLD blockers.
 No row may claim assumed, partial, or compile-only evidence.
-`READY` means the replacement is approved for the deletion slice; `DELETED`
-additionally requires the legacy path and the full deletion set to be absent.
-This foundation makes no deletion claim.
+`HOLD` may describe a still-present legacy path or one that was already ripped
+while references, packaging handoff files, or approval remain. `READY` means
+the replacement is approved for the deletion or handoff slice. `DELETED` is
+valid only for `cutoverAction: delete` rows whose legacy path and the full
+deletion set are absent. Handoff rows never become `DELETED`; they become
+`READY` when required binaries, packager tokens, and update files exist and
+their prerequisites are green. This foundation makes no deletion, install,
+publish, or user-data claim.
 
 The audit uses `git ls-files` as the tracked universe. Candidate mode uses a
 bounded internal fixed-string scanner; fixture mode may use a PATH-confined `rg`
-shim after fixture authority. Only this ledger is an allowed self-reference. An
-exact `session.json` file is path-only evidence and is never opened or hashed by
-the audit.
+shim after fixture authority. Only this ledger is an allowed self-reference.
+Intentional historical references are allowlisted in
+`referencePolicy.intentionalHistoricalReferencePaths`. An exact `session.json`
+file is path-only evidence and is never opened or hashed by the audit. The
+audit remaps `%APPDATA%` beneath the worktree evidence root, does not set
+`DEVMANAGER_PROFILE`, and never observes or mutates the installed DevManager
+process or production `config.json` / `remote.json`.
 
 ```json cutover-contract
 {
@@ -36,7 +53,86 @@ the audit.
     "protectedFileBasenames": [
       "session.json"
     ],
-    "maxMatchesPerRow": 20
+    "maxMatchesPerRow": 20,
+    "intentionalHistoricalReferencePaths": [
+      "docs/replacement-deletion-ledger.md",
+      "docs/superpowers/plans/2026-08-04-phase-11-cutover-release.md",
+      "tests/cutover_contract.rs",
+      "scripts/native-next/Invoke-CutoverAudit.ps1",
+      "scripts/native-next/NativeNext.ps1",
+      "scripts/native-next/Isolation.ps1"
+    ]
+  },
+  "productEntrypoints": {
+    "desktopClient": {
+      "id": "gpui-desktop-client",
+      "path": "src/main.rs",
+      "symbol": "main",
+      "role": "gpui-client",
+      "forbiddenDispatch": [
+        "devmanager::app::run"
+      ]
+    },
+    "durableHost": {
+      "id": "durable-host",
+      "path": "src/bin/devmanager-host.rs",
+      "symbol": "main",
+      "role": "durable-host",
+      "lifecycle": [
+        "attach",
+        "detach",
+        "full-quit"
+      ]
+    }
+  },
+  "compatibilityPolicy": {
+    "permanentDualUi": false,
+    "backwardCompatibilityMode": false,
+    "forbiddenRuntimeSwitches": [
+      "new_ui",
+      "use_old",
+      "old_runtime",
+      "compatibility_mode"
+    ],
+    "scanPaths": [
+      "src",
+      "Cargo.toml"
+    ]
+  },
+  "packagingHandoff": {
+    "requiredBinaries": [
+      "devmanager.exe",
+      "devmanager-host.exe"
+    ],
+    "atomicTwoBinaryIdentity": true,
+    "packagerManifest": "Cargo.toml",
+    "requiredManifestTokens": [
+      "devmanager-host"
+    ],
+    "requiredFiles": [
+      "src/updater/handoff.rs",
+      "src/host/update.rs",
+      "tests/update_contract.rs",
+      "tests/package_contract.rs"
+    ],
+    "forbidInstallOrPublish": true
+  },
+  "profileIsolation": {
+    "productionRootName": "com.userfirst.devmanager",
+    "evidenceRoot": ".devmanager-next/evidence",
+    "forbidSettingDevmanagerProfile": true,
+    "remapAppData": true,
+    "productionProfileOnlyInSignedRelease": true
+  },
+  "installedAppPolicy": {
+    "touchInstalledApp": false,
+    "hashProductionFiles": false,
+    "openSessionJson": false,
+    "installPublishDeleteUserData": false
+  },
+  "publicationPolicy": {
+    "requireExplicitManualApproval": true,
+    "forbidAutomatedPublish": true
   },
   "prerequisiteNodes": [
     {
@@ -1011,8 +1107,9 @@ the audit.
       "approvalRequirement": "Archive deletion is allowed only after release-candidate evidence and explicit approval"
     },
     {
-      "id": "legacy-updater-module",
+      "id": "handoff-updater-module",
       "area": "update-metadata-and-handoff",
+      "cutoverAction": "handoff",
       "legacy": {
         "path": "src/updater/mod.rs",
         "symbols": [
@@ -1023,31 +1120,29 @@ the audit.
         "tokens": []
       },
       "replacementOwner": {
-        "path": "src/client/cli.rs",
-        "symbol": "UpdateCommand"
+        "path": "src/updater/handoff.rs",
+        "symbol": "UpdateHandoff"
       },
       "prerequisites": [
         "gate-release-candidate"
       ],
       "evidence": {
         "commands": [
-          "cargo test --test updater -- --nocapture",
-          "pwsh scripts/native-next/Invoke-CutoverAudit.ps1 -Mode Parity"
+          "cargo test --test cutover_contract entry_ -- --nocapture",
+          "cargo test --test update_contract -- --nocapture"
         ],
         "artifacts": [
           ".devmanager-next/evidence/phase-11/release-candidate.json"
         ]
       },
-      "deletionSet": [
-        "src/updater/mod.rs"
-      ],
       "status": "HOLD",
       "approvalRequired": true,
-      "approvalRequirement": "Signed metadata, client/host identity, rollback, and update matrix approval"
+      "approvalRequirement": "Signed metadata, matching client/host identity, rollback, and update matrix approval. This module is completed in place; it is not deleted."
     },
     {
-      "id": "legacy-updater-tests",
+      "id": "handoff-update-contract",
       "area": "update-contract-evidence",
+      "cutoverAction": "handoff",
       "legacy": {
         "path": "tests/updater.rs",
         "symbols": [
@@ -1058,33 +1153,37 @@ the audit.
         "tokens": []
       },
       "replacementOwner": {
-        "path": "tests/fixtures/latest.json",
-        "symbol": "latest fixture"
+        "path": "tests/update_contract.rs",
+        "symbol": "update_contract"
       },
       "prerequisites": [
         "gate-release-candidate"
       ],
       "evidence": {
         "commands": [
-          "cargo test --test updater -- --nocapture",
-          "rg -n -F latest.json src tests web --glob !docs/replacement-deletion-ledger.md"
+          "cargo test --test update_contract -- --nocapture",
+          "cargo test --test package_contract -- --nocapture"
         ],
         "artifacts": [
           ".devmanager-next/evidence/phase-11/release-candidate.json"
         ]
       },
-      "deletionSet": [
-        "tests/updater.rs"
-      ],
       "status": "HOLD",
       "approvalRequired": true,
-      "approvalRequirement": "Update-contract replacement evidence and explicit approval"
+      "approvalRequirement": "Update-contract and package-contract evidence plus explicit approval. Do not install, publish, or delete user data from this phase."
     }
   ]
 }
 ```
 
-Current state: `HOLD`. The repository intentionally still contains the
-legacy paths, references, development documentation, and unproven evidence
-artifacts. A nonzero audit result is therefore the honest result until earlier
-phase gates and the explicit Phase 11 approval exist.
+Current state: `HOLD`. Final product entry is sole GPUI `src/main.rs` plus
+durable `devmanager-host` attach/detach/full quit; `devmanager-next` must not
+return as a binary or compatibility shell. `src/main.rs` may still dispatch
+`devmanager::app::run()` today, and that remains a forbidden-dispatch finding
+until replaced. Packaging/update handoff files (`src/updater/handoff.rs`,
+`tests/update_contract.rs`, `tests/package_contract.rs`) and signed release
+production-profile proof are still missing. Remaining integrated prerequisites
+are every phase-01 through phase-10 node plus `gate-phase11-approval` and
+`gate-release-candidate`. A nonzero audit result is the honest result until
+those gates, handoff files, and explicit manual Phase 11 approval exist. This
+contract does not install, publish, or delete user data.

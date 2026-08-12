@@ -26,6 +26,9 @@ function Get-NativeNextValidationPlan {
     $worktreeRoot = Get-DevManagerNativeNextWorktreeRoot -ScriptRoot $ScriptRoot
     $buildTargetDir = [System.IO.Path]::GetFullPath((Join-Path $worktreeRoot 'target-native-next'))
     $liveDir = [System.IO.Path]::GetFullPath((Join-Path $worktreeRoot 'target-live-native-next'))
+    # `.devmanager-next` remains the intentional historical evidence/runtime root
+    # name; it is not a product binary identity. Desktop live identity is sole
+    # `devmanager.exe` plus durable `devmanager-host.exe`.
     $runtimeDir = [System.IO.Path]::GetFullPath((Join-Path $worktreeRoot '.devmanager-next'))
     $runtimeJson = [System.IO.Path]::GetFullPath((Join-Path $runtimeDir 'runtime.json'))
     $evidenceRoot = Get-DevManagerNativeNextEvidenceRoot -ScriptRoot $ScriptRoot
@@ -38,7 +41,7 @@ function Get-NativeNextValidationPlan {
         runtimeJson    = $runtimeJson
         evidenceRoot   = $evidenceRoot
         hostLiveExe    = [System.IO.Path]::GetFullPath((Join-Path $liveDir 'devmanager-host.exe'))
-        desktopLiveExe = [System.IO.Path]::GetFullPath((Join-Path $liveDir 'devmanager-next.exe'))
+        desktopLiveExe = [System.IO.Path]::GetFullPath((Join-Path $liveDir 'devmanager.exe'))
         profile        = $script:NativeNextProfile
         instanceLabel  = $script:NativeNextInstanceLabel
         runtimeKind    = $script:NativeNextRuntimeKind
