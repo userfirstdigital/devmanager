@@ -14,6 +14,7 @@ use crate::domain::snapshot::{
 };
 use crate::kernel::command_bus;
 use crate::kernel::store::{load_event_log_bounds, KernelStore, StoreError};
+use crate::kernel::SessionScope;
 
 const SNAPSHOT_CURSOR_VERSION: u16 = 1;
 const SNAPSHOT_CURSOR_DOMAIN: &[u8] = b"devmanager:snapshot-cursor:v1\0";
@@ -96,6 +97,7 @@ struct SnapshotCursorDocument {
     section: SnapshotSection,
     last_item: SnapshotItemKey,
     limits: PageLimits,
+    scope: SessionScope,
 }
 
 /// One immutable, read-only SQLite view of the durable kernel projections.
@@ -106,6 +108,7 @@ pub(crate) struct SnapshotSession {
     snapshot_id: SnapshotId,
     through_sequence: u64,
     limits: PageLimits,
+    scope: SessionScope,
     cursor_hmac_key: Zeroizing<[u8; 32]>,
     conn: Connection,
 }
@@ -126,6 +129,14 @@ impl KernelStore {
         &self,
         limits: PageLimits,
     ) -> Result<SnapshotSession, SnapshotError> {
+        self.begin_snapshot_scoped(limits, SessionScope::GLOBAL)
+    }
+
+    pub(crate) fn begin_snapshot_scoped(
+        &self,
+        limits: PageLimits,
+        scope: SessionScope,
+    ) -> Result<SnapshotSession, SnapshotError> {
         limits.validate()?;
         let mut cursor_hmac_key = Zeroizing::new([0u8; 32]);
         getrandom::fill(cursor_hmac_key.as_mut()).map_err(|_| SnapshotError::EntropyUnavailable)?;
@@ -138,6 +149,7 @@ impl KernelStore {
             snapshot_id: SnapshotId::new(),
             through_sequence,
             limits,
+            scope,
             cursor_hmac_key,
             conn,
         })
@@ -147,6 +159,10 @@ impl KernelStore {
 impl SnapshotSession {
     pub(crate) fn snapshot_id(&self) -> SnapshotId {
         self.snapshot_id
+    }
+
+    pub(crate) fn scope(&self) -> SessionScope {
+        self.scope
     }
 
     /// Read one bounded section page from the view pinned by `begin_snapshot`.
@@ -404,6 +420,7 @@ impl SnapshotSession {
             section,
             last_item,
             limits: self.limits,
+            scope: self.scope,
         };
         let payload =
             rmp_serde::to_vec_named(&document).map_err(|error| StoreError::CodecMismatch {
@@ -448,6 +465,7 @@ impl SnapshotSession {
             || document.through_sequence != self.through_sequence
             || document.section != requested_section
             || document.limits != self.limits
+            || document.scope != self.scope
         {
             return Err(SnapshotError::CursorContextMismatch);
         }
@@ -754,6 +772,7 @@ mod tests {
         WorkspaceRef,
     };
     use crate::kernel::dispatch::DispatchCompletion;
+    use uuid::Uuid;
 
     fn fixed_uuid_v7(tail: u8) -> [u8; 16] {
         [
@@ -820,7 +839,7 @@ mod tests {
             review_readiness: ReviewReadiness::NotReady,
         };
         match store
-            .execute(envelope(
+            .execute_for_test(envelope(
                 command_id,
                 None,
                 None,
@@ -1100,6 +1119,71 @@ mod tests {
             snapshot.page(SnapshotSection::AgentSessions, Some(&cursor)),
             Err(SnapshotError::CursorContextMismatch)
         );
+    }
+
+    #[test]
+    fn scoped_snapshot_cursor_rejects_cross_scope_replay() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("kernel.sqlite3");
+        let mut store = KernelStore::open(&path).expect("open");
+        create_task(&mut store, task_id(0xE1), command_id(0xE2));
+        create_task(&mut store, task_id(0xE3), command_id(0xE4));
+
+        let limits = PageLimits::new(1, 512 * 1024).expect("limits");
+        let scope = SessionScope {
+            client_id: Some(client_id(0xE5)),
+            task_id: Some(task_id(0xE6)),
+            connection_id: Some(Uuid::now_v7()),
+            action_epoch: Some(7),
+            runtime_generation: Some(11),
+        };
+        let first = store
+            .begin_snapshot_scoped(limits, scope)
+            .expect("scoped snapshot");
+        let cursor = first
+            .page(SnapshotSection::Tasks, None)
+            .expect("first page")
+            .next_cursor
+            .expect("resume cursor");
+
+        let other_scopes = [
+            SessionScope {
+                client_id: Some(ClientId::new()),
+                ..scope
+            },
+            SessionScope {
+                task_id: Some(TaskId::new()),
+                ..scope
+            },
+            SessionScope {
+                connection_id: Some(Uuid::now_v7()),
+                ..scope
+            },
+            SessionScope {
+                action_epoch: Some(scope.action_epoch.unwrap() + 1),
+                ..scope
+            },
+            SessionScope {
+                runtime_generation: Some(scope.runtime_generation.unwrap() + 1),
+                ..scope
+            },
+        ];
+        for other_scope in other_scopes {
+            let mut other = store
+                .begin_snapshot_scoped(limits, other_scope)
+                .expect("other scoped snapshot");
+            // Keep the other session's snapshot metadata and HMAC key equal to
+            // the original. The rejection below therefore proves the exact
+            // scope, rather than merely a different random session identity,
+            // fences this cursor.
+            other.snapshot_id = first.snapshot_id;
+            other.through_sequence = first.through_sequence;
+            other.cursor_hmac_key = first.cursor_hmac_key.clone();
+            assert_eq!(
+                other.page(SnapshotSection::Tasks, Some(&cursor)),
+                Err(SnapshotError::CursorContextMismatch)
+            );
+        }
     }
 
     #[test]

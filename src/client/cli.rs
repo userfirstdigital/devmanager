@@ -8,9 +8,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde_json::json;
 
 use super::action::{
-    self, task_create_command, task_rename_command, ActionArgumentSchema, ActionRisk, ActionScope,
-    TaskCreateArguments, TaskRenameArguments, ACTION_HOST_STATUS, ACTION_TASK_CREATE,
-    ACTION_TASK_LIST, ACTION_TASK_RENAME, ACTION_TASK_SHOW,
+    self, task_create_v2_command, task_rename_command, ActionArgumentSchema, ActionRisk,
+    ActionScope, TaskCreateV2Arguments, TaskRenameArguments, ACTION_HOST_STATUS,
+    ACTION_TASK_CREATE, ACTION_TASK_CREATE_V2, ACTION_TASK_LIST, ACTION_TASK_RENAME,
+    ACTION_TASK_SHOW,
 };
 use super::{HostClient, HostClientConfig};
 use crate::domain::command::{CommandEnvelope, CommandReceipt, RejectionCode};
@@ -458,6 +459,38 @@ fn argument_schema_json(schema: ActionArgumentSchema) -> serde_json::Value {
             },
             "required": ["task_id", "environment_id", "title", "project_id", "workspace"],
         }),
+        ActionArgumentSchema::TaskCreateV2 => json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "task_id": uuid(),
+                "environment_id": uuid(),
+                "title": { "type": "string", "minLength": 1 },
+                "description": { "type": ["string", "null"] },
+                "project_id": uuid(),
+                "workspace": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "choice": {
+                            "type": "string",
+                            "enum": ["main", "new_worktree", "ask", "external"]
+                        },
+                        "path": { "type": ["string", "null"] },
+                        "branch": { "type": ["string", "null"] },
+                        "external_confirmed": { "type": "boolean" }
+                    },
+                    "required": ["choice", "path", "branch", "external_confirmed"]
+                }
+            },
+            "required": [
+                "task_id",
+                "environment_id",
+                "title",
+                "project_id",
+                "workspace"
+            ],
+        }),
         ActionArgumentSchema::TaskRenameV1 => json!({
             "type": "object",
             "additionalProperties": false,
@@ -770,10 +803,10 @@ fn invoke_json_document(
     expected_task_revision: Option<u64>,
 ) -> Result<String, CliError> {
     match action_id {
-        ACTION_TASK_CREATE => {
+        ACTION_TASK_CREATE_V2 => {
             if expected_task_revision.is_some() {
                 return Err(CliError::new(
-                    "task.create requires expected-task-revision to be absent",
+                    "task creation requires expected-task-revision to be absent",
                 ));
             }
             #[cfg(not(windows))]
@@ -790,9 +823,12 @@ fn invoke_json_document(
                     .map_err(|error| {
                         CliError::new(format!("failed to build ctl runtime: {error}"))
                     })?;
-                runtime.block_on(task_create_invoke_async(profile, arguments_json))
+                runtime.block_on(task_create_invoke_async(profile, action_id, arguments_json))
             }
         }
+        ACTION_TASK_CREATE => Err(CliError::new(
+            "task.create is a frozen V1 codec and is not an advertised public action; use task.create.v2",
+        )),
         ACTION_TASK_RENAME => {
             let Some(expected_task_revision) = expected_task_revision else {
                 return Err(CliError::new("task.rename requires expected-task-revision"));
@@ -824,23 +860,31 @@ fn invoke_json_document(
 }
 
 #[cfg(windows)]
-async fn task_create_invoke_async(profile: &str, arguments_json: &str) -> Result<String, CliError> {
-    let args: TaskCreateArguments = serde_json::from_str(arguments_json)
-        .map_err(|error| CliError::new(format!("invalid task.create arguments JSON: {error}")))?;
+async fn task_create_invoke_async(
+    profile: &str,
+    action_id: &str,
+    arguments_json: &str,
+) -> Result<String, CliError> {
+    let args: TaskCreateV2Arguments = serde_json::from_str(arguments_json).map_err(|error| {
+        CliError::new(format!("invalid task.create.v2 arguments JSON: {error}"))
+    })?;
     let task_id = args.task_id;
+    let envelope =
+        task_create_v2_command(CommandId::new(), ClientId::new(), unix_epoch_ms()?, args)
+            .map_err(|error| CliError::new(format!("invalid task.create.v2 arguments: {error}")))?;
     let client_id = ClientId::new();
-    let command_id = CommandId::new();
-    let issued_at_ms = unix_epoch_ms()?;
-    let envelope = task_create_command(command_id, client_id, issued_at_ms, args)
-        .map_err(|error| CliError::new(format!("invalid task.create arguments: {error}")))?;
+    let envelope = CommandEnvelope {
+        client_id,
+        ..envelope
+    };
 
     let mut client = connect_profile_client(profile, client_id, CapabilitySet::empty()).await?;
-    let receipt = execute_command_with_reconnect(&mut client, envelope, ACTION_TASK_CREATE).await?;
+    let receipt = execute_command_with_reconnect(&mut client, envelope, action_id).await?;
     match &receipt {
         CommandReceipt::Accepted { .. } => {
             let doc = json!({
                 "schema_version": SCHEMA_VERSION,
-                "action_id": ACTION_TASK_CREATE,
+                "action_id": action_id,
                 "profile": profile,
                 "task_id": task_id,
                 "receipt": receipt,
@@ -849,7 +893,7 @@ async fn task_create_invoke_async(profile: &str, arguments_json: &str) -> Result
                 .map_err(|error| CliError::new(format!("failed to encode invoke JSON: {error}")))
         }
         CommandReceipt::Rejected { code, .. } => Err(CliError::new(format!(
-            "task.create rejected: {}",
+            "{action_id} rejected: {}",
             rejection_code_name(*code)
         ))),
     }

@@ -714,6 +714,7 @@ fn protocol_client_hello_rejects_invalid_fields_and_document_shape() {
         profile_fingerprint: fingerprint,
         requested,
         limits,
+        reconnect_grant: None,
     };
     assert_eq!(
         codec.encode(&forged_empty),

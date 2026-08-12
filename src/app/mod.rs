@@ -19,12 +19,14 @@ use crate::browser::{
     BrowserRisk, BrowserSettingsAction, BrowserWebViewHost, BrowserWorkflowReviewEditor,
     BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
 };
+use crate::git::command::{GitHostBinding, GitRepository};
 use crate::git::git_service;
 use crate::models::{
     AppConfig, DependencyStatus, MacTerminalProfile, PortStatus, Project, ProjectFolder,
     RunCommand, SSHConnection, SessionState, SessionTab, TabType,
 };
 use crate::notifications;
+use crate::persistence::{ConfigWriteAvailability, WorkspaceSnapshot};
 use crate::remote::presentation::{SemanticEventKind, StableSessionKey};
 use crate::remote::{
     self, ClientAuth, LocalPortForwardManager, PendingRemoteRequest, RemoteAction,
@@ -261,9 +263,39 @@ fn execute_app_termination(termination: PendingAppTermination, cx: &App) {
     }
 }
 
+fn is_config_mutation_remote_action(action: &RemoteAction) -> bool {
+    matches!(
+        action,
+        RemoteAction::SaveProject { .. }
+            | RemoteAction::DeleteProject { .. }
+            | RemoteAction::SaveFolder { .. }
+            | RemoteAction::DeleteFolder { .. }
+            | RemoteAction::SaveCommand { .. }
+            | RemoteAction::DeleteCommand { .. }
+            | RemoteAction::SaveSsh { .. }
+            | RemoteAction::DeleteSsh { .. }
+            | RemoteAction::SaveSettings { .. }
+            | RemoteAction::GitPollForToken { .. }
+            | RemoteAction::GitLogout
+    )
+}
+
+fn unavailable_sidebar_config() -> AppConfig {
+    let mut config = AppConfig::default();
+    config.projects.push(Project {
+        id: "__config_unavailable__".to_string(),
+        name: "Configuration unavailable".to_string(),
+        root_path: String::new(),
+        notes: Some("Repair the canonical ConfigStore before editing projects.".to_string()),
+        ..Project::default()
+    });
+    config
+}
+
 struct NativeShell {
     state: AppState,
     session_manager: SessionManager,
+    config_write_availability: ConfigWriteAvailability,
     process_manager: ProcessManager,
     browser_gateway: Option<BrowserGatewayHandle>,
     browser_host: BrowserWebViewHost,
@@ -1233,14 +1265,44 @@ impl NativeShell {
             diagnostic: remote_config_diagnostic,
         } = resolve_remote_state_startup(remote::load_remote_machine_state());
         let native_dialog_blockers = Arc::new(AtomicUsize::new(0));
-        let (mut state, mut startup_notice) = match session_manager.load_workspace() {
-            Ok(snapshot) => (AppState::from_workspace(snapshot), None),
-            Err(error) => (
-                AppState::default(),
-                Some(format!(
-                    "Fell back to an empty workspace because legacy state could not be loaded: {error}"
-                )),
+        let (mut state, mut startup_notice, config_write_availability) = match session_manager
+            .load_workspace()
+        {
+            Ok(snapshot) => (
+                AppState::from_workspace(snapshot),
+                None,
+                ConfigWriteAvailability::Ready,
             ),
+            Err(error) => {
+                // Keep validated current/backup rows visible when the
+                // canonical store is temporarily unreadable.  If no
+                // validated recovery copy exists, show an explicit unavailable
+                // sidebar row rather than silently constructing a blank editor
+                // model. Session state is intentionally not touched on this
+                // fail-closed path.
+                let (config, diagnostic) = match session_manager.load_config_recovery() {
+                    Ok(config) => (
+                        config,
+                        format!(
+                            "ConfigStore failed to load the workspace: {error}. A validated recovery copy is shown read-only until the canonical store is repaired."
+                        ),
+                    ),
+                    Err(recovery_error) => (
+                        unavailable_sidebar_config(),
+                        format!(
+                            "ConfigStore is unavailable and no validated recovery copy could be loaded: {recovery_error}. The left sidebar is read-only until the store is repaired."
+                        ),
+                    ),
+                };
+                (
+                    AppState::from_workspace(WorkspaceSnapshot {
+                        config,
+                        session: SessionState::default(),
+                    }),
+                    Some(diagnostic.clone()),
+                    ConfigWriteAvailability::Unavailable { diagnostic },
+                )
+            }
         };
         if let Some(diagnostic) = browser_config_diagnostic {
             startup_notice = Some(match startup_notice {
@@ -1387,6 +1449,7 @@ impl NativeShell {
         let shell = Self {
             state,
             session_manager,
+            config_write_availability,
             process_manager,
             browser_gateway,
             browser_host,
@@ -1500,15 +1563,20 @@ impl NativeShell {
     fn apply_diagnostics_settings_delta(
         &mut self,
         delta: &crate::diagnostics::DiagnosticsSettingsDelta,
-    ) {
+        cx: &mut Context<Self>,
+    ) -> bool {
         if delta.is_empty() {
-            return;
+            return true;
+        }
+        if !self.ensure_config_mutation_available(cx) {
+            return false;
         }
         let mut settings = self.state.settings().clone();
         delta.apply_to(&mut settings);
         self.state.update_settings(settings.clone());
         self.process_manager.set_settings(settings);
         self.save_config_state();
+        true
     }
 
     fn next_diagnostics_generation(&mut self) -> u64 {
@@ -1819,7 +1887,9 @@ impl NativeShell {
                                 );
                                 match follow_up {
                                     DiagnosticsRepairFollowUp::ApplyDeltaAndSnapshot => {
-                                        shell.apply_diagnostics_settings_delta(&delta);
+                                        if !shell.apply_diagnostics_settings_delta(&delta, cx) {
+                                            return;
+                                        }
                                         if let Some(Ok(snapshot)) = scan_result {
                                             shell.finish_diagnostics_scan(generation, snapshot, cx);
                                         }
@@ -1829,7 +1899,9 @@ impl NativeShell {
                                         }
                                     }
                                     DiagnosticsRepairFollowUp::ApplyDeltaAndRescan => {
-                                        shell.apply_diagnostics_settings_delta(&delta);
+                                        if !shell.apply_diagnostics_settings_delta(&delta, cx) {
+                                            return;
+                                        }
                                         shell.surface_diagnostics_restart_notice(&batch);
                                         if let Some(EditorPanel::Diagnostics(draft)) =
                                             shell.editor_panel.as_mut()
@@ -1851,7 +1923,9 @@ impl NativeShell {
                                     DiagnosticsRepairFollowUp::ApplyDeltaAndScanError(
                                         scan_error,
                                     ) => {
-                                        shell.apply_diagnostics_settings_delta(&delta);
+                                        if !shell.apply_diagnostics_settings_delta(&delta, cx) {
+                                            return;
+                                        }
                                         shell.surface_diagnostics_restart_notice(&batch);
                                         if let Some(error) = diagnostics_repair_soft_error(
                                             batch_failure,
@@ -5145,8 +5219,18 @@ impl NativeShell {
         if self.remote_mode.is_some() {
             return;
         }
+        if let Some(diagnostic) = self.config_write_availability.diagnostic() {
+            self.editor_notice = Some(format!(
+                "Configuration is read-only until ConfigStore recovery succeeds: {diagnostic}"
+            ));
+            return;
+        }
         if let Err(error) = self.session_manager.save_config(&self.state.config) {
-            self.editor_notice = Some(format!("Failed to save config: {error}"));
+            let diagnostic = error.to_string();
+            self.config_write_availability = ConfigWriteAvailability::Unavailable {
+                diagnostic: diagnostic.clone(),
+            };
+            self.editor_notice = Some(format!("Failed to save config: {diagnostic}"));
         } else {
             self.process_manager
                 .set_settings(self.state.config.settings.clone());
@@ -5358,7 +5442,21 @@ impl NativeShell {
         false
     }
 
+    fn ensure_config_mutation_available(&mut self, cx: &mut Context<Self>) -> bool {
+        if let Some(diagnostic) = self.config_write_availability.diagnostic() {
+            self.editor_notice = Some(format!(
+                "Configuration is read-only until ConfigStore recovery succeeds: {diagnostic}"
+            ));
+            cx.notify();
+            return false;
+        }
+        true
+    }
+
     fn ensure_mutation_control(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.ensure_config_mutation_available(cx) {
+            return false;
+        }
         if self.remote_mode.is_some() {
             return self.ensure_remote_control(cx);
         }
@@ -5369,6 +5467,35 @@ impl NativeShell {
         self.editor_notice =
             Some("Took control back from the connected remote client.".to_string());
         self.sync_settings_remote_draft();
+        cx.notify();
+        true
+    }
+
+    fn reject_unavailable_config_remote_action(
+        &mut self,
+        action: &RemoteAction,
+        response: &mut Option<std::sync::mpsc::Sender<RemoteActionResult>>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.config_write_availability.diagnostic().is_none()
+            || !is_config_mutation_remote_action(action)
+        {
+            return false;
+        }
+        let diagnostic = self
+            .config_write_availability
+            .diagnostic()
+            .unwrap_or("ConfigStore is unavailable");
+        let result = RemoteActionResult::error(format!(
+            "configuration mutation is unavailable until ConfigStore recovery succeeds: {diagnostic}"
+        ));
+        if let Some(sender) = response.take() {
+            let _ = sender.send(result);
+        }
+        self.editor_notice = Some(
+            "Configuration mutations are disabled while the canonical ConfigStore is unavailable."
+                .to_string(),
+        );
         cx.notify();
         true
     }
@@ -6580,6 +6707,7 @@ impl NativeShell {
         &mut self,
         action: &RemoteAction,
         response: Option<std::sync::mpsc::Sender<RemoteActionResult>>,
+        bound_repository: Option<Result<GitRepository, String>>,
         cx: &mut Context<Self>,
     ) -> bool {
         #[derive(Debug)]
@@ -6649,8 +6777,10 @@ impl NativeShell {
                                 ),
                                 None,
                             ),
-                            RemoteAction::GitStatus { repo_path } => (
-                                match git_service::status(&repo_path) {
+                            RemoteAction::GitStatus { .. } => (
+                                match require_bound_git_repository(&bound_repository)
+                                    .and_then(git_service::status)
+                                {
                                     Ok(status) => RemoteActionResult::ok(
                                         None,
                                         Some(RemoteActionPayload::GitStatus { status }),
@@ -6660,11 +6790,13 @@ impl NativeShell {
                                 None,
                             ),
                             RemoteAction::GitLog {
-                                repo_path,
                                 limit,
                                 skip,
+                                ..
                             } => (
-                                match git_service::log(&repo_path, limit, skip) {
+                                match require_bound_git_repository(&bound_repository)
+                                    .and_then(|repository| git_service::log(repository, limit, skip))
+                                {
                                     Ok(entries) => RemoteActionResult::ok(
                                         None,
                                         Some(RemoteActionPayload::GitLogEntries { entries }),
@@ -6674,11 +6806,14 @@ impl NativeShell {
                                 None,
                             ),
                             RemoteAction::GitDiffFile {
-                                repo_path,
                                 file_path,
                                 staged,
+                                ..
                             } => (
-                                match git_service::diff_file(&repo_path, &file_path, staged) {
+                                match require_bound_git_repository(&bound_repository)
+                                    .and_then(|repository| {
+                                        git_service::diff_file(repository, &file_path, staged)
+                                    }) {
                                     Ok(diff) => RemoteActionResult::ok(
                                         None,
                                         Some(RemoteActionPayload::GitDiff { diff }),
@@ -6687,8 +6822,10 @@ impl NativeShell {
                                 },
                                 None,
                             ),
-                            RemoteAction::GitDiffCommit { repo_path, hash } => (
-                                match git_service::diff_commit(&repo_path, &hash) {
+                            RemoteAction::GitDiffCommit { hash, .. } => (
+                                match require_bound_git_repository(&bound_repository)
+                                    .and_then(|repository| git_service::diff_commit(repository, &hash))
+                                {
                                     Ok(diff) => RemoteActionResult::ok(
                                         None,
                                         Some(RemoteActionPayload::GitDiff { diff }),
@@ -6697,8 +6834,10 @@ impl NativeShell {
                                 },
                                 None,
                             ),
-                            RemoteAction::GitBranches { repo_path } => (
-                                match git_service::branches(&repo_path) {
+                            RemoteAction::GitBranches { .. } => (
+                                match require_bound_git_repository(&bound_repository)
+                                    .and_then(git_service::branches)
+                                {
                                     Ok(branches) => RemoteActionResult::ok(
                                         None,
                                         Some(RemoteActionPayload::GitBranches { branches }),
@@ -6707,48 +6846,59 @@ impl NativeShell {
                                 },
                                 None,
                             ),
-                            RemoteAction::GitStage { repo_path, files } => {
+                            RemoteAction::GitStage { files, .. } => {
                                 let file_refs =
                                     files.iter().map(|file| file.as_str()).collect::<Vec<_>>();
                                 (
-                                    match git_service::stage(&repo_path, &file_refs) {
+                                    match require_bound_git_repository(&bound_repository)
+                                        .and_then(|repository| git_service::stage(repository, &file_refs))
+                                    {
                                         Ok(()) => RemoteActionResult::ok(None, None),
                                         Err(error) => RemoteActionResult::error(error),
                                     },
                                     None,
                                 )
                             }
-                            RemoteAction::GitUnstage { repo_path, files } => {
+                            RemoteAction::GitUnstage { files, .. } => {
                                 let file_refs =
                                     files.iter().map(|file| file.as_str()).collect::<Vec<_>>();
                                 (
-                                    match git_service::unstage(&repo_path, &file_refs) {
+                                    match require_bound_git_repository(&bound_repository)
+                                        .and_then(|repository| git_service::unstage(repository, &file_refs))
+                                    {
                                         Ok(()) => RemoteActionResult::ok(None, None),
                                         Err(error) => RemoteActionResult::error(error),
                                     },
                                     None,
                                 )
                             }
-                            RemoteAction::GitStageAll { repo_path } => (
-                                match git_service::stage_all(&repo_path) {
+                            RemoteAction::GitStageAll { .. } => (
+                                match require_bound_git_repository(&bound_repository)
+                                    .and_then(git_service::stage_all)
+                                {
                                     Ok(()) => RemoteActionResult::ok(None, None),
                                     Err(error) => RemoteActionResult::error(error),
                                 },
                                 None,
                             ),
-                            RemoteAction::GitUnstageAll { repo_path } => (
-                                match git_service::unstage_all(&repo_path) {
+                            RemoteAction::GitUnstageAll { .. } => (
+                                match require_bound_git_repository(&bound_repository)
+                                    .and_then(git_service::unstage_all)
+                                {
                                     Ok(()) => RemoteActionResult::ok(None, None),
                                     Err(error) => RemoteActionResult::error(error),
                                 },
                                 None,
                             ),
                             RemoteAction::GitCommit {
-                                repo_path,
                                 summary,
                                 body,
+                                ..
                             } => (
-                                match git_service::commit(&repo_path, &summary, body.as_deref()) {
+                                match require_bound_git_repository(&bound_repository)
+                                    .and_then(|repository| {
+                                        git_service::commit(repository, &summary, body.as_deref())
+                                    }) {
                                     Ok(hash) => RemoteActionResult::ok(
                                         None,
                                         Some(RemoteActionPayload::GitCommit { hash }),
@@ -6757,57 +6907,74 @@ impl NativeShell {
                                 },
                                 None,
                             ),
-                            RemoteAction::GitPush { repo_path } => (
-                                match git_service::push(&repo_path) {
+                            RemoteAction::GitPush { .. } => (
+                                match require_bound_git_repository(&bound_repository)
+                                    .and_then(git_service::push)
+                                {
                                     Ok(message) => RemoteActionResult::ok(Some(message), None),
                                     Err(error) => RemoteActionResult::error(error),
                                 },
                                 None,
                             ),
-                            RemoteAction::GitPushSetUpstream { repo_path, branch } => (
-                                match git_service::push_set_upstream(&repo_path, &branch) {
+                            RemoteAction::GitPushSetUpstream { branch, .. } => (
+                                match require_bound_git_repository(&bound_repository)
+                                    .and_then(|repository| {
+                                        git_service::push_set_upstream(repository, &branch)
+                                    }) {
                                     Ok(message) => RemoteActionResult::ok(Some(message), None),
                                     Err(error) => RemoteActionResult::error(error),
                                 },
                                 None,
                             ),
-                            RemoteAction::GitPull { repo_path } => (
-                                match git_service::pull(&repo_path) {
+                            RemoteAction::GitPull { .. } => (
+                                match require_bound_git_repository(&bound_repository)
+                                    .and_then(git_service::pull)
+                                {
                                     Ok(message) => RemoteActionResult::ok(Some(message), None),
                                     Err(error) => RemoteActionResult::error(error),
                                 },
                                 None,
                             ),
-                            RemoteAction::GitFetch { repo_path } => (
-                                match git_service::fetch(&repo_path) {
+                            RemoteAction::GitFetch { .. } => (
+                                match require_bound_git_repository(&bound_repository)
+                                    .and_then(git_service::fetch)
+                                {
                                     Ok(message) => RemoteActionResult::ok(Some(message), None),
                                     Err(error) => RemoteActionResult::error(error),
                                 },
                                 None,
                             ),
-                            RemoteAction::GitSync { repo_path } => (
-                                match git_service::sync(&repo_path) {
+                            RemoteAction::GitSync { .. } => (
+                                match require_bound_git_repository(&bound_repository)
+                                    .and_then(git_service::sync)
+                                {
                                     Ok(message) => RemoteActionResult::ok(Some(message), None),
                                     Err(error) => RemoteActionResult::error(error),
                                 },
                                 None,
                             ),
-                            RemoteAction::GitSwitchBranch { repo_path, name } => (
-                                match git_service::switch_branch(&repo_path, &name) {
+                            RemoteAction::GitSwitchBranch { name, .. } => (
+                                match require_bound_git_repository(&bound_repository)
+                                    .and_then(|repository| git_service::switch_branch(repository, &name))
+                                {
                                     Ok(()) => RemoteActionResult::ok(None, None),
                                     Err(error) => RemoteActionResult::error(error),
                                 },
                                 None,
                             ),
-                            RemoteAction::GitCreateBranch { repo_path, name } => (
-                                match git_service::create_branch(&repo_path, &name) {
+                            RemoteAction::GitCreateBranch { name, .. } => (
+                                match require_bound_git_repository(&bound_repository)
+                                    .and_then(|repository| git_service::create_branch(repository, &name))
+                                {
                                     Ok(()) => RemoteActionResult::ok(None, None),
                                     Err(error) => RemoteActionResult::error(error),
                                 },
                                 None,
                             ),
-                            RemoteAction::GitDeleteBranch { repo_path, name } => (
-                                match git_service::delete_branch(&repo_path, &name) {
+                            RemoteAction::GitDeleteBranch { name, .. } => (
+                                match require_bound_git_repository(&bound_repository)
+                                    .and_then(|repository| git_service::delete_branch(repository, &name))
+                                {
                                     Ok(()) => RemoteActionResult::ok(None, None),
                                     Err(error) => RemoteActionResult::error(error),
                                 },
@@ -6908,9 +7075,11 @@ impl NativeShell {
                                 RemoteActionResult::ok(None, None),
                                 Some(GitHostMutation::SetGithubToken(None)),
                             ),
-                            RemoteAction::GitGenerateCommitMessage { repo_path } => {
+                            RemoteAction::GitGenerateCommitMessage { .. } => {
                                 if let Some(token) = host_token.clone() {
-                                    match git_service::get_staged_diff(&repo_path) {
+                                    match require_bound_git_repository(&bound_repository)
+                                        .and_then(git_service::get_staged_diff)
+                                    {
                                         Ok(diff) if diff.trim().is_empty() => (
                                             RemoteActionResult::error(
                                                 "No staged changes to summarize",
@@ -6956,6 +7125,9 @@ impl NativeShell {
                     let _ = this.update(&mut cx, |this, cx| {
                         match mutation {
                             GitHostMutation::SetGithubToken(token) => {
+                                if !this.ensure_config_mutation_available(cx) {
+                                    return;
+                                }
                                 let mut settings = this.state.settings().clone();
                                 settings.github_token = token;
                                 this.state.update_settings(settings);
@@ -7138,13 +7310,20 @@ impl NativeShell {
         let mut did_change = false;
 
         for request in requests {
-            let PendingRemoteRequest {
-                client_id: _client_id,
-                action,
-                response,
-            } = request;
+            let (_client_id, git_authority, action, mut response) = request.into_host_parts();
 
-            if self.spawn_remote_git_request_if_needed(&action, response.clone(), cx) {
+            if self.reject_unavailable_config_remote_action(&action, &mut response, cx) {
+                continue;
+            }
+
+            let bound_repository = git_action_repository(&action, git_authority.as_ref());
+
+            if self.spawn_remote_git_request_if_needed(
+                &action,
+                response.clone(),
+                bound_repository.clone(),
+                cx,
+            ) {
                 continue;
             }
 
@@ -7771,36 +7950,42 @@ impl NativeShell {
                         repos: collect_git_repositories(&self.state),
                     }),
                 ),
-                RemoteAction::GitStatus { repo_path } => match git_service::status(&repo_path) {
-                    Ok(status) => RemoteActionResult::ok(
-                        None,
-                        Some(RemoteActionPayload::GitStatus { status }),
-                    ),
-                    Err(error) => RemoteActionResult::error(error),
-                },
-                RemoteAction::GitLog {
-                    repo_path,
-                    limit,
-                    skip,
-                } => match git_service::log(&repo_path, limit, skip) {
-                    Ok(entries) => RemoteActionResult::ok(
-                        None,
-                        Some(RemoteActionPayload::GitLogEntries { entries }),
-                    ),
-                    Err(error) => RemoteActionResult::error(error),
-                },
+                RemoteAction::GitStatus { .. } => {
+                    match require_bound_git_repository(&bound_repository)
+                        .and_then(git_service::status)
+                    {
+                        Ok(status) => RemoteActionResult::ok(
+                            None,
+                            Some(RemoteActionPayload::GitStatus { status }),
+                        ),
+                        Err(error) => RemoteActionResult::error(error),
+                    }
+                }
+                RemoteAction::GitLog { limit, skip, .. } => {
+                    match require_bound_git_repository(&bound_repository)
+                        .and_then(|repository| git_service::log(repository, limit, skip))
+                    {
+                        Ok(entries) => RemoteActionResult::ok(
+                            None,
+                            Some(RemoteActionPayload::GitLogEntries { entries }),
+                        ),
+                        Err(error) => RemoteActionResult::error(error),
+                    }
+                }
                 RemoteAction::GitDiffFile {
-                    repo_path,
-                    file_path,
-                    staged,
-                } => match git_service::diff_file(&repo_path, &file_path, staged) {
+                    file_path, staged, ..
+                } => match require_bound_git_repository(&bound_repository)
+                    .and_then(|repository| git_service::diff_file(repository, &file_path, staged))
+                {
                     Ok(diff) => {
                         RemoteActionResult::ok(None, Some(RemoteActionPayload::GitDiff { diff }))
                     }
                     Err(error) => RemoteActionResult::error(error),
                 },
-                RemoteAction::GitDiffCommit { repo_path, hash } => {
-                    match git_service::diff_commit(&repo_path, &hash) {
+                RemoteAction::GitDiffCommit { hash, .. } => {
+                    match require_bound_git_repository(&bound_repository)
+                        .and_then(|repository| git_service::diff_commit(repository, &hash))
+                    {
                         Ok(diff) => RemoteActionResult::ok(
                             None,
                             Some(RemoteActionPayload::GitDiff { diff }),
@@ -7808,8 +7993,10 @@ impl NativeShell {
                         Err(error) => RemoteActionResult::error(error),
                     }
                 }
-                RemoteAction::GitBranches { repo_path } => {
-                    match git_service::branches(&repo_path) {
+                RemoteAction::GitBranches { .. } => {
+                    match require_bound_git_repository(&bound_repository)
+                        .and_then(git_service::branches)
+                    {
                         Ok(branches) => RemoteActionResult::ok(
                             None,
                             Some(RemoteActionPayload::GitBranches { branches }),
@@ -7817,77 +8004,111 @@ impl NativeShell {
                         Err(error) => RemoteActionResult::error(error),
                     }
                 }
-                RemoteAction::GitStage { repo_path, files } => {
+                RemoteAction::GitStage { files, .. } => {
                     let file_refs = files.iter().map(|file| file.as_str()).collect::<Vec<_>>();
-                    match git_service::stage(&repo_path, &file_refs) {
+                    match require_bound_git_repository(&bound_repository)
+                        .and_then(|repository| git_service::stage(repository, &file_refs))
+                    {
                         Ok(()) => RemoteActionResult::ok(None, None),
                         Err(error) => RemoteActionResult::error(error),
                     }
                 }
-                RemoteAction::GitUnstage { repo_path, files } => {
+                RemoteAction::GitUnstage { files, .. } => {
                     let file_refs = files.iter().map(|file| file.as_str()).collect::<Vec<_>>();
-                    match git_service::unstage(&repo_path, &file_refs) {
+                    match require_bound_git_repository(&bound_repository)
+                        .and_then(|repository| git_service::unstage(repository, &file_refs))
+                    {
                         Ok(()) => RemoteActionResult::ok(None, None),
                         Err(error) => RemoteActionResult::error(error),
                     }
                 }
-                RemoteAction::GitStageAll { repo_path } => match git_service::stage_all(&repo_path)
-                {
-                    Ok(()) => RemoteActionResult::ok(None, None),
-                    Err(error) => RemoteActionResult::error(error),
-                },
-                RemoteAction::GitUnstageAll { repo_path } => {
-                    match git_service::unstage_all(&repo_path) {
+                RemoteAction::GitStageAll { .. } => {
+                    match require_bound_git_repository(&bound_repository)
+                        .and_then(git_service::stage_all)
+                    {
                         Ok(()) => RemoteActionResult::ok(None, None),
                         Err(error) => RemoteActionResult::error(error),
                     }
                 }
-                RemoteAction::GitCommit {
-                    repo_path,
-                    summary,
-                    body,
-                } => match git_service::commit(&repo_path, &summary, body.as_deref()) {
-                    Ok(hash) => {
-                        RemoteActionResult::ok(None, Some(RemoteActionPayload::GitCommit { hash }))
+                RemoteAction::GitUnstageAll { .. } => {
+                    match require_bound_git_repository(&bound_repository)
+                        .and_then(git_service::unstage_all)
+                    {
+                        Ok(()) => RemoteActionResult::ok(None, None),
+                        Err(error) => RemoteActionResult::error(error),
                     }
-                    Err(error) => RemoteActionResult::error(error),
-                },
-                RemoteAction::GitPush { repo_path } => match git_service::push(&repo_path) {
-                    Ok(message) => RemoteActionResult::ok(Some(message), None),
-                    Err(error) => RemoteActionResult::error(error),
-                },
-                RemoteAction::GitPushSetUpstream { repo_path, branch } => {
-                    match git_service::push_set_upstream(&repo_path, &branch) {
+                }
+                RemoteAction::GitCommit { summary, body, .. } => {
+                    match require_bound_git_repository(&bound_repository).and_then(|repository| {
+                        git_service::commit(repository, &summary, body.as_deref())
+                    }) {
+                        Ok(hash) => RemoteActionResult::ok(
+                            None,
+                            Some(RemoteActionPayload::GitCommit { hash }),
+                        ),
+                        Err(error) => RemoteActionResult::error(error),
+                    }
+                }
+                RemoteAction::GitPush { .. } => {
+                    match require_bound_git_repository(&bound_repository)
+                        .and_then(git_service::push)
+                    {
                         Ok(message) => RemoteActionResult::ok(Some(message), None),
                         Err(error) => RemoteActionResult::error(error),
                     }
                 }
-                RemoteAction::GitPull { repo_path } => match git_service::pull(&repo_path) {
-                    Ok(message) => RemoteActionResult::ok(Some(message), None),
-                    Err(error) => RemoteActionResult::error(error),
-                },
-                RemoteAction::GitFetch { repo_path } => match git_service::fetch(&repo_path) {
-                    Ok(message) => RemoteActionResult::ok(Some(message), None),
-                    Err(error) => RemoteActionResult::error(error),
-                },
-                RemoteAction::GitSync { repo_path } => match git_service::sync(&repo_path) {
-                    Ok(message) => RemoteActionResult::ok(Some(message), None),
-                    Err(error) => RemoteActionResult::error(error),
-                },
-                RemoteAction::GitSwitchBranch { repo_path, name } => {
-                    match git_service::switch_branch(&repo_path, &name) {
+                RemoteAction::GitPushSetUpstream { branch, .. } => {
+                    match require_bound_git_repository(&bound_repository)
+                        .and_then(|repository| git_service::push_set_upstream(repository, &branch))
+                    {
+                        Ok(message) => RemoteActionResult::ok(Some(message), None),
+                        Err(error) => RemoteActionResult::error(error),
+                    }
+                }
+                RemoteAction::GitPull { .. } => {
+                    match require_bound_git_repository(&bound_repository)
+                        .and_then(git_service::pull)
+                    {
+                        Ok(message) => RemoteActionResult::ok(Some(message), None),
+                        Err(error) => RemoteActionResult::error(error),
+                    }
+                }
+                RemoteAction::GitFetch { .. } => {
+                    match require_bound_git_repository(&bound_repository)
+                        .and_then(git_service::fetch)
+                    {
+                        Ok(message) => RemoteActionResult::ok(Some(message), None),
+                        Err(error) => RemoteActionResult::error(error),
+                    }
+                }
+                RemoteAction::GitSync { .. } => {
+                    match require_bound_git_repository(&bound_repository)
+                        .and_then(git_service::sync)
+                    {
+                        Ok(message) => RemoteActionResult::ok(Some(message), None),
+                        Err(error) => RemoteActionResult::error(error),
+                    }
+                }
+                RemoteAction::GitSwitchBranch { name, .. } => {
+                    match require_bound_git_repository(&bound_repository)
+                        .and_then(|repository| git_service::switch_branch(repository, &name))
+                    {
                         Ok(()) => RemoteActionResult::ok(None, None),
                         Err(error) => RemoteActionResult::error(error),
                     }
                 }
-                RemoteAction::GitCreateBranch { repo_path, name } => {
-                    match git_service::create_branch(&repo_path, &name) {
+                RemoteAction::GitCreateBranch { name, .. } => {
+                    match require_bound_git_repository(&bound_repository)
+                        .and_then(|repository| git_service::create_branch(repository, &name))
+                    {
                         Ok(()) => RemoteActionResult::ok(None, None),
                         Err(error) => RemoteActionResult::error(error),
                     }
                 }
-                RemoteAction::GitDeleteBranch { repo_path, name } => {
-                    match git_service::delete_branch(&repo_path, &name) {
+                RemoteAction::GitDeleteBranch { name, .. } => {
+                    match require_bound_git_repository(&bound_repository)
+                        .and_then(|repository| git_service::delete_branch(repository, &name))
+                    {
                         Ok(()) => RemoteActionResult::ok(None, None),
                         Err(error) => RemoteActionResult::error(error),
                     }
@@ -7970,7 +8191,7 @@ impl NativeShell {
                     did_change = true;
                     RemoteActionResult::ok(None, None)
                 }
-                RemoteAction::GitGenerateCommitMessage { repo_path } => {
+                RemoteAction::GitGenerateCommitMessage { .. } => {
                     if let Some(token) = self
                         .state
                         .settings()
@@ -7978,7 +8199,9 @@ impl NativeShell {
                         .clone()
                         .filter(|token| !token.trim().is_empty())
                     {
-                        match git_service::get_staged_diff(&repo_path) {
+                        match require_bound_git_repository(&bound_repository)
+                            .and_then(git_service::get_staged_diff)
+                        {
                             Ok(diff) if diff.trim().is_empty() => {
                                 RemoteActionResult::error("No staged changes to summarize")
                             }
@@ -8219,10 +8442,7 @@ impl NativeShell {
 
     fn export_config_action(&mut self, cx: &mut Context<Self>) {
         let _dialog_pause = self.pause_for_native_dialog();
-        match self
-            .session_manager
-            .export_config_dialog(&self.state.config)
-        {
+        match self.session_manager.export_config_dialog() {
             Ok(Some(path)) => {
                 self.editor_notice = Some(format!("Exported config to {}", path.display()));
             }
@@ -8235,6 +8455,9 @@ impl NativeShell {
     }
 
     fn import_config_action(&mut self, mode: ConfigImportMode, cx: &mut Context<Self>) {
+        if !self.ensure_mutation_control(cx) {
+            return;
+        }
         let _dialog_pause = self.pause_for_native_dialog();
         match self
             .session_manager
@@ -8258,6 +8481,9 @@ impl NativeShell {
         source_path: &std::path::Path,
         cx: &mut Context<Self>,
     ) {
+        if !self.ensure_mutation_control(cx) {
+            return;
+        }
         let replace_disables_browser = matches!(mode, ConfigImportMode::Replace)
             && self.state.settings().browser_enabled
             && !config.settings.browser_enabled;
@@ -8713,6 +8939,20 @@ impl NativeShell {
         remote_client: Option<RemoteClientHandle>,
         cx: &mut Context<Self>,
     ) {
+        let (repos, local_repositories) = if remote_client.is_none() {
+            let mut local_repositories = Vec::new();
+            let repos = repos
+                .into_iter()
+                .filter_map(|(label, path)| {
+                    let repository = local_host_git_repository(&path).ok()?;
+                    local_repositories.push(repository);
+                    Some((label, path))
+                })
+                .collect::<Vec<_>>();
+            (repos, local_repositories)
+        } else {
+            (repos, Vec::new())
+        };
         if repos.is_empty() {
             self.editor_notice = Some("No Git repositories were found.".to_string());
             cx.notify();
@@ -8733,11 +8973,12 @@ impl NativeShell {
             |_window, cx| {
                 let repos = repos.clone();
                 let remote_client = remote_client.clone();
+                let local_repositories = local_repositories.clone();
                 cx.new(move |cx| {
                     if let Some(client) = remote_client.clone() {
                         crate::git::GitWindow::new_remote(repos, client, cx)
                     } else {
-                        crate::git::GitWindow::new(repos, cx)
+                        crate::git::GitWindow::new_local(repos, local_repositories, cx)
                     }
                 })
             },
@@ -10182,6 +10423,17 @@ impl NativeShell {
         let Some(panel) = self.editor_panel.clone() else {
             return;
         };
+
+        if matches!(
+            panel,
+            EditorPanel::Project(_)
+                | EditorPanel::Folder(_)
+                | EditorPanel::Command(_)
+                | EditorPanel::Ssh(_)
+        ) && !self.ensure_mutation_control(cx)
+        {
+            return;
+        }
 
         match panel {
             EditorPanel::Settings(_) => {}
@@ -12943,6 +13195,9 @@ impl NativeShell {
     }
 
     fn toggle_terminal_mouse_override_action(&mut self, cx: &mut Context<Self>) {
+        if !self.ensure_mutation_control(cx) {
+            return;
+        }
         let mut settings = self.state.settings().clone();
         settings.terminal_mouse_override = !settings.terminal_mouse_override;
         self.state.update_settings(settings);
@@ -12951,6 +13206,9 @@ impl NativeShell {
     }
 
     fn toggle_terminal_read_only_action(&mut self, cx: &mut Context<Self>) {
+        if !self.ensure_mutation_control(cx) {
+            return;
+        }
         let mut settings = self.state.settings().clone();
         settings.terminal_read_only = !settings.terminal_read_only;
         self.state.update_settings(settings);
@@ -14842,6 +15100,13 @@ fn apply_window_bounds_state(state: &mut AppState, next: crate::models::WindowBo
 fn remote_shared_app_state(state: &AppState) -> AppState {
     let mut next = state.clone();
     next.window_bounds = None;
+    // Remote snapshots are a transfer surface, not a credential boundary.
+    // Keep the local state intact for SSH password auto-submit, while
+    // ensuring serialized app-state diagnostics never carry legacy secrets.
+    for connection in &mut next.config.ssh_connections {
+        connection.password = None;
+        connection.private_key = None;
+    }
     next
 }
 
@@ -15045,6 +15310,9 @@ impl Render for NativeShell {
         let make_move_project_up_handler =
             |project_id: String| -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
                 Box::new(cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                    if !this.ensure_mutation_control(cx) {
+                        return;
+                    }
                     this.state.move_project(&project_id, -1);
                     this.save_config_state();
                     cx.notify();
@@ -15053,6 +15321,9 @@ impl Render for NativeShell {
         let make_move_project_down_handler =
             |project_id: String| -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
                 Box::new(cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                    if !this.ensure_mutation_control(cx) {
+                        return;
+                    }
                     this.state.move_project(&project_id, 1);
                     this.save_config_state();
                     cx.notify();
@@ -15688,7 +15959,8 @@ impl Render for NativeShell {
                 &runtime_snapshot,
                 &server_indicators,
                 sidebar::SidebarActions {
-                    mutations_allowed: self.remote_mode.is_none() || self.remote_has_control(),
+                    mutations_allowed: self.config_write_availability.diagnostic().is_none()
+                        && (self.remote_mode.is_none() || self.remote_has_control()),
                     on_open_settings: &make_open_settings_handler,
                     on_toggle_sidebar: &make_toggle_sidebar_handler,
                     on_stop_all_servers: &make_stop_all_servers_handler,
@@ -18641,11 +18913,62 @@ fn collect_git_repositories(state: &AppState) -> Vec<RemoteGitRepo> {
     collect_git_repositories_from_projects(state.projects())
 }
 
+fn git_action_repository(
+    action: &RemoteAction,
+    authority: Option<&GitHostBinding>,
+) -> Option<Result<GitRepository, String>> {
+    let needs_repository = matches!(
+        action,
+        RemoteAction::GitStatus { .. }
+            | RemoteAction::GitLog { .. }
+            | RemoteAction::GitDiffFile { .. }
+            | RemoteAction::GitDiffCommit { .. }
+            | RemoteAction::GitBranches { .. }
+            | RemoteAction::GitStage { .. }
+            | RemoteAction::GitUnstage { .. }
+            | RemoteAction::GitStageAll { .. }
+            | RemoteAction::GitUnstageAll { .. }
+            | RemoteAction::GitCommit { .. }
+            | RemoteAction::GitPush { .. }
+            | RemoteAction::GitPushSetUpstream { .. }
+            | RemoteAction::GitPull { .. }
+            | RemoteAction::GitFetch { .. }
+            | RemoteAction::GitSync { .. }
+            | RemoteAction::GitSwitchBranch { .. }
+            | RemoteAction::GitCreateBranch { .. }
+            | RemoteAction::GitDeleteBranch { .. }
+            | RemoteAction::GitGenerateCommitMessage { .. }
+    );
+    if !needs_repository {
+        return None;
+    };
+    Some(match authority {
+        Some(binding) => git_service::open_repository(binding),
+        None => Err(
+            "Git action requires a live WorkspaceService-issued repository authority.".to_string(),
+        ),
+    })
+}
+
+fn require_bound_git_repository(
+    repository: &Option<Result<GitRepository, String>>,
+) -> Result<&GitRepository, String> {
+    match repository {
+        Some(Ok(repository)) => Ok(repository),
+        Some(Err(error)) => Err(error.clone()),
+        None => Err("Git action did not carry a host-issued repository binding.".to_string()),
+    }
+}
+
+fn local_host_git_repository(_display_hint: &str) -> Result<GitRepository, String> {
+    Err("Git local UI requires a live WorkspaceService-issued repository authority.".to_string())
+}
+
 fn collect_git_repositories_from_projects(projects: &[Project]) -> Vec<RemoteGitRepo> {
     let mut repos = Vec::new();
 
     for project in projects {
-        if git_service::is_repo(&project.root_path) {
+        if !project.root_path.trim().is_empty() {
             repos.push(RemoteGitRepo {
                 label: project.name.clone(),
                 path: project.root_path.clone(),
@@ -18653,7 +18976,7 @@ fn collect_git_repositories_from_projects(projects: &[Project]) -> Vec<RemoteGit
         }
 
         for folder in &project.folders {
-            if folder.folder_path.is_empty() || !git_service::is_repo(&folder.folder_path) {
+            if folder.folder_path.is_empty() {
                 continue;
             }
 
@@ -20992,6 +21315,34 @@ mod tests {
 
         assert_eq!(shared.window_bounds, None);
         assert_eq!(shared.revision(), state.revision());
+    }
+
+    #[test]
+    fn remote_shared_app_state_redacts_legacy_ssh_material() {
+        let mut state = AppState::default();
+        state.config.ssh_connections.push(SSHConnection {
+            id: "ssh-redaction-test".to_string(),
+            label: "redaction test".to_string(),
+            host: "redaction.example.test".to_string(),
+            port: 22,
+            username: "builder".to_string(),
+            password: Some("PASSWORD_SENTINEL".to_string()),
+            private_key: Some("PRIVATE_KEY_SENTINEL".to_string()),
+        });
+
+        let shared = remote_shared_app_state(&state);
+        let serialized = serde_json::to_string(&shared).expect("serialize remote snapshot");
+
+        assert!(!serialized.contains("PASSWORD_SENTINEL"));
+        assert!(!serialized.contains("PRIVATE_KEY_SENTINEL"));
+        assert_eq!(
+            state.config.ssh_connections[0].password.as_deref(),
+            Some("PASSWORD_SENTINEL")
+        );
+        assert_eq!(
+            state.config.ssh_connections[0].private_key.as_deref(),
+            Some("PRIVATE_KEY_SENTINEL")
+        );
     }
 
     #[test]

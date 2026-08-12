@@ -19,9 +19,12 @@ use tokio::task::JoinHandle;
 use tokio::time::{interval_at, MissedTickBehavior};
 use uuid::Uuid;
 
-use crate::domain::command::{Command, CommandReceipt};
+use crate::config::{ConfigError, ConfigStore};
+use crate::domain::command::{
+    Command, CommandEnvelope, CommandReceipt, CreateTaskIntent, CreateTaskRequestIntent,
+};
 use crate::domain::event::DomainEvent;
-use crate::domain::id::{ArtifactId, OperationId, SnapshotId, SubscriptionId, TaskId};
+use crate::domain::id::{ArtifactId, OperationId, RequestId, SnapshotId, SubscriptionId, TaskId};
 use crate::domain::query::{
     Query, QueryEnvelope, QueryError, QueryOutcome, QueryReply, QueryResult,
 };
@@ -29,11 +32,17 @@ use crate::domain::snapshot::{PageLimits, SnapshotSection};
 use crate::domain::ClientId;
 use crate::kernel::{
     ArtifactContentError, ArtifactContentRegistry, CommandBus, EventReplaySession, ReplayError,
-    SnapshotError, SnapshotSession, StoreError,
+    SessionScope, SnapshotError, SnapshotSession, StoreError,
 };
 use crate::protocol::{
     Capability, CapabilitySet, ClientRequest, DetachAck, DetachRequest, NegotiatedParameters,
     ServerMessage, StreamFrame, StreamKey,
+};
+#[cfg(test)]
+use crate::workspace::WorkspaceProjectRootsError;
+use crate::workspace::{
+    WorkspaceAuthorization, WorkspaceChoice, WorkspaceProjectRoots, WorkspaceRequest,
+    WorkspaceResourceCoordinator, WorkspaceService,
 };
 
 use super::ipc::IpcError;
@@ -53,6 +62,11 @@ pub(crate) const HOST_DURABLE_OUTPUT_QUEUE_CAPACITY: usize = 32;
 /// Default ephemeral stream output lane capacity for one duplex connection.
 pub(crate) const HOST_EPHEMERAL_OUTPUT_QUEUE_CAPACITY: usize = 32;
 
+/// Hard upper bound for every per-connection output lane.  Capacities are
+/// host-selected today, but clamping at the constructor keeps a future
+/// negotiated or test-provided value from turning into an allocation bomb.
+const MAX_OUTPUT_LANE_CAPACITY: usize = 4_096;
+
 const MAX_SNAPSHOT_SESSIONS: usize = 32;
 const SNAPSHOT_IDLE_TTL: Duration = Duration::from_secs(30);
 const SNAPSHOT_REAPER_PERIOD: Duration = Duration::from_secs(1);
@@ -64,12 +78,348 @@ const EVENT_REPLAY_REAPER_PERIOD: Duration = Duration::from_secs(1);
 /// One absolute deadline for all quit-terminal high-water ack waits.
 const QUIT_TERMINAL_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 
+fn session_scope(
+    negotiated: NegotiatedParameters,
+    task_id: Option<TaskId>,
+    output_id: Option<ConnectionOutputId>,
+) -> SessionScope {
+    SessionScope {
+        client_id: Some(negotiated.client_id),
+        task_id,
+        connection_id: output_id.map(ConnectionOutputId::as_uuid),
+        // The host currently has no resumable runtime-generation token in the
+        // query envelope. Keep the fields explicit and fail closed on a future
+        // caller that supplies them rather than silently inferring them.
+        action_epoch: None,
+        runtime_generation: None,
+    }
+}
+
 /// Capacity-one supervisor arm request: drop the pending listener before ack.
 #[derive(Debug)]
 pub struct PhysicalExitArmRequest {
     pub operation_id: OperationId,
     pub action_epoch: u64,
     pub ack: oneshot::Sender<()>,
+}
+
+#[cfg(test)]
+mod workspace_security_tests {
+    use std::process::Command as ProcessCommand;
+
+    use super::{
+        dispatch_authenticated_request, dispatch_authenticated_request_with_workspace_projects,
+        normalize_task_create_at_host,
+    };
+    use crate::domain::command::{
+        Command, CommandEnvelope, CreateTaskIntent, CreateTaskRequestIntent,
+    };
+    use crate::domain::task::{
+        ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity,
+        WorkspaceRef,
+    };
+    use crate::domain::{ClientId, CommandId, EnvironmentId, ProjectId, TaskId};
+    use crate::host::IpcError;
+    use crate::kernel::CommandBus;
+    use crate::protocol::{CapabilitySet, ClientRequest};
+    use crate::workspace::{WorkspaceProjectRoots, WorkspaceRequest};
+    use uuid::Uuid;
+
+    #[test]
+    fn authenticated_legacy_create_cannot_persist_client_supplied_workspace() {
+        let directory = tempfile::tempdir().expect("temporary host database directory");
+        let database = directory.path().join("tasks.sqlite");
+        let mut bus = CommandBus::open(&database).expect("host command bus");
+        let client_id = ClientId::new();
+        let task_id = TaskId::new();
+        let project_id = ProjectId::new();
+        let envelope = CommandEnvelope {
+            command_id: CommandId::new(),
+            client_id,
+            task_id: None,
+            issued_at_ms: 1_725_000_000_100,
+            expected_task_revision: None,
+            command: Command::CreateTask(CreateTaskIntent {
+                id: task_id,
+                environment_id: EnvironmentId::new(),
+                title: "Untrusted workspace".into(),
+                description: None,
+                project_id,
+                workspace: WorkspaceRef::external(r"C:\forged").expect("workspace ref"),
+                assignment: TaskAssignment::LocalOwner,
+                created_at_ms: 1_725_000_000_100,
+                connectivity: TaskConnectivity::Connected,
+                attention: TaskAttention::None,
+                activity: TaskActivity::Idle,
+                review_readiness: ReviewReadiness::NotReady,
+            }),
+        };
+
+        let result = dispatch_authenticated_request_with_workspace_projects(
+            client_id,
+            CapabilitySet::empty(),
+            &mut bus,
+            &WorkspaceProjectRoots::empty(),
+            ClientRequest::Command(envelope),
+        );
+
+        assert!(
+            matches!(result, Err(IpcError::Security(_))),
+            "legacy raw CreateTask must fail closed at the authenticated host boundary: {result:?}"
+        );
+        assert!(
+            bus.task_snapshot(task_id)
+                .expect("task lookup after rejected request")
+                .is_none(),
+            "rejected raw task creation must not persist a task"
+        );
+    }
+
+    #[test]
+    fn authenticated_v2_create_resolves_workspace_before_persistence() {
+        let repository = tempfile::tempdir().expect("temporary repository");
+        let output = ProcessCommand::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(repository.path())
+            .output()
+            .expect("git init");
+        assert!(output.status.success());
+
+        let database = repository.path().join("tasks.sqlite");
+        let mut bus = CommandBus::open(&database).expect("host command bus");
+        let client_id = ClientId::new();
+        let task_id = TaskId::new();
+        let project_id = ProjectId::new();
+        let project_roots =
+            WorkspaceProjectRoots::try_from_pairs([(project_id, repository.path().to_path_buf())])
+                .expect("host project roots");
+        let envelope = CommandEnvelope {
+            command_id: CommandId::new(),
+            client_id,
+            task_id: None,
+            issued_at_ms: 1_725_000_000_101,
+            expected_task_revision: None,
+            command: Command::CreateTaskV2(CreateTaskRequestIntent {
+                id: task_id,
+                environment_id: EnvironmentId::new(),
+                title: "Host-resolved workspace".into(),
+                description: None,
+                project_id,
+                workspace: WorkspaceRequest::main(),
+                assignment: TaskAssignment::LocalOwner,
+                created_at_ms: 1_725_000_000_101,
+                connectivity: TaskConnectivity::Connected,
+                attention: TaskAttention::None,
+                activity: TaskActivity::Idle,
+                review_readiness: ReviewReadiness::NotReady,
+            }),
+        };
+
+        let compatibility_result = dispatch_authenticated_request(
+            client_id,
+            CapabilitySet::empty(),
+            &mut bus,
+            ClientRequest::Command(envelope.clone()),
+        );
+        assert!(matches!(compatibility_result, Err(IpcError::Security(_))));
+
+        let result = dispatch_authenticated_request_with_workspace_projects(
+            client_id,
+            CapabilitySet::empty(),
+            &mut bus,
+            &project_roots,
+            ClientRequest::Command(envelope),
+        );
+        assert!(matches!(
+            result,
+            Ok(crate::protocol::ServerMessage::CommandReceipt(
+                crate::domain::command::CommandReceipt::Accepted { .. }
+            ))
+        ));
+        let snapshot = bus
+            .task_snapshot(task_id)
+            .expect("task lookup")
+            .expect("created task");
+        assert!(matches!(
+            snapshot.task.workspace,
+            crate::domain::task::WorkspaceRef::HostBound { .. }
+        ));
+    }
+
+    #[test]
+    fn authenticated_v2_create_rejects_an_unknown_host_project_id() {
+        let repository = tempfile::tempdir().expect("temporary repository");
+        let output = ProcessCommand::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(repository.path())
+            .output()
+            .expect("git init");
+        assert!(output.status.success());
+
+        let database = repository.path().join("tasks.sqlite");
+        let mut bus = CommandBus::open(&database).expect("host command bus");
+        let client_id = ClientId::new();
+        let task_id = TaskId::new();
+        let envelope = CommandEnvelope {
+            command_id: CommandId::new(),
+            client_id,
+            task_id: None,
+            issued_at_ms: 1_725_000_000_102,
+            expected_task_revision: None,
+            command: Command::CreateTaskV2(CreateTaskRequestIntent {
+                id: task_id,
+                environment_id: EnvironmentId::new(),
+                title: "Unknown project".into(),
+                description: None,
+                project_id: ProjectId::new(),
+                workspace: WorkspaceRequest::main(),
+                assignment: TaskAssignment::LocalOwner,
+                created_at_ms: 1_725_000_000_102,
+                connectivity: TaskConnectivity::Connected,
+                attention: TaskAttention::None,
+                activity: TaskActivity::Idle,
+                review_readiness: ReviewReadiness::NotReady,
+            }),
+        };
+
+        let result = dispatch_authenticated_request_with_workspace_projects(
+            client_id,
+            CapabilitySet::empty(),
+            &mut bus,
+            &WorkspaceProjectRoots::empty(),
+            ClientRequest::Command(envelope),
+        );
+
+        assert!(matches!(result, Err(IpcError::Security(_))));
+        assert!(
+            bus.task_snapshot(task_id)
+                .expect("task lookup after rejected request")
+                .is_none(),
+            "unknown host project ids must not persist a task"
+        );
+    }
+
+    #[test]
+    fn workspace_security_errors_are_bounded_and_do_not_echo_paths() {
+        let repository = tempfile::tempdir().expect("temporary repository");
+        let database = repository.path().join("tasks.sqlite");
+        let mut bus = CommandBus::open(&database).expect("host command bus");
+        let client_id = ClientId::new();
+        let task_id = TaskId::new();
+        let project_id = ProjectId::new();
+        let project_roots =
+            WorkspaceProjectRoots::try_from_pairs([(project_id, repository.path().to_path_buf())])
+                .expect("host project roots");
+        let envelope = CommandEnvelope {
+            command_id: CommandId::new(),
+            client_id,
+            task_id: None,
+            issued_at_ms: 1_725_000_000_103,
+            expected_task_revision: None,
+            command: Command::CreateTaskV2(CreateTaskRequestIntent {
+                id: task_id,
+                environment_id: EnvironmentId::new(),
+                title: "Rejected workspace".into(),
+                description: None,
+                project_id,
+                workspace: WorkspaceRequest::new_worktree(
+                    repository.path().join("missing-worktree"),
+                    "codex/missing",
+                ),
+                assignment: TaskAssignment::LocalOwner,
+                created_at_ms: 1_725_000_000_103,
+                connectivity: TaskConnectivity::Connected,
+                attention: TaskAttention::None,
+                activity: TaskActivity::Idle,
+                review_readiness: ReviewReadiness::NotReady,
+            }),
+        };
+
+        let result = dispatch_authenticated_request_with_workspace_projects(
+            client_id,
+            CapabilitySet::empty(),
+            &mut bus,
+            &project_roots,
+            ClientRequest::Command(envelope),
+        );
+        let IpcError::Security(message) = result.expect_err("invalid workspace must reject") else {
+            panic!("invalid workspace must return a security error");
+        };
+        assert!(message.len() <= 128, "security error must remain bounded");
+        assert!(
+            !message.contains(&repository.path().to_string_lossy().to_string()),
+            "security error must not echo a filesystem path"
+        );
+        assert!(bus
+            .task_snapshot(task_id)
+            .expect("task lookup after rejected request")
+            .is_none());
+    }
+
+    #[test]
+    fn authorization_rejects_command_substitution_without_persisting_an_effect() {
+        let repository = tempfile::tempdir().expect("temporary repository");
+        let output = ProcessCommand::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(repository.path())
+            .output()
+            .expect("git init");
+        assert!(output.status.success());
+
+        let database = repository.path().join("substitution.sqlite");
+        let mut bus = CommandBus::open(&database).expect("host command bus");
+        let client_id = ClientId::new();
+        let task_id = TaskId::new();
+        let project_id = ProjectId::new();
+        let project_roots =
+            WorkspaceProjectRoots::try_from_pairs([(project_id, repository.path().to_path_buf())])
+                .expect("host project roots");
+        let connection_id = Uuid::now_v7();
+        let envelope = CommandEnvelope {
+            command_id: CommandId::new(),
+            client_id,
+            task_id: None,
+            issued_at_ms: 1_725_000_000_104,
+            expected_task_revision: None,
+            command: Command::CreateTaskV2(CreateTaskRequestIntent {
+                id: task_id,
+                environment_id: EnvironmentId::new(),
+                title: "substitution guard".into(),
+                description: None,
+                project_id,
+                workspace: WorkspaceRequest::main(),
+                assignment: TaskAssignment::LocalOwner,
+                created_at_ms: 1_725_000_000_104,
+                connectivity: TaskConnectivity::Connected,
+                attention: TaskAttention::None,
+                activity: TaskActivity::Idle,
+                review_readiness: ReviewReadiness::NotReady,
+            }),
+        };
+        let (normalized, authorization, request_id) =
+            normalize_task_create_at_host(envelope, Some(&project_roots), None, connection_id)
+                .expect("host normalization");
+        let Some(authorization) = authorization else {
+            panic!("CreateTaskV2 must receive host authorization");
+        };
+        let request_id = request_id.expect("host request nonce");
+        let mut substituted = normalized;
+        substituted.command_id = CommandId::new();
+
+        assert_eq!(
+            bus.execute_host_authorized(
+                substituted,
+                Some(authorization),
+                request_id,
+                connection_id,
+            ),
+            Err(crate::kernel::StoreError::HostAuthorityRequired)
+        );
+        assert!(bus
+            .task_snapshot(task_id)
+            .expect("task lookup after substitution")
+            .is_none());
+    }
 }
 
 /// Typed intentional exit from a supervised [`HostRequestExecutor`].
@@ -121,6 +471,8 @@ enum ExecutorControl {
     RegisterOutput {
         id: ConnectionOutputId,
         output: ConnectionOutputHandle,
+        client_id: Option<ClientId>,
+        reconnect_from: Option<ConnectionOutputId>,
         ack: oneshot::Sender<()>,
     },
     UnregisterOutput {
@@ -151,6 +503,7 @@ pub(crate) struct OutputInspection {
 
 struct SnapshotRegistryEntry {
     owner: ClientId,
+    scope: SessionScope,
     session: SnapshotSession,
     limits: PageLimits,
     last_touch: Instant,
@@ -163,7 +516,7 @@ struct SnapshotRegistry {
 impl SnapshotRegistry {
     fn new() -> Self {
         Self {
-            entries: HashMap::new(),
+            entries: HashMap::with_capacity(MAX_SNAPSHOT_SESSIONS),
         }
     }
 
@@ -185,6 +538,13 @@ impl SnapshotRegistry {
         }
     }
 
+    /// Make the bounded map admission decision before opening a SQLite view.
+    /// The page/session allocation is therefore never the first operation to
+    /// grow this registry.
+    fn prepare_insert(&mut self) {
+        self.evict_lru_if_at_capacity();
+    }
+
     fn insert(
         &mut self,
         owner: ClientId,
@@ -198,6 +558,7 @@ impl SnapshotRegistry {
             snapshot_id,
             SnapshotRegistryEntry {
                 owner,
+                scope: session.scope(),
                 session,
                 limits,
                 last_touch: now,
@@ -215,10 +576,28 @@ impl SnapshotRegistry {
         self.entries.remove(&snapshot_id)
     }
 
+    /// Move authorization for one client from a closed physical connection to
+    /// the new connection admitted by a one-shot reconnect grant.  The pinned
+    /// session keeps the issuance scope so its HMAC cursor remains resumable;
+    /// this registry scope is the current connection gate.
+    fn rebind_output(
+        &mut self,
+        client_id: ClientId,
+        old_output: ConnectionOutputId,
+        new_output: ConnectionOutputId,
+    ) {
+        for entry in self.entries.values_mut() {
+            if entry.owner == client_id && entry.scope.connection_id == Some(old_output.as_uuid()) {
+                entry.scope.connection_id = Some(new_output.as_uuid());
+            }
+        }
+    }
+
     fn get(
         &self,
         snapshot_id: SnapshotId,
         requester: ClientId,
+        scope: SessionScope,
         limits: PageLimits,
         now: Instant,
     ) -> Result<&SnapshotSession, QueryError> {
@@ -228,7 +607,7 @@ impl SnapshotRegistry {
         if now.duration_since(entry.last_touch) >= SNAPSHOT_IDLE_TTL {
             return Err(QueryError::NotFound);
         }
-        if entry.owner != requester {
+        if entry.owner != requester || entry.scope != scope {
             return Err(QueryError::Unauthorized);
         }
         if entry.limits != limits {
@@ -326,6 +705,7 @@ impl LiveTail {
 
 struct EventReplayRegistryEntry {
     owner: ClientId,
+    scope: SessionScope,
     /// Present only while frozen pages remain. Dropped when frozen replay completes.
     frozen: Option<EventReplaySession>,
     limits: PageLimits,
@@ -341,7 +721,7 @@ struct EventReplayRegistry {
 impl EventReplayRegistry {
     fn new() -> Self {
         Self {
-            entries: HashMap::new(),
+            entries: HashMap::with_capacity(MAX_EVENT_REPLAY_SESSIONS),
         }
     }
 
@@ -379,6 +759,13 @@ impl EventReplayRegistry {
         }
     }
 
+    /// Preflight the bounded registry before opening a read transaction.  A
+    /// full live-only registry fails closed; only inactive frozen sessions may
+    /// be evicted.
+    fn prepare_insert(&mut self) -> bool {
+        self.try_evict_inactive_frozen_for_capacity()
+    }
+
     fn insert_open(
         &mut self,
         owner: ClientId,
@@ -401,6 +788,7 @@ impl EventReplayRegistry {
             subscription_id,
             EventReplayRegistryEntry {
                 owner,
+                scope: session.scope(),
                 frozen: retain_frozen.then_some(session),
                 limits,
                 last_touch: now,
@@ -422,6 +810,30 @@ impl EventReplayRegistry {
             live.stream.cancel();
         }
         Some(entry)
+    }
+
+    /// Move frozen/live authorization to a freshly admitted physical output.
+    /// The immutable replay cursor retains its issuance scope, while live
+    /// delivery starts from the last sequence physically admitted before the
+    /// old output was lost.
+    fn rebind_output(
+        &mut self,
+        client_id: ClientId,
+        old_output: ConnectionOutputId,
+        new_output: ConnectionOutputId,
+    ) {
+        for entry in self.entries.values_mut() {
+            if entry.owner != client_id || entry.scope.connection_id != Some(old_output.as_uuid()) {
+                continue;
+            }
+            entry.scope.connection_id = Some(new_output.as_uuid());
+            if let Some(live) = entry.live.as_mut() {
+                let baseline = live.last_admitted_sequence;
+                live.stream.cancel();
+                live.output_id = new_output;
+                live.stream = LiveStreamState::new(baseline);
+            }
+        }
     }
 
     fn remove_for_output(&mut self, output_id: ConnectionOutputId) {
@@ -451,6 +863,7 @@ impl EventReplayRegistry {
         &self,
         subscription_id: SubscriptionId,
         requester: ClientId,
+        scope: SessionScope,
         limits: PageLimits,
         now: Instant,
     ) -> Result<&EventReplaySession, QueryError> {
@@ -460,7 +873,7 @@ impl EventReplayRegistry {
         if entry.frozen.is_some() && now.duration_since(entry.last_touch) >= EVENT_REPLAY_IDLE_TTL {
             return Err(QueryError::NotFound);
         }
-        if entry.owner != requester {
+        if entry.owner != requester || entry.scope != scope {
             return Err(QueryError::Unauthorized);
         }
         if entry.limits != limits {
@@ -520,6 +933,30 @@ impl HostRequestHandle {
         &self,
         output: ConnectionOutputHandle,
     ) -> Result<ConnectionOutputRegistration, IpcError> {
+        self.register_output_with_reconnect(output, None, None)
+            .await
+    }
+
+    pub(crate) async fn register_output_for_connection(
+        &self,
+        output: ConnectionOutputHandle,
+        client_id: ClientId,
+        reconnect_from: Option<Uuid>,
+    ) -> Result<ConnectionOutputRegistration, IpcError> {
+        self.register_output_with_reconnect(
+            output,
+            Some(client_id),
+            reconnect_from.map(ConnectionOutputId::from_uuid),
+        )
+        .await
+    }
+
+    async fn register_output_with_reconnect(
+        &self,
+        output: ConnectionOutputHandle,
+        client_id: Option<ClientId>,
+        reconnect_from: Option<ConnectionOutputId>,
+    ) -> Result<ConnectionOutputRegistration, IpcError> {
         let id = output.id();
         // Arm before any await: cancel must not leave an inserted output without
         // a shutdown owner. Shutdown goes through the handle's synchronized path.
@@ -533,6 +970,8 @@ impl HostRequestHandle {
             .send(ExecutorControl::RegisterOutput {
                 id,
                 output,
+                client_id,
+                reconnect_from,
                 ack: ack_tx,
             })
             .await
@@ -640,9 +1079,59 @@ impl HostRequestHandle {
     }
 }
 
+/// Host-only configuration admission.  The roots are derived once from the
+/// sealed ConfigStore issuer; every task admission re-reads the strict store
+/// immediately before binding so an external replacement cannot revive stale
+/// path authority.
+struct HostWorkspaceAdmission {
+    store: ConfigStore,
+    issuer: crate::config::ConfigWorkspaceIssuer,
+    roots: WorkspaceProjectRoots,
+}
+
+impl HostWorkspaceAdmission {
+    fn new(
+        mut store: ConfigStore,
+        action_epoch: u64,
+        runtime_generation: u64,
+    ) -> Result<Self, ConfigError> {
+        let revision = store.snapshot().revision;
+        let issuer = store.issue_workspace_authority(revision, action_epoch, runtime_generation)?;
+        let roots = WorkspaceProjectRoots::from_config_issuer(&issuer).map_err(|_| {
+            ConfigError::new(
+                crate::config::ConfigErrorKind::Validation,
+                "configured workspace roots are unavailable",
+            )
+        })?;
+        Ok(Self {
+            store,
+            issuer,
+            roots,
+        })
+    }
+
+    fn validate_current(&self) -> Result<(), ConfigError> {
+        self.store.validate_workspace_issuer_current(&self.issuer)
+    }
+
+    fn roots(&self) -> &WorkspaceProjectRoots {
+        &self.roots
+    }
+
+    fn action_epoch(&self) -> u64 {
+        self.issuer.action_epoch()
+    }
+
+    fn runtime_generation(&self) -> u64 {
+        self.issuer.runtime_generation()
+    }
+}
+
 /// Exclusive owner of [`CommandBus`]. Runs on one task and drains a bounded queue.
 pub struct HostRequestExecutor {
     bus: CommandBus,
+    workspace_projects: WorkspaceProjectRoots,
+    config_admission: Option<HostWorkspaceAdmission>,
     rx: mpsc::Receiver<HostRequestJob>,
     control_rx: mpsc::Receiver<ExecutorControl>,
     control_closed: bool,
@@ -663,7 +1152,15 @@ impl HostRequestExecutor {
     /// every handle closes the queue; the executor then finishes after draining
     /// any already-queued jobs.
     pub fn start(bus: CommandBus) -> (HostRequestHandle, JoinHandle<()>) {
-        Self::spawn(bus, true)
+        Self::start_with_workspace_projects(bus, WorkspaceProjectRoots::empty())
+    }
+
+    /// Spawn the executor with the host-owned ProjectId-to-root mapping.
+    pub(crate) fn start_with_workspace_projects(
+        bus: CommandBus,
+        workspace_projects: WorkspaceProjectRoots,
+    ) -> (HostRequestHandle, JoinHandle<()>) {
+        Self::spawn(bus, true, workspace_projects)
     }
 
     /// Supervised foreground start: arm channel + typed intentional exit outcome.
@@ -671,8 +1168,52 @@ impl HostRequestExecutor {
     /// Ordinary [`Self::start`] callers are unchanged. The supervisor must drop the
     /// pending accept listener before acknowledging [`PhysicalExitArmRequest`].
     pub fn start_supervised(bus: CommandBus) -> (HostRequestHandle, SupervisedHostExecutor) {
-        let (handle, join, arm_rx) = Self::spawn_supervised(bus, true);
+        Self::start_supervised_with_workspace_projects(bus, WorkspaceProjectRoots::empty())
+    }
+
+    /// Supervised start with the host-owned ProjectId-to-root mapping.
+    pub(crate) fn start_supervised_with_workspace_projects(
+        bus: CommandBus,
+        workspace_projects: WorkspaceProjectRoots,
+    ) -> (HostRequestHandle, SupervisedHostExecutor) {
+        let (handle, join, arm_rx) = Self::spawn_supervised(bus, true, workspace_projects);
         (handle, SupervisedHostExecutor { arm_rx, join })
+    }
+
+    /// Start the supervised host from a ConfigStore-issued workspace
+    /// authority. Raw configured id/root pairs never enter this API.
+    pub fn start_supervised_with_config_store(
+        bus: CommandBus,
+        store: ConfigStore,
+    ) -> Result<(HostRequestHandle, SupervisedHostExecutor), ConfigError> {
+        Self::start_supervised_with_config_store_at_generation(bus, store, 1, 1)
+    }
+
+    /// Test-only compatibility seam for the workspace service contract suite.
+    /// Production host admission must use [`Self::start_supervised_with_config_store`].
+    #[cfg(test)]
+    pub(crate) fn start_supervised_with_project_config(
+        bus: CommandBus,
+        projects: Vec<(String, String)>,
+    ) -> Result<(HostRequestHandle, SupervisedHostExecutor), WorkspaceProjectRootsError> {
+        let workspace_projects = WorkspaceProjectRoots::try_from_config(projects)?;
+        Ok(Self::start_supervised_with_workspace_projects(
+            bus,
+            workspace_projects,
+        ))
+    }
+
+    pub(crate) fn start_supervised_with_config_store_at_generation(
+        bus: CommandBus,
+        store: ConfigStore,
+        action_epoch: u64,
+        runtime_generation: u64,
+    ) -> Result<(HostRequestHandle, SupervisedHostExecutor), ConfigError> {
+        let admission = HostWorkspaceAdmission::new(store, action_epoch, runtime_generation)?;
+        let workspace_projects = admission.roots().clone();
+        let (handle, join, arm_rx) =
+            Self::spawn_supervised_with_admission(bus, true, workspace_projects, admission);
+        Ok((handle, SupervisedHostExecutor { arm_rx, join }))
     }
 
     /// Test-only: same executor as [`Self::start`], but without the automatic
@@ -680,7 +1221,15 @@ impl HostRequestExecutor {
     /// calls are the only cleanup/teardown driver.
     #[cfg(test)]
     fn start_without_automatic_maintenance(bus: CommandBus) -> (HostRequestHandle, JoinHandle<()>) {
-        Self::spawn(bus, false)
+        Self::spawn(bus, false, WorkspaceProjectRoots::empty())
+    }
+
+    #[cfg(test)]
+    fn start_without_automatic_maintenance_with_workspace_projects(
+        bus: CommandBus,
+        workspace_projects: WorkspaceProjectRoots,
+    ) -> (HostRequestHandle, JoinHandle<()>) {
+        Self::spawn(bus, false, workspace_projects)
     }
 
     /// Test-only supervised start without the automatic maintenance timer.
@@ -688,13 +1237,51 @@ impl HostRequestExecutor {
     fn start_supervised_without_automatic_maintenance(
         bus: CommandBus,
     ) -> (HostRequestHandle, SupervisedHostExecutor) {
-        let (handle, join, arm_rx) = Self::spawn_supervised(bus, false);
+        let (handle, join, arm_rx) =
+            Self::spawn_supervised(bus, false, WorkspaceProjectRoots::empty());
         (handle, SupervisedHostExecutor { arm_rx, join })
     }
 
     fn spawn_supervised(
         bus: CommandBus,
         schedule_automatic_maintenance: bool,
+        workspace_projects: WorkspaceProjectRoots,
+    ) -> (
+        HostRequestHandle,
+        JoinHandle<Result<HostExecutorOutcome, StoreError>>,
+        mpsc::Receiver<PhysicalExitArmRequest>,
+    ) {
+        Self::spawn_supervised_inner(
+            bus,
+            schedule_automatic_maintenance,
+            workspace_projects,
+            None,
+        )
+    }
+
+    fn spawn_supervised_with_admission(
+        bus: CommandBus,
+        schedule_automatic_maintenance: bool,
+        workspace_projects: WorkspaceProjectRoots,
+        admission: HostWorkspaceAdmission,
+    ) -> (
+        HostRequestHandle,
+        JoinHandle<Result<HostExecutorOutcome, StoreError>>,
+        mpsc::Receiver<PhysicalExitArmRequest>,
+    ) {
+        Self::spawn_supervised_inner(
+            bus,
+            schedule_automatic_maintenance,
+            workspace_projects,
+            Some(admission),
+        )
+    }
+
+    fn spawn_supervised_inner(
+        bus: CommandBus,
+        schedule_automatic_maintenance: bool,
+        workspace_projects: WorkspaceProjectRoots,
+        config_admission: Option<HostWorkspaceAdmission>,
     ) -> (
         HostRequestHandle,
         JoinHandle<Result<HostExecutorOutcome, StoreError>>,
@@ -710,14 +1297,16 @@ impl HostRequestExecutor {
         };
         let mut executor = Self {
             bus,
+            workspace_projects,
+            config_admission,
             rx,
             control_rx,
             control_closed: false,
             registry: SnapshotRegistry::new(),
             replay_registry: EventReplayRegistry::new(),
             artifact_content_registry: ArtifactContentRegistry::new(),
-            outputs: HashMap::new(),
-            pending_quit_receipt_acks: HashMap::new(),
+            outputs: HashMap::with_capacity(MAX_SNAPSHOT_SESSIONS),
+            pending_quit_receipt_acks: HashMap::with_capacity(MAX_SNAPSHOT_SESSIONS),
             arm_tx: Some(arm_tx),
         };
         let join = tokio::spawn(async move {
@@ -731,6 +1320,21 @@ impl HostRequestExecutor {
     fn spawn(
         bus: CommandBus,
         schedule_automatic_maintenance: bool,
+        workspace_projects: WorkspaceProjectRoots,
+    ) -> (HostRequestHandle, JoinHandle<()>) {
+        Self::spawn_inner(
+            bus,
+            schedule_automatic_maintenance,
+            workspace_projects,
+            None,
+        )
+    }
+
+    fn spawn_inner(
+        bus: CommandBus,
+        schedule_automatic_maintenance: bool,
+        workspace_projects: WorkspaceProjectRoots,
+        config_admission: Option<HostWorkspaceAdmission>,
     ) -> (HostRequestHandle, JoinHandle<()>) {
         let (tx, rx) = mpsc::channel(HOST_REQUEST_QUEUE_CAPACITY);
         let (control_tx, control_rx) = mpsc::channel(HOST_REQUEST_QUEUE_CAPACITY);
@@ -741,14 +1345,16 @@ impl HostRequestExecutor {
         };
         let mut executor = Self {
             bus,
+            workspace_projects,
+            config_admission,
             rx,
             control_rx,
             control_closed: false,
             registry: SnapshotRegistry::new(),
             replay_registry: EventReplayRegistry::new(),
             artifact_content_registry: ArtifactContentRegistry::new(),
-            outputs: HashMap::new(),
-            pending_quit_receipt_acks: HashMap::new(),
+            outputs: HashMap::with_capacity(MAX_SNAPSHOT_SESSIONS),
+            pending_quit_receipt_acks: HashMap::with_capacity(MAX_SNAPSHOT_SESSIONS),
             arm_tx: None,
         };
         let join = tokio::spawn(async move {
@@ -843,7 +1449,24 @@ impl HostRequestExecutor {
 
     fn handle_control(&mut self, control: ExecutorControl) {
         match control {
-            ExecutorControl::RegisterOutput { id, output, ack } => {
+            ExecutorControl::RegisterOutput {
+                id,
+                output,
+                client_id,
+                reconnect_from,
+                ack,
+            } => {
+                let replacing = reconnect_from.filter(|old| self.outputs.contains_key(old));
+                if self.outputs.len() >= MAX_SNAPSHOT_SESSIONS
+                    && !self.outputs.contains_key(&id)
+                    && replacing.is_none()
+                {
+                    output.request_shutdown();
+                    return;
+                }
+                if let (Some(client_id), Some(old_id)) = (client_id, reconnect_from) {
+                    self.rebind_connection(client_id, old_id, id);
+                }
                 self.outputs.insert(id, output);
                 if ack.send(()).is_err() {
                     self.detach_output(id);
@@ -878,6 +1501,26 @@ impl HostRequestExecutor {
                     .map(|pending| (pending.operation_id, pending.ack));
                 let _ = ack.send(taken);
             }
+        }
+    }
+
+    fn rebind_connection(
+        &mut self,
+        client_id: ClientId,
+        old_id: ConnectionOutputId,
+        new_id: ConnectionOutputId,
+    ) {
+        if old_id == new_id {
+            return;
+        }
+        self.registry.rebind_output(client_id, old_id, new_id);
+        self.replay_registry
+            .rebind_output(client_id, old_id, new_id);
+        self.artifact_content_registry
+            .rebind_output(client_id, old_id.as_uuid(), new_id.as_uuid());
+        self.pending_quit_receipt_acks.remove(&old_id);
+        if let Some(old_output) = self.outputs.remove(&old_id) {
+            old_output.request_shutdown();
         }
     }
 
@@ -1304,6 +1947,9 @@ impl HostRequestExecutor {
         let Some(output) = self.outputs.get(&output_id) else {
             return Err(IpcError::Unavailable);
         };
+        if self.pending_quit_receipt_acks.len() >= MAX_SNAPSHOT_SESSIONS {
+            return Err(IpcError::Busy);
+        }
         let ack = output.try_enqueue_critical_tracked(response)?;
         self.pending_quit_receipt_acks
             .insert(output_id, PendingQuitReceiptAck { operation_id, ack });
@@ -1326,7 +1972,24 @@ impl HostRequestExecutor {
                 {
                     return Err(IpcError::UnsupportedCapability);
                 }
-                let receipt = self.bus.execute(envelope).map_err(map_store_error)?;
+                let connection_id = output_id
+                    .map(ConnectionOutputId::as_uuid)
+                    .unwrap_or(Uuid::nil());
+                let (envelope, authorization, request_id) = normalize_task_create_at_host(
+                    envelope,
+                    Some(&self.workspace_projects),
+                    self.config_admission.as_ref(),
+                    connection_id,
+                )?;
+                let receipt = self
+                    .bus
+                    .execute_host_authorized(
+                        envelope,
+                        authorization,
+                        request_id.unwrap_or_else(RequestId::new),
+                        connection_id,
+                    )
+                    .map_err(map_store_error)?;
                 self.fan_out_live_durable_events();
                 Ok(ServerMessage::CommandReceipt(receipt))
             }
@@ -1354,14 +2017,29 @@ impl HostRequestExecutor {
                 snapshot_id,
                 resume_cursor,
             } => {
+                // The kernel snapshot is global. A task-scoped envelope must
+                // not be allowed to borrow that view until a task-filtered
+                // snapshot implementation exists.
+                if task_id.is_some() {
+                    return Ok(QueryReply {
+                        request_id: envelope.request_id,
+                        outcome: QueryOutcome::Err(QueryError::InvalidRequest),
+                    });
+                }
                 if !negotiated.capabilities.contains(Capability::PagedSnapshots) {
                     return Ok(QueryReply {
                         request_id: envelope.request_id,
                         outcome: QueryOutcome::Err(QueryError::UnsupportedCapability),
                     });
                 }
-                let outcome =
-                    self.serve_snapshot_page(negotiated, section, snapshot_id, resume_cursor)?;
+                let outcome = self.serve_snapshot_page(
+                    negotiated,
+                    task_id,
+                    section,
+                    snapshot_id,
+                    resume_cursor,
+                    output_id,
+                )?;
                 Ok(QueryReply {
                     request_id: envelope.request_id,
                     outcome,
@@ -1374,7 +2052,8 @@ impl HostRequestExecutor {
                         outcome: QueryOutcome::Err(QueryError::UnsupportedCapability),
                     });
                 }
-                let outcome = self.serve_release_snapshot(negotiated.client_id, snapshot_id);
+                let outcome =
+                    self.serve_release_snapshot(negotiated, task_id, snapshot_id, output_id);
                 Ok(QueryReply {
                     request_id: envelope.request_id,
                     outcome,
@@ -1441,7 +2120,7 @@ impl HostRequestExecutor {
                     });
                 }
                 let outcome =
-                    self.serve_release_event_replay(negotiated.client_id, subscription_id);
+                    self.serve_release_event_replay(negotiated, subscription_id, output_id);
                 Ok(QueryReply {
                     request_id: envelope.request_id,
                     outcome,
@@ -1460,7 +2139,13 @@ impl HostRequestExecutor {
                         outcome: QueryOutcome::Err(QueryError::UnsupportedCapability),
                     });
                 }
-                let outcome = self.serve_open_artifact_content(negotiated, task_id, artifact_id)?;
+                let outcome = self.serve_open_artifact_content(
+                    negotiated,
+                    envelope.request_id,
+                    task_id,
+                    artifact_id,
+                    output_id,
+                )?;
                 Ok(QueryReply {
                     request_id: envelope.request_id,
                     outcome,
@@ -1487,6 +2172,7 @@ impl HostRequestExecutor {
                     task_id,
                     subscription_id,
                     resume_cursor,
+                    output_id,
                 )?;
                 Ok(QueryReply {
                     request_id: envelope.request_id,
@@ -1507,9 +2193,10 @@ impl HostRequestExecutor {
                     });
                 }
                 let outcome = self.serve_release_artifact_content(
-                    negotiated.client_id,
+                    negotiated,
                     task_id,
                     subscription_id,
+                    output_id,
                 )?;
                 Ok(QueryReply {
                     request_id: envelope.request_id,
@@ -1540,18 +2227,25 @@ impl HostRequestExecutor {
     fn serve_snapshot_page(
         &mut self,
         negotiated: NegotiatedParameters,
+        task_id: Option<TaskId>,
         section: SnapshotSection,
         snapshot_id: Option<SnapshotId>,
         resume_cursor: Option<Vec<u8>>,
+        output_id: Option<ConnectionOutputId>,
     ) -> Result<QueryOutcome, IpcError> {
         match (snapshot_id, resume_cursor) {
-            (None, None) => self.open_snapshot_page(negotiated, section),
+            (None, None) => self.open_snapshot_page(negotiated, task_id, section, output_id),
             (Some(snapshot_id), None) => {
-                self.begin_snapshot_section(negotiated, section, snapshot_id)
+                self.begin_snapshot_section(negotiated, task_id, section, snapshot_id, output_id)
             }
-            (Some(snapshot_id), Some(resume_cursor)) => {
-                self.resume_snapshot_page(negotiated, section, snapshot_id, resume_cursor)
-            }
+            (Some(snapshot_id), Some(resume_cursor)) => self.resume_snapshot_page(
+                negotiated,
+                task_id,
+                section,
+                snapshot_id,
+                resume_cursor,
+                output_id,
+            ),
             (None, Some(_)) => Ok(QueryOutcome::Err(QueryError::InvalidRequest)),
         }
     }
@@ -1559,14 +2253,18 @@ impl HostRequestExecutor {
     fn open_snapshot_page(
         &mut self,
         negotiated: NegotiatedParameters,
+        task_id: Option<TaskId>,
         section: SnapshotSection,
+        output_id: Option<ConnectionOutputId>,
     ) -> Result<QueryOutcome, IpcError> {
         let now = Instant::now();
         self.registry.reap_idle(now);
         let limits = page_limits_from_negotiated(negotiated)?;
+        self.registry.prepare_insert();
+        let scope = session_scope(negotiated, task_id, output_id);
         let session = self
             .bus
-            .begin_snapshot(limits)
+            .begin_snapshot_scoped(limits, scope)
             .map_err(map_snapshot_error_transport)?;
         let page = match session.page(section, None) {
             Ok(page) => page,
@@ -1582,8 +2280,10 @@ impl HostRequestExecutor {
     fn begin_snapshot_section(
         &mut self,
         negotiated: NegotiatedParameters,
+        task_id: Option<TaskId>,
         section: SnapshotSection,
         snapshot_id: SnapshotId,
+        output_id: Option<ConnectionOutputId>,
     ) -> Result<QueryOutcome, IpcError> {
         let now = Instant::now();
         self.registry.reap_idle(now);
@@ -1594,9 +2294,10 @@ impl HostRequestExecutor {
             }
         }
         let limits = page_limits_from_negotiated(negotiated)?;
+        let scope = session_scope(negotiated, task_id, output_id);
         let session = match self
             .registry
-            .get(snapshot_id, negotiated.client_id, limits, now)
+            .get(snapshot_id, negotiated.client_id, scope, limits, now)
         {
             Ok(session) => session,
             Err(error) => return Ok(QueryOutcome::Err(error)),
@@ -1612,9 +2313,11 @@ impl HostRequestExecutor {
     fn resume_snapshot_page(
         &mut self,
         negotiated: NegotiatedParameters,
+        task_id: Option<TaskId>,
         section: SnapshotSection,
         snapshot_id: SnapshotId,
         resume_cursor: Vec<u8>,
+        output_id: Option<ConnectionOutputId>,
     ) -> Result<QueryOutcome, IpcError> {
         let now = Instant::now();
         self.registry.reap_idle(now);
@@ -1626,9 +2329,10 @@ impl HostRequestExecutor {
             }
         }
         let limits = page_limits_from_negotiated(negotiated)?;
+        let scope = session_scope(negotiated, task_id, output_id);
         let session = match self
             .registry
-            .get(snapshot_id, negotiated.client_id, limits, now)
+            .get(snapshot_id, negotiated.client_id, scope, limits, now)
         {
             Ok(session) => session,
             Err(error) => return Ok(QueryOutcome::Err(error)),
@@ -1647,14 +2351,21 @@ impl HostRequestExecutor {
 
     fn serve_release_snapshot(
         &mut self,
-        requester: ClientId,
+        negotiated: NegotiatedParameters,
+        task_id: Option<TaskId>,
         snapshot_id: SnapshotId,
+        output_id: Option<ConnectionOutputId>,
     ) -> QueryOutcome {
         let now = Instant::now();
         self.registry.reap_idle(now);
         match self.registry.entries.get(&snapshot_id) {
             None => QueryOutcome::Ok(QueryResult::SnapshotReleased { snapshot_id }),
-            Some(entry) if entry.owner != requester => QueryOutcome::Err(QueryError::Unauthorized),
+            Some(entry)
+                if entry.owner != negotiated.client_id
+                    || entry.scope != session_scope(negotiated, task_id, output_id) =>
+            {
+                QueryOutcome::Err(QueryError::Unauthorized)
+            }
             Some(_) => {
                 self.registry.remove(snapshot_id);
                 QueryOutcome::Ok(QueryResult::SnapshotReleased { snapshot_id })
@@ -1671,7 +2382,14 @@ impl HostRequestExecutor {
         let now = Instant::now();
         self.replay_registry.reap_idle(now);
         let limits = page_limits_from_negotiated(negotiated)?;
-        let session = match self.bus.begin_event_replay(after_sequence, limits) {
+        if !self.replay_registry.prepare_insert() {
+            return Err(IpcError::Busy);
+        }
+        let session = match self.bus.begin_event_replay_scoped(
+            after_sequence,
+            limits,
+            session_scope(negotiated, None, output_id),
+        ) {
             Ok(session) => session,
             Err(error) => return map_replay_error(error),
         };
@@ -1722,6 +2440,7 @@ impl HostRequestExecutor {
         let session = match self.replay_registry.get_frozen(
             subscription_id,
             negotiated.client_id,
+            session_scope(negotiated, None, output_id),
             limits,
             now,
         ) {
@@ -1796,14 +2515,20 @@ impl HostRequestExecutor {
 
     fn serve_release_event_replay(
         &mut self,
-        requester: ClientId,
+        negotiated: NegotiatedParameters,
         subscription_id: SubscriptionId,
+        output_id: Option<ConnectionOutputId>,
     ) -> QueryOutcome {
         let now = Instant::now();
         self.replay_registry.reap_idle(now);
         match self.replay_registry.entries.get(&subscription_id) {
             None => QueryOutcome::Ok(QueryResult::EventReplayReleased { subscription_id }),
-            Some(entry) if entry.owner != requester => QueryOutcome::Err(QueryError::Unauthorized),
+            Some(entry)
+                if entry.owner != negotiated.client_id
+                    || entry.scope != session_scope(negotiated, None, output_id) =>
+            {
+                QueryOutcome::Err(QueryError::Unauthorized)
+            }
             Some(_) => {
                 // remove() cancels the live stream generation so queued durables
                 // for this subscription are skipped after the release reply.
@@ -1816,15 +2541,18 @@ impl HostRequestExecutor {
     fn serve_open_artifact_content(
         &mut self,
         negotiated: NegotiatedParameters,
+        request_id: RequestId,
         task_id: TaskId,
         artifact_id: ArtifactId,
+        output_id: Option<ConnectionOutputId>,
     ) -> Result<QueryOutcome, IpcError> {
         let now = Instant::now();
         self.artifact_content_registry.reap(now);
         let limits = page_limits_from_negotiated(negotiated)?;
-        let session = match self.bus.begin_artifact_content(
-            negotiated.client_id,
-            task_id,
+        let scope = session_scope(negotiated, Some(task_id), output_id);
+        let session = match self.bus.begin_artifact_content_scoped(
+            scope,
+            request_id,
             artifact_id,
             limits,
             negotiated.limits.max_reassembled_message_bytes,
@@ -1852,14 +2580,14 @@ impl HostRequestExecutor {
         task_id: TaskId,
         subscription_id: SubscriptionId,
         resume_cursor: Vec<u8>,
+        output_id: Option<ConnectionOutputId>,
     ) -> Result<QueryOutcome, IpcError> {
         let now = Instant::now();
         self.artifact_content_registry.reap(now);
         let limits = page_limits_from_negotiated(negotiated)?;
-        let session = match self.artifact_content_registry.get(
+        let session = match self.artifact_content_registry.get_scoped(
             subscription_id,
-            negotiated.client_id,
-            task_id,
+            session_scope(negotiated, Some(task_id), output_id),
             limits,
             negotiated.limits.max_reassembled_message_bytes,
             negotiated.limits.max_physical_frame_bytes,
@@ -1885,16 +2613,17 @@ impl HostRequestExecutor {
 
     fn serve_release_artifact_content(
         &mut self,
-        requester: ClientId,
+        negotiated: NegotiatedParameters,
         task_id: TaskId,
         subscription_id: SubscriptionId,
+        output_id: Option<ConnectionOutputId>,
     ) -> Result<QueryOutcome, IpcError> {
         let now = Instant::now();
         self.artifact_content_registry.reap(now);
-        match self
-            .artifact_content_registry
-            .release(subscription_id, requester, task_id)
-        {
+        match self.artifact_content_registry.release_scoped(
+            subscription_id,
+            session_scope(negotiated, Some(task_id), output_id),
+        ) {
             Ok(()) => Ok(QueryOutcome::Ok(QueryResult::ArtifactContentReleased {
                 subscription_id,
             })),
@@ -2052,6 +2781,131 @@ fn map_store_error(error: StoreError) -> IpcError {
     }
 }
 
+/// Normalize request-shaped task creation only after authentication and
+/// before the command enters the durable kernel. Raw V1 `CreateTaskIntent`
+/// requests are rejected because their client-supplied WorkspaceRef has not
+/// been resolved against a host-owned project root.
+fn normalize_task_create_at_host(
+    envelope: CommandEnvelope,
+    workspace_projects: Option<&WorkspaceProjectRoots>,
+    config_admission: Option<&HostWorkspaceAdmission>,
+    connection_id: Uuid,
+) -> Result<
+    (
+        CommandEnvelope,
+        Option<WorkspaceAuthorization>,
+        Option<RequestId>,
+    ),
+    IpcError,
+> {
+    let CommandEnvelope {
+        command,
+        command_id,
+        client_id,
+        task_id,
+        issued_at_ms,
+        expected_task_revision,
+    } = envelope;
+
+    let (command, authorization, request_id) = match command {
+        Command::CreateTask(_) => {
+            return Err(IpcError::Security(
+                "raw CreateTask is not accepted at the authenticated host boundary".into(),
+            ));
+        }
+        Command::CreateTaskV2(CreateTaskRequestIntent {
+            id,
+            environment_id,
+            title,
+            description,
+            project_id,
+            workspace,
+            assignment,
+            created_at_ms,
+            connectivity,
+            attention,
+            activity,
+            review_readiness,
+        }) => {
+            let workspace_projects = workspace_projects.ok_or_else(|| {
+                IpcError::Security(
+                    "task.create.v2 is unavailable on the compatibility transport".into(),
+                )
+            })?;
+            let (action_epoch, runtime_generation) = if let Some(admission) = config_admission {
+                admission
+                    .validate_current()
+                    .map_err(|_| IpcError::Security("workspace configuration is stale".into()))?;
+                (admission.action_epoch(), admission.runtime_generation())
+            } else {
+                (0, 0)
+            };
+            let project_root = workspace_projects.root_for(project_id).ok_or_else(|| {
+                IpcError::Security("project is not configured for this host".into())
+            })?;
+            let workspace = match workspace.choice {
+                // External is a creation-time choice, not a caller-owned root.
+                // The authenticated host keeps the configured project root as
+                // the only authority available to durable task creation.
+                WorkspaceChoice::External => WorkspaceRequest::confirmed_external(project_root),
+                _ => workspace,
+            };
+            let request_id = RequestId::new();
+            let mut service = WorkspaceService::with_task_coordinator(
+                project_id,
+                id,
+                workspace_projects,
+                WorkspaceResourceCoordinator::new(),
+            )
+            .map_err(|_| IpcError::Security("configured project is unavailable".into()))?;
+            let (binding, authorization) = service
+                .bind_authorized_with_generation(
+                    workspace,
+                    id,
+                    client_id,
+                    connection_id,
+                    request_id,
+                    command_id,
+                    action_epoch,
+                    runtime_generation,
+                )
+                .map_err(|_| IpcError::Security("workspace request rejected".into()))?;
+            (
+                Command::CreateTask(CreateTaskIntent {
+                    id,
+                    environment_id,
+                    title,
+                    description,
+                    project_id,
+                    workspace: binding.durable_ref().clone(),
+                    assignment,
+                    created_at_ms,
+                    connectivity,
+                    attention,
+                    activity,
+                    review_readiness,
+                }),
+                Some(authorization),
+                Some(request_id),
+            )
+        }
+        command => (command, None, None),
+    };
+
+    Ok((
+        CommandEnvelope {
+            command_id,
+            client_id,
+            task_id,
+            issued_at_ms,
+            expected_task_revision,
+            command,
+        },
+        authorization,
+        request_id,
+    ))
+}
+
 fn map_snapshot_error_transport(error: SnapshotError) -> IpcError {
     match error {
         SnapshotError::Store(StoreError::Busy) => IpcError::Busy,
@@ -2132,6 +2986,33 @@ pub(crate) fn dispatch_authenticated_request(
     bus: &mut CommandBus,
     request: ClientRequest,
 ) -> Result<ServerMessage, IpcError> {
+    dispatch_authenticated_request_inner(authenticated_client_id, capabilities, bus, None, request)
+}
+
+/// Compatibility dispatch with the host-owned ProjectId-to-root mapping.
+pub(crate) fn dispatch_authenticated_request_with_workspace_projects(
+    authenticated_client_id: ClientId,
+    capabilities: CapabilitySet,
+    bus: &mut CommandBus,
+    workspace_projects: &WorkspaceProjectRoots,
+    request: ClientRequest,
+) -> Result<ServerMessage, IpcError> {
+    dispatch_authenticated_request_inner(
+        authenticated_client_id,
+        capabilities,
+        bus,
+        Some(workspace_projects),
+        request,
+    )
+}
+
+fn dispatch_authenticated_request_inner(
+    authenticated_client_id: ClientId,
+    capabilities: CapabilitySet,
+    bus: &mut CommandBus,
+    workspace_projects: Option<&WorkspaceProjectRoots>,
+    request: ClientRequest,
+) -> Result<ServerMessage, IpcError> {
     match request {
         ClientRequest::Command(envelope) => {
             if envelope.client_id != authenticated_client_id {
@@ -2142,7 +3023,20 @@ pub(crate) fn dispatch_authenticated_request(
             {
                 return Err(IpcError::UnsupportedCapability);
             }
-            let receipt = bus.execute(envelope).map_err(map_store_error)?;
+            // The compatibility transport has no resumable connection
+            // identity. Keep its receipt unbound so a later registered output
+            // can claim the exact same receipt once.
+            let connection_id = Uuid::nil();
+            let (envelope, authorization, request_id) =
+                normalize_task_create_at_host(envelope, workspace_projects, None, connection_id)?;
+            let receipt = bus
+                .execute_host_authorized(
+                    envelope,
+                    authorization,
+                    request_id.unwrap_or_else(RequestId::new),
+                    connection_id,
+                )
+                .map_err(map_store_error)?;
             Ok(ServerMessage::CommandReceipt(receipt))
         }
         ClientRequest::Query(envelope) => {
@@ -2204,7 +3098,6 @@ impl ConnectionOutputId {
         Self(id)
     }
 
-    #[cfg(test)]
     pub(crate) fn as_uuid(self) -> Uuid {
         self.0
     }
@@ -2636,21 +3529,24 @@ impl ConnectionOutputHandle {
         durable_capacity: usize,
         ephemeral_capacity: usize,
     ) -> (Self, ConnectionOutputPorts) {
+        let critical_capacity = critical_capacity.max(1).min(MAX_OUTPUT_LANE_CAPACITY);
+        let durable_capacity = durable_capacity.max(1).min(MAX_OUTPUT_LANE_CAPACITY);
+        let ephemeral_capacity = ephemeral_capacity.max(1).min(MAX_OUTPUT_LANE_CAPACITY);
         let (critical_tx, critical_rx) = mpsc::unbounded_channel();
-        let (durable_tx, durable_rx) = mpsc::channel(durable_capacity.max(1));
+        let (durable_tx, durable_rx) = mpsc::channel(durable_capacity);
         let (ephemeral_wake_tx, ephemeral_wake_rx) = mpsc::channel(1);
         let (shutdown, shutdown_rx) = watch::channel(false);
         let ephemeral = Arc::new(Mutex::new(EphemeralControl {
             shutdown: false,
             lane: EphemeralLaneInner {
-                capacity: ephemeral_capacity.max(1),
+                capacity: ephemeral_capacity,
                 slots: HashMap::new(),
                 pending: VecDeque::new(),
             },
         }));
         let handle = Self {
             id: ConnectionOutputId::from_uuid(connection_id),
-            critical_slots: Arc::new(Semaphore::new(critical_capacity.max(1))),
+            critical_slots: Arc::new(Semaphore::new(critical_capacity)),
             critical_tx,
             durable_tx,
             ephemeral: Arc::clone(&ephemeral),
@@ -3008,22 +3904,33 @@ impl ConnectionOutputPorts {
 
 #[cfg(test)]
 mod output_tests {
+    use std::path::PathBuf;
     use std::time::Duration;
 
     use super::{
-        ConnectionOutputHandle, DuplexExecuteCompletion, DurableAdmitResult, EphemeralAdmitResult,
-        HostRequestExecutor, HostRequestHandle, LiveStreamState, PhysicalWriteAckStatus,
-        PrioritizedOutbound, StreamMaterializer,
+        ConnectionOutputHandle, ConnectionOutputId, DuplexExecuteCompletion, DurableAdmitResult,
+        EphemeralAdmitResult, EventReplayRegistry, HostRequestExecutor, HostRequestHandle,
+        LiveStreamState, LiveTail, PhysicalWriteAckStatus, PrioritizedOutbound, StreamMaterializer,
     };
+    use crate::domain::command::{Command, CommandEnvelope, CreateTaskIntent};
     use crate::domain::event::{DomainEvent, Event};
-    use crate::domain::id::{EventId, RequestId, ResourceId, SubscriptionId};
+    use crate::domain::id::{
+        CommandId, EnvironmentId, EventId, ProjectId, RequestId, ResourceId, SubscriptionId, TaskId,
+    };
     use crate::domain::query::{QueryOutcome, QueryReply};
+    use crate::domain::snapshot::PageLimits;
+    use crate::domain::task::{
+        ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity,
+        WorkspaceRef,
+    };
     use crate::domain::ClientId;
+    use crate::kernel::SessionScope;
     use crate::protocol::{
         ClientRequest, NegotiatedParameters, ServerMessage, StreamFrame, StreamKey,
         StreamPayloadKind,
     };
     use std::sync::Arc;
+    use uuid::Uuid;
 
     fn sample_event(sequence: u64) -> DomainEvent {
         DomainEvent {
@@ -3043,6 +3950,27 @@ mod output_tests {
             request_id: RequestId::new(),
             outcome: QueryOutcome::Err(crate::domain::query::QueryError::NotFound),
         })
+    }
+
+    fn test_repository_root() -> PathBuf {
+        let current = std::env::current_dir().expect("test current directory");
+        current
+            .ancestors()
+            .find(|candidate| candidate.join(".git").is_dir())
+            .unwrap_or(current.as_path())
+            .to_path_buf()
+    }
+
+    #[test]
+    fn output_lane_capacities_are_clamped_before_channel_allocation() {
+        let (handle, _ports) = ConnectionOutputHandle::with_connection_id(
+            Uuid::now_v7(),
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+        );
+
+        assert!(handle.critical_permits_available() <= super::MAX_OUTPUT_LANE_CAPACITY);
     }
 
     #[cfg(debug_assertions)]
@@ -3896,12 +4824,11 @@ mod output_tests {
     #[tokio::test(flavor = "current_thread")]
     async fn detach_removes_exact_output_and_live_binding_before_ack_shutdown() {
         use super::{ConnectionOutputId, HostRequestExecutor, OutputInspection};
-        use crate::domain::command::{Command, CommandEnvelope, CreateTaskIntent};
+        use crate::domain::command::{Command, CommandEnvelope, CreateTaskRequestIntent};
         use crate::domain::id::{CommandId, EnvironmentId, ProjectId, RequestId, TaskId};
         use crate::domain::query::{Query, QueryEnvelope};
         use crate::domain::task::{
             ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity,
-            WorkspaceRef,
         };
         use crate::domain::ClientId;
         use crate::kernel::CommandBus;
@@ -3909,11 +4836,21 @@ mod output_tests {
             Capability, CapabilitySet, ClientRequest, DetachRequest, FrameLimits,
             NegotiatedParameters, ProtocolVersion, ServerMessage,
         };
+        use crate::workspace::{WorkspaceProjectRoots, WorkspaceRequest};
         use uuid::Uuid;
 
         let dir = tempfile::tempdir().expect("tempdir");
         let bus = CommandBus::open(&dir.path().join("detach.db")).expect("bus");
-        let (requests, executor) = HostRequestExecutor::start(bus);
+        let project_id = ProjectId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xd7,
+        ])
+        .expect("project");
+        let project_roots =
+            WorkspaceProjectRoots::try_from_pairs([(project_id, test_repository_root())])
+                .expect("project roots");
+        let (requests, executor) =
+            HostRequestExecutor::start_with_workspace_projects(bus, project_roots);
 
         let id_a = Uuid::from_bytes([
             0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -3971,7 +4908,7 @@ mod output_tests {
             task_id: None,
             issued_at_ms: 1,
             expected_task_revision: None,
-            command: Command::CreateTask(CreateTaskIntent {
+            command: Command::CreateTaskV2(CreateTaskRequestIntent {
                 id: task_id,
                 environment_id: EnvironmentId::from_bytes([
                     0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00,
@@ -3980,12 +4917,8 @@ mod output_tests {
                 .expect("env"),
                 title: "detach live".into(),
                 description: None,
-                project_id: ProjectId::from_bytes([
-                    0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00,
-                    0x00, 0x00, 0xd7,
-                ])
-                .expect("project"),
-                workspace: WorkspaceRef::Main,
+                project_id,
+                workspace: WorkspaceRequest::main(),
                 assignment: TaskAssignment::LocalOwner,
                 created_at_ms: 1,
                 connectivity: TaskConnectivity::Connected,
@@ -4765,7 +5698,7 @@ mod output_tests {
                 0x00, 0x41,
             ])
             .expect("task");
-            bus.execute(CommandEnvelope {
+            bus.execute_for_test(CommandEnvelope {
                 command_id: CommandId::from_bytes([
                     0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00,
                     0x00, 0x00, 0x42,
@@ -5185,18 +6118,26 @@ mod output_tests {
     #[tokio::test(flavor = "current_thread")]
     async fn duplex_non_quit_rejected_quit_and_command_id_collision_remain_caller_owned() {
         use crate::domain::command::{
-            Command, CommandEnvelope, CommandReceipt, CreateTaskIntent, RejectionCode,
+            Command, CommandEnvelope, CommandReceipt, CreateTaskRequestIntent, RejectionCode,
         };
         use crate::domain::id::{CommandId, EnvironmentId, ProjectId, TaskId};
         use crate::domain::task::{
             ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity,
-            WorkspaceRef,
         };
         use crate::kernel::CommandBus;
+        use crate::workspace::{WorkspaceProjectRoots, WorkspaceRequest};
 
         let dir = tempfile::tempdir().expect("tempdir");
         let bus = CommandBus::open(&dir.path().join("duplex-caller-owned.db")).expect("bus");
-        let (requests, executor) = HostRequestExecutor::start_without_automatic_maintenance(bus);
+        let project_id = ProjectId::new();
+        let project_roots =
+            WorkspaceProjectRoots::try_from_pairs([(project_id, test_repository_root())])
+                .expect("project roots");
+        let (requests, executor) =
+            HostRequestExecutor::start_without_automatic_maintenance_with_workspace_projects(
+                bus,
+                project_roots,
+            );
         let (out, mut ports) = ConnectionOutputHandle::new(4, 8, 1);
         let reg = requests.register_output(out).await.expect("register");
         let client = ClientId::new();
@@ -5252,13 +6193,13 @@ mod output_tests {
                     task_id: None,
                     issued_at_ms: 1_725_000_000_702,
                     expected_task_revision: None,
-                    command: Command::CreateTask(CreateTaskIntent {
+                    command: Command::CreateTaskV2(CreateTaskRequestIntent {
                         id: TaskId::new(),
                         environment_id: EnvironmentId::new(),
                         title: "collision".into(),
                         description: None,
-                        project_id: ProjectId::new(),
-                        workspace: WorkspaceRef::Main,
+                        project_id,
+                        workspace: WorkspaceRequest::main(),
                         assignment: TaskAssignment::LocalOwner,
                         created_at_ms: 1_725_000_000_000,
                         connectivity: TaskConnectivity::Connected,
@@ -5283,17 +6224,8 @@ mod output_tests {
                 negotiated,
                 confirm_quit_request(client, reused_command_id, 0),
             )
-            .await
-            .expect("collision duplex");
-        match collision {
-            DuplexExecuteCompletion::CallerMustWrite(ServerMessage::CommandReceipt(
-                CommandReceipt::Accepted {
-                    task_revision: Some(_),
-                    ..
-                },
-            )) => {}
-            other => panic!("collision must stay caller-owned non-quit Accepted, got {other:?}"),
-        }
+            .await;
+        assert!(matches!(collision, Err(crate::host::IpcError::Unavailable)));
         assert!(ports.try_recv_prioritized().is_none());
         assert!(requests
             .take_pending_quit_receipt_ack(reg.id())
@@ -5416,13 +6348,9 @@ mod output_tests {
                 negotiated,
                 confirm_quit_request(client, command_id, inspection_id),
             )
-            .await
-            .expect("retry");
-        assert!(matches!(
-            retry,
-            DuplexExecuteCompletion::ExecutorAdmittedQuitReceipt { .. }
-        ));
-        assert!(healthy_ports.try_recv_prioritized().is_some());
+            .await;
+        assert!(matches!(retry, Err(crate::host::IpcError::Unavailable)));
+        assert!(healthy_ports.try_recv_prioritized().is_none());
         // Detach clears the pending map without requiring a take first.
         drop(reg);
         assert!(requests
@@ -5460,6 +6388,224 @@ mod output_tests {
             |row| row.get(0),
         )
         .expect("count")
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reconnect_handoff_rebinds_live_replay_to_new_output_without_reusing_id() {
+        use crate::domain::query::{Query, QueryEnvelope, QueryError, QueryOutcome, QueryResult};
+        use crate::kernel::CommandBus;
+
+        let dir = tempfile::tempdir().expect("reconnect tempdir");
+        let bus = CommandBus::open(&dir.path().join("reconnect-replay.db")).expect("bus");
+        let (requests, executor) = HostRequestExecutor::start_without_automatic_maintenance(bus);
+        let client = ClientId::new();
+        let negotiated = event_replay_negotiated(client);
+
+        let (old_output, mut old_ports) = ConnectionOutputHandle::new(4, 8, 1);
+        let old_id = old_output.id();
+        let old_registration = requests
+            .register_output_for_connection(old_output, client, None)
+            .await
+            .expect("old registration");
+        let old_handle = requests.with_output(old_id);
+        let opened = old_handle
+            .execute(
+                negotiated.clone(),
+                ClientRequest::Query(QueryEnvelope {
+                    request_id: RequestId::new(),
+                    client_id: client,
+                    task_id: None,
+                    query: Query::OpenEventReplay { after_sequence: 0 },
+                }),
+            )
+            .await
+            .expect("open replay");
+        let subscription_id = match opened {
+            ServerMessage::QueryReply(reply) => match reply.outcome {
+                QueryOutcome::Ok(QueryResult::EventReplayPage {
+                    subscription_id, ..
+                }) => subscription_id,
+                other => panic!("expected replay page, got {other:?}"),
+            },
+            other => panic!("expected query reply, got {other:?}"),
+        };
+        while let Some(outbound) = old_ports.try_recv_prioritized() {
+            outbound.after_successful_write();
+        }
+
+        let (new_output, _new_ports) = ConnectionOutputHandle::new(4, 8, 1);
+        let new_id = new_output.id();
+        assert_ne!(old_id, new_id, "reconnect must never reuse physical IDs");
+        let new_registration = requests
+            .register_output_for_connection(new_output, client, Some(old_id.as_uuid()))
+            .await
+            .expect("new registration");
+        assert_eq!(new_registration.id(), new_id);
+        assert!(
+            !requests
+                .inspect_output(old_id)
+                .await
+                .expect("old inspection")
+                .registered
+        );
+        assert!(
+            requests
+                .inspect_output(new_id)
+                .await
+                .expect("new inspection")
+                .live_bound
+        );
+
+        let old_release = old_handle
+            .execute(
+                negotiated.clone(),
+                ClientRequest::Query(QueryEnvelope {
+                    request_id: RequestId::new(),
+                    client_id: client,
+                    task_id: None,
+                    query: Query::ReleaseEventReplay { subscription_id },
+                }),
+            )
+            .await
+            .expect("old release response");
+        assert!(matches!(
+            old_release,
+            ServerMessage::QueryReply(crate::domain::query::QueryReply {
+                outcome: QueryOutcome::Err(QueryError::Unauthorized),
+                ..
+            })
+        ));
+
+        let new_release = requests
+            .with_output(new_id)
+            .execute(
+                negotiated,
+                ClientRequest::Query(QueryEnvelope {
+                    request_id: RequestId::new(),
+                    client_id: client,
+                    task_id: None,
+                    query: Query::ReleaseEventReplay { subscription_id },
+                }),
+            )
+            .await
+            .expect("new release response");
+        assert!(matches!(
+            new_release,
+            ServerMessage::QueryReply(crate::domain::query::QueryReply {
+                outcome: QueryOutcome::Ok(QueryResult::EventReplayReleased { .. }),
+                ..
+            })
+        ));
+
+        drop(old_registration);
+        drop(new_registration);
+        drop(requests);
+        executor.abort();
+        let _ = executor.await;
+    }
+
+    #[test]
+    fn reconnect_handoff_preserves_frozen_replay_cursor_only_in_new_scope() {
+        use crate::domain::command::CommandReceipt;
+        use crate::kernel::CommandBus;
+
+        let dir = tempfile::tempdir().expect("reconnect frozen tempdir");
+        let mut bus = CommandBus::open(&dir.path().join("reconnect-frozen.db")).expect("bus");
+        let client = ClientId::new();
+        let project_id = ProjectId::new();
+        for index in 0..2_u8 {
+            let task_id = TaskId::new();
+            let receipt = bus
+                .execute_for_test(CommandEnvelope {
+                    command_id: CommandId::new(),
+                    client_id: client,
+                    task_id: None,
+                    issued_at_ms: 1_725_000_000_900 + i64::from(index),
+                    expected_task_revision: None,
+                    command: Command::CreateTask(CreateTaskIntent {
+                        id: task_id,
+                        environment_id: EnvironmentId::new(),
+                        title: format!("frozen replay {index}"),
+                        description: None,
+                        project_id,
+                        workspace: WorkspaceRef::Main,
+                        assignment: TaskAssignment::LocalOwner,
+                        created_at_ms: 1_725_000_000_900 + i64::from(index),
+                        connectivity: TaskConnectivity::Connected,
+                        attention: TaskAttention::None,
+                        activity: TaskActivity::Idle,
+                        review_readiness: ReviewReadiness::NotReady,
+                    }),
+                })
+                .expect("create replay fixture task");
+            assert!(matches!(receipt, CommandReceipt::Accepted { .. }));
+        }
+
+        let limits = PageLimits::new(1, 512 * 1024).expect("replay limits");
+        let old_output = ConnectionOutputId::new();
+        let new_output = ConnectionOutputId::new();
+        let old_scope = SessionScope {
+            client_id: Some(client),
+            task_id: None,
+            connection_id: Some(old_output.as_uuid()),
+            action_epoch: None,
+            runtime_generation: None,
+        };
+        let new_scope = SessionScope {
+            connection_id: Some(new_output.as_uuid()),
+            ..old_scope
+        };
+        let session = bus
+            .begin_event_replay_scoped(0, limits, old_scope)
+            .expect("frozen replay");
+        let cursor = session
+            .page(None)
+            .expect("first page")
+            .next_cursor
+            .expect("bounded fixture should have a cursor");
+        let subscription_id = session.subscription_id();
+
+        let mut registry = EventReplayRegistry::new();
+        registry
+            .insert_open(
+                client,
+                session,
+                limits,
+                Some(LiveTail::new(old_output, 0)),
+                true,
+                std::time::Instant::now(),
+            )
+            .expect("registry admission");
+        // A dropped old output removes only its live writer binding; the
+        // frozen cursor remains reachable until the authenticated successor
+        // explicitly rebinds it.
+        registry.remove_for_output(old_output);
+        registry.rebind_output(client, old_output, new_output);
+
+        assert!(matches!(
+            registry.get_frozen(
+                subscription_id,
+                client,
+                old_scope,
+                limits,
+                std::time::Instant::now(),
+            ),
+            Err(crate::domain::query::QueryError::Unauthorized)
+        ));
+        let resumed = registry
+            .get_frozen(
+                subscription_id,
+                client,
+                new_scope,
+                limits,
+                std::time::Instant::now(),
+            )
+            .expect("new connection scope");
+        assert!(!resumed
+            .page(Some(&cursor))
+            .expect("cursor continuation")
+            .events
+            .is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]

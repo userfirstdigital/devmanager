@@ -1029,6 +1029,7 @@ mod tests {
             profile_fingerprint: ProfileFingerprint::hash_normalized("detach-unit"),
             granted: CapabilitySet::from_capabilities([Capability::ExplicitDetach]),
             limits: FrameLimits::v1_default(),
+            reconnect_grant: None,
         };
         let conn = ClientConnection::scripted_for_test(
             client_id,
@@ -1079,6 +1080,7 @@ mod tests {
             profile_fingerprint: ProfileFingerprint::hash_normalized("detach-unit"),
             granted: CapabilitySet::from_capabilities([Capability::ExplicitDetach]),
             limits: FrameLimits::v1_default(),
+            reconnect_grant: None,
         };
         // MatchingAck keeps a live write consumer; we only exercise the deadline path.
         let conn = ClientConnection::scripted_for_test(
@@ -1159,6 +1161,7 @@ mod tests {
             profile_fingerprint: ProfileFingerprint::hash_normalized("detach-unit"),
             granted: CapabilitySet::from_capabilities([Capability::ExplicitDetach]),
             limits: FrameLimits::v1_default(),
+            reconnect_grant: None,
         };
         let conn = ClientConnection::scripted_for_test(
             client_id,
@@ -1217,6 +1220,7 @@ mod tests {
             profile_fingerprint: ProfileFingerprint::hash_normalized("detach-unit"),
             granted: CapabilitySet::from_capabilities([Capability::ExplicitDetach]),
             limits: FrameLimits::v1_default(),
+            reconnect_grant: None,
         };
         let conn = ClientConnection::scripted_for_test(
             client_id,
@@ -1271,6 +1275,7 @@ mod tests {
             profile_fingerprint: ProfileFingerprint::hash_normalized("detach-unit"),
             granted: CapabilitySet::from_capabilities([Capability::ExplicitDetach]),
             limits: FrameLimits::v1_default(),
+            reconnect_grant: None,
         };
         let conn = ClientConnection::scripted_for_test(
             client_id,

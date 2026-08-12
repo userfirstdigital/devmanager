@@ -19,18 +19,23 @@ use uuid::Uuid;
 
 use devmanager::client::action::{
     self, ActionRisk, ActionScope, ACTION_HOST_ACTIONS, ACTION_HOST_STATUS, ACTION_TASK_CREATE,
-    ACTION_TASK_LIST, ACTION_TASK_RENAME, ACTION_TASK_SHOW,
+    ACTION_TASK_CREATE_V2, ACTION_TASK_LIST, ACTION_TASK_RENAME, ACTION_TASK_SHOW,
 };
 use devmanager::config::paths::{resolve_app_paths, AppProfile, BuildKind, ResolvedAppPaths};
-use devmanager::domain::command::{Command, CommandEnvelope, CommandReceipt, CreateTaskIntent};
+use devmanager::domain::command::{
+    Command, CommandEnvelope, CommandReceipt, CreateTaskRequestIntent,
+};
 use devmanager::domain::id::{CommandId, EnvironmentId, ProjectId, TaskId};
 use devmanager::domain::task::{
-    ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity, WorkspaceRef,
+    ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity,
 };
 use devmanager::domain::ClientId;
-use devmanager::host::HostIdentity;
-use devmanager::kernel::CommandBus;
-use devmanager::protocol::Capability;
+use devmanager::host::{HostIdentity, HostRequestExecutor};
+use devmanager::protocol::{
+    Capability, CapabilitySet, ClientRequest, FrameLimits, NegotiatedParameters, ProtocolVersion,
+    ServerMessage,
+};
+use devmanager::workspace::WorkspaceRequest;
 
 const READY_TIMEOUT: Duration = Duration::from_secs(15);
 const CTL_TIMEOUT: Duration = Duration::from_secs(10);
@@ -54,36 +59,65 @@ fn fixed_uuid_v7(tail: u8) -> [u8; 16] {
 
 fn seed_task_with_base(paths: &ResolvedAppPaths, base: u8, title: &str) -> TaskId {
     fs::create_dir_all(&paths.root).expect("create isolated profile root");
-    let mut bus = CommandBus::open(&paths.database).expect("open isolated seed command bus");
+    let project_id = ProjectId::from_bytes(fixed_uuid_v7(base + 4)).expect("project id");
+    let project_config = vec![(
+        project_id.to_string(),
+        paths.root.to_string_lossy().into_owned(),
+    )];
     let client_id = ClientId::from_bytes(fixed_uuid_v7(base)).expect("seed client id");
     let task_id = TaskId::from_bytes(fixed_uuid_v7(base + 1)).expect("seed task id");
-    let command_id = CommandId::from_bytes(fixed_uuid_v7(base + 2)).expect("seed command id");
-    let receipt = bus
-        .execute(CommandEnvelope {
-            command_id,
-            client_id,
-            task_id: None,
-            issued_at_ms: 1_725_000_000_100,
-            expected_task_revision: None,
-            command: Command::CreateTask(CreateTaskIntent {
-                id: task_id,
-                environment_id: EnvironmentId::from_bytes(fixed_uuid_v7(base + 3))
-                    .expect("environment id"),
-                title: title.into(),
-                description: Some("Read through the host query boundary".into()),
-                project_id: ProjectId::from_bytes(fixed_uuid_v7(base + 4)).expect("project id"),
-                workspace: WorkspaceRef::Main,
-                assignment: TaskAssignment::LocalOwner,
-                created_at_ms: 1_725_000_000_000,
-                connectivity: TaskConnectivity::Connected,
-                attention: TaskAttention::None,
-                activity: TaskActivity::Idle,
-                review_readiness: ReviewReadiness::NotReady,
-            }),
-        })
-        .expect("seed task command");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("seed host runtime");
+    let receipt = runtime.block_on(async move {
+        let bus = devmanager::kernel::CommandBus::open(&paths.database)
+            .expect("open isolated seed command store");
+        let (requests, executor) =
+            HostRequestExecutor::start_supervised_with_project_config(bus, project_config)
+                .expect("configured seed project roots");
+        let response = requests
+            .execute(
+                NegotiatedParameters {
+                    version: ProtocolVersion::current(),
+                    client_id,
+                    capabilities: CapabilitySet::empty(),
+                    limits: FrameLimits::v1_default(),
+                },
+                ClientRequest::Command(CommandEnvelope {
+                    command_id: CommandId::from_bytes(fixed_uuid_v7(base + 2))
+                        .expect("seed command id"),
+                    client_id,
+                    task_id: None,
+                    issued_at_ms: 1_725_000_000_100,
+                    expected_task_revision: None,
+                    command: Command::CreateTaskV2(CreateTaskRequestIntent {
+                        id: task_id,
+                        environment_id: EnvironmentId::from_bytes(fixed_uuid_v7(base + 3))
+                            .expect("environment id"),
+                        title: title.into(),
+                        description: Some("Read through the host query boundary".into()),
+                        project_id,
+                        workspace: WorkspaceRequest::confirmed_external(&paths.root),
+                        assignment: TaskAssignment::LocalOwner,
+                        created_at_ms: 1_725_000_000_000,
+                        connectivity: TaskConnectivity::Connected,
+                        attention: TaskAttention::None,
+                        activity: TaskActivity::Idle,
+                        review_readiness: ReviewReadiness::NotReady,
+                    }),
+                }),
+            )
+            .await
+            .expect("seed task command");
+        drop(requests);
+        let _ = executor.join.await.expect("seed host executor join");
+        let ServerMessage::CommandReceipt(receipt) = response else {
+            panic!("seed task must return a command receipt");
+        };
+        receipt
+    });
     assert!(matches!(receipt, CommandReceipt::Accepted { .. }));
-    drop(bus);
     task_id
 }
 
@@ -277,11 +311,7 @@ fn wait_for_identity(host: &mut ChildGuard, lock_path: &Path) -> HostIdentity {
 #[test]
 fn action_catalog_ids_are_unique_and_classified() {
     let catalog = action::catalog();
-    assert_eq!(
-        catalog.len(),
-        6,
-        "slice exposes host.actions, host.status, task.list/show/create/rename"
-    );
+    assert_eq!(catalog.len(), 6);
 
     let mut ids = Vec::new();
     for action in catalog {
@@ -292,7 +322,10 @@ fn action_catalog_ids_are_unique_and_classified() {
             action.id
         );
         ids.push(action.id);
-        let expected_risk = if matches!(action.id, ACTION_TASK_CREATE | ACTION_TASK_RENAME) {
+        let expected_risk = if matches!(
+            action.id,
+            ACTION_TASK_CREATE | ACTION_TASK_CREATE_V2 | ACTION_TASK_RENAME
+        ) {
             ActionRisk::Mutating
         } else {
             ActionRisk::ReadOnly
@@ -313,7 +346,8 @@ fn action_catalog_ids_are_unique_and_classified() {
     assert!(ids.contains(&ACTION_HOST_STATUS));
     assert!(ids.contains(&ACTION_TASK_LIST));
     assert!(ids.contains(&ACTION_TASK_SHOW));
-    assert!(ids.contains(&ACTION_TASK_CREATE));
+    assert!(!ids.contains(&ACTION_TASK_CREATE));
+    assert!(ids.contains(&ACTION_TASK_CREATE_V2));
     assert!(ids.contains(&ACTION_TASK_RENAME));
     assert!(action::require_unique_ids().is_ok());
     let task_list = catalog
@@ -350,7 +384,10 @@ fn ctl_actions_json_is_stable_unique_and_offline() {
         let id = action["id"].as_str().expect("action id string");
         assert!(!ids.contains(&id.to_string()), "duplicate id in JSON: {id}");
         ids.push(id.to_string());
-        let expected_risk = if matches!(id, ACTION_TASK_CREATE | ACTION_TASK_RENAME) {
+        let expected_risk = if matches!(
+            id,
+            ACTION_TASK_CREATE | ACTION_TASK_CREATE_V2 | ACTION_TASK_RENAME
+        ) {
             "mutating"
         } else {
             "read_only"
@@ -371,22 +408,24 @@ fn ctl_actions_json_is_stable_unique_and_offline() {
             .expect("each action exposes an argument schema");
         assert_eq!(schema["type"], "object");
         assert_eq!(schema["additionalProperties"], false);
-        if id == ACTION_TASK_CREATE {
+        if id == ACTION_TASK_CREATE_V2 {
             let required = schema["required"]
                 .as_array()
                 .expect("create required fields");
-            for field in [
+            let fields = vec![
                 "task_id",
                 "environment_id",
                 "title",
                 "project_id",
                 "workspace",
-            ] {
+            ];
+            for field in fields {
                 assert!(
                     required.iter().any(|value| value == field),
                     "task.create schema must require {field}"
                 );
             }
+            assert!(schema["properties"].get("project_root").is_none());
         }
         if id == ACTION_TASK_RENAME {
             let required = schema["required"]
@@ -404,7 +443,8 @@ fn ctl_actions_json_is_stable_unique_and_offline() {
     assert!(ids.iter().any(|id| id == ACTION_HOST_STATUS));
     assert!(ids.iter().any(|id| id == ACTION_TASK_LIST));
     assert!(ids.iter().any(|id| id == ACTION_TASK_SHOW));
-    assert!(ids.iter().any(|id| id == ACTION_TASK_CREATE));
+    assert!(!ids.iter().any(|id| id == ACTION_TASK_CREATE));
+    assert!(ids.iter().any(|id| id == ACTION_TASK_CREATE_V2));
     assert!(ids.iter().any(|id| id == ACTION_TASK_RENAME));
     assert!(
         String::from_utf8_lossy(&first.stderr).trim().is_empty(),
@@ -614,20 +654,42 @@ fn ctl_invoke_task_create_uses_shared_mutation_without_taking_host_lock() {
     let config_base = TempDir::new().expect("process-unique config base");
     let profile = unique_profile();
     let paths = isolated_paths(&config_base, &profile);
+    let configured_root = config_base.path().join("configured-project-root");
+    let caller_external_path = config_base.path().join("caller-external-path");
     fs::create_dir(&paths.root).expect("create isolated profile root");
+    fs::create_dir(&configured_root).expect("create configured project root");
+    fs::create_dir(&caller_external_path).expect("create caller external path");
     let lock_path = paths.root.join("host.lock");
+
+    let task_id = TaskId::new();
+    let project_id = ProjectId::new();
+    fs::write(
+        &paths.config,
+        serde_json::json!({
+            "projects": [{
+                "id": project_id.to_string(),
+                "rootPath": configured_root
+            }]
+        })
+        .to_string(),
+    )
+    .expect("host-owned project config");
 
     let mut host = ChildGuard::spawn(host_command(config_base.path(), &profile));
     let original = wait_for_identity(&mut host, &lock_path);
 
-    let task_id = TaskId::new();
     let arguments = serde_json::json!({
         "task_id": task_id,
         "environment_id": EnvironmentId::new(),
         "title": "CLI Created Task",
         "description": "Created through task.create",
-        "project_id": ProjectId::new(),
-        "workspace": "main"
+        "project_id": project_id,
+        "workspace": {
+            "choice": "external",
+            "path": caller_external_path,
+            "branch": null,
+            "external_confirmed": true
+        }
     })
     .to_string();
     let output = run_ctl_bounded(&[
@@ -636,7 +698,7 @@ fn ctl_invoke_task_create_uses_shared_mutation_without_taking_host_lock() {
         "--profile",
         &profile,
         "--action",
-        ACTION_TASK_CREATE,
+        ACTION_TASK_CREATE_V2,
         "--arguments-json",
         &arguments,
         "--json",
@@ -649,7 +711,7 @@ fn ctl_invoke_task_create_uses_shared_mutation_without_taking_host_lock() {
     );
     let doc: Value = serde_json::from_slice(&output.stdout).expect("invoke JSON");
     assert_eq!(doc["schema_version"], 1);
-    assert_eq!(doc["action_id"], ACTION_TASK_CREATE);
+    assert_eq!(doc["action_id"], ACTION_TASK_CREATE_V2);
     assert_eq!(doc["profile"], profile);
     assert_eq!(doc["task_id"], task_id.to_string());
     assert_eq!(doc["receipt"]["accepted"]["task_revision"], 1);
@@ -675,6 +737,27 @@ fn ctl_invoke_task_create_uses_shared_mutation_without_taking_host_lock() {
     assert!(shown.status.success(), "created task must be queryable");
     let shown_doc: Value = serde_json::from_slice(&shown.stdout).expect("task-show JSON");
     assert_eq!(shown_doc["snapshot"]["task"]["title"], "CLI Created Task");
+    let workspace = &shown_doc["snapshot"]["task"]["workspace"];
+    let external_binding = &workspace["external_bound"]["binding"];
+    assert_eq!(
+        external_binding["kind"], "external",
+        "durable workspace must come from the host-issued external authority"
+    );
+    assert!(
+        external_binding["workspace_root"]["workspace_id"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty()),
+        "durable workspace must expose only an opaque workspace id"
+    );
+    let workspace_json = serde_json::to_string(workspace).expect("workspace JSON");
+    assert!(
+        !workspace_json.contains(configured_root.to_string_lossy().as_ref()),
+        "configured host path must remain outside the client projection"
+    );
+    assert!(
+        !workspace_json.contains(caller_external_path.to_string_lossy().as_ref()),
+        "caller-supplied path must remain outside the client projection"
+    );
 
     let duplicate = run_ctl_bounded(&[
         "ctl",
@@ -682,7 +765,7 @@ fn ctl_invoke_task_create_uses_shared_mutation_without_taking_host_lock() {
         "--profile",
         &profile,
         "--action",
-        ACTION_TASK_CREATE,
+        ACTION_TASK_CREATE_V2,
         "--arguments-json",
         &arguments,
         "--json",
@@ -863,7 +946,7 @@ fn ctl_rejects_unknown_commands_and_invalid_profiles() {
         "--profile",
         "validprofile",
         "--action",
-        ACTION_TASK_CREATE,
+        ACTION_TASK_CREATE_V2,
         "--arguments-json",
         r#"{"unknown":true}"#,
         "--json",
@@ -878,7 +961,7 @@ fn ctl_rejects_unknown_commands_and_invalid_profiles() {
         "--profile",
         "validprofile",
         "--action",
-        ACTION_TASK_CREATE,
+        ACTION_TASK_CREATE_V2,
         "--arguments-json",
         "{}",
         "--expected-task-revision",

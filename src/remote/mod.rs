@@ -19,6 +19,7 @@ use web::lease::{ControllerRequest, ControllerTarget, WebControlState};
 use web::request_executor::WebRequestExecutor;
 
 use crate::domain::operation::ResourceFence;
+use crate::git::command::GitHostBinding;
 use crate::git::git_service::{
     AiCommitMessage, DeviceCodeResponse, GitBranch, GitDiffResult, GitLogEntry, GitStatusResult,
 };
@@ -1251,9 +1252,32 @@ pub struct RemoteClientConnectResult {
 
 #[derive(Debug)]
 pub struct PendingRemoteRequest {
-    pub client_id: String,
-    pub action: RemoteAction,
-    pub response: Option<mpsc::Sender<RemoteActionResult>>,
+    client_id: String,
+    /// Opaque authority issued by the host WorkspaceService. Remote payloads
+    /// carry only a display hint and can never construct or widen this value.
+    git_authority: Option<GitHostBinding>,
+    action: RemoteAction,
+    response: Option<mpsc::Sender<RemoteActionResult>>,
+}
+
+impl PendingRemoteRequest {
+    /// Consume a host-queued request at the host boundary.  The authority
+    /// tuple cannot be constructed or widened by a remote action payload.
+    pub(crate) fn into_host_parts(
+        self,
+    ) -> (
+        String,
+        Option<GitHostBinding>,
+        RemoteAction,
+        Option<mpsc::Sender<RemoteActionResult>>,
+    ) {
+        (
+            self.client_id,
+            self.git_authority,
+            self.action,
+            self.response,
+        )
+    }
 }
 
 #[derive(Clone)]
@@ -8732,6 +8756,7 @@ fn handle_client_connection_with_weak(
                     &inner,
                     PendingRemoteRequest {
                         client_id: client_id.clone(),
+                        git_authority: None,
                         action,
                         response: None,
                     },
@@ -8815,6 +8840,7 @@ fn handle_client_connection_with_weak(
                     &inner,
                     PendingRemoteRequest {
                         client_id: client_id.clone(),
+                        git_authority: None,
                         action,
                         response: Some(response_tx),
                     },
@@ -11393,6 +11419,7 @@ mod tests {
                 &service.inner,
                 PendingRemoteRequest {
                     client_id: format!("client-{index}"),
+                    git_authority: None,
                     action: RemoteAction::GitListRepos,
                     response: None,
                 },
@@ -11404,6 +11431,7 @@ mod tests {
             &service.inner,
             PendingRemoteRequest {
                 client_id: "overflow".to_string(),
+                git_authority: None,
                 action: RemoteAction::GitListRepos,
                 response: None,
             },

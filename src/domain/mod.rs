@@ -18,7 +18,7 @@ pub use artifact::{
 };
 pub use command::{
     decide, Command, CommandEnvelope, CommandReceipt, ConfirmHostQuitIntent, CreateTaskIntent,
-    RejectionCode, RenameTaskIntent, SetTaskAttentionIntent,
+    CreateTaskRequestIntent, RejectionCode, RenameTaskIntent, SetTaskAttentionIntent,
 };
 pub use event::{
     apply, ApplyError, DomainEvent, Event, EventSerdeError, OperationAcceptedFact,
@@ -51,6 +51,7 @@ pub use snapshot::{
     MAX_SNAPSHOT_PAGE_ITEMS,
 };
 pub use task::{
-    ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity, TaskFacts,
-    TaskLifecycle, TaskValidationError, VisibleTaskStatus, WorkspaceRef,
+    RepositoryFingerprint, ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention,
+    TaskConnectivity, TaskFacts, TaskLifecycle, TaskValidationError, VisibleTaskStatus,
+    WorkspaceChoice, WorkspaceRef,
 };

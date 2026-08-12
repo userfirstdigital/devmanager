@@ -6,7 +6,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::domain::command::{Command, CommandEnvelope, CreateTaskIntent, RenameTaskIntent};
+use crate::domain::command::{
+    Command, CommandEnvelope, CreateTaskIntent, CreateTaskRequestIntent, RenameTaskIntent,
+};
 use crate::domain::query::{Query, QueryEnvelope};
 use crate::domain::task::{
     ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity, TaskFacts,
@@ -14,6 +16,7 @@ use crate::domain::task::{
 };
 use crate::domain::{ClientId, CommandId, EnvironmentId, ProjectId, RequestId, TaskId};
 use crate::protocol::Capability;
+use crate::workspace::{WorkspaceError, WorkspaceRequest};
 
 /// Stable id for listing the shared action catalog.
 pub const ACTION_HOST_ACTIONS: &str = "host.actions";
@@ -23,8 +26,13 @@ pub const ACTION_HOST_STATUS: &str = "host.status";
 pub const ACTION_TASK_LIST: &str = "task.list";
 /// Stable id for reading one Task through the host query boundary.
 pub const ACTION_TASK_SHOW: &str = "task.show";
-/// Stable id for creating one Task through the host command boundary.
+/// Frozen V1 codec id for the old durable-workspace create shape.
+///
+/// This id remains available to decode preserved V1 data, but is intentionally
+/// not advertised as an authenticated public action.
 pub const ACTION_TASK_CREATE: &str = "task.create";
+/// Stable id for request-shaped task creation whose workspace is resolved by the host.
+pub const ACTION_TASK_CREATE_V2: &str = "task.create.v2";
 /// Stable id for renaming one Task through the host command boundary.
 pub const ACTION_TASK_RENAME: &str = "task.rename";
 
@@ -48,6 +56,7 @@ pub enum ActionArgumentSchema {
     None,
     TaskId,
     TaskCreateV1,
+    TaskCreateV2,
     TaskRenameV1,
 }
 
@@ -106,14 +115,15 @@ const ACTIONS: &[ActionDescriptor] = &[
         argument_schema: ActionArgumentSchema::TaskId,
     },
     ActionDescriptor {
-        id: ACTION_TASK_CREATE,
-        title: "Create task",
-        description: "Create one Task through the host command boundary.",
-        keywords: &["task", "create", "new", "add"],
+        id: ACTION_TASK_CREATE_V2,
+        title: "Create task (workspace request)",
+        description:
+            "Create one Task after the host resolves a workspace request against a project root.",
+        keywords: &["task", "create", "workspace", "worktree", "new"],
         scope: ActionScope::Host,
         required_capability: None,
         risk: ActionRisk::Mutating,
-        argument_schema: ActionArgumentSchema::TaskCreateV1,
+        argument_schema: ActionArgumentSchema::TaskCreateV2,
     },
     ActionDescriptor {
         id: ACTION_TASK_RENAME,
@@ -127,7 +137,9 @@ const ACTIONS: &[ActionDescriptor] = &[
     },
 ];
 
-/// Caller-owned `task.create` arguments validated before transport.
+/// Frozen V1 `task.create` arguments. The workspace is already durable; the
+/// host transport rejects raw untrusted CreateTask intents, while trusted
+/// local callers can continue to use this stable action shape.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TaskCreateArguments {
@@ -137,6 +149,43 @@ pub struct TaskCreateArguments {
     pub description: Option<String>,
     pub project_id: ProjectId,
     pub workspace: WorkspaceRef,
+}
+
+/// V2 request-shaped task creation. `WorkspaceRequest` is disposable and is
+/// normalized to a durable reference only inside the authenticated host. The
+/// host selects the project root from its own ProjectId configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskCreateV2Arguments {
+    pub task_id: TaskId,
+    pub environment_id: EnvironmentId,
+    pub title: String,
+    pub description: Option<String>,
+    pub project_id: ProjectId,
+    pub workspace: WorkspaceRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskCreateError {
+    Validation(TaskValidationError),
+    Workspace(WorkspaceError),
+}
+
+impl std::fmt::Display for TaskCreateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Validation(error) => error.fmt(f),
+            Self::Workspace(error) => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for TaskCreateError {}
+
+impl From<TaskValidationError> for TaskCreateError {
+    fn from(error: TaskValidationError) -> Self {
+        Self::Validation(error)
+    }
 }
 
 /// Caller-owned `task.rename` arguments validated before transport.
@@ -178,13 +227,14 @@ pub fn task_show_query(
     }
 }
 
-/// Build the shared `task.create` mutation after local canonicalization.
+/// Build the shared `task.create` mutation after content canonicalization and
+/// workspace resolution.
 pub fn task_create_command(
     command_id: CommandId,
     client_id: ClientId,
     issued_at_ms: i64,
     args: TaskCreateArguments,
-) -> Result<CommandEnvelope, TaskValidationError> {
+) -> Result<CommandEnvelope, TaskCreateError> {
     let title = TaskFacts::canonicalize_title(args.title)?;
     let description = TaskFacts::canonicalize_description(args.description)?;
     args.workspace.validate()?;
@@ -195,6 +245,40 @@ pub fn task_create_command(
         issued_at_ms,
         expected_task_revision: None,
         command: Command::CreateTask(CreateTaskIntent {
+            id: args.task_id,
+            environment_id: args.environment_id,
+            title,
+            description,
+            project_id: args.project_id,
+            workspace: args.workspace,
+            assignment: TaskAssignment::LocalOwner,
+            created_at_ms: issued_at_ms,
+            connectivity: TaskConnectivity::Connected,
+            attention: TaskAttention::None,
+            activity: TaskActivity::Idle,
+            review_readiness: ReviewReadiness::NotReady,
+        }),
+    })
+}
+
+/// Build the truthful V2 request. No durable workspace or project path is
+/// produced here; the authenticated host resolves the request against its
+/// ProjectId configuration.
+pub fn task_create_v2_command(
+    command_id: CommandId,
+    client_id: ClientId,
+    issued_at_ms: i64,
+    args: TaskCreateV2Arguments,
+) -> Result<CommandEnvelope, TaskCreateError> {
+    let title = TaskFacts::canonicalize_title(args.title)?;
+    let description = TaskFacts::canonicalize_description(args.description)?;
+    Ok(CommandEnvelope {
+        command_id,
+        client_id,
+        task_id: None,
+        issued_at_ms,
+        expected_task_revision: None,
+        command: Command::CreateTaskV2(CreateTaskRequestIntent {
             id: args.task_id,
             environment_id: args.environment_id,
             title,
@@ -234,9 +318,9 @@ pub fn task_rename_command(
 mod tests {
     use super::{
         catalog, require_unique_ids, task_create_command, task_rename_command, task_show_query,
-        ActionArgumentSchema, ActionRisk, ActionScope, TaskCreateArguments, TaskRenameArguments,
-        ACTION_HOST_ACTIONS, ACTION_HOST_STATUS, ACTION_TASK_CREATE, ACTION_TASK_LIST,
-        ACTION_TASK_RENAME, ACTION_TASK_SHOW,
+        ActionArgumentSchema, ActionRisk, ActionScope, TaskCreateArguments, TaskCreateV2Arguments,
+        TaskRenameArguments, ACTION_HOST_ACTIONS, ACTION_HOST_STATUS, ACTION_TASK_CREATE,
+        ACTION_TASK_CREATE_V2, ACTION_TASK_LIST, ACTION_TASK_RENAME, ACTION_TASK_SHOW,
     };
     use crate::domain::command::Command;
     use crate::domain::query::Query;
@@ -254,7 +338,7 @@ mod tests {
         assert!(ids.contains(&ACTION_HOST_STATUS));
         assert!(ids.contains(&ACTION_TASK_LIST));
         assert!(ids.contains(&ACTION_TASK_SHOW));
-        assert!(ids.contains(&ACTION_TASK_CREATE));
+        assert!(!ids.contains(&ACTION_TASK_CREATE));
         assert!(ids.contains(&ACTION_TASK_RENAME));
         assert_eq!(ids.len(), 6);
         require_unique_ids().expect("ids must be unique");
@@ -273,10 +357,10 @@ mod tests {
                         ActionArgumentSchema::TaskId,
                         None,
                     ),
-                    ACTION_TASK_CREATE => (
+                    ACTION_TASK_CREATE_V2 => (
                         ActionScope::Host,
                         ActionRisk::Mutating,
-                        ActionArgumentSchema::TaskCreateV1,
+                        ActionArgumentSchema::TaskCreateV2,
                         None,
                     ),
                     ACTION_TASK_RENAME => (
@@ -375,6 +459,55 @@ mod tests {
             },
         );
         assert!(result.is_err(), "blank titles must fail before transport");
+    }
+
+    #[test]
+    fn frozen_task_create_v1_arguments_still_accept_the_durable_workspace_shape() {
+        let value = serde_json::json!({
+            "task_id": TaskId::new(),
+            "environment_id": EnvironmentId::new(),
+            "title": "Frozen V1 task",
+            "description": null,
+            "project_id": ProjectId::new(),
+            "workspace": "main"
+        });
+
+        let result = serde_json::from_value::<TaskCreateArguments>(value);
+        assert!(
+            result.is_ok(),
+            "TaskCreateV1 must remain decodable: {}",
+            result.expect_err("expected the current shape to fail")
+        );
+    }
+
+    #[test]
+    fn task_create_v2_arguments_reject_a_client_supplied_project_root() {
+        let mut value = serde_json::json!({
+            "task_id": TaskId::new(),
+            "environment_id": EnvironmentId::new(),
+            "title": "Host-owned project root",
+            "description": null,
+            "project_id": ProjectId::new(),
+            "project_root": "C:/client-selected-root",
+            "workspace": {
+                "choice": "main",
+                "path": null,
+                "branch": null,
+                "external_confirmed": false
+            }
+        });
+
+        assert!(
+            serde_json::from_value::<TaskCreateV2Arguments>(value.clone()).is_err(),
+            "V2 must not decode a client-selected project root"
+        );
+
+        value
+            .as_object_mut()
+            .expect("V2 arguments object")
+            .remove("project_root");
+        serde_json::from_value::<TaskCreateV2Arguments>(value)
+            .expect("V2 must decode without a client project root");
     }
 
     #[test]

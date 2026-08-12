@@ -23,6 +23,14 @@ impl SessionManager {
         persistence::load_workspace()
     }
 
+    pub(crate) fn load_config_recovery(&self) -> Result<AppConfig, PersistenceError> {
+        persistence::load_config_recovery()
+    }
+
+    pub fn load_session(&self) -> Result<SessionState, PersistenceError> {
+        persistence::load_session()
+    }
+
     pub fn save_config(&self, config: &AppConfig) -> Result<(), PersistenceError> {
         persistence::save_config(config)
     }
@@ -31,19 +39,18 @@ impl SessionManager {
         persistence::save_session(session)
     }
 
-    pub fn export_config_to_path(
-        &self,
-        path: &Path,
-        config: &AppConfig,
-    ) -> Result<(), PersistenceError> {
-        persistence::save_config_to_path(path, config)
+    pub(crate) fn export_active_config_to_path(&self, path: &Path) -> Result<(), PersistenceError> {
+        persistence::export_active_config_to_path(path)
     }
 
-    pub fn import_config_from_path(&self, path: &Path) -> Result<AppConfig, PersistenceError> {
+    pub(crate) fn import_config_from_path(
+        &self,
+        path: &Path,
+    ) -> Result<AppConfig, PersistenceError> {
         persistence::load_config_from_path(path)
     }
 
-    pub fn export_config_dialog(&self, config: &AppConfig) -> Result<Option<PathBuf>, String> {
+    pub(crate) fn export_config_dialog(&self) -> Result<Option<PathBuf>, String> {
         let default_name = default_export_file_name();
         let Some(path) = FileDialog::new()
             .add_filter("JSON", &["json"])
@@ -53,12 +60,12 @@ impl SessionManager {
             return Ok(None);
         };
 
-        self.export_config_to_path(&path, config)
+        self.export_active_config_to_path(&path)
             .map_err(|error| error.to_string())?;
         Ok(Some(path))
     }
 
-    pub fn import_config_dialog(
+    pub(crate) fn import_config_dialog(
         &self,
         current: &AppConfig,
         mode: ConfigImportMode,

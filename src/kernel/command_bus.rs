@@ -12,6 +12,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension, Transaction};
+use sha2::{Digest, Sha256};
 
 use crate::domain::agent::{AgentRole, AgentSessionFacts, AgentSessionLifecycle};
 use crate::domain::artifact::{ArtifactFacts, ArtifactKind, PrivacyClass};
@@ -28,7 +29,7 @@ use crate::domain::host::{
 };
 use crate::domain::id::{
     AgentSessionId, ArtifactId, ClientId, CommandId, EnvironmentId, EventId, OperationId, OutboxId,
-    ProjectId, ResourceId, TaskId,
+    ProjectId, RequestId, ResourceId, TaskId,
 };
 use crate::domain::operation::{
     CancellationReason, OperationErrorCode, OperationFacts, OperationOutcome, OperationOutcomeKind,
@@ -56,6 +57,12 @@ use crate::kernel::store::{
     encode_event_payload, now_ms, u64_from_nonnegative_i64, u64_to_sqlite_i64, KernelStore,
     StoreError,
 };
+use crate::kernel::SessionScope;
+use crate::workspace::{
+    WorkspaceAuthorization, WorkspaceError, WorkspaceProjectRoots, WorkspaceResourceCoordinator,
+    WorkspaceService,
+};
+use uuid::Uuid;
 
 /// One advancement unit from the Closing host-cleanup journal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,6 +114,57 @@ pub struct CommandBus {
     store: KernelStore,
 }
 
+/// Internal receipt namespace. These values never become part of the public
+/// receipt document, but are persisted beside it so a reused command ID cannot
+/// replay a receipt across clients, sessions, tasks, or runtime epochs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ReceiptScope {
+    connection_id: Option<Uuid>,
+    request_id: Option<RequestId>,
+    action_epoch: Option<u64>,
+    runtime_generation: Option<u64>,
+}
+
+const MAX_RECEIPT_ROWS: i64 = 4_096;
+
+/// Runtime task state with its host-reconstructed workspace projection.
+/// Resource services must receive this result before they start work; the
+/// durable WorkspaceRef remains the only persisted task truth.
+pub struct LoadedTaskRuntime {
+    pub snapshot: TaskSnapshot,
+    pub workspace: WorkspaceService,
+}
+
+#[derive(Debug)]
+pub enum TaskRuntimeLoadError {
+    Store(StoreError),
+    Workspace(WorkspaceError),
+    ProjectNotConfigured(ProjectId),
+}
+
+impl std::fmt::Display for TaskRuntimeLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Store(error) => write!(f, "task runtime store load failed: {error}"),
+            Self::Workspace(error) => write!(f, "task runtime workspace load failed: {error}"),
+            Self::ProjectNotConfigured(project_id) => write!(
+                f,
+                "task runtime project is not configured on the host: {project_id}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TaskRuntimeLoadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Store(error) => Some(error),
+            Self::Workspace(error) => Some(error),
+            Self::ProjectNotConfigured(_) => None,
+        }
+    }
+}
+
 impl fmt::Debug for CommandBus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("CommandBus")
@@ -123,7 +181,66 @@ impl CommandBus {
 
     /// Execute a command through the owned store.
     pub fn execute(&mut self, envelope: CommandEnvelope) -> Result<CommandReceipt, StoreError> {
+        if matches!(
+            &envelope.command,
+            Command::CreateTask(_) | Command::CreateTaskV2(_)
+        ) {
+            return Err(StoreError::HostAuthorityRequired);
+        }
         self.store.execute(envelope)
+    }
+
+    /// Execute a host-normalized CreateTask admitted by a configured project.
+    ///
+    /// The authorization is opaque and cannot be constructed by callers. It
+    /// is consumed here so the persistence seam cannot accept a caller-chosen
+    /// durable workspace reference without a preceding host resolution.
+    pub(crate) fn execute_authorized(
+        &mut self,
+        envelope: CommandEnvelope,
+        authorization: WorkspaceAuthorization,
+        request_id: RequestId,
+        connection_id: Uuid,
+    ) -> Result<CommandReceipt, StoreError> {
+        execute_authorized_with_context(
+            &mut self.store,
+            envelope,
+            authorization,
+            request_id,
+            connection_id,
+        )
+    }
+
+    /// Execute a command after the authenticated host has normalized it.
+    pub(crate) fn execute_host_authorized(
+        &mut self,
+        envelope: CommandEnvelope,
+        authorization: Option<WorkspaceAuthorization>,
+        request_id: RequestId,
+        connection_id: Uuid,
+    ) -> Result<CommandReceipt, StoreError> {
+        match authorization {
+            Some(authorization) => {
+                self.execute_authorized(envelope, authorization, request_id, connection_id)
+            }
+            None => execute_with_scope(
+                &mut self.store,
+                envelope,
+                ReceiptScope {
+                    connection_id: (!connection_id.is_nil()).then_some(connection_id),
+                    request_id: (!connection_id.is_nil()).then_some(request_id),
+                    ..ReceiptScope::default()
+                },
+            ),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn execute_for_test(
+        &mut self,
+        envelope: CommandEnvelope,
+    ) -> Result<CommandReceipt, StoreError> {
+        execute_for_test(&mut self.store, envelope)
     }
 
     /// Query durable operation status without creating operations.
@@ -141,6 +258,51 @@ impl CommandBus {
         let snapshot = load_task_snapshot(&tx, task_id)?;
         tx.commit()?;
         Ok(snapshot)
+    }
+
+    /// Load the durable task and reconstruct its host-owned workspace before
+    /// any runtime resource can be handed out.
+    pub fn load_task_runtime(
+        &self,
+        task_id: TaskId,
+        workspace_projects: &WorkspaceProjectRoots,
+    ) -> Result<Option<LoadedTaskRuntime>, TaskRuntimeLoadError> {
+        self.load_task_runtime_with_coordinator(
+            task_id,
+            workspace_projects,
+            WorkspaceResourceCoordinator::new(),
+        )
+    }
+
+    pub(crate) fn load_task_runtime_with_coordinator(
+        &self,
+        task_id: TaskId,
+        workspace_projects: &WorkspaceProjectRoots,
+        coordinator: WorkspaceResourceCoordinator,
+    ) -> Result<Option<LoadedTaskRuntime>, TaskRuntimeLoadError> {
+        let Some(snapshot) = self
+            .task_snapshot(task_id)
+            .map_err(TaskRuntimeLoadError::Store)?
+        else {
+            return Ok(None);
+        };
+        let workspace = WorkspaceService::from_durable_with_task_coordinator(
+            snapshot.task.project_id,
+            snapshot.task.id,
+            workspace_projects,
+            &snapshot.task.workspace,
+            coordinator,
+        )
+        .map_err(|error| match error {
+            WorkspaceError::ProjectNotConfigured(project_id) => {
+                TaskRuntimeLoadError::ProjectNotConfigured(project_id)
+            }
+            error => TaskRuntimeLoadError::Workspace(error),
+        })?;
+        Ok(Some(LoadedTaskRuntime {
+            snapshot,
+            workspace,
+        }))
     }
 
     /// Inspect durable host-quit blockers through one short read-only transaction.
@@ -276,6 +438,14 @@ impl CommandBus {
         self.store.begin_snapshot(limits)
     }
 
+    pub(crate) fn begin_snapshot_scoped(
+        &self,
+        limits: PageLimits,
+        scope: SessionScope,
+    ) -> Result<SnapshotSession, SnapshotError> {
+        self.store.begin_snapshot_scoped(limits, scope)
+    }
+
     /// Pin an immutable event replay through the store boundary (no SQLite escape).
     pub(crate) fn begin_event_replay(
         &self,
@@ -283,6 +453,16 @@ impl CommandBus {
         limits: PageLimits,
     ) -> Result<EventReplaySession, ReplayError> {
         self.store.begin_event_replay(after_sequence, limits)
+    }
+
+    pub(crate) fn begin_event_replay_scoped(
+        &self,
+        after_sequence: u64,
+        limits: PageLimits,
+        scope: SessionScope,
+    ) -> Result<EventReplaySession, ReplayError> {
+        self.store
+            .begin_event_replay_scoped(after_sequence, limits, scope)
     }
 
     /// Load InlineUtf8 artifact content into a paged session (no SQLite escape).
@@ -304,13 +484,206 @@ impl CommandBus {
             max_physical_frame_bytes,
         )
     }
+
+    pub(crate) fn begin_artifact_content_scoped(
+        &self,
+        scope: SessionScope,
+        request_id: RequestId,
+        artifact_id: ArtifactId,
+        limits: PageLimits,
+        max_reassembled_message_bytes: u32,
+        max_physical_frame_bytes: u32,
+    ) -> Result<ArtifactContentSession, ArtifactContentError> {
+        self.store.begin_artifact_content_scoped(
+            scope,
+            request_id,
+            artifact_id,
+            limits,
+            max_reassembled_message_bytes,
+            max_physical_frame_bytes,
+        )
+    }
 }
 
 pub(crate) fn execute(
     store: &mut KernelStore,
     envelope: CommandEnvelope,
 ) -> Result<CommandReceipt, StoreError> {
-    store.with_immediate_transaction(|tx| execute_in_tx(tx, envelope))
+    if matches!(
+        &envelope.command,
+        Command::CreateTask(_) | Command::CreateTaskV2(_)
+    ) {
+        return Err(StoreError::HostAuthorityRequired);
+    }
+    store.with_immediate_transaction(|tx| execute_in_tx(tx, envelope, ReceiptScope::default()))
+}
+
+fn execute_with_scope(
+    store: &mut KernelStore,
+    envelope: CommandEnvelope,
+    scope: ReceiptScope,
+) -> Result<CommandReceipt, StoreError> {
+    store.with_immediate_transaction(|tx| execute_in_tx(tx, envelope, scope))
+}
+
+pub(crate) fn execute_authorized(
+    store: &mut KernelStore,
+    envelope: CommandEnvelope,
+    authorization: WorkspaceAuthorization,
+) -> Result<CommandReceipt, StoreError> {
+    let request_id = authorization.request_id();
+    let connection_id = authorization.connection_id();
+    execute_authorized_with_context(store, envelope, authorization, request_id, connection_id)
+}
+
+pub(crate) fn execute_authorized_with_context(
+    store: &mut KernelStore,
+    envelope: CommandEnvelope,
+    authorization: WorkspaceAuthorization,
+    request_id: RequestId,
+    connection_id: Uuid,
+) -> Result<CommandReceipt, StoreError> {
+    let Command::CreateTask(intent) = &envelope.command else {
+        return Err(StoreError::HostAuthorityRequired);
+    };
+    let task_id = intent.id;
+    let project_id = intent.project_id;
+    let client_id = envelope.client_id;
+    let command_id = envelope.command_id;
+    let workspace = intent.workspace.clone();
+    if envelope.task_id.is_some()
+        || !authorization.permits(
+            task_id,
+            project_id,
+            client_id,
+            connection_id,
+            request_id,
+            command_id,
+            &workspace,
+        )
+    {
+        return Err(StoreError::HostAuthorityRequired);
+    }
+    store.with_immediate_transaction(|tx| {
+        if !authorization.permits(
+            task_id,
+            project_id,
+            client_id,
+            connection_id,
+            request_id,
+            command_id,
+            &workspace,
+        ) {
+            return Err(StoreError::HostAuthorityRequired);
+        }
+        let receipt = execute_in_tx(
+            tx,
+            envelope,
+            ReceiptScope {
+                connection_id: (!connection_id.is_nil()).then_some(connection_id),
+                request_id: (!connection_id.is_nil()).then_some(request_id),
+                action_epoch: Some(authorization.action_epoch()),
+                runtime_generation: Some(authorization.runtime_generation()),
+            },
+        )?;
+        // Keep the host-captured pins live through the mutation and perform
+        // the final identity/content check before this closure returns and
+        // SQLite can commit. A rewrite or replacement observed here rolls
+        // the command back instead of committing an unverified task fact.
+        if !authorization.permits(
+            task_id,
+            project_id,
+            client_id,
+            connection_id,
+            request_id,
+            command_id,
+            &workspace,
+        ) {
+            return Err(StoreError::HostAuthorityRequired);
+        }
+        Ok(receipt)
+    })
+}
+
+/// Test-only fixture adapter. It resolves the fixed Main workspace against
+/// the checked-out repository before using the same opaque authority as the
+/// host. Tests for paging, replay, and maintenance can therefore exercise
+/// ordinary command behavior without reopening the production raw-command
+/// seam.
+#[cfg(test)]
+pub(crate) fn execute_for_test(
+    store: &mut KernelStore,
+    envelope: CommandEnvelope,
+) -> Result<CommandReceipt, StoreError> {
+    let CommandEnvelope {
+        command,
+        command_id,
+        client_id,
+        task_id,
+        issued_at_ms,
+        expected_task_revision,
+    } = envelope;
+    let Command::CreateTask(mut intent) = command else {
+        return execute(
+            store,
+            CommandEnvelope {
+                command,
+                command_id,
+                client_id,
+                task_id,
+                issued_at_ms,
+                expected_task_revision,
+            },
+        );
+    };
+    if !matches!(intent.workspace, crate::domain::task::WorkspaceRef::Main) {
+        return Err(StoreError::HostAuthorityRequired);
+    }
+    let project = tempfile::tempdir().map_err(|error| StoreError::Io(error.to_string()))?;
+    std::fs::create_dir(project.path().join(".git"))
+        .map_err(|error| StoreError::Io(error.to_string()))?;
+    std::fs::write(
+        project.path().join(".git").join("HEAD"),
+        "ref: refs/heads/main\n",
+    )
+    .map_err(|error| StoreError::Io(error.to_string()))?;
+    let workspace_projects =
+        WorkspaceProjectRoots::try_from_pairs([(intent.project_id, project.path().to_path_buf())])
+            .map_err(|_| StoreError::HostAuthorityRequired)?;
+    let mut service = WorkspaceService::with_task_coordinator(
+        intent.project_id,
+        intent.id,
+        &workspace_projects,
+        WorkspaceResourceCoordinator::new(),
+    )
+    .map_err(|_| StoreError::HostAuthorityRequired)?;
+    let request_id = RequestId::new();
+    let connection_id = Uuid::now_v7();
+    let (binding, authorization) = service
+        .bind_authorized(
+            crate::workspace::WorkspaceRequest::main(),
+            intent.id,
+            client_id,
+            connection_id,
+            request_id,
+            command_id,
+        )
+        .map_err(|_| StoreError::HostAuthorityRequired)?;
+    intent.workspace = binding.durable_ref().clone();
+    execute_authorized_with_context(
+        store,
+        CommandEnvelope {
+            command: Command::CreateTask(intent),
+            command_id,
+            client_id,
+            task_id,
+            issued_at_ms,
+            expected_task_revision,
+        },
+        authorization,
+        request_id,
+        connection_id,
+    )
 }
 
 pub(crate) fn operation_status_in_tx(
@@ -427,6 +800,43 @@ fn operation_state_from_validated_projection(
 }
 
 #[cfg(test)]
+mod workspace_authority_tests {
+    use super::*;
+
+    #[test]
+    fn direct_command_bus_task_creation_requires_host_normalization() {
+        let directory = tempfile::tempdir().expect("temporary command bus directory");
+        let mut bus =
+            CommandBus::open(&directory.path().join("tasks.sqlite")).expect("command bus");
+        let task_id = TaskId::new();
+        let result = bus.execute(CommandEnvelope {
+            command_id: CommandId::new(),
+            client_id: ClientId::new(),
+            task_id: None,
+            issued_at_ms: 1_725_000_000_100,
+            expected_task_revision: None,
+            command: Command::CreateTask(crate::domain::command::CreateTaskIntent {
+                id: task_id,
+                environment_id: EnvironmentId::new(),
+                title: "unresolved direct task".into(),
+                description: None,
+                project_id: ProjectId::new(),
+                workspace: crate::domain::task::WorkspaceRef::Main,
+                assignment: crate::domain::task::TaskAssignment::LocalOwner,
+                created_at_ms: 1_725_000_000_100,
+                connectivity: crate::domain::task::TaskConnectivity::Connected,
+                attention: crate::domain::task::TaskAttention::None,
+                activity: crate::domain::task::TaskActivity::Idle,
+                review_readiness: crate::domain::task::ReviewReadiness::NotReady,
+            }),
+        });
+
+        assert_eq!(result, Err(StoreError::HostAuthorityRequired));
+        assert!(bus.task_snapshot(task_id).expect("task lookup").is_none());
+    }
+}
+
+#[cfg(test)]
 mod operation_status_tests {
     use super::*;
 
@@ -506,6 +916,138 @@ mod operation_status_tests {
                 "wrong mapping for {state}",
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod receipt_scope_tests {
+    use super::*;
+
+    fn missing_task_envelope(
+        command_id: CommandId,
+        client_id: ClientId,
+        task_id: TaskId,
+    ) -> CommandEnvelope {
+        CommandEnvelope {
+            command_id,
+            client_id,
+            task_id: Some(task_id),
+            issued_at_ms: 1_725_000_000_777,
+            expected_task_revision: None,
+            command: Command::RenameTask(crate::domain::command::RenameTaskIntent {
+                title: "scope-bound receipt".into(),
+            }),
+        }
+    }
+
+    fn scoped(
+        connection_id: Uuid,
+        request_id: RequestId,
+        epoch: u64,
+        generation: u64,
+    ) -> ReceiptScope {
+        ReceiptScope {
+            connection_id: Some(connection_id),
+            request_id: Some(request_id),
+            action_epoch: Some(epoch),
+            runtime_generation: Some(generation),
+        }
+    }
+
+    #[test]
+    fn receipt_replay_requires_exact_client_session_task_epoch_and_command_identity() {
+        let directory = tempfile::tempdir().expect("receipt scope directory");
+        let mut store = KernelStore::open(&directory.path().join("tasks.sqlite")).expect("store");
+        let command_id = CommandId::new();
+        let client_id = ClientId::new();
+        let task_id = TaskId::new();
+        let connection_id = Uuid::now_v7();
+        let request_id = RequestId::new();
+        let base = missing_task_envelope(command_id, client_id, task_id);
+        let scope = scoped(connection_id, request_id, 4, 9);
+
+        let original = execute_with_scope(&mut store, base.clone(), scope).expect("first receipt");
+        let replay =
+            execute_with_scope(&mut store, base.clone(), scope).expect("same scope replay");
+        assert_eq!(replay, original);
+
+        let mut altered = base.clone();
+        altered.client_id = ClientId::new();
+        assert_eq!(
+            execute_with_scope(&mut store, altered, scope),
+            Err(StoreError::CommandIdConflict)
+        );
+
+        let mut altered = base.clone();
+        altered.task_id = Some(TaskId::new());
+        assert_eq!(
+            execute_with_scope(&mut store, altered, scope),
+            Err(StoreError::CommandIdConflict)
+        );
+
+        for altered_scope in [
+            ReceiptScope {
+                connection_id: Some(Uuid::now_v7()),
+                ..scope
+            },
+            ReceiptScope {
+                request_id: Some(RequestId::new()),
+                ..scope
+            },
+            ReceiptScope {
+                action_epoch: Some(scope.action_epoch.unwrap() + 1),
+                ..scope
+            },
+            ReceiptScope {
+                runtime_generation: Some(scope.runtime_generation.unwrap() + 1),
+                ..scope
+            },
+        ] {
+            assert_eq!(
+                execute_with_scope(&mut store, base.clone(), altered_scope),
+                Err(StoreError::CommandIdConflict)
+            );
+        }
+
+        for partial_scope in [
+            ReceiptScope {
+                connection_id: None,
+                ..scope
+            },
+            ReceiptScope {
+                request_id: None,
+                ..scope
+            },
+            ReceiptScope {
+                action_epoch: None,
+                ..scope
+            },
+            ReceiptScope {
+                runtime_generation: None,
+                ..scope
+            },
+        ] {
+            assert_eq!(
+                execute_with_scope(&mut store, base.clone(), partial_scope),
+                Err(StoreError::CommandIdConflict)
+            );
+        }
+
+        let mut altered = base.clone();
+        altered.issued_at_ms += 1;
+        assert_eq!(
+            execute_with_scope(&mut store, altered, scope),
+            Err(StoreError::CommandIdConflict)
+        );
+
+        let mut altered = base;
+        altered.command = Command::RenameTask(crate::domain::command::RenameTaskIntent {
+            title: "different command".into(),
+        });
+        assert_eq!(
+            execute_with_scope(&mut store, altered, scope),
+            Err(StoreError::CommandIdConflict)
+        );
     }
 }
 
@@ -2049,8 +2591,9 @@ fn cancel_untouched_begin_close_for_reopen(
 fn execute_in_tx(
     tx: &Transaction<'_>,
     envelope: CommandEnvelope,
+    scope: ReceiptScope,
 ) -> Result<CommandReceipt, StoreError> {
-    if let Some(existing) = lookup_receipt(tx, envelope.command_id)? {
+    if let Some(existing) = lookup_receipt_for_scope(tx, &envelope, scope)? {
         return Ok(existing);
     }
 
@@ -2069,11 +2612,12 @@ fn execute_in_tx(
             RejectionCode::Closing,
             current_revision,
             accepted_at_ms,
+            scope,
         );
     }
 
     if matches!(envelope.command, Command::ConfirmHostQuit(_)) {
-        return persist_confirm_host_quit(tx, envelope);
+        return persist_confirm_host_quit(tx, envelope, scope);
     }
 
     let accepted_at_ms = now_ms()?;
@@ -2092,6 +2636,7 @@ fn execute_in_tx(
             code,
             current_revision,
             accepted_at_ms,
+            scope,
         ),
         Ok(decision) => {
             // Empty authoritative decisions for already Closing/Releasing stay unsupported
@@ -2104,6 +2649,7 @@ fn execute_in_tx(
                     RejectionCode::UnsupportedCapability,
                     current_revision,
                     accepted_at_ms,
+                    scope,
                 );
             }
             let Some(task_id) = effective_task_id else {
@@ -2132,6 +2678,7 @@ fn execute_in_tx(
                     snapshot.as_ref(),
                     decision,
                     accepted_at_ms,
+                    scope,
                 )
             } else {
                 persist_side_effect_acceptance(
@@ -2142,6 +2689,7 @@ fn execute_in_tx(
                     decision,
                     planned,
                     accepted_at_ms,
+                    scope,
                 )
             }
         }
@@ -2202,6 +2750,173 @@ fn lookup_receipt(
         }
     }
     Ok(Some(receipt))
+}
+
+fn command_fingerprint(envelope: &CommandEnvelope) -> Result<[u8; 32], StoreError> {
+    // The command ID is only idempotent for one exact envelope identity. In
+    // particular, a caller cannot reuse an ID with a different task revision
+    // or task scope and receive the first caller's receipt.
+    let encoded = rmp_serde::to_vec(&(
+        envelope.task_id,
+        envelope.issued_at_ms,
+        envelope.expected_task_revision,
+        &envelope.command,
+    ))
+    .map_err(|_| StoreError::CodecMismatch {
+        detail: "command identity encoding failed".into(),
+    })?;
+    Ok(Sha256::digest(encoded).into())
+}
+
+fn lookup_receipt_for_scope(
+    tx: &Transaction<'_>,
+    envelope: &CommandEnvelope,
+    scope: ReceiptScope,
+) -> Result<Option<CommandReceipt>, StoreError> {
+    let row: Option<(
+        Vec<u8>,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+        Option<i64>,
+        Option<i64>,
+        Option<Vec<u8>>,
+    )> = tx
+        .query_row(
+            "SELECT client_id, task_id, connection_id, request_id,
+                    action_epoch, runtime_generation, command_fingerprint
+             FROM command_receipts WHERE command_id = ?1",
+            [envelope.command_id.as_bytes().as_slice()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        client_bytes,
+        task_bytes,
+        connection_bytes,
+        request_bytes,
+        epoch,
+        generation,
+        fingerprint,
+    )) = row
+    else {
+        return Ok(None);
+    };
+    let client_id = parse_client_receipt_id("command_receipts.client_id", &client_bytes)?;
+    let task_id = parse_optional_task_scope("command_receipts.task_id", task_bytes)?;
+    let connection_id = connection_bytes
+        .as_deref()
+        .map(|bytes| id16_uuid("command_receipts.connection_id", bytes))
+        .transpose()?;
+    let request_id = request_bytes
+        .as_deref()
+        .map(|bytes| parse_request_receipt_id("command_receipts.request_id", bytes))
+        .transpose()?;
+    let stored_scope = ReceiptScope {
+        connection_id,
+        request_id,
+        action_epoch: epoch
+            .map(|value| u64_from_nonnegative_i64("command_receipts.action_epoch", value))
+            .transpose()?,
+        runtime_generation: generation
+            .map(|value| u64_from_nonnegative_i64("command_receipts.runtime_generation", value))
+            .transpose()?,
+    };
+    let expected_fingerprint = command_fingerprint(envelope)?;
+    // V7 cannot reconstruct the original envelope identity for a pre-V7 row.
+    // Treat that row as a conflict instead of returning a receipt whose
+    // command/task scope cannot be proven exact.
+    let fingerprint_matches = fingerprint
+        .as_deref()
+        .is_some_and(|bytes| bytes == expected_fingerprint.as_slice());
+    let expected_task_id = effective_task_scope(envelope);
+    if client_id != envelope.client_id || task_id != expected_task_id || !fingerprint_matches {
+        return Err(StoreError::CommandIdConflict);
+    }
+
+    // A receipt first persisted without an output connection is a delivery
+    // recovery token, not a cross-session replay token. Claim it exactly once
+    // for the new output after rechecking the client/task/command identity.
+    let can_claim_unbound = fingerprint.is_some()
+        && stored_scope.connection_id.is_none()
+        && stored_scope.request_id.is_none()
+        && scope.connection_id.is_some()
+        && scope.request_id.is_some()
+        && (stored_scope.action_epoch.is_none() || stored_scope.action_epoch == scope.action_epoch)
+        && (stored_scope.runtime_generation.is_none()
+            || stored_scope.runtime_generation == scope.runtime_generation);
+    if can_claim_unbound {
+        tx.execute(
+            "UPDATE command_receipts
+             SET connection_id = ?2, request_id = ?3,
+                 action_epoch = ?4, runtime_generation = ?5
+             WHERE command_id = ?1 AND connection_id IS NULL AND request_id IS NULL",
+            rusqlite::params![
+                envelope.command_id.as_bytes().as_slice(),
+                scope.connection_id.map(|id| id.as_bytes().to_vec()),
+                scope.request_id.map(|id| id.as_bytes().to_vec()),
+                scope
+                    .action_epoch
+                    .map(|epoch| u64_to_sqlite_i64("command_receipts.action_epoch", epoch))
+                    .transpose()?,
+                scope
+                    .runtime_generation
+                    .map(|generation| {
+                        u64_to_sqlite_i64("command_receipts.runtime_generation", generation)
+                    })
+                    .transpose()?,
+            ],
+        )?;
+        return lookup_receipt(tx, envelope.command_id);
+    }
+
+    // Every scope dimension must be present and equal before returning a
+    // receipt. Treating a missing incoming dimension as a wildcard would let
+    // an otherwise valid partial host context replay another connection's
+    // receipt. The only exception is the explicit one-shot unbound claim
+    // above, which atomically fills both connection and request identity.
+    if stored_scope != scope {
+        return Err(StoreError::CommandIdConflict);
+    }
+    lookup_receipt(tx, envelope.command_id)
+}
+
+// `Uuid` itself is not one of the domain ID wrappers. Keep parsing the 16-byte
+// session/connection value in one checked helper rather than accepting an
+// arbitrary byte vector from SQLite.
+fn id16_uuid(field: &'static str, bytes: &[u8]) -> Result<Uuid, StoreError> {
+    if bytes.len() != 16 {
+        return Err(StoreError::CodecMismatch {
+            detail: format!("{field} must be 16 bytes"),
+        });
+    }
+    let mut raw = [0u8; 16];
+    raw.copy_from_slice(bytes);
+    Ok(Uuid::from_bytes(raw))
+}
+
+fn parse_client_receipt_id(field: &'static str, bytes: &[u8]) -> Result<ClientId, StoreError> {
+    let raw: [u8; 16] = bytes.try_into().map_err(|_| StoreError::CodecMismatch {
+        detail: format!("{field} must be 16 bytes"),
+    })?;
+    ClientId::from_bytes(raw).map_err(|_| StoreError::Corruption)
+}
+
+fn parse_request_receipt_id(field: &'static str, bytes: &[u8]) -> Result<RequestId, StoreError> {
+    let raw: [u8; 16] = bytes.try_into().map_err(|_| StoreError::CodecMismatch {
+        detail: format!("{field} must be 16 bytes"),
+    })?;
+    RequestId::from_bytes(raw).map_err(|_| StoreError::Corruption)
 }
 
 /// Validate durable e2 dispatch metadata after an explicit projection rebuild.
@@ -5480,6 +6195,7 @@ fn parse_optional_task_scope(
 fn effective_task_scope(envelope: &CommandEnvelope) -> Option<TaskId> {
     match &envelope.command {
         Command::CreateTask(intent) => Some(intent.id),
+        Command::CreateTaskV2(intent) => Some(intent.id),
         _ => envelope.task_id,
     }
 }
@@ -5498,6 +6214,7 @@ fn persist_rejection(
     code: RejectionCode,
     current_revision: Option<u64>,
     created_at_ms: i64,
+    scope: ReceiptScope,
 ) -> Result<CommandReceipt, StoreError> {
     let receipt = CommandReceipt::Rejected {
         command_id: envelope.command_id,
@@ -5511,6 +6228,7 @@ fn persist_rejection(
         &receipt,
         None,
         created_at_ms,
+        scope,
     )?;
     Ok(receipt)
 }
@@ -5522,6 +6240,7 @@ fn persist_pure_acceptance(
     snapshot: Option<&TaskSnapshot>,
     decision: Vec<Event>,
     accepted_at_ms: i64,
+    scope: ReceiptScope,
 ) -> Result<CommandReceipt, StoreError> {
     let operation_id = OperationId::new();
     let decision_event_ids: Vec<EventId> = (0..decision.len()).map(|_| EventId::new()).collect();
@@ -5562,6 +6281,7 @@ fn persist_pure_acceptance(
         &receipt,
         None,
         accepted_at_ms,
+        scope,
     )?;
 
     for ((payload, event_id), task_revision) in decision
@@ -5628,6 +6348,7 @@ fn persist_side_effect_acceptance(
     decision: Vec<Event>,
     planned: Vec<PlannedEffect>,
     accepted_at_ms: i64,
+    scope: ReceiptScope,
 ) -> Result<CommandReceipt, StoreError> {
     if planned.is_empty() {
         return Err(StoreError::Projection(
@@ -5675,7 +6396,15 @@ fn persist_side_effect_acceptance(
         task_revision: final_task_revision,
         event_ids: decision_event_ids.clone(),
     };
-    insert_receipt_row(tx, envelope, Some(task_id), &receipt, None, accepted_at_ms)?;
+    insert_receipt_row(
+        tx,
+        envelope,
+        Some(task_id),
+        &receipt,
+        None,
+        accepted_at_ms,
+        scope,
+    )?;
 
     for ((payload, event_id), task_revision) in decision
         .into_iter()
@@ -5746,12 +6475,15 @@ fn insert_receipt_row(
     receipt: &CommandReceipt,
     committed_sequence: Option<u64>,
     created_at_ms: i64,
+    scope: ReceiptScope,
 ) -> Result<(), StoreError> {
     let payload = encode_receipt_document(receipt)?;
+    let fingerprint = command_fingerprint(envelope)?;
     tx.execute(
         "INSERT INTO command_receipts(
-            command_id, client_id, task_id, receipt, committed_sequence, created_at_ms
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            command_id, client_id, task_id, receipt, committed_sequence, created_at_ms,
+            connection_id, request_id, action_epoch, runtime_generation, command_fingerprint
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         rusqlite::params![
             envelope.command_id.as_bytes().as_slice(),
             envelope.client_id.as_bytes().as_slice(),
@@ -5765,8 +6497,57 @@ fn insert_receipt_row(
                 None => None,
             },
             created_at_ms,
+            scope.connection_id.map(|id| id.as_bytes().to_vec()),
+            scope.request_id.map(|id| id.as_bytes().to_vec()),
+            match scope.action_epoch {
+                Some(epoch) => Some(u64_to_sqlite_i64("command_receipts.action_epoch", epoch)?),
+                None => None,
+            },
+            match scope.runtime_generation {
+                Some(generation) => Some(u64_to_sqlite_i64(
+                    "command_receipts.runtime_generation",
+                    generation,
+                )?),
+                None => None,
+            },
+            fingerprint.to_vec(),
         ],
     )?;
+    trim_receipt_ledger(tx, envelope.command_id)?;
+    Ok(())
+}
+
+fn trim_receipt_ledger(tx: &Transaction<'_>, newest: CommandId) -> Result<(), StoreError> {
+    let count: i64 = tx.query_row("SELECT COUNT(*) FROM command_receipts", [], |row| {
+        row.get(0)
+    })?;
+    let excess = count.saturating_sub(MAX_RECEIPT_ROWS);
+    if excess <= 0 {
+        return Ok(());
+    }
+    let mut stmt = tx.prepare(
+        "SELECT command_id FROM command_receipts
+         WHERE command_id <> ?1
+           AND NOT EXISTS (SELECT 1 FROM operations WHERE operations.command_id = command_receipts.command_id)
+         ORDER BY created_at_ms ASC, command_id ASC LIMIT ?2",
+    )?;
+    let ids = stmt
+        .query_map(
+            rusqlite::params![newest.as_bytes().as_slice(), excess],
+            |row| row.get::<_, Vec<u8>>(0),
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(stmt);
+    if ids.len() < usize::try_from(excess).unwrap_or(usize::MAX) {
+        // Every older row is still referenced by an operation. Do not let a
+        // durable receipt ledger grow without bound; the surrounding
+        // transaction rolls back this new command and the caller can retry
+        // after operation retention has released a row.
+        return Err(StoreError::Busy);
+    }
+    for id in ids {
+        tx.execute("DELETE FROM command_receipts WHERE command_id = ?1", [id])?;
+    }
     Ok(())
 }
 
@@ -6387,6 +7168,7 @@ fn load_host_admission_row(conn: &Connection) -> Result<Option<HostAdmissionRow>
 fn persist_confirm_host_quit(
     tx: &Transaction<'_>,
     envelope: CommandEnvelope,
+    scope: ReceiptScope,
 ) -> Result<CommandReceipt, StoreError> {
     let accepted_at_ms = now_ms()?;
     let Command::ConfirmHostQuit(ConfirmHostQuitIntent {
@@ -6407,6 +7189,7 @@ fn persist_confirm_host_quit(
             RejectionCode::InvalidTransition,
             None,
             accepted_at_ms,
+            scope,
         );
     }
     if host_admission_is_closing(tx)? {
@@ -6417,6 +7200,7 @@ fn persist_confirm_host_quit(
             RejectionCode::Closing,
             None,
             accepted_at_ms,
+            scope,
         );
     }
     let current_high_water = durable_event_high_water(tx)?;
@@ -6428,6 +7212,7 @@ fn persist_confirm_host_quit(
             RejectionCode::RevisionConflict,
             None,
             accepted_at_ms,
+            scope,
         );
     }
     if !*allow_uninspected_worktrees {
@@ -6438,6 +7223,7 @@ fn persist_confirm_host_quit(
             RejectionCode::InvalidTransition,
             None,
             accepted_at_ms,
+            scope,
         );
     }
 
@@ -6452,7 +7238,7 @@ fn persist_confirm_host_quit(
         task_revision: None,
         event_ids: vec![begun_event_id],
     };
-    insert_receipt_row(tx, &envelope, None, &receipt, None, accepted_at_ms)?;
+    insert_receipt_row(tx, &envelope, None, &receipt, None, accepted_at_ms, scope)?;
 
     append_and_project(
         tx,

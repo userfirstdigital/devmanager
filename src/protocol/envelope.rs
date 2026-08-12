@@ -12,7 +12,8 @@ use crate::domain::ClientId;
 
 use super::frame::MAX_PHYSICAL_FRAME_BYTES;
 use super::{
-    CapabilitySet, FrameLimits, FrameLimitsError, ProtocolVersion, VersionNegotiationError,
+    CapabilitySet, FrameLimits, FrameLimitsError, ProtocolVersion, ReconnectGrant,
+    VersionNegotiationError,
 };
 
 pub const MAX_CLIENT_BUILD_BYTES: u32 = 128;
@@ -180,6 +181,7 @@ pub struct ClientHello {
     pub profile_fingerprint: ProfileFingerprint,
     pub requested: CapabilitySet,
     pub limits: FrameLimits,
+    pub reconnect_grant: Option<ReconnectGrant>,
 }
 
 impl Serialize for ClientHello {
@@ -188,7 +190,8 @@ impl Serialize for ClientHello {
         S: Serializer,
     {
         self.validate().map_err(ser::Error::custom)?;
-        let mut map = serializer.serialize_map(Some(7))?;
+        let mut map =
+            serializer.serialize_map(Some(7 + usize::from(self.reconnect_grant.is_some())))?;
         map.serialize_entry("protocol_major", &self.protocol_major)?;
         map.serialize_entry("protocol_minor", &self.protocol_minor)?;
         map.serialize_entry("client_build", &self.client_build)?;
@@ -196,6 +199,9 @@ impl Serialize for ClientHello {
         map.serialize_entry("profile_fingerprint", &self.profile_fingerprint)?;
         map.serialize_entry("requested", &self.requested)?;
         map.serialize_entry("limits", &self.limits)?;
+        if let Some(grant) = &self.reconnect_grant {
+            map.serialize_entry("reconnect_grant", grant)?;
+        }
         map.end()
     }
 }
@@ -208,6 +214,7 @@ const CLIENT_HELLO_FIELDS: &[&str] = &[
     "profile_fingerprint",
     "requested",
     "limits",
+    "reconnect_grant",
 ];
 
 enum ClientHelloField {
@@ -218,6 +225,7 @@ enum ClientHelloField {
     ProfileFingerprint,
     Requested,
     Limits,
+    ReconnectGrant,
 }
 
 impl<'de> Deserialize<'de> for ClientHelloField {
@@ -246,6 +254,7 @@ impl<'de> Deserialize<'de> for ClientHelloField {
                     "profile_fingerprint" => Ok(ClientHelloField::ProfileFingerprint),
                     "requested" => Ok(ClientHelloField::Requested),
                     "limits" => Ok(ClientHelloField::Limits),
+                    "reconnect_grant" => Ok(ClientHelloField::ReconnectGrant),
                     _ => Err(de::Error::unknown_field(value, CLIENT_HELLO_FIELDS)),
                 }
             }
@@ -280,6 +289,7 @@ impl<'de> Deserialize<'de> for ClientHello {
                 let mut profile_fingerprint = None;
                 let mut requested = None;
                 let mut limits = None;
+                let mut reconnect_grant = None;
 
                 while let Some(field) = map.next_key()? {
                     match field {
@@ -325,6 +335,12 @@ impl<'de> Deserialize<'de> for ClientHello {
                             }
                             limits = Some(map.next_value()?);
                         }
+                        ClientHelloField::ReconnectGrant => {
+                            if reconnect_grant.is_some() {
+                                return Err(de::Error::duplicate_field("reconnect_grant"));
+                            }
+                            reconnect_grant = Some(map.next_value()?);
+                        }
                     }
                 }
 
@@ -340,6 +356,7 @@ impl<'de> Deserialize<'de> for ClientHello {
                         .ok_or_else(|| de::Error::missing_field("profile_fingerprint"))?,
                     requested: requested.ok_or_else(|| de::Error::missing_field("requested"))?,
                     limits: limits.ok_or_else(|| de::Error::missing_field("limits"))?,
+                    reconnect_grant,
                 };
                 hello.validate().map_err(de::Error::custom)?;
                 Ok(hello)
@@ -366,8 +383,28 @@ impl ClientHello {
             profile_fingerprint,
             requested,
             limits,
+            reconnect_grant: None,
         };
         hello.validate()?;
+        Ok(hello)
+    }
+
+    pub fn new_with_reconnect_grant(
+        client_build: impl Into<String>,
+        client_id: ClientId,
+        profile_fingerprint: ProfileFingerprint,
+        requested: CapabilitySet,
+        limits: FrameLimits,
+        reconnect_grant: Option<ReconnectGrant>,
+    ) -> Result<Self, ClientHelloError> {
+        let mut hello = Self::new(
+            client_build,
+            client_id,
+            profile_fingerprint,
+            requested,
+            limits,
+        )?;
+        hello.reconnect_grant = reconnect_grant;
         Ok(hello)
     }
 
@@ -473,6 +510,7 @@ pub struct ServerHello {
     pub profile_fingerprint: ProfileFingerprint,
     pub granted: CapabilitySet,
     pub limits: FrameLimits,
+    pub reconnect_grant: Option<ReconnectGrant>,
 }
 
 impl Serialize for ServerHello {
@@ -481,7 +519,8 @@ impl Serialize for ServerHello {
         S: Serializer,
     {
         self.validate().map_err(ser::Error::custom)?;
-        let mut map = serializer.serialize_map(Some(8))?;
+        let mut map =
+            serializer.serialize_map(Some(8 + usize::from(self.reconnect_grant.is_some())))?;
         map.serialize_entry("protocol_major", &self.protocol_major)?;
         map.serialize_entry("protocol_minor", &self.protocol_minor)?;
         map.serialize_entry("server_build", &self.server_build)?;
@@ -490,6 +529,9 @@ impl Serialize for ServerHello {
         map.serialize_entry("profile_fingerprint", &self.profile_fingerprint)?;
         map.serialize_entry("granted", &self.granted)?;
         map.serialize_entry("limits", &self.limits)?;
+        if let Some(grant) = &self.reconnect_grant {
+            map.serialize_entry("reconnect_grant", grant)?;
+        }
         map.end()
     }
 }
@@ -503,6 +545,7 @@ const SERVER_HELLO_FIELDS: &[&str] = &[
     "profile_fingerprint",
     "granted",
     "limits",
+    "reconnect_grant",
 ];
 
 enum ServerHelloField {
@@ -514,6 +557,7 @@ enum ServerHelloField {
     ProfileFingerprint,
     Granted,
     Limits,
+    ReconnectGrant,
 }
 
 impl<'de> Deserialize<'de> for ServerHelloField {
@@ -543,6 +587,7 @@ impl<'de> Deserialize<'de> for ServerHelloField {
                     "profile_fingerprint" => Ok(ServerHelloField::ProfileFingerprint),
                     "granted" => Ok(ServerHelloField::Granted),
                     "limits" => Ok(ServerHelloField::Limits),
+                    "reconnect_grant" => Ok(ServerHelloField::ReconnectGrant),
                     _ => Err(de::Error::unknown_field(value, SERVER_HELLO_FIELDS)),
                 }
             }
@@ -578,6 +623,7 @@ impl<'de> Deserialize<'de> for ServerHello {
                 let mut profile_fingerprint = None;
                 let mut granted = None;
                 let mut limits = None;
+                let mut reconnect_grant = None;
 
                 while let Some(field) = map.next_key()? {
                     match field {
@@ -629,6 +675,12 @@ impl<'de> Deserialize<'de> for ServerHello {
                             }
                             limits = Some(map.next_value()?);
                         }
+                        ServerHelloField::ReconnectGrant => {
+                            if reconnect_grant.is_some() {
+                                return Err(de::Error::duplicate_field("reconnect_grant"));
+                            }
+                            reconnect_grant = Some(map.next_value()?);
+                        }
                     }
                 }
 
@@ -647,6 +699,7 @@ impl<'de> Deserialize<'de> for ServerHello {
                         .ok_or_else(|| de::Error::missing_field("profile_fingerprint"))?,
                     granted: granted.ok_or_else(|| de::Error::missing_field("granted"))?,
                     limits: limits.ok_or_else(|| de::Error::missing_field("limits"))?,
+                    reconnect_grant,
                 };
                 hello.validate().map_err(de::Error::custom)?;
                 Ok(hello)
@@ -673,6 +726,7 @@ impl ServerHello {
             profile_fingerprint,
             granted: negotiated.capabilities,
             limits: negotiated.limits,
+            reconnect_grant: None,
         };
         hello.validate()?;
         Ok(hello)
