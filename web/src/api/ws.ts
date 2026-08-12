@@ -64,6 +64,8 @@ export interface WsClientCallbacks {
   onStatus(status: WsStatus): void;
   onMessage(message: WsOutbound): void;
   onSessionOutput(frame: SessionOutputFrame): void;
+  /** Explicit authority emitted only after the current socket hello passes validation. */
+  onCapabilityGrant?(grant: CapabilityGrant | null): void;
   getResumeContext?(): ResumeContext;
   onHelloFailure?(failure: WsHelloFailure): void;
 }
@@ -307,6 +309,7 @@ export class WsClient {
 
     const epoch = ++this.connectionEpoch;
     this.starting = true;
+    this.hostAdvertisedRelayUrl = null;
     this.hostCapabilityGrant = null;
     this.cb.onStatus({ kind: "connecting" });
 
@@ -430,6 +433,7 @@ export class WsClient {
           } else {
             this.hostCapabilityGrant = null;
           }
+          this.cb.onCapabilityGrant?.(this.hostCapabilityGrant);
           this.completeHello(socket, epoch);
           this.cb.onMessage(parsed);
           return;
@@ -480,6 +484,8 @@ export class WsClient {
       this.ws = null;
       this.lastForegroundWakeAt = Number.NEGATIVE_INFINITY;
       this.writerLease = { ...EMPTY_WRITER_LEASE };
+      this.hostAdvertisedRelayUrl = null;
+      this.hostCapabilityGrant = null;
       this.cb.onStatus({ kind: "closed", reason });
       if (!this.stopped) this.scheduleReconnect(reason);
       this.scheduleComposerRetry(true);
@@ -684,6 +690,8 @@ export class WsClient {
       } catch {}
     }
     this.writerLease = { ...EMPTY_WRITER_LEASE };
+    this.hostAdvertisedRelayUrl = null;
+    this.hostCapabilityGrant = null;
   }
 
   /**

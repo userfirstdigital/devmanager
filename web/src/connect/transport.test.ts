@@ -7,6 +7,7 @@ import {
   MAX_PENDING_OUTBOUND_BYTES,
   MAX_PENDING_OUTBOUND_ITEMS,
   allowsRawTerminal,
+  buildConnectWebSocketUrl,
   classifyInboundFrame,
   inboundTextByteLength,
   isRawTerminalWriterFrame,
@@ -102,6 +103,14 @@ describe("selectConnectRoute", () => {
     expect(
       parseAdvertisedRelayUrl("wss://relay.example/connect?t=PAIRCODE"),
     ).toBeNull();
+  });
+});
+
+describe("browser Connect transport boundary", () => {
+  it("uses the dedicated /api/connect endpoint", () => {
+    expect(buildConnectWebSocketUrl(location)).toBe(
+      "ws://example.test/api/connect",
+    );
   });
 });
 

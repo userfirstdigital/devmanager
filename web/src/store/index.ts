@@ -31,6 +31,7 @@ import type {
 } from "../api/ws";
 import { isTransientComposerRejection, WsClient } from "../api/ws";
 import { staleResumeRequiresRefresh } from "../connect/resume";
+import type { CapabilityGrant } from "../connect/permissions";
 import { stageDraftHandoff } from "../drafts/draftStore";
 import { requestCompatibleBuild } from "../pwa/register";
 
@@ -83,6 +84,8 @@ export interface WebCompatibilityDiagnostic {
 
 export interface StoreState {
   status: WsStatus;
+  /** Connection-scoped host authority; never restored from browser state. */
+  capabilityGrant: CapabilityGrant | null;
   workspace: WebWorkspaceSnapshot | null;
   /** Temporary safe projection consumed by the terminal-first UI only. */
   snapshot: LegacyWorkspaceProjection | null;
@@ -700,6 +703,7 @@ export const useStore = create<StoreState>((set, get) => {
       current.client?.stop();
       set({
         status: { kind: "closed", reason: message },
+        capabilityGrant: null,
         workspace: null,
         snapshot: null,
         runtimeInstanceId: null,
@@ -812,6 +816,7 @@ export const useStore = create<StoreState>((set, get) => {
         : (snapshot.projects[0]?.id ?? null);
 
     set({
+      capabilityGrant: runtimeChanged ? null : current.capabilityGrant,
       workspace: snapshot,
       snapshot: projectLegacySnapshot(snapshot),
       runtimeInstanceId: snapshot.runtimeInstanceId,
@@ -883,6 +888,7 @@ export const useStore = create<StoreState>((set, get) => {
       invalidateAsyncOperations();
       get().client?.resetRuntime("host runtime changed");
       set({
+        capabilityGrant: null,
         workspace: null,
         snapshot: null,
         runtimeInstanceId: resumeState.runtimeInstanceId,
@@ -1130,6 +1136,7 @@ export const useStore = create<StoreState>((set, get) => {
           get().client?.resetRuntime("browser pairing was revoked");
           set({
             status: { kind: "unauthorized" },
+            capabilityGrant: null,
             workspace: null,
             snapshot: null,
             runtimeInstanceId: null,
@@ -1153,6 +1160,7 @@ export const useStore = create<StoreState>((set, get) => {
         } else {
           set({
             status: { kind: "closed", reason: message.message },
+            capabilityGrant: null,
             lastError: message.message,
           });
         }
@@ -1230,6 +1238,7 @@ export const useStore = create<StoreState>((set, get) => {
 
   return {
     status: { kind: "idle" },
+    capabilityGrant: null,
     workspace: null,
     snapshot: null,
     runtimeInstanceId: null,
@@ -1275,6 +1284,7 @@ export const useStore = create<StoreState>((set, get) => {
           if (!draftHandoffReady) {
             set({
               status: { kind: "closed", reason: "host web bundle changed" },
+              capabilityGrant: null,
               compatibleDraftHandoffTargetBuildId: null,
               lastError:
                 "DevManager could not preserve the exact draft for an automatic web update, so the current page will not reload.",
@@ -1283,6 +1293,7 @@ export const useStore = create<StoreState>((set, get) => {
           }
           set({
             status: { kind: "closed", reason: "host web bundle changed" },
+            capabilityGrant: null,
             compatibleDraftHandoffTargetBuildId: failure.receivedBuildId,
             lastError:
               "DevManager is reconciling this web app with the updated host automatically.",
@@ -1293,6 +1304,7 @@ export const useStore = create<StoreState>((set, get) => {
         if (failure.kind === "protocolMismatch") {
           set({
             status: { kind: "closed", reason: "incompatible web protocol" },
+            capabilityGrant: null,
             compatibilityDiagnostic: {
               expectedProtocolVersion: failure.expectedProtocolVersion,
               receivedProtocolVersion: failure.receivedProtocolVersion,
@@ -1303,6 +1315,7 @@ export const useStore = create<StoreState>((set, get) => {
         }
         set({
           status: { kind: "closed", reason: "invalid websocket handshake" },
+          capabilityGrant: null,
           lastError:
             "The host did not send a valid web hello before session data.",
         });
@@ -1317,12 +1330,17 @@ export const useStore = create<StoreState>((set, get) => {
             status.kind === "idle"
           ) {
             updateLease({ ...EMPTY_WRITER_LEASE });
+            set({ capabilityGrant: null });
           }
           set({ status });
         },
         onMessage: (message) => {
           if (compatibleBuildPending) return;
           handleMessage(message);
+        },
+        onCapabilityGrant: (capabilityGrant) => {
+          if (compatibleBuildPending) return;
+          set({ capabilityGrant });
         },
         onHelloFailure: handleHelloFailure,
         onSessionOutput: handleSessionOutput,

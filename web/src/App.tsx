@@ -77,6 +77,7 @@ function LoadingHost({ offline }: { offline: boolean }) {
 export function App() {
   const init = useStore((state) => state.init);
   const hostStatus = useStore((state) => state.status);
+  const capabilityGrant = useStore((state) => state.capabilityGrant);
   const hostWorkspace = useStore((state) => state.workspace);
   const foregroundConnection = useStore((state) => state.foregroundConnection);
   const setConnectionVisibility = useStore(
@@ -284,6 +285,7 @@ export function App() {
           route={route}
           workspace={workspace}
           status={status}
+          grant={capabilityGrant}
           onNavigate={moveTo}
           demoEvents={
             DEMO_MODE

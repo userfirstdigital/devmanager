@@ -18,6 +18,7 @@ const { wsClientState, MockWsClient } = vi.hoisted(() => {
       onStatus(status: unknown): void;
       onMessage(message: unknown): void;
       onSessionOutput(frame: unknown): void;
+      onCapabilityGrant?(grant: unknown): void;
       getResumeContext?(): unknown;
       onHelloFailure?(failure: unknown): void;
     };
@@ -1166,6 +1167,29 @@ describe("host runtime reconciliation", () => {
     expect(
       useStore.getState().rawTerminal.streamSessionIdByStableKey["tab:old-tab"],
     ).toBeUndefined();
+  });
+});
+
+describe("connection-scoped capability grant", () => {
+  it("accepts only the current hello grant and clears it on connection loss", () => {
+    useStore.getState().init();
+    const client = wsClientState.instance;
+    const grant = {
+      role: "owner" as const,
+      taskId: "tab:a",
+      actions: ["readTask", "sendPrompt"] as const,
+    };
+
+    expect(useStore.getState().capabilityGrant).toBeNull();
+    client?.callbacks.onCapabilityGrant?.(grant);
+    expect(useStore.getState().capabilityGrant).toEqual(grant);
+
+    client?.callbacks.onStatus({ kind: "connecting" });
+    expect(useStore.getState().capabilityGrant).toBeNull();
+
+    client?.callbacks.onCapabilityGrant?.(grant);
+    client?.callbacks.onStatus({ kind: "closed", reason: "socket closed" });
+    expect(useStore.getState().capabilityGrant).toBeNull();
   });
 });
 
