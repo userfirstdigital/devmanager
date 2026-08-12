@@ -367,7 +367,9 @@ impl CommandBus {
             .cloned()
             .ok_or_else(|| StoreError::Projection("provider agent not found".into()))?;
         if agent.provider_kind != intent.provider_kind {
-            return Err(StoreError::Projection("provider kind fence mismatch".into()));
+            return Err(StoreError::Projection(
+                "provider kind fence mismatch".into(),
+            ));
         }
         let resource = snapshot
             .resources
@@ -380,7 +382,9 @@ impl CommandBus {
             || binding.resource_id != intent.resource_id
             || binding.provider_kind != intent.provider_kind
         {
-            return Err(StoreError::Projection("provider resource fence mismatch".into()));
+            return Err(StoreError::Projection(
+                "provider resource fence mismatch".into(),
+            ));
         }
         let claimed = self.claim_agent_resource(binding)?;
         Ok((claimed, agent, snapshot))

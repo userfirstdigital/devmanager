@@ -27,7 +27,7 @@ use crate::ui::components::interaction::{
 };
 use crate::ui::components::text_field::{TextField, TextFieldError, TextFieldKey, TextFieldLimits};
 use crate::ui::tokens::ThemeTokens;
-use gpui::{div, px, AnyElement, IntoElement, ParentElement, Styled};
+use gpui::{div, px, AnyElement, InteractiveElement, IntoElement, ParentElement, Styled};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt::{Debug, Display, Formatter};

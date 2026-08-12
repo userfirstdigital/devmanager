@@ -5,7 +5,7 @@
 //! [`ActionRequest`].  They never create a second command vocabulary or read
 //! workspace/configuration state themselves.
 
-use gpui::{div, px, rgb, AnyElement, IntoElement, ParentElement, Styled};
+use gpui::{div, px, rgb, AnyElement, InteractiveElement, IntoElement, ParentElement, Styled};
 
 use crate::client::action::ActionRequest;
 use crate::domain::id::TaskId;

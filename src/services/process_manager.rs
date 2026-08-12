@@ -1699,10 +1699,7 @@ impl ProcessManager {
         observation: &crate::providers::registry::ProviderObservation,
         input: Option<crate::providers::adapter::ProviderInput>,
         cwd: PathBuf,
-        environment: std::collections::BTreeMap<
-            std::ffi::OsString,
-            std::ffi::OsString,
-        >,
+        environment: std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString>,
         mode: crate::providers::session::ProviderSessionStartMode,
     ) -> Result<
         crate::providers::session::ProviderRuntime,
@@ -1712,11 +1709,13 @@ impl ProcessManager {
             .inner
             .provider_host
             .adapter(agent.provider_kind)
-            .ok_or(crate::providers::controller::StockProviderSessionError::Adapter(
-                crate::providers::adapter::ProviderError::ProviderNotRegistered(
-                    agent.provider_kind,
+            .ok_or(
+                crate::providers::controller::StockProviderSessionError::Adapter(
+                    crate::providers::adapter::ProviderError::ProviderNotRegistered(
+                        agent.provider_kind,
+                    ),
                 ),
-            ))?;
+            )?;
         let mut slot = self.inner.provider_sessions.lock().map_err(|_| {
             crate::providers::controller::StockProviderSessionError::Session(
                 crate::providers::session::ProviderSessionError::StateStore(
@@ -1727,16 +1726,12 @@ impl ProcessManager {
         if slot.is_none() {
             let root = crate::persistence::app_config_dir().map_err(|error| {
                 crate::providers::controller::StockProviderSessionError::Session(
-                    crate::providers::session::ProviderSessionError::StateStore(
-                        error.to_string(),
-                    ),
+                    crate::providers::session::ProviderSessionError::StateStore(error.to_string()),
                 )
             })?;
             std::fs::create_dir_all(&root).map_err(|error| {
                 crate::providers::controller::StockProviderSessionError::Session(
-                    crate::providers::session::ProviderSessionError::StateStore(
-                        error.to_string(),
-                    ),
+                    crate::providers::session::ProviderSessionError::StateStore(error.to_string()),
                 )
             })?;
             let store = crate::providers::session::SqliteProviderSessionStateStore::open(

@@ -6,7 +6,7 @@
 //! [`ConfigSnapshot`] and the shell dispatches the typed selection requests.
 //! Configuration editing remains behind the existing ConfigStore/app facade.
 
-use gpui::{div, px, rgb, AnyElement, IntoElement, ParentElement, Styled};
+use gpui::{div, px, rgb, AnyElement, InteractiveElement, IntoElement, ParentElement, Styled};
 
 use crate::config::{
     AppConfig, ConfigRevision, ConfigSnapshot, Nullable, Project, ProjectFolder, RunCommand,

@@ -234,8 +234,8 @@ impl HostedTerminal {
         runtime.title = spec.title.clone();
         runtime.pid = None;
         let replica = TerminalReplica::from_bootstrap(terminal_id.to_string(), runtime, &[]);
-        replica.bound_history(spec.max_scrollback_rows);
-        let screen = replica.screen_snapshot();
+        replica.bound_history_exact(spec.max_scrollback_rows);
+        let screen = replica.snapshot();
         let last_rows = rows_from_screen(&screen);
         let last_title = spec.title.clone();
         Ok(Self {
@@ -365,7 +365,7 @@ impl HostedTerminal {
 
     fn screen_snapshot(&self) -> TerminalScreenSnapshot {
         match &self.projection {
-            ProjectionSource::Fixture(replica) => replica.screen_snapshot(),
+            ProjectionSource::Fixture(replica) => replica.snapshot(),
             ProjectionSource::Attached(runtime) => runtime.screen_snapshot(),
         }
     }
@@ -537,7 +537,7 @@ impl HostedTerminal {
         if over_rows || over_bytes {
             match &self.projection {
                 ProjectionSource::Fixture(replica) => {
-                    replica.bound_history(self.spec.max_scrollback_rows);
+                    replica.bound_history_exact(self.spec.max_scrollback_rows);
                 }
                 ProjectionSource::Attached(runtime) => {
                     runtime.bound_history(self.spec.max_scrollback_rows);
@@ -959,7 +959,7 @@ impl HostedTerminal {
         runtime.provider_session_id = self.provider_session_id.clone();
         runtime.pid = None;
         let replica = TerminalReplica::from_bootstrap(terminal_id.to_string(), runtime, &[]);
-        replica.bound_history(self.spec.max_scrollback_rows);
+        replica.bound_history_exact(self.spec.max_scrollback_rows);
         self.projection = ProjectionSource::Fixture(replica);
         self.generation = next;
         self.agent_session_id = None;

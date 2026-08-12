@@ -461,6 +461,9 @@ impl ConnectPayload {
         match message {
             ServerMessage::QueryReply(reply) => Ok(Self::QueryReply(reply)),
             ServerMessage::CommandReceipt(receipt) => Ok(Self::CommandReceipt(receipt)),
+            ServerMessage::TerminalInputAck(_) => Err(PayloadDecodeError::Ambiguous {
+                reason: "terminal input acknowledgements are not Connect request-lane payloads",
+            }),
             ServerMessage::UpdateHandoff(_) => Err(PayloadDecodeError::Ambiguous {
                 reason: "update handoff replies stay on the authenticated host control lane",
             }),

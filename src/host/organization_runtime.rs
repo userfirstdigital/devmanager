@@ -391,7 +391,7 @@ impl OrganizationRuntimeHandle {
             .lock()
             .map_err(|_| OrganizationRuntimeError::Closed)?;
         ensure_open(&state)?;
-        query_locked(&state, query)
+        Self::query_locked(&state, query)
     }
 
     fn query_locked(
@@ -447,7 +447,7 @@ impl OrganizationRuntimeHandle {
             .lock()
             .map_err(|_| OrganizationRuntimeError::Closed)?;
         ensure_open(&state)?;
-        command_locked(&mut state, command)
+        Self::command_locked(&mut state, command)
     }
 
     fn command_locked(
@@ -571,8 +571,10 @@ impl OrganizationRuntimeHandle {
             }
         }
         let reply = match request {
-            OrganizationConnectRequest::Query(query) => query_locked(&state, query)?,
-            OrganizationConnectRequest::Command(command) => command_locked(&mut state, command)?,
+            OrganizationConnectRequest::Query(query) => Self::query_locked(&state, query)?,
+            OrganizationConnectRequest::Command(command) => {
+                Self::command_locked(&mut state, command)?
+            }
         };
         if let Some(operation_id) = operation_id {
             if state.connect_operations.len() >= ORGANIZATION_CONNECT_OPERATION_CACHE_CAPACITY {

@@ -102,7 +102,7 @@ impl AgentResourceBinding {
     }
 
     /// Return whether this claim names the same immutable identity.
-    pub const fn matches(self, requested: Self) -> bool {
+    pub fn matches(self, requested: Self) -> bool {
         self.task_id == requested.task_id
             && self.agent_session_id == requested.agent_session_id
             && self.resource_id == requested.resource_id

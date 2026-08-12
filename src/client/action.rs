@@ -13,12 +13,13 @@ use serde::{Deserialize, Serialize};
 use crate::browser::BrowserNativeHostCommand;
 use crate::domain::cockpit::{TaskCockpitQuery, MAX_COCKPIT_FILE_LIST, MAX_COCKPIT_READ_BYTES};
 use crate::domain::command::{
-    Command, CommandEnvelope, CreateTaskIntent, CreateTaskRequestIntent, RenameTaskIntent,
-    ProviderStartMode, ServiceControlAction, ServiceControlIntent, StartProviderSessionIntent,
+    Command, CommandEnvelope, CreateTaskIntent, CreateTaskRequestIntent, ProviderStartMode,
+    RenameTaskIntent, ServiceControlAction, ServiceControlIntent, StartProviderSessionIntent,
     SubmitProviderInputIntent,
 };
-use crate::domain::id::{AgentSessionId, ConfiguredServiceId, PromptChainId, PromptVersionId, ResourceId};
-use crate::providers::ProviderKind;
+use crate::domain::id::{
+    AgentSessionId, ConfiguredServiceId, PromptChainId, PromptVersionId, ResourceId,
+};
 use crate::domain::provider_input::{ProviderInputAction, ProviderInputIntentError};
 use crate::domain::query::{Query, QueryEnvelope};
 use crate::domain::task::{
@@ -35,6 +36,7 @@ use crate::prompts::projection::{
 };
 use crate::prompts::ui::composer::{ComposerInsertionMode, PutPromptVersionInComposer};
 use crate::protocol::{Capability, CapabilitySet};
+use crate::providers::ProviderKind;
 use crate::services::model::ServiceId;
 use crate::workspace::{WorkspaceError, WorkspaceRequest};
 

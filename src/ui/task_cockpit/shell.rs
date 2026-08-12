@@ -1,7 +1,8 @@
 //! Native shell mount for the single context dock.
 
 use gpui::{
-    div, AnyElement, Context, InteractiveElement, IntoElement, ParentElement, Render, Window,
+    div, AnyElement, Context, InteractiveElement, IntoElement, ParentElement, Render, Styled,
+    Window,
 };
 
 use crate::browser::{
@@ -13,6 +14,7 @@ use crate::browser::{
 use crate::client::model::ClientModel;
 use crate::domain::id::{RequestId, TaskId};
 use crate::domain::TaskCockpitResult;
+use crate::protocol::CapabilitySet;
 use crate::ui::actions::{
     DockSelectArtifacts, DockSelectBrowser, DockSelectChanges, DockSelectFiles, DockSelectReview,
     DockSelectServices, DockSelectTerminal, DockToggleRawTerminal,

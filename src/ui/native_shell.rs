@@ -4752,7 +4752,8 @@ impl NativeInteraction {
             ActionRequest::StartProviderSession(arguments) => {
                 let model = self.client_model.as_ref()?;
                 let task = model.tasks().get(&arguments.task_id)?;
-                if task.task.revision == 0 || arguments.action_epoch == 0
+                if task.task.revision == 0
+                    || arguments.action_epoch == 0
                     || arguments.action_epoch != task.task.action_epoch
                 {
                     return None;
@@ -7213,7 +7214,7 @@ impl NativeShell {
             .id("native-task-conversation-interactive")
             .w_full()
             .tab_stop(true)
-            .on_mouse_down(focus)
+            .on_mouse_down(MouseButton::Left, focus)
             .on_key_down(key)
             .on_scroll_wheel(scroll)
             .child(conversation)
@@ -7232,25 +7233,25 @@ impl NativeShell {
             .child(
                 div()
                     .id("native-task-composer-send")
-                    .on_mouse_down(send)
+                    .on_mouse_down(MouseButton::Left, send)
                     .child("Send"),
             )
             .child(
                 div()
                     .id("native-task-composer-answer")
-                    .on_mouse_down(answer)
+                    .on_mouse_down(MouseButton::Left, answer)
                     .child("Answer"),
             )
             .child(
                 div()
                     .id("native-task-composer-approve")
-                    .on_mouse_down(approve)
+                    .on_mouse_down(MouseButton::Left, approve)
                     .child("Approve"),
             )
             .child(
                 div()
                     .id("native-task-composer-reject")
-                    .on_mouse_down(reject)
+                    .on_mouse_down(MouseButton::Left, reject)
                     .child("Reject"),
             )
             .into_any_element()

@@ -220,6 +220,5 @@ mod tests {
         request.workspace = WorkspaceRef::external("C:\\other").expect("workspace");
         let error = LocalActionBridge::new().submit(&context, &request);
         assert_eq!(error, Err(OrgError::FingerprintMismatch));
-        context.workspace = WorkspaceRef::Main;
     }
 }

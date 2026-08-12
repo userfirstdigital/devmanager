@@ -2526,6 +2526,16 @@ impl HostRequestExecutor {
                 ExecutorControl::UnregisterOutput { id } => {
                     self.detach_output(id);
                 }
+                ExecutorControl::AttachTerminal { ack, .. } => {
+                    let _ = ack.send(Err(
+                        "terminal attachment rejected after quit intake quiesce".into(),
+                    ));
+                }
+                ExecutorControl::BindTerminalIdentity { ack, .. } => {
+                    let _ = ack.send(Err(
+                        "terminal identity binding rejected after quit intake quiesce".into(),
+                    ));
+                }
                 ExecutorControl::InspectHostQuitForUpdate { ack } => {
                     let _ = ack.send(Err(
                         "InspectHostQuit rejected after quit intake quiesce".into()
@@ -2865,7 +2875,9 @@ impl HostRequestExecutor {
         if envelope.task_id != Some(intent.task_id)
             || envelope.expected_task_revision != Some(intent.expected_task_revision)
         {
-            return Err(IpcError::Security("provider start envelope fence mismatch".into()));
+            return Err(IpcError::Security(
+                "provider start envelope fence mismatch".into(),
+            ));
         }
         let runtime = self
             .configured_service_runtime
