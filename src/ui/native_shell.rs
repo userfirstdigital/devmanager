@@ -1521,6 +1521,12 @@ pub enum NativeHostCommand {
         command_id: CommandId,
         issued_at_ms: i64,
     },
+    ProviderStart {
+        arguments: crate::client::action::ProviderStartArguments,
+        expected_task_revision: u64,
+        command_id: CommandId,
+        issued_at_ms: i64,
+    },
     /// Canonical `task.show` query via [`crate::client::action::task_show_query`].
     TaskShowQuery {
         request_id: RequestId,
@@ -1586,6 +1592,7 @@ fn native_command_id(command: &NativeHostCommand) -> Option<CommandId> {
         | NativeHostCommand::TaskRename { command_id, .. } => Some(*command_id),
         NativeHostCommand::ServiceControl { command_id, .. } => Some(*command_id),
         NativeHostCommand::ProviderInput { command_id, .. } => Some(*command_id),
+        NativeHostCommand::ProviderStart { command_id, .. } => Some(*command_id),
         NativeHostCommand::TaskShowQuery { .. }
         | NativeHostCommand::TaskListQuery { .. }
         | NativeHostCommand::HostStatusQuery { .. }
@@ -3816,6 +3823,25 @@ async fn execute_native_command(
                 .await
                 .map(NativeHostExecutionResult::Command)
         }
+        NativeHostCommand::ProviderStart {
+            arguments,
+            expected_task_revision,
+            command_id,
+            issued_at_ms,
+        } => {
+            let envelope = crate::client::action::provider_start_command(
+                command_id,
+                client.client_id(),
+                issued_at_ms,
+                expected_task_revision,
+                arguments,
+            )
+            .map_err(|_| IpcError::Unavailable)?;
+            client
+                .execute_command(envelope)
+                .await
+                .map(NativeHostExecutionResult::Command)
+        }
         NativeHostCommand::TaskShowQuery {
             request_id,
             task_id,
@@ -4691,6 +4717,7 @@ impl NativeInteraction {
             ActionRequest::TaskShow { task_id } => Some(*task_id),
             ActionRequest::TaskRename(arguments) => Some(arguments.task_id),
             ActionRequest::ProviderInput(arguments) => Some(arguments.arguments.task_id),
+            ActionRequest::StartProviderSession(arguments) => Some(arguments.task_id),
             ActionRequest::TaskCockpit { task_id, .. } => Some(*task_id),
             ActionRequest::Browser(arguments) => Some(arguments.task_id()),
             _ => None,
@@ -4717,6 +4744,16 @@ impl NativeInteraction {
                     || arguments.arguments.action_epoch == 0
                     || arguments.arguments.action_epoch != task.task.action_epoch
                     || arguments.arguments.runtime_generation != self.runtime_generation
+                {
+                    return None;
+                }
+                (Some(task.task.revision), Some(task.task.action_epoch))
+            }
+            ActionRequest::StartProviderSession(arguments) => {
+                let model = self.client_model.as_ref()?;
+                let task = model.tasks().get(&arguments.task_id)?;
+                if task.task.revision == 0 || arguments.action_epoch == 0
+                    || arguments.action_epoch != task.task.action_epoch
                 {
                     return None;
                 }
@@ -4766,6 +4803,13 @@ impl NativeInteraction {
                 arguments: arguments.arguments.clone(),
                 expected_task_revision: expected_task_revision
                     .expect("provider input revision was validated above"),
+                command_id,
+                issued_at_ms,
+            },
+            ActionRequest::StartProviderSession(arguments) => NativeHostCommand::ProviderStart {
+                arguments: *arguments,
+                expected_task_revision: expected_task_revision
+                    .expect("provider start revision was validated above"),
                 command_id,
                 issued_at_ms,
             },

@@ -14,9 +14,11 @@ use crate::browser::BrowserNativeHostCommand;
 use crate::domain::cockpit::{TaskCockpitQuery, MAX_COCKPIT_FILE_LIST, MAX_COCKPIT_READ_BYTES};
 use crate::domain::command::{
     Command, CommandEnvelope, CreateTaskIntent, CreateTaskRequestIntent, RenameTaskIntent,
-    ServiceControlAction, ServiceControlIntent, SubmitProviderInputIntent,
+    ProviderStartMode, ServiceControlAction, ServiceControlIntent, StartProviderSessionIntent,
+    SubmitProviderInputIntent,
 };
-use crate::domain::id::{AgentSessionId, ConfiguredServiceId, PromptChainId, PromptVersionId};
+use crate::domain::id::{AgentSessionId, ConfiguredServiceId, PromptChainId, PromptVersionId, ResourceId};
+use crate::providers::ProviderKind;
 use crate::domain::provider_input::{ProviderInputAction, ProviderInputIntentError};
 use crate::domain::query::{Query, QueryEnvelope};
 use crate::domain::task::{
@@ -94,6 +96,8 @@ pub const ACTION_PROVIDER_STOP_TURN: &str = crate::providers::input::ACTION_PROV
 /// Stable id for starting a new AgentSession identity. Not Restart.
 pub const ACTION_PROVIDER_NEW_CONVERSATION: &str =
     crate::providers::input::ACTION_PROVIDER_NEW_CONVERSATION;
+/// Task Cockpit action for starting one exact task-owned stock provider.
+pub const ACTION_PROVIDER_START_SESSION: &str = "provider.start_session";
 /// Read-only host query for a personal prompt metadata page.
 pub const ACTION_PROMPT_METADATA_PAGE: &str = "prompt.library.metadata_page";
 /// Read-only host query for an exact immutable prompt version page.
@@ -212,7 +216,8 @@ const ACTIONS: &[ActionDescriptor] = &[
     ActionDescriptor {
         id: ACTION_BROWSER_NATIVE,
         title: "Browser surface",
-        description: "Attach, resize, focus, submit, or detach the exact Task-owned browser surface.",
+        description:
+            "Attach, resize, focus, submit, or detach the exact Task-owned browser surface.",
         keywords: &["browser", "webview", "surface", "attach"],
         scope: ActionScope::Task,
         required_capability: Some(Capability::BrowserProjection),
@@ -398,6 +403,7 @@ pub enum ActionRequest {
     TaskCreate(TaskCreateArguments),
     TaskRename(TaskRenameArguments),
     ProviderInput(ProviderInputActionRequest),
+    StartProviderSession(ProviderStartArguments),
     ServiceControl {
         action: ServiceControlAction,
         arguments: ServiceControlArguments,
@@ -423,6 +429,7 @@ impl ActionRequest {
             Self::TaskCreate(_) => ACTION_TASK_CREATE,
             Self::TaskRename(_) => ACTION_TASK_RENAME,
             Self::ProviderInput(arguments) => arguments.action_id,
+            Self::StartProviderSession(_) => ACTION_PROVIDER_START_SESSION,
             Self::ServiceControl { action, .. } => match action {
                 ServiceControlAction::Start => ACTION_SERVICE_START,
                 ServiceControlAction::Stop => ACTION_SERVICE_STOP,
@@ -461,6 +468,16 @@ impl BrowserActionRequest {
 pub struct ProviderInputActionRequest {
     pub action_id: &'static str,
     pub arguments: ProviderInputArguments,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderStartArguments {
+    pub task_id: TaskId,
+    pub agent_session_id: AgentSessionId,
+    pub resource_id: ResourceId,
+    pub provider_kind: ProviderKind,
+    pub mode: ProviderStartMode,
+    pub action_epoch: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -782,6 +799,16 @@ const SERVICE_CONTROL_EXTENSION: &[ActionDescriptor] = &[
 ];
 
 const TASK_COCKPIT_EXTENSION: &[ActionDescriptor] = &[
+    ActionDescriptor {
+        id: ACTION_PROVIDER_START_SESSION,
+        title: "Start provider session",
+        description: "Start one exact task-owned stock provider runtime.",
+        keywords: &["provider", "start", "session", "cockpit"],
+        scope: ActionScope::Task,
+        required_capability: Some(Capability::ProviderInput),
+        risk: ActionRisk::Mutating,
+        argument_schema: ActionArgumentSchema::TaskCockpitV1,
+    },
     ActionDescriptor {
         id: ACTION_WORKSPACE_STATUS,
         title: "Workspace status",
@@ -1340,6 +1367,35 @@ pub fn provider_input_command(
         issued_at_ms,
         expected_task_revision: Some(expected_task_revision),
         command: Command::SubmitProviderInput(intent),
+    })
+}
+
+/// Build a stock-provider launch command from the exact Task Cockpit fence.
+pub fn provider_start_command(
+    command_id: CommandId,
+    client_id: ClientId,
+    issued_at_ms: i64,
+    expected_task_revision: u64,
+    args: ProviderStartArguments,
+) -> Result<CommandEnvelope, ProviderInputIntentError> {
+    if expected_task_revision == 0 || args.action_epoch == 0 {
+        return Err(ProviderInputIntentError::InconsistentNestedIds);
+    }
+    Ok(CommandEnvelope {
+        command_id,
+        client_id,
+        task_id: Some(args.task_id),
+        issued_at_ms,
+        expected_task_revision: Some(expected_task_revision),
+        command: Command::StartProviderSession(StartProviderSessionIntent {
+            task_id: args.task_id,
+            agent_session_id: args.agent_session_id,
+            resource_id: args.resource_id,
+            provider_kind: args.provider_kind,
+            mode: args.mode,
+            expected_task_revision,
+            expected_action_epoch: args.action_epoch,
+        }),
     })
 }
 
