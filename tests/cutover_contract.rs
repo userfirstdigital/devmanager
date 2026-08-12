@@ -25,7 +25,6 @@ struct FixtureRepo {
     _temp: TempDir,
     root: PathBuf,
 }
-
 struct AuditRun {
     fixture: FixtureRepo,
     output: Output,
@@ -862,6 +861,43 @@ fn strings_at<'a>(value: &'a Value, path: &[&str]) -> Vec<&'a str> {
         .iter()
         .map(|value| value.as_str().expect("string entry"))
         .collect()
+}
+
+fn merge_contract(mut document: Value, extra: Value) -> Value {
+    let object = document.as_object_mut().expect("contract object");
+    for (key, value) in extra.as_object().expect("extra object") {
+        object.insert(key.clone(), value.clone());
+    }
+    document
+}
+
+fn current_ledger_text() -> &'static str {
+    include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/docs/replacement-deletion-ledger.md"
+    ))
+}
+
+fn current_contract() -> Value {
+    let text = current_ledger_text();
+    let start = text
+        .find("```json cutover-contract\n")
+        .expect("cutover contract fence start")
+        + "```json cutover-contract\n".len();
+    let rest = &text[start..];
+    let end = rest.find("\n```").expect("cutover contract fence end");
+    serde_json::from_str(&rest[..end]).expect("canonical cutover contract JSON")
+}
+
+fn current_rows() -> Vec<Value> {
+    current_contract()["rows"].as_array().expect("rows").clone()
+}
+
+fn current_row(id: &str) -> Value {
+    current_rows()
+        .into_iter()
+        .find(|row| row["id"] == id)
+        .unwrap_or_else(|| panic!("missing ledger row {id}"))
 }
 
 fn strip_parity_verifiable_fields(mut row: Value) -> Value {
@@ -4419,4 +4455,358 @@ fn scanner_job_has_a_bounded_active_process_limit() {
         source.contains("ActiveProcessLimit") && source.contains("MaxTrackedProcesses"),
         "the active-process limit must be tied to the bounded descendant budget"
     );
+}
+
+#[test]
+fn handoff_row_missing_replacement_is_blocker_not_contract_error() {
+    let mut handoff_row = base_row(
+        "handoff-updater",
+        "src/legacy.rs",
+        &["LegacyFixture"],
+        "src/handoff.rs",
+        &["gate-parity"],
+        "HOLD",
+    );
+    handoff_row["cutoverAction"] = json!("handoff");
+    handoff_row
+        .as_object_mut()
+        .expect("row object")
+        .remove("deletionSet");
+    let run = run_audit(
+        contract(
+            vec![handoff_row],
+            vec![base_node("gate-parity", "gate", "HOLD")],
+        ),
+        &[],
+    );
+    let report_row = row(&run.report, "handoff-updater");
+    assert!(!run.output.status.success());
+    assert!(!strings_at(&run.report, &["contractErrors"])
+        .iter()
+        .any(|error| error.contains("replacement owner path is not an exact tracked path")));
+    assert!(strings_at(report_row, &["blockers"])
+        .iter()
+        .any(|blocker| blocker.contains("handoff replacement")));
+    assert_eq!(report_row["cutoverAction"], "handoff");
+    assert!(report_row["deletionSet"]["paths"]
+        .as_array()
+        .expect("handoff deletion paths")
+        .is_empty());
+}
+
+#[test]
+fn entry_product_entrypoints_report_old_app_dispatch() {
+    let document = merge_contract(
+        contract(
+            vec![base_row(
+                "legacy-app",
+                "src/legacy.rs",
+                &["LegacyFixture"],
+                "src/replacement.rs",
+                &["gate-parity"],
+                "HOLD",
+            )],
+            vec![base_node("gate-parity", "gate", "HOLD")],
+        ),
+        json!({
+            "productEntrypoints": {
+                "desktopClient": {
+                    "id": "gpui-desktop-client",
+                    "path": "src/replacement.rs",
+                    "symbol": "main",
+                    "role": "gpui-client",
+                    "forbiddenDispatch": ["LegacyFixture"]
+                },
+                "durableHost": {
+                    "id": "durable-host",
+                    "path": "src/replacement.rs",
+                    "symbol": "main",
+                    "role": "durable-host",
+                    "lifecycle": ["attach", "detach", "full-quit"]
+                }
+            }
+        }),
+    );
+    let run = run_audit(
+        document,
+        &[("src/main.rs", b"fn main() { LegacyFixture; }\n")],
+    );
+    assert!(!run.output.status.success());
+    assert!(strings_at(&run.report, &["entrypointFindings"])
+        .iter()
+        .any(|finding| finding.contains("gpui-desktop-client")));
+    assert!(strings_at(&run.report, &["blockers"])
+        .iter()
+        .any(|blocker| blocker.contains("forbidden legacy runtime")
+            || blocker.contains("gpui-desktop-client")));
+}
+
+#[test]
+fn compatibility_policy_reports_forbidden_runtime_switch() {
+    let document = merge_contract(
+        contract(
+            vec![base_row(
+                "legacy-app",
+                "src/legacy.rs",
+                &["LegacyFixture"],
+                "src/replacement.rs",
+                &["gate-parity"],
+                "HOLD",
+            )],
+            vec![base_node("gate-parity", "gate", "HOLD")],
+        ),
+        json!({
+            "compatibilityPolicy": {
+                "permanentDualUi": false,
+                "backwardCompatibilityMode": false,
+                "forbiddenRuntimeSwitches": ["new_ui"],
+                "scanPaths": ["src", "Cargo.toml"]
+            }
+        }),
+    );
+    let run = run_audit(
+        document,
+        &[("src/switch.rs", b"const MODE: &str = \"new_ui\";\n")],
+    );
+    assert!(!run.output.status.success());
+    assert!(strings_at(&run.report, &["compatibilityFindings"]).contains(&"src/switch.rs"));
+}
+
+#[test]
+fn packaging_handoff_reports_missing_required_files() {
+    let document = merge_contract(
+        contract(
+            vec![base_row(
+                "legacy-app",
+                "src/legacy.rs",
+                &["LegacyFixture"],
+                "src/replacement.rs",
+                &["gate-parity"],
+                "HOLD",
+            )],
+            vec![base_node("gate-parity", "gate", "HOLD")],
+        ),
+        json!({
+            "packagingHandoff": {
+                "requiredBinaries": ["devmanager.exe", "devmanager-host.exe"],
+                "atomicTwoBinaryIdentity": true,
+                "packagerManifest": "Cargo.toml",
+                "requiredManifestTokens": ["devmanager-host"],
+                "requiredFiles": ["src/updater/handoff.rs"],
+                "forbidInstallOrPublish": true
+            }
+        }),
+    );
+    let run = run_audit(document, &[("Cargo.toml", b"name = \"devmanager\"\n")]);
+    assert!(!run.output.status.success());
+    assert!(strings_at(&run.report, &["packagingFindings"])
+        .iter()
+        .any(|finding| finding.contains("devmanager-host")));
+    assert!(strings_at(&run.report, &["packagingFindings"])
+        .iter()
+        .any(|finding| finding.contains("src/updater/handoff.rs")));
+}
+
+#[test]
+fn profile_isolation_does_not_set_devmanager_profile_or_touch_installed_app() {
+    let document = merge_contract(
+        contract(
+            vec![base_row(
+                "legacy-app",
+                "src/legacy.rs",
+                &["LegacyFixture"],
+                "src/replacement.rs",
+                &["gate-parity"],
+                "HOLD",
+            )],
+            vec![base_node("gate-parity", "gate", "HOLD")],
+        ),
+        json!({
+            "profileIsolation": {
+                "productionRootName": "com.userfirst.devmanager",
+                "evidenceRoot": ".devmanager-next/evidence",
+                "forbidSettingDevmanagerProfile": true,
+                "remapAppData": true,
+                "productionProfileOnlyInSignedRelease": true
+            },
+            "installedAppPolicy": {
+                "touchInstalledApp": false,
+                "hashProductionFiles": false,
+                "openSessionJson": false,
+                "installPublishDeleteUserData": false
+            }
+        }),
+    );
+    let run = run_audit(document, &[]);
+    assert_eq!(run.report["isolation"]["setDevmanagerProfile"], false);
+    assert_eq!(run.report["isolation"]["remappedAppData"], true);
+    assert_eq!(
+        run.report["isolation"]["inheritedDevmanagerProfileCleared"],
+        true
+    );
+    assert_eq!(run.report["isolation"]["productionRootRead"], false);
+    assert_eq!(
+        run.report["installedApp"]["observedInstalledProcesses"],
+        false
+    );
+    assert_eq!(run.report["installedApp"]["openSessionJson"], false);
+    assert!(!run.human.contains("must-not-be-read"));
+}
+
+#[test]
+fn entry_single_gpui_client_and_host_are_declared() {
+    let contract = current_contract();
+    assert_eq!(
+        contract["productEntrypoints"]["desktopClient"]["path"],
+        "src/main.rs"
+    );
+    assert_eq!(
+        contract["productEntrypoints"]["desktopClient"]["role"],
+        "gpui-client"
+    );
+    assert_eq!(
+        contract["productEntrypoints"]["durableHost"]["path"],
+        "src/bin/devmanager-host.rs"
+    );
+    assert_eq!(
+        contract["productEntrypoints"]["durableHost"]["role"],
+        "durable-host"
+    );
+    assert_eq!(
+        contract["productEntrypoints"]["durableHost"]["lifecycle"],
+        json!(["attach", "detach", "full-quit"])
+    );
+    assert_eq!(contract["compatibilityPolicy"]["permanentDualUi"], false);
+    assert_eq!(
+        contract["compatibilityPolicy"]["backwardCompatibilityMode"],
+        false
+    );
+    assert_eq!(contract["packagingHandoff"]["forbidInstallOrPublish"], true);
+    assert_eq!(
+        contract["packagingHandoff"]["atomicTwoBinaryIdentity"],
+        true
+    );
+    assert_eq!(
+        contract["profileIsolation"]["productionProfileOnlyInSignedRelease"],
+        true
+    );
+    assert_eq!(
+        contract["publicationPolicy"]["requireExplicitManualApproval"],
+        true
+    );
+    assert_eq!(contract["installedAppPolicy"]["touchInstalledApp"], false);
+}
+
+#[test]
+fn entry_old_app_dispatch_and_devmanager_next_are_forbidden() {
+    let contract = current_contract();
+    let forbidden = contract["productEntrypoints"]["desktopClient"]["forbiddenDispatch"]
+        .as_array()
+        .expect("forbiddenDispatch");
+    assert!(
+        forbidden
+            .iter()
+            .any(|value| value == "devmanager::app::run"),
+        "sole GPUI entry must forbid old app dispatch"
+    );
+    assert!(
+        !Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/bin/devmanager-next.rs")
+            .is_file(),
+        "devmanager-next binary source must remain absent"
+    );
+    let next = current_row("legacy-next-entrypoint");
+    assert_eq!(next["legacy"]["path"], "src/bin/devmanager-next.rs");
+    assert_eq!(next["status"], "HOLD");
+    let packaging_files = contract["packagingHandoff"]["requiredFiles"]
+        .as_array()
+        .expect("requiredFiles");
+    assert!(packaging_files
+        .iter()
+        .any(|value| value == "src/updater/handoff.rs"));
+    assert!(packaging_files
+        .iter()
+        .any(|value| value == "tests/update_contract.rs"));
+    assert!(packaging_files
+        .iter()
+        .any(|value| value == "tests/package_contract.rs"));
+}
+
+#[test]
+fn handoff_rows_are_distinct_from_deletion_rows() {
+    let updater = current_row("handoff-updater-module");
+    let update_contract = current_row("handoff-update-contract");
+    assert_eq!(updater["cutoverAction"], "handoff");
+    assert_eq!(update_contract["cutoverAction"], "handoff");
+    assert!(updater.get("deletionSet").is_none());
+    assert!(update_contract.get("deletionSet").is_none());
+    assert_eq!(
+        updater["replacementOwner"]["path"],
+        "src/updater/handoff.rs"
+    );
+    assert_eq!(
+        update_contract["replacementOwner"]["path"],
+        "tests/update_contract.rs"
+    );
+    for row in current_rows() {
+        if row["cutoverAction"] == "handoff" {
+            continue;
+        }
+        assert!(
+            row.get("deletionSet").is_some(),
+            "delete rows must keep an exact deletionSet: {}",
+            row["id"]
+        );
+    }
+}
+
+#[test]
+fn session_json_is_path_only_in_contract() {
+    let contract = current_contract();
+    let protected = contract["referencePolicy"]["protectedFileBasenames"]
+        .as_array()
+        .expect("protected basenames");
+    assert!(protected.iter().any(|value| value == "session.json"));
+    assert_eq!(contract["installedAppPolicy"]["openSessionJson"], false);
+    let session = current_row("legacy-session-persistence");
+    assert_eq!(session["status"], "HOLD");
+    assert!(session["legacy"]["symbols"]
+        .as_array()
+        .expect("session symbols")
+        .iter()
+        .any(|value| value == "session.json"));
+}
+
+#[test]
+fn parity_current_ledger_is_hold() {
+    assert!(current_rows().iter().all(|row| row["status"] == "HOLD"));
+    assert!(current_contract()["prerequisiteNodes"]
+        .as_array()
+        .expect("nodes")
+        .iter()
+        .all(|node| node["status"] == "HOLD"));
+}
+
+#[test]
+fn old_rust_paths_remain_tracked_until_deleted() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    for relative in [
+        "src/app/mod.rs",
+        "src/services/process_manager.rs",
+        "src/ai/codex_rollout.rs",
+        "src/browser/pane.rs",
+        "src/sidebar/mod.rs",
+        "src/models/mod.rs",
+        "src/persistence/mod.rs",
+        "zz-archive/tauri-react-v0.1.11",
+    ] {
+        assert!(
+            root.join(relative).exists(),
+            "legacy path should remain until a later approved deletion slice: {relative}"
+        );
+    }
+    assert!(!root.join("src/updater/handoff.rs").exists());
+    assert!(!root.join("src/host/update.rs").exists());
+    assert!(!root.join("tests/update_contract.rs").exists());
+    assert!(!root.join("tests/package_contract.rs").exists());
 }

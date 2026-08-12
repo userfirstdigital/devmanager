@@ -39,11 +39,32 @@ $globalBlockers = New-Object 'System.Collections.Generic.List[string]'
 $rowReports = New-Object 'System.Collections.Generic.List[object]'
 $nodeReports = New-Object 'System.Collections.Generic.List[object]'
 $entrypointFindings = New-Object 'System.Collections.Generic.List[string]'
+$compatibilityFindings = New-Object 'System.Collections.Generic.List[string]'
+$packagingFindings = New-Object 'System.Collections.Generic.List[string]'
 $protectedTrackedFiles = New-Object 'System.Collections.Generic.List[string]'
 $trackedFiles = @()
 $sortedEntrypointFindings = @()
+$sortedCompatibilityFindings = @()
+$sortedPackagingFindings = @()
 $sortedContractErrors = @()
 $sortedGlobalBlockers = @()
+$productEntrypointReport = New-Object 'System.Collections.Generic.List[object]'
+$packagingHandoffReport = $null
+$remainingIntegratedPrerequisites = @()
+$historicalReferenceAllowlist = New-Object 'System.Collections.Generic.List[string]'
+$isolationReport = [ordered]@{
+    remappedAppData = $false
+    setDevmanagerProfile = $false
+    inheritedDevmanagerProfileCleared = $false
+    productionRootRead = $false
+    evidenceRootBeneathWorktree = $false
+}
+$installedAppReport = [ordered]@{
+    observedInstalledProcesses = $false
+    openSessionJson = $false
+    hashProductionFiles = $false
+    installPublishDeleteUserData = $false
+}
 $contract = $null
 $reportPath = $null
 $humanPath = $null
@@ -2710,6 +2731,79 @@ function Assert-NodeGraph {
     }
 }
 
+
+function Test-PathUnderScanRoots {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Path,
+        [AllowEmptyCollection()][string[]]$ScanRoots
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    if (@($ScanRoots).Count -eq 0) { return $true }
+    $normalized = $Path.Replace('\', '/')
+    foreach ($root in @($ScanRoots)) {
+        $candidate = ([string]$root).Replace('\', '/').TrimEnd('/')
+        if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
+        if ([string]::Equals($normalized, $candidate, [System.StringComparison]::Ordinal)) { return $true }
+        if ($normalized.StartsWith($candidate + '/', [System.StringComparison]::Ordinal)) { return $true }
+    }
+    return $false
+}
+
+function Test-CutoverHistoricalReferenceAllowed {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Path,
+        [AllowEmptyCollection()][string[]]$Allowlist
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    $normalized = $Path.Replace('\', '/')
+    foreach ($allowed in @($Allowlist)) {
+        $candidate = ([string]$allowed).Replace('\', '/').TrimEnd('/')
+        if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
+        if ([string]::Equals($normalized, $candidate, [System.StringComparison]::Ordinal)) { return $true }
+        if ($normalized.StartsWith($candidate + '/', [System.StringComparison]::Ordinal)) { return $true }
+    }
+    return $false
+}
+
+function Enable-CutoverAuditIsolation {
+    param(
+        [Parameter(Mandatory = $true)][string]$RepositoryRoot,
+        [Parameter(Mandatory = $true)][string]$EvidenceRoot
+    )
+
+    $inherited = [Environment]::GetEnvironmentVariable('DEVMANAGER_PROFILE')
+    if (-not [string]::IsNullOrWhiteSpace([string]$inherited)) {
+        [Environment]::SetEnvironmentVariable('DEVMANAGER_PROFILE', $null, 'Process')
+        $script:isolationReport.inheritedDevmanagerProfileCleared = $true
+    }
+    else {
+        $script:isolationReport.inheritedDevmanagerProfileCleared = $true
+    }
+    $script:isolationReport.setDevmanagerProfile = -not [string]::IsNullOrWhiteSpace(
+        [string][Environment]::GetEnvironmentVariable('DEVMANAGER_PROFILE')
+    )
+
+    $isolatedAppData = Normalize-CutoverAbsolutePath `
+        -LiteralPath (Join-Path $EvidenceRoot 'appdata') `
+        -Label 'isolated APPDATA'
+    New-Item -ItemType Directory -Force -Path $isolatedAppData | Out-Null
+    [Environment]::SetEnvironmentVariable('APPDATA', $isolatedAppData, 'Process')
+    $currentAppData = [Environment]::GetEnvironmentVariable('APPDATA')
+    $script:isolationReport.remappedAppData = Test-CutoverPathEqualsOrBeneath `
+        -Path $currentAppData `
+        -Ancestor $RepositoryRoot
+    $script:isolationReport.evidenceRootBeneathWorktree = Test-CutoverPathEqualsOrBeneath `
+        -Path $EvidenceRoot `
+        -Ancestor $RepositoryRoot
+    $script:isolationReport.productionRootRead = $false
+    $script:installedAppReport.observedInstalledProcesses = $false
+    $script:installedAppReport.openSessionJson = $false
+    $script:installedAppReport.hashProductionFiles = $false
+    $script:installedAppReport.installPublishDeleteUserData = $false
+}
+
 function Add-Needle {
     param(
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][System.Collections.Generic.List[object]]$Needles,
@@ -4671,6 +4765,13 @@ function New-BoundedAuditReport {
             contractErrors = @()
             blockers = @($boundedBlockers.ToArray())
             entrypointFindings = @()
+            compatibilityFindings = @()
+            packagingFindings = @()
+            remainingIntegratedPrerequisites = @()
+            productEntrypoints = @()
+            packagingHandoff = $null
+            isolation = [pscustomobject]$isolationReport
+            installedApp = [pscustomobject]$installedAppReport
             prerequisiteNodes = @()
             rows = @()
             remoteChangeAttribution = $remoteChangeAttribution
@@ -4737,8 +4838,46 @@ function Assert-CutoverReportBounds {
     foreach ($category in @($Report.remoteChangeAttribution.changedCategories)) {
         & $addString ([string]$category)
     }
-    foreach ($value in @($Report.contractErrors) + @($Report.blockers) + @($Report.entrypointFindings) + @($Report.protectedFilesSkipped)) {
+    foreach ($value in @(
+            @($Report.contractErrors) +
+            @($Report.blockers) +
+            @($Report.entrypointFindings) +
+            @(Get-ContractArray (Get-ContractProperty -Object $Report -Name 'compatibilityFindings')) +
+            @(Get-ContractArray (Get-ContractProperty -Object $Report -Name 'packagingFindings')) +
+            @(Get-ContractArray (Get-ContractProperty -Object $Report -Name 'remainingIntegratedPrerequisites')) +
+            @($Report.protectedFilesSkipped)
+        )) {
         & $addString ([string]$value)
+    }
+    foreach ($entrypoint in @(Get-ContractArray (Get-ContractProperty -Object $Report -Name 'productEntrypoints'))) {
+        & $addString ([string](Get-ContractProperty -Object $entrypoint -Name 'id'))
+        & $addString ([string](Get-ContractProperty -Object $entrypoint -Name 'role'))
+        & $addString ([string](Get-ContractProperty -Object $entrypoint -Name 'path'))
+    }
+    $isolation = Get-ContractProperty -Object $Report -Name 'isolation'
+    if ($null -ne $isolation) {
+        foreach ($name in @('remappedAppData', 'setDevmanagerProfile', 'inheritedDevmanagerProfileCleared', 'productionRootRead', 'evidenceRootBeneathWorktree')) {
+            & $addString ([string](Get-ContractProperty -Object $isolation -Name $name))
+        }
+    }
+    $installedApp = Get-ContractProperty -Object $Report -Name 'installedApp'
+    if ($null -ne $installedApp) {
+        foreach ($name in @('observedInstalledProcesses', 'openSessionJson', 'hashProductionFiles', 'installPublishDeleteUserData')) {
+            & $addString ([string](Get-ContractProperty -Object $installedApp -Name $name))
+        }
+    }
+    $packaging = Get-ContractProperty -Object $Report -Name 'packagingHandoff'
+    if ($null -ne $packaging) {
+        foreach ($binary in @(Get-ContractArray (Get-ContractProperty -Object $packaging -Name 'requiredBinaries'))) {
+            & $addString ([string]$binary)
+        }
+        foreach ($token in @(Get-ContractArray (Get-ContractProperty -Object $packaging -Name 'missingManifestTokens'))) {
+            & $addString ([string]$token)
+        }
+        foreach ($file in @(Get-ContractArray (Get-ContractProperty -Object $packaging -Name 'requiredFiles'))) {
+            & $addString ([string](Get-ContractProperty -Object $file -Name 'path'))
+        }
+        & $addString ([string](Get-ContractProperty -Object $packaging -Name 'packagerManifest'))
     }
     $nodes = @($Report.prerequisiteNodes)
     $rows = @($Report.rows)
@@ -4755,6 +4894,7 @@ function Assert-CutoverReportBounds {
     foreach ($row in $rows) {
         & $addString ([string]$row.id)
         & $addString ([string]$row.status)
+        & $addString ([string](Get-ContractProperty -Object $row -Name 'cutoverAction'))
         & $addString ([string]$row.legacy.path)
         & $addString ([string]$row.replacementOwner.path)
         & $addString ([string]$row.replacementOwner.symbol)
@@ -4844,6 +4984,26 @@ function Write-AuditReports {
     }
     $null = & $addLine 'forbidden entrypoint findings:'
     foreach ($finding in @($Report.entrypointFindings)) { $null = & $addLine "- $finding" }
+    $null = & $addLine 'compatibility findings:'
+    foreach ($finding in @(Get-ContractArray (Get-ContractProperty -Object $Report -Name 'compatibilityFindings'))) {
+        $null = & $addLine "- $finding"
+    }
+    $null = & $addLine 'packaging/update handoff:'
+    $packagingReport = Get-ContractProperty -Object $Report -Name 'packagingHandoff'
+    if ($null -eq $packagingReport) {
+        $null = & $addLine '- none'
+    }
+    else {
+        $null = & $addLine ("- binaries: {0}" -f ((@(Get-ContractArray (Get-ContractProperty -Object $packagingReport -Name 'requiredBinaries')) -join ', ')))
+        $null = & $addLine ("- atomic two-binary identity: {0}" -f (Get-ContractProperty -Object $packagingReport -Name 'atomicTwoBinaryIdentity'))
+        $null = & $addLine ("- install/publish forbidden: {0}" -f (Get-ContractProperty -Object $packagingReport -Name 'forbidInstallOrPublish'))
+        foreach ($file in @(Get-ContractArray (Get-ContractProperty -Object $packagingReport -Name 'requiredFiles'))) {
+            $null = & $addLine ("- required file: {0}; present={1}" -f (Get-ContractProperty -Object $file -Name 'path'), (Get-ContractProperty -Object $file -Name 'present'))
+        }
+    }
+    $null = & $addLine ("installed app touched: {0}" -f (Get-ContractProperty -Object (Get-ContractProperty -Object $Report -Name 'installedApp') -Name 'observedInstalledProcesses'))
+    $null = & $addLine ("session.json opened: {0}" -f (Get-ContractProperty -Object (Get-ContractProperty -Object $Report -Name 'installedApp') -Name 'openSessionJson'))
+    $null = & $addLine ("DEVMANAGER_PROFILE set: {0}" -f (Get-ContractProperty -Object (Get-ContractProperty -Object $Report -Name 'isolation') -Name 'setDevmanagerProfile'))
     $human = ($lines -join [Environment]::NewLine) + [Environment]::NewLine
     if ($humanTruncated -or [System.Text.UTF8Encoding]::new($false).GetByteCount($human) -gt $maxReportHumanBytes) {
         Add-SafetyBound
@@ -4963,6 +5123,7 @@ try {
         }
     }
     $evidenceRoot = Normalize-CutoverAbsolutePath -LiteralPath (Join-Path $rootPath '.devmanager-next\evidence') -Label 'evidence root'
+    Enable-CutoverAuditIsolation -RepositoryRoot $rootPath -EvidenceRoot $evidenceRoot
     $defaultReportPath = Assert-AuditOutputPath -RepositoryRoot $rootPath -EvidenceRoot $evidenceRoot -RequestedPath $null
     if ([string]::IsNullOrEmpty($OutputPath)) {
         $reportPath = $defaultReportPath
@@ -5044,6 +5205,21 @@ try {
     $protectedBasenames = @(Get-ContractArray (Get-ContractProperty -Object $policy -Name 'protectedFileBasenames') | ForEach-Object { [string]$_ })
     if (-not ($protectedBasenames -contains 'session.json')) {
         Add-ContractError 'referencePolicy.protectedFileBasenames must contain the exact session.json name.'
+    }
+    $historicalReferenceAllowlist = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($allowedHistorical in @(Get-BoundedContractStringArray `
+                -Value (Get-ContractProperty -Object $policy -Name 'intentionalHistoricalReferencePaths') `
+                -Label 'referencePolicy.intentionalHistoricalReferencePaths')) {
+        $normalizedHistorical = Normalize-ContractRelativePath `
+            -Value $allowedHistorical `
+            -Label 'referencePolicy.intentionalHistoricalReferencePaths' `
+            -AllowDirectory
+        if ($null -ne $normalizedHistorical) {
+            $historicalReferenceAllowlist.Add($normalizedHistorical)
+        }
+    }
+    if (-not ($historicalReferenceAllowlist -contains 'docs/replacement-deletion-ledger.md')) {
+        $historicalReferenceAllowlist.Add('docs/replacement-deletion-ledger.md')
     }
     $maxMatches = 20
     $maxMatchesValue = Get-ContractProperty -Object $policy -Name 'maxMatchesPerRow'
@@ -5206,6 +5382,16 @@ try {
         if ($status -notin $expectedStatuses) {
             Add-ContractError "row '$rowId' has invalid status '$status'."
         }
+        $cutoverAction = [string](Get-ContractProperty -Object $row -Name 'cutoverAction')
+        if ([string]::IsNullOrWhiteSpace($cutoverAction)) {
+            $cutoverAction = 'delete'
+        }
+        if ($cutoverAction -notin @('delete', 'handoff')) {
+            Add-ContractError "row '$rowId' cutoverAction must be delete or handoff."
+        }
+        if ($cutoverAction -eq 'handoff' -and $status -eq 'DELETED') {
+            Add-ContractError "row '$rowId' is a handoff row and cannot be DELETED."
+        }
         if ((Get-ContractProperty -Object $row -Name 'approvalRequired') -ne $true) {
             Add-ContractError "row '$rowId' must require explicit approval."
         }
@@ -5306,17 +5492,25 @@ try {
         }
 
         $deletionSet = @()
-        foreach ($deletionPath in @(Get-BoundedContractStringArray -Value (Get-ContractProperty -Object $row -Name 'deletionSet') -Label "row '$rowId' deletionSet")) {
-            $normalizedDeletion = Normalize-ContractRelativePath -Value $deletionPath -Label "row '$rowId' deletionSet" -AllowDirectory
-            if ($null -ne $normalizedDeletion) {
-                $deletionSet += $normalizedDeletion
+        $deletionValue = Get-ContractProperty -Object $row -Name 'deletionSet'
+        if ($null -ne $deletionValue) {
+            foreach ($deletionPath in @(Get-BoundedContractStringArray -Value $deletionValue -Label "row '$rowId' deletionSet")) {
+                $normalizedDeletion = Normalize-ContractRelativePath -Value $deletionPath -Label "row '$rowId' deletionSet" -AllowDirectory
+                if ($null -ne $normalizedDeletion) {
+                    $deletionSet += $normalizedDeletion
+                }
             }
         }
-        if ($deletionSet.Count -eq 0) {
-            Add-ContractError "row '$rowId' deletionSet is empty."
+        if ($cutoverAction -eq 'delete') {
+            if ($deletionSet.Count -eq 0) {
+                Add-ContractError "row '$rowId' deletionSet is empty."
+            }
+            elseif ($null -ne $legacyPath -and -not ($deletionSet -contains $legacyPath)) {
+                Add-ContractError "row '$rowId' deletionSet must include the legacy owner path."
+            }
         }
-        elseif ($null -ne $legacyPath -and -not ($deletionSet -contains $legacyPath)) {
-            Add-ContractError "row '$rowId' deletionSet must include the legacy owner path."
+        elseif ($deletionSet.Count -gt 0) {
+            Add-ContractError "row '$rowId' is a handoff row and must not declare a deletionSet."
         }
 
         $rowModels.Add([pscustomobject]@{
@@ -5342,6 +5536,7 @@ try {
                 impactNeverTouches = $impactNeverTouches
                 deletionSet    = $deletionSet
                 status         = $status
+                cutoverAction  = $cutoverAction
             })
     }
 
@@ -5411,6 +5606,199 @@ try {
         }
     }
 
+    $compatibilityScanRoots = @()
+    $productEntrypoints = Get-ContractProperty -Object $contract -Name 'productEntrypoints'
+    if ($null -ne $productEntrypoints) {
+        foreach ($entrypointName in @('desktopClient', 'durableHost')) {
+            Assert-CutoverWorkDeadline
+            $entrypoint = Get-ContractProperty -Object $productEntrypoints -Name $entrypointName
+            if ($null -eq $entrypoint) {
+                Add-ContractError "productEntrypoints.$entrypointName is required when productEntrypoints is present."
+                continue
+            }
+            $entrypointId = [string](Get-ContractProperty -Object $entrypoint -Name 'id')
+            $entrypointPath = Normalize-ContractRelativePath `
+                -Value (Get-ContractProperty -Object $entrypoint -Name 'path') `
+                -Label "productEntrypoints.$entrypointName.path"
+            $entrypointRole = [string](Get-ContractProperty -Object $entrypoint -Name 'role')
+            $entrypointPresent = $false
+            if ($null -ne $entrypointPath) {
+                $entrypointPresent = Test-TrackedPathPresent -Path $entrypointPath -Tracked $trackedFiles
+                if (-not $entrypointPresent) {
+                    Add-GlobalBlocker "required product entrypoint is missing: $entrypointPath"
+                }
+            }
+            $productOwner = "product:$(Get-CutoverSafeReportIdentifier -Value $entrypointId)"
+            foreach ($dispatch in @(Get-BoundedContractStringArray `
+                        -Value (Get-ContractProperty -Object $entrypoint -Name 'forbiddenDispatch') `
+                        -Label "productEntrypoints.$entrypointName.forbiddenDispatch")) {
+                Add-Needle -Needles $needles -NeedleKeys $needleKeys -OwnerId $productOwner -Kind 'token' -Value $dispatch
+            }
+            if ($entrypointRole -eq 'durable-host') {
+                $lifecycle = @(Get-BoundedContractStringArray `
+                        -Value (Get-ContractProperty -Object $entrypoint -Name 'lifecycle') `
+                        -Label "productEntrypoints.$entrypointName.lifecycle")
+                foreach ($requiredLifecycle in @('attach', 'detach', 'full-quit')) {
+                    if (-not ($lifecycle -contains $requiredLifecycle)) {
+                        Add-ContractError "productEntrypoints.durableHost.lifecycle must include $requiredLifecycle."
+                    }
+                }
+            }
+            $productEntrypointReport.Add([pscustomobject]@{
+                    id = Get-CutoverSafeReportIdentifier -Value $entrypointId
+                    role = $entrypointRole
+                    path = $entrypointPath
+                    present = $entrypointPresent
+                })
+        }
+        $desktopRoleCount = @($productEntrypointReport | Where-Object { $_.role -eq 'gpui-client' }).Count
+        $hostRoleCount = @($productEntrypointReport | Where-Object { $_.role -eq 'durable-host' }).Count
+        if ($desktopRoleCount -ne 1 -or $hostRoleCount -ne 1) {
+            Add-ContractError 'productEntrypoints must declare exactly one gpui-client and one durable-host.'
+        }
+    }
+
+    $compatibilityPolicy = Get-ContractProperty -Object $contract -Name 'compatibilityPolicy'
+    if ($null -ne $compatibilityPolicy) {
+        if ((Get-ContractProperty -Object $compatibilityPolicy -Name 'permanentDualUi') -ne $false) {
+            Add-ContractError 'compatibilityPolicy.permanentDualUi must be false.'
+        }
+        if ((Get-ContractProperty -Object $compatibilityPolicy -Name 'backwardCompatibilityMode') -ne $false) {
+            Add-ContractError 'compatibilityPolicy.backwardCompatibilityMode must be false.'
+        }
+        $compatibilityScanRoots = @(Get-BoundedContractStringArray `
+                -Value (Get-ContractProperty -Object $compatibilityPolicy -Name 'scanPaths') `
+                -Label 'compatibilityPolicy.scanPaths')
+        foreach ($switchToken in @(Get-BoundedContractStringArray `
+                    -Value (Get-ContractProperty -Object $compatibilityPolicy -Name 'forbiddenRuntimeSwitches') `
+                    -Label 'compatibilityPolicy.forbiddenRuntimeSwitches')) {
+            Add-Needle -Needles $needles -NeedleKeys $needleKeys -OwnerId 'compatibility:switch' -Kind 'token' -Value $switchToken
+        }
+    }
+
+    $packagingHandoff = Get-ContractProperty -Object $contract -Name 'packagingHandoff'
+    if ($null -ne $packagingHandoff) {
+        $packagerManifest = Normalize-ContractRelativePath `
+            -Value (Get-ContractProperty -Object $packagingHandoff -Name 'packagerManifest') `
+            -Label 'packagingHandoff.packagerManifest'
+        $requiredBinaries = @(Get-BoundedContractStringArray `
+                -Value (Get-ContractProperty -Object $packagingHandoff -Name 'requiredBinaries') `
+                -Label 'packagingHandoff.requiredBinaries')
+        $requiredManifestTokens = @(Get-BoundedContractStringArray `
+                -Value (Get-ContractProperty -Object $packagingHandoff -Name 'requiredManifestTokens') `
+                -Label 'packagingHandoff.requiredManifestTokens')
+        $requiredFiles = @(Get-BoundedContractStringArray `
+                -Value (Get-ContractProperty -Object $packagingHandoff -Name 'requiredFiles') `
+                -Label 'packagingHandoff.requiredFiles')
+        if ((Get-ContractProperty -Object $packagingHandoff -Name 'forbidInstallOrPublish') -ne $true) {
+            Add-ContractError 'packagingHandoff.forbidInstallOrPublish must be true.'
+        }
+        if ((Get-ContractProperty -Object $packagingHandoff -Name 'atomicTwoBinaryIdentity') -ne $true) {
+            Add-ContractError 'packagingHandoff.atomicTwoBinaryIdentity must be true.'
+        }
+        if (-not ($requiredBinaries -contains 'devmanager.exe') -or -not ($requiredBinaries -contains 'devmanager-host.exe')) {
+            Add-ContractError 'packagingHandoff.requiredBinaries must include devmanager.exe and devmanager-host.exe.'
+        }
+        if ($requiredBinaries -contains 'devmanager-next.exe') {
+            Add-ContractError 'packagingHandoff.requiredBinaries must not include devmanager-next.exe.'
+        }
+        $manifestPresent = $false
+        $missingTokens = New-Object 'System.Collections.Generic.List[string]'
+        if ($null -ne $packagerManifest) {
+            $manifestPresent = Test-TrackedPathPresent -Path $packagerManifest -Tracked $trackedFiles
+            if (-not $manifestPresent) {
+                Add-GlobalBlocker "packager manifest is missing: $packagerManifest"
+            }
+            else {
+                try {
+                    $manifestLiteral = Assert-CutoverConfinedPath `
+                        -LiteralPath (Join-Path $rootPath ($packagerManifest.Replace('/', '\'))) `
+                        -AncestorPath $rootPath
+                    $manifestText = Read-CutoverConfinedUtf8 `
+                        -LiteralPath $manifestLiteral `
+                        -MaxBytes $maxScanBytesPerFile `
+                        -Label 'packager manifest'
+                    foreach ($token in $requiredManifestTokens) {
+                        Assert-CutoverWorkDeadline
+                        if ($manifestText.IndexOf([string]$token, [System.StringComparison]::Ordinal) -lt 0) {
+                            $missingTokens.Add([string]$token)
+                            $packagingFindings.Add("missing packager token '$token' in $packagerManifest")
+                        }
+                    }
+                }
+                catch {
+                    Add-GlobalBlocker "packager manifest could not be read safely: $packagerManifest"
+                }
+            }
+        }
+        $requiredFileReports = New-Object 'System.Collections.Generic.List[object]'
+        foreach ($requiredFile in $requiredFiles) {
+            Assert-CutoverWorkDeadline
+            $requiredPath = Normalize-ContractRelativePath -Value $requiredFile -Label 'packagingHandoff.requiredFiles'
+            $requiredPresent = $false
+            if ($null -ne $requiredPath) {
+                $requiredPresent = Test-TrackedPathPresent -Path $requiredPath -Tracked $trackedFiles
+                if (-not $requiredPresent) {
+                    $packagingFindings.Add("missing packaging/update handoff file: $requiredPath")
+                }
+            }
+            $requiredFileReports.Add([pscustomobject]@{ path = $requiredPath; present = $requiredPresent })
+        }
+        $packagingHandoffReport = [pscustomobject]([ordered]@{
+                requiredBinaries = @($requiredBinaries)
+                atomicTwoBinaryIdentity = $true
+                packagerManifest = $packagerManifest
+                manifestPresent = $manifestPresent
+                missingManifestTokens = @($missingTokens.ToArray())
+                requiredFiles = @($requiredFileReports.ToArray())
+                forbidInstallOrPublish = $true
+            })
+        foreach ($finding in @($packagingFindings)) {
+            Add-GlobalBlocker $finding
+        }
+    }
+
+    $profileIsolation = Get-ContractProperty -Object $contract -Name 'profileIsolation'
+    if ($null -ne $profileIsolation) {
+        if ((Get-ContractProperty -Object $profileIsolation -Name 'forbidSettingDevmanagerProfile') -ne $true) {
+            Add-ContractError 'profileIsolation.forbidSettingDevmanagerProfile must be true.'
+        }
+        if ((Get-ContractProperty -Object $profileIsolation -Name 'remapAppData') -ne $true) {
+            Add-ContractError 'profileIsolation.remapAppData must be true.'
+        }
+        if ((Get-ContractProperty -Object $profileIsolation -Name 'productionProfileOnlyInSignedRelease') -ne $true) {
+            Add-ContractError 'profileIsolation.productionProfileOnlyInSignedRelease must be true.'
+        }
+        if ([string](Get-ContractProperty -Object $profileIsolation -Name 'evidenceRoot') -ne '.devmanager-next/evidence') {
+            Add-ContractError 'profileIsolation.evidenceRoot must be .devmanager-next/evidence.'
+        }
+        if ($isolationReport.setDevmanagerProfile) {
+            Add-GlobalBlocker 'audit process still has DEVMANAGER_PROFILE set.'
+        }
+        if (-not $isolationReport.remappedAppData) {
+            Add-GlobalBlocker 'audit APPDATA is not isolated beneath the repository root.'
+        }
+    }
+
+    $installedAppPolicy = Get-ContractProperty -Object $contract -Name 'installedAppPolicy'
+    if ($null -ne $installedAppPolicy) {
+        foreach ($flag in @('touchInstalledApp', 'hashProductionFiles', 'openSessionJson', 'installPublishDeleteUserData')) {
+            if ((Get-ContractProperty -Object $installedAppPolicy -Name $flag) -ne $false) {
+                Add-ContractError "installedAppPolicy.$flag must be false."
+            }
+        }
+    }
+
+    $publicationPolicy = Get-ContractProperty -Object $contract -Name 'publicationPolicy'
+    if ($null -ne $publicationPolicy) {
+        if ((Get-ContractProperty -Object $publicationPolicy -Name 'requireExplicitManualApproval') -ne $true) {
+            Add-ContractError 'publicationPolicy.requireExplicitManualApproval must be true.'
+        }
+        if ((Get-ContractProperty -Object $publicationPolicy -Name 'forbidAutomatedPublish') -ne $true) {
+            Add-ContractError 'publicationPolicy.forbidAutomatedPublish must be true.'
+        }
+    }
+
     $scanMatches = @(Invoke-ReferenceScan `
         -RepositoryRoot $rootPath `
         -Tracked $trackedFiles `
@@ -5421,6 +5809,25 @@ try {
     foreach ($match in $scanMatches | Where-Object { $_.ownerId -like 'entrypoint:*' }) {
         Assert-CutoverWorkDeadline
         $entrypointFindings.Add("$($match.ownerId.Substring(11)):$($match.path)")
+    }
+
+    foreach ($match in $scanMatches | Where-Object { $_.ownerId -like 'product:*' }) {
+        Assert-CutoverWorkDeadline
+        if (Test-CutoverHistoricalReferenceAllowed -Path $match.path -Allowlist @($historicalReferenceAllowlist.ToArray())) {
+            continue
+        }
+        $entrypointFindings.Add("$($match.ownerId.Substring(8)):$($match.path)")
+        Add-GlobalBlocker "desktop client still dispatches a forbidden legacy runtime: $($match.path)"
+    }
+    foreach ($match in @($scanMatches | Where-Object { $_.ownerId -eq 'compatibility:switch' })) {
+        Assert-CutoverWorkDeadline
+        if (-not (Test-PathUnderScanRoots -Path $match.path -ScanRoots $compatibilityScanRoots)) {
+            continue
+        }
+        if (Test-CutoverHistoricalReferenceAllowed -Path $match.path -Allowlist @($historicalReferenceAllowlist.ToArray())) {
+            continue
+        }
+        $compatibilityFindings.Add("$($match.path)")
     }
 
     foreach ($model in $rowModels) {
@@ -5437,8 +5844,16 @@ try {
         if ($null -ne $model.replacementPath) {
             $replacementPresent = Test-TrackedPathPresent -Path $model.replacementPath -Tracked $trackedFiles
             if (-not $replacementPresent) {
-                Add-ContractError "row '$($model.id)' replacement owner path is not an exact tracked path: $($model.replacementPath)."
+                if ($model.cutoverAction -eq 'handoff') {
+                    Add-RowBlocker -Blockers ([ref]$rowBlockers) -Message "handoff replacement owner is not yet present: $($model.replacementPath)"
+                }
+                else {
+                    Add-ContractError "row '$($model.id)' replacement owner path is not an exact tracked path: $($model.replacementPath)."
+                }
             }
+        }
+        if ($null -ne $model.legacyPath -and -not $pathPresent -and $model.status -eq 'DELETED' -and $model.cutoverAction -ne 'delete') {
+            Add-ContractError "row '$($model.id)' DELETED status is only valid for delete actions."
         }
 
         $artifactReports = New-Object 'System.Collections.Generic.List[object]'
@@ -5590,6 +6005,7 @@ try {
         $rowDocument = [pscustomobject]([ordered]@{
                     id = $model.reportId
                     status = $model.status
+                    cutoverAction = $model.cutoverAction
                     legacy = [ordered]@{
                         path = $model.legacyPath
                         symbolCount = @($model.symbols).Count
@@ -5633,11 +6049,45 @@ try {
     foreach ($finding in $sortedEntrypointFindings) {
         Add-GlobalBlocker "forbidden legacy entrypoint finding: $finding"
     }
+    $sortedCompatibilityFindings = @(Sort-CutoverOrdinalStrings -Values @($compatibilityFindings.ToArray()))
+    if ($sortedCompatibilityFindings.Count -gt 60) {
+        $sortedCompatibilityFindings = @($sortedCompatibilityFindings | Select-Object -First 60)
+    }
+    foreach ($finding in $sortedCompatibilityFindings) {
+        Add-GlobalBlocker "forbidden compatibility/runtime switch reference: $finding"
+    }
+    $sortedPackagingFindings = @(Sort-CutoverOrdinalStrings -Values @($packagingFindings.ToArray()))
     $sortedContractErrors = @(Sort-CutoverOrdinalDiagnostics -Values @($contractErrors.ToArray()))
     $sortedGlobalBlockers = @(Sort-CutoverOrdinalStrings -Values @($globalBlockers.ToArray()))
+    $remainingIntegratedPrerequisites = @(
+        Sort-CutoverOrdinalStrings -Values @(
+            $nodeReports |
+                Where-Object { $_.status -ne 'READY' } |
+                ForEach-Object { [string]$_.id }
+        )
+    )
 
     $allRowsTerminal = $rowReports.Count -gt 0 -and @($rowReports | Where-Object { $_.status -eq 'HOLD' }).Count -eq 0
-    $contractStatus = if ($contractErrors.Count -gt 0 -or $globalBlockers.Count -gt 0 -or -not $allRowsTerminal) { 'HOLD' } else { 'READY' }
+    $handoffReady = $true
+    foreach ($row in @($rowReports | Where-Object { $_.cutoverAction -eq 'handoff' })) {
+        if ($row.status -ne 'READY' -or @($row.blockers).Count -gt 0) {
+            $handoffReady = $false
+        }
+    }
+    $packagingReady = $true
+    if ($null -ne $packagingHandoffReport) {
+        $missingHandoffFiles = @($packagingHandoffReport.requiredFiles | Where-Object { -not $_.present })
+        if ($missingHandoffFiles.Count -gt 0 -or @($packagingHandoffReport.missingManifestTokens).Count -gt 0) {
+            $packagingReady = $false
+        }
+    }
+    $contractStatus = if (
+        $contractErrors.Count -gt 0 -or
+        $globalBlockers.Count -gt 0 -or
+        -not $allRowsTerminal -or
+        -not $handoffReady -or
+        -not $packagingReady
+    ) { 'HOLD' } else { 'READY' }
 }
 catch {
     $fatalDiagnosticCategory = Get-CutoverDiagnosticCategory -Message $_.Exception.Message
@@ -5651,11 +6101,16 @@ catch {
         Add-SafetyBound
         $boundedPublicationRequired = $true
         $sortedEntrypointFindings = @()
+        $sortedCompatibilityFindings = @()
+        $sortedPackagingFindings = @()
         $sortedContractErrors = @()
         $sortedGlobalBlockers = @()
+        $remainingIntegratedPrerequisites = @()
     }
     else {
         $sortedEntrypointFindings = @(Sort-CutoverOrdinalStrings -Values @($entrypointFindings.ToArray()))
+        $sortedCompatibilityFindings = @(Sort-CutoverOrdinalStrings -Values @($compatibilityFindings.ToArray()))
+        $sortedPackagingFindings = @(Sort-CutoverOrdinalStrings -Values @($packagingFindings.ToArray()))
         $sortedContractErrors = @(Sort-CutoverOrdinalDiagnostics -Values @($contractErrors.ToArray()))
         $sortedGlobalBlockers = @(Sort-CutoverOrdinalStrings -Values @($globalBlockers.ToArray()))
     }
@@ -5703,6 +6158,13 @@ else {
         contractErrors = @($sortedContractErrors)
         blockers = @($sortedGlobalBlockers)
         entrypointFindings = @($sortedEntrypointFindings)
+        compatibilityFindings = @($sortedCompatibilityFindings)
+        packagingFindings = @($sortedPackagingFindings)
+        remainingIntegratedPrerequisites = @($remainingIntegratedPrerequisites)
+        productEntrypoints = @(Sort-CutoverOrdinalObjects -Values @($productEntrypointReport.ToArray()) -Fields @('id'))
+        packagingHandoff = $packagingHandoffReport
+        isolation = [pscustomobject]$isolationReport
+        installedApp = [pscustomobject]$installedAppReport
         prerequisiteNodes = @(Sort-CutoverOrdinalObjects -Values @($nodeReports.ToArray()) -Fields @('id'))
         rows = @(Sort-CutoverOrdinalObjects -Values @($rowReports.ToArray()) -Fields @('id'))
         remoteChangeAttribution = $remoteChangeAttribution
