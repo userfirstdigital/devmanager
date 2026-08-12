@@ -8048,6 +8048,43 @@ fn launch_root_fence_description(inner: &Arc<ProcessManagerInner>, session_id: &
     format!("session {session_id}, pid {pid}, creation {creation}, canonical executable bound")
 }
 
+/// Return the current runtime root only when the projection still carries the
+/// exact managed-process fence that named that root. A runtime PID by itself is
+/// diagnostic data and cannot establish ownership across a replacement.
+fn live_runtime_root_pid(inner: &Arc<ProcessManagerInner>, session_id: &str) -> Option<u32> {
+    let runtime = inner.runtime_state.read().ok()?;
+    let session = runtime.sessions.get(session_id)?;
+    let fence = session.resources.managed_process_fence.as_ref()?;
+    let root_pid = fence.root().id().pid();
+    (session.status.is_live()
+        && session.pid == Some(root_pid)
+        && session.resources.process_ids.contains(&root_pid))
+    .then_some(root_pid)
+}
+
+/// Return only the process IDs from the same current, fenced resource sample
+/// as the runtime root. This is a read-only ownership projection; it never
+/// reconstructs control authority from a PID or from the persistence ledger.
+fn session_managed_process_ids(inner: &ProcessManagerInner, session_id: &str) -> Vec<u32> {
+    let Ok(runtime) = inner.runtime_state.read() else {
+        return Vec::new();
+    };
+    let Some(session) = runtime.sessions.get(session_id) else {
+        return Vec::new();
+    };
+    let Some(fence) = session.resources.managed_process_fence.as_ref() else {
+        return Vec::new();
+    };
+    let root_pid = fence.root().id().pid();
+    if !session.status.is_live()
+        || session.pid != Some(root_pid)
+        || !session.resources.process_ids.contains(&root_pid)
+    {
+        return Vec::new();
+    }
+    session.resources.process_ids.clone()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PostLaunchListenerSettlement {
     /// No listener is visible yet; keep polling while the reservation remains

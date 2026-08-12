@@ -3736,7 +3736,30 @@ impl NativeInteraction {
     }
 
     pub fn sync_selected_task(&mut self, selected_task: Option<TaskId>) -> bool {
-        self.shell.sync_selected_task(selected_task)
+        if self.shell.selected_task() == selected_task {
+            return false;
+        }
+        let Some(navigation_epoch) = self.shell.navigation_epoch().checked_add(1) else {
+            return false;
+        };
+        self.replace_shell_selection(selected_task, navigation_epoch);
+        true
+    }
+
+    fn replace_shell_selection(&mut self, selected_task: Option<TaskId>, navigation_epoch: u64) {
+        let epochs = crate::ui::shell::HostEpochSnapshot::try_from_host(
+            self.resource_generation.max(1),
+            self.connection_epoch.max(1),
+            self.shell.focus_navigation_epoch().max(1),
+            self.client_epoch.max(1),
+            navigation_epoch.max(1),
+        );
+        self.shell = epochs
+            .ok()
+            .map(|epochs| Shell::new(selected_task, epochs))
+            .unwrap_or_else(|| Shell::detached(selected_task));
+        self.pointer_capture = None;
+        self.pointer_owner = None;
     }
 
     pub fn keyboard_state(&self) -> NativeKeyboardState {
@@ -3777,9 +3800,26 @@ impl NativeInteraction {
         task_list: &TaskList,
     ) -> NavigationHandlerOutcome {
         let (focus_epoch, request_generation) = self.begin_handler(Some(task_id));
-        let navigation =
-            self.shell
-                .navigation_mouse_down(task_id, self.shell.navigation_epoch(), task_list);
+        let navigation = if task_list.task_ids().any(|candidate| candidate == task_id) {
+            match self.shell.navigation_epoch().checked_add(1) {
+                Some(navigation_epoch) => {
+                    self.replace_shell_selection(Some(task_id), navigation_epoch);
+                    NavigationResult::Committed {
+                        task_id,
+                        navigation_epoch,
+                    }
+                }
+                None => NavigationResult::Rejected {
+                    reason: crate::ui::shell::NavigationRejection::EpochExhausted,
+                },
+            }
+        } else {
+            self.pointer_capture = None;
+            self.pointer_owner = None;
+            NavigationResult::Rejected {
+                reason: crate::ui::shell::NavigationRejection::TaskNotInInbox,
+            }
+        };
         NavigationHandlerOutcome {
             focus_epoch,
             task_id,
@@ -3922,6 +3962,7 @@ impl NativeInteraction {
                 self.keyboard_state.palette_open = false;
                 self.keyboard_state.task_switcher_open = false;
             }
+            KeyboardAction::OpenTaskDetails => {}
             KeyboardAction::SelectDock(tool) => self.keyboard_state.selected_dock = Some(tool),
             KeyboardAction::OpenTerminal => self.keyboard_state.terminal_open = true,
             KeyboardAction::DismissTransient => {
@@ -4087,15 +4128,15 @@ impl AccessibilityNode {
     }
 
     pub fn name(&self) -> &str {
-        &self.metadata.name
+        self.metadata.name()
     }
 
     pub fn description(&self) -> &str {
-        &self.metadata.description
+        self.metadata.description()
     }
 
     pub fn role(&self) -> AccessibleRole {
-        self.metadata.role
+        self.metadata.role()
     }
 
     pub fn metadata(&self) -> &AccessibilityMetadata {
@@ -4158,7 +4199,7 @@ impl AccessibilityTree {
                     "Select this task and open its native task cockpit.",
                 )
                 .gpui(format!("native-task-row-{}", task_id), true, true);
-                row.metadata.focused = selected_task == Some(*task_id);
+                row.metadata.set_focused(selected_task == Some(*task_id));
                 row
             })
             .collect::<Vec<_>>();
@@ -4398,10 +4439,13 @@ fn accesskit_tree_update(tree: &AccessibilityTree) -> accesskit::TreeUpdate {
     fn role(role: AccessibleRole) -> Role {
         match role {
             AccessibleRole::Button => Role::Button,
+            AccessibleRole::Menu => Role::Menu,
             AccessibleRole::TextField => Role::TextInput,
             AccessibleRole::Status => Role::Status,
             AccessibleRole::Alert => Role::Alert,
             AccessibleRole::Region => Role::Region,
+            AccessibleRole::Tab => Role::Tab,
+            AccessibleRole::TabList => Role::TabList,
         }
     }
     fn visit(
@@ -4430,25 +4474,25 @@ fn accesskit_tree_update(tree: &AccessibilityTree) -> accesskit::TreeUpdate {
             node.add_action(accesskit::Action::Focus);
         }
         let metadata = source.metadata();
-        if metadata.disabled {
+        if metadata.disabled() {
             node.set_disabled();
         }
-        if metadata.busy {
+        if metadata.busy() {
             node.set_busy();
         }
-        if metadata.read_only {
+        if metadata.read_only() {
             node.set_read_only();
         }
-        if metadata.invalid {
+        if metadata.invalid() {
             node.set_invalid(accesskit::Invalid::Grammar);
         }
-        if let Some(value) = metadata.value.as_ref() {
-            node.set_value(value.clone());
+        if let Some(value) = metadata.value() {
+            node.set_value(value.to_string());
         }
-        if let Some(error) = metadata.error.as_ref() {
+        if let Some(error) = metadata.error() {
             node.set_description(format!("{} {}", source.description(), error));
         }
-        if source.metadata().focused {
+        if source.metadata().focused() {
             node.set_selected(true);
             *focused = Some(id);
         }
@@ -4987,7 +5031,7 @@ impl NativeShell {
                 self.set_transport_failure(&action, NativeHostActionResult::Stale);
                 break;
             }
-            match self.try_enqueue_host_action(action) {
+            match self.try_enqueue_host_action(action.clone()) {
                 NativeHostActionResult::Queued => {
                     if from_overflow {
                         self.retained_action_overflow = None;
@@ -6424,9 +6468,9 @@ fn launch_native_shell(
     error
 }
 
-fn bounded_host_error(message: String) -> String {
+fn bounded_host_error(message: impl Into<String>) -> String {
     const MAX_HOST_ERROR_CHARS: usize = 256;
-    message.chars().take(MAX_HOST_ERROR_CHARS).collect()
+    message.into().chars().take(MAX_HOST_ERROR_CHARS).collect()
 }
 
 fn validated_runtime_attachment(
@@ -6463,20 +6507,23 @@ fn enqueue_pending_preference(
 #[cfg(test)]
 mod tests {
     use super::{
-        acquire_reaper_permit, dispatch_pending_action, enqueue_pending_preference,
-        ensure_isolated_host_config_base, isolated_dev_profile, publish_projection,
-        reap_retained_children, reap_retained_workers, retain_child, retain_worker,
-        retained_children, take_retained_action_outcomes, wait_for_cancellation, AccessibilityTree,
-        ClientId, CommandId, NativeActionRecord, NativeHostActionFailure, NativeHostActionOutcome,
-        NativeHostActionResult, NativeHostProjection, NativeHostProjectionKind,
-        NativeHostRuntimeEpochs, NativeHostRuntimePort, NativeHostWorkerCommand, NativeInteraction,
-        NativePlatformAccessibilityBridge, NativeShell, NativeShutdownDeadline, OwnedChild,
-        OwnedWorker, ReaperKind, TaskId, MAX_ACTION_LANE_RECORDS, MAX_ACTION_OUTCOME_PROJECTIONS,
-        MAX_HOST_PROJECTIONS, MAX_PENDING_HOST_ACTIONS, MAX_PENDING_PREFERENCES,
-        MAX_RETAINED_CHILDREN, MAX_RETAINED_WORKERS, MAX_RETRY_HOST_ACTIONS,
+        acquire_reaper_permit, authorize_full_host_quit, dispatch_pending_action,
+        enqueue_pending_preference, ensure_isolated_host_config_base, isolated_dev_profile,
+        publish_projection, reap_retained_children, reap_retained_workers, retain_child,
+        retain_worker, retained_children, take_retained_action_outcomes, wait_for_cancellation,
+        AccessibilityTree, ClientId, CommandId, IsolatedDevProfile, NativeActionRecord,
+        NativeHostActionFailure, NativeHostActionOutcome, NativeHostActionResult,
+        NativeHostChildOwnership, NativeHostLaunchMode, NativeHostLaunchSpec, NativeHostProjection,
+        NativeHostProjectionKind, NativeHostRuntimeEpochs, NativeHostRuntimePort,
+        NativeHostWorkerCommand, NativeInteraction, NativePlatformAccessibilityBridge, NativeShell,
+        NativeShellMode, NativeShutdownDeadline, OwnedChild, OwnedWorker, ReaperKind, TaskId,
+        MAX_ACTION_LANE_RECORDS, MAX_ACTION_OUTCOME_PROJECTIONS, MAX_HOST_PROJECTIONS,
+        MAX_PENDING_HOST_ACTIONS, MAX_PENDING_PREFERENCES, MAX_RETAINED_CHILDREN,
+        MAX_RETAINED_WORKERS, MAX_RETRY_HOST_ACTIONS, PRODUCTION_HOST_PROFILE,
     };
     use gpui::AppContext;
     use std::collections::VecDeque;
+    use std::path::PathBuf;
     use std::process::Command;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc::SyncSender;

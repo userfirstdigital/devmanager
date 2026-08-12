@@ -986,7 +986,7 @@ impl HostRequestHandle {
         );
     }
 
-    fn control_recv_deadline<T>(
+    fn control_recv_deadline<T: Send + 'static>(
         &self,
         enqueue: impl FnOnce(oneshot::Sender<T>) -> ExecutorControl,
         deadline: Instant,
@@ -3287,7 +3287,8 @@ impl HostRequestExecutor {
                     .manager
                     .configured_service_control(
                         action,
-                        &intent.service_id,
+                        &crate::services::model::ServiceId::new(intent.service_id)
+                            .map_err(|error| IpcError::Security(error.to_string()))?,
                         crate::services::model::AdmissionFence::new(
                             intent.resource_generation,
                             intent.connection_epoch,

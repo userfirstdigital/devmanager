@@ -18,10 +18,9 @@ use crate::providers::adapter::{
     QuotaObservation, StopStrategy, WindowsProviderProbeRunner,
 };
 use crate::providers::capabilities::{
-    CapabilityEvidence, CapabilityEvidenceError, CapabilitySupport, EvidenceSourceId,
-    EvidenceStatus, ProviderAuthState, ProviderCapabilities, ProviderCapabilitiesError,
-    ProviderCapability, ProviderExecutableHandle, ProviderExecutablePolicy, ProviderKind,
-    ProviderVersion, ProviderVersionError,
+    CapabilityEvidence, CapabilitySupport, EvidenceSourceId, EvidenceStatus, ProviderAuthState,
+    ProviderCapabilities, ProviderCapabilitiesError, ProviderCapability, ProviderExecutableHandle,
+    ProviderExecutablePolicy, ProviderKind, ProviderVersion, ProviderVersionError,
 };
 use async_trait::async_trait;
 use std::sync::{Arc, Mutex};
@@ -332,8 +331,8 @@ mod tests {
     use crate::providers::adapter::{
         LaunchProviderRequest, ProviderProbeRequest, ProviderProbeResult,
     };
-    use crate::providers::capabilities::ProviderExecutable;
-    use std::path::PathBuf;
+    use crate::providers::capabilities::{ProviderExecutable, ProviderExecutableHandle};
+    use std::path::{Path, PathBuf};
 
     const PINNED_VERSION: &[u8] =
         include_bytes!("../../tests/fixtures/providers/cursor/version.txt");
@@ -348,15 +347,17 @@ mod tests {
         ProviderExecutable::new(PathBuf::from("C:/bin/cursor-agent"), [0x44; 32]).unwrap()
     }
 
+    fn cursor_handle() -> ProviderExecutableHandle {
+        cursor_executable().open_for_launch().unwrap()
+    }
+
     #[tokio::test]
     async fn cursor_probe_from_pinned_fixtures_keeps_interactive_terminal_first_class() {
         let adapter = pinned_adapter();
         assert_eq!(adapter.kind(), ProviderKind::Cursor);
 
-        let capabilities = adapter
-            .probe(Path::new("C:/bin/cursor-agent"))
-            .await
-            .unwrap();
+        let executable = cursor_handle();
+        let capabilities = adapter.probe(&executable).await.unwrap();
 
         assert_eq!(capabilities.kind, ProviderKind::Cursor);
         assert_eq!(capabilities.version.as_str(), "2026.08.09-docs-pinned");
@@ -385,7 +386,7 @@ mod tests {
     fn cursor_build_launch_requires_supported_observation() {
         let adapter = pinned_adapter();
         let before_probe =
-            adapter.build_launch(LaunchProviderRequest::new(cursor_executable(), None, None));
+            adapter.build_launch(LaunchProviderRequest::new(cursor_handle(), None, None));
         assert!(matches!(
             before_probe,
             Err(ProviderError::UnsupportedCapability(
@@ -397,11 +398,9 @@ mod tests {
     #[tokio::test]
     async fn cursor_build_launch_is_bare_interactive_and_resume_is_typed_failure() {
         let adapter = pinned_adapter();
-        let executable = cursor_executable();
-        adapter
-            .probe(Path::new("C:/bin/cursor-agent"))
-            .await
-            .unwrap();
+        let executable = cursor_handle();
+        let probe_executable = cursor_handle();
+        adapter.probe(&probe_executable).await.unwrap();
 
         let fresh = adapter
             .build_launch(LaunchProviderRequest::new(executable.clone(), None, None))
@@ -430,15 +429,13 @@ mod tests {
             b"Usage: agent --print\nPrint responses (non-interactive; not a TTY session)\n",
             OBSERVED_AT,
         );
-        let capabilities = adapter
-            .probe(Path::new("C:/bin/cursor-agent"))
-            .await
-            .unwrap();
+        let executable = cursor_handle();
+        let capabilities = adapter.probe(&executable).await.unwrap();
         assert_eq!(capabilities.build_launch, CapabilitySupport::Unknown);
         assert_eq!(capabilities.exact_resume, CapabilitySupport::Unsupported);
         assert_eq!(capabilities.auth_state, ProviderAuthState::Unknown);
         assert!(matches!(
-            adapter.build_launch(LaunchProviderRequest::new(cursor_executable(), None, None)),
+            adapter.build_launch(LaunchProviderRequest::new(cursor_handle(), None, None)),
             Err(ProviderError::UnsupportedCapability(
                 ProviderCapability::BuildLaunch
             ))
@@ -452,10 +449,8 @@ mod tests {
             b"agent session interactive words without the pinned default surface\n",
             OBSERVED_AT,
         );
-        let capabilities = adapter
-            .probe(Path::new("C:/bin/cursor-agent"))
-            .await
-            .unwrap();
+        let executable = cursor_handle();
+        let capabilities = adapter.probe(&executable).await.unwrap();
         assert_eq!(capabilities.build_launch, CapabilitySupport::Unknown);
     }
 
@@ -474,7 +469,8 @@ mod tests {
     #[tokio::test]
     async fn cursor_nonzero_probe_status_is_rejected() {
         let adapter = CursorAdapter::from_test_runner(Arc::new(NonZeroProbeRunner));
-        let result = adapter.probe(Path::new("C:/bin/cursor-agent")).await;
+        let executable = cursor_handle();
+        let result = adapter.probe(&executable).await;
         assert!(matches!(
             result,
             Err(ProviderError::Probe(ProviderProbeError::NonZeroExit(_)))
@@ -496,7 +492,8 @@ mod tests {
     #[tokio::test]
     async fn cursor_oversize_probe_is_rejected() {
         let adapter = CursorAdapter::from_test_runner(Arc::new(OversizeProbeRunner));
-        let result = adapter.probe(Path::new("C:/bin/cursor-agent")).await;
+        let executable = cursor_handle();
+        let result = adapter.probe(&executable).await;
         assert!(matches!(
             result,
             Err(ProviderError::Probe(ProviderProbeError::OutputTooLarge))
@@ -507,7 +504,8 @@ mod tests {
     async fn cursor_lossy_help_utf8_is_rejected() {
         let adapter =
             CursorAdapter::from_pinned_probes(PINNED_VERSION, b"\xff\xfe not utf-8", OBSERVED_AT);
-        let result = adapter.probe(Path::new("C:/bin/cursor-agent")).await;
+        let executable = cursor_handle();
+        let result = adapter.probe(&executable).await;
         assert!(matches!(
             result,
             Err(ProviderError::MalformedVersion(

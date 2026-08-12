@@ -16,7 +16,7 @@ use crate::domain::canonical;
 use crate::domain::event::Event;
 use crate::domain::id::{
     AgentSessionId, ArtifactId, ClientId, CommandId, EnvironmentId, EventId, OperationId,
-    ProjectId, ResourceId, ServiceId, TaskId, TurnId,
+    ProjectId, ResourceId, TaskId, TurnId,
 };
 use crate::domain::provider_input::{
     validate_action_nested_ids, PresentProviderApprovalIntent, PresentProviderQuestionIntent,
@@ -1263,7 +1263,9 @@ pub enum ServiceControlAction {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServiceControlIntent {
-    pub service_id: ServiceId,
+    /// Configured-service catalog identifier. The host validates this bounded
+    /// wire value into `services::model::ServiceId` before supervisor use.
+    pub service_id: String,
     pub resource_generation: u64,
     pub connection_epoch: u64,
     pub action_epoch: u64,

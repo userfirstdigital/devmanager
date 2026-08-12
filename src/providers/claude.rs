@@ -928,7 +928,6 @@ mod tests {
     use super::*;
     use crate::providers::adapter::{ProviderProbeKind, ProviderProbeResult};
     use crate::providers::registry::{ProviderDiscoveryConfig, ProviderRegistry};
-    use std::path::Path;
     use tempfile::tempdir;
 
     fn fixture(name: &str) -> &'static [u8] {
@@ -954,6 +953,13 @@ mod tests {
             }
             _ => panic!("unknown Claude fixture {name}"),
         }
+    }
+
+    fn fixture_handle() -> ProviderExecutableHandle {
+        ProviderExecutable::new(r"C:\bin\claude.exe", [0x11; 32])
+            .expect("executable")
+            .open_for_launch()
+            .expect("launch handle")
     }
 
     struct FixtureProbeRunner {
@@ -1016,10 +1022,8 @@ mod tests {
         let adapter = ClaudeCodeAdapter::with_clock(FixtureProbeRunner::authenticated(), || {
             1_700_000_000_100
         });
-        let capabilities = adapter
-            .probe(Path::new(r"C:\bin\claude.exe"))
-            .await
-            .expect("fixture probe");
+        let executable = fixture_handle();
+        let capabilities = adapter.probe(&executable).await.expect("fixture probe");
         assert_eq!(capabilities.kind, ProviderKind::ClaudeCode);
         assert_eq!(capabilities.version.as_str(), "2.0.72 (Claude Code)");
         assert_eq!(
@@ -1046,10 +1050,8 @@ mod tests {
         ] {
             let adapter =
                 ClaudeCodeAdapter::with_clock(FixtureProbeRunner::auth(body), || 1_700_000_000_100);
-            let capabilities = adapter
-                .probe(Path::new(r"C:\bin\claude.exe"))
-                .await
-                .unwrap();
+            let executable = fixture_handle();
+            let capabilities = adapter.probe(&executable).await.unwrap();
             assert_eq!(capabilities.auth_state, expected, "{body:?}");
             assert_ne!(
                 capabilities.auth_state,
@@ -1063,8 +1065,9 @@ mod tests {
             auth_stderr: fixture("auth_authenticated"),
             fail: None,
         });
+        let executable = fixture_handle();
         let capabilities = ClaudeCodeAdapter::with_clock(stderr_only, || 1_700_000_000_100)
-            .probe(Path::new(r"C:\bin\claude.exe"))
+            .probe(&executable)
             .await
             .unwrap();
         assert_ne!(
@@ -1081,8 +1084,9 @@ mod tests {
             auth_stderr: b"",
             fail: None,
         });
+        let executable = fixture_handle();
         let error = ClaudeCodeAdapter::with_clock(nonzero, || 1_700_000_000_100)
-            .probe(Path::new(r"C:\bin\claude.exe"))
+            .probe(&executable)
             .await
             .expect_err("nonzero auth must not mint evidence");
         assert!(matches!(
@@ -1096,8 +1100,9 @@ mod tests {
             auth_stderr: b"",
             fail: Some(ProviderProbeError::TimedOut),
         });
+        let executable = fixture_handle();
         let error = ClaudeCodeAdapter::with_clock(timed_out, || 1_700_000_000_100)
-            .probe(Path::new(r"C:\bin\claude.exe"))
+            .probe(&executable)
             .await
             .expect_err("timeout must not mint evidence");
         assert!(matches!(

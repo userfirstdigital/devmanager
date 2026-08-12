@@ -897,7 +897,7 @@ pub fn service_control_command(
         issued_at_ms,
         expected_task_revision: None,
         command: Command::ServiceControl(ServiceControlIntent {
-            service_id: args.service_id,
+            service_id: args.service_id.as_str().to_owned(),
             resource_generation: args.resource_generation,
             connection_epoch: args.connection_epoch,
             action_epoch: args.action_epoch,
@@ -928,9 +928,10 @@ mod tests {
                 ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity,
                 WorkspaceRef,
             },
-            ClientId, CommandId, EnvironmentId, ProjectId, RequestId, ServiceId, TaskId,
+            ClientId, CommandId, EnvironmentId, ProjectId, RequestId, TaskId,
         },
         protocol::Capability,
+        services::model::ServiceId,
     };
 
     #[test]
@@ -1050,7 +1051,7 @@ mod tests {
         let Command::ServiceControl(intent) = envelope.command else {
             panic!("service action must build ServiceControl");
         };
-        assert_eq!(intent.service_id, service_id);
+        assert_eq!(intent.service_id, service_id.as_str());
         assert_eq!(intent.resource_generation, 1);
         assert_eq!(intent.connection_epoch, 2);
         assert_eq!(intent.action_epoch, 3);
