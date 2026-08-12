@@ -1,5 +1,6 @@
 #[cfg(target_os = "windows")]
 fn main() {
+    emit_preview_build_identity();
     validate_web_bundle();
     use winresource::{VersionInfo, WindowsResource};
 
@@ -28,7 +29,20 @@ fn main() {
 
 #[cfg(not(target_os = "windows"))]
 fn main() {
+    emit_preview_build_identity();
     validate_web_bundle();
+}
+
+fn emit_preview_build_identity() {
+    let identity = std::env::var("DEV_MANAGER_PREVIEW_BUILD_IDENTITY")
+        .unwrap_or_else(|_| "unbound".to_string());
+    if identity != "unbound"
+        && (identity.len() != 64 || !identity.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    {
+        panic!("DEV_MANAGER_PREVIEW_BUILD_IDENTITY must be a 64-character hexadecimal digest");
+    }
+    println!("cargo:rustc-env=DEV_MANAGER_PREVIEW_BUILD_IDENTITY={identity}");
+    println!("cargo:rerun-if-env-changed=DEV_MANAGER_PREVIEW_BUILD_IDENTITY");
 }
 
 const WEB_BUNDLE_RECOVERY: &str = "npm --prefix web ci && npm --prefix web run build";

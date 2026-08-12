@@ -1,6 +1,5 @@
-use crate::state::{
-    aggregate_memory_snapshots, ResourceMemoryTotal, ResourceMetricValueState, RuntimeState,
-};
+use crate::state::RuntimeState;
+use crate::ui::task_cockpit::TopBarModel;
 use crate::updater::{UpdaterSnapshot, UpdaterStage};
 use crate::{icons, theme};
 use gpui::{
@@ -42,11 +41,6 @@ pub struct RemoteStatusBarModel {
     pub tertiary_action: Option<StatusBarQuickAction>,
 }
 
-pub struct QuotaStatus {
-    pub provider: &'static str,
-    pub detail: String,
-}
-
 pub struct StatusBarActions<'a> {
     pub on_open_process_monitor:
         &'a dyn Fn() -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
@@ -67,11 +61,10 @@ pub fn render_status_bar(
     runtime: &RuntimeState,
     updater: &UpdaterSnapshot,
     remote: Option<&RemoteStatusBarModel>,
-    quotas: &[QuotaStatus],
+    _top_bar: &TopBarModel,
     actions: StatusBarActions<'_>,
 ) -> impl IntoElement {
-    let metrics = running_terminal_metrics(runtime);
-    let open_terminals = metrics.open_terminals;
+    let (open_terminals, total_memory_bytes) = running_terminal_metrics(runtime);
     let time_label = current_time_label();
     let update_content = render_updater_status(updater, &actions);
 
@@ -115,8 +108,8 @@ pub fn render_status_bar(
                         .text_color(rgb(theme::TEXT_DIM))
                         .child(icons::app_icon(icons::ACTIVITY, 10.0, theme::TEXT_DIM))
                         .child(SharedString::from(format!(
-                            "{}",
-                            format_running_memory(metrics.memory)
+                            "{} total memory",
+                            format_memory(total_memory_bytes)
                         )))
                 })),
         )
@@ -127,11 +120,6 @@ pub fn render_status_bar(
                 .gap(px(8.0))
                 .children(
                     remote.map(|remote| render_remote_status(remote, &actions).into_any_element()),
-                )
-                .children(
-                    quotas
-                        .iter()
-                        .map(|quota| render_ai_quota_status(quota).into_any_element()),
                 )
                 .child(update_content)
                 .child(
@@ -283,28 +271,6 @@ fn render_remote_status(
         )
 }
 
-fn render_ai_quota_status(quota: &QuotaStatus) -> impl IntoElement {
-    let color = match quota.provider {
-        "Claude" => theme::AI_DOT,
-        "Codex" => theme::SUCCESS_TEXT,
-        _ => theme::TEXT_SUBTLE,
-    };
-
-    div()
-        .px(px(6.0))
-        .py(px(1.0))
-        .rounded_full()
-        .bg(rgb(theme::STATUS_BAR_BG))
-        .border_1()
-        .border_color(rgb(theme::BORDER_PRIMARY))
-        .text_xs()
-        .text_color(rgb(color))
-        .child(SharedString::from(format!(
-            "{}: {}",
-            quota.provider, quota.detail
-        )))
-}
-
 fn render_status_bar_transport_toggle(
     toggle: &StatusBarTransportToggle,
     handler: Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
@@ -429,52 +395,17 @@ fn updater_status_label(updater: &UpdaterSnapshot) -> Option<String> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct RunningTerminalMetrics {
-    open_terminals: usize,
-    memory: ResourceMemoryTotal,
-}
-
-fn running_terminal_metrics(runtime: &RuntimeState) -> RunningTerminalMetrics {
-    let open_terminals = runtime
+fn running_terminal_metrics(runtime: &RuntimeState) -> (usize, u64) {
+    runtime
         .sessions
         .values()
         .filter(|session| session.status.is_live())
-        .count();
-    let memory = aggregate_memory_snapshots(
-        runtime
-            .sessions
-            .values()
-            .filter(|session| session.status.is_live())
-            .map(|session| &session.resources),
-    );
-    RunningTerminalMetrics {
-        open_terminals,
-        memory,
-    }
-}
-
-fn format_running_memory(memory: ResourceMemoryTotal) -> String {
-    match memory.value_state {
-        ResourceMetricValueState::Observed => format!(
-            "{} total {}",
-            format_memory(memory.bytes),
-            memory.metric.label()
-        ),
-        ResourceMetricValueState::Partial => format!(
-            "{} current {} (partial)",
-            format_memory(memory.bytes),
-            memory.metric.label()
-        ),
-        ResourceMetricValueState::LastKnown => format!(
-            "{} {} (last known)",
-            format_memory(memory.bytes),
-            memory.metric.label()
-        ),
-        ResourceMetricValueState::Unavailable => {
-            format!("{} unavailable", memory.metric.label())
-        }
-    }
+        .fold((0, 0), |(count, memory), session| {
+            (
+                count + 1,
+                memory.saturating_add(session.resources.memory_bytes),
+            )
+        })
 }
 
 fn format_memory(bytes: u64) -> String {
@@ -504,7 +435,7 @@ fn plural(count: usize) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_running_memory, running_terminal_metrics, updater_status_label};
+    use super::{running_terminal_metrics, updater_status_label};
     use crate::state::{
         ResourceSnapshot, RuntimeState, ServerLaunchSpec, SessionDimensions, SessionRuntimeState,
         SessionStatus,
@@ -528,8 +459,6 @@ mod tests {
         shell.status = SessionStatus::Running;
         shell.resources = ResourceSnapshot {
             memory_bytes: 32,
-            memory_metric: crate::state::ResourceMemoryMetric::PrivateCommitted,
-            memory_value_state: crate::state::ResourceMetricValueState::Observed,
             ..Default::default()
         };
 
@@ -543,19 +472,15 @@ mod tests {
         server.configure_server(ServerLaunchSpec {
             command_id: "cmd-1".to_string(),
             project_id: "project-1".to_string(),
-            port: None,
             cwd: PathBuf::from("."),
             program: "cmd".to_string(),
             args: Vec::new(),
             env: HashMap::new(),
             auto_restart: false,
-            port: None,
             log_file_path: None,
         });
         server.resources = ResourceSnapshot {
             memory_bytes: 64,
-            memory_metric: crate::state::ResourceMemoryMetric::PrivateCommitted,
-            memory_value_state: crate::state::ResourceMetricValueState::Observed,
             ..Default::default()
         };
 
@@ -575,50 +500,7 @@ mod tests {
         runtime.sessions.insert(server.session_id.clone(), server);
         runtime.sessions.insert(stopped.session_id.clone(), stopped);
 
-        let metrics = running_terminal_metrics(&runtime);
-        assert_eq!(metrics.open_terminals, 2);
-        assert_eq!(metrics.memory.bytes, 96);
-        assert_eq!(
-            metrics.memory.value_state,
-            crate::state::ResourceMetricValueState::Observed
-        );
-        assert!(format_running_memory(metrics.memory).contains("private committed"));
-    }
-
-    #[test]
-    fn chrome_memory_total_excludes_last_known_values_from_current_total() {
-        let mut runtime = RuntimeState::new(false);
-        for (id, bytes, state) in [
-            (
-                "current",
-                64,
-                crate::state::ResourceMetricValueState::Observed,
-            ),
-            (
-                "stale",
-                128,
-                crate::state::ResourceMetricValueState::LastKnown,
-            ),
-        ] {
-            let mut session = SessionRuntimeState::new(
-                id,
-                PathBuf::from("."),
-                crate::state::SessionDimensions::default(),
-                TerminalBackend::PortablePtyFeedingAlacritty,
-            );
-            session.status = SessionStatus::Running;
-            session.resources.memory_bytes = bytes;
-            session.resources.memory_value_state = state;
-            runtime.sessions.insert(id.to_string(), session);
-        }
-
-        let metrics = running_terminal_metrics(&runtime);
-        assert_eq!(metrics.memory.bytes, 64);
-        assert_eq!(
-            metrics.memory.value_state,
-            crate::state::ResourceMetricValueState::Partial
-        );
-        assert!(format_running_memory(metrics.memory).contains("partial"));
+        assert_eq!(running_terminal_metrics(&runtime), (2, 96));
     }
 
     #[test]

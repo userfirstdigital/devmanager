@@ -1,0 +1,13 @@
+{
+  "schema": "devmanager.ui.preview/v1",
+  "id": "theme-gallery",
+  "title": "Theme Gallery",
+  "capture": {
+    "cursor": "excluded",
+    "border": "excluded"
+  },
+  "root": {
+    "kind": "minimal",
+    "label": "DevManager native preview"
+  }
+}

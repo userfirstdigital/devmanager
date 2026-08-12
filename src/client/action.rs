@@ -35,6 +35,24 @@ pub const ACTION_TASK_CREATE: &str = "task.create";
 pub const ACTION_TASK_CREATE_V2: &str = "task.create.v2";
 /// Stable id for renaming one Task through the host command boundary.
 pub const ACTION_TASK_RENAME: &str = "task.rename";
+/// Reserved Phase 4.7 id. Not registered in `ACTIONS` until the host command exists.
+pub const ACTION_TASK_SEND_NOW: &str = "task.send_now";
+/// Reserved Phase 4.7 id. Not registered in `ACTIONS` until the host command exists.
+pub const ACTION_TASK_STEER_CURRENT_TURN: &str = "task.steer_current_turn";
+/// Reserved Phase 4.7 id. Not registered in `ACTIONS` until the host command exists.
+pub const ACTION_TASK_QUEUE_FOLLOW_UP: &str = "task.queue_follow_up";
+/// Reserved Phase 4.7 id. Not registered in `ACTIONS` until the host command exists.
+pub const ACTION_TASK_ANSWER_QUESTION: &str = "task.answer_question";
+/// Reserved Phase 4.7 id. Not registered in `ACTIONS` until the host command exists.
+pub const ACTION_TASK_RESOLVE_APPROVAL: &str = "task.resolve_approval";
+/// Reserved Phase 4.7 id. Not registered in `ACTIONS` until the host command exists.
+pub const ACTION_TASK_STOP_TURN: &str = "task.stop_turn";
+/// Reserved Phase 4.7 id. Not registered in `ACTIONS` until the host command exists.
+pub const ACTION_TASK_SAVE_COMPOSER_DRAFT: &str = "task.save_composer_draft";
+/// Reserved Phase 4.7 id. Not registered in `ACTIONS` until the host command exists.
+pub const ACTION_TASK_STAGE_COMPOSER_ATTACHMENT: &str = "task.stage_composer_attachment";
+/// Reserved Phase 4.7 id. Not registered in `ACTIONS` until the host command exists.
+pub const ACTION_TASK_REMOVE_COMPOSER_ATTACHMENT: &str = "task.remove_composer_attachment";
 
 /// Where an action applies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -196,9 +214,46 @@ pub struct TaskRenameArguments {
     pub title: String,
 }
 
+/// A presentational client request backed by one of the closed catalog entries.
+///
+/// Components may emit this value, but they do not turn it into a transport
+/// operation. The client boundary remains responsible for adding request and
+/// command identity before sending it to the host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActionRequest {
+    HostActions,
+    HostStatus,
+    TaskList,
+    TaskShow { task_id: TaskId },
+    TaskCreate(TaskCreateArguments),
+    TaskRename(TaskRenameArguments),
+}
+
+impl ActionRequest {
+    pub const fn id(&self) -> &'static str {
+        match self {
+            Self::HostActions => ACTION_HOST_ACTIONS,
+            Self::HostStatus => ACTION_HOST_STATUS,
+            Self::TaskList => ACTION_TASK_LIST,
+            Self::TaskShow { .. } => ACTION_TASK_SHOW,
+            Self::TaskCreate(_) => ACTION_TASK_CREATE,
+            Self::TaskRename(_) => ACTION_TASK_RENAME,
+        }
+    }
+
+    pub fn descriptor(&self) -> &'static ActionDescriptor {
+        descriptor(self.id()).expect("every ActionRequest must have a catalog descriptor")
+    }
+}
+
 /// Return the closed catalog for this slice.
 pub fn catalog() -> &'static [ActionDescriptor] {
     ACTIONS
+}
+
+/// Resolve one stable action id through the single shared catalog.
+pub fn descriptor(id: &str) -> Option<&'static ActionDescriptor> {
+    catalog().iter().find(|action| action.id == id)
 }
 
 /// Fail when two descriptors share a stable id.
