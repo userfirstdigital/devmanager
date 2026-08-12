@@ -1605,6 +1605,30 @@ mod tests {
                         ActionArgumentSchema::TaskCockpitV1,
                         Some(Capability::ProviderInput),
                     ),
+                    ACTION_PROMPT_METADATA_PAGE => (
+                        ActionScope::Host,
+                        ActionRisk::ReadOnly,
+                        ActionArgumentSchema::PromptMetadataPageV1,
+                        Some(Capability::PromptProjection),
+                    ),
+                    ACTION_PROMPT_VERSION_PAGE => (
+                        ActionScope::Host,
+                        ActionRisk::ReadOnly,
+                        ActionArgumentSchema::PromptVersionPageV1,
+                        Some(Capability::PromptProjection),
+                    ),
+                    ACTION_PROMPT_DIFF => (
+                        ActionScope::Host,
+                        ActionRisk::ReadOnly,
+                        ActionArgumentSchema::PromptDiffV1,
+                        Some(Capability::PromptProjection),
+                    ),
+                    ACTION_PROMPT_CHAIN_PAGE => (
+                        ActionScope::Host,
+                        ActionRisk::ReadOnly,
+                        ActionArgumentSchema::PromptChainPageV1,
+                        Some(Capability::PromptProjection),
+                    ),
                     ACTION_SERVICE_START | ACTION_SERVICE_STOP | ACTION_SERVICE_RESTART => (
                         ActionScope::Host,
                         ActionRisk::Mutating,
