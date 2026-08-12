@@ -5898,8 +5898,11 @@ impl NativeShell {
                     loop {
                         Timer::after(CONTROLLER_TICK_INTERVAL).await;
                         if this
-                            .update(&mut async_cx, |shell, _cx| {
+                            .update(&mut async_cx, |shell, cx| {
                                 shell.controller_tick(MAX_PENDING_HOST_ACTIONS);
+                                if shell.exit_after_update {
+                                    cx.quit();
+                                }
                             })
                             .is_err()
                         {
