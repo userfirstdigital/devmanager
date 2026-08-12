@@ -17,9 +17,11 @@ pub use action::{
     action_enabled_with_service_state, catalog, cockpit_surface_descriptors, require_unique_ids,
     service_action_disabled_reason, service_control_command, service_control_command_with_task,
     task_cockpit_query, task_show_query, ActionDescriptor, ActionRisk, ActionScope,
-    CockpitSurfaceAccess, CockpitSurfaceDescriptor, CockpitSurfaceKind, ServiceControlActionError,
+    BrowserActionRequest, CockpitSurfaceAccess, CockpitSurfaceDescriptor, CockpitSurfaceKind,
+    ServiceControlActionError,
     ServiceControlArguments, ACTION_FILES_LIST, ACTION_FILES_READ, ACTION_GIT_STATUS,
-    ACTION_HOST_ACTIONS, ACTION_HOST_STATUS, ACTION_SERVICE_HEALTH, ACTION_SERVICE_LOGS,
+    ACTION_BROWSER_NATIVE, ACTION_HOST_ACTIONS, ACTION_HOST_STATUS, ACTION_SERVICE_HEALTH,
+    ACTION_SERVICE_LOGS,
     ACTION_SERVICE_RESTART, ACTION_SERVICE_START, ACTION_SERVICE_STOP, ACTION_SSH_STATUS,
     ACTION_TASK_SHOW, ACTION_WORKSPACE_STATUS,
 };

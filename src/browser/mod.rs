@@ -88,7 +88,7 @@ pub use conformance::{
 pub use native_shell_controller::{
     BrowserGatewayBindingRef, BrowserNativeCallback, BrowserNativeCallbackKind,
     BrowserNativeControllerError, BrowserNativeDestination, BrowserNativeHostCommand,
-    BrowserNativeHostOutcome, BrowserNativeIdentity, BrowserNativeLease,
+    BrowserNativeHostOutcome, BrowserNativeIdentity, BrowserNativeLease, BrowserNativeLeaseFence,
     BrowserNativeShellController,
 };
 pub use downloads::{

@@ -45,7 +45,8 @@ use crate::browser::{
     BrowserResourceStore, BrowserResponse, BrowserRevision, BrowserRuntimeTarget,
     BrowserScreenshotMode, BrowserSnapshotSummary, BrowserStorageLayout, BrowserUploadResult,
     BrowserWaitResult, BrowserWorkflowCoordinator, BrowserWorkflowReviewMutation,
-    BrowserNativeHostCommand, BrowserNativeHostOutcome, BrowserWorkflowReviewProjection,
+    BrowserNativeHostCommand, BrowserNativeHostOutcome, BrowserNativeLeaseFence,
+    BrowserWorkflowReviewProjection,
     BrowserWorkspaceKey, BrowserWorkspaceSnapshot, MAX_BROWSER_ACTIONS, MAX_BROWSER_RECIPE_WAIT_MS,
 };
 use crate::domain::id::ClientId;
@@ -1078,6 +1079,7 @@ pub struct BrowserWebViewHost {
     pending_task_surface: Option<(BrowserWorkspaceKey, PreparedTaskSurface)>,
     task_surface_capture_active: bool,
     gateway_registrar: Option<BrowserGatewayRegistrar>,
+    native_shell_lease_fence: BrowserNativeLeaseFence,
     published_host_bindings: HashMap<BrowserViewKey, String>,
     projects: HashMap<String, BrowserProjectRuntime>,
     views: HashMap<BrowserViewKey, WebView>,
@@ -1201,6 +1203,7 @@ impl BrowserWebViewHost {
             pending_task_surface: None,
             task_surface_capture_active: false,
             gateway_registrar: None,
+            native_shell_lease_fence: BrowserNativeLeaseFence::default(),
             published_host_bindings: HashMap::new(),
             trusted_app_config_dir,
             projects: HashMap::new(),
@@ -1632,7 +1635,12 @@ impl BrowserWebViewHost {
         &mut self,
         command: &BrowserNativeHostCommand,
     ) -> Result<BrowserNativeHostOutcome, BrowserError> {
-        match command {
+        let lease = command.lease();
+        self.native_shell_lease_fence
+            .admit(lease)
+            .map_err(BrowserError::from)?;
+        let detach = matches!(command, BrowserNativeHostCommand::Detach { .. });
+        let result = match command {
             BrowserNativeHostCommand::Attach {
                 identity,
                 workspace_key,
@@ -1739,7 +1747,13 @@ impl BrowserWebViewHost {
                 self.clear_published_gateway_binding(&key);
                 Ok(BrowserNativeHostOutcome::Parked)
             }
+        };
+        if detach && result.is_ok() {
+            self.native_shell_lease_fence
+                .retire(lease)
+                .map_err(BrowserError::from)?;
         }
+        result
     }
 
     fn apply_controller_gateway_binding(

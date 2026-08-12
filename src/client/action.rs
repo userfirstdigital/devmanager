@@ -10,6 +10,7 @@ use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
+use crate::browser::BrowserNativeHostCommand;
 use crate::domain::cockpit::{TaskCockpitQuery, MAX_COCKPIT_FILE_LIST, MAX_COCKPIT_READ_BYTES};
 use crate::domain::command::{
     Command, CommandEnvelope, CreateTaskIntent, CreateTaskRequestIntent, RenameTaskIntent,
@@ -39,6 +40,10 @@ use crate::workspace::{WorkspaceError, WorkspaceRequest};
 pub const ACTION_HOST_ACTIONS: &str = "host.actions";
 /// Stable id for attaching and reporting host status.
 pub const ACTION_HOST_STATUS: &str = "host.status";
+/// Native Task Cockpit browser surface command. The command already carries
+/// the controller-issued identity and lease; this action never accepts raw
+/// HWNDs or an unbound Task id from presentation code.
+pub const ACTION_BROWSER_NATIVE: &str = "browser.native";
 /// Stable id for listing Tasks through the paged snapshot query boundary.
 pub const ACTION_TASK_LIST: &str = "task.list";
 /// Stable id for reading one Task through the host query boundary.
@@ -202,6 +207,16 @@ const ACTIONS: &[ActionDescriptor] = &[
         scope: ActionScope::Host,
         required_capability: None,
         risk: ActionRisk::ReadOnly,
+        argument_schema: ActionArgumentSchema::None,
+    },
+    ActionDescriptor {
+        id: ACTION_BROWSER_NATIVE,
+        title: "Browser surface",
+        description: "Attach, resize, focus, submit, or detach the exact Task-owned browser surface.",
+        keywords: &["browser", "webview", "surface", "attach"],
+        scope: ActionScope::Task,
+        required_capability: Some(Capability::BrowserProjection),
+        risk: ActionRisk::Mutating,
         argument_schema: ActionArgumentSchema::None,
     },
     ActionDescriptor {
@@ -375,6 +390,7 @@ pub struct TaskRenameArguments {
 pub enum ActionRequest {
     HostActions,
     HostStatus,
+    Browser(BrowserActionRequest),
     TaskList,
     TaskShow {
         task_id: TaskId,
@@ -401,6 +417,7 @@ impl ActionRequest {
         match self {
             Self::HostActions => ACTION_HOST_ACTIONS,
             Self::HostStatus => ACTION_HOST_STATUS,
+            Self::Browser(_) => ACTION_BROWSER_NATIVE,
             Self::TaskList => ACTION_TASK_LIST,
             Self::TaskShow { .. } => ACTION_TASK_SHOW,
             Self::TaskCreate(_) => ACTION_TASK_CREATE,
@@ -419,6 +436,21 @@ impl ActionRequest {
 
     pub fn descriptor(&self) -> &'static ActionDescriptor {
         descriptor(self.id()).expect("every ActionRequest must have a catalog descriptor")
+    }
+}
+
+/// Native-shell browser action backed by an already-admitted controller
+/// command. Keeping the command here lets keyboard/pointer paths share the
+/// same exact identity/lease fence as the host, while avoiding a second
+/// browser command vocabulary in the UI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowserActionRequest {
+    pub command: BrowserNativeHostCommand,
+}
+
+impl BrowserActionRequest {
+    pub fn task_id(&self) -> crate::domain::id::TaskId {
+        self.command.identity().task_id()
     }
 }
 

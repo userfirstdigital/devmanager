@@ -1030,23 +1030,51 @@ impl BrowserBook {
         self.tabs.get(&tab_id).map(|tab| tab.view(tab_id))
     }
 
+    /// Return the bounded browser identity projection retained by this book.
+    ///
+    /// Client projections use this instead of reaching into the private
+    /// context/tab maps, keeping browser identity assembly in the domain
+    /// boundary while preserving the durable generation and selected tab.
+    pub fn identity_snapshot(&self) -> BrowserIdentitySnapshot {
+        BrowserIdentitySnapshot {
+            contexts: self
+                .contexts
+                .iter()
+                .map(|(id, context)| context.view(*id))
+                .collect(),
+            tabs: self
+                .tabs
+                .iter()
+                .map(|(id, tab)| tab.view(*id))
+                .collect(),
+        }
+    }
+
     pub(crate) fn project_context_view(
         &mut self,
         view: &BrowserContextView,
     ) -> Result<(), BrowserContractError> {
         self.open_task(view.task_id)?;
-        self.apply_facts(&[BrowserDurableFact::ContextCreated {
-            context_id: view.context_id,
-            task_id: view.task_id,
-            generation: view.generation,
-        }])?;
-        if view.closed {
-            self.apply_facts(&[BrowserDurableFact::ContextClosed {
-                context_id: view.context_id,
+        if self.contexts.contains_key(&view.context_id) {
+            return Err(BrowserContractError::InvalidRequest);
+        }
+        if self.contexts.len() >= MAX_BROWSER_CONTEXTS {
+            return Err(BrowserContractError::BoundExceeded);
+        }
+        self.contexts.insert(
+            view.context_id,
+            ContextState {
                 task_id: view.task_id,
                 generation: view.generation,
-            }])?;
-        }
+                selected_tab_id: view.selected_tab_id,
+                health: view.health,
+                closed: view.closed,
+                permissions: view.permissions.clone(),
+                linked_artifacts: view.linked_artifacts.clone(),
+                recipe_id: view.recipe_id.clone(),
+                recording_id: view.recording_id.clone(),
+            },
+        );
         Ok(())
     }
 
@@ -1055,24 +1083,25 @@ impl BrowserBook {
         view: &BrowserTabView,
     ) -> Result<(), BrowserContractError> {
         self.open_task(view.task_id)?;
-        let url = view
-            .committed_url
-            .clone()
-            .unwrap_or_else(|| "https://example.invalid/".to_string());
-        self.apply_facts(&[BrowserDurableFact::TabOpened {
-            tab_id: view.tab_id,
-            context_id: view.context_id,
-            task_id: view.task_id,
-            kind: view.kind,
-            url,
-        }])?;
-        if view.closed {
-            self.apply_facts(&[BrowserDurableFact::TabClosed {
-                tab_id: view.tab_id,
+        let Some(context) = self.contexts.get(&view.context_id) else {
+            return Err(BrowserContractError::InvalidRequest);
+        };
+        if context.task_id != view.task_id || self.tabs.contains_key(&view.tab_id) {
+            return Err(BrowserContractError::InvalidRequest);
+        }
+        if self.tabs.len() >= MAX_BROWSER_TABS {
+            return Err(BrowserContractError::BoundExceeded);
+        }
+        self.tabs.insert(
+            view.tab_id,
+            TabState {
                 context_id: view.context_id,
                 task_id: view.task_id,
-            }])?;
-        }
+                kind: view.kind,
+                committed_url: view.committed_url.clone(),
+                closed: view.closed,
+            },
+        );
         Ok(())
     }
 

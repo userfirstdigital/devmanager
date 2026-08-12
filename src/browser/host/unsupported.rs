@@ -5,7 +5,8 @@ use super::super::{
     apply_browser_workflow_review_mutation, browser_workflow_review_projection,
     discard_browser_workflow_review, preview_browser_workflow_review, save_browser_workflow_review,
     BrowserBounds, BrowserGatewayRegistrar, BrowserHostControl, BrowserHostEvent,
-    BrowserNativeHostCommand, BrowserNativeHostOutcome, BrowserPageRecordingIpcError,
+    BrowserNativeHostCommand, BrowserNativeHostOutcome, BrowserNativeLeaseFence,
+    BrowserPageRecordingIpcError,
     BrowserPaneSurface, BrowserRecipeV1, BrowserRecordingError, BrowserRecordingInstance,
     BrowserRecordingReview, BrowserRecordingStatus, BrowserReplayRepairCleanupWork,
     BrowserWorkflowCoordinator, BrowserWorkflowReviewMutation, BrowserWorkflowReviewProjection,
@@ -124,6 +125,7 @@ pub struct BrowserWebViewHost {
     #[allow(dead_code)]
     state: BrowserHostState,
     workflow_coordinator: BrowserWorkflowCoordinator,
+    native_shell_lease_fence: BrowserNativeLeaseFence,
     native_window_lifetime: BrowserNativeWindowLifetime,
     _main_thread_only: PhantomData<Rc<()>>,
 }
@@ -137,6 +139,7 @@ impl BrowserWebViewHost {
             state: BrowserHostState::new(&app_config_dir)
                 .unwrap_or_else(|_| BrowserHostState::unavailable(&app_config_dir)),
             workflow_coordinator: BrowserWorkflowCoordinator::default(),
+            native_shell_lease_fence: BrowserNativeLeaseFence::default(),
             native_window_lifetime: BrowserNativeWindowLifetime::default(),
             _main_thread_only: PhantomData,
         }
@@ -152,6 +155,7 @@ impl BrowserWebViewHost {
             },
             state: BrowserHostState::unavailable(PathBuf::new()),
             workflow_coordinator: BrowserWorkflowCoordinator::default(),
+            native_shell_lease_fence: BrowserNativeLeaseFence::default(),
             native_window_lifetime: BrowserNativeWindowLifetime::default(),
             _main_thread_only: PhantomData,
         }
@@ -171,8 +175,17 @@ impl BrowserWebViewHost {
         &mut self,
         command: &BrowserNativeHostCommand,
     ) -> Result<BrowserNativeHostOutcome, BrowserError> {
+        let lease = command.lease();
+        self.native_shell_lease_fence
+            .admit(lease)
+            .map_err(BrowserError::from)?;
         match command {
-            BrowserNativeHostCommand::Detach { .. } => Ok(BrowserNativeHostOutcome::Idempotent),
+            BrowserNativeHostCommand::Detach { .. } => {
+                self.native_shell_lease_fence
+                    .retire(lease)
+                    .map_err(BrowserError::from)?;
+                Ok(BrowserNativeHostOutcome::Idempotent)
+            }
             _ => Err(unsupported_platform_error(std::env::consts::OS)),
         }
     }

@@ -1,10 +1,11 @@
 //! The real native Task Cockpit shell entrypoint and its isolated host seam.
 //!
 //! This module deliberately owns only a local projection. It does not open the
-//! installed profile, read the production session, start a legacy app, or
-//! embed a WebView. The host runtime supplies the immutable `ClientModel`; the
-//! task cockpit and terminal adapter consume that projection through the
-//! explicit seams below.
+//! installed profile, read the production session, or start a legacy app. The
+//! active shell talks to the one host-owned WebView authority through the
+//! controller/lease seam below; the host runtime supplies the immutable
+//! `ClientModel`, while the task cockpit and terminal adapter consume that
+//! projection.
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -32,7 +33,11 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::assets::AppAssets;
-use crate::client::action::{self, CockpitSurfaceKind, UpdaterAction};
+use crate::browser::{
+    BrowserError, BrowserNativeHostCommand, BrowserNativeHostOutcome, BrowserResponse,
+    BrowserWebViewHost,
+};
+use crate::client::action::{self, BrowserActionRequest, CockpitSurfaceKind, UpdaterAction};
 use crate::client::{
     ClientModel, ClientSubscription, HostClient, HostClientConfig, SubscriptionUpdate,
 };
@@ -1452,6 +1457,10 @@ impl NativeActionRecord {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NativeHostCommand {
     Envelope(crate::domain::command::CommandEnvelope),
+    /// UI-thread browser surface command. It is intentionally not serialized
+    /// through the generic host worker: the WebView host owns this exact
+    /// lease and must apply it on its GPUI/COM thread.
+    Browser(BrowserNativeHostCommand),
     TaskCreate {
         arguments: crate::client::action::TaskCreateArguments,
         command_id: CommandId,
@@ -1516,6 +1525,7 @@ pub enum NativeHostCommand {
 fn native_command_id(command: &NativeHostCommand) -> Option<CommandId> {
     match command {
         NativeHostCommand::Envelope(envelope) => Some(envelope.command_id),
+        NativeHostCommand::Browser(_) => None,
         NativeHostCommand::TaskCreate { command_id, .. }
         | NativeHostCommand::TaskRename { command_id, .. } => Some(*command_id),
         NativeHostCommand::ServiceControl { command_id, .. } => Some(*command_id),
@@ -3645,6 +3655,10 @@ async fn execute_native_command(
             .execute_command(envelope)
             .await
             .map(NativeHostExecutionResult::Command),
+        // BrowserNativeHostCommand is applied by the owning NativeShell host
+        // on the UI thread. It must never be downgraded into a generic IPC
+        // command or a fresh browser instance.
+        NativeHostCommand::Browser(_) => Err(IpcError::Unavailable),
         NativeHostCommand::TaskCreate {
             arguments,
             command_id,
@@ -4501,6 +4515,7 @@ impl NativeInteraction {
             ActionRequest::TaskRename(arguments) => Some(arguments.task_id),
             ActionRequest::ProviderInput(arguments) => Some(arguments.arguments.task_id),
             ActionRequest::TaskCockpit { task_id, .. } => Some(*task_id),
+            ActionRequest::Browser(arguments) => Some(arguments.task_id()),
             _ => None,
         };
         if request_task.is_some() && request_task != selected_task {
@@ -4577,6 +4592,9 @@ impl NativeInteraction {
                 command_id,
                 issued_at_ms,
             },
+            ActionRequest::Browser(BrowserActionRequest { command }) => {
+                NativeHostCommand::Browser(command.clone())
+            }
             ActionRequest::HostActions => NativeHostCommand::HostActionsQuery { request_id },
             ActionRequest::HostStatus => NativeHostCommand::HostStatusQuery { request_id },
             ActionRequest::TaskList => NativeHostCommand::TaskListQuery { request_id },
@@ -5163,6 +5181,10 @@ pub struct NativeShell {
     inbox: Inbox,
     task_list: TaskList,
     cockpit: TaskCockpitShell,
+    /// The one host-owned WebView2 authority used by the active GPUI shell.
+    /// Tests use the unsupported implementation so they never touch an
+    /// installed browser profile or create a real WebView.
+    browser_host: BrowserWebViewHost,
     prompt_library: PromptLibrarySession,
     services_projection: ServicesPanelProjection,
     interaction: NativeInteraction,
@@ -5192,6 +5214,13 @@ pub struct NativeShell {
 
 impl Drop for NativeShell {
     fn drop(&mut self) {
+        if self.cockpit.browser_projection().is_some() {
+            if let Ok(command) = self.cockpit.detach_browser_native() {
+                let _ = self.browser_host.apply_native_shell_command(&command);
+                self.cockpit.finish_browser_detach();
+            }
+        }
+        let _ = self.browser_host.drain_events();
         // Invalidate the transport before transferring any shell-owned action
         // into shutdown retention. Dropping the shell must never turn a
         // pending identity into a fresh Execute.
@@ -5393,6 +5422,7 @@ impl NativeShell {
             })
             .unwrap_or_default();
         interaction.sync_host_epochs(initial_epochs);
+        let browser_profile_root = profile.root().to_path_buf();
         let mut shell = Self {
             host_connection: profile.host_connection(),
             profile,
@@ -5404,6 +5434,16 @@ impl NativeShell {
             inbox,
             task_list,
             cockpit: TaskCockpitShell::new(DockEdge::Bottom),
+            browser_host: {
+                #[cfg(test)]
+                {
+                    BrowserWebViewHost::unavailable("native shell tests")
+                }
+                #[cfg(not(test))]
+                {
+                    BrowserWebViewHost::new(&browser_profile_root)
+                }
+            },
             prompt_library,
             services_projection,
             interaction,
@@ -5495,6 +5535,62 @@ impl NativeShell {
 
     pub fn last_query_detail(&self) -> Option<&str> {
         self.last_query_detail.as_deref()
+    }
+
+    pub fn browser_host_status(&self) -> crate::browser::BrowserHostStatus {
+        self.browser_host.status()
+    }
+
+    /// Apply a controller-admitted native command through the sole active
+    /// WebView host. This is the production call seam used by the native
+    /// action path; it never starts a second browser/window owner.
+    pub fn apply_browser_native_command(
+        &mut self,
+        command: &BrowserNativeHostCommand,
+    ) -> Result<BrowserNativeHostOutcome, BrowserError> {
+        let outcome = self.browser_host.apply_native_shell_command(command)?;
+        if matches!(command, BrowserNativeHostCommand::Detach { .. }) {
+            self.cockpit.finish_browser_detach();
+        }
+        self.forward_browser_host_events();
+        Ok(outcome)
+    }
+
+    /// Submit through the existing BrowserWebViewHost command authority after
+    /// the native lease fence has accepted the handoff. The GPUI window is
+    /// only borrowed for the owning WebView/COM thread call.
+    pub fn submit_browser_native_command(
+        &mut self,
+        window: &Window,
+        command: &BrowserNativeHostCommand,
+    ) -> Result<BrowserResponse, BrowserError> {
+        let outcome = self.browser_host.apply_native_shell_command(command)?;
+        if outcome != BrowserNativeHostOutcome::CommandHandoff {
+            return Err(BrowserError::InvalidInvocation {
+                field: "browserCommand".to_string(),
+            });
+        }
+        let workspace_key = command.workspace_key().ok_or_else(|| {
+            BrowserError::InvalidInvocation {
+                field: "workspaceKey".to_string(),
+            }
+        })?;
+        let browser_command = command.browser_command().ok_or_else(|| {
+            BrowserError::InvalidInvocation {
+                field: "browserCommand".to_string(),
+            }
+        })?;
+        let response = self
+            .browser_host
+            .handle_command(window, workspace_key, browser_command.clone())?;
+        self.forward_browser_host_events();
+        Ok(response)
+    }
+
+    fn forward_browser_host_events(&mut self) {
+        for event in self.browser_host.drain_events() {
+            let _ = self.cockpit.forward_browser_host_event(&event);
+        }
     }
 
     fn apply_query_body(&mut self, body: NativeHostQueryBody) {
@@ -6752,7 +6848,22 @@ impl NativeShell {
             progress: None,
             tab_labels,
             selected_tab: None,
-            diagnostic: Some(format!("{} browser tab(s)", view.tab_count)),
+            diagnostic: Some(format!(
+                "{} browser tab(s) · context={} · resource={} · agent={} · generation={}",
+                view.tab_count,
+                view.context_id
+                    .map(|id| id.to_string())
+                    .unwrap_or_else(|| "unbound".to_string()),
+                view.resource_id
+                    .map(|id| id.to_string())
+                    .unwrap_or_else(|| "unbound".to_string()),
+                view.agent_session_id
+                    .map(|id| id.to_string())
+                    .unwrap_or_else(|| "unbound".to_string()),
+                view.generation
+                    .map(|generation| generation.to_string())
+                    .unwrap_or_else(|| "unbound".to_string()),
+            )),
             approval: None,
             artifact_count: model.artifact_summaries().len(),
         })
@@ -7715,6 +7826,12 @@ impl NativeShell {
             return None;
         };
         let returned = record.clone();
+        if let NativeHostCommand::Browser(command) = record.command.clone() {
+            return match self.apply_browser_native_command(&command) {
+                Ok(_) => None,
+                Err(_) => Some(returned),
+            };
+        }
         match self.enqueue_host_action(record) {
             NativeHostActionResult::Queued => None,
             NativeHostActionResult::Disconnected
@@ -7748,6 +7865,12 @@ impl NativeShell {
             return None;
         };
         let returned = record.clone();
+        if let NativeHostCommand::Browser(command) = record.command.clone() {
+            return match self.apply_browser_native_command(&command) {
+                Ok(_) => None,
+                Err(_) => Some(returned),
+            };
+        }
         match self.enqueue_host_action(record) {
             NativeHostActionResult::Queued => None,
             NativeHostActionResult::Disconnected

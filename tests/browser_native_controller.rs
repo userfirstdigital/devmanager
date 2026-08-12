@@ -8,7 +8,8 @@ use devmanager::browser::{
     classify_visible_host_proof, unsupported_host_status, BrowserBounds, BrowserCommand,
     BrowserGatewayBindingRef, BrowserNativeCallback, BrowserNativeCallbackKind,
     BrowserNativeControllerError, BrowserNativeDestination, BrowserNativeHostCommand,
-    BrowserNativeIdentity, BrowserNativeShellController, BrowserVisibleHostProofClaim,
+    BrowserNativeIdentity, BrowserNativeLeaseFence, BrowserNativeShellController,
+    BrowserVisibleHostProofClaim,
     BrowserVisibleHostProofClass, BrowserWorkspaceKey, BROWSER_VISIBLE_WEBVIEW2_OPT_IN_ENV,
 };
 use devmanager::domain::{AgentSessionId, BrowserContextId, ResourceId, TaskId};
@@ -361,6 +362,42 @@ fn command_handoff_and_render_ops_require_the_live_lease() {
         controller.submit_command(&lease, navigate),
         Err(BrowserNativeControllerError::Detached)
     );
+}
+
+#[test]
+fn host_lease_fence_rejects_commands_from_a_replaced_binding() {
+    let controller = BrowserNativeShellController::supported();
+    let first = controller
+        .bind(
+            identity(),
+            workspace("project", "one"),
+            BrowserGatewayBindingRef::new("process-one"),
+        )
+        .expect("first bind");
+    let stale_command = controller
+        .bind_gateway(&first, &BrowserGatewayBindingRef::new("process-one"))
+        .expect("first gateway binding");
+    controller.detach(&first).expect("first detach");
+
+    let second = controller
+        .bind(
+            identity(),
+            workspace("project", "two"),
+            BrowserGatewayBindingRef::new("process-two"),
+        )
+        .expect("second bind");
+    let current_command = controller
+        .bind_gateway(&second, &BrowserGatewayBindingRef::new("process-two"))
+        .expect("second gateway binding");
+
+    let mut fence = BrowserNativeLeaseFence::default();
+    fence.admit(current_command.lease()).expect("current lease");
+    assert_eq!(
+        fence.admit(stale_command.lease()),
+        Err(BrowserNativeControllerError::StaleGeneration)
+    );
+    fence.retire(current_command.lease()).expect("retire current");
+    assert_eq!(fence.current(), None);
 }
 
 #[test]

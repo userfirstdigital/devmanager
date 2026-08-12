@@ -113,6 +113,52 @@ impl BrowserNativeLease {
     }
 }
 
+/// Host-side fence for commands crossing the NativeShell/WebView boundary.
+///
+/// The controller is the authority that mints a lease, but the host must also
+/// remember the lease it admitted.  Without this small second fence a command
+/// that was queued before a detach/rebind could still reach the WebView host
+/// after a new task surface had become current.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BrowserNativeLeaseFence {
+    current: Option<BrowserNativeLease>,
+}
+
+impl BrowserNativeLeaseFence {
+    /// Admit the first lease or the exact lease already owned by the host.
+    /// Any other generation/token is stale and must not reach host state.
+    pub fn admit(
+        &mut self,
+        lease: BrowserNativeLease,
+    ) -> Result<(), BrowserNativeControllerError> {
+        match self.current {
+            None => {
+                self.current = Some(lease);
+                Ok(())
+            }
+            Some(current) if current == lease => Ok(()),
+            Some(current) if current.generation != lease.generation => {
+                Err(BrowserNativeControllerError::StaleGeneration)
+            }
+            Some(_) => Err(BrowserNativeControllerError::StaleLease),
+        }
+    }
+
+    /// Retire only the lease currently owned by the host.
+    pub fn retire(
+        &mut self,
+        lease: BrowserNativeLease,
+    ) -> Result<(), BrowserNativeControllerError> {
+        self.admit(lease)?;
+        self.current = None;
+        Ok(())
+    }
+
+    pub fn current(&self) -> Option<BrowserNativeLease> {
+        self.current
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BrowserNativeDestination {
     raw: u64,
@@ -243,6 +289,8 @@ pub enum BrowserNativeHostCommand {
     SubmitCommand {
         lease: BrowserNativeLease,
         identity: BrowserNativeIdentity,
+        workspace_key: BrowserWorkspaceKey,
+        gateway: BrowserGatewayBindingRef,
         command: BrowserCommand,
     },
     Resize {
@@ -261,6 +309,61 @@ pub enum BrowserNativeHostCommand {
         workspace_key: BrowserWorkspaceKey,
         gateway: BrowserGatewayBindingRef,
     },
+}
+
+impl BrowserNativeHostCommand {
+    pub fn lease(&self) -> BrowserNativeLease {
+        match self {
+            Self::Attach { lease, .. }
+            | Self::Reattach { lease, .. }
+            | Self::BindGateway { lease, .. }
+            | Self::SubmitCommand { lease, .. }
+            | Self::Resize { lease, .. }
+            | Self::Focus { lease, .. }
+            | Self::Detach { lease, .. } => *lease,
+        }
+    }
+
+    pub fn identity(&self) -> BrowserNativeIdentity {
+        match self {
+            Self::Attach { identity, .. }
+            | Self::Reattach { identity, .. }
+            | Self::BindGateway { identity, .. }
+            | Self::SubmitCommand { identity, .. }
+            | Self::Resize { identity, .. }
+            | Self::Focus { identity, .. }
+            | Self::Detach { identity, .. } => *identity,
+        }
+    }
+
+    pub fn workspace_key(&self) -> Option<&BrowserWorkspaceKey> {
+        match self {
+            Self::Attach { workspace_key, .. }
+            | Self::Reattach { workspace_key, .. }
+            | Self::BindGateway { workspace_key, .. }
+            | Self::SubmitCommand { workspace_key, .. }
+            | Self::Detach { workspace_key, .. } => Some(workspace_key),
+            Self::Resize { .. } | Self::Focus { .. } => None,
+        }
+    }
+
+    pub fn gateway(&self) -> Option<&BrowserGatewayBindingRef> {
+        match self {
+            Self::Attach { gateway, .. }
+            | Self::Reattach { gateway, .. }
+            | Self::BindGateway { gateway, .. }
+            | Self::SubmitCommand { gateway, .. }
+            | Self::Detach { gateway, .. } => Some(gateway),
+            Self::Resize { .. } | Self::Focus { .. } => None,
+        }
+    }
+
+    pub fn browser_command(&self) -> Option<&BrowserCommand> {
+        match self {
+            Self::SubmitCommand { command, .. } => Some(command),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -547,6 +650,8 @@ impl BrowserNativeShellController {
         Ok(BrowserNativeHostCommand::SubmitCommand {
             lease: current.lease,
             identity: current.identity,
+            workspace_key: current.workspace_key.clone(),
+            gateway: current.gateway.clone(),
             command,
         })
     }

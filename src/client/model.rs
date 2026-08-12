@@ -13,10 +13,11 @@ use crate::domain::agent::AgentSessionFacts;
 use crate::domain::artifact::ArtifactSummary;
 use crate::domain::event::{apply, DomainEvent, Event};
 use crate::domain::id::{
-    AgentSessionId, ArtifactId, OperationId, ResourceId, SnapshotId, SubscriptionId, TaskId,
+    AgentSessionId, ArtifactId, BrowserContextId, OperationId, ResourceId, SnapshotId,
+    SubscriptionId, TaskId,
 };
 use crate::domain::operation::{OperationFacts, OperationState};
-use crate::domain::resource::{OwnerKind, ResourceFacts};
+use crate::domain::resource::{OwnerKind, ResourceFacts, ResourceKind};
 use crate::domain::snapshot::{
     EventPage, SnapshotItem, SnapshotPage, SnapshotSection, TaskSnapshot, TaskSnapshotItem,
 };
@@ -1202,15 +1203,44 @@ impl ClientModel {
     /// Native dock chrome may read Task identity from the client model.
     /// This is not a BrowserService settle path and carries no HWND/pixels.
     pub fn browser_dock_view(&self, task_id: TaskId) -> Option<ClientBrowserDockView> {
-        self.tasks
-            .get(&task_id)
-            .map(|snapshot| ClientBrowserDockView {
-                task_id,
-                title: snapshot.task.title.clone(),
-                generation: None,
-                shareable_url: None,
-                tab_count: 0,
+        let snapshot = self.tasks.get(&task_id)?;
+        let browser = snapshot.browser.identity_snapshot();
+        let context = browser
+            .contexts
+            .iter()
+            .find(|context| context.task_id == task_id && !context.closed);
+        let selected_tab_id = context.and_then(|context| context.selected_tab_id);
+        let selected_tab = selected_tab_id.and_then(|tab_id| {
+            browser
+                .tabs
+                .iter()
+                .find(|tab| tab.tab_id == tab_id && tab.task_id == task_id && !tab.closed)
+        });
+        let resource_id = snapshot
+            .resources
+            .values()
+            .find(|resource| {
+                resource.resource_kind == ResourceKind::BrowserContext
+                    && resource.lifecycle != crate::domain::resource::ResourceLifecycle::Released
             })
+            .map(|resource| resource.id);
+        Some(ClientBrowserDockView {
+            task_id,
+            title: snapshot.task.title.clone(),
+            agent_session_id: snapshot.primary_agent_id,
+            context_id: context.map(|context| context.context_id),
+            resource_id,
+            selected_tab_id,
+            generation: context.map(|context| context.generation),
+            shareable_url: selected_tab.and_then(|tab| {
+                crate::domain::browser::BrowserSnapshotRow::Tab(tab.clone()).shareable_url()
+            }),
+            tab_count: browser
+                .tabs
+                .iter()
+                .filter(|tab| tab.task_id == task_id && !tab.closed)
+                .count(),
+        })
     }
 
     /// Fail-closed Task Cockpit workspace/git/files/ssh/service surface map.
@@ -1661,6 +1691,8 @@ pub struct ClientModelBuilder {
     artifacts: BTreeMap<ArtifactId, ArtifactSummary>,
     resources: BTreeMap<ResourceId, ResourceFacts>,
     operations: BTreeMap<OperationId, OperationFacts>,
+    browser_contexts: BTreeMap<BrowserContextId, crate::domain::browser::BrowserContextView>,
+    browser_tabs: BTreeMap<crate::domain::id::BrowserTabId, crate::domain::browser::BrowserTabView>,
 }
 
 impl Default for ClientModelBuilder {
@@ -1682,6 +1714,8 @@ impl ClientModelBuilder {
             artifacts: BTreeMap::new(),
             resources: BTreeMap::new(),
             operations: BTreeMap::new(),
+            browser_contexts: BTreeMap::new(),
+            browser_tabs: BTreeMap::new(),
         }
     }
 
@@ -1804,6 +1838,30 @@ impl ClientModelBuilder {
             }
         }
 
+        for (context_id, context) in self.browser_contexts {
+            let task = tasks
+                .get_mut(&context.task_id)
+                .ok_or(ClientModelError::MissingParentTask)?;
+            task.browser
+                .project_context_view(&context)
+                .map_err(|_| ClientModelError::InvalidOwnership)?;
+            if task.browser.context_view(context_id).is_none() {
+                return Err(ClientModelError::ApplyFailed);
+            }
+        }
+
+        for (tab_id, tab) in self.browser_tabs {
+            let task = tasks
+                .get_mut(&tab.task_id)
+                .ok_or(ClientModelError::MissingParentTask)?;
+            task.browser
+                .project_tab_view(&tab)
+                .map_err(|_| ClientModelError::InvalidOwnership)?;
+            if task.browser.tab_view(tab_id).is_none() {
+                return Err(ClientModelError::ApplyFailed);
+            }
+        }
+
         // Snapshot ArtifactSummary items never invent content_ref into TaskSnapshot.
         for summary in self.artifacts.values() {
             if !tasks.contains_key(&summary.task_id) {
@@ -1918,9 +1976,19 @@ impl ClientModelBuilder {
                     return Err(ClientModelError::DuplicateItem);
                 }
             }
-            (SnapshotSection::BrowserContexts, SnapshotItem::BrowserContext(_))
-            | (SnapshotSection::BrowserTabs, SnapshotItem::BrowserTab(_)) => {
-                return Err(ClientModelError::SectionItemMismatch);
+            (SnapshotSection::BrowserContexts, SnapshotItem::BrowserContext(context)) => {
+                if self
+                    .browser_contexts
+                    .insert(context.context_id, context.clone())
+                    .is_some()
+                {
+                    return Err(ClientModelError::DuplicateItem);
+                }
+            }
+            (SnapshotSection::BrowserTabs, SnapshotItem::BrowserTab(tab)) => {
+                if self.browser_tabs.insert(tab.tab_id, tab.clone()).is_some() {
+                    return Err(ClientModelError::DuplicateItem);
+                }
             }
             _ => return Err(ClientModelError::SectionItemMismatch),
         }
@@ -1934,6 +2002,10 @@ impl ClientModelBuilder {
 pub struct ClientBrowserDockView {
     pub task_id: TaskId,
     pub title: String,
+    pub agent_session_id: Option<AgentSessionId>,
+    pub context_id: Option<BrowserContextId>,
+    pub resource_id: Option<ResourceId>,
+    pub selected_tab_id: Option<crate::domain::id::BrowserTabId>,
     pub generation: Option<u64>,
     pub shareable_url: Option<String>,
     pub tab_count: usize,
@@ -1966,6 +2038,10 @@ impl ClientBrowserDockView {
         Ok(Self {
             task_id,
             title: String::new(),
+            agent_session_id: None,
+            context_id: None,
+            resource_id: None,
+            selected_tab_id: None,
             generation,
             shareable_url,
             tab_count,

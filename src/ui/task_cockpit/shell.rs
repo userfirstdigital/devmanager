@@ -2,6 +2,12 @@
 
 use gpui::{div, Context, InteractiveElement, IntoElement, ParentElement, Render, Window};
 
+use crate::browser::{
+    BrowserBounds, BrowserCommand, BrowserGatewayBindingRef, BrowserHostEvent,
+    BrowserNativeCallback, BrowserNativeCallbackKind, BrowserNativeControllerError,
+    BrowserNativeHostCommand, BrowserNativeIdentity, BrowserNativeLease,
+    BrowserNativeShellController, BrowserPageLoadState, BrowserWorkspaceKey,
+};
 use crate::client::model::ClientModel;
 use crate::domain::id::{RequestId, TaskId};
 use crate::domain::TaskCockpitResult;
@@ -20,6 +26,53 @@ pub struct TaskCockpitShell {
     dock: ContextDock,
     model: Option<ClientModel>,
     projection: Option<TaskCockpitLiveProjection>,
+    browser_controller: BrowserNativeShellController,
+    browser_projection: Option<BrowserNativeProjection>,
+}
+
+/// Authoritative browser surface projection mounted by the active Task
+/// Cockpit. It carries the durable Task/Agent/Context/Resource identity and
+/// the disposable host lease/process-session/bounds state together; no UI
+/// element is allowed to reconstruct those fields from a tab title or URL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowserNativeProjection {
+    identity: BrowserNativeIdentity,
+    workspace_key: BrowserWorkspaceKey,
+    gateway: BrowserGatewayBindingRef,
+    lease: BrowserNativeLease,
+    bounds: BrowserBounds,
+    attached: bool,
+    focused: bool,
+}
+
+impl BrowserNativeProjection {
+    pub fn identity(&self) -> BrowserNativeIdentity {
+        self.identity
+    }
+
+    pub fn workspace_key(&self) -> &BrowserWorkspaceKey {
+        &self.workspace_key
+    }
+
+    pub fn gateway(&self) -> &BrowserGatewayBindingRef {
+        &self.gateway
+    }
+
+    pub fn lease(&self) -> BrowserNativeLease {
+        self.lease
+    }
+
+    pub fn bounds(&self) -> BrowserBounds {
+        self.bounds
+    }
+
+    pub fn attached(&self) -> bool {
+        self.attached
+    }
+
+    pub fn focused(&self) -> bool {
+        self.focused
+    }
 }
 
 impl TaskCockpitShell {
@@ -28,6 +81,8 @@ impl TaskCockpitShell {
             dock: ContextDock::new(edge),
             model: None,
             projection: None,
+            browser_controller: BrowserNativeShellController::for_current_platform(),
+            browser_projection: None,
         }
     }
 
@@ -37,6 +92,157 @@ impl TaskCockpitShell {
 
     pub fn dock_mut(&mut self) -> &mut ContextDock {
         &mut self.dock
+    }
+
+    pub fn browser_controller(&self) -> &BrowserNativeShellController {
+        &self.browser_controller
+    }
+
+    pub fn browser_projection(&self) -> Option<&BrowserNativeProjection> {
+        self.browser_projection.as_ref()
+    }
+
+    pub fn bind_browser_native(
+        &mut self,
+        identity: BrowserNativeIdentity,
+        workspace_key: BrowserWorkspaceKey,
+        gateway: BrowserGatewayBindingRef,
+        bounds: BrowserBounds,
+    ) -> Result<BrowserNativeLease, BrowserNativeControllerError> {
+        let lease = self
+            .browser_controller
+            .bind(identity, workspace_key.clone(), gateway.clone())?;
+        self.browser_projection = Some(BrowserNativeProjection {
+            identity,
+            workspace_key,
+            gateway,
+            lease,
+            bounds,
+            attached: self.browser_controller.is_attached(),
+            focused: false,
+        });
+        Ok(lease)
+    }
+
+    pub fn attach_browser_native(
+        &mut self,
+        destination: crate::browser::BrowserNativeDestination,
+        bounds: BrowserBounds,
+    ) -> Result<BrowserNativeHostCommand, BrowserNativeControllerError> {
+        let projection = self
+            .browser_projection
+            .as_mut()
+            .ok_or(BrowserNativeControllerError::GatewayUnbound)?;
+        let command = self
+            .browser_controller
+            .attach_with_gateway(&projection.lease, &projection.gateway, destination, bounds)?;
+        projection.bounds = bounds;
+        projection.attached = true;
+        Ok(command)
+    }
+
+    pub fn resize_browser_native(
+        &mut self,
+        bounds: BrowserBounds,
+    ) -> Result<BrowserNativeHostCommand, BrowserNativeControllerError> {
+        let projection = self
+            .browser_projection
+            .as_mut()
+            .ok_or(BrowserNativeControllerError::GatewayUnbound)?;
+        let command = self.browser_controller.resize(&projection.lease, bounds)?;
+        projection.bounds = bounds;
+        Ok(command)
+    }
+
+    pub fn focus_browser_native(
+        &mut self,
+        focused: bool,
+    ) -> Result<BrowserNativeHostCommand, BrowserNativeControllerError> {
+        let projection = self
+            .browser_projection
+            .as_mut()
+            .ok_or(BrowserNativeControllerError::GatewayUnbound)?;
+        let command = self.browser_controller.focus(&projection.lease, focused)?;
+        projection.focused = focused;
+        Ok(command)
+    }
+
+    pub fn submit_browser_command(
+        &mut self,
+        command: BrowserCommand,
+    ) -> Result<BrowserNativeHostCommand, BrowserNativeControllerError> {
+        let projection = self
+            .browser_projection
+            .as_ref()
+            .ok_or(BrowserNativeControllerError::GatewayUnbound)?;
+        self.browser_controller.submit_command(&projection.lease, command)
+    }
+
+    pub fn detach_browser_native(
+        &mut self,
+    ) -> Result<BrowserNativeHostCommand, BrowserNativeControllerError> {
+        let projection = self
+            .browser_projection
+            .as_mut()
+            .ok_or(BrowserNativeControllerError::GatewayUnbound)?;
+        let command = self.browser_controller.detach(&projection.lease)?;
+        projection.attached = false;
+        projection.focused = false;
+        Ok(command)
+    }
+
+    /// Clear the UI projection only after the host has accepted the matching
+    /// detach command. This keeps stale callbacks visible until teardown has
+    /// actually drained.
+    pub fn finish_browser_detach(&mut self) {
+        self.browser_projection = None;
+    }
+
+    /// Convert host lifecycle events into controller-fenced callbacks. Events
+    /// for another workspace are deliberately ignored before they can mutate
+    /// the active dock projection.
+    pub fn forward_browser_host_event(
+        &self,
+        event: &BrowserHostEvent,
+    ) -> Option<BrowserNativeCallbackKind> {
+        let projection = self.browser_projection.as_ref()?;
+        let matches_workspace = match event {
+            BrowserHostEvent::UrlChanged { workspace_key, .. }
+            | BrowserHostEvent::TitleChanged { workspace_key, .. }
+            | BrowserHostEvent::PageLoad { workspace_key, .. }
+            | BrowserHostEvent::UserInput { workspace_key, .. }
+            | BrowserHostEvent::DomMutation { workspace_key, .. }
+            | BrowserHostEvent::AnnotationCandidate { workspace_key, .. }
+            | BrowserHostEvent::AnnotationCanceled { workspace_key, .. }
+            | BrowserHostEvent::AnnotationDraftReady { workspace_key, .. }
+            | BrowserHostEvent::AnnotationModeChanged { workspace_key, .. }
+            | BrowserHostEvent::AutomationStateChanged { workspace_key, .. }
+            | BrowserHostEvent::ApprovalRequested { workspace_key, .. }
+            | BrowserHostEvent::NewWindow { workspace_key, .. }
+            | BrowserHostEvent::Download { workspace_key, .. }
+            | BrowserHostEvent::Diagnostic { workspace_key, .. } => {
+                workspace_key == &projection.workspace_key
+            }
+        };
+        if !matches_workspace {
+            return None;
+        }
+        let kind = match event {
+            BrowserHostEvent::UrlChanged { .. }
+            | BrowserHostEvent::TitleChanged { .. }
+            | BrowserHostEvent::NewWindow { .. }
+            | BrowserHostEvent::PageLoad {
+                state: BrowserPageLoadState::Finished,
+                ..
+            } => BrowserNativeCallbackKind::NavigationComplete,
+            BrowserHostEvent::UserInput { .. } => BrowserNativeCallbackKind::SurfaceFocused,
+            _ => BrowserNativeCallbackKind::SurfaceResized,
+        };
+        self.browser_controller.take_callback(BrowserNativeCallback {
+            generation: projection.lease.generation(),
+            lease: projection.lease,
+            kind,
+        })
     }
 
     pub fn native_bin_mount(&self) -> Result<(), DependencyUnavailable> {
