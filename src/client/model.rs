@@ -1111,6 +1111,12 @@ impl ClientModel {
         &self.tasks
     }
 
+    /// Return one already assembled task without exposing another projection
+    /// source to UI code.
+    pub fn task(&self, task_id: TaskId) -> Option<&TaskSnapshot> {
+        self.tasks.get(&task_id)
+    }
+
     pub fn host_resources(&self) -> &BTreeMap<ResourceId, ResourceFacts> {
         &self.host_resources
     }

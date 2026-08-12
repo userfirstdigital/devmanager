@@ -553,7 +553,7 @@ async fn native_next_bootstrap_drives_visible_inbox_from_fixture_host() {
     cockpit
         .runtime_mut()
         .set_filter(InboxFilter::new("").including_archived());
-    let shell = Shell::new(Some(task_id));
+    let shell = Shell::detached(Some(task_id));
     let inbox = cockpit
         .runtime()
         .projection()

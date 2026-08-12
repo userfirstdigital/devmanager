@@ -3,12 +3,15 @@
 //! The shell owns only local interaction state. It never emits terminal input
 //! and never calls a host, terminal, provider, or component callback.
 
+use std::num::NonZeroU64;
 use std::sync::Arc;
 
+use crate::client::ClientModel;
 use crate::domain::command::{Command, CommandEnvelope};
 use crate::domain::id::{ClientId, CommandId, TaskId};
+use crate::ui::task_cockpit::header::{HeaderAction, TaskActionContext};
 use crate::ui::task_cockpit::{
-    Inbox, InboxPresentationWidth, InboxRenderModel, RuntimeSummary, TaskRowModel,
+    Inbox, InboxPresentationWidth, InboxRenderModel, RuntimeSummary, TaskHeaderModel, TaskRowModel,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -179,6 +182,60 @@ pub enum InvalidationReason {
     Resync,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ShellAttachmentError {
+    Unavailable,
+    ZeroEpoch(&'static str),
+}
+
+/// Host-issued initial epochs required before the shell can project or
+/// dispatch a task action.  The fields stay private so callers cannot mutate
+/// one dimension after the host has issued the attachment.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct HostEpochSnapshot {
+    resource_generation: NonZeroU64,
+    connection_epoch: NonZeroU64,
+    focus_epoch: NonZeroU64,
+    client_epoch: NonZeroU64,
+    navigation_epoch: NonZeroU64,
+}
+
+impl std::fmt::Debug for HostEpochSnapshot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HostEpochSnapshot")
+            .field("resource_generation", &self.resource_generation)
+            .field("connection_epoch", &self.connection_epoch)
+            .field("focus_epoch", &self.focus_epoch)
+            .field("client_epoch", &self.client_epoch)
+            .field("navigation_epoch", &self.navigation_epoch)
+            .finish()
+    }
+}
+
+impl HostEpochSnapshot {
+    pub fn try_from_host(
+        resource_generation: u64,
+        connection_epoch: u64,
+        focus_epoch: u64,
+        client_epoch: u64,
+        navigation_epoch: u64,
+    ) -> Result<Self, ShellAttachmentError> {
+        Ok(Self {
+            resource_generation: NonZeroU64::new(resource_generation)
+                .ok_or(ShellAttachmentError::ZeroEpoch("resource_generation"))?,
+            connection_epoch: NonZeroU64::new(connection_epoch)
+                .ok_or(ShellAttachmentError::ZeroEpoch("connection_epoch"))?,
+            focus_epoch: NonZeroU64::new(focus_epoch)
+                .ok_or(ShellAttachmentError::ZeroEpoch("focus_epoch"))?,
+            client_epoch: NonZeroU64::new(client_epoch)
+                .ok_or(ShellAttachmentError::ZeroEpoch("client_epoch"))?,
+            navigation_epoch: NonZeroU64::new(navigation_epoch)
+                .ok_or(ShellAttachmentError::ZeroEpoch("navigation_epoch"))?,
+        })
+    }
+}
+
 #[derive(Debug)]
 pub struct PointerOwner {
     identity: Arc<()>,
@@ -202,7 +259,7 @@ impl PartialEq for PointerOwner {
 
 impl Eq for PointerOwner {}
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct PointerCapture {
     identity: Arc<()>,
     pointer_id: u64,
@@ -225,11 +282,14 @@ impl PointerCapture {
 
 pub type TerminalPointerOwner = PointerOwner;
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Shell {
     selected_task: Option<TaskId>,
-    navigation_epoch: u64,
+    resource_generation: u64,
+    connection_epoch: u64,
     focus_epoch: u64,
+    client_epoch: u64,
+    navigation_epoch: u64,
     transient_priority: Option<TransientPriority>,
     pointer_owner: Option<PointerCapture>,
     generation: u64,
@@ -238,11 +298,44 @@ pub struct Shell {
 pub type TaskCockpitShell = Shell;
 
 impl Shell {
-    pub fn new(selected_task: Option<TaskId>) -> Self {
+    /// Attach the shell to a current host snapshot.  No detached or
+    /// zero-epoch shell can project a task or authorize an action.
+    pub fn attach(
+        selected_task: Option<TaskId>,
+        epochs: Option<HostEpochSnapshot>,
+    ) -> Result<Self, ShellAttachmentError> {
+        let Some(epochs) = epochs else {
+            return Err(ShellAttachmentError::Unavailable);
+        };
+        Ok(Self {
+            selected_task,
+            resource_generation: epochs.resource_generation.get(),
+            connection_epoch: epochs.connection_epoch.get(),
+            focus_epoch: epochs.focus_epoch.get(),
+            client_epoch: epochs.client_epoch.get(),
+            navigation_epoch: epochs.navigation_epoch.get(),
+            transient_priority: None,
+            pointer_owner: None,
+            generation: 0,
+        })
+    }
+
+    /// Convenience constructor for callers that already hold a validated
+    /// host-issued snapshot.
+    pub fn new(selected_task: Option<TaskId>, epochs: HostEpochSnapshot) -> Self {
+        Self::attach(selected_task, Some(epochs)).expect("validated host epochs must attach")
+    }
+
+    /// Detached constructor retained for local inbox projection tests. It
+    /// cannot project a host-fenced task header until `attach` is used.
+    pub fn detached(selected_task: Option<TaskId>) -> Self {
         Self {
             selected_task,
-            navigation_epoch: 0,
+            resource_generation: 0,
+            connection_epoch: 0,
             focus_epoch: 0,
+            client_epoch: 0,
+            navigation_epoch: 0,
             transient_priority: None,
             pointer_owner: None,
             generation: 0,
@@ -261,8 +354,82 @@ impl Shell {
         self.focus_epoch
     }
 
+    pub fn resource_generation(&self) -> u64 {
+        self.resource_generation
+    }
+
+    pub fn connection_epoch(&self) -> u64 {
+        self.connection_epoch
+    }
+
+    pub fn focus_epoch(&self) -> u64 {
+        self.focus_epoch
+    }
+
+    pub fn client_epoch(&self) -> u64 {
+        self.client_epoch
+    }
     pub fn transient_priority(&self) -> Option<TransientPriority> {
         self.transient_priority
+    }
+
+    /// Project the selected task from the immutable client snapshot and the
+    /// epochs currently owned by this shell. No caller-supplied context can
+    /// mint or replace the action fence.
+    pub fn task_header(&self, model: &ClientModel) -> Option<TaskHeaderModel> {
+        if model.last_applied_sequence() != self.client_epoch {
+            return None;
+        }
+        self.selected_task.and_then(|task_id| {
+            TaskHeaderModel::from_model(
+                model,
+                task_id,
+                TaskActionContext::new(
+                    self.resource_generation,
+                    self.connection_epoch,
+                    self.focus_epoch,
+                    self.client_epoch,
+                    self.navigation_epoch,
+                ),
+            )
+        })
+    }
+
+    /// Dispatch only a projected action carrying the current task and all
+    /// action-fence epochs. The shell performs no side effect; a true result
+    /// authorizes the caller's downstream action dispatcher to proceed.
+    pub fn dispatch_task_action(&self, model: &ClientModel, action: &HeaderAction) -> bool {
+        self.task_header(model)
+            .is_some_and(|header| header.accepts_action(action))
+    }
+
+    /// Observe the current client subscription high-water. Older updates are
+    /// ignored, so a stale subscription cannot revive an older projected row.
+    pub fn sync_client_epoch(&mut self, client_epoch: u64) -> bool {
+        if client_epoch == 0 {
+            return false;
+        }
+        if client_epoch < self.client_epoch {
+            return false;
+        }
+        self.client_epoch = client_epoch;
+        true
+    }
+
+    pub fn advance_resource_generation(&mut self) -> bool {
+        advance_epoch(&mut self.resource_generation)
+    }
+
+    pub fn advance_connection_epoch(&mut self) -> bool {
+        advance_epoch(&mut self.connection_epoch)
+    }
+
+    pub fn advance_focus_epoch(&mut self) -> bool {
+        advance_epoch(&mut self.focus_epoch)
+    }
+
+    pub fn advance_client_epoch(&mut self) -> bool {
+        advance_epoch(&mut self.client_epoch)
     }
 
     pub fn set_transient_priority(&mut self, priority: Option<TransientPriority>) {
@@ -509,6 +676,9 @@ impl Shell {
     }
 
     pub fn on_focus_loss(&mut self) -> bool {
+        if !self.advance_focus_epoch() {
+            return false;
+        }
         self.invalidate(InvalidationReason::FocusLoss)
     }
 
@@ -524,4 +694,12 @@ impl Shell {
         self.pointer_owner = None;
         self.generation = self.generation.saturating_add(1);
     }
+}
+
+fn advance_epoch(epoch: &mut u64) -> bool {
+    let Some(next) = epoch.checked_add(1) else {
+        return false;
+    };
+    *epoch = next;
+    true
 }

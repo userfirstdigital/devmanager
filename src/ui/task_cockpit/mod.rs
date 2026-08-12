@@ -4,6 +4,24 @@ mod bootstrap;
 pub mod inbox;
 
 pub use bootstrap::NativeNextTaskCockpit;
+pub mod header;
+pub use header::{
+    ActionTarget, AgentIdentity, AgentProjection, AgentResourceField, AgentRoleProjection,
+    ConnectObservation, ConnectObservationIdentity, ConnectState, CpuDiagnostic, CpuInputUnit,
+    CpuProjection, HeaderAction, HeaderField, HeaderFieldKey, HeaderHighWaterLedger, HeaderLayout,
+    HighWaterDecision, HostHealth, HostObservation, HostObservationIdentity,
+    HostResourceObservation, HostResourceProjection, OverflowControl, PendingHeaderActionError,
+    PendingHeaderActionQueue, PrimaryAgentProjection, ProjectProjection, ProjectedAction,
+    QuotaObservation, QuotaObservationIdentity, QuotaProjection, RemoteHealth, RemoteObservation,
+    RemoteObservationIdentity, RemoteProjection, SpecialistWindow, StatusLink, TaskHeaderModel,
+    TaskIdentity, TopBarAction, TopBarModel, TopBarProjectionController, TopBarProjectionError,
+    TopBarProjectionInput, TopBarStatus, TopBarStatusLink, TurnProjection, UpdateObservation,
+    UpdateObservationIdentity, UpdateState, WorkspaceProjection, HEADER_HIGH_WATER_TTL_MS,
+    MAX_HEADER_HIGH_WATER_ENTRIES, MAX_HEADER_SPECIALISTS, MAX_PENDING_HEADER_ACTIONS,
+    MAX_SPECIALIST_VIRTUAL_WINDOW, MAX_TOP_BAR_QUOTAS, MAX_TOP_BAR_QUOTA_CACHE,
+    NARROW_HEADER_WIDTH_PX, PROVIDER_QUOTA_MAX_AGE_MS, STANDARD_HEADER_WIDTH_PX,
+};
+
 pub use inbox::{
     render_native_inbox, render_native_inbox_with_actions, Inbox, InboxActionEpochs, InboxError,
     InboxFilter, InboxItemKey, InboxOverflow, InboxPresentationWidth, InboxRenderItem,

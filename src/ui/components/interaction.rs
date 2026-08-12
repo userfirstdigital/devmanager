@@ -329,6 +329,7 @@ impl ActionEvent {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AccessibleRole {
     Button,
+    Menu,
     TextField,
     Status,
     Alert,

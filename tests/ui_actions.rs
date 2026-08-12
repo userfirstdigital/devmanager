@@ -139,6 +139,10 @@ fn keyboard_model_contains_only_the_planned_task_cockpit_shortcuts() {
         Some(KeyboardAction::OpenTerminal)
     );
     assert_eq!(
+        model.resolve(KeyboardShortcut::ctrl(ShortcutKey::Character('m'))),
+        Some(KeyboardAction::OpenTaskDetails)
+    );
+    assert_eq!(
         model.resolve(KeyboardShortcut::escape()),
         Some(KeyboardAction::DismissTransient)
     );

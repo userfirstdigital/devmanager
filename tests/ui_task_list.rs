@@ -193,7 +193,7 @@ fn navigation_mouse_down_commits_only_tasks_in_the_current_bounded_inbox() {
     let foreign = task_id_from_index(3);
     let model = model_from_ids(&[first, second]);
     let inbox = Inbox::from_model(&model);
-    let mut shell = Shell::new(Some(first));
+    let mut shell = Shell::detached(Some(first));
     let epoch = shell.navigation_epoch();
     let owner = shell
         .terminal_mouse_down(7, first, PointerButton::Primary, epoch, Some(first))
@@ -238,7 +238,7 @@ fn stale_navigation_invalidates_an_active_terminal_owner() {
     let second = task_id_from_index(5);
     let model = model_from_ids(&[first, second]);
     let inbox = Inbox::from_model(&model);
-    let mut shell = Shell::new(Some(first));
+    let mut shell = Shell::detached(Some(first));
     let epoch = shell.navigation_epoch();
     let owner = shell
         .terminal_mouse_down(8, first, PointerButton::Primary, epoch, Some(first))
@@ -269,7 +269,7 @@ fn inbox_excludes_archived_tasks_and_rejects_their_navigation() {
     let inbox = Inbox::from_model(&model);
 
     assert_eq!(inbox.task_ids().collect::<Vec<_>>(), vec![open]);
-    let mut shell = Shell::new(Some(open));
+    let mut shell = Shell::detached(Some(open));
     let epoch = shell.navigation_epoch();
     assert_eq!(
         shell.navigation_mouse_down(archived, epoch, &inbox),
@@ -378,7 +378,7 @@ fn shell_navigation_consumes_attention_inbox_beyond_the_legacy_5000_prefix() {
         "the inbox must retain the highest-attention row before the finite cap"
     );
 
-    let mut shell = Shell::new(None);
+    let mut shell = Shell::detached(None);
     assert_eq!(
         shell.navigation_mouse_down(high_attention, 0, &inbox),
         NavigationResult::Committed {
@@ -394,7 +394,7 @@ fn captured_inbox_actions_are_task_and_epoch_fenced_across_reorder_filter_and_as
     let second = task_id_from_index(6_001);
     let model = model_from_task_items(vec![task_item(first, 0), task_item(second, 1)]);
     let inbox = Inbox::from_model(&model);
-    let mut shell = Shell::new(Some(first));
+    let mut shell = Shell::detached(Some(first));
     let epoch = shell.focus_navigation_epoch();
     let captured = shell
         .capture_inbox_action(first, epoch, &inbox)
@@ -448,7 +448,7 @@ fn history_rows_are_separate_read_only_projection_and_never_actionable() {
     assert_eq!(history.history_rows().len(), 1);
     assert!(history.history_rows()[0].read_only);
 
-    let mut shell = Shell::new(Some(active));
+    let mut shell = Shell::detached(Some(active));
     assert_eq!(
         shell.navigation_mouse_down(archived, 0, &history),
         NavigationResult::Rejected {
@@ -474,7 +474,7 @@ fn inbox_actions_revalidate_identity_focus_row_generation_and_read_only_state() 
     let second = task_id_from_index(8_001);
     let model = model_from_task_items(vec![task_item(first, 0), task_item(second, 1)]);
     let inbox = Inbox::from_model(&model);
-    let mut shell = Shell::new(Some(first));
+    let mut shell = Shell::detached(Some(first));
     let captured = shell
         .capture_inbox_row_action(
             inbox.active_row(first).expect("first row"),
@@ -547,7 +547,7 @@ fn inbox_actions_revalidate_identity_focus_row_generation_and_read_only_state() 
         "archived rows cannot be archived or activated again"
     );
 
-    let history_shell = Shell::new(None);
+    let history_shell = Shell::detached(None);
     let history_epoch = history_shell.navigation_epoch();
     let history_focus_epoch = history_shell.focus_navigation_epoch();
     let unarchive = history_shell

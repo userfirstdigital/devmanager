@@ -145,6 +145,7 @@ pub enum KeyboardAction {
     OpenPalette,
     OpenTaskSwitcher,
     OpenCommandPalette,
+    OpenTaskDetails,
     SelectDock(DockTool),
     OpenTerminal,
     DismissTransient,
@@ -252,6 +253,10 @@ impl Default for KeyboardModel {
             });
         }
         bindings.extend([
+            KeyboardBinding {
+                shortcut: KeyboardShortcut::ctrl(ShortcutKey::Character('m')),
+                action: KeyboardAction::OpenTaskDetails,
+            },
             KeyboardBinding {
                 shortcut: KeyboardShortcut::ctrl(ShortcutKey::Backtick),
                 action: KeyboardAction::OpenTerminal,
