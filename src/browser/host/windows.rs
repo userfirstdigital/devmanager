@@ -5557,7 +5557,7 @@ impl BrowserWebViewHost {
         let files = paths
             .iter()
             .map(|path| path.to_string_lossy().into_owned())
-            .collect::<Vec<_>>();
+            .collect::<Vec<String>>();
         active.phase = BrowserAsyncPhase::UploadSet { paths, token };
         let params = json!({"files": files, "backendNodeId": backend_node_id});
         if let Err(error) = self.start_cdp(&target, &operation_id, "DOM.setFileInputFiles", &params)

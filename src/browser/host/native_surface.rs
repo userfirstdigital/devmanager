@@ -328,6 +328,22 @@ impl HostOwnedNativeSurfaceBackend {
         op()
     }
 
+    fn observe_production_hwnd_drain(
+        &self,
+        child: &BrowserWindowHandle,
+        parking: &BrowserWindowHandle,
+    ) -> Result<(), String> {
+        let child_live = Self::win32_is_window(child)?;
+        let parking_live = Self::win32_is_window(parking)?;
+        if child_live {
+            return Err(HostOwnedSurfaceBindError::ResiduePresent.to_string());
+        }
+        if !parking_live {
+            return Err(HostOwnedSurfaceBindError::LiveWindowRequired.to_string());
+        }
+        Ok(())
+    }
+
     #[cfg(target_os = "windows")]
     fn win32_require_live(handle: &BrowserWindowHandle) -> Result<(), String> {
         use windows::Win32::Foundation::HWND;
@@ -422,7 +438,7 @@ impl HostOwnedNativeSurfaceBackend {
     #[cfg(target_os = "windows")]
     fn win32_set_focus(child: &BrowserWindowHandle, focused: bool) -> Result<(), String> {
         use windows::Win32::Foundation::HWND;
-        use windows::Win32::UI::WindowsAndMessaging::SetFocus;
+        use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
         Self::win32_require_live(child)?;
         if !focused {
             return Ok(());
@@ -701,21 +717,6 @@ impl BrowserNativeSurfaceBackend for HostOwnedNativeSurfaceBackend {
         Ok(())
     }
 
-    fn observe_production_hwnd_drain(
-        &self,
-        child: &BrowserWindowHandle,
-        parking: &BrowserWindowHandle,
-    ) -> Result<(), String> {
-        let child_live = Self::win32_is_window(child)?;
-        let parking_live = Self::win32_is_window(parking)?;
-        if child_live {
-            return Err(HostOwnedSurfaceBindError::ResiduePresent.to_string());
-        }
-        if !parking_live {
-            return Err(HostOwnedSurfaceBindError::LiveWindowRequired.to_string());
-        }
-        Ok(())
-    }
 }
 
 #[cfg(test)]
