@@ -1,5 +1,6 @@
+use devmanager::prompts::search::PromptSearchSource;
 use devmanager::prompts::{
-    PromptHistoryErrorCode, PromptSearchQuery, PromptSearchSource, ValidatedDeliveredInputProof,
+    PromptHistoryErrorCode, PromptSearchQuery, ValidatedDeliveredInputProof,
 };
 
 #[test]
