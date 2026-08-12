@@ -33,7 +33,7 @@ pub use host::{
 pub use id::{
     AgentSessionId, ArtifactId, BrowserContextId, ClientId, CommandId, EnvironmentId, EventId,
     IdError, OperationId, OutboxId, ProjectId, RequestId, ResourceId, ServiceId, SnapshotId,
-    SubscriptionId, TaskId, TerminalId, TransferId,
+    SubscriptionId, TaskId, TaskInviteId, TerminalId, TransferId,
 };
 pub use operation::{
     validate_outcome_fence, validate_source_for_kind, validate_terminal_fact_source,

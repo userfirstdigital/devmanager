@@ -7,18 +7,25 @@ mod local_actions;
 mod managed;
 mod org;
 mod org_prompts;
+mod epoch;
+mod failure;
 mod identity;
 mod identity_codec;
 mod identity_store;
+mod invites;
 mod permission;
 mod policy;
 mod presence;
+mod projection;
+mod push;
 mod schema;
 mod telemetry;
 #[cfg(test)]
 mod telemetry_tests;
 mod transport;
 mod watcher;
+mod session;
+mod update;
 
 #[cfg(test)]
 mod identity_tests;
@@ -53,21 +60,46 @@ pub use identity::{
 };
 #[cfg(test)]
 pub(crate) use identity::bind_device_credential_from_snapshot as bind_device_credential;
+pub use epoch::{ActionEpoch, FocusEpoch, RuntimeGeneration, TurnEpoch};
+pub use failure::{
+    matrix_covers_direct_and_hosted, simulate_fault, ConnectActor, ConnectRouteKind, ConnectSurface,
+    FailureCase, FailureClass, FailureExpectation, SimulatedFaultOutcome, FAILURE_MATRIX,
+};
 pub use identity_store::{
     IdentityPersistence, InMemoryIdentityPersistence, IsolatedRemoteStore, LoadedRemoteDocument,
+};
+pub use invites::{
+    guest_may_perform, ContentClass, InviteAuditEvent, InviteAuditKind, InviteError, InviteGrantView,
+    InviteRole, InviteUsePolicy, IssuedInvite, PinnedHostPublicId, RedeemedDevicePublicId,
+    TaskInviteStore, INVITE_SECRET_BYTES, MAX_INVITE_NICKNAME_BYTES, MAX_TASK_INVITES,
 };
 pub use permission::{
     ActionId, AuthoritativePermissionContext, ConnectRole, KnownAction, PermissionDecision,
     PermissionDenyReason, PermissionEvaluator, PermissionRequest, ScopedPermissionGrant,
 };
 pub use policy::{
-    ActiveSessionInterval, ActiveSessionIntervalError, ContentClass, DeniedContentClass,
+    ActiveSessionInterval, ActiveSessionIntervalError, ContentClass as ManagementContentClass,
+    DeniedContentClass,
     GrantError, ManagedField, ManagementGrant, ManagementPolicy, ManagementPrivacyClass,
     ManagementRole, MetadataField, PolicyAuthority, PolicyDecision, PolicyOperation,
     PolicyPrincipal, PolicyPrivacyClass, PolicyReasonCode, TaskContext, TaskEnrollment,
     ACTIVE_SESSION_IDLE_LIMIT_MS,
 };
 pub use presence::{EphemeralPresence, LastSenderHint, PresenceSink};
+pub use projection::{
+    project_field, project_object, ConnectEnrollment, OutboundField, ProjectedObject,
+    ProjectionDenyReason, ProjectionGrant,
+};
+pub use push::{
+    forbidden_push_fields, sanitize_push, AttentionKind, PushPolicy, PushSanitizeError,
+    SanitizedPush, MAX_ROUTE_BYTES, MAX_SAFE_TITLE_BYTES,
+};
+pub use session::{
+    ActionAnswer, ConnectSession, DeviceInput, SessionAdmitError, SessionReceipt, SessionReceiptKind,
+};
+pub use update::{
+    PairingContinuity, UpdateContinuity, UpdateContinuityError,
+};
 pub use schema::{
     canonical_schema_fixtures, catalog_entry, encode_canonical_schema, payload_catalog,
     CanonicalSchemaFixture, ChunkPayload, ConnectPayload, ErrorPayload, GenericExtensionPayload,

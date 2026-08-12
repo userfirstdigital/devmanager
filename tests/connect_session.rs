@@ -4,10 +4,11 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use devmanager::connect::{
-    decode_inner, encode_inner, ActionId, ChannelKind, ConnectEnvelope, ConnectLimits,
-    ConnectPrivacyClass, ConnectRole, ConnectTransport, EphemeralPresence, LastSenderHint,
-    PayloadKind, PermissionDecision, PermissionEvaluator, PermissionRequest, PresenceSink,
-    ProjectionExtensions, ProjectionSource, ReplayRequest, SnapshotRequest,
+    decode_inner, encode_inner, ActionId, AuthoritativePermissionContext, ChannelKind,
+    ConnectEnvelope, ConnectLimits, ConnectPrivacyClass, ConnectRole, ConnectTransport,
+    EphemeralPresence, FocusEpoch, LastSenderHint, PermissionDecision, PermissionDenyReason,
+    PermissionEvaluator, PermissionRequest, PresenceSink, ProjectionExtensions, ProjectionSource,
+    ReplayRequest, ScopedPermissionGrant, SnapshotRequest, TurnEpoch,
     MAX_CONNECT_RESUME_CURSOR_BYTES,
 };
 use devmanager::domain::id::{ClientId, OperationId, RequestId, SnapshotId, TaskId};
@@ -208,62 +209,114 @@ fn permission_evaluator_is_task_scoped_and_watcher_never_mutates() {
     let task = task_id(0x31);
     let other_task = task_id(0x32);
     let evaluator = PermissionEvaluator::default();
+    let context = AuthoritativePermissionContext::live(4, 5, 6).expect("live epochs");
 
     assert_eq!(
         evaluator.evaluate(PermissionRequest {
             role: ConnectRole::PairedOwner,
             task_id: None,
             action: ActionId::APPROVE_DANGEROUS,
+            credential: None,
         }),
-        PermissionDecision::Allow
+        PermissionDecision::Denied(PermissionDenyReason::DeviceCredentialRequired)
     );
+    let watcher_read = PermissionRequest {
+        role: ConnectRole::Watcher { task_id: task },
+        task_id: Some(task),
+        action: ActionId::READ_TASK,
+        credential: None,
+    };
+    let watcher_grant = ScopedPermissionGrant::issue(
+        ConnectRole::Watcher { task_id: task },
+        task,
+        ActionId::READ_TASK,
+        context,
+    )
+    .expect("watcher grant");
     assert_eq!(
-        evaluator.evaluate(PermissionRequest {
-            role: ConnectRole::Watcher { task_id: task },
-            task_id: Some(task),
-            action: ActionId::READ_TASK,
-        }),
+        evaluator.evaluate_with_scoped_grant(watcher_read, &watcher_grant, context),
         PermissionDecision::Allow
     );
+    let watcher_mutate = PermissionRequest {
+        role: ConnectRole::Watcher { task_id: task },
+        task_id: Some(task),
+        action: ActionId::MUTATE_TASK,
+        credential: None,
+    };
+    let watcher_mutate_grant = ScopedPermissionGrant::issue(
+        ConnectRole::Watcher { task_id: task },
+        task,
+        ActionId::MUTATE_TASK,
+        context,
+    )
+    .expect("watcher mutate grant");
     assert!(matches!(
-        evaluator.evaluate(PermissionRequest {
-            role: ConnectRole::Watcher { task_id: task },
-            task_id: Some(task),
-            action: ActionId::MUTATE_TASK,
-        }),
-        PermissionDecision::Denied(devmanager::connect::PermissionDenyReason::WatcherReadOnly)
+        evaluator.evaluate_with_scoped_grant(watcher_mutate, &watcher_mutate_grant, context),
+        PermissionDecision::Denied(PermissionDenyReason::WatcherReadOnly)
     ));
+    let collaborator_mutate = PermissionRequest {
+        role: ConnectRole::Collaborator { task_id: task },
+        task_id: Some(task),
+        action: ActionId::MUTATE_TASK,
+        credential: None,
+    };
+    let collaborator_grant = ScopedPermissionGrant::issue(
+        ConnectRole::Collaborator { task_id: task },
+        task,
+        ActionId::MUTATE_TASK,
+        context,
+    )
+    .expect("collaborator grant");
     assert_eq!(
-        evaluator.evaluate(PermissionRequest {
-            role: ConnectRole::Collaborator { task_id: task },
-            task_id: Some(task),
-            action: ActionId::MUTATE_TASK,
-        }),
+        evaluator.evaluate_with_scoped_grant(collaborator_mutate.clone(), &collaborator_grant, context),
         PermissionDecision::Allow
     );
+    let foreign_grant = ScopedPermissionGrant::issue(
+        ConnectRole::Collaborator {
+            task_id: other_task,
+        },
+        other_task,
+        ActionId::MUTATE_TASK,
+        context,
+    )
+    .expect("foreign grant");
     assert!(matches!(
-        evaluator.evaluate(PermissionRequest {
-            role: ConnectRole::Collaborator { task_id: task },
-            task_id: Some(other_task),
-            action: ActionId::MUTATE_TASK,
-        }),
-        PermissionDecision::Denied(devmanager::connect::PermissionDenyReason::TaskScopeMismatch)
+        evaluator.evaluate_with_scoped_grant(collaborator_mutate, &foreign_grant, context),
+        PermissionDecision::Denied(PermissionDenyReason::ScopedGrantRequired)
     ));
+    let dangerous = PermissionRequest {
+        role: ConnectRole::Collaborator { task_id: task },
+        task_id: Some(task),
+        action: ActionId::APPROVE_DANGEROUS,
+        credential: None,
+    };
+    let dangerous_grant = ScopedPermissionGrant::issue(
+        ConnectRole::Collaborator { task_id: task },
+        task,
+        ActionId::APPROVE_DANGEROUS,
+        context,
+    )
+    .expect("dangerous grant");
     assert!(matches!(
-        evaluator.evaluate(PermissionRequest {
-            role: ConnectRole::Collaborator { task_id: task },
-            task_id: Some(task),
-            action: ActionId::APPROVE_DANGEROUS,
-        }),
-        PermissionDecision::Denied(devmanager::connect::PermissionDenyReason::OwnerOnly)
+        evaluator.evaluate_with_scoped_grant(dangerous, &dangerous_grant, context),
+        PermissionDecision::Denied(PermissionDenyReason::OwnerOnly)
     ));
+    let unknown = PermissionRequest {
+        role: ConnectRole::Watcher { task_id: task },
+        task_id: Some(task),
+        action: ActionId::new(0x7fff).expect("unknown action"),
+        credential: None,
+    };
+    let unknown_grant = ScopedPermissionGrant::issue(
+        ConnectRole::Watcher { task_id: task },
+        task,
+        ActionId::new(0x7fff).expect("unknown action"),
+        context,
+    )
+    .expect("unknown grant");
     assert!(matches!(
-        evaluator.evaluate(PermissionRequest {
-            role: ConnectRole::Watcher { task_id: task },
-            task_id: Some(task),
-            action: ActionId::new(0x7fff).expect("unknown action"),
-        }),
-        PermissionDecision::Denied(devmanager::connect::PermissionDenyReason::UnknownAction)
+        evaluator.evaluate_with_scoped_grant(unknown, &unknown_grant, context),
+        PermissionDecision::Denied(PermissionDenyReason::UnknownAction)
     ));
 }
 
@@ -274,11 +327,15 @@ fn presence_is_ephemeral_last_sender_metadata_only() {
     let second = client_id(0x43);
     let mut presence = EphemeralPresence::new(2);
 
-    presence.record(LastSenderHint::new(task, first, 100));
+    let turn = TurnEpoch::new(1).expect("turn");
+    let focus = FocusEpoch::new(1).expect("focus");
+    presence.record(LastSenderHint::new(task, first, 100, turn, focus));
     assert_eq!(presence.last_sender(task).unwrap().client_id, first);
-    presence.record(LastSenderHint::new(task, second, 101));
+    presence.record(LastSenderHint::new(task, second, 101, turn, focus));
     assert_eq!(presence.last_sender(task).unwrap().client_id, second);
     assert_eq!(presence.last_sender(task).unwrap().observed_at_ms, 101);
+    assert_eq!(presence.last_sender(task).unwrap().turn_epoch, turn);
+    assert_eq!(presence.last_sender(task).unwrap().focus_epoch, focus);
 }
 
 #[test]
@@ -287,7 +344,13 @@ fn zero_capacity_presence_retains_nothing() {
     let client = client_id(0x45);
     let mut presence = EphemeralPresence::new(0);
 
-    assert!(!presence.record(LastSenderHint::new(task, client, 100)));
+    assert!(!presence.record(LastSenderHint::new(
+        task,
+        client,
+        100,
+        TurnEpoch::new(1).expect("turn"),
+        FocusEpoch::new(1).expect("focus"),
+    )));
     assert!(presence.is_empty());
 }
 

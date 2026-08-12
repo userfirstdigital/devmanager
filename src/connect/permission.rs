@@ -123,13 +123,21 @@ pub struct AuthoritativePermissionContext {
 }
 
 impl AuthoritativePermissionContext {
-    #[cfg(test)]
-    pub(crate) fn for_test(channel_epoch: u64, session_epoch: u64, route_epoch: u64) -> Self {
-        Self {
+    pub fn live(channel_epoch: u64, session_epoch: u64, route_epoch: u64) -> Option<Self> {
+        if channel_epoch == 0 || session_epoch == 0 || route_epoch == 0 {
+            return None;
+        }
+        Some(Self {
             channel_epoch,
             session_epoch,
             route_epoch,
-        }
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(channel_epoch: u64, session_epoch: u64, route_epoch: u64) -> Self {
+        Self::live(channel_epoch, session_epoch, route_epoch)
+            .expect("test epochs must be nonzero")
     }
 }
 
@@ -158,6 +166,35 @@ pub struct ScopedPermissionGrant {
 }
 
 impl ScopedPermissionGrant {
+    pub fn issue(
+        role: ConnectRole,
+        task_id: TaskId,
+        action: ActionId,
+        context: AuthoritativePermissionContext,
+    ) -> Option<Self> {
+        if context.channel_epoch == 0 || context.session_epoch == 0 || context.route_epoch == 0 {
+            return None;
+        }
+        if matches!(role, ConnectRole::PairedOwner) {
+            return None;
+        }
+        if let ConnectRole::Watcher { task_id: scoped }
+        | ConnectRole::Collaborator { task_id: scoped } = role
+        {
+            if scoped != task_id {
+                return None;
+            }
+        }
+        Some(Self {
+            role,
+            task_id,
+            action,
+            channel_epoch: context.channel_epoch,
+            session_epoch: context.session_epoch,
+            route_epoch: context.route_epoch,
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test(
         role: ConnectRole,
@@ -165,14 +202,7 @@ impl ScopedPermissionGrant {
         action: ActionId,
         context: AuthoritativePermissionContext,
     ) -> Self {
-        Self {
-            role,
-            task_id,
-            action,
-            channel_epoch: context.channel_epoch,
-            session_epoch: context.session_epoch,
-            route_epoch: context.route_epoch,
-        }
+        Self::issue(role, task_id, action, context).expect("test grant must be scoped")
     }
 
     fn matches(

@@ -6,20 +6,32 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::id::{ClientId, TaskId};
 
+use super::epoch::{FocusEpoch, TurnEpoch};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LastSenderHint {
     pub task_id: TaskId,
     pub client_id: ClientId,
     pub observed_at_ms: i64,
+    pub turn_epoch: TurnEpoch,
+    pub focus_epoch: FocusEpoch,
 }
 
 impl LastSenderHint {
-    pub const fn new(task_id: TaskId, client_id: ClientId, observed_at_ms: i64) -> Self {
+    pub const fn new(
+        task_id: TaskId,
+        client_id: ClientId,
+        observed_at_ms: i64,
+        turn_epoch: TurnEpoch,
+        focus_epoch: FocusEpoch,
+    ) -> Self {
         Self {
             task_id,
             client_id,
             observed_at_ms,
+            turn_epoch,
+            focus_epoch,
         }
     }
 }
