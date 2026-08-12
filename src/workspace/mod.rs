@@ -1,3 +1,19 @@
+pub mod checkpoint;
+pub mod model;
+pub mod service;
+pub mod worktree;
+pub mod files;
+
+pub use crate::domain::task::WorkspaceChoice;
+pub use model::{
+    default_workspace_choice, path_identity_key, PendingWorktreeCandidate, RepositoryIdentity,
+    TaskKind, WorkspaceBinding, WorkspaceKind, WorkspaceProjectRoots, WorkspaceProjectRootsError,
+    WorkspaceRequest, WorkspaceResolution, WorkspaceResource,
+};
+pub use service::{
+    WorkspaceAuthorization, WorkspaceError, WorkspaceLeaseError, WorkspaceResourceCoordinator,
+    WorkspaceResourceLease, WorkspaceService,
+};
 mod editor_ui;
 
 use self::editor_ui::{

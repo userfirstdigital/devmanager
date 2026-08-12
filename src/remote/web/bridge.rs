@@ -1378,6 +1378,7 @@ fn handle_inbound_core(
                     inner,
                     PendingRemoteRequest {
                         client_id: client_id.to_string(),
+                        git_authority: None,
                         action,
                         response: None,
                     },
@@ -1457,6 +1458,7 @@ fn handle_inbound_core(
                     inner,
                     PendingRemoteRequest {
                         client_id: client_id.to_string(),
+                        git_authority: None,
                         action,
                         response: Some(response_tx),
                     },
@@ -9549,6 +9551,7 @@ mod tests {
             for index in 0..crate::remote::MAX_PENDING_REMOTE_REQUESTS {
                 requests.push(PendingRemoteRequest {
                     client_id: format!("queued-{index}"),
+                    git_authority: None,
                     action: super::super::super::RemoteAction::GitListRepos,
                     response: None,
                 });

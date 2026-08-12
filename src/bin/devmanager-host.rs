@@ -11,7 +11,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use devmanager::config::paths::{resolve_app_paths, AppProfile, BuildKind};
+use devmanager::config::paths::{resolve_app_paths, AppProfile, BuildKind, ResolvedAppPaths};
+use devmanager::config::ConfigStore;
 use devmanager::domain::ClientId;
 use devmanager::host::{
     AcceptHelloConfig, HelloListener, HostCleanupWorker, HostConnection, HostExecutorOutcome,
@@ -41,6 +42,7 @@ struct HostArgs {
 struct PreparedDebugPaths {
     profile_root: PathBuf,
     database: PathBuf,
+    resolved: ResolvedAppPaths,
 }
 
 enum HostRunError {
@@ -107,6 +109,8 @@ fn run(raw_args: Vec<String>) -> Result<(), HostRunError> {
             // runtime or reach HelloListener::bind.
             return Ok(());
         };
+        let config_store = ConfigStore::open_host(&paths.resolved)
+            .map_err(|error| format!("failed to open host configuration store: {error}"))?;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -117,6 +121,7 @@ fn run(raw_args: Vec<String>) -> Result<(), HostRunError> {
             parent,
             host_boot_id,
             bus,
+            config_store,
             args.test_slow_durable_reader_client_id,
         ))?;
         drop(host_lock);
@@ -485,7 +490,8 @@ fn prepare_debug_paths(args: &HostArgs) -> Result<PreparedDebugPaths, String> {
 
     Ok(PreparedDebugPaths {
         profile_root: canonical_root,
-        database: paths.database,
+        database: paths.database.clone(),
+        resolved: paths,
     })
 }
 
@@ -812,6 +818,7 @@ async fn serve_foreground_host(
     parent: ParentProcess,
     host_boot_id: Uuid,
     bus: CommandBus,
+    config_store: ConfigStore,
     slow_durable_reader_client_id: Option<ClientId>,
 ) -> Result<(), String> {
     let hello_config = AcceptHelloConfig {
@@ -842,7 +849,8 @@ async fn serve_foreground_host(
             mut arm_rx,
             mut join,
         },
-    ) = HostRequestExecutor::start_supervised(bus);
+    ) = HostRequestExecutor::start_supervised_with_config_store(bus, config_store)
+        .map_err(|error| format!("invalid host project configuration: {error}"))?;
     let mut connection_tasks = tokio::task::JoinSet::new();
     // `accept_with_successor` owns its listener. Keep the future pinned across
     // unrelated task-completion branches so a normal client disconnect never

@@ -1,12 +1,7 @@
+use crate::git::command::{GitCancellation, GitHostBinding, GitRepository};
+use crate::git::model::{BranchName, CommitId, FileState, RepoPath, StatusKind};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
-use std::process::Command;
-
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
-
-#[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x08000000;
+use std::ffi::OsString;
 
 // ── Data types ──────────────────────────────────────────────────────────────
 
@@ -90,199 +85,114 @@ pub struct GitDiffResult {
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
-fn git_command(repo_path: &str, args: &[&str]) -> Command {
-    let mut cmd = Command::new("git");
-    cmd.current_dir(repo_path);
-    cmd.args(args);
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
-    #[cfg(windows)]
-    cmd.creation_flags(CREATE_NO_WINDOW);
-    cmd
+pub(crate) fn open_repository(binding: &GitHostBinding) -> Result<GitRepository, String> {
+    GitRepository::from_host_binding(binding.clone(), GitCancellation::new())
+        .map_err(|error| error.to_string())
 }
 
-fn run_git(repo_path: &str, args: &[&str]) -> Result<String, String> {
-    let output = git_command(repo_path, args)
-        .output()
-        .map_err(|e| format!("Failed to run git: {e}"))?;
-
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+fn run_git(repository: &GitRepository, args: &[&str]) -> Result<String, String> {
+    let arguments = args.iter().map(|arg| OsString::from(arg)).collect();
+    let output = if is_mutating_command(args.first().copied()) {
+        repository
+            .run_service_mutation(arguments, None, None)
+            .map_err(|error| error.to_string())?
+            .stdout
     } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        Err(stderr.trim().to_string())
-    }
+        repository
+            .run_service_read(arguments)
+            .map_err(|error| error.to_string())?
+    };
+    Ok(String::from_utf8_lossy(&output).into_owned())
 }
 
-fn run_git_allow_failure(repo_path: &str, args: &[&str]) -> Result<(String, String), String> {
-    let output = git_command(repo_path, args)
-        .output()
-        .map_err(|e| format!("Failed to run git: {e}"))?;
-
-    Ok((
-        String::from_utf8_lossy(&output.stdout).to_string(),
-        String::from_utf8_lossy(&output.stderr).to_string(),
-    ))
+fn is_mutating_command(command: Option<&str>) -> bool {
+    matches!(
+        command,
+        Some("add")
+            | Some("commit")
+            | Some("fetch")
+            | Some("pull")
+            | Some("push")
+            | Some("reset")
+            | Some("restore")
+            | Some("switch")
+            | Some("branch")
+    )
 }
 
 // ── Repository checks ───────────────────────────────────────────────────────
 
-pub fn is_repo(path: &str) -> bool {
-    Path::new(path).join(".git").exists()
-}
-
 pub fn git_available() -> bool {
-    let mut cmd = Command::new("git");
-    cmd.arg("--version");
-    cmd.stdout(std::process::Stdio::null());
-    cmd.stderr(std::process::Stdio::null());
-    #[cfg(windows)]
-    cmd.creation_flags(CREATE_NO_WINDOW);
-    cmd.status().is_ok()
+    crate::git::command::git_available()
 }
 
 // ── Status ──────────────────────────────────────────────────────────────────
 
-pub fn status(repo_path: &str) -> Result<GitStatusResult, String> {
-    let output = run_git(repo_path, &["status", "--porcelain=v2", "--branch"])?;
-    parse_status_v2(&output, repo_path)
-}
-
-fn parse_status_v2(output: &str, repo_path: &str) -> Result<GitStatusResult, String> {
-    let mut branch: Option<String> = None;
-    let mut upstream: Option<String> = None;
-    let mut ahead: u32 = 0;
-    let mut behind: u32 = 0;
-    let mut is_detached = false;
+pub(crate) fn status(repository: &GitRepository) -> Result<GitStatusResult, String> {
+    let status = repository.status().map_err(|error| error.to_string())?;
+    let (is_merging, is_rebasing) = repository
+        .operation_state()
+        .map_err(|error| error.to_string())?;
+    let branch = if status.is_detached {
+        status
+            .head
+            .as_ref()
+            .map(|head| head.as_str().chars().take(7).collect())
+    } else {
+        status
+            .branch
+            .as_ref()
+            .map(|branch| branch.as_str().to_string())
+    };
     let mut entries = Vec::new();
-
-    for line in output.lines() {
-        if line.starts_with("# branch.head ") {
-            let head = line.strip_prefix("# branch.head ").unwrap_or("");
-            if head == "(detached)" {
-                is_detached = true;
-                // Get short hash for detached display
-                if let Ok(hash) = run_git(repo_path, &["rev-parse", "--short", "HEAD"]) {
-                    branch = Some(hash.trim().to_string());
-                }
-            } else {
-                branch = Some(head.to_string());
-            }
-        } else if line.starts_with("# branch.upstream ") {
-            upstream = line
-                .strip_prefix("# branch.upstream ")
-                .map(|s| s.to_string());
-        } else if line.starts_with("# branch.ab ") {
-            if let Some(ab) = line.strip_prefix("# branch.ab ") {
-                for part in ab.split_whitespace() {
-                    if let Some(n) = part.strip_prefix('+') {
-                        ahead = n.parse().unwrap_or(0);
-                    } else if let Some(n) = part.strip_prefix('-') {
-                        behind = n.parse().unwrap_or(0);
-                    }
-                }
-            }
-        } else if line.starts_with("1 ") || line.starts_with("2 ") {
-            // Changed entries: "1 XY ..." or "2 XY ... \t origpath"
-            parse_changed_entry(line, &mut entries);
-        } else if line.starts_with("u ") {
-            // Unmerged (conflict) entry
-            parse_unmerged_entry(line, &mut entries);
-        } else if line.starts_with("? ") {
-            // Untracked
-            if let Some(path) = line.strip_prefix("? ") {
-                entries.push(GitStatusEntry {
-                    path: path.to_string(),
-                    status: GitFileStatus::Untracked,
-                    staged: false,
-                    original_path: None,
-                });
-            }
+    for entry in status.entries {
+        if entry.index != FileState::Unchanged {
+            entries.push(GitStatusEntry {
+                path: entry.path.display_lossy().into_owned(),
+                status: legacy_status(entry.kind),
+                staged: true,
+                original_path: entry
+                    .original_path
+                    .as_ref()
+                    .map(|path| path.display_lossy().into_owned()),
+            });
+        }
+        if entry.worktree != FileState::Unchanged || entry.index == FileState::Unchanged {
+            entries.push(GitStatusEntry {
+                path: entry.path.display_lossy().into_owned(),
+                status: legacy_status(entry.kind),
+                staged: false,
+                original_path: entry
+                    .original_path
+                    .as_ref()
+                    .map(|path| path.display_lossy().into_owned()),
+            });
         }
     }
-
-    // Detect merge/rebase state from repo files
-    let git_dir = Path::new(repo_path).join(".git");
-    let is_merging = git_dir.join("MERGE_HEAD").exists();
-    let is_rebasing =
-        git_dir.join("rebase-merge").exists() || git_dir.join("rebase-apply").exists();
-
     Ok(GitStatusResult {
         branch,
-        upstream,
-        ahead,
-        behind,
+        upstream: status.upstream,
+        ahead: status.ahead,
+        behind: status.behind,
         entries,
-        is_detached,
+        is_detached: status.is_detached,
         is_merging,
         is_rebasing,
     })
 }
 
-fn parse_changed_entry(line: &str, entries: &mut Vec<GitStatusEntry>) {
-    let parts: Vec<&str> = line.splitn(9, ' ').collect();
-    if parts.len() < 9 {
-        return;
-    }
-    let xy = parts[1];
-    let x = xy.as_bytes().first().copied().unwrap_or(b'.');
-    let y = xy.as_bytes().get(1).copied().unwrap_or(b'.');
-
-    // For rename entries (type "2"), the path field contains "path\torig_path"
-    let is_rename = parts[0] == "2";
-    let raw_path = parts[8];
-    let (path, original_path) = if is_rename {
-        let mut split = raw_path.splitn(2, '\t');
-        let p = split.next().unwrap_or(raw_path).to_string();
-        let orig = split.next().map(|s| s.to_string());
-        (p, orig)
-    } else {
-        (raw_path.to_string(), None)
-    };
-
-    // Index (staged) change
-    if x != b'.' {
-        entries.push(GitStatusEntry {
-            path: path.clone(),
-            status: xy_to_status(x),
-            staged: true,
-            original_path: original_path.clone(),
-        });
-    }
-
-    // Worktree (unstaged) change
-    if y != b'.' {
-        entries.push(GitStatusEntry {
-            path,
-            status: xy_to_status(y),
-            staged: false,
-            original_path,
-        });
-    }
-}
-
-fn parse_unmerged_entry(line: &str, entries: &mut Vec<GitStatusEntry>) {
-    // "u XY sub m1 m2 m3 mW h1 h2 h3 path"
-    let parts: Vec<&str> = line.splitn(11, ' ').collect();
-    if parts.len() < 11 {
-        return;
-    }
-    entries.push(GitStatusEntry {
-        path: parts[10].to_string(),
-        status: GitFileStatus::Conflicted,
-        staged: false,
-        original_path: None,
-    });
-}
-
-fn xy_to_status(c: u8) -> GitFileStatus {
-    match c {
-        b'M' => GitFileStatus::Modified,
-        b'A' => GitFileStatus::Added,
-        b'D' => GitFileStatus::Deleted,
-        b'R' => GitFileStatus::Renamed,
-        b'C' => GitFileStatus::Copied,
-        _ => GitFileStatus::Modified,
+fn legacy_status(kind: StatusKind) -> GitFileStatus {
+    match kind {
+        StatusKind::Modified | StatusKind::TypeChanged | StatusKind::Unknown => {
+            GitFileStatus::Modified
+        }
+        StatusKind::Added => GitFileStatus::Added,
+        StatusKind::Deleted => GitFileStatus::Deleted,
+        StatusKind::Renamed => GitFileStatus::Renamed,
+        StatusKind::Copied => GitFileStatus::Copied,
+        StatusKind::Untracked => GitFileStatus::Untracked,
+        StatusKind::Conflict => GitFileStatus::Conflicted,
+        StatusKind::Submodule => GitFileStatus::Modified,
     }
 }
 
@@ -291,12 +201,17 @@ fn xy_to_status(c: u8) -> GitFileStatus {
 const LOG_FORMAT: &str = "%h\x1f%H\x1f%s\x1f%b\x1f%an\x1f%aI\x1f%D";
 const LOG_SEPARATOR: char = '\x1e';
 
-pub fn log(repo_path: &str, limit: u32, skip: u32) -> Result<Vec<GitLogEntry>, String> {
+pub(crate) fn log(
+    repository: &GitRepository,
+    limit: u32,
+    skip: u32,
+) -> Result<Vec<GitLogEntry>, String> {
+    let limit = limit.clamp(1, 500);
     let format_arg = format!("--format={LOG_FORMAT}{LOG_SEPARATOR}");
     let limit_arg = format!("-{limit}");
     let skip_arg = format!("--skip={skip}");
 
-    let output = run_git(repo_path, &["log", &format_arg, &limit_arg, &skip_arg])?;
+    let output = run_git(repository, &["log", &format_arg, &limit_arg, &skip_arg])?;
     let mut entries = Vec::new();
 
     for record in output.split(LOG_SEPARATOR) {
@@ -314,6 +229,8 @@ pub fn log(repo_path: &str, limit: u32, skip: u32) -> Result<Vec<GitLogEntry>, S
         } else {
             refs_str.split(", ").map(|s| s.trim().to_string()).collect()
         };
+        validate_hash(fields[0], "short commit hash")?;
+        validate_hash(fields[1], "commit hash")?;
         let body = fields[3].trim();
         entries.push(GitLogEntry {
             hash: fields[0].to_string(),
@@ -335,31 +252,54 @@ pub fn log(repo_path: &str, limit: u32, skip: u32) -> Result<Vec<GitLogEntry>, S
 
 // ── Diff ────────────────────────────────────────────────────────────────────
 
-pub fn diff_file(repo_path: &str, file_path: &str, staged: bool) -> Result<GitDiffResult, String> {
+pub(crate) fn diff_file(
+    repository: &GitRepository,
+    file_path: &str,
+    staged: bool,
+) -> Result<GitDiffResult, String> {
+    let path = RepoPath::from(file_path);
+    repository
+        .validate_service_path(&path)
+        .map_err(|error| error.to_string())?;
+    let is_untracked = repository
+        .status()
+        .map_err(|error| error.to_string())?
+        .entry(file_path)
+        .is_some_and(|entry| entry.kind == StatusKind::Untracked);
     let args = if staged {
         vec!["diff", "--cached", "--", file_path]
     } else {
         vec!["diff", "--", file_path]
     };
-    let output = run_git(repo_path, &args)?;
+    let output = run_git(repository, &args)?;
 
     // Check for untracked file — show full content as additions
-    if output.is_empty() && !staged {
-        return diff_untracked(repo_path, file_path);
+    if output.is_empty() && !staged && is_untracked {
+        return diff_untracked(repository, file_path);
     }
 
     Ok(parse_diff(&output))
 }
 
-pub fn diff_commit(repo_path: &str, hash: &str) -> Result<GitDiffResult, String> {
-    let output = run_git(repo_path, &["show", "--format=", hash])?;
+pub(crate) fn diff_commit(repository: &GitRepository, hash: &str) -> Result<GitDiffResult, String> {
+    let hash = validate_hash(hash, "commit hash")?;
+    let output = run_git(repository, &["show", "--format=", hash.as_str()])?;
     Ok(parse_diff(&output))
 }
 
-fn diff_untracked(repo_path: &str, file_path: &str) -> Result<GitDiffResult, String> {
-    let full_path = Path::new(repo_path).join(file_path);
-    let content =
-        std::fs::read_to_string(&full_path).map_err(|e| format!("Cannot read file: {e}"))?;
+fn validate_hash(value: &str, label: &str) -> Result<CommitId, String> {
+    if !(4..=64).contains(&value.len()) || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(format!("{label} is not a typed Git object ID"));
+    }
+    Ok(CommitId::from(value))
+}
+
+fn diff_untracked(repository: &GitRepository, file_path: &str) -> Result<GitDiffResult, String> {
+    let path = RepoPath::from(file_path);
+    let content = repository
+        .read_service_file(&path, 8 * 1024 * 1024)
+        .map_err(|error| error.to_string())?;
+    let content = String::from_utf8_lossy(&content);
 
     let lines: Vec<GitDiffLine> = content
         .lines()
@@ -487,13 +427,20 @@ fn parse_hunk_header(header: &str) -> (u32, u32) {
     (old_start, new_start)
 }
 
-pub fn diff_stat_commit(
-    repo_path: &str,
+pub(crate) fn diff_stat_commit(
+    repository: &GitRepository,
     hash: &str,
 ) -> Result<Vec<(String, GitFileStatus)>, String> {
+    let hash = validate_hash(hash, "commit hash")?;
     let output = run_git(
-        repo_path,
-        &["diff-tree", "--no-commit-id", "-r", "--name-status", hash],
+        repository,
+        &[
+            "diff-tree",
+            "--no-commit-id",
+            "-r",
+            "--name-status",
+            hash.as_str(),
+        ],
     )?;
 
     let mut files = Vec::new();
@@ -505,6 +452,9 @@ pub fn diff_stat_commit(
         let mut parts = line.splitn(2, '\t');
         let status_char = parts.next().unwrap_or("M");
         let path = parts.next().unwrap_or("").to_string();
+        RepoPath::from(path.as_str())
+            .validate_relative()
+            .map_err(|reason| format!("commit diff path is invalid: {reason}"))?;
         let status = match status_char.as_bytes().first() {
             Some(b'A') => GitFileStatus::Added,
             Some(b'D') => GitFileStatus::Deleted,
@@ -519,10 +469,10 @@ pub fn diff_stat_commit(
 
 // ── Branches ────────────────────────────────────────────────────────────────
 
-pub fn branches(repo_path: &str) -> Result<Vec<GitBranch>, String> {
+pub(crate) fn branches(repository: &GitRepository) -> Result<Vec<GitBranch>, String> {
     let format = "%(HEAD)\x1f%(refname:short)\x1f%(upstream:short)\x1f%(subject)";
     let format_arg = format!("--format={format}");
-    let output = run_git(repo_path, &["branch", &format_arg])?;
+    let output = run_git(repository, &["branch", &format_arg])?;
 
     let mut result = Vec::new();
     for line in output.lines() {
@@ -536,6 +486,7 @@ pub fn branches(repo_path: &str) -> Result<Vec<GitBranch>, String> {
         }
         let is_current = fields[0].trim() == "*";
         let name = fields[1].trim().to_string();
+        BranchName::new(name.clone()).map_err(|message| message)?;
         let upstream = fields.get(2).and_then(|s| {
             let s = s.trim();
             if s.is_empty() {
@@ -564,33 +515,53 @@ pub fn branches(repo_path: &str) -> Result<Vec<GitBranch>, String> {
 
 // ── Staging ─────────────────────────────────────────────────────────────────
 
-pub fn stage(repo_path: &str, files: &[&str]) -> Result<(), String> {
+pub(crate) fn stage(repository: &GitRepository, files: &[&str]) -> Result<(), String> {
+    let paths = files
+        .iter()
+        .copied()
+        .map(RepoPath::from)
+        .collect::<Vec<_>>();
+    repository
+        .validate_service_paths(&paths)
+        .map_err(|error| error.to_string())?;
     let mut args = vec!["add", "--"];
     args.extend_from_slice(files);
-    run_git(repo_path, &args)?;
+    run_git(repository, &args)?;
     Ok(())
 }
 
-pub fn unstage(repo_path: &str, files: &[&str]) -> Result<(), String> {
+pub(crate) fn unstage(repository: &GitRepository, files: &[&str]) -> Result<(), String> {
+    let paths = files
+        .iter()
+        .copied()
+        .map(RepoPath::from)
+        .collect::<Vec<_>>();
+    repository
+        .validate_service_paths(&paths)
+        .map_err(|error| error.to_string())?;
     let mut args = vec!["restore", "--staged", "--"];
     args.extend_from_slice(files);
-    run_git(repo_path, &args)?;
+    run_git(repository, &args)?;
     Ok(())
 }
 
-pub fn stage_all(repo_path: &str) -> Result<(), String> {
-    run_git(repo_path, &["add", "-A"])?;
+pub(crate) fn stage_all(repository: &GitRepository) -> Result<(), String> {
+    run_git(repository, &["add", "-A"])?;
     Ok(())
 }
 
-pub fn unstage_all(repo_path: &str) -> Result<(), String> {
-    run_git(repo_path, &["reset", "HEAD"])?;
+pub(crate) fn unstage_all(repository: &GitRepository) -> Result<(), String> {
+    run_git(repository, &["reset", "HEAD"])?;
     Ok(())
 }
 
 // ── Commit ──────────────────────────────────────────────────────────────────
 
-pub fn commit(repo_path: &str, summary: &str, body: Option<&str>) -> Result<String, String> {
+pub(crate) fn commit(
+    repository: &GitRepository,
+    summary: &str,
+    body: Option<&str>,
+) -> Result<String, String> {
     let message = if let Some(body) = body {
         if body.trim().is_empty() {
             summary.to_string()
@@ -600,62 +571,82 @@ pub fn commit(repo_path: &str, summary: &str, body: Option<&str>) -> Result<Stri
     } else {
         summary.to_string()
     };
-    let output = run_git(repo_path, &["commit", "-m", &message])?;
-    // Extract short hash from output like "[main abc1234] message"
-    let hash = output
-        .lines()
-        .next()
-        .and_then(|l| l.split_whitespace().nth(1))
-        .and_then(|s| s.strip_suffix(']'))
-        .unwrap_or("")
-        .to_string();
-    Ok(hash)
+    if message.trim().is_empty() || message.contains('\0') || message.len() > 64 * 1024 {
+        return Err("commit message is outside the bounded typed request".to_string());
+    }
+    run_git(repository, &["commit", "-m", &message])?;
+    let hash = run_git(repository, &["rev-parse", "--short", "HEAD"])?;
+    let hash = validate_hash(hash.trim(), "commit hash")?;
+    Ok(hash.as_str().to_string())
 }
 
 // ── Remote operations ───────────────────────────────────────────────────────
 
-pub fn push(repo_path: &str) -> Result<String, String> {
-    let (stdout, stderr) = run_git_allow_failure(repo_path, &["push"])?;
-    // git push often writes to stderr even on success
-    if stderr.contains("error:") || stderr.contains("fatal:") {
+pub(crate) fn push(repository: &GitRepository) -> Result<String, String> {
+    let plan = repository
+        .plan_push(None, None)
+        .map_err(|error| error.to_string())?;
+    execute_push(repository, &plan)
+}
+
+pub(crate) fn push_set_upstream(
+    repository: &GitRepository,
+    branch: &str,
+) -> Result<String, String> {
+    let branch = BranchName::new(branch.to_string()).map_err(|message| message)?;
+    let plan = repository
+        .plan_push(Some("origin"), Some(branch.as_str()))
+        .map_err(|error| error.to_string())?;
+    execute_push(repository, &plan)
+}
+
+fn execute_push(
+    repository: &GitRepository,
+    plan: &crate::git::model::PushPlan,
+) -> Result<String, String> {
+    let mut arguments = vec![OsString::from("push")];
+    if plan.set_upstream {
+        arguments.push(OsString::from("--set-upstream"));
+    }
+    arguments.extend([
+        OsString::from("--"),
+        OsString::from(plan.remote_policy().endpoint()),
+        OsString::from(plan.branch.as_str()),
+    ]);
+    let output = repository
+        .run_service_mutation(
+            arguments,
+            Some(plan.remote_policy().clone()),
+            Some(plan.remote.clone()),
+        )
+        .map_err(|error| error.to_string())?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() || stderr.contains("error:") || stderr.contains("fatal:") {
         Err(stderr.trim().to_string())
+    } else if stdout.trim().is_empty() {
+        Ok(stderr.trim().to_string())
     } else {
-        let msg = if stdout.trim().is_empty() {
-            stderr.trim().to_string()
-        } else {
-            stdout.trim().to_string()
-        };
-        Ok(msg)
+        Ok(stdout.trim().to_string())
     }
 }
 
-pub fn push_set_upstream(repo_path: &str, branch: &str) -> Result<String, String> {
-    let (stdout, stderr) =
-        run_git_allow_failure(repo_path, &["push", "--set-upstream", "origin", branch])?;
-    if stderr.contains("error:") || stderr.contains("fatal:") {
-        Err(stderr.trim().to_string())
-    } else {
-        let msg = if stdout.trim().is_empty() {
-            stderr.trim().to_string()
-        } else {
-            stdout.trim().to_string()
-        };
-        Ok(msg)
-    }
-}
-
-pub fn pull(repo_path: &str) -> Result<String, String> {
-    let (stdout, stderr) = run_git_allow_failure(repo_path, &["pull"])?;
-    if stderr.contains("error:") || stderr.contains("fatal:") {
+pub(crate) fn pull(repository: &GitRepository) -> Result<String, String> {
+    let (stdout, stderr, success) = run_authorized_remote(repository, &["pull"])?;
+    if !success || stderr.contains("error:") || stderr.contains("fatal:") {
         Err(stderr.trim().to_string())
     } else {
         Ok(stdout.trim().to_string())
     }
 }
 
-pub fn pull_rebase(repo_path: &str) -> Result<String, String> {
-    let (stdout, stderr) = run_git_allow_failure(repo_path, &["pull", "--rebase"])?;
-    if stderr.contains("error:") || stderr.contains("fatal:") || stderr.contains("CONFLICT") {
+pub(crate) fn pull_rebase(repository: &GitRepository) -> Result<String, String> {
+    let (stdout, stderr, success) = run_authorized_remote(repository, &["pull", "--rebase"])?;
+    if !success
+        || stderr.contains("error:")
+        || stderr.contains("fatal:")
+        || stderr.contains("CONFLICT")
+    {
         Err(stderr.trim().to_string())
     } else {
         Ok(stdout.trim().to_string())
@@ -664,20 +655,20 @@ pub fn pull_rebase(repo_path: &str) -> Result<String, String> {
 
 /// Try to push; if rejected because the remote has diverged, pull --rebase
 /// and retry the push once.
-pub fn sync(repo_path: &str) -> Result<String, String> {
-    match push(repo_path) {
+pub(crate) fn sync(repository: &GitRepository) -> Result<String, String> {
+    match push(repository) {
         Ok(msg) => Ok(msg),
         Err(e) if e.contains("[rejected]") || e.contains("fetch first") => {
-            pull_rebase(repo_path)?;
-            push(repo_path)
+            pull_rebase(repository)?;
+            push(repository)
         }
         Err(e) => Err(e),
     }
 }
 
-pub fn fetch(repo_path: &str) -> Result<String, String> {
-    let (stdout, stderr) = run_git_allow_failure(repo_path, &["fetch", "--all"])?;
-    if stderr.contains("error:") || stderr.contains("fatal:") {
+pub(crate) fn fetch(repository: &GitRepository) -> Result<String, String> {
+    let (stdout, stderr, success) = run_authorized_remote(repository, &["fetch"])?;
+    if !success || stderr.contains("error:") || stderr.contains("fatal:") {
         Err(stderr.trim().to_string())
     } else {
         let msg = if stdout.trim().is_empty() {
@@ -689,34 +680,76 @@ pub fn fetch(repo_path: &str) -> Result<String, String> {
     }
 }
 
+fn run_authorized_remote(
+    repository: &GitRepository,
+    args: &[&str],
+) -> Result<(String, String, bool), String> {
+    let remote = repository
+        .status()
+        .map_err(|error| error.to_string())?
+        .upstream
+        .as_deref()
+        .and_then(|upstream| {
+            upstream
+                .split_once('/')
+                .map(|(remote, _)| remote.to_string())
+        })
+        .or_else(|| {
+            run_git(repository, &["remote"])
+                .ok()
+                .and_then(|output| output.lines().next().map(str::trim).map(str::to_string))
+        })
+        .filter(|remote| !remote.is_empty())
+        .ok_or_else(|| "Git operation has no configured remote".to_string())?;
+    let policy = repository
+        .service_remote_policy(&remote)
+        .map_err(|error| error.to_string())?;
+    let mut arguments = args
+        .iter()
+        .map(|arg| OsString::from(arg))
+        .collect::<Vec<_>>();
+    arguments.push(OsString::from(remote.as_str()));
+    let output = repository
+        .run_service_mutation(arguments, Some(policy), Some(remote))
+        .map_err(|error| error.to_string())?;
+    Ok((
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+        output.status.success(),
+    ))
+}
+
 // ── Branch operations ───────────────────────────────────────────────────────
 
-pub fn switch_branch(repo_path: &str, name: &str) -> Result<(), String> {
-    run_git(repo_path, &["switch", name])?;
+pub(crate) fn switch_branch(repository: &GitRepository, name: &str) -> Result<(), String> {
+    let name = BranchName::new(name.to_string()).map_err(|message| message)?;
+    run_git(repository, &["switch", name.as_str()])?;
     Ok(())
 }
 
-pub fn create_branch(repo_path: &str, name: &str) -> Result<(), String> {
-    run_git(repo_path, &["switch", "-c", name])?;
+pub(crate) fn create_branch(repository: &GitRepository, name: &str) -> Result<(), String> {
+    let name = BranchName::new(name.to_string()).map_err(|message| message)?;
+    run_git(repository, &["switch", "-c", name.as_str()])?;
     Ok(())
 }
 
-pub fn delete_branch(repo_path: &str, name: &str) -> Result<(), String> {
-    run_git(repo_path, &["branch", "-d", name])?;
+pub(crate) fn delete_branch(repository: &GitRepository, name: &str) -> Result<(), String> {
+    let name = BranchName::new(name.to_string()).map_err(|message| message)?;
+    run_git(repository, &["branch", "-d", name.as_str()])?;
     Ok(())
 }
 
 // ── Utility ─────────────────────────────────────────────────────────────────
 
-pub fn get_remote_name(repo_path: &str) -> Option<String> {
-    run_git(repo_path, &["remote"])
+pub(crate) fn get_remote_name(repository: &GitRepository) -> Option<String> {
+    run_git(repository, &["remote"])
         .ok()
         .and_then(|s| s.lines().next().map(|l| l.trim().to_string()))
         .filter(|s| !s.is_empty())
 }
 
-pub fn has_commits(repo_path: &str) -> bool {
-    run_git(repo_path, &["rev-parse", "HEAD"]).is_ok()
+pub(crate) fn has_commits(repository: &GitRepository) -> bool {
+    run_git(repository, &["rev-parse", "HEAD"]).is_ok()
 }
 
 // ── GitHub OAuth Device Flow ────────────────────────────────────────────────
@@ -867,9 +900,9 @@ pub struct AiCommitMessage {
     pub description: String,
 }
 
-pub fn get_staged_diff(repo_path: &str) -> Result<String, String> {
+pub(crate) fn get_staged_diff(repository: &GitRepository) -> Result<String, String> {
     run_git(
-        repo_path,
+        repository,
         &["diff", "--cached", "--no-ext-diff", "--no-color"],
     )
 }

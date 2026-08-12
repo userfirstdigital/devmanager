@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "projects": [],
+  "settings": {
+    "theme": "dark",
+    "defaultTerminal": "pwsh"
+  },
+  "sshConnections": [
+    {
+      "id": "ssh-v1",
+      "label": "Legacy V1 host",
+      "host": "legacy-v1.example.test",
+      "port": 22,
+      "username": "builder",
+      "password": "PASSWORD_SENTINEL"
+    }
+  ]
+}

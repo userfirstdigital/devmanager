@@ -22,7 +22,8 @@ use crate::host::{
     pipe_endpoint_for_named_profile, profile_fingerprint_for_named_profile, IpcError,
 };
 use crate::protocol::{
-    Capability, CapabilitySet, ClientHello, DetachAck, DetachRequest, FrameLimits, ServerHello,
+    Capability, CapabilitySet, ClientHello, DetachAck, DetachRequest, FrameLimits, ReconnectGrant,
+    ServerHello,
 };
 
 use super::action::task_show_query;
@@ -70,6 +71,7 @@ pub struct HostClient {
     endpoint: String,
     connection: Option<ClientConnection>,
     server_hello: ServerHello,
+    reconnect_grant: Option<ReconnectGrant>,
     tracked: BTreeMap<OperationId, TrackedOperation>,
 }
 
@@ -77,12 +79,14 @@ impl HostClient {
     /// Validate the named profile, build ClientHello, and connect.
     pub async fn connect(config: HostClientConfig) -> Result<Self, IpcError> {
         let endpoint = pipe_endpoint_for_named_profile(&config.named_profile)?;
-        let (connection, server_hello) = open_connection(&config, &endpoint).await?;
+        let (connection, server_hello) = open_connection(&config, &endpoint, None).await?;
+        let reconnect_grant = server_hello.reconnect_grant.clone();
         Ok(Self {
             config,
             endpoint,
             connection: Some(connection),
             server_hello,
+            reconnect_grant,
             tracked: BTreeMap::new(),
         })
     }
@@ -91,9 +95,10 @@ impl HostClient {
     /// A failed attempt leaves the client disconnected while preserving tracking.
     pub async fn reconnect(&mut self) -> Result<(), IpcError> {
         self.connection = None;
-        match open_connection(&self.config, &self.endpoint).await {
+        match open_connection(&self.config, &self.endpoint, self.reconnect_grant.clone()).await {
             Ok((connection, server_hello)) => {
                 self.connection = Some(connection);
+                self.reconnect_grant = server_hello.reconnect_grant.clone();
                 self.server_hello = server_hello;
                 Ok(())
             }
@@ -820,11 +825,13 @@ impl HostClient {
         connection: Option<ClientConnection>,
         tracked: BTreeMap<OperationId, TrackedOperation>,
     ) -> Self {
+        let reconnect_grant = server_hello.reconnect_grant.clone();
         Self {
             config,
             endpoint: String::new(),
             connection,
             server_hello,
+            reconnect_grant,
             tracked,
         }
     }
@@ -980,14 +987,16 @@ fn apply_observed_operation_state(
 async fn open_connection(
     config: &HostClientConfig,
     endpoint: &str,
+    reconnect_grant: Option<ReconnectGrant>,
 ) -> Result<(ClientConnection, ServerHello), IpcError> {
     let fingerprint = profile_fingerprint_for_named_profile(&config.named_profile)?;
-    let hello = ClientHello::new(
+    let hello = ClientHello::new_with_reconnect_grant(
         config.client_build.clone(),
         config.client_id,
         fingerprint,
         config.requested,
         config.limits,
+        reconnect_grant,
     )
     .map_err(IpcError::ClientHello)?;
     let connection = connect(endpoint, &hello).await?;
@@ -1271,6 +1280,7 @@ mod tests {
             profile_fingerprint: ProfileFingerprint::hash_normalized("detach-unit"),
             granted,
             limits: FrameLimits::v1_default(),
+            reconnect_grant: None,
         }
     }
 

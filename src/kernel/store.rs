@@ -33,6 +33,7 @@ use crate::kernel::projector;
 use crate::kernel::runtime::RecoveringResource;
 use crate::kernel::schema::{self, Migration, PROJECTION_TABLES};
 use crate::kernel::StoreMaintenanceReport;
+use crate::workspace::WorkspaceAuthorization;
 
 const BUSY_TIMEOUT_MS: i64 = 5_000;
 const MAX_DISPATCH_LEASE_MS: i64 = 3_600_000;
@@ -59,10 +60,12 @@ pub struct ProjectionRebuild {
 pub enum StoreError {
     Io(String),
     Sqlite(String),
+    HostAuthorityRequired,
     Busy,
     Corruption,
     Truncated,
     ConstraintViolation,
+    CommandIdConflict,
     StaleFence,
     ConflictingOutcome,
     MissingOperation,
@@ -86,10 +89,14 @@ impl fmt::Display for StoreError {
         match self {
             Self::Io(msg) => write!(f, "store io error: {msg}"),
             Self::Sqlite(msg) => write!(f, "sqlite error: {msg}"),
+            Self::HostAuthorityRequired => {
+                write!(f, "host authority is required for task creation")
+            }
             Self::Busy => write!(f, "sqlite busy"),
             Self::Corruption => write!(f, "database corruption detected"),
             Self::Truncated => write!(f, "database file is truncated"),
             Self::ConstraintViolation => write!(f, "sqlite constraint violation"),
+            Self::CommandIdConflict => write!(f, "command id is already bound to another scope"),
             Self::StaleFence => write!(f, "stale operation fence"),
             Self::ConflictingOutcome => write!(f, "conflicting operation outcome"),
             Self::MissingOperation => write!(f, "operation not found"),
@@ -157,6 +164,23 @@ impl KernelStore {
     /// Execute a command in one IMMEDIATE writer transaction.
     pub fn execute(&mut self, envelope: CommandEnvelope) -> Result<CommandReceipt, StoreError> {
         command_bus::execute(self, envelope)
+    }
+
+    /// Execute a host-normalized CreateTask with opaque workspace authority.
+    pub(crate) fn execute_authorized(
+        &mut self,
+        envelope: CommandEnvelope,
+        authorization: WorkspaceAuthorization,
+    ) -> Result<CommandReceipt, StoreError> {
+        command_bus::execute_authorized(self, envelope, authorization)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn execute_for_test(
+        &mut self,
+        envelope: CommandEnvelope,
+    ) -> Result<CommandReceipt, StoreError> {
+        command_bus::execute_for_test(self, envelope)
     }
 
     /// Load one durable operation state after validating its complete lineage.
@@ -2531,7 +2555,7 @@ mod tests {
     fn seed_open_task(store: &mut KernelStore) -> TaskId {
         let task_id = TaskId::new();
         store
-            .execute(maintenance_envelope(
+            .execute_for_test(maintenance_envelope(
                 CommandId::new(),
                 None,
                 None,

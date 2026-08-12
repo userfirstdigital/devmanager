@@ -22,10 +22,11 @@ use zeroize::Zeroizing;
 use crate::domain::artifact::{
     verify_inline_content_digest, ArtifactContentRef, ArtifactValidationError,
 };
-use crate::domain::id::{ArtifactId, ClientId, SubscriptionId, TaskId};
+use crate::domain::id::{ArtifactId, ClientId, RequestId, SubscriptionId, TaskId};
 use crate::domain::snapshot::{ArtifactContentPage, PageLimits, PageLimitsError};
 use crate::kernel::command_bus;
 use crate::kernel::store::{KernelStore, StoreError};
+use crate::kernel::SessionScope;
 
 const ARTIFACT_CONTENT_CURSOR_VERSION: u16 = 1;
 const ARTIFACT_CONTENT_CURSOR_DOMAIN: &[u8] = b"devmanager:artifact-content-cursor:v1\0";
@@ -119,6 +120,8 @@ impl From<rusqlite::Error> for ArtifactContentError {
 struct ArtifactContentCursorDocument {
     version: u16,
     subscription_id: SubscriptionId,
+    request_id: RequestId,
+    scope: SessionScope,
     task_id: TaskId,
     artifact_id: ArtifactId,
     next_offset: u64,
@@ -131,6 +134,8 @@ struct ArtifactContentCursorDocument {
 pub(crate) struct ArtifactContentSession {
     client_id: ClientId,
     task_id: TaskId,
+    request_id: RequestId,
+    scope: SessionScope,
     artifact_id: ArtifactId,
     sha256: [u8; 32],
     content: Vec<u8>,
@@ -164,6 +169,10 @@ impl ArtifactContentSession {
         self.subscription_id
     }
 
+    pub(crate) fn scope(&self) -> SessionScope {
+        self.scope
+    }
+
     #[cfg(test)]
     fn test_stub(
         client_id: ClientId,
@@ -172,12 +181,39 @@ impl ArtifactContentSession {
         subscription_id: SubscriptionId,
         limits: PageLimits,
     ) -> Self {
+        Self::test_stub_scoped(
+            SessionScope {
+                client_id: Some(client_id),
+                task_id: Some(task_id),
+                connection_id: None,
+                action_epoch: None,
+                runtime_generation: None,
+            },
+            RequestId::new(),
+            artifact_id,
+            subscription_id,
+            limits,
+        )
+    }
+
+    #[cfg(test)]
+    fn test_stub_scoped(
+        scope: SessionScope,
+        request_id: RequestId,
+        artifact_id: ArtifactId,
+        subscription_id: SubscriptionId,
+        limits: PageLimits,
+    ) -> Self {
+        let client_id = scope.client_id.expect("stub client scope");
+        let task_id = scope.task_id.expect("stub task scope");
         Self {
             client_id,
             task_id,
+            request_id,
+            scope,
             artifact_id,
             sha256: [0u8; 32],
-            content: b"x".to_vec(),
+            content: vec![b'x'; 2_000],
             limits,
             max_reassembled_message_bytes: 16 * 1024 * 1024,
             max_physical_frame_bytes: 1024 * 1024,
@@ -351,6 +387,8 @@ impl ArtifactContentSession {
         let document = ArtifactContentCursorDocument {
             version: ARTIFACT_CONTENT_CURSOR_VERSION,
             subscription_id: self.subscription_id,
+            request_id: self.request_id,
+            scope: self.scope,
             task_id: self.task_id,
             artifact_id: self.artifact_id,
             next_offset,
@@ -398,6 +436,8 @@ impl ArtifactContentSession {
         document.limits.validate()?;
         let total_bytes = u64::try_from(self.content.len()).map_err(|_| StoreError::Corruption)?;
         if document.subscription_id != self.subscription_id
+            || document.request_id != self.request_id
+            || document.scope != self.scope
             || document.task_id != self.task_id
             || document.artifact_id != self.artifact_id
             || document.total_bytes != total_bytes
@@ -424,10 +464,39 @@ impl KernelStore {
         max_reassembled_message_bytes: u32,
         max_physical_frame_bytes: u32,
     ) -> Result<ArtifactContentSession, ArtifactContentError> {
+        self.begin_artifact_content_scoped(
+            SessionScope {
+                client_id: Some(client_id),
+                task_id: Some(task_id),
+                connection_id: None,
+                action_epoch: None,
+                runtime_generation: None,
+            },
+            RequestId::new(),
+            artifact_id,
+            limits,
+            max_reassembled_message_bytes,
+            max_physical_frame_bytes,
+        )
+    }
+
+    pub(crate) fn begin_artifact_content_scoped(
+        &self,
+        scope: SessionScope,
+        request_id: RequestId,
+        artifact_id: ArtifactId,
+        limits: PageLimits,
+        max_reassembled_message_bytes: u32,
+        max_physical_frame_bytes: u32,
+    ) -> Result<ArtifactContentSession, ArtifactContentError> {
         limits.validate()?;
         if max_reassembled_message_bytes == 0 || max_physical_frame_bytes == 0 {
             return Err(ArtifactContentError::InvalidRequest);
         }
+        let client_id = scope
+            .client_id
+            .ok_or(ArtifactContentError::InvalidRequest)?;
+        let task_id = scope.task_id.ok_or(ArtifactContentError::InvalidRequest)?;
 
         let conn = self.open_query_connection()?;
         let artifact = command_bus::load_artifact(&conn, artifact_id)?
@@ -474,6 +543,8 @@ impl KernelStore {
         Ok(ArtifactContentSession {
             client_id,
             task_id,
+            request_id,
+            scope,
             artifact_id: artifact.id,
             sha256: artifact.sha256,
             content,
@@ -488,6 +559,10 @@ impl KernelStore {
 
 struct ArtifactContentRegistryEntry {
     session: ArtifactContentSession,
+    /// Current host authorization scope.  The session's immutable cursor
+    /// scope intentionally remains the issuance scope across an authenticated
+    /// reconnect; this field is what gates the new physical connection.
+    scope: SessionScope,
     last_touch: Instant,
 }
 
@@ -518,6 +593,7 @@ impl ArtifactContentRegistry {
         self.entries.insert(
             subscription_id,
             ArtifactContentRegistryEntry {
+                scope: session.scope(),
                 session,
                 last_touch: now,
             },
@@ -534,16 +610,44 @@ impl ArtifactContentRegistry {
         max_physical_frame_bytes: u32,
         now: Instant,
     ) -> Result<&ArtifactContentSession, ArtifactContentError> {
+        self.get_scoped(
+            subscription_id,
+            SessionScope {
+                client_id: Some(client_id),
+                task_id: Some(task_id),
+                connection_id: None,
+                action_epoch: None,
+                runtime_generation: None,
+            },
+            limits,
+            max_reassembled_message_bytes,
+            max_physical_frame_bytes,
+            now,
+        )
+    }
+
+    pub(crate) fn get_scoped(
+        &self,
+        subscription_id: SubscriptionId,
+        scope: SessionScope,
+        limits: PageLimits,
+        max_reassembled_message_bytes: u32,
+        max_physical_frame_bytes: u32,
+        now: Instant,
+    ) -> Result<&ArtifactContentSession, ArtifactContentError> {
         let Some(entry) = self.entries.get(&subscription_id) else {
             return Err(ArtifactContentError::NotFound);
         };
         if now.duration_since(entry.last_touch) >= ARTIFACT_CONTENT_IDLE_TTL {
             return Err(ArtifactContentError::NotFound);
         }
-        if entry.session.client_id != client_id {
+        if entry.scope.client_id != scope.client_id {
             return Err(ArtifactContentError::Unauthorized);
         }
-        if entry.session.task_id != task_id {
+        if entry.scope.task_id != scope.task_id {
+            return Err(ArtifactContentError::Unauthorized);
+        }
+        if entry.scope != scope {
             return Err(ArtifactContentError::Unauthorized);
         }
         if entry.session.limits != limits
@@ -561,20 +665,24 @@ impl ArtifactContentRegistry {
         }
     }
 
-    pub(crate) fn release(
+    pub(crate) fn release_scoped(
         &mut self,
         subscription_id: SubscriptionId,
-        client_id: ClientId,
-        task_id: TaskId,
+        scope: SessionScope,
     ) -> Result<(), ArtifactContentError> {
         match self.entries.get(&subscription_id) {
-            None => Ok(()),
-            Some(entry) if entry.session.client_id != client_id => {
+            // A release is an authorization operation, not an idempotent
+            // best-effort cleanup.  Treat an expired/evicted/already-released
+            // subscription as stale so callers cannot turn a stale scope into
+            // a successful release acknowledgement.
+            None => Err(ArtifactContentError::NotFound),
+            Some(entry) if entry.scope.client_id != scope.client_id => {
                 Err(ArtifactContentError::Unauthorized)
             }
-            Some(entry) if entry.session.task_id != task_id => {
+            Some(entry) if entry.scope.task_id != scope.task_id => {
                 Err(ArtifactContentError::Unauthorized)
             }
+            Some(entry) if entry.scope != scope => Err(ArtifactContentError::Unauthorized),
             Some(_) => {
                 self.entries.remove(&subscription_id);
                 Ok(())
@@ -585,6 +693,26 @@ impl ArtifactContentRegistry {
     pub(crate) fn reap(&mut self, now: Instant) {
         self.entries
             .retain(|_, entry| now.duration_since(entry.last_touch) < ARTIFACT_CONTENT_IDLE_TTL);
+    }
+
+    /// Migrate the registry authorization scope after a host-authenticated
+    /// reconnect.  The session keeps its original cursor scope so a cursor
+    /// issued before the handoff remains verifiable, while registry lookup
+    /// requires the new physical connection identity.
+    pub(crate) fn rebind_output(
+        &mut self,
+        client_id: ClientId,
+        old_output: uuid::Uuid,
+        new_output: uuid::Uuid,
+    ) {
+        for entry in self.entries.values_mut() {
+            if entry.scope.client_id != Some(client_id)
+                || entry.scope.connection_id != Some(old_output)
+            {
+                continue;
+            }
+            entry.scope.connection_id = Some(new_output);
+        }
     }
 
     #[cfg(test)]
@@ -602,6 +730,7 @@ impl ArtifactContentRegistry {
 mod tests {
     use sha2::{Digest, Sha256};
     use tempfile::TempDir;
+    use uuid::Uuid;
 
     use super::*;
     use crate::domain::artifact::{ArtifactFacts, ArtifactKind, PrivacyClass};
@@ -667,7 +796,7 @@ mod tests {
         };
         assert!(matches!(
             store
-                .execute(envelope(command, None, None, Command::CreateTask(intent)))
+                .execute_for_test(envelope(command, None, None, Command::CreateTask(intent)))
                 .expect("create task"),
             CommandReceipt::Accepted { .. }
         ));
@@ -1014,7 +1143,10 @@ mod tests {
         );
 
         // Tight bound: first page must be partial; remaining must fit only without a cursor.
-        let limits = PageLimits::new(10, 780).expect("limits");
+        // The cursor now carries the complete authenticated request scope, so
+        // leave enough room for that metadata while still forcing the first
+        // page to be partial.  The final remainder must fit only cursorless.
+        let limits = PageLimits::new(10, 900).expect("limits");
         let session = store
             .begin_artifact_content(
                 client,
@@ -1243,5 +1375,99 @@ mod tests {
             registry.contains(ids[0]),
             "recently touched session remains after reap of older idle entries"
         );
+    }
+
+    #[test]
+    fn artifact_cursor_requires_exact_connection_and_reconnect_migrates_once() {
+        let client = client_id(0x72);
+        let task = task_id(0x73);
+        let artifact = ArtifactId::from_bytes(fixed_uuid_v7(0x74)).expect("artifact");
+        let subscription = SubscriptionId::from_bytes(fixed_uuid_v7(0x75)).expect("subscription");
+        let old_connection = Uuid::now_v7();
+        let new_connection = Uuid::now_v7();
+        let scope = |connection_id| SessionScope {
+            client_id: Some(client),
+            task_id: Some(task),
+            connection_id: Some(connection_id),
+            action_epoch: Some(4),
+            runtime_generation: Some(9),
+        };
+        let limits = PageLimits::new(1, 1_024).expect("limits");
+        let mut registry = ArtifactContentRegistry::new();
+        registry.insert(
+            ArtifactContentSession::test_stub_scoped(
+                scope(old_connection),
+                RequestId::new(),
+                artifact,
+                subscription,
+                limits,
+            ),
+            Instant::now(),
+        );
+        let now = Instant::now();
+        let first = registry
+            .get_scoped(
+                subscription,
+                scope(old_connection),
+                limits,
+                16 * 1024 * 1024,
+                1024 * 1024,
+                now,
+            )
+            .expect("old connection owns cursor")
+            .page(None)
+            .expect("first page");
+        let first_payload_len = first.payload.len() as u64;
+        let cursor = first.next_cursor.clone().expect("bounded cursor");
+
+        assert!(matches!(
+            registry.get_scoped(
+                subscription,
+                scope(new_connection),
+                limits,
+                16 * 1024 * 1024,
+                1024 * 1024,
+                now,
+            ),
+            Err(ArtifactContentError::Unauthorized)
+        ));
+
+        registry.rebind_output(client, old_connection, new_connection);
+        assert!(matches!(
+            registry.get_scoped(
+                subscription,
+                scope(old_connection),
+                limits,
+                16 * 1024 * 1024,
+                1024 * 1024,
+                now,
+            ),
+            Err(ArtifactContentError::Unauthorized)
+        ));
+        assert!(matches!(
+            registry.release_scoped(subscription, scope(old_connection)),
+            Err(ArtifactContentError::Unauthorized)
+        ));
+        let resumed = registry
+            .get_scoped(
+                subscription,
+                scope(new_connection),
+                limits,
+                16 * 1024 * 1024,
+                1024 * 1024,
+                now,
+            )
+            .expect("new connection owns migrated cursor")
+            .page(Some(cursor.as_slice()))
+            .expect("cursor remains valid only through the explicit migration");
+        assert_eq!(resumed.offset, first_payload_len);
+        registry
+            .release_scoped(subscription, scope(new_connection))
+            .expect("new connection may release migrated cursor");
+        assert!(!registry.contains(subscription));
+        assert!(matches!(
+            registry.release_scoped(subscription, scope(new_connection)),
+            Err(ArtifactContentError::NotFound)
+        ));
     }
 }

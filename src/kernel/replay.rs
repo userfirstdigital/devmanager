@@ -13,6 +13,7 @@ use crate::kernel::store::{
     decode_stored_domain_event, load_event_log_bounds, u64_from_nonnegative_i64, u64_to_sqlite_i64,
     KernelStore, StoreError,
 };
+use crate::kernel::SessionScope;
 
 const EVENT_CURSOR_VERSION: u16 = 1;
 const EVENT_CURSOR_DOMAIN: &[u8] = b"devmanager:event-cursor:v1\0";
@@ -116,6 +117,7 @@ struct EventCursorDocument {
     through_sequence: u64,
     last_sequence: u64,
     limits: PageLimits,
+    scope: SessionScope,
 }
 
 /// One immutable, read-only SQLite view of an ordered durable event range.
@@ -127,6 +129,7 @@ pub(crate) struct EventReplaySession {
     start_after_sequence: u64,
     through_sequence: u64,
     limits: PageLimits,
+    scope: SessionScope,
     cursor_hmac_key: Zeroizing<[u8; 32]>,
     conn: Connection,
 }
@@ -148,6 +151,15 @@ impl KernelStore {
         &self,
         after_sequence: u64,
         limits: PageLimits,
+    ) -> Result<EventReplaySession, ReplayError> {
+        self.begin_event_replay_scoped(after_sequence, limits, SessionScope::GLOBAL)
+    }
+
+    pub(crate) fn begin_event_replay_scoped(
+        &self,
+        after_sequence: u64,
+        limits: PageLimits,
+        scope: SessionScope,
     ) -> Result<EventReplaySession, ReplayError> {
         limits.validate()?;
         let mut cursor_hmac_key = Zeroizing::new([0u8; 32]);
@@ -173,6 +185,7 @@ impl KernelStore {
             start_after_sequence: after_sequence,
             through_sequence,
             limits,
+            scope,
             cursor_hmac_key,
             conn,
         })
@@ -182,6 +195,10 @@ impl KernelStore {
 impl EventReplaySession {
     pub(crate) fn subscription_id(&self) -> SubscriptionId {
         self.subscription_id
+    }
+
+    pub(crate) fn scope(&self) -> SessionScope {
+        self.scope
     }
 
     /// Read one bounded event page from the view pinned by `begin_event_replay`.
@@ -273,6 +290,7 @@ impl EventReplaySession {
             through_sequence: self.through_sequence,
             last_sequence,
             limits: self.limits,
+            scope: self.scope,
         };
         let payload =
             rmp_serde::to_vec_named(&document).map_err(|error| StoreError::CodecMismatch {
@@ -312,6 +330,7 @@ impl EventReplaySession {
         if document.start_after_sequence != self.start_after_sequence
             || document.through_sequence != self.through_sequence
             || document.limits != self.limits
+            || document.scope != self.scope
         {
             return Err(ReplayError::CursorContextMismatch);
         }
@@ -474,6 +493,7 @@ mod tests {
         ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity,
         WorkspaceRef,
     };
+    use uuid::Uuid;
 
     fn fixed_uuid_v7(tail: u8) -> [u8; 16] {
         [
@@ -531,7 +551,7 @@ mod tests {
         };
         assert!(matches!(
             store
-                .execute(envelope(
+                .execute_for_test(envelope(
                     command_id(tail.wrapping_add(0x40)),
                     None,
                     None,
@@ -727,6 +747,71 @@ mod tests {
             store.begin_event_replay(first.through_sequence + 1, limits),
             Err(ReplayError::InvalidRange { .. })
         ));
+    }
+
+    #[test]
+    fn scoped_event_cursor_rejects_cross_scope_replay() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("kernel.sqlite3");
+        let mut store = KernelStore::open(&path).expect("open");
+        create_task(&mut store, 0xE7);
+        create_task(&mut store, 0xE8);
+
+        let limits = PageLimits::new(1, 512 * 1024).expect("limits");
+        let scope = SessionScope {
+            client_id: Some(client_id(0xE9)),
+            task_id: Some(task_id(0xEA)),
+            connection_id: Some(Uuid::now_v7()),
+            action_epoch: Some(13),
+            runtime_generation: Some(17),
+        };
+        let first = store
+            .begin_event_replay_scoped(0, limits, scope)
+            .expect("scoped replay");
+        let cursor = first
+            .page(None)
+            .expect("first page")
+            .next_cursor
+            .expect("resume cursor");
+
+        let other_scopes = [
+            SessionScope {
+                client_id: Some(ClientId::new()),
+                ..scope
+            },
+            SessionScope {
+                task_id: Some(TaskId::new()),
+                ..scope
+            },
+            SessionScope {
+                connection_id: Some(Uuid::now_v7()),
+                ..scope
+            },
+            SessionScope {
+                action_epoch: Some(scope.action_epoch.unwrap() + 1),
+                ..scope
+            },
+            SessionScope {
+                runtime_generation: Some(scope.runtime_generation.unwrap() + 1),
+                ..scope
+            },
+        ];
+        for other_scope in other_scopes {
+            let mut other = store
+                .begin_event_replay_scoped(0, limits, other_scope)
+                .expect("other scoped replay");
+            // Preserve every non-scope cursor field and the HMAC key so this
+            // exercises the exact namespace check rather than random-key
+            // rejection.
+            other.start_after_sequence = first.start_after_sequence;
+            other.through_sequence = first.through_sequence;
+            other.limits = first.limits;
+            other.cursor_hmac_key = first.cursor_hmac_key.clone();
+            assert_eq!(
+                other.page(Some(&cursor)),
+                Err(ReplayError::CursorContextMismatch)
+            );
+        }
     }
 
     #[test]

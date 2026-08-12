@@ -1,6 +1,15 @@
+pub mod command;
 pub mod git_service;
 mod git_ui;
+pub mod model;
+pub mod review;
 
+#[cfg(test)]
+mod test_git_process;
+#[cfg(test)]
+mod test_git_service;
+
+use crate::git::command::GitRepository;
 use crate::persistence;
 use crate::remote::{RemoteAction, RemoteActionPayload, RemoteClientHandle};
 use crate::theme;
@@ -87,7 +96,7 @@ pub struct GitWindow {
 
 #[derive(Clone)]
 enum GitBackend {
-    Local,
+    Local(Vec<GitRepository>),
     Remote(RemoteClientHandle),
 }
 
@@ -102,8 +111,12 @@ macro_rules! git_spawn {
 }
 
 impl GitWindow {
-    pub fn new(repos: Vec<(String, String)>, cx: &mut Context<Self>) -> Self {
-        Self::new_with_backend(repos, GitBackend::Local, cx)
+    pub fn new_local(
+        repos: Vec<(String, String)>,
+        repositories: Vec<GitRepository>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::new_with_backend(repos, GitBackend::Local(repositories), cx)
     }
 
     pub fn new_remote(
@@ -163,7 +176,7 @@ impl GitWindow {
             last_fetch_at: None,
             operation_result: None,
         };
-        if matches!(win.backend, GitBackend::Local) {
+        if matches!(win.backend, GitBackend::Local(_)) {
             win.load_persisted_token();
         }
         win.fetch_github_username(cx);
@@ -181,8 +194,15 @@ impl GitWindow {
 
     fn remote_client(&self) -> Option<RemoteClientHandle> {
         match &self.backend {
-            GitBackend::Local => None,
+            GitBackend::Local(_) => None,
             GitBackend::Remote(client) => Some(client.clone()),
+        }
+    }
+
+    fn local_repository(&self) -> Option<GitRepository> {
+        match &self.backend {
+            GitBackend::Local(repositories) => repositories.get(self.active_repo).cloned(),
+            GitBackend::Remote(_) => None,
         }
     }
 
@@ -203,6 +223,9 @@ impl GitWindow {
     }
 
     fn ensure_mutation_control(&mut self, cx: &mut Context<Self>) -> bool {
+        if matches!(self.backend, GitBackend::Local) && !self.ensure_config_write_available(cx) {
+            return false;
+        }
         if self.has_mutation_control() {
             return true;
         }
@@ -212,6 +235,22 @@ impl GitWindow {
         ));
         cx.notify();
         false
+    }
+
+    fn ensure_config_write_available(&mut self, cx: &mut Context<Self>) -> bool {
+        match persistence::active_config_write_availability() {
+            persistence::ConfigWriteAvailability::Ready => true,
+            persistence::ConfigWriteAvailability::Unavailable { diagnostic } => {
+                self.operation_result = Some((
+                    false,
+                    format!(
+                        "GitHub/configuration writes are unavailable until ConfigStore is repaired: {diagnostic}"
+                    ),
+                ));
+                cx.notify();
+                false
+            }
+        }
     }
 
     fn logout_github(&mut self, cx: &mut Context<Self>) {
@@ -288,6 +327,10 @@ impl GitWindow {
             .collect();
 
         let remote_client = self.remote_client();
+        let local_repositories = match &self.backend {
+            GitBackend::Local(repositories) => Some(repositories.clone()),
+            GitBackend::Remote(_) => None,
+        };
 
         git_spawn!(cx, |this, cx| {
             let results: Vec<(usize, bool, u32)> =
@@ -313,7 +356,13 @@ impl GitWindow {
                                         Err(error) => Err(error),
                                     }
                                 } else {
-                                    git_service::status(&path)
+                                    local_repositories
+                                        .as_ref()
+                                        .and_then(|repositories| repositories.get(i))
+                                        .ok_or_else(|| {
+                                            "Local Git repository is unavailable.".to_string()
+                                        })
+                                        .and_then(git_service::status)
                                 };
                                 match status {
                                     Ok(s) => {
@@ -347,6 +396,7 @@ impl GitWindow {
     fn refresh_status_inner(&mut self, auto_stage: bool, cx: &mut Context<Self>) {
         let repo = self.repo_path().to_string();
         let remote_client = self.remote_client();
+        let local_repository = self.local_repository();
         self.is_loading = true;
         git_spawn!(cx, |this, cx| {
             // Auto-stage all files so they appear checked by default (like GitHub Desktop)
@@ -360,10 +410,15 @@ impl GitWindow {
                         })
                         .await;
                 } else {
-                    let repo2 = repo.clone();
+                    let repository = local_repository.clone();
                     let _ = cx
                         .background_executor()
-                        .spawn(async move { git_service::stage_all(&repo2) })
+                        .spawn(async move {
+                            repository
+                                .as_ref()
+                                .ok_or_else(|| "Local Git repository is unavailable.".to_string())
+                                .and_then(git_service::stage_all)
+                        })
                         .await;
                 }
             }
@@ -382,7 +437,10 @@ impl GitWindow {
                             Err(error) => Err(error),
                         }
                     } else {
-                        git_service::status(&repo)
+                        local_repository
+                            .as_ref()
+                            .ok_or_else(|| "Local Git repository is unavailable.".to_string())
+                            .and_then(git_service::status)
                     }
                 })
                 .await;
@@ -411,6 +469,7 @@ impl GitWindow {
     pub fn load_branches(&mut self, cx: &mut Context<Self>) {
         let repo = self.repo_path().to_string();
         let remote_client = self.remote_client();
+        let local_repository = self.local_repository();
         git_spawn!(cx, |this, cx| {
             let branches = cx
                 .background_executor()
@@ -427,7 +486,10 @@ impl GitWindow {
                             Err(error) => Err(error),
                         }
                     } else {
-                        git_service::branches(&repo)
+                        local_repository
+                            .as_ref()
+                            .ok_or_else(|| "Local Git repository is unavailable.".to_string())
+                            .and_then(git_service::branches)
                     }
                 })
                 .await;
@@ -444,6 +506,7 @@ impl GitWindow {
         let repo = self.repo_path().to_string();
         let skip = self.log_page * 50;
         let remote_client = self.remote_client();
+        let local_repository = self.local_repository();
         git_spawn!(cx, |this, cx| {
             let entries = cx
                 .background_executor()
@@ -464,7 +527,10 @@ impl GitWindow {
                             Err(error) => Err(error),
                         }
                     } else {
-                        git_service::log(&repo, 50, skip)
+                        local_repository
+                            .as_ref()
+                            .ok_or_else(|| "Local Git repository is unavailable.".to_string())
+                            .and_then(|repository| git_service::log(repository, 50, skip))
                     }
                 })
                 .await;
@@ -489,6 +555,7 @@ impl GitWindow {
         let repo = self.repo_path().to_string();
         let file_path = path.to_string();
         let remote_client = self.remote_client();
+        let local_repository = self.local_repository();
         let staged = self
             .status
             .as_ref()
@@ -516,7 +583,12 @@ impl GitWindow {
                             Err(error) => Err(error),
                         }
                     } else {
-                        git_service::diff_file(&repo, &file_path, staged)
+                        local_repository
+                            .as_ref()
+                            .ok_or_else(|| "Local Git repository is unavailable.".to_string())
+                            .and_then(|repository| {
+                                git_service::diff_file(repository, &file_path, staged)
+                            })
                     }
                 })
                 .await;
@@ -536,6 +608,7 @@ impl GitWindow {
         let repo = self.repo_path().to_string();
         let hash = hash.to_string();
         let remote_client = self.remote_client();
+        let local_repository = self.local_repository();
 
         git_spawn!(cx, |this, cx| {
             let diff = cx
@@ -556,7 +629,10 @@ impl GitWindow {
                             Err(error) => Err(error),
                         }
                     } else {
-                        git_service::diff_commit(&repo, &hash)
+                        local_repository
+                            .as_ref()
+                            .ok_or_else(|| "Local Git repository is unavailable.".to_string())
+                            .and_then(|repository| git_service::diff_commit(repository, &hash))
                     }
                 })
                 .await;
@@ -579,6 +655,7 @@ impl GitWindow {
         let repo = self.repo_path().to_string();
         let file_path = path.to_string();
         let remote_client = self.remote_client();
+        let local_repository = self.local_repository();
         git_spawn!(cx, |this, cx| {
             let result = cx
                 .background_executor()
@@ -595,7 +672,12 @@ impl GitWindow {
                             Err(error) => Err(error),
                         }
                     } else {
-                        git_service::stage(&repo, &[file_path.as_str()])
+                        local_repository
+                            .as_ref()
+                            .ok_or_else(|| "Local Git repository is unavailable.".to_string())
+                            .and_then(|repository| {
+                                git_service::stage(repository, &[file_path.as_str()])
+                            })
                     }
                 })
                 .await;
@@ -615,6 +697,7 @@ impl GitWindow {
         let repo = self.repo_path().to_string();
         let file_path = path.to_string();
         let remote_client = self.remote_client();
+        let local_repository = self.local_repository();
         git_spawn!(cx, |this, cx| {
             let result = cx
                 .background_executor()
@@ -631,7 +714,12 @@ impl GitWindow {
                             Err(error) => Err(error),
                         }
                     } else {
-                        git_service::unstage(&repo, &[file_path.as_str()])
+                        local_repository
+                            .as_ref()
+                            .ok_or_else(|| "Local Git repository is unavailable.".to_string())
+                            .and_then(|repository| {
+                                git_service::unstage(repository, &[file_path.as_str()])
+                            })
                     }
                 })
                 .await;
@@ -650,6 +738,7 @@ impl GitWindow {
         }
         let repo = self.repo_path().to_string();
         let remote_client = self.remote_client();
+        let local_repository = self.local_repository();
         git_spawn!(cx, |this, cx| {
             let result = cx
                 .background_executor()
@@ -663,7 +752,10 @@ impl GitWindow {
                             Err(error) => Err(error),
                         }
                     } else {
-                        git_service::stage_all(&repo)
+                        local_repository
+                            .as_ref()
+                            .ok_or_else(|| "Local Git repository is unavailable.".to_string())
+                            .and_then(git_service::stage_all)
                     }
                 })
                 .await;
@@ -682,6 +774,7 @@ impl GitWindow {
         }
         let repo = self.repo_path().to_string();
         let remote_client = self.remote_client();
+        let local_repository = self.local_repository();
         git_spawn!(cx, |this, cx| {
             let result = cx
                 .background_executor()
@@ -695,7 +788,10 @@ impl GitWindow {
                             Err(error) => Err(error),
                         }
                     } else {
-                        git_service::unstage_all(&repo)
+                        local_repository
+                            .as_ref()
+                            .ok_or_else(|| "Local Git repository is unavailable.".to_string())
+                            .and_then(git_service::unstage_all)
                     }
                 })
                 .await;
@@ -711,23 +807,22 @@ impl GitWindow {
     // ── Token persistence ────────────────────────────────────────────
 
     pub fn persist_github_token(token: Option<String>) {
-        if let Ok(mut config) = persistence::load_config() {
-            config.settings.github_token = token;
-            let _ = persistence::save_config(&config);
+        let availability: persistence::ConfigWriteAvailability =
+            persistence::active_config_write_availability();
+        if !matches!(availability, persistence::ConfigWriteAvailability::Ready) {
+            return;
         }
+        // The canonical ConfigStore accepts only credential references.  A
+        // raw OAuth token is retained in memory for the current session and is
+        // deliberately rejected by the persistence boundary until the
+        // credential-provider migration lands.
+        let _ = persistence::persist_github_token_reference(token.as_deref());
     }
 
     fn load_persisted_token(&mut self) {
-        if self.github_token.is_some() {
-            return;
-        }
-        if let Ok(config) = persistence::load_config() {
-            if let Some(ref token) = config.settings.github_token {
-                if !token.is_empty() {
-                    self.github_token = Some(token.clone());
-                }
-            }
-        }
+        // Raw GitHub tokens are never reconstructed from the legacy-facing
+        // model.  A future credential provider will resolve the strict opaque
+        // reference here without exposing it through diagnostics or export.
     }
 
     fn fetch_github_username(&mut self, cx: &mut Context<Self>) {
@@ -994,6 +1089,7 @@ impl GitWindow {
         }
         let repo = self.repo_path().to_string();
         let remote_client = self.remote_client();
+        let local_repository = self.local_repository();
         let token = self.github_token.clone().unwrap_or_default();
         self.is_generating_message = true;
         cx.notify();
@@ -1019,7 +1115,10 @@ impl GitWindow {
                                 Err(error) => Err(error),
                             }
                         } else {
-                            let diff = git_service::get_staged_diff(&repo)?;
+                            let repository = local_repository.as_ref().ok_or_else(|| {
+                                "Local Git repository is unavailable.".to_string()
+                            })?;
+                            let diff = git_service::get_staged_diff(repository)?;
                             if diff.trim().is_empty() {
                                 return Err("No staged changes to summarize".to_string());
                             }
@@ -1062,6 +1161,7 @@ impl GitWindow {
             Some(self.commit_description.clone())
         };
         let remote_client = self.remote_client();
+        let local_repository = self.local_repository();
 
         git_spawn!(cx, |this, cx| {
             let result = cx
@@ -1083,7 +1183,12 @@ impl GitWindow {
                             Err(error) => Err(error),
                         }
                     } else {
-                        git_service::commit(&repo, &summary, body.as_deref())
+                        local_repository
+                            .as_ref()
+                            .ok_or_else(|| "Local Git repository is unavailable.".to_string())
+                            .and_then(|repository| {
+                                git_service::commit(repository, &summary, body.as_deref())
+                            })
                     }
                 })
                 .await;
@@ -1122,6 +1227,7 @@ impl GitWindow {
             .and_then(|s| s.branch.clone())
             .unwrap_or_default();
         let remote_client = self.remote_client();
+        let local_repository = self.local_repository();
         self.is_pushing = true;
         cx.notify();
 
@@ -1146,10 +1252,13 @@ impl GitWindow {
                             Err(error) => Err(error),
                         }
                     } else {
+                        let repository = local_repository
+                            .as_ref()
+                            .ok_or_else(|| "Local Git repository is unavailable.".to_string())?;
                         if has_upstream {
-                            git_service::sync(&repo)
+                            git_service::sync(repository)
                         } else {
-                            git_service::push_set_upstream(&repo, &branch)
+                            git_service::push_set_upstream(repository, &branch)
                         }
                     }
                 })
@@ -1181,6 +1290,7 @@ impl GitWindow {
         }
         let repo = self.repo_path().to_string();
         let remote_client = self.remote_client();
+        let local_repository = self.local_repository();
         self.is_pulling = true;
         cx.notify();
         git_spawn!(cx, |this, cx| {
@@ -1196,7 +1306,10 @@ impl GitWindow {
                             Err(error) => Err(error),
                         }
                     } else {
-                        git_service::pull(&repo)
+                        local_repository
+                            .as_ref()
+                            .ok_or_else(|| "Local Git repository is unavailable.".to_string())
+                            .and_then(git_service::pull)
                     }
                 })
                 .await;
@@ -1227,6 +1340,7 @@ impl GitWindow {
         }
         let repo = self.repo_path().to_string();
         let remote_client = self.remote_client();
+        let local_repository = self.local_repository();
         self.is_fetching = true;
         cx.notify();
         git_spawn!(cx, |this, cx| {
@@ -1242,7 +1356,10 @@ impl GitWindow {
                             Err(error) => Err(error),
                         }
                     } else {
-                        git_service::fetch(&repo)
+                        local_repository
+                            .as_ref()
+                            .ok_or_else(|| "Local Git repository is unavailable.".to_string())
+                            .and_then(git_service::fetch)
                     }
                 })
                 .await;
@@ -1267,6 +1384,7 @@ impl GitWindow {
         let repo = self.repo_path().to_string();
         let branch = name.to_string();
         let remote_client = self.remote_client();
+        let local_repository = self.local_repository();
         self.show_branch_dropdown = false;
         git_spawn!(cx, |this, cx| {
             let result = cx
@@ -1284,7 +1402,10 @@ impl GitWindow {
                             Err(error) => Err(error),
                         }
                     } else {
-                        git_service::switch_branch(&repo, &branch)
+                        local_repository
+                            .as_ref()
+                            .ok_or_else(|| "Local Git repository is unavailable.".to_string())
+                            .and_then(|repository| git_service::switch_branch(repository, &branch))
                     }
                 })
                 .await;
@@ -1319,6 +1440,7 @@ impl GitWindow {
         self.new_branch_name.clear();
         self.show_branch_dropdown = false;
         let remote_client = self.remote_client();
+        let local_repository = self.local_repository();
         git_spawn!(cx, |this, cx| {
             let result = cx
                 .background_executor()
@@ -1335,7 +1457,10 @@ impl GitWindow {
                             Err(error) => Err(error),
                         }
                     } else {
-                        git_service::create_branch(&repo, &name)
+                        local_repository
+                            .as_ref()
+                            .ok_or_else(|| "Local Git repository is unavailable.".to_string())
+                            .and_then(|repository| git_service::create_branch(repository, &name))
                     }
                 })
                 .await;
@@ -1356,6 +1481,7 @@ impl GitWindow {
         let repo = self.repo_path().to_string();
         let branch = name.to_string();
         let remote_client = self.remote_client();
+        let local_repository = self.local_repository();
         git_spawn!(cx, |this, cx| {
             let result = cx
                 .background_executor()
@@ -1372,7 +1498,10 @@ impl GitWindow {
                             Err(error) => Err(error),
                         }
                     } else {
-                        git_service::delete_branch(&repo, &branch)
+                        local_repository
+                            .as_ref()
+                            .ok_or_else(|| "Local Git repository is unavailable.".to_string())
+                            .and_then(|repository| git_service::delete_branch(repository, &branch))
                     }
                 })
                 .await;

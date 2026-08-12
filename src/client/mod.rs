@@ -3,6 +3,7 @@
 
 pub mod action;
 pub mod cli;
+pub mod command_center;
 mod connection;
 mod host_client;
 pub mod model;

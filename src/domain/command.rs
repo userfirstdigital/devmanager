@@ -15,6 +15,7 @@ use crate::domain::task::{
     ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity, TaskFacts,
     TaskLifecycle, WorkspaceRef,
 };
+use crate::workspace::WorkspaceRequest;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -646,6 +647,27 @@ pub struct CreateTaskIntent {
     pub review_readiness: ReviewReadiness,
 }
 
+/// Request-shaped task creation accepted only at the authenticated host
+/// boundary. The host resolves `workspace` against the ProjectId root from
+/// host-owned configuration and creates the durable [`CreateTaskIntent`]
+/// privately before persistence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateTaskRequestIntent {
+    pub id: TaskId,
+    pub environment_id: EnvironmentId,
+    pub title: String,
+    pub description: Option<String>,
+    pub project_id: ProjectId,
+    pub workspace: WorkspaceRequest,
+    pub assignment: TaskAssignment,
+    pub created_at_ms: i64,
+    pub connectivity: TaskConnectivity,
+    pub attention: TaskAttention,
+    pub activity: TaskActivity,
+    pub review_readiness: ReviewReadiness,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RenameTaskIntent {
@@ -745,6 +767,7 @@ impl<'de> Deserialize<'de> for ConfirmHostQuitIntent {
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum Command {
     CreateTask(CreateTaskIntent),
+    CreateTaskV2(CreateTaskRequestIntent),
     RenameTask(RenameTaskIntent),
     SetTaskAttention(SetTaskAttentionIntent),
     BeginCloseTask,
@@ -763,6 +786,10 @@ pub fn decide(
 ) -> Result<Vec<Event>, RejectionCode> {
     match &envelope.command {
         Command::CreateTask(intent) => decide_create_task(snapshot, envelope, intent),
+        // Request-shaped creation must be normalized by the host boundary;
+        // accepting it in the domain would make the client request itself
+        // authoritative over durable workspace state.
+        Command::CreateTaskV2(_) => Err(RejectionCode::InvalidTransition),
         Command::RenameTask(intent) => {
             let snap = require_open_or_closing_task(snapshot, envelope)?;
             require_expected_revision(snap, envelope)?;

@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "git": {
+    "backend": "local-cli-fixture",
+    "adapter_integrated": false,
+    "porcelain": ["worktree-list", "status-v2"],
+    "mutating_executor": false
+  },
+  "service": {
+    "catalog_decode": true,
+    "supervisor_launch": false,
+    "job_ownership": false
+  },
+  "port": {
+    "live_probe": false,
+    "external_listener_control": "forbidden",
+    "observed_only": true
+  },
+  "ssh": {
+    "launch_adapter": false,
+    "password_auto_inject": false,
+    "secrets_in_events": false
+  }
+}

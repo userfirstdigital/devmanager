@@ -290,9 +290,10 @@ fn workspace_and_assignment_validate_paths_and_principals() {
 
 #[test]
 fn task_facts_serde_preserves_persisted_fields_and_rejects_malformed() {
-    let workspace =
-        WorkspaceRef::worktree(PathBuf::from(r"C:\code\proj\.worktrees\a"), "feature/x")
-            .expect("workspace");
+    // Durable serialization may only carry an opaque host binding.  Use the
+    // path-free Main fixture for this round-trip; path-bearing request refs
+    // are intentionally rejected at the durable boundary.
+    let workspace = WorkspaceRef::Main;
     let assignment =
         TaskAssignment::external_principal("org", "user@example.com").expect("assignment");
     let mut facts = TaskFacts::new(

@@ -6,9 +6,12 @@
 //! writes through dual bounded critical and durable output lanes. Live durable
 //! event tails attach after frozen EventReplay on the same duplex connection.
 
+use std::collections::HashMap;
 use std::future::Future;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::config::paths::AppProfile;
@@ -17,8 +20,8 @@ use crate::kernel::CommandBus;
 use crate::protocol::{
     Capability, CapabilitySet, ClientHello, ClientHelloError, ClientRequest, FrameLimits,
     MessagePackCodec, MessagePackError, NegotiatedParameters, PhysicalFrameCodec,
-    PhysicalFrameError, ProfileFingerprint, ServerBuildError, ServerHello, ServerHelloError,
-    ServerMessage,
+    PhysicalFrameError, ProfileFingerprint, ReconnectGrant, ServerBuildError, ServerHello,
+    ServerHelloError, ServerMessage,
 };
 
 use super::connection::{
@@ -28,6 +31,80 @@ use super::connection::{
 
 const PIPE_PRODUCT_PREFIX: &str = r"\\.\pipe\devmanager-";
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+const RECONNECT_GRANT_TTL: Duration = Duration::from_secs(5 * 60);
+const MAX_RECONNECT_GRANTS: usize = 256;
+
+#[derive(Clone, Copy)]
+struct ReconnectGrantRecord {
+    host_boot_id: Uuid,
+    client_id: ClientId,
+    connection_id: Uuid,
+    issued_at: std::time::Instant,
+}
+
+#[derive(Default)]
+struct ReconnectGrantLedger {
+    entries: HashMap<[u8; 32], ReconnectGrantRecord>,
+}
+
+impl ReconnectGrantLedger {
+    fn reap(&mut self, now: std::time::Instant) {
+        self.entries
+            .retain(|_, entry| now.duration_since(entry.issued_at) < RECONNECT_GRANT_TTL);
+    }
+
+    fn admit(
+        &mut self,
+        host_boot_id: Uuid,
+        client_id: ClientId,
+        presented: Option<&ReconnectGrant>,
+        new_connection_id: Uuid,
+        now: std::time::Instant,
+    ) -> Result<(ReconnectGrant, Option<Uuid>), IpcError> {
+        self.reap(now);
+        let reconnect_from = if let Some(grant) = presented {
+            let digest: [u8; 32] = Sha256::digest(grant.as_bytes()).into();
+            let Some(record) = self.entries.get(&digest).copied() else {
+                return Err(IpcError::Unauthorized);
+            };
+            if record.host_boot_id != host_boot_id || record.client_id != client_id {
+                return Err(IpcError::Unauthorized);
+            }
+            // Single-use: consume the old credential before issuing its
+            // successor. A retry/replay of the old bytes can never revive it.
+            self.entries.remove(&digest);
+            Some(record.connection_id)
+        } else {
+            None
+        };
+        if self.entries.len() >= MAX_RECONNECT_GRANTS {
+            return Err(IpcError::Busy);
+        }
+        let grant = ReconnectGrant::issue()
+            .map_err(|_| IpcError::Security("reconnect grant entropy unavailable".to_string()))?;
+        let digest: [u8; 32] = Sha256::digest(grant.as_bytes()).into();
+        self.entries.insert(
+            digest,
+            ReconnectGrantRecord {
+                host_boot_id,
+                client_id,
+                connection_id: new_connection_id,
+                issued_at: now,
+            },
+        );
+        Ok((grant, reconnect_from))
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+fn global_reconnect_grants() -> &'static Mutex<ReconnectGrantLedger> {
+    static LEDGER: OnceLock<Mutex<ReconnectGrantLedger>> = OnceLock::new();
+    LEDGER.get_or_init(|| Mutex::new(ReconnectGrantLedger::default()))
+}
 
 /// Reader disposition after applying one duplex execute completion to the output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -365,6 +442,7 @@ pub struct HostConnection {
     client_id: ClientId,
     negotiated: NegotiatedParameters,
     server_hello: ServerHello,
+    reconnect_from: Option<Uuid>,
     physical: PhysicalFrameCodec,
     message: MessagePackCodec,
     poisoned: bool,
@@ -402,6 +480,9 @@ impl HostConnection {
     /// Exclusive compatibility path used by ipc_protocol tests: dispatches
     /// directly against a caller-owned [`CommandBus`]. Concurrent host serving
     /// uses [`Self::serve_duplex`] instead.
+    /// The compatibility path has no host project resolver, so request-shaped
+    /// `task.create.v2` commands are intentionally rejected there; production
+    /// task creation must use the resolver-backed executor path.
     pub async fn serve_request(&mut self, bus: &mut CommandBus) -> Result<(), IpcError> {
         connection_ensure_live(self.poisoned)?;
         #[cfg(windows)]
@@ -578,41 +659,59 @@ async fn windows_finish_handshake(mut listener: HelloListener) -> Result<HostCon
 
     let (hello_physical, hello_message) = handshake_codecs()?;
 
-    let (client_id, negotiated, server_hello) = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
-        let payload = read_physical_frame(&mut listener.server, &hello_physical).await?;
-        let hello = hello_message
-            .decode::<ClientHello>(&payload)
-            .map_err(IpcError::MessagePack)?;
-        if hello.profile_fingerprint != listener.expected_fingerprint {
-            return Err(IpcError::ProfileMismatch);
-        }
-        let negotiated = fence_capabilities_by_transport(
-            hello
-                .negotiate(listener.config.supported, listener.config.local_limits)
-                .map_err(IpcError::ClientHello)?,
-        );
-        let server_hello = ServerHello::from_negotiated(
-            listener.config.server_build.clone(),
-            listener.config.host_boot_id,
-            listener.expected_fingerprint,
-            negotiated,
-        )
-        .map_err(IpcError::ServerHello)?;
-        let encoded = hello_message
-            .encode(&server_hello)
-            .map_err(IpcError::MessagePack)?;
-        write_physical_frame(&mut listener.server, &hello_physical, &encoded).await?;
-        listener.server.flush().await.map_err(IpcError::Io)?;
-        Ok((negotiated.client_id, negotiated, server_hello))
-    })
-    .await
-    .map_err(|_| IpcError::Timeout)??;
+    let (client_id, negotiated, server_hello, reconnect_from) =
+        tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
+            let payload = read_physical_frame(&mut listener.server, &hello_physical).await?;
+            let hello = hello_message
+                .decode::<ClientHello>(&payload)
+                .map_err(IpcError::MessagePack)?;
+            if hello.profile_fingerprint != listener.expected_fingerprint {
+                return Err(IpcError::ProfileMismatch);
+            }
+            let negotiated = fence_capabilities_by_transport(
+                hello
+                    .negotiate(listener.config.supported, listener.config.local_limits)
+                    .map_err(IpcError::ClientHello)?,
+            );
+            let mut server_hello = ServerHello::from_negotiated(
+                listener.config.server_build.clone(),
+                listener.config.host_boot_id,
+                listener.expected_fingerprint,
+                negotiated,
+            )
+            .map_err(IpcError::ServerHello)?;
+            let (reconnect_grant, reconnect_from) = global_reconnect_grants()
+                .lock()
+                .map_err(|_| IpcError::Security("reconnect grant ledger poisoned".into()))?
+                .admit(
+                    listener.config.host_boot_id,
+                    hello.client_id,
+                    hello.reconnect_grant.as_ref(),
+                    server_hello.connection_id,
+                    std::time::Instant::now(),
+                )?;
+            server_hello.reconnect_grant = Some(reconnect_grant);
+            let encoded = hello_message
+                .encode(&server_hello)
+                .map_err(IpcError::MessagePack)?;
+            write_physical_frame(&mut listener.server, &hello_physical, &encoded).await?;
+            listener.server.flush().await.map_err(IpcError::Io)?;
+            Ok((
+                negotiated.client_id,
+                negotiated,
+                server_hello,
+                reconnect_from,
+            ))
+        })
+        .await
+        .map_err(|_| IpcError::Timeout)??;
 
     let (physical, message) = negotiated_codecs(negotiated.limits)?;
     Ok(HostConnection {
         client_id,
         negotiated,
         server_hello,
+        reconnect_from,
         physical,
         message,
         poisoned: false,
@@ -736,8 +835,10 @@ async fn windows_serve_duplex(
     drain_mode: OutputDrainMode,
 ) -> Result<(), IpcError> {
     let HostConnection {
+        client_id,
         negotiated,
         server_hello,
+        reconnect_from,
         physical,
         message,
         pipe,
@@ -752,7 +853,9 @@ async fn windows_serve_duplex(
     );
     let reader_output = output.clone();
     let mut reader_shutdown = output.subscribe_shutdown();
-    let registration = requests.register_output(output).await?;
+    let registration = requests
+        .register_output_for_connection(output, client_id, reconnect_from)
+        .await?;
     let requests = requests.with_output(registration.id());
     let message_for_writer = message;
     let physical_for_writer = physical;
@@ -1115,9 +1218,12 @@ mod tests {
     use super::{
         connection_ensure_live, connection_fail_closed, protected_pipe_sddl,
         read_physical_frame_idle_then_deadline, supervise_duplex_halves,
-        write_physical_frame_with_deadline, IpcError,
+        write_physical_frame_with_deadline, IpcError, ReconnectGrantLedger, MAX_RECONNECT_GRANTS,
+        RECONNECT_GRANT_TTL,
     };
+    use crate::domain::ClientId;
     use crate::protocol::{FrameLimits, PhysicalFrameCodec};
+    use uuid::Uuid;
 
     #[test]
     fn protected_pipe_sddl_is_exact_protected_two_ace_form() {
@@ -1125,6 +1231,70 @@ mod tests {
             protected_pipe_sddl("S-1-5-21-1-2-3-1001"),
             "D:P(A;;GA;;;SY)(A;;GA;;;S-1-5-21-1-2-3-1001)"
         );
+    }
+
+    #[test]
+    fn reconnect_grants_are_single_use_exact_client_boot_bound_and_expire() {
+        let mut ledger = ReconnectGrantLedger::default();
+        let boot = Uuid::now_v7();
+        let other_boot = Uuid::now_v7();
+        let client = ClientId::new();
+        let other_client = ClientId::new();
+        let issued_at = std::time::Instant::now();
+        let old_connection = Uuid::now_v7();
+        let (grant, previous) = ledger
+            .admit(boot, client, None, old_connection, issued_at)
+            .expect("initial grant");
+        assert!(previous.is_none());
+
+        assert!(matches!(
+            ledger.admit(other_boot, client, Some(&grant), Uuid::now_v7(), issued_at,),
+            Err(IpcError::Unauthorized)
+        ));
+        assert!(matches!(
+            ledger.admit(boot, other_client, Some(&grant), Uuid::now_v7(), issued_at,),
+            Err(IpcError::Unauthorized)
+        ));
+
+        let next_connection = Uuid::now_v7();
+        let (successor, previous) = ledger
+            .admit(boot, client, Some(&grant), next_connection, issued_at)
+            .expect("one handoff");
+        assert_eq!(previous, Some(old_connection));
+        assert_ne!(grant, successor);
+        assert!(matches!(
+            ledger.admit(boot, client, Some(&grant), Uuid::now_v7(), issued_at),
+            Err(IpcError::Unauthorized)
+        ));
+
+        assert!(matches!(
+            ledger.admit(
+                boot,
+                client,
+                Some(&successor),
+                Uuid::now_v7(),
+                issued_at + RECONNECT_GRANT_TTL,
+            ),
+            Err(IpcError::Unauthorized)
+        ));
+
+        // A full live ledger fails closed; it does not evict a still-valid
+        // grant that could otherwise be used to migrate an active authority.
+        let mut bounded = ReconnectGrantLedger::default();
+        for index in 0..MAX_RECONNECT_GRANTS {
+            let _ = bounded.admit(
+                boot,
+                client,
+                None,
+                Uuid::now_v7(),
+                issued_at + std::time::Duration::from_millis(u64::from(index as u32)),
+            );
+        }
+        assert_eq!(bounded.len(), MAX_RECONNECT_GRANTS);
+        assert!(matches!(
+            bounded.admit(boot, client, None, Uuid::now_v7(), issued_at),
+            Err(IpcError::Busy)
+        ));
     }
 
     #[test]

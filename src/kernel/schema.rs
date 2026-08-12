@@ -165,6 +165,18 @@ CREATE TABLE host_cleanup_branches (\n\
 );\n\
 ";
 
+// Scope metadata is intentionally separate from the public receipt document.
+// Older rows have NULL scope fields and are never eligible for a scoped replay;
+// they remain readable only by their original command/client tuple.
+const V7_SQL: &str = "\
+ALTER TABLE command_receipts ADD COLUMN connection_id BLOB CHECK(connection_id IS NULL OR length(connection_id) = 16);\n\
+ALTER TABLE command_receipts ADD COLUMN request_id BLOB CHECK(request_id IS NULL OR length(request_id) = 16);\n\
+ALTER TABLE command_receipts ADD COLUMN action_epoch INTEGER CHECK(action_epoch IS NULL OR action_epoch >= 0);\n\
+ALTER TABLE command_receipts ADD COLUMN runtime_generation INTEGER CHECK(runtime_generation IS NULL OR runtime_generation >= 0);\n\
+ALTER TABLE command_receipts ADD COLUMN command_fingerprint BLOB CHECK(command_fingerprint IS NULL OR length(command_fingerprint) = 32);\n\
+CREATE INDEX idx_command_receipts_scope ON command_receipts(client_id, connection_id, task_id, action_epoch, runtime_generation, created_at_ms);\n\
+";
+
 /// Compiled SHA-256 of [`V1_SQL`]. Do not change V1_SQL without updating this literal.
 pub(crate) const V1_SHA256: [u8; 32] = [
     0x79, 0xf0, 0xa3, 0x8f, 0x10, 0x92, 0xf7, 0x70, 0xa8, 0x84, 0xef, 0x3a, 0x12, 0x84, 0x81, 0x84,
@@ -199,6 +211,11 @@ pub(crate) const V5_SHA256: [u8; 32] = [
 pub(crate) const V6_SHA256: [u8; 32] = [
     0x11, 0xce, 0x61, 0x1c, 0xf9, 0xc1, 0x3e, 0xcd, 0xd8, 0x44, 0x21, 0xd5, 0x0d, 0xc7, 0xa7, 0x71,
     0x0b, 0x27, 0x47, 0x02, 0x05, 0x31, 0xad, 0x6f, 0x68, 0x34, 0x16, 0x4c, 0xa0, 0xe6, 0x2e, 0x67,
+];
+
+pub(crate) const V7_SHA256: [u8; 32] = [
+    0x89, 0xdc, 0xdf, 0xf7, 0x34, 0xc6, 0xea, 0x4e, 0x37, 0xda, 0xda, 0x76, 0x67, 0x26, 0x1f, 0x0b,
+    0xee, 0xd1, 0x0e, 0x31, 0xe4, 0xcd, 0x78, 0xd3, 0xb9, 0x8f, 0xdc, 0x62, 0x6b, 0x2d, 0x2c, 0x2a,
 ];
 
 /// Stable hex form of [`V1_SHA256`] for internal diagnostics.
@@ -253,6 +270,11 @@ pub(crate) fn migration_manifest() -> &'static [Migration] {
                 sha256_bytes(V6_SQL),
                 "V6_SHA256 literal must match V6_SQL bytes"
             );
+            assert_eq!(
+                V7_SHA256,
+                sha256_bytes(V7_SQL),
+                "V7_SHA256 literal must match V7_SQL bytes"
+            );
             let migrations = vec![
                 Migration {
                     version: 1,
@@ -289,6 +311,12 @@ pub(crate) fn migration_manifest() -> &'static [Migration] {
                     name: "v6_host_cleanup_branches",
                     sql: V6_SQL,
                     sha256: V6_SHA256,
+                },
+                Migration {
+                    version: 7,
+                    name: "v7_command_receipt_scope",
+                    sql: V7_SQL,
+                    sha256: V7_SHA256,
                 },
             ];
             verify_manifest(&migrations);
@@ -498,7 +526,7 @@ mod tests {
                 .map(|row| row.unwrap())
                 .collect()
         };
-        assert_eq!(history.len(), 6);
+        assert_eq!(history.len(), 7);
         assert_eq!(history[0], (1, "v1_initial".into(), V1_SHA256.to_vec()));
         assert_eq!(
             history[1],
@@ -516,6 +544,9 @@ mod tests {
         assert_eq!(history[5].0, 6);
         assert_eq!(history[5].1, "v6_host_cleanup_branches");
         assert_eq!(history[5].2, V6_SHA256.to_vec());
+        assert_eq!(history[6].0, 7);
+        assert_eq!(history[6].1, "v7_command_receipt_scope");
+        assert_eq!(history[6].2, V7_SHA256.to_vec());
 
         let compacted_column: (String, i64) = conn
             .query_row(
@@ -535,6 +566,48 @@ mod tests {
             )
             .expect("V4 cleanup index");
         assert_eq!(cleanup_index, 1);
+    }
+
+    #[test]
+    fn schema_v7_receipt_scope_columns_are_bounded_and_indexed() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("v7.sqlite3");
+        let store = crate::kernel::KernelStore::open(&path).expect("open current schema");
+        drop(store);
+
+        let conn = Connection::open(&path).expect("reopen raw");
+        let columns: Vec<(String, String, i64)> = {
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(command_receipts)")
+                .expect("receipt columns");
+            stmt.query_map([], |row| Ok((row.get(1)?, row.get(2)?, row.get(3)?)))
+                .expect("query receipt columns")
+                .map(|row| row.expect("receipt column row"))
+                .collect()
+        };
+        for (name, type_name, not_null) in [
+            ("connection_id", "BLOB", 0),
+            ("request_id", "BLOB", 0),
+            ("action_epoch", "INTEGER", 0),
+            ("runtime_generation", "INTEGER", 0),
+            ("command_fingerprint", "BLOB", 0),
+        ] {
+            assert!(
+                columns.iter().any(|(column, kind, required)| column == name
+                    && kind == type_name
+                    && *required == not_null),
+                "V7 receipt scope column has an unexpected definition"
+            );
+        }
+        let index_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE type = 'index' AND name = 'idx_command_receipts_scope'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("receipt scope index");
+        assert_eq!(index_count, 1);
     }
 
     #[test]

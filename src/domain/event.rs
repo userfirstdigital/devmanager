@@ -850,7 +850,7 @@ impl TryFrom<EventDocument> for Event {
             EventBody::TaskCreated(p) => {
                 p.task
                     .validate_for_create()
-                    .map_err(|err| EventSerdeError::Payload(err.to_string()))?;
+                    .map_err(|_| EventSerdeError::Payload)?;
                 Event::TaskCreated {
                     task: p.task,
                     connectivity: p.connectivity,
@@ -860,8 +860,8 @@ impl TryFrom<EventDocument> for Event {
                 }
             }
             EventBody::TaskRenamed(p) => {
-                let payload = TaskRenamedPayload::validated(p.title)
-                    .map_err(|err| EventSerdeError::Payload(err.to_string()))?;
+                let payload =
+                    TaskRenamedPayload::validated(p.title).map_err(|_| EventSerdeError::Payload)?;
                 Event::TaskRenamed {
                     title: payload.title,
                 }
@@ -877,7 +877,7 @@ impl TryFrom<EventDocument> for Event {
             EventBody::AgentSessionRegistered(p) => {
                 p.agent
                     .validate_for_registration()
-                    .map_err(|err| EventSerdeError::Payload(err.to_string()))?;
+                    .map_err(|_| EventSerdeError::Payload)?;
                 Event::AgentSessionRegistered { agent: p.agent }
             }
             EventBody::PrimaryAgentSet(p) => Event::PrimaryAgentSet {
@@ -886,7 +886,7 @@ impl TryFrom<EventDocument> for Event {
             EventBody::ArtifactRegistered(p) => {
                 p.artifact
                     .validate()
-                    .map_err(|err| EventSerdeError::Payload(err.to_string()))?;
+                    .map_err(|_| EventSerdeError::Payload)?;
                 Event::ArtifactRegistered {
                     artifact: p.artifact,
                 }
@@ -894,13 +894,11 @@ impl TryFrom<EventDocument> for Event {
             EventBody::ResourceRegistered(p) => {
                 p.resource
                     .validate()
-                    .map_err(|err| EventSerdeError::Payload(err.to_string()))?;
+                    .map_err(|_| EventSerdeError::Payload)?;
                 if p.resource.owner_kind != crate::domain::resource::OwnerKind::Task
                     || p.resource.lifecycle != crate::domain::resource::ResourceLifecycle::Active
                 {
-                    return Err(EventSerdeError::Payload(
-                        "resource registration requires Active Task-owned facts".into(),
-                    ));
+                    return Err(EventSerdeError::Payload);
                 }
                 Event::ResourceRegistered {
                     resource: p.resource,
@@ -947,23 +945,182 @@ impl<'de> Deserialize<'de> for Event {
     }
 }
 
+#[cfg(test)]
+mod durable_workspace_serde_tests {
+    use super::{DomainEvent, Event, EventSerdeError};
+    use crate::domain::id::{EnvironmentId, EventId, ProjectId};
+    use crate::domain::snapshot::{
+        EventPage, SnapshotItem, SnapshotPage, SnapshotSection, TaskSnapshotItem,
+    };
+    use crate::domain::task::{
+        ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity, TaskFacts,
+        WorkspaceBindingFact, WorkspaceBindingKind, WorkspacePathFact, WorkspaceRef,
+    };
+
+    fn fact(path: &str, identity: &str) -> WorkspacePathFact {
+        WorkspacePathFact::new(path.into(), identity.into(), None, None)
+            .expect("valid host-only path fact")
+    }
+
+    fn task_with_host_binding() -> TaskFacts {
+        let binding = WorkspaceBindingFact::issue(
+            WorkspaceBindingKind::Main,
+            fact(
+                r"C:\Users\sentinel\secret-workspace",
+                "windows:device-secret",
+            ),
+            fact(
+                r"C:\Users\sentinel\secret-workspace",
+                "windows:workspace-secret",
+            ),
+            Some(fact(
+                r"C:\Users\sentinel\secret-workspace",
+                "windows:repo-secret",
+            )),
+            Some(fact(
+                r"C:\Users\sentinel\secret-workspace\.git",
+                "windows:git-secret",
+            )),
+            None,
+            Some(fact(
+                r"C:\Users\sentinel\secret-workspace\.git",
+                "windows:marker-secret",
+            )),
+            None,
+            None,
+            Some(fact(
+                r"C:\Users\sentinel\secret-workspace\.git\HEAD",
+                "windows:head-secret",
+            )),
+            None,
+        )
+        .expect("valid host binding");
+        let mut task = TaskFacts::new(
+            EnvironmentId::new(),
+            "opaque workspace",
+            Some("safe metadata".into()),
+            ProjectId::new(),
+            WorkspaceRef::HostBound { binding },
+            TaskAssignment::LocalOwner,
+            1_725_000_000_001,
+        )
+        .expect("task facts");
+        task.revision = 1;
+        task
+    }
+
+    fn assert_no_host_material(encoded: &str) {
+        for sentinel in [
+            r"C:\Users\sentinel\secret-workspace",
+            "sentinel",
+            "device-secret",
+            "workspace-secret",
+            "TOP_SECRET",
+        ] {
+            assert!(
+                !encoded.contains(sentinel),
+                "durable bytes leaked {sentinel}"
+            );
+        }
+    }
+
+    #[test]
+    fn task_created_event_snapshot_and_replay_are_pathless() {
+        let task = task_with_host_binding();
+        let event = Event::TaskCreated {
+            task: task.clone(),
+            connectivity: TaskConnectivity::Connected,
+            attention: TaskAttention::None,
+            activity: TaskActivity::Idle,
+            review_readiness: ReviewReadiness::NotReady,
+        };
+        let domain_event = DomainEvent {
+            id: EventId::new(),
+            task_id: Some(task.id),
+            sequence: 7,
+            task_revision: Some(1),
+            occurred_at_ms: 1_725_000_000_002,
+            payload: event.clone(),
+        };
+        let snapshot = SnapshotPage {
+            snapshot_id: crate::domain::id::SnapshotId::new(),
+            through_sequence: 7,
+            section: SnapshotSection::Tasks,
+            after_item: None,
+            items: vec![SnapshotItem::Task(TaskSnapshotItem {
+                task,
+                connectivity: TaskConnectivity::Connected,
+                attention: TaskAttention::None,
+                activity: TaskActivity::Idle,
+                review_readiness: ReviewReadiness::NotReady,
+                primary_agent_id: None,
+            })],
+            encoded_bytes: 1,
+            next_cursor: None,
+        };
+        let replay = EventPage {
+            after_sequence: 0,
+            through_sequence: 7,
+            events: vec![domain_event],
+            next_cursor: None,
+        };
+
+        for encoded in [
+            serde_json::to_string(&event).expect("event json"),
+            rmp_serde::to_vec(&event)
+                .expect("event msgpack")
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+            serde_json::to_string(&snapshot).expect("snapshot json"),
+            rmp_serde::to_vec(&snapshot)
+                .expect("snapshot msgpack")
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+            serde_json::to_string(&replay).expect("replay json"),
+            rmp_serde::to_vec(&replay)
+                .expect("replay msgpack")
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+        ] {
+            assert_no_host_material(&encoded);
+        }
+
+        let event_json = serde_json::to_string(&event).expect("event json");
+        let _: Event = serde_json::from_str(&event_json).expect("event replay");
+        let snapshot_json = serde_json::to_string(&snapshot).expect("snapshot json");
+        let _: SnapshotPage = serde_json::from_str(&snapshot_json).expect("snapshot restore");
+        let replay_json = serde_json::to_string(&replay).expect("replay json");
+        let _: EventPage = serde_json::from_str(&replay_json).expect("replay restore");
+    }
+
+    #[test]
+    fn event_serde_errors_never_echo_attacker_text() {
+        let rendered = format!("{}", EventSerdeError::UnknownEventType);
+        assert_eq!(rendered, "unknown event type");
+        assert!(!rendered.contains("attacker"));
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EventSerdeError {
-    UnknownEventType(String),
+    UnknownEventType,
     UnsupportedSchemaVersion(u64),
     InvalidEnvelope,
-    Payload(String),
+    Payload,
 }
 
 impl fmt::Display for EventSerdeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::UnknownEventType(name) => write!(f, "unknown event type: {name}"),
+            Self::UnknownEventType => write!(f, "unknown event type"),
             Self::UnsupportedSchemaVersion(version) => {
                 write!(f, "unsupported event schema version: {version}")
             }
             Self::InvalidEnvelope => write!(f, "invalid durable event envelope"),
-            Self::Payload(message) => write!(f, "invalid event payload: {message}"),
+            Self::Payload => write!(f, "invalid event payload"),
         }
     }
 }

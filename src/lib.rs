@@ -21,6 +21,7 @@ pub mod protocol;
 pub mod remote;
 pub mod services;
 pub mod sidebar;
+pub mod ssh;
 pub mod state;
 pub mod terminal;
 pub mod theme;
