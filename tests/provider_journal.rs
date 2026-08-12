@@ -8,7 +8,9 @@ use devmanager::providers::adapter::{
     NormalizedAdapterDelivery, ProviderAdapter, ProviderError, ProviderLaunchSpec, ProviderRuntime,
     QuotaObservation, StopStrategy,
 };
-use devmanager::providers::capabilities::{ProviderCapabilities, ProviderCapability, ProviderKind};
+use devmanager::providers::capabilities::{
+    ProviderCapabilities, ProviderCapability, ProviderExecutableHandle, ProviderKind,
+};
 use devmanager::providers::journal::{
     stock_adapter_ingress, stock_adapter_ingress_available, AdapterDeliveryPermit,
 };
@@ -23,7 +25,7 @@ impl ProviderAdapter for UnavailableAdapter {
 
     async fn probe(
         &self,
-        _executable: &std::path::Path,
+        _executable: &ProviderExecutableHandle,
     ) -> Result<ProviderCapabilities, ProviderError> {
         Err(ProviderError::UnsupportedCapability(
             ProviderCapability::ParseSignal,
@@ -55,7 +57,7 @@ impl ProviderAdapter for UnavailableAdapter {
 
     async fn observe_quota(
         &self,
-        _executable: &std::path::Path,
+        _executable: &ProviderExecutableHandle,
     ) -> Result<Option<QuotaObservation>, ProviderError> {
         Ok(None)
     }
