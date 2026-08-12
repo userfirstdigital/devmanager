@@ -1801,6 +1801,37 @@ impl Admission for LiveAdmission<'_> {
     }
 }
 
+/// Host-owned Task Cockpit seam: re-check the exact Task/workspace fence
+/// immediately before a mutation. Path strings never authorize. A File
+/// mutation must present a File lease; Git/worktree mutations present Git.
+pub(crate) fn revalidate_cockpit_workspace_action(
+    authorization: &WorkspaceAuthorization,
+    lease: &WorkspaceResourceLease,
+    context: &WorkspaceActionContext,
+    resource: WorkspaceResource,
+) -> Result<(), WorktreeError> {
+    if lease.resource() != resource {
+        return Err(WorktreeError::StaleAuthority);
+    }
+    lease
+        .ensure_active()
+        .map_err(|_| WorktreeError::StaleAuthority)?;
+    authorization
+        .validated_binding(
+            context.task_id,
+            context.project_id,
+            context.client_id,
+            context.connection_id,
+            context.request_id,
+            context.command_id,
+            &context.workspace,
+            context.action_epoch,
+            context.runtime_generation,
+        )
+        .ok_or(WorktreeError::StaleAuthority)?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn resolved_workspace(
     binding: &WorkspaceBinding,

@@ -30,8 +30,8 @@ pub use cockpit::{
     cockpit_surface, git_projection, relative_path_is_safe, workspace_projection,
     TaskCockpitDeniedReason, TaskCockpitQuery, TaskCockpitResult, TaskCockpitSurface,
     TaskCockpitUnavailableReason, TaskFileEntry, TaskFilesListProjection, TaskFilesReadProjection,
-    TaskGitProjection, TaskServiceProjection, TaskServiceRuntimeState, TaskServiceScope,
-    TaskServiceSnapshot, TaskSshEndpoint, TaskSshProjection, TaskWorkspaceKind,
+    TaskGitMutateIntent, TaskGitProjection, TaskServiceProjection, TaskServiceRuntimeState,
+    TaskServiceScope, TaskServiceSnapshot, TaskSshEndpoint, TaskSshProjection, TaskWorkspaceKind,
     TaskWorkspaceProjection, MAX_COCKPIT_FILE_LIST, MAX_COCKPIT_READ_BYTES,
 };
 pub use codec::{
@@ -59,11 +59,11 @@ pub use host::{
 };
 pub use id::{
     AgentSessionId, ApprovalId, ArtifactId, BrowserContextId, BrowserRequestId, BrowserSessionId,
-    BrowserTabId, ClientId, CommandId, ConfiguredServiceId, ConfiguredServiceIdError, EnvironmentId,
-    EventId, IdError, OperationId, OutboxId, ProjectId, PromptChainId, PromptChainLinkId,
-    PromptHistoryId, PromptId, PromptVersionId, QuestionId, RequestId, ResourceId, ServiceId,
-    SnapshotId, SubscriptionId, TaskId, TaskInviteId, TerminalId, TransferId, TurnId,
-    MAX_CONFIGURED_SERVICE_ID_BYTES,
+    BrowserTabId, ClientId, CommandId, ConfiguredServiceId, ConfiguredServiceIdError,
+    EnvironmentId, EventId, IdError, OperationId, OutboxId, ProjectId, PromptChainId,
+    PromptChainLinkId, PromptHistoryId, PromptId, PromptVersionId, QuestionId, RequestId,
+    ResourceId, ServiceId, SnapshotId, SubscriptionId, TaskId, TaskInviteId, TerminalId,
+    TransferId, TurnId, MAX_CONFIGURED_SERVICE_ID_BYTES,
 };
 pub use operation::{
     validate_outcome_fence, validate_source_for_kind, validate_terminal_fact_source,

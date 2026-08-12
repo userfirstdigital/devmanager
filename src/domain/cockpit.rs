@@ -34,6 +34,7 @@ pub enum TaskCockpitDeniedReason {
     StaleFence,
     UnknownService,
     ForeignScope,
+    RevisionConflict,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,6 +53,14 @@ pub enum TaskCockpitUnavailableReason {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum TaskGitMutateIntent {
+    Stage { relative_paths: Vec<String> },
+    Unstage { relative_paths: Vec<String> },
+    Commit { message: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum TaskCockpitQuery {
     WorkspaceStatus,
     GitStatus,
@@ -63,8 +72,19 @@ pub enum TaskCockpitQuery {
         relative_path: String,
         max_bytes: u32,
     },
-    FilesWrite,
-    GitMutate,
+    FilesWrite {
+        relative_path: String,
+        utf8_contents: String,
+        #[serde(default)]
+        expected_sha256_hex: Option<String>,
+        #[serde(default)]
+        confirm: bool,
+    },
+    GitMutate {
+        intent: TaskGitMutateIntent,
+        #[serde(default)]
+        confirm: bool,
+    },
     SshStatus,
     SshAction {
         endpoint_id: String,
@@ -258,9 +278,9 @@ pub fn relative_path_is_safe(path: &str) -> bool {
     if path.contains('\\')
         || path.starts_with('/')
         || path.as_bytes().get(1) == Some(&b':')
-        || path.split(['/', '\\']).any(|component| {
-            component.is_empty() || component == "." || component == ".."
-        })
+        || path
+            .split(['/', '\\'])
+            .any(|component| component.is_empty() || component == "." || component == "..")
     {
         return false;
     }
@@ -324,10 +344,10 @@ fn workspace_kind(kind: WorkspaceBindingKind) -> TaskWorkspaceKind {
 pub fn cockpit_surface(query: &TaskCockpitQuery) -> TaskCockpitSurface {
     match query {
         TaskCockpitQuery::WorkspaceStatus => TaskCockpitSurface::Workspace,
-        TaskCockpitQuery::GitStatus | TaskCockpitQuery::GitMutate => TaskCockpitSurface::Git,
+        TaskCockpitQuery::GitStatus | TaskCockpitQuery::GitMutate { .. } => TaskCockpitSurface::Git,
         TaskCockpitQuery::FilesList { .. }
         | TaskCockpitQuery::FilesRead { .. }
-        | TaskCockpitQuery::FilesWrite => TaskCockpitSurface::Files,
+        | TaskCockpitQuery::FilesWrite { .. } => TaskCockpitSurface::Files,
         TaskCockpitQuery::SshStatus | TaskCockpitQuery::SshAction { .. } => TaskCockpitSurface::Ssh,
         TaskCockpitQuery::ServiceSnapshots
         | TaskCockpitQuery::ServiceLogs { .. }
@@ -409,9 +429,15 @@ mod tests {
         let payload = encoded
             .get("service_control")
             .expect("service_control variant");
-        assert_eq!(payload.get("service_id").and_then(|value| value.as_str()), Some("api"));
+        assert_eq!(
+            payload.get("service_id").and_then(|value| value.as_str()),
+            Some("api")
+        );
         let text = payload.to_string();
-        assert!(!text.contains("019"), "must not look like a UUIDv7 service id: {text}");
+        assert!(
+            !text.contains("019"),
+            "must not look like a UUIDv7 service id: {text}"
+        );
         let decoded: Command = serde_json::from_value(encoded).expect("decode");
         let Command::ServiceControl(intent) = decoded else {
             panic!("round trip");
@@ -432,9 +458,56 @@ mod tests {
             .get("task_cockpit")
             .and_then(|value| value.get("service_logs"))
             .expect("service logs");
-        assert_eq!(payload.get("service_id").and_then(|value| value.as_str()), Some("api"));
+        assert_eq!(
+            payload.get("service_id").and_then(|value| value.as_str()),
+            Some("api")
+        );
         let text = payload.to_string();
-        assert!(!text.contains("019"), "must not look like a UUIDv7 service id: {text}");
+        assert!(
+            !text.contains("019"),
+            "must not look like a UUIDv7 service id: {text}"
+        );
+    }
+
+    #[test]
+    fn mutate_queries_require_typed_payloads_not_raw_paths_or_commands() {
+        let write = Query::TaskCockpit(TaskCockpitQuery::FilesWrite {
+            relative_path: "notes.txt".into(),
+            utf8_contents: "hello".into(),
+            expected_sha256_hex: None,
+            confirm: true,
+        });
+        let encoded = serde_json::to_value(&write).expect("encode write");
+        let payload = encoded
+            .get("task_cockpit")
+            .and_then(|value| value.get("files_write"))
+            .expect("files_write");
+        assert_eq!(
+            payload
+                .get("relative_path")
+                .and_then(|value| value.as_str()),
+            Some("notes.txt")
+        );
+        assert!(payload.get("utf8_contents").is_some());
+        assert!(payload.get("command").is_none());
+        let decoded: Query = serde_json::from_value(encoded).expect("decode write");
+        assert_eq!(decoded, write);
+
+        let mutate = Query::TaskCockpit(TaskCockpitQuery::GitMutate {
+            intent: TaskGitMutateIntent::Stage {
+                relative_paths: vec!["README.md".into()],
+            },
+            confirm: true,
+        });
+        let encoded = serde_json::to_value(&mutate).expect("encode mutate");
+        let payload = encoded
+            .get("task_cockpit")
+            .and_then(|value| value.get("git_mutate"))
+            .expect("git_mutate");
+        assert!(payload.get("intent").is_some());
+        assert!(payload.get("command").is_none());
+        let decoded: Query = serde_json::from_value(encoded).expect("decode mutate");
+        assert_eq!(decoded, mutate);
     }
 
     fn workspace_projection_omits_raw_paths() {
