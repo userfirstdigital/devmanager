@@ -2517,32 +2517,34 @@ fn render_row(row: &TaskRowModel, width: InboxPresentationWidth) -> InboxRenderR
         ),
         MAX_ACCESSIBLE_DESCRIPTION_CHARS,
     );
-    let accessibility = AccessibilityMetadata {
-        role: if row.read_only {
+    let mut accessibility = AccessibilityMetadata::new(
+        if row.read_only {
             AccessibleRole::Region
         } else {
             AccessibleRole::Button
         },
-        name: accessible_name.clone(),
-        description: accessible_description.clone(),
-        error: matches!(
-            row.status,
-            VisibleTaskStatus::Failed | VisibleTaskStatus::UncertainOutcome
-        )
-        .then(|| status_label(row.status).to_string()),
-        disabled: row.read_only,
-        busy: matches!(
-            row.status,
-            VisibleTaskStatus::Working | VisibleTaskStatus::Settling
-        ),
-        focused: false,
-        invalid: matches!(
-            row.status,
-            VisibleTaskStatus::Failed | VisibleTaskStatus::UncertainOutcome
-        ),
-        read_only: row.read_only,
-        value: Some(status_label(row.status).to_string()),
-    };
+        accessible_name.clone(),
+    )
+    .expect("bounded inbox accessibility name");
+    accessibility
+        .set_description(accessible_description.clone())
+        .expect("bounded inbox accessibility description");
+    let failed = matches!(
+        row.status,
+        VisibleTaskStatus::Failed | VisibleTaskStatus::UncertainOutcome
+    );
+    accessibility
+        .set_error(failed.then(|| status_label(row.status).to_string()))
+        .expect("bounded inbox accessibility error");
+    accessibility.set_disabled(row.read_only);
+    accessibility.set_busy(matches!(
+        row.status,
+        VisibleTaskStatus::Working | VisibleTaskStatus::Settling
+    ));
+    accessibility.set_focused(false);
+    accessibility.set_invalid(failed);
+    accessibility.set_read_only(row.read_only);
+    accessibility.set_value(Some(status_label(row.status).to_string()));
     InboxRenderRow {
         key: if row.read_only {
             InboxItemKey::HistoryRow(row.task_id)
