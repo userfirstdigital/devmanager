@@ -32,6 +32,10 @@ import type {
 import { isTransientComposerRejection, WsClient } from "../api/ws";
 import { staleResumeRequiresRefresh } from "../connect/resume";
 import type { CapabilityGrant } from "../connect/permissions";
+import {
+  readConnectStoreConfiguration,
+  selectStoreClientOptions,
+} from "../connect/storeAdapter";
 import { stageDraftHandoff } from "../drafts/draftStore";
 import { requestCompatibleBuild } from "../pwa/register";
 
@@ -1313,6 +1317,15 @@ export const useStore = create<StoreState>((set, get) => {
           });
           return;
         }
+        if (failure.kind === "connectTransportHeld") {
+          const message = `${failure.code}: Connect browser transport is unavailable in this build.`;
+          set({
+            status: { kind: "closed", reason: message },
+            capabilityGrant: null,
+            lastError: message,
+          });
+          return;
+        }
         set({
           status: { kind: "closed", reason: "invalid websocket handshake" },
           capabilityGrant: null,
@@ -1320,52 +1333,56 @@ export const useStore = create<StoreState>((set, get) => {
             "The host did not send a valid web hello before session data.",
         });
       };
-      const client = new WsClient({
-        onStatus: (status) => {
-          if (compatibleBuildPending) return;
-          if (
-            status.kind === "connecting" ||
-            status.kind === "closed" ||
-            status.kind === "unauthorized" ||
-            status.kind === "idle"
-          ) {
-            updateLease({ ...EMPTY_WRITER_LEASE });
-            set({ capabilityGrant: null });
-          }
-          set({ status });
+      const connectConfiguration = readConnectStoreConfiguration();
+      const client = new WsClient(
+        {
+          onStatus: (status) => {
+            if (compatibleBuildPending) return;
+            if (
+              status.kind === "connecting" ||
+              status.kind === "closed" ||
+              status.kind === "unauthorized" ||
+              status.kind === "idle"
+            ) {
+              updateLease({ ...EMPTY_WRITER_LEASE });
+              set({ capabilityGrant: null });
+            }
+            set({ status });
+          },
+          onMessage: (message) => {
+            if (compatibleBuildPending) return;
+            handleMessage(message);
+          },
+          onCapabilityGrant: (capabilityGrant) => {
+            if (compatibleBuildPending) return;
+            set({ capabilityGrant });
+          },
+          onHelloFailure: handleHelloFailure,
+          onSessionOutput: handleSessionOutput,
+          getResumeContext: (): ResumeContext => {
+            const state = get();
+            const stableSessionKey = state.activeSessionKey;
+            const visible = isVisible();
+            return {
+              seenRuntimeInstanceId: state.runtimeInstanceId,
+              seenRevision: state.revision,
+              route:
+                state.pendingRoute ??
+                (stableSessionKey
+                  ? routeForStableKey(stableSessionKey)
+                  : "/tasks"),
+              desiredSessionKey: stableSessionKey,
+              rawSessionId: state.rawTerminal.activeStreamSessionId,
+              semanticAfterSequence: stableSessionKey
+                ? (state.journals[stableSessionKey]?.latestSequence ?? null)
+                : null,
+              visible,
+              wantsWriterLease: visible,
+            };
+          },
         },
-        onMessage: (message) => {
-          if (compatibleBuildPending) return;
-          handleMessage(message);
-        },
-        onCapabilityGrant: (capabilityGrant) => {
-          if (compatibleBuildPending) return;
-          set({ capabilityGrant });
-        },
-        onHelloFailure: handleHelloFailure,
-        onSessionOutput: handleSessionOutput,
-        getResumeContext: (): ResumeContext => {
-          const state = get();
-          const stableSessionKey = state.activeSessionKey;
-          const visible = isVisible();
-          return {
-            seenRuntimeInstanceId: state.runtimeInstanceId,
-            seenRevision: state.revision,
-            route:
-              state.pendingRoute ??
-              (stableSessionKey
-                ? routeForStableKey(stableSessionKey)
-                : "/tasks"),
-            desiredSessionKey: stableSessionKey,
-            rawSessionId: state.rawTerminal.activeStreamSessionId,
-            semanticAfterSequence: stableSessionKey
-              ? (state.journals[stableSessionKey]?.latestSequence ?? null)
-              : null,
-            visible,
-            wantsWriterLease: visible,
-          };
-        },
-      });
+        selectStoreClientOptions(connectConfiguration),
+      );
       set({ client });
       void client.start();
     },

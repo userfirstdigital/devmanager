@@ -9,6 +9,10 @@ import type {
   WebWorkspaceSnapshot,
 } from "../api/types";
 import { WEB_PROTOCOL_VERSION } from "../api/types";
+import {
+  CONNECT_STORE_CONFIGURATION_KEY,
+  type ConnectStoreConfiguration,
+} from "../connect/storeAdapter";
 
 const { wsClientState, MockWsClient } = vi.hoisted(() => {
   const state: { instance: MockWsClient | null } = { instance: null };
@@ -52,8 +56,14 @@ const { wsClientState, MockWsClient } = vi.hoisted(() => {
       }),
     );
 
-    constructor(callbacks: MockWsClient["callbacks"]) {
+    options: unknown;
+
+    constructor(
+      callbacks: MockWsClient["callbacks"],
+      options?: unknown,
+    ) {
       this.callbacks = callbacks;
+      this.options = options;
       state.instance = this;
     }
   }
@@ -256,6 +266,7 @@ function deferred<T>() {
 function resetStore(): void {
   useStore.setState(useStore.getInitialState(), true);
   wsClientState.instance = null;
+  Reflect.deleteProperty(globalThis, CONNECT_STORE_CONFIGURATION_KEY);
 }
 
 beforeEach(() => {
@@ -462,6 +473,42 @@ describe("aggregate app badge", () => {
       authorityKey: "runtime:runtime-1",
     });
     expect(shouldApplyAppBadge(unread, acknowledged)).toBe(true);
+  });
+});
+
+describe("Connect store transport selection", () => {
+  it("passes a published Connect configuration to the live client", () => {
+    const configuration: ConnectStoreConfiguration = { transport: "connect" };
+    Object.defineProperty(globalThis, CONNECT_STORE_CONFIGURATION_KEY, {
+      configurable: true,
+      value: configuration,
+    });
+
+    useStore.getState().init();
+
+    expect(wsClientState.instance?.options).toEqual(configuration);
+  });
+
+  it("surfaces a typed WASM HOLD without falling back to the legacy socket", () => {
+    Object.defineProperty(globalThis, CONNECT_STORE_CONFIGURATION_KEY, {
+      configurable: true,
+      value: { transport: "connect" },
+    });
+
+    useStore.getState().init();
+    const client = wsClientState.instance;
+    client?.callbacks.onHelloFailure?.({
+      kind: "connectTransportHeld",
+      code: "browser-e2e-transport-held",
+    });
+
+    expect(client?.options).toEqual({ transport: "connect" });
+    expect(useStore.getState().status).toEqual({
+      kind: "closed",
+      reason:
+        "browser-e2e-transport-held: Connect browser transport is unavailable in this build.",
+    });
+    expect(useStore.getState().lastError).toMatch(/browser-e2e-transport-held/);
   });
 });
 
