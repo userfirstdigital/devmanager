@@ -68,9 +68,9 @@ export function allowsRawTerminal(route: ConnectRoute): boolean {
   return route.kind === "direct";
 }
 
-export function isRawTerminalWriterFrame(frame: {
-  type: string;
-}): boolean {
+export function isRawTerminalWriterFrame(
+  frame: { type: string } & Record<string, unknown>,
+): boolean {
   return (
     frame.type === "input" ||
     frame.type === "pasteImage" ||

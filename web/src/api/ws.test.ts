@@ -1683,7 +1683,7 @@ describe("WsClient connect route and inbound bounds", () => {
       expect.objectContaining({ type: "error" }),
     );
     const delivered = callbacks.onMessage.mock.calls.map(
-      ([message]: [unknown]) => message,
+      (call: unknown[]) => call[0],
     );
     expect(
       delivered.every(
