@@ -43,9 +43,6 @@ export function canPerform(
     );
   }
   if (grant.role === "collaborator") {
-    if (action === "approveDangerous" || action === "readPersonalPrompts") {
-      return false;
-    }
     return grant.actions.includes(action);
   }
   return grant.actions.includes(action);
