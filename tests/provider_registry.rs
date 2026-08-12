@@ -92,6 +92,16 @@ fn test_executable_handle() -> ProviderExecutableHandle {
         .expect("test executable handle")
 }
 
+// Revision constructors are intentionally private to the provider authority;
+// wire decoding is the only test seam for comparing cache dimensions.
+fn adapter_revision(value: u32) -> AdapterRevision {
+    serde_json::from_value(Value::from(value)).unwrap()
+}
+
+fn semantic_schema_version(value: u32) -> SemanticSchemaVersion {
+    serde_json::from_value(Value::from(value)).unwrap()
+}
+
 struct FakeAdapter {
     kind: ProviderKind,
     version: Mutex<ProviderVersion>,
@@ -402,8 +412,8 @@ fn capability_cache_key_contains_every_identity_dimension() {
         ProviderKind::ClaudeCode,
         identity.clone(),
         version.clone(),
-        AdapterRevision::new(1),
-        SemanticSchemaVersion::new(1),
+        adapter_revision(1),
+        semantic_schema_version(1),
     );
 
     assert_ne!(
@@ -412,8 +422,8 @@ fn capability_cache_key_contains_every_identity_dimension() {
             ProviderKind::Codex,
             identity.clone(),
             version.clone(),
-            AdapterRevision::new(1),
-            SemanticSchemaVersion::new(1),
+            adapter_revision(1),
+            semantic_schema_version(1),
         )
     );
     assert_ne!(
@@ -422,8 +432,8 @@ fn capability_cache_key_contains_every_identity_dimension() {
             ProviderKind::ClaudeCode,
             replacement_identity,
             version.clone(),
-            AdapterRevision::new(1),
-            SemanticSchemaVersion::new(1),
+            adapter_revision(1),
+            semantic_schema_version(1),
         )
     );
     assert_ne!(
@@ -432,8 +442,8 @@ fn capability_cache_key_contains_every_identity_dimension() {
             ProviderKind::ClaudeCode,
             identity.clone(),
             ProviderVersion::new("fixture-2").unwrap(),
-            AdapterRevision::new(1),
-            SemanticSchemaVersion::new(1),
+            adapter_revision(1),
+            semantic_schema_version(1),
         )
     );
     assert_ne!(
@@ -442,8 +452,8 @@ fn capability_cache_key_contains_every_identity_dimension() {
             ProviderKind::ClaudeCode,
             identity.clone(),
             version.clone(),
-            AdapterRevision::new(2),
-            SemanticSchemaVersion::new(1),
+            adapter_revision(2),
+            semantic_schema_version(1),
         )
     );
     assert_ne!(
@@ -452,8 +462,8 @@ fn capability_cache_key_contains_every_identity_dimension() {
             ProviderKind::ClaudeCode,
             identity,
             version,
-            AdapterRevision::new(1),
-            SemanticSchemaVersion::new(2),
+            adapter_revision(1),
+            semantic_schema_version(2),
         )
     );
 }
@@ -733,6 +743,42 @@ async fn cancelled_probe_leader_stays_charged_until_worker_completion() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert_eq!(registry.in_flight_len(), 0);
+}
+
+#[tokio::test]
+async fn timed_out_probe_worker_cannot_publish_a_late_cache_entry() {
+    let temp = tempdir().unwrap();
+    let executable = executable_file(temp.path(), "claude", b"cancelled-cache-write");
+    let adapter = FakeAdapter::new(capabilities(
+        ProviderKind::ClaudeCode,
+        "fixture-1",
+        ProviderAuthState::Unknown,
+        CapabilitySupport::Unknown,
+        CapabilitySupport::Unknown,
+        CapabilitySupport::Unknown,
+    ));
+    adapter.set_probe_delay(Duration::from_millis(300));
+    let mut registry = ProviderRegistry::new();
+    registry.register(adapter).unwrap();
+
+    let task_registry = Arc::new(registry);
+    let observed_registry = Arc::clone(&task_registry);
+    let observed = tokio::spawn(async move {
+        observed_registry
+            .observe(ProviderKind::ClaudeCode, &discovery(Some(executable), None))
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    observed.abort();
+    let _ = observed.await;
+
+    assert_eq!(task_registry.cache_len(), 0);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while task_registry.in_flight_len() != 0 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(task_registry.in_flight_len(), 0);
+    assert_eq!(task_registry.cache_len(), 0);
 }
 
 #[tokio::test]
@@ -1551,6 +1597,10 @@ async fn observation_metadata_is_serializable_without_probe_payloads() {
     assert!(encoded.contains("sha256"));
     assert!(!encoded.contains("stdout"));
     assert!(!encoded.contains("stderr"));
+    assert_eq!(
+        observation.executable_handle().executable(),
+        &observation.executable
+    );
 }
 
 #[tokio::test]
@@ -1616,6 +1666,10 @@ async fn provider_observation_wire_is_versioned_and_validates_cross_fields() {
     let mut cache_unknown = cache_value;
     cache_unknown["unexpected"] = serde_json::json!(true);
     assert!(serde_json::from_value::<CapabilityCacheKey>(cache_unknown).is_err());
+
+    let mut wrapper_identity = serde_json::to_value(&observation).unwrap();
+    wrapper_identity["executable"]["is_native"] = serde_json::json!(false);
+    assert!(serde_json::from_value::<ProviderObservation>(wrapper_identity).is_err());
 }
 
 #[test]
@@ -1814,6 +1868,8 @@ fn provider_probe_result_has_bounded_structured_status() {
     )
     .unwrap();
     let result = ProviderProbeResult::completed(&request, 0, 12, 4).unwrap();
+    let auth_request = ProviderProbeRequest::auth_status(test_executable_handle()).unwrap();
+    assert!(ProviderProbeResult::completed(&auth_request, 0, 0, 0).is_err());
     assert_eq!(
         result.status(),
         devmanager::providers::ProviderProbeStatus::Completed

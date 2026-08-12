@@ -295,7 +295,7 @@ macro_rules! define_revision {
         pub struct $name(u32);
 
         impl $name {
-            pub const fn new(value: u32) -> Self {
+            const fn new(value: u32) -> Self {
                 Self(value)
             }
 
@@ -314,6 +314,14 @@ define_revision!(SemanticSchemaVersion);
 pub const PROVIDER_AUTH_ADAPTER_REVISION: AdapterRevision = AdapterRevision::new(1);
 pub const PROVIDER_AUTH_SEMANTIC_SCHEMA_VERSION: SemanticSchemaVersion =
     SemanticSchemaVersion::new(1);
+
+/// The registry and authentication authorities share the same exact values;
+/// keep the registry aliases crate-visible without exposing a constructor
+/// that lets callers mint arbitrary revisions.
+pub(crate) const PROVIDER_REGISTRY_ADAPTER_REVISION: AdapterRevision =
+    PROVIDER_AUTH_ADAPTER_REVISION;
+pub(crate) const PROVIDER_REGISTRY_SEMANTIC_SCHEMA_VERSION: SemanticSchemaVersion =
+    PROVIDER_AUTH_SEMANTIC_SCHEMA_VERSION;
 
 /// Clock authority for authentication evidence.  Freshness always uses the
 /// monotonic `Instant`; the serial timestamp is only for capability evidence
@@ -2093,6 +2101,15 @@ impl ProviderExecutable {
     /// Prepare a launch handle after revalidating both the current path and
     /// the originally captured file handle.
     pub fn open_for_launch(&self) -> Result<ProviderExecutableHandle, ProviderExecutableError> {
+        // A non-native identity is only a graph node owned by discovery.  It
+        // has no standalone launch semantics: issuing `Direct` here would
+        // discard the wrapper/interpreter graph and let a public caller turn
+        // a deserialized shim or script into a direct executable.
+        if !self.is_native {
+            return Err(ProviderExecutableError::NotNativeExecutable(
+                self.canonical_path.clone(),
+            ));
+        }
         self.validate_current()?;
         Ok(ProviderExecutableHandle {
             executable: self.clone(),
@@ -2341,11 +2358,31 @@ impl ProviderExecutableHandle {
 
     pub fn try_clone_file(&self) -> Result<File, ProviderExecutableError> {
         self.revalidate()?;
+        // Script plans must stay opaque; returning only the interpreter file
+        // would let a public caller discard the attested wrapper graph.
+        if matches!(
+            &self.launch_plan,
+            ProviderLaunchPlan::NodeScript { .. } | ProviderLaunchPlan::PowerShellScript { .. }
+        ) {
+            return Err(ProviderExecutableError::NotNativeExecutable(
+                self.canonical_path().to_path_buf(),
+            ));
+        }
         self.launch_program().clone_file_handle()
     }
 
     pub fn into_file(self) -> Result<File, ProviderExecutableError> {
         self.revalidate()?;
+        // Script plans must stay opaque; returning only the interpreter file
+        // would let a public caller discard the attested wrapper graph.
+        if matches!(
+            &self.launch_plan,
+            ProviderLaunchPlan::NodeScript { .. } | ProviderLaunchPlan::PowerShellScript { .. }
+        ) {
+            return Err(ProviderExecutableError::NotNativeExecutable(
+                self.canonical_path().to_path_buf(),
+            ));
+        }
         self.launch_program().clone_file_handle()
     }
 
@@ -3946,11 +3983,8 @@ fn attest_direct_cmd_wrapper(contents: &str, target_name: &str) -> bool {
     {
         return true;
     }
-    strict_wrapper_lines(&lines, &required, |line| {
-        line.starts_with("\"%dp0%\\")
-            && line.ends_with("%*")
-            && line.contains(&target_name)
-            && !contains_cmd_separator(line)
+    strict_wrapper_lines(&lines, &required, required.len(), |line| {
+        line == &format!("\"%dp0%\\{target_name}\" %*")
     })
 }
 
@@ -3998,11 +4032,8 @@ fn attest_claude_cmd_wrapper(contents: &str) -> bool {
     ];
     let target = "node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe";
     let lines = normalized_wrapper_lines(contents);
-    strict_wrapper_lines(&lines, &required, |line| {
-        line.starts_with("\"%dp0%\\")
-            && line.ends_with("%*")
-            && line.contains(target)
-            && !contains_cmd_separator(line)
+    strict_wrapper_lines(&lines, &required, required.len(), |line| {
+        line == &format!("\"%dp0%\\{target}\" %*")
     })
 }
 
@@ -4010,11 +4041,8 @@ fn attest_claude_cmd_wrapper(contents: &str) -> bool {
 fn attest_claude_powershell_wrapper(contents: &str) -> bool {
     let required = ["$basedir=split-path", "exit $lastexitcode"];
     let lines = normalized_wrapper_lines(contents);
-    strict_wrapper_lines(&lines, &required, |line| {
-        line.starts_with("& ")
-            && line.contains("$basedir/node_modules/@anthropic-ai/claude-code/bin/claude.exe")
-            && line.ends_with("$args")
-            && !line.contains(';')
+    strict_wrapper_lines(&lines, &required, 1, |line| {
+        line == "& \"$basedir/node_modules/@anthropic-ai/claude-code/bin/claude.exe\" $args"
     })
 }
 
@@ -4036,7 +4064,7 @@ fn attest_codex_cmd_wrapper(contents: &str) -> bool {
         ")",
     ];
     let lines = normalized_wrapper_lines(contents);
-    strict_wrapper_lines(&lines, &required, |line| {
+    strict_wrapper_lines(&lines, &required, required.len(), |line| {
         line == "endlocal & goto #_undefined_# 2>nul || title %comspec% & set pathext=%pathext:;.js;=;% & \"%_prog%\" \"%dp0%\\..\\@openai\\codex\\bin\\codex.js\" %*"
     })
 }
@@ -4045,11 +4073,8 @@ fn attest_codex_cmd_wrapper(contents: &str) -> bool {
 fn attest_codex_powershell_wrapper(contents: &str) -> bool {
     let required = ["$basedir=split-path", "exit $lastexitcode"];
     let lines = normalized_wrapper_lines(contents);
-    strict_wrapper_lines(&lines, &required, |line| {
-        line.starts_with("& \"$basedir/node$exe\"")
-            && line.contains("$basedir/../@openai/codex/bin/codex.js")
-            && line.ends_with("$args")
-            && !line.contains(';')
+    strict_wrapper_lines(&lines, &required, 1, |line| {
+        line == "& \"$basedir/node$exe\" \"$basedir/../@openai/codex/bin/codex.js\" $args"
     })
 }
 
@@ -4063,12 +4088,8 @@ fn attest_cursor_cmd_wrapper(contents: &str) -> bool {
         "if \"%script_dir:~-1%\"==\"\\\" set \"script_dir=%script_dir:~0,-1%\"",
     ];
     let lines = normalized_wrapper_lines(contents);
-    let result = strict_wrapper_lines(&lines, &required, |line| {
-        line.contains("powershell.exe")
-            && line.contains("-noprofile")
-            && line.contains("-executionpolicy bypass")
-            && line.contains("-file \"%script_dir%\\cursor-agent.ps1\" %*")
-            && !contains_cmd_separator(line)
+    let result = strict_wrapper_lines(&lines, &required, required.len(), |line| {
+        line == "%systemroot%\\system32\\windowspowershell\\v1.0\\powershell.exe -noprofile -executionpolicy bypass -file \"%script_dir%\\cursor-agent.ps1\" %*"
     });
     result
 }
@@ -4091,17 +4112,33 @@ fn attest_cursor_powershell_wrapper(contents: &str) -> bool {
             == &format!(
                 "{version_prefix} | where-object {{ $_.name -match '^\\d{{4}}\\.\\d{{1,2}}\\.\\d{{1,2}}-[a-f0-9]+$' }} {version_sort} | select-object -first 1"
             );
+    let node_line = &lines[3 + offset];
+    let launch_line = &lines[4 + offset];
+    let node_version = node_line
+        .strip_prefix("$nodepath = \"$scriptpath\\versions\\")
+        .and_then(|value| value.strip_suffix("\\node.exe\""));
+    let launch_version = launch_line
+        .strip_prefix("& \"$nodepath\" \"$scriptpath\\versions\\")
+        .and_then(|value| value.strip_suffix("\\index.js\" $args"));
+    let version_is_attested = node_version.is_some_and(|value| {
+        (offset == 1 && value == "$versionname") || is_safe_wrapper_version(value)
+    });
     lines[0] == "$scriptpath = split-path -parent $myinvocation.mycommand.definition"
-        && lines[1].starts_with("function parse-versionstring {")
-        && lines[1].ends_with('}')
-        && !lines[1].contains(';')
+        && lines[1] == "function parse-versionstring { param ([string]$versionstring) return 1 }"
         && version_line_is_stock
-        && lines[3 + offset].starts_with("$nodepath = \"$scriptpath\\versions\\")
-        && lines[3 + offset].ends_with("\\node.exe\"")
-        && lines[4 + offset].starts_with("& \"$nodepath\" \"$scriptpath\\versions\\")
-        && lines[4 + offset].ends_with("\\index.js\" $args")
-        && !lines[4 + offset].contains(';')
+        && version_is_attested
+        && launch_version == node_version
         && lines[5 + offset] == "exit $lastexitcode"
+}
+
+#[cfg(target_os = "windows")]
+fn is_safe_wrapper_version(value: &str) -> bool {
+    !value.is_empty()
+        && value != "."
+        && value != ".."
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_')
+        })
 }
 
 #[cfg(target_os = "windows")]
@@ -4121,26 +4158,37 @@ fn normalized_wrapper_lines(contents: &str) -> Vec<String> {
 }
 
 #[cfg(target_os = "windows")]
-fn strict_wrapper_lines<F>(lines: &[String], required: &[&str], dynamic: F) -> bool
+fn strict_wrapper_lines<F>(
+    lines: &[String],
+    required: &[&str],
+    dynamic_index: usize,
+    dynamic: F,
+) -> bool
 where
     F: Fn(&str) -> bool,
 {
-    let mut counts = vec![0_u8; required.len()];
-    let mut dynamic_count = 0_u8;
-    for line in lines {
-        if dynamic(line) {
-            dynamic_count = dynamic_count.saturating_add(1);
+    if dynamic_index > required.len() || lines.len() != required.len() + 1 {
+        return false;
+    }
+    let mut required_index = 0;
+    let mut dynamic_seen = false;
+    for (line_index, line) in lines.iter().enumerate() {
+        if line_index == dynamic_index {
+            if dynamic_seen || !dynamic(line) {
+                return false;
+            }
+            dynamic_seen = true;
             continue;
         }
-        if contains_cmd_separator(line) {
+        if dynamic(line)
+            || contains_cmd_separator(line)
+            || required.get(required_index).copied() != Some(line.as_str())
+        {
             return false;
         }
-        let Some(index) = required.iter().position(|required| *required == line) else {
-            return false;
-        };
-        counts[index] = counts[index].saturating_add(1);
+        required_index += 1;
     }
-    dynamic_count == 1 && counts.iter().all(|count| *count == 1)
+    dynamic_seen && required_index == required.len()
 }
 
 #[cfg(target_os = "windows")]
@@ -4335,8 +4383,12 @@ mod auth_timestamp_tests {
             self.now
         }
 
-        fn timestamp_ms(&self, _instant: Instant) -> u64 {
+        fn timestamp_ms(&self, instant: Instant) -> u64 {
+            // Keep the deterministic base timestamp while preserving the
+            // monotonic ordering of the Instant values used by the registry.
+            let elapsed_ms = instant.saturating_duration_since(self.now).as_millis();
             self.timestamp_ms
+                .saturating_add(elapsed_ms.min(u128::from(u64::MAX)) as u64)
         }
     }
 
@@ -4369,6 +4421,11 @@ mod auth_timestamp_tests {
         assert_eq!(receipt.observed_at(), now);
         assert_eq!(receipt.observed_at_ms(), 4_242);
         assert_ne!(receipt.observed_at_ms(), receipt.generation());
+        let evidence = CapabilityEvidence::from_auth_receipt(&receipt);
+        assert!(evidence.validate().is_ok());
+        assert!(evidence
+            .expires_at()
+            .is_some_and(|expires_at| expires_at > evidence.observed_at()));
     }
 
     #[test]
@@ -4639,10 +4696,21 @@ $versionDir = Get-ChildItem -Path "$scriptPath\versions" -Directory | Sort-Objec
 $nodePath = "$scriptPath\versions\x\node.exe"
 & "$nodePath" "$scriptPath\versions\x\index.js" $args
 exit $LASTEXITCODE
-"#
+        "#
         .replace("\r\n", "\n")
         .to_ascii_lowercase();
         assert!(attest_cursor_powershell_wrapper(&cursor_ps1));
+
+        let cursor_ps_variable = cursor_ps1
+            .replace(
+                "$nodepath = \"$scriptpath\\versions\\x\\node.exe\"",
+                "$versionname = $versiondir.name\n$nodepath = \"$scriptpath\\versions\\$versionname\\node.exe\"",
+            )
+            .replace(
+                "\"$scriptpath\\versions\\x\\index.js\"",
+                "\"$scriptpath\\versions\\$versionname\\index.js\"",
+            );
+        assert!(attest_cursor_powershell_wrapper(&cursor_ps_variable));
     }
 
     #[test]
@@ -4680,6 +4748,85 @@ exit $LASTEXITCODE
         assert!(attest_cursor_powershell_wrapper(&cursor));
         cursor.push_str("Get-Process\n");
         assert!(!attest_cursor_powershell_wrapper(&cursor));
+    }
+
+    #[test]
+    fn shell_wrappers_reject_interpreter_injection_and_extra_launch_tokens() {
+        let claude_powershell = r#"$basedir = Split-Path -parent $MyInvocation.MyCommand.Definition
+& "$basedir/node_modules/@anthropic-ai/claude-code/bin/claude.exe" $args
+exit $LASTEXITCODE
+"#
+        .replace("\r\n", "\n")
+        .to_ascii_lowercase();
+        assert!(attest_provider_wrapper(
+            ProviderKind::ClaudeCode,
+            std::path::Path::new("claude.ps1"),
+            &claude_powershell
+        ));
+        assert!(!attest_provider_wrapper(
+            ProviderKind::ClaudeCode,
+            std::path::Path::new("claude.ps1"),
+            &claude_powershell.replace("$args", "$(get-process) $args")
+        ));
+        assert!(!attest_provider_wrapper(
+            ProviderKind::ClaudeCode,
+            std::path::Path::new("claude.ps1"),
+            &claude_powershell.replace("$args", "`$args")
+        ));
+        assert!(!attest_provider_wrapper(
+            ProviderKind::ClaudeCode,
+            std::path::Path::new("claude.ps1"),
+            &claude_powershell.replace("claude.exe\" $args", "claude.exe\" --extra $args")
+        ));
+        assert!(!attest_provider_wrapper(
+            ProviderKind::ClaudeCode,
+            std::path::Path::new("claude.ps1"),
+            &claude_powershell.replace(
+                "& \"$basedir/node_modules/@anthropic-ai/claude-code/bin/claude.exe\" $args\nexit $lastexitcode",
+                "exit $lastexitcode\n& \"$basedir/node_modules/@anthropic-ai/claude-code/bin/claude.exe\" $args",
+            )
+        ));
+
+        let cursor_cmd = r#"@echo off
+setlocal enabledelayedexpansion
+set "CURSOR_INVOKED_AS=%~nx0"
+set "SCRIPT_DIR=%~dp0"
+if "%SCRIPT_DIR:~-1%"=="\" set "SCRIPT_DIR=%SCRIPT_DIR:~0,-1%"
+%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%\cursor-agent.ps1" %*
+"#
+        .replace("\r\n", "\n")
+        .to_ascii_lowercase();
+        assert!(attest_cursor_cmd_wrapper(&cursor_cmd));
+        assert!(!attest_cursor_cmd_wrapper(&cursor_cmd.replace(
+            "-file \"%script_dir%\\cursor-agent.ps1\" %*",
+            "-command whoami -file \"%script_dir%\\cursor-agent.ps1\" %*"
+        )));
+
+        let cursor_powershell = r#"$scriptPath = Split-Path -parent $MyInvocation.MyCommand.Definition
+function Parse-VersionString { param ([string]$versionString) return 1 }
+$versionDir = Get-ChildItem -Path "$scriptPath\versions" -Directory | Sort-Object { Parse-VersionString $_.Name } -Descending
+$nodePath = "$scriptPath\versions\x\node.exe"
+& "$nodePath" "$scriptPath\versions\x\index.js" $args
+exit $LASTEXITCODE
+"#
+        .replace("\r\n", "\n")
+        .to_ascii_lowercase();
+        assert!(attest_cursor_powershell_wrapper(&cursor_powershell));
+        assert!(!attest_cursor_powershell_wrapper(
+            &cursor_powershell.replace(
+                "function parse-versionstring { param ([string]$versionstring) return 1 }",
+                "function parse-versionstring { get-process }"
+            )
+        ));
+        assert!(!attest_cursor_powershell_wrapper(
+            &cursor_powershell.replace(
+                "\\versions\\x\\index.js\" $args",
+                "\\versions\\x\\index.js\" -NoProfile $args"
+            )
+        ));
+        assert!(!attest_cursor_powershell_wrapper(
+            &cursor_powershell.replace("\\versions\\x\\node.exe", "\\versions\\..\\node.exe")
+        ));
     }
 }
 

@@ -236,6 +236,12 @@ fn provider_cleanup_source_has_no_external_kill_subprocess() {
     assert!(!adapter_source.contains("Command::new(\"kill\")"));
     assert!(!platform_source.contains("Command::new(\"kill\")"));
     assert!(!adapter_source.contains("reader\n        .join()"));
+    for marker in ["ProbeReaderReaper", "reader-reaper", "self.deadline"] {
+        assert!(
+            adapter_source.contains(marker),
+            "reader lifecycle is missing bounded ownership marker {marker}"
+        );
+    }
 }
 
 #[test]
@@ -297,6 +303,10 @@ fn linux_probe_cleanup_requires_exit_kill_and_process_start_identity() {
             "Unix cleanup is missing owned identity marker {marker}"
         );
     }
+    assert!(
+        adapter_source.contains("LINUX_DESCENDANT_CONTAINMENT_HOLD"),
+        "Linux fork/clone/setsid containment must remain an explicit platform HOLD"
+    );
 }
 
 #[test]
@@ -1555,6 +1565,22 @@ fn executable_wire_preserves_native_form_and_requires_it_on_decode() {
     let mut missing_form = encoded;
     missing_form.as_object_mut().unwrap().remove("is_native");
     assert!(serde_json::from_value::<ProviderExecutable>(missing_form).is_err());
+}
+
+#[test]
+fn deserialized_non_native_identity_cannot_open_as_a_direct_handle() {
+    let temp = tempdir().unwrap();
+    let path = native_fixture(temp.path(), "provider-native.exe", b"non-native-form");
+    let identity = executable(&path);
+    let mut encoded = serde_json::to_value(&identity).unwrap();
+    encoded["is_native"] = serde_json::json!(false);
+
+    let non_native: ProviderExecutable = serde_json::from_value(encoded).unwrap();
+    assert!(!non_native.is_native());
+    assert!(matches!(
+        non_native.open_for_launch(),
+        Err(ProviderExecutableError::NotNativeExecutable(_))
+    ));
 }
 
 #[cfg(windows)]

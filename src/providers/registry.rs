@@ -7,6 +7,7 @@ use crate::providers::capabilities::{
     ProviderCapabilities, ProviderDiscoveryCandidateInput, ProviderDiscoveryContract,
     ProviderDiscoveryError, ProviderExecutable, ProviderExecutableError, ProviderExecutableHandle,
     ProviderKind, ProviderVersion, SemanticSchemaVersion, MAX_PROVIDER_CAPABILITY_CACHE_ENTRIES,
+    PROVIDER_REGISTRY_ADAPTER_REVISION, PROVIDER_REGISTRY_SEMANTIC_SCHEMA_VERSION,
 };
 use async_trait::async_trait;
 use futures_util::FutureExt;
@@ -22,8 +23,9 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Notify};
 use tokio::task::{JoinHandle, JoinSet};
 
-const TASK_4_1_ADAPTER_REVISION: AdapterRevision = AdapterRevision::new(1);
-const TASK_4_1_SEMANTIC_SCHEMA_VERSION: SemanticSchemaVersion = SemanticSchemaVersion::new(1);
+const TASK_4_1_ADAPTER_REVISION: AdapterRevision = PROVIDER_REGISTRY_ADAPTER_REVISION;
+const TASK_4_1_SEMANTIC_SCHEMA_VERSION: SemanticSchemaVersion =
+    PROVIDER_REGISTRY_SEMANTIC_SCHEMA_VERSION;
 const PROVIDER_CAPABILITY_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 const MAX_PROVIDER_IN_FLIGHT_ENTRIES: usize = 64;
 const PROVIDER_IN_FLIGHT_TTL: Duration = Duration::from_secs(30);
@@ -133,6 +135,7 @@ impl CapabilityCacheKey {
 pub struct ProviderObservation {
     pub kind: ProviderKind,
     pub executable: ProviderExecutable,
+    launch_handle: ProviderExecutableHandle,
     pub version: ProviderVersion,
     pub adapter_revision: AdapterRevision,
     pub semantic_schema_version: SemanticSchemaVersion,
@@ -158,7 +161,22 @@ impl ProviderObservation {
         self.executable
             .validate_current()
             .map_err(ProviderError::Executable)?;
+        if self.launch_handle.executable() != &self.executable {
+            return Err(ProviderError::ExecutableChanged {
+                before: self.executable.clone(),
+                after: self.launch_handle.executable().clone(),
+            });
+        }
+        self.launch_handle
+            .revalidate()
+            .map_err(ProviderError::Executable)?;
         Ok(())
+    }
+
+    /// Returns the registry-issued launch graph, retaining any native target,
+    /// interpreter, and script handles discovered for a wrapper.
+    pub fn executable_handle(&self) -> &ProviderExecutableHandle {
+        &self.launch_handle
     }
 }
 
@@ -205,9 +223,23 @@ impl<'de> Deserialize<'de> for ProviderObservation {
                 wire.schema_version
             )));
         }
+        let executable = wire.executable;
+        // Wire identity is not launch authority.  A native graph can be
+        // re-opened from the attested file; a wrapper graph cannot be
+        // reconstituted from the primary identity alone, so fail closed
+        // instead of forging a Direct handle.
+        if !executable.is_native() {
+            return Err(de::Error::custom(
+                ProviderExecutableError::NotNativeExecutable(
+                    executable.canonical_path().to_path_buf(),
+                ),
+            ));
+        }
+        let launch_handle = executable.open_for_launch().map_err(de::Error::custom)?;
         let observation = Self {
             kind: wire.kind,
-            executable: wire.executable,
+            executable,
+            launch_handle,
             version: wire.version,
             adapter_revision: wire.adapter_revision,
             semantic_schema_version: wire.semantic_schema_version,
@@ -293,8 +325,12 @@ struct ProbeFlight {
 
 impl ProbeFlight {
     fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Release);
         let mut result = self.result.lock().unwrap();
+        // Serialize cancellation with the cache commit fence below. A worker
+        // that already owns this lock may commit one final cache entry before
+        // cancellation linearizes; once cancellation owns it, no worker can
+        // write a later cache entry.
+        self.cancelled.store(true, Ordering::Release);
         if result.is_none() {
             *result = Some(Err(ProviderError::Probe(
                 crate::providers::adapter::ProviderProbeError::TimedOut,
@@ -573,6 +609,7 @@ async fn run_probe_worker(request: ProbeWorkerRequest) -> ProbeWorkerCompletion 
             &before,
             &before_handle,
             &identity_key,
+            &flight,
         )
         .await
     }
@@ -740,10 +777,16 @@ pub struct ProviderRegistry {
 
 impl Drop for ProviderRegistry {
     fn drop(&mut self) {
-        if let Ok(in_flight) = self.in_flight.lock() {
-            for flight in in_flight.values() {
-                flight.cancel();
-            }
+        let flights = self
+            .in_flight
+            .lock()
+            .map(|in_flight| in_flight.values().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        // Publication takes the flight result lock before the in-flight map
+        // lock. Snapshot first so drop never reverses that order while
+        // canceling a worker that is completing concurrently.
+        for flight in flights {
+            flight.cancel();
         }
         self.worker_supervisor.shutdown();
     }
@@ -781,6 +824,18 @@ impl ProviderRegistry {
     ) -> Result<ProviderExecutable, ProviderError> {
         let (_, identity, _) = self.select_executable(kind, config).await?;
         Ok(identity)
+    }
+
+    /// Resolves the complete registry-issued launch graph.  Callers that may
+    /// launch a wrapper must retain this opaque handle instead of reopening
+    /// the public primary executable identity.
+    pub async fn resolve_executable_handle(
+        &self,
+        kind: ProviderKind,
+        config: &ProviderDiscoveryConfig,
+    ) -> Result<ProviderExecutableHandle, ProviderError> {
+        let (_, _, handle) = self.select_executable(kind, config).await?;
+        Ok(handle)
     }
 
     pub async fn observe(
@@ -983,6 +1038,7 @@ impl ProviderRegistry {
         let observation = ProviderObservation {
             kind,
             executable: probe.executable,
+            launch_handle: probe.executable_handle.clone(),
             version,
             adapter_revision: TASK_4_1_ADAPTER_REVISION,
             semantic_schema_version: TASK_4_1_SEMANTIC_SCHEMA_VERSION,
@@ -1000,7 +1056,7 @@ impl ProviderRegistry {
         config: ProviderDiscoveryConfig,
         key: ProbeReservationKey,
     ) -> Result<ProbeRun, ProviderError> {
-        let (flight, leader) = {
+        let (flight, leader, cancellation_targets) = {
             let mut in_flight = self.in_flight.lock().unwrap();
             let now = Instant::now();
             let expired: Vec<_> = in_flight
@@ -1010,11 +1066,12 @@ impl ProviderRegistry {
                 })
                 .map(|(key, flight)| (key.clone(), Arc::clone(flight)))
                 .collect();
-            for (_expired_key, expired_flight) in expired {
-                expired_flight.cancel();
-            }
+            let mut cancellation_targets = expired
+                .into_iter()
+                .map(|(_, flight)| flight)
+                .collect::<Vec<_>>();
             if let Some(flight) = in_flight.get(&key) {
-                (Arc::clone(flight), false)
+                (Some(Arc::clone(flight)), false, cancellation_targets)
             } else {
                 if in_flight.len() >= MAX_PROVIDER_IN_FLIGHT_ENTRIES {
                     // Cancellation is cooperative for the async layer, but
@@ -1025,23 +1082,33 @@ impl ProviderRegistry {
                     if let Some((_, oldest_flight)) =
                         in_flight.iter().min_by_key(|(_, flight)| flight.started_at)
                     {
-                        oldest_flight.cancel();
+                        cancellation_targets.push(Arc::clone(oldest_flight));
                     }
-                    return Err(ProviderError::Probe(
-                        crate::providers::adapter::ProviderProbeError::TimedOut,
-                    ));
+                    (None, false, cancellation_targets)
+                } else {
+                    let flight = Arc::new(ProbeFlight {
+                        result: Mutex::new(None),
+                        completed: Notify::new(),
+                        started_at: now,
+                        deadline: now + PROVIDER_IN_FLIGHT_TTL,
+                        cancelled: AtomicBool::new(false),
+                        cancellation: Notify::new(),
+                    });
+                    in_flight.insert(key.clone(), Arc::clone(&flight));
+                    (Some(flight), true, cancellation_targets)
                 }
-                let flight = Arc::new(ProbeFlight {
-                    result: Mutex::new(None),
-                    completed: Notify::new(),
-                    started_at: now,
-                    deadline: now + PROVIDER_IN_FLIGHT_TTL,
-                    cancelled: AtomicBool::new(false),
-                    cancellation: Notify::new(),
-                });
-                in_flight.insert(key.clone(), Arc::clone(&flight));
-                (flight, true)
             }
+        };
+
+        // Do not call cancel while holding `in_flight`: worker publication
+        // stores its result before removing the same flight from this map.
+        for flight in cancellation_targets {
+            flight.cancel();
+        }
+        let Some(flight) = flight else {
+            return Err(ProviderError::Probe(
+                crate::providers::adapter::ProviderProbeError::TimedOut,
+            ));
         };
 
         if leader {
@@ -1137,8 +1204,18 @@ impl ProviderRegistry {
         before: &ProviderExecutable,
         before_handle: &ProviderExecutableHandle,
         identity_key: &ProbeIdentityKey,
+        flight: &ProbeFlight,
     ) -> Result<ProbeWorkResult, ProviderError> {
+        // Once the retained worker has started, let the adapter finish its
+        // bounded probe so its worker/admission ownership settles. The
+        // post-probe fence below converts caller cancellation or deadline
+        // expiry into a timeout before any identity/cache result is published.
         let capabilities = adapter.probe(before_handle).await?;
+        if flight.cancelled.load(Ordering::Acquire) || Instant::now() >= flight.deadline {
+            return Err(ProviderError::Probe(
+                crate::providers::adapter::ProviderProbeError::TimedOut,
+            ));
+        }
         if capabilities.kind != identity_key.kind {
             return Err(ProviderError::CapabilityKindMismatch {
                 expected: identity_key.kind,
@@ -1175,6 +1252,11 @@ impl ProviderRegistry {
                     }
                     other => ProviderError::Executable(other),
                 })?;
+        if flight.cancelled.load(Ordering::Acquire) || Instant::now() >= flight.deadline {
+            return Err(ProviderError::Probe(
+                crate::providers::adapter::ProviderProbeError::TimedOut,
+            ));
+        }
         let contract = ProviderDiscoveryContract::for_kind(identity_key.kind);
         if after.is_native() {
             contract
@@ -1205,17 +1287,39 @@ impl ProviderRegistry {
             .matching_entries(identity_key, before_handle)
             .iter()
             .any(|(existing_key, _)| existing_key == &cache_key);
-        cache.lock().unwrap().insert(
+        // Hold the flight result lock while checking the absolute deadline,
+        // committing the cache write, and publishing the worker result.
+        // `ProbeFlight::cancel` takes the same lock first, so a timeout
+        // cannot insert a cache entry and then lose the result slot.
+        let mut flight_result = flight.result.lock().unwrap();
+        if flight.cancelled.load(Ordering::Acquire) || Instant::now() >= flight.deadline {
+            return Err(ProviderError::Probe(
+                crate::providers::adapter::ProviderProbeError::TimedOut,
+            ));
+        }
+        let mut cache = cache.lock().unwrap();
+        if flight.cancelled.load(Ordering::Acquire) || Instant::now() >= flight.deadline {
+            return Err(ProviderError::Probe(
+                crate::providers::adapter::ProviderProbeError::TimedOut,
+            ));
+        }
+        cache.insert(
             cache_key,
             capabilities.stable_projection(),
             before_handle.clone(),
         );
-        Ok(ProbeWorkResult {
+        let work = ProbeWorkResult {
             capabilities,
             executable: after,
             executable_handle: before_handle.clone(),
             had_matching_cached,
-        })
+        };
+        if flight_result.is_none() {
+            *flight_result = Some(Ok(work.clone()));
+        }
+        drop(cache);
+        drop(flight_result);
+        Ok(work)
     }
 
     async fn select_executable(

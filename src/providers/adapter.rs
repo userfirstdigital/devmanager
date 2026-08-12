@@ -282,6 +282,7 @@ pub enum ProviderProbeRequestError {
     ZeroTimeout,
     TimeoutTooLong,
     OutputBoundTooLarge,
+    AuthStatusRequiresRunnerProof,
 }
 
 impl fmt::Display for ProviderProbeRequestError {
@@ -291,6 +292,12 @@ impl fmt::Display for ProviderProbeRequestError {
             Self::ZeroTimeout => write!(f, "provider probe timeout must be non-zero"),
             Self::TimeoutTooLong => write!(f, "provider probe timeout exceeded its bound"),
             Self::OutputBoundTooLarge => write!(f, "provider probe output bound is too large"),
+            Self::AuthStatusRequiresRunnerProof => {
+                write!(
+                    f,
+                    "auth-status probe results can only be issued by the bounded runner"
+                )
+            }
         }
     }
 }
@@ -592,6 +599,14 @@ impl ProviderProbeResult {
         stdout_bytes: usize,
         stderr_bytes: usize,
     ) -> Result<Self, ProviderProbeError> {
+        // Public metadata may describe a version/help probe.  It cannot claim
+        // an auth-status observation: that result is issued only by the
+        // crate-owned runner with a private proof token.
+        if request.kind() == ProviderProbeKind::AuthStatus || request.auth_binding.is_some() {
+            return Err(ProviderProbeError::InvalidRequest(
+                ProviderProbeRequestError::AuthStatusRequiresRunnerProof,
+            ));
+        }
         if stdout_bytes.saturating_add(stderr_bytes) > request.max_output_bytes() {
             return Err(ProviderProbeError::OutputTooLarge);
         }
@@ -1001,6 +1016,10 @@ impl WindowsProviderProbeRunner {
             return Err(ProviderProbeError::Io(
                 ProviderProbeIoError::ExecutableNotAllowed,
             ));
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = process.terminate_tree(deadline);
+            return Err(ProviderProbeError::TimedOut);
         }
         if let Err(error) = process.release_attestation_barrier_once() {
             let _ = process.terminate_tree(deadline);
@@ -1899,8 +1918,6 @@ impl ProbeProcess {
         let barrier_kill_ok = self.kill_while_attestation_barrier();
         let mut cleanup_failed = !barrier_kill_ok;
         #[cfg(unix)]
-        let now = std::time::Instant::now();
-        #[cfg(unix)]
         let group_cleanup_deadline = deadline;
         if let Some(job) = self.managed_job.as_ref() {
             match job.active_process_ids() {
@@ -1934,7 +1951,8 @@ impl ProbeProcess {
                 if !identity_matches {
                     false
                 } else {
-                    let remaining = group_cleanup_deadline.saturating_duration_since(now);
+                    let remaining =
+                        group_cleanup_deadline.saturating_duration_since(std::time::Instant::now());
                     let term_grace = remaining / 3;
                     let result = crate::services::platform_service::terminate_owned_process_group(
                         self.pid(),
@@ -2037,6 +2055,9 @@ const LINUX_PTRACE_O_TRACEEXEC: i64 = 0x10;
 #[cfg(target_os = "linux")]
 const LINUX_PTRACE_O_EXITKILL: i64 = 0x0010_0000;
 #[cfg(target_os = "linux")]
+const LINUX_DESCENDANT_CONTAINMENT_HOLD: &str =
+    "platform HOLD: fork/clone/setsid descendants are not yet ptrace-supervised";
+#[cfg(target_os = "linux")]
 const LINUX_PTRACE_EVENT_EXEC: i32 = 4;
 #[cfg(target_os = "linux")]
 const LINUX_WAIT_NOHANG: i32 = 1;
@@ -2097,6 +2118,12 @@ fn wait_for_linux_exec_stop(
 
 #[cfg(target_os = "linux")]
 fn linux_ptrace_set_options(pid: u32) -> Result<(), ProviderProbeError> {
+    // This implementation intentionally records an explicit platform HOLD:
+    // TRACEEXEC plus EXITKILL does not control fork/clone children that leave
+    // the process group (for example after setsid). No production provider
+    // launch may rely on Linux containment until those descendants are
+    // traced and reaped under the same absolute deadline.
+    let _platform_hold = LINUX_DESCENDANT_CONTAINMENT_HOLD;
     if unsafe {
         linux_ptrace(
             LINUX_PTRACE_SETOPTIONS,
@@ -2442,6 +2469,54 @@ impl BoundedProbeCapture {
 struct ProbeReaderHandle {
     cancelled: Arc<AtomicBool>,
     join: Option<JoinHandle<io::Result<()>>>,
+    deadline: std::time::Instant,
+}
+
+/// Owns an exceptional reader that did not join by the probe deadline.  The
+/// reaper itself is bounded by that same absolute deadline; dropping its
+/// `JoinHandle` after the bound is the last-resort containment boundary for a
+/// custom pipe that violates the production non-blocking pipe contract.
+struct ProbeReaderReaper {
+    join: JoinHandle<io::Result<()>>,
+    deadline: std::time::Instant,
+}
+
+const PROBE_READER_REAPER_THREAD_NAME: &str = "devmanager-provider-probe-reader-reaper";
+
+impl ProbeReaderReaper {
+    fn run(self) {
+        let _reader_reaper = PROBE_READER_REAPER_THREAD_NAME;
+        while !self.join.is_finished() {
+            let now = std::time::Instant::now();
+            if now >= self.deadline {
+                break;
+            }
+            std::thread::sleep((self.deadline - now).min(Duration::from_millis(1)));
+        }
+        if self.join.is_finished() {
+            let _ = self.join.join();
+        }
+        // Dropping an unfinished JoinHandle after the absolute deadline is
+        // the last-resort containment boundary for a custom pipe that
+        // violates the production non-blocking contract.
+    }
+}
+
+impl Drop for ProbeReaderHandle {
+    fn drop(&mut self) {
+        let Some(join) = self.join.take() else {
+            return;
+        };
+        self.cancelled.store(true, Ordering::Release);
+        // Keep cleanup owned on this thread.  Spawning a helper here would
+        // detach the JoinHandle if thread creation failed, and the happy
+        // path already joined through `receive_probe_reader`.
+        ProbeReaderReaper {
+            join,
+            deadline: self.deadline,
+        }
+        .run();
+    }
 }
 
 fn spawn_probe_reader(
@@ -2476,6 +2551,7 @@ fn spawn_probe_reader(
     ProbeReaderHandle {
         cancelled,
         join: Some(join),
+        deadline,
     }
 }
 
@@ -2832,6 +2908,19 @@ mod tests {
         let observation = result.into_auth_observation(&first, &request).unwrap();
         let accepted = evidence.accept_observation(first, observation);
         assert!(accepted.is_ok(), "{accepted:?}");
+    }
+
+    #[test]
+    fn public_completed_result_cannot_describe_auth_status() {
+        let executable = ProviderExecutable::from_path(std::env::current_exe().unwrap()).unwrap();
+        let request =
+            ProviderProbeRequest::auth_status(executable.open_for_launch().unwrap()).unwrap();
+        assert!(matches!(
+            ProviderProbeResult::completed(&request, 0, 0, 0),
+            Err(super::ProviderProbeError::InvalidRequest(
+                super::ProviderProbeRequestError::AuthStatusRequiresRunnerProof
+            ))
+        ));
     }
 
     #[test]
