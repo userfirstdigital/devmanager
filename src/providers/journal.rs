@@ -8,7 +8,10 @@ use crate::domain::{
     AgentSessionId, DomainEvent, EventId, PageLimits, PrivacyClass, ResourceId,
     SemanticJournalFact, SemanticJournalPage, SemanticJournalPayload, TaskId,
 };
-use crate::kernel::semantic_journal::{SemanticJournalAuthorityRecord, SemanticJournalFactRow};
+use crate::kernel::semantic_journal::{
+    SemanticJournalAuthorityRecord, SemanticJournalFactRef, SemanticJournalFactRow,
+    SemanticJournalPageRowAction, SemanticJournalPageRowMeta,
+};
 use crate::kernel::{KernelStore, StoreError};
 use crate::protocol::{FrameLimits, MessagePackCodec, MessagePackError, MAX_MESSAGEPACK_DEPTH};
 use crate::providers::capabilities::ProviderKind;
@@ -18,6 +21,7 @@ use serde::ser::{SerializeSeq, SerializeStruct, Serializer};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::io::Cursor;
@@ -37,6 +41,8 @@ thread_local! {
 fn debug_reset_journal_page_materialization_counters() {
     JOURNAL_PAGE_EVENT_MATERIALIZATIONS.with(|counter| counter.set(0));
     JOURNAL_PAGE_FACT_MATERIALIZATIONS.with(|counter| counter.set(0));
+    crate::kernel::semantic_journal::debug_reset_semantic_journal_materialization_counters();
+    JOURNAL_PAGE_PAYLOAD_PROBES.with(|counter| counter.set(0));
 }
 
 #[cfg(test)]
@@ -44,6 +50,14 @@ fn debug_journal_page_materialization_counters() -> (usize, usize) {
     (
         JOURNAL_PAGE_EVENT_MATERIALIZATIONS.with(Cell::get),
         JOURNAL_PAGE_FACT_MATERIALIZATIONS.with(Cell::get),
+    )
+}
+
+#[cfg(test)]
+fn debug_journal_page_preflight_counters() -> (usize, usize) {
+    (
+        crate::kernel::semantic_journal::debug_semantic_journal_materialization_counters(),
+        JOURNAL_PAGE_PAYLOAD_PROBES.with(Cell::get),
     )
 }
 
@@ -57,6 +71,18 @@ fn debug_record_page_event_materialization() {
 #[cfg(test)]
 fn debug_record_page_fact_materialization() {
     JOURNAL_PAGE_FACT_MATERIALIZATIONS.with(|counter| {
+        counter.set(counter.get().saturating_add(1));
+    });
+}
+
+#[cfg(test)]
+thread_local! {
+    static JOURNAL_PAGE_PAYLOAD_PROBES: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+fn debug_record_page_payload_probe() {
+    JOURNAL_PAGE_PAYLOAD_PROBES.with(|counter| {
         counter.set(counter.get().saturating_add(1));
     });
 }
@@ -79,6 +105,7 @@ pub const MAX_CALL_ID_BYTES: usize = 128;
 pub const MAX_REQUEST_ID_BYTES: usize = 128;
 pub const MAX_QUESTION_OPTIONS: usize = 16;
 pub const MAX_JOURNAL_JSON_NODES: usize = 512;
+const MAX_JOURNAL_MESSAGEPACK_VALUES: usize = MAX_JOURNAL_JSON_NODES;
 pub const MAX_JOURNAL_EVENTS: u32 = 4_096;
 pub const MAX_JOURNAL_DEDUPE_KEYS: u32 = 8_192;
 pub const DEFAULT_MAX_INGEST_STEPS: u32 = 65_536;
@@ -1719,7 +1746,9 @@ impl SemanticJournal {
             .semantic_journal_ensure_session(&record)
             .map_err(|_| JournalError::Store)?;
         let (next_sequence, _) = store
-            .semantic_journal_high_water(&record.digest)
+            .semantic_journal_high_water_validated(&record.digest, |row| {
+                validate_restored_row(permit.authority, row)
+            })
             .map_err(|_| JournalError::Store)?;
         Ok(Self {
             store,
@@ -1949,52 +1978,74 @@ impl SemanticJournal {
         let after = i64::try_from(after_sequence).unwrap_or(i64::MAX);
         let codec = MessagePackCodec::from_limits(FrameLimits::v1_default())
             .map_err(|_| JournalIngestOutcome::Backpressure(JournalBackpressure::PageBudget))?;
-        let mut expected = after_sequence.saturating_add(1);
         // Do not reserve candidate storage until a row passes the byte
         // preflight below; a tiny page budget must not allocate a page-sized
         // fact buffer just to reject its first row.
-        let mut candidates = Vec::new();
-        let mut overflow_sequence = None;
-        let mut scanned_through = after_sequence;
-        let mut stream_error = None;
+        let page_state = RefCell::new(PageBuildState {
+            expected: after_sequence.saturating_add(1),
+            candidates: Vec::new(),
+            next_candidate_sequences: Vec::new(),
+            overflow_sequence: None,
+            scanned_through: after_sequence,
+            stream_error: None,
+            preflight_encoded_bytes: None,
+        });
         let high_water = self
             .store
             .semantic_journal_stream_page(
                 &self.authority_digest,
                 after,
                 requested_high_water,
-                |row| validate_restored_row(self.authority, row),
+                |_high_water, rows: &[SemanticJournalPageRowMeta]| {
+                    let mut state = page_state.borrow_mut();
+                    let mut next_candidate = None;
+                    let mut next_candidates = Vec::with_capacity(rows.len());
+                    for row in rows.iter().rev() {
+                        next_candidates.push((row.sequence, next_candidate));
+                        if persist_only || !row.runtime_only {
+                            next_candidate = Some(row.sequence);
+                        }
+                    }
+                    next_candidates.reverse();
+                    state.next_candidate_sequences = next_candidates;
+                    Ok(())
+                },
+                |row| validate_metadata_row(self.authority, &row),
                 |high_water, row| {
+                    let mut state = page_state.borrow_mut();
                     let sequence = match u64::try_from(row.sequence) {
                         Ok(sequence) => sequence,
                         Err(_) => {
-                            stream_error = Some(JournalIngestOutcome::NeedsResync);
-                            return Ok(false);
+                            state.stream_error = Some(JournalIngestOutcome::NeedsResync);
+                            return Ok(SemanticJournalPageRowAction::Stop);
                         }
                     };
-                    if sequence != expected || sequence > high_water {
-                        stream_error = Some(JournalIngestOutcome::NeedsResync);
-                        return Ok(false);
+                    if sequence != state.expected || sequence > high_water {
+                        state.stream_error = Some(JournalIngestOutcome::NeedsResync);
+                        return Ok(SemanticJournalPageRowAction::Stop);
                     }
-                    expected = expected.saturating_add(1);
-                    scanned_through = sequence;
-                    if candidates.len() as u32 >= limits.max_items {
-                        overflow_sequence = Some(sequence);
-                        return Ok(false);
-                    }
+                    state.expected = state.expected.saturating_add(1);
+                    state.scanned_through = sequence;
                     if !persist_only && row.visibility == JournalVisibility::RuntimeOnly.as_str() {
-                        return Ok(true);
+                        return Ok(SemanticJournalPageRowAction::Skip);
                     }
-                    let candidate = match page_fact_projection(&row, self.authority.provider) {
-                        Ok(candidate) => candidate,
-                        Err(_) => {
-                            stream_error = Some(JournalIngestOutcome::NeedsResync);
-                            return Ok(false);
-                        }
-                    };
-                    let next_sequence = (sequence < high_water)
-                        .then(|| sequence.checked_add(1))
-                        .flatten();
+                    if state.candidates.len() as u32 >= limits.max_items {
+                        state.overflow_sequence = Some(sequence);
+                        return Ok(SemanticJournalPageRowAction::Stop);
+                    }
+                    let candidate =
+                        match page_fact_projection_preflight(&row, self.authority.provider) {
+                            Ok(candidate) => candidate,
+                            Err(_) => {
+                                state.stream_error = Some(JournalIngestOutcome::NeedsResync);
+                                return Ok(SemanticJournalPageRowAction::Stop);
+                            }
+                        };
+                    let next_sequence = state
+                        .next_candidate_sequences
+                        .iter()
+                        .find(|(candidate, _)| *candidate == sequence)
+                        .and_then(|(_, next)| *next);
                     // Measure the exact projected page before restoring the
                     // candidate event or allocating its owned fact. The
                     // borrowed projection reuses the durable payload's
@@ -2006,27 +2057,61 @@ impl SemanticJournal {
                         sequence,
                         high_water,
                         next_sequence,
-                        &candidates,
+                        &state.candidates,
                         &candidate,
                         limits.max_encoded_bytes,
                     ) {
                         Ok(encoded_bytes) => encoded_bytes,
                         Err(PageMeasureError::TooLarge) => {
-                            overflow_sequence = Some(sequence);
-                            return Ok(false);
+                            state.overflow_sequence = Some(sequence);
+                            return Ok(SemanticJournalPageRowAction::Stop);
                         }
                         Err(PageMeasureError::Encode) => {
-                            stream_error = Some(JournalIngestOutcome::Backpressure(
+                            state.stream_error = Some(JournalIngestOutcome::Backpressure(
                                 JournalBackpressure::PageBudget,
                             ));
+                            return Ok(SemanticJournalPageRowAction::Stop);
+                        }
+                    };
+                    state.preflight_encoded_bytes = Some(encoded_bytes);
+                    Ok(SemanticJournalPageRowAction::Fetch)
+                },
+                |high_water, row| {
+                    let mut state = page_state.borrow_mut();
+                    if validate_restored_row(self.authority, &row).is_err() {
+                        state.stream_error = Some(JournalIngestOutcome::NeedsResync);
+                        return Ok(false);
+                    }
+                    let sequence = match u64::try_from(row.sequence) {
+                        Ok(sequence) => sequence,
+                        Err(_) => {
+                            state.stream_error = Some(JournalIngestOutcome::NeedsResync);
                             return Ok(false);
                         }
                     };
-                    drop(candidate);
+                    let encoded_bytes = match state.preflight_encoded_bytes.take() {
+                        Some(encoded_bytes) => encoded_bytes,
+                        None => {
+                            state.stream_error = Some(JournalIngestOutcome::NeedsResync);
+                            return Ok(false);
+                        }
+                    };
+                    let _candidate = match page_fact_projection(&row, self.authority.provider) {
+                        Ok(candidate) => candidate,
+                        Err(_) => {
+                            state.stream_error = Some(JournalIngestOutcome::NeedsResync);
+                            return Ok(false);
+                        }
+                    };
+                    let next_sequence = state
+                        .next_candidate_sequences
+                        .iter()
+                        .find(|(candidate, _)| *candidate == sequence)
+                        .and_then(|(_, next)| *next);
                     let event = match restore_event(&self.authority, row) {
                         Ok(event) => event,
                         Err(_) => {
-                            stream_error = Some(JournalIngestOutcome::NeedsResync);
+                            state.stream_error = Some(JournalIngestOutcome::NeedsResync);
                             return Ok(false);
                         }
                     };
@@ -2034,21 +2119,28 @@ impl SemanticJournal {
                         return Ok(true);
                     }
                     let candidate = event.to_snapshot_fact();
-                    candidates.push(candidate);
+                    state.candidates.push(candidate);
                     let mut page = SemanticJournalPage {
                         after_sequence,
                         through_sequence: event.sequence,
                         high_water,
                         encoded_bytes: 0,
                         next_sequence,
-                        facts: std::mem::take(&mut candidates),
+                        facts: std::mem::take(&mut state.candidates),
                     };
                     page.encoded_bytes = encoded_bytes;
-                    candidates = page.facts;
+                    state.candidates = page.facts;
                     Ok(true)
                 },
             )
             .map_err(|_| JournalIngestOutcome::NeedsResync)?;
+        let PageBuildState {
+            candidates,
+            overflow_sequence,
+            scanned_through,
+            stream_error,
+            ..
+        } = page_state.into_inner();
         if let Some(error) = stream_error {
             return Err(error);
         }
@@ -2058,10 +2150,10 @@ impl SemanticJournal {
         let through_sequence = candidates
             .last()
             .map(|fact| fact.sequence)
-            // An oversized first candidate was fetched and decoded only to
-            // establish that it cannot fit. It was not returned, so the page
-            // must leave the durable cursor at `after_sequence` and expose
-            // the candidate again through `next_sequence`.
+            // An oversized first candidate was admitted to neither the owned
+            // row nor payload path. It was not returned, so the page leaves
+            // the durable cursor at `after_sequence` and exposes the
+            // candidate again through `next_sequence`.
             .or_else(|| overflow_sequence.is_none().then_some(scanned_through))
             .unwrap_or(after_sequence);
         let next_sequence = overflow_sequence
@@ -2276,6 +2368,16 @@ enum PageMeasureError {
     Encode,
 }
 
+struct PageBuildState {
+    expected: u64,
+    candidates: Vec<SemanticJournalFact>,
+    next_candidate_sequences: Vec<(u64, Option<u64>)>,
+    overflow_sequence: Option<u64>,
+    scanned_through: u64,
+    stream_error: Option<JournalIngestOutcome>,
+    preflight_encoded_bytes: Option<u32>,
+}
+
 fn page_encoded_len(
     codec: &MessagePackCodec,
     page: &mut SemanticJournalPage,
@@ -2363,14 +2465,858 @@ enum SemanticJournalPayloadRef<'a> {
     },
 }
 
+/// Zero-allocation payload shape used only for the page byte preflight. It
+/// reads the persisted MessagePack value directly and borrows every string;
+/// the owned `Cow` probe below is reserved for rows that already passed the
+/// cap.
+#[derive(Debug, Clone, Copy)]
+enum RawPayloadShape<'a> {
+    UserMessage {
+        text: &'a str,
+    },
+    AssistantText {
+        text: &'a str,
+    },
+    ReasoningSummary {
+        text: &'a str,
+    },
+    ToolCall {
+        tool_name: &'a str,
+        call_id: &'a str,
+    },
+    ToolResult {
+        call_id: &'a str,
+        status: &'a str,
+    },
+    ApprovalRequest {
+        request_id: &'a str,
+        summary: &'a str,
+    },
+    ApprovalResult {
+        request_id: &'a str,
+        decision: &'a str,
+    },
+    Question {
+        question_id: &'a str,
+        prompt: &'a str,
+        options: RawPayloadOptions<'a>,
+    },
+    PlanStep {
+        step_id: &'a str,
+        title: &'a str,
+        status: &'a str,
+    },
+    UsageObservation {
+        remaining_percent: Option<u8>,
+    },
+    Error {
+        code: &'a str,
+        message: &'a str,
+    },
+    TurnState {
+        state: &'a str,
+    },
+    SessionState {
+        state: &'a str,
+    },
+    ArtifactReference {
+        label: &'a str,
+    },
+    Unknown {
+        provider: &'a str,
+        source_type: &'a str,
+        schema_version: u32,
+        diagnostic_ref: &'a str,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RawPayloadOptions<'a> {
+    values: [&'a str; MAX_JOURNAL_ARRAY_ITEMS],
+    len: usize,
+}
+
+impl Serialize for RawPayloadOptions<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(self.len))?;
+        for value in &self.values[..self.len] {
+            sequence.serialize_element(value)?;
+        }
+        sequence.end()
+    }
+}
+
+impl Serialize for RawPayloadShape<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::UserMessage { text } => {
+                let mut payload = serializer.serialize_struct("SemanticJournalPayload", 2)?;
+                payload.serialize_field("kind", "user_message")?;
+                payload.serialize_field("text", text)?;
+                payload.end()
+            }
+            Self::AssistantText { text } => {
+                let mut payload = serializer.serialize_struct("SemanticJournalPayload", 2)?;
+                payload.serialize_field("kind", "assistant_text")?;
+                payload.serialize_field("text", text)?;
+                payload.end()
+            }
+            Self::ReasoningSummary { text } => {
+                let mut payload = serializer.serialize_struct("SemanticJournalPayload", 2)?;
+                payload.serialize_field("kind", "reasoning_summary")?;
+                payload.serialize_field("text", text)?;
+                payload.end()
+            }
+            Self::ToolCall { tool_name, call_id } => {
+                let mut payload = serializer.serialize_struct("SemanticJournalPayload", 3)?;
+                payload.serialize_field("kind", "tool_call")?;
+                payload.serialize_field("tool_name", tool_name)?;
+                payload.serialize_field("call_id", call_id)?;
+                payload.end()
+            }
+            Self::ToolResult { call_id, status } => {
+                let mut payload = serializer.serialize_struct("SemanticJournalPayload", 3)?;
+                payload.serialize_field("kind", "tool_result")?;
+                payload.serialize_field("call_id", call_id)?;
+                payload.serialize_field("status", status)?;
+                payload.end()
+            }
+            Self::ApprovalRequest {
+                request_id,
+                summary,
+            } => {
+                let mut payload = serializer.serialize_struct("SemanticJournalPayload", 3)?;
+                payload.serialize_field("kind", "approval_request")?;
+                payload.serialize_field("request_id", request_id)?;
+                payload.serialize_field("summary", summary)?;
+                payload.end()
+            }
+            Self::ApprovalResult {
+                request_id,
+                decision,
+            } => {
+                let mut payload = serializer.serialize_struct("SemanticJournalPayload", 3)?;
+                payload.serialize_field("kind", "approval_result")?;
+                payload.serialize_field("request_id", request_id)?;
+                payload.serialize_field("decision", decision)?;
+                payload.end()
+            }
+            Self::Question {
+                question_id,
+                prompt,
+                options,
+            } => {
+                let mut payload = serializer.serialize_struct("SemanticJournalPayload", 4)?;
+                payload.serialize_field("kind", "question")?;
+                payload.serialize_field("question_id", question_id)?;
+                payload.serialize_field("prompt", prompt)?;
+                payload.serialize_field("options", options)?;
+                payload.end()
+            }
+            Self::PlanStep {
+                step_id,
+                title,
+                status,
+            } => {
+                let mut payload = serializer.serialize_struct("SemanticJournalPayload", 4)?;
+                payload.serialize_field("kind", "plan_step")?;
+                payload.serialize_field("step_id", step_id)?;
+                payload.serialize_field("title", title)?;
+                payload.serialize_field("status", status)?;
+                payload.end()
+            }
+            Self::UsageObservation { remaining_percent } => {
+                let mut payload = serializer.serialize_struct("SemanticJournalPayload", 2)?;
+                payload.serialize_field("kind", "usage_observation")?;
+                payload.serialize_field("remaining_percent", remaining_percent)?;
+                payload.end()
+            }
+            Self::Error { code, message } => {
+                let mut payload = serializer.serialize_struct("SemanticJournalPayload", 3)?;
+                payload.serialize_field("kind", "error")?;
+                payload.serialize_field("code", code)?;
+                payload.serialize_field("message", message)?;
+                payload.end()
+            }
+            Self::TurnState { state } => {
+                let mut payload = serializer.serialize_struct("SemanticJournalPayload", 2)?;
+                payload.serialize_field("kind", "turn_state")?;
+                payload.serialize_field("state", state)?;
+                payload.end()
+            }
+            Self::SessionState { state } => {
+                let mut payload = serializer.serialize_struct("SemanticJournalPayload", 2)?;
+                payload.serialize_field("kind", "session_state")?;
+                payload.serialize_field("state", state)?;
+                payload.end()
+            }
+            Self::ArtifactReference { label } => {
+                let mut payload = serializer.serialize_struct("SemanticJournalPayload", 2)?;
+                payload.serialize_field("kind", "artifact_reference")?;
+                payload.serialize_field("label", label)?;
+                payload.end()
+            }
+            Self::Unknown {
+                provider,
+                source_type,
+                schema_version,
+                diagnostic_ref,
+            } => {
+                let mut payload = serializer.serialize_struct("SemanticJournalPayload", 5)?;
+                payload.serialize_field("kind", "unknown")?;
+                payload.serialize_field("provider", provider)?;
+                payload.serialize_field("source_type", source_type)?;
+                payload.serialize_field("schema_version", schema_version)?;
+                payload.serialize_field("diagnostic_ref", diagnostic_ref)?;
+                payload.end()
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RawPersistedBody<'a> {
+    text: Option<&'a str>,
+    extensions: RawPersistedExtensions<'a>,
+    unknown_source_type: Option<&'a str>,
+    unknown_schema_version: Option<u32>,
+    unknown_diagnostic_ref: Option<&'a str>,
+    provider_event_id: Option<&'a str>,
+    payload: RawPayloadShape<'a>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct RawPersistedExtensions<'a> {
+    hook_event_name: Option<&'a str>,
+    codex_item: Option<&'a str>,
+    cursor_surface: Option<&'a str>,
+}
+
+struct RawMessagePack<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+    values_seen: usize,
+}
+
+impl<'a> RawMessagePack<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self {
+            bytes,
+            offset: 0,
+            values_seen: 0,
+        }
+    }
+
+    fn persisted_payload_shape(mut self) -> Result<RawPayloadShape<'a>, JournalError> {
+        self.persisted_body().map(|body| body.payload)
+    }
+
+    fn persisted_body(mut self) -> Result<RawPersistedBody<'a>, JournalError> {
+        let fields = self.map_len()?;
+        let mut text = None;
+        let mut extensions = None;
+        let mut unknown_source_type = None;
+        let mut unknown_schema_version = None;
+        let mut unknown_diagnostic_ref = None;
+        let mut provider_event_id = None;
+        let mut payload = None;
+        for _ in 0..fields {
+            let key = self.string()?;
+            match key {
+                "text" => set_once(&mut text, self.optional_string()?)?,
+                "extensions" => set_once(&mut extensions, self.extensions()?)?,
+                "unknown_source_type" => {
+                    set_once(&mut unknown_source_type, self.optional_string()?)?
+                }
+                "unknown_schema_version" => {
+                    set_once(&mut unknown_schema_version, self.optional_u32()?)?
+                }
+                "unknown_diagnostic_ref" => {
+                    set_once(&mut unknown_diagnostic_ref, self.optional_string()?)?
+                }
+                "provider_event_id" => set_once(&mut provider_event_id, self.optional_string()?)?,
+                "payload" => set_once(&mut payload, self.payload_shape(1)?)?,
+                _ => return Err(JournalError::InvalidEnvelope),
+            }
+        }
+        if self.offset != self.bytes.len() {
+            return Err(JournalError::Store);
+        }
+        Ok(RawPersistedBody {
+            text: text.unwrap_or(None),
+            extensions: extensions.ok_or(JournalError::InvalidEnvelope)?,
+            unknown_source_type: unknown_source_type.unwrap_or(None),
+            unknown_schema_version: unknown_schema_version.unwrap_or(None),
+            unknown_diagnostic_ref: unknown_diagnostic_ref.unwrap_or(None),
+            provider_event_id: provider_event_id.unwrap_or(None),
+            payload: payload.ok_or(JournalError::InvalidEnvelope)?,
+        })
+    }
+
+    fn payload_shape(&mut self, depth: usize) -> Result<RawPayloadShape<'a>, JournalError> {
+        if depth > MAX_JOURNAL_NESTING {
+            return Err(JournalError::NestingTooDeep);
+        }
+        let fields = self.map_len()?;
+        let mut values = RawPayloadFields::default();
+        for _ in 0..fields {
+            let key = self.string()?;
+            values.read_field(self, key, depth + 1)?;
+        }
+        values.finish()
+    }
+
+    fn optional_string(&mut self) -> Result<Option<&'a str>, JournalError> {
+        if self.bytes.get(self.offset).copied() == Some(0xc0) {
+            self.value_marker()?;
+            Ok(None)
+        } else {
+            self.string().map(Some)
+        }
+    }
+
+    fn optional_u32(&mut self) -> Result<Option<u32>, JournalError> {
+        if self.bytes.get(self.offset).copied() == Some(0xc0) {
+            self.value_marker()?;
+            Ok(None)
+        } else {
+            u32::try_from(self.unsigned()?)
+                .map(Some)
+                .map_err(|_| JournalError::InvalidEnvelope)
+        }
+    }
+
+    fn extensions(&mut self) -> Result<RawPersistedExtensions<'a>, JournalError> {
+        let fields = self.map_len()?;
+        if fields > MAX_EXTENSION_ENTRIES {
+            return Err(JournalError::TooManyExtensions);
+        }
+        let mut extensions = RawPersistedExtensions::default();
+        for _ in 0..fields {
+            let key = self.string()?;
+            let value = self.string()?;
+            match key {
+                "hook_event_name" => set_once(&mut extensions.hook_event_name, value)?,
+                "codex_item" => set_once(&mut extensions.codex_item, value)?,
+                "cursor_surface" => set_once(&mut extensions.cursor_surface, value)?,
+                _ => return Err(JournalError::InvalidEnvelope),
+            }
+        }
+        Ok(extensions)
+    }
+
+    fn map_len(&mut self) -> Result<usize, JournalError> {
+        let marker = self.value_marker()?;
+        let length = match marker {
+            0x80..=0x8f => usize::from(marker - 0x80),
+            0xde => usize::from(self.u16()?),
+            0xdf => usize::try_from(self.u32()?).map_err(|_| JournalError::Store)?,
+            _ => return Err(JournalError::InvalidEnvelope),
+        };
+        if length > MAX_JOURNAL_MAP_ENTRIES {
+            return Err(JournalError::Oversized);
+        }
+        Ok(length)
+    }
+
+    fn array_len(&mut self) -> Result<usize, JournalError> {
+        let marker = self.value_marker()?;
+        let length = match marker {
+            0x90..=0x9f => usize::from(marker - 0x90),
+            0xdc => usize::from(self.u16()?),
+            0xdd => usize::try_from(self.u32()?).map_err(|_| JournalError::Store)?,
+            _ => return Err(JournalError::InvalidEnvelope),
+        };
+        if length > MAX_JOURNAL_ARRAY_ITEMS {
+            return Err(JournalError::Oversized);
+        }
+        Ok(length)
+    }
+
+    fn string(&mut self) -> Result<&'a str, JournalError> {
+        let marker = self.value_marker()?;
+        let length = match marker {
+            0xa0..=0xbf => usize::from(marker - 0xa0),
+            0xd9 => usize::from(self.byte()?),
+            0xda => usize::from(self.u16()?),
+            0xdb => usize::try_from(self.u32()?).map_err(|_| JournalError::Store)?,
+            _ => return Err(JournalError::InvalidEnvelope),
+        };
+        if length > MAX_JOURNAL_TEXT_BYTES {
+            return Err(JournalError::TooLong);
+        }
+        let bytes = self.take(length)?;
+        std::str::from_utf8(bytes).map_err(|_| JournalError::InvalidEnvelope)
+    }
+
+    fn optional_u8(&mut self) -> Result<Option<u8>, JournalError> {
+        if self.bytes.get(self.offset).copied() == Some(0xc0) {
+            self.value_marker()?;
+            return Ok(None);
+        }
+        let value = self.unsigned()?;
+        u8::try_from(value)
+            .map(Some)
+            .map_err(|_| JournalError::InvalidEnvelope)
+    }
+
+    fn unsigned(&mut self) -> Result<u64, JournalError> {
+        let marker = self.value_marker()?;
+        match marker {
+            0x00..=0x7f => Ok(u64::from(marker)),
+            0xcc => Ok(u64::from(self.byte()?)),
+            0xcd => Ok(u64::from(self.u16()?)),
+            0xce => Ok(u64::from(self.u32()?)),
+            0xcf => Ok(self.u64()?),
+            _ => Err(JournalError::InvalidEnvelope),
+        }
+    }
+
+    fn skip_value(&mut self, depth: usize) -> Result<(), JournalError> {
+        if depth > usize::from(MAX_MESSAGEPACK_DEPTH) {
+            return Err(JournalError::NestingTooDeep);
+        }
+        let marker = self.value_marker()?;
+        match marker {
+            0x00..=0x7f | 0xe0..=0xff | 0xc0 | 0xc2 | 0xc3 => Ok(()),
+            0x80..=0x8f => {
+                let length = usize::from(marker - 0x80);
+                self.skip_children(length, depth + 1)
+            }
+            0x90..=0x9f => {
+                let length = usize::from(marker - 0x90);
+                self.skip_children(length, depth + 1)
+            }
+            0xa0..=0xbf => self.skip(usize::from(marker - 0xa0)),
+            0xc4 => {
+                let length = usize::from(self.byte()?);
+                self.skip(length)
+            }
+            0xc5 => {
+                let length = usize::from(self.u16()?);
+                self.skip(length)
+            }
+            0xc6 => {
+                let length = usize::try_from(self.u32()?).map_err(|_| JournalError::Store)?;
+                self.skip(length)
+            }
+            0xca | 0xce | 0xd2 => self.skip(4),
+            0xcb | 0xcf | 0xd3 => self.skip(8),
+            0xcc | 0xd0 => self.skip(1),
+            0xcd | 0xd1 => self.skip(2),
+            0xd4 => self.skip(3),
+            0xd5 => self.skip(4),
+            0xd6 => self.skip(6),
+            0xd7 => self.skip(10),
+            0xd8 => self.skip(18),
+            0xd9 => {
+                let length = usize::from(self.byte()?);
+                self.skip(length)
+            }
+            0xda => {
+                let length = usize::from(self.u16()?);
+                self.skip(length)
+            }
+            0xdb => {
+                let length = usize::try_from(self.u32()?).map_err(|_| JournalError::Store)?;
+                self.skip(length)
+            }
+            0xdc => {
+                let length = usize::from(self.u16()?);
+                if length > MAX_JOURNAL_ARRAY_ITEMS {
+                    return Err(JournalError::Oversized);
+                }
+                self.skip_children(length, depth + 1)
+            }
+            0xdd => {
+                let length = usize::try_from(self.u32()?).map_err(|_| JournalError::Store)?;
+                if length > MAX_JOURNAL_ARRAY_ITEMS {
+                    return Err(JournalError::Oversized);
+                }
+                self.skip_children(length, depth + 1)
+            }
+            0xde => {
+                let length = usize::from(self.u16()?);
+                if length > MAX_JOURNAL_MAP_ENTRIES {
+                    return Err(JournalError::Oversized);
+                }
+                self.skip_children(length.saturating_mul(2), depth + 1)
+            }
+            0xdf => {
+                let length = usize::try_from(self.u32()?).map_err(|_| JournalError::Store)?;
+                if length > MAX_JOURNAL_MAP_ENTRIES {
+                    return Err(JournalError::Oversized);
+                }
+                self.skip_children(length.saturating_mul(2), depth + 1)
+            }
+            0xc1 | 0xc7..=0xc9 => Err(JournalError::InvalidEnvelope),
+            _ => Err(JournalError::InvalidEnvelope),
+        }
+    }
+
+    fn skip_children(&mut self, count: usize, depth: usize) -> Result<(), JournalError> {
+        for _ in 0..count {
+            self.skip_value(depth)?;
+        }
+        Ok(())
+    }
+
+    fn value_marker(&mut self) -> Result<u8, JournalError> {
+        self.values_seen = self
+            .values_seen
+            .checked_add(1)
+            .ok_or(JournalError::Oversized)?;
+        if self.values_seen > MAX_JOURNAL_MESSAGEPACK_VALUES {
+            return Err(JournalError::Oversized);
+        }
+        self.byte()
+    }
+
+    fn byte(&mut self) -> Result<u8, JournalError> {
+        let value = self
+            .bytes
+            .get(self.offset)
+            .copied()
+            .ok_or(JournalError::Store)?;
+        self.offset = self.offset.saturating_add(1);
+        Ok(value)
+    }
+
+    fn u16(&mut self) -> Result<u16, JournalError> {
+        let bytes = self.take(2)?;
+        Ok(u16::from_be_bytes([bytes[0], bytes[1]]))
+    }
+
+    fn u32(&mut self) -> Result<u32, JournalError> {
+        let bytes = self.take(4)?;
+        Ok(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
+    fn u64(&mut self) -> Result<u64, JournalError> {
+        let bytes = self.take(8)?;
+        Ok(u64::from_be_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]))
+    }
+
+    fn skip(&mut self, length: usize) -> Result<(), JournalError> {
+        self.take(length).map(|_| ())
+    }
+
+    fn take(&mut self, length: usize) -> Result<&'a [u8], JournalError> {
+        let end = self.offset.checked_add(length).ok_or(JournalError::Store)?;
+        if end > self.bytes.len() {
+            return Err(JournalError::Store);
+        }
+        let bytes = &self.bytes[self.offset..end];
+        self.offset = end;
+        Ok(bytes)
+    }
+}
+
+#[derive(Default)]
+struct RawPayloadFields<'a> {
+    kind: Option<&'a str>,
+    text: Option<&'a str>,
+    tool_name: Option<&'a str>,
+    call_id: Option<&'a str>,
+    status: Option<&'a str>,
+    request_id: Option<&'a str>,
+    summary: Option<&'a str>,
+    decision: Option<&'a str>,
+    question_id: Option<&'a str>,
+    prompt: Option<&'a str>,
+    options: Option<RawPayloadOptions<'a>>,
+    step_id: Option<&'a str>,
+    title: Option<&'a str>,
+    remaining_percent: Option<u8>,
+    remaining_percent_seen: bool,
+    code: Option<&'a str>,
+    message: Option<&'a str>,
+    state: Option<&'a str>,
+    label: Option<&'a str>,
+    provider: Option<&'a str>,
+    source_type: Option<&'a str>,
+    schema_version: Option<u32>,
+    diagnostic_ref: Option<&'a str>,
+}
+
+const RAW_FIELD_KIND: u32 = 1 << 0;
+const RAW_FIELD_TEXT: u32 = 1 << 1;
+const RAW_FIELD_TOOL_NAME: u32 = 1 << 2;
+const RAW_FIELD_CALL_ID: u32 = 1 << 3;
+const RAW_FIELD_STATUS: u32 = 1 << 4;
+const RAW_FIELD_REQUEST_ID: u32 = 1 << 5;
+const RAW_FIELD_SUMMARY: u32 = 1 << 6;
+const RAW_FIELD_DECISION: u32 = 1 << 7;
+const RAW_FIELD_QUESTION_ID: u32 = 1 << 8;
+const RAW_FIELD_PROMPT: u32 = 1 << 9;
+const RAW_FIELD_OPTIONS: u32 = 1 << 10;
+const RAW_FIELD_STEP_ID: u32 = 1 << 11;
+const RAW_FIELD_TITLE: u32 = 1 << 12;
+const RAW_FIELD_REMAINING_PERCENT: u32 = 1 << 13;
+const RAW_FIELD_CODE: u32 = 1 << 14;
+const RAW_FIELD_MESSAGE: u32 = 1 << 15;
+const RAW_FIELD_STATE: u32 = 1 << 16;
+const RAW_FIELD_LABEL: u32 = 1 << 17;
+const RAW_FIELD_PROVIDER: u32 = 1 << 18;
+const RAW_FIELD_SOURCE_TYPE: u32 = 1 << 19;
+const RAW_FIELD_SCHEMA_VERSION: u32 = 1 << 20;
+const RAW_FIELD_DIAGNOSTIC_REF: u32 = 1 << 21;
+
+impl<'a> RawPayloadFields<'a> {
+    fn read_field(
+        &mut self,
+        reader: &mut RawMessagePack<'a>,
+        key: &str,
+        depth: usize,
+    ) -> Result<(), JournalError> {
+        if depth > MAX_JOURNAL_NESTING {
+            return Err(JournalError::NestingTooDeep);
+        }
+        match key {
+            "kind" => set_once(&mut self.kind, reader.string()?),
+            "text" => set_once(&mut self.text, reader.string()?),
+            "tool_name" => set_once(&mut self.tool_name, reader.string()?),
+            "call_id" => set_once(&mut self.call_id, reader.string()?),
+            "status" => set_once(&mut self.status, reader.string()?),
+            "request_id" => set_once(&mut self.request_id, reader.string()?),
+            "summary" => set_once(&mut self.summary, reader.string()?),
+            "decision" => set_once(&mut self.decision, reader.string()?),
+            "question_id" => set_once(&mut self.question_id, reader.string()?),
+            "prompt" => set_once(&mut self.prompt, reader.string()?),
+            "options" => set_once(&mut self.options, read_options(reader)?),
+            "step_id" => set_once(&mut self.step_id, reader.string()?),
+            "title" => set_once(&mut self.title, reader.string()?),
+            "remaining_percent" => {
+                if self.remaining_percent_seen {
+                    return Err(JournalError::DuplicateKey);
+                }
+                self.remaining_percent_seen = true;
+                self.remaining_percent = reader.optional_u8()?;
+                Ok(())
+            }
+            "code" => set_once(&mut self.code, reader.string()?),
+            "message" => set_once(&mut self.message, reader.string()?),
+            "state" => set_once(&mut self.state, reader.string()?),
+            "label" => set_once(&mut self.label, reader.string()?),
+            "provider" => set_once(&mut self.provider, reader.string()?),
+            "source_type" => set_once(&mut self.source_type, reader.string()?),
+            "schema_version" => set_once(
+                &mut self.schema_version,
+                u32::try_from(reader.unsigned()?).map_err(|_| JournalError::InvalidEnvelope)?,
+            ),
+            "diagnostic_ref" => set_once(&mut self.diagnostic_ref, reader.string()?),
+            _ => Err(JournalError::InvalidEnvelope),
+        }
+    }
+
+    fn present_mask(&self) -> u32 {
+        let mut fields = 0;
+        if self.kind.is_some() {
+            fields |= RAW_FIELD_KIND;
+        }
+        if self.text.is_some() {
+            fields |= RAW_FIELD_TEXT;
+        }
+        if self.tool_name.is_some() {
+            fields |= RAW_FIELD_TOOL_NAME;
+        }
+        if self.call_id.is_some() {
+            fields |= RAW_FIELD_CALL_ID;
+        }
+        if self.status.is_some() {
+            fields |= RAW_FIELD_STATUS;
+        }
+        if self.request_id.is_some() {
+            fields |= RAW_FIELD_REQUEST_ID;
+        }
+        if self.summary.is_some() {
+            fields |= RAW_FIELD_SUMMARY;
+        }
+        if self.decision.is_some() {
+            fields |= RAW_FIELD_DECISION;
+        }
+        if self.question_id.is_some() {
+            fields |= RAW_FIELD_QUESTION_ID;
+        }
+        if self.prompt.is_some() {
+            fields |= RAW_FIELD_PROMPT;
+        }
+        if self.options.is_some() {
+            fields |= RAW_FIELD_OPTIONS;
+        }
+        if self.step_id.is_some() {
+            fields |= RAW_FIELD_STEP_ID;
+        }
+        if self.title.is_some() {
+            fields |= RAW_FIELD_TITLE;
+        }
+        if self.remaining_percent_seen {
+            fields |= RAW_FIELD_REMAINING_PERCENT;
+        }
+        if self.code.is_some() {
+            fields |= RAW_FIELD_CODE;
+        }
+        if self.message.is_some() {
+            fields |= RAW_FIELD_MESSAGE;
+        }
+        if self.state.is_some() {
+            fields |= RAW_FIELD_STATE;
+        }
+        if self.label.is_some() {
+            fields |= RAW_FIELD_LABEL;
+        }
+        if self.provider.is_some() {
+            fields |= RAW_FIELD_PROVIDER;
+        }
+        if self.source_type.is_some() {
+            fields |= RAW_FIELD_SOURCE_TYPE;
+        }
+        if self.schema_version.is_some() {
+            fields |= RAW_FIELD_SCHEMA_VERSION;
+        }
+        if self.diagnostic_ref.is_some() {
+            fields |= RAW_FIELD_DIAGNOSTIC_REF;
+        }
+        fields
+    }
+
+    fn finish(self) -> Result<RawPayloadShape<'a>, JournalError> {
+        let kind = self.kind.ok_or(JournalError::InvalidEnvelope)?;
+        let present = self.present_mask();
+        let allowed = match kind {
+            "user_message" | "assistant_text" | "reasoning_summary" => {
+                RAW_FIELD_KIND | RAW_FIELD_TEXT
+            }
+            "tool_call" => RAW_FIELD_KIND | RAW_FIELD_TOOL_NAME | RAW_FIELD_CALL_ID,
+            "tool_result" => RAW_FIELD_KIND | RAW_FIELD_CALL_ID | RAW_FIELD_STATUS,
+            "approval_request" => RAW_FIELD_KIND | RAW_FIELD_REQUEST_ID | RAW_FIELD_SUMMARY,
+            "approval_result" => RAW_FIELD_KIND | RAW_FIELD_REQUEST_ID | RAW_FIELD_DECISION,
+            "question" => {
+                RAW_FIELD_KIND | RAW_FIELD_QUESTION_ID | RAW_FIELD_PROMPT | RAW_FIELD_OPTIONS
+            }
+            "plan_step" => RAW_FIELD_KIND | RAW_FIELD_STEP_ID | RAW_FIELD_TITLE | RAW_FIELD_STATUS,
+            "usage_observation" => RAW_FIELD_KIND | RAW_FIELD_REMAINING_PERCENT,
+            "error" => RAW_FIELD_KIND | RAW_FIELD_CODE | RAW_FIELD_MESSAGE,
+            "turn_state" | "session_state" => RAW_FIELD_KIND | RAW_FIELD_STATE,
+            "artifact_reference" => RAW_FIELD_KIND | RAW_FIELD_LABEL,
+            "unknown" => {
+                RAW_FIELD_KIND
+                    | RAW_FIELD_PROVIDER
+                    | RAW_FIELD_SOURCE_TYPE
+                    | RAW_FIELD_SCHEMA_VERSION
+                    | RAW_FIELD_DIAGNOSTIC_REF
+            }
+            _ => return Err(JournalError::InvalidEnvelope),
+        };
+        if present != allowed {
+            return Err(JournalError::InvalidEnvelope);
+        }
+        match kind {
+            "user_message" => Ok(RawPayloadShape::UserMessage {
+                text: required(self.text)?,
+            }),
+            "assistant_text" => Ok(RawPayloadShape::AssistantText {
+                text: required(self.text)?,
+            }),
+            "reasoning_summary" => Ok(RawPayloadShape::ReasoningSummary {
+                text: required(self.text)?,
+            }),
+            "tool_call" => Ok(RawPayloadShape::ToolCall {
+                tool_name: required(self.tool_name)?,
+                call_id: required(self.call_id)?,
+            }),
+            "tool_result" => Ok(RawPayloadShape::ToolResult {
+                call_id: required(self.call_id)?,
+                status: required(self.status)?,
+            }),
+            "approval_request" => Ok(RawPayloadShape::ApprovalRequest {
+                request_id: required(self.request_id)?,
+                summary: required(self.summary)?,
+            }),
+            "approval_result" => Ok(RawPayloadShape::ApprovalResult {
+                request_id: required(self.request_id)?,
+                decision: required(self.decision)?,
+            }),
+            "question" => Ok(RawPayloadShape::Question {
+                question_id: required(self.question_id)?,
+                prompt: required(self.prompt)?,
+                options: self.options.ok_or(JournalError::InvalidEnvelope)?,
+            }),
+            "plan_step" => Ok(RawPayloadShape::PlanStep {
+                step_id: required(self.step_id)?,
+                title: required(self.title)?,
+                status: required(self.status)?,
+            }),
+            "usage_observation" => Ok(RawPayloadShape::UsageObservation {
+                remaining_percent: if self.remaining_percent_seen {
+                    self.remaining_percent
+                } else {
+                    return Err(JournalError::InvalidEnvelope);
+                },
+            }),
+            "error" => Ok(RawPayloadShape::Error {
+                code: required(self.code)?,
+                message: required(self.message)?,
+            }),
+            "turn_state" => Ok(RawPayloadShape::TurnState {
+                state: required(self.state)?,
+            }),
+            "session_state" => Ok(RawPayloadShape::SessionState {
+                state: required(self.state)?,
+            }),
+            "artifact_reference" => Ok(RawPayloadShape::ArtifactReference {
+                label: required(self.label)?,
+            }),
+            "unknown" => Ok(RawPayloadShape::Unknown {
+                provider: required(self.provider)?,
+                source_type: required(self.source_type)?,
+                schema_version: self.schema_version.ok_or(JournalError::InvalidEnvelope)?,
+                diagnostic_ref: required(self.diagnostic_ref)?,
+            }),
+            _ => unreachable!("payload kind was checked above"),
+        }
+    }
+}
+
+fn set_once<T>(slot: &mut Option<T>, value: T) -> Result<(), JournalError> {
+    if slot.is_some() {
+        return Err(JournalError::DuplicateKey);
+    }
+    *slot = Some(value);
+    Ok(())
+}
+
+fn required<T>(value: Option<T>) -> Result<T, JournalError> {
+    value.ok_or(JournalError::InvalidEnvelope)
+}
+
+fn read_options<'a>(
+    reader: &mut RawMessagePack<'a>,
+) -> Result<RawPayloadOptions<'a>, JournalError> {
+    let len = reader.array_len()?;
+    let mut values = [""; MAX_JOURNAL_ARRAY_ITEMS];
+    for value in &mut values[..len] {
+        *value = reader.string()?;
+    }
+    Ok(RawPayloadOptions { values, len })
+}
+
 #[derive(Debug, Deserialize)]
 struct PersistedJournalPayloadProbe<'a> {
     #[serde(borrow)]
     payload: SemanticJournalPayloadRef<'a>,
 }
 
-#[derive(Debug, Serialize)]
-struct JournalFactProjection<'a> {
+#[derive(Debug)]
+struct JournalFactProjection<'a, P> {
     id: EventId,
     sequence: u64,
     provider: &'a str,
@@ -2379,15 +3325,34 @@ struct JournalFactProjection<'a> {
     visibility: &'a str,
     privacy_class: PrivacyClass,
     redacted: bool,
-    payload: SemanticJournalPayloadRef<'a>,
+    payload: P,
 }
 
-struct JournalFactSequence<'a, 'b> {
+impl<P: Serialize> Serialize for JournalFactProjection<'_, P> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut fact = serializer.serialize_struct("SemanticJournalFact", 9)?;
+        fact.serialize_field("id", &self.id)?;
+        fact.serialize_field("sequence", &self.sequence)?;
+        fact.serialize_field("provider", &self.provider)?;
+        fact.serialize_field("schema_version", &self.schema_version)?;
+        fact.serialize_field("kind", &self.kind)?;
+        fact.serialize_field("visibility", &self.visibility)?;
+        fact.serialize_field("privacy_class", &self.privacy_class)?;
+        fact.serialize_field("redacted", &self.redacted)?;
+        fact.serialize_field("payload", &self.payload)?;
+        fact.end()
+    }
+}
+
+struct JournalFactSequence<'a, 'b, P> {
     existing: &'a [SemanticJournalFact],
-    candidate: &'a JournalFactProjection<'b>,
+    candidate: &'a JournalFactProjection<'b, P>,
 }
 
-impl Serialize for JournalFactSequence<'_, '_> {
+impl<P: Serialize> Serialize for JournalFactSequence<'_, '_, P> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -2401,16 +3366,16 @@ impl Serialize for JournalFactSequence<'_, '_> {
     }
 }
 
-struct JournalPageProjection<'a, 'b> {
+struct JournalPageProjection<'a, 'b, P> {
     after_sequence: u64,
     through_sequence: u64,
     high_water: u64,
     encoded_bytes: u32,
     next_sequence: Option<u64>,
-    facts: JournalFactSequence<'a, 'b>,
+    facts: JournalFactSequence<'a, 'b, P>,
 }
 
-impl Serialize for JournalPageProjection<'_, '_> {
+impl<P: Serialize> Serialize for JournalPageProjection<'_, '_, P> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -2429,7 +3394,9 @@ impl Serialize for JournalPageProjection<'_, '_> {
 fn page_fact_projection<'a>(
     row: &'a SemanticJournalFactRow,
     provider: ProviderKind,
-) -> Result<JournalFactProjection<'a>, JournalError> {
+) -> Result<JournalFactProjection<'a, SemanticJournalPayloadRef<'a>>, JournalError> {
+    #[cfg(test)]
+    debug_record_page_payload_probe();
     let codec = MessagePackCodec::from_limits(FrameLimits::v1_default())
         .map_err(|_| JournalError::Store)?;
     if row.payload.is_empty() || row.payload.len() > codec.max_document_bytes() as usize {
@@ -2463,14 +3430,45 @@ fn page_fact_projection<'a>(
     })
 }
 
-fn page_encoded_len_with_candidate(
+fn page_fact_projection_preflight<'a>(
+    row: &SemanticJournalFactRef<'a>,
+    provider: ProviderKind,
+) -> Result<JournalFactProjection<'a, RawPayloadShape<'a>>, JournalError> {
+    let codec = MessagePackCodec::from_limits(FrameLimits::v1_default())
+        .map_err(|_| JournalError::Store)?;
+    if row.payload.is_empty() || row.payload.len() > codec.max_document_bytes() as usize {
+        return Err(JournalError::Store);
+    }
+    let payload = RawMessagePack::new(row.payload).persisted_payload_shape()?;
+    let schema_version = u32::try_from(row.schema_version).map_err(|_| JournalError::Store)?;
+    let sequence = u64::try_from(row.sequence).map_err(|_| JournalError::Store)?;
+    let privacy_class = match row.privacy_class {
+        "local_only" => PrivacyClass::LocalOnly,
+        "shareable" => PrivacyClass::Shareable,
+        _ => return Err(JournalError::Store),
+    };
+    let event_id = <[u8; 16]>::try_from(row.event_id).map_err(|_| JournalError::Store)?;
+    Ok(JournalFactProjection {
+        id: EventId::from_bytes(event_id).map_err(|_| JournalError::Store)?,
+        sequence,
+        provider: provider_kind_sql(provider),
+        schema_version,
+        kind: row.kind,
+        visibility: row.visibility,
+        privacy_class,
+        redacted: row.redaction_class != JournalRedactionClass::Persistable.as_str(),
+        payload,
+    })
+}
+
+fn page_encoded_len_with_candidate<P: Serialize>(
     codec: &MessagePackCodec,
     after_sequence: u64,
     through_sequence: u64,
     high_water: u64,
     next_sequence: Option<u64>,
     existing: &[SemanticJournalFact],
-    candidate: &JournalFactProjection<'_>,
+    candidate: &JournalFactProjection<'_, P>,
     maximum: u32,
 ) -> Result<u32, PageMeasureError> {
     let mut encoded_bytes = 0_u32;
@@ -2678,6 +3676,15 @@ fn restore_event_internal(
             }
         }
     }
+    // Identity constructors are part of row integrity, even when this pass
+    // intentionally avoids allocating a page event. Otherwise a persisted
+    // bidi/control identity would pass the non-materializing validator and be
+    // observed only on a later event restore.
+    let provider_event_id = body
+        .provider_event_id
+        .map(ProviderEventId::new)
+        .transpose()?;
+    let delivery_id = RelayDeliveryId::new(row.delivery_id.clone())?;
     if !materialize {
         return Ok(None);
     }
@@ -2685,11 +3692,8 @@ fn restore_event_internal(
         id: EventId::from_bytes(row.event_id).map_err(|_| JournalError::Store)?,
         schema_version,
         provider: authority.provider,
-        provider_event_id: body
-            .provider_event_id
-            .map(ProviderEventId::new)
-            .transpose()?,
-        delivery_id: RelayDeliveryId::new(row.delivery_id.clone())?,
+        provider_event_id,
+        delivery_id,
         task_id: authority.task_id,
         agent_session_id: authority.agent_session_id,
         resource_id: authority.resource_id,
@@ -2727,6 +3731,280 @@ fn validate_restored_row(
     restore_event_internal(&authority, row, false)
         .map(|_| ())
         .map_err(|_| StoreError::Corruption)
+}
+
+fn validate_metadata_row(
+    authority: JournalSessionAuthority,
+    row: &SemanticJournalFactRef<'_>,
+) -> Result<(), StoreError> {
+    if row.redaction_class == JournalRedactionClass::NeverPersist.as_str() {
+        return Err(StoreError::Corruption);
+    }
+    reject_display_bound(row.delivery_id, MAX_DELIVERY_ID_BYTES)
+        .map_err(|_| StoreError::Corruption)?;
+    if let Some(provider_event_id) = row.provider_event_id {
+        reject_display_bound(provider_event_id, MAX_PROVIDER_EVENT_ID_BYTES)
+            .map_err(|_| StoreError::Corruption)?;
+    }
+    validate_borrowed_persisted_body(authority, row).map_err(|_| StoreError::Corruption)?;
+    Ok(())
+}
+
+/// Validate every persisted body while it is still borrowed from SQLite. This
+/// is the page transaction's global integrity pass: it covers rows that are
+/// runtime-only, beyond max_items, or rejected by the page byte cap without
+/// allocating an owned row, payload, event, or fact. The admission preflight
+/// may then reuse the same bounded parser for the candidate projection.
+fn validate_borrowed_persisted_body(
+    authority: JournalSessionAuthority,
+    row: &SemanticJournalFactRef<'_>,
+) -> Result<(), JournalError> {
+    if row.payload.is_empty() || row.payload.len() > MAX_JOURNAL_DOCUMENT_BYTES {
+        return Err(JournalError::Oversized);
+    }
+    let body = RawMessagePack::new(row.payload).persisted_body()?;
+    let schema_version =
+        u32::try_from(row.schema_version).map_err(|_| JournalError::UnsupportedSchemaVersion)?;
+    let sequence = u64::try_from(row.sequence).map_err(|_| JournalError::InvalidEnvelope)?;
+    if sequence == 0 || row.occurred_at_ms < 0 || row.ingested_at_ms < 0 {
+        return Err(JournalError::InvalidEnvelope);
+    }
+    let kind = parse_kind(row.kind)?;
+    if schema_version != JOURNAL_SCHEMA_VERSION && kind != JournalSemanticKind::UnknownProviderEvent
+    {
+        return Err(JournalError::UnsupportedSchemaVersion);
+    }
+    let visibility = parse_visibility(row.visibility)?;
+    let redaction_class = parse_redaction(row.redaction_class)?;
+    if redaction_class == JournalRedactionClass::NeverPersist {
+        return Err(JournalError::InvalidEnvelope);
+    }
+    match row.privacy_class {
+        "local_only" | "shareable" => {}
+        _ => return Err(JournalError::InvalidEnvelope),
+    }
+    if body.provider_event_id != row.provider_event_id {
+        return Err(JournalError::InvalidEnvelope);
+    }
+    if let Some(text) = body.text {
+        reject_display_bound(text, MAX_JOURNAL_TEXT_BYTES)?;
+    }
+    validate_raw_extensions(&body.extensions)?;
+    validate_raw_semantic_payload(&kind, &body.payload)?;
+    if let Some(source_type) = body.unknown_source_type {
+        reject_display_bound(source_type, MAX_SOURCE_TYPE_BYTES)?;
+    }
+    if let Some(diagnostic_ref) = body.unknown_diagnostic_ref {
+        validate_diagnostic_ref(diagnostic_ref)?;
+    }
+    match kind {
+        JournalSemanticKind::UnknownProviderEvent => {
+            let Some(unknown_schema_version) = body.unknown_schema_version else {
+                return Err(JournalError::InvalidEnvelope);
+            };
+            let RawPayloadShape::Unknown {
+                provider,
+                source_type,
+                schema_version: payload_schema_version,
+                diagnostic_ref,
+            } = body.payload
+            else {
+                return Err(JournalError::InvalidEnvelope);
+            };
+            if provider != provider_kind_sql(authority.provider)
+                || payload_schema_version != unknown_schema_version
+                || payload_schema_version != schema_version
+                || body.unknown_source_type != Some(source_type)
+                || body.unknown_diagnostic_ref != Some(diagnostic_ref)
+                || visibility != JournalVisibility::Diagnostic
+            {
+                return Err(JournalError::InvalidEnvelope);
+            }
+        }
+        _ => {
+            if body.unknown_source_type.is_some()
+                || body.unknown_schema_version.is_some()
+                || body.unknown_diagnostic_ref.is_some()
+            {
+                return Err(JournalError::InvalidEnvelope);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_raw_extensions(extensions: &RawPersistedExtensions<'_>) -> Result<(), JournalError> {
+    for value in [
+        extensions.hook_event_name,
+        extensions.codex_item,
+        extensions.cursor_surface,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        reject_display_bound(value, MAX_EXTENSION_VALUE_BYTES)?;
+    }
+    Ok(())
+}
+
+fn validate_raw_semantic_payload(
+    kind: &JournalSemanticKind,
+    payload: &RawPayloadShape<'_>,
+) -> Result<(), JournalError> {
+    let matches_kind = matches!(
+        (kind, payload),
+        (
+            JournalSemanticKind::UserMessage,
+            RawPayloadShape::UserMessage { .. }
+        ) | (
+            JournalSemanticKind::AssistantText,
+            RawPayloadShape::AssistantText { .. }
+        ) | (
+            JournalSemanticKind::ReasoningSummary,
+            RawPayloadShape::ReasoningSummary { .. }
+        ) | (
+            JournalSemanticKind::ToolCall,
+            RawPayloadShape::ToolCall { .. }
+        ) | (
+            JournalSemanticKind::ToolResult,
+            RawPayloadShape::ToolResult { .. }
+        ) | (
+            JournalSemanticKind::ApprovalRequest,
+            RawPayloadShape::ApprovalRequest { .. }
+        ) | (
+            JournalSemanticKind::ApprovalResult,
+            RawPayloadShape::ApprovalResult { .. }
+        ) | (
+            JournalSemanticKind::Question,
+            RawPayloadShape::Question { .. }
+        ) | (
+            JournalSemanticKind::PlanStep,
+            RawPayloadShape::PlanStep { .. }
+        ) | (
+            JournalSemanticKind::UsageObservation,
+            RawPayloadShape::UsageObservation { .. }
+        ) | (JournalSemanticKind::Error, RawPayloadShape::Error { .. })
+            | (
+                JournalSemanticKind::TurnState,
+                RawPayloadShape::TurnState { .. }
+            )
+            | (
+                JournalSemanticKind::SessionState,
+                RawPayloadShape::SessionState { .. }
+            )
+            | (
+                JournalSemanticKind::ArtifactReference,
+                RawPayloadShape::ArtifactReference { .. }
+            )
+            | (
+                JournalSemanticKind::UnknownProviderEvent,
+                RawPayloadShape::Unknown { .. }
+            )
+    );
+    if !matches_kind {
+        return Err(JournalError::InvalidEnvelope);
+    }
+    match payload {
+        RawPayloadShape::UserMessage { text }
+        | RawPayloadShape::AssistantText { text }
+        | RawPayloadShape::ReasoningSummary { text } => {
+            reject_display_bound(text, MAX_JOURNAL_TEXT_BYTES)?;
+        }
+        RawPayloadShape::ToolCall { tool_name, call_id } => {
+            reject_display_bound(tool_name, MAX_TOOL_NAME_BYTES)?;
+            reject_display_bound(call_id, MAX_CALL_ID_BYTES)?;
+        }
+        RawPayloadShape::ToolResult { call_id, status } => {
+            reject_display_bound(call_id, MAX_CALL_ID_BYTES)?;
+            reject_display_bound(status, MAX_SOURCE_TYPE_BYTES)?;
+        }
+        RawPayloadShape::ApprovalRequest {
+            request_id,
+            summary,
+        } => {
+            reject_display_bound(request_id, MAX_REQUEST_ID_BYTES)?;
+            reject_display_bound(summary, MAX_JOURNAL_TEXT_BYTES)?;
+        }
+        RawPayloadShape::ApprovalResult {
+            request_id,
+            decision,
+        } => {
+            reject_display_bound(request_id, MAX_REQUEST_ID_BYTES)?;
+            reject_display_bound(decision, MAX_SOURCE_TYPE_BYTES)?;
+        }
+        RawPayloadShape::Question {
+            question_id,
+            prompt,
+            options,
+        } => {
+            reject_display_bound(question_id, MAX_REQUEST_ID_BYTES)?;
+            reject_display_bound(prompt, MAX_JOURNAL_TEXT_BYTES)?;
+            if options.len > MAX_QUESTION_OPTIONS {
+                return Err(JournalError::TooLong);
+            }
+            for option in &options.values[..options.len] {
+                reject_display_bound(option, MAX_EXTENSION_VALUE_BYTES)?;
+            }
+        }
+        RawPayloadShape::PlanStep {
+            step_id,
+            title,
+            status,
+        } => {
+            reject_display_bound(step_id, MAX_REQUEST_ID_BYTES)?;
+            reject_display_bound(title, MAX_JOURNAL_TEXT_BYTES)?;
+            reject_display_bound(status, MAX_SOURCE_TYPE_BYTES)?;
+        }
+        RawPayloadShape::UsageObservation { remaining_percent } => {
+            if remaining_percent.is_some_and(|percent| percent > 100) {
+                return Err(JournalError::InvalidEnvelope);
+            }
+        }
+        RawPayloadShape::Error { code, message } => {
+            reject_display_bound(code, MAX_SOURCE_TYPE_BYTES)?;
+            reject_display_bound(message, MAX_JOURNAL_TEXT_BYTES)?;
+        }
+        RawPayloadShape::TurnState { state } => {
+            reject_display_bound(state, MAX_SOURCE_TYPE_BYTES)?;
+            if !matches!(*state, "started" | "completed" | "failed") {
+                return Err(JournalError::InvalidEnvelope);
+            }
+        }
+        RawPayloadShape::SessionState { state } => {
+            reject_display_bound(state, MAX_SOURCE_TYPE_BYTES)?;
+            if !matches!(*state, "open" | "closed") {
+                return Err(JournalError::InvalidEnvelope);
+            }
+        }
+        RawPayloadShape::ArtifactReference { label } => {
+            reject_display_bound(label, MAX_JOURNAL_TEXT_BYTES)?;
+        }
+        RawPayloadShape::Unknown {
+            provider,
+            source_type,
+            schema_version,
+            diagnostic_ref,
+        } => {
+            reject_display_bound(provider, MAX_SOURCE_TYPE_BYTES)?;
+            reject_display_bound(source_type, MAX_SOURCE_TYPE_BYTES)?;
+            if *schema_version == 0 {
+                return Err(JournalError::InvalidEnvelope);
+            }
+            validate_diagnostic_ref(diagnostic_ref)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_diagnostic_ref(value: &str) -> Result<(), JournalError> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(JournalError::InvalidEnvelope);
+    }
+    Ok(())
 }
 
 fn parse_kind(value: &str) -> Result<JournalSemanticKind, JournalError> {

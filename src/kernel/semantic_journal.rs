@@ -4,8 +4,12 @@
 
 use std::collections::HashSet;
 
+use rusqlite::types::{Type, ValueRef};
 use rusqlite::{Connection, OptionalExtension, Transaction};
 use sha2::{Digest, Sha256};
+
+#[cfg(test)]
+use std::cell::Cell;
 
 use crate::domain::EventId;
 use crate::kernel::StoreError;
@@ -70,6 +74,39 @@ pub(crate) struct SemanticJournalFactRow {
     pub payload: Vec<u8>,
 }
 
+/// A SQLite-borrowed row view used to decide page admission. It intentionally
+/// carries no owned payload or row strings: callers must make the byte-budget
+/// decision before asking the kernel to materialize a [`SemanticJournalFactRow`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SemanticJournalFactRef<'a> {
+    pub sequence: i64,
+    pub event_id: &'a [u8],
+    pub delivery_id: &'a str,
+    pub provider_event_id: Option<&'a str>,
+    pub content_hash: &'a [u8],
+    pub kind: &'a str,
+    pub visibility: &'a str,
+    pub privacy_class: &'a str,
+    pub redaction_class: &'a str,
+    pub occurred_at_ms: i64,
+    pub ingested_at_ms: i64,
+    pub schema_version: i64,
+    pub payload: &'a [u8],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SemanticJournalPageRowAction {
+    Fetch,
+    Skip,
+    Stop,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SemanticJournalPageRowMeta {
+    pub sequence: u64,
+    pub runtime_only: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SemanticJournalDedupeHit {
     pub event_id: [u8; 16],
@@ -101,6 +138,28 @@ pub(crate) enum SemanticJournalWrite {
 
 const ALLOWED_PROVIDER_KINDS: &[&str] = &["claude_code", "codex", "cursor"];
 const STORE_INSTANCE_KIND: &str = "store_instance";
+
+#[cfg(test)]
+thread_local! {
+    static SEMANTIC_JOURNAL_ROW_MATERIALIZATIONS: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn debug_reset_semantic_journal_materialization_counters() {
+    SEMANTIC_JOURNAL_ROW_MATERIALIZATIONS.with(|counter| counter.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn debug_semantic_journal_materialization_counters() -> usize {
+    SEMANTIC_JOURNAL_ROW_MATERIALIZATIONS.with(Cell::get)
+}
+
+#[cfg(test)]
+fn debug_record_semantic_journal_row_materialization() {
+    SEMANTIC_JOURNAL_ROW_MATERIALIZATIONS.with(|counter| {
+        counter.set(counter.get().saturating_add(1));
+    });
+}
 
 fn store_instance_digest() -> [u8; 32] {
     Sha256::digest(b"devmanager.semantic_journal.store_instance.v1").into()
@@ -248,7 +307,15 @@ pub(crate) fn high_water(
     conn: &Connection,
     digest: &[u8; 32],
 ) -> Result<(u64, Option<i64>), StoreError> {
-    let (count, last_occurred_at_ms, _) = validate_facts(conn, digest, |_| Ok(()))?;
+    high_water_with_validator(conn, digest, |_| Ok(()))
+}
+
+pub(crate) fn high_water_with_validator(
+    conn: &Connection,
+    digest: &[u8; 32],
+    validate_row: impl FnMut(&SemanticJournalFactRow) -> Result<(), StoreError>,
+) -> Result<(u64, Option<i64>), StoreError> {
+    let (count, last_occurred_at_ms, _) = validate_facts(conn, digest, validate_row)?;
     let next = if count == 0 {
         1
     } else {
@@ -296,7 +363,7 @@ pub(crate) fn validate_facts(
     let mut last_ingested_at_ms: Option<i64> = None;
     let mut event_ids = HashSet::new();
     let mut delivery_ids = HashSet::new();
-    let mut provider_event_ids = HashSet::new();
+    let mut provider_event_ids: HashSet<String> = HashSet::new();
     while let Some(row) = rows.next()? {
         count = count.checked_add(1).ok_or(StoreError::Corruption)?;
         if count > MAX_JOURNAL_EVENTS as u64 {
@@ -329,6 +396,100 @@ pub(crate) fn validate_facts(
         last_occurred_at_ms = Some(fact.occurred_at_ms);
         last_ingested_at_ms = Some(fact.ingested_at_ms);
         validate_row(&fact)?;
+    }
+    Ok((count, last_occurred_at_ms, last_ingested_at_ms))
+}
+
+/// Validate the bounded SQLite row contract without copying any persisted row
+/// into owned storage. The payload remains borrowed from SQLite so the caller
+/// can run a bounded body-integrity pass for every row before page admission.
+pub(crate) fn validate_fact_metadata(
+    conn: &Connection,
+    digest: &[u8; 32],
+    mut validate_row: impl for<'a> FnMut(&SemanticJournalFactRef<'a>) -> Result<(), StoreError>,
+) -> Result<(u64, Option<i64>, Option<i64>), StoreError> {
+    let mut stmt = conn.prepare(
+        "SELECT sequence, event_id, delivery_id, provider_event_id, content_hash,
+                kind, visibility, privacy_class, redaction_class, occurred_at_ms,
+                ingested_at_ms, schema_version, payload
+         FROM semantic_journal_facts
+         WHERE authority_digest = ?1
+         ORDER BY sequence ASC",
+    )?;
+    let mut rows = stmt.query([digest.as_slice()])?;
+    let mut expected_sequence = 1_i64;
+    let mut count = 0_u64;
+    let mut last_occurred_at_ms: Option<i64> = None;
+    let mut last_ingested_at_ms: Option<i64> = None;
+    let mut event_ids = HashSet::new();
+    let mut delivery_ids = HashSet::new();
+    let mut provider_event_ids = HashSet::new();
+    while let Some(row) = rows.next()? {
+        count = count.checked_add(1).ok_or(StoreError::Corruption)?;
+        if count > MAX_JOURNAL_EVENTS as u64 {
+            return Err(StoreError::Corruption);
+        }
+        let metadata = map_fact_metadata(row)?;
+        let event_id = exact16_ref(metadata.event_id)?;
+        EventId::from_bytes(event_id).map_err(|_| StoreError::Corruption)?;
+        let content_hash = exact32_ref(metadata.content_hash)?;
+        if content_hash == [0u8; 32]
+            || metadata.sequence != expected_sequence
+            || metadata.sequence <= 0
+            || metadata.occurred_at_ms < 0
+            || metadata.ingested_at_ms < 0
+            || metadata.schema_version <= 0
+            || metadata.payload.is_empty()
+            || metadata.payload.len() > MAX_JOURNAL_PAYLOAD_BYTES
+            || !ALLOWED_JOURNAL_KINDS.contains(&metadata.kind)
+            || !ALLOWED_JOURNAL_VISIBILITIES.contains(&metadata.visibility)
+            || !ALLOWED_JOURNAL_PRIVACY_CLASSES.contains(&metadata.privacy_class)
+            || !ALLOWED_JOURNAL_REDACTION_CLASSES.contains(&metadata.redaction_class)
+        {
+            return Err(StoreError::Corruption);
+        }
+        validate_text_field(metadata.delivery_id)?;
+        if let Some(provider_event_id) = metadata.provider_event_id {
+            validate_text_field(provider_event_id)?;
+        }
+        validate_text_field(metadata.kind)?;
+        validate_text_field(metadata.visibility)?;
+        validate_text_field(metadata.privacy_class)?;
+        validate_text_field(metadata.redaction_class)?;
+        if !event_ids.insert(event_id)
+            || !delivery_ids.insert(metadata.delivery_id.to_owned())
+            || metadata.provider_event_id.is_some_and(|provider_event_id| {
+                !provider_event_ids.insert(provider_event_id.to_owned())
+            })
+        {
+            return Err(StoreError::Corruption);
+        }
+        if last_occurred_at_ms.is_some_and(|last| metadata.occurred_at_ms < last)
+            || last_ingested_at_ms.is_some_and(|last| metadata.ingested_at_ms < last)
+        {
+            return Err(StoreError::Corruption);
+        }
+        let row_ref = SemanticJournalFactRef {
+            sequence: metadata.sequence,
+            event_id: metadata.event_id,
+            delivery_id: metadata.delivery_id,
+            provider_event_id: metadata.provider_event_id,
+            content_hash: metadata.content_hash,
+            kind: metadata.kind,
+            visibility: metadata.visibility,
+            privacy_class: metadata.privacy_class,
+            redaction_class: metadata.redaction_class,
+            occurred_at_ms: metadata.occurred_at_ms,
+            ingested_at_ms: metadata.ingested_at_ms,
+            schema_version: metadata.schema_version,
+            payload: metadata.payload,
+        };
+        validate_row(&row_ref)?;
+        expected_sequence = expected_sequence
+            .checked_add(1)
+            .ok_or(StoreError::Corruption)?;
+        last_occurred_at_ms = Some(metadata.occurred_at_ms);
+        last_ingested_at_ms = Some(metadata.ingested_at_ms);
     }
     Ok((count, last_occurred_at_ms, last_ingested_at_ms))
 }
@@ -499,16 +660,50 @@ pub(crate) fn load_fact(
     .and_then(|row| row.map(finalize_fact).transpose())
 }
 
-/// Stream facts from one pinned read transaction. The caller receives one
-/// bounded, finalized row at a time and may return `false` to stop fetching;
-/// no page-sized `Vec` is built by the kernel.
+/// Stream facts from one pinned read transaction. A borrowed row preflight is
+/// invoked while SQLite still owns the row, before any payload or scalar value
+/// is copied into a [`SemanticJournalFactRow`]. Only admitted rows take that
+/// owned path; callers may stop without fetching the next candidate.
 pub(crate) fn stream_page(
     tx: &Transaction<'_>,
     digest: &[u8; 32],
     after_sequence: i64,
     high_water: i64,
+    mut prepare: impl FnMut(u64, &[SemanticJournalPageRowMeta]) -> Result<(), StoreError>,
+    mut preflight: impl for<'a> FnMut(
+        u64,
+        SemanticJournalFactRef<'a>,
+    ) -> Result<SemanticJournalPageRowAction, StoreError>,
     mut visit: impl FnMut(SemanticJournalFactRow) -> Result<bool, StoreError>,
 ) -> Result<(), StoreError> {
+    let high_water_i64 = high_water;
+    let high_water = u64::try_from(high_water_i64).map_err(|_| StoreError::Corruption)?;
+    let mut metadata_stmt = tx.prepare(
+        "SELECT sequence, visibility = 'runtime_only'
+         FROM semantic_journal_facts
+         WHERE authority_digest = ?1
+           AND sequence > ?2
+           AND sequence <= ?3
+         ORDER BY sequence ASC",
+    )?;
+    let mut metadata_rows = metadata_stmt.query(rusqlite::params![
+        digest.as_slice(),
+        after_sequence,
+        high_water_i64,
+    ])?;
+    let mut metadata = Vec::new();
+    while let Some(row) = metadata_rows.next()? {
+        let sequence = u64::try_from(row.get::<_, i64>(0)?).map_err(|_| StoreError::Corruption)?;
+        let runtime_only = row.get::<_, i64>(1)? != 0;
+        metadata.push(SemanticJournalPageRowMeta {
+            sequence,
+            runtime_only,
+        });
+    }
+    drop(metadata_rows);
+    drop(metadata_stmt);
+    prepare(high_water, &metadata)?;
+
     let mut stmt = tx.prepare(
         "SELECT sequence, event_id, delivery_id, provider_event_id, content_hash,
                 kind, visibility, privacy_class, redaction_class, occurred_at_ms,
@@ -522,9 +717,18 @@ pub(crate) fn stream_page(
     let mut rows = stmt.query(rusqlite::params![
         digest.as_slice(),
         after_sequence,
-        high_water,
+        high_water_i64,
     ])?;
     while let Some(row) = rows.next()? {
+        let action = {
+            let row_ref = map_fact_ref(row)?;
+            preflight(high_water, row_ref)?
+        };
+        match action {
+            SemanticJournalPageRowAction::Stop => break,
+            SemanticJournalPageRowAction::Skip => continue,
+            SemanticJournalPageRowAction::Fetch => {}
+        }
         let fact = finalize_fact(map_raw_fact(row)?)?;
         if !visit(fact)? {
             break;
@@ -582,6 +786,22 @@ struct RawFact {
     payload: Vec<u8>,
 }
 
+struct SemanticJournalFactMetadata<'a> {
+    sequence: i64,
+    event_id: &'a [u8],
+    delivery_id: &'a str,
+    provider_event_id: Option<&'a str>,
+    content_hash: &'a [u8],
+    kind: &'a str,
+    visibility: &'a str,
+    privacy_class: &'a str,
+    redaction_class: &'a str,
+    occurred_at_ms: i64,
+    ingested_at_ms: i64,
+    schema_version: i64,
+    payload: &'a [u8],
+}
+
 fn map_dedupe_hit(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawDedupeHit> {
     Ok(RawDedupeHit {
         event_id: row.get(0)?,
@@ -599,6 +819,8 @@ fn finalize_dedupe_hit(raw: RawDedupeHit) -> Result<SemanticJournalDedupeHit, St
 }
 
 fn map_raw_fact(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawFact> {
+    #[cfg(test)]
+    debug_record_semantic_journal_row_materialization();
     Ok(RawFact {
         sequence: row.get(0)?,
         event_id: row.get(1)?,
@@ -614,6 +836,84 @@ fn map_raw_fact(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawFact> {
         schema_version: row.get(11)?,
         payload: row.get(12)?,
     })
+}
+
+fn map_fact_metadata<'a>(
+    row: &'a rusqlite::Row<'a>,
+) -> rusqlite::Result<SemanticJournalFactMetadata<'a>> {
+    Ok(SemanticJournalFactMetadata {
+        sequence: row.get(0)?,
+        event_id: blob_ref(row, 1)?,
+        delivery_id: text_ref(row, 2)?,
+        provider_event_id: optional_text_ref(row, 3)?,
+        content_hash: blob_ref(row, 4)?,
+        kind: text_ref(row, 5)?,
+        visibility: text_ref(row, 6)?,
+        privacy_class: text_ref(row, 7)?,
+        redaction_class: text_ref(row, 8)?,
+        occurred_at_ms: row.get(9)?,
+        ingested_at_ms: row.get(10)?,
+        schema_version: row.get(11)?,
+        payload: blob_ref(row, 12)?,
+    })
+}
+
+fn map_fact_ref<'a>(row: &'a rusqlite::Row<'a>) -> rusqlite::Result<SemanticJournalFactRef<'a>> {
+    Ok(SemanticJournalFactRef {
+        sequence: row.get(0)?,
+        event_id: blob_ref(row, 1)?,
+        delivery_id: text_ref(row, 2)?,
+        provider_event_id: optional_text_ref(row, 3)?,
+        content_hash: blob_ref(row, 4)?,
+        kind: text_ref(row, 5)?,
+        visibility: text_ref(row, 6)?,
+        privacy_class: text_ref(row, 7)?,
+        redaction_class: text_ref(row, 8)?,
+        occurred_at_ms: row.get(9)?,
+        ingested_at_ms: row.get(10)?,
+        schema_version: row.get(11)?,
+        payload: blob_ref(row, 12)?,
+    })
+}
+
+fn blob_ref<'a>(row: &'a rusqlite::Row<'_>, index: usize) -> rusqlite::Result<&'a [u8]> {
+    match row.get_ref(index)? {
+        ValueRef::Blob(value) => Ok(value),
+        ValueRef::Null => Err(rusqlite::Error::InvalidColumnType(
+            index,
+            "blob".into(),
+            Type::Blob,
+        )),
+        ValueRef::Integer(_) | ValueRef::Real(_) | ValueRef::Text(_) => Err(
+            rusqlite::Error::InvalidColumnType(index, "blob".into(), Type::Blob),
+        ),
+    }
+}
+
+fn text_ref<'a>(row: &'a rusqlite::Row<'_>, index: usize) -> rusqlite::Result<&'a str> {
+    match row.get_ref(index)? {
+        ValueRef::Text(value) => std::str::from_utf8(value).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(index, Type::Text, Box::new(error))
+        }),
+        ValueRef::Null | ValueRef::Blob(_) | ValueRef::Integer(_) | ValueRef::Real(_) => Err(
+            rusqlite::Error::InvalidColumnType(index, "text".into(), Type::Text),
+        ),
+    }
+}
+
+fn optional_text_ref<'a>(
+    row: &'a rusqlite::Row<'_>,
+    index: usize,
+) -> rusqlite::Result<Option<&'a str>> {
+    match row.get_ref(index)? {
+        ValueRef::Null => Ok(None),
+        ValueRef::Text(value) => std::str::from_utf8(value).map(Some).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(index, Type::Text, Box::new(error))
+        }),
+        ValueRef::Blob(_) | ValueRef::Integer(_) | ValueRef::Real(_) => Err(
+            rusqlite::Error::InvalidColumnType(index, "text".into(), Type::Text),
+        ),
+    }
 }
 
 fn finalize_fact(raw: RawFact) -> Result<SemanticJournalFactRow, StoreError> {
@@ -688,6 +988,14 @@ fn validate_text_field(value: &str) -> Result<(), StoreError> {
 
 pub(crate) fn exact16(bytes: Vec<u8>) -> Result<[u8; 16], StoreError> {
     <[u8; 16]>::try_from(bytes).map_err(|_| StoreError::Corruption)
+}
+
+fn exact16_ref(bytes: &[u8]) -> Result<[u8; 16], StoreError> {
+    <[u8; 16]>::try_from(bytes).map_err(|_| StoreError::Corruption)
+}
+
+fn exact32_ref(bytes: &[u8]) -> Result<[u8; 32], StoreError> {
+    <[u8; 32]>::try_from(bytes).map_err(|_| StoreError::Corruption)
 }
 
 pub(crate) fn exact32(bytes: Vec<u8>) -> Result<[u8; 32], StoreError> {

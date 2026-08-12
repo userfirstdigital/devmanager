@@ -402,6 +402,16 @@ impl KernelStore {
         crate::kernel::semantic_journal::high_water(&self.conn, digest)
     }
 
+    pub(crate) fn semantic_journal_high_water_validated(
+        &self,
+        digest: &[u8; 32],
+        validate_row: impl FnMut(
+            &crate::kernel::semantic_journal::SemanticJournalFactRow,
+        ) -> Result<(), StoreError>,
+    ) -> Result<(u64, Option<i64>), StoreError> {
+        crate::kernel::semantic_journal::high_water_with_validator(&self.conn, digest, validate_row)
+    }
+
     pub(crate) fn semantic_journal_retained_len(
         &self,
         digest: &[u8; 32],
@@ -470,17 +480,31 @@ impl KernelStore {
         digest: &[u8; 32],
         after_sequence: i64,
         requested_high_water: Option<u64>,
-        validate_row: impl FnMut(
-            &crate::kernel::semantic_journal::SemanticJournalFactRow,
+        mut prepare: impl FnMut(
+            u64,
+            &[crate::kernel::semantic_journal::SemanticJournalPageRowMeta],
         ) -> Result<(), StoreError>,
+        mut validate_metadata: impl for<'a> FnMut(
+            &crate::kernel::semantic_journal::SemanticJournalFactRef<'a>,
+        ) -> Result<(), StoreError>,
+        mut preflight: impl for<'a> FnMut(
+            u64,
+            crate::kernel::semantic_journal::SemanticJournalFactRef<'a>,
+        ) -> Result<
+            crate::kernel::semantic_journal::SemanticJournalPageRowAction,
+            StoreError,
+        >,
         mut visit: impl FnMut(
             u64,
             crate::kernel::semantic_journal::SemanticJournalFactRow,
         ) -> Result<bool, StoreError>,
     ) -> Result<u64, StoreError> {
         let tx = self.conn.unchecked_transaction()?;
-        let (count, _, _) =
-            crate::kernel::semantic_journal::validate_facts(&tx, digest, validate_row)?;
+        let (count, _, _) = crate::kernel::semantic_journal::validate_fact_metadata(
+            &tx,
+            digest,
+            &mut validate_metadata,
+        )?;
         let next_sequence = count.checked_add(1).ok_or(StoreError::Corruption)?;
         let high_water = next_sequence.checked_sub(1).ok_or(StoreError::Corruption)?;
         if requested_high_water.is_some_and(|requested| requested != high_water) {
@@ -501,6 +525,8 @@ impl KernelStore {
             digest,
             after_sequence,
             high_water_i64,
+            &mut prepare,
+            &mut preflight,
             |row| visit(high_water, row),
         )?;
         tx.commit()?;

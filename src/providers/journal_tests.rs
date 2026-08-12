@@ -1354,7 +1354,7 @@ fn journal_corruption_in_later_row_is_sticky_across_all_reads_and_writes() {
 }
 
 #[test]
-fn journal_restore_rejects_unbounded_unknown_metadata() {
+fn journal_open_rejects_unbounded_unknown_metadata() {
     let dir = TempDir::new().expect("tempdir");
     let path = dir.path().join("kernel.sqlite3");
     let mut journal = open_on(&path, ProviderKind::ClaudeCode);
@@ -1390,11 +1390,13 @@ fn journal_restore_rejects_unbounded_unknown_metadata() {
     )
     .expect("replace persisted body");
 
-    let reopened = open_on(&path, ProviderKind::ClaudeCode);
-    assert!(matches!(
-        reopened.event_at(1),
-        Err(JournalIngestOutcome::NeedsResync)
-    ));
+    let reopened = SemanticJournal::open(
+        &path,
+        &test_permit(ProviderKind::ClaudeCode, "session_open"),
+        JournalLimits::default(),
+        NOW_MS,
+    );
+    assert!(matches!(reopened, Err(JournalError::Store)));
 }
 
 #[test]
@@ -1417,6 +1419,11 @@ fn journal_oversized_first_page_fails_before_returning_materialized_facts() {
         debug_journal_page_materialization_counters(),
         (0, 0),
         "an oversized first candidate must not restore or allocate a fact"
+    );
+    assert_eq!(
+        debug_journal_page_preflight_counters(),
+        (0, 0),
+        "an oversized first candidate must not finalize a row or decode its payload"
     );
 }
 
@@ -1454,6 +1461,303 @@ fn journal_page_cap_blocks_continuation_restore_before_owned_fact_copy() {
         (1, 1),
         "the continuation row must be rejected before restore and owned-copy"
     );
+    assert_eq!(
+        debug_journal_page_preflight_counters(),
+        (1, 1),
+        "only the admitted continuation row may finalize or decode a payload"
+    );
+}
+
+#[test]
+fn journal_page_preflight_uses_cursor_after_runtime_skips_at_integer_boundary() {
+    let (_dir, path, mut journal) = temp_journal(ProviderKind::ClaudeCode);
+    for index in 1..=129 {
+        let body = format!(
+            r#"{{"schema_version":1,"source_type":"user_message","provider_event_id":"claude_evt_boundary_{index}","occurred_at_ms":{},"payload":{{"kind":"user_message","text":"boundary"}},"extensions":{{}}}}"#,
+            NOW_MS - 1_000 + i64::from(index)
+        );
+        assert!(matches!(
+            journal.ingest(
+                test_permit(ProviderKind::ClaudeCode, &format!("relay_boundary_{index}")),
+                body.as_bytes(),
+                NOW_MS,
+            ),
+            JournalIngestOutcome::Accepted(_)
+        ));
+    }
+    let authority_digest = journal.authority_digest;
+    let conn = Connection::open(&path).expect("reopen raw");
+    conn.execute(
+        "UPDATE semantic_journal_facts
+         SET visibility = 'runtime_only'
+         WHERE authority_digest = ?1 AND sequence IN (127, 128)",
+        rusqlite::params![authority_digest.as_slice()],
+    )
+    .expect("mark cursor-boundary rows runtime-only");
+    drop(conn);
+
+    let wide = journal
+        .projected_page(125, None, PageLimits::new(1, 8 * 1024).expect("limits"))
+        .expect("wide page");
+    assert_eq!(wide.facts.len(), 1);
+    assert_eq!(wide.facts[0].sequence, 126);
+    assert_eq!(wide.next_sequence, Some(129));
+    assert!(wide.encoded_bytes > 1);
+
+    debug_reset_journal_page_materialization_counters();
+    let cap = wide.encoded_bytes - 1;
+    let bounded = journal
+        .projected_page(125, None, PageLimits::new(1, cap).expect("under cap"))
+        .expect("under-cap page must stop before candidate materialization");
+    assert!(bounded.facts.is_empty());
+    assert_eq!(bounded.next_sequence, Some(126));
+    assert!(bounded.encoded_bytes <= cap);
+    assert_eq!(
+        debug_journal_page_materialization_counters(),
+        (0, 0),
+        "cursor-width overflow must be rejected before event/fact materialization"
+    );
+    assert_eq!(
+        debug_journal_page_preflight_counters(),
+        (0, 0),
+        "cursor-width overflow must be rejected before owned row/payload decode"
+    );
+}
+
+#[test]
+fn journal_persisted_bidi_delivery_id_fails_closed_during_integrity_scan() {
+    let (_dir, path, mut journal) = temp_journal(ProviderKind::ClaudeCode);
+    ingest_named(
+        &mut journal,
+        ProviderKind::ClaudeCode,
+        "relay_bidi_corrupt",
+        "claude_user_message.json",
+    );
+    let authority_digest = journal.authority_digest;
+    let conn = Connection::open(&path).expect("reopen raw");
+    conn.execute(
+        "UPDATE semantic_journal_facts SET delivery_id = ?1
+         WHERE authority_digest = ?2 AND sequence = 1",
+        rusqlite::params!["relay_\u{202e}corrupt", authority_digest.as_slice()],
+    )
+    .expect("corrupt persisted delivery id");
+    drop(conn);
+
+    assert!(matches!(
+        journal.retained_len(),
+        Err(JournalIngestOutcome::NeedsResync)
+    ));
+    assert!(matches!(
+        journal.projected_page(0, None, PageLimits::new(1, 8 * 1024).expect("limits")),
+        Err(JournalIngestOutcome::NeedsResync)
+    ));
+}
+
+#[test]
+fn journal_page_global_integrity_rejects_post_cap_corrupt_body() {
+    let (_dir, path, mut journal) = temp_journal(ProviderKind::ClaudeCode);
+    ingest_named(
+        &mut journal,
+        ProviderKind::ClaudeCode,
+        "relay_global_integrity_first",
+        "claude_user_message.json",
+    );
+    ingest_named(
+        &mut journal,
+        ProviderKind::ClaudeCode,
+        "relay_global_integrity_second",
+        "claude_tool_call.json",
+    );
+    let authority_digest = journal.authority_digest;
+    let conn = Connection::open(&path).expect("reopen raw");
+    conn.execute(
+        "UPDATE semantic_journal_facts SET payload = ?1
+         WHERE authority_digest = ?2 AND sequence = 2",
+        rusqlite::params![
+            vec![0x81, 0xa7, b'u', b'n', b'k', b'n', b'o', b'w', b'n', 0xc0],
+            authority_digest.as_slice()
+        ],
+    )
+    .expect("corrupt post-cap body");
+    drop(conn);
+
+    assert!(matches!(
+        journal.projected_page(0, None, PageLimits::new(1, 8 * 1024).expect("limits")),
+        Err(JournalIngestOutcome::NeedsResync)
+    ));
+}
+
+#[test]
+fn journal_page_global_integrity_rejects_runtime_only_corrupt_body_before_skip() {
+    let (_dir, path, mut journal) = temp_journal(ProviderKind::ClaudeCode);
+    ingest_named(
+        &mut journal,
+        ProviderKind::ClaudeCode,
+        "relay_global_integrity_runtime",
+        "claude_user_message.json",
+    );
+    let authority_digest = journal.authority_digest;
+    let conn = Connection::open(&path).expect("reopen raw");
+    conn.execute(
+        "UPDATE semantic_journal_facts
+         SET visibility = 'runtime_only', payload = ?1
+         WHERE authority_digest = ?2 AND sequence = 1",
+        rusqlite::params![
+            vec![0x81, 0xa7, b'u', b'n', b'k', b'n', b'o', b'w', b'n', 0xc0],
+            authority_digest.as_slice()
+        ],
+    )
+    .expect("corrupt runtime-only body");
+    drop(conn);
+
+    assert!(matches!(
+        journal.projected_page(0, None, PageLimits::new(1, 8 * 1024).expect("limits")),
+        Err(JournalIngestOutcome::NeedsResync)
+    ));
+}
+
+#[test]
+fn journal_page_global_integrity_rejects_runtime_only_known_field_for_kind() {
+    let (_dir, path, mut journal) = temp_journal(ProviderKind::ClaudeCode);
+    ingest_named(
+        &mut journal,
+        ProviderKind::ClaudeCode,
+        "relay_global_integrity_runtime_kind",
+        "claude_user_message.json",
+    );
+    let body = PersistedJournalBody {
+        text: None,
+        extensions: BTreeMap::new(),
+        unknown_source_type: None,
+        unknown_schema_version: None,
+        unknown_diagnostic_ref: None,
+        provider_event_id: Some("claude_evt_user_1".into()),
+        payload: SemanticJournalPayload::UserMessage { text: "ok".into() },
+    };
+    let mut payload = rmp_serde::to_vec_named(&body).expect("encode body");
+    let payload_map = payload
+        .iter()
+        .rposition(|marker| *marker == 0x82)
+        .expect("payload map");
+    payload[payload_map] = 0x83;
+    payload.extend_from_slice(&[0xa6, b's', b't', b'a', b't', b'u', b's', 0xa1, b'x']);
+    let authority_digest = journal.authority_digest;
+    let conn = Connection::open(&path).expect("reopen raw");
+    conn.execute(
+        "UPDATE semantic_journal_facts
+         SET visibility = 'runtime_only', payload = ?1
+         WHERE authority_digest = ?2 AND sequence = 1",
+        rusqlite::params![payload, authority_digest.as_slice()],
+    )
+    .expect("corrupt runtime-only kind fields");
+    drop(conn);
+
+    assert!(matches!(
+        journal.projected_page(0, None, PageLimits::new(1, 8 * 1024).expect("limits")),
+        Err(JournalIngestOutcome::NeedsResync)
+    ));
+}
+
+#[test]
+fn journal_raw_preflight_rejects_unknown_envelope_and_payload_keys() {
+    let body = PersistedJournalBody {
+        text: None,
+        extensions: BTreeMap::new(),
+        unknown_source_type: None,
+        unknown_schema_version: None,
+        unknown_diagnostic_ref: None,
+        provider_event_id: Some("claude_evt_raw_keys".into()),
+        payload: SemanticJournalPayload::UserMessage { text: "ok".into() },
+    };
+    let mut envelope = rmp_serde::to_vec_named(&body).expect("encode body");
+    assert_eq!(envelope.first(), Some(&0x87), "body map must be a fixmap");
+    envelope[0] = 0x88;
+    envelope.extend_from_slice(&[0xa5, b'b', b'o', b'g', b'u', b's', 0xc0]);
+    assert!(matches!(
+        RawMessagePack::new(&envelope).persisted_payload_shape(),
+        Err(JournalError::InvalidEnvelope)
+    ));
+
+    let mut payload = rmp_serde::to_vec_named(&body).expect("encode body");
+    let payload_map = payload
+        .iter()
+        .rposition(|marker| *marker == 0x82)
+        .expect("payload map");
+    payload[payload_map] = 0x83;
+    payload.extend_from_slice(&[0xa5, b'b', b'o', b'g', b'u', b's', 0xc0]);
+    assert!(matches!(
+        RawMessagePack::new(&payload).persisted_payload_shape(),
+        Err(JournalError::InvalidEnvelope)
+    ));
+}
+
+#[test]
+fn journal_raw_preflight_rejects_known_field_for_wrong_payload_kind() {
+    let body = PersistedJournalBody {
+        text: None,
+        extensions: BTreeMap::new(),
+        unknown_source_type: None,
+        unknown_schema_version: None,
+        unknown_diagnostic_ref: None,
+        provider_event_id: Some("claude_evt_wrong_kind_field".into()),
+        payload: SemanticJournalPayload::UserMessage { text: "ok".into() },
+    };
+    let mut payload = rmp_serde::to_vec_named(&body).expect("encode body");
+    let payload_map = payload
+        .iter()
+        .rposition(|marker| *marker == 0x82)
+        .expect("payload map");
+    payload[payload_map] = 0x83;
+    payload.extend_from_slice(&[0xa6, b's', b't', b'a', b't', b'u', b's', 0xa1, b'x']);
+    assert!(matches!(
+        RawMessagePack::new(&payload).persisted_payload_shape(),
+        Err(JournalError::InvalidEnvelope)
+    ));
+}
+
+#[test]
+fn journal_raw_preflight_bounds_total_messagepack_values() {
+    let mut bomb = Vec::new();
+    bomb.extend_from_slice(&[0xdc, 0, 16]);
+    for _ in 0..16 {
+        bomb.extend_from_slice(&[0xde, 0, 16]);
+        for _ in 0..16 {
+            bomb.extend_from_slice(&[0xa1, b'k', 0xa1, b'v']);
+        }
+    }
+    let mut reader = RawMessagePack::new(&bomb);
+    assert!(matches!(reader.skip_value(0), Err(JournalError::Oversized)));
+}
+
+#[test]
+fn journal_open_rejects_persisted_bidi_identity_in_high_water_scan() {
+    let (_dir, path, mut journal) = temp_journal(ProviderKind::ClaudeCode);
+    ingest_named(
+        &mut journal,
+        ProviderKind::ClaudeCode,
+        "relay_open_bidi_corrupt",
+        "claude_user_message.json",
+    );
+    let authority_digest = journal.authority_digest;
+    let conn = Connection::open(&path).expect("reopen raw");
+    conn.execute(
+        "UPDATE semantic_journal_facts SET delivery_id = ?1
+         WHERE authority_digest = ?2 AND sequence = 1",
+        rusqlite::params!["relay_\u{202e}open-corrupt", authority_digest.as_slice()],
+    )
+    .expect("corrupt persisted delivery id");
+    drop(conn);
+    drop(journal);
+
+    assert!(matches!(
+        SemanticJournal::open(
+            &path,
+            &test_permit(ProviderKind::ClaudeCode, "session_reopen"),
+            JournalLimits::default(),
+            NOW_MS,
+        ),
+        Err(JournalError::Store)
+    ));
 }
 
 #[test]
