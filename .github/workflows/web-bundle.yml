@@ -6,6 +6,7 @@ on:
       - ".gitattributes"
       - ".github/workflows/web-bundle.yml"
       - "build.rs"
+      - "packaging/package-contract.json"
       - "src/remote/web/assets.rs"
       - "src/remote/web/mod.rs"
       - "web/**"

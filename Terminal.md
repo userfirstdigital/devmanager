@@ -4,6 +4,8 @@ This file is the source of truth for DevManager terminal parity decisions.
 
 Use Zed as a reference for terminal behavior, but do not treat Zed as something we must copy feature-for-feature. Prefer the parts that improve a mouse-first, English-language workflow and skip power-user terminal modes that add complexity without real value for this app.
 
+In the packaged product, the durable `devmanager-host` process owns PTYs and canonical terminal state; the GPUI client and remote surfaces render that state. This file still governs client-visible terminal UX decisions (clipboard, selection, key bindings) independent of which binary draws the grid.
+
 ## Port And Maintain
 
 These are the Zed-inspired terminal features we want in DevManager and want to keep.
