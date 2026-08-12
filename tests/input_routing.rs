@@ -5,7 +5,9 @@ use devmanager::terminal::protocol::{
     ClientInputGrant, FocusEpoch, InputAck, InputEnvelope, InputId, InputRejectReason,
     TerminalGeneration, TerminalSessionId, TerminalSize, TerminalSpec,
 };
-use devmanager::terminal::service::{MockAttachedRuntime, TerminalService};
+use devmanager::terminal::service::{
+    AttachedTerminalRuntime, MockAttachedRuntime, TerminalService,
+};
 
 struct Fixture {
     service: TerminalService,
@@ -25,9 +27,8 @@ fn fixture() -> Fixture {
     let size = TerminalSize::new(40, 8).expect("size");
     let runtime = MockAttachedRuntime::new(size);
     let spec = TerminalSpec::new(session, size).expect("spec");
-    let id = service
-        .attach(task, spec, Arc::clone(&runtime))
-        .expect("attach");
+    let attached: Arc<dyn AttachedTerminalRuntime> = runtime.clone();
+    let id = service.attach(task, spec, attached).expect("attach");
     let client = ClientId::new();
     service
         .grant_client(id, client, ClientInputGrant::ReadWrite)
