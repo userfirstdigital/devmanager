@@ -7875,7 +7875,7 @@ fn handle_codex_session_started(
     identity: &CodexAdapterIdentity,
     binding: CodexSessionBinding,
 ) {
-    bind_runtime_provider_session_id(inner, session_id, binding.session_id.clone());
+    bind_runtime_provider_session_id(inner, session_id, binding.session_id.as_str().to_owned());
     let new_tailer = binding.transcript_path.map(|path| {
         let tail_inner = Arc::downgrade(inner);
         let tail_session_id = session_id.to_string();

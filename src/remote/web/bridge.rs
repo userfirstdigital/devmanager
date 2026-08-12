@@ -566,7 +566,7 @@ async fn run_connect_session(
 fn connect_dispatch_hold_reply(
     envelope: &crate::connect::ConnectEnvelope,
     payload: crate::connect::ConnectPayload,
-) -> Option<crate::connect::ConnectPayload> {
+) -> crate::connect::ConnectPayload {
     let message = match payload {
         crate::connect::ConnectPayload::Query(_) => {
             "Connect query dispatch is unavailable until the host executor callback is bound"
@@ -621,6 +621,10 @@ async fn recv_connect_binary(socket: &mut WebSocket, max_bytes: usize) -> Option
             }
             Ok(WsMessage::Ping(_) | WsMessage::Pong(_)) => {}
             Ok(WsMessage::Text(_) | WsMessage::Close(_)) => {
+                let _ = socket.close().await;
+                return None;
+            }
+            Err(_) => {
                 let _ = socket.close().await;
                 return None;
             }

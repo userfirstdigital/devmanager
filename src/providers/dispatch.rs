@@ -10,8 +10,7 @@ use std::time::Duration;
 
 use crate::domain::operation::OperationState;
 use crate::domain::provider_input::ProviderInputAction;
-use crate::kernel::outbox::{DestinationClass, Effect};
-use crate::kernel::{KernelStore, StoreError};
+use crate::kernel::{DestinationClass, Effect, KernelStore, StoreError};
 use crate::providers::input::{
     sequence_provider_action, ProviderInputDeliveryError, ProviderInputDeliveryIdentity,
     ProviderInputWriteReceipt,
