@@ -36,8 +36,93 @@ impl Scale {
         }
     }
 
-    const fn factor(self) -> f32 {
+    pub const fn factor(self) -> f32 {
         self.percent() as f32 / 100.0
+    }
+
+    /// Resolve the nearest supported Windows display scale once, before a
+    /// render pass starts. Native layout consumes the resulting immutable
+    /// snapshot rather than querying the window while painting.
+    pub fn from_factor(factor: f32) -> Self {
+        let percent = (factor.max(1.0) * 100.0).round() as u16;
+        match percent {
+            0..=112 => Self::Scale100,
+            113..=137 => Self::Scale125,
+            138..=174 => Self::Scale150,
+            _ => Self::Scale200,
+        }
+    }
+}
+
+/// The only runtime preference input consumed by the native shell. It is a
+/// copyable snapshot so appearance and display scale are resolved at window
+/// creation (or by a future preferences event), never during GPUI render.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RuntimePreferencesSnapshot {
+    mode: ThemeMode,
+    density: Density,
+    scale: Scale,
+}
+
+impl Default for RuntimePreferencesSnapshot {
+    fn default() -> Self {
+        Self::new(ThemeMode::Dark, Density::Comfortable, Scale::Scale100)
+    }
+}
+
+impl RuntimePreferencesSnapshot {
+    pub const fn new(mode: ThemeMode, density: Density, scale: Scale) -> Self {
+        Self {
+            mode,
+            density,
+            scale,
+        }
+    }
+
+    pub fn from_system(
+        appearance: gpui::WindowAppearance,
+        scale_factor: f32,
+        density: Density,
+    ) -> Self {
+        let mode = match appearance {
+            gpui::WindowAppearance::Light | gpui::WindowAppearance::VibrantLight => {
+                ThemeMode::Light
+            }
+            gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark => ThemeMode::Dark,
+        };
+        Self::new(mode, density, Scale::from_factor(scale_factor))
+    }
+
+    pub const fn mode(self) -> ThemeMode {
+        self.mode
+    }
+
+    pub const fn density(self) -> Density {
+        self.density
+    }
+
+    pub const fn scale(self) -> Scale {
+        self.scale
+    }
+
+    pub fn tokens(self) -> ThemeTokens {
+        theme(self.mode, self.density, self.scale)
+    }
+
+    pub fn metrics(self) -> PhysicalDensityMetrics {
+        self.tokens().density.physical()
+    }
+
+    /// Conservative minimum window check used by acceptance tests and by the
+    /// shell's initial bounds. It catches scale regressions before a window
+    /// is painted, without requiring a platform capture in unit tests.
+    pub fn layout_fits(self, width: u32, height: u32) -> bool {
+        let metrics = self.metrics();
+        width
+            >= metrics
+                .label_min_width
+                .saturating_add(metrics.control_padding * 8)
+            && height >= metrics.control_height.saturating_mul(4)
     }
 }
 
@@ -60,6 +145,14 @@ impl Color {
             ((value >> 16) & 0xff) as u8,
             ((value >> 8) & 0xff) as u8,
             (value & 0xff) as u8,
+        )
+    }
+
+    /// Convert a semantic token to GPUI's opaque native color without exposing
+    /// palette literals to UI consumers.
+    pub fn to_gpui(self) -> gpui::Rgba {
+        gpui::rgb(
+            (u32::from(self.red()) << 16) | (u32::from(self.green()) << 8) | u32::from(self.blue()),
         )
     }
 
@@ -91,6 +184,10 @@ impl Color {
         format!("#{:02X}{:02X}{:02X}", self.red(), self.green(), self.blue())
     }
 }
+
+/// Deterministic preview capture marker. It is intentionally a token-module
+/// constant so preview rendering does not become a second color source.
+pub const PREVIEW_SENTINEL: Color = Color::from_u32(0x912bd4);
 
 /// Return the relative luminance of an opaque sRGB color using the WCAG 2.x
 /// transfer function. The calculation is intentionally independent of a UI
@@ -1848,6 +1945,64 @@ pub fn light(density: Density, scale: Scale) -> ThemeTokens {
 
 pub type Theme = ThemeTokens;
 
+/// Byte-preserving names retained for the legacy GPUI surface.
+///
+/// The compatibility module is deliberately kept in this canonical token
+/// source.  Legacy callers still receive their existing palette values while
+/// the native cockpit uses the semantic [`ThemeTokens`] contract above; the
+/// `theme` module only re-exports this module and cannot become a second color
+/// source.
+pub mod legacy {
+    use super::Color;
+
+    pub const APP_BG: u32 = Color::from_u32(0x18181b).to_u32();
+    pub const SIDEBAR_BG: u32 = Color::from_u32(0x27272a).to_u32();
+    pub const PANEL_BG: u32 = Color::from_u32(0x18181b).to_u32();
+    pub const PANEL_HEADER_BG: u32 = Color::from_u32(0x27272a).to_u32();
+    pub const PANEL_CARD_BG: u32 = Color::from_u32(0x18181b).to_u32();
+    pub const EDITOR_CARD_BG: u32 = Color::from_u32(0x202127).to_u32();
+    pub const EDITOR_FIELD_BG: u32 = Color::from_u32(0x121318).to_u32();
+    pub const EDITOR_NOTICE_BG: u32 = Color::from_u32(0x1a202a).to_u32();
+    pub const TOPBAR_BG: u32 = Color::from_u32(0x27272a).to_u32();
+    pub const TAB_BAR_BG: u32 = Color::from_u32(0x27272a).to_u32();
+    pub const TAB_ACTIVE_BG: u32 = Color::from_u32(0x18181b).to_u32();
+    pub const TAB_HOVER_BG: u32 = Color::from_u32(0x323238).to_u32();
+    pub const STATUS_BAR_BG: u32 = Color::from_u32(0x09090b).to_u32();
+    pub const TERMINAL_BG: u32 = Color::from_u32(0x09090b).to_u32();
+
+    pub const PROJECT_ROW_BG: u32 = Color::from_u32(0x3f3f46).to_u32();
+    pub const AGENT_ROW_BG: u32 = Color::from_u32(0x27272a).to_u32();
+
+    pub const BORDER_PRIMARY: u32 = Color::from_u32(0x3f3f46).to_u32();
+    pub const BORDER_SECONDARY: u32 = Color::from_u32(0x27272a).to_u32();
+    pub const BORDER_ACCENT: u32 = Color::from_u32(0x243040).to_u32();
+
+    pub const TEXT_PRIMARY: u32 = Color::from_u32(0xe4e4e7).to_u32();
+    pub const TEXT_MUTED: u32 = Color::from_u32(0xa1a1aa).to_u32();
+    pub const TEXT_SUBTLE: u32 = Color::from_u32(0x71717a).to_u32();
+    pub const TEXT_DIM: u32 = Color::from_u32(0x52525b).to_u32();
+
+    pub const SELECTION_BG: u32 = Color::from_u32(0x22364d).to_u32();
+    pub const SELECTION_TEXT: u32 = Color::from_u32(0xf8fafc).to_u32();
+    pub const PROJECT_DOT: u32 = Color::from_u32(0x6366f1).to_u32();
+    pub const AI_DOT: u32 = Color::from_u32(0xf59e0b).to_u32();
+    pub const SSH_DOT: u32 = Color::from_u32(0x06b6d4).to_u32();
+    pub const SUCCESS_BG: u32 = Color::from_u32(0x142117).to_u32();
+    pub const SUCCESS_TEXT: u32 = Color::from_u32(0x4ade80).to_u32();
+    pub const WARNING_TEXT: u32 = Color::from_u32(0xfacc15).to_u32();
+    pub const EXTERNAL_TEXT: u32 = Color::from_u32(0x60a5fa).to_u32();
+    pub const DANGER_TEXT: u32 = Color::from_u32(0xfb7185).to_u32();
+    pub const DANGER_BG_SUBTLE: u32 = Color::from_u32(0x2a1517).to_u32();
+
+    pub const PRIMARY: u32 = Color::from_u32(0x4f46e5).to_u32();
+    pub const PRIMARY_HOVER: u32 = Color::from_u32(0x4338ca).to_u32();
+    pub const PRIMARY_MUTED: u32 = Color::from_u32(0x2c266b).to_u32();
+    pub const ROW_HOVER_BG: u32 = Color::from_u32(0x323238).to_u32();
+    pub const BUTTON_HOVER_BG: u32 = Color::from_u32(0x52525b).to_u32();
+}
+
+pub use legacy::*;
+
 pub fn parse_hex_color(value: Option<&str>, fallback: u32) -> u32 {
     let Some(value) = value.map(str::trim) else {
         return fallback;
@@ -1858,49 +2013,3 @@ pub fn parse_hex_color(value: Option<&str>, fallback: u32) -> u32 {
     }
     u32::from_str_radix(hex, 16).unwrap_or(fallback)
 }
-
-pub const PREVIEW_BACKGROUND: Color = Color::from_u32(0x202124);
-pub const PREVIEW_FOREGROUND: Color = Color::from_u32(0xf1f3f4);
-
-// Legacy GPUI palette names remain in this canonical token module so
-// `crate::theme` can stay a compatibility re-export without a second source
-// of visual values.
-pub const APP_BG: u32 = 0x18181b;
-pub const SIDEBAR_BG: u32 = 0x27272a;
-pub const PANEL_BG: u32 = 0x18181b;
-pub const PANEL_HEADER_BG: u32 = 0x27272a;
-pub const PANEL_CARD_BG: u32 = 0x18181b;
-pub const EDITOR_CARD_BG: u32 = 0x202127;
-pub const EDITOR_FIELD_BG: u32 = 0x121318;
-pub const EDITOR_NOTICE_BG: u32 = 0x1a202a;
-pub const TOPBAR_BG: u32 = 0x27272a;
-pub const TAB_BAR_BG: u32 = 0x27272a;
-pub const TAB_ACTIVE_BG: u32 = 0x18181b;
-pub const TAB_HOVER_BG: u32 = 0x323238;
-pub const STATUS_BAR_BG: u32 = 0x09090b;
-pub const TERMINAL_BG: u32 = 0x09090b;
-pub const PROJECT_ROW_BG: u32 = 0x3f3f46;
-pub const AGENT_ROW_BG: u32 = 0x27272a;
-pub const BORDER_PRIMARY: u32 = 0x3f3f46;
-pub const BORDER_SECONDARY: u32 = 0x27272a;
-pub const BORDER_ACCENT: u32 = 0x243040;
-pub const TEXT_PRIMARY: u32 = 0xe4e4e7;
-pub const TEXT_MUTED: u32 = 0xa1a1aa;
-pub const TEXT_SUBTLE: u32 = 0x71717a;
-pub const TEXT_DIM: u32 = 0x52525b;
-pub const SELECTION_BG: u32 = 0x22364d;
-pub const SELECTION_TEXT: u32 = 0xf8fafc;
-pub const PROJECT_DOT: u32 = 0x6366f1;
-pub const AI_DOT: u32 = 0xf59e0b;
-pub const SSH_DOT: u32 = 0x06b6d4;
-pub const SUCCESS_BG: u32 = 0x142117;
-pub const SUCCESS_TEXT: u32 = 0x4ade80;
-pub const WARNING_TEXT: u32 = 0xfacc15;
-pub const EXTERNAL_TEXT: u32 = 0x60a5fa;
-pub const DANGER_TEXT: u32 = 0xfb7185;
-pub const DANGER_BG_SUBTLE: u32 = 0x2a1517;
-pub const PRIMARY: u32 = 0x4f46e5;
-pub const PRIMARY_HOVER: u32 = 0x4338ca;
-pub const PRIMARY_MUTED: u32 = 0x2c266b;
-pub const ROW_HOVER_BG: u32 = 0x323238;
-pub const BUTTON_HOVER_BG: u32 = 0x52525b;

@@ -96,6 +96,40 @@ fn theme_gallery_fixture_requires_capture_exclusion_semantics() {
 }
 
 #[test]
+fn task_cockpit_fixture_describes_the_actual_native_shell_surface() {
+    let (_root, policy) = temporary_policy();
+    let path = policy.fixture_root().join("task-cockpit.json");
+    fs::write(
+        &path,
+        r#"{
+          "schema": "devmanager.ui.preview/v1",
+          "id": "task-cockpit",
+          "title": "Task Cockpit",
+          "capture": { "cursor": "excluded", "border": "excluded" },
+          "root": { "kind": "task-cockpit", "label": "Task Cockpit" }
+        }"#,
+    )
+    .expect("task cockpit fixture");
+    let request = PreviewRequest::validate(
+        &path,
+        policy.output_root().join("task-cockpit.png"),
+        &policy,
+    )
+    .expect("valid task cockpit request");
+    let preview = PreviewApplication::load(request, &policy).expect("fixture should load");
+    let body = &preview.root_snapshot().body;
+    for section in [
+        "Task Cockpit",
+        "Header",
+        "Task Inbox",
+        "Context Dock",
+        "Disconnected",
+    ] {
+        assert!(body.contains(section), "missing {section} in {body}");
+    }
+}
+
+#[test]
 fn first_frame_wait_uses_a_fixed_deadline_and_returns_without_thread_residue() {
     assert_eq!(FIRST_FRAME_DEADLINE, Duration::from_secs(5));
 
