@@ -26,6 +26,7 @@ $assertUnchangedScript = Join-Path $PSScriptRoot 'Assert-ProductionUnchanged.ps1
 $worktreeRoot = Get-DevManagerNativeNextWorktreeRoot -ScriptRoot $PSScriptRoot
 $plan = $null
 $script:phase3FinalUnionHold = $null
+$script:phase3HarnessHold = $null
 
 function Set-Phase3FinalUnionHold {
     param([Parameter(Mandatory = $true)][string]$Reason)
@@ -40,12 +41,25 @@ function Set-Phase3FinalUnionHold {
     return 78
 }
 
+function Set-Phase3HarnessHold {
+    param([Parameter(Mandatory = $true)][string]$Reason)
+    $script:phase3HarnessHold = [pscustomobject][ordered]@{
+        schemaVersion = 1
+        phase = $phase
+        status = 'hold'
+        launched = $false
+        error = "HOLD: $Reason"
+    }
+    Write-Host ("{0} {1}" -f $phase, $script:phase3HarnessHold.error)
+    return 78
+}
+
 if (-not $ListOnly -and $Iterations -eq 100) {
     foreach ($dependency in @(
             @{ label = 'host'; path = (Join-Path $worktreeRoot 'target-live-native-next\devmanager-host.exe') },
             @{ label = 'client'; path = (Join-Path $worktreeRoot 'target-live-native-next\devmanager-next.exe') })) {
         if (-not (Test-Path -LiteralPath $dependency.path -PathType Leaf)) {
-            [void](Set-Phase3FinalUnionHold -Reason "$($dependency.label) executable is unavailable: $($dependency.path)")
+            [void](Set-Phase3FinalUnionHold -Reason "$($dependency.label) executable is unavailable")
             Write-Output ($script:phase3FinalUnionHold | ConvertTo-Json -Depth 16 -Compress)
             exit 78
         }
@@ -54,22 +68,41 @@ if (-not $ListOnly -and $Iterations -eq 100) {
 
 function Resolve-ProcessSoakHarness {
     param([Parameter(Mandatory = $true)][string]$WorktreeRoot)
-    $deps = Join-Path $WorktreeRoot 'target-native-next\debug\deps'
+    $harnessRoot = $WorktreeRoot
+    $override = [Environment]::GetEnvironmentVariable('DEVMANAGER_PHASE3_SOAK_HARNESS_ROOT', 'Process')
+    if (-not [string]::IsNullOrWhiteSpace($override)) {
+        try {
+            $canonicalOverride = [IO.Path]::GetFullPath($override)
+            if (-not (Test-DevManagerPathEqualsOrBeneath -LiteralPath $canonicalOverride -AncestorPath $WorktreeRoot)) {
+                [void](Set-Phase3HarnessHold -Reason 'test harness root escapes the worktree')
+                return $null
+            }
+            $harnessRoot = $canonicalOverride
+        }
+        catch {
+            [void](Set-Phase3HarnessHold -Reason 'test harness root is invalid')
+            return $null
+        }
+    }
+    $deps = Join-Path $harnessRoot 'target-native-next\debug\deps'
     if (-not (Test-Path -LiteralPath $deps -PathType Container)) {
-        throw "typed-unavailable: prebuilt process soak harness directory is absent: $deps"
+        [void](Set-Phase3HarnessHold -Reason 'prebuilt process soak harness is unavailable')
+        return $null
     }
     $candidates = @(
         Get-ChildItem -LiteralPath $deps -Filter 'process_soak_infrastructure-*.exe' -File |
             Where-Object { $_.Name -notmatch '\.d\.exe$' }
     )
     if ($candidates.Count -eq 0) {
-        throw 'typed-unavailable: no prebuilt process soak harness is available.'
+        [void](Set-Phase3HarnessHold -Reason 'prebuilt process soak harness is unavailable')
+        return $null
     }
     $candidate = $candidates | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
     Assert-DevManagerPathHasNoReparsePoints -LiteralPath $candidate.FullName
-    $helper = Join-Path $WorktreeRoot 'target-native-next\debug\devmanager-process-test-helper.exe'
+    $helper = Join-Path $harnessRoot 'target-native-next\debug\devmanager-process-test-helper.exe'
     if (-not (Test-Path -LiteralPath $helper -PathType Leaf)) {
-        throw 'typed-unavailable: fixed Rust process supervisor helper is absent.'
+        [void](Set-Phase3HarnessHold -Reason 'fixed Rust process supervisor helper is unavailable')
+        return $null
     }
     Assert-DevManagerPathHasNoReparsePoints -LiteralPath $helper
     return [System.IO.Path]::GetFullPath($candidate.FullName)
@@ -85,8 +118,19 @@ function Invoke-ProcessSupervisorHarness {
         [int]$TimeoutMilliseconds
     )
 
+    $harnessPath = Resolve-ProcessSoakHarness -WorktreeRoot $WorktreeRoot
+    if ([string]::IsNullOrWhiteSpace([string]$harnessPath)) {
+        $holdJson = $script:phase3HarnessHold | ConvertTo-Json -Depth 16 -Compress
+        return [pscustomobject]@{
+            ExitCode = 78
+            Stdout = $holdJson
+            Stderr = ''
+            StdoutBytes = [Text.Encoding]::UTF8.GetByteCount($holdJson)
+            StderrBytes = 0
+        }
+    }
     $listInfo = [System.Diagnostics.ProcessStartInfo]::new()
-    $listInfo.FileName = Resolve-ProcessSoakHarness -WorktreeRoot $WorktreeRoot
+    $listInfo.FileName = [string]$harnessPath
     $listInfo.UseShellExecute = $false
     $listInfo.CreateNoWindow = $true
     $listInfo.RedirectStandardOutput = $true
@@ -120,6 +164,9 @@ function Invoke-ProcessSupervisorHarness {
 function Invoke-ProcessSupervisorTestList {
     param([Parameter(Mandatory = $true)][string]$WorktreeRoot)
     $listResult = Invoke-ProcessSupervisorHarness -WorktreeRoot $WorktreeRoot -Arguments @('--list') -TimeoutMilliseconds 120000
+    if ($listResult.ExitCode -eq 78 -and $null -ne $script:phase3HarnessHold) {
+        return $null
+    }
     if ($listResult.ExitCode -ne 0) {
         throw ("process-supervisor test-list preflight failed ({0}): {1}" -f $listResult.ExitCode, $listResult.Stderr.Trim())
     }
@@ -176,10 +223,10 @@ function Invoke-Phase3FinalUnion {
     $hostPath = Join-Path $WorktreeRoot 'target-live-native-next\devmanager-host.exe'
     $clientPath = Join-Path $WorktreeRoot 'target-live-native-next\devmanager-next.exe'
     if (-not (Test-Path -LiteralPath $hostPath -PathType Leaf)) {
-        return Set-Phase3FinalUnionHold -Reason "host executable is unavailable: $hostPath"
+        return Set-Phase3FinalUnionHold -Reason 'host executable is unavailable'
     }
     if (-not (Test-Path -LiteralPath $clientPath -PathType Leaf)) {
-        return Set-Phase3FinalUnionHold -Reason "client executable is unavailable: $clientPath"
+        return Set-Phase3FinalUnionHold -Reason 'client executable is unavailable'
     }
     $pwshCommands = @(
         Get-Command -Name 'pwsh' -All -CommandType Application -ErrorAction SilentlyContinue |
@@ -197,7 +244,9 @@ function Invoke-Phase3FinalUnion {
         -Label 'client' `
         -WorktreeRoot $WorktreeRoot
     $unionEntrypoint = Join-Path $PSScriptRoot 'Invoke-HostClientProcessSoak.ps1'
-    if (-not (Test-Path -LiteralPath $unionEntrypoint -PathType Leaf)) { throw 'final union host/client entrypoint is unavailable.' }
+    if (-not (Test-Path -LiteralPath $unionEntrypoint -PathType Leaf)) {
+        return Set-Phase3FinalUnionHold -Reason 'host/client soak entrypoint is unavailable'
+    }
     Assert-DevManagerPathHasNoReparsePoints -LiteralPath $unionEntrypoint
     $info = [Diagnostics.ProcessStartInfo]::new()
     $info.FileName = [IO.Path]::GetFullPath([string]$pwshCommands[0].Source)
@@ -285,6 +334,10 @@ try {
         Assert-DevManagerPhaseGateExecutionPlan -Plan $plan
     }
     $testCount = Invoke-ProcessSupervisorTestList -WorktreeRoot $worktreeRoot
+    if ($null -ne $script:phase3HarnessHold) {
+        Write-Output ($script:phase3HarnessHold | ConvertTo-Json -Depth 16 -Compress)
+        exit 78
+    }
     if ($ListOnly) {
         Write-Output ("{0} tests={1}" -f $phase, $testCount)
         exit 0
@@ -293,6 +346,10 @@ try {
     Write-Output ("{0} focused-tests={1}" -f $phase, $focusedTestCount)
 }
 catch {
+    if ($null -ne $script:phase3HarnessHold) {
+        Write-Output ($script:phase3HarnessHold | ConvertTo-Json -Depth 16 -Compress)
+        exit 78
+    }
     Write-Error -Message ("{0} unavailable/failed closed: {1}" -f $phase, $_.Exception.Message) -ErrorAction Continue
     exit 1
 }

@@ -394,7 +394,17 @@ function Invoke-BoundedFinalUnion {
     $systemRoot = [Environment]::GetEnvironmentVariable('SystemRoot', 'Process')
     if ([string]::IsNullOrWhiteSpace($systemRoot)) { throw 'final host/client union cannot establish SystemRoot.' }
     if (-not (Test-Path -LiteralPath $Entrypoint -PathType Leaf)) {
-        throw 'final host/client union entrypoint is unavailable.'
+        return [pscustomobject][ordered]@{
+            result = [pscustomobject][ordered]@{
+                schemaVersion = $schemaVersion
+                phase = $phase
+                status = 'hold'
+                launched = $false
+                error = 'HOLD: final host/client union entrypoint is unavailable.'
+            }
+            exitCode = 78
+            stderr = $null
+        }
     }
     Assert-DevManagerPathHasNoReparsePoints -LiteralPath $Entrypoint
     $canonicalEntrypoint = [IO.Path]::GetFullPath((Resolve-Path -LiteralPath $Entrypoint -ErrorAction Stop).Path)
@@ -420,6 +430,15 @@ function Invoke-BoundedFinalUnion {
         -TimeoutMilliseconds 600000 `
         -StdoutBytes $stdoutByteCap `
         -StderrBytes $stderrByteCap
+    if ($bounded.ExitCode -eq 78 -and $bounded.StderrBytes -eq 0) {
+        $holdLines = @($bounded.Stdout -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        if ($holdLines.Count -eq 1) {
+            $holdDocument = $holdLines[0] | ConvertFrom-Json
+            if ([string]$holdDocument.status -eq 'hold' -and [int]$holdDocument.schemaVersion -eq $schemaVersion) {
+                return [pscustomobject][ordered]@{ result = $holdDocument; exitCode = 78; stderr = $null }
+            }
+        }
+    }
     if ($bounded.ExitCode -ne 0 -or $bounded.StderrBytes -ne 0) {
         throw "final host/client union failed closed (exit=$($bounded.ExitCode) stderrBytes=$($bounded.StderrBytes))."
     }
@@ -546,8 +565,14 @@ try {
     else {
         $null
     }
-    $finalStatus = if ([string]$result.status -eq 'passed' -and $supervisorDocument.exitCode -eq 0) { 'passed' } else { 'failed' }
-    if ($finalStatus -ne 'passed') { $failure = 'Rust supervisor reported a failed or rejected cycle; no pass is inferred.' }
+    if ([string]$result.status -eq 'hold' -and $supervisorDocument.exitCode -eq 78) {
+        $finalStatus = 'hold'
+        $failure = ConvertTo-BoundedError $result.error
+    }
+    else {
+        $finalStatus = if ([string]$result.status -eq 'passed' -and $supervisorDocument.exitCode -eq 0) { 'passed' } else { 'failed' }
+        if ($finalStatus -ne 'passed') { $failure = 'Rust supervisor reported a failed or rejected cycle; no pass is inferred.' }
+    }
 }
 catch {
     $failure = ConvertTo-BoundedError $_.Exception.Message

@@ -6,8 +6,8 @@ use std::net::TcpListener;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver};
-use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 #[cfg(windows)]
@@ -34,6 +34,122 @@ const SUPERVISOR_MAX_ARGUMENTS: usize = 32;
 const SUPERVISOR_MAX_ARGUMENT_BYTES: usize = 512;
 const SUPERVISOR_MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 const SUPERVISOR_MAX_RESULT_BYTES: usize = 256 * 1024;
+#[cfg(windows)]
+const FINAL_UNION_SCHEMA_VERSION: u64 = 1;
+#[cfg(windows)]
+const FINAL_UNION_SEED: u64 = 3403;
+#[cfg(windows)]
+const FINAL_UNION_ITERATIONS: u64 = 100;
+#[cfg(windows)]
+const FINAL_UNION_MAX_HANDLE_GROWTH: u64 = 32;
+#[cfg(windows)]
+const FINAL_UNION_MAX_MEMORY_GROWTH_BYTES: u64 = 16 * 1024 * 1024;
+
+#[cfg(windows)]
+const FINAL_UNION_BOOLEAN_FIELDS: &[&str] = &[
+    "jobZero",
+    "releaseEligible",
+    "realLifecycle",
+    "externalListenersUnchanged",
+    "zeroOrphanProcesses",
+    "zeroHelperProcesses",
+    "zeroProviderProcesses",
+    "zeroJobMembers",
+    "zeroOwnedListeners",
+    "zeroNamedPipesExceptDeclaredHost",
+    "pipeReadersSettled",
+    "readerThreadsJoined",
+    "handleGrowthBounded",
+    "memoryGrowthBounded",
+];
+
+#[cfg(windows)]
+const FINAL_UNION_ZERO_COUNTER_FIELDS: &[&str] = &[
+    "orphanProcessCount",
+    "helperProcessCount",
+    "providerProcessCount",
+    "jobMemberCount",
+    "ownedListenerCount",
+    "unexpectedNamedPipeCount",
+];
+
+#[cfg(windows)]
+fn final_union_u64(document: &serde_json::Map<String, Value>, field: &str) -> Result<u64, String> {
+    document
+        .get(field)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| format!("final union field `{field}` must be an exact unsigned integer"))
+}
+
+#[cfg(windows)]
+fn final_union_bool(
+    document: &serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<bool, String> {
+    document
+        .get(field)
+        .and_then(Value::as_bool)
+        .ok_or_else(|| format!("final union field `{field}` must be a boolean"))
+}
+
+#[cfg(windows)]
+/// Validate the one release-facing final-union schema.  This is deliberately
+/// independent from the per-cycle supervisor schema: a partial or synthetic
+/// summary must never be promoted merely because it contains the old
+/// `jobZero`/`releaseEligible` pair.
+fn validate_final_union_document(value: &Value) -> Result<(), String> {
+    let document = value
+        .as_object()
+        .ok_or_else(|| "final union document must be a JSON object".to_string())?;
+    let schema_version = final_union_u64(document, "schemaVersion")?;
+    let seed = final_union_u64(document, "seed")?;
+    let iterations = final_union_u64(document, "iterations")?;
+    let completed_cycles = final_union_u64(document, "completedCycles")?;
+    if schema_version != FINAL_UNION_SCHEMA_VERSION {
+        return Err("final union schemaVersion must equal 1 exactly".to_string());
+    }
+    if seed != FINAL_UNION_SEED {
+        return Err("final union seed must equal 3403 exactly".to_string());
+    }
+    if iterations != FINAL_UNION_ITERATIONS {
+        return Err("final union iterations must equal 100 exactly".to_string());
+    }
+    if completed_cycles != FINAL_UNION_ITERATIONS {
+        return Err("final union completedCycles must equal 100 exactly".to_string());
+    }
+    if document.get("status").and_then(Value::as_str) != Some("passed") {
+        return Err("final union status must be passed".to_string());
+    }
+    for field in FINAL_UNION_BOOLEAN_FIELDS {
+        if !final_union_bool(document, field)? {
+            return Err(format!("final union field `{field}` must be true"));
+        }
+    }
+    for field in FINAL_UNION_ZERO_COUNTER_FIELDS {
+        if final_union_u64(document, field)? != 0 {
+            return Err(format!("final union field `{field}` must equal zero"));
+        }
+    }
+    let declared_host_pipe_count = final_union_u64(document, "declaredHostPipeCount")?;
+    if declared_host_pipe_count > 1 {
+        return Err("final union declaredHostPipeCount must be zero or one".to_string());
+    }
+    let handle_growth = final_union_u64(document, "handleGrowth")?;
+    if handle_growth > FINAL_UNION_MAX_HANDLE_GROWTH {
+        return Err(format!(
+            "final union handleGrowth exceeds {}-handle bound",
+            FINAL_UNION_MAX_HANDLE_GROWTH
+        ));
+    }
+    let memory_growth_bytes = final_union_u64(document, "memoryGrowthBytes")?;
+    if memory_growth_bytes > FINAL_UNION_MAX_MEMORY_GROWTH_BYTES {
+        return Err(format!(
+            "final union memoryGrowthBytes exceeds {}-byte bound",
+            FINAL_UNION_MAX_MEMORY_GROWTH_BYTES
+        ));
+    }
+    Ok(())
+}
 
 fn write_marker(path: &Path, value: impl AsRef<[u8]>) {
     fs::write(path, value).expect("write process-test marker");
@@ -1133,7 +1249,12 @@ fn pipe_closed(error: &io::Error) -> bool {
 }
 
 #[cfg(windows)]
-fn read_capped_pipe(handle: *mut c_void, cancelled: &AtomicBool, limit: usize) -> CappedOutput {
+fn read_capped_pipe(
+    handle: *mut c_void,
+    cancelled: &AtomicBool,
+    limit: usize,
+    deadline: Instant,
+) -> CappedOutput {
     // Anonymous-pipe reads may be synchronous and cannot be reliably
     // interrupted from another thread. Explicitly switch the inherited pipe
     // to PIPE_NOWAIT before polling availability; if that contract is not
@@ -1159,7 +1280,10 @@ fn read_capped_pipe(handle: *mut c_void, cancelled: &AtomicBool, limit: usize) -
         };
     }
     loop {
-        if cancelled.load(Ordering::Acquire) {
+        if cancelled.load(Ordering::Acquire) || Instant::now() >= deadline {
+            if Instant::now() >= deadline && !cancelled.load(Ordering::Acquire) {
+                truncated = true;
+            }
             break;
         }
 
@@ -1182,8 +1306,17 @@ fn read_capped_pipe(handle: *mut c_void, cancelled: &AtomicBool, limit: usize) -
             break;
         }
         if available == 0 {
+            if Instant::now() >= deadline {
+                truncated = true;
+                break;
+            }
             std::thread::sleep(Duration::from_millis(1));
             continue;
+        }
+
+        if Instant::now() >= deadline {
+            truncated = true;
+            break;
         }
 
         let requested = available.min(chunk.len() as u32);
@@ -1208,6 +1341,9 @@ fn read_capped_pipe(handle: *mut c_void, cancelled: &AtomicBool, limit: usize) -
             continue;
         }
 
+        if Instant::now() >= deadline {
+            truncated = true;
+        }
         let count = read_count as usize;
         total_bytes = total_bytes.saturating_add(read_count as u64);
         if bytes.len() < limit {
@@ -1227,17 +1363,39 @@ fn read_capped_pipe(handle: *mut c_void, cancelled: &AtomicBool, limit: usize) -
     }
 }
 
+type ReaderReap = (std::thread::JoinHandle<()>, Arc<AtomicBool>);
+
+fn reader_reaper() -> &'static Sender<ReaderReap> {
+    static REAPER: OnceLock<Sender<ReaderReap>> = OnceLock::new();
+    REAPER.get_or_init(|| {
+        let (sender, receiver) = mpsc::channel::<ReaderReap>();
+        std::thread::Builder::new()
+            .name("devmanager-capped-reader-reaper".to_string())
+            .spawn(move || {
+                while let Ok((thread, joined)) = receiver.recv() {
+                    let _ = thread.join();
+                    joined.store(true, Ordering::Release);
+                }
+            })
+            .expect("spawn capped-reader reaper");
+        sender
+    })
+}
+
 struct CappedReaderTask {
     receiver: Receiver<CappedOutput>,
     thread: Option<std::thread::JoinHandle<()>>,
+    deadline: Instant,
+    reaper_joined: Arc<AtomicBool>,
     #[cfg(windows)]
     reader_handle: Arc<AtomicUsize>,
     #[cfg(windows)]
     cancelled: Arc<AtomicBool>,
 }
 
-fn spawn_capped_reader(reader: fs::File, limit: usize) -> CappedReaderTask {
+fn spawn_capped_reader(reader: fs::File, limit: usize, deadline: Instant) -> CappedReaderTask {
     let (sender, receiver) = mpsc::sync_channel(1);
+    let reaper_joined = Arc::new(AtomicBool::new(false));
     #[cfg(windows)]
     let reader_handle = Arc::new(AtomicUsize::new(reader.as_raw_handle() as usize));
     #[cfg(windows)]
@@ -1246,9 +1404,16 @@ fn spawn_capped_reader(reader: fs::File, limit: usize) -> CappedReaderTask {
     let cancelled = Arc::new(AtomicBool::new(false));
     #[cfg(windows)]
     let worker_cancelled = Arc::clone(&cancelled);
+    #[cfg(windows)]
+    let worker_deadline = deadline.clone();
     let thread = std::thread::spawn(move || {
         #[cfg(windows)]
-        let output = read_capped_pipe(reader_raw as *mut c_void, &worker_cancelled, limit);
+        let output = read_capped_pipe(
+            reader_raw as *mut c_void,
+            &worker_cancelled,
+            limit,
+            worker_deadline,
+        );
         #[cfg(not(windows))]
         let output = read_capped(reader, limit);
         let _ = sender.send(output);
@@ -1256,6 +1421,8 @@ fn spawn_capped_reader(reader: fs::File, limit: usize) -> CappedReaderTask {
     CappedReaderTask {
         receiver,
         thread: Some(thread),
+        deadline,
+        reaper_joined,
         #[cfg(windows)]
         reader_handle,
         #[cfg(windows)]
@@ -1276,10 +1443,10 @@ fn receive_capped_reader(
 }
 
 impl CappedReaderTask {
-    fn cancel(&self, deadline: Instant, label: &str) -> Result<(), String> {
+    fn cancel(&self, label: &str) -> Result<(), String> {
         #[cfg(windows)]
         {
-            let expired = Instant::now() >= deadline;
+            let expired = Instant::now() >= self.deadline;
             self.cancelled.store(true, Ordering::Release);
             let reader_handle = self.reader_handle.swap(0, Ordering::SeqCst) as *mut c_void;
             let close_error = if reader_handle.is_null() {
@@ -1301,7 +1468,7 @@ impl CappedReaderTask {
         }
         #[cfg(not(windows))]
         {
-            let _ = (deadline, label);
+            let _ = label;
             if self
                 .thread
                 .as_ref()
@@ -1314,12 +1481,12 @@ impl CappedReaderTask {
         }
     }
 
-    fn join_until(&mut self, deadline: Instant, label: &str) -> Result<(), String> {
+    fn join_until(&mut self, label: &str) -> Result<(), String> {
         let Some(thread) = self.thread.as_mut() else {
             return Ok(());
         };
         while !thread.is_finished() {
-            let remaining = deadline.saturating_duration_since(Instant::now());
+            let remaining = self.deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Err(format!(
                     "{label} reader thread did not join before the absolute deadline"
@@ -1328,27 +1495,46 @@ impl CappedReaderTask {
             std::thread::sleep(remaining.min(Duration::from_millis(1)));
         }
         let thread = self.thread.take().expect("reader thread handle present");
-        thread
-            .join()
-            .map_err(|_| format!("{label} reader thread panicked"))
+        let joined = thread.join();
+        self.reaper_joined.store(true, Ordering::Release);
+        joined.map_err(|_| format!("{label} reader thread panicked"))
     }
 }
 
-fn finish_capped_reader(
-    mut task: CappedReaderTask,
-    deadline: Instant,
-    label: &str,
-) -> Result<CappedOutput, String> {
+impl Drop for CappedReaderTask {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        {
+            self.cancelled.store(true, Ordering::Release);
+            let reader_handle = self.reader_handle.swap(0, Ordering::SeqCst) as *mut c_void;
+            if !reader_handle.is_null() {
+                unsafe {
+                    let _ = CloseHandle(reader_handle);
+                }
+            }
+        }
+        if let Some(thread) = self.thread.take() {
+            // A timed-out join never consumes or detaches this handle. The
+            // process-wide reaper owns it until the worker has joined.
+            reader_reaper()
+                .send((thread, Arc::clone(&self.reaper_joined)))
+                .expect("capped-reader reaper is alive");
+        }
+    }
+}
+
+fn finish_capped_reader(mut task: CappedReaderTask, label: &str) -> Result<CappedOutput, String> {
     // Reserve a scheduler-safe slice of the caller's one absolute deadline for
     // cancellation, pipe-handle close (when the cancelled read unwinds), and
     // the bounded JoinHandle settlement. A receive timeout is never followed
     // by an unconditional join.
-    let receive_deadline = deadline
+    let receive_deadline = task
+        .deadline
         .checked_sub(Duration::from_millis(100))
-        .unwrap_or(deadline);
+        .unwrap_or(task.deadline);
     let output = receive_capped_reader(&task.receiver, receive_deadline, label);
-    let cancellation = task.cancel(deadline, label);
-    let joined = task.join_until(deadline, label);
+    let cancellation = task.cancel(label);
+    let joined = task.join_until(label);
     match (output, joined) {
         (Ok(output), Ok(())) if cancellation.is_ok() => Ok(output),
         (Err(error), Ok(())) if cancellation.is_ok() => Err(error),
@@ -1366,14 +1552,13 @@ fn finish_capped_reader(
 fn finish_capped_readers(
     stdout: CappedReaderTask,
     stderr: CappedReaderTask,
-    deadline: Instant,
     label: &str,
 ) -> Result<(CappedOutput, CappedOutput), String> {
     // Settle both owned readers even when the first one reports an error. A
     // short receive/cleanup failure must never skip the other inherited pipe
-    // handle and leave its worker detached.
-    let stdout_result = finish_capped_reader(stdout, deadline, &format!("{label} stdout"));
-    let stderr_result = finish_capped_reader(stderr, deadline, &format!("{label} stderr"));
+    // handle; an unfinished JoinHandle remains owned by the reaper.
+    let stdout_result = finish_capped_reader(stdout, &format!("{label} stdout"));
+    let stderr_result = finish_capped_reader(stderr, &format!("{label} stderr"));
     match (stdout_result, stderr_result) {
         (Ok(stdout), Ok(stderr)) => Ok((stdout, stderr)),
         (Err(stdout), Ok(_)) => Err(stdout),
@@ -2907,6 +3092,80 @@ mod windows_supervisor {
         }
     }
 
+    pub(super) fn final_schema_probe(kind: &str) -> Result<(), String> {
+        let mut document = json!({
+            "schemaVersion": FINAL_UNION_SCHEMA_VERSION,
+            "status": "passed",
+            "seed": FINAL_UNION_SEED,
+            "iterations": FINAL_UNION_ITERATIONS,
+            "completedCycles": FINAL_UNION_ITERATIONS,
+            "jobZero": true,
+            "releaseEligible": true,
+            "realLifecycle": true,
+            "externalListenersUnchanged": true,
+            "zeroOrphanProcesses": true,
+            "zeroHelperProcesses": true,
+            "zeroProviderProcesses": true,
+            "zeroJobMembers": true,
+            "zeroOwnedListeners": true,
+            "zeroNamedPipesExceptDeclaredHost": true,
+            "pipeReadersSettled": true,
+            "readerThreadsJoined": true,
+            "handleGrowthBounded": true,
+            "memoryGrowthBounded": true,
+            "orphanProcessCount": 0,
+            "helperProcessCount": 0,
+            "providerProcessCount": 0,
+            "jobMemberCount": 0,
+            "ownedListenerCount": 0,
+            "unexpectedNamedPipeCount": 0,
+            "declaredHostPipeCount": 1,
+            "handleGrowth": 0,
+            "memoryGrowthBytes": 0,
+        });
+        match kind {
+            "partial" => {
+                document
+                    .as_object_mut()
+                    .expect("final schema probe object")
+                    .remove("zeroProviderProcesses");
+            }
+            "wrong-seed" => document["seed"] = json!(3404),
+            "orphan" => document["orphanProcessCount"] = json!(1),
+            "memory-growth" => {
+                document["memoryGrowthBytes"] = json!(FINAL_UNION_MAX_MEMORY_GROWTH_BYTES + 1)
+            }
+            _ => {}
+        }
+        match super::validate_final_union_document(&document) {
+            Err(error) if kind != "valid" => {
+                println!(
+                    "{}",
+                    json!({
+                        "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
+                        "status": "passed",
+                        "validatorRejected": true,
+                        "error": error,
+                    })
+                );
+                Ok(())
+            }
+            Ok(()) if kind == "valid" => {
+                println!(
+                    "{}",
+                    json!({
+                        "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
+                        "status": "passed",
+                        "validatorAccepted": true,
+                    })
+                );
+                Ok(())
+            }
+            Ok(()) => Err(format!("{kind} final union document was accepted")),
+            Err(error) => Err(format!("valid final union document was rejected: {error}")),
+        }
+    }
+
     pub(super) fn membership_deadline_probe() -> Result<(), String> {
         let job = SupervisorJob::create()?;
         let deadline = Instant::now();
@@ -2935,11 +3194,11 @@ mod windows_supervisor {
         let (stdout_read, stdout_write, _stderr_read, stderr_write) = open_pipes()?;
         drop(stderr_write);
         let reader = unsafe { File::from_raw_handle(stdout_read.into_raw_handle()) };
-        let task = spawn_capped_reader(reader, 1024);
         let deadline = Instant::now()
             .checked_add(Duration::from_millis(2_000))
             .ok_or_else(|| "reader probe deadline overflow".to_string())?;
-        let result = finish_capped_reader(task, deadline, "reader-cancel-probe");
+        let task = spawn_capped_reader(reader, 1024, deadline);
+        let result = finish_capped_reader(task, "reader-cancel-probe");
         drop(stdout_write);
         match result {
             Err(error)
@@ -2963,6 +3222,54 @@ mod windows_supervisor {
             )),
             Ok(_) => Err("reader cancellation probe unexpectedly reached EOF".to_string()),
         }
+    }
+
+    pub(super) fn reader_reaper_probe() -> Result<(), String> {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let thread = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            let _ = sender.send(CappedOutput {
+                bytes: Vec::new(),
+                total_bytes: 0,
+                truncated: false,
+            });
+        });
+        let deadline = Instant::now();
+        let reaper_joined = Arc::new(AtomicBool::new(false));
+        let task = CappedReaderTask {
+            receiver,
+            thread: Some(thread),
+            deadline,
+            reaper_joined: Arc::clone(&reaper_joined),
+            reader_handle: Arc::new(AtomicUsize::new(0)),
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+        let result = finish_capped_reader(task, "reader-reaper-probe");
+        if result.is_ok() {
+            return Err("reader reaper probe unexpectedly joined before its deadline".to_string());
+        }
+        if reaper_joined.load(Ordering::Acquire) {
+            return Err("reader reaper probe consumed the timed-out JoinHandle".to_string());
+        }
+        let reaper_deadline = Instant::now()
+            .checked_add(Duration::from_secs(2))
+            .ok_or_else(|| "reader reaper probe deadline overflow".to_string())?;
+        while !reaper_joined.load(Ordering::Acquire) && Instant::now() < reaper_deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        if !reaper_joined.load(Ordering::Acquire) {
+            return Err("reader reaper did not join the timed-out worker".to_string());
+        }
+        println!(
+            "{}",
+            json!({
+                "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
+                "status": "passed",
+                "joinHandleRetainedOnTimeout": true,
+                "reaperJoined": true,
+            })
+        );
+        Ok(())
     }
 
     struct SpawnedChild {
@@ -3926,6 +4233,10 @@ mod windows_supervisor {
         baseline_digest: Option<String>,
         last_after_digest: Option<String>,
         all_external_listeners_unchanged: bool,
+        all_job_zero: bool,
+        all_reader_threads_joined: bool,
+        all_owned_listeners_zero: bool,
+        max_handle_growth: u64,
         first_error: Option<String>,
     }
 
@@ -3943,6 +4254,10 @@ mod windows_supervisor {
                 baseline_digest: None,
                 last_after_digest: None,
                 all_external_listeners_unchanged: true,
+                all_job_zero: true,
+                all_reader_threads_joined: true,
+                all_owned_listeners_zero: true,
+                max_handle_growth: 0,
                 first_error: None,
             }
         }
@@ -3977,6 +4292,37 @@ mod windows_supervisor {
                 },
             }));
             if let Some(audit_object) = audit.as_object() {
+                self.all_job_zero &= cycle["activeProcessZero"].as_bool().unwrap_or(false);
+                self.all_reader_threads_joined &= audit_object
+                    .get("readerThreadsJoined")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                self.all_owned_listeners_zero &= audit_object
+                    .get("ownedListenersAfter")
+                    .and_then(Value::as_array)
+                    .map(|listeners| listeners.is_empty())
+                    .unwrap_or(false);
+                let process_before = audit_object
+                    .get("processHandleCountBefore")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default();
+                let process_after = audit_object
+                    .get("processHandleCountAfter")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default();
+                let host_before = audit_object
+                    .get("hostProcessHandleCountBefore")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default();
+                let host_after = audit_object
+                    .get("hostProcessHandleCountAfter")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default();
+                self.max_handle_growth = self.max_handle_growth.max(
+                    process_after
+                        .saturating_sub(process_before)
+                        .max(host_after.saturating_sub(host_before)),
+                );
                 self.all_external_listeners_unchanged &= audit_object
                     .get("externalListenersUnchanged")
                     .and_then(Value::as_bool)
@@ -3993,6 +4339,9 @@ mod windows_supervisor {
                     .map(str::to_string);
             } else {
                 self.all_external_listeners_unchanged = false;
+                self.all_job_zero = false;
+                self.all_reader_threads_joined = false;
+                self.all_owned_listeners_zero = false;
             }
             if self.first_error.is_none() {
                 self.first_error = cycle["error"].as_str().map(redact_bounded_error);
@@ -4023,6 +4372,10 @@ mod windows_supervisor {
                 "cpuSamples": self.cpu_samples,
                 "conformance": self.conformance,
                 "externalListenersUnchanged": self.all_external_listeners_unchanged,
+                "jobZero": self.all_job_zero,
+                "readerThreadsJoined": self.all_reader_threads_joined,
+                "ownedListenersZero": self.all_owned_listeners_zero,
+                "handleGrowth": self.max_handle_growth,
                 "externalListenerBaselineDigest": self.baseline_digest,
                 "externalListenerLastAfterDigest": self.last_after_digest,
                 "firstError": self.first_error,
@@ -4304,6 +4657,7 @@ mod windows_supervisor {
                     stdout
                 },
                 manifest.budgets.stdout_bytes,
+                cleanup_deadline,
             );
             let stderr_reader = spawn_capped_reader(
                 {
@@ -4311,6 +4665,7 @@ mod windows_supervisor {
                     stderr
                 },
                 manifest.budgets.stderr_bytes,
+                cleanup_deadline,
             );
             let _reader_threads = (&stdout_reader, &stderr_reader);
             let mut outcome = "completed";
@@ -4414,21 +4769,17 @@ mod windows_supervisor {
                         }),
                     );
                     status = "failed";
-                    finish_capped_readers(
-                        stdout_reader,
-                        stderr_reader,
-                        cleanup_deadline,
-                        "wait-error",
-                    )
-                    .map_err(|error| {
-                        json!({
-                            "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
-                            "status": "rejected",
-                            "revision": manifest.revision,
-                            "launched": true,
-                            "error": format!("reader cleanup failed after wait error: {error}"),
-                        })
-                    })?;
+                    finish_capped_readers(stdout_reader, stderr_reader, "wait-error").map_err(
+                        |error| {
+                            json!({
+                                "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
+                                "status": "rejected",
+                                "revision": manifest.revision,
+                                "launched": true,
+                                "error": format!("reader cleanup failed after wait error: {error}"),
+                            })
+                        },
+                    )?;
                     break;
                 }
             };
@@ -4466,17 +4817,16 @@ mod windows_supervisor {
                     }
                 }
             }
-            let (stdout, stderr) =
-                finish_capped_readers(stdout_reader, stderr_reader, cleanup_deadline, "cycle")
-                    .map_err(|error| {
-                        json!({
-                            "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
-                            "status": "rejected",
-                            "revision": manifest.revision,
-                            "launched": true,
-                            "error": error,
-                        })
-                    })?;
+            let (stdout, stderr) = finish_capped_readers(stdout_reader, stderr_reader, "cycle")
+                .map_err(|error| {
+                    json!({
+                        "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
+                        "status": "rejected",
+                        "revision": manifest.revision,
+                        "launched": true,
+                        "error": error,
+                    })
+                })?;
             let process_cpu_time = process_cpu_time_100ns(
                 child.process.as_raw_handle() as _,
                 child.root_identity.process_id,
@@ -4782,7 +5132,7 @@ mod windows_supervisor {
         let completed_cycles = aggregate.count;
         let cycle_aggregate = aggregate.finish();
         let real_lifecycle = !synthetic;
-        let release_eligible = real_lifecycle
+        let release_candidate = real_lifecycle
             && status == "passed"
             && manifest.iterations == 100
             && completed_cycles == 100
@@ -4790,6 +5140,45 @@ mod windows_supervisor {
             && manifest.host_sha256.is_some()
             && manifest.client_executable.is_some()
             && manifest.client_sha256.is_some();
+        let mut final_union_document = json!({
+            "schemaVersion": FINAL_UNION_SCHEMA_VERSION,
+            "status": status,
+            "seed": manifest.seed,
+            "iterations": manifest.iterations,
+            "completedCycles": completed_cycles,
+            "jobZero": cycle_aggregate["jobZero"],
+            "releaseEligible": release_candidate,
+            "realLifecycle": real_lifecycle,
+            "externalListenersUnchanged": cycle_aggregate["externalListenersUnchanged"],
+            "zeroOrphanProcesses": cycle_aggregate["jobZero"],
+            "zeroHelperProcesses": cycle_aggregate["jobZero"],
+            "zeroProviderProcesses": cycle_aggregate["jobZero"],
+            "zeroJobMembers": cycle_aggregate["jobZero"],
+            "zeroOwnedListeners": cycle_aggregate["ownedListenersZero"],
+            // The fixed Rust supervisor only owns anonymous stdout/stderr
+            // pipes. Host-pipe enumeration belongs to the real union, so a
+            // supervisor-only summary cannot claim this release invariant.
+            "zeroNamedPipesExceptDeclaredHost": false,
+            "pipeReadersSettled": cycle_aggregate["readerThreadsJoined"],
+            "readerThreadsJoined": cycle_aggregate["readerThreadsJoined"],
+            "handleGrowthBounded": cycle_aggregate["handleGrowth"]
+                .as_u64()
+                .map(|growth| growth <= FINAL_UNION_MAX_HANDLE_GROWTH)
+                .unwrap_or(false),
+            "memoryGrowthBounded": false,
+            "orphanProcessCount": if cycle_aggregate["jobZero"] == true { 0 } else { 1 },
+            "helperProcessCount": if cycle_aggregate["jobZero"] == true { 0 } else { 1 },
+            "providerProcessCount": if cycle_aggregate["jobZero"] == true { 0 } else { 1 },
+            "jobMemberCount": if cycle_aggregate["jobZero"] == true { 0 } else { 1 },
+            "ownedListenerCount": if cycle_aggregate["ownedListenersZero"] == true { 0 } else { 1 },
+            "unexpectedNamedPipeCount": 0,
+            "declaredHostPipeCount": 0,
+            "handleGrowth": cycle_aggregate["handleGrowth"],
+            "memoryGrowthBytes": 0,
+        });
+        let release_eligible =
+            release_candidate && validate_final_union_document(&final_union_document).is_ok();
+        final_union_document["releaseEligible"] = json!(release_eligible);
         Ok(json!({
             "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
             "status": status,
@@ -4802,7 +5191,30 @@ mod windows_supervisor {
             "completedCycles": completed_cycles,
             "realLifecycle": real_lifecycle,
             "releaseEligible": release_eligible,
-            "releaseHold": if release_eligible { Value::Null } else { json!("requires 100 completed real cycles and caller-pinned host/client identities") },
+            "jobZero": final_union_document["jobZero"],
+            "externalListenersUnchanged": final_union_document["externalListenersUnchanged"],
+            "zeroOrphanProcesses": final_union_document["zeroOrphanProcesses"],
+            "zeroHelperProcesses": final_union_document["zeroHelperProcesses"],
+            "zeroProviderProcesses": final_union_document["zeroProviderProcesses"],
+            "zeroJobMembers": final_union_document["zeroJobMembers"],
+            "zeroOwnedListeners": final_union_document["zeroOwnedListeners"],
+            "zeroNamedPipesExceptDeclaredHost": final_union_document
+                ["zeroNamedPipesExceptDeclaredHost"],
+            "pipeReadersSettled": final_union_document["pipeReadersSettled"],
+            "readerThreadsJoined": final_union_document["readerThreadsJoined"],
+            "handleGrowthBounded": final_union_document["handleGrowthBounded"],
+            "memoryGrowthBounded": final_union_document["memoryGrowthBounded"],
+            "orphanProcessCount": final_union_document["orphanProcessCount"],
+            "helperProcessCount": final_union_document["helperProcessCount"],
+            "providerProcessCount": final_union_document["providerProcessCount"],
+            "jobMemberCount": final_union_document["jobMemberCount"],
+            "ownedListenerCount": final_union_document["ownedListenerCount"],
+            "unexpectedNamedPipeCount": final_union_document["unexpectedNamedPipeCount"],
+            "declaredHostPipeCount": final_union_document["declaredHostPipeCount"],
+            "handleGrowth": final_union_document["handleGrowth"],
+            "memoryGrowthBytes": final_union_document["memoryGrowthBytes"],
+            "releaseHold": if release_eligible { Value::Null } else { json!("requires 100 completed real cycles, caller-pinned host/client identities, and exact final-union cleanup evidence") },
+            "finalUnion": final_union_document,
             "ansiCorpus": ansi_corpus,
             "cycles": cycles,
             "cycleAggregate": cycle_aggregate,
@@ -5328,10 +5740,12 @@ mod windows_supervisor {
         let stdout_receiver = spawn_capped_reader(
             child.stdout.take().expect("wrapper stdout pipe"),
             SUPERVISOR_MAX_RESULT_BYTES,
+            cleanup_deadline,
         );
         let stderr_receiver = spawn_capped_reader(
             child.stderr.take().expect("wrapper stderr pipe"),
             SUPERVISOR_MAX_OUTPUT_BYTES,
+            cleanup_deadline,
         );
         let exit_code = match wait_process(child.process.as_raw_handle() as _, wrapper_deadline) {
             Ok(Some(code)) => code,
@@ -5349,16 +5763,10 @@ mod windows_supervisor {
                         "bounded supervisor timeout Job settlement failed: cleanup={cleanup:?}; active-members={members:?}"
                     )),
                 };
-                let stdout_join = finish_capped_reader(
-                    stdout_receiver,
-                    cleanup_deadline,
-                    "bounded supervisor stdout",
-                );
-                let stderr_join = finish_capped_reader(
-                    stderr_receiver,
-                    cleanup_deadline,
-                    "bounded supervisor stderr",
-                );
+                let stdout_join =
+                    finish_capped_reader(stdout_receiver, "bounded supervisor stdout");
+                let stderr_join =
+                    finish_capped_reader(stderr_receiver, "bounded supervisor stderr");
                 let readers_joined = stdout_join.is_ok() && stderr_join.is_ok();
                 drop(child);
                 return (
@@ -5394,16 +5802,10 @@ mod windows_supervisor {
                         "bounded supervisor wait-error Job settlement failed: cleanup={cleanup:?}; active-members={members:?}"
                     )),
                 };
-                let stdout_join = finish_capped_reader(
-                    stdout_receiver,
-                    cleanup_deadline,
-                    "bounded supervisor stdout",
-                );
-                let stderr_join = finish_capped_reader(
-                    stderr_receiver,
-                    cleanup_deadline,
-                    "bounded supervisor stderr",
-                );
+                let stdout_join =
+                    finish_capped_reader(stdout_receiver, "bounded supervisor stdout");
+                let stderr_join =
+                    finish_capped_reader(stderr_receiver, "bounded supervisor stderr");
                 let readers_joined = stdout_join.is_ok() && stderr_join.is_ok();
                 drop(child);
                 return (
@@ -5443,16 +5845,8 @@ mod windows_supervisor {
                 zero
             }
         };
-        let stdout = finish_capped_reader(
-            stdout_receiver,
-            cleanup_deadline,
-            "bounded supervisor stdout",
-        );
-        let stderr = finish_capped_reader(
-            stderr_receiver,
-            cleanup_deadline,
-            "bounded supervisor stderr",
-        );
+        let stdout = finish_capped_reader(stdout_receiver, "bounded supervisor stdout");
+        let stderr = finish_capped_reader(stderr_receiver, "bounded supervisor stderr");
         drop(child);
         let stdout = match stdout {
             Ok(output) if !output.truncated => output,
@@ -5702,6 +6096,30 @@ fn main() {
             #[cfg(not(windows))]
             {
                 Err("reader cancellation probe requires Windows pipe cancellation".to_string())
+            }
+        }
+        "final-schema-probe" => {
+            #[cfg(windows)]
+            {
+                let kind = args
+                    .next()
+                    .and_then(|value| value.into_string().ok())
+                    .unwrap_or_else(|| "valid".to_string());
+                windows_supervisor::final_schema_probe(&kind)
+            }
+            #[cfg(not(windows))]
+            {
+                Err("final schema probe requires Windows process-soak evidence".to_string())
+            }
+        }
+        "reader-reaper-probe" => {
+            #[cfg(windows)]
+            {
+                windows_supervisor::reader_reaper_probe()
+            }
+            #[cfg(not(windows))]
+            {
+                Err("reader reaper probe requires Windows pipe cancellation".to_string())
             }
         }
         "supervise" => {

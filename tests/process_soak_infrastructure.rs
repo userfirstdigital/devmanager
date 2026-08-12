@@ -1472,9 +1472,30 @@ function New-UnionResult([object]$schema, [object]$iterations) {{
     [pscustomobject]@{{
         schemaVersion = $schema
         status = 'passed'
+        seed = 3403
         jobZero = $true
         releaseEligible = $true
         realLifecycle = $true
+        externalListenersUnchanged = $true
+        zeroOrphanProcesses = $true
+        zeroHelperProcesses = $true
+        zeroProviderProcesses = $true
+        zeroJobMembers = $true
+        zeroOwnedListeners = $true
+        zeroNamedPipesExceptDeclaredHost = $true
+        pipeReadersSettled = $true
+        readerThreadsJoined = $true
+        handleGrowthBounded = $true
+        memoryGrowthBounded = $true
+        orphanProcessCount = 0
+        helperProcessCount = 0
+        providerProcessCount = 0
+        jobMemberCount = 0
+        ownedListenerCount = 0
+        unexpectedNamedPipeCount = 0
+        declaredHostPipeCount = 1
+        handleGrowth = 0
+        memoryGrowthBytes = 0
         completedCycles = 100
         iterations = $iterations
     }}
@@ -1485,6 +1506,27 @@ foreach ($invalid in @((New-UnionResult 2 100), (New-UnionResult 1 99), (New-Uni
         throw 'invalid final union document was accepted'
     }} catch [System.Management.Automation.RuntimeException] {{
         if ($_.Exception.Message -eq 'invalid final union document was accepted') {{ throw }}
+    }}
+}}
+$required = @(
+    'schemaVersion', 'status', 'seed', 'iterations', 'completedCycles',
+    'jobZero', 'releaseEligible', 'realLifecycle', 'externalListenersUnchanged',
+    'zeroOrphanProcesses', 'zeroHelperProcesses', 'zeroProviderProcesses',
+    'zeroJobMembers', 'zeroOwnedListeners', 'zeroNamedPipesExceptDeclaredHost',
+    'pipeReadersSettled', 'readerThreadsJoined', 'handleGrowthBounded',
+    'memoryGrowthBounded', 'orphanProcessCount', 'helperProcessCount',
+    'providerProcessCount', 'jobMemberCount', 'ownedListenerCount',
+    'unexpectedNamedPipeCount', 'declaredHostPipeCount', 'handleGrowth',
+    'memoryGrowthBytes'
+)
+foreach ($missing in $required) {{
+    $invalid = New-UnionResult 1 100
+    [void]$invalid.PSObject.Properties.Remove($missing)
+    try {{
+        Assert-DevManagerPhase3FinalUnionDocument -Document $invalid
+        throw "partial final union document was accepted: $missing"
+    }} catch [System.Management.Automation.RuntimeException] {{
+        if ($_.Exception.Message -eq "partial final union document was accepted: $missing") {{ throw }}
     }}
 }}
 Assert-DevManagerPhase3FinalUnionDocument -Document (New-UnionResult 1 100)
@@ -1503,6 +1545,81 @@ Write-Output PASS
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("PASS"));
+}
+
+#[cfg(windows)]
+#[test]
+fn rust_final_schema_validator_rejects_a_crafted_partial_document() {
+    for kind in ["valid", "partial", "wrong-seed", "orphan", "memory-growth"] {
+        let captured = run_helper(&["final-schema-probe", kind]);
+        assert!(
+            captured.status.success(),
+            "Rust final schema probe ({kind}) failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&captured.stdout),
+            String::from_utf8_lossy(&captured.stderr)
+        );
+        let events = parse_json_lines(&captured.stdout);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["status"], "passed");
+        if kind == "valid" {
+            assert_eq!(events[0]["validatorAccepted"], true);
+        } else {
+            assert_eq!(events[0]["validatorRejected"], true);
+            assert!(events[0]["error"].as_str().is_some());
+        }
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn rust_reader_reaper_probe_keeps_a_timed_out_join_owned() {
+    let started = Instant::now();
+    let captured = run_helper(&["reader-reaper-probe"]);
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "reader reaper probe exceeded its bounded harness: {:?}",
+        started.elapsed()
+    );
+    assert!(
+        captured.status.success(),
+        "reader reaper probe failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&captured.stdout),
+        String::from_utf8_lossy(&captured.stderr)
+    );
+    let events = parse_json_lines(&captured.stdout);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["status"], "passed");
+    assert_eq!(events[0]["joinHandleRetainedOnTimeout"], true);
+    assert_eq!(events[0]["reaperJoined"], true);
+}
+
+#[cfg(windows)]
+#[test]
+fn outer_phase_gate_publishes_missing_harness_as_a_redacted_typed_hold() {
+    let worktree = std::env::current_dir().expect("current worktree");
+    let harness_root = tempfile::tempdir_in(&worktree).expect("create empty harness root");
+    let script = worktree.join("scripts/native-next/Invoke-Phase3ProcessSupervisorGate.ps1");
+    let output = Command::new("pwsh")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            script.to_str().expect("outer gate script path"),
+            "-ListOnly",
+        ])
+        .env("DEVMANAGER_PHASE3_SOAK_HARNESS_ROOT", harness_root.path())
+        .output()
+        .expect("run missing harness outer hold");
+    assert_eq!(output.status.code(), Some(78));
+    let lines = parse_json_lines(&output.stdout);
+    assert_eq!(lines.len(), 1, "outer gate must publish one typed HOLD");
+    assert_eq!(lines[0]["schemaVersion"], 1);
+    assert_eq!(lines[0]["status"], "hold");
+    assert_eq!(lines[0]["launched"], false);
+    let error = lines[0]["error"].as_str().unwrap_or_default();
+    assert!(error.contains("HOLD"));
+    assert!(!error.contains("C:\\"));
+    assert!(!error.contains("target-native-next"));
 }
 
 #[cfg(windows)]
@@ -1528,10 +1645,10 @@ fn missing_final_union_binaries_publish_a_typed_hold_without_launching_100_cycle
     assert_eq!(lines[0]["schemaVersion"], 1);
     assert_eq!(lines[0]["status"], "hold");
     assert_eq!(lines[0]["launched"], false);
-    assert!(lines[0]["error"]
-        .as_str()
-        .unwrap_or_default()
-        .contains("HOLD"));
+    let error = lines[0]["error"].as_str().unwrap_or_default();
+    assert!(error.contains("HOLD"));
+    assert!(!error.contains("C:\\"));
+    assert!(!error.contains("target-live-native-next"));
 }
 
 #[cfg(windows)]
@@ -1540,7 +1657,7 @@ fn outer_phase_gate_publishes_missing_binary_hold_before_any_production_guard() 
     let worktree = std::env::current_dir().expect("current worktree");
     let live_root = worktree.join("target-live-native-next");
     if live_root.join("devmanager-host.exe").is_file()
-        || live_root.join("devmanager-next.exe").is_file()
+        && live_root.join("devmanager-next.exe").is_file()
     {
         eprintln!("skipping missing-binary outer-gate probe: live inputs are present");
         return;
@@ -1563,8 +1680,8 @@ fn outer_phase_gate_publishes_missing_binary_hold_before_any_production_guard() 
     assert_eq!(lines[0]["schemaVersion"], 1);
     assert_eq!(lines[0]["status"], "hold");
     assert_eq!(lines[0]["launched"], false);
-    assert!(lines[0]["error"]
-        .as_str()
-        .unwrap_or_default()
-        .contains("HOLD"));
+    let error = lines[0]["error"].as_str().unwrap_or_default();
+    assert!(error.contains("HOLD"));
+    assert!(!error.contains("C:\\"));
+    assert!(!error.contains("target-live-native-next"));
 }

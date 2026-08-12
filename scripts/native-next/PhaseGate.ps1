@@ -694,7 +694,13 @@ function Assert-DevManagerPhase3FinalUnionDocument {
         [byte], [sbyte], [int16], [uint16], [int32], [uint32],
         [int64], [uint64], [single], [double], [decimal]
     )
-    foreach ($property in @('schemaVersion', 'iterations', 'completedCycles')) {
+    $numericProperties = @(
+        'schemaVersion', 'seed', 'iterations', 'completedCycles',
+        'orphanProcessCount', 'helperProcessCount', 'providerProcessCount',
+        'jobMemberCount', 'ownedListenerCount', 'unexpectedNamedPipeCount',
+        'declaredHostPipeCount', 'handleGrowth', 'memoryGrowthBytes'
+    )
+    foreach ($property in $numericProperties) {
         $entry = $Document.PSObject.Properties[$property]
         if ($null -eq $entry -or $null -eq $entry.Value) {
             throw "final union document is missing $property."
@@ -709,22 +715,58 @@ function Assert-DevManagerPhase3FinalUnionDocument {
     if ([int64]$Document.schemaVersion -ne 1) {
         throw "final union schemaVersion must equal 1 exactly."
     }
+    if ([int64]$Document.seed -ne 3403) {
+        throw "final union seed must equal 3403 exactly."
+    }
     if ([int64]$Document.iterations -ne 100) {
         throw "final union iterations must equal 100 exactly."
     }
     if ([int64]$Document.completedCycles -ne 100) {
         throw "final union completedCycles must equal 100 exactly."
     }
-    foreach ($property in @('status', 'jobZero', 'releaseEligible', 'realLifecycle')) {
+    $booleanProperties = @(
+        'jobZero', 'releaseEligible', 'realLifecycle', 'externalListenersUnchanged',
+        'zeroOrphanProcesses', 'zeroHelperProcesses', 'zeroProviderProcesses',
+        'zeroJobMembers', 'zeroOwnedListeners', 'zeroNamedPipesExceptDeclaredHost',
+        'pipeReadersSettled', 'readerThreadsJoined', 'handleGrowthBounded',
+        'memoryGrowthBounded'
+    )
+    foreach ($property in @('status') + $booleanProperties) {
         if ($null -eq $Document.PSObject.Properties[$property]) {
             throw "final union document is missing $property."
         }
     }
-    if ([string]$Document.status -ne 'passed' -or
-        $Document.jobZero -ne $true -or
-        $Document.releaseEligible -ne $true -or
-        $Document.realLifecycle -ne $true) {
+    if ([string]$Document.status -ne 'passed') {
         throw 'final union document did not prove passed, Job-zero, real-lifecycle release eligibility.'
+    }
+    foreach ($property in $booleanProperties) {
+        if ($Document.$property -ne $true) {
+            throw "final union $property must be true."
+        }
+    }
+    foreach ($property in @(
+            'orphanProcessCount', 'helperProcessCount', 'providerProcessCount',
+            'jobMemberCount', 'ownedListenerCount', 'unexpectedNamedPipeCount')) {
+        if ([int64]$Document.$property -lt 0) {
+            throw "final union $property must not be negative."
+        }
+        if ([int64]$Document.$property -ne 0) {
+            throw "final union $property must equal zero."
+        }
+    }
+    if ([int64]$Document.declaredHostPipeCount -lt 0 -or
+        [int64]$Document.handleGrowth -lt 0 -or
+        [int64]$Document.memoryGrowthBytes -lt 0) {
+        throw 'final union pipe, handle, and memory counts must not be negative.'
+    }
+    if ([int64]$Document.declaredHostPipeCount -gt 1) {
+        throw 'final union declaredHostPipeCount must be zero or one.'
+    }
+    if ([int64]$Document.handleGrowth -gt 32) {
+        throw 'final union handleGrowth exceeds the 32-handle bound.'
+    }
+    if ([int64]$Document.memoryGrowthBytes -gt 16MB) {
+        throw 'final union memoryGrowthBytes exceeds the 16 MiB bound.'
     }
     return $Document
 }
