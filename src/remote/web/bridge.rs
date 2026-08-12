@@ -178,48 +178,50 @@ pub(crate) async fn connect_ws_handler(
     inner
         .connect_encryption_required
         .store(true, Ordering::Release);
-    match crate::connect::ConnectProductionSession::open() {
-        Ok(session) => match session.identity_store().identity_live_state() {
-            Ok(crate::connect::ConnectIdentityLiveState::Live) => {}
-            Ok(crate::connect::ConnectIdentityLiveState::Pending) => {
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    crate::connect::ConnectStartupError::Production(
-                        crate::connect::ConnectProductionError::Identity(
-                            crate::connect::IdentityError::TransitionPending,
-                        ),
-                    )
-                    .to_string(),
+    let Some(connect_startup) = state.connect_startup.clone() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Connect production startup is unavailable; refusing plaintext fallback",
+        )
+            .into_response();
+    };
+    match connect_startup
+        .session()
+        .identity_store()
+        .identity_live_state()
+    {
+        Ok(crate::connect::ConnectIdentityLiveState::Live) => {}
+        Ok(crate::connect::ConnectIdentityLiveState::Pending) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                crate::connect::ConnectStartupError::Production(
+                    crate::connect::ConnectProductionError::Identity(
+                        crate::connect::IdentityError::TransitionPending,
+                    ),
                 )
-                    .into_response();
-            }
-            Ok(crate::connect::ConnectIdentityLiveState::Absent) => {
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    crate::connect::ConnectStartupError::Production(
-                        crate::connect::ConnectProductionError::Identity(
-                            crate::connect::IdentityError::NotEnabled,
-                        ),
-                    )
-                    .to_string(),
+                .to_string(),
+            )
+                .into_response();
+        }
+        Ok(crate::connect::ConnectIdentityLiveState::Absent) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                crate::connect::ConnectStartupError::Production(
+                    crate::connect::ConnectProductionError::Identity(
+                        crate::connect::IdentityError::NotEnabled,
+                    ),
                 )
-                    .into_response();
-            }
-            Err(error) => {
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    crate::connect::ConnectStartupError::Production(
-                        crate::connect::ConnectProductionError::Identity(error),
-                    )
-                    .to_string(),
-                )
-                    .into_response();
-            }
-        },
+                .to_string(),
+            )
+                .into_response();
+        }
         Err(error) => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
-                crate::connect::ConnectStartupError::Production(error).to_string(),
+                crate::connect::ConnectStartupError::Production(
+                    crate::connect::ConnectProductionError::Identity(error),
+                )
+                .to_string(),
             )
                 .into_response();
         }
@@ -227,13 +229,29 @@ pub(crate) async fn connect_ws_handler(
     let inner = Arc::downgrade(&inner);
     ws.max_message_size(CONNECT_WS_MAX_FRAME_BYTES)
         .max_frame_size(CONNECT_WS_MAX_FRAME_BYTES)
-        .on_upgrade(move |socket| run_connect_session(socket, inner))
+        .on_upgrade(move |socket| run_connect_session(socket, inner, connect_startup))
 }
 
 fn admit_connect_ws_request(state: &WebState, headers: &HeaderMap) -> Result<(), Response> {
-    if !request_is_same_origin(headers) {
-        return Err((StatusCode::FORBIDDEN, "cross-origin websocket rejected").into_response());
-    }
+    // The Noise handshake authenticates the peer, but it is not a substitute
+    // for the host's paired-browser admission.  Keep the cookie check in the
+    // HTTP upgrade path so an unauthenticated socket can never reach the
+    // handshake or payload dispatcher.
+    authorize_ws_request(state, headers).map_err(|status| match status {
+        StatusCode::FORBIDDEN => {
+            (StatusCode::FORBIDDEN, "cross-origin websocket rejected").into_response()
+        }
+        StatusCode::INTERNAL_SERVER_ERROR => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "authentication state unavailable",
+        )
+            .into_response(),
+        _ => (
+            StatusCode::UNAUTHORIZED,
+            "missing or invalid web auth cookie",
+        )
+            .into_response(),
+    })?;
     let Some(inner) = state.upgrade_inner() else {
         return Err((StatusCode::INTERNAL_SERVER_ERROR, "host unavailable").into_response());
     };
@@ -247,10 +265,7 @@ fn admit_connect_ws_request(state: &WebState, headers: &HeaderMap) -> Result<(),
     let referer = headers
         .get(axum::http::header::REFERER)
         .and_then(|value| value.to_str().ok());
-    let query = headers
-        .get(axum::http::header::SEC_WEBSOCKET_PROTOCOL)
-        .and_then(|value| value.to_str().ok());
-    let _ = query;
+    let scheme = connect_request_scheme(headers);
     let policy =
         if crate::connect::is_trustworthy_loopback_host(host.split(':').next().unwrap_or(host)) {
             crate::connect::DirectBindPolicy::loopback()
@@ -260,7 +275,7 @@ fn admit_connect_ws_request(state: &WebState, headers: &HeaderMap) -> Result<(),
     let view = crate::connect::DirectRequestView {
         method: "GET",
         path: "/api/connect",
-        scheme: "http",
+        scheme,
         host,
         origin,
         referer,
@@ -281,20 +296,70 @@ fn admit_connect_ws_request(state: &WebState, headers: &HeaderMap) -> Result<(),
     Ok(())
 }
 
-async fn run_connect_session(mut socket: WebSocket, inner: Weak<RemoteHostInner>) {
+/// Determine the HTTP scheme that was used for the WebSocket upgrade.
+///
+/// Axum's upgrade extractor intentionally exposes the HTTP request but not a
+/// TLS flag.  A reverse proxy therefore has to carry the original scheme in
+/// Forwarded/X-Forwarded-Proto; for direct browser connections the Origin is
+/// the authoritative browser-visible scheme.  Only the two schemes supported
+/// by the direct admission policy are accepted, and malformed forwarding
+/// metadata fails closed to `http` (which is valid only for loopback).
+fn connect_request_scheme(headers: &HeaderMap) -> &'static str {
+    fn normalize(value: &str) -> Option<&'static str> {
+        match value
+            .trim()
+            .split(',')
+            .next()?
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "http" => Some("http"),
+            "https" => Some("https"),
+            _ => None,
+        }
+    }
+
+    if let Some(value) = headers
+        .get("forwarded")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| {
+            value.split(';').find_map(|part| {
+                let (key, value) = part.trim().split_once('=')?;
+                key.trim().eq_ignore_ascii_case("proto").then_some(value)
+            })
+        })
+        .and_then(normalize)
+    {
+        return value;
+    }
+    if let Some(value) = headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .and_then(normalize)
+    {
+        return value;
+    }
+    headers
+        .get(axum::http::header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split_once("://").map(|(scheme, _)| scheme))
+        .and_then(normalize)
+        .unwrap_or("http")
+}
+
+async fn run_connect_session(
+    mut socket: WebSocket,
+    inner: Weak<RemoteHostInner>,
+    connect_startup: std::sync::Arc<crate::connect::ConnectProductionStartup>,
+) {
     let Some(inner) = inner.upgrade() else {
         return;
     };
     inner
         .connect_encryption_required
         .store(true, Ordering::Release);
-    let session = match crate::connect::ConnectProductionSession::open() {
-        Ok(session) => session,
-        Err(_) => {
-            let _ = socket.close().await;
-            return;
-        }
-    };
+    let session = connect_startup.session();
     if !matches!(
         session.identity_store().identity_live_state(),
         Ok(crate::connect::ConnectIdentityLiveState::Live)
@@ -5363,6 +5428,7 @@ mod tests {
                 .native_runtime_generation
                 .load(Ordering::Acquire),
             pairing_attempts: Arc::new(std::sync::Mutex::new(Default::default())),
+            connect_startup: None,
         };
         let config = service.config();
         let signed = super::super::sign_cookie(&config.web.cookie_secret_hex, "paired-browser")
@@ -5393,6 +5459,39 @@ mod tests {
             authorize_ws_request(&state, &headers),
             Err(StatusCode::FORBIDDEN)
         );
+    }
+
+    #[test]
+    fn connect_request_scheme_prefers_forwarded_tls_and_origin_fallback() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::ORIGIN,
+            "https://devmanager.test".parse().unwrap(),
+        );
+        assert_eq!(connect_request_scheme(&headers), "https");
+
+        headers.insert("x-forwarded-proto", "http, https".parse().unwrap());
+        assert_eq!(connect_request_scheme(&headers), "http");
+
+        headers.insert("forwarded", "for=192.0.2.7;proto=https".parse().unwrap());
+        assert_eq!(connect_request_scheme(&headers), "https");
+    }
+
+    #[test]
+    fn connect_upgrade_requires_the_paired_browser_cookie_before_noise() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let state = WebState {
+            inner: Arc::downgrade(&service.inner),
+            listener_generation: service
+                .inner
+                .native_runtime_generation
+                .load(Ordering::Acquire),
+            pairing_attempts: Arc::new(std::sync::Mutex::new(Default::default())),
+            connect_startup: None,
+        };
+        let response = admit_connect_ws_request(&state, &HeaderMap::new())
+            .expect_err("Connect must not reach Noise without browser admission");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[test]

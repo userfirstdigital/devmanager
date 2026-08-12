@@ -483,6 +483,10 @@ pub struct WebListenerHandle {
     push_inner: std::sync::Weak<RemoteHostInner>,
     push_dispatcher: Option<push::PushDispatcher>,
     push_sender: Option<push::PushSender>,
+    /// The production Connect session is owned by the listener generation.
+    /// Keeping it here prevents startup custody from being prepared and then
+    /// immediately dropped while the route opens a second, untracked session.
+    connect_startup: Option<std::sync::Arc<crate::connect::ConnectProductionStartup>>,
     listener_generation: u64,
     pub bind_info: String,
 }
@@ -569,10 +573,20 @@ impl WebListenerHandle {
         let (bind_result_tx, bind_result_rx) =
             std::sync::mpsc::channel::<Result<(), ListenerBindFailure>>();
 
+        let connect_startup = match crate::connect::ConnectProductionStartup::prepare_direct(
+            crate::connect::DirectBindPolicy::loopback(),
+        ) {
+            Ok(startup) => Some(std::sync::Arc::new(startup)),
+            Err(error) => {
+                eprintln!("[remote-web] Connect production startup held closed: {error}");
+                None
+            }
+        };
         let router_state = Arc::new(WebState {
             inner: Arc::downgrade(&inner),
             listener_generation,
             pairing_attempts: Arc::new(std::sync::Mutex::new(PairingAttemptTracker::default())),
+            connect_startup: connect_startup.clone(),
         });
 
         // /api/ws remains the legacy same-origin UI. /api/connect is the
@@ -636,6 +650,7 @@ impl WebListenerHandle {
                     push_inner,
                     push_dispatcher,
                     push_sender,
+                    connect_startup,
                     listener_generation,
                     bind_info,
                 })
@@ -717,6 +732,7 @@ pub(crate) struct WebState {
     pub(crate) inner: Weak<RemoteHostInner>,
     pub(crate) listener_generation: u64,
     pub(crate) pairing_attempts: Arc<std::sync::Mutex<PairingAttemptTracker>>,
+    pub(crate) connect_startup: Option<std::sync::Arc<crate::connect::ConnectProductionStartup>>,
 }
 
 impl WebState {
@@ -1702,6 +1718,7 @@ mod tests {
                 .native_runtime_generation
                 .load(std::sync::atomic::Ordering::Acquire),
             pairing_attempts: Arc::new(std::sync::Mutex::new(PairingAttemptTracker::default())),
+            connect_startup: None,
         })
     }
 
