@@ -7,7 +7,7 @@ use devmanager::ui::components::error_boundary::{
 };
 use devmanager::ui::components::icon_button::{IconButton, TooltipContract};
 use devmanager::ui::components::interaction::{
-    AccessibilityMetadata, AccessibleRole, ActionEvent, ActionId, ActivationSource, ComponentError,
+    AccessibilityMetadata, AccessibleRole, ActionEvent, ActivationSource, ComponentError,
     FocusEpochSource, InteractionState, InteractionStateModel, InteractionTransition, KeyboardKey,
 };
 use devmanager::ui::components::status_light::StatusLight;
@@ -20,10 +20,6 @@ use std::sync::{Arc, Mutex};
 
 assert_not_impl_any!(InteractionStateModel: Clone);
 assert_not_impl_any!(InteractionStateModel: Copy);
-
-fn action_id(value: &str) -> ActionId {
-    ActionId::new(value).expect("test action ids are stable and valid")
-}
 
 fn recording_callback() -> (
     Arc<Mutex<Vec<ActionEvent>>>,
@@ -49,8 +45,8 @@ fn interaction_transition_table_rejects_invalid_combinations_and_fails_closed() 
         state.visual_state(),
         devmanager::ui::components::interaction::VisualState::Pressed
     );
-    assert!(state.pressed);
-    assert!(state.focused);
+    assert!(state.pressed());
+    assert!(state.focused());
 
     let invalid = InteractionState::disabled()
         .transition(InteractionTransition::Press)
@@ -77,7 +73,7 @@ fn pointer_capture_and_keyboard_activation_reject_stale_focus_epochs() {
     let second = source.advance();
     model.set_focus_epoch(second);
     assert!(!model.pointer_up(42, first));
-    assert!(!model.state().pressed);
+    assert!(!model.state().pressed());
 
     assert!(!model.key_activate(KeyboardKey::Enter, second));
     assert!(model.focus());
@@ -93,9 +89,9 @@ fn button_requires_accessible_metadata_and_never_dispatches_stale_or_blocked_inp
     let mut button = Button::new("Save changes", ActionRequest::TaskList)
         .expect("button should be constructible");
 
-    assert_eq!(button.accessibility().role, AccessibleRole::Button);
-    assert_eq!(button.accessibility().name, "Save changes");
-    assert!(!button.accessibility().disabled);
+    assert_eq!(button.accessibility().role(), AccessibleRole::Button);
+    assert_eq!(button.accessibility().name(), "Save changes");
+    assert!(!button.accessibility().disabled());
     assert_eq!(button.variant(), ButtonVariant::Primary);
 
     let mut source = FocusEpochSource::new();
@@ -120,7 +116,7 @@ fn button_requires_accessible_metadata_and_never_dispatches_stale_or_blocked_inp
         Some("saving is already in progress")
     );
     assert_eq!(
-        button.accessibility().description,
+        button.accessibility().description(),
         "saving is already in progress"
     );
     assert!(button.key_activate(KeyboardKey::Enter, third).is_none());
@@ -155,8 +151,8 @@ fn icon_button_requires_nonempty_accessible_label_and_tooltip_contract() {
     )
     .expect("icon button");
 
-    assert_eq!(icon_button.accessibility().role, AccessibleRole::Button);
-    assert_eq!(icon_button.accessibility().name, "Open task details");
+    assert_eq!(icon_button.accessibility().role(), AccessibleRole::Button);
+    assert_eq!(icon_button.accessibility().name(), "Open task details");
     assert_eq!(icon_button.tooltip().label, "Open task details");
     assert_eq!(icon_button.tooltip().delay_ms, 500);
 }
@@ -173,14 +169,14 @@ fn badges_and_status_lights_are_noninteractive_and_use_semantic_status_signals()
         .expect("status light");
     let tokens = theme(ThemeMode::Light, Density::Compact, Scale::Scale125);
 
-    assert_eq!(badge.accessibility().role, AccessibleRole::Status);
+    assert_eq!(badge.accessibility().role(), AccessibleRole::Status);
     assert!(!badge.is_interactive());
     assert_eq!(badge.presentation(tokens).indicator, tokens.status.external);
-    assert_eq!(light.accessibility().role, AccessibleRole::Status);
+    assert_eq!(light.accessibility().role(), AccessibleRole::Status);
     assert!(!light.is_interactive());
     assert_eq!(light.presentation(tokens).indicator, tokens.status.success);
     assert_eq!(light.presentation(tokens).meaning, StatusMeaning::Success);
-    assert!(!light.accessibility().description.is_empty());
+    assert!(!light.accessibility().description().is_empty());
 }
 
 #[test]
@@ -201,15 +197,15 @@ fn text_field_enforces_scalar_and_utf8_byte_bounds_and_keeps_paste_as_data() {
     assert_eq!(field.value(), "界🙂");
     assert_eq!(field.value().chars().count(), 2);
     assert_eq!(field.value().len(), "界🙂".len());
-    assert_eq!(field.accessibility().role, AccessibleRole::TextField);
-    assert_eq!(field.accessibility().name, "Command text");
-    assert!(field.accessibility().description.contains("explicit"));
+    assert_eq!(field.accessibility().role(), AccessibleRole::TextField);
+    assert_eq!(field.accessibility().name(), "Command text");
+    assert!(field.accessibility().description().contains("explicit"));
     field
         .set_error(Some("Use a safe task command"))
         .expect("error is bounded and accessible");
-    assert!(field.accessibility().invalid);
+    assert!(field.accessibility().invalid());
     assert_eq!(
-        field.accessibility().error.as_deref(),
+        field.accessibility().error(),
         Some("Use a safe task command")
     );
 
@@ -224,13 +220,13 @@ fn text_field_enforces_scalar_and_utf8_byte_bounds_and_keeps_paste_as_data() {
     assert_eq!(field.value(), "界🙂");
 
     field.set_read_only(true);
-    assert!(field.accessibility().read_only);
+    assert!(field.accessibility().read_only());
     assert!(!field
         .handle_key(TextFieldKey::Character('x'), field.focus_epoch())
         .expect("read-only input is safe"));
     field.set_read_only(false);
     field.set_disabled(true);
-    assert!(field.accessibility().disabled);
+    assert!(field.accessibility().disabled());
     assert!(!field.focus());
     assert!(!field
         .paste("never-execute-this", field.focus_epoch())
@@ -246,7 +242,7 @@ fn empty_and_error_states_expose_only_explicit_typed_recovery_actions() {
         .expect("empty state")
         .with_recovery_action(action)
         .expect("recovery action");
-    assert_eq!(empty.accessibility().role, AccessibleRole::Region);
+    assert_eq!(empty.accessibility().role(), AccessibleRole::Region);
     assert_eq!(empty.recovery_actions().len(), 1);
     assert_eq!(
         empty.recovery_actions()[0].action_request(),
@@ -290,8 +286,8 @@ fn empty_and_error_states_expose_only_explicit_typed_recovery_actions() {
         RecoveryAction::new("Try again", ActionRequest::TaskList).expect("action"),
     )
     .expect("recovery action");
-    assert_eq!(error.accessibility().role, AccessibleRole::Alert);
-    assert!(error.accessibility().invalid);
+    assert_eq!(error.accessibility().role(), AccessibleRole::Alert);
+    assert!(error.accessibility().invalid());
     assert_eq!(error.recovery_actions().len(), 1);
     error.set_focus_epoch(epoch);
     assert!(error.focus_recovery(0));
@@ -345,7 +341,7 @@ fn keyboard_activation_requires_current_focus_and_epoch_changes_clear_focus() {
     assert!(model.key_activate(KeyboardKey::Enter, first));
 
     model.set_focus_epoch(second);
-    assert!(!model.state().focused);
+    assert!(!model.state().focused());
     assert!(!model.key_activate(KeyboardKey::Space, second));
 
     assert!(model.focus());
@@ -356,7 +352,7 @@ fn keyboard_activation_requires_current_focus_and_epoch_changes_clear_focus() {
         "stale host epochs must be rejected"
     );
     assert!(
-        model.state().focused,
+        model.state().focused(),
         "rejected epochs must not clear focus"
     );
     assert!(model.key_activate(KeyboardKey::Enter, second));
@@ -507,7 +503,7 @@ fn every_renderable_error_and_recovery_label_is_bounded_and_redacted() {
     metadata
         .set_error(Some(format!("api_key={API_KEY}")))
         .expect("metadata error is bounded");
-    assert!(!metadata.error.as_deref().unwrap().contains(API_KEY));
+    assert!(!metadata.error().unwrap().contains(API_KEY));
 }
 
 #[test]
@@ -524,7 +520,7 @@ fn focus_tokens_are_minted_by_one_monotonic_source_and_stale_tokens_cannot_activ
     assert_ne!(first, second);
     assert!(model.set_focus_epoch(second));
     assert!(!model.key_activate(KeyboardKey::Enter, first));
-    assert!(!model.state().focused);
+    assert!(!model.state().focused());
 
     let mut foreign_source = FocusEpochSource::new();
     let foreign = foreign_source.advance();
@@ -548,7 +544,7 @@ fn error_label_redaction_normalizes_key_separators_without_redacting_unrelated_p
         )))
         .expect("error label is bounded and redacted");
 
-    let rendered = metadata.error.expect("error label");
+    let rendered = metadata.error().expect("error label");
     for secret in [
         ACCESS,
         SECRET,
@@ -593,13 +589,13 @@ fn composer_controls_expose_names_roles_disabled_reasons_and_input_identity() {
     let send = composer
         .control_accessibility(ComposerControl::SendNow)
         .expect("bounded accessibility");
-    assert_eq!(send.role, AccessibleRole::Button);
-    assert_eq!(send.name, "Send Now");
-    assert!(send.disabled);
-    assert!(send.description.contains(EXPECTED_ACTION_SEND_NOW));
-    assert!(!send.description.contains('\\'));
+    assert_eq!(send.role(), AccessibleRole::Button);
+    assert_eq!(send.name(), "Send Now");
+    assert!(send.disabled());
+    assert!(send.description().contains(EXPECTED_ACTION_SEND_NOW));
+    assert!(!send.description().contains('\\'));
 
     let input = composer.input_accessibility();
-    assert_eq!(input.role, AccessibleRole::TextField);
-    assert_eq!(input.name, "Prompt");
+    assert_eq!(input.role(), AccessibleRole::TextField);
+    assert_eq!(input.name(), "Prompt");
 }
