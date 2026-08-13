@@ -121,6 +121,7 @@ impl TaskCockpitLiveProjection {
                 self.service_health = Some(value.clone());
                 self.load = CockpitSurfaceLoad::Ready;
             }
+            TaskCockpitResult::Config(_) | TaskCockpitResult::AgentConnection(_) => {}
             TaskCockpitResult::Denied { reason, .. } => {
                 self.load = CockpitSurfaceLoad::Denied { reason: *reason };
             }

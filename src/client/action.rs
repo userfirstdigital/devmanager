@@ -59,6 +59,8 @@ pub const ACTION_TASK_SHOW: &str = "task.show";
 pub const ACTION_TASK_CREATE: &str = "task.create";
 /// Stable id for request-shaped task creation whose workspace is resolved by the host.
 pub const ACTION_TASK_CREATE_V2: &str = "task.create.v2";
+/// Stable id for host-owned project creation from a name and folder path.
+pub const ACTION_CONFIG_CREATE_PROJECT: &str = "config.create_project";
 /// Stable id for renaming one Task through the host command boundary.
 pub const ACTION_TASK_RENAME: &str = "task.rename";
 /// Canonical composer Send Now. Settles through SubmitProviderInput.
@@ -258,6 +260,16 @@ const ACTIONS: &[ActionDescriptor] = &[
         argument_schema: ActionArgumentSchema::TaskCreateV2,
     },
     ActionDescriptor {
+        id: ACTION_CONFIG_CREATE_PROJECT,
+        title: "Add project",
+        description: "Add one project folder through the host configuration store.",
+        keywords: &["project", "add", "folder", "workspace", "config"],
+        scope: ActionScope::Host,
+        required_capability: Some(Capability::TaskCockpit),
+        risk: ActionRisk::Mutating,
+        argument_schema: ActionArgumentSchema::TaskCockpitV1,
+    },
+    ActionDescriptor {
         id: ACTION_TASK_RENAME,
         title: "Rename task",
         description: "Rename one Task through the host command boundary.",
@@ -403,6 +415,7 @@ pub enum ActionRequest {
         task_id: TaskId,
     },
     TaskCreate(TaskCreateArguments),
+    TaskCreateV2(TaskCreateV2Arguments),
     TaskRename(TaskRenameArguments),
     ProviderInput(ProviderInputActionRequest),
     StartProviderSession(ProviderStartArguments),
@@ -429,6 +442,7 @@ impl ActionRequest {
             Self::TaskList => ACTION_TASK_LIST,
             Self::TaskShow { .. } => ACTION_TASK_SHOW,
             Self::TaskCreate(_) => ACTION_TASK_CREATE,
+            Self::TaskCreateV2(_) => ACTION_TASK_CREATE_V2,
             Self::TaskRename(_) => ACTION_TASK_RENAME,
             Self::ProviderInput(arguments) => arguments.action_id,
             Self::StartProviderSession(_) => ACTION_PROVIDER_START_SESSION,
@@ -504,6 +518,8 @@ impl UpdaterAction {
 pub const fn cockpit_query_action_id(query: &TaskCockpitQuery) -> &'static str {
     match query {
         TaskCockpitQuery::ConfigSnapshot => ACTION_WORKSPACE_STATUS,
+        TaskCockpitQuery::AgentConnection => ACTION_HOST_STATUS,
+        TaskCockpitQuery::ConfigCreateProject { .. } => ACTION_CONFIG_CREATE_PROJECT,
         TaskCockpitQuery::WorkspaceStatus => ACTION_WORKSPACE_STATUS,
         TaskCockpitQuery::GitStatus | TaskCockpitQuery::GitMutate { .. } => ACTION_GIT_STATUS,
         TaskCockpitQuery::FilesList { .. } => ACTION_FILES_LIST,
@@ -1489,7 +1505,8 @@ mod tests {
         ACTION_PROVIDER_STEER_CURRENT_TURN, ACTION_PROVIDER_STOP_TURN, ACTION_SERVICE_HEALTH,
         ACTION_SERVICE_LOGS, ACTION_SERVICE_RESTART, ACTION_SERVICE_START, ACTION_SERVICE_STOP,
         ACTION_SSH_ACTION, ACTION_SSH_STATUS, ACTION_TASK_ANSWER_QUESTION, ACTION_TASK_CREATE,
-        ACTION_TASK_CREATE_V2, ACTION_TASK_LIST, ACTION_TASK_QUEUE_FOLLOW_UP, ACTION_TASK_RENAME,
+        ACTION_TASK_CREATE_V2, ACTION_CONFIG_CREATE_PROJECT, ACTION_TASK_LIST,
+        ACTION_TASK_QUEUE_FOLLOW_UP, ACTION_TASK_RENAME,
         ACTION_TASK_RESOLVE_APPROVAL, ACTION_TASK_SEND_NOW, ACTION_TASK_SHOW,
         ACTION_TASK_STEER_CURRENT_TURN, ACTION_TASK_STOP_TURN, ACTION_UPDATER_CHECK,
         ACTION_UPDATER_DOWNLOAD, ACTION_UPDATER_INSTALL, ACTION_UPDATER_START_BACKGROUND,
@@ -1517,6 +1534,8 @@ mod tests {
         assert!(ids.contains(&ACTION_TASK_LIST));
         assert!(ids.contains(&ACTION_TASK_SHOW));
         assert!(!ids.contains(&ACTION_TASK_CREATE));
+        assert!(ids.contains(&ACTION_TASK_CREATE_V2));
+        assert!(ids.contains(&ACTION_CONFIG_CREATE_PROJECT));
         assert!(ids.contains(&ACTION_TASK_RENAME));
         assert!(ids.contains(&ACTION_PROVIDER_SEND_NOW));
         assert!(ids.contains(&ACTION_PROVIDER_STEER_CURRENT_TURN));
@@ -1537,7 +1556,7 @@ mod tests {
         assert!(ids.contains(&ACTION_UPDATER_INSTALL));
         assert!(ids.contains(&ACTION_BROWSER_NATIVE));
         assert!(ids.contains(&ACTION_PROVIDER_START_SESSION));
-        assert_eq!(ids.len(), 38);
+        assert_eq!(ids.len(), 39);
         assert!(ids.contains(&ACTION_SERVICE_START));
         assert!(ids.contains(&ACTION_SERVICE_STOP));
         assert!(ids.contains(&ACTION_SERVICE_RESTART));
@@ -1576,6 +1595,12 @@ mod tests {
                         ActionRisk::Mutating,
                         ActionArgumentSchema::TaskCreateV2,
                         None,
+                    ),
+                    ACTION_CONFIG_CREATE_PROJECT => (
+                        ActionScope::Host,
+                        ActionRisk::Mutating,
+                        ActionArgumentSchema::TaskCockpitV1,
+                        Some(Capability::TaskCockpit),
                     ),
                     ACTION_TASK_RENAME => (
                         ActionScope::Task,

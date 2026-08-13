@@ -44,7 +44,10 @@ use crate::client::{
     SubscriptionUpdate,
 };
 use crate::config::paths::{resolve_app_paths, AppProfile, BuildKind};
-use crate::domain::cockpit::TaskCockpitQuery;
+use crate::domain::cockpit::{
+    AgentConnectionRow, AgentConnectionSnapshot, AgentPresence, ConfigSidebarProviderKind,
+    TaskCockpitQuery,
+};
 use crate::domain::command::{
     ArmUpdateInstallIntent, Command as DomainCommand, CommandEnvelope, CommandReceipt,
     ConfirmUpdateDrainIntent,
@@ -119,6 +122,7 @@ pub struct NativeHostFullQuit;
 const NATIVE_PROFILE_DIR: &str = ".devmanager-next/dev-profile";
 const NATIVE_PROFILE_NAME_PREFIX: &str = "native-next";
 const NATIVE_HOST_SCHEME: &str = "devtest";
+const ACTION_AGENT_CONNECTION_QUERY: &str = "agent.connection";
 /// Stable pipe/lock profile name for the packaged production host.
 const PRODUCTION_HOST_PROFILE: &str = "production";
 const CLIENT_BUILD_PREFIX: &str = "devmanager";
@@ -1583,6 +1587,9 @@ pub enum NativeHostCommand {
     HostStatusQuery {
         request_id: RequestId,
     },
+    AgentConnectionQuery {
+        request_id: RequestId,
+    },
     /// Shared action catalog observation through the live host grant seam.
     HostActionsQuery {
         request_id: RequestId,
@@ -1640,6 +1647,7 @@ fn native_command_id(command: &NativeHostCommand) -> Option<CommandId> {
         NativeHostCommand::TaskShowQuery { .. }
         | NativeHostCommand::TaskListQuery { .. }
         | NativeHostCommand::HostStatusQuery { .. }
+        | NativeHostCommand::AgentConnectionQuery { .. }
         | NativeHostCommand::HostActionsQuery { .. }
         | NativeHostCommand::TaskCockpitQuery { .. }
         | NativeHostCommand::PromptLibraryQuery { .. }
@@ -1658,12 +1666,17 @@ fn native_request_id(command: &NativeHostCommand) -> Option<RequestId> {
         NativeHostCommand::TaskShowQuery { request_id, .. }
         | NativeHostCommand::TaskListQuery { request_id }
         | NativeHostCommand::HostStatusQuery { request_id }
+        | NativeHostCommand::AgentConnectionQuery { request_id }
         | NativeHostCommand::HostActionsQuery { request_id }
         | NativeHostCommand::TaskCockpitQuery { request_id, .. }
         | NativeHostCommand::PromptLibraryQuery { request_id, .. }
         | NativeHostCommand::Updater { request_id, .. } => Some(*request_id),
         _ => None,
     }
+}
+
+fn is_agent_connection_query_command(command: &NativeHostCommand) -> bool {
+    matches!(command, NativeHostCommand::AgentConnectionQuery { .. })
 }
 
 fn same_native_action_identity(left: &NativeActionRecord, right: &NativeActionRecord) -> bool {
@@ -1892,10 +1905,26 @@ impl NativeHostActionOutcome {
 pub enum NativeHostQueryBody {
     Text,
     ConfigSidebar(crate::domain::ConfigSidebarSnapshot),
+    AgentConnection(AgentConnectionSnapshot),
     TaskCockpit(crate::domain::TaskCockpitResult),
     PromptLibrary(PromptProjectionReply),
     Updater(UpdaterSnapshot),
     UpdaterInstalled(UpdaterSnapshot),
+}
+
+fn agent_connection_snapshot(presence: AgentPresence) -> AgentConnectionSnapshot {
+    AgentConnectionSnapshot {
+        agents: vec![
+            AgentConnectionRow {
+                provider: ConfigSidebarProviderKind::Claude,
+                presence,
+            },
+            AgentConnectionRow {
+                provider: ConfigSidebarProviderKind::Codex,
+                presence,
+            },
+        ],
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4066,6 +4095,23 @@ async fn execute_native_command(
                 ))),
             }
         }
+        NativeHostCommand::AgentConnectionQuery { request_id } => {
+            let _ = request_id;
+            match client.query_agent_connection().await? {
+                Ok(snapshot) => Ok(NativeHostExecutionResult::Query {
+                    detail: bounded_host_error("agent.connection"),
+                    body: NativeHostQueryBody::AgentConnection(snapshot),
+                }),
+                Err(error) => Ok(NativeHostExecutionResult::Query {
+                    detail: bounded_host_error(format!(
+                        "agent.connection unavailable: {error:?}"
+                    )),
+                    body: NativeHostQueryBody::AgentConnection(agent_connection_snapshot(
+                        AgentPresence::CheckFailed,
+                    )),
+                }),
+            }
+        }
         NativeHostCommand::HostActionsQuery { request_id } => {
             let _ = request_id;
             let granted = client.granted_capabilities();
@@ -4918,9 +4964,9 @@ impl NativeInteraction {
             ActionRequest::ProviderInput(arguments) => Some(arguments.arguments.task_id),
             ActionRequest::StartProviderSession(arguments) => Some(arguments.task_id),
             ActionRequest::TaskCockpit { task_id, query } => match query {
-                TaskCockpitQuery::ConfigSnapshot | TaskCockpitQuery::ConfigCreateProject { .. } => {
-                    None
-                }
+                TaskCockpitQuery::ConfigSnapshot
+                | TaskCockpitQuery::AgentConnection
+                | TaskCockpitQuery::ConfigCreateProject { .. } => None,
                 _ => Some(*task_id),
             },
             ActionRequest::Browser(arguments) => Some(arguments.task_id()),
@@ -5754,6 +5800,7 @@ pub struct NativeShell {
     /// until then it stays explicitly read-only instead of reading a second
     /// config file or synthesizing defaults.
     config_sidebar: ConfigSidebarProjection,
+    agent_connection: Option<AgentConnectionSnapshot>,
     interaction: NativeInteraction,
     keyboard: KeyboardModel,
     last_keyboard_action: Option<KeyboardAction>,
@@ -6068,6 +6115,7 @@ impl NativeShell {
             prompt_library,
             services_projection,
             config_sidebar,
+            agent_connection: Some(agent_connection_snapshot(AgentPresence::Checking)),
             interaction,
             keyboard: KeyboardModel::default(),
             last_keyboard_action: None,
@@ -6105,6 +6153,11 @@ impl NativeShell {
         };
         if start_controller {
             let _ = shell.dispatch_action(ActionRequest::HostStatus);
+        }
+        if matches!(shell.host_state, NativeHostState::Connected { .. }) {
+            let _ = shell.dispatch_agent_connection_query(start_controller);
+        }
+        if start_controller {
             shell.start_controller(cx);
         }
         shell
@@ -6134,6 +6187,10 @@ impl NativeShell {
 
     pub fn preferences(&self) -> RuntimePreferencesSnapshot {
         self.preferences
+    }
+
+    pub fn agent_connection(&self) -> Option<&AgentConnectionSnapshot> {
+        self.agent_connection.as_ref()
     }
 
     pub fn header_attachment(&self) -> &NativeHeaderAttachment {
@@ -6174,6 +6231,23 @@ impl NativeShell {
 
     pub fn last_query_detail(&self) -> Option<&str> {
         self.last_query_detail.as_deref()
+    }
+
+    fn dispatch_agent_connection_query(&mut self, reuse_handler: bool) -> NativeHostActionResult {
+        let captured = if reuse_handler {
+            self.interaction
+                .action_on_current_handler(ActionRequest::HostStatus)
+        } else {
+            self.interaction.action(ActionRequest::HostStatus)
+        };
+        let Some(mut record) = captured else {
+            return NativeHostActionResult::Stale;
+        };
+        record.id = ACTION_AGENT_CONNECTION_QUERY;
+        record.command = NativeHostCommand::AgentConnectionQuery {
+            request_id: RequestId::new(),
+        };
+        self.enqueue_host_action(record)
     }
 
     pub fn browser_host_status(&self) -> crate::browser::BrowserHostStatus {
@@ -6244,6 +6318,9 @@ impl NativeShell {
                 }
                 self.sync_header_projection();
                 self.refresh_accessibility_tree();
+            }
+            NativeHostQueryBody::AgentConnection(snapshot) => {
+                self.agent_connection = Some(snapshot);
             }
             NativeHostQueryBody::TaskCockpit(result) => {
                 if let crate::domain::TaskCockpitResult::Config(snapshot) = &result {
@@ -6438,7 +6515,11 @@ impl NativeShell {
                                 if shell.pending_folder_prompt {
                                     shell.schedule_folder_prompt(cx);
                                 }
+                                let agent_connection = shell.agent_connection.clone();
                                 shell.controller_tick(MAX_PENDING_HOST_ACTIONS);
+                                if shell.agent_connection != agent_connection {
+                                    cx.notify();
+                                }
                                 if shell.exit_after_update {
                                     cx.quit();
                                 }
@@ -6673,6 +6754,19 @@ impl NativeShell {
     fn apply_epoch_fenced_action_outcome(&mut self, outcome: NativeHostActionOutcome) {
         let action = outcome.action().clone();
         if !self.interaction.accepts_action_outcome_record(&action) {
+            if is_agent_connection_query_command(&action.command) {
+                let request_id = native_request_id(&action.command);
+                self.pending_host_actions
+                    .retain(|pending| native_request_id(&pending.command) != request_id);
+                if self
+                    .retained_action_overflow
+                    .as_ref()
+                    .is_some_and(|pending| native_request_id(&pending.command) == request_id)
+                {
+                    self.retained_action_overflow = None;
+                }
+                return;
+            }
             if self.retain_pending_host_action(action.clone()) {
                 self.set_transport_failure(&action, NativeHostActionResult::Stale);
             } else {
@@ -6776,6 +6870,22 @@ impl NativeShell {
                 }
             }
             NativeHostActionOutcome::Failed { action, error } => {
+                if is_agent_connection_query_command(&action.command) {
+                    let request_id = native_request_id(&action.command);
+                    self.agent_connection =
+                        Some(agent_connection_snapshot(AgentPresence::CheckFailed));
+                    self.pending_host_actions
+                        .retain(|pending| native_request_id(&pending.command) != request_id);
+                    if self
+                        .retained_action_overflow
+                        .as_ref()
+                        .is_some_and(|pending| native_request_id(&pending.command) == request_id)
+                    {
+                        self.retained_action_overflow = None;
+                    }
+                    self.last_query_detail = Some(error);
+                    return;
+                }
                 if action.id == action::ACTION_CONFIG_CREATE_PROJECT {
                     if let Some(draft) = self.add_project.as_mut() {
                         draft.error = Some(error.clone());
@@ -7292,6 +7402,7 @@ impl NativeShell {
                 .expect("runtime attached")
                 .to_string(),
         };
+        let _ = self.dispatch_agent_connection_query(false);
         Ok(())
     }
 

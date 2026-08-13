@@ -82,6 +82,18 @@ pub(crate) fn serve_task_cockpit(dispatch: TaskCockpitDispatch<'_>) -> QueryOutc
         return QueryOutcome::Err(QueryError::UnsupportedCapability);
     }
     let surface = cockpit_surface(dispatch.query);
+    if matches!(dispatch.query, TaskCockpitQuery::ConfigCreateProject { .. }) {
+        // Mutation is owned by the exclusive host executor, which re-issues
+        // workspace authority before returning a snapshot.
+        return QueryOutcome::Err(QueryError::Unavailable {
+            reason: "config_create",
+        });
+    }
+    if matches!(dispatch.query, TaskCockpitQuery::AgentConnection) {
+        return QueryOutcome::Err(QueryError::Unavailable {
+            reason: "agent_connection",
+        });
+    }
     if matches!(dispatch.query, TaskCockpitQuery::ConfigSnapshot) {
         let Some(config) = dispatch.config else {
             return QueryOutcome::Err(QueryError::Unavailable {
@@ -109,7 +121,9 @@ pub(crate) fn serve_task_cockpit(dispatch: TaskCockpitDispatch<'_>) -> QueryOutc
     }
 
     match dispatch.query {
-        TaskCockpitQuery::ConfigSnapshot => {
+        TaskCockpitQuery::ConfigSnapshot
+        | TaskCockpitQuery::AgentConnection
+        | TaskCockpitQuery::ConfigCreateProject { .. } => {
             unreachable!("config snapshot is handled before task-scoped lookup")
         }
         TaskCockpitQuery::WorkspaceStatus => QueryOutcome::Ok(QueryResult::TaskCockpit(
@@ -250,7 +264,7 @@ pub(crate) fn serve_task_cockpit(dispatch: TaskCockpitDispatch<'_>) -> QueryOutc
     }
 }
 
-fn config_sidebar_snapshot(config: &AppConfig) -> ConfigSidebarSnapshot {
+pub(crate) fn config_sidebar_snapshot(config: &AppConfig) -> ConfigSidebarSnapshot {
     const MAX_PROJECTS: usize = 128;
     const MAX_FOLDERS: usize = 64;
     const MAX_SERVERS: usize = 256;
@@ -272,6 +286,11 @@ fn config_sidebar_snapshot(config: &AppConfig) -> ConfigSidebarSnapshot {
                 MAX_LABEL,
             ),
             root_configured: !project.root_path.trim().is_empty(),
+            workspace_id: config
+                .workspace_project_ids()
+                .get(&project.id)
+                .cloned()
+                .unwrap_or_default(),
             folders: project
                 .folders
                 .iter()

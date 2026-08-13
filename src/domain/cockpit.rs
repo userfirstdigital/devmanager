@@ -108,6 +108,15 @@ pub enum TaskCockpitQuery {
     /// This carries labels and capability metadata only; roots, commands,
     /// environment values, and credential material remain host-private.
     ConfigSnapshot,
+    /// Read-only Claude and Codex CLI authentication observation.
+    AgentConnection,
+    /// Host-owned project creation. The host validates the folder, persists
+    /// it through ConfigStore, and re-issues workspace authority. Clients
+    /// never write `config.json`.
+    ConfigCreateProject {
+        name: String,
+        root_path: String,
+    },
     WorkspaceStatus,
     GitStatus,
     FilesList {
@@ -338,6 +347,10 @@ pub struct ConfigSidebarProject {
     pub config_id: String,
     pub label: String,
     pub root_configured: bool,
+    /// Host-issued opaque `ProjectId` used by `task.create.v2`. Empty when the
+    /// mapping has not been issued yet. Never a filesystem path.
+    #[serde(default)]
+    pub workspace_id: String,
     pub folders: Vec<ConfigSidebarFolder>,
 }
 
@@ -420,6 +433,7 @@ impl AgentConnectionSnapshot {
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum TaskCockpitResult {
     Config(ConfigSidebarSnapshot),
+    AgentConnection(AgentConnectionSnapshot),
     Workspace(TaskWorkspaceProjection),
     Git(TaskGitProjection),
     FilesList(TaskFilesListProjection),
@@ -522,7 +536,9 @@ fn workspace_kind(kind: WorkspaceBindingKind) -> TaskWorkspaceKind {
 
 pub fn cockpit_surface(query: &TaskCockpitQuery) -> TaskCockpitSurface {
     match query {
-        TaskCockpitQuery::ConfigSnapshot => TaskCockpitSurface::Workspace,
+        TaskCockpitQuery::ConfigSnapshot
+        | TaskCockpitQuery::AgentConnection
+        | TaskCockpitQuery::ConfigCreateProject { .. } => TaskCockpitSurface::Workspace,
         TaskCockpitQuery::WorkspaceStatus => TaskCockpitSurface::Workspace,
         TaskCockpitQuery::GitStatus | TaskCockpitQuery::GitMutate { .. } => TaskCockpitSurface::Git,
         TaskCockpitQuery::FilesList { .. }
@@ -581,6 +597,18 @@ mod tests {
         assert!(encoded.get("task_cockpit").is_some());
         let decoded: Query = serde_json::from_value(encoded).expect("decode query");
         assert_eq!(decoded, query);
+
+        let create = Query::TaskCockpit(TaskCockpitQuery::ConfigCreateProject {
+            name: "demo".into(),
+            root_path: "C:/repo".into(),
+        });
+        let encoded = serde_json::to_value(&create).expect("encode create");
+        assert!(encoded
+            .get("task_cockpit")
+            .and_then(|value| value.get("config_create_project"))
+            .is_some());
+        let decoded: Query = serde_json::from_value(encoded).expect("decode create");
+        assert_eq!(decoded, create);
 
         let task_id = TaskId::new();
         let result = QueryResult::TaskCockpit(TaskCockpitResult::Denied {

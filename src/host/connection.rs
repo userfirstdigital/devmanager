@@ -20,7 +20,10 @@ use tokio::task::JoinHandle;
 use tokio::time::{interval_at, MissedTickBehavior};
 use uuid::Uuid;
 
-use crate::config::{ConfigError, ConfigStore};
+use crate::config::{
+    ConfigCommand, ConfigError, ConfigErrorKind, ConfigStore, Nullable, Project,
+};
+use crate::domain::cockpit::{TaskCockpitQuery, TaskCockpitResult};
 use crate::domain::command::{
     ArmUpdateInstallIntent, Command, CommandEnvelope, CommandReceipt, ConfirmUpdateDrainIntent,
     CreateTaskIntent, CreateTaskRequestIntent, PrepareUpdateIntent,
@@ -1836,6 +1839,78 @@ impl HostWorkspaceAdmission {
     fn redacted_ssh_endpoints(&self) -> Vec<crate::domain::TaskSshEndpoint> {
         crate::ssh::redacted_endpoints(&self.store.snapshot().config.ssh_connections)
     }
+
+    fn create_user_project(&mut self, name: &str, root_path: &str) -> Result<(), ConfigError> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(ConfigError::new(
+                ConfigErrorKind::Validation,
+                "project name is empty",
+            ));
+        }
+        let root = std::path::Path::new(root_path.trim());
+        let validated = crate::workspace::service::validate_host_workspace_path(root, true)
+            .map_err(|_| {
+                ConfigError::new(
+                    ConfigErrorKind::Validation,
+                    "project folder is unavailable",
+                )
+            })?;
+        let timestamp = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|duration| duration.as_secs().to_string())
+            .unwrap_or_else(|_| "0".to_string());
+        let project = Project {
+            id: format!("project-{}", Uuid::now_v7()),
+            name: name.to_string(),
+            root_path: validated.path.to_string_lossy().into_owned(),
+            folders: Vec::new(),
+            color: Nullable::Null,
+            pinned: Nullable::Value(false),
+            notes: Nullable::Null,
+            save_log_files: Nullable::Value(true),
+            created_at: timestamp.clone(),
+            updated_at: timestamp,
+            archived: Nullable::Null,
+            extra: Default::default(),
+        };
+        let revision = self.store.snapshot().revision;
+        self.store
+            .execute(revision, ConfigCommand::CreateProject { project })?;
+        let revision = self.store.snapshot().revision;
+        let issuer = self.store.issue_workspace_authority(
+            revision,
+            self.issuer.action_epoch(),
+            self.issuer.runtime_generation(),
+        )?;
+        let roots = WorkspaceProjectRoots::from_config_issuer(&issuer).map_err(|_| {
+            ConfigError::new(
+                ConfigErrorKind::Validation,
+                "configured workspace roots are unavailable",
+            )
+        })?;
+        self.issuer = issuer;
+        self.roots = roots;
+        self.ssh_runtime = HostSshRuntime::new(
+            self.store.snapshot().config.clone(),
+            self.store.path().parent().map(|parent| parent.join("ssh-keys")),
+        );
+        Ok(())
+    }
+
+    fn create_user_project_outcome(&mut self, name: &str, root_path: &str) -> QueryOutcome {
+        match self.create_user_project(name, root_path) {
+            Ok(()) => QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Config(
+                super::cockpit::config_sidebar_snapshot(&self.store.snapshot().config),
+            ))),
+            Err(error) if error.kind() == ConfigErrorKind::Validation => {
+                QueryOutcome::Err(QueryError::InvalidRequest)
+            }
+            Err(_) => QueryOutcome::Err(QueryError::Unavailable {
+                reason: "config_create",
+            }),
+        }
+    }
 }
 
 /// Exclusive owner of [`CommandBus`]. Runs on one task and drains a bounded queue.
@@ -2128,7 +2203,9 @@ impl HostRequestExecutor {
                     let Some(job) = job else {
                         break;
                     };
-                    let result = if is_provider_start_request(&job.request) {
+                    let result = if is_agent_connection_query(&job.request) {
+                        self.dispatch_agent_connection(job.negotiated, job.request, job.output_id).await
+                    } else if is_provider_start_request(&job.request) {
                         self.dispatch_provider_start(job.negotiated, job.request, job.output_id).await
                     } else {
                         self.dispatch_job(job.negotiated, job.request, job.output_id, job.routing)
@@ -2179,7 +2256,9 @@ impl HostRequestExecutor {
                             "supervised executor request queue closed unexpectedly".into(),
                         ));
                     };
-                    let result = if is_provider_start_request(&job.request) {
+                    let result = if is_agent_connection_query(&job.request) {
+                        self.dispatch_agent_connection(job.negotiated, job.request, job.output_id).await
+                    } else if is_provider_start_request(&job.request) {
                         self.dispatch_provider_start(job.negotiated, job.request, job.output_id).await
                     } else {
                         self.dispatch_job(job.negotiated, job.request, job.output_id, job.routing)
@@ -2940,6 +3019,73 @@ impl HostRequestExecutor {
         ))
     }
 
+    async fn dispatch_agent_connection(
+        &mut self,
+        negotiated: NegotiatedParameters,
+        request: ClientRequest,
+        _output_id: Option<ConnectionOutputId>,
+    ) -> Result<DuplexExecuteCompletion, IpcError> {
+        let ClientRequest::Query(envelope) = request else {
+            return Err(IpcError::Unavailable);
+        };
+        if envelope.client_id != negotiated.client_id {
+            return Err(IpcError::Unauthorized);
+        }
+        if !negotiated.capabilities.grants_task_cockpit() {
+            return Ok(DuplexExecuteCompletion::CallerMustWrite(
+                ServerMessage::QueryReply(QueryReply {
+                    request_id: envelope.request_id,
+                    outcome: QueryOutcome::Err(QueryError::UnsupportedCapability),
+                }),
+            ));
+        }
+        let Query::TaskCockpit(TaskCockpitQuery::AgentConnection) = envelope.query else {
+            return Err(IpcError::Unavailable);
+        };
+
+        let agents = if let Some(runtime) = self.configured_service_runtime.as_ref() {
+            let registry = runtime.manager.provider_host().registry();
+            let discovery = crate::providers::ProviderDiscoveryConfig::default();
+            let claude = registry
+                .observe(crate::providers::ProviderKind::ClaudeCode, &discovery)
+                .await;
+            let codex = registry
+                .observe(crate::providers::ProviderKind::Codex, &discovery)
+                .await;
+            vec![
+                super::agent_connection::map_provider_observe(
+                    crate::domain::ConfigSidebarProviderKind::Claude,
+                    claude.as_ref(),
+                ),
+                super::agent_connection::map_provider_observe(
+                    crate::domain::ConfigSidebarProviderKind::Codex,
+                    codex.as_ref(),
+                ),
+            ]
+        } else {
+            vec![
+                crate::domain::AgentConnectionRow {
+                    provider: crate::domain::ConfigSidebarProviderKind::Claude,
+                    presence: crate::domain::AgentPresence::CheckFailed,
+                },
+                crate::domain::AgentConnectionRow {
+                    provider: crate::domain::ConfigSidebarProviderKind::Codex,
+                    presence: crate::domain::AgentPresence::CheckFailed,
+                },
+            ]
+        };
+        Ok(DuplexExecuteCompletion::CallerMustWrite(
+            ServerMessage::QueryReply(QueryReply {
+                request_id: envelope.request_id,
+                outcome: QueryOutcome::Ok(QueryResult::TaskCockpit(
+                    TaskCockpitResult::AgentConnection(crate::domain::AgentConnectionSnapshot {
+                        agents,
+                    }),
+                )),
+            }),
+        ))
+    }
+
     fn dispatch(
         &mut self,
         negotiated: NegotiatedParameters,
@@ -3256,6 +3402,30 @@ impl HostRequestExecutor {
                     .map_err(map_store_error)
             }
             Query::TaskCockpit(query) => {
+                if let TaskCockpitQuery::ConfigCreateProject { name, root_path } = &query {
+                    if !negotiated.capabilities.grants_task_cockpit() {
+                        return Ok(QueryReply {
+                            request_id: envelope.request_id,
+                            outcome: QueryOutcome::Err(QueryError::UnsupportedCapability),
+                        });
+                    }
+                    let outcome = match self.config_admission.as_mut() {
+                        Some(admission) => {
+                            let outcome = admission.create_user_project_outcome(name, root_path);
+                            if matches!(outcome, QueryOutcome::Ok(_)) {
+                                self.workspace_projects = admission.roots().clone();
+                            }
+                            outcome
+                        }
+                        None => QueryOutcome::Err(QueryError::Unavailable {
+                            reason: "config_store",
+                        }),
+                    };
+                    return Ok(QueryReply {
+                        request_id: envelope.request_id,
+                        outcome,
+                    });
+                }
                 let ssh_endpoints = self
                     .config_admission
                     .as_ref()
@@ -3887,6 +4057,16 @@ fn is_provider_start_request(request: &ClientRequest) -> bool {
         ClientRequest::Command(envelope) if matches!(
             &envelope.command,
             Command::StartProviderSession(_)
+        )
+    )
+}
+
+fn is_agent_connection_query(request: &ClientRequest) -> bool {
+    matches!(
+        request,
+        ClientRequest::Query(envelope) if matches!(
+            &envelope.query,
+            Query::TaskCockpit(TaskCockpitQuery::AgentConnection)
         )
     )
 }
