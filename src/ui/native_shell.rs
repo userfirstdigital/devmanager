@@ -5329,12 +5329,12 @@ impl AccessibilityTree {
             root,
             rendered_task_count: rendered_task_ids.len(),
             // `accesskit_tree_update` assigns IDs in pre-order. The shell's
-            // root, toolbar, header, inbox, and inbox-status occupy 0..=4,
-            // making the row mapping stable while the same tree is rendered.
+            // root, toolbar, header, settings, inbox, and inbox-status occupy
+            // 0..=5, making the row mapping stable while the same tree is rendered.
             task_node_ids: rendered_task_ids
                 .iter()
                 .enumerate()
-                .map(|(index, task_id)| (accesskit::NodeId::from(5 + index as u64), *task_id))
+                .map(|(index, task_id)| (accesskit::NodeId::from(6 + index as u64), *task_id))
                 .collect(),
         }
     }
@@ -5438,6 +5438,11 @@ impl AccessibilityTree {
 
     pub fn rendered_task_count(&self) -> usize {
         self.rendered_task_count
+    }
+
+    #[cfg(test)]
+    pub(crate) fn task_node_ids_for_test(&self) -> &[(accesskit::NodeId, TaskId)] {
+        &self.task_node_ids
     }
 
     fn task_for_platform_node(&self, node_id: accesskit::NodeId) -> Option<TaskId> {
@@ -13015,6 +13020,40 @@ mod tests {
         std::thread::sleep(Duration::from_millis(30));
         assert!(deadline.expired());
         assert_eq!(deadline.remaining(), Duration::ZERO);
+    }
+
+    #[test]
+    fn task_node_ids_maps_rendered_rows_after_settings_node() {
+        use crate::ui::task_cockpit::TaskList;
+
+        let first = TaskId::new();
+        let second = TaskId::new();
+        let task_list =
+            TaskList::from_virtual_task_ids(vec![first, second]).expect("two-task list");
+        let tree = AccessibilityTree::for_task_list_with_header(
+            &task_list,
+            None,
+            &NativeHeaderAttachment::default(),
+        );
+        let mapped = tree.task_node_ids_for_test();
+        assert_eq!(mapped.len(), 2);
+        assert_eq!(mapped[0], (accesskit::NodeId::from(6), first));
+        assert_eq!(mapped[1], (accesskit::NodeId::from(7), second));
+        let update = tree.platform_update_for_test();
+        for &(node_id, task_id) in mapped {
+            let node = update
+                .nodes
+                .iter()
+                .find(|(id, _)| *id == node_id)
+                .map(|(_, node)| node)
+                .expect("platform node");
+            let expected = format!("native-task-row-{task_id}");
+            assert_eq!(
+                node.author_id(),
+                Some(expected.as_str()),
+                "pre-order id must match the rendered row"
+            );
+        }
     }
 
     #[test]
