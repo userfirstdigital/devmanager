@@ -14698,6 +14698,7 @@ mod tests {
         let (runtime, shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
         let (model, task_id) = open_task_without_agent_client_model();
         let report = with_test_shell_in_app(cx, runtime, |shell| {
+            shell.agent_connection = Some(agent_connection_snapshot(AgentPresence::SignedIn));
             shell.install_named_folder_for_test("command");
             shell
                 .apply_client_model(Arc::new(model))

@@ -343,14 +343,26 @@ impl TaskCockpitShell {
             self.timeline_error = None;
             return;
         };
-        if model
-            .tasks()
-            .get(&task_id)
-            .is_some_and(|snapshot| snapshot.primary_agent_id.is_none())
-        {
+        let Some(task) = model.tasks().get(&task_id) else {
+            self.timeline = None;
+            self.timeline_error = Some("This task is no longer available.".to_string());
+            return;
+        };
+        if task.primary_agent_id.is_none() {
             self.timeline = None;
             self.timeline_error =
                 Some("This task is ready. An agent has not been connected yet.".to_string());
+            return;
+        }
+        if task
+            .primary_agent_id
+            .is_some_and(|agent_id| !task.agents.contains_key(&agent_id))
+        {
+            self.timeline = None;
+            self.timeline_error = Some(
+                "The agent connection is still starting. Conversation will appear when it is ready."
+                    .to_string(),
+            );
             return;
         }
         let result = (|| {
