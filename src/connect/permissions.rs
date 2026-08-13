@@ -65,6 +65,13 @@ pub fn action_for_client_request(request: &ClientRequest) -> Option<(ActionId, O
                 Query::OperationStatus { .. } => ActionId::READ_OPERATION,
                 Query::InspectHostQuit => ActionId::READ_OPERATION,
                 Query::PromptLibrary(_) => ActionId::READ_PERSONAL_PROMPTS,
+                Query::TaskCockpit(
+                    crate::domain::cockpit::TaskCockpitQuery::ConfigCreateProject { .. },
+                ) => {
+                    // Minting a project root is a host-local config mutation.
+                    // Connect must not map it as READ_TASK or forward it.
+                    return None;
+                }
                 Query::TaskCockpit(_) => ActionId::READ_TASK,
             };
             Some((action, envelope.task_id))
@@ -290,9 +297,11 @@ impl SessionAuthorizer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::cockpit::TaskCockpitQuery;
     use crate::domain::command::CommandEnvelope;
     use crate::domain::command::{Command, ServiceControlAction, ServiceControlIntent};
-    use crate::domain::id::{ClientId, CommandId};
+    use crate::domain::id::{ClientId, CommandId, RequestId};
+    use crate::domain::query::QueryEnvelope;
     use crate::protocol::ClientRequest;
 
     #[test]
@@ -334,6 +343,24 @@ mod tests {
         assert_eq!(
             authorizer.authorize_request_with_grant(&request, &grant, context),
             PermissionDecision::Denied(PermissionDenyReason::WatcherReadOnly)
+        );
+    }
+
+    #[test]
+    fn config_create_project_is_not_a_connect_read() {
+        let request = ClientRequest::Query(QueryEnvelope {
+            request_id: RequestId::new(),
+            client_id: ClientId::new(),
+            task_id: None,
+            query: Query::TaskCockpit(TaskCockpitQuery::ConfigCreateProject {
+                name: "workspace".into(),
+                root_path: "C:/workspace".into(),
+            }),
+        });
+        assert_eq!(action_for_client_request(&request), None);
+        assert_eq!(
+            SessionAuthorizer::paired_owner().authorize_request(&request),
+            PermissionDecision::Denied(PermissionDenyReason::UnknownAction)
         );
     }
 

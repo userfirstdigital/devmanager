@@ -226,10 +226,13 @@ fn native_gpui_smoke_report() -> NativeGpuiSmokeReport {
                     let nodes = shell.accessibility_tree().gpui_nodes();
                     nodes
                         .iter()
-                        .any(|node| node.element_id == "native-setup-add-project")
+                        .any(|node| node.element_id == "native-header-settings")
                         && !nodes
                             .iter()
                             .any(|node| node.element_id == "native-task-inbox")
+                        && !nodes
+                            .iter()
+                            .any(|node| node.element_id == "native-setup-add-project")
                 },
                 shell.platform_accessibility_available(),
                 shell.platform_accessibility_node_count(),

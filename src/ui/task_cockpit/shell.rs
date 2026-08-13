@@ -348,6 +348,14 @@ impl TaskCockpitShell {
             self.timeline_error = Some("This task is no longer available.".to_string());
             return;
         };
+        if task.attention == crate::domain::task::TaskAttention::Failed {
+            self.timeline = None;
+            self.timeline_error = Some(
+                "The agent didn't start. Check Settings, then use +Claude or +Codex again."
+                    .to_string(),
+            );
+            return;
+        }
         if task.primary_agent_id.is_none() {
             self.timeline = None;
             self.timeline_error =
@@ -389,7 +397,14 @@ impl TaskCockpitShell {
             }
             Err(error) => {
                 self.timeline = None;
-                self.timeline_error = Some(error);
+                self.timeline_error = Some(
+                    if error.contains("missing field") || error.contains("agent_session_id") {
+                        "The agent didn't start. Check Settings, then use +Claude or +Codex again."
+                            .to_string()
+                    } else {
+                        error
+                    },
+                );
             }
         }
     }

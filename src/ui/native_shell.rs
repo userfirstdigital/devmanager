@@ -5448,6 +5448,15 @@ impl AccessibilityTree {
                 )
                 .gpui("native-projects-add", true, true),
             );
+        } else if matches!(stage, ShellStage::Welcome) {
+            children.push(
+                AccessibilityNode::new(
+                    AccessibleRole::Button,
+                    "Refresh",
+                    "Check Claude Code and Codex sign-in on this machine.",
+                )
+                .gpui("native-connect-refresh", true, true),
+            );
         }
         let root = AccessibilityNode::new(
             AccessibleRole::Region,
@@ -6310,7 +6319,11 @@ impl NativeShell {
         record.command = NativeHostCommand::AgentConnectionQuery {
             request_id: RequestId::new(),
         };
-        self.enqueue_host_action(record)
+        let result = self.enqueue_host_action(record);
+        if matches!(result, NativeHostActionResult::Queued) {
+            self.agent_connection = Some(agent_connection_snapshot(AgentPresence::Checking));
+        }
+        result
     }
 
     pub fn browser_host_status(&self) -> crate::browser::BrowserHostStatus {
@@ -6953,6 +6966,17 @@ impl NativeShell {
                     if let Some(draft) = self.add_project.as_mut() {
                         draft.error = Some(error.clone());
                     }
+                    let request_id = native_request_id(&action.command);
+                    self.pending_host_actions
+                        .retain(|pending| native_request_id(&pending.command) != request_id);
+                    if self
+                        .retained_action_overflow
+                        .as_ref()
+                        .is_some_and(|pending| native_request_id(&pending.command) == request_id)
+                    {
+                        self.retained_action_overflow = None;
+                    }
+                    return;
                 }
                 self.composer_error = Some(error.clone());
                 let retained = self.retain_pending_host_action(action.clone());
@@ -7883,6 +7907,14 @@ impl NativeShell {
             self.composer = None;
             return;
         };
+        if snapshot.attention == crate::domain::task::TaskAttention::Failed {
+            self.composer = None;
+            self.composer_error = Some(
+                "The agent didn't start. Check Settings, then use +Claude or +Codex again."
+                    .to_string(),
+            );
+            return;
+        }
         let Some(agent_session_id) = snapshot.primary_agent_id else {
             self.composer = None;
             self.composer_error = Some("primary agent is not bound".to_string());
@@ -8988,7 +9020,7 @@ impl NativeShell {
             "native-new-task-submit" => self.submit_new_task(),
             "native-new-task-cancel" => self.new_task = None,
             "native-header-settings" => self.settings_open = true,
-            "native-settings-refresh" => {
+            "native-connect-refresh" | "native-settings-refresh" => {
                 let _ = self.dispatch_agent_connection_query(false);
             }
             "native-settings-cancel" => self.settings_open = false,
@@ -9507,7 +9539,7 @@ impl NativeShell {
                 return div().id("native-shell-setup-unused").into_any_element();
             }
         };
-        let composed_action = if stage == ShellStage::Welcome && self.shows_add_project_plus() {
+        let composed_action = if stage == ShellStage::Welcome {
             Some(
                 div()
                     .id("native-shell-setup-welcome-action")
@@ -11224,7 +11256,14 @@ impl NativeShell {
                             stage,
                             tokens,
                             layout,
-                            None,
+                            (!self.shows_add_project_plus() && stage == ShellStage::Welcome).then(
+                                || {
+                                    Button::new("native-connect-refresh")
+                                        .label("Refresh")
+                                        .primary()
+                                        .into_any_element()
+                                },
+                            ),
                             self.shows_add_project_plus().then(|| {
                                 Button::new("native-projects-add")
                                     .label("+")
@@ -11793,7 +11832,18 @@ impl NativeShell {
         let show_sidebar = !layout.sidebar_collapsed && stage == ShellStage::Cockpit;
         let pane_toggles = (stage == ShellStage::Cockpit).then(|| self.pane_toggles(tokens, cx));
         let workspace_actions = None;
-        let setup_action = None;
+        let setup_action =
+            (stage == ShellStage::Welcome && !self.shows_add_project_plus()).then(|| {
+                Button::new("native-connect-refresh")
+                    .label("Refresh")
+                    .primary()
+                    .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
+                        cx.stop_propagation();
+                        let _ = shell.dispatch_agent_connection_query(false);
+                        cx.notify();
+                    }))
+                    .into_any_element()
+            });
         let setup_project_plus = self.shows_add_project_plus().then(|| {
             Button::new("native-projects-add")
                 .label("+")
@@ -12735,6 +12785,10 @@ mod tests {
             !ids.iter().any(|id| id == "native-projects-add"),
             "connect canvas must hide the project heading plus"
         );
+        assert!(
+            ids.iter().any(|id| id == "native-connect-refresh"),
+            "connect canvas must expose Refresh so sign-in can be re-checked"
+        );
     }
 
     #[test]
@@ -12776,6 +12830,10 @@ mod tests {
         assert!(
             !ids.iter().any(|id| id == "native-setup-add-project"),
             "add-project canvas must not expose a large folder action"
+        );
+        assert!(
+            !ids.iter().any(|id| id == "native-connect-refresh"),
+            "signed-in add-project canvas must not keep the connect Refresh control"
         );
     }
 
@@ -14762,6 +14820,12 @@ mod tests {
     }
 
     fn terminal_bound_client_model() -> (crate::client::ClientModel, TaskId) {
+        terminal_bound_client_model_with_attention(crate::domain::task::TaskAttention::None)
+    }
+
+    fn terminal_bound_client_model_with_attention(
+        attention: crate::domain::task::TaskAttention,
+    ) -> (crate::client::ClientModel, TaskId) {
         use crate::client::ClientModelBuilder;
         use crate::domain::{
             agent::{AgentRole, AgentSessionFacts, AgentSessionLifecycle},
@@ -14769,8 +14833,8 @@ mod tests {
             resource::{OwnerKind, ResourceFacts, ResourceKind, ResourceLifecycle, ResourceRecipe},
             snapshot::{SnapshotItem, SnapshotPage, SnapshotSection, TaskSnapshotItem},
             task::{
-                ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity,
-                TaskFacts, TaskLifecycle, WorkspaceRef,
+                ReviewReadiness, TaskActivity, TaskAssignment, TaskConnectivity, TaskFacts,
+                TaskLifecycle, WorkspaceRef,
             },
         };
 
@@ -14812,7 +14876,7 @@ mod tests {
                         created_at_ms: 1,
                     },
                     connectivity: TaskConnectivity::Connected,
-                    attention: TaskAttention::None,
+                    attention,
                     activity: TaskActivity::Idle,
                     review_readiness: ReviewReadiness::NotReady,
                     primary_agent_id: Some(agent_id),
@@ -14885,6 +14949,48 @@ mod tests {
         });
     }
 
+    fn bound_task_with_failed_launch_holds_conversation(cx: &mut gpui::App) {
+        let (runtime, _shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        let (model, task_id) =
+            terminal_bound_client_model_with_attention(crate::domain::task::TaskAttention::Failed);
+        let report = with_test_shell_in_app(cx, runtime, |shell| {
+            shell
+                .apply_client_model(Arc::new(model))
+                .expect("apply model");
+            let list = crate::ui::task_cockpit::TaskList::from_client_model_virtual(
+                shell.client_model_snapshot().as_ref().unwrap(),
+            )
+            .expect("task list");
+            let _ = shell.interaction.navigation_mouse_down(task_id, &list);
+            shell.sync_cockpit_follow();
+            (
+                shell
+                    .cockpit()
+                    .conversation_hold_message()
+                    .unwrap_or("")
+                    .to_string(),
+                shell.composer.is_none(),
+                shell.host_status_text(),
+            )
+        });
+        assert!(
+            report.0.contains("didn't start"),
+            "a bound task whose agent failed to launch must surface that on the task, got {}",
+            report.0
+        );
+        assert!(
+            !report.0.contains("missing field") && !report.0.contains("agent_session_id"),
+            "launch failure must not leak a developer field name: {}",
+            report.0
+        );
+        assert!(report.1, "composer must stay closed when launch failed");
+        assert!(
+            !report.2.contains("Can't connect"),
+            "launch failure must not paint host transport failure: {}",
+            report.2
+        );
+    }
+
     fn dock_shortcuts_and_open_task_details_bind_selection(cx: &mut gpui::App) {
         use crate::ui::actions::{KeyboardShortcut, ShortcutKey};
         use crate::ui::task_cockpit::dock::DockTool as CockpitDockTool;
@@ -14952,6 +15058,7 @@ mod tests {
             crate::ui::init(cx);
             created_task_is_listed_without_a_disconnect_or_missing_field(cx);
             selected_task_follow_title_and_terminal_binding(cx);
+            bound_task_with_failed_launch_holds_conversation(cx);
             dock_shortcuts_and_open_task_details_bind_selection(cx);
             *completed_for_app.borrow_mut() = true;
             cx.quit();

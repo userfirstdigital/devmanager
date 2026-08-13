@@ -25,7 +25,7 @@ use crate::domain::agent::{AgentRole, AgentSessionFacts};
 use crate::domain::cockpit::{TaskCockpitQuery, TaskCockpitResult};
 use crate::domain::command::{
     ArmUpdateInstallIntent, Command, CommandEnvelope, CommandReceipt, ConfirmUpdateDrainIntent,
-    CreateTaskIntent, CreateTaskRequestIntent, PrepareUpdateIntent,
+    CreateTaskIntent, CreateTaskRequestIntent, PrepareUpdateIntent, SetTaskAttentionIntent,
 };
 use crate::domain::event::DomainEvent;
 use crate::domain::id::{
@@ -1851,6 +1851,7 @@ struct ConfiguredServiceRuntime {
     manager: crate::services::ProcessManager,
     host_id: crate::services::model::HostId,
     provider_dispatch: crate::providers::dispatch::ProviderDispatchRuntime,
+    supervisor_ready: bool,
 }
 
 impl ConfiguredServiceRuntime {
@@ -1858,71 +1859,74 @@ impl ConfiguredServiceRuntime {
         let manager = crate::services::ProcessManager::new();
         let host_id = crate::services::model::HostId::new(u64::from(std::process::id()));
         let config = &admission.store.snapshot().config;
-
-        // Resolve folder env files on the host before handing source references
-        // to the binding layer. Values remain in the redacted supervisor
-        // overlay; they never enter the action catalog or a client projection.
-        // Relative env-file paths resolve under project root + folder path and
-        // fail closed on traversal; absolute paths keep absolute behavior.
-        let mut env_files = Vec::new();
-        for project in &config.projects {
-            for folder in &project.folders {
-                let env = match folder.env_file_path.as_ref() {
-                    None => None,
-                    Some(path) => {
-                        // Containment/path-validation errors fail closed and
-                        // prevent supervisor initialization. A valid path whose
-                        // file is missing or unreadable stays an optional overlay.
-                        let resolved = crate::services::resolve_configured_env_file_path(
-                            &project.root_path,
-                            &folder.folder_path,
-                            path,
-                        )
-                        .ok()?;
-                        crate::services::env_service::read_env_map(&resolved)
-                            .ok()
-                            .map(|values| {
-                                values
-                                    .into_iter()
-                                    .collect::<std::collections::BTreeMap<_, _>>()
-                            })
-                    }
-                };
-                env_files.push(env);
-            }
-        }
-
-        let mut sources = Vec::new();
-        let mut env_index = 0;
-        for project in &config.projects {
-            for folder in &project.folders {
-                for command in &folder.commands {
-                    sources.push(crate::services::binding::ConfiguredServiceSource {
-                        project,
-                        folder,
-                        command,
-                        owner: crate::services::binding::ConfiguredServiceOwner::Workspace {
-                            project_id: project.id.clone(),
-                            folder_id: folder.id.clone(),
-                        },
-                        folder_env_file: env_files.get(env_index).and_then(Option::as_ref),
-                    });
+        let supervisor_ready = (|| -> Option<()> {
+            // Resolve folder env files on the host before handing source references
+            // to the binding layer. Values remain in the redacted supervisor
+            // overlay; they never enter the action catalog or a client projection.
+            // Relative env-file paths resolve under project root + folder path and
+            // fail closed on traversal; absolute paths keep absolute behavior.
+            let mut env_files = Vec::new();
+            for project in &config.projects {
+                for folder in &project.folders {
+                    let env = match folder.env_file_path.as_ref() {
+                        None => None,
+                        Some(path) => {
+                            // Containment/path-validation errors fail closed and
+                            // prevent supervisor initialization. A valid path whose
+                            // file is missing or unreadable stays an optional overlay.
+                            let resolved = crate::services::resolve_configured_env_file_path(
+                                &project.root_path,
+                                &folder.folder_path,
+                                path,
+                            )
+                            .ok()?;
+                            crate::services::env_service::read_env_map(&resolved)
+                                .ok()
+                                .map(|values| {
+                                    values
+                                        .into_iter()
+                                        .collect::<std::collections::BTreeMap<_, _>>()
+                                })
+                        }
+                    };
+                    env_files.push(env);
                 }
-                env_index += 1;
             }
-        }
 
-        manager
-            .ensure_configured_service_supervisor(sources, host_id, unix_time_ms_u64())
-            .ok()
-            .map(|()| Self {
-                provider_dispatch:
-                    crate::providers::dispatch::ProviderDispatchRuntime::from_process_manager(
-                        manager.clone(),
-                    ),
-                manager,
-                host_id,
-            })
+            let mut sources = Vec::new();
+            let mut env_index = 0;
+            for project in &config.projects {
+                for folder in &project.folders {
+                    for command in &folder.commands {
+                        sources.push(crate::services::binding::ConfiguredServiceSource {
+                            project,
+                            folder,
+                            command,
+                            owner: crate::services::binding::ConfiguredServiceOwner::Workspace {
+                                project_id: project.id.clone(),
+                                folder_id: folder.id.clone(),
+                            },
+                            folder_env_file: env_files.get(env_index).and_then(Option::as_ref),
+                        });
+                    }
+                    env_index += 1;
+                }
+            }
+
+            manager
+                .ensure_configured_service_supervisor(sources, host_id, unix_time_ms_u64())
+                .ok()
+        })()
+        .is_some();
+        Some(Self {
+            provider_dispatch:
+                crate::providers::dispatch::ProviderDispatchRuntime::from_process_manager(
+                    manager.clone(),
+                ),
+            manager,
+            host_id,
+            supervisor_ready,
+        })
     }
 }
 
@@ -2232,7 +2236,9 @@ impl HostRequestExecutor {
         let configured_service_runtime = config_admission
             .as_ref()
             .and_then(ConfiguredServiceRuntime::initialized_from_admission);
-        let configured_service_supervisor_ready = configured_service_runtime.is_some();
+        let configured_service_supervisor_ready = configured_service_runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.supervisor_ready);
         let handle = HostRequestHandle {
             tx,
             control_tx,
@@ -2295,7 +2301,9 @@ impl HostRequestExecutor {
         let configured_service_runtime = config_admission
             .as_ref()
             .and_then(ConfiguredServiceRuntime::initialized_from_admission);
-        let configured_service_supervisor_ready = configured_service_runtime.is_some();
+        let configured_service_supervisor_ready = configured_service_runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.supervisor_ready);
         let handle = HostRequestHandle {
             tx,
             control_tx,
@@ -3161,24 +3169,32 @@ impl HostRequestExecutor {
                 )
                 .map_err(map_store_error)
         };
-        execute_follow_through(
+        if execute_follow_through(
             Command::RegisterAgentSession {
                 agent: agent.clone(),
             },
             1,
-        )?;
-        execute_follow_through(
-            Command::RegisterResource {
-                resource: resource.clone(),
-            },
-            2,
-        )?;
-        execute_follow_through(
-            Command::SetPrimaryAgent {
-                agent_session_id: agent.id,
-            },
-            3,
-        )?;
+        )
+        .is_err()
+            || execute_follow_through(
+                Command::RegisterResource {
+                    resource: resource.clone(),
+                },
+                2,
+            )
+            .is_err()
+            || execute_follow_through(
+                Command::SetPrimaryAgent {
+                    agent_session_id: agent.id,
+                },
+                3,
+            )
+            .is_err()
+        {
+            return Ok(DuplexExecuteCompletion::CallerMustWrite(
+                ServerMessage::CommandReceipt(receipt),
+            ));
+        }
         self.fan_out_live_durable_events();
 
         let start = ClientRequest::Command(CommandEnvelope {
@@ -3199,9 +3215,39 @@ impl HostRequestExecutor {
                 },
             ),
         });
-        let _ = self
+        if self
             .dispatch_provider_start(negotiated, start, output_id)
-            .await;
+            .await
+            .is_err()
+        {
+            if let Some(revision) = self
+                .bus
+                .task_snapshot(task_id)
+                .ok()
+                .flatten()
+                .map(|snapshot| snapshot.task.revision)
+            {
+                let _ = self
+                    .bus
+                    .execute_host_authorized(
+                        CommandEnvelope {
+                            command_id: crate::domain::CommandId::new(),
+                            client_id: negotiated.client_id,
+                            task_id: Some(task_id),
+                            issued_at_ms,
+                            expected_task_revision: Some(revision),
+                            command: Command::SetTaskAttention(SetTaskAttentionIntent {
+                                attention: crate::domain::task::TaskAttention::Failed,
+                            }),
+                        },
+                        None,
+                        RequestId::new(),
+                        connection_id,
+                    )
+                    .map_err(map_store_error);
+                self.fan_out_live_durable_events();
+            }
+        }
         Ok(DuplexExecuteCompletion::CallerMustWrite(
             ServerMessage::CommandReceipt(receipt),
         ))
@@ -3319,35 +3365,10 @@ impl HostRequestExecutor {
         };
 
         let agents = if let Some(runtime) = self.configured_service_runtime.as_ref() {
-            let registry = runtime.manager.provider_host().registry();
-            let discovery = crate::providers::ProviderDiscoveryConfig::default();
-            let claude = registry
-                .observe(crate::providers::ProviderKind::ClaudeCode, &discovery)
-                .await;
-            let codex = registry
-                .observe(crate::providers::ProviderKind::Codex, &discovery)
-                .await;
-            vec![
-                super::agent_connection::map_provider_observe(
-                    crate::domain::ConfigSidebarProviderKind::Claude,
-                    claude.as_ref(),
-                ),
-                super::agent_connection::map_provider_observe(
-                    crate::domain::ConfigSidebarProviderKind::Codex,
-                    codex.as_ref(),
-                ),
-            ]
+            super::agent_connection::probe_agents(runtime.manager.provider_host().registry()).await
         } else {
-            vec![
-                crate::domain::AgentConnectionRow {
-                    provider: crate::domain::ConfigSidebarProviderKind::Claude,
-                    presence: crate::domain::AgentPresence::CheckFailed,
-                },
-                crate::domain::AgentConnectionRow {
-                    provider: crate::domain::ConfigSidebarProviderKind::Codex,
-                    presence: crate::domain::AgentPresence::CheckFailed,
-                },
-            ]
+            let manager = crate::services::ProcessManager::new();
+            super::agent_connection::probe_agents(manager.provider_host().registry()).await
         };
         Ok(DuplexExecuteCompletion::CallerMustWrite(
             ServerMessage::QueryReply(QueryReply {
@@ -8055,6 +8076,7 @@ mod output_tests {
             .find(|resource| resource.task_id == Some(task_id))
             .expect("primary resource");
         assert_eq!(resource.runtime_generation, 1);
+        assert_eq!(snapshot.attention, TaskAttention::Failed);
         drop(bus);
 
         let cursor_task_id = TaskId::new();

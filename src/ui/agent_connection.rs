@@ -65,10 +65,30 @@ pub fn connect_canvas_copy(snapshot: Option<&AgentConnectionSnapshot>) -> (&'sta
             "Add a project",
             "Use + in the project list to add one.".into(),
         )
+    } else if snapshot.is_some_and(|snapshot| {
+        snapshot
+            .agents
+            .iter()
+            .any(|row| row.presence == AgentPresence::Checking)
+    }) {
+        (
+            "Checking agents",
+            "Looking for Claude Code and Codex on this machine.".into(),
+        )
+    } else if snapshot.is_some_and(|snapshot| {
+        snapshot
+            .agents
+            .iter()
+            .any(|row| row.presence == AgentPresence::CheckFailed)
+    }) {
+        (
+            "Could not check agents",
+            "Use Refresh to look for Claude Code and Codex. Sign in with those apps on this machine; DevManager does not log you in.".into(),
+        )
     } else {
         (
             "Connect an agent",
-            "Sign in with Claude Code or Codex on this machine, then Refresh. You can add a project after one of them is connected.".into(),
+            "Sign in with Claude Code or Codex on this machine, then Refresh. DevManager does not log you in.".into(),
         )
     }
 }
@@ -80,7 +100,10 @@ mod tests {
     };
     use crate::providers::ProviderKind;
 
-    use super::{inbox_agent_actions, placeholder_task_title, settings_row_copy, InboxAgentAction};
+    use super::{
+        connect_canvas_copy, inbox_agent_actions, placeholder_task_title, settings_row_copy,
+        InboxAgentAction,
+    };
 
     #[test]
     fn placeholder_titles_are_non_empty_and_provider_specific() {
@@ -115,6 +138,46 @@ mod tests {
                 label: "+Claude",
             }]
         );
+    }
+
+    #[test]
+    fn checking_canvas_does_not_tell_the_user_to_sign_in() {
+        let snapshot = AgentConnectionSnapshot {
+            agents: vec![
+                AgentConnectionRow {
+                    provider: ConfigSidebarProviderKind::Claude,
+                    presence: AgentPresence::Checking,
+                },
+                AgentConnectionRow {
+                    provider: ConfigSidebarProviderKind::Codex,
+                    presence: AgentPresence::Checking,
+                },
+            ],
+        };
+        let (title, detail) = connect_canvas_copy(Some(&snapshot));
+        assert_eq!(title, "Checking agents");
+        assert!(!detail.to_ascii_lowercase().contains("sign in"));
+    }
+
+    #[test]
+    fn check_failed_canvas_points_at_refresh_not_in_app_login() {
+        let snapshot = AgentConnectionSnapshot {
+            agents: vec![
+                AgentConnectionRow {
+                    provider: ConfigSidebarProviderKind::Claude,
+                    presence: AgentPresence::CheckFailed,
+                },
+                AgentConnectionRow {
+                    provider: ConfigSidebarProviderKind::Codex,
+                    presence: AgentPresence::CheckFailed,
+                },
+            ],
+        };
+        let (title, detail) = connect_canvas_copy(Some(&snapshot));
+        assert_eq!(title, "Could not check agents");
+        let lower = detail.to_ascii_lowercase();
+        assert!(lower.contains("refresh"));
+        assert!(lower.contains("does not log you in"));
     }
 
     #[test]
