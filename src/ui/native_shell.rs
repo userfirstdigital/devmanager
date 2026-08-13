@@ -72,7 +72,10 @@ use crate::ui::actions::{
     NativeResetLayout, NativeToggleDock, NativeToggleSidebar, NativeToggleTerminal, TaskCreate,
     TaskListAction, TaskRename, TaskShow,
 };
-use crate::ui::agent_connection::{connect_canvas_copy, settings_row_copy, snapshot_connected};
+use crate::providers::ProviderKind;
+use crate::ui::agent_connection::{
+    connect_canvas_copy, inbox_agent_actions, settings_row_copy, snapshot_connected,
+};
 use crate::ui::components::interaction::{FocusEpoch, FocusEpochSource};
 use crate::ui::components::status_light::{ExternalPortStatus, StatusLight};
 use crate::ui::components::text_field::{TextField, TextFieldKey};
@@ -1725,7 +1728,6 @@ struct NewTaskDraft {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PaletteItem {
     AddProject,
-    NewTask,
     ToggleSidebar,
     ToggleDock,
     ToggleTerminal,
@@ -1757,9 +1759,8 @@ struct OverlayTextFieldChrome {
 }
 
 impl PaletteItem {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 5] = [
         Self::AddProject,
-        Self::NewTask,
         Self::ToggleSidebar,
         Self::ToggleDock,
         Self::ToggleTerminal,
@@ -1773,7 +1774,7 @@ impl PaletteItem {
         match stage {
             ShellStage::Connecting | ShellStage::Recovery => &[Self::AddProject],
             ShellStage::Welcome => &[Self::AddProject],
-            ShellStage::FirstTask => &[Self::AddProject, Self::NewTask],
+            ShellStage::FirstTask => &[Self::AddProject],
             ShellStage::Cockpit => &Self::ALL,
         }
     }
@@ -1781,7 +1782,6 @@ impl PaletteItem {
     fn title(self) -> &'static str {
         match self {
             Self::AddProject => "Add project",
-            Self::NewTask => "New task",
             Self::ToggleSidebar => "Toggle configuration",
             Self::ToggleDock => "Toggle context dock",
             Self::ToggleTerminal => "Toggle terminal",
@@ -1792,7 +1792,6 @@ impl PaletteItem {
     fn hint(self) -> &'static str {
         match self {
             Self::AddProject => "Choose a folder on this computer",
-            Self::NewTask => "Name a piece of work",
             Self::ToggleSidebar => "Ctrl+B",
             Self::ToggleDock => "Ctrl+Alt+B",
             Self::ToggleTerminal => "Ctrl+J",
@@ -5364,35 +5363,27 @@ impl AccessibilityTree {
         welcome_copy: (&str, String),
         show_project_plus: bool,
     ) -> Self {
-        let (canvas_id, title, detail, cta) = match stage {
+        let (canvas_id, title, detail) = match stage {
             ShellStage::Connecting => (
                 "native-shell-setup-connecting",
                 "Getting ready".to_string(),
                 "DevManager is starting up.".to_string(),
-                None,
             ),
             ShellStage::Recovery => (
                 "native-shell-setup-recovery",
                 "Can't load your settings".to_string(),
                 "DevManager needs to recover before you can continue.".to_string(),
-                None,
             ),
             ShellStage::Welcome => (
                 "native-shell-setup-welcome",
                 welcome_copy.0.to_string(),
                 welcome_copy.1,
-                None,
             ),
             ShellStage::FirstTask => (
                 "native-shell-setup-first-task",
                 "Start a task".to_string(),
                 "Name the work you want to do. Chat, files, and the terminal open with that task."
                     .to_string(),
-                Some((
-                    "native-setup-create-task",
-                    "Create a task",
-                    "Give this work a name.",
-                )),
             ),
             ShellStage::Cockpit => {
                 unreachable!("cockpit uses the task-list accessibility tree")
@@ -5432,12 +5423,6 @@ impl AccessibilityTree {
                     "Choose a folder to add as a project.",
                 )
                 .gpui("native-projects-add", true, true),
-            );
-        }
-        if let Some((cta_id, cta_label, cta_description)) = cta {
-            children.push(
-                AccessibilityNode::new(AccessibleRole::Button, cta_label, cta_description)
-                    .gpui(cta_id, true, true),
             );
         }
         let root = AccessibilityNode::new(
@@ -5882,8 +5867,8 @@ pub struct NativeShell {
     add_project: Option<AddProjectDraft>,
     settings_open: bool,
     pending_folder_prompt: bool,
-    first_task_overlay_offered: bool,
     new_task: Option<NewTaskDraft>,
+    pending_inbox_agent: Option<ProviderKind>,
     palette_index: usize,
     pending_select_task: Option<TaskId>,
 }
@@ -6197,8 +6182,8 @@ impl NativeShell {
             add_project: None,
             settings_open: false,
             pending_folder_prompt: false,
-            first_task_overlay_offered: false,
             new_task: None,
+            pending_inbox_agent: None,
             palette_index: 0,
             pending_select_task: None,
         };
@@ -8643,7 +8628,6 @@ impl NativeShell {
             }
             _ if !snapshot_connected(self.agent_connection.as_ref()) => ShellStage::Welcome,
             _ if self.config_sidebar.projects.is_empty() => ShellStage::Welcome,
-            _ if self.task_list.task_ids().is_empty() => ShellStage::FirstTask,
             _ => ShellStage::Cockpit,
         }
     }
@@ -8873,21 +8857,20 @@ impl NativeShell {
         self.offer_first_task_if_needed();
     }
 
-    fn offer_first_task_if_needed(&mut self) {
-        if self.first_task_overlay_offered {
+    fn offer_first_task_if_needed(&mut self) {}
+
+    fn start_task_with_agent(&mut self, kind: ProviderKind) {
+        let Some(snapshot) = self.agent_connection.as_ref() else {
+            return;
+        };
+        if self.first_workspace_project_id().is_none()
+            || !inbox_agent_actions(snapshot)
+                .iter()
+                .any(|action| action.provider == kind)
+        {
             return;
         }
-        if self.shell_stage() != ShellStage::FirstTask {
-            return;
-        }
-        if self.new_task.is_some() || self.add_project.is_some() {
-            return;
-        }
-        if self.first_workspace_project_id().is_none() {
-            return;
-        }
-        self.first_task_overlay_offered = true;
-        self.begin_new_task();
+        self.pending_inbox_agent = Some(kind);
     }
 
     fn begin_new_task(&mut self) {
@@ -8950,9 +8933,10 @@ impl NativeShell {
                     self.settings_open = true;
                 }
             }
-            "native-setup-create-task" | "native-header-new-task" | "native-inbox-new-task" => {
-                self.begin_new_task()
+            "native-inbox-plus-claude" => {
+                self.start_task_with_agent(ProviderKind::ClaudeCode)
             }
+            "native-inbox-plus-codex" => self.start_task_with_agent(ProviderKind::Codex),
             "native-add-project-submit" => {
                 if self
                     .add_project
@@ -8994,7 +8978,6 @@ impl NativeShell {
         self.interaction.close_palettes();
         match item {
             PaletteItem::AddProject => self.begin_choose_folder(cx),
-            PaletteItem::NewTask => self.begin_new_task(),
             PaletteItem::ToggleSidebar => self.toggle_pane(PaneEdge::Sidebar),
             PaletteItem::ToggleDock => self.toggle_pane(PaneEdge::Dock),
             PaletteItem::ToggleTerminal => self.toggle_pane(PaneEdge::Terminal),
@@ -9169,16 +9152,6 @@ impl NativeShell {
             .into_any_element()
     }
 
-    /// Panel header. Uppercase caption at medium weight reads as chrome rather
-    /// than content, which is what separates a panel from the text inside it
-    /// when every surface shares one hue.
-    fn panel_label(
-        label: impl Into<String>,
-        tokens: crate::ui::tokens::ThemeTokens,
-    ) -> impl IntoElement {
-        Self::panel_header(label, tokens, None)
-    }
-
     fn panel_header(
         label: impl Into<String>,
         tokens: crate::ui::tokens::ThemeTokens,
@@ -9225,6 +9198,64 @@ impl NativeShell {
             .into_any_element()
     }
 
+    fn inbox_agent_action_id(provider: ProviderKind) -> &'static str {
+        match provider {
+            ProviderKind::ClaudeCode => "native-inbox-plus-claude",
+            ProviderKind::Codex => "native-inbox-plus-codex",
+            ProviderKind::Cursor => unreachable!("Cursor is not an inbox agent action"),
+        }
+    }
+
+    fn inbox_agent_header_actions_static(&self) -> Option<AnyElement> {
+        if self.first_workspace_project_id().is_none() {
+            return None;
+        }
+        let actions = inbox_agent_actions(self.agent_connection.as_ref()?);
+        (!actions.is_empty()).then(|| {
+            div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap(px(self.preferences.tokens().density.spacing.xs))
+                .children(actions.into_iter().map(|action| {
+                    Button::new(Self::inbox_agent_action_id(action.provider))
+                        .label(action.label)
+                        .ghost()
+                        .into_any_element()
+                }))
+                .into_any_element()
+        })
+    }
+
+    fn inbox_agent_header_actions(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        if self.first_workspace_project_id().is_none() {
+            return None;
+        }
+        let actions = inbox_agent_actions(self.agent_connection.as_ref()?);
+        (!actions.is_empty()).then(|| {
+            div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap(px(self.preferences.tokens().density.spacing.xs))
+                .children(actions.into_iter().map(|action| {
+                    let provider = action.provider;
+                    Button::new(Self::inbox_agent_action_id(provider))
+                        .label(action.label)
+                        .ghost()
+                        .on_click(cx.listener(
+                            move |shell, _event: &ClickEvent, _window, cx| {
+                                cx.stop_propagation();
+                                shell.start_task_with_agent(provider);
+                                cx.notify();
+                            },
+                        ))
+                        .into_any_element()
+                }))
+                .into_any_element()
+        })
+    }
+
     /// Column widths and the terminal height are user-owned and persisted;
     /// their bounds live with the layout store that clamps them.
     ///
@@ -9243,7 +9274,7 @@ impl NativeShell {
         tokens: crate::ui::tokens::ThemeTokens,
         body: AnyElement,
     ) -> AnyElement {
-        Self::panel_frame(id, label, tokens, body, false)
+        Self::panel_frame(id, label, tokens, body, false, None)
     }
 
     /// Panel that claims the leftover height of its column. Column-filling
@@ -9254,8 +9285,9 @@ impl NativeShell {
         label: impl Into<String>,
         tokens: crate::ui::tokens::ThemeTokens,
         body: AnyElement,
+        trailing: Option<AnyElement>,
     ) -> AnyElement {
-        Self::panel_frame(id, label, tokens, body, true)
+        Self::panel_frame(id, label, tokens, body, true, trailing)
     }
 
     fn panel_frame(
@@ -9264,6 +9296,7 @@ impl NativeShell {
         tokens: crate::ui::tokens::ThemeTokens,
         body: AnyElement,
         grow: bool,
+        trailing: Option<AnyElement>,
     ) -> AnyElement {
         let frame = div()
             .id(id)
@@ -9289,7 +9322,7 @@ impl NativeShell {
             frame.flex_none()
         };
         frame
-            .child(Self::panel_label(label, tokens))
+            .child(Self::panel_header(label, tokens, trailing))
             .child(body)
             .into_any_element()
     }
@@ -9398,7 +9431,7 @@ impl NativeShell {
             "native-shell-task-inbox-empty",
             "+",
             "No tasks yet",
-            "Create a task to open its conversation.",
+            "Use +Claude or +Codex to start.",
             tokens,
             action,
         )
@@ -10985,6 +11018,7 @@ impl NativeShell {
                                 self.cockpit
                                     .conversation_surface(tokens, self.composer.as_ref())
                                     .into_any_element(),
+                                None,
                             ))
                             .child(
                                 // Reference data, not the primary surface: it
@@ -11182,13 +11216,19 @@ impl NativeShell {
                 .children(task_rows)
                 .into_any_element()
         };
-        let inbox =
-            Self::stacked_panel_grow("native-shell-task-inbox", "Task inbox", tokens, inbox_body);
+        let inbox = Self::stacked_panel_grow(
+            "native-shell-task-inbox",
+            "Task inbox",
+            tokens,
+            inbox_body,
+            self.inbox_agent_header_actions_static(),
+        );
         let dock = Self::stacked_panel_grow(
             "native-shell-context-dock",
             self.cockpit.active_tool().label(),
             tokens,
             self.context_dock_surface(tokens, None),
+            None,
         );
         let show_sidebar = !layout.sidebar_collapsed;
         div()
@@ -11659,26 +11699,12 @@ impl NativeShell {
             .child(self.context_dock_surface(tokens, Some(services_shell_entity)))
             .into_any_element();
 
-        let inbox_empty_action = div()
-            .flex()
-            .gap(px(tokens.density.spacing.sm))
-            .child(
-                Button::new("native-inbox-new-task")
-                    .label("New task")
-                    .primary()
-                    .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
-                        cx.stop_propagation();
-                        shell.begin_new_task();
-                        cx.notify();
-                    })),
-            )
-            .into_any_element();
         let inbox_panel = Self::stacked_panel_grow(
             "native-shell-task-inbox",
             "Task inbox",
             tokens,
             if inbox_is_empty {
-                Self::inbox_empty_state(tokens, Some(inbox_empty_action))
+                Self::inbox_empty_state(tokens, None)
             } else {
                 div()
                     .id("native-shell-task-inbox-rows")
@@ -11694,6 +11720,7 @@ impl NativeShell {
                     .child(task_list_element)
                     .into_any_element()
             },
+            self.inbox_agent_header_actions(cx),
         );
 
         let host_status_control = div()
@@ -11732,37 +11759,8 @@ impl NativeShell {
         let stage = self.shell_stage();
         let show_sidebar = !layout.sidebar_collapsed && stage == ShellStage::Cockpit;
         let pane_toggles = (stage == ShellStage::Cockpit).then(|| self.pane_toggles(tokens, cx));
-        let workspace_actions =
-            matches!(stage, ShellStage::FirstTask | ShellStage::Cockpit).then(|| {
-                div()
-                    .id("native-shell-workspace-actions")
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .gap(px(tokens.density.spacing.xs))
-                    .child(
-                        Button::new("native-header-new-task")
-                            .label("New task")
-                            .primary()
-                            .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
-                                cx.stop_propagation();
-                                shell.begin_new_task();
-                                cx.notify();
-                            })),
-                    )
-                    .into_any_element()
-            });
-        let setup_action = match stage {
-            ShellStage::Cockpit => None,
-            ShellStage::FirstTask => Some(Self::primary_action_button(
-                "native-setup-create-task",
-                "Create a task",
-                tokens,
-                cx,
-                |shell, _cx| shell.begin_new_task(),
-            )),
-            ShellStage::Welcome | ShellStage::Connecting | ShellStage::Recovery => None,
-        };
+        let workspace_actions = None;
+        let setup_action = None;
         let setup_project_plus = self.shows_add_project_plus().then(|| {
             Button::new("native-projects-add")
                 .label("+")
@@ -12411,7 +12409,7 @@ mod tests {
         NativeHostRuntimeEpochs, NativeHostRuntimePort, NativeHostWorkerCommand, NativeInteraction,
         NativeHeaderAttachment, NativePlatformAccessibilityBridge, NativeShell, NativeShellMode,
         NativeShutdownDeadline, OverlayTextFieldPart, OwnedChild, OwnedWorker, PaletteItem,
-        AgentPresence, ReaperKind, ShellStage, TaskId, UpdateState, UpdaterStage,
+        AgentPresence, ProviderKind, ReaperKind, ShellStage, TaskId, UpdateState, UpdaterStage,
         MAX_ACTION_LANE_RECORDS, MAX_ACTION_OUTCOME_PROJECTIONS, MAX_HOST_PROJECTIONS,
         MAX_PENDING_HOST_ACTIONS, MAX_PENDING_PREFERENCES, MAX_RETAINED_CHILDREN,
         MAX_RETAINED_WORKERS, MAX_RETRY_HOST_ACTIONS, PRODUCTION_HOST_PROFILE,
@@ -12900,6 +12898,7 @@ mod tests {
             crate::ui::init(cx);
             let (runtime, _) = TestRuntime::new(true, NativeHostActionResult::Queued);
             let snapshot = with_test_shell_in_app(cx, runtime, |shell| {
+                shell.agent_connection = Some(agent_connection_snapshot(AgentPresence::SignedIn));
                 shell.install_named_folder_for_test("command");
                 shell.sync_header_projection();
                 let header = match shell.header_attachment() {
@@ -12923,7 +12922,7 @@ mod tests {
             .borrow()
             .clone()
             .expect("first-task copy snapshot");
-        assert_eq!(stage, ShellStage::FirstTask);
+        assert_eq!(stage, ShellStage::Cockpit);
         assert!(
             !title.eq_ignore_ascii_case("command"),
             "header must not restamp the folder name next to DevManager: {title:?}"
@@ -12939,7 +12938,7 @@ mod tests {
     }
 
     #[test]
-    fn first_task_stage_opens_the_name_overlay_once() {
+    fn first_task_does_not_open_a_name_overlay() {
         let _test_guard = HEADLESS_SHELL_TEST_LOCK
             .get_or_init(|| Mutex::new(()))
             .lock()
@@ -12950,13 +12949,10 @@ mod tests {
             crate::ui::init(cx);
             let (runtime, _) = TestRuntime::new(true, NativeHostActionResult::Queued);
             let snapshot = with_test_shell_in_app(cx, runtime, |shell| {
+                shell.agent_connection = Some(agent_connection_snapshot(AgentPresence::SignedIn));
                 shell.install_named_folder_for_test("command");
                 shell.offer_first_task_if_needed();
-                let opened = shell.new_task_overlay_open_for_test();
-                shell.dispatch_named_accessibility_action("native-new-task-cancel");
-                shell.offer_first_task_if_needed();
                 (
-                    opened,
                     shell.new_task_overlay_open_for_test(),
                     shell.shell_stage(),
                 )
@@ -12964,16 +12960,43 @@ mod tests {
             *completed_for_app.borrow_mut() = Some(snapshot);
             cx.quit();
         });
-        let (opened, reopened, stage) = completed
+        let (opened, stage) = completed
             .borrow()
             .clone()
             .expect("first-task overlay snapshot");
-        assert_eq!(stage, ShellStage::FirstTask);
-        assert!(opened, "first-task must open Name this task once");
-        assert!(
-            !reopened,
-            "cancelling Name this task must not reopen it on the next offer"
-        );
+        assert_eq!(stage, ShellStage::Cockpit);
+        assert!(!opened, "first-task must not open Name this task");
+    }
+
+    #[test]
+    fn inbox_plus_claude_selects_claude_without_opening_name_overlay() {
+        let _test_guard = HEADLESS_SHELL_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("headless shell test lock");
+        let completed = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let completed_for_app = std::rc::Rc::clone(&completed);
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            let (runtime, _) = TestRuntime::new(true, NativeHostActionResult::Queued);
+            let snapshot = with_test_shell_in_app(cx, runtime, |shell| {
+                shell.agent_connection = Some(agent_connection_snapshot(AgentPresence::SignedIn));
+                shell.install_named_folder_for_test("command");
+                shell.dispatch_named_accessibility_action("native-inbox-plus-claude");
+                (
+                    shell.pending_inbox_agent,
+                    shell.new_task_overlay_open_for_test(),
+                )
+            });
+            *completed_for_app.borrow_mut() = Some(snapshot);
+            cx.quit();
+        });
+        let (pending_agent, overlay_open) = completed
+            .borrow()
+            .clone()
+            .expect("inbox agent action snapshot");
+        assert_eq!(pending_agent, Some(ProviderKind::ClaudeCode));
+        assert!(!overlay_open);
     }
 
     #[test]
@@ -12988,6 +13011,7 @@ mod tests {
             crate::ui::init(cx);
             let (runtime, _) = TestRuntime::new(true, NativeHostActionResult::Queued);
             let snapshot = with_test_shell_in_app(cx, runtime, |shell| {
+                shell.agent_connection = Some(agent_connection_snapshot(AgentPresence::SignedIn));
                 let welcome_shows = shell.header_shows_settings_for_test();
                 assert!(!shell.settings_open_for_test());
                 shell.dispatch_named_accessibility_action("native-header-settings");
@@ -13014,13 +13038,13 @@ mod tests {
         assert!(welcome_open, "settings must open from welcome header");
         assert!(
             after_project_shows,
-            "first-task header must show Settings"
+            "empty-inbox header must show Settings"
         );
         assert!(
             after_project_open,
-            "settings must open from first-task header"
+            "settings must open from empty-inbox header"
         );
-        assert_eq!(stage, ShellStage::FirstTask);
+        assert_eq!(stage, ShellStage::Cockpit);
     }
 
     #[test]
