@@ -22,6 +22,20 @@ The active codebase lives at the repo root. Approved design history remains unde
 
 ## Run
 
+For the easiest isolated test launch, double-click `launch-dev.bat` or run:
+
+```powershell
+.\launch-dev.bat
+```
+
+This builds and launches `devmanager.exe` with its required sibling
+`devmanager-host.exe` under the generated workspace-bound development profile.
+It does not stop or reuse the installed DevManager instance. Startup failures
+remain visible in the launcher window and are recorded in
+`target-live-dev/launch-status.txt`.
+
+For a direct Cargo run:
+
 ```powershell
 cargo run
 ```
@@ -43,7 +57,7 @@ watch.bat
 ```
 
 The watcher listens to `src/`, `assets/`, `Cargo.toml`, and `Cargo.lock`.
-Each successful rebuild goes to `target-watch/`, then the script copies the fresh binary to `target-live/` and relaunches from there.
+Each successful rebuild goes to `target-watch/`, then the script copies both fresh binaries to `target-live-dev/` and relaunches from there.
 That split avoids Windows locking the compiler output while the app is running, and a failed build leaves the last good app window untouched.
 
 If you only want a single rebuild-and-launch cycle, run:
