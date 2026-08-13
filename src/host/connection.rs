@@ -3187,8 +3187,9 @@ impl HostRequestExecutor {
                 },
             ),
         });
-        self.dispatch_provider_start(negotiated, start, output_id)
-            .await?;
+        let _ = self
+            .dispatch_provider_start(negotiated, start, output_id)
+            .await;
         Ok(DuplexExecuteCompletion::CallerMustWrite(
             ServerMessage::CommandReceipt(receipt),
         ))
@@ -7942,6 +7943,148 @@ mod output_tests {
         drop(requests);
         executor.abort();
         let _ = executor.await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn create_with_primary_provider_keeps_bindings_when_launch_fails() {
+        use std::process::Command as ProcessCommand;
+
+        use crate::domain::command::{Command, CommandEnvelope, CreateTaskRequestIntent};
+        use crate::domain::id::{CommandId, EnvironmentId, ProjectId, TaskId};
+        use crate::domain::task::{
+            ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity,
+        };
+        use crate::host::IpcError;
+        use crate::kernel::CommandBus;
+        use crate::protocol::{Capability, CapabilitySet, FrameLimits, ProtocolVersion};
+        use crate::providers::ProviderKind;
+        use crate::workspace::{WorkspaceProjectRoots, WorkspaceRequest};
+
+        let repository = tempfile::tempdir().expect("repository");
+        let output = ProcessCommand::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(repository.path())
+            .output()
+            .expect("git init");
+        assert!(output.status.success());
+        let database = repository.path().join("create-primary-executor.sqlite");
+        let project_id = ProjectId::new();
+        let project_roots =
+            WorkspaceProjectRoots::try_from_pairs([(project_id, repository.path().to_path_buf())])
+                .expect("project roots");
+        let client = ClientId::new();
+        let negotiated = NegotiatedParameters {
+            version: ProtocolVersion::current(),
+            client_id: client,
+            capabilities: CapabilitySet::from_capabilities([Capability::ProviderInput]),
+            limits: FrameLimits::v1_default(),
+        };
+        let task_id = TaskId::new();
+        let bus = CommandBus::open(&database).expect("bus");
+        let (requests, executor) =
+            HostRequestExecutor::start_without_automatic_maintenance_with_workspace_projects(
+                bus,
+                project_roots.clone(),
+            );
+        let (out, _ports) = ConnectionOutputHandle::new(4, 8, 1);
+        let registration = requests.register_output(out).await.expect("register");
+        let handle = requests.with_output(registration.id());
+        let result = handle
+            .execute(
+                negotiated.clone(),
+                ClientRequest::Command(CommandEnvelope {
+                    command_id: CommandId::new(),
+                    client_id: client,
+                    task_id: None,
+                    issued_at_ms: 1_725_000_000_800,
+                    expected_task_revision: None,
+                    command: Command::CreateTaskV2(CreateTaskRequestIntent {
+                        id: task_id,
+                        environment_id: EnvironmentId::new(),
+                        title: "Claude primary".into(),
+                        description: None,
+                        project_id,
+                        workspace: WorkspaceRequest::main(),
+                        primary_provider: Some(ProviderKind::ClaudeCode),
+                        assignment: TaskAssignment::LocalOwner,
+                        created_at_ms: 1_725_000_000_800,
+                        connectivity: TaskConnectivity::Connected,
+                        attention: TaskAttention::None,
+                        activity: TaskActivity::Idle,
+                        review_readiness: ReviewReadiness::NotReady,
+                    }),
+                }),
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Ok(ServerMessage::CommandReceipt(
+                crate::domain::command::CommandReceipt::Accepted { .. }
+            ))
+        ));
+        drop(registration);
+        drop(requests);
+        executor.abort();
+        let _ = executor.await;
+
+        let bus = CommandBus::open(&database).expect("reopen bus");
+        let snapshot = bus
+            .task_snapshot(task_id)
+            .expect("snapshot")
+            .expect("created task");
+        let agent_id = snapshot.primary_agent_id.expect("primary agent");
+        assert_eq!(snapshot.agents[&agent_id].runtime_generation, 1);
+        let resource = snapshot
+            .resources
+            .values()
+            .find(|resource| resource.task_id == Some(task_id))
+            .expect("primary resource");
+        assert_eq!(resource.runtime_generation, 1);
+        drop(bus);
+
+        let cursor_task_id = TaskId::new();
+        let bus = CommandBus::open(&database).expect("bus for cursor rejection");
+        let (requests, executor) =
+            HostRequestExecutor::start_without_automatic_maintenance_with_workspace_projects(
+                bus,
+                project_roots,
+            );
+        let cursor = requests
+            .execute(
+                negotiated,
+                ClientRequest::Command(CommandEnvelope {
+                    command_id: CommandId::new(),
+                    client_id: client,
+                    task_id: None,
+                    issued_at_ms: 1_725_000_000_801,
+                    expected_task_revision: None,
+                    command: Command::CreateTaskV2(CreateTaskRequestIntent {
+                        id: cursor_task_id,
+                        environment_id: EnvironmentId::new(),
+                        title: "Cursor primary".into(),
+                        description: None,
+                        project_id,
+                        workspace: WorkspaceRequest::main(),
+                        primary_provider: Some(ProviderKind::Cursor),
+                        assignment: TaskAssignment::LocalOwner,
+                        created_at_ms: 1_725_000_000_801,
+                        connectivity: TaskConnectivity::Connected,
+                        attention: TaskAttention::None,
+                        activity: TaskActivity::Idle,
+                        review_readiness: ReviewReadiness::NotReady,
+                    }),
+                }),
+            )
+            .await;
+        assert!(matches!(cursor, Err(IpcError::Unavailable)));
+        drop(requests);
+        executor.abort();
+        let _ = executor.await;
+        let bus = CommandBus::open(&database).expect("reopen cursor bus");
+        assert!(bus
+            .task_snapshot(cursor_task_id)
+            .expect("cursor task lookup")
+            .is_none());
     }
 
     #[tokio::test(flavor = "current_thread")]
