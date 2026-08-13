@@ -5444,7 +5444,7 @@ impl AccessibilityTree {
                 AccessibilityNode::new(
                     AccessibleRole::Button,
                     "Add project",
-                    "Choose a folder to add as a project.",
+                    "Choose a project location.",
                 )
                 .gpui("native-projects-add", true, true),
             );
@@ -9841,7 +9841,7 @@ impl NativeShell {
                                     .child(if has_folder {
                                         "You can change the name. Nothing is added until you confirm."
                                     } else {
-                                        "Choose a folder on this computer. Nothing is added until you confirm."
+                                        "Choose a project location on this computer. Nothing is added until you confirm."
                                     }),
                             )
                             .child(
@@ -10150,7 +10150,7 @@ impl NativeShell {
                                     .text_size(px(tokens.density.typography.heading))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(tokens.text.primary.to_gpui())
-                                    .child("Name this task"),
+                                    .child("Create task"),
                             )
                             .child(
                                 div()
