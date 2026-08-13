@@ -8655,7 +8655,7 @@ impl NativeShell {
         }
         if name.is_empty() {
             if let Some(draft) = self.add_project.as_mut() {
-                draft.error = Some("Give this folder a name.".into());
+                draft.error = Some("Give this project a name.".into());
             }
             return;
         }
@@ -8667,7 +8667,7 @@ impl NativeShell {
             .is_some()
         {
             if let Some(draft) = self.add_project.as_mut() {
-                draft.error = Some("Couldn't add this folder. Try again.".into());
+                draft.error = Some("Couldn't add this project. Try again.".into());
                 draft.submitting = false;
             }
             return;
@@ -12352,6 +12352,32 @@ mod tests {
         assert_eq!(
             PaletteItem::AddProject.hint(),
             "Choose a folder on this computer"
+        );
+    }
+
+    #[test]
+    fn add_project_overlay_error_says_project_not_folder() {
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/ui/native_shell.rs"
+        ));
+        assert!(
+            source.contains("Give this project a name."),
+            "empty-name overlay error should say project, not folder"
+        );
+        assert!(
+            source.contains("Couldn't add this project. Try again."),
+            "add-project failure overlay error should say project, not folder"
+        );
+        let folder_name_err = concat!("Give this ", "folder", " a name.");
+        let folder_add_err = concat!("Couldn't add this ", "folder", ". Try again.");
+        assert!(
+            !source.contains(folder_name_err),
+            "overlay should not use folder wording for name validation"
+        );
+        assert!(
+            !source.contains(folder_add_err),
+            "overlay should not use folder wording for add failure"
         );
     }
 
