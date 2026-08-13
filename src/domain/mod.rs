@@ -30,9 +30,9 @@ pub use artifact::{
 };
 pub use cockpit::{
     cockpit_surface, git_projection, relative_path_is_safe, task_agent_resource_projection,
-    workspace_projection, ConfigSidebarFolder, ConfigSidebarProject, ConfigSidebarProvider,
-    ConfigSidebarProviderKind, ConfigSidebarServer, ConfigSidebarSnapshot, ConfigSidebarSsh,
-    TaskAgentResourceProjection, TaskCockpitDeniedReason, TaskCockpitQuery, TaskCockpitResult,
+    workspace_projection, AgentConnectionRow, AgentConnectionSnapshot, AgentPresence,
+    ConfigSidebarFolder, ConfigSidebarProject, ConfigSidebarProvider, ConfigSidebarProviderKind,
+    ConfigSidebarServer, ConfigSidebarSnapshot, ConfigSidebarSsh, TaskAgentResourceProjection, TaskCockpitDeniedReason, TaskCockpitQuery, TaskCockpitResult,
     TaskCockpitSurface, TaskCockpitUnavailableReason, TaskFileEntry, TaskFilesListProjection,
     TaskFilesReadProjection, TaskGitMutateIntent, TaskGitProjection, TaskServiceProjection,
     TaskServiceRuntimeState, TaskServiceScope, TaskServiceSnapshot, TaskSshEndpoint,

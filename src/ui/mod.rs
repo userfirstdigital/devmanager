@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use gpui::{App, Global};
 
 pub mod actions;
+pub mod agent_connection;
 pub mod components;
 pub mod native_shell;
 pub mod preview;
@@ -16,6 +17,7 @@ pub mod shell;
 pub mod task_cockpit;
 pub mod terminal_adapter;
 pub mod tokens;
+pub mod workspace_layout;
 
 pub use native_shell::{NativeClientDetach, NativeHostFullQuit};
 pub use preview::PreviewInitReport;
