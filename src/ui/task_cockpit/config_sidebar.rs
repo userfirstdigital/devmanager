@@ -465,13 +465,18 @@ impl ConfigSidebarProjection {
 
     /// Render-only surface. The shell owns dispatch and can therefore preserve
     /// the native terminal/browser surfaces while this rail is updated.
-    pub fn surface(&self, tokens: ThemeTokens) -> AnyElement {
+    pub fn surface(
+        &self,
+        tokens: ThemeTokens,
+        projects_heading_action: Option<AnyElement>,
+    ) -> AnyElement {
         let mut sections = Vec::new();
         sections.push(section(
             self.project_section_title(),
             self.projects.iter().map(|row| row.label.clone()),
             0,
             tokens,
+            projects_heading_action,
         ));
         if !self.servers.is_empty() {
             sections.push(section(
@@ -479,16 +484,8 @@ impl ConfigSidebarProjection {
                 self.servers.iter().map(|row| row.label.clone()),
                 1,
                 tokens,
+                None,
             ));
-        }
-        let configured_providers = self
-            .providers
-            .iter()
-            .filter(|row| row.command_configured)
-            .map(|row| row.label.to_string())
-            .collect::<Vec<_>>();
-        if !configured_providers.is_empty() {
-            sections.push(section("LLM providers", configured_providers, 2, tokens));
         }
         if !self.ssh_connections.is_empty() {
             sections.push(section(
@@ -496,6 +493,7 @@ impl ConfigSidebarProjection {
                 self.ssh_connections.iter().map(|row| row.label.clone()),
                 3,
                 tokens,
+                None,
             ));
         }
         div()
@@ -702,6 +700,7 @@ fn section(
     labels: impl IntoIterator<Item = String>,
     section_id: usize,
     tokens: ThemeTokens,
+    heading_action: Option<AnyElement>,
 ) -> AnyElement {
     let labels: Vec<String> = labels.into_iter().take(MAX_CONFIG_SERVERS).collect();
     let is_empty = labels.is_empty();
@@ -743,13 +742,21 @@ fn section(
         .gap(px(tokens.density.spacing.xxs))
         .child(
             div()
+                .w_full()
+                .flex()
+                .items_center()
+                .justify_between()
                 .px(px(tokens.density.spacing.sm))
                 .pb(px(tokens.density.spacing.xxs))
-                .text_size(px(tokens.density.typography.caption))
-                .line_height(px(tokens.density.typography.caption_line_height))
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(rgb(tokens.text.muted.to_u32()))
-                .child(title.to_uppercase()),
+                .child(
+                    div()
+                        .text_size(px(tokens.density.typography.caption))
+                        .line_height(px(tokens.density.typography.caption_line_height))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(tokens.text.muted.to_u32()))
+                        .child(title.to_uppercase()),
+                )
+                .children(heading_action),
         )
         .children(rows)
         .children(is_empty.then(|| {

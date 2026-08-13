@@ -64,7 +64,6 @@ use crate::protocol::BrowserSecurityState;
 use crate::protocol::StreamFrame;
 use crate::protocol::{Capability, CapabilitySet, FrameLimits};
 use crate::remote::RemoteHostService;
-use crate::ui::agent_connection::settings_row_copy;
 use crate::ui::actions::{
     self, DockTool, HostActions, HostStatus, KeyboardAction, KeyboardModel, KeyboardShortcut,
     NativeDismissTransient, NativeDockArtifacts, NativeDockBrowser, NativeDockChanges,
@@ -73,6 +72,7 @@ use crate::ui::actions::{
     NativeResetLayout, NativeToggleDock, NativeToggleSidebar, NativeToggleTerminal, TaskCreate,
     TaskListAction, TaskRename, TaskShow,
 };
+use crate::ui::agent_connection::{connect_canvas_copy, settings_row_copy, snapshot_connected};
 use crate::ui::components::interaction::{FocusEpoch, FocusEpochSource};
 use crate::ui::components::status_light::{ExternalPortStatus, StatusLight};
 use crate::ui::components::text_field::{TextField, TextFieldKey};
@@ -1766,7 +1766,10 @@ impl PaletteItem {
         Self::ResetLayout,
     ];
 
-    fn for_stage(stage: ShellStage) -> &'static [Self] {
+    fn for_stage(stage: ShellStage, connected: bool) -> &'static [Self] {
+        if !connected {
+            return &[];
+        }
         match stage {
             ShellStage::Connecting | ShellStage::Recovery => &[Self::AddProject],
             ShellStage::Welcome => &[Self::AddProject],
@@ -5344,48 +5347,52 @@ impl AccessibilityTree {
         task_list: &TaskList,
         selected_task: Option<TaskId>,
         header: &NativeHeaderAttachment,
+        welcome_copy: (&str, String),
+        show_project_plus: bool,
     ) -> Self {
         match stage {
             ShellStage::Cockpit => {
                 Self::for_task_list_with_header(task_list, selected_task, header)
             }
-            _ => Self::for_setup(stage, header),
+            _ => Self::for_setup(stage, header, welcome_copy, show_project_plus),
         }
     }
 
-    fn for_setup(stage: ShellStage, header: &NativeHeaderAttachment) -> Self {
-        let (canvas_id, title, detail, cta_id, cta_label, cta_description) = match stage {
+    fn for_setup(
+        stage: ShellStage,
+        header: &NativeHeaderAttachment,
+        welcome_copy: (&str, String),
+        show_project_plus: bool,
+    ) -> Self {
+        let (canvas_id, title, detail, cta) = match stage {
             ShellStage::Connecting => (
                 "native-shell-setup-connecting",
-                "Getting ready",
-                "DevManager is starting up.",
-                "native-setup-add-project",
-                "Choose a folder",
-                "Pick a folder on this computer to start using DevManager.",
+                "Getting ready".to_string(),
+                "DevManager is starting up.".to_string(),
+                None,
             ),
             ShellStage::Recovery => (
                 "native-shell-setup-recovery",
-                "Can't load your settings",
-                "DevManager needs to recover before you can continue.",
-                "native-setup-add-project",
-                "Choose a folder",
-                "Pick a folder on this computer after recovery.",
+                "Can't load your settings".to_string(),
+                "DevManager needs to recover before you can continue.".to_string(),
+                None,
             ),
             ShellStage::Welcome => (
                 "native-shell-setup-welcome",
-                "Welcome to DevManager",
-                "Pick a folder you already have. Tasks, chat, and the terminal stay out of the way until you have somewhere to work.",
-                "native-setup-add-project",
-                "Choose a folder",
-                "Pick a folder on this computer.",
+                welcome_copy.0.to_string(),
+                welcome_copy.1,
+                None,
             ),
             ShellStage::FirstTask => (
                 "native-shell-setup-first-task",
-                "Start a task",
-                "Name the work you want to do. Chat, files, and the terminal open with that task.",
-                "native-setup-create-task",
-                "Create a task",
-                "Give this work a name.",
+                "Start a task".to_string(),
+                "Name the work you want to do. Chat, files, and the terminal open with that task."
+                    .to_string(),
+                Some((
+                    "native-setup-create-task",
+                    "Create a task",
+                    "Give this work a name.",
+                )),
             ),
             ShellStage::Cockpit => {
                 unreachable!("cockpit uses the task-list accessibility tree")
@@ -5396,12 +5403,12 @@ impl AccessibilityTree {
         let header_node = AccessibilityNode::new(
             AccessibleRole::Status,
             if header_label.is_empty() {
-                title.to_string()
+                title.clone()
             } else {
                 header_label
             },
             if header_detail.is_empty() {
-                detail.to_string()
+                detail.clone()
             } else {
                 header_detail
             },
@@ -5416,15 +5423,30 @@ impl AccessibilityTree {
         .with_children(vec![header_node, Self::header_settings_node()]);
         let canvas = AccessibilityNode::new(AccessibleRole::Region, title, detail)
             .gpui(canvas_id, false, false);
-        let cta = AccessibilityNode::new(AccessibleRole::Button, cta_label, cta_description)
-            .gpui(cta_id, true, true);
+        let mut children = vec![toolbar, canvas];
+        if show_project_plus && matches!(stage, ShellStage::Welcome | ShellStage::FirstTask) {
+            children.push(
+                AccessibilityNode::new(
+                    AccessibleRole::Button,
+                    "Add project",
+                    "Choose a folder to add as a project.",
+                )
+                .gpui("native-projects-add", true, true),
+            );
+        }
+        if let Some((cta_id, cta_label, cta_description)) = cta {
+            children.push(
+                AccessibilityNode::new(AccessibleRole::Button, cta_label, cta_description)
+                    .gpui(cta_id, true, true),
+            );
+        }
         let root = AccessibilityNode::new(
             AccessibleRole::Region,
             "DevManager",
-            "Get started with a folder on this computer.",
+            "Get started with DevManager.",
         )
         .gpui("native-shell-root", true, true)
-        .with_children(vec![toolbar, canvas, cta]);
+        .with_children(children);
         Self {
             root,
             rendered_task_count: 0,
@@ -6102,6 +6124,8 @@ impl NativeShell {
             &task_list,
             None,
             &header_attachment,
+            connect_canvas_copy(None),
+            false,
         );
         let platform_accessibility = NativePlatformAccessibilityBridge::new(&accessibility_tree);
         let mut interaction = NativeInteraction::new(None);
@@ -6232,11 +6256,14 @@ impl NativeShell {
     }
 
     fn refresh_accessibility_tree(&mut self) {
+        let welcome_copy = connect_canvas_copy(self.agent_connection.as_ref());
         self.accessibility_tree = AccessibilityTree::for_stage(
             self.shell_stage(),
             &self.task_list,
             self.interaction.selected_task(),
             &self.header_attachment,
+            welcome_copy,
+            self.shows_add_project_plus(),
         );
         self.platform_accessibility.sync(&self.accessibility_tree);
     }
@@ -7983,7 +8010,9 @@ impl NativeShell {
             }
             KeyboardAction::OpenPalette => {
                 self.palette_index = 0;
-                if PaletteItem::for_stage(self.shell_stage()).is_empty() {
+                if PaletteItem::for_stage(self.shell_stage(), self.shows_add_project_plus())
+                    .is_empty()
+                {
                     self.interaction.close_palettes();
                 }
             }
@@ -8612,6 +8641,7 @@ impl NativeShell {
             {
                 ShellStage::Connecting
             }
+            _ if !snapshot_connected(self.agent_connection.as_ref()) => ShellStage::Welcome,
             _ if self.config_sidebar.projects.is_empty() => ShellStage::Welcome,
             _ if self.task_list.task_ids().is_empty() => ShellStage::FirstTask,
             _ => ShellStage::Cockpit,
@@ -8634,6 +8664,10 @@ impl NativeShell {
     fn begin_choose_folder(&mut self, cx: &mut Context<Self>) {
         self.interaction.close_palettes();
         self.new_task = None;
+        if !self.shows_add_project_plus() {
+            self.settings_open = true;
+            return;
+        }
         self.schedule_folder_prompt(cx);
     }
 
@@ -8907,13 +8941,14 @@ impl NativeShell {
 
     fn dispatch_named_accessibility_action(&mut self, element_id: &str) {
         match element_id {
-            "native-setup-add-project"
-            | "native-header-add-project"
-            | "native-sidebar-add-project"
-            | "native-inbox-add-project" => {
+            "native-projects-add" => {
                 self.interaction.close_palettes();
                 self.new_task = None;
-                self.pending_folder_prompt = true;
+                if self.shows_add_project_plus() {
+                    self.pending_folder_prompt = true;
+                } else {
+                    self.settings_open = true;
+                }
             }
             "native-setup-create-task" | "native-header-new-task" | "native-inbox-new-task" => {
                 self.begin_new_task()
@@ -9379,10 +9414,7 @@ impl NativeShell {
                 "Can't load your settings",
                 "DevManager needs to recover before you can continue.".to_string(),
             )),
-            ShellStage::Welcome => Some((
-                "Welcome to DevManager",
-                "Pick a folder you already have. Tasks, chat, and the terminal stay out of the way until you have somewhere to work.".to_string(),
-            )),
+            ShellStage::Welcome => Some(connect_canvas_copy(self.agent_connection.as_ref())),
             ShellStage::FirstTask => Some((
                 "Start a task",
                 "Name the work you want to do. Chat, files, and the terminal open with it."
@@ -9410,7 +9442,7 @@ impl NativeShell {
                 return div().id("native-shell-setup-unused").into_any_element();
             }
         };
-        let composed_action = if stage == ShellStage::Welcome {
+        let composed_action = if stage == ShellStage::Welcome && self.shows_add_project_plus() {
             Some(
                 div()
                     .id("native-shell-setup-welcome-action")
@@ -9462,9 +9494,9 @@ impl NativeShell {
 
     fn setup_welcome_steps(&self, tokens: crate::ui::tokens::ThemeTokens) -> AnyElement {
         let steps = [
-            "Choose a folder you already have",
-            "Start a task for the work you want done",
-            "Chat, files, and the terminal open with that task",
+            "Connect an agent",
+            "Add a project",
+            "Start Claude or Codex from the inbox",
         ];
         div()
             .id("native-shell-setup-steps")
@@ -9493,7 +9525,7 @@ impl NativeShell {
         tokens: crate::ui::tokens::ThemeTokens,
         layout: WorkspaceLayout,
         action: Option<AnyElement>,
-        add_project: Option<AnyElement>,
+        projects_heading_action: Option<AnyElement>,
     ) -> AnyElement {
         let intro = self.setup_intro(stage, tokens, action);
         let canvas = div()
@@ -9503,9 +9535,12 @@ impl NativeShell {
             .min_h(px(0.0))
             .min_w(px(0.0))
             .overflow_hidden();
-        if stage == ShellStage::FirstTask {
+        let show_sidebar = stage == ShellStage::FirstTask
+            || (stage == ShellStage::Welcome
+                && (self.shows_add_project_plus() || !self.config_sidebar.projects.is_empty()));
+        if show_sidebar {
             canvas
-                .child(self.sidebar(tokens, layout.sidebar_width, add_project))
+                .child(self.sidebar(tokens, layout.sidebar_width, projects_heading_action))
                 .child(intro)
                 .into_any_element()
         } else {
@@ -9653,8 +9688,15 @@ impl NativeShell {
         }
     }
 
-    fn shows_add_folder_chrome(stage: ShellStage) -> bool {
-        stage == ShellStage::Cockpit
+    fn plus_visible_for_state(connected: bool, _has_project: bool) -> bool {
+        connected
+    }
+
+    fn shows_add_project_plus(&self) -> bool {
+        Self::plus_visible_for_state(
+            snapshot_connected(self.agent_connection.as_ref()),
+            !self.config_sidebar.projects.is_empty(),
+        )
     }
 
     fn render_add_project_overlay(
@@ -10105,7 +10147,7 @@ impl NativeShell {
         viewport: Size<Pixels>,
         cx: &Context<Self>,
     ) -> AnyElement {
-        let items = PaletteItem::for_stage(self.shell_stage());
+        let items = PaletteItem::for_stage(self.shell_stage(), self.shows_add_project_plus());
         let selected = if items.is_empty() {
             0
         } else {
@@ -10379,7 +10421,7 @@ impl NativeShell {
         cx: &mut Context<Self>,
     ) {
         let key = event.keystroke.key.as_str();
-        let items = PaletteItem::for_stage(self.shell_stage());
+        let items = PaletteItem::for_stage(self.shell_stage(), self.shows_add_project_plus());
         match key {
             "escape" => {
                 window.prevent_default();
@@ -11068,7 +11110,7 @@ impl NativeShell {
         &self,
         tokens: crate::ui::tokens::ThemeTokens,
         width: f32,
-        add_project: Option<AnyElement>,
+        projects_heading_action: Option<AnyElement>,
     ) -> AnyElement {
         div()
             .id("native-shell-sidebar")
@@ -11078,8 +11120,7 @@ impl NativeShell {
             .h_full()
             .overflow_hidden()
             .flex_col()
-            .child(self.config_sidebar.surface(tokens))
-            .children(add_project)
+            .child(self.config_sidebar.surface(tokens, projects_heading_action))
             .into_any_element()
     }
 
@@ -11112,7 +11153,18 @@ impl NativeShell {
                         .flex_1()
                         .min_h(px(0.0))
                         .overflow_hidden()
-                        .child(self.setup_shell_content(stage, tokens, layout, None, None)),
+                        .child(self.setup_shell_content(
+                            stage,
+                            tokens,
+                            layout,
+                            None,
+                            self.shows_add_project_plus().then(|| {
+                                Button::new("native-projects-add")
+                                    .label("+")
+                                    .tooltip("Add project")
+                                    .into_any_element()
+                            }),
+                        )),
                 )
                 .into_any_element();
         }
@@ -11163,9 +11215,18 @@ impl NativeShell {
                     .flex_1()
                     .min_h(px(0.0))
                     .overflow_hidden()
-                    .children(
-                        show_sidebar.then(|| self.sidebar(tokens, layout.sidebar_width, None)),
-                    )
+                    .children(show_sidebar.then(|| {
+                        self.sidebar(
+                            tokens,
+                            layout.sidebar_width,
+                            self.shows_add_project_plus().then(|| {
+                                Button::new("native-projects-add")
+                                    .label("+")
+                                    .tooltip("Add project")
+                                    .into_any_element()
+                            }),
+                        )
+                    }))
                     .children(show_sidebar.then(|| Self::pane_rail_static(true, tokens)))
                     .child(self.main_column(
                         tokens,
@@ -11602,16 +11663,6 @@ impl NativeShell {
             .flex()
             .gap(px(tokens.density.spacing.sm))
             .child(
-                Button::new("native-inbox-add-project")
-                    .label("Add project")
-                    .ghost()
-                    .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
-                        cx.stop_propagation();
-                        shell.begin_choose_folder(cx);
-                        cx.notify();
-                    })),
-            )
-            .child(
                 Button::new("native-inbox-new-task")
                     .label("New task")
                     .primary()
@@ -11689,16 +11740,6 @@ impl NativeShell {
                     .flex_none()
                     .items_center()
                     .gap(px(tokens.density.spacing.xs))
-                    .children(Self::shows_add_folder_chrome(stage).then(|| {
-                        Button::new("native-header-add-project")
-                            .label("Add project")
-                            .ghost()
-                            .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
-                                cx.stop_propagation();
-                                shell.begin_choose_folder(cx);
-                                cx.notify();
-                            }))
-                    }))
                     .child(
                         Button::new("native-header-new-task")
                             .label("New task")
@@ -11720,36 +11761,18 @@ impl NativeShell {
                 cx,
                 |shell, _cx| shell.begin_new_task(),
             )),
-            ShellStage::Welcome | ShellStage::Connecting | ShellStage::Recovery => {
-                Some(Self::primary_action_button(
-                    "native-setup-add-project",
-                    "Choose a folder",
-                    tokens,
-                    cx,
-                    NativeShell::begin_choose_folder,
-                ))
-            }
+            ShellStage::Welcome | ShellStage::Connecting | ShellStage::Recovery => None,
         };
-        let setup_add_project = (stage == ShellStage::FirstTask
-            && Self::shows_add_folder_chrome(stage))
-        .then(|| {
-            div()
-                .id("native-config-add-project")
-                .w_full()
-                .flex_none()
-                .p(px(tokens.density.spacing.md))
-                .border_t(px(1.0))
-                .border_color(tokens.borders.subtle.to_gpui())
-                .child(
-                    Button::new("native-sidebar-add-project")
-                        .label("Add project")
-                        .ghost()
-                        .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
-                            cx.stop_propagation();
-                            shell.begin_choose_folder(cx);
-                            cx.notify();
-                        })),
-                )
+        let setup_project_plus = self.shows_add_project_plus().then(|| {
+            Button::new("native-projects-add")
+                .label("+")
+                .tooltip("Add project")
+                .ghost()
+                .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
+                    cx.stop_propagation();
+                    shell.begin_choose_folder(cx);
+                    cx.notify();
+                }))
                 .into_any_element()
         });
         let sidebar_rail = self.pane_rail(PaneEdge::Sidebar, tokens, cx);
@@ -11900,28 +11923,20 @@ impl NativeShell {
                                 self.sidebar(
                                     tokens,
                                     layout.sidebar_width,
-                                    Some(
-                                        div()
-                                            .id("native-config-add-project")
-                                            .w_full()
-                                            .flex_none()
-                                            .p(px(tokens.density.spacing.md))
-                                            .border_t(px(1.0))
-                                            .border_color(tokens.borders.subtle.to_gpui())
-                                            .child(
-                                                Button::new("native-sidebar-add-project")
-                                                    .label("Add project")
-                                                    .ghost()
-                                                    .on_click(cx.listener(
-                                                        |shell, _event: &ClickEvent, _window, cx| {
-                                                            cx.stop_propagation();
-                                                            shell.begin_choose_folder(cx);
-                                                            cx.notify();
-                                                        },
-                                                    )),
-                                            )
-                                            .into_any_element(),
-                                    ),
+                                    self.shows_add_project_plus().then(|| {
+                                        Button::new("native-projects-add")
+                                            .label("+")
+                                            .tooltip("Add project")
+                                            .ghost()
+                                            .on_click(cx.listener(
+                                                |shell, _event: &ClickEvent, _window, cx| {
+                                                    cx.stop_propagation();
+                                                    shell.begin_choose_folder(cx);
+                                                    cx.notify();
+                                                },
+                                            ))
+                                            .into_any_element()
+                                    }),
                                 )
                             }))
                             .children(show_sidebar.then_some(sidebar_rail))
@@ -11942,7 +11957,7 @@ impl NativeShell {
                             tokens,
                             layout,
                             setup_action,
-                            setup_add_project,
+                            setup_project_plus,
                         )
                     })),
             )
@@ -12384,7 +12399,8 @@ fn enqueue_pending_preference(
 #[cfg(test)]
 mod tests {
     use super::{
-        acquire_reaper_permit, authorize_full_host_quit, dispatch_pending_action,
+        acquire_reaper_permit, agent_connection_snapshot, authorize_full_host_quit,
+        dispatch_pending_action,
         enqueue_pending_preference, ensure_isolated_host_config_base, isolated_dev_profile,
         publish_projection, reap_retained_children, reap_retained_workers, retain_child,
         retain_worker, retained_children, take_retained_action_outcomes, update_state_from_stage,
@@ -12395,7 +12411,7 @@ mod tests {
         NativeHostRuntimeEpochs, NativeHostRuntimePort, NativeHostWorkerCommand, NativeInteraction,
         NativeHeaderAttachment, NativePlatformAccessibilityBridge, NativeShell, NativeShellMode,
         NativeShutdownDeadline, OverlayTextFieldPart, OwnedChild, OwnedWorker, PaletteItem,
-        ReaperKind, ShellStage, TaskId, UpdateState, UpdaterStage,
+        AgentPresence, ReaperKind, ShellStage, TaskId, UpdateState, UpdaterStage,
         MAX_ACTION_LANE_RECORDS, MAX_ACTION_OUTCOME_PROJECTIONS, MAX_HOST_PROJECTIONS,
         MAX_PENDING_HOST_ACTIONS, MAX_PENDING_PREFERENCES, MAX_RETAINED_CHILDREN,
         MAX_RETAINED_WORKERS, MAX_RETRY_HOST_ACTIONS, PRODUCTION_HOST_PROFILE,
@@ -12639,7 +12655,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_shell_opens_a_setup_canvas_instead_of_the_cockpit() {
+    fn disconnected_empty_shell_shows_connect_canvas_without_project_controls() {
         let _test_guard = HEADLESS_SHELL_TEST_LOCK
             .get_or_init(|| Mutex::new(()))
             .lock()
@@ -12650,9 +12666,14 @@ mod tests {
             crate::ui::init(cx);
             let (runtime, _) = TestRuntime::new(true, NativeHostActionResult::Queued);
             let snapshot = with_test_shell_in_app(cx, runtime, |shell| {
+                shell.agent_connection = Some(agent_connection_snapshot(AgentPresence::NotFound));
                 let _ = shell.element_without_handlers();
+                shell.refresh_accessibility_tree();
                 (
                     shell.shell_stage(),
+                    shell
+                        .setup_intro_copy(shell.shell_stage())
+                        .map(|copy| copy.0.to_string()),
                     shell
                         .accessibility_tree()
                         .gpui_nodes()
@@ -12664,19 +12685,66 @@ mod tests {
             *completed_for_app.borrow_mut() = Some(snapshot);
             cx.quit();
         });
-        let (stage, ids) = completed.borrow().clone().expect("setup canvas snapshot");
+        let (stage, title, ids) = completed.borrow().clone().expect("setup canvas snapshot");
         assert_eq!(
             stage,
             ShellStage::Welcome,
-            "an empty connected profile must open the welcome canvas, not the task cockpit"
+            "an empty disconnected profile must open the connect canvas"
         );
+        assert_eq!(title.as_deref(), Some("Connect an agent"));
         assert!(
             !ids.iter().any(|id| id == "native-task-inbox"),
             "setup canvas must not advertise the task inbox"
         );
         assert!(
-            ids.iter().any(|id| id == "native-setup-add-project"),
-            "setup canvas must expose the first-run folder action"
+            !ids.iter().any(|id| id == "native-setup-add-project"),
+            "connect canvas must not expose a folder action"
+        );
+        assert!(
+            !ids.iter().any(|id| id == "native-projects-add"),
+            "connect canvas must hide the project heading plus"
+        );
+    }
+
+    #[test]
+    fn connected_empty_shell_shows_add_project_canvas_and_heading_plus() {
+        let _test_guard = HEADLESS_SHELL_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("headless shell test lock");
+        let completed = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let completed_for_app = std::rc::Rc::clone(&completed);
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            let (runtime, _) = TestRuntime::new(true, NativeHostActionResult::Queued);
+            let snapshot = with_test_shell_in_app(cx, runtime, |shell| {
+                shell.agent_connection = Some(agent_connection_snapshot(AgentPresence::SignedIn));
+                let _ = shell.element_without_handlers();
+                shell.refresh_accessibility_tree();
+                (
+                    shell
+                        .setup_intro_copy(shell.shell_stage())
+                        .map(|copy| copy.0.to_string()),
+                    shell
+                        .accessibility_tree()
+                        .gpui_nodes()
+                        .into_iter()
+                        .map(|node| node.element_id)
+                        .collect::<Vec<_>>(),
+                )
+            });
+            *completed_for_app.borrow_mut() = Some(snapshot);
+            cx.quit();
+        });
+        let (title, ids) = completed.borrow().clone().expect("setup canvas snapshot");
+        assert_eq!(title.as_deref(), Some("Add a project"));
+        assert!(
+            ids.iter().any(|id| id == "native-projects-add"),
+            "signed-in setup canvas must expose the project heading plus"
+        );
+        assert!(
+            !ids.iter().any(|id| id == "native-setup-add-project"),
+            "add-project canvas must not expose a large folder action"
         );
     }
 
@@ -12970,9 +13038,20 @@ mod tests {
     }
 
     #[test]
-    fn first_task_does_not_show_add_folder() {
-        assert!(!NativeShell::shows_add_folder_chrome(ShellStage::FirstTask));
-        assert!(NativeShell::shows_add_folder_chrome(ShellStage::Cockpit));
+    fn project_plus_is_hidden_until_an_agent_is_connected() {
+        assert!(!NativeShell::plus_visible_for_state(false, true));
+        assert!(NativeShell::plus_visible_for_state(true, false));
+        assert!(NativeShell::plus_visible_for_state(true, true));
+    }
+
+    #[test]
+    fn palette_does_not_advertise_add_project_while_disconnected() {
+        assert!(
+            !PaletteItem::for_stage(ShellStage::Welcome, false).contains(&PaletteItem::AddProject)
+        );
+        assert!(
+            PaletteItem::for_stage(ShellStage::Welcome, true).contains(&PaletteItem::AddProject)
+        );
     }
 
     #[test]
