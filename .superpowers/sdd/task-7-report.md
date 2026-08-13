@@ -44,3 +44,9 @@ Before the fix it failed because the no-runtime launch returned
   test passed.
 - `cargo check --locked --lib --bins --tests` passed with
   `CARGO_TARGET_DIR=C:/Temp/devmanager-project-agent-first-run`.
+
+### Task 7 review-fix: update-drain launch gate
+
+Added the existing `stops_new_launches()` check to provider-backed task
+creation before normalization/persistence, preserving the keep-task-on-launch-
+failure behavior.
