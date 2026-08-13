@@ -217,6 +217,18 @@ impl<C: PortalTransport> PortalSyncRuntime<C> {
             });
         }
 
+        // A Connect sign-in and a local boolean are not enrollment proof. The
+        // claim + confirm flow installs the exact server confirmation before
+        // ordinary portal synchronization is allowed to begin.
+        if !matches!(
+            projection.mode(),
+            crate::org::OperatingMode::HostEnrolled { .. }
+        ) {
+            projection.set_authenticated_online(false);
+            let _ = store.save(projection);
+            return Err(OrgError::EnrollmentNotConfirmed.into());
+        }
+
         projection.set_authenticated_online(false);
         let checkpoint = projection.export_state()?;
         let checkpoint_cursors = self.cursors.clone();
@@ -1360,25 +1372,28 @@ mod tests {
     }
 
     #[test]
-    fn connect_sign_in_does_not_enroll_without_local_confirmation() {
+    fn connect_sign_in_boolean_cannot_enroll_or_call_removed_reconcile_route() {
         let host_id = ConnectHostId::new();
         let fake = FakePortal::with_reconcile(reconcile_ok(&host_str(host_id)));
         let mut runtime = PortalSyncRuntime::new(fake, None);
         let mut projection = OrganizationProjection::standalone();
         assert_eq!(projection.sign_in(account()), 0);
         let (root, store) = temp_store();
-        let outcome = runtime
+        let error = runtime
             .reconcile(
                 &mut projection,
                 &store,
                 PortalReconcileRequest {
                     host_id,
-                    local_confirmation: false,
+                    local_confirmation: true,
                 },
                 1_000,
             )
-            .expect("preview");
-        assert_eq!(outcome.kind, PortalReconcileKind::PreviewOnly);
+            .expect_err("a boolean is not enrollment proof");
+        assert_eq!(
+            error,
+            PortalSyncError::Org(OrgError::EnrollmentNotConfirmed)
+        );
         assert!(matches!(
             projection.mode(),
             crate::org::OperatingMode::ConnectSignedIn { .. }
@@ -1387,21 +1402,7 @@ mod tests {
             runtime.capability(&projection),
             OrganizationCapabilityState::Disabled(OrganizationCapabilityDisableReason::Unenrolled)
         );
-        assert_eq!(
-            runtime.publish_prompt(
-                &projection,
-                &PublishPromptRequest {
-                    namespace: "ops".into(),
-                    name: "n".into(),
-                    title: "t".into(),
-                    body: "b".into(),
-                    tags: Vec::new(),
-                    expected_current_version_id: None,
-                    expected_revision: None,
-                }
-            ),
-            Err(PortalSyncError::Org(OrgError::HostUnenrolled))
-        );
+        assert_eq!(runtime.transport().calls(), 0);
         let _ = fs::remove_dir_all(root);
     }
 

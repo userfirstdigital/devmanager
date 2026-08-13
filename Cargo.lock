@@ -2062,6 +2062,7 @@ dependencies = [
  "cargo-packager-updater",
  "caseless",
  "dirs 6.0.0",
+ "ed25519-compact",
  "embed-resource",
  "futures-util",
  "getrandom 0.3.4",

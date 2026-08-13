@@ -6,6 +6,7 @@
 
 mod boundary;
 mod enforcement;
+pub mod enrollment_bootstrap;
 mod error;
 mod evidence;
 mod identity;

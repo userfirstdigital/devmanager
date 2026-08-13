@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::connect::{ConnectHostId, ManagedField, ACTIVE_SESSION_IDLE_LIMIT_MS};
+use crate::org::enrollment_bootstrap::EnrollmentConfirmation;
 use crate::org::error::OrgError;
 use crate::org::identity::{ExternalAccount, PortalAccountId, PortalDeviceId, PortalTenantId};
 
@@ -282,6 +283,37 @@ impl HostMembership {
         Ok(())
     }
 
+    pub fn confirm_from_server(
+        &mut self,
+        now_ms: i64,
+        policy: &OrganizationPolicyDocument,
+        confirmation: &EnrollmentConfirmation,
+    ) -> Result<(), OrgError> {
+        if self.status == MembershipStatus::Revoked {
+            return Err(OrgError::MembershipRevoked);
+        }
+        let host_id = uuid::Uuid::from_bytes(self.host_id.as_bytes()).to_string();
+        if confirmation.host_id() != host_id
+            || confirmation.tenant_id() != self.tenant_id.as_str()
+            || self
+                .device_id
+                .as_ref()
+                .is_none_or(|device| device.as_str() != confirmation.device_public_id())
+        {
+            return Err(OrgError::CrossTenant);
+        }
+        if self.policy_revision != policy.revision
+            || self.policy_hash_hex != policy.content_hash_hex
+            || confirmation.policy_revision() != policy.revision
+        {
+            return Err(OrgError::StalePolicy);
+        }
+        self.status = MembershipStatus::Enrolled;
+        self.enrolled_at_ms = Some(now_ms);
+        self.last_seen_at_ms = Some(now_ms);
+        Ok(())
+    }
+
     pub fn unenroll_offline(&mut self, now_ms: i64) {
         self.status = MembershipStatus::Unenrolled;
         self.revoked_at_ms = Some(now_ms);
@@ -305,4 +337,54 @@ fn hex_encode(bytes: &[u8]) -> String {
         out.push(HEX[(byte & 0x0f) as usize] as char);
     }
     out
+}
+
+#[cfg(test)]
+mod enrollment_confirmation_tests {
+    use super::*;
+    use crate::org::enrollment_bootstrap::EnrollmentConfirmation;
+
+    fn host_string(host_id: ConnectHostId) -> String {
+        uuid::Uuid::from_bytes(host_id.as_bytes()).to_string()
+    }
+
+    #[test]
+    fn pending_membership_requires_exact_server_confirmation_receipt() {
+        let host_id = ConnectHostId::new();
+        let tenant = PortalTenantId::parse("tenant-1").expect("tenant");
+        let device = PortalDeviceId::parse("device-1").expect("device");
+        let account = ExternalAccount::new(
+            tenant.clone(),
+            PortalAccountId::parse("owner-1").expect("account"),
+            Some(device),
+        );
+        let policy = OrganizationPolicyDocument::deny_minimal(tenant).expect("policy");
+        let mut membership = HostMembership::pending(
+            host_id,
+            account,
+            MembershipRole::Owner,
+            &policy,
+            "owner-host",
+        )
+        .expect("pending");
+
+        let wrong_host =
+            EnrollmentConfirmation::fixture("host-other", "tenant-1", "device-1", policy.revision);
+        assert_eq!(
+            membership.confirm_from_server(1_000, &policy, &wrong_host),
+            Err(OrgError::CrossTenant)
+        );
+        assert_eq!(membership.status, MembershipStatus::PendingLocalConfirm);
+
+        let exact = EnrollmentConfirmation::fixture(
+            host_string(host_id),
+            "tenant-1",
+            "device-1",
+            policy.revision,
+        );
+        membership
+            .confirm_from_server(1_000, &policy, &exact)
+            .expect("confirmed");
+        assert_eq!(membership.status, MembershipStatus::Enrolled);
+    }
 }
