@@ -10,6 +10,7 @@ Task 3: complete (commits 52b0674..181a6e1, review acceptable). Minors for final
 Task 4: complete (commits 181a6e1..778494a, Settings overlay + AccessKit row-id fix review clean). Minor for final review: settings GPUI test does not assert Connecting/Recovery/Cockpit stages.
 Task 5: complete (commits 778494a..0521dd0). Reviewer Important palette hint “Choose a folder on this computer” left as-is: Task 2 / plan required that hint because it describes the OS picker. Final review may triage.
 Task 6: complete (commits 0521dd0..02fe3dc, empty-inbox +Claude a11y fix review clean). Minor: one RED cargo run used default target.
+Task 7: complete (commits 02fe3dc..ba6ee17). Review: start-failure must return create Accepted (b03169c); update-drain gate copied onto the async create path (ba6ee17). Plan tension: launch IpcError is not returned (would paint Can't connect); Task 8 hold is the user-visible start-failure surface. Minors for final review: host fixture still manually replays bind commands; ba6ee17 commit subject has a trailing `'`; full lib suite deferred to Task 9; user commits c692af1 (WIP dump incl. workspace_layout) and b636799 (watcher) landed on the branch during Task 7.
 
 # DevManager Per-Conversation Browser V1 (2026-07-16)
 

@@ -74,7 +74,8 @@ use crate::ui::actions::{
     TaskListAction, TaskRename, TaskShow,
 };
 use crate::ui::agent_connection::{
-    connect_canvas_copy, inbox_agent_actions, settings_row_copy, snapshot_connected,
+    connect_canvas_copy, inbox_agent_actions, placeholder_task_title, settings_row_copy,
+    snapshot_connected,
 };
 use crate::ui::components::interaction::{FocusEpoch, FocusEpochSource};
 use crate::ui::components::status_light::{ExternalPortStatus, StatusLight};
@@ -5891,7 +5892,6 @@ pub struct NativeShell {
     settings_open: bool,
     pending_folder_prompt: bool,
     new_task: Option<NewTaskDraft>,
-    pending_inbox_agent: Option<ProviderKind>,
     palette_index: usize,
     pending_select_task: Option<TaskId>,
 }
@@ -6207,7 +6207,6 @@ impl NativeShell {
             settings_open: false,
             pending_folder_prompt: false,
             new_task: None,
-            pending_inbox_agent: None,
             palette_index: 0,
             pending_select_task: None,
         };
@@ -8888,14 +8887,26 @@ impl NativeShell {
         let Some(snapshot) = self.agent_connection.as_ref() else {
             return;
         };
-        if self.first_workspace_project_id().is_none()
-            || !inbox_agent_actions(snapshot)
-                .iter()
-                .any(|action| action.provider == kind)
+        let Some(project_id) = self.first_workspace_project_id() else {
+            return;
+        };
+        if !inbox_agent_actions(snapshot)
+            .iter()
+            .any(|action| action.provider == kind)
         {
             return;
         }
-        self.pending_inbox_agent = Some(kind);
+        let _ = self.dispatch_action(ActionRequest::TaskCreateV2(
+            crate::client::action::TaskCreateV2Arguments {
+                task_id: TaskId::new(),
+                environment_id: crate::domain::id::EnvironmentId::new(),
+                title: placeholder_task_title(kind).to_string(),
+                description: None,
+                project_id,
+                workspace: crate::workspace::WorkspaceRequest::main(),
+                primary_provider: Some(kind),
+            },
+        ));
     }
 
     fn begin_new_task(&mut self) {
@@ -12981,7 +12992,7 @@ mod tests {
     }
 
     #[test]
-    fn inbox_plus_claude_selects_claude_without_opening_name_overlay() {
+    fn plus_claude_creates_a_task_with_placeholder_title() {
         let _test_guard = HEADLESS_SHELL_TEST_LOCK
             .get_or_init(|| Mutex::new(()))
             .lock()
@@ -12990,24 +13001,35 @@ mod tests {
         let completed_for_app = std::rc::Rc::clone(&completed);
         gpui::Application::headless().run(move |cx| {
             crate::ui::init(cx);
-            let (runtime, _) = TestRuntime::new(true, NativeHostActionResult::Queued);
+            let (runtime, shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
             let snapshot = with_test_shell_in_app(cx, runtime, |shell| {
                 shell.agent_connection = Some(agent_connection_snapshot(AgentPresence::SignedIn));
                 shell.install_named_folder_for_test("command");
                 shell.dispatch_named_accessibility_action("native-inbox-plus-claude");
-                (
-                    shell.pending_inbox_agent,
-                    shell.new_task_overlay_open_for_test(),
-                )
+                let create = shared
+                    .lock()
+                    .expect("test runtime state")
+                    .accepted
+                    .iter()
+                    .rev()
+                    .find_map(|record| match &record.command {
+                        super::NativeHostCommand::TaskCreateV2 { arguments, .. } => {
+                            Some(arguments.clone())
+                        }
+                        _ => None,
+                    });
+                (create, shell.new_task_overlay_open_for_test())
             });
             *completed_for_app.borrow_mut() = Some(snapshot);
             cx.quit();
         });
-        let (pending_agent, overlay_open) = completed
+        let (create, overlay_open) = completed
             .borrow()
             .clone()
             .expect("inbox agent action snapshot");
-        assert_eq!(pending_agent, Some(ProviderKind::ClaudeCode));
+        let create = create.expect("plus Claude dispatches task.create.v2");
+        assert_eq!(create.title, "New Claude task");
+        assert_eq!(create.primary_provider, Some(ProviderKind::ClaudeCode));
         assert!(!overlay_open);
     }
 

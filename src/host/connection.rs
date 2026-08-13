@@ -3099,9 +3099,7 @@ impl HostRequestExecutor {
             return Err(IpcError::Unavailable);
         }
         validate_authenticated_command_capability(negotiated.capabilities, &envelope.command)?;
-        if command_starts_new_launch(&envelope.command)
-            && self.update_gate.stops_new_launches()
-        {
+        if command_starts_new_launch(&envelope.command) && self.update_gate.stops_new_launches() {
             return Err(IpcError::Unavailable);
         }
         let connection_id = output_id
