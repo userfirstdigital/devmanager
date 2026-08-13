@@ -21,8 +21,8 @@ use uuid::Uuid;
 
 use devmanager::{
     client::action::{
-        self, ActionRisk, ActionScope, ACTION_HOST_ACTIONS, ACTION_HOST_STATUS,
-        ACTION_PROVIDER_ANSWER_QUESTION, ACTION_PROVIDER_NEW_CONVERSATION,
+        self, ActionRisk, ActionScope, ACTION_CONFIG_CREATE_PROJECT, ACTION_HOST_ACTIONS,
+        ACTION_HOST_STATUS, ACTION_PROVIDER_ANSWER_QUESTION, ACTION_PROVIDER_NEW_CONVERSATION,
         ACTION_PROVIDER_QUEUE_FOLLOW_UP, ACTION_PROVIDER_RESOLVE_APPROVAL,
         ACTION_PROVIDER_SEND_NOW, ACTION_PROVIDER_STEER_CURRENT_TURN, ACTION_PROVIDER_STOP_TURN,
         ACTION_TASK_CREATE, ACTION_TASK_CREATE_V2, ACTION_TASK_LIST, ACTION_TASK_RENAME,
@@ -125,6 +125,7 @@ fn seed_task_with_base(paths: &ResolvedAppPaths, base: u8, title: &str) -> TaskI
                         description: Some("Read through the host query boundary".into()),
                         project_id,
                         workspace: WorkspaceRequest::confirmed_external(&paths.root),
+                        primary_provider: None,
                         assignment: TaskAssignment::LocalOwner,
                         created_at_ms: 1_725_000_000_000,
                         connectivity: TaskConnectivity::Connected,
@@ -356,6 +357,7 @@ fn action_catalog_ids_are_unique_and_classified() {
             action.id,
             ACTION_TASK_CREATE
                 | ACTION_TASK_CREATE_V2
+                | ACTION_CONFIG_CREATE_PROJECT
                 | ACTION_TASK_RENAME
                 | ACTION_PROVIDER_SEND_NOW
                 | ACTION_PROVIDER_STEER_CURRENT_TURN
@@ -438,6 +440,7 @@ fn ctl_actions_json_is_stable_unique_and_offline() {
             id,
             ACTION_TASK_CREATE
                 | ACTION_TASK_CREATE_V2
+                | ACTION_CONFIG_CREATE_PROJECT
                 | ACTION_TASK_RENAME
                 | ACTION_PROVIDER_SEND_NOW
                 | ACTION_PROVIDER_STEER_CURRENT_TURN

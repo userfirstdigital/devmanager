@@ -367,6 +367,8 @@ pub struct TaskCreateV2Arguments {
     pub description: Option<String>,
     pub project_id: ProjectId,
     pub workspace: WorkspaceRequest,
+    #[serde(default)]
+    pub primary_provider: Option<ProviderKind>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1276,6 +1278,7 @@ pub fn task_create_v2_command(
             description,
             project_id: args.project_id,
             workspace: args.workspace,
+            primary_provider: args.primary_provider,
             assignment: TaskAssignment::LocalOwner,
             created_at_ms: issued_at_ms,
             connectivity: TaskConnectivity::Connected,
@@ -1496,17 +1499,16 @@ mod tests {
         catalog, require_unique_ids, service_control_command, task_cockpit_query,
         task_create_command, task_rename_command, task_show_query, ActionArgumentSchema,
         ActionRisk, ActionScope, ServiceControlArguments, TaskCreateArguments,
-        TaskCreateV2Arguments, TaskRenameArguments, ACTION_BROWSER_NATIVE, ACTION_FILES_LIST,
-        ACTION_FILES_READ, ACTION_GIT_STATUS, ACTION_HOST_ACTIONS, ACTION_HOST_STATUS,
-        ACTION_PROMPT_CHAIN_PAGE, ACTION_PROMPT_DIFF, ACTION_PROMPT_METADATA_PAGE,
-        ACTION_PROMPT_VERSION_PAGE, ACTION_PROVIDER_ANSWER_QUESTION,
+        TaskCreateV2Arguments, TaskRenameArguments, ACTION_BROWSER_NATIVE,
+        ACTION_CONFIG_CREATE_PROJECT, ACTION_FILES_LIST, ACTION_FILES_READ, ACTION_GIT_STATUS,
+        ACTION_HOST_ACTIONS, ACTION_HOST_STATUS, ACTION_PROMPT_CHAIN_PAGE, ACTION_PROMPT_DIFF,
+        ACTION_PROMPT_METADATA_PAGE, ACTION_PROMPT_VERSION_PAGE, ACTION_PROVIDER_ANSWER_QUESTION,
         ACTION_PROVIDER_NEW_CONVERSATION, ACTION_PROVIDER_QUEUE_FOLLOW_UP,
         ACTION_PROVIDER_RESOLVE_APPROVAL, ACTION_PROVIDER_SEND_NOW, ACTION_PROVIDER_START_SESSION,
         ACTION_PROVIDER_STEER_CURRENT_TURN, ACTION_PROVIDER_STOP_TURN, ACTION_SERVICE_HEALTH,
         ACTION_SERVICE_LOGS, ACTION_SERVICE_RESTART, ACTION_SERVICE_START, ACTION_SERVICE_STOP,
         ACTION_SSH_ACTION, ACTION_SSH_STATUS, ACTION_TASK_ANSWER_QUESTION, ACTION_TASK_CREATE,
-        ACTION_TASK_CREATE_V2, ACTION_CONFIG_CREATE_PROJECT, ACTION_TASK_LIST,
-        ACTION_TASK_QUEUE_FOLLOW_UP, ACTION_TASK_RENAME,
+        ACTION_TASK_CREATE_V2, ACTION_TASK_LIST, ACTION_TASK_QUEUE_FOLLOW_UP, ACTION_TASK_RENAME,
         ACTION_TASK_RESOLVE_APPROVAL, ACTION_TASK_SEND_NOW, ACTION_TASK_SHOW,
         ACTION_TASK_STEER_CURRENT_TURN, ACTION_TASK_STOP_TURN, ACTION_UPDATER_CHECK,
         ACTION_UPDATER_DOWNLOAD, ACTION_UPDATER_INSTALL, ACTION_UPDATER_START_BACKGROUND,
@@ -2032,6 +2034,23 @@ mod tests {
             .remove("project_root");
         serde_json::from_value::<TaskCreateV2Arguments>(value)
             .expect("V2 must decode without a client project root");
+    }
+
+    #[test]
+    fn task_create_v2_carries_optional_primary_provider() {
+        let args = TaskCreateV2Arguments {
+            task_id: TaskId::new(),
+            environment_id: EnvironmentId::new(),
+            title: "New Claude task".into(),
+            description: None,
+            project_id: ProjectId::new(),
+            workspace: crate::workspace::WorkspaceRequest::main(),
+            primary_provider: Some(crate::providers::ProviderKind::ClaudeCode),
+        };
+        assert_eq!(
+            args.primary_provider,
+            Some(crate::providers::ProviderKind::ClaudeCode)
+        );
     }
 
     #[test]

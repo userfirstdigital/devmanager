@@ -206,6 +206,7 @@ fn create_task_via_host(
                 description: None,
                 project_id,
                 workspace,
+                primary_provider: None,
                 assignment: TaskAssignment::LocalOwner,
                 created_at_ms: 1_725_000_000_000,
                 connectivity: TaskConnectivity::Connected,

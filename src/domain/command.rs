@@ -724,6 +724,8 @@ pub struct CreateTaskRequestIntent {
     pub description: Option<String>,
     pub project_id: ProjectId,
     pub workspace: WorkspaceRequest,
+    #[serde(default)]
+    pub primary_provider: Option<ProviderKind>,
     pub assignment: TaskAssignment,
     pub created_at_ms: i64,
     pub connectivity: TaskConnectivity,

@@ -20,14 +20,14 @@ use tokio::task::JoinHandle;
 use tokio::time::{interval_at, MissedTickBehavior};
 use uuid::Uuid;
 
-use crate::config::{
-    ConfigCommand, ConfigError, ConfigErrorKind, ConfigStore, Nullable, Project,
-};
+use crate::config::{ConfigCommand, ConfigError, ConfigErrorKind, ConfigStore, Nullable, Project};
 use crate::domain::cockpit::{TaskCockpitQuery, TaskCockpitResult};
+use crate::domain::agent::{AgentRole, AgentSessionFacts};
 use crate::domain::command::{
     ArmUpdateInstallIntent, Command, CommandEnvelope, CommandReceipt, ConfirmUpdateDrainIntent,
     CreateTaskIntent, CreateTaskRequestIntent, PrepareUpdateIntent,
 };
+use crate::domain::resource::{OwnerKind, ResourceFacts, ResourceKind, ResourceRecipe};
 use crate::domain::event::DomainEvent;
 use crate::domain::id::{
     ArtifactId, OperationId, RequestId, SnapshotId, SubscriptionId, TaskId, TerminalId,
@@ -127,16 +127,21 @@ mod workspace_security_tests {
     };
     use crate::domain::command::{
         Command, CommandEnvelope, CreateTaskIntent, CreateTaskRequestIntent,
+        StartProviderSessionIntent,
     };
+    use crate::domain::agent::{AgentRole, AgentSessionFacts};
+    use crate::domain::agent_resource::AgentResourceBinding;
+    use crate::domain::resource::{OwnerKind, ResourceFacts, ResourceKind, ResourceRecipe};
     use crate::domain::task::{
         ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity,
         WorkspaceRef,
     };
-    use crate::domain::{ClientId, CommandId, EnvironmentId, ProjectId, TaskId};
+    use crate::domain::{ClientId, CommandId, EnvironmentId, ProjectId, RequestId, TaskId};
     use crate::host::IpcError;
     use crate::kernel::CommandBus;
     use crate::protocol::{CapabilitySet, ClientRequest};
     use crate::workspace::{WorkspaceProjectRoots, WorkspaceRequest};
+    use crate::providers::ProviderKind;
     use uuid::Uuid;
 
     #[test]
@@ -190,6 +195,125 @@ mod workspace_security_tests {
     }
 
     #[test]
+    fn create_with_primary_provider_binds_generation_one_before_launch() {
+        let repository = tempfile::tempdir().expect("repository");
+        let output = ProcessCommand::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(repository.path())
+            .output()
+            .expect("git init");
+        assert!(output.status.success());
+        let database = repository.path().join("create-primary.sqlite");
+        let mut bus = CommandBus::open(&database).expect("host command bus");
+        let client_id = ClientId::new();
+        let task_id = TaskId::new();
+        let project_id = ProjectId::new();
+        let roots = WorkspaceProjectRoots::try_from_pairs([(project_id, repository.path().to_path_buf())])
+            .expect("roots");
+        let create = CommandEnvelope {
+            command_id: CommandId::new(),
+            client_id,
+            task_id: None,
+            issued_at_ms: 1_725_000_000_300,
+            expected_task_revision: None,
+            command: Command::CreateTaskV2(CreateTaskRequestIntent {
+                id: task_id,
+                environment_id: EnvironmentId::new(),
+                title: "Claude primary".into(),
+                description: None,
+                project_id,
+                workspace: WorkspaceRequest::main(),
+                primary_provider: Some(ProviderKind::ClaudeCode),
+                assignment: TaskAssignment::LocalOwner,
+                created_at_ms: 1_725_000_000_300,
+                connectivity: TaskConnectivity::Connected,
+                attention: TaskAttention::None,
+                activity: TaskActivity::Idle,
+                review_readiness: ReviewReadiness::NotReady,
+            }),
+        };
+        let (normalized, authorization, request_id) = normalize_task_create_at_host(
+            create,
+            Some(&roots),
+            None,
+            Uuid::nil(),
+            None,
+        )
+        .expect("normalize create");
+        let receipt = bus
+            .execute_host_authorized(
+                normalized,
+                authorization,
+                request_id.expect("request id"),
+                Uuid::nil(),
+            )
+            .expect("create");
+        assert!(matches!(receipt, crate::domain::command::CommandReceipt::Accepted { .. }));
+        let mut agent = AgentSessionFacts::new(
+            task_id,
+            AgentRole::Primary,
+            ProviderKind::ClaudeCode,
+            None,
+        )
+        .expect("agent");
+        agent.runtime_generation = 1;
+        let mut resource = ResourceFacts::new(
+            Some(task_id),
+            OwnerKind::Task,
+            ResourceKind::Terminal,
+            ResourceRecipe::Terminal { cols: 120, rows: 40 },
+            1_725_000_000_300,
+        )
+        .expect("terminal");
+        resource.runtime_generation = 1;
+        for (expected_revision, command) in [
+            (1, Command::RegisterAgentSession { agent: agent.clone() }),
+            (2, Command::RegisterResource { resource: resource.clone() }),
+            (
+                3,
+                Command::SetPrimaryAgent {
+                    agent_session_id: agent.id,
+                },
+            ),
+        ] {
+            bus.execute_host_authorized(
+                CommandEnvelope {
+                    command_id: CommandId::new(),
+                    client_id,
+                    task_id: Some(task_id),
+                    issued_at_ms: 1_725_000_000_300,
+                    expected_task_revision: Some(expected_revision),
+                    command,
+                },
+                None,
+                RequestId::new(),
+                Uuid::nil(),
+            )
+            .expect("follow-through command");
+        }
+        let snapshot = bus.task_snapshot(task_id).expect("snapshot").expect("task");
+        assert_eq!(snapshot.primary_agent_id, Some(agent.id));
+        assert_eq!(snapshot.agents[&agent.id].runtime_generation, 1);
+        assert_eq!(
+            AgentResourceBinding::from_facts(&snapshot.agents[&agent.id], &snapshot.resources[&resource.id])
+                .expect("binding")
+                .runtime_generation,
+            1
+        );
+        let start = StartProviderSessionIntent {
+            task_id,
+            agent_session_id: agent.id,
+            resource_id: resource.id,
+            provider_kind: ProviderKind::ClaudeCode,
+            mode: crate::domain::command::ProviderStartMode::NewConversation,
+            expected_task_revision: snapshot.task.revision,
+            expected_action_epoch: snapshot.task.action_epoch,
+        };
+        assert_eq!(start.expected_action_epoch, 0);
+        assert_eq!(start.expected_task_revision, snapshot.task.revision);
+    }
+
+    #[test]
     fn authenticated_v2_create_resolves_workspace_before_persistence() {
         let repository = tempfile::tempdir().expect("temporary repository");
         let output = ProcessCommand::new("git")
@@ -220,6 +344,7 @@ mod workspace_security_tests {
                 description: None,
                 project_id,
                 workspace: WorkspaceRequest::main(),
+                primary_provider: None,
                 assignment: TaskAssignment::LocalOwner,
                 created_at_ms: 1_725_000_000_101,
                 connectivity: TaskConnectivity::Connected,
@@ -287,6 +412,7 @@ mod workspace_security_tests {
                 description: None,
                 project_id: ProjectId::new(),
                 workspace: WorkspaceRequest::main(),
+                primary_provider: None,
                 assignment: TaskAssignment::LocalOwner,
                 created_at_ms: 1_725_000_000_102,
                 connectivity: TaskConnectivity::Connected,
@@ -340,6 +466,7 @@ mod workspace_security_tests {
                     repository.path().join("missing-worktree"),
                     "codex/missing",
                 ),
+                primary_provider: None,
                 assignment: TaskAssignment::LocalOwner,
                 created_at_ms: 1_725_000_000_103,
                 connectivity: TaskConnectivity::Connected,
@@ -402,6 +529,7 @@ mod workspace_security_tests {
                 description: None,
                 project_id,
                 workspace: WorkspaceRequest::main(),
+                primary_provider: None,
                 assignment: TaskAssignment::LocalOwner,
                 created_at_ms: 1_725_000_000_104,
                 connectivity: TaskConnectivity::Connected,
@@ -471,6 +599,7 @@ mod workspace_security_tests {
                 description: None,
                 project_id,
                 workspace: WorkspaceRequest::main(),
+                primary_provider: None,
                 assignment: TaskAssignment::LocalOwner,
                 created_at_ms: 1_725_000_000_200,
                 connectivity: TaskConnectivity::Connected,
@@ -1851,10 +1980,7 @@ impl HostWorkspaceAdmission {
         let root = std::path::Path::new(root_path.trim());
         let validated = crate::workspace::service::validate_host_workspace_path(root, true)
             .map_err(|_| {
-                ConfigError::new(
-                    ConfigErrorKind::Validation,
-                    "project folder is unavailable",
-                )
+                ConfigError::new(ConfigErrorKind::Validation, "project folder is unavailable")
             })?;
         let timestamp = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -1893,7 +2019,10 @@ impl HostWorkspaceAdmission {
         self.roots = roots;
         self.ssh_runtime = HostSshRuntime::new(
             self.store.snapshot().config.clone(),
-            self.store.path().parent().map(|parent| parent.join("ssh-keys")),
+            self.store
+                .path()
+                .parent()
+                .map(|parent| parent.join("ssh-keys")),
         );
         Ok(())
     }
@@ -2205,6 +2334,8 @@ impl HostRequestExecutor {
                     };
                     let result = if is_agent_connection_query(&job.request) {
                         self.dispatch_agent_connection(job.negotiated, job.request, job.output_id).await
+                    } else if is_task_create_with_primary_provider(&job.request) {
+                        self.dispatch_task_create_with_primary_provider(job.negotiated, job.request, job.output_id).await
                     } else if is_provider_start_request(&job.request) {
                         self.dispatch_provider_start(job.negotiated, job.request, job.output_id).await
                     } else {
@@ -2258,6 +2389,8 @@ impl HostRequestExecutor {
                     };
                     let result = if is_agent_connection_query(&job.request) {
                         self.dispatch_agent_connection(job.negotiated, job.request, job.output_id).await
+                    } else if is_task_create_with_primary_provider(&job.request) {
+                        self.dispatch_task_create_with_primary_provider(job.negotiated, job.request, job.output_id).await
                     } else if is_provider_start_request(&job.request) {
                         self.dispatch_provider_start(job.negotiated, job.request, job.output_id).await
                     } else {
@@ -2930,6 +3063,135 @@ impl HostRequestExecutor {
         self.pending_quit_receipt_acks
             .insert(output_id, PendingQuitReceiptAck { operation_id, ack });
         Ok(DuplexExecuteCompletion::ExecutorAdmittedQuitReceipt { operation_id })
+    }
+
+    async fn dispatch_task_create_with_primary_provider(
+        &mut self,
+        negotiated: NegotiatedParameters,
+        request: ClientRequest,
+        output_id: Option<ConnectionOutputId>,
+    ) -> Result<DuplexExecuteCompletion, IpcError> {
+        let ClientRequest::Command(envelope) = request else {
+            return Err(IpcError::Unavailable);
+        };
+        if envelope.client_id != negotiated.client_id {
+            return Err(IpcError::Unauthorized);
+        }
+        let primary_provider = match &envelope.command {
+            Command::CreateTaskV2(intent) => intent.primary_provider,
+            _ => return Err(IpcError::Unavailable),
+        };
+        if matches!(primary_provider, Some(crate::providers::ProviderKind::Cursor)) {
+            return Err(IpcError::Unavailable);
+        }
+        validate_authenticated_command_capability(negotiated.capabilities, &envelope.command)?;
+        let connection_id = output_id
+            .map(ConnectionOutputId::as_uuid)
+            .unwrap_or(Uuid::nil());
+        let issued_at_ms = envelope.issued_at_ms;
+        let (normalized, authorization, request_id) = normalize_task_create_at_host(
+            envelope,
+            Some(&self.workspace_projects),
+            self.config_admission.as_ref(),
+            connection_id,
+            Some(&self.workspace_coordinator),
+        )?;
+        let task_id = match &normalized.command {
+            Command::CreateTask(intent) => intent.id,
+            _ => return Err(IpcError::Unavailable),
+        };
+        let receipt = self
+            .bus
+            .execute_host_authorized(
+                normalized,
+                authorization,
+                request_id.unwrap_or_else(RequestId::new),
+                connection_id,
+            )
+            .map_err(map_store_error)?;
+        self.fan_out_live_durable_events();
+        let provider_kind = primary_provider.ok_or(IpcError::Unavailable)?;
+        let mut agent = AgentSessionFacts::new(
+            task_id,
+            AgentRole::Primary,
+            provider_kind,
+            None,
+        )
+        .map_err(|_| IpcError::Unavailable)?;
+        agent.runtime_generation = 1;
+        let mut resource = ResourceFacts::new(
+            Some(task_id),
+            OwnerKind::Task,
+            ResourceKind::Terminal,
+            ResourceRecipe::Terminal {
+                cols: 120,
+                rows: 40,
+            },
+            issued_at_ms,
+        )
+        .map_err(|_| IpcError::Unavailable)?;
+        resource.runtime_generation = 1;
+
+        let mut execute_follow_through = |command: Command, expected_revision: u64| {
+            self.bus
+                .execute_host_authorized(
+                    CommandEnvelope {
+                        command_id: crate::domain::CommandId::new(),
+                        client_id: negotiated.client_id,
+                        task_id: Some(task_id),
+                        issued_at_ms,
+                        expected_task_revision: Some(expected_revision),
+                        command,
+                    },
+                    None,
+                    RequestId::new(),
+                    connection_id,
+                )
+                .map_err(map_store_error)
+        };
+        execute_follow_through(
+            Command::RegisterAgentSession {
+                agent: agent.clone(),
+            },
+            1,
+        )?;
+        execute_follow_through(
+            Command::RegisterResource {
+                resource: resource.clone(),
+            },
+            2,
+        )?;
+        execute_follow_through(
+            Command::SetPrimaryAgent {
+                agent_session_id: agent.id,
+            },
+            3,
+        )?;
+        self.fan_out_live_durable_events();
+
+        let start = ClientRequest::Command(CommandEnvelope {
+            command_id: crate::domain::CommandId::new(),
+            client_id: negotiated.client_id,
+            task_id: Some(task_id),
+            issued_at_ms,
+            expected_task_revision: Some(4),
+            command: Command::StartProviderSession(
+                crate::domain::command::StartProviderSessionIntent {
+                    task_id,
+                    agent_session_id: agent.id,
+                    resource_id: resource.id,
+                    provider_kind,
+                    mode: crate::domain::command::ProviderStartMode::NewConversation,
+                    expected_task_revision: 4,
+                    expected_action_epoch: 0,
+                },
+            ),
+        });
+        self.dispatch_provider_start(negotiated, start, output_id)
+            .await?;
+        Ok(DuplexExecuteCompletion::CallerMustWrite(
+            ServerMessage::CommandReceipt(receipt),
+        ))
     }
 
     /// Authenticated stock-provider effect. The durable bus supplies the
@@ -4264,6 +4526,22 @@ impl HostRequestExecutor {
     }
 }
 
+fn is_task_create_with_primary_provider(request: &ClientRequest) -> bool {
+    matches!(
+        request,
+        ClientRequest::Command(CommandEnvelope {
+            command: Command::CreateTaskV2(CreateTaskRequestIntent {
+                primary_provider: Some(
+                    crate::providers::ProviderKind::ClaudeCode
+                        | crate::providers::ProviderKind::Codex
+                ),
+                ..
+            }),
+            ..
+        })
+    )
+}
+
 /// Normalize request-shaped task creation only after authentication and
 /// before the command enters the durable kernel. Raw V1 `CreateTaskIntent`
 /// requests are rejected because their client-supplied WorkspaceRef has not
@@ -4304,6 +4582,7 @@ fn normalize_task_create_at_host(
             description,
             project_id,
             workspace,
+            primary_provider,
             assignment,
             created_at_ms,
             connectivity,
@@ -4311,6 +4590,9 @@ fn normalize_task_create_at_host(
             activity,
             review_readiness,
         }) => {
+            if matches!(primary_provider, Some(crate::providers::ProviderKind::Cursor)) {
+                return Err(IpcError::Unavailable);
+            }
             let workspace_projects = workspace_projects.ok_or_else(|| {
                 IpcError::Security(
                     "task.create.v2 is unavailable on the compatibility transport".into(),
@@ -6520,6 +6802,7 @@ mod output_tests {
                 description: None,
                 project_id,
                 workspace: WorkspaceRequest::main(),
+                primary_provider: None,
                 assignment: TaskAssignment::LocalOwner,
                 created_at_ms: 1,
                 connectivity: TaskConnectivity::Connected,
@@ -7804,6 +8087,7 @@ mod output_tests {
                         description: None,
                         project_id,
                         workspace: WorkspaceRequest::main(),
+                        primary_provider: None,
                         assignment: TaskAssignment::LocalOwner,
                         created_at_ms: 1_725_000_000_000,
                         connectivity: TaskConnectivity::Connected,
