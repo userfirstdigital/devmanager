@@ -608,9 +608,9 @@ impl HostClient {
 
         match reply.outcome {
             QueryOutcome::Err(error) => Ok(Err(error)),
-            QueryOutcome::Ok(QueryResult::TaskCockpit(
-                TaskCockpitResult::AgentConnection(snapshot),
-            )) => Ok(Ok(snapshot)),
+            QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::AgentConnection(
+                snapshot,
+            ))) => Ok(Ok(snapshot)),
             QueryOutcome::Ok(_) => {
                 self.retire_connection();
                 Err(IpcError::CorrelationMismatch)

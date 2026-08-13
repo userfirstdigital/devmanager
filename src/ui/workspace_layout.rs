@@ -1,0 +1,454 @@
+//! Persisted geometry for the cockpit's resizable panes.
+//!
+//! The shell owns pane sizes, not the host: they are a local view preference
+//! and must never be inferred from task or host truth. Sizes are stored beside
+//! the profile they belong to, so a dev profile cannot inherit or overwrite the
+//! installed profile's layout.
+
+use std::fs;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+
+const LAYOUT_SCHEMA: &str = "devmanager.workspace-layout/v1";
+const LAYOUT_FILE_NAME: &str = "workspace-layout.json";
+
+pub const SIDEBAR_MIN: f32 = 180.0;
+pub const SIDEBAR_MAX: f32 = 460.0;
+pub const INBOX_MIN: f32 = 220.0;
+pub const INBOX_MAX: f32 = 560.0;
+pub const DOCK_MIN: f32 = 240.0;
+pub const DOCK_MAX: f32 = 680.0;
+pub const TERMINAL_MIN: f32 = 120.0;
+pub const TERMINAL_MAX: f32 = 800.0;
+/// The conversation column is the reason the cockpit exists, so it keeps a
+/// floor that the draggable rails are not allowed to cross.
+pub const CENTER_MIN: f32 = 320.0;
+
+/// A pane edge the user can drag. Each one owns exactly one stored dimension.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PaneEdge {
+    Sidebar,
+    Inbox,
+    Dock,
+    Terminal,
+}
+
+/// Where the window itself was last left, in the logical pixels GPUI reports.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WindowFrame {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    #[serde(default)]
+    pub maximized: bool,
+}
+
+/// Smallest window worth restoring. Anything below this is storage damage or a
+/// window that was mid-minimize, and restoring it hands back an unusable shell.
+pub const MIN_WINDOW_WIDTH: f32 = 640.0;
+pub const MIN_WINDOW_HEIGHT: f32 = 480.0;
+
+impl WindowFrame {
+    pub fn is_usable(&self) -> bool {
+        [self.x, self.y, self.width, self.height]
+            .iter()
+            .all(|value| value.is_finite())
+            && self.width >= MIN_WINDOW_WIDTH
+            && self.height >= MIN_WINDOW_HEIGHT
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WorkspaceLayout {
+    pub sidebar_width: f32,
+    pub inbox_width: f32,
+    pub dock_width: f32,
+    pub terminal_height: f32,
+    #[serde(default)]
+    pub sidebar_collapsed: bool,
+    #[serde(default)]
+    pub dock_collapsed: bool,
+    #[serde(default)]
+    pub terminal_collapsed: bool,
+    #[serde(default)]
+    pub window: Option<WindowFrame>,
+}
+
+impl Default for WorkspaceLayout {
+    fn default() -> Self {
+        Self {
+            sidebar_width: 260.0,
+            inbox_width: 320.0,
+            dock_width: 360.0,
+            // The conversation is the primary surface; an idle terminal that
+            // opens taller than a third of the window inverts that on the
+            // laptop-class windows this ships to.
+            terminal_height: 200.0,
+            sidebar_collapsed: false,
+            dock_collapsed: false,
+            terminal_collapsed: false,
+            window: None,
+        }
+    }
+}
+
+impl WorkspaceLayout {
+    pub fn value(&self, edge: PaneEdge) -> f32 {
+        match edge {
+            PaneEdge::Sidebar => self.sidebar_width,
+            PaneEdge::Inbox => self.inbox_width,
+            PaneEdge::Dock => self.dock_width,
+            PaneEdge::Terminal => self.terminal_height,
+        }
+    }
+
+    pub fn set_value(&mut self, edge: PaneEdge, value: f32) {
+        let clamped = clamp_edge(edge, value);
+        match edge {
+            PaneEdge::Sidebar => self.sidebar_width = clamped,
+            PaneEdge::Inbox => self.inbox_width = clamped,
+            PaneEdge::Dock => self.dock_width = clamped,
+            PaneEdge::Terminal => self.terminal_height = clamped,
+        }
+    }
+
+    pub fn reset(&mut self, edge: PaneEdge) {
+        let defaults = Self::default();
+        self.set_value(edge, defaults.value(edge));
+    }
+
+    pub fn toggle(&mut self, edge: PaneEdge) {
+        match edge {
+            PaneEdge::Sidebar => self.sidebar_collapsed = !self.sidebar_collapsed,
+            PaneEdge::Dock => self.dock_collapsed = !self.dock_collapsed,
+            PaneEdge::Terminal => self.terminal_collapsed = !self.terminal_collapsed,
+            PaneEdge::Inbox => {}
+        }
+    }
+
+    /// Reject non-finite and out-of-range values from storage. A corrupt or
+    /// hand-edited file must degrade to a usable window, never to a pane that
+    /// swallows the workspace.
+    pub fn sanitized(mut self) -> Self {
+        for edge in [
+            PaneEdge::Sidebar,
+            PaneEdge::Inbox,
+            PaneEdge::Dock,
+            PaneEdge::Terminal,
+        ] {
+            let value = self.value(edge);
+            let fallback = Self::default().value(edge);
+            self.set_value(edge, if value.is_finite() { value } else { fallback });
+        }
+        self.window = self.window.filter(WindowFrame::is_usable);
+        self
+    }
+
+    /// The window frame to restore, if one was stored and is still usable.
+    pub fn restorable_window(&self) -> Option<WindowFrame> {
+        self.window.filter(WindowFrame::is_usable)
+    }
+
+    /// Shrink the rails so the conversation keeps its floor in this window.
+    /// Stored sizes are preserved; only the rendered widths give way, so
+    /// widening the window restores what the user chose.
+    pub fn fitted(self, available_width: f32, available_height: f32) -> Self {
+        let mut fitted = self.sanitized();
+        if fitted.terminal_collapsed {
+            fitted.terminal_height = 0.0;
+        } else {
+            // Half the window is the most an idle strip may claim, however
+            // tall the user dragged it on a larger display.
+            fitted.terminal_height = fitted
+                .terminal_height
+                .min((available_height * 0.5).max(TERMINAL_MIN));
+        }
+        if fitted.sidebar_collapsed {
+            fitted.sidebar_width = 0.0;
+        }
+        if fitted.dock_collapsed {
+            fitted.dock_width = 0.0;
+        }
+        let mut rails = fitted.sidebar_width + fitted.inbox_width + fitted.dock_width;
+        let budget = (available_width - CENTER_MIN).max(0.0);
+        if rails <= budget {
+            return fitted;
+        }
+        // Give way in the order the panes are least likely to be the focus.
+        for (edge, floor) in [
+            (PaneEdge::Dock, DOCK_MIN),
+            (PaneEdge::Inbox, INBOX_MIN),
+            (PaneEdge::Sidebar, SIDEBAR_MIN),
+        ] {
+            let current = fitted.value(edge);
+            if current <= 0.0 {
+                continue;
+            }
+            let excess = rails - budget;
+            if excess <= 0.0 {
+                break;
+            }
+            let reduced = (current - excess).max(floor);
+            rails -= current - reduced;
+            match edge {
+                PaneEdge::Dock => fitted.dock_width = reduced,
+                PaneEdge::Inbox => fitted.inbox_width = reduced,
+                PaneEdge::Sidebar => fitted.sidebar_width = reduced,
+                PaneEdge::Terminal => {}
+            }
+        }
+        fitted
+    }
+}
+
+pub fn clamp_edge(edge: PaneEdge, value: f32) -> f32 {
+    let (min, max) = match edge {
+        PaneEdge::Sidebar => (SIDEBAR_MIN, SIDEBAR_MAX),
+        PaneEdge::Inbox => (INBOX_MIN, INBOX_MAX),
+        PaneEdge::Dock => (DOCK_MIN, DOCK_MAX),
+        PaneEdge::Terminal => (TERMINAL_MIN, TERMINAL_MAX),
+    };
+    if value.is_finite() {
+        value.clamp(min, max)
+    } else {
+        min
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct LayoutFile {
+    schema: String,
+    layout: WorkspaceLayout,
+}
+
+/// Profile-scoped store for the pane geometry.
+#[derive(Clone, Debug)]
+pub struct WorkspaceLayoutStore {
+    path: PathBuf,
+}
+
+impl WorkspaceLayoutStore {
+    pub fn at_path(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+
+    pub fn at_profile_root(root: impl AsRef<Path>) -> Self {
+        Self::at_path(root.as_ref().join(LAYOUT_FILE_NAME))
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Load the stored layout, falling back to defaults. A view preference is
+    /// never worth failing a launch over, so unreadable or foreign-schema
+    /// storage degrades to the default geometry.
+    pub fn load(&self) -> WorkspaceLayout {
+        let Ok(bytes) = fs::read(&self.path) else {
+            return WorkspaceLayout::default();
+        };
+        let Ok(file) = serde_json::from_slice::<LayoutFile>(&bytes) else {
+            return WorkspaceLayout::default();
+        };
+        if file.schema != LAYOUT_SCHEMA {
+            return WorkspaceLayout::default();
+        }
+        file.layout.sanitized()
+    }
+
+    pub fn save(&self, layout: WorkspaceLayout) -> io::Result<()> {
+        let file = LayoutFile {
+            schema: LAYOUT_SCHEMA.to_string(),
+            layout: layout.sanitized(),
+        };
+        let bytes = serde_json::to_vec_pretty(&file)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        write_atomically(&self.path, &bytes)
+    }
+}
+
+fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let temporary = parent.join(format!(
+        "{}.tmp",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(LAYOUT_FILE_NAME)
+    ));
+    {
+        let mut handle = fs::File::create(&temporary)?;
+        handle.write_all(bytes)?;
+        handle.sync_all()?;
+    }
+    match replace_file(&temporary, path) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = fs::remove_file(&temporary);
+            Err(error)
+        }
+    }
+}
+
+#[cfg(windows)]
+fn replace_file(temporary: &Path, destination: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let temporary: Vec<u16> = temporary.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    unsafe {
+        MoveFileExW(
+            PCWSTR(temporary.as_ptr()),
+            PCWSTR(destination.as_ptr()),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+        .map_err(io::Error::from)
+    }
+}
+
+#[cfg(not(windows))]
+fn replace_file(temporary: &Path, destination: &Path) -> io::Result<()> {
+    fs::rename(temporary, destination)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stored_layout_round_trips_through_the_profile_store() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let store = WorkspaceLayoutStore::at_profile_root(directory.path());
+        assert_eq!(store.load(), WorkspaceLayout::default());
+
+        let mut layout = WorkspaceLayout::default();
+        layout.set_value(PaneEdge::Inbox, 401.0);
+        layout.set_value(PaneEdge::Terminal, 333.0);
+        layout.sidebar_collapsed = true;
+        store.save(layout).expect("save layout");
+
+        assert_eq!(store.load(), layout);
+    }
+
+    #[test]
+    fn a_second_save_atomically_replaces_the_existing_layout() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let store = WorkspaceLayoutStore::at_profile_root(directory.path());
+        let mut first = WorkspaceLayout::default();
+        first.set_value(PaneEdge::Inbox, 401.0);
+        store.save(first).expect("save first layout");
+
+        let mut second = WorkspaceLayout::default();
+        second.set_value(PaneEdge::Dock, 517.0);
+        second.sidebar_collapsed = true;
+        store.save(second).expect("replace existing layout");
+
+        assert_eq!(store.load(), second);
+    }
+
+    #[test]
+    fn corrupt_or_foreign_storage_degrades_to_defaults() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let store = WorkspaceLayoutStore::at_profile_root(directory.path());
+        fs::write(store.path(), b"{not json").expect("write");
+        assert_eq!(store.load(), WorkspaceLayout::default());
+
+        fs::write(
+            store.path(),
+            br#"{"schema":"other/v9","layout":{"sidebar_width":1.0,"inbox_width":1.0,"dock_width":1.0,"terminal_height":1.0}}"#,
+        )
+        .expect("write");
+        assert_eq!(store.load(), WorkspaceLayout::default());
+    }
+
+    #[test]
+    fn an_unusable_stored_window_frame_is_not_restored() {
+        let mut layout = WorkspaceLayout::default();
+        layout.window = Some(WindowFrame {
+            x: 40.0,
+            y: 40.0,
+            width: 120.0,
+            height: 90.0,
+            maximized: false,
+        });
+        assert_eq!(layout.sanitized().restorable_window(), None);
+
+        layout.window = Some(WindowFrame {
+            x: 40.0,
+            y: 40.0,
+            width: f32::INFINITY,
+            height: 900.0,
+            maximized: false,
+        });
+        assert_eq!(layout.sanitized().restorable_window(), None);
+
+        let usable = WindowFrame {
+            x: 120.0,
+            y: 80.0,
+            width: 1440.0,
+            height: 900.0,
+            maximized: true,
+        };
+        layout.window = Some(usable);
+        assert_eq!(layout.sanitized().restorable_window(), Some(usable));
+    }
+
+    #[test]
+    fn edges_clamp_to_their_own_bounds_and_reject_non_finite_values() {
+        let mut layout = WorkspaceLayout::default();
+        layout.set_value(PaneEdge::Sidebar, 10_000.0);
+        assert_eq!(layout.sidebar_width, SIDEBAR_MAX);
+        layout.set_value(PaneEdge::Dock, -50.0);
+        assert_eq!(layout.dock_width, DOCK_MIN);
+        layout.set_value(PaneEdge::Terminal, f32::NAN);
+        assert_eq!(layout.terminal_height, TERMINAL_MIN);
+    }
+
+    #[test]
+    fn a_narrow_window_yields_rails_before_the_conversation_floor() {
+        let layout = WorkspaceLayout {
+            sidebar_width: 400.0,
+            inbox_width: 500.0,
+            dock_width: 600.0,
+            terminal_height: 260.0,
+            sidebar_collapsed: false,
+            dock_collapsed: false,
+            terminal_collapsed: false,
+            window: None,
+        };
+        let fitted = layout.fitted(1000.0, 900.0);
+        let rails = fitted.sidebar_width + fitted.inbox_width + fitted.dock_width;
+        assert!(rails <= 1000.0 - CENTER_MIN + f32::EPSILON, "rails {rails}");
+        assert!(fitted.dock_width >= DOCK_MIN);
+        assert!(fitted.inbox_width >= INBOX_MIN);
+        assert!(fitted.sidebar_width >= SIDEBAR_MIN);
+        // Stored preference is untouched: only the rendered geometry gave way.
+        assert_eq!(layout.dock_width, 600.0);
+    }
+
+    #[test]
+    fn collapsed_panes_render_at_zero_without_losing_their_stored_size() {
+        let layout = WorkspaceLayout {
+            sidebar_collapsed: true,
+            dock_collapsed: true,
+            terminal_collapsed: true,
+            ..WorkspaceLayout::default()
+        };
+        let fitted = layout.fitted(1600.0, 1000.0);
+        assert_eq!(fitted.sidebar_width, 0.0);
+        assert_eq!(fitted.dock_width, 0.0);
+        assert_eq!(fitted.terminal_height, 0.0);
+        assert_eq!(layout.dock_width, WorkspaceLayout::default().dock_width);
+    }
+}

@@ -17,6 +17,7 @@ pub mod shell;
 pub mod task_cockpit;
 pub mod terminal_adapter;
 pub mod tokens;
+pub mod workspace_layout;
 
 pub use native_shell::{NativeClientDetach, NativeHostFullQuit};
 pub use preview::PreviewInitReport;

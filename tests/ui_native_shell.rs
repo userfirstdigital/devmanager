@@ -189,7 +189,7 @@ struct NativeGpuiSmokeReport {
     profile_root: std::path::PathBuf,
     host_state: NativeHostState,
     root_focusable: bool,
-    inbox_label: bool,
+    setup_canvas: bool,
     header_projection: bool,
     model_sequence: Option<u64>,
     model_rendered: usize,
@@ -222,9 +222,15 @@ fn native_gpui_smoke_report() -> NativeGpuiSmokeReport {
                     .gpui_nodes()
                     .iter()
                     .any(|node| node.element_id == "native-shell-root" && node.focusable),
-                shell.accessibility_tree().gpui_nodes().iter().any(|node| {
-                    node.element_id == "native-task-inbox" && node.label == "Task inbox"
-                }),
+                {
+                    let nodes = shell.accessibility_tree().gpui_nodes();
+                    nodes
+                        .iter()
+                        .any(|node| node.element_id == "native-setup-add-project")
+                        && !nodes
+                            .iter()
+                            .any(|node| node.element_id == "native-task-inbox")
+                },
                 shell.platform_accessibility_available(),
                 shell.platform_accessibility_node_count(),
                 platform_tree
@@ -291,7 +297,7 @@ fn native_gpui_smoke_report() -> NativeGpuiSmokeReport {
             profile_root: first_report.3,
             host_state: first_report.4,
             root_focusable: first_report.5,
-            inbox_label: first_report.6,
+            setup_canvas: first_report.6,
             header_projection,
             model_sequence: model_report.0,
             model_rendered: model_report.1,
@@ -319,7 +325,7 @@ fn native_gpui_smokes_share_one_headless_lifetime_authority() {
     assert_eq!(report.host_profile, report.profile_root);
     assert_eq!(report.host_state, NativeHostState::Disconnected);
     assert!(report.root_focusable);
-    assert!(report.inbox_label);
+    assert!(report.setup_canvas);
     assert!(report.header_projection);
     assert_eq!(report.model_sequence, Some(7));
     assert_eq!(report.model_rendered, 2);

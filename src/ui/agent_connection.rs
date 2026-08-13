@@ -88,7 +88,10 @@ mod tests {
             placeholder_task_title(ProviderKind::ClaudeCode),
             "New Claude task"
         );
-        assert_eq!(placeholder_task_title(ProviderKind::Codex), "New Codex task");
+        assert_eq!(
+            placeholder_task_title(ProviderKind::Codex),
+            "New Codex task"
+        );
     }
 
     #[test]
@@ -116,7 +119,10 @@ mod tests {
 
     #[test]
     fn settings_copy_does_not_claim_signed_out_on_check_failed() {
-        let copy = settings_row_copy(ConfigSidebarProviderKind::Claude, AgentPresence::CheckFailed);
+        let copy = settings_row_copy(
+            ConfigSidebarProviderKind::Claude,
+            AgentPresence::CheckFailed,
+        );
         assert!(copy.to_ascii_lowercase().contains("could not check"));
         assert!(!copy.to_ascii_lowercase().contains("signed out"));
     }

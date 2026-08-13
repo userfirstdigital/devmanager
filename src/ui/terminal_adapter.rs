@@ -117,18 +117,27 @@ struct TerminalDockUnavailable {
 impl RenderOnce for TerminalDockUnavailable {
     fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
         let tokens = self.preferences.tokens();
-        let metrics = tokens.density.physical();
+        // The dock sits on the terminal surface, so this state reads from the
+        // terminal palette. Panel colors here would render dark text on a dark
+        // background and look like a rendering failure.
         div()
             .id("terminal-dock-unavailable")
             .w_full()
-            .h(px((metrics.row_height.saturating_mul(3)) as f32))
-            .p(px(metrics.control_padding as f32))
             .flex_col()
-            .gap(px(tokens.density.spacing.md))
-            .bg(tokens.surfaces.sunken.to_gpui())
-            .text_color(tokens.text.primary.to_gpui())
+            .gap(px(tokens.density.spacing.xs))
+            .text_color(tokens.terminal.foreground.to_gpui())
             .whitespace_normal()
-            .child("Terminal dock unavailable")
+            .child(
+                div()
+                    .flex()
+                    .gap(px(tokens.density.spacing.sm))
+                    .child(div().text_color(tokens.terminal.green.to_gpui()).child("$"))
+                    .child(
+                        div()
+                            .text_color(tokens.terminal.foreground.to_gpui())
+                            .child("Terminal dock unavailable"),
+                    ),
+            )
             .child("Waiting for the task terminal stream")
             .child("No terminal is synthesized and no extra PTY is started.")
     }

@@ -55,6 +55,26 @@ pub struct NativeOpenCommandPalette;
 #[action(name = "native.dock_changes")]
 pub struct NativeDockChanges;
 
+/// Collapse or restore the configuration rail.
+#[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
+#[action(name = "native.toggle_sidebar")]
+pub struct NativeToggleSidebar;
+
+/// Collapse or restore the context dock column.
+#[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
+#[action(name = "native.toggle_dock")]
+pub struct NativeToggleDock;
+
+/// Collapse or restore the terminal strip.
+#[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
+#[action(name = "native.toggle_terminal")]
+pub struct NativeToggleTerminal;
+
+/// Restore every pane to its shipped size.
+#[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
+#[action(name = "native.reset_layout")]
+pub struct NativeResetLayout;
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
 #[action(name = "native.dock_files")]
 pub struct NativeDockFiles;
@@ -153,6 +173,10 @@ pub fn register_native_keyboard_bindings(cx: &mut gpui::App) {
         KeyBinding::new("alt-6", NativeDockArtifacts, None),
         KeyBinding::new("alt-7", NativeDockReview, None),
         KeyBinding::new("ctrl-`", NativeOpenTerminal, None),
+        KeyBinding::new("ctrl-b", NativeToggleSidebar, None),
+        KeyBinding::new("ctrl-alt-b", NativeToggleDock, None),
+        KeyBinding::new("ctrl-j", NativeToggleTerminal, None),
+        KeyBinding::new("ctrl-alt-0", NativeResetLayout, None),
         KeyBinding::new("escape", NativeDismissTransient, None),
     ]);
 }

@@ -1,3 +1,16 @@
+# Project and agent first-run (2026-08-12)
+
+Plan: `docs/superpowers/plans/2026-08-12-project-and-agent-first-run.md`
+Branch: `project-and-agent-first-run`
+Checkout: `C:/Code/userfirst/devmanager` (primary checkout; uncommitted first-run UI must stay)
+Task 1 base: `7b428a55338523d4d99312b881ee8540f2fc6968`
+Task 1: complete (commits 7b428a5..ceb0536, review clean)
+Task 2: complete (commits ceb0536..52b0674; overlay project copy fix 52b0674 review clean). Note for final review: 4e84992 also landed in-progress first-run native_shell/config_sidebar substrate (~4k lines) that later tasks edit; not unbundled.
+Task 3: complete (commits 52b0674..181a6e1, review acceptable). Minors for final review: `host::agent_connection` is private not `pub(crate)`; diff may include unrelated project-creation hunks.
+Task 4: complete (commits 181a6e1..778494a, Settings overlay + AccessKit row-id fix review clean). Minor for final review: settings GPUI test does not assert Connecting/Recovery/Cockpit stages.
+Task 5: complete (commits 778494a..0521dd0). Reviewer Important palette hint “Choose a folder on this computer” left as-is: Task 2 / plan required that hint because it describes the OS picker. Final review may triage.
+Task 6: complete (commits 0521dd0..02fe3dc, empty-inbox +Claude a11y fix review clean). Minor: one RED cargo run used default target.
+
 # DevManager Per-Conversation Browser V1 (2026-07-16)
 
 Execution location: clean `master`, explicitly authorized by the user.

@@ -1462,6 +1462,7 @@ mod tests {
                 description: None,
                 project_id,
                 workspace: WorkspaceRequest::main(),
+                primary_provider: None,
                 assignment: TaskAssignment::LocalOwner,
                 created_at_ms: 1,
                 connectivity: TaskConnectivity::Connected,

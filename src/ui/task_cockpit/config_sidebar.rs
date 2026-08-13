@@ -847,10 +847,7 @@ mod tests {
             .providers
             .iter()
             .all(|provider| !provider.command_configured));
-        assert_eq!(
-            projection.summary(),
-            "No projects yet"
-        );
+        assert_eq!(projection.summary(), "No projects yet");
     }
 
     #[test]

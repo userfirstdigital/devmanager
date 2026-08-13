@@ -343,6 +343,16 @@ impl TaskCockpitShell {
             self.timeline_error = None;
             return;
         };
+        if model
+            .tasks()
+            .get(&task_id)
+            .is_some_and(|snapshot| snapshot.primary_agent_id.is_none())
+        {
+            self.timeline = None;
+            self.timeline_error =
+                Some("This task is ready. An agent has not been connected yet.".to_string());
+            return;
+        }
         let result = (|| {
             let journal = SemanticJournalView::from_live_projection(model, task_id)
                 .map_err(|error| error.to_string())?;
@@ -385,40 +395,95 @@ impl TaskCockpitShell {
         self.timeline_error = None;
     }
 
+    pub fn conversation_hold_message(&self) -> Option<&str> {
+        self.timeline_error.as_deref()
+    }
+
     pub fn conversation_surface(
         &self,
         tokens: crate::ui::tokens::ThemeTokens,
         composer: Option<&TaskComposer>,
     ) -> AnyElement {
         let timeline_error = self.timeline_error.clone().unwrap_or_else(|| {
-            "Semantic timeline unavailable until an authenticated journal is admitted".to_string()
+            if self.dock.selected_task().is_none() {
+                "Add a project, then create a task. The conversation fills in once a task is selected.".to_string()
+            } else {
+                "Semantic timeline unavailable until an authenticated journal is admitted".to_string()
+            }
         });
         let timeline = self
             .timeline
             .as_ref()
-            .map(|timeline| timeline.surface(tokens))
+            .map(|timeline| {
+                div()
+                    .id("native-semantic-timeline")
+                    .w_full()
+                    .flex_1()
+                    .min_h(gpui::px(0.0))
+                    .overflow_hidden()
+                    .child(timeline.surface(tokens))
+                    .into_any_element()
+            })
             .unwrap_or_else(move || {
+                // A hold is an expected state, not an error surface. Centred
+                // secondary copy keeps the panel composed while it waits, so a
+                // bound timeline is what draws the eye once one is admitted.
                 div()
                     .id("native-semantic-timeline-hold")
                     .w_full()
-                    .p(gpui::px(tokens.density.physical().control_padding as f32))
-                    .bg(tokens.surfaces.raised.to_gpui())
-                    .child(timeline_error)
+                    .flex_1()
+                    .min_h(gpui::px(0.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .p(gpui::px(tokens.density.spacing.xl))
+                    .child(
+                        div()
+                            .w_full()
+                            .min_w(gpui::px(0.0))
+                            .max_w(gpui::px(340.0))
+                            .text_center()
+                            .text_size(gpui::px(tokens.density.typography.caption))
+                            .line_height(gpui::px(tokens.density.typography.caption_line_height))
+                            .text_color(tokens.text.muted.to_gpui())
+                            .child(timeline_error),
+                    )
                     .into_any_element()
             });
         let composer = composer
             .map(|composer| composer.surface(tokens))
             .unwrap_or_else(|| {
+                // Held composer still occupies the composer's place and shape,
+                // so the panel does not lose its footer when no agent is bound.
                 div()
                     .id("native-task-composer-hold")
                     .w_full()
-                    .p(gpui::px(tokens.density.physical().control_padding as f32))
-                    .child("Task composer unavailable until a primary agent is bound")
+                    .flex_none()
+                    .p(gpui::px(tokens.density.spacing.md))
+                    .border_t(gpui::px(1.0))
+                    .border_color(tokens.borders.subtle.to_gpui())
+                    .child(
+                        div()
+                            .w_full()
+                            .px(gpui::px(tokens.density.spacing.md))
+                            .py(gpui::px(tokens.density.spacing.sm))
+                            .rounded(gpui::px(tokens.density.radii.md))
+                            .bg(tokens.surfaces.disabled.to_gpui())
+                            .border(gpui::px(1.0))
+                            .border_color(tokens.borders.subtle.to_gpui())
+                            .text_size(gpui::px(tokens.density.typography.caption))
+                            .line_height(gpui::px(tokens.density.typography.caption_line_height))
+                            .text_color(tokens.text.disabled.to_gpui())
+                            .child("Task composer unavailable until a primary agent is bound"),
+                    )
                     .into_any_element()
             });
         div()
             .id("native-task-conversation-surface")
             .w_full()
+            .flex_1()
+            .min_h(gpui::px(0.0))
+            .flex()
             .flex_col()
             .child(timeline)
             .child(composer)

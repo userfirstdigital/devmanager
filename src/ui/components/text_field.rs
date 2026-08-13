@@ -107,6 +107,7 @@ pub enum TextFieldKey {
 pub struct TextField {
     value: String,
     cursor: usize,
+    all_selected: bool,
     limits: TextFieldLimits,
     label: String,
     description: String,
@@ -136,6 +137,7 @@ impl TextField {
             accessibility: AccessibilityMetadata::new(AccessibleRole::TextField, label.clone())?,
             value: String::new(),
             cursor: 0,
+            all_selected: false,
             limits,
             label,
             description: String::new(),
@@ -147,6 +149,23 @@ impl TextField {
 
     pub fn value(&self) -> &str {
         &self.value
+    }
+
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    pub fn is_all_selected(&self) -> bool {
+        self.all_selected && !self.value.is_empty()
+    }
+
+    pub fn select_all(&mut self) {
+        if self.value.is_empty() {
+            self.all_selected = false;
+            return;
+        }
+        self.cursor = self.value.chars().count();
+        self.all_selected = true;
     }
 
     pub fn label(&self) -> &str {
@@ -215,6 +234,7 @@ impl TextField {
         self.validate_value(&value)?;
         self.value = value;
         self.cursor = self.value.chars().count();
+        self.all_selected = false;
         self.accessibility.set_value(Some(self.value.clone()));
         Ok(())
     }
@@ -266,12 +286,15 @@ impl TextField {
                 if self.read_only {
                     Ok(false)
                 } else {
+                    self.replace_selection_if_needed();
                     self.insert_text(&character.to_string())
                 }
             }
             TextFieldKey::Backspace => {
                 if self.read_only {
                     Ok(false)
+                } else if self.clear_selection_contents() {
+                    Ok(true)
                 } else {
                     Ok(self.delete_before_cursor())
                 }
@@ -279,23 +302,29 @@ impl TextField {
             TextFieldKey::Delete => {
                 if self.read_only {
                     Ok(false)
+                } else if self.clear_selection_contents() {
+                    Ok(true)
                 } else {
                     Ok(self.delete_at_cursor())
                 }
             }
             TextFieldKey::Left => {
+                self.clear_selection_keeping_value();
                 self.cursor = self.cursor.saturating_sub(1);
                 Ok(false)
             }
             TextFieldKey::Right => {
+                self.clear_selection_keeping_value();
                 self.cursor = (self.cursor + 1).min(self.value.chars().count());
                 Ok(false)
             }
             TextFieldKey::Home => {
+                self.clear_selection_keeping_value();
                 self.cursor = 0;
                 Ok(false)
             }
             TextFieldKey::End => {
+                self.clear_selection_keeping_value();
                 self.cursor = self.value.chars().count();
                 Ok(false)
             }
@@ -312,7 +341,27 @@ impl TextField {
         {
             return Ok(false);
         }
+        self.replace_selection_if_needed();
         self.insert_text(text)
+    }
+
+    fn replace_selection_if_needed(&mut self) {
+        let _ = self.clear_selection_contents();
+    }
+
+    fn clear_selection_keeping_value(&mut self) {
+        self.all_selected = false;
+    }
+
+    fn clear_selection_contents(&mut self) -> bool {
+        if !self.all_selected {
+            return false;
+        }
+        self.value.clear();
+        self.cursor = 0;
+        self.all_selected = false;
+        self.accessibility.set_value(Some(self.value.clone()));
+        true
     }
 
     fn insert_text(&mut self, text: &str) -> Result<bool, TextFieldError> {
@@ -406,4 +455,41 @@ fn byte_index_at_scalar(value: &str, scalar_index: usize) -> usize {
         .nth(scalar_index)
         .map(|(index, _)| index)
         .unwrap_or(value.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TextField, TextFieldKey};
+
+    fn focused_field(value: &str) -> TextField {
+        let mut field = TextField::new("Name").expect("text field");
+        field.set_value(value).expect("set value");
+        field.focus();
+        field
+    }
+
+    #[test]
+    fn typing_replaces_a_selected_prefilled_name() {
+        let mut field = focused_field("command");
+        field.select_all();
+        assert!(field.is_all_selected());
+        let epoch = field.focus_epoch();
+        assert!(field
+            .handle_key(TextFieldKey::Character('x'), epoch)
+            .expect("type"));
+        assert_eq!(field.value(), "x");
+        assert!(!field.is_all_selected());
+    }
+
+    #[test]
+    fn backspace_clears_a_selected_prefilled_name() {
+        let mut field = focused_field("command");
+        field.select_all();
+        let epoch = field.focus_epoch();
+        assert!(field
+            .handle_key(TextFieldKey::Backspace, epoch)
+            .expect("backspace"));
+        assert_eq!(field.value(), "");
+        assert!(!field.is_all_selected());
+    }
 }

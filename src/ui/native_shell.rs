@@ -23,9 +23,9 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     anchored, deferred, div, point, px, size, uniform_list, AnyElement, App, AppContext,
-    Application, ClickEvent, Context, ElementId, FocusHandle, FontWeight,
-    InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, ParentElement, PathPromptOptions, Pixels, Point, Render, ScrollWheelEvent, Size,
+    Application, ClickEvent, Context, ElementId, FocusHandle, FontWeight, InteractiveElement,
+    IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    ParentElement, PathPromptOptions, Pixels, Point, Render, ScrollWheelEvent, Size,
     StatefulInteractiveElement, Styled, Subscription, Task, Timer, UniformListScrollHandle, Window,
     WindowBounds, WindowOptions,
 };
@@ -63,6 +63,7 @@ use crate::prompts::projection::{PromptLibraryQuery, PromptNamespace, PromptProj
 use crate::protocol::BrowserSecurityState;
 use crate::protocol::StreamFrame;
 use crate::protocol::{Capability, CapabilitySet, FrameLimits};
+use crate::providers::ProviderKind;
 use crate::remote::RemoteHostService;
 use crate::ui::actions::{
     self, DockTool, HostActions, HostStatus, KeyboardAction, KeyboardModel, KeyboardShortcut,
@@ -72,7 +73,6 @@ use crate::ui::actions::{
     NativeResetLayout, NativeToggleDock, NativeToggleSidebar, NativeToggleTerminal, TaskCreate,
     TaskListAction, TaskRename, TaskShow,
 };
-use crate::providers::ProviderKind;
 use crate::ui::agent_connection::{
     connect_canvas_copy, inbox_agent_actions, settings_row_copy, snapshot_connected,
 };
@@ -4106,9 +4106,7 @@ async fn execute_native_command(
                     body: NativeHostQueryBody::AgentConnection(snapshot),
                 }),
                 Err(error) => Ok(NativeHostExecutionResult::Query {
-                    detail: bounded_host_error(format!(
-                        "agent.connection unavailable: {error:?}"
-                    )),
+                    detail: bounded_host_error(format!("agent.connection unavailable: {error:?}")),
                     body: NativeHostQueryBody::AgentConnection(agent_connection_snapshot(
                         AgentPresence::CheckFailed,
                     )),
@@ -5031,7 +5029,11 @@ impl NativeInteraction {
         }
         let (focus_epoch, request_generation, action_epoch) = if reuse_handler {
             if let Some(trace) = self.last_handler.as_ref() {
-                (trace.focus_epoch, trace.request_generation, trace.action_epoch)
+                (
+                    trace.focus_epoch,
+                    trace.request_generation,
+                    trace.action_epoch,
+                )
             } else {
                 let (focus_epoch, request_generation) = self.begin_handler(self.selected_task());
                 (focus_epoch, request_generation, self.action_epoch)
@@ -8933,6 +8935,7 @@ impl NativeShell {
                     description: None,
                     project_id,
                     workspace: crate::workspace::WorkspaceRequest::main(),
+                    primary_provider: None,
                 },
             ))
             .is_some()
@@ -8956,9 +8959,7 @@ impl NativeShell {
                     self.settings_open = true;
                 }
             }
-            "native-inbox-plus-claude" => {
-                self.start_task_with_agent(ProviderKind::ClaudeCode)
-            }
+            "native-inbox-plus-claude" => self.start_task_with_agent(ProviderKind::ClaudeCode),
             "native-inbox-plus-codex" => self.start_task_with_agent(ProviderKind::Codex),
             "native-add-project-submit" => {
                 if self
@@ -9266,13 +9267,11 @@ impl NativeShell {
                     Button::new(Self::inbox_agent_action_id(provider))
                         .label(action.label)
                         .ghost()
-                        .on_click(cx.listener(
-                            move |shell, _event: &ClickEvent, _window, cx| {
-                                cx.stop_propagation();
-                                shell.start_task_with_agent(provider);
-                                cx.notify();
-                            },
-                        ))
+                        .on_click(cx.listener(move |shell, _event: &ClickEvent, _window, cx| {
+                            cx.stop_propagation();
+                            shell.start_task_with_agent(provider);
+                            cx.notify();
+                        }))
                         .into_any_element()
                 }))
                 .into_any_element()
@@ -9462,10 +9461,9 @@ impl NativeShell {
 
     fn setup_intro_copy(&self, stage: ShellStage) -> Option<(&'static str, String)> {
         match stage {
-            ShellStage::Connecting => Some((
-                "Getting ready",
-                "This only takes a moment.".to_string(),
-            )),
+            ShellStage::Connecting => {
+                Some(("Getting ready", "This only takes a moment.".to_string()))
+            }
             ShellStage::Recovery => Some((
                 "Can't load your settings",
                 "DevManager needs to recover before you can continue.".to_string(),
@@ -9654,18 +9652,21 @@ impl NativeShell {
             .rounded(px(tokens.density.radii.md))
             .bg(tokens.surfaces.sunken.to_gpui())
             .border(px(1.0))
-            .border_color(
-                if chrome.show_focus_ring {
-                    tokens.borders.selection.to_gpui()
-                } else {
-                    tokens.borders.subtle.to_gpui()
-                },
-            )
+            .border_color(if chrome.show_focus_ring {
+                tokens.borders.selection.to_gpui()
+            } else {
+                tokens.borders.subtle.to_gpui()
+            })
             .flex()
             .items_center()
             .min_h(px(tokens.density.controls.row_height));
         for (index, part) in parts.into_iter().enumerate() {
-            row = row.child(Self::overlay_text_field_part(part, placeholder, tokens, index));
+            row = row.child(Self::overlay_text_field_part(
+                part,
+                placeholder,
+                tokens,
+                index,
+            ));
         }
         row.into_any_element()
     }
@@ -10257,57 +10258,57 @@ impl NativeShell {
                 .position(point(px(0.0), px(0.0)))
                 .snap_to_window()
                 .child(
-                div()
-                    .id("native-command-palette-backdrop")
-                    .occlude()
-                    .w(viewport.width)
-                    .h(viewport.height)
-                    .flex()
-                    .justify_center()
-                    .pt(px(96.0))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|shell, _event: &MouseDownEvent, _window, cx| {
+                    div()
+                        .id("native-command-palette-backdrop")
+                        .occlude()
+                        .w(viewport.width)
+                        .h(viewport.height)
+                        .flex()
+                        .justify_center()
+                        .pt(px(96.0))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|shell, _event: &MouseDownEvent, _window, cx| {
+                                cx.stop_propagation();
+                                shell.interaction.close_palettes();
+                                cx.notify();
+                            }),
+                        )
+                        .on_key_down(cx.listener(|shell, event: &KeyDownEvent, window, cx| {
                             cx.stop_propagation();
-                            shell.interaction.close_palettes();
+                            shell.handle_palette_key(event, window, cx);
                             cx.notify();
-                        }),
-                    )
-                    .on_key_down(cx.listener(|shell, event: &KeyDownEvent, window, cx| {
-                        cx.stop_propagation();
-                        shell.handle_palette_key(event, window, cx);
-                        cx.notify();
-                    }))
-                    .child(
-                        div()
-                            .id("native-command-palette")
-                            .w(px(420.0))
-                            .rounded(px(tokens.density.radii.lg))
-                            .bg(tokens.surfaces.raised.to_gpui())
-                            .border(px(1.0))
-                            .border_color(tokens.borders.subtle.to_gpui())
-                            .shadow_sm()
-                            .p(px(tokens.density.spacing.sm))
-                            .flex()
-                            .flex_col()
-                            .gap(px(tokens.density.spacing.xxs))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|_shell, _event: &MouseDownEvent, _window, cx| {
-                                    cx.stop_propagation();
-                                }),
-                            )
-                            .child(
-                                div()
-                                    .px(px(tokens.density.spacing.md))
-                                    .py(px(tokens.density.spacing.sm))
-                                    .text_size(px(tokens.density.typography.caption))
-                                    .text_color(tokens.text.muted.to_gpui())
-                                    .child("Commands · Enter to run · Esc to close"),
-                            )
-                            .children(rows),
-                    ),
-            ),
+                        }))
+                        .child(
+                            div()
+                                .id("native-command-palette")
+                                .w(px(420.0))
+                                .rounded(px(tokens.density.radii.lg))
+                                .bg(tokens.surfaces.raised.to_gpui())
+                                .border(px(1.0))
+                                .border_color(tokens.borders.subtle.to_gpui())
+                                .shadow_sm()
+                                .p(px(tokens.density.spacing.sm))
+                                .flex()
+                                .flex_col()
+                                .gap(px(tokens.density.spacing.xxs))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|_shell, _event: &MouseDownEvent, _window, cx| {
+                                        cx.stop_propagation();
+                                    }),
+                                )
+                                .child(
+                                    div()
+                                        .px(px(tokens.density.spacing.md))
+                                        .py(px(tokens.density.spacing.sm))
+                                        .text_size(px(tokens.density.typography.caption))
+                                        .text_color(tokens.text.muted.to_gpui())
+                                        .child("Commands · Enter to run · Esc to close"),
+                                )
+                                .children(rows),
+                        ),
+                ),
         )
         .with_priority(2)
         .into_any_element()
@@ -10343,9 +10344,7 @@ impl NativeShell {
         }
         let mut chars = event.keystroke.key.chars();
         match (chars.next(), chars.next()) {
-            (Some(character), None)
-                if character.is_ascii_graphic() || character == ' ' =>
-            {
+            (Some(character), None) if character.is_ascii_graphic() || character == ' ' => {
                 Some(TextFieldKey::Character(character))
             }
             _ => None,
@@ -12421,18 +12420,17 @@ fn enqueue_pending_preference(
 mod tests {
     use super::{
         acquire_reaper_permit, agent_connection_snapshot, authorize_full_host_quit,
-        dispatch_pending_action,
-        enqueue_pending_preference, ensure_isolated_host_config_base, isolated_dev_profile,
-        publish_projection, reap_retained_children, reap_retained_workers, retain_child,
-        retain_worker, retained_children, take_retained_action_outcomes, update_state_from_stage,
-        wait_for_cancellation, AccessibilityTree, ClientId, CommandId, IsolatedDevProfile,
-        NativeActionRecord, NativeHostActionFailure, NativeHostActionOutcome,
-        NativeHostActionResult, NativeHostChildOwnership, NativeHostLaunchMode,
-        NativeHostLaunchSpec, NativeHostProjection, NativeHostProjectionKind,
-        NativeHostRuntimeEpochs, NativeHostRuntimePort, NativeHostWorkerCommand, NativeInteraction,
-        NativeHeaderAttachment, NativePlatformAccessibilityBridge, NativeShell, NativeShellMode,
-        NativeShutdownDeadline, OverlayTextFieldPart, OwnedChild, OwnedWorker, PaletteItem,
-        AgentPresence, ProviderKind, ReaperKind, ShellStage, TaskId, UpdateState, UpdaterStage,
+        dispatch_pending_action, enqueue_pending_preference, ensure_isolated_host_config_base,
+        isolated_dev_profile, publish_projection, reap_retained_children, reap_retained_workers,
+        retain_child, retain_worker, retained_children, take_retained_action_outcomes,
+        update_state_from_stage, wait_for_cancellation, AccessibilityTree, AgentPresence, ClientId,
+        CommandId, IsolatedDevProfile, NativeActionRecord, NativeHeaderAttachment,
+        NativeHostActionFailure, NativeHostActionOutcome, NativeHostActionResult,
+        NativeHostChildOwnership, NativeHostLaunchMode, NativeHostLaunchSpec, NativeHostProjection,
+        NativeHostProjectionKind, NativeHostRuntimeEpochs, NativeHostRuntimePort,
+        NativeHostWorkerCommand, NativeInteraction, NativePlatformAccessibilityBridge, NativeShell,
+        NativeShellMode, NativeShutdownDeadline, OverlayTextFieldPart, OwnedChild, OwnedWorker,
+        PaletteItem, ProviderKind, ReaperKind, ShellStage, TaskId, UpdateState, UpdaterStage,
         MAX_ACTION_LANE_RECORDS, MAX_ACTION_OUTCOME_PROJECTIONS, MAX_HOST_PROJECTIONS,
         MAX_PENDING_HOST_ACTIONS, MAX_PENDING_PREFERENCES, MAX_RETAINED_CHILDREN,
         MAX_RETAINED_WORKERS, MAX_RETRY_HOST_ACTIONS, PRODUCTION_HOST_PROFILE,
@@ -12608,6 +12606,7 @@ mod tests {
                 description: None,
                 project_id: crate::domain::id::ProjectId::new(),
                 workspace: crate::workspace::WorkspaceRequest::main(),
+                primary_provider: None,
             },
         )
     }
@@ -12890,19 +12889,12 @@ mod tests {
                 shell.apply_picked_project_folder(path);
                 let selected = shell.add_project_name_is_selected_for_test();
                 let typed = shell.type_add_project_character_for_test('x');
-                (
-                    selected,
-                    typed,
-                    shell.add_project_overlay_for_test(),
-                )
+                (selected, typed, shell.add_project_overlay_for_test())
             });
             *completed_for_app.borrow_mut() = Some(snapshot);
             cx.quit();
         });
-        let (selected, typed, overlay) = completed
-            .borrow()
-            .clone()
-            .expect("typed folder name");
+        let (selected, typed, overlay) = completed.borrow().clone().expect("typed folder name");
         assert!(selected, "prefilled folder name must start selected");
         assert!(typed, "typing into the selected name must be accepted");
         let (name, _) = overlay.expect("add-folder overlay");
@@ -12975,10 +12967,7 @@ mod tests {
                 shell.agent_connection = Some(agent_connection_snapshot(AgentPresence::SignedIn));
                 shell.install_named_folder_for_test("command");
                 shell.offer_first_task_if_needed();
-                (
-                    shell.new_task_overlay_open_for_test(),
-                    shell.shell_stage(),
-                )
+                (shell.new_task_overlay_open_for_test(), shell.shell_stage())
             });
             *completed_for_app.borrow_mut() = Some(snapshot);
             cx.quit();
@@ -13056,13 +13045,13 @@ mod tests {
             cx.quit();
         });
         let (welcome_shows, welcome_open, after_project_shows, after_project_open, stage) =
-            completed.borrow().clone().expect("settings header snapshot");
+            completed
+                .borrow()
+                .clone()
+                .expect("settings header snapshot");
         assert!(welcome_shows, "welcome header must show Settings");
         assert!(welcome_open, "settings must open from welcome header");
-        assert!(
-            after_project_shows,
-            "empty-inbox header must show Settings"
-        );
+        assert!(after_project_shows, "empty-inbox header must show Settings");
         assert!(
             after_project_open,
             "settings must open from empty-inbox header"
@@ -13166,7 +13155,9 @@ mod tests {
             .filter(|id| !id.is_empty())
             .collect();
         assert!(
-            element_ids.iter().any(|id| id == "native-inbox-plus-claude"),
+            element_ids
+                .iter()
+                .any(|id| id == "native-inbox-plus-claude"),
             "expected +Claude inbox action: {element_ids:?}"
         );
         assert!(
@@ -13495,6 +13486,7 @@ mod tests {
                             description: None,
                             project_id: crate::domain::id::ProjectId::new(),
                             workspace: crate::workspace::WorkspaceRequest::main(),
+                            primary_provider: None,
                         },
                     ),
                 );

@@ -21,13 +21,12 @@ use tokio::time::{interval_at, MissedTickBehavior};
 use uuid::Uuid;
 
 use crate::config::{ConfigCommand, ConfigError, ConfigErrorKind, ConfigStore, Nullable, Project};
-use crate::domain::cockpit::{TaskCockpitQuery, TaskCockpitResult};
 use crate::domain::agent::{AgentRole, AgentSessionFacts};
+use crate::domain::cockpit::{TaskCockpitQuery, TaskCockpitResult};
 use crate::domain::command::{
     ArmUpdateInstallIntent, Command, CommandEnvelope, CommandReceipt, ConfirmUpdateDrainIntent,
     CreateTaskIntent, CreateTaskRequestIntent, PrepareUpdateIntent,
 };
-use crate::domain::resource::{OwnerKind, ResourceFacts, ResourceKind, ResourceRecipe};
 use crate::domain::event::DomainEvent;
 use crate::domain::id::{
     ArtifactId, OperationId, RequestId, SnapshotId, SubscriptionId, TaskId, TerminalId,
@@ -35,6 +34,7 @@ use crate::domain::id::{
 use crate::domain::query::{
     Query, QueryEnvelope, QueryError, QueryOutcome, QueryReply, QueryResult,
 };
+use crate::domain::resource::{OwnerKind, ResourceFacts, ResourceKind, ResourceRecipe};
 use crate::domain::snapshot::{PageLimits, SnapshotSection};
 use crate::domain::AgentSessionId;
 use crate::domain::ClientId;
@@ -125,12 +125,12 @@ mod workspace_security_tests {
         dispatch_authenticated_request, dispatch_authenticated_request_with_workspace_projects,
         normalize_task_create_at_host,
     };
+    use crate::domain::agent::{AgentRole, AgentSessionFacts};
+    use crate::domain::agent_resource::AgentResourceBinding;
     use crate::domain::command::{
         Command, CommandEnvelope, CreateTaskIntent, CreateTaskRequestIntent,
         StartProviderSessionIntent,
     };
-    use crate::domain::agent::{AgentRole, AgentSessionFacts};
-    use crate::domain::agent_resource::AgentResourceBinding;
     use crate::domain::resource::{OwnerKind, ResourceFacts, ResourceKind, ResourceRecipe};
     use crate::domain::task::{
         ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity,
@@ -140,8 +140,8 @@ mod workspace_security_tests {
     use crate::host::IpcError;
     use crate::kernel::CommandBus;
     use crate::protocol::{CapabilitySet, ClientRequest};
-    use crate::workspace::{WorkspaceProjectRoots, WorkspaceRequest};
     use crate::providers::ProviderKind;
+    use crate::workspace::{WorkspaceProjectRoots, WorkspaceRequest};
     use uuid::Uuid;
 
     #[test]
@@ -208,8 +208,9 @@ mod workspace_security_tests {
         let client_id = ClientId::new();
         let task_id = TaskId::new();
         let project_id = ProjectId::new();
-        let roots = WorkspaceProjectRoots::try_from_pairs([(project_id, repository.path().to_path_buf())])
-            .expect("roots");
+        let roots =
+            WorkspaceProjectRoots::try_from_pairs([(project_id, repository.path().to_path_buf())])
+                .expect("roots");
         let create = CommandEnvelope {
             command_id: CommandId::new(),
             client_id,
@@ -232,14 +233,9 @@ mod workspace_security_tests {
                 review_readiness: ReviewReadiness::NotReady,
             }),
         };
-        let (normalized, authorization, request_id) = normalize_task_create_at_host(
-            create,
-            Some(&roots),
-            None,
-            Uuid::nil(),
-            None,
-        )
-        .expect("normalize create");
+        let (normalized, authorization, request_id) =
+            normalize_task_create_at_host(create, Some(&roots), None, Uuid::nil(), None)
+                .expect("normalize create");
         let receipt = bus
             .execute_host_authorized(
                 normalized,
@@ -248,27 +244,39 @@ mod workspace_security_tests {
                 Uuid::nil(),
             )
             .expect("create");
-        assert!(matches!(receipt, crate::domain::command::CommandReceipt::Accepted { .. }));
-        let mut agent = AgentSessionFacts::new(
-            task_id,
-            AgentRole::Primary,
-            ProviderKind::ClaudeCode,
-            None,
-        )
-        .expect("agent");
+        assert!(matches!(
+            receipt,
+            crate::domain::command::CommandReceipt::Accepted { .. }
+        ));
+        let mut agent =
+            AgentSessionFacts::new(task_id, AgentRole::Primary, ProviderKind::ClaudeCode, None)
+                .expect("agent");
         agent.runtime_generation = 1;
         let mut resource = ResourceFacts::new(
             Some(task_id),
             OwnerKind::Task,
             ResourceKind::Terminal,
-            ResourceRecipe::Terminal { cols: 120, rows: 40 },
+            ResourceRecipe::Terminal {
+                cols: 120,
+                rows: 40,
+            },
             1_725_000_000_300,
         )
         .expect("terminal");
         resource.runtime_generation = 1;
         for (expected_revision, command) in [
-            (1, Command::RegisterAgentSession { agent: agent.clone() }),
-            (2, Command::RegisterResource { resource: resource.clone() }),
+            (
+                1,
+                Command::RegisterAgentSession {
+                    agent: agent.clone(),
+                },
+            ),
+            (
+                2,
+                Command::RegisterResource {
+                    resource: resource.clone(),
+                },
+            ),
             (
                 3,
                 Command::SetPrimaryAgent {
@@ -295,9 +303,12 @@ mod workspace_security_tests {
         assert_eq!(snapshot.primary_agent_id, Some(agent.id));
         assert_eq!(snapshot.agents[&agent.id].runtime_generation, 1);
         assert_eq!(
-            AgentResourceBinding::from_facts(&snapshot.agents[&agent.id], &snapshot.resources[&resource.id])
-                .expect("binding")
-                .runtime_generation,
+            AgentResourceBinding::from_facts(
+                &snapshot.agents[&agent.id],
+                &snapshot.resources[&resource.id]
+            )
+            .expect("binding")
+            .runtime_generation,
             1
         );
         let start = StartProviderSessionIntent {
@@ -3081,7 +3092,10 @@ impl HostRequestExecutor {
             Command::CreateTaskV2(intent) => intent.primary_provider,
             _ => return Err(IpcError::Unavailable),
         };
-        if matches!(primary_provider, Some(crate::providers::ProviderKind::Cursor)) {
+        if matches!(
+            primary_provider,
+            Some(crate::providers::ProviderKind::Cursor)
+        ) {
             return Err(IpcError::Unavailable);
         }
         validate_authenticated_command_capability(negotiated.capabilities, &envelope.command)?;
@@ -3111,13 +3125,8 @@ impl HostRequestExecutor {
             .map_err(map_store_error)?;
         self.fan_out_live_durable_events();
         let provider_kind = primary_provider.ok_or(IpcError::Unavailable)?;
-        let mut agent = AgentSessionFacts::new(
-            task_id,
-            AgentRole::Primary,
-            provider_kind,
-            None,
-        )
-        .map_err(|_| IpcError::Unavailable)?;
+        let mut agent = AgentSessionFacts::new(task_id, AgentRole::Primary, provider_kind, None)
+            .map_err(|_| IpcError::Unavailable)?;
         agent.runtime_generation = 1;
         let mut resource = ResourceFacts::new(
             Some(task_id),
@@ -4591,7 +4600,10 @@ fn normalize_task_create_at_host(
             activity,
             review_readiness,
         }) => {
-            if matches!(primary_provider, Some(crate::providers::ProviderKind::Cursor)) {
+            if matches!(
+                primary_provider,
+                Some(crate::providers::ProviderKind::Cursor)
+            ) {
                 return Err(IpcError::Unavailable);
             }
             let workspace_projects = workspace_projects.ok_or_else(|| {

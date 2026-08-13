@@ -1,6 +1,4 @@
-use crate::domain::{
-    AgentConnectionRow, AgentPresence, ConfigSidebarProviderKind,
-};
+use crate::domain::{AgentConnectionRow, AgentPresence, ConfigSidebarProviderKind};
 use crate::providers::{ProviderAuthState, ProviderError, ProviderObservation};
 
 pub(crate) fn map_provider_observe(
