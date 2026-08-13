@@ -6,7 +6,9 @@
 //! [`ConfigSnapshot`] and the shell dispatches the typed selection requests.
 //! Configuration editing remains behind the existing ConfigStore/app facade.
 
-use gpui::{div, px, rgb, AnyElement, InteractiveElement, IntoElement, ParentElement, Styled};
+use gpui::{
+    div, px, rgb, AnyElement, FontWeight, InteractiveElement, IntoElement, ParentElement, Styled,
+};
 
 use crate::config::{
     AppConfig, ConfigRevision, ConfigSnapshot, Nullable, Project, ProjectFolder, RunCommand,
@@ -35,7 +37,7 @@ impl ConfigSidebarUnavailableReason {
         match self {
             Self::SnapshotMissing => "Configuration is unavailable",
             Self::StoreRecoveryRequired => "Configuration is read-only until recovery succeeds",
-            Self::NoConfiguredItems => "No configured projects, servers, or providers",
+            Self::NoConfiguredItems => "No projects yet",
         }
     }
 }
@@ -120,6 +122,7 @@ impl ConfigSidebarAction {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigProjectRow {
     pub config_id: String,
+    pub workspace_id: String,
     pub label: String,
     pub root_configured: bool,
     pub folders: Vec<ConfigFolderRow>,
@@ -197,7 +200,16 @@ impl ConfigSidebarProjection {
             .iter()
             .filter(|project| !is_archived(&project.archived))
             .take(MAX_CONFIG_PROJECTS)
-            .map(project_row)
+            .map(|project| {
+                project_row(
+                    project,
+                    config
+                        .workspace_project_ids()
+                        .get(&project.id)
+                        .cloned()
+                        .unwrap_or_default(),
+                )
+            })
             .collect::<Vec<_>>();
         let mut servers = Vec::new();
         for project in config
@@ -260,6 +272,7 @@ impl ConfigSidebarProjection {
             .take(MAX_CONFIG_PROJECTS)
             .map(|project| ConfigProjectRow {
                 config_id: bounded(&project.config_id, MAX_CONFIG_LABEL_SCALARS),
+                workspace_id: bounded(&project.workspace_id, MAX_CONFIG_LABEL_SCALARS),
                 label: bounded(&project.label, MAX_CONFIG_LABEL_SCALARS),
                 root_configured: project.root_configured,
                 folders: project
@@ -417,14 +430,36 @@ impl ConfigSidebarProjection {
     pub fn summary(&self) -> String {
         self.unavailable_reason.map_or_else(
             || {
-                format!(
-                    "{} project(s) · {} server(s) · {} remote(s)",
-                    self.projects.len(),
-                    self.servers.len(),
-                    self.ssh_connections.len()
-                )
+                if self.servers.is_empty() && self.ssh_connections.is_empty() {
+                    match self.projects.as_slice() {
+                        [] => "No projects yet".to_owned(),
+                        [project] => project.label.clone(),
+                        projects => format!("{} projects", projects.len()),
+                    }
+                } else {
+                    format!(
+                        "{} project(s) · {} server(s) · {} remote(s)",
+                        self.projects.len(),
+                        self.servers.len(),
+                        self.ssh_connections.len()
+                    )
+                }
             },
             |reason| reason.label().to_owned(),
+        )
+    }
+
+    pub fn project_section_title(&self) -> &'static str {
+        "Projects"
+    }
+
+    /// One added project already appears in the Projects list. Repeating it under
+    /// a Workspace heading makes the same name look like two different things.
+    pub fn shows_identity_summary(&self) -> bool {
+        matches!(
+            self.unavailable_reason,
+            Some(ConfigSidebarUnavailableReason::SnapshotMissing)
+                | Some(ConfigSidebarUnavailableReason::StoreRecoveryRequired)
         )
     }
 
@@ -433,56 +468,88 @@ impl ConfigSidebarProjection {
     pub fn surface(&self, tokens: ThemeTokens) -> AnyElement {
         let mut sections = Vec::new();
         sections.push(section(
-            "Projects",
+            self.project_section_title(),
             self.projects.iter().map(|row| row.label.clone()),
             0,
             tokens,
         ));
-        sections.push(section(
-            "Servers",
-            self.servers.iter().map(|row| row.label.clone()),
-            1,
-            tokens,
-        ));
-        sections.push(section(
-            "LLM providers",
-            self.providers.iter().map(|row| {
-                format!(
-                    "{}{}",
-                    row.label,
-                    if row.command_configured {
-                        ""
-                    } else {
-                        " · not configured"
-                    }
-                )
-            }),
-            2,
-            tokens,
-        ));
-        sections.push(section(
-            "Remote connections",
-            self.ssh_connections.iter().map(|row| row.label.clone()),
-            3,
-            tokens,
-        ));
+        if !self.servers.is_empty() {
+            sections.push(section(
+                "Servers",
+                self.servers.iter().map(|row| row.label.clone()),
+                1,
+                tokens,
+            ));
+        }
+        let configured_providers = self
+            .providers
+            .iter()
+            .filter(|row| row.command_configured)
+            .map(|row| row.label.to_string())
+            .collect::<Vec<_>>();
+        if !configured_providers.is_empty() {
+            sections.push(section("LLM providers", configured_providers, 2, tokens));
+        }
+        if !self.ssh_connections.is_empty() {
+            sections.push(section(
+                "Remote connections",
+                self.ssh_connections.iter().map(|row| row.label.clone()),
+                3,
+                tokens,
+            ));
+        }
         div()
             .id("native-config-sidebar")
-            .w(px(280.0))
-            .flex_none()
+            // The rail's width is owned by the shell's persisted layout, so the
+            // surface fills whatever the user dragged it to instead of pinning
+            // a second, conflicting width here.
+            .w_full()
+            .flex_1()
+            .min_w(px(0.0))
             .h_full()
             .flex()
             .flex_col()
-            .gap(px(tokens.density.spacing.sm))
-            .p(px(tokens.density.physical().control_padding as f32))
-            .bg(rgb(tokens.surfaces.sunken.to_u32()))
-            .child(self.summary())
-            .children(sections)
+            .overflow_hidden()
+            .bg(rgb(tokens.surfaces.overlay.to_u32()))
+            .children(self.shows_identity_summary().then(|| {
+                div()
+                    .id("native-config-sidebar-summary")
+                    .w_full()
+                    .flex_none()
+                    .flex()
+                    .flex_col()
+                    .gap(px(tokens.density.spacing.xxs))
+                    .px(px(tokens.density.spacing.lg))
+                    .py(px(tokens.density.spacing.md))
+                    .border_b(px(1.0))
+                    .border_color(rgb(tokens.borders.subtle.to_u32()))
+                    .child(
+                        div()
+                            .text_size(px(tokens.density.typography.caption))
+                            .line_height(px(tokens.density.typography.caption_line_height))
+                            .text_color(rgb(tokens.text.secondary.to_u32()))
+                            .child(self.summary()),
+                    )
+            }))
+            .child(
+                div()
+                    .id("native-config-sidebar-sections")
+                    .w_full()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .overflow_hidden()
+                    .flex()
+                    .flex_col()
+                    .gap(px(tokens.density.spacing.lg))
+                    .px(px(tokens.density.spacing.sm))
+                    .py(px(tokens.density.spacing.md))
+                    .children(sections),
+            )
             .into_any_element()
     }
 }
 
-fn project_row(project: &Project) -> ConfigProjectRow {
+fn project_row(project: &Project, workspace_id: String) -> ConfigProjectRow {
     let config_id = bounded(&project.id, MAX_CONFIG_LABEL_SCALARS);
     let label = bounded(
         if project.name.trim().is_empty() {
@@ -502,6 +569,7 @@ fn project_row(project: &Project) -> ConfigProjectRow {
     let accessibility = accessibility(AccessibleRole::Button, &format!("Project {label}"));
     ConfigProjectRow {
         config_id: config_id.clone(),
+        workspace_id: bounded(&workspace_id, MAX_CONFIG_LABEL_SCALARS),
         label,
         root_configured: !project.root_path.trim().is_empty(),
         folders,
@@ -635,18 +703,66 @@ fn section(
     section_id: usize,
     tokens: ThemeTokens,
 ) -> AnyElement {
-    let rows = labels
-        .into_iter()
-        .take(MAX_CONFIG_SERVERS)
-        .enumerate()
-        .map(|(index, label)| div().id(("native-config-sidebar-row", index)).child(label));
+    let labels: Vec<String> = labels.into_iter().take(MAX_CONFIG_SERVERS).collect();
+    let is_empty = labels.is_empty();
+    // Row ids are offset by their section so two rails cannot mint the same
+    // GPUI element identity for different rows.
+    let rows = labels.into_iter().enumerate().map(|(index, label)| {
+        div()
+            .id((
+                "native-config-sidebar-row",
+                section_id * MAX_CONFIG_SERVERS + index,
+            ))
+            .w_full()
+            .flex()
+            .items_center()
+            .gap(px(tokens.density.spacing.sm))
+            .h(px(tokens.density.controls.row_height))
+            .px(px(tokens.density.spacing.sm))
+            .rounded(px(tokens.density.radii.sm))
+            .text_size(px(tokens.density.typography.body))
+            .line_height(px(tokens.density.typography.body_line_height))
+            .text_color(rgb(tokens.text.secondary.to_u32()))
+            .cursor_pointer()
+            .hover(|style| style.bg(rgb(tokens.surfaces.hover.to_u32())))
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(5.0))
+                    .h(px(5.0))
+                    .rounded(px(tokens.density.radii.pill))
+                    .bg(rgb(tokens.borders.strong.to_u32())),
+            )
+            .child(div().flex_1().min_w(px(0.0)).truncate().child(label))
+    });
     div()
         .id(("native-config-sidebar-section", section_id))
+        .w_full()
         .flex()
         .flex_col()
-        .gap(px(tokens.density.spacing.xs))
-        .child(title)
+        .gap(px(tokens.density.spacing.xxs))
+        .child(
+            div()
+                .px(px(tokens.density.spacing.sm))
+                .pb(px(tokens.density.spacing.xxs))
+                .text_size(px(tokens.density.typography.caption))
+                .line_height(px(tokens.density.typography.caption_line_height))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgb(tokens.text.muted.to_u32()))
+                .child(title.to_uppercase()),
+        )
         .children(rows)
+        .children(is_empty.then(|| {
+            div()
+                .flex()
+                .items_center()
+                .h(px(tokens.density.controls.row_height))
+                .px(px(tokens.density.spacing.sm))
+                .text_size(px(tokens.density.typography.caption))
+                .line_height(px(tokens.density.typography.caption_line_height))
+                .text_color(rgb(tokens.text.disabled.to_u32()))
+                .child("None configured")
+        }))
         .into_any_element()
 }
 
@@ -726,7 +842,44 @@ mod tests {
             .all(|provider| !provider.command_configured));
         assert_eq!(
             projection.summary(),
-            "No configured projects, servers, or providers"
+            "No projects yet"
         );
+    }
+
+    #[test]
+    fn summary_names_a_single_project_instead_of_empty_server_counts() {
+        let mut config = AppConfig::default();
+        config.projects.push(Project {
+            id: "project-1".into(),
+            name: "Notes".into(),
+            root_path: "C:/notes".into(),
+            ..Project::default()
+        });
+        let projection = ConfigSidebarProjection::from_config(&config, 7);
+        assert_eq!(projection.summary(), "Notes");
+    }
+
+    #[test]
+    fn a_single_project_is_listed_once_under_projects() {
+        let mut config = AppConfig::default();
+        config.projects.push(Project {
+            id: "project-1".into(),
+            name: "command".into(),
+            root_path: "C:/Code/command".into(),
+            ..Project::default()
+        });
+        let projection = ConfigSidebarProjection::from_config(&config, 7);
+        assert_eq!(projection.project_section_title(), "Projects");
+        assert!(
+            !projection.shows_identity_summary(),
+            "one folder must not also appear under a Workspace summary"
+        );
+    }
+
+    #[test]
+    fn recovery_still_explains_why_the_rail_is_empty() {
+        let projection =
+            ConfigSidebarProjection::unavailable(ConfigSidebarUnavailableReason::SnapshotMissing);
+        assert!(projection.shows_identity_summary());
     }
 }

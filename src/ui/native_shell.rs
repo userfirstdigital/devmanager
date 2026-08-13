@@ -22,9 +22,10 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    div, point, px, size, uniform_list, AnyElement, AppContext, Application, ClickEvent, Context,
-    ElementId, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
-    MouseDownEvent, MouseUpEvent, ParentElement, Render, ScrollWheelEvent,
+    anchored, deferred, div, point, px, size, uniform_list, AnyElement, App, AppContext,
+    Application, ClickEvent, Context, ElementId, FocusHandle, FontWeight,
+    InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, ParentElement, PathPromptOptions, Pixels, Point, Render, ScrollWheelEvent, Size,
     StatefulInteractiveElement, Styled, Subscription, Task, Timer, UniformListScrollHandle, Window,
     WindowBounds, WindowOptions,
 };
@@ -65,11 +66,12 @@ use crate::ui::actions::{
     NativeDismissTransient, NativeDockArtifacts, NativeDockBrowser, NativeDockChanges,
     NativeDockFiles, NativeDockReview, NativeDockServices, NativeDockTerminal,
     NativeOpenCommandPalette, NativeOpenPalette, NativeOpenTaskSwitcher, NativeOpenTerminal,
-    TaskCreate, TaskListAction, TaskRename, TaskShow,
+    NativeResetLayout, NativeToggleDock, NativeToggleSidebar, NativeToggleTerminal, TaskCreate,
+    TaskListAction, TaskRename, TaskShow,
 };
 use crate::ui::components::interaction::{FocusEpoch, FocusEpochSource};
 use crate::ui::components::status_light::{ExternalPortStatus, StatusLight};
-use crate::ui::components::text_field::TextFieldKey;
+use crate::ui::components::text_field::{TextField, TextFieldKey};
 use crate::ui::components::{
     AccessibilityMetadata, AccessibleRole, ActionEvent, ActionRequest, ActivationSource,
     InteractionStateModel,
@@ -101,6 +103,7 @@ use crate::ui::task_cockpit::{
 use crate::ui::terminal_adapter::TerminalDockAdapter;
 pub use crate::ui::terminal_adapter::{TerminalDockState, TERMINAL_ADAPTER_DEPENDENCY};
 use crate::ui::tokens::{RuntimePreferencesSnapshot, StatusMeaning};
+use crate::ui::workspace_layout::{PaneEdge, WindowFrame, WorkspaceLayout, WorkspaceLayoutStore};
 use crate::updater::{UpdaterService, UpdaterSnapshot, UpdaterStage};
 
 /// Explicit UI action: acknowledged client detach (host survives in production).
@@ -120,6 +123,18 @@ const NATIVE_HOST_SCHEME: &str = "devtest";
 const PRODUCTION_HOST_PROFILE: &str = "production";
 const CLIENT_BUILD_PREFIX: &str = "devmanager";
 const NATIVE_POINTER_ID: u64 = 1;
+/// The dock tools in their canonical Alt+digit order. The tab strip and the
+/// keyboard shortcuts both read this table, so a visible tab can never select a
+/// different tool than its accelerator.
+const NATIVE_DOCK_TABS: [(CockpitDockTool, &str, u8); 7] = [
+    (CockpitDockTool::Changes, "native-dock-tab-changes", 1),
+    (CockpitDockTool::Files, "native-dock-tab-files", 2),
+    (CockpitDockTool::Terminal, "native-dock-tab-terminal", 3),
+    (CockpitDockTool::Browser, "native-dock-tab-browser", 4),
+    (CockpitDockTool::Services, "native-dock-tab-services", 5),
+    (CockpitDockTool::Artifacts, "native-dock-tab-artifacts", 6),
+    (CockpitDockTool::Review, "native-dock-tab-review", 7),
+];
 const MAX_RENDERED_TASK_ROWS: usize = DEFAULT_VISIBLE_ROWS + FIXED_VIRTUAL_OVERSCAN * 2;
 const MAX_PENDING_HOST_ACTIONS: usize = 32;
 const MAX_HOST_PROJECTIONS: usize = 64;
@@ -615,6 +630,21 @@ impl IsolatedDevProfile {
         &self.named_profile
     }
 
+    /// Title for the shell window. A non-production shell says so in the title
+    /// bar and the taskbar, because two identical-looking DevManager windows
+    /// side by side is how a dev action gets taken against live state.
+    pub fn window_title(&self) -> String {
+        if self.is_production() {
+            return "DevManager".to_string();
+        }
+        let workspace = self
+            .workspace_root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("workspace");
+        format!("DevManager — dev profile ({workspace})")
+    }
+
     fn child_ownership(&self) -> NativeHostChildOwnership {
         match self.mode {
             NativeShellMode::IsolatedDebug => NativeHostChildOwnership::TerminateWithClient,
@@ -635,6 +665,11 @@ impl IsolatedDevProfile {
             requested: CapabilitySet::from_capabilities([
                 Capability::PagedSnapshots,
                 Capability::EventReplay,
+                Capability::OperationSettlement,
+                Capability::ChunkResume,
+                Capability::PromptProjection,
+                Capability::ProviderInput,
+                Capability::TaskCockpit,
                 Capability::ExplicitDetach,
                 Capability::HostShutdown,
                 Capability::UpdateHandoff,
@@ -1052,10 +1087,13 @@ fn try_attach_existing_host(
             .build()
             .map_err(|_| IpcError::Unavailable)?,
     );
-    let client = runtime.block_on(tokio::time::timeout(
-        deadline.remaining(),
-        HostClient::connect(profile.host_client_config()),
-    ));
+    let client = runtime.block_on(async {
+        tokio::time::timeout(
+            deadline.remaining(),
+            HostClient::connect(profile.host_client_config()),
+        )
+        .await
+    });
     let client = match client {
         Ok(Ok(client)) => client,
         Ok(Err(error)) => {
@@ -1075,10 +1113,10 @@ fn try_attach_existing_host(
     };
     match NativeHostClientRuntime::new_with_runtime(profile, client, runtime.clone()) {
         Ok(mut runtime_owner) => {
-            let bootstrap = runtime.block_on(tokio::time::timeout(
-                deadline.remaining(),
-                runtime_owner.bootstrap_projection(),
-            ));
+            let bootstrap = runtime.block_on(async {
+                tokio::time::timeout(deadline.remaining(), runtime_owner.bootstrap_projection())
+                    .await
+            });
             match bootstrap {
                 Ok(Ok(_)) => Ok(runtime_owner),
                 Ok(Err(error)) => Err(IpcError::Security(error.to_string())),
@@ -1502,6 +1540,11 @@ pub enum NativeHostCommand {
         command_id: CommandId,
         issued_at_ms: i64,
     },
+    TaskCreateV2 {
+        arguments: crate::client::action::TaskCreateV2Arguments,
+        command_id: CommandId,
+        issued_at_ms: i64,
+    },
     TaskRename {
         arguments: crate::client::action::TaskRenameArguments,
         expected_task_revision: u64,
@@ -1589,6 +1632,7 @@ fn native_command_id(command: &NativeHostCommand) -> Option<CommandId> {
         NativeHostCommand::Envelope(envelope) => Some(envelope.command_id),
         NativeHostCommand::Browser(_) => None,
         NativeHostCommand::TaskCreate { command_id, .. }
+        | NativeHostCommand::TaskCreateV2 { command_id, .. }
         | NativeHostCommand::TaskRename { command_id, .. } => Some(*command_id),
         NativeHostCommand::ServiceControl { command_id, .. } => Some(*command_id),
         NativeHostCommand::ProviderInput { command_id, .. } => Some(*command_id),
@@ -1650,6 +1694,94 @@ pub struct NativeKeyboardState {
     pub selected_dock: Option<DockTool>,
     pub terminal_open: bool,
     pub task_details_open: bool,
+}
+
+struct AddProjectDraft {
+    name: TextField,
+    path: String,
+    error: Option<String>,
+    submitting: bool,
+}
+
+struct NewTaskDraft {
+    title: TextField,
+    error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PaletteItem {
+    AddProject,
+    NewTask,
+    ToggleSidebar,
+    ToggleDock,
+    ToggleTerminal,
+    ResetLayout,
+}
+
+/// Which workspace the shell should paint. Empty profiles must not show a
+/// hollow cockpit: inbox, conversation, dock, and terminal are task tools.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ShellStage {
+    Connecting,
+    Recovery,
+    Welcome,
+    FirstTask,
+    Cockpit,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum OverlayTextFieldPart {
+    Caret,
+    Placeholder,
+    Text(String),
+    Selection(String),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OverlayTextFieldChrome {
+    show_focus_ring: bool,
+}
+
+impl PaletteItem {
+    const ALL: [Self; 6] = [
+        Self::AddProject,
+        Self::NewTask,
+        Self::ToggleSidebar,
+        Self::ToggleDock,
+        Self::ToggleTerminal,
+        Self::ResetLayout,
+    ];
+
+    fn for_stage(stage: ShellStage) -> &'static [Self] {
+        match stage {
+            ShellStage::Connecting | ShellStage::Recovery => &[Self::AddProject],
+            ShellStage::Welcome => &[Self::AddProject],
+            ShellStage::FirstTask => &[Self::AddProject, Self::NewTask],
+            ShellStage::Cockpit => &Self::ALL,
+        }
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::AddProject => "Add project",
+            Self::NewTask => "New task",
+            Self::ToggleSidebar => "Toggle configuration",
+            Self::ToggleDock => "Toggle context dock",
+            Self::ToggleTerminal => "Toggle terminal",
+            Self::ResetLayout => "Reset layout",
+        }
+    }
+
+    fn hint(self) -> &'static str {
+        match self {
+            Self::AddProject => "Choose a folder on this computer",
+            Self::NewTask => "Name a piece of work",
+            Self::ToggleSidebar => "Ctrl+B",
+            Self::ToggleDock => "Ctrl+Alt+B",
+            Self::ToggleTerminal => "Ctrl+J",
+            Self::ResetLayout => "Ctrl+Alt+0",
+        }
+    }
 }
 
 /// Result of handing one already-validated UI action to the host lane.
@@ -1975,22 +2107,24 @@ impl NativeHeaderAttachment {
 
     fn label(&self) -> String {
         match self {
-            Self::Unavailable { reason } => format!("Header unavailable: {reason}"),
+            Self::Unavailable { .. } => String::new(),
             Self::Projection { title, .. } => title.clone(),
         }
     }
 
     fn detail(&self) -> String {
         match self {
-            Self::Unavailable { .. } => {
-                "The canonical header projection is not attached to this shell.".to_string()
-            }
+            Self::Unavailable { .. } => String::new(),
             Self::Projection {
                 status,
                 remote,
                 quota,
                 ..
-            } => format!("{status} · {remote} · {quota}")
+            } => [status.as_str(), remote.as_str(), quota.as_str()]
+                .into_iter()
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>()
+                .join(" · ")
                 .chars()
                 .take(512)
                 .collect(),
@@ -2224,10 +2358,13 @@ impl NativeHostClientRuntime {
                     message: format!("runtime bootstrap failed: {error}"),
                 })?,
         );
-        let client = runtime.block_on(tokio::time::timeout(
-            deadline.remaining(),
-            HostClient::connect(profile.host_client_config()),
-        ));
+        let client = runtime.block_on(async {
+            tokio::time::timeout(
+                deadline.remaining(),
+                HostClient::connect(profile.host_client_config()),
+            )
+            .await
+        });
         let client = client.map_err(|_| NativeShellError::HostConnect {
             message: "native host connection deadline expired".to_string(),
         })?;
@@ -2244,10 +2381,10 @@ impl NativeHostClientRuntime {
             }
         };
         runtime
-            .block_on(tokio::time::timeout(
-                deadline.remaining(),
-                runtime_owner.bootstrap_projection(),
-            ))
+            .block_on(async {
+                tokio::time::timeout(deadline.remaining(), runtime_owner.bootstrap_projection())
+                    .await
+            })
             .map_err(|_| NativeShellError::HostConnect {
                 message: "native host bootstrap deadline expired".to_string(),
             })?
@@ -2295,10 +2432,10 @@ impl NativeHostClientRuntime {
                 }
             };
         let bootstrap = runtime
-            .block_on(tokio::time::timeout(
-                deadline.remaining(),
-                runtime_owner.bootstrap_projection(),
-            ))
+            .block_on(async {
+                tokio::time::timeout(deadline.remaining(), runtime_owner.bootstrap_projection())
+                    .await
+            })
             .map_err(|_| NativeShellError::HostConnect {
                 message: "native host bootstrap deadline expired".to_string(),
             })
@@ -3472,10 +3609,13 @@ fn pump_subscription_once(
             );
             return;
         };
-        runtime.block_on(tokio::time::timeout(
-            Duration::from_millis(2),
-            subscription_guard.recv_and_apply(client_ref),
-        ))
+        runtime.block_on(async {
+            tokio::time::timeout(
+                Duration::from_millis(2),
+                subscription_guard.recv_and_apply(client_ref),
+            )
+            .await
+        })
     };
 
     let update = match update {
@@ -3754,6 +3894,23 @@ async fn execute_native_command(
             issued_at_ms,
         } => {
             let envelope = crate::client::action::task_create_command(
+                command_id,
+                client.client_id(),
+                issued_at_ms,
+                arguments,
+            )
+            .map_err(|_| IpcError::Unavailable)?;
+            client
+                .execute_command(envelope)
+                .await
+                .map(NativeHostExecutionResult::Command)
+        }
+        NativeHostCommand::TaskCreateV2 {
+            arguments,
+            command_id,
+            issued_at_ms,
+        } => {
+            let envelope = crate::client::action::task_create_v2_command(
                 command_id,
                 client.client_id(),
                 issued_at_ms,
@@ -4386,6 +4543,12 @@ impl NativeInteraction {
         self.keyboard_state
     }
 
+    fn close_palettes(&mut self) {
+        self.keyboard_state.palette_open = false;
+        self.keyboard_state.command_palette_open = false;
+        self.keyboard_state.task_switcher_open = false;
+    }
+
     fn begin_handler(&mut self, task_id: Option<TaskId>) -> (FocusEpoch, u64) {
         // Any pointer, terminal, or keyboard event advances the capture
         // generation. Invalidate a previously resolved key intent before the
@@ -4698,11 +4861,28 @@ impl NativeInteraction {
     }
 
     pub fn action(&mut self, request: ActionRequest) -> Option<NativeActionRecord> {
-        self.action_from_source(
+        self.capture_action(
             request,
             ActivationSource::Keyboard {
                 key: crate::ui::components::KeyboardKey::Enter,
             },
+            false,
+        )
+    }
+
+    /// Capture another host query against the handler that is already open.
+    /// One user or controller intent may fan out into several reads; advancing
+    /// the handler for each sibling would stale every earlier query.
+    pub fn action_on_current_handler(
+        &mut self,
+        request: ActionRequest,
+    ) -> Option<NativeActionRecord> {
+        self.capture_action(
+            request,
+            ActivationSource::Keyboard {
+                key: crate::ui::components::KeyboardKey::Enter,
+            },
+            true,
         )
     }
 
@@ -4710,6 +4890,15 @@ impl NativeInteraction {
         &mut self,
         request: ActionRequest,
         source: ActivationSource,
+    ) -> Option<NativeActionRecord> {
+        self.capture_action(request, source, false)
+    }
+
+    fn capture_action(
+        &mut self,
+        request: ActionRequest,
+        source: ActivationSource,
+        reuse_handler: bool,
     ) -> Option<NativeActionRecord> {
         let descriptor = action::catalog()
             .iter()
@@ -4728,7 +4917,12 @@ impl NativeInteraction {
             ActionRequest::TaskRename(arguments) => Some(arguments.task_id),
             ActionRequest::ProviderInput(arguments) => Some(arguments.arguments.task_id),
             ActionRequest::StartProviderSession(arguments) => Some(arguments.task_id),
-            ActionRequest::TaskCockpit { task_id, .. } => Some(*task_id),
+            ActionRequest::TaskCockpit { task_id, query } => match query {
+                TaskCockpitQuery::ConfigSnapshot | TaskCockpitQuery::ConfigCreateProject { .. } => {
+                    None
+                }
+                _ => Some(*task_id),
+            },
             ActionRequest::Browser(arguments) => Some(arguments.task_id()),
             _ => None,
         };
@@ -4786,12 +4980,27 @@ impl NativeInteraction {
                 return None;
             }
         }
-        let (focus_epoch, request_generation) = self.begin_handler(self.selected_task());
+        let (focus_epoch, request_generation, action_epoch) = if reuse_handler {
+            if let Some(trace) = self.last_handler.as_ref() {
+                (trace.focus_epoch, trace.request_generation, trace.action_epoch)
+            } else {
+                let (focus_epoch, request_generation) = self.begin_handler(self.selected_task());
+                (focus_epoch, request_generation, self.action_epoch)
+            }
+        } else {
+            let (focus_epoch, request_generation) = self.begin_handler(self.selected_task());
+            (focus_epoch, request_generation, self.action_epoch)
+        };
         let command_id = CommandId::new();
         let request_id = RequestId::new();
         let issued_at_ms = unix_time_ms();
         let command = match &request {
             ActionRequest::TaskCreate(arguments) => NativeHostCommand::TaskCreate {
+                arguments: arguments.clone(),
+                command_id,
+                issued_at_ms,
+            },
+            ActionRequest::TaskCreateV2(arguments) => NativeHostCommand::TaskCreateV2 {
                 arguments: arguments.clone(),
                 command_id,
                 issued_at_ms,
@@ -4854,7 +5063,7 @@ impl NativeInteraction {
             id: descriptor.id,
             focus_epoch,
             request_generation,
-            action_epoch: self.action_epoch,
+            action_epoch,
             connection_epoch: self.connection_epoch,
             client_epoch: self.client_epoch,
             navigation_epoch: self.shell.navigation_epoch(),
@@ -5010,6 +5219,8 @@ impl AccessibilityTree {
                 .chain(rows)
                 .collect::<Vec<_>>(),
         );
+        let header_label = header.label();
+        let header_detail = header.detail();
         let toolbar = AccessibilityNode::new(
             AccessibleRole::Region,
             "Task cockpit actions",
@@ -5018,8 +5229,16 @@ impl AccessibilityTree {
         .gpui("native-shell-toolbar", false, false)
         .with_children(vec![AccessibilityNode::new(
             AccessibleRole::Status,
-            header.label(),
-            header.detail(),
+            if header_label.is_empty() {
+                "DevManager".to_string()
+            } else {
+                header_label
+            },
+            if header_detail.is_empty() {
+                "Task inbox".to_string()
+            } else {
+                header_detail
+            },
         )
         .gpui("native-shell-header-attachment", false, false)]);
         let terminal = AccessibilityNode::new(
@@ -5042,8 +5261,8 @@ impl AccessibilityTree {
         .gpui("native-shell-context-dock", false, false);
         let root = AccessibilityNode::new(
             AccessibleRole::Region,
-            "Task Cockpit",
-            "Native GPUI shell using an isolated dev/test host profile.",
+            "DevManager",
+            "Native shell using an isolated profile.",
         )
         .gpui("native-shell-root", true, true)
         .with_children(vec![toolbar, inbox, prompt_library, context_dock, terminal]);
@@ -5061,6 +5280,92 @@ impl AccessibilityTree {
         }
     }
 
+    fn for_stage(
+        stage: ShellStage,
+        task_list: &TaskList,
+        selected_task: Option<TaskId>,
+        header: &NativeHeaderAttachment,
+    ) -> Self {
+        match stage {
+            ShellStage::Cockpit => {
+                Self::for_task_list_with_header(task_list, selected_task, header)
+            }
+            _ => Self::for_setup(stage, header),
+        }
+    }
+
+    fn for_setup(stage: ShellStage, header: &NativeHeaderAttachment) -> Self {
+        let (canvas_id, title, detail, cta_id, cta_label, cta_description) = match stage {
+            ShellStage::Connecting => (
+                "native-shell-setup-connecting",
+                "Getting ready",
+                "DevManager is starting up.",
+                "native-setup-add-project",
+                "Choose a folder",
+                "Pick a folder on this computer to start using DevManager.",
+            ),
+            ShellStage::Recovery => (
+                "native-shell-setup-recovery",
+                "Can't load your settings",
+                "DevManager needs to recover before you can continue.",
+                "native-setup-add-project",
+                "Choose a folder",
+                "Pick a folder on this computer after recovery.",
+            ),
+            ShellStage::Welcome => (
+                "native-shell-setup-welcome",
+                "Welcome to DevManager",
+                "Pick a folder you already have. Tasks, chat, and the terminal stay out of the way until you have somewhere to work.",
+                "native-setup-add-project",
+                "Choose a folder",
+                "Pick a folder on this computer.",
+            ),
+            ShellStage::FirstTask => (
+                "native-shell-setup-first-task",
+                "Start a task",
+                "Name the work you want to do. Chat, files, and the terminal open with that task.",
+                "native-setup-create-task",
+                "Create a task",
+                "Give this work a name.",
+            ),
+            ShellStage::Cockpit => {
+                unreachable!("cockpit uses the task-list accessibility tree")
+            }
+        };
+        let header_label = header.label();
+        let header_detail = header.detail();
+        let header_node = AccessibilityNode::new(
+            AccessibleRole::Status,
+            if header_label.is_empty() {
+                title.to_string()
+            } else {
+                header_label
+            },
+            if header_detail.is_empty() {
+                detail.to_string()
+            } else {
+                header_detail
+            },
+        )
+        .gpui("native-shell-header-attachment", false, false);
+        let canvas = AccessibilityNode::new(AccessibleRole::Region, title, detail)
+            .gpui(canvas_id, false, false);
+        let cta = AccessibilityNode::new(AccessibleRole::Button, cta_label, cta_description)
+            .gpui(cta_id, true, true);
+        let root = AccessibilityNode::new(
+            AccessibleRole::Region,
+            "DevManager",
+            "Get started with a folder on this computer.",
+        )
+        .gpui("native-shell-root", true, true)
+        .with_children(vec![header_node, canvas, cta]);
+        Self {
+            root,
+            rendered_task_count: 0,
+            task_node_ids: Vec::new(),
+        }
+    }
+
     pub fn root(&self) -> &AccessibilityNode {
         &self.root
     }
@@ -5073,6 +5378,26 @@ impl AccessibilityTree {
         self.task_node_ids
             .iter()
             .find_map(|(candidate, task_id)| (*candidate == node_id).then_some(*task_id))
+    }
+
+    fn node_for_platform_id(&self, node_id: accesskit::NodeId) -> Option<&AccessibilityNode> {
+        fn visit<'a>(
+            node: &'a AccessibilityNode,
+            remaining: &mut u64,
+        ) -> Option<&'a AccessibilityNode> {
+            if *remaining == 0 {
+                return Some(node);
+            }
+            *remaining -= 1;
+            for child in &node.children {
+                if let Some(found) = visit(child, remaining) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        let mut remaining = u64::from(node_id);
+        visit(&self.root, &mut remaining)
     }
 
     pub fn nodes(&self) -> Vec<&AccessibilityNode> {
@@ -5453,6 +5778,32 @@ pub struct NativeShell {
     appearance_subscription: Option<Subscription>,
     bounds_subscription: Option<Subscription>,
     platform_accessibility: NativePlatformAccessibilityBridge,
+    /// Pane geometry the user chose, and the profile-scoped store it came
+    /// from. Layout is a view preference: it is owned by the shell, never
+    /// projected from the host, and never shared across profiles.
+    layout: WorkspaceLayout,
+    layout_store: WorkspaceLayoutStore,
+    pane_drag: Option<PaneDrag>,
+    last_window_persist: Option<Instant>,
+    add_project: Option<AddProjectDraft>,
+    pending_folder_prompt: bool,
+    first_task_overlay_offered: bool,
+    new_task: Option<NewTaskDraft>,
+    palette_index: usize,
+    pending_select_task: Option<TaskId>,
+}
+
+/// Rate limit for window-frame writes while the user drags a window edge.
+const WINDOW_FRAME_PERSIST_INTERVAL: Duration = Duration::from_millis(750);
+
+/// One in-flight pane resize. The origin and the size at grab time are both
+/// captured so the drag stays absolute: deriving it from per-frame deltas
+/// accumulates rounding and drifts away from the pointer.
+#[derive(Clone, Copy, Debug)]
+struct PaneDrag {
+    edge: PaneEdge,
+    origin: Point<Pixels>,
+    start_value: f32,
 }
 
 impl Drop for NativeShell {
@@ -5651,21 +6002,7 @@ impl NativeShell {
         start_controller: bool,
     ) -> Self {
         let (connect_host_port, remote_host_service) = if start_controller {
-            let mut host_config = profile.host_client_config();
-            host_config.requested = CapabilitySet::from_capabilities([
-                Capability::PagedSnapshots,
-                Capability::EventReplay,
-                Capability::OperationSettlement,
-                Capability::ChunkResume,
-                Capability::PromptProjection,
-                Capability::ProviderInput,
-                Capability::TaskCockpit,
-                Capability::HostShutdown,
-                Capability::UpdateHandoff,
-                Capability::ExplicitDetach,
-                Capability::ServiceSupervisor,
-            ]);
-            let bridge = Arc::new(HostClientConnectPort::new(host_config));
+            let bridge = Arc::new(HostClientConnectPort::new(profile.host_client_config()));
             crate::connect::bind_host_executor(bridge.clone());
             let remote_config = crate::remote::load_remote_machine_state()
                 .map(|state| state.host)
@@ -5684,12 +6021,15 @@ impl NativeShell {
             data: DataFixtureKind::Empty,
         });
         let services_projection = ServicesPanelProjection::default();
-        let config_sidebar = ConfigSidebarProjection::unavailable(
-            ConfigSidebarUnavailableReason::StoreRecoveryRequired,
-        );
+        let config_sidebar =
+            ConfigSidebarProjection::unavailable(ConfigSidebarUnavailableReason::SnapshotMissing);
         let header_attachment = NativeHeaderAttachment::default();
-        let accessibility_tree =
-            AccessibilityTree::for_task_list_with_header(&task_list, None, &header_attachment);
+        let accessibility_tree = AccessibilityTree::for_stage(
+            ShellStage::Connecting,
+            &task_list,
+            None,
+            &header_attachment,
+        );
         let platform_accessibility = NativePlatformAccessibilityBridge::new(&accessibility_tree);
         let mut interaction = NativeInteraction::new(None);
         let initial_epochs = host_runtime
@@ -5701,6 +6041,7 @@ impl NativeShell {
             .unwrap_or_default();
         interaction.sync_host_epochs(initial_epochs);
         let browser_profile_root = profile.root().to_path_buf();
+        let layout_store = WorkspaceLayoutStore::at_profile_root(profile.root());
         let mut shell = Self {
             host_connection: profile.host_connection(),
             profile,
@@ -5751,6 +6092,16 @@ impl NativeShell {
             appearance_subscription: None,
             bounds_subscription: None,
             platform_accessibility,
+            layout: layout_store.load(),
+            layout_store,
+            pane_drag: None,
+            last_window_persist: None,
+            add_project: None,
+            pending_folder_prompt: false,
+            first_task_overlay_offered: false,
+            new_task: None,
+            palette_index: 0,
+            pending_select_task: None,
         };
         if start_controller {
             let _ = shell.dispatch_action(ActionRequest::HostStatus);
@@ -5793,7 +6144,12 @@ impl NativeShell {
     /// runtime. This is an adapter-only mutation; it never touches transport.
     pub fn attach_header_projection(&mut self, attachment: NativeHeaderAttachment) {
         self.header_attachment = attachment;
-        self.accessibility_tree = AccessibilityTree::for_task_list_with_header(
+        self.refresh_accessibility_tree();
+    }
+
+    fn refresh_accessibility_tree(&mut self) {
+        self.accessibility_tree = AccessibilityTree::for_stage(
+            self.shell_stage(),
             &self.task_list,
             self.interaction.selected_task(),
             &self.header_attachment,
@@ -5883,8 +6239,19 @@ impl NativeShell {
             NativeHostQueryBody::Text => {}
             NativeHostQueryBody::ConfigSidebar(snapshot) => {
                 self.config_sidebar = ConfigSidebarProjection::from_host_snapshot(&snapshot);
+                if !self.config_sidebar.projects.is_empty() {
+                    self.finish_add_project_after_host_accept();
+                }
+                self.sync_header_projection();
+                self.refresh_accessibility_tree();
             }
             NativeHostQueryBody::TaskCockpit(result) => {
+                if let crate::domain::TaskCockpitResult::Config(snapshot) = &result {
+                    self.config_sidebar = ConfigSidebarProjection::from_host_snapshot(snapshot);
+                    self.finish_add_project_after_host_accept();
+                    self.sync_header_projection();
+                    self.refresh_accessibility_tree();
+                }
                 self.cockpit.apply_cockpit_result(&result);
                 if let crate::domain::TaskCockpitResult::Services(services) = &result {
                     self.services_projection = project_services_from_task_projection(services);
@@ -5915,6 +6282,7 @@ impl NativeShell {
         };
         self.cockpit
             .begin_cockpit_query(task_id, crate::client::action::ACTION_GIT_STATUS);
+        let mut requests = Vec::new();
         for action_id in [
             crate::client::action::ACTION_WORKSPACE_STATUS,
             crate::client::action::ACTION_GIT_STATUS,
@@ -5922,31 +6290,34 @@ impl NativeShell {
             crate::client::action::ACTION_SSH_STATUS,
         ] {
             if let Some(request) = action::task_cockpit_request(task_id, action_id) {
-                let _ = self.dispatch_action(request);
+                requests.push(request);
             }
         }
-        let _ = self.dispatch_action(ActionRequest::TaskCockpit {
+        requests.push(ActionRequest::TaskCockpit {
             task_id,
             query: TaskCockpitQuery::ServiceSnapshots,
         });
+        self.dispatch_related_actions(requests);
     }
 
     fn hydrate_prompt_library(&mut self) {
         self.prompt_library.load = crate::ui::prompts::PromptLibraryLoadState::Loading;
-        let _ = self.dispatch_action(ActionRequest::PromptLibrary {
-            query: PromptLibraryQuery::MetadataPage {
-                namespace: PromptNamespace::Personal,
-                cursor: None,
-                expected_revision: self.prompt_library.expected_revision,
+        self.dispatch_related_actions([
+            ActionRequest::PromptLibrary {
+                query: PromptLibraryQuery::MetadataPage {
+                    namespace: PromptNamespace::Personal,
+                    cursor: None,
+                    expected_revision: self.prompt_library.expected_revision,
+                },
             },
-        });
-        let _ = self.dispatch_action(ActionRequest::PromptLibrary {
-            query: PromptLibraryQuery::ChainPage {
-                chain_id: None,
-                cursor: None,
-                expected_revision: self.prompt_library.expected_revision,
+            ActionRequest::PromptLibrary {
+                query: PromptLibraryQuery::ChainPage {
+                    chain_id: None,
+                    cursor: None,
+                    expected_revision: self.prompt_library.expected_revision,
+                },
             },
-        });
+        ]);
     }
 
     fn admit_ready_stream_frames(&mut self, max: usize) {
@@ -6064,6 +6435,9 @@ impl NativeShell {
                         Timer::after(CONTROLLER_TICK_INTERVAL).await;
                         if this
                             .update(&mut async_cx, |shell, cx| {
+                                if shell.pending_folder_prompt {
+                                    shell.schedule_folder_prompt(cx);
+                                }
                                 shell.controller_tick(MAX_PENDING_HOST_ACTIONS);
                                 if shell.exit_after_update {
                                     cx.quit();
@@ -6244,6 +6618,17 @@ impl NativeShell {
         };
         self.host_state = match &failure {
             NativeHostActionFailure::Disconnected { .. } => NativeHostState::Disconnected,
+            NativeHostActionFailure::Stale { .. } => match &self.host_state {
+                NativeHostState::Connected { .. } => self.host_state.clone(),
+                _ => self
+                    .host_runtime
+                    .as_ref()
+                    .map(|runtime| match runtime {
+                        NativeHostRuntimeAttachment::Injected(runtime) => runtime.host_state(),
+                        NativeHostRuntimeAttachment::Client(runtime) => runtime.host_state(),
+                    })
+                    .unwrap_or(self.host_state.clone()),
+            },
             _ => NativeHostState::Error {
                 message: bounded_host_error(failure.retry_message()),
             },
@@ -6342,6 +6727,12 @@ impl NativeShell {
                     }
                 }
                 self.composer_error = None;
+                if let NativeHostCommand::TaskCreateV2 { arguments, .. } = &action.command {
+                    self.pending_select_task = Some(arguments.task_id);
+                    if self.task_list.task_ids().contains(&arguments.task_id) {
+                        let _ = self.select_projected_task(arguments.task_id);
+                    }
+                }
             }
             NativeHostActionOutcome::Queried {
                 action,
@@ -6385,6 +6776,11 @@ impl NativeShell {
                 }
             }
             NativeHostActionOutcome::Failed { action, error } => {
+                if action.id == action::ACTION_CONFIG_CREATE_PROJECT {
+                    if let Some(draft) = self.add_project.as_mut() {
+                        draft.error = Some(error.clone());
+                    }
+                }
                 self.composer_error = Some(error.clone());
                 let retained = self.retain_pending_host_action(action.clone());
                 self.set_execution_failure(&action, error, false);
@@ -6632,15 +7028,24 @@ impl NativeShell {
             ) {
                 continue;
             }
-            let Some(task_id) = self
+            if let Some(task_id) = self
                 .accessibility_tree
                 .task_for_platform_node(request.target_node)
-            else {
+            {
+                let _ = self
+                    .interaction
+                    .navigation_mouse_down(task_id, &self.task_list);
                 continue;
-            };
-            let _ = self
-                .interaction
-                .navigation_mouse_down(task_id, &self.task_list);
+            }
+            if matches!(request.action, accesskit::Action::Click) {
+                if let Some(element_id) = self
+                    .accessibility_tree
+                    .node_for_platform_id(request.target_node)
+                    .map(|node| node.element_id().to_string())
+                {
+                    self.dispatch_named_accessibility_action(&element_id);
+                }
+            }
         }
 
         let offset = self.task_scroll_handle.0.borrow().base_handle.offset().y / px(1.0);
@@ -6649,12 +7054,8 @@ impl NativeShell {
         let _ = self
             .task_list
             .set_viewport(first_visible, DEFAULT_VISIBLE_ROWS);
-        self.accessibility_tree = AccessibilityTree::for_task_list_with_header(
-            &self.task_list,
-            self.interaction.selected_task(),
-            &self.header_attachment,
-        );
-        self.platform_accessibility.sync(&self.accessibility_tree);
+        self.offer_first_task_if_needed();
+        self.refresh_accessibility_tree();
     }
 
     pub(crate) fn install_window_observers(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -6672,6 +7073,7 @@ impl NativeShell {
                 window.scale_factor(),
                 shell.preferences.density(),
             ));
+            shell.record_window_frame(window);
         });
         self.appearance_subscription = Some(appearance);
         self.bounds_subscription = Some(bounds);
@@ -6916,18 +7318,20 @@ impl NativeShell {
     /// This is a pure handoff; no client, subscription, or second connection
     /// is created by the shell.
     fn apply_task_list(&mut self, task_list: TaskList) {
-        let selected_task = self
-            .interaction
-            .selected_task()
+        let pending = self
+            .pending_select_task
             .filter(|task_id| task_list.task_ids().contains(task_id));
+        if pending.is_some() {
+            self.pending_select_task = None;
+        }
+        let selected_task = pending.or_else(|| {
+            self.interaction
+                .selected_task()
+                .filter(|task_id| task_list.task_ids().contains(task_id))
+        });
         self.interaction.sync_selected_task(selected_task);
         self.task_list = task_list;
-        self.accessibility_tree = AccessibilityTree::for_task_list_with_header(
-            &self.task_list,
-            self.interaction.selected_task(),
-            &self.header_attachment,
-        );
-        self.platform_accessibility.sync(&self.accessibility_tree);
+        self.refresh_accessibility_tree();
     }
 
     pub fn apply_client_model(&mut self, model: Arc<ClientModel>) -> Result<(), String> {
@@ -6986,7 +7390,7 @@ impl NativeShell {
                     .map(|controller| {
                         let model = controller.model();
                         if model.quotas.is_empty() {
-                            "quota unavailable".to_string()
+                            String::new()
                         } else {
                             model
                                 .quotas
@@ -6996,18 +7400,46 @@ impl NativeShell {
                                 .join(" · ")
                         }
                     })
-                    .unwrap_or_else(|| "quota unavailable".to_string());
+                    .unwrap_or_default();
                 NativeHeaderAttachment::projection(
                     header.title,
-                    format!(
-                        "{} · {} · rev {}",
-                        header.status.label, workspace, header.identity.revision
-                    ),
-                    format!("Host · {} · {remote}", self.host_state.label()),
-                    format!("{} · {}", header.accessible_description, quota),
+                    format!("{} · {}", header.status.label, workspace),
+                    remote,
+                    quota,
                 )
             })
-            .unwrap_or_else(|| NativeHeaderAttachment::unavailable("select a task"));
+            .unwrap_or_else(|| match self.shell_stage() {
+                ShellStage::Connecting => NativeHeaderAttachment::projection(
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                ),
+                ShellStage::Recovery => NativeHeaderAttachment::projection(
+                    "Can't load settings",
+                    "DevManager needs to recover before you can continue",
+                    String::new(),
+                    String::new(),
+                ),
+                ShellStage::Welcome => NativeHeaderAttachment::projection(
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                ),
+                ShellStage::FirstTask => NativeHeaderAttachment::projection(
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                ),
+                ShellStage::Cockpit => NativeHeaderAttachment::projection(
+                    "No task selected",
+                    "Pick a task from the list",
+                    String::new(),
+                    String::new(),
+                ),
+            });
         if self.header_attachment != attachment {
             self.attach_header_projection(attachment);
         }
@@ -7412,7 +7844,14 @@ impl NativeShell {
                 self.hydrate_prompt_library();
             }
             KeyboardAction::OpenPalette => {
-                let _ = self.prompt_library.handle_key(PromptLibraryKey::Slash);
+                self.palette_index = 0;
+                if PaletteItem::for_stage(self.shell_stage()).is_empty() {
+                    self.interaction.close_palettes();
+                }
+            }
+            KeyboardAction::DismissTransient => {
+                self.add_project = None;
+                self.new_task = None;
             }
             _ => {}
         }
@@ -7491,19 +7930,18 @@ impl NativeShell {
             .prompt_library
             .suggested_next
             .as_ref()
-            .map(|next| format!("next prompt · {}", next.title))
-            .unwrap_or_else(|| "next prompt · none".to_string());
+            .map(|next| next.title.clone())
+            .unwrap_or_else(|| "none".to_string());
         let composer = match (
             self.composer
                 .as_ref()
                 .and_then(TaskComposer::pending_intent),
             self.composer_error.as_deref(),
         ) {
-            (_, Some(error)) => format!("Composer · error · {error}"),
-            (Some(intent), None) => format!("Composer · pending · {}", intent.action_id),
+            (_, Some(error)) => format!("error · {error}"),
+            (Some(intent), None) => format!("pending · {}", intent.action_id),
             (None, None) => format!(
-                "Composer · {} character draft · {}",
-                draft_chars,
+                "{draft_chars} character draft · {}",
                 if self.prompt_library.draft.sent {
                     "sent"
                 } else {
@@ -7514,26 +7952,34 @@ impl NativeShell {
         let updater = self
             .updater_snapshot
             .as_ref()
-            .map(|snapshot| format!("Updater · {:?}", snapshot.stage))
-            .unwrap_or_else(|| "Updater · snapshot unavailable".to_string());
+            .map(|snapshot| format!("{:?}", snapshot.stage))
+            .unwrap_or_else(|| "snapshot unavailable".to_string());
         div()
             .id("native-shell-prompt-composer")
             .w_full()
             .flex()
-            .flex_wrap()
-            .gap(px(tokens.density.spacing.sm))
-            .p(px(tokens.density.physical().control_padding as f32))
-            .bg(tokens.surfaces.raised.to_gpui())
-            .child(format!(
-                "{} · {} · {} saved · {}",
-                self.prompt_library.chrome.rail_label,
-                self.prompt_library.chrome.active_section.label(),
-                list.total,
-                load
+            .flex_col()
+            .px(px(tokens.density.spacing.lg))
+            .py(px(tokens.density.spacing.sm))
+            .child(Self::meta_row(
+                "Library",
+                self.prompt_library.chrome.rail_label.clone(),
+                tokens,
             ))
-            .child(next)
-            .child(composer)
-            .child(updater)
+            .child(Self::meta_row(
+                "Section",
+                self.prompt_library
+                    .chrome
+                    .active_section
+                    .label()
+                    .to_string(),
+                tokens,
+            ))
+            .child(Self::meta_row("Saved", list.total.to_string(), tokens))
+            .child(Self::meta_row("State", load.to_string(), tokens))
+            .child(Self::meta_row("Next", next, tokens))
+            .child(Self::meta_row("Composer", composer, tokens))
+            .child(Self::meta_row("Updater", updater, tokens))
             .into_any_element()
     }
 
@@ -7588,14 +8034,7 @@ impl NativeShell {
         shell_entity: Option<gpui::WeakEntity<NativeShell>>,
     ) -> AnyElement {
         let Some(task_id) = self.interaction.selected_task() else {
-            return render_panel_frame(
-                "native-shell-workspace-dock",
-                tool.label(),
-                "Select a task first",
-                Vec::new(),
-                div(),
-                tokens,
-            );
+            return Self::dock_empty_state(tool, tokens);
         };
         let snapshot = self
             .client_model
@@ -8016,6 +8455,344 @@ impl NativeShell {
         true
     }
 
+    fn first_workspace_project_id(&self) -> Option<crate::domain::id::ProjectId> {
+        self.config_sidebar
+            .projects
+            .iter()
+            .find_map(|project| crate::domain::id::ProjectId::parse(&project.workspace_id).ok())
+    }
+
+    fn shell_stage(&self) -> ShellStage {
+        match self.config_sidebar.unavailable_reason {
+            Some(ConfigSidebarUnavailableReason::StoreRecoveryRequired) => ShellStage::Recovery,
+            Some(ConfigSidebarUnavailableReason::SnapshotMissing)
+                if !matches!(self.host_state, NativeHostState::Connected { .. }) =>
+            {
+                ShellStage::Connecting
+            }
+            _ if self.config_sidebar.projects.is_empty() => ShellStage::Welcome,
+            _ if self.task_list.task_ids().is_empty() => ShellStage::FirstTask,
+            _ => ShellStage::Cockpit,
+        }
+    }
+
+    fn open_add_project(&mut self) {
+        let mut name = TextField::new("Project name").expect("project name field");
+        name.focus();
+        self.add_project = Some(AddProjectDraft {
+            name,
+            path: String::new(),
+            error: None,
+            submitting: false,
+        });
+        self.new_task = None;
+        self.interaction.close_palettes();
+    }
+
+    fn begin_choose_folder(&mut self, cx: &mut Context<Self>) {
+        self.interaction.close_palettes();
+        self.new_task = None;
+        self.schedule_folder_prompt(cx);
+    }
+
+    fn schedule_folder_prompt(&mut self, cx: &mut Context<Self>) {
+        self.pending_folder_prompt = false;
+        if cfg!(test) {
+            return;
+        }
+        let handle = cx.weak_entity();
+        cx.defer(move |cx| {
+            let _ = handle.update(cx, |shell, cx| {
+                shell.prompt_for_project_folder(cx);
+            });
+        });
+    }
+
+    fn prompt_for_project_folder(&mut self, cx: &mut Context<Self>) {
+        let rx = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Choose folder".into()),
+        });
+        cx.spawn(
+            |this: gpui::WeakEntity<NativeShell>, cx: &mut gpui::AsyncApp| {
+                let mut async_cx = cx.clone();
+                async move {
+                    let picked = match rx.await {
+                        Ok(Ok(Some(mut paths))) => paths.pop(),
+                        _ => None,
+                    };
+                    let Some(path) = picked else {
+                        return;
+                    };
+                    let _ = this.update(&mut async_cx, |shell, cx| {
+                        shell.apply_picked_project_folder(path);
+                        cx.notify();
+                    });
+                }
+            },
+        )
+        .detach();
+    }
+
+    fn apply_picked_project_folder(&mut self, path: PathBuf) {
+        let folder_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("Project");
+        match self.add_project.as_mut() {
+            Some(draft) => {
+                draft.path = path.display().to_string();
+                if draft.name.value().trim().is_empty() {
+                    let _ = draft.name.set_value(folder_name);
+                    draft.name.focus();
+                    draft.name.select_all();
+                }
+                draft.error = None;
+                draft.submitting = false;
+            }
+            None => {
+                let mut name = TextField::new("Project name").expect("project name field");
+                let _ = name.set_value(folder_name);
+                name.focus();
+                name.select_all();
+                self.add_project = Some(AddProjectDraft {
+                    name,
+                    path: path.display().to_string(),
+                    error: None,
+                    submitting: false,
+                });
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn add_project_overlay_for_test(&self) -> Option<(String, String)> {
+        self.add_project
+            .as_ref()
+            .map(|draft| (draft.name.value().to_string(), draft.path.clone()))
+    }
+
+    #[cfg(test)]
+    fn add_project_name_is_selected_for_test(&self) -> bool {
+        self.add_project
+            .as_ref()
+            .is_some_and(|draft| draft.name.is_all_selected())
+    }
+
+    #[cfg(test)]
+    fn type_add_project_character_for_test(&mut self, character: char) -> bool {
+        let Some(draft) = self.add_project.as_mut() else {
+            return false;
+        };
+        let epoch = draft.name.focus_epoch();
+        draft
+            .name
+            .handle_key(TextFieldKey::Character(character), epoch)
+            .ok()
+            .unwrap_or(false)
+    }
+
+    #[cfg(test)]
+    fn install_named_folder_for_test(&mut self, label: &str) {
+        let snapshot = crate::domain::cockpit::ConfigSidebarSnapshot {
+            revision: 1,
+            projects: vec![crate::domain::cockpit::ConfigSidebarProject {
+                config_id: "project-1".into(),
+                label: label.into(),
+                root_configured: true,
+                workspace_id: crate::domain::id::ProjectId::new().to_string(),
+                folders: Vec::new(),
+            }],
+            servers: Vec::new(),
+            ssh_connections: Vec::new(),
+            providers: Vec::new(),
+        };
+        self.config_sidebar = ConfigSidebarProjection::from_host_snapshot(&snapshot);
+    }
+
+    #[cfg(test)]
+    fn new_task_overlay_open_for_test(&self) -> bool {
+        self.new_task.is_some()
+    }
+
+    #[cfg(test)]
+    fn first_task_body_copy_for_test(&self) -> String {
+        self.setup_intro_copy(ShellStage::FirstTask)
+            .map(|(_, detail)| detail)
+            .unwrap_or_default()
+    }
+
+    fn browse_add_project_folder(&mut self, cx: &mut Context<Self>) {
+        self.schedule_folder_prompt(cx);
+    }
+
+    fn submit_add_project(&mut self, cx: &mut Context<Self>) {
+        if self
+            .add_project
+            .as_ref()
+            .is_some_and(|draft| draft.path.trim().is_empty())
+        {
+            self.schedule_folder_prompt(cx);
+            return;
+        }
+        self.commit_add_project();
+    }
+
+    fn commit_add_project(&mut self) {
+        let Some(draft) = self.add_project.as_ref() else {
+            return;
+        };
+        if draft.submitting {
+            return;
+        }
+        let name = draft.name.value().trim().to_string();
+        let root_path = draft.path.trim().to_string();
+        if root_path.is_empty() {
+            self.pending_folder_prompt = true;
+            return;
+        }
+        if name.is_empty() {
+            if let Some(draft) = self.add_project.as_mut() {
+                draft.error = Some("Give this folder a name.".into());
+            }
+            return;
+        }
+        if self
+            .dispatch_action(ActionRequest::TaskCockpit {
+                task_id: TaskId::new(),
+                query: TaskCockpitQuery::ConfigCreateProject { name, root_path },
+            })
+            .is_some()
+        {
+            if let Some(draft) = self.add_project.as_mut() {
+                draft.error = Some("Couldn't add this folder. Try again.".into());
+                draft.submitting = false;
+            }
+            return;
+        }
+        if let Some(draft) = self.add_project.as_mut() {
+            draft.submitting = true;
+            draft.error = None;
+        }
+    }
+
+    fn finish_add_project_after_host_accept(&mut self) {
+        self.add_project = None;
+        self.offer_first_task_if_needed();
+    }
+
+    fn offer_first_task_if_needed(&mut self) {
+        if self.first_task_overlay_offered {
+            return;
+        }
+        if self.shell_stage() != ShellStage::FirstTask {
+            return;
+        }
+        if self.new_task.is_some() || self.add_project.is_some() {
+            return;
+        }
+        if self.first_workspace_project_id().is_none() {
+            return;
+        }
+        self.first_task_overlay_offered = true;
+        self.begin_new_task();
+    }
+
+    fn begin_new_task(&mut self) {
+        let Some(_project_id) = self.first_workspace_project_id() else {
+            self.open_add_project();
+            return;
+        };
+        let mut title = TextField::new("Task name").expect("task name field");
+        title.focus();
+        self.new_task = Some(NewTaskDraft { title, error: None });
+        self.add_project = None;
+        self.interaction.close_palettes();
+    }
+
+    fn submit_new_task(&mut self) {
+        let Some(draft) = self.new_task.as_ref() else {
+            return;
+        };
+        let title = draft.title.value().trim().to_string();
+        if title.is_empty() {
+            if let Some(draft) = self.new_task.as_mut() {
+                draft.error = Some("Give this task a name.".into());
+            }
+            return;
+        }
+        let Some(project_id) = self.first_workspace_project_id() else {
+            self.new_task = None;
+            self.open_add_project();
+            return;
+        };
+        if self
+            .dispatch_action(ActionRequest::TaskCreateV2(
+                crate::client::action::TaskCreateV2Arguments {
+                    task_id: TaskId::new(),
+                    environment_id: crate::domain::id::EnvironmentId::new(),
+                    title,
+                    description: None,
+                    project_id,
+                    workspace: crate::workspace::WorkspaceRequest::main(),
+                },
+            ))
+            .is_some()
+        {
+            if let Some(draft) = self.new_task.as_mut() {
+                draft.error = Some("Couldn't create the task. Try again.".into());
+            }
+            return;
+        }
+        self.new_task = None;
+    }
+
+    fn dispatch_named_accessibility_action(&mut self, element_id: &str) {
+        match element_id {
+            "native-setup-add-project"
+            | "native-header-add-project"
+            | "native-sidebar-add-project"
+            | "native-inbox-add-project" => {
+                self.interaction.close_palettes();
+                self.new_task = None;
+                self.pending_folder_prompt = true;
+            }
+            "native-setup-create-task" | "native-header-new-task" | "native-inbox-new-task" => {
+                self.begin_new_task()
+            }
+            "native-add-project-submit" => {
+                if self
+                    .add_project
+                    .as_ref()
+                    .is_some_and(|draft| draft.path.trim().is_empty())
+                {
+                    self.pending_folder_prompt = true;
+                } else {
+                    self.commit_add_project();
+                }
+            }
+            "native-add-project-browse" => self.pending_folder_prompt = true,
+            "native-add-project-cancel" => self.add_project = None,
+            "native-new-task-submit" => self.submit_new_task(),
+            "native-new-task-cancel" => self.new_task = None,
+            _ => {}
+        }
+    }
+
+    fn run_palette_item(&mut self, item: PaletteItem, cx: &mut Context<Self>) {
+        self.interaction.close_palettes();
+        match item {
+            PaletteItem::AddProject => self.begin_choose_folder(cx),
+            PaletteItem::NewTask => self.begin_new_task(),
+            PaletteItem::ToggleSidebar => self.toggle_pane(PaneEdge::Sidebar),
+            PaletteItem::ToggleDock => self.toggle_pane(PaneEdge::Dock),
+            PaletteItem::ToggleTerminal => self.toggle_pane(PaneEdge::Terminal),
+            PaletteItem::ResetLayout => self.reset_layout(),
+        }
+    }
+
     pub fn task_list(&self) -> &TaskList {
         &self.task_list
     }
@@ -8031,135 +8808,2080 @@ impl NativeShell {
             .min(MAX_RENDERED_TASK_ROWS)
     }
 
+    /// Semantic status color for the current host connection.
+    fn host_tone(&self, tokens: crate::ui::tokens::ThemeTokens) -> crate::ui::tokens::Color {
+        match &self.host_state {
+            NativeHostState::Connected { .. } => tokens.status.success,
+            NativeHostState::Disconnected => tokens.status.inactive,
+            NativeHostState::Error { .. } => tokens.status.destructive,
+        }
+    }
+
+    /// Title without the status suffix. `task_row_label` keeps the suffix
+    /// because the accessibility tree reads a row as a single string.
+    fn task_row_title(&self, task_id: TaskId) -> String {
+        if let Some(row) = self.inbox.row(task_id) {
+            return row.title.clone();
+        }
+        self.client_model
+            .as_ref()
+            .and_then(|model| model.tasks().get(&task_id))
+            .map(|snapshot| snapshot.task.title.clone())
+            .unwrap_or_else(|| format!("Task {task_id}"))
+    }
+
+    fn task_row_status(&self, task_id: TaskId) -> Option<VisibleTaskStatus> {
+        if let Some(row) = self.inbox.row(task_id) {
+            return Some(row.status);
+        }
+        self.client_model
+            .as_ref()?
+            .tasks()
+            .get(&task_id)
+            .map(|snapshot| snapshot.visible_status())
+    }
+
+    /// Second row line, built only from facts the row projection already
+    /// carries so the list reads without opening the task.
+    fn task_row_detail(&self, task_id: TaskId) -> String {
+        let status = self
+            .task_row_status(task_id)
+            .map(visible_status_label)
+            .unwrap_or("Unprojected");
+        let Some(row) = self.inbox.row(task_id) else {
+            return status.to_string();
+        };
+        let mut parts = vec![status.to_string()];
+        if !row.display.project.trim().is_empty() {
+            parts.push(row.display.project.clone());
+        }
+        if !row.display.worktree.trim().is_empty() {
+            parts.push(row.display.worktree.clone());
+        }
+        if row.unread_event_count > 0 {
+            parts.push(format!("{} unread", row.unread_event_count));
+        }
+        parts.join(" · ")
+    }
+
+    /// Status colors are always paired with their textual label, so no state
+    /// in this shell is carried by color alone.
+    fn status_tone(
+        status: Option<VisibleTaskStatus>,
+        tokens: crate::ui::tokens::ThemeTokens,
+    ) -> crate::ui::tokens::Color {
+        match status {
+            Some(VisibleTaskStatus::Failed) => tokens.status.destructive,
+            Some(VisibleTaskStatus::UncertainOutcome) | Some(VisibleTaskStatus::Settling) => {
+                tokens.status.warning
+            }
+            Some(VisibleTaskStatus::NeedsApproval) | Some(VisibleTaskStatus::NeedsAnswer) => {
+                tokens.status.attention
+            }
+            Some(VisibleTaskStatus::Working) => tokens.status.external,
+            Some(VisibleTaskStatus::ReadyForReview) => tokens.status.success,
+            Some(VisibleTaskStatus::Idle) | Some(VisibleTaskStatus::Disconnected) | None => {
+                tokens.status.inactive
+            }
+        }
+    }
+
+    fn tone_dot(color: crate::ui::tokens::Color, diameter: f32) -> AnyElement {
+        div()
+            .flex_none()
+            .w(px(diameter))
+            .h(px(diameter))
+            .rounded_full()
+            .bg(color.to_gpui())
+            .into_any_element()
+    }
+
+    /// Compact labelled fact. Keeping these as separate chips instead of one
+    /// concatenated sentence lets the eye find a single value without reading
+    /// the whole line.
+    fn meta_chip(
+        label: &'static str,
+        value: impl Into<String>,
+        tokens: crate::ui::tokens::ThemeTokens,
+    ) -> AnyElement {
+        div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(tokens.density.spacing.xs))
+            .px(px(tokens.density.spacing.sm))
+            .py(px(tokens.density.spacing.xxs))
+            .rounded(px(tokens.density.radii.pill))
+            .bg(tokens.surfaces.raised.to_gpui())
+            .text_size(px(tokens.density.typography.caption))
+            .line_height(px(tokens.density.typography.caption_line_height))
+            .child(div().text_color(tokens.text.muted.to_gpui()).child(label))
+            .child(
+                div()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(tokens.text.primary.to_gpui())
+                    .child(value.into()),
+            )
+            .into_any_element()
+    }
+
+    /// One labelled fact on its own line. A row of chips reads as debug output
+    /// once there are more than a few; a two-column list keeps the labels
+    /// scannable and lets the values truncate independently.
+    fn meta_row(
+        label: &'static str,
+        value: impl Into<String>,
+        tokens: crate::ui::tokens::ThemeTokens,
+    ) -> AnyElement {
+        div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap(px(tokens.density.spacing.md))
+            .py(px(tokens.density.spacing.xs))
+            .text_size(px(tokens.density.typography.caption))
+            .line_height(px(tokens.density.typography.caption_line_height))
+            .child(
+                div()
+                    .flex_none()
+                    .text_color(tokens.text.muted.to_gpui())
+                    .child(label),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .truncate()
+                    .text_right()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(tokens.text.primary.to_gpui())
+                    .child(value.into()),
+            )
+            .into_any_element()
+    }
+
+    /// Panel header. Uppercase caption at medium weight reads as chrome rather
+    /// than content, which is what separates a panel from the text inside it
+    /// when every surface shares one hue.
+    fn panel_label(
+        label: impl Into<String>,
+        tokens: crate::ui::tokens::ThemeTokens,
+    ) -> impl IntoElement {
+        Self::panel_header(label, tokens, None)
+    }
+
+    fn panel_header(
+        label: impl Into<String>,
+        tokens: crate::ui::tokens::ThemeTokens,
+        trailing: Option<AnyElement>,
+    ) -> impl IntoElement {
+        div()
+            .w_full()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(tokens.density.spacing.sm))
+            .h(px(Self::PANEL_HEADER_HEIGHT))
+            .px(px(tokens.density.spacing.lg))
+            .border_b(px(1.0))
+            .border_color(tokens.borders.subtle.to_gpui())
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .truncate()
+                    .text_size(px(tokens.density.typography.caption))
+                    .line_height(px(tokens.density.typography.caption_line_height))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(tokens.text.muted.to_gpui())
+                    .child(label.into().to_uppercase()),
+            )
+            .children(trailing)
+    }
+
+    /// Count badge for a panel header, so a list states its size without
+    /// spending a row on it.
+    fn panel_count_badge(count: usize, tokens: crate::ui::tokens::ThemeTokens) -> AnyElement {
+        div()
+            .flex_none()
+            .px(px(tokens.density.spacing.sm))
+            .py(px(tokens.density.spacing.xxs))
+            .rounded(px(tokens.density.radii.pill))
+            .bg(tokens.surfaces.sunken.to_gpui())
+            .text_size(px(tokens.density.typography.caption))
+            .line_height(px(tokens.density.typography.caption_line_height))
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(tokens.text.muted.to_gpui())
+            .child(count.to_string())
+            .into_any_element()
+    }
+
+    /// Column widths and the terminal height are user-owned and persisted;
+    /// their bounds live with the layout store that clamps them.
+    ///
+    /// Header height is pinned so the workspace row can be measured against the
+    /// window without reading back layout.
+    const HEADER_HEIGHT: f32 = 56.0;
+    const MIN_WORKSPACE_ROW_HEIGHT: f32 = 240.0;
+    const PANEL_HEADER_HEIGHT: f32 = 34.0;
+
+    /// Shared card chrome for the cockpit panels. Every panel gets the same
+    /// surface, hairline, and radius so the workspace reads as one system
+    /// rather than a pile of unrelated text.
+    fn stacked_panel(
+        id: &'static str,
+        label: impl Into<String>,
+        tokens: crate::ui::tokens::ThemeTokens,
+        body: AnyElement,
+    ) -> AnyElement {
+        Self::panel_frame(id, label, tokens, body, false)
+    }
+
+    /// Panel that claims the leftover height of its column. Column-filling
+    /// panels are what keep the cockpit from collapsing into a short stack
+    /// with dead space beneath it.
+    fn stacked_panel_grow(
+        id: &'static str,
+        label: impl Into<String>,
+        tokens: crate::ui::tokens::ThemeTokens,
+        body: AnyElement,
+    ) -> AnyElement {
+        Self::panel_frame(id, label, tokens, body, true)
+    }
+
+    fn panel_frame(
+        id: &'static str,
+        label: impl Into<String>,
+        tokens: crate::ui::tokens::ThemeTokens,
+        body: AnyElement,
+        grow: bool,
+    ) -> AnyElement {
+        let frame = div()
+            .id(id)
+            .w_full()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            // Panels are the lightest surface in the window. Card-on-canvas is
+            // the only depth cue available without shadows, and the previous
+            // raised-on-canvas pairing differed by too little to read as one.
+            .bg(tokens.surfaces.overlay.to_gpui())
+            .border(px(1.0))
+            .border_color(tokens.borders.subtle.to_gpui())
+            .rounded(px(tokens.density.radii.lg))
+            // A hairline alone reads as flat at this contrast; the shadow is
+            // what separates a card from its canvas at a glance.
+            .shadow_sm();
+        // `min-height: auto` on a flex item would let a tall body win over the
+        // column bound, so a growing panel has to opt out of it explicitly.
+        let frame = if grow {
+            frame.flex_1().min_h(px(0.0))
+        } else {
+            frame.flex_none()
+        };
+        frame
+            .child(Self::panel_label(label, tokens))
+            .child(body)
+            .into_any_element()
+    }
+
+    /// Body padding shared by panels that hold projected text rather than a
+    /// surface of their own.
+    fn panel_body(tokens: crate::ui::tokens::ThemeTokens, body: AnyElement) -> AnyElement {
+        div()
+            .w_full()
+            .flex_1()
+            .min_h(px(0.0))
+            .overflow_hidden()
+            .p(px(tokens.density.spacing.md))
+            .text_size(px(tokens.density.typography.body))
+            .line_height(px(tokens.density.typography.body_line_height))
+            .text_color(tokens.text.primary.to_gpui())
+            .child(body)
+            .into_any_element()
+    }
+
+    /// Shared empty state. An empty profile is the first thing a new install
+    /// shows, so it is composed rather than left as a bare line of text: the
+    /// glyph anchors the panel, the headline states the fact, and the caption
+    /// says what would fill it.
+    fn empty_state(
+        id: &'static str,
+        glyph: &'static str,
+        headline: impl Into<String>,
+        detail: impl Into<String>,
+        tokens: crate::ui::tokens::ThemeTokens,
+        action: Option<AnyElement>,
+    ) -> AnyElement {
+        div()
+            .id(id)
+            .w_full()
+            .flex_1()
+            .min_h(px(0.0))
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap(px(tokens.density.spacing.sm))
+            .p(px(tokens.density.spacing.xl))
+            .pb(px(72.0))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .w(px(44.0))
+                    .h(px(44.0))
+                    .mb(px(tokens.density.spacing.xs))
+                    .rounded(px(tokens.density.radii.pill))
+                    .bg(tokens.surfaces.sunken.to_gpui())
+                    .text_size(px(tokens.density.typography.heading))
+                    .text_color(tokens.text.muted.to_gpui())
+                    .child(glyph),
+            )
+            .child(
+                div()
+                    .text_size(px(tokens.density.typography.heading))
+                    .line_height(px(tokens.density.typography.heading_line_height))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(tokens.text.primary.to_gpui())
+                    .child(headline.into()),
+            )
+            .child(
+                div()
+                    .max_w(px(420.0))
+                    .text_center()
+                    .text_size(px(tokens.density.typography.caption))
+                    .line_height(px(tokens.density.typography.caption_line_height))
+                    .text_color(tokens.text.muted.to_gpui())
+                    .child(detail.into()),
+            )
+            .children(action)
+            .into_any_element()
+    }
+
+    /// Dock empty state. The tab strip above already names the tool, so the
+    /// body says what is missing instead of repeating the label on a band.
+    fn dock_empty_state(
+        tool: CockpitDockTool,
+        tokens: crate::ui::tokens::ThemeTokens,
+    ) -> AnyElement {
+        Self::empty_state(
+            "native-shell-workspace-dock",
+            "\u{25cb}",
+            "Select a task first",
+            format!(
+                "{} loads once a task in the inbox is selected.",
+                tool.label()
+            ),
+            tokens,
+            None,
+        )
+    }
+
+    /// Empty-state copy for the task list. Without this the inbox renders a
+    /// bare label on a fresh profile and reads as a failure.
+    fn inbox_empty_state(
+        tokens: crate::ui::tokens::ThemeTokens,
+        action: Option<AnyElement>,
+    ) -> AnyElement {
+        Self::empty_state(
+            "native-shell-task-inbox-empty",
+            "+",
+            "No tasks yet",
+            "Create a task to open its conversation.",
+            tokens,
+            action,
+        )
+    }
+
+    fn setup_intro_copy(&self, stage: ShellStage) -> Option<(&'static str, String)> {
+        match stage {
+            ShellStage::Connecting => Some((
+                "Getting ready",
+                "This only takes a moment.".to_string(),
+            )),
+            ShellStage::Recovery => Some((
+                "Can't load your settings",
+                "DevManager needs to recover before you can continue.".to_string(),
+            )),
+            ShellStage::Welcome => Some((
+                "Welcome to DevManager",
+                "Pick a folder you already have. Tasks, chat, and the terminal stay out of the way until you have somewhere to work.".to_string(),
+            )),
+            ShellStage::FirstTask => Some((
+                "Start a task",
+                "Name the work you want to do. Chat, files, and the terminal open with it."
+                    .to_string(),
+            )),
+            ShellStage::Cockpit => None,
+        }
+    }
+
+    fn setup_intro(
+        &self,
+        stage: ShellStage,
+        tokens: crate::ui::tokens::ThemeTokens,
+        action: Option<AnyElement>,
+    ) -> AnyElement {
+        let Some((title, detail)) = self.setup_intro_copy(stage) else {
+            return div().id("native-shell-setup-unused").into_any_element();
+        };
+        let (id, glyph) = match stage {
+            ShellStage::Connecting => ("native-shell-setup-connecting", "·"),
+            ShellStage::Recovery => ("native-shell-setup-recovery", "!"),
+            ShellStage::Welcome => ("native-shell-setup-welcome", "+"),
+            ShellStage::FirstTask => ("native-shell-setup-first-task", "1"),
+            ShellStage::Cockpit => {
+                return div().id("native-shell-setup-unused").into_any_element();
+            }
+        };
+        let composed_action = if stage == ShellStage::Welcome {
+            Some(
+                div()
+                    .id("native-shell-setup-welcome-action")
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(px(tokens.density.spacing.md))
+                    .child(self.setup_welcome_steps(tokens))
+                    .children(action)
+                    .into_any_element(),
+            )
+        } else {
+            action
+        };
+        Self::empty_state(id, glyph, title, detail, tokens, composed_action)
+    }
+
+    fn primary_action_button(
+        id: &'static str,
+        label: &'static str,
+        tokens: crate::ui::tokens::ThemeTokens,
+        cx: &Context<Self>,
+        action: fn(&mut NativeShell, &mut Context<NativeShell>),
+    ) -> AnyElement {
+        div()
+            .id(id)
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .px(px(tokens.density.spacing.lg))
+            .py(px(tokens.density.spacing.sm))
+            .rounded(px(tokens.density.radii.md))
+            .bg(tokens.actions.primary.default.background.to_gpui())
+            .text_color(tokens.actions.primary.default.foreground.to_gpui())
+            .font_weight(FontWeight::SEMIBOLD)
+            .cursor_pointer()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |shell, _event: &MouseDownEvent, _window, cx| {
+                    cx.stop_propagation();
+                    action(shell, cx);
+                    cx.notify();
+                }),
+            )
+            .child(label)
+            .into_any_element()
+    }
+
+    fn setup_welcome_steps(&self, tokens: crate::ui::tokens::ThemeTokens) -> AnyElement {
+        let steps = [
+            "Choose a folder you already have",
+            "Start a task for the work you want done",
+            "Chat, files, and the terminal open with that task",
+        ];
+        div()
+            .id("native-shell-setup-steps")
+            .w_full()
+            .flex_none()
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap(px(tokens.density.spacing.xxs))
+            .children(steps.into_iter().enumerate().map(|(index, step)| {
+                div()
+                    .id(("native-shell-setup-step", index))
+                    .max_w(px(360.0))
+                    .text_center()
+                    .text_size(px(tokens.density.typography.caption))
+                    .line_height(px(tokens.density.typography.caption_line_height))
+                    .text_color(tokens.text.muted.to_gpui())
+                    .child(format!("{}. {step}", index + 1))
+            }))
+            .into_any_element()
+    }
+
+    fn setup_shell_content(
+        &self,
+        stage: ShellStage,
+        tokens: crate::ui::tokens::ThemeTokens,
+        layout: WorkspaceLayout,
+        action: Option<AnyElement>,
+        add_project: Option<AnyElement>,
+    ) -> AnyElement {
+        let intro = self.setup_intro(stage, tokens, action);
+        let canvas = div()
+            .id("native-shell-setup")
+            .flex()
+            .flex_1()
+            .min_h(px(0.0))
+            .min_w(px(0.0))
+            .overflow_hidden();
+        if stage == ShellStage::FirstTask {
+            canvas
+                .child(self.sidebar(tokens, layout.sidebar_width, add_project))
+                .child(intro)
+                .into_any_element()
+        } else {
+            canvas.child(intro).into_any_element()
+        }
+    }
+
+    /// Fixed row height for the virtualized inbox. `uniform_list` requires a
+    /// stable height, so the two text lines and their padding are summed from
+    /// the same tokens that render them.
+    fn inbox_row_height(tokens: crate::ui::tokens::ThemeTokens) -> f32 {
+        tokens.density.typography.body_line_height
+            + tokens.density.typography.caption_line_height
+            + tokens.density.spacing.sm * 2.0
+    }
+
     fn element_without_handlers(&self) -> impl IntoElement {
         self.element_body(Vec::new())
     }
 
-    fn element_body(&self, task_rows: Vec<AnyElement>) -> impl IntoElement {
-        let tokens = self.preferences.tokens();
-        let metrics = tokens.density.physical();
-        let toolbar = div()
+    fn render_overlays(
+        &self,
+        tokens: crate::ui::tokens::ThemeTokens,
+        viewport: Size<Pixels>,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        if self.add_project.is_some() {
+            return Some(self.render_add_project_overlay(tokens, viewport, cx));
+        }
+        if self.new_task.is_some() {
+            return Some(self.render_new_task_overlay(tokens, viewport, cx));
+        }
+        if self.interaction.keyboard_state().palette_open {
+            return Some(self.render_command_palette(tokens, viewport, cx));
+        }
+        None
+    }
+
+    fn overlay_text_field(
+        id: &'static str,
+        field: &TextField,
+        placeholder: &'static str,
+        tokens: crate::ui::tokens::ThemeTokens,
+    ) -> AnyElement {
+        let chrome = Self::overlay_text_field_chrome(field);
+        let parts = Self::overlay_text_field_parts(field);
+        let mut row = div()
+            .id(id)
+            .w_full()
+            .px(px(tokens.density.spacing.md))
+            .py(px(tokens.density.spacing.sm))
+            .rounded(px(tokens.density.radii.md))
+            .bg(tokens.surfaces.sunken.to_gpui())
+            .border(px(1.0))
+            .border_color(
+                if chrome.show_focus_ring {
+                    tokens.borders.selection.to_gpui()
+                } else {
+                    tokens.borders.subtle.to_gpui()
+                },
+            )
+            .flex()
+            .items_center()
+            .min_h(px(tokens.density.controls.row_height));
+        for (index, part) in parts.into_iter().enumerate() {
+            row = row.child(Self::overlay_text_field_part(part, placeholder, tokens, index));
+        }
+        row.into_any_element()
+    }
+
+    fn overlay_text_field_chrome(field: &TextField) -> OverlayTextFieldChrome {
+        OverlayTextFieldChrome {
+            show_focus_ring: field.is_focused(),
+        }
+    }
+
+    fn overlay_text_field_parts(field: &TextField) -> Vec<OverlayTextFieldPart> {
+        let value = field.value();
+        let empty = value.is_empty();
+        let selected = field.is_all_selected();
+        let focused = field.is_focused();
+        if selected {
+            return vec![OverlayTextFieldPart::Selection(value.to_string())];
+        }
+        if empty {
+            let mut parts = Vec::new();
+            if focused {
+                parts.push(OverlayTextFieldPart::Caret);
+            }
+            parts.push(OverlayTextFieldPart::Placeholder);
+            return parts;
+        }
+        let cursor = field.cursor().min(value.chars().count());
+        let mut chars = value.chars();
+        let before: String = chars.by_ref().take(cursor).collect();
+        let after: String = chars.collect();
+        let mut parts = Vec::new();
+        if !before.is_empty() {
+            parts.push(OverlayTextFieldPart::Text(before));
+        }
+        if focused {
+            parts.push(OverlayTextFieldPart::Caret);
+        }
+        if !after.is_empty() {
+            parts.push(OverlayTextFieldPart::Text(after));
+        }
+        parts
+    }
+
+    fn overlay_text_field_part(
+        part: OverlayTextFieldPart,
+        placeholder: &'static str,
+        tokens: crate::ui::tokens::ThemeTokens,
+        index: usize,
+    ) -> AnyElement {
+        match part {
+            OverlayTextFieldPart::Placeholder => div()
+                .id(("native-overlay-field-placeholder", index))
+                .text_color(tokens.text.muted.to_gpui())
+                .child(placeholder)
+                .into_any_element(),
+            OverlayTextFieldPart::Caret => div()
+                .id(("native-overlay-field-caret", index))
+                .flex_none()
+                .w(px(1.0))
+                .h(px(16.0))
+                .bg(tokens.actions.primary.default.background.to_gpui())
+                .into_any_element(),
+            OverlayTextFieldPart::Text(text) => div()
+                .id(("native-overlay-field-text", index))
+                .text_color(tokens.text.primary.to_gpui())
+                .child(text)
+                .into_any_element(),
+            OverlayTextFieldPart::Selection(text) => div()
+                .id(("native-overlay-field-selection", index))
+                .rounded(px(2.0))
+                .px(px(2.0))
+                .bg(tokens.surfaces.selection.to_gpui())
+                .text_color(tokens.text.on_selection.to_gpui())
+                .child(text)
+                .into_any_element(),
+        }
+    }
+
+    fn shows_add_folder_chrome(stage: ShellStage) -> bool {
+        stage == ShellStage::Cockpit
+    }
+
+    fn render_add_project_overlay(
+        &self,
+        tokens: crate::ui::tokens::ThemeTokens,
+        viewport: Size<Pixels>,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let draft = self.add_project.as_ref().expect("overlay is open");
+        let error = draft.error.clone();
+        let has_folder = !draft.path.trim().is_empty();
+        let submitting = draft.submitting;
+        deferred(
+            anchored()
+                .position(point(px(0.0), px(0.0)))
+                .snap_to_window()
+                .child(
+                div()
+                    .id("native-add-project-backdrop")
+                    .occlude()
+                    .w(viewport.width)
+                    .h(viewport.height)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(tokens.surfaces.overlay.to_gpui())
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|shell, _event: &MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            shell.focus_handle.focus(window);
+                        }),
+                    )
+                    .on_key_down(cx.listener(|shell, event: &KeyDownEvent, window, cx| {
+                        cx.stop_propagation();
+                        shell.handle_add_project_key(event, window, cx);
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .id("native-add-project-dialog")
+                            .w(px(440.0))
+                            .rounded(px(tokens.density.radii.lg))
+                            .bg(tokens.surfaces.raised.to_gpui())
+                            .border(px(1.0))
+                            .border_color(tokens.borders.subtle.to_gpui())
+                            .shadow_sm()
+                            .p(px(tokens.density.spacing.xl))
+                            .flex()
+                            .flex_col()
+                            .gap(px(tokens.density.spacing.md))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|shell, _event: &MouseDownEvent, window, cx| {
+                                    cx.stop_propagation();
+                                    shell.focus_handle.focus(window);
+                                }),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(tokens.density.typography.heading))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(tokens.text.primary.to_gpui())
+                                    .child(if has_folder {
+                                        "Add this project?"
+                                    } else {
+                                        "Add a project"
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(tokens.density.typography.caption))
+                                    .text_color(tokens.text.muted.to_gpui())
+                                    .child(if has_folder {
+                                        "You can change the name. Nothing is added until you confirm."
+                                    } else {
+                                        "Choose a folder on this computer. Nothing is added until you confirm."
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(tokens.density.spacing.xxs))
+                                    .child(
+                                        div()
+                                            .text_size(px(tokens.density.typography.caption))
+                                            .text_color(tokens.text.muted.to_gpui())
+                                            .child("Name"),
+                                    )
+                                    .child(Self::overlay_text_field(
+                                        "native-add-project-name",
+                                        &draft.name,
+                                        "Give it a name",
+                                        tokens,
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(tokens.density.spacing.xxs))
+                                    .child(
+                                        div()
+                                            .text_size(px(tokens.density.typography.caption))
+                                            .text_color(tokens.text.muted.to_gpui())
+                                            .child("Folder"),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .gap(px(tokens.density.spacing.sm))
+                                            .items_center()
+                                            .child(
+                                                div()
+                                                    .id("native-add-project-path")
+                                                    .flex_1()
+                                                    .min_w(px(0.0))
+                                                    .px(px(tokens.density.spacing.md))
+                                                    .py(px(tokens.density.spacing.sm))
+                                                    .rounded(px(tokens.density.radii.md))
+                                                    .bg(tokens.surfaces.sunken.to_gpui())
+                                                    .truncate()
+                                                    .text_color(if has_folder {
+                                                        tokens.text.primary.to_gpui()
+                                                    } else {
+                                                        tokens.text.muted.to_gpui()
+                                                    })
+                                                    .child(if has_folder {
+                                                        draft.path.clone()
+                                                    } else {
+                                                        "No folder chosen yet".to_string()
+                                                    }),
+                                            )
+                                            .child(
+                                                Button::new("native-add-project-browse")
+                                                    .label(if has_folder {
+                                                        "Choose a different folder"
+                                                    } else {
+                                                        "Choose folder"
+                                                    })
+                                                    .ghost()
+                                                    .on_click(cx.listener(
+                                                        |shell, _event: &ClickEvent, _window, cx| {
+                                                            cx.stop_propagation();
+                                                            shell.browse_add_project_folder(cx);
+                                                            cx.notify();
+                                                        },
+                                                    )),
+                                            ),
+                                    ),
+                            )
+                            .children(error.map(|message| {
+                                div()
+                                    .text_size(px(tokens.density.typography.caption))
+                                    .text_color(tokens.status.destructive.to_gpui())
+                                    .child(message)
+                            }))
+                            .child(
+                                div()
+                                    .flex()
+                                    .justify_end()
+                                    .gap(px(tokens.density.spacing.sm))
+                                    .child(
+                                        Button::new("native-add-project-cancel")
+                                            .label("Cancel")
+                                            .ghost()
+                                            .on_click(cx.listener(
+                                                |shell, _event: &ClickEvent, _window, cx| {
+                                                    cx.stop_propagation();
+                                                    shell.add_project = None;
+                                                    cx.notify();
+                                                },
+                                            )),
+                                    )
+                                    .child(
+                                        Button::new("native-add-project-submit")
+                                            .label(if submitting {
+                                                "Adding…"
+                                            } else if has_folder {
+                                                "Add project"
+                                            } else {
+                                                "Choose folder"
+                                            })
+                                            .primary()
+                                            .on_click(cx.listener(
+                                                |shell, _event: &ClickEvent, _window, cx| {
+                                                    cx.stop_propagation();
+                                                    shell.submit_add_project(cx);
+                                                    cx.notify();
+                                                },
+                                            )),
+                                    ),
+                            ),
+                    ),
+            ),
+        )
+        .with_priority(2)
+        .into_any_element()
+    }
+
+    fn render_new_task_overlay(
+        &self,
+        tokens: crate::ui::tokens::ThemeTokens,
+        viewport: Size<Pixels>,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let draft = self.new_task.as_ref().expect("overlay is open");
+        let error = draft.error.clone();
+        deferred(
+            anchored()
+                .position(point(px(0.0), px(0.0)))
+                .snap_to_window()
+                .child(
+                div()
+                    .id("native-new-task-backdrop")
+                    .occlude()
+                    .w(viewport.width)
+                    .h(viewport.height)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(tokens.surfaces.overlay.to_gpui())
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|shell, _event: &MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            shell.focus_handle.focus(window);
+                        }),
+                    )
+                    .on_key_down(cx.listener(|shell, event: &KeyDownEvent, window, cx| {
+                        cx.stop_propagation();
+                        shell.handle_new_task_key(event, window, cx);
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .id("native-new-task-dialog")
+                            .w(px(440.0))
+                            .rounded(px(tokens.density.radii.lg))
+                            .bg(tokens.surfaces.raised.to_gpui())
+                            .border(px(1.0))
+                            .border_color(tokens.borders.subtle.to_gpui())
+                            .shadow_sm()
+                            .p(px(tokens.density.spacing.xl))
+                            .flex()
+                            .flex_col()
+                            .gap(px(tokens.density.spacing.md))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|shell, _event: &MouseDownEvent, window, cx| {
+                                    cx.stop_propagation();
+                                    shell.focus_handle.focus(window);
+                                }),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(tokens.density.typography.heading))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(tokens.text.primary.to_gpui())
+                                    .child("Name this task"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(tokens.density.typography.caption))
+                                    .text_color(tokens.text.muted.to_gpui())
+                                    .child(
+                                        "Chat, files, and the terminal will open with this work.",
+                                    ),
+                            )
+                            .child(Self::overlay_text_field(
+                                "native-new-task-name",
+                                &draft.title,
+                                "What are you working on?",
+                                tokens,
+                            ))
+                            .children(error.map(|message| {
+                                div()
+                                    .text_size(px(tokens.density.typography.caption))
+                                    .text_color(tokens.status.destructive.to_gpui())
+                                    .child(message)
+                            }))
+                            .child(
+                                div()
+                                    .flex()
+                                    .justify_end()
+                                    .gap(px(tokens.density.spacing.sm))
+                                    .child(
+                                        Button::new("native-new-task-cancel")
+                                            .label("Cancel")
+                                            .ghost()
+                                            .on_click(cx.listener(
+                                                |shell, _event: &ClickEvent, _window, cx| {
+                                                    cx.stop_propagation();
+                                                    shell.new_task = None;
+                                                    cx.notify();
+                                                },
+                                            )),
+                                    )
+                                    .child(
+                                        Button::new("native-new-task-submit")
+                                            .label("Create task")
+                                            .primary()
+                                            .on_click(cx.listener(
+                                                |shell, _event: &ClickEvent, _window, cx| {
+                                                    cx.stop_propagation();
+                                                    shell.submit_new_task();
+                                                    cx.notify();
+                                                },
+                                            )),
+                                    ),
+                            ),
+                    ),
+            ),
+        )
+        .with_priority(2)
+        .into_any_element()
+    }
+
+    fn render_command_palette(
+        &self,
+        tokens: crate::ui::tokens::ThemeTokens,
+        viewport: Size<Pixels>,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let items = PaletteItem::for_stage(self.shell_stage());
+        let selected = if items.is_empty() {
+            0
+        } else {
+            self.palette_index.min(items.len() - 1)
+        };
+        let rows = items.iter().copied().enumerate().map(|(index, item)| {
+            let row = div()
+                .id(("native-palette-item", index))
+                .w_full()
+                .px(px(tokens.density.spacing.md))
+                .py(px(tokens.density.spacing.sm))
+                .rounded(px(tokens.density.radii.md))
+                .flex()
+                .flex_col()
+                .cursor_pointer();
+            let row = if index == selected {
+                row.bg(tokens.surfaces.selection.to_gpui())
+            } else {
+                row.hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
+            };
+            row.on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |shell, _event: &MouseDownEvent, _window, cx| {
+                    cx.stop_propagation();
+                    shell.run_palette_item(item, cx);
+                    cx.notify();
+                }),
+            )
+            .child(
+                div()
+                    .text_color(if index == selected {
+                        tokens.text.on_selection.to_gpui()
+                    } else {
+                        tokens.text.primary.to_gpui()
+                    })
+                    .child(item.title()),
+            )
+            .child(
+                div()
+                    .text_size(px(tokens.density.typography.caption))
+                    .text_color(if index == selected {
+                        tokens.text.on_selection.to_gpui()
+                    } else {
+                        tokens.text.muted.to_gpui()
+                    })
+                    .child(item.hint()),
+            )
+        });
+        deferred(
+            anchored()
+                .position(point(px(0.0), px(0.0)))
+                .snap_to_window()
+                .child(
+                div()
+                    .id("native-command-palette-backdrop")
+                    .occlude()
+                    .w(viewport.width)
+                    .h(viewport.height)
+                    .flex()
+                    .justify_center()
+                    .pt(px(96.0))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|shell, _event: &MouseDownEvent, _window, cx| {
+                            cx.stop_propagation();
+                            shell.interaction.close_palettes();
+                            cx.notify();
+                        }),
+                    )
+                    .on_key_down(cx.listener(|shell, event: &KeyDownEvent, window, cx| {
+                        cx.stop_propagation();
+                        shell.handle_palette_key(event, window, cx);
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .id("native-command-palette")
+                            .w(px(420.0))
+                            .rounded(px(tokens.density.radii.lg))
+                            .bg(tokens.surfaces.raised.to_gpui())
+                            .border(px(1.0))
+                            .border_color(tokens.borders.subtle.to_gpui())
+                            .shadow_sm()
+                            .p(px(tokens.density.spacing.sm))
+                            .flex()
+                            .flex_col()
+                            .gap(px(tokens.density.spacing.xxs))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|_shell, _event: &MouseDownEvent, _window, cx| {
+                                    cx.stop_propagation();
+                                }),
+                            )
+                            .child(
+                                div()
+                                    .px(px(tokens.density.spacing.md))
+                                    .py(px(tokens.density.spacing.sm))
+                                    .text_size(px(tokens.density.typography.caption))
+                                    .text_color(tokens.text.muted.to_gpui())
+                                    .child("Commands · Enter to run · Esc to close"),
+                            )
+                            .children(rows),
+                    ),
+            ),
+        )
+        .with_priority(2)
+        .into_any_element()
+    }
+
+    fn overlay_key_input(event: &KeyDownEvent) -> Option<TextFieldKey> {
+        match event.keystroke.key.as_str() {
+            "backspace" => Some(TextFieldKey::Backspace),
+            "delete" => Some(TextFieldKey::Delete),
+            "left" => Some(TextFieldKey::Left),
+            "right" => Some(TextFieldKey::Right),
+            "home" => Some(TextFieldKey::Home),
+            "end" => Some(TextFieldKey::End),
+            "space" => Some(TextFieldKey::Character(' ')),
+            _ if !event.keystroke.modifiers.control
+                && !event.keystroke.modifiers.platform
+                && !event.keystroke.modifiers.alt =>
+            {
+                Self::overlay_typed_character(event)
+            }
+            _ => None,
+        }
+    }
+
+    fn overlay_typed_character(event: &KeyDownEvent) -> Option<TextFieldKey> {
+        if let Some(text) = event.keystroke.key_char.as_deref() {
+            let mut chars = text.chars();
+            if let (Some(character), None) = (chars.next(), chars.next()) {
+                if !character.is_control() {
+                    return Some(TextFieldKey::Character(character));
+                }
+            }
+        }
+        let mut chars = event.keystroke.key.chars();
+        match (chars.next(), chars.next()) {
+            (Some(character), None)
+                if character.is_ascii_graphic() || character == ' ' =>
+            {
+                Some(TextFieldKey::Character(character))
+            }
+            _ => None,
+        }
+    }
+
+    fn handle_overlay_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.add_project.is_some() {
+            self.handle_add_project_key(event, window, cx);
+            true
+        } else if self.new_task.is_some() {
+            self.handle_new_task_key(event, window, cx);
+            true
+        } else if self.interaction.keyboard_state().palette_open {
+            self.handle_palette_key(event, window, cx);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn handle_add_project_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = event.keystroke.key.as_str();
+        if key == "escape" {
+            window.prevent_default();
+            self.add_project = None;
+            return;
+        }
+        if key == "enter" {
+            window.prevent_default();
+            self.submit_add_project(cx);
+            return;
+        }
+        if event.keystroke.modifiers.control || event.keystroke.modifiers.platform {
+            match key {
+                "a" => {
+                    window.prevent_default();
+                    if let Some(draft) = self.add_project.as_mut() {
+                        draft.name.select_all();
+                    }
+                }
+                "v" => {
+                    window.prevent_default();
+                    if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                        if let Some(draft) = self.add_project.as_mut() {
+                            let epoch = draft.name.focus_epoch();
+                            let _ = draft.name.paste(&text, epoch);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+        let Some(draft) = self.add_project.as_mut() else {
+            return;
+        };
+        let epoch = draft.name.focus_epoch();
+        if let Some(input) = Self::overlay_key_input(event) {
+            if draft.name.handle_key(input, epoch).ok().unwrap_or(false) {
+                window.prevent_default();
+            }
+        }
+    }
+
+    fn handle_new_task_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = event.keystroke.key.as_str();
+        if key == "escape" {
+            window.prevent_default();
+            self.new_task = None;
+            return;
+        }
+        if key == "enter" {
+            window.prevent_default();
+            self.submit_new_task();
+            return;
+        }
+        if event.keystroke.modifiers.control || event.keystroke.modifiers.platform {
+            match key {
+                "a" => {
+                    window.prevent_default();
+                    if let Some(draft) = self.new_task.as_mut() {
+                        draft.title.select_all();
+                    }
+                }
+                "v" => {
+                    window.prevent_default();
+                    if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                        if let Some(draft) = self.new_task.as_mut() {
+                            let epoch = draft.title.focus_epoch();
+                            let _ = draft.title.paste(&text, epoch);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+        let Some(draft) = self.new_task.as_mut() else {
+            return;
+        };
+        let epoch = draft.title.focus_epoch();
+        if let Some(input) = Self::overlay_key_input(event) {
+            if draft.title.handle_key(input, epoch).ok().unwrap_or(false) {
+                window.prevent_default();
+            }
+        }
+    }
+
+    fn handle_palette_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = event.keystroke.key.as_str();
+        let items = PaletteItem::for_stage(self.shell_stage());
+        match key {
+            "escape" => {
+                window.prevent_default();
+                self.interaction.close_palettes();
+            }
+            "up" => {
+                window.prevent_default();
+                self.palette_index = self.palette_index.saturating_sub(1);
+            }
+            "down" => {
+                window.prevent_default();
+                if !items.is_empty() {
+                    self.palette_index = (self.palette_index + 1).min(items.len() - 1);
+                }
+            }
+            "enter" => {
+                window.prevent_default();
+                if let Some(item) = items.get(self.palette_index.min(items.len().saturating_sub(1)))
+                {
+                    self.run_palette_item(*item, cx);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The application header. `host_status_control` is supplied by the caller
+    /// so the interactive path can attach listeners without duplicating chrome.
+    /// Segmented control for the collapsible panes. Collapse state belongs in
+    /// the header rather than in a menu: it is a one-click, frequently-used
+    /// view control, and hiding it makes a collapsed pane look like a bug.
+    fn pane_toggles(
+        &self,
+        tokens: crate::ui::tokens::ThemeTokens,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        div()
+            .id("native-shell-pane-toggles")
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(tokens.density.spacing.xxs))
+            .p(px(tokens.density.spacing.xxs))
+            .rounded(px(tokens.density.radii.md))
+            .bg(tokens.surfaces.raised.to_gpui())
+            .child(self.pane_toggle(
+                "native-shell-toggle-sidebar",
+                "Config",
+                PaneEdge::Sidebar,
+                !self.layout.sidebar_collapsed,
+                tokens,
+                cx,
+            ))
+            .child(self.pane_toggle(
+                "native-shell-toggle-dock",
+                "Dock",
+                PaneEdge::Dock,
+                !self.layout.dock_collapsed,
+                tokens,
+                cx,
+            ))
+            .child(self.pane_toggle(
+                "native-shell-toggle-terminal",
+                "Terminal",
+                PaneEdge::Terminal,
+                !self.layout.terminal_collapsed,
+                tokens,
+                cx,
+            ))
+            .into_any_element()
+    }
+
+    fn pane_toggle(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        edge: PaneEdge,
+        visible: bool,
+        tokens: crate::ui::tokens::ThemeTokens,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let (foreground, background, weight) = if visible {
+            (
+                tokens.text.primary,
+                tokens.surfaces.overlay,
+                FontWeight::SEMIBOLD,
+            )
+        } else {
+            (
+                tokens.text.muted,
+                tokens.surfaces.raised,
+                FontWeight::NORMAL,
+            )
+        };
+        div()
+            .id(id)
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .h(px(22.0))
+            .px(px(tokens.density.spacing.sm))
+            .rounded(px(tokens.density.radii.sm))
+            .bg(background.to_gpui())
+            .text_size(px(tokens.density.typography.caption))
+            .line_height(px(tokens.density.typography.caption_line_height))
+            .font_weight(weight)
+            .text_color(foreground.to_gpui())
+            .hover(|style| style.bg(tokens.surfaces.overlay.to_gpui()))
+            .on_click(cx.listener(move |shell, _event: &ClickEvent, _window, cx| {
+                cx.stop_propagation();
+                shell.toggle_pane(edge);
+                cx.notify();
+            }))
+            .child(label)
+            .into_any_element()
+    }
+
+    fn header_bar(
+        &self,
+        tokens: crate::ui::tokens::ThemeTokens,
+        host_status_control: Option<AnyElement>,
+        workspace_actions: Option<AnyElement>,
+        pane_toggles: Option<AnyElement>,
+    ) -> AnyElement {
+        let show_attachment = !self.header_attachment.label().is_empty()
+            || !self.header_attachment.detail().is_empty();
+        let show_connection = matches!(self.shell_stage(), ShellStage::Cockpit)
+            || !matches!(self.host_state, NativeHostState::Connected { .. });
+        div()
             .id("native-shell-toolbar")
             .w_full()
             .flex()
-            .flex_wrap()
+            .flex_none()
+            .h(px(Self::HEADER_HEIGHT))
             .items_center()
-            .gap(px(tokens.density.spacing.md))
-            .p(px(metrics.control_padding as f32))
-            .bg(tokens.surfaces.raised.to_gpui())
+            .gap(px(tokens.density.spacing.lg))
+            .px(px(tokens.density.spacing.lg))
+            .bg(tokens.surfaces.overlay.to_gpui())
+            .border_b(px(1.0))
+            .border_color(tokens.borders.subtle.to_gpui())
             .child(
                 div()
                     .id("native-shell-header-title")
-                    .text_size(px(18.0))
-                    .child("Task Cockpit"),
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .gap(px(tokens.density.spacing.sm))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .w(px(24.0))
+                            .h(px(24.0))
+                            .rounded(px(tokens.density.radii.md))
+                            .bg(tokens.actions.primary.default.background.to_gpui())
+                            .text_size(px(tokens.density.typography.caption))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(tokens.actions.primary.default.foreground.to_gpui())
+                            .child("DM"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(tokens.density.typography.heading))
+                            .line_height(px(tokens.density.typography.heading_line_height))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(tokens.text.primary.to_gpui())
+                            .child("DevManager"),
+                    ),
             )
-            .child(
+            .children(show_attachment.then(|| {
                 div()
-                    .id("native-shell-header-attachment")
-                    .text_color(tokens.text.secondary.to_gpui())
-                    .whitespace_normal()
-                    .child(self.header_attachment.label()),
-            )
-            .child(
-                div()
-                    .id("native-shell-header-detail")
-                    .text_color(tokens.text.secondary.to_gpui())
-                    .whitespace_normal()
-                    .child(self.header_attachment.detail()),
-            )
-            .child(
-                Button::new("native-shell-host-status")
-                    .label("Host status")
-                    .info(),
-            )
-            .child(
-                div()
-                    .text_color(tokens.text.secondary.to_gpui())
-                    .whitespace_normal()
-                    .child(self.host_status_text()),
-            );
-        let inbox = div()
-            .id("native-shell-task-inbox")
-            .w_full()
-            .flex_col()
-            .gap(px(tokens.density.spacing.xs))
-            .overflow_y_scroll()
-            .child(
-                div()
-                    .id("native-task-inbox-label")
-                    .text_color(tokens.text.secondary.to_gpui())
-                    .child("Task Inbox"),
-            )
-            .children(task_rows);
-        let details = self
+                    .flex()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .items_center()
+                    .gap(px(tokens.density.spacing.lg))
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(1.0))
+                            .h(px(20.0))
+                            .bg(tokens.borders.subtle.to_gpui()),
+                    )
+                    .child(
+                        div()
+                            .id("native-shell-header-attachment")
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .overflow_hidden()
+                            .child(
+                                div()
+                                    .text_size(px(tokens.density.typography.body))
+                                    .line_height(px(tokens.density.typography.body_line_height))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(tokens.text.primary.to_gpui())
+                                    .truncate()
+                                    .child(self.header_attachment.label()),
+                            )
+                            .child(
+                                div()
+                                    .id("native-shell-header-detail")
+                                    .text_size(px(tokens.density.typography.caption))
+                                    .line_height(px(tokens.density.typography.caption_line_height))
+                                    .text_color(tokens.text.secondary.to_gpui())
+                                    .truncate()
+                                    .child(self.header_attachment.detail()),
+                            ),
+                    )
+                    .into_any_element()
+            }))
+            .children((!show_attachment).then(|| div().flex_1().into_any_element()))
+            .children(workspace_actions)
+            .children(pane_toggles)
+            .children(show_connection.then(|| self.status_bar(tokens)))
+            .children(host_status_control.map(|control| div().flex_none().child(control)))
+            .into_any_element()
+    }
+
+    /// Connection truth, carried in the header beside the host control it
+    /// describes. The status string is long and low-priority, so it is capped
+    /// and truncated rather than allowed to crowd the task title.
+    fn status_bar(&self, tokens: crate::ui::tokens::ThemeTokens) -> AnyElement {
+        div()
+            .id("native-shell-status-bar")
+            .flex()
+            .flex_none()
+            .items_center()
+            .max_w(px(560.0))
+            .gap(px(tokens.density.spacing.sm))
+            .px(px(tokens.density.spacing.md))
+            .py(px(tokens.density.spacing.xs))
+            .rounded(px(tokens.density.radii.pill))
+            .bg(tokens.surfaces.raised.to_gpui())
+            .text_size(px(tokens.density.typography.caption))
+            .line_height(px(tokens.density.typography.caption_line_height))
+            .text_color(tokens.text.secondary.to_gpui())
+            .child(Self::tone_dot(self.host_tone(tokens), 8.0))
+            .child(div().truncate().child(self.host_status_headline()))
+            .into_any_element()
+    }
+
+    /// Header-sized projection of the status line. The full string carries
+    /// boot, connection, and build identifiers, which truncate mid-identifier
+    /// in a chip; the leading segments already state connection truth.
+    fn host_status_headline(&self) -> String {
+        self.host_status_text()
+            .split(" · ")
+            .take(3)
+            .collect::<Vec<_>>()
+            .join(" · ")
+    }
+
+    /// Optional task-details panel, shown only while the keyboard model has it
+    /// open.
+    fn task_details_panel(&self, tokens: crate::ui::tokens::ThemeTokens) -> Option<AnyElement> {
+        if !self.interaction.keyboard_state().task_details_open {
+            return None;
+        }
+        let body = self
             .interaction
-            .keyboard_state()
-            .task_details_open
-            .then(|| {
-                let selected = self.interaction.selected_task();
-                let body = selected
-                    .map(|task_id| self.task_row_label(task_id))
-                    .unwrap_or_else(|| "No task selected".to_string());
-                div()
-                    .id("native-shell-task-details")
-                    .w_full()
-                    .p(px(metrics.control_padding as f32))
-                    .bg(tokens.surfaces.raised.to_gpui())
-                    .child(format!("Task details · {body}"))
+            .selected_task()
+            .map(|task_id| self.task_row_label(task_id))
+            .unwrap_or_else(|| "No task selected".to_string());
+        Some(Self::stacked_panel(
+            "native-shell-task-details",
+            "Task details",
+            tokens,
+            Self::panel_body(tokens, div().child(body).into_any_element()),
+        ))
+    }
+
+    /// Grab width of a pane rail. Wider than the hairline it draws, because a
+    /// one-pixel drag target is the difference between a resizable window and
+    /// a frustrating one.
+    const RAIL_THICKNESS: f32 = 6.0;
+    /// A collapsed terminal keeps its header so it can be reopened from where
+    /// it was closed rather than from a menu.
+    const COLLAPSED_TERMINAL_HEIGHT: f32 = Self::PANEL_HEADER_HEIGHT + 2.0;
+
+    /// Height of the workspace row for a given viewport. The terminal strip is
+    /// a sized sibling, and a grown row starves it, so the row is measured from
+    /// the window rather than from leftover flex space.
+    fn workspace_row_height(
+        tokens: crate::ui::tokens::ThemeTokens,
+        viewport: Size<Pixels>,
+        layout: WorkspaceLayout,
+    ) -> Pixels {
+        let terminal = if layout.terminal_collapsed {
+            Self::COLLAPSED_TERMINAL_HEIGHT
+        } else {
+            layout.terminal_height
+        };
+        let chrome = Self::HEADER_HEIGHT
+            + tokens.density.spacing.lg * 2.0
+            + terminal
+            + tokens.density.spacing.md;
+        px((f32::from(viewport.height) - chrome).max(Self::MIN_WORKSPACE_ROW_HEIGHT))
+    }
+
+    /// A draggable pane edge. Dormant it is a hairline that reads as the seam
+    /// between two panes; on hover it thickens into the accent so the affordance
+    /// is discoverable without a tooltip. Double-click restores the default.
+    fn pane_rail(
+        &self,
+        edge: PaneEdge,
+        tokens: crate::ui::tokens::ThemeTokens,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let (id, vertical): (&'static str, bool) = match edge {
+            PaneEdge::Sidebar => ("native-shell-rail-sidebar", true),
+            PaneEdge::Inbox => ("native-shell-rail-inbox", true),
+            PaneEdge::Dock => ("native-shell-rail-dock", true),
+            PaneEdge::Terminal => ("native-shell-rail-terminal", false),
+        };
+        let dragging = self
+            .pane_drag
+            .map(|drag| drag.edge == edge)
+            .unwrap_or(false);
+        let line_color = if dragging {
+            tokens.borders.focus
+        } else {
+            tokens.borders.subtle
+        };
+        let rail = div()
+            .id(id)
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |shell, event: &MouseDownEvent, _window, cx| {
+                    cx.stop_propagation();
+                    if event.click_count >= 2 {
+                        shell.reset_pane(edge);
+                    } else {
+                        shell.begin_pane_drag(edge, event.position);
+                    }
+                    cx.notify();
+                }),
+            )
+            .child({
+                let line = div().flex_none().bg(line_color.to_gpui());
+                if vertical {
+                    line.w(px(1.0)).h_full().into_any_element()
+                } else {
+                    line.h(px(1.0)).w_full().into_any_element()
+                }
             });
-        let prompt_composer = self.prompt_library_surface(tokens);
-        let context_dock = div()
-            .id("native-shell-context-dock")
-            .w_full()
-            .child(self.context_dock_surface(tokens, None));
-        let terminal = div()
-            .id("native-shell-terminal-dock")
-            .w_full()
-            .flex_grow()
-            .bg(tokens.surfaces.sunken.to_gpui())
-            .child(self.terminal.element());
-        let config_sidebar = self.config_sidebar.surface(tokens);
-        let main_content = div()
+        let rail = if vertical {
+            rail.w(px(Self::RAIL_THICKNESS))
+                .h_full()
+                .cursor_col_resize()
+        } else {
+            rail.h(px(Self::RAIL_THICKNESS))
+                .w_full()
+                .cursor_row_resize()
+        };
+        rail.hover(|style| style.bg(tokens.borders.focus.to_gpui()))
+            .into_any_element()
+    }
+
+    /// The non-interactive stand-in used by the projection-only render path,
+    /// which has no listener context to attach a drag to.
+    fn pane_rail_static(vertical: bool, tokens: crate::ui::tokens::ThemeTokens) -> AnyElement {
+        let rail = div().flex_none().bg(tokens.borders.subtle.to_gpui());
+        if vertical {
+            rail.w(px(1.0)).h_full().into_any_element()
+        } else {
+            rail.h(px(1.0)).w_full().into_any_element()
+        }
+    }
+
+    fn begin_pane_drag(&mut self, edge: PaneEdge, position: Point<Pixels>) {
+        self.pane_drag = Some(PaneDrag {
+            edge,
+            origin: position,
+            start_value: self.layout.value(edge),
+        });
+    }
+
+    /// Apply a pointer position to the in-flight drag. Returns whether the
+    /// stored geometry actually moved, so the caller can skip a repaint for
+    /// sub-pixel jitter and for movement past a clamp.
+    fn update_pane_drag(&mut self, position: Point<Pixels>) -> bool {
+        let Some(drag) = self.pane_drag else {
+            return false;
+        };
+        let delta = match drag.edge {
+            PaneEdge::Sidebar | PaneEdge::Inbox => f32::from(position.x) - f32::from(drag.origin.x),
+            // The dock is anchored right and the terminal bottom, so their
+            // edges grow against the pointer's direction of travel.
+            PaneEdge::Dock => f32::from(drag.origin.x) - f32::from(position.x),
+            PaneEdge::Terminal => f32::from(drag.origin.y) - f32::from(position.y),
+        };
+        let before = self.layout.value(drag.edge);
+        self.layout.set_value(drag.edge, drag.start_value + delta);
+        // A drag past a pane's floor must not silently uncollapse it.
+        (self.layout.value(drag.edge) - before).abs() > f32::EPSILON
+    }
+
+    fn end_pane_drag(&mut self) -> bool {
+        if self.pane_drag.take().is_none() {
+            return false;
+        }
+        self.persist_layout();
+        true
+    }
+
+    fn reset_pane(&mut self, edge: PaneEdge) {
+        self.pane_drag = None;
+        self.layout.reset(edge);
+        self.persist_layout();
+    }
+
+    fn toggle_pane(&mut self, edge: PaneEdge) {
+        self.pane_drag = None;
+        self.layout.toggle(edge);
+        self.persist_layout();
+    }
+
+    /// Restore the shipped geometry without discarding where the window is.
+    /// A layout the user cannot recover from is a layout they will not touch.
+    fn reset_layout(&mut self) {
+        self.pane_drag = None;
+        let window = self.layout.window;
+        self.layout = WorkspaceLayout {
+            window,
+            ..WorkspaceLayout::default()
+        };
+        self.persist_layout();
+    }
+
+    /// Track where the user left the window. Bounds are observed continuously
+    /// while a drag is in progress, so the frame is kept in memory and written
+    /// at most once per interval; a resize must not become a write storm.
+    fn record_window_frame(&mut self, window: &Window) {
+        let (bounds, maximized) = match window.window_bounds() {
+            WindowBounds::Windowed(bounds) => (bounds, false),
+            WindowBounds::Maximized(bounds) => (bounds, true),
+            // A fullscreen frame is not a window position the user chose, so
+            // restoring it would strand the next launch with no chrome.
+            WindowBounds::Fullscreen(_) => return,
+        };
+        let frame = WindowFrame {
+            x: f32::from(bounds.origin.x),
+            y: f32::from(bounds.origin.y),
+            width: f32::from(bounds.size.width),
+            height: f32::from(bounds.size.height),
+            maximized,
+        };
+        if !frame.is_usable() || self.layout.window == Some(frame) {
+            return;
+        }
+        self.layout.window = Some(frame);
+        let now = Instant::now();
+        let due = self
+            .last_window_persist
+            .map(|last| now.duration_since(last) >= WINDOW_FRAME_PERSIST_INTERVAL)
+            .unwrap_or(true);
+        if due {
+            self.last_window_persist = Some(now);
+            self.persist_layout();
+        }
+    }
+
+    /// Persist the chosen geometry. A view preference is never worth failing a
+    /// session over, so a store that refuses the write leaves the in-memory
+    /// layout intact and the window usable.
+    fn persist_layout(&self) {
+        if let Err(error) = self.layout_store.save(self.layout) {
+            eprintln!(
+                "devmanager: workspace layout not persisted ({}): {error}",
+                self.layout_store.path().display()
+            );
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn main_column(
+        &self,
+        tokens: crate::ui::tokens::ThemeTokens,
+        inbox: AnyElement,
+        dock: AnyElement,
+        terminal: AnyElement,
+        workspace_height: Option<Pixels>,
+        layout: WorkspaceLayout,
+        rails: Option<(AnyElement, AnyElement, AnyElement)>,
+    ) -> AnyElement {
+        let (inbox_rail, dock_rail, terminal_rail) = match rails {
+            Some(rails) => rails,
+            None => (
+                Self::pane_rail_static(true, tokens),
+                Self::pane_rail_static(true, tokens),
+                Self::pane_rail_static(false, tokens),
+            ),
+        };
+        let workspace_row = div()
+            .id("native-shell-workspace-row")
+            .flex()
+            .min_h(px(0.0))
+            .min_w(px(0.0));
+        let workspace_row = match workspace_height {
+            Some(height) => workspace_row.flex_none().h(height),
+            None => workspace_row.flex_1(),
+        };
+        let show_dock = !layout.dock_collapsed;
+        div()
             .id("native-shell-main-content")
             .flex()
             .flex_col()
-            .flex_grow()
-            .child(inbox)
-            .children(details)
-            .child(prompt_composer)
+            .flex_1()
+            // Flex items default to `min-height: auto`, which would let the
+            // stacked panels grow past the window instead of clipping inside
+            // this column.
+            .min_h(px(0.0))
+            .min_w(px(0.0))
+            .overflow_hidden()
+            .gap(px(tokens.density.spacing.sm))
+            .p(px(tokens.density.spacing.lg))
             .child(
-                self.cockpit
-                    .conversation_surface(tokens, self.composer.as_ref()),
+                workspace_row
+                    .child(
+                        div()
+                            .id("native-shell-inbox-column")
+                            .flex()
+                            .flex_col()
+                            .flex_none()
+                            .w(px(layout.inbox_width))
+                            .h_full()
+                            .min_h(px(0.0))
+                            .child(inbox),
+                    )
+                    .child(inbox_rail)
+                    .child(
+                        div()
+                            .id("native-shell-center-column")
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_h(px(0.0))
+                            .min_w(px(0.0))
+                            .gap(px(tokens.density.spacing.md))
+                            .child(Self::stacked_panel_grow(
+                                "native-shell-conversation-panel",
+                                "Conversation",
+                                tokens,
+                                self.cockpit
+                                    .conversation_surface(tokens, self.composer.as_ref())
+                                    .into_any_element(),
+                            ))
+                            .child(
+                                // Reference data, not the primary surface: it
+                                // keeps its natural height only up to a cap so
+                                // it can never crush the conversation above it.
+                                div()
+                                    .flex()
+                                    .flex_none()
+                                    .flex_col()
+                                    .max_h(px(200.0))
+                                    .overflow_hidden()
+                                    .child(Self::stacked_panel(
+                                        "native-shell-prompt-panel",
+                                        "Prompt library",
+                                        tokens,
+                                        self.prompt_library_surface(tokens),
+                                    )),
+                            ),
+                    )
+                    .children(show_dock.then_some(dock_rail))
+                    .children(show_dock.then(|| {
+                        div()
+                            .id("native-shell-dock-column")
+                            .flex()
+                            .flex_col()
+                            .flex_none()
+                            .w(px(layout.dock_width))
+                            .min_h(px(0.0))
+                            .gap(px(tokens.density.spacing.md))
+                            .children(self.task_details_panel(tokens))
+                            .child(dock)
+                    })),
             )
-            .child(context_dock)
-            .child(terminal);
-        let content = div()
-            .id("native-shell-content")
+            .child(terminal_rail)
+            .child(terminal)
+            .into_any_element()
+    }
+
+    /// Header for the terminal strip. The strip carries the terminal palette
+    /// rather than panel chrome, so its header cannot borrow the panel header's
+    /// surface colors without losing contrast.
+    fn terminal_header(tokens: crate::ui::tokens::ThemeTokens, collapsed: bool) -> AnyElement {
+        div()
+            .w_full()
             .flex()
-            .flex_grow()
-            .child(config_sidebar)
-            .child(main_content);
+            .flex_none()
+            .items_center()
+            .gap(px(tokens.density.spacing.sm))
+            .h(px(Self::PANEL_HEADER_HEIGHT))
+            .px(px(tokens.density.spacing.lg))
+            .border_b(px(1.0))
+            .border_color(tokens.terminal.selection.to_gpui())
+            .text_size(px(tokens.density.typography.caption))
+            .line_height(px(tokens.density.typography.caption_line_height))
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(tokens.terminal.bright_white.to_gpui())
+            .child("TERMINAL")
+            .child(
+                div()
+                    .flex_1()
+                    .text_color(tokens.terminal.bright_black.to_gpui())
+                    .font_weight(FontWeight::NORMAL)
+                    .truncate()
+                    .child(if collapsed {
+                        "hidden — Ctrl+J to reopen"
+                    } else {
+                        "drag the edge above to resize · Ctrl+J to hide"
+                    }),
+            )
+            .into_any_element()
+    }
+
+    /// Terminal strip beneath the workspace row. Its height is user-owned and
+    /// persisted, and it can be collapsed to its header so an idle terminal
+    /// never claims the majority of a tall window.
+    fn terminal_panel(
+        &self,
+        tokens: crate::ui::tokens::ThemeTokens,
+        layout: WorkspaceLayout,
+    ) -> AnyElement {
+        let collapsed = layout.terminal_collapsed;
+        let height = if collapsed {
+            Self::COLLAPSED_TERMINAL_HEIGHT
+        } else {
+            layout.terminal_height.max(Self::COLLAPSED_TERMINAL_HEIGHT)
+        };
+        let panel = div()
+            .id("native-shell-terminal-dock")
+            .w_full()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .h(px(height))
+            .min_h(px(0.0))
+            .overflow_hidden()
+            .bg(tokens.terminal.background.to_gpui())
+            .border(px(1.0))
+            .border_color(tokens.borders.subtle.to_gpui())
+            .rounded(px(tokens.density.radii.lg))
+            .shadow_sm()
+            .child(Self::terminal_header(tokens, collapsed));
+        if collapsed {
+            return panel.into_any_element();
+        }
+        panel
+            .child(
+                div()
+                    .w_full()
+                    .flex_grow()
+                    .min_h(px(0.0))
+                    .overflow_hidden()
+                    .px(px(tokens.density.spacing.lg))
+                    .py(px(tokens.density.spacing.md))
+                    .text_size(px(tokens.density.typography.code))
+                    .line_height(px(tokens.density.typography.code_line_height))
+                    .text_color(tokens.terminal.foreground.to_gpui())
+                    .child(self.terminal.element()),
+            )
+            .into_any_element()
+    }
+
+    fn sidebar(
+        &self,
+        tokens: crate::ui::tokens::ThemeTokens,
+        width: f32,
+        add_project: Option<AnyElement>,
+    ) -> AnyElement {
+        div()
+            .id("native-shell-sidebar")
+            .flex()
+            .flex_none()
+            .w(px(width))
+            .h_full()
+            .overflow_hidden()
+            .flex_col()
+            .child(self.config_sidebar.surface(tokens))
+            .children(add_project)
+            .into_any_element()
+    }
+
+    fn element_body(&self, task_rows: Vec<AnyElement>) -> impl IntoElement {
+        let tokens = self.preferences.tokens();
+        let layout = self.layout.sanitized();
+        let stage = self.shell_stage();
+        if stage != ShellStage::Cockpit {
+            return div()
+                .id("native-shell-root")
+                .size_full()
+                .track_focus(&self.focus_handle)
+                .flex()
+                .flex_col()
+                .bg(tokens.surfaces.raised.to_gpui())
+                .text_size(px(tokens.density.typography.body))
+                .line_height(px(tokens.density.typography.body_line_height))
+                .text_color(tokens.text.primary.to_gpui())
+                .child(self.header_bar(tokens, None, None, None))
+                .child(
+                    div()
+                        .id("native-shell-content")
+                        .flex()
+                        .flex_1()
+                        .min_h(px(0.0))
+                        .overflow_hidden()
+                        .child(self.setup_shell_content(stage, tokens, layout, None, None)),
+                )
+                .into_any_element();
+        }
+        let inbox_body = if task_rows.is_empty() {
+            Self::inbox_empty_state(tokens, None)
+        } else {
+            div()
+                .id("native-shell-task-inbox-rows")
+                .w_full()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h(px(0.0))
+                .overflow_hidden()
+                .children(task_rows)
+                .into_any_element()
+        };
+        let inbox =
+            Self::stacked_panel_grow("native-shell-task-inbox", "Task inbox", tokens, inbox_body);
+        let dock = Self::stacked_panel_grow(
+            "native-shell-context-dock",
+            self.cockpit.active_tool().label(),
+            tokens,
+            self.context_dock_surface(tokens, None),
+        );
+        let show_sidebar = !layout.sidebar_collapsed;
         div()
             .id("native-shell-root")
             .size_full()
             .track_focus(&self.focus_handle)
+            .flex()
             .flex_col()
-            .bg(tokens.surfaces.canvas.to_gpui())
+            .bg(tokens.surfaces.raised.to_gpui())
+            .text_size(px(tokens.density.typography.body))
+            .line_height(px(tokens.density.typography.body_line_height))
             .text_color(tokens.text.primary.to_gpui())
-            .child(toolbar)
-            .child(content)
+            .child(self.header_bar(tokens, None, None, None))
+            .child(
+                div()
+                    .id("native-shell-content")
+                    .flex()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .overflow_hidden()
+                    .children(
+                        show_sidebar.then(|| self.sidebar(tokens, layout.sidebar_width, None)),
+                    )
+                    .children(show_sidebar.then(|| Self::pane_rail_static(true, tokens)))
+                    .child(self.main_column(
+                        tokens,
+                        inbox,
+                        dock,
+                        self.terminal_panel(tokens, layout),
+                        None,
+                        layout,
+                        None,
+                    )),
+            )
+            .into_any_element()
     }
 
-    fn element_with_handlers(&mut self, cx: &Context<Self>) -> impl IntoElement {
+    fn element_with_handlers(
+        &mut self,
+        viewport: Size<Pixels>,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
         let tokens = self.preferences.tokens();
-        let metrics = tokens.density.physical();
         let task_ids = Arc::new(self.task_list.task_ids().to_vec());
-        let task_labels = Arc::new(
+        let row_models = Arc::new(
             task_ids
                 .iter()
-                .map(|task_id| (*task_id, self.task_row_label(*task_id)))
+                .map(|task_id| {
+                    (
+                        *task_id,
+                        (
+                            self.task_row_title(*task_id),
+                            self.task_row_detail(*task_id),
+                            Self::status_tone(self.task_row_status(*task_id), tokens),
+                        ),
+                    )
+                })
                 .collect::<std::collections::HashMap<_, _>>(),
         );
+        let selected_task = self.interaction.selected_task();
+        let row_height = Self::inbox_row_height(tokens);
+        let inbox_is_empty = task_ids.is_empty();
         let shell_entity = cx.entity().downgrade();
         let services_shell_entity = shell_entity.clone();
         let task_list_element = uniform_list(
@@ -8174,10 +10896,15 @@ impl NativeShell {
                         let shell_for_mouse = shell_entity.clone();
                         let shell_for_mouse_up = shell_entity.clone();
                         let shell_for_key = shell_entity.clone();
-                        let row_label = task_labels
-                            .get(&task_id)
-                            .cloned()
-                            .unwrap_or_else(|| format!("Task {task_id}"));
+                        let (row_title, row_detail, row_tone) =
+                            row_models.get(&task_id).cloned().unwrap_or_else(|| {
+                                (
+                                    format!("Task {task_id}"),
+                                    "Unprojected".to_string(),
+                                    tokens.status.inactive,
+                                )
+                            });
+                        let row_selected = selected_task == Some(task_id);
                         let mouse_handler =
                             move |event: &MouseDownEvent,
                                   window: &mut Window,
@@ -8190,15 +10917,7 @@ impl NativeShell {
                                             .interaction
                                             .navigation_mouse_down(task_id, &shell.task_list);
                                         shell.sync_cockpit_follow();
-                                        shell.accessibility_tree =
-                                            AccessibilityTree::for_task_list_with_header(
-                                                &shell.task_list,
-                                                shell.interaction.selected_task(),
-                                                &shell.header_attachment,
-                                            );
-                                        shell
-                                            .platform_accessibility
-                                            .sync(&shell.accessibility_tree);
+                                        shell.refresh_accessibility_tree();
                                     }
                                 });
                             };
@@ -8222,27 +10941,37 @@ impl NativeShell {
                                             .interaction
                                             .navigation_mouse_down(task_id, &shell.task_list);
                                         shell.sync_cockpit_follow();
-                                        shell.accessibility_tree =
-                                            AccessibilityTree::for_task_list_with_header(
-                                                &shell.task_list,
-                                                shell.interaction.selected_task(),
-                                                &shell.header_attachment,
-                                            );
-                                        shell
-                                            .platform_accessibility
-                                            .sync(&shell.accessibility_tree);
+                                        shell.refresh_accessibility_tree();
                                     });
                                 }
                             };
-                        div()
+                        let row = div()
                             .id(stable_task_element_id(task_id))
                             .tab_stop(true)
                             .w_full()
-                            .h(px(metrics.row_height as f32))
-                            .p(px(metrics.row_padding as f32))
-                            .border_b_1()
-                            .border_color(tokens.borders.subtle.to_gpui())
-                            .whitespace_normal()
+                            .h(px(row_height))
+                            .flex()
+                            .items_center()
+                            .gap(px(tokens.density.spacing.sm))
+                            .px(px(tokens.density.spacing.md))
+                            .border_l(px(2.0))
+                            .cursor_pointer();
+                        // Selection is carried by fill plus an accent edge, and
+                        // the same row still states its status in text, so the
+                        // list never depends on color alone.
+                        let row = if row_selected {
+                            row.bg(tokens.surfaces.selection.to_gpui())
+                                .border_color(tokens.borders.selection.to_gpui())
+                        } else {
+                            row.border_color(tokens.surfaces.raised.to_gpui())
+                                .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
+                        };
+                        let title_color = if row_selected {
+                            tokens.text.on_selection.to_gpui()
+                        } else {
+                            tokens.text.primary.to_gpui()
+                        };
+                        row
                             // Capture every button at the row boundary so a
                             // right/middle click cannot fall through to the
                             // terminal dock behind the list. The handler
@@ -8251,12 +10980,42 @@ impl NativeShell {
                             .capture_any_mouse_down(mouse_handler)
                             .capture_any_mouse_up(mouse_up_handler)
                             .on_key_down(key_handler)
-                            .child(row_label)
+                            .child(Self::tone_dot(row_tone, 8.0))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .flex_grow()
+                                    .overflow_hidden()
+                                    .child(
+                                        div()
+                                            .text_size(px(tokens.density.typography.body))
+                                            .line_height(px(tokens
+                                                .density
+                                                .typography
+                                                .body_line_height))
+                                            .text_color(title_color)
+                                            .truncate()
+                                            .child(row_title),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(tokens.density.typography.caption))
+                                            .line_height(px(tokens
+                                                .density
+                                                .typography
+                                                .caption_line_height))
+                                            .text_color(tokens.text.secondary.to_gpui())
+                                            .truncate()
+                                            .child(row_detail),
+                                    ),
+                            )
                             .into_any_element()
                     })
                     .collect::<Vec<_>>()
             },
         )
+        .h_full()
         .track_scroll(self.task_scroll_handle.clone());
 
         let terminal_down = cx.listener(|shell, event: &MouseDownEvent, window, cx| {
@@ -8287,18 +11046,13 @@ impl NativeShell {
         let scroll_handle = self.task_scroll_handle.clone();
         let inbox_scroll = cx.listener(move |shell, event: &ScrollWheelEvent, _window, cx| {
             cx.stop_propagation();
-            let delta = event.delta.pixel_delta(px(metrics.row_height as f32)).y;
+            let delta = event.delta.pixel_delta(px(row_height)).y;
             let scroll_state = scroll_handle.0.borrow_mut();
             let offset = scroll_state.base_handle.offset();
             scroll_state
                 .base_handle
                 .set_offset(point(offset.x, offset.y - delta));
-            shell.accessibility_tree = AccessibilityTree::for_task_list_with_header(
-                &shell.task_list,
-                shell.interaction.selected_task(),
-                &shell.header_attachment,
-            );
-            shell.platform_accessibility.sync(&shell.accessibility_tree);
+            shell.refresh_accessibility_tree();
         });
 
         let host_actions = cx.listener(|shell, _action: &HostActions, _window, cx| {
@@ -8349,16 +11103,7 @@ impl NativeShell {
         });
         let task_create = cx.listener(|shell, _action: &TaskCreate, _window, cx| {
             cx.stop_propagation();
-            shell.dispatch_action(ActionRequest::TaskCreate(
-                crate::client::action::TaskCreateArguments {
-                    task_id: TaskId::new(),
-                    environment_id: crate::domain::id::EnvironmentId::new(),
-                    title: "Native shell task".to_string(),
-                    description: None,
-                    project_id: crate::domain::id::ProjectId::new(),
-                    workspace: crate::domain::task::WorkspaceRef::Main,
-                },
-            ));
+            shell.begin_new_task();
         });
         let task_rename = cx.listener(|shell, _action: &TaskRename, _window, cx| {
             cx.stop_propagation();
@@ -8443,11 +11188,329 @@ impl NativeShell {
                 crate::ui::actions::ShortcutKey::Digit(7),
             ));
         });
+        let toggle_sidebar = cx.listener(|shell, _action: &NativeToggleSidebar, _window, cx| {
+            cx.stop_propagation();
+            shell.toggle_pane(PaneEdge::Sidebar);
+            cx.notify();
+        });
+        let toggle_dock = cx.listener(|shell, _action: &NativeToggleDock, _window, cx| {
+            cx.stop_propagation();
+            shell.toggle_pane(PaneEdge::Dock);
+            cx.notify();
+        });
+        let toggle_terminal = cx.listener(|shell, _action: &NativeToggleTerminal, _window, cx| {
+            cx.stop_propagation();
+            shell.toggle_pane(PaneEdge::Terminal);
+            cx.notify();
+        });
+        let reset_layout = cx.listener(|shell, _action: &NativeResetLayout, _window, cx| {
+            cx.stop_propagation();
+            shell.reset_layout();
+            cx.notify();
+        });
+
+        // The dock tools were previously reachable only through Alt+1..7. The
+        // tab strip gives the same seven tools a visible, clickable affordance
+        // and dispatches the identical keyboard action, so selection stays on
+        // one fenced path.
+        let active_tool = self.cockpit.active_tool();
+        let mut dock_tabs = div()
+            .id("native-shell-dock-tabs")
+            .w_full()
+            .flex()
+            .flex_none()
+            .flex_wrap()
+            .items_center()
+            .gap(px(tokens.density.spacing.xxs))
+            .p(px(tokens.density.spacing.sm))
+            .border_b(px(1.0))
+            .border_color(tokens.borders.subtle.to_gpui());
+        for (tool, element_id, digit) in NATIVE_DOCK_TABS {
+            let selected = tool == active_tool;
+            let tab = div()
+                .id(element_id)
+                .flex()
+                .items_center()
+                .h(px(24.0))
+                .px(px(tokens.density.spacing.sm))
+                .rounded(px(tokens.density.radii.sm))
+                .text_size(px(tokens.density.typography.caption))
+                .line_height(px(tokens.density.typography.caption_line_height))
+                .cursor_pointer()
+                .child(tool.label());
+            let tab = if selected {
+                tab.bg(tokens.actions.primary.default.background.to_gpui())
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(tokens.actions.primary.default.foreground.to_gpui())
+            } else {
+                tab.text_color(tokens.text.muted.to_gpui())
+                    .hover(|style| style.bg(tokens.surfaces.raised.to_gpui()))
+            };
+            dock_tabs = dock_tabs.child(tab.on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |shell, _event: &MouseDownEvent, _window, cx| {
+                    cx.stop_propagation();
+                    shell.dispatch_keyboard(KeyboardShortcut::alt(
+                        crate::ui::actions::ShortcutKey::Digit(digit),
+                    ));
+                }),
+            ));
+        }
+        let dock_panel = div()
+            .id("native-shell-context-dock")
+            .w_full()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h(px(0.0))
+            .overflow_hidden()
+            // Same card chrome as every other panel: the dock differing by a
+            // surface and a radius made it read as a different application.
+            .bg(tokens.surfaces.overlay.to_gpui())
+            .border(px(1.0))
+            .border_color(tokens.borders.subtle.to_gpui())
+            .rounded(px(tokens.density.radii.lg))
+            .shadow_sm()
+            .child(dock_tabs)
+            .child(self.context_dock_surface(tokens, Some(services_shell_entity)))
+            .into_any_element();
+
+        let inbox_empty_action = div()
+            .flex()
+            .gap(px(tokens.density.spacing.sm))
+            .child(
+                Button::new("native-inbox-add-project")
+                    .label("Add project")
+                    .ghost()
+                    .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
+                        cx.stop_propagation();
+                        shell.begin_choose_folder(cx);
+                        cx.notify();
+                    })),
+            )
+            .child(
+                Button::new("native-inbox-new-task")
+                    .label("New task")
+                    .primary()
+                    .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
+                        cx.stop_propagation();
+                        shell.begin_new_task();
+                        cx.notify();
+                    })),
+            )
+            .into_any_element();
+        let inbox_panel = Self::stacked_panel_grow(
+            "native-shell-task-inbox",
+            "Task inbox",
+            tokens,
+            if inbox_is_empty {
+                Self::inbox_empty_state(tokens, Some(inbox_empty_action))
+            } else {
+                div()
+                    .id("native-shell-task-inbox-rows")
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    // The list still needs a floor so a short column keeps a
+                    // usable number of rows rather than collapsing to nothing.
+                    .min_h(px(row_height * DEFAULT_VISIBLE_ROWS as f32))
+                    .overflow_hidden()
+                    .on_scroll_wheel(inbox_scroll)
+                    .child(task_list_element)
+                    .into_any_element()
+            },
+        );
+
+        let host_status_control = div()
+            .id("native-shell-host-status-hit")
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|shell, _event: &MouseDownEvent, _window, cx| {
+                    cx.stop_propagation();
+                    shell.interaction.begin_control_pointer(NATIVE_POINTER_ID);
+                }),
+            )
+            .child(
+                Button::new("native-shell-host-status")
+                    .label("Host status")
+                    .info()
+                    .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
+                        cx.stop_propagation();
+                        shell.dispatch_pointer_action(ActionRequest::HostStatus, NATIVE_POINTER_ID);
+                    })),
+            )
+            .into_any_element();
+
+        let layout = self
+            .layout
+            .fitted(f32::from(viewport.width), f32::from(viewport.height));
+        let stage = self.shell_stage();
+        let show_sidebar = !layout.sidebar_collapsed && stage == ShellStage::Cockpit;
+        let pane_toggles = (stage == ShellStage::Cockpit).then(|| self.pane_toggles(tokens, cx));
+        let workspace_actions =
+            matches!(stage, ShellStage::FirstTask | ShellStage::Cockpit).then(|| {
+                div()
+                    .id("native-shell-workspace-actions")
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .gap(px(tokens.density.spacing.xs))
+                    .children(Self::shows_add_folder_chrome(stage).then(|| {
+                        Button::new("native-header-add-project")
+                            .label("Add project")
+                            .ghost()
+                            .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
+                                cx.stop_propagation();
+                                shell.begin_choose_folder(cx);
+                                cx.notify();
+                            }))
+                    }))
+                    .child(
+                        Button::new("native-header-new-task")
+                            .label("New task")
+                            .primary()
+                            .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
+                                cx.stop_propagation();
+                                shell.begin_new_task();
+                                cx.notify();
+                            })),
+                    )
+                    .into_any_element()
+            });
+        let setup_action = match stage {
+            ShellStage::Cockpit => None,
+            ShellStage::FirstTask => Some(Self::primary_action_button(
+                "native-setup-create-task",
+                "Create a task",
+                tokens,
+                cx,
+                |shell, _cx| shell.begin_new_task(),
+            )),
+            ShellStage::Welcome | ShellStage::Connecting | ShellStage::Recovery => {
+                Some(Self::primary_action_button(
+                    "native-setup-add-project",
+                    "Choose a folder",
+                    tokens,
+                    cx,
+                    NativeShell::begin_choose_folder,
+                ))
+            }
+        };
+        let setup_add_project = (stage == ShellStage::FirstTask
+            && Self::shows_add_folder_chrome(stage))
+        .then(|| {
+            div()
+                .id("native-config-add-project")
+                .w_full()
+                .flex_none()
+                .p(px(tokens.density.spacing.md))
+                .border_t(px(1.0))
+                .border_color(tokens.borders.subtle.to_gpui())
+                .child(
+                    Button::new("native-sidebar-add-project")
+                        .label("Add project")
+                        .ghost()
+                        .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
+                            cx.stop_propagation();
+                            shell.begin_choose_folder(cx);
+                            cx.notify();
+                        })),
+                )
+                .into_any_element()
+        });
+        let sidebar_rail = self.pane_rail(PaneEdge::Sidebar, tokens, cx);
+        let workspace_rails = (
+            self.pane_rail(PaneEdge::Inbox, tokens, cx),
+            self.pane_rail(PaneEdge::Dock, tokens, cx),
+            self.pane_rail(PaneEdge::Terminal, tokens, cx),
+        );
+        let terminal_element = {
+            let collapsed = layout.terminal_collapsed;
+            let panel = div()
+                .id("native-shell-terminal-dock")
+                .w_full()
+                .flex()
+                .flex_col()
+                .flex_none()
+                .h(px(if collapsed {
+                    Self::COLLAPSED_TERMINAL_HEIGHT
+                } else {
+                    layout.terminal_height.max(Self::COLLAPSED_TERMINAL_HEIGHT)
+                }))
+                .min_h(px(0.0))
+                .overflow_hidden()
+                .bg(tokens.terminal.background.to_gpui())
+                .border(px(1.0))
+                .border_color(tokens.borders.subtle.to_gpui())
+                .rounded(px(tokens.density.radii.lg))
+                .shadow_sm()
+                .capture_any_mouse_down(terminal_down)
+                .capture_any_mouse_up(terminal_up)
+                .child(Self::terminal_header(tokens, collapsed));
+            if collapsed {
+                panel.into_any_element()
+            } else {
+                panel
+                    .child(
+                        div()
+                            .w_full()
+                            .flex_grow()
+                            .min_h(px(0.0))
+                            .overflow_hidden()
+                            .px(px(tokens.density.spacing.lg))
+                            .py(px(tokens.density.spacing.md))
+                            .text_size(px(tokens.density.typography.code))
+                            .line_height(px(tokens.density.typography.code_line_height))
+                            .text_color(tokens.terminal.foreground.to_gpui())
+                            .child(self.terminal.element()),
+                    )
+                    .into_any_element()
+            }
+        };
 
         div()
             .id("native-shell-root")
+            // The root fills the client area rather than a measured viewport:
+            // the two differ by the window frame on Windows, and any shortfall
+            // paints as a transparent strip along the window edges.
             .size_full()
             .track_focus(&self.focus_handle)
+            .on_key_down(cx.listener(|shell, event: &KeyDownEvent, window, cx| {
+                if shell.handle_overlay_key(event, window, cx) {
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            }))
+            // A pane drag has to keep tracking once the pointer leaves the thin
+            // rail, so the move and release are owned by the root rather than by
+            // the handle that started them.
+            .on_mouse_move(cx.listener(|shell, event: &MouseMoveEvent, _window, cx| {
+                if shell.pane_drag.is_none() {
+                    return;
+                }
+                if shell.update_pane_drag(event.position) {
+                    cx.notify();
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|shell, _event: &MouseUpEvent, _window, cx| {
+                    if shell.end_pane_drag() {
+                        cx.notify();
+                    }
+                }),
+            )
+            // A release outside the window would otherwise leave the layout
+            // stuck to the pointer on the next hover.
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|shell, _event: &MouseUpEvent, _window, cx| {
+                    if shell.end_pane_drag() {
+                        cx.notify();
+                    }
+                }),
+            )
             .on_action::<HostActions>(host_actions)
             .on_action::<HostStatus>(host_status)
             .on_action::<NativeClientDetach>(client_detach)
@@ -8468,127 +11531,88 @@ impl NativeShell {
             .on_action::<NativeDockServices>(dock_services)
             .on_action::<NativeDockArtifacts>(dock_artifacts)
             .on_action::<NativeDockReview>(dock_review)
+            .on_action::<NativeToggleSidebar>(toggle_sidebar)
+            .on_action::<NativeToggleDock>(toggle_dock)
+            .on_action::<NativeToggleTerminal>(toggle_terminal)
+            .on_action::<NativeResetLayout>(reset_layout)
+            .flex()
             .flex_col()
-            .bg(tokens.surfaces.canvas.to_gpui())
+            .bg(tokens.surfaces.raised.to_gpui())
+            .text_size(px(tokens.density.typography.body))
+            .line_height(px(tokens.density.typography.body_line_height))
             .text_color(tokens.text.primary.to_gpui())
-            .child(
-                div()
-                    .id("native-shell-toolbar")
-                    .w_full()
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .gap(px(tokens.density.spacing.md))
-                    .p(px(metrics.control_padding as f32))
-                    .bg(tokens.surfaces.raised.to_gpui())
-                    .child(
-                        div()
-                            .id("native-shell-header-title")
-                            .text_size(px(18.0))
-                            .child("Task Cockpit"),
-                    )
-                    .child(
-                        div()
-                            .id("native-shell-header-attachment")
-                            .text_color(tokens.text.secondary.to_gpui())
-                            .whitespace_normal()
-                            .child(self.header_attachment.label()),
-                    )
-                    .child(
-                        div()
-                            .id("native-shell-header-detail")
-                            .text_color(tokens.text.secondary.to_gpui())
-                            .whitespace_normal()
-                            .child(self.header_attachment.detail()),
-                    )
-                    .child(
-                        div()
-                            .id("native-shell-host-status-hit")
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|shell, _event: &MouseDownEvent, _window, cx| {
-                                    cx.stop_propagation();
-                                    shell.interaction.begin_control_pointer(NATIVE_POINTER_ID);
-                                }),
-                            )
-                            .child(
-                                Button::new("native-shell-host-status")
-                                    .label("Host status")
-                                    .info()
-                                    .on_click(cx.listener(
-                                        |shell, _event: &ClickEvent, _window, cx| {
-                                            cx.stop_propagation();
-                                            shell.dispatch_pointer_action(
-                                                ActionRequest::HostStatus,
-                                                NATIVE_POINTER_ID,
-                                            );
-                                        },
-                                    )),
-                            ),
-                    )
-                    .child(self.host_status_text()),
-            )
+            .child(self.header_bar(
+                tokens,
+                (stage == ShellStage::Cockpit).then_some(host_status_control),
+                workspace_actions,
+                pane_toggles,
+            ))
             .child(
                 div()
                     .id("native-shell-content")
                     .flex()
-                    .flex_grow()
-                    .child(self.config_sidebar.surface(tokens))
-                    .child(
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .overflow_hidden()
+                    .children((stage == ShellStage::Cockpit).then(|| {
                         div()
-                            .id("native-shell-main-content")
+                            .id("native-shell-cockpit")
                             .flex()
-                            .flex_col()
-                            .flex_grow()
-                            .child(
-                                div()
-                                    .id("native-shell-task-inbox")
-                                    .w_full()
-                                    .flex_col()
-                                    .gap(px(tokens.density.spacing.xs))
-                                    .on_scroll_wheel(inbox_scroll)
-                                    .child(
+                            .flex_1()
+                            .min_h(px(0.0))
+                            .min_w(px(0.0))
+                            .overflow_hidden()
+                            .children(show_sidebar.then(|| {
+                                self.sidebar(
+                                    tokens,
+                                    layout.sidebar_width,
+                                    Some(
                                         div()
-                                            .id("native-task-inbox-label")
-                                            .text_color(tokens.text.secondary.to_gpui())
-                                            .child("Task Inbox"),
-                                    )
-                                    .child(task_list_element),
-                            )
-                            .children(self.interaction.keyboard_state().task_details_open.then(
-                                || {
-                                    let selected = self.interaction.selected_task();
-                                    let body = selected
-                                        .map(|task_id| self.task_row_label(task_id))
-                                        .unwrap_or_else(|| "No task selected".to_string());
-                                    div()
-                                        .id("native-shell-task-details")
-                                        .w_full()
-                                        .p(px(metrics.control_padding as f32))
-                                        .bg(tokens.surfaces.raised.to_gpui())
-                                        .child(format!("Task details · {body}"))
-                                },
+                                            .id("native-config-add-project")
+                                            .w_full()
+                                            .flex_none()
+                                            .p(px(tokens.density.spacing.md))
+                                            .border_t(px(1.0))
+                                            .border_color(tokens.borders.subtle.to_gpui())
+                                            .child(
+                                                Button::new("native-sidebar-add-project")
+                                                    .label("Add project")
+                                                    .ghost()
+                                                    .on_click(cx.listener(
+                                                        |shell, _event: &ClickEvent, _window, cx| {
+                                                            cx.stop_propagation();
+                                                            shell.begin_choose_folder(cx);
+                                                            cx.notify();
+                                                        },
+                                                    )),
+                                            )
+                                            .into_any_element(),
+                                    ),
+                                )
+                            }))
+                            .children(show_sidebar.then_some(sidebar_rail))
+                            .child(self.main_column(
+                                tokens,
+                                inbox_panel,
+                                dock_panel,
+                                terminal_element,
+                                Some(Self::workspace_row_height(tokens, viewport, layout)),
+                                layout,
+                                Some(workspace_rails),
                             ))
-                            .child(div().w_full().child(self.prompt_library_surface(tokens)))
-                            .child(
-                                self.cockpit
-                                    .conversation_surface(tokens, self.composer.as_ref()),
-                            )
-                            .child(div().id("native-shell-context-dock").w_full().child(
-                                self.context_dock_surface(tokens, Some(services_shell_entity)),
-                            ))
-                            .child(
-                                div()
-                                    .id("native-shell-terminal-dock")
-                                    .w_full()
-                                    .flex_grow()
-                                    .capture_any_mouse_down(terminal_down)
-                                    .capture_any_mouse_up(terminal_up)
-                                    .bg(tokens.surfaces.sunken.to_gpui())
-                                    .child(self.terminal.element()),
-                            ),
-                    ),
+                            .into_any_element()
+                    }))
+                    .children((stage != ShellStage::Cockpit).then(|| {
+                        self.setup_shell_content(
+                            stage,
+                            tokens,
+                            layout,
+                            setup_action,
+                            setup_add_project,
+                        )
+                    })),
             )
+            .children(self.render_overlays(tokens, viewport, cx))
     }
 
     pub fn dispatch_action_for_test(
@@ -8632,6 +11656,35 @@ impl NativeShell {
             NativeHostActionResult::Disconnected
             | NativeHostActionResult::QueueFull
             | NativeHostActionResult::Stale => Some(returned),
+        }
+    }
+
+    fn dispatch_related_actions(&mut self, requests: impl IntoIterator<Item = ActionRequest>) {
+        let mut reuse_handler = false;
+        for request in requests {
+            if self.action_lane_len() >= MAX_ACTION_LANE_RECORDS {
+                self.set_action_capacity_failure(request.id());
+                return;
+            }
+            let captured = if reuse_handler {
+                self.interaction.action_on_current_handler(request)
+            } else {
+                self.interaction.action(request)
+            };
+            let Some(record) = captured else {
+                continue;
+            };
+            if let NativeHostCommand::Browser(command) = record.command.clone() {
+                let _ = self.apply_browser_native_command(&command);
+                reuse_handler = true;
+                continue;
+            }
+            match self.enqueue_host_action(record) {
+                NativeHostActionResult::Queued => reuse_handler = true,
+                NativeHostActionResult::Disconnected
+                | NativeHostActionResult::QueueFull
+                | NativeHostActionResult::Stale => return,
+            }
         }
     }
 
@@ -8717,9 +11770,9 @@ impl NativeShell {
 
     fn host_status_text(&self) -> String {
         let base = match &self.host_state {
-            NativeHostState::Connected { .. } => "Connected · host".to_string(),
-            NativeHostState::Disconnected => "Disconnected · host".to_string(),
-            NativeHostState::Error { .. } => "Error · host".to_string(),
+            NativeHostState::Connected { .. } => "Connected".to_string(),
+            NativeHostState::Disconnected => "Disconnected".to_string(),
+            NativeHostState::Error { .. } => "Can't connect".to_string(),
         };
         let with_failure = self
             .last_action_failure
@@ -8727,16 +11780,25 @@ impl NativeShell {
             .map_or(base.clone(), |failure| {
                 format!("{base} · {}", failure.retry_message())
             });
-        match self.last_query_detail.as_ref() {
-            Some(detail) => format!("{with_failure} · {detail}"),
-            None => with_failure,
+        match (
+            self.last_action_failure.as_ref(),
+            self.last_query_detail.as_ref(),
+        ) {
+            (Some(_), Some(detail)) => format!("{with_failure} · {detail}"),
+            _ => with_failure,
         }
     }
 }
 
 impl Render for NativeShell {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.element_with_handlers(cx)
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The shell root takes explicit viewport pixels. A percentage size
+        // leaves the root laid out against indefinite available space, so it
+        // sizes to its own content and every full-width or bottom-anchored
+        // child resolves outside the visible window.
+        // `viewport_size` is already in the logical pixels the element tree is
+        // laid out in; GPUI scales the tree into device pixels itself.
+        self.element_with_handlers(window.viewport_size(), cx)
     }
 }
 
@@ -8808,6 +11870,32 @@ pub(crate) fn run_native_shell_with_runtime(
     )
 }
 
+/// Reopen where the user left the window, but only if that rectangle still
+/// overlaps a connected display. A frame stored on a monitor that is no longer
+/// attached would otherwise open the shell off-screen with no way back.
+fn restored_window_bounds(layout: WorkspaceLayout, cx: &mut App) -> WindowBounds {
+    let default = WindowBounds::centered(size(px(1_280.0), px(800.0)), cx);
+    let Some(frame) = layout.restorable_window() else {
+        return default;
+    };
+    let bounds = gpui::Bounds {
+        origin: point(px(frame.x), px(frame.y)),
+        size: size(px(frame.width), px(frame.height)),
+    };
+    let visible = cx
+        .displays()
+        .into_iter()
+        .any(|display| display.bounds().intersects(&bounds));
+    if !visible {
+        return default;
+    }
+    if frame.maximized {
+        WindowBounds::Maximized(bounds)
+    } else {
+        WindowBounds::Windowed(bounds)
+    }
+}
+
 fn launch_native_shell(
     profile: IsolatedDevProfile,
     host_runtime: Option<NativeHostRuntimeAttachment>,
@@ -8819,6 +11907,10 @@ fn launch_native_shell(
     );
     let error_slot = Rc::new(RefCell::new(None));
     let error_slot_for_app = Rc::clone(&error_slot);
+    // The window frame is restored from the same profile-scoped store the panes
+    // use, so a dev profile can never reopen on top of the installed app.
+    let stored_layout = WorkspaceLayoutStore::at_profile_root(profile.root()).load();
+    let window_title = profile.window_title();
     Application::new()
         .with_assets(AppAssets::new())
         .run(move |cx| {
@@ -8827,9 +11919,20 @@ fn launch_native_shell(
             let profile_for_window = profile.clone();
             let host_runtime_for_window = host_runtime;
             let host_state_for_window = host_state;
+            let window_bounds = restored_window_bounds(stored_layout, cx);
             let result = cx.open_window(
                 WindowOptions {
-                    window_bounds: Some(WindowBounds::centered(size(px(1_280.0), px(800.0)), cx)),
+                    window_bounds: Some(window_bounds),
+                    titlebar: Some(gpui::TitlebarOptions {
+                        title: Some(window_title.clone().into()),
+                        ..gpui::TitlebarOptions::default()
+                    }),
+                    // AccessKit's Windows subclass must be installed before the
+                    // HWND is made visible for the first time. GPUI normally
+                    // shows the window during construction, so create this
+                    // shell hidden and reveal it after install_window_observers
+                    // attaches the adapter below.
+                    show: false,
                     ..WindowOptions::default()
                 },
                 move |window, cx| {
@@ -8851,6 +11954,7 @@ fn launch_native_shell(
                     let _ = entity.update(cx, |shell, cx| {
                         shell.install_window_observers(window, cx);
                     });
+                    window.activate_window();
                     entity
                 },
             );
@@ -8955,13 +12059,15 @@ mod tests {
         NativeHostActionResult, NativeHostChildOwnership, NativeHostLaunchMode,
         NativeHostLaunchSpec, NativeHostProjection, NativeHostProjectionKind,
         NativeHostRuntimeEpochs, NativeHostRuntimePort, NativeHostWorkerCommand, NativeInteraction,
-        NativePlatformAccessibilityBridge, NativeShell, NativeShellMode, NativeShutdownDeadline,
-        OwnedChild, OwnedWorker, ReaperKind, TaskId, UpdateState, UpdaterStage,
+        NativeHeaderAttachment, NativePlatformAccessibilityBridge, NativeShell, NativeShellMode,
+        NativeShutdownDeadline, OverlayTextFieldPart, OwnedChild, OwnedWorker, PaletteItem,
+        ReaperKind, ShellStage, TaskId, UpdateState, UpdaterStage,
         MAX_ACTION_LANE_RECORDS, MAX_ACTION_OUTCOME_PROJECTIONS, MAX_HOST_PROJECTIONS,
         MAX_PENDING_HOST_ACTIONS, MAX_PENDING_PREFERENCES, MAX_RETAINED_CHILDREN,
         MAX_RETAINED_WORKERS, MAX_RETRY_HOST_ACTIONS, PRODUCTION_HOST_PROFILE,
     };
-    use gpui::AppContext;
+    use crate::ui::components::text_field::{TextField, TextFieldKey};
+    use gpui::{AppContext, KeyDownEvent, Keystroke};
     use std::collections::VecDeque;
     use std::path::PathBuf;
     use std::process::Command;
@@ -9122,10 +12228,31 @@ mod tests {
         }
     }
 
+    fn test_task_create_v2(title: &str) -> crate::ui::components::ActionRequest {
+        crate::ui::components::ActionRequest::TaskCreateV2(
+            crate::client::action::TaskCreateV2Arguments {
+                task_id: TaskId::new(),
+                environment_id: crate::domain::id::EnvironmentId::new(),
+                title: title.to_string(),
+                description: None,
+                project_id: crate::domain::id::ProjectId::new(),
+                workspace: crate::workspace::WorkspaceRequest::main(),
+            },
+        )
+    }
+
     fn with_test_shell_in_app<R>(
         cx: &mut gpui::App,
         runtime: TestRuntime,
         action: impl FnOnce(&mut NativeShell) -> R,
+    ) -> R {
+        with_test_shell_in_app_cx(cx, runtime, |shell, _cx| action(shell))
+    }
+
+    fn with_test_shell_in_app_cx<R>(
+        cx: &mut gpui::App,
+        runtime: TestRuntime,
+        action: impl FnOnce(&mut NativeShell, &mut gpui::Context<NativeShell>) -> R,
     ) -> R {
         let workspace = tempfile::tempdir().expect("workspace tempdir");
         let profile = isolated_dev_profile(workspace.path()).expect("isolated profile");
@@ -9137,7 +12264,7 @@ mod tests {
                 cx,
             )
         });
-        let value = entity.update(cx, |shell, _cx| action(shell));
+        let value = entity.update(cx, |shell, cx| action(shell, cx));
         drop(entity);
         value
     }
@@ -9171,6 +12298,290 @@ mod tests {
         assert!(std::fs::canonicalize(profile.host_config_base())
             .expect("canonical isolated config base")
             .starts_with(profile.workspace_root()));
+        assert!(
+            !profile.host_config_base().join("config.json").exists(),
+            "isolated bootstrap must not seed a configuration file"
+        );
+    }
+
+    #[test]
+    fn empty_shell_opens_a_setup_canvas_instead_of_the_cockpit() {
+        let _test_guard = HEADLESS_SHELL_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("headless shell test lock");
+        let completed = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let completed_for_app = std::rc::Rc::clone(&completed);
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            let (runtime, _) = TestRuntime::new(true, NativeHostActionResult::Queued);
+            let snapshot = with_test_shell_in_app(cx, runtime, |shell| {
+                let _ = shell.element_without_handlers();
+                (
+                    shell.shell_stage(),
+                    shell
+                        .accessibility_tree()
+                        .gpui_nodes()
+                        .into_iter()
+                        .map(|node| node.element_id)
+                        .collect::<Vec<_>>(),
+                )
+            });
+            *completed_for_app.borrow_mut() = Some(snapshot);
+            cx.quit();
+        });
+        let (stage, ids) = completed.borrow().clone().expect("setup canvas snapshot");
+        assert_eq!(
+            stage,
+            ShellStage::Welcome,
+            "an empty connected profile must open the welcome canvas, not the task cockpit"
+        );
+        assert!(
+            !ids.iter().any(|id| id == "native-task-inbox"),
+            "setup canvas must not advertise the task inbox"
+        );
+        assert!(
+            ids.iter().any(|id| id == "native-setup-add-project"),
+            "setup canvas must expose the first-run folder action"
+        );
+    }
+
+    #[test]
+    fn palette_add_project_says_project_not_folder() {
+        assert_eq!(PaletteItem::AddProject.title(), "Add project");
+        assert_eq!(
+            PaletteItem::AddProject.hint(),
+            "Choose a folder on this computer"
+        );
+    }
+
+    #[test]
+    fn choosing_a_folder_must_not_block_the_gpu_thread_with_rfd() {
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/ui/native_shell.rs"
+        ));
+        assert!(
+            !source.contains(concat!("rfd", "::")),
+            "native shell must not open a blocking native file dialog from a GPUI mouse handler"
+        );
+        assert!(
+            source.contains("prompt_for_paths"),
+            "native shell must defer folder picking through GPUI's platform prompt"
+        );
+    }
+
+    #[test]
+    fn applying_a_picked_folder_opens_the_name_overlay() {
+        let _test_guard = HEADLESS_SHELL_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("headless shell test lock");
+        let completed = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let completed_for_app = std::rc::Rc::clone(&completed);
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            let (runtime, _) = TestRuntime::new(true, NativeHostActionResult::Queued);
+            let snapshot = with_test_shell_in_app(cx, runtime, |shell| {
+                let folder = tempfile::tempdir().expect("picked folder parent");
+                let path = folder.path().join("my-app");
+                std::fs::create_dir(&path).expect("named folder");
+                shell.apply_picked_project_folder(path.clone());
+                (shell.add_project_overlay_for_test(), path)
+            });
+            *completed_for_app.borrow_mut() = Some(snapshot);
+            cx.quit();
+        });
+        let (overlay, path) = completed.borrow().clone().expect("picked folder overlay");
+        let (name, overlay_path) = overlay.expect("add-folder overlay after pick");
+        assert_eq!(name, "my-app");
+        assert_eq!(overlay_path, path.display().to_string());
+    }
+
+    #[test]
+    fn choose_folder_returns_before_a_path_is_applied() {
+        let _test_guard = HEADLESS_SHELL_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("headless shell test lock");
+        let completed = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let completed_for_app = std::rc::Rc::clone(&completed);
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            let (runtime, _) = TestRuntime::new(true, NativeHostActionResult::Queued);
+            let overlay = with_test_shell_in_app_cx(cx, runtime, |shell, cx| {
+                shell.begin_choose_folder(cx);
+                shell.add_project_overlay_for_test()
+            });
+            *completed_for_app.borrow_mut() = Some(overlay);
+            cx.quit();
+        });
+        assert_eq!(
+            completed.borrow().clone().expect("choose-folder snapshot"),
+            None,
+            "Choose a folder must return immediately; the name overlay opens after a path is picked"
+        );
+    }
+
+    #[test]
+    fn typing_replaces_the_prefilled_folder_name() {
+        let _test_guard = HEADLESS_SHELL_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("headless shell test lock");
+        let completed = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let completed_for_app = std::rc::Rc::clone(&completed);
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            let (runtime, _) = TestRuntime::new(true, NativeHostActionResult::Queued);
+            let snapshot = with_test_shell_in_app(cx, runtime, |shell| {
+                let folder = tempfile::tempdir().expect("picked folder parent");
+                let path = folder.path().join("command");
+                std::fs::create_dir(&path).expect("named folder");
+                shell.apply_picked_project_folder(path);
+                let selected = shell.add_project_name_is_selected_for_test();
+                let typed = shell.type_add_project_character_for_test('x');
+                (
+                    selected,
+                    typed,
+                    shell.add_project_overlay_for_test(),
+                )
+            });
+            *completed_for_app.borrow_mut() = Some(snapshot);
+            cx.quit();
+        });
+        let (selected, typed, overlay) = completed
+            .borrow()
+            .clone()
+            .expect("typed folder name");
+        assert!(selected, "prefilled folder name must start selected");
+        assert!(typed, "typing into the selected name must be accepted");
+        let (name, _) = overlay.expect("add-folder overlay");
+        assert_eq!(name, "x");
+    }
+
+    #[test]
+    fn first_task_does_not_repeat_the_folder_name() {
+        let _test_guard = HEADLESS_SHELL_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("headless shell test lock");
+        let completed = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let completed_for_app = std::rc::Rc::clone(&completed);
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            let (runtime, _) = TestRuntime::new(true, NativeHostActionResult::Queued);
+            let snapshot = with_test_shell_in_app(cx, runtime, |shell| {
+                shell.install_named_folder_for_test("command");
+                shell.sync_header_projection();
+                let header = match shell.header_attachment() {
+                    NativeHeaderAttachment::Projection { title, status, .. } => {
+                        (title.clone(), status.clone())
+                    }
+                    NativeHeaderAttachment::Unavailable { reason } => {
+                        (format!("unavailable:{reason}"), String::new())
+                    }
+                };
+                (
+                    shell.shell_stage(),
+                    header,
+                    shell.first_task_body_copy_for_test(),
+                )
+            });
+            *completed_for_app.borrow_mut() = Some(snapshot);
+            cx.quit();
+        });
+        let (stage, (title, status), body) = completed
+            .borrow()
+            .clone()
+            .expect("first-task copy snapshot");
+        assert_eq!(stage, ShellStage::FirstTask);
+        assert!(
+            !title.eq_ignore_ascii_case("command"),
+            "header must not restamp the folder name next to DevManager: {title:?}"
+        );
+        assert!(
+            !status.to_ascii_lowercase().contains("command"),
+            "header detail must not restamp the folder name: {status:?}"
+        );
+        assert!(
+            !body.to_ascii_lowercase().contains("command"),
+            "center copy must not restamp the folder name: {body:?}"
+        );
+    }
+
+    #[test]
+    fn first_task_stage_opens_the_name_overlay_once() {
+        let _test_guard = HEADLESS_SHELL_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("headless shell test lock");
+        let completed = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let completed_for_app = std::rc::Rc::clone(&completed);
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            let (runtime, _) = TestRuntime::new(true, NativeHostActionResult::Queued);
+            let snapshot = with_test_shell_in_app(cx, runtime, |shell| {
+                shell.install_named_folder_for_test("command");
+                shell.offer_first_task_if_needed();
+                let opened = shell.new_task_overlay_open_for_test();
+                shell.dispatch_named_accessibility_action("native-new-task-cancel");
+                shell.offer_first_task_if_needed();
+                (
+                    opened,
+                    shell.new_task_overlay_open_for_test(),
+                    shell.shell_stage(),
+                )
+            });
+            *completed_for_app.borrow_mut() = Some(snapshot);
+            cx.quit();
+        });
+        let (opened, reopened, stage) = completed
+            .borrow()
+            .clone()
+            .expect("first-task overlay snapshot");
+        assert_eq!(stage, ShellStage::FirstTask);
+        assert!(opened, "first-task must open Name this task once");
+        assert!(
+            !reopened,
+            "cancelling Name this task must not reopen it on the next offer"
+        );
+    }
+
+    #[test]
+    fn empty_focused_task_field_shows_a_caret_before_the_placeholder() {
+        let mut field = TextField::new("Task name").expect("task name field");
+        field.focus();
+        assert_eq!(
+            NativeShell::overlay_text_field_parts(&field),
+            vec![
+                OverlayTextFieldPart::Caret,
+                OverlayTextFieldPart::Placeholder,
+            ]
+        );
+        assert!(NativeShell::overlay_text_field_chrome(&field).show_focus_ring);
+    }
+
+    #[test]
+    fn first_task_does_not_show_add_folder() {
+        assert!(!NativeShell::shows_add_folder_chrome(ShellStage::FirstTask));
+        assert!(NativeShell::shows_add_folder_chrome(ShellStage::Cockpit));
+    }
+
+    #[test]
+    fn overlay_key_input_accepts_a_letter_without_key_char() {
+        let event = KeyDownEvent {
+            keystroke: Keystroke {
+                modifiers: gpui::Modifiers::default(),
+                key: "r".into(),
+                key_char: None,
+            },
+            is_held: false,
+        };
+        assert_eq!(
+            NativeShell::overlay_key_input(&event),
+            Some(TextFieldKey::Character('r'))
+        );
     }
 
     #[test]
@@ -9431,16 +12842,7 @@ mod tests {
         let (runtime, shared) = TestRuntime::new(false, NativeHostActionResult::Queued);
         let (original, accepted, failure) = with_test_shell_in_app(cx, runtime, |shell| {
             let returned = shell
-                .dispatch_action_for_test(crate::ui::components::ActionRequest::TaskCreate(
-                    crate::client::action::TaskCreateArguments {
-                        task_id: TaskId::new(),
-                        environment_id: crate::domain::id::EnvironmentId::new(),
-                        title: "durable admission".to_string(),
-                        description: None,
-                        project_id: crate::domain::id::ProjectId::new(),
-                        workspace: crate::domain::task::WorkspaceRef::Main,
-                    },
-                ))
+                .dispatch_action_for_test(test_task_create_v2("durable admission"))
                 .expect("disconnected admission returns exact record");
             let original = returned.clone();
             {
@@ -9483,14 +12885,14 @@ mod tests {
         let (original, retained, accepted, failure) =
             with_test_shell_in_app(cx, runtime, |shell| {
                 let _ = shell.dispatch_action_for_test(
-                    crate::ui::components::ActionRequest::TaskCreate(
-                        crate::client::action::TaskCreateArguments {
+                    crate::ui::components::ActionRequest::TaskCreateV2(
+                        crate::client::action::TaskCreateV2Arguments {
                             task_id: TaskId::new(),
                             environment_id: crate::domain::id::EnvironmentId::new(),
                             title: "uncertain execution".to_string(),
                             description: None,
                             project_id: crate::domain::id::ProjectId::new(),
-                            workspace: crate::domain::task::WorkspaceRef::Main,
+                            workspace: crate::workspace::WorkspaceRequest::main(),
                         },
                     ),
                 );
@@ -9547,18 +12949,7 @@ mod tests {
         let (runtime, shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
         let (original, retained, failure, recovered_failure, accepted) =
             with_test_shell_in_app(cx, runtime, |shell| {
-                let _ = shell.dispatch_action_for_test(
-                    crate::ui::components::ActionRequest::TaskCreate(
-                        crate::client::action::TaskCreateArguments {
-                            task_id: TaskId::new(),
-                            environment_id: crate::domain::id::EnvironmentId::new(),
-                            title: "failed execution".to_string(),
-                            description: None,
-                            project_id: crate::domain::id::ProjectId::new(),
-                            workspace: crate::domain::task::WorkspaceRef::Main,
-                        },
-                    ),
-                );
+                let _ = shell.dispatch_action_for_test(test_task_create_v2("failed execution"));
                 let original = shared
                     .lock()
                     .expect("test runtime state")
@@ -10618,6 +14009,141 @@ mod tests {
         );
     }
 
+    fn open_task_without_agent_client_model() -> (crate::client::ClientModel, TaskId) {
+        use crate::client::ClientModelBuilder;
+        use crate::domain::{
+            id::{EnvironmentId, ProjectId, SnapshotId},
+            snapshot::{SnapshotItem, SnapshotPage, SnapshotSection, TaskSnapshotItem},
+            task::{
+                ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity,
+                TaskFacts, TaskLifecycle, WorkspaceRef,
+            },
+        };
+
+        let uuid = |tail: u8| {
+            [
+                0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, tail,
+            ]
+        };
+        let task_id = TaskId::from_bytes(uuid(0xb1)).expect("task");
+        let snap = SnapshotId::from_bytes(uuid(0x20)).expect("snapshot");
+        let page = |section, items| SnapshotPage {
+            snapshot_id: snap,
+            through_sequence: 1,
+            section,
+            after_item: None,
+            items,
+            encoded_bytes: 1,
+            next_cursor: None,
+        };
+        let mut builder = ClientModelBuilder::new();
+        builder
+            .ingest_page(page(
+                SnapshotSection::Tasks,
+                vec![SnapshotItem::Task(TaskSnapshotItem {
+                    task: TaskFacts {
+                        id: task_id,
+                        environment_id: EnvironmentId::from_bytes(uuid(0x01)).expect("env"),
+                        title: "test".into(),
+                        description: None,
+                        project_id: ProjectId::from_bytes(uuid(0x02)).expect("project"),
+                        workspace: WorkspaceRef::Main,
+                        assignment: TaskAssignment::LocalOwner,
+                        lifecycle: TaskLifecycle::Open,
+                        action_epoch: 0,
+                        revision: 1,
+                        created_at_ms: 1,
+                    },
+                    connectivity: TaskConnectivity::Connected,
+                    attention: TaskAttention::None,
+                    activity: TaskActivity::Idle,
+                    review_readiness: ReviewReadiness::NotReady,
+                    primary_agent_id: None,
+                })],
+            ))
+            .expect("tasks");
+        builder
+            .ingest_page(page(SnapshotSection::AgentSessions, Vec::new()))
+            .expect("agents");
+        builder
+            .ingest_page(page(SnapshotSection::Artifacts, Vec::new()))
+            .expect("artifacts");
+        builder
+            .ingest_page(page(SnapshotSection::Resources, Vec::new()))
+            .expect("resources");
+        builder
+            .ingest_page(page(SnapshotSection::Operations, Vec::new()))
+            .expect("operations");
+        (builder.finish().expect("client model"), task_id)
+    }
+
+    fn created_task_is_listed_without_a_disconnect_or_missing_field(cx: &mut gpui::App) {
+        let (runtime, shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        let (model, task_id) = open_task_without_agent_client_model();
+        let report = with_test_shell_in_app(cx, runtime, |shell| {
+            shell.install_named_folder_for_test("command");
+            shell
+                .apply_client_model(Arc::new(model))
+                .expect("apply created task");
+            let list = crate::ui::task_cockpit::TaskList::from_client_model_virtual(
+                shell.client_model_snapshot().as_ref().unwrap(),
+            )
+            .expect("task list");
+            let _ = shell.interaction.navigation_mouse_down(task_id, &list);
+            shell.sync_cockpit_follow();
+            let accepted = shared.lock().expect("test runtime state").accepted.clone();
+            let cockpit_queries: Vec<_> = accepted
+                .iter()
+                .filter(|record| {
+                    matches!(
+                        record.command,
+                        super::NativeHostCommand::TaskCockpitQuery { .. }
+                    )
+                })
+                .cloned()
+                .collect();
+            let admissible = cockpit_queries
+                .iter()
+                .filter(|record| shell.interaction.accepts_action_record(record))
+                .count();
+            (
+                shell.task_row_title(task_id),
+                shell.shell_stage(),
+                shell.host_status_text(),
+                shell
+                    .cockpit()
+                    .conversation_hold_message()
+                    .unwrap_or("")
+                    .to_string(),
+                cockpit_queries.len(),
+                admissible,
+            )
+        });
+        assert_eq!(report.1, ShellStage::Cockpit);
+        assert_eq!(report.0, "test");
+        assert!(
+            report.4 >= 2,
+            "selecting a created task must refresh more than one cockpit surface, got {}",
+            report.4
+        );
+        assert_eq!(
+            report.5, report.4,
+            "every query in one cockpit refresh must stay admissible, {} of {} were",
+            report.5, report.4
+        );
+        assert!(
+            !report.2.contains("Can't connect"),
+            "a connected host must not paint a stale follow-up query as a disconnect: {}",
+            report.2
+        );
+        assert!(
+            !report.3.contains("missing field") && !report.3.contains("agent_session_id"),
+            "a new task without an agent must not fail closed on a developer field name: {}",
+            report.3
+        );
+    }
+
     fn terminal_bound_client_model() -> (crate::client::ClientModel, TaskId) {
         use crate::client::ClientModelBuilder;
         use crate::domain::{
@@ -10807,6 +14333,7 @@ mod tests {
         let completed_for_app = std::rc::Rc::clone(&completed);
         gpui::Application::headless().run(move |cx| {
             crate::ui::init(cx);
+            created_task_is_listed_without_a_disconnect_or_missing_field(cx);
             selected_task_follow_title_and_terminal_binding(cx);
             dock_shortcuts_and_open_task_details_bind_selection(cx);
             *completed_for_app.borrow_mut() = true;
