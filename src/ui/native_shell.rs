@@ -9841,7 +9841,7 @@ impl NativeShell {
                                     .child(if has_folder {
                                         "You can change the name. Nothing is added until you confirm."
                                     } else {
-                                        "Choose a project location on this computer. Nothing is added until you confirm."
+                                        "Choose a folder on this computer. Nothing is added until you confirm."
                                     }),
                             )
                             .child(
