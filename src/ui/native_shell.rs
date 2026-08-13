@@ -64,6 +64,7 @@ use crate::protocol::BrowserSecurityState;
 use crate::protocol::StreamFrame;
 use crate::protocol::{Capability, CapabilitySet, FrameLimits};
 use crate::remote::RemoteHostService;
+use crate::ui::agent_connection::settings_row_copy;
 use crate::ui::actions::{
     self, DockTool, HostActions, HostStatus, KeyboardAction, KeyboardModel, KeyboardShortcut,
     NativeDismissTransient, NativeDockArtifacts, NativeDockBrowser, NativeDockChanges,
@@ -5214,6 +5215,15 @@ pub struct AccessibilityTree {
 }
 
 impl AccessibilityTree {
+    fn header_settings_node() -> AccessibilityNode {
+        AccessibilityNode::new(
+            AccessibleRole::Button,
+            "Settings",
+            "Open agent sign-in settings.",
+        )
+        .gpui("native-header-settings", true, true)
+    }
+
     pub fn for_task_list(task_list: &TaskList, selected_task: Option<TaskId>) -> Self {
         let header = NativeHeaderAttachment::default();
         Self::for_task_list_with_header(task_list, selected_task, &header)
@@ -5273,20 +5283,23 @@ impl AccessibilityTree {
             "Actions are dispatched through the shared client action catalog.",
         )
         .gpui("native-shell-toolbar", false, false)
-        .with_children(vec![AccessibilityNode::new(
-            AccessibleRole::Status,
-            if header_label.is_empty() {
-                "DevManager".to_string()
-            } else {
-                header_label
-            },
-            if header_detail.is_empty() {
-                "Task inbox".to_string()
-            } else {
-                header_detail
-            },
-        )
-        .gpui("native-shell-header-attachment", false, false)]);
+        .with_children(vec![
+            AccessibilityNode::new(
+                AccessibleRole::Status,
+                if header_label.is_empty() {
+                    "DevManager".to_string()
+                } else {
+                    header_label
+                },
+                if header_detail.is_empty() {
+                    "Task inbox".to_string()
+                } else {
+                    header_detail
+                },
+            )
+            .gpui("native-shell-header-attachment", false, false),
+            Self::header_settings_node(),
+        ]);
         let terminal = AccessibilityNode::new(
             AccessibleRole::Status,
             "Terminal dock",
@@ -5394,6 +5407,13 @@ impl AccessibilityTree {
             },
         )
         .gpui("native-shell-header-attachment", false, false);
+        let toolbar = AccessibilityNode::new(
+            AccessibleRole::Region,
+            "DevManager header",
+            "Header actions including Settings.",
+        )
+        .gpui("native-shell-toolbar", false, false)
+        .with_children(vec![header_node, Self::header_settings_node()]);
         let canvas = AccessibilityNode::new(AccessibleRole::Region, title, detail)
             .gpui(canvas_id, false, false);
         let cta = AccessibilityNode::new(AccessibleRole::Button, cta_label, cta_description)
@@ -5404,7 +5424,7 @@ impl AccessibilityTree {
             "Get started with a folder on this computer.",
         )
         .gpui("native-shell-root", true, true)
-        .with_children(vec![header_node, canvas, cta]);
+        .with_children(vec![toolbar, canvas, cta]);
         Self {
             root,
             rendered_task_count: 0,
@@ -5833,6 +5853,7 @@ pub struct NativeShell {
     pane_drag: Option<PaneDrag>,
     last_window_persist: Option<Instant>,
     add_project: Option<AddProjectDraft>,
+    settings_open: bool,
     pending_folder_prompt: bool,
     first_task_overlay_offered: bool,
     new_task: Option<NewTaskDraft>,
@@ -6145,6 +6166,7 @@ impl NativeShell {
             pane_drag: None,
             last_window_persist: None,
             add_project: None,
+            settings_open: false,
             pending_folder_prompt: false,
             first_task_overlay_offered: false,
             new_task: None,
@@ -8542,6 +8564,10 @@ impl NativeShell {
     /// intentionally handed to the existing app/config navigation boundary;
     /// this method never edits `AppConfig` or opens a second ConfigStore.
     pub fn dispatch_config_sidebar_request(&mut self, request: ConfigSidebarActionRequest) -> bool {
+        if matches!(request, ConfigSidebarActionRequest::OpenSettings) {
+            self.settings_open = true;
+            return true;
+        }
         self.last_query_detail = Some(match request {
             ConfigSidebarActionRequest::SelectProject { config_id } => {
                 format!("Configuration project selected: {config_id}")
@@ -8561,7 +8587,7 @@ impl NativeShell {
             ConfigSidebarActionRequest::SelectProvider { provider } => {
                 format!("LLM provider selected: {}", provider.label())
             }
-            ConfigSidebarActionRequest::OpenSettings => "Configuration settings selected".into(),
+            ConfigSidebarActionRequest::OpenSettings => unreachable!("handled above"),
         });
         true
     }
@@ -8679,6 +8705,20 @@ impl NativeShell {
     }
 
     #[cfg(test)]
+    fn header_shows_settings_for_test(&mut self) -> bool {
+        let _ = self.element_without_handlers();
+        self.refresh_accessibility_tree();
+        self.accessibility_tree
+            .gpui_nodes()
+            .into_iter()
+            .any(|node| node.element_id == "native-header-settings")
+    }
+
+    #[cfg(test)]
+    fn settings_open_for_test(&self) -> bool {
+        self.settings_open
+    }
+
     fn add_project_overlay_for_test(&self) -> Option<(String, String)> {
         self.add_project
             .as_ref()
@@ -8888,8 +8928,26 @@ impl NativeShell {
             "native-add-project-cancel" => self.add_project = None,
             "native-new-task-submit" => self.submit_new_task(),
             "native-new-task-cancel" => self.new_task = None,
+            "native-header-settings" => self.settings_open = true,
+            "native-settings-refresh" => {
+                let _ = self.dispatch_agent_connection_query(false);
+            }
+            "native-settings-cancel" => self.settings_open = false,
             _ => {}
         }
+    }
+
+    fn agent_presence_for(&self, provider: ConfigSidebarProviderKind) -> AgentPresence {
+        self.agent_connection
+            .as_ref()
+            .and_then(|snapshot| {
+                snapshot
+                    .agents
+                    .iter()
+                    .find(|row| row.provider == provider)
+                    .map(|row| row.presence)
+            })
+            .unwrap_or(AgentPresence::Checking)
     }
 
     fn run_palette_item(&mut self, item: PaletteItem, cx: &mut Context<Self>) {
@@ -9475,6 +9533,9 @@ impl NativeShell {
         if self.new_task.is_some() {
             return Some(self.render_new_task_overlay(tokens, viewport, cx));
         }
+        if self.settings_open {
+            return Some(self.render_settings_overlay(tokens, viewport, cx));
+        }
         if self.interaction.keyboard_state().palette_open {
             return Some(self.render_command_palette(tokens, viewport, cx));
         }
@@ -9785,6 +9846,131 @@ impl NativeShell {
                             ),
                     ),
             ),
+        )
+        .with_priority(2)
+        .into_any_element()
+    }
+
+    fn render_settings_overlay(
+        &self,
+        tokens: crate::ui::tokens::ThemeTokens,
+        viewport: Size<Pixels>,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let claude_copy = settings_row_copy(
+            ConfigSidebarProviderKind::Claude,
+            self.agent_presence_for(ConfigSidebarProviderKind::Claude),
+        );
+        let codex_copy = settings_row_copy(
+            ConfigSidebarProviderKind::Codex,
+            self.agent_presence_for(ConfigSidebarProviderKind::Codex),
+        );
+        deferred(
+            anchored()
+                .position(point(px(0.0), px(0.0)))
+                .snap_to_window()
+                .child(
+                    div()
+                        .id("native-settings-backdrop")
+                        .occlude()
+                        .w(viewport.width)
+                        .h(viewport.height)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .bg(tokens.surfaces.overlay.to_gpui())
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|shell, _event: &MouseDownEvent, _window, cx| {
+                                cx.stop_propagation();
+                                shell.settings_open = false;
+                                cx.notify();
+                            }),
+                        )
+                        .child(
+                            div()
+                                .id("native-settings-dialog")
+                                .w(px(440.0))
+                                .rounded(px(tokens.density.radii.lg))
+                                .bg(tokens.surfaces.raised.to_gpui())
+                                .border(px(1.0))
+                                .border_color(tokens.borders.subtle.to_gpui())
+                                .shadow_sm()
+                                .p(px(tokens.density.spacing.xl))
+                                .flex()
+                                .flex_col()
+                                .gap(px(tokens.density.spacing.md))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|shell, _event: &MouseDownEvent, window, cx| {
+                                        cx.stop_propagation();
+                                        shell.focus_handle.focus(window);
+                                    }),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(tokens.density.typography.heading))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(tokens.text.primary.to_gpui())
+                                        .child("Settings"),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(tokens.density.typography.body))
+                                        .line_height(px(tokens.density.typography.body_line_height))
+                                        .text_color(tokens.text.secondary.to_gpui())
+                                        .child(claude_copy),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(tokens.density.typography.body))
+                                        .line_height(px(tokens.density.typography.body_line_height))
+                                        .text_color(tokens.text.secondary.to_gpui())
+                                        .child(codex_copy),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(tokens.density.typography.caption))
+                                        .text_color(tokens.text.muted.to_gpui())
+                                        .child(
+                                            "DevManager does not log you in; sign in with that app, then Refresh",
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .justify_end()
+                                        .gap(px(tokens.density.spacing.sm))
+                                        .child(
+                                            Button::new("native-settings-cancel")
+                                                .label("Cancel")
+                                                .ghost()
+                                                .on_click(cx.listener(
+                                                    |shell, _event: &ClickEvent, _window, cx| {
+                                                        cx.stop_propagation();
+                                                        shell.settings_open = false;
+                                                        cx.notify();
+                                                    },
+                                                )),
+                                        )
+                                        .child(
+                                            Button::new("native-settings-refresh")
+                                                .label("Refresh")
+                                                .primary()
+                                                .on_click(cx.listener(
+                                                    |shell, _event: &ClickEvent, _window, cx| {
+                                                        cx.stop_propagation();
+                                                        let _ =
+                                                            shell.dispatch_agent_connection_query(
+                                                                false,
+                                                            );
+                                                        cx.notify();
+                                                    },
+                                                )),
+                                        ),
+                                ),
+                        ),
+                ),
         )
         .with_priority(2)
         .into_any_element()
@@ -10307,12 +10493,20 @@ impl NativeShell {
             .into_any_element()
     }
 
+    fn header_settings_control_static() -> AnyElement {
+        Button::new("native-header-settings")
+            .label("Settings")
+            .ghost()
+            .into_any_element()
+    }
+
     fn header_bar(
         &self,
         tokens: crate::ui::tokens::ThemeTokens,
         host_status_control: Option<AnyElement>,
         workspace_actions: Option<AnyElement>,
         pane_toggles: Option<AnyElement>,
+        settings_control: AnyElement,
     ) -> AnyElement {
         let show_attachment = !self.header_attachment.label().is_empty()
             || !self.header_attachment.detail().is_empty();
@@ -10407,6 +10601,7 @@ impl NativeShell {
             .children(workspace_actions)
             .children(pane_toggles)
             .children(show_connection.then(|| self.status_bar(tokens)))
+            .child(settings_control)
             .children(host_status_control.map(|control| div().flex_none().child(control)))
             .into_any_element()
     }
@@ -10898,7 +11093,13 @@ impl NativeShell {
                 .text_size(px(tokens.density.typography.body))
                 .line_height(px(tokens.density.typography.body_line_height))
                 .text_color(tokens.text.primary.to_gpui())
-                .child(self.header_bar(tokens, None, None, None))
+                .child(self.header_bar(
+                    tokens,
+                    None,
+                    None,
+                    None,
+                    Self::header_settings_control_static(),
+                ))
                 .child(
                     div()
                         .id("native-shell-content")
@@ -10943,7 +11144,13 @@ impl NativeShell {
             .text_size(px(tokens.density.typography.body))
             .line_height(px(tokens.density.typography.body_line_height))
             .text_color(tokens.text.primary.to_gpui())
-            .child(self.header_bar(tokens, None, None, None))
+            .child(self.header_bar(
+                tokens,
+                None,
+                None,
+                None,
+                Self::header_settings_control_static(),
+            ))
             .child(
                 div()
                     .id("native-shell-content")
@@ -11453,6 +11660,16 @@ impl NativeShell {
             )
             .into_any_element();
 
+        let header_settings_control = Button::new("native-header-settings")
+            .label("Settings")
+            .ghost()
+            .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
+                cx.stop_propagation();
+                shell.settings_open = true;
+                cx.notify();
+            }))
+            .into_any_element();
+
         let layout = self
             .layout
             .fitted(f32::from(viewport.width), f32::from(viewport.height));
@@ -11657,6 +11874,7 @@ impl NativeShell {
                 (stage == ShellStage::Cockpit).then_some(host_status_control),
                 workspace_actions,
                 pane_toggles,
+                header_settings_control,
             ))
             .child(
                 div()
@@ -12683,6 +12901,53 @@ mod tests {
             !reopened,
             "cancelling Name this task must not reopen it on the next offer"
         );
+    }
+
+    #[test]
+    fn header_settings_opens_on_welcome_and_cockpit() {
+        let _test_guard = HEADLESS_SHELL_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("headless shell test lock");
+        let completed = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let completed_for_app = std::rc::Rc::clone(&completed);
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            let (runtime, _) = TestRuntime::new(true, NativeHostActionResult::Queued);
+            let snapshot = with_test_shell_in_app(cx, runtime, |shell| {
+                let welcome_shows = shell.header_shows_settings_for_test();
+                assert!(!shell.settings_open_for_test());
+                shell.dispatch_named_accessibility_action("native-header-settings");
+                let welcome_open = shell.settings_open_for_test();
+                shell.settings_open = false;
+                shell.install_named_folder_for_test("command");
+                let after_project_shows = shell.header_shows_settings_for_test();
+                shell.dispatch_named_accessibility_action("native-header-settings");
+                let after_project_open = shell.settings_open_for_test();
+                (
+                    welcome_shows,
+                    welcome_open,
+                    after_project_shows,
+                    after_project_open,
+                    shell.shell_stage(),
+                )
+            });
+            *completed_for_app.borrow_mut() = Some(snapshot);
+            cx.quit();
+        });
+        let (welcome_shows, welcome_open, after_project_shows, after_project_open, stage) =
+            completed.borrow().clone().expect("settings header snapshot");
+        assert!(welcome_shows, "welcome header must show Settings");
+        assert!(welcome_open, "settings must open from welcome header");
+        assert!(
+            after_project_shows,
+            "first-task header must show Settings"
+        );
+        assert!(
+            after_project_open,
+            "settings must open from first-task header"
+        );
+        assert_eq!(stage, ShellStage::FirstTask);
     }
 
     #[test]
