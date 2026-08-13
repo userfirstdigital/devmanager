@@ -5228,13 +5228,14 @@ impl AccessibilityTree {
 
     pub fn for_task_list(task_list: &TaskList, selected_task: Option<TaskId>) -> Self {
         let header = NativeHeaderAttachment::default();
-        Self::for_task_list_with_header(task_list, selected_task, &header)
+        Self::for_task_list_with_header(task_list, selected_task, &header, None)
     }
 
     pub fn for_task_list_with_header(
         task_list: &TaskList,
         selected_task: Option<TaskId>,
         header: &NativeHeaderAttachment,
+        snapshot: Option<&AgentConnectionSnapshot>,
     ) -> Self {
         let rendered_task_ids = task_list.rendered_task_ids();
         let rows = task_list
@@ -5254,8 +5255,8 @@ impl AccessibilityTree {
         let inbox_status = if rows.is_empty() {
             AccessibilityNode::new(
                 AccessibleRole::Status,
-                "No tasks in isolated inbox",
-                "The dev/test host has not supplied a task snapshot.",
+                "No tasks yet",
+                "Use +Claude or +Codex to start.",
             )
             .gpui("native-task-inbox-status", false, false)
         } else {
@@ -5266,6 +5267,24 @@ impl AccessibilityTree {
             )
             .gpui("native-task-inbox-status", false, false)
         };
+        let inbox_agent_buttons = snapshot
+            .map(inbox_agent_actions)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|action| {
+                let element_id = match action.provider {
+                    ProviderKind::ClaudeCode => "native-inbox-plus-claude",
+                    ProviderKind::Codex => "native-inbox-plus-codex",
+                    ProviderKind::Cursor => unreachable!("Cursor is not an inbox agent action"),
+                };
+                AccessibilityNode::new(
+                    AccessibleRole::Button,
+                    action.label,
+                    "Start a new task with this agent.",
+                )
+                .gpui(element_id, true, true)
+            })
+            .collect::<Vec<_>>();
         let inbox = AccessibilityNode::new(
             AccessibleRole::Region,
             "Task inbox",
@@ -5275,6 +5294,7 @@ impl AccessibilityTree {
         .with_children(
             std::iter::once(inbox_status)
                 .chain(rows)
+                .chain(inbox_agent_buttons)
                 .collect::<Vec<_>>(),
         );
         let header_label = header.label();
@@ -5348,10 +5368,11 @@ impl AccessibilityTree {
         header: &NativeHeaderAttachment,
         welcome_copy: (&str, String),
         show_project_plus: bool,
+        snapshot: Option<&AgentConnectionSnapshot>,
     ) -> Self {
         match stage {
             ShellStage::Cockpit => {
-                Self::for_task_list_with_header(task_list, selected_task, header)
+                Self::for_task_list_with_header(task_list, selected_task, header, snapshot)
             }
             _ => Self::for_setup(stage, header, welcome_copy, show_project_plus),
         }
@@ -6111,6 +6132,7 @@ impl NativeShell {
             &header_attachment,
             connect_canvas_copy(None),
             false,
+            None,
         );
         let platform_accessibility = NativePlatformAccessibilityBridge::new(&accessibility_tree);
         let mut interaction = NativeInteraction::new(None);
@@ -6249,6 +6271,7 @@ impl NativeShell {
             &self.header_attachment,
             welcome_copy,
             self.shows_add_project_plus(),
+            self.agent_connection.as_ref(),
         );
         self.platform_accessibility.sync(&self.accessibility_tree);
     }
@@ -13126,6 +13149,40 @@ mod tests {
     }
 
     #[test]
+    fn empty_inbox_accessibility_lists_signed_in_agent_actions() {
+        use crate::ui::task_cockpit::TaskList;
+
+        let snapshot = agent_connection_snapshot(AgentPresence::SignedIn);
+        let tree = AccessibilityTree::for_task_list_with_header(
+            &TaskList::empty(),
+            None,
+            &NativeHeaderAttachment::default(),
+            Some(&snapshot),
+        );
+        let element_ids: Vec<String> = tree
+            .gpui_nodes()
+            .into_iter()
+            .map(|node| node.element_id)
+            .filter(|id| !id.is_empty())
+            .collect();
+        assert!(
+            element_ids.iter().any(|id| id == "native-inbox-plus-claude"),
+            "expected +Claude inbox action: {element_ids:?}"
+        );
+        assert!(
+            element_ids.iter().any(|id| id == "native-inbox-plus-codex"),
+            "expected +Codex inbox action: {element_ids:?}"
+        );
+        let status = tree
+            .nodes()
+            .into_iter()
+            .find(|node| node.element_id() == "native-task-inbox-status")
+            .expect("inbox status node");
+        assert_eq!(status.name(), "No tasks yet");
+        assert_eq!(status.description(), "Use +Claude or +Codex to start.");
+    }
+
+    #[test]
     fn task_node_ids_maps_rendered_rows_after_settings_node() {
         use crate::ui::task_cockpit::TaskList;
 
@@ -13137,6 +13194,7 @@ mod tests {
             &task_list,
             None,
             &NativeHeaderAttachment::default(),
+            None,
         );
         let mapped = tree.task_node_ids_for_test();
         assert_eq!(mapped.len(), 2);
