@@ -526,7 +526,7 @@ impl PreviewApplication {
             || fixture.capture.border != PreviewCaptureSetting::Excluded
             || !matches!(
                 fixture.root.kind.as_str(),
-                "minimal" | "task-cockpit" | "component_gallery"
+                "minimal" | "task-cockpit" | "component_gallery" | "conversation"
             )
             || fixture.root.label.trim().is_empty()
             || fixture.root.label.chars().count() > 256
@@ -553,7 +553,7 @@ impl PreviewApplication {
                     message: "component gallery roots must carry gallery data".into(),
                 });
             }
-            ("minimal", Some(_)) | ("task-cockpit", Some(_)) => {
+            ("minimal", Some(_)) | ("task-cockpit", Some(_)) | ("conversation", Some(_)) => {
                 return Err(PreviewError::MalformedFixture {
                     path: request.fixture_path,
                     message: "non-gallery preview roots cannot carry a component gallery".into(),
@@ -831,6 +831,8 @@ impl PreviewRoot {
                 .child(div().id("preview-dock").child("Context Dock"))
                 .child(div().id("preview-host-state").child("Host unavailable"))
                 .into_any_element()
+        } else if self.snapshot.root_kind == "conversation" {
+            crate::ui::conversation_preview::conversation_preview_element(tokens)
         } else {
             div().child(self.snapshot.body.clone()).into_any_element()
         };

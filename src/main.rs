@@ -25,6 +25,9 @@ fn main() -> ExitCode {
     if args.iter().any(|argument| argument == "--ui-preview") {
         return run_ui_preview(args);
     }
+    if args.iter().any(|argument| argument == "--ui-proto") {
+        return run_ui_proto();
+    }
 
     run_product_shell()
 }
@@ -41,6 +44,20 @@ fn run_product_shell() -> ExitCode {
             eprintln!("{error}");
             ExitCode::from(2)
         }
+    }
+}
+
+/// Throwaway conversation look prototype. Debug-only, no capture contract.
+fn run_ui_proto() -> ExitCode {
+    #[cfg(debug_assertions)]
+    {
+        devmanager::ui::conversation_preview::run_prototype_window();
+        ExitCode::SUCCESS
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        eprintln!("--ui-proto is available only in debug builds");
+        ExitCode::from(2)
     }
 }
 
