@@ -1075,21 +1075,14 @@ Replace the existing `conversation_hides_lifecycle_usage_and_unknown_diagnostic_
         let rows = derive_conversation_rows(&items, ConversationVerbosity::Calm);
         assert!(rows.is_empty());
     }
-
-    #[test]
-    fn the_substring_denylist_is_gone() {
-        // Guards the regression: re-introducing string sniffing must fail here.
-        let source = include_str!("timeline.rs");
-        assert!(!source.contains("is_hidden_conversation_chrome"));
-        assert!(!source.contains("contains(\"session_state\")"));
-        assert!(!source.contains("starts_with(\"error\")"));
-    }
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `CARGO_TARGET_DIR="C:/Temp/devmanager-train1" cargo test --lib timeline::tests::the_substring_denylist_is_gone`
-Expected: FAIL — the assertions find the strings still present.
+Run: `CARGO_TARGET_DIR="C:/Temp/devmanager-train1" cargo test --lib timeline::tests::an_unmapped_kind`
+Expected: FAIL - the unmapped kind still renders, because `conversation_item_visibility` classifies it as `Activity`.
+
+The test is deliberately **behavioural**, not a source-text search. An assertion like `assert!(!include_str!("timeline.rs").contains("is_hidden_conversation_chrome"))` would pass silently the moment the file is renamed or the substring reworded, and would then guard nothing. Assert what the code does, not what its source says.
 
 - [ ] **Step 3: Store rows on the Timeline**
 
@@ -1173,7 +1166,9 @@ Port each element body from `src/ui/conversation_preview.rs`, which already impl
 - [ ] **Step 5: Run tests to verify they pass**
 
 Run: `CARGO_TARGET_DIR="C:/Temp/devmanager-train1" cargo test --lib timeline`
-Expected: PASS, including `the_substring_denylist_is_gone`.
+Expected: PASS.
+
+Then prove the deletion by state rather than by grep: `cargo check` must fail if anything still calls the removed functions. Confirm `is_hidden_conversation_chrome`, `conversation_item_visibility` and `is_user_role` are gone with `grep -n "is_hidden_conversation_chrome\|conversation_item_visibility\|fn is_user_role" src/ui/task_cockpit/timeline.rs`, expecting no output. A compile that succeeds with no callers left is the real evidence.
 
 - [ ] **Step 6: Confirm the whole crate still builds**
 
@@ -1389,13 +1384,26 @@ mod tests {
 
     #[test]
     fn no_conversation_row_renderer_draws_a_border() {
-        // The only hairline in the transcript is the turn fold's.
+        // KNOWN LIMITATION: this is a source-text assertion, and source-text
+        // assertions decay silently. GPUI offers no way to inspect a painted
+        // element's computed style from a unit test, so there is no behavioural
+        // equivalent available today. Two mitigations, both required:
+        //   1. `border_b` for the turn fold is counted separately below, so the
+        //      test cannot pass merely because the anchor stopped matching.
+        //   2. The sabotage check in Step 4 proves the anchor still matches.
+        // Re-anchor this on the real element tree if a render harness lands.
         let source = include_str!("render.rs");
-        let border_calls = source.matches(".border(px(").count();
         assert_eq!(
-            border_calls, 0,
-            "conversation rows must be separated by whitespace and surface \
+            source.matches(".border(px(").count(),
+            0,
+            "conversation rows are separated by whitespace and surface \
              lightness, never by borders"
+        );
+        assert_eq!(
+            source.matches(".border_b(px(").count(),
+            1,
+            "exactly one hairline exists, the turn fold's -- if this is 0 the \
+             anchor above has stopped matching and is guarding nothing"
         );
     }
 
@@ -1420,12 +1428,19 @@ Expected: FAIL — `border_calls` is non-zero because the ported `activity_card_
 
 Port the treatments exactly as the prototype implements them: user bubble at 16 px radius and 12 px padding on `surfaces.raised`, capped at 80 % of the measure and right-aligned with `justify_end()`; assistant rows at `px(4) py(2)` with no surface, no border and no role marker; work rows at 6 px radius with only the heading recolouring to `status.warning` or `status.destructive`; the turn fold as the single `border_b` hairline.
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [ ] **Step 4: Sabotage-test the border guard**
+
+The border test is source-anchored, so prove the anchor matches before trusting it. Temporarily add `.border(px(1.0))` to any row renderer and re-run: the test MUST fail. Remove it and confirm the test passes again. An absence assertion nobody has seen go red is not a guard.
+
+Run: `CARGO_TARGET_DIR="C:/Temp/devmanager-train2" cargo test --lib conversation::render`
+Expected: FAIL while sabotaged, PASS once reverted.
+
+- [ ] **Step 5: Run tests to verify they pass**
 
 Run: `CARGO_TARGET_DIR="C:/Temp/devmanager-train2" cargo test --lib conversation::render`
 Expected: PASS, `3 passed`.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 git add src/ui/conversation/render.rs
@@ -1512,20 +1527,36 @@ git commit -m "fix(ui): re-arm live follow within a 40px band above the bottom"
 
 ```rust
     #[test]
-    fn message_meta_is_not_painted_at_rest() {
-        let source = include_str!("render.rs");
+    fn meta_is_absent_at_rest_and_present_when_revealed() {
+        let tokens = theme(ThemeMode::Dark, Density::Comfortable, Scale::Scale100);
+        let key = ConversationRowKey::Message("row-1".to_string());
+        let other = ConversationRowKey::Message("row-2".to_string());
+
         assert!(
-            source.contains("hover_meta"),
-            "timestamp, copy and revert must be gated behind hover rather than \
-             painted at rest"
+            hover_meta_is_empty(&key, None, None, tokens),
+            "at rest the row must paint no timestamp, copy or revert"
+        );
+        assert!(
+            hover_meta_is_empty(&key, Some(&other), None, tokens),
+            "hovering a different row must not reveal this one"
+        );
+        assert!(
+            !hover_meta_is_empty(&key, Some(&key), None, tokens),
+            "hovering the row must reveal its meta"
+        );
+        assert!(
+            !hover_meta_is_empty(&key, None, Some(&key), tokens),
+            "keyboard focus must reveal it too, not only the mouse"
         );
     }
 ```
 
+`hover_meta_is_empty` is a thin test helper over the same predicate `hover_meta` uses; expose that predicate rather than inspecting the returned element, so the assertion tests behaviour instead of source text. A test that greps `render.rs` for the string `hover_meta` passes as soon as the symbol exists, whether or not it does anything.
+
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `CARGO_TARGET_DIR="C:/Temp/devmanager-train2" cargo test --lib conversation::render::tests::message_meta`
-Expected: FAIL.
+Run: `CARGO_TARGET_DIR="C:/Temp/devmanager-train2" cargo test --lib conversation::render::tests::meta_is_absent`
+Expected: FAIL - `hover_meta_is_empty` does not exist.
 
 - [ ] **Step 3: Implement**
 
