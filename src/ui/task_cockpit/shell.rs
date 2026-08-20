@@ -12,7 +12,8 @@ use crate::browser::{
     BrowserNativeShellController, BrowserPageLoadState, BrowserWorkspaceKey,
 };
 use crate::client::model::ClientModel;
-use crate::domain::id::{RequestId, TaskId};
+use crate::domain::id::{ApprovalId, QuestionId, RequestId, TaskId};
+use crate::domain::SemanticJournalPage;
 use crate::domain::TaskCockpitResult;
 use crate::protocol::CapabilitySet;
 use crate::ui::actions::{
@@ -21,7 +22,7 @@ use crate::ui::actions::{
 };
 use crate::ui::renderers::{RendererRegistry, SemanticJournalView};
 use crate::ui::task_cockpit::cockpit_projection::TaskCockpitLiveProjection;
-use crate::ui::task_cockpit::composer::TaskComposer;
+use crate::ui::task_cockpit::composer::{ApprovalProjection, QuestionProjection, TaskComposer};
 use crate::ui::task_cockpit::dock::{
     ContextDock, DependencyUnavailable, DockEdge, DockProjectionError, DockTool, PointerPhase,
     PointerPress,
@@ -32,11 +33,13 @@ use crate::ui::tokens::{theme, Density, Scale, ThemeMode};
 pub struct TaskCockpitShell {
     dock: ContextDock,
     model: Option<ClientModel>,
+    capabilities: CapabilitySet,
     projection: Option<TaskCockpitLiveProjection>,
     browser_controller: BrowserNativeShellController,
     browser_projection: Option<BrowserNativeProjection>,
     timeline: Option<Timeline>,
     timeline_error: Option<String>,
+    conversation: Option<SemanticJournalPage>,
 }
 
 /// Authoritative browser surface projection mounted by the active Task
@@ -89,11 +92,13 @@ impl TaskCockpitShell {
         Self {
             dock: ContextDock::new(edge),
             model: None,
+            capabilities: CapabilitySet::empty(),
             projection: None,
             browser_controller: BrowserNativeShellController::for_current_platform(),
             browser_projection: None,
             timeline: None,
             timeline_error: None,
+            conversation: None,
         }
     }
 
@@ -281,8 +286,20 @@ impl TaskCockpitShell {
             self.projection = None;
             self.timeline = None;
             self.timeline_error = None;
+            self.conversation = None;
         }
         self.dock.follow_task(task_id);
+    }
+
+    /// Clear live cockpit surfaces while retaining ContextDock per-task memory
+    /// (including TerminalPresentation) so returning to a task restores the view.
+    pub fn clear_live_surfaces_preserving_dock_memory(&mut self) {
+        self.projection = None;
+        self.timeline = None;
+        self.timeline_error = None;
+        self.conversation = None;
+        self.browser_projection = None;
+        self.dock.clear_selection();
     }
 
     pub fn begin_cockpit_query(&mut self, task_id: TaskId, action_id: &'static str) {
@@ -308,6 +325,12 @@ impl TaskCockpitShell {
         projection.apply_result(result);
         self.dock.bind_cockpit_projection(projection.clone());
         self.projection = Some(projection);
+        if let TaskCockpitResult::Conversation(page) = result {
+            self.conversation = Some(page.clone());
+            if let Some(model) = self.model.clone() {
+                self.project_timeline(&model, self.capabilities);
+            }
+        }
     }
 
     pub fn live_projection(&self) -> Option<&TaskCockpitLiveProjection> {
@@ -334,6 +357,7 @@ impl TaskCockpitShell {
             }
         }
         self.model = Some(model.clone());
+        self.capabilities = capabilities;
         self.project_timeline(model, capabilities);
     }
 
@@ -374,8 +398,11 @@ impl TaskCockpitShell {
             return;
         }
         let result = (|| {
-            let journal = SemanticJournalView::from_live_projection(model, task_id)
-                .map_err(|error| error.to_string())?;
+            let journal = match self.conversation.as_ref() {
+                Some(page) => SemanticJournalView::from_live_page(model, task_id, page),
+                None => SemanticJournalView::from_live_projection(model, task_id),
+            }
+            .map_err(|error| error.to_string())?;
             let registry = RendererRegistry::standard().map_err(|error| error.to_string())?;
             Timeline::project(
                 model,
@@ -426,11 +453,70 @@ impl TaskCockpitShell {
         self.timeline_error.as_deref()
     }
 
+    pub fn pending_question_projection(
+        &self,
+        open_question: QuestionId,
+        fallback_revision: u64,
+    ) -> QuestionProjection {
+        self.conversation
+            .as_ref()
+            .and_then(|page| question_projection_from_page(page, open_question))
+            .unwrap_or(QuestionProjection {
+                request_id: RequestId::from_bytes(*open_question.as_bytes())
+                    .expect("provider question ids are UUIDv7"),
+                state_revision: fallback_revision,
+                options: Vec::new(),
+            })
+    }
+
+    pub fn pending_approval_projection(
+        &self,
+        open_approval: ApprovalId,
+        fallback_revision: u64,
+    ) -> ApprovalProjection {
+        ApprovalProjection {
+            request_id: RequestId::from_bytes(*open_approval.as_bytes())
+                .expect("provider approval ids are UUIDv7"),
+            state_revision: self
+                .conversation
+                .as_ref()
+                .map(|page| page.through_sequence)
+                .unwrap_or(fallback_revision),
+        }
+    }
+
     pub fn conversation_surface(
         &self,
         tokens: crate::ui::tokens::ThemeTokens,
         composer: Option<&TaskComposer>,
     ) -> AnyElement {
+        let footer = composer
+            .map(|composer| composer.surface(tokens))
+            .unwrap_or_else(|| self.conversation_hold_footer(tokens));
+        self.conversation_surface_with_footer(tokens, footer)
+    }
+
+    /// Mount the timeline with the one interactive composer owned by the
+    /// caller. The native shell uses this seam so it does not paint a second,
+    /// disconnected prompt row below the real task composer.
+    pub fn conversation_surface_with_footer(
+        &self,
+        tokens: crate::ui::tokens::ThemeTokens,
+        footer: AnyElement,
+    ) -> AnyElement {
+        div()
+            .id("native-task-conversation-surface")
+            .w_full()
+            .flex_1()
+            .min_h(gpui::px(0.0))
+            .flex()
+            .flex_col()
+            .child(self.conversation_timeline_surface(tokens))
+            .child(footer)
+            .into_any_element()
+    }
+
+    fn conversation_timeline_surface(&self, tokens: crate::ui::tokens::ThemeTokens) -> AnyElement {
         let timeline_error = self.timeline_error.clone().unwrap_or_else(|| {
             if self.dock.selected_task().is_none() {
                 "Add a project, then create a task. The conversation fills in once a task is selected.".to_string()
@@ -438,8 +524,7 @@ impl TaskCockpitShell {
                 "Semantic timeline unavailable until an authenticated journal is admitted".to_string()
             }
         });
-        let timeline = self
-            .timeline
+        self.timeline
             .as_ref()
             .map(|timeline| {
                 div()
@@ -476,44 +561,31 @@ impl TaskCockpitShell {
                             .child(timeline_error),
                     )
                     .into_any_element()
-            });
-        let composer = composer
-            .map(|composer| composer.surface(tokens))
-            .unwrap_or_else(|| {
-                // Held composer still occupies the composer's place and shape,
-                // so the panel does not lose its footer when no agent is bound.
-                div()
-                    .id("native-task-composer-hold")
-                    .w_full()
-                    .flex_none()
-                    .p(gpui::px(tokens.density.spacing.md))
-                    .border_t(gpui::px(1.0))
-                    .border_color(tokens.borders.subtle.to_gpui())
-                    .child(
-                        div()
-                            .w_full()
-                            .px(gpui::px(tokens.density.spacing.md))
-                            .py(gpui::px(tokens.density.spacing.sm))
-                            .rounded(gpui::px(tokens.density.radii.md))
-                            .bg(tokens.surfaces.disabled.to_gpui())
-                            .border(gpui::px(1.0))
-                            .border_color(tokens.borders.subtle.to_gpui())
-                            .text_size(gpui::px(tokens.density.typography.caption))
-                            .line_height(gpui::px(tokens.density.typography.caption_line_height))
-                            .text_color(tokens.text.disabled.to_gpui())
-                            .child("Task composer unavailable until a primary agent is bound"),
-                    )
-                    .into_any_element()
-            });
+            })
+    }
+
+    fn conversation_hold_footer(&self, tokens: crate::ui::tokens::ThemeTokens) -> AnyElement {
         div()
-            .id("native-task-conversation-surface")
+            .id("native-task-composer-hold")
             .w_full()
-            .flex_1()
-            .min_h(gpui::px(0.0))
-            .flex()
-            .flex_col()
-            .child(timeline)
-            .child(composer)
+            .flex_none()
+            .p(gpui::px(tokens.density.spacing.md))
+            .border_t(gpui::px(1.0))
+            .border_color(tokens.borders.subtle.to_gpui())
+            .child(
+                div()
+                    .w_full()
+                    .px(gpui::px(tokens.density.spacing.md))
+                    .py(gpui::px(tokens.density.spacing.sm))
+                    .rounded(gpui::px(tokens.density.radii.md))
+                    .bg(tokens.surfaces.disabled.to_gpui())
+                    .border(gpui::px(1.0))
+                    .border_color(tokens.borders.subtle.to_gpui())
+                    .text_size(gpui::px(tokens.density.typography.caption))
+                    .line_height(gpui::px(tokens.density.typography.caption_line_height))
+                    .text_color(tokens.text.disabled.to_gpui())
+                    .child("Task composer unavailable until a primary agent is bound"),
+            )
             .into_any_element()
     }
 
@@ -553,6 +625,28 @@ impl TaskCockpitShell {
     }
 }
 
+fn question_projection_from_page(
+    page: &SemanticJournalPage,
+    open_question: QuestionId,
+) -> Option<QuestionProjection> {
+    let options = page.facts.iter().rev().find_map(|fact| {
+        if fact.redacted {
+            return None;
+        }
+        match &fact.payload {
+            crate::domain::SemanticJournalPayload::Question { options, .. } => {
+                Some(options.clone())
+            }
+            _ => None,
+        }
+    })?;
+    Some(QuestionProjection {
+        request_id: RequestId::from_bytes(*open_question.as_bytes()).ok()?,
+        state_revision: page.through_sequence,
+        options,
+    })
+}
+
 impl Render for TaskCockpitShell {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let tokens = theme(ThemeMode::Dark, Density::Compact, Scale::Scale100);
@@ -582,5 +676,48 @@ impl Render for TaskCockpitShell {
                 let _ = this.handle_toggle_raw(RequestId::new());
             }))
             .child(self.dock.render_context_dock(tokens))
+    }
+}
+
+#[cfg(test)]
+mod ai_acceptance_tests {
+    use super::*;
+    use crate::domain::{
+        EventId, PrivacyClass, QuestionId, SemanticJournalFact, SemanticJournalPage,
+        SemanticJournalPayload,
+    };
+
+    #[test]
+    fn ai_acceptance_open_question_binds_authenticated_options_and_revision() {
+        let open_question = QuestionId::new();
+        let fact_id = EventId::new();
+        let page = SemanticJournalPage {
+            after_sequence: 0,
+            through_sequence: 17,
+            high_water: 17,
+            encoded_bytes: 0,
+            next_sequence: None,
+            facts: vec![SemanticJournalFact {
+                id: fact_id,
+                sequence: 17,
+                provider: "claude_code".into(),
+                schema_version: 1,
+                kind: "question".into(),
+                visibility: "normal".into(),
+                privacy_class: PrivacyClass::Shareable,
+                redacted: false,
+                payload: SemanticJournalPayload::Question {
+                    question_id: "provider-opaque-question".into(),
+                    prompt: "Choose the acceptance color".into(),
+                    options: vec!["Green".into(), "Blue".into()],
+                },
+            }],
+        };
+
+        let projection = question_projection_from_page(&page, open_question)
+            .expect("the exact open provider question must bind");
+        assert_eq!(projection.request_id.as_bytes(), open_question.as_bytes());
+        assert_eq!(projection.state_revision, 17);
+        assert_eq!(projection.options, ["Green", "Blue"]);
     }
 }

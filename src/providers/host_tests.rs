@@ -174,7 +174,7 @@ fn input_identity(generation: u64) -> ProviderInputDeliveryIdentity {
         agent_session_id: AgentSessionId::parse("018f60b0-9c1a-7001-8000-000000000021")
             .expect("agent"),
         provider_kind: ProviderKind::Codex,
-        provider_session_id: ProviderSessionId::new("codex-session-1").expect("session"),
+        provider_session_id: Some(ProviderSessionId::new("codex-session-1").expect("session")),
         runtime_generation: generation,
         action_epoch: 4,
         turn_id: crate::domain::TurnId::parse("018f60b0-9c1a-7001-8000-000000000034")
@@ -442,6 +442,7 @@ fn specialist_actions_stay_held_after_fence_correlation() {
 #[test]
 fn specialist_lifecycle_uses_exact_fenced_process_and_journal() {
     let manager = crate::services::ProcessManager::new();
+    manager.accept_codex_hooks_for_test();
     let mut launcher = manager.provider_process_launcher();
     let facts = agent_facts(
         ProviderKind::Codex,
@@ -456,6 +457,10 @@ fn specialist_lifecycle_uses_exact_fenced_process_and_journal() {
     let resource_id =
         crate::domain::ResourceId::parse("018f60b0-9c1a-7001-8000-000000000057").expect("resource");
     let launch_nonce = crate::providers::session::LaunchNonce::new();
+    let mut capabilities = observation_for(ProviderKind::Codex, CapabilitySupport::Supported)
+        .capabilities()
+        .clone();
+    capabilities.auth_state = ProviderAuthState::AuthenticatedSubscription;
     let request = crate::providers::session::ProviderRuntimeLaunchRequest::sealed(
         crate::providers::session::RuntimeCorrelation::sealed(
             facts.task_id,
@@ -471,12 +476,13 @@ fn specialist_lifecycle_uses_exact_fenced_process_and_journal() {
             crate::providers::session::ProviderLaunchMode::ResumeExact(
                 facts.provider_session_id.clone().expect("session"),
             ),
-            Vec::new(),
+            // Keep the process alive while the provider composer performs its
+            // distinct Escape, prompt, and submit writes. A bare cmd.exe exits
+            // after interpreting the injected Codex hook arguments.
+            vec![OsString::from("/K")],
             std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             BTreeMap::new(),
-            observation_for(ProviderKind::Codex, CapabilitySupport::Supported)
-                .capabilities()
-                .clone(),
+            capabilities,
             facts.task_id,
             resource_id,
             crate::domain::TerminalId::new(),
@@ -501,7 +507,7 @@ fn specialist_lifecycle_uses_exact_fenced_process_and_journal() {
             .expect("client"),
         agent_session_id: facts.id,
         provider_kind: facts.provider_kind,
-        provider_session_id: facts.provider_session_id.clone().expect("session"),
+        provider_session_id: Some(facts.provider_session_id.clone().expect("session")),
         runtime_generation: 3,
         action_epoch: 4,
         turn_id: crate::domain::TurnId::parse("018f60b0-9c1a-7001-8000-000000000034")

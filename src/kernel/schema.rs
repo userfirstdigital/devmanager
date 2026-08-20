@@ -1372,6 +1372,16 @@ CREATE TABLE connect_identity (\n\
 );\n\
 ";
 
+/// Keep the exact durable terminal/resource binding beside the correlated
+/// provider conversation identity. Restart recovery must never rediscover this
+/// association from cwd, timestamps, or whichever terminal happens to exist.
+const V15_SQL: &str = "\
+ALTER TABLE agent_sessions ADD COLUMN provider_resource_id BLOB\n\
+  CHECK(provider_resource_id IS NULL OR length(provider_resource_id) = 16);\n\
+CREATE UNIQUE INDEX idx_agent_provider_resource\n\
+  ON agent_sessions(provider_resource_id) WHERE provider_resource_id IS NOT NULL;\n\
+";
+
 /// Provider input authority and durable fenced state are additive to the
 /// scoped receipt ledger. The payload digest lets typed provider retries reject
 /// a reused command id without weakening connection/session scope checks.
@@ -1644,6 +1654,12 @@ pub(crate) fn migration_manifest() -> &'static [Migration] {
                     name: "connect-identity-v1",
                     sql: CONNECT_V14_SQL,
                     sha256: V14_SHA256,
+                },
+                Migration {
+                    version: 15,
+                    name: "v15_agent_provider_resource_binding",
+                    sql: V15_SQL,
+                    sha256: sha256_bytes(V15_SQL),
                 },
             ];
             verify_manifest(&migrations);
@@ -1961,7 +1977,7 @@ mod tests {
                 .map(|row| row.unwrap())
                 .collect()
         };
-        assert_eq!(history.len(), 14);
+        assert_eq!(history.len(), 15);
         assert_eq!(history[0], (1, "v1_initial".into(), V1_SHA256.to_vec()));
         assert_eq!(
             history[1],
@@ -2003,6 +2019,9 @@ mod tests {
         assert_eq!(history[13].0, 14);
         assert_eq!(history[13].1, "connect-identity-v1");
         assert_eq!(history[13].2, V14_SHA256.to_vec());
+        assert_eq!(history[14].0, 15);
+        assert_eq!(history[14].1, "v15_agent_provider_resource_binding");
+        assert_eq!(history[14].2, sha256_bytes(V15_SQL).to_vec());
 
         let compacted_column: (String, i64) = conn
             .query_row(
@@ -2545,7 +2564,7 @@ mod tests {
                     row.get(0)
                 })
                 .expect("migration count");
-            assert_eq!(migration_count, 14, "prior schema V{prior_version}");
+            assert_eq!(migration_count, 15, "prior schema V{prior_version}");
             let missing_prompt_command_payloads: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM prompt_command_receipts
@@ -2566,6 +2585,17 @@ mod tests {
                 )
                 .expect("history migration record");
             assert_eq!(latest_name, "phase07-prompt-history-v1");
+            let provider_resource_name: String = conn
+                .query_row(
+                    "SELECT name FROM schema_migrations WHERE version = 15",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("provider resource migration record");
+            assert_eq!(
+                provider_resource_name,
+                "v15_agent_provider_resource_binding"
+            );
             let lineage_name: String = conn
                 .query_row(
                     "SELECT name FROM schema_migrations WHERE version = 12",
@@ -2685,15 +2715,18 @@ mod tests {
     }
 
     #[test]
-    fn connect_identity_v14_is_contiguous_and_hash_locked() {
+    fn provider_resource_v15_is_contiguous_and_hash_locked() {
         let migrations = migration_manifest();
-        assert_eq!(latest_migration_version(), 14);
-        assert_eq!(migrations.len(), 14);
+        assert_eq!(latest_migration_version(), 15);
+        assert_eq!(migrations.len(), 15);
         assert_eq!(migrations[13].version, 14);
         assert_eq!(migrations[13].name, "connect-identity-v1");
         assert_eq!(migrations[13].sha256, V14_SHA256);
         assert_eq!(V14_SHA256, sha256_bytes(CONNECT_V14_SQL));
         assert_eq!(V14_SHA256_HEX, hex_lower(&V14_SHA256));
+        assert_eq!(migrations[14].version, 15);
+        assert_eq!(migrations[14].name, "v15_agent_provider_resource_binding");
+        assert_eq!(migrations[14].sha256, sha256_bytes(V15_SQL));
     }
 
     #[test]

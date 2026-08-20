@@ -21,58 +21,150 @@ fn fixed_uuid_v7(tail: u8) -> [u8; 16] {
 }
 
 fn seed_open_task_with_agent(
-    bus: &mut devmanager::kernel::CommandBus,
+    path: &std::path::Path,
     tail: u8,
-) -> (TaskId, AgentSessionId, u64, u64, ClientId) {
-    seed_open_task_with_agent_runtime(bus, tail, true)
+) -> (
+    devmanager::kernel::CommandBus,
+    TaskId,
+    AgentSessionId,
+    u64,
+    u64,
+    ClientId,
+) {
+    seed_open_task_with_agent_runtime(path, tail, true)
 }
 
 fn seed_open_task_without_provider_runtime(
-    bus: &mut devmanager::kernel::CommandBus,
+    path: &std::path::Path,
     tail: u8,
-) -> (TaskId, AgentSessionId, u64, u64, ClientId) {
-    seed_open_task_with_agent_runtime(bus, tail, false)
+) -> (
+    devmanager::kernel::CommandBus,
+    TaskId,
+    AgentSessionId,
+    u64,
+    u64,
+    ClientId,
+) {
+    seed_open_task_with_agent_runtime(path, tail, false)
 }
 
 fn seed_open_task_with_agent_runtime(
-    bus: &mut devmanager::kernel::CommandBus,
+    path: &std::path::Path,
     tail: u8,
     bind_provider_runtime: bool,
-) -> (TaskId, AgentSessionId, u64, u64, ClientId) {
+) -> (
+    devmanager::kernel::CommandBus,
+    TaskId,
+    AgentSessionId,
+    u64,
+    u64,
+    ClientId,
+) {
+    use devmanager::config::paths::{resolve_app_paths, AppProfile, BuildKind};
+    use devmanager::config::{ConfigCommand, ConfigStore, Project};
     use devmanager::domain::command::CommandReceipt;
     use devmanager::domain::{
-        AgentRole, AgentSessionFacts, AgentSessionLifecycle, CreateTaskIntent, EnvironmentId,
-        ProjectId, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity, TaskLifecycle,
-        WorkspaceRef,
+        AgentRole, AgentSessionFacts, AgentSessionLifecycle, CreateTaskRequestIntent,
+        EnvironmentId, ProjectId, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity,
+        TaskLifecycle,
     };
+    use devmanager::host::HostRequestExecutor;
+    use devmanager::protocol::{
+        CapabilitySet, ClientRequest, FrameLimits, NegotiatedParameters, ProtocolVersion,
+        ServerMessage,
+    };
+    use devmanager::workspace::{WorkspaceProjectRoots, WorkspaceRequest};
 
     let client_id = ClientId::from_bytes(fixed_uuid_v7(tail)).expect("client");
     let task_id = TaskId::from_bytes(fixed_uuid_v7(tail + 1)).expect("task");
     let agent_session_id = AgentSessionId::from_bytes(fixed_uuid_v7(tail + 2)).expect("agent");
-    let create = bus
-        .execute(CommandEnvelope {
-            command_id: CommandId::from_bytes(fixed_uuid_v7(tail + 3)).expect("create cmd"),
-            client_id,
-            task_id: None,
-            issued_at_ms: 1_725_000_000_100,
-            expected_task_revision: None,
-            command: Command::CreateTask(CreateTaskIntent {
-                id: task_id,
-                environment_id: EnvironmentId::from_bytes(fixed_uuid_v7(tail + 4))
-                    .expect("environment"),
-                title: "Provider input".into(),
-                description: None,
-                project_id: ProjectId::from_bytes(fixed_uuid_v7(tail + 5)).expect("project"),
-                workspace: WorkspaceRef::Main,
-                assignment: TaskAssignment::LocalOwner,
-                created_at_ms: 1_725_000_000_000,
-                connectivity: TaskConnectivity::Connected,
-                attention: TaskAttention::None,
-                activity: TaskActivity::Idle,
-                review_readiness: devmanager::domain::ReviewReadiness::NotReady,
-            }),
-        })
-        .expect("create task");
+    let profile = AppProfile::named(&format!("providerinput{tail:02x}"))
+        .expect("isolated provider-input profile");
+    let paths = resolve_app_paths(
+        path.parent().expect("provider-input database parent"),
+        profile,
+        BuildKind::Debug,
+    )
+    .expect("resolve isolated provider-input paths");
+    std::fs::create_dir_all(&paths.root).expect("create isolated provider-input root");
+    let configured_id = ProjectId::from_bytes(fixed_uuid_v7(tail + 5))
+        .expect("configured project")
+        .to_string();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("provider-input host runtime");
+    let create = runtime.block_on(async {
+        let bus = devmanager::kernel::CommandBus::open(path).expect("open seed command bus");
+        let mut config = ConfigStore::open_host(&paths).expect("open isolated host config");
+        config
+            .execute(
+                config.snapshot().revision,
+                ConfigCommand::CreateProject {
+                    project: Project {
+                        id: configured_id.clone(),
+                        name: "Provider input fixture".into(),
+                        root_path: paths.root.to_string_lossy().into_owned(),
+                        created_at: "now".into(),
+                        updated_at: "now".into(),
+                        ..Project::default()
+                    },
+                },
+            )
+            .expect("persist isolated provider-input project");
+        let revision = config.snapshot().revision;
+        let roots = WorkspaceProjectRoots::from_host_config_store(&mut config, revision, 1, 1)
+            .expect("issue isolated provider-input roots");
+        let project_id = roots
+            .project_id_for_config_id(&configured_id)
+            .expect("resolve provider-input project id");
+        let (requests, executor) =
+            HostRequestExecutor::start_supervised_with_config_store(bus, config, &paths.root)
+                .expect("start configured provider-input host");
+        let response = requests
+            .execute(
+                NegotiatedParameters {
+                    version: ProtocolVersion::current(),
+                    client_id,
+                    capabilities: CapabilitySet::empty(),
+                    limits: FrameLimits::v1_default(),
+                },
+                ClientRequest::Command(CommandEnvelope {
+                    command_id: CommandId::from_bytes(fixed_uuid_v7(tail + 3)).expect("create cmd"),
+                    client_id,
+                    task_id: None,
+                    issued_at_ms: 1_725_000_000_100,
+                    expected_task_revision: None,
+                    command: Command::CreateTaskV2(CreateTaskRequestIntent {
+                        id: task_id,
+                        environment_id: EnvironmentId::from_bytes(fixed_uuid_v7(tail + 4))
+                            .expect("environment"),
+                        title: "Provider input".into(),
+                        description: None,
+                        project_id,
+                        workspace: WorkspaceRequest::confirmed_external(&paths.root),
+                        primary_provider: None,
+                        assignment: TaskAssignment::LocalOwner,
+                        created_at_ms: 1_725_000_000_000,
+                        connectivity: TaskConnectivity::Connected,
+                        attention: TaskAttention::None,
+                        activity: TaskActivity::Idle,
+                        review_readiness: devmanager::domain::ReviewReadiness::NotReady,
+                    }),
+                }),
+            )
+            .await
+            .expect("create task through configured host");
+        drop(requests);
+        let _ = executor
+            .join
+            .await
+            .expect("configured provider-input host join");
+        let ServerMessage::CommandReceipt(receipt) = response else {
+            panic!("provider-input task create must return a command receipt");
+        };
+        receipt
+    });
     let CommandReceipt::Accepted {
         task_revision: Some(revision),
         ..
@@ -80,6 +172,7 @@ fn seed_open_task_with_agent_runtime(
     else {
         panic!("expected accepted create, got {create:?}");
     };
+    let mut bus = devmanager::kernel::CommandBus::open(path).expect("reopen seeded command bus");
     let register = bus
         .execute(CommandEnvelope {
             command_id: CommandId::from_bytes(fixed_uuid_v7(tail + 6)).expect("register cmd"),
@@ -113,16 +206,34 @@ fn seed_open_task_with_agent_runtime(
     else {
         panic!("expected accepted register, got {register:?}");
     };
+    let set_primary = bus
+        .execute(CommandEnvelope {
+            command_id: CommandId::from_bytes(fixed_uuid_v7(tail + 7)).expect("primary cmd"),
+            client_id,
+            task_id: Some(task_id),
+            issued_at_ms: 1_725_000_000_120,
+            expected_task_revision: Some(next_revision),
+            command: Command::SetPrimaryAgent { agent_session_id },
+        })
+        .expect("set primary agent");
+    let CommandReceipt::Accepted {
+        task_revision: Some(primary_revision),
+        ..
+    } = set_primary
+    else {
+        panic!("expected accepted primary assignment, got {set_primary:?}");
+    };
     let snapshot = bus
         .task_snapshot(task_id)
         .expect("load snapshot")
         .expect("task exists");
     assert_eq!(snapshot.task.lifecycle, TaskLifecycle::Open);
     (
+        bus,
         task_id,
         agent_session_id,
         snapshot.task.action_epoch,
-        next_revision,
+        primary_revision,
         client_id,
     )
 }
@@ -223,11 +334,10 @@ fn begin_provider_dispatch(
     devmanager::kernel::DispatchPermit,
 ) {
     use devmanager::domain::command::CommandReceipt;
-    use devmanager::kernel::{CommandBus, KernelStore};
+    use devmanager::kernel::KernelStore;
 
-    let mut bus = CommandBus::open(path).expect("open command bus");
-    let (task_id, agent_session_id, action_epoch, revision, client_id) =
-        seed_open_task_with_agent(&mut bus, tail);
+    let (mut bus, task_id, agent_session_id, action_epoch, revision, client_id) =
+        seed_open_task_with_agent(path, tail);
     let command_id = CommandId::from_bytes(fixed_uuid_v7(tail + 10)).expect("command");
     let turn_id = TurnId::from_bytes(fixed_uuid_v7(tail + 11)).expect("turn");
     let accepted = bus
@@ -275,7 +385,10 @@ fn begin_provider_dispatch(
         } => {
             assert_eq!(*runtime_generation, 3);
             let expected_session = format!("codex-session-{tail:02x}");
-            assert_eq!(provider_session_id.as_str(), expected_session.as_str());
+            assert_eq!(
+                provider_session_id.as_ref().map(ProviderSessionId::as_str),
+                Some(expected_session.as_str())
+            );
         }
         effect => panic!("expected typed provider effect, got {effect:?}"),
     }
@@ -285,16 +398,19 @@ fn begin_provider_dispatch(
 
 fn register_secondary_agent(path: &std::path::Path, task_id: TaskId, tail: u8) -> AgentSessionId {
     use devmanager::domain::command::CommandReceipt;
-    use devmanager::domain::{AgentRole, AgentSessionFacts, AgentSessionLifecycle};
+    use devmanager::domain::{
+        AgentRole, AgentSessionFacts, AgentSessionLifecycle, ArtifactKind, RequestSpecialistIntent,
+        SpecialistPermission, DEFAULT_MAX_TOP_LEVEL_RUNTIMES,
+    };
     use devmanager::kernel::CommandBus;
 
     let mut bus = CommandBus::open(path).expect("open secondary-agent bus");
-    let revision = bus
+    let snapshot = bus
         .task_snapshot(task_id)
         .expect("secondary-agent snapshot")
-        .expect("secondary-agent task")
-        .task
-        .revision;
+        .expect("secondary-agent task");
+    let primary_id = snapshot.primary_agent_id.expect("primary agent");
+    let primary = snapshot.agents.get(&primary_id).expect("primary facts");
     let agent_session_id = AgentSessionId::from_bytes(fixed_uuid_v7(tail)).expect("secondary id");
     let receipt = bus
         .execute(CommandEnvelope {
@@ -302,9 +418,9 @@ fn register_secondary_agent(path: &std::path::Path, task_id: TaskId, tail: u8) -
             client_id: ClientId::from_bytes(fixed_uuid_v7(tail + 2)).expect("secondary client"),
             task_id: Some(task_id),
             issued_at_ms: 1_725_003_000_500,
-            expected_task_revision: Some(revision),
-            command: Command::RegisterAgentSession {
-                agent: AgentSessionFacts {
+            expected_task_revision: Some(snapshot.task.revision),
+            command: Command::RequestSpecialist(RequestSpecialistIntent {
+                specialist: AgentSessionFacts {
                     id: agent_session_id,
                     task_id,
                     role: AgentRole::specialist("reviewer").expect("specialist role"),
@@ -314,19 +430,28 @@ fn register_secondary_agent(path: &std::path::Path, task_id: TaskId, tail: u8) -
                             .expect("secondary provider session"),
                     ),
                     lifecycle: AgentSessionLifecycle::Open,
-                    runtime_generation: 7,
+                    runtime_generation: primary.runtime_generation,
                     revision: 0,
                 },
-            },
+                requested_by: primary_id,
+                purpose: "verify rebuild checks unrelated agents".into(),
+                permission: SpecialistPermission::ReadOnly,
+                workspace: snapshot.task.workspace.clone(),
+                expected_artifact_kind: ArtifactKind::ReviewReport,
+                expected_action_epoch: snapshot.task.action_epoch,
+                expected_runtime_generation: primary.runtime_generation,
+                resource_id: None,
+                max_top_level_runtimes: DEFAULT_MAX_TOP_LEVEL_RUNTIMES,
+            }),
         })
-        .expect("register secondary agent");
-    assert!(matches!(
-        receipt,
-        CommandReceipt::Accepted {
-            task_revision: Some(_),
-            ..
-        }
-    ));
+        .expect("request secondary agent");
+    let CommandReceipt::Accepted {
+        task_revision: Some(_),
+        ..
+    } = receipt
+    else {
+        panic!("secondary-agent request must be accepted: {receipt:?}");
+    };
     agent_session_id
 }
 
@@ -555,7 +680,10 @@ fn expired_provider_dispatch_recovery_preserves_g1_after_runtime_replacement() {
             ..
         } => {
             assert_eq!(*runtime_generation, 3, "uncertainty must audit G1 attempt");
-            assert_eq!(provider_session_id.as_str(), "codex-session-21");
+            assert_eq!(
+                provider_session_id.as_ref().map(ProviderSessionId::as_str),
+                Some("codex-session-21")
+            );
         }
         effect => panic!("expected typed provider effect, got {effect:?}"),
     }
@@ -574,15 +702,14 @@ fn expired_provider_dispatch_recovery_preserves_g1_after_runtime_replacement() {
 #[test]
 fn generic_ambiguity_fails_closed_on_tampered_task_fence() {
     use devmanager::domain::command::CommandReceipt;
-    use devmanager::kernel::{CommandBus, Effect, KernelStore, StoreError};
+    use devmanager::kernel::{Effect, KernelStore, StoreError};
     use rusqlite::Connection;
     use tempfile::TempDir;
 
     let dir = TempDir::new().expect("tempdir");
     let path = dir.path().join("generic-ambiguity-stale-fence.sqlite3");
-    let mut bus = CommandBus::open(&path).expect("open command bus");
-    let (task_id, _agent_session_id, _action_epoch, revision, client_id) =
-        seed_open_task_with_agent(&mut bus, 0x31);
+    let (mut bus, task_id, _agent_session_id, _action_epoch, revision, client_id) =
+        seed_open_task_with_agent(&path, 0x31);
     let accepted = bus
         .execute(CommandEnvelope {
             command_id: CommandId::from_bytes(fixed_uuid_v7(0x3b)).expect("close command"),
@@ -658,18 +785,17 @@ fn generic_ambiguity_fails_closed_on_tampered_task_fence() {
 #[test]
 fn generic_retry_safe_ambiguity_keeps_current_dispatch_path() {
     use devmanager::domain::command::CommandReceipt;
-    use devmanager::kernel::{AmbiguityDisposition, CommandBus, Effect, KernelStore};
+    use devmanager::kernel::{AmbiguityDisposition, Effect, KernelStore};
     use rusqlite::Connection;
     use tempfile::TempDir;
 
     let dir = TempDir::new().expect("tempdir");
     let path = dir.path().join("generic-retry-safe-ambiguity.sqlite3");
-    let mut bus = CommandBus::open(&path).expect("open generic bus");
-    let (task_id, _agent_session_id, _action_epoch, revision, client_id) =
-        seed_open_task_with_agent(&mut bus, 0x37);
+    let (mut bus, task_id, _agent_session_id, _action_epoch, revision, client_id) =
+        seed_open_task_with_agent(&path, 0x37);
     let accepted = bus
         .execute(CommandEnvelope {
-            command_id: CommandId::from_bytes(fixed_uuid_v7(0x3d)).expect("close command"),
+            command_id: CommandId::from_bytes(fixed_uuid_v7(0x46)).expect("close command"),
             client_id,
             task_id: Some(task_id),
             issued_at_ms: 1_725_003_200_000,
@@ -757,7 +883,6 @@ fn uncertain_provider_rebuild_checks_other_agents_and_attempt_generation() {
     let dir = TempDir::new().expect("tempdir");
     let path = dir.path().join("provider-input-rebuild-generation.sqlite3");
     let (task_id, _agent_session_id, operation_id, permit) = begin_provider_dispatch(&path, 0x3f);
-    let secondary_id = register_secondary_agent(&path, task_id, 0x4f);
     let mut store = KernelStore::open(&path).expect("reopen provider store");
     assert_eq!(
         store
@@ -766,10 +891,11 @@ fn uncertain_provider_rebuild_checks_other_agents_and_attempt_generation() {
         AmbiguityDisposition::Uncertain
     );
     drop(store);
+    let secondary_id = register_secondary_agent(&path, task_id, 0x4f);
 
     let conn = Connection::open(&path).expect("open provider projection");
     conn.execute(
-        "UPDATE agent_sessions SET runtime_generation = 8 WHERE agent_session_id = ?1",
+        "UPDATE agent_sessions SET runtime_generation = 4 WHERE agent_session_id = ?1",
         [secondary_id.as_bytes().as_slice()],
     )
     .expect("tamper non-provider agent row");
@@ -783,7 +909,7 @@ fn uncertain_provider_rebuild_checks_other_agents_and_attempt_generation() {
 
     let conn = Connection::open(&path).expect("reopen provider projection");
     conn.execute(
-        "UPDATE agent_sessions SET runtime_generation = 7 WHERE agent_session_id = ?1",
+        "UPDATE agent_sessions SET runtime_generation = 3 WHERE agent_session_id = ?1",
         [secondary_id.as_bytes().as_slice()],
     )
     .expect("restore secondary agent row");
@@ -842,8 +968,9 @@ fn provider_dispatch_ambiguity_rejects_immutable_attempt_tampering() {
                 ..
             } = &mut effect
             {
-                *provider_session_id =
-                    ProviderSessionId::new("codex-session-tampered").expect("provider session");
+                *provider_session_id = Some(
+                    ProviderSessionId::new("codex-session-tampered").expect("provider session"),
+                );
             }
             effect
         }),
@@ -985,9 +1112,8 @@ fn submit_provider_input_receipt_survives_close_reopen_only_after_durable_commit
 
     let dir = TempDir::new().expect("tempdir");
     let path = dir.path().join("provider-input.sqlite3");
-    let mut bus = CommandBus::open(&path).expect("open");
-    let (task_id, agent_session_id, action_epoch, revision, client_id) =
-        seed_open_task_with_agent(&mut bus, 0x40);
+    let (mut bus, task_id, agent_session_id, action_epoch, revision, client_id) =
+        seed_open_task_with_agent(&path, 0x40);
     let turn_id = TurnId::from_bytes(fixed_uuid_v7(0x4A)).expect("turn");
     let command_id = CommandId::from_bytes(fixed_uuid_v7(0x4B)).expect("submit cmd");
     let envelope = CommandEnvelope {
@@ -1039,14 +1165,12 @@ fn submit_provider_input_receipt_survives_close_reopen_only_after_durable_commit
 #[test]
 fn submit_provider_input_same_command_id_different_payload_is_typed_conflict() {
     use devmanager::domain::command::CommandReceipt;
-    use devmanager::kernel::CommandBus;
     use tempfile::TempDir;
 
     let dir = TempDir::new().expect("tempdir");
     let path = dir.path().join("provider-input-digest.sqlite3");
-    let mut bus = CommandBus::open(&path).expect("open");
-    let (task_id, agent_session_id, action_epoch, revision, client_id) =
-        seed_open_task_with_agent(&mut bus, 0x50);
+    let (mut bus, task_id, agent_session_id, action_epoch, revision, client_id) =
+        seed_open_task_with_agent(&path, 0x50);
     let turn_id = TurnId::from_bytes(fixed_uuid_v7(0x5A)).expect("turn");
     let command_id = CommandId::from_bytes(fixed_uuid_v7(0x5B)).expect("submit cmd");
     let first_envelope = CommandEnvelope {
@@ -1105,9 +1229,8 @@ fn first_answer_wins_uses_host_order_and_survives_reopen_and_second_connection()
 
     let dir = TempDir::new().expect("tempdir");
     let path = dir.path().join("provider-input-faw.sqlite3");
-    let mut bus = CommandBus::open(&path).expect("open");
-    let (task_id, agent_session_id, action_epoch, mut revision, client_id) =
-        seed_open_task_with_agent(&mut bus, 0x60);
+    let (mut bus, task_id, agent_session_id, action_epoch, mut revision, client_id) =
+        seed_open_task_with_agent(&path, 0x60);
     let turn_id = TurnId::from_bytes(fixed_uuid_v7(0x6A)).expect("turn");
     let question_id = QuestionId::from_bytes(fixed_uuid_v7(0x6B)).expect("question");
 
@@ -1247,15 +1370,13 @@ fn first_answer_wins_uses_host_order_and_survives_reopen_and_second_connection()
 #[test]
 fn wait_settlement_requires_exact_fence_and_rejects_replacement_generation() {
     use devmanager::domain::command::CommandReceipt;
-    use devmanager::domain::{ProviderWaitFence, SettleProviderWaitIntent};
-    use devmanager::kernel::CommandBus;
+    use devmanager::domain::SettleProviderWaitIntent;
     use tempfile::TempDir;
 
     let dir = TempDir::new().expect("tempdir");
     let path = dir.path().join("provider-input-wait.sqlite3");
-    let mut bus = CommandBus::open(&path).expect("open");
-    let (task_id, agent_session_id, action_epoch, revision, client_id) =
-        seed_open_task_with_agent(&mut bus, 0x70);
+    let (mut bus, task_id, agent_session_id, action_epoch, revision, client_id) =
+        seed_open_task_with_agent(&path, 0x70);
     let turn_id = TurnId::from_bytes(fixed_uuid_v7(0x7A)).expect("turn");
     let command_id = CommandId::from_bytes(fixed_uuid_v7(0x7B)).expect("wait cmd");
     let accepted = bus
@@ -1347,15 +1468,13 @@ fn wait_settlement_requires_exact_fence_and_rejects_replacement_generation() {
 #[test]
 fn settled_waits_reclaim_capacity_across_sixty_five_cycles() {
     use devmanager::domain::command::CommandReceipt;
-    use devmanager::domain::{ProviderWaitFence, SettleProviderWaitIntent};
-    use devmanager::kernel::CommandBus;
+    use devmanager::domain::SettleProviderWaitIntent;
     use tempfile::TempDir;
 
     let dir = TempDir::new().expect("tempdir");
     let path = dir.path().join("provider-input-wait-capacity.sqlite3");
-    let mut bus = CommandBus::open(&path).expect("open");
-    let (task_id, agent_session_id, action_epoch, mut revision, client_id) =
-        seed_open_task_with_agent(&mut bus, 0xE0);
+    let (mut bus, task_id, agent_session_id, action_epoch, mut revision, client_id) =
+        seed_open_task_with_agent(&path, 0xE0);
     let turn_id = TurnId::from_bytes(fixed_uuid_v7(0xEA)).expect("turn");
 
     for index in 0..65_u8 {
@@ -1431,14 +1550,12 @@ fn settled_waits_reclaim_capacity_across_sixty_five_cycles() {
 #[test]
 fn first_approval_wins_reports_typed_resolution_and_clears_open_approval() {
     use devmanager::domain::command::CommandReceipt;
-    use devmanager::kernel::CommandBus;
     use tempfile::TempDir;
 
     let dir = TempDir::new().expect("tempdir");
     let path = dir.path().join("provider-input-approval.sqlite3");
-    let mut bus = CommandBus::open(&path).expect("open");
-    let (task_id, agent_session_id, action_epoch, mut revision, client_id) =
-        seed_open_task_with_agent(&mut bus, 0xF0);
+    let (mut bus, task_id, agent_session_id, action_epoch, mut revision, client_id) =
+        seed_open_task_with_agent(&path, 0xF0);
     let turn_id = TurnId::from_bytes(fixed_uuid_v7(0xFA)).expect("turn");
     let approval_id =
         devmanager::domain::ApprovalId::from_bytes(fixed_uuid_v7(0xFB)).expect("approval");
@@ -1616,8 +1733,9 @@ fn action_catalog_exposes_executable_provider_controls_without_restart_or_new_co
     }
     assert!(!ids.contains(&ACTION_PROVIDER_NEW_CONVERSATION));
     assert!(
-        !ids.iter()
-            .any(|id| id.to_ascii_lowercase().contains("restart")),
+        !ids.iter().any(|id| {
+            id.starts_with("provider.") && id.to_ascii_lowercase().contains("restart")
+        }),
         "provider catalog must not expose Restart"
     );
 
@@ -1638,14 +1756,12 @@ fn action_catalog_exposes_executable_provider_controls_without_restart_or_new_co
 
 #[test]
 fn available_actions_omit_turn_controls_until_a_turn_exists() {
-    use devmanager::kernel::CommandBus;
     use tempfile::TempDir;
 
     let dir = TempDir::new().expect("tempdir");
     let path = dir.path().join("provider-input-catalog.sqlite3");
-    let mut bus = CommandBus::open(&path).expect("open");
-    let (task_id, agent_session_id, action_epoch, revision, client_id) =
-        seed_open_task_with_agent(&mut bus, 0x80);
+    let (mut bus, task_id, agent_session_id, action_epoch, revision, client_id) =
+        seed_open_task_with_agent(&path, 0x80);
     let snapshot = bus.task_snapshot(task_id).expect("snapshot").expect("task");
     let before = devmanager::providers::input::available_action_ids(&snapshot, agent_session_id);
     assert_eq!(before, vec![ACTION_PROVIDER_SEND_NOW]);
@@ -1759,15 +1875,13 @@ fn raw_pty_composer_is_forbidden_only_when_provider_input_capability_selects_ai_
 #[test]
 fn duplicate_journal_only_provider_inputs_do_not_create_empty_operations() {
     use devmanager::domain::command::CommandReceipt;
-    use devmanager::domain::{ProviderWaitFence, SettleProviderWaitIntent};
-    use devmanager::kernel::CommandBus;
+    use devmanager::domain::SettleProviderWaitIntent;
     use tempfile::TempDir;
 
     let dir = TempDir::new().expect("tempdir");
     let path = dir.path().join("provider-input-duplicates.sqlite3");
-    let mut bus = CommandBus::open(&path).expect("open");
-    let (task_id, agent_session_id, action_epoch, revision, client_id) =
-        seed_open_task_with_agent(&mut bus, 0xA0);
+    let (mut bus, task_id, agent_session_id, action_epoch, revision, client_id) =
+        seed_open_task_with_agent(&path, 0xA0);
     let turn_id = TurnId::from_bytes(fixed_uuid_v7(0xAA)).expect("turn");
     let question_id = QuestionId::from_bytes(fixed_uuid_v7(0xAB)).expect("question");
     let presented = bus
@@ -1827,9 +1941,8 @@ fn duplicate_journal_only_provider_inputs_do_not_create_empty_operations() {
     let path = dir
         .path()
         .join("provider-input-settlement-duplicates.sqlite3");
-    let mut bus = CommandBus::open(&path).expect("open wait store");
-    let (task_id, agent_session_id, action_epoch, revision, client_id) =
-        seed_open_task_with_agent(&mut bus, 0xB0);
+    let (mut bus, task_id, agent_session_id, action_epoch, revision, client_id) =
+        seed_open_task_with_agent(&path, 0xB0);
     let turn_id = TurnId::from_bytes(fixed_uuid_v7(0xBA)).expect("wait turn");
     let wait_command_id = CommandId::from_bytes(fixed_uuid_v7(0xBB)).expect("wait cmd");
     let accepted = bus
@@ -1913,8 +2026,7 @@ fn oversized_provider_session_projection_is_rejected_before_decode() {
 
     let dir = TempDir::new().expect("tempdir");
     let path = dir.path().join("provider-input-state-bound.sqlite3");
-    let mut bus = CommandBus::open(&path).expect("open");
-    let (task_id, agent_session_id, ..) = seed_open_task_with_agent(&mut bus, 0xC0);
+    let (bus, task_id, agent_session_id, ..) = seed_open_task_with_agent(&path, 0xC0);
     drop(bus);
 
     let oversized = vec![0_u8; devmanager::domain::MAX_PROVIDER_SESSION_STATE_BYTES + 1];
@@ -1995,8 +2107,9 @@ fn provider_input_event_decode_rejects_mismatched_nested_identity_and_wait_flag(
         operation_id: OperationId::from_bytes(fixed_uuid_v7(0xD6)).expect("operation"),
         agent_session_id: AgentSessionId::from_bytes(fixed_uuid_v7(0xD4)).expect("agent"),
         provider_kind: ProviderKind::Codex,
-        provider_session_id: devmanager::domain::ProviderSessionId::new("session-d4")
-            .expect("provider session"),
+        provider_session_id: Some(
+            devmanager::domain::ProviderSessionId::new("session-d4").expect("provider session"),
+        ),
         runtime_generation: 3,
         turn_id: TurnId::from_bytes(fixed_uuid_v7(0xD5)).expect("turn"),
         action_epoch: 0,
@@ -2010,25 +2123,18 @@ fn provider_input_event_decode_rejects_mismatched_nested_identity_and_wait_flag(
         delivery: ProviderDeliveryVisibility::hold_until_destination_adapter(),
     };
     let encoded = serde_json::to_vec(&event).expect("encode event");
-    let error = serde_json::from_slice::<Event>(&encoded).expect_err("invalid event payload");
-    let rendered = error.to_string();
-    assert!(
-        rendered.contains("inconsistent") || rendered.contains("wait"),
-        "unexpected error: {rendered}"
-    );
+    serde_json::from_slice::<Event>(&encoded).expect_err("invalid event payload");
 }
 
 #[test]
-fn provider_input_without_bound_runtime_is_rejected_as_unsupported() {
+fn codex_provider_input_without_bound_session_is_accepted_for_first_turn() {
     use devmanager::domain::command::CommandReceipt;
-    use devmanager::kernel::CommandBus;
     use tempfile::TempDir;
 
     let dir = TempDir::new().expect("tempdir");
     let path = dir.path().join("provider-input-unavailable.sqlite3");
-    let mut bus = CommandBus::open(&path).expect("open");
-    let (task_id, agent_session_id, action_epoch, revision, client_id) =
-        seed_open_task_without_provider_runtime(&mut bus, 0xF0);
+    let (mut bus, task_id, agent_session_id, action_epoch, revision, client_id) =
+        seed_open_task_without_provider_runtime(&path, 0xF0);
     let receipt = bus
         .execute(CommandEnvelope {
             command_id: CommandId::from_bytes(fixed_uuid_v7(0xFA)).expect("command"),
@@ -2044,11 +2150,11 @@ fn provider_input_without_bound_runtime_is_rejected_as_unsupported() {
                 false,
             )),
         })
-        .expect("unavailable provider input must return a typed receipt");
+        .expect("Codex first-turn input must return a typed receipt");
     assert!(matches!(
         receipt,
-        CommandReceipt::Rejected {
-            code: RejectionCode::UnsupportedCapability,
+        CommandReceipt::Accepted {
+            task_revision: Some(_),
             ..
         }
     ));

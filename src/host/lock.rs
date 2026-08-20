@@ -267,9 +267,15 @@ fn build_identity(profile: String) -> Result<HostIdentity, HostLockError> {
 
 /// Returns `Ok(true)` when `prior` exactly names a live process generation for
 /// the normalized requested profile.
-/// Returns `Ok(false)` when the PID is absent, its generation/path differs, or
-/// its profile does not match the requested profile (stale for this acquire).
+/// Returns `Ok(false)` when the PID is absent, has already exited, its
+/// generation/path differs, or its profile does not match the requested
+/// profile (stale for this acquire).
 /// Returns `Err` when a live same-profile PID cannot be verified fail-closed.
+///
+/// An exited PID whose process object is still queryable (a peer still holds
+/// a child handle) is stale, not an I/O error. Isolated debug keeps that
+/// handle after the host dies; treating image-path failure as live contention
+/// leaves the next host unable to acquire `host.lock`.
 #[cfg(windows)]
 fn prior_identity_names_live_process(
     prior: &HostIdentity,
@@ -277,7 +283,7 @@ fn prior_identity_names_live_process(
 ) -> Result<bool, HostLockError> {
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::System::Threading::{
-        GetProcessId, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        GetProcessId, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
     };
 
     let prior_profile = match AppProfile::named(&prior.profile) {
@@ -292,21 +298,31 @@ fn prior_identity_names_live_process(
         return Ok(false);
     }
 
-    let handle = match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, prior.pid) } {
+    let handle = match unsafe {
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+            false,
+            prior.pid,
+        )
+    } {
         Ok(handle) => handle,
-        Err(error) => {
-            // Fail closed when the PID still appears live but cannot be queried.
-            let mut system = sysinfo::System::new();
-            system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
-            if system.process(sysinfo::Pid::from_u32(prior.pid)).is_some() {
-                return Err(HostLockError::Io(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    format!("unable to verify prior host pid {}: {error}", prior.pid),
-                )));
+        Err(_) => match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, prior.pid) }
+        {
+            Ok(handle) => handle,
+            Err(error) => {
+                // Fail closed when the PID still appears live but cannot be queried.
+                let mut system = sysinfo::System::new();
+                system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+                if system.process(sysinfo::Pid::from_u32(prior.pid)).is_some() {
+                    return Err(HostLockError::Io(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        format!("unable to verify prior host pid {}: {error}", prior.pid),
+                    )));
+                }
+                // Absent / invalid PID => stale metadata.
+                return Ok(false);
             }
-            // Absent / invalid PID => stale metadata.
-            return Ok(false);
-        }
+        },
     };
 
     struct HandleGuard(windows::Win32::Foundation::HANDLE);
@@ -319,6 +335,10 @@ fn prior_identity_names_live_process(
     }
     let guard = HandleGuard(handle);
 
+    if prior_process_has_exited(guard.0) {
+        return Ok(false);
+    }
+
     let live_pid = unsafe { GetProcessId(guard.0) };
     if live_pid == 0 || live_pid != prior.pid {
         return Ok(false);
@@ -327,6 +347,9 @@ fn prior_identity_names_live_process(
     let live_ticks = match process_creation_ticks(guard.0) {
         Ok(ticks) => ticks,
         Err(_) => {
+            if prior_process_has_exited(guard.0) {
+                return Ok(false);
+            }
             return Err(HostLockError::Io(std::io::Error::new(
                 std::io::ErrorKind::Other,
                 format!(
@@ -339,6 +362,9 @@ fn prior_identity_names_live_process(
     let live_exe = match process_image_path(guard.0) {
         Ok(path) => path,
         Err(_) => {
+            if prior_process_has_exited(guard.0) {
+                return Ok(false);
+            }
             return Err(HostLockError::Io(std::io::Error::new(
                 std::io::ErrorKind::Other,
                 format!(
@@ -355,6 +381,68 @@ fn prior_identity_names_live_process(
     };
 
     Ok(live_ticks == prior.process_creation_filetime_ticks && live_exe == prior_exe)
+}
+
+/// True when the opened process object has already exited.
+///
+/// `WaitForSingleObject` needs `PROCESS_SYNCHRONIZE`. `GetExitCodeProcess`
+/// works with query-limited access and covers the handle we opened after
+/// that right was denied. Exit code 259 (`STILL_ACTIVE`) is treated as live.
+#[cfg(windows)]
+fn prior_process_has_exited(handle: windows::Win32::Foundation::HANDLE) -> bool {
+    use windows::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
+
+    const STILL_ACTIVE: u32 = 259;
+
+    let wait = unsafe { WaitForSingleObject(handle, 0) };
+    if wait == WAIT_OBJECT_0 {
+        return true;
+    }
+    if wait == WAIT_TIMEOUT {
+        return false;
+    }
+
+    let mut exit_code = 0u32;
+    unsafe { GetExitCodeProcess(handle, &mut exit_code) }.is_ok() && exit_code != STILL_ACTIVE
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+    use std::process::{Command, Stdio};
+
+    #[test]
+    fn exited_prior_pid_with_held_child_handle_is_stale_not_io_error() {
+        let dir = tempfile::tempdir().expect("profile root");
+        let profile = "lock-stale-zombie";
+        let mut child = Command::new("cmd.exe")
+            .args(["/C", "ping", "-n", "30", "127.0.0.1"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn placeholder prior pid");
+        let identity = HostIdentity {
+            pid: child.id(),
+            process_creation_filetime_ticks: 1,
+            executable_path: PathBuf::from(r"C:\Windows\System32\cmd.exe"),
+            profile: profile.to_string(),
+            protocol_major: PROTOCOL_MAJOR,
+            boot_id: Uuid::now_v7(),
+        };
+        std::fs::write(
+            dir.path().join(LOCK_FILE_NAME),
+            serde_json::to_vec_pretty(&identity).expect("identity json"),
+        )
+        .expect("write stale host.lock");
+        child.kill().expect("kill placeholder prior pid");
+        let _ = child.wait();
+        let lock = HostLock::acquire(dir.path(), profile).unwrap_or_else(|error| {
+            panic!("exited prior pid must be stale even while the child handle is held: {error}")
+        });
+        assert_eq!(lock.identity().profile, profile);
+        drop(child);
+    }
 }
 
 #[cfg(windows)]

@@ -219,6 +219,7 @@ impl CommandBus {
             &envelope.command,
             Command::CreateTask(_)
                 | Command::CreateTaskV2(_)
+                | Command::BindProviderSession { .. }
                 | Command::ServiceControl(_)
                 | Command::StartProviderSession(_)
         ) {
@@ -390,6 +391,86 @@ impl CommandBus {
         Ok((claimed, agent, snapshot))
     }
 
+    /// Enumerate a bounded set of exact provider conversations that can be
+    /// resumed after a host/watch restart. Both the opaque provider identity
+    /// and its original resource id must have been durably bound by the same
+    /// correlated SessionStart event; partial legacy rows are skipped.
+    pub(crate) fn restorable_provider_starts(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<StartProviderSessionIntent>, StoreError> {
+        let limit = limit.min(64);
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self.store.open_query_connection()?;
+        let mut statement = conn.prepare(
+            "SELECT t.task_id, t.revision, t.action_epoch,
+                    a.agent_session_id, a.provider_kind, a.provider_resource_id
+             FROM tasks t
+             JOIN agent_sessions a
+               ON a.agent_session_id = t.primary_agent_session_id
+              AND a.task_id = t.task_id
+             WHERE t.lifecycle = 'open'
+               AND a.lifecycle = 'open'
+               AND a.provider_session_id IS NOT NULL
+               AND a.provider_resource_id IS NOT NULL
+             ORDER BY t.updated_at_ms DESC, t.task_id ASC
+             LIMIT ?1",
+        )?;
+        let mut rows = statement.query(rusqlite::params![
+            i64::try_from(limit).map_err(|_| StoreError::Corruption)?
+        ])?;
+        let mut starts = Vec::with_capacity(limit);
+        while let Some(row) = rows.next()? {
+            let task_bytes: Vec<u8> = row.get(0)?;
+            let revision = u64_from_nonnegative_i64("tasks.revision", row.get(1)?)?;
+            let action_epoch = u64_from_nonnegative_i64("tasks.action_epoch", row.get(2)?)?;
+            let agent_bytes: Vec<u8> = row.get(3)?;
+            let provider_wire: String = row.get(4)?;
+            let resource_bytes: Vec<u8> = row.get(5)?;
+            let provider_kind = ProviderKind::parse_wire(&provider_wire)
+                .ok_or_else(|| StoreError::Projection("invalid provider kind".into()))?;
+            starts.push(StartProviderSessionIntent {
+                task_id: id16("tasks.task_id", &task_bytes)?,
+                agent_session_id: id16("agent_sessions.agent_session_id", &agent_bytes)?,
+                resource_id: id16("agent_sessions.provider_resource_id", &resource_bytes)?,
+                provider_kind,
+                mode: crate::domain::command::ProviderStartMode::ResumeExact,
+                expected_task_revision: revision,
+                expected_action_epoch: action_epoch,
+            });
+        }
+        Ok(starts)
+    }
+
+    /// Load the exact durable provider identity/resource pair for one agent.
+    /// Partial rows are corruption: a provider conversation is never valid
+    /// without the resource established by the same correlated hook fact.
+    pub(crate) fn durable_provider_binding(
+        &self,
+        agent_session_id: AgentSessionId,
+    ) -> Result<Option<(ProviderSessionId, ResourceId)>, StoreError> {
+        let conn = self.store.open_query_connection()?;
+        let row: Option<(Option<String>, Option<Vec<u8>>)> = conn
+            .query_row(
+                "SELECT provider_session_id, provider_resource_id
+                 FROM agent_sessions WHERE agent_session_id = ?1",
+                [agent_session_id.as_bytes().as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        match row {
+            None | Some((None, None)) => Ok(None),
+            Some((Some(provider_session_id), Some(resource_id))) => Ok(Some((
+                ProviderSessionId::new(provider_session_id)
+                    .map_err(|_| StoreError::Projection("invalid provider session id".into()))?,
+                id16("agent_sessions.provider_resource_id", &resource_id)?,
+            ))),
+            Some(_) => Err(StoreError::Corruption),
+        }
+    }
+
     /// Load the durable task and reconstruct its host-owned workspace before
     /// any runtime resource can be handed out.
     pub fn load_task_runtime(
@@ -457,6 +538,36 @@ impl CommandBus {
         lease: Duration,
     ) -> Result<Option<(TaskId, OperationId)>, StoreError> {
         self.store.settle_next_process_empty_task_teardown(lease)
+    }
+
+    /// Settle the next `ReleaseResource` outbox row as process-empty.
+    ///
+    /// Failed launches register a task-owned terminal without creating an OS
+    /// process. Archive still requires that resource to reach `Released` before
+    /// `BeginTaskTeardown` can settle.
+    pub(crate) fn settle_next_resource_release(
+        &mut self,
+        lease: Duration,
+    ) -> Result<Option<(TaskId, OperationId)>, StoreError> {
+        let Some(claim) = self
+            .store
+            .claim_next_dispatch_for_destination(DestinationClass::ResourceRelease, lease)?
+        else {
+            return Ok(None);
+        };
+        let permit = self.store.begin_dispatch(&claim)?;
+        let Effect::ReleaseResource { task_id, .. } = permit.effect() else {
+            return Err(StoreError::Corruption);
+        };
+        let task_id = *task_id;
+        let operation_id = permit.operation_id();
+        let state = self
+            .store
+            .record_dispatch_completion(&permit, DispatchCompletion::Settled)?;
+        if !matches!(state, OperationState::Settled { .. }) {
+            return Err(StoreError::Corruption);
+        }
+        Ok(Some((task_id, operation_id)))
     }
 
     /// Whether the durable host admission singleton is Closing.
@@ -1349,6 +1460,281 @@ mod workspace_authority_tests {
 
         assert_eq!(result, Err(StoreError::HostAuthorityRequired));
         assert!(bus.task_snapshot(task_id).expect("task lookup").is_none());
+    }
+}
+
+#[cfg(test)]
+mod provider_restart_identity_tests {
+    use super::*;
+    use crate::domain::command::{CreateTaskIntent, ProviderStartMode};
+    use crate::domain::resource::ResourceRecipe;
+    use crate::domain::task::{TaskAssignment, TaskAttention, TaskConnectivity, WorkspaceRef};
+
+    fn accepted_revision(receipt: CommandReceipt) -> u64 {
+        match receipt {
+            CommandReceipt::Accepted {
+                task_revision: Some(revision),
+                ..
+            } => revision,
+            other => panic!("expected accepted task receipt, got {other:?}"),
+        }
+    }
+
+    fn task_envelope(
+        client_id: ClientId,
+        task_id: TaskId,
+        revision: u64,
+        command: Command,
+    ) -> CommandEnvelope {
+        CommandEnvelope {
+            command_id: CommandId::new(),
+            client_id,
+            task_id: Some(task_id),
+            issued_at_ms: 1_725_000_100_000,
+            expected_task_revision: Some(revision),
+            command,
+        }
+    }
+
+    fn host_execute(bus: &mut CommandBus, envelope: CommandEnvelope) -> CommandReceipt {
+        bus.execute_host_authorized(envelope, None, RequestId::new(), Uuid::now_v7())
+            .expect("host-authorized command")
+    }
+
+    #[test]
+    fn correlated_provider_binding_is_exact_write_once_and_restorable() {
+        let directory = tempfile::tempdir().expect("provider restart directory");
+        let mut bus =
+            CommandBus::open(&directory.path().join("tasks.sqlite")).expect("command bus");
+        let task_id = TaskId::new();
+        let client_id = ClientId::new();
+        let project_id = ProjectId::new();
+        let created = bus
+            .execute_for_test(CommandEnvelope {
+                command_id: CommandId::new(),
+                client_id,
+                task_id: None,
+                issued_at_ms: 1_725_000_000_000,
+                expected_task_revision: None,
+                command: Command::CreateTask(CreateTaskIntent {
+                    id: task_id,
+                    environment_id: EnvironmentId::new(),
+                    title: "Durable provider restart".into(),
+                    description: None,
+                    project_id,
+                    workspace: WorkspaceRef::Main,
+                    assignment: TaskAssignment::LocalOwner,
+                    created_at_ms: 1_725_000_000_000,
+                    connectivity: TaskConnectivity::Connected,
+                    attention: TaskAttention::None,
+                    activity: TaskActivity::Idle,
+                    review_readiness: ReviewReadiness::NotReady,
+                }),
+            })
+            .expect("create task");
+        let mut revision = accepted_revision(created);
+        let agent_session_id = AgentSessionId::new();
+        revision = accepted_revision(
+            bus.execute(task_envelope(
+                client_id,
+                task_id,
+                revision,
+                Command::RegisterAgentSession {
+                    agent: AgentSessionFacts {
+                        id: agent_session_id,
+                        task_id,
+                        role: AgentRole::Primary,
+                        provider_kind: ProviderKind::Codex,
+                        provider_session_id: None,
+                        lifecycle: AgentSessionLifecycle::Open,
+                        runtime_generation: 7,
+                        revision: 0,
+                    },
+                },
+            ))
+            .expect("register agent"),
+        );
+        revision = accepted_revision(
+            bus.execute(task_envelope(
+                client_id,
+                task_id,
+                revision,
+                Command::SetPrimaryAgent { agent_session_id },
+            ))
+            .expect("set primary agent"),
+        );
+        let resource_id = ResourceId::new();
+        let alternate_resource_id = ResourceId::new();
+        for id in [resource_id, alternate_resource_id] {
+            revision = accepted_revision(
+                bus.execute(task_envelope(
+                    client_id,
+                    task_id,
+                    revision,
+                    Command::RegisterResource {
+                        resource: ResourceFacts {
+                            id,
+                            task_id: Some(task_id),
+                            owner_kind: OwnerKind::Task,
+                            resource_kind: ResourceKind::Terminal,
+                            recipe: ResourceRecipe::Terminal {
+                                cols: 120,
+                                rows: 40,
+                            },
+                            lifecycle: ResourceLifecycle::Active,
+                            runtime_generation: 7,
+                            updated_at_ms: 1_725_000_000_100,
+                        },
+                    },
+                ))
+                .expect("register resource"),
+            );
+        }
+        assert!(bus
+            .restorable_provider_starts(64)
+            .expect("pre-bind restore query")
+            .is_empty());
+
+        let provider_session_id =
+            ProviderSessionId::new("codex-durable-session").expect("provider session");
+        let bind_command =
+            |resource_id, provider_session_id, generation| Command::BindProviderSession {
+                agent_session_id,
+                resource_id,
+                provider_session_id,
+                expected_runtime_generation: generation,
+            };
+        assert_eq!(
+            bus.execute(task_envelope(
+                client_id,
+                task_id,
+                revision,
+                bind_command(resource_id, provider_session_id.clone(), 7),
+            )),
+            Err(StoreError::HostAuthorityRequired),
+            "a client cannot inject provider identity"
+        );
+        revision = accepted_revision(host_execute(
+            &mut bus,
+            task_envelope(
+                client_id,
+                task_id,
+                revision,
+                bind_command(resource_id, provider_session_id.clone(), 7),
+            ),
+        ));
+
+        let starts = bus
+            .restorable_provider_starts(64)
+            .expect("post-bind restore query");
+        assert_eq!(starts.len(), 1);
+        let start = &starts[0];
+        assert_eq!(start.task_id, task_id);
+        assert_eq!(start.agent_session_id, agent_session_id);
+        assert_eq!(start.resource_id, resource_id);
+        assert_eq!(start.provider_kind, ProviderKind::Codex);
+        assert_eq!(start.mode, ProviderStartMode::ResumeExact);
+        assert_eq!(start.expected_task_revision, revision);
+
+        let duplicate = host_execute(
+            &mut bus,
+            task_envelope(
+                client_id,
+                task_id,
+                revision,
+                bind_command(resource_id, provider_session_id.clone(), 7),
+            ),
+        );
+        assert!(
+            matches!(
+                duplicate,
+                CommandReceipt::Rejected {
+                    code: RejectionCode::AlreadyExists,
+                    ..
+                }
+            ),
+            "duplicate binding returned {duplicate:?}"
+        );
+        let wrong_resource = host_execute(
+            &mut bus,
+            task_envelope(
+                client_id,
+                task_id,
+                revision,
+                bind_command(alternate_resource_id, provider_session_id.clone(), 7),
+            ),
+        );
+        assert!(matches!(
+            wrong_resource,
+            CommandReceipt::Rejected {
+                code: RejectionCode::OwnershipConflict,
+                ..
+            }
+        ));
+        let wrong_session = host_execute(
+            &mut bus,
+            task_envelope(
+                client_id,
+                task_id,
+                revision,
+                bind_command(
+                    resource_id,
+                    ProviderSessionId::new("replacement-session").expect("replacement"),
+                    7,
+                ),
+            ),
+        );
+        assert!(matches!(
+            wrong_session,
+            CommandReceipt::Rejected {
+                code: RejectionCode::OwnershipConflict,
+                ..
+            }
+        ));
+        let stale_generation = host_execute(
+            &mut bus,
+            task_envelope(
+                client_id,
+                task_id,
+                revision,
+                bind_command(resource_id, provider_session_id, 8),
+            ),
+        );
+        assert!(matches!(
+            stale_generation,
+            CommandReceipt::Rejected {
+                code: RejectionCode::InvalidTransition,
+                ..
+            }
+        ));
+        assert_eq!(
+            bus.restorable_provider_starts(64)
+                .expect("stable restore query")[0]
+                .resource_id,
+            resource_id,
+            "conflicting retries must not retarget the durable conversation"
+        );
+
+        let rebuild = bus
+            .store
+            .rebuild_projections()
+            .expect("rebuild provider projections");
+        assert!(rebuild.events_replayed > 0);
+        assert_eq!(
+            bus.durable_provider_binding(agent_session_id)
+                .expect("rebuilt durable binding"),
+            Some((
+                ProviderSessionId::new("codex-durable-session").expect("provider session"),
+                resource_id,
+            ))
+        );
+        assert_eq!(
+            bus.restorable_provider_starts(64)
+                .expect("rebuilt restore query")[0]
+                .resource_id,
+            resource_id,
+            "projection rebuild must preserve the exact restart resource"
+        );
     }
 }
 
@@ -3053,7 +3439,7 @@ fn require_current_effect_ownership(
             if !owned_ok
                 || lifecycle != "open"
                 || current_kind != provider_kind.wire_name()
-                || expected_session.as_ref() != Some(provider_session_id)
+                || expected_session != *provider_session_id
                 || generation != *runtime_generation
             {
                 return Err(StoreError::StaleFence);
@@ -3537,6 +3923,44 @@ fn execute_in_tx(
     };
     let current_revision = snapshot.as_ref().map(|snap| snap.task.revision);
 
+    if let Command::BindProviderSession {
+        agent_session_id,
+        resource_id,
+        provider_session_id,
+        ..
+    } = &envelope.command
+    {
+        let existing: Option<(Option<String>, Option<Vec<u8>>)> = tx
+            .query_row(
+                "SELECT provider_session_id, provider_resource_id
+                 FROM agent_sessions
+                 WHERE agent_session_id = ?1",
+                [agent_session_id.as_bytes().as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((existing_session, existing_resource)) = existing {
+            match (existing_session, existing_resource) {
+                (None, None) => {}
+                (Some(existing_session), Some(existing_resource))
+                    if existing_session == provider_session_id.as_str()
+                        && existing_resource.as_slice() == resource_id.as_bytes() => {}
+                (Some(_), Some(_)) => {
+                    return persist_rejection(
+                        tx,
+                        &envelope,
+                        effective_task_id,
+                        RejectionCode::OwnershipConflict,
+                        current_revision,
+                        accepted_at_ms,
+                        scope,
+                    );
+                }
+                _ => return Err(StoreError::Corruption),
+            }
+        }
+    }
+
     match decide(snapshot.as_ref(), &envelope) {
         Err(code) => {
             let resolution = provider_resolution_for_rejection(snapshot.as_ref(), &envelope);
@@ -3801,17 +4225,21 @@ fn lookup_receipt_for_scope(
         .as_ref()
         .is_some_and(|digest| digest == &expected_payload_digest);
     let expected_task_id = effective_task_scope(envelope);
-    if client_id != envelope.client_id || task_id != expected_task_id {
+    if client_id != envelope.client_id {
         return Err(StoreError::CommandIdConflict);
     }
-    if !fingerprint_matches {
-        if stored_payload_digest.is_some()
-            && !payload_matches
-            && matches!(
-                &envelope.command,
-                Command::ConfirmHostQuit(_) | Command::SubmitProviderInput(_)
-            )
-        {
+    let typed_idempotency_conflict = stored_payload_digest.is_some()
+        && !payload_matches
+        && matches!(
+            &envelope.command,
+            Command::ConfirmHostQuit(_) | Command::SubmitProviderInput(_)
+        );
+    // These two duplex commands expose a typed, caller-owned collision result.
+    // A same-client command-id reuse must remain writable even when the older
+    // command occupied a different task scope; it must never be mistaken for
+    // an accepted quit/input effect. Cross-client collisions still fail closed.
+    if task_id != expected_task_id {
+        if typed_idempotency_conflict {
             let current_revision = expected_task_id
                 .map(|task_id| load_task_snapshot(tx, task_id))
                 .transpose()?
@@ -3826,13 +4254,23 @@ fn lookup_receipt_for_scope(
         }
         return Err(StoreError::CommandIdConflict);
     }
-    if stored_payload_digest.is_some()
-        && !payload_matches
-        && matches!(
-            &envelope.command,
-            Command::ConfirmHostQuit(_) | Command::SubmitProviderInput(_)
-        )
-    {
+    if !fingerprint_matches {
+        if typed_idempotency_conflict {
+            let current_revision = expected_task_id
+                .map(|task_id| load_task_snapshot(tx, task_id))
+                .transpose()?
+                .flatten()
+                .map(|snapshot| snapshot.task.revision);
+            return Ok(Some(CommandReceipt::Rejected {
+                command_id: envelope.command_id,
+                code: RejectionCode::IdempotencyConflict,
+                current_revision,
+                resolution: None,
+            }));
+        }
+        return Err(StoreError::CommandIdConflict);
+    }
+    if typed_idempotency_conflict {
         let current_revision = expected_task_id
             .map(|task_id| load_task_snapshot(tx, task_id))
             .transpose()?
@@ -6036,20 +6474,11 @@ fn validate_settled_result_fact(
                 && result_approval == *approval_id => {}
             _ => return Err(StoreError::Corruption),
         }
-        let snapshot = load_task_snapshot(tx, scope)?.ok_or(StoreError::Corruption)?;
-        let session = snapshot
-            .provider_sessions
-            .get(agent_session_id)
-            .ok_or(StoreError::Corruption)?;
-        let Some(settlement) = session.last_settlement else {
-            return Err(StoreError::Corruption);
-        };
-        if settlement.command_id != *command_id
-            || settlement.operation_id != Some(*operation_id)
-            || !settlement.delivery.is_delivered()
-        {
-            return Err(StoreError::Corruption);
-        }
+        // A provider session keeps only its latest settlement. Requiring that
+        // current projection to still name this operation makes every earlier
+        // delivered turn look corrupt as soon as a later turn settles. The
+        // immutable delivered fact above proves this operation's result; the
+        // complete ordered replay below proves the latest provider projection.
         let _ = validate_task_history_and_projection(tx, scope)?;
         return Ok(());
     }
@@ -8013,13 +8442,28 @@ pub(crate) fn load_task_snapshot(
     conn: &Connection,
     task_id: TaskId,
 ) -> Result<Option<TaskSnapshot>, StoreError> {
-    let Some(task_row) = load_task_row(conn, task_id)? else {
+    let Some(task_row) = load_task_row(conn, task_id).map_err(|error| {
+        StoreError::Projection(format!("task {task_id} row is invalid: {error}"))
+    })?
+    else {
         return Ok(None);
     };
 
-    let agents = load_agents(conn, task_id)?;
-    let artifacts = load_artifacts(conn, task_id)?;
-    let resources = load_resources(conn, task_id)?;
+    let agents = load_agents(conn, task_id).map_err(|error| {
+        StoreError::Projection(format!(
+            "task {task_id} agent projection is invalid: {error}"
+        ))
+    })?;
+    let artifacts = load_artifacts(conn, task_id).map_err(|error| {
+        StoreError::Projection(format!(
+            "task {task_id} artifact projection is invalid: {error}"
+        ))
+    })?;
+    let resources = load_resources(conn, task_id).map_err(|error| {
+        StoreError::Projection(format!(
+            "task {task_id} resource projection is invalid: {error}"
+        ))
+    })?;
 
     if let Some(primary_id) = task_row.primary_agent_id {
         let Some(agent) = agents.get(&primary_id) else {
@@ -8075,8 +8519,16 @@ pub(crate) fn load_task_snapshot(
         primary_agent_id: task_row.primary_agent_id,
         artifacts,
         resources,
-        provider_sessions: load_provider_sessions(conn, task_id)?,
-        browser: load_browser_book(conn, task_id, task_lifecycle)?,
+        provider_sessions: load_provider_sessions(conn, task_id).map_err(|error| {
+            StoreError::Projection(format!(
+                "task {task_id} provider projection is invalid: {error}"
+            ))
+        })?,
+        browser: load_browser_book(conn, task_id, task_lifecycle).map_err(|error| {
+            StoreError::Projection(format!(
+                "task {task_id} browser projection is invalid: {error}"
+            ))
+        })?,
     }))
 }
 

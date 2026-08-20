@@ -12,7 +12,7 @@ use crate::kernel::outbox::Effect;
 use crate::providers::input::{
     deliver_through_capability, sequence_bounded_input, sequence_provider_action,
     BoundProviderInputPort, ProviderInputDeliveryError, ProviderInputDeliveryIdentity,
-    ACTION_PROVIDER_SEND_NOW,
+    ProviderRuntimeByteWriter, ProviderRuntimeWriteHandle, ACTION_PROVIDER_SEND_NOW,
 };
 use std::time::Duration;
 use tempfile::TempDir;
@@ -180,6 +180,125 @@ fn delivered_event_count(store: &KernelStore) -> i64 {
         .expect("count delivered")
 }
 
+struct AcceptingRuntimeWriter;
+
+impl ProviderRuntimeByteWriter for AcceptingRuntimeWriter {
+    fn write_provider_action(
+        &self,
+        _fence: &crate::process::registry::ManagedProcessFence,
+        _identity: &ProviderInputDeliveryIdentity,
+        _action: &ProviderInputAction,
+        _logical_bytes: &[u8],
+    ) -> Result<(), ProviderInputDeliveryError> {
+        Ok(())
+    }
+}
+
+fn settle_with_accepting_runtime(
+    store: &mut KernelStore,
+    permit: &DispatchPermit,
+) -> OperationState {
+    let identity = identity_from_effect(permit.effect());
+    let action = match permit.effect() {
+        Effect::DeliverProviderInput { action, .. } => action.clone(),
+        other => panic!("expected DeliverProviderInput, got {other:?}"),
+    };
+    let plan = sequence_provider_action(&action).expect("provider delivery plan");
+    let fence = crate::process::registry::ManagedProcessFence::new(
+        crate::domain::operation::ResourceFence::new(
+            crate::domain::ResourceId::new(),
+            identity.runtime_generation,
+        ),
+        crate::process::identity::ProcessOwner::Task(identity.task_id),
+        crate::process::identity::ManagedProcessIdentity::new(
+            crate::process::identity::ManagedProcessId::new(7, 11).expect("pid"),
+            std::env::current_exe().expect("test executable"),
+        )
+        .expect("managed identity"),
+    );
+    let handle =
+        ProviderRuntimeWriteHandle::bind(identity.clone(), fence, Box::new(AcceptingRuntimeWriter))
+            .expect("write handle");
+    let receipt = handle
+        .write_action(&identity, &action, &plan)
+        .expect("live write");
+    store
+        .settle_provider_input_delivery(permit, &receipt)
+        .expect("settle provider delivery")
+}
+
+#[test]
+fn historical_settled_provider_turn_remains_queryable_after_a_later_turn_settles() {
+    let dir = TempDir::new().expect("tempdir");
+    let mut store = KernelStore::open(&dir.path().join("historical.sqlite3")).expect("open");
+    let (first_operation_id, first_permit) = seed_provider_dispatch(&mut store, 0x81);
+    let first_identity = identity_from_effect(first_permit.effect());
+    assert!(matches!(
+        settle_with_accepting_runtime(&mut store, &first_permit),
+        OperationState::Settled { .. }
+    ));
+
+    let (revision, action_epoch): (i64, i64) = store
+        .conn
+        .query_row(
+            "SELECT revision, action_epoch FROM tasks WHERE task_id = ?1",
+            [first_identity.task_id.as_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("current task fence");
+    let second_command_id = CommandId::from_bytes(fixed_uuid_v7(0x8D)).expect("second command");
+    let second = store
+        .execute_for_test(CommandEnvelope {
+            command_id: second_command_id,
+            client_id: first_identity.client_id,
+            task_id: Some(first_identity.task_id),
+            issued_at_ms: 1_725_003_000_100,
+            expected_task_revision: Some(u64::try_from(revision).expect("revision")),
+            command: Command::SubmitProviderInput(
+                SubmitProviderInputIntent::try_new(
+                    first_identity.agent_session_id,
+                    first_identity.runtime_generation,
+                    first_identity.turn_id,
+                    u64::try_from(action_epoch).expect("action epoch"),
+                    None,
+                    None,
+                    ProviderInputAction::SteerCurrentTurn {
+                        text: "second delivered turn".into(),
+                    },
+                )
+                .expect("second provider input"),
+            ),
+        })
+        .expect("accept second provider turn");
+    let CommandReceipt::Accepted {
+        operation_id: second_operation_id,
+        ..
+    } = second
+    else {
+        panic!("second provider turn must be accepted: {second:?}");
+    };
+    let second_claim = store
+        .claim_next_dispatch(Duration::from_secs(30))
+        .expect("claim second provider turn")
+        .expect("second provider turn is dispatchable");
+    let second_permit = store
+        .begin_dispatch(&second_claim)
+        .expect("begin second provider turn");
+    assert!(matches!(
+        settle_with_accepting_runtime(&mut store, &second_permit),
+        OperationState::Settled { .. }
+    ));
+
+    for operation_id in [first_operation_id, second_operation_id] {
+        assert!(matches!(
+            store
+                .operation_status(operation_id)
+                .expect("provider operation status"),
+            Some(OperationState::Settled { .. })
+        ));
+    }
+}
+
 #[test]
 fn generic_completion_cannot_settle_provider_input() {
     let dir = TempDir::new().expect("tempdir");
@@ -229,16 +348,20 @@ fn plan_only_and_bind_only_cannot_settle_provider_input() {
     assert_eq!(delivered_event_count(&store), 0);
 }
 
-#[cfg(windows)]
 #[test]
 fn live_write_receipt_settles_and_rejects_stale_action_or_bytes() {
-    use crate::providers::session::{
-        LaunchNonce, ProviderLaunchMode, ProviderLaunchOutcome, ProviderLaunchSpec,
-        ProviderRuntimeLaunchRequest, RuntimeCorrelation,
-    };
-    use crate::services::ProcessManager;
-    use std::collections::BTreeMap;
-    use std::path::PathBuf;
+    struct AcceptingRuntimeWriter;
+    impl ProviderRuntimeByteWriter for AcceptingRuntimeWriter {
+        fn write_provider_action(
+            &self,
+            _fence: &crate::process::registry::ManagedProcessFence,
+            _identity: &ProviderInputDeliveryIdentity,
+            _action: &ProviderInputAction,
+            _logical_bytes: &[u8],
+        ) -> Result<(), ProviderInputDeliveryError> {
+            Ok(())
+        }
+    }
 
     let dir = TempDir::new().expect("tempdir");
     let mut store = KernelStore::open(&dir.path().join("receipt.sqlite3")).expect("open");
@@ -249,57 +372,19 @@ fn live_write_receipt_settles_and_rejects_stale_action_or_bytes() {
         other => panic!("expected DeliverProviderInput, got {other:?}"),
     };
     let plan = sequence_provider_action(&action).expect("plan");
-    let manager = ProcessManager::new();
-    let mut launcher = manager.provider_process_launcher();
-    let executable = crate::providers::capabilities::ProviderExecutable::from_path(PathBuf::from(
-        r"C:\Windows\System32\cmd.exe",
-    ))
-    .expect("cmd");
     let resource_id = crate::domain::ResourceId::new();
-    let launch_nonce = LaunchNonce::new();
-    let request = ProviderRuntimeLaunchRequest::sealed(
-        RuntimeCorrelation::sealed(
-            identity.task_id,
-            identity.agent_session_id,
-            identity.provider_kind,
-            identity.runtime_generation,
-            identity.action_epoch,
-            launch_nonce,
-        ),
-        ProviderLaunchSpec::sealed(
-            identity.provider_kind,
-            executable,
-            ProviderLaunchMode::ResumeExact(identity.provider_session_id.clone()),
-            Vec::new(),
-            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            BTreeMap::new(),
-            crate::providers::capabilities::ProviderCapabilities {
-                kind: identity.provider_kind,
-                version: crate::providers::capabilities::ProviderVersion::new("1.0.0-test")
-                    .expect("version"),
-                auth_state: crate::providers::capabilities::ProviderAuthState::Unknown,
-                exact_resume: crate::providers::capabilities::CapabilitySupport::Supported,
-                semantic_events: crate::providers::capabilities::CapabilitySupport::Unsupported,
-                provider_session_id: crate::providers::capabilities::CapabilitySupport::Supported,
-                build_launch: crate::providers::capabilities::CapabilitySupport::Supported,
-                parse_signal: crate::providers::capabilities::CapabilitySupport::Unsupported,
-                cooperative_stop: crate::providers::capabilities::CapabilitySupport::Unsupported,
-                observe_quota: crate::providers::capabilities::CapabilitySupport::Unsupported,
-                evidence: vec![],
-            },
-            identity.task_id,
-            resource_id,
-            crate::domain::TerminalId::new(),
-            identity.runtime_generation,
-            launch_nonce,
-        ),
+    let fence = crate::process::registry::ManagedProcessFence::new(
+        crate::domain::operation::ResourceFence::new(resource_id, identity.runtime_generation),
+        crate::process::identity::ProcessOwner::Task(identity.task_id),
+        crate::process::identity::ManagedProcessIdentity::new(
+            crate::process::identity::ManagedProcessId::new(7, 11).expect("pid"),
+            std::env::current_exe().expect("test executable"),
+        )
+        .expect("managed identity"),
     );
-    let ProviderLaunchOutcome::Started(mut lease) = launcher.launch(&request) else {
-        panic!("expected live permit");
-    };
-    let handle = launcher
-        .write_handle(identity.clone(), &lease)
-        .expect("write handle");
+    let handle =
+        ProviderRuntimeWriteHandle::bind(identity.clone(), fence, Box::new(AcceptingRuntimeWriter))
+            .expect("write handle");
     let mut stale = identity.clone();
     stale.runtime_generation = stale.runtime_generation.saturating_add(1);
     assert_eq!(
@@ -329,5 +414,36 @@ fn live_write_receipt_settles_and_rejects_stale_action_or_bytes() {
         store.operation_status(operation_id).expect("status"),
         Some(OperationState::Settled { .. })
     ));
-    let _ = launcher.stop_and_join(&mut lease);
+}
+
+#[test]
+fn expired_provider_dispatch_is_recovered_as_uncertain_without_replay() {
+    let dir = TempDir::new().expect("tempdir");
+    let mut store = KernelStore::open(&dir.path().join("expired.sqlite3")).expect("open");
+    let (operation_id, permit) = seed_provider_dispatch(&mut store, 0x31);
+    store
+        .conn
+        .execute(
+            "UPDATE outbox SET leased_until_ms = 0 WHERE outbox_id = ?1",
+            [permit.outbox_id().as_bytes().as_slice()],
+        )
+        .expect("expire simulated crashed dispatch");
+
+    assert_eq!(
+        store
+            .recover_next_expired_dispatch(Duration::from_millis(1))
+            .expect("recover"),
+        Some(AmbiguityDisposition::Uncertain)
+    );
+    assert!(matches!(
+        store.operation_status(operation_id).expect("status"),
+        Some(OperationState::Uncertain { .. })
+    ));
+    assert!(store
+        .claim_next_dispatch_for_destination(
+            DestinationClass::ProviderInput,
+            Duration::from_secs(30),
+        )
+        .expect("no retry")
+        .is_none());
 }

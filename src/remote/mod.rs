@@ -59,6 +59,10 @@ const IDLE_BROADCAST_INTERVAL: Duration = Duration::from_millis(250);
 const PENDING_BOOTSTRAP_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 pub(in crate::remote) const REMOTE_WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(500);
 const REMOTE_CALLBACK_TIMEOUT: Duration = Duration::from_millis(500);
+// Native outbound traffic is channel-backed while readiness waits observe only
+// the socket. Bound those waits independently from the heartbeat so terminal
+// output and user input cannot sit queued for the two-second heartbeat period.
+const NATIVE_OUTBOUND_POLL_INTERVAL: Duration = Duration::from_millis(50);
 // Loopback connects normally settle immediately. Keep each OS connect attempt
 // below the lifecycle join budget so cancellation is observed before teardown
 // is forced to retain worker residue.
@@ -3622,8 +3626,6 @@ pub(crate) struct RemoteHostInner {
     #[cfg(test)]
     semantic_delivery_test_hook: RwLock<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
-    port_forward_authorizer_test_hook: RwLock<Option<Arc<dyn Fn(u16) -> bool + Send + Sync>>>,
-    #[cfg(test)]
     port_forward_connector_test_hook:
         RwLock<Option<Arc<dyn Fn(u16) -> Result<TcpStream, String> + Send + Sync>>>,
     #[cfg(test)]
@@ -3967,8 +3969,6 @@ impl RemoteHostService {
             semantic_delivery_lock: Mutex::new(()),
             #[cfg(test)]
             semantic_delivery_test_hook: RwLock::new(None),
-            #[cfg(test)]
-            port_forward_authorizer_test_hook: RwLock::new(None),
             #[cfg(test)]
             port_forward_connector_test_hook: RwLock::new(None),
             #[cfg(test)]
@@ -9025,7 +9025,7 @@ fn handle_client_connection_with_weak(
                     drop(inner);
                     if wait_for_remote_socket_io(
                         &stream.sock,
-                        Instant::now() + HEARTBEAT_INTERVAL,
+                        Instant::now() + NATIVE_OUTBOUND_POLL_INTERVAL,
                         false,
                     )
                     .is_err()
@@ -10218,7 +10218,9 @@ fn run_client_connection(
 ) {
     let mut read_buffer = Vec::new();
     let mut last_heartbeat_at = Instant::now();
-    let _ = stream.sock.set_read_timeout(Some(HEARTBEAT_INTERVAL));
+    let _ = stream
+        .sock
+        .set_read_timeout(Some(NATIVE_OUTBOUND_POLL_INTERVAL));
 
     while inner
         .disconnected_message
@@ -12214,7 +12216,7 @@ mod tests {
     fn production_remote_loops_have_no_short_timeout_polling() {
         let source = include_str!("mod.rs");
         let production = source
-            .split("#[cfg(test)]\nmod tests {")
+            .split("#[cfg(test)]")
             .next()
             .expect("remote production source boundary");
         assert!(!production.contains("recv_timeout(Duration::from_millis(25))"));
@@ -12967,7 +12969,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_output_is_recorded_without_raw_terminal_subscribers() {
+    fn ai_raw_output_is_not_recorded_without_raw_terminal_subscribers() {
         let service = RemoteHostService::new(RemoteHostConfig::default());
         let mut app = AppState::default();
         app.open_tabs.push(SessionTab {
@@ -13017,7 +13019,7 @@ mod tests {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(output, vec!["red\nnext"]);
+        assert!(output.is_empty());
         assert!(service.inner.clients.lock().unwrap().is_empty());
         assert!(service.inner.snapshot_revision.load(Ordering::Relaxed) > before_revision);
     }
@@ -13086,7 +13088,7 @@ mod tests {
     }
 
     #[test]
-    fn ai_push_session_output_projects_screen_snapshot_instead_of_byte_dumps() {
+    fn ai_push_session_output_keeps_screen_snapshots_out_of_conversation() {
         let service = RemoteHostService::new(RemoteHostConfig::default());
         let mut app = AppState::default();
         app.open_tabs.push(SessionTab {
@@ -13161,32 +13163,25 @@ mod tests {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(outputs, vec!["frame two"]);
-        assert!(replay.events.iter().any(|event| {
-            matches!(event.kind, SemanticEventKind::Output { .. })
-                && event.replaces_sequence.is_some()
-        }));
+        assert!(outputs.is_empty());
+        assert!(replay
+            .events
+            .iter()
+            .all(|event| !matches!(event.kind, SemanticEventKind::Output { .. })));
     }
 
     #[test]
     fn semantic_projection_runs_outside_the_snapshot_state_lock() {
         let service = RemoteHostService::new(RemoteHostConfig::default());
-        let mut app = AppState::default();
-        app.open_tabs.push(SessionTab {
-            id: "tab-stable".to_string(),
-            tab_type: TabType::Claude,
-            pty_session_id: Some("pty-ephemeral".to_string()),
-            provider_session_id: None,
-            ..SessionTab::default()
-        });
+        let app = AppState::default();
         let mut runtime = SessionRuntimeState::new(
             "pty-ephemeral",
             PathBuf::new(),
             SessionDimensions::default(),
             TerminalBackend::default(),
         );
-        runtime.session_kind = SessionKind::Claude;
-        runtime.tab_id = Some("tab-stable".to_string());
+        runtime.session_kind = SessionKind::Shell;
+        runtime.command_id = Some("shell-command".to_string());
         let mut runtime_state = RuntimeState::default();
         runtime_state
             .sessions
@@ -13231,7 +13226,7 @@ mod tests {
         wait_for(
             || {
                 service
-                    .semantic_replay(&StableSessionKey::from_tab("tab-stable"), 0)
+                    .semantic_replay(&StableSessionKey::from_server("shell-command"), 0)
                     .is_some_and(|replay| {
                         replay.events.iter().any(|event| {
                             matches!(
@@ -15923,6 +15918,10 @@ mod tests {
             "native client never subscribed to the open terminal",
         );
 
+        // Let the connection worker enter its readiness wait so this proves
+        // channel-delivered output wakes promptly even when the peer sends no
+        // further socket input.
+        thread::sleep(Duration::from_millis(100));
         service.push_session_output("alpha", b"hello\r\n".to_vec());
         wait_for(
             || {
@@ -15931,7 +15930,7 @@ mod tests {
                     .session_screen_text("alpha")
                     .is_some_and(|text| text.contains("hello"))
             },
-            Duration::from_secs(3),
+            Duration::from_millis(750),
             "native client did not paint output while bootstrap was blocked",
         );
 
@@ -16755,7 +16754,7 @@ mod tests {
         let service = RemoteHostService::new(config);
         service.update_snapshot(
             managed_server_state(server_port),
-            managed_server_runtime("command-web", 4242),
+            managed_server_runtime("command-web", 4242, server_port),
             HashMap::from([(
                 server_port,
                 PortStatus {
@@ -16831,7 +16830,7 @@ mod tests {
         let service = RemoteHostService::new(config);
         service.update_snapshot(
             managed_server_state(server_port),
-            managed_server_runtime("command-web", 4242),
+            managed_server_runtime("command-web", 4242, server_port),
             HashMap::from([(
                 server_port,
                 PortStatus {
@@ -16890,7 +16889,7 @@ mod tests {
         let service = RemoteHostService::new(config.clone());
         service.update_snapshot(
             managed_server_state(server_port),
-            managed_server_runtime("command-web", 4242),
+            managed_server_runtime("command-web", 4242, server_port),
             HashMap::from([(
                 server_port,
                 PortStatus {
@@ -17088,9 +17087,18 @@ mod tests {
             crate::process::ports::PortStatusKind::ManagedHealthy,
             "forward authority must come from the strict live snapshot: {live_status:?}"
         );
+        let capability = Arc::new(crate::process::ports::test_capability_from_snapshot(
+            managed,
+        ));
         let authority = RemotePortAuthority::from_rich(&live_status, now_epoch_ms())
-            .with_snapshot_metadata(live_snapshot.publication_sequence(), 1, 1);
-        let runtime = managed_server_runtime("command-web", process_id);
+            .with_snapshot_metadata(
+                live_snapshot.publication_sequence(),
+                capability.snapshot().membership_revision(),
+                capability.snapshot().observation_sequence(),
+            )
+            .with_session_id("command-web")
+            .with_managed_capability(capability.as_ref());
+        let runtime = managed_server_runtime("command-web", process_id, server_port);
         let legacy_status = PortStatus {
             port: server_port,
             in_use: !live_status.listeners().is_empty(),
@@ -17103,6 +17111,7 @@ mod tests {
             Some(HashMap::from([(server_port, legacy_status)])),
             Some(HashMap::from([(server_port, authority)])),
         );
+        service.update_managed_port_capabilities(HashMap::from([(server_port, capability)]));
 
         let (upstream_done_tx, upstream_done_rx) = mpsc::sync_channel(1);
         let upstream_thread = thread::spawn(move || {
@@ -17168,12 +17177,7 @@ mod tests {
             last_seen_epoch_ms: Some(1),
         });
         let root = RemoteHostService::new(config);
-        *root
-            .inner
-            .port_forward_authorizer_test_hook
-            .write()
-            .expect("port-forward test hook lock") =
-            Some(Arc::new(move |port| port == server_port));
+        publish_live_managed_port(&root, server_port);
 
         let (upstream_closed_tx, upstream_closed_rx) = mpsc::sync_channel(1);
         let upstream_thread = thread::spawn(move || {
@@ -17751,12 +17755,6 @@ mod tests {
         let host = RemoteHostService::new(host_config.clone());
         *host
             .inner
-            .port_forward_authorizer_test_hook
-            .write()
-            .expect("forward authorizer hook lock") =
-            Some(Arc::new(move |port| port == local_port));
-        *host
-            .inner
             .port_forward_connector_test_hook
             .write()
             .expect("forward connector hook lock") = Some(Arc::new(move |port| {
@@ -17777,6 +17775,7 @@ mod tests {
         .expect("remote client should connect");
         let manager = LocalPortForwardManager::new(client.client.clone());
         assert!(manager.sync_ports(&[local_port]));
+        publish_live_managed_port(&host, local_port);
 
         let (upstream_closed_tx, upstream_closed_rx) = mpsc::sync_channel(1);
         let upstream_worker = thread::spawn(move || {
@@ -18653,7 +18652,7 @@ mod tests {
         state
     }
 
-    fn managed_server_runtime(command_id: &str, pid: u32) -> RuntimeState {
+    fn managed_server_runtime(command_id: &str, pid: u32, port: u16) -> RuntimeState {
         let mut runtime = RuntimeState::default();
         let mut session = SessionRuntimeState::new(
             command_id.to_string(),
@@ -18661,12 +18660,109 @@ mod tests {
             SessionDimensions::default(),
             TerminalBackend::PortablePtyFeedingAlacritty,
         );
+        session.configure_server(crate::state::ServerLaunchSpec {
+            command_id: command_id.to_string(),
+            project_id: "project-web".to_string(),
+            port: Some(port),
+            cwd: PathBuf::from("."),
+            program: "test-server".to_string(),
+            args: Vec::new(),
+            env: HashMap::new(),
+            auto_restart: false,
+            log_file_path: None,
+        });
         session.status = crate::state::SessionStatus::Running;
         session.pid = Some(pid);
-        session.command_id = Some(command_id.to_string());
         session.resources.process_ids.push(pid);
         runtime.sessions.insert(command_id.to_string(), session);
         runtime
+    }
+
+    fn publish_live_managed_port(service: &RemoteHostService, port: u16) {
+        let inventory = crate::services::ports_service::PortInventory::new();
+        let live_snapshot = inventory
+            .refresh(&[port])
+            .expect("strict live port inventory should complete");
+        assert!(live_snapshot.is_valid(), "live port snapshot must validate");
+        let live_listener = live_snapshot
+            .observation(port)
+            .expect("live port observation")
+            .listeners()
+            .first()
+            .expect("live listener identity");
+        let process_id = live_listener.pid();
+        let executable = live_listener
+            .canonical_executable()
+            .expect("strict live listener must include executable proof")
+            .to_path_buf();
+        let managed_identity = crate::process::identity::ManagedProcessIdentity::new(
+            crate::process::identity::ManagedProcessId::new(
+                process_id,
+                live_listener.creation_time_100ns(),
+            )
+            .expect("live listener process identity should be valid"),
+            executable,
+        )
+        .expect("live listener executable should canonicalize");
+        let resource = ResourceFence::new(ResourceId::new(), 1);
+        let managed = crate::process::ports::ManagedResourceSnapshot::new(
+            crate::process::registry::ManagedProcessFence::new(
+                resource,
+                crate::process::identity::ProcessOwner::Host,
+                managed_identity.clone(),
+            ),
+            crate::process::registry::ManagedProcessState::Running,
+            vec![managed_identity],
+            crate::process::ports::RegistryMembershipSnapshot::valid(
+                1,
+                1,
+                Instant::now(),
+                Duration::from_secs(5),
+            ),
+        );
+        let observed_at = live_snapshot.observed_at();
+        let live_status = crate::process::ports::project_port_status_from_snapshot_at(
+            &crate::process::ports::PortTarget::new(
+                port,
+                resource,
+                crate::process::ports::ManagedPortHealth::Ready,
+            ),
+            &live_snapshot,
+            Some(&managed),
+            Instant::now(),
+            observed_at
+                .checked_add(crate::process::ports::DEFAULT_FREE_PROOF_MAX_AGE)
+                .expect("live snapshot deadline should fit"),
+        );
+        assert_eq!(
+            live_status.kind(),
+            crate::process::ports::PortStatusKind::ManagedHealthy,
+            "test listener must project as live managed authority: {live_status:?}"
+        );
+        let capability = Arc::new(crate::process::ports::test_capability_from_snapshot(
+            managed,
+        ));
+        let authority = RemotePortAuthority::from_rich(&live_status, now_epoch_ms())
+            .with_snapshot_metadata(
+                live_snapshot.publication_sequence(),
+                capability.snapshot().membership_revision(),
+                capability.snapshot().observation_sequence(),
+            )
+            .with_session_id("command-web")
+            .with_managed_capability(capability.as_ref());
+        let legacy_status = PortStatus {
+            port,
+            in_use: true,
+            pid: Some(process_id),
+            process_name: None,
+        };
+        service.update_snapshot_parts_with_authorities(
+            Some(managed_server_state(port)),
+            Some(managed_server_runtime("command-web", process_id, port)),
+            Some(HashMap::from([(port, legacy_status)])),
+            Some(HashMap::from([(port, authority)])),
+        );
+        service.update_managed_port_capabilities(HashMap::from([(port, capability)]));
     }
 
     fn sample_remote_client_handle(client_id: &str) -> RemoteClientHandle {

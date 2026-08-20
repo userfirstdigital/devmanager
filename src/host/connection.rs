@@ -8,13 +8,15 @@
 //! event-replay, and artifact-content queries.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::future::Future;
 use std::path::PathBuf;
-use std::pin::pin;
+use std::pin::{pin, Pin};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use futures_util::stream::{FuturesUnordered, StreamExt};
+use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, oneshot, watch, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::{interval_at, MissedTickBehavior};
@@ -29,15 +31,17 @@ use crate::domain::command::{
 };
 use crate::domain::event::DomainEvent;
 use crate::domain::id::{
-    ArtifactId, OperationId, RequestId, SnapshotId, SubscriptionId, TaskId, TerminalId,
+    ArtifactId, OperationId, QuestionId, RequestId, SnapshotId, SubscriptionId, TaskId, TerminalId,
 };
 use crate::domain::query::{
     Query, QueryEnvelope, QueryError, QueryOutcome, QueryReply, QueryResult,
 };
-use crate::domain::resource::{OwnerKind, ResourceFacts, ResourceKind, ResourceRecipe};
+use crate::domain::resource::{
+    OwnerKind, ResourceFacts, ResourceKind, ResourceLifecycle, ResourceRecipe,
+};
 use crate::domain::snapshot::{PageLimits, SnapshotSection};
-use crate::domain::AgentSessionId;
 use crate::domain::ClientId;
+use crate::domain::{AgentSessionId, PresentProviderQuestionIntent};
 use crate::kernel::{
     ArtifactContentError, ArtifactContentRegistry, CommandBus, EventReplaySession, ReplayError,
     SessionScope, SnapshotError, SnapshotSession, StoreError,
@@ -66,6 +70,59 @@ use super::shutdown::{
 /// When the queue is full, [`HostRequestHandle::execute`] awaits send capacity
 /// (bounded backpressure). Requests are never silently dropped.
 pub const HOST_REQUEST_QUEUE_CAPACITY: usize = 32;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderSemanticIngress {
+    Question {
+        task_id: TaskId,
+        question_id: QuestionId,
+    },
+}
+
+struct ProviderRestoreOutcome {
+    task_id: TaskId,
+    result: Result<(), String>,
+}
+
+type ProviderRestoreFuture = Pin<Box<dyn Future<Output = ProviderRestoreOutcome> + Send + 'static>>;
+
+fn normalize_provider_question_draft(
+    draft: &mut crate::remote::presentation::SemanticEventDraft,
+) -> Option<ProviderSemanticIngress> {
+    let provider_question_id = match &draft.kind {
+        crate::remote::presentation::SemanticEventKind::Question { question_id, .. } => {
+            question_id.clone()
+        }
+        _ => return None,
+    };
+    let task_id = draft
+        .stable_session_key
+        .as_str()
+        .strip_prefix("tab:")
+        .and_then(|value| TaskId::parse(value).ok())?;
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"devmanager/provider-question/v1\0");
+    hasher.update(task_id.as_bytes());
+    hasher.update(provider_question_id.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x70;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let question_id = QuestionId::from_bytes(bytes).ok()?;
+    if let crate::remote::presentation::SemanticEventKind::Question {
+        question_id: semantic_question_id,
+        ..
+    } = &mut draft.kind
+    {
+        *semantic_question_id = question_id.to_string();
+    }
+    Some(ProviderSemanticIngress::Question {
+        task_id,
+        question_id,
+    })
+}
 
 /// Bounded retry ledger for lost authenticated PrepareUpdate replies.
 const MAX_PREPARED_UPDATE_HANDOFFS: usize = 4;
@@ -123,7 +180,7 @@ mod workspace_security_tests {
 
     use super::{
         dispatch_authenticated_request, dispatch_authenticated_request_with_workspace_projects,
-        normalize_task_create_at_host,
+        normalize_provider_question_draft, normalize_task_create_at_host, ProviderSemanticIngress,
     };
     use crate::domain::agent::{AgentRole, AgentSessionFacts};
     use crate::domain::agent_resource::AgentResourceBinding;
@@ -141,8 +198,43 @@ mod workspace_security_tests {
     use crate::kernel::CommandBus;
     use crate::protocol::{CapabilitySet, ClientRequest};
     use crate::providers::ProviderKind;
+    use crate::remote::presentation::{
+        SemanticEventDraft, SemanticEventKind, SemanticRetention, SemanticSource, StableSessionKey,
+    };
     use crate::workspace::{WorkspaceProjectRoots, WorkspaceRequest};
     use uuid::Uuid;
+
+    #[test]
+    fn ai_acceptance_semantic_question_gets_stable_durable_identity() {
+        let task_id = TaskId::new();
+        let draft = || SemanticEventDraft {
+            stable_session_key: StableSessionKey::from_tab(task_id.to_string()),
+            occurred_at_epoch_ms: 42,
+            source: SemanticSource::Claude,
+            kind: SemanticEventKind::Question {
+                question_id: "toolu-provider-question".to_string(),
+                prompt: "Pick a color".to_string(),
+                choices: vec!["Blue".to_string(), "Green".to_string()],
+            },
+            retention: SemanticRetention::Canonical,
+            deduplication_key: Some("provider-question".to_string()),
+        };
+        let mut first = draft();
+        let mut duplicate = draft();
+
+        let first_ingress = normalize_provider_question_draft(&mut first);
+        let duplicate_ingress = normalize_provider_question_draft(&mut duplicate);
+
+        assert_eq!(first_ingress, duplicate_ingress);
+        assert!(matches!(
+            first_ingress,
+            Some(ProviderSemanticIngress::Question {
+                task_id: correlated_task_id,
+                question_id,
+            }) if correlated_task_id == task_id
+                && matches!(first.kind, SemanticEventKind::Question { question_id: ref semantic_id, .. } if semantic_id == &question_id.to_string())
+        ));
+    }
 
     #[test]
     fn authenticated_legacy_create_cannot_persist_client_supplied_workspace() {
@@ -1849,14 +1941,68 @@ impl crate::ssh::SshRuntimeAdapter for HostSshRuntime {
 /// constructed.
 struct ConfiguredServiceRuntime {
     manager: crate::services::ProcessManager,
+    semantic_journal: Arc<Mutex<crate::remote::presentation::SemanticJournalStore>>,
     host_id: crate::services::model::HostId,
     provider_dispatch: crate::providers::dispatch::ProviderDispatchRuntime,
     supervisor_ready: bool,
 }
 
 impl ConfiguredServiceRuntime {
-    fn initialized_from_admission(admission: &HostWorkspaceAdmission) -> Option<Self> {
-        let manager = crate::services::ProcessManager::new();
+    fn initialized_from_admission(
+        admission: &HostWorkspaceAdmission,
+        provider_session_store_path: Option<std::path::PathBuf>,
+        semantic_ingress_tx: mpsc::UnboundedSender<ProviderSemanticIngress>,
+    ) -> Option<Self> {
+        let manager = provider_session_store_path
+            .map(crate::services::ProcessManager::new_with_provider_session_store_path)
+            .unwrap_or_else(crate::services::ProcessManager::new);
+        let semantic_journal = Arc::new(Mutex::new(
+            crate::remote::presentation::SemanticJournalStore::default(),
+        ));
+        let event_journal = Arc::clone(&semantic_journal);
+        manager.set_remote_session_handler(Some(Arc::new(move |event| {
+            let Ok(mut journal) = event_journal.lock() else {
+                return;
+            };
+            let now_ms = unix_time_ms_u64();
+            match event {
+                crate::services::RemoteSessionEvent::Runtime { runtime, .. } => {
+                    journal.observe_runtime(&runtime, &[], now_ms);
+                }
+                crate::services::RemoteSessionEvent::Output {
+                    session_id,
+                    bytes,
+                    mode,
+                    screen,
+                } => {
+                    journal.observe_output(&session_id, &bytes, screen.as_ref(), now_ms);
+                    journal.observe_native_terminal_mode(&session_id, mode, now_ms);
+                }
+                crate::services::RemoteSessionEvent::Removed { session_id } => {
+                    journal.remove_session_binding(&session_id);
+                }
+                crate::services::RemoteSessionEvent::Semantic { mut draft }
+                | crate::services::RemoteSessionEvent::ClaudeSemantic { mut draft, .. }
+                | crate::services::RemoteSessionEvent::CodexSemantic { mut draft, .. } => {
+                    let ingress = normalize_provider_question_draft(&mut draft);
+                    journal.record(draft);
+                    drop(journal);
+                    if let Some(ingress) = ingress {
+                        let _ = semantic_ingress_tx.send(ingress);
+                    }
+                }
+                crate::services::RemoteSessionEvent::AdapterHealth {
+                    stable_session_key,
+                    health,
+                } => {
+                    journal.set_adapter_health(&stable_session_key, health);
+                }
+                crate::services::RemoteSessionEvent::ClaudeAdapterRegistered { .. }
+                | crate::services::RemoteSessionEvent::ClaudeAdapterRemoved { .. }
+                | crate::services::RemoteSessionEvent::CodexAdapterRegistered { .. }
+                | crate::services::RemoteSessionEvent::CodexAdapterRemoved { .. } => {}
+            }
+        })));
         let host_id = crate::services::model::HostId::new(u64::from(std::process::id()));
         let config = &admission.store.snapshot().config;
         let supervisor_ready = (|| -> Option<()> {
@@ -1924,6 +2070,7 @@ impl ConfiguredServiceRuntime {
                     manager.clone(),
                 ),
             manager,
+            semantic_journal,
             host_id,
             supervisor_ready,
         })
@@ -2063,6 +2210,11 @@ pub struct HostRequestExecutor {
     workspace_projects: WorkspaceProjectRoots,
     config_admission: Option<HostWorkspaceAdmission>,
     configured_service_runtime: Option<ConfiguredServiceRuntime>,
+    /// One bounded exact-resume enumeration is consumed incrementally after the
+    /// request loop is live. It is never retried as a fresh conversation.
+    provider_restore_pending: bool,
+    provider_restore_queue: VecDeque<crate::domain::command::StartProviderSessionIntent>,
+    provider_restore_jobs: FuturesUnordered<ProviderRestoreFuture>,
     /// Host-owned terminal admission. It only writes to terminals explicitly
     /// attached by the task runtime; an unbound/missing terminal fails closed.
     terminal_service: TerminalService,
@@ -2070,6 +2222,9 @@ pub struct HostRequestExecutor {
     host_boot_id: Arc<OnceLock<Uuid>>,
     rx: mpsc::Receiver<HostRequestJob>,
     control_rx: mpsc::Receiver<ExecutorControl>,
+    semantic_ingress_rx: mpsc::UnboundedReceiver<ProviderSemanticIngress>,
+    // Keep the queue open for executors without configured provider services.
+    _semantic_ingress_guard: mpsc::UnboundedSender<ProviderSemanticIngress>,
     control_closed: bool,
     registry: SnapshotRegistry,
     replay_registry: EventReplayRegistry,
@@ -2085,6 +2240,13 @@ pub struct HostRequestExecutor {
     /// One host-owned workspace resource coordinator. CreateTask and Task
     /// Cockpit Git/file leases share this instance; queries never mint another.
     workspace_coordinator: WorkspaceResourceCoordinator,
+}
+
+fn provider_restore_success_attention(
+    current: crate::domain::task::TaskAttention,
+) -> Option<crate::domain::task::TaskAttention> {
+    (current == crate::domain::task::TaskAttention::Failed)
+        .then_some(crate::domain::task::TaskAttention::None)
 }
 
 impl HostRequestExecutor {
@@ -2127,8 +2289,9 @@ impl HostRequestExecutor {
     pub fn start_supervised_with_config_store(
         bus: CommandBus,
         store: ConfigStore,
+        profile_root: &std::path::Path,
     ) -> Result<(HostRequestHandle, SupervisedHostExecutor), ConfigError> {
-        Self::start_supervised_with_config_store_at_generation(bus, store, 1, 1)
+        Self::start_supervised_with_config_store_at_generation(bus, store, profile_root, 1, 1)
     }
 
     /// Test-only compatibility seam for the workspace service contract suite.
@@ -2148,13 +2311,19 @@ impl HostRequestExecutor {
     pub(crate) fn start_supervised_with_config_store_at_generation(
         bus: CommandBus,
         store: ConfigStore,
+        profile_root: &std::path::Path,
         action_epoch: u64,
         runtime_generation: u64,
     ) -> Result<(HostRequestHandle, SupervisedHostExecutor), ConfigError> {
         let admission = HostWorkspaceAdmission::new(store, action_epoch, runtime_generation)?;
         let workspace_projects = admission.roots().clone();
-        let (handle, join, arm_rx) =
-            Self::spawn_supervised_with_admission(bus, true, workspace_projects, admission);
+        let (handle, join, arm_rx) = Self::spawn_supervised_with_admission(
+            bus,
+            true,
+            workspace_projects,
+            admission,
+            profile_root.join("provider-sessions.sqlite3"),
+        );
         Ok((handle, SupervisedHostExecutor { arm_rx, join }))
     }
 
@@ -2206,6 +2375,7 @@ impl HostRequestExecutor {
         schedule_automatic_maintenance: bool,
         workspace_projects: WorkspaceProjectRoots,
         admission: HostWorkspaceAdmission,
+        provider_session_store_path: std::path::PathBuf,
     ) -> (
         HostRequestHandle,
         JoinHandle<Result<HostExecutorOutcome, StoreError>>,
@@ -2215,7 +2385,7 @@ impl HostRequestExecutor {
             bus,
             schedule_automatic_maintenance,
             workspace_projects,
-            Some(admission),
+            Some((admission, provider_session_store_path)),
         )
     }
 
@@ -2223,7 +2393,7 @@ impl HostRequestExecutor {
         bus: CommandBus,
         schedule_automatic_maintenance: bool,
         workspace_projects: WorkspaceProjectRoots,
-        config_admission: Option<HostWorkspaceAdmission>,
+        config_admission: Option<(HostWorkspaceAdmission, std::path::PathBuf)>,
     ) -> (
         HostRequestHandle,
         JoinHandle<Result<HostExecutorOutcome, StoreError>>,
@@ -2231,14 +2401,23 @@ impl HostRequestExecutor {
     ) {
         let (tx, rx) = mpsc::channel(HOST_REQUEST_QUEUE_CAPACITY);
         let (control_tx, control_rx) = mpsc::channel(HOST_REQUEST_QUEUE_CAPACITY);
+        let (semantic_ingress_tx, semantic_ingress_rx) = mpsc::unbounded_channel();
         let (arm_tx, arm_rx) = mpsc::channel(1);
         let update_gate = crate::host::update::HostUpdateRuntimeGate::new();
-        let configured_service_runtime = config_admission
-            .as_ref()
-            .and_then(ConfiguredServiceRuntime::initialized_from_admission);
+        let configured_service_runtime =
+            config_admission
+                .as_ref()
+                .and_then(|(admission, provider_session_store_path)| {
+                    ConfiguredServiceRuntime::initialized_from_admission(
+                        admission,
+                        Some(provider_session_store_path.clone()),
+                        semantic_ingress_tx.clone(),
+                    )
+                });
         let configured_service_supervisor_ready = configured_service_runtime
             .as_ref()
             .is_some_and(|runtime| runtime.supervisor_ready);
+        let provider_restore_pending = configured_service_runtime.is_some();
         let handle = HostRequestHandle {
             tx,
             control_tx,
@@ -2251,13 +2430,18 @@ impl HostRequestExecutor {
         let mut executor = Self {
             bus,
             workspace_projects,
-            config_admission,
+            config_admission: config_admission.map(|(admission, _)| admission),
             configured_service_runtime,
+            provider_restore_pending,
+            provider_restore_queue: VecDeque::new(),
+            provider_restore_jobs: FuturesUnordered::new(),
             terminal_service: TerminalService::new(),
             update_gate,
             host_boot_id,
             rx,
             control_rx,
+            semantic_ingress_rx,
+            _semantic_ingress_guard: semantic_ingress_tx,
             control_closed: false,
             registry: SnapshotRegistry::new(),
             replay_registry: EventReplayRegistry::new(),
@@ -2297,13 +2481,19 @@ impl HostRequestExecutor {
     ) -> (HostRequestHandle, JoinHandle<()>) {
         let (tx, rx) = mpsc::channel(HOST_REQUEST_QUEUE_CAPACITY);
         let (control_tx, control_rx) = mpsc::channel(HOST_REQUEST_QUEUE_CAPACITY);
+        let (semantic_ingress_tx, semantic_ingress_rx) = mpsc::unbounded_channel();
         let update_gate = crate::host::update::HostUpdateRuntimeGate::new();
-        let configured_service_runtime = config_admission
-            .as_ref()
-            .and_then(ConfiguredServiceRuntime::initialized_from_admission);
+        let configured_service_runtime = config_admission.as_ref().and_then(|admission| {
+            ConfiguredServiceRuntime::initialized_from_admission(
+                admission,
+                None,
+                semantic_ingress_tx.clone(),
+            )
+        });
         let configured_service_supervisor_ready = configured_service_runtime
             .as_ref()
             .is_some_and(|runtime| runtime.supervisor_ready);
+        let provider_restore_pending = configured_service_runtime.is_some();
         let handle = HostRequestHandle {
             tx,
             control_tx,
@@ -2318,11 +2508,16 @@ impl HostRequestExecutor {
             workspace_projects,
             config_admission,
             configured_service_runtime,
+            provider_restore_pending,
+            provider_restore_queue: VecDeque::new(),
+            provider_restore_jobs: FuturesUnordered::new(),
             terminal_service: TerminalService::new(),
             update_gate,
             host_boot_id,
             rx,
             control_rx,
+            semantic_ingress_rx,
+            _semantic_ingress_guard: semantic_ingress_tx,
             control_closed: false,
             registry: SnapshotRegistry::new(),
             replay_registry: EventReplayRegistry::new(),
@@ -2341,7 +2536,9 @@ impl HostRequestExecutor {
 
     async fn run(&mut self, schedule_automatic_maintenance: bool) {
         // `interval` ticks immediately. Delay the first maintenance pass so
-        // startup does not race an eager teardown scan.
+        // startup does not race teardown or provider restoration. Restoring one
+        // provider at a time keeps the request loop available to bootstrap the
+        // native client even when provider discovery is slow.
         let period = SNAPSHOT_REAPER_PERIOD.min(EVENT_REPLAY_REAPER_PERIOD);
         let mut reaper = interval_at(tokio::time::Instant::now() + period, period);
         reaper.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -2371,12 +2568,21 @@ impl HostRequestExecutor {
                     };
                     self.handle_control(control);
                 }
+                Some(ingress) = self.semantic_ingress_rx.recv() => {
+                    if let Err(error) = self.handle_provider_semantic_ingress(ingress) {
+                        eprintln!("devmanager-host: provider semantic ingress rejected: {error}");
+                    }
+                }
+                Some(outcome) = self.provider_restore_jobs.next(), if !self.provider_restore_jobs.is_empty() => {
+                    self.handle_provider_restore_outcome(outcome);
+                }
                 _ = reaper.tick(), if schedule_automatic_maintenance => {
                     let now = Instant::now();
                     self.registry.reap_idle(now);
                     self.replay_registry.reap_idle(now);
                     self.artifact_content_registry.reap(now);
                     self.reconcile_configured_services();
+                    self.queue_one_provider_restore();
                     // Missed unregister try_send must not leave completed live
                     // metadata forever once the connection has requested shutdown.
                     self.reap_shutdown_outputs();
@@ -2426,12 +2632,21 @@ impl HostRequestExecutor {
                         return Ok(outcome);
                     }
                 }
+                Some(ingress) = self.semantic_ingress_rx.recv() => {
+                    if let Err(error) = self.handle_provider_semantic_ingress(ingress) {
+                        eprintln!("devmanager-host: provider semantic ingress rejected: {error}");
+                    }
+                }
+                Some(outcome) = self.provider_restore_jobs.next(), if !self.provider_restore_jobs.is_empty() => {
+                    self.handle_provider_restore_outcome(outcome);
+                }
                 _ = reaper.tick(), if schedule_automatic_maintenance => {
                     let now = Instant::now();
                     self.registry.reap_idle(now);
                     self.replay_registry.reap_idle(now);
                     self.artifact_content_registry.reap(now);
                     self.reconcile_configured_services();
+                    self.queue_one_provider_restore();
                     self.reap_shutdown_outputs();
                     if let Some(outcome) = self.drive_supervised_maintenance_unit().await? {
                         return Ok(outcome);
@@ -2439,6 +2654,81 @@ impl HostRequestExecutor {
                 }
             }
         }
+    }
+
+    fn handle_provider_semantic_ingress(
+        &mut self,
+        ingress: ProviderSemanticIngress,
+    ) -> Result<(), StoreError> {
+        match ingress {
+            ProviderSemanticIngress::Question {
+                task_id,
+                question_id,
+            } => self.present_provider_question(task_id, question_id),
+        }
+    }
+
+    fn present_provider_question(
+        &mut self,
+        task_id: TaskId,
+        question_id: QuestionId,
+    ) -> Result<(), StoreError> {
+        let snapshot = self
+            .bus
+            .task_snapshot(task_id)?
+            .ok_or_else(|| StoreError::Projection("semantic question task is missing".into()))?;
+        let agent_session_id = snapshot.primary_agent_id.ok_or_else(|| {
+            StoreError::Projection("semantic question task has no primary agent".into())
+        })?;
+        let agent = snapshot.agents.get(&agent_session_id).ok_or_else(|| {
+            StoreError::Projection("semantic question primary agent is missing".into())
+        })?;
+        let session = snapshot
+            .provider_sessions
+            .get(&agent_session_id)
+            .cloned()
+            .unwrap_or_default();
+        if session.open_question == Some(question_id)
+            || session.question_winners.contains_key(&question_id)
+        {
+            return Ok(());
+        }
+        if session.open_question.is_some() {
+            return Err(StoreError::Projection(
+                "a different provider question is already open".into(),
+            ));
+        }
+        let turn_id = session.current_turn.ok_or_else(|| {
+            StoreError::Projection("semantic question has no current provider turn".into())
+        })?;
+        let intent = PresentProviderQuestionIntent::try_new(
+            agent_session_id,
+            agent.runtime_generation,
+            turn_id,
+            snapshot.task.action_epoch,
+            question_id,
+        )
+        .map_err(|error| StoreError::Projection(error.to_string()))?;
+        let receipt = self.bus.execute_host_authorized(
+            CommandEnvelope {
+                command_id: crate::domain::CommandId::new(),
+                client_id: crate::domain::ClientId::new(),
+                task_id: Some(task_id),
+                issued_at_ms: unix_time_ms_u64() as i64,
+                expected_task_revision: Some(snapshot.task.revision),
+                command: Command::PresentProviderQuestion(intent),
+            },
+            None,
+            RequestId::new(),
+            Uuid::nil(),
+        )?;
+        if !matches!(receipt, CommandReceipt::Accepted { .. }) {
+            return Err(StoreError::Projection(format!(
+                "semantic provider question was rejected: {receipt:?}"
+            )));
+        }
+        self.fan_out_live_durable_events();
+        Ok(())
     }
 
     fn handle_control(&mut self, control: ExecutorControl) {
@@ -2598,10 +2888,243 @@ impl HostRequestExecutor {
     /// service panel and action path therefore observe reconciled process/port
     /// evidence without doing probes or process work in request dispatch.
     fn reconcile_configured_services(&mut self) {
-        if let Some(runtime) = self.configured_service_runtime.as_mut() {
-            let _ = self.bus.run_provider_dispatch(&runtime.provider_dispatch);
+        let provider_failures = if let Some(runtime) = self.configured_service_runtime.as_mut() {
+            if let Err(error) = self.bus.run_provider_dispatch(&runtime.provider_dispatch) {
+                eprintln!("devmanager-host: provider dispatch maintenance failed: {error}");
+            }
             let _ = runtime.manager.configured_service_snapshots();
+            runtime.manager.drain_provider_session_failures()
+        } else {
+            Vec::new()
+        };
+        for failure in provider_failures {
+            eprintln!(
+                "devmanager-host: provider session failed task={} agent={} provider={:?}: {:?}",
+                failure.task_id, failure.agent_session_id, failure.provider_kind, failure.failure,
+            );
+            self.mark_provider_restore_failed(failure.task_id);
         }
+        if let Err(error) = self.sync_provider_session_identities() {
+            eprintln!("devmanager-host: provider session identity sync failed: {error}");
+        }
+    }
+
+    fn queue_one_provider_restore(&mut self) {
+        if self.provider_restore_pending {
+            self.provider_restore_pending = false;
+            match self.bus.restorable_provider_starts(64) {
+                Ok(starts) => self.provider_restore_queue.extend(starts),
+                Err(error) => {
+                    eprintln!("devmanager-host: provider restore enumeration failed: {error}");
+                    return;
+                }
+            }
+        }
+        if !self.provider_restore_jobs.is_empty() {
+            return;
+        }
+        let Some(intent) = self.provider_restore_queue.pop_front() else {
+            return;
+        };
+        let Some(runtime) = self.configured_service_runtime.as_ref() else {
+            self.handle_provider_restore_outcome(ProviderRestoreOutcome {
+                task_id: intent.task_id,
+                result: Err("configured provider runtime is unavailable".to_string()),
+            });
+            return;
+        };
+        let manager = runtime.manager.clone();
+        let prepared = (|| {
+            let (binding, agent, _) = self
+                .bus
+                .prepare_provider_start(&intent)
+                .map_err(|error| error.to_string())?;
+            let loaded = self
+                .bus
+                .load_task_runtime(intent.task_id, &self.workspace_projects)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "provider restore task runtime is missing".to_string())?;
+            let cwd = loaded
+                .workspace
+                .runtime_working_directory()
+                .map_err(|error| error.to_string())?;
+            let mode = match intent.mode {
+                crate::domain::command::ProviderStartMode::Open => {
+                    crate::providers::session::ProviderSessionStartMode::Open
+                }
+                crate::domain::command::ProviderStartMode::NewConversation => {
+                    crate::providers::session::ProviderSessionStartMode::NewConversation
+                }
+                crate::domain::command::ProviderStartMode::ResumeExact => {
+                    crate::providers::session::ProviderSessionStartMode::ResumeExact
+                }
+            };
+            Ok::<_, String>((binding, agent, cwd, mode))
+        })();
+        let (binding, agent, cwd, mode) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.handle_provider_restore_outcome(ProviderRestoreOutcome {
+                    task_id: intent.task_id,
+                    result: Err(error),
+                });
+                return;
+            }
+        };
+        let task_id = intent.task_id;
+        let provider_kind = intent.provider_kind;
+        self.provider_restore_jobs.push(Box::pin(async move {
+            let result = async {
+                let observation = super::agent_connection::observe_with_trusted_auth(
+                    manager.provider_host().registry(),
+                    provider_kind,
+                    &crate::providers::registry::ProviderDiscoveryConfig::default(),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+                tokio::task::spawn_blocking(move || {
+                    manager
+                        .start_production_stock_provider_session(
+                            binding,
+                            agent,
+                            &observation,
+                            None,
+                            cwd,
+                            BTreeMap::new(),
+                            mode,
+                        )
+                        .map_err(|error| error.to_string())
+                })
+                .await
+                .map_err(|error| format!("provider restore launch worker failed: {error}"))??;
+                Ok(())
+            }
+            .await;
+            ProviderRestoreOutcome { task_id, result }
+        }));
+    }
+
+    fn handle_provider_restore_outcome(&mut self, outcome: ProviderRestoreOutcome) {
+        if let Err(error) = outcome.result {
+            eprintln!(
+                "devmanager-host: exact provider restore failed task={}: {error}",
+                outcome.task_id
+            );
+            self.mark_provider_restore_failed(outcome.task_id);
+        }
+    }
+
+    fn mark_provider_restore_succeeded(&mut self, task_id: TaskId) {
+        let Some(snapshot) = self.bus.task_snapshot(task_id).ok().flatten() else {
+            return;
+        };
+        let Some(attention) = provider_restore_success_attention(snapshot.attention) else {
+            return;
+        };
+        let _ = self.bus.execute_host_authorized(
+            CommandEnvelope {
+                command_id: crate::domain::CommandId::new(),
+                client_id: crate::domain::ClientId::new(),
+                task_id: Some(task_id),
+                issued_at_ms: unix_time_ms_u64() as i64,
+                expected_task_revision: Some(snapshot.task.revision),
+                command: Command::SetTaskAttention(SetTaskAttentionIntent { attention }),
+            },
+            None,
+            RequestId::new(),
+            Uuid::nil(),
+        );
+        self.fan_out_live_durable_events();
+    }
+
+    fn mark_provider_restore_failed(&mut self, task_id: TaskId) {
+        let Some(snapshot) = self.bus.task_snapshot(task_id).ok().flatten() else {
+            return;
+        };
+        let _ = self.bus.execute_host_authorized(
+            CommandEnvelope {
+                command_id: crate::domain::CommandId::new(),
+                client_id: crate::domain::ClientId::new(),
+                task_id: Some(task_id),
+                issued_at_ms: unix_time_ms_u64() as i64,
+                expected_task_revision: Some(snapshot.task.revision),
+                command: Command::SetTaskAttention(SetTaskAttentionIntent {
+                    attention: crate::domain::task::TaskAttention::Failed,
+                }),
+            },
+            None,
+            RequestId::new(),
+            Uuid::nil(),
+        );
+        self.fan_out_live_durable_events();
+    }
+
+    fn sync_provider_session_identities(&mut self) -> Result<(), StoreError> {
+        let Some(runtime) = self.configured_service_runtime.as_ref() else {
+            return Ok(());
+        };
+        let bindings = runtime.manager.provider_session_bindings();
+        for binding in bindings {
+            let Some(snapshot) = self.bus.task_snapshot(binding.task_id)? else {
+                continue;
+            };
+            let Some(agent) = snapshot.agents.get(&binding.agent_session_id) else {
+                continue;
+            };
+            if agent.provider_kind != binding.provider_kind
+                || agent.runtime_generation != binding.runtime_generation
+            {
+                continue;
+            }
+            match self
+                .bus
+                .durable_provider_binding(binding.agent_session_id)?
+            {
+                Some((provider_session_id, resource_id))
+                    if provider_session_id == binding.provider_session_id
+                        && resource_id == binding.resource_id =>
+                {
+                    self.mark_provider_restore_succeeded(binding.task_id);
+                    continue;
+                }
+                Some(_) => {
+                    return Err(StoreError::Projection(
+                        "live provider session identity conflicts with durable agent binding"
+                            .into(),
+                    ));
+                }
+                None if agent.provider_session_id.is_some() => {
+                    return Err(StoreError::Corruption);
+                }
+                None => {}
+            }
+            let receipt = self.bus.execute_host_authorized(
+                CommandEnvelope {
+                    command_id: crate::domain::CommandId::new(),
+                    client_id: crate::domain::ClientId::new(),
+                    task_id: Some(binding.task_id),
+                    issued_at_ms: unix_time_ms_u64() as i64,
+                    expected_task_revision: Some(snapshot.task.revision),
+                    command: Command::BindProviderSession {
+                        agent_session_id: binding.agent_session_id,
+                        resource_id: binding.resource_id,
+                        provider_session_id: binding.provider_session_id,
+                        expected_runtime_generation: binding.runtime_generation,
+                    },
+                },
+                None,
+                RequestId::new(),
+                Uuid::nil(),
+            )?;
+            if !matches!(receipt, CommandReceipt::Accepted { .. }) {
+                return Err(StoreError::Projection(
+                    "provider session identity binding was rejected".into(),
+                ));
+            }
+            self.fan_out_live_durable_events();
+            self.mark_provider_restore_succeeded(binding.task_id);
+        }
+        Ok(())
     }
 
     fn rebind_connection(
@@ -3108,6 +3631,7 @@ impl HostRequestExecutor {
         }
         validate_authenticated_command_capability(negotiated.capabilities, &envelope.command)?;
         if command_starts_new_launch(&envelope.command) && self.update_gate.stops_new_launches() {
+            eprintln!("devmanager-host: provider start blocked by update gate");
             return Err(IpcError::Unavailable);
         }
         let connection_id = output_id
@@ -3152,74 +3676,86 @@ impl HostRequestExecutor {
         .map_err(|_| IpcError::Unavailable)?;
         resource.runtime_generation = 1;
 
-        let mut execute_follow_through = |command: Command, expected_revision: u64| {
-            self.bus
-                .execute_host_authorized(
-                    CommandEnvelope {
-                        command_id: crate::domain::CommandId::new(),
-                        client_id: negotiated.client_id,
-                        task_id: Some(task_id),
-                        issued_at_ms,
-                        expected_task_revision: Some(expected_revision),
-                        command,
-                    },
-                    None,
-                    RequestId::new(),
-                    connection_id,
-                )
-                .map_err(map_store_error)
+        let client_id = negotiated.client_id;
+        let mut follow_through = |command: Command, expected_revision: u64, label: &str| -> bool {
+            match self.bus.execute_host_authorized(
+                CommandEnvelope {
+                    command_id: crate::domain::CommandId::new(),
+                    client_id,
+                    task_id: Some(task_id),
+                    issued_at_ms,
+                    expected_task_revision: Some(expected_revision),
+                    command,
+                },
+                None,
+                RequestId::new(),
+                connection_id,
+            ) {
+                Ok(crate::domain::command::CommandReceipt::Accepted { .. }) => true,
+                Ok(rejected) => {
+                    eprintln!("devmanager-host: provider start {label} rejected: {rejected:?}");
+                    false
+                }
+                Err(error) => {
+                    eprintln!("devmanager-host: provider start {label} failed: {error}");
+                    false
+                }
+            }
         };
-        if execute_follow_through(
+        if !follow_through(
             Command::RegisterAgentSession {
                 agent: agent.clone(),
             },
             1,
-        )
-        .is_err()
-            || execute_follow_through(
-                Command::RegisterResource {
-                    resource: resource.clone(),
-                },
-                2,
-            )
-            .is_err()
-            || execute_follow_through(
-                Command::SetPrimaryAgent {
-                    agent_session_id: agent.id,
-                },
-                3,
-            )
-            .is_err()
-        {
+            "register agent",
+        ) {
+            return Ok(DuplexExecuteCompletion::CallerMustWrite(
+                ServerMessage::CommandReceipt(receipt),
+            ));
+        }
+        if !follow_through(
+            Command::RegisterResource {
+                resource: resource.clone(),
+            },
+            2,
+            "register resource",
+        ) {
+            return Ok(DuplexExecuteCompletion::CallerMustWrite(
+                ServerMessage::CommandReceipt(receipt),
+            ));
+        }
+        if !follow_through(
+            Command::SetPrimaryAgent {
+                agent_session_id: agent.id,
+            },
+            3,
+            "set primary agent",
+        ) {
             return Ok(DuplexExecuteCompletion::CallerMustWrite(
                 ServerMessage::CommandReceipt(receipt),
             ));
         }
         self.fan_out_live_durable_events();
+        let snapshot = self
+            .bus
+            .task_snapshot(task_id)
+            .map_err(map_store_error)?
+            .ok_or(IpcError::Unavailable)?;
 
-        let start = ClientRequest::Command(CommandEnvelope {
-            command_id: crate::domain::CommandId::new(),
-            client_id: negotiated.client_id,
-            task_id: Some(task_id),
-            issued_at_ms,
-            expected_task_revision: Some(4),
-            command: Command::StartProviderSession(
-                crate::domain::command::StartProviderSessionIntent {
-                    task_id,
-                    agent_session_id: agent.id,
-                    resource_id: resource.id,
-                    provider_kind,
-                    mode: crate::domain::command::ProviderStartMode::NewConversation,
-                    expected_task_revision: 4,
-                    expected_action_epoch: 0,
-                },
-            ),
-        });
-        if self
-            .dispatch_provider_start(negotiated, start, output_id)
-            .await
-            .is_err()
-        {
+        let start_intent = crate::domain::command::StartProviderSessionIntent {
+            task_id,
+            agent_session_id: agent.id,
+            resource_id: resource.id,
+            provider_kind,
+            mode: crate::domain::command::ProviderStartMode::NewConversation,
+            expected_task_revision: snapshot.task.revision,
+            expected_action_epoch: snapshot.task.action_epoch,
+        };
+        // Durable create facts are already committed. Schedule observation/launch
+        // onto the cancellation-owned FuturesUnordered lane and return the create
+        // receipt immediately so task-list queries stay responsive.
+        if let Err(error) = self.start_provider_session_intent(&start_intent) {
+            eprintln!("devmanager-host: provider start schedule failed after create: {error}");
             if let Some(revision) = self
                 .bus
                 .task_snapshot(task_id)
@@ -3268,44 +3804,67 @@ impl HostRequestExecutor {
         if envelope.client_id != negotiated.client_id {
             return Err(IpcError::Unauthorized);
         }
-        validate_authenticated_command_capability(negotiated.capabilities, &envelope.command)?;
+        if let Err(error) =
+            validate_authenticated_command_capability(negotiated.capabilities, &envelope.command)
+        {
+            eprintln!("devmanager-host: provider start capability rejected: {error}");
+            return Err(error);
+        }
         let Command::StartProviderSession(intent) = envelope.command else {
             return Err(IpcError::Unavailable);
         };
         if envelope.task_id != Some(intent.task_id)
             || envelope.expected_task_revision != Some(intent.expected_task_revision)
         {
+            eprintln!("devmanager-host: provider start envelope fence mismatch");
             return Err(IpcError::Security(
                 "provider start envelope fence mismatch".into(),
             ));
         }
-        let runtime = self
-            .configured_service_runtime
-            .as_mut()
-            .ok_or(IpcError::Unavailable)?;
-        let (binding, agent, snapshot) = self
-            .bus
-            .prepare_provider_start(&intent)
-            .map_err(map_store_error)?;
+        let task_revision = self.start_provider_session_intent(&intent)?;
+        Ok(DuplexExecuteCompletion::CallerMustWrite(
+            ServerMessage::CommandReceipt(CommandReceipt::Accepted {
+                command_id: envelope.command_id,
+                operation_id: OperationId::new(),
+                task_revision: Some(task_revision),
+                event_ids: Vec::new(),
+                prompt_mutation: None,
+            }),
+        ))
+    }
+
+    fn start_provider_session_intent(
+        &mut self,
+        intent: &crate::domain::command::StartProviderSessionIntent,
+    ) -> Result<u64, IpcError> {
+        let runtime = self.configured_service_runtime.as_ref().ok_or_else(|| {
+            eprintln!("devmanager-host: provider start has no configured service runtime");
+            IpcError::Unavailable
+        })?;
+        let manager = runtime.manager.clone();
+        let (binding, agent, snapshot) =
+            self.bus.prepare_provider_start(intent).map_err(|error| {
+                eprintln!("devmanager-host: provider start prepare failed: {error}");
+                map_store_error(error)
+            })?;
         let loaded = self
             .bus
             .load_task_runtime(intent.task_id, &self.workspace_projects)
-            .map_err(|_| IpcError::Unavailable)?
-            .ok_or(IpcError::Unavailable)?;
+            .map_err(|error| {
+                eprintln!("devmanager-host: provider start load runtime failed: {error}");
+                IpcError::Unavailable
+            })?
+            .ok_or_else(|| {
+                eprintln!("devmanager-host: provider start task runtime missing");
+                IpcError::Unavailable
+            })?;
         let cwd = loaded
             .workspace
             .runtime_working_directory()
-            .map_err(|_| IpcError::Unavailable)?;
-        let observation = runtime
-            .manager
-            .provider_host()
-            .registry()
-            .observe(
-                intent.provider_kind,
-                &crate::providers::registry::ProviderDiscoveryConfig::default(),
-            )
-            .await
-            .map_err(|_| IpcError::Unavailable)?;
+            .map_err(|error| {
+                eprintln!("devmanager-host: provider start cwd failed: {error}");
+                IpcError::Unavailable
+            })?;
         let mode = match intent.mode {
             crate::domain::command::ProviderStartMode::Open => {
                 crate::providers::session::ProviderSessionStartMode::Open
@@ -3317,27 +3876,200 @@ impl HostRequestExecutor {
                 crate::providers::session::ProviderSessionStartMode::ResumeExact
             }
         };
-        runtime
-            .manager
-            .start_production_stock_provider_session(
-                binding,
-                agent,
-                &observation,
-                None,
-                cwd,
-                BTreeMap::new(),
-                mode,
-            )
-            .map_err(|_| IpcError::Unavailable)?;
-        Ok(DuplexExecuteCompletion::CallerMustWrite(
-            ServerMessage::CommandReceipt(CommandReceipt::Accepted {
+        let task_id = intent.task_id;
+        let provider_kind = intent.provider_kind;
+        let revision = snapshot.task.revision;
+        // Sync prepare is complete. Enqueue discovery/launch onto the same
+        // cancellation-owned FuturesUnordered lane used by provider restore so
+        // the request executor stays free for task-list and cockpit queries.
+        self.provider_restore_jobs.push(Box::pin(async move {
+            let result = async {
+                let observation = super::agent_connection::observe_with_trusted_auth(
+                    manager.provider_host().registry(),
+                    provider_kind,
+                    &crate::providers::registry::ProviderDiscoveryConfig::default(),
+                )
+                .await
+                .map_err(|error| {
+                    format!("devmanager-host: provider start observe failed: {error}")
+                })?;
+                tokio::task::spawn_blocking(move || {
+                    manager
+                        .start_production_stock_provider_session(
+                            binding,
+                            agent,
+                            &observation,
+                            None,
+                            cwd,
+                            BTreeMap::new(),
+                            mode,
+                        )
+                        .map_err(|error| {
+                            format!("devmanager-host: provider start launch failed: {error}")
+                        })
+                })
+                .await
+                .map_err(|error| {
+                    format!("devmanager-host: provider start launch worker failed: {error}")
+                })??;
+                Ok(())
+            }
+            .await;
+            ProviderRestoreOutcome { task_id, result }
+        }));
+        Ok(revision)
+    }
+
+    /// Archive one task after releasing its task-owned resources.
+    ///
+    /// `BeginCloseTask` alone cannot archive a failed +Claude/+Codex start:
+    /// that path registers an Active terminal resource with no OS process, and
+    /// process-empty teardown refuses live resources. Release, settle, close,
+    /// then archive in this host effect.
+    fn dispatch_task_close(
+        &mut self,
+        negotiated: NegotiatedParameters,
+        envelope: CommandEnvelope,
+        output_id: Option<ConnectionOutputId>,
+    ) -> Result<ServerMessage, IpcError> {
+        if envelope.client_id != negotiated.client_id {
+            return Err(IpcError::Unauthorized);
+        }
+        if !matches!(envelope.command, Command::BeginCloseTask) {
+            return Err(IpcError::Unavailable);
+        }
+        let task_id = envelope.task_id.ok_or(IpcError::Unavailable)?;
+        let connection_id = output_id
+            .map(ConnectionOutputId::as_uuid)
+            .unwrap_or(Uuid::nil());
+        let issued_at_ms = envelope.issued_at_ms;
+        let snapshot = self
+            .bus
+            .task_snapshot(task_id)
+            .map_err(map_store_error)?
+            .ok_or(IpcError::Unavailable)?;
+        if envelope.expected_task_revision != Some(snapshot.task.revision) {
+            eprintln!(
+                "devmanager-host: task close stale fence task={task_id} expected={:?} actual={}",
+                envelope.expected_task_revision, snapshot.task.revision
+            );
+            return Err(IpcError::Unavailable);
+        }
+        if snapshot.task.lifecycle == crate::domain::task::TaskLifecycle::Archived {
+            return Ok(ServerMessage::CommandReceipt(CommandReceipt::Rejected {
                 command_id: envelope.command_id,
-                operation_id: OperationId::new(),
-                task_revision: Some(snapshot.task.revision),
-                event_ids: Vec::new(),
-                prompt_mutation: None,
-            }),
-        ))
+                code: crate::domain::command::RejectionCode::InvalidTransition,
+                current_revision: Some(snapshot.task.revision),
+                resolution: None,
+            }));
+        }
+        if let Some(runtime) = self.configured_service_runtime.as_ref() {
+            if let Err(error) = runtime.manager.close_provider_task(task_id) {
+                eprintln!("devmanager-host: task close provider session stop failed: {error}");
+            }
+        }
+
+        let mut released = 0usize;
+        loop {
+            if released >= 32 {
+                eprintln!("devmanager-host: task close exceeded resource release bound");
+                return Err(IpcError::Unavailable);
+            }
+            let snapshot = self
+                .bus
+                .task_snapshot(task_id)
+                .map_err(map_store_error)?
+                .ok_or(IpcError::Unavailable)?;
+            let Some(resource) = snapshot.resources.values().find(|resource| {
+                resource.owner_kind == OwnerKind::Task
+                    && resource.task_id == Some(task_id)
+                    && matches!(
+                        resource.lifecycle,
+                        ResourceLifecycle::Active | ResourceLifecycle::Releasing
+                    )
+            }) else {
+                break;
+            };
+            if resource.lifecycle == ResourceLifecycle::Active {
+                let receipt = self
+                    .bus
+                    .execute_host_authorized(
+                        CommandEnvelope {
+                            command_id: crate::domain::id::CommandId::new(),
+                            client_id: negotiated.client_id,
+                            task_id: Some(task_id),
+                            issued_at_ms,
+                            expected_task_revision: Some(snapshot.task.revision),
+                            command: Command::ReleaseResource {
+                                resource_id: resource.id,
+                            },
+                        },
+                        None,
+                        RequestId::new(),
+                        connection_id,
+                    )
+                    .map_err(|error| {
+                        eprintln!("devmanager-host: task close release resource failed: {error}");
+                        map_store_error(error)
+                    })?;
+                if !matches!(receipt, CommandReceipt::Accepted { .. }) {
+                    eprintln!("devmanager-host: task close release resource rejected: {receipt:?}");
+                    return Ok(ServerMessage::CommandReceipt(receipt));
+                }
+                self.fan_out_live_durable_events();
+            }
+            if self
+                .bus
+                .settle_next_resource_release(Duration::from_secs(30))
+                .map_err(|error| {
+                    eprintln!("devmanager-host: task close settle release failed: {error}");
+                    map_store_error(error)
+                })?
+                .is_none()
+            {
+                eprintln!("devmanager-host: task close settle release found no outbox row");
+                return Err(IpcError::Unavailable);
+            }
+            self.fan_out_live_durable_events();
+            released += 1;
+        }
+
+        let snapshot = self
+            .bus
+            .task_snapshot(task_id)
+            .map_err(map_store_error)?
+            .ok_or(IpcError::Unavailable)?;
+        let receipt = self
+            .bus
+            .execute_host_authorized(
+                CommandEnvelope {
+                    command_id: envelope.command_id,
+                    client_id: negotiated.client_id,
+                    task_id: Some(task_id),
+                    issued_at_ms,
+                    expected_task_revision: Some(snapshot.task.revision),
+                    command: Command::BeginCloseTask,
+                },
+                None,
+                RequestId::new(),
+                connection_id,
+            )
+            .map_err(|error| {
+                eprintln!("devmanager-host: task close begin failed: {error}");
+                map_store_error(error)
+            })?;
+        self.fan_out_live_durable_events();
+        if matches!(receipt, CommandReceipt::Accepted { .. }) {
+            if let Err(error) = self
+                .bus
+                .settle_next_process_empty_task_teardown(Duration::from_secs(30))
+            {
+                eprintln!("devmanager-host: task close teardown settle failed: {error}");
+                return Err(map_store_error(error));
+            }
+            self.fan_out_live_durable_events();
+        }
+        Ok(ServerMessage::CommandReceipt(receipt))
     }
 
     async fn dispatch_agent_connection(
@@ -3418,6 +4150,9 @@ impl HostRequestExecutor {
                     self.try_dispatch_update_handoff_command(&negotiated, &envelope)?
                 {
                     return Ok(message);
+                }
+                if matches!(envelope.command, Command::BeginCloseTask) {
+                    return self.dispatch_task_close(negotiated, envelope, output_id);
                 }
                 let connection_id = output_id
                     .map(ConnectionOutputId::as_uuid)
@@ -3753,6 +4488,10 @@ impl HostRequestExecutor {
                             .configured_service_runtime
                             .as_ref()
                             .map(|runtime| &runtime.manager),
+                        semantic_journal: self
+                            .configured_service_runtime
+                            .as_ref()
+                            .map(|runtime| runtime.semantic_journal.as_ref()),
                         ssh_endpoints: ssh_endpoints.as_deref(),
                         ssh_runtime: self.config_admission.as_ref().map(|admission| {
                             &admission.ssh_runtime as &dyn crate::ssh::SshRuntimeAdapter
@@ -3821,7 +4560,7 @@ impl HostRequestExecutor {
             .map_err(map_snapshot_error_transport)?;
         let page = match session.page(section, None) {
             Ok(page) => page,
-            Err(error) => return map_snapshot_error(error),
+            Err(error) => return map_snapshot_section_error(section, error),
         };
         // Retain the pinned session for every valid open page, including empty
         // or single-page first sections, until explicit release / TTL / eviction.
@@ -3857,7 +4596,7 @@ impl HostRequestExecutor {
         };
         let page = match session.page(section, None) {
             Ok(page) => page,
-            Err(error) => return map_snapshot_error(error),
+            Err(error) => return map_snapshot_section_error(section, error),
         };
         self.registry.touch(snapshot_id, Instant::now());
         Ok(QueryOutcome::Ok(QueryResult::SnapshotPage { page }))
@@ -3894,7 +4633,7 @@ impl HostRequestExecutor {
             Ok(page) => page,
             Err(error) => {
                 // Cursor/shape failures leave a valid retained session intact.
-                return map_snapshot_error(error);
+                return map_snapshot_section_error(section, error);
             }
         };
         // Finished sections stay pinned; only release / TTL / eviction drops them.
@@ -4713,6 +5452,7 @@ fn normalize_task_create_at_host(
 }
 
 fn map_snapshot_error_transport(error: SnapshotError) -> IpcError {
+    eprintln!("devmanager-host: snapshot open failed: {error:?}");
     match error {
         SnapshotError::Store(StoreError::Busy) => IpcError::Busy,
         SnapshotError::InvalidCursor | SnapshotError::CursorContextMismatch => {
@@ -4723,7 +5463,11 @@ fn map_snapshot_error_transport(error: SnapshotError) -> IpcError {
     }
 }
 
-fn map_snapshot_error(error: SnapshotError) -> Result<QueryOutcome, IpcError> {
+fn map_snapshot_section_error(
+    section: SnapshotSection,
+    error: SnapshotError,
+) -> Result<QueryOutcome, IpcError> {
+    eprintln!("devmanager-host: snapshot section {section:?} page failed: {error:?}");
     match error {
         SnapshotError::InvalidCursor | SnapshotError::CursorContextMismatch => {
             Ok(QueryOutcome::Err(QueryError::InvalidRequest))
@@ -4934,6 +5678,7 @@ fn dispatch_authenticated_request_inner(
                             query,
                             bus,
                             service_runtime: None,
+                            semantic_journal: None,
                             ssh_endpoints: None,
                             ssh_runtime: None,
                             workspace_projects,
@@ -5828,9 +6573,10 @@ mod output_tests {
     use std::time::Duration;
 
     use super::{
-        ConnectionOutputHandle, ConnectionOutputId, DuplexExecuteCompletion, DurableAdmitResult,
-        EphemeralAdmitResult, EventReplayRegistry, HostRequestExecutor, HostRequestHandle,
-        LiveStreamState, LiveTail, PhysicalWriteAckStatus, PrioritizedOutbound, StreamMaterializer,
+        provider_restore_success_attention, ConnectionOutputHandle, ConnectionOutputId,
+        DuplexExecuteCompletion, DurableAdmitResult, EphemeralAdmitResult, EventReplayRegistry,
+        HostRequestExecutor, HostRequestHandle, LiveStreamState, LiveTail, PhysicalWriteAckStatus,
+        PrioritizedOutbound, StreamMaterializer,
     };
     use crate::domain::command::{Command, CommandEnvelope, CreateTaskIntent};
     use crate::domain::event::{DomainEvent, Event};
@@ -5851,6 +6597,22 @@ mod output_tests {
     };
     use std::sync::Arc;
     use uuid::Uuid;
+
+    #[test]
+    fn successful_provider_restore_clears_only_stale_failed_attention() {
+        assert_eq!(
+            provider_restore_success_attention(TaskAttention::Failed),
+            Some(TaskAttention::None)
+        );
+        assert_eq!(
+            provider_restore_success_attention(TaskAttention::NeedsAnswer),
+            None
+        );
+        assert_eq!(
+            provider_restore_success_attention(TaskAttention::None),
+            None
+        );
+    }
 
     fn sample_event(sequence: u64) -> DomainEvent {
         DomainEvent {
@@ -8077,6 +8839,12 @@ mod output_tests {
             .expect("primary resource");
         assert_eq!(resource.runtime_generation, 1);
         assert_eq!(snapshot.attention, TaskAttention::Failed);
+        bus.load_task_runtime(task_id, &project_roots)
+            .expect("load runtime after failed launch")
+            .expect("persisted primary task")
+            .workspace
+            .runtime_working_directory()
+            .expect("reopen cwd after failed launch");
         drop(bus);
 
         let cursor_task_id = TaskId::new();
@@ -8122,6 +8890,145 @@ mod output_tests {
             .task_snapshot(cursor_task_id)
             .expect("cursor task lookup")
             .is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn closing_failed_primary_provider_task_archives_it() {
+        use std::process::Command as ProcessCommand;
+
+        use crate::domain::command::{Command, CommandEnvelope, CreateTaskRequestIntent};
+        use crate::domain::id::{CommandId, EnvironmentId, ProjectId, TaskId};
+        use crate::domain::resource::ResourceLifecycle;
+        use crate::domain::task::{
+            ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity,
+            TaskLifecycle,
+        };
+        use crate::kernel::CommandBus;
+        use crate::protocol::{Capability, CapabilitySet, FrameLimits, ProtocolVersion};
+        use crate::providers::ProviderKind;
+        use crate::workspace::{WorkspaceProjectRoots, WorkspaceRequest};
+
+        let repository = tempfile::tempdir().expect("repository");
+        let output = ProcessCommand::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(repository.path())
+            .output()
+            .expect("git init");
+        assert!(output.status.success());
+        let database = repository.path().join("close-failed-primary.sqlite");
+        let project_id = ProjectId::new();
+        let project_roots =
+            WorkspaceProjectRoots::try_from_pairs([(project_id, repository.path().to_path_buf())])
+                .expect("project roots");
+        let client = ClientId::new();
+        let negotiated = NegotiatedParameters {
+            version: ProtocolVersion::current(),
+            client_id: client,
+            capabilities: CapabilitySet::from_capabilities([Capability::ProviderInput]),
+            limits: FrameLimits::v1_default(),
+        };
+        let task_id = TaskId::new();
+        let bus = CommandBus::open(&database).expect("bus");
+        let (requests, executor) =
+            HostRequestExecutor::start_without_automatic_maintenance_with_workspace_projects(
+                bus,
+                project_roots.clone(),
+            );
+        let (out, _ports) = ConnectionOutputHandle::new(4, 8, 1);
+        let registration = requests.register_output(out).await.expect("register");
+        let handle = requests.with_output(registration.id());
+        handle
+            .execute(
+                negotiated.clone(),
+                ClientRequest::Command(CommandEnvelope {
+                    command_id: CommandId::new(),
+                    client_id: client,
+                    task_id: None,
+                    issued_at_ms: 1_725_000_000_800,
+                    expected_task_revision: None,
+                    command: Command::CreateTaskV2(CreateTaskRequestIntent {
+                        id: task_id,
+                        environment_id: EnvironmentId::new(),
+                        title: "Claude primary".into(),
+                        description: None,
+                        project_id,
+                        workspace: WorkspaceRequest::main(),
+                        primary_provider: Some(ProviderKind::ClaudeCode),
+                        assignment: TaskAssignment::LocalOwner,
+                        created_at_ms: 1_725_000_000_800,
+                        connectivity: TaskConnectivity::Connected,
+                        attention: TaskAttention::None,
+                        activity: TaskActivity::Idle,
+                        review_readiness: ReviewReadiness::NotReady,
+                    }),
+                }),
+            )
+            .await
+            .expect("create task");
+        drop(registration);
+        drop(requests);
+        executor.abort();
+        let _ = executor.await;
+
+        let bus = CommandBus::open(&database).expect("reopen bus");
+        let snapshot = bus
+            .task_snapshot(task_id)
+            .expect("snapshot")
+            .expect("created task");
+        assert_eq!(snapshot.attention, TaskAttention::Failed);
+        let revision = snapshot.task.revision;
+        drop(bus);
+
+        let bus = CommandBus::open(&database).expect("bus for close");
+        let (requests, executor) =
+            HostRequestExecutor::start_without_automatic_maintenance_with_workspace_projects(
+                bus,
+                project_roots,
+            );
+        let (out, _ports) = ConnectionOutputHandle::new(4, 8, 1);
+        let registration = requests.register_output(out).await.expect("register");
+        let handle = requests.with_output(registration.id());
+        let close = handle
+            .execute(
+                negotiated,
+                ClientRequest::Command(CommandEnvelope {
+                    command_id: CommandId::new(),
+                    client_id: client,
+                    task_id: Some(task_id),
+                    issued_at_ms: 1_725_000_000_801,
+                    expected_task_revision: Some(revision),
+                    command: Command::BeginCloseTask,
+                }),
+            )
+            .await
+            .expect("close task");
+        assert!(
+            matches!(
+                close,
+                ServerMessage::CommandReceipt(
+                    crate::domain::command::CommandReceipt::Accepted { .. }
+                )
+            ),
+            "close must be accepted: {close:?}"
+        );
+        drop(registration);
+        drop(requests);
+        executor.abort();
+        let _ = executor.await;
+
+        let bus = CommandBus::open(&database).expect("reopen after close");
+        let snapshot = bus
+            .task_snapshot(task_id)
+            .expect("snapshot")
+            .expect("closed task");
+        assert_eq!(snapshot.task.lifecycle, TaskLifecycle::Archived);
+        assert!(
+            snapshot
+                .resources
+                .values()
+                .all(|resource| resource.lifecycle == ResourceLifecycle::Released),
+            "archive must release the failed-start terminal resource"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -9273,5 +10180,67 @@ mod output_tests {
             &provider,
         )
         .is_ok());
+    }
+
+    #[test]
+    fn task_create_releases_request_lane_before_provider_observe() {
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/host/connection.rs"
+        ));
+        let start = source
+            .find("async fn dispatch_task_create_with_primary_provider(")
+            .expect("create-with-primary dispatch");
+        let body = &source[start..];
+        let end = body
+            .find("/// Authenticated stock-provider effect.")
+            .or_else(|| body.find("async fn dispatch_provider_start("))
+            .expect("provider start follows create");
+        let body = &body[..end];
+        assert!(
+            !body.contains("dispatch_provider_start("),
+            "CreateTask must schedule provider launch off the request lane instead of awaiting dispatch_provider_start"
+        );
+        assert!(
+            body.contains("start_provider_session_intent("),
+            "CreateTask must schedule through start_provider_session_intent after durable facts"
+        );
+    }
+
+    #[test]
+    fn provider_start_schedules_observe_off_request_lane() {
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/host/connection.rs"
+        ));
+        let start = source
+            .find("\n    fn start_provider_session_intent(")
+            .expect("start_provider_session_intent");
+        let body = &source[start..];
+        let end = body
+            .find("/// Archive one task after releasing")
+            .or_else(|| body.find("fn dispatch_task_close("))
+            .expect("task close follows provider start intent");
+        let body = &body[..end];
+        let schedule_at = body.find("provider_restore_jobs.push").expect(
+            "direct provider-start must release the request lane after sync prepare/schedule",
+        );
+        let observe_at = body
+            .find("observe_with_trusted_auth")
+            .expect("provider start must still observe with trusted auth before launch");
+        let blocking_worker_at = body
+            .find("tokio::task::spawn_blocking")
+            .expect("synchronous provider launch must run on the blocking worker lane");
+        let launch_at = body
+            .find("start_production_stock_provider_session")
+            .expect("provider start must still launch the prepared session");
+        assert!(
+            observe_at > schedule_at,
+            "trusted auth observe must run inside the scheduled future, not on the request-lane hot path"
+        );
+        assert!(
+            blocking_worker_at > observe_at && launch_at > blocking_worker_at,
+            "provider process launch must run inside spawn_blocking after async discovery"
+        );
     }
 }

@@ -1,4 +1,4 @@
-use devmanager::client::{ClientModel, ClientModelBuilder};
+use devmanager::client::{ClientModel, ClientModelBuilder, TaskInboxPreview};
 use devmanager::domain::id::{EnvironmentId, ProjectId, SnapshotId, TaskId};
 use devmanager::domain::snapshot::{SnapshotItem, SnapshotPage, SnapshotSection};
 use devmanager::domain::task::{
@@ -8,8 +8,8 @@ use devmanager::domain::task::{
 use devmanager::ui::actions::{KeyboardShortcut, ShortcutKey};
 use devmanager::ui::components::{ActionRequest, ActivationSource};
 use devmanager::ui::native_shell::{
-    isolated_dev_profile, AccessibilityTree, NativeHeaderAttachment, NativeHostState,
-    NativeInteraction, NativeShell, NativeShellError, TerminalDockState,
+    isolated_dev_profile, AccessibilityTree, MainConversationCanvas, NativeHeaderAttachment,
+    NativeHostState, NativeInteraction, NativeShell, NativeShellError, TerminalDockState,
 };
 use devmanager::ui::shell::{NavigationResult, PointerButton, TerminalPressRejection};
 use devmanager::ui::task_cockpit::inbox::{
@@ -20,6 +20,26 @@ use devmanager::ui::tokens::{Density, RuntimePreferencesSnapshot, Scale, ThemeMo
 use gpui::AppContext;
 use std::sync::Arc;
 use tempfile::tempdir;
+
+const HEADLESS_INTEGRATION_CHILD_ENV: &str = "DEVMANAGER_UI_NATIVE_SHELL_CHILD";
+
+fn rerun_headless_integration_test_in_child(test_name: &'static str) -> bool {
+    if std::env::var(HEADLESS_INTEGRATION_CHILD_ENV).as_deref() == Ok(test_name) {
+        return false;
+    }
+    let status = std::process::Command::new(
+        std::env::current_exe().expect("current ui_native_shell test harness"),
+    )
+    .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
+    .env(HEADLESS_INTEGRATION_CHILD_ENV, test_name)
+    .status()
+    .expect("start isolated ui_native_shell headless test");
+    assert!(
+        status.success(),
+        "isolated ui_native_shell headless test failed: {test_name} ({status})"
+    );
+    true
+}
 
 fn task_id(tail: u8) -> TaskId {
     let mut bytes = [
@@ -112,6 +132,60 @@ fn model_with_tasks(ids: &[TaskId]) -> ClientModel {
     builder.finish().expect("complete client model")
 }
 
+fn tasks_preview(ids: &[TaskId]) -> TaskInboxPreview {
+    let snapshot_id = SnapshotId::from_bytes([
+        0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x21,
+    ])
+    .expect("snapshot id");
+    let mut builder = ClientModelBuilder::new();
+    builder
+        .ingest_page(SnapshotPage {
+            snapshot_id,
+            through_sequence: 7,
+            section: SnapshotSection::Tasks,
+            after_item: None,
+            items: ids
+                .iter()
+                .enumerate()
+                .map(|(ordinal, id)| {
+                    SnapshotItem::Task(devmanager::domain::snapshot::TaskSnapshotItem {
+                        task: TaskFacts {
+                            id: *id,
+                            environment_id: EnvironmentId::from_bytes([
+                                0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00,
+                                0x00, 0x00, 0x00, 0x00, 0x10,
+                            ])
+                            .expect("environment id"),
+                            title: format!("Task {ordinal}"),
+                            description: None,
+                            project_id: ProjectId::from_bytes([
+                                0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00,
+                                0x00, 0x00, 0x00, 0x00, 0x11,
+                            ])
+                            .expect("project id"),
+                            workspace: WorkspaceRef::Main,
+                            assignment: TaskAssignment::LocalOwner,
+                            lifecycle: TaskLifecycle::Open,
+                            action_epoch: 3,
+                            revision: 4,
+                            created_at_ms: 1_725_000_000_000 + ordinal as i64,
+                        },
+                        connectivity: TaskConnectivity::Connected,
+                        attention: TaskAttention::None,
+                        activity: TaskActivity::Idle,
+                        review_readiness: ReviewReadiness::NotReady,
+                        primary_agent_id: None,
+                    })
+                })
+                .collect(),
+            encoded_bytes: 1,
+            next_cursor: None,
+        })
+        .expect("task page");
+    builder.finish_tasks_preview().expect("tasks preview")
+}
+
 #[test]
 fn isolated_native_profile_rejects_default_and_foreign_profile_inputs() {
     let workspace = tempdir().expect("workspace tempdir");
@@ -162,7 +236,7 @@ fn native_interaction_captures_focus_task_generation_and_stops_click_through() {
 #[test]
 fn native_semantic_tree_and_virtual_rows_are_bounded() {
     let tree = AccessibilityTree::for_task_list(&TaskList::empty(), None);
-    assert_eq!(tree.root().name(), "Task Cockpit");
+    assert_eq!(tree.root().name(), "DevManager");
     assert!(tree
         .root()
         .children()
@@ -178,7 +252,8 @@ fn native_semantic_tree_and_virtual_rows_are_bounded() {
     assert!(!dock.is_live());
     assert!(dock
         .message()
-        .contains("src/terminal/view.rs::render_terminal_surface"));
+        .contains("No task-bound native terminal view has been admitted yet"));
+    assert!(dock.message().contains("exact task/resource generation"));
 }
 
 struct NativeGpuiSmokeReport {
@@ -189,7 +264,7 @@ struct NativeGpuiSmokeReport {
     profile_root: std::path::PathBuf,
     host_state: NativeHostState,
     root_focusable: bool,
-    setup_canvas: bool,
+    stable_workspace: bool,
     header_projection: bool,
     model_sequence: Option<u64>,
     model_rendered: usize,
@@ -227,7 +302,7 @@ fn native_gpui_smoke_report() -> NativeGpuiSmokeReport {
                     nodes
                         .iter()
                         .any(|node| node.element_id == "native-header-settings")
-                        && !nodes
+                        && nodes
                             .iter()
                             .any(|node| node.element_id == "native-task-inbox")
                         && !nodes
@@ -300,7 +375,7 @@ fn native_gpui_smoke_report() -> NativeGpuiSmokeReport {
             profile_root: first_report.3,
             host_state: first_report.4,
             root_focusable: first_report.5,
-            setup_canvas: first_report.6,
+            stable_workspace: first_report.6,
             header_projection,
             model_sequence: model_report.0,
             model_rendered: model_report.1,
@@ -321,6 +396,11 @@ fn native_gpui_smoke_report() -> NativeGpuiSmokeReport {
 
 #[test]
 fn native_gpui_smokes_share_one_headless_lifetime_authority() {
+    if rerun_headless_integration_test_in_child(
+        "native_gpui_smokes_share_one_headless_lifetime_authority",
+    ) {
+        return;
+    }
     let report = native_gpui_smoke_report();
     assert!(report.root_constructed);
     assert!(report.semantic_nodes > 0);
@@ -328,7 +408,7 @@ fn native_gpui_smokes_share_one_headless_lifetime_authority() {
     assert_eq!(report.host_profile, report.profile_root);
     assert_eq!(report.host_state, NativeHostState::Disconnected);
     assert!(report.root_focusable);
-    assert!(report.setup_canvas);
+    assert!(report.stable_workspace);
     assert!(report.header_projection);
     assert_eq!(report.model_sequence, Some(7));
     assert_eq!(report.model_rendered, 2);
@@ -454,10 +534,7 @@ fn native_action_dispatch_is_selection_and_interaction_fenced() {
     ));
     assert!(matches!(
         pointer_action.command,
-        devmanager::ui::native_shell::NativeHostCommand::Hold {
-            action_id: "host.status",
-            ..
-        }
+        devmanager::ui::native_shell::NativeHostCommand::HostStatusQuery { .. }
     ));
 
     let show = interaction
@@ -466,10 +543,8 @@ fn native_action_dispatch_is_selection_and_interaction_fenced() {
     assert!(interaction.accepts_action_record(&show));
     assert!(matches!(
         show.command,
-        devmanager::ui::native_shell::NativeHostCommand::Hold {
-            action_id: "task.show",
-            ..
-        }
+        devmanager::ui::native_shell::NativeHostCommand::TaskShowQuery { task_id, .. }
+            if task_id == selected
     ));
 }
 
@@ -530,19 +605,20 @@ fn native_mutating_action_captures_model_revision_and_epochs() {
 
     let create_task = task_id(35);
     let create = interaction
-        .action(ActionRequest::TaskCreate(
-            devmanager::client::action::TaskCreateArguments {
+        .action(ActionRequest::TaskCreateV2(
+            devmanager::client::action::TaskCreateV2Arguments {
                 task_id: create_task,
                 environment_id: EnvironmentId::new(),
                 title: "captured create".to_string(),
                 description: None,
                 project_id: ProjectId::new(),
-                workspace: WorkspaceRef::Main,
+                workspace: devmanager::workspace::WorkspaceRequest::main(),
+                primary_provider: None,
             },
         ))
         .expect("task create should capture a retry identity");
     match &create.command {
-        devmanager::ui::native_shell::NativeHostCommand::TaskCreate {
+        devmanager::ui::native_shell::NativeHostCommand::TaskCreateV2 {
             arguments,
             command_id,
             issued_at_ms,
@@ -633,6 +709,17 @@ fn isolated_profile_exposes_one_explicit_native_host_client_config() {
     assert_eq!(config.named_profile, profile.named_profile());
     assert!(config.client_build.starts_with("devmanager/"));
     assert!(!config.client_build.contains("devmanager-next"));
+    assert!(
+        config
+            .requested
+            .contains(devmanager::protocol::Capability::SemanticConversation),
+        "the production native client must negotiate the conversation surface it queries"
+    );
+    assert!(
+        devmanager::host::NATIVE_HOST_BASE_CAPABILITIES
+            .contains(&devmanager::protocol::Capability::SemanticConversation),
+        "the production native host must advertise the conversation surface"
+    );
 }
 
 #[test]
@@ -675,6 +762,11 @@ fn virtual_shell_uses_full_source_count_and_stable_task_keys() {
 
 #[test]
 fn native_shell_projects_typed_inbox_and_header_from_client_model() {
+    if rerun_headless_integration_test_in_child(
+        "native_shell_projects_typed_inbox_and_header_from_client_model",
+    ) {
+        return;
+    }
     let first = task_id(21);
     let second = task_id(22);
     let model = Arc::new(model_with_tasks(&[first, second]));
@@ -689,9 +781,9 @@ fn native_shell_projects_typed_inbox_and_header_from_client_model() {
             shell
                 .apply_client_model(Arc::clone(&model))
                 .expect("client model projection");
-            let before = matches!(
+            let header_projected_after_model = matches!(
                 shell.header_attachment(),
-                NativeHeaderAttachment::Unavailable { .. }
+                NativeHeaderAttachment::Projection { .. }
             );
             let selected = shell.select_projected_task(first);
             assert!(selected.consumed);
@@ -712,7 +804,7 @@ fn native_shell_projects_typed_inbox_and_header_from_client_model() {
                 }
             };
             (
-                before,
+                header_projected_after_model,
                 header_title,
                 titles,
                 shell.cockpit().selected_task(),
@@ -722,11 +814,11 @@ fn native_shell_projects_typed_inbox_and_header_from_client_model() {
         drop(entity);
         cx.quit();
     });
-    let (header_was_unavailable, header_title, titles, selected) = report_slot
+    let (header_projected_after_model, header_title, titles, selected) = report_slot
         .borrow_mut()
         .take()
         .expect("typed cockpit report");
-    assert!(header_was_unavailable);
+    assert!(header_projected_after_model);
     assert_eq!(header_title, "Task 0");
     assert!(titles.iter().any(|title| title == "Task 0"));
     assert!(titles.iter().any(|title| title == "Task 1"));
@@ -751,4 +843,169 @@ fn platform_accessibility_tree_exposes_the_focused_task_node() {
     assert_eq!(focused.label(), Some(format!("Task {task}").as_str()));
     assert!(focused.supports_action(accesskit::Action::Click));
     assert!(focused.supports_action(accesskit::Action::Focus));
+}
+
+#[test]
+fn task_preview_projects_inbox_without_becoming_client_model() {
+    if rerun_headless_integration_test_in_child(
+        "task_preview_projects_inbox_without_becoming_client_model",
+    ) {
+        return;
+    }
+    let first = task_id(31);
+    let second = task_id(32);
+    let preview = Arc::new(tasks_preview(&[first, second]));
+    let canonical = Arc::new(model_with_tasks(&[first, second, task_id(33)]));
+    let workspace = tempdir().expect("workspace tempdir");
+    let profile = isolated_dev_profile(workspace.path()).expect("isolated profile");
+    let report_slot = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let report_slot_for_app = std::rc::Rc::clone(&report_slot);
+    gpui::Application::headless().run(move |cx| {
+        devmanager::ui::init(cx);
+        let entity = cx.new(|cx| NativeShell::new_for_headless(profile, cx));
+        let report = entity.update(cx, |shell, _cx| {
+            shell
+                .apply_task_preview(Arc::clone(&preview))
+                .expect("task preview projection");
+            let after_preview = (
+                shell.client_model_snapshot().is_some(),
+                shell.task_list_ids(),
+                shell
+                    .inbox_render_model(InboxPresentationWidth::Regular)
+                    .items
+                    .iter()
+                    .filter_map(|item| match item {
+                        InboxRenderItem::Row(row) => Some(row.title.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+                shell.mutations_enabled(),
+            );
+            shell
+                .apply_client_model(Arc::clone(&canonical))
+                .expect("canonical model");
+            (
+                after_preview,
+                shell.client_model_snapshot().is_some(),
+                shell.task_list_ids(),
+                shell.mutations_enabled(),
+                shell.last_projection_kinds(),
+            )
+        });
+        *report_slot_for_app.borrow_mut() = Some(report);
+        drop(entity);
+        cx.quit();
+    });
+    let (
+        (preview_had_client_model, preview_ids, preview_titles, preview_mutations),
+        canonical_has_model,
+        canonical_ids,
+        canonical_mutations,
+        _kinds,
+    ) = report_slot
+        .borrow_mut()
+        .take()
+        .expect("preview/canonical report");
+    assert!(
+        !preview_had_client_model,
+        "task preview must not install client_model"
+    );
+    assert!(!preview_mutations, "preview must not enable mutations");
+    assert_eq!(preview_ids, vec![first, second]);
+    assert!(preview_titles.iter().any(|title| title == "Task 0"));
+    assert!(preview_titles.iter().any(|title| title == "Task 1"));
+    assert!(canonical_has_model);
+    assert!(canonical_mutations);
+    assert_eq!(canonical_ids.len(), 3);
+}
+
+#[test]
+fn idle_conversation_photo_survives_task_selection() {
+    if rerun_headless_integration_test_in_child("idle_conversation_photo_survives_task_selection") {
+        return;
+    }
+    let task = task_id(41);
+    let model = Arc::new(model_with_tasks(&[task]));
+    let workspace = tempdir().expect("workspace tempdir");
+    let profile = isolated_dev_profile(workspace.path()).expect("isolated profile");
+    let report_slot = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let report_slot_for_app = std::rc::Rc::clone(&report_slot);
+    gpui::Application::headless().run(move |cx| {
+        devmanager::ui::init(cx);
+        let entity = cx.new(|cx| NativeShell::new_for_headless(profile, cx));
+        let report = entity.update(cx, |shell, _cx| {
+            shell.install_idle_conversation_photo_for_test();
+            let idle_before = shell.main_conversation_canvas();
+            shell
+                .apply_client_model(Arc::clone(&model))
+                .expect("client model");
+            let still_idle = shell.main_conversation_canvas();
+            let selected = shell.select_projected_task(task);
+            assert!(selected.consumed);
+            let with_task = shell.main_conversation_canvas();
+            shell.clear_selected_task();
+            let idle_again = shell.main_conversation_canvas();
+            (
+                idle_before,
+                still_idle,
+                with_task,
+                idle_again,
+                matches!(
+                    idle_before,
+                    MainConversationCanvas::IdlePhoto { has_image: true }
+                ),
+            )
+        });
+        *report_slot_for_app.borrow_mut() = Some(report);
+        drop(entity);
+        cx.quit();
+    });
+    let (idle_before, still_idle, with_task, idle_again, photo_present) =
+        report_slot.borrow_mut().take().expect("idle photo report");
+    assert!(photo_present);
+    assert!(matches!(
+        idle_before,
+        MainConversationCanvas::IdlePhoto { has_image: true }
+    ));
+    assert!(matches!(
+        still_idle,
+        MainConversationCanvas::IdlePhoto { has_image: true }
+    ));
+    assert!(matches!(
+        with_task,
+        MainConversationCanvas::TaskConversation
+    ));
+    assert!(matches!(
+        idle_again,
+        MainConversationCanvas::IdlePhoto { has_image: true }
+    ));
+}
+
+#[test]
+fn native_conversation_accessibility_exposes_attach_and_composer_ids() {
+    let task = task_id(55);
+    let task_list = TaskList::from_virtual_task_ids(vec![task]).expect("single-task list");
+    let tree = AccessibilityTree::for_task_list_with_header(
+        &task_list,
+        Some(task),
+        &NativeHeaderAttachment::default(),
+        None,
+    );
+    let ids: Vec<_> = tree
+        .gpui_nodes()
+        .into_iter()
+        .map(|node| node.element_id)
+        .collect();
+    assert!(
+        ids.iter().any(|id| id == "native-task-composer-input"),
+        "composer input AccessKit id must remain: {ids:?}"
+    );
+    assert!(
+        ids.iter().any(|id| id == "native-task-composer-send"),
+        "composer send AccessKit id must remain: {ids:?}"
+    );
+    assert!(
+        ids.iter().any(|id| id == "native-task-composer-attach"),
+        "conversation composer must expose an attach control: {ids:?}"
+    );
 }

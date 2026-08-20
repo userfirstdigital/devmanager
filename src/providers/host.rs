@@ -373,7 +373,7 @@ pub fn write_specialist_with_authority(
     if handle.fence().resource() != authority.resource_fence
         || identity.agent_session_id != authority.specialist_id
         || identity.runtime_generation != authority.runtime_generation
-        || identity.provider_session_id != authority.provider_session_id
+        || identity.provider_session_id.as_ref() != Some(&authority.provider_session_id)
     {
         return Err(specialist_write_hold());
     }

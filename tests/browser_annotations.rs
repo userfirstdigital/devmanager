@@ -1,5 +1,5 @@
 use devmanager::browser::{
-    BrowserAnnotation, BrowserRevision, BrowserTabSnapshot, BrowserViewport,
+    BrowserAnnotation, BrowserError, BrowserRevision, BrowserTabSnapshot, BrowserViewport,
     BrowserWorkspaceSnapshot,
 };
 use serde_json::json;
@@ -99,12 +99,20 @@ fn save_queues_annotation_and_rejects_blank_or_duplicate_ids() {
     let blank = snapshot
         .save_annotation(annotation("annotation-2", "  \n "))
         .expect_err("blank comments are invalid");
-    assert!(blank.to_string().contains("comment"));
+    assert!(matches!(
+        blank,
+        BrowserError::InvalidAnnotation { field, message }
+            if field == "comment" && message == "cannot be blank"
+    ));
 
     let duplicate = snapshot
         .save_annotation(annotation("annotation-1", "Different"))
         .expect_err("duplicate ids are invalid");
-    assert!(duplicate.to_string().contains("annotation-1"));
+    assert!(matches!(
+        duplicate,
+        BrowserError::InvalidAnnotation { field, message }
+            if field == "id" && message == "annotation-1 already exists"
+    ));
 }
 
 #[test]

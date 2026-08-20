@@ -20,9 +20,10 @@ pub use connection::{
 #[cfg(test)]
 pub(crate) use connection::{ConnectionOutputHandle, ConnectionOutputId, OutputInspection};
 pub(crate) use ipc::{
-    codecs_for_limits, handshake_codecs, handshake_timeout, read_physical_frame,
-    read_physical_frame_idle_then_deadline, request_completion_timeout, supervise_duplex_halves,
-    write_physical_frame, write_physical_frame_with_deadline,
+    agent_connection_query_timeout, codecs_for_limits, handshake_codecs, handshake_timeout,
+    read_physical_frame, read_physical_frame_idle_then_deadline, request_completion_timeout,
+    supervise_duplex_halves, task_cockpit_query_timeout, write_physical_frame,
+    write_physical_frame_with_deadline,
 };
 pub use ipc::{
     pipe_endpoint_for_named_profile, profile_fingerprint_for_named_profile, AcceptHelloConfig,
@@ -45,3 +46,21 @@ pub use update::{
     HostExecutorActiveResourceProbe, HostQuitInspectionSource, HostUpdateRuntimeGate,
     OwnedActiveResourceProbe,
 };
+
+/// Capabilities implemented by every production native host. Optional
+/// organization and service-supervisor capabilities are appended at runtime.
+/// Keep the desktop client's requested set covered by this base before adding
+/// a native query path.
+pub const NATIVE_HOST_BASE_CAPABILITIES: [crate::protocol::Capability; 11] = [
+    crate::protocol::Capability::PagedSnapshots,
+    crate::protocol::Capability::EventReplay,
+    crate::protocol::Capability::OperationSettlement,
+    crate::protocol::Capability::ChunkResume,
+    crate::protocol::Capability::PromptProjection,
+    crate::protocol::Capability::ExplicitDetach,
+    crate::protocol::Capability::HostShutdown,
+    crate::protocol::Capability::UpdateHandoff,
+    crate::protocol::Capability::ProviderInput,
+    crate::protocol::Capability::TaskCockpit,
+    crate::protocol::Capability::SemanticConversation,
+];

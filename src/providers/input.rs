@@ -28,6 +28,7 @@ pub const ACTION_PROVIDER_QUEUE_FOLLOW_UP: &str = "provider.queue_follow_up";
 pub const ACTION_PROVIDER_ANSWER_QUESTION: &str = "provider.answer_question";
 pub const ACTION_PROVIDER_RESOLVE_APPROVAL: &str = "provider.resolve_approval";
 pub const ACTION_PROVIDER_STOP_TURN: &str = "provider.stop_turn";
+pub const ACTION_PROVIDER_TERMINAL_INPUT: &str = "provider.terminal_input";
 pub const ACTION_PROVIDER_NEW_CONVERSATION: &str = "provider.new_conversation";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,7 +127,7 @@ pub struct ProviderInputDeliveryIdentity {
     pub client_id: ClientId,
     pub agent_session_id: AgentSessionId,
     pub provider_kind: ProviderKind,
-    pub provider_session_id: ProviderSessionId,
+    pub provider_session_id: Option<ProviderSessionId>,
     pub runtime_generation: u64,
     pub action_epoch: u64,
     pub turn_id: TurnId,
@@ -143,6 +144,163 @@ pub enum ProviderInputDeliveryError {
     ActionMismatch,
     BytesMismatch,
     RuntimeAuthorityAbsent,
+    /// Action has no proven physical provider interaction yet.
+    UnsupportedAction,
+    /// At least one required physical write may have crossed; never retry.
+    PostBoundaryFailure,
+}
+
+/// One distinct PTY write in a provider composer submit sequence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProviderComposerWriteStep {
+    bytes: Vec<u8>,
+    delay_after: Option<std::time::Duration>,
+}
+
+impl ProviderComposerWriteStep {
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub(crate) fn delay_after(&self) -> Option<std::time::Duration> {
+        self.delay_after
+    }
+}
+
+/// Proven Claude/Codex composer submit sequence. It mirrors the established
+/// web-composer timing: distinct Enter writes, Codex Escape sequencing, and
+/// typed slash-command tokens that cannot be collapsed into a ConPTY paste.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProviderComposerSubmitPlan {
+    steps: Vec<ProviderComposerWriteStep>,
+}
+
+impl ProviderComposerSubmitPlan {
+    pub(crate) fn steps(&self) -> &[ProviderComposerWriteStep] {
+        &self.steps
+    }
+}
+
+/// Build the physical write sequence for a provider input action. Approval
+/// resolution fails closed because it has no provider-neutral key sequence;
+/// StopTurn uses the standard interrupt byte instead of typing a placeholder.
+pub(crate) fn provider_composer_submit_plan(
+    provider_kind: ProviderKind,
+    action: &ProviderInputAction,
+) -> Result<ProviderComposerSubmitPlan, ProviderInputDeliveryError> {
+    if matches!(provider_kind, ProviderKind::Cursor) {
+        return Err(ProviderInputDeliveryError::UnsupportedAction);
+    }
+    if let ProviderInputAction::TerminalInput { text } = action {
+        if text.is_empty() {
+            return Err(ProviderInputDeliveryError::BytesMismatch);
+        }
+        return Ok(ProviderComposerSubmitPlan {
+            steps: vec![ProviderComposerWriteStep {
+                bytes: text.as_bytes().to_vec(),
+                delay_after: None,
+            }],
+        });
+    }
+    let text = match action {
+        ProviderInputAction::SendNow { text, .. }
+        | ProviderInputAction::SteerCurrentTurn { text }
+        | ProviderInputAction::QueueFollowUp { text } => text.as_bytes(),
+        ProviderInputAction::AnswerQuestion { answer, .. } => answer.as_bytes(),
+        ProviderInputAction::StopTurn => {
+            return Ok(ProviderComposerSubmitPlan {
+                steps: vec![ProviderComposerWriteStep {
+                    bytes: vec![0x03],
+                    delay_after: None,
+                }],
+            });
+        }
+        ProviderInputAction::ResolveApproval { .. } => {
+            return Err(ProviderInputDeliveryError::UnsupportedAction);
+        }
+        ProviderInputAction::TerminalInput { .. } => unreachable!("handled above"),
+    };
+    if text.is_empty() {
+        return Err(ProviderInputDeliveryError::BytesMismatch);
+    }
+
+    let mut steps = Vec::new();
+    if matches!(provider_kind, ProviderKind::Codex) {
+        // Exit any full-screen Codex TUI surface before typing the prompt.
+        steps.push(ProviderComposerWriteStep {
+            bytes: "\u{1b}".as_bytes().to_vec(),
+            delay_after: Some(std::time::Duration::from_millis(180)),
+        });
+    }
+    let text = std::str::from_utf8(text).map_err(|_| ProviderInputDeliveryError::BytesMismatch)?;
+    let trimmed = text.trim_start();
+    let slash_command = trimmed.starts_with('/');
+    if slash_command {
+        let leading_len = text.len() - trimmed.len();
+        if leading_len > 0 {
+            steps.push(ProviderComposerWriteStep {
+                bytes: text.as_bytes()[..leading_len].to_vec(),
+                delay_after: None,
+            });
+        }
+        let token_end = trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
+        let token = &trimmed[..token_end];
+        let token_char_count = token.chars().count();
+        for (index, character) in token.chars().enumerate() {
+            let mut encoded = [0_u8; 4];
+            let is_last = index + 1 == token_char_count;
+            steps.push(ProviderComposerWriteStep {
+                bytes: character.encode_utf8(&mut encoded).as_bytes().to_vec(),
+                delay_after: Some(std::time::Duration::from_millis(
+                    if is_last && token_end == trimmed.len() {
+                        350
+                    } else {
+                        100
+                    },
+                )),
+            });
+        }
+        if token_end < trimmed.len() {
+            steps.push(ProviderComposerWriteStep {
+                bytes: trimmed.as_bytes()[token_end..].to_vec(),
+                delay_after: Some(std::time::Duration::from_millis(250)),
+            });
+        }
+        steps.push(ProviderComposerWriteStep {
+            bytes: b" ".to_vec(),
+            delay_after: Some(std::time::Duration::from_millis(500)),
+        });
+    } else {
+        steps.push(ProviderComposerWriteStep {
+            bytes: text.as_bytes().to_vec(),
+            delay_after: Some(std::time::Duration::from_millis(50)),
+        });
+    }
+    if matches!(provider_kind, ProviderKind::Codex) && !slash_command {
+        // Leave multiline edit mode before submitting.
+        steps.push(ProviderComposerWriteStep {
+            bytes: "\u{1b}".as_bytes().to_vec(),
+            delay_after: Some(std::time::Duration::from_millis(120)),
+        });
+    }
+    let claude_exact_slash = slash_command
+        && matches!(provider_kind, ProviderKind::ClaudeCode)
+        && trimmed[token_end(trimmed)..].trim().is_empty();
+    steps.push(ProviderComposerWriteStep {
+        bytes: b"\r".to_vec(),
+        delay_after: claude_exact_slash.then_some(std::time::Duration::from_millis(180)),
+    });
+    if claude_exact_slash {
+        steps.push(ProviderComposerWriteStep {
+            bytes: b"\r".to_vec(),
+            delay_after: None,
+        });
+    }
+    Ok(ProviderComposerSubmitPlan { steps })
+}
+
+fn token_end(text: &str) -> usize {
+    text.find(char::is_whitespace).unwrap_or(text.len())
 }
 
 /// Opaque receipt issued only after a live managed session writes the exact
@@ -218,11 +376,17 @@ pub struct ProviderRuntimeWriteHandle {
 }
 
 pub(crate) trait ProviderRuntimeByteWriter: Send {
-    fn write_exact(
+    /// Deliver a bounded provider action through the live managed session.
+    /// Implementations must perform every required physical write (prompt plus
+    /// distinct submit, plus provider-specific control keys) before returning
+    /// Ok. Logical `bytes` are the action payload, not the full physical PTY
+    /// sequence.
+    fn write_provider_action(
         &self,
         fence: &ManagedProcessFence,
         identity: &ProviderInputDeliveryIdentity,
-        bytes: &[u8],
+        action: &ProviderInputAction,
+        logical_bytes: &[u8],
     ) -> Result<(), ProviderInputDeliveryError>;
 }
 
@@ -282,8 +446,11 @@ impl ProviderRuntimeWriteHandle {
         if plan.as_bytes() != expected.as_slice() {
             return Err(ProviderInputDeliveryError::BytesMismatch);
         }
+        // Fail closed for actions without a proven physical interaction before
+        // any managed-session write occurs.
+        provider_composer_submit_plan(identity.provider_kind, action)?;
         self.writer
-            .write_exact(&self.fence, identity, plan.as_bytes())?;
+            .write_provider_action(&self.fence, identity, action, plan.as_bytes())?;
         ProviderInputWriteReceipt::issue(
             identity.clone(),
             action.clone(),
@@ -300,6 +467,7 @@ pub fn provider_input_action_id(action: &ProviderInputAction) -> &'static str {
         ProviderInputAction::QueueFollowUp { .. } => ACTION_PROVIDER_QUEUE_FOLLOW_UP,
         ProviderInputAction::AnswerQuestion { .. } => ACTION_PROVIDER_ANSWER_QUESTION,
         ProviderInputAction::ResolveApproval { .. } => ACTION_PROVIDER_RESOLVE_APPROVAL,
+        ProviderInputAction::TerminalInput { .. } => ACTION_PROVIDER_TERMINAL_INPUT,
         ProviderInputAction::StopTurn => ACTION_PROVIDER_STOP_TURN,
     }
 }
@@ -319,6 +487,7 @@ pub fn provider_input_action_bytes(
                 b"deny".to_vec()
             }
         }
+        ProviderInputAction::TerminalInput { text } => text.as_bytes().to_vec(),
         ProviderInputAction::StopTurn => b"stop_turn".to_vec(),
     };
     Ok(ProviderInput::new(bytes)?.as_bytes().to_vec())
@@ -391,6 +560,7 @@ pub fn sequence_bounded_input(
         | ACTION_PROVIDER_QUEUE_FOLLOW_UP
         | ACTION_PROVIDER_ANSWER_QUESTION
         | ACTION_PROVIDER_RESOLVE_APPROVAL
+        | ACTION_PROVIDER_TERMINAL_INPUT
         | ACTION_PROVIDER_STOP_TURN => {}
         _ => return Err(ProviderInputError::Empty),
     }
@@ -429,6 +599,7 @@ pub fn available_action_ids(
     if session.current_turn.is_some() {
         ids.push(ACTION_PROVIDER_STEER_CURRENT_TURN);
         ids.push(ACTION_PROVIDER_QUEUE_FOLLOW_UP);
+        ids.push(ACTION_PROVIDER_TERMINAL_INPUT);
         ids.push(ACTION_PROVIDER_STOP_TURN);
     }
     if session.open_question.is_some() && session.current_turn.is_some() {
@@ -457,7 +628,9 @@ mod tests {
             agent_session_id: AgentSessionId::parse("018f60b0-9c1a-7001-8000-000000000021")
                 .unwrap(),
             provider_kind: crate::providers::ProviderKind::Codex,
-            provider_session_id: crate::domain::ProviderSessionId::new("codex-session-1").unwrap(),
+            provider_session_id: Some(
+                crate::domain::ProviderSessionId::new("codex-session-1").unwrap(),
+            ),
             runtime_generation: generation,
             action_epoch: 4,
             turn_id: crate::domain::TurnId::parse("018f60b0-9c1a-7001-8000-000000000034").unwrap(),
@@ -518,14 +691,84 @@ mod tests {
     }
 
     #[test]
+    fn composer_submit_plan_preserves_distinct_provider_key_boundaries() {
+        let action = ProviderInputAction::SendNow {
+            text: "hello".into(),
+            wait: false,
+        };
+        let claude =
+            provider_composer_submit_plan(ProviderKind::ClaudeCode, &action).expect("claude plan");
+        assert_eq!(
+            claude
+                .steps()
+                .iter()
+                .map(ProviderComposerWriteStep::bytes)
+                .collect::<Vec<_>>(),
+            vec![b"hello".as_slice(), b"\r".as_slice()]
+        );
+
+        let codex =
+            provider_composer_submit_plan(ProviderKind::Codex, &action).expect("codex plan");
+        assert_eq!(
+            codex
+                .steps()
+                .iter()
+                .map(ProviderComposerWriteStep::bytes)
+                .collect::<Vec<_>>(),
+            vec![
+                b"\x1b".as_slice(),
+                b"hello".as_slice(),
+                b"\x1b".as_slice(),
+                b"\r".as_slice(),
+            ]
+        );
+    }
+
+    #[test]
+    fn composer_submit_plan_supports_interrupt_and_fails_closed_for_unproven_approval() {
+        let stop =
+            provider_composer_submit_plan(ProviderKind::ClaudeCode, &ProviderInputAction::StopTurn)
+                .expect("stop plan");
+        assert_eq!(stop.steps()[0].bytes(), &[0x03]);
+        assert_eq!(
+            provider_composer_submit_plan(
+                ProviderKind::ClaudeCode,
+                &ProviderInputAction::ResolveApproval {
+                    approval_id: crate::domain::ApprovalId::new(),
+                    allow: true,
+                },
+            ),
+            Err(ProviderInputDeliveryError::UnsupportedAction)
+        );
+    }
+
+    #[test]
+    fn terminal_input_plan_preserves_interactive_control_bytes_without_submit() {
+        let action = ProviderInputAction::TerminalInput {
+            text: "\u{1b}[B".into(),
+        };
+        let plan = provider_composer_submit_plan(ProviderKind::ClaudeCode, &action)
+            .expect("terminal input plan");
+        assert_eq!(
+            provider_input_action_id(&action),
+            ACTION_PROVIDER_TERMINAL_INPUT
+        );
+        assert_eq!(provider_input_action_bytes(&action).unwrap(), b"\x1b[B");
+        assert_eq!(plan.steps().len(), 1);
+        assert_eq!(plan.steps()[0].bytes(), b"\x1b[B");
+        assert_eq!(plan.steps()[0].delay_after(), None);
+    }
+
+    #[test]
     fn live_write_handle_rejects_stale_action_and_bytes() {
         struct RejectingWriter;
         impl ProviderRuntimeByteWriter for RejectingWriter {
-            fn write_exact(
+            fn write_provider_action(
                 &self,
                 _fence: &crate::process::registry::ManagedProcessFence,
                 _identity: &ProviderInputDeliveryIdentity,
-                _bytes: &[u8],
+                _action: &crate::domain::provider_input::ProviderInputAction,
+                _logical_bytes: &[u8],
             ) -> Result<(), ProviderInputDeliveryError> {
                 panic!("mismatched action/bytes must not write");
             }

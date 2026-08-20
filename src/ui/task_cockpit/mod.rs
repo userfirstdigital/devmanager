@@ -54,6 +54,7 @@ pub mod cockpit_projection;
 pub mod composer;
 pub mod config_sidebar;
 pub mod dock;
+pub mod draft_store;
 pub mod files_panel;
 pub mod panel;
 pub mod review_panel;

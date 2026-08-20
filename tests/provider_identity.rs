@@ -212,9 +212,15 @@ fn suspended_windows_claim_precedes_resume_and_graph_attestation() {
         .find("claim_suspended_process(child.id())")
         .expect("suspended process claim");
     let graph_check = spawn_source
-        .find("requested.revalidate()")
+        .find("requested.revalidate_bound_identity()")
         .expect("pre-resume graph revalidation");
     assert!(claim < graph_check, "Job claim must precede graph proof");
+    assert!(
+        !spawn_source
+            .replace("requested.revalidate_bound_identity()", "")
+            .contains("requested.revalidate()"),
+        "full SHA-256 revalidate during CREATE_SUSPENDED burns the probe timeout on large native CLIs"
+    );
     assert!(
         adapter_source
             .find("resume_suspended_process(self.pid())")
@@ -352,7 +358,12 @@ fn executable_identity_is_canonical_file_bound_and_checked_on_serde() {
     let identity = executable(&path);
 
     assert!(identity.canonical_path().is_absolute());
-    assert_eq!(identity.sha256(), &file_hash(&path));
+    assert_ne!(
+        identity.sha256(),
+        &file_hash(&path),
+        "native attestation is the captured file ID, not a SHA-256 of the whole image"
+    );
+    assert_ne!(identity.sha256(), &[0_u8; 32]);
     assert_eq!(identity.file_identity().link_count(), 1);
     assert!(identity.file_identity().stable_id() != 0);
 
@@ -388,6 +399,79 @@ fn executable_identity_rejects_replacement_even_when_the_path_is_unchanged() {
     } else {
         assert_ne!(replacement, original);
     }
+}
+
+#[test]
+fn native_inspect_hashes_file_contents_once() {
+    let source = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/providers/capabilities.rs"
+    ));
+    let start = source
+        .find("fn inspect_blocking_with_mode(")
+        .expect("inspect_blocking_with_mode");
+    let body = &source[start..];
+    let end = body
+        .find("\n    fn validate_bound_handle(")
+        .expect("validate_bound_handle follows inspect");
+    let body = &body[..end];
+    assert_eq!(
+        body.matches("inspect_opened_file(").count(),
+        1,
+        "re-opening the same native CLI to confirm identity must not SHA-256 hundreds of MB a second time"
+    );
+    assert!(
+        body.contains("inspect_opened_metadata"),
+        "confirmation pass should re-read file identity only"
+    );
+}
+
+#[test]
+fn inspect_opened_file_does_not_content_hash_natives() {
+    let source = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/providers/capabilities.rs"
+    ));
+    let start = source
+        .find("fn inspect_opened_file(")
+        .expect("inspect_opened_file");
+    let body = &source[start..];
+    let end = body
+        .find("\nfn inspect_opened_metadata(")
+        .expect("inspect_opened_metadata follows inspect_opened_file");
+    let body = &body[..end];
+    assert!(
+        !body.contains("let sha256 = hash_file"),
+        "PATH inspect must not SHA-256 a 300MB native CLI; file identity is the attestation"
+    );
+    assert!(
+        body.contains("hash_file("),
+        "Windows shims and scripts are small and must still be content-hashed"
+    );
+}
+
+#[test]
+fn validate_current_does_not_rehash_native_contents() {
+    let source = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/providers/capabilities.rs"
+    ));
+    let start = source
+        .find("pub fn validate_current(&self)")
+        .expect("validate_current");
+    let body = &source[start..];
+    let end = body
+        .find("\n    pub(crate) fn inspect_blocking(")
+        .expect("inspect_blocking follows validate_current");
+    let body = &body[..end];
+    assert!(
+        !body.contains("inspect_blocking_with_mode"),
+        "validate_current must not SHA-256 the native CLI again"
+    );
+    assert!(
+        body.contains("validate_bound_handle") && body.contains("inspect_opened_metadata"),
+        "validate_current should confirm the captured file ID only"
+    );
 }
 
 #[test]
@@ -458,6 +542,45 @@ fn held_launch_graph_handle_denies_write_and_delete_sharing() {
 }
 
 #[test]
+fn executable_identity_accepts_npm_style_hardlinked_native_binaries() {
+    let temp = tempdir().unwrap();
+    let target = native_fixture(temp.path(), "claude.exe", b"provider");
+    let packaged = temp.path().join("claude-win32-x64.exe");
+    std::fs::hard_link(&target, &packaged).expect("npm-style hardlink");
+    let original = executable(&target);
+    let linked = executable(&packaged);
+    assert_eq!(
+        original.file_identity().stable_id(),
+        linked.file_identity().stable_id()
+    );
+    assert!(original.file_identity().link_count() >= 2);
+}
+
+#[test]
+fn stock_path_claude_discovery_accepts_npm_hardlinked_native_target_when_present() {
+    let snapshot = ProviderPathSnapshot::capture_current().expect("capture PATH");
+    let claude = ProviderDiscoveryContract::for_kind(ProviderKind::ClaudeCode);
+    match claude.resolve_all_from_path_snapshot(&snapshot) {
+        Ok(_) | Err(ProviderDiscoveryError::NoCandidate(_)) => {}
+        Err(error) => panic!("stock Claude discovery failed: {error}: {error:?}"),
+    }
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let has_codex_cmd =
+        std::env::split_paths(&path).any(|directory| directory.join("codex.cmd").is_file());
+    let codex = ProviderDiscoveryContract::for_kind(ProviderKind::Codex);
+    match codex.resolve_all_from_path_snapshot(&snapshot) {
+        Ok(candidates) if has_codex_cmd => {
+            assert!(
+                !candidates.is_empty(),
+                "codex.cmd is on PATH but discovery returned no candidates"
+            );
+        }
+        Ok(_) | Err(ProviderDiscoveryError::NoCandidate(_)) => {}
+        Err(error) => panic!("stock Codex discovery failed: {error}: {error:?}"),
+    }
+}
+
+#[test]
 fn executable_identity_rejects_directories_symlinks_and_hardlinks_when_supported() {
     let temp = tempdir().unwrap();
     let directory = temp.path().join("provider-native.exe");
@@ -475,21 +598,6 @@ fn executable_identity_rejects_directories_symlinks_and_hardlinks_when_supported
     {
         if std::os::windows::fs::symlink_file(&target, &symlink).is_ok() {
             assert!(ProviderExecutable::from_path(&symlink).is_err());
-        }
-    }
-
-    let hardlink = temp.path().join("provider-hardlink.exe");
-    #[cfg(unix)]
-    {
-        std::fs::hard_link(&target, &hardlink).unwrap();
-        assert!(ProviderExecutable::from_path(&target).is_err());
-        assert!(ProviderExecutable::from_path(&hardlink).is_err());
-    }
-    #[cfg(windows)]
-    {
-        if std::fs::hard_link(&target, &hardlink).is_ok() {
-            assert!(ProviderExecutable::from_path(&target).is_err());
-            assert!(ProviderExecutable::from_path(&hardlink).is_err());
         }
     }
 }
@@ -653,6 +761,51 @@ fn path_snapshot_attests_a_safe_reparse_directory_and_resolves_its_target() {
     );
 }
 
+#[cfg(windows)]
+#[test]
+fn path_snapshot_skips_unattestable_directory_and_keeps_later_trusted_native() {
+    // Catches restoring fail-fast capture on one unattestable PATH entry:
+    // an earlier absolute directory that cannot acquire its security handle
+    // must not abort discovery of a later fully attested Claude installation.
+    use std::fs::OpenOptions;
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    };
+
+    let temp = tempdir().unwrap();
+    let blocked = temp.path().join("blocked-windowsapps");
+    let trusted = temp.path().join("trusted-nvm");
+    fs::create_dir(&blocked).unwrap();
+    fs::create_dir(&trusted).unwrap();
+    native_fixture(&trusted, "claude.exe", b"later-trusted-native");
+
+    // Hold the earlier directory open without read sharing so
+    // ProviderPathSnapshot cannot acquire its security-preserving handle,
+    // matching the WindowsApps package-directory failure mode.
+    let _blocked_hold = OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0 | FILE_FLAG_OPEN_REPARSE_POINT.0)
+        .share_mode(0)
+        .open(&blocked)
+        .expect("exclusive hold that denies security-handle acquisition");
+
+    let path_value = std::env::join_paths([blocked.as_os_str(), trusted.as_os_str()]).unwrap();
+    let snapshot = ProviderPathSnapshot::capture(&OsString::from(path_value))
+        .expect("one unattestable PATH entry must not abort later trusted directories");
+    let candidate = ProviderDiscoveryContract::for_kind(ProviderKind::ClaudeCode)
+        .resolve_from_path_snapshot(&snapshot)
+        .expect("resolve later trusted native Claude");
+    assert!(matches!(
+        candidate.origin(),
+        ProviderDiscoveryOrigin::PathEntry { index: 1, .. }
+    ));
+    assert_eq!(
+        candidate.executable().canonical_path(),
+        fs::canonicalize(trusted.join("claude.exe")).unwrap()
+    );
+}
+
 #[test]
 fn path_snapshot_resolver_fails_closed_on_a_shadowing_non_native_candidate() {
     let temp = tempdir().unwrap();
@@ -750,6 +903,37 @@ CALL :find_dp0
         ProviderExecutableForm::WindowsShim { .. }
     ));
     claude.open_for_launch().unwrap().revalidate().unwrap();
+
+    fs::write(
+        claude_root.join("claude.ps1"),
+        r#"#!/usr/bin/env pwsh
+$basedir=Split-Path $MyInvocation.MyCommand.Definition -Parent
+
+$exe=""
+if ($PSVersionTable.PSVersion -lt "6.0" -or $IsWindows) {
+  # Fix case when both the Windows and Linux builds of Node
+  # are installed in the same directory
+  $exe=".exe"
+}
+# Support pipeline input
+if ($MyInvocation.ExpectingInput) {
+  $input | & "$basedir/node_modules/@anthropic-ai/claude-code/bin/claude.exe"   $args
+} else {
+  & "$basedir/node_modules/@anthropic-ai/claude-code/bin/claude.exe"   $args
+}
+exit $LASTEXITCODE
+"#,
+    )
+    .unwrap();
+    let claude_with_ps1 = ProviderDiscoveryContract::for_kind(ProviderKind::ClaudeCode)
+        .resolve_from_path_snapshot(&claude_snapshot)
+        .unwrap_or_else(|error| {
+            panic!("npm claude.cmd must still resolve when stock claude.ps1 sits beside it: {error}: {error:?}")
+        });
+    assert!(matches!(
+        claude_with_ps1.form(),
+        ProviderExecutableForm::WindowsShim { .. }
+    ));
 
     // Codex's npm wrapper is a Node entry graph.  The interpreter is chosen
     // from the same trusted PATH snapshot, with the sibling node.exe winning
@@ -874,6 +1058,93 @@ if "%SCRIPT_DIR:~-1%"=="\" set "SCRIPT_DIR=%SCRIPT_DIR:~0,-1%"
             .ends_with(Path::new("2026.08.05-bbbb3333").join("node.exe")));
     }
     cursor.open_for_launch().unwrap().revalidate().unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn discovery_accepts_global_npm_prefix_codex_cmd_when_ps1_sits_beside_it() {
+    let temp = tempdir().unwrap();
+    let prefix = temp.path().join("nodejs");
+    let script = prefix
+        .join("node_modules")
+        .join("@openai")
+        .join("codex")
+        .join("bin");
+    fs::create_dir_all(&script).unwrap();
+    fs::copy(std::env::current_exe().unwrap(), prefix.join("node.exe")).unwrap();
+    fs::write(script.join("codex.js"), b"module.exports = {};\n").unwrap();
+    fs::write(
+        prefix.join("codex.cmd"),
+        r#"@ECHO off
+GOTO start
+:find_dp0
+SET dp0=%~dp0
+EXIT /b
+:start
+SETLOCAL
+CALL :find_dp0
+
+IF EXIST "%dp0%\node.exe" (
+  SET "_prog=%dp0%\node.exe"
+) ELSE (
+  SET "_prog=node"
+)
+
+endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & set PATHEXT=%PATHEXT:;.JS;=;% & "%_prog%"  "%dp0%\node_modules\@openai\codex\bin\codex.js" %*
+"#,
+    )
+    .unwrap();
+    fs::write(
+        prefix.join("codex.ps1"),
+        r#"#!/usr/bin/env pwsh
+$basedir=Split-Path $MyInvocation.MyCommand.Definition -Parent
+$exe=""
+if ($PSVersionTable.PSVersion -lt "6.0" -or $IsWindows) {
+  $exe=".exe"
+}
+$ret=0
+if (Test-Path "$basedir/node$exe") {
+  if ($MyInvocation.ExpectingInput) {
+    $input | & "$basedir/node$exe"  "$basedir/node_modules/@openai/codex/bin/codex.js" $args
+  } else {
+    & "$basedir/node$exe"  "$basedir/node_modules/@openai/codex/bin/codex.js" $args
+  }
+  $ret=$LASTEXITCODE
+} else {
+  if ($MyInvocation.ExpectingInput) {
+    $input | & "node$exe"  "$basedir/node_modules/@openai/codex/bin/codex.js" $args
+  } else {
+    & "node$exe"  "$basedir/node_modules/@openai/codex/bin/codex.js" $args
+  }
+  $ret=$LASTEXITCODE
+}
+exit $ret
+"#,
+    )
+    .unwrap();
+
+    let snapshot =
+        ProviderPathSnapshot::capture(&std::env::join_paths([prefix.as_os_str()]).unwrap())
+            .unwrap();
+    let codex = ProviderDiscoveryContract::for_kind(ProviderKind::Codex)
+        .resolve_from_path_snapshot(&snapshot)
+        .unwrap_or_else(|error| {
+            panic!("global npm prefix codex.cmd must resolve: {error}: {error:?}")
+        });
+    assert!(matches!(
+        codex.form(),
+        ProviderExecutableForm::WindowsNodeScript { .. }
+    ));
+    if let ProviderExecutableForm::WindowsNodeScript { script, .. } = codex.form() {
+        assert!(script.canonical_path().ends_with(
+            Path::new("node_modules")
+                .join("@openai")
+                .join("codex")
+                .join("bin")
+                .join("codex.js")
+        ));
+    }
+    codex.open_for_launch().unwrap().revalidate().unwrap();
 }
 
 #[test]
@@ -1568,19 +1839,14 @@ fn executable_wire_preserves_native_form_and_requires_it_on_decode() {
 }
 
 #[test]
-fn deserialized_non_native_identity_cannot_open_as_a_direct_handle() {
+fn deserialized_native_identity_rejects_non_native_form_tampering() {
     let temp = tempdir().unwrap();
     let path = native_fixture(temp.path(), "provider-native.exe", b"non-native-form");
     let identity = executable(&path);
     let mut encoded = serde_json::to_value(&identity).unwrap();
     encoded["is_native"] = serde_json::json!(false);
 
-    let non_native: ProviderExecutable = serde_json::from_value(encoded).unwrap();
-    assert!(!non_native.is_native());
-    assert!(matches!(
-        non_native.open_for_launch(),
-        Err(ProviderExecutableError::NotNativeExecutable(_))
-    ));
+    assert!(serde_json::from_value::<ProviderExecutable>(encoded).is_err());
 }
 
 #[cfg(windows)]

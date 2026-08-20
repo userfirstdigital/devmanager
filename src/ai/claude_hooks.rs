@@ -355,6 +355,24 @@ impl ClaudeReducer {
             "UserPromptSubmit" => {
                 let deduplication_key =
                     self.official_deduplication_key(&value, "prompt_id", "claude-user-prompt");
+                if let Some(detail) = value
+                    .get("prompt")
+                    .and_then(Value::as_str)
+                    .and_then(provider_task_notification_detail)
+                {
+                    return ClaudeReduceOutcome {
+                        drafts: vec![self.draft(
+                            occurred_at_epoch_ms,
+                            SemanticEventKind::Status {
+                                state: "subagentCompleted".to_string(),
+                                detail: Some(detail),
+                            },
+                            SemanticRetention::Canonical,
+                            deduplication_key,
+                        )],
+                        degraded: false,
+                    };
+                }
                 self.text_event(
                     occurred_at_epoch_ms,
                     value.get("prompt").and_then(Value::as_str),
@@ -364,6 +382,11 @@ impl ClaudeReducer {
                 )
             }
             "MessageDisplay" => self.message_display(&value, occurred_at_epoch_ms),
+            "PreToolUse"
+                if value.get("tool_name").and_then(Value::as_str) == Some("AskUserQuestion") =>
+            {
+                self.ask_user_question(&value, occurred_at_epoch_ms, occurrence)
+            }
             "PreToolUse" => self.tool_event(
                 &value,
                 occurred_at_epoch_ms,
@@ -706,6 +729,61 @@ impl ClaudeReducer {
         }
     }
 
+    fn ask_user_question(
+        &self,
+        value: &Value,
+        occurred_at_epoch_ms: u64,
+        occurrence: u64,
+    ) -> ClaudeReduceOutcome {
+        let Some(question) = value
+            .get("tool_input")
+            .and_then(|input| input.get("questions"))
+            .and_then(Value::as_array)
+            .and_then(|questions| questions.first())
+        else {
+            return ClaudeReduceOutcome::malformed();
+        };
+        let Some(prompt) = question.get("question").and_then(Value::as_str) else {
+            return ClaudeReduceOutcome::malformed();
+        };
+        let official_id = official_identifier(value, "tool_use_id");
+        let question_id = official_id
+            .clone()
+            .unwrap_or_else(|| format!("ask-user-question-{occurrence}"));
+        let deduplication_key = official_id.as_ref().map(|id| {
+            scoped_deduplication_key(
+                "claude-ask-user-question",
+                &self.provider_session_id(value),
+                id,
+            )
+        });
+        let choices = question
+            .get("options")
+            .and_then(Value::as_array)
+            .map(|options| {
+                options
+                    .iter()
+                    .filter_map(|option| option.get("label").and_then(Value::as_str))
+                    .map(bounded_text)
+                    .take(16)
+                    .collect()
+            })
+            .unwrap_or_default();
+        ClaudeReduceOutcome {
+            drafts: vec![self.draft(
+                occurred_at_epoch_ms,
+                SemanticEventKind::Question {
+                    question_id,
+                    prompt: bounded_text(prompt),
+                    choices,
+                },
+                SemanticRetention::Canonical,
+                deduplication_key,
+            )],
+            degraded: false,
+        }
+    }
+
     fn permission_denied(
         &mut self,
         value: &Value,
@@ -776,13 +854,30 @@ impl ClaudeReducer {
         let deduplication_key = official_id.as_ref().map(|id| {
             scoped_deduplication_key("claude-elicitation", &self.provider_session_id(value), id)
         });
+        let choices = value
+            .get("choices")
+            .or_else(|| value.get("options"))
+            .and_then(Value::as_array)
+            .map(|choices| {
+                choices
+                    .iter()
+                    .filter_map(|choice| {
+                        choice
+                            .as_str()
+                            .or_else(|| choice.get("label").and_then(Value::as_str))
+                            .map(bounded_text)
+                    })
+                    .take(16)
+                    .collect()
+            })
+            .unwrap_or_default();
         ClaudeReduceOutcome {
             drafts: vec![self.draft(
                 occurred_at_epoch_ms,
                 SemanticEventKind::Question {
                     question_id: question_id.clone(),
                     prompt: bounded_text(message),
-                    choices: Vec::new(),
+                    choices,
                 },
                 SemanticRetention::Canonical,
                 deduplication_key,
@@ -910,6 +1005,25 @@ impl ClaudeReducer {
         official_identifier(value, field)
             .map(|id| scoped_deduplication_key(prefix, &self.provider_session_id(value), &id))
     }
+}
+
+fn provider_task_notification_detail(prompt: &str) -> Option<String> {
+    let prompt = prompt.trim();
+    if !prompt.starts_with("<task-notification>") || !prompt.ends_with("</task-notification>") {
+        return None;
+    }
+    fn element(text: &str, tag: &str) -> Option<String> {
+        let open = format!("<{tag}>");
+        let close = format!("</{tag}>");
+        let value = text.split_once(&open)?.1.split_once(&close)?.0.trim();
+        (!value.is_empty()).then(|| bounded_text(value))
+    }
+    let summary = element(prompt, "summary")?;
+    let result = element(prompt, "result");
+    Some(match result {
+        Some(result) => format!("{summary}\n{result}"),
+        None => summary,
+    })
 }
 
 fn safe_stop_failure_category(error: &str) -> &'static str {
@@ -1200,6 +1314,14 @@ impl ClaudeCorrelatedRegistration {
 
     pub fn journal_key(&self) -> &StableSessionKey {
         &self.journal_key
+    }
+
+    pub(crate) fn hook_registration(&self) -> ClaudeHookRegistration {
+        ClaudeHookRegistration {
+            nonce: self.nonce.clone(),
+            stable_session_key: self.journal_key.clone(),
+            generation: self.generation,
+        }
     }
 }
 
@@ -3268,6 +3390,78 @@ pub fn prepare_claude_launch_overlay(
     temp_root: &Path,
     now: Instant,
 ) -> ClaudeLaunchOverlay {
+    prepare_claude_launch_overlay_with_registration(
+        registry,
+        stable_session_key,
+        startup_command,
+        shell,
+        devmanager_executable,
+        endpoint,
+        temp_root,
+        now,
+        |registry, stable_session_key, now| registry.register_at(stable_session_key, now),
+    )
+}
+
+/// Production launch preparation: the relay registration is sealed to the
+/// exact launch correlation before its nonce is written into the settings
+/// overlay. HTTP ingress therefore never observes an uncorrelated production
+/// registration, even during launch or cleanup races.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_correlated_claude_launch_overlay(
+    registry: &ClaudeHookRegistry,
+    stable_session_key: StableSessionKey,
+    binding: ClaudeCorrelationBinding,
+    expected_provider_session_id: Option<ProviderSessionId>,
+    startup_command: &str,
+    shell: ClaudeShellKind,
+    devmanager_executable: &Path,
+    endpoint: &str,
+    temp_root: &Path,
+    now: Instant,
+) -> ClaudeLaunchOverlay {
+    prepare_claude_launch_overlay_with_registration(
+        registry,
+        stable_session_key,
+        startup_command,
+        shell,
+        devmanager_executable,
+        endpoint,
+        temp_root,
+        now,
+        move |registry, stable_session_key, now| {
+            registry
+                .register_correlated_at(
+                    stable_session_key,
+                    binding,
+                    expected_provider_session_id,
+                    None,
+                    now,
+                )
+                .map(|registration| registration.hook_registration())
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_claude_launch_overlay_with_registration<F>(
+    registry: &ClaudeHookRegistry,
+    stable_session_key: StableSessionKey,
+    startup_command: &str,
+    shell: ClaudeShellKind,
+    devmanager_executable: &Path,
+    endpoint: &str,
+    temp_root: &Path,
+    now: Instant,
+    register: F,
+) -> ClaudeLaunchOverlay
+where
+    F: FnOnce(
+        &ClaudeHookRegistry,
+        StableSessionKey,
+        Instant,
+    ) -> Result<ClaudeHookRegistration, String>,
+{
     if !is_valid_loopback_relay_url(endpoint) {
         return ClaudeLaunchOverlay::degraded(
             startup_command,
@@ -3315,7 +3509,7 @@ pub fn prepare_claude_launch_overlay(
         );
     }
 
-    let registration = match registry.register_at(stable_session_key, now) {
+    let registration = match register(registry, stable_session_key, now) {
         Ok(registration) => registration,
         Err(error) => return ClaudeLaunchOverlay::degraded(startup_command, endpoint, error),
     };
@@ -3454,14 +3648,20 @@ fn merge_relay_hooks(
             .get_mut(*event)
             .and_then(Value::as_array_mut)
             .ok_or_else(|| format!("Claude settings hook {event} must be an array"))?;
-        event_hooks.push(serde_json::json!({
+        let mut relay = serde_json::json!({
             "hooks": [{
                 "type": "command",
                 "command": devmanager_executable.display().to_string(),
-                "args": ["claude-hook-relay", "--url", endpoint, "--nonce", nonce],
-                "async": true
+                "args": ["claude-hook-relay", "--url", endpoint, "--nonce", nonce]
             }]
-        }));
+        });
+        // PreToolUse must reach the host before Claude paints and blocks on an
+        // interactive AskUserQuestion prompt. Other observational hooks remain
+        // asynchronous so ordinary tool and output progress never stalls.
+        if *event != "PreToolUse" {
+            relay["hooks"][0]["async"] = Value::Bool(true);
+        }
+        event_hooks.push(relay);
     }
     Ok(())
 }
@@ -4248,5 +4448,109 @@ mod registry_race_tests {
                 Instant::now(),
             )
             .unwrap()
+    }
+}
+
+#[cfg(test)]
+mod ai_acceptance_tests {
+    use super::*;
+
+    #[test]
+    fn ai_acceptance_provider_task_notification_is_subagent_status_not_user_message() {
+        let mut reducer = ClaudeReducer::new(
+            StableSessionKey::from_tab("subagent-tab"),
+            ClaudeReducerLimits::default(),
+        );
+        let body = br#"{
+            "hook_event_name":"UserPromptSubmit",
+            "prompt":"<task-notification><summary>Agent \"Inspect AGENTS.md\" finished</summary><result># DevManager Agent Guidance</result></task-notification>"
+        }"#;
+
+        let outcome = reducer.apply_json(body, 42);
+        assert!(matches!(
+            outcome.drafts.as_slice(),
+            [SemanticEventDraft {
+                kind: SemanticEventKind::Status { state, detail: Some(detail) },
+                ..
+            }] if state == "subagentCompleted"
+                && detail.contains("Inspect AGENTS.md")
+                && detail.contains("DevManager Agent Guidance")
+        ));
+    }
+
+    #[test]
+    fn ai_acceptance_elicitation_preserves_provider_question_choices() {
+        let mut reducer = ClaudeReducer::new(
+            StableSessionKey::from_tab("question-tab"),
+            ClaudeReducerLimits::default(),
+        );
+        let body = br#"{
+            "hook_event_name":"Elicitation",
+            "elicitation_id":"question-1",
+            "message":"Choose the acceptance color",
+            "options":[{"label":"Green"},{"label":"Blue"}]
+        }"#;
+
+        let outcome = reducer.apply_json(body, 43);
+        assert!(matches!(
+            outcome.drafts.as_slice(),
+            [SemanticEventDraft {
+                kind: SemanticEventKind::Question { prompt, choices, .. },
+                ..
+            }] if prompt == "Choose the acceptance color"
+                && choices == &["Green".to_string(), "Blue".to_string()]
+        ));
+    }
+
+    #[test]
+    fn ai_acceptance_ask_user_question_preserves_prompt_and_choices() {
+        let mut reducer = ClaudeReducer::new(
+            StableSessionKey::from_tab("question-tab"),
+            ClaudeReducerLimits::default(),
+        );
+        let body = br#"{
+            "hook_event_name":"PreToolUse",
+            "session_id":"claude-session",
+            "tool_name":"AskUserQuestion",
+            "tool_use_id":"toolu-question-1",
+            "tool_input":{"questions":[{
+                "question":"Pick a color",
+                "header":"Color",
+                "options":[{"label":"Blue"},{"label":"Green"}],
+                "multiSelect":false
+            }]}
+        }"#;
+
+        let outcome = reducer.apply_json(body, 44);
+        assert!(matches!(
+            outcome.drafts.as_slice(),
+            [SemanticEventDraft {
+                kind: SemanticEventKind::Question { question_id, prompt, choices },
+                ..
+            }] if question_id == "toolu-question-1"
+                && prompt == "Pick a color"
+                && choices == &["Blue".to_string(), "Green".to_string()]
+        ));
+    }
+
+    #[test]
+    fn ai_acceptance_pre_tool_use_relay_is_synchronous() {
+        let mut settings = serde_json::json!({});
+        merge_relay_hooks(
+            &mut settings,
+            std::path::Path::new("devmanager-host"),
+            "http://127.0.0.1:1234/claude-hook",
+            "aabbccdd",
+        )
+        .expect("merge hooks");
+
+        assert_eq!(
+            settings["hooks"]["PreToolUse"][0]["hooks"][0].get("async"),
+            None
+        );
+        assert_eq!(
+            settings["hooks"]["PostToolUse"][0]["hooks"][0]["async"],
+            Value::Bool(true)
+        );
     }
 }

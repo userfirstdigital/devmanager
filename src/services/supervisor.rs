@@ -445,8 +445,14 @@ impl<A: ManagedLaunchAuthority> ServiceSupervisor<A> {
             };
             let generation = runtime.evidence.generation;
             if let Some(tracker) = runtime.health.as_mut() {
-                let _ = tracker.advance(self.now_ms, generation);
-                runtime.evidence.health = tracker.axis();
+                // A tracker exists for every configured health check, but it
+                // has no generation until that service is started. Advancing
+                // another service's clock must not replace a stopped
+                // service's Disabled evidence with the tracker's initial
+                // Unknown axis.
+                if tracker.advance(self.now_ms, generation).is_ok() {
+                    runtime.evidence.health = tracker.axis();
+                }
             }
             self.project_runtime(&id);
         }
@@ -942,7 +948,9 @@ impl<A: ManagedLaunchAuthority> ServiceSupervisor<A> {
             match self.start_member(item.service_id(), item.fence(), item.intent().unwrap()) {
                 Ok(()) => started.push(item.service_id().clone()),
                 Err(error) => {
-                    self.fail_member(item.service_id(), item.fence().resource_generation().get());
+                    let generation = item.fence().resource_generation().get().saturating_add(1);
+                    let epoch = item.fence().action_epoch().get().saturating_add(1);
+                    self.fail_member(item.service_id(), generation, epoch);
                     return Err(error);
                 }
             }
@@ -1045,10 +1053,7 @@ impl<A: ManagedLaunchAuthority> ServiceSupervisor<A> {
         let spec = self.launch_spec(service_id, generation, intent)?;
         let pending = match self.authority.prepare_suspended(&spec) {
             Ok(pending) => pending,
-            Err(error) => {
-                self.fail_member(service_id, generation);
-                return Err(error);
-            }
+            Err(error) => return Err(error),
         };
         let runtime = self
             .runtimes
@@ -1061,17 +1066,11 @@ impl<A: ManagedLaunchAuthority> ServiceSupervisor<A> {
             .expect("pending launch was just stored");
         let registered = match self.authority.register_suspended(pending) {
             Ok(registered) => registered,
-            Err(error) => {
-                self.fail_member(service_id, generation);
-                return Err(error);
-            }
+            Err(error) => return Err(error),
         };
         let live = match self.authority.resume(registered) {
             Ok(live) => live,
-            Err(error) => {
-                self.fail_member(service_id, generation);
-                return Err(error);
-            }
+            Err(error) => return Err(error),
         };
 
         if let Some(port) = intent.expected_port().map(|port| port.port) {
@@ -1239,7 +1238,7 @@ impl<A: ManagedLaunchAuthority> ServiceSupervisor<A> {
         Ok(())
     }
 
-    fn fail_member(&mut self, service_id: &ServiceId, generation: u64) {
+    fn fail_member(&mut self, service_id: &ServiceId, generation: u64, epoch: u64) {
         let resource_id = self
             .runtimes
             .get(service_id)
@@ -1261,10 +1260,19 @@ impl<A: ManagedLaunchAuthority> ServiceSupervisor<A> {
         if let Some(runtime) = self.runtimes.get_mut(service_id) {
             runtime.pending = None;
             runtime.evidence.generation = generation;
+            runtime.evidence.epoch = epoch;
             runtime.evidence.lifecycle = LifecycleAxis::Failed;
             runtime.evidence.process = ProcessAxis::Crashed { generation };
             runtime.evidence.health = HealthAxis::Crashed;
+            runtime.evidence.port = PortAxis::Free;
+            runtime.evidence.ownership = OwnershipAxis::None;
             runtime.evidence.observed_at_ms = self.now_ms;
+            runtime.evidence.provenance = EvidenceProvenance {
+                source: EvidenceSource::ProcessRegistry,
+                observed_at_ms: self.now_ms,
+                generation: Some(generation),
+                epoch: Some(epoch),
+            };
             runtime.operation = None;
         }
         self.release_port_for(service_id, generation);

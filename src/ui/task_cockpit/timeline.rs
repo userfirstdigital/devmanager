@@ -7,6 +7,7 @@ use gpui::{
     div, px, AnyElement, InteractiveElement, IntoElement, ParentElement,
     StatefulInteractiveElement, Styled,
 };
+use std::collections::BTreeSet;
 
 use crate::client::model::ClientModel;
 use crate::domain::id::{OperationId, TaskId};
@@ -18,6 +19,116 @@ use crate::ui::renderers::{
 
 pub const DEFAULT_OVERSCAN: usize = 4;
 pub const MAX_PAINTED_ITEMS: usize = 48;
+/// Shared readable measure for the conversation column and floating composer.
+pub const CONVERSATION_CONTENT_MAX_WIDTH: f32 = 860.0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConversationItemVisibility {
+    Message,
+    Reasoning,
+    Activity,
+    Callout,
+    HiddenChrome,
+}
+
+pub(crate) fn conversation_item_visibility(item: &TimelineItemModel) -> ConversationItemVisibility {
+    use crate::ui::renderers::TimelineItemContent;
+    match &item.content {
+        TimelineItemContent::Message(view) => {
+            let role = view.role.to_ascii_lowercase();
+            if role.starts_with("error") {
+                ConversationItemVisibility::Callout
+            } else if role.contains("reason") {
+                ConversationItemVisibility::Reasoning
+            } else {
+                ConversationItemVisibility::Message
+            }
+        }
+        TimelineItemContent::Tool(_) | TimelineItemContent::Plan(_) => {
+            ConversationItemVisibility::Activity
+        }
+        TimelineItemContent::Question(_) | TimelineItemContent::Approval(_) => {
+            ConversationItemVisibility::Callout
+        }
+        TimelineItemContent::Operation(view) if view.needs_me => {
+            ConversationItemVisibility::Callout
+        }
+        TimelineItemContent::Operation(_)
+        | TimelineItemContent::Artifact(_)
+        | TimelineItemContent::Agent(_) => ConversationItemVisibility::Activity,
+        TimelineItemContent::Generic(card) => {
+            if is_hidden_conversation_chrome(&card.source_type, card.title.as_str()) {
+                ConversationItemVisibility::HiddenChrome
+            } else {
+                ConversationItemVisibility::Activity
+            }
+        }
+    }
+}
+
+fn is_hidden_conversation_chrome(source_type: &str, title: &str) -> bool {
+    let haystacks = [source_type, title];
+    haystacks.iter().any(|value| {
+        let lower = value.to_ascii_lowercase();
+        lower.contains("session_state")
+            || lower.contains("session_stale")
+            || lower.contains("turn_state")
+            || lower.contains("usage")
+            || lower.contains("unknown")
+            || lower.contains("malformed")
+            || lower.contains("diagnostic")
+    })
+}
+
+pub(crate) fn conversation_activity_summary(
+    items: &[TimelineItemModel],
+    status: &str,
+) -> Option<String> {
+    use crate::ui::renderers::TimelineItemContent;
+
+    let mut activity = ActivityCounts::default();
+    for item in items {
+        match &item.content {
+            TimelineItemContent::Tool(view) => {
+                activity.observe_tool(&view.tool_id, &view.name, &view.state);
+            }
+            TimelineItemContent::Plan(view) => activity.observe_plan(&view.status),
+            _ => {}
+        }
+    }
+
+    let mut parts = Vec::new();
+    if !activity.running_commands.is_empty() {
+        if !activity.running_shells.is_empty() {
+            parts.push(format!(
+                "Running {} shell command(s)",
+                activity.running_shells.len()
+            ));
+        }
+        let other_tools = activity
+            .running_commands
+            .len()
+            .saturating_sub(activity.running_shells.len());
+        if other_tools > 0 {
+            parts.push(format!("{other_tools} other tool(s) running"));
+        }
+    }
+    if activity.active_subagents > 0 {
+        parts.push(format!("{} subagent(s) active", activity.active_subagents));
+    }
+    if activity.open_task_steps > 0 {
+        parts.push(format!(
+            "Goal active · {} task step(s) open",
+            activity.open_task_steps
+        ));
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    let mut summary = vec![status.to_string()];
+    summary.append(&mut parts);
+    Some(summary.join(" · "))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TimelineViewport {
@@ -97,36 +208,46 @@ impl Timeline {
             JournalAvailability::Unavailable(_) => {
                 "Semantic timeline awaiting authenticated journal"
             }
+            JournalAvailability::LiveProjection => "Conversation",
             #[cfg(any(test, feature = "semantic-conformance"))]
             JournalAvailability::ConformanceFixture => "Semantic timeline",
         };
+        let activity = conversation_activity_summary(&self.items, status);
         let rows = self
             .painted_items()
             .iter()
-            .map(|item| {
-                div()
-                    .w_full()
-                    .p(px(tokens.density.physical().row_padding as f32))
-                    .border_b_1()
-                    .border_color(tokens.borders.subtle.to_gpui())
-                    .child(item.accessibility.name().to_string())
-                    .into_any_element()
+            .filter(|item| {
+                conversation_item_visibility(item) != ConversationItemVisibility::HiddenChrome
             })
+            .map(|item| conversation_item_element(item, tokens))
             .collect::<Vec<_>>();
         div()
             .id("native-semantic-timeline")
             .w_full()
-            .max_h(px(280.0))
+            .h_full()
             .overflow_y_scroll()
-            .bg(tokens.surfaces.raised.to_gpui())
+            .bg(tokens.surfaces.canvas.to_gpui())
             .child(
                 div()
+                    .id("native-conversation-column")
                     .w_full()
-                    .p(px(tokens.density.physical().control_padding as f32))
-                    .text_color(tokens.text.secondary.to_gpui())
-                    .child(format!("{status} · {} item(s)", self.items.len())),
+                    .mx_auto()
+                    .max_w(px(CONVERSATION_CONTENT_MAX_WIDTH))
+                    .px(px(tokens.density.spacing.md))
+                    .py(px(tokens.density.spacing.lg))
+                    .flex()
+                    .flex_col()
+                    .gap(px(tokens.density.spacing.md))
+                    .children(activity.map(|summary| {
+                        div()
+                            .w_full()
+                            .text_size(px(tokens.density.typography.caption))
+                            .text_color(tokens.text.secondary.to_gpui())
+                            .child(summary)
+                            .into_any_element()
+                    }))
+                    .children(rows),
             )
-            .children(rows)
             .into_any_element()
     }
 
@@ -222,6 +343,25 @@ impl Timeline {
         !self.at_bottom()
     }
 
+    /// Keep the virtual window aligned with the actual conversation canvas.
+    /// The old inspector used a fixed 280px viewport; a full-height chat must
+    /// paint enough rows for the space the window really gives it.
+    pub fn set_viewport_height(&mut self, height: u32) {
+        let height = height.max(1);
+        if self.viewport.height == height {
+            return;
+        }
+        let was_following = self.following;
+        self.viewport.height = height;
+        self.clamp_scroll();
+        if was_following {
+            self.jump_to_latest();
+        } else {
+            self.refresh_window();
+            self.capture_anchor();
+        }
+    }
+
     pub fn jump_to_latest(&mut self) {
         self.viewport.scroll_offset = self.content_height.saturating_sub(self.viewport.height);
         self.following = true;
@@ -235,7 +375,13 @@ impl Timeline {
         self.prefix.reserve(self.items.len());
         for item in &self.items {
             self.prefix.push(total);
-            total = total.saturating_add(item.estimated_height());
+            let height =
+                if conversation_item_visibility(item) == ConversationItemVisibility::HiddenChrome {
+                    0
+                } else {
+                    item.estimated_height()
+                };
+            total = total.saturating_add(height);
         }
         self.content_height = total;
         self.clamp_scroll();
@@ -301,6 +447,49 @@ impl Timeline {
     }
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ActivityCounts {
+    running_commands: BTreeSet<String>,
+    running_shells: BTreeSet<String>,
+    active_subagents: usize,
+    open_task_steps: usize,
+}
+
+impl ActivityCounts {
+    fn observe_tool(&mut self, tool_id: &str, name: &str, state: &str) {
+        match state {
+            "pending" | "running" => {
+                self.running_commands.insert(tool_id.to_string());
+                let name = name.to_ascii_lowercase();
+                if ["shell", "bash", "powershell", "terminal", "command"]
+                    .iter()
+                    .any(|needle| name.contains(needle))
+                {
+                    self.running_shells.insert(tool_id.to_string());
+                }
+            }
+            "completed" | "failed" => {
+                self.running_commands.remove(tool_id);
+                self.running_shells.remove(tool_id);
+            }
+            _ => {}
+        }
+    }
+
+    fn observe_plan(&mut self, status: &str) {
+        match status {
+            "subagentStarted" => self.active_subagents += 1,
+            // Claude emits a correlated SubagentStop hook for every completed
+            // subagent. The later task notification is presentation-only and
+            // must not decrement a second time.
+            "subagentStopped" => self.active_subagents = self.active_subagents.saturating_sub(1),
+            "taskCreated" => self.open_task_steps += 1,
+            "taskCompleted" => self.open_task_steps = self.open_task_steps.saturating_sub(1),
+            _ => {}
+        }
+    }
+}
+
 fn assert_task_projection(
     model: &ClientModel,
     task_id: TaskId,
@@ -311,7 +500,472 @@ fn assert_task_projection(
     }
     match journal.availability() {
         JournalAvailability::Unavailable(_) => live_target(model, task_id).map(|_| ()),
+        JournalAvailability::LiveProjection => live_target(model, task_id).map(|_| ()),
         #[cfg(any(test, feature = "semantic-conformance"))]
         JournalAvailability::ConformanceFixture => Ok(()),
+    }
+}
+
+fn conversation_item_element(
+    item: &TimelineItemModel,
+    tokens: crate::ui::tokens::ThemeTokens,
+) -> AnyElement {
+    use crate::ui::renderers::TimelineItemContent;
+    match conversation_item_visibility(item) {
+        ConversationItemVisibility::HiddenChrome => div().into_any_element(),
+        ConversationItemVisibility::Message => match &item.content {
+            TimelineItemContent::Message(view) if is_user_role(&view.role) => {
+                user_message_element(view.markdown.plain_text(), tokens)
+            }
+            TimelineItemContent::Message(view) => {
+                assistant_message_element(&view.role, view.markdown.plain_text(), tokens)
+            }
+            _ => fallback_conversation_element(item, tokens),
+        },
+        ConversationItemVisibility::Reasoning => match &item.content {
+            TimelineItemContent::Message(view) => {
+                reasoning_element(view.markdown.plain_text(), tokens)
+            }
+            _ => fallback_conversation_element(item, tokens),
+        },
+        ConversationItemVisibility::Activity => match &item.content {
+            TimelineItemContent::Tool(view) => tool_activity_element(view, tokens),
+            TimelineItemContent::Plan(view) => {
+                activity_card_element(&view.title, &view.status, &view.steps.join("\n"), tokens)
+            }
+            _ => activity_card_element(
+                item.accessibility.name(),
+                "",
+                &timeline_item_text(item),
+                tokens,
+            ),
+        },
+        ConversationItemVisibility::Callout => match &item.content {
+            TimelineItemContent::Question(view) => {
+                callout_element("Question", &view.prompt, tokens, true)
+            }
+            TimelineItemContent::Approval(view) => {
+                callout_element("Approval", &view.summary, tokens, true)
+            }
+            TimelineItemContent::Message(view)
+                if view.role.to_ascii_lowercase().starts_with("error") =>
+            {
+                callout_element(&view.role, &view.markdown.plain_text(), tokens, false)
+            }
+            _ => callout_element(
+                item.accessibility.name(),
+                &timeline_item_text(item),
+                tokens,
+                true,
+            ),
+        },
+    }
+}
+
+fn is_user_role(role: &str) -> bool {
+    let role = role.to_ascii_lowercase();
+    role == "you" || role == "user" || role.starts_with("user")
+}
+
+fn user_message_element(text: String, tokens: crate::ui::tokens::ThemeTokens) -> AnyElement {
+    div()
+        .w_full()
+        .flex()
+        .justify_end()
+        .child(
+            div()
+                .max_w(px(CONVERSATION_CONTENT_MAX_WIDTH * 0.82))
+                .px(px(tokens.density.spacing.md))
+                .py(px(tokens.density.spacing.sm))
+                .rounded(px(tokens.density.radii.lg))
+                .bg(tokens.surfaces.selection.to_gpui())
+                .text_color(tokens.text.on_selection.to_gpui())
+                .child(text),
+        )
+        .into_any_element()
+}
+
+fn assistant_message_element(
+    role: &str,
+    text: String,
+    tokens: crate::ui::tokens::ThemeTokens,
+) -> AnyElement {
+    div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap(px(tokens.density.spacing.xs))
+        .child(
+            div()
+                .text_size(px(tokens.density.typography.caption))
+                .text_color(tokens.text.muted.to_gpui())
+                .child(role.to_string()),
+        )
+        .child(
+            div()
+                .w_full()
+                .text_color(tokens.text.primary.to_gpui())
+                .child(text),
+        )
+        .into_any_element()
+}
+
+fn reasoning_element(text: String, tokens: crate::ui::tokens::ThemeTokens) -> AnyElement {
+    div()
+        .w_full()
+        .px(px(tokens.density.spacing.md))
+        .py(px(tokens.density.spacing.sm))
+        .rounded(px(tokens.density.radii.md))
+        .bg(tokens.surfaces.sunken.to_gpui())
+        .text_size(px(tokens.density.typography.caption))
+        .text_color(tokens.text.secondary.to_gpui())
+        .child(text)
+        .into_any_element()
+}
+
+fn tool_activity_element(
+    view: &crate::ui::renderers::ToolView,
+    tokens: crate::ui::tokens::ThemeTokens,
+) -> AnyElement {
+    let running = matches!(view.state.as_str(), "pending" | "running");
+    let failed = view.state.eq_ignore_ascii_case("failed")
+        || view.summary.to_ascii_lowercase().contains("fail");
+    if running || failed {
+        let detail = if view.summary.trim().is_empty() {
+            view.state.clone()
+        } else {
+            view.summary.clone()
+        };
+        activity_card_element(&view.name, &view.state, &detail, tokens)
+    } else {
+        let line = if view.summary.trim().is_empty() {
+            format!("{} · {}", view.name, view.state)
+        } else {
+            format!("{} · {}", view.name, view.summary)
+        };
+        div()
+            .w_full()
+            .text_size(px(tokens.density.typography.caption))
+            .text_color(tokens.text.muted.to_gpui())
+            .child(line)
+            .into_any_element()
+    }
+}
+
+fn activity_card_element(
+    title: &str,
+    status: &str,
+    detail: &str,
+    tokens: crate::ui::tokens::ThemeTokens,
+) -> AnyElement {
+    let heading = if status.trim().is_empty() {
+        title.to_string()
+    } else {
+        format!("{title} · {status}")
+    };
+    div()
+        .w_full()
+        .px(px(tokens.density.spacing.md))
+        .py(px(tokens.density.spacing.sm))
+        .rounded(px(tokens.density.radii.md))
+        .border(px(1.0))
+        .border_color(tokens.borders.subtle.to_gpui())
+        .bg(tokens.surfaces.raised.to_gpui())
+        .flex()
+        .flex_col()
+        .gap(px(tokens.density.spacing.xxs))
+        .child(
+            div()
+                .text_size(px(tokens.density.typography.caption))
+                .text_color(tokens.text.secondary.to_gpui())
+                .child(heading),
+        )
+        .children((!detail.trim().is_empty()).then(|| {
+            div()
+                .text_color(tokens.text.primary.to_gpui())
+                .child(detail.to_string())
+                .into_any_element()
+        }))
+        .into_any_element()
+}
+
+fn callout_element(
+    title: &str,
+    body: &str,
+    tokens: crate::ui::tokens::ThemeTokens,
+    prominent: bool,
+) -> AnyElement {
+    let border = if title.to_ascii_lowercase().starts_with("error") || !prominent {
+        tokens.status.destructive
+    } else {
+        tokens.borders.focus
+    };
+    div()
+        .w_full()
+        .px(px(tokens.density.spacing.md))
+        .py(px(tokens.density.spacing.md))
+        .rounded(px(tokens.density.radii.md))
+        .border(px(if prominent { 2.0 } else { 1.0 }))
+        .border_color(border.to_gpui())
+        .bg(tokens.surfaces.raised.to_gpui())
+        .flex()
+        .flex_col()
+        .gap(px(tokens.density.spacing.xs))
+        .child(
+            div()
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(if title.to_ascii_lowercase().starts_with("error") {
+                    tokens.status.destructive.to_gpui()
+                } else {
+                    tokens.text.primary.to_gpui()
+                })
+                .child(title.to_string()),
+        )
+        .child(
+            div()
+                .text_color(tokens.text.primary.to_gpui())
+                .child(body.to_string()),
+        )
+        .into_any_element()
+}
+
+fn fallback_conversation_element(
+    item: &TimelineItemModel,
+    tokens: crate::ui::tokens::ThemeTokens,
+) -> AnyElement {
+    div()
+        .w_full()
+        .text_color(tokens.text.secondary.to_gpui())
+        .child(timeline_item_text(item))
+        .into_any_element()
+}
+
+fn timeline_item_text(item: &TimelineItemModel) -> String {
+    use crate::ui::renderers::TimelineItemContent;
+    match &item.content {
+        TimelineItemContent::Message(view) => {
+            format!("{}\n{}", view.role, view.markdown.plain_text())
+        }
+        TimelineItemContent::Tool(view) if view.summary.trim().is_empty() => {
+            format!("{} · {}", view.name, view.state)
+        }
+        TimelineItemContent::Tool(view) => {
+            format!("{} · {}\n{}", view.name, view.state, view.summary)
+        }
+        TimelineItemContent::Question(view) => format!("Question\n{}", view.prompt),
+        TimelineItemContent::Approval(view) => format!("Approval\n{}", view.summary),
+        TimelineItemContent::Plan(view) => {
+            format!(
+                "{} · {}\n{}",
+                view.title,
+                view.status,
+                view.steps.join("\n")
+            )
+        }
+        TimelineItemContent::Generic(view) => view.title.clone(),
+        _ => item.accessibility.name().to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        conversation_activity_summary, conversation_item_visibility, ActivityCounts,
+        ConversationItemVisibility, CONVERSATION_CONTENT_MAX_WIDTH,
+    };
+    use crate::domain::id::{EventId, TaskId};
+    use crate::ui::components::interaction::{AccessibilityMetadata, AccessibleRole};
+    use crate::ui::renderers::{
+        GenericSemanticCard, GenericStatus, InteractionEligibility, MarkdownBlock,
+        MarkdownDocument, MessageView, ProviderKind, RendererSelection, SemanticKind,
+        TimelineItemContent, TimelineItemId, TimelineItemModel, ToolView,
+    };
+
+    #[test]
+    fn ai_acceptance_activity_counts_track_open_lifecycles_only() {
+        let mut activity = ActivityCounts::default();
+
+        activity.observe_tool("shell-1", "Bash", "running");
+        activity.observe_tool("shell-2", "PowerShell", "running");
+        activity.observe_plan("subagentStarted");
+        activity.observe_plan("taskCreated");
+        assert_eq!(activity.running_commands.len(), 2);
+        assert_eq!(activity.running_shells.len(), 2);
+        assert_eq!(activity.active_subagents, 1);
+        assert_eq!(activity.open_task_steps, 1);
+
+        activity.observe_tool("shell-1", "Bash", "completed");
+        activity.observe_plan("subagentStopped");
+        activity.observe_plan("subagentCompleted");
+        activity.observe_plan("taskCompleted");
+        assert_eq!(activity.running_commands.len(), 1);
+        assert_eq!(activity.active_subagents, 0);
+        assert_eq!(activity.open_task_steps, 0);
+
+        activity.observe_tool("shell-2", "PowerShell", "failed");
+        activity.observe_plan("subagentStopped");
+        activity.observe_plan("taskCompleted");
+        assert_eq!(activity, ActivityCounts::default());
+    }
+
+    #[test]
+    fn conversation_hides_lifecycle_usage_and_unknown_diagnostic_chrome() {
+        for source_type in [
+            "session_state",
+            "session_stale",
+            "turn_state",
+            "usage_observation",
+            "unknown_diagnostic",
+        ] {
+            let item = generic_item(source_type, GenericStatus::Unknown);
+            assert_eq!(
+                conversation_item_visibility(&item),
+                ConversationItemVisibility::HiddenChrome,
+                "{source_type} must not paint as a transcript row"
+            );
+        }
+    }
+
+    #[test]
+    fn conversation_classifies_user_and_assistant_message_roles() {
+        let user = message_item("You", "ship the dock collapse");
+        let assistant = message_item("Assistant", "Done — dock starts collapsed.");
+        assert_eq!(
+            conversation_item_visibility(&user),
+            ConversationItemVisibility::Message
+        );
+        assert_eq!(
+            conversation_item_visibility(&assistant),
+            ConversationItemVisibility::Message
+        );
+        match (&user.content, &assistant.content) {
+            (
+                TimelineItemContent::Message(user_view),
+                TimelineItemContent::Message(assistant_view),
+            ) => {
+                assert_eq!(user_view.role, "You");
+                assert_eq!(user_view.markdown.plain_text(), "ship the dock collapse");
+                assert_eq!(assistant_view.role, "Assistant");
+                assert_eq!(
+                    assistant_view.markdown.plain_text(),
+                    "Done — dock starts collapsed."
+                );
+            }
+            _ => panic!("expected message content"),
+        }
+        assert_eq!(
+            conversation_item_visibility(&message_item("Reasoning", "checking fences")),
+            ConversationItemVisibility::Reasoning
+        );
+        assert_eq!(
+            conversation_item_visibility(&message_item("Error (provider)", "exact resume failed")),
+            ConversationItemVisibility::Callout
+        );
+    }
+
+    #[test]
+    fn idle_activity_summary_omits_raw_event_count_and_stays_quiet() {
+        let items = vec![
+            message_item("You", "hello"),
+            message_item("Assistant", "hi"),
+            generic_item("session_state", GenericStatus::Unknown),
+        ];
+        let summary = conversation_activity_summary(&items, "Conversation");
+        assert!(
+            summary.is_none(),
+            "idle transcripts must not surface a raw event count: {summary:?}"
+        );
+        assert_eq!(CONVERSATION_CONTENT_MAX_WIDTH, 860.0);
+    }
+
+    #[test]
+    fn useful_activity_summary_reports_running_tools_without_event_count() {
+        let items = vec![
+            message_item("You", "run tests"),
+            tool_item("shell-1", "Bash", "running", ""),
+            generic_item("turn_state", GenericStatus::Unknown),
+        ];
+        let summary = conversation_activity_summary(&items, "Conversation")
+            .expect("running tools are useful activity");
+        assert!(summary.contains("Running"));
+        assert!(summary.contains("shell"));
+        assert!(
+            !summary.contains("event(s)"),
+            "useful activity must still omit the raw event count: {summary}"
+        );
+    }
+
+    fn message_item(role: &str, text: &str) -> TimelineItemModel {
+        TimelineItemModel {
+            id: TimelineItemId::Event(EventId::new()),
+            task_id: TaskId::new(),
+            renderer_selection: RendererSelection::Specialized(SemanticKind::Message),
+            interaction: InteractionEligibility::None,
+            content: TimelineItemContent::Message(MessageView {
+                role: role.to_string(),
+                streaming: false,
+                markdown: MarkdownDocument {
+                    selectable: true,
+                    copyable: true,
+                    html_executed: false,
+                    prose_wraps: true,
+                    blocks: vec![MarkdownBlock::Paragraph {
+                        text: text.to_string(),
+                    }],
+                    pending_links: Vec::new(),
+                },
+            }),
+            activated_on_enter: false,
+            accessibility: AccessibilityMetadata::new(AccessibleRole::Region, role)
+                .expect("accessible name"),
+            turn_id: None,
+            related_event_id: None,
+        }
+    }
+
+    fn tool_item(tool_id: &str, name: &str, state: &str, summary: &str) -> TimelineItemModel {
+        TimelineItemModel {
+            id: TimelineItemId::Event(EventId::new()),
+            task_id: TaskId::new(),
+            renderer_selection: RendererSelection::Specialized(SemanticKind::Tool),
+            interaction: InteractionEligibility::None,
+            content: TimelineItemContent::Tool(ToolView {
+                tool_id: tool_id.to_string(),
+                name: name.to_string(),
+                state: state.to_string(),
+                summary: summary.to_string(),
+                provider_specific: false,
+            }),
+            activated_on_enter: false,
+            accessibility: AccessibilityMetadata::new(AccessibleRole::Status, name)
+                .expect("accessible name"),
+            turn_id: None,
+            related_event_id: None,
+        }
+    }
+
+    fn generic_item(source_type: &str, status: GenericStatus) -> TimelineItemModel {
+        let event_id = EventId::new();
+        TimelineItemModel {
+            id: TimelineItemId::Event(event_id),
+            task_id: TaskId::new(),
+            renderer_selection: RendererSelection::GenericFallback,
+            interaction: InteractionEligibility::None,
+            content: TimelineItemContent::Generic(GenericSemanticCard {
+                event_id,
+                provider: ProviderKind::parse("claude").expect("provider"),
+                source_type: source_type.to_string(),
+                schema_version: 1,
+                status,
+                title: source_type.to_string(),
+                redacted_fields: Vec::new(),
+                raw_terminal_available: false,
+            }),
+            activated_on_enter: false,
+            accessibility: AccessibilityMetadata::new(AccessibleRole::Status, source_type)
+                .expect("accessible name"),
+            turn_id: None,
+            related_event_id: None,
+        }
     }
 }

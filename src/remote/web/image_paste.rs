@@ -8,6 +8,9 @@ use crate::services::ProcessManager;
 use crate::state::SessionRuntimeState;
 
 pub(crate) const WEB_PASTE_IMAGE_MAX_BYTES: usize = 5 * 1024 * 1024;
+pub(crate) const NATIVE_COMPOSER_IMAGE_MAX_COUNT: usize = 8;
+const PASTE_IMAGE_MAX_DIMENSION: u32 = 4096;
+const PASTE_IMAGE_MAX_PIXELS: u64 = 16_000_000;
 pub(crate) const WEB_COMPOSER_AUTHORITY_CHANGED: &str =
     "The writer lease changed before the prompt reached the terminal.";
 const STAGING_DIR: [&str; 2] = [".devmanager", "pasted-images"];
@@ -241,9 +244,15 @@ pub(crate) fn stage_web_image_for_session(
     if !session.session_kind.is_ai() {
         return Err("Image paste is only supported in Claude and Codex terminals.".to_string());
     }
+    stage_image_for_workspace(&session.cwd, attachment)
+}
 
+pub(crate) fn stage_image_for_workspace(
+    workspace_root: &Path,
+    attachment: &RemoteImageAttachment,
+) -> Result<StagedImageAttachment, String> {
     let extension = validate_image_attachment(attachment)?;
-    let staging_dir = staging_dir_for_session(&session.cwd);
+    let staging_dir = staging_dir_for_session(workspace_root);
     let _ = cleanup_staged_images(&staging_dir);
     fs::create_dir_all(&staging_dir)
         .map_err(|error| format!("Failed to prepare pasted image staging: {error}"))?;
@@ -262,9 +271,17 @@ pub(crate) fn stage_web_image_for_session(
     }
 
     Ok(StagedImageAttachment {
-        prompt_reference: format!("@{}", prompt_path(&path, &session.cwd)),
+        prompt_reference: format!("@{}", prompt_path(&path, workspace_root)),
         path,
     })
+}
+
+pub(crate) fn remove_staged_image(staged: &StagedImageAttachment) -> Result<(), String> {
+    match fs::remove_file(&staged.path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("Failed to remove staged image: {error}")),
+    }
 }
 
 fn validate_image_attachment(attachment: &RemoteImageAttachment) -> Result<&'static str, String> {
@@ -274,11 +291,32 @@ fn validate_image_attachment(attachment: &RemoteImageAttachment) -> Result<&'sta
     if attachment.bytes.len() > WEB_PASTE_IMAGE_MAX_BYTES {
         return Err("Pasted image is too large. Max size is 5 MiB.".to_string());
     }
-    match attachment.mime_type.as_str() {
-        "image/png" => Ok("png"),
-        "image/jpeg" => Ok("jpg"),
-        _ => Err("Unsupported pasted image type. Try PNG or JPEG.".to_string()),
+    let (extension, expected_format) = match attachment.mime_type.as_str() {
+        "image/png" => ("png", image::ImageFormat::Png),
+        "image/jpeg" => ("jpg", image::ImageFormat::Jpeg),
+        _ => return Err("Unsupported pasted image type. Try PNG or JPEG.".to_string()),
+    };
+    let detected_format = image::guess_format(&attachment.bytes)
+        .map_err(|error| format!("Failed to decode pasted image: {error}"))?;
+    if detected_format != expected_format {
+        return Err("Pasted image content does not match its PNG or JPEG type.".to_string());
     }
+    let reader =
+        image::ImageReader::with_format(std::io::Cursor::new(&attachment.bytes), detected_format);
+    let (width, height) = reader
+        .into_dimensions()
+        .map_err(|error| format!("Failed to decode pasted image: {error}"))?;
+    if width == 0
+        || height == 0
+        || width > PASTE_IMAGE_MAX_DIMENSION
+        || height > PASTE_IMAGE_MAX_DIMENSION
+        || (width as u64).saturating_mul(height as u64) > PASTE_IMAGE_MAX_PIXELS
+    {
+        return Err("Pasted image dimensions are too large.".to_string());
+    }
+    image::load_from_memory_with_format(&attachment.bytes, detected_format)
+        .map_err(|error| format!("Failed to decode pasted image: {error}"))?;
+    Ok(extension)
 }
 
 fn staging_dir_for_session(cwd: &Path) -> PathBuf {
@@ -366,7 +404,7 @@ mod tests {
         let attachment = RemoteImageAttachment {
             mime_type: "image/png".to_string(),
             file_name: Some("Screen Shot.png".to_string()),
-            bytes: vec![1, 2, 3],
+            bytes: tiny_png_bytes(),
         };
 
         let staged = stage_web_image_for_session(&session, &attachment).expect("stage image");
@@ -374,7 +412,10 @@ mod tests {
         assert!(staged
             .path
             .starts_with(cwd.join(".devmanager").join("pasted-images")));
-        assert_eq!(fs::read(&staged.path).expect("saved bytes"), vec![1, 2, 3]);
+        assert_eq!(
+            fs::read(&staged.path).expect("saved bytes"),
+            tiny_png_bytes()
+        );
         assert!(staged
             .prompt_reference
             .starts_with("@.devmanager/pasted-images/"));
@@ -394,7 +435,7 @@ mod tests {
         let attachment = RemoteImageAttachment {
             mime_type: "image/png".to_string(),
             file_name: Some("clip.png".to_string()),
-            bytes: vec![1, 2, 3],
+            bytes: tiny_png_bytes(),
         };
 
         let error = stage_web_image_for_session(&session, &attachment).unwrap_err();
@@ -418,7 +459,7 @@ mod tests {
         let attachment = RemoteImageAttachment {
             mime_type: "image/png".to_string(),
             file_name: Some("transaction.png".to_string()),
-            bytes: vec![1, 2, 3],
+            bytes: tiny_png_bytes(),
         };
         let broker = BrowserAttachmentBroker::default();
         let workspace_key = BrowserWorkspaceKey::new("project", "conversation").unwrap();
@@ -503,12 +544,12 @@ mod tests {
             RemoteImageAttachment {
                 mime_type: "image/png".to_string(),
                 file_name: Some("first.png".to_string()),
-                bytes: vec![1, 2, 3],
+                bytes: tiny_png_bytes(),
             },
             RemoteImageAttachment {
                 mime_type: "image/gif".to_string(),
                 file_name: Some("second.gif".to_string()),
-                bytes: vec![4, 5, 6],
+                bytes: tiny_png_bytes(),
             },
         ];
         let writes = std::sync::atomic::AtomicUsize::new(0);
@@ -547,12 +588,12 @@ mod tests {
             RemoteImageAttachment {
                 mime_type: "image/png".to_string(),
                 file_name: Some("clipboard.png".to_string()),
-                bytes: vec![1, 2, 3],
+                bytes: tiny_png_bytes(),
             },
             RemoteImageAttachment {
                 mime_type: "image/png".to_string(),
                 file_name: Some("clipboard.png".to_string()),
-                bytes: vec![4, 5, 6],
+                bytes: tiny_png_bytes(),
             },
         ];
         let observed_writes = std::sync::Mutex::new(Vec::new());
@@ -582,11 +623,11 @@ mod tests {
         assert_ne!(references[0], references[1]);
         assert_eq!(
             fs::read(cwd.join(references[0].trim_start_matches('@'))).unwrap(),
-            vec![1, 2, 3]
+            tiny_png_bytes()
         );
         assert_eq!(
             fs::read(cwd.join(references[1].trim_start_matches('@'))).unwrap(),
-            vec![4, 5, 6]
+            tiny_png_bytes()
         );
     }
 
@@ -812,7 +853,7 @@ mod tests {
         let attachments = vec![RemoteImageAttachment {
             mime_type: "image/png".to_string(),
             file_name: Some("authority.png".to_string()),
-            bytes: vec![1, 2, 3],
+            bytes: tiny_png_bytes(),
         }];
         let writes = std::sync::atomic::AtomicUsize::new(0);
 
@@ -913,7 +954,7 @@ mod tests {
         let attachments = [RemoteImageAttachment {
             mime_type: "image/png".to_string(),
             file_name: Some("ordinary.png".to_string()),
-            bytes: vec![1, 2, 3],
+            bytes: tiny_png_bytes(),
         }];
         let broker = BrowserAttachmentBroker::default();
         let workspace_key = BrowserWorkspaceKey::new("project", "ordinary").unwrap();
@@ -975,6 +1016,88 @@ mod tests {
             .pending_annotation_ids
             .is_empty());
         assert!(kept_path.lock().unwrap().as_ref().unwrap().is_file());
+    }
+
+    #[test]
+    fn native_composer_image_stages_under_workspace_pasted_images() {
+        let cwd = temp_test_dir("native-composer-image-stage");
+        let png = tiny_png_bytes();
+        let attachment = RemoteImageAttachment {
+            mime_type: "image/png".to_string(),
+            file_name: Some("Paste Board.png".to_string()),
+            bytes: png.clone(),
+        };
+
+        let staged = stage_image_for_workspace(&cwd, &attachment).expect("stage native image");
+
+        assert!(staged
+            .path
+            .starts_with(cwd.join(".devmanager").join("pasted-images")));
+        assert_eq!(fs::read(&staged.path).expect("saved bytes"), png);
+        assert!(staged
+            .prompt_reference
+            .starts_with("@.devmanager/pasted-images/"));
+        assert!(staged.prompt_reference.ends_with(".png"));
+    }
+
+    #[test]
+    fn native_composer_image_rejects_oversize_and_invalid_decode() {
+        let cwd = temp_test_dir("native-composer-image-reject");
+        let oversize = RemoteImageAttachment {
+            mime_type: "image/png".to_string(),
+            file_name: Some("huge.png".to_string()),
+            bytes: vec![0; WEB_PASTE_IMAGE_MAX_BYTES + 1],
+        };
+        assert!(stage_image_for_workspace(&cwd, &oversize)
+            .unwrap_err()
+            .contains("too large"));
+
+        let invalid = RemoteImageAttachment {
+            mime_type: "image/png".to_string(),
+            file_name: Some("bad.png".to_string()),
+            bytes: b"not-a-png".to_vec(),
+        };
+        let invalid_error = stage_image_for_workspace(&cwd, &invalid)
+            .unwrap_err()
+            .to_ascii_lowercase();
+        assert!(
+            invalid_error.contains("decode") || invalid_error.contains("invalid"),
+            "unexpected decode failure: {invalid_error}"
+        );
+
+        let mismatched = RemoteImageAttachment {
+            mime_type: "image/jpeg".to_string(),
+            file_name: Some("not-really-jpeg.jpg".to_string()),
+            bytes: tiny_png_bytes(),
+        };
+        assert!(stage_image_for_workspace(&cwd, &mismatched)
+            .unwrap_err()
+            .contains("does not match"));
+    }
+
+    #[test]
+    fn native_composer_image_removal_deletes_unsent_staged_file() {
+        let cwd = temp_test_dir("native-composer-image-remove");
+        let attachment = RemoteImageAttachment {
+            mime_type: "image/png".to_string(),
+            file_name: Some("remove-me.png".to_string()),
+            bytes: tiny_png_bytes(),
+        };
+        let staged = stage_image_for_workspace(&cwd, &attachment).expect("stage");
+        assert!(staged.path.is_file());
+        remove_staged_image(&staged).expect("remove staged");
+        assert!(!staged.path.exists());
+    }
+
+    fn tiny_png_bytes() -> Vec<u8> {
+        // 1x1 transparent PNG
+        vec![
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
+            0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ]
     }
 
     fn temp_test_dir(label: &str) -> PathBuf {

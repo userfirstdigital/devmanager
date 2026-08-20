@@ -58,6 +58,15 @@
   Claude/Codex `SessionStart` hooks, preserve it while its tab remains open, and
   never infer it from cwd, timestamps, or transcript ordering. An exact-resume
   failure must remain visible and must not fall back to a fresh conversation.
+  A provider that explicitly reports session identity as unsupported may accept
+  first-turn input with no provider session ID only when the exact Task, Agent,
+  runtime generation, and action epoch still match. Never synthesize an ID; once
+  a correlated current-generation hook binds one, every later write must match it.
+  Before full verification, test the production client/host capability
+  intersection for conversation queries and deterministic `SessionStart`
+  mismatches both before and after live-process publication. A mismatch must
+  settle the exact lease, remove the correlated adapter and relay nonce, and
+  surface the task failure.
 
 ## Host transport ownership and wire truth
 
@@ -78,6 +87,32 @@
   a sequence-skipping terminal. Use persistent per-stream progress notification;
   do not add a channel allocation to every ordinary durable event.
 
+## Native live-shell discipline
+
+- Treat first-paint task preview and canonical conversation attachment as one
+  recovery contract. A transient snapshot or query failure may fail closed, but
+  it must retire and reconnect the exact client, retry canonical synchronization
+  off the UI thread, and keep every snapshot request within its bounded IPC
+  deadline. Never leave a preview-only inbox permanently disabling task
+  selection or the composer, and never weaken durable corruption validation to
+  recover. Every fresh native input gesture must also rearm the current focus
+  epoch before it mutates the composer.
+- Provider discovery and exact-session restore must never monopolize the host's
+  local request executor. Prepare the bounded local state synchronously, then
+  poll cancellation-owned restore futures alongside inbox and cockpit requests;
+  dropping the executor must cancel them. Prove task-list latency while restores
+  are still in flight, not only after every provider has connected.
+- Automatic cockpit refresh must be idempotent and query only the active dock
+  surface. Keep read-only file browsing on the least-authority path, use bounded
+  pagination, and validate a handle-relative snapshot at stable root boundaries
+  rather than once per child. A client deadline must cover every sequential
+  bounded host phase plus cleanup; cancellation of one panel query must not poison
+  the shared host transport or erase unrelated panel projections.
+- Watch-mode reload must stop only the exact isolated live app and sibling-host
+  paths, then verify both processes have exited before copying or launching new
+  binaries. A process stop request or unlocked executable alone is not proof that
+  the old profile endpoint has been released.
+
 ## Durable orchestration journals
 
 - Never use a current-state projection row as a resume cursor until it is
@@ -89,6 +124,19 @@
   validate the complete receipt, event sequence, planned effect, and operation
   fence lineage. Corrupt storage is an execution error, never a synthetic
   cleanup-failure outcome.
+
+## Native first-paint acceptance
+
+- Measure native startup as two separate intervals: process-to-window and
+  window-to-first-task-row. Open the stable workspace before host bootstrap;
+  a task-only preview may populate the inbox but must never install the
+  canonical `ClientModel` or enable mutations. Only the completed full
+  snapshot/replay handoff may do that.
+- On Windows, GPUI headless applications own process-global native state. Run
+  each independently named headless test in a fresh copy of its test harness,
+  or consolidate its scenarios into one `Application` lifetime. Tests that
+  render the idle conversation photo must install an in-memory image; do not
+  let a detached network task outlive the GPUI application during teardown.
 
 ## Lean phase execution
 

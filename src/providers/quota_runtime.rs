@@ -244,6 +244,10 @@ async fn refresh_loop(
 ) {
     let mut interval = tokio::time::interval(refresh_interval);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Tokio intervals fire immediately. Consuming that tick keeps the first
+    // PATH observe off the host's current-thread runtime until Hello can bind
+    // and accept; hashing native Claude on that thread starves the pipe.
+    interval.tick().await;
     loop {
         tokio::select! {
             changed = stop_rx.changed() => {

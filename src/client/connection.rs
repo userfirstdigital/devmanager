@@ -877,6 +877,15 @@ impl ClientConnection {
     }
 
     pub async fn query(&self, envelope: QueryEnvelope) -> Result<QueryReply, IpcError> {
+        self.query_with_timeout(envelope, request_completion_timeout())
+            .await
+    }
+
+    pub async fn query_with_timeout(
+        &self,
+        envelope: QueryEnvelope,
+        completion: Duration,
+    ) -> Result<QueryReply, IpcError> {
         let request_id = envelope.request_id;
         let (reply_tx, reply_rx) = oneshot::channel();
         let mut registration =
@@ -885,8 +894,7 @@ impl ClientConnection {
             self.fail_closed();
             return Err(error);
         }
-        if let Err(error) = registration
-            .arm_response_deadline(self.io_abort_handle()?, request_completion_timeout())
+        if let Err(error) = registration.arm_response_deadline(self.io_abort_handle()?, completion)
         {
             self.fail_closed();
             return Err(error);

@@ -11,7 +11,7 @@ use std::sync::OnceLock;
 use serde::{Deserialize, Serialize};
 
 use crate::browser::BrowserNativeHostCommand;
-use crate::domain::cockpit::{TaskCockpitQuery, MAX_COCKPIT_FILE_LIST, MAX_COCKPIT_READ_BYTES};
+use crate::domain::cockpit::{TaskCockpitQuery, MAX_COCKPIT_FILE_LIST};
 use crate::domain::command::{
     Command, CommandEnvelope, CreateTaskIntent, CreateTaskRequestIntent, ProviderStartMode,
     RenameTaskIntent, ServiceControlAction, ServiceControlIntent, StartProviderSessionIntent,
@@ -63,6 +63,8 @@ pub const ACTION_TASK_CREATE_V2: &str = "task.create.v2";
 pub const ACTION_CONFIG_CREATE_PROJECT: &str = "config.create_project";
 /// Stable id for renaming one Task through the host command boundary.
 pub const ACTION_TASK_RENAME: &str = "task.rename";
+/// Stable id for archiving one Task through the host close boundary.
+pub const ACTION_TASK_ARCHIVE: &str = "task.archive";
 /// Canonical composer Send Now. Settles through SubmitProviderInput.
 pub const ACTION_TASK_SEND_NOW: &str = "task.send_now";
 /// Canonical composer steer. Settles through SubmitProviderInput.
@@ -97,6 +99,9 @@ pub const ACTION_PROVIDER_RESOLVE_APPROVAL: &str =
     crate::providers::input::ACTION_PROVIDER_RESOLVE_APPROVAL;
 /// Stable id for stopping the current provider turn.
 pub const ACTION_PROVIDER_STOP_TURN: &str = crate::providers::input::ACTION_PROVIDER_STOP_TURN;
+/// Stable id for interactive input to the current provider terminal.
+pub const ACTION_PROVIDER_TERMINAL_INPUT: &str =
+    crate::providers::input::ACTION_PROVIDER_TERMINAL_INPUT;
 /// Stable id for starting a new AgentSession identity. Not Restart.
 pub const ACTION_PROVIDER_NEW_CONVERSATION: &str =
     crate::providers::input::ACTION_PROVIDER_NEW_CONVERSATION;
@@ -127,6 +132,8 @@ pub const ACTION_SERVICE_RESTART: &str = "service.restart";
 pub const ACTION_SERVICE_LOGS: &str = "service.logs";
 /// Typed Task Cockpit health query through the configured-service supervisor.
 pub const ACTION_SERVICE_HEALTH: &str = "service.health";
+/// Task-scoped semantic conversation projection.
+pub const ACTION_CONVERSATION_STATUS: &str = "conversation.status";
 /// Task-scoped workspace identity projection.
 pub const ACTION_WORKSPACE_STATUS: &str = "workspace.status";
 /// Task-scoped durable git identity/status projection.
@@ -280,6 +287,16 @@ const ACTIONS: &[ActionDescriptor] = &[
         argument_schema: ActionArgumentSchema::TaskRenameV1,
     },
     ActionDescriptor {
+        id: ACTION_TASK_ARCHIVE,
+        title: "Delete task",
+        description: "Archive one Task after releasing its task-owned resources.",
+        keywords: &["task", "delete", "archive", "close", "remove"],
+        scope: ActionScope::Task,
+        required_capability: None,
+        risk: ActionRisk::Mutating,
+        argument_schema: ActionArgumentSchema::TaskId,
+    },
+    ActionDescriptor {
         id: ACTION_PROVIDER_SEND_NOW,
         title: "Send now",
         description: "Send provider input on the exact Task, Agent, generation, and turn.",
@@ -334,6 +351,17 @@ const ACTIONS: &[ActionDescriptor] = &[
         title: "Stop turn",
         description: "Stop the exact current provider turn. This is not Restart.",
         keywords: &["provider", "stop", "turn", "interrupt"],
+        scope: ActionScope::Task,
+        required_capability: Some(Capability::ProviderInput),
+        risk: ActionRisk::Mutating,
+        argument_schema: ActionArgumentSchema::ProviderInputV1,
+    },
+    ActionDescriptor {
+        id: ACTION_PROVIDER_TERMINAL_INPUT,
+        title: "Provider terminal input",
+        description:
+            "Send one bounded key or paste sequence to the exact running provider terminal.",
+        keywords: &["provider", "terminal", "input", "interactive"],
         scope: ActionScope::Task,
         required_capability: Some(Capability::ProviderInput),
         risk: ActionRisk::Mutating,
@@ -419,6 +447,9 @@ pub enum ActionRequest {
     TaskCreate(TaskCreateArguments),
     TaskCreateV2(TaskCreateV2Arguments),
     TaskRename(TaskRenameArguments),
+    TaskArchive {
+        task_id: TaskId,
+    },
     ProviderInput(ProviderInputActionRequest),
     StartProviderSession(ProviderStartArguments),
     ServiceControl {
@@ -446,6 +477,7 @@ impl ActionRequest {
             Self::TaskCreate(_) => ACTION_TASK_CREATE,
             Self::TaskCreateV2(_) => ACTION_TASK_CREATE_V2,
             Self::TaskRename(_) => ACTION_TASK_RENAME,
+            Self::TaskArchive { .. } => ACTION_TASK_ARCHIVE,
             Self::ProviderInput(arguments) => arguments.action_id,
             Self::StartProviderSession(_) => ACTION_PROVIDER_START_SESSION,
             Self::ServiceControl { action, .. } => match action {
@@ -484,6 +516,9 @@ impl BrowserActionRequest {
 /// exposed to the UI.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderInputActionRequest {
+    /// The composer-owned durable command identity. The native action adapter
+    /// must preserve it so host acceptance settles the exact submitted draft.
+    pub command_id: CommandId,
     pub action_id: &'static str,
     pub arguments: ProviderInputArguments,
 }
@@ -522,6 +557,7 @@ pub const fn cockpit_query_action_id(query: &TaskCockpitQuery) -> &'static str {
         TaskCockpitQuery::ConfigSnapshot => ACTION_WORKSPACE_STATUS,
         TaskCockpitQuery::AgentConnection => ACTION_HOST_STATUS,
         TaskCockpitQuery::ConfigCreateProject { .. } => ACTION_CONFIG_CREATE_PROJECT,
+        TaskCockpitQuery::Conversation { .. } => ACTION_CONVERSATION_STATUS,
         TaskCockpitQuery::WorkspaceStatus => ACTION_WORKSPACE_STATUS,
         TaskCockpitQuery::GitStatus | TaskCockpitQuery::GitMutate { .. } => ACTION_GIT_STATUS,
         TaskCockpitQuery::FilesList { .. } => ACTION_FILES_LIST,
@@ -828,6 +864,16 @@ const TASK_COCKPIT_EXTENSION: &[ActionDescriptor] = &[
         scope: ActionScope::Task,
         required_capability: Some(Capability::ProviderInput),
         risk: ActionRisk::Mutating,
+        argument_schema: ActionArgumentSchema::TaskCockpitV1,
+    },
+    ActionDescriptor {
+        id: ACTION_CONVERSATION_STATUS,
+        title: "Conversation status",
+        description: "Read the selected Task's bounded semantic AI conversation.",
+        keywords: &["conversation", "messages", "timeline", "cockpit"],
+        scope: ActionScope::Task,
+        required_capability: Some(Capability::SemanticConversation),
+        risk: ActionRisk::ReadOnly,
         argument_schema: ActionArgumentSchema::TaskCockpitV1,
     },
     ActionDescriptor {
@@ -1308,6 +1354,25 @@ pub fn task_rename_command(
     })
 }
 
+/// Build the shared `task.archive` mutation after the caller captured the
+/// exact durable revision. The host releases leftover resources, then closes.
+pub fn task_archive_command(
+    command_id: CommandId,
+    client_id: ClientId,
+    issued_at_ms: i64,
+    expected_task_revision: u64,
+    task_id: TaskId,
+) -> CommandEnvelope {
+    CommandEnvelope {
+        command_id,
+        client_id,
+        task_id: Some(task_id),
+        issued_at_ms,
+        expected_task_revision: Some(expected_task_revision),
+        command: Command::BeginCloseTask,
+    }
+}
+
 /// Caller-owned provider input arguments validated before transport.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1371,6 +1436,9 @@ pub fn provider_input_command(
             }
         }
         ACTION_PROVIDER_STOP_TURN | ACTION_TASK_STOP_TURN => ProviderInputAction::StopTurn,
+        ACTION_PROVIDER_TERMINAL_INPUT => ProviderInputAction::TerminalInput {
+            text: args.text.ok_or(ProviderInputIntentError::EmptyText)?,
+        },
         _ => return Err(ProviderInputIntentError::InconsistentNestedIds),
     };
     let intent = SubmitProviderInputIntent::try_new(
@@ -1400,7 +1468,10 @@ pub fn provider_start_command(
     expected_task_revision: u64,
     args: ProviderStartArguments,
 ) -> Result<CommandEnvelope, ProviderInputIntentError> {
-    if expected_task_revision == 0 || args.action_epoch == 0 {
+    // Task action epochs are zero-based: a newly-created open task is
+    // legitimately fenced at epoch zero until a lifecycle transition advances
+    // it. Only the durable revision uses zero as an invalid sentinel.
+    if expected_task_revision == 0 {
         return Err(ProviderInputIntentError::InconsistentNestedIds);
     }
     Ok(CommandEnvelope {
@@ -1496,18 +1567,20 @@ pub fn service_control_command_with_task(
 #[cfg(test)]
 mod tests {
     use super::{
-        catalog, require_unique_ids, service_control_command, task_cockpit_query,
-        task_create_command, task_rename_command, task_show_query, ActionArgumentSchema,
-        ActionRisk, ActionScope, ServiceControlArguments, TaskCreateArguments,
-        TaskCreateV2Arguments, TaskRenameArguments, ACTION_BROWSER_NATIVE,
-        ACTION_CONFIG_CREATE_PROJECT, ACTION_FILES_LIST, ACTION_FILES_READ, ACTION_GIT_STATUS,
-        ACTION_HOST_ACTIONS, ACTION_HOST_STATUS, ACTION_PROMPT_CHAIN_PAGE, ACTION_PROMPT_DIFF,
+        catalog, provider_start_command, require_unique_ids, service_control_command,
+        task_cockpit_query, task_create_command, task_rename_command, task_show_query,
+        ActionArgumentSchema, ActionRisk, ActionScope, ProviderStartArguments,
+        ServiceControlArguments, TaskCreateArguments, TaskCreateV2Arguments, TaskRenameArguments,
+        ACTION_BROWSER_NATIVE, ACTION_CONFIG_CREATE_PROJECT, ACTION_CONVERSATION_STATUS,
+        ACTION_FILES_LIST, ACTION_FILES_READ, ACTION_GIT_STATUS, ACTION_HOST_ACTIONS,
+        ACTION_HOST_STATUS, ACTION_PROMPT_CHAIN_PAGE, ACTION_PROMPT_DIFF,
         ACTION_PROMPT_METADATA_PAGE, ACTION_PROMPT_VERSION_PAGE, ACTION_PROVIDER_ANSWER_QUESTION,
         ACTION_PROVIDER_NEW_CONVERSATION, ACTION_PROVIDER_QUEUE_FOLLOW_UP,
         ACTION_PROVIDER_RESOLVE_APPROVAL, ACTION_PROVIDER_SEND_NOW, ACTION_PROVIDER_START_SESSION,
-        ACTION_PROVIDER_STEER_CURRENT_TURN, ACTION_PROVIDER_STOP_TURN, ACTION_SERVICE_HEALTH,
-        ACTION_SERVICE_LOGS, ACTION_SERVICE_RESTART, ACTION_SERVICE_START, ACTION_SERVICE_STOP,
-        ACTION_SSH_ACTION, ACTION_SSH_STATUS, ACTION_TASK_ANSWER_QUESTION, ACTION_TASK_CREATE,
+        ACTION_PROVIDER_STEER_CURRENT_TURN, ACTION_PROVIDER_STOP_TURN,
+        ACTION_PROVIDER_TERMINAL_INPUT, ACTION_SERVICE_HEALTH, ACTION_SERVICE_LOGS,
+        ACTION_SERVICE_RESTART, ACTION_SERVICE_START, ACTION_SERVICE_STOP, ACTION_SSH_ACTION,
+        ACTION_SSH_STATUS, ACTION_TASK_ANSWER_QUESTION, ACTION_TASK_ARCHIVE, ACTION_TASK_CREATE,
         ACTION_TASK_CREATE_V2, ACTION_TASK_LIST, ACTION_TASK_QUEUE_FOLLOW_UP, ACTION_TASK_RENAME,
         ACTION_TASK_RESOLVE_APPROVAL, ACTION_TASK_SEND_NOW, ACTION_TASK_SHOW,
         ACTION_TASK_STEER_CURRENT_TURN, ACTION_TASK_STOP_TURN, ACTION_UPDATER_CHECK,
@@ -1522,9 +1595,11 @@ mod tests {
                 ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity,
                 WorkspaceRef,
             },
-            ClientId, CommandId, EnvironmentId, ProjectId, RequestId, TaskId,
+            AgentSessionId, ClientId, CommandId, EnvironmentId, ProjectId, RequestId, ResourceId,
+            TaskId,
         },
         protocol::Capability,
+        providers::ProviderKind,
         services::model::ServiceId,
     };
 
@@ -1539,12 +1614,14 @@ mod tests {
         assert!(ids.contains(&ACTION_TASK_CREATE_V2));
         assert!(ids.contains(&ACTION_CONFIG_CREATE_PROJECT));
         assert!(ids.contains(&ACTION_TASK_RENAME));
+        assert!(ids.contains(&ACTION_TASK_ARCHIVE));
         assert!(ids.contains(&ACTION_PROVIDER_SEND_NOW));
         assert!(ids.contains(&ACTION_PROVIDER_STEER_CURRENT_TURN));
         assert!(ids.contains(&ACTION_PROVIDER_QUEUE_FOLLOW_UP));
         assert!(ids.contains(&ACTION_PROVIDER_ANSWER_QUESTION));
         assert!(ids.contains(&ACTION_PROVIDER_RESOLVE_APPROVAL));
         assert!(ids.contains(&ACTION_PROVIDER_STOP_TURN));
+        assert!(ids.contains(&ACTION_PROVIDER_TERMINAL_INPUT));
         assert!(!ids.contains(&ACTION_PROVIDER_NEW_CONVERSATION));
         assert!(ids.contains(&ACTION_TASK_SEND_NOW));
         assert!(ids.contains(&ACTION_TASK_STEER_CURRENT_TURN));
@@ -1558,7 +1635,8 @@ mod tests {
         assert!(ids.contains(&ACTION_UPDATER_INSTALL));
         assert!(ids.contains(&ACTION_BROWSER_NATIVE));
         assert!(ids.contains(&ACTION_PROVIDER_START_SESSION));
-        assert_eq!(ids.len(), 39);
+        assert!(ids.contains(&ACTION_CONVERSATION_STATUS));
+        assert_eq!(ids.len(), 42);
         assert!(ids.contains(&ACTION_SERVICE_START));
         assert!(ids.contains(&ACTION_SERVICE_STOP));
         assert!(ids.contains(&ACTION_SERVICE_RESTART));
@@ -1610,11 +1688,18 @@ mod tests {
                         ActionArgumentSchema::TaskRenameV1,
                         None,
                     ),
+                    ACTION_TASK_ARCHIVE => (
+                        ActionScope::Task,
+                        ActionRisk::Mutating,
+                        ActionArgumentSchema::TaskId,
+                        None,
+                    ),
                     ACTION_PROVIDER_SEND_NOW
                     | ACTION_PROVIDER_STEER_CURRENT_TURN
                     | ACTION_PROVIDER_QUEUE_FOLLOW_UP
                     | ACTION_PROVIDER_ANSWER_QUESTION
                     | ACTION_PROVIDER_RESOLVE_APPROVAL
+                    | ACTION_PROVIDER_TERMINAL_INPUT
                     | ACTION_PROVIDER_STOP_TURN
                     | ACTION_TASK_SEND_NOW
                     | ACTION_TASK_STEER_CURRENT_TURN
@@ -1662,6 +1747,12 @@ mod tests {
                         ActionRisk::Mutating,
                         ActionArgumentSchema::ServiceControlV1,
                         Some(Capability::ServiceSupervisor),
+                    ),
+                    ACTION_CONVERSATION_STATUS => (
+                        ActionScope::Task,
+                        ActionRisk::ReadOnly,
+                        ActionArgumentSchema::TaskCockpitV1,
+                        Some(Capability::SemanticConversation),
                     ),
                     ACTION_WORKSPACE_STATUS
                     | ACTION_GIT_STATUS
@@ -2096,6 +2187,37 @@ mod tests {
             result.is_err(),
             "blank rename titles must fail before transport"
         );
+    }
+
+    #[test]
+    fn provider_start_factory_accepts_the_initial_task_action_epoch() {
+        let task_id = TaskId::new();
+        let agent_session_id = AgentSessionId::new();
+        let resource_id = ResourceId::new();
+        let envelope = provider_start_command(
+            CommandId::new(),
+            ClientId::new(),
+            1_725_000_000_100,
+            5,
+            ProviderStartArguments {
+                task_id,
+                agent_session_id,
+                resource_id,
+                provider_kind: ProviderKind::ClaudeCode,
+                mode: crate::domain::command::ProviderStartMode::Open,
+                action_epoch: 0,
+            },
+        )
+        .expect("zero is the valid initial durable task action epoch");
+
+        let Command::StartProviderSession(intent) = envelope.command else {
+            panic!("provider start must build StartProviderSession");
+        };
+        assert_eq!(intent.task_id, task_id);
+        assert_eq!(intent.agent_session_id, agent_session_id);
+        assert_eq!(intent.resource_id, resource_id);
+        assert_eq!(intent.expected_task_revision, 5);
+        assert_eq!(intent.expected_action_epoch, 0);
     }
 
     #[test]

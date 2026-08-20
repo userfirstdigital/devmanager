@@ -1,8 +1,9 @@
 //! Bounded files panel projection backed by Task Cockpit file queries.
 
-use crate::client::action::{self, ActionRequest};
+use crate::client::action::ActionRequest;
 use crate::domain::cockpit::{
     truncate_to_max_bytes, TaskCockpitQuery, TaskFileEntry, TaskFilesListProjection,
+    TaskFilesReadProjection,
 };
 use crate::domain::id::TaskId;
 
@@ -10,6 +11,8 @@ use super::panel::{
     task_identity, PanelAction, PanelDisabledReason, PanelIdentity, MAX_PANEL_LABEL_BYTES,
     MAX_PANEL_ROWS,
 };
+
+const MAX_FILE_PREVIEW_BYTES: usize = 8 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FilePanelRow {
@@ -23,10 +26,19 @@ pub struct FilePanelRow {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilePanelPreview {
+    pub relative_path: String,
+    pub content: String,
+    pub byte_len: u32,
+    pub binary: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FilesPanelProjection {
     pub identity: PanelIdentity,
     pub relative_directory: Option<String>,
     pub rows: Vec<FilePanelRow>,
+    pub preview: Option<FilePanelPreview>,
     pub truncated: bool,
     pub refresh: PanelAction,
     pub disabled_reason: Option<PanelDisabledReason>,
@@ -35,6 +47,7 @@ pub struct FilesPanelProjection {
 impl FilesPanelProjection {
     pub fn from_host(
         projection: Option<&TaskFilesListProjection>,
+        file_read: Option<&TaskFilesReadProjection>,
         task_id: TaskId,
         revision: Option<u64>,
         relative_directory: Option<String>,
@@ -52,6 +65,7 @@ impl FilesPanelProjection {
                 identity,
                 relative_directory,
                 rows: Vec::new(),
+                preview: file_preview(file_read, task_id),
                 truncated: false,
                 refresh: PanelAction::disabled(
                     identity,
@@ -71,6 +85,7 @@ impl FilesPanelProjection {
             identity,
             relative_directory,
             rows,
+            preview: file_preview(file_read, task_id),
             truncated: projection.truncated || projection.entries.len() > MAX_PANEL_ROWS,
             refresh: PanelAction::enabled(identity, refresh_request),
             disabled_reason: None,
@@ -86,6 +101,27 @@ impl FilesPanelProjection {
             .trim()
             .to_owned()
     }
+}
+
+fn file_preview(
+    projection: Option<&TaskFilesReadProjection>,
+    task_id: TaskId,
+) -> Option<FilePanelPreview> {
+    let projection =
+        projection.filter(|projection| projection.task_id == task_id && !projection.secret)?;
+    let (content, binary) = match projection.utf8_prefix.as_deref() {
+        Some(content) => (
+            truncate_to_max_bytes(content, MAX_FILE_PREVIEW_BYTES),
+            false,
+        ),
+        None => ("Binary file preview unavailable".to_owned(), true),
+    };
+    Some(FilePanelPreview {
+        relative_path: truncate_to_max_bytes(&projection.relative_path, MAX_PANEL_LABEL_BYTES),
+        content,
+        byte_len: projection.byte_len,
+        binary,
+    })
 }
 
 fn file_row(entry: &TaskFileEntry, identity: PanelIdentity) -> FilePanelRow {
@@ -138,6 +174,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn files_panel_projects_the_selected_text_file_for_display() {
+        let task_id = TaskId::new();
+        let panel = FilesPanelProjection::from_host(
+            Some(&TaskFilesListProjection {
+                task_id,
+                entries: vec![TaskFileEntry {
+                    relative_path: "README.md".into(),
+                    is_directory: false,
+                    secret: false,
+                }],
+                truncated: false,
+            }),
+            Some(&crate::domain::cockpit::TaskFilesReadProjection {
+                task_id,
+                relative_path: "README.md".into(),
+                utf8_prefix: Some("hello from the selected file".into()),
+                byte_len: 28,
+                secret: false,
+            }),
+            task_id,
+            Some(3),
+            None,
+        );
+
+        let preview = panel.preview.expect("selected file preview");
+        assert_eq!(preview.relative_path, "README.md");
+        assert_eq!(preview.content, "hello from the selected file");
+        assert!(!preview.binary);
+        assert_eq!(preview.byte_len, 28);
+    }
+
+    #[test]
     fn files_panel_bounds_rows_and_keeps_read_action_task_scoped() {
         let task_id = TaskId::new();
         let mut entries = Vec::new();
@@ -154,6 +222,7 @@ mod tests {
                 entries,
                 truncated: false,
             }),
+            None,
             task_id,
             Some(3),
             Some("src".into()),
@@ -192,6 +261,7 @@ mod tests {
                 ],
                 truncated: false,
             }),
+            None,
             task_id,
             None,
             None,

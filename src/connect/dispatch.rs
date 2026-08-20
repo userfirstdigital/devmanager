@@ -978,7 +978,9 @@ fn typed_error(
 mod tests {
     use super::*;
     use crate::connect::{ConnectEnvelope, SessionId};
-    use crate::domain::command::{Command, CommandEnvelope, CommandReceipt, RejectionCode};
+    use crate::domain::command::{
+        Command, CommandEnvelope, CommandReceipt, RejectionCode, RenameTaskIntent,
+    };
     use crate::domain::id::{CommandId, EventId, OperationId, RequestId, TaskId};
     use crate::domain::query::{Query, QueryEnvelope, QueryReply};
     use crate::host::HostRequestExecutor;
@@ -1122,7 +1124,13 @@ mod tests {
             task_id: Some(TaskId::new()),
             issued_at_ms: 1,
             expected_task_revision: None,
-            command: Command::BeginCloseTask,
+            // Use an ordinary command-bus mutation here. BeginCloseTask is a
+            // host effect that intentionally requires a current task revision
+            // before it enters the durable bus, so a made-up task would test
+            // that close fence instead of Connect command dispatch.
+            command: Command::RenameTask(RenameTaskIntent {
+                title: "Connect dispatch probe".into(),
+            }),
         };
         let payload = ConnectPayload::Command(command);
         let env = envelope(binding, 2, Some(request_id), None, limits, payload.clone());

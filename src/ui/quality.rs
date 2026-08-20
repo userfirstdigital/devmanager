@@ -8,7 +8,7 @@ use crate::client::action::{
     catalog, task_create_command, task_rename_command, ActionArgumentSchema, ActionRequest,
     ServiceControlArguments, TaskCreateArguments, TaskRenameArguments, ACTION_HOST_ACTIONS,
     ACTION_HOST_STATUS, ACTION_SERVICE_RESTART, ACTION_SERVICE_START, ACTION_SERVICE_STOP,
-    ACTION_TASK_LIST, ACTION_TASK_SHOW,
+    ACTION_TASK_ARCHIVE, ACTION_TASK_LIST, ACTION_TASK_SHOW,
 };
 use crate::client::model::{ClientModel, ClientModelBuilder, ClientModelError};
 use crate::domain::command::ServiceControlAction;
@@ -436,10 +436,15 @@ pub fn request_from_catalog(id: &str, input: CatalogInput) -> Result<ActionReque
                 "catalog action {other} requires CatalogInput::None"
             ))),
         },
-        ActionArgumentSchema::TaskId => match input {
-            CatalogInput::TaskId(task_id) => Ok(ActionRequest::TaskShow { task_id }),
-            _ => Err(QualityError::InvalidControl(format!(
-                "{ACTION_TASK_SHOW} requires TaskId"
+        ActionArgumentSchema::TaskId => match (id, input) {
+            (ACTION_TASK_SHOW, CatalogInput::TaskId(task_id)) => {
+                Ok(ActionRequest::TaskShow { task_id })
+            }
+            (ACTION_TASK_ARCHIVE, CatalogInput::TaskId(task_id)) => {
+                Ok(ActionRequest::TaskArchive { task_id })
+            }
+            (other, _) => Err(QualityError::InvalidControl(format!(
+                "{other} requires TaskId"
             ))),
         },
         ActionArgumentSchema::TaskCreateV1 => match input {

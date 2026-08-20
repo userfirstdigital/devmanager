@@ -18,7 +18,9 @@ use gpui::{
 use serde::{Deserialize, Serialize};
 
 use crate::client::model::MAX_INDEXED_TITLE_CHARS;
-use crate::client::{normalize_bounded_search_text, ClientModel, SearchContinuation, SearchPage};
+use crate::client::{
+    normalize_bounded_search_text, ClientModel, SearchContinuation, SearchPage, TaskInboxPreview,
+};
 use crate::client::{
     ClientSubscription, InboxHostController, SubscriptionError, SubscriptionUpdate,
 };
@@ -157,6 +159,16 @@ impl TaskList {
 
     pub fn from_client_model_virtual(model: &ClientModel) -> Result<Self, TaskListOverflow> {
         let ids: Vec<_> = model
+            .tasks()
+            .iter()
+            .filter(|(_, snapshot)| snapshot.task.lifecycle != TaskLifecycle::Archived)
+            .map(|(id, _)| *id)
+            .collect();
+        Self::from_virtual_task_ids(ids)
+    }
+
+    pub fn from_task_preview(preview: &TaskInboxPreview) -> Result<Self, TaskListOverflow> {
+        let ids: Vec<_> = preview
             .tasks()
             .iter()
             .filter(|(_, snapshot)| snapshot.task.lifecycle != TaskLifecycle::Archived)
@@ -1720,6 +1732,7 @@ pub fn render_native_inbox_with_actions(
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TaskRowModel {
     pub task_id: TaskId,
+    pub project_id: crate::domain::id::ProjectId,
     pub title: String,
     pub lifecycle: TaskLifecycle,
     pub connectivity: TaskConnectivity,
@@ -1828,6 +1841,64 @@ pub struct Inbox {
 impl Inbox {
     pub fn from_model(model: &ClientModel) -> Self {
         Self::from_model_with_filter(model, &InboxFilter::default(), &UnreadCursor::default())
+    }
+
+    /// Project a Tasks-only preview into inbox rows from [`TaskInboxPreview`]
+    /// snapshots with the default filter. Does not build the canonical search
+    /// index and must not be treated as mutation-ready ClientModel state.
+    pub fn from_task_preview(preview: &TaskInboxPreview) -> Self {
+        let filter = InboxFilter::default();
+        let unread = UnreadCursor::default();
+        let mut grouped: [Vec<TaskRowModel>; 4] = std::array::from_fn(|_| Vec::new());
+        for snapshot in preview.tasks().values() {
+            if snapshot.task.lifecycle == TaskLifecycle::Archived {
+                continue;
+            }
+            if !filter.matches(&snapshot.task.title, snapshot.task.lifecycle) {
+                continue;
+            }
+            let row = row_from_snapshot(
+                snapshot,
+                snapshot.task.created_at_ms,
+                &unread,
+                true, // preview is read-only
+            );
+            grouped[row.section.index()].push(row);
+        }
+        for rows in &mut grouped {
+            rows.sort_by(compare_rows);
+        }
+        // Honest overflow total before the retained window truncates rows.
+        let matching_total: usize = grouped.iter().map(Vec::len).sum();
+        let mut active_rows = Vec::new();
+        let mut section_ranges = [0..0, 0..0, 0..0, 0..0];
+        for section in InboxSection::ALL {
+            let start = active_rows.len();
+            let take = MAX_TASK_LIST_ITEMS.saturating_sub(active_rows.len());
+            active_rows.extend(grouped[section.index()].drain(..).take(take));
+            section_ranges[section.index()] = start..active_rows.len();
+            if active_rows.len() >= MAX_TASK_LIST_ITEMS {
+                break;
+            }
+        }
+        let state = if active_rows.is_empty() {
+            InboxState::Empty
+        } else {
+            InboxState::Ready
+        };
+        let task_ids: Vec<_> = active_rows.iter().map(|row| row.task_id).collect();
+        Self {
+            task_list: InboxList::from_ordered_ids(task_ids, matching_total),
+            rows: active_rows,
+            archived_list: InboxList::from_ordered_ids(Vec::new(), 0),
+            history_rows: Vec::new(),
+            unread,
+            section_ranges,
+            filter,
+            state,
+            full_rebuilds: 1,
+            incremental_updates: 0,
+        }
     }
 
     pub fn from_model_with_unread(model: &ClientModel, unread: &UnreadCursor) -> Self {
@@ -2339,6 +2410,7 @@ fn row_from_snapshot(
         text_was_truncated(&snapshot.task.title, MAX_ACCESSIBLE_NAME_CHARS);
     TaskRowModel {
         task_id: snapshot.task.id,
+        project_id: snapshot.task.project_id,
         title: sanitize_bounded_text(&snapshot.task.title, MAX_ACCESSIBLE_NAME_CHARS),
         lifecycle: snapshot.task.lifecycle,
         connectivity: snapshot.connectivity,
@@ -2651,13 +2723,17 @@ fn compare_rows(left: &TaskRowModel, right: &TaskRowModel) -> Ordering {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::ClientModelBuilder;
+    use crate::client::{ClientModelBuilder, TaskInboxPreview};
+    use crate::domain::browser::BrowserBook;
     use crate::domain::id::{EnvironmentId, ProjectId, SnapshotId};
-    use crate::domain::snapshot::{SnapshotItem, SnapshotPage, SnapshotSection, TaskSnapshotItem};
+    use crate::domain::snapshot::{
+        SnapshotItem, SnapshotPage, SnapshotSection, TaskSnapshot, TaskSnapshotItem,
+    };
     use crate::domain::task::{
         ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity, TaskFacts,
         TaskLifecycle, WorkspaceRef,
     };
+    use std::collections::BTreeMap;
     use std::time::Duration;
 
     fn search_model(task_count: u64) -> ClientModel {
@@ -3068,5 +3144,68 @@ mod tests {
                 .total_count,
             100_000
         );
+    }
+
+    #[test]
+    fn task_preview_inbox_preserves_overflow_total_before_truncation() {
+        let total = MAX_TASK_LIST_ITEMS + 1;
+        let mut tasks = BTreeMap::new();
+        for index in 0..total {
+            let id = crate::domain::id::TaskId::from_bytes({
+                let mut bytes = [0u8; 16];
+                bytes[..8].copy_from_slice(&[0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01]);
+                bytes[8] = 0x80;
+                bytes[9..].copy_from_slice(&(index as u64).to_be_bytes()[1..]);
+                bytes
+            })
+            .expect("task");
+            let mut browser = BrowserBook::new();
+            let _ = browser.open_task(id);
+            tasks.insert(
+                id,
+                TaskSnapshot {
+                    task: TaskFacts {
+                        id,
+                        environment_id: EnvironmentId::from_bytes([
+                            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00,
+                            0x00, 0x00, 0x00, 0x10,
+                        ])
+                        .expect("env"),
+                        title: format!("Preview {index}"),
+                        description: None,
+                        project_id: ProjectId::from_bytes([
+                            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00,
+                            0x00, 0x00, 0x00, 0x11,
+                        ])
+                        .expect("project"),
+                        workspace: WorkspaceRef::Main,
+                        assignment: TaskAssignment::LocalOwner,
+                        lifecycle: TaskLifecycle::Open,
+                        action_epoch: 1,
+                        revision: 1,
+                        created_at_ms: index as i64,
+                    },
+                    connectivity: TaskConnectivity::Connected,
+                    attention: TaskAttention::None,
+                    activity: TaskActivity::Idle,
+                    review_readiness: ReviewReadiness::NotReady,
+                    agents: BTreeMap::new(),
+                    primary_agent_id: None,
+                    artifacts: BTreeMap::new(),
+                    resources: BTreeMap::new(),
+                    provider_sessions: BTreeMap::new(),
+                    browser,
+                },
+            );
+        }
+        let preview = TaskInboxPreview::from_tasks_for_test(tasks, 11);
+        let inbox = Inbox::from_task_preview(&preview);
+        assert_eq!(inbox.rows.len(), MAX_TASK_LIST_ITEMS);
+        let overflow = inbox
+            .active_overflow()
+            .expect("matching total above retained window must expose overflow");
+        assert_eq!(overflow.total_count, total);
+        assert_eq!(overflow.retained_count, MAX_TASK_LIST_ITEMS);
+        assert_eq!(overflow.limit, MAX_TASK_LIST_ITEMS);
     }
 }

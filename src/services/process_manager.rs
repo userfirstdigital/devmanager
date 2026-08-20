@@ -1,10 +1,12 @@
 use crate::ai::claude_hooks::{
-    prepare_claude_launch_overlay, quote_shell_argument, ClaudeHookRegistration,
-    ClaudeHookRegistry, ClaudeHookRelayListener, ClaudeRegistryEvent, ClaudeShellKind,
+    prepare_correlated_claude_launch_overlay, quote_shell_argument, ClaudeCorrelationBinding,
+    ClaudeHookRegistration, ClaudeHookRegistry, ClaudeHookRelayListener, ClaudeRegistryEvent,
+    ClaudeShellKind,
 };
 use crate::ai::codex_hooks::{
-    build_codex_hooks_command, codex_supports_hooks, CodexHookRegistration, CodexHookRegistry,
-    CodexHookRelayListener, CodexRegistryEvent, CodexSessionBinding,
+    build_codex_hooks_command, codex_hook_argument_tokens, codex_supports_hooks,
+    CodexHookRegistration, CodexHookRegistry, CodexHookRelayListener, CodexRegistryEvent,
+    CodexSessionBinding,
 };
 use crate::browser::{
     browser_input_opens_prompt_boundary, codex_browser_config_overrides,
@@ -12,7 +14,7 @@ use crate::browser::{
     BrowserGatewayRegistrar, BrowserGatewayRegistration, BrowserPromptInput, BrowserProviderAccess,
     BrowserWorkspaceKey, BrowserWorkspaceSnapshot, ClaudeBrowserOverlay,
 };
-use crate::domain::id::{OperationId, ResourceId, TaskId};
+use crate::domain::id::{AgentSessionId, OperationId, ResourceId, TaskId};
 #[cfg(test)]
 use crate::domain::operation::ResourceFence;
 use crate::domain::snapshot::{ProcessAccountingMemberSnapshot, ProcessMetricStatus};
@@ -317,6 +319,7 @@ pub(crate) struct ProcessManagerInner {
     remote_session_handler: RwLock<Option<RemoteSessionEventHandler>>,
     claude_hook_registry: Arc<ClaudeHookRegistry>,
     claude_hook_listener: Mutex<Option<ClaudeHookRelayListener>>,
+    claude_adapter_generation: AtomicU64,
     claude_hook_sessions: Mutex<HashMap<String, ClaudeHookSession>>,
     #[cfg(test)]
     claude_semantic_publication_test_hook: RwLock<Option<ClaudeSemanticPublicationTestHook>>,
@@ -342,6 +345,7 @@ pub(crate) struct ProcessManagerInner {
     provider_host: ProviderHost,
     provider_runtime: Mutex<ProviderRuntimeBook>,
     provider_sessions: Mutex<Option<ProductionProviderSessionManager>>,
+    provider_session_store_path: Option<PathBuf>,
     #[cfg(test)]
     background_test_hook: RwLock<Option<ProcessManagerBackgroundTestHook>>,
     #[cfg(test)]
@@ -405,6 +409,40 @@ struct CodexAdapterIdentity {
     generation: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CodexExactResumeLaunchBinding {
+    task_id: TaskId,
+    agent_session_id: AgentSessionId,
+    resource_id: ResourceId,
+    runtime_generation: u64,
+    provider_kind: ProviderKind,
+    expected_provider_session_id: crate::domain::ProviderSessionId,
+}
+
+impl CodexExactResumeLaunchBinding {
+    fn key(&self) -> (ResourceId, u64) {
+        (self.resource_id, self.runtime_generation)
+    }
+
+    fn matches_live(&self, live: &ProviderLiveSession) -> bool {
+        live.task_id == self.task_id
+            && live.agent_session_id == self.agent_session_id
+            && live.provider_kind == self.provider_kind
+            && live.provider_session_id.as_ref() == Some(&self.expected_provider_session_id)
+            && live.fence.resource().resource_id == self.resource_id
+            && live.fence.resource().runtime_generation == self.runtime_generation
+    }
+
+    fn task_failure(&self) -> ProviderSessionFailure {
+        ProviderSessionFailure {
+            task_id: self.task_id,
+            agent_session_id: self.agent_session_id,
+            provider_kind: self.provider_kind,
+            failure: crate::providers::session::ExactResumeFailure::ProviderRejected,
+        }
+    }
+}
+
 fn codex_semantic_identity(
     pty_session_id: &str,
     identity: &CodexAdapterIdentity,
@@ -424,6 +462,7 @@ enum CodexAdapterSession {
         identity: CodexAdapterIdentity,
         registration: CodexHookRegistration,
         activated: bool,
+        exact_resume: Option<CodexExactResumeLaunchBinding>,
     },
 }
 
@@ -486,7 +525,7 @@ impl CodexAdapterRegistry {
     }
 }
 
-fn next_codex_adapter_generation(counter: &AtomicU64) -> Option<u64> {
+fn next_adapter_generation(counter: &AtomicU64) -> Option<u64> {
     counter
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |generation| {
             generation.checked_add(1)
@@ -571,13 +610,14 @@ static AI_SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
 static SSH_SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
 static CLAUDE_OVERLAY_OWNER_COUNTER: AtomicU64 = AtomicU64::new(1);
 
-const DEFAULT_CLAUDE_COMMAND: &str =
-    "npx -y @anthropic-ai/claude-code@latest --dangerously-skip-permissions";
-const DEFAULT_CODEX_COMMAND: &str =
-    "npx -y @openai/codex@latest --dangerously-bypass-approvals-and-sandbox";
+const DEFAULT_CLAUDE_COMMAND: &str = "npx -y @anthropic-ai/claude-code@latest";
+const DEFAULT_CODEX_COMMAND: &str = "npx -y @openai/codex@latest";
 const PROCESS_MANAGER_HELPER_JOIN_BUDGET: Duration = Duration::from_secs(5);
 const MAX_AUTO_RESTART_WORKERS: usize = 256;
 const MAX_TERMINAL_AUTHORITY_RESOURCES: usize = 1_024;
+const MAX_PROVIDER_SESSION_FAILURES: usize = 128;
+const PROVIDER_EXIT_RETRY_INITIAL: Duration = Duration::from_millis(250);
+const PROVIDER_EXIT_RETRY_MAX: Duration = Duration::from_secs(30);
 
 type ProductionProviderSessionManager = crate::providers::session::ProviderSessionManager<
     crate::services::provider_process_launcher::ProcessManagerProviderLauncher,
@@ -592,6 +632,18 @@ impl Default for ProcessManager {
 
 impl ProcessManager {
     pub fn new() -> Self {
+        Self::new_with_optional_provider_session_store_path(None)
+    }
+
+    /// Construct the host-owned process runtime with provider session state
+    /// anchored beneath the same resolved profile root as the kernel database.
+    pub(crate) fn new_with_provider_session_store_path(path: PathBuf) -> Self {
+        Self::new_with_optional_provider_session_store_path(Some(path))
+    }
+
+    fn new_with_optional_provider_session_store_path(
+        provider_session_store_path: Option<PathBuf>,
+    ) -> Self {
         let debug_enabled = debug_enabled();
         let handle_lifecycle = Arc::new(ProcessManagerHandleLifecycle::new());
         let claude_hook_registry = Arc::new(ClaudeHookRegistry::default());
@@ -615,6 +667,7 @@ impl ProcessManager {
             remote_session_handler: RwLock::new(None),
             claude_hook_registry: claude_hook_registry.clone(),
             claude_hook_listener: Mutex::new(None),
+            claude_adapter_generation: AtomicU64::new(1),
             claude_hook_sessions: Mutex::new(HashMap::new()),
             #[cfg(test)]
             claude_semantic_publication_test_hook: RwLock::new(None),
@@ -643,6 +696,7 @@ impl ProcessManager {
                 .expect("stock provider adapters register deterministically"),
             provider_runtime: Mutex::new(ProviderRuntimeBook::default()),
             provider_sessions: Mutex::new(None),
+            provider_session_store_path,
             #[cfg(test)]
             background_test_hook: RwLock::new(None),
             #[cfg(test)]
@@ -803,6 +857,26 @@ impl ProcessManager {
             handle_lifecycle,
             shutdown_vote: true,
         }
+    }
+
+    fn production_provider_session_store_path(
+        &self,
+    ) -> Result<PathBuf, crate::providers::session::ProviderSessionError> {
+        if let Some(path) = self.inner.provider_session_store_path.as_ref() {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(|error| {
+                    crate::providers::session::ProviderSessionError::StateStore(error.to_string())
+                })?;
+            }
+            return Ok(path.clone());
+        }
+        let root = crate::persistence::app_config_dir().map_err(|error| {
+            crate::providers::session::ProviderSessionError::StateStore(error.to_string())
+        })?;
+        std::fs::create_dir_all(&root).map_err(|error| {
+            crate::providers::session::ProviderSessionError::StateStore(error.to_string())
+        })?;
+        Ok(root.join("provider-sessions.sqlite3"))
     }
 
     pub fn drain_process_op_completions(&self) -> Vec<ProcessOpCompletion> {
@@ -1666,14 +1740,8 @@ impl ProcessManager {
             )
         })?;
         if slot.is_none() {
-            let root = crate::persistence::app_config_dir().map_err(|error| {
-                crate::providers::session::ProviderSessionError::StateStore(error.to_string())
-            })?;
-            std::fs::create_dir_all(&root).map_err(|error| {
-                crate::providers::session::ProviderSessionError::StateStore(error.to_string())
-            })?;
             let store = crate::providers::session::SqliteProviderSessionStateStore::open(
-                root.join("provider-sessions.sqlite3"),
+                self.production_provider_session_store_path()?,
             )
             .map_err(crate::providers::session::ProviderSessionError::StateStore)?;
             *slot = Some(
@@ -1683,9 +1751,19 @@ impl ProcessManager {
                 ),
             );
         }
-        slot.as_mut()
+        let start_result = slot
+            .as_mut()
             .expect("production provider manager initialized")
-            .start(request)
+            .start(request);
+        let started_correlation = start_result
+            .as_ref()
+            .ok()
+            .map(crate::providers::session::ProviderRuntime::correlation);
+        drop(slot);
+        if let Some(correlation) = started_correlation {
+            reconcile_provider_session_start_after_launch(&self.inner, correlation);
+        }
+        start_result
     }
 
     /// Start one stock Claude/Codex/Cursor runtime through the provider-owned
@@ -1724,18 +1802,9 @@ impl ProcessManager {
             )
         })?;
         if slot.is_none() {
-            let root = crate::persistence::app_config_dir().map_err(|error| {
-                crate::providers::controller::StockProviderSessionError::Session(
-                    crate::providers::session::ProviderSessionError::StateStore(error.to_string()),
-                )
-            })?;
-            std::fs::create_dir_all(&root).map_err(|error| {
-                crate::providers::controller::StockProviderSessionError::Session(
-                    crate::providers::session::ProviderSessionError::StateStore(error.to_string()),
-                )
-            })?;
             let store = crate::providers::session::SqliteProviderSessionStateStore::open(
-                root.join("provider-sessions.sqlite3"),
+                self.production_provider_session_store_path()
+                    .map_err(crate::providers::controller::StockProviderSessionError::Session)?,
             )
             .map_err(|error| {
                 crate::providers::controller::StockProviderSessionError::Session(
@@ -1749,10 +1818,12 @@ impl ProcessManager {
                 ),
             );
         }
-        crate::providers::controller::StockProviderSessionController::new()
+        let manager = slot
+            .as_mut()
+            .expect("production provider manager initialized");
+        let start_result = crate::providers::controller::StockProviderSessionController::new()
             .start_with_resource_binding(
-                slot.as_mut()
-                    .expect("production provider manager initialized"),
+                manager,
                 binding,
                 agent,
                 observation,
@@ -1761,7 +1832,86 @@ impl ProcessManager {
                 cwd,
                 environment,
                 mode,
+            );
+        let latched = take_latched_codex_exact_resume_failure(
+            &self.inner,
+            (binding.resource_id, binding.runtime_generation),
+        );
+        if let Some(latched) = latched {
+            queue_provider_session_failure(&self.inner, latched.task_failure());
+            return match start_result {
+                Ok(_) => {
+                    manager
+                        .settle_exact_resume_failure(latched.agent_session_id)
+                        .map_err(
+                            crate::providers::controller::StockProviderSessionError::Session,
+                        )?;
+                    Err(
+                        crate::providers::controller::StockProviderSessionError::Session(
+                            crate::providers::session::ProviderSessionError::ExactResumeFailed {
+                                provider_session_id: latched.expected_provider_session_id,
+                                failure:
+                                    crate::providers::session::ExactResumeFailure::ProviderRejected,
+                            },
+                        ),
+                    )
+                }
+                Err(error) => Err(error),
+            };
+        }
+        let started_correlation = start_result
+            .as_ref()
+            .ok()
+            .map(crate::providers::session::ProviderRuntime::correlation);
+        drop(slot);
+        if let Some(correlation) = started_correlation {
+            reconcile_provider_session_start_after_launch(&self.inner, correlation);
+        }
+        start_result
+    }
+
+    pub(crate) fn provider_session_bindings(&self) -> Vec<ProviderSessionBinding> {
+        let Ok(book) = self.inner.provider_runtime.lock() else {
+            return Vec::new();
+        };
+        book.live
+            .values()
+            .filter(|live| live.provider_identity_confirmed && !live.exit_reported)
+            .filter_map(|live| {
+                Some(ProviderSessionBinding {
+                    task_id: live.task_id,
+                    agent_session_id: live.agent_session_id,
+                    resource_id: live.fence.resource().resource_id,
+                    provider_kind: live.provider_kind,
+                    provider_session_id: live.provider_session_id.clone()?,
+                    runtime_generation: live.fence.resource().runtime_generation,
+                })
+            })
+            .collect()
+    }
+
+    pub(crate) fn drain_provider_session_failures(&self) -> Vec<ProviderSessionFailure> {
+        let Ok(mut book) = self.inner.provider_runtime.lock() else {
+            return Vec::new();
+        };
+        book.failures.drain(..).collect()
+    }
+
+    /// Close every provider session bound to one task. Missing manager state is
+    /// success: a failed launch never created a live session.
+    pub fn close_provider_task(
+        &self,
+        task_id: crate::domain::id::TaskId,
+    ) -> Result<(), crate::providers::session::ProviderSessionError> {
+        let mut slot = self.inner.provider_sessions.lock().map_err(|_| {
+            crate::providers::session::ProviderSessionError::StateStore(
+                "provider session manager lock poisoned".to_string(),
             )
+        })?;
+        match slot.as_mut() {
+            Some(manager) => manager.close_task(task_id),
+            None => Ok(()),
+        }
     }
 
     pub fn admit_stock_provider_launch(
@@ -1942,6 +2092,18 @@ impl ProcessManager {
         session_id: &str,
         temp_root: &Path,
     ) {
+        self.prepare_claude_launch_for_session_with_provider_session_id(
+            launch, session_id, temp_root, None,
+        );
+    }
+
+    fn prepare_claude_launch_for_session_with_provider_session_id(
+        &self,
+        launch: &mut AiLaunchSpec,
+        session_id: &str,
+        temp_root: &Path,
+        expected_provider_session_id: Option<&str>,
+    ) {
         if launch.tool != SessionKind::Claude {
             return;
         }
@@ -1972,9 +2134,48 @@ impl ProcessManager {
                 return;
             }
         };
-        let overlay = prepare_claude_launch_overlay(
+        let Some(generation) = next_adapter_generation(&self.inner.claude_adapter_generation)
+        else {
+            emit_remote_session_event(
+                &self.inner,
+                RemoteSessionEvent::AdapterHealth {
+                    stable_session_key,
+                    health: SemanticAdapterHealth::Degraded,
+                },
+            );
+            return;
+        };
+        let expected_provider_session_id = match expected_provider_session_id
+            .map(|raw| crate::domain::ProviderSessionId::new(raw.to_string()))
+            .transpose()
+        {
+            Ok(expected) => expected,
+            Err(_) => {
+                emit_remote_session_event(
+                    &self.inner,
+                    RemoteSessionEvent::AdapterHealth {
+                        stable_session_key,
+                        health: SemanticAdapterHealth::Degraded,
+                    },
+                );
+                return;
+            }
+        };
+        let task_id = TaskId::parse(&launch.tab_id).unwrap_or_else(|_| TaskId::new());
+        let agent_session_id =
+            AgentSessionId::parse(session_id).unwrap_or_else(|_| AgentSessionId::new());
+        let correlation = ClaudeCorrelationBinding::new(
+            task_id,
+            agent_session_id,
+            generation,
+            generation,
+            ResourceId::new(),
+        );
+        let overlay = prepare_correlated_claude_launch_overlay(
             &self.inner.claude_hook_registry,
             stable_session_key.clone(),
+            correlation,
+            expected_provider_session_id,
             &launch.startup_command,
             claude_shell_kind(&launch.shell_program),
             &executable,
@@ -2022,7 +2223,7 @@ impl ProcessManager {
     }
 
     fn cleanup_claude_hook_session(&self, session_id: &str) {
-        fence_and_remove_claude_hook_session(&self.inner, session_id, None);
+        cleanup_claude_hook_session_inner(&self.inner, session_id);
     }
 
     pub fn drain_claude_hook_adapter(&self) {
@@ -2043,6 +2244,11 @@ impl ProcessManager {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = probe;
     }
 
+    #[cfg(test)]
+    pub(crate) fn accept_codex_hooks_for_test(&self) {
+        self.set_codex_hooks_support_probe_for_test(Arc::new(|_| Ok(())));
+    }
+
     fn prepare_codex_launch_for_session(
         &self,
         launch: &mut AiLaunchSpec,
@@ -2057,8 +2263,7 @@ impl ProcessManager {
             .map(codex_browser_config_overrides)
             .unwrap_or_default();
         let stable_session_key = StableSessionKey::from_tab(&launch.tab_id);
-        let Some(generation) = next_codex_adapter_generation(&self.inner.codex_adapter_generation)
-        else {
+        let Some(generation) = next_adapter_generation(&self.inner.codex_adapter_generation) else {
             emit_remote_session_event(
                 &self.inner,
                 RemoteSessionEvent::AdapterHealth {
@@ -2179,6 +2384,7 @@ impl ProcessManager {
                         identity: identity.clone(),
                         registration: registration.clone(),
                         activated: false,
+                        exact_resume: None,
                     },
                 );
                 true
@@ -2237,46 +2443,257 @@ impl ProcessManager {
         terminal_environment
     }
 
+    fn prepare_sealed_provider_adapter(
+        &self,
+        request: &crate::providers::session::ProviderRuntimeLaunchRequest,
+        session_id: &str,
+        program: &str,
+        mut args: Vec<String>,
+    ) -> Result<(Vec<String>, Option<AiLaunchSpec>), crate::providers::session::ProviderLaunchError>
+    {
+        use crate::providers::session::{ProviderLaunchError, ProviderLaunchMode};
+
+        let task_key = request.correlation().task_id().to_string();
+        let tool = match request.provider_kind() {
+            ProviderKind::ClaudeCode => SessionKind::Claude,
+            ProviderKind::Codex => SessionKind::Codex,
+            ProviderKind::Cursor => return Ok((args, None)),
+        };
+        let original_command = std::iter::once(program)
+            .chain(args.iter().map(String::as_str))
+            .map(|token| quote_shell_argument(token, ClaudeShellKind::Cmd))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let stable_session_key = StableSessionKey::from_tab(&task_key);
+
+        match request.provider_kind() {
+            ProviderKind::ClaudeCode => {
+                let endpoint = self
+                    .claude_hook_endpoint()
+                    .map_err(|_| ProviderLaunchError::BridgeUnavailable)?;
+                let relay_executable =
+                    std::env::current_exe().map_err(|_| ProviderLaunchError::BridgeUnavailable)?;
+                let correlation = ClaudeCorrelationBinding::new(
+                    request.correlation().task_id(),
+                    request.correlation().agent_session_id(),
+                    request.correlation().generation(),
+                    request.correlation().action_epoch(),
+                    request.resource_id(),
+                );
+                let expected_provider_session_id = match request.launch_spec().mode() {
+                    ProviderLaunchMode::ResumeExact(id) => Some(id.clone()),
+                    ProviderLaunchMode::NewConversation => None,
+                };
+                let overlay = prepare_correlated_claude_launch_overlay(
+                    &self.inner.claude_hook_registry,
+                    stable_session_key.clone(),
+                    correlation,
+                    expected_provider_session_id,
+                    &original_command,
+                    ClaudeShellKind::Cmd,
+                    &relay_executable,
+                    &endpoint,
+                    &self.inner.claude_hook_temp_root,
+                    Instant::now(),
+                );
+                let (Some(registration), Some(settings_path)) =
+                    (overlay.registration, overlay.settings_path)
+                else {
+                    emit_remote_session_event(
+                        &self.inner,
+                        RemoteSessionEvent::AdapterHealth {
+                            stable_session_key,
+                            health: SemanticAdapterHealth::Degraded,
+                        },
+                    );
+                    return Err(ProviderLaunchError::BridgeUnavailable);
+                };
+                args.push("--settings".to_string());
+                args.push(settings_path.to_string_lossy().into_owned());
+                let session = ClaudeHookSession {
+                    registration,
+                    settings_path,
+                };
+                if let Some(previous) = self
+                    .inner
+                    .claude_hook_sessions
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .get(session_id)
+                    .map(|session| session.registration.clone())
+                {
+                    fence_and_remove_claude_hook_session(&self.inner, session_id, Some(&previous));
+                }
+                let identity = claude_semantic_identity(session_id, &session);
+                self.inner
+                    .claude_hook_sessions
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(session_id.to_string(), session);
+                emit_remote_session_event(
+                    &self.inner,
+                    RemoteSessionEvent::ClaudeAdapterRegistered { identity },
+                );
+                emit_remote_session_event(
+                    &self.inner,
+                    RemoteSessionEvent::AdapterHealth {
+                        stable_session_key,
+                        health: overlay.health,
+                    },
+                );
+            }
+            ProviderKind::Codex => {
+                let Some(generation) =
+                    next_adapter_generation(&self.inner.codex_adapter_generation)
+                else {
+                    return Err(ProviderLaunchError::BridgeUnavailable);
+                };
+                let identity = CodexAdapterIdentity {
+                    stable_session_key: stable_session_key.clone(),
+                    generation,
+                };
+                let replaced = {
+                    let mut registry = self
+                        .inner
+                        .codex_adapter_registry
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    registry.note_generation(&identity);
+                    registry.sessions.insert(
+                        session_id.to_string(),
+                        CodexAdapterSession::Pending(identity.clone()),
+                    )
+                };
+                if let Some(replaced) = replaced
+                    .as_ref()
+                    .and_then(|session| session.registered_semantic_identity(session_id))
+                {
+                    emit_remote_session_event(
+                        &self.inner,
+                        RemoteSessionEvent::CodexAdapterRemoved { identity: replaced },
+                    );
+                }
+                let probe = self
+                    .inner
+                    .codex_hooks_support_probe
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone();
+                if probe(&original_command).is_err() {
+                    mark_codex_adapter_degraded(&self.inner, session_id, &identity);
+                    return Err(ProviderLaunchError::BridgeUnavailable);
+                }
+                let endpoint = self
+                    .codex_hook_endpoint()
+                    .map_err(|_| ProviderLaunchError::BridgeUnavailable)?;
+                let relay_executable =
+                    std::env::current_exe().map_err(|_| ProviderLaunchError::BridgeUnavailable)?;
+                let registration = self
+                    .inner
+                    .codex_hook_registry
+                    .register_expected(
+                        stable_session_key.clone(),
+                        match request.launch_spec().mode() {
+                            ProviderLaunchMode::ResumeExact(id) => Some(id.clone()),
+                            ProviderLaunchMode::NewConversation => None,
+                        },
+                    )
+                    .map_err(|_| ProviderLaunchError::BridgeUnavailable)?;
+                let hook_args =
+                    codex_hook_argument_tokens(&relay_executable, &endpoint, &registration.nonce)
+                        .inspect_err(|_| {
+                            self.inner
+                                .codex_hook_registry
+                                .unregister(&registration.nonce);
+                        })
+                        .map_err(|_| ProviderLaunchError::BridgeUnavailable)?;
+                let installed = {
+                    let mut registry = self
+                        .inner
+                        .codex_adapter_registry
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if registry.is_current(&identity)
+                        && registry
+                            .sessions
+                            .get(session_id)
+                            .is_some_and(|session| session.identity() == &identity)
+                    {
+                        registry.sessions.insert(
+                            session_id.to_string(),
+                            CodexAdapterSession::Running {
+                                identity: identity.clone(),
+                                registration: registration.clone(),
+                                activated: false,
+                                exact_resume: match request.launch_spec().mode() {
+                                    ProviderLaunchMode::ResumeExact(provider_session_id) => {
+                                        Some(CodexExactResumeLaunchBinding {
+                                            task_id: request.correlation().task_id(),
+                                            agent_session_id: request
+                                                .correlation()
+                                                .agent_session_id(),
+                                            resource_id: request.resource_id(),
+                                            runtime_generation: request.correlation().generation(),
+                                            provider_kind: request.provider_kind(),
+                                            expected_provider_session_id: provider_session_id
+                                                .clone(),
+                                        })
+                                    }
+                                    ProviderLaunchMode::NewConversation => None,
+                                },
+                            },
+                        );
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if !installed {
+                    self.inner
+                        .codex_hook_registry
+                        .unregister(&registration.nonce);
+                    return Err(ProviderLaunchError::BridgeUnavailable);
+                }
+                args.extend(hook_args);
+                emit_remote_session_event(
+                    &self.inner,
+                    RemoteSessionEvent::CodexAdapterRegistered {
+                        identity: codex_semantic_identity(session_id, &identity),
+                    },
+                );
+            }
+            ProviderKind::Cursor => unreachable!("Cursor returned before adapter preparation"),
+        }
+
+        let startup_command = std::iter::once(program)
+            .chain(args.iter().map(String::as_str))
+            .map(|token| quote_shell_argument(token, ClaudeShellKind::Cmd))
+            .collect::<Vec<_>>()
+            .join(" ");
+        Ok((
+            args.clone(),
+            Some(AiLaunchSpec {
+                tab_id: task_key.clone(),
+                project_id: task_key,
+                tool,
+                cwd: request.launch_spec().cwd().to_path_buf(),
+                shell_program: program.to_string(),
+                shell_args: args,
+                startup_command,
+            }),
+        ))
+    }
+
     fn cleanup_codex_adapter_session(&self, session_id: &str) {
-        let removed = self
-            .inner
-            .codex_adapter_registry
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove_session(session_id);
-        let removed_identity = removed
-            .as_ref()
-            .and_then(|session| session.registered_semantic_identity(session_id));
-        // Retire the relay nonce outside the registry lock.
-        if let Some(CodexAdapterSession::Running { registration, .. }) = removed {
-            self.inner
-                .codex_hook_registry
-                .unregister(&registration.nonce);
-        }
-        if let Some(identity) = removed_identity {
-            emit_remote_session_event(
-                &self.inner,
-                RemoteSessionEvent::CodexAdapterRemoved { identity },
-            );
-        }
+        cleanup_codex_adapter_session_inner(&self.inner, session_id);
     }
 
     fn cleanup_browser_provider_session(&self, session_id: &str) {
-        let removed = self
-            .inner
-            .browser_provider_sessions
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(session_id);
-        if let Some(removed) = removed {
-            removed.registrar.revoke(&removed.registration);
-        }
+        cleanup_browser_provider_session_inner(&self.inner, session_id);
     }
 
     fn cleanup_ai_adapters_for_session(&self, session_id: &str) {
-        self.cleanup_claude_hook_session(session_id);
-        self.cleanup_codex_adapter_session(session_id);
-        self.cleanup_browser_provider_session(session_id);
+        cleanup_ai_adapters_for_session_inner(&self.inner, session_id);
     }
 
     pub fn set_notification_sound(&self, sound_id: Option<String>) {
@@ -2473,6 +2890,19 @@ impl ProcessManager {
         #[cfg(windows)]
         {
             let session_id = format!("provider-{}", request.terminal_id());
+            if !request.launch_spec().executable().is_native() {
+                return Err(ProviderLaunchError::SpawnFailed);
+            }
+            if let Some(dependency) = request.launch_spec().runtime_dependency() {
+                dependency
+                    .validate_current()
+                    .map_err(|_| ProviderLaunchError::SpawnFailed)?;
+            }
+            request
+                .launch_spec()
+                .executable()
+                .validate_current()
+                .map_err(|_| ProviderLaunchError::SpawnFailed)?;
             let program = request
                 .launch_spec()
                 .executable()
@@ -2482,8 +2912,9 @@ impl ProcessManager {
                 .to_string();
             let args = request
                 .launch_spec()
-                .arguments()
-                .map(|argument| os_to_launch_string(argument))
+                .create_process_arguments()
+                .into_iter()
+                .map(|argument| os_to_launch_string(&argument))
                 .collect::<Result<Vec<_>, _>>()?;
             let env = request
                 .launch_spec()
@@ -2493,11 +2924,29 @@ impl ProcessManager {
                 .collect::<Result<HashMap<String, String>, ProviderLaunchError>>()?;
             ensure_prior_session_teardown_settled(&self.inner, &session_id, Duration::from_secs(2))
                 .map_err(|_| ProviderLaunchError::SpawnFailed)?;
+            let (args, ai_launch) =
+                self.prepare_sealed_provider_adapter(request, &session_id, &program, args)?;
             self.ensure_runtime_entry(
                 &session_id,
                 request.launch_spec().cwd().to_path_buf(),
                 SessionDimensions::default(),
             );
+            if let Some(ai_launch) = ai_launch {
+                let resumed_provider_session_id = match request.launch_spec().mode() {
+                    crate::providers::session::ProviderLaunchMode::ResumeExact(id) => {
+                        Some(id.as_str().to_string())
+                    }
+                    crate::providers::session::ProviderLaunchMode::NewConversation => None,
+                };
+                self.update_session_state(&session_id, |state| {
+                    state.status = SessionStatus::Starting;
+                    state.cwd = ai_launch.cwd.clone();
+                    state.shell_program = program.clone();
+                    state.configure_ai(ai_launch.clone());
+                    state.provider_session_id = resumed_provider_session_id.clone();
+                    state.exit = None;
+                });
+            }
             let authority = self
                 .issue_exact_provider_terminal_authority(
                     &session_id,
@@ -2506,7 +2955,10 @@ impl ProcessManager {
                     request.launch_spec().generation(),
                     request.correlation().action_epoch(),
                 )
-                .map_err(|_| ProviderLaunchError::SpawnFailed)?;
+                .map_err(|_| {
+                    self.cleanup_ai_adapters_for_session(&session_id);
+                    ProviderLaunchError::SpawnFailed
+                })?;
             let session = TerminalSession::spawn_command(
                 session_id.clone(),
                 request.launch_spec().cwd().to_path_buf(),
@@ -2532,20 +2984,24 @@ impl ProcessManager {
                 )),
                 authority,
             )
-            .map_err(|_| match request.launch_spec().mode() {
-                crate::providers::session::ProviderLaunchMode::ResumeExact(_) => {
-                    ProviderLaunchError::ExactResumeFailed(
-                        crate::providers::session::ExactResumeFailure::ProviderRejected,
-                    )
-                }
-                crate::providers::session::ProviderLaunchMode::NewConversation => {
-                    ProviderLaunchError::SpawnFailed
+            .map_err(|_| {
+                self.cleanup_ai_adapters_for_session(&session_id);
+                match request.launch_spec().mode() {
+                    crate::providers::session::ProviderLaunchMode::ResumeExact(_) => {
+                        ProviderLaunchError::ExactResumeFailed(
+                            crate::providers::session::ExactResumeFailure::ProviderRejected,
+                        )
+                    }
+                    crate::providers::session::ProviderLaunchMode::NewConversation => {
+                        ProviderLaunchError::SpawnFailed
+                    }
                 }
             })?;
             let fence = match session.managed_process_fence() {
                 Ok(Some(fence)) => fence,
                 _ => {
                     let _ = session.close(false);
+                    self.cleanup_ai_adapters_for_session(&session_id);
                     return Err(ProviderLaunchError::ProcessFenceMismatch);
                 }
             };
@@ -2561,12 +3017,14 @@ impl ProcessManager {
                     != request.launch_spec().executable().canonical_path()
             {
                 let _ = session.close_managed_process_exact(&fence, false);
+                self.cleanup_ai_adapters_for_session(&session_id);
                 return Err(ProviderLaunchError::ProcessFenceMismatch);
             }
             if let Ok(mut sessions) = self.inner.sessions.lock() {
                 sessions.insert(session_id.clone(), Arc::new(session));
             } else {
                 let _ = session.close_managed_process_exact(&fence, false);
+                self.cleanup_ai_adapters_for_session(&session_id);
                 return Err(ProviderLaunchError::SpawnFailed);
             }
             if self
@@ -2579,6 +3037,7 @@ impl ProcessManager {
                         ProviderLiveSession {
                             session_id: session_id.clone(),
                             fence: fence.clone(),
+                            correlation: request.correlation(),
                             task_id: request.correlation().task_id(),
                             agent_session_id: request.correlation().agent_session_id(),
                             provider_kind: request.provider_kind(),
@@ -2590,6 +3049,13 @@ impl ProcessManager {
                                     None
                                 }
                             },
+                            provider_identity_confirmed: false,
+                            provider_identity_acceptance_started: false,
+                            exit_reported: false,
+                            settlement_kind: ProviderSettlementKind::ObserveExit,
+                            settlement_failures: 0,
+                            next_settlement_attempt: None,
+                            failure_reported: false,
                         },
                     );
                 })
@@ -2602,7 +3068,11 @@ impl ProcessManager {
                     fence.root().id().pid(),
                     true,
                 );
+                self.cleanup_ai_adapters_for_session(&session_id);
                 return Err(ProviderLaunchError::BridgeUnavailable);
+            }
+            if provider_terminal_has_exited(&self.inner, &session_id) {
+                reconcile_one_provider_terminal_exit(&self.inner, &session_id);
             }
             Ok(ProviderManagedProcessPermit::from_registry(
                 fence,
@@ -2652,6 +3122,7 @@ impl ProcessManager {
                 true,
             )
             .map_err(|_| ProviderLaunchError::StopFailed)?;
+            self.cleanup_ai_adapters_for_session(&live.session_id);
             if let Ok(mut book) = self.inner.provider_runtime.lock() {
                 book.live.remove(&key);
             }
@@ -2762,8 +3233,6 @@ impl ProcessManager {
         use crate::process::registry::{
             ProviderManagedProcessPermit, RegistryIssuedTerminalOwnership,
         };
-        use crate::providers::session::ProviderLaunchError;
-
         let key = crate::providers::session::RecoveryKey::from_state(state);
         if let Ok(mut book) = self.inner.provider_runtime.lock() {
             if let Some(lease) = book.recovery.remove(&key) {
@@ -2785,12 +3254,136 @@ impl ProcessManager {
         Ok(None)
     }
 
+    pub(crate) fn recover_sealed_provider_runtime_verified_absence(
+        &self,
+        state: &crate::providers::session::ProviderSessionState,
+    ) -> Result<
+        Option<crate::providers::session::ProviderRecoveryZeroSettlement>,
+        crate::providers::session::ProviderLaunchError,
+    > {
+        use crate::process::sampler::ExactProcessIdentityStatus;
+        use crate::providers::session::{ProviderLaunchError, ProviderRecoveryZeroSettlement};
+
+        #[cfg(not(windows))]
+        {
+            let _ = state;
+            return Err(ProviderLaunchError::Unsupported);
+        }
+        #[cfg(windows)]
+        {
+            let key = crate::providers::session::RecoveryKey::from_state(state);
+            let live_key = (state.launch_spec().resource_id(), state.generation());
+            let book = self
+                .inner
+                .provider_runtime
+                .lock()
+                .map_err(|_| ProviderLaunchError::BridgeUnavailable)?;
+            if book.recovery.contains_key(&key) || book.live.contains_key(&live_key) {
+                return Ok(None);
+            }
+            drop(book);
+
+            let Some((process_id, executable)) = state.process_root_identity_parts() else {
+                return Ok(None);
+            };
+            let expected =
+                crate::process::identity::ManagedProcessIdentity::new(process_id, executable)
+                    .map_err(|_| ProviderLaunchError::BridgeUnavailable)?;
+            match ProcessSampler::observe_exact_process_identity(&expected) {
+                ExactProcessIdentityStatus::Absent | ExactProcessIdentityStatus::Different => Ok(
+                    Some(ProviderRecoveryZeroSettlement::from_verified_absence(state)),
+                ),
+                ExactProcessIdentityStatus::Present => Ok(None),
+                ExactProcessIdentityStatus::Inaccessible => {
+                    Err(ProviderLaunchError::BridgeUnavailable)
+                }
+            }
+        }
+    }
+
+    pub(crate) fn write_sealed_provider_action(
+        &self,
+        fence: &ManagedProcessFence,
+        identity: &crate::providers::input::ProviderInputDeliveryIdentity,
+        action: &crate::domain::provider_input::ProviderInputAction,
+        logical_bytes: &[u8],
+    ) -> Result<(), crate::providers::input::ProviderInputDeliveryError> {
+        use crate::providers::input::{provider_composer_submit_plan, ProviderInputDeliveryError};
+
+        let expected = crate::providers::input::provider_input_action_bytes(action)
+            .map_err(|_| ProviderInputDeliveryError::BytesMismatch)?;
+        if expected.as_slice() != logical_bytes {
+            return Err(ProviderInputDeliveryError::BytesMismatch);
+        }
+        let plan = provider_composer_submit_plan(identity.provider_kind, action)?;
+
+        let key = (
+            fence.resource().resource_id,
+            fence.resource().runtime_generation,
+        );
+        let live = self
+            .inner
+            .provider_runtime
+            .lock()
+            .ok()
+            .and_then(|book| book.live.get(&key).cloned())
+            .ok_or(ProviderInputDeliveryError::SessionNotBound)?;
+        if live.fence != *fence {
+            return Err(ProviderInputDeliveryError::StaleFence);
+        }
+        if live.provider_session_id != identity.provider_session_id
+            || identity.agent_session_id != live.agent_session_id
+            || identity.task_id != live.task_id
+            || identity.provider_kind != live.provider_kind
+            || identity.runtime_generation != fence.resource().runtime_generation
+        {
+            return Err(ProviderInputDeliveryError::ProviderMismatch);
+        }
+        let session = self
+            .get_session(&live.session_id)
+            .map_err(|_| ProviderInputDeliveryError::SessionNotBound)?;
+        #[cfg(windows)]
+        {
+            let current = session
+                .managed_process_fence()
+                .map_err(|_| ProviderInputDeliveryError::SessionNotBound)?
+                .ok_or(ProviderInputDeliveryError::SessionNotBound)?;
+            if current != *fence {
+                return Err(ProviderInputDeliveryError::StaleFence);
+            }
+        }
+
+        // Delays run only between physical writes and never while holding the
+        // ProcessManager provider_runtime lock (released above after clone).
+        let mut crossed_boundary = false;
+        for step in plan.steps() {
+            match session.write_provider_bytes(step.bytes()) {
+                Ok(()) => {
+                    crossed_boundary = true;
+                    if let Some(delay) = step.delay_after() {
+                        std::thread::sleep(delay);
+                    }
+                }
+                Err(_) => {
+                    return Err(if crossed_boundary {
+                        ProviderInputDeliveryError::PostBoundaryFailure
+                    } else {
+                        ProviderInputDeliveryError::RuntimeAuthorityAbsent
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn write_sealed_provider_bytes(
         &self,
         fence: &ManagedProcessFence,
         identity: &crate::providers::input::ProviderInputDeliveryIdentity,
         bytes: &[u8],
     ) -> Result<(), crate::providers::input::ProviderInputDeliveryError> {
+        // Legacy raw-byte entry point retained for transitional callers. Prefer
+        // write_sealed_provider_action so submit is a distinct physical write.
         use crate::providers::input::ProviderInputDeliveryError;
 
         let key = (
@@ -2807,7 +3400,7 @@ impl ProcessManager {
         if live.fence != *fence {
             return Err(ProviderInputDeliveryError::StaleFence);
         }
-        if live.provider_session_id.as_ref() != Some(&identity.provider_session_id)
+        if live.provider_session_id != identity.provider_session_id
             || identity.agent_session_id != live.agent_session_id
             || identity.task_id != live.task_id
             || identity.provider_kind != live.provider_kind
@@ -2847,7 +3440,7 @@ impl ProcessManager {
             live.task_id == identity.task_id
                 && live.agent_session_id == identity.agent_session_id
                 && live.provider_kind == identity.provider_kind
-                && live.provider_session_id.as_ref() == Some(&identity.provider_session_id)
+                && live.provider_session_id == identity.provider_session_id
                 && live.fence.resource().runtime_generation == identity.runtime_generation
         }) else {
             return Err(ProviderInputDeliveryError::SessionNotBound);
@@ -3235,10 +3828,11 @@ impl ProcessManager {
             &session_id,
             tab.browser_workspace.clone().unwrap_or_default(),
         );
-        self.prepare_claude_launch_for_session(
+        self.prepare_claude_launch_for_session_with_provider_session_id(
             &mut launch,
             &session_id,
             &self.inner.claude_hook_temp_root,
+            tab.provider_session_id.as_deref(),
         );
 
         let _ = app_state.update_ai_tab_session(&tab.id, session_id.clone());
@@ -3353,10 +3947,11 @@ impl ProcessManager {
             &session_id,
             tab.browser_workspace.clone().unwrap_or_default(),
         );
-        self.prepare_claude_launch_for_session(
+        self.prepare_claude_launch_for_session_with_provider_session_id(
             &mut launch,
             &session_id,
             &self.inner.claude_hook_temp_root,
+            tab.provider_session_id.as_deref(),
         );
 
         let _ = app_state.update_ai_tab_session(&tab.id, session_id.clone());
@@ -4616,6 +5211,7 @@ fn spawn_background_tasks(inner: Weak<ProcessManagerInner>) -> thread::JoinHandl
 
             refresh_resource_snapshots(&inner, &mut system);
             reconcile_ai_activity(&inner);
+            reconcile_provider_terminal_exits(&inner);
             handle_auto_restart(&inner);
             reconcile_exit_states(&inner);
 
@@ -6459,6 +7055,49 @@ struct TerminalAuthorityIssuer {
     state: Mutex<TerminalAuthorityState>,
 }
 
+fn cleanup_claude_hook_session_inner(inner: &ProcessManagerInner, session_id: &str) {
+    fence_and_remove_claude_hook_session(inner, session_id, None);
+}
+
+fn cleanup_codex_adapter_session_inner(inner: &ProcessManagerInner, session_id: &str) {
+    let removed = inner
+        .codex_adapter_registry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove_session(session_id);
+    let removed_identity = removed
+        .as_ref()
+        .and_then(|session| session.registered_semantic_identity(session_id));
+    let relay_nonce = removed.as_ref().and_then(|session| match session {
+        CodexAdapterSession::Running { registration, .. } => Some(registration.nonce.clone()),
+        CodexAdapterSession::Pending(_) | CodexAdapterSession::Degraded(_) => None,
+    });
+    drop(removed);
+    if let Some(nonce) = relay_nonce {
+        inner.codex_hook_registry.unregister(&nonce);
+    }
+    if let Some(identity) = removed_identity {
+        emit_remote_session_event(inner, RemoteSessionEvent::CodexAdapterRemoved { identity });
+    }
+}
+
+fn cleanup_browser_provider_session_inner(inner: &ProcessManagerInner, session_id: &str) {
+    let removed = inner
+        .browser_provider_sessions
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(session_id);
+    if let Some(removed) = removed {
+        removed.registrar.revoke(&removed.registration);
+    }
+}
+
+fn cleanup_ai_adapters_for_session_inner(inner: &ProcessManagerInner, session_id: &str) {
+    cleanup_claude_hook_session_inner(inner, session_id);
+    cleanup_codex_adapter_session_inner(inner, session_id);
+    cleanup_browser_provider_session_inner(inner, session_id);
+}
+
 #[derive(Debug, Default)]
 struct ProviderRuntimeBook {
     live: HashMap<(ResourceId, u64), ProviderLiveSession>,
@@ -6466,16 +7105,199 @@ struct ProviderRuntimeBook {
         crate::providers::session::RecoveryKey,
         crate::process::registry::ProviderManagedProcessPermit,
     >,
+    failures: VecDeque<ProviderSessionFailure>,
+    latched_exact_resume_failures: HashMap<(ResourceId, u64), CodexExactResumeLaunchBinding>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderSettlementKind {
+    ObserveExit,
+    AbortRejectedSessionStart,
 }
 
 #[derive(Debug, Clone)]
 struct ProviderLiveSession {
     session_id: String,
     fence: ManagedProcessFence,
+    correlation: crate::providers::session::RuntimeCorrelation,
     task_id: TaskId,
     agent_session_id: crate::domain::AgentSessionId,
     provider_kind: ProviderKind,
     provider_session_id: Option<crate::domain::ProviderSessionId>,
+    /// Launch-time resume intent is not live identity proof. Only the
+    /// authenticated current-generation SessionStart hook confirms it.
+    provider_identity_confirmed: bool,
+    /// Owns the one-shot durable SessionStart transaction. A duplicate hook or
+    /// post-launch reconciliation may observe this claim but must not consume
+    /// the authenticated provenance a second time.
+    provider_identity_acceptance_started: bool,
+    /// Claimed before exit settlement so notifier/background races cannot
+    /// report the same provider terminal exit twice.
+    exit_reported: bool,
+    settlement_kind: ProviderSettlementKind,
+    settlement_failures: u32,
+    next_settlement_attempt: Option<Instant>,
+    failure_reported: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProviderSessionBinding {
+    pub task_id: TaskId,
+    pub agent_session_id: crate::domain::AgentSessionId,
+    pub resource_id: ResourceId,
+    pub provider_kind: ProviderKind,
+    pub provider_session_id: crate::domain::ProviderSessionId,
+    pub runtime_generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProviderSessionFailure {
+    pub task_id: TaskId,
+    pub agent_session_id: crate::domain::AgentSessionId,
+    pub provider_kind: ProviderKind,
+    pub failure: crate::providers::session::ExactResumeFailure,
+}
+
+fn queue_provider_session_failure(inner: &ProcessManagerInner, failure: ProviderSessionFailure) {
+    if let Ok(mut book) = inner.provider_runtime.lock() {
+        if book.failures.len() >= MAX_PROVIDER_SESSION_FAILURES {
+            book.failures.pop_front();
+        }
+        book.failures.push_back(failure);
+    }
+}
+
+fn provider_exit_retry_delay(failures: u32) -> Duration {
+    let exponent = failures.saturating_sub(1).min(7);
+    (PROVIDER_EXIT_RETRY_INITIAL * (1_u32 << exponent)).min(PROVIDER_EXIT_RETRY_MAX)
+}
+
+fn reconcile_provider_terminal_exits(inner: &Arc<ProcessManagerInner>) {
+    let now = Instant::now();
+    let candidates = inner
+        .provider_runtime
+        .lock()
+        .map(|book| {
+            book.live
+                .values()
+                .filter(|live| {
+                    !live.exit_reported
+                        && live
+                            .next_settlement_attempt
+                            .is_none_or(|deadline| deadline <= now)
+                })
+                .map(|live| live.session_id.clone())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    for session_id in candidates {
+        if provider_terminal_has_exited(inner, &session_id) {
+            reconcile_one_provider_terminal_exit(inner, &session_id);
+        }
+    }
+}
+
+fn provider_terminal_has_exited(inner: &ProcessManagerInner, session_id: &str) -> bool {
+    inner
+        .runtime_state
+        .read()
+        .ok()
+        .and_then(|runtime| {
+            runtime
+                .sessions
+                .get(session_id)
+                .map(|state| !state.status.is_live())
+        })
+        .unwrap_or(true)
+}
+
+fn reconcile_one_provider_terminal_exit(inner: &ProcessManagerInner, session_id: &str) {
+    let live = {
+        let Ok(mut book) = inner.provider_runtime.lock() else {
+            return;
+        };
+        let Some(live) = book
+            .live
+            .values_mut()
+            .find(|live| live.session_id == session_id && !live.exit_reported)
+        else {
+            return;
+        };
+        live.exit_reported = true;
+        live.provider_identity_confirmed = false;
+        live.provider_identity_acceptance_started = matches!(
+            live.settlement_kind,
+            ProviderSettlementKind::AbortRejectedSessionStart
+        );
+        live.next_settlement_attempt = None;
+        live.clone()
+    };
+
+    let settlement = inner
+        .provider_sessions
+        .lock()
+        .map_err(|_| "provider session manager lock poisoned".to_string())
+        .and_then(|mut slot| {
+            let manager = slot
+                .as_mut()
+                .ok_or_else(|| "provider session manager is unavailable".to_string())?;
+            match live.settlement_kind {
+                ProviderSettlementKind::ObserveExit => manager
+                    .process_exited(live.correlation)
+                    .map_err(|error| error.to_string()),
+                ProviderSettlementKind::AbortRejectedSessionStart => manager
+                    .close_agent_session(live.agent_session_id)
+                    .map_err(|error| error.to_string()),
+            }
+        });
+    if let Err(error) = settlement {
+        let mut attempt = 0;
+        if let Ok(mut book) = inner.provider_runtime.lock() {
+            if let Some(current) = book.live.values_mut().find(|current| {
+                current.session_id == live.session_id && current.correlation == live.correlation
+            }) {
+                current.settlement_failures = current.settlement_failures.saturating_add(1);
+                attempt = current.settlement_failures;
+                current.next_settlement_attempt =
+                    Some(Instant::now() + provider_exit_retry_delay(attempt));
+                current.exit_reported = false;
+            }
+        }
+        if attempt <= 1 || attempt.is_power_of_two() {
+            eprintln!("provider terminal exit settlement deferred (attempt {attempt}): {error}");
+        }
+        return;
+    }
+
+    if !live.failure_reported {
+        queue_provider_session_failure(
+            inner,
+            ProviderSessionFailure {
+                task_id: live.task_id,
+                agent_session_id: live.agent_session_id,
+                provider_kind: live.provider_kind,
+                failure: crate::providers::session::ExactResumeFailure::ProviderRejected,
+            },
+        );
+        if let Ok(mut book) = inner.provider_runtime.lock() {
+            if let Some(current) = book.live.values_mut().find(|current| {
+                current.session_id == live.session_id && current.correlation == live.correlation
+            }) {
+                current.failure_reported = true;
+            }
+        }
+    }
+}
+
+fn take_latched_codex_exact_resume_failure(
+    inner: &ProcessManagerInner,
+    key: (ResourceId, u64),
+) -> Option<CodexExactResumeLaunchBinding> {
+    inner
+        .provider_runtime
+        .lock()
+        .ok()
+        .and_then(|mut book| book.latched_exact_resume_failures.remove(&key))
 }
 
 impl TerminalAuthorityIssuer {
@@ -7786,7 +8608,7 @@ fn restore_interrupted_server_prompt(
     Ok(())
 }
 
-fn mark_remote_session_dirty(inner: &Arc<ProcessManagerInner>, session_id: &str) {
+fn mark_remote_session_dirty(inner: &ProcessManagerInner, session_id: &str) {
     if let Ok(mut dirty) = inner.remote_dirty_sessions.lock() {
         dirty.insert(session_id.to_string());
     }
@@ -7884,17 +8706,17 @@ fn emit_codex_semantic_if_current(
     }
 }
 
-#[cfg(test)]
 fn emit_codex_health_if_current(
     inner: &ProcessManagerInner,
     identity: &CodexAdapterIdentity,
     health: SemanticAdapterHealth,
 ) {
-    let registry = inner
+    let is_current = inner
         .codex_adapter_registry
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if registry.is_current(identity) {
+        .map(|registry| registry.is_current(identity))
+        .unwrap_or(false);
+    if is_current {
         emit_remote_session_event(
             inner,
             RemoteSessionEvent::AdapterHealth {
@@ -7922,14 +8744,15 @@ fn handle_codex_hook_registry_event(
                 CodexAdapterSession::Running {
                     identity,
                     registration: current,
+                    exact_resume,
                     ..
                 } if current.nonce == registration.nonce => {
-                    Some((session_id.clone(), identity.clone()))
+                    Some((session_id.clone(), identity.clone(), exact_resume.clone()))
                 }
                 _ => None,
             })
     };
-    let Some((session_id, identity)) = located else {
+    let Some((session_id, identity, exact_resume)) = located else {
         return;
     };
     match event {
@@ -7939,6 +8762,95 @@ fn handle_codex_hook_registry_event(
         CodexRegistryEvent::SessionStarted(binding) => {
             handle_codex_session_started(inner, &session_id, &identity, binding);
         }
+        CodexRegistryEvent::ExactResumeFailed => {
+            handle_codex_exact_resume_failed(
+                inner,
+                &session_id,
+                &identity,
+                &registration,
+                exact_resume.as_ref(),
+            );
+        }
+    }
+}
+
+fn handle_codex_exact_resume_failed(
+    inner: &Arc<ProcessManagerInner>,
+    session_id: &str,
+    identity: &CodexAdapterIdentity,
+    registration: &CodexHookRegistration,
+    exact_resume: Option<&CodexExactResumeLaunchBinding>,
+) {
+    // The adapter entry may already have been replaced after the event was
+    // located. Retire the event's exact relay capability independently; the
+    // identity-fenced cleanup below must never remove the replacement.
+    inner.codex_hook_registry.unregister(&registration.nonce);
+    emit_codex_health_if_current(inner, identity, SemanticAdapterHealth::Degraded);
+    if !cleanup_codex_adapter_session_if_matches(inner, session_id, identity) {
+        return;
+    }
+
+    let live = exact_resume.and_then(|binding| {
+        inner.provider_runtime.lock().ok().and_then(|mut book| {
+            let live = book
+                .live
+                .get(&binding.key())
+                .filter(|live| live.session_id == session_id && binding.matches_live(live))
+                .cloned();
+            if live.is_none() {
+                book.latched_exact_resume_failures
+                    .insert(binding.key(), binding.clone());
+            }
+            live
+        })
+    });
+
+    let settlement_error = live.as_ref().and_then(|live| {
+        if arm_provider_abort(inner, live) {
+            queue_provider_session_failure(
+                inner,
+                ProviderSessionFailure {
+                    task_id: live.task_id,
+                    agent_session_id: live.agent_session_id,
+                    provider_kind: live.provider_kind,
+                    failure: crate::providers::session::ExactResumeFailure::ProviderRejected,
+                },
+            );
+        }
+        reconcile_one_provider_terminal_exit(inner, &live.session_id);
+        inner.provider_runtime.lock().ok().and_then(|book| {
+            book.live
+                .values()
+                .any(|current| current.correlation == live.correlation)
+                .then_some("exact runtime teardown is armed for bounded retry".to_string())
+        })
+    });
+
+    let mut changed = false;
+    if let Ok(mut runtime) = inner.runtime_state.write() {
+        if let Some(session) = runtime.sessions.get_mut(session_id) {
+            session.status = SessionStatus::Failed;
+            session.exit = Some(SessionExitState {
+                code: None,
+                signal: None,
+                closed_by_user: false,
+                summary: settlement_error.map_or_else(
+                    || "Exact provider resume failed: ProviderRejected".to_string(),
+                    |error| {
+                        format!(
+                            "Exact provider resume failed: ProviderRejected; teardown remains retryable: {error}"
+                        )
+                    },
+                ),
+            });
+            session.mark_dirty();
+            changed = true;
+        }
+    }
+    if changed {
+        bump_runtime_revision(inner);
+        mark_remote_session_dirty(inner, session_id);
+        emit_tracked_remote_runtime_snapshot(inner, session_id);
     }
 }
 
@@ -7982,6 +8894,72 @@ fn handle_codex_session_started(
     }
 }
 
+fn arm_provider_abort(inner: &ProcessManagerInner, live: &ProviderLiveSession) -> bool {
+    inner
+        .provider_runtime
+        .lock()
+        .map(|mut book| {
+            let Some(current) = book.live.values_mut().find(|current| {
+                current.session_id == live.session_id && current.correlation == live.correlation
+            }) else {
+                return !live.failure_reported;
+            };
+            current.provider_identity_confirmed = false;
+            current.settlement_kind = ProviderSettlementKind::AbortRejectedSessionStart;
+            current.settlement_failures = 0;
+            current.next_settlement_attempt = None;
+            current.exit_reported = false;
+            let should_report = !current.failure_reported;
+            current.failure_reported = true;
+            should_report
+        })
+        .unwrap_or(!live.failure_reported)
+}
+
+fn fail_provider_session_start(
+    inner: &ProcessManagerInner,
+    live: &ProviderLiveSession,
+    error: &str,
+) {
+    cleanup_ai_adapters_for_session_inner(inner, &live.session_id);
+    let should_report = arm_provider_abort(inner, live);
+    if should_report {
+        queue_provider_session_failure(
+            inner,
+            ProviderSessionFailure {
+                task_id: live.task_id,
+                agent_session_id: live.agent_session_id,
+                provider_kind: live.provider_kind,
+                failure: crate::providers::session::ExactResumeFailure::ProviderRejected,
+            },
+        );
+    }
+    reconcile_one_provider_terminal_exit(inner, &live.session_id);
+
+    let mut changed = false;
+    if let Ok(mut runtime) = inner.runtime_state.write() {
+        if let Some(session) = runtime.sessions.get_mut(&live.session_id) {
+            session.status = SessionStatus::Failed;
+            session.provider_session_id = None;
+            session.exit = Some(SessionExitState {
+                code: None,
+                signal: None,
+                closed_by_user: false,
+                summary: "Provider conversation identity could not be persisted; the exact runtime was stopped and no fresh conversation was substituted."
+                    .to_string(),
+            });
+            session.mark_dirty();
+            changed = true;
+        }
+    }
+    if changed {
+        bump_runtime_revision(inner);
+        mark_remote_session_dirty(inner, &live.session_id);
+        emit_tracked_remote_runtime_snapshot(inner, &live.session_id);
+    }
+    eprintln!("provider SessionStart persistence failed; exact runtime rejected: {error}");
+}
+
 fn bind_runtime_provider_session_id(
     inner: &ProcessManagerInner,
     pty_session_id: &str,
@@ -7992,21 +8970,87 @@ fn bind_runtime_provider_session_id(
     else {
         return;
     };
+    bind_runtime_provider_session_id_inner(inner, pty_session_id, provider_session_id, true);
+}
+
+fn bind_runtime_provider_session_id_inner(
+    inner: &ProcessManagerInner,
+    pty_session_id: &str,
+    provider_session_id: crate::domain::ProviderSessionId,
+    allow_live_recheck: bool,
+) {
     // SessionStart is write-once for a live PTY generation. The registry is
     // the primary fence, but keep this ProcessManager projection fail-closed
     // as well so a late adapter callback can never rebind a running session to
     // a different conversation identity.
-    {
-        let Ok(book) = inner.provider_runtime.lock() else {
-            return;
-        };
-        if book.live.values().any(|live| {
-            live.session_id == pty_session_id
-                && live
+    let (live, conflict) = {
+        let mut book = inner
+            .provider_runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match book
+            .live
+            .values()
+            .find(|live| live.session_id == pty_session_id)
+            .cloned()
+        {
+            None => (None, None),
+            Some(current)
+                if current
                     .provider_session_id
                     .as_ref()
-                    .is_some_and(|bound| bound != &provider_session_id)
-        }) {
+                    .is_some_and(|bound| bound != &provider_session_id) =>
+            {
+                (None, Some(current))
+            }
+            Some(current)
+                if current.provider_identity_confirmed
+                    || current.provider_identity_acceptance_started =>
+            {
+                return;
+            }
+            Some(current) => {
+                let claimed = book
+                    .live
+                    .values_mut()
+                    .find(|live| {
+                        live.session_id == pty_session_id && live.correlation == current.correlation
+                    })
+                    .expect("live provider claim remains present");
+                claimed.provider_session_id = Some(provider_session_id.clone());
+                claimed.provider_identity_acceptance_started = true;
+                (Some(claimed.clone()), None)
+            }
+        }
+    };
+    if let Some(conflict) = conflict.as_ref() {
+        fail_provider_session_start(
+            inner,
+            conflict,
+            "authenticated SessionStart conflicts with the exact live provider identity",
+        );
+        return;
+    }
+    if let Some(live) = live.as_ref() {
+        let acceptance = inner
+            .provider_sessions
+            .lock()
+            .map_err(|_| "provider session manager lock poisoned".to_string())
+            .and_then(|mut managers| {
+                let manager = managers
+                    .as_mut()
+                    .ok_or_else(|| "provider session manager is unavailable".to_string())?;
+                let provenance = crate::providers::session::ProviderSessionStartProvenance::from_authenticated_hook(
+                    live.correlation,
+                    provider_session_id.clone(),
+                );
+                manager
+                    .accept_provider_session_start(provenance)
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            });
+        if let Err(error) = acceptance {
+            fail_provider_session_start(inner, live, &error);
             return;
         }
     }
@@ -8035,16 +9079,50 @@ fn bind_runtime_provider_session_id(
             true
         }
     };
-    if let Ok(mut book) = inner.provider_runtime.lock() {
-        for live in book.live.values_mut() {
-            if live.session_id == pty_session_id {
-                live.provider_session_id = Some(provider_session_id.clone());
-            }
+    if let (Some(accepted), Ok(mut book)) = (live.as_ref(), inner.provider_runtime.lock()) {
+        if let Some(current) = book.live.values_mut().find(|current| {
+            current.session_id == pty_session_id && current.correlation == accepted.correlation
+        }) {
+            current.provider_session_id = Some(provider_session_id.clone());
+            current.provider_identity_confirmed = true;
+            current.provider_identity_acceptance_started = false;
         }
     }
     if changed {
         bump_runtime_revision(inner);
         emit_tracked_remote_runtime_snapshot(inner, pty_session_id);
+    }
+    if live.is_none() && allow_live_recheck {
+        bind_runtime_provider_session_id_inner(inner, pty_session_id, provider_session_id, false);
+    }
+}
+
+fn reconcile_provider_session_start_after_launch(
+    inner: &ProcessManagerInner,
+    correlation: crate::providers::session::RuntimeCorrelation,
+) {
+    let session_id = {
+        let book = inner
+            .provider_runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        book.live
+            .values()
+            .find(|live| live.correlation == correlation && !live.provider_identity_confirmed)
+            .map(|live| live.session_id.clone())
+    };
+    let Some(session_id) = session_id else {
+        return;
+    };
+    let provider_session_id = inner.runtime_state.read().ok().and_then(|runtime| {
+        runtime
+            .sessions
+            .get(&session_id)?
+            .provider_session_id
+            .clone()
+    });
+    if let Some(provider_session_id) = provider_session_id {
+        bind_runtime_provider_session_id(inner, &session_id, provider_session_id);
     }
 }
 
@@ -8099,10 +9177,17 @@ fn cleanup_codex_adapter_session_if_matches(
             .flatten()
     };
     let was_removed = removed.is_some();
+    let relay_nonce = removed.as_ref().and_then(|session| match session {
+        CodexAdapterSession::Running { registration, .. } => Some(registration.nonce.clone()),
+        CodexAdapterSession::Pending(_) | CodexAdapterSession::Degraded(_) => None,
+    });
     let removed_identity = removed
         .as_ref()
         .and_then(|session| session.registered_semantic_identity(session_id));
     drop(removed);
+    if let Some(nonce) = relay_nonce {
+        inner.codex_hook_registry.unregister(&nonce);
+    }
     if let Some(identity) = removed_identity {
         emit_remote_session_event(inner, RemoteSessionEvent::CodexAdapterRemoved { identity });
     }
@@ -8186,6 +9271,7 @@ fn session_change_notifier_with_attachment_binding(
             })
             .unwrap_or(true);
         if terminal_exited {
+            reconcile_one_provider_terminal_exit(&inner, &session_id);
             unbind_attachment_if_matches(&inner, attachment_binding.as_ref());
             if let Some(registration) = claude_registration.as_ref() {
                 cleanup_claude_hook_session_if_matches(&inner, &session_id, registration);
@@ -9104,9 +10190,32 @@ fn classify_post_launch_listener_settlement_against_job(
     listeners: &[crate::process::ports::ListenerIdentity],
     job_members: &[JobMemberObservation],
 ) -> PostLaunchListenerSettlement {
-    classify_post_launch_listener_settlement(listeners, |listener| {
-        listener_owned_by_current_job_member(listener, job_members)
-    })
+    if listeners.is_empty() {
+        return PostLaunchListenerSettlement::Pending;
+    }
+    let mut saw_unverified = false;
+    for listener in listeners {
+        if listener_owned_by_current_job_member(listener, job_members) {
+            continue;
+        }
+        if !listener.has_executable_proof()
+            || job_members.iter().any(|member| match member {
+                JobMemberObservation::Accessible { identity } => {
+                    identity.id().pid() == listener.pid()
+                }
+                JobMemberObservation::Inaccessible { pid, .. } => *pid == listener.pid(),
+            })
+        {
+            saw_unverified = true;
+            continue;
+        }
+        return PostLaunchListenerSettlement::Foreign;
+    }
+    if saw_unverified {
+        PostLaunchListenerSettlement::Unverified
+    } else {
+        PostLaunchListenerSettlement::Owned
+    }
 }
 
 /// Resolve one listener snapshot against the exact current Job query. A query
@@ -10167,6 +11276,698 @@ mod tests {
         assert_eq!(manager.runtime_revision(), after_codex);
     }
 
+    #[test]
+    fn provider_session_binding_keeps_the_exact_runtime_resource() {
+        let manager = ProcessManager::new();
+        let task_id = TaskId::new();
+        let agent_session_id = crate::domain::AgentSessionId::new();
+        manager.ensure_runtime_entry(
+            "provider-runtime",
+            std::env::current_dir().unwrap(),
+            SessionDimensions::default(),
+        );
+        manager.update_session_state("provider-runtime", |state| {
+            state.status = SessionStatus::Running;
+        });
+        let fence = sealed_fence_issuer::issue(0x44, 9, ProcessOwner::Task(task_id), 42, 7);
+        let resource_id = fence.resource().resource_id;
+        manager
+            .inner
+            .provider_runtime
+            .lock()
+            .expect("provider runtime book")
+            .live
+            .insert(
+                (resource_id, 9),
+                ProviderLiveSession {
+                    session_id: "provider-runtime".into(),
+                    fence,
+                    correlation: crate::providers::session::RuntimeCorrelation::sealed(
+                        task_id,
+                        agent_session_id,
+                        ProviderKind::Codex,
+                        9,
+                        7,
+                        crate::providers::session::LaunchNonce::new(),
+                    ),
+                    task_id,
+                    agent_session_id,
+                    provider_kind: ProviderKind::Codex,
+                    provider_session_id: Some(
+                        crate::domain::ProviderSessionId::new("codex-runtime-session")
+                            .expect("provider session"),
+                    ),
+                    provider_identity_confirmed: false,
+                    provider_identity_acceptance_started: false,
+                    exit_reported: false,
+                    settlement_kind: ProviderSettlementKind::ObserveExit,
+                    settlement_failures: 0,
+                    next_settlement_attempt: None,
+                    failure_reported: false,
+                },
+            );
+
+        assert!(manager.provider_session_bindings().is_empty());
+        manager
+            .inner
+            .provider_runtime
+            .lock()
+            .expect("provider runtime book")
+            .live
+            .get_mut(&(resource_id, 9))
+            .expect("live provider")
+            .provider_identity_confirmed = true;
+        assert_eq!(
+            manager.provider_session_bindings(),
+            vec![ProviderSessionBinding {
+                task_id,
+                agent_session_id,
+                resource_id,
+                provider_kind: ProviderKind::Codex,
+                provider_session_id: crate::domain::ProviderSessionId::new("codex-runtime-session")
+                    .expect("provider session"),
+                runtime_generation: 9,
+            }]
+        );
+    }
+
+    #[test]
+    fn duplicate_confirmed_provider_session_start_is_idempotent() {
+        let manager = ProcessManager::new();
+        let task_id = TaskId::new();
+        let agent_session_id = AgentSessionId::new();
+        let session_id = "duplicate-confirmed-session-start";
+        let provider_session_id =
+            crate::domain::ProviderSessionId::new("confirmed-provider-session")
+                .expect("provider session");
+        manager.ensure_runtime_entry(
+            session_id,
+            std::env::current_dir().unwrap(),
+            SessionDimensions::default(),
+        );
+        manager.update_session_state(session_id, |state| {
+            state.status = SessionStatus::Running;
+            state.provider_session_id = Some(provider_session_id.as_str().to_owned());
+        });
+        let fence = sealed_fence_issuer::issue(0x47, 1, ProcessOwner::Task(task_id), 45, 10);
+        let resource_id = fence.resource().resource_id;
+        let correlation = crate::providers::session::RuntimeCorrelation::sealed(
+            task_id,
+            agent_session_id,
+            ProviderKind::ClaudeCode,
+            1,
+            1,
+            crate::providers::session::LaunchNonce::new(),
+        );
+        manager.inner.provider_runtime.lock().unwrap().live.insert(
+            (resource_id, 1),
+            ProviderLiveSession {
+                session_id: session_id.to_string(),
+                fence,
+                correlation,
+                task_id,
+                agent_session_id,
+                provider_kind: ProviderKind::ClaudeCode,
+                provider_session_id: Some(provider_session_id.clone()),
+                provider_identity_confirmed: true,
+                provider_identity_acceptance_started: false,
+                exit_reported: false,
+                settlement_kind: ProviderSettlementKind::ObserveExit,
+                settlement_failures: 0,
+                next_settlement_attempt: None,
+                failure_reported: false,
+            },
+        );
+        let revision_before_duplicate = manager.runtime_revision();
+
+        bind_runtime_provider_session_id(
+            &manager.inner,
+            session_id,
+            provider_session_id.as_str().to_owned(),
+        );
+
+        let runtime = manager.runtime_state();
+        let session = runtime
+            .sessions
+            .get(session_id)
+            .expect("confirmed runtime remains visible");
+        assert_eq!(session.status, SessionStatus::Running);
+        assert_eq!(
+            session.provider_session_id.as_deref(),
+            Some(provider_session_id.as_str())
+        );
+        assert_eq!(manager.runtime_revision(), revision_before_duplicate);
+        assert!(manager.drain_provider_session_failures().is_empty());
+        let book = manager.inner.provider_runtime.lock().unwrap();
+        let live = book.live.get(&(resource_id, 1)).expect("live provider");
+        assert!(live.provider_identity_confirmed);
+        assert!(!live.exit_reported);
+    }
+
+    #[test]
+    fn early_provider_session_start_is_reconciled_after_live_publication() {
+        let manager = ProcessManager::new();
+        let task_id = TaskId::new();
+        let agent_session_id = AgentSessionId::new();
+        let session_id = "early-session-start";
+        let provider_session_id = crate::domain::ProviderSessionId::new("early-provider-session")
+            .expect("provider session");
+        manager.ensure_runtime_entry(
+            session_id,
+            std::env::current_dir().unwrap(),
+            SessionDimensions::default(),
+        );
+        manager.update_session_state(session_id, |state| {
+            state.status = SessionStatus::Running;
+        });
+
+        bind_runtime_provider_session_id(
+            &manager.inner,
+            session_id,
+            provider_session_id.as_str().to_owned(),
+        );
+        let early_runtime = manager.runtime_state();
+        assert_eq!(
+            early_runtime
+                .sessions
+                .get(session_id)
+                .and_then(|session| session.provider_session_id.as_deref()),
+            Some(provider_session_id.as_str())
+        );
+        assert!(manager.drain_provider_session_failures().is_empty());
+
+        let fence = sealed_fence_issuer::issue(0x48, 1, ProcessOwner::Task(task_id), 46, 11);
+        let resource_id = fence.resource().resource_id;
+        let correlation = crate::providers::session::RuntimeCorrelation::sealed(
+            task_id,
+            agent_session_id,
+            ProviderKind::ClaudeCode,
+            1,
+            1,
+            crate::providers::session::LaunchNonce::new(),
+        );
+        manager.inner.provider_runtime.lock().unwrap().live.insert(
+            (resource_id, 1),
+            ProviderLiveSession {
+                session_id: session_id.to_string(),
+                fence,
+                correlation,
+                task_id,
+                agent_session_id,
+                provider_kind: ProviderKind::ClaudeCode,
+                provider_session_id: None,
+                provider_identity_confirmed: false,
+                provider_identity_acceptance_started: false,
+                exit_reported: false,
+                settlement_kind: ProviderSettlementKind::ObserveExit,
+                settlement_failures: 0,
+                next_settlement_attempt: None,
+                failure_reported: false,
+            },
+        );
+
+        reconcile_provider_session_start_after_launch(&manager.inner, correlation);
+
+        let runtime = manager.runtime_state();
+        let session = runtime
+            .sessions
+            .get(session_id)
+            .expect("failed exact runtime remains visible");
+        assert_eq!(session.status, SessionStatus::Failed);
+        assert_eq!(session.provider_session_id, None);
+        assert_eq!(manager.drain_provider_session_failures().len(), 1);
+        let book = manager.inner.provider_runtime.lock().unwrap();
+        let live = book.live.get(&(resource_id, 1)).expect("live provider");
+        assert!(live.provider_identity_acceptance_started);
+        assert!(!live.provider_identity_confirmed);
+    }
+
+    #[test]
+    fn provider_exit_settlement_retry_is_exponential_and_bounded() {
+        assert_eq!(provider_exit_retry_delay(1), Duration::from_millis(250));
+        assert_eq!(provider_exit_retry_delay(2), Duration::from_millis(500));
+        assert_eq!(provider_exit_retry_delay(8), Duration::from_secs(30));
+        assert_eq!(provider_exit_retry_delay(u32::MAX), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn rejected_session_start_removes_adapter_reports_failure_and_leaves_exact_retry() {
+        let manager = ProcessManager::new();
+        let task_id = TaskId::new();
+        let agent_session_id = AgentSessionId::new();
+        let session_id = "rejected-session-start";
+        let stable_session_key = StableSessionKey::from_tab(task_id.to_string());
+        let registration = manager
+            .inner
+            .codex_hook_registry
+            .register_expected(stable_session_key.clone(), None)
+            .expect("relay registration");
+        let identity = CodexAdapterIdentity {
+            stable_session_key,
+            generation: 1,
+        };
+        {
+            let mut registry = manager.inner.codex_adapter_registry.lock().unwrap();
+            registry.note_generation(&identity);
+            registry.sessions.insert(
+                session_id.to_string(),
+                CodexAdapterSession::Running {
+                    identity: identity.clone(),
+                    registration: registration.clone(),
+                    activated: false,
+                    exact_resume: None,
+                },
+            );
+        }
+        manager.ensure_runtime_entry(
+            session_id,
+            std::env::current_dir().unwrap(),
+            SessionDimensions::default(),
+        );
+        manager.update_session_state(session_id, |state| {
+            state.status = SessionStatus::Running;
+        });
+        let fence = sealed_fence_issuer::issue(0x46, 1, ProcessOwner::Task(task_id), 44, 9);
+        let resource_id = fence.resource().resource_id;
+        manager.inner.provider_runtime.lock().unwrap().live.insert(
+            (resource_id, 1),
+            ProviderLiveSession {
+                session_id: session_id.to_string(),
+                fence,
+                correlation: crate::providers::session::RuntimeCorrelation::sealed(
+                    task_id,
+                    agent_session_id,
+                    ProviderKind::Codex,
+                    1,
+                    1,
+                    crate::providers::session::LaunchNonce::new(),
+                ),
+                task_id,
+                agent_session_id,
+                provider_kind: ProviderKind::Codex,
+                provider_session_id: None,
+                provider_identity_confirmed: false,
+                provider_identity_acceptance_started: false,
+                exit_reported: false,
+                settlement_kind: ProviderSettlementKind::ObserveExit,
+                settlement_failures: 0,
+                next_settlement_attempt: None,
+                failure_reported: false,
+            },
+        );
+
+        bind_runtime_provider_session_id(
+            &manager.inner,
+            session_id,
+            "provider-conversation".to_string(),
+        );
+
+        assert!(!manager
+            .inner
+            .codex_adapter_registry
+            .lock()
+            .unwrap()
+            .sessions
+            .contains_key(session_id));
+        assert_eq!(
+            manager.inner.codex_hook_registry.ingest(
+                "127.0.0.1:9999".parse().unwrap(),
+                &registration.nonce,
+                br#"{"session_id":"late","hook_event_name":"SessionStart"}"#,
+                1,
+            ),
+            crate::ai::codex_hooks::CodexRelayIngestStatus::Rejected
+        );
+        let runtime = manager.runtime_state();
+        let failed = runtime
+            .sessions
+            .get(session_id)
+            .expect("failed runtime remains visible");
+        assert_eq!(failed.status, SessionStatus::Failed);
+        assert_eq!(failed.provider_session_id, None);
+        assert!(failed
+            .exit
+            .as_ref()
+            .is_some_and(|exit| exit.summary.contains("could not be persisted")));
+        assert_eq!(
+            manager.drain_provider_session_failures(),
+            vec![ProviderSessionFailure {
+                task_id,
+                agent_session_id,
+                provider_kind: ProviderKind::Codex,
+                failure: crate::providers::session::ExactResumeFailure::ProviderRejected,
+            }]
+        );
+        let book = manager.inner.provider_runtime.lock().unwrap();
+        let live = book
+            .live
+            .get(&(resource_id, 1))
+            .expect("exact lease remains retryable");
+        assert_eq!(
+            live.settlement_kind,
+            ProviderSettlementKind::AbortRejectedSessionStart
+        );
+        assert_eq!(live.settlement_failures, 1);
+        assert!(live.next_settlement_attempt.is_some());
+        assert!(live.failure_reported);
+        assert!(live.provider_identity_acceptance_started);
+        assert!(!live.exit_reported);
+    }
+
+    #[test]
+    fn codex_exact_resume_mismatch_fails_the_runtime_and_reports_the_task() {
+        let manager = ProcessManager::new();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let observed = events.clone();
+        manager.set_remote_session_handler(Some(Arc::new(move |event| {
+            observed.lock().unwrap().push(event);
+        })));
+        let task_id = TaskId::new();
+        let agent_session_id = crate::domain::AgentSessionId::new();
+        let stable_session_key = StableSessionKey::from_tab(task_id.to_string());
+        let expected = crate::domain::ProviderSessionId::new("expected-conversation").unwrap();
+        let fence = sealed_fence_issuer::issue(0x45, 9, ProcessOwner::Task(task_id), 43, 8);
+        let exact_resume = CodexExactResumeLaunchBinding {
+            task_id,
+            agent_session_id,
+            resource_id: fence.resource().resource_id,
+            runtime_generation: 9,
+            provider_kind: ProviderKind::Codex,
+            expected_provider_session_id: expected.clone(),
+        };
+        let registration = manager
+            .inner
+            .codex_hook_registry
+            .register_expected(stable_session_key.clone(), Some(expected.clone()))
+            .unwrap();
+        let identity = CodexAdapterIdentity {
+            stable_session_key,
+            generation: 1,
+        };
+        {
+            let mut registry = manager.inner.codex_adapter_registry.lock().unwrap();
+            registry.note_generation(&identity);
+            registry.sessions.insert(
+                "codex-exact-mismatch".to_string(),
+                CodexAdapterSession::Running {
+                    identity: identity.clone(),
+                    registration: registration.clone(),
+                    activated: false,
+                    exact_resume: Some(exact_resume),
+                },
+            );
+        }
+        manager.ensure_runtime_entry(
+            "codex-exact-mismatch",
+            std::env::current_dir().unwrap(),
+            SessionDimensions::default(),
+        );
+        manager.update_session_state("codex-exact-mismatch", |state| {
+            state.status = SessionStatus::Running;
+            state.provider_session_id = Some(expected.as_str().to_string());
+        });
+        manager.inner.provider_runtime.lock().unwrap().live.insert(
+            (fence.resource().resource_id, 9),
+            ProviderLiveSession {
+                session_id: "codex-exact-mismatch".into(),
+                fence,
+                correlation: crate::providers::session::RuntimeCorrelation::sealed(
+                    task_id,
+                    agent_session_id,
+                    ProviderKind::Codex,
+                    9,
+                    8,
+                    crate::providers::session::LaunchNonce::new(),
+                ),
+                task_id,
+                agent_session_id,
+                provider_kind: ProviderKind::Codex,
+                provider_session_id: Some(expected),
+                provider_identity_confirmed: false,
+                provider_identity_acceptance_started: false,
+                exit_reported: false,
+                settlement_kind: ProviderSettlementKind::ObserveExit,
+                settlement_failures: 0,
+                next_settlement_attempt: None,
+                failure_reported: false,
+            },
+        );
+
+        assert_eq!(
+            manager.inner.codex_hook_registry.ingest(
+                "127.0.0.1:9999".parse().unwrap(),
+                &registration.nonce,
+                &serde_json::to_vec(&serde_json::json!({
+                    "session_id": "different-conversation",
+                    "hook_event_name": "SessionStart",
+                    "cwd": "C:\\proj",
+                    "transcript_path": null
+                }))
+                .unwrap(),
+                1,
+            ),
+            crate::ai::codex_hooks::CodexRelayIngestStatus::Rejected
+        );
+        let runtime = manager.runtime_state();
+        let failed = runtime
+            .sessions
+            .get("codex-exact-mismatch")
+            .expect("failed runtime remains visible");
+        assert_eq!(failed.status, SessionStatus::Failed);
+        assert!(failed
+            .exit
+            .as_ref()
+            .is_some_and(|exit| exit.summary.contains("Exact provider resume failed")));
+        assert_eq!(
+            manager.drain_provider_session_failures(),
+            vec![ProviderSessionFailure {
+                task_id,
+                agent_session_id,
+                provider_kind: ProviderKind::Codex,
+                failure: crate::providers::session::ExactResumeFailure::ProviderRejected,
+            }]
+        );
+        assert!(!manager
+            .inner
+            .codex_adapter_registry
+            .lock()
+            .unwrap()
+            .sessions
+            .contains_key("codex-exact-mismatch"));
+        assert!(events.lock().unwrap().iter().any(|event| matches!(
+            event,
+            RemoteSessionEvent::CodexAdapterRemoved { identity: removed }
+                if removed == &codex_semantic_identity("codex-exact-mismatch", &identity)
+        )));
+        assert_eq!(
+            manager.inner.codex_hook_registry.ingest(
+                "127.0.0.1:9999".parse().unwrap(),
+                &registration.nonce,
+                br#"{"session_id":"different-conversation","hook_event_name":"Stop","cwd":"C:\\proj"}"#,
+                2,
+            ),
+            crate::ai::codex_hooks::CodexRelayIngestStatus::Rejected
+        );
+    }
+
+    #[test]
+    fn codex_exact_resume_mismatch_before_live_publication_is_latched_and_removes_adapter() {
+        let manager = ProcessManager::new();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let observed = events.clone();
+        manager.set_remote_session_handler(Some(Arc::new(move |event| {
+            observed.lock().unwrap().push(event);
+        })));
+        let task_id = TaskId::new();
+        let agent_session_id = AgentSessionId::new();
+        let expected = crate::domain::ProviderSessionId::new("expected-pre-live").unwrap();
+        let fence = sealed_fence_issuer::issue(0x46, 11, ProcessOwner::Task(task_id), 44, 9);
+        let exact_resume = CodexExactResumeLaunchBinding {
+            task_id,
+            agent_session_id,
+            resource_id: fence.resource().resource_id,
+            runtime_generation: 11,
+            provider_kind: ProviderKind::Codex,
+            expected_provider_session_id: expected.clone(),
+        };
+        let stable_session_key = StableSessionKey::from_tab(task_id.to_string());
+        let registration = manager
+            .inner
+            .codex_hook_registry
+            .register_expected(stable_session_key.clone(), Some(expected))
+            .unwrap();
+        let identity = CodexAdapterIdentity {
+            stable_session_key,
+            generation: 1,
+        };
+        {
+            let mut registry = manager.inner.codex_adapter_registry.lock().unwrap();
+            registry.note_generation(&identity);
+            registry.sessions.insert(
+                "codex-pre-live-mismatch".to_string(),
+                CodexAdapterSession::Running {
+                    identity: identity.clone(),
+                    registration: registration.clone(),
+                    activated: false,
+                    exact_resume: Some(exact_resume.clone()),
+                },
+            );
+        }
+        manager.ensure_runtime_entry(
+            "codex-pre-live-mismatch",
+            std::env::current_dir().unwrap(),
+            SessionDimensions::default(),
+        );
+        manager.update_session_state("codex-pre-live-mismatch", |state| {
+            state.status = SessionStatus::Starting;
+        });
+
+        assert_eq!(
+            manager.inner.codex_hook_registry.ingest(
+                "127.0.0.1:9999".parse().unwrap(),
+                &registration.nonce,
+                &serde_json::to_vec(&serde_json::json!({
+                    "session_id": "different-conversation",
+                    "hook_event_name": "SessionStart",
+                    "cwd": "C:\\proj",
+                    "transcript_path": null
+                }))
+                .unwrap(),
+                1,
+            ),
+            crate::ai::codex_hooks::CodexRelayIngestStatus::Rejected
+        );
+
+        assert!(!manager
+            .inner
+            .codex_adapter_registry
+            .lock()
+            .unwrap()
+            .sessions
+            .contains_key("codex-pre-live-mismatch"));
+        assert_eq!(
+            take_latched_codex_exact_resume_failure(&manager.inner, exact_resume.key()),
+            Some(exact_resume.clone())
+        );
+        queue_provider_session_failure(&manager.inner, exact_resume.task_failure());
+        assert_eq!(
+            manager.drain_provider_session_failures(),
+            vec![exact_resume.task_failure()]
+        );
+        assert!(events.lock().unwrap().iter().any(|event| matches!(
+            event,
+            RemoteSessionEvent::CodexAdapterRemoved { identity: removed }
+                if removed == &codex_semantic_identity("codex-pre-live-mismatch", &identity)
+        )));
+    }
+
+    #[test]
+    fn codex_exact_resume_failure_retires_old_nonce_without_removing_replacement() {
+        let manager = ProcessManager::new();
+        let task_id = TaskId::new();
+        let agent_session_id = AgentSessionId::new();
+        let stable_session_key = StableSessionKey::from_tab(task_id.to_string());
+        let old_expected = crate::domain::ProviderSessionId::new("old-conversation").unwrap();
+        let old_registration = manager
+            .inner
+            .codex_hook_registry
+            .register_expected(stable_session_key.clone(), Some(old_expected.clone()))
+            .unwrap();
+        let old_identity = CodexAdapterIdentity {
+            stable_session_key: stable_session_key.clone(),
+            generation: 1,
+        };
+        let old_fence = sealed_fence_issuer::issue(0x47, 12, ProcessOwner::Task(task_id), 45, 10);
+        let old_exact_resume = CodexExactResumeLaunchBinding {
+            task_id,
+            agent_session_id,
+            resource_id: old_fence.resource().resource_id,
+            runtime_generation: 12,
+            provider_kind: ProviderKind::Codex,
+            expected_provider_session_id: old_expected,
+        };
+        {
+            let mut registry = manager.inner.codex_adapter_registry.lock().unwrap();
+            registry.note_generation(&old_identity);
+            registry.sessions.insert(
+                "codex-replaced-mismatch".to_string(),
+                CodexAdapterSession::Running {
+                    identity: old_identity.clone(),
+                    registration: old_registration.clone(),
+                    activated: false,
+                    exact_resume: Some(old_exact_resume.clone()),
+                },
+            );
+        }
+
+        // The mismatch handler has already located the old identity. A newer
+        // launch now replaces that adapter before the handler can clean it up.
+        let replacement_expected =
+            crate::domain::ProviderSessionId::new("replacement-conversation").unwrap();
+        let replacement_registration = manager
+            .inner
+            .codex_hook_registry
+            .register_expected(
+                stable_session_key.clone(),
+                Some(replacement_expected.clone()),
+            )
+            .unwrap();
+        let replacement_identity = CodexAdapterIdentity {
+            stable_session_key,
+            generation: 2,
+        };
+        let replacement_fence =
+            sealed_fence_issuer::issue(0x48, 13, ProcessOwner::Task(task_id), 46, 11);
+        let replacement_exact_resume = CodexExactResumeLaunchBinding {
+            task_id,
+            agent_session_id,
+            resource_id: replacement_fence.resource().resource_id,
+            runtime_generation: 13,
+            provider_kind: ProviderKind::Codex,
+            expected_provider_session_id: replacement_expected,
+        };
+        {
+            let mut registry = manager.inner.codex_adapter_registry.lock().unwrap();
+            registry.note_generation(&replacement_identity);
+            registry.sessions.insert(
+                "codex-replaced-mismatch".to_string(),
+                CodexAdapterSession::Running {
+                    identity: replacement_identity.clone(),
+                    registration: replacement_registration.clone(),
+                    activated: false,
+                    exact_resume: Some(replacement_exact_resume),
+                },
+            );
+        }
+
+        handle_codex_exact_resume_failed(
+            &manager.inner,
+            "codex-replaced-mismatch",
+            &old_identity,
+            &old_registration,
+            Some(&old_exact_resume),
+        );
+
+        assert!(manager
+            .inner
+            .codex_adapter_registry
+            .lock()
+            .unwrap()
+            .sessions
+            .get("codex-replaced-mismatch")
+            .is_some_and(|session| session.identity() == &replacement_identity));
+        assert!(manager
+            .inner
+            .codex_hook_registry
+            .unregister(&old_registration.nonce)
+            .is_none());
+        assert!(manager
+            .inner
+            .codex_hook_registry
+            .unregister(&replacement_registration.nonce)
+            .is_some());
+    }
+
     fn browser_provider_replay_plan(
         label: &str,
         with_secret: bool,
@@ -11133,12 +12934,22 @@ mod tests {
                         }
                     )
                 });
-                let inferred = events
-                    .iter()
-                    .any(|event| matches!(event, RemoteSessionEvent::CodexSemantic { .. }));
+                let ready = events.iter().any(|event| {
+                    matches!(
+                        event,
+                        RemoteSessionEvent::CodexSemantic { draft, .. }
+                            if matches!(
+                                &draft.kind,
+                                crate::remote::presentation::SemanticEventKind::Status {
+                                    state,
+                                    ..
+                                } if state == "ready"
+                            )
+                    )
+                });
                 assert!(
-                    !inferred,
-                    "SessionStart must not publish semantic drafts from a rollout transcript"
+                    ready,
+                    "SessionStart should publish only its hook-derived ready status"
                 );
                 if healthy {
                     break;
@@ -11818,6 +13629,12 @@ mod tests {
             .registration
             .clone();
         let endpoint = manager.claude_hook_endpoint().unwrap();
+        ureq::post(&endpoint)
+            .header("x-devmanager-claude-nonce", &registration.nonce)
+            .send(
+                br#"{"hook_event_name":"SessionStart","session_id":"provider-fence","source":"startup"}"#,
+            )
+            .unwrap();
 
         let events = Arc::new(Mutex::new(Vec::new()));
         let observed = events.clone();
@@ -11866,7 +13683,9 @@ mod tests {
 
         let _ = ureq::post(&endpoint)
             .header("x-devmanager-claude-nonce", &registration.nonce)
-            .send(br#"{"hook_event_name":"UserPromptSubmit","prompt":"racing prompt"}"#);
+            .send(
+                br#"{"hook_event_name":"UserPromptSubmit","session_id":"provider-fence","prompt":"racing prompt"}"#,
+            );
 
         let generic_escaped = {
             let (lock, condition) = &*cleanup_gate;
@@ -11915,6 +13734,12 @@ mod tests {
             .registration
             .clone();
         let endpoint = manager.claude_hook_endpoint().unwrap();
+        ureq::post(&endpoint)
+            .header("x-devmanager-claude-nonce", &registration.nonce)
+            .send(
+                br#"{"hook_event_name":"SessionStart","session_id":"provider-admitted","source":"startup"}"#,
+            )
+            .unwrap();
 
         let publication_gate = Arc::new((Mutex::new((false, false)), Condvar::new()));
         let hook_gate = publication_gate.clone();
@@ -11944,7 +13769,9 @@ mod tests {
 
         ureq::post(&endpoint)
             .header("x-devmanager-claude-nonce", &registration.nonce)
-            .send(br#"{"hook_event_name":"UserPromptSubmit","prompt":"admitted prompt"}"#)
+            .send(
+                br#"{"hook_event_name":"UserPromptSubmit","session_id":"provider-admitted","prompt":"admitted prompt"}"#,
+            )
             .unwrap();
         {
             let (lock, condition) = &*publication_gate;
@@ -12033,6 +13860,19 @@ mod tests {
             let old = sessions.get("old-session").unwrap();
             (old.registration.clone(), old.settings_path.clone())
         };
+        let endpoint = manager.claude_hook_endpoint().unwrap();
+        ureq::post(&endpoint)
+            .header("x-devmanager-claude-nonce", &old_registration.nonce)
+            .send(
+                br#"{"hook_event_name":"SessionStart","session_id":"provider-old","source":"startup"}"#,
+            )
+            .unwrap();
+        let response = ureq::post(&endpoint)
+            .header("x-devmanager-claude-nonce", &old_registration.nonce)
+            .send(
+                br#"{"hook_event_name":"SessionEnd","session_id":"provider-old","reason":"clear"}"#,
+            )
+            .unwrap();
         let mut replacement = old_launch.clone();
         replacement.startup_command = "claude".to_string();
         manager.prepare_claude_launch_for_session(&mut replacement, "new-session", &temp);
@@ -12045,12 +13885,6 @@ mod tests {
             .map(|session| session.settings_path.clone())
             .unwrap();
         events.lock().unwrap().clear();
-
-        let endpoint = manager.claude_hook_endpoint().unwrap();
-        let response = ureq::post(&endpoint)
-            .header("x-devmanager-claude-nonce", &old_registration.nonce)
-            .send(br#"{"hook_event_name":"SessionEnd","reason":"clear"}"#)
-            .unwrap();
 
         assert_eq!(response.status().as_u16(), 204);
         assert!(manager
@@ -14785,6 +16619,17 @@ mod tests {
         );
         assert_eq!(unknown, "Node");
         assert!(!unknown.contains("do-not-render-this"));
+    }
+
+    #[test]
+    fn ai_acceptance_default_provider_commands_preserve_interactive_questions_and_approvals() {
+        let settings = Settings::default();
+        let claude =
+            resolve_ai_startup_command(&settings, TabType::Claude).expect("Claude command");
+        let codex = resolve_ai_startup_command(&settings, TabType::Codex).expect("Codex command");
+
+        assert!(!claude.contains("dangerously-skip-permissions"));
+        assert!(!codex.contains("dangerously-bypass-approvals-and-sandbox"));
     }
 
     #[test]

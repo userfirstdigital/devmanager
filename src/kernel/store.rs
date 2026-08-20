@@ -8,15 +8,16 @@ use sha2::{Digest, Sha256};
 use crate::domain::agent_resource::AgentResourceBinding;
 use crate::domain::command::{CommandEnvelope, CommandReceipt};
 use crate::domain::event::{
-    AgentSessionRegisteredPayload, ArtifactRegisteredPayload, DomainEvent, Event,
-    HostCleanupBranchCompletedPayload, HostCloseBegunPayload, OperationAcceptedFact,
-    OperationCancelledFact, OperationFailedFact, OperationSettledFact, OperationUncertainFact,
-    PrimaryAgentSetPayload, PrimaryPromotedPayload, ProviderApprovalPresentedPayload,
-    ProviderInputAcceptedPayload, ProviderInputDeliveredPayload, ProviderQuestionPresentedPayload,
-    ProviderWaitSettledPayload, ResourceRegisteredPayload, ResourceReleaseBegunPayload,
-    ResourceReleasedPayload, SpecialistClosedPayload, SpecialistHandoffRecordedPayload,
-    SpecialistRequestedPayload, TaskAttentionSetPayload, TaskCloseBegunPayload, TaskCreatedPayload,
-    TaskRenamedPayload, TaskUnitPayload, EVENT_SCHEMA_VERSION,
+    AgentProviderSessionBoundPayload, AgentSessionRegisteredPayload, ArtifactRegisteredPayload,
+    DomainEvent, Event, HostCleanupBranchCompletedPayload, HostCloseBegunPayload,
+    OperationAcceptedFact, OperationCancelledFact, OperationFailedFact, OperationSettledFact,
+    OperationUncertainFact, PrimaryAgentSetPayload, PrimaryPromotedPayload,
+    ProviderApprovalPresentedPayload, ProviderInputAcceptedPayload, ProviderInputDeliveredPayload,
+    ProviderQuestionPresentedPayload, ProviderWaitSettledPayload, ResourceRegisteredPayload,
+    ResourceReleaseBegunPayload, ResourceReleasedPayload, SpecialistClosedPayload,
+    SpecialistHandoffRecordedPayload, SpecialistRequestedPayload, TaskAttentionSetPayload,
+    TaskCloseBegunPayload, TaskCreatedPayload, TaskRenamedPayload, TaskUnitPayload,
+    EVENT_SCHEMA_VERSION,
 };
 use crate::domain::id::{EventId, OperationId, OutboxId, TaskId};
 use crate::domain::operation::{
@@ -347,6 +348,21 @@ impl KernelStore {
     /// Begin dispatch for a live claim, returning an authorizing permit.
     pub fn begin_dispatch(&mut self, claim: &DispatchClaim) -> Result<DispatchPermit, StoreError> {
         self.with_immediate_transaction(|tx| begin_dispatch_in_tx(tx, now_ms()?, claim))
+    }
+
+    /// Return a dispatch to pending when the destination proves that no
+    /// external write boundary was crossed. This reverses the provisional
+    /// attempt recorded by `begin_dispatch`; it must never be used after any
+    /// provider byte may have been written.
+    pub(crate) fn defer_dispatch_before_boundary(
+        &mut self,
+        permit: &DispatchPermit,
+        next_available: Duration,
+    ) -> Result<(), StoreError> {
+        let delay_ms = validate_dispatch_lease_ms(next_available)?;
+        self.with_immediate_transaction(|tx| {
+            defer_dispatch_before_boundary_in_tx(tx, permit, now_ms()?, delay_ms)
+        })
     }
 
     /// Record a terminal result for the exact in-flight dispatch attempt.
@@ -1225,6 +1241,9 @@ fn rebuild_projection_tables_tx(tx: &Transaction<'_>) -> Result<ProjectionRebuil
 
 #[cfg(test)]
 mod projector_rebuild_tests;
+#[cfg(test)]
+#[path = "provider_input_delivery_tests.rs"]
+mod provider_input_delivery_tests;
 
 fn shadow_name(table: &str) -> String {
     format!("shadow_{table}")
@@ -1422,6 +1441,17 @@ pub(crate) fn encode_event_payload(event: &Event) -> Result<Vec<u8>, StoreError>
                 agent: agent.clone(),
             })
         }
+        Event::AgentProviderSessionBound {
+            agent_session_id,
+            resource_id,
+            provider_session_id,
+            runtime_generation,
+        } => rmp_serde::to_vec(&AgentProviderSessionBoundPayload {
+            agent_session_id: *agent_session_id,
+            resource_id: *resource_id,
+            provider_session_id: provider_session_id.clone(),
+            runtime_generation: *runtime_generation,
+        }),
         Event::PrimaryAgentSet { agent_session_id } => rmp_serde::to_vec(&PrimaryAgentSetPayload {
             agent_session_id: *agent_session_id,
         }),
@@ -1695,6 +1725,15 @@ pub(crate) fn decode_stored_event(
                 .validate_for_registration()
                 .map_err(|e| StoreError::EventDecode(e.to_string()))?;
             Event::AgentSessionRegistered { agent: p.agent }
+        }
+        "agent_session.provider_bound" => {
+            let p: AgentProviderSessionBoundPayload = unpack(payload)?;
+            Event::AgentProviderSessionBound {
+                agent_session_id: p.agent_session_id,
+                resource_id: p.resource_id,
+                provider_session_id: p.provider_session_id,
+                runtime_generation: p.runtime_generation,
+            }
         }
         "primary_agent.set" => {
             let p: PrimaryAgentSetPayload = unpack(payload)?;
@@ -2655,7 +2694,12 @@ fn pending_dispatch_is_authorized(
     replay_policy: ReplayPolicy,
 ) -> Result<bool, StoreError> {
     if matches!(replay_policy, ReplayPolicy::NoAutomaticRetry) {
-        return Ok(false);
+        // Browser NoAutomaticRetry rows are durable holds and remain
+        // unclaimable. Provider input has an explicit destination-owned
+        // dispatcher, so it alone may make its first (attempt 0) claim.
+        return Ok(
+            row.destination_class == DestinationClass::ProviderInput.as_str() && row.attempts == 0,
+        );
     }
     if row.attempts == 0 {
         return Ok(true);
@@ -2976,6 +3020,41 @@ fn begin_dispatch_in_tx(
     permit_row.dispatch_started_at_ms = Some(dispatch_started_at);
     permit_row.reconciliation_receipt = None;
     build_dispatch_permit(&permit_row, effect_doc, fence)
+}
+
+fn defer_dispatch_before_boundary_in_tx(
+    tx: &Transaction<'_>,
+    permit: &DispatchPermit,
+    now_ms: i64,
+    delay_ms: i64,
+) -> Result<(), StoreError> {
+    let row = load_outbox_row_by_id(tx, permit.outbox_id())?.ok_or(StoreError::StaleClaim)?;
+    let (effect_doc, fence) = revalidate_ambiguity_effect(tx, &row)?;
+    validate_dispatch_permit(&row, permit, &effect_doc, fence)?;
+    if row.state != "dispatching" || row.attempts <= 0 {
+        return Err(StoreError::InvalidDispatchTransition);
+    }
+    let restored_attempts = row.attempts.checked_sub(1).ok_or(StoreError::Corruption)?;
+    let available_at = lease_deadline(now_ms.max(row.available_at_ms), delay_ms)?;
+    let changed = tx.execute(
+        "UPDATE outbox
+         SET state = 'pending', attempts = ?1, dispatch_started_at_ms = NULL,
+             leased_until_ms = NULL, available_at_ms = ?2,
+             reconciliation_receipt = NULL
+         WHERE outbox_id = ?3 AND state = 'dispatching'
+           AND lease_generation = ?4 AND attempts = ?5",
+        rusqlite::params![
+            restored_attempts,
+            available_at,
+            permit.outbox_id().as_bytes().as_slice(),
+            permit.lease_generation(),
+            row.attempts,
+        ],
+    )?;
+    if changed != 1 {
+        return Err(StoreError::InvalidDispatchTransition);
+    }
+    Ok(())
 }
 
 fn record_dispatch_ambiguity_in_tx(
@@ -3600,7 +3679,7 @@ mod tests {
     use crate::domain::agent_resource::AgentResourceBinding;
     use crate::domain::command::{Command, CreateTaskIntent};
     use crate::domain::id::{
-        AgentSessionId, ClientId, CommandId, EnvironmentId, ProjectId, ResourceId, TaskId,
+        AgentSessionId, ClientId, CommandId, EnvironmentId, ProjectId, ResourceId, TaskId, TurnId,
     };
     use crate::domain::operation::{CancellationReason, OperationErrorCode};
     use crate::domain::resource::{
@@ -3610,6 +3689,7 @@ mod tests {
         ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity,
         WorkspaceRef,
     };
+    use crate::domain::{ProviderInputAction, SubmitProviderInputIntent};
     use crate::kernel::maintenance::OutboxPayloadCleanup;
     use crate::kernel::WalCheckpointOutcome;
     use crate::providers::ProviderKind;
@@ -4355,5 +4435,173 @@ mod tests {
                 .expect("exact"),
             2
         );
+    }
+
+    #[test]
+    fn codex_provider_input_accepts_without_unavailable_external_session_identity() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("codex-input-without-session-id.sqlite3");
+        let mut store = KernelStore::open(&path).expect("open");
+        let task_id = seed_open_task(&mut store);
+        let client_id = ClientId::new();
+        let agent_session_id = AgentSessionId::new();
+        let registered = store
+            .execute_for_test(CommandEnvelope {
+                command_id: CommandId::new(),
+                client_id,
+                task_id: Some(task_id),
+                issued_at_ms: 1_725_000_000_110,
+                expected_task_revision: Some(1),
+                command: Command::RegisterAgentSession {
+                    agent: AgentSessionFacts {
+                        id: agent_session_id,
+                        task_id,
+                        role: AgentRole::Primary,
+                        provider_kind: ProviderKind::Codex,
+                        provider_session_id: None,
+                        lifecycle: AgentSessionLifecycle::Open,
+                        runtime_generation: 1,
+                        revision: 0,
+                    },
+                },
+            })
+            .expect("register Codex agent without upstream session identity");
+        let CommandReceipt::Accepted {
+            task_revision: Some(revision),
+            ..
+        } = registered
+        else {
+            panic!("agent registration must be accepted: {registered:?}");
+        };
+
+        let receipt = store
+            .execute_for_test(CommandEnvelope {
+                command_id: CommandId::new(),
+                client_id,
+                task_id: Some(task_id),
+                issued_at_ms: 1_725_000_000_120,
+                expected_task_revision: Some(revision),
+                command: Command::SubmitProviderInput(
+                    SubmitProviderInputIntent::try_new(
+                        agent_session_id,
+                        1,
+                        TurnId::new(),
+                        0,
+                        None,
+                        None,
+                        ProviderInputAction::SendNow {
+                            text: "Codex prompt".into(),
+                            wait: false,
+                        },
+                    )
+                    .expect("intent"),
+                ),
+            })
+            .expect("Codex prompt must not require an unsupported external session id");
+        assert!(matches!(receipt, CommandReceipt::Accepted { .. }));
+    }
+
+    #[test]
+    fn provider_no_retry_allows_first_attempt_and_pre_boundary_deferral() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("provider-first-attempt.sqlite3");
+        let mut store = KernelStore::open(&path).expect("open");
+        let task_id = seed_open_task(&mut store);
+        let client_id = ClientId::new();
+        let agent_session_id = AgentSessionId::new();
+        let registered = store
+            .execute_for_test(CommandEnvelope {
+                command_id: CommandId::new(),
+                client_id,
+                task_id: Some(task_id),
+                issued_at_ms: 1_725_000_000_110,
+                expected_task_revision: Some(1),
+                command: Command::RegisterAgentSession {
+                    agent: AgentSessionFacts {
+                        id: agent_session_id,
+                        task_id,
+                        role: AgentRole::Primary,
+                        provider_kind: ProviderKind::Codex,
+                        provider_session_id: Some(
+                            ProviderSessionId::new("codex-first-attempt").expect("session"),
+                        ),
+                        lifecycle: AgentSessionLifecycle::Open,
+                        runtime_generation: 3,
+                        revision: 0,
+                    },
+                },
+            })
+            .expect("register agent");
+        let CommandReceipt::Accepted {
+            task_revision: Some(revision),
+            ..
+        } = registered
+        else {
+            panic!("agent registration must be accepted: {registered:?}");
+        };
+        let action_epoch: i64 = store
+            .conn
+            .query_row(
+                "SELECT action_epoch FROM tasks WHERE task_id = ?1",
+                [task_id.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .expect("action epoch");
+        let accepted = store
+            .execute_for_test(CommandEnvelope {
+                command_id: CommandId::new(),
+                client_id,
+                task_id: Some(task_id),
+                issued_at_ms: 1_725_000_000_120,
+                expected_task_revision: Some(revision),
+                command: Command::SubmitProviderInput(
+                    SubmitProviderInputIntent::try_new(
+                        agent_session_id,
+                        3,
+                        TurnId::new(),
+                        u64::try_from(action_epoch).expect("epoch"),
+                        None,
+                        None,
+                        ProviderInputAction::SendNow {
+                            text: "first attempt".into(),
+                            wait: false,
+                        },
+                    )
+                    .expect("intent"),
+                ),
+            })
+            .expect("accept provider input");
+        let CommandReceipt::Accepted { operation_id, .. } = accepted else {
+            panic!("provider input must be accepted: {accepted:?}");
+        };
+
+        let claim = store
+            .claim_next_dispatch(Duration::from_secs(30))
+            .expect("claim")
+            .expect("first provider NoAutomaticRetry dispatch must be claimable");
+        let permit = store.begin_dispatch(&claim).expect("begin");
+        store
+            .defer_dispatch_before_boundary(&permit, Duration::from_millis(1))
+            .expect("defer before boundary");
+        std::thread::sleep(Duration::from_millis(5));
+        let claim = store
+            .claim_next_dispatch(Duration::from_secs(30))
+            .expect("reclaim")
+            .expect("pre-boundary deferral must preserve first attempt");
+        let permit = store.begin_dispatch(&claim).expect("begin after deferral");
+        assert_eq!(
+            store
+                .record_dispatch_ambiguity(&permit, Duration::from_millis(1))
+                .expect("record crossed-boundary ambiguity"),
+            AmbiguityDisposition::Uncertain
+        );
+        assert!(matches!(
+            store.operation_status(operation_id).expect("status"),
+            Some(OperationState::Uncertain { .. })
+        ));
+        assert!(store
+            .claim_next_dispatch(Duration::from_secs(30))
+            .expect("no retry")
+            .is_none());
     }
 }

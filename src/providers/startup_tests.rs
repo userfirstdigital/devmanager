@@ -10,6 +10,7 @@ use crate::providers::adapter::{
 };
 use crate::providers::capabilities::{
     CapabilitySupport, ProviderAuthState, ProviderCapabilities, ProviderCapability,
+    ProviderDiscoveryCandidateInput, ProviderDiscoveryContract, ProviderDiscoveryOrigin,
     ProviderExecutable, ProviderExecutableHandle, ProviderVersion,
 };
 use crate::providers::cursor::CursorAdapter;
@@ -19,6 +20,9 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Mutex;
+
+#[cfg(windows)]
+use std::fs;
 
 fn current_executable() -> ProviderExecutable {
     ProviderExecutable::from_path(std::env::current_exe().expect("current exe")).expect("identity")
@@ -180,6 +184,134 @@ fn start_request_from_adapter_calls_build_launch_and_seals_exact_resume() {
         .launch_spec()
         .arguments()
         .any(|argument| argument == "--resume"));
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_shim_is_normalized_to_its_native_launch_program_before_session_persistence() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let target = temp.path().join("claude.exe");
+    let shim = temp.path().join("claude.cmd");
+    fs::copy(std::env::current_exe().expect("current exe"), &target).expect("native target");
+    fs::write(&shim, "@echo off\r\ncall \"%~dp0claude.exe\" %*\r\n").expect("shim");
+
+    let candidate = ProviderDiscoveryContract::for_kind(ProviderKind::ClaudeCode)
+        .validate(ProviderDiscoveryCandidateInput::windows_shim(
+            &shim,
+            &target,
+            ProviderDiscoveryOrigin::ConfiguredOverride,
+        ))
+        .expect("attested shim");
+    let version = ProviderVersion::new("1.0.0-test").expect("version");
+    let capabilities = ProviderCapabilities {
+        kind: ProviderKind::ClaudeCode,
+        version: version.clone(),
+        auth_state: ProviderAuthState::Unknown,
+        exact_resume: CapabilitySupport::Supported,
+        semantic_events: CapabilitySupport::Unsupported,
+        provider_session_id: CapabilitySupport::Supported,
+        build_launch: CapabilitySupport::Supported,
+        parse_signal: CapabilitySupport::Unsupported,
+        cooperative_stop: CapabilitySupport::Unsupported,
+        observe_quota: CapabilitySupport::Unsupported,
+        evidence: vec![],
+    };
+    let observation = ProviderObservation::from_test_parts(
+        ProviderKind::ClaudeCode,
+        candidate.open_for_launch().expect("launch graph"),
+        version,
+        capabilities,
+    )
+    .expect("observation");
+    let adapter = ScriptedAdapter::new(ProviderKind::ClaudeCode, CapabilitySupport::Supported);
+
+    let request = start_request_from_adapter(
+        agent_facts(ProviderKind::ClaudeCode, None),
+        &observation,
+        &adapter,
+        None,
+        temp.path().to_path_buf(),
+        BTreeMap::new(),
+        ProviderSessionStartMode::NewConversation,
+    )
+    .expect("start request");
+
+    assert!(request.launch_spec().executable().is_native());
+    assert_eq!(
+        request.launch_spec().executable().canonical_path(),
+        fs::canonicalize(target).expect("canonical target")
+    );
+    assert!(request.launch_spec().runtime_dependency().is_none());
+}
+
+#[cfg(windows)]
+#[test]
+fn node_script_normalized_launch_keeps_runtime_dependency_identity() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let interpreter_path = temp.path().join("node.exe");
+    let script_path = temp.path().join("codex.js");
+    let wrapper_path = temp.path().join("codex.cmd");
+    fs::copy(
+        std::env::current_exe().expect("current exe"),
+        &interpreter_path,
+    )
+    .expect("interpreter");
+    fs::write(&script_path, "console.log('fixture');\n").expect("script");
+    fs::write(&wrapper_path, "@echo off\r\nnode \"%~dp0codex.js\" %*\r\n").expect("wrapper");
+
+    let interpreter = ProviderExecutable::from_path(&interpreter_path).expect("native interpreter");
+    let script = ProviderExecutable::inspect_non_native_blocking(&script_path).expect("script");
+    let wrapper = ProviderExecutable::inspect_non_native_blocking(&wrapper_path).expect("wrapper");
+    let handle = wrapper
+        .open_for_launch_form(
+            &crate::providers::capabilities::ProviderExecutableForm::WindowsNodeScript {
+                interpreter: Box::new(interpreter.clone()),
+                script: Box::new(script.clone()),
+            },
+        )
+        .expect("script launch graph");
+    let version = ProviderVersion::new("1.0.0-test").expect("version");
+    let capabilities = ProviderCapabilities {
+        kind: ProviderKind::Codex,
+        version: version.clone(),
+        auth_state: ProviderAuthState::Unknown,
+        exact_resume: CapabilitySupport::Supported,
+        semantic_events: CapabilitySupport::Unsupported,
+        provider_session_id: CapabilitySupport::Supported,
+        build_launch: CapabilitySupport::Supported,
+        parse_signal: CapabilitySupport::Unsupported,
+        cooperative_stop: CapabilitySupport::Unsupported,
+        observe_quota: CapabilitySupport::Unsupported,
+        evidence: vec![],
+    };
+    let observation =
+        ProviderObservation::from_test_parts(ProviderKind::Codex, handle, version, capabilities)
+            .expect("observation");
+    let adapter = ScriptedAdapter::new(ProviderKind::Codex, CapabilitySupport::Supported);
+
+    let request = start_request_from_adapter(
+        agent_facts(ProviderKind::Codex, None),
+        &observation,
+        &adapter,
+        None,
+        temp.path().to_path_buf(),
+        BTreeMap::new(),
+        ProviderSessionStartMode::NewConversation,
+    )
+    .expect("start request");
+
+    assert!(request.launch_spec().executable().is_native());
+    assert_eq!(
+        request.launch_spec().executable().canonical_path(),
+        interpreter.canonical_path()
+    );
+    let dependency = request
+        .launch_spec()
+        .runtime_dependency()
+        .expect("script dependency");
+    assert_eq!(dependency.canonical_path(), script.canonical_path());
+    assert_eq!(dependency.sha256(), script.sha256());
+    assert!(!dependency.is_native());
 }
 
 #[test]

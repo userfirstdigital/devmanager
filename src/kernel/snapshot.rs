@@ -209,8 +209,13 @@ impl SnapshotSession {
             task_ids,
             SnapshotItemKey::Task,
             |task_id| {
-                let snapshot =
-                    command_bus::load_task_snapshot(&self.conn, task_id)?.ok_or_else(|| {
+                let snapshot = command_bus::load_task_snapshot(&self.conn, task_id)
+                    .map_err(|error| {
+                        StoreError::Projection(format!(
+                            "task {task_id} could not be loaded for the pinned snapshot: {error}"
+                        ))
+                    })?
+                    .ok_or_else(|| {
                         StoreError::Projection("task disappeared from pinned snapshot".into())
                     })?;
                 Ok(SnapshotItem::Task(TaskSnapshotItem {
@@ -324,7 +329,12 @@ impl SnapshotSession {
             operation_ids,
             SnapshotItemKey::Operation,
             |operation_id| {
-                let operation = command_bus::load_operation_facts(&self.conn, operation_id)?
+                let operation = command_bus::load_operation_facts(&self.conn, operation_id)
+                    .map_err(|error| {
+                        StoreError::Projection(format!(
+                            "operation {operation_id} could not be loaded for the pinned snapshot: {error}"
+                        ))
+                    })?
                     .ok_or_else(|| {
                         StoreError::Projection("operation disappeared from pinned snapshot".into())
                     })?;
@@ -2082,7 +2092,7 @@ mod tests {
             snapshot
                 .page(SnapshotSection::Operations, None)
                 .expect_err("invalid operation lineage must fail closed"),
-            SnapshotError::Store(StoreError::CodecMismatch { .. })
+            SnapshotError::Store(StoreError::Projection(_))
         ));
     }
 

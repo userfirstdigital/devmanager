@@ -28,8 +28,15 @@ const TASK_4_1_SEMANTIC_SCHEMA_VERSION: SemanticSchemaVersion =
     PROVIDER_REGISTRY_SEMANTIC_SCHEMA_VERSION;
 const PROVIDER_CAPABILITY_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 const MAX_PROVIDER_IN_FLIGHT_ENTRIES: usize = 64;
-const PROVIDER_IN_FLIGHT_TTL: Duration = Duration::from_secs(30);
+/// Covers PATH identity capture plus sequential version/help/auth probes.
+/// Native CLIs are attested by file ID, not a multi-minute SHA-256 of
+/// `claude.exe`. A 30s flight discarded in-flight probes as `CheckFailed`.
+const PROVIDER_IN_FLIGHT_TTL: Duration = Duration::from_secs(180);
 const PROVIDER_WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+pub(crate) fn provider_in_flight_ttl() -> Duration {
+    PROVIDER_IN_FLIGHT_TTL
+}
 
 #[derive(Clone, Default)]
 pub struct ProviderDiscoveryConfig {
@@ -923,21 +930,59 @@ impl ProviderRegistry {
         config: &ProviderDiscoveryConfig,
         ttl: Duration,
     ) -> Result<ProviderAuthProbeInvocation, ProviderError> {
+        self.begin_auth_probe_with_observation(kind, config, ttl)
+            .await
+            .map(|(invocation, _)| invocation)
+    }
+
+    pub async fn begin_auth_probe_with_observation(
+        &self,
+        kind: ProviderKind,
+        config: &ProviderDiscoveryConfig,
+        ttl: Duration,
+    ) -> Result<(ProviderAuthProbeInvocation, ProviderObservation), ProviderError> {
         if !self.adapters.contains_key(&kind) {
             return Err(ProviderError::ProviderNotRegistered(kind));
         }
         let (observation, executable_handle) = self.observe_internal(kind, config, None).await?;
-        self.auth_evidence
+        let version = observation.version.clone();
+        let invocation = self
+            .auth_evidence
             .lock()
             .unwrap()
             .begin_with_handle_and_version(
                 kind,
                 crate::providers::capabilities::ProviderAuthEvidenceSource::for_kind(kind),
                 executable_handle,
-                observation.version,
+                version,
                 ttl,
             )
-            .map_err(ProviderError::AuthEvidence)
+            .map_err(ProviderError::AuthEvidence)?;
+        Ok((invocation, observation))
+    }
+
+    pub(crate) fn attach_auth_receipt(
+        &self,
+        mut observation: ProviderObservation,
+        receipt: ProviderAuthEvidenceReceipt,
+    ) -> Result<ProviderObservation, ProviderError> {
+        let consumed = self
+            .auth_evidence
+            .lock()
+            .unwrap()
+            .consume_at_for_handle(
+                observation.kind(),
+                observation.executable_handle(),
+                observation.version(),
+                receipt,
+            )
+            .map_err(ProviderError::AuthEvidence)?;
+        observation.capabilities = observation
+            .capabilities
+            .stable_projection()
+            .with_auth_receipt(&consumed)?;
+        observation.capabilities.validate()?;
+        Ok(observation)
     }
 
     pub fn accept_auth_probe(

@@ -124,7 +124,16 @@ const HARD_MAX_REF_ENTRIES: usize = 8192;
 const HARD_MAX_LOG_ENTRIES: usize = 8192;
 const HARD_MAX_WORKTREE_ENTRIES: usize = 1024;
 const HARD_MAX_GRAPH_BYTES: u64 = 256 * 1024 * 1024;
-const HARD_MAX_TIMEOUT: Duration = Duration::from_secs(10);
+// Windows repository graph validation deliberately pins and revalidates every
+// relevant handle around each Git child. Under Defender or sustained build
+// load, a healthy local operation can occasionally exceed ten seconds. Keep
+// the runner bounded, but leave enough room for those safety checks to finish.
+const HARD_MAX_TIMEOUT: Duration = Duration::from_secs(30);
+// One confirmed host action can perform a preview status, a freshness status,
+// and the mutation itself. Each child stays capped by HARD_MAX_TIMEOUT; this
+// outer capability only supplies enough bounded runway for all three phases
+// plus cleanup/scheduling margin under sustained Windows I/O load.
+const HOST_AUTHORITY_LIFETIME: Duration = Duration::from_secs(120);
 const CLEANUP_RESERVE: Duration = Duration::from_secs(1);
 const READER_DROP_TIMEOUT: Duration = Duration::from_millis(250);
 const HARD_MAX_READER_REAPERS: usize = 16;
@@ -265,12 +274,11 @@ struct GitAuthorityCapability {
     connection: ConnectionHandle,
     action_generation: ActionGeneration,
     identity: AuthorityIdentity,
-    root: PathBuf,
+    bound_root: RepositoryRoot,
     root_handle: Arc<fs::File>,
     graph_handles: Arc<Vec<fs::File>>,
     repository_identity: Arc<Mutex<String>>,
     repository_static_identity: String,
-    approved_external_roots: Vec<PathBuf>,
     authority_deadline: Instant,
     forced_expiry: Arc<AtomicBool>,
     limits: GitLimits,
@@ -374,7 +382,7 @@ pub(crate) fn test_issue_git_host_binding(
         "test-command",
         1,
         1,
-        Duration::from_secs(30),
+        HOST_AUTHORITY_LIFETIME,
     )
 }
 
@@ -397,13 +405,12 @@ pub(crate) fn test_issue_git_host_binding_with_fence(
                 path: "<test-bound-root>".to_string(),
                 reason,
             })?;
-    let approved_external_roots =
-        canonicalize_approved_graph_roots(&root.path, &approved_external_roots).map_err(
-            |reason| GitError::InvalidRepositoryRoot {
-                path: "<test-bound-root>".to_string(),
-                reason,
-            },
-        )?;
+    canonicalize_approved_graph_roots(&root.path, &approved_external_roots).map_err(|reason| {
+        GitError::InvalidRepositoryRoot {
+            path: "<test-bound-root>".to_string(),
+            reason,
+        }
+    })?;
     let repository_identity = repository_graph_identity(&root);
     let repository_static_identity = repository_static_graph_identity(&root);
     let workspace = WorkspaceIdentity::from_canonical_root(root.path.clone());
@@ -430,12 +437,11 @@ pub(crate) fn test_issue_git_host_binding_with_fence(
                 issued: 1,
             },
             identity,
-            root: root.path,
+            bound_root: root.clone(),
             root_handle: Arc::clone(&root.handle),
             graph_handles: Arc::clone(&root.pinned_handles),
             repository_identity: Arc::new(Mutex::new(repository_identity)),
             repository_static_identity,
-            approved_external_roots,
             authority_deadline: Instant::now() + live_for,
             forced_expiry: Arc::new(AtomicBool::new(false)),
             limits: GitLimits::default(),
@@ -513,13 +519,12 @@ pub(crate) fn issue_git_host_binding(
         path: "<bound-root>".to_string(),
         reason,
     })?;
-    let approved_external_roots =
-        canonicalize_approved_graph_roots(&root.path, &approved_external_roots).map_err(
-            |reason| GitError::InvalidRepositoryRoot {
-                path: "<bound-root>".to_string(),
-                reason,
-            },
-        )?;
+    canonicalize_approved_graph_roots(&root.path, &approved_external_roots).map_err(|reason| {
+        GitError::InvalidRepositoryRoot {
+            path: "<bound-root>".to_string(),
+            reason,
+        }
+    })?;
     let repository_identity = repository_graph_identity(&root);
     let repository_static_identity = repository_static_graph_identity(&root);
     let workspace_identity = WorkspaceIdentity::from_canonical_root(root.path.clone());
@@ -546,13 +551,12 @@ pub(crate) fn issue_git_host_binding(
                 issued: action_epoch.max(1),
             },
             identity,
-            root: root.path,
+            bound_root: root.clone(),
             root_handle: Arc::clone(&root.handle),
             graph_handles: Arc::clone(&root.pinned_handles),
             repository_identity: Arc::new(Mutex::new(repository_identity)),
             repository_static_identity,
-            approved_external_roots,
-            authority_deadline: Instant::now() + Duration::from_secs(30),
+            authority_deadline: Instant::now() + HOST_AUTHORITY_LIFETIME,
             forced_expiry: Arc::new(AtomicBool::new(false)),
             limits: GitLimits::default(),
             workspace_resource_lease: Some(Arc::new(lease)),
@@ -789,10 +793,13 @@ impl GitOperationPermit {
                 if !capability.is_live() {
                     return Err(GitError::AuthorityUnavailable);
                 }
-                self.deadline
+                OperationDeadline::from_host_authority(
+                    capability.authority_deadline,
+                    capability.limits.timeout,
+                )
             }
             #[cfg(test)]
-            GitPermitAuthority::Test => self.deadline,
+            GitPermitAuthority::Test => OperationDeadline::from_now(self.deadline.timeout),
         };
         Ok(Self {
             authority: self.authority.clone(),
@@ -1201,6 +1208,20 @@ impl GitError {
             Self::RemoteNotAuthorized => "remote_not_authorized",
             Self::WorkspaceMismatch { .. } => "workspace_mismatch",
             Self::AuthorityUnavailable => "authority_unavailable",
+        }
+    }
+}
+
+fn repository_validation_error(operation: &str, timeout: Duration, reason: String) -> GitError {
+    if reason.contains("operation deadline") {
+        GitError::TimedOut {
+            operation: operation.to_string(),
+            timeout,
+        }
+    } else {
+        GitError::InvalidRepositoryRoot {
+            path: "<repository>".to_string(),
+            reason,
         }
     }
 }
@@ -1854,7 +1875,7 @@ impl TrustedExecutable {
             {
                 return Err("Git PATH entry must not be the current directory".to_string());
             }
-            let candidate = directory.join(executable_name);
+            let mut candidate = directory.join(executable_name);
             let Ok(metadata) = fs::symlink_metadata(&candidate) else {
                 continue;
             };
@@ -1862,7 +1883,12 @@ impl TrustedExecutable {
                 return Err("Git PATH candidate is not a regular file".to_string());
             }
             if is_known_git_wrapper(&candidate) {
-                continue;
+                let Some(native) = trusted_native_git_for_wrapper(&candidate, deadline)? else {
+                    // A wrapper outside an explicitly trusted installation is
+                    // never spawned and contributes no ambient authority.
+                    continue;
+                };
+                candidate = native;
             }
             let canonical = fs::canonicalize(&candidate)
                 .map_err(|_| "Git executable cannot be canonicalized".to_string())?;
@@ -2048,12 +2074,82 @@ fn is_known_git_wrapper(path: &Path) -> bool {
             .to_string_lossy()
             .replace('/', "\\")
             .to_ascii_lowercase();
-        return path.ends_with("\\git\\cmd\\git.exe");
+        return path.ends_with("\\git\\cmd\\git.exe") || path.ends_with("\\git\\bin\\git.exe");
     }
     #[cfg(not(windows))]
     {
         let _ = path;
         false
+    }
+}
+
+fn trusted_native_git_for_wrapper(
+    wrapper: &Path,
+    deadline: Option<OperationDeadline>,
+) -> Result<Option<PathBuf>, String> {
+    #[cfg(windows)]
+    {
+        if deadline.is_some_and(OperationDeadline::is_expired) {
+            return Err("Git wrapper resolution exceeded the operation deadline".to_string());
+        }
+        if !is_known_git_wrapper(wrapper) {
+            return Ok(None);
+        }
+        let Some(installation_root) = wrapper.parent().and_then(Path::parent) else {
+            return Ok(None);
+        };
+        let Ok(canonical_root) = fs::canonicalize(installation_root) else {
+            return Ok(None);
+        };
+        let trusted_root = trusted_installation_roots().into_iter().any(|root| {
+            fs::canonicalize(root)
+                .ok()
+                .is_some_and(|root| same_path(&root, &canonical_root))
+        });
+        if !trusted_root {
+            return Ok(None);
+        }
+
+        let mut native: Vec<PathBuf> = Vec::new();
+        for relative in [
+            Path::new("mingw64").join("bin").join("git.exe"),
+            Path::new("mingw32").join("bin").join("git.exe"),
+            Path::new("usr").join("bin").join("git.exe"),
+        ] {
+            let candidate = canonical_root.join(relative);
+            let Ok(metadata) = fs::symlink_metadata(&candidate) else {
+                continue;
+            };
+            if !metadata.is_file() {
+                return Err("trusted Git native candidate is not a regular file".to_string());
+            }
+            let canonical = fs::canonicalize(&candidate)
+                .map_err(|_| "trusted Git native executable cannot be canonicalized".to_string())?;
+            if !same_path(&canonical, &candidate) || !is_explicitly_trusted_git_path(&canonical) {
+                return Err(
+                    "trusted Git native executable failed installation validation".to_string(),
+                );
+            }
+            if !native
+                .iter()
+                .any(|existing| same_path(existing, &canonical))
+            {
+                native.push(canonical);
+            }
+        }
+        if deadline.is_some_and(OperationDeadline::is_expired) {
+            return Err("Git wrapper resolution exceeded the operation deadline".to_string());
+        }
+        return match native.len() {
+            0 => Err("trusted Git wrapper has no native executable".to_string()),
+            1 => Ok(native.pop()),
+            _ => Err("trusted Git wrapper resolves to multiple native executables".to_string()),
+        };
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (wrapper, deadline);
+        Ok(None)
     }
 }
 
@@ -2073,7 +2169,7 @@ fn is_explicitly_trusted_git_path(path: &Path) -> bool {
         {
             matches!(
                 relative.to_ascii_lowercase().as_str(),
-                "mingw64/bin/git.exe" | "mingw32/bin/git.exe" | "usr/bin/git.exe" | "bin/git.exe"
+                "mingw64/bin/git.exe" | "mingw32/bin/git.exe" | "usr/bin/git.exe"
             )
         }
         #[cfg(not(windows))]
@@ -2327,7 +2423,7 @@ impl GraphTransition {
     fn allows_ref_path(self, root: &Path, path: &Path, logs_root: bool) -> bool {
         if !matches!(
             self,
-            Self::Commit | Self::Reset | Self::Branch | Self::Fetch | Self::Pull
+            Self::Commit | Self::Reset | Self::Branch | Self::Fetch | Self::Pull | Self::Push
         ) {
             return false;
         }
@@ -2358,7 +2454,9 @@ impl GraphTransition {
             &components[..]
         };
         if components.is_empty() {
-            return false;
+            // The first ref-writing operation creates `.git/logs/refs` as a
+            // directory scaffold before it writes the concrete ref log.
+            return logs_root;
         }
         let last = components.last().expect("nonempty ref path");
         let last = last.to_string_lossy();
@@ -2408,6 +2506,12 @@ impl GraphTransition {
                     Self::StatusRefresh | Self::Stage | Self::Commit | Self::Reset | Self::Pull
                 ),
                 "ORIG_HEAD" => matches!(self, Self::Commit | Self::Reset | Self::Pull),
+                "MERGE_HEAD" | "CHERRY_PICK_HEAD" | "REVERT_HEAD" => {
+                    matches!(self, Self::Commit | Self::Reset | Self::Pull)
+                }
+                "COMMIT_EDITMSG" | "MERGE_MSG" | "SQUASH_MSG" => {
+                    matches!(self, Self::Commit | Self::Pull)
+                }
                 "logs" | "refs" => {
                     matches!(
                         self,
@@ -2435,6 +2539,12 @@ impl GraphTransition {
                     Self::StatusRefresh | Self::Stage | Self::Commit | Self::Reset | Self::Pull
                 ),
                 "ORIG_HEAD" => matches!(self, Self::Commit | Self::Reset | Self::Pull),
+                "MERGE_HEAD" | "CHERRY_PICK_HEAD" | "REVERT_HEAD" => {
+                    matches!(self, Self::Commit | Self::Reset | Self::Pull)
+                }
+                "COMMIT_EDITMSG" | "MERGE_MSG" | "SQUASH_MSG" => {
+                    matches!(self, Self::Commit | Self::Pull)
+                }
                 "logs" | "refs" => {
                     matches!(
                         self,
@@ -3065,11 +3175,7 @@ impl RepositoryGraph {
         // post-effect proof.  This keeps the one bounded operation budget
         // usable for short Git commands without weakening the before/after
         // identity contract.
-        let full_content = update_baseline
-            || matches!(
-                transition,
-                GraphTransition::ReadOnly | GraphTransition::StatusRefresh
-            );
+        let full_content = update_baseline || transition == GraphTransition::ReadOnly;
         if deadline.is_some_and(OperationDeadline::is_expired) {
             return Err("repository validation exceeded the operation deadline".to_string());
         }
@@ -3138,7 +3244,17 @@ impl RepositoryGraph {
                     &node.path,
                 ) {
                     let expected = baseline.get(&node.path).unwrap_or(&node.identity);
-                    if !graph_identity_matches(expected, &identity) {
+                    // The during-child pass deliberately defers recursive
+                    // directory enumeration. At that point only the pinned
+                    // container identity is comparable; the complete
+                    // post-effect pass below restores the recursive digest
+                    // check before adopting any mutable baseline.
+                    let matches = if !node.is_file && node.mutable_recursive && !full_content {
+                        graph_container_identity_matches(expected, &identity)
+                    } else {
+                        graph_identity_matches(expected, &identity)
+                    };
+                    if !matches {
                         return Err(format!(
                             "repository graph mutable entry was substituted: {}",
                             node.path.display()
@@ -3448,6 +3564,21 @@ fn validate_mutable_directory_snapshot(
         let object_path = object_stores
             .iter()
             .find(|object_store| is_within(object_store, &changed_path));
+        if object_path.is_some()
+            && matches!(
+                (expected_identity, actual_identity),
+                (Some(expected), Some(actual))
+                    if expected.1
+                        && actual.1
+                        && git_object_content_identity_matches(&expected.2, &actual.2)
+            )
+        {
+            // Git may freshen an already-existing loose object when the same
+            // content is staged again.  That changes only the write timestamp;
+            // the held file, link count, size, and digest remain identical.
+            // Treat that as immutable object preservation, not replacement.
+            continue;
+        }
         if object_path.is_some() && expected_identity.is_some() {
             return Err(format!(
                 "repository object content was removed or replaced during Git operation: {}",
@@ -4467,24 +4598,41 @@ fn mutable_directory_snapshot_for_node(
             .map_err(|_| "mutable Git graph directory entry cannot be read".to_string())?
             .path();
         reject_reparse_components(&path)?;
-        let metadata = fs::symlink_metadata(&path)
-            .map_err(|_| "mutable Git graph entry metadata is unavailable".to_string())?;
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            // A Git lock may disappear between directory enumeration and its
+            // metadata lookup. Omit only that already-gone entry from this
+            // completed snapshot. A disappeared bound entry remains absent
+            // and is rejected by the expected/actual comparison below.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(format!(
+                    "mutable Git graph entry metadata is unavailable for {}: {error}",
+                    path.display()
+                ))
+            }
+        };
         let relative = path
             .strip_prefix(&node.path)
             .unwrap_or(&path)
             .as_os_str()
             .to_os_string();
         if metadata.is_dir() {
-            entries.push((
-                relative,
-                false,
-                directory_identity_with_deadline(&path, deadline)?,
-            ));
+            let identity = match directory_identity_with_deadline(&path, deadline) {
+                Ok(identity) => identity,
+                Err(_) if mutable_graph_entry_disappeared(&path) => continue,
+                Err(reason) => return Err(reason),
+            };
+            entries.push((relative, false, identity));
         } else if metadata.is_file() {
-            let identity = deadline.map_or_else(
+            let identity = match deadline.map_or_else(
                 || data_file_identity(&path),
                 |deadline| data_file_identity_with_deadline(&path, deadline),
-            )?;
+            ) {
+                Ok(identity) => identity,
+                Err(_) if mutable_graph_entry_disappeared(&path) => continue,
+                Err(reason) => return Err(reason),
+            };
             entries.push((relative, true, identity));
         } else {
             return Err("mutable Git graph contains a non-regular entry".to_string());
@@ -4521,6 +4669,38 @@ fn graph_container_identity_matches(expected: &FileIdentity, actual: &FileIdenti
     }
 }
 
+fn git_object_content_identity_matches(expected: &FileIdentity, actual: &FileIdentity) -> bool {
+    #[cfg(windows)]
+    {
+        expected.volume_serial_number == actual.volume_serial_number
+            && expected.file_index == actual.file_index
+            && expected.number_of_links == actual.number_of_links
+            && expected.file_size == actual.file_size
+            && expected.content_digest == actual.content_digest
+    }
+
+    #[cfg(unix)]
+    {
+        expected.device == actual.device
+            && expected.inode == actual.inode
+            && expected.number_of_links == actual.number_of_links
+            && expected.file_size == actual.file_size
+            && expected.content_digest == actual.content_digest
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        expected.content_digest == actual.content_digest
+    }
+}
+
+fn mutable_graph_entry_disappeared(path: &Path) -> bool {
+    matches!(
+        fs::symlink_metadata(path),
+        Err(error) if error.kind() == io::ErrorKind::NotFound
+    )
+}
+
 fn collect_mutable_directory_entries(
     root: &Path,
     directory: &Path,
@@ -4544,22 +4724,47 @@ fn collect_mutable_directory_entries(
             .map_err(|_| "mutable Git graph directory entry cannot be read".to_string())?
             .path();
         reject_reparse_components(&path)?;
-        let metadata = fs::symlink_metadata(&path)
-            .map_err(|_| "mutable Git graph entry metadata is unavailable".to_string())?;
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(format!(
+                    "mutable Git graph entry metadata is unavailable for {}: {error}",
+                    path.display()
+                ))
+            }
+        };
         let relative = path
             .strip_prefix(root)
             .unwrap_or(&path)
             .as_os_str()
             .to_os_string();
         if metadata.is_dir() {
-            let identity = directory_identity_with_deadline(&path, deadline)?;
+            let identity = match directory_identity_with_deadline(&path, deadline) {
+                Ok(identity) => identity,
+                Err(_) if mutable_graph_entry_disappeared(&path) => continue,
+                Err(reason) => return Err(reason),
+            };
+            let entry_count = entries.len();
             entries.push((relative, false, identity));
-            collect_mutable_directory_entries(root, &path, depth + 1, entries, deadline)?;
+            if let Err(reason) =
+                collect_mutable_directory_entries(root, &path, depth + 1, entries, deadline)
+            {
+                if mutable_graph_entry_disappeared(&path) {
+                    entries.truncate(entry_count);
+                    continue;
+                }
+                return Err(reason);
+            }
         } else if metadata.is_file() {
-            let identity = deadline.map_or_else(
+            let identity = match deadline.map_or_else(
                 || data_file_identity(&path),
                 |deadline| data_file_identity_with_deadline(&path, deadline),
-            )?;
+            ) {
+                Ok(identity) => identity,
+                Err(_) if mutable_graph_entry_disappeared(&path) => continue,
+                Err(reason) => return Err(reason),
+            };
             entries.push((relative, true, identity));
         } else {
             return Err("mutable Git graph contains a non-regular entry".to_string());
@@ -5644,18 +5849,53 @@ fn apply_git_options(command: &mut Command, sandbox: &GitSandbox, policy: &GitEx
                 command.args([OsString::from("-c"), OsString::from("core.sshCommand=ssh")]);
             }
             if let Some(remote_name) = remote_name {
+                let launch_endpoint = git_remote_launch_endpoint(remote);
                 command.args([
                     OsString::from("-c"),
-                    OsString::from(format!("remote.{remote_name}.url={}", remote.endpoint())),
+                    OsString::from(format!("remote.{remote_name}.url={launch_endpoint}")),
                     OsString::from("-c"),
-                    OsString::from(format!(
-                        "remote.{remote_name}.pushurl={}",
-                        remote.endpoint()
-                    )),
+                    OsString::from(format!("remote.{remote_name}.pushurl={launch_endpoint}")),
                 ]);
             }
         }
     }
+}
+
+/// Git for Windows treats a verbatim local path (`\\?\C:\...`) as an
+/// scp-like remote because of the drive colon. Keep the verbatim endpoint in
+/// the policy/lease authority and convert only the child-process value to its
+/// DOS/UNC spelling.
+fn git_remote_launch_endpoint(remote: &RemotePolicy) -> String {
+    #[cfg(windows)]
+    {
+        if remote.transport() == RemoteTransport::Local {
+            let path = Path::new(remote.endpoint());
+            let text = path.to_string_lossy();
+            if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+                return format!(r"\\{rest}");
+            }
+            if let Some(rest) = text.strip_prefix(r"\\?\") {
+                return rest.to_string();
+            }
+        }
+        if remote.transport() == RemoteTransport::File {
+            if let Ok(url) = url::Url::parse(remote.endpoint()) {
+                if let Ok(path) = url.to_file_path() {
+                    let text = path.to_string_lossy();
+                    let launch_path = text
+                        .strip_prefix(r"\\?\UNC\")
+                        .map(|rest| format!(r"\\{rest}"))
+                        .or_else(|| text.strip_prefix(r"\\?\").map(str::to_string));
+                    if let Some(launch_path) = launch_path {
+                        if let Ok(url) = url::Url::from_file_path(launch_path) {
+                            return url.to_string();
+                        }
+                    }
+                }
+            }
+        }
+    }
+    remote.endpoint().to_string()
 }
 
 fn service_mutation_digest(
@@ -5716,7 +5956,7 @@ fn remote_policy_matches(
 fn operation_label(arguments: &[OsString]) -> String {
     match arguments.first().and_then(|argument| argument.to_str()) {
         Some("add") => "stage".to_string(),
-        Some("restore") => "unstage".to_string(),
+        Some("restore") | Some("rm") => "unstage".to_string(),
         Some("commit") => "commit".to_string(),
         Some("push") => "push".to_string(),
         Some("pull") => "pull".to_string(),
@@ -5741,7 +5981,7 @@ fn graph_transition_for(arguments: &[OsString], policy: &GitExecutionPolicy) -> 
     }
     match command {
         Some("status") => GraphTransition::StatusRefresh,
-        Some("add") | Some("restore") => GraphTransition::Stage,
+        Some("add") | Some("restore") | Some("rm") => GraphTransition::Stage,
         Some("commit") => GraphTransition::Commit,
         Some("reset") => GraphTransition::Reset,
         Some("branch") | Some("switch") => GraphTransition::Branch,
@@ -5823,7 +6063,7 @@ fn argument_contains_nul(argument: &OsString) -> bool {
 fn service_mutation_allowed(arguments: &[OsString]) -> bool {
     match arguments.first().and_then(|argument| argument.to_str()) {
         Some("add") | Some("commit") | Some("fetch") | Some("pull") | Some("push")
-        | Some("reset") | Some("restore") | Some("switch") | Some("branch") => true,
+        | Some("reset") | Some("restore") | Some("rm") | Some("switch") | Some("branch") => true,
         _ => false,
     }
 }
@@ -5883,7 +6123,7 @@ fn capability_matches_arguments(capability: GitCapability, arguments: &[OsString
     let command = arguments.first().and_then(|argument| argument.to_str());
     match capability {
         GitCapability::Stage => command == Some("add"),
-        GitCapability::Unstage => command == Some("restore"),
+        GitCapability::Unstage => matches!(command, Some("restore") | Some("rm")),
         GitCapability::Commit => command == Some("commit"),
         GitCapability::Push => command == Some("push"),
         GitCapability::CreatePullRequest => false,
@@ -6606,19 +6846,12 @@ impl GitRepository {
             });
         }
         let capability = Arc::clone(&binding.capability);
-        let open_deadline = OperationDeadline::from_host_authority(
-            capability.authority_deadline,
-            capability.limits.timeout,
-        );
-        let root = RepositoryRoot::open_with_approved_external_roots_and_deadline(
-            &capability.root,
-            &capability.approved_external_roots,
-            open_deadline,
-        )
-        .map_err(|reason| GitError::InvalidRepositoryRoot {
-            path: "<bound-root>".to_string(),
-            reason,
-        })?;
+        // The issuer already completed the bounded graph admission and owns
+        // every retained root/static handle. Reopening the same graph here
+        // repeats the most expensive proof without strengthening identity;
+        // operations still revalidate the retained graph immediately before
+        // and after every child effect.
+        let root = capability.bound_root.clone();
         let bound_repository_identity = capability
             .repository_identity
             .lock()
@@ -6845,6 +7078,21 @@ impl GitRepository {
         }
     }
 
+    fn with_read_timeout_retry<T>(
+        &self,
+        mut operation: impl FnMut(&GitOperationPermit) -> Result<T, GitError>,
+    ) -> Result<T, GitError> {
+        let first = self.with_read_permit(|permit| operation(permit));
+        if matches!(&first, Err(GitError::TimedOut { .. })) && !self.cancellation.is_cancelled() {
+            // A read has no effect to duplicate. One fresh permit lets a
+            // healthy repository recover from transient Windows/Defender load,
+            // while the host authority deadline still bounds both attempts.
+            self.with_read_permit(|permit| operation(permit))
+        } else {
+            first
+        }
+    }
+
     fn validate_operation_permit(
         &self,
         permit: &GitOperationPermit,
@@ -6900,7 +7148,34 @@ impl GitRepository {
 
     pub fn status(&self) -> Result<RepositoryStatus, GitError> {
         let plan = self.plan_status();
-        self.with_read_permit(|permit| self.status_with_permit(&plan, permit))
+        self.with_read_timeout_retry(|permit| self.status_with_permit(&plan, permit))
+    }
+
+    /// Read the bounded porcelain projection without building the mutation
+    /// fingerprint. Cockpit status rendering does not consume diff or blob
+    /// contents and must not pay for one attested Git process per file.
+    pub(crate) fn status_summary(&self) -> Result<RepositoryStatus, GitError> {
+        let plan = self.plan_status();
+        self.with_read_timeout_retry(|permit| self.status_summary_with_permit(&plan, permit))
+    }
+
+    fn status_summary_with_permit(
+        &self,
+        plan: &StatusPlan,
+        permit: &GitOperationPermit,
+    ) -> Result<RepositoryStatus, GitError> {
+        let output =
+            self.run_read_plan_with_permit(plan.workspace(), plan.raw_arguments(), permit)?;
+        let status =
+            crate::git::model::parse_porcelain_v2_z_limited(&output.stdout, plan.max_bytes)
+                .map_err(|message| GitError::Parse { message })?;
+        for entry in &status.entries {
+            validate_repository_path(&self.root.path, &entry.path)?;
+            if let Some(original_path) = &entry.original_path {
+                validate_repository_path(&self.root.path, original_path)?;
+            }
+        }
+        Ok(status)
     }
 
     fn status_with_permit(
@@ -6912,17 +7187,7 @@ impl GitRepository {
         // bounded invocations to build its fingerprint. Reuse the same permit
         // so graph admission, reads, enumeration, and all child effects share
         // one absolute deadline/work budget.
-        let output =
-            self.run_read_plan_with_permit(plan.workspace(), plan.raw_arguments(), permit)?;
-        let mut status =
-            crate::git::model::parse_porcelain_v2_z_limited(&output.stdout, plan.max_bytes)
-                .map_err(|message| GitError::Parse { message })?;
-        for entry in &status.entries {
-            validate_repository_path(&self.root.path, &entry.path)?;
-            if let Some(original_path) = &entry.original_path {
-                validate_repository_path(&self.root.path, original_path)?;
-            }
-        }
+        let mut status = self.status_summary_with_permit(plan, permit)?;
         if permit.deadline.is_expired() {
             return Err(GitError::TimedOut {
                 operation: "status".to_string(),
@@ -6960,11 +7225,12 @@ impl GitRepository {
         hasher.update(&unstaged.stdout);
         hasher.update((staged.stdout.len() as u64).to_le_bytes());
         hasher.update(&staged.stdout);
-        for entry in status
+        let untracked = status
             .entries
             .iter()
             .filter(|entry| entry.kind == StatusKind::Untracked)
-        {
+            .collect::<Vec<_>>();
+        for entry in &untracked {
             entry
                 .path
                 .validate_relative()
@@ -6972,18 +7238,49 @@ impl GitRepository {
                     path: entry.path.display_lossy().into_owned(),
                     reason,
                 })?;
-            let content = self.run_read_args_with_permit(
-                &[
-                    arg("hash-object"),
-                    arg("--no-filters"),
-                    arg("--"),
-                    entry.path.to_os_string(),
-                ],
-                permit,
-            )?;
-            hasher.update((entry.path.as_bytes().len() as u64).to_le_bytes());
-            hasher.update(entry.path.as_bytes());
-            hasher.update(&content.stdout);
+        }
+        let base_arguments = vec![arg("hash-object"), arg("--no-filters"), arg("--")];
+        let base_argument_bytes = base_arguments.iter().map(argument_exact_len).sum::<usize>();
+        let mut first = 0usize;
+        while first < untracked.len() {
+            let mut arguments = base_arguments.clone();
+            let mut argument_bytes = base_argument_bytes;
+            let mut end = first;
+            while end < untracked.len() && arguments.len() < HARD_MAX_ARGUMENTS {
+                let path = untracked[end].path.to_os_string();
+                let Some(next_bytes) = argument_bytes.checked_add(argument_exact_len(&path)) else {
+                    return Err(GitError::InvalidRequest {
+                        message: "Git hash-object argument byte size overflowed".to_string(),
+                    });
+                };
+                if next_bytes > HARD_MAX_ARGUMENT_BYTES {
+                    break;
+                }
+                argument_bytes = next_bytes;
+                arguments.push(path);
+                end += 1;
+            }
+            if end == first {
+                return Err(GitError::InvalidRequest {
+                    message: "an untracked path exceeds the Git argument budget".to_string(),
+                });
+            }
+            let content = self.run_read_args_with_permit(&arguments, permit)?;
+            let hashes = content
+                .stdout
+                .split_inclusive(|byte| *byte == b'\n')
+                .collect::<Vec<_>>();
+            if hashes.len() != end - first || hashes.iter().any(|hash| hash.is_empty()) {
+                return Err(GitError::Parse {
+                    message: "Git hash-object returned an unexpected result count".to_string(),
+                });
+            }
+            for (entry, hash) in untracked[first..end].iter().zip(hashes) {
+                hasher.update((entry.path.as_bytes().len() as u64).to_le_bytes());
+                hasher.update(entry.path.as_bytes());
+                hasher.update(hash);
+            }
+            first = end;
         }
         status.fingerprint.status_digest = hasher
             .finalize()
@@ -7089,6 +7386,7 @@ impl GitRepository {
     }
 
     pub fn plan_stage(&self, files: &[RepoPath]) -> Result<StagePlan, GitError> {
+        validate_file_request_shape(files)?;
         let status = self.status()?;
         let files = validate_files(&self.root.path, &status, files)?;
         let mut arguments = vec![arg("add"), arg("--")];
@@ -7177,9 +7475,17 @@ impl GitRepository {
     }
 
     pub fn plan_unstage(&self, files: &[RepoPath]) -> Result<UnstagePlan, GitError> {
+        validate_file_request_shape(files)?;
         let status = self.status()?;
         let files = validate_files(&self.root.path, &status, files)?;
-        let mut arguments = vec![arg("restore"), arg("--staged"), arg("--")];
+        let mut arguments = if status.head.is_some() {
+            vec![arg("restore"), arg("--staged"), arg("--")]
+        } else {
+            // `restore --staged` requires HEAD. Before the first commit,
+            // removing the selected path from the index is the equivalent
+            // unstage operation and leaves the worktree file untouched.
+            vec![arg("rm"), arg("--cached"), arg("--")]
+        };
         arguments.extend(files.iter().map(RepoPath::to_os_string));
         Ok(UnstagePlan::new(
             self.workspace.clone(),
@@ -7292,7 +7598,7 @@ impl GitRepository {
         }
         arguments.extend([
             arg("--"),
-            OsString::from(remote_policy.endpoint()),
+            OsString::from(git_remote_launch_endpoint(&remote_policy)),
             OsString::from(branch.as_str()),
         ]);
         Ok(PushPlan::new(
@@ -7438,6 +7744,19 @@ impl GitRepository {
         if !confirmation.permit.is_live() || !confirmation.permit.plan_matches(plan) {
             return Err(GitError::AuthorityUnavailable);
         }
+        // Reject a confirmation issued by another repository binding before
+        // any status/graph read. The later invocation repeats this check at
+        // spawn time, but authority mismatch must not be masked by an
+        // unrelated filesystem error or learn anything about this binding.
+        self.validate_operation_permit(
+            &confirmation.permit,
+            &GitExecutionPolicy::AuthorizedMutation {
+                capability: plan.capability(),
+                remote: plan.remote_policy().cloned(),
+                remote_name: plan.remote_name().map(str::to_string),
+            },
+            plan.arguments_for_digest(),
+        )?;
         let actual = self.status()?.fingerprint;
         if &actual != plan.expected_fingerprint() {
             return Err(GitError::FingerprintMismatch {
@@ -7869,17 +8188,12 @@ impl GitRepository {
             .or(resolved_executable.as_ref())
             .expect("Git invocation must have an executable");
 
-        if let Err(reason) = self.root.revalidate_with_deadline(deadline) {
-            return Err(GitError::InvalidRepositoryRoot {
-                path: "<repository>".to_string(),
-                reason,
-            });
-        }
         if let Err(reason) = self.validate_host_authority(false, deadline) {
-            return Err(GitError::InvalidRepositoryRoot {
-                path: "<repository>".to_string(),
+            return Err(repository_validation_error(
+                &operation,
+                deadline.timeout,
                 reason,
-            });
+            ));
         }
         let remote_for_revalidation = match &policy {
             GitExecutionPolicy::AuthorizedMutation {
@@ -7939,14 +8253,19 @@ impl GitRepository {
                 timeout: deadline.timeout,
             });
         }
-        let executable_verification = executable.verify_with_deadline(Some(deadline));
-        let graph_verification = self.root.revalidate_with_deadline(deadline);
-        if executable_verification.is_err() || graph_verification.is_err() {
-            return Err(GitError::CommandStart {
-                operation,
+        // Perform the complete graph proof once, at the last boundary before
+        // the trusted child is spawned. An earlier identical proof would be
+        // stale again after executable/sandbox binding and only halves the
+        // useful operation budget on repositories with large object stores.
+        executable
+            .verify_with_deadline(Some(deadline))
+            .map_err(|_| GitError::CommandStart {
+                operation: operation.clone(),
                 message: "trusted Git executable identity could not be verified".to_string(),
-            });
-        }
+            })?;
+        self.root
+            .revalidate_with_deadline(deadline)
+            .map_err(|reason| repository_validation_error(&operation, deadline.timeout, reason))?;
 
         let mut command = Command::new(&binding.command_path);
         self.root.configure_command(&mut command);
@@ -8105,17 +8424,19 @@ impl GitRepository {
                 .root
                 .revalidate_during_transition_with_deadline(graph_transition, deadline)
             {
-                failure = Some(GitError::InvalidRepositoryRoot {
-                    path: "<repository>".to_string(),
+                failure = Some(repository_validation_error(
+                    &operation,
+                    deadline.timeout,
                     reason,
-                });
+                ));
                 break;
             }
             if let Err(reason) = self.validate_host_authority(false, deadline) {
-                failure = Some(GitError::InvalidRepositoryRoot {
-                    path: "<repository>".to_string(),
+                failure = Some(repository_validation_error(
+                    &operation,
+                    deadline.timeout,
                     reason,
-                });
+                ));
                 break;
             }
             if let Some(remote) = remote_for_revalidation {
@@ -8367,16 +8688,18 @@ impl GitRepository {
         process.release_job();
 
         if let Err(reason) = graph_validation {
-            return Err(GitError::InvalidRepositoryRoot {
-                path: "<repository>".to_string(),
+            return Err(repository_validation_error(
+                &operation,
+                deadline.timeout,
                 reason,
-            });
+            ));
         }
         if let Some(reason) = authority_validation {
-            return Err(GitError::InvalidRepositoryRoot {
-                path: "<repository>".to_string(),
+            return Err(repository_validation_error(
+                &operation,
+                deadline.timeout,
                 reason,
-            });
+            ));
         }
         if let Some(reason) = child_authority_validation {
             return Err(GitError::InvalidRepositoryRoot {
@@ -8805,6 +9128,27 @@ fn validate_files(
     status: &RepositoryStatus,
     files: &[RepoPath],
 ) -> Result<Vec<RepoPath>, GitError> {
+    validate_file_request_shape(files)?;
+    let mut result = Vec::with_capacity(files.len());
+    for file in files {
+        let candidate = root.join(file.to_path_buf());
+        validate_repository_path(root, file)?;
+        let is_submodule = status
+            .entries
+            .iter()
+            .any(|entry| entry.path == *file && entry.kind == StatusKind::Submodule);
+        if candidate.is_dir() && !is_submodule {
+            return Err(GitError::InvalidPath {
+                path: file.display_lossy().into_owned(),
+                reason: "directories are not exact file targets".to_string(),
+            });
+        }
+        result.push(file.clone());
+    }
+    Ok(result)
+}
+
+fn validate_file_request_shape(files: &[RepoPath]) -> Result<(), GitError> {
     if files.is_empty() {
         return Err(GitError::InvalidRequest {
             message: "at least one exact repository file is required".to_string(),
@@ -8829,33 +9173,19 @@ fn validate_files(
             ),
         });
     }
-    let mut result = Vec::with_capacity(files.len());
-    for file in files {
+    for (index, file) in files.iter().enumerate() {
         file.validate_relative()
             .map_err(|reason| GitError::InvalidPath {
                 path: file.display_lossy().into_owned(),
                 reason,
             })?;
-        let candidate = root.join(file.to_path_buf());
-        validate_repository_path(root, file)?;
-        let is_submodule = status
-            .entries
-            .iter()
-            .any(|entry| entry.path == *file && entry.kind == StatusKind::Submodule);
-        if candidate.is_dir() && !is_submodule {
-            return Err(GitError::InvalidPath {
-                path: file.display_lossy().into_owned(),
-                reason: "directories are not exact file targets".to_string(),
-            });
-        }
-        if result.iter().any(|existing| existing == file) {
+        if files[..index].iter().any(|existing| existing == file) {
             return Err(GitError::InvalidRequest {
                 message: "mutation file list contains a duplicate path".to_string(),
             });
         }
-        result.push(file.clone());
     }
-    Ok(result)
+    Ok(())
 }
 
 fn validate_repository_path(root: &Path, path: &RepoPath) -> Result<(), GitError> {
@@ -9457,6 +9787,30 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::{Mutex, OnceLock};
+
+    #[test]
+    fn repository_validation_deadlines_remain_typed_as_timeouts() {
+        let timeout = Duration::from_secs(7);
+        let error = repository_validation_error(
+            "status",
+            timeout,
+            "repository graph validation exceeded the operation deadline".to_string(),
+        );
+        assert!(matches!(
+            error,
+            GitError::TimedOut {
+                operation,
+                timeout: actual,
+            } if operation == "status" && actual == timeout
+        ));
+
+        let error = repository_validation_error(
+            "status",
+            timeout,
+            "repository root identity changed".to_string(),
+        );
+        assert!(matches!(error, GitError::InvalidRepositoryRoot { .. }));
+    }
 
     #[test]
     fn bounded_file_read_refuses_final_symlink_alias() {
@@ -10384,6 +10738,27 @@ mod tests {
     }
 
     #[test]
+    fn mutation_execution_gets_a_fresh_slice_after_live_preflight() {
+        let arguments = vec![OsString::from("add"), OsString::from("--")];
+        let permit = GitOperationPermit::test_service_mutation_with_timeout(
+            &arguments,
+            None,
+            None,
+            Duration::from_millis(500),
+        );
+        let preflight_deadline = permit.deadline.deadline;
+        thread::sleep(Duration::from_millis(20));
+
+        let execution = permit
+            .renewed_for_execution()
+            .expect("live preflight can mint the execution slice");
+        assert!(
+            execution.deadline.deadline > preflight_deadline,
+            "execution must receive a fresh bounded slice after fingerprint validation"
+        );
+    }
+
+    #[test]
     fn service_path_validation_requires_an_owned_read_permit() {
         let fixture = tempfile::tempdir().expect("create service-path fixture");
         let repository = test_repository(fixture.path(), GitLimits::default());
@@ -10431,7 +10806,13 @@ mod tests {
         let swap = thread::spawn(move || {
             thread::sleep(Duration::from_millis(40));
             fs::rename(&restore_head, &restore_moved).expect("move HEAD out of graph");
-            thread::sleep(Duration::from_millis(40));
+            // Keep the synthetic substitution visible across at least one
+            // complete recursive graph-validation pass, even when the full
+            // suite is running under heavy Windows I/O pressure. The child
+            // remains alive for roughly three seconds, so this is still a
+            // swap-and-restore during one operation rather than a terminal
+            // missing-file case.
+            thread::sleep(Duration::from_millis(500));
             fs::rename(&restore_moved, &restore_head).expect("restore HEAD");
         });
 
@@ -10492,6 +10873,27 @@ mod tests {
     }
 
     #[test]
+    fn object_identity_allows_timestamp_only_freshening() {
+        let fixture = tempfile::tempdir().expect("create object freshening fixture");
+        let object = fixture.path().join("object");
+        fs::write(&object, b"immutable Git object").expect("create Git object");
+        let expected = data_file_identity(&object).expect("capture object identity");
+        let mut freshened = expected.clone();
+        #[cfg(windows)]
+        {
+            freshened.last_write_time = freshened.last_write_time.saturating_add(1);
+        }
+        #[cfg(unix)]
+        {
+            freshened.modified_nanos = freshened.modified_nanos.saturating_add(1);
+        }
+
+        assert!(git_object_content_identity_matches(&expected, &freshened));
+        freshened.content_digest[0] ^= 1;
+        assert!(!git_object_content_identity_matches(&expected, &freshened));
+    }
+
+    #[test]
     fn in_flight_transition_does_not_advance_the_read_baseline() {
         let fixture = tempfile::tempdir().expect("create object baseline fixture");
         let repository = test_repository(fixture.path(), GitLimits::default());
@@ -10513,6 +10915,33 @@ mod tests {
             )
             .expect("Git-shaped object may appear during an authorized stage");
         assert!(repository.root.graph.revalidate().is_err());
+    }
+
+    #[test]
+    fn in_flight_status_refresh_defers_recursive_object_content() {
+        let fixture = tempfile::tempdir().expect("create status refresh fixture");
+        let repository = test_repository(fixture.path(), GitLimits::default());
+        let object_store = fixture.path().join(".git").join("objects");
+        let fanout = object_store.join("ab");
+        fs::create_dir(&fanout).expect("create Git object fanout");
+        fs::write(
+            fanout.join("01234567890123456789012345678901234567"),
+            b"new object",
+        )
+        .expect("create Git-shaped object");
+
+        repository
+            .root
+            .graph
+            .revalidate_during_transition_with_deadline(
+                GraphTransition::StatusRefresh,
+                Some(OperationDeadline::from_now(HARD_MAX_TIMEOUT)),
+            )
+            .expect("status refresh defers recursive content until its post-effect proof");
+        assert!(
+            repository.root.graph.revalidate().is_err(),
+            "a strict read must still reject the unadmitted object"
+        );
     }
 
     #[cfg(unix)]
@@ -11203,6 +11632,17 @@ Start-Sleep -Seconds 10
         let repository = GitRepository::from_host_binding(binding, GitCancellation::new())
             .expect("open bound repository");
         assert!(repository.has_live_authority_for_test());
+    }
+
+    #[test]
+    fn host_authority_covers_preview_revalidation_and_mutation_deadlines() {
+        let required = HARD_MAX_TIMEOUT
+            .saturating_mul(3)
+            .saturating_add(CLEANUP_RESERVE.saturating_mul(3));
+        assert!(
+            HOST_AUTHORITY_LIFETIME >= required,
+            "one host action must cover preview, freshness, mutation, and cleanup budgets"
+        );
     }
 
     #[test]

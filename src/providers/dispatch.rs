@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use crate::domain::operation::OperationState;
 use crate::domain::provider_input::ProviderInputAction;
-use crate::kernel::{DestinationClass, Effect, KernelStore, StoreError};
+use crate::kernel::{AmbiguityDisposition, DestinationClass, Effect, KernelStore, StoreError};
 use crate::providers::input::{
     sequence_provider_action, ProviderInputDeliveryError, ProviderInputDeliveryIdentity,
     ProviderInputWriteReceipt,
@@ -29,6 +29,9 @@ pub enum ProviderDispatchOutcome {
     },
     Uncertain {
         operation_id: crate::domain::OperationId,
+    },
+    Recovered {
+        disposition: AmbiguityDisposition,
     },
 }
 
@@ -77,7 +80,19 @@ impl ProviderDispatchWriteAuthority for ProcessManagerDispatchAuthority {
             .write_action(identity, action, &plan)
             .map_err(|error| ProviderWriteFailure {
                 error,
-                disposition: WriteFailureDisposition::Uncertain,
+                disposition: match error {
+                    ProviderInputDeliveryError::SessionNotBound
+                    | ProviderInputDeliveryError::StaleGeneration
+                    | ProviderInputDeliveryError::StaleFence
+                    | ProviderInputDeliveryError::ProviderMismatch
+                    | ProviderInputDeliveryError::RuntimeAuthorityAbsent
+                    | ProviderInputDeliveryError::UnsupportedAction
+                    | ProviderInputDeliveryError::ActionMismatch
+                    | ProviderInputDeliveryError::BytesMismatch => WriteFailureDisposition::Hold,
+                    ProviderInputDeliveryError::PostBoundaryFailure => {
+                        WriteFailureDisposition::Uncertain
+                    }
+                },
             })
     }
 }
@@ -107,6 +122,9 @@ impl ProviderDispatchRuntime {
         &self,
         store: &mut KernelStore,
     ) -> Result<ProviderDispatchOutcome, StoreError> {
+        if let Some(disposition) = store.recover_next_expired_dispatch(HOLD_RETRY)? {
+            return Ok(ProviderDispatchOutcome::Recovered { disposition });
+        }
         let Some(claim) = store
             .claim_next_dispatch_for_destination(DestinationClass::ProviderInput, DISPATCH_LEASE)?
         else {
@@ -148,7 +166,22 @@ impl ProviderDispatchRuntime {
         };
         match self.authority.write(&identity, action) {
             Ok(receipt) => {
-                let state = store.settle_provider_input_delivery(&permit, &receipt)?;
+                let state = match store.settle_provider_input_delivery(&permit, &receipt) {
+                    Ok(state) => state,
+                    Err(error) => {
+                        eprintln!(
+                            "provider input durable settlement failed: operation_id={} error={:?}",
+                            operation_id, error
+                        );
+                        let disposition = store.record_dispatch_ambiguity(&permit, HOLD_RETRY)?;
+                        if disposition != AmbiguityDisposition::Uncertain {
+                            return Err(StoreError::Corruption);
+                        }
+                        return Ok(ProviderDispatchOutcome::Uncertain {
+                            operation_id: *operation_id,
+                        });
+                    }
+                };
                 if !matches!(state, OperationState::Settled { .. }) {
                     return Err(StoreError::Corruption);
                 }
@@ -158,13 +191,13 @@ impl ProviderDispatchRuntime {
             }
             Err(failure) if failure.disposition == WriteFailureDisposition::Hold => {
                 let _ = failure.error;
-                store.release_dispatch_claim(&claim, HOLD_RETRY)?;
+                store.defer_dispatch_before_boundary(&permit, HOLD_RETRY)?;
                 Ok(ProviderDispatchOutcome::Held)
             }
             Err(failure) => {
                 let _ = failure.error;
                 let disposition = store.record_dispatch_ambiguity(&permit, HOLD_RETRY)?;
-                if !matches!(disposition, crate::kernel::AmbiguityDisposition::Uncertain) {
+                if disposition != AmbiguityDisposition::Uncertain {
                     return Err(StoreError::Corruption);
                 }
                 Ok(ProviderDispatchOutcome::Uncertain {

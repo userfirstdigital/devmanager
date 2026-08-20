@@ -36,6 +36,7 @@ use std::sync::{atomic::AtomicU64, Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const HOOK_TRUST_FLAG: &str = "--dangerously-bypass-hook-trust";
+const DANGEROUS_NO_APPROVAL_FLAG: &str = "--dangerously-bypass-approvals-and-sandbox";
 const RESUME_COMMAND: &str = "resume";
 const LOGIN_METHOD_LINE: &str = "Logged in using ChatGPT";
 const LOGIN_PLAN_LINE: &str = "ChatGPT Plus subscription";
@@ -278,8 +279,12 @@ impl CodexAdapter {
             generation,
             identity,
         )?;
-        require_clean_completion(&login_result)?;
-        let (auth_state, auth_status) = classify_login_status(login_result.stdout());
+        // Stock `codex login status` prints the ChatGPT line on stderr and
+        // leaves stdout empty. Version/help still require a silent stderr.
+        require_zero_exit(&login_result)?;
+        let mut login_text = login_result.stdout().to_vec();
+        login_text.extend_from_slice(login_result.stderr());
+        let (auth_state, _) = classify_login_status(&login_text);
 
         let hooks_advertised = help_advertises_flag(&help, HOOK_TRUST_FLAG);
         let semantic_state = if hooks_advertised {
@@ -288,7 +293,7 @@ impl CodexAdapter {
             CodexSemanticLaunchState::TerminalOnly
         };
         let observed_at = unix_now_ms();
-        let mut evidence = vec![
+        let evidence = vec![
             CapabilityEvidence::new(
                 EvidenceSourceId::ExecutableVersion,
                 observed_at,
@@ -308,29 +313,14 @@ impl CodexAdapter {
             )
             .map_err(ProviderCapabilitiesError::InvalidEvidence)?,
         ];
-        if auth_state != ProviderAuthState::Unknown {
-            evidence.push(
-                CapabilityEvidence::new(
-                    EvidenceSourceId::AuthStatusProbe,
-                    observed_at,
-                    auth_status,
-                    Some(EvidenceDiagnostic::new(
-                        if auth_state == ProviderAuthState::AuthRequired {
-                            EvidenceDiagnosticCode::AuthenticationRequired
-                        } else {
-                            EvidenceDiagnosticCode::ProbeFailed
-                        },
-                        Some(identity_status_digest(identity, auth_status)),
-                    )),
-                )
-                .map_err(ProviderCapabilitiesError::InvalidEvidence)?,
-            );
-        }
 
+        // Registry probes may not mint AuthStatusProbe evidence. Keep the
+        // classified login on the adapter-local surface; trusted auth is a
+        // receipt attached after the extra bound `login status` probe.
         let capabilities = ProviderCapabilities {
             kind: ProviderKind::Codex,
             version,
-            auth_state,
+            auth_state: ProviderAuthState::Unknown,
             exact_resume,
             semantic_events: CapabilitySupport::Unsupported,
             provider_session_id: CapabilitySupport::Unsupported,
@@ -341,17 +331,19 @@ impl CodexAdapter {
             evidence,
         };
         capabilities.validate()?;
+        let mut local = capabilities.clone();
+        local.auth_state = auth_state;
         self.publish_attestation(
             identity,
             generation,
             ProbedCodexSurface {
                 identity: identity.clone(),
-                capabilities: capabilities.clone(),
+                capabilities: local,
                 hooks_advertised,
                 semantic_state,
             },
         )?;
-        Ok(capabilities.stable_projection())
+        Ok(capabilities)
     }
 
     pub fn prepare_correlated_launch(
@@ -1001,27 +993,35 @@ fn probe_request(
         .map_err(ProviderError::from)
 }
 
-fn identity_status_digest(identity: &ProviderExecutable, status: EvidenceStatus) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(identity.sha256());
-    hasher.update([status as u8]);
-    hasher.finalize().into()
-}
-
 fn is_clean_completion(result: &crate::providers::adapter::ProviderProbeResult) -> bool {
     result.status() == ProviderProbeStatus::Completed && result.stderr().is_empty()
+}
+
+fn probe_status_error(
+    result: &crate::providers::adapter::ProviderProbeResult,
+) -> ProviderProbeError {
+    match result.status() {
+        ProviderProbeStatus::NonZeroExit => ProviderProbeError::NonZeroExit(None),
+        ProviderProbeStatus::TimedOut => ProviderProbeError::TimedOut,
+        ProviderProbeStatus::OutputTooLarge => ProviderProbeError::OutputTooLarge,
+        _ => ProviderProbeError::NonZeroExit(None),
+    }
 }
 
 fn require_clean_completion(
     result: &crate::providers::adapter::ProviderProbeResult,
 ) -> Result<(), ProviderError> {
     if !is_clean_completion(result) {
-        return Err(ProviderError::Probe(match result.status() {
-            ProviderProbeStatus::NonZeroExit => ProviderProbeError::NonZeroExit(None),
-            ProviderProbeStatus::TimedOut => ProviderProbeError::TimedOut,
-            ProviderProbeStatus::OutputTooLarge => ProviderProbeError::OutputTooLarge,
-            _ => ProviderProbeError::NonZeroExit(None),
-        }));
+        return Err(ProviderError::Probe(probe_status_error(result)));
+    }
+    Ok(())
+}
+
+fn require_zero_exit(
+    result: &crate::providers::adapter::ProviderProbeResult,
+) -> Result<(), ProviderError> {
+    if result.status() != ProviderProbeStatus::Completed {
+        return Err(ProviderError::Probe(probe_status_error(result)));
     }
     Ok(())
 }
@@ -1029,7 +1029,7 @@ fn require_clean_completion(
 fn stock_arguments(
     session_id: Option<&ProviderSessionId>,
 ) -> Result<Vec<ProviderArgument>, ProviderError> {
-    let mut arguments = Vec::new();
+    let mut arguments = vec![argument(DANGEROUS_NO_APPROVAL_FLAG)?];
     if let Some(session_id) = session_id {
         arguments.push(argument(RESUME_COMMAND)?);
         arguments.push(argument(session_id.as_str())?);

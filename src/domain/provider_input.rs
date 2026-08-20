@@ -103,6 +103,12 @@ pub enum ProviderInputAction {
         approval_id: ApprovalId,
         allow: bool,
     },
+    /// Opaque interactive bytes for the already-running provider TUI. This is
+    /// deliberately distinct from composer text: it never appends Enter and
+    /// can carry Escape, arrows, control keys, or bounded paste text.
+    TerminalInput {
+        text: String,
+    },
     StopTurn,
 }
 
@@ -133,6 +139,10 @@ impl<'de> Deserialize<'de> for ProviderInputAction {
                 approval_id: ApprovalId,
                 allow: bool,
             },
+            TerminalInput {
+                #[serde(deserialize_with = "deserialize_provider_text")]
+                text: String,
+            },
             StopTurn,
         }
         Ok(match Wire::deserialize(deserializer)? {
@@ -149,6 +159,7 @@ impl<'de> Deserialize<'de> for ProviderInputAction {
             Wire::ResolveApproval { approval_id, allow } => {
                 Self::ResolveApproval { approval_id, allow }
             }
+            Wire::TerminalInput { text } => Self::TerminalInput { text },
             Wire::StopTurn => Self::StopTurn,
         })
     }
@@ -182,6 +193,10 @@ impl fmt::Debug for ProviderInputAction {
                 .debug_struct("ResolveApproval")
                 .field("approval_id", approval_id)
                 .field("allow", allow)
+                .finish(),
+            Self::TerminalInput { text } => f
+                .debug_struct("TerminalInput")
+                .field("text_bytes", &text.len())
                 .finish(),
             Self::StopTurn => write!(f, "StopTurn"),
         }
@@ -332,7 +347,7 @@ impl ProviderWaitFence {
         action_epoch: u64,
         agent_session_id: AgentSessionId,
         provider_kind: ProviderKind,
-        provider_session_id: ProviderSessionId,
+        provider_session_id: impl Into<Option<ProviderSessionId>>,
         runtime_generation: u64,
         turn_id: TurnId,
         question_id: Option<QuestionId>,
@@ -345,7 +360,7 @@ impl ProviderWaitFence {
             action_epoch,
             agent_session_id,
             provider_kind: Some(provider_kind),
-            provider_session_id: Some(provider_session_id),
+            provider_session_id: provider_session_id.into(),
             runtime_generation,
             turn_id,
             question_id,
@@ -466,12 +481,12 @@ impl ProviderFenceIdentity {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub const fn new_with_identity(
+    pub fn new_with_identity(
         command_id: Option<CommandId>,
         task_id: Option<TaskId>,
         agent_session_id: AgentSessionId,
         provider_kind: ProviderKind,
-        provider_session_id: ProviderSessionId,
+        provider_session_id: impl Into<Option<ProviderSessionId>>,
         operation_id: Option<OperationId>,
         runtime_generation: u64,
         action_epoch: u64,
@@ -484,7 +499,7 @@ impl ProviderFenceIdentity {
             task_id,
             agent_session_id,
             provider_kind: Some(provider_kind),
-            provider_session_id: Some(provider_session_id),
+            provider_session_id: provider_session_id.into(),
             operation_id,
             runtime_generation,
             action_epoch,
@@ -557,9 +572,14 @@ pub fn validate_provider_fence(
     wait: Option<bool>,
     context: Option<&ProviderFenceContext>,
 ) -> Result<(), ProviderFenceError> {
-    let has_provider_kind = fence.provider_kind.is_some();
-    let has_provider_session = fence.provider_session_id.is_some();
-    if !has_provider_kind || has_provider_kind != has_provider_session {
+    let Some(provider_kind) = fence.provider_kind.as_ref() else {
+        return Err(ProviderFenceError::MissingProviderIdentity);
+    };
+    // Codex does not currently expose a trustworthy upstream conversation id.
+    // Keep that absence explicit and bind delivery to the exact durable agent
+    // plus live runtime generation; every other provider still requires its
+    // captured external conversation identity.
+    if fence.provider_session_id.is_none() && !matches!(provider_kind, ProviderKind::Codex) {
         return Err(ProviderFenceError::MissingProviderIdentity);
     }
     if fence.operation_id.is_some() {
@@ -586,9 +606,6 @@ pub fn validate_provider_fence(
         if fence.agent_session_id != context.agent_session_id {
             return Err(ProviderFenceError::AgentSessionMismatch);
         }
-        let Some(provider_kind) = fence.provider_kind.as_ref() else {
-            return Err(ProviderFenceError::MissingProviderIdentity);
-        };
         if provider_kind != &context.provider_kind {
             return Err(ProviderFenceError::ProviderKindMismatch);
         }
@@ -930,6 +947,12 @@ pub fn validate_action_nested_ids(
             ..
         } => {
             if approval_id != Some(*nested) || question_id.is_some() {
+                return Err(ProviderInputIntentError::InconsistentNestedIds);
+            }
+        }
+        ProviderInputAction::TerminalInput { text } => {
+            validate_provider_text(text)?;
+            if question_id.is_some() || approval_id.is_some() {
                 return Err(ProviderInputIntentError::InconsistentNestedIds);
             }
         }

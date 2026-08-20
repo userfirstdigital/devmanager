@@ -1,16 +1,14 @@
 //! Sealed semantic journal view.
-//!
-//! Production cannot invent a conversation journal from ClientModel inventory.
-//! Until Phase 4.6 supplies an authenticated journal page, the view is
-//! [`JournalAvailability::Unavailable`].
 
 #[cfg(any(test, feature = "semantic-conformance"))]
 use super::ParsedSemanticEvent;
 use super::{
-    InteractionEligibility, RenderModelError, SemanticEvent, TimelineItemContent, TimelineItemModel,
+    InteractionEligibility, RenderModelError, SemanticEvent, SemanticEventBody,
+    TimelineItemContent, TimelineItemModel,
 };
 use crate::client::model::ClientModel;
 use crate::domain::id::{AgentSessionId, OperationId, RequestId, TaskId};
+use crate::domain::{SemanticJournalFact, SemanticJournalPage, SemanticJournalPayload};
 use crate::protocol::{Capability, CapabilitySet};
 
 pub const ANSWER_QUESTION_ACTION_ID: &str = "task.answer_question";
@@ -55,6 +53,7 @@ pub enum JournalUnavailableReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JournalAvailability {
     Unavailable(JournalUnavailableReason),
+    LiveProjection,
     #[cfg(any(test, feature = "semantic-conformance"))]
     ConformanceFixture,
 }
@@ -90,7 +89,7 @@ pub enum TimelineActivation {
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 enum JournalRow {
-    Fixture(SemanticEvent),
+    Event(SemanticEvent),
 }
 
 #[derive(Debug, Clone)]
@@ -99,6 +98,7 @@ pub struct SemanticJournalView {
     availability: JournalAvailability,
     task_id: TaskId,
     rows: Vec<JournalRow>,
+    cursor: Option<JournalCursor>,
 }
 
 impl SemanticJournalView {
@@ -117,6 +117,38 @@ impl SemanticJournalView {
             ),
             task_id,
             rows: Vec::new(),
+            cursor: None,
+        })
+    }
+
+    /// Bind an authenticated host page to the selected Task. Provider-neutral
+    /// facts are converted only after the live task/agent fence is available;
+    /// raw terminal bytes and provider envelopes never enter this renderer.
+    pub fn from_live_page(
+        model: &ClientModel,
+        task_id: TaskId,
+        page: &SemanticJournalPage,
+    ) -> Result<Self, RenderModelError> {
+        let target = live_target(model, task_id)?;
+        if page.facts.len() > MAX_CONFORMANCE_JOURNAL_EVENTS {
+            return Err(RenderModelError::WorkBoundExceeded {
+                kind: "events",
+                limit: MAX_CONFORMANCE_JOURNAL_EVENTS,
+            });
+        }
+        let rows = page
+            .facts
+            .iter()
+            .map(|fact| live_fact_event(task_id, target, fact).map(JournalRow::Event))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            origin: JournalOrigin::LiveProjection,
+            availability: JournalAvailability::LiveProjection,
+            task_id,
+            rows,
+            cursor: Some(JournalCursor {
+                through_sequence: page.through_sequence,
+            }),
         })
     }
 
@@ -141,13 +173,14 @@ impl SemanticJournalView {
             if !seen.insert(event.event_id) {
                 return Err(RenderModelError::InvalidIdentity("event_id"));
             }
-            rows.push(JournalRow::Fixture(event.clone()));
+            rows.push(JournalRow::Event(event.clone()));
         }
         Ok(Self {
             origin: JournalOrigin::ConformanceFixture,
             availability: JournalAvailability::ConformanceFixture,
             task_id,
             rows,
+            cursor: None,
         })
     }
 
@@ -160,7 +193,7 @@ impl SemanticJournalView {
     }
 
     pub fn journal_cursor(&self) -> Option<JournalCursor> {
-        None
+        self.cursor
     }
 
     pub fn task_id(&self) -> TaskId {
@@ -185,13 +218,150 @@ impl SemanticJournalView {
         }
         let mut items = Vec::with_capacity(self.rows.len());
         for row in &self.rows {
-            let JournalRow::Fixture(event) = row;
+            let JournalRow::Event(event) = row;
             let mut item = registry.project(event)?;
             gate_interaction(&mut item, capabilities);
             items.push(item);
         }
         Ok(items)
     }
+}
+
+fn live_fact_event(
+    task_id: TaskId,
+    target: CapturedActionTarget,
+    fact: &SemanticJournalFact,
+) -> Result<SemanticEvent, RenderModelError> {
+    use std::collections::BTreeMap;
+
+    let provider = super::ProviderKind::parse(fact.provider.clone())?;
+    let body = if fact.redacted {
+        SemanticEventBody::Extension {
+            source_kind: fact.kind.clone(),
+            fields: BTreeMap::from([("status".to_string(), "redacted".to_string())]),
+        }
+    } else {
+        match &fact.payload {
+            SemanticJournalPayload::UserMessage { text } => SemanticEventBody::Message {
+                role: "You".to_string(),
+                text: text.clone(),
+                streaming: false,
+            },
+            SemanticJournalPayload::AssistantText { text } => SemanticEventBody::Message {
+                role: "Assistant".to_string(),
+                text: text.clone(),
+                streaming: false,
+            },
+            SemanticJournalPayload::ReasoningSummary { text } => SemanticEventBody::Message {
+                role: "Reasoning".to_string(),
+                text: text.clone(),
+                streaming: false,
+            },
+            SemanticJournalPayload::ToolCall { tool_name, call_id } => SemanticEventBody::Tool {
+                tool_id: call_id.clone(),
+                name: tool_name.clone(),
+                state: "running".to_string(),
+                summary: String::new(),
+            },
+            SemanticJournalPayload::ToolResult { call_id, status } => SemanticEventBody::Tool {
+                tool_id: call_id.clone(),
+                name: "Tool result".to_string(),
+                state: "completed".to_string(),
+                summary: status.clone(),
+            },
+            SemanticJournalPayload::Question {
+                question_id,
+                prompt,
+                options,
+            } => SemanticEventBody::Question {
+                request_id: RequestId::parse(question_id)
+                    .or_else(|_| RequestId::from_bytes(*fact.id.as_bytes()))
+                    .map_err(|_| RenderModelError::InvalidIdentity("request_id"))?,
+                prompt: prompt.clone(),
+                choices: options.clone(),
+                action_epoch: target.action_epoch,
+                runtime_generation: target.runtime_generation,
+                capability: true,
+                settled_choice: None,
+            },
+            SemanticJournalPayload::ApprovalRequest {
+                request_id,
+                summary,
+            } => SemanticEventBody::Approval {
+                request_id: RequestId::parse(request_id)
+                    .or_else(|_| RequestId::from_bytes(*fact.id.as_bytes()))
+                    .map_err(|_| RenderModelError::InvalidIdentity("request_id"))?,
+                summary: summary.clone(),
+                action_epoch: target.action_epoch,
+                runtime_generation: target.runtime_generation,
+                capability: true,
+                settled: false,
+            },
+            SemanticJournalPayload::ApprovalResult {
+                request_id,
+                decision,
+            } => SemanticEventBody::Approval {
+                request_id: RequestId::parse(request_id)
+                    .or_else(|_| RequestId::from_bytes(*fact.id.as_bytes()))
+                    .map_err(|_| RenderModelError::InvalidIdentity("request_id"))?,
+                summary: decision.clone(),
+                action_epoch: target.action_epoch,
+                runtime_generation: target.runtime_generation,
+                capability: true,
+                settled: true,
+            },
+            SemanticJournalPayload::PlanStep { title, status, .. } => SemanticEventBody::Plan {
+                title: title.clone(),
+                steps: vec![title.clone()],
+                status: status.clone(),
+            },
+            SemanticJournalPayload::Error { code, message } => SemanticEventBody::Message {
+                role: format!("Error ({code})"),
+                text: message.clone(),
+                streaming: false,
+            },
+            SemanticJournalPayload::TurnState { state }
+            | SemanticJournalPayload::SessionState { state } => SemanticEventBody::Extension {
+                source_kind: fact.kind.clone(),
+                fields: BTreeMap::from([("state".to_string(), state.clone())]),
+            },
+            SemanticJournalPayload::UsageObservation { remaining_percent } => {
+                SemanticEventBody::Extension {
+                    source_kind: fact.kind.clone(),
+                    fields: BTreeMap::from([(
+                        "remaining".to_string(),
+                        remaining_percent
+                            .map(|value| format!("{value}%"))
+                            .unwrap_or_else(|| "unknown".to_string()),
+                    )]),
+                }
+            }
+            SemanticJournalPayload::ArtifactReference { label } => SemanticEventBody::Extension {
+                source_kind: fact.kind.clone(),
+                fields: BTreeMap::from([("artifact".to_string(), label.clone())]),
+            },
+            SemanticJournalPayload::Unknown {
+                source_type,
+                diagnostic_ref,
+                ..
+            } => SemanticEventBody::Extension {
+                source_kind: source_type.clone(),
+                fields: BTreeMap::from([("detail".to_string(), diagnostic_ref.clone())]),
+            },
+        }
+    };
+    Ok(SemanticEvent {
+        event_id: fact.id,
+        task_id,
+        schema_version: u16::try_from(fact.schema_version).unwrap_or(u16::MAX),
+        provider,
+        source_type: fact.kind.clone(),
+        occurred_at_ms: fact.sequence,
+        raw_terminal_available: false,
+        turn_id: None,
+        related_event_id: None,
+        body,
+    })
 }
 
 fn gate_interaction(item: &mut TimelineItemModel, capabilities: CapabilitySet) {

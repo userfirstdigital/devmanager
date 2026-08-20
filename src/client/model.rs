@@ -1111,6 +1111,60 @@ pub struct ClientModel {
     task_projection_index: TaskProjectionIndex,
 }
 
+/// Bounded Tasks-only inbox preview. Never a substitute for [`ClientModel`]:
+/// it carries only fully paged task snapshots and the pinned through-sequence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskInboxPreview {
+    tasks: BTreeMap<TaskId, TaskSnapshot>,
+    through_sequence: u64,
+}
+
+impl TaskInboxPreview {
+    pub fn tasks(&self) -> &BTreeMap<TaskId, TaskSnapshot> {
+        &self.tasks
+    }
+
+    pub fn through_sequence(&self) -> u64 {
+        self.through_sequence
+    }
+
+    pub fn task_ids(&self) -> impl Iterator<Item = TaskId> + '_ {
+        self.tasks.keys().copied()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_tasks_for_test(
+        tasks: BTreeMap<TaskId, TaskSnapshot>,
+        through_sequence: u64,
+    ) -> Self {
+        Self {
+            tasks,
+            through_sequence,
+        }
+    }
+}
+
+fn task_snapshot_from_item(item: TaskSnapshotItem) -> TaskSnapshot {
+    let task_id = item.task.id;
+    TaskSnapshot {
+        task: item.task,
+        connectivity: item.connectivity,
+        attention: item.attention,
+        activity: item.activity,
+        review_readiness: item.review_readiness,
+        agents: BTreeMap::new(),
+        primary_agent_id: None,
+        artifacts: BTreeMap::new(),
+        resources: BTreeMap::new(),
+        provider_sessions: BTreeMap::new(),
+        browser: {
+            let mut browser = crate::domain::browser::BrowserBook::new();
+            let _ = browser.open_task(task_id);
+            browser
+        },
+    }
+}
+
 impl ClientModel {
     pub fn tasks(&self) -> &BTreeMap<TaskId, TaskSnapshot> {
         &self.tasks
@@ -1801,32 +1855,45 @@ impl ClientModelBuilder {
         {
             return Err(ClientModelError::MissingSections);
         }
+        self.finish_assembled()
+    }
+
+    /// Finish after a fully paged Tasks section only. Returns a dedicated
+    /// [`TaskInboxPreview`]; never constructs [`ClientModel`].
+    pub fn finish_tasks_preview(self) -> Result<TaskInboxPreview, ClientModelError> {
+        let tasks_idx = section_index(SnapshotSection::Tasks);
+        if !self.sections[tasks_idx].finished {
+            return Err(ClientModelError::MissingSections);
+        }
+        for (idx, section) in self.sections.iter().enumerate() {
+            if idx != tasks_idx && section.started {
+                return Err(ClientModelError::DuplicateSection);
+            }
+        }
+        let through_sequence = self
+            .through_sequence
+            .ok_or(ClientModelError::MissingSections)?;
+        let mut tasks = BTreeMap::new();
+        for (task_id, item) in self.tasks {
+            tasks.insert(task_id, task_snapshot_from_item(item));
+        }
+        Ok(TaskInboxPreview {
+            tasks,
+            through_sequence,
+        })
+    }
+
+    fn finish_assembled(self) -> Result<ClientModel, ClientModelError> {
         let through_sequence = self
             .through_sequence
             .ok_or(ClientModelError::MissingSections)?;
 
         let mut tasks = BTreeMap::new();
         for (task_id, item) in self.tasks {
-            tasks.insert(
-                task_id,
-                TaskSnapshot {
-                    task: item.task,
-                    connectivity: item.connectivity,
-                    attention: item.attention,
-                    activity: item.activity,
-                    review_readiness: item.review_readiness,
-                    agents: BTreeMap::new(),
-                    primary_agent_id: item.primary_agent_id,
-                    artifacts: BTreeMap::new(),
-                    resources: BTreeMap::new(),
-                    provider_sessions: BTreeMap::new(),
-                    browser: {
-                        let mut browser = crate::domain::browser::BrowserBook::new();
-                        let _ = browser.open_task(task_id);
-                        browser
-                    },
-                },
-            );
+            let primary_agent_id = item.primary_agent_id;
+            let mut snapshot = task_snapshot_from_item(item);
+            snapshot.primary_agent_id = primary_agent_id;
+            tasks.insert(task_id, snapshot);
         }
 
         for (agent_id, agent) in self.agents {
@@ -3715,5 +3782,117 @@ mod tests {
         assert_eq!(visible, vec![("claude".into(), "55% remaining".into())]);
         assert!(!quota_observation_is_fresh(None, now));
         assert!(!quota_observation_is_fresh(Some(now + 5), now));
+    }
+
+    #[test]
+    fn finish_tasks_preview_returns_dedicated_type_not_client_model() {
+        let snap = snapshot_id(0xe1);
+        let first = task_id(0xe2);
+        let second = task_id(0xe3);
+        let mut builder = ClientModelBuilder::new();
+        builder
+            .ingest_page(page(
+                snap,
+                7,
+                SnapshotSection::Tasks,
+                None,
+                vec![SnapshotItem::Task(task_item(first, "Preview A", None))],
+                Some(vec![1]),
+            ))
+            .expect("first tasks page");
+        builder
+            .ingest_page(page(
+                snap,
+                7,
+                SnapshotSection::Tasks,
+                Some(crate::domain::snapshot::SnapshotItemKey::Task(first)),
+                vec![SnapshotItem::Task(task_item(second, "Preview B", None))],
+                None,
+            ))
+            .expect("second tasks page");
+
+        let incomplete = {
+            let mut incomplete = ClientModelBuilder::new();
+            incomplete
+                .ingest_page(page(
+                    snap,
+                    7,
+                    SnapshotSection::Tasks,
+                    None,
+                    vec![SnapshotItem::Task(task_item(first, "Preview A", None))],
+                    None,
+                ))
+                .expect("tasks");
+            incomplete
+        };
+        assert!(matches!(
+            incomplete.finish(),
+            Err(ClientModelError::MissingSections)
+        ));
+
+        let preview = builder
+            .finish_tasks_preview()
+            .expect("tasks-only preview must finish");
+        // Dedicated type: through_sequence + tasks only; not ClientModel APIs.
+        assert_eq!(preview.through_sequence(), 7);
+        assert_eq!(preview.tasks().len(), 2);
+        assert!(preview.tasks().contains_key(&first));
+        assert!(preview.tasks().contains_key(&second));
+        let ids: Vec<_> = preview.task_ids().collect();
+        assert_eq!(ids.len(), 2);
+    }
+
+    #[test]
+    fn finish_tasks_preview_rejects_started_browser_sections() {
+        use crate::domain::browser::{BrowserContextView, BrowserHealth};
+        use crate::domain::id::BrowserContextId;
+        use std::collections::{BTreeMap, BTreeSet};
+
+        let snap = snapshot_id(0xe4);
+        let task = task_id(0xe5);
+        let context = BrowserContextId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xe6,
+        ])
+        .expect("context");
+        let mut builder = ClientModelBuilder::new();
+        builder
+            .ingest_page(page(
+                snap,
+                9,
+                SnapshotSection::Tasks,
+                None,
+                vec![SnapshotItem::Task(task_item(task, "Only tasks", None))],
+                None,
+            ))
+            .expect("tasks");
+        builder
+            .ingest_page(page(
+                snap,
+                9,
+                SnapshotSection::BrowserContexts,
+                None,
+                vec![SnapshotItem::BrowserContext(BrowserContextView {
+                    context_id: context,
+                    task_id: task,
+                    generation: 1,
+                    selected_tab_id: None,
+                    health: BrowserHealth::Healthy,
+                    closed: false,
+                    permissions: BTreeMap::new(),
+                    linked_artifacts: BTreeSet::new(),
+                    recipe_id: None,
+                    recording_id: None,
+                })],
+                None,
+            ))
+            .expect("browser contexts must ingest");
+        assert!(
+            matches!(
+                builder.finish_tasks_preview(),
+                Err(ClientModelError::DuplicateSection)
+            ),
+            "started browser sections must fail Tasks-only preview"
+        );
     }
 }

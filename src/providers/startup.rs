@@ -127,7 +127,7 @@ pub(crate) fn prove_adapter_launch(
         .map(OsString::from)
         .collect::<Vec<_>>();
     let spec = ProviderAdapterLaunchSpec::from_registry(
-        observation.executable().clone(),
+        observation.executable_handle().clone(),
         arguments,
         cwd,
         environment,

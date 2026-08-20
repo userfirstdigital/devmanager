@@ -17,8 +17,8 @@ use crate::protocol::StreamFrame;
 use crate::services::ProcessManager;
 use crate::terminal::session::TerminalSessionView;
 use crate::terminal::view::{
-    render_terminal_surface, terminal_pane_from_replica, ReplicaPaneRequest, TerminalPaneModel,
-    TerminalReplicaOverlay, TerminalScrollbarModel, TerminalSearchHighlight, TerminalSearchUiModel,
+    terminal_pane_from_replica, ReplicaPaneRequest, TerminalPaneModel, TerminalReplicaOverlay,
+    TerminalScrollbarModel, TerminalSearchHighlight, TerminalSearchUiModel,
     TerminalSelectionSnapshot,
 };
 use crate::ui::components::empty_state::EmptyState;
@@ -39,10 +39,9 @@ pub const MAX_REPLICA_CELLS: usize = 256 * 512;
 pub const MAX_SEARCH_SCALARS: usize = 256;
 pub const MAX_EXIT_SUMMARY_SCALARS: usize = 160;
 
-const DOCK_TOOLS: [DockTool; 7] = [
+const DOCK_TOOLS: [DockTool; 6] = [
     DockTool::Changes,
     DockTool::Files,
-    DockTool::Terminal,
     DockTool::Browser,
     DockTool::Services,
     DockTool::Artifacts,
@@ -74,7 +73,28 @@ impl DockTool {
     }
 
     fn from_alt_index(index: u8) -> Option<Self> {
-        DOCK_TOOLS.get((index as usize).saturating_sub(1)).copied()
+        match index {
+            1 => Some(Self::Changes),
+            2 => Some(Self::Files),
+            3 => Some(Self::Terminal),
+            4 => Some(Self::Browser),
+            5 => Some(Self::Services),
+            6 => Some(Self::Artifacts),
+            7 => Some(Self::Review),
+            _ => None,
+        }
+    }
+
+    fn alt_index(self) -> u8 {
+        match self {
+            Self::Changes => 1,
+            Self::Files => 2,
+            Self::Terminal => 3,
+            Self::Browser => 4,
+            Self::Services => 5,
+            Self::Artifacts => 6,
+            Self::Review => 7,
+        }
     }
 }
 
@@ -673,8 +693,7 @@ impl ContextDock {
     }
 
     pub fn showing_raw_terminal(&self) -> bool {
-        self.active_tool() == DockTool::Terminal
-            && self.terminal_presentation() == TerminalPresentation::Raw
+        self.terminal_presentation() == TerminalPresentation::Raw
     }
 
     pub fn is_collapsed(&self) -> bool {
@@ -710,15 +729,31 @@ impl ContextDock {
         self.advance_epochs();
     }
 
+    /// Drop the active selection without erasing per-task presentation memory.
+    /// Conversation/Terminal restore depends on `remembered` surviving temporary
+    /// deselection while the idle canvas is shown.
+    pub fn clear_selection(&mut self) {
+        self.selected_task = None;
+        self.cockpit_projection = None;
+        self.press_owner = None;
+        self.focused_tab_index = None;
+        self.terminal_mouse_report_emitted = false;
+        self.terminal_selection_changed = false;
+        self.terminal_click_completed = false;
+        self.advance_epochs();
+    }
+
     fn select_tool(&mut self, tool: DockTool) {
         if self.selected_task.is_none() {
             return;
         }
+        if tool == DockTool::Terminal {
+            self.set_terminal_presentation(TerminalPresentation::Raw);
+            return;
+        }
         self.with_memory(|memory| {
             memory.tool = tool;
-            if tool != DockTool::Terminal {
-                memory.viewport.focused = false;
-            }
+            memory.viewport.focused = false;
         });
         self.focused_tab_index = DOCK_TOOLS.iter().position(|candidate| *candidate == tool);
         self.advance_epochs();
@@ -729,7 +764,6 @@ impl ContextDock {
             return;
         }
         self.with_memory(|memory| {
-            memory.tool = DockTool::Terminal;
             memory.terminal_presentation = presentation;
             memory.viewport.focused = presentation == TerminalPresentation::Raw;
         });
@@ -1163,7 +1197,11 @@ impl ContextDock {
     }
 
     pub fn focus_terminal(&mut self) {
-        if self.needs_resync || !self.showing_raw_terminal() || self.is_collapsed() {
+        if self.needs_resync
+            || self.active_tool() != DockTool::Terminal
+            || !self.showing_raw_terminal()
+            || self.is_collapsed()
+        {
             return;
         }
         self.with_memory(|memory| memory.viewport.focused = true);
@@ -1194,7 +1232,8 @@ impl ContextDock {
                 true
             }
             DockPointerSurface::TerminalGrid => {
-                if !self.showing_raw_terminal()
+                if self.active_tool() != DockTool::Terminal
+                    || !self.showing_raw_terminal()
                     || self.is_collapsed()
                     || !self.current_memory().viewport.focused
                 {
@@ -1277,7 +1316,10 @@ impl ContextDock {
     }
 
     pub fn terminal_mouse_reports_enabled(&self) -> bool {
-        self.terminal_click_completed && !self.is_collapsed() && self.showing_raw_terminal()
+        self.terminal_click_completed
+            && self.active_tool() == DockTool::Terminal
+            && !self.is_collapsed()
+            && self.showing_raw_terminal()
     }
 
     pub fn terminal_mouse_report_emitted(&self) -> bool {
@@ -1444,7 +1486,7 @@ impl ContextDock {
                     name: tool.label().to_string(),
                     selected: *tool == active,
                     unavailable,
-                    shortcut: DockShortcut::AltTool((index + 1) as u8),
+                    shortcut: DockShortcut::AltTool(tool.alt_index()),
                     accessibility,
                 }
             })
@@ -1505,18 +1547,7 @@ impl ContextDock {
                 )
             },
         );
-        let live_output = self.live_output();
-        let body = if self.showing_raw_terminal() && !self.is_collapsed() {
-            render_terminal_surface(&self.terminal_pane_model(), None).into_any_element()
-        } else if chrome.active_tool == DockTool::Terminal
-            && !live_output.is_empty()
-            && !self.is_collapsed()
-        {
-            div()
-                .text_color(rgb(tokens.text.primary.to_u32()))
-                .child(live_output)
-                .into_any_element()
-        } else if let Some(summary) = self.cockpit_surface_summary(chrome.active_tool) {
+        let body = if let Some(summary) = self.cockpit_surface_summary(chrome.active_tool) {
             div()
                 .text_color(rgb(tokens.text.primary.to_u32()))
                 .child(summary)
@@ -1856,6 +1887,32 @@ mod process_census_tests {
         assert_eq!(
             census.one_provider_one_pty_proof(),
             Err(DependencyUnavailable::LiveRuntimeCensus)
+        );
+    }
+
+    #[test]
+    fn terminal_shortcut_switches_canvas_without_becoming_a_context_dock_tool() {
+        let (model, task_id) = census_client_model();
+        let mut dock = ContextDock::new(DockEdge::Right);
+        dock.follow_task(task_id);
+        dock.bind_from_model(&model).expect("bind");
+
+        let context_tool = dock.active_tool();
+        assert!(!ContextDock::tools().contains(&DockTool::Terminal));
+        dock.dispatch_shortcut(DockShortcut::AltTool(3), RequestId::new(), &model)
+            .expect("terminal canvas shortcut");
+
+        assert!(dock.showing_raw_terminal());
+        assert_eq!(dock.active_tool(), context_tool);
+        let chrome = dock.chrome();
+        assert!(chrome.tabs.iter().all(|tab| tab.tool != DockTool::Terminal));
+        assert_eq!(
+            chrome
+                .tabs
+                .iter()
+                .find(|tab| tab.tool == DockTool::Browser)
+                .map(|tab| tab.shortcut),
+            Some(DockShortcut::AltTool(4))
         );
     }
 

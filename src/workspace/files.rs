@@ -1704,6 +1704,8 @@ pub struct WorkspaceFileService {
     lease_guard: OpaqueTask6LeaseGuard,
     #[cfg(test)]
     test_budget_mode: AtomicUsize,
+    #[cfg(test)]
+    root_revalidations: AtomicUsize,
 }
 
 struct TombstoneReservation {
@@ -1761,26 +1763,20 @@ impl WorkspaceFileService {
         Self::from_task6_binding(binding)
     }
 
+    /// Issue a least-authority service for browsing and reading. Read-only
+    /// callers must not depend on the workspace-wide mutation recovery scan:
+    /// large repositories can exceed that scan's deliberate safety bound even
+    /// though a bounded list or read is still safe and fully authorized.
+    pub(crate) fn from_task6_read_workspace<L: Task6WorkspaceLease>(
+        lease: L,
+    ) -> Result<Self, FileServiceError> {
+        let mut binding = lease.into_file_binding()?;
+        binding.root.root.write_handle = None;
+        Self::from_task6_binding_unrecovered(binding)
+    }
+
     fn from_task6_binding(binding: Task6FileBinding) -> Result<Self, FileServiceError> {
-        let mut authority = [0_u8; 16];
-        fill_random(&mut authority).map_err(|_| FileServiceError::AuthorityUnavailable)?;
-        let mut epoch_bytes = [0_u8; 8];
-        fill_random(&mut epoch_bytes).map_err(|_| FileServiceError::AuthorityUnavailable)?;
-        let cursor_epoch = u64::from_le_bytes(epoch_bytes).max(1);
-        let service = Self {
-            root: binding.root.root,
-            authority,
-            binding: binding.authority,
-            cursor_epoch,
-            active_operations: Arc::new(AtomicUsize::new(0)),
-            mutation_locks: DeadlineMutex::new(HashMap::new()),
-            directory_identities: DeadlineMutex::new(HashMap::new()),
-            directory_identity_order: DeadlineMutex::new(VecDeque::new()),
-            cleanup: Arc::new(CleanupLedger::new()),
-            lease_guard: binding.lease_guard,
-            #[cfg(test)]
-            test_budget_mode: AtomicUsize::new(0),
-        };
+        let service = Self::from_task6_binding_unrecovered(binding)?;
         let deadline = service.operation_deadline();
         deadline.check()?;
         #[cfg(target_os = "linux")]
@@ -1807,6 +1803,30 @@ impl WorkspaceFileService {
         })?;
         service.discover_tombstones(&deadline)?;
         Ok(service)
+    }
+
+    fn from_task6_binding_unrecovered(binding: Task6FileBinding) -> Result<Self, FileServiceError> {
+        let mut authority = [0_u8; 16];
+        fill_random(&mut authority).map_err(|_| FileServiceError::AuthorityUnavailable)?;
+        let mut epoch_bytes = [0_u8; 8];
+        fill_random(&mut epoch_bytes).map_err(|_| FileServiceError::AuthorityUnavailable)?;
+        let cursor_epoch = u64::from_le_bytes(epoch_bytes).max(1);
+        Ok(Self {
+            root: binding.root.root,
+            authority,
+            binding: binding.authority,
+            cursor_epoch,
+            active_operations: Arc::new(AtomicUsize::new(0)),
+            mutation_locks: DeadlineMutex::new(HashMap::new()),
+            directory_identities: DeadlineMutex::new(HashMap::new()),
+            directory_identity_order: DeadlineMutex::new(VecDeque::new()),
+            cleanup: Arc::new(CleanupLedger::new()),
+            lease_guard: binding.lease_guard,
+            #[cfg(test)]
+            test_budget_mode: AtomicUsize::new(0),
+            #[cfg(test)]
+            root_revalidations: AtomicUsize::new(0),
+        })
     }
 
     #[cfg(test)]
@@ -1885,6 +1905,16 @@ impl WorkspaceFileService {
     #[cfg(test)]
     pub(crate) fn set_test_budget_mode(&self, mode: usize) {
         self.test_budget_mode.store(mode, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_root_revalidations_for_test(&self) {
+        self.root_revalidations.store(0, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn root_revalidation_count_for_test(&self) -> usize {
+        self.root_revalidations.load(Ordering::Acquire)
     }
 
     #[cfg(test)]
@@ -3782,7 +3812,13 @@ impl WorkspaceFileService {
                 |dir| format!("{}/{}", dir.as_str(), name),
             );
             let path = normalize_relative_path(&raw_path)?;
-            let target = self.resolve_existing_with_deadline(&path, deadline)?;
+            // The root was revalidated immediately before this handle-relative
+            // snapshot and is revalidated again before the public operation
+            // returns. Reopening the named root once per child adds no
+            // authority: every child is opened from the already-pinned handle,
+            // and a concurrent name replacement is caught by the final fence.
+            let target =
+                self.resolve_existing_from_validated_root_with_deadline(&path, deadline)?;
             let metadata = target.metadata.as_ref().expect("directory entry metadata");
             let target_identity = target.identity.ok_or(FileServiceError::RootUnavailable)?;
             let kind = if metadata.is_file() {
@@ -3891,7 +3927,26 @@ impl WorkspaceFileService {
         self.resolve_target_with_deadline(path, false, deadline)
     }
 
+    fn resolve_existing_from_validated_root_with_deadline(
+        &self,
+        path: &RepoPath,
+        deadline: &OperationDeadline,
+    ) -> Result<ResolvedTarget, FileServiceError> {
+        self.resolve_target_from_validated_root_with_deadline(path, false, deadline)
+    }
+
     fn resolve_target_with_deadline(
+        &self,
+        path: &RepoPath,
+        allow_missing_final: bool,
+        deadline: &OperationDeadline,
+    ) -> Result<ResolvedTarget, FileServiceError> {
+        deadline.check()?;
+        self.revalidate_root_with_deadline(deadline)?;
+        self.resolve_target_from_validated_root_with_deadline(path, allow_missing_final, deadline)
+    }
+
+    fn resolve_target_from_validated_root_with_deadline(
         &self,
         path: &RepoPath,
         allow_missing_final: bool,
@@ -3901,7 +3956,6 @@ impl WorkspaceFileService {
         if path.0.split('/').any(is_private_cleanup_component) {
             return Err(private_cleanup_not_found());
         }
-        self.revalidate_root_with_deadline(deadline)?;
         let components = path.0.split('/').collect::<Vec<_>>();
         let mut current_path = self.root.path.clone();
         let mut parent_path = self.root.path.clone();
@@ -4188,6 +4242,8 @@ impl WorkspaceFileService {
         &self,
         deadline: &OperationDeadline,
     ) -> Result<(), FileServiceError> {
+        #[cfg(test)]
+        self.root_revalidations.fetch_add(1, Ordering::AcqRel);
         // The descriptor remains the authority for traversal. This additional
         // metadata check only detects that the originally approved root name
         // was replaced or reparse-swapped. The production Task 6.2 binder

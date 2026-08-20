@@ -11,7 +11,7 @@ pub use model::{
     TaskKind, WorkspaceBinding, WorkspaceKind, WorkspaceProjectRoots, WorkspaceProjectRootsError,
     WorkspaceRequest, WorkspaceResolution, WorkspaceResource,
 };
-pub(crate) use service::issue_file_service;
+pub(crate) use service::{issue_file_service, issue_read_file_service};
 pub use service::{
     WorkspaceAuthorization, WorkspaceError, WorkspaceLeaseError, WorkspaceResourceCoordinator,
     WorkspaceResourceLease, WorkspaceService,
@@ -2109,7 +2109,7 @@ fn render_settings_panel(
                     model,
                     actions,
                     None,
-                    "npx -y @anthropic-ai/claude-code@latest --dangerously-skip-permissions",
+                    "npx -y @anthropic-ai/claude-code@latest",
                 )
                 .into_any_element(),
             ),
@@ -2122,7 +2122,7 @@ fn render_settings_panel(
                     model,
                     actions,
                     None,
-                    "npx -y @openai/codex@latest --dangerously-bypass-approvals-and-sandbox",
+                    "npx -y @openai/codex@latest",
                 )
                 .into_any_element(),
             ),
@@ -4378,10 +4378,8 @@ fn sample_settings_draft(open_picker: Option<SettingsPicker>) -> SettingsDraft {
         mac_terminal_profile: MacTerminalProfile::Zsh,
         theme: "dark".to_string(),
         log_buffer_size: "10000".to_string(),
-        claude_command: "npx -y @anthropic-ai/claude-code@latest --dangerously-skip-permissions"
-            .to_string(),
-        codex_command: "npx -y @openai/codex@latest --dangerously-bypass-approvals-and-sandbox"
-            .to_string(),
+        claude_command: "npx -y @anthropic-ai/claude-code@latest".to_string(),
+        codex_command: "npx -y @openai/codex@latest".to_string(),
         notification_sound: "glass".to_string(),
         confirm_on_close: true,
         minimize_to_tray: false,

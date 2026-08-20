@@ -19,7 +19,7 @@ use devmanager::host::{
     AcceptHelloConfig, HelloListener, HostCleanupWorker, HostConnection, HostExecutorOutcome,
     HostLock, HostLockError, HostRequestExecutor, HostRequestHandle, HostRestartDisposition,
     OrganizationRuntime, OrganizationRuntimeConfig, PhysicalExitArmRequest, SupervisedHostExecutor,
-    HOST_EXIT_ALREADY_RUNNING,
+    HOST_EXIT_ALREADY_RUNNING, NATIVE_HOST_BASE_CAPABILITIES,
 };
 use devmanager::kernel::CommandBus;
 use devmanager::protocol::{
@@ -77,6 +77,21 @@ impl From<String> for HostRunError {
 }
 
 fn main() -> ExitCode {
+    // Provider sessions are launched by the durable host, so their hook
+    // settings point back to this executable. Relay subcommands must exit
+    // before ctl parsing, HostLock acquisition, or server bootstrap.
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    if let Some(exit_code) =
+        devmanager::ai::claude_hooks::run_hook_relay_subcommand(&args, std::io::stdin().lock())
+    {
+        return exit_code;
+    }
+    if let Some(exit_code) =
+        devmanager::ai::codex_hooks::run_codex_hook_relay_subcommand(&args, std::io::stdin().lock())
+    {
+        return exit_code;
+    }
+
     let mut argv = std::env::args().skip(1).peekable();
     // Dispatch ctl before foreground-host bootstrap so CLI never parses or uses
     // --parent-pid, --config-base, or HostLock.
@@ -89,10 +104,12 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(HostRunError::AlreadyRunning(message)) => {
             let _ = writeln!(io::stderr(), "devmanager-host: {message}");
+            let _ = io::stderr().flush();
             ExitCode::from(HOST_EXIT_ALREADY_RUNNING)
         }
         Err(HostRunError::Message(message)) => {
             let _ = writeln!(io::stderr(), "devmanager-host: {message}");
+            let _ = io::stderr().flush();
             ExitCode::FAILURE
         }
     }
@@ -681,9 +698,9 @@ impl Drop for ParentProcess {
 fn actual_parent_pid() -> Result<u32, String> {
     use sysinfo::{Pid, ProcessesToUpdate, System};
 
-    let mut system = System::new();
-    system.refresh_processes(ProcessesToUpdate::All, true);
     let self_pid = Pid::from_u32(std::process::id());
+    let mut system = System::new();
+    system.refresh_processes(ProcessesToUpdate::Some(&[self_pid]), true);
     let process = system
         .process(self_pid)
         .ok_or_else(|| "unable to resolve current process via sysinfo".to_string())?;
@@ -773,20 +790,35 @@ fn open_and_validate_parent(parent_pid: u32) -> Result<ParentProcess, String> {
 #[cfg(windows)]
 fn parent_has_exited(parent: &ParentProcess) -> Result<bool, String> {
     use windows::Win32::Foundation::{WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
-    use windows::Win32::System::Threading::WaitForSingleObject;
+    use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
+
+    const STILL_ACTIVE: u32 = 259;
 
     let result = unsafe { WaitForSingleObject(parent.handle, 0) };
-    if result == WAIT_OBJECT_0 {
-        Ok(true)
-    } else if result == WAIT_TIMEOUT {
-        Ok(false)
-    } else if result == WAIT_FAILED {
-        Err("WaitForSingleObject on parent process failed".to_string())
-    } else {
-        Err(format!(
-            "unexpected WaitForSingleObject result for parent process: {result:?}"
-        ))
+    if result == WAIT_TIMEOUT {
+        return Ok(false);
     }
+    if result == WAIT_FAILED {
+        return Err("WaitForSingleObject on parent process failed".to_string());
+    }
+    if result != WAIT_OBJECT_0 {
+        return Err(format!(
+            "unexpected WaitForSingleObject result for parent process: {result:?}"
+        ));
+    }
+
+    let mut exit_code = 0u32;
+    if unsafe { GetExitCodeProcess(parent.handle, &mut exit_code) }.is_ok()
+        && exit_code == STILL_ACTIVE
+    {
+        let _ = writeln!(
+            io::stderr(),
+            "devmanager-host: parent wait signaled while process is still active; ignoring"
+        );
+        let _ = io::stderr().flush();
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 #[cfg(windows)]
@@ -887,7 +919,13 @@ async fn finish_supervised_host(
     let mut intentional_match = None;
 
     match exit {
-        HostLoopExit::Parent(Ok(())) => {}
+        HostLoopExit::Parent(Ok(())) => {
+            let _ = writeln!(
+                io::stderr(),
+                "devmanager-host: parent process exited; stopping"
+            );
+            let _ = io::stderr().flush();
+        }
         HostLoopExit::Parent(Err(error)) | HostLoopExit::Listener(error) => errors.push(error),
         HostLoopExit::Executor(Ok(Ok(HostExecutorOutcome::Intentional {
             operation_id,
@@ -961,13 +999,21 @@ fn spawn_connection_task(
     tasks.spawn(async move {
         // Duplex serve owns reader+writer halves until disconnect; abort/drain
         // of this JoinSet task reaps both halves with the connection lifecycle.
-        let matched_slow = slow_durable_reader_client_id == Some(connection.client_id());
-        if matched_slow {
-            let _ = connection
+        let client_id = connection.client_id();
+        let matched_slow = slow_durable_reader_client_id == Some(client_id);
+        let result = if matched_slow {
+            connection
                 .serve_duplex_for_test_slow_durable_reader(requests)
-                .await;
+                .await
         } else {
-            let _ = connection.serve_duplex(requests).await;
+            connection.serve_duplex(requests).await
+        };
+        if let Err(error) = result {
+            let _ = writeln!(
+                io::stderr(),
+                "devmanager-host: client {client_id} duplex connection ended with error: {error}"
+            );
+            let _ = io::stderr().flush();
         }
     });
 }
@@ -993,7 +1039,7 @@ async fn serve_foreground_host(
             mut arm_rx,
             mut join,
         },
-    ) = HostRequestExecutor::start_supervised_with_config_store(bus, config_store)
+    ) = HostRequestExecutor::start_supervised_with_config_store(bus, config_store, profile_root)
         .map_err(|error| format!("invalid host project configuration: {error}"))?;
 
     // The host owns the restored projection for its full process lifetime.
@@ -1019,25 +1065,14 @@ async fn serve_foreground_host(
         host_boot_id,
         server_build: format!("devmanager-host/{}", env!("CARGO_PKG_VERSION")),
         supported: CapabilitySet::from_capabilities(
-            [
-                Capability::PagedSnapshots,
-                Capability::EventReplay,
-                Capability::OperationSettlement,
-                Capability::ChunkResume,
-                Capability::PromptProjection,
-                Capability::ExplicitDetach,
-                Capability::HostShutdown,
-                Capability::UpdateHandoff,
-                Capability::ProviderInput,
-                Capability::TaskCockpit,
-            ]
-            .into_iter()
-            .chain(organization_runtime.capability().advertised_capability())
-            .chain(
-                request_handle
-                    .configured_service_supervisor_ready()
-                    .then_some(Capability::ServiceSupervisor),
-            ),
+            NATIVE_HOST_BASE_CAPABILITIES
+                .into_iter()
+                .chain(organization_runtime.capability().advertised_capability())
+                .chain(
+                    request_handle
+                        .configured_service_supervisor_ready()
+                        .then_some(Capability::ServiceSupervisor),
+                ),
         ),
         local_limits: FrameLimits::v1_default(),
     };
@@ -1117,6 +1152,8 @@ async fn serve_foreground_host(
     // cancels and drops the sole pending listener. On arm, take/drop before ack.
     let mut accept_task = Some(Box::pin(listener.accept_with_successor()));
     let mut armed: Option<(devmanager::domain::id::OperationId, u64)> = None;
+    let _ = writeln!(io::stderr(), "devmanager-host: listening for clients");
+    let _ = io::stderr().flush();
 
     let exit = loop {
         tokio::select! {
@@ -1156,7 +1193,14 @@ async fn serve_foreground_host(
             connection_result = connection_tasks.join_next(), if !connection_tasks.is_empty() => {
                 match connection_result {
                     Some(Ok(())) => {}
-                    Some(Err(error)) => break HostLoopExit::Connection(error),
+                    Some(Err(error)) => {
+                        let _ = writeln!(
+                            io::stderr(),
+                            "devmanager-host: {}; continuing to accept clients",
+                            join_error_message("connection task", error)
+                        );
+                        let _ = io::stderr().flush();
+                    }
                     None => {}
                 }
             }
@@ -1178,13 +1222,16 @@ async fn serve_foreground_host(
                 accept_task = Some(Box::pin(next_listener.accept_with_successor()));
                 // Handshake failures belong only to the attempted connection.
                 // The secured successor remains pending for another client.
-                if let Ok(connection) = accepted {
-                    spawn_connection_task(
-                        &mut connection_tasks,
-                        connection,
-                        request_handle.clone(),
-                        slow_durable_reader_client_id,
-                    );
+                match accepted {
+                    Ok(connection) => {
+                        spawn_connection_task(
+                            &mut connection_tasks,
+                            connection,
+                            request_handle.clone(),
+                            slow_durable_reader_client_id,
+                        );
+                    }
+                    Err(_) => {}
                 }
             }
         }

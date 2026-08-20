@@ -12,9 +12,9 @@ use crate::domain::task::{
 };
 
 use super::model::{
-    is_within, path_identity_key, relative_location, PendingWorktreeCandidate, RepositoryIdentity,
-    WorkspaceBinding, WorkspaceKind, WorkspaceProjectRoots, WorkspaceRequest, WorkspaceResolution,
-    WorkspaceResource,
+    durable_refs_same_location, is_within, path_identity_key, relative_location,
+    PendingWorktreeCandidate, RepositoryIdentity, WorkspaceBinding, WorkspaceKind,
+    WorkspaceProjectRoots, WorkspaceRequest, WorkspaceResolution, WorkspaceResource,
 };
 use crate::domain::{ClientId, CommandId, ProjectId, RequestId, TaskId};
 use uuid::Uuid;
@@ -304,7 +304,7 @@ impl WorkspaceAuthorization {
             && self.action_epoch == action_epoch
             && self.runtime_generation == runtime_generation
             && self.workspace_identity == workspace_identity_for_ref(workspace)
-            && self.binding.durable_ref() == workspace
+            && durable_refs_same_location(self.binding.durable_ref(), workspace)
             && self.binding_is_current()
     }
 
@@ -1364,6 +1364,7 @@ impl Drop for WorkspaceResourceLease {
 struct IssuedTask6WorkspaceLease {
     pin: WorkspacePinnedPath,
     handle: fs::File,
+    write_handle: Option<fs::File>,
     lease: Option<WorkspaceResourceLease>,
     workspace_lease: [u8; 16],
     task_id: [u8; 16],
@@ -1394,7 +1395,7 @@ impl super::files::Task6WorkspaceLease for IssuedTask6WorkspaceLease {
     }
 
     fn retained_root_write_handle(&self) -> Option<&fs::File> {
-        None
+        self.write_handle.as_ref()
     }
 
     fn workspace_lease(&self) -> [u8; 16] {
@@ -1444,6 +1445,75 @@ pub(crate) fn issue_file_service(
     action_epoch: u64,
     runtime_generation: u64,
 ) -> Result<super::files::WorkspaceFileService, super::files::FileServiceError> {
+    issue_file_service_with_access(
+        authorization,
+        lease,
+        task_id,
+        project_id,
+        client_id,
+        connection_id,
+        request_id,
+        command_id,
+        workspace,
+        action_epoch,
+        runtime_generation,
+        FileServiceAccess::ReadWrite,
+    )
+}
+
+/// Issue a production file service that can list and read but cannot mutate.
+/// This intentionally skips mutation-recovery discovery so a bounded read is
+/// available even when a large workspace exceeds the recovery scan bound.
+pub(crate) fn issue_read_file_service(
+    authorization: &WorkspaceAuthorization,
+    lease: WorkspaceResourceLease,
+    task_id: TaskId,
+    project_id: ProjectId,
+    client_id: ClientId,
+    connection_id: Uuid,
+    request_id: RequestId,
+    command_id: CommandId,
+    workspace: &WorkspaceRef,
+    action_epoch: u64,
+    runtime_generation: u64,
+) -> Result<super::files::WorkspaceFileService, super::files::FileServiceError> {
+    issue_file_service_with_access(
+        authorization,
+        lease,
+        task_id,
+        project_id,
+        client_id,
+        connection_id,
+        request_id,
+        command_id,
+        workspace,
+        action_epoch,
+        runtime_generation,
+        FileServiceAccess::ReadOnly,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum FileServiceAccess {
+    ReadOnly,
+    ReadWrite,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn issue_file_service_with_access(
+    authorization: &WorkspaceAuthorization,
+    lease: WorkspaceResourceLease,
+    task_id: TaskId,
+    project_id: ProjectId,
+    client_id: ClientId,
+    connection_id: Uuid,
+    request_id: RequestId,
+    command_id: CommandId,
+    workspace: &WorkspaceRef,
+    action_epoch: u64,
+    runtime_generation: u64,
+    access: FileServiceAccess,
+) -> Result<super::files::WorkspaceFileService, super::files::FileServiceError> {
     if lease.resource() != WorkspaceResource::File {
         return Err(super::files::FileServiceError::AuthorityUnavailable);
     }
@@ -1477,16 +1547,31 @@ pub(crate) fn issue_file_service(
         .handle()
         .try_clone()
         .map_err(|_| super::files::FileServiceError::RootUnavailable)?;
-    super::files::WorkspaceFileService::from_task6_workspace(IssuedTask6WorkspaceLease {
+    let write_handle = match access {
+        FileServiceAccess::ReadOnly => None,
+        FileServiceAccess::ReadWrite => pin
+            .write_handle()
+            .and_then(|handle| handle.try_clone().ok()),
+    };
+    let lease = IssuedTask6WorkspaceLease {
         pin,
         handle,
+        write_handle,
         lease: Some(lease),
         workspace_lease: *request_id.as_bytes(),
         task_id: *task_id.as_bytes(),
         client_id: *client_id.as_bytes(),
         connection_id: *connection_id.as_bytes(),
         action_epoch,
-    })
+    };
+    match access {
+        FileServiceAccess::ReadOnly => {
+            super::files::WorkspaceFileService::from_task6_read_workspace(lease)
+        }
+        FileServiceAccess::ReadWrite => {
+            super::files::WorkspaceFileService::from_task6_workspace(lease)
+        }
+    }
 }
 
 impl WorkspaceService {
@@ -1791,7 +1876,7 @@ impl WorkspaceService {
             });
         }
         let binding = self.current().ok_or(WorkspaceError::RebindRequired)?;
-        if binding.durable_ref() != expected_workspace {
+        if !durable_refs_same_location(binding.durable_ref(), expected_workspace) {
             return Err(WorkspaceError::RebindRequired);
         }
         let fact = binding
@@ -2010,23 +2095,29 @@ impl WorkspaceService {
         expected
             .validate()
             .map_err(|_| WorkspaceError::RebindRequired)?;
-        // Durable projections intentionally contain only opaque binding IDs.
-        // A ConfigStore issuer must supply the host-private path mapping before
-        // this process can reopen a workspace; never reconstruct one from a
-        // serialized path or an inferred project identity.
-        if expected.project_root().path().as_os_str().is_empty()
-            || expected.workspace_root().path().as_os_str().is_empty()
-        {
-            return Err(WorkspaceError::RebindRequired);
-        }
+        // Durable projections omit live paths. Re-resolve from the host-owned
+        // project root already admitted on this service, then match the opaque
+        // binding fingerprint. Never reconstruct a workspace from a serialized
+        // path.
         let request = match expected.kind() {
             WorkspaceBindingKind::Main => WorkspaceRequest::main(),
-            WorkspaceBindingKind::Worktree => WorkspaceRequest::new_worktree(
-                expected.workspace_root().path(),
-                expected.branch().ok_or(WorkspaceError::RebindRequired)?,
-            ),
+            WorkspaceBindingKind::Worktree => {
+                let path = expected.workspace_root().path();
+                if path.as_os_str().is_empty() {
+                    return Err(WorkspaceError::RebindRequired);
+                }
+                WorkspaceRequest::new_worktree(
+                    path,
+                    expected.branch().ok_or(WorkspaceError::RebindRequired)?,
+                )
+            }
             WorkspaceBindingKind::External => {
-                WorkspaceRequest::confirmed_external(expected.workspace_root().path())
+                let path = expected.workspace_root().path();
+                if path.as_os_str().is_empty() {
+                    WorkspaceRequest::confirmed_external(&self.project_root)
+                } else {
+                    WorkspaceRequest::confirmed_external(path)
+                }
             }
         };
         let WorkspaceResolution::Resolved(binding) = self.resolve(request)? else {
@@ -2036,11 +2127,11 @@ impl WorkspaceService {
             .durable_ref()
             .host_binding()
             .ok_or(WorkspaceError::RebindRequired)?;
-        if actual == expected {
+        if actual.binding_fingerprint() == expected.binding_fingerprint() {
             Ok(binding)
         } else {
             Err(WorkspaceError::RepositoryFingerprintMismatch {
-                path: expected.workspace_root().path().to_path_buf(),
+                path: self.project_root.clone(),
                 expected: expected.binding_fingerprint().clone(),
                 actual: actual.binding_fingerprint().clone(),
             })
@@ -2387,6 +2478,7 @@ struct PinnedPath {
 pub(crate) struct WorkspacePinnedPath {
     path: PathBuf,
     file: Arc<fs::File>,
+    write_file: Option<Arc<fs::File>>,
     identity: String,
     is_dir: bool,
 }
@@ -2396,6 +2488,7 @@ impl WorkspacePinnedPath {
         Some(Self {
             path: pin.path.clone(),
             file: Arc::new(pin.file.try_clone().ok()?),
+            write_file: mutation_directory_handle(pin).map(Arc::new),
             identity: pin.identity.clone(),
             is_dir: pin.is_dir,
         })
@@ -2407,6 +2500,10 @@ impl WorkspacePinnedPath {
 
     pub(crate) fn handle(&self) -> Arc<fs::File> {
         Arc::clone(&self.file)
+    }
+
+    fn write_handle(&self) -> Option<Arc<fs::File>> {
+        self.write_file.as_ref().map(Arc::clone)
     }
 
     pub(crate) fn identity(&self) -> &str {
@@ -2426,6 +2523,46 @@ struct PinnedAncestor {
     hard_link_count: u64,
     permissions: u32,
     security_fingerprint: Option<[u8; 32]>,
+}
+
+fn mutation_directory_handle(pin: &PinnedPath) -> Option<fs::File> {
+    if !pin.is_dir {
+        return None;
+    }
+
+    #[cfg(unix)]
+    let file = pin.file.try_clone().ok()?;
+
+    #[cfg(windows)]
+    let file = {
+        use std::fs::OpenOptions;
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
+            FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0 | FILE_SHARE_DELETE.0)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0 | FILE_FLAG_OPEN_REPARSE_POINT.0)
+            .open(&pin.path)
+            .ok()?
+    };
+
+    #[cfg(not(any(unix, windows)))]
+    let file = pin.file.try_clone().ok()?;
+
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_dir()
+        || is_reparse_point(&metadata)
+        || stable_identity_from_file(&file).as_deref() != Some(pin.identity.as_str())
+        || stable_identity_from_file(&pin.file).as_deref() != Some(pin.identity.as_str())
+    {
+        return None;
+    }
+    Some(file)
 }
 
 impl PinnedPath {
@@ -3413,7 +3550,8 @@ fn repository_fingerprint_for_pins(pins: &[&PinnedPath]) -> Option<RepositoryFin
 
 #[cfg(test)]
 mod cockpit_authority_tests {
-    use super::{issue_file_service, WorkspaceService};
+    use super::{issue_file_service, issue_read_file_service, WorkspaceService};
+    use crate::domain::task::WorkspaceRef;
     use crate::domain::{ClientId, CommandId, ProjectId, RequestId, TaskId};
     use crate::git::command::{issue_git_host_binding, GitCancellation, GitRepository};
     use crate::workspace::files::ReadOptions;
@@ -3461,6 +3599,56 @@ mod cockpit_authority_tests {
             )
             .expect("bind");
         (root, service, task_id)
+    }
+
+    #[test]
+    fn persisted_main_workspace_reopens_from_host_project_roots() {
+        let (root, service, task_id) = bound_service();
+        let durable = service.current().expect("binding").durable_ref().clone();
+        let encoded = serde_json::to_vec(&durable).expect("encode durable workspace");
+        let restored: WorkspaceRef =
+            serde_json::from_slice(&encoded).expect("decode durable workspace");
+        assert!(
+            restored
+                .host_binding()
+                .expect("host binding")
+                .project_root()
+                .path()
+                .as_os_str()
+                .is_empty(),
+            "durable workspace facts must omit live paths"
+        );
+        let project_id = service.project_id;
+        let roots =
+            WorkspaceProjectRoots::try_from_pairs([(project_id, root.path().to_path_buf())])
+                .expect("roots");
+        let loaded = WorkspaceService::from_durable_with_task_coordinator(
+            project_id,
+            task_id,
+            &roots,
+            &restored,
+            super::WorkspaceResourceCoordinator::new(),
+        )
+        .expect("reopen persisted main workspace");
+        loaded
+            .runtime_working_directory()
+            .expect("runtime working directory after persist");
+        let client_id = ClientId::new();
+        let connection_id = Uuid::now_v7();
+        let request_id = RequestId::new();
+        let command_id = CommandId::from_bytes(*request_id.as_bytes()).expect("command");
+        loaded
+            .authorize_current_with_generation(
+                &restored,
+                task_id,
+                client_id,
+                connection_id,
+                request_id,
+                command_id,
+                1,
+                1,
+            )
+            .expect("authorize rehydrated durable workspace");
     }
 
     #[test]
@@ -3567,6 +3755,124 @@ mod cockpit_authority_tests {
         assert!(!service
             .live_resources_for_task_for_test()
             .contains(&WorkspaceResource::File));
+    }
+
+    #[test]
+    fn read_only_file_service_stays_available_when_global_cleanup_scan_is_bounded() {
+        let (root, service, task_id) = bound_service();
+        // The mutation-capable service deliberately bounds its recursive
+        // recovery scan at 1,024 directories. Read-only browsing must not be
+        // disabled merely because a legitimate workspace is larger.
+        for index in 0..1_025 {
+            fs::create_dir(root.path().join(format!("large-{index:04}")))
+                .expect("large workspace directory");
+        }
+
+        let binding = service.current().expect("binding").durable_ref().clone();
+        let client_id = ClientId::new();
+        let connection_id = Uuid::now_v7();
+        let request_id = RequestId::new();
+        let command_id = CommandId::from_bytes(*request_id.as_bytes()).expect("command");
+        let authorization = service
+            .authorize_current_with_generation(
+                &binding,
+                task_id,
+                client_id,
+                connection_id,
+                request_id,
+                command_id,
+                1,
+                1,
+            )
+            .expect("authorize");
+        let lease = service
+            .acquire_task_resource(
+                task_id,
+                WorkspaceResource::File,
+                client_id,
+                connection_id,
+                request_id,
+                command_id,
+                1,
+                1,
+            )
+            .expect("file lease");
+
+        let files = issue_read_file_service(
+            &authorization,
+            lease,
+            task_id,
+            service.project_id,
+            client_id,
+            connection_id,
+            request_id,
+            command_id,
+            &binding,
+            1,
+            1,
+        )
+        .expect("read-only file service");
+        let read = files
+            .read("README.md", ReadOptions::default())
+            .expect("read large workspace");
+        assert_eq!(read.total_bytes, 3);
+    }
+
+    #[test]
+    fn file_list_root_revalidation_is_bounded_independently_of_entry_count() {
+        let (_root, service, task_id) = bound_service();
+        let binding = service.current().expect("binding").durable_ref().clone();
+        let client_id = ClientId::new();
+        let connection_id = Uuid::now_v7();
+        let request_id = RequestId::new();
+        let command_id = CommandId::from_bytes(*request_id.as_bytes()).expect("command");
+        let authorization = service
+            .authorize_current_with_generation(
+                &binding,
+                task_id,
+                client_id,
+                connection_id,
+                request_id,
+                command_id,
+                1,
+                1,
+            )
+            .expect("authorize");
+        let lease = service
+            .acquire_task_resource(
+                task_id,
+                WorkspaceResource::File,
+                client_id,
+                connection_id,
+                request_id,
+                command_id,
+                1,
+                1,
+            )
+            .expect("file lease");
+        let files = issue_read_file_service(
+            &authorization,
+            lease,
+            task_id,
+            service.project_id,
+            client_id,
+            connection_id,
+            request_id,
+            command_id,
+            &binding,
+            1,
+            1,
+        )
+        .expect("read-only file service");
+
+        files.reset_root_revalidations_for_test();
+        let entries = files.list(None, 16).expect("list workspace root");
+        assert!(entries.len() >= 4);
+        assert_eq!(
+            files.root_revalidation_count_for_test(),
+            2,
+            "list must validate the named root before and after the handle-relative snapshot, not once per entry"
+        );
     }
 
     #[test]

@@ -470,6 +470,18 @@ pub enum ProcessMemberObservation {
     Inaccessible(InaccessibleProcess),
 }
 
+/// Exact identity result used only when a former sealed process owner has
+/// disappeared and durable recovery must distinguish a dead root from an
+/// inaccessible or still-live process. PID reuse is an explicit `Different`
+/// result, never a match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExactProcessIdentityStatus {
+    Present,
+    Absent,
+    Different,
+    Inaccessible,
+}
+
 impl ProcessMemberObservation {
     pub fn pid(&self) -> u32 {
         match self {
@@ -858,6 +870,20 @@ impl ProcessSampler {
             )
         }
     }
+
+    pub fn observe_exact_process_identity(
+        expected: &ManagedProcessIdentity,
+    ) -> ExactProcessIdentityStatus {
+        #[cfg(windows)]
+        {
+            observe_exact_windows_process(expected)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = expected;
+            ExactProcessIdentityStatus::Inaccessible
+        }
+    }
 }
 
 /// Deduplicate member observations without allowing an unbounded iterator to
@@ -1018,6 +1044,60 @@ extern "system" {
 const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
 #[cfg(windows)]
 const PROCESS_VM_READ: u32 = 0x0010;
+#[cfg(windows)]
+const ERROR_INVALID_PARAMETER: i32 = 87;
+
+#[cfg(windows)]
+fn observe_exact_windows_process(expected: &ManagedProcessIdentity) -> ExactProcessIdentityStatus {
+    let pid = expected.id().pid();
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return if std::io::Error::last_os_error().raw_os_error() == Some(ERROR_INVALID_PARAMETER) {
+            ExactProcessIdentityStatus::Absent
+        } else {
+            ExactProcessIdentityStatus::Inaccessible
+        };
+    }
+    let handle = ProcessHandle(handle);
+    let mut creation = FileTime::default();
+    let mut exit = FileTime::default();
+    let mut kernel = FileTime::default();
+    let mut user = FileTime::default();
+    if unsafe { GetProcessTimes(handle.0, &mut creation, &mut exit, &mut kernel, &mut user) } == 0 {
+        return ExactProcessIdentityStatus::Inaccessible;
+    }
+    let creation_time_100ns = file_time_value(&creation);
+    if creation_time_100ns == 0 {
+        return ExactProcessIdentityStatus::Inaccessible;
+    }
+    if creation_time_100ns != expected.id().creation_time_100ns() {
+        return ExactProcessIdentityStatus::Different;
+    }
+
+    let mut executable_buffer = vec![0u16; 32_768];
+    let mut executable_length = executable_buffer.len() as u32;
+    if unsafe {
+        QueryFullProcessImageNameW(
+            handle.0,
+            0,
+            executable_buffer.as_mut_ptr(),
+            &mut executable_length,
+        )
+    } == 0
+    {
+        return ExactProcessIdentityStatus::Inaccessible;
+    }
+    executable_buffer.truncate(executable_length as usize);
+    let executable = PathBuf::from(String::from_utf16_lossy(&executable_buffer));
+    let Ok(actual) = ManagedProcessIdentity::new(expected.id(), executable) else {
+        return ExactProcessIdentityStatus::Inaccessible;
+    };
+    if actual.matches_root(expected) {
+        ExactProcessIdentityStatus::Present
+    } else {
+        ExactProcessIdentityStatus::Different
+    }
+}
 
 #[cfg(windows)]
 fn observe_windows_process(
@@ -1272,4 +1352,37 @@ fn read_proc_io(pid: u32) -> Option<(u64, u64)> {
         }
     }
     Some((read_bytes?, write_bytes?))
+}
+
+#[cfg(all(test, windows))]
+mod exact_identity_tests {
+    use super::*;
+
+    #[test]
+    fn exact_identity_observation_distinguishes_present_root_from_pid_reuse() {
+        let current = match ProcessSampler::observe_process(std::process::id()) {
+            ProcessMemberObservation::Accessible(current) => current.identity,
+            ProcessMemberObservation::Inaccessible(reason) => {
+                panic!("current process identity must be accessible: {reason:?}")
+            }
+        };
+        assert_eq!(
+            ProcessSampler::observe_exact_process_identity(&current),
+            ExactProcessIdentityStatus::Present
+        );
+
+        let reused = ManagedProcessIdentity::new(
+            ManagedProcessId::new(
+                current.id().pid(),
+                current.id().creation_time_100ns().saturating_add(1),
+            )
+            .unwrap(),
+            current.canonical_executable(),
+        )
+        .unwrap();
+        assert_eq!(
+            ProcessSampler::observe_exact_process_identity(&reused),
+            ExactProcessIdentityStatus::Different
+        );
+    }
 }

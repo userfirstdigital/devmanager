@@ -1343,6 +1343,24 @@ mod tests {
         format!("{tag:02x}{}", "ab".repeat(31))
     }
 
+    fn enrolled_projection(host_id: ConnectHostId) -> OrganizationProjection {
+        let mut projection = OrganizationProjection::standalone();
+        assert_eq!(projection.sign_in(account()), 0);
+        let policy = OrganizationPolicyDocument::deny_minimal(tenant()).expect("policy");
+        let pending = HostMembership::pending(
+            host_id,
+            account(),
+            MembershipRole::Owner,
+            &policy,
+            "owner-host",
+        )
+        .expect("pending membership");
+        projection
+            .confirm_enrollment(pending, policy, 1_000)
+            .expect("confirmed enrollment");
+        projection
+    }
+
     #[test]
     fn standalone_is_noop_and_disabled() {
         let fake = FakePortal::default();
@@ -1464,11 +1482,10 @@ mod tests {
         let handle = PortalCredentialHandle::parse("vault:org-portal").expect("handle");
         let fake = FakePortal::with_reconcile(reconcile_ok(&host_str(host_id)));
         let mut runtime = PortalSyncRuntime::new(fake, Some(handle.clone()));
-        let mut projection = OrganizationProjection::standalone();
-        assert_eq!(projection.sign_in(account()), 0);
+        let mut projection = enrolled_projection(host_id);
         assert_eq!(
             runtime.capability(&projection),
-            OrganizationCapabilityState::Disabled(OrganizationCapabilityDisableReason::Unenrolled)
+            OrganizationCapabilityState::Disabled(OrganizationCapabilityDisableReason::Offline)
         );
         let (root, store) = temp_store();
         let outcome = runtime
@@ -1506,8 +1523,7 @@ mod tests {
         other.membership.organization_id = "other".into();
         let fake = FakePortal::with_reconcile(other);
         let mut runtime = PortalSyncRuntime::new(fake, None);
-        let mut projection = OrganizationProjection::standalone();
-        assert_eq!(projection.sign_in(account()), 0);
+        let mut projection = enrolled_projection(host_id);
         let (root, store) = temp_store();
         let error = runtime
             .reconcile(
@@ -1521,11 +1537,14 @@ mod tests {
             )
             .expect_err("cross tenant");
         assert_eq!(error.kind(), PortalSyncFailureKind::Validation);
-        assert!(projection.membership().is_none());
-        let restored = store.load().expect("signed-in only");
-        assert!(restored.membership().is_none());
+        assert_eq!(
+            projection.membership().map(|m| &m.tenant_id),
+            Some(&tenant())
+        );
+        let restored = store.load().expect("previous enrolled state");
+        assert_eq!(restored.membership().map(|m| &m.tenant_id), Some(&tenant()));
         assert!(restored.persisted_links().next().is_none());
-        assert_eq!(restored.sync_state(), OrganizationSyncState::SignedIn);
+        assert_eq!(restored.sync_state(), OrganizationSyncState::Enrolled);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1535,8 +1554,7 @@ mod tests {
         let host = host_str(host_id);
         let fake = FakePortal::with_reconcile(reconcile_ok(&host));
         let mut runtime = PortalSyncRuntime::new(fake, None);
-        let mut projection = OrganizationProjection::standalone();
-        assert_eq!(projection.sign_in(account()), 0);
+        let mut projection = enrolled_projection(host_id);
         let (root, store) = temp_store();
         runtime
             .reconcile(
@@ -1604,8 +1622,7 @@ mod tests {
         let fake = FakePortal::with_reconcile(reconcile_ok(&host_str(host_id)));
         fake.set_infinite_task_pages(true);
         let mut runtime = PortalSyncRuntime::new(fake, None);
-        let mut projection = OrganizationProjection::standalone();
-        assert_eq!(projection.sign_in(account()), 0);
+        let mut projection = enrolled_projection(host_id);
         let (root, store) = temp_store();
         let error = runtime
             .reconcile(
@@ -1619,8 +1636,8 @@ mod tests {
             )
             .expect_err("bound");
         assert_eq!(error, PortalSyncError::Org(OrgError::BoundExceeded));
-        let restored = store.load().expect("no enrolled persist");
-        assert!(restored.membership().is_none());
+        let restored = store.load().expect("previous enrolled state");
+        assert!(restored.membership().is_some());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1629,8 +1646,7 @@ mod tests {
         let host_id = ConnectHostId::new();
         let fake = FakePortal::with_reconcile(reconcile_ok(&host_str(host_id)));
         let mut runtime = PortalSyncRuntime::new(fake, None);
-        let mut projection = OrganizationProjection::standalone();
-        assert_eq!(projection.sign_in(account()), 0);
+        let mut projection = enrolled_projection(host_id);
         let (root, store) = temp_store();
         runtime
             .reconcile(
@@ -1705,8 +1721,7 @@ mod tests {
         let host_id = ConnectHostId::new();
         let fake = FakePortal::with_reconcile(reconcile_ok(&host_str(host_id)));
         let mut runtime = PortalSyncRuntime::new(fake, None);
-        let mut projection = OrganizationProjection::standalone();
-        assert_eq!(projection.sign_in(account()), 0);
+        let mut projection = enrolled_projection(host_id);
         let (root, store) = temp_store();
         runtime
             .reconcile(
@@ -1797,8 +1812,7 @@ mod tests {
         let mut response = reconcile_ok(&host_str(host_id));
         let fake = FakePortal::with_reconcile(response.clone());
         let mut runtime = PortalSyncRuntime::new(fake, None);
-        let mut projection = OrganizationProjection::standalone();
-        assert_eq!(projection.sign_in(account()), 0);
+        let mut projection = enrolled_projection(host_id);
         let (root, store) = temp_store();
         runtime
             .reconcile(

@@ -7,7 +7,7 @@ use crate::providers::input::{
 use crate::providers::session::{
     sealed, ActiveProcessZeroSettlement, ProviderLaunchError, ProviderLaunchOutcome,
     ProviderProcessLauncher, ProviderProcessLease, ProviderRecoveryHandoffFailure,
-    ProviderRuntimeLaunchRequest, ProviderSessionState,
+    ProviderRecoveryZeroSettlement, ProviderRuntimeLaunchRequest, ProviderSessionState,
 };
 use crate::services::process_manager::ProcessManager;
 use uuid::Uuid;
@@ -60,14 +60,15 @@ struct ProcessManagerByteWriter {
 }
 
 impl ProviderRuntimeByteWriter for ProcessManagerByteWriter {
-    fn write_exact(
+    fn write_provider_action(
         &self,
         fence: &crate::process::registry::ManagedProcessFence,
         identity: &ProviderInputDeliveryIdentity,
-        bytes: &[u8],
+        action: &crate::domain::provider_input::ProviderInputAction,
+        logical_bytes: &[u8],
     ) -> Result<(), ProviderInputDeliveryError> {
         self.manager
-            .write_sealed_provider_bytes(fence, identity, bytes)
+            .write_sealed_provider_action(fence, identity, action, logical_bytes)
     }
 }
 
@@ -125,6 +126,14 @@ impl ProviderProcessLauncher for ProcessManagerProviderLauncher {
         state: &ProviderSessionState,
     ) -> Result<Option<ProviderProcessLease>, ProviderLaunchError> {
         self.manager.recover_sealed_provider_runtime(state)
+    }
+
+    fn recover_verified_absence(
+        &mut self,
+        state: &ProviderSessionState,
+    ) -> Result<Option<ProviderRecoveryZeroSettlement>, ProviderLaunchError> {
+        self.manager
+            .recover_sealed_provider_runtime_verified_absence(state)
     }
 }
 
@@ -285,6 +294,7 @@ mod tests {
     #[test]
     fn production_launcher_issues_registry_permit_with_nonzero_fence() {
         let manager = ProcessManager::new();
+        manager.accept_codex_hooks_for_test();
         let mut launcher = manager.provider_process_launcher();
         let request = launch_request(
             ProviderKind::Codex,
@@ -347,6 +357,7 @@ mod tests {
         match launcher.launch(&missing) {
             ProviderLaunchOutcome::Rejected(ProviderLaunchError::ExactResumeFailed(_))
             | ProviderLaunchOutcome::Rejected(ProviderLaunchError::SpawnFailed)
+            | ProviderLaunchOutcome::Rejected(ProviderLaunchError::BridgeUnavailable)
             | ProviderLaunchOutcome::Started(_) => {}
             other => panic!("exact resume must not invent a fresh conversation: {other:?}"),
         }

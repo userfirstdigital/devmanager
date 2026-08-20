@@ -2194,8 +2194,8 @@ fn scan_msgpack_map_with_array_limit(
     }
     for _ in 0..pairs {
         let key_start = *offset;
-        let dynamic_key = match take_msgpack_text(bytes, offset) {
-            Ok(key) => matches!(key, b"objects" | b"operations" | b"completed"),
+        let field_array_limit = match take_msgpack_text(bytes, offset) {
+            Ok(key) => persisted_field_array_limit(key, dynamic_array_limit),
             Err(MsgpackScanFailure::Corrupt) => {
                 *offset = key_start;
                 scan_msgpack_value_with_limits(
@@ -2206,7 +2206,7 @@ fn scan_msgpack_map_with_array_limit(
                     None,
                     dynamic_array_limit,
                 )?;
-                false
+                None
             }
             Err(error) => return Err(error),
         };
@@ -2215,11 +2215,33 @@ fn scan_msgpack_map_with_array_limit(
             offset,
             depth.saturating_add(1),
             budget,
-            dynamic_key.then_some(dynamic_array_limit),
+            field_array_limit,
             dynamic_array_limit,
         )?;
     }
     Ok(())
+}
+
+fn persisted_field_array_limit(key: &[u8], dynamic_array_limit: usize) -> Option<usize> {
+    match key {
+        b"objects" | b"operations" | b"completed" => Some(dynamic_array_limit),
+        // Serde's MsgPack representation for fixed byte arrays is an array of
+        // integers rather than a binary blob. Keep those schema-owned fields
+        // independently bounded without treating their 16/32 bytes as a
+        // caller-sized collection.
+        b"task_id" | b"checkpoint_id" => Some(16),
+        b"workspace"
+        | b"id"
+        | b"agent"
+        | b"digest"
+        | b"revision"
+        | b"fingerprint"
+        | b"planned_revision"
+        | b"approval_nonce"
+        | b"attempt_generation"
+        | b"issued_approval_nonce" => Some(32),
+        _ => None,
+    }
 }
 
 fn scan_msgpack_blob_len(

@@ -28,9 +28,11 @@ use crate::ui::components::interaction::{
 use crate::ui::components::text_field::{TextField, TextFieldError, TextFieldKey, TextFieldLimits};
 use crate::ui::tokens::ThemeTokens;
 use gpui::{div, px, AnyElement, InteractiveElement, IntoElement, ParentElement, Styled};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt::{Debug, Display, Formatter};
+use std::ops::Range;
 
 pub use crate::client::action::{
     ACTION_TASK_ANSWER_QUESTION as EXPECTED_ACTION_ANSWER,
@@ -163,6 +165,127 @@ pub fn suggest_provider_commands<'a>(
         .collect()
 }
 
+/// Native and web surfaces share the reviewed provider catalog. Keeping the
+/// Rust projection sourced from the web seed table prevents the desktop menu
+/// from becoming a tiny, stale second list.
+pub fn provider_command_catalog(
+    provider_kind: &crate::providers::ProviderKind,
+) -> Vec<ProviderCommandSuggestion> {
+    const SOURCE: &str = include_str!("../../../web/src/tasks/commands/builtinCatalog.ts");
+    let (start_marker, end_marker, provider_name) = match provider_kind {
+        crate::providers::ProviderKind::ClaudeCode => {
+            ("const CLAUDE_SEEDS:", "const CODEX_SEEDS:", "claude")
+        }
+        crate::providers::ProviderKind::Codex => (
+            "const CODEX_SEEDS:",
+            "export const CLAUDE_BUILTIN_COMMANDS",
+            "codex",
+        ),
+        crate::providers::ProviderKind::Cursor => return Vec::new(),
+    };
+    let Some(section) = SOURCE.split_once(start_marker).map(|(_, tail)| tail) else {
+        return Vec::new();
+    };
+    let section = section
+        .split_once(end_marker)
+        .map(|(catalog, _)| catalog)
+        .unwrap_or(section);
+    let mut commands = Vec::new();
+    for line in section.lines() {
+        let line = line.trim();
+        if !line.starts_with("[\"/") {
+            continue;
+        }
+        let Some((command, command_end)) = parse_catalog_string(line, 1) else {
+            continue;
+        };
+        let description_start = line[command_end..]
+            .find('"')
+            .map(|offset| command_end + offset);
+        let Some(description_start) = description_start else {
+            continue;
+        };
+        let Some((description, _)) = parse_catalog_string(line, description_start) else {
+            continue;
+        };
+        commands.push(ProviderCommandSuggestion {
+            label: description.clone(),
+            command: command.clone(),
+            provider_kind: provider_name.to_string(),
+        });
+        if let Some(aliases) = catalog_aliases(line) {
+            for alias in aliases {
+                commands.push(ProviderCommandSuggestion {
+                    label: format!("{description} (alias for {command})"),
+                    command: format!("/{}", alias.trim_start_matches('/')),
+                    provider_kind: provider_name.to_string(),
+                });
+            }
+        }
+    }
+    commands
+}
+
+pub fn provider_command_opens_terminal(
+    provider_kind: &crate::providers::ProviderKind,
+    draft: &str,
+) -> bool {
+    let submitted = draft.trim();
+    if !submitted.starts_with('/') || submitted.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let source = include_str!("../../../web/src/tasks/commands/builtinCatalog.ts");
+    let catalog = provider_command_catalog(provider_kind);
+    let Some(suggestion) = catalog.iter().find(|entry| entry.command == submitted) else {
+        return false;
+    };
+    let canonical = suggestion
+        .label
+        .rsplit_once("(alias for ")
+        .and_then(|(_, suffix)| suffix.strip_suffix(')'))
+        .unwrap_or(submitted);
+    source.lines().any(|line| {
+        let line = line.trim();
+        line.starts_with(&format!("[\"{canonical}\""))
+            && line.contains("interaction: \"providerMenu\"")
+    })
+}
+
+fn parse_catalog_string(line: &str, quote_start: usize) -> Option<(String, usize)> {
+    let bytes = line.as_bytes();
+    if bytes.get(quote_start) != Some(&b'"') {
+        return None;
+    }
+    let mut value = String::new();
+    let mut escaped = false;
+    for (offset, character) in line[quote_start + 1..].char_indices() {
+        if escaped {
+            value.push(character);
+            escaped = false;
+        } else if character == '\\' {
+            escaped = true;
+        } else if character == '"' {
+            return Some((value, quote_start + 1 + offset + 1));
+        } else {
+            value.push(character);
+        }
+    }
+    None
+}
+
+fn catalog_aliases(line: &str) -> Option<Vec<String>> {
+    let aliases = line.split_once("aliases: [")?.1.split_once(']')?.0;
+    Some(
+        aliases
+            .split(',')
+            .filter_map(|alias| {
+                let alias = alias.trim();
+                parse_catalog_string(alias, 0).map(|(value, _)| value)
+            })
+            .collect(),
+    )
+}
+
 pub fn apply_put_prompt_version(
     draft: &mut ComposerDraft,
     action: &PutPromptVersionInComposer,
@@ -214,7 +337,7 @@ pub enum EnterPreference {
     EnterInsertsNewline,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum AttachmentKind {
     File,
     Image,
@@ -233,7 +356,7 @@ impl TurnId {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PromptVersionRef {
     pub prompt_id: String,
     pub version: u64,
@@ -338,8 +461,18 @@ impl ComposerIntent {
                 )?,
             });
         }
-        let Some(turn_id) = turn_id else {
-            return Err(ComposerError::UnknownTurn);
+        let turn_id = match turn_id {
+            Some(turn_id) => turn_id,
+            None if matches!(&self.payload, ComposerPayload::SendNow { .. }) => {
+                // SendNow is the one provider action the kernel admits when
+                // there is no current turn; its accepted event establishes
+                // this identity as the current turn. Derive it from the
+                // already-stable intent command so transport retries cannot
+                // fork one click into multiple provider turns.
+                DomainTurnId::from_bytes(*self.command_id.as_bytes())
+                    .map_err(|_| ComposerError::UnknownTurn)?
+            }
+            None => return Err(ComposerError::UnknownTurn),
         };
         let text = match &self.payload {
             ComposerPayload::SendNow { text, .. }
@@ -375,6 +508,7 @@ impl ComposerIntent {
             _ => None,
         };
         Ok(ActionRequest::ProviderInput(ProviderInputActionRequest {
+            command_id: self.command_id,
             action_id: self.action_id,
             arguments: ProviderInputArguments {
                 task_id: self.fence.task_id,
@@ -392,14 +526,14 @@ impl ComposerIntent {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ComposerAttachmentProjection {
     pub artifact_id: ArtifactId,
     pub kind: AttachmentKind,
     pub label: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ComposerDraftProjection {
     pub text: String,
     pub attachments: Vec<ComposerAttachmentProjection>,
@@ -841,8 +975,54 @@ impl TaskComposer {
         self.field.value()
     }
 
+    pub fn draft_cursor(&self) -> usize {
+        self.field.cursor()
+    }
+
+    pub fn draft_is_all_selected(&self) -> bool {
+        self.field.is_all_selected()
+    }
+
+    pub fn select_all_draft(&mut self, focus_epoch: FocusEpoch) -> Result<(), ComposerError> {
+        self.require_epoch(focus_epoch)?;
+        self.field.select_all();
+        Ok(())
+    }
+
+    pub fn replace_draft_range(
+        &mut self,
+        range: Range<usize>,
+        text: &str,
+        focus_epoch: FocusEpoch,
+    ) -> Result<bool, ComposerError> {
+        self.require_epoch(focus_epoch)?;
+        let changed = self.field.replace_range(range, text, focus_epoch)?;
+        if changed {
+            self.dirty = true;
+        }
+        Ok(changed)
+    }
+
     pub fn attachments(&self) -> &[ComposerAttachmentProjection] {
         &self.attachments
+    }
+
+    /// Snapshot the local, unsent input so a task switch can park and restore
+    /// the exact draft without treating it as host-projected conversation
+    /// state. Provider/runtime identity remains owned by the composer fence.
+    pub fn draft_projection(&self) -> ComposerDraftProjection {
+        ComposerDraftProjection {
+            text: self.field.value().to_string(),
+            attachments: self.attachments.clone(),
+            prompt: self
+                .inserted_prompt
+                .as_ref()
+                .map(|(prompt_id, version)| PromptVersionRef {
+                    prompt_id: prompt_id.clone(),
+                    version: *version,
+                    body: self.field.value().to_string(),
+                }),
+        }
     }
 
     pub fn presented_question_options(&self) -> Result<Vec<String>, ComposerError> {
@@ -1007,6 +1187,38 @@ impl TaskComposer {
         focus_epoch: FocusEpoch,
     ) -> Result<ComposerIntent, ComposerError> {
         self.activate_with_fence(control, self.fence, focus_epoch)
+    }
+
+    /// Submit an image-only prompt. The native shell calls this only after it
+    /// has staged at least one image; it then prefixes the frozen provider
+    /// payload with those exact prompt references before dispatch.
+    pub fn activate_attachment_only_send(
+        &mut self,
+        focus_epoch: FocusEpoch,
+    ) -> Result<ComposerIntent, ComposerError> {
+        self.require_epoch(focus_epoch)?;
+        self.require_available(ComposerControl::SendNow)?;
+        if !self.field.value().trim().is_empty() {
+            return Err(ComposerError::Unavailable {
+                control: ComposerControl::SendNow,
+                reason: bound_reason("attachment-only send requires an empty draft")?,
+            });
+        }
+        let artifact_ids = self
+            .attachments
+            .iter()
+            .map(|attachment| attachment.artifact_id)
+            .collect();
+        self.submit(
+            ComposerControl::SendNow,
+            self.fence,
+            focus_epoch,
+            ComposerPayload::SendNow {
+                text: String::new(),
+                artifact_ids,
+                prompt: self.inserted_prompt.clone(),
+            },
+        )
     }
 
     pub fn activate_with_fence(
@@ -1228,7 +1440,47 @@ impl TaskComposer {
     }
 
     pub fn settle_pending(&mut self, command_id: CommandId) -> Result<(), ComposerError> {
-        self.cancel_pending(command_id)
+        let pending = match self.pending.as_ref() {
+            Some(pending) if pending.command_id == command_id => pending.clone(),
+            Some(pending) => {
+                return Err(ComposerError::PendingConflict {
+                    command_id: pending.command_id,
+                });
+            }
+            None => {
+                return Err(ComposerError::Unavailable {
+                    control: ComposerControl::SendNow,
+                    reason: bound_reason("no pending composer command to settle")?,
+                });
+            }
+        };
+        let clear_consumed_draft = self.pending_consumes_current_draft(&pending);
+        self.pending = None;
+        if clear_consumed_draft {
+            self.field.set_value("")?;
+            self.attachments.clear();
+            self.inserted_prompt = None;
+            self.dirty = false;
+            self.auto_sent = false;
+        }
+        Ok(())
+    }
+
+    /// Clear a host-accepted draft after the composer was rebound while the
+    /// command was in flight. Exact equality protects any newer user edits.
+    pub fn clear_draft_if_matches(
+        &mut self,
+        accepted: &ComposerDraftProjection,
+    ) -> Result<bool, ComposerError> {
+        if self.draft_projection() != *accepted {
+            return Ok(false);
+        }
+        self.field.set_value("")?;
+        self.attachments.clear();
+        self.inserted_prompt = None;
+        self.dirty = false;
+        self.auto_sent = false;
+        Ok(true)
     }
 
     pub fn action_search(&self) -> Result<Vec<ActionSearchHit>, ComposerError> {
@@ -1589,6 +1841,44 @@ impl TaskComposer {
                     reason: bound_reason("attachment mutation requires an ArtifactId")?,
                 })
             }
+        }
+    }
+
+    fn pending_consumes_current_draft(&self, pending: &ComposerIntent) -> bool {
+        let attachment_ids = self
+            .attachments
+            .iter()
+            .map(|attachment| attachment.artifact_id)
+            .collect::<Vec<_>>();
+        match &pending.payload {
+            ComposerPayload::SendNow {
+                text,
+                artifact_ids,
+                prompt,
+            } => {
+                self.field.value() == text
+                    && attachment_ids == *artifact_ids
+                    && self.inserted_prompt.as_ref() == prompt.as_ref()
+            }
+            ComposerPayload::Steer {
+                text, artifact_ids, ..
+            }
+            | ComposerPayload::QueueFollowUp { text, artifact_ids } => {
+                self.field.value() == text && attachment_ids == *artifact_ids
+            }
+            ComposerPayload::Answer {
+                answer: AnswerPayload::Text(text),
+                ..
+            } => self.field.value() == text,
+            ComposerPayload::Answer {
+                answer: AnswerPayload::Option { .. },
+                ..
+            }
+            | ComposerPayload::Approval { .. }
+            | ComposerPayload::StopTurn { .. }
+            | ComposerPayload::SaveDraft { .. }
+            | ComposerPayload::StageAttachment { .. }
+            | ComposerPayload::RemoveAttachment { .. } => false,
         }
     }
 
@@ -2415,6 +2705,27 @@ mod tests {
     }
 
     #[test]
+    fn attachment_only_send_requires_explicit_activation() {
+        let mut composer = bind_granted("");
+        let mut epochs = FocusEpochSource::new();
+        focus(&mut composer, &mut epochs);
+        let epoch = epochs.current();
+
+        let ordinary = composer
+            .activate(ComposerControl::SendNow, epoch)
+            .expect_err("ordinary empty sends remain invalid");
+        assert!(ordinary.to_string().contains("empty"));
+
+        let intent = composer
+            .activate_attachment_only_send(epoch)
+            .expect("an explicitly attached image may supply the provider prompt later");
+        assert!(matches!(
+            intent.payload,
+            ComposerPayload::SendNow { ref text, .. } if text.is_empty()
+        ));
+    }
+
+    #[test]
     fn retry_returns_frozen_payload_after_adversarial_edits() {
         let artifact = ArtifactId::new();
         let mut projection = projection_with(fence(), "retry me");
@@ -2496,6 +2807,49 @@ mod tests {
             .activate(ComposerControl::SendNow, epoch)
             .expect("new command");
         assert_ne!(first.command_id, second.command_id);
+    }
+
+    #[test]
+    fn accepted_text_submission_clears_only_the_exact_consumed_draft() {
+        let mut composer = bind_granted("ship this exact draft");
+        let mut epochs = FocusEpochSource::new();
+        focus(&mut composer, &mut epochs);
+        let epoch = epochs.current();
+        let submitted = composer
+            .activate(ComposerControl::SendNow, epoch)
+            .expect("submit");
+
+        composer
+            .settle_pending(submitted.command_id)
+            .expect("matching host acceptance");
+
+        assert_eq!(composer.draft_text(), "");
+        assert!(composer.attachments().is_empty());
+        assert!(composer.pending_intent().is_none());
+    }
+
+    #[test]
+    fn accepted_text_submission_preserves_a_newer_local_edit() {
+        let mut composer = bind_granted("first draft");
+        let mut epochs = FocusEpochSource::new();
+        focus(&mut composer, &mut epochs);
+        let epoch = epochs.current();
+        let submitted = composer
+            .activate(ComposerControl::SendNow, epoch)
+            .expect("submit");
+        composer
+            .replace_draft("follow-up typed while the host accepted", epoch)
+            .expect("newer local edit");
+
+        composer
+            .settle_pending(submitted.command_id)
+            .expect("matching host acceptance");
+
+        assert_eq!(
+            composer.draft_text(),
+            "follow-up typed while the host accepted"
+        );
+        assert!(composer.pending_intent().is_none());
     }
 
     #[test]
@@ -3238,7 +3592,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_send_maps_to_provider_input_and_exact_resume_stays_visible() {
+    fn pending_send_maps_to_provider_input_and_mints_a_stable_first_turn() {
         let mut composer = bind_granted("ship it");
         let mut epochs = FocusEpochSource::new();
         focus(&mut composer, &mut epochs);
@@ -3259,10 +3613,17 @@ mod tests {
             }
             other => panic!("expected ProviderInput, got {other:?}"),
         }
-        assert!(matches!(
-            intent.to_provider_input_request(None, None, None),
-            Err(ComposerError::UnknownTurn)
-        ));
+        let expected_first_turn =
+            DomainTurnId::from_bytes(*intent.command_id.as_bytes()).expect("command-backed turn");
+        for _ in 0..2 {
+            let request = intent
+                .to_provider_input_request(None, None, None)
+                .expect("Send Now must establish the first provider turn");
+            let ActionRequest::ProviderInput(inner) = request else {
+                panic!("expected ProviderInput");
+            };
+            assert_eq!(inner.arguments.turn_id, expected_first_turn);
+        }
 
         let mut exact_resume = intent.clone();
         exact_resume.action_id = crate::client::action::ACTION_PROVIDER_NEW_CONVERSATION;
@@ -3327,5 +3688,28 @@ mod tests {
         .expect("task composer binds");
 
         assert_eq!(composer.fence().turn_id, None);
+    }
+
+    #[test]
+    fn ai_acceptance_slash_catalog_is_complete_and_provider_aware() {
+        let claude = provider_command_catalog(&crate::providers::ProviderKind::ClaudeCode);
+        let codex = provider_command_catalog(&crate::providers::ProviderKind::Codex);
+
+        assert!(claude.len() >= 90, "Claude catalog unexpectedly incomplete");
+        assert!(codex.len() >= 45, "Codex catalog unexpectedly incomplete");
+        assert!(claude.iter().any(|command| command.command == "/agents"));
+        assert!(codex.iter().any(|command| command.command == "/agent"));
+        assert!(provider_command_opens_terminal(
+            &crate::providers::ProviderKind::ClaudeCode,
+            "/help"
+        ));
+        assert!(provider_command_opens_terminal(
+            &crate::providers::ProviderKind::Codex,
+            "/subagents"
+        ));
+        assert!(!provider_command_opens_terminal(
+            &crate::providers::ProviderKind::ClaudeCode,
+            "/compact focus on tests"
+        ));
     }
 }

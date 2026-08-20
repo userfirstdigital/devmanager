@@ -191,7 +191,7 @@ fn create_task_via_host(
             .project_id_for_config_id(&config_id)
             .expect("opaque host project id");
         let (requests, executor) =
-            HostRequestExecutor::start_supervised_with_config_store(bus, store)
+            HostRequestExecutor::start_supervised_with_config_store(bus, store, &config_root)
                 .expect("host config store");
         let envelope = CommandEnvelope {
             command_id: CommandId::new(),

@@ -15,16 +15,19 @@ use super::action::{
     ServiceControlArguments, TaskCreateV2Arguments, TaskRenameArguments, ACTION_HOST_STATUS,
     ACTION_PROVIDER_ANSWER_QUESTION, ACTION_PROVIDER_NEW_CONVERSATION,
     ACTION_PROVIDER_QUEUE_FOLLOW_UP, ACTION_PROVIDER_RESOLVE_APPROVAL, ACTION_PROVIDER_SEND_NOW,
-    ACTION_PROVIDER_STEER_CURRENT_TURN, ACTION_PROVIDER_STOP_TURN, ACTION_SERVICE_RESTART,
-    ACTION_SERVICE_START, ACTION_SERVICE_STOP, ACTION_TASK_CREATE, ACTION_TASK_CREATE_V2,
-    ACTION_TASK_LIST, ACTION_TASK_RENAME, ACTION_TASK_SHOW,
+    ACTION_PROVIDER_STEER_CURRENT_TURN, ACTION_PROVIDER_STOP_TURN, ACTION_PROVIDER_TERMINAL_INPUT,
+    ACTION_SERVICE_RESTART, ACTION_SERVICE_START, ACTION_SERVICE_STOP, ACTION_TASK_ANSWER_QUESTION,
+    ACTION_TASK_CREATE, ACTION_TASK_CREATE_V2, ACTION_TASK_LIST, ACTION_TASK_QUEUE_FOLLOW_UP,
+    ACTION_TASK_RENAME, ACTION_TASK_RESOLVE_APPROVAL, ACTION_TASK_SEND_NOW, ACTION_TASK_SHOW,
+    ACTION_TASK_STEER_CURRENT_TURN, ACTION_TASK_STOP_TURN,
 };
 use super::{HostClient, HostClientConfig};
 use crate::domain::command::{CommandEnvelope, CommandReceipt, RejectionCode};
 use crate::domain::id::SnapshotId;
+use crate::domain::operation::OperationState;
 use crate::domain::query::QueryError;
 use crate::domain::snapshot::{SnapshotItem, SnapshotSection, TaskSnapshotItem};
-use crate::domain::{ClientId, CommandId, TaskId};
+use crate::domain::{ClientId, CommandId, OperationId, TaskId};
 use crate::host::IpcError;
 use crate::protocol::{Capability, CapabilitySet, FrameLimits};
 
@@ -32,6 +35,8 @@ const SCHEMA_VERSION: u16 = 1;
 const STATUS_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const STATUS_CONNECT_POLL: Duration = Duration::from_millis(25);
 const COMMAND_REPLAY_TIMEOUT: Duration = Duration::from_secs(16);
+const PROVIDER_DELIVERY_WAIT: Duration = Duration::from_secs(3);
+const PROVIDER_DELIVERY_POLL: Duration = Duration::from_millis(50);
 const MAX_COMMAND_ATTEMPTS: usize = 2;
 const MAX_DIAGNOSTIC_CHARS: usize = 1_024;
 const MAX_ARGUMENTS_JSON_BYTES: usize = 64 * 1024;
@@ -479,6 +484,10 @@ fn argument_schema_json(schema: ActionArgumentSchema) -> serde_json::Value {
                 "title": { "type": "string", "minLength": 1 },
                 "description": { "type": ["string", "null"] },
                 "project_id": uuid(),
+                "primary_provider": {
+                    "type": ["string", "null"],
+                    "enum": ["claude", "codex", null]
+                },
                 "workspace": {
                     "type": "object",
                     "additionalProperties": false,
@@ -891,6 +900,25 @@ async fn task_show_json_document_async(profile: &str, task_id: TaskId) -> Result
         .map_err(|error| CliError::new(format!("failed to encode task-show JSON: {error}")))
 }
 
+fn is_provider_input_invoke_action(action_id: &str) -> bool {
+    matches!(
+        action_id,
+        ACTION_PROVIDER_SEND_NOW
+            | ACTION_PROVIDER_STEER_CURRENT_TURN
+            | ACTION_PROVIDER_QUEUE_FOLLOW_UP
+            | ACTION_PROVIDER_ANSWER_QUESTION
+            | ACTION_PROVIDER_RESOLVE_APPROVAL
+            | ACTION_PROVIDER_TERMINAL_INPUT
+            | ACTION_PROVIDER_STOP_TURN
+            | ACTION_TASK_SEND_NOW
+            | ACTION_TASK_STEER_CURRENT_TURN
+            | ACTION_TASK_QUEUE_FOLLOW_UP
+            | ACTION_TASK_ANSWER_QUESTION
+            | ACTION_TASK_RESOLVE_APPROVAL
+            | ACTION_TASK_STOP_TURN
+    )
+}
+
 fn invoke_json_document(
     profile: &str,
     action_id: &str,
@@ -958,12 +986,7 @@ fn invoke_json_document(
                 reason.reason_code()
             )))
         }
-        ACTION_PROVIDER_SEND_NOW
-        | ACTION_PROVIDER_STEER_CURRENT_TURN
-        | ACTION_PROVIDER_QUEUE_FOLLOW_UP
-        | ACTION_PROVIDER_ANSWER_QUESTION
-        | ACTION_PROVIDER_RESOLVE_APPROVAL
-        | ACTION_PROVIDER_STOP_TURN => {
+        provider_action if is_provider_input_invoke_action(provider_action) => {
             let Some(expected_task_revision) = expected_task_revision else {
                 return Err(CliError::new(format!(
                     "{action_id} requires expected-task-revision"
@@ -1085,6 +1108,7 @@ async fn task_create_invoke_async(
         CliError::new(format!("invalid task.create.v2 arguments JSON: {error}"))
     })?;
     let task_id = args.task_id;
+    let requested = task_create_requested_capabilities(&args);
     let envelope =
         task_create_v2_command(CommandId::new(), ClientId::new(), unix_epoch_ms()?, args)
             .map_err(|error| CliError::new(format!("invalid task.create.v2 arguments: {error}")))?;
@@ -1094,7 +1118,7 @@ async fn task_create_invoke_async(
         ..envelope
     };
 
-    let mut client = connect_profile_client(profile, client_id, CapabilitySet::empty()).await?;
+    let mut client = connect_profile_client(profile, client_id, requested).await?;
     let receipt = execute_command_with_reconnect(&mut client, envelope, action_id).await?;
     match &receipt {
         CommandReceipt::Accepted { .. } => {
@@ -1112,6 +1136,14 @@ async fn task_create_invoke_async(
             "{action_id} rejected: {}",
             rejection_code_name(*code)
         ))),
+    }
+}
+
+fn task_create_requested_capabilities(args: &TaskCreateV2Arguments) -> CapabilitySet {
+    if args.primary_provider.is_some() {
+        CapabilitySet::from_capabilities([Capability::ProviderInput])
+    } else {
+        CapabilitySet::empty()
     }
 }
 
@@ -1183,7 +1215,10 @@ async fn provider_input_invoke_async(
     let mut client = connect_profile_client(
         profile,
         client_id,
-        CapabilitySet::from_capabilities([Capability::ProviderInput]),
+        CapabilitySet::from_capabilities([
+            Capability::ProviderInput,
+            Capability::OperationSettlement,
+        ]),
     )
     .await?;
     if !client
@@ -1196,9 +1231,8 @@ async fn provider_input_invoke_async(
     }
     let receipt = execute_command_with_reconnect(&mut client, envelope, action_id).await?;
     match &receipt {
-        CommandReceipt::Accepted { .. } => {
-            let delivery =
-                crate::domain::ProviderDeliveryVisibility::hold_until_destination_adapter();
+        CommandReceipt::Accepted { operation_id, .. } => {
+            let delivery = wait_for_provider_input_delivery(&mut client, *operation_id).await;
             let doc = json!({
                 "schema_version": SCHEMA_VERSION,
                 "action_id": action_id,
@@ -1206,11 +1240,7 @@ async fn provider_input_invoke_async(
                 "task_id": task_id,
                 "receipt": receipt,
                 "intent": "accepted",
-                "delivery": {
-                    "status": "hold",
-                    "reason": delivery.reason_code(),
-                    "delivered": false,
-                },
+                "delivery": delivery,
             });
             serde_json::to_string(&doc)
                 .map_err(|error| CliError::new(format!("failed to encode invoke JSON: {error}")))
@@ -1219,6 +1249,96 @@ async fn provider_input_invoke_async(
             "{action_id} rejected: {}",
             rejection_code_name(*code)
         ))),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProviderInputDeliveryReport {
+    status: &'static str,
+    reason: &'static str,
+    delivered: bool,
+}
+
+impl ProviderInputDeliveryReport {
+    fn to_json(&self) -> serde_json::Value {
+        json!({
+            "status": self.status,
+            "reason": self.reason,
+            "delivered": self.delivered,
+        })
+    }
+}
+
+fn provider_input_delivery_from_operation_state(
+    state: &OperationState,
+) -> Option<ProviderInputDeliveryReport> {
+    match state {
+        OperationState::Settled { .. } => Some(ProviderInputDeliveryReport {
+            status: "delivered",
+            reason: "settled",
+            delivered: true,
+        }),
+        OperationState::Uncertain { .. } => Some(ProviderInputDeliveryReport {
+            status: "uncertain",
+            reason: "ambiguous_dispatch",
+            delivered: false,
+        }),
+        OperationState::Failed { .. } => Some(ProviderInputDeliveryReport {
+            status: "failed",
+            reason: "operation_failed",
+            delivered: false,
+        }),
+        OperationState::Cancelled { .. } => Some(ProviderInputDeliveryReport {
+            status: "failed",
+            reason: "operation_cancelled",
+            delivered: false,
+        }),
+        OperationState::Accepted => None,
+    }
+}
+
+#[cfg(windows)]
+async fn wait_for_provider_input_delivery(
+    client: &mut HostClient,
+    operation_id: OperationId,
+) -> serde_json::Value {
+    if !client
+        .granted_capabilities()
+        .contains(Capability::OperationSettlement)
+    {
+        return ProviderInputDeliveryReport {
+            status: "pending",
+            reason: "operation_settlement_ungranted",
+            delivered: false,
+        }
+        .to_json();
+    }
+    let deadline = tokio::time::Instant::now() + PROVIDER_DELIVERY_WAIT;
+    loop {
+        match client.refresh_operation(operation_id).await {
+            Ok(Ok(state)) => {
+                if let Some(report) = provider_input_delivery_from_operation_state(&state) {
+                    return report.to_json();
+                }
+            }
+            Ok(Err(_)) | Err(_) => {
+                return ProviderInputDeliveryReport {
+                    status: "pending",
+                    reason: "operation_status_unavailable",
+                    delivered: false,
+                }
+                .to_json();
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return ProviderInputDeliveryReport {
+                status: "pending",
+                reason: "delivery_wait_elapsed",
+                delivered: false,
+            }
+            .to_json();
+        }
+        tokio::time::sleep(PROVIDER_DELIVERY_POLL).await;
     }
 }
 
@@ -1403,10 +1523,73 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_ctl_args, CliError, CtlCommand, COMMAND_REPLAY_TIMEOUT, MAX_ARGUMENTS_JSON_BYTES,
+        is_provider_input_invoke_action, parse_ctl_args, task_create_requested_capabilities,
+        CliError, CtlCommand, COMMAND_REPLAY_TIMEOUT, MAX_ARGUMENTS_JSON_BYTES,
         MAX_COMMAND_ATTEMPTS, MAX_DIAGNOSTIC_CHARS, STATUS_CONNECT_TIMEOUT,
     };
-    use crate::{client::action::ACTION_TASK_CREATE, domain::TaskId};
+    use crate::{
+        client::action::{
+            TaskCreateV2Arguments, ACTION_PROVIDER_ANSWER_QUESTION,
+            ACTION_PROVIDER_QUEUE_FOLLOW_UP, ACTION_PROVIDER_RESOLVE_APPROVAL,
+            ACTION_PROVIDER_SEND_NOW, ACTION_PROVIDER_STEER_CURRENT_TURN,
+            ACTION_PROVIDER_STOP_TURN, ACTION_PROVIDER_TERMINAL_INPUT, ACTION_TASK_ANSWER_QUESTION,
+            ACTION_TASK_CREATE, ACTION_TASK_QUEUE_FOLLOW_UP, ACTION_TASK_RESOLVE_APPROVAL,
+            ACTION_TASK_SEND_NOW, ACTION_TASK_STEER_CURRENT_TURN, ACTION_TASK_STOP_TURN,
+        },
+        domain::{EnvironmentId, ProjectId, TaskId},
+        protocol::Capability,
+        providers::ProviderKind,
+        workspace::WorkspaceRequest,
+    };
+
+    fn create_args(primary_provider: Option<ProviderKind>) -> TaskCreateV2Arguments {
+        TaskCreateV2Arguments {
+            task_id: TaskId::new(),
+            environment_id: EnvironmentId::new(),
+            title: "CLI task".into(),
+            description: None,
+            project_id: ProjectId::new(),
+            workspace: WorkspaceRequest::main(),
+            primary_provider,
+        }
+    }
+
+    #[test]
+    fn primary_provider_task_create_requests_provider_input_capability() {
+        assert!(!task_create_requested_capabilities(&create_args(None))
+            .contains(Capability::ProviderInput));
+        for provider in [ProviderKind::ClaudeCode, ProviderKind::Codex] {
+            assert!(
+                task_create_requested_capabilities(&create_args(Some(provider)))
+                    .contains(Capability::ProviderInput)
+            );
+        }
+    }
+
+    #[test]
+    fn ctl_routes_canonical_composer_actions_to_provider_input() {
+        for action_id in [
+            ACTION_TASK_SEND_NOW,
+            ACTION_TASK_STEER_CURRENT_TURN,
+            ACTION_TASK_QUEUE_FOLLOW_UP,
+            ACTION_TASK_ANSWER_QUESTION,
+            ACTION_TASK_RESOLVE_APPROVAL,
+            ACTION_TASK_STOP_TURN,
+            ACTION_PROVIDER_SEND_NOW,
+            ACTION_PROVIDER_STEER_CURRENT_TURN,
+            ACTION_PROVIDER_QUEUE_FOLLOW_UP,
+            ACTION_PROVIDER_ANSWER_QUESTION,
+            ACTION_PROVIDER_RESOLVE_APPROVAL,
+            ACTION_PROVIDER_TERMINAL_INPUT,
+            ACTION_PROVIDER_STOP_TURN,
+        ] {
+            assert!(
+                is_provider_input_invoke_action(action_id),
+                "{action_id} must reach the provider-input dispatcher"
+            );
+        }
+        assert!(!is_provider_input_invoke_action(ACTION_TASK_CREATE));
+    }
 
     #[test]
     fn parses_actions_status_and_task_show() {
@@ -1566,5 +1749,51 @@ mod tests {
     fn command_replay_budget_allows_one_full_replay_after_timeout() {
         assert_eq!(MAX_COMMAND_ATTEMPTS, 2);
         assert!(COMMAND_REPLAY_TIMEOUT > STATUS_CONNECT_TIMEOUT * 3);
+    }
+
+    #[test]
+    fn provider_input_delivery_report_never_hardcodes_adapter_not_wired() {
+        use super::provider_input_delivery_from_operation_state;
+        use crate::domain::operation::{
+            CancellationReason, OperationErrorCode, OperationState, OperationUncertaintyCode,
+        };
+        use crate::domain::EventId;
+
+        let settled = provider_input_delivery_from_operation_state(&OperationState::Settled {
+            settled_at_ms: 1,
+            result_event_ids: Vec::<EventId>::new(),
+        })
+        .expect("settled");
+        assert!(settled.delivered);
+        assert_eq!(settled.status, "delivered");
+        assert_ne!(settled.reason, "destination_adapter_not_wired");
+
+        let uncertain = provider_input_delivery_from_operation_state(&OperationState::Uncertain {
+            observed_at_ms: 1,
+            code: OperationUncertaintyCode::AmbiguousDispatch,
+        })
+        .expect("uncertain");
+        assert!(!uncertain.delivered);
+        assert_eq!(uncertain.status, "uncertain");
+        assert_ne!(uncertain.reason, "destination_adapter_not_wired");
+
+        let failed = provider_input_delivery_from_operation_state(&OperationState::Failed {
+            settled_at_ms: 1,
+            code: OperationErrorCode::SideEffectFailed,
+        })
+        .expect("failed");
+        assert!(!failed.delivered);
+        assert_eq!(failed.status, "failed");
+        assert_ne!(failed.reason, "destination_adapter_not_wired");
+
+        let cancelled = provider_input_delivery_from_operation_state(&OperationState::Cancelled {
+            settled_at_ms: 1,
+            reason: CancellationReason::Superseded,
+        })
+        .expect("cancelled");
+        assert!(!cancelled.delivered);
+        assert_ne!(cancelled.reason, "destination_adapter_not_wired");
+
+        assert!(provider_input_delivery_from_operation_state(&OperationState::Accepted).is_none());
     }
 }

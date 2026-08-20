@@ -57,18 +57,18 @@ fn host_mutation_permit_cannot_authorize_a_replaced_host_binding() {
 
     let binding_a =
         test_issue_git_host_binding(repo_dir.path(), Vec::new()).expect("issue first host binding");
-    let binding_b = test_issue_git_host_binding(repo_dir.path(), Vec::new())
-        .expect("issue replacement host binding");
     let repo_a = GitRepository::from_host_binding(binding_a, GitCancellation::new())
         .expect("open first bound repository");
-    let repo_b = GitRepository::from_host_binding(binding_b, GitCancellation::new())
-        .expect("open replacement bound repository");
     let plan = repo_a
         .plan_stage(&[RepoPath::from("tracked.txt")])
         .expect("plan stage from the first binding");
     let confirmation = repo_a
         .test_confirm(&plan)
         .expect("confirm with the first host binding");
+    let binding_b = test_issue_git_host_binding(repo_dir.path(), Vec::new())
+        .expect("issue replacement host binding");
+    let repo_b = GitRepository::from_host_binding(binding_b, GitCancellation::new())
+        .expect("open replacement bound repository");
 
     let error = repo_b
         .stage(&plan, &confirmation)

@@ -5,6 +5,7 @@ use super::interaction::{
     InteractionStateModel, MAX_ACCESSIBLE_DESCRIPTION_SCALARS, MAX_ACCESSIBLE_NAME_SCALARS,
 };
 use std::fmt::{Display, Formatter};
+use std::ops::Range;
 
 pub const MAX_TEXT_FIELD_SCALARS: usize = 4_096;
 pub const MAX_TEXT_FIELD_BYTES: usize = 16_384;
@@ -61,8 +62,19 @@ impl Default for TextFieldLimits {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TextFieldError {
     Component(ComponentError),
-    ScalarLimitExceeded { max: usize, actual: usize },
-    ByteLimitExceeded { max: usize, actual: usize },
+    InvalidScalarRange {
+        start: usize,
+        end: usize,
+        len: usize,
+    },
+    ScalarLimitExceeded {
+        max: usize,
+        actual: usize,
+    },
+    ByteLimitExceeded {
+        max: usize,
+        actual: usize,
+    },
 }
 
 impl From<ComponentError> for TextFieldError {
@@ -75,6 +87,12 @@ impl Display for TextFieldError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Component(error) => Display::fmt(error, formatter),
+            Self::InvalidScalarRange { start, end, len } => {
+                write!(
+                    formatter,
+                    "invalid text range {start}..{end} for {len} scalars"
+                )
+            }
             Self::ScalarLimitExceeded { max, actual } => {
                 write!(
                     formatter,
@@ -345,6 +363,47 @@ impl TextField {
         self.insert_text(text)
     }
 
+    /// Replace a scalar-indexed range as one platform text-input operation.
+    ///
+    /// Platform IME, paste, and accessibility input arrive as range
+    /// replacements rather than individual key presses. Keeping that edit in
+    /// the field model preserves the same limits, focus fence, cursor, and
+    /// accessibility value used by ordinary typing.
+    pub fn replace_range(
+        &mut self,
+        range: Range<usize>,
+        text: &str,
+        focus_epoch: FocusEpoch,
+    ) -> Result<bool, TextFieldError> {
+        let state = self.interaction.state();
+        if self.interaction.focus_epoch() != focus_epoch
+            || !state.focused()
+            || state.is_disabled()
+            || self.read_only
+        {
+            return Ok(false);
+        }
+        let scalar_len = self.value.chars().count();
+        if range.start > range.end || range.end > scalar_len {
+            return Err(TextFieldError::InvalidScalarRange {
+                start: range.start,
+                end: range.end,
+                len: scalar_len,
+            });
+        }
+        let start = byte_index_at_scalar(&self.value, range.start);
+        let end = byte_index_at_scalar(&self.value, range.end);
+        let mut next = self.value.clone();
+        next.replace_range(start..end, text);
+        self.validate_value(&next)?;
+        let changed = next != self.value;
+        self.value = next;
+        self.cursor = range.start + text.chars().count();
+        self.all_selected = false;
+        self.accessibility.set_value(Some(self.value.clone()));
+        Ok(changed)
+    }
+
     fn replace_selection_if_needed(&mut self) {
         let _ = self.clear_selection_contents();
     }
@@ -490,6 +549,18 @@ mod tests {
             .handle_key(TextFieldKey::Backspace, epoch)
             .expect("backspace"));
         assert_eq!(field.value(), "");
+        assert!(!field.is_all_selected());
+    }
+
+    #[test]
+    fn platform_text_replacement_keeps_the_inserted_cursor_position() {
+        let mut field = focused_field("alpha omega");
+        let epoch = field.focus_epoch();
+        assert!(field
+            .replace_range(6..11, "beta", epoch)
+            .expect("replace platform text range"));
+        assert_eq!(field.value(), "alpha beta");
+        assert_eq!(field.cursor(), 10);
         assert!(!field.is_all_selected());
     }
 }

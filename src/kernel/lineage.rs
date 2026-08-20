@@ -21,24 +21,21 @@ fn mismatch(as_projection: bool, detail: &str) -> StoreError {
 pub(crate) enum SettledLineageKind {
     Pure,
     PromptLibrary,
-    TaskTeardown,
+    /// Task-scoped action-only side effects are distinguished by their
+    /// immediately preceding derived result (`task.archived` or
+    /// `provider_input.delivered`), not by an impossible partial resource
+    /// fence.
+    TaskScopedSideEffect,
     HostAdmission,
     Release {
         resource_id: ResourceId,
         runtime_generation: u64,
     },
-    /// A provider adapter delivery is an external side effect whose result is
-    /// a non-task-mutating `provider_input.delivered` fact immediately before
-    /// `operation.settled`.
-    ProviderInput,
 }
 
-/// Pure = all-none; teardown = action + task scope; host admission = action + global scope;
-/// release = action + both resource fields; provider input = action + runtime generation.
-/// Any other combination fails closed.
 /// Pure = task-scoped all-none fence (task-mutation adjacency).
 /// PromptLibrary = host-scoped all-none fence (accepted+settled only; never task decisions).
-/// Teardown = action + task scope; host admission = action + global scope;
+/// TaskScopedSideEffect = action + task scope; host admission = action + global scope;
 /// release = action + both resource fields. Any other combination fails closed.
 pub(crate) fn classify_settled_lineage_fence(
     action_epoch: Option<u64>,
@@ -50,7 +47,7 @@ pub(crate) fn classify_settled_lineage_fence(
     match (action_epoch, resource_id, runtime_generation, task_id) {
         (None, None, None, Some(_)) => Ok(SettledLineageKind::Pure),
         (None, None, None, None) => Ok(SettledLineageKind::PromptLibrary),
-        (Some(_), None, None, Some(_)) => Ok(SettledLineageKind::TaskTeardown),
+        (Some(_), None, None, Some(_)) => Ok(SettledLineageKind::TaskScopedSideEffect),
         (Some(_), None, None, None) => Ok(SettledLineageKind::HostAdmission),
         (Some(_), Some(resource_id), Some(runtime_generation), Some(_)) => {
             Ok(SettledLineageKind::Release {
@@ -58,7 +55,6 @@ pub(crate) fn classify_settled_lineage_fence(
                 runtime_generation,
             })
         }
-        (Some(_), None, Some(_), Some(_)) => Ok(SettledLineageKind::ProviderInput),
         _ => Err(mismatch(
             as_projection,
             "unsupported operation fence shape for lineage",
@@ -190,31 +186,29 @@ pub(crate) fn validate_side_effect_settled_against_derived(
     }
     match (kind, derived) {
         (
-            SettledLineageKind::ProviderInput,
+            SettledLineageKind::TaskScopedSideEffect,
             Event::ProviderInputDelivered {
                 command_id,
                 operation_id,
-                runtime_generation,
                 action_epoch,
                 ..
             },
         ) if derived_revision.is_none()
             && *command_id == fact.command_id
             && *operation_id == fact.operation_id
-            && fact.action_epoch == Some(*action_epoch)
-            && fact.runtime_generation == Some(*runtime_generation) =>
+            && fact.action_epoch == Some(*action_epoch) =>
         {
             Ok(())
         }
-        (SettledLineageKind::ProviderInput, Event::ProviderInputDelivered { .. }) => Err(mismatch(
-            as_projection,
-            "provider input delivery and operation.settled identity mismatch",
-        )),
-        (SettledLineageKind::ProviderInput, _) => Err(mismatch(
-            as_projection,
-            "provider input settlement requires immediately preceding provider_input.delivered",
-        )),
-        (SettledLineageKind::TaskTeardown, Event::TaskArchived) if derived_revision.is_some() => {
+        (SettledLineageKind::TaskScopedSideEffect, Event::ProviderInputDelivered { .. }) => {
+            Err(mismatch(
+                as_projection,
+                "provider input delivery and operation.settled identity mismatch",
+            ))
+        }
+        (SettledLineageKind::TaskScopedSideEffect, Event::TaskArchived)
+            if derived_revision.is_some() =>
+        {
             Ok(())
         }
         (
@@ -232,9 +226,9 @@ pub(crate) fn validate_side_effect_settled_against_derived(
         {
             Ok(())
         }
-        (SettledLineageKind::TaskTeardown, _) => Err(mismatch(
+        (SettledLineageKind::TaskScopedSideEffect, _) => Err(mismatch(
             as_projection,
-            "task teardown settle requires immediately preceding task.archived",
+            "task-scoped side-effect settle requires matching immediately preceding derived result",
         )),
         (SettledLineageKind::Release { .. }, _) => Err(mismatch(
             as_projection,
@@ -551,10 +545,17 @@ fn is_pure_decision_fact(event: &Event) -> bool {
             | Event::TaskRenamed { .. }
             | Event::TaskAttentionSet { .. }
             | Event::TaskReopened
+            | Event::TaskArchived
             | Event::AgentSessionRegistered { .. }
+            | Event::AgentProviderSessionBound { .. }
             | Event::PrimaryAgentSet { .. }
+            | Event::SpecialistRequested { .. }
+            | Event::PrimaryPromoted { .. }
+            | Event::SpecialistHandoffRecorded { .. }
+            | Event::SpecialistClosed { .. }
             | Event::ArtifactRegistered { .. }
             | Event::ResourceRegistered { .. }
+            | Event::ResourceReleased { .. }
             | Event::ProviderQuestionPresented { .. }
             | Event::ProviderApprovalPresented { .. }
             | Event::ProviderWaitSettled { .. }

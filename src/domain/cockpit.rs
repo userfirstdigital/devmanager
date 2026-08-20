@@ -58,6 +58,7 @@ pub const fn task_agent_resource_projection(
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskCockpitSurface {
+    Conversation,
     Workspace,
     Git,
     Files,
@@ -116,6 +117,12 @@ pub enum TaskCockpitQuery {
     ConfigCreateProject {
         name: String,
         root_path: String,
+    },
+    /// Read the bounded provider-neutral semantic conversation retained for
+    /// the selected Task. The cursor is exclusive; zero requests the current
+    /// retained window from its beginning.
+    Conversation {
+        after_sequence: u64,
     },
     WorkspaceStatus,
     GitStatus,
@@ -434,6 +441,7 @@ impl AgentConnectionSnapshot {
 pub enum TaskCockpitResult {
     Config(ConfigSidebarSnapshot),
     AgentConnection(AgentConnectionSnapshot),
+    Conversation(crate::domain::snapshot::SemanticJournalPage),
     Workspace(TaskWorkspaceProjection),
     Git(TaskGitProjection),
     FilesList(TaskFilesListProjection),
@@ -539,6 +547,7 @@ pub fn cockpit_surface(query: &TaskCockpitQuery) -> TaskCockpitSurface {
         TaskCockpitQuery::ConfigSnapshot
         | TaskCockpitQuery::AgentConnection
         | TaskCockpitQuery::ConfigCreateProject { .. } => TaskCockpitSurface::Workspace,
+        TaskCockpitQuery::Conversation { .. } => TaskCockpitSurface::Conversation,
         TaskCockpitQuery::WorkspaceStatus => TaskCockpitSurface::Workspace,
         TaskCockpitQuery::GitStatus | TaskCockpitQuery::GitMutate { .. } => TaskCockpitSurface::Git,
         TaskCockpitQuery::FilesList { .. }

@@ -19,10 +19,9 @@ use crate::providers::adapter::{
     QuotaObservation, StopStrategy, WindowsProviderProbeRunner,
 };
 use crate::providers::capabilities::{
-    CapabilityEvidence, CapabilityEvidenceError, CapabilitySupport, EvidenceSourceId,
-    EvidenceStatus, ProviderAuthState, ProviderCapabilities, ProviderCapabilitiesError,
-    ProviderCapability, ProviderExecutable, ProviderExecutableHandle, ProviderExecutablePolicy,
-    ProviderKind, ProviderVersion,
+    CapabilityEvidence, CapabilitySupport, EvidenceSourceId, EvidenceStatus, ProviderAuthState,
+    ProviderCapabilities, ProviderCapabilitiesError, ProviderCapability, ProviderExecutable,
+    ProviderExecutableHandle, ProviderExecutablePolicy, ProviderKind, ProviderVersion,
 };
 use crate::providers::hook_bridge;
 use crate::providers::registry::ProviderObservation;
@@ -640,7 +639,6 @@ impl ClaudeCodeAdapter {
         &self,
         version_stdout: &[u8],
         help_stdout: &[u8],
-        auth_stdout: &[u8],
         observed_at: u64,
     ) -> Result<ProviderCapabilities, ProviderError> {
         let version = ProviderVersion::from_probe_output(version_stdout)?;
@@ -658,16 +656,10 @@ impl ClaudeCodeAdapter {
         } else {
             CapabilitySupport::Unknown
         };
-        let auth_state = parse_subscription_auth(auth_stdout);
-        let auth_status = match auth_state {
-            ProviderAuthState::AuthenticatedSubscription => EvidenceStatus::Authenticated,
-            ProviderAuthState::AuthRequired => EvidenceStatus::AuthRequired,
-            ProviderAuthState::Unknown => EvidenceStatus::Unknown,
-        };
         let capabilities = ProviderCapabilities {
             kind: ProviderKind::ClaudeCode,
             version,
-            auth_state,
+            auth_state: ProviderAuthState::Unknown,
             exact_resume,
             semantic_events: semantic,
             provider_session_id: semantic,
@@ -686,7 +678,6 @@ impl ClaudeCodeAdapter {
                     observed_at,
                     EvidenceStatus::Supported,
                 )?,
-                evidence(EvidenceSourceId::AuthStatusProbe, observed_at, auth_status)?,
             ],
         };
         capabilities.validate()?;
@@ -750,10 +741,8 @@ fn evidence(
     observed_at: u64,
     status: EvidenceStatus,
 ) -> Result<CapabilityEvidence, ProviderError> {
-    CapabilityEvidence::new(source, observed_at, status, None).map_err(|_| {
-        ProviderError::InvalidCapabilities(ProviderCapabilitiesError::InvalidEvidence(
-            CapabilityEvidenceError::ObservedAtZero,
-        ))
+    CapabilityEvidence::new(source, observed_at, status, None).map_err(|error| {
+        ProviderError::InvalidCapabilities(ProviderCapabilitiesError::InvalidEvidence(error))
     })
 }
 
@@ -910,12 +899,8 @@ impl ProviderAdapter for ClaudeCodeAdapter {
         let auth = self
             .run_probe(executable, ProviderProbeKind::AuthStatus)
             .await?;
-        let capabilities = self.interpret_probe_outputs(
-            version.stdout(),
-            help.stdout(),
-            auth.stdout(),
-            (self.now_ms)(),
-        )?;
+        let capabilities =
+            self.interpret_probe_outputs(version.stdout(), help.stdout(), (self.now_ms)())?;
         let mut state = self.state.lock().map_err(|_| {
             ProviderError::Probe(ProviderProbeError::Io(
                 crate::providers::adapter::ProviderProbeIoError::WaitFailed,
@@ -925,10 +910,12 @@ impl ProviderAdapter for ClaudeCodeAdapter {
             executable: executable.executable().clone(),
             version: capabilities.version.clone(),
         });
-        // Keep full probe (including auth) for adapter-local decisions; the
-        // registry only accepts the stable non-auth projection.
-        state.probed = Some(capabilities.clone());
-        Ok(capabilities.stable_projection())
+        // Keep parsed auth for adapter-local decisions. The registry only
+        // accepts the stable non-auth projection; trusted auth is a receipt.
+        let mut probed = capabilities.clone();
+        probed.auth_state = parse_subscription_auth(auth.stdout());
+        state.probed = Some(probed);
+        Ok(capabilities)
     }
 
     fn build_launch(
@@ -959,10 +946,13 @@ impl ProviderAdapter for ClaudeCodeAdapter {
                 after: request.executable().executable().clone(),
             });
         }
-        let arguments = if let Some(session_id) = request.provider_session_id() {
-            if capabilities.exact_resume != CapabilitySupport::Supported
-                || capabilities.provider_session_id != CapabilitySupport::Supported
-            {
+        let mut arguments = if let Some(session_id) = request.provider_session_id() {
+            // The executable help probe proves whether `--resume <id>` is
+            // supported. The supplied id is already a durable, correlated
+            // SessionStart fact and the launch relay verifies Claude reports
+            // the same id again, so help text does not also need to enumerate
+            // hook payload fields.
+            if capabilities.exact_resume != CapabilitySupport::Supported {
                 return Err(ProviderError::UnsupportedCapability(
                     ProviderCapability::ExactResume,
                 ));
@@ -978,6 +968,18 @@ impl ProviderAdapter for ClaudeCodeAdapter {
         } else {
             Vec::new()
         };
+        // DevManager is the controlling interaction surface and its provider
+        // sessions are intentionally launched with the user's no-prompt policy.
+        // `bypassPermissions` suppresses tool approval prompts without disabling
+        // explicit AskUserQuestion interactions, which are projected separately.
+        arguments.extend([
+            ProviderArgument::new("--permission-mode").map_err(|_| {
+                ProviderError::UnsupportedCapability(ProviderCapability::BuildLaunch)
+            })?,
+            ProviderArgument::new("bypassPermissions").map_err(|_| {
+                ProviderError::UnsupportedCapability(ProviderCapability::BuildLaunch)
+            })?,
+        ]);
         // Bounded launch input is retained on the request for the provider
         // sequencer; stock Claude CLI does not accept a prompt argv here.
         let _ = request.input();
@@ -1116,8 +1118,12 @@ mod tests {
         let capabilities = adapter.probe(&executable).await.expect("fixture probe");
         assert_eq!(capabilities.kind, ProviderKind::ClaudeCode);
         assert_eq!(capabilities.version.as_str(), "2.0.72 (Claude Code)");
+        assert_eq!(capabilities.auth_state, ProviderAuthState::Unknown);
         assert_eq!(
-            capabilities.auth_state,
+            adapter
+                .probed_capabilities()
+                .expect("adapter-local probe")
+                .auth_state,
             ProviderAuthState::AuthenticatedSubscription
         );
         assert_eq!(capabilities.exact_resume, CapabilitySupport::Supported);
@@ -1157,9 +1163,24 @@ mod tests {
                 ClaudeCodeAdapter::with_clock(FixtureProbeRunner::auth(body), || 1_700_000_000_100);
             let executable = fixture_handle();
             let capabilities = adapter.probe(&executable).await.unwrap();
-            assert_eq!(capabilities.auth_state, expected, "{body:?}");
-            assert_ne!(
+            assert_eq!(
                 capabilities.auth_state,
+                ProviderAuthState::Unknown,
+                "{body:?}"
+            );
+            assert_eq!(
+                adapter
+                    .probed_capabilities()
+                    .expect("adapter-local probe")
+                    .auth_state,
+                expected,
+                "{body:?}"
+            );
+            assert_ne!(
+                adapter
+                    .probed_capabilities()
+                    .expect("adapter-local probe")
+                    .auth_state,
                 ProviderAuthState::AuthenticatedSubscription
             );
         }
@@ -1219,16 +1240,19 @@ mod tests {
     #[tokio::test]
     async fn registry_observe_uses_real_adapter_probe() {
         let temp = tempdir().unwrap();
-        let path = temp.path().join("claude");
-        std::fs::write(&path, b"fixture-claude").unwrap();
+        let path = temp.path().join(if cfg!(windows) {
+            "claude.exe"
+        } else {
+            "claude"
+        });
+        std::fs::copy(std::env::current_exe().unwrap(), &path).unwrap();
 
+        let adapter = Arc::new(ClaudeCodeAdapter::with_clock(
+            FixtureProbeRunner::authenticated(),
+            || 1_700_000_000_100,
+        ));
         let mut registry = ProviderRegistry::new();
-        registry
-            .register(Arc::new(ClaudeCodeAdapter::with_clock(
-                FixtureProbeRunner::authenticated(),
-                || 1_700_000_000_100,
-            )))
-            .unwrap();
+        registry.register(adapter.clone()).unwrap();
         let observation = registry
             .observe(
                 ProviderKind::ClaudeCode,
@@ -1241,6 +1265,10 @@ mod tests {
             .unwrap();
         assert_eq!(
             observation.capabilities().auth_state,
+            ProviderAuthState::Unknown
+        );
+        assert_eq!(
+            adapter.probed_capabilities().unwrap().auth_state,
             ProviderAuthState::AuthenticatedSubscription
         );
         assert_eq!(
@@ -1362,6 +1390,63 @@ mod tests {
     fn current_executable_for_hooks() -> ProviderExecutable {
         ProviderExecutable::from_path(std::env::current_exe().expect("current exe"))
             .expect("identity")
+    }
+
+    #[test]
+    fn launches_bypass_permission_mode_for_fresh_and_exact_resume_sessions() {
+        let executable = current_executable_for_hooks();
+        let version = ProviderVersion::from_probe_output(fixture("version")).unwrap();
+        let capabilities = ProviderCapabilities {
+            kind: ProviderKind::ClaudeCode,
+            version: version.clone(),
+            auth_state: ProviderAuthState::Unknown,
+            exact_resume: CapabilitySupport::Supported,
+            semantic_events: CapabilitySupport::Unknown,
+            provider_session_id: CapabilitySupport::Unknown,
+            build_launch: CapabilitySupport::Supported,
+            parse_signal: CapabilitySupport::Unsupported,
+            cooperative_stop: CapabilitySupport::Unknown,
+            observe_quota: CapabilitySupport::Unsupported,
+            evidence: vec![],
+        };
+        let observation = ProviderObservation::from_test_parts(
+            ProviderKind::ClaudeCode,
+            executable.open_for_launch().unwrap(),
+            version,
+            capabilities,
+        )
+        .expect("attested Claude observation");
+        let adapter = ClaudeCodeAdapter::from_attested_observation(observation.clone()).unwrap();
+        let session_id = ProviderSessionId::new("durably-bound-session").unwrap();
+
+        let fresh_spec = adapter
+            .build_launch(LaunchProviderRequest::new(
+                observation.executable_handle().clone(),
+                None,
+                None,
+            ))
+            .expect("fresh Claude sessions must permit interactive questions");
+        assert_eq!(
+            fresh_spec.arguments().collect::<Vec<_>>(),
+            vec!["--permission-mode", "bypassPermissions"]
+        );
+
+        let spec = adapter
+            .build_launch(LaunchProviderRequest::new(
+                observation.executable_handle().clone(),
+                None,
+                Some(session_id),
+            ))
+            .expect("the --resume capability is independent of help text listing hook fields");
+        assert_eq!(
+            spec.arguments().collect::<Vec<_>>(),
+            vec![
+                "--resume",
+                "durably-bound-session",
+                "--permission-mode",
+                "bypassPermissions"
+            ]
+        );
     }
 
     fn hook_binding() -> ClaudeCorrelationBinding {

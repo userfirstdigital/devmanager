@@ -6,6 +6,7 @@ use std::fmt;
 
 pub use crate::domain::agent::SpecialistPermission;
 use crate::domain::agent::{AgentRole, AgentSessionFacts, AgentSessionLifecycle};
+use crate::domain::agent_resource::AgentResourceBinding;
 use crate::domain::artifact::{
     verify_inline_content_digest, ArtifactContentRef, ArtifactFacts, ArtifactKind, PrivacyClass,
     MAX_SPECIALIST_RAW_ARTIFACT_BYTES,
@@ -1208,6 +1209,15 @@ pub enum Command {
     RegisterAgentSession {
         agent: AgentSessionFacts,
     },
+    /// Host-journal ingress only. A correlated current-generation provider
+    /// SessionStart is the sole authority for binding the durable conversation
+    /// identity to an already-registered agent session.
+    BindProviderSession {
+        agent_session_id: AgentSessionId,
+        resource_id: ResourceId,
+        provider_session_id: crate::domain::ProviderSessionId,
+        expected_runtime_generation: u64,
+    },
     SetPrimaryAgent {
         agent_session_id: AgentSessionId,
     },
@@ -1416,6 +1426,44 @@ pub fn decide(
             Ok(vec![Event::AgentSessionRegistered {
                 agent: agent.clone(),
             }])
+        }
+        Command::BindProviderSession {
+            agent_session_id,
+            resource_id,
+            provider_session_id,
+            expected_runtime_generation,
+        } => {
+            let snap = require_runtime_capable_task(snapshot, envelope)?;
+            require_expected_revision(snap, envelope)?;
+            let agent = snap
+                .agents
+                .get(agent_session_id)
+                .ok_or(RejectionCode::NotFound)?;
+            require_open_agent(agent)?;
+            if agent.runtime_generation != *expected_runtime_generation {
+                return Err(RejectionCode::InvalidTransition);
+            }
+            let resource = snap
+                .resources
+                .get(resource_id)
+                .ok_or(RejectionCode::NotFound)?;
+            let binding = AgentResourceBinding::from_facts(agent, resource)
+                .map_err(|_| RejectionCode::InvalidTransition)?;
+            if binding.resource_id != *resource_id
+                || binding.runtime_generation != *expected_runtime_generation
+            {
+                return Err(RejectionCode::InvalidTransition);
+            }
+            match agent.provider_session_id.as_ref() {
+                Some(bound) if bound == provider_session_id => Err(RejectionCode::AlreadyExists),
+                Some(_) => Err(RejectionCode::OwnershipConflict),
+                None => Ok(vec![Event::AgentProviderSessionBound {
+                    agent_session_id: *agent_session_id,
+                    resource_id: *resource_id,
+                    provider_session_id: provider_session_id.clone(),
+                    runtime_generation: *expected_runtime_generation,
+                }]),
+            }
         }
         Command::SetPrimaryAgent { agent_session_id } => {
             let snap = require_runtime_capable_task(snapshot, envelope)?;
@@ -1642,10 +1690,16 @@ fn decide_submit_provider_input(
         return Err(RejectionCode::OwnershipConflict);
     }
     require_open_agent(agent)?;
-    let Some(provider_session_id) = agent.provider_session_id.clone() else {
-        return Err(RejectionCode::UnsupportedCapability);
-    };
     let provider_kind = agent.provider_kind;
+    let provider_session_id = match (provider_kind, agent.provider_session_id.clone()) {
+        (_, Some(provider_session_id)) => Some(provider_session_id),
+        // The stock Codex adapter currently has no trustworthy upstream
+        // conversation-id signal. Its live task/agent/generation/epoch fence
+        // still authorizes PTY delivery, while exact resume remains visibly
+        // unsupported instead of inventing a provider identity.
+        (ProviderKind::Codex, None) => None,
+        _ => return Err(RejectionCode::UnsupportedCapability),
+    };
     if agent.runtime_generation != intent.runtime_generation() {
         return Err(RejectionCode::InvalidTransition);
     }
@@ -1667,6 +1721,7 @@ fn decide_submit_provider_input(
         }
         ProviderInputAction::SteerCurrentTurn { .. }
         | ProviderInputAction::QueueFollowUp { .. }
+        | ProviderInputAction::TerminalInput { .. }
         | ProviderInputAction::StopTurn => {
             if session.current_turn != Some(intent.turn_id()) {
                 return Err(RejectionCode::InvalidTransition);

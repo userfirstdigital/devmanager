@@ -11,7 +11,10 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-const LAYOUT_SCHEMA: &str = "devmanager.workspace-layout/v1";
+use crate::domain::TaskId;
+
+const LAYOUT_SCHEMA_V1: &str = "devmanager.workspace-layout/v1";
+const LAYOUT_SCHEMA: &str = "devmanager.workspace-layout/v2";
 const LAYOUT_FILE_NAME: &str = "workspace-layout.json";
 
 pub const SIDEBAR_MIN: f32 = 180.0;
@@ -75,6 +78,11 @@ pub struct WorkspaceLayout {
     pub terminal_collapsed: bool,
     #[serde(default)]
     pub window: Option<WindowFrame>,
+    /// Client-local navigation state. This is a view preference, not durable
+    /// Task state, and is validated against the next host projection before it
+    /// can become active.
+    #[serde(default)]
+    pub selected_task: Option<TaskId>,
 }
 
 impl Default for WorkspaceLayout {
@@ -88,9 +96,10 @@ impl Default for WorkspaceLayout {
             // laptop-class windows this ships to.
             terminal_height: 200.0,
             sidebar_collapsed: false,
-            dock_collapsed: false,
+            dock_collapsed: true,
             terminal_collapsed: false,
             window: None,
+            selected_task: None,
         }
     }
 }
@@ -245,7 +254,9 @@ impl WorkspaceLayoutStore {
 
     /// Load the stored layout, falling back to defaults. A view preference is
     /// never worth failing a launch over, so unreadable or foreign-schema
-    /// storage degrades to the default geometry.
+    /// storage degrades to the default geometry. Version-1 layouts migrate
+    /// once into the conversation-first schema by collapsing the context dock
+    /// while preserving every other stored preference.
     pub fn load(&self) -> WorkspaceLayout {
         let Ok(bytes) = fs::read(&self.path) else {
             return WorkspaceLayout::default();
@@ -253,10 +264,15 @@ impl WorkspaceLayoutStore {
         let Ok(file) = serde_json::from_slice::<LayoutFile>(&bytes) else {
             return WorkspaceLayout::default();
         };
-        if file.schema != LAYOUT_SCHEMA {
-            return WorkspaceLayout::default();
+        match file.schema.as_str() {
+            LAYOUT_SCHEMA => file.layout.sanitized(),
+            LAYOUT_SCHEMA_V1 => {
+                let mut layout = file.layout.sanitized();
+                layout.dock_collapsed = true;
+                layout
+            }
+            _ => WorkspaceLayout::default(),
         }
-        file.layout.sanitized()
     }
 
     pub fn save(&self, layout: WorkspaceLayout) -> io::Result<()> {
@@ -270,7 +286,7 @@ impl WorkspaceLayoutStore {
     }
 }
 
-fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
+pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)?;
     let temporary = parent.join(format!(
@@ -336,6 +352,7 @@ mod tests {
         layout.set_value(PaneEdge::Inbox, 401.0);
         layout.set_value(PaneEdge::Terminal, 333.0);
         layout.sidebar_collapsed = true;
+        layout.selected_task = Some(TaskId::new());
         store.save(layout).expect("save layout");
 
         assert_eq!(store.load(), layout);
@@ -426,6 +443,7 @@ mod tests {
             dock_collapsed: false,
             terminal_collapsed: false,
             window: None,
+            selected_task: None,
         };
         let fitted = layout.fitted(1000.0, 900.0);
         let rails = fitted.sidebar_width + fitted.inbox_width + fitted.dock_width;
@@ -450,5 +468,69 @@ mod tests {
         assert_eq!(fitted.dock_width, 0.0);
         assert_eq!(fitted.terminal_height, 0.0);
         assert_eq!(layout.dock_width, WorkspaceLayout::default().dock_width);
+    }
+
+    #[test]
+    fn conversation_first_defaults_collapse_the_context_dock() {
+        assert!(
+            WorkspaceLayout::default().dock_collapsed,
+            "new layouts must start with the context dock collapsed"
+        );
+    }
+
+    #[test]
+    fn v1_layout_migrates_once_to_v2_with_dock_collapsed() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let store = WorkspaceLayoutStore::at_profile_root(directory.path());
+        let selected = TaskId::new();
+        let window = WindowFrame {
+            x: 48.0,
+            y: 64.0,
+            width: 1440.0,
+            height: 900.0,
+            maximized: false,
+        };
+        let v1 = serde_json::json!({
+            "schema": "devmanager.workspace-layout/v1",
+            "layout": {
+                "sidebar_width": 275.0,
+                "inbox_width": 410.0,
+                "dock_width": 520.0,
+                "terminal_height": 240.0,
+                "sidebar_collapsed": true,
+                "dock_collapsed": false,
+                "terminal_collapsed": true,
+                "window": window,
+                "selected_task": selected
+            }
+        });
+        fs::write(
+            store.path(),
+            serde_json::to_vec_pretty(&v1).expect("encode"),
+        )
+        .expect("write");
+
+        let migrated = store.load();
+        assert_eq!(migrated.sidebar_width, 275.0);
+        assert_eq!(migrated.inbox_width, 410.0);
+        assert_eq!(migrated.dock_width, 520.0);
+        assert_eq!(migrated.terminal_height, 240.0);
+        assert!(migrated.sidebar_collapsed);
+        assert!(
+            migrated.dock_collapsed,
+            "v1 open docks must collapse once during conversation-first migration"
+        );
+        assert!(migrated.terminal_collapsed);
+        assert_eq!(migrated.window, Some(window));
+        assert_eq!(migrated.selected_task, Some(selected));
+
+        store.save(migrated).expect("persist migrated layout");
+        let bytes = fs::read(store.path()).expect("read saved layout");
+        let saved: serde_json::Value = serde_json::from_slice(&bytes).expect("parse saved");
+        assert_eq!(
+            saved["schema"], "devmanager.workspace-layout/v2",
+            "save must write the conversation-first schema"
+        );
+        assert_eq!(store.load(), migrated);
     }
 }

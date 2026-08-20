@@ -84,6 +84,31 @@ function Stop-StaleLiveCopies {
     }
 }
 
+function Wait-ForStaleLiveCopiesToExit {
+    param([int]$TimeoutMs = 10000)
+
+    $targets = @(
+        @{ Name = "devmanager.exe"; Path = $LiveExe.ToLowerInvariant() },
+        @{ Name = "devmanager-host.exe"; Path = $LiveHostExe.ToLowerInvariant() }
+    )
+    $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
+    do {
+        $running = @(
+            foreach ($target in $targets) {
+                Get-CimInstance Win32_Process -Filter ("Name = '{0}'" -f $target.Name) -ErrorAction SilentlyContinue |
+                    Where-Object { $_.ExecutablePath -and $_.ExecutablePath.ToLowerInvariant() -eq $target.Path }
+            }
+        )
+        if ($running.Count -eq 0) {
+            return
+        }
+        Start-Sleep -Milliseconds 120
+    } while ((Get-Date) -lt $deadline)
+
+    $remaining = $running | ForEach-Object { "{0} (pid {1})" -f $_.Name, $_.ProcessId }
+    throw ("Timed out waiting for stale live processes to exit: {0}." -f ($remaining -join ", "))
+}
+
 function Wait-ForFileUnlock {
     param(
         [string]$Path,
@@ -209,7 +234,7 @@ function Show-HostStartupFailure {
 }
 
 function Wait-ForDevHost {
-    param([int]$TimeoutMs = 15000)
+    param([int]$TimeoutMs = 45000)
 
     $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
     while ((Get-Date) -lt $deadline) {
@@ -260,6 +285,7 @@ function Invoke-BuildAndRelaunch {
 
     Stop-ManagedApp
     Stop-StaleLiveCopies
+    Wait-ForStaleLiveCopiesToExit
     Wait-ForFileUnlock -Path $LiveExe
     Wait-ForFileUnlock -Path $LiveHostExe
 

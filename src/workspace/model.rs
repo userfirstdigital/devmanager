@@ -667,7 +667,7 @@ impl WorkspaceBinding {
     }
 }
 
-fn durable_refs_same_location(left: &WorkspaceRef, right: &WorkspaceRef) -> bool {
+pub(crate) fn durable_refs_same_location(left: &WorkspaceRef, right: &WorkspaceRef) -> bool {
     match (left, right) {
         (WorkspaceRef::Main, WorkspaceRef::Main)
         | (WorkspaceRef::Main, WorkspaceRef::MainWithFingerprint { .. })

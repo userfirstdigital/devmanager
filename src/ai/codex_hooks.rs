@@ -204,18 +204,40 @@ impl CodexHookReducer {
                     session_binding: None,
                 }
             }
-            "Stop" => CodexHookReduction {
-                drafts: vec![self.event(
+            "Stop" => {
+                let turn_key = string_field(payload, "turn_id")
+                    .map(bounded_identifier)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| occurred_at_epoch_ms.to_string());
+                let mut drafts = Vec::with_capacity(2);
+                if let Some(text) =
+                    string_field(payload, "last_assistant_message").filter(|text| !text.is_empty())
+                {
+                    drafts.push(self.event(
+                        occurred_at_epoch_ms,
+                        SemanticEventKind::AssistantMessage {
+                            message_id: turn_key.clone(),
+                            text: bounded_hook_text(text),
+                            streaming: false,
+                        },
+                        SemanticRetention::Canonical,
+                        format!("codex-hook:assistant:{session_id}:{turn_key}"),
+                    ));
+                }
+                drafts.push(self.event(
                     occurred_at_epoch_ms,
                     SemanticEventKind::Status {
                         state: "idle".to_string(),
                         detail: None,
                     },
                     SemanticRetention::Canonical,
-                    format!("codex-hook:turn-status:{session_id}"),
-                )],
-                session_binding: None,
-            },
+                    format!("codex-hook:turn-status:{session_id}:{turn_key}"),
+                ));
+                CodexHookReduction {
+                    drafts,
+                    session_binding: None,
+                }
+            }
             _ => CodexHookReduction::default(),
         }
     }
@@ -376,6 +398,7 @@ impl Drop for CodexLaunchPermit {
 pub enum CodexRegistryEvent {
     Semantic(SemanticEventDraft),
     SessionStarted(CodexSessionBinding),
+    ExactResumeFailed,
 }
 
 pub type CodexRegistryEventHandler =
@@ -459,6 +482,10 @@ struct RegisteredCodexSession {
     /// generation. It is deliberately write-once: a PTY/relay nonce is not a
     /// substitute for the provider's SessionStart identity.
     provider_session_id: Option<ProviderSessionId>,
+    /// Exact provider identity requested by a resume launch. This remains
+    /// separate from `provider_session_id`: an expected identity is not a
+    /// provider-confirmed binding until the correlated SessionStart arrives.
+    expected_provider_session_id: Option<ProviderSessionId>,
 }
 
 struct CodexRegistryState {
@@ -491,8 +518,10 @@ fn session_is_current(state: &CodexRegistryState, session: &RegisteredCodexSessi
 /// Superseded registrations (an older launch of the same session key) are
 /// rejected so a stale relaunch can never publish into the newer session.
 ///
-/// The registered event handler is invoked while a publication read-guard is
-/// held: it must not call back into the registry.
+/// Normal admitted events invoke the registered handler while a publication
+/// read-guard is held, so those callbacks must not call back into the registry.
+/// An exact-resume mismatch is terminal and publishes only after releasing the
+/// gate, allowing its owner to unregister and settle the rejected generation.
 pub struct CodexHookRegistry {
     publication_gate: std::sync::RwLock<()>,
     state: std::sync::Mutex<CodexRegistryState>,
@@ -524,6 +553,14 @@ impl CodexHookRegistry {
     pub(crate) fn register(
         &self,
         stable_session_key: StableSessionKey,
+    ) -> Result<CodexHookRegistration, String> {
+        self.register_expected(stable_session_key, None)
+    }
+
+    pub(crate) fn register_expected(
+        &self,
+        stable_session_key: StableSessionKey,
+        expected_provider_session_id: Option<ProviderSessionId>,
     ) -> Result<CodexHookRegistration, String> {
         let _publication = self
             .publication_gate
@@ -571,6 +608,7 @@ impl CodexHookRegistry {
                 generation,
                 reducer: CodexHookReducer::new(stable_session_key.clone()),
                 provider_session_id: None,
+                expected_provider_session_id,
             },
         );
         Ok(CodexHookRegistration {
@@ -774,8 +812,18 @@ impl CodexHookRegistry {
         let Some(session) = state.registrations.get_mut(&expected.nonce) else {
             return Ok(None);
         };
-        if !admit_provider_identity(session, &payload) {
-            return Ok(None);
+        match provider_identity_admission(session, &payload) {
+            ProviderIdentityAdmission::Admit => {}
+            ProviderIdentityAdmission::Reject => return Ok(None),
+            ProviderIdentityAdmission::ExactResumeMismatch => {
+                drop(state);
+                drop(_publication);
+                let handler = self.event_handler.read().ok().and_then(|slot| slot.clone());
+                if let Some(handler) = handler {
+                    handler(expected.clone(), CodexRegistryEvent::ExactResumeFailed);
+                }
+                return Ok(None);
+            }
         }
         // The publication read-lock and registry state lock remain held while
         // the adapter commits its identity decision. The operation must only
@@ -840,30 +888,56 @@ fn session_start_provider_session_id(payload: &Value) -> Option<ProviderSessionI
         .and_then(|raw| ProviderSessionId::new(raw.to_string()).ok())
 }
 
-fn admit_provider_identity(session: &RegisteredCodexSession, payload: &Value) -> bool {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProviderIdentityAdmission {
+    Admit,
+    Reject,
+    ExactResumeMismatch,
+}
+
+fn provider_identity_admission(
+    session: &RegisteredCodexSession,
+    payload: &Value,
+) -> ProviderIdentityAdmission {
     let event_name = string_field(payload, "hook_event_name");
     if event_name == Some("SessionStart") {
         let Some(observed) = session_start_provider_session_id(payload) else {
-            return false;
+            return ProviderIdentityAdmission::Reject;
         };
-        return session
-            .provider_session_id
+        if let Some(bound) = session.provider_session_id.as_ref() {
+            return if bound == &observed {
+                ProviderIdentityAdmission::Admit
+            } else {
+                ProviderIdentityAdmission::Reject
+            };
+        }
+        if session
+            .expected_provider_session_id
             .as_ref()
-            .is_none_or(|bound| bound == &observed);
+            .is_some_and(|expected| expected != &observed)
+        {
+            return ProviderIdentityAdmission::ExactResumeMismatch;
+        }
+        return ProviderIdentityAdmission::Admit;
     }
 
     // Known semantic events must carry the exact identity already established
     // by SessionStart. Unknown provider events remain redacted by the adapter
     // and do not cross this identity boundary.
     if !event_name.is_some_and(|name| CODEX_HOOK_EVENTS.contains(&name)) {
-        return true;
+        return ProviderIdentityAdmission::Admit;
     }
     let Some(bound) = session.provider_session_id.as_ref() else {
-        return false;
+        return ProviderIdentityAdmission::Reject;
     };
-    string_field(payload, "session_id")
+    if string_field(payload, "session_id")
         .and_then(|raw| ProviderSessionId::new(raw.to_string()).ok())
         .is_some_and(|observed| observed.as_str() == bound.as_str())
+    {
+        ProviderIdentityAdmission::Admit
+    } else {
+        ProviderIdentityAdmission::Reject
+    }
 }
 
 /// Loopback HTTP listener for `codex-hook-relay` POSTs. One per process,
@@ -1288,12 +1362,33 @@ mod reducer_tests {
     }
 
     #[test]
-    fn stop_produces_idle_status() {
+    fn stop_produces_last_assistant_message_before_idle_status() {
+        let mut reducer = test_reducer();
+        let payload = serde_json::json!({
+            "session_id": "s", "hook_event_name": "Stop",
+            "turn_id": "turn-1",
+            "last_assistant_message": "The fix is complete."
+        });
+        let out = reducer.apply_json(&payload, 1);
+        assert!(matches!(
+            &out.drafts[0].kind,
+            SemanticEventKind::AssistantMessage { text, streaming, .. }
+                if text == "The fix is complete." && !streaming
+        ));
+        assert!(matches!(
+            &out.drafts[1].kind,
+            SemanticEventKind::Status { state, .. } if state == "idle"
+        ));
+    }
+
+    #[test]
+    fn stop_without_assistant_message_still_produces_idle_status() {
         let mut reducer = test_reducer();
         let payload = serde_json::json!({
             "session_id": "s", "hook_event_name": "Stop"
         });
         let out = reducer.apply_json(&payload, 1);
+        assert_eq!(out.drafts.len(), 1);
         assert!(matches!(
             &out.drafts[0].kind,
             SemanticEventKind::Status { state, .. } if state == "idle"
@@ -1536,6 +1631,70 @@ mod registry_tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn exact_resume_mismatch_is_rejected_and_reported_without_binding() {
+        let registry = CodexHookRegistry::default();
+        let events = collecting_handler(&registry);
+        let expected = ProviderSessionId::new("expected-conversation").unwrap();
+        let registration = registry
+            .register_expected(StableSessionKey::from_tab("t1"), Some(expected))
+            .unwrap();
+
+        assert_eq!(
+            registry
+                .ingest(
+                    loopback_peer(),
+                    &registration.nonce,
+                    &session_start_body("different-conversation"),
+                    1,
+                )
+                .status(),
+            CodexRelayIngestStatus::Rejected
+        );
+        assert_eq!(
+            registry.bound_provider_session_id(&registration.nonce),
+            None
+        );
+        assert!(events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, event)| matches!(event, CodexRegistryEvent::ExactResumeFailed)));
+    }
+
+    #[test]
+    fn exact_resume_matching_session_start_becomes_the_confirmed_binding() {
+        let registry = CodexHookRegistry::default();
+        let events = collecting_handler(&registry);
+        let expected = ProviderSessionId::new("expected-conversation").unwrap();
+        let registration = registry
+            .register_expected(StableSessionKey::from_tab("t1"), Some(expected))
+            .unwrap();
+
+        assert_eq!(
+            registry
+                .ingest(
+                    loopback_peer(),
+                    &registration.nonce,
+                    &session_start_body("expected-conversation"),
+                    1,
+                )
+                .status(),
+            CodexRelayIngestStatus::Accepted
+        );
+        assert_eq!(
+            registry
+                .bound_provider_session_id(&registration.nonce)
+                .as_deref(),
+            Some("expected-conversation")
+        );
+        assert!(events.lock().unwrap().iter().any(|(_, event)| matches!(
+            event,
+            CodexRegistryEvent::SessionStarted(binding)
+                if binding.session_id == "expected-conversation"
+        )));
     }
 
     #[test]

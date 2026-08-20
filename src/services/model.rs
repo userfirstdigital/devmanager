@@ -1574,22 +1574,23 @@ impl ServiceCatalog {
                     action: ServiceAction::Stop,
                 };
             }
-            return AdmissionDecision::Refused(AdmissionRejection::OperationInProgress {
-                service: root,
-                action: operation.action,
-            });
+            // A readiness-tracked start remains an active operation until the
+            // service becomes healthy, but Stop is its cancellation path.  If
+            // Stop were refused here, a service that never reaches readiness
+            // could not be cleaned up by either the user or a failed graph.
+            if !(operation.action == ServiceAction::Start
+                && matches!(runtime.state, ServiceState::Starting))
+            {
+                return AdmissionDecision::Refused(AdmissionRejection::OperationInProgress {
+                    service: root,
+                    action: operation.action,
+                });
+            }
         }
-        if matches!(
-            runtime.state,
-            ServiceState::Starting | ServiceState::Stopping
-        ) {
+        if matches!(runtime.state, ServiceState::Stopping) {
             return AdmissionDecision::Refused(AdmissionRejection::OperationInProgress {
                 service: root,
-                action: if matches!(runtime.state, ServiceState::Starting) {
-                    ServiceAction::Start
-                } else {
-                    ServiceAction::Stop
-                },
+                action: ServiceAction::Stop,
             });
         }
         if matches!(runtime.state, ServiceState::Stopped) {
@@ -1612,25 +1613,27 @@ impl ServiceCatalog {
                 });
             };
             if let Some(operation) = &dependent.operation {
-                return AdmissionDecision::Refused(AdmissionRejection::OperationInProgress {
-                    service: service_id,
-                    action: operation.action,
-                });
+                if !(operation.action == ServiceAction::Start
+                    && matches!(dependent.state, ServiceState::Starting))
+                {
+                    return AdmissionDecision::Refused(AdmissionRejection::OperationInProgress {
+                        service: service_id,
+                        action: operation.action,
+                    });
+                }
             }
-            if matches!(dependent.state, ServiceState::Stopped) {
-                continue;
-            }
+            // A failed dependent has already lost its process authority and
+            // must not prevent the still-live dependency from being stopped.
             if matches!(
                 dependent.state,
-                ServiceState::Starting | ServiceState::Stopping
+                ServiceState::Stopped | ServiceState::Failed
             ) {
+                continue;
+            }
+            if matches!(dependent.state, ServiceState::Stopping) {
                 return AdmissionDecision::Refused(AdmissionRejection::OperationInProgress {
                     service: service_id,
-                    action: if matches!(dependent.state, ServiceState::Starting) {
-                        ServiceAction::Start
-                    } else {
-                        ServiceAction::Stop
-                    },
+                    action: ServiceAction::Stop,
                 });
             }
             if matches!(dependent.state, ServiceState::Unknown) {
@@ -2242,7 +2245,7 @@ impl StopPlan {
     ) -> Result<(), AdmissionRejection> {
         validate_stop_plan(self, catalog, snapshot)?;
         for item in &self.ordered {
-            revalidate_service_item(item, snapshot)?;
+            revalidate_stop_item(item, snapshot)?;
         }
         Ok(())
     }
@@ -3208,10 +3211,9 @@ fn validate_stop_plan(
         .reverse_selected_order(&selected)
         .into_iter()
         .filter(|service_id| {
-            snapshot
-                .services
-                .get(service_id)
-                .is_some_and(|runtime| !matches!(runtime.state, ServiceState::Stopped))
+            snapshot.services.get(service_id).is_some_and(|runtime| {
+                !matches!(runtime.state, ServiceState::Stopped | ServiceState::Failed)
+            })
         })
         .collect();
     if plan.ordered.len() != expected_order.len()
@@ -3331,20 +3333,28 @@ fn revalidate_service_item(
     item: &ServicePlanItem,
     snapshot: &AdmissionSnapshot,
 ) -> Result<(), AdmissionRejection> {
-    revalidate_service_item_inner(item, snapshot, true)
+    revalidate_service_item_inner(item, snapshot, true, false)
+}
+
+fn revalidate_stop_item(
+    item: &ServicePlanItem,
+    snapshot: &AdmissionSnapshot,
+) -> Result<(), AdmissionRejection> {
+    revalidate_service_item_inner(item, snapshot, true, true)
 }
 
 fn revalidate_close_item(
     item: &ServicePlanItem,
     snapshot: &AdmissionSnapshot,
 ) -> Result<(), AdmissionRejection> {
-    revalidate_service_item_inner(item, snapshot, false)
+    revalidate_service_item_inner(item, snapshot, false, false)
 }
 
 fn revalidate_service_item_inner(
     item: &ServicePlanItem,
     snapshot: &AdmissionSnapshot,
     reject_closing: bool,
+    allow_start_cancellation: bool,
 ) -> Result<(), AdmissionRejection> {
     if reject_closing {
         if let ServiceScope::Task { task_id } = &item.scope {
@@ -3381,6 +3391,13 @@ fn revalidate_service_item_inner(
         });
     }
     if let Some(operation) = &runtime.operation {
+        if allow_start_cancellation
+            && operation.action == ServiceAction::Start
+            && matches!(runtime.state, ServiceState::Starting)
+            && matches!(item.expected_state, ServiceState::Starting)
+        {
+            return Ok(());
+        }
         return Err(AdmissionRejection::OperationInProgress {
             service: item.service_id.clone(),
             action: operation.action,

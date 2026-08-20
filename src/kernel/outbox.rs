@@ -106,7 +106,7 @@ pub enum Effect {
         client_id: ClientId,
         agent_session_id: AgentSessionId,
         provider_kind: ProviderKind,
-        provider_session_id: ProviderSessionId,
+        provider_session_id: Option<ProviderSessionId>,
         runtime_generation: u64,
         action_epoch: u64,
         turn_id: TurnId,
@@ -189,6 +189,7 @@ pub(crate) fn is_pure_slice_decision_fact(event: &Event) -> bool {
         | Event::TaskReopened
         | Event::TaskArchived
         | Event::AgentSessionRegistered { .. }
+        | Event::AgentProviderSessionBound { .. }
         | Event::PrimaryAgentSet { .. }
         | Event::SpecialistRequested { .. }
         | Event::PrimaryPromoted { .. }
@@ -374,7 +375,7 @@ pub(crate) fn plan_effects(
                         "provider input planning missing agent session".into(),
                     ));
                 };
-                if agent.provider_session_id.as_ref() != Some(provider_session_id)
+                if agent.provider_session_id != *provider_session_id
                     || agent.provider_kind != *provider_kind
                     || agent.runtime_generation != *runtime_generation
                 {
@@ -467,6 +468,7 @@ pub(crate) fn plan_effects(
             | Event::TaskReopened
             | Event::TaskArchived
             | Event::AgentSessionRegistered { .. }
+            | Event::AgentProviderSessionBound { .. }
             | Event::PrimaryAgentSet { .. }
             | Event::SpecialistRequested { .. }
             | Event::PrimaryPromoted { .. }
@@ -1172,7 +1174,7 @@ mod tests {
             operation_id: provider_operation,
             agent_session_id,
             provider_kind: crate::providers::ProviderKind::Codex,
-            provider_session_id,
+            provider_session_id: Some(provider_session_id),
             runtime_generation: 9,
             turn_id: crate::domain::TurnId::from_bytes(fixed_uuid_v7(0x29)).unwrap(),
             action_epoch: 3,

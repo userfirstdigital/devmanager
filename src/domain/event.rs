@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::domain::agent::{
     AgentRole, AgentSessionFacts, AgentSessionLifecycle, ProviderSessionId, SpecialistPermission,
 };
+use crate::domain::agent_resource::AgentResourceBinding;
 use crate::domain::artifact::{
     structured_specialist_result, verify_inline_content_digest, ArtifactContentRef, ArtifactFacts,
     ArtifactKind, MAX_SPECIALIST_RAW_ARTIFACT_BYTES,
@@ -562,6 +563,15 @@ pub struct AgentSessionRegisteredPayload {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct AgentProviderSessionBoundPayload {
+    pub agent_session_id: AgentSessionId,
+    pub resource_id: ResourceId,
+    pub provider_session_id: ProviderSessionId,
+    pub runtime_generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PrimaryAgentSetPayload {
     pub agent_session_id: AgentSessionId,
 }
@@ -617,7 +627,7 @@ pub struct ProviderInputAcceptedPayload {
     pub operation_id: OperationId,
     pub agent_session_id: AgentSessionId,
     pub provider_kind: ProviderKind,
-    pub provider_session_id: ProviderSessionId,
+    pub provider_session_id: Option<ProviderSessionId>,
     pub runtime_generation: u64,
     pub turn_id: TurnId,
     pub action_epoch: u64,
@@ -687,7 +697,7 @@ pub struct ProviderInputDeliveredPayload {
     pub operation_id: OperationId,
     pub agent_session_id: AgentSessionId,
     pub provider_kind: ProviderKind,
-    pub provider_session_id: ProviderSessionId,
+    pub provider_session_id: Option<ProviderSessionId>,
     pub runtime_generation: u64,
     pub turn_id: TurnId,
     pub action_epoch: u64,
@@ -999,6 +1009,12 @@ pub enum Event {
     AgentSessionRegistered {
         agent: AgentSessionFacts,
     },
+    AgentProviderSessionBound {
+        agent_session_id: AgentSessionId,
+        resource_id: ResourceId,
+        provider_session_id: ProviderSessionId,
+        runtime_generation: u64,
+    },
     PrimaryAgentSet {
         agent_session_id: AgentSessionId,
     },
@@ -1067,7 +1083,7 @@ pub enum Event {
         operation_id: OperationId,
         agent_session_id: AgentSessionId,
         provider_kind: ProviderKind,
-        provider_session_id: ProviderSessionId,
+        provider_session_id: Option<ProviderSessionId>,
         runtime_generation: u64,
         turn_id: TurnId,
         action_epoch: u64,
@@ -1104,7 +1120,7 @@ pub enum Event {
         operation_id: OperationId,
         agent_session_id: AgentSessionId,
         provider_kind: ProviderKind,
-        provider_session_id: ProviderSessionId,
+        provider_session_id: Option<ProviderSessionId>,
         runtime_generation: u64,
         turn_id: TurnId,
         action_epoch: u64,
@@ -1124,6 +1140,7 @@ impl Event {
             Self::TaskReopened => "task.reopened",
             Self::TaskArchived => "task.archived",
             Self::AgentSessionRegistered { .. } => "agent_session.registered",
+            Self::AgentProviderSessionBound { .. } => "agent_session.provider_bound",
             Self::PrimaryAgentSet { .. } => "primary_agent.set",
             Self::SpecialistRequested { .. } => "specialist.requested",
             Self::PrimaryPromoted { .. } => "primary_agent.promoted",
@@ -1181,6 +1198,8 @@ enum EventBody {
     TaskArchived(TaskUnitPayload),
     #[serde(rename = "agent_session.registered")]
     AgentSessionRegistered(AgentSessionRegisteredPayload),
+    #[serde(rename = "agent_session.provider_bound")]
+    AgentProviderSessionBound(AgentProviderSessionBoundPayload),
     #[serde(rename = "primary_agent.set")]
     PrimaryAgentSet(PrimaryAgentSetPayload),
     #[serde(rename = "specialist.requested")]
@@ -1270,6 +1289,17 @@ impl From<&Event> for EventDocument {
                     agent: agent.clone(),
                 })
             }
+            Event::AgentProviderSessionBound {
+                agent_session_id,
+                resource_id,
+                provider_session_id,
+                runtime_generation,
+            } => EventBody::AgentProviderSessionBound(AgentProviderSessionBoundPayload {
+                agent_session_id: *agent_session_id,
+                resource_id: *resource_id,
+                provider_session_id: provider_session_id.clone(),
+                runtime_generation: *runtime_generation,
+            }),
             Event::PrimaryAgentSet { agent_session_id } => {
                 EventBody::PrimaryAgentSet(PrimaryAgentSetPayload {
                     agent_session_id: *agent_session_id,
@@ -1526,6 +1556,12 @@ impl TryFrom<EventDocument> for Event {
                     .map_err(|_| EventSerdeError::Payload)?;
                 Event::AgentSessionRegistered { agent: p.agent }
             }
+            EventBody::AgentProviderSessionBound(p) => Event::AgentProviderSessionBound {
+                agent_session_id: p.agent_session_id,
+                resource_id: p.resource_id,
+                provider_session_id: p.provider_session_id,
+                runtime_generation: p.runtime_generation,
+            },
             EventBody::PrimaryAgentSet(p) => Event::PrimaryAgentSet {
                 agent_session_id: p.agent_session_id,
             },
@@ -2031,10 +2067,18 @@ pub fn apply(
         Event::OperationSettled(_)
         | Event::OperationFailed(_)
         | Event::OperationCancelled(_)
-        | Event::OperationUncertain(_)
-        | Event::ProviderInputDelivered { .. } => {
+        | Event::OperationUncertain(_) => {
             let snap = snapshot.ok_or(ApplyError::MissingSnapshot)?;
             require_matching_task_id(&snap, event)?;
+            Ok(snap)
+        }
+        Event::ProviderInputDelivered { .. } => {
+            let mut snap = snapshot.ok_or(ApplyError::MissingSnapshot)?;
+            require_matching_task_id(&snap, event)?;
+            // Delivery is a durable provider-session projection change, but it
+            // does not consume a task revision. Replay must still apply it so
+            // rebuild/status validation agrees with the live projector.
+            apply_into(&mut snap, &event.payload, event.occurred_at_ms)?;
             Ok(snap)
         }
         other => {
@@ -2171,6 +2215,38 @@ fn apply_into(
             }
             snap.agents.insert(agent.id, agent.clone());
             snap.provider_sessions.entry(agent.id).or_default();
+        }
+        Event::AgentProviderSessionBound {
+            agent_session_id,
+            resource_id,
+            provider_session_id,
+            runtime_generation,
+        } => {
+            let Some(agent) = snap.agents.get(agent_session_id) else {
+                return Err(ApplyError::NotFound);
+            };
+            if agent.lifecycle != AgentSessionLifecycle::Open
+                || agent.runtime_generation != *runtime_generation
+            {
+                return Err(ApplyError::InvalidTransition);
+            }
+            let Some(resource) = snap.resources.get(resource_id) else {
+                return Err(ApplyError::NotFound);
+            };
+            AgentResourceBinding::from_facts(agent, resource)
+                .map_err(|_| ApplyError::InvalidTransition)?;
+            let agent = snap
+                .agents
+                .get_mut(agent_session_id)
+                .ok_or(ApplyError::NotFound)?;
+            match agent.provider_session_id.as_ref() {
+                Some(bound) if bound == provider_session_id => {}
+                Some(_) => return Err(ApplyError::OwnershipConflict),
+                None => {
+                    agent.provider_session_id = Some(provider_session_id.clone());
+                    agent.revision = agent.revision.saturating_add(1);
+                }
+            }
         }
         Event::PrimaryAgentSet { agent_session_id } => {
             let Some(agent) = snap.agents.get(agent_session_id) else {

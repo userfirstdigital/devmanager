@@ -2090,6 +2090,36 @@ fn provider_executable_policy_rejects_undeclared_runners_and_desktop_cursor() {
         .is_err());
 }
 
+#[test]
+fn extensionless_probe_policy_matches_windows_pathext_launch_names() {
+    let policy = ProviderExecutablePolicy::new(["claude"]).unwrap();
+    assert!(policy
+        .validate_canonical_path(Path::new("C:/bin/claude"))
+        .is_ok());
+    assert!(policy
+        .validate_canonical_path(Path::new("C:/bin/claude.exe"))
+        .is_ok());
+    assert!(policy
+        .validate_canonical_path(Path::new("C:/bin/claude.cmd"))
+        .is_ok());
+    assert!(policy
+        .validate_canonical_path(Path::new("C:/bin/claude.bat"))
+        .is_ok());
+    assert!(policy
+        .validate_canonical_path(Path::new("C:/bin/claude.com"))
+        .is_ok());
+    assert!(policy
+        .validate_canonical_path(Path::new("C:/bin/claude.js"))
+        .is_err());
+    assert!(policy
+        .validate_canonical_path(Path::new("C:/bin/codex.exe"))
+        .is_err());
+    let codex = ProviderExecutablePolicy::new(["codex"]).unwrap();
+    assert!(codex
+        .validate_canonical_path(Path::new("C:/nvm4w/nodejs/codex.cmd"))
+        .is_ok());
+}
+
 struct SequenceInspector {
     identities: Mutex<Vec<ProviderExecutable>>,
     events: Arc<Mutex<Vec<&'static str>>>,

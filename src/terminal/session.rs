@@ -632,6 +632,14 @@ impl TerminalSession {
         write_composite_pty_payload(&self.writer, &self.input_admission, b"", bytes)
     }
 
+    /// Queue one provider-automation key boundary without flushing the
+    /// ConPTY writer. SessionStart hooks must return before the provider TUI
+    /// can read input; flushing from the host during that hook can otherwise
+    /// deadlock the hook acknowledgement against the provider reader.
+    pub(crate) fn write_provider_bytes(&self, bytes: &[u8]) -> Result<(), String> {
+        write_composite_pty_payload_inner(&self.writer, &self.input_admission, b"", bytes, false)
+    }
+
     /// Install or replace the TerminalService observer on the existing reader.
     /// Does not spawn a second reader or parser; process-manager notifiers stay.
     pub fn install_service_output_sink(&self, sink: TerminalOutputSink) -> Result<(), String> {
@@ -2054,6 +2062,16 @@ fn write_composite_pty_payload(
     prefix: &[u8],
     input: &[u8],
 ) -> Result<(), String> {
+    write_composite_pty_payload_inner(writer, input_admission, prefix, input, true)
+}
+
+fn write_composite_pty_payload_inner(
+    writer: &Arc<Mutex<Box<dyn Write + Send>>>,
+    input_admission: &AtomicBool,
+    prefix: &[u8],
+    input: &[u8],
+    flush: bool,
+) -> Result<(), String> {
     validate_terminal_input_source_bounds(prefix, input)?;
     let total = prefix.len() + input.len();
     let mut writer = writer
@@ -2068,9 +2086,11 @@ fn write_composite_pty_payload(
     writer
         .write_all(&payload)
         .map_err(|error| format!("Failed to write to PTY: {error}"))?;
-    writer
-        .flush()
-        .map_err(|error| format!("Failed to flush PTY input: {error}"))?;
+    if flush {
+        writer
+            .flush()
+            .map_err(|error| format!("Failed to flush PTY input: {error}"))?;
+    }
     Ok(())
 }
 
@@ -4867,6 +4887,24 @@ mod tests {
         assert_eq!(state.bytes, b"annotation preamble\nuser prompt");
         assert_eq!(state.writes, 1);
         assert_eq!(state.flushes, 1);
+    }
+
+    #[test]
+    fn provider_payload_writes_without_waiting_for_conpty_flush() {
+        let state = Arc::new(Mutex::new(CountingWriteState {
+            fail_flush: true,
+            ..CountingWriteState::default()
+        }));
+        let writer = counting_writer(state.clone());
+        let admission = AtomicBool::new(true);
+
+        write_composite_pty_payload_inner(&writer, &admission, b"", b"provider prompt", false)
+            .expect("provider write must not call the blocking flush path");
+
+        let state = state.lock().unwrap();
+        assert_eq!(state.bytes, b"provider prompt");
+        assert_eq!(state.writes, 1);
+        assert_eq!(state.flushes, 0);
     }
 
     #[test]

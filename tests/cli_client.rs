@@ -25,8 +25,8 @@ use devmanager::{
         ACTION_HOST_STATUS, ACTION_PROVIDER_ANSWER_QUESTION, ACTION_PROVIDER_NEW_CONVERSATION,
         ACTION_PROVIDER_QUEUE_FOLLOW_UP, ACTION_PROVIDER_RESOLVE_APPROVAL,
         ACTION_PROVIDER_SEND_NOW, ACTION_PROVIDER_STEER_CURRENT_TURN, ACTION_PROVIDER_STOP_TURN,
-        ACTION_TASK_CREATE, ACTION_TASK_CREATE_V2, ACTION_TASK_LIST, ACTION_TASK_RENAME,
-        ACTION_TASK_SHOW,
+        ACTION_PROVIDER_TERMINAL_INPUT, ACTION_TASK_ARCHIVE, ACTION_TASK_CREATE,
+        ACTION_TASK_CREATE_V2, ACTION_TASK_LIST, ACTION_TASK_RENAME, ACTION_TASK_SHOW,
     },
     config::paths::{resolve_app_paths, AppProfile, BuildKind, ResolvedAppPaths},
     config::{ConfigCommand, ConfigStore, Project},
@@ -100,7 +100,7 @@ fn seed_task_with_base(paths: &ResolvedAppPaths, base: u8, title: &str) -> TaskI
             .project_id_for_config_id(&configured_id)
             .expect("opaque isolated host project id");
         let (requests, executor) =
-            HostRequestExecutor::start_supervised_with_config_store(bus, store)
+            HostRequestExecutor::start_supervised_with_config_store(bus, store, &paths.root)
                 .expect("configured seed host store");
         let response = requests
             .execute(
@@ -359,11 +359,13 @@ fn action_catalog_ids_are_unique_and_classified() {
                 | ACTION_TASK_CREATE_V2
                 | ACTION_CONFIG_CREATE_PROJECT
                 | ACTION_TASK_RENAME
+                | ACTION_TASK_ARCHIVE
                 | ACTION_PROVIDER_SEND_NOW
                 | ACTION_PROVIDER_STEER_CURRENT_TURN
                 | ACTION_PROVIDER_QUEUE_FOLLOW_UP
                 | ACTION_PROVIDER_ANSWER_QUESTION
                 | ACTION_PROVIDER_RESOLVE_APPROVAL
+                | ACTION_PROVIDER_TERMINAL_INPUT
                 | ACTION_PROVIDER_STOP_TURN
                 | ACTION_PROVIDER_NEW_CONVERSATION
         ) {
@@ -376,11 +378,13 @@ fn action_catalog_ids_are_unique_and_classified() {
             action.id,
             ACTION_TASK_SHOW
                 | ACTION_TASK_RENAME
+                | ACTION_TASK_ARCHIVE
                 | ACTION_PROVIDER_SEND_NOW
                 | ACTION_PROVIDER_STEER_CURRENT_TURN
                 | ACTION_PROVIDER_QUEUE_FOLLOW_UP
                 | ACTION_PROVIDER_ANSWER_QUESTION
                 | ACTION_PROVIDER_RESOLVE_APPROVAL
+                | ACTION_PROVIDER_TERMINAL_INPUT
                 | ACTION_PROVIDER_STOP_TURN
                 | ACTION_PROVIDER_NEW_CONVERSATION
         ) {
@@ -436,40 +440,18 @@ fn ctl_actions_json_is_stable_unique_and_offline() {
         let id = action["id"].as_str().expect("action id string");
         assert!(!ids.contains(&id.to_string()), "duplicate id in JSON: {id}");
         ids.push(id.to_string());
-        let expected_risk = if matches!(
-            id,
-            ACTION_TASK_CREATE
-                | ACTION_TASK_CREATE_V2
-                | ACTION_CONFIG_CREATE_PROJECT
-                | ACTION_TASK_RENAME
-                | ACTION_PROVIDER_SEND_NOW
-                | ACTION_PROVIDER_STEER_CURRENT_TURN
-                | ACTION_PROVIDER_QUEUE_FOLLOW_UP
-                | ACTION_PROVIDER_ANSWER_QUESTION
-                | ACTION_PROVIDER_RESOLVE_APPROVAL
-                | ACTION_PROVIDER_STOP_TURN
-                | ACTION_PROVIDER_NEW_CONVERSATION
-        ) {
-            "mutating"
-        } else {
-            "read_only"
+        let descriptor = action::catalog()
+            .iter()
+            .find(|descriptor| descriptor.id == id)
+            .expect("JSON action must come from the shared catalog");
+        let expected_risk = match descriptor.risk {
+            ActionRisk::ReadOnly => "read_only",
+            ActionRisk::Mutating => "mutating",
         };
         assert_eq!(action["risk"], expected_risk);
-        let expected_scope = if matches!(
-            id,
-            ACTION_TASK_SHOW
-                | ACTION_TASK_RENAME
-                | ACTION_PROVIDER_SEND_NOW
-                | ACTION_PROVIDER_STEER_CURRENT_TURN
-                | ACTION_PROVIDER_QUEUE_FOLLOW_UP
-                | ACTION_PROVIDER_ANSWER_QUESTION
-                | ACTION_PROVIDER_RESOLVE_APPROVAL
-                | ACTION_PROVIDER_STOP_TURN
-                | ACTION_PROVIDER_NEW_CONVERSATION
-        ) {
-            "task"
-        } else {
-            "host"
+        let expected_scope = match descriptor.scope {
+            ActionScope::Host => "host",
+            ActionScope::Task => "task",
         };
         assert_eq!(action["scope"], expected_scope);
         assert!(action["title"].as_str().unwrap().len() > 0);
@@ -499,6 +481,11 @@ fn ctl_actions_json_is_stable_unique_and_offline() {
                 );
             }
             assert!(schema["properties"].get("project_root").is_none());
+            assert_eq!(
+                schema["properties"]["primary_provider"]["enum"],
+                serde_json::json!(["claude", "codex", null]),
+                "task.create.v2 must advertise the same stock-provider choice accepted by its codec"
+            );
         }
         if id == ACTION_TASK_RENAME {
             let required = schema["required"]

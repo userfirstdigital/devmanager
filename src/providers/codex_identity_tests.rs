@@ -352,6 +352,24 @@ async fn codex_truncated_login_status_cannot_authenticate() {
 }
 
 #[tokio::test]
+async fn codex_login_status_on_stderr_still_probes() {
+    let identity = fixture_executable();
+    let mut runner = ScriptedProbeRunner::ok(VERSION, HELP, RESUME_HELP, "");
+    {
+        let runner = Arc::make_mut(&mut runner);
+        runner.login_status = ProbeScript::Completed {
+            stdout: Vec::new(),
+            stderr: b"Logged in using ChatGPT\n".to_vec(),
+        };
+    }
+    let adapter = CodexAdapter::new(runner);
+    adapter
+        .probe_attested(&identity)
+        .await
+        .expect("stock Codex writes login status to stderr with exit 0");
+}
+
+#[tokio::test]
 async fn codex_probe_timeout_nonzero_or_stderr_cannot_mint_capabilities() {
     let identity = fixture_executable();
     let mut timeout = ScriptedProbeRunner::ok(VERSION, HELP, RESUME_HELP, LOGIN_CHATGPT);
@@ -380,8 +398,8 @@ async fn codex_probe_timeout_nonzero_or_stderr_cannot_mint_capabilities() {
     let mut stderr = ScriptedProbeRunner::ok(VERSION, HELP, RESUME_HELP, LOGIN_CHATGPT);
     {
         let runner = Arc::make_mut(&mut stderr);
-        runner.login_status = ProbeScript::Completed {
-            stdout: LOGIN_CHATGPT.as_bytes().to_vec(),
+        runner.version = ProbeScript::Completed {
+            stdout: VERSION.as_bytes().to_vec(),
             stderr: b"warning".to_vec(),
         };
     }
@@ -493,7 +511,11 @@ async fn codex_exact_resume_is_resume_id_and_typed_failures_do_not_fallback() {
         .unwrap();
     assert_eq!(
         spec.arguments().collect::<Vec<_>>(),
-        ["resume", FIXTURE_SESSION_ID]
+        [
+            "--dangerously-bypass-approvals-and-sandbox",
+            "resume",
+            FIXTURE_SESSION_ID
+        ]
     );
 
     let resume_id = session_id();
@@ -799,9 +821,9 @@ async fn codex_same_identity_reprobe_failure_quarantines_previous_capabilities()
             None,
             None,
         )),
-        Err(ProviderError::UnsupportedCapability(
-            ProviderCapability::BuildLaunch
-        ))
+        Err(ProviderError::DependencyUnavailable {
+            capability: ProviderCapability::BuildLaunch
+        })
     ));
 }
 
@@ -834,9 +856,9 @@ async fn codex_public_probe_inspection_failure_quarantines_previous_capabilities
             None,
             None,
         )),
-        Err(ProviderError::UnsupportedCapability(
-            ProviderCapability::BuildLaunch
-        ))
+        Err(ProviderError::DependencyUnavailable {
+            capability: ProviderCapability::BuildLaunch
+        })
     ));
 }
 
@@ -861,9 +883,9 @@ fn codex_attestation_generation_fences_stale_probe_publication() {
             first,
             &identity,
         ),
-        Err(ProviderError::UnsupportedCapability(
-            crate::providers::capabilities::ProviderCapability::BuildLaunch
-        ))
+        Err(ProviderError::DependencyUnavailable {
+            capability: crate::providers::capabilities::ProviderCapability::BuildLaunch
+        })
     ));
     assert!(require_attestation(
         &adapter.pinned,
@@ -1280,22 +1302,23 @@ async fn codex_managed_process_views_are_dependency_unavailable() {
     let adapter = probed(HELP, RESUME_HELP, LOGIN_CHATGPT).await;
     assert!(matches!(
         adapter.managed_process_views(),
-        Err(ProviderError::UnsupportedCapability(
-            ProviderCapability::SemanticEvents
-        ))
+        Err(ProviderError::DependencyUnavailable {
+            capability: ProviderCapability::SemanticEvents
+        })
     ));
 }
 
 #[tokio::test]
 async fn codex_registry_observe_uses_adapter_login_status_seam() {
     let temp = tempfile::tempdir().unwrap();
-    let executable = temp.path().join("codex");
+    let executable = temp
+        .path()
+        .join(if cfg!(windows) { "codex.exe" } else { "codex" });
     std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
     let runner = ScriptedProbeRunner::ok(VERSION, HELP, RESUME_HELP, LOGIN_CHATGPT);
+    let adapter = Arc::new(CodexAdapter::new(runner));
     let mut registry = ProviderRegistry::new();
-    registry
-        .register(Arc::new(CodexAdapter::new(runner)))
-        .unwrap();
+    registry.register(adapter.clone()).unwrap();
     let observation = registry
         .observe(
             ProviderKind::Codex,
@@ -1309,6 +1332,13 @@ async fn codex_registry_observe_uses_adapter_login_status_seam() {
     assert_eq!(observation.kind, ProviderKind::Codex);
     assert_eq!(
         observation.capabilities.auth_state,
+        ProviderAuthState::Unknown
+    );
+    assert_eq!(
+        adapter
+            .last_capabilities(observation.executable())
+            .unwrap()
+            .auth_state,
         ProviderAuthState::AuthenticatedSubscription
     );
     assert_eq!(

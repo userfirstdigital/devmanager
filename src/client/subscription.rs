@@ -4,7 +4,7 @@ use std::collections::{HashSet, VecDeque};
 
 use crate::client::connection::UnsolicitedServerMessage;
 use crate::client::host_client::HostClient;
-use crate::client::model::{ClientModel, ClientModelBuilder, ClientModelError};
+use crate::client::model::{ClientModel, ClientModelBuilder, ClientModelError, TaskInboxPreview};
 use crate::domain::event::DomainEvent;
 use crate::domain::id::{SnapshotId, SubscriptionId};
 use crate::domain::query::QueryError;
@@ -58,6 +58,10 @@ pub enum SubscriptionError {
     },
     InvalidResync,
     Transport(IpcError),
+    TransportAt {
+        operation: String,
+        error: IpcError,
+    },
     Query(QueryError),
     IncompleteSnapshot,
     MissingCapabilities,
@@ -78,6 +82,9 @@ impl std::fmt::Display for SubscriptionError {
             }
             Self::InvalidResync => write!(f, "resync required fields are inconsistent"),
             Self::Transport(error) => write!(f, "subscription transport error: {error}"),
+            Self::TransportAt { operation, error } => {
+                write!(f, "subscription {operation} transport error: {error}")
+            }
             Self::Query(error) => write!(f, "subscription query error: {error:?}"),
             Self::IncompleteSnapshot => write!(f, "snapshot synchronization was incomplete"),
             Self::MissingCapabilities => {
@@ -148,6 +155,120 @@ impl ClientSubscription {
         self.pending_replay_events.drain(..).collect()
     }
 
+    /// Fetch a fully paginated Tasks snapshot preview on the one HostClient,
+    /// release that exact snapshot, and return a [`TaskInboxPreview`] without
+    /// installing it as the subscription's ClientModel.
+    pub async fn preview_tasks(
+        &mut self,
+        client: &mut HostClient,
+    ) -> Result<TaskInboxPreview, SubscriptionError> {
+        // Fail closed before any release/wipe so a Ready canonical model stays
+        // intact when Tasks preview is refused.
+        if self.state == ClientSubscriptionState::Ready {
+            return Err(SubscriptionError::NotReady);
+        }
+        if self.state == ClientSubscriptionState::Released {
+            return Err(SubscriptionError::Released);
+        }
+        let granted = client.granted_capabilities();
+        if !granted.contains(Capability::PagedSnapshots) {
+            return Err(SubscriptionError::MissingCapabilities);
+        }
+
+        if let Err(error) = self.release_snapshot_if_owned(client).await {
+            self.state = ClientSubscriptionState::NeedsResync;
+            return Err(error);
+        }
+
+        let mut builder = ClientModelBuilder::new();
+        let mut snapshot_id: Option<SnapshotId> = None;
+        let mut through_sequence: Option<u64> = None;
+        let mut resume_cursor = None;
+        let mut section_started = false;
+        let preview = loop {
+            let requested_id = if section_started {
+                let Some(id) = snapshot_id else {
+                    return Err(SubscriptionError::IncompleteSnapshot);
+                };
+                Some(id)
+            } else {
+                snapshot_id
+            };
+            let page = match client
+                .snapshot_page(SnapshotSection::Tasks, requested_id, resume_cursor.clone())
+                .await
+            {
+                Ok(Ok(page)) => page,
+                Ok(Err(error)) => {
+                    self.state = ClientSubscriptionState::NeedsResync;
+                    let _ = self.best_effort_cleanup(client).await;
+                    return Err(SubscriptionError::Query(error));
+                }
+                Err(error) => {
+                    self.state = ClientSubscriptionState::NeedsResync;
+                    let _ = self.best_effort_cleanup(client).await;
+                    return Err(SubscriptionError::Transport(error));
+                }
+            };
+            self.snapshot_id = Some(page.snapshot_id);
+            match snapshot_id {
+                Some(expected) if expected != page.snapshot_id => {
+                    self.state = ClientSubscriptionState::NeedsResync;
+                    let _ = self.best_effort_cleanup(client).await;
+                    return Err(SubscriptionError::IncompleteSnapshot);
+                }
+                Some(_) => {}
+                None => snapshot_id = Some(page.snapshot_id),
+            }
+            match through_sequence {
+                Some(expected) if expected != page.through_sequence => {
+                    self.state = ClientSubscriptionState::NeedsResync;
+                    let _ = self.best_effort_cleanup(client).await;
+                    return Err(SubscriptionError::IncompleteSnapshot);
+                }
+                Some(_) => {}
+                None => through_sequence = Some(page.through_sequence),
+            }
+            section_started = true;
+            let next = page.next_cursor.clone();
+            if let Err(error) = builder.ingest_page(page) {
+                self.state = ClientSubscriptionState::NeedsResync;
+                let _ = self.best_effort_cleanup(client).await;
+                return Err(error.into());
+            }
+            match next {
+                Some(cursor) => resume_cursor = Some(cursor),
+                None => {
+                    let preview = match builder.finish_tasks_preview() {
+                        Ok(preview) => preview,
+                        Err(error) => {
+                            self.state = ClientSubscriptionState::NeedsResync;
+                            let _ = self.best_effort_cleanup(client).await;
+                            return Err(error.into());
+                        }
+                    };
+                    break preview;
+                }
+            }
+        };
+
+        if self.snapshot_id.is_some() {
+            if let Err(error) = self.release_snapshot_if_owned(client).await {
+                self.state = ClientSubscriptionState::NeedsResync;
+                return Err(error);
+            }
+        }
+        self.model = None;
+        if self.state == ClientSubscriptionState::Ready {
+            self.state = ClientSubscriptionState::Pending;
+        }
+        let through = through_sequence.ok_or(SubscriptionError::IncompleteSnapshot)?;
+        if preview.through_sequence() != through {
+            return Err(SubscriptionError::IncompleteSnapshot);
+        }
+        Ok(preview)
+    }
+
     /// Snapshot through N → open replay after N → release snapshot → apply frozen
     /// replay → retain live subscription metadata. Caller-driven only.
     pub async fn synchronize(&mut self, client: &mut HostClient) -> Result<(), SubscriptionError> {
@@ -188,7 +309,9 @@ impl ClientSubscription {
                 self.state = ClientSubscriptionState::NeedsResync;
                 self.pending_replay_events.clear();
                 if let Some(cleanup_error) = self.best_effort_cleanup(client).await {
-                    return Err(cleanup_error);
+                    eprintln!(
+                        "devmanager client subscription cleanup after synchronize failure also failed: {cleanup_error}"
+                    );
                 }
                 Err(error)
             }
@@ -223,7 +346,12 @@ impl ClientSubscription {
                 {
                     Ok(Ok(page)) => page,
                     Ok(Err(error)) => return Err(SubscriptionError::Query(error)),
-                    Err(error) => return Err(SubscriptionError::Transport(error)),
+                    Err(error) => {
+                        return Err(SubscriptionError::TransportAt {
+                            operation: format!("snapshot {section:?}"),
+                            error,
+                        });
+                    }
                 };
                 self.snapshot_id = Some(page.snapshot_id);
                 match snapshot_id {
@@ -259,7 +387,12 @@ impl ClientSubscription {
         let open = match client.open_event_replay(through).await {
             Ok(Ok(batch)) => batch,
             Ok(Err(error)) => return Err(SubscriptionError::Query(error)),
-            Err(error) => return Err(SubscriptionError::Transport(error)),
+            Err(error) => {
+                return Err(SubscriptionError::TransportAt {
+                    operation: "open replay".to_string(),
+                    error,
+                });
+            }
         };
         self.subscription_id = Some(open.subscription_id);
 
@@ -284,7 +417,12 @@ impl ClientSubscription {
             {
                 Ok(Ok(batch)) => batch,
                 Ok(Err(error)) => return Err(SubscriptionError::Query(error)),
-                Err(error) => return Err(SubscriptionError::Transport(error)),
+                Err(error) => {
+                    return Err(SubscriptionError::TransportAt {
+                        operation: "continue replay".to_string(),
+                        error,
+                    });
+                }
             };
             if Some(batch.subscription_id) != self.subscription_id {
                 return Err(SubscriptionError::IncompleteSnapshot);
@@ -945,5 +1083,141 @@ mod tests {
             matches!(err, SubscriptionError::ReplayOverflow { limit } if limit == MAX_PENDING_REPLAY_EVENTS)
         );
         assert_eq!(sub.pending_replay_events.len(), MAX_PENDING_REPLAY_EVENTS);
+    }
+
+    #[test]
+    fn paged_tasks_preview_stays_subscription_model_free() {
+        let snap = SnapshotId::from_bytes(fixed_uuid_v7(0xf0)).expect("snapshot");
+        let first = TaskId::from_bytes(fixed_uuid_v7(0xf1)).expect("task");
+        let second = TaskId::from_bytes(fixed_uuid_v7(0xf2)).expect("task");
+        let mut builder = ClientModelBuilder::new();
+        builder
+            .ingest_page(SnapshotPage {
+                snapshot_id: snap,
+                through_sequence: 4,
+                section: SnapshotSection::Tasks,
+                after_item: None,
+                items: vec![SnapshotItem::Task(TaskSnapshotItem {
+                    task: TaskFacts {
+                        id: first,
+                        environment_id: EnvironmentId::from_bytes(fixed_uuid_v7(0xf3))
+                            .expect("env"),
+                        title: "One".into(),
+                        description: None,
+                        project_id: ProjectId::from_bytes(fixed_uuid_v7(0xf4)).expect("project"),
+                        workspace: WorkspaceRef::Main,
+                        assignment: TaskAssignment::LocalOwner,
+                        lifecycle: TaskLifecycle::Open,
+                        action_epoch: 0,
+                        revision: 1,
+                        created_at_ms: 1,
+                    },
+                    connectivity: TaskConnectivity::Connected,
+                    attention: TaskAttention::None,
+                    activity: TaskActivity::Idle,
+                    review_readiness: ReviewReadiness::NotReady,
+                    primary_agent_id: None,
+                })],
+                encoded_bytes: 1,
+                next_cursor: Some(vec![9]),
+            })
+            .expect("page 1");
+        builder
+            .ingest_page(SnapshotPage {
+                snapshot_id: snap,
+                through_sequence: 4,
+                section: SnapshotSection::Tasks,
+                after_item: Some(crate::domain::snapshot::SnapshotItemKey::Task(first)),
+                items: vec![SnapshotItem::Task(TaskSnapshotItem {
+                    task: TaskFacts {
+                        id: second,
+                        environment_id: EnvironmentId::from_bytes(fixed_uuid_v7(0xf3))
+                            .expect("env"),
+                        title: "Two".into(),
+                        description: None,
+                        project_id: ProjectId::from_bytes(fixed_uuid_v7(0xf4)).expect("project"),
+                        workspace: WorkspaceRef::Main,
+                        assignment: TaskAssignment::LocalOwner,
+                        lifecycle: TaskLifecycle::Open,
+                        action_epoch: 0,
+                        revision: 1,
+                        created_at_ms: 2,
+                    },
+                    connectivity: TaskConnectivity::Connected,
+                    attention: TaskAttention::None,
+                    activity: TaskActivity::Idle,
+                    review_readiness: ReviewReadiness::NotReady,
+                    primary_agent_id: None,
+                })],
+                encoded_bytes: 1,
+                next_cursor: None,
+            })
+            .expect("page 2");
+
+        let subscription = ClientSubscription::new();
+        let preview = builder.finish_tasks_preview().expect("paged tasks preview");
+        assert_eq!(preview.tasks().len(), 2);
+        assert!(preview.tasks().contains_key(&first));
+        assert!(preview.tasks().contains_key(&second));
+        assert_eq!(preview.through_sequence(), 4);
+        assert!(subscription.model().is_none());
+        assert_eq!(subscription.state(), ClientSubscriptionState::Pending);
+        assert!(subscription.snapshot_id.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn preview_tasks_rejects_ready_without_mutating_canonical_model() {
+        use crate::client::connection::ClientConnection;
+        use crate::client::host_client::{HostClient, HostClientConfig};
+        use crate::domain::ClientId;
+        use crate::protocol::{
+            Capability, CapabilitySet, FrameLimits, ProfileFingerprint, ServerHello,
+            PROTOCOL_MAJOR, PROTOCOL_MINOR,
+        };
+        use std::collections::BTreeMap;
+
+        let client_id = ClientId::from_bytes(fixed_uuid_v7(0xc1)).expect("client");
+        let connection_id = uuid::Uuid::from_bytes(fixed_uuid_v7(0xc2));
+        let hello = ServerHello {
+            protocol_major: PROTOCOL_MAJOR,
+            protocol_minor: PROTOCOL_MINOR,
+            server_build: "subscription-preview-ready-test".into(),
+            host_boot_id: uuid::Uuid::from_bytes(fixed_uuid_v7(0xc3)),
+            connection_id,
+            profile_fingerprint: ProfileFingerprint::hash_normalized("subscription-preview-ready"),
+            granted: CapabilitySet::from_capabilities([Capability::PagedSnapshots]),
+            limits: FrameLimits::v1_default(),
+            reconnect_grant: None,
+        };
+        let connection = ClientConnection::scripted_for_test(
+            client_id,
+            hello.clone(),
+            crate::client::connection::ScriptedDetachBehavior::MatchingAck,
+        );
+        let mut client = HostClient::from_parts_for_test(
+            HostClientConfig {
+                named_profile: "subscription-preview-ready-test".into(),
+                client_build: "devmanager/test".into(),
+                client_id,
+                requested: CapabilitySet::from_capabilities([Capability::PagedSnapshots]),
+                limits: FrameLimits::v1_default(),
+            },
+            hello,
+            Some(connection),
+            BTreeMap::new(),
+        );
+        let mut subscription = ready_subscription();
+        let model_before = subscription.model().cloned();
+        let state_before = subscription.state();
+        let id_before = subscription.subscription_id();
+
+        let error = subscription
+            .preview_tasks(&mut client)
+            .await
+            .expect_err("Ready subscription must refuse Tasks preview");
+        assert!(matches!(error, SubscriptionError::NotReady));
+        assert_eq!(subscription.state(), state_before);
+        assert_eq!(subscription.subscription_id(), id_before);
+        assert_eq!(subscription.model(), model_before.as_ref());
     }
 }

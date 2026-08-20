@@ -121,7 +121,9 @@ impl TaskCockpitLiveProjection {
                 self.service_health = Some(value.clone());
                 self.load = CockpitSurfaceLoad::Ready;
             }
-            TaskCockpitResult::Config(_) | TaskCockpitResult::AgentConnection(_) => {}
+            TaskCockpitResult::Config(_)
+            | TaskCockpitResult::AgentConnection(_)
+            | TaskCockpitResult::Conversation(_) => {}
             TaskCockpitResult::Denied { reason, .. } => {
                 self.load = CockpitSurfaceLoad::Denied { reason: *reason };
             }
@@ -177,6 +179,7 @@ fn load_for_ready_or_empty(empty: bool) -> CockpitSurfaceLoad {
 
 pub fn surface_query_action_id(surface: TaskCockpitSurface) -> Option<&'static str> {
     match surface {
+        TaskCockpitSurface::Conversation => None,
         TaskCockpitSurface::Workspace => Some(ACTION_WORKSPACE_STATUS),
         TaskCockpitSurface::Git => Some(ACTION_GIT_STATUS),
         TaskCockpitSurface::Files => Some(ACTION_FILES_LIST),

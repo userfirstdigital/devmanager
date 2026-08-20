@@ -340,7 +340,12 @@ fn subscription_launch_uses_adapter_resume_flags() {
         .collect();
     assert_eq!(
         arguments,
-        vec!["--resume".to_string(), "claude-session-1".to_string()]
+        vec![
+            "--resume".to_string(),
+            "claude-session-1".to_string(),
+            "--permission-mode".to_string(),
+            "bypassPermissions".to_string(),
+        ]
     );
 }
 

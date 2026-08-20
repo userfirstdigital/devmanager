@@ -4960,12 +4960,26 @@ fn native_entry_cutover_source_contract_is_preserved() {
     assert!(root.join("src/ui/native_shell.rs").is_file());
 
     let host = read_source("src/bin/devmanager-host.rs");
+    assert!(host.contains("run_hook_relay_subcommand"));
+    assert!(host.contains("run_codex_hook_relay_subcommand"));
     assert!(host.contains("parse_production_args"));
     assert!(host.contains("prepare_production_paths"));
     assert!(host.contains("PRODUCTION_HOST_PROFILE"));
     assert!(!host.contains("release host startup is deferred until Phase 11"));
     assert!(host.find("\"ctl\"").unwrap() < host.find("acquire_lock").unwrap());
     assert!(host.contains("dispatch_ctl_from_args"));
+
+    let host_main_body = host
+        .split("fn main()")
+        .nth(1)
+        .expect("host main function body");
+    let host_claude = host_main_body.find("run_hook_relay_subcommand").unwrap();
+    let host_codex = host_main_body
+        .find("run_codex_hook_relay_subcommand")
+        .unwrap();
+    let host_ctl = host_main_body.find("Some(\"ctl\")").unwrap();
+    let host_run = host_main_body.find("match run(").unwrap();
+    assert!(host_claude < host_codex && host_codex < host_ctl.min(host_run));
 
     let connection = read_source("src/client/connection.rs");
     assert!(connection.contains("map_named_pipe_open_error"));
@@ -4999,7 +5013,7 @@ fn native_entry_cutover_source_contract_is_preserved() {
     let main_body = main.split("fn main()").nth(1).expect("main function body");
     let claude = main_body.find("run_hook_relay_subcommand").unwrap();
     let codex = main_body.find("run_codex_hook_relay_subcommand").unwrap();
-    let preview = main_body.find("--ui-preview").unwrap();
+    let preview = main_body.find("if args.iter().any").unwrap();
     let product = main_body.find("run_product_shell").unwrap();
     assert!(claude < codex && codex < preview.min(product));
 

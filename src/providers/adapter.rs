@@ -296,6 +296,13 @@ impl ProviderProbeKind {
             Self::ResumeHelp => &["resume", "--help"],
         }
     }
+
+    pub const fn for_auth_probe(provider: ProviderKind) -> Self {
+        match provider {
+            ProviderKind::Codex => Self::LoginStatus,
+            ProviderKind::ClaudeCode | ProviderKind::Cursor => Self::AuthStatus,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -349,7 +356,8 @@ impl fmt::Debug for ProviderProbeRequest {
 }
 
 impl ProviderProbeRequest {
-    pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
+    /// Cold `claude.exe` / Defender scans routinely miss a 5s spawn budget.
+    pub const DEFAULT_TIMEOUT: Duration = MAX_PROVIDER_PROBE_TIMEOUT;
     pub const DEFAULT_MAX_OUTPUT_BYTES: usize = MAX_PROVIDER_PROBE_OUTPUT_BYTES;
 
     pub fn version(
@@ -423,7 +431,7 @@ impl ProviderProbeRequest {
         mut self,
         invocation: &ProviderAuthProbeInvocation,
     ) -> Result<Self, ProviderAuthEvidenceError> {
-        if self.kind != ProviderProbeKind::AuthStatus
+        if self.kind != ProviderProbeKind::for_auth_probe(invocation.provider_kind())
             || self.executable != *invocation.executable_handle()
         {
             return Err(ProviderAuthEvidenceError::RequestBindingMismatch);
@@ -754,7 +762,7 @@ impl ProviderProbeResult {
         invocation: &ProviderAuthProbeInvocation,
         request: &ProviderProbeRequest,
     ) -> Result<ProviderAuthProbeObservation, ProviderAuthEvidenceError> {
-        if request.kind() != ProviderProbeKind::AuthStatus
+        if request.kind() != ProviderProbeKind::for_auth_probe(invocation.provider_kind())
             || !request.auth_binding_matches(invocation)
         {
             return Err(ProviderAuthEvidenceError::UntrustedAuthenticationEvidence);
@@ -1064,7 +1072,7 @@ impl WindowsProviderProbeRunner {
         // Windows keeps the no-delete handles open through CreateProcess;
         // Unix uses inherited descriptor paths from `prepare_unix_launch`.
         // Revalidate immediately after spawn as a final identity diagnostic.
-        if request.executable().revalidate().is_err() {
+        if request.executable().revalidate_bound_identity().is_err() {
             process.terminate_tree(deadline)?;
             return Err(ProviderProbeError::Io(
                 ProviderProbeIoError::ExecutableNotAllowed,
@@ -1080,7 +1088,7 @@ impl WindowsProviderProbeRunner {
         }
         #[cfg(any(windows, target_os = "linux"))]
         {
-            let post_revalidate = request.executable().revalidate();
+            let post_revalidate = request.executable().revalidate_bound_identity();
             let post_attestation = if post_revalidate.is_ok() {
                 let retry_deadline = std::cmp::min(
                     deadline,
@@ -1126,7 +1134,7 @@ impl WindowsProviderProbeRunner {
             }
         }
         #[cfg(target_os = "macos")]
-        if request.executable().revalidate().is_err()
+        if request.executable().revalidate_bound_identity().is_err()
             || attest_launched_image(
                 process.pid(),
                 request.executable().launch_program().canonical_path(),
@@ -1195,7 +1203,7 @@ impl WindowsProviderProbeRunner {
         // wrapper target, interpreter, or script that changed during the
         // observation cannot produce a trusted result even if the launched
         // image path itself still matches.
-        if request.executable().revalidate().is_err() {
+        if request.executable().revalidate_bound_identity().is_err() {
             return Err(ProviderProbeError::Io(
                 ProviderProbeIoError::ExecutableNotAllowed,
             ));
@@ -1232,7 +1240,7 @@ fn validate_probe_executable(
     requested: &ProviderExecutableHandle,
 ) -> Result<PathBuf, ProviderProbeError> {
     requested
-        .revalidate()
+        .revalidate_bound_identity()
         .map_err(|_| ProviderProbeError::Io(ProviderProbeIoError::ExecutableNotAllowed))?;
     let canonical = requested.canonical_path().to_path_buf();
     policy
@@ -1525,7 +1533,7 @@ impl ProbeProcess {
             };
         #[cfg(windows)]
         if expected.is_some_and(|expected| attest_launched_image(&child, expected).is_err())
-            || requested.revalidate().is_err()
+            || requested.revalidate_bound_identity().is_err()
         {
             let _ = child.kill();
             reap_child_until(&mut child, deadline);
@@ -1539,7 +1547,7 @@ impl ProbeProcess {
             expected.expect("Linux expected image checked above"),
         )
         .is_err()
-            || requested.revalidate().is_err()
+            || requested.revalidate_bound_identity().is_err()
         {
             let _ = child.kill();
             reap_child_until(&mut child, deadline);
@@ -1591,7 +1599,7 @@ impl ProbeProcess {
         }
 
         requested
-            .revalidate()
+            .revalidate_bound_identity()
             .map_err(|_| ProviderProbeError::Io(ProviderProbeIoError::ExecutableNotAllowed))?;
         let executable_c = cstring(executable.as_os_str())?;
         let mut arguments = Vec::with_capacity(1 + fixed_arguments.len() + request_arguments.len());
@@ -1755,7 +1763,9 @@ impl ProbeProcess {
         let stdout = unsafe { std::fs::File::from_raw_fd(stdout_pipe[0]) };
         let stderr = unsafe { std::fs::File::from_raw_fd(stderr_pipe[0]) };
         let pid = pid as u32;
-        if attest_launched_image(pid, expected).is_err() || requested.revalidate().is_err() {
+        if attest_launched_image(pid, expected).is_err()
+            || requested.revalidate_bound_identity().is_err()
+        {
             unsafe {
                 libc::kill(pid as libc::pid_t, libc::SIGKILL);
             }
@@ -2934,6 +2944,18 @@ mod tests {
                 b""
             ),
             ProviderAuthProbeResult::AuthRequired
+        );
+    }
+
+    #[test]
+    fn auth_probe_kind_uses_login_status_for_codex() {
+        assert_eq!(
+            ProviderProbeKind::for_auth_probe(ProviderKind::Codex),
+            ProviderProbeKind::LoginStatus
+        );
+        assert_eq!(
+            ProviderProbeKind::for_auth_probe(ProviderKind::ClaudeCode),
+            ProviderProbeKind::AuthStatus
         );
     }
 

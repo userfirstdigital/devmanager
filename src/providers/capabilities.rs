@@ -787,8 +787,8 @@ impl std::error::Error for ProviderExecutableError {}
 /// The OS identity of the exact regular file that was inspected.
 ///
 /// The identity is deliberately retained in addition to the canonical path
-/// and content hash. A path and a timestamp are not sufficient to identify a
-/// runnable provider after replacement.
+/// and attestation digest. A path and a timestamp are not sufficient to
+/// identify a runnable provider after replacement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProviderFileIdentity {
     Windows {
@@ -940,12 +940,9 @@ impl ProviderFileIdentity {
                 path.to_path_buf(),
             ));
         }
-        if self.link_count() != 1 {
-            return Err(ProviderExecutableError::HardlinkAmbiguous(
-                path.to_path_buf(),
-            ));
-        }
-        if self.stable_id() == 0 {
+        // npm/pnpm hardlink the same native binary into package bin paths.
+        // Identity is the volume/file index (or device/inode), not the link count.
+        if self.link_count() == 0 || self.stable_id() == 0 {
             return Err(ProviderExecutableError::InvalidFileIdentity(
                 path.to_path_buf(),
             ));
@@ -1029,7 +1026,7 @@ impl fmt::Display for ProviderAuthEvidenceError {
             ),
             Self::Reordered => write!(f, "auth evidence generation is reordered"),
             Self::NonMonotonicTimestamp => {
-                write!(f, "auth evidence timestamp is not strictly increasing")
+                write!(f, "auth evidence timestamp moved backward")
             }
             Self::AlreadyConsumed => write!(f, "auth evidence receipt was already consumed"),
             Self::UntrustedAuthenticationEvidence => write!(
@@ -1717,7 +1714,11 @@ impl ProviderAuthEvidenceRegistry {
             if observed_at <= last_observed_at {
                 return Err(ProviderAuthEvidenceError::NonMonotonicTimestamp);
             }
-            if observed_at_ms <= last_observed_at_ms {
+            // The exported wall-clock value has millisecond resolution. Two
+            // strictly ordered monotonic observations may legitimately share
+            // one millisecond; generation + Instant establish their order.
+            // Only a backwards wall-clock reading is invalid.
+            if observed_at_ms < last_observed_at_ms {
                 return Err(ProviderAuthEvidenceError::NonMonotonicTimestamp);
             }
         }
@@ -2117,6 +2118,41 @@ impl ProviderExecutable {
         })
     }
 
+    /// Re-open a persisted non-native runtime dependency (Node/PowerShell
+    /// script) by path and content hash. Never opens a launch handle and never
+    /// treats the file as a CreateProcess image.
+    pub(crate) fn reopen_non_native(
+        canonical_path: impl Into<PathBuf>,
+        sha256: [u8; 32],
+    ) -> Result<Self, ProviderExecutableError> {
+        let canonical_path = canonical_path.into();
+        if canonical_path.as_os_str().is_empty() {
+            return Err(ProviderExecutableError::EmptyPath);
+        }
+        if path_bytes(&canonical_path) > MAX_PROVIDER_PATH_BYTES {
+            return Err(ProviderExecutableError::PathTooLong);
+        }
+        let inspected = Self::inspect_non_native_blocking(&canonical_path)?;
+        if inspected.canonical_path != canonical_path {
+            return Err(ProviderExecutableError::NotCanonical {
+                requested: canonical_path,
+                canonical: inspected.canonical_path,
+            });
+        }
+        if inspected.sha256 != sha256 {
+            return Err(ProviderExecutableError::HashMismatch(
+                inspected.canonical_path,
+            ));
+        }
+        Ok(inspected)
+    }
+
+    /// DOS-shaped argv form for a script dependency. Identity attestation still
+    /// uses the canonical verbatim path; only CreateProcess argv is rewritten.
+    pub(crate) fn script_launch_argument(&self) -> OsString {
+        windows_launch_argv_path(self.canonical_path())
+    }
+
     pub(crate) fn open_for_launch_form(
         &self,
         form: &ProviderExecutableForm,
@@ -2158,16 +2194,36 @@ impl ProviderExecutable {
     }
 
     /// Re-check the current path, native format, and captured file identity
-    /// before using a cached fact.
+    /// before using a cached fact. Native CLIs are attested by the bound file
+    /// ID, not a second SHA-256 of a 300MB image.
     pub fn validate_current(&self) -> Result<(), ProviderExecutableError> {
-        let current = Self::inspect_blocking_with_mode(&self.canonical_path, self.is_native)?;
-        if current != *self || !self.validate_bound_handle()? {
-            Err(ProviderExecutableError::ChangedDuringValidation(
+        if !self.validate_bound_handle()? {
+            return Err(ProviderExecutableError::ChangedDuringValidation(
                 self.canonical_path.clone(),
-            ))
-        } else {
-            Ok(())
+            ));
         }
+        let file = open_nofollow(&self.canonical_path)?;
+        let identity = inspect_opened_metadata(&file, &self.canonical_path, self.is_native)?;
+        if identity != self.file_identity {
+            return Err(ProviderExecutableError::ChangedDuringValidation(
+                self.canonical_path.clone(),
+            ));
+        }
+        if self.is_native {
+            let size = file
+                .metadata()
+                .map_err(|error| ProviderExecutableError::Io {
+                    path: self.canonical_path.clone(),
+                    kind: error.kind(),
+                })?
+                .len();
+            if native_identity_digest(&identity, size) != self.sha256 {
+                return Err(ProviderExecutableError::ChangedDuringValidation(
+                    self.canonical_path.clone(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn inspect_blocking(path: &Path) -> Result<Self, ProviderExecutableError> {
@@ -2227,9 +2283,10 @@ impl ProviderExecutable {
                 path.to_path_buf(),
             ));
         }
-        let second =
-            inspect_opened_file(open_nofollow(&canonical_path)?, &canonical_path, is_native)?;
-        if first.identity != second.identity || first.sha256 != second.sha256 {
+        let confirmation = open_nofollow(&canonical_path)?;
+        let confirmation_identity =
+            inspect_opened_metadata(&confirmation, &canonical_path, is_native)?;
+        if first.identity != confirmation_identity {
             return Err(ProviderExecutableError::ChangedDuringValidation(
                 canonical_path.clone(),
             ));
@@ -2237,10 +2294,10 @@ impl ProviderExecutable {
 
         Ok(Self {
             canonical_path,
-            file_identity: second.identity,
-            sha256: second.sha256,
+            file_identity: first.identity,
+            sha256: first.sha256,
             is_native,
-            handle: Arc::new(Mutex::new(second.file)),
+            handle: Arc::new(Mutex::new(first.file)),
         })
     }
 
@@ -2254,6 +2311,19 @@ impl ProviderExecutable {
             })?;
         let identity = inspect_opened_metadata(&file, &self.canonical_path, self.is_native)?;
         Ok(identity == self.file_identity)
+    }
+
+    /// Cheap TOCTOU check: the captured file ID is still the same open file.
+    /// Probe spawn uses this instead of a full SHA-256 so a 300MB native CLI
+    /// does not burn the `--version` timeout while frozen in CREATE_SUSPENDED.
+    pub(crate) fn validate_bound_identity(&self) -> Result<(), ProviderExecutableError> {
+        if !self.validate_bound_handle()? {
+            Err(ProviderExecutableError::ChangedDuringValidation(
+                self.canonical_path.clone(),
+            ))
+        } else {
+            Ok(())
+        }
     }
 
     fn clone_file_handle(&self) -> Result<File, ProviderExecutableError> {
@@ -2356,6 +2426,26 @@ impl ProviderExecutableHandle {
         Ok(())
     }
 
+    pub(crate) fn revalidate_bound_identity(&self) -> Result<(), ProviderExecutableError> {
+        self.executable.validate_bound_identity()?;
+        match &self.launch_plan {
+            ProviderLaunchPlan::Direct => {}
+            ProviderLaunchPlan::DirectTarget(target) => target.validate_bound_identity()?,
+            ProviderLaunchPlan::NodeScript {
+                interpreter,
+                script,
+            }
+            | ProviderLaunchPlan::PowerShellScript {
+                interpreter,
+                script,
+            } => {
+                interpreter.validate_bound_identity()?;
+                script.validate_bound_identity()?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn try_clone_file(&self) -> Result<File, ProviderExecutableError> {
         self.revalidate()?;
         // Script plans must stay opaque; returning only the interpreter file
@@ -2395,12 +2485,24 @@ impl ProviderExecutableHandle {
         }
     }
 
+    /// Attested non-native script that must stay bound from discovery through
+    /// CreateProcess. Windows shim redirects (`DirectTarget`) have none: the
+    /// wrapper itself is not a runtime dependency once normalized to its
+    /// native target.
+    pub(crate) fn runtime_dependency(&self) -> Option<&ProviderExecutable> {
+        match &self.launch_plan {
+            ProviderLaunchPlan::NodeScript { script, .. }
+            | ProviderLaunchPlan::PowerShellScript { script, .. } => Some(script.as_ref()),
+            ProviderLaunchPlan::Direct | ProviderLaunchPlan::DirectTarget(_) => None,
+        }
+    }
+
     pub(crate) fn launch_fixed_arguments(&self) -> Vec<OsString> {
         match &self.launch_plan {
             ProviderLaunchPlan::Direct | ProviderLaunchPlan::DirectTarget(_) => Vec::new(),
             ProviderLaunchPlan::NodeScript { script, .. }
             | ProviderLaunchPlan::PowerShellScript { script, .. } => {
-                vec![script.canonical_path().as_os_str().to_os_string()]
+                vec![script.script_launch_argument()]
             }
         }
     }
@@ -2422,6 +2524,25 @@ impl ProviderExecutableHandle {
         };
         Ok((program, script))
     }
+}
+
+/// Node and PowerShell cannot `realpath` Windows verbatim (`\\?\`) argv paths;
+/// they lstat the drive (`C:`) and exit nonzero. Identity attestation still
+/// uses the canonical verbatim path; only the launched script argv is DOS-shaped.
+fn windows_launch_argv_path(path: &Path) -> OsString {
+    #[cfg(windows)]
+    {
+        let Some(text) = path.to_str() else {
+            return path.as_os_str().to_os_string();
+        };
+        if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+            return OsString::from(format!(r"\\{rest}"));
+        }
+        if let Some(rest) = text.strip_prefix(r"\\?\") {
+            return OsString::from(rest);
+        }
+    }
+    path.as_os_str().to_os_string()
 }
 
 impl Serialize for ProviderExecutable {
@@ -2529,7 +2650,18 @@ fn inspect_opened_file(
     is_native: bool,
 ) -> Result<OpenedExecutable, ProviderExecutableError> {
     let identity = inspect_opened_metadata(&file, path, is_native)?;
-    let sha256 = hash_file(&mut file, path)?;
+    let sha256 = if is_native {
+        let size = file
+            .metadata()
+            .map_err(|error| ProviderExecutableError::Io {
+                path: path.to_path_buf(),
+                kind: error.kind(),
+            })?
+            .len();
+        native_identity_digest(&identity, size)
+    } else {
+        hash_file(&mut file, path)?
+    };
     let after_identity = file_identity(&file, path)?;
     after_identity.validate(path)?;
     if after_identity != identity {
@@ -2542,6 +2674,43 @@ fn inspect_opened_file(
         identity,
         sha256,
     })
+}
+
+fn native_identity_digest(identity: &ProviderFileIdentity, size: u64) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"devmanager.provider-native-file-v1\0");
+    match identity {
+        ProviderFileIdentity::Windows {
+            volume_serial,
+            file_index,
+            link_count,
+        } => {
+            hasher.update(b"windows\0");
+            hasher.update(volume_serial.to_le_bytes());
+            hasher.update(file_index);
+            hasher.update(link_count.to_le_bytes());
+        }
+        ProviderFileIdentity::Unix {
+            device,
+            inode,
+            link_count,
+        } => {
+            hasher.update(b"unix\0");
+            hasher.update(device.to_le_bytes());
+            hasher.update(inode.to_le_bytes());
+            hasher.update(link_count.to_le_bytes());
+        }
+        ProviderFileIdentity::Other {
+            stable_id,
+            link_count,
+        } => {
+            hasher.update(b"other\0");
+            hasher.update(stable_id);
+            hasher.update(link_count.to_le_bytes());
+        }
+    }
+    hasher.update(size.to_le_bytes());
+    hasher.finalize().into()
 }
 
 fn inspect_opened_metadata(
@@ -3131,7 +3300,7 @@ impl ProviderExecutablePolicy {
         if self
             .entrypoints
             .iter()
-            .any(|declared| same_entrypoint(declared, file_name))
+            .any(|declared| policy_matches_file_name(declared, file_name))
         {
             Ok(())
         } else {
@@ -3197,13 +3366,24 @@ impl ProviderPathSnapshot {
             )));
         }
         let mut directories = Vec::with_capacity(MAX_PROVIDER_PATH_ENTRIES.min(8));
+        // One unattestable absolute entry (for example a WindowsApps package
+        // directory whose security-preserving handle cannot be acquired) must
+        // not abort later trusted Claude/Codex installations. Remember the
+        // first such error and fail closed only when nothing could be attested.
+        let mut first_invalid_entry: Option<ProviderDiscoveryError> = None;
         for (index, directory) in std::env::split_paths(path).enumerate() {
             if index >= MAX_PROVIDER_PATH_ENTRIES {
                 return Err(ProviderDiscoveryError::InvalidPathSnapshot(PathBuf::from(
                     path,
                 )));
             }
-            if directory.as_os_str().is_empty() || !directory.is_absolute() {
+            // Windows user PATH commonly contains a blank slot (`;;`). Treat
+            // it like a missing directory instead of aborting later trusted
+            // entries — that fail-closed the whole Claude/Codex check.
+            if directory.as_os_str().is_empty() {
+                continue;
+            }
+            if !directory.is_absolute() {
                 return Err(ProviderDiscoveryError::InvalidPathSnapshot(directory));
             }
             if path_bytes(&directory) > MAX_PROVIDER_PATH_BYTES {
@@ -3233,17 +3413,47 @@ impl ProviderPathSnapshot {
             if !canonical.is_dir() {
                 continue;
             }
-            reject_reparse_components(&canonical)
-                .map_err(|_| ProviderDiscoveryError::InvalidPathSnapshot(canonical.clone()))?;
-            let (directory_handle, identity) = open_directory_handle(&canonical)?;
+            if reject_reparse_components(&canonical).is_err() {
+                if first_invalid_entry.is_none() {
+                    first_invalid_entry = Some(ProviderDiscoveryError::InvalidPathSnapshot(
+                        canonical.clone(),
+                    ));
+                }
+                continue;
+            }
+            let (directory_handle, identity) = match open_directory_handle(&canonical) {
+                Ok(opened) => opened,
+                Err(error) => {
+                    if first_invalid_entry.is_none() {
+                        first_invalid_entry = Some(error);
+                    }
+                    continue;
+                }
+            };
             #[cfg(target_os = "windows")]
             let (requested_directory_handle, requested_identity) =
-                open_directory_reparse_handle(&directory)?;
+                match open_directory_reparse_handle(&directory) {
+                    Ok(opened) => opened,
+                    Err(error) => {
+                        if first_invalid_entry.is_none() {
+                            first_invalid_entry = Some(error);
+                        }
+                        continue;
+                    }
+                };
             #[cfg(not(target_os = "windows"))]
             let (requested_directory_handle, requested_identity) =
                 (Arc::clone(&directory_handle), identity);
             #[cfg(target_os = "windows")]
-            let ancestor_handles = capture_ancestor_handles(&directory)?;
+            let ancestor_handles = match capture_ancestor_handles(&directory) {
+                Ok(handles) => handles,
+                Err(error) => {
+                    if first_invalid_entry.is_none() {
+                        first_invalid_entry = Some(error);
+                    }
+                    continue;
+                }
+            };
             #[cfg(not(target_os = "windows"))]
             let ancestor_handles = Vec::new();
             directories.push(ProviderPathSnapshotEntry {
@@ -3256,6 +3466,11 @@ impl ProviderPathSnapshot {
                 requested_directory_handle,
                 ancestor_handles,
             });
+        }
+        if directories.is_empty() {
+            if let Some(error) = first_invalid_entry {
+                return Err(error);
+            }
         }
         Ok(Self { directories })
     }
@@ -3626,11 +3841,20 @@ impl ProviderDiscoveryContract {
             for wrapper_entrypoint in self.wrapper_entrypoints() {
                 let wrapper_path = entry.directory.join(wrapper_entrypoint);
                 match fs::symlink_metadata(&wrapper_path) {
-                    Ok(_) => candidates.push(self.resolve_windows_wrapper(
-                        wrapper_path,
-                        origin.clone(),
-                        snapshot,
-                    )?),
+                    Ok(_) => {
+                        match self.resolve_windows_wrapper(wrapper_path, origin.clone(), snapshot) {
+                            Ok(candidate) => candidates.push(candidate),
+                            // npm installs claude.cmd beside a pwsh sibling that is
+                            // not the attested three-line wrapper. Skip that sibling
+                            // instead of failing the whole PATH scan.
+                            Err(
+                                ProviderDiscoveryError::ShimProofInvalid(_)
+                                | ProviderDiscoveryError::WrongFileType(_)
+                                | ProviderDiscoveryError::WrongEntrypoint(_),
+                            ) => {}
+                            Err(error) => return Err(error),
+                        }
+                    }
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                     Err(error) => {
                         return Err(ProviderDiscoveryError::Executable(
@@ -4039,11 +4263,19 @@ fn attest_claude_cmd_wrapper(contents: &str) -> bool {
 
 #[cfg(target_os = "windows")]
 fn attest_claude_powershell_wrapper(contents: &str) -> bool {
-    let required = ["$basedir=split-path", "exit $lastexitcode"];
     let lines = normalized_wrapper_lines(contents);
-    strict_wrapper_lines(&lines, &required, 1, |line| {
-        line == "& \"$basedir/node_modules/@anthropic-ai/claude-code/bin/claude.exe\" $args"
-    })
+    matches!(
+        lines.as_slice(),
+        [basedir, launch, exit]
+            if matches!(
+                basedir.as_str(),
+                "$basedir=split-path -parent $myinvocation.mycommand.definition"
+                    | "$basedir = split-path -parent $myinvocation.mycommand.definition"
+            )
+                && launch
+                    == "& \"$basedir/node_modules/@anthropic-ai/claude-code/bin/claude.exe\" $args"
+                && exit == "exit $lastexitcode"
+    )
 }
 
 #[cfg(target_os = "windows")]
@@ -4064,8 +4296,10 @@ fn attest_codex_cmd_wrapper(contents: &str) -> bool {
         ")",
     ];
     let lines = normalized_wrapper_lines(contents);
+    let bin_launch = "endlocal & goto #_undefined_# 2>nul || title %comspec% & set pathext=%pathext:;.js;=;% & \"%_prog%\" \"%dp0%\\..\\@openai\\codex\\bin\\codex.js\" %*";
+    let global_launch = "endlocal & goto #_undefined_# 2>nul || title %comspec% & set pathext=%pathext:;.js;=;% & \"%_prog%\" \"%dp0%\\node_modules\\@openai\\codex\\bin\\codex.js\" %*";
     strict_wrapper_lines(&lines, &required, required.len(), |line| {
-        line == "endlocal & goto #_undefined_# 2>nul || title %comspec% & set pathext=%pathext:;.js;=;% & \"%_prog%\" \"%dp0%\\..\\@openai\\codex\\bin\\codex.js\" %*"
+        line == bin_launch || line == global_launch
     })
 }
 
@@ -4230,14 +4464,29 @@ fn parse_codex_wrapper_script(wrapper_path: &Path, contents: &str) -> Option<Pat
     {
         return None;
     }
-    let relative = wrapper_path
-        .parent()?
-        .join("..")
-        .join("@openai")
-        .join("codex")
-        .join("bin")
-        .join("codex.js");
-    Some(relative)
+    let parent = wrapper_path.parent()?;
+    let script = if lower.contains("node_modules\\@openai\\codex\\bin\\codex.js")
+        || lower.contains("node_modules/@openai/codex/bin/codex.js")
+    {
+        parent
+            .join("node_modules")
+            .join("@openai")
+            .join("codex")
+            .join("bin")
+            .join("codex.js")
+    } else if lower.contains("..\\@openai\\codex\\bin\\codex.js")
+        || lower.contains("../@openai/codex/bin/codex.js")
+    {
+        parent
+            .join("..")
+            .join("@openai")
+            .join("codex")
+            .join("bin")
+            .join("codex.js")
+    } else {
+        return None;
+    };
+    Some(script)
 }
 
 #[cfg(target_os = "windows")]
@@ -4613,6 +4862,35 @@ fn same_entrypoint(left: &str, right: &str) -> bool {
     }
 }
 
+const WINDOWS_PROBE_PATHEXT: [&str; 4] = [".exe", ".cmd", ".bat", ".com"];
+
+fn windows_executable_extension(name: &str) -> Option<&'static str> {
+    WINDOWS_PROBE_PATHEXT.iter().copied().find(|extension| {
+        name.len() > extension.len()
+            && name[name.len() - extension.len()..].eq_ignore_ascii_case(extension)
+    })
+}
+
+/// Stock adapters declare Unix-style stems (`claude`, `codex`). Windows PATH
+/// discovery yields `claude.exe` / `claude.cmd`. An extensionless policy name
+/// therefore also matches those PATHEXT launch names. A policy that already
+/// names an executable extension stays exact, so `claude.cmd` still does not
+/// admit `claude.exe`.
+fn policy_matches_file_name(declared: &str, file_name: &str) -> bool {
+    if same_entrypoint(declared, file_name) {
+        return true;
+    }
+    if windows_executable_extension(declared).is_some() {
+        return false;
+    }
+    WINDOWS_PROBE_PATHEXT.iter().any(|extension| {
+        let mut candidate = String::with_capacity(declared.len() + extension.len());
+        candidate.push_str(declared);
+        candidate.push_str(extension);
+        same_entrypoint(&candidate, file_name)
+    })
+}
+
 fn is_forbidden_runner_name(name: &str) -> bool {
     [
         "node",
@@ -4647,9 +4925,33 @@ fn is_forbidden_runner_name(name: &str) -> bool {
 mod wrapper_tests {
     use super::{
         attest_claude_cmd_wrapper, attest_codex_cmd_wrapper, attest_cursor_cmd_wrapper,
-        attest_cursor_powershell_wrapper, attest_provider_wrapper,
+        attest_cursor_powershell_wrapper, attest_provider_wrapper, windows_launch_argv_path,
     };
     use crate::providers::capabilities::ProviderKind;
+    use std::ffi::OsString;
+    use std::path::Path;
+
+    #[test]
+    fn node_script_argv_strips_windows_verbatim_prefix() {
+        assert_eq!(
+            windows_launch_argv_path(Path::new(
+                r"\\?\C:\Users\micro\AppData\Local\nvm\v22.23.2\node_modules\@openai\codex\bin\codex.js"
+            )),
+            OsString::from(
+                r"C:\Users\micro\AppData\Local\nvm\v22.23.2\node_modules\@openai\codex\bin\codex.js"
+            )
+        );
+        assert_eq!(
+            windows_launch_argv_path(Path::new(r"\\?\UNC\server\share\codex.js")),
+            OsString::from(r"\\server\share\codex.js")
+        );
+        assert_eq!(
+            windows_launch_argv_path(Path::new(
+                r"C:\nvm4w\nodejs\node_modules\@openai\codex\bin\codex.js"
+            )),
+            OsString::from(r"C:\nvm4w\nodejs\node_modules\@openai\codex\bin\codex.js")
+        );
+    }
 
     #[test]
     fn stock_codex_cmd_wrapper_is_attested() {
@@ -4677,6 +4979,16 @@ endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & set PATHEXT=%PATHEXT:;.
             ProviderKind::Codex,
             std::path::Path::new("codex.cmd"),
             &wrapper
+        ));
+        let global_wrapper = wrapper.replace(
+            r#"%dp0%\..\@openai\codex\bin\codex.js"#,
+            r#"%dp0%\node_modules\@openai\codex\bin\codex.js"#,
+        );
+        assert!(attest_codex_cmd_wrapper(&global_wrapper));
+        assert!(attest_provider_wrapper(
+            ProviderKind::Codex,
+            std::path::Path::new("codex.cmd"),
+            &global_wrapper
         ));
 
         let cursor_cmd = r#"@echo off
@@ -5100,5 +5412,25 @@ impl ProviderCapabilities {
             ProviderCapability::CooperativeStop => self.cooperative_stop,
             ProviderCapability::ObserveQuota => self.observe_quota,
         }
+    }
+}
+
+#[cfg(test)]
+mod path_snapshot_tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn capture_skips_empty_path_entries_and_keeps_later_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        fs::create_dir(&first).unwrap();
+        fs::create_dir(&second).unwrap();
+        let path =
+            std::env::join_paths([first.as_os_str(), OsStr::new(""), second.as_os_str()]).unwrap();
+        let snapshot = ProviderPathSnapshot::capture(path)
+            .expect("an empty PATH slot must not abort later trusted directories");
+        assert_eq!(snapshot.len(), 2);
     }
 }

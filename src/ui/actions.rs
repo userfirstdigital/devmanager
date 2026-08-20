@@ -6,7 +6,8 @@
 
 use crate::client::action::{
     self, ActionDescriptor, ActionRisk, ActionScope, ACTION_HOST_ACTIONS, ACTION_HOST_STATUS,
-    ACTION_TASK_CREATE, ACTION_TASK_LIST, ACTION_TASK_RENAME, ACTION_TASK_SHOW,
+    ACTION_TASK_ARCHIVE, ACTION_TASK_CREATE, ACTION_TASK_LIST, ACTION_TASK_RENAME,
+    ACTION_TASK_SHOW,
 };
 use crate::domain::id::TaskId;
 use crate::ui::components::interaction::FocusEpoch;
@@ -65,7 +66,7 @@ pub struct NativeToggleSidebar;
 #[action(name = "native.toggle_dock")]
 pub struct NativeToggleDock;
 
-/// Collapse or restore the terminal strip.
+/// Switch the selected task's center canvas between Conversation and Terminal.
 #[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
 #[action(name = "native.toggle_terminal")]
 pub struct NativeToggleTerminal;
@@ -451,6 +452,7 @@ fn presentation_for(
         ACTION_TASK_SHOW => (ActionPresentationKind::Secondary, Some("Ctrl+Alt+4")),
         ACTION_TASK_CREATE => (ActionPresentationKind::Primary, Some("Ctrl+Alt+5")),
         ACTION_TASK_RENAME => (ActionPresentationKind::Secondary, Some("Ctrl+Alt+6")),
+        ACTION_TASK_ARCHIVE => (ActionPresentationKind::Destructive, None),
         _ if descriptor.risk == ActionRisk::Mutating => (ActionPresentationKind::Primary, None),
         _ if descriptor.scope == ActionScope::Task => (ActionPresentationKind::Secondary, None),
         _ => (ActionPresentationKind::Navigation, None),
@@ -458,7 +460,10 @@ fn presentation_for(
 }
 
 fn requires_selected_task(descriptor: &ActionDescriptor) -> bool {
-    matches!(descriptor.id, ACTION_TASK_SHOW | ACTION_TASK_RENAME)
+    matches!(
+        descriptor.id,
+        ACTION_TASK_SHOW | ACTION_TASK_RENAME | ACTION_TASK_ARCHIVE
+    )
 }
 
 /// Decorate the shared catalog for the current local selection.

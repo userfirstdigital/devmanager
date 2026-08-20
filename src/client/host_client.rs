@@ -26,7 +26,8 @@ use crate::domain::snapshot::{
 };
 use crate::domain::ClientId;
 use crate::host::{
-    pipe_endpoint_for_named_profile, profile_fingerprint_for_named_profile, IpcError,
+    agent_connection_query_timeout, pipe_endpoint_for_named_profile,
+    profile_fingerprint_for_named_profile, task_cockpit_query_timeout, IpcError,
 };
 use crate::prompts::projection::{PromptLibraryQuery, PromptProjectionReply};
 use crate::protocol::{
@@ -514,7 +515,10 @@ impl HostClient {
         let outcome = {
             let connection = self.live_connection()?;
             connection
-                .query(task_cockpit_query(request_id, client_id, task_id, query))
+                .query_with_timeout(
+                    task_cockpit_query(request_id, client_id, task_id, query),
+                    task_cockpit_query_timeout(),
+                )
                 .await
         };
         let reply = match outcome {
@@ -590,12 +594,15 @@ impl HostClient {
         let outcome = {
             let connection = self.live_connection()?;
             connection
-                .query(task_cockpit_query(
-                    request_id,
-                    client_id,
-                    TaskId::new(),
-                    TaskCockpitQuery::AgentConnection,
-                ))
+                .query_with_timeout(
+                    task_cockpit_query(
+                        request_id,
+                        client_id,
+                        TaskId::new(),
+                        TaskCockpitQuery::AgentConnection,
+                    ),
+                    agent_connection_query_timeout(),
+                )
                 .await
         };
         let reply = match outcome {

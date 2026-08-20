@@ -1749,15 +1749,32 @@ mod tests {
     }
 
     #[test]
-    fn connect_route_is_not_the_legacy_websocket_and_rejects_cross_origin() {
+    fn connect_route_is_registered_and_requires_a_real_websocket_upgrade() {
         let _profile = TestProfileGuard::new("web-connect-route");
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let service = test_service("connect-route");
         assert!(service.connect_encryption_required());
         assert!(!service.status().connect_listener_bound);
         let state = test_state(&service);
-        let missing_origin = runtime.block_on(route_response(state.clone(), "/api/connect"));
-        assert_eq!(missing_origin.status(), StatusCode::FORBIDDEN);
+        let mut upgrade_headers = HeaderMap::new();
+        upgrade_headers.insert(header::CONNECTION, "upgrade".parse().unwrap());
+        upgrade_headers.insert(header::UPGRADE, "websocket".parse().unwrap());
+        upgrade_headers.insert("sec-websocket-version", "13".parse().unwrap());
+        upgrade_headers.insert(
+            "sec-websocket-key",
+            "dGhlIHNhbXBsZSBub25jZQ==".parse().unwrap(),
+        );
+        let upgrade_without_transport = runtime.block_on(route_request(
+            state.clone(),
+            axum::http::Method::GET,
+            "/api/connect",
+            upgrade_headers,
+            Vec::new(),
+        ));
+        assert_eq!(
+            upgrade_without_transport.status(),
+            StatusCode::UPGRADE_REQUIRED
+        );
         let legacy = runtime.block_on(route_response(state, "/api/ws"));
         assert_ne!(legacy.status(), StatusCode::NOT_FOUND);
     }

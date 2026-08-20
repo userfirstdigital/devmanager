@@ -5584,7 +5584,16 @@ mod tests {
             connect_startup: None,
             host_requests: crate::connect::ConnectHostRequestSlot::new(),
         };
-        let response = admit_connect_ws_request(&state, &HeaderMap::new())
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::HOST,
+            "devmanager.test:43872".parse().unwrap(),
+        );
+        headers.insert(
+            axum::http::header::ORIGIN,
+            "http://devmanager.test:43872".parse().unwrap(),
+        );
+        let response = admit_connect_ws_request(&state, &headers)
             .expect_err("Connect must not reach Noise without browser admission");
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
@@ -7542,6 +7551,12 @@ mod tests {
         });
     }
 
+    fn legacy_web_service() -> RemoteHostService {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        service.set_connect_encryption_required_for_test(false);
+        service
+    }
+
     fn ai_session(service: &RemoteHostService, tab_id: &str, session_id: &str) {
         let mut app = crate::state::AppState::default();
         app.open_tabs.push(crate::models::SessionTab {
@@ -7813,7 +7828,7 @@ mod tests {
 
     #[test]
     fn raw_resume_marks_only_requested_terminal_bootstrap_pending() {
-        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let service = legacy_web_service();
         pair_web_client(&service, "web-client");
         ai_session(&service, "tab-a", "session-a");
         let (std_tx, _std_rx) = std_mpsc::channel::<ServerMessage>();
@@ -9193,7 +9208,7 @@ mod tests {
 
     #[test]
     fn blocked_composer_does_not_pin_lease_or_other_session_input() {
-        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let service = legacy_web_service();
         let mut app = crate::state::AppState::default();
         let mut runtime_state = crate::state::RuntimeState::default();
         for (tab_id, session_id) in [("tab-a", "session-a"), ("tab-b", "session-b")] {
@@ -10656,7 +10671,7 @@ mod tests {
 
     #[test]
     fn subscribe_sessions_eagerly_bootstraps_ready_sessions() {
-        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let service = legacy_web_service();
         service.set_session_bootstrap_provider(Some(Arc::new(|session_id| {
             Some(RemoteSessionBootstrap {
                 session_id: session_id.to_string(),
@@ -11253,7 +11268,7 @@ mod tests {
 
     #[test]
     fn viewer_mode_paste_image_reports_error_without_disconnect() {
-        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let service = legacy_web_service();
         ai_session(&service, "tab-a", "claude-1");
         let connection_id = 13;
         let client_id = "web-viewer";
@@ -11295,7 +11310,7 @@ mod tests {
 
     #[test]
     fn paste_image_decodes_base64_and_forwards_binary_attachment() {
-        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let service = legacy_web_service();
         ai_session(&service, "tab-a", "claude-1");
         let connection_id = 14;
         let client_id = "web-client";
@@ -11366,7 +11381,7 @@ mod tests {
 
     #[test]
     fn legacy_paste_image_keeps_a_post_staging_connection_authority() {
-        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let service = legacy_web_service();
         ai_session(&service, "tab-a", "claude-legacy-image");
         let connection_id = 15;
         let client_id = "legacy-image-client";
@@ -11423,7 +11438,7 @@ mod tests {
 
     #[test]
     fn legacy_raw_input_is_authorized_for_only_the_exact_claiming_connection() {
-        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let service = legacy_web_service();
         ai_session(&service, "tab-a", "session-a");
         let client_id = "same-cookie";
         pair_web_client(&service, client_id);
@@ -11498,7 +11513,7 @@ mod tests {
 
     #[test]
     fn web_input_kind_maps_to_matching_native_user_origin_variant() {
-        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let service = legacy_web_service();
         ai_session(&service, "tab-a", "session-a");
         let client_id = "input-origin-owner";
         let connection_id = 1;
@@ -11560,7 +11575,7 @@ mod tests {
 
     #[test]
     fn generation_bearing_raw_input_rejects_a_same_cookie_viewer() {
-        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let service = legacy_web_service();
         ai_session(&service, "tab-a", "session-a");
         let client_id = "same-cookie";
         pair_web_client(&service, client_id);
@@ -11607,7 +11622,7 @@ mod tests {
 
     #[test]
     fn interrupt_session_maps_to_ctrl_c_only_for_exact_generation_owner() {
-        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let service = legacy_web_service();
         ai_session(&service, "tab-a", "session-a");
         let client_id = "same-cookie";
         pair_web_client(&service, client_id);
@@ -11665,7 +11680,7 @@ mod tests {
 
     #[test]
     fn raw_payload_bounds_reject_before_any_pty_write() {
-        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let service = legacy_web_service();
         let connection_id = 1;
         let client_id = "web-client";
         pair_web_client(&service, client_id);
@@ -12072,7 +12087,7 @@ mod tests {
 
     #[test]
     fn subscribe_marks_session_before_eager_bootstrap_lookup() {
-        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let service = legacy_web_service();
         let (entered_tx, entered_rx) = std_mpsc::channel::<()>();
         let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
         let provider_gate = gate.clone();
@@ -12132,7 +12147,7 @@ mod tests {
 
     #[test]
     fn subscribed_web_client_can_receive_output_while_bootstrap_lookup_blocks() {
-        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let service = legacy_web_service();
         let (entered_tx, entered_rx) = std_mpsc::channel::<()>();
         let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
         let provider_gate = gate.clone();
@@ -12183,7 +12198,7 @@ mod tests {
 
     #[test]
     fn subscribe_without_initial_bootstrap_still_bootstraps_once_session_becomes_ready() {
-        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let service = legacy_web_service();
         let connection_id = 15;
         let client_id = "web-client";
         pair_web_client(&service, client_id);

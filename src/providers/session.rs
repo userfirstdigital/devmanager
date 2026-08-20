@@ -17,7 +17,8 @@ use crate::process::registry::ManagedProcessFence;
 use crate::process::registry::ProviderPermitOwnership;
 pub use crate::process::registry::{JoinedActiveProcessZeroProof, ProviderManagedProcessPermit};
 use crate::providers::capabilities::{
-    CapabilitySupport, ProviderCapabilities, ProviderExecutable, ProviderKind,
+    CapabilitySupport, ProviderCapabilities, ProviderExecutable, ProviderExecutableHandle,
+    ProviderKind,
 };
 use rusqlite::types::ValueRef;
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
@@ -190,6 +191,7 @@ pub enum ProviderLaunchMode {
 #[derive(Clone, PartialEq, Eq)]
 pub struct ProviderAdapterLaunchSpec {
     executable: ProviderExecutable,
+    runtime_dependency: Option<ProviderExecutable>,
     arguments: Vec<OsString>,
     cwd: PathBuf,
     environment: BTreeMap<OsString, OsString>,
@@ -201,6 +203,10 @@ impl fmt::Debug for ProviderAdapterLaunchSpec {
         formatter
             .debug_struct("ProviderAdapterLaunchSpec")
             .field("executable", &self.executable)
+            .field(
+                "runtime_dependency_present",
+                &self.runtime_dependency.is_some(),
+            )
             .field("argument_count", &self.arguments.len())
             .field("environment_entry_count", &self.environment.len())
             .field("cwd_present", &(!self.cwd.as_os_str().is_empty()))
@@ -212,12 +218,28 @@ impl fmt::Debug for ProviderAdapterLaunchSpec {
 impl ProviderAdapterLaunchSpec {
     fn bounded(
         executable: ProviderExecutable,
+        runtime_dependency: Option<ProviderExecutable>,
         arguments: Vec<OsString>,
         cwd: PathBuf,
         environment: BTreeMap<OsString, OsString>,
         capabilities: ProviderCapabilities,
     ) -> Result<Self, ProviderLaunchSpecError> {
-        if arguments.len() > MAX_PROVIDER_LAUNCH_ARGUMENTS {
+        if !executable.is_native() {
+            return Err(ProviderLaunchSpecError::InvalidCapabilities);
+        }
+        if runtime_dependency
+            .as_ref()
+            .is_some_and(|dependency| dependency.is_native())
+        {
+            return Err(ProviderLaunchSpecError::InvalidCapabilities);
+        }
+        if runtime_dependency.as_ref().is_some_and(|dependency| {
+            dependency.script_launch_argument().len() > MAX_PROVIDER_LAUNCH_ARGUMENT_BYTES
+        }) {
+            return Err(ProviderLaunchSpecError::ArgumentTooLong);
+        }
+        let reserved = usize::from(runtime_dependency.is_some());
+        if arguments.len().saturating_add(reserved) > MAX_PROVIDER_LAUNCH_ARGUMENTS {
             return Err(ProviderLaunchSpecError::TooManyArguments);
         }
         if arguments
@@ -243,6 +265,7 @@ impl ProviderAdapterLaunchSpec {
             .map_err(|_| ProviderLaunchSpecError::InvalidCapabilities)?;
         Ok(Self {
             executable,
+            runtime_dependency,
             arguments,
             cwd,
             environment,
@@ -250,17 +273,30 @@ impl ProviderAdapterLaunchSpec {
         })
     }
 
-    /// Registry/Task 3 adapter handoff. The provider registry supplies the
-    /// bounded executable graph and exact launch material; callers cannot
-    /// construct this value from raw args or environment.
+    /// Registry/Task 3 adapter handoff. Consumes the already-attested launch
+    /// graph and normalizes it to the native CreateProcess image plus any
+    /// identity-bearing script dependency. Callers cannot construct this value
+    /// from raw args or environment.
     pub(crate) fn from_registry(
-        executable: ProviderExecutable,
+        handle: ProviderExecutableHandle,
         arguments: Vec<OsString>,
         cwd: PathBuf,
         environment: BTreeMap<OsString, OsString>,
         capabilities: ProviderCapabilities,
     ) -> Result<Self, ProviderLaunchSpecError> {
-        Self::bounded(executable, arguments, cwd, environment, capabilities)
+        handle
+            .revalidate()
+            .map_err(|_| ProviderLaunchSpecError::InvalidCapabilities)?;
+        let executable = handle.launch_program().clone();
+        let runtime_dependency = handle.runtime_dependency().cloned();
+        Self::bounded(
+            executable,
+            runtime_dependency,
+            arguments,
+            cwd,
+            environment,
+            capabilities,
+        )
     }
 
     #[cfg(test)]
@@ -271,7 +307,10 @@ impl ProviderAdapterLaunchSpec {
         environment: BTreeMap<OsString, OsString>,
         capabilities: ProviderCapabilities,
     ) -> Result<Self, ProviderLaunchSpecError> {
-        Self::bounded(executable, arguments, cwd, environment, capabilities)
+        let handle = executable
+            .open_for_launch()
+            .map_err(|_| ProviderLaunchSpecError::InvalidCapabilities)?;
+        Self::from_registry(handle, arguments, cwd, environment, capabilities)
     }
 
     fn unavailable_placeholder(
@@ -280,6 +319,7 @@ impl ProviderAdapterLaunchSpec {
     ) -> Self {
         Self {
             executable,
+            runtime_dependency: None,
             arguments: Vec::new(),
             cwd: PathBuf::new(),
             environment: BTreeMap::new(),
@@ -289,6 +329,10 @@ impl ProviderAdapterLaunchSpec {
 
     pub fn executable(&self) -> &ProviderExecutable {
         &self.executable
+    }
+
+    pub fn runtime_dependency(&self) -> Option<&ProviderExecutable> {
+        self.runtime_dependency.as_ref()
     }
 
     pub fn arguments(&self) -> impl Iterator<Item = &OsString> {
@@ -338,6 +382,8 @@ impl fmt::Debug for ProviderAdapterLaunchProof {
 struct AdapterLaunchProofDigestWire<'a> {
     executable_path: &'a Path,
     executable_sha256: &'a [u8; 32],
+    runtime_dependency_path: Option<&'a Path>,
+    runtime_dependency_sha256: Option<&'a [u8; 32]>,
     arguments: &'a [OsString],
     cwd: &'a Path,
     environment: &'a BTreeMap<OsString, OsString>,
@@ -442,6 +488,14 @@ fn launch_proof_digest(
     let wire = AdapterLaunchProofDigestWire {
         executable_path: spec.executable.canonical_path(),
         executable_sha256: spec.executable.sha256(),
+        runtime_dependency_path: spec
+            .runtime_dependency
+            .as_ref()
+            .map(|dependency| dependency.canonical_path()),
+        runtime_dependency_sha256: spec
+            .runtime_dependency
+            .as_ref()
+            .map(ProviderExecutable::sha256),
         arguments: &spec.arguments,
         cwd: &spec.cwd,
         environment: &spec.environment,
@@ -482,6 +536,7 @@ pub enum ProviderLaunchSpecError {
 pub struct ProviderLaunchSpec {
     provider_kind: ProviderKind,
     executable: ProviderExecutable,
+    runtime_dependency: Option<ProviderExecutable>,
     mode: ProviderLaunchMode,
     arguments: Vec<OsString>,
     cwd: PathBuf,
@@ -500,6 +555,10 @@ impl fmt::Debug for ProviderLaunchSpec {
             .debug_struct("ProviderLaunchSpec")
             .field("provider_kind", &self.provider_kind)
             .field("executable", &self.executable)
+            .field(
+                "runtime_dependency_present",
+                &self.runtime_dependency.is_some(),
+            )
             .field("mode", &self.mode)
             .field("argument_count", &self.arguments.len())
             .field("environment_entry_count", &self.environment.len())
@@ -518,12 +577,32 @@ impl ProviderLaunchSpec {
         &self.executable
     }
 
+    pub fn runtime_dependency(&self) -> Option<&ProviderExecutable> {
+        self.runtime_dependency.as_ref()
+    }
+
     pub fn mode(&self) -> &ProviderLaunchMode {
         &self.mode
     }
 
     pub fn arguments(&self) -> impl Iterator<Item = &OsString> {
         self.arguments.iter()
+    }
+
+    /// Final CreateProcess argv: attested script path (when present) then
+    /// adapter arguments. Fixed dependency args are never taken from raw
+    /// caller strings.
+    pub(crate) fn create_process_arguments(&self) -> Vec<OsString> {
+        let mut arguments = Vec::with_capacity(
+            self.arguments
+                .len()
+                .saturating_add(usize::from(self.runtime_dependency.is_some())),
+        );
+        if let Some(dependency) = &self.runtime_dependency {
+            arguments.push(dependency.script_launch_argument());
+        }
+        arguments.extend(self.arguments.iter().cloned());
+        arguments
     }
 
     pub fn cwd(&self) -> &Path {
@@ -575,6 +654,7 @@ impl ProviderLaunchSpec {
         Self {
             provider_kind,
             executable,
+            runtime_dependency: None,
             mode,
             arguments,
             cwd,
@@ -773,6 +853,18 @@ pub trait ProviderProcessLauncher: sealed::ProviderProcessLauncher {
     ) -> Result<Option<ProviderProcessLease>, ProviderLaunchError> {
         Ok(None)
     }
+
+    /// Reconcile a durable process root after the registry authority that
+    /// launched it has disappeared. Only the sealed production bridge may
+    /// mint this opaque receipt, and only after proving that the exact
+    /// PID/creation-time/executable identity is no longer present. A missing
+    /// registry entry alone is never sufficient.
+    fn recover_verified_absence(
+        &mut self,
+        _state: &ProviderSessionState,
+    ) -> Result<Option<ProviderRecoveryZeroSettlement>, ProviderLaunchError> {
+        Ok(None)
+    }
 }
 
 pub(crate) mod sealed {
@@ -868,6 +960,7 @@ struct FixtureProviderLaunchState {
     next_exit_proof_valid: bool,
     recovery_error: Option<ProviderLaunchError>,
     recovery_error_permanently: Option<ProviderLaunchError>,
+    recovery_process_absent: bool,
     drop_observer: Arc<Mutex<usize>>,
     // Test-only stand-in for the process registry's durable handoff. The
     // production manager never adopts roots from a process-local map.
@@ -994,6 +1087,13 @@ impl FixtureProviderProcessLauncher {
             .lock()
             .expect("fixture provider state")
             .recovery_error_permanently = error;
+    }
+
+    pub fn set_recovery_process_absent(&self, absent: bool) {
+        self.state
+            .lock()
+            .expect("fixture provider state")
+            .recovery_process_absent = absent;
     }
 
     fn fixture_fence(
@@ -1157,6 +1257,18 @@ impl ProviderProcessLauncher for FixtureProviderProcessLauncher {
             .expect("fixture provider state")
             .recovery
             .remove(&RecoveryKey::from_state(state)))
+    }
+
+    fn recover_verified_absence(
+        &mut self,
+        state: &ProviderSessionState,
+    ) -> Result<Option<ProviderRecoveryZeroSettlement>, ProviderLaunchError> {
+        let absent = self
+            .state
+            .lock()
+            .expect("fixture provider state")
+            .recovery_process_absent;
+        Ok(absent.then(|| ProviderRecoveryZeroSettlement::from_verified_absence(state)))
     }
 }
 
@@ -1674,6 +1786,100 @@ enum SessionStartCommit {
     AlreadyConsumed,
 }
 
+fn session_start_state_mismatch_fields(
+    current: &ProviderSessionState,
+    proposed: &ProviderSessionState,
+    correlation: RuntimeCorrelation,
+) -> Vec<&'static str> {
+    let mut fields = Vec::new();
+    if current.task_id != correlation.task_id {
+        fields.push("task_id");
+    }
+    if current.agent_session_id != correlation.agent_session_id {
+        fields.push("agent_session_id");
+    }
+    if current.generation != correlation.generation {
+        fields.push("generation");
+    }
+    if current.action_epoch != correlation.action_epoch {
+        fields.push("action_epoch");
+    }
+    if current.launch_nonce != correlation.launch_nonce {
+        fields.push("launch_nonce");
+    }
+    if current.launch_spec.provider_kind != correlation.provider_kind {
+        fields.push("provider_kind");
+    }
+    if current.lifecycle != PersistedRuntimeLifecycle::Running {
+        fields.push("lifecycle");
+    }
+    fields.extend(launch_spec_mismatch_fields(
+        &current.launch_spec,
+        &proposed.launch_spec,
+    ));
+    if proposed.process_root != current.process_root {
+        fields.push("process_root");
+    }
+    fields
+}
+
+fn launch_spec_mismatch_fields(
+    current: &ProviderLaunchSpec,
+    proposed: &ProviderLaunchSpec,
+) -> Vec<&'static str> {
+    let mut fields = Vec::new();
+    for (matches, name) in [
+        (
+            current.provider_kind == proposed.provider_kind,
+            "launch_spec.provider_kind",
+        ),
+        (
+            current.executable == proposed.executable,
+            "launch_spec.executable",
+        ),
+        (
+            current.runtime_dependency == proposed.runtime_dependency,
+            "launch_spec.runtime_dependency",
+        ),
+        (current.mode == proposed.mode, "launch_spec.mode"),
+        (
+            current.arguments == proposed.arguments,
+            "launch_spec.arguments",
+        ),
+        (current.cwd == proposed.cwd, "launch_spec.cwd"),
+        (
+            current.environment == proposed.environment,
+            "launch_spec.environment",
+        ),
+        (
+            current.capabilities.stable_projection() == proposed.capabilities.stable_projection(),
+            "launch_spec.capabilities",
+        ),
+        (current.task_id == proposed.task_id, "launch_spec.task_id"),
+        (
+            current.resource_id == proposed.resource_id,
+            "launch_spec.resource_id",
+        ),
+        (
+            current.terminal_id == proposed.terminal_id,
+            "launch_spec.terminal_id",
+        ),
+        (
+            current.generation == proposed.generation,
+            "launch_spec.generation",
+        ),
+        (
+            current.launch_nonce == proposed.launch_nonce,
+            "launch_spec.launch_nonce",
+        ),
+    ] {
+        if !matches {
+            fields.push(name);
+        }
+    }
+    fields
+}
+
 const RECOVERY_CLAIM_LEASE_MS: u64 = 30_000;
 const RECOVERY_OWNERSHIP_SETTLED: &str = "settled";
 
@@ -1788,6 +1994,15 @@ impl ProviderSessionState {
     pub fn process_root_present(&self) -> bool {
         self.process_root.is_some()
     }
+
+    pub(crate) fn process_root_identity_parts(&self) -> Option<(ManagedProcessId, &Path)> {
+        let root = self.process_root.as_ref()?;
+        Some((
+            ManagedProcessId::new(root.pid, root.creation_time_100ns)
+                .expect("persisted provider root validation rejects zero identity"),
+            root.canonical_executable.as_path(),
+        ))
+    }
 }
 
 /// Scan the private persistence envelope before serde is allowed to allocate
@@ -1808,6 +2023,101 @@ fn validate_bounded_state_json(bytes: &[u8]) -> Result<(), String> {
         return Err("provider session state has trailing bytes".to_string());
     }
     Ok(())
+}
+
+fn strip_untrusted_persisted_auth(value: &mut serde_json::Value) {
+    let Some(capabilities) = value
+        .get_mut("launch_spec")
+        .and_then(|launch| launch.get_mut("capabilities"))
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+    capabilities.insert(
+        "auth_state".to_string(),
+        serde_json::Value::String("unknown".to_string()),
+    );
+    let Some(serde_json::Value::Array(evidence)) = capabilities.get_mut("evidence") else {
+        return;
+    };
+    evidence.retain(|item| {
+        let source = item.get("source").and_then(serde_json::Value::as_str);
+        let status = item.get("status").and_then(serde_json::Value::as_str);
+        let has_auth_source = item
+            .get("auth_source")
+            .is_some_and(|auth_source| !auth_source.is_null());
+        source != Some("auth_status_probe")
+            && !has_auth_source
+            && !matches!(status, Some("authenticated" | "auth_required"))
+    });
+}
+
+fn is_untrusted_persisted_auth_error(error: &str) -> bool {
+    error.contains("subscription authentication evidence requires a registry receipt")
+        || error.contains("requires matching AuthStatusProbe evidence")
+        || error.contains("does not match AuthStatusProbe evidence")
+}
+
+fn stripped_persisted_auth(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let mut value: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+    strip_untrusted_persisted_auth(&mut value);
+    serde_json::to_vec(&value).map_err(|error| error.to_string())
+}
+
+fn decode_session_wire(bytes: &[u8]) -> Result<ProviderSessionStateWire, String> {
+    // Decode the current shape first so strict unknown-field errors stay
+    // actionable. The predecessor v1 shape is tried only when the new
+    // fields are absent. An earlier release emitted the new shape while
+    // still labelling it schema 1, so that transitional form is accepted
+    // and normalized in memory as well. Schema 2 native-only rows remain
+    // readable after the schema-3 runtime-dependency additive fields.
+    match serde_json::from_slice::<ProviderSessionStateWire>(bytes) {
+        Ok(wire) => {
+            if !accepted_session_state_schema(wire.schema_version) {
+                return Err(format!(
+                    "unsupported provider session state schema {}",
+                    wire.schema_version
+                ));
+            }
+            Ok(wire)
+        }
+        Err(current_error) => {
+            let legacy = serde_json::from_slice::<ProviderSessionStateWireV1>(bytes)
+                .map_err(|_| current_error.to_string())?;
+            if legacy.schema_version != PROVIDER_SESSION_STATE_LEGACY_SCHEMA_VERSION {
+                return Err(format!(
+                    "unsupported provider session state schema {}",
+                    legacy.schema_version
+                ));
+            }
+            Ok(ProviderSessionStateWire {
+                schema_version: PROVIDER_SESSION_STATE_SCHEMA_VERSION,
+                agent_session_id: legacy.agent_session_id,
+                task_id: legacy.task_id,
+                generation: legacy.generation,
+                // Schema v1 had no independent action epoch. Its
+                // generation was the only monotonic authority, so use it
+                // as the deterministic migration epoch.
+                action_epoch: legacy.generation,
+                revision: legacy.revision,
+                lifecycle: legacy.lifecycle,
+                launch_nonce: legacy.launch_nonce,
+                launch_spec: legacy.launch_spec,
+                provider_session_id: legacy.provider_session_id,
+                process_root: None,
+            })
+        }
+    }
+}
+
+fn accepted_session_state_schema(version: u16) -> bool {
+    matches!(
+        version,
+        PROVIDER_SESSION_STATE_LEGACY_SCHEMA_VERSION
+            | PROVIDER_SESSION_STATE_NATIVE_ONLY_SCHEMA_VERSION
+            | PROVIDER_SESSION_STATE_SCHEMA_VERSION
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -1839,7 +2149,7 @@ fn json_field_limits(field: &str, inherited: JsonScanLimits) -> JsonScanLimits {
             max_string_bytes: MAX_PROVIDER_LAUNCH_CWD_BYTES,
             ..GENERIC_JSON_SCAN_LIMITS
         },
-        "executable_path" | "canonical_executable" => JsonScanLimits {
+        "executable_path" | "canonical_executable" | "runtime_dependency_path" => JsonScanLimits {
             max_string_bytes: crate::providers::capabilities::MAX_PROVIDER_PATH_BYTES,
             ..GENERIC_JSON_SCAN_LIMITS
         },
@@ -2317,20 +2627,7 @@ impl ProviderSessionStateStore for InMemoryProviderSessionStateStore {
             if let Err(error) = validate_same_generation_state_identity(current, &state) {
                 return Err(error);
             }
-            if (current.generation == state.generation
-                && (current.action_epoch != state.action_epoch
-                    || current.launch_nonce != state.launch_nonce
-                    || current.launch_spec.provider_kind != state.launch_spec.provider_kind))
-                || (state.generation > current.generation
-                    && (state.action_epoch <= current.action_epoch
-                        || state.launch_nonce == current.launch_nonce))
-                || state.generation < current.generation
-            {
-                return Err(
-                    "provider session state action identity changed without a new generation"
-                        .to_string(),
-                );
-            }
+            validate_action_identity_transition(current, &state)?;
         }
         if !self.states.contains_key(&state.agent_session_id) && state.revision != 1 {
             return Err("provider session state initial revision must be one".to_string());
@@ -2628,6 +2925,10 @@ struct PersistedLaunchSpecWire {
     provider_kind: ProviderKind,
     executable_path: PathBuf,
     executable_sha256: [u8; 32],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    runtime_dependency_path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    runtime_dependency_sha256: Option<[u8; 32]>,
     mode: PersistedLaunchModeWire,
     arguments: Vec<OsString>,
     cwd: PathBuf,
@@ -2687,7 +2988,8 @@ struct ProviderSessionStateWireV1 {
 }
 
 const PROVIDER_SESSION_STATE_LEGACY_SCHEMA_VERSION: u16 = 1;
-const PROVIDER_SESSION_STATE_SCHEMA_VERSION: u16 = 2;
+const PROVIDER_SESSION_STATE_NATIVE_ONLY_SCHEMA_VERSION: u16 = 2;
+const PROVIDER_SESSION_STATE_SCHEMA_VERSION: u16 = 3;
 
 impl ProviderSessionState {
     fn encode(&self) -> Result<Vec<u8>, String> {
@@ -2723,11 +3025,21 @@ impl ProviderSessionState {
                 provider_kind: self.launch_spec.provider_kind,
                 executable_path: self.launch_spec.executable.canonical_path().to_path_buf(),
                 executable_sha256: *self.launch_spec.executable.sha256(),
+                runtime_dependency_path: self
+                    .launch_spec
+                    .runtime_dependency
+                    .as_ref()
+                    .map(|dependency| dependency.canonical_path().to_path_buf()),
+                runtime_dependency_sha256: self
+                    .launch_spec
+                    .runtime_dependency
+                    .as_ref()
+                    .map(|dependency| *dependency.sha256()),
                 mode,
                 arguments: self.launch_spec.arguments.clone(),
                 cwd: self.launch_spec.cwd.clone(),
                 environment: self.launch_spec.environment.clone(),
-                capabilities: self.launch_spec.capabilities.clone(),
+                capabilities: self.launch_spec.capabilities.stable_projection(),
                 task_id: self.launch_spec.task_id,
                 resource_id: self.launch_spec.resource_id,
                 terminal_id: self.launch_spec.terminal_id,
@@ -2752,50 +3064,12 @@ impl ProviderSessionState {
 
     fn decode(bytes: &[u8]) -> Result<Self, String> {
         validate_bounded_state_json(bytes)?;
-        // Decode the current shape first so strict unknown-field errors stay
-        // actionable. The predecessor v1 shape is tried only when the new
-        // fields are absent. An earlier release emitted the new shape while
-        // still labelling it schema 1, so that transitional form is accepted
-        // and normalized in memory as well.
-        let current_decode = serde_json::from_slice::<ProviderSessionStateWire>(bytes);
-        let wire = match current_decode {
-            Ok(wire) => {
-                if wire.schema_version != PROVIDER_SESSION_STATE_SCHEMA_VERSION
-                    && wire.schema_version != PROVIDER_SESSION_STATE_LEGACY_SCHEMA_VERSION
-                {
-                    return Err(format!(
-                        "unsupported provider session state schema {}",
-                        wire.schema_version
-                    ));
-                }
-                wire
+        let wire = match decode_session_wire(bytes) {
+            Ok(wire) => wire,
+            Err(error) if is_untrusted_persisted_auth_error(&error) => {
+                decode_session_wire(&stripped_persisted_auth(bytes)?)?
             }
-            Err(current_error) => {
-                let legacy = serde_json::from_slice::<ProviderSessionStateWireV1>(bytes)
-                    .map_err(|_| current_error.to_string())?;
-                if legacy.schema_version != PROVIDER_SESSION_STATE_LEGACY_SCHEMA_VERSION {
-                    return Err(format!(
-                        "unsupported provider session state schema {}",
-                        legacy.schema_version
-                    ));
-                }
-                ProviderSessionStateWire {
-                    schema_version: PROVIDER_SESSION_STATE_SCHEMA_VERSION,
-                    agent_session_id: legacy.agent_session_id,
-                    task_id: legacy.task_id,
-                    generation: legacy.generation,
-                    // Schema v1 had no independent action epoch. Its
-                    // generation was the only monotonic authority, so use it
-                    // as the deterministic migration epoch.
-                    action_epoch: legacy.generation,
-                    revision: legacy.revision,
-                    lifecycle: legacy.lifecycle,
-                    launch_nonce: legacy.launch_nonce,
-                    launch_spec: legacy.launch_spec,
-                    provider_session_id: legacy.provider_session_id,
-                    process_root: None,
-                }
-            }
+            Err(error) => return Err(error),
         };
         let persisted_launch = &wire.launch_spec;
         if wire.generation == 0
@@ -2813,8 +3087,25 @@ impl ProviderSessionState {
             persisted_launch.executable_sha256,
         )
         .map_err(|error| format!("persisted executable identity invalid: {error:?}"))?;
+        let runtime_dependency = match (
+            &persisted_launch.runtime_dependency_path,
+            &persisted_launch.runtime_dependency_sha256,
+        ) {
+            (None, None) => None,
+            (Some(path), Some(sha256)) => {
+                let dependency = ProviderExecutable::reopen_non_native(path.clone(), *sha256)
+                    .map_err(|error| {
+                        format!("persisted runtime dependency identity invalid: {error:?}")
+                    })?;
+                Some(dependency)
+            }
+            _ => {
+                return Err("persisted runtime dependency identity is incomplete".to_string());
+            }
+        };
         let bounded_adapter_spec = ProviderAdapterLaunchSpec::bounded(
             executable.clone(),
+            runtime_dependency,
             persisted_launch.arguments.clone(),
             persisted_launch.cwd.clone(),
             persisted_launch.environment.clone(),
@@ -2834,6 +3125,7 @@ impl ProviderSessionState {
         let launch_spec = ProviderLaunchSpec {
             provider_kind: persisted_launch.provider_kind,
             executable: bounded_adapter_spec.executable,
+            runtime_dependency: bounded_adapter_spec.runtime_dependency,
             mode,
             arguments: bounded_adapter_spec.arguments,
             cwd: bounded_adapter_spec.cwd,
@@ -2909,7 +3201,14 @@ fn validate_same_generation_state_identity(
     if current.generation != next.generation {
         return Ok(());
     }
-    if current.launch_spec != next.launch_spec {
+    if is_settled_exact_resume_relaunch(current, next) {
+        return Ok(());
+    }
+    let mut current_launch_spec = current.launch_spec.clone();
+    current_launch_spec.capabilities = current_launch_spec.capabilities.stable_projection();
+    let mut next_launch_spec = next.launch_spec.clone();
+    next_launch_spec.capabilities = next_launch_spec.capabilities.stable_projection();
+    if current_launch_spec != next_launch_spec {
         return Err("provider session state launch spec identity changed".to_string());
     }
     if current.process_root.is_some() && current.process_root != next.process_root {
@@ -2928,6 +3227,59 @@ fn validate_same_generation_state_identity(
     ) && current.lifecycle != next.lifecycle
     {
         return Err("provider session state terminal lifecycle regressed".to_string());
+    }
+    Ok(())
+}
+
+fn is_settled_exact_resume_relaunch(
+    current: &ProviderSessionState,
+    next: &ProviderSessionState,
+) -> bool {
+    let Some(provider_session_id) = next.provider_session_id.as_ref() else {
+        return false;
+    };
+    let ProviderLaunchMode::ResumeExact(resumed_id) = &next.launch_spec.mode else {
+        return false;
+    };
+    current.lifecycle == PersistedRuntimeLifecycle::Replaced
+        && next.lifecycle == PersistedRuntimeLifecycle::Starting
+        && next.action_epoch > current.action_epoch
+        && next.launch_nonce != current.launch_nonce
+        && next.process_root.is_none()
+        && current
+            .provider_session_id
+            .as_ref()
+            .is_none_or(|current_id| current_id == provider_session_id)
+        && resumed_id == provider_session_id
+        && current.launch_spec.task_id == next.launch_spec.task_id
+        && current.launch_spec.resource_id == next.launch_spec.resource_id
+        && current.launch_spec.provider_kind == next.launch_spec.provider_kind
+        && current.launch_spec.executable == next.launch_spec.executable
+        && current.launch_spec.runtime_dependency == next.launch_spec.runtime_dependency
+        && current.launch_spec.cwd == next.launch_spec.cwd
+        && current.launch_spec.environment == next.launch_spec.environment
+        && next.launch_spec.generation == current.generation
+        && next.launch_spec.launch_nonce == next.launch_nonce
+}
+
+fn validate_action_identity_transition(
+    current: &ProviderSessionState,
+    next: &ProviderSessionState,
+) -> Result<(), String> {
+    let invalid = if current.generation == next.generation {
+        !is_settled_exact_resume_relaunch(current, next)
+            && (current.action_epoch != next.action_epoch
+                || current.launch_nonce != next.launch_nonce
+                || current.launch_spec.provider_kind != next.launch_spec.provider_kind)
+    } else if next.generation > current.generation {
+        next.action_epoch <= current.action_epoch || next.launch_nonce == current.launch_nonce
+    } else {
+        true
+    };
+    if invalid {
+        return Err(
+            "provider session state action identity changed without a new generation".to_string(),
+        );
     }
     Ok(())
 }
@@ -3190,20 +3542,7 @@ impl SqliteProviderSessionStateStore {
             if let Err(error) = validate_same_generation_state_identity(&current_state, state) {
                 return Err(error);
             }
-            if (current_state.generation == state.generation
-                && (current_state.action_epoch != state.action_epoch
-                    || current_state.launch_nonce != state.launch_nonce
-                    || current_state.launch_spec.provider_kind != state.launch_spec.provider_kind))
-                || (state.generation > current_state.generation
-                    && (state.action_epoch <= current_state.action_epoch
-                        || state.launch_nonce == current_state.launch_nonce))
-                || state.generation < current_state.generation
-            {
-                return Err(
-                    "provider session state action identity changed without a new generation"
-                        .to_string(),
-                );
-            }
+            validate_action_identity_transition(&current_state, state)?;
         } else if state.revision != 1 {
             return Err("provider session state initial revision must be one".to_string());
         }
@@ -3525,17 +3864,12 @@ impl ProviderSessionStateStore for SqliteProviderSessionStateStore {
             .map_err(|error| error.to_string())?;
         let current = Self::load_transaction_state(&transaction, correlation.agent_session_id())?
             .ok_or_else(|| "provider SessionStart state is missing".to_string())?;
-        if current.task_id != correlation.task_id
-            || current.agent_session_id != correlation.agent_session_id
-            || current.generation != correlation.generation
-            || current.action_epoch != correlation.action_epoch
-            || current.launch_nonce != correlation.launch_nonce
-            || current.launch_spec.provider_kind != correlation.provider_kind
-            || current.lifecycle != PersistedRuntimeLifecycle::Running
-            || state.launch_spec != current.launch_spec
-            || state.process_root != current.process_root
-        {
-            return Err("provider SessionStart state correlation mismatch".to_string());
+        let mismatch_fields = session_start_state_mismatch_fields(&current, &state, correlation);
+        if !mismatch_fields.is_empty() {
+            return Err(format!(
+                "provider SessionStart state correlation mismatch: {}",
+                mismatch_fields.join(",")
+            ));
         }
         let token_id = provenance.token_id().to_string();
         let existing: Option<(String, String, i64, i64, String, String, String)> = transaction
@@ -4361,6 +4695,20 @@ impl ProviderSessionStartProvenance {
         self.token_id
     }
 
+    /// Production hook-registry handoff. The caller has already authenticated
+    /// a current-generation Claude/Codex registration and supplies the exact
+    /// manager-issued runtime correlation captured before process launch.
+    pub(crate) fn from_authenticated_hook(
+        correlation: RuntimeCorrelation,
+        provider_session_id: ProviderSessionId,
+    ) -> Self {
+        Self {
+            correlation,
+            provider_session_id,
+            token_id: Uuid::now_v7(),
+        }
+    }
+
     /// Test-only handoff for the fixture issuer. The production Task 4.1b
     /// hook issuer remains unavailable until its authenticated identity union
     /// is joined; no caller-facing factory exists.
@@ -4914,6 +5262,33 @@ impl RecoveryKey {
     }
 }
 
+/// Opaque proof that a sealed recovery bridge observed the exact persisted
+/// provider root as absent after its former registry owner disappeared. The
+/// receipt carries the full durable recovery identity and cannot be created by
+/// external launcher implementations because the launcher trait is sealed.
+#[derive(Debug)]
+pub struct ProviderRecoveryZeroSettlement {
+    recovery_key: RecoveryKey,
+    process_root: PersistedProcessRoot,
+}
+
+impl ProviderRecoveryZeroSettlement {
+    pub(crate) fn from_verified_absence(state: &ProviderSessionState) -> Self {
+        Self {
+            recovery_key: RecoveryKey::from_state(state),
+            process_root: state
+                .process_root
+                .clone()
+                .expect("verified provider absence requires a persisted process root"),
+        }
+    }
+
+    fn matches_state(&self, state: &ProviderSessionState) -> bool {
+        self.recovery_key == RecoveryKey::from_state(state)
+            && state.process_root.as_ref() == Some(&self.process_root)
+    }
+}
+
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderSessionCrashPoint {
@@ -5080,6 +5455,7 @@ impl<L: ProviderProcessLauncher, S: ProviderSessionStateStore> ProviderSessionMa
             }
         }
 
+        let mut recovered_persisted_generation = false;
         if let Some(state) = &persisted {
             if state.task_id != request.agent.task_id {
                 return Err(ProviderSessionError::WrongTask {
@@ -5092,6 +5468,9 @@ impl<L: ProviderProcessLauncher, S: ProviderSessionStateStore> ProviderSessionMa
                     expected: state.launch_spec.provider_kind,
                     actual: request.agent.provider_kind,
                 });
+            }
+            if binding.is_some_and(|binding| state.launch_spec.resource_id != binding.resource_id) {
+                return Err(ProviderSessionError::SettlementFenceMismatch);
             }
             if state.lifecycle == PersistedRuntimeLifecycle::Closed {
                 return Err(ProviderSessionError::SessionClosed(agent_id));
@@ -5115,13 +5494,17 @@ impl<L: ProviderProcessLauncher, S: ProviderSessionStateStore> ProviderSessionMa
                 }))
             {
                 self.recover_persisted_state(state)?;
+                recovered_persisted_generation = true;
             }
         }
         let generation = if let Some(binding) = binding {
-            if persisted
-                .as_ref()
-                .is_some_and(|state| state.generation >= binding.runtime_generation)
-            {
+            let persisted_generation_conflicts = persisted.as_ref().is_some_and(|state| {
+                state.generation > binding.runtime_generation
+                    || (state.generation == binding.runtime_generation
+                        && !recovered_persisted_generation
+                        && state.lifecycle != PersistedRuntimeLifecycle::Replaced)
+            });
+            if persisted_generation_conflicts {
                 return Err(ProviderSessionError::StaleGeneration {
                     expected: persisted
                         .as_ref()
@@ -5157,6 +5540,7 @@ impl<L: ProviderProcessLauncher, S: ProviderSessionStateStore> ProviderSessionMa
         let launch_spec = ProviderLaunchSpec {
             provider_kind: request.agent.provider_kind,
             executable: request.launch_spec.executable.clone(),
+            runtime_dependency: request.launch_spec.runtime_dependency.clone(),
             mode: mode.clone(),
             arguments: request.launch_spec.arguments.clone(),
             cwd: request.launch_spec.cwd.clone(),
@@ -5492,6 +5876,27 @@ impl<L: ProviderProcessLauncher, S: ProviderSessionStateStore> ProviderSessionMa
         )
     }
 
+    /// Terminate and durably settle a running exact-resume generation after
+    /// its authenticated provider SessionStart reports a different identity.
+    /// The expected ID is only launch intent; mismatch must never leave the
+    /// process live or fall back to a fresh conversation.
+    pub fn settle_exact_resume_failure(
+        &mut self,
+        agent_session_id: AgentSessionId,
+    ) -> Result<(), ProviderSessionError> {
+        let runtime = self
+            .current
+            .get(&agent_session_id)
+            .cloned()
+            .ok_or(ProviderSessionError::AgentSessionNotFound(agent_session_id))?;
+        if !matches!(runtime.identity_state(), ProviderIdentityState::Expected(_)) {
+            return Err(ProviderSessionError::CorrelatedProviderSessionRequired {
+                agent_session_id,
+            });
+        }
+        self.close_agent_session(agent_session_id)
+    }
+
     fn reconcile_closed_runtime(
         &mut self,
         agent_session_id: AgentSessionId,
@@ -5571,7 +5976,7 @@ impl<L: ProviderProcessLauncher, S: ProviderSessionStateStore> ProviderSessionMa
             self.leases.remove(&state.agent_session_id);
             return Ok(());
         }
-        let claim = self
+        let mut claim = self
             .state_store
             .claim_recovery(state, self.recovery_owner_id, recovery_now_ms())
             .map_err(ProviderSessionError::StateStore)?
@@ -5634,6 +6039,7 @@ impl<L: ProviderProcessLauncher, S: ProviderSessionStateStore> ProviderSessionMa
             self.remember_recovery_claim(state, claim, RecoveryClaimResidueKind::Settlement);
             return Err(ProviderSessionError::StateStore(error));
         }
+        claim.settled = true;
         self.release_recovery_claim(state, &claim)?;
         self.leases.remove(&state.agent_session_id);
         Ok(())
@@ -5951,7 +6357,12 @@ impl<L: ProviderProcessLauncher, S: ProviderSessionStateStore> ProviderSessionMa
                 actual_generation: durable_state.generation,
             });
         }
-        let existing_receipt = self.release_receipt_for(state, claim);
+        // A lifecycle transition may advance the durable projection revision
+        // after this claim was acquired. Release receipts must name that exact
+        // current projection, while the immutable recovery identity and claim
+        // continue to fence the same generation.
+        let release_state = &durable_state;
+        let existing_receipt = self.release_receipt_for(release_state, claim);
         if existing_receipt
             .as_ref()
             .is_some_and(|receipt| receipt.handoff_receipt.is_some() && !receipt.handoff_confirmed)
@@ -5962,7 +6373,7 @@ impl<L: ProviderProcessLauncher, S: ProviderSessionStateStore> ProviderSessionMa
                 error: "recovery handoff intent is still unconfirmed".to_string(),
             });
         }
-        match self.state_store.release_recovery(state, claim) {
+        match self.state_store.release_recovery(release_state, claim) {
             Ok(()) => {
                 if let Some(receipt) = existing_receipt {
                     if let Err(error) = self.state_store.clear_recovery_release(&receipt) {
@@ -5976,9 +6387,10 @@ impl<L: ProviderProcessLauncher, S: ProviderSessionStateStore> ProviderSessionMa
                     self.forget_release_receipt(&receipt);
                 } else if self
                     .pending_recovery_claims
-                    .get(&state.agent_session_id)
+                    .get(&release_state.agent_session_id)
                     .is_some_and(|residue| {
-                        same_recovery_identity(&residue.state, state) && residue.claim == *claim
+                        same_recovery_identity(&residue.state, release_state)
+                            && residue.claim == *claim
                     })
                 {
                     self.pending_recovery_claims.remove(&state.agent_session_id);
@@ -5986,8 +6398,8 @@ impl<L: ProviderProcessLauncher, S: ProviderSessionStateStore> ProviderSessionMa
                 Ok(())
             }
             Err(error) => {
-                let receipt =
-                    existing_receipt.unwrap_or_else(|| RecoveryReleaseReceipt::new(state, claim));
+                let receipt = existing_receipt
+                    .unwrap_or_else(|| RecoveryReleaseReceipt::new(release_state, claim));
                 let error = match self.state_store.record_recovery_release(&receipt) {
                     Ok(()) => error,
                     Err(receipt_error) => {
@@ -6478,7 +6890,7 @@ impl<L: ProviderProcessLauncher, S: ProviderSessionStateStore> ProviderSessionMa
         if let Some(slot) = self.leases.get_mut(&agent_session_id) {
             slot.state = state.clone();
         }
-        let claim = self
+        let mut claim = self
             .state_store
             .claim_recovery(&state, self.recovery_owner_id, recovery_now_ms())
             .map_err(ProviderSessionError::StateStore)?
@@ -6494,6 +6906,7 @@ impl<L: ProviderProcessLauncher, S: ProviderSessionStateStore> ProviderSessionMa
             self.remember_recovery_claim(&state, claim, RecoveryClaimResidueKind::Settlement);
             return Err(ProviderSessionError::StateStore(error));
         }
+        claim.settled = true;
         self.release_recovery_claim(&state, &claim)
     }
 
@@ -6574,7 +6987,7 @@ impl<L: ProviderProcessLauncher, S: ProviderSessionStateStore> ProviderSessionMa
             self.leases.remove(&state.agent_session_id);
             return Ok(());
         }
-        let claim = self
+        let mut claim = self
             .state_store
             .claim_recovery(state, self.recovery_owner_id, recovery_now_ms())
             .map_err(ProviderSessionError::StateStore)?
@@ -6592,6 +7005,34 @@ impl<L: ProviderProcessLauncher, S: ProviderSessionStateStore> ProviderSessionMa
         let Some(mut lease) = recovered else {
             if claim.settled {
                 self.persist_state_with_lifecycle(state, final_lifecycle)?;
+                self.release_recovery_claim(state, &claim)?;
+                return Ok(());
+            }
+            let verified_absence = match self.launcher.recover_verified_absence(state) {
+                Ok(settlement) => settlement,
+                Err(error) => {
+                    self.release_recovery_claim(state, &claim)?;
+                    return Err(ProviderSessionError::StopFailed(error));
+                }
+            };
+            if let Some(settlement) = verified_absence {
+                if !settlement.matches_state(state) {
+                    self.release_recovery_claim(state, &claim)?;
+                    return Err(ProviderSessionError::SettlementFenceMismatch);
+                }
+                if let Err(error) = self.state_store.mark_recovery_settled(state, &claim) {
+                    self.remember_recovery_claim(
+                        state,
+                        claim,
+                        RecoveryClaimResidueKind::Settlement,
+                    );
+                    return Err(ProviderSessionError::StateStore(error));
+                }
+                claim.settled = true;
+                if let Err(error) = self.persist_state_with_lifecycle(state, final_lifecycle) {
+                    self.release_recovery_claim(state, &claim)?;
+                    return Err(error);
+                }
                 self.release_recovery_claim(state, &claim)?;
                 return Ok(());
             }
@@ -6652,6 +7093,7 @@ impl<L: ProviderProcessLauncher, S: ProviderSessionStateStore> ProviderSessionMa
                 self.remember_recovery_claim(state, claim, RecoveryClaimResidueKind::Settlement);
                 return Err(ProviderSessionError::StateStore(error));
             }
+            claim.settled = true;
         }
         if let Err(error) = self.persist_state_with_lifecycle(state, final_lifecycle) {
             self.release_recovery_claim(state, &claim)?;
@@ -7111,7 +7553,11 @@ impl<L: ProviderProcessLauncher, S: ProviderSessionStateStore> Drop
         if let Err(error) = self.prepare_for_shutdown() {
             eprintln!("provider session shutdown handoff failed: {error}");
             for (_, slot) in std::mem::take(&mut self.leases) {
-                std::mem::forget(slot.lease);
+                if slot.settled {
+                    drop(slot.lease);
+                } else {
+                    std::mem::forget(slot.lease);
+                }
             }
         }
         for (agent_id, mut state) in std::mem::take(&mut self.pending_launches) {
@@ -7289,6 +7735,7 @@ mod tests {
         let launch_spec = ProviderLaunchSpec {
             provider_kind: ProviderKind::ClaudeCode,
             executable: executable.clone(),
+            runtime_dependency: None,
             mode: ProviderLaunchMode::NewConversation,
             arguments: Vec::new(),
             cwd: PathBuf::from("."),
@@ -7488,6 +7935,76 @@ mod tests {
             }) if received == provider_session_id
         ));
         assert_eq!(launcher.snapshot().launches().len(), 1);
+    }
+
+    #[test]
+    fn authenticated_exact_resume_mismatch_settles_the_live_process_generation() {
+        let provider_session_id = ProviderSessionId::new("expected-provider-session").unwrap();
+        let agent = AgentSessionFacts::new(
+            TaskId::new(),
+            AgentRole::Primary,
+            ProviderKind::ClaudeCode,
+            Some(provider_session_id.clone()),
+        )
+        .unwrap();
+        let agent_session_id = agent.id;
+        let launcher = FixtureProviderProcessLauncher::new();
+        let mut manager = ProviderSessionManager::new(launcher.clone());
+        let mut request = test_request(agent);
+        request.mode = ProviderSessionStartMode::Open;
+        request.launch_proof = Some(
+            ProviderAdapterLaunchProof::from_test(
+                request.launch_spec.clone(),
+                ProviderSessionStartMode::Open,
+                Some(provider_session_id.clone()),
+            )
+            .unwrap(),
+        );
+        let runtime = manager.start(request).unwrap();
+        assert_eq!(
+            runtime.identity_state(),
+            ProviderIdentityState::Expected(provider_session_id)
+        );
+
+        manager
+            .settle_exact_resume_failure(agent_session_id)
+            .expect("mismatched exact resume must reach joined active-process-zero");
+
+        assert_eq!(launcher.snapshot().stop_attempts(), 1);
+        assert_eq!(runtime.lifecycle(), RuntimeLifecycle::Closed);
+        assert!(!manager.leases.contains_key(&agent_session_id));
+    }
+
+    #[test]
+    fn authenticated_hook_session_start_is_persisted_before_publication() {
+        let launcher = FixtureProviderProcessLauncher::new();
+        let agent = AgentSessionFacts::new(
+            TaskId::new(),
+            AgentRole::Primary,
+            ProviderKind::ClaudeCode,
+            None,
+        )
+        .unwrap();
+        let agent_session_id = agent.id;
+        let mut manager = ProviderSessionManager::new(launcher);
+        let runtime = manager.start(test_request(agent)).unwrap();
+        let provider_session_id = ProviderSessionId::new("authenticated-hook-session").unwrap();
+
+        manager
+            .accept_provider_session_start(ProviderSessionStartProvenance::from_authenticated_hook(
+                runtime.correlation(),
+                provider_session_id.clone(),
+            ))
+            .unwrap();
+
+        assert_eq!(
+            manager
+                .state_store
+                .state(agent_session_id)
+                .and_then(ProviderSessionState::provider_session_id),
+            Some(provider_session_id)
+        );
+        manager.close_agent_session(agent_session_id).unwrap();
     }
 
     #[test]
@@ -7861,6 +8378,151 @@ mod tests {
                 .lifecycle(),
             PersistedRuntimeLifecycle::Closed
         );
+    }
+
+    #[test]
+    fn crash_reopen_running_state_accepts_sealed_verified_process_absence() {
+        let launcher = FixtureProviderProcessLauncher::new();
+        let agent = AgentSessionFacts::new(
+            TaskId::new(),
+            AgentRole::Primary,
+            ProviderKind::ClaudeCode,
+            None,
+        )
+        .unwrap();
+        let path = tempfile::NamedTempFile::new().unwrap();
+        let mut manager = ProviderSessionManager::with_state_store(
+            launcher.clone(),
+            SqliteProviderSessionStateStore::open(path.path()).unwrap(),
+        );
+        let runtime = manager.start(test_request(agent.clone())).unwrap();
+        let slot = manager.leases.remove(&agent.id).unwrap();
+        std::mem::forget(slot.lease);
+        drop(runtime);
+        std::mem::forget(manager);
+
+        launcher.set_recovery_process_absent(true);
+        let mut reopened = ProviderSessionManager::with_state_store(
+            launcher.clone(),
+            SqliteProviderSessionStateStore::open(path.path()).unwrap(),
+        );
+        reopened.close_agent_session(agent.id).unwrap();
+
+        assert_eq!(launcher.snapshot().stop_attempts(), 0);
+        assert_eq!(
+            SqliteProviderSessionStateStore::open(path.path())
+                .unwrap()
+                .load(agent.id)
+                .unwrap()
+                .unwrap()
+                .lifecycle(),
+            PersistedRuntimeLifecycle::Closed
+        );
+    }
+
+    #[test]
+    fn exact_resource_binding_resumes_after_verified_old_process_absence() {
+        let launcher = FixtureProviderProcessLauncher::new();
+        let mut agent = AgentSessionFacts::new(
+            TaskId::new(),
+            AgentRole::Primary,
+            ProviderKind::ClaudeCode,
+            None,
+        )
+        .unwrap();
+        agent.runtime_generation = 1;
+        let binding = AgentResourceBinding {
+            task_id: agent.task_id,
+            agent_session_id: agent.id,
+            resource_id: ResourceId::new(),
+            provider_kind: agent.provider_kind,
+            runtime_generation: agent.runtime_generation,
+        };
+        let path = tempfile::NamedTempFile::new().unwrap();
+        let mut manager = ProviderSessionManager::with_state_store(
+            launcher.clone(),
+            SqliteProviderSessionStateStore::open(path.path()).unwrap(),
+        );
+        let runtime = manager
+            .start_with_resource_binding(test_request(agent.clone()), binding)
+            .unwrap();
+        let provider_session_id = ProviderSessionId::new("durable-resume-session").unwrap();
+        let old_action_epoch = runtime.correlation().action_epoch();
+        let slot = manager.leases.remove(&agent.id).unwrap();
+        std::mem::forget(slot.lease);
+        drop(runtime);
+        std::mem::forget(manager);
+
+        launcher.set_recovery_process_absent(true);
+        agent.provider_session_id = Some(provider_session_id.clone());
+        let mut request = test_request(agent.clone());
+        request.mode = ProviderSessionStartMode::ResumeExact;
+        request.launch_proof = Some(
+            ProviderAdapterLaunchProof::from_test(
+                request.launch_spec.clone(),
+                ProviderSessionStartMode::ResumeExact,
+                Some(provider_session_id),
+            )
+            .unwrap(),
+        );
+        let mut reopened = ProviderSessionManager::with_state_store(
+            launcher.clone(),
+            SqliteProviderSessionStateStore::open(path.path()).unwrap(),
+        );
+        let resumed = reopened
+            .start_with_resource_binding(request, binding)
+            .expect("the exact durable binding must resume after old-root settlement");
+
+        assert_eq!(resumed.generation(), binding.runtime_generation);
+        assert!(resumed.correlation().action_epoch() > old_action_epoch);
+        assert_eq!(resumed.provider_session_id(), agent.provider_session_id);
+        reopened.close_agent_session(agent.id).unwrap();
+    }
+
+    #[test]
+    fn exact_resume_cannot_retarget_a_settled_generation_to_another_resource() {
+        let launcher = FixtureProviderProcessLauncher::new();
+        let mut agent = AgentSessionFacts::new(
+            TaskId::new(),
+            AgentRole::Primary,
+            ProviderKind::ClaudeCode,
+            None,
+        )
+        .unwrap();
+        agent.runtime_generation = 1;
+        let binding = AgentResourceBinding {
+            task_id: agent.task_id,
+            agent_session_id: agent.id,
+            resource_id: ResourceId::new(),
+            provider_kind: agent.provider_kind,
+            runtime_generation: agent.runtime_generation,
+        };
+        let path = tempfile::NamedTempFile::new().unwrap();
+        let mut manager = ProviderSessionManager::with_state_store(
+            launcher.clone(),
+            SqliteProviderSessionStateStore::open(path.path()).unwrap(),
+        );
+        let runtime = manager
+            .start_with_resource_binding(test_request(agent.clone()), binding)
+            .unwrap();
+        let slot = manager.leases.remove(&agent.id).unwrap();
+        std::mem::forget(slot.lease);
+        drop(runtime);
+        std::mem::forget(manager);
+
+        launcher.set_recovery_process_absent(true);
+        let retargeted = AgentResourceBinding {
+            resource_id: ResourceId::new(),
+            ..binding
+        };
+        let mut reopened = ProviderSessionManager::with_state_store(
+            launcher,
+            SqliteProviderSessionStateStore::open(path.path()).unwrap(),
+        );
+        assert!(matches!(
+            reopened.start_with_resource_binding(test_request(agent), retargeted),
+            Err(ProviderSessionError::SettlementFenceMismatch)
+        ));
     }
 
     #[test]
@@ -8639,11 +9301,12 @@ mod tests {
         .unwrap();
         let mut manager = ProviderSessionManager::new(launcher);
         let runtime = manager.start(test_request(agent.clone())).unwrap();
-        let state = manager.state_store.load(agent.id).unwrap().unwrap();
+        let mut state = manager.state_store.load(agent.id).unwrap().unwrap();
         drop(runtime);
         drop(manager);
 
         let mut store = InMemoryProviderSessionStateStore::default();
+        state.revision = 1;
         store.persist(state.clone()).unwrap();
         let claim = store
             .claim_recovery(&state, Uuid::now_v7(), recovery_now_ms())
@@ -9031,9 +9694,7 @@ mod tests {
 
         assert!(matches!(
             manager.prepare_for_shutdown(),
-            Err(ProviderSessionError::StopFailed(
-                ProviderLaunchError::BridgeUnavailable
-            ))
+            Err(ProviderSessionError::RecoveryReleaseFailed { .. })
         ));
         assert_eq!(launcher.snapshot().lease_drops(), 0);
 
@@ -9259,6 +9920,50 @@ mod tests {
             error.contains("environment") || error.contains("string"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn persisted_session_state_does_not_fail_closed_on_subscription_auth_without_a_disk_receipt() {
+        let runtime = unit_runtime();
+        let state = ProviderSessionState {
+            agent_session_id: runtime.agent_session_id(),
+            task_id: runtime.task_id(),
+            generation: runtime.generation(),
+            action_epoch: runtime.correlation().action_epoch(),
+            revision: 1,
+            lifecycle: PersistedRuntimeLifecycle::Starting,
+            launch_nonce: runtime.launch_nonce(),
+            launch_spec: runtime.launch_spec(),
+            provider_session_id: None,
+            process_root: None,
+        };
+        let mut wire: serde_json::Value = serde_json::from_slice(&state.encode().unwrap()).unwrap();
+        wire["launch_spec"]["capabilities"]["auth_state"] =
+            serde_json::json!("authenticated_subscription");
+        wire["launch_spec"]["capabilities"]["evidence"] = serde_json::json!([{
+            "schema_version": 1,
+            "source": "auth_status_probe",
+            "observed_at": 1_700_000_000_000u64,
+            "expires_at": 1_700_000_000_100u64,
+            "confidence": "high",
+            "auth_source": "claude_code_subscription_login",
+            "status": "authenticated",
+            "diagnostic": null
+        }]);
+        let decoded = ProviderSessionState::decode(&serde_json::to_vec(&wire).unwrap()).expect(
+            "disk subscription auth without a registry receipt must not abort launch persist",
+        );
+        assert_eq!(
+            decoded.launch_spec.capabilities.auth_state(),
+            crate::providers::capabilities::ProviderAuthState::Unknown
+        );
+        assert!(decoded
+            .launch_spec
+            .capabilities
+            .evidence()
+            .iter()
+            .all(|evidence| evidence.source()
+                != crate::providers::capabilities::EvidenceSourceId::AuthStatusProbe));
     }
 
     #[test]
@@ -9565,7 +10270,7 @@ mod tests {
             )
             .unwrap();
         let upgraded: serde_json::Value = serde_json::from_slice(&upgraded_bytes).unwrap();
-        assert_eq!(upgraded["schema_version"], serde_json::json!(2));
+        assert_eq!(upgraded["schema_version"], serde_json::json!(3));
     }
 
     #[test]
@@ -9591,6 +10296,105 @@ mod tests {
         let migrated = ProviderSessionState::decode(&serde_json::to_vec(&wire).unwrap()).unwrap();
         assert_eq!(migrated.action_epoch(), state.action_epoch());
         assert!(migrated.process_root_present());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn durable_state_round_trips_normalized_native_program_and_script_dependency() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let interpreter_path = temp.path().join("node.exe");
+        let script_path = temp.path().join("codex.js");
+        std::fs::copy(std::env::current_exe().unwrap(), &interpreter_path).unwrap();
+        std::fs::write(&script_path, "console.log('fixture');\n").unwrap();
+        let interpreter = ProviderExecutable::from_path(&interpreter_path).unwrap();
+        let script = ProviderExecutable::inspect_non_native_blocking(&script_path).unwrap();
+        let capabilities = ProviderCapabilities {
+            kind: ProviderKind::Codex,
+            version: crate::providers::capabilities::ProviderVersion::new("fixture").unwrap(),
+            auth_state: crate::providers::capabilities::ProviderAuthState::Unknown,
+            exact_resume: CapabilitySupport::Supported,
+            semantic_events: CapabilitySupport::Unsupported,
+            provider_session_id: CapabilitySupport::Supported,
+            build_launch: CapabilitySupport::Supported,
+            parse_signal: CapabilitySupport::Unsupported,
+            cooperative_stop: CapabilitySupport::Unsupported,
+            observe_quota: CapabilitySupport::Unsupported,
+            evidence: Vec::new(),
+        };
+        let task_id = TaskId::new();
+        let launch_nonce = LaunchNonce::new();
+        let launch_spec = ProviderLaunchSpec {
+            provider_kind: ProviderKind::Codex,
+            executable: interpreter.clone(),
+            runtime_dependency: Some(script.clone()),
+            mode: ProviderLaunchMode::NewConversation,
+            arguments: vec![OsString::from("--fixture")],
+            cwd: temp.path().to_path_buf(),
+            environment: BTreeMap::new(),
+            capabilities,
+            task_id,
+            resource_id: ResourceId::new(),
+            terminal_id: TerminalId::new(),
+            generation: 1,
+            launch_nonce,
+        };
+        assert_eq!(
+            launch_spec.create_process_arguments(),
+            vec![script.script_launch_argument(), OsString::from("--fixture")]
+        );
+        let state = ProviderSessionState {
+            agent_session_id: AgentSessionId::new(),
+            task_id,
+            generation: 1,
+            action_epoch: 1,
+            revision: 1,
+            lifecycle: PersistedRuntimeLifecycle::Running,
+            launch_nonce,
+            launch_spec: launch_spec.clone(),
+            provider_session_id: None,
+            process_root: None,
+        };
+        let encoded = state.encode().expect("encode");
+        let wire: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(wire["schema_version"], serde_json::json!(3));
+        assert!(wire["launch_spec"]["runtime_dependency_path"].is_string());
+        let decoded = ProviderSessionState::decode(&encoded).expect("decode");
+        assert_eq!(
+            decoded.launch_spec.executable.canonical_path(),
+            interpreter.canonical_path()
+        );
+        assert!(decoded.launch_spec.executable.is_native());
+        let dependency = decoded
+            .launch_spec
+            .runtime_dependency
+            .as_ref()
+            .expect("dependency");
+        assert_eq!(dependency.canonical_path(), script.canonical_path());
+        assert_eq!(dependency.sha256(), script.sha256());
+        assert!(!dependency.is_native());
+        assert_eq!(
+            decoded.launch_spec.create_process_arguments(),
+            vec![script.script_launch_argument(), OsString::from("--fixture")]
+        );
+
+        // Schema 2 native-only rows remain readable without dependency fields.
+        let mut native_only = wire.clone();
+        native_only["schema_version"] = serde_json::json!(2);
+        native_only["launch_spec"]
+            .as_object_mut()
+            .unwrap()
+            .remove("runtime_dependency_path");
+        native_only["launch_spec"]
+            .as_object_mut()
+            .unwrap()
+            .remove("runtime_dependency_sha256");
+        let native_decoded =
+            ProviderSessionState::decode(&serde_json::to_vec(&native_only).unwrap()).unwrap();
+        assert!(native_decoded.launch_spec.runtime_dependency.is_none());
+        assert_eq!(
+            native_decoded.launch_spec.create_process_arguments(),
+            vec![OsString::from("--fixture")]
+        );
     }
 
     #[test]
@@ -10091,6 +10895,41 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_same_generation_ignores_registry_auth_fields_omitted_from_durable_identity() {
+        let runtime = unit_runtime();
+        let path = tempfile::NamedTempFile::new().unwrap();
+        let mut launch_spec = runtime.launch_spec();
+        launch_spec.capabilities.auth_state =
+            crate::providers::capabilities::ProviderAuthState::AuthenticatedSubscription;
+        let mut state = ProviderSessionState {
+            agent_session_id: runtime.agent_session_id(),
+            task_id: runtime.task_id(),
+            generation: runtime.generation(),
+            action_epoch: runtime.correlation().action_epoch(),
+            revision: 1,
+            lifecycle: PersistedRuntimeLifecycle::Starting,
+            launch_nonce: runtime.launch_nonce(),
+            launch_spec,
+            provider_session_id: None,
+            process_root: None,
+        };
+        let mut store = SqliteProviderSessionStateStore::open(path.path()).unwrap();
+        store.persist(state.clone()).unwrap();
+
+        state.revision = 2;
+        state.lifecycle = PersistedRuntimeLifecycle::Running;
+        store
+            .persist(state)
+            .expect("volatile registry auth must not change durable launch identity");
+
+        let reopened = store.load(runtime.agent_session_id()).unwrap().unwrap();
+        assert_eq!(
+            reopened.launch_spec.capabilities.auth_state(),
+            crate::providers::capabilities::ProviderAuthState::Unknown
+        );
+    }
+
+    #[test]
     fn sqlite_task_enumeration_separates_open_and_closed_recovery_states() {
         let runtime = unit_runtime();
         let task_id = runtime.task_id();
@@ -10163,6 +11002,78 @@ mod tests {
             .consume_session_start_token(&mismatched)
             .unwrap_err()
             .contains("provenance mismatch"));
+    }
+
+    #[test]
+    fn sqlite_session_start_correlation_error_names_the_drifted_field() {
+        let runtime = unit_runtime();
+        let path = tempfile::NamedTempFile::new().unwrap();
+        let current = ProviderSessionState {
+            agent_session_id: runtime.agent_session_id(),
+            task_id: runtime.task_id(),
+            generation: runtime.generation(),
+            action_epoch: runtime.correlation().action_epoch(),
+            revision: 1,
+            lifecycle: PersistedRuntimeLifecycle::Running,
+            launch_nonce: runtime.launch_nonce(),
+            launch_spec: runtime.launch_spec(),
+            provider_session_id: None,
+            process_root: Some(PersistedProcessRoot::from_fence(
+                &runtime.fence(),
+                runtime.launch_spec().executable(),
+            )),
+        };
+        let mut store = SqliteProviderSessionStateStore::open(path.path()).unwrap();
+        store.persist(current.clone()).unwrap();
+        let mut changed_root = current.clone();
+        changed_root
+            .process_root
+            .as_mut()
+            .expect("process root")
+            .creation_time_100ns += 1;
+        let provenance = ProviderSessionStartProvenance::mint(
+            runtime.correlation(),
+            ProviderSessionId::new("diagnostic-provider-session").unwrap(),
+        );
+
+        let error = store
+            .consume_session_start_and_persist(&provenance, changed_root)
+            .unwrap_err();
+
+        assert!(error.contains("process_root"), "{error}");
+
+        let mut changed_launch_spec = current;
+        changed_launch_spec.launch_spec.cwd.push("drift");
+        let provenance = ProviderSessionStartProvenance::mint(
+            runtime.correlation(),
+            ProviderSessionId::new("launch-spec-diagnostic-session").unwrap(),
+        );
+        let error = store
+            .consume_session_start_and_persist(&provenance, changed_launch_spec)
+            .unwrap_err();
+
+        assert!(error.contains("launch_spec.cwd"), "{error}");
+
+        let mut authenticated_runtime_state = store
+            .load(runtime.agent_session_id())
+            .unwrap()
+            .expect("persisted runtime state");
+        authenticated_runtime_state
+            .launch_spec
+            .capabilities
+            .auth_state =
+            crate::providers::capabilities::ProviderAuthState::AuthenticatedSubscription;
+        let provenance = ProviderSessionStartProvenance::mint(
+            runtime.correlation(),
+            ProviderSessionId::new("stable-capability-projection-session").unwrap(),
+        );
+
+        assert_eq!(
+            store
+                .consume_session_start_and_persist(&provenance, authenticated_runtime_state)
+                .unwrap(),
+            SessionStartCommit::Accepted
+        );
     }
 
     #[test]

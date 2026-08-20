@@ -138,6 +138,13 @@ pub(crate) fn admit_duplex_completion(
     }
 }
 const REQUEST_COMPLETION_TIMEOUT: Duration = Duration::from_secs(5);
+/// Git status performs two sequential bounded operations: repository admission
+/// and the status command. Each owns a ten-second operation deadline, so the
+/// client must leave enough time for both plus host-side cleanup and framing.
+const TASK_COCKPIT_QUERY_TIMEOUT: Duration = Duration::from_secs(25);
+/// Agent connection Refresh hashes native CLIs, then runs observe + auth.
+/// Must outlast [`crate::providers::registry::provider_in_flight_ttl`].
+const AGENT_CONNECTION_QUERY_TIMEOUT: Duration = Duration::from_secs(240);
 /// Bounded post-Hello host→client critical output queue capacity.
 const HOST_CRITICAL_OUTPUT_QUEUE_CAPACITY: usize = 32;
 
@@ -1111,6 +1118,14 @@ pub(crate) fn request_completion_timeout() -> Duration {
     REQUEST_COMPLETION_TIMEOUT
 }
 
+pub(crate) fn task_cockpit_query_timeout() -> Duration {
+    TASK_COCKPIT_QUERY_TIMEOUT
+}
+
+pub(crate) fn agent_connection_query_timeout() -> Duration {
+    AGENT_CONNECTION_QUERY_TIMEOUT
+}
+
 pub(crate) fn codecs_for_limits(
     limits: FrameLimits,
 ) -> Result<(PhysicalFrameCodec, MessagePackCodec), IpcError> {
@@ -1225,12 +1240,20 @@ mod tests {
     use super::{
         connection_ensure_live, connection_fail_closed, protected_pipe_sddl,
         read_physical_frame_idle_then_deadline, supervise_duplex_halves,
-        write_physical_frame_with_deadline, IpcError, ReconnectGrantLedger, MAX_RECONNECT_GRANTS,
-        RECONNECT_GRANT_TTL,
+        task_cockpit_query_timeout, write_physical_frame_with_deadline, IpcError,
+        ReconnectGrantLedger, MAX_RECONNECT_GRANTS, RECONNECT_GRANT_TTL,
     };
     use crate::domain::ClientId;
     use crate::protocol::{FrameLimits, PhysicalFrameCodec};
     use uuid::Uuid;
+
+    #[test]
+    fn task_cockpit_client_deadline_outlasts_two_sequential_git_deadlines() {
+        assert!(
+            task_cockpit_query_timeout() >= Duration::from_secs(25),
+            "repository admission and status each own a ten-second Git deadline, plus cleanup"
+        );
+    }
 
     #[test]
     fn protected_pipe_sddl_is_exact_protected_two_ace_form() {

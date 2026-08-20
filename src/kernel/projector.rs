@@ -223,6 +223,64 @@ pub(crate) fn apply_event(
                 Ok(())
             })?;
         }
+        Event::AgentProviderSessionBound {
+            agent_session_id,
+            resource_id,
+            provider_session_id,
+            runtime_generation,
+        } => {
+            let task_id = require_task_id(event)?;
+            let table = table_name("agent_sessions", shadow);
+            let changed = tx.execute(
+                &format!(
+                    "UPDATE {table}
+                     SET provider_session_id = ?1, provider_resource_id = ?2,
+                         revision = revision + 1
+                     WHERE agent_session_id = ?3 AND task_id = ?4
+                       AND lifecycle = 'open' AND runtime_generation = ?5
+                       AND provider_session_id IS NULL"
+                ),
+                rusqlite::params![
+                    provider_session_id.as_str(),
+                    resource_id.as_bytes().as_slice(),
+                    agent_session_id.as_bytes().as_slice(),
+                    task_id.as_bytes().as_slice(),
+                    u64_to_sqlite_i64("agent_sessions.runtime_generation", *runtime_generation)?,
+                ],
+            )?;
+            if changed == 0 {
+                let existing: Option<(String, Vec<u8>)> = tx
+                    .query_row(
+                        &format!(
+                            "SELECT provider_session_id, provider_resource_id FROM {table}
+                             WHERE agent_session_id = ?1 AND task_id = ?2
+                               AND lifecycle = 'open' AND runtime_generation = ?3"
+                        ),
+                        rusqlite::params![
+                            agent_session_id.as_bytes().as_slice(),
+                            task_id.as_bytes().as_slice(),
+                            u64_to_sqlite_i64(
+                                "agent_sessions.runtime_generation",
+                                *runtime_generation
+                            )?,
+                        ],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()?;
+                if existing
+                    .as_ref()
+                    .is_none_or(|(session_id, stored_resource_id)| {
+                        session_id != provider_session_id.as_str()
+                            || stored_resource_id.as_slice() != resource_id.as_bytes()
+                    })
+                {
+                    return Err(StoreError::Projection(
+                        "provider session binding fence mismatch".into(),
+                    ));
+                }
+            }
+            bump_task_revision(tx, shadow, task_id, event)?;
+        }
         Event::PrimaryAgentSet { agent_session_id } => {
             let task_id = require_task_id(event)?;
             validate_primary_agent(tx, shadow, task_id, *agent_session_id)?;

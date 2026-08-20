@@ -8,28 +8,32 @@
 //! projection.
 
 use std::cell::RefCell;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::env;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
+use std::ops::Range;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    anchored, deferred, div, point, px, size, uniform_list, AnyElement, App, AppContext,
-    Application, ClickEvent, Context, ElementId, FocusHandle, FontWeight, InteractiveElement,
-    IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    ParentElement, PathPromptOptions, Pixels, Point, Render, ScrollWheelEvent, Size,
-    StatefulInteractiveElement, Styled, Subscription, Task, Timer, UniformListScrollHandle, Window,
-    WindowBounds, WindowOptions,
+    anchored, canvas, deferred, div, img, point, px, size, uniform_list, AnyElement, App,
+    AppContext, Application, Bounds, ClickEvent, ClipboardEntry, Context, ElementId,
+    ElementInputHandler, Entity, EntityInputHandler, FocusHandle, FontWeight, ImageFormat,
+    ImageSource, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, ObjectFit, ParentElement, PathPromptOptions, Pixels, Point,
+    Render, RenderImage, ScrollWheelEvent, Size, StatefulInteractiveElement, Styled, StyledImage,
+    Subscription, Task, UTF16Selection, UniformListScrollHandle, Window, WindowBounds,
+    WindowOptions,
 };
 use gpui_component::button::{Button, ButtonVariants};
+use gpui_component::{Disableable, Selectable};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -41,7 +45,7 @@ use crate::browser::{
 use crate::client::action::{self, BrowserActionRequest, UpdaterAction};
 use crate::client::{
     ClientModel, ClientSubscription, HostClient, HostClientConfig, HostClientConnectPort,
-    SubscriptionUpdate,
+    SubscriptionUpdate, TaskInboxPreview,
 };
 use crate::config::paths::{resolve_app_paths, AppProfile, BuildKind};
 use crate::domain::cockpit::{
@@ -54,7 +58,7 @@ use crate::domain::command::{
 };
 use crate::domain::host::{HostQuitInspection, HostQuitWorktreeInspection};
 use crate::domain::id::SubscriptionId;
-use crate::domain::id::{CommandId, RequestId, TaskId};
+use crate::domain::id::{AgentSessionId, CommandId, ProjectId, RequestId, TaskId};
 use crate::domain::snapshot::SnapshotSection;
 use crate::domain::task::VisibleTaskStatus;
 use crate::domain::ClientId;
@@ -64,7 +68,12 @@ use crate::protocol::BrowserSecurityState;
 use crate::protocol::StreamFrame;
 use crate::protocol::{Capability, CapabilitySet, FrameLimits};
 use crate::providers::ProviderKind;
+use crate::remote::web::image_paste::{
+    remove_staged_image, stage_image_for_workspace, StagedImageAttachment,
+    NATIVE_COMPOSER_IMAGE_MAX_COUNT, WEB_PASTE_IMAGE_MAX_BYTES,
+};
 use crate::remote::RemoteHostService;
+use crate::remote::RemoteImageAttachment;
 use crate::ui::actions::{
     self, DockTool, HostActions, HostStatus, KeyboardAction, KeyboardModel, KeyboardShortcut,
     NativeDismissTransient, NativeDockArtifacts, NativeDockBrowser, NativeDockChanges,
@@ -92,14 +101,17 @@ use crate::ui::shell::{
     TerminalRelease,
 };
 use crate::ui::task_cockpit::composer::{
-    ApprovalDecision, ComposerControl, ComposerDraftProjection, ComposerError, ComposerFence,
-    ComposerHostProjection, ComposerIntent, TaskComposer,
+    provider_command_catalog, provider_command_opens_terminal, AnswerPayload, ApprovalDecision,
+    ComposerControl, ComposerDraftProjection, ComposerError, ComposerFence, ComposerHostProjection,
+    ComposerIntent, ComposerPayload, ProviderCommandSuggestion, TaskComposer,
 };
 use crate::ui::task_cockpit::dock::{DockEdge, DockTool as CockpitDockTool};
+use crate::ui::task_cockpit::draft_store::{ComposerDraftKey, ComposerDraftStore};
 use crate::ui::task_cockpit::shell::TaskCockpitShell;
+use crate::ui::task_cockpit::timeline::CONVERSATION_CONTENT_MAX_WIDTH;
 use crate::ui::task_cockpit::{
     action_is_current, one_fresh_quota_observations, project_services_from_task_projection,
-    project_services_panel, render_panel_action, render_panel_frame, render_task_browser_dock,
+    project_services_panel, render_panel_action, render_task_browser_dock,
     update_observation_from_snapshot, ArtifactsPanelProjection, ChangesPanelProjection,
     ConfigSidebarActionRequest, ConfigSidebarProjection, ConfigSidebarUnavailableReason,
     FilesPanelProjection, Inbox, InboxPresentationWidth, InboxRenderModel, PanelAction,
@@ -108,6 +120,7 @@ use crate::ui::task_cockpit::{
     TopBarProjectionInput, UpdateState, WorkspacePanelProjection, DEFAULT_VISIBLE_ROWS,
     FIXED_VIRTUAL_OVERSCAN,
 };
+
 use crate::ui::terminal_adapter::TerminalDockAdapter;
 pub use crate::ui::terminal_adapter::{TerminalDockState, TERMINAL_ADAPTER_DEPENDENCY};
 use crate::ui::tokens::{RuntimePreferencesSnapshot, StatusMeaning};
@@ -131,14 +144,19 @@ const ACTION_AGENT_CONNECTION_QUERY: &str = "agent.connection";
 /// Stable pipe/lock profile name for the packaged production host.
 const PRODUCTION_HOST_PROFILE: &str = "production";
 const CLIENT_BUILD_PREFIX: &str = "devmanager";
+// Keep every native snapshot request comfortably within the generic IPC
+// completion bound even when an old profile contains hundreds of operations
+// whose durable lineage must be validated. The full snapshot still paginates
+// to completion; this changes only the amount of synchronous host work and
+// physical output admitted by one request.
+const NATIVE_SNAPSHOT_PAGE_ITEMS: u32 = 128;
 const NATIVE_POINTER_ID: u64 = 1;
 /// The dock tools in their canonical Alt+digit order. The tab strip and the
 /// keyboard shortcuts both read this table, so a visible tab can never select a
 /// different tool than its accelerator.
-const NATIVE_DOCK_TABS: [(CockpitDockTool, &str, u8); 7] = [
+const NATIVE_DOCK_TABS: [(CockpitDockTool, &str, u8); 6] = [
     (CockpitDockTool::Changes, "native-dock-tab-changes", 1),
     (CockpitDockTool::Files, "native-dock-tab-files", 2),
-    (CockpitDockTool::Terminal, "native-dock-tab-terminal", 3),
     (CockpitDockTool::Browser, "native-dock-tab-browser", 4),
     (CockpitDockTool::Services, "native-dock-tab-services", 5),
     (CockpitDockTool::Artifacts, "native-dock-tab-artifacts", 6),
@@ -161,11 +179,40 @@ const MAX_RETRY_HOST_ACTIONS: usize = MAX_ACTION_LANE_RECORDS - 1;
 const MAX_ACCESSIBILITY_ACTIONS: usize = 32;
 const MAX_PENDING_PREFERENCES: usize = 8;
 const CONTROLLER_TICK_INTERVAL: Duration = Duration::from_millis(16);
+const BOOTSTRAP_RETRY_INTERVAL: Duration = Duration::from_millis(250);
+// A failed initial rendezvous must not strand the shell on "Can't connect"
+// after the durable host becomes available. Only the real shell-first launch
+// path enables this retry, and it owns at most one bootstrap worker at a time.
+const HOST_BOOTSTRAP_REATTACH_TICKS: usize = 60;
+#[cfg_attr(test, allow(dead_code))]
+const IDLE_PHOTO_FETCH_TIMEOUT: Duration = Duration::from_secs(8);
+#[cfg_attr(test, allow(dead_code))]
+const IDLE_PHOTO_MAX_BYTES: u64 = 8 * 1024 * 1024;
+const COMPOSER_DRAFT_PERSIST_INTERVAL: Duration = Duration::from_millis(250);
 const NATIVE_SHUTDOWN_BUDGET: Duration = Duration::from_secs(2);
 const NATIVE_STARTUP_BUDGET: Duration = Duration::from_secs(5);
+/// Isolated debug hosts cold-open sqlite and refresh parent identity before
+/// binding the pipe. Five seconds is enough for the packaged production host,
+/// but killing the debug sibling at that budget leaves the window on
+/// "Getting ready" with no host and a stale `host.lock`.
+const NATIVE_ISOLATED_STARTUP_BUDGET: Duration = Duration::from_secs(30);
 const MAX_RETAINED_WORKERS: usize = 8;
 const MAX_RETAINED_CHILDREN: usize = 8;
 const MAX_RETAINED_ACTION_BATCHES: usize = 8;
+
+fn should_schedule_host_bootstrap_retry(
+    enabled: bool,
+    has_runtime: bool,
+    has_pending_bootstrap: bool,
+    connection_failed: bool,
+    controller_ticks: usize,
+) -> bool {
+    enabled
+        && !has_runtime
+        && !has_pending_bootstrap
+        && connection_failed
+        && controller_ticks % HOST_BOOTSTRAP_REATTACH_TICKS == 0
+}
 
 fn action_lane_total(
     channel_count: usize,
@@ -492,6 +539,19 @@ fn stable_task_element_id(task_id: TaskId) -> ElementId {
     ElementId::Uuid(Uuid::from_bytes(*task_id.as_bytes()))
 }
 
+fn stable_project_element_key(project_id: ProjectId, suffix: &str) -> u64 {
+    let mut digest = Sha256::new();
+    digest.update(b"native-project");
+    digest.update([0]);
+    digest.update(project_id.as_bytes());
+    digest.update([0]);
+    digest.update(suffix.as_bytes());
+    let bytes: [u8; 8] = digest.finalize()[..8]
+        .try_into()
+        .expect("sha256 prefix is eight bytes");
+    u64::from_be_bytes(bytes)
+}
+
 /// Return a deterministic numeric suffix for a service element identity.
 ///
 /// GPUI's tuple element IDs intentionally accept only a static name and a
@@ -535,6 +595,7 @@ pub enum NativeShellError {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NativeHostState {
+    Connecting,
     Connected { endpoint: String },
     Disconnected,
     Error { message: String },
@@ -543,6 +604,7 @@ pub enum NativeHostState {
 impl NativeHostState {
     pub fn label(&self) -> &'static str {
         match self {
+            Self::Connecting => "Connecting",
             Self::Connected { .. } => "Connected",
             Self::Disconnected => "Disconnected",
             Self::Error { .. } => "Error",
@@ -552,7 +614,7 @@ impl NativeHostState {
     pub fn endpoint(&self) -> Option<&str> {
         match self {
             Self::Connected { endpoint } => Some(endpoint),
-            Self::Disconnected | Self::Error { .. } => None,
+            Self::Connecting | Self::Disconnected | Self::Error { .. } => None,
         }
     }
 }
@@ -667,6 +729,8 @@ impl IsolatedDevProfile {
     /// host controller may use it from its I/O lane and then attach the single
     /// resulting [`HostClient`] through [`NativeHostClientRuntime`].
     pub fn host_client_config(&self) -> HostClientConfig {
+        let mut limits = FrameLimits::v1_default();
+        limits.max_page_items = NATIVE_SNAPSHOT_PAGE_ITEMS;
         HostClientConfig {
             named_profile: self.named_profile().to_string(),
             client_build: format!("{CLIENT_BUILD_PREFIX}/{}", env!("CARGO_PKG_VERSION")),
@@ -679,12 +743,13 @@ impl IsolatedDevProfile {
                 Capability::PromptProjection,
                 Capability::ProviderInput,
                 Capability::TaskCockpit,
+                Capability::SemanticConversation,
                 Capability::ExplicitDetach,
                 Capability::HostShutdown,
                 Capability::UpdateHandoff,
                 Capability::ServiceSupervisor,
             ]),
-            limits: FrameLimits::v1_default(),
+            limits,
         }
     }
 
@@ -946,12 +1011,69 @@ impl NativeHostProcess {
     }
 }
 
-pub(crate) trait NativeHostBootstrap {
+pub(crate) trait NativeHostBootstrap: Send {
     fn start_until(
         &mut self,
         profile: &IsolatedDevProfile,
         deadline: Instant,
     ) -> Result<NativeHostRuntimeAttachment, NativeShellError>;
+}
+
+/// Background connect/attach rendezvous. The zero-capacity channel keeps any
+/// produced runtime on the bootstrap thread when the shell closes first.
+struct PendingHostBootstrap {
+    result_rx: Option<Receiver<Result<NativeHostRuntimeAttachment, NativeShellError>>>,
+    worker: Option<OwnedWorker>,
+}
+
+impl Drop for PendingHostBootstrap {
+    fn drop(&mut self) {
+        // Receiver first so a blocked send fails and drops Ok(runtime) on the
+        // bootstrap thread; then join or retain the worker (never detach).
+        drop(self.result_rx.take());
+        finish_pending_bootstrap_worker(self.worker.take());
+    }
+}
+
+fn spawn_pending_host_bootstrap(
+    profile: IsolatedDevProfile,
+    mut bootstrap: impl NativeHostBootstrap + 'static,
+) -> Result<PendingHostBootstrap, NativeShellError> {
+    let permit =
+        acquire_reaper_permit(ReaperKind::Worker).ok_or_else(|| NativeShellError::HostConnect {
+            message: "native host bootstrap reaper capacity exhausted".to_string(),
+        })?;
+    let (result_tx, result_rx) = std::sync::mpsc::sync_channel(0);
+    let deadline = Instant::now() + native_startup_budget(&profile);
+    let handle = std::thread::Builder::new()
+        .name("devmanager-native-host-bootstrap".to_string())
+        .spawn(move || {
+            let result = bootstrap.start_until(&profile, deadline);
+            // Send failure means the shell dropped the receiver first: any Ok
+            // runtime is dropped here on the bootstrap thread, not the UI thread.
+            let _ = result_tx.send(result);
+        })
+        .map_err(|error| NativeShellError::HostConnect {
+            message: format!("native host bootstrap worker spawn failed: {error}"),
+        })?;
+    Ok(PendingHostBootstrap {
+        result_rx: Some(result_rx),
+        worker: Some(OwnedWorker {
+            handle,
+            _permit: permit,
+        }),
+    })
+}
+
+fn finish_pending_bootstrap_worker(worker: Option<OwnedWorker>) {
+    let Some(worker) = worker else {
+        return;
+    };
+    if worker.handle.is_finished() {
+        let _ = worker.handle.join();
+    } else {
+        retain_worker(worker);
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1047,10 +1169,12 @@ impl NativeHostBootstrap for ProcessNativeHostBootstrap {
         let mut command = Command::new(&spec.executable);
         command.args(spec.arguments());
         sanitize_spawned_host_environment(&mut command);
-        command
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
+        command.stdin(Stdio::null()).stdout(Stdio::null());
+        if profile.is_production() {
+            command.stderr(Stdio::null());
+        } else {
+            command.stderr(Stdio::from(isolated_host_stderr_log(profile)?));
+        }
         let child = command
             .spawn()
             .map_err(|error| NativeShellError::HostConnect {
@@ -1069,6 +1193,42 @@ impl NativeHostBootstrap for ProcessNativeHostBootstrap {
             NativeHostClientRuntime::connect_blocking_with_process(profile, process, deadline)?;
         Ok(NativeHostRuntimeAttachment::Client(runtime))
     }
+}
+
+fn native_startup_budget(profile: &IsolatedDevProfile) -> Duration {
+    if profile.is_production() {
+        NATIVE_STARTUP_BUDGET
+    } else {
+        NATIVE_ISOLATED_STARTUP_BUDGET
+    }
+}
+
+fn isolated_host_stderr_log(
+    profile: &IsolatedDevProfile,
+) -> Result<std::fs::File, NativeShellError> {
+    let named = AppProfile::named(profile.named_profile()).map_err(|error| {
+        NativeShellError::HostConnect {
+            message: format!("isolated host log profile is invalid: {error}"),
+        }
+    })?;
+    let paths = resolve_app_paths(profile.host_config_base(), named, BuildKind::Debug).map_err(
+        |error| NativeShellError::HostConnect {
+            message: format!("isolated host log path cannot be resolved: {error}"),
+        },
+    )?;
+    std::fs::create_dir_all(&paths.logs).map_err(|error| NativeShellError::HostConnect {
+        message: format!(
+            "isolated host log directory cannot be created {}: {error}",
+            paths.logs.display()
+        ),
+    })?;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(paths.logs.join("host-stderr.log"))
+        .map_err(|error| NativeShellError::HostConnect {
+            message: format!("isolated host stderr log cannot be opened: {error}"),
+        })
 }
 
 /// Strip parent DevManager identity overrides so the sibling host resolves only
@@ -1121,17 +1281,7 @@ fn try_attach_existing_host(
         }
     };
     match NativeHostClientRuntime::new_with_runtime(profile, client, runtime.clone()) {
-        Ok(mut runtime_owner) => {
-            let bootstrap = runtime.block_on(async {
-                tokio::time::timeout(deadline.remaining(), runtime_owner.bootstrap_projection())
-                    .await
-            });
-            match bootstrap {
-                Ok(Ok(_)) => Ok(runtime_owner),
-                Ok(Err(error)) => Err(IpcError::Security(error.to_string())),
-                Err(_) => Err(IpcError::Timeout),
-            }
-        }
+        Ok(runtime_owner) => Ok(runtime_owner),
         Err(error) => {
             if let Ok(runtime) = Arc::try_unwrap(runtime) {
                 runtime.shutdown_timeout(Duration::from_millis(1));
@@ -1528,6 +1678,51 @@ pub struct NativeActionRecord {
     pub command: NativeHostCommand,
 }
 
+#[derive(Debug)]
+struct NativeActionDispatchFailure {
+    record: Option<NativeActionRecord>,
+    message: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PendingComposerSubmission {
+    key: ComposerDraftKey,
+    draft: ComposerDraftProjection,
+    image_ids: Vec<u64>,
+    open_provider_terminal: bool,
+}
+
+#[derive(Clone)]
+struct NativeComposerImage {
+    id: u64,
+    path: PathBuf,
+    prompt_reference: String,
+    label: String,
+    preview: Arc<RenderImage>,
+}
+
+struct PreparedNativeComposerImage {
+    staged: StagedImageAttachment,
+    label: String,
+    preview: Arc<RenderImage>,
+}
+
+impl NativeActionDispatchFailure {
+    fn before_capture(message: impl Into<String>) -> Self {
+        Self {
+            record: None,
+            message: message.into(),
+        }
+    }
+
+    fn after_capture(record: NativeActionRecord, message: impl Into<String>) -> Self {
+        Self {
+            record: Some(record),
+            message: message.into(),
+        }
+    }
+}
+
 impl NativeActionRecord {
     fn rebind_transport_epochs(&mut self, epochs: NativeHostRuntimeEpochs, navigation_epoch: u64) {
         self.connection_epoch = epochs.connection_epoch;
@@ -1556,6 +1751,12 @@ pub enum NativeHostCommand {
     },
     TaskRename {
         arguments: crate::client::action::TaskRenameArguments,
+        expected_task_revision: u64,
+        command_id: CommandId,
+        issued_at_ms: i64,
+    },
+    TaskArchive {
+        task_id: TaskId,
         expected_task_revision: u64,
         command_id: CommandId,
         issued_at_ms: i64,
@@ -1645,7 +1846,8 @@ fn native_command_id(command: &NativeHostCommand) -> Option<CommandId> {
         NativeHostCommand::Browser(_) => None,
         NativeHostCommand::TaskCreate { command_id, .. }
         | NativeHostCommand::TaskCreateV2 { command_id, .. }
-        | NativeHostCommand::TaskRename { command_id, .. } => Some(*command_id),
+        | NativeHostCommand::TaskRename { command_id, .. }
+        | NativeHostCommand::TaskArchive { command_id, .. } => Some(*command_id),
         NativeHostCommand::ServiceControl { command_id, .. } => Some(*command_id),
         NativeHostCommand::ProviderInput { command_id, .. } => Some(*command_id),
         NativeHostCommand::ProviderStart { command_id, .. } => Some(*command_id),
@@ -1682,6 +1884,50 @@ fn native_request_id(command: &NativeHostCommand) -> Option<RequestId> {
 
 fn is_agent_connection_query_command(command: &NativeHostCommand) -> bool {
     matches!(command, NativeHostCommand::AgentConnectionQuery { .. })
+}
+
+fn is_conversation_query_command(command: &NativeHostCommand) -> bool {
+    matches!(
+        command,
+        NativeHostCommand::TaskCockpitQuery {
+            query: TaskCockpitQuery::Conversation { .. },
+            ..
+        }
+    )
+}
+
+fn is_native_query_command(command: &NativeHostCommand) -> bool {
+    matches!(
+        command,
+        NativeHostCommand::TaskShowQuery { .. }
+            | NativeHostCommand::TaskListQuery { .. }
+            | NativeHostCommand::HostStatusQuery { .. }
+            | NativeHostCommand::AgentConnectionQuery { .. }
+            | NativeHostCommand::HostActionsQuery { .. }
+            | NativeHostCommand::TaskCockpitQuery { .. }
+            | NativeHostCommand::PromptLibraryQuery { .. }
+    )
+}
+
+fn is_global_native_query_command(command: &NativeHostCommand) -> bool {
+    matches!(
+        command,
+        NativeHostCommand::HostStatusQuery { .. }
+            | NativeHostCommand::AgentConnectionQuery { .. }
+            | NativeHostCommand::HostActionsQuery { .. }
+    )
+}
+
+fn is_native_query_request(request: &ActionRequest) -> bool {
+    matches!(
+        request,
+        ActionRequest::HostActions
+            | ActionRequest::HostStatus
+            | ActionRequest::TaskList
+            | ActionRequest::TaskShow { .. }
+            | ActionRequest::TaskCockpit { .. }
+            | ActionRequest::PromptLibrary { .. }
+    )
 }
 
 fn same_native_action_identity(left: &NativeActionRecord, right: &NativeActionRecord) -> bool {
@@ -1722,8 +1968,29 @@ struct AddProjectDraft {
 }
 
 struct NewTaskDraft {
+    project_id: ProjectId,
     title: TextField,
     error: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ProjectInboxItem {
+    Project {
+        project_id: ProjectId,
+        label: String,
+        expanded: bool,
+        task_count: usize,
+    },
+    Task {
+        project_id: ProjectId,
+        task_id: TaskId,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProjectAccessibilityAction {
+    Toggle(ProjectId),
+    StartAgent(ProjectId, ProviderKind),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1731,7 +1998,7 @@ enum PaletteItem {
     AddProject,
     ToggleSidebar,
     ToggleDock,
-    ToggleTerminal,
+    ToggleTaskCanvas,
     ResetLayout,
 }
 
@@ -1764,7 +2031,7 @@ impl PaletteItem {
         Self::AddProject,
         Self::ToggleSidebar,
         Self::ToggleDock,
-        Self::ToggleTerminal,
+        Self::ToggleTaskCanvas,
         Self::ResetLayout,
     ];
 
@@ -1785,7 +2052,7 @@ impl PaletteItem {
             Self::AddProject => "Add project",
             Self::ToggleSidebar => "Toggle configuration",
             Self::ToggleDock => "Toggle context dock",
-            Self::ToggleTerminal => "Toggle terminal",
+            Self::ToggleTaskCanvas => "Switch Conversation / Terminal",
             Self::ResetLayout => "Reset layout",
         }
     }
@@ -1795,7 +2062,7 @@ impl PaletteItem {
             Self::AddProject => "Choose a folder on this computer",
             Self::ToggleSidebar => "Ctrl+B",
             Self::ToggleDock => "Ctrl+Alt+B",
-            Self::ToggleTerminal => "Ctrl+J",
+            Self::ToggleTaskCanvas => "Ctrl+J",
             Self::ResetLayout => "Ctrl+Alt+0",
         }
     }
@@ -1937,6 +2204,7 @@ pub enum NativeHostProjectionKind {
     Replay,
     Live,
     Error,
+    TaskPreview,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -2004,6 +2272,7 @@ fn bump_resource_generation(
 pub struct NativeHostProjection {
     pub kind: NativeHostProjectionKind,
     pub client_model: Option<Arc<ClientModel>>,
+    pub task_preview: Option<Arc<TaskInboxPreview>>,
     pub error: Option<String>,
     pub epochs: Option<NativeHostRuntimeEpochs>,
     pub action_outcome: Option<NativeHostActionOutcome>,
@@ -2181,16 +2450,24 @@ impl NativeHostProjection {
         Self {
             kind,
             client_model: None,
+            task_preview: None,
             error: None,
             epochs: None,
             action_outcome: None,
         }
     }
 
-    pub fn model(kind: NativeHostProjectionKind, model: Arc<ClientModel>) -> Self {
+    /// Build a ClientModel-bearing projection. TaskPreview must use
+    /// [`Self::task_preview`] instead.
+    fn model(kind: NativeHostProjectionKind, model: Arc<ClientModel>) -> Self {
+        assert!(
+            kind != NativeHostProjectionKind::TaskPreview,
+            "TaskPreview projections must use NativeHostProjection::task_preview"
+        );
         Self {
             kind,
             client_model: Some(model),
+            task_preview: None,
             error: None,
             epochs: None,
             action_outcome: None,
@@ -2201,9 +2478,55 @@ impl NativeHostProjection {
         Self::model(NativeHostProjectionKind::Snapshot, model)
     }
 
+    pub fn task_preview(preview: Arc<TaskInboxPreview>) -> Self {
+        Self {
+            kind: NativeHostProjectionKind::TaskPreview,
+            client_model: None,
+            task_preview: Some(preview),
+            error: None,
+            epochs: None,
+            action_outcome: None,
+        }
+    }
+
     fn at_epochs(mut self, epochs: NativeHostRuntimeEpochs) -> Self {
         self.epochs = Some(epochs);
         self
+    }
+}
+
+enum ValidatedHostProjectionPayload {
+    None,
+    TaskPreview(Arc<TaskInboxPreview>),
+    ClientModel(Arc<ClientModel>),
+}
+
+fn validate_host_projection_payloads(
+    projection: &NativeHostProjection,
+) -> Result<ValidatedHostProjectionPayload, String> {
+    match projection.kind {
+        NativeHostProjectionKind::TaskPreview => match (
+            projection.task_preview.as_ref(),
+            projection.client_model.as_ref(),
+        ) {
+            (Some(preview), None) => Ok(ValidatedHostProjectionPayload::TaskPreview(Arc::clone(
+                preview,
+            ))),
+            _ => Err(bounded_host_error(
+                "TaskPreview projection requires task_preview without client_model",
+            )),
+        },
+        _ => {
+            if projection.task_preview.is_some() {
+                return Err(bounded_host_error(
+                    "non-TaskPreview projection must not carry task_preview",
+                ));
+            }
+            Ok(match projection.client_model.as_ref() {
+                Some(model) => ValidatedHostProjectionPayload::ClientModel(Arc::clone(model)),
+                None => ValidatedHostProjectionPayload::None,
+            })
+        }
     }
 }
 
@@ -2368,11 +2691,9 @@ impl NativeHostClientRuntime {
                 })?,
         );
         let mut runtime = Self::new_with_runtime(profile, client, runtime_guard)?;
-        tokio::time::timeout(deadline.remaining(), runtime.bootstrap_projection())
-            .await
-            .map_err(|_| NativeShellError::HostConnect {
-                message: "native host bootstrap deadline expired".to_string(),
-            })??;
+        // Snapshot/replay hydration is owned by the background worker so the
+        // shell window can open as soon as this one HostClient is connected.
+        let _ = &runtime;
         Ok(runtime)
     }
 
@@ -2404,7 +2725,7 @@ impl NativeHostClientRuntime {
         let client = client.map_err(|error| NativeShellError::HostConnect {
             message: error.to_string(),
         })?;
-        let mut runtime_owner = match Self::new_with_runtime(profile, client, runtime.clone()) {
+        let runtime_owner = match Self::new_with_runtime(profile, client, runtime.clone()) {
             Ok(runtime_owner) => runtime_owner,
             Err(error) => {
                 if let Ok(runtime) = Arc::try_unwrap(runtime) {
@@ -2413,17 +2734,7 @@ impl NativeHostClientRuntime {
                 return Err(error);
             }
         };
-        runtime
-            .block_on(async {
-                tokio::time::timeout(deadline.remaining(), runtime_owner.bootstrap_projection())
-                    .await
-            })
-            .map_err(|_| NativeShellError::HostConnect {
-                message: "native host bootstrap deadline expired".to_string(),
-            })?
-            .map_err(|error| NativeShellError::HostConnect {
-                message: error.to_string(),
-            })?;
+        let _ = runtime;
         Ok(runtime_owner)
     }
 
@@ -2456,7 +2767,7 @@ impl NativeHostClientRuntime {
                 });
             }
         };
-        let mut runtime_owner =
+        let runtime_owner =
             match Self::new_with_runtime_and_process(profile, client, runtime.clone(), process) {
                 Ok(runtime_owner) => runtime_owner,
                 Err((error, mut process)) => {
@@ -2464,25 +2775,7 @@ impl NativeHostClientRuntime {
                     return Err(error);
                 }
             };
-        let bootstrap = runtime
-            .block_on(async {
-                tokio::time::timeout(deadline.remaining(), runtime_owner.bootstrap_projection())
-                    .await
-            })
-            .map_err(|_| NativeShellError::HostConnect {
-                message: "native host bootstrap deadline expired".to_string(),
-            })
-            .and_then(|result| {
-                result.map_err(|error| NativeShellError::HostConnect {
-                    message: error.to_string(),
-                })
-            });
-        if let Err(error) = bootstrap {
-            if let Some(process) = runtime_owner.host_process.as_mut() {
-                process.dispose(deadline);
-            }
-            return Err(error);
-        }
+        let _ = runtime;
         Ok(runtime_owner)
     }
 
@@ -2631,11 +2924,19 @@ impl NativeHostClientRuntime {
     }
 
     pub(crate) fn is_connected(&self) -> bool {
-        self.client
-            .lock()
-            .ok()
-            .and_then(|guard| guard.as_ref().map(|client| client.is_connected()))
-            .unwrap_or(false)
+        let worker_running = self
+            .worker
+            .as_ref()
+            .is_some_and(|worker| !worker.handle.is_finished());
+        let cancellation = self.cancellation.load(Ordering::Acquire);
+        match self.client.lock() {
+            Ok(guard) => runtime_connection_visible(
+                guard.as_ref().map(|client| client.is_connected()),
+                worker_running,
+                cancellation,
+            ),
+            Err(_) => false,
+        }
     }
 
     pub(crate) fn endpoint(&self) -> &str {
@@ -2665,23 +2966,11 @@ impl NativeHostClientRuntime {
     }
 
     fn validate_attachment(&self, profile: &IsolatedDevProfile) -> Result<(), NativeShellError> {
-        if !self.binding.matches_profile(profile) {
-            return Err(NativeShellError::HostConnect {
-                message: "native host runtime profile binding does not match shell profile"
-                    .to_string(),
-            });
-        }
-        if !self.bootstrapped.load(Ordering::Acquire) {
-            return Err(NativeShellError::HostConnect {
-                message: "native host runtime has no bootstrapped client projection".to_string(),
-            });
-        }
-        if !self.is_connected() {
-            return Err(NativeShellError::HostConnect {
-                message: "native host runtime is disconnected".to_string(),
-            });
-        }
-        Ok(())
+        validate_connected_host_for_shell_launch(
+            self.binding.matches_profile(profile),
+            self.is_connected(),
+            self.bootstrapped.load(Ordering::Acquire),
+        )
     }
 
     pub(crate) fn pending_count(&self) -> usize {
@@ -2895,7 +3184,7 @@ impl NativeHostClientRuntime {
 
     /// Queue one action without performing transport work on the UI thread.
     pub(crate) fn enqueue(&mut self, action: NativeActionRecord) -> NativeHostActionResult {
-        if !self.is_connected() {
+        if !self.action_admission_allows() {
             return NativeHostActionResult::Disconnected;
         }
         if self.pending.len() >= MAX_PENDING_HOST_ACTIONS
@@ -2915,6 +3204,18 @@ impl NativeHostClientRuntime {
             let _ = self.pending.pop_back();
         }
         result
+    }
+
+    /// Exact admission gate consulted by [`Self::enqueue`] before queueing.
+    fn action_admission_allows(&self) -> bool {
+        Self::action_admission_allows_for(
+            self.is_connected(),
+            self.bootstrapped.load(Ordering::Acquire),
+        )
+    }
+
+    fn action_admission_allows_for(connected: bool, bootstrapped: bool) -> bool {
+        admits_host_actions(connected, bootstrapped)
     }
 
     fn pending_front(&self) -> Option<&NativeActionRecord> {
@@ -2961,6 +3262,7 @@ impl NativeHostClientRuntime {
             projections.push(NativeHostProjection {
                 kind: NativeHostProjectionKind::Error,
                 client_model: None,
+                task_preview: None,
                 error: Some(
                     "native host worker action outcome retained under queue pressure".to_string(),
                 ),
@@ -2971,81 +3273,21 @@ impl NativeHostClientRuntime {
         projections
     }
 
-    /// Perform the initial bounded five-section snapshot/replay handoff owned
-    /// by the one client subscription. GPUI receives an immutable model; it
-    /// never observes raw snapshot pages or a task-only transport projection.
+    /// Perform the initial Tasks preview plus bounded five-section snapshot/replay
+    /// handoff owned by the one client subscription. GPUI may receive a tasks-only
+    /// preview first; the canonical ClientModel replaces it only after invariants pass.
     pub async fn bootstrap_projection(
         &mut self,
     ) -> Result<Vec<NativeHostProjectionKind>, NativeShellError> {
-        // Take ownership before the await. Holding either mutex across host
-        // I/O would deadlock lifecycle paths and previously passed the
-        // `MutexGuard<Option<HostClient>>` itself to `synchronize`.
-        let mut client_owned = self
-            .client
-            .lock()
-            .map_err(|_| NativeShellError::HostConnect {
-                message: "native host client lock poisoned".to_string(),
-            })?
-            .take()
-            .ok_or_else(|| NativeShellError::HostConnect {
-                message: "native host client unavailable during bootstrap".to_string(),
-            })?;
-        let mut subscription_owned = {
-            let mut guard =
-                self.subscription
-                    .lock()
-                    .map_err(|_| NativeShellError::HostConnect {
-                        message: "native host subscription lock poisoned".to_string(),
-                    })?;
-            std::mem::replace(&mut *guard, ClientSubscription::new())
-        };
-        let synchronized = subscription_owned.synchronize(&mut client_owned).await;
-        let model = synchronized
-            .map_err(|error| NativeShellError::HostConnect {
-                message: error.to_string(),
-            })
-            .and_then(|()| {
-                subscription_owned
-                    .model()
-                    .cloned()
-                    .map(Arc::new)
-                    .ok_or_else(|| NativeShellError::HostConnect {
-                        message: "native host subscription produced no client model".to_string(),
-                    })
-            });
-        let restore_subscription = self.subscription.lock().map(|mut guard| {
-            *guard = subscription_owned;
-        });
-        let restore_client = self.client.lock().map(|mut guard| {
-            *guard = Some(client_owned);
-        });
-        restore_subscription.map_err(|_| NativeShellError::HostConnect {
-            message: "native host subscription lock poisoned during bootstrap restore".to_string(),
-        })?;
-        restore_client.map_err(|_| NativeShellError::HostConnect {
-            message: "native host client lock poisoned during bootstrap restore".to_string(),
-        })?;
-        let model = model?;
-        if let Ok(mut current) = self.client_model.lock() {
-            *current = Some(Arc::clone(&model));
-        }
-        let epochs = current_runtime_epochs(&self.epochs);
-        publish_projection(
+        deferred_bootstrap_projection(
+            &self.client,
+            &self.subscription,
+            &self.client_model,
+            &self.bootstrapped,
+            &self.epochs,
             &self.ready_projections,
-            NativeHostProjection::client_model(Arc::clone(&model)).at_epochs(epochs),
-        );
-        for _ in 0..MAX_HOST_PROJECTIONS.saturating_sub(1) {
-            publish_projection(
-                &self.ready_projections,
-                NativeHostProjection::kind(NativeHostProjectionKind::Replay).at_epochs(epochs),
-            );
-        }
-        self.bootstrapped.store(true, Ordering::Release);
-        Ok([
-            NativeHostProjectionKind::Snapshot,
-            NativeHostProjectionKind::Replay,
-        ]
-        .to_vec())
+        )
+        .await
     }
 
     /// Execute a caller-created, revision-fenced command on this same client.
@@ -3244,14 +3486,28 @@ async fn connect_with_startup_retry(
     deadline: NativeShutdownDeadline,
 ) -> Result<HostClient, IpcError> {
     let config = profile.host_client_config();
+    retry_until_startup_deadline(deadline, Duration::from_millis(25), || {
+        HostClient::connect(config.clone())
+    })
+    .await
+}
+
+async fn retry_until_startup_deadline<T, Attempt, AttemptFuture>(
+    deadline: NativeShutdownDeadline,
+    retry_delay: Duration,
+    mut attempt: Attempt,
+) -> Result<T, IpcError>
+where
+    Attempt: FnMut() -> AttemptFuture,
+    AttemptFuture: std::future::Future<Output = Result<T, IpcError>>,
+{
     let mut last_error = None;
-    for _ in 0..40 {
+    loop {
         if deadline.expired() {
             return Err(last_error.unwrap_or(IpcError::Unavailable));
         }
-        match tokio::time::timeout(deadline.remaining(), HostClient::connect(config.clone())).await
-        {
-            Ok(Ok(client)) => return Ok(client),
+        match tokio::time::timeout(deadline.remaining(), attempt()).await {
+            Ok(Ok(value)) => return Ok(value),
             Ok(Err(error)) => {
                 last_error = Some(error);
             }
@@ -3262,7 +3518,7 @@ async fn connect_with_startup_retry(
         }
         match tokio::time::timeout(
             deadline.remaining(),
-            tokio::time::sleep(Duration::from_millis(25)),
+            tokio::time::sleep(retry_delay.min(deadline.remaining())),
         )
         .await
         {
@@ -3270,7 +3526,117 @@ async fn connect_with_startup_retry(
             Err(_) => return Err(last_error.unwrap_or(IpcError::Unavailable)),
         }
     }
-    Err(last_error.unwrap_or(IpcError::Unavailable))
+}
+
+async fn deferred_bootstrap_projection(
+    client: &Arc<Mutex<Option<HostClient>>>,
+    subscription: &Arc<Mutex<ClientSubscription>>,
+    client_model: &Arc<Mutex<Option<Arc<ClientModel>>>>,
+    bootstrapped: &AtomicBool,
+    epochs: &Arc<Mutex<NativeHostRuntimeEpochs>>,
+    projections: &Arc<Mutex<VecDeque<NativeHostProjection>>>,
+) -> Result<Vec<NativeHostProjectionKind>, NativeShellError> {
+    // Take ownership before the await. Holding either mutex across host
+    // I/O would deadlock lifecycle paths and previously passed the
+    // `MutexGuard<Option<HostClient>>` itself to `synchronize`.
+    let mut client_owned = client
+        .lock()
+        .map_err(|_| NativeShellError::HostConnect {
+            message: "native host client lock poisoned".to_string(),
+        })?
+        .take()
+        .ok_or_else(|| NativeShellError::HostConnect {
+            message: "native host client unavailable during bootstrap".to_string(),
+        })?;
+    let mut subscription_owned = {
+        let mut guard = subscription
+            .lock()
+            .map_err(|_| NativeShellError::HostConnect {
+                message: "native host subscription lock poisoned".to_string(),
+            })?;
+        std::mem::replace(&mut *guard, ClientSubscription::new())
+    };
+
+    let mut kinds = Vec::new();
+    let preview = subscription_owned.preview_tasks(&mut client_owned).await;
+    let preview_error = match preview {
+        Ok(preview_model) => {
+            let epochs_now = current_runtime_epochs(epochs);
+            publish_projection(
+                projections,
+                NativeHostProjection::task_preview(Arc::new(preview_model)).at_epochs(epochs_now),
+            );
+            kinds.push(NativeHostProjectionKind::TaskPreview);
+            None
+        }
+        Err(error) => {
+            let error = error.to_string();
+            // Preview is best-effort for inbox usefulness; canonical sync still runs.
+            publish_projection(
+                projections,
+                NativeHostProjection {
+                    kind: NativeHostProjectionKind::Error,
+                    client_model: None,
+                    task_preview: None,
+                    error: Some(bounded_host_error(format!(
+                        "task preview unavailable: {error}"
+                    ))),
+                    epochs: Some(current_runtime_epochs(epochs)),
+                    action_outcome: None,
+                },
+            );
+            Some(error)
+        }
+    };
+
+    let synchronized = subscription_owned.synchronize(&mut client_owned).await;
+    let model = synchronized
+        .map_err(|error| NativeShellError::HostConnect {
+            message: preview_error.as_ref().map_or_else(
+                || error.to_string(),
+                |preview| format!("task preview failed: {preview}; canonical sync failed: {error}"),
+            ),
+        })
+        .and_then(|()| {
+            subscription_owned
+                .model()
+                .cloned()
+                .map(Arc::new)
+                .ok_or_else(|| NativeShellError::HostConnect {
+                    message: "native host subscription produced no client model".to_string(),
+                })
+        });
+    let restore_subscription = subscription.lock().map(|mut guard| {
+        *guard = subscription_owned;
+    });
+    let restore_client = client.lock().map(|mut guard| {
+        *guard = Some(client_owned);
+    });
+    restore_subscription.map_err(|_| NativeShellError::HostConnect {
+        message: "native host subscription lock poisoned during bootstrap restore".to_string(),
+    })?;
+    restore_client.map_err(|_| NativeShellError::HostConnect {
+        message: "native host client lock poisoned during bootstrap restore".to_string(),
+    })?;
+    let model = model?;
+    if let Ok(mut current) = client_model.lock() {
+        *current = Some(Arc::clone(&model));
+    }
+    let epochs_now = current_runtime_epochs(epochs);
+    publish_projection(
+        projections,
+        NativeHostProjection::client_model(Arc::clone(&model)).at_epochs(epochs_now),
+    );
+    kinds.push(NativeHostProjectionKind::Snapshot);
+    for _ in 0..MAX_HOST_PROJECTIONS.saturating_sub(kinds.len()) {
+        publish_projection(
+            projections,
+            NativeHostProjection::kind(NativeHostProjectionKind::Replay).at_epochs(epochs_now),
+        );
+        kinds.push(NativeHostProjectionKind::Replay);
+    }
+    bootstrapped.store(true, Ordering::Release);
+    Ok(kinds)
 }
 
 fn native_host_worker_loop(
@@ -3293,7 +3659,7 @@ fn native_host_worker_loop(
         return;
     };
     loop {
-        if !bootstrapped.load(Ordering::Acquire) {
+        if worker_should_run_deferred_bootstrap(bootstrapped.load(Ordering::Acquire)) {
             if cancellation.load(Ordering::Acquire) {
                 drain_cancelled_worker_commands(
                     &command_rx,
@@ -3306,7 +3672,45 @@ fn native_host_worker_loop(
                 );
                 break;
             }
-            std::thread::sleep(CONTROLLER_TICK_INTERVAL);
+            let bootstrap = runtime.block_on(deferred_bootstrap_projection(
+                &client,
+                &subscription,
+                &client_model,
+                &bootstrapped,
+                &epochs,
+                &projections,
+            ));
+            if let Err(error) = bootstrap {
+                eprintln!("devmanager native host projection bootstrap failed: {error}");
+                if let Err(recovery_error) = recover_deferred_bootstrap_projection(
+                    &client,
+                    &subscription,
+                    &client_model,
+                    &bootstrapped,
+                    runtime.as_ref(),
+                    &cancellation,
+                    &epochs,
+                    &projections,
+                ) {
+                    eprintln!(
+                        "devmanager native host projection recovery failed: {recovery_error}"
+                    );
+                    publish_projection(
+                        &projections,
+                        NativeHostProjection {
+                            kind: NativeHostProjectionKind::Error,
+                            client_model: None,
+                            task_preview: None,
+                            error: Some(bounded_host_error(format!(
+                                "{error}; reconnect failed: {recovery_error}"
+                            ))),
+                            epochs: Some(current_runtime_epochs(&epochs)),
+                            action_outcome: None,
+                        },
+                    );
+                    std::thread::sleep(BOOTSTRAP_RETRY_INTERVAL);
+                }
+            }
             continue;
         }
         match command_rx.recv_timeout(CONTROLLER_TICK_INTERVAL) {
@@ -3350,6 +3754,7 @@ fn native_host_worker_loop(
                         NativeHostProjection {
                             kind: NativeHostProjectionKind::Error,
                             client_model: None,
+                            task_preview: None,
                             error: Some(message.clone()),
                             epochs: None,
                             action_outcome: Some(NativeHostActionOutcome::Failed {
@@ -3361,12 +3766,13 @@ fn native_host_worker_loop(
                     command => {
                         let result = client.lock().ok().and_then(|mut guard| {
                             let client = guard.as_mut()?;
-                            Some(runtime.block_on(execute_native_command_cancellable(
+                            let result = runtime.block_on(execute_native_command_cancellable(
                                 client,
                                 command,
                                 &updater,
                                 &cancellation,
-                            )))
+                            ));
+                            Some(result)
                         });
                         match result {
                             Some(Ok(NativeHostExecutionResult::Command(receipt))) => {
@@ -3381,6 +3787,7 @@ fn native_host_worker_loop(
                                 NativeHostProjection {
                                     kind,
                                     client_model: None,
+                                    task_preview: None,
                                     error: None,
                                     epochs: None,
                                     action_outcome: Some(NativeHostActionOutcome::Accepted {
@@ -3393,6 +3800,7 @@ fn native_host_worker_loop(
                                 NativeHostProjection {
                                     kind: NativeHostProjectionKind::Live,
                                     client_model: None,
+                                    task_preview: None,
                                     error: None,
                                     epochs: None,
                                     action_outcome: Some(NativeHostActionOutcome::Queried {
@@ -3406,6 +3814,7 @@ fn native_host_worker_loop(
                                 NativeHostProjection {
                                     kind: NativeHostProjectionKind::Error,
                                     client_model: None,
+                                    task_preview: None,
                                     error: Some(error.clone()),
                                     epochs: None,
                                     action_outcome: Some(NativeHostActionOutcome::Failed {
@@ -3419,6 +3828,7 @@ fn native_host_worker_loop(
                                 NativeHostProjection {
                                     kind: NativeHostProjectionKind::Error,
                                     client_model: None,
+                                    task_preview: None,
                                     error: Some(message.clone()),
                                     epochs: None,
                                     action_outcome: Some(NativeHostActionOutcome::Uncertain {
@@ -3432,6 +3842,7 @@ fn native_host_worker_loop(
                                 NativeHostProjection {
                                     kind: NativeHostProjectionKind::Error,
                                     client_model: None,
+                                    task_preview: None,
                                     error: Some(message.clone()),
                                     epochs: None,
                                     action_outcome: Some(NativeHostActionOutcome::Uncertain {
@@ -3504,6 +3915,37 @@ fn native_host_worker_loop(
     }
 }
 
+fn recover_deferred_bootstrap_projection(
+    client: &Arc<Mutex<Option<HostClient>>>,
+    subscription: &Arc<Mutex<ClientSubscription>>,
+    client_model: &Arc<Mutex<Option<Arc<ClientModel>>>>,
+    bootstrapped: &AtomicBool,
+    runtime: &tokio::runtime::Runtime,
+    cancellation: &Arc<AtomicBool>,
+    epochs: &Arc<Mutex<NativeHostRuntimeEpochs>>,
+    projections: &Arc<Mutex<VecDeque<NativeHostProjection>>>,
+) -> Result<(), String> {
+    let (model, reconnected) =
+        resynchronize_subscription(client, subscription, runtime, cancellation)?;
+    if reconnected {
+        bump_connection_epoch(epochs);
+    }
+    let current_epochs = bump_resource_generation(epochs);
+    if let Ok(mut current) = client_model.lock() {
+        *current = Some(Arc::clone(&model));
+    }
+    publish_projection(
+        projections,
+        NativeHostProjection::client_model(model).at_epochs(current_epochs),
+    );
+    publish_projection(
+        projections,
+        NativeHostProjection::kind(NativeHostProjectionKind::Replay).at_epochs(current_epochs),
+    );
+    bootstrapped.store(true, Ordering::Release);
+    Ok(())
+}
+
 fn publish_cancelled_action_outcome(
     action: NativeActionRecord,
     projections: &Arc<Mutex<VecDeque<NativeHostProjection>>>,
@@ -3520,6 +3962,7 @@ fn publish_cancelled_action_outcome(
         NativeHostProjection {
             kind: NativeHostProjectionKind::Error,
             client_model: None,
+            task_preview: None,
             error: Some(message.clone()),
             epochs: Some(current_runtime_epochs(epochs)),
             action_outcome: Some(NativeHostActionOutcome::Uncertain {
@@ -3597,6 +4040,10 @@ fn publish_worker_projection(
     }
 }
 
+fn subscription_pump_requires_resync(client_connected: bool) -> bool {
+    !client_connected
+}
+
 fn pump_subscription_once(
     client: &Arc<Mutex<Option<HostClient>>>,
     subscription: &Arc<Mutex<ClientSubscription>>,
@@ -3610,6 +4057,48 @@ fn pump_subscription_once(
     if cancellation.load(Ordering::Acquire) {
         return;
     }
+    let client_connected = client
+        .lock()
+        .ok()
+        .and_then(|guard| guard.as_ref().map(HostClient::is_connected));
+    if client_connected.is_some_and(subscription_pump_requires_resync) {
+        match resynchronize_subscription(client, subscription, runtime, cancellation) {
+            Ok((model, reconnected)) => {
+                if reconnected {
+                    bump_connection_epoch(epochs);
+                }
+                let current_epochs = bump_resource_generation(epochs);
+                if let Ok(mut current) = client_model.lock() {
+                    *current = Some(Arc::clone(&model));
+                }
+                publish_projection(
+                    projections,
+                    NativeHostProjection::client_model(model).at_epochs(current_epochs),
+                );
+                publish_projection(
+                    projections,
+                    NativeHostProjection::kind(NativeHostProjectionKind::Replay)
+                        .at_epochs(current_epochs),
+                );
+            }
+            Err(error) if error != "native host subscription resync cancelled" => {
+                publish_projection(
+                    projections,
+                    NativeHostProjection {
+                        kind: NativeHostProjectionKind::Error,
+                        client_model: None,
+                        task_preview: None,
+                        error: Some(bounded_host_error(error)),
+                        epochs: None,
+                        action_outcome: None,
+                    }
+                    .at_epochs(current_runtime_epochs(epochs)),
+                );
+            }
+            Err(_) => {}
+        }
+        return;
+    }
     let update = {
         let Ok(client_guard) = client.lock() else {
             publish_projection(
@@ -3617,6 +4106,7 @@ fn pump_subscription_once(
                 NativeHostProjection {
                     kind: NativeHostProjectionKind::Error,
                     client_model: None,
+                    task_preview: None,
                     error: Some("native host client lock poisoned".to_string()),
                     epochs: None,
                     action_outcome: None,
@@ -3634,6 +4124,7 @@ fn pump_subscription_once(
                 NativeHostProjection {
                     kind: NativeHostProjectionKind::Error,
                     client_model: None,
+                    task_preview: None,
                     error: Some("native host subscription lock poisoned".to_string()),
                     epochs: None,
                     action_outcome: None,
@@ -3661,6 +4152,7 @@ fn pump_subscription_once(
                     | crate::client::SubscriptionError::ForeignSubscription(_)
                     | crate::client::SubscriptionError::InvalidResync
                     | crate::client::SubscriptionError::Transport(_)
+                    | crate::client::SubscriptionError::TransportAt { .. }
                     | crate::client::SubscriptionError::Query(_)
                     | crate::client::SubscriptionError::IncompleteSnapshot
                     | crate::client::SubscriptionError::MissingCapabilities
@@ -3670,13 +4162,7 @@ fn pump_subscription_once(
                     .ok()
                     .and_then(|guard| guard.as_ref().map(|client| client.is_connected()))
                     .unwrap_or(false);
-                match resynchronize_subscription(
-                    client,
-                    subscription,
-                    runtime,
-                    cancellation,
-                    NativeShutdownDeadline::from_now(NATIVE_STARTUP_BUDGET),
-                ) {
+                match resynchronize_subscription(client, subscription, runtime, cancellation) {
                     Ok((model, reconnected)) => {
                         if reconnected || !was_connected {
                             bump_connection_epoch(epochs);
@@ -3703,6 +4189,7 @@ fn pump_subscription_once(
                             NativeHostProjection {
                                 kind: NativeHostProjectionKind::Error,
                                 client_model: None,
+                                task_preview: None,
                                 error: Some(bounded_host_error(resync_error)),
                                 epochs: None,
                                 action_outcome: None,
@@ -3741,13 +4228,7 @@ fn pump_subscription_once(
                 .ok()
                 .and_then(|guard| guard.as_ref().map(|client| client.is_connected()))
                 .unwrap_or(false);
-            let model = resynchronize_subscription(
-                client,
-                subscription,
-                runtime,
-                cancellation,
-                NativeShutdownDeadline::from_now(NATIVE_STARTUP_BUDGET),
-            );
+            let model = resynchronize_subscription(client, subscription, runtime, cancellation);
             match model {
                 Ok((model, reconnected)) => {
                     if reconnected || !was_connected {
@@ -3773,6 +4254,7 @@ fn pump_subscription_once(
                         NativeHostProjection {
                             kind: NativeHostProjectionKind::Error,
                             client_model: None,
+                            task_preview: None,
                             error: Some(bounded_host_error(error)),
                             epochs: None,
                             action_outcome: None,
@@ -3802,7 +4284,6 @@ fn resynchronize_subscription(
     subscription: &Arc<Mutex<ClientSubscription>>,
     runtime: &tokio::runtime::Runtime,
     cancellation: &Arc<AtomicBool>,
-    deadline: NativeShutdownDeadline,
 ) -> Result<(Arc<ClientModel>, bool), String> {
     // Take ownership so host awaits do not run under mutex guards.
     let mut client_owned = client
@@ -3818,34 +4299,37 @@ fn resynchronize_subscription(
     };
     let was_connected = client_owned.is_connected();
     let result = runtime.block_on(async {
-        tokio::time::timeout(deadline.remaining(), async {
-            tokio::select! {
-                result = async {
-                    if client_owned.is_connected() {
-                        subscription_owned
-                            .release(&mut client_owned)
-                            .await
-                            .map_err(|error| error.to_string())?;
-                    }
-                    if !client_owned.is_connected() {
-                        client_owned
-                            .reconnect()
-                            .await
-                            .map_err(|error| error.to_string())?;
-                    }
-                    subscription_owned = ClientSubscription::new();
-                    subscription_owned
-                        .synchronize(&mut client_owned)
-                        .await
-                        .map_err(|error| error.to_string())
-                } => result,
-                _ = wait_for_cancellation(Arc::clone(cancellation)) => {
-                    Err("native host subscription resync cancelled".to_string())
-                }
-            }
-        })
-        .await
-        .map_err(|_| "native host subscription resync deadline expired".to_string())?
+        // Every admitted pipe exchange owns its completion. Cancelling a Hello
+        // after the host rotates the one-shot reconnect grant can strand the
+        // client with the consumed predecessor forever. Observe shutdown only
+        // between bounded wire operations; each operation already owns its
+        // protocol deadline and must settle before this state is published.
+        if cancellation.load(Ordering::Acquire) {
+            return Err("native host subscription resync cancelled".to_string());
+        }
+        if client_owned.is_connected() {
+            subscription_owned
+                .release(&mut client_owned)
+                .await
+                .map_err(|error| format!("subscription release failed: {error}"))?;
+        }
+        if cancellation.load(Ordering::Acquire) {
+            return Err("native host subscription resync cancelled".to_string());
+        }
+        if !client_owned.is_connected() {
+            client_owned
+                .reconnect()
+                .await
+                .map_err(|error| format!("host reconnect failed: {error}"))?;
+        }
+        if cancellation.load(Ordering::Acquire) {
+            return Err("native host subscription resync cancelled".to_string());
+        }
+        subscription_owned = ClientSubscription::new();
+        subscription_owned
+            .synchronize(&mut client_owned)
+            .await
+            .map_err(|error| format!("subscription synchronize failed: {error}"))
     });
     let model = match result {
         Ok(()) => subscription_owned
@@ -3969,6 +4453,24 @@ async fn execute_native_command(
                 arguments,
             )
             .map_err(|_| IpcError::Unavailable)?;
+            client
+                .execute_command(envelope)
+                .await
+                .map(NativeHostExecutionResult::Command)
+        }
+        NativeHostCommand::TaskArchive {
+            task_id,
+            expected_task_revision,
+            command_id,
+            issued_at_ms,
+        } => {
+            let envelope = crate::client::action::task_archive_command(
+                command_id,
+                client.client_id(),
+                issued_at_ms,
+                expected_task_revision,
+                task_id,
+            );
             client
                 .execute_command(envelope)
                 .await
@@ -4537,6 +5039,19 @@ impl NativeInteraction {
         self.accepts_action_record(&adjusted)
     }
 
+    /// Global read-only queries are scoped to the live transport, not to the
+    /// currently focused task. Startup can advance client/navigation focus
+    /// while host status, agent presence, or the shared action catalog is in
+    /// flight; those results remain current as long as the exact connection
+    /// and runtime generations have not changed.
+    pub fn accepts_global_query_outcome_record(&self, record: &NativeActionRecord) -> bool {
+        record.task_id.is_none()
+            && record.client_epoch <= self.client_epoch
+            && record.connection_epoch == self.connection_epoch
+            && record.resource_generation == self.resource_generation
+            && record.runtime_generation == self.runtime_generation
+    }
+
     /// Provide the immutable transport projection used to capture mutation
     /// fences. A task-only attachment deliberately clears this value so a
     /// rename cannot be synthesized with revision zero.
@@ -4963,6 +5478,7 @@ impl NativeInteraction {
         let request_task = match &request {
             ActionRequest::TaskShow { task_id } => Some(*task_id),
             ActionRequest::TaskRename(arguments) => Some(arguments.task_id),
+            ActionRequest::TaskArchive { task_id } => Some(*task_id),
             ActionRequest::ProviderInput(arguments) => Some(arguments.arguments.task_id),
             ActionRequest::StartProviderSession(arguments) => Some(arguments.task_id),
             ActionRequest::TaskCockpit { task_id, query } => match query {
@@ -4988,14 +5504,25 @@ impl NativeInteraction {
                 }
                 (Some(task.task.revision), Some(task.task.action_epoch))
             }
+            ActionRequest::TaskArchive { task_id } => {
+                let model = self.client_model.as_ref()?;
+                let task = model.tasks().get(task_id)?;
+                if task.task.revision == 0 {
+                    return None;
+                }
+                (Some(task.task.revision), Some(task.task.action_epoch))
+            }
             ActionRequest::ProviderInput(arguments) => {
                 let model = self.client_model.as_ref()?;
                 let task = model.tasks().get(&arguments.arguments.task_id)?;
+                let agent_session_id = task.primary_agent_id?;
+                let agent = task.agents.get(&agent_session_id)?;
+                // The initial durable task epoch is zero; equality with the
+                // projection, not nonzero-ness, is the provider action fence.
                 if task.task.revision == 0
                     || arguments.arguments.runtime_generation == 0
-                    || arguments.arguments.action_epoch == 0
                     || arguments.arguments.action_epoch != task.task.action_epoch
-                    || arguments.arguments.runtime_generation != self.runtime_generation
+                    || arguments.arguments.runtime_generation != agent.runtime_generation
                 {
                     return None;
                 }
@@ -5004,10 +5531,7 @@ impl NativeInteraction {
             ActionRequest::StartProviderSession(arguments) => {
                 let model = self.client_model.as_ref()?;
                 let task = model.tasks().get(&arguments.task_id)?;
-                if task.task.revision == 0
-                    || arguments.action_epoch == 0
-                    || arguments.action_epoch != task.task.action_epoch
-                {
+                if task.task.revision == 0 || arguments.action_epoch != task.task.action_epoch {
                     return None;
                 }
                 (Some(task.task.revision), Some(task.task.action_epoch))
@@ -5043,7 +5567,10 @@ impl NativeInteraction {
             let (focus_epoch, request_generation) = self.begin_handler(self.selected_task());
             (focus_epoch, request_generation, self.action_epoch)
         };
-        let command_id = CommandId::new();
+        let command_id = match &request {
+            ActionRequest::ProviderInput(arguments) => arguments.command_id,
+            _ => CommandId::new(),
+        };
         let request_id = RequestId::new();
         let issued_at_ms = unix_time_ms();
         let command = match &request {
@@ -5061,6 +5588,13 @@ impl NativeInteraction {
                 arguments: arguments.clone(),
                 expected_task_revision: expected_task_revision
                     .expect("rename revision was validated above"),
+                command_id,
+                issued_at_ms,
+            },
+            ActionRequest::TaskArchive { task_id } => NativeHostCommand::TaskArchive {
+                task_id: *task_id,
+                expected_task_revision: expected_task_revision
+                    .expect("archive revision was validated above"),
                 command_id,
                 issued_at_ms,
             },
@@ -5164,6 +5698,16 @@ impl AccessibilityNode {
         self
     }
 
+    fn with_value(mut self, value: impl Into<String>) -> Self {
+        self.metadata.set_value(Some(value.into()));
+        self
+    }
+
+    fn with_focus(mut self, focused: bool) -> Self {
+        self.metadata.set_focused(focused);
+        self
+    }
+
     fn with_children(mut self, children: Vec<AccessibilityNode>) -> Self {
         self.children = children;
         self
@@ -5212,11 +5756,18 @@ pub struct NativeAccessibilityNode {
     pub tab_stop: bool,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct ComposerAccessibilityState {
+    value: String,
+    focused: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AccessibilityTree {
     root: AccessibilityNode,
     rendered_task_count: usize,
     task_node_ids: Vec<(accesskit::NodeId, TaskId)>,
+    project_node_actions: Vec<(accesskit::NodeId, ProjectAccessibilityAction)>,
 }
 
 impl AccessibilityTree {
@@ -5240,26 +5791,146 @@ impl AccessibilityTree {
         header: &NativeHeaderAttachment,
         snapshot: Option<&AgentConnectionSnapshot>,
     ) -> Self {
+        Self::for_task_list_with_projects(task_list, selected_task, header, snapshot, &[])
+    }
+
+    fn for_task_list_with_projects(
+        task_list: &TaskList,
+        selected_task: Option<TaskId>,
+        header: &NativeHeaderAttachment,
+        snapshot: Option<&AgentConnectionSnapshot>,
+        project_items: &[ProjectInboxItem],
+    ) -> Self {
+        let composer = selected_task.map(|_| ComposerAccessibilityState::default());
+        Self::for_task_list_with_projects_and_composer(
+            task_list,
+            selected_task,
+            header,
+            snapshot,
+            project_items,
+            composer.as_ref(),
+        )
+    }
+
+    fn for_task_list_with_projects_and_composer(
+        task_list: &TaskList,
+        selected_task: Option<TaskId>,
+        header: &NativeHeaderAttachment,
+        snapshot: Option<&AgentConnectionSnapshot>,
+        project_items: &[ProjectInboxItem],
+        composer: Option<&ComposerAccessibilityState>,
+    ) -> Self {
         let rendered_task_ids = task_list.rendered_task_ids();
-        let rows = task_list
-            .rendered_task_ids()
+        let rendered_task_set = rendered_task_ids.iter().copied().collect::<HashSet<_>>();
+        let available_agents = snapshot.map(inbox_agent_actions).unwrap_or_default();
+        let claude_available = available_agents
             .iter()
-            .map(|task_id| {
-                let mut row = AccessibilityNode::new(
-                    AccessibleRole::Button,
-                    format!("Task {task_id}"),
-                    "Select this task and open its native task cockpit.",
-                )
-                .gpui(format!("native-task-row-{}", task_id), true, true);
-                row.metadata.set_focused(selected_task == Some(*task_id));
-                row
-            })
-            .collect::<Vec<_>>();
-        let inbox_status = if rows.is_empty() {
+            .any(|action| action.provider == ProviderKind::ClaudeCode);
+        let codex_available = available_agents
+            .iter()
+            .any(|action| action.provider == ProviderKind::Codex);
+        let mut task_element_ids = BTreeMap::new();
+        let mut project_action_elements = BTreeMap::new();
+        let mut rows = Vec::new();
+        let push_task_row = |rows: &mut Vec<AccessibilityNode>,
+                             task_element_ids: &mut BTreeMap<String, TaskId>,
+                             task_id: TaskId| {
+            let element_id = format!("native-task-row-{task_id}");
+            let mut row = AccessibilityNode::new(
+                AccessibleRole::Button,
+                format!("Task {task_id}"),
+                "Select this task and open its native task cockpit.",
+            )
+            .gpui(element_id.clone(), true, true);
+            row.metadata.set_focused(selected_task == Some(task_id));
+            task_element_ids.insert(element_id, task_id);
+            rows.push(row);
+        };
+        if project_items.is_empty() {
+            for &task_id in rendered_task_ids {
+                push_task_row(&mut rows, &mut task_element_ids, task_id);
+            }
+        } else {
+            for item in project_items {
+                match item {
+                    ProjectInboxItem::Project {
+                        project_id,
+                        label,
+                        expanded,
+                        task_count,
+                    } => {
+                        let state = if *expanded { "expanded" } else { "collapsed" };
+                        let task_word = if *task_count == 1 { "task" } else { "tasks" };
+                        let element_id = format!("native-project-row-{project_id}");
+                        rows.push(
+                            AccessibilityNode::new(
+                                AccessibleRole::Button,
+                                format!("Project {label}, {task_count} {task_word}, {state}"),
+                                "Expand or collapse this project's tasks.",
+                            )
+                            .gpui(element_id.clone(), true, true),
+                        );
+                        project_action_elements
+                            .insert(element_id, ProjectAccessibilityAction::Toggle(*project_id));
+                        if claude_available {
+                            let element_id = format!("native-project-claude-{project_id}");
+                            rows.push(
+                                AccessibilityNode::new(
+                                    AccessibleRole::Button,
+                                    format!("Start Claude task in {label}"),
+                                    "Create a new task in this project and connect Claude Code.",
+                                )
+                                .gpui(
+                                    element_id.clone(),
+                                    true,
+                                    true,
+                                ),
+                            );
+                            project_action_elements.insert(
+                                element_id,
+                                ProjectAccessibilityAction::StartAgent(
+                                    *project_id,
+                                    ProviderKind::ClaudeCode,
+                                ),
+                            );
+                        }
+                        if codex_available {
+                            let element_id = format!("native-project-codex-{project_id}");
+                            rows.push(
+                                AccessibilityNode::new(
+                                    AccessibleRole::Button,
+                                    format!("Start Codex task in {label}"),
+                                    "Create a new task in this project and connect Codex.",
+                                )
+                                .gpui(
+                                    element_id.clone(),
+                                    true,
+                                    true,
+                                ),
+                            );
+                            project_action_elements.insert(
+                                element_id,
+                                ProjectAccessibilityAction::StartAgent(
+                                    *project_id,
+                                    ProviderKind::Codex,
+                                ),
+                            );
+                        }
+                    }
+                    ProjectInboxItem::Task { task_id, .. }
+                        if rendered_task_set.contains(task_id) =>
+                    {
+                        push_task_row(&mut rows, &mut task_element_ids, *task_id);
+                    }
+                    ProjectInboxItem::Task { .. } => {}
+                }
+            }
+        }
+        let inbox_status = if rendered_task_ids.is_empty() {
             AccessibilityNode::new(
                 AccessibleRole::Status,
                 "No tasks yet",
-                "Use +Claude or +Codex to start.",
+                "Add or choose a project, then start with +Claude or +Codex.",
             )
             .gpui("native-task-inbox-status", false, false)
         } else {
@@ -5270,24 +5941,22 @@ impl AccessibilityTree {
             )
             .gpui("native-task-inbox-status", false, false)
         };
-        let inbox_agent_buttons = snapshot
-            .map(inbox_agent_actions)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|action| {
-                let element_id = match action.provider {
-                    ProviderKind::ClaudeCode => "native-inbox-plus-claude",
-                    ProviderKind::Codex => "native-inbox-plus-codex",
-                    ProviderKind::Cursor => unreachable!("Cursor is not an inbox agent action"),
-                };
-                AccessibilityNode::new(
-                    AccessibleRole::Button,
-                    action.label,
-                    "Start a new task with this agent.",
-                )
-                .gpui(element_id, true, true)
-            })
-            .collect::<Vec<_>>();
+        let project_action = snapshot_connected(snapshot).then(|| {
+            AccessibilityNode::new(
+                AccessibleRole::Button,
+                "Add project",
+                "Choose a project folder and add it to the Task Inbox.",
+            )
+            .gpui("native-projects-add", true, true)
+        });
+        let delete_selected = selected_task.map(|_| {
+            AccessibilityNode::new(
+                AccessibleRole::Button,
+                "Delete",
+                "Archive the selected task.",
+            )
+            .gpui("native-task-delete", true, true)
+        });
         let inbox = AccessibilityNode::new(
             AccessibleRole::Region,
             "Task inbox",
@@ -5297,7 +5966,8 @@ impl AccessibilityTree {
         .with_children(
             std::iter::once(inbox_status)
                 .chain(rows)
-                .chain(inbox_agent_buttons)
+                .chain(project_action)
+                .chain(delete_selected)
                 .collect::<Vec<_>>(),
         );
         let header_label = header.label();
@@ -5325,18 +5995,80 @@ impl AccessibilityTree {
             .gpui("native-shell-header-attachment", false, false),
             Self::header_settings_node(),
         ]);
-        let terminal = AccessibilityNode::new(
-            AccessibleRole::Status,
-            "Terminal dock",
-            TerminalDockState::unavailable().message(),
-        )
-        .gpui("native-shell-terminal-dock", false, false);
+        let canvas_switch = selected_task.map(|_| {
+            AccessibilityNode::new(
+                AccessibleRole::Region,
+                "Task canvas",
+                "Switch the center surface between Conversation and Terminal.",
+            )
+            .gpui("native-task-center-canvas-switch", false, false)
+            .with_children(vec![
+                AccessibilityNode::new(
+                    AccessibleRole::Button,
+                    "Conversation",
+                    "Show the task conversation timeline and composer.",
+                )
+                .gpui("native-task-center-conversation", true, true),
+                AccessibilityNode::new(
+                    AccessibleRole::Button,
+                    "Terminal",
+                    "Show the bound provider terminal in the center canvas.",
+                )
+                .gpui("native-task-center-terminal", true, true),
+            ])
+        });
+        let composer_children = selected_task
+            .zip(composer)
+            .map(|(_, composer)| {
+                vec![
+                    AccessibilityNode::new(
+                        AccessibleRole::TextField,
+                        "Prompt",
+                        "Type a message for the selected AI task.",
+                    )
+                    .gpui("native-task-composer-input", true, true)
+                    .with_value(composer.value.clone())
+                    .with_focus(composer.focused),
+                    AccessibilityNode::new(
+                        AccessibleRole::Button,
+                        "Attach",
+                        "Attach a PNG or JPEG image to this prompt.",
+                    )
+                    .gpui("native-task-composer-attach", true, true),
+                    AccessibilityNode::new(
+                        AccessibleRole::Button,
+                        "Send",
+                        "Send this prompt to the selected AI task.",
+                    )
+                    .gpui("native-task-composer-send", true, true),
+                    AccessibilityNode::new(
+                        AccessibleRole::Button,
+                        "Answer",
+                        "Answer the provider's current question.",
+                    )
+                    .gpui("native-task-composer-answer", true, true),
+                    AccessibilityNode::new(
+                        AccessibleRole::Button,
+                        "Approve",
+                        "Approve the provider's current request.",
+                    )
+                    .gpui("native-task-composer-approve", true, true),
+                    AccessibilityNode::new(
+                        AccessibleRole::Button,
+                        "Reject",
+                        "Reject the provider's current request.",
+                    )
+                    .gpui("native-task-composer-reject", true, true),
+                ]
+            })
+            .unwrap_or_default();
         let prompt_library = AccessibilityNode::new(
             AccessibleRole::Region,
-            "Prompt Library and Composer",
-            "Personal saved prompts and the task composer use typed host/client projections.",
+            "Task composer",
+            "Send a message or answer the selected AI task.",
         )
-        .gpui("native-shell-prompt-composer", false, false);
+        .gpui("native-shell-prompt-composer", false, false)
+        .with_children(composer_children);
         let context_dock = AccessibilityNode::new(
             AccessibleRole::Region,
             "Task context dock",
@@ -5349,18 +6081,58 @@ impl AccessibilityTree {
             "Native shell using an isolated profile.",
         )
         .gpui("native-shell-root", true, true)
-        .with_children(vec![toolbar, inbox, prompt_library, context_dock, terminal]);
+        .with_children({
+            let mut children = vec![toolbar, inbox];
+            if let Some(canvas_switch) = canvas_switch {
+                children.push(canvas_switch);
+            }
+            children.push(prompt_library);
+            children.push(context_dock);
+            children
+        });
+        fn collect_action_nodes(
+            node: &AccessibilityNode,
+            next_id: &mut u64,
+            task_elements: &BTreeMap<String, TaskId>,
+            project_elements: &BTreeMap<String, ProjectAccessibilityAction>,
+            task_nodes: &mut Vec<(accesskit::NodeId, TaskId)>,
+            project_nodes: &mut Vec<(accesskit::NodeId, ProjectAccessibilityAction)>,
+        ) {
+            let node_id = accesskit::NodeId::from(*next_id);
+            *next_id = next_id.saturating_add(1);
+            if let Some(task_id) = task_elements.get(node.element_id()) {
+                task_nodes.push((node_id, *task_id));
+            }
+            if let Some(action) = project_elements.get(node.element_id()) {
+                project_nodes.push((node_id, *action));
+            }
+            for child in node.children() {
+                collect_action_nodes(
+                    child,
+                    next_id,
+                    task_elements,
+                    project_elements,
+                    task_nodes,
+                    project_nodes,
+                );
+            }
+        }
+        let mut task_node_ids = Vec::new();
+        let mut project_node_actions = Vec::new();
+        let mut next_id = 0;
+        collect_action_nodes(
+            &root,
+            &mut next_id,
+            &task_element_ids,
+            &project_action_elements,
+            &mut task_node_ids,
+            &mut project_node_actions,
+        );
         Self {
             root,
-            rendered_task_count: rendered_task_ids.len(),
-            // `accesskit_tree_update` assigns IDs in pre-order. The shell's
-            // root, toolbar, header, settings, inbox, and inbox-status occupy
-            // 0..=5, making the row mapping stable while the same tree is rendered.
-            task_node_ids: rendered_task_ids
-                .iter()
-                .enumerate()
-                .map(|(index, task_id)| (accesskit::NodeId::from(6 + index as u64), *task_id))
-                .collect(),
+            rendered_task_count: task_node_ids.len(),
+            task_node_ids,
+            project_node_actions,
         }
     }
 
@@ -5372,11 +6144,18 @@ impl AccessibilityTree {
         welcome_copy: (&str, String),
         show_project_plus: bool,
         snapshot: Option<&AgentConnectionSnapshot>,
+        project_items: &[ProjectInboxItem],
+        composer: Option<&ComposerAccessibilityState>,
     ) -> Self {
         match stage {
-            ShellStage::Cockpit => {
-                Self::for_task_list_with_header(task_list, selected_task, header, snapshot)
-            }
+            ShellStage::Cockpit => Self::for_task_list_with_projects_and_composer(
+                task_list,
+                selected_task,
+                header,
+                snapshot,
+                project_items,
+                composer,
+            ),
             _ => Self::for_setup(stage, header, welcome_copy, show_project_plus),
         }
     }
@@ -5469,6 +6248,7 @@ impl AccessibilityTree {
             root,
             rendered_task_count: 0,
             task_node_ids: Vec::new(),
+            project_node_actions: Vec::new(),
         }
     }
 
@@ -5489,6 +6269,15 @@ impl AccessibilityTree {
         self.task_node_ids
             .iter()
             .find_map(|(candidate, task_id)| (*candidate == node_id).then_some(*task_id))
+    }
+
+    fn project_action_for_platform_node(
+        &self,
+        node_id: accesskit::NodeId,
+    ) -> Option<ProjectAccessibilityAction> {
+        self.project_node_actions
+            .iter()
+            .find_map(|(candidate, action)| (*candidate == node_id).then_some(*action))
     }
 
     fn node_for_platform_id(&self, node_id: accesskit::NodeId) -> Option<&AccessibilityNode> {
@@ -5643,6 +6432,33 @@ impl NativePlatformAccessibilityBridge {
         let _ = window;
     }
 
+    fn reveal_window(&self, window: &Window) {
+        #[cfg(windows)]
+        {
+            use raw_window_handle::RawWindowHandle;
+            use windows::Win32::Foundation::HWND;
+            use windows::Win32::UI::WindowsAndMessaging::{ShowWindowAsync, SW_SHOW};
+
+            let Ok(handle) = raw_window_handle::HasWindowHandle::window_handle(window) else {
+                return;
+            };
+            let RawWindowHandle::Win32(handle) = handle.as_raw() else {
+                return;
+            };
+            // AccessKit requires the HWND to remain hidden until its subclass is
+            // installed. Posting the reveal is also essential: ShowWindow sends
+            // WM_SHOWWINDOW synchronously, but this method runs while GPUI owns
+            // the registered Window update. Its request-frame callback cannot
+            // re-enter that update, consumes the only first-paint message, and
+            // leaves an apparently visible but transparent window.
+            unsafe {
+                let _ = ShowWindowAsync(HWND(handle.hwnd.get() as *mut std::ffi::c_void), SW_SHOW);
+            }
+        }
+        #[cfg(not(windows))]
+        let _ = window;
+    }
+
     fn sync(&mut self, tree: &AccessibilityTree) {
         self.node_count = tree.nodes().len();
         let _ = self
@@ -5700,9 +6516,14 @@ fn accesskit_tree_update(tree: &AccessibilityTree) -> accesskit::TreeUpdate {
             // the same node that the GPUI row uses; no parallel action model
             // is introduced.
             node.add_action(accesskit::Action::Click);
+        }
+        if source.focusable() {
             node.add_action(accesskit::Action::Focus);
         }
         let metadata = source.metadata();
+        if matches!(source.role(), AccessibleRole::TextField) && !metadata.read_only() {
+            node.add_action(accesskit::Action::SetValue);
+        }
         if metadata.disabled() {
             node.set_disabled();
         }
@@ -5843,6 +6664,11 @@ pub struct NativeShell {
     profile: IsolatedDevProfile,
     host_connection: DevTestHostConnection,
     host_runtime: Option<NativeHostRuntimeAttachment>,
+    /// Background ProcessNativeHostBootstrap rendezvous before the first attach.
+    pending_bootstrap: Option<PendingHostBootstrap>,
+    /// True only for the real shell-first launch path. Test/injected shells do
+    /// not create process-backed bootstrap retries behind their fixtures.
+    retry_host_bootstrap: bool,
     /// Owns the local `/api/connect` listener in the native process.
     remote_host_service: Option<RemoteHostService>,
     /// Keeps the IPC-backed Connect executor alive until the listener joins.
@@ -5872,18 +6698,60 @@ pub struct NativeShell {
     accessibility_tree: AccessibilityTree,
     terminal: TerminalDockAdapter,
     focus_handle: FocusHandle,
+    terminal_focus_handle: FocusHandle,
+    composer_focus_handle: FocusHandle,
     task_scroll_handle: UniformListScrollHandle,
     controller_task: Option<Task<()>>,
     controller_ticks: usize,
     last_projection_kinds: Vec<NativeHostProjectionKind>,
     pending_host_actions: VecDeque<NativeActionRecord>,
     retained_action_overflow: Option<NativeActionRecord>,
+    conversation_query_in_flight: bool,
     last_action_failure: Option<NativeHostActionFailure>,
     last_action_receipt: Option<crate::domain::command::CommandReceipt>,
     last_query_detail: Option<String>,
     top_bar: Option<TopBarProjectionController>,
     composer: Option<TaskComposer>,
+    /// Mirrors the real GPUI prompt focus into the Windows accessibility tree.
+    composer_accessibility_focused: bool,
+    /// AccessKit actions arrive outside a Window update; the next render owns
+    /// the actual GPUI focus transfer.
+    pending_composer_focus: bool,
+    /// Accepted provider-menu commands move focus into the existing raw
+    /// terminal on the next frame so arrow/Enter/Escape reach that same PTY.
+    pending_terminal_focus: bool,
+    /// Active IME marked range in UTF-16 units. This is platform editing
+    /// state, not provider conversation state, and is discarded on commit.
+    composer_marked_range: Option<Range<usize>>,
+    /// Accepted receipts can arrive after navigation replaces the active
+    /// composer. Correlate them by the original command identity so only the
+    /// exact submitted draft is consumed, regardless of the selected task.
+    pending_composer_submissions: BTreeMap<CommandId, PendingComposerSubmission>,
+    composer_images: BTreeMap<ComposerDraftKey, Vec<NativeComposerImage>>,
+    next_composer_image_id: u64,
+    slash_command_selection: usize,
+    slash_command_menu_dismissed: bool,
+    slash_command_catalog_key: Option<(TaskId, ProviderKind)>,
+    slash_command_catalog: Vec<ProviderCommandSuggestion>,
+    /// Unsent input belongs to its task. Parking it here prevents selecting a
+    /// neighboring task from erasing work while keeping it out of durable host
+    /// projections and provider conversation identity.
+    composer_drafts: BTreeMap<ComposerDraftKey, ComposerDraftProjection>,
+    composer_draft_store: ComposerDraftStore,
+    composer_drafts_dirty: bool,
+    last_composer_draft_persist: Option<Instant>,
     composer_error: Option<String>,
+    /// Idle main-canvas photo shown only while no task is selected.
+    splash_image: Option<Arc<RenderImage>>,
+    splash_fetch_in_flight: bool,
+    /// One network attempt per app session; failures must not refetch every paint.
+    splash_fetch_attempted: bool,
+    /// Test/observability counter for idle-photo fetch admission (not a second fetch path).
+    idle_photo_fetch_spawns: usize,
+    #[cfg(test)]
+    interactive_conversation_builds: usize,
+    #[cfg(test)]
+    interactive_conversation_focus_wires: usize,
     updater_snapshot: Option<UpdaterSnapshot>,
     exit_after_update: bool,
     pending_preferences: VecDeque<RuntimePreferencesSnapshot>,
@@ -5901,8 +6769,18 @@ pub struct NativeShell {
     settings_open: bool,
     pending_folder_prompt: bool,
     new_task: Option<NewTaskDraft>,
+    selected_project_id: Option<ProjectId>,
+    collapsed_projects: HashSet<ProjectId>,
     palette_index: usize,
     pending_select_task: Option<TaskId>,
+}
+
+/// What the main conversation canvas should show for the current selection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MainConversationCanvas {
+    IdlePhoto { has_image: bool },
+    TaskConversation,
+    TaskTerminal,
 }
 
 /// Rate limit for window-frame writes while the user drags a window edge.
@@ -5920,6 +6798,8 @@ struct PaneDrag {
 
 impl Drop for NativeShell {
     fn drop(&mut self) {
+        self.cache_current_composer_draft();
+        self.flush_composer_drafts_if_due(true);
         if self.cockpit.browser_projection().is_some() {
             if let Ok(command) = self.cockpit.detach_browser_native() {
                 let _ = self.browser_host.apply_native_shell_command(&command);
@@ -5927,6 +6807,9 @@ impl Drop for NativeShell {
             }
         }
         let _ = self.browser_host.drain_events();
+
+        // PendingHostBootstrap::Drop drops the receiver first, then joins/retains.
+        drop(self.pending_bootstrap.take());
 
         // Stop new Connect dispatch before joining the web listener. The
         // listener then observes the typed unavailable result while the
@@ -6113,6 +6996,27 @@ impl NativeShell {
         cx: &mut Context<Self>,
         start_controller: bool,
     ) -> Self {
+        Self::new_with_attachment_state_pending_and_preferences(
+            profile,
+            host_runtime,
+            None,
+            host_state,
+            preferences,
+            cx,
+            start_controller,
+        )
+    }
+
+    fn new_with_attachment_state_pending_and_preferences(
+        profile: IsolatedDevProfile,
+        host_runtime: Option<NativeHostRuntimeAttachment>,
+        pending_bootstrap: Option<PendingHostBootstrap>,
+        host_state: NativeHostState,
+        preferences: RuntimePreferencesSnapshot,
+        cx: &mut Context<Self>,
+        start_controller: bool,
+    ) -> Self {
+        let retry_host_bootstrap = start_controller && pending_bootstrap.is_some();
         let (connect_host_port, remote_host_service) = if start_controller {
             let bridge = Arc::new(HostClientConnectPort::new(profile.host_client_config()));
             crate::connect::bind_host_executor(bridge.clone());
@@ -6137,16 +7041,22 @@ impl NativeShell {
             ConfigSidebarProjection::unavailable(ConfigSidebarUnavailableReason::SnapshotMissing);
         let header_attachment = NativeHeaderAttachment::default();
         let accessibility_tree = AccessibilityTree::for_stage(
-            ShellStage::Connecting,
+            ShellStage::Cockpit,
             &task_list,
             None,
             &header_attachment,
             connect_canvas_copy(None),
             false,
             None,
+            &[],
+            None,
         );
         let platform_accessibility = NativePlatformAccessibilityBridge::new(&accessibility_tree);
-        let mut interaction = NativeInteraction::new(None);
+        let layout_store = WorkspaceLayoutStore::at_profile_root(profile.root());
+        let layout = layout_store.load();
+        let composer_draft_store = ComposerDraftStore::at_profile_root(profile.root());
+        let composer_drafts = composer_draft_store.load();
+        let mut interaction = NativeInteraction::new(layout.selected_task);
         let initial_epochs = host_runtime
             .as_ref()
             .map(|runtime| match runtime {
@@ -6156,11 +7066,12 @@ impl NativeShell {
             .unwrap_or_default();
         interaction.sync_host_epochs(initial_epochs);
         let browser_profile_root = profile.root().to_path_buf();
-        let layout_store = WorkspaceLayoutStore::at_profile_root(profile.root());
         let mut shell = Self {
             host_connection: profile.host_connection(),
             profile,
             host_runtime,
+            pending_bootstrap,
+            retry_host_bootstrap,
             remote_host_service,
             connect_host_port,
             host_state,
@@ -6190,25 +7101,51 @@ impl NativeShell {
             accessibility_tree,
             terminal: TerminalDockAdapter::unavailable_with_preferences(preferences),
             focus_handle: cx.focus_handle().tab_stop(true),
+            terminal_focus_handle: cx.focus_handle().tab_stop(true),
+            composer_focus_handle: cx.focus_handle().tab_stop(true),
             task_scroll_handle: UniformListScrollHandle::new(),
             controller_task: None,
             controller_ticks: 0,
             last_projection_kinds: Vec::new(),
             pending_host_actions: VecDeque::new(),
             retained_action_overflow: None,
+            conversation_query_in_flight: false,
             last_action_failure: None,
             last_action_receipt: None,
             last_query_detail: None,
             top_bar: None,
             composer: None,
+            composer_accessibility_focused: false,
+            pending_composer_focus: false,
+            pending_terminal_focus: false,
+            composer_marked_range: None,
+            pending_composer_submissions: BTreeMap::new(),
+            composer_images: BTreeMap::new(),
+            next_composer_image_id: 1,
+            slash_command_selection: 0,
+            slash_command_menu_dismissed: false,
+            slash_command_catalog_key: None,
+            slash_command_catalog: Vec::new(),
+            composer_drafts,
+            composer_draft_store,
+            composer_drafts_dirty: false,
+            last_composer_draft_persist: None,
             composer_error: None,
+            splash_image: None,
+            splash_fetch_in_flight: false,
+            splash_fetch_attempted: false,
+            idle_photo_fetch_spawns: 0,
+            #[cfg(test)]
+            interactive_conversation_builds: 0,
+            #[cfg(test)]
+            interactive_conversation_focus_wires: 0,
             updater_snapshot: None,
             exit_after_update: false,
             pending_preferences: VecDeque::new(),
             appearance_subscription: None,
             bounds_subscription: None,
             platform_accessibility,
-            layout: layout_store.load(),
+            layout,
             layout_store,
             pane_drag: None,
             last_window_persist: None,
@@ -6216,18 +7153,18 @@ impl NativeShell {
             settings_open: false,
             pending_folder_prompt: false,
             new_task: None,
+            selected_project_id: None,
+            collapsed_projects: HashSet::new(),
             palette_index: 0,
             pending_select_task: None,
         };
         if start_controller {
-            let _ = shell.dispatch_action(ActionRequest::HostStatus);
-        }
-        if matches!(shell.host_state, NativeHostState::Connected { .. }) {
-            let _ = shell.dispatch_agent_connection_query(start_controller);
-        }
-        if start_controller {
             shell.start_controller(cx);
         }
+        // First paint is owned by the shell itself. A slow or failed host
+        // bootstrap must never leave the hidden GPUI window transparent while
+        // it waits for the controller's first state change.
+        cx.notify();
         shell
     }
 
@@ -6274,14 +7211,24 @@ impl NativeShell {
 
     fn refresh_accessibility_tree(&mut self) {
         let welcome_copy = connect_canvas_copy(self.agent_connection.as_ref());
+        let project_items = self.project_inbox_items();
+        let composer = self
+            .composer
+            .as_ref()
+            .map(|composer| ComposerAccessibilityState {
+                value: composer.draft_text().to_string(),
+                focused: self.composer_accessibility_focused,
+            });
         self.accessibility_tree = AccessibilityTree::for_stage(
-            self.shell_stage(),
+            ShellStage::Cockpit,
             &self.task_list,
             self.interaction.selected_task(),
             &self.header_attachment,
             welcome_copy,
             self.shows_add_project_plus(),
             self.agent_connection.as_ref(),
+            &project_items,
+            composer.as_ref(),
         );
         self.platform_accessibility.sync(&self.accessibility_tree);
     }
@@ -6399,6 +7346,9 @@ impl NativeShell {
                 self.agent_connection = Some(snapshot);
             }
             NativeHostQueryBody::TaskCockpit(result) => {
+                if matches!(result, crate::domain::TaskCockpitResult::Conversation(_)) {
+                    self.conversation_query_in_flight = false;
+                }
                 if let crate::domain::TaskCockpitResult::Config(snapshot) = &result {
                     self.config_sidebar = ConfigSidebarProjection::from_host_snapshot(snapshot);
                     self.finish_add_project_after_host_accept();
@@ -6433,23 +7383,52 @@ impl NativeShell {
         let Some(task_id) = self.interaction.selected_task() else {
             return;
         };
-        self.cockpit
-            .begin_cockpit_query(task_id, crate::client::action::ACTION_GIT_STATUS);
-        let mut requests = Vec::new();
-        for action_id in [
-            crate::client::action::ACTION_WORKSPACE_STATUS,
-            crate::client::action::ACTION_GIT_STATUS,
-            crate::client::action::ACTION_FILES_LIST,
-            crate::client::action::ACTION_SSH_STATUS,
-        ] {
-            if let Some(request) = action::task_cockpit_request(task_id, action_id) {
-                requests.push(request);
-            }
+        let (loading_action, mut requests) = match self.cockpit.active_tool() {
+            CockpitDockTool::Changes => (
+                Some(crate::client::action::ACTION_GIT_STATUS),
+                vec![
+                    ActionRequest::TaskCockpit {
+                        task_id,
+                        query: TaskCockpitQuery::WorkspaceStatus,
+                    },
+                    ActionRequest::TaskCockpit {
+                        task_id,
+                        query: TaskCockpitQuery::GitStatus,
+                    },
+                ],
+            ),
+            CockpitDockTool::Files => (
+                Some(crate::client::action::ACTION_FILES_LIST),
+                vec![ActionRequest::TaskCockpit {
+                    task_id,
+                    query: TaskCockpitQuery::FilesList {
+                        relative_directory: None,
+                        limit: 64,
+                    },
+                }],
+            ),
+            CockpitDockTool::Services => (
+                Some(crate::client::action::ACTION_SERVICE_LOGS),
+                vec![ActionRequest::TaskCockpit {
+                    task_id,
+                    query: TaskCockpitQuery::ServiceSnapshots,
+                }],
+            ),
+            CockpitDockTool::Terminal
+            | CockpitDockTool::Browser
+            | CockpitDockTool::Artifacts
+            | CockpitDockTool::Review => (None, Vec::new()),
+        };
+        if let Some(action_id) = loading_action {
+            self.cockpit.begin_cockpit_query(task_id, action_id);
         }
-        requests.push(ActionRequest::TaskCockpit {
-            task_id,
-            query: TaskCockpitQuery::ServiceSnapshots,
-        });
+        requests.insert(
+            0,
+            ActionRequest::TaskCockpit {
+                task_id,
+                query: TaskCockpitQuery::Conversation { after_sequence: 0 },
+            },
+        );
         self.dispatch_related_actions(requests);
     }
 
@@ -6473,7 +7452,7 @@ impl NativeShell {
         ]);
     }
 
-    fn admit_ready_stream_frames(&mut self, max: usize) {
+    fn admit_ready_stream_frames(&mut self, max: usize) -> bool {
         let Some(subscription_id) = self
             .host_runtime
             .as_ref()
@@ -6482,7 +7461,7 @@ impl NativeShell {
                 NativeHostRuntimeAttachment::Injected(_) => None,
             })
         else {
-            return;
+            return false;
         };
         let frames = match self.host_runtime.as_mut() {
             Some(NativeHostRuntimeAttachment::Client(runtime)) => {
@@ -6490,6 +7469,7 @@ impl NativeShell {
             }
             _ => Vec::new(),
         };
+        let had_frames = !frames.is_empty();
         for frame in frames {
             let _ = self
                 .cockpit
@@ -6497,9 +7477,10 @@ impl NativeShell {
                 .admit_subscription_stream(subscription_id, &frame);
         }
         self.sync_terminal_from_cockpit();
+        had_frames
     }
 
-    fn sync_top_bar_from_updater(&mut self) {
+    fn sync_top_bar_from_updater(&mut self) -> bool {
         let snapshot = self.updater_snapshot.clone().or_else(|| {
             self.host_runtime
                 .as_ref()
@@ -6511,8 +7492,9 @@ impl NativeShell {
                 })
         });
         let Some(snapshot) = snapshot else {
-            return;
+            return false;
         };
+        let changed = self.updater_snapshot.as_ref() != Some(&snapshot);
         self.updater_snapshot = Some(snapshot.clone());
         let now_ms = unix_time_ms();
         let generation = self
@@ -6548,6 +7530,7 @@ impl NativeShell {
             }
         }
         self.sync_header_projection();
+        changed
     }
 
     #[allow(dead_code)]
@@ -6565,8 +7548,8 @@ impl NativeShell {
             .ok_or(ComposerError::UnknownTurn)?;
         let request = intent.to_provider_input_request(turn_id, question_id, approval_id)?;
         self.composer_error = None;
-        if self.dispatch_action(request).is_some() {
-            self.composer_error = Some("composer action was not accepted by the host lane".into());
+        if let Err(failure) = self.dispatch_action_checked(request) {
+            self.composer_error = Some(failure.message);
         }
         Ok(())
     }
@@ -6580,20 +7563,21 @@ impl NativeShell {
     }
 
     fn start_controller(&mut self, cx: &mut Context<Self>) {
+        let timer = cx.background_executor().clone();
         let task = cx.spawn(
-            |this: gpui::WeakEntity<NativeShell>, cx: &mut gpui::AsyncApp| {
+            move |this: gpui::WeakEntity<NativeShell>, cx: &mut gpui::AsyncApp| {
                 let mut async_cx = cx.clone();
                 async move {
                     loop {
-                        Timer::after(CONTROLLER_TICK_INTERVAL).await;
+                        timer.timer(CONTROLLER_TICK_INTERVAL).await;
                         if this
                             .update(&mut async_cx, |shell, cx| {
                                 if shell.pending_folder_prompt {
                                     shell.schedule_folder_prompt(cx);
                                 }
                                 let agent_connection = shell.agent_connection.clone();
-                                shell.controller_tick(MAX_PENDING_HOST_ACTIONS);
-                                if shell.agent_connection != agent_connection {
+                                let repaint = shell.controller_tick(MAX_PENDING_HOST_ACTIONS);
+                                if repaint || shell.agent_connection != agent_connection {
                                     cx.notify();
                                 }
                                 if shell.exit_after_update {
@@ -6611,8 +7595,8 @@ impl NativeShell {
         self.controller_task = Some(task);
     }
 
-    pub fn controller_tick_for_test(&mut self, max: usize) {
-        self.controller_tick(max);
+    pub fn controller_tick_for_test(&mut self, max: usize) -> bool {
+        self.controller_tick(max)
     }
 
     #[cfg(test)]
@@ -6699,6 +7683,10 @@ impl NativeShell {
                 break;
             };
             if !self.interaction.accepts_action_record(&action) {
+                if is_native_query_command(&action.command) {
+                    self.discard_native_query_action(&action);
+                    continue;
+                }
                 self.set_transport_failure(&action, NativeHostActionResult::Stale);
                 break;
             }
@@ -6714,6 +7702,10 @@ impl NativeShell {
                 result @ (NativeHostActionResult::Disconnected
                 | NativeHostActionResult::QueueFull
                 | NativeHostActionResult::Stale) => {
+                    if is_native_query_command(&action.command) {
+                        self.settle_native_query_admission_failure(&action, result);
+                        continue;
+                    }
                     self.set_transport_failure(&action, result);
                     break;
                 }
@@ -6747,6 +7739,57 @@ impl NativeShell {
         }
     }
 
+    fn discard_native_query_action(&mut self, action: &NativeActionRecord) {
+        if is_conversation_query_command(&action.command) {
+            self.conversation_query_in_flight = false;
+        }
+        let request_id = native_request_id(&action.command);
+        self.pending_host_actions
+            .retain(|pending| native_request_id(&pending.command) != request_id);
+        if self
+            .retained_action_overflow
+            .as_ref()
+            .is_some_and(|pending| native_request_id(&pending.command) == request_id)
+        {
+            self.retained_action_overflow = None;
+        }
+        if self.last_action_failure.as_ref().is_some_and(|failure| {
+            failure.action_id() == action.id && failure.command_id().is_none()
+        }) {
+            self.last_action_failure = None;
+            self.restore_connected_host_state();
+        }
+    }
+
+    fn settle_native_query_failure(&mut self, action: &NativeActionRecord, error: String) {
+        if is_agent_connection_query_command(&action.command) {
+            self.agent_connection = Some(agent_connection_snapshot(AgentPresence::CheckFailed));
+        }
+        self.discard_native_query_action(action);
+        self.last_query_detail = Some(error);
+    }
+
+    fn settle_native_query_admission_failure(
+        &mut self,
+        action: &NativeActionRecord,
+        result: NativeHostActionResult,
+    ) {
+        let detail = match result {
+            NativeHostActionResult::Disconnected => "host query not sent: disconnected",
+            NativeHostActionResult::QueueFull => "host query not sent: host is busy",
+            NativeHostActionResult::Stale => "host query superseded before it was sent",
+            NativeHostActionResult::Queued => return,
+        };
+        self.discard_native_query_action(action);
+        self.last_query_detail = Some(detail.to_string());
+        self.restore_connected_host_state();
+    }
+
+    fn settle_native_query_request_capacity_failure(&mut self) {
+        self.last_query_detail = Some("host query not sent: host is busy".to_string());
+        self.restore_connected_host_state();
+    }
+
     fn try_enqueue_host_action(&mut self, record: NativeActionRecord) -> NativeHostActionResult {
         match self.host_runtime.as_mut() {
             Some(NativeHostRuntimeAttachment::Client(runtime)) => runtime.enqueue(record),
@@ -6775,17 +7818,19 @@ impl NativeShell {
         };
         self.host_state = match &failure {
             NativeHostActionFailure::Disconnected { .. } => NativeHostState::Disconnected,
-            NativeHostActionFailure::Stale { .. } => match &self.host_state {
-                NativeHostState::Connected { .. } => self.host_state.clone(),
-                _ => self
-                    .host_runtime
-                    .as_ref()
-                    .map(|runtime| match runtime {
-                        NativeHostRuntimeAttachment::Injected(runtime) => runtime.host_state(),
-                        NativeHostRuntimeAttachment::Client(runtime) => runtime.host_state(),
-                    })
-                    .unwrap_or(self.host_state.clone()),
-            },
+            NativeHostActionFailure::QueueFull { .. } | NativeHostActionFailure::Stale { .. } => {
+                match &self.host_state {
+                    NativeHostState::Connected { .. } => self.host_state.clone(),
+                    _ => self
+                        .host_runtime
+                        .as_ref()
+                        .map(|runtime| match runtime {
+                            NativeHostRuntimeAttachment::Injected(runtime) => runtime.host_state(),
+                            NativeHostRuntimeAttachment::Client(runtime) => runtime.host_state(),
+                        })
+                        .unwrap_or(self.host_state.clone()),
+                }
+            }
             _ => NativeHostState::Error {
                 message: bounded_host_error(failure.retry_message()),
             },
@@ -6829,18 +7874,15 @@ impl NativeShell {
 
     fn apply_epoch_fenced_action_outcome(&mut self, outcome: NativeHostActionOutcome) {
         let action = outcome.action().clone();
-        if !self.interaction.accepts_action_outcome_record(&action) {
-            if is_agent_connection_query_command(&action.command) {
-                let request_id = native_request_id(&action.command);
-                self.pending_host_actions
-                    .retain(|pending| native_request_id(&pending.command) != request_id);
-                if self
-                    .retained_action_overflow
-                    .as_ref()
-                    .is_some_and(|pending| native_request_id(&pending.command) == request_id)
-                {
-                    self.retained_action_overflow = None;
-                }
+        let accepted = if is_global_native_query_command(&action.command) {
+            self.interaction
+                .accepts_global_query_outcome_record(&action)
+        } else {
+            self.interaction.accepts_action_outcome_record(&action)
+        };
+        if !accepted {
+            if is_native_query_command(&action.command) {
+                self.discard_native_query_action(&action);
                 return;
             }
             if self.retain_pending_host_action(action.clone()) {
@@ -6890,10 +7932,51 @@ impl NativeShell {
                     self.last_action_failure = None;
                     self.restore_connected_host_state();
                 }
-                if let Some(composer) = self.composer.as_mut() {
-                    if let Some(pending) = composer.pending_intent().map(|intent| intent.command_id)
+                let settled_active_composer = if let (Some(composer), Some(command_id)) =
+                    (self.composer.as_mut(), command_id)
+                {
+                    composer
+                        .pending_intent()
+                        .is_some_and(|pending| pending.command_id == command_id)
+                        && composer.settle_pending(command_id).is_ok()
+                } else {
+                    false
+                };
+                if settled_active_composer {
+                    self.cache_current_composer_draft();
+                }
+                if let Some(command_id) = command_id {
+                    if let Some(submission) = self.pending_composer_submissions.remove(&command_id)
                     {
-                        let _ = composer.settle_pending(pending);
+                        let open_provider_terminal = submission.open_provider_terminal;
+                        let active_matches = self.composer.as_ref().is_some_and(|composer| {
+                            let fence = composer.fence();
+                            submission.key
+                                == ComposerDraftKey::new(fence.task_id, fence.agent_session_id)
+                        });
+                        if active_matches && !settled_active_composer {
+                            let cleared = self.composer.as_mut().is_some_and(|composer| {
+                                composer
+                                    .clear_draft_if_matches(&submission.draft)
+                                    .unwrap_or(false)
+                            });
+                            if cleared {
+                                self.cache_current_composer_draft();
+                            }
+                        } else if self.composer_drafts.get(&submission.key)
+                            == Some(&submission.draft)
+                        {
+                            self.composer_drafts.remove(&submission.key);
+                            self.composer_drafts_dirty = true;
+                        }
+                        // The provider prompt contains workspace-relative image
+                        // references. Detach them from this composer after the
+                        // accepted send, but leave the staged files for the
+                        // provider to read; bounded TTL cleanup owns deletion.
+                        self.detach_composer_images_for_key(submission.key, &submission.image_ids);
+                        if open_provider_terminal {
+                            self.set_provider_terminal_visible(true);
+                        }
                     }
                 }
                 self.composer_error = None;
@@ -6911,6 +7994,9 @@ impl NativeShell {
             } => {
                 let action_id = action.id;
                 let request_id = native_request_id(&action.command);
+                if is_conversation_query_command(&action.command) {
+                    self.conversation_query_in_flight = false;
+                }
                 self.last_query_detail = Some(detail);
                 self.apply_query_body(body);
                 if let Some(request_id) = request_id {
@@ -6946,20 +8032,8 @@ impl NativeShell {
                 }
             }
             NativeHostActionOutcome::Failed { action, error } => {
-                if is_agent_connection_query_command(&action.command) {
-                    let request_id = native_request_id(&action.command);
-                    self.agent_connection =
-                        Some(agent_connection_snapshot(AgentPresence::CheckFailed));
-                    self.pending_host_actions
-                        .retain(|pending| native_request_id(&pending.command) != request_id);
-                    if self
-                        .retained_action_overflow
-                        .as_ref()
-                        .is_some_and(|pending| native_request_id(&pending.command) == request_id)
-                    {
-                        self.retained_action_overflow = None;
-                    }
-                    self.last_query_detail = Some(error);
+                if is_native_query_command(&action.command) {
+                    self.settle_native_query_failure(&action, error);
                     return;
                 }
                 if action.id == action::ACTION_CONFIG_CREATE_PROJECT {
@@ -6986,6 +8060,10 @@ impl NativeShell {
                 }
             }
             NativeHostActionOutcome::Uncertain { action, error } => {
+                if is_native_query_command(&action.command) {
+                    self.settle_native_query_failure(&action, error);
+                    return;
+                }
                 let retained = self.retain_pending_host_action(action.clone());
                 self.set_execution_failure(&action, error, true);
                 if !retained {
@@ -7025,12 +8103,44 @@ impl NativeShell {
         self.host_state = runtime_state;
     }
 
-    fn controller_tick(&mut self, max: usize) {
+    fn controller_tick(&mut self, max: usize) -> bool {
         self.controller_ticks = self.controller_ticks.saturating_add(1);
+        self.flush_composer_drafts_if_due(false);
+        let mut repaint = false;
         if let Some(preferences) = self.pending_preferences.pop_back() {
             self.pending_preferences.clear();
             self.preferences = preferences;
             self.terminal.set_preferences(preferences);
+            repaint = true;
+        }
+
+        // Poll background connect/attach before draining projections so a late
+        // runtime is owned by exactly one shell attachment.
+        if self.poll_pending_host_bootstrap() {
+            repaint = true;
+        }
+        if should_schedule_host_bootstrap_retry(
+            self.retry_host_bootstrap,
+            self.host_runtime.is_some(),
+            self.pending_bootstrap.is_some(),
+            matches!(
+                self.host_state,
+                NativeHostState::Disconnected | NativeHostState::Error { .. }
+            ),
+            self.controller_ticks,
+        ) {
+            match spawn_pending_host_bootstrap(self.profile.clone(), ProcessNativeHostBootstrap) {
+                Ok(pending) => {
+                    self.pending_bootstrap = Some(pending);
+                    self.host_state = NativeHostState::Connecting;
+                }
+                Err(error) => {
+                    self.host_state = NativeHostState::Error {
+                        message: bounded_host_error(error.to_string()),
+                    };
+                }
+            }
+            repaint = true;
         }
 
         let runtime_epochs = self
@@ -7043,6 +8153,7 @@ impl NativeShell {
             .unwrap_or_default();
         if self.interaction.sync_host_epochs(runtime_epochs) {
             self.clear_cockpit_projection();
+            repaint = true;
         }
         let mut current_epochs = self.interaction.host_runtime_epochs();
         let mut current_navigation_epoch = self.interaction.action_epochs().navigation_epoch;
@@ -7076,6 +8187,7 @@ impl NativeShell {
             projections.push(NativeHostProjection {
                 kind: NativeHostProjectionKind::Error,
                 client_model: None,
+                task_preview: None,
                 error: Some(
                     "native host action outcome retained under projection pressure".to_string(),
                 ),
@@ -7102,10 +8214,8 @@ impl NativeShell {
             }
             accepted_projection_kinds.push(projection.kind);
             if !stale_projection {
-                if let Some(model) = projection.client_model {
-                    if let Err(error) = self.apply_client_model(model) {
-                        self.host_state = NativeHostState::Error { message: error };
-                    }
+                if let Err(error) = self.apply_validated_host_projection_payloads(&projection) {
+                    self.host_state = NativeHostState::Error { message: error };
                 }
             }
             if let Some(outcome) = projection.action_outcome {
@@ -7116,9 +8226,31 @@ impl NativeShell {
         }
         if had_projections {
             self.last_projection_kinds = accepted_projection_kinds;
+            repaint = true;
         }
-        self.admit_ready_stream_frames(max);
-        self.sync_top_bar_from_updater();
+        repaint |= self.admit_ready_stream_frames(max);
+        repaint |= self.sync_top_bar_from_updater();
+
+        // Keep the primary conversation live without refreshing inactive dock
+        // tools. The host page is bounded and replaces the previous retained
+        // window, so polling cannot grow client memory.
+        if self.controller_ticks % 30 == 0
+            && !self.conversation_query_in_flight
+            && self.action_lane_len() < MAX_ACTION_LANE_RECORDS / 2
+        {
+            if let Some(task_id) = self.interaction.selected_task() {
+                let request = ActionRequest::TaskCockpit {
+                    task_id,
+                    query: TaskCockpitQuery::Conversation { after_sequence: 0 },
+                };
+                if let Some(record) = self.interaction.action_on_current_handler(request) {
+                    self.conversation_query_in_flight = matches!(
+                        self.enqueue_host_action(record),
+                        NativeHostActionResult::Queued
+                    );
+                }
+            }
+        }
 
         for _ in 0..max.min(MAX_PENDING_HOST_ACTIONS) {
             let Some(has_pending) = self.host_runtime.as_ref().map(|runtime| match runtime {
@@ -7130,6 +8262,7 @@ impl NativeShell {
             if !has_pending {
                 break;
             }
+            repaint = true;
 
             let pending_action = match self.host_runtime.as_ref() {
                 Some(NativeHostRuntimeAttachment::Injected(runtime)) => {
@@ -7152,7 +8285,10 @@ impl NativeShell {
                         None => None,
                     };
                     if let Some(stale) = stale {
-                        if self.retain_pending_host_action(stale.clone()) {
+                        if is_native_query_command(&stale.command) {
+                            self.discard_native_query_action(&stale);
+                            continue;
+                        } else if self.retain_pending_host_action(stale.clone()) {
                             self.set_transport_failure(&stale, NativeHostActionResult::Stale);
                         } else {
                             self.set_action_capacity_failure(stale.id);
@@ -7176,6 +8312,22 @@ impl NativeShell {
                 }
                 NativeHostActionResult::Disconnected => {
                     if let Some(action) = pending_action.as_ref() {
+                        if is_native_query_command(&action.command) {
+                            let _ = match self.host_runtime.as_mut() {
+                                Some(NativeHostRuntimeAttachment::Injected(runtime)) => {
+                                    runtime.take_pending_front()
+                                }
+                                Some(NativeHostRuntimeAttachment::Client(runtime)) => {
+                                    runtime.take_pending_front()
+                                }
+                                None => None,
+                            };
+                            self.settle_native_query_admission_failure(
+                                action,
+                                NativeHostActionResult::Disconnected,
+                            );
+                            continue;
+                        }
                         self.set_transport_failure(action, NativeHostActionResult::Disconnected);
                     } else {
                         self.host_state = NativeHostState::Disconnected;
@@ -7184,6 +8336,22 @@ impl NativeShell {
                 }
                 NativeHostActionResult::QueueFull => {
                     if let Some(action) = pending_action.as_ref() {
+                        if is_native_query_command(&action.command) {
+                            let _ = match self.host_runtime.as_mut() {
+                                Some(NativeHostRuntimeAttachment::Injected(runtime)) => {
+                                    runtime.take_pending_front()
+                                }
+                                Some(NativeHostRuntimeAttachment::Client(runtime)) => {
+                                    runtime.take_pending_front()
+                                }
+                                None => None,
+                            };
+                            self.settle_native_query_admission_failure(
+                                action,
+                                NativeHostActionResult::QueueFull,
+                            );
+                            continue;
+                        }
                         self.set_transport_failure(action, NativeHostActionResult::QueueFull);
                     } else {
                         self.host_state = NativeHostState::Error {
@@ -7197,6 +8365,22 @@ impl NativeShell {
                 }
                 NativeHostActionResult::Stale => {
                     if let Some(action) = pending_action.as_ref() {
+                        if is_native_query_command(&action.command) {
+                            let _ = match self.host_runtime.as_mut() {
+                                Some(NativeHostRuntimeAttachment::Injected(runtime)) => {
+                                    runtime.take_pending_front()
+                                }
+                                Some(NativeHostRuntimeAttachment::Client(runtime)) => {
+                                    runtime.take_pending_front()
+                                }
+                                None => None,
+                            };
+                            self.settle_native_query_admission_failure(
+                                action,
+                                NativeHostActionResult::Stale,
+                            );
+                            continue;
+                        }
                         self.set_transport_failure(action, NativeHostActionResult::Stale);
                     }
                     break;
@@ -7221,27 +8405,66 @@ impl NativeShell {
             let request = queued.request;
             if !matches!(
                 request.action,
-                accesskit::Action::Click | accesskit::Action::Focus
+                accesskit::Action::Click | accesskit::Action::Focus | accesskit::Action::SetValue
             ) {
                 continue;
             }
-            if let Some(task_id) = self
-                .accessibility_tree
-                .task_for_platform_node(request.target_node)
-            {
-                let _ = self
-                    .interaction
-                    .navigation_mouse_down(task_id, &self.task_list);
-                continue;
+            if matches!(
+                request.action,
+                accesskit::Action::Click | accesskit::Action::Focus
+            ) {
+                if let Some(task_id) = self
+                    .accessibility_tree
+                    .task_for_platform_node(request.target_node)
+                {
+                    let _ = self
+                        .interaction
+                        .navigation_mouse_down(task_id, &self.task_list);
+                    repaint = true;
+                    continue;
+                }
             }
             if matches!(request.action, accesskit::Action::Click) {
-                if let Some(element_id) = self
+                if let Some(action) = self
                     .accessibility_tree
-                    .node_for_platform_id(request.target_node)
-                    .map(|node| node.element_id().to_string())
+                    .project_action_for_platform_node(request.target_node)
                 {
-                    self.dispatch_named_accessibility_action(&element_id);
+                    match action {
+                        ProjectAccessibilityAction::Toggle(project_id) => {
+                            self.toggle_project(project_id);
+                            self.refresh_accessibility_tree();
+                        }
+                        ProjectAccessibilityAction::StartAgent(project_id, provider) => {
+                            self.start_task_with_agent_for_project(project_id, provider);
+                        }
+                    }
+                    repaint = true;
+                    continue;
                 }
+            }
+            let Some(element_id) = self
+                .accessibility_tree
+                .node_for_platform_id(request.target_node)
+                .map(|node| node.element_id().to_string())
+            else {
+                continue;
+            };
+            match request.action {
+                accesskit::Action::Click => {
+                    self.dispatch_named_accessibility_action(&element_id);
+                    repaint = true;
+                }
+                accesskit::Action::Focus if element_id == "native-task-composer-input" => {
+                    self.request_composer_accessibility_focus();
+                    repaint = true;
+                }
+                accesskit::Action::SetValue if element_id == "native-task-composer-input" => {
+                    if let Some(accesskit::ActionData::Value(value)) = request.data {
+                        self.replace_composer_accessibility_value(&value);
+                        repaint = true;
+                    }
+                }
+                _ => {}
             }
         }
 
@@ -7253,6 +8476,7 @@ impl NativeShell {
             .set_viewport(first_visible, DEFAULT_VISIBLE_ROWS);
         self.offer_first_task_if_needed();
         self.refresh_accessibility_tree();
+        repaint
     }
 
     pub(crate) fn install_window_observers(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -7366,10 +8590,8 @@ impl NativeShell {
             }
             kinds.push(projection.kind);
             if !stale_projection {
-                if let Some(model) = projection.client_model {
-                    if let Err(error) = self.apply_client_model(model) {
-                        self.host_state = NativeHostState::Error { message: error };
-                    }
+                if let Err(error) = self.apply_validated_host_projection_payloads(&projection) {
+                    self.host_state = NativeHostState::Error { message: error };
                 }
             }
             if let Some(outcome) = projection.action_outcome {
@@ -7410,6 +8632,7 @@ impl NativeShell {
             projections.push(NativeHostProjection {
                 kind: NativeHostProjectionKind::Error,
                 client_model: None,
+                task_preview: None,
                 error: Some(
                     "native host action outcome retained under projection pressure".to_string(),
                 ),
@@ -7451,6 +8674,7 @@ impl NativeShell {
             projections.push(NativeHostProjection {
                 kind: NativeHostProjectionKind::Error,
                 client_model: None,
+                task_preview: None,
                 error: Some(
                     "native host action outcome retained under projection pressure".to_string(),
                 ),
@@ -7467,30 +8691,93 @@ impl NativeShell {
         &mut self,
         host_runtime: NativeHostClientRuntime,
     ) -> Result<(), NativeHostClientRuntime> {
+        self.attach_host_runtime_attachment(NativeHostRuntimeAttachment::Client(host_runtime))
+            .map_err(|attachment| match attachment {
+                NativeHostRuntimeAttachment::Client(runtime) => runtime,
+                NativeHostRuntimeAttachment::Injected(_) => {
+                    unreachable!("client attach cannot return injected attachment")
+                }
+            })
+    }
+
+    fn attach_host_runtime_attachment(
+        &mut self,
+        attachment: NativeHostRuntimeAttachment,
+    ) -> Result<(), NativeHostRuntimeAttachment> {
         if self.host_runtime.is_some() {
-            return Err(host_runtime);
+            return Err(attachment);
         }
-        if let Err(error) = host_runtime.validate_attachment(&self.profile) {
-            self.host_state = NativeHostState::Error {
-                message: bounded_host_error(error.to_string()),
-            };
-            return Err(host_runtime);
+        match &attachment {
+            NativeHostRuntimeAttachment::Client(runtime) => {
+                if let Err(error) = runtime.validate_attachment(&self.profile) {
+                    self.host_state = NativeHostState::Error {
+                        message: bounded_host_error(error.to_string()),
+                    };
+                    return Err(attachment);
+                }
+                self.interaction.sync_host_epochs(runtime.epochs());
+            }
+            NativeHostRuntimeAttachment::Injected(runtime) => {
+                self.interaction.sync_host_epochs(runtime.epochs());
+            }
         }
-        self.interaction.sync_host_epochs(host_runtime.epochs());
-        self.host_runtime = Some(NativeHostRuntimeAttachment::Client(host_runtime));
-        self.host_state = NativeHostState::Connected {
-            endpoint: self
-                .host_runtime
-                .as_ref()
-                .and_then(|attachment| match attachment {
-                    NativeHostRuntimeAttachment::Client(runtime) => Some(runtime.endpoint()),
-                    NativeHostRuntimeAttachment::Injected(_) => None,
-                })
-                .expect("runtime attached")
-                .to_string(),
+        let host_state = match &attachment {
+            NativeHostRuntimeAttachment::Client(runtime) => NativeHostState::Connected {
+                endpoint: runtime.endpoint().to_string(),
+            },
+            NativeHostRuntimeAttachment::Injected(runtime) => runtime.host_state(),
         };
-        let _ = self.dispatch_agent_connection_query(false);
+        self.host_runtime = Some(attachment);
+        self.host_state = host_state;
         Ok(())
+    }
+
+    fn poll_pending_host_bootstrap(&mut self) -> bool {
+        let Some(pending) = self.pending_bootstrap.as_mut() else {
+            return false;
+        };
+        let Some(result_rx) = pending.result_rx.as_mut() else {
+            return false;
+        };
+        let received = match result_rx.try_recv() {
+            Ok(result) => Some(result),
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => Some(Err(NativeShellError::HostConnect {
+                message: "native host bootstrap worker disconnected".to_string(),
+            })),
+        };
+        let Some(result) = received else {
+            return false;
+        };
+        let mut pending = self
+            .pending_bootstrap
+            .take()
+            .expect("pending bootstrap present after try_recv");
+        // Drop the receiver before joining/retaining so a racing send still
+        // cleans the runtime on the bootstrap thread. Taking worker prevents
+        // Drop from joining twice.
+        drop(pending.result_rx.take());
+        let worker = pending.worker.take();
+        match result {
+            Ok(attachment) => {
+                if let Err(returned) = self.attach_host_runtime_attachment(attachment) {
+                    drop(returned);
+                    self.host_state = NativeHostState::Error {
+                        message: bounded_host_error(
+                            "native host runtime already attached during bootstrap",
+                        ),
+                    };
+                }
+            }
+            Err(error) => {
+                eprintln!("devmanager native host bootstrap failed: {error}");
+                self.host_state = NativeHostState::Error {
+                    message: bounded_host_error(error.to_string()),
+                };
+            }
+        }
+        finish_pending_bootstrap_worker(worker);
+        true
     }
 
     pub fn accessibility_tree(&self) -> &AccessibilityTree {
@@ -7516,6 +8803,7 @@ impl NativeShell {
     /// This is a pure handoff; no client, subscription, or second connection
     /// is created by the shell.
     fn apply_task_list(&mut self, task_list: TaskList) {
+        self.cache_current_composer_draft();
         let pending = self
             .pending_select_task
             .filter(|task_id| task_list.task_ids().contains(task_id));
@@ -7529,13 +8817,43 @@ impl NativeShell {
         });
         self.interaction.sync_selected_task(selected_task);
         self.task_list = task_list;
+        let previous_draft_count = self.composer_drafts.len();
+        self.composer_drafts
+            .retain(|key, _| self.task_list.task_ids().contains(&key.task_id));
+        self.composer_drafts_dirty |= self.composer_drafts.len() != previous_draft_count;
         self.refresh_accessibility_tree();
     }
 
+    /// Fail closed on invalid TaskPreview/ClientModel payload combinations, then
+    /// apply at most one validated payload.
+    fn apply_validated_host_projection_payloads(
+        &mut self,
+        projection: &NativeHostProjection,
+    ) -> Result<(), String> {
+        match validate_host_projection_payloads(projection)? {
+            ValidatedHostProjectionPayload::None => Ok(()),
+            ValidatedHostProjectionPayload::TaskPreview(preview) => {
+                self.apply_task_preview(preview)
+            }
+            ValidatedHostProjectionPayload::ClientModel(model) => {
+                self.apply_client_model(model)?;
+                if self.last_action_failure.is_none() {
+                    self.restore_connected_host_state();
+                }
+                Ok(())
+            }
+        }
+    }
+
     pub fn apply_client_model(&mut self, model: Arc<ClientModel>) -> Result<(), String> {
+        let first_canonical = self.client_model.is_none();
+        let previous_selected_task = self.interaction.selected_task();
         let task_list = TaskList::from_client_model_virtual(&model)
             .map_err(|error| format!("client model task projection failed: {error:?}"))?;
         self.apply_task_list(task_list);
+        let selected_task_changed = self.interaction.selected_task() != previous_selected_task;
+        let selected_task_needs_initial_follow =
+            self.interaction.selected_task() != self.cockpit.selected_task();
         self.inbox = Inbox::from_model(&model);
         self.client_model = Some(Arc::clone(&model));
         self.interaction.bind_projected_model(Arc::clone(&model));
@@ -7543,8 +8861,98 @@ impl NativeShell {
         self.sync_header_projection();
         let client_epoch = self.interaction.action_epochs().client_epoch;
         self.rebind_pending_client_epoch(client_epoch);
-        self.sync_cockpit_follow();
+        self.sync_cockpit_follow_with_refresh(
+            selected_task_changed || selected_task_needs_initial_follow,
+        );
+        if first_canonical {
+            let _ = self.dispatch_action(ActionRequest::HostStatus);
+            let _ = self.dispatch_agent_connection_query(false);
+        }
         Ok(())
+    }
+
+    /// Project a Tasks-only preview into the inbox without installing ClientModel
+    /// or enabling mutation/action paths that require the canonical subscription.
+    pub fn apply_task_preview(&mut self, preview: Arc<TaskInboxPreview>) -> Result<(), String> {
+        let task_list = TaskList::from_task_preview(preview.as_ref())
+            .map_err(|error| format!("task preview projection failed: {error:?}"))?;
+        self.apply_task_list(task_list);
+        self.inbox = Inbox::from_task_preview(preview.as_ref());
+        Ok(())
+    }
+
+    pub fn task_list_ids(&self) -> Vec<TaskId> {
+        self.task_list.task_ids().to_vec()
+    }
+
+    pub fn mutations_enabled(&self) -> bool {
+        self.client_model.is_some()
+    }
+
+    pub fn clear_selected_task(&mut self) {
+        self.interaction.sync_selected_task(None);
+        self.sync_cockpit_follow();
+    }
+
+    pub fn main_conversation_canvas(&self) -> MainConversationCanvas {
+        if self.interaction.selected_task().is_some() {
+            if self.cockpit.dock().showing_raw_terminal() {
+                MainConversationCanvas::TaskTerminal
+            } else {
+                MainConversationCanvas::TaskConversation
+            }
+        } else {
+            MainConversationCanvas::IdlePhoto {
+                has_image: self.splash_image.is_some(),
+            }
+        }
+    }
+
+    pub fn install_idle_conversation_photo_for_test(&mut self) {
+        self.splash_image = Some(test_idle_conversation_photo());
+        self.splash_fetch_in_flight = false;
+        self.splash_fetch_attempted = true;
+    }
+
+    pub fn idle_photo_fetch_spawn_count_for_test(&self) -> usize {
+        self.idle_photo_fetch_spawns
+    }
+
+    fn ensure_idle_conversation_photo(&mut self, cx: &mut Context<Self>) {
+        if !admit_idle_conversation_photo_fetch(
+            self.interaction.selected_task().is_some(),
+            self.splash_image.is_some(),
+            self.splash_fetch_attempted,
+            self.splash_fetch_in_flight,
+        ) {
+            return;
+        }
+        self.splash_fetch_attempted = true;
+        self.splash_fetch_in_flight = true;
+        self.idle_photo_fetch_spawns = self.idle_photo_fetch_spawns.saturating_add(1);
+        Self::spawn_idle_conversation_photo_fetch(cx);
+    }
+
+    fn spawn_idle_conversation_photo_fetch(cx: &mut Context<Self>) {
+        let executor = cx.background_executor().clone();
+        cx.spawn(
+            move |this: gpui::WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let mut async_cx = cx.clone();
+                async move {
+                    let image = executor
+                        .spawn(async move { fetch_idle_conversation_photo() })
+                        .await;
+                    let _ = this.update(&mut async_cx, |shell, cx| {
+                        shell.splash_fetch_in_flight = false;
+                        if let Some(image) = image {
+                            shell.splash_image = Some(image);
+                        }
+                        cx.notify();
+                    });
+                }
+            },
+        )
+        .detach();
     }
 
     pub fn inbox_render_model(&self, width: InboxPresentationWidth) -> InboxRenderModel {
@@ -7644,23 +9052,363 @@ impl NativeShell {
     }
 
     fn sync_cockpit_follow(&mut self) {
-        let Some(task_id) = self.interaction.selected_task() else {
+        let refresh_host_surfaces =
+            self.interaction.selected_task() != self.cockpit.selected_task();
+        self.sync_cockpit_follow_with_refresh(refresh_host_surfaces);
+    }
+
+    fn sync_cockpit_follow_with_refresh(&mut self, refresh_host_surfaces: bool) {
+        self.cache_current_composer_draft();
+        let selected_task = self.interaction.selected_task();
+        if self.layout.selected_task != selected_task {
+            self.layout.selected_task = selected_task;
+            self.persist_layout();
+        }
+        let Some(task_id) = selected_task else {
             self.clear_cockpit_projection();
-            self.composer = None;
+            self.clear_composer_binding();
             return;
         };
         self.cockpit.follow_task(task_id);
-        if let Some(model) = self.client_model.clone() {
+        let composer_model = if let Some(model) = self.client_model.clone() {
             self.cockpit
                 .follow_projection(model.as_ref(), self.granted_capabilities());
-            self.sync_task_composer(model.as_ref(), task_id);
+            Some(model)
         } else {
-            self.composer = None;
+            self.clear_composer_binding();
             self.cockpit.clear_timeline();
+            None
+        };
+        if refresh_host_surfaces {
+            self.refresh_selected_cockpit_surfaces();
         }
-        self.refresh_selected_cockpit_surfaces();
+        if let Some(model) = composer_model {
+            self.sync_task_composer(model.as_ref(), task_id);
+        }
         self.sync_terminal_from_cockpit();
         self.sync_header_projection();
+    }
+
+    fn cache_current_composer_draft(&mut self) {
+        let Some(composer) = self.composer.as_ref() else {
+            return;
+        };
+        let fence = composer.fence();
+        let task_id = fence.task_id;
+        let key = ComposerDraftKey::new(task_id, fence.agent_session_id);
+        if !self.task_list.task_ids().contains(&task_id) {
+            let previous_draft_count = self.composer_drafts.len();
+            self.composer_drafts
+                .retain(|candidate, _| candidate.task_id != task_id);
+            self.composer_drafts_dirty |= self.composer_drafts.len() != previous_draft_count;
+            return;
+        }
+        let draft = composer.draft_projection();
+        let text_changed = self
+            .composer_drafts
+            .get(&key)
+            .is_none_or(|cached| cached.text != draft.text);
+        if draft.text.starts_with('/') {
+            if text_changed {
+                self.slash_command_menu_dismissed = false;
+            }
+        } else {
+            self.slash_command_selection = 0;
+            self.slash_command_menu_dismissed = false;
+        }
+        if draft.text.is_empty() && draft.attachments.is_empty() && draft.prompt.is_none() {
+            self.composer_drafts_dirty |= self.composer_drafts.remove(&key).is_some();
+        } else if self.composer_drafts.get(&key) != Some(&draft) {
+            self.composer_drafts.insert(key, draft);
+            self.composer_drafts_dirty = true;
+        }
+    }
+
+    fn clear_composer_binding(&mut self) {
+        self.composer = None;
+        self.composer_marked_range = None;
+        self.slash_command_selection = 0;
+        self.slash_command_menu_dismissed = false;
+    }
+
+    fn active_provider_kind(&self) -> Option<ProviderKind> {
+        let task_id = self.interaction.selected_task()?;
+        let snapshot = self.client_model.as_ref()?.task(task_id)?;
+        let agent_id = snapshot.primary_agent_id?;
+        snapshot
+            .agents
+            .get(&agent_id)
+            .map(|agent| agent.provider_kind.clone())
+    }
+
+    fn slash_command_suggestions(&self) -> Vec<ProviderCommandSuggestion> {
+        if self.slash_command_menu_dismissed {
+            return Vec::new();
+        }
+        let draft = self
+            .composer
+            .as_ref()
+            .map(TaskComposer::draft_text)
+            .unwrap_or("");
+        if !draft.starts_with('/') || draft.chars().any(char::is_whitespace) {
+            return Vec::new();
+        }
+        self.slash_command_catalog
+            .iter()
+            .cloned()
+            .filter(|suggestion| suggestion.command.starts_with(draft))
+            .take(8)
+            .collect()
+    }
+
+    fn refresh_slash_command_catalog(
+        &mut self,
+        snapshot: &crate::domain::TaskSnapshot,
+        agent_session_id: AgentSessionId,
+    ) {
+        let Some(agent) = snapshot.agents.get(&agent_session_id) else {
+            return;
+        };
+        let key = (snapshot.task.id, agent.provider_kind.clone());
+        if self.slash_command_catalog_key.as_ref() == Some(&key) {
+            return;
+        }
+        let mut catalog = provider_command_catalog(&agent.provider_kind);
+        let provider = match agent.provider_kind {
+            ProviderKind::ClaudeCode => {
+                Some(crate::remote::web::command_catalog::SlashCommandProvider::Claude)
+            }
+            ProviderKind::Codex => {
+                Some(crate::remote::web::command_catalog::SlashCommandProvider::Codex)
+            }
+            ProviderKind::Cursor => None,
+        };
+        if let (Some(provider), Some(binding)) = (provider, snapshot.task.workspace.host_binding())
+        {
+            let project_root = binding.project_root().path();
+            let session_cwd = binding.workspace_root().path();
+            let discovered = crate::remote::web::command_catalog::discover_slash_commands(
+                provider,
+                Some(project_root),
+                session_cwd,
+                dirs::home_dir().as_deref(),
+                crate::remote::web::command_catalog::DiscoveryLimits::default(),
+            );
+            for command in discovered {
+                if catalog
+                    .iter()
+                    .any(|builtin| builtin.command == command.name)
+                {
+                    continue;
+                }
+                catalog.push(ProviderCommandSuggestion {
+                    label: command.description,
+                    command: command.name,
+                    provider_kind: match agent.provider_kind {
+                        ProviderKind::ClaudeCode => "claude",
+                        ProviderKind::Codex => "codex",
+                        ProviderKind::Cursor => "cursor",
+                    }
+                    .to_string(),
+                });
+            }
+        }
+        catalog.sort_by(|left, right| left.command.cmp(&right.command));
+        self.slash_command_catalog_key = Some(key);
+        self.slash_command_catalog = catalog;
+        self.slash_command_selection = 0;
+    }
+
+    /// Adopt the shell's current focus epoch only at the boundary of a fresh
+    /// local input gesture. Background projections may legitimately advance
+    /// the shell epoch while the same task stays selected; leaving the bound
+    /// composer on the previous epoch makes the visible input focusable but
+    /// rejects every subsequent Windows text transaction as stale.
+    fn rearm_composer_focus(&mut self) -> Result<FocusEpoch, ComposerError> {
+        let epoch = self.interaction.current_focus_epoch();
+        let composer = self
+            .composer
+            .as_mut()
+            .ok_or_else(|| ComposerError::Unavailable {
+                control: ComposerControl::SendNow,
+                reason: "composer is unavailable".to_string(),
+            })?;
+        composer.set_focus_epoch(epoch)?;
+        Ok(epoch)
+    }
+
+    fn focus_current_composer_input(&mut self) -> Result<FocusEpoch, ComposerError> {
+        let epoch = self.rearm_composer_focus()?;
+        self.composer
+            .as_mut()
+            .expect("rearming requires a bound composer")
+            .focus_input(epoch)?;
+        Ok(epoch)
+    }
+
+    fn insert_slash_command(&mut self, command: &str) -> bool {
+        let Ok(epoch) = self.focus_current_composer_input() else {
+            return false;
+        };
+        let Some(composer) = self.composer.as_mut() else {
+            return false;
+        };
+        let scalar_len = composer.draft_text().chars().count();
+        if composer
+            .replace_draft_range(0..scalar_len, command, epoch)
+            .is_err()
+        {
+            return false;
+        }
+        self.slash_command_selection = 0;
+        self.slash_command_menu_dismissed = false;
+        self.cache_current_composer_draft();
+        true
+    }
+
+    fn accept_selected_slash_command(&mut self) -> bool {
+        let suggestions = self.slash_command_suggestions();
+        let Some(selected) = suggestions.get(
+            self.slash_command_selection
+                .min(suggestions.len().saturating_sub(1)),
+        ) else {
+            return false;
+        };
+        if self
+            .composer
+            .as_ref()
+            .is_some_and(|composer| composer.draft_text() == selected.command)
+        {
+            return false;
+        }
+        self.insert_slash_command(&selected.command)
+    }
+
+    fn set_provider_terminal_visible(&mut self, visible: bool) {
+        let Some(model) = self.client_model.as_ref().cloned() else {
+            return;
+        };
+        let result = if visible {
+            self.cockpit
+                .dock_mut()
+                .switch_to_raw_terminal(model.as_ref(), None)
+        } else {
+            self.cockpit
+                .dock_mut()
+                .switch_to_semantic(model.as_ref(), None)
+        };
+        if let Err(error) = result {
+            self.composer_error = Some(format!("{error:?}"));
+        } else {
+            self.pending_terminal_focus = visible;
+        }
+        self.sync_terminal_from_cockpit();
+    }
+
+    fn dispatch_provider_terminal_text(&mut self, text: String) -> bool {
+        if text.is_empty() || !self.cockpit.dock().showing_raw_terminal() {
+            return false;
+        }
+        let Some(model) = self.client_model.as_ref() else {
+            self.composer_error = Some("host model unavailable".into());
+            return false;
+        };
+        let Some(task_id) = self.interaction.selected_task() else {
+            self.composer_error = Some("select a task before using its terminal".into());
+            return false;
+        };
+        let Some(snapshot) = model.task(task_id) else {
+            self.composer_error = Some("task projection unavailable".into());
+            return false;
+        };
+        let Some(agent_session_id) = snapshot.primary_agent_id else {
+            self.composer_error = Some("primary agent is not bound".into());
+            return false;
+        };
+        let Some(agent) = snapshot.agents.get(&agent_session_id) else {
+            self.composer_error = Some("primary agent facts are unavailable".into());
+            return false;
+        };
+        let Some(turn_id) = snapshot
+            .provider_sessions
+            .get(&agent_session_id)
+            .and_then(|provider| provider.current_turn)
+        else {
+            // Hold keystrokes until the turn exists. Switching into Terminal must
+            // not surface a red "turn not ready" composer error.
+            return false;
+        };
+        let request =
+            ActionRequest::ProviderInput(crate::client::action::ProviderInputActionRequest {
+                command_id: CommandId::new(),
+                action_id: action::ACTION_PROVIDER_TERMINAL_INPUT,
+                arguments: crate::client::action::ProviderInputArguments {
+                    task_id,
+                    agent_session_id,
+                    runtime_generation: agent.runtime_generation,
+                    action_epoch: snapshot.task.action_epoch,
+                    turn_id,
+                    question_id: None,
+                    approval_id: None,
+                    text: Some(text),
+                    wait: None,
+                    allow: None,
+                },
+            });
+        match self.dispatch_action_checked(request) {
+            Ok(()) => {
+                self.composer_error = None;
+                true
+            }
+            Err(failure) => {
+                self.composer_error = Some(failure.message);
+                false
+            }
+        }
+    }
+
+    fn handle_provider_terminal_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.cockpit.dock().showing_raw_terminal() {
+            return;
+        }
+        let command = event.keystroke.modifiers.control || event.keystroke.modifiers.platform;
+        let text = if command && event.keystroke.key.eq_ignore_ascii_case("v") {
+            cx.read_from_clipboard().and_then(|item| item.text())
+        } else {
+            native_terminal_key_text(&event.keystroke)
+        };
+        if let Some(text) = text {
+            let _ = self.dispatch_provider_terminal_text(text);
+            window.prevent_default();
+        }
+    }
+
+    fn flush_composer_drafts_if_due(&mut self, force: bool) {
+        if !self.composer_drafts_dirty {
+            return;
+        }
+        let now = Instant::now();
+        let due = force
+            || self
+                .last_composer_draft_persist
+                .map(|last| now.duration_since(last) >= COMPOSER_DRAFT_PERSIST_INTERVAL)
+                .unwrap_or(true);
+        if !due {
+            return;
+        }
+        self.last_composer_draft_persist = Some(now);
+        match self.composer_draft_store.save(&self.composer_drafts) {
+            Ok(()) => self.composer_drafts_dirty = false,
+            Err(error) => eprintln!(
+                "devmanager: composer drafts not persisted ({}): {error}",
+                self.composer_draft_store.path().display()
+            ),
+        }
     }
 
     fn granted_capabilities(&self) -> CapabilitySet {
@@ -7671,19 +9419,198 @@ impl NativeShell {
         }
     }
 
-    fn handle_composer_key(&mut self, event: &KeyDownEvent, window: &mut Window) {
-        let epoch = self.interaction.current_focus_epoch();
-        let focused = self
-            .composer
-            .as_mut()
-            .map(|composer| composer.focus_input(epoch).is_ok())
-            .unwrap_or(false);
-        if !focused {
+    fn composer_utf16_selection(&self) -> Option<Range<usize>> {
+        let composer = self.composer.as_ref()?;
+        let text = composer.draft_text();
+        let total = text.encode_utf16().count();
+        if composer.draft_is_all_selected() {
+            return Some(0..total);
+        }
+        let cursor = text
+            .chars()
+            .take(composer.draft_cursor())
+            .map(char::len_utf16)
+            .sum();
+        Some(cursor..cursor)
+    }
+
+    fn scalar_boundary_for_utf16(text: &str, requested: usize) -> (usize, usize) {
+        let mut utf16 = 0usize;
+        let mut scalar = 0usize;
+        for character in text.chars() {
+            let next = utf16.saturating_add(character.len_utf16());
+            if requested < next {
+                break;
+            }
+            utf16 = next;
+            scalar = scalar.saturating_add(1);
+        }
+        (scalar, utf16)
+    }
+
+    /// Apply one platform text-input transaction to the task-owned composer.
+    /// GPUI delivers paste, accessibility replacement, and IME commit through
+    /// this path; it must land in the same bounded field and draft store as
+    /// ordinary key editing.
+    fn replace_composer_platform_text(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        text: &str,
+    ) -> Result<Range<usize>, ComposerError> {
+        let epoch = self.focus_current_composer_input()?;
+        let selection = self.composer_utf16_selection().unwrap_or(0..0);
+        let requested = range_utf16
+            .or_else(|| self.composer_marked_range.take())
+            .unwrap_or(selection);
+        let (scalar_range, actual_start_utf16) = {
+            let composer = self
+                .composer
+                .as_ref()
+                .ok_or_else(|| ComposerError::Unavailable {
+                    control: ComposerControl::SendNow,
+                    reason: "composer is unavailable".to_string(),
+                })?;
+            let value = composer.draft_text();
+            let (start_scalar, start_utf16) =
+                Self::scalar_boundary_for_utf16(value, requested.start);
+            let (mut end_scalar, _) = Self::scalar_boundary_for_utf16(value, requested.end);
+            if end_scalar < start_scalar {
+                end_scalar = start_scalar;
+            }
+            (start_scalar..end_scalar, start_utf16)
+        };
+        let changed = {
+            let composer = self
+                .composer
+                .as_mut()
+                .ok_or_else(|| ComposerError::Unavailable {
+                    control: ComposerControl::SendNow,
+                    reason: "composer is unavailable".to_string(),
+                })?;
+            composer.replace_draft_range(scalar_range, text, epoch)?
+        };
+        self.composer_marked_range = None;
+        if changed {
+            self.cache_current_composer_draft();
+        }
+        let inserted_end = actual_start_utf16.saturating_add(text.encode_utf16().count());
+        Ok(actual_start_utf16..inserted_end)
+    }
+
+    fn handle_composer_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let epoch = match self.focus_current_composer_input() {
+            Ok(epoch) => epoch,
+            Err(error) => {
+                self.composer_error = Some(error.to_string());
+                return;
+            }
+        };
+        self.composer_error = None;
+        let key = event.keystroke.key.as_str();
+        let command = event.keystroke.modifiers.control || event.keystroke.modifiers.platform;
+        if key == "escape" && !self.slash_command_suggestions().is_empty() {
+            self.slash_command_menu_dismissed = true;
+            window.prevent_default();
+            cx.stop_propagation();
             return;
         }
-        let key = event.keystroke.key.as_str();
+        if (key == "up" || key == "down") && !self.slash_command_suggestions().is_empty() {
+            let count = self.slash_command_suggestions().len();
+            self.slash_command_selection = if key == "up" {
+                self.slash_command_selection
+                    .checked_sub(1)
+                    .unwrap_or(count - 1)
+            } else {
+                (self.slash_command_selection + 1) % count
+            };
+            window.prevent_default();
+            cx.stop_propagation();
+            return;
+        }
+        if command && key == "a" {
+            if let Some(composer) = self.composer.as_mut() {
+                let _ = composer.select_all_draft(epoch);
+            }
+            window.prevent_default();
+            cx.stop_propagation();
+            return;
+        }
+        if command && key == "v" {
+            if self.paste_composer_clipboard_image(cx) {
+                window.prevent_default();
+                cx.stop_propagation();
+                return;
+            }
+            if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                let changed = self
+                    .composer
+                    .as_mut()
+                    .and_then(|composer| composer.paste_text(&text, epoch).ok())
+                    .unwrap_or(false);
+                if changed {
+                    self.composer_marked_range = None;
+                    self.cache_current_composer_draft();
+                }
+            }
+            window.prevent_default();
+            cx.stop_propagation();
+            return;
+        }
+        if command && (key == "c" || key == "x") {
+            let selected = self.composer.as_ref().and_then(|composer| {
+                composer
+                    .draft_is_all_selected()
+                    .then(|| composer.draft_text().to_string())
+            });
+            if let Some(selected) = selected {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(selected));
+                if key == "x" {
+                    let scalar_len = self
+                        .composer
+                        .as_ref()
+                        .map(|composer| composer.draft_text().chars().count())
+                        .unwrap_or(0);
+                    let changed = self
+                        .composer
+                        .as_mut()
+                        .and_then(|composer| {
+                            composer.replace_draft_range(0..scalar_len, "", epoch).ok()
+                        })
+                        .unwrap_or(false);
+                    if changed {
+                        self.cache_current_composer_draft();
+                    }
+                }
+            }
+            window.prevent_default();
+            cx.stop_propagation();
+            return;
+        }
+        if key == "enter" && event.keystroke.modifiers.shift {
+            let changed = self
+                .composer
+                .as_mut()
+                .and_then(|composer| composer.paste_text("\n", epoch).ok())
+                .unwrap_or(false);
+            if changed {
+                self.composer_marked_range = None;
+                self.cache_current_composer_draft();
+            }
+            window.prevent_default();
+            cx.stop_propagation();
+            return;
+        }
         if key == "enter" && !event.keystroke.modifiers.shift {
             window.prevent_default();
+            cx.stop_propagation();
+            if self.accept_selected_slash_command() {
+                return;
+            }
             self.activate_composer_control(ComposerControl::SendNow);
             return;
         }
@@ -7694,16 +9621,6 @@ impl NativeShell {
             "right" => Some(TextFieldKey::Right),
             "home" => Some(TextFieldKey::Home),
             "end" => Some(TextFieldKey::End),
-            "space" => Some(TextFieldKey::Character(' ')),
-            _ if !event.keystroke.modifiers.control
-                && !event.keystroke.modifiers.platform
-                && !event.keystroke.modifiers.alt =>
-            {
-                event.keystroke.key_char.as_deref().and_then(|text| {
-                    (text.chars().count() == 1)
-                        .then(|| TextFieldKey::Character(text.chars().next().unwrap()))
-                })
-            }
             _ => None,
         };
         if let Some(input) = input {
@@ -7714,20 +9631,37 @@ impl NativeShell {
                 .unwrap_or(false);
             if handled {
                 window.prevent_default();
+                cx.stop_propagation();
+                self.cache_current_composer_draft();
             }
         }
     }
 
     fn activate_composer_control(&mut self, control: ComposerControl) {
-        let epoch = self.interaction.current_focus_epoch();
+        let epoch = match self.rearm_composer_focus() {
+            Ok(epoch) => epoch,
+            Err(error) => {
+                self.composer_error = Some(error.to_string());
+                return;
+            }
+        };
+        let attachment_only = control == ComposerControl::SendNow
+            && !self.current_composer_images().is_empty()
+            && self
+                .composer
+                .as_ref()
+                .is_some_and(|composer| composer.draft_text().trim().is_empty());
         let intent = {
             let Some(composer) = self.composer.as_mut() else {
                 return;
             };
-            match composer
-                .focus_control(control, epoch)
-                .and_then(|_| composer.activate(control, epoch))
-            {
+            match composer.focus_control(control, epoch).and_then(|_| {
+                if attachment_only {
+                    composer.activate_attachment_only_send(epoch)
+                } else {
+                    composer.activate(control, epoch)
+                }
+            }) {
                 Ok(intent) => intent,
                 Err(error) => {
                     self.composer_error = Some(error.to_string());
@@ -7739,7 +9673,13 @@ impl NativeShell {
     }
 
     fn activate_composer_approval(&mut self, decision: ApprovalDecision) {
-        let epoch = self.interaction.current_focus_epoch();
+        let epoch = match self.rearm_composer_focus() {
+            Ok(epoch) => epoch,
+            Err(error) => {
+                self.composer_error = Some(error.to_string());
+                return;
+            }
+        };
         let intent = {
             let Some(composer) = self.composer.as_mut() else {
                 return;
@@ -7764,18 +9704,108 @@ impl NativeShell {
         self.dispatch_composer_intent(intent);
     }
 
+    fn activate_composer_answer_option(&mut self, index: usize, label: String) {
+        let Ok(index) = u16::try_from(index) else {
+            return;
+        };
+        let epoch = match self.rearm_composer_focus() {
+            Ok(epoch) => epoch,
+            Err(error) => {
+                self.composer_error = Some(error.to_string());
+                return;
+            }
+        };
+        let intent = {
+            let Some(composer) = self.composer.as_mut() else {
+                return;
+            };
+            let Some((request_id, revision)) = composer.pending_question_identity() else {
+                self.composer_error = Some("question identity unavailable".into());
+                return;
+            };
+            let fence = composer.fence();
+            match composer
+                .focus_control(ComposerControl::Answer, epoch)
+                .and_then(|_| {
+                    composer.activate_answer(
+                        request_id,
+                        revision,
+                        fence,
+                        AnswerPayload::Option { index, label },
+                        epoch,
+                    )
+                }) {
+                Ok(intent) => intent,
+                Err(error) => {
+                    self.composer_error = Some(error.to_string());
+                    return;
+                }
+            }
+        };
+        self.dispatch_composer_intent(intent);
+    }
+
     fn dispatch_composer_intent(&mut self, intent: ComposerIntent) {
         let fence = intent.fence;
+        let command_id = intent.command_id;
+        let consumes_draft = matches!(
+            &intent.payload,
+            ComposerPayload::SendNow { .. }
+                | ComposerPayload::Steer { .. }
+                | ComposerPayload::QueueFollowUp { .. }
+                | ComposerPayload::Answer {
+                    answer: AnswerPayload::Text(_),
+                    ..
+                }
+        );
+        let provider_kind = self.active_provider_kind();
+        let is_slash_command_send = matches!(&intent.payload, ComposerPayload::SendNow { .. });
+        let submission = consumes_draft.then(|| {
+            let key = ComposerDraftKey::new(fence.task_id, fence.agent_session_id);
+            PendingComposerSubmission {
+                key,
+                draft: self
+                    .composer
+                    .as_ref()
+                    .map(TaskComposer::draft_projection)
+                    .unwrap_or(ComposerDraftProjection {
+                        text: String::new(),
+                        attachments: Vec::new(),
+                        prompt: None,
+                    }),
+                image_ids: self
+                    .composer_images
+                    .get(&key)
+                    .map(|images| images.iter().map(|image| image.id).collect())
+                    .unwrap_or_default(),
+                open_provider_terminal: is_slash_command_send
+                    && provider_kind.as_ref().is_some_and(|provider_kind| {
+                        self.composer.as_ref().is_some_and(|composer| {
+                            provider_command_opens_terminal(provider_kind, composer.draft_text())
+                        })
+                    }),
+            }
+        });
+        let intent = self.prefix_composer_intent_with_images(intent);
         let provider_identity = {
             let Some(model) = self.client_model.as_ref() else {
+                if let Some(composer) = self.composer.as_mut() {
+                    let _ = composer.cancel_pending(command_id);
+                }
                 self.composer_error = Some("host model unavailable".into());
                 return;
             };
             let Some(snapshot) = model.task(fence.task_id) else {
+                if let Some(composer) = self.composer.as_mut() {
+                    let _ = composer.cancel_pending(command_id);
+                }
                 self.composer_error = Some("task projection unavailable".into());
                 return;
             };
             let Some(provider) = snapshot.provider_sessions.get(&fence.agent_session_id) else {
+                if let Some(composer) = self.composer.as_mut() {
+                    let _ = composer.cancel_pending(command_id);
+                }
                 self.composer_error = Some("provider projection unavailable".into());
                 return;
             };
@@ -7785,61 +9815,434 @@ impl NativeShell {
                 provider.open_approval,
             )
         };
-        let request = intent.to_provider_input_request(
+        let request = match intent.to_provider_input_request(
             provider_identity.0,
             provider_identity.1,
             provider_identity.2,
-        );
-        match request.and_then(|request| {
-            if self.dispatch_action(request).is_some() {
-                Err(ComposerError::Unavailable {
-                    control: ComposerControl::SendNow,
-                    reason: "host action lane rejected composer intent".into(),
-                })
-            } else {
-                Ok(())
+        ) {
+            Ok(request) => request,
+            Err(error) => {
+                if let Some(composer) = self.composer.as_mut() {
+                    let _ = composer.cancel_pending(command_id);
+                }
+                self.composer_error = Some(error.to_string());
+                return;
             }
-        }) {
-            Ok(()) => self.composer_error = None,
-            Err(error) => self.composer_error = Some(error.to_string()),
+        };
+        match self.dispatch_action_checked(request) {
+            Ok(()) => {
+                if let Some(submission) = submission {
+                    self.pending_composer_submissions
+                        .insert(command_id, submission);
+                }
+                self.composer_error = None;
+            }
+            Err(failure) => {
+                if failure.record.is_some() {
+                    if let Some(submission) = submission {
+                        self.pending_composer_submissions
+                            .insert(command_id, submission);
+                    }
+                } else if let Some(composer) = self.composer.as_mut() {
+                    let _ = composer.cancel_pending(command_id);
+                }
+                self.composer_error = Some(
+                    ComposerError::Unavailable {
+                        control: ComposerControl::SendNow,
+                        reason: failure.message,
+                    }
+                    .to_string(),
+                );
+            }
+        }
+    }
+
+    fn prefix_composer_intent_with_images(&self, mut intent: ComposerIntent) -> ComposerIntent {
+        let key = ComposerDraftKey::new(intent.fence.task_id, intent.fence.agent_session_id);
+        let references = self
+            .composer_images
+            .get(&key)
+            .map(|images| {
+                images
+                    .iter()
+                    .map(|image| image.prompt_reference.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .unwrap_or_default();
+        if references.is_empty() {
+            return intent;
+        }
+        match &mut intent.payload {
+            ComposerPayload::SendNow { text, .. }
+            | ComposerPayload::Steer { text, .. }
+            | ComposerPayload::QueueFollowUp { text, .. }
+            | ComposerPayload::SaveDraft { text, .. } => {
+                if text.trim().is_empty() {
+                    *text = references;
+                } else {
+                    *text = format!("{references} {text}");
+                }
+            }
+            ComposerPayload::Answer {
+                answer: AnswerPayload::Text(text),
+                ..
+            } => {
+                if text.trim().is_empty() {
+                    *text = references;
+                } else {
+                    *text = format!("{references} {text}");
+                }
+            }
+            _ => {}
+        }
+        intent
+    }
+
+    fn current_composer_draft_key(&self) -> Option<ComposerDraftKey> {
+        self.composer.as_ref().map(|composer| {
+            let fence = composer.fence();
+            ComposerDraftKey::new(fence.task_id, fence.agent_session_id)
+        })
+    }
+
+    fn current_composer_images(&self) -> &[NativeComposerImage] {
+        self.current_composer_draft_key()
+            .and_then(|key| self.composer_images.get(&key))
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    fn detach_composer_images_for_key(&mut self, key: ComposerDraftKey, image_ids: &[u64]) {
+        detach_native_composer_images_for_key(&mut self.composer_images, key, image_ids);
+    }
+
+    fn selected_task_workspace_root(&self) -> Result<PathBuf, String> {
+        let model = self
+            .client_model
+            .as_ref()
+            .ok_or_else(|| "host model unavailable".to_string())?;
+        let task_id = self
+            .interaction
+            .selected_task()
+            .ok_or_else(|| "select a task before attaching images".to_string())?;
+        let snapshot = model
+            .task(task_id)
+            .ok_or_else(|| "task projection unavailable".to_string())?;
+        let binding = snapshot
+            .task
+            .workspace
+            .host_binding()
+            .ok_or_else(|| "task workspace binding is missing".to_string())?;
+        let root = binding.workspace_root().path();
+        if root.as_os_str().is_empty() {
+            return Err("task workspace binding is missing".to_string());
+        }
+        Ok(root.to_path_buf())
+    }
+
+    fn admit_prepared_native_composer_images(
+        &mut self,
+        expected_key: ComposerDraftKey,
+        prepared: Vec<PreparedNativeComposerImage>,
+    ) -> Result<(), String> {
+        if self
+            .composer
+            .as_ref()
+            .and_then(TaskComposer::pending_intent)
+            .is_some()
+        {
+            discard_prepared_native_composer_images(prepared);
+            return Err(
+                "Wait for the current message to be accepted before attaching more images."
+                    .to_string(),
+            );
+        }
+        if self.current_composer_draft_key() != Some(expected_key) {
+            discard_prepared_native_composer_images(prepared);
+            return Err("The selected task changed before the images were attached.".to_string());
+        }
+        let count = self.composer_images.get(&expected_key).map_or(0, Vec::len);
+        if count.saturating_add(prepared.len()) > NATIVE_COMPOSER_IMAGE_MAX_COUNT {
+            discard_prepared_native_composer_images(prepared);
+            return Err(format!(
+                "Too many images. Max is {NATIVE_COMPOSER_IMAGE_MAX_COUNT}."
+            ));
+        }
+        let images = self.composer_images.entry(expected_key).or_default();
+        for prepared in prepared {
+            let id = self.next_composer_image_id;
+            self.next_composer_image_id = self.next_composer_image_id.saturating_add(1);
+            images.push(NativeComposerImage {
+                id,
+                path: prepared.staged.path,
+                prompt_reference: prepared.staged.prompt_reference,
+                label: prepared.label,
+                preview: prepared.preview,
+            });
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn admit_native_composer_image(
+        &mut self,
+        attachment: RemoteImageAttachment,
+    ) -> Result<(), String> {
+        let key = self
+            .current_composer_draft_key()
+            .ok_or_else(|| "composer is unavailable".to_string())?;
+        let workspace = self.selected_task_workspace_root()?;
+        let prepared = prepare_native_composer_image(&workspace, attachment)?;
+        self.admit_prepared_native_composer_images(key, vec![prepared])
+    }
+
+    fn remove_native_composer_image(&mut self, image_id: u64) {
+        if self
+            .composer
+            .as_ref()
+            .and_then(TaskComposer::pending_intent)
+            .is_some()
+        {
+            self.composer_error =
+                Some("Wait for the current message to be accepted before removing images.".into());
+            return;
+        }
+        let Some(key) = self.current_composer_draft_key() else {
+            return;
+        };
+        let Some(images) = self.composer_images.get_mut(&key) else {
+            return;
+        };
+        if let Some(index) = images.iter().position(|image| image.id == image_id) {
+            let removed = images.remove(index);
+            let _ = remove_staged_image(&StagedImageAttachment {
+                path: removed.path,
+                prompt_reference: removed.prompt_reference,
+            });
+        }
+        if self
+            .composer_images
+            .get(&key)
+            .is_some_and(|images| images.is_empty())
+        {
+            self.composer_images.remove(&key);
+        }
+    }
+
+    fn paste_composer_clipboard_image(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(item) = cx.read_from_clipboard() else {
+            return false;
+        };
+        let Some(image) = item.entries().iter().find_map(|entry| match entry {
+            ClipboardEntry::Image(image) => Some(image.clone()),
+            _ => None,
+        }) else {
+            return false;
+        };
+        let mime_type = match image.format {
+            ImageFormat::Png => "image/png",
+            ImageFormat::Jpeg => "image/jpeg",
+            _ => {
+                self.composer_error =
+                    Some("Unsupported pasted image type. Try PNG or JPEG.".to_string());
+                return true;
+            }
+        };
+        let attachment = RemoteImageAttachment {
+            mime_type: mime_type.to_string(),
+            file_name: Some(format!(
+                "clipboard-image.{}",
+                match image.format {
+                    ImageFormat::Jpeg => "jpg",
+                    _ => "png",
+                }
+            )),
+            bytes: image.bytes,
+        };
+        let Some(expected_key) = self.current_composer_draft_key() else {
+            self.composer_error = Some("composer is unavailable".to_string());
+            return true;
+        };
+        let workspace = match self.selected_task_workspace_root() {
+            Ok(workspace) => workspace,
+            Err(error) => {
+                self.composer_error = Some(error);
+                return true;
+            }
+        };
+        let executor = cx.background_executor().clone();
+        cx.spawn(
+            move |this: gpui::WeakEntity<NativeShell>, cx: &mut gpui::AsyncApp| {
+                let mut async_cx = cx.clone();
+                async move {
+                    let prepared = executor
+                        .spawn(async move { prepare_native_composer_image(&workspace, attachment) })
+                        .await;
+                    let _ = this.update(&mut async_cx, |shell, cx| {
+                        match prepared.and_then(|prepared| {
+                            shell
+                                .admit_prepared_native_composer_images(expected_key, vec![prepared])
+                        }) {
+                            Ok(()) => shell.composer_error = None,
+                            Err(error) => shell.composer_error = Some(error),
+                        }
+                        shell.pending_composer_focus = true;
+                        cx.notify();
+                    });
+                }
+            },
+        )
+        .detach();
+        true
+    }
+
+    fn schedule_composer_image_picker(&mut self, cx: &mut Context<Self>) {
+        if cfg!(test) {
+            return;
+        }
+        let Some(expected_key) = self.current_composer_draft_key() else {
+            self.composer_error = Some("composer is unavailable".to_string());
+            return;
+        };
+        let workspace = match self.selected_task_workspace_root() {
+            Ok(workspace) => workspace,
+            Err(error) => {
+                self.composer_error = Some(error);
+                return;
+            }
+        };
+        let rx = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some("Attach images".into()),
+        });
+        let executor = cx.background_executor().clone();
+        cx.spawn(
+            move |this: gpui::WeakEntity<NativeShell>, cx: &mut gpui::AsyncApp| {
+                let mut async_cx = cx.clone();
+                async move {
+                    let picked = match rx.await {
+                        Ok(Ok(Some(paths))) => paths,
+                        _ => return,
+                    };
+                    let prepared = executor
+                        .spawn(async move {
+                            prepare_native_composer_images_from_paths(&workspace, picked)
+                        })
+                        .await;
+                    let _ = this.update(&mut async_cx, |shell, cx| {
+                        match prepared.and_then(|prepared| {
+                            shell.admit_prepared_native_composer_images(expected_key, prepared)
+                        }) {
+                            Ok(()) => shell.composer_error = None,
+                            Err(error) => shell.composer_error = Some(error),
+                        }
+                        shell.pending_composer_focus = true;
+                        cx.notify();
+                    });
+                }
+            },
+        )
+        .detach();
+    }
+
+    fn idle_conversation_photo_surface(
+        &self,
+        tokens: crate::ui::tokens::ThemeTokens,
+        photo_size: Option<Size<Pixels>>,
+    ) -> AnyElement {
+        let surface = div()
+            .id("native-shell-idle-conversation-photo")
+            .flex()
+            .flex_col()
+            .min_h(px(0.0))
+            .min_w(px(0.0))
+            .overflow_hidden();
+        if let (Some(photo), Some(photo_size)) = (self.splash_image.as_ref(), photo_size) {
+            surface
+                .flex_none()
+                .w(photo_size.width)
+                .h(photo_size.height)
+                .child(
+                    img(ImageSource::Render(Arc::clone(photo)))
+                        .w(photo_size.width)
+                        .h(photo_size.height)
+                        .object_fit(ObjectFit::Cover),
+                )
+                .into_any_element()
+        } else {
+            surface
+                .w_full()
+                .flex_1()
+                .bg(tokens.surfaces.sunken.to_gpui())
+                .into_any_element()
         }
     }
 
     fn task_conversation_surface(
         &mut self,
         tokens: crate::ui::tokens::ThemeTokens,
-        cx: &Context<Self>,
+        idle_photo_size: Size<Pixels>,
+        cx: &mut Context<Self>,
     ) -> AnyElement {
-        let conversation = self
-            .cockpit
-            .conversation_surface(tokens, self.composer.as_ref());
+        self.ensure_idle_conversation_photo(cx);
+        if self.interaction.selected_task().is_none() {
+            return self.idle_conversation_photo_surface(tokens, Some(idle_photo_size));
+        }
+        const COMPOSER_AND_GUTTER_HEIGHT: f32 = 148.0;
+        let timeline_height =
+            (f32::from(idle_photo_size.height) - COMPOSER_AND_GUTTER_HEIGHT).max(120.0) as u32;
+        if let Some(timeline) = self.cockpit.timeline_mut() {
+            timeline.set_viewport_height(timeline_height);
+        }
+        #[cfg(test)]
+        {
+            self.interactive_conversation_builds =
+                self.interactive_conversation_builds.saturating_add(1);
+            self.interactive_conversation_focus_wires =
+                self.interactive_conversation_focus_wires.saturating_add(1);
+        }
         let focus = cx.listener(|shell, _event: &MouseDownEvent, window, cx| {
             cx.stop_propagation();
-            shell.focus_handle.focus(window);
-            let epoch = shell.interaction.current_focus_epoch();
-            if let Some(composer) = shell.composer.as_mut() {
-                let _ = composer.focus_input(epoch);
+            shell.composer_focus_handle.focus(window);
+            shell.pending_composer_focus = false;
+            shell.composer_accessibility_focused = true;
+            if let Err(error) = shell.focus_current_composer_input() {
+                shell.composer_error = Some(error.to_string());
+            } else {
+                shell.composer_error = None;
             }
+            shell.refresh_accessibility_tree();
+            cx.notify();
         });
         let key = cx.listener(|shell, event: &KeyDownEvent, window, cx| {
-            cx.stop_propagation();
-            shell.handle_composer_key(event, window);
+            // Printable keys must propagate to GPUI's Windows input handler so
+            // WM_CHAR/IME text reaches EntityInputHandler. The handler stops
+            // propagation only for commands it consumes (Enter, arrows, etc.).
+            shell.handle_composer_key(event, window, cx);
+            cx.notify();
         });
-        let send = cx.listener(|shell, _event: &MouseDownEvent, _window, cx| {
+        let send = cx.listener(|shell, _event: &ClickEvent, _window, cx| {
             cx.stop_propagation();
             shell.activate_composer_control(ComposerControl::SendNow);
+            cx.notify();
         });
-        let answer = cx.listener(|shell, _event: &MouseDownEvent, _window, cx| {
+        let answer = cx.listener(|shell, _event: &ClickEvent, _window, cx| {
             cx.stop_propagation();
             shell.activate_composer_control(ComposerControl::Answer);
+            cx.notify();
         });
-        let approve = cx.listener(|shell, _event: &MouseDownEvent, _window, cx| {
+        let approve = cx.listener(|shell, _event: &ClickEvent, _window, cx| {
             cx.stop_propagation();
             shell.activate_composer_approval(ApprovalDecision::Approve);
+            cx.notify();
         });
-        let reject = cx.listener(|shell, _event: &MouseDownEvent, _window, cx| {
+        let reject = cx.listener(|shell, _event: &ClickEvent, _window, cx| {
             cx.stop_propagation();
             shell.activate_composer_approval(ApprovalDecision::Reject { reason: None });
+            cx.notify();
         });
         let scroll = cx.listener(|shell, event: &ScrollWheelEvent, _window, cx| {
             cx.stop_propagation();
@@ -7849,66 +10252,534 @@ impl NativeShell {
                 cx.notify();
             }
         });
+        let composer_input_registration = {
+            let shell_entity: Entity<NativeShell> = cx.entity();
+            let focus_handle = self.composer_focus_handle.clone();
+            canvas(
+                |_, _, _| (),
+                move |bounds, _, window, cx| {
+                    window.handle_input(
+                        &focus_handle,
+                        ElementInputHandler::new(bounds, shell_entity),
+                        cx,
+                    );
+                },
+            )
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .size_full()
+        };
         let draft = self
             .composer
             .as_ref()
-            .map(|composer| composer.draft_text().chars().take(256).collect::<String>())
+            .map(|composer| composer.draft_text().to_string())
             .unwrap_or_default();
-        let draft_label = if draft.is_empty() {
-            "Prompt input · click and type".to_string()
+        let draft_is_empty = draft.is_empty();
+        let draft_has_text = !draft.trim().is_empty();
+        let draft_label = if draft_is_empty {
+            "Ask Claude or Codex to build, fix, or explain…".to_string()
         } else {
             draft
         };
-        div()
-            .id("native-task-conversation-interactive")
-            .w_full()
-            .tab_stop(true)
-            .on_mouse_down(MouseButton::Left, focus)
-            .on_key_down(key)
-            .on_scroll_wheel(scroll)
-            .child(conversation)
-            .child(
+        let mut slash_suggestions = self.slash_command_suggestions();
+        if !slash_suggestions.is_empty() {
+            self.slash_command_selection = self
+                .slash_command_selection
+                .min(slash_suggestions.len().saturating_sub(1));
+        }
+        let slash_menu = (!slash_suggestions.is_empty()).then(|| {
+            let selected = self.slash_command_selection;
+            div()
+                .id("native-task-composer-slash-menu")
+                .w_full()
+                .max_w(px(CONVERSATION_CONTENT_MAX_WIDTH))
+                .mx_auto()
+                .max_h(px(260.0))
+                .overflow_hidden()
+                .flex()
+                .flex_col()
+                .rounded(px(tokens.density.radii.lg))
+                .border(px(1.0))
+                .border_color(tokens.borders.subtle.to_gpui())
+                .bg(tokens.surfaces.overlay.to_gpui())
+                .shadow_sm()
+                .children(
+                    slash_suggestions
+                        .drain(..)
+                        .enumerate()
+                        .map(|(index, suggestion)| {
+                            let command = suggestion.command.clone();
+                            let choose =
+                                cx.listener(move |shell, _event: &ClickEvent, _window, cx| {
+                                    cx.stop_propagation();
+                                    shell.insert_slash_command(&command);
+                                    cx.notify();
+                                });
+                            div()
+                                .id(("native-slash-command", index))
+                                .w_full()
+                                .flex()
+                                .items_center()
+                                .gap(px(tokens.density.spacing.sm))
+                                .px(px(tokens.density.spacing.md))
+                                .py(px(tokens.density.spacing.xs))
+                                .bg(if index == selected {
+                                    tokens.surfaces.selection.to_gpui()
+                                } else {
+                                    tokens.surfaces.overlay.to_gpui()
+                                })
+                                .on_click(choose)
+                                .child(
+                                    div()
+                                        .min_w(px(112.0))
+                                        .text_color(tokens.text.primary.to_gpui())
+                                        .child(suggestion.command),
+                                )
+                                .child(
+                                    div()
+                                        .text_color(tokens.text.muted.to_gpui())
+                                        .child(suggestion.label),
+                                )
+                        }),
+                )
+                .into_any_element()
+        });
+        let attach = cx.listener(|shell, _event: &ClickEvent, _window, cx| {
+            cx.stop_propagation();
+            shell.schedule_composer_image_picker(cx);
+            cx.notify();
+        });
+        let composer_pending = self
+            .composer
+            .as_ref()
+            .and_then(TaskComposer::pending_intent)
+            .is_some();
+        let image_chips = self
+            .current_composer_images()
+            .iter()
+            .map(|image| {
+                let image_id = image.id;
+                let preview = Arc::clone(&image.preview);
+                let remove = cx.listener(move |shell, _event: &ClickEvent, _window, cx| {
+                    cx.stop_propagation();
+                    shell.remove_native_composer_image(image_id);
+                    cx.notify();
+                });
                 div()
-                    .id("native-task-composer-input")
-                    .w_full()
-                    .p(px(tokens.density.physical().control_padding as f32))
+                    .id(("native-composer-image-chip", image.id))
+                    .flex()
+                    .items_center()
+                    .gap(px(tokens.density.spacing.xs))
+                    .px(px(tokens.density.spacing.sm))
+                    .py(px(tokens.density.spacing.xxs))
+                    .rounded(px(tokens.density.radii.md))
+                    .border(px(1.0))
+                    .border_color(tokens.borders.subtle.to_gpui())
                     .bg(tokens.surfaces.sunken.to_gpui())
-                    .child(draft_label),
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(40.0))
+                            .h(px(40.0))
+                            .rounded(px(tokens.density.radii.sm))
+                            .overflow_hidden()
+                            .child(
+                                img(ImageSource::Render(preview))
+                                    .w(px(40.0))
+                                    .h(px(40.0))
+                                    .object_fit(ObjectFit::Cover),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .max_w(px(220.0))
+                            .overflow_hidden()
+                            .text_size(px(tokens.density.typography.caption))
+                            .text_color(tokens.text.secondary.to_gpui())
+                            .child(image.label.clone()),
+                    )
+                    .child(
+                        Button::new(("native-task-composer-remove-image", image.id))
+                            .label("Remove")
+                            .ghost()
+                            .disabled(composer_pending)
+                            .on_click(remove),
+                    )
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
+        let send_availability = self
+            .composer
+            .as_ref()
+            .and_then(|composer| composer.availability(ComposerControl::SendNow).ok());
+        let send_available = send_availability
+            .as_ref()
+            .is_some_and(|availability| availability.is_available());
+        let has_send_content = draft_has_text || !self.current_composer_images().is_empty();
+        let send_enabled = send_available && has_send_content;
+        let composer_hold = send_availability
+            .as_ref()
+            .filter(|availability| !availability.is_available())
+            .and_then(|availability| availability.reason())
+            .map(str::to_string);
+        let has_question = self
+            .composer
+            .as_ref()
+            .and_then(TaskComposer::pending_question_identity)
+            .is_some();
+        let has_approval = self
+            .composer
+            .as_ref()
+            .and_then(TaskComposer::pending_approval_identity)
+            .is_some();
+        let question_options = self
+            .composer
+            .as_ref()
+            .and_then(|composer| composer.presented_question_options().ok())
+            .unwrap_or_default();
+        let question_option_buttons = question_options
+            .into_iter()
+            .enumerate()
+            .map(|(index, label)| {
+                let selected_label = label.clone();
+                let select = cx.listener(move |shell, _event: &ClickEvent, _window, cx| {
+                    cx.stop_propagation();
+                    shell.activate_composer_answer_option(index, selected_label.clone());
+                    cx.notify();
+                });
+                Button::new(("native-question-option", index))
+                    .label(label)
+                    .ghost()
+                    .on_click(select)
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
+        let showing_provider_terminal = self.cockpit.dock().showing_raw_terminal();
+        let composer_footer = if self.composer.is_some() {
+            div()
+                .id("native-task-composer")
+                .w_full()
+                .flex_none()
+                .px(px(tokens.density.spacing.md))
+                .pb(px(tokens.density.spacing.md))
+                .pt(px(tokens.density.spacing.sm))
+                .flex()
+                .flex_col()
+                .gap(px(tokens.density.spacing.sm))
+                .children(slash_menu)
+                .child(
+                    div()
+                        .id("native-task-composer-card")
+                        .w_full()
+                        .max_w(px(CONVERSATION_CONTENT_MAX_WIDTH))
+                        .mx_auto()
+                        .flex()
+                        .flex_col()
+                        .gap(px(tokens.density.spacing.sm))
+                        .p(px(tokens.density.spacing.md))
+                        .rounded(px(tokens.density.radii.lg))
+                        .border(px(1.0))
+                        .border_color(tokens.borders.subtle.to_gpui())
+                        .bg(tokens.surfaces.raised.to_gpui())
+                        .shadow_md()
+                        .children((!question_option_buttons.is_empty()).then(|| {
+                            div()
+                                .id("native-question-options")
+                                .w_full()
+                                .flex()
+                                .flex_wrap()
+                                .gap(px(tokens.density.spacing.xs))
+                                .children(question_option_buttons)
+                                .into_any_element()
+                        }))
+                        .children((!image_chips.is_empty()).then(|| {
+                            div()
+                                .id("native-task-composer-attachments")
+                                .w_full()
+                                .flex()
+                                .flex_wrap()
+                                .gap(px(tokens.density.spacing.xs))
+                                .children(image_chips)
+                                .into_any_element()
+                        }))
+                        .child(
+                            div()
+                                .id("native-task-composer-input")
+                                .relative()
+                                .w_full()
+                                .min_h(px(72.0))
+                                .max_h(px(200.0))
+                                .overflow_y_scroll()
+                                .track_focus(&self.composer_focus_handle)
+                                .tab_stop(true)
+                                .cursor_text()
+                                .on_mouse_down(MouseButton::Left, focus)
+                                .on_key_down(key)
+                                .px(px(tokens.density.spacing.md))
+                                .py(px(tokens.density.spacing.sm))
+                                .rounded(px(tokens.density.radii.md))
+                                .border(px(1.0))
+                                .border_color(if self.composer_accessibility_focused {
+                                    tokens.borders.focus.to_gpui()
+                                } else {
+                                    tokens.borders.subtle.to_gpui()
+                                })
+                                .bg(tokens.surfaces.sunken.to_gpui())
+                                .text_color(if draft_is_empty {
+                                    tokens.text.muted.to_gpui()
+                                } else {
+                                    tokens.text.primary.to_gpui()
+                                })
+                                .child(draft_label)
+                                .child(composer_input_registration),
+                        )
+                        .children(self.composer_error.as_ref().map(|error| {
+                            div()
+                                .text_size(px(tokens.density.typography.caption))
+                                .text_color(tokens.status.destructive.to_gpui())
+                                .child(error.clone())
+                                .into_any_element()
+                        }))
+                        .children(composer_hold.map(|hold| {
+                            div()
+                                .text_size(px(tokens.density.typography.caption))
+                                .text_color(tokens.text.muted.to_gpui())
+                                .child(hold)
+                                .into_any_element()
+                        }))
+                        .child(
+                            div()
+                                .w_full()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .gap(px(tokens.density.spacing.sm))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(tokens.density.spacing.sm))
+                                        .child(
+                                            Button::new("native-task-composer-attach")
+                                                .label("Attach")
+                                                .ghost()
+                                                .disabled(composer_pending)
+                                                .on_click(attach),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(tokens.density.spacing.sm))
+                                        .children(has_question.then(|| {
+                                            Button::new("native-task-composer-answer")
+                                                .label("Answer")
+                                                .ghost()
+                                                .on_click(answer)
+                                                .into_any_element()
+                                        }))
+                                        .children(has_approval.then(|| {
+                                            Button::new("native-task-composer-reject")
+                                                .label("Reject")
+                                                .ghost()
+                                                .on_click(reject)
+                                                .into_any_element()
+                                        }))
+                                        .children(has_approval.then(|| {
+                                            Button::new("native-task-composer-approve")
+                                                .label("Approve")
+                                                .ghost()
+                                                .on_click(approve)
+                                                .into_any_element()
+                                        }))
+                                        .child(
+                                            Button::new("native-task-composer-send")
+                                                .label(if send_available {
+                                                    "Send"
+                                                } else {
+                                                    "Connecting…"
+                                                })
+                                                .primary()
+                                                .disabled(!send_enabled)
+                                                .on_click(send),
+                                        ),
+                                ),
+                        ),
+                )
+                .into_any_element()
+        } else {
+            div()
+                .id("native-task-composer-hold")
+                .w_full()
+                .flex_none()
+                .px(px(tokens.density.spacing.md))
+                .pb(px(tokens.density.spacing.md))
+                .child(
+                    div()
+                        .w_full()
+                        .max_w(px(CONVERSATION_CONTENT_MAX_WIDTH))
+                        .mx_auto()
+                        .px(px(tokens.density.spacing.md))
+                        .py(px(tokens.density.spacing.sm))
+                        .rounded(px(tokens.density.radii.lg))
+                        .bg(tokens.surfaces.disabled.to_gpui())
+                        .text_color(tokens.text.disabled.to_gpui())
+                        .child("Select a task with a connected agent to start chatting"),
+                )
+                .into_any_element()
+        };
+        let conversation = self
+            .cockpit
+            .conversation_surface_with_footer(tokens, composer_footer);
+        let show_conversation = cx.listener(|shell, _event: &ClickEvent, window, cx| {
+            cx.stop_propagation();
+            shell.set_provider_terminal_visible(false);
+            shell.composer_focus_handle.focus(window);
+            shell.pending_composer_focus = false;
+            cx.notify();
+        });
+        let show_terminal = cx.listener(|shell, _event: &ClickEvent, window, cx| {
+            cx.stop_propagation();
+            shell.set_provider_terminal_visible(true);
+            shell.terminal_focus_handle.focus(window);
+            shell.pending_terminal_focus = false;
+            cx.notify();
+        });
+        let canvas_switch = div()
+            .id("native-task-center-canvas-switch")
+            .w_full()
+            .flex_none()
+            .px(px(tokens.density.spacing.md))
+            .pt(px(tokens.density.spacing.sm))
+            .flex()
+            .justify_center()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(tokens.density.spacing.xs))
+                    .px(px(tokens.density.spacing.xs))
+                    .py(px(tokens.density.spacing.xxs))
+                    .rounded(px(tokens.density.radii.md))
+                    .bg(tokens.surfaces.sunken.to_gpui())
+                    .child(
+                        Button::new("native-task-center-conversation")
+                            .label("Conversation")
+                            .ghost()
+                            .selected(!showing_provider_terminal)
+                            .on_click(show_conversation),
+                    )
+                    .child(
+                        Button::new("native-task-center-terminal")
+                            .label("Terminal")
+                            .ghost()
+                            .selected(showing_provider_terminal)
+                            .on_click(show_terminal),
+                    ),
+            );
+        let center_body = if showing_provider_terminal {
+            self.center_provider_terminal_surface(tokens, cx)
+        } else {
+            div()
+                .id("native-task-conversation-interactive")
+                .w_full()
+                .flex()
+                .flex_1()
+                .min_h(px(0.0))
+                .flex_col()
+                .on_scroll_wheel(scroll)
+                .child(conversation)
+                .into_any_element()
+        };
+        div()
+            .id("native-task-center-canvas")
+            .w_full()
+            .flex()
+            .flex_1()
+            .min_h(px(0.0))
+            .flex_col()
+            .child(canvas_switch)
+            .child(center_body)
+            .into_any_element()
+    }
+
+    fn center_provider_terminal_surface(
+        &self,
+        tokens: crate::ui::tokens::ThemeTokens,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let shell_entity = cx.weak_entity();
+        let interactive = self.cockpit.dock().terminal_binding().is_some();
+        let summary = if interactive {
+            "Provider terminal · type, use arrows, Enter, or Escape"
+        } else {
+            "Provider terminal · waiting for the bound session"
+        };
+        let surface = div()
+            .id("native-task-center-terminal-surface")
+            .w_full()
+            .flex()
+            .flex_1()
+            .min_h(px(0.0))
+            .flex_col()
+            .gap(px(tokens.density.spacing.xs))
+            .p(px(tokens.density.spacing.md))
+            .bg(tokens.terminal.background.to_gpui())
+            .text_color(tokens.terminal.foreground.to_gpui())
+            .child(
+                div()
+                    .text_size(px(tokens.density.typography.caption))
+                    .text_color(tokens.terminal.bright_black.to_gpui())
+                    .child(summary),
             )
             .child(
                 div()
-                    .id("native-task-composer-send")
-                    .on_mouse_down(MouseButton::Left, send)
-                    .child("Send"),
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .overflow_hidden()
+                    .child(self.terminal.element()),
+            );
+        if !interactive {
+            return surface.into_any_element();
+        }
+        let shell_for_focus = shell_entity.clone();
+        let shell_for_key = shell_entity;
+        surface
+            .tab_stop(true)
+            .track_focus(&self.terminal_focus_handle)
+            .cursor_text()
+            .on_mouse_down(
+                MouseButton::Left,
+                move |_event: &MouseDownEvent, window: &mut Window, app: &mut gpui::App| {
+                    let _ = shell_for_focus.update(app, |shell, cx| {
+                        cx.stop_propagation();
+                        shell.terminal_focus_handle.focus(window);
+                        shell.pending_terminal_focus = false;
+                        cx.notify();
+                    });
+                },
             )
-            .child(
-                div()
-                    .id("native-task-composer-answer")
-                    .on_mouse_down(MouseButton::Left, answer)
-                    .child("Answer"),
-            )
-            .child(
-                div()
-                    .id("native-task-composer-approve")
-                    .on_mouse_down(MouseButton::Left, approve)
-                    .child("Approve"),
-            )
-            .child(
-                div()
-                    .id("native-task-composer-reject")
-                    .on_mouse_down(MouseButton::Left, reject)
-                    .child("Reject"),
+            .on_key_down(
+                move |event: &KeyDownEvent, window: &mut Window, app: &mut gpui::App| {
+                    let _ = shell_for_key.update(app, |shell, cx| {
+                        cx.stop_propagation();
+                        shell.handle_provider_terminal_key(event, window, cx);
+                        cx.notify();
+                    });
+                },
             )
             .into_any_element()
     }
 
     fn sync_task_composer(&mut self, model: &ClientModel, task_id: TaskId) {
         let Some(snapshot) = model.task(task_id) else {
-            self.composer = None;
+            self.clear_composer_binding();
             return;
         };
         if snapshot.attention == crate::domain::task::TaskAttention::Failed {
-            self.composer = None;
+            self.clear_composer_binding();
             self.composer_error = Some(
                 "The agent didn't start. Check Settings, then use +Claude or +Codex again."
                     .to_string(),
@@ -7916,14 +10787,38 @@ impl NativeShell {
             return;
         }
         let Some(agent_session_id) = snapshot.primary_agent_id else {
-            self.composer = None;
+            self.clear_composer_binding();
             self.composer_error = Some("primary agent is not bound".to_string());
             return;
         };
         let Some(agent) = snapshot.agents.get(&agent_session_id) else {
-            self.composer = None;
+            self.clear_composer_binding();
             self.composer_error = Some("primary agent facts are unavailable".to_string());
             return;
+        };
+        self.refresh_slash_command_catalog(snapshot, agent_session_id);
+        let provider_wait = "Waiting for the provider conversation to connect";
+        // Codex currently reports external provider-session identity as
+        // unsupported. Its first prompt is still fenced by the exact Task,
+        // Agent, runtime generation, and action epoch, and the host rechecks
+        // that live capability before writing. Waiting for an identity Codex
+        // cannot publish deadlocks the conversation before its first turn.
+        let waits_for_provider_identity = agent.provider_session_id.is_none()
+            && agent.provider_kind != crate::providers::ProviderKind::Codex;
+        let disabled_reasons = if waits_for_provider_identity {
+            [
+                ComposerControl::SendNow,
+                ComposerControl::Steer,
+                ComposerControl::QueueFollowUp,
+                ComposerControl::Answer,
+                ComposerControl::Approval,
+                ComposerControl::StopTurn,
+            ]
+            .into_iter()
+            .map(|control| (control, provider_wait.to_string()))
+            .collect()
+        } else {
+            Vec::new()
         };
         let projection = ComposerHostProjection {
             fence: ComposerFence {
@@ -7936,30 +10831,47 @@ impl NativeShell {
                 // provider projection supplies the typed turn identity.
                 turn_id: None,
             },
-            draft: ComposerDraftProjection {
-                text: String::new(),
-                attachments: Vec::new(),
-                prompt: None,
-            },
+            draft: self
+                .composer_drafts
+                .get(&ComposerDraftKey::new(task_id, agent_session_id))
+                .cloned()
+                .unwrap_or(ComposerDraftProjection {
+                    text: String::new(),
+                    attachments: Vec::new(),
+                    prompt: None,
+                }),
             owned_artifacts: snapshot.artifacts.keys().copied().collect(),
-            // Open QuestionId/ApprovalId values in the provider snapshot are
-            // not interchangeable with the journal's RequestId plus revision.
-            // Keep these controls unbound until the authenticated semantic
-            // page provides the exact request identity and state revision.
-            question: None,
-            approval: None,
-            disabled_reasons: Vec::new(),
+            question: snapshot
+                .provider_sessions
+                .get(&agent_session_id)
+                .and_then(|provider| provider.open_question)
+                .map(|question_id| {
+                    self.cockpit
+                        .pending_question_projection(question_id, snapshot.task.revision)
+                }),
+            approval: snapshot
+                .provider_sessions
+                .get(&agent_session_id)
+                .and_then(|provider| provider.open_approval)
+                .map(|approval_id| {
+                    self.cockpit
+                        .pending_approval_projection(approval_id, snapshot.task.revision)
+                }),
+            disabled_reasons,
         };
         let focus_epoch = self.interaction.current_focus_epoch();
         let same_binding = self.composer.as_ref().is_some_and(|composer| {
             composer.fence().task_id == task_id
                 && composer.fence().agent_session_id == agent_session_id
         });
+        if !same_binding {
+            self.composer_marked_range = None;
+        }
         let result = if same_binding {
-            self.composer
-                .as_mut()
-                .expect("same composer binding")
-                .apply_projection(projection, focus_epoch)
+            let composer = self.composer.as_mut().expect("same composer binding");
+            composer
+                .set_focus_epoch(focus_epoch)
+                .and_then(|()| composer.apply_projection(projection, focus_epoch))
         } else {
             match TaskComposer::bind_for_task(projection, focus_epoch) {
                 Ok(composer) => {
@@ -7978,7 +10890,7 @@ impl NativeShell {
     }
 
     fn clear_cockpit_projection(&mut self) {
-        self.cockpit = TaskCockpitShell::new(DockEdge::Bottom);
+        self.cockpit.clear_live_surfaces_preserving_dock_memory();
         self.terminal.rebind(None);
         self.terminal.set_preferences(self.preferences);
         self.sync_header_projection();
@@ -8011,6 +10923,10 @@ impl NativeShell {
     fn apply_keyboard_shell_effects(&mut self, action: KeyboardAction) {
         match action {
             KeyboardAction::SelectDock(tool) => {
+                if matches!(tool, DockTool::Terminal) {
+                    self.set_provider_terminal_visible(true);
+                    return;
+                }
                 let _ = self
                     .cockpit
                     .handle_tool_action(Self::cockpit_dock_tool(tool), RequestId::new());
@@ -8020,23 +10936,17 @@ impl NativeShell {
                     // panel becomes active; the panel itself never mints a
                     // supervisor command or bypasses ServiceControl fences.
                     let _ = self.dispatch_action(ActionRequest::HostActions);
-                } else if matches!(
-                    tool,
-                    DockTool::Changes | DockTool::Files | DockTool::Services
-                ) {
                     self.refresh_selected_cockpit_surfaces();
-                } else if !matches!(tool, DockTool::Terminal) {
+                } else if matches!(tool, DockTool::Changes | DockTool::Files) {
+                    self.refresh_selected_cockpit_surfaces();
+                } else {
                     if let Some(task_id) = self.interaction.selected_task() {
                         let _ = self.dispatch_action(ActionRequest::TaskShow { task_id });
                     }
                 }
             }
             KeyboardAction::OpenTerminal => {
-                let _ = self
-                    .cockpit
-                    .handle_tool_action(CockpitDockTool::Terminal, RequestId::new());
-                let _ = self.cockpit.handle_toggle_raw(RequestId::new());
-                self.sync_terminal_from_cockpit();
+                self.set_provider_terminal_visible(true);
             }
             KeyboardAction::OpenTaskDetails => {
                 if let Some(task_id) = self.interaction.selected_task() {
@@ -8124,73 +11034,6 @@ impl NativeShell {
         })
     }
 
-    fn prompt_library_surface(&self, tokens: crate::ui::tokens::ThemeTokens) -> AnyElement {
-        let list = self.prompt_library.list_state();
-        let load = match &self.prompt_library.load {
-            crate::ui::prompts::PromptLibraryLoadState::Empty => "empty",
-            crate::ui::prompts::PromptLibraryLoadState::Loading => "loading",
-            crate::ui::prompts::PromptLibraryLoadState::Ready => "ready",
-            crate::ui::prompts::PromptLibraryLoadState::Error { .. } => "error",
-            crate::ui::prompts::PromptLibraryLoadState::StaleRevision { .. } => "stale",
-        };
-        let draft_chars = self.prompt_library.draft.text.chars().count();
-        let next = self
-            .prompt_library
-            .suggested_next
-            .as_ref()
-            .map(|next| next.title.clone())
-            .unwrap_or_else(|| "none".to_string());
-        let composer = match (
-            self.composer
-                .as_ref()
-                .and_then(TaskComposer::pending_intent),
-            self.composer_error.as_deref(),
-        ) {
-            (_, Some(error)) => format!("error · {error}"),
-            (Some(intent), None) => format!("pending · {}", intent.action_id),
-            (None, None) => format!(
-                "{draft_chars} character draft · {}",
-                if self.prompt_library.draft.sent {
-                    "sent"
-                } else {
-                    "ready"
-                }
-            ),
-        };
-        let updater = self
-            .updater_snapshot
-            .as_ref()
-            .map(|snapshot| format!("{:?}", snapshot.stage))
-            .unwrap_or_else(|| "snapshot unavailable".to_string());
-        div()
-            .id("native-shell-prompt-composer")
-            .w_full()
-            .flex()
-            .flex_col()
-            .px(px(tokens.density.spacing.lg))
-            .py(px(tokens.density.spacing.sm))
-            .child(Self::meta_row(
-                "Library",
-                self.prompt_library.chrome.rail_label.clone(),
-                tokens,
-            ))
-            .child(Self::meta_row(
-                "Section",
-                self.prompt_library
-                    .chrome
-                    .active_section
-                    .label()
-                    .to_string(),
-                tokens,
-            ))
-            .child(Self::meta_row("Saved", list.total.to_string(), tokens))
-            .child(Self::meta_row("State", load.to_string(), tokens))
-            .child(Self::meta_row("Next", next, tokens))
-            .child(Self::meta_row("Composer", composer, tokens))
-            .child(Self::meta_row("Updater", updater, tokens))
-            .into_any_element()
-    }
-
     fn panel_action_element(
         action: PanelAction,
         target: &str,
@@ -8204,9 +11047,10 @@ impl NativeShell {
         let Some(shell_entity) = shell_entity else {
             return element;
         };
+        let element_key = action.element_key(target);
 
         div()
-            .id(("native-panel-control", action.element_key(target)))
+            .id(("native-panel-control", element_key))
             .cursor_pointer()
             .on_mouse_down(MouseButton::Left, move |event, _window, app| {
                 if event.button != MouseButton::Left {
@@ -8226,8 +11070,7 @@ impl NativeShell {
                         return;
                     }
                     shell.interaction.begin_control_pointer(NATIVE_POINTER_ID);
-                    let _ =
-                        shell.dispatch_pointer_action(action.request.clone(), NATIVE_POINTER_ID);
+                    shell.dispatch_pointer_action(action.request.clone(), NATIVE_POINTER_ID);
                     shell.interaction.release_pointer(NATIVE_POINTER_ID);
                 });
             })
@@ -8277,11 +11120,12 @@ impl NativeShell {
             CockpitDockTool::Files => {
                 let panel = FilesPanelProjection::from_host(
                     live.and_then(|projection| projection.files.as_ref()),
+                    live.and_then(|projection| projection.file_read.as_ref()),
                     task_id,
                     revision,
                     None,
                 );
-                let rows = panel
+                let mut rows: Vec<AnyElement> = panel
                     .rows
                     .iter()
                     .map(|row| {
@@ -8299,6 +11143,30 @@ impl NativeShell {
                             .into_any_element()
                     })
                     .collect();
+                if let Some(preview) = panel.preview.as_ref() {
+                    rows.insert(
+                        0,
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(tokens.density.spacing.xs))
+                            .p(px(tokens.density.physical().control_padding as f32))
+                            .bg(tokens.surfaces.raised.to_gpui())
+                            .child(format!(
+                                "Open · {} · {} byte(s){}",
+                                preview.relative_path,
+                                preview.byte_len,
+                                if preview.binary { " · binary" } else { "" }
+                            ))
+                            .child(
+                                div()
+                                    .max_h(px(200.0))
+                                    .overflow_hidden()
+                                    .child(preview.content.clone()),
+                            )
+                            .into_any_element(),
+                    );
+                }
                 ("Files", panel.summary(), vec![panel.refresh], rows)
             }
             CockpitDockTool::Artifacts => {
@@ -8611,11 +11479,7 @@ impl NativeShell {
         shell_entity: Option<gpui::WeakEntity<NativeShell>>,
     ) -> AnyElement {
         match self.cockpit.active_tool() {
-            CockpitDockTool::Terminal => self
-                .cockpit
-                .dock()
-                .render_context_dock(tokens)
-                .into_any_element(),
+            CockpitDockTool::Terminal => self.terminal_dock_surface(tokens, shell_entity),
             CockpitDockTool::Browser => self
                 .selected_browser_dock_model()
                 .map(|model| render_task_browser_dock(model, tokens).into_any_element())
@@ -8625,6 +11489,71 @@ impl NativeShell {
             CockpitDockTool::Services => self.services_dock_surface(tokens, shell_entity),
             tool => self.workspace_dock_surface(tool, tokens, shell_entity),
         }
+    }
+
+    fn terminal_dock_surface(
+        &self,
+        tokens: crate::ui::tokens::ThemeTokens,
+        shell_entity: Option<gpui::WeakEntity<NativeShell>>,
+    ) -> AnyElement {
+        let dock = self.cockpit.dock();
+        let live_output = dock.live_output();
+        let interactive = dock.showing_raw_terminal() && dock.terminal_binding().is_some();
+        let summary = if interactive {
+            "Interactive provider terminal · type, use arrows, Enter, or Escape"
+        } else if dock.terminal_binding().is_some() {
+            "Terminal · bound to this task"
+        } else {
+            "Terminal · no matching task terminal"
+        };
+        let surface = div()
+            .id("native-shell-context-terminal")
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(px(tokens.density.spacing.xs))
+            .p(px(tokens.density.physical().control_padding as f32))
+            .bg(tokens.surfaces.sunken.to_gpui())
+            .child(summary)
+            .children((!live_output.is_empty()).then(|| {
+                div()
+                    .text_color(tokens.text.primary.to_gpui())
+                    .child(live_output)
+            }));
+        if !interactive {
+            return surface.into_any_element();
+        }
+        let Some(shell_for_focus) = shell_entity.clone() else {
+            return surface.into_any_element();
+        };
+        let Some(shell_for_key) = shell_entity else {
+            return surface.into_any_element();
+        };
+        surface
+            .tab_stop(true)
+            .track_focus(&self.terminal_focus_handle)
+            .cursor_text()
+            .on_mouse_down(
+                MouseButton::Left,
+                move |_event: &MouseDownEvent, window: &mut Window, app: &mut gpui::App| {
+                    let _ = shell_for_focus.update(app, |shell, cx| {
+                        cx.stop_propagation();
+                        shell.terminal_focus_handle.focus(window);
+                        shell.pending_terminal_focus = false;
+                        cx.notify();
+                    });
+                },
+            )
+            .on_key_down(
+                move |event: &KeyDownEvent, window: &mut Window, app: &mut gpui::App| {
+                    let _ = shell_for_key.update(app, |shell, cx| {
+                        cx.stop_propagation();
+                        shell.handle_provider_terminal_key(event, window, cx);
+                        cx.notify();
+                    });
+                },
+            )
+            .into_any_element()
     }
 
     pub fn client_model_snapshot(&self) -> Option<Arc<ClientModel>> {
@@ -8674,6 +11603,83 @@ impl NativeShell {
             .find_map(|project| crate::domain::id::ProjectId::parse(&project.workspace_id).ok())
     }
 
+    fn current_workspace_project_id(&self) -> Option<ProjectId> {
+        self.selected_project_id
+            .filter(|selected| {
+                self.config_sidebar
+                    .projects
+                    .iter()
+                    .any(|project| ProjectId::parse(&project.workspace_id).ok() == Some(*selected))
+            })
+            .or_else(|| self.first_workspace_project_id())
+    }
+
+    fn project_inbox_items(&self) -> Vec<ProjectInboxItem> {
+        let mut items = Vec::new();
+        let mut represented = HashSet::new();
+        for project in &self.config_sidebar.projects {
+            let Ok(project_id) = ProjectId::parse(&project.workspace_id) else {
+                continue;
+            };
+            represented.insert(project_id);
+            let tasks = self
+                .inbox
+                .active_rows()
+                .iter()
+                .filter(|row| row.project_id == project_id)
+                .map(|row| row.task_id)
+                .collect::<Vec<_>>();
+            let expanded = !self.collapsed_projects.contains(&project_id);
+            items.push(ProjectInboxItem::Project {
+                project_id,
+                label: project.label.clone(),
+                expanded,
+                task_count: tasks.len(),
+            });
+            if expanded {
+                items.extend(tasks.into_iter().map(|task_id| ProjectInboxItem::Task {
+                    project_id,
+                    task_id,
+                }));
+            }
+        }
+        for row in self.inbox.active_rows() {
+            if represented.contains(&row.project_id) {
+                continue;
+            }
+            represented.insert(row.project_id);
+            let project_id = row.project_id;
+            let tasks = self
+                .inbox
+                .active_rows()
+                .iter()
+                .filter(|candidate| candidate.project_id == project_id)
+                .map(|candidate| candidate.task_id)
+                .collect::<Vec<_>>();
+            let expanded = !self.collapsed_projects.contains(&project_id);
+            items.push(ProjectInboxItem::Project {
+                project_id,
+                label: "Other project".to_string(),
+                expanded,
+                task_count: tasks.len(),
+            });
+            if expanded {
+                items.extend(tasks.into_iter().map(|task_id| ProjectInboxItem::Task {
+                    project_id,
+                    task_id,
+                }));
+            }
+        }
+        items
+    }
+
+    fn toggle_project(&mut self, project_id: ProjectId) {
+        self.selected_project_id = Some(project_id);
+        if !self.collapsed_projects.insert(project_id) {
+            self.collapsed_projects.remove(&project_id);
+        }
+    }
+
     fn shell_stage(&self) -> ShellStage {
         match self.config_sidebar.unavailable_reason {
             Some(ConfigSidebarUnavailableReason::StoreRecoveryRequired) => ShellStage::Recovery,
@@ -8682,7 +11688,6 @@ impl NativeShell {
             {
                 ShellStage::Connecting
             }
-            _ if !snapshot_connected(self.agent_connection.as_ref()) => ShellStage::Welcome,
             _ if self.config_sidebar.projects.is_empty() => ShellStage::Welcome,
             _ => ShellStage::Cockpit,
         }
@@ -8794,6 +11799,60 @@ impl NativeShell {
     }
 
     #[cfg(test)]
+    fn conversation_tools_affordance_visible_for_test(&self) -> bool {
+        self.layout.dock_collapsed
+    }
+
+    #[cfg(test)]
+    fn bottom_terminal_strip_present_for_test(&mut self) -> bool {
+        let _ = self.element_without_handlers();
+        self.refresh_accessibility_tree();
+        self.accessibility_tree
+            .gpui_nodes()
+            .into_iter()
+            .any(|node| node.element_id == "native-shell-terminal-dock")
+    }
+
+    #[cfg(test)]
+    fn center_canvas_switch_visible_for_test(&mut self) -> bool {
+        let _ = self.element_without_handlers();
+        self.refresh_accessibility_tree();
+        self.accessibility_tree
+            .gpui_nodes()
+            .into_iter()
+            .any(|node| {
+                node.element_id == "native-task-center-conversation"
+                    || node.element_id == "native-task-center-terminal"
+            })
+    }
+
+    #[cfg(test)]
+    fn composer_key_for_test(&mut self, key: &str, shift: bool, control: bool) {
+        let Ok(epoch) = self.focus_current_composer_input() else {
+            return;
+        };
+        let _ = control;
+        if key == "enter" && shift {
+            let changed = self
+                .composer
+                .as_mut()
+                .and_then(|composer| composer.paste_text("\n", epoch).ok())
+                .unwrap_or(false);
+            if changed {
+                self.composer_marked_range = None;
+                self.cache_current_composer_draft();
+            }
+            return;
+        }
+        if key == "enter" && !shift {
+            if self.accept_selected_slash_command() {
+                return;
+            }
+            self.activate_composer_control(ComposerControl::SendNow);
+        }
+    }
+
+    #[cfg(test)]
     fn settings_open_for_test(&self) -> bool {
         self.settings_open
     }
@@ -8826,13 +11885,18 @@ impl NativeShell {
 
     #[cfg(test)]
     fn install_named_folder_for_test(&mut self, label: &str) {
+        self.install_project_for_test(label, crate::domain::id::ProjectId::new());
+    }
+
+    #[cfg(test)]
+    fn install_project_for_test(&mut self, label: &str, project_id: ProjectId) {
         let snapshot = crate::domain::cockpit::ConfigSidebarSnapshot {
             revision: 1,
             projects: vec![crate::domain::cockpit::ConfigSidebarProject {
                 config_id: "project-1".into(),
                 label: label.into(),
                 root_configured: true,
-                workspace_id: crate::domain::id::ProjectId::new().to_string(),
+                workspace_id: project_id.to_string(),
                 folders: Vec::new(),
             }],
             servers: Vec::new(),
@@ -8916,10 +11980,14 @@ impl NativeShell {
     fn offer_first_task_if_needed(&mut self) {}
 
     fn start_task_with_agent(&mut self, kind: ProviderKind) {
-        let Some(snapshot) = self.agent_connection.as_ref() else {
+        let Some(project_id) = self.current_workspace_project_id() else {
             return;
         };
-        let Some(project_id) = self.first_workspace_project_id() else {
+        self.start_task_with_agent_for_project(project_id, kind);
+    }
+
+    fn start_task_with_agent_for_project(&mut self, project_id: ProjectId, kind: ProviderKind) {
+        let Some(snapshot) = self.agent_connection.as_ref() else {
             return;
         };
         if !inbox_agent_actions(snapshot)
@@ -8928,6 +11996,7 @@ impl NativeShell {
         {
             return;
         }
+        self.selected_project_id = Some(project_id);
         let _ = self.dispatch_action(ActionRequest::TaskCreateV2(
             crate::client::action::TaskCreateV2Arguments {
                 task_id: TaskId::new(),
@@ -8941,14 +12010,30 @@ impl NativeShell {
         ));
     }
 
+    fn archive_selected_task(&mut self) {
+        let Some(task_id) = self.interaction.selected_task() else {
+            return;
+        };
+        let _ = self.dispatch_action(ActionRequest::TaskArchive { task_id });
+    }
+
     fn begin_new_task(&mut self) {
-        let Some(_project_id) = self.first_workspace_project_id() else {
+        let Some(project_id) = self.current_workspace_project_id() else {
             self.open_add_project();
             return;
         };
+        self.begin_new_task_for_project(project_id);
+    }
+
+    fn begin_new_task_for_project(&mut self, project_id: ProjectId) {
+        self.selected_project_id = Some(project_id);
         let mut title = TextField::new("Task name").expect("task name field");
         title.focus();
-        self.new_task = Some(NewTaskDraft { title, error: None });
+        self.new_task = Some(NewTaskDraft {
+            project_id,
+            title,
+            error: None,
+        });
         self.add_project = None;
         self.interaction.close_palettes();
     }
@@ -8964,11 +12049,7 @@ impl NativeShell {
             }
             return;
         }
-        let Some(project_id) = self.first_workspace_project_id() else {
-            self.new_task = None;
-            self.open_add_project();
-            return;
-        };
+        let project_id = draft.project_id;
         if self
             .dispatch_action(ActionRequest::TaskCreateV2(
                 crate::client::action::TaskCreateV2Arguments {
@@ -8991,6 +12072,35 @@ impl NativeShell {
         self.new_task = None;
     }
 
+    fn request_composer_accessibility_focus(&mut self) {
+        if self.composer.is_none() {
+            return;
+        }
+        self.pending_composer_focus = true;
+        self.composer_accessibility_focused = true;
+        if let Err(error) = self.focus_current_composer_input() {
+            self.composer_error = Some(error.to_string());
+        } else {
+            self.composer_error = None;
+        }
+    }
+
+    fn replace_composer_accessibility_value(&mut self, value: &str) {
+        let current_utf16 = self
+            .composer
+            .as_ref()
+            .map(|composer| composer.draft_text().encode_utf16().count())
+            .unwrap_or_default();
+        match self.replace_composer_platform_text(Some(0..current_utf16), value) {
+            Ok(_) => {
+                self.composer_error = None;
+            }
+            Err(error) => {
+                self.composer_error = Some(error.to_string());
+            }
+        }
+    }
+
     fn dispatch_named_accessibility_action(&mut self, element_id: &str) {
         match element_id {
             "native-projects-add" => {
@@ -9004,6 +12114,20 @@ impl NativeShell {
             }
             "native-inbox-plus-claude" => self.start_task_with_agent(ProviderKind::ClaudeCode),
             "native-inbox-plus-codex" => self.start_task_with_agent(ProviderKind::Codex),
+            "native-task-delete" => self.archive_selected_task(),
+            "native-task-composer-input" => self.request_composer_accessibility_focus(),
+            "native-task-composer-send" => self.activate_composer_control(ComposerControl::SendNow),
+            "native-task-center-conversation" => self.set_provider_terminal_visible(false),
+            "native-task-center-terminal" => self.set_provider_terminal_visible(true),
+            "native-task-composer-answer" => {
+                self.activate_composer_control(ComposerControl::Answer)
+            }
+            "native-task-composer-approve" => {
+                self.activate_composer_approval(ApprovalDecision::Approve)
+            }
+            "native-task-composer-reject" => {
+                self.activate_composer_approval(ApprovalDecision::Reject { reason: None })
+            }
             "native-add-project-submit" => {
                 if self
                     .add_project
@@ -9047,7 +12171,9 @@ impl NativeShell {
             PaletteItem::AddProject => self.begin_choose_folder(cx),
             PaletteItem::ToggleSidebar => self.toggle_pane(PaneEdge::Sidebar),
             PaletteItem::ToggleDock => self.toggle_pane(PaneEdge::Dock),
-            PaletteItem::ToggleTerminal => self.toggle_pane(PaneEdge::Terminal),
+            PaletteItem::ToggleTaskCanvas => {
+                self.set_provider_terminal_visible(!self.cockpit.dock().showing_raw_terminal())
+            }
             PaletteItem::ResetLayout => self.reset_layout(),
         }
     }
@@ -9071,6 +12197,7 @@ impl NativeShell {
     fn host_tone(&self, tokens: crate::ui::tokens::ThemeTokens) -> crate::ui::tokens::Color {
         match &self.host_state {
             NativeHostState::Connected { .. } => tokens.status.success,
+            NativeHostState::Connecting => tokens.status.warning,
             NativeHostState::Disconnected => tokens.status.inactive,
             NativeHostState::Error { .. } => tokens.status.destructive,
         }
@@ -9321,6 +12448,84 @@ impl NativeShell {
         })
     }
 
+    fn conversation_delete_action(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let delete = self.interaction.selected_task().map(|_| {
+            Button::new("native-task-delete")
+                .label("Delete")
+                .tooltip("Delete this task")
+                .ghost()
+                .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
+                    cx.stop_propagation();
+                    shell.archive_selected_task();
+                    cx.notify();
+                }))
+                .into_any_element()
+        });
+        let tools = self.layout.dock_collapsed.then(|| {
+            Button::new("native-shell-tools-affordance")
+                .label("Tools")
+                .tooltip("Show the context dock")
+                .ghost()
+                .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
+                    cx.stop_propagation();
+                    shell.toggle_pane(PaneEdge::Dock);
+                    cx.notify();
+                }))
+                .into_any_element()
+        });
+        match (tools, delete) {
+            (None, None) => None,
+            (tools, delete) => Some(
+                div()
+                    .id("native-conversation-panel-actions")
+                    .flex()
+                    .items_center()
+                    .gap(px(self.preferences.tokens().density.spacing.xs))
+                    .children(tools)
+                    .children(delete)
+                    .into_any_element(),
+            ),
+        }
+    }
+
+    /// Low-chrome conversation canvas: the transcript is the primary surface,
+    /// so it avoids the bordered/shadowed inspector card treatment.
+    fn conversation_canvas_panel(
+        tokens: crate::ui::tokens::ThemeTokens,
+        body: AnyElement,
+        trailing: Option<AnyElement>,
+    ) -> AnyElement {
+        div()
+            .id("native-shell-conversation-panel")
+            .w_full()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h(px(0.0))
+            .overflow_hidden()
+            .bg(tokens.surfaces.canvas.to_gpui())
+            .child(
+                div()
+                    .id("native-shell-conversation-header")
+                    .w_full()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .h(px(Self::PANEL_HEADER_HEIGHT))
+                    .px(px(tokens.density.spacing.md))
+                    .child(
+                        div()
+                            .text_size(px(tokens.density.typography.caption))
+                            .text_color(tokens.text.muted.to_gpui())
+                            .child("Conversation"),
+                    )
+                    .children(trailing),
+            )
+            .child(body)
+            .into_any_element()
+    }
+
     /// Column widths and the terminal height are user-owned and persisted;
     /// their bounds live with the layout store that clamps them.
     ///
@@ -9372,13 +12577,13 @@ impl NativeShell {
             // Panels are the lightest surface in the window. Card-on-canvas is
             // the only depth cue available without shadows, and the previous
             // raised-on-canvas pairing differed by too little to read as one.
-            .bg(tokens.surfaces.overlay.to_gpui())
             .border(px(1.0))
             .border_color(tokens.borders.subtle.to_gpui())
             .rounded(px(tokens.density.radii.lg))
             // A hairline alone reads as flat at this contrast; the shadow is
             // what separates a card from its canvas at a glance.
-            .shadow_sm();
+            .shadow_sm()
+            .bg(tokens.surfaces.overlay.to_gpui());
         // `min-height: auto` on a flex item would let a tall body win over the
         // column bound, so a growing panel has to opt out of it explicitly.
         let frame = if grow {
@@ -9679,6 +12884,10 @@ impl NativeShell {
         None
     }
 
+    fn modal_backdrop() -> gpui::Rgba {
+        gpui::rgba(0x00000059)
+    }
+
     fn overlay_text_field(
         id: &'static str,
         field: &TextField,
@@ -9822,7 +13031,7 @@ impl NativeShell {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .bg(tokens.surfaces.overlay.to_gpui())
+                    .bg(Self::modal_backdrop())
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|shell, _event: &MouseDownEvent, window, cx| {
@@ -10025,7 +13234,7 @@ impl NativeShell {
                         .flex()
                         .items_center()
                         .justify_center()
-                        .bg(tokens.surfaces.overlay.to_gpui())
+                        .bg(Self::modal_backdrop())
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|shell, _event: &MouseDownEvent, _window, cx| {
@@ -10144,7 +13353,7 @@ impl NativeShell {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .bg(tokens.surfaces.overlay.to_gpui())
+                    .bg(Self::modal_backdrop())
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|shell, _event: &MouseDownEvent, window, cx| {
@@ -10566,26 +13775,10 @@ impl NativeShell {
             .rounded(px(tokens.density.radii.md))
             .bg(tokens.surfaces.raised.to_gpui())
             .child(self.pane_toggle(
-                "native-shell-toggle-sidebar",
-                "Config",
-                PaneEdge::Sidebar,
-                !self.layout.sidebar_collapsed,
-                tokens,
-                cx,
-            ))
-            .child(self.pane_toggle(
                 "native-shell-toggle-dock",
                 "Dock",
                 PaneEdge::Dock,
                 !self.layout.dock_collapsed,
-                tokens,
-                cx,
-            ))
-            .child(self.pane_toggle(
-                "native-shell-toggle-terminal",
-                "Terminal",
-                PaneEdge::Terminal,
-                !self.layout.terminal_collapsed,
                 tokens,
                 cx,
             ))
@@ -10655,8 +13848,7 @@ impl NativeShell {
     ) -> AnyElement {
         let show_attachment = !self.header_attachment.label().is_empty()
             || !self.header_attachment.detail().is_empty();
-        let show_connection = matches!(self.shell_stage(), ShellStage::Cockpit)
-            || !matches!(self.host_state, NativeHostState::Connected { .. });
+        let show_connection = !matches!(self.host_state, NativeHostState::Connected { .. });
         div()
             .id("native-shell-toolbar")
             .w_full()
@@ -10808,28 +14000,28 @@ impl NativeShell {
     /// one-pixel drag target is the difference between a resizable window and
     /// a frustrating one.
     const RAIL_THICKNESS: f32 = 6.0;
-    /// A collapsed terminal keeps its header so it can be reopened from where
-    /// it was closed rather than from a menu.
-    const COLLAPSED_TERMINAL_HEIGHT: f32 = Self::PANEL_HEADER_HEIGHT + 2.0;
-
-    /// Height of the workspace row for a given viewport. The terminal strip is
-    /// a sized sibling, and a grown row starves it, so the row is measured from
-    /// the window rather than from leftover flex space.
-    fn workspace_row_height(
+    fn idle_conversation_photo_size(
         tokens: crate::ui::tokens::ThemeTokens,
         viewport: Size<Pixels>,
         layout: WorkspaceLayout,
-    ) -> Pixels {
-        let terminal = if layout.terminal_collapsed {
-            Self::COLLAPSED_TERMINAL_HEIGHT
+    ) -> Size<Pixels> {
+        let dock = if layout.dock_collapsed {
+            0.0
         } else {
-            layout.terminal_height
+            Self::RAIL_THICKNESS + layout.dock_width
         };
-        let chrome = Self::HEADER_HEIGHT
-            + tokens.density.spacing.lg * 2.0
-            + terminal
-            + tokens.density.spacing.md;
-        px((f32::from(viewport.height) - chrome).max(Self::MIN_WORKSPACE_ROW_HEIGHT))
+        let width = f32::from(viewport.width)
+            - tokens.density.spacing.lg * 2.0
+            - layout.inbox_width
+            - Self::RAIL_THICKNESS
+            - dock
+            - 2.0;
+        let height = f32::from(viewport.height)
+            - Self::HEADER_HEIGHT
+            - tokens.density.spacing.lg * 2.0
+            - Self::PANEL_HEADER_HEIGHT
+            - 2.0;
+        size(px(width.max(1.0)), px(height.max(1.0)))
     }
 
     /// A draggable pane edge. Dormant it is a hairline that reads as the seam
@@ -10959,8 +14151,10 @@ impl NativeShell {
     fn reset_layout(&mut self) {
         self.pane_drag = None;
         let window = self.layout.window;
+        let selected_task = self.layout.selected_task;
         self.layout = WorkspaceLayout {
             window,
+            selected_task,
             ..WorkspaceLayout::default()
         };
         self.persist_layout();
@@ -11011,23 +14205,22 @@ impl NativeShell {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn main_column(
         &self,
         tokens: crate::ui::tokens::ThemeTokens,
+        conversation: AnyElement,
         inbox: AnyElement,
         dock: AnyElement,
-        terminal: AnyElement,
         workspace_height: Option<Pixels>,
         layout: WorkspaceLayout,
-        rails: Option<(AnyElement, AnyElement, AnyElement)>,
+        rails: Option<(AnyElement, AnyElement)>,
+        conversation_trailing: Option<AnyElement>,
     ) -> AnyElement {
-        let (inbox_rail, dock_rail, terminal_rail) = match rails {
+        let (inbox_rail, dock_rail) = match rails {
             Some(rails) => rails,
             None => (
                 Self::pane_rail_static(true, tokens),
                 Self::pane_rail_static(true, tokens),
-                Self::pane_rail_static(false, tokens),
             ),
         };
         let workspace_row = div()
@@ -11040,6 +14233,8 @@ impl NativeShell {
             None => workspace_row.flex_1(),
         };
         let show_dock = !layout.dock_collapsed;
+        let conversation_panel =
+            Self::conversation_canvas_panel(tokens, conversation, conversation_trailing);
         div()
             .id("native-shell-main-content")
             .flex()
@@ -11075,33 +14270,7 @@ impl NativeShell {
                             .flex_1()
                             .min_h(px(0.0))
                             .min_w(px(0.0))
-                            .gap(px(tokens.density.spacing.md))
-                            .child(Self::stacked_panel_grow(
-                                "native-shell-conversation-panel",
-                                "Conversation",
-                                tokens,
-                                self.cockpit
-                                    .conversation_surface(tokens, self.composer.as_ref())
-                                    .into_any_element(),
-                                None,
-                            ))
-                            .child(
-                                // Reference data, not the primary surface: it
-                                // keeps its natural height only up to a cap so
-                                // it can never crush the conversation above it.
-                                div()
-                                    .flex()
-                                    .flex_none()
-                                    .flex_col()
-                                    .max_h(px(200.0))
-                                    .overflow_hidden()
-                                    .child(Self::stacked_panel(
-                                        "native-shell-prompt-panel",
-                                        "Prompt library",
-                                        tokens,
-                                        self.prompt_library_surface(tokens),
-                                    )),
-                            ),
+                            .child(conversation_panel),
                     )
                     .children(show_dock.then_some(dock_rail))
                     .children(show_dock.then(|| {
@@ -11116,91 +14285,6 @@ impl NativeShell {
                             .children(self.task_details_panel(tokens))
                             .child(dock)
                     })),
-            )
-            .child(terminal_rail)
-            .child(terminal)
-            .into_any_element()
-    }
-
-    /// Header for the terminal strip. The strip carries the terminal palette
-    /// rather than panel chrome, so its header cannot borrow the panel header's
-    /// surface colors without losing contrast.
-    fn terminal_header(tokens: crate::ui::tokens::ThemeTokens, collapsed: bool) -> AnyElement {
-        div()
-            .w_full()
-            .flex()
-            .flex_none()
-            .items_center()
-            .gap(px(tokens.density.spacing.sm))
-            .h(px(Self::PANEL_HEADER_HEIGHT))
-            .px(px(tokens.density.spacing.lg))
-            .border_b(px(1.0))
-            .border_color(tokens.terminal.selection.to_gpui())
-            .text_size(px(tokens.density.typography.caption))
-            .line_height(px(tokens.density.typography.caption_line_height))
-            .font_weight(FontWeight::SEMIBOLD)
-            .text_color(tokens.terminal.bright_white.to_gpui())
-            .child("TERMINAL")
-            .child(
-                div()
-                    .flex_1()
-                    .text_color(tokens.terminal.bright_black.to_gpui())
-                    .font_weight(FontWeight::NORMAL)
-                    .truncate()
-                    .child(if collapsed {
-                        "hidden — Ctrl+J to reopen"
-                    } else {
-                        "drag the edge above to resize · Ctrl+J to hide"
-                    }),
-            )
-            .into_any_element()
-    }
-
-    /// Terminal strip beneath the workspace row. Its height is user-owned and
-    /// persisted, and it can be collapsed to its header so an idle terminal
-    /// never claims the majority of a tall window.
-    fn terminal_panel(
-        &self,
-        tokens: crate::ui::tokens::ThemeTokens,
-        layout: WorkspaceLayout,
-    ) -> AnyElement {
-        let collapsed = layout.terminal_collapsed;
-        let height = if collapsed {
-            Self::COLLAPSED_TERMINAL_HEIGHT
-        } else {
-            layout.terminal_height.max(Self::COLLAPSED_TERMINAL_HEIGHT)
-        };
-        let panel = div()
-            .id("native-shell-terminal-dock")
-            .w_full()
-            .flex()
-            .flex_col()
-            .flex_none()
-            .h(px(height))
-            .min_h(px(0.0))
-            .overflow_hidden()
-            .bg(tokens.terminal.background.to_gpui())
-            .border(px(1.0))
-            .border_color(tokens.borders.subtle.to_gpui())
-            .rounded(px(tokens.density.radii.lg))
-            .shadow_sm()
-            .child(Self::terminal_header(tokens, collapsed));
-        if collapsed {
-            return panel.into_any_element();
-        }
-        panel
-            .child(
-                div()
-                    .w_full()
-                    .flex_grow()
-                    .min_h(px(0.0))
-                    .overflow_hidden()
-                    .px(px(tokens.density.spacing.lg))
-                    .py(px(tokens.density.spacing.md))
-                    .text_size(px(tokens.density.typography.code))
-                    .line_height(px(tokens.density.typography.code_line_height))
-                    .text_color(tokens.terminal.foreground.to_gpui())
-                    .child(self.terminal.element()),
             )
             .into_any_element()
     }
@@ -11226,7 +14310,9 @@ impl NativeShell {
     fn element_body(&self, task_rows: Vec<AnyElement>) -> impl IntoElement {
         let tokens = self.preferences.tokens();
         let layout = self.layout.sanitized();
-        let stage = self.shell_stage();
+        // Connection state changes controls in-place; it never replaces the
+        // workspace with a full-window waiting canvas.
+        let stage = ShellStage::Cockpit;
         if stage != ShellStage::Cockpit {
             return div()
                 .id("native-shell-root")
@@ -11302,7 +14388,9 @@ impl NativeShell {
             self.context_dock_surface(tokens, None),
             None,
         );
-        let show_sidebar = !layout.sidebar_collapsed;
+        // Project navigation now lives in the grouped Task Inbox. The former
+        // configuration rail remains available through Settings only.
+        let show_sidebar = false;
         div()
             .id("native-shell-root")
             .size_full()
@@ -11342,11 +14430,18 @@ impl NativeShell {
                     .children(show_sidebar.then(|| Self::pane_rail_static(true, tokens)))
                     .child(self.main_column(
                         tokens,
+                        if self.interaction.selected_task().is_none() {
+                            self.idle_conversation_photo_surface(tokens, None)
+                        } else {
+                            self.cockpit
+                                .conversation_surface(tokens, self.composer.as_ref())
+                                .into_any_element()
+                        },
                         inbox,
                         dock,
-                        self.terminal_panel(tokens, layout),
                         None,
                         layout,
+                        None,
                         None,
                     )),
             )
@@ -11356,9 +14451,10 @@ impl NativeShell {
     fn element_with_handlers(
         &mut self,
         viewport: Size<Pixels>,
-        cx: &Context<Self>,
+        cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let tokens = self.preferences.tokens();
+        let inbox_items = Arc::new(self.project_inbox_items());
         let task_ids = Arc::new(self.task_list.task_ids().to_vec());
         let row_models = Arc::new(
             task_ids
@@ -11377,18 +14473,212 @@ impl NativeShell {
         );
         let selected_task = self.interaction.selected_task();
         let row_height = Self::inbox_row_height(tokens);
-        let inbox_is_empty = task_ids.is_empty();
+        let inbox_is_empty = inbox_items.is_empty();
+        let agents_connected = snapshot_connected(self.agent_connection.as_ref());
+        let agent_loading_glyph = match self.controller_ticks % 4 {
+            0 => "◐",
+            1 => "◓",
+            2 => "◑",
+            _ => "◒",
+        };
+        let available_agents = self
+            .agent_connection
+            .as_ref()
+            .map(inbox_agent_actions)
+            .unwrap_or_default();
+        let claude_available = available_agents
+            .iter()
+            .any(|action| action.provider == ProviderKind::ClaudeCode);
+        let codex_available = available_agents
+            .iter()
+            .any(|action| action.provider == ProviderKind::Codex);
         let shell_entity = cx.entity().downgrade();
         let services_shell_entity = shell_entity.clone();
         let task_list_element = uniform_list(
             "native-task-uniform-list",
-            task_ids.len(),
+            inbox_items.len(),
             move |range, _window, _app| {
                 range
-                    .filter_map(|index| {
-                        task_ids.get(index).copied().map(|task_id| (index, task_id))
-                    })
-                    .map(|(_index, task_id)| {
+                    .filter_map(|index| inbox_items.get(index).cloned())
+                    .map(|item| match item {
+                        ProjectInboxItem::Project {
+                            project_id,
+                            label,
+                            expanded,
+                            task_count,
+                        } => {
+                            let shell_for_toggle = shell_entity.clone();
+                            let shell_for_toggle_key = shell_entity.clone();
+                            let shell_for_claude = shell_entity.clone();
+                            let shell_for_claude_key = shell_entity.clone();
+                            let shell_for_codex = shell_entity.clone();
+                            let shell_for_codex_key = shell_entity.clone();
+                            let header = div()
+                                .id(("native-project-row", stable_project_element_key(project_id, "row")))
+                                .tab_stop(true)
+                                .w_full()
+                                .h(px(row_height))
+                                .flex()
+                                .items_center()
+                                .gap(px(tokens.density.spacing.sm))
+                                .px(px(tokens.density.spacing.md))
+                                .bg(tokens.surfaces.overlay.to_gpui())
+                                .border_b(px(1.0))
+                                .border_color(tokens.borders.subtle.to_gpui())
+                                .cursor_pointer()
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    move |_event: &MouseDownEvent,
+                                          _window: &mut Window,
+                                          app: &mut gpui::App| {
+                                        let _ = shell_for_toggle.update(app, |shell, cx| {
+                                            cx.stop_propagation();
+                                            shell.toggle_project(project_id);
+                                            shell.refresh_accessibility_tree();
+                                            cx.notify();
+                                        });
+                                    },
+                                )
+                                .on_key_down(
+                                    move |event: &KeyDownEvent,
+                                          _window: &mut Window,
+                                          app: &mut gpui::App| {
+                                        if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                                            let _ = shell_for_toggle_key.update(app, |shell, cx| {
+                                                cx.stop_propagation();
+                                                shell.toggle_project(project_id);
+                                                shell.refresh_accessibility_tree();
+                                                cx.notify();
+                                            });
+                                        }
+                                    },
+                                )
+                                .child(if expanded { "▾" } else { "▸" })
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(0.0))
+                                        .truncate()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child(label),
+                                )
+                                .child(Self::panel_count_badge(task_count, tokens));
+                            let header = if agents_connected {
+                                let claude = if claude_available {
+                                    div()
+                                        .id(("native-project-claude", stable_project_element_key(project_id, "claude")))
+                                        .tab_stop(true)
+                                        .px(px(tokens.density.spacing.sm))
+                                        .py(px(tokens.density.spacing.xxs))
+                                        .rounded(px(tokens.density.radii.sm))
+                                        .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            move |_event: &MouseDownEvent,
+                                                  _window: &mut Window,
+                                                  app: &mut gpui::App| {
+                                                let _ = shell_for_claude.update(app, |shell, cx| {
+                                                    cx.stop_propagation();
+                                                    shell.start_task_with_agent_for_project(
+                                                        project_id,
+                                                        ProviderKind::ClaudeCode,
+                                                    );
+                                                    cx.notify();
+                                                });
+                                            },
+                                        )
+                                        .on_key_down(
+                                            move |event: &KeyDownEvent,
+                                                  _window: &mut Window,
+                                                  app: &mut gpui::App| {
+                                                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                                                    let _ = shell_for_claude_key.update(app, |shell, cx| {
+                                                        cx.stop_propagation();
+                                                        shell.start_task_with_agent_for_project(
+                                                            project_id,
+                                                            ProviderKind::ClaudeCode,
+                                                        );
+                                                        cx.notify();
+                                                    });
+                                                }
+                                            },
+                                        )
+                                        .child("+Claude")
+                                        .into_any_element()
+                                } else {
+                                    div()
+                                        .px(px(tokens.density.spacing.sm))
+                                        .text_color(tokens.text.disabled.to_gpui())
+                                        .child("Claude")
+                                        .into_any_element()
+                                };
+                                let codex = if codex_available {
+                                    div()
+                                        .id(("native-project-codex", stable_project_element_key(project_id, "codex")))
+                                        .tab_stop(true)
+                                        .px(px(tokens.density.spacing.sm))
+                                        .py(px(tokens.density.spacing.xxs))
+                                        .rounded(px(tokens.density.radii.sm))
+                                        .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            move |_event: &MouseDownEvent,
+                                                  _window: &mut Window,
+                                                  app: &mut gpui::App| {
+                                                let _ = shell_for_codex.update(app, |shell, cx| {
+                                                    cx.stop_propagation();
+                                                    shell.start_task_with_agent_for_project(
+                                                        project_id,
+                                                        ProviderKind::Codex,
+                                                    );
+                                                    cx.notify();
+                                                });
+                                            },
+                                        )
+                                        .on_key_down(
+                                            move |event: &KeyDownEvent,
+                                                  _window: &mut Window,
+                                                  app: &mut gpui::App| {
+                                                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                                                    let _ = shell_for_codex_key.update(app, |shell, cx| {
+                                                        cx.stop_propagation();
+                                                        shell.start_task_with_agent_for_project(
+                                                            project_id,
+                                                            ProviderKind::Codex,
+                                                        );
+                                                        cx.notify();
+                                                    });
+                                                }
+                                            },
+                                        )
+                                        .child("+Codex")
+                                        .into_any_element()
+                                } else {
+                                    div()
+                                        .px(px(tokens.density.spacing.sm))
+                                        .text_color(tokens.text.disabled.to_gpui())
+                                        .child("Codex")
+                                        .into_any_element()
+                                };
+                                header.child(claude).child(codex)
+                            } else {
+                                header
+                                    .child(
+                                        div()
+                                            .px(px(tokens.density.spacing.sm))
+                                            .text_color(tokens.text.muted.to_gpui())
+                                            .child(format!("{agent_loading_glyph} Claude")),
+                                    )
+                                    .child(
+                                        div()
+                                            .px(px(tokens.density.spacing.sm))
+                                            .text_color(tokens.text.muted.to_gpui())
+                                            .child(format!("{agent_loading_glyph} Codex")),
+                                    )
+                            };
+                            header.into_any_element()
+                        }
+                        ProjectInboxItem::Task { project_id, task_id } => {
                         let shell_for_mouse = shell_entity.clone();
                         let shell_for_mouse_up = shell_entity.clone();
                         let shell_for_key = shell_entity.clone();
@@ -11408,12 +14698,14 @@ impl NativeShell {
                                 let _ = shell_for_mouse.update(app, |shell, cx| {
                                     cx.stop_propagation();
                                     if event.button == MouseButton::Left {
+                                        shell.selected_project_id = Some(project_id);
                                         shell.focus_handle.focus(window);
                                         let _ = shell
                                             .interaction
                                             .navigation_mouse_down(task_id, &shell.task_list);
                                         shell.sync_cockpit_follow();
                                         shell.refresh_accessibility_tree();
+                                        cx.notify();
                                     }
                                 });
                             };
@@ -11433,11 +14725,13 @@ impl NativeShell {
                                 if matches!(event.keystroke.key.as_str(), "enter" | "space") {
                                     let _ = shell_for_key.update(app, |shell, cx| {
                                         cx.stop_propagation();
+                                        shell.selected_project_id = Some(project_id);
                                         let _ = shell
                                             .interaction
                                             .navigation_mouse_down(task_id, &shell.task_list);
                                         shell.sync_cockpit_follow();
                                         shell.refresh_accessibility_tree();
+                                        cx.notify();
                                     });
                                 }
                             };
@@ -11449,7 +14743,8 @@ impl NativeShell {
                             .flex()
                             .items_center()
                             .gap(px(tokens.density.spacing.sm))
-                            .px(px(tokens.density.spacing.md))
+                            .pl(px(tokens.density.spacing.xl))
+                            .pr(px(tokens.density.spacing.md))
                             .border_l(px(2.0))
                             .cursor_pointer();
                         // Selection is carried by fill plus an accent edge, and
@@ -11507,6 +14802,7 @@ impl NativeShell {
                                     ),
                             )
                             .into_any_element()
+                        }
                     })
                     .collect::<Vec<_>>()
             },
@@ -11514,31 +14810,6 @@ impl NativeShell {
         .h_full()
         .track_scroll(self.task_scroll_handle.clone());
 
-        let terminal_down = cx.listener(|shell, event: &MouseDownEvent, window, cx| {
-            cx.stop_propagation();
-            shell.focus_handle.focus(window);
-            let selected = shell.interaction.selected_task();
-            if let (Some(task_id), Some(button)) = (selected, pointer_button(event.button)) {
-                shell.interaction.terminal_mouse_down(
-                    NATIVE_POINTER_ID,
-                    task_id,
-                    button,
-                    Some(task_id),
-                );
-            }
-        });
-        let terminal_up = cx.listener(|shell, event: &MouseUpEvent, _window, cx| {
-            cx.stop_propagation();
-            if let Some(button) = pointer_button(event.button) {
-                shell
-                    .interaction
-                    .terminal_mouse_up_for(NATIVE_POINTER_ID, button);
-            } else {
-                shell
-                    .interaction
-                    .terminal_mouse_up_unmapped(NATIVE_POINTER_ID);
-            }
-        });
         let scroll_handle = self.task_scroll_handle.clone();
         let inbox_scroll = cx.listener(move |shell, event: &ScrollWheelEvent, _window, cx| {
             cx.stop_propagation();
@@ -11549,6 +14820,7 @@ impl NativeShell {
                 .base_handle
                 .set_offset(point(offset.x, offset.y - delta));
             shell.refresh_accessibility_tree();
+            cx.notify();
         });
 
         let host_actions = cx.listener(|shell, _action: &HostActions, _window, cx| {
@@ -11694,9 +14966,17 @@ impl NativeShell {
             shell.toggle_pane(PaneEdge::Dock);
             cx.notify();
         });
-        let toggle_terminal = cx.listener(|shell, _action: &NativeToggleTerminal, _window, cx| {
+        let toggle_terminal = cx.listener(|shell, _action: &NativeToggleTerminal, window, cx| {
             cx.stop_propagation();
-            shell.toggle_pane(PaneEdge::Terminal);
+            let show_terminal = !shell.cockpit.dock().showing_raw_terminal();
+            shell.set_provider_terminal_visible(show_terminal);
+            if show_terminal {
+                shell.terminal_focus_handle.focus(window);
+                shell.pending_terminal_focus = false;
+            } else {
+                shell.composer_focus_handle.focus(window);
+                shell.pending_composer_focus = false;
+            }
             cx.notify();
         });
         let reset_layout = cx.listener(|shell, _action: &NativeResetLayout, _window, cx| {
@@ -11705,10 +14985,9 @@ impl NativeShell {
             cx.notify();
         });
 
-        // The dock tools were previously reachable only through Alt+1..7. The
-        // tab strip gives the same seven tools a visible, clickable affordance
-        // and dispatches the identical keyboard action, so selection stays on
-        // one fenced path.
+        // Context tools keep their existing Alt+digit accelerators. Terminal
+        // is intentionally absent here because it is the center-canvas mode,
+        // not a duplicate right-dock surface.
         let active_tool = self.cockpit.active_tool();
         let mut dock_tabs = div()
             .id("native-shell-dock-tabs")
@@ -11771,6 +15050,27 @@ impl NativeShell {
             .child(self.context_dock_surface(tokens, Some(services_shell_entity)))
             .into_any_element();
 
+        let inbox_heading_action = if agents_connected {
+            Button::new("native-projects-add")
+                .label("+ Project")
+                .ghost()
+                .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
+                    cx.stop_propagation();
+                    shell.begin_choose_folder(cx);
+                    cx.notify();
+                }))
+                .into_any_element()
+        } else {
+            div()
+                .flex()
+                .items_center()
+                .gap(px(tokens.density.spacing.sm))
+                .text_size(px(tokens.density.typography.caption))
+                .text_color(tokens.text.muted.to_gpui())
+                .child(format!("{agent_loading_glyph} +Claude"))
+                .child(format!("{agent_loading_glyph} +Codex"))
+                .into_any_element()
+        };
         let inbox_panel = Self::stacked_panel_grow(
             "native-shell-task-inbox",
             "Task inbox",
@@ -11792,28 +15092,8 @@ impl NativeShell {
                     .child(task_list_element)
                     .into_any_element()
             },
-            self.inbox_agent_header_actions(cx),
+            Some(inbox_heading_action),
         );
-
-        let host_status_control = div()
-            .id("native-shell-host-status-hit")
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|shell, _event: &MouseDownEvent, _window, cx| {
-                    cx.stop_propagation();
-                    shell.interaction.begin_control_pointer(NATIVE_POINTER_ID);
-                }),
-            )
-            .child(
-                Button::new("native-shell-host-status")
-                    .label("Host status")
-                    .info()
-                    .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
-                        cx.stop_propagation();
-                        shell.dispatch_pointer_action(ActionRequest::HostStatus, NATIVE_POINTER_ID);
-                    })),
-            )
-            .into_any_element();
 
         let header_settings_control = Button::new("native-header-settings")
             .label("Settings")
@@ -11828,8 +15108,8 @@ impl NativeShell {
         let layout = self
             .layout
             .fitted(f32::from(viewport.width), f32::from(viewport.height));
-        let stage = self.shell_stage();
-        let show_sidebar = !layout.sidebar_collapsed && stage == ShellStage::Cockpit;
+        let stage = ShellStage::Cockpit;
+        let show_sidebar = false;
         let pane_toggles = (stage == ShellStage::Cockpit).then(|| self.pane_toggles(tokens, cx));
         let workspace_actions = None;
         let setup_action =
@@ -11860,58 +15140,21 @@ impl NativeShell {
         let workspace_rails = (
             self.pane_rail(PaneEdge::Inbox, tokens, cx),
             self.pane_rail(PaneEdge::Dock, tokens, cx),
-            self.pane_rail(PaneEdge::Terminal, tokens, cx),
         );
-        let terminal_element = {
-            let collapsed = layout.terminal_collapsed;
-            let panel = div()
-                .id("native-shell-terminal-dock")
-                .w_full()
-                .flex()
-                .flex_col()
-                .flex_none()
-                .h(px(if collapsed {
-                    Self::COLLAPSED_TERMINAL_HEIGHT
-                } else {
-                    layout.terminal_height.max(Self::COLLAPSED_TERMINAL_HEIGHT)
-                }))
-                .min_h(px(0.0))
-                .overflow_hidden()
-                .bg(tokens.terminal.background.to_gpui())
-                .border(px(1.0))
-                .border_color(tokens.borders.subtle.to_gpui())
-                .rounded(px(tokens.density.radii.lg))
-                .shadow_sm()
-                .capture_any_mouse_down(terminal_down)
-                .capture_any_mouse_up(terminal_up)
-                .child(Self::terminal_header(tokens, collapsed));
-            if collapsed {
-                panel.into_any_element()
-            } else {
-                panel
-                    .child(
-                        div()
-                            .w_full()
-                            .flex_grow()
-                            .min_h(px(0.0))
-                            .overflow_hidden()
-                            .px(px(tokens.density.spacing.lg))
-                            .py(px(tokens.density.spacing.md))
-                            .text_size(px(tokens.density.typography.code))
-                            .line_height(px(tokens.density.typography.code_line_height))
-                            .text_color(tokens.terminal.foreground.to_gpui())
-                            .child(self.terminal.element()),
-                    )
-                    .into_any_element()
-            }
-        };
+        let conversation = self.task_conversation_surface(
+            tokens,
+            Self::idle_conversation_photo_size(tokens, viewport, layout),
+            cx,
+        );
 
         div()
             .id("native-shell-root")
             // The root fills the client area rather than a measured viewport:
             // the two differ by the window frame on Windows, and any shortfall
             // paints as a transparent strip along the window edges.
-            .size_full()
+            .w(viewport.width)
+            .h(viewport.height)
+            .relative()
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(|shell, event: &KeyDownEvent, window, cx| {
                 if shell.handle_overlay_key(event, window, cx) {
@@ -11980,7 +15223,7 @@ impl NativeShell {
             .text_color(tokens.text.primary.to_gpui())
             .child(self.header_bar(
                 tokens,
-                (stage == ShellStage::Cockpit).then_some(host_status_control),
+                None,
                 workspace_actions,
                 pane_toggles,
                 header_settings_control,
@@ -12023,12 +15266,13 @@ impl NativeShell {
                             .children(show_sidebar.then_some(sidebar_rail))
                             .child(self.main_column(
                                 tokens,
+                                conversation,
                                 inbox_panel,
                                 dock_panel,
-                                terminal_element,
-                                Some(Self::workspace_row_height(tokens, viewport, layout)),
+                                None,
                                 layout,
                                 Some(workspace_rails),
+                                self.conversation_delete_action(cx),
                             ))
                             .into_any_element()
                     }))
@@ -12063,29 +15307,60 @@ impl NativeShell {
     }
 
     fn dispatch_action(&mut self, request: ActionRequest) -> Option<NativeActionRecord> {
+        self.dispatch_action_checked(request)
+            .err()
+            .and_then(|failure| failure.record)
+    }
+
+    /// Dispatch an action while preserving the difference between successful
+    /// queue admission and a request rejected before a record existed. The
+    /// composer uses this seam so it can never clear an intent that was not
+    /// actually handed to the host lane.
+    fn dispatch_action_checked(
+        &mut self,
+        request: ActionRequest,
+    ) -> Result<(), NativeActionDispatchFailure> {
         if self.action_lane_len() >= MAX_ACTION_LANE_RECORDS {
             // The shell-side retry queue is deliberately bounded. Refuse a
             // new intent before constructing a record when that bound is
             // reached, retaining every already-created record and surfacing
             // typed pressure to the user instead of silently evicting one.
-            self.set_action_capacity_failure(request.id());
-            return None;
+            if is_native_query_request(&request) {
+                self.settle_native_query_request_capacity_failure();
+            } else {
+                self.set_action_capacity_failure(request.id());
+            }
+            return Err(NativeActionDispatchFailure::before_capture(
+                "the host action lane is busy",
+            ));
         }
         let Some(record) = self.interaction.action(request) else {
-            return None;
+            return Err(NativeActionDispatchFailure::before_capture(
+                "the selected task or runtime fence changed",
+            ));
         };
-        let returned = record.clone();
         if let NativeHostCommand::Browser(command) = record.command.clone() {
             return match self.apply_browser_native_command(&command) {
-                Ok(_) => None,
-                Err(_) => Some(returned),
+                Ok(_) => Ok(()),
+                Err(error) => Err(NativeActionDispatchFailure::after_capture(
+                    record,
+                    error.to_string(),
+                )),
             };
         }
-        match self.enqueue_host_action(record) {
-            NativeHostActionResult::Queued => None,
-            NativeHostActionResult::Disconnected
-            | NativeHostActionResult::QueueFull
-            | NativeHostActionResult::Stale => Some(returned),
+        match self.enqueue_host_action(record.clone()) {
+            NativeHostActionResult::Queued => Ok(()),
+            NativeHostActionResult::Disconnected => Err(
+                NativeActionDispatchFailure::after_capture(record, "the host is disconnected"),
+            ),
+            NativeHostActionResult::QueueFull => Err(NativeActionDispatchFailure::after_capture(
+                record,
+                "the host action queue is full",
+            )),
+            NativeHostActionResult::Stale => Err(NativeActionDispatchFailure::after_capture(
+                record,
+                "the task changed before Send was admitted",
+            )),
         }
     }
 
@@ -12093,6 +15368,10 @@ impl NativeShell {
         let mut reuse_handler = false;
         for request in requests {
             if self.action_lane_len() >= MAX_ACTION_LANE_RECORDS {
+                if is_native_query_request(&request) {
+                    self.settle_native_query_request_capacity_failure();
+                    continue;
+                }
                 self.set_action_capacity_failure(request.id());
                 return;
             }
@@ -12109,8 +15388,14 @@ impl NativeShell {
                 reuse_handler = true;
                 continue;
             }
+            let is_conversation_query = is_conversation_query_command(&record.command);
             match self.enqueue_host_action(record) {
-                NativeHostActionResult::Queued => reuse_handler = true,
+                NativeHostActionResult::Queued => {
+                    if is_conversation_query {
+                        self.conversation_query_in_flight = true;
+                    }
+                    reuse_handler = true;
+                }
                 NativeHostActionResult::Disconnected
                 | NativeHostActionResult::QueueFull
                 | NativeHostActionResult::Stale => return,
@@ -12133,7 +15418,11 @@ impl NativeShell {
         pointer_id: u64,
     ) -> Option<NativeActionRecord> {
         if self.action_lane_len() >= MAX_ACTION_LANE_RECORDS {
-            self.set_action_capacity_failure(request.id());
+            if is_native_query_request(&request) {
+                self.settle_native_query_request_capacity_failure();
+            } else {
+                self.set_action_capacity_failure(request.id());
+            }
             return None;
         }
         let Some(record) = self
@@ -12175,6 +15464,10 @@ impl NativeShell {
     fn enqueue_host_action(&mut self, record: NativeActionRecord) -> NativeHostActionResult {
         if !self.interaction.accepts_action_record(&record) {
             let result = NativeHostActionResult::Stale;
+            if is_native_query_command(&record.command) {
+                self.discard_native_query_action(&record);
+                return result;
+            }
             if self.retain_pending_host_action(record.clone()) {
                 self.set_transport_failure(&record, result);
             } else {
@@ -12185,6 +15478,13 @@ impl NativeShell {
         let result = self.try_enqueue_host_action(record.clone());
         match result {
             NativeHostActionResult::Queued => {}
+            result @ (NativeHostActionResult::Disconnected
+            | NativeHostActionResult::QueueFull
+            | NativeHostActionResult::Stale)
+                if is_native_query_command(&record.command) =>
+            {
+                self.settle_native_query_admission_failure(&record, result);
+            }
             NativeHostActionResult::Disconnected
             | NativeHostActionResult::QueueFull
             | NativeHostActionResult::Stale => {
@@ -12201,8 +15501,11 @@ impl NativeShell {
     fn host_status_text(&self) -> String {
         let base = match &self.host_state {
             NativeHostState::Connected { .. } => "Connected".to_string(),
+            NativeHostState::Connecting => "Connecting".to_string(),
             NativeHostState::Disconnected => "Disconnected".to_string(),
-            NativeHostState::Error { .. } => "Can't connect".to_string(),
+            NativeHostState::Error { message } => {
+                format!("Can't connect · {}", bounded_host_error(message.clone()))
+            }
         };
         let with_failure = self
             .last_action_failure
@@ -12220,15 +15523,135 @@ impl NativeShell {
     }
 }
 
+impl EntityInputHandler for NativeShell {
+    fn text_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        adjusted_range: &mut Option<Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let composer = self.composer.as_ref()?;
+        let value = composer.draft_text();
+        let (start_scalar, start_utf16) = Self::scalar_boundary_for_utf16(value, range_utf16.start);
+        let (mut end_scalar, mut end_utf16) =
+            Self::scalar_boundary_for_utf16(value, range_utf16.end);
+        if end_scalar < start_scalar {
+            end_scalar = start_scalar;
+            end_utf16 = start_utf16;
+        }
+        adjusted_range.replace(start_utf16..end_utf16);
+        let start = value
+            .char_indices()
+            .nth(start_scalar)
+            .map(|(index, _)| index)
+            .unwrap_or(value.len());
+        let end = value
+            .char_indices()
+            .nth(end_scalar)
+            .map(|(index, _)| index)
+            .unwrap_or(value.len());
+        Some(value[start..end].to_string())
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        self.composer_utf16_selection().map(|range| UTF16Selection {
+            range,
+            reversed: false,
+        })
+    }
+
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Range<usize>> {
+        self.composer_marked_range.clone()
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
+        self.composer_marked_range = None;
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        text: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Err(error) = self.replace_composer_platform_text(range_utf16, text) {
+            self.composer_error = Some(error.to_string());
+        } else {
+            self.composer_error = None;
+        }
+        cx.notify();
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        new_text: &str,
+        _new_selected_range: Option<Range<usize>>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match self.replace_composer_platform_text(range_utf16, new_text) {
+            Ok(inserted) => {
+                self.composer_marked_range = (!new_text.is_empty()).then_some(inserted);
+                self.composer_error = None;
+            }
+            Err(error) => self.composer_error = Some(error.to_string()),
+        }
+        cx.notify();
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        _range_utf16: Range<usize>,
+        element_bounds: Bounds<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        Some(element_bounds)
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _point: Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        self.composer_utf16_selection().map(|range| range.end)
+    }
+}
+
 impl Render for NativeShell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // The shell root takes explicit viewport pixels. A percentage size
-        // leaves the root laid out against indefinite available space, so it
-        // sizes to its own content and every full-width or bottom-anchored
-        // child resolves outside the visible window.
-        // `viewport_size` is already in the logical pixels the element tree is
-        // laid out in; GPUI scales the tree into device pixels itself.
-        self.element_with_handlers(window.viewport_size(), cx)
+        if self.pending_terminal_focus && self.cockpit.dock().showing_raw_terminal() {
+            self.terminal_focus_handle.focus(window);
+            self.pending_terminal_focus = false;
+        }
+        if self.pending_composer_focus && self.composer.is_some() {
+            self.composer_focus_handle.focus(window);
+            self.pending_composer_focus = false;
+        }
+        let composer_is_focused =
+            self.composer.is_some() && self.composer_focus_handle.is_focused(window);
+        if self.composer_accessibility_focused != composer_is_focused {
+            self.composer_accessibility_focused = composer_is_focused;
+            self.refresh_accessibility_tree();
+        }
+        // `bounds()` is GPUI's current drawable HWND size and its hit-testing
+        // authority. `window_bounds()` is the saved normal-placement rectangle,
+        // which can describe a different monitor-sized surface during reveal.
+        let viewport = window.bounds().size;
+        self.element_with_handlers(viewport, cx)
     }
 }
 
@@ -12241,45 +15664,24 @@ pub fn run_native_shell(workspace_root: impl AsRef<Path>) -> Result<(), NativeSh
     #[cfg(debug_assertions)]
     {
         let profile = isolated_dev_profile(workspace_root)?;
-        let mut bootstrap = ProcessNativeHostBootstrap;
-        run_native_shell_with_bootstrap(profile, &mut bootstrap)
+        run_native_shell_with_bootstrap(profile, ProcessNativeHostBootstrap)
     }
     #[cfg(not(debug_assertions))]
     {
         let _ = workspace_root;
         let profile = production_shell_profile()?;
-        let mut bootstrap = ProcessNativeHostBootstrap;
-        run_native_shell_with_bootstrap(profile, &mut bootstrap)
+        run_native_shell_with_bootstrap(profile, ProcessNativeHostBootstrap)
     }
 }
 
 pub(crate) fn run_native_shell_with_bootstrap(
     profile: IsolatedDevProfile,
-    bootstrap: &mut dyn NativeHostBootstrap,
+    bootstrap: impl NativeHostBootstrap + 'static,
 ) -> Result<(), NativeShellError> {
-    let deadline = Instant::now() + NATIVE_STARTUP_BUDGET;
-    let (host_runtime, host_state) = match bootstrap.start_until(&profile, deadline) {
-        Ok(runtime) => {
-            let endpoint = match &runtime {
-                NativeHostRuntimeAttachment::Client(runtime) => runtime.endpoint().to_string(),
-                NativeHostRuntimeAttachment::Injected(runtime) => runtime.endpoint().to_string(),
-            };
-            (Some(runtime), NativeHostState::Connected { endpoint })
-        }
-        Err(NativeShellError::HostConnect { message }) => (
-            None,
-            NativeHostState::Error {
-                message: bounded_host_error(message),
-            },
-        ),
-        Err(error) => (
-            None,
-            NativeHostState::Error {
-                message: bounded_host_error(error.to_string()),
-            },
-        ),
-    };
-    launch_native_shell(profile, host_runtime, host_state)
+    // Shell-first: open the stable Cockpit workspace immediately and connect on
+    // one owned background worker. controller_tick attaches exactly once.
+    let pending = spawn_pending_host_bootstrap(profile.clone(), bootstrap)?;
+    launch_native_shell(profile, None, NativeHostState::Connecting, Some(pending))
 }
 
 /// Launch the native shell with one caller-owned host runtime attachment.
@@ -12297,6 +15699,7 @@ pub(crate) fn run_native_shell_with_runtime(
         profile,
         host_runtime.map(NativeHostRuntimeAttachment::Client),
         host_state,
+        None,
     )
 }
 
@@ -12330,6 +15733,7 @@ fn launch_native_shell(
     profile: IsolatedDevProfile,
     host_runtime: Option<NativeHostRuntimeAttachment>,
     host_state: NativeHostState,
+    pending_bootstrap: Option<PendingHostBootstrap>,
 ) -> Result<(), NativeShellError> {
     eprintln!(
         "devmanager native shell profile: {}",
@@ -12349,6 +15753,7 @@ fn launch_native_shell(
             let profile_for_window = profile.clone();
             let host_runtime_for_window = host_runtime;
             let host_state_for_window = host_state;
+            let pending_bootstrap_for_window = pending_bootstrap;
             let window_bounds = restored_window_bounds(stored_layout, cx);
             let result = cx.open_window(
                 WindowOptions {
@@ -12357,11 +15762,9 @@ fn launch_native_shell(
                         title: Some(window_title.clone().into()),
                         ..gpui::TitlebarOptions::default()
                     }),
-                    // AccessKit's Windows subclass must be installed before the
-                    // HWND is made visible for the first time. GPUI normally
-                    // shows the window during construction, so create this
-                    // shell hidden and reveal it after install_window_observers
-                    // attaches the adapter below.
+                    // AccessKit's subclass must own the HWND before its first
+                    // show. The registered-window callback below reveals it
+                    // after open_window has installed the root view.
                     show: false,
                     ..WindowOptions::default()
                 },
@@ -12372,29 +15775,47 @@ fn launch_native_shell(
                         RuntimePreferencesSnapshot::default().density(),
                     );
                     let entity = cx.new(|cx| {
-                        NativeShell::new_with_attachment_and_state_and_preferences(
+                        NativeShell::new_with_attachment_state_pending_and_preferences(
                             profile_for_window,
                             host_runtime_for_window,
+                            pending_bootstrap_for_window,
                             host_state_for_window,
                             preferences,
                             cx,
-                            true,
+                            false,
                         )
                     });
                     let _ = entity.update(cx, |shell, cx| {
                         shell.install_window_observers(window, cx);
+                        // A controller spawned from inside the entity's own
+                        // constructor holds a weak handle before App has
+                        // registered that entity. Start it only after cx.new
+                        // returns so the first timer tick has a live owner.
+                        shell.start_controller(cx);
                     });
-                    window.activate_window();
                     entity
                 },
             );
-            if let Err(error) = result {
-                *error_slot_for_app.borrow_mut() = Some(NativeShellError::WindowOpen {
-                    message: error.to_string(),
-                });
-                cx.quit();
-            } else {
-                cx.activate(true);
+            match result {
+                Err(error) => {
+                    *error_slot_for_app.borrow_mut() = Some(NativeShellError::WindowOpen {
+                        message: error.to_string(),
+                    });
+                    cx.quit();
+                }
+                Ok(window_handle) => {
+                    // open_window draws the hidden root before registering the
+                    // Window. Refreshing or activating inside its builder is
+                    // therefore too early on Windows. Update the now-registered
+                    // window synchronously so revealing it supplies the native
+                    // wake that begins the frame and controller loops.
+                    let _ = window_handle.update(cx, |shell, window, _cx| {
+                        shell.platform_accessibility.reveal_window(window);
+                        window.refresh();
+                        window.activate_window();
+                    });
+                    cx.activate(true);
+                }
             }
         });
     let error = error_slot.borrow_mut().take().map_or(Ok(()), Err);
@@ -12404,6 +15825,252 @@ fn launch_native_shell(
 fn bounded_host_error(message: impl Into<String>) -> String {
     const MAX_HOST_ERROR_CHARS: usize = 256;
     message.into().chars().take(MAX_HOST_ERROR_CHARS).collect()
+}
+
+/// Translate GPUI keys into the bounded byte strings understood by stock
+/// provider TUIs. Composer submission owns its own Enter choreography; this
+/// path preserves exactly one interactive key/paste gesture without adding a
+/// newline or launching another provider process.
+fn native_terminal_key_text(keystroke: &gpui::Keystroke) -> Option<String> {
+    let key = keystroke.key.to_ascii_lowercase();
+    let modifiers = keystroke.modifiers;
+    let command = modifiers.control || modifiers.platform;
+
+    if command && !modifiers.alt {
+        if key == "space" {
+            return Some("\u{0}".into());
+        }
+        if key.len() == 1 {
+            let byte = key.as_bytes()[0];
+            if byte.is_ascii_alphabetic() {
+                return String::from_utf8(vec![byte.to_ascii_uppercase() & 0x1f]).ok();
+            }
+        }
+    }
+
+    let special = match key.as_str() {
+        "escape" => Some("\u{1b}"),
+        "enter" => Some("\r"),
+        "tab" => Some("\t"),
+        "backspace" => Some("\u{7f}"),
+        "up" => Some("\u{1b}[A"),
+        "down" => Some("\u{1b}[B"),
+        "right" => Some("\u{1b}[C"),
+        "left" => Some("\u{1b}[D"),
+        "home" => Some("\u{1b}[H"),
+        "end" => Some("\u{1b}[F"),
+        "pageup" => Some("\u{1b}[5~"),
+        "pagedown" => Some("\u{1b}[6~"),
+        "delete" => Some("\u{1b}[3~"),
+        "insert" => Some("\u{1b}[2~"),
+        "space" if !command => Some(" "),
+        _ => None,
+    };
+    if let Some(special) = special {
+        return Some(special.into());
+    }
+
+    if command {
+        return None;
+    }
+    let text = keystroke
+        .key_char
+        .clone()
+        .or_else(|| (key.chars().count() == 1).then_some(keystroke.key.clone()))?;
+    if modifiers.alt {
+        Some(format!("\u{1b}{text}"))
+    } else {
+        Some(text)
+    }
+}
+
+fn fetch_idle_conversation_photo() -> Option<Arc<RenderImage>> {
+    #[cfg(test)]
+    {
+        return None;
+    }
+    #[cfg(not(test))]
+    {
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos() as u64)
+            .unwrap_or(0);
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_global(Some(IDLE_PHOTO_FETCH_TIMEOUT))
+            .build()
+            .into();
+        let mut response = agent.get(idle_conversation_photo_url(seed)).call().ok()?;
+        let bytes = response
+            .body_mut()
+            .with_config()
+            .limit(IDLE_PHOTO_MAX_BYTES)
+            .read_to_vec()
+            .ok()?;
+        decode_idle_conversation_photo_bytes(&bytes)
+    }
+}
+
+const IDLE_UNSPLASH_PHOTOS: [&str; 5] = [
+    "https://images.unsplash.com/photo-1497366754035-f200968a6e72?auto=format&fit=crop&w=1920&h=1080&q=85",
+    "https://images.unsplash.com/photo-1497366811353-6870744d04b2?auto=format&fit=crop&w=1920&h=1080&q=85",
+    "https://images.unsplash.com/photo-1497215728101-856f4ea42174?auto=format&fit=crop&w=1920&h=1080&q=85",
+    "https://images.unsplash.com/photo-1524758631624-e2822e304c36?auto=format&fit=crop&w=1920&h=1080&q=85",
+    "https://images.unsplash.com/photo-1497366216548-37526070297c?auto=format&fit=crop&w=1920&h=1080&q=85",
+];
+
+fn idle_conversation_photo_url(seed: u64) -> &'static str {
+    IDLE_UNSPLASH_PHOTOS[(seed as usize) % IDLE_UNSPLASH_PHOTOS.len()]
+}
+
+fn prepare_native_composer_image(
+    workspace: &Path,
+    attachment: RemoteImageAttachment,
+) -> Result<PreparedNativeComposerImage, String> {
+    let preview = decode_bounded_render_image_bytes(&attachment.bytes)
+        .ok_or_else(|| "Failed to decode pasted image preview.".to_string())?;
+    let label = attachment
+        .file_name
+        .clone()
+        .unwrap_or_else(|| "image".to_string());
+    let staged = stage_image_for_workspace(workspace, &attachment)?;
+    Ok(PreparedNativeComposerImage {
+        staged,
+        label,
+        preview,
+    })
+}
+
+fn prepare_native_composer_images_from_paths(
+    workspace: &Path,
+    paths: Vec<PathBuf>,
+) -> Result<Vec<PreparedNativeComposerImage>, String> {
+    if paths.len() > NATIVE_COMPOSER_IMAGE_MAX_COUNT {
+        return Err(format!(
+            "Too many images. Max is {NATIVE_COMPOSER_IMAGE_MAX_COUNT}."
+        ));
+    }
+    let mut prepared = Vec::with_capacity(paths.len());
+    for path in paths {
+        let result = load_native_image_attachment(&path)
+            .and_then(|attachment| prepare_native_composer_image(workspace, attachment));
+        match result {
+            Ok(image) => prepared.push(image),
+            Err(error) => {
+                discard_prepared_native_composer_images(prepared);
+                return Err(error);
+            }
+        }
+    }
+    Ok(prepared)
+}
+
+fn discard_prepared_native_composer_images(images: Vec<PreparedNativeComposerImage>) {
+    for image in images {
+        let _ = remove_staged_image(&image.staged);
+    }
+}
+
+fn detach_native_composer_images_for_key(
+    images_by_draft: &mut BTreeMap<ComposerDraftKey, Vec<NativeComposerImage>>,
+    key: ComposerDraftKey,
+    sent_image_ids: &[u64],
+) {
+    let Some(images) = images_by_draft.get_mut(&key) else {
+        return;
+    };
+    images.retain(|image| !sent_image_ids.contains(&image.id));
+    if images.is_empty() {
+        images_by_draft.remove(&key);
+    }
+}
+
+fn load_native_image_attachment(path: &Path) -> Result<RemoteImageAttachment, String> {
+    let bytes = std::fs::read(path).map_err(|error| format!("Failed to read image: {error}"))?;
+    if bytes.len() > WEB_PASTE_IMAGE_MAX_BYTES {
+        return Err("Pasted image is too large. Max size is 5 MiB.".to_string());
+    }
+    let extension = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let mime_type = match extension.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        _ => return Err("Unsupported pasted image type. Try PNG or JPEG.".to_string()),
+    };
+    Ok(RemoteImageAttachment {
+        mime_type: mime_type.to_string(),
+        file_name: path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_string),
+        bytes,
+    })
+}
+
+#[cfg(test)]
+fn tiny_png_bytes_for_test() -> Vec<u8> {
+    vec![
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F,
+        0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00,
+        0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49,
+        0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+    ]
+}
+
+fn decode_idle_conversation_photo_bytes(bytes: &[u8]) -> Option<Arc<RenderImage>> {
+    decode_bounded_render_image_bytes(bytes)
+}
+
+fn decode_bounded_render_image_bytes(bytes: &[u8]) -> Option<Arc<RenderImage>> {
+    let reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?;
+    let (width, height) = reader.into_dimensions().ok()?;
+    if !idle_photo_dimensions_allowed(width, height) {
+        return None;
+    }
+    let format = image::guess_format(bytes).ok()?;
+    let mut rgba = image::load_from_memory_with_format(bytes, format)
+        .ok()?
+        .into_rgba8();
+    // GPUI's native image renderer expects BGRA pixel order.
+    for pixel in rgba.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+    }
+    Some(Arc::new(RenderImage::new(vec![image::Frame::new(rgba)])))
+}
+
+const IDLE_PHOTO_MAX_DIMENSION: u32 = 4096;
+const IDLE_PHOTO_MAX_PIXELS: u64 = 16_000_000;
+
+fn idle_photo_dimensions_allowed(width: u32, height: u32) -> bool {
+    if width == 0 || height == 0 {
+        return false;
+    }
+    if width > IDLE_PHOTO_MAX_DIMENSION || height > IDLE_PHOTO_MAX_DIMENSION {
+        return false;
+    }
+    (width as u64).saturating_mul(height as u64) <= IDLE_PHOTO_MAX_PIXELS
+}
+
+/// Pure one-shot admission for the idle photo fetch. Separated from spawn so
+/// unit tests never exercise the production network branch.
+fn admit_idle_conversation_photo_fetch(
+    has_selected_task: bool,
+    has_cached_image: bool,
+    fetch_attempted: bool,
+    fetch_in_flight: bool,
+) -> bool {
+    !has_selected_task && !has_cached_image && !fetch_attempted && !fetch_in_flight
+}
+
+fn test_idle_conversation_photo() -> Arc<RenderImage> {
+    let pixels = vec![0x40, 0x30, 0x20, 0xff].repeat(4);
+    let rgba = image::RgbaImage::from_raw(2, 2, pixels).expect("valid test image dimensions");
+    Arc::new(RenderImage::new(vec![image::Frame::new(rgba)]))
 }
 
 fn workspace_projection_label(workspace: &crate::domain::task::WorkspaceRef) -> String {
@@ -12446,6 +16113,50 @@ fn visible_status_label(status: VisibleTaskStatus) -> &'static str {
     }
 }
 
+fn validate_connected_host_for_shell_launch(
+    profile_matches: bool,
+    connected: bool,
+    _projection_bootstrapped: bool,
+) -> Result<(), NativeShellError> {
+    if !profile_matches {
+        return Err(NativeShellError::HostConnect {
+            message: "native host runtime profile binding does not match shell profile".to_string(),
+        });
+    }
+    if !connected {
+        return Err(NativeShellError::HostConnect {
+            message: "native host runtime is disconnected".to_string(),
+        });
+    }
+    // Projection bootstrap is owned by the single background worker after the
+    // shell window attaches. Connect/attach must not wait for snapshot/replay.
+    Ok(())
+}
+
+fn runtime_connection_visible(
+    client_connected: Option<bool>,
+    worker_running: bool,
+    cancellation: bool,
+) -> bool {
+    match client_connected {
+        Some(connected) => connected,
+        // The bootstrap worker takes exclusive client ownership before host
+        // awaits and restores it afterward. That loan is still a live
+        // connection; only a stopped/cancelled worker makes absence terminal.
+        None => worker_running && !cancellation,
+    }
+}
+
+fn worker_should_run_deferred_bootstrap(bootstrapped: bool) -> bool {
+    !bootstrapped
+}
+
+/// Fail closed until the host is connected and the canonical ClientModel bootstrap
+/// has succeeded. Preview attachment alone must not admit mutations.
+fn admits_host_actions(connected: bool, bootstrapped: bool) -> bool {
+    connected && bootstrapped
+}
+
 fn validated_runtime_attachment(
     profile: &IsolatedDevProfile,
     host_runtime: Option<NativeHostClientRuntime>,
@@ -12480,31 +16191,81 @@ fn enqueue_pending_preference(
 #[cfg(test)]
 mod tests {
     use super::{
-        acquire_reaper_permit, agent_connection_snapshot, authorize_full_host_quit,
+        acquire_reaper_permit, admit_idle_conversation_photo_fetch, admits_host_actions,
+        agent_connection_snapshot, authorize_full_host_quit, decode_idle_conversation_photo_bytes,
+        detach_native_composer_images_for_key, discard_prepared_native_composer_images,
         dispatch_pending_action, enqueue_pending_preference, ensure_isolated_host_config_base,
-        isolated_dev_profile, publish_projection, reap_retained_children, reap_retained_workers,
-        retain_child, retain_worker, retained_children, take_retained_action_outcomes,
-        update_state_from_stage, wait_for_cancellation, AccessibilityTree, AgentPresence, ClientId,
-        CommandId, IsolatedDevProfile, NativeActionRecord, NativeHeaderAttachment,
-        NativeHostActionFailure, NativeHostActionOutcome, NativeHostActionResult,
-        NativeHostChildOwnership, NativeHostLaunchMode, NativeHostLaunchSpec, NativeHostProjection,
-        NativeHostProjectionKind, NativeHostRuntimeEpochs, NativeHostRuntimePort,
-        NativeHostWorkerCommand, NativeInteraction, NativePlatformAccessibilityBridge, NativeShell,
-        NativeShellMode, NativeShutdownDeadline, OverlayTextFieldPart, OwnedChild, OwnedWorker,
-        PaletteItem, ProviderKind, ReaperKind, ShellStage, TaskId, UpdateState, UpdaterStage,
-        MAX_ACTION_LANE_RECORDS, MAX_ACTION_OUTCOME_PROJECTIONS, MAX_HOST_PROJECTIONS,
-        MAX_PENDING_HOST_ACTIONS, MAX_PENDING_PREFERENCES, MAX_RETAINED_CHILDREN,
-        MAX_RETAINED_WORKERS, MAX_RETRY_HOST_ACTIONS, PRODUCTION_HOST_PROFILE,
+        idle_conversation_photo_url, idle_photo_dimensions_allowed, isolated_dev_profile,
+        native_command_id, prepare_native_composer_image, publish_projection,
+        reap_retained_children, reap_retained_workers, remove_staged_image, retain_child,
+        retain_worker, retained_children, retry_until_startup_deadline, runtime_connection_visible,
+        should_schedule_host_bootstrap_retry, take_retained_action_outcomes,
+        update_state_from_stage, validate_connected_host_for_shell_launch,
+        validate_host_projection_payloads, wait_for_cancellation,
+        worker_should_run_deferred_bootstrap, AccessibilityTree, AccessibleRole, AgentPresence,
+        AgentSessionId, ClientId, CommandId, ComposerControl, ComposerDraftKey, IsolatedDevProfile,
+        MainConversationCanvas, NativeAccessibilityAction, NativeActionRecord, NativeComposerImage,
+        NativeHeaderAttachment, NativeHostActionFailure, NativeHostActionOutcome,
+        NativeHostActionResult, NativeHostChildOwnership, NativeHostClientRuntime,
+        NativeHostLaunchMode, NativeHostLaunchSpec, NativeHostProjection, NativeHostProjectionKind,
+        NativeHostQueryBody, NativeHostRuntimeAttachment, NativeHostRuntimeEpochs,
+        NativeHostRuntimePort, NativeHostState, NativeHostWorkerCommand, NativeInteraction,
+        NativePlatformAccessibilityBridge, NativeShell, NativeShellMode, NativeShutdownDeadline,
+        OverlayTextFieldPart, OwnedChild, OwnedWorker, PaletteItem, PendingHostBootstrap,
+        ProjectId, ProjectInboxItem, ProviderKind, ReaperKind, ShellStage, TaskComposer, TaskId,
+        UpdateState, UpdaterStage, CONVERSATION_CONTENT_MAX_WIDTH, HOST_BOOTSTRAP_REATTACH_TICKS,
+        MAX_ACCESSIBILITY_ACTIONS, MAX_ACTION_LANE_RECORDS, MAX_ACTION_OUTCOME_PROJECTIONS,
+        MAX_HOST_PROJECTIONS, MAX_PENDING_HOST_ACTIONS, MAX_PENDING_PREFERENCES,
+        MAX_RETAINED_CHILDREN, MAX_RETAINED_WORKERS, MAX_RETRY_HOST_ACTIONS,
+        NATIVE_SNAPSHOT_PAGE_ITEMS, PRODUCTION_HOST_PROFILE,
     };
+    use crate::protocol::FrameLimits;
+    use crate::remote::RemoteImageAttachment;
     use crate::ui::components::text_field::{TextField, TextFieldKey};
-    use gpui::{AppContext, KeyDownEvent, Keystroke};
-    use std::collections::VecDeque;
+    use crate::ui::workspace_layout::{PaneEdge, WorkspaceLayout};
+    use gpui::{AppContext, KeyDownEvent, Keystroke, WindowOptions};
+    use std::collections::{BTreeMap, VecDeque};
     use std::path::PathBuf;
     use std::process::Command;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc::SyncSender;
     use std::sync::{Arc, Mutex, OnceLock};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn native_terminal_keys_cover_provider_tui_navigation_and_text() {
+        let key = |source: &str| Keystroke::parse(source).expect("valid keystroke");
+        assert_eq!(
+            super::native_terminal_key_text(&key("escape")),
+            Some("\u{1b}".into())
+        );
+        assert_eq!(
+            super::native_terminal_key_text(&key("enter")),
+            Some("\r".into())
+        );
+        assert_eq!(
+            super::native_terminal_key_text(&key("down")),
+            Some("\u{1b}[B".into())
+        );
+        assert_eq!(
+            super::native_terminal_key_text(&key("backspace")),
+            Some("\u{7f}".into())
+        );
+        assert_eq!(
+            super::native_terminal_key_text(&key("ctrl-c")),
+            Some("\u{3}".into())
+        );
+        assert_eq!(super::native_terminal_key_text(&key("x")), Some("x".into()));
+    }
+
+    #[test]
+    fn idle_photo_rotation_uses_unsplash_without_a_blocking_api_call() {
+        let first = idle_conversation_photo_url(0);
+        let second = idle_conversation_photo_url(1);
+        assert!(first.starts_with("https://images.unsplash.com/"));
+        assert!(second.starts_with("https://images.unsplash.com/"));
+        assert_ne!(first, second);
+    }
 
     #[derive(Clone)]
     struct TestRuntime {
@@ -12522,6 +16283,95 @@ mod tests {
     }
 
     static HEADLESS_SHELL_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    const HEADLESS_SHELL_CHILD_ENV: &str = "DEVMANAGER_HEADLESS_SHELL_TEST_CHILD";
+
+    #[test]
+    fn worker_client_loan_remains_connected_until_cancelled_or_stopped() {
+        assert!(runtime_connection_visible(Some(true), false, false));
+        assert!(!runtime_connection_visible(Some(false), true, false));
+        assert!(runtime_connection_visible(None, true, false));
+        assert!(!runtime_connection_visible(None, false, false));
+        assert!(!runtime_connection_visible(None, true, true));
+    }
+
+    #[test]
+    fn failed_shell_first_bootstrap_retries_only_without_an_owned_runtime_or_worker() {
+        let due = HOST_BOOTSTRAP_REATTACH_TICKS;
+        assert!(should_schedule_host_bootstrap_retry(
+            true, false, false, true, due
+        ));
+        assert!(!should_schedule_host_bootstrap_retry(
+            false, false, false, true, due
+        ));
+        assert!(!should_schedule_host_bootstrap_retry(
+            true, true, false, true, due
+        ));
+        assert!(!should_schedule_host_bootstrap_retry(
+            true, false, true, true, due
+        ));
+        assert!(!should_schedule_host_bootstrap_retry(
+            true, false, false, false, due
+        ));
+        assert!(!should_schedule_host_bootstrap_retry(
+            true,
+            false,
+            false,
+            true,
+            due - 1
+        ));
+    }
+
+    #[test]
+    fn host_startup_retry_honors_the_deadline_instead_of_an_attempt_cap() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("startup retry runtime");
+        let result = runtime.block_on(retry_until_startup_deadline(
+            NativeShutdownDeadline::from_now(Duration::from_secs(1)),
+            Duration::ZERO,
+            {
+                let attempts = Arc::clone(&attempts);
+                move || {
+                    let attempts = Arc::clone(&attempts);
+                    async move {
+                        if attempts.fetch_add(1, Ordering::SeqCst) < 40 {
+                            Err(crate::host::IpcError::Unavailable)
+                        } else {
+                            Ok(())
+                        }
+                    }
+                }
+            },
+        ));
+
+        assert!(result.is_ok(), "got {result:?}");
+        assert_eq!(attempts.load(Ordering::SeqCst), 41);
+    }
+
+    /// GPUI's Windows headless message loop owns process-global native state
+    /// that cannot be safely initialized again after `Application::run`
+    /// returns. Run each independently named scenario in a fresh copy of this
+    /// test harness so the ordinary full-suite process never constructs two
+    /// headless applications.
+    fn rerun_headless_shell_test_in_child(test_name: &'static str) -> bool {
+        if std::env::var(HEADLESS_SHELL_CHILD_ENV).as_deref() == Ok(test_name) {
+            return false;
+        }
+        let status = std::process::Command::new(
+            std::env::current_exe().expect("current native-shell test harness"),
+        )
+        .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
+        .env(HEADLESS_SHELL_CHILD_ENV, test_name)
+        .status()
+        .expect("start isolated native-shell headless test");
+        assert!(
+            status.success(),
+            "isolated native-shell headless test failed: {test_name} ({status})"
+        );
+        true
+    }
 
     impl TestRuntime {
         fn new(
@@ -12687,6 +16537,15 @@ mod tests {
     ) -> R {
         let workspace = tempfile::tempdir().expect("workspace tempdir");
         let profile = isolated_dev_profile(workspace.path()).expect("isolated profile");
+        with_test_shell_profile_in_app_cx(cx, profile, runtime, action)
+    }
+
+    fn with_test_shell_profile_in_app_cx<R>(
+        cx: &mut gpui::App,
+        profile: IsolatedDevProfile,
+        runtime: TestRuntime,
+        action: impl FnOnce(&mut NativeShell, &mut gpui::Context<NativeShell>) -> R,
+    ) -> R {
         let entity = cx.new(|cx| {
             NativeShell::new_with_host_runtime_port(
                 profile,
@@ -12697,6 +16556,11 @@ mod tests {
         });
         let value = entity.update(cx, |shell, cx| action(shell, cx));
         drop(entity);
+        // GPUI releases the entity payload at the next effect cycle. Trigger a
+        // minimal cycle so each scenario observes its own NativeShell::drop
+        // effects instead of leaking them into the following scenario.
+        let flush = cx.new(|_| ());
+        drop(flush);
         value
     }
 
@@ -12736,7 +16600,12 @@ mod tests {
     }
 
     #[test]
-    fn disconnected_empty_shell_shows_connect_canvas_without_project_controls() {
+    fn disconnected_empty_shell_keeps_cockpit_visible_without_project_controls() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::disconnected_empty_shell_keeps_cockpit_visible_without_project_controls",
+        ) {
+            return;
+        }
         let _test_guard = HEADLESS_SHELL_TEST_LOCK
             .get_or_init(|| Mutex::new(()))
             .lock()
@@ -12774,8 +16643,8 @@ mod tests {
         );
         assert_eq!(title.as_deref(), Some("Connect an agent"));
         assert!(
-            !ids.iter().any(|id| id == "native-task-inbox"),
-            "setup canvas must not advertise the task inbox"
+            ids.iter().any(|id| id == "native-task-inbox"),
+            "the stable shell must keep the task inbox visible while agents reconnect"
         );
         assert!(
             !ids.iter().any(|id| id == "native-setup-add-project"),
@@ -12786,13 +16655,18 @@ mod tests {
             "connect canvas must hide the project heading plus"
         );
         assert!(
-            ids.iter().any(|id| id == "native-connect-refresh"),
-            "connect canvas must expose Refresh so sign-in can be re-checked"
+            ids.iter().any(|id| id == "native-header-settings"),
+            "the stable cockpit must keep Settings available while agents reconnect"
         );
     }
 
     #[test]
     fn connected_empty_shell_shows_add_project_canvas_and_heading_plus() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::connected_empty_shell_shows_add_project_canvas_and_heading_plus",
+        ) {
+            return;
+        }
         let _test_guard = HEADLESS_SHELL_TEST_LOCK
             .get_or_init(|| Mutex::new(()))
             .lock()
@@ -12890,6 +16764,11 @@ mod tests {
 
     #[test]
     fn applying_a_picked_folder_opens_the_name_overlay() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::applying_a_picked_folder_opens_the_name_overlay",
+        ) {
+            return;
+        }
         let _test_guard = HEADLESS_SHELL_TEST_LOCK
             .get_or_init(|| Mutex::new(()))
             .lock()
@@ -12917,6 +16796,11 @@ mod tests {
 
     #[test]
     fn choose_folder_returns_before_a_path_is_applied() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::choose_folder_returns_before_a_path_is_applied",
+        ) {
+            return;
+        }
         let _test_guard = HEADLESS_SHELL_TEST_LOCK
             .get_or_init(|| Mutex::new(()))
             .lock()
@@ -12942,6 +16826,11 @@ mod tests {
 
     #[test]
     fn typing_replaces_the_prefilled_folder_name() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::typing_replaces_the_prefilled_folder_name",
+        ) {
+            return;
+        }
         let _test_guard = HEADLESS_SHELL_TEST_LOCK
             .get_or_init(|| Mutex::new(()))
             .lock()
@@ -12972,6 +16861,11 @@ mod tests {
 
     #[test]
     fn first_task_does_not_repeat_the_folder_name() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::first_task_does_not_repeat_the_folder_name",
+        ) {
+            return;
+        }
         let _test_guard = HEADLESS_SHELL_TEST_LOCK
             .get_or_init(|| Mutex::new(()))
             .lock()
@@ -13023,6 +16917,11 @@ mod tests {
 
     #[test]
     fn first_task_does_not_open_a_name_overlay() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::first_task_does_not_open_a_name_overlay",
+        ) {
+            return;
+        }
         let _test_guard = HEADLESS_SHELL_TEST_LOCK
             .get_or_init(|| Mutex::new(()))
             .lock()
@@ -13051,6 +16950,11 @@ mod tests {
 
     #[test]
     fn plus_claude_creates_a_task_with_placeholder_title() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::plus_claude_creates_a_task_with_placeholder_title",
+        ) {
+            return;
+        }
         let _test_guard = HEADLESS_SHELL_TEST_LOCK
             .get_or_init(|| Mutex::new(()))
             .lock()
@@ -13093,6 +16997,11 @@ mod tests {
 
     #[test]
     fn header_settings_opens_on_welcome_and_cockpit() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::header_settings_opens_on_welcome_and_cockpit",
+        ) {
+            return;
+        }
         let _test_guard = HEADLESS_SHELL_TEST_LOCK
             .get_or_init(|| Mutex::new(()))
             .lock()
@@ -13137,6 +17046,86 @@ mod tests {
             "settings must open from empty-inbox header"
         );
         assert_eq!(stage, ShellStage::Cockpit);
+    }
+
+    #[test]
+    fn settings_refresh_keeps_cockpit_while_agents_are_rechecked() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::settings_refresh_keeps_cockpit_while_agents_are_rechecked",
+        ) {
+            return;
+        }
+        let _test_guard = HEADLESS_SHELL_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("headless shell test lock");
+        let completed = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let completed_for_app = std::rc::Rc::clone(&completed);
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            let (runtime, _) = TestRuntime::new(true, NativeHostActionResult::Queued);
+            let snapshot = with_test_shell_in_app(cx, runtime, |shell| {
+                shell.agent_connection = Some(agent_connection_snapshot(AgentPresence::SignedIn));
+                shell.install_named_folder_for_test("command");
+                shell.settings_open = true;
+                let _ = shell.dispatch_agent_connection_query(false);
+                (
+                    shell.shell_stage(),
+                    shell.settings_open_for_test(),
+                    shell
+                        .agent_connection
+                        .as_ref()
+                        .and_then(|snapshot| snapshot.agents.first())
+                        .map(|row| row.presence),
+                )
+            });
+            *completed_for_app.borrow_mut() = Some(snapshot);
+            cx.quit();
+        });
+        let (stage, settings_open, presence) = completed
+            .borrow()
+            .clone()
+            .expect("settings refresh snapshot");
+        assert_eq!(stage, ShellStage::Cockpit);
+        assert!(settings_open, "Settings must stay open during Refresh");
+        assert_eq!(presence, Some(AgentPresence::Checking));
+    }
+
+    #[test]
+    fn settings_refresh_queue_full_does_not_paint_cant_connect() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::settings_refresh_queue_full_does_not_paint_cant_connect",
+        ) {
+            return;
+        }
+        let _test_guard = HEADLESS_SHELL_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("headless shell test lock");
+        let completed = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let completed_for_app = std::rc::Rc::clone(&completed);
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            let (runtime, _) = TestRuntime::new(true, NativeHostActionResult::QueueFull);
+            let snapshot = with_test_shell_in_app(cx, runtime, |shell| {
+                shell.agent_connection = Some(agent_connection_snapshot(AgentPresence::SignedIn));
+                shell.install_named_folder_for_test("command");
+                shell.settings_open = true;
+                let _ = shell.dispatch_agent_connection_query(false);
+                (shell.shell_stage(), shell.host_status_text())
+            });
+            *completed_for_app.borrow_mut() = Some(snapshot);
+            cx.quit();
+        });
+        let (stage, status) = completed
+            .borrow()
+            .clone()
+            .expect("settings refresh queue snapshot");
+        assert_eq!(stage, ShellStage::Cockpit);
+        assert!(
+            !status.contains("Can't connect"),
+            "a full action lane is not a host disconnect: {status}"
+        );
     }
 
     #[test]
@@ -13218,7 +17207,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_inbox_accessibility_lists_signed_in_agent_actions() {
+    fn empty_inbox_accessibility_requires_a_project_before_agent_actions() {
         use crate::ui::task_cockpit::TaskList;
 
         let snapshot = agent_connection_snapshot(AgentPresence::SignedIn);
@@ -13235,14 +17224,18 @@ mod tests {
             .filter(|id| !id.is_empty())
             .collect();
         assert!(
-            element_ids
+            !element_ids
                 .iter()
                 .any(|id| id == "native-inbox-plus-claude"),
-            "expected +Claude inbox action: {element_ids:?}"
+            "project-scoped +Claude must not appear without a project: {element_ids:?}"
         );
         assert!(
-            element_ids.iter().any(|id| id == "native-inbox-plus-codex"),
-            "expected +Codex inbox action: {element_ids:?}"
+            !element_ids.iter().any(|id| id == "native-inbox-plus-codex"),
+            "project-scoped +Codex must not appear without a project: {element_ids:?}"
+        );
+        assert!(
+            element_ids.iter().any(|id| id == "native-projects-add"),
+            "an empty signed-in inbox must offer Add project: {element_ids:?}"
         );
         let status = tree
             .nodes()
@@ -13250,7 +17243,69 @@ mod tests {
             .find(|node| node.element_id() == "native-task-inbox-status")
             .expect("inbox status node");
         assert_eq!(status.name(), "No tasks yet");
-        assert_eq!(status.description(), "Use +Claude or +Codex to start.");
+        assert_eq!(
+            status.description(),
+            "Add or choose a project, then start with +Claude or +Codex."
+        );
+    }
+
+    #[test]
+    fn project_inbox_accessibility_exposes_group_actions_and_keeps_task_mapping_exact() {
+        use crate::ui::task_cockpit::TaskList;
+
+        let project_id = ProjectId::new();
+        let task_id = TaskId::new();
+        let task_list = TaskList::from_virtual_task_ids(vec![task_id]).expect("single-task list");
+        let items = vec![
+            ProjectInboxItem::Project {
+                project_id,
+                label: "DevManager".to_string(),
+                expanded: true,
+                task_count: 1,
+            },
+            ProjectInboxItem::Task {
+                project_id,
+                task_id,
+            },
+        ];
+        let snapshot = agent_connection_snapshot(AgentPresence::SignedIn);
+        let tree = AccessibilityTree::for_task_list_with_projects(
+            &task_list,
+            Some(task_id),
+            &NativeHeaderAttachment::default(),
+            Some(&snapshot),
+            &items,
+        );
+        let nodes = tree.gpui_nodes();
+        assert!(nodes.iter().any(|node| {
+            node.element_id == format!("native-project-row-{project_id}")
+                && node.label == "Project DevManager, 1 task, expanded"
+                && node.focusable
+                && node.tab_stop
+        }));
+        assert!(nodes.iter().any(|node| {
+            node.element_id == format!("native-project-claude-{project_id}")
+                && node.label == "Start Claude task in DevManager"
+        }));
+        assert!(nodes.iter().any(|node| {
+            node.element_id == format!("native-project-codex-{project_id}")
+                && node.label == "Start Codex task in DevManager"
+        }));
+
+        let (node_id, mapped_task_id) = tree.task_node_ids_for_test()[0];
+        assert_eq!(mapped_task_id, task_id);
+        let update = tree.platform_update_for_test();
+        let task_node = update
+            .nodes
+            .iter()
+            .find(|(candidate, _)| *candidate == node_id)
+            .map(|(_, node)| node)
+            .expect("mapped task node");
+        assert_eq!(
+            task_node.author_id(),
+            Some(format!("native-task-row-{task_id}").as_str()),
+            "project controls inserted ahead of tasks must not corrupt platform task routing"
+        );
     }
 
     #[test]
@@ -13286,6 +17341,308 @@ mod tests {
                 "pre-order id must match the rendered row"
             );
         }
+    }
+
+    #[test]
+    fn selected_task_accessibility_exposes_the_conversation_composer() {
+        use crate::ui::task_cockpit::TaskList;
+
+        let task_id = TaskId::new();
+        let task_list = TaskList::from_virtual_task_ids(vec![task_id]).expect("single-task list");
+        let tree = AccessibilityTree::for_task_list_with_header(
+            &task_list,
+            Some(task_id),
+            &NativeHeaderAttachment::default(),
+            None,
+        );
+        let nodes = tree.gpui_nodes();
+        let prompt = nodes
+            .iter()
+            .find(|node| node.element_id == "native-task-composer-input")
+            .expect("prompt field");
+        assert_eq!(prompt.role, AccessibleRole::TextField);
+        assert!(prompt.focusable && prompt.tab_stop);
+        let platform_update = tree.platform_update_for_test();
+        let platform_prompt = platform_update
+            .nodes
+            .iter()
+            .find_map(|(_, node)| {
+                (node.author_id() == Some("native-task-composer-input")).then_some(node)
+            })
+            .expect("platform prompt field");
+        assert!(platform_prompt.supports_action(accesskit::Action::Focus));
+        assert!(platform_prompt.supports_action(accesskit::Action::SetValue));
+        assert_eq!(platform_prompt.value(), Some(""));
+        let attach = nodes
+            .iter()
+            .find(|node| node.element_id == "native-task-composer-attach")
+            .expect("attach button");
+        assert_eq!(attach.role, AccessibleRole::Button);
+        let send = nodes
+            .iter()
+            .find(|node| node.element_id == "native-task-composer-send")
+            .expect("send button");
+        assert_eq!(send.role, AccessibleRole::Button);
+        assert!(send.focusable && send.tab_stop);
+    }
+
+    #[test]
+    fn native_conversation_composer_shares_readable_measure_and_tools_affordance() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::native_conversation_composer_shares_readable_measure_and_tools_affordance",
+        ) {
+            return;
+        }
+        assert_eq!(CONVERSATION_CONTENT_MAX_WIDTH, 860.0);
+        assert!(
+            WorkspaceLayout::default().dock_collapsed,
+            "conversation-first layouts start with the dock collapsed"
+        );
+        let (runtime, _) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        let _guard = HEADLESS_SHELL_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("headless shell test lock");
+        gpui::Application::headless().run(|cx| {
+            crate::ui::init(cx);
+            with_test_shell_in_app_cx(cx, runtime, |shell, _cx| {
+                assert!(shell.layout.dock_collapsed);
+                assert!(
+                    shell.conversation_tools_affordance_visible_for_test(),
+                    "collapsed dock must keep a Tools affordance"
+                );
+                shell.toggle_pane(PaneEdge::Dock);
+                assert!(!shell.layout.dock_collapsed);
+                assert!(!shell.conversation_tools_affordance_visible_for_test());
+            });
+            cx.quit();
+        });
+    }
+
+    #[test]
+    fn native_conversation_shift_enter_keeps_newline_and_enter_sends() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::native_conversation_shift_enter_keeps_newline_and_enter_sends",
+        ) {
+            return;
+        }
+        let _guard = HEADLESS_SHELL_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("headless shell test lock");
+        gpui::Application::headless().run(|cx| {
+            crate::ui::init(cx);
+            let (runtime, _) = TestRuntime::new(true, NativeHostActionResult::Queued);
+            let (model, task_id) = terminal_bound_client_model();
+            with_test_shell_in_app_cx(cx, runtime, |shell, _cx| {
+                shell
+                    .apply_client_model(Arc::new(model))
+                    .expect("apply model");
+                let list = crate::ui::task_cockpit::TaskList::from_client_model_virtual(
+                    shell.client_model_snapshot().as_ref().unwrap(),
+                )
+                .expect("task list");
+                let _ = shell.interaction.navigation_mouse_down(task_id, &list);
+                shell.sync_cockpit_follow();
+                shell
+                    .replace_composer_platform_text(None, "line one")
+                    .expect("seed draft");
+                shell.composer_key_for_test("enter", true, false);
+                assert_eq!(
+                    shell.composer.as_ref().expect("composer").draft_text(),
+                    "line one\n"
+                );
+                let utf16_len = "line one\n".encode_utf16().count();
+                shell
+                    .replace_composer_platform_text(Some(0..utf16_len), "ready to send")
+                    .expect("replace draft");
+                assert_eq!(
+                    shell.composer.as_ref().expect("composer").draft_text(),
+                    "ready to send"
+                );
+                shell.composer_key_for_test("enter", false, false);
+                let pending = shell
+                    .composer
+                    .as_ref()
+                    .and_then(TaskComposer::pending_intent)
+                    .is_some();
+                let queued = !shell.pending_composer_submissions.is_empty();
+                let errored = shell.composer_error.is_some();
+                assert!(
+                    pending || queued || errored,
+                    "Enter without Shift must invoke the send path (pending={pending} queued={queued} error={:?})",
+                    shell.composer_error
+                );
+                assert_eq!(
+                    shell.composer.as_ref().expect("composer").draft_text(),
+                    "ready to send",
+                    "Enter must not insert a newline"
+                );
+            });
+            cx.quit();
+        });
+    }
+
+    #[test]
+    fn native_composer_image_missing_binding_preserves_draft() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::native_composer_image_missing_binding_preserves_draft",
+        ) {
+            return;
+        }
+        let _guard = HEADLESS_SHELL_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("headless shell test lock");
+        gpui::Application::headless().run(|cx| {
+            crate::ui::init(cx);
+            let (runtime, _) = TestRuntime::new(true, NativeHostActionResult::Queued);
+            let (model, task_id) = terminal_bound_client_model();
+            with_test_shell_in_app_cx(cx, runtime, |shell, _cx| {
+                shell
+                    .apply_client_model(Arc::new(model))
+                    .expect("apply model");
+                let list = crate::ui::task_cockpit::TaskList::from_client_model_virtual(
+                    shell.client_model_snapshot().as_ref().unwrap(),
+                )
+                .expect("task list");
+                let _ = shell.interaction.navigation_mouse_down(task_id, &list);
+                shell.sync_cockpit_follow();
+                shell
+                    .replace_composer_platform_text(None, "keep me")
+                    .expect("seed draft");
+                let error = shell
+                    .admit_native_composer_image(RemoteImageAttachment {
+                        mime_type: "image/png".to_string(),
+                        file_name: Some("clip.png".to_string()),
+                        bytes: super::tiny_png_bytes_for_test(),
+                    })
+                    .expect_err("Main workspace has no host binding");
+                assert!(
+                    error.to_ascii_lowercase().contains("binding")
+                        || error.to_ascii_lowercase().contains("workspace"),
+                    "unexpected error: {error}"
+                );
+                assert_eq!(
+                    shell.composer.as_ref().expect("composer").draft_text(),
+                    "keep me"
+                );
+                assert!(shell.current_composer_images().is_empty());
+            });
+            cx.quit();
+        });
+    }
+
+    #[test]
+    fn native_composer_image_prepares_a_real_preview_and_staged_reference() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let prepared = prepare_native_composer_image(
+            workspace.path(),
+            RemoteImageAttachment {
+                mime_type: "image/png".to_string(),
+                file_name: Some("screen.png".to_string()),
+                bytes: super::tiny_png_bytes_for_test(),
+            },
+        )
+        .expect("prepare image off the UI path");
+
+        assert_eq!(prepared.label, "screen.png");
+        assert!(prepared.staged.path.is_file());
+        assert!(prepared.staged.prompt_reference.starts_with('@'));
+        assert_eq!(Arc::strong_count(&prepared.preview), 1);
+        discard_prepared_native_composer_images(vec![prepared]);
+    }
+
+    #[test]
+    fn sent_composer_image_detaches_without_deleting_provider_file() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let prepared = prepare_native_composer_image(
+            workspace.path(),
+            RemoteImageAttachment {
+                mime_type: "image/png".to_string(),
+                file_name: Some("provider.png".to_string()),
+                bytes: super::tiny_png_bytes_for_test(),
+            },
+        )
+        .expect("prepare image");
+        let staged = prepared.staged.clone();
+        let image = NativeComposerImage {
+            id: 1,
+            path: prepared.staged.path,
+            prompt_reference: prepared.staged.prompt_reference,
+            label: prepared.label,
+            preview: prepared.preview,
+        };
+        let later = prepare_native_composer_image(
+            workspace.path(),
+            RemoteImageAttachment {
+                mime_type: "image/png".to_string(),
+                file_name: Some("later.png".to_string()),
+                bytes: super::tiny_png_bytes_for_test(),
+            },
+        )
+        .expect("prepare later image");
+        let later_staged = later.staged.clone();
+        let later_image = NativeComposerImage {
+            id: 2,
+            path: later.staged.path,
+            prompt_reference: later.staged.prompt_reference,
+            label: later.label,
+            preview: later.preview,
+        };
+        let key = ComposerDraftKey::new(TaskId::new(), AgentSessionId::new());
+        let mut images_by_draft = BTreeMap::from([(key, vec![image, later_image])]);
+
+        detach_native_composer_images_for_key(&mut images_by_draft, key, &[1]);
+
+        assert_eq!(images_by_draft.get(&key).map(Vec::len), Some(1));
+        assert_eq!(images_by_draft[&key][0].id, 2);
+        assert!(
+            staged.path.is_file(),
+            "accepted sends must leave the referenced file available to the provider"
+        );
+        assert!(later_staged.path.is_file());
+        remove_staged_image(&staged).expect("test cleanup");
+        remove_staged_image(&later_staged).expect("test cleanup later image");
+    }
+
+    fn live_shell_builds_the_interactive_conversation_surface() {
+        let _guard = HEADLESS_SHELL_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("headless shell test lock");
+        gpui::Application::headless().run(|cx| {
+            crate::ui::init(cx);
+            let (runtime, _) = TestRuntime::new(true, NativeHostActionResult::Queued);
+            with_test_shell_in_app_cx(cx, runtime, |shell, cx| {
+                assert_eq!(shell.interactive_conversation_builds, 0);
+                shell.install_idle_conversation_photo_for_test();
+                let _idle_root =
+                    shell.element_with_handlers(gpui::size(gpui::px(1_280.0), gpui::px(800.0)), cx);
+                assert_eq!(
+                    shell.interactive_conversation_builds, 0,
+                    "the unselected center column must render the idle photo instead of a composer"
+                );
+
+                let task_id = TaskId::new();
+                shell.apply_task_list(
+                    crate::ui::task_cockpit::TaskList::from_virtual_task_ids(vec![task_id])
+                        .expect("single projected task"),
+                );
+                assert!(shell.select_projected_task(task_id).consumed);
+                let _task_root =
+                    shell.element_with_handlers(gpui::size(gpui::px(1_280.0), gpui::px(800.0)), cx);
+                assert_eq!(
+                    shell.interactive_conversation_builds, 1,
+                    "a selected task must use the surface that owns prompt focus, typing, and Send"
+                );
+                assert_eq!(
+                    shell.interactive_conversation_focus_wires, 1,
+                    "the live composer must own the focus target that receives its key handler"
+                );
+            });
+            cx.quit();
+        });
     }
 
     #[test]
@@ -13486,13 +17843,61 @@ mod tests {
         );
     }
 
+    #[test]
+    fn disconnected_subscription_pump_resynchronizes_before_receive() {
+        assert!(super::subscription_pump_requires_resync(false));
+        assert!(!super::subscription_pump_requires_resync(true));
+    }
+
+    #[test]
+    fn initial_projection_failure_reconnects_before_the_shell_stays_degraded() {
+        let source = include_str!("native_shell.rs");
+        let start = source
+            .find("fn recover_deferred_bootstrap_projection(")
+            .expect("initial bootstrap recovery function");
+        let end = source[start..]
+            .find("\nfn publish_cancelled_action_outcome(")
+            .map(|offset| start + offset)
+            .expect("initial bootstrap recovery function end");
+        let body = &source[start..end];
+
+        assert!(
+            body.contains("resynchronize_subscription("),
+            "a failed initial snapshot must reconnect instead of retrying a retired client forever"
+        );
+        assert!(
+            body.contains("bootstrapped.store(true, Ordering::Release)"),
+            "successful recovery must publish canonical mutation authority"
+        );
+        assert!(
+            body.contains("bump_connection_epoch(epochs)"),
+            "reconnection must invalidate transport and navigation generations"
+        );
+    }
+
+    #[test]
+    fn subscription_resync_does_not_cancel_an_admitted_wire_exchange() {
+        let source = include_str!("native_shell.rs");
+        let start = source
+            .find("fn resynchronize_subscription(")
+            .expect("resync function");
+        let end = source[start..]
+            .find("\nfn publish_projection(")
+            .map(|offset| start + offset)
+            .expect("resync function end");
+        let body = &source[start..end];
+
+        assert!(
+            !body.contains("tokio::time::timeout") && !body.contains("tokio::select!"),
+            "an admitted reconnect or snapshot exchange must settle before cancellation is observed"
+        );
+    }
+
     fn ui_queue_full_pointer_admission_returns_and_retains_exact_record(cx: &mut gpui::App) {
         let (runtime, _shared) = TestRuntime::new(true, NativeHostActionResult::QueueFull);
         let (returned, retained, failure) = with_test_shell_in_app(cx, runtime, |shell| {
-            let returned = shell.dispatch_pointer_action_for_test(
-                crate::ui::components::ActionRequest::HostStatus,
-                17,
-            );
+            let returned =
+                shell.dispatch_pointer_action_for_test(test_task_create_v2("pointer mutation"), 17);
             (
                 returned,
                 shell.pending_action_for_test().cloned(),
@@ -13585,6 +17990,7 @@ mod tests {
                     .push_back(NativeHostProjection {
                         kind: NativeHostProjectionKind::Error,
                         client_model: None,
+                        task_preview: None,
                         error: Some("transport outcome uncertain".to_string()),
                         epochs: Some(epochs),
                         action_outcome: Some(NativeHostActionOutcome::Uncertain {
@@ -13639,6 +18045,7 @@ mod tests {
                     .push_back(NativeHostProjection {
                         kind: NativeHostProjectionKind::Error,
                         client_model: None,
+                        task_preview: None,
                         error: Some("host rejected command".to_string()),
                         epochs: Some(epochs),
                         action_outcome: Some(NativeHostActionOutcome::Failed {
@@ -13679,7 +18086,7 @@ mod tests {
 
     fn newer_projection_epoch_is_adopted_after_the_drain_snapshot(cx: &mut gpui::App) {
         let (runtime, shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
-        let adopted = with_test_shell_in_app(cx, runtime, |shell| {
+        let (adopted, repaint) = with_test_shell_in_app(cx, runtime, |shell| {
             shared
                 .lock()
                 .expect("test runtime state")
@@ -13693,9 +18100,10 @@ mod tests {
                         },
                     ),
                 );
-            shell.controller_tick_for_test(MAX_PENDING_HOST_ACTIONS);
-            shell.interaction.host_runtime_epochs()
+            let repaint = shell.controller_tick_for_test(MAX_PENDING_HOST_ACTIONS);
+            (shell.interaction.host_runtime_epochs(), repaint)
         });
+        assert!(repaint, "an asynchronously drained projection must repaint");
         assert_eq!(
             adopted,
             NativeHostRuntimeEpochs {
@@ -13740,8 +18148,7 @@ mod tests {
     fn stale_action_outcomes_are_epoch_fenced(cx: &mut gpui::App) {
         let (runtime, shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
         let (receipt, failure, retained) = with_test_shell_in_app(cx, runtime, |shell| {
-            let _ =
-                shell.dispatch_action_for_test(crate::ui::components::ActionRequest::HostStatus);
+            let _ = shell.dispatch_action_for_test(test_task_create_v2("stale mutation"));
             let action = shared
                 .lock()
                 .expect("test runtime state")
@@ -13762,6 +18169,7 @@ mod tests {
                 .push_back(NativeHostProjection {
                     kind: NativeHostProjectionKind::Live,
                     client_model: None,
+                    task_preview: None,
                     error: None,
                     epochs: Some(old_epochs),
                     action_outcome: Some(NativeHostActionOutcome::Accepted {
@@ -13794,29 +18202,354 @@ mod tests {
         let _ = take_retained_action_outcomes(MAX_ACTION_LANE_RECORDS);
     }
 
+    fn stale_query_outcomes_are_discarded_without_transport_failure(cx: &mut gpui::App) {
+        let (runtime, shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        let (receipt, failure, retained, connected) =
+            with_test_shell_in_app(cx, runtime, |shell| {
+                let _ = shell
+                    .dispatch_action_for_test(crate::ui::components::ActionRequest::HostStatus);
+                shell.host_state = NativeHostState::Error {
+                    message: "previous query transport error".to_string(),
+                };
+                let action = shared
+                    .lock()
+                    .expect("test runtime state")
+                    .accepted
+                    .first()
+                    .cloned()
+                    .expect("accepted query");
+                shell.set_transport_failure(&action, NativeHostActionResult::QueueFull);
+                let old_epochs = shared.lock().expect("test runtime state").epochs;
+                shared.lock().expect("test runtime state").epochs = NativeHostRuntimeEpochs {
+                    connection_epoch: 2,
+                    resource_generation: 2,
+                    runtime_generation: 2,
+                };
+                shared
+                    .lock()
+                    .expect("test runtime state")
+                    .projections
+                    .push_back(NativeHostProjection {
+                        kind: NativeHostProjectionKind::Live,
+                        client_model: None,
+                        task_preview: None,
+                        error: None,
+                        epochs: Some(old_epochs),
+                        action_outcome: Some(NativeHostActionOutcome::Queried {
+                            action,
+                            detail: "stale status".to_string(),
+                            body: NativeHostQueryBody::Text,
+                        }),
+                    });
+                shell.controller_tick_for_test(MAX_PENDING_HOST_ACTIONS);
+                (
+                    shell.last_action_receipt().cloned(),
+                    shell.last_action_failure().cloned(),
+                    shell.pending_action_for_test().cloned(),
+                    matches!(shell.host_state, NativeHostState::Connected { .. }),
+                )
+            });
+        assert_eq!(receipt, None, "a stale query must not publish a receipt");
+        assert_eq!(failure, None, "a stale query is not a transport failure");
+        assert_eq!(retained, None, "a stale query is safe to discard");
+        assert!(
+            connected,
+            "discarding a stale query must preserve connectivity"
+        );
+    }
+
+    fn global_query_outcome_survives_navigation_and_projection_advance(cx: &mut gpui::App) {
+        let (runtime, shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        with_test_shell_in_app(cx, runtime, |shell| {
+            let project_id = ProjectId::new();
+            let _ =
+                shell.dispatch_action_for_test(crate::ui::components::ActionRequest::HostStatus);
+            let action = shared
+                .lock()
+                .expect("test runtime state")
+                .accepted
+                .first()
+                .cloned()
+                .expect("accepted global query");
+
+            shell.interaction.set_client_model(None);
+            assert!(shell.interaction.sync_selected_task(Some(TaskId::new())));
+            let epochs = shared.lock().expect("test runtime state").epochs;
+            shared
+                .lock()
+                .expect("test runtime state")
+                .projections
+                .push_back(NativeHostProjection {
+                    kind: NativeHostProjectionKind::Live,
+                    client_model: None,
+                    task_preview: None,
+                    error: None,
+                    epochs: Some(epochs),
+                    action_outcome: Some(NativeHostActionOutcome::Queried {
+                        action,
+                        detail: "current host status".to_string(),
+                        body: NativeHostQueryBody::ConfigSidebar(
+                            crate::domain::cockpit::ConfigSidebarSnapshot {
+                                revision: 1,
+                                projects: vec![crate::domain::cockpit::ConfigSidebarProject {
+                                    config_id: "project-1".into(),
+                                    label: "DevManager".into(),
+                                    root_configured: true,
+                                    workspace_id: project_id.to_string(),
+                                    folders: Vec::new(),
+                                }],
+                                servers: Vec::new(),
+                                ssh_connections: Vec::new(),
+                                providers: Vec::new(),
+                            },
+                        ),
+                    }),
+                });
+
+            shell.controller_tick_for_test(MAX_PENDING_HOST_ACTIONS);
+            assert_eq!(
+                shell.config_sidebar.projects.first().map(|project| project.label.as_str()),
+                Some("DevManager"),
+                "a same-transport global config result must survive startup navigation/client advancement"
+            );
+        });
+    }
+
+    fn failed_queries_are_discarded_without_transport_failure(cx: &mut gpui::App) {
+        let (runtime, shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        let (failure, retained, detail, connected, composer_error) =
+            with_test_shell_in_app(cx, runtime, |shell| {
+                let _ = shell
+                    .dispatch_action_for_test(crate::ui::components::ActionRequest::HostStatus);
+                let action = shared
+                    .lock()
+                    .expect("test runtime state")
+                    .accepted
+                    .first()
+                    .cloned()
+                    .expect("accepted query");
+                let epochs = shared.lock().expect("test runtime state").epochs;
+                shared
+                    .lock()
+                    .expect("test runtime state")
+                    .projections
+                    .push_back(NativeHostProjection {
+                        kind: NativeHostProjectionKind::Error,
+                        client_model: None,
+                        task_preview: None,
+                        error: None,
+                        epochs: Some(epochs),
+                        action_outcome: Some(NativeHostActionOutcome::Failed {
+                            action,
+                            error: "status refresh timed out".to_string(),
+                        }),
+                    });
+                shell.controller_tick_for_test(MAX_PENDING_HOST_ACTIONS);
+                (
+                    shell.last_action_failure().cloned(),
+                    shell.pending_action_for_test().cloned(),
+                    shell.last_query_detail().map(str::to_string),
+                    matches!(shell.host_state, NativeHostState::Connected { .. }),
+                    shell.composer_error.clone(),
+                )
+            });
+        assert_eq!(
+            failure, None,
+            "a failed query is not a durable action failure"
+        );
+        assert_eq!(retained, None, "a failed query is safe to reissue later");
+        assert_eq!(detail.as_deref(), Some("status refresh timed out"));
+        assert!(
+            connected,
+            "a query failure must not paint the host disconnected"
+        );
+        assert_eq!(
+            composer_error, None,
+            "query errors do not belong to the composer"
+        );
+    }
+
+    fn successful_resync_projection_restores_runtime_connection(cx: &mut gpui::App) {
+        let (runtime, shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        let (model, _task_id) = open_task_without_agent_client_model();
+        let connected = with_test_shell_in_app(cx, runtime, |shell| {
+            shell.host_state = NativeHostState::Error {
+                message: "subscription reconnect in progress".to_string(),
+            };
+            let epochs = shared.lock().expect("test runtime state").epochs;
+            shared
+                .lock()
+                .expect("test runtime state")
+                .projections
+                .push_back(NativeHostProjection::client_model(Arc::new(model)).at_epochs(epochs));
+            let _ = shell.drain_host_projections(MAX_PENDING_HOST_ACTIONS);
+            matches!(shell.host_state, NativeHostState::Connected { .. })
+        });
+        assert!(
+            connected,
+            "a successful resync projection must restore the live runtime state"
+        );
+    }
+
+    fn uncertain_queries_are_discarded_without_transport_failure(cx: &mut gpui::App) {
+        let (runtime, shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        let (failure, retained, detail, connected) = with_test_shell_in_app(cx, runtime, |shell| {
+            let _ =
+                shell.dispatch_action_for_test(crate::ui::components::ActionRequest::HostStatus);
+            let action = shared
+                .lock()
+                .expect("test runtime state")
+                .accepted
+                .first()
+                .cloned()
+                .expect("accepted query");
+            let epochs = shared.lock().expect("test runtime state").epochs;
+            shared
+                .lock()
+                .expect("test runtime state")
+                .projections
+                .push_back(NativeHostProjection {
+                    kind: NativeHostProjectionKind::Error,
+                    client_model: None,
+                    task_preview: None,
+                    error: None,
+                    epochs: Some(epochs),
+                    action_outcome: Some(NativeHostActionOutcome::Uncertain {
+                        action,
+                        error: "status refresh outcome unknown".to_string(),
+                    }),
+                });
+            shell.controller_tick_for_test(MAX_PENDING_HOST_ACTIONS);
+            (
+                shell.last_action_failure().cloned(),
+                shell.pending_action_for_test().cloned(),
+                shell.last_query_detail().map(str::to_string),
+                matches!(shell.host_state, NativeHostState::Connected { .. }),
+            )
+        });
+        assert_eq!(
+            failure, None,
+            "an uncertain query is not a durable action failure"
+        );
+        assert_eq!(
+            retained, None,
+            "an uncertain query is safe to reissue later"
+        );
+        assert_eq!(detail.as_deref(), Some("status refresh outcome unknown"));
+        assert!(
+            connected,
+            "an uncertain query must not paint the host disconnected"
+        );
+    }
+
+    fn query_admission_failures_are_discarded_without_durable_retention(cx: &mut gpui::App) {
+        let (runtime, shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        let disconnected = with_test_shell_in_app(cx, runtime, |shell| {
+            shared.lock().expect("test runtime state").connected = false;
+            let returned = shell
+                .dispatch_action_for_test(crate::ui::components::ActionRequest::HostStatus)
+                .is_some();
+            (
+                returned,
+                shell.last_action_failure().cloned(),
+                shell.pending_action_for_test().cloned(),
+                shell.last_query_detail().map(str::to_string),
+                matches!(shell.host_state, NativeHostState::Disconnected),
+            )
+        });
+        assert!(
+            disconnected.0,
+            "the caller still observes that the query was not admitted"
+        );
+        assert_eq!(
+            disconnected.1, None,
+            "a disconnected query admission is not a durable action failure"
+        );
+        assert_eq!(
+            disconnected.2, None,
+            "a disconnected query admission must not enter the retry lane"
+        );
+        assert!(
+            disconnected
+                .3
+                .as_deref()
+                .is_some_and(|detail| detail.contains("disconnected")),
+            "the panel-local query detail must explain the admission failure: {:?}",
+            disconnected.3
+        );
+        assert!(
+            disconnected.4,
+            "the header may still reflect the runtime's real disconnected state"
+        );
+
+        let (runtime, _shared) = TestRuntime::new(true, NativeHostActionResult::QueueFull);
+        let saturated = with_test_shell_in_app(cx, runtime, |shell| {
+            let returned = shell
+                .dispatch_action_for_test(crate::ui::components::ActionRequest::HostStatus)
+                .is_some();
+            (
+                returned,
+                shell.last_action_failure().cloned(),
+                shell.pending_action_for_test().cloned(),
+                shell.last_query_detail().map(str::to_string),
+                matches!(shell.host_state, NativeHostState::Connected { .. }),
+            )
+        });
+        assert!(
+            saturated.0,
+            "the caller still observes that the query was not admitted"
+        );
+        assert_eq!(
+            saturated.1, None,
+            "a saturated query admission is not a durable action failure"
+        );
+        assert_eq!(
+            saturated.2, None,
+            "a saturated query admission must not enter the retry lane"
+        );
+        assert!(
+            saturated
+                .3
+                .as_deref()
+                .is_some_and(|detail| detail.contains("busy")),
+            "the panel-local query detail must explain queue pressure: {:?}",
+            saturated.3
+        );
+        assert!(
+            saturated.4,
+            "queue pressure must preserve the runtime's connected state"
+        );
+    }
+
     fn action_outcome_retention_pressure_keeps_exact_overflow_record(cx: &mut gpui::App) {
         let (runtime, _shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
         let (pending_len, overflow, failure) = with_test_shell_in_app(cx, runtime, |shell| {
             for _ in 0..MAX_RETRY_HOST_ACTIONS {
                 let action = shell
                     .interaction
-                    .action(crate::ui::components::ActionRequest::HostStatus)
+                    .action(test_task_create_v2("retry-lane mutation"))
                     .expect("retry-lane action identity");
                 assert!(shell.retain_pending_host_action(action));
             }
             let overflow = shell
                 .interaction
-                .action(crate::ui::components::ActionRequest::HostStatus)
+                .action(test_task_create_v2("outcome overflow mutation"))
                 .expect("outcome overflow identity");
             shell.apply_action_outcome(NativeHostActionOutcome::Uncertain {
                 action: overflow.clone(),
                 error: "outcome pressure".to_string(),
             });
-            (
+            let observed = (
                 shell.pending_host_actions.len(),
                 shell.retained_action_overflow.clone(),
                 (overflow, shell.last_action_failure().cloned()),
-            )
+            );
+            // This scenario verifies the live bounded lanes. It must not leave
+            // its synthetic pressure records for the following drop scenario,
+            // which owns the process-global shutdown-retention assertion.
+            shell.pending_host_actions.clear();
+            shell.retained_action_overflow = None;
+            observed
         });
         assert_eq!(pending_len, MAX_RETRY_HOST_ACTIONS);
         assert_eq!(overflow, Some(failure.0));
@@ -13942,6 +18675,11 @@ mod tests {
 
     #[test]
     fn action_admission_and_outcome_durability() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::action_admission_and_outcome_durability",
+        ) {
+            return;
+        }
         // GPUI's Windows headless message loop is process-global. Exercise
         // every injected-runtime scenario in one app lifetime so teardown
         // cannot race the next headless application instance.
@@ -13960,6 +18698,12 @@ mod tests {
             newer_projection_epoch_is_adopted_after_the_drain_snapshot(cx);
             mixed_newer_projection_epoch_is_merged_not_dropped(cx);
             stale_action_outcomes_are_epoch_fenced(cx);
+            stale_query_outcomes_are_discarded_without_transport_failure(cx);
+            global_query_outcome_survives_navigation_and_projection_advance(cx);
+            failed_queries_are_discarded_without_transport_failure(cx);
+            uncertain_queries_are_discarded_without_transport_failure(cx);
+            query_admission_failures_are_discarded_without_durable_retention(cx);
+            successful_resync_projection_restores_runtime_connection(cx);
             action_outcome_retention_pressure_keeps_exact_overflow_record(cx);
             native_shell_drop_retains_pending_overflow_and_deferred_as_uncertain(cx);
             *completed_for_app.borrow_mut() = true;
@@ -13986,6 +18730,7 @@ mod tests {
             NativeHostProjection {
                 kind: NativeHostProjectionKind::Error,
                 client_model: None,
+                task_preview: None,
                 error: Some("outcome uncertain".to_string()),
                 epochs: None,
                 action_outcome: Some(NativeHostActionOutcome::Uncertain {
@@ -14019,6 +18764,7 @@ mod tests {
                 NativeHostProjection {
                     kind: NativeHostProjectionKind::Error,
                     client_model: None,
+                    task_preview: None,
                     error: Some("outcome retained".to_string()),
                     epochs: None,
                     action_outcome: Some(NativeHostActionOutcome::Uncertain {
@@ -14038,6 +18784,7 @@ mod tests {
                 NativeHostProjection {
                     kind: NativeHostProjectionKind::Error,
                     client_model: None,
+                    task_preview: None,
                     error: Some("outcome pressure".to_string()),
                     epochs: None,
                     action_outcome: Some(NativeHostActionOutcome::Uncertain {
@@ -14063,6 +18810,7 @@ mod tests {
                 NativeHostProjection {
                     kind: NativeHostProjectionKind::Error,
                     client_model: None,
+                    task_preview: None,
                     error: Some("lane full".to_string()),
                     epochs: None,
                     action_outcome: Some(NativeHostActionOutcome::Uncertain {
@@ -14093,6 +18841,7 @@ mod tests {
             NativeHostProjection {
                 kind: NativeHostProjectionKind::Error,
                 client_model: None,
+                task_preview: None,
                 error: Some("worker overflow".to_string()),
                 epochs: None,
                 action_outcome: Some(NativeHostActionOutcome::Uncertain {
@@ -14120,6 +18869,20 @@ mod tests {
             .host_client_config()
             .client_build
             .contains("devmanager-next"));
+    }
+
+    #[test]
+    fn native_snapshot_offer_bounds_each_host_request() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let profile = isolated_dev_profile(workspace.path()).expect("isolated profile");
+        let limits = profile.host_client_config().limits;
+
+        assert_eq!(limits.max_page_items, NATIVE_SNAPSHOT_PAGE_ITEMS);
+        assert!(limits.max_page_items < FrameLimits::v1_default().max_page_items);
+        assert_eq!(
+            limits.max_page_encoded_bytes,
+            FrameLimits::v1_default().max_page_encoded_bytes
+        );
     }
 
     #[test]
@@ -14172,8 +18935,34 @@ mod tests {
         assert!(source.contains("DetachOnClientClose"));
         assert!(source.contains("try_attach_existing_host"));
         assert!(source.contains("PRODUCTION_HOST_PROFILE"));
-        assert!(!source.contains("\"devmanager-next/"));
-        assert!(!source.contains("Native Next"));
+        let legacy_profile_path = concat!("\"", "devmanager", "-next/");
+        let legacy_label = concat!("Native", " Next");
+        assert!(!source.contains(legacy_profile_path));
+        assert!(!source.contains(legacy_label));
+    }
+
+    #[test]
+    fn dev_watch_waits_for_stale_live_processes_before_copy_and_relaunch() {
+        let script = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/dev-watch.ps1"));
+        assert!(
+            script.contains("function Wait-ForStaleLiveCopiesToExit"),
+            "watch mode must own an explicit stale-process exit barrier"
+        );
+        let relaunch = script
+            .split("function Invoke-BuildAndRelaunch")
+            .nth(1)
+            .expect("relaunch function");
+        let stop = relaunch
+            .find("Stop-StaleLiveCopies")
+            .expect("stale-copy stop");
+        let wait = relaunch
+            .find("Wait-ForStaleLiveCopiesToExit")
+            .expect("stale-copy exit barrier");
+        let copy = relaunch.find("Copy-Item $BuildExe").expect("binary copy");
+        assert!(
+            stop < wait && wait < copy,
+            "stale live processes must exit before binaries are copied and relaunched"
+        );
     }
 
     #[test]
@@ -14752,6 +19541,70 @@ mod tests {
         (builder.finish().expect("client model"), task_id)
     }
 
+    #[test]
+    fn task_inbox_groups_tasks_under_their_project_and_preserves_project_on_create() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::task_inbox_groups_tasks_under_their_project_and_preserves_project_on_create",
+        ) {
+            return;
+        }
+        let _test_guard = HEADLESS_SHELL_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("headless shell test lock");
+        let completed = std::rc::Rc::new(std::cell::RefCell::new(false));
+        let completed_for_app = std::rc::Rc::clone(&completed);
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            let (runtime, _shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+            let (model, task_id) = open_task_without_agent_client_model();
+            let project_id = model.task(task_id).expect("task").task.project_id;
+            with_test_shell_in_app(cx, runtime, |shell| {
+                shell.agent_connection = Some(agent_connection_snapshot(AgentPresence::SignedIn));
+                shell.install_project_for_test("DevManager", project_id);
+                shell
+                    .apply_client_model(Arc::new(model))
+                    .expect("apply model");
+                assert_eq!(
+                    shell.project_inbox_items(),
+                    vec![
+                        ProjectInboxItem::Project {
+                            project_id,
+                            label: "DevManager".to_string(),
+                            expanded: true,
+                            task_count: 1,
+                        },
+                        ProjectInboxItem::Task {
+                            project_id,
+                            task_id,
+                        },
+                    ]
+                );
+
+                shell.toggle_project(project_id);
+                assert_eq!(
+                    shell.project_inbox_items(),
+                    vec![ProjectInboxItem::Project {
+                        project_id,
+                        label: "DevManager".to_string(),
+                        expanded: false,
+                        task_count: 1,
+                    }]
+                );
+
+                shell.begin_new_task_for_project(project_id);
+                assert_eq!(
+                    shell.new_task.as_ref().map(|draft| draft.project_id),
+                    Some(project_id),
+                    "task creation must retain the project whose header launched it"
+                );
+            });
+            *completed_for_app.borrow_mut() = true;
+            cx.quit();
+        });
+        assert!(*completed.borrow(), "project inbox scenario completed");
+    }
+
     fn created_task_is_listed_without_a_disconnect_or_missing_field(cx: &mut gpui::App) {
         let (runtime, shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
         let (model, task_id) = open_task_without_agent_client_model();
@@ -14797,10 +19650,9 @@ mod tests {
         });
         assert_eq!(report.1, ShellStage::Cockpit);
         assert_eq!(report.0, "test");
-        assert!(
-            report.4 >= 2,
-            "selecting a created task must refresh more than one cockpit surface, got {}",
-            report.4
+        assert_eq!(
+            report.4, 2,
+            "selecting a created task must refresh its conversation and active cockpit surface"
         );
         assert_eq!(
             report.5, report.4,
@@ -14823,8 +19675,156 @@ mod tests {
         terminal_bound_client_model_with_attention(crate::domain::task::TaskAttention::None)
     }
 
+    #[test]
+    fn provider_input_uses_the_selected_agent_generation_not_the_host_epoch() {
+        use crate::client::action::{ProviderInputActionRequest, ProviderInputArguments};
+        use crate::ui::components::ActionRequest;
+
+        let (model, task_id) = terminal_bound_client_model();
+        let agent_session_id = model
+            .task(task_id)
+            .and_then(|task| task.primary_agent_id)
+            .expect("primary agent");
+        let mut interaction = NativeInteraction::new(Some(task_id));
+        interaction.sync_host_epochs(NativeHostRuntimeEpochs {
+            connection_epoch: 1,
+            resource_generation: 1,
+            runtime_generation: 99,
+        });
+        interaction.bind_projected_model(Arc::new(model));
+        let captured =
+            interaction.action(ActionRequest::ProviderInput(ProviderInputActionRequest {
+                command_id: CommandId::new(),
+                action_id: crate::client::action::ACTION_TASK_SEND_NOW,
+                arguments: ProviderInputArguments {
+                    task_id,
+                    agent_session_id,
+                    runtime_generation: 1,
+                    action_epoch: 3,
+                    turn_id: crate::domain::TurnId::new(),
+                    question_id: None,
+                    approval_id: None,
+                    text: Some("hello".to_string()),
+                    wait: Some(false),
+                    allow: None,
+                },
+            }));
+        assert!(
+            captured.is_some(),
+            "the provider fence belongs to the selected agent, not the unrelated host epoch"
+        );
+    }
+
+    #[test]
+    fn provider_actions_accept_the_initial_task_action_epoch() {
+        use crate::client::action::{
+            ProviderInputActionRequest, ProviderInputArguments, ProviderStartArguments,
+        };
+        use crate::domain::command::ProviderStartMode;
+        use crate::domain::id::ResourceId;
+        use crate::ui::components::ActionRequest;
+
+        let (model, task_id) = terminal_bound_client_model_at_epoch(0);
+        let agent_session_id = model
+            .task(task_id)
+            .and_then(|task| task.primary_agent_id)
+            .expect("primary agent");
+        let resource_id = ResourceId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xa3,
+        ])
+        .expect("resource");
+        let mut interaction = NativeInteraction::new(Some(task_id));
+        interaction.sync_host_epochs(NativeHostRuntimeEpochs {
+            connection_epoch: 1,
+            resource_generation: 1,
+            runtime_generation: 1,
+        });
+        interaction.bind_projected_model(Arc::new(model));
+
+        let input = interaction.action(ActionRequest::ProviderInput(ProviderInputActionRequest {
+            command_id: CommandId::new(),
+            action_id: crate::client::action::ACTION_TASK_SEND_NOW,
+            arguments: ProviderInputArguments {
+                task_id,
+                agent_session_id,
+                runtime_generation: 1,
+                action_epoch: 0,
+                turn_id: crate::domain::TurnId::new(),
+                question_id: None,
+                approval_id: None,
+                text: Some("first message".to_string()),
+                wait: Some(false),
+                allow: None,
+            },
+        }));
+        assert!(
+            input.is_some(),
+            "a bound provider on a newly-created task must accept its exact epoch-zero fence"
+        );
+
+        let start = interaction.action(ActionRequest::StartProviderSession(
+            ProviderStartArguments {
+                task_id,
+                agent_session_id,
+                resource_id,
+                provider_kind: crate::providers::ProviderKind::ClaudeCode,
+                mode: ProviderStartMode::Open,
+                action_epoch: 0,
+            },
+        ));
+        assert!(
+            start.is_some(),
+            "a newly-created task must be able to launch its provider at epoch zero"
+        );
+    }
+
     fn terminal_bound_client_model_with_attention(
         attention: crate::domain::task::TaskAttention,
+    ) -> (crate::client::ClientModel, TaskId) {
+        terminal_bound_client_model_with_provider(attention, Some("provider-conversation-ready"))
+    }
+
+    fn terminal_bound_client_model_at_epoch(
+        action_epoch: u64,
+    ) -> (crate::client::ClientModel, TaskId) {
+        terminal_bound_client_model_with_provider_at_epoch(
+            crate::domain::task::TaskAttention::None,
+            Some("provider-conversation-ready"),
+            action_epoch,
+        )
+    }
+
+    fn terminal_bound_client_model_with_provider(
+        attention: crate::domain::task::TaskAttention,
+        provider_session_id: Option<&str>,
+    ) -> (crate::client::ClientModel, TaskId) {
+        terminal_bound_client_model_with_kind_provider_at_epoch(
+            attention,
+            crate::providers::ProviderKind::ClaudeCode,
+            provider_session_id,
+            3,
+        )
+    }
+
+    fn terminal_bound_client_model_with_provider_at_epoch(
+        attention: crate::domain::task::TaskAttention,
+        provider_session_id: Option<&str>,
+        action_epoch: u64,
+    ) -> (crate::client::ClientModel, TaskId) {
+        terminal_bound_client_model_with_kind_provider_at_epoch(
+            attention,
+            crate::providers::ProviderKind::ClaudeCode,
+            provider_session_id,
+            action_epoch,
+        )
+    }
+
+    fn terminal_bound_client_model_with_kind_provider_at_epoch(
+        attention: crate::domain::task::TaskAttention,
+        provider_kind: crate::providers::ProviderKind,
+        provider_session_id: Option<&str>,
+        action_epoch: u64,
     ) -> (crate::client::ClientModel, TaskId) {
         use crate::client::ClientModelBuilder;
         use crate::domain::{
@@ -14871,7 +19871,7 @@ mod tests {
                         workspace: WorkspaceRef::Main,
                         assignment: TaskAssignment::LocalOwner,
                         lifecycle: TaskLifecycle::Open,
-                        action_epoch: 3,
+                        action_epoch,
                         revision: 4,
                         created_at_ms: 1,
                     },
@@ -14890,8 +19890,11 @@ mod tests {
                     id: agent_id,
                     task_id,
                     role: AgentRole::Primary,
-                    provider_kind: crate::providers::ProviderKind::ClaudeCode,
-                    provider_session_id: None,
+                    provider_kind,
+                    provider_session_id: provider_session_id.map(|value| {
+                        crate::domain::ProviderSessionId::new(value)
+                            .expect("provider conversation identity")
+                    }),
                     lifecycle: AgentSessionLifecycle::Open,
                     runtime_generation: 1,
                     revision: 0,
@@ -14922,6 +19925,88 @@ mod tests {
         (builder.finish().expect("client model"), task_id)
     }
 
+    fn selected_task_composer_waits_for_durable_provider_identity(cx: &mut gpui::App) {
+        let (runtime, _shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        let (pending_model, task_id) = terminal_bound_client_model_with_provider(
+            crate::domain::task::TaskAttention::None,
+            None,
+        );
+        let (ready_model, ready_task_id) = terminal_bound_client_model();
+        assert_eq!(task_id, ready_task_id);
+
+        with_test_shell_in_app(cx, runtime, |shell| {
+            shell
+                .apply_client_model(Arc::new(pending_model))
+                .expect("apply pending provider model");
+            let list = crate::ui::task_cockpit::TaskList::from_client_model_virtual(
+                shell
+                    .client_model_snapshot()
+                    .as_ref()
+                    .expect("pending model"),
+            )
+            .expect("task list");
+            let _ = shell.interaction.navigation_mouse_down(task_id, &list);
+            shell.sync_cockpit_follow();
+            shell
+                .replace_composer_platform_text(None, "keep this draft")
+                .expect("edit pending composer");
+
+            let pending = shell
+                .composer
+                .as_ref()
+                .expect("composer remains visible while provider connects")
+                .availability(ComposerControl::SendNow)
+                .expect("send availability");
+            assert!(!pending.is_available());
+            assert_eq!(
+                pending.reason(),
+                Some("Waiting for the provider conversation to connect")
+            );
+
+            shell
+                .apply_client_model(Arc::new(ready_model))
+                .expect("apply durable provider identity");
+            let composer = shell.composer.as_ref().expect("ready composer");
+            assert_eq!(composer.draft_text(), "keep this draft");
+            assert!(composer
+                .availability(ComposerControl::SendNow)
+                .expect("ready send availability")
+                .is_available());
+        });
+    }
+
+    fn selected_codex_task_composer_allows_first_prompt_without_provider_identity(
+        cx: &mut gpui::App,
+    ) {
+        let (runtime, _shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        let (model, task_id) = terminal_bound_client_model_with_kind_provider_at_epoch(
+            crate::domain::task::TaskAttention::None,
+            crate::providers::ProviderKind::Codex,
+            None,
+            3,
+        );
+
+        with_test_shell_in_app(cx, runtime, |shell| {
+            shell
+                .apply_client_model(Arc::new(model))
+                .expect("apply Codex model without external provider identity");
+            let list = crate::ui::task_cockpit::TaskList::from_client_model_virtual(
+                shell.client_model_snapshot().as_ref().expect("Codex model"),
+            )
+            .expect("task list");
+            let _ = shell.interaction.navigation_mouse_down(task_id, &list);
+            shell.sync_cockpit_follow();
+
+            assert!(shell
+                .composer
+                .as_ref()
+                .expect("Codex composer")
+                .availability(ComposerControl::SendNow)
+                .expect("send availability")
+                .is_available());
+        });
+    }
+
     fn selected_task_follow_title_and_terminal_binding(cx: &mut gpui::App) {
         let (runtime, _shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
         let (model, task_id) = terminal_bound_client_model();
@@ -14949,11 +20034,48 @@ mod tests {
         });
     }
 
-    fn bound_task_with_failed_launch_holds_conversation(cx: &mut gpui::App) {
+    fn selected_task_composer_rebinds_after_focus_epoch_advances(cx: &mut gpui::App) {
         let (runtime, _shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
-        let (model, task_id) =
-            terminal_bound_client_model_with_attention(crate::domain::task::TaskAttention::Failed);
-        let report = with_test_shell_in_app(cx, runtime, |shell| {
+        let (model, task_id) = terminal_bound_client_model();
+        let model = Arc::new(model);
+        with_test_shell_in_app(cx, runtime, |shell| {
+            shell
+                .apply_client_model(Arc::clone(&model))
+                .expect("apply model");
+            let list = crate::ui::task_cockpit::TaskList::from_client_model_virtual(
+                shell.client_model_snapshot().as_ref().unwrap(),
+            )
+            .expect("task list");
+            let _ = shell.interaction.navigation_mouse_down(task_id, &list);
+            shell.sync_cockpit_follow();
+            assert!(shell.composer_error.is_none(), "composer initially binds");
+
+            let before = shell.interaction.current_focus_epoch();
+            let _ =
+                shell.dispatch_action_for_test(crate::ui::components::ActionRequest::HostStatus);
+            assert_ne!(shell.interaction.current_focus_epoch(), before);
+            shell
+                .apply_client_model(Arc::clone(&model))
+                .expect("refresh model after focus change");
+
+            assert_eq!(
+                shell.composer_error, None,
+                "a current host projection must rebind the composer to the new focus epoch"
+            );
+            assert_eq!(
+                shell
+                    .composer
+                    .as_ref()
+                    .and_then(|composer| composer.focus_epoch()),
+                Some(shell.interaction.current_focus_epoch())
+            );
+        });
+    }
+
+    fn task_switch_parks_and_restores_unsent_composer_draft(cx: &mut gpui::App) {
+        let (runtime, _shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        let (model, task_id) = terminal_bound_client_model();
+        with_test_shell_in_app(cx, runtime, |shell| {
             shell
                 .apply_client_model(Arc::new(model))
                 .expect("apply model");
@@ -14963,6 +20085,746 @@ mod tests {
             .expect("task list");
             let _ = shell.interaction.navigation_mouse_down(task_id, &list);
             shell.sync_cockpit_follow();
+
+            let focus_epoch = shell.interaction.current_focus_epoch();
+            shell
+                .composer
+                .as_mut()
+                .expect("selected task composer")
+                .replace_draft("keep this task draft", focus_epoch)
+                .expect("edit draft");
+
+            shell.interaction.sync_selected_task(None);
+            shell.sync_cockpit_follow();
+            assert!(shell.composer.is_none(), "deselection parks the composer");
+
+            shell.interaction.sync_selected_task(Some(task_id));
+            shell.sync_cockpit_follow();
+            assert_eq!(
+                shell
+                    .composer
+                    .as_ref()
+                    .expect("restored task composer")
+                    .draft_text(),
+                "keep this task draft",
+                "returning to a task must restore its unsent input"
+            );
+        });
+    }
+
+    fn task_draft_survives_native_shell_remount(cx: &mut gpui::App) {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let profile = isolated_dev_profile(workspace.path()).expect("isolated profile");
+        let (model, task_id) = terminal_bound_client_model();
+        let model = Arc::new(model);
+
+        let (runtime, _) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        with_test_shell_profile_in_app_cx(cx, profile.clone(), runtime, |shell, _cx| {
+            shell
+                .apply_client_model(Arc::clone(&model))
+                .expect("apply model");
+            let list = crate::ui::task_cockpit::TaskList::from_client_model_virtual(
+                shell.client_model_snapshot().as_ref().unwrap(),
+            )
+            .expect("task list");
+            let _ = shell.interaction.navigation_mouse_down(task_id, &list);
+            shell.sync_cockpit_follow();
+            let focus_epoch = shell.interaction.current_focus_epoch();
+            shell
+                .composer
+                .as_mut()
+                .expect("selected task composer")
+                .replace_draft("survive a complete shell remount", focus_epoch)
+                .expect("edit draft");
+            shell.cache_current_composer_draft();
+            shell.flush_composer_drafts_if_due(true);
+            assert!(shell.composer_draft_store.path().is_file());
+        });
+
+        let (runtime, _) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        with_test_shell_profile_in_app_cx(cx, profile, runtime, |shell, _cx| {
+            shell
+                .apply_client_model(Arc::clone(&model))
+                .expect("restore model");
+            let list = crate::ui::task_cockpit::TaskList::from_client_model_virtual(
+                shell.client_model_snapshot().as_ref().unwrap(),
+            )
+            .expect("task list");
+            let _ = shell.interaction.navigation_mouse_down(task_id, &list);
+            shell.sync_cockpit_follow();
+            assert_eq!(
+                shell
+                    .composer
+                    .as_ref()
+                    .expect("restored composer")
+                    .draft_text(),
+                "survive a complete shell remount"
+            );
+        });
+    }
+
+    fn platform_text_input_replaces_the_selected_composer_draft(cx: &mut gpui::App) {
+        let (runtime, _shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        let (model, task_id) = terminal_bound_client_model();
+        with_test_shell_in_app(cx, runtime, |shell| {
+            shell
+                .apply_client_model(Arc::new(model))
+                .expect("apply model");
+            let list = crate::ui::task_cockpit::TaskList::from_client_model_virtual(
+                shell.client_model_snapshot().as_ref().unwrap(),
+            )
+            .expect("task list");
+            let _ = shell.interaction.navigation_mouse_down(task_id, &list);
+            shell.sync_cockpit_follow();
+
+            let focus_epoch = shell.interaction.current_focus_epoch();
+            let composer = shell.composer.as_mut().expect("selected task composer");
+            composer
+                .replace_draft("replace this", focus_epoch)
+                .expect("seed draft");
+            composer
+                .select_all_draft(focus_epoch)
+                .expect("select draft");
+
+            shell
+                .replace_composer_platform_text(None, "pasted prompt")
+                .expect("platform text input");
+
+            let composer = shell.composer.as_ref().expect("composer remains bound");
+            assert_eq!(composer.draft_text(), "pasted prompt");
+            assert_eq!(composer.draft_cursor(), "pasted prompt".chars().count());
+            assert_eq!(
+                shell
+                    .composer_drafts
+                    .values()
+                    .next()
+                    .map(|draft| draft.text.as_str()),
+                Some("pasted prompt"),
+                "platform text must enter the same persisted task draft path"
+            );
+        });
+    }
+
+    fn platform_text_edits_draft_while_send_unavailable(cx: &mut gpui::App) {
+        let (runtime, _shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        let (pending_model, task_id) = terminal_bound_client_model_with_provider(
+            crate::domain::task::TaskAttention::None,
+            None,
+        );
+        with_test_shell_in_app(cx, runtime, |shell| {
+            shell
+                .apply_client_model(Arc::new(pending_model))
+                .expect("apply pending provider model");
+            let list = crate::ui::task_cockpit::TaskList::from_client_model_virtual(
+                shell
+                    .client_model_snapshot()
+                    .as_ref()
+                    .expect("pending model"),
+            )
+            .expect("task list");
+            let _ = shell.interaction.navigation_mouse_down(task_id, &list);
+            shell.sync_cockpit_follow();
+
+            let focus_epoch = shell.interaction.current_focus_epoch();
+            shell
+                .composer
+                .as_mut()
+                .expect("composer while send unavailable")
+                .focus_input(focus_epoch)
+                .expect("focus composer input");
+            shell.composer_accessibility_focused = true;
+            shell
+                .replace_composer_platform_text(None, "typed while connecting")
+                .expect("platform text must mutate draft while Send is unavailable");
+
+            let composer = shell.composer.as_ref().expect("composer remains editable");
+            assert_eq!(composer.draft_text(), "typed while connecting");
+            let send = composer
+                .availability(ComposerControl::SendNow)
+                .expect("send availability");
+            assert!(!send.is_available());
+            assert_eq!(
+                shell.composer_error.as_deref(),
+                None,
+                "turn readiness must stay compact status, not a red composer error"
+            );
+            assert_eq!(
+                shell
+                    .composer_drafts
+                    .values()
+                    .next()
+                    .map(|draft| draft.text.as_str()),
+                Some("typed while connecting")
+            );
+        });
+    }
+
+    fn dismissed_slash_menu_stays_closed_while_background_state_caches(cx: &mut gpui::App) {
+        let (runtime, _shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        let (model, task_id) = terminal_bound_client_model_with_kind_provider_at_epoch(
+            crate::domain::task::TaskAttention::None,
+            crate::providers::ProviderKind::Codex,
+            None,
+            3,
+        );
+        with_test_shell_in_app(cx, runtime, |shell| {
+            shell
+                .apply_client_model(Arc::new(model))
+                .expect("apply Codex model");
+            let list = crate::ui::task_cockpit::TaskList::from_client_model_virtual(
+                shell.client_model_snapshot().as_ref().expect("Codex model"),
+            )
+            .expect("task list");
+            let _ = shell.interaction.navigation_mouse_down(task_id, &list);
+            shell.sync_cockpit_follow();
+            shell
+                .replace_composer_platform_text(None, "/")
+                .expect("type slash");
+            assert!(!shell.slash_command_suggestions().is_empty());
+
+            shell.slash_command_menu_dismissed = true;
+            shell.cache_current_composer_draft();
+
+            assert!(
+                shell.slash_command_suggestions().is_empty(),
+                "caching unchanged task state must not reopen a menu dismissed with Escape"
+            );
+        });
+    }
+
+    fn center_task_canvas_switches_conversation_and_terminal(cx: &mut gpui::App) {
+        let (runtime, _shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        let (model, task_id) = terminal_bound_client_model();
+        with_test_shell_in_app(cx, runtime, |shell| {
+            shell
+                .apply_client_model(Arc::new(model))
+                .expect("apply model");
+            let list = crate::ui::task_cockpit::TaskList::from_client_model_virtual(
+                shell.client_model_snapshot().as_ref().unwrap(),
+            )
+            .expect("task list");
+            let _ = shell.interaction.navigation_mouse_down(task_id, &list);
+            shell.sync_cockpit_follow();
+
+            assert_eq!(
+                shell.main_conversation_canvas(),
+                MainConversationCanvas::TaskConversation
+            );
+            assert!(
+                shell.center_canvas_switch_visible_for_test(),
+                "center top Conversation/Terminal switch must be visible"
+            );
+            assert!(
+                !shell.bottom_terminal_strip_present_for_test(),
+                "bottom terminal strip must be removed"
+            );
+
+            shell.set_provider_terminal_visible(true);
+            assert_eq!(
+                shell.main_conversation_canvas(),
+                MainConversationCanvas::TaskTerminal
+            );
+            assert!(
+                shell.composer_error.as_deref() != Some("provider terminal turn is not ready yet"),
+                "switching to Terminal before a turn exists must not emit a red turn-not-ready error"
+            );
+
+            shell.clear_selected_task();
+            assert!(matches!(
+                shell.main_conversation_canvas(),
+                MainConversationCanvas::IdlePhoto { .. }
+            ));
+            let restored = shell.select_projected_task(task_id);
+            assert!(restored.consumed);
+            assert_eq!(
+                shell.main_conversation_canvas(),
+                MainConversationCanvas::TaskTerminal,
+                "ContextDock TerminalPresentation memory must restore Terminal for the task"
+            );
+
+            shell.set_provider_terminal_visible(false);
+            assert_eq!(
+                shell.main_conversation_canvas(),
+                MainConversationCanvas::TaskConversation
+            );
+        });
+    }
+
+    fn platform_accessibility_set_value_replaces_the_selected_composer_draft(cx: &mut gpui::App) {
+        let (runtime, _shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        let (model, task_id) = terminal_bound_client_model();
+        with_test_shell_in_app(cx, runtime, |shell| {
+            shell
+                .apply_client_model(Arc::new(model))
+                .expect("apply model");
+            let list = crate::ui::task_cockpit::TaskList::from_client_model_virtual(
+                shell.client_model_snapshot().as_ref().unwrap(),
+            )
+            .expect("task list");
+            let _ = shell.interaction.navigation_mouse_down(task_id, &list);
+            shell.sync_cockpit_follow();
+            shell.refresh_accessibility_tree();
+
+            let target_node = shell
+                .platform_accessibility
+                .tree_update()
+                .nodes
+                .iter()
+                .find_map(|(node_id, node)| {
+                    (node.author_id() == Some("native-task-composer-input")).then_some(*node_id)
+                })
+                .expect("platform prompt node");
+            let generation = shell.platform_accessibility.generation();
+            shell
+                .platform_accessibility
+                .pending_actions
+                .lock()
+                .expect("accessibility action queue")
+                .push_back(NativeAccessibilityAction {
+                    request: accesskit::ActionRequest {
+                        action: accesskit::Action::SetValue,
+                        target_tree: accesskit::TreeId::ROOT,
+                        target_node,
+                        data: Some(accesskit::ActionData::Value(
+                            "typed through Windows accessibility".into(),
+                        )),
+                    },
+                    tree_generation: generation,
+                });
+
+            assert!(shell.controller_tick_for_test(MAX_ACCESSIBILITY_ACTIONS));
+            assert_eq!(
+                shell
+                    .composer
+                    .as_ref()
+                    .expect("selected task composer")
+                    .draft_text(),
+                "typed through Windows accessibility"
+            );
+
+            let update = shell.platform_accessibility.tree_update();
+            let target_node = update
+                .nodes
+                .iter()
+                .find_map(|(node_id, node)| {
+                    (node.author_id() == Some("native-task-composer-input")).then_some(*node_id)
+                })
+                .expect("updated platform prompt node");
+            let generation = shell.platform_accessibility.generation();
+            shell
+                .platform_accessibility
+                .pending_actions
+                .lock()
+                .expect("accessibility action queue")
+                .push_back(NativeAccessibilityAction {
+                    request: accesskit::ActionRequest {
+                        action: accesskit::Action::Focus,
+                        target_tree: accesskit::TreeId::ROOT,
+                        target_node,
+                        data: None,
+                    },
+                    tree_generation: generation,
+                });
+
+            assert!(shell.controller_tick_for_test(MAX_ACCESSIBILITY_ACTIONS));
+            assert!(
+                shell.pending_composer_focus,
+                "Windows focus must be handed to GPUI on the next render"
+            );
+            assert_eq!(
+                shell.platform_accessibility.tree_update().focus,
+                target_node,
+                "the platform tree must report the prompt as focused immediately"
+            );
+        });
+    }
+
+    fn composer_settles_only_the_matching_accepted_command(cx: &mut gpui::App) {
+        let (runtime, _) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        let (model, task_id) = terminal_bound_client_model();
+        with_test_shell_in_app(cx, runtime, |shell| {
+            shell
+                .apply_client_model(Arc::new(model))
+                .expect("apply model");
+            let list = crate::ui::task_cockpit::TaskList::from_client_model_virtual(
+                shell.client_model_snapshot().as_ref().unwrap(),
+            )
+            .expect("task list");
+            let _ = shell.interaction.navigation_mouse_down(task_id, &list);
+            shell.sync_cockpit_follow();
+            let focus_epoch = shell.interaction.current_focus_epoch();
+            shell
+                .composer
+                .as_mut()
+                .expect("selected task composer")
+                .replace_draft("accepted exactly once", focus_epoch)
+                .expect("edit draft");
+            let intent = {
+                let composer = shell.composer.as_mut().expect("composer");
+                composer
+                    .focus_control(ComposerControl::SendNow, focus_epoch)
+                    .expect("focus send");
+                composer
+                    .activate(ComposerControl::SendNow, focus_epoch)
+                    .expect("submit intent")
+            };
+            let submitted = shell
+                .interaction
+                .action(
+                    intent
+                        .to_provider_input_request(None, None, None)
+                        .expect("provider request"),
+                )
+                .expect("provider action");
+            let submitted_command_id =
+                native_command_id(&submitted.command).expect("provider command identity");
+
+            let unrelated = shell
+                .interaction
+                .action(test_task_create_v2("unrelated accepted task"))
+                .expect("unrelated command action");
+            let unrelated_command_id =
+                native_command_id(&unrelated.command).expect("unrelated command identity");
+            shell.apply_action_outcome(NativeHostActionOutcome::Accepted {
+                action: unrelated,
+                receipt: crate::domain::command::CommandReceipt::Accepted {
+                    command_id: unrelated_command_id,
+                    operation_id: crate::domain::id::OperationId::new(),
+                    task_revision: None,
+                    event_ids: Vec::new(),
+                    prompt_mutation: None,
+                },
+            });
+            assert_eq!(
+                shell
+                    .composer
+                    .as_ref()
+                    .and_then(TaskComposer::pending_intent)
+                    .map(|pending| pending.command_id),
+                Some(submitted_command_id),
+                "an unrelated receipt must not settle the composer"
+            );
+            assert_eq!(
+                shell.composer.as_ref().expect("composer").draft_text(),
+                "accepted exactly once"
+            );
+
+            shell.apply_action_outcome(NativeHostActionOutcome::Accepted {
+                action: submitted,
+                receipt: crate::domain::command::CommandReceipt::Accepted {
+                    command_id: submitted_command_id,
+                    operation_id: crate::domain::id::OperationId::new(),
+                    task_revision: None,
+                    event_ids: Vec::new(),
+                    prompt_mutation: None,
+                },
+            });
+            assert!(shell
+                .composer
+                .as_ref()
+                .and_then(TaskComposer::pending_intent)
+                .is_none());
+            assert_eq!(shell.composer.as_ref().expect("composer").draft_text(), "");
+        });
+    }
+
+    fn accepted_send_consumes_the_exact_parked_draft(cx: &mut gpui::App) {
+        let (runtime, _shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        let (model, task_id) = terminal_bound_client_model();
+        with_test_shell_in_app(cx, runtime, |shell| {
+            shell
+                .apply_client_model(Arc::new(model))
+                .expect("apply model");
+            let list = crate::ui::task_cockpit::TaskList::from_client_model_virtual(
+                shell.client_model_snapshot().as_ref().unwrap(),
+            )
+            .expect("task list");
+            let _ = shell.interaction.navigation_mouse_down(task_id, &list);
+            shell.sync_cockpit_follow();
+
+            let focus_epoch = shell.interaction.current_focus_epoch();
+            shell
+                .composer
+                .as_mut()
+                .expect("selected task composer")
+                .replace_draft("accepted while another task is selected", focus_epoch)
+                .expect("edit draft");
+            shell.cache_current_composer_draft();
+            let intent = {
+                let composer = shell.composer.as_mut().expect("composer");
+                composer
+                    .focus_control(ComposerControl::SendNow, focus_epoch)
+                    .expect("focus send");
+                composer
+                    .activate(ComposerControl::SendNow, focus_epoch)
+                    .expect("submit intent")
+            };
+            let command_id = intent.command_id;
+            let submitted = shell
+                .interaction
+                .action(
+                    intent
+                        .to_provider_input_request(None, None, None)
+                        .expect("provider request"),
+                )
+                .expect("provider action");
+            let composer = shell.composer.as_ref().expect("composer");
+            let fence = composer.fence();
+            shell.pending_composer_submissions.insert(
+                command_id,
+                super::PendingComposerSubmission {
+                    key: crate::ui::task_cockpit::draft_store::ComposerDraftKey::new(
+                        fence.task_id,
+                        fence.agent_session_id,
+                    ),
+                    draft: composer.draft_projection(),
+                    image_ids: Vec::new(),
+                    open_provider_terminal: false,
+                },
+            );
+            assert!(shell.pending_composer_submissions.contains_key(&command_id));
+
+            shell.clear_composer_binding();
+            shell.apply_action_outcome(NativeHostActionOutcome::Accepted {
+                action: submitted,
+                receipt: crate::domain::command::CommandReceipt::Accepted {
+                    command_id,
+                    operation_id: crate::domain::id::OperationId::new(),
+                    task_revision: None,
+                    event_ids: Vec::new(),
+                    prompt_mutation: None,
+                },
+            });
+
+            assert!(!shell.pending_composer_submissions.contains_key(&command_id));
+            assert!(
+                shell.composer_drafts.is_empty(),
+                "an accepted parked submission must not restore as an unsent draft"
+            );
+        });
+    }
+
+    fn unchanged_task_projection_does_not_restart_cockpit_queries(cx: &mut gpui::App) {
+        let (runtime, shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        let (model, task_id) = terminal_bound_client_model();
+        let model = Arc::new(model);
+        with_test_shell_in_app(cx, runtime, |shell| {
+            shell
+                .apply_client_model(Arc::clone(&model))
+                .expect("apply model");
+            let list = crate::ui::task_cockpit::TaskList::from_client_model_virtual(
+                shell.client_model_snapshot().as_ref().unwrap(),
+            )
+            .expect("task list");
+            let _ = shell.interaction.navigation_mouse_down(task_id, &list);
+            shell.sync_cockpit_follow();
+            let before = shared
+                .lock()
+                .expect("runtime")
+                .accepted
+                .iter()
+                .filter(|record| {
+                    matches!(
+                        record.command,
+                        super::NativeHostCommand::TaskCockpitQuery { .. }
+                    )
+                })
+                .count();
+
+            shell
+                .apply_client_model(Arc::clone(&model))
+                .expect("refresh unchanged model");
+
+            let after = shared
+                .lock()
+                .expect("runtime")
+                .accepted
+                .iter()
+                .filter(|record| {
+                    matches!(
+                        record.command,
+                        super::NativeHostCommand::TaskCockpitQuery { .. }
+                    )
+                })
+                .count();
+            assert_eq!(
+                after, before,
+                "an unchanged selected-task projection must not invalidate and restart in-flight cockpit queries"
+            );
+        });
+    }
+
+    fn restored_selected_task_hydrates_cockpit_on_first_projection(cx: &mut gpui::App) {
+        let (runtime, shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        let (model, task_id) = terminal_bound_client_model();
+        with_test_shell_in_app(cx, runtime, |shell| {
+            shell.interaction.sync_selected_task(Some(task_id));
+            assert_eq!(shell.cockpit.selected_task(), None);
+            shared.lock().expect("runtime").accepted.clear();
+
+            shell
+                .apply_client_model(Arc::new(model))
+                .expect("apply first restored model");
+
+            assert_eq!(shell.cockpit.selected_task(), Some(task_id));
+            assert!(
+                shared
+                    .lock()
+                    .expect("runtime")
+                    .accepted
+                    .iter()
+                    .any(|record| matches!(record.command, super::NativeHostCommand::TaskCockpitQuery { .. })),
+                "a restored selection that the cockpit has not followed must issue its initial conversation/files query wave"
+            );
+        });
+    }
+
+    fn repeated_follow_of_same_selected_task_does_not_restart_cockpit_queries(cx: &mut gpui::App) {
+        let (runtime, shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        let (model, task_id) = terminal_bound_client_model();
+        with_test_shell_in_app(cx, runtime, |shell| {
+            shell
+                .apply_client_model(Arc::new(model))
+                .expect("apply model");
+            let list = crate::ui::task_cockpit::TaskList::from_client_model_virtual(
+                shell.client_model_snapshot().as_ref().unwrap(),
+            )
+            .expect("task list");
+            let _ = shell.interaction.navigation_mouse_down(task_id, &list);
+            shell.sync_cockpit_follow();
+            let first = shared.lock().expect("runtime").accepted.len();
+
+            shell.sync_cockpit_follow();
+
+            let second = shared.lock().expect("runtime").accepted.len();
+            assert!(first > 0, "first follow must refresh cockpit queries");
+            assert_eq!(
+                second, first,
+                "an already-followed selected task must not enqueue the same query wave again"
+            );
+        });
+    }
+
+    fn cockpit_refresh_only_queries_the_active_host_surface(cx: &mut gpui::App) {
+        let (runtime, shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        let (model, task_id) = terminal_bound_client_model();
+        with_test_shell_in_app(cx, runtime, |shell| {
+            shell
+                .apply_client_model(Arc::new(model))
+                .expect("apply model");
+            let list = crate::ui::task_cockpit::TaskList::from_client_model_virtual(
+                shell.client_model_snapshot().as_ref().unwrap(),
+            )
+            .expect("task list");
+            let _ = shell.interaction.navigation_mouse_down(task_id, &list);
+            shell.sync_cockpit_follow();
+
+            let assert_queries =
+                |shared: &Arc<Mutex<TestRuntimeState>>,
+                 expected: &[crate::domain::TaskCockpitQuery]| {
+                    let state = shared.lock().expect("runtime");
+                    let actual = state
+                        .accepted
+                        .iter()
+                        .filter_map(|record| match &record.command {
+                            super::NativeHostCommand::TaskCockpitQuery { query, .. } => {
+                                Some(query.clone())
+                            }
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(actual, expected);
+                };
+
+            let _ = shell.cockpit.handle_tool_action(
+                crate::ui::task_cockpit::dock::DockTool::Files,
+                crate::domain::RequestId::new(),
+            );
+            shared.lock().expect("runtime").accepted.clear();
+            shell.refresh_selected_cockpit_surfaces();
+            assert_queries(
+                &shared,
+                &[
+                    crate::domain::TaskCockpitQuery::Conversation { after_sequence: 0 },
+                    crate::domain::TaskCockpitQuery::FilesList {
+                        relative_directory: None,
+                        limit: 64,
+                    },
+                ],
+            );
+
+            let _ = shell.cockpit.handle_tool_action(
+                crate::ui::task_cockpit::dock::DockTool::Changes,
+                crate::domain::RequestId::new(),
+            );
+            shared.lock().expect("runtime").accepted.clear();
+            shell.refresh_selected_cockpit_surfaces();
+            assert_queries(
+                &shared,
+                &[
+                    crate::domain::TaskCockpitQuery::Conversation { after_sequence: 0 },
+                    crate::domain::TaskCockpitQuery::WorkspaceStatus,
+                    crate::domain::TaskCockpitQuery::GitStatus,
+                ],
+            );
+
+            shared.lock().expect("runtime").accepted.clear();
+            shell.apply_keyboard_shell_effects(crate::ui::actions::KeyboardAction::SelectDock(
+                crate::ui::actions::DockTool::Services,
+            ));
+            assert_queries(
+                &shared,
+                &[
+                    crate::domain::TaskCockpitQuery::Conversation { after_sequence: 0 },
+                    crate::domain::TaskCockpitQuery::ServiceSnapshots,
+                ],
+            );
+            assert!(
+                shared
+                    .lock()
+                    .expect("runtime")
+                    .accepted
+                    .iter()
+                    .any(|record| matches!(
+                        record.command,
+                        super::NativeHostCommand::HostActionsQuery { .. }
+                    )),
+                "opening Services must refresh the catalog and the task-scoped snapshots"
+            );
+        });
+    }
+
+    fn bound_task_with_failed_launch_holds_conversation(cx: &mut gpui::App) {
+        let (runtime, shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        let (model, task_id) =
+            terminal_bound_client_model_with_attention(crate::domain::task::TaskAttention::Failed);
+        let report = with_test_shell_in_app(cx, runtime, |shell| {
+            shell.agent_connection = Some(agent_connection_snapshot(AgentPresence::SignedIn));
+            shell.install_named_folder_for_test("command");
+            shell
+                .apply_client_model(Arc::new(model))
+                .expect("apply model");
+            let list = crate::ui::task_cockpit::TaskList::from_client_model_virtual(
+                shell.client_model_snapshot().as_ref().unwrap(),
+            )
+            .expect("task list");
+            let _ = shell.interaction.navigation_mouse_down(task_id, &list);
+            shell.sync_cockpit_follow();
+            shell.refresh_accessibility_tree();
+            let element_ids: Vec<String> = shell
+                .accessibility_tree()
+                .gpui_nodes()
+                .into_iter()
+                .map(|node| node.element_id)
+                .filter(|id| !id.is_empty())
+                .collect();
+            let before = shared.lock().expect("runtime").accepted.len();
+            let archive_failed = shell
+                .dispatch_action_for_test(crate::ui::components::ActionRequest::TaskArchive {
+                    task_id,
+                })
+                .is_some();
+            let accepted = shared.lock().expect("runtime").accepted.clone();
             (
                 shell
                     .cockpit()
@@ -14971,6 +20833,10 @@ mod tests {
                     .to_string(),
                 shell.composer.is_none(),
                 shell.host_status_text(),
+                element_ids,
+                archive_failed,
+                before,
+                accepted,
             )
         });
         assert!(
@@ -14988,6 +20854,25 @@ mod tests {
             !report.2.contains("Can't connect"),
             "launch failure must not paint host transport failure: {}",
             report.2
+        );
+        assert!(
+            report.3.iter().any(|id| id == "native-task-delete"),
+            "a selected failed task must expose Delete: {:?}",
+            report.3
+        );
+        assert!(
+            !report.4,
+            "task.archive must enqueue without a capture failure"
+        );
+        assert!(
+            report.6.len() > report.5
+                && report.6.iter().any(|record| {
+                    matches!(
+                        record.command,
+                        super::NativeHostCommand::TaskArchive { task_id: id, .. } if id == task_id
+                    )
+                }),
+            "Delete must dispatch TaskArchive for the selected task"
         );
     }
 
@@ -15023,7 +20908,15 @@ mod tests {
                 shell.last_keyboard_action(),
                 Some(crate::ui::actions::KeyboardAction::OpenTerminal)
             );
-            assert_eq!(shell.cockpit().active_tool(), CockpitDockTool::Terminal);
+            assert_eq!(
+                shell.cockpit().active_tool(),
+                CockpitDockTool::Browser,
+                "the full-canvas terminal switch must not replace the right context tool"
+            );
+            assert_eq!(
+                shell.main_conversation_canvas(),
+                MainConversationCanvas::TaskTerminal
+            );
             assert!(shell.interaction.keyboard_state().terminal_open);
 
             let before = shared.lock().expect("runtime").accepted.len();
@@ -15048,6 +20941,11 @@ mod tests {
 
     #[test]
     fn native_shell_follow_dock_and_details_scenarios() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::native_shell_follow_dock_and_details_scenarios",
+        ) {
+            return;
+        }
         let _test_guard = HEADLESS_SHELL_TEST_LOCK
             .get_or_init(|| Mutex::new(()))
             .lock()
@@ -15058,6 +20956,19 @@ mod tests {
             crate::ui::init(cx);
             created_task_is_listed_without_a_disconnect_or_missing_field(cx);
             selected_task_follow_title_and_terminal_binding(cx);
+            selected_task_composer_waits_for_durable_provider_identity(cx);
+            selected_codex_task_composer_allows_first_prompt_without_provider_identity(cx);
+            selected_task_composer_rebinds_after_focus_epoch_advances(cx);
+            task_switch_parks_and_restores_unsent_composer_draft(cx);
+            task_draft_survives_native_shell_remount(cx);
+            platform_text_input_replaces_the_selected_composer_draft(cx);
+            platform_accessibility_set_value_replaces_the_selected_composer_draft(cx);
+            composer_settles_only_the_matching_accepted_command(cx);
+            accepted_send_consumes_the_exact_parked_draft(cx);
+            restored_selected_task_hydrates_cockpit_on_first_projection(cx);
+            unchanged_task_projection_does_not_restart_cockpit_queries(cx);
+            repeated_follow_of_same_selected_task_does_not_restart_cockpit_queries(cx);
+            cockpit_refresh_only_queries_the_active_host_surface(cx);
             bound_task_with_failed_launch_holds_conversation(cx);
             dock_shortcuts_and_open_task_details_bind_selection(cx);
             *completed_for_app.borrow_mut() = true;
@@ -15067,6 +20978,642 @@ mod tests {
             *completed.borrow(),
             "follow/dock/details scenarios completed"
         );
+    }
+
+    #[test]
+    fn center_canvas_and_composer_input_scenarios() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::center_canvas_and_composer_input_scenarios",
+        ) {
+            return;
+        }
+        let _test_guard = HEADLESS_SHELL_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("headless shell test lock");
+        let completed = std::rc::Rc::new(std::cell::RefCell::new(false));
+        let completed_for_app = std::rc::Rc::clone(&completed);
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            platform_text_edits_draft_while_send_unavailable(cx);
+            dismissed_slash_menu_stays_closed_while_background_state_caches(cx);
+            center_task_canvas_switches_conversation_and_terminal(cx);
+            *completed_for_app.borrow_mut() = true;
+            cx.quit();
+        });
+        assert!(
+            *completed.borrow(),
+            "center canvas and composer input scenarios completed"
+        );
+    }
+
+    #[test]
+    fn composer_input_survives_slash_menu_rerender() {
+        const TEST_NAME: &str =
+            "ui::native_shell::tests::composer_input_survives_slash_menu_rerender";
+        if rerun_headless_shell_test_in_child(TEST_NAME) {
+            return;
+        }
+
+        let completed = std::rc::Rc::new(std::cell::Cell::new(false));
+        let completed_for_app = std::rc::Rc::clone(&completed);
+        gpui::Application::new().run(move |cx| {
+            crate::ui::init(cx);
+            let workspace = tempfile::tempdir().expect("workspace tempdir");
+            let profile = isolated_dev_profile(workspace.path()).expect("isolated profile");
+            let (runtime, _) = TestRuntime::new(true, NativeHostActionResult::Queued);
+            let (model, task_id) = terminal_bound_client_model_with_kind_provider_at_epoch(
+                crate::domain::task::TaskAttention::None,
+                crate::providers::ProviderKind::Codex,
+                None,
+                3,
+            );
+            let window = cx
+                .open_window(
+                    WindowOptions {
+                        show: false,
+                        ..WindowOptions::default()
+                    },
+                    move |window, cx| {
+                        let entity = cx.new(|cx| {
+                            NativeShell::new_with_host_runtime_port(
+                                profile,
+                                Box::new(runtime),
+                                crate::ui::tokens::RuntimePreferencesSnapshot::default(),
+                                cx,
+                            )
+                        });
+                        entity.update(cx, |shell, _cx| {
+                            shell
+                                .apply_client_model(Arc::new(model))
+                                .expect("apply model");
+                            let list =
+                                crate::ui::task_cockpit::TaskList::from_client_model_virtual(
+                                    shell.client_model_snapshot().as_ref().expect("model"),
+                                )
+                                .expect("task list");
+                            let _ = shell.interaction.navigation_mouse_down(task_id, &list);
+                            shell.sync_cockpit_follow();
+                            assert!(
+                                !shell.slash_command_catalog.is_empty(),
+                                "the first slash must insert a visible menu before the input"
+                            );
+                            shell.composer_focus_handle.focus(window);
+                            let before = shell.interaction.current_focus_epoch();
+                            let _ = shell.dispatch_action_for_test(
+                                crate::ui::components::ActionRequest::HostStatus,
+                            );
+                            assert_ne!(
+                                shell.interaction.current_focus_epoch(),
+                                before,
+                                "the regression requires a background focus-epoch advance"
+                            );
+                        });
+                        entity
+                    },
+                )
+                .expect("open hidden composer window");
+            let entity = window.entity(cx).expect("composer root entity");
+            let any_window = window.into();
+
+            cx.update_window(any_window, |_root, window, cx| {
+                assert!(
+                    window.dispatch_keystroke(Keystroke::parse("/").expect("slash key"), cx),
+                    "the first platform character must reach the composer"
+                );
+                assert!(
+                    window.dispatch_keystroke(Keystroke::parse("p").expect("p key"), cx),
+                    "the key after the slash-menu rerender must still reach the composer"
+                );
+            })
+            .expect("dispatch composer keys");
+
+            assert_eq!(
+                entity
+                    .read(cx)
+                    .composer
+                    .as_ref()
+                    .expect("bound composer")
+                    .draft_text(),
+                "/p"
+            );
+            completed_for_app.set(true);
+            cx.quit();
+        });
+        assert!(completed.get(), "hidden composer scenario completed");
+    }
+
+    #[test]
+    fn printable_composer_keys_reach_the_platform_text_input_handler() {
+        let source = include_str!("native_shell.rs");
+        let listener_start = source
+            .find("let key = cx.listener(|shell, event: &KeyDownEvent")
+            .expect("composer key listener");
+        let listener_end = source[listener_start..]
+            .find("let send = cx.listener")
+            .map(|offset| listener_start + offset)
+            .expect("composer send listener after key listener");
+        let listener = &source[listener_start..listener_end];
+        assert!(
+            !listener.contains("cx.stop_propagation()"),
+            "the listener must let printable keys reach GPUI's WM_CHAR/IME input path"
+        );
+        assert!(
+            source.contains("fn replace_text_in_range(")
+                && source.contains("self.replace_composer_platform_text(range_utf16, text)"),
+            "the registered EntityInputHandler must mutate the task draft"
+        );
+    }
+
+    #[test]
+    fn native_modal_backdrop_dims_without_hiding_the_cockpit() {
+        assert_eq!(NativeShell::modal_backdrop(), gpui::rgba(0x00000059));
+    }
+
+    #[test]
+    fn delayed_background_bootstrap_attaches_once_after_shell_is_usable() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::delayed_background_bootstrap_attaches_once_after_shell_is_usable",
+        ) {
+            return;
+        }
+        let workspace = tempfile::tempdir().expect("workspace");
+        let profile = isolated_dev_profile(workspace.path()).expect("profile");
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<()>(0);
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(0);
+        let permit = acquire_reaper_permit(ReaperKind::Worker).expect("bootstrap permit");
+        let handle = std::thread::spawn(move || {
+            let _ = ready_rx.recv();
+            let (runtime, _) = TestRuntime::new(true, NativeHostActionResult::Queued);
+            let _ = result_tx.send(Ok(NativeHostRuntimeAttachment::Injected(Box::new(runtime))));
+        });
+        let pending = PendingHostBootstrap {
+            result_rx: Some(result_rx),
+            worker: Some(OwnedWorker {
+                handle,
+                _permit: permit,
+            }),
+        };
+        let report_slot = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let report_slot_for_app = std::rc::Rc::clone(&report_slot);
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            let entity = cx.new(|cx| {
+                NativeShell::new_with_attachment_state_pending_and_preferences(
+                    profile,
+                    None,
+                    Some(pending),
+                    NativeHostState::Connecting,
+                    crate::ui::tokens::RuntimePreferencesSnapshot::default(),
+                    cx,
+                    false,
+                )
+            });
+            let before = entity.update(cx, |shell, _cx| {
+                let canvas = shell.main_conversation_canvas();
+                let inbox_items = shell
+                    .inbox_render_model(
+                        crate::ui::task_cockpit::inbox::InboxPresentationWidth::Regular,
+                    )
+                    .items
+                    .len();
+                let tree_name = shell.accessibility_tree().root().name().to_string();
+                (
+                    shell.host_state().clone(),
+                    shell.host_runtime.is_some(),
+                    canvas,
+                    inbox_items,
+                    tree_name,
+                )
+            });
+            let _ = ready_tx.send(());
+            let mut attached = false;
+            for _ in 0..200 {
+                attached = entity.update(cx, |shell, _cx| {
+                    let _ = shell.controller_tick_for_test(8);
+                    matches!(shell.host_state(), NativeHostState::Connected { .. })
+                        && shell.host_runtime.is_some()
+                });
+                if attached {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let after = entity.update(cx, |shell, _cx| {
+                let _ = shell.controller_tick_for_test(8);
+                (
+                    matches!(shell.host_state(), NativeHostState::Connected { .. }),
+                    shell.host_runtime.is_some(),
+                    shell.pending_bootstrap.is_none(),
+                )
+            });
+            *report_slot_for_app.borrow_mut() = Some((before, attached, after));
+            drop(entity);
+            cx.quit();
+        });
+        let (
+            (before_state, before_runtime, before_canvas, before_inbox_items, before_tree),
+            attached,
+            (connected, has_runtime, pending_cleared),
+        ) = report_slot.borrow_mut().take().expect("bootstrap report");
+        assert_eq!(before_state, NativeHostState::Connecting);
+        assert!(!before_runtime, "shell must open before attach");
+        assert!(
+            matches!(before_canvas, MainConversationCanvas::IdlePhoto { .. }),
+            "workspace conversation canvas must be usable before attach"
+        );
+        let _ = before_inbox_items;
+        assert_eq!(
+            before_tree, "DevManager",
+            "accessibility root must already be the native workspace shell"
+        );
+        assert!(attached, "delayed bootstrap must attach once");
+        assert!(connected);
+        assert!(has_runtime);
+        assert!(pending_cleared);
+    }
+
+    #[test]
+    fn host_actions_are_rejected_until_canonical_bootstrap() {
+        assert!(
+            !NativeHostClientRuntime::action_admission_allows_for(true, false),
+            "connected but not bootstrapped must reject via enqueue gate"
+        );
+        assert!(
+            NativeHostClientRuntime::action_admission_allows_for(true, true),
+            "canonical bootstrap admits actions via enqueue gate"
+        );
+        assert!(
+            !NativeHostClientRuntime::action_admission_allows_for(false, true),
+            "disconnected hosts still fail closed"
+        );
+        assert!(
+            !admits_host_actions(true, false),
+            "shared gate stays fail-closed"
+        );
+        assert!(
+            worker_should_run_deferred_bootstrap(false),
+            "background worker owns bootstrap after attach"
+        );
+        assert!(
+            !worker_should_run_deferred_bootstrap(true),
+            "canonical model ready means normal action admission"
+        );
+    }
+
+    #[test]
+    fn idle_photo_fetch_admission_is_oneshot_without_network() {
+        assert!(admit_idle_conversation_photo_fetch(
+            false, false, false, false
+        ));
+        assert!(!admit_idle_conversation_photo_fetch(
+            true, false, false, false
+        ));
+        assert!(!admit_idle_conversation_photo_fetch(
+            false, true, false, false
+        ));
+        assert!(!admit_idle_conversation_photo_fetch(
+            false, false, true, false
+        ));
+        assert!(!admit_idle_conversation_photo_fetch(
+            false, false, false, true
+        ));
+        // After a failed attempt the session flag stays set: no second fetch.
+        assert!(!admit_idle_conversation_photo_fetch(
+            false, false, true, false
+        ));
+    }
+
+    #[test]
+    fn idle_photo_decode_rejects_oversized_and_accepts_tiny() {
+        let mut tiny = image::RgbaImage::new(2, 2);
+        for pixel in tiny.chunks_exact_mut(4) {
+            pixel.copy_from_slice(&[0x10, 0x20, 0x30, 0xff]);
+        }
+        let mut tiny_bytes = Vec::new();
+        image::DynamicImage::ImageRgba8(tiny)
+            .write_to(
+                &mut std::io::Cursor::new(&mut tiny_bytes),
+                image::ImageFormat::Png,
+            )
+            .expect("encode tiny png");
+        assert!(
+            decode_idle_conversation_photo_bytes(&tiny_bytes).is_some(),
+            "tiny png must decode"
+        );
+        assert!(!idle_photo_dimensions_allowed(0, 1));
+        assert!(!idle_photo_dimensions_allowed(1, 0));
+        assert!(!idle_photo_dimensions_allowed(4097, 1));
+        assert!(!idle_photo_dimensions_allowed(1, 4097));
+        assert!(!idle_photo_dimensions_allowed(4096, 4096));
+        assert!(idle_photo_dimensions_allowed(2, 2));
+        // PNM header carries oversized dimensions without allocating a bitmap.
+        let oversized = b"P6\n5000 5000\n255\n";
+        assert!(
+            decode_idle_conversation_photo_bytes(oversized).is_none(),
+            "oversized header must fail closed before bitmap allocation"
+        );
+    }
+
+    #[test]
+    fn invalid_host_projection_payloads_fail_closed_without_applying() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::invalid_host_projection_payloads_fail_closed_without_applying",
+        ) {
+            return;
+        }
+        use crate::client::{ClientModelBuilder, TaskInboxPreview};
+        use crate::domain::id::{EnvironmentId, ProjectId, SnapshotId, TaskId};
+        use crate::domain::snapshot::{
+            SnapshotItem, SnapshotPage, SnapshotSection, TaskSnapshotItem,
+        };
+        use crate::domain::task::{
+            ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity,
+            TaskFacts, TaskLifecycle, WorkspaceRef,
+        };
+        use std::sync::Arc;
+
+        let task = TaskId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x61,
+        ])
+        .expect("task");
+        let snap = SnapshotId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x60,
+        ])
+        .expect("snap");
+        let mut builder = ClientModelBuilder::new();
+        builder
+            .ingest_page(SnapshotPage {
+                snapshot_id: snap,
+                through_sequence: 3,
+                section: SnapshotSection::Tasks,
+                after_item: None,
+                items: vec![SnapshotItem::Task(TaskSnapshotItem {
+                    task: TaskFacts {
+                        id: task,
+                        environment_id: EnvironmentId::from_bytes([
+                            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00,
+                            0x00, 0x00, 0x00, 0x10,
+                        ])
+                        .expect("env"),
+                        title: "Invalid payload".into(),
+                        description: None,
+                        project_id: ProjectId::from_bytes([
+                            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00,
+                            0x00, 0x00, 0x00, 0x11,
+                        ])
+                        .expect("project"),
+                        workspace: WorkspaceRef::Main,
+                        assignment: TaskAssignment::LocalOwner,
+                        lifecycle: TaskLifecycle::Open,
+                        action_epoch: 1,
+                        revision: 1,
+                        created_at_ms: 1,
+                    },
+                    connectivity: TaskConnectivity::Connected,
+                    attention: TaskAttention::None,
+                    activity: TaskActivity::Idle,
+                    review_readiness: ReviewReadiness::NotReady,
+                    primary_agent_id: None,
+                })],
+                encoded_bytes: 1,
+                next_cursor: None,
+            })
+            .expect("tasks");
+        let preview = Arc::new(builder.finish_tasks_preview().expect("preview"));
+        let invalid_task_preview = NativeHostProjection {
+            kind: NativeHostProjectionKind::TaskPreview,
+            client_model: None,
+            task_preview: None,
+            error: None,
+            epochs: None,
+            action_outcome: None,
+        };
+        let invalid_snapshot = NativeHostProjection {
+            kind: NativeHostProjectionKind::Snapshot,
+            client_model: None,
+            task_preview: Some(Arc::clone(&preview)),
+            error: None,
+            epochs: None,
+            action_outcome: None,
+        };
+        assert!(validate_host_projection_payloads(&invalid_task_preview).is_err());
+        assert!(validate_host_projection_payloads(&invalid_snapshot).is_err());
+        assert!(
+            validate_host_projection_payloads(&NativeHostProjection::task_preview(Arc::clone(
+                &preview
+            )))
+            .is_ok()
+        );
+
+        let workspace = tempfile::tempdir().expect("workspace");
+        let profile = isolated_dev_profile(workspace.path()).expect("profile");
+        let (runtime, shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        shared
+            .lock()
+            .expect("state")
+            .projections
+            .push_back(invalid_task_preview);
+        shared
+            .lock()
+            .expect("state")
+            .projections
+            .push_back(invalid_snapshot);
+        let report_slot = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let report_slot_for_app = std::rc::Rc::clone(&report_slot);
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            let entity = cx.new(|cx| {
+                NativeShell::new_with_host_runtime_port(
+                    profile,
+                    Box::new(runtime),
+                    crate::ui::tokens::RuntimePreferencesSnapshot::default(),
+                    cx,
+                )
+            });
+            let report = entity.update(cx, |shell, _cx| {
+                let kinds = shell.drain_host_projections(8);
+                (
+                    kinds,
+                    shell.client_model_snapshot().is_some(),
+                    shell.mutations_enabled(),
+                    shell.task_list_ids().is_empty(),
+                    matches!(shell.host_state(), NativeHostState::Error { .. }),
+                )
+            });
+            *report_slot_for_app.borrow_mut() = Some(report);
+            drop(entity);
+            cx.quit();
+        });
+        let (kinds, has_model, mutations, empty_tasks, errored) = report_slot
+            .borrow_mut()
+            .take()
+            .expect("invalid payload report");
+        assert_eq!(
+            kinds,
+            vec![
+                NativeHostProjectionKind::TaskPreview,
+                NativeHostProjectionKind::Snapshot
+            ]
+        );
+        assert!(!has_model);
+        assert!(!mutations);
+        assert!(empty_tasks, "invalid payloads must not apply preview rows");
+        assert!(
+            errored,
+            "invalid payloads must surface a bounded host error"
+        );
+    }
+
+    #[test]
+    fn task_preview_projection_never_binds_client_model() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::task_preview_projection_never_binds_client_model",
+        ) {
+            return;
+        }
+        use crate::client::{ClientModelBuilder, TaskInboxPreview};
+        use crate::domain::id::{EnvironmentId, ProjectId, SnapshotId, TaskId};
+        use crate::domain::snapshot::{
+            SnapshotItem, SnapshotPage, SnapshotSection, TaskSnapshotItem,
+        };
+        use crate::domain::task::{
+            ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity,
+            TaskFacts, TaskLifecycle, WorkspaceRef,
+        };
+        use std::sync::Arc;
+
+        let first = TaskId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x51,
+        ])
+        .expect("task");
+        let second = TaskId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x52,
+        ])
+        .expect("task");
+        let snap = SnapshotId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x50,
+        ])
+        .expect("snap");
+        let mut builder = ClientModelBuilder::new();
+        builder
+            .ingest_page(SnapshotPage {
+                snapshot_id: snap,
+                through_sequence: 3,
+                section: SnapshotSection::Tasks,
+                after_item: None,
+                items: vec![
+                    SnapshotItem::Task(TaskSnapshotItem {
+                        task: TaskFacts {
+                            id: first,
+                            environment_id: EnvironmentId::from_bytes([
+                                0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00,
+                                0x00, 0x00, 0x00, 0x00, 0x10,
+                            ])
+                            .expect("env"),
+                            title: "Preview A".into(),
+                            description: None,
+                            project_id: ProjectId::from_bytes([
+                                0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00,
+                                0x00, 0x00, 0x00, 0x00, 0x11,
+                            ])
+                            .expect("project"),
+                            workspace: WorkspaceRef::Main,
+                            assignment: TaskAssignment::LocalOwner,
+                            lifecycle: TaskLifecycle::Open,
+                            action_epoch: 1,
+                            revision: 1,
+                            created_at_ms: 1,
+                        },
+                        connectivity: TaskConnectivity::Connected,
+                        attention: TaskAttention::None,
+                        activity: TaskActivity::Idle,
+                        review_readiness: ReviewReadiness::NotReady,
+                        primary_agent_id: None,
+                    }),
+                    SnapshotItem::Task(TaskSnapshotItem {
+                        task: TaskFacts {
+                            id: second,
+                            environment_id: EnvironmentId::from_bytes([
+                                0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00,
+                                0x00, 0x00, 0x00, 0x00, 0x10,
+                            ])
+                            .expect("env"),
+                            title: "Preview B".into(),
+                            description: None,
+                            project_id: ProjectId::from_bytes([
+                                0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00,
+                                0x00, 0x00, 0x00, 0x00, 0x11,
+                            ])
+                            .expect("project"),
+                            workspace: WorkspaceRef::Main,
+                            assignment: TaskAssignment::LocalOwner,
+                            lifecycle: TaskLifecycle::Open,
+                            action_epoch: 1,
+                            revision: 1,
+                            created_at_ms: 2,
+                        },
+                        connectivity: TaskConnectivity::Connected,
+                        attention: TaskAttention::None,
+                        activity: TaskActivity::Idle,
+                        review_readiness: ReviewReadiness::NotReady,
+                        primary_agent_id: None,
+                    }),
+                ],
+                encoded_bytes: 1,
+                next_cursor: None,
+            })
+            .expect("tasks page");
+        let preview: Arc<TaskInboxPreview> =
+            Arc::new(builder.finish_tasks_preview().expect("preview"));
+        let projection = NativeHostProjection::task_preview(Arc::clone(&preview));
+        assert!(projection.client_model.is_none());
+        assert!(projection.task_preview.is_some());
+
+        let workspace = tempfile::tempdir().expect("workspace");
+        let profile = isolated_dev_profile(workspace.path()).expect("profile");
+        let (runtime, shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        shared
+            .lock()
+            .expect("state")
+            .projections
+            .push_back(projection);
+        let report_slot = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let report_slot_for_app = std::rc::Rc::clone(&report_slot);
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            let entity = cx.new(|cx| {
+                NativeShell::new_with_host_runtime_port(
+                    profile,
+                    Box::new(runtime),
+                    crate::ui::tokens::RuntimePreferencesSnapshot::default(),
+                    cx,
+                )
+            });
+            let after_preview = entity.update(cx, |shell, _cx| {
+                let kinds = shell.drain_host_projections(8);
+                (
+                    kinds,
+                    shell.client_model_snapshot().is_some(),
+                    shell.mutations_enabled(),
+                    shell.task_list_ids(),
+                )
+            });
+            *report_slot_for_app.borrow_mut() = Some(after_preview);
+            drop(entity);
+            cx.quit();
+        });
+        let (kinds, has_model, mutations, ids) =
+            report_slot.borrow_mut().take().expect("preview report");
+        assert_eq!(kinds, vec![NativeHostProjectionKind::TaskPreview]);
+        assert!(!has_model);
+        assert!(!mutations);
+        assert_eq!(ids, vec![first, second]);
     }
 }
 

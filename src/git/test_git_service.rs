@@ -522,7 +522,12 @@ fn unstage_plan_only_removes_the_requested_index_entry() {
         .expect("unstage plan");
     let confirmation = confirm(&repo, &plan);
     repo.unstage(&plan, &confirmation)
-        .expect("selective unstage");
+        .unwrap_or_else(|error| match error {
+            GitError::InvalidRepositoryRoot { reason, .. } => {
+                panic!("selective unstage: {reason}")
+            }
+            error => panic!("selective unstage: {error}"),
+        });
     let status = repo.status().expect("status after");
     assert_eq!(
         status.entry("a.txt").expect("a status").index,
@@ -537,6 +542,35 @@ fn unstage_plan_only_removes_the_requested_index_entry() {
         FileState::Modified
     );
 }
+
+#[test]
+fn unstage_before_the_first_commit_removes_only_the_index_entry() {
+    let repo_dir = init_repo();
+    fs::write(repo_dir.path().join("a.txt"), "new file\n").expect("write new file");
+    let repo = GitRepository::test_open(repo_dir.path()).expect("open repository");
+    let stage = repo
+        .plan_stage(&[RepoPath::from("a.txt")])
+        .expect("stage plan");
+    repo.stage(&stage, &confirm(&repo, &stage)).expect("stage");
+
+    let unstage = repo
+        .plan_unstage(&[RepoPath::from("a.txt")])
+        .expect("unstage plan");
+    assert_eq!(unstage.arguments().first().map(String::as_str), Some("rm"));
+    repo.unstage(&unstage, &confirm(&repo, &unstage))
+        .unwrap_or_else(|error| match error {
+            GitError::InvalidRepositoryRoot { reason, .. } => {
+                panic!("unstage before first commit: {reason}")
+            }
+            error => panic!("unstage before first commit: {error}"),
+        });
+
+    let status = repo.status().expect("status after unstage");
+    let entry = status.entry("a.txt").expect("untracked worktree file");
+    assert_eq!(entry.index, FileState::Unchanged);
+    assert_eq!(entry.kind, StatusKind::Untracked);
+}
+
 #[test]
 fn expected_fingerprint_rejects_external_drift_before_stage() {
     let repo_dir = init_repo();
@@ -858,7 +892,12 @@ fn pull_request_plan_is_provider_typed_and_dry_by_construction() {
             "Ship the change",
             "Body stays in the typed invocation.",
         )
-        .expect("pull request plan");
+        .unwrap_or_else(|error| match error {
+            GitError::InvalidRepositoryRoot { reason, .. } => {
+                panic!("pull request plan: {reason}")
+            }
+            error => panic!("pull request plan: {error}"),
+        });
     assert_eq!(plan.provider, PullRequestProvider::GitHub);
     assert_eq!(plan.executable(), "gh");
     assert_eq!(plan.workspace().cwd(), repo.root());
@@ -1229,11 +1268,21 @@ fn linked_worktree_allows_normal_stage_and_commit_transitions() {
     fs::write(linked.join("linked.txt"), "linked\n").expect("write linked change");
     let stage = repository
         .plan_stage(&[RepoPath::from("linked.txt")])
-        .expect("plan linked stage");
+        .unwrap_or_else(|error| match error {
+            GitError::InvalidRepositoryRoot { reason, .. } => {
+                panic!("plan linked stage: {reason}")
+            }
+            error => panic!("plan linked stage: {error}"),
+        });
     let confirmation = confirm(&repository, &stage);
     repository
         .stage(&stage, &confirmation)
-        .expect("stage linked file");
+        .unwrap_or_else(|error| match error {
+            GitError::InvalidRepositoryRoot { reason, .. } => {
+                panic!("stage linked file: {reason}")
+            }
+            error => panic!("stage linked file: {error}"),
+        });
 
     let commit = repository
         .plan_commit("linked commit")
@@ -1397,6 +1446,7 @@ fn production_host_issuer_confirms_and_executes_stage_unstage_commit_when_fence_
         .expect("tracked")
         .is_staged());
 
+    let repo = issued_production_host_repository(repo_dir.path(), 2, 1);
     let unstage = repo
         .plan_unstage(&[RepoPath::from("tracked.txt")])
         .expect("unstage plan");
@@ -1404,7 +1454,12 @@ fn production_host_issuer_confirms_and_executes_stage_unstage_commit_when_fence_
         .host_confirm(&unstage)
         .expect("production host issuer must confirm the exact unstage plan");
     repo.unstage(&unstage, &confirmation)
-        .expect("confirmed host unstage must execute");
+        .unwrap_or_else(|error| match error {
+            GitError::InvalidRepositoryRoot { reason, .. } => {
+                panic!("confirmed host unstage must execute: {reason}")
+            }
+            error => panic!("confirmed host unstage must execute: {error}"),
+        });
     assert!(!repo
         .status()
         .expect("status after unstage")
@@ -1412,17 +1467,24 @@ fn production_host_issuer_confirms_and_executes_stage_unstage_commit_when_fence_
         .expect("tracked")
         .is_staged());
 
+    let repo = issued_production_host_repository(repo_dir.path(), 3, 1);
     let stage = repo
         .plan_stage(&[RepoPath::from("tracked.txt")])
         .expect("stage before commit");
     repo.stage(&stage, &repo.host_confirm(&stage).expect("confirm restage"))
         .expect("restage");
+    let repo = issued_production_host_repository(repo_dir.path(), 4, 1);
     let commit = repo.plan_commit("host issuer commit").expect("commit plan");
     let confirmation = repo
         .host_confirm(&commit)
         .expect("production host issuer must confirm the exact commit plan");
     repo.commit(&commit, &confirmation)
-        .expect("confirmed host commit must execute");
+        .unwrap_or_else(|error| match error {
+            GitError::InvalidRepositoryRoot { reason, .. } => {
+                panic!("confirmed host commit must execute: {reason}")
+            }
+            error => panic!("confirmed host commit must execute: {error}"),
+        });
     assert!(repo
         .status()
         .expect("status after commit")
@@ -1687,7 +1749,15 @@ fn host_issuer_rejects_traversal_raw_path_and_unsupported_capability() {
         "a raw absolute path must not become a mutation plan"
     );
 
-    let test_repo = GitRepository::test_open(repo_dir.path()).expect("open test repository");
+    // Keep the fixture-authority check on a separate repository. A second Git
+    // client can legitimately refresh mutable index metadata; doing that on
+    // the host-bound repository would (correctly) stale its retained graph
+    // identity before the capability check below.
+    let test_repo_dir = init_repo();
+    commit_initial(test_repo_dir.path(), "tracked.txt", "tracked\n");
+    fs::write(test_repo_dir.path().join("tracked.txt"), "changed\n")
+        .expect("change test-fixture tracked file");
+    let test_repo = GitRepository::test_open(test_repo_dir.path()).expect("open test repository");
     let plan = test_repo
         .plan_stage(&[RepoPath::from("tracked.txt")])
         .expect("test stage plan");

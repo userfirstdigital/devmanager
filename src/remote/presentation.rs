@@ -14,7 +14,6 @@ const DEFAULT_VERBOSE_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_STORE_SESSIONS: usize = 256;
 const DEFAULT_STORE_BYTES: usize = 128 * 1024 * 1024;
 pub(crate) const MAX_SEMANTIC_EVENT_BYTES: usize = 64 * 1024;
-const AI_FALLBACK_SCREEN_DEDUP_KEY: &str = "ai-screen-fallback";
 const AI_FALLBACK_MAX_CHARS: usize = 12_288;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -642,7 +641,6 @@ pub struct SemanticJournalStore {
     sessions: HashMap<StableSessionKey, StoredSessionJournal>,
     session_bindings: HashMap<String, SessionBinding>,
     projectors: HashMap<String, PlainTextProjector>,
-    screen_projectors: HashMap<String, AiScreenProjector>,
 }
 
 impl Default for SemanticJournalStore {
@@ -668,7 +666,6 @@ impl SemanticJournalStore {
             sessions: HashMap::new(),
             session_bindings: HashMap::new(),
             projectors: HashMap::new(),
-            screen_projectors: HashMap::new(),
         }
     }
 
@@ -757,44 +754,30 @@ impl SemanticJournalStore {
         &mut self,
         session_id: &str,
         bytes: &[u8],
-        screen: Option<&TerminalScreenSnapshot>,
+        _screen: Option<&TerminalScreenSnapshot>,
         occurred_at_epoch_ms: u64,
     ) -> bool {
         let Some(binding) = self.session_bindings.get(session_id).cloned() else {
             return false;
         };
-        let uses_screen_projection = matches!(
+        let uses_ai_raw_screen = matches!(
             binding.source,
             SemanticSource::Claude | SemanticSource::Codex
         );
-        // Always project AI screens when a snapshot is available. Visibility is
-        // gated in AiSessionView via includeFallbackOutput={adapterHealth !==
-        // "healthy"}; keeping the replacing snapshot current means a health drop
-        // immediately has a fresh fallback rather than waiting for the next chunk.
-        let (text, deduplication_key) = if uses_screen_projection {
-            let Some(screen) = screen else {
-                return false;
-            };
-            let Some(text) = self
-                .screen_projectors
-                .entry(session_id.to_string())
-                .or_default()
-                .project(screen)
-            else {
-                return false;
-            };
-            (text, Some(AI_FALLBACK_SCREEN_DEDUP_KEY.to_string()))
-        } else {
-            let text = self
-                .projectors
-                .entry(session_id.to_string())
-                .or_default()
-                .push(bytes);
-            if text.is_empty() {
-                return false;
-            }
-            (text, None)
-        };
+        // Raw Claude/Codex PTY screens stay in Terminal only. Never record AI
+        // Output fallback facts into the semantic journal; conversation truth
+        // comes from AssistantMessage and other semantic events.
+        if uses_ai_raw_screen {
+            return false;
+        }
+        let text = self
+            .projectors
+            .entry(session_id.to_string())
+            .or_default()
+            .push(bytes);
+        if text.is_empty() {
+            return false;
+        }
         self.record(SemanticEventDraft {
             stable_session_key: binding.key,
             occurred_at_epoch_ms,
@@ -804,7 +787,7 @@ impl SemanticJournalStore {
                 text,
             },
             retention: SemanticRetention::Verbose,
-            deduplication_key,
+            deduplication_key: None,
         });
         true
     }
@@ -986,7 +969,6 @@ impl SemanticJournalStore {
 
     pub fn remove_session_binding(&mut self, session_id: &str) -> Option<StableSessionKey> {
         self.projectors.remove(session_id);
-        self.screen_projectors.remove(session_id);
         let key = self
             .session_bindings
             .remove(session_id)
@@ -1139,7 +1121,6 @@ impl SemanticJournalStore {
         for session_id in removed_session_ids {
             self.session_bindings.remove(&session_id);
             self.projectors.remove(&session_id);
-            self.screen_projectors.remove(&session_id);
         }
     }
 }
@@ -1223,27 +1204,6 @@ impl PlainTextProjector {
         };
         self.parser.advance(&mut collector, bytes);
         collector.output
-    }
-}
-
-#[derive(Debug, Default)]
-struct AiScreenProjector {
-    last_projection: Option<String>,
-}
-
-impl AiScreenProjector {
-    fn project(&mut self, screen: &TerminalScreenSnapshot) -> Option<String> {
-        let text = project_terminal_screen(screen);
-        if self.last_projection.as_deref() == Some(text.as_str()) {
-            return None;
-        }
-        // Initial blank/cleared frames stay silent; a later clear after content
-        // emits one empty replacement so clients can drop the prior fallback.
-        if text.is_empty() && self.last_projection.is_none() {
-            return None;
-        }
-        self.last_projection = Some(text.clone());
-        Some(text)
     }
 }
 
@@ -1444,8 +1404,7 @@ mod tests {
     use crate::models::{SessionTab, TabType};
     use crate::state::{SessionKind, SessionRuntimeState};
     use crate::terminal::session::{
-        TerminalBackend, TerminalCellSnapshot, TerminalModeSnapshot, TerminalReplica,
-        TerminalScreenSnapshot,
+        TerminalBackend, TerminalCellSnapshot, TerminalModeSnapshot, TerminalScreenSnapshot,
     };
     use std::path::PathBuf;
 
@@ -1514,27 +1473,6 @@ mod tests {
         runtime.session_kind = SessionKind::Claude;
         runtime.tab_id = Some(tab_id.to_string());
         assert!(store.observe_runtime(&runtime, &[], 1));
-    }
-
-    fn screen_after_bytes(chunks: &[&[u8]]) -> TerminalScreenSnapshot {
-        let dimensions = crate::state::SessionDimensions {
-            cols: 40,
-            rows: 12,
-            cell_width: 8,
-            cell_height: 16,
-        };
-        let mut runtime = SessionRuntimeState::new(
-            "projector",
-            PathBuf::new(),
-            dimensions,
-            TerminalBackend::default(),
-        );
-        runtime.session_kind = SessionKind::Claude;
-        let replica = TerminalReplica::from_bootstrap("projector", runtime, &[]);
-        for chunk in chunks {
-            replica.apply_output_bytes(chunk);
-        }
-        replica.view().expect("replica view").screen
     }
 
     fn output_texts(store: &SemanticJournalStore, key: &StableSessionKey) -> Vec<String> {
@@ -2164,7 +2102,7 @@ mod tests {
     }
 
     #[test]
-    fn journal_store_tracks_runtime_output_and_session_metadata() {
+    fn journal_store_tracks_ai_runtime_metadata_without_raw_output() {
         let mut runtime = SessionRuntimeState::new(
             "pty-ephemeral",
             PathBuf::new(),
@@ -2186,22 +2124,23 @@ mod tests {
 
         assert!(store.observe_runtime(&runtime, &tabs, 100));
         let screen = screen_from_lines(&["hello"]);
-        assert!(store.observe_output("pty-ephemeral", b"\x1b[31mhello\x1b[0m", Some(&screen), 101));
+        assert!(!store.observe_output(
+            "pty-ephemeral",
+            b"\x1b[31mhello\x1b[0m",
+            Some(&screen),
+            101
+        ));
 
         let metadata = store.metadata(&key).expect("session metadata");
-        assert_eq!(metadata.last_activity_epoch_ms, Some(101));
+        assert_eq!(metadata.last_activity_epoch_ms, Some(100));
         assert_eq!(metadata.attention, SemanticAttention::Unread);
         assert_eq!(metadata.attention_count, 2);
         assert_eq!(metadata.adapter_health, SemanticAdapterHealth::Degraded);
         let replay = store.replay_after(&key, 0).expect("session replay");
-        assert!(replay.events.iter().any(|event| matches!(
-            &event.kind,
-            SemanticEventKind::Output { text, .. } if text == "hello"
-        )));
-        assert!(replay.events.iter().any(|event| {
-            matches!(&event.kind, SemanticEventKind::Output { .. })
-                && event.replaces_sequence.is_none()
-        }));
+        assert!(replay
+            .events
+            .iter()
+            .all(|event| !matches!(event.kind, SemanticEventKind::Output { .. })));
     }
 
     #[test]
@@ -2418,7 +2357,6 @@ mod tests {
         assert!(store.retained_bytes() <= 2 * 1024);
         assert!(store.session_bindings.is_empty());
         assert!(store.projectors.is_empty());
-        assert!(store.screen_projectors.is_empty());
         assert!(store
             .metadata(&StableSessionKey::from_server("command-23"))
             .is_some());
@@ -2739,143 +2677,6 @@ mod tests {
     }
 
     #[test]
-    fn degraded_ai_screen_redraw_replaces_in_progress_output() {
-        let mut store = SemanticJournalStore::default();
-        bind_ai_session(&mut store, "ai-pty", "ai-tab");
-        let key = StableSessionKey::from_tab("ai-tab");
-
-        let first = screen_after_bytes(&[b"draft answer v1"]);
-        assert!(store.observe_output("ai-pty", b"draft answer v1", Some(&first), 10));
-        let second = screen_after_bytes(&[b"draft answer v1", b"\rdraft answer v2"]);
-        assert!(store.observe_output("ai-pty", b"\rdraft answer v2", Some(&second), 11));
-        let third = screen_after_bytes(&[
-            b"draft answer v1",
-            b"\rdraft answer v2",
-            b"\x1b[2J\x1b[Hfinal answer",
-        ]);
-        assert!(store.observe_output("ai-pty", b"\x1b[2J\x1b[Hfinal answer", Some(&third), 12));
-
-        let replay = store.replay_after(&key, 0).expect("replay");
-        let output_events = replay
-            .events
-            .iter()
-            .filter(|event| matches!(event.kind, SemanticEventKind::Output { .. }))
-            .cloned()
-            .collect::<Vec<_>>();
-        assert!(
-            output_events.len() <= 2,
-            "fallback redraws must stay replacement-chained, got {}",
-            output_events.len()
-        );
-        let mut visible = std::collections::BTreeSet::new();
-        for event in &output_events {
-            if let Some(replaced) = event.replaces_sequence {
-                visible.remove(&replaced);
-            }
-            visible.insert(event.sequence);
-        }
-        assert_eq!(visible.len(), 1);
-        let final_text = output_events
-            .iter()
-            .find(|event| visible.contains(&event.sequence))
-            .and_then(|event| match &event.kind {
-                SemanticEventKind::Output { text, .. } => Some(text.as_str()),
-                _ => None,
-            })
-            .expect("final fallback");
-        assert!(final_text.contains("final answer"));
-        assert!(!final_text.contains("draft answer v1"));
-    }
-
-    #[test]
-    fn degraded_ai_cursor_up_redraw_replaces_instead_of_appending() {
-        let mut store = SemanticJournalStore::default();
-        bind_ai_session(&mut store, "ai-pty", "ai-tab");
-        let key = StableSessionKey::from_tab("ai-tab");
-
-        let first = screen_after_bytes(&[b"line-one\nline-two"]);
-        assert!(store.observe_output("ai-pty", b"line-one\nline-two", Some(&first), 10));
-        let redraw = screen_after_bytes(&[b"line-one\nline-two", b"\x1b[1A\rline-ONE"]);
-        assert!(store.observe_output("ai-pty", b"\x1b[1A\rline-ONE", Some(&redraw), 11));
-
-        let outputs = output_texts(&store, &key);
-        assert_eq!(outputs.len(), 1);
-        assert!(outputs[0].contains("line-ONE"));
-        assert!(outputs[0].contains("line-two"));
-        assert_eq!(outputs[0].matches("line-one").count(), 0);
-    }
-
-    #[test]
-    fn degraded_ai_carriage_return_progress_keeps_latest_frame() {
-        let mut store = SemanticJournalStore::default();
-        bind_ai_session(&mut store, "ai-pty", "ai-tab");
-        let key = StableSessionKey::from_tab("ai-tab");
-
-        let first = screen_after_bytes(&[b"progress 10%"]);
-        assert!(store.observe_output("ai-pty", b"progress 10%", Some(&first), 10));
-        let second = screen_after_bytes(&[b"progress 10%", b"\rprogress 100%\n"]);
-        assert!(store.observe_output("ai-pty", b"\rprogress 100%\n", Some(&second), 11));
-
-        let outputs = output_texts(&store, &key);
-        assert_eq!(outputs, vec!["progress 100%".to_string()]);
-    }
-
-    #[test]
-    fn degraded_ai_blank_or_unchanged_screen_emits_no_event() {
-        let mut store = SemanticJournalStore::default();
-        bind_ai_session(&mut store, "ai-pty", "ai-tab");
-        let key = StableSessionKey::from_tab("ai-tab");
-
-        let blank = screen_from_lines(&["", "   ", ""]);
-        assert!(!store.observe_output("ai-pty", b"\x1b[2J", Some(&blank), 10));
-        assert!(output_texts(&store, &key).is_empty());
-
-        let screen = screen_from_lines(&["stable"]);
-        assert!(store.observe_output("ai-pty", b"stable", Some(&screen), 11));
-        assert!(!store.observe_output("ai-pty", b"stable", Some(&screen), 12));
-        assert_eq!(output_texts(&store, &key), vec!["stable".to_string()]);
-    }
-
-    #[test]
-    fn cleared_ai_screen_replaces_prior_fallback_with_empty_output() {
-        let mut store = SemanticJournalStore::default();
-        bind_ai_session(&mut store, "ai-pty", "ai-tab");
-        let key = StableSessionKey::from_tab("ai-tab");
-
-        let screen = screen_from_lines(&["visible fallback"]);
-        assert!(store.observe_output("ai-pty", b"visible fallback", Some(&screen), 10));
-        let blank = screen_from_lines(&["", "   ", ""]);
-        assert!(store.observe_output("ai-pty", b"\x1b[2J", Some(&blank), 11));
-        assert!(!store.observe_output("ai-pty", b"\x1b[2J", Some(&blank), 12));
-
-        let replay = store.replay_after(&key, 0).expect("replay");
-        let output_events = replay
-            .events
-            .iter()
-            .filter(|event| matches!(event.kind, SemanticEventKind::Output { .. }))
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut visible = std::collections::BTreeSet::new();
-        for event in &output_events {
-            if let Some(replaced) = event.replaces_sequence {
-                visible.remove(&replaced);
-            }
-            visible.insert(event.sequence);
-        }
-        assert_eq!(visible.len(), 1);
-        let final_text = output_events
-            .iter()
-            .find(|event| visible.contains(&event.sequence))
-            .and_then(|event| match &event.kind {
-                SemanticEventKind::Output { text, .. } => Some(text.as_str()),
-                _ => None,
-            })
-            .expect("final fallback");
-        assert_eq!(final_text, "");
-        assert!(!final_text.contains("visible fallback"));
-    }
-
-    #[test]
     fn ai_output_without_screen_does_not_append_byte_dumps() {
         let mut store = SemanticJournalStore::default();
         bind_ai_session(&mut store, "ai-pty", "ai-tab");
@@ -2908,17 +2709,65 @@ mod tests {
     }
 
     #[test]
-    fn removing_ai_session_clears_screen_projector_state() {
+    fn ai_raw_screen_output_is_not_recorded_as_conversation() {
         let mut store = SemanticJournalStore::default();
         bind_ai_session(&mut store, "ai-pty", "ai-tab");
-        let screen = screen_from_lines(&["one"]);
-        assert!(store.observe_output("ai-pty", b"one", Some(&screen), 2));
-        assert!(store.screen_projectors.contains_key("ai-pty"));
+        let key = StableSessionKey::from_tab("ai-tab");
+        let screen = screen_from_lines(&["visible fallback"]);
 
-        assert_eq!(
-            store.remove_session_binding("ai-pty"),
-            Some(StableSessionKey::from_tab("ai-tab"))
+        assert!(
+            !store.observe_output("ai-pty", b"visible fallback", Some(&screen), 10),
+            "AI raw PTY screens must stay out of the semantic journal"
         );
-        assert!(!store.screen_projectors.contains_key("ai-pty"));
+        assert!(
+            output_texts(&store, &key).is_empty(),
+            "AI Output facts must not be recorded"
+        );
+
+        store.record(SemanticEventDraft {
+            stable_session_key: key.clone(),
+            occurred_at_epoch_ms: 11,
+            source: SemanticSource::Claude,
+            kind: SemanticEventKind::AssistantMessage {
+                message_id: "msg-1".into(),
+                text: "semantic assistant reply".into(),
+                streaming: false,
+            },
+            retention: SemanticRetention::Canonical,
+            deduplication_key: None,
+        });
+        let replay = store.replay_after(&key, 0).expect("replay");
+        assert!(
+            replay.events.iter().any(|event| matches!(
+                &event.kind,
+                SemanticEventKind::AssistantMessage { text, .. }
+                    if text == "semantic assistant reply"
+            )),
+            "semantic AssistantMessage must remain"
+        );
+        assert!(
+            !replay
+                .events
+                .iter()
+                .any(|event| matches!(event.kind, SemanticEventKind::Output { .. })),
+            "no AI Output events may remain in the journal"
+        );
+
+        let mut shell = SemanticJournalStore::default();
+        let mut runtime = SessionRuntimeState::new(
+            "shell-pty",
+            PathBuf::new(),
+            Default::default(),
+            TerminalBackend::default(),
+        );
+        runtime.session_kind = SessionKind::Shell;
+        runtime.command_id = Some("shell-command".to_string());
+        assert!(shell.observe_runtime(&runtime, &[], 1));
+        let shell_key = StableSessionKey::from_server("shell-command");
+        assert!(shell.observe_output("shell-pty", b"shell line\n", None, 2));
+        assert_eq!(
+            output_texts(&shell, &shell_key),
+            vec!["shell line\n".to_string()]
+        );
     }
 }

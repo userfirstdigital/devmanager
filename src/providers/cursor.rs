@@ -336,7 +336,6 @@ mod tests {
     };
     use crate::providers::capabilities::{ProviderExecutable, ProviderExecutableHandle};
     use crate::providers::test_support::{executable as test_executable, TestExecutableSlot};
-    use std::path::Path;
 
     const PINNED_VERSION: &[u8] =
         include_bytes!("../../tests/fixtures/providers/cursor/version.txt");
@@ -417,7 +416,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             fresh.executable().canonical_path(),
-            Path::new("C:/bin/cursor-agent")
+            executable.executable().canonical_path()
         );
         assert_eq!(fresh.arguments().count(), 0);
 

@@ -26,6 +26,7 @@ use crate::git::command::{
 };
 use crate::git::model::{MutationPlan, RepoPath, StatusKind};
 use crate::kernel::CommandBus;
+use crate::protocol::Capability;
 use crate::protocol::CapabilitySet;
 use crate::services::model::AdmissionFence;
 use crate::services::supervisor::{
@@ -37,13 +38,13 @@ use crate::ssh::{
     SshRuntimeSnapshot, SshTaskIdentity,
 };
 use crate::workspace::files::{
-    ContentKind, EntryKind, ExpectedRevision, FileServiceError, ReadOptions, SecretClassification,
-    MAX_CHUNK_BYTES,
+    ContentKind, EntryKind, ExpectedRevision, FilePageRequest, FileServiceError, ReadOptions,
+    SecretClassification, MAX_CHUNK_BYTES,
 };
 use crate::workspace::worktree::{revalidate_cockpit_workspace_action, WorkspaceActionContext};
 use crate::workspace::{
-    issue_file_service, WorkspaceAuthorization, WorkspaceProjectRoots, WorkspaceResource,
-    WorkspaceResourceCoordinator, WorkspaceResourceLease, WorkspaceService,
+    issue_file_service, issue_read_file_service, WorkspaceAuthorization, WorkspaceProjectRoots,
+    WorkspaceResource, WorkspaceResourceCoordinator, WorkspaceResourceLease, WorkspaceService,
 };
 
 pub(crate) struct TaskCockpitDispatch<'a> {
@@ -55,6 +56,8 @@ pub(crate) struct TaskCockpitDispatch<'a> {
     pub query: &'a TaskCockpitQuery,
     pub bus: &'a CommandBus,
     pub service_runtime: Option<&'a ProcessManager>,
+    pub semantic_journal:
+        Option<&'a std::sync::Mutex<crate::remote::presentation::SemanticJournalStore>>,
     pub ssh_endpoints: Option<&'a [TaskSshEndpoint]>,
     pub ssh_runtime: Option<&'a dyn SshRuntimeAdapter>,
     pub workspace_projects: Option<&'a WorkspaceProjectRoots>,
@@ -125,6 +128,15 @@ pub(crate) fn serve_task_cockpit(dispatch: TaskCockpitDispatch<'_>) -> QueryOutc
         | TaskCockpitQuery::AgentConnection
         | TaskCockpitQuery::ConfigCreateProject { .. } => {
             unreachable!("config snapshot is handled before task-scoped lookup")
+        }
+        TaskCockpitQuery::Conversation { after_sequence } => {
+            if !dispatch
+                .capabilities
+                .contains(Capability::SemanticConversation)
+            {
+                return QueryOutcome::Err(QueryError::UnsupportedCapability);
+            }
+            serve_conversation(&dispatch, task_id, *after_sequence)
         }
         TaskCockpitQuery::WorkspaceStatus => QueryOutcome::Ok(QueryResult::TaskCockpit(
             TaskCockpitResult::Workspace(workspace_projection(task_id, &snapshot.task.workspace)),
@@ -261,6 +273,240 @@ pub(crate) fn serve_task_cockpit(dispatch: TaskCockpitDispatch<'_>) -> QueryOutc
             *action_epoch,
             SupervisorAction::Health,
         ),
+    }
+}
+
+const MAX_CONVERSATION_PAGE_ITEMS: usize = 128;
+const MAX_CONVERSATION_PAGE_BYTES: usize = 256 * 1024;
+
+fn serve_conversation(
+    dispatch: &TaskCockpitDispatch<'_>,
+    task_id: TaskId,
+    after_sequence: u64,
+) -> QueryOutcome {
+    use crate::domain::{PrivacyClass, SemanticJournalFact, SemanticJournalPage};
+    use crate::remote::presentation::StableSessionKey;
+
+    let Some(store) = dispatch.semantic_journal else {
+        return unavailable(
+            TaskCockpitSurface::Conversation,
+            TaskCockpitUnavailableReason::WorkspaceAuthorityUnavailable,
+        );
+    };
+    let Ok(store) = store.lock() else {
+        return QueryOutcome::Err(QueryError::Unavailable {
+            reason: "semantic_journal",
+        });
+    };
+    let key = StableSessionKey::from_tab(&task_id.to_string());
+    let replay = store
+        .capture_replay_after(&key, after_sequence)
+        .map(|capture| capture.into_replay());
+    drop(store);
+
+    let (through_sequence, high_water, events) = match replay {
+        Some(replay) => (
+            replay.through_sequence,
+            replay.through_sequence,
+            replay.events,
+        ),
+        None => (0, 0, Vec::new()),
+    };
+    let replaced = events
+        .iter()
+        .filter_map(|event| event.replaces_sequence)
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut facts = events
+        .iter()
+        .filter(|event| !replaced.contains(&event.sequence))
+        .filter(|event| !conversation_omits_ai_raw_output(event))
+        .rev()
+        .take(MAX_CONVERSATION_PAGE_ITEMS)
+        .map(|event| SemanticJournalFact {
+            id: conversation_event_id(task_id, event.sequence),
+            sequence: event.sequence,
+            provider: semantic_provider_name(event.source).to_string(),
+            schema_version: 1,
+            kind: semantic_payload_kind(&event.kind).to_string(),
+            visibility: "task".to_string(),
+            privacy_class: PrivacyClass::LocalOnly,
+            redacted: false,
+            payload: semantic_payload(&event.kind),
+        })
+        .collect::<Vec<_>>();
+    facts.reverse();
+    let mut page = SemanticJournalPage {
+        after_sequence,
+        through_sequence,
+        high_water,
+        encoded_bytes: 0,
+        next_sequence: None,
+        facts,
+    };
+    loop {
+        let encoded = rmp_serde::to_vec_named(&page).unwrap_or_default();
+        if encoded.len() <= MAX_CONVERSATION_PAGE_BYTES || page.facts.is_empty() {
+            page.encoded_bytes = u32::try_from(encoded.len()).unwrap_or(u32::MAX);
+            break;
+        }
+        page.facts.remove(0);
+    }
+    QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Conversation(
+        page,
+    )))
+}
+
+fn conversation_event_id(task_id: TaskId, sequence: u64) -> crate::domain::EventId {
+    let mut bytes = *task_id.as_bytes();
+    bytes[8..].copy_from_slice(&sequence.to_be_bytes());
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    crate::domain::EventId::from_bytes(bytes).expect("task-derived event id remains UUIDv7")
+}
+
+fn conversation_omits_ai_raw_output(event: &crate::remote::presentation::SemanticEvent) -> bool {
+    use crate::remote::presentation::{SemanticEventKind, SemanticSource};
+    matches!(
+        (event.source, &event.kind),
+        (
+            SemanticSource::Claude | SemanticSource::Codex,
+            SemanticEventKind::Output { .. }
+        )
+    )
+}
+
+fn semantic_provider_name(source: crate::remote::presentation::SemanticSource) -> &'static str {
+    use crate::remote::presentation::SemanticSource;
+    match source {
+        SemanticSource::Claude => "claude_code",
+        SemanticSource::Codex => "codex",
+        SemanticSource::Shell => "shell",
+        SemanticSource::Server => "server",
+        SemanticSource::Ssh => "ssh",
+        SemanticSource::System => "system",
+    }
+}
+
+fn semantic_status_is_plan_step(state: &str) -> bool {
+    state.starts_with("subagent") || state.starts_with("task")
+}
+
+fn semantic_payload_kind(kind: &crate::remote::presentation::SemanticEventKind) -> &'static str {
+    use crate::remote::presentation::SemanticEventKind;
+    match kind {
+        SemanticEventKind::UserMessage { .. } => "user_message",
+        SemanticEventKind::AssistantMessage { .. } | SemanticEventKind::Output { .. } => {
+            "assistant_text"
+        }
+        SemanticEventKind::Reasoning { .. } => "reasoning_summary",
+        SemanticEventKind::Tool { .. } | SemanticEventKind::Diff { .. } => "tool_result",
+        SemanticEventKind::Command { .. } => "tool_call",
+        SemanticEventKind::Question { .. } => "question",
+        SemanticEventKind::Status { state, .. } if semantic_status_is_plan_step(state) => {
+            "plan_step"
+        }
+        SemanticEventKind::Status { .. } | SemanticEventKind::TerminalMode { .. } => {
+            "session_state"
+        }
+        SemanticEventKind::Error { .. } => "error",
+    }
+}
+
+fn semantic_payload(
+    kind: &crate::remote::presentation::SemanticEventKind,
+) -> crate::domain::SemanticJournalPayload {
+    use crate::domain::SemanticJournalPayload;
+    use crate::remote::presentation::{SemanticEventKind, SemanticToolState};
+    match kind {
+        SemanticEventKind::UserMessage { text } => {
+            SemanticJournalPayload::UserMessage { text: text.clone() }
+        }
+        SemanticEventKind::AssistantMessage { text, .. }
+        | SemanticEventKind::Output { text, .. } => {
+            SemanticJournalPayload::AssistantText { text: text.clone() }
+        }
+        SemanticEventKind::Reasoning { summary, .. } => SemanticJournalPayload::ReasoningSummary {
+            text: summary.clone(),
+        },
+        SemanticEventKind::Tool {
+            tool_id,
+            name,
+            state,
+            summary,
+        } => match state {
+            SemanticToolState::Pending | SemanticToolState::Running => {
+                SemanticJournalPayload::ToolCall {
+                    tool_name: name.clone(),
+                    call_id: tool_id.clone(),
+                }
+            }
+            SemanticToolState::Completed | SemanticToolState::Failed => {
+                SemanticJournalPayload::ToolResult {
+                    call_id: tool_id.clone(),
+                    status: if summary.is_empty() {
+                        format!("{state:?}").to_ascii_lowercase()
+                    } else {
+                        summary.clone()
+                    },
+                }
+            }
+        },
+        SemanticEventKind::Diff {
+            item_id,
+            unified_diff,
+        } => SemanticJournalPayload::ToolResult {
+            call_id: item_id.clone(),
+            status: unified_diff.clone(),
+        },
+        SemanticEventKind::Command {
+            command_id,
+            text,
+            exit_code,
+        } => SemanticJournalPayload::ToolResult {
+            call_id: command_id.clone(),
+            status: exit_code
+                .map(|code| format!("{text} (exit {code})"))
+                .unwrap_or_else(|| text.clone()),
+        },
+        SemanticEventKind::Question {
+            question_id,
+            prompt,
+            choices,
+        } => SemanticJournalPayload::Question {
+            question_id: question_id.clone(),
+            prompt: prompt.clone(),
+            options: choices.clone(),
+        },
+        SemanticEventKind::Status { state, detail } if semantic_status_is_plan_step(state) => {
+            SemanticJournalPayload::PlanStep {
+                step_id: state.clone(),
+                title: detail.clone().unwrap_or_else(|| {
+                    if state.starts_with("task") {
+                        "Task".to_string()
+                    } else {
+                        "Subagent".to_string()
+                    }
+                }),
+                status: state.clone(),
+            }
+        }
+        SemanticEventKind::Status { state, detail } => SemanticJournalPayload::SessionState {
+            state: detail
+                .as_ref()
+                .map(|detail| format!("{state}: {detail}"))
+                .unwrap_or_else(|| state.clone()),
+        },
+        SemanticEventKind::Error { message } => SemanticJournalPayload::Error {
+            code: "provider".to_string(),
+            message: message.clone(),
+        },
+        SemanticEventKind::TerminalMode { raw_required } => SemanticJournalPayload::SessionState {
+            state: if *raw_required {
+                "raw terminal required"
+            } else {
+                "semantic conversation active"
+            }
+            .to_string(),
+        },
     }
 }
 
@@ -550,7 +796,10 @@ fn serve_git_mutate(
             let paths = paths.expect("stage paths");
             match repository.plan_stage(&paths) {
                 Ok(plan) => GitPlannedMutation::Stage(plan),
-                Err(error) => return map_git_error(error),
+                Err(error) => {
+                    eprintln!("devmanager-host: cockpit Git stage planning failed: {error}");
+                    return map_git_error(error);
+                }
             }
         }
         TaskGitMutateIntent::Unstage { .. } => {
@@ -580,7 +829,14 @@ fn serve_git_mutate(
             .and_then(|confirmation| repository.commit(plan, &confirmation)),
     };
     match executed {
-        Ok(()) => git_status_outcome(task_id, &repository),
+        Ok(()) => {
+            // A successful mutation can create or replace legitimate mutable
+            // Git graph entries (for example, the first commit creates
+            // `.git/logs`). Release the pre-effect pinned graph and reacquire
+            // host authority before projecting the post-effect status.
+            drop(repository);
+            serve_git_status(dispatch, task_id, task)
+        }
         Err(error) => map_git_error(error),
     }
 }
@@ -654,7 +910,8 @@ fn map_git_error(error: GitError) -> QueryOutcome {
 }
 
 fn git_status_outcome(task_id: TaskId, repository: &GitRepository) -> QueryOutcome {
-    match repository.status() {
+    let started = std::time::Instant::now();
+    match repository.status_summary() {
         Ok(status) => QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Git(
             TaskGitProjection {
                 task_id,
@@ -669,10 +926,16 @@ fn git_status_outcome(task_id: TaskId, repository: &GitRepository) -> QueryOutco
                 detached: status.is_detached,
             },
         ))),
-        Err(_) => unavailable(
-            TaskCockpitSurface::Git,
-            TaskCockpitUnavailableReason::GitAuthorityNotIssued,
-        ),
+        Err(error) => {
+            eprintln!(
+                "devmanager-host: cockpit Git status failed after {:?}: {error:?}",
+                started.elapsed()
+            );
+            unavailable(
+                TaskCockpitSurface::Git,
+                TaskCockpitUnavailableReason::GitAuthorityNotIssued,
+            )
+        }
     }
 }
 
@@ -694,7 +957,8 @@ fn open_git_repository(
             action_epoch,
             runtime_generation,
         )
-        .map_err(|_| {
+        .map_err(|error| {
+            eprintln!("devmanager-host: cockpit Git lease acquisition failed: {error:?}");
             unavailable(
                 TaskCockpitSurface::Git,
                 TaskCockpitUnavailableReason::GitAuthorityNotIssued,
@@ -711,7 +975,11 @@ fn open_git_repository(
         runtime_generation,
         WorkspaceResource::Git,
         TaskCockpitSurface::Git,
-    )?;
+    )
+    .map_err(|outcome| {
+        eprintln!("devmanager-host: cockpit Git fence revalidation failed: {outcome:?}");
+        outcome
+    })?;
     let binding = issue_git_host_binding(
         &authorization,
         lease,
@@ -725,13 +993,15 @@ fn open_git_repository(
         action_epoch,
         runtime_generation,
     )
-    .map_err(|_| {
+    .map_err(|error| {
+        eprintln!("devmanager-host: cockpit Git binding failed: {error:?}");
         unavailable(
             TaskCockpitSurface::Git,
             TaskCockpitUnavailableReason::GitAuthorityNotIssued,
         )
     })?;
-    GitRepository::from_host_binding(binding, GitCancellation::new()).map_err(|_| {
+    GitRepository::from_host_binding(binding, GitCancellation::new()).map_err(|error| {
+        eprintln!("devmanager-host: cockpit Git repository open failed: {error:?}");
         unavailable(
             TaskCockpitSurface::Git,
             TaskCockpitUnavailableReason::GitAuthorityNotIssued,
@@ -754,16 +1024,22 @@ fn serve_files_list(
     relative_directory: Option<&str>,
     limit: u16,
 ) -> QueryOutcome {
-    let files = match live_file_service(dispatch, task_id, task) {
+    let files = match live_read_file_service(dispatch, task_id, task) {
         Ok(files) => files,
         Err(outcome) => return outcome,
     };
-    match files.list(relative_directory, usize::from(limit)) {
-        Ok(entries) => {
-            let truncated = entries.len() >= usize::from(limit);
-            let entries = entries
+    match files.list_page(
+        relative_directory,
+        FilePageRequest {
+            offset: 0,
+            limit: usize::from(limit),
+        },
+    ) {
+        Ok(page) => {
+            let truncated = page.next_offset.is_some();
+            let entries = page
+                .entries
                 .into_iter()
-                .take(usize::from(limit))
                 .filter_map(|entry| {
                     if !relative_path_is_safe(entry.path.as_str()) {
                         return None;
@@ -794,7 +1070,7 @@ fn serve_files_read(
     relative_path: &str,
     max_bytes: u32,
 ) -> QueryOutcome {
-    let files = match live_file_service(dispatch, task_id, task) {
+    let files = match live_read_file_service(dispatch, task_id, task) {
         Ok(files) => files,
         Err(outcome) => return outcome,
     };
@@ -981,8 +1257,34 @@ fn live_file_service(
     task_id: TaskId,
     task: &crate::domain::task::TaskFacts,
 ) -> Result<crate::workspace::files::WorkspaceFileService, QueryOutcome> {
+    live_file_service_with_access(dispatch, task_id, task, FileServiceAccess::ReadWrite)
+}
+
+fn live_read_file_service(
+    dispatch: &TaskCockpitDispatch<'_>,
+    task_id: TaskId,
+    task: &crate::domain::task::TaskFacts,
+) -> Result<crate::workspace::files::WorkspaceFileService, QueryOutcome> {
+    live_file_service_with_access(dispatch, task_id, task, FileServiceAccess::ReadOnly)
+}
+
+#[derive(Clone, Copy)]
+enum FileServiceAccess {
+    ReadOnly,
+    ReadWrite,
+}
+
+fn live_file_service_with_access(
+    dispatch: &TaskCockpitDispatch<'_>,
+    task_id: TaskId,
+    task: &crate::domain::task::TaskFacts,
+    access: FileServiceAccess,
+) -> Result<crate::workspace::files::WorkspaceFileService, QueryOutcome> {
     let (service, authorization, command_id, action_epoch, runtime_generation) =
-        live_mutation_authority(dispatch, task_id, task, TaskCockpitSurface::Files)?;
+        match live_mutation_authority(dispatch, task_id, task, TaskCockpitSurface::Files) {
+            Ok(authority) => authority,
+            Err(outcome) => return Err(outcome),
+        };
     let lease = service
         .acquire_task_resource(
             task_id,
@@ -1000,7 +1302,7 @@ fn live_file_service(
                 TaskCockpitUnavailableReason::FileAuthorityNotIssued,
             )
         })?;
-    revalidate_issued_fence(
+    if let Err(outcome) = revalidate_issued_fence(
         dispatch,
         task_id,
         task,
@@ -1011,8 +1313,14 @@ fn live_file_service(
         runtime_generation,
         WorkspaceResource::File,
         TaskCockpitSurface::Files,
-    )?;
-    issue_file_service(
+    ) {
+        return Err(outcome);
+    }
+    let issue = match access {
+        FileServiceAccess::ReadOnly => issue_read_file_service,
+        FileServiceAccess::ReadWrite => issue_file_service,
+    };
+    issue(
         &authorization,
         lease,
         task_id,
@@ -1102,7 +1410,10 @@ fn live_mutation_authority(
         &task.workspace,
         coordinator.clone(),
     )
-    .map_err(|_| {
+    .map_err(|error| {
+        eprintln!(
+            "devmanager-host: cockpit workspace service reconstruction failed for {surface:?}: {error:?}"
+        );
         unavailable(
             surface,
             TaskCockpitUnavailableReason::WorkspaceAuthorityUnavailable,
@@ -1119,7 +1430,12 @@ fn live_mutation_authority(
             action_epoch,
             runtime_generation,
         )
-        .map_err(|_| denied(surface, TaskCockpitDeniedReason::StaleFence))?;
+        .map_err(|error| {
+            eprintln!(
+                "devmanager-host: cockpit workspace authorization rejected for {surface:?}: {error:?}"
+            );
+            denied(surface, TaskCockpitDeniedReason::StaleFence)
+        })?;
     Ok((
         service,
         authorization,
@@ -1503,6 +1819,7 @@ mod tests {
             },
             bus: &bus,
             service_runtime: None,
+            semantic_journal: None,
             ssh_endpoints: Some(&endpoints),
             ssh_runtime: None,
             workspace_projects: Some(&roots),
@@ -1530,6 +1847,7 @@ mod tests {
             },
             bus: &bus,
             service_runtime: None,
+            semantic_journal: None,
             ssh_endpoints: Some(&endpoints),
             ssh_runtime: None,
             workspace_projects: Some(&roots),
@@ -1556,6 +1874,7 @@ mod tests {
             },
             bus: &bus,
             service_runtime: None,
+            semantic_journal: None,
             ssh_endpoints: Some(&endpoints),
             ssh_runtime: None,
             workspace_projects: Some(&roots),
@@ -1590,6 +1909,7 @@ mod tests {
             },
             bus: &bus,
             service_runtime: None,
+            semantic_journal: None,
             ssh_endpoints: None,
             ssh_runtime: None,
             workspace_projects: Some(&roots),
@@ -1616,6 +1936,7 @@ mod tests {
             },
             bus: &bus,
             service_runtime: None,
+            semantic_journal: None,
             ssh_endpoints: None,
             ssh_runtime: None,
             workspace_projects: Some(&roots),
@@ -1643,6 +1964,7 @@ mod tests {
             },
             bus: &bus,
             service_runtime: None,
+            semantic_journal: None,
             ssh_endpoints: None,
             ssh_runtime: None,
             workspace_projects: Some(&roots),
@@ -1660,8 +1982,182 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn files_list_returns_a_truncated_first_page_for_large_directories() {
+        let (repository, bus, client_id, task_id, roots) = create_bound_task();
+        for index in 0..70 {
+            fs::write(
+                repository.path().join(format!("visible-{index:02}.txt")),
+                "visible\n",
+            )
+            .expect("large directory entry");
+        }
+        let granted = CapabilitySet::from_capabilities([Capability::TaskCockpit]);
+        let coordinator = WorkspaceResourceCoordinator::new();
+        let listed = serve_task_cockpit(TaskCockpitDispatch {
+            capabilities: granted,
+            envelope_task_id: Some(task_id),
+            client_id,
+            connection_id: Uuid::now_v7(),
+            request_id: RequestId::new(),
+            query: &TaskCockpitQuery::FilesList {
+                relative_directory: None,
+                limit: MAX_COCKPIT_FILE_LIST,
+            },
+            bus: &bus,
+            service_runtime: None,
+            semantic_journal: None,
+            ssh_endpoints: None,
+            ssh_runtime: None,
+            workspace_projects: Some(&roots),
+            coordinator: Some(&coordinator),
+            action_epoch: Some(1),
+            runtime_generation: Some(1),
+            config: None,
+        });
+        let QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::FilesList(listed))) =
+            listed
+        else {
+            panic!("expected a truncated files page, got {listed:?}");
+        };
+        assert_eq!(listed.entries.len(), usize::from(MAX_COCKPIT_FILE_LIST));
+        assert!(listed.truncated);
+    }
+
     fn granted() -> CapabilitySet {
         CapabilitySet::from_capabilities([Capability::TaskCockpit])
+    }
+
+    #[test]
+    fn conversation_query_projects_the_task_semantic_journal() {
+        use crate::remote::presentation::{
+            SemanticEventDraft, SemanticEventKind, SemanticRetention, SemanticSource,
+            StableSessionKey,
+        };
+        use std::sync::Mutex;
+
+        let (_repository, bus, client_id, task_id, _roots) = create_bound_task();
+        let journal = Mutex::new(crate::remote::presentation::SemanticJournalStore::default());
+        journal.lock().expect("journal").record(SemanticEventDraft {
+            stable_session_key: StableSessionKey::from_tab(&task_id.to_string()),
+            occurred_at_epoch_ms: 10,
+            source: SemanticSource::Claude,
+            kind: SemanticEventKind::UserMessage {
+                text: "Fix the failing test".to_string(),
+            },
+            retention: SemanticRetention::Canonical,
+            deduplication_key: None,
+        });
+        let query = TaskCockpitQuery::Conversation { after_sequence: 0 };
+        let outcome = serve_task_cockpit(TaskCockpitDispatch {
+            capabilities: CapabilitySet::from_capabilities([
+                Capability::TaskCockpit,
+                Capability::SemanticConversation,
+            ]),
+            envelope_task_id: Some(task_id),
+            client_id,
+            connection_id: Uuid::now_v7(),
+            request_id: RequestId::new(),
+            query: &query,
+            bus: &bus,
+            service_runtime: None,
+            semantic_journal: Some(&journal),
+            ssh_endpoints: None,
+            ssh_runtime: None,
+            workspace_projects: None,
+            coordinator: None,
+            action_epoch: None,
+            runtime_generation: None,
+            config: None,
+        });
+        let QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Conversation(page))) =
+            outcome
+        else {
+            panic!("expected conversation page, got {outcome:?}");
+        };
+        assert_eq!(page.facts.len(), 1);
+        assert!(matches!(
+            &page.facts[0].payload,
+            crate::domain::SemanticJournalPayload::UserMessage { text }
+                if text == "Fix the failing test"
+        ));
+        assert!(page.encoded_bytes > 0);
+    }
+
+    #[test]
+    fn conversation_filters_historical_ai_terminal_output() {
+        use crate::remote::presentation::{
+            SemanticEventDraft, SemanticEventKind, SemanticRetention, SemanticSource,
+            SemanticStream, StableSessionKey,
+        };
+        use std::sync::Mutex;
+
+        let (_repository, bus, client_id, task_id, _roots) = create_bound_task();
+        let journal = Mutex::new(crate::remote::presentation::SemanticJournalStore::default());
+        {
+            let mut store = journal.lock().expect("journal");
+            let key = StableSessionKey::from_tab(&task_id.to_string());
+            store.record(SemanticEventDraft {
+                stable_session_key: key.clone(),
+                occurred_at_epoch_ms: 10,
+                source: SemanticSource::Claude,
+                kind: SemanticEventKind::AssistantMessage {
+                    message_id: "msg-1".to_string(),
+                    text: "semantic assistant".to_string(),
+                    streaming: false,
+                },
+                retention: SemanticRetention::Canonical,
+                deduplication_key: None,
+            });
+            store.record(SemanticEventDraft {
+                stable_session_key: key,
+                occurred_at_epoch_ms: 11,
+                source: SemanticSource::Claude,
+                kind: SemanticEventKind::Output {
+                    stream: SemanticStream::Stdout,
+                    text: "raw Claude PTY wall".to_string(),
+                },
+                retention: SemanticRetention::Verbose,
+                deduplication_key: None,
+            });
+        }
+        let query = TaskCockpitQuery::Conversation { after_sequence: 0 };
+        let outcome = serve_task_cockpit(TaskCockpitDispatch {
+            capabilities: CapabilitySet::from_capabilities([
+                Capability::TaskCockpit,
+                Capability::SemanticConversation,
+            ]),
+            envelope_task_id: Some(task_id),
+            client_id,
+            connection_id: Uuid::now_v7(),
+            request_id: RequestId::new(),
+            query: &query,
+            bus: &bus,
+            service_runtime: None,
+            semantic_journal: Some(&journal),
+            ssh_endpoints: None,
+            ssh_runtime: None,
+            workspace_projects: None,
+            coordinator: None,
+            action_epoch: None,
+            runtime_generation: None,
+            config: None,
+        });
+        let QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Conversation(page))) =
+            outcome
+        else {
+            panic!("expected conversation page, got {outcome:?}");
+        };
+        assert_eq!(
+            page.facts.len(),
+            1,
+            "historical AI Output must not become conversation AssistantText: {page:?}"
+        );
+        assert!(matches!(
+            &page.facts[0].payload,
+            crate::domain::SemanticJournalPayload::AssistantText { text }
+                if text == "semantic assistant"
+        ));
     }
 
     fn dispatch<'a>(
@@ -1683,6 +2179,7 @@ mod tests {
             query,
             bus,
             service_runtime: None,
+            semantic_journal: None,
             ssh_endpoints: None,
             ssh_runtime: None,
             workspace_projects: roots,
@@ -1901,7 +2398,7 @@ mod tests {
 
     #[test]
     fn git_mutate_host_issuer_unstages_and_commits_only_through_confirmed_plans() {
-        let (_repository, bus, client_id, task_id, roots) = create_bound_task();
+        let (repository, bus, client_id, task_id, roots) = create_bound_task();
         let coordinator = WorkspaceResourceCoordinator::new();
         let staged = serve_task_cockpit(dispatch(
             &bus,
@@ -1978,7 +2475,13 @@ mod tests {
             panic!("expected host-confirmed commit, got {committed:?}");
         };
         assert_eq!(committed.task_id, task_id);
-        assert_eq!(committed.change_count, 0);
+        let readme_status = std::process::Command::new("git")
+            .args(["status", "--porcelain", "--", "README.md"])
+            .current_dir(repository.path())
+            .output()
+            .expect("inspect committed README");
+        assert!(readme_status.status.success());
+        assert!(readme_status.stdout.is_empty());
     }
 
     #[test]
@@ -2098,5 +2601,29 @@ mod tests {
         assert_eq!(projection.resource_id, resource_id);
         assert_eq!(projection.provider_kind, ProviderKind::ClaudeCode);
         assert_eq!(projection.runtime_generation, 4);
+    }
+
+    #[test]
+    fn task_cockpit_client_deadline_outlasts_bounded_git_cleanup() {
+        assert!(
+            crate::host::task_cockpit_query_timeout() >= std::time::Duration::from_secs(15),
+            "Task Cockpit must outlast Git's 10s operation bound plus cleanup and reply delivery"
+        );
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/client/host_client.rs"
+        ));
+        let start = source
+            .find("pub async fn query_task_cockpit(")
+            .expect("Task Cockpit client query");
+        let body = &source[start..];
+        let end = body
+            .find("pub async fn query_config_sidebar(")
+            .expect("config query follows Task Cockpit query");
+        let body = &body[..end];
+        assert!(
+            body.contains("query_with_timeout") && body.contains("task_cockpit_query_timeout"),
+            "Task Cockpit must not use the generic 5s request deadline"
+        );
     }
 }
