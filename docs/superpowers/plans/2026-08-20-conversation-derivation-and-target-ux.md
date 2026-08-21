@@ -695,14 +695,16 @@ Without this the transcript re-mounts rows while assistant tokens stream.
 ```rust
     #[test]
     fn row_keys_survive_a_streaming_text_change() {
-        let first = derive_conversation_rows(
-            &[message_item(MessageRole::Assistant, "Two of")],
-            ConversationVerbosity::Calm,
-        );
-        let second = derive_conversation_rows(
-            &[message_item(MessageRole::Assistant, "Two of the three")],
-            ConversationVerbosity::Calm,
-        );
+        // A streaming delta is the SAME event carrying more text. `message_item`
+        // mints a fresh EventId per call, so calling it twice models two
+        // different messages and no key-based reconciliation could ever match
+        // them -- copy the id across to model the real thing.
+        let item = message_item("Assistant", MessageRole::Assistant, "Two of");
+        let mut grown = message_item("Assistant", MessageRole::Assistant, "Two of the three");
+        grown.id = item.id;
+
+        let first = derive_conversation_rows(&[item], ConversationVerbosity::Calm);
+        let second = derive_conversation_rows(&[grown], ConversationVerbosity::Calm);
         let stable = stable_conversation_rows(&first, second);
         assert_eq!(
             conversation_row_key(&first[0]),
@@ -718,7 +720,7 @@ Without this the transcript re-mounts rows while assistant tokens stream.
     #[test]
     fn an_unchanged_row_is_returned_untouched() {
         let rows = derive_conversation_rows(
-            &[message_item(MessageRole::User, "hello")],
+            &[message_item("You", MessageRole::User, "hello")],
             ConversationVerbosity::Calm,
         );
         let stable = stable_conversation_rows(&rows, rows.clone());
