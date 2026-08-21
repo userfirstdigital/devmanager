@@ -1451,6 +1451,25 @@ git commit -m "test(ui): pin Rust and PWA conversation derivations to one corpus
 
 # Train 2 — Target UX
 
+### Task 6b: Populate `turn_id` so turn folds are not inert
+
+**Discovered during Task 4b review, not in the original plan.** `src/ui/renderers/journal_view.rs:365` sets `turn_id: None` unconditionally on every projected item. Task 4b's `TurnFold` emission is therefore correct and completely inert: no production item ever carries a turn id, so no fold is ever produced, and the Target UX's turn-fold affordance cannot appear.
+
+This is a plan gap, not a defect in Task 4b, which implemented its brief faithfully.
+
+**Files:**
+- Modify: `src/ui/renderers/journal_view.rs:365`
+- Test: inline
+
+**Two things this task must establish, in order:**
+
+1. **Whether a turn identifier exists to populate from at all.** Read `SemanticJournalFactRow` and the journal schema. If no per-turn identifier is persisted, STOP and report that — the honest outcome is then to remove `TurnFold` from `ConversationRow` rather than ship a variant nothing can construct, and that is a decision for the plan owner, not something to work around by synthesising an id. **Never synthesize a turn identifier**; the project's invariants forbid inferring conversation identity from ordering or timestamps.
+2. If an identifier does exist, thread it into `TimelineItemModel.turn_id` and add a test proving a projected item carries it, plus an end-to-end test proving `derive_conversation_rows` emits a fold at a real turn boundary rather than only for hand-built fixtures.
+
+Note that the journal is read `ORDER BY sequence ASC` (four sites in `src/kernel/semantic_journal.rs`) and `project_items` preserves that order, so turn ids cannot revisit a value within one list. `ConversationRowKey::TurnFold` keying on the raw string is therefore safe.
+
+---
+
 ### Task 7: Row treatments and geometry
 
 **Files:**
