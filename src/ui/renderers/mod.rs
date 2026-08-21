@@ -196,7 +196,9 @@ impl SemanticEvent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SemanticEventBody {
     Message {
+        /// Display label only. Never match on this.
         role: String,
+        role_kind: MessageRole,
         text: String,
         streaming: bool,
     },
@@ -584,6 +586,7 @@ fn parse_known_body(
     match kind {
         SemanticKind::Message => Ok(SemanticEventBody::Message {
             role: bounded_required_string(value, "role")?,
+            role_kind: parse_message_role_kind(value)?,
             text: bounded_required_string(value, "text")?,
             streaming: value
                 .get("streaming")
@@ -692,6 +695,17 @@ fn bounded_required_string(value: &Value, field: &'static str) -> Result<String,
         });
     }
     Ok(text.to_string())
+}
+
+#[cfg(any(test, feature = "semantic-conformance"))]
+fn parse_message_role_kind(value: &Value) -> Result<MessageRole, RenderModelError> {
+    match required_str(value, "role_kind")? {
+        "user" => Ok(MessageRole::User),
+        "assistant" => Ok(MessageRole::Assistant),
+        "reasoning" => Ok(MessageRole::Reasoning),
+        "error" => Ok(MessageRole::Error),
+        _ => Err(RenderModelError::InvalidIdentity("role_kind")),
+    }
 }
 
 #[cfg(any(test, feature = "semantic-conformance"))]

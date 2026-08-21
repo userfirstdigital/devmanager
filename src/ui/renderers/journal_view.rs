@@ -3,7 +3,7 @@
 #[cfg(any(test, feature = "semantic-conformance"))]
 use super::ParsedSemanticEvent;
 use super::{
-    InteractionEligibility, RenderModelError, SemanticEvent, SemanticEventBody,
+    InteractionEligibility, MessageRole, RenderModelError, SemanticEvent, SemanticEventBody,
     TimelineItemContent, TimelineItemModel,
 };
 use crate::client::model::ClientModel;
@@ -244,16 +244,19 @@ fn live_fact_event(
         match &fact.payload {
             SemanticJournalPayload::UserMessage { text } => SemanticEventBody::Message {
                 role: "You".to_string(),
+                role_kind: MessageRole::User,
                 text: text.clone(),
                 streaming: false,
             },
             SemanticJournalPayload::AssistantText { text } => SemanticEventBody::Message {
                 role: "Assistant".to_string(),
+                role_kind: MessageRole::Assistant,
                 text: text.clone(),
                 streaming: false,
             },
             SemanticJournalPayload::ReasoningSummary { text } => SemanticEventBody::Message {
                 role: "Reasoning".to_string(),
+                role_kind: MessageRole::Reasoning,
                 text: text.clone(),
                 streaming: false,
             },
@@ -317,6 +320,7 @@ fn live_fact_event(
             },
             SemanticJournalPayload::Error { code, message } => SemanticEventBody::Message {
                 role: format!("Error ({code})"),
+                role_kind: MessageRole::Error,
                 text: message.clone(),
                 streaming: false,
             },

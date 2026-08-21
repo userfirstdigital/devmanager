@@ -1,9 +1,9 @@
 use crate::ui::components::interaction::{AccessibilityMetadata, AccessibleRole};
 
 use super::{
-    take_scalars, InteractionEligibility, RenderModelError, RendererSelection, SemanticEvent,
-    SemanticEventBody, SemanticKind, SemanticRenderer, TimelineItemContent, TimelineItemId,
-    TimelineItemModel,
+    take_scalars, InteractionEligibility, ProviderKind, RenderModelError, RendererSelection,
+    SemanticEvent, SemanticEventBody, SemanticKind, SemanticRenderer, TimelineItemContent,
+    TimelineItemId, TimelineItemModel,
 };
 
 pub struct MessageRenderer;
@@ -114,6 +114,7 @@ impl SemanticRenderer for MessageRenderer {
     fn project(&self, event: &SemanticEvent) -> Result<TimelineItemModel, RenderModelError> {
         let SemanticEventBody::Message {
             role,
+            role_kind,
             text,
             streaming,
         } = &event.body
@@ -132,14 +133,7 @@ impl SemanticRenderer for MessageRenderer {
             interaction: InteractionEligibility::None,
             content: TimelineItemContent::Message(MessageView {
                 role: role.clone(),
-                // `SemanticEventBody::Message` only carries the display
-                // label, not the originating `MessageRole` — the sending
-                // side (journal_view.rs) erases the discriminant into a
-                // plain string before it reaches this generic projector.
-                // Matching on `role` here to recover it would reintroduce
-                // exactly the string-sniffing this type exists to remove,
-                // so default to `Assistant` rather than guess.
-                role_kind: MessageRole::Assistant,
+                role_kind: *role_kind,
                 streaming: *streaming,
                 markdown,
             }),
@@ -326,5 +320,53 @@ mod role_tests {
                 assert_eq!(index == other, left == right);
             }
         }
+    }
+
+    fn message_event(role_kind: MessageRole) -> SemanticEvent {
+        use crate::domain::id::{EventId, TaskId};
+
+        SemanticEvent {
+            event_id: EventId::new(),
+            task_id: TaskId::new(),
+            schema_version: 1,
+            provider: ProviderKind::parse("codex").expect("provider"),
+            source_type: "message".to_string(),
+            occurred_at_ms: 0,
+            raw_terminal_available: false,
+            turn_id: None,
+            related_event_id: None,
+            body: SemanticEventBody::Message {
+                role: "Reasoning".to_string(),
+                role_kind,
+                text: "checking fences".to_string(),
+                streaming: false,
+            },
+        }
+    }
+
+    // These two tests are the real gate for this task: they exercise
+    // `MessageRenderer::project`, the only production code path that turns
+    // a `SemanticEventBody::Message` into a `MessageView`. A test that
+    // builds a `MessageView` by hand (like the two above) cannot catch a
+    // projector that ignores `role_kind` and hardcodes a variant.
+    #[test]
+    fn a_reasoning_payload_projects_to_a_reasoning_role_kind() {
+        let event = message_event(MessageRole::Reasoning);
+        let model = MessageRenderer.project(&event).expect("message projects");
+        let TimelineItemContent::Message(view) = model.content else {
+            panic!("expected message content");
+        };
+        assert_eq!(view.role_kind, MessageRole::Reasoning);
+    }
+
+    #[test]
+    fn an_error_payload_does_not_project_as_assistant() {
+        let event = message_event(MessageRole::Error);
+        let model = MessageRenderer.project(&event).expect("message projects");
+        let TimelineItemContent::Message(view) = model.content else {
+            panic!("expected message content");
+        };
+        assert_ne!(view.role_kind, MessageRole::Assistant);
+        assert_eq!(view.role_kind, MessageRole::Error);
     }
 }
