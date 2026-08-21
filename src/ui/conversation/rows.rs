@@ -661,6 +661,33 @@ mod tests {
     }
 
     #[test]
+    fn the_first_turn_emits_no_fold() {
+        // A fold marks a boundary BETWEEN turns. On the first turn there is
+        // nothing before it, so a fold would offer to collapse nothing.
+        let mut only = message_item(MessageRole::User, "first question");
+        only.turn_id = Some("turn-1".to_string());
+        let rows = derive_conversation_rows(&[only], ConversationVerbosity::Calm);
+        assert!(
+            !rows.iter().any(|row| matches!(row, ConversationRow::TurnFold { .. })),
+            "the first turn must not emit a fold, got {rows:?}"
+        );
+    }
+
+    #[test]
+    fn the_second_turn_emits_exactly_one_fold() {
+        let mut first = message_item(MessageRole::Assistant, "answer");
+        first.turn_id = Some("turn-1".to_string());
+        let mut second = message_item(MessageRole::User, "follow up");
+        second.turn_id = Some("turn-2".to_string());
+        let rows = derive_conversation_rows(&[first, second], ConversationVerbosity::Calm);
+        let folds: Vec<_> = rows
+            .iter()
+            .filter(|row| matches!(row, ConversationRow::TurnFold { .. }))
+            .collect();
+        assert_eq!(folds.len(), 1, "expected exactly one fold, got {rows:?}");
+    }
+
+    #[test]
     fn a_running_tool_emits_a_working_row_at_the_tail() {
         let rows = derive_conversation_rows(
             &[tool_item("t1", "Bash", "running")],
