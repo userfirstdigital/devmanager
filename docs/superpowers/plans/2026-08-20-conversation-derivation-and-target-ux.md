@@ -523,8 +523,11 @@ fn activity_summary(entries: &[ActivityEntry]) -> String {
 }
 
 /// Maps one projected item to an activity entry, or `None` when the item is
-/// not activity. This match is TOTAL over `TimelineItemContent`; adding a
-/// variant is a compile error here, which is the point.
+/// not activity. This match is TOTAL over `TimelineItemContent` -- every
+/// variant is named explicitly and there is no `_` arm, so adding a variant is
+/// a compile error here as well as in the main loop. Do not "simplify" either
+/// one to a wildcard: making an unmapped kind unrenderable is the whole point
+/// of this module, and a wildcard silently defaults it to visible.
 fn activity_entry_of(item: &TimelineItemModel) -> Option<ActivityEntry> {
     match &item.content {
         TimelineItemContent::Tool(view) => Some(ActivityEntry {
@@ -547,7 +550,13 @@ fn activity_entry_of(item: &TimelineItemModel) -> Option<ActivityEntry> {
                 _ => ActivityState::Success,
             },
         }),
-        _ => None,
+        TimelineItemContent::Message(_)
+        | TimelineItemContent::Question(_)
+        | TimelineItemContent::Approval(_)
+        | TimelineItemContent::Operation(_)
+        | TimelineItemContent::Artifact(_)
+        | TimelineItemContent::Agent(_)
+        | TimelineItemContent::Generic(_) => None,
     }
 }
 
