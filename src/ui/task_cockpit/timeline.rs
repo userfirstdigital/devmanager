@@ -12,19 +12,40 @@ use std::collections::BTreeSet;
 use crate::client::model::ClientModel;
 use crate::domain::id::{OperationId, TaskId};
 use crate::protocol::CapabilitySet;
-use crate::ui::conversation::render::conversation_row_element;
+use crate::ui::conversation::render::{conversation_row_element, conversation_row_height};
 use crate::ui::conversation::rows::{
-    apply_activity_collapse, derive_conversation_rows, ConversationRow, ConversationVerbosity,
+    apply_activity_collapse, conversation_row_key, derive_conversation_rows, ConversationRow,
+    ConversationRowKey, ConversationVerbosity,
 };
 use crate::ui::renderers::{
     inspect_operation, live_target, CapturedActionTarget, JournalAvailability, RenderModelError,
     RendererRegistry, SemanticJournalView, TimelineActivation, TimelineItemId, TimelineItemModel,
 };
+use crate::ui::tokens::ThemeTokens;
 
 pub const DEFAULT_OVERSCAN: usize = 4;
-pub const MAX_PAINTED_ITEMS: usize = 48;
+pub const MAX_PAINTED_ROWS: usize = 48;
 /// Shared readable measure for the conversation column and floating composer.
 pub const CONVERSATION_CONTENT_MAX_WIDTH: f32 = 860.0;
+
+/// Row heights are estimated at a fixed baseline density/scale, never the
+/// live user theme. Threading the real `ThemeTokens` into this path would
+/// mean plumbing it through `TaskCockpitShell::follow_projection` and every
+/// mutation-time caller of it in `native_shell.rs` (a single caller today,
+/// itself reached from many `sync_cockpit_follow` call sites with no `cx`
+/// or theme snapshot in scope) -- none of which currently carry theme
+/// state; only paint-time `surface(tokens)` calls do. That is a much wider,
+/// less certain conversion than this task's row-indexing fix, so this
+/// baseline is scoped to scroll/virtualization bookkeeping only. Nothing
+/// visible depends on it: the actual paint in `surface()` always uses the
+/// caller's live tokens.
+fn height_estimation_tokens() -> ThemeTokens {
+    crate::ui::tokens::theme(
+        crate::ui::tokens::ThemeMode::Dark,
+        crate::ui::tokens::Density::Comfortable,
+        crate::ui::tokens::Scale::Scale100,
+    )
+}
 
 pub(crate) fn conversation_activity_summary(
     items: &[TimelineItemModel],
@@ -82,9 +103,9 @@ pub struct TimelineViewport {
     pub scroll_offset: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct TimelineAnchor {
-    id: TimelineItemId,
+    key: ConversationRowKey,
     offset_within: u32,
 }
 
@@ -117,13 +138,33 @@ impl Timeline {
         assert_task_projection(model, task_id, journal)?;
         let captured_target = live_target(model, task_id)?;
         let items = journal.project_items(registry, capabilities)?;
+        Ok(Self::assemble(
+            task_id,
+            journal.availability(),
+            items,
+            viewport,
+            captured_target,
+        ))
+    }
+
+    /// Shared by [`Self::project`] and the test-only [`Self::for_test_items`]
+    /// so a test exercises the same row derivation and height/window
+    /// bookkeeping production runs, rather than a hand-assembled struct with
+    /// pre-baked results.
+    fn assemble(
+        task_id: TaskId,
+        availability: JournalAvailability,
+        items: Vec<TimelineItemModel>,
+        viewport: TimelineViewport,
+        captured_target: CapturedActionTarget,
+    ) -> Self {
         let rows = apply_activity_collapse(
             derive_conversation_rows(&items, ConversationVerbosity::Calm),
             &[],
         );
         let mut timeline = Self {
             task_id,
-            availability: journal.availability(),
+            availability,
             items,
             rows,
             expanded_activity: Vec::new(),
@@ -139,7 +180,33 @@ impl Timeline {
         timeline.rebuild_heights();
         timeline.following = true;
         timeline.jump_to_latest();
-        Ok(timeline)
+        timeline
+    }
+
+    /// Test-only constructor that runs the identical `assemble` pipeline as
+    /// production, over hand-built items, without the ClientModel/journal/
+    /// registry plumbing `project` needs. Exists so a test can assert on a
+    /// real `Timeline` (rows, heights, windowing) rather than a struct
+    /// literal that bypasses the code under test.
+    #[cfg(test)]
+    pub(crate) fn for_test_items(items: Vec<TimelineItemModel>) -> Self {
+        let task_id = TaskId::new();
+        Self::assemble(
+            task_id,
+            JournalAvailability::LiveProjection,
+            items,
+            TimelineViewport {
+                height: 280,
+                scroll_offset: 0,
+            },
+            CapturedActionTarget {
+                task_id,
+                agent_session_id: None,
+                runtime_generation: 0,
+                request_id: None,
+                action_epoch: 0,
+            },
+        )
     }
 
     pub fn item_count(&self) -> usize {
@@ -157,7 +224,7 @@ impl Timeline {
     /// Render the semantic surface without deriving transcript content from
     /// the native terminal. An unavailable journal remains visibly mounted as
     /// a typed hold until an authenticated semantic page is admitted.
-    pub fn surface(&self, tokens: crate::ui::tokens::ThemeTokens) -> AnyElement {
+    pub fn surface(&self, tokens: ThemeTokens) -> AnyElement {
         let status = match self.availability {
             JournalAvailability::Unavailable(_) => {
                 "Semantic timeline awaiting authenticated journal"
@@ -168,7 +235,7 @@ impl Timeline {
         };
         let activity = conversation_activity_summary(&self.items, status);
         let painted_rows = self
-            .rows
+            .painted_rows()
             .iter()
             .map(|row| conversation_row_element(row, tokens))
             .collect::<Vec<_>>();
@@ -210,6 +277,10 @@ impl Timeline {
         &self.rows
     }
 
+    pub fn content_height(&self) -> u32 {
+        self.content_height
+    }
+
     pub fn item_ids(&self) -> Vec<TimelineItemId> {
         self.items.iter().map(TimelineItemModel::id).collect()
     }
@@ -218,11 +289,11 @@ impl Timeline {
         self.items.get(index)
     }
 
-    pub fn painted_items(&self) -> &[TimelineItemModel] {
-        if self.items.is_empty() {
+    pub fn painted_rows(&self) -> &[ConversationRow] {
+        if self.rows.is_empty() {
             return &[];
         }
-        &self.items[self.paint_start..=self.paint_end]
+        &self.rows[self.paint_start..=self.paint_end]
     }
 
     pub fn on_task_entered(&mut self) {
@@ -254,8 +325,8 @@ impl Timeline {
         )
     }
 
-    pub fn scroll_to_item(&mut self, index: usize) {
-        if index >= self.items.len() {
+    pub fn scroll_to_row(&mut self, index: usize) {
+        if index >= self.rows.len() {
             return;
         }
         self.viewport.scroll_offset = self.prefix[index];
@@ -277,8 +348,8 @@ impl Timeline {
         self.capture_anchor();
     }
 
-    pub fn visible_anchor_id(&self) -> Option<TimelineItemId> {
-        self.anchor.map(|anchor| anchor.id)
+    pub fn visible_anchor_key(&self) -> Option<ConversationRowKey> {
+        self.anchor.as_ref().map(|anchor| anchor.key.clone())
     }
 
     pub fn follow_latest(&self) -> bool {
@@ -324,20 +395,26 @@ impl Timeline {
         self.capture_anchor();
     }
 
+    /// Scroll/virtualization math walks the derived `rows`, not the raw
+    /// `items` list. A row can fold several items into one (an Activity
+    /// group) or none (a suppressed item that produces no row), so keying
+    /// height off items would reserve scroll space for content that never
+    /// paints. Keying off rows means a suppressed item costs zero height,
+    /// because it never produced a row to have a height at all.
+    /// Scroll/virtualization math walks the derived `rows`, not the raw
+    /// `items` list. A row can fold several items into one (an Activity
+    /// group) or none (a suppressed item that produces no row), so keying
+    /// height off items would reserve scroll space for content that never
+    /// paints. Keying off rows means a suppressed item costs zero height,
+    /// because it never produced a row to have a height at all.
     fn rebuild_heights(&mut self) {
         self.prefix.clear();
         let mut total = 0u32;
-        self.prefix.reserve(self.items.len());
-        for item in &self.items {
+        self.prefix.reserve(self.rows.len());
+        let tokens = height_estimation_tokens();
+        for row in &self.rows {
             self.prefix.push(total);
-            // Scroll/virtualization math still walks the raw item list, not
-            // the derived rows: a row can fold several items into one (an
-            // Activity group) or none (a Generic item that contributes no
-            // row), so there is no 1:1 item-to-row height mapping to key
-            // this off. Every item now counts its full estimated height,
-            // including ones whose content produces no visible row -- this
-            // was flagged in the task report rather than guessed past.
-            total = total.saturating_add(item.estimated_height());
+            total = total.saturating_add(conversation_row_height(row, tokens));
         }
         self.content_height = total;
         self.clamp_scroll();
@@ -352,7 +429,7 @@ impl Timeline {
     }
 
     fn refresh_window(&mut self) {
-        if self.items.is_empty() {
+        if self.rows.is_empty() {
             self.paint_start = 0;
             self.paint_end = 0;
             return;
@@ -364,25 +441,25 @@ impl Timeline {
             .saturating_add(self.viewport.height);
         let first = match self.prefix.partition_point(|top| *top <= start_y) {
             0 => 0,
-            n => (n - 1).min(self.items.len() - 1),
+            n => (n - 1).min(self.rows.len() - 1),
         };
         let last = match self.prefix.partition_point(|top| *top < end_y) {
             0 => 0,
-            n => (n - 1).min(self.items.len() - 1),
+            n => (n - 1).min(self.rows.len() - 1),
         };
         let start = first.saturating_sub(DEFAULT_OVERSCAN);
         let mut end = last
             .saturating_add(DEFAULT_OVERSCAN)
-            .min(self.items.len() - 1);
-        if end.saturating_sub(start) + 1 > MAX_PAINTED_ITEMS {
-            end = start + MAX_PAINTED_ITEMS - 1;
+            .min(self.rows.len() - 1);
+        if end.saturating_sub(start) + 1 > MAX_PAINTED_ROWS {
+            end = start + MAX_PAINTED_ROWS - 1;
         }
         self.paint_start = start;
         self.paint_end = end;
     }
 
     fn capture_anchor(&mut self) {
-        if self.items.is_empty() {
+        if self.rows.is_empty() {
             self.anchor = None;
             return;
         }
@@ -391,10 +468,10 @@ impl Timeline {
             .partition_point(|top| *top <= self.viewport.scroll_offset)
         {
             0 => 0,
-            n => (n - 1).min(self.items.len() - 1),
+            n => (n - 1).min(self.rows.len() - 1),
         };
         self.anchor = Some(TimelineAnchor {
-            id: self.items[index].id(),
+            key: conversation_row_key(&self.rows[index]),
             offset_within: self
                 .viewport
                 .scroll_offset
@@ -464,7 +541,9 @@ fn assert_task_projection(
 
 #[cfg(test)]
 mod tests {
-    use super::{conversation_activity_summary, ActivityCounts, CONVERSATION_CONTENT_MAX_WIDTH};
+    use super::{
+        conversation_activity_summary, ActivityCounts, Timeline, CONVERSATION_CONTENT_MAX_WIDTH,
+    };
     use crate::ui::conversation::fixtures::{generic_item, message_item, tool_item};
     use crate::ui::conversation::rows::{derive_conversation_rows, ConversationVerbosity};
     use crate::ui::renderers::MessageRole;
@@ -477,6 +556,32 @@ mod tests {
         ];
         let rows = derive_conversation_rows(&items, ConversationVerbosity::Calm);
         assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn suppressed_items_produce_no_rows_and_reserve_no_space() {
+        // Guards the real defect surface: the Timeline must paint from
+        // derived rows, not from raw items. A transcript of nothing but
+        // suppressed lifecycle events must render nothing AND occupy no
+        // height -- an invisible 96px gap per event is just a debug card
+        // you cannot see. Built through the real `project`-sharing
+        // constructor, not a hand-assembled struct, so this exercises the
+        // actual row derivation and height bookkeeping.
+        let items = vec![
+            generic_item("session_state"),
+            generic_item("usage_observation"),
+            generic_item("a_kind_invented_after_this_test_was_written"),
+        ];
+        let timeline = Timeline::for_test_items(items);
+        assert!(
+            timeline.rows().is_empty(),
+            "suppressed kinds must produce no rows"
+        );
+        assert_eq!(
+            timeline.content_height(),
+            0,
+            "suppressed kinds must reserve no scroll space"
+        );
     }
 
     #[test]

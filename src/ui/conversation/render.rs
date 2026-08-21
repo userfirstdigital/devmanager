@@ -66,6 +66,42 @@ pub fn conversation_row_element(row: &ConversationRow, tokens: ThemeTokens) -> A
     }
 }
 
+/// Estimated paint height for one row, in the same closed vocabulary as
+/// [`conversation_row_element`] and living beside it so the two cannot
+/// drift. This is scroll/virtualization bookkeeping, not a layout oracle --
+/// GPUI computes the real on-screen height independently when `surface()`
+/// actually paints `conversation_row_element`'s output. A row that never
+/// exists (a suppressed `Generic` item, for instance) never reaches this
+/// function at all, because `derive_conversation_rows` never emitted it --
+/// which is the whole point: no row means no height means no reserved
+/// scroll space, unlike the old item-keyed estimate it replaces.
+pub fn conversation_row_height(row: &ConversationRow, tokens: ThemeTokens) -> u32 {
+    let line_height = tokens.density.typography.body_line_height.max(1.0);
+    let caption_line_height = tokens.density.typography.caption_line_height.max(1.0);
+    let text_lines = |text: &str| text.lines().count().max(1) as f32;
+    match row {
+        ConversationRow::Message {
+            role: MessageRole::Reasoning,
+            text,
+            ..
+        } => (16.0 + text_lines(text) * caption_line_height) as u32,
+        ConversationRow::Message { text, .. } => (16.0 + text_lines(text) * line_height) as u32,
+        ConversationRow::Error { text, .. } => {
+            (32.0 + caption_line_height + text_lines(text) * line_height) as u32
+        }
+        ConversationRow::Activity { entries, .. } => {
+            (entries.len().max(1) as f32 * (ICON_SLOT + 4.0)) as u32
+        }
+        ConversationRow::ActivityToggle { .. } => (ICON_SLOT + 4.0) as u32,
+        ConversationRow::Question {
+            prompt, choices, ..
+        } => (28.0 + text_lines(prompt) * line_height + if choices.is_empty() { 0.0 } else { 32.0 }) as u32,
+        ConversationRow::TurnFold { .. } => 24.0 as u32,
+        ConversationRow::Working { .. } => 20.0 as u32,
+    }
+    .clamp(16, 480)
+}
+
 /// Turn fold. The only hairline anywhere in the transcript.
 fn turn_fold_element(label: &str, expanded: bool, tokens: ThemeTokens) -> AnyElement {
     let chevron = if expanded { "^" } else { "v" };
