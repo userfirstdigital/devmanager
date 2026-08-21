@@ -210,8 +210,9 @@ pub fn derive_conversation_rows(
     let mut rows: Vec<ConversationRow> = Vec::new();
     let mut pending: Vec<ActivityEntry> = Vec::new();
     let mut pending_anchor: Option<TimelineItemId> = None;
+    let mut previous_turn_id: Option<String> = None;
 
-    let mut flush = |rows: &mut Vec<ConversationRow>,
+    let flush = |rows: &mut Vec<ConversationRow>,
                      pending: &mut Vec<ActivityEntry>,
                      anchor: &mut Option<TimelineItemId>| {
         if pending.is_empty() {
@@ -235,6 +236,20 @@ pub fn derive_conversation_rows(
     };
 
     for item in items {
+        if let Some(turn) = &item.turn_id {
+            if let Some(previous) = &previous_turn_id {
+                if previous != turn {
+                    flush(&mut rows, &mut pending, &mut pending_anchor);
+                    rows.push(ConversationRow::TurnFold {
+                        turn_id: turn.clone(),
+                        label: "Earlier turn".to_string(),
+                        expanded: false,
+                    });
+                }
+            }
+            previous_turn_id = Some(turn.clone());
+        }
+
         if let Some(entry) = activity_entry_of(item) {
             if pending_anchor.is_none() {
                 pending_anchor = Some(item.id);
@@ -285,7 +300,53 @@ pub fn derive_conversation_rows(
     }
 
     flush(&mut rows, &mut pending, &mut pending_anchor);
+
+    let tail_is_active = matches!(
+        rows.last(),
+        Some(ConversationRow::Activity {
+            state: ActivityState::Active,
+            ..
+        })
+    );
+    if tail_is_active {
+        rows.push(ConversationRow::Working {
+            elapsed_ms: None,
+            step: None,
+        });
+    }
+
     rows
+}
+
+/// For each row, the index of the row that opened its elapsed-time window. A
+/// user turn opens a boundary; a settled assistant turn closes it. This is the
+/// Rust form of T3 Code's `computeMessageDurationStart`.
+pub fn duration_boundaries(rows: &[ConversationRow]) -> Vec<Option<usize>> {
+    let mut out = Vec::with_capacity(rows.len());
+    let mut open: Option<usize> = None;
+    for (index, row) in rows.iter().enumerate() {
+        match row {
+            ConversationRow::Message {
+                role: MessageRole::User,
+                ..
+            } => {
+                open = Some(index);
+                out.push(open);
+            }
+            ConversationRow::Message {
+                role: MessageRole::Assistant,
+                streaming,
+                ..
+            } => {
+                out.push(open.or(Some(index)));
+                if !*streaming {
+                    open = None;
+                }
+            }
+            _ => out.push(open),
+        }
+    }
+    out
 }
 
 /// Target UX: exactly one activity entry stays visible; the rest sit behind a
@@ -453,8 +514,18 @@ mod tests {
 
     #[test]
     fn minimal_verbosity_keeps_a_running_group() {
+        // This used to assert `len() == 1`. Task 4b adds a trailing `Working`
+        // row whenever the tail activity group is still active (Decision 3),
+        // so a running group under Minimal verbosity now derives two rows:
+        // the kept Activity row this test cares about, plus Working. Assert
+        // the Activity row survives rather than hardcoding a length that is
+        // now a function of two independent features.
         let items = vec![tool_item("t1", "Bash", "running")];
-        assert_eq!(derive_conversation_rows(&items, ConversationVerbosity::Minimal).len(), 1);
+        let rows = derive_conversation_rows(&items, ConversationVerbosity::Minimal);
+        assert!(
+            matches!(rows.first(), Some(ConversationRow::Activity { .. })),
+            "an active group must not be dropped by minimal verbosity, got {rows:?}"
+        );
     }
 
     #[test]
@@ -560,5 +631,72 @@ mod tests {
         assert_eq!(activity_toggle_label(1, false, false), "+1 previous log entry");
         assert_eq!(activity_toggle_label(2, true, true), "Show fewer tool calls");
         assert_eq!(activity_toggle_label(2, true, false), "Show fewer log entries");
+    }
+
+    #[test]
+    fn a_turn_boundary_emits_a_fold_row() {
+        let mut first = message_item(MessageRole::Assistant, "older answer");
+        first.turn_id = Some("turn-1".to_string());
+        let mut second = message_item(MessageRole::User, "next question");
+        second.turn_id = Some("turn-2".to_string());
+        let rows = derive_conversation_rows(&[first, second], ConversationVerbosity::Calm);
+        let folded = rows.iter().any(|row| {
+            matches!(row, ConversationRow::TurnFold { turn_id, .. } if turn_id == "turn-2")
+        });
+        assert!(folded, "a change of turn must emit a fold, got {rows:?}");
+    }
+
+    #[test]
+    fn items_without_a_turn_id_emit_no_fold() {
+        let rows = derive_conversation_rows(
+            &[
+                message_item(MessageRole::User, "a"),
+                message_item(MessageRole::Assistant, "b"),
+            ],
+            ConversationVerbosity::Calm,
+        );
+        assert!(!rows
+            .iter()
+            .any(|row| matches!(row, ConversationRow::TurnFold { .. })));
+    }
+
+    #[test]
+    fn a_running_tool_emits_a_working_row_at_the_tail() {
+        let rows = derive_conversation_rows(
+            &[tool_item("t1", "Bash", "running")],
+            ConversationVerbosity::Calm,
+        );
+        assert!(
+            matches!(rows.last(), Some(ConversationRow::Working { .. })),
+            "an active group must be followed by a working row, got {rows:?}"
+        );
+    }
+
+    #[test]
+    fn a_settled_transcript_emits_no_working_row() {
+        let rows = derive_conversation_rows(
+            &[tool_item("t1", "Bash", "succeeded")],
+            ConversationVerbosity::Calm,
+        );
+        assert!(!rows
+            .iter()
+            .any(|row| matches!(row, ConversationRow::Working { .. })));
+    }
+
+    #[test]
+    fn a_user_message_opens_a_duration_boundary_and_a_settled_assistant_closes_it() {
+        let rows = derive_conversation_rows(
+            &[
+                message_item(MessageRole::User, "q"),
+                message_item(MessageRole::Assistant, "a"),
+                message_item(MessageRole::User, "q2"),
+            ],
+            ConversationVerbosity::Calm,
+        );
+        let boundaries = duration_boundaries(&rows);
+        assert_eq!(boundaries.len(), rows.len());
+        assert_eq!(boundaries[0], Some(0), "a user turn opens its own boundary");
+        assert_eq!(boundaries[1], Some(0), "the answer is measured from the question");
+        assert_eq!(boundaries[2], Some(2), "the next question opens a new boundary");
     }
 }
