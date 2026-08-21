@@ -2753,6 +2753,12 @@ fn drain_deferred_worker_fallback(
     }
 }
 
+/// How often the reaper re-checks workers it already holds. Only used when
+/// `pending` is non-empty: a worker thread finishing does not signal the
+/// reaper's condvar, so held workers must be polled or they are stranded
+/// until an unrelated deferral arrives.
+const REMOTE_WORKER_REAPER_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
 fn spawn_remote_worker_reaper(
     receiver: mpsc::Receiver<DeferredRemoteWorker>,
     signal: Arc<(Mutex<u64>, Condvar)>,
@@ -2799,11 +2805,28 @@ fn spawn_remote_worker_reaper(
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 if *guard == observed_sequence {
-                    let guard = signal
-                        .1
-                        .wait(guard)
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    observed_sequence = *guard;
+                    if pending.is_empty() {
+                        // Nothing in hand: the only thing that can create work
+                        // is a new deferral, and that always signals. Sleep
+                        // until then rather than spinning.
+                        let guard = signal
+                            .1
+                            .wait(guard)
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        observed_sequence = *guard;
+                    } else {
+                        // Workers already in hand finish on their own threads,
+                        // and thread completion is NOT a wake source -- nothing
+                        // signals this condvar when a worker returns. Waiting
+                        // without a timeout here strands a worker that finished
+                        // moments after the scan above, until some unrelated
+                        // deferral happens to wake us. Poll instead.
+                        let (guard, _timed_out) = signal
+                            .1
+                            .wait_timeout(guard, REMOTE_WORKER_REAPER_POLL_INTERVAL)
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        observed_sequence = *guard;
+                    }
                 } else {
                     observed_sequence = *guard;
                 }
