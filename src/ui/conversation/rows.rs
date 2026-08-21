@@ -288,6 +288,77 @@ pub fn derive_conversation_rows(
     rows
 }
 
+/// Target UX: exactly one activity entry stays visible; the rest sit behind a
+/// toggle. This single number is most of why the transcript reads calm.
+pub const MAX_VISIBLE_ACTIVITY_ENTRIES: usize = 1;
+
+pub fn apply_activity_collapse(
+    rows: Vec<ConversationRow>,
+    expanded: &[String],
+) -> Vec<ConversationRow> {
+    let mut out: Vec<ConversationRow> = Vec::with_capacity(rows.len());
+    for row in rows {
+        let ConversationRow::Activity {
+            anchor,
+            entries,
+            state,
+            summary,
+        } = row
+        else {
+            out.push(row);
+            continue;
+        };
+        let group = format!("{anchor:?}");
+        let is_expanded = expanded.iter().any(|candidate| candidate == &group);
+        if entries.len() <= MAX_VISIBLE_ACTIVITY_ENTRIES {
+            out.push(ConversationRow::Activity { anchor, entries, state, summary });
+            continue;
+        }
+        let hidden = entries.len() - MAX_VISIBLE_ACTIVITY_ENTRIES;
+        let only_tools = entries.iter().all(|entry| entry.identity.starts_with("tool:"));
+        let shown = if is_expanded {
+            entries.clone()
+        } else {
+            entries
+                .iter()
+                .rev()
+                .take(MAX_VISIBLE_ACTIVITY_ENTRIES)
+                .rev()
+                .cloned()
+                .collect()
+        };
+        out.push(ConversationRow::Activity {
+            anchor,
+            entries: shown,
+            state,
+            summary,
+        });
+        out.push(ConversationRow::ActivityToggle {
+            group,
+            hidden,
+            expanded: is_expanded,
+            only_tools,
+        });
+    }
+    out
+}
+
+/// Count- and kind-aware toggle copy, matching the Target UX exactly.
+pub fn activity_toggle_label(hidden: usize, expanded: bool, only_tools: bool) -> String {
+    let noun = match (only_tools, hidden) {
+        (true, 1) => "previous tool call",
+        (true, _) => "previous tool calls",
+        (false, 1) => "previous log entry",
+        (false, _) => "previous log entries",
+    };
+    if expanded {
+        let shown = if only_tools { "tool calls" } else { "log entries" };
+        format!("Show fewer {shown}")
+    } else {
+        format!("+{hidden} {noun}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -418,5 +489,76 @@ mod tests {
         );
         let stable = stable_conversation_rows(&rows, rows.clone());
         assert_eq!(rows, stable);
+    }
+
+    #[test]
+    fn a_group_over_the_visible_cap_gains_a_toggle() {
+        let rows = derive_conversation_rows(
+            &[
+                tool_item("t1", "Read", "succeeded"),
+                tool_item("t2", "Read", "succeeded"),
+                tool_item("t3", "Bash", "succeeded"),
+            ],
+            ConversationVerbosity::Calm,
+        );
+        let collapsed = apply_activity_collapse(rows, &[]);
+        assert_eq!(collapsed.len(), 2);
+        match &collapsed[0] {
+            ConversationRow::Activity { entries, .. } => {
+                assert_eq!(entries.len(), MAX_VISIBLE_ACTIVITY_ENTRIES);
+            }
+            other => panic!("expected an activity row, got {other:?}"),
+        }
+        match &collapsed[1] {
+            ConversationRow::ActivityToggle { hidden, expanded, only_tools, .. } => {
+                assert_eq!(*hidden, 2);
+                assert!(!*expanded);
+                assert!(*only_tools);
+            }
+            other => panic!("expected a toggle row, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_expanded_group_shows_every_entry() {
+        let rows = derive_conversation_rows(
+            &[
+                tool_item("t1", "Read", "succeeded"),
+                tool_item("t2", "Read", "succeeded"),
+                tool_item("t3", "Bash", "succeeded"),
+            ],
+            ConversationVerbosity::Calm,
+        );
+        let group = match &rows[0] {
+            ConversationRow::Activity { anchor, .. } => format!("{anchor:?}"),
+            other => panic!("expected an activity row, got {other:?}"),
+        };
+        let expanded = apply_activity_collapse(rows, &[group]);
+        match &expanded[0] {
+            ConversationRow::Activity { entries, .. } => assert_eq!(entries.len(), 3),
+            other => panic!("expected an activity row, got {other:?}"),
+        }
+        match &expanded[1] {
+            ConversationRow::ActivityToggle { expanded, .. } => assert!(*expanded),
+            other => panic!("expected a toggle row, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_group_at_or_under_the_cap_gains_no_toggle() {
+        let rows = derive_conversation_rows(
+            &[tool_item("t1", "Read", "succeeded")],
+            ConversationVerbosity::Calm,
+        );
+        assert_eq!(apply_activity_collapse(rows, &[]).len(), 1);
+    }
+
+    #[test]
+    fn toggle_copy_is_count_and_kind_aware() {
+        assert_eq!(activity_toggle_label(1, false, true), "+1 previous tool call");
+        assert_eq!(activity_toggle_label(3, false, true), "+3 previous tool calls");
+        assert_eq!(activity_toggle_label(1, false, false), "+1 previous log entry");
+        assert_eq!(activity_toggle_label(2, true, true), "Show fewer tool calls");
+        assert_eq!(activity_toggle_label(2, true, false), "Show fewer log entries");
     }
 }
