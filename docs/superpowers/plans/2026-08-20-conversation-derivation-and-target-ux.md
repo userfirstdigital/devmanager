@@ -699,8 +699,8 @@ Without this the transcript re-mounts rows while assistant tokens stream.
         // mints a fresh EventId per call, so calling it twice models two
         // different messages and no key-based reconciliation could ever match
         // them -- copy the id across to model the real thing.
-        let item = message_item("Assistant", MessageRole::Assistant, "Two of");
-        let mut grown = message_item("Assistant", MessageRole::Assistant, "Two of the three");
+        let item = message_item(MessageRole::Assistant, "Two of");
+        let mut grown = message_item(MessageRole::Assistant, "Two of the three");
         grown.id = item.id;
 
         let first = derive_conversation_rows(&[item], ConversationVerbosity::Calm);
@@ -720,7 +720,7 @@ Without this the transcript re-mounts rows while assistant tokens stream.
     #[test]
     fn an_unchanged_row_is_returned_untouched() {
         let rows = derive_conversation_rows(
-            &[message_item("You", MessageRole::User, "hello")],
+            &[message_item(MessageRole::User, "hello")],
             ConversationVerbosity::Calm,
         );
         let stable = stable_conversation_rows(&rows, rows.clone());
