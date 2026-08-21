@@ -130,26 +130,101 @@ pub struct MessageView {
 }
 ```
 
-- [ ] **Step 4: Populate it at the four construction sites**
+- [ ] **Step 4: Thread the discriminant through `SemanticEventBody::Message`**
 
-In `src/ui/renderers/journal_view.rs`, each of the four sites gains `role_kind` beside its existing `role`:
+**Corrected after a first implementation attempt proved this plan wrong.** The four `journal_view.rs` sites do not construct `MessageView` at all - they construct `SemanticEventBody::Message`, and `src/ui/renderers/message.rs` later projects that into a `MessageView`. So adding a field to `MessageView` alone cannot carry the discriminant: `message.rs` has nothing to read it from and can only guess.
+
+The role is destroyed one layer earlier, at `src/ui/renderers/mod.rs:196-200`:
 
 ```rust
-// line ~246
-role: "You".to_string(),
-role_kind: MessageRole::User,
-// line ~251
-role: "Assistant".to_string(),
-role_kind: MessageRole::Assistant,
-// line ~256
-role: "Reasoning".to_string(),
-role_kind: MessageRole::Reasoning,
-// line ~319
-role: format!("Error ({code})"),
-role_kind: MessageRole::Error,
+    Message {
+        role: String,
+        text: String,
+        streaming: bool,
+    },
 ```
 
-Add `MessageRole` to the `use` list at the top of `journal_view.rs`. Then fix `src/ui/renderers/message.rs:121` and `src/ui/renderers/agent.rs:40`, which also construct `MessageView`; give both `role_kind: MessageRole::Assistant` unless the surrounding code already distinguishes a role.
+Add the discriminant there:
+
+```rust
+    Message {
+        /// Display label only. Never match on this.
+        role: String,
+        role_kind: MessageRole,
+        text: String,
+        streaming: bool,
+    },
+```
+
+Populate it at the four `journal_view.rs` sites, each of which already has the typed `SemanticJournalPayload` variant in hand - the discriminant is right there and is currently thrown away:
+
+```rust
+SemanticJournalPayload::UserMessage { text } => SemanticEventBody::Message {
+    role: "You".to_string(),
+    role_kind: MessageRole::User,
+    text: text.clone(),
+    streaming: false,
+},
+SemanticJournalPayload::AssistantText { text } => SemanticEventBody::Message {
+    role: "Assistant".to_string(),
+    role_kind: MessageRole::Assistant,
+    text: text.clone(),
+    streaming: false,
+},
+SemanticJournalPayload::ReasoningSummary { text } => SemanticEventBody::Message {
+    role: "Reasoning".to_string(),
+    role_kind: MessageRole::Reasoning,
+    text: text.clone(),
+    streaming: false,
+},
+```
+
+and the error site at roughly line 319 with `role_kind: MessageRole::Error`.
+
+Then have `message.rs`'s `project` destructure `role_kind` alongside `role` and pass it into the `MessageView` it builds. `AgentView` is a different type and needs no change.
+
+- [ ] **Step 4b: Prove the discriminant survives the projection**
+
+The Step 1 tests construct a `MessageView` by hand, so they cannot detect a `message.rs` that hardcodes one role - which is exactly what a first attempt shipped, green. Add a test that goes through the real projection:
+
+```rust
+    #[test]
+    fn a_reasoning_payload_projects_to_a_reasoning_role_kind() {
+        let event = semantic_event(SemanticEventBody::Message {
+            role: "Reasoning".to_string(),
+            role_kind: MessageRole::Reasoning,
+            text: "checking fences".to_string(),
+            streaming: false,
+        });
+        let item = MessageRenderer.project(&event).expect("projection");
+        match item.content {
+            TimelineItemContent::Message(view) => {
+                assert_eq!(view.role_kind, MessageRole::Reasoning);
+            }
+            other => panic!("expected message content, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_error_payload_does_not_project_as_assistant() {
+        let event = semantic_event(SemanticEventBody::Message {
+            role: "Error (provider)".to_string(),
+            role_kind: MessageRole::Error,
+            text: "exact resume failed".to_string(),
+            streaming: false,
+        });
+        let item = MessageRenderer.project(&event).expect("projection");
+        match item.content {
+            TimelineItemContent::Message(view) => {
+                assert_ne!(view.role_kind, MessageRole::Assistant);
+                assert_eq!(view.role_kind, MessageRole::Error);
+            }
+            other => panic!("expected message content, got {other:?}"),
+        }
+    }
+```
+
+Build `semantic_event` from the existing `SemanticEvent` shape in `src/ui/renderers/mod.rs:144-155`. These two tests are the ones that actually gate this task: a projection that hardcodes `MessageRole::Assistant` must fail them.
 
 - [ ] **Step 5: Run tests to verify they pass**
 
