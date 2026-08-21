@@ -37,7 +37,9 @@ pub use journal_view::{
     ANSWER_QUESTION_ACTION_ID, INSPECT_OPERATION_ACTION_ID, MAX_CONFORMANCE_JOURNAL_EVENTS,
     RESOLVE_APPROVAL_ACTION_ID,
 };
-pub use message::{MarkdownBlock, MarkdownDocument, MessageRenderer, MessageView, PendingLink};
+pub use message::{
+    MarkdownBlock, MarkdownDocument, MessageRenderer, MessageRole, MessageView, PendingLink,
+};
 pub use operation::{OperationRenderState, OperationRenderer, OperationView};
 pub use plan::{PlanRenderer, PlanView};
 pub use question::QuestionRenderer;

@@ -8,9 +8,22 @@ use super::{
 
 pub struct MessageRenderer;
 
+/// Closed conversation role. Classification must read this, never the
+/// human-facing `role` label, which is a display string and may be reworded
+/// or localized at any time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageRole {
+    User,
+    Assistant,
+    Reasoning,
+    Error,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MessageView {
+    /// Display label only. Never match on this.
     pub role: String,
+    pub role_kind: MessageRole,
     pub streaming: bool,
     pub markdown: MarkdownDocument,
 }
@@ -119,6 +132,14 @@ impl SemanticRenderer for MessageRenderer {
             interaction: InteractionEligibility::None,
             content: TimelineItemContent::Message(MessageView {
                 role: role.clone(),
+                // `SemanticEventBody::Message` only carries the display
+                // label, not the originating `MessageRole` — the sending
+                // side (journal_view.rs) erases the discriminant into a
+                // plain string before it reaches this generic projector.
+                // Matching on `role` here to recover it would reintroduce
+                // exactly the string-sniffing this type exists to remove,
+                // so default to `Assistant` rather than guess.
+                role_kind: MessageRole::Assistant,
                 streaming: *streaming,
                 markdown,
             }),
@@ -266,4 +287,44 @@ fn extract_links(text: &str) -> Vec<PendingLink> {
         index += 1;
     }
     links
+}
+
+#[cfg(test)]
+mod role_tests {
+    use super::*;
+
+    #[test]
+    fn role_kind_is_independent_of_the_display_label() {
+        let view = MessageView {
+            role: "Thinking".to_string(),
+            role_kind: MessageRole::Reasoning,
+            streaming: false,
+            markdown: MarkdownDocument {
+                selectable: true,
+                copyable: true,
+                html_executed: false,
+                prose_wraps: true,
+                blocks: Vec::new(),
+                pending_links: Vec::new(),
+            },
+        };
+        // Renaming the label must not change classification.
+        assert_eq!(view.role_kind, MessageRole::Reasoning);
+        assert_ne!(view.role_kind, MessageRole::Assistant);
+    }
+
+    #[test]
+    fn every_role_kind_is_distinct() {
+        let all = [
+            MessageRole::User,
+            MessageRole::Assistant,
+            MessageRole::Reasoning,
+            MessageRole::Error,
+        ];
+        for (index, left) in all.iter().enumerate() {
+            for (other, right) in all.iter().enumerate() {
+                assert_eq!(index == other, left == right);
+            }
+        }
+    }
 }
