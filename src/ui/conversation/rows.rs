@@ -171,6 +171,38 @@ fn activity_entry_of(item: &TimelineItemModel) -> Option<ActivityEntry> {
     }
 }
 
+/// Preserves row identity across derivations so a streaming message updates
+/// in place rather than re-mounting. Keys come from `conversation_row_key`,
+/// which is derived from durable ids, never from content.
+pub fn stable_conversation_rows(
+    previous: &[ConversationRow],
+    next: Vec<ConversationRow>,
+) -> Vec<ConversationRow> {
+    if previous.is_empty() {
+        return next;
+    }
+    let mut prior: Vec<(ConversationRowKey, &ConversationRow)> = previous
+        .iter()
+        .map(|row| (conversation_row_key(row), row))
+        .collect();
+    next.into_iter()
+        .map(|row| {
+            let key = conversation_row_key(&row);
+            match prior.iter().position(|(prior_key, _)| prior_key == &key) {
+                Some(index) => {
+                    let (_, existing) = prior.remove(index);
+                    if existing == &row {
+                        existing.clone()
+                    } else {
+                        row
+                    }
+                }
+                None => row,
+            }
+        })
+        .collect()
+}
+
 pub fn derive_conversation_rows(
     items: &[TimelineItemModel],
     verbosity: ConversationVerbosity,
@@ -352,5 +384,39 @@ mod tests {
     fn minimal_verbosity_keeps_a_running_group() {
         let items = vec![tool_item("t1", "Bash", "running")];
         assert_eq!(derive_conversation_rows(&items, ConversationVerbosity::Minimal).len(), 1);
+    }
+
+    #[test]
+    fn row_keys_survive_a_streaming_text_change() {
+        // A streaming delta is the SAME event carrying more text. `message_item`
+        // mints a fresh EventId per call, so calling it twice models two
+        // different messages and no key-based reconciliation could ever match
+        // them -- copy the id across to model the real thing.
+        let item = message_item(MessageRole::Assistant, "Two of");
+        let mut grown = message_item(MessageRole::Assistant, "Two of the three");
+        grown.id = item.id;
+
+        let first = derive_conversation_rows(&[item], ConversationVerbosity::Calm);
+        let second = derive_conversation_rows(&[grown], ConversationVerbosity::Calm);
+        let stable = stable_conversation_rows(&first, second);
+        assert_eq!(
+            conversation_row_key(&first[0]),
+            conversation_row_key(&stable[0]),
+            "a growing message must keep its key"
+        );
+        match &stable[0] {
+            ConversationRow::Message { text, .. } => assert_eq!(text, "Two of the three"),
+            other => panic!("expected a message row, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unchanged_row_is_returned_untouched() {
+        let rows = derive_conversation_rows(
+            &[message_item(MessageRole::User, "hello")],
+            ConversationVerbosity::Calm,
+        );
+        let stable = stable_conversation_rows(&rows, rows.clone());
+        assert_eq!(rows, stable);
     }
 }
