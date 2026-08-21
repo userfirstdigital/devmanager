@@ -161,7 +161,13 @@ fn activity_entry_of(item: &TimelineItemModel) -> Option<ActivityEntry> {
                 _ => ActivityState::Success,
             },
         }),
-        _ => None,
+        TimelineItemContent::Message(_)
+        | TimelineItemContent::Question(_)
+        | TimelineItemContent::Approval(_)
+        | TimelineItemContent::Operation(_)
+        | TimelineItemContent::Artifact(_)
+        | TimelineItemContent::Agent(_)
+        | TimelineItemContent::Generic(_) => None,
     }
 }
 
