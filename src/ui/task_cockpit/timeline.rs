@@ -12,6 +12,10 @@ use std::collections::BTreeSet;
 use crate::client::model::ClientModel;
 use crate::domain::id::{OperationId, TaskId};
 use crate::protocol::CapabilitySet;
+use crate::ui::conversation::render::conversation_row_element;
+use crate::ui::conversation::rows::{
+    apply_activity_collapse, derive_conversation_rows, ConversationRow, ConversationVerbosity,
+};
 use crate::ui::renderers::{
     inspect_operation, live_target, CapturedActionTarget, JournalAvailability, RenderModelError,
     RendererRegistry, SemanticJournalView, TimelineActivation, TimelineItemId, TimelineItemModel,
@@ -21,64 +25,6 @@ pub const DEFAULT_OVERSCAN: usize = 4;
 pub const MAX_PAINTED_ITEMS: usize = 48;
 /// Shared readable measure for the conversation column and floating composer.
 pub const CONVERSATION_CONTENT_MAX_WIDTH: f32 = 860.0;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ConversationItemVisibility {
-    Message,
-    Reasoning,
-    Activity,
-    Callout,
-    HiddenChrome,
-}
-
-pub(crate) fn conversation_item_visibility(item: &TimelineItemModel) -> ConversationItemVisibility {
-    use crate::ui::renderers::TimelineItemContent;
-    match &item.content {
-        TimelineItemContent::Message(view) => {
-            let role = view.role.to_ascii_lowercase();
-            if role.starts_with("error") {
-                ConversationItemVisibility::Callout
-            } else if role.contains("reason") {
-                ConversationItemVisibility::Reasoning
-            } else {
-                ConversationItemVisibility::Message
-            }
-        }
-        TimelineItemContent::Tool(_) | TimelineItemContent::Plan(_) => {
-            ConversationItemVisibility::Activity
-        }
-        TimelineItemContent::Question(_) | TimelineItemContent::Approval(_) => {
-            ConversationItemVisibility::Callout
-        }
-        TimelineItemContent::Operation(view) if view.needs_me => {
-            ConversationItemVisibility::Callout
-        }
-        TimelineItemContent::Operation(_)
-        | TimelineItemContent::Artifact(_)
-        | TimelineItemContent::Agent(_) => ConversationItemVisibility::Activity,
-        TimelineItemContent::Generic(card) => {
-            if is_hidden_conversation_chrome(&card.source_type, card.title.as_str()) {
-                ConversationItemVisibility::HiddenChrome
-            } else {
-                ConversationItemVisibility::Activity
-            }
-        }
-    }
-}
-
-fn is_hidden_conversation_chrome(source_type: &str, title: &str) -> bool {
-    let haystacks = [source_type, title];
-    haystacks.iter().any(|value| {
-        let lower = value.to_ascii_lowercase();
-        lower.contains("session_state")
-            || lower.contains("session_stale")
-            || lower.contains("turn_state")
-            || lower.contains("usage")
-            || lower.contains("unknown")
-            || lower.contains("malformed")
-            || lower.contains("diagnostic")
-    })
-}
 
 pub(crate) fn conversation_activity_summary(
     items: &[TimelineItemModel],
@@ -147,6 +93,8 @@ pub struct Timeline {
     task_id: TaskId,
     availability: JournalAvailability,
     items: Vec<TimelineItemModel>,
+    rows: Vec<ConversationRow>,
+    expanded_activity: Vec<String>,
     prefix: Vec<u32>,
     content_height: u32,
     viewport: TimelineViewport,
@@ -169,10 +117,16 @@ impl Timeline {
         assert_task_projection(model, task_id, journal)?;
         let captured_target = live_target(model, task_id)?;
         let items = journal.project_items(registry, capabilities)?;
+        let rows = apply_activity_collapse(
+            derive_conversation_rows(&items, ConversationVerbosity::Calm),
+            &[],
+        );
         let mut timeline = Self {
             task_id,
             availability: journal.availability(),
             items,
+            rows,
+            expanded_activity: Vec::new(),
             prefix: Vec::new(),
             content_height: 0,
             viewport,
@@ -213,13 +167,10 @@ impl Timeline {
             JournalAvailability::ConformanceFixture => "Semantic timeline",
         };
         let activity = conversation_activity_summary(&self.items, status);
-        let rows = self
-            .painted_items()
+        let painted_rows = self
+            .rows
             .iter()
-            .filter(|item| {
-                conversation_item_visibility(item) != ConversationItemVisibility::HiddenChrome
-            })
-            .map(|item| conversation_item_element(item, tokens))
+            .map(|row| conversation_row_element(row, tokens))
             .collect::<Vec<_>>();
         div()
             .id("native-semantic-timeline")
@@ -246,13 +197,17 @@ impl Timeline {
                             .child(summary)
                             .into_any_element()
                     }))
-                    .children(rows),
+                    .children(painted_rows),
             )
             .into_any_element()
     }
 
     pub fn items(&self) -> &[TimelineItemModel] {
         &self.items
+    }
+
+    pub fn rows(&self) -> &[ConversationRow] {
+        &self.rows
     }
 
     pub fn item_ids(&self) -> Vec<TimelineItemId> {
@@ -375,13 +330,14 @@ impl Timeline {
         self.prefix.reserve(self.items.len());
         for item in &self.items {
             self.prefix.push(total);
-            let height =
-                if conversation_item_visibility(item) == ConversationItemVisibility::HiddenChrome {
-                    0
-                } else {
-                    item.estimated_height()
-                };
-            total = total.saturating_add(height);
+            // Scroll/virtualization math still walks the raw item list, not
+            // the derived rows: a row can fold several items into one (an
+            // Activity group) or none (a Generic item that contributes no
+            // row), so there is no 1:1 item-to-row height mapping to key
+            // this off. Every item now counts its full estimated height,
+            // including ones whose content produces no visible row -- this
+            // was flagged in the task report rather than guessed past.
+            total = total.saturating_add(item.estimated_height());
         }
         self.content_height = total;
         self.clamp_scroll();
@@ -506,275 +462,22 @@ fn assert_task_projection(
     }
 }
 
-fn conversation_item_element(
-    item: &TimelineItemModel,
-    tokens: crate::ui::tokens::ThemeTokens,
-) -> AnyElement {
-    use crate::ui::renderers::TimelineItemContent;
-    match conversation_item_visibility(item) {
-        ConversationItemVisibility::HiddenChrome => div().into_any_element(),
-        ConversationItemVisibility::Message => match &item.content {
-            TimelineItemContent::Message(view) if is_user_role(&view.role) => {
-                user_message_element(view.markdown.plain_text(), tokens)
-            }
-            TimelineItemContent::Message(view) => {
-                assistant_message_element(&view.role, view.markdown.plain_text(), tokens)
-            }
-            _ => fallback_conversation_element(item, tokens),
-        },
-        ConversationItemVisibility::Reasoning => match &item.content {
-            TimelineItemContent::Message(view) => {
-                reasoning_element(view.markdown.plain_text(), tokens)
-            }
-            _ => fallback_conversation_element(item, tokens),
-        },
-        ConversationItemVisibility::Activity => match &item.content {
-            TimelineItemContent::Tool(view) => tool_activity_element(view, tokens),
-            TimelineItemContent::Plan(view) => {
-                activity_card_element(&view.title, &view.status, &view.steps.join("\n"), tokens)
-            }
-            _ => activity_card_element(
-                item.accessibility.name(),
-                "",
-                &timeline_item_text(item),
-                tokens,
-            ),
-        },
-        ConversationItemVisibility::Callout => match &item.content {
-            TimelineItemContent::Question(view) => {
-                callout_element("Question", &view.prompt, tokens, true)
-            }
-            TimelineItemContent::Approval(view) => {
-                callout_element("Approval", &view.summary, tokens, true)
-            }
-            TimelineItemContent::Message(view)
-                if view.role.to_ascii_lowercase().starts_with("error") =>
-            {
-                callout_element(&view.role, &view.markdown.plain_text(), tokens, false)
-            }
-            _ => callout_element(
-                item.accessibility.name(),
-                &timeline_item_text(item),
-                tokens,
-                true,
-            ),
-        },
-    }
-}
-
-fn is_user_role(role: &str) -> bool {
-    let role = role.to_ascii_lowercase();
-    role == "you" || role == "user" || role.starts_with("user")
-}
-
-fn user_message_element(text: String, tokens: crate::ui::tokens::ThemeTokens) -> AnyElement {
-    div()
-        .w_full()
-        .flex()
-        .justify_end()
-        .child(
-            div()
-                .max_w(px(CONVERSATION_CONTENT_MAX_WIDTH * 0.82))
-                .px(px(tokens.density.spacing.md))
-                .py(px(tokens.density.spacing.sm))
-                .rounded(px(tokens.density.radii.lg))
-                .bg(tokens.surfaces.selection.to_gpui())
-                .text_color(tokens.text.on_selection.to_gpui())
-                .child(text),
-        )
-        .into_any_element()
-}
-
-fn assistant_message_element(
-    role: &str,
-    text: String,
-    tokens: crate::ui::tokens::ThemeTokens,
-) -> AnyElement {
-    div()
-        .w_full()
-        .flex()
-        .flex_col()
-        .gap(px(tokens.density.spacing.xs))
-        .child(
-            div()
-                .text_size(px(tokens.density.typography.caption))
-                .text_color(tokens.text.muted.to_gpui())
-                .child(role.to_string()),
-        )
-        .child(
-            div()
-                .w_full()
-                .text_color(tokens.text.primary.to_gpui())
-                .child(text),
-        )
-        .into_any_element()
-}
-
-fn reasoning_element(text: String, tokens: crate::ui::tokens::ThemeTokens) -> AnyElement {
-    div()
-        .w_full()
-        .px(px(tokens.density.spacing.md))
-        .py(px(tokens.density.spacing.sm))
-        .rounded(px(tokens.density.radii.md))
-        .bg(tokens.surfaces.sunken.to_gpui())
-        .text_size(px(tokens.density.typography.caption))
-        .text_color(tokens.text.secondary.to_gpui())
-        .child(text)
-        .into_any_element()
-}
-
-fn tool_activity_element(
-    view: &crate::ui::renderers::ToolView,
-    tokens: crate::ui::tokens::ThemeTokens,
-) -> AnyElement {
-    let running = matches!(view.state.as_str(), "pending" | "running");
-    let failed = view.state.eq_ignore_ascii_case("failed")
-        || view.summary.to_ascii_lowercase().contains("fail");
-    if running || failed {
-        let detail = if view.summary.trim().is_empty() {
-            view.state.clone()
-        } else {
-            view.summary.clone()
-        };
-        activity_card_element(&view.name, &view.state, &detail, tokens)
-    } else {
-        let line = if view.summary.trim().is_empty() {
-            format!("{} · {}", view.name, view.state)
-        } else {
-            format!("{} · {}", view.name, view.summary)
-        };
-        div()
-            .w_full()
-            .text_size(px(tokens.density.typography.caption))
-            .text_color(tokens.text.muted.to_gpui())
-            .child(line)
-            .into_any_element()
-    }
-}
-
-fn activity_card_element(
-    title: &str,
-    status: &str,
-    detail: &str,
-    tokens: crate::ui::tokens::ThemeTokens,
-) -> AnyElement {
-    let heading = if status.trim().is_empty() {
-        title.to_string()
-    } else {
-        format!("{title} · {status}")
-    };
-    div()
-        .w_full()
-        .px(px(tokens.density.spacing.md))
-        .py(px(tokens.density.spacing.sm))
-        .rounded(px(tokens.density.radii.md))
-        .border(px(1.0))
-        .border_color(tokens.borders.subtle.to_gpui())
-        .bg(tokens.surfaces.raised.to_gpui())
-        .flex()
-        .flex_col()
-        .gap(px(tokens.density.spacing.xxs))
-        .child(
-            div()
-                .text_size(px(tokens.density.typography.caption))
-                .text_color(tokens.text.secondary.to_gpui())
-                .child(heading),
-        )
-        .children((!detail.trim().is_empty()).then(|| {
-            div()
-                .text_color(tokens.text.primary.to_gpui())
-                .child(detail.to_string())
-                .into_any_element()
-        }))
-        .into_any_element()
-}
-
-fn callout_element(
-    title: &str,
-    body: &str,
-    tokens: crate::ui::tokens::ThemeTokens,
-    prominent: bool,
-) -> AnyElement {
-    let border = if title.to_ascii_lowercase().starts_with("error") || !prominent {
-        tokens.status.destructive
-    } else {
-        tokens.borders.focus
-    };
-    div()
-        .w_full()
-        .px(px(tokens.density.spacing.md))
-        .py(px(tokens.density.spacing.md))
-        .rounded(px(tokens.density.radii.md))
-        .border(px(if prominent { 2.0 } else { 1.0 }))
-        .border_color(border.to_gpui())
-        .bg(tokens.surfaces.raised.to_gpui())
-        .flex()
-        .flex_col()
-        .gap(px(tokens.density.spacing.xs))
-        .child(
-            div()
-                .font_weight(gpui::FontWeight::SEMIBOLD)
-                .text_color(if title.to_ascii_lowercase().starts_with("error") {
-                    tokens.status.destructive.to_gpui()
-                } else {
-                    tokens.text.primary.to_gpui()
-                })
-                .child(title.to_string()),
-        )
-        .child(
-            div()
-                .text_color(tokens.text.primary.to_gpui())
-                .child(body.to_string()),
-        )
-        .into_any_element()
-}
-
-fn fallback_conversation_element(
-    item: &TimelineItemModel,
-    tokens: crate::ui::tokens::ThemeTokens,
-) -> AnyElement {
-    div()
-        .w_full()
-        .text_color(tokens.text.secondary.to_gpui())
-        .child(timeline_item_text(item))
-        .into_any_element()
-}
-
-fn timeline_item_text(item: &TimelineItemModel) -> String {
-    use crate::ui::renderers::TimelineItemContent;
-    match &item.content {
-        TimelineItemContent::Message(view) => {
-            format!("{}\n{}", view.role, view.markdown.plain_text())
-        }
-        TimelineItemContent::Tool(view) if view.summary.trim().is_empty() => {
-            format!("{} · {}", view.name, view.state)
-        }
-        TimelineItemContent::Tool(view) => {
-            format!("{} · {}\n{}", view.name, view.state, view.summary)
-        }
-        TimelineItemContent::Question(view) => format!("Question\n{}", view.prompt),
-        TimelineItemContent::Approval(view) => format!("Approval\n{}", view.summary),
-        TimelineItemContent::Plan(view) => {
-            format!(
-                "{} · {}\n{}",
-                view.title,
-                view.status,
-                view.steps.join("\n")
-            )
-        }
-        TimelineItemContent::Generic(view) => view.title.clone(),
-        _ => item.accessibility.name().to_string(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        conversation_activity_summary, conversation_item_visibility, ActivityCounts,
-        ConversationItemVisibility, CONVERSATION_CONTENT_MAX_WIDTH,
-    };
+    use super::{conversation_activity_summary, ActivityCounts, CONVERSATION_CONTENT_MAX_WIDTH};
     use crate::ui::conversation::fixtures::{generic_item, message_item, tool_item};
-    use crate::ui::renderers::{MessageRole, TimelineItemContent};
+    use crate::ui::conversation::rows::{derive_conversation_rows, ConversationVerbosity};
+    use crate::ui::renderers::MessageRole;
+
+    #[test]
+    fn an_unmapped_kind_produces_no_conversation_row_without_a_denylist() {
+        let items = vec![
+            generic_item("session_state"),
+            generic_item("a_kind_invented_after_this_test_was_written"),
+        ];
+        let rows = derive_conversation_rows(&items, ConversationVerbosity::Calm);
+        assert!(rows.is_empty());
+    }
 
     #[test]
     fn ai_acceptance_activity_counts_track_open_lifecycles_only() {
@@ -801,64 +504,6 @@ mod tests {
         activity.observe_plan("subagentStopped");
         activity.observe_plan("taskCompleted");
         assert_eq!(activity, ActivityCounts::default());
-    }
-
-    #[test]
-    fn conversation_hides_lifecycle_usage_and_unknown_diagnostic_chrome() {
-        for source_type in [
-            "session_state",
-            "session_stale",
-            "turn_state",
-            "usage_observation",
-            "unknown_diagnostic",
-        ] {
-            let item = generic_item(source_type);
-            assert_eq!(
-                conversation_item_visibility(&item),
-                ConversationItemVisibility::HiddenChrome,
-                "{source_type} must not paint as a transcript row"
-            );
-        }
-    }
-
-    #[test]
-    fn conversation_classifies_user_and_assistant_message_roles() {
-        let user = message_item(MessageRole::User, "ship the dock collapse");
-        let assistant = message_item(MessageRole::Assistant, "Done — dock starts collapsed.");
-        assert_eq!(
-            conversation_item_visibility(&user),
-            ConversationItemVisibility::Message
-        );
-        assert_eq!(
-            conversation_item_visibility(&assistant),
-            ConversationItemVisibility::Message
-        );
-        match (&user.content, &assistant.content) {
-            (
-                TimelineItemContent::Message(user_view),
-                TimelineItemContent::Message(assistant_view),
-            ) => {
-                assert_eq!(user_view.role, "You");
-                assert_eq!(user_view.markdown.plain_text(), "ship the dock collapse");
-                assert_eq!(assistant_view.role, "Assistant");
-                assert_eq!(
-                    assistant_view.markdown.plain_text(),
-                    "Done — dock starts collapsed."
-                );
-            }
-            _ => panic!("expected message content"),
-        }
-        assert_eq!(
-            conversation_item_visibility(&message_item(MessageRole::Reasoning, "checking fences")),
-            ConversationItemVisibility::Reasoning
-        );
-        assert_eq!(
-            conversation_item_visibility(&message_item(
-                MessageRole::Error,
-                "exact resume failed"
-            )),
-            ConversationItemVisibility::Callout
-        );
     }
 
     #[test]

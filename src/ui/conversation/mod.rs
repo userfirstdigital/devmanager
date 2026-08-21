@@ -2,4 +2,5 @@
 
 #[cfg(test)]
 pub(crate) mod fixtures;
+pub mod render;
 pub mod rows;

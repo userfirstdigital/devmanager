@@ -34,7 +34,7 @@ const WORKING_DOT: f32 = 4.0;
 /// Blend two token colors. The target palette leans on fractional surfaces
 /// (`--accent/20`, `--border/60`) that the token set does not carry directly,
 /// so the prototype mixes them rather than inventing new literals.
-fn mix(base: Color, other: Color, amount: f32) -> Color {
+pub(crate) fn mix(base: Color, other: Color, amount: f32) -> Color {
     let amount = amount.clamp(0.0, 1.0);
     let blend = |a: u8, b: u8| -> u8 {
         let a = f32::from(a);
