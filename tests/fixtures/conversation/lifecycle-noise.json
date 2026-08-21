@@ -1,0 +1,16 @@
+{
+  "schema": "devmanager.conversation.fixture/v1",
+  "id": "lifecycle-noise",
+  "events": [
+    { "kind": "user_message", "text": "find the flake" },
+    { "kind": "session_state", "state": "ready" },
+    { "kind": "turn_state", "state": "running" },
+    { "kind": "usage_observation", "remaining_percent": 82 },
+    { "kind": "unknown_provider_event", "source_type": "provider_v9_frame" },
+    { "kind": "assistant_text", "text": "two share a cause" }
+  ],
+  "expected_rows": [
+    { "kind": "message", "role": "user", "text": "find the flake" },
+    { "kind": "message", "role": "assistant", "text": "two share a cause" }
+  ]
+}
