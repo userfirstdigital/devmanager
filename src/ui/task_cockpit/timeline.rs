@@ -773,13 +773,8 @@ mod tests {
         conversation_activity_summary, conversation_item_visibility, ActivityCounts,
         ConversationItemVisibility, CONVERSATION_CONTENT_MAX_WIDTH,
     };
-    use crate::domain::id::{EventId, TaskId};
-    use crate::ui::components::interaction::{AccessibilityMetadata, AccessibleRole};
-    use crate::ui::renderers::{
-        GenericSemanticCard, GenericStatus, InteractionEligibility, MarkdownBlock,
-        MarkdownDocument, MessageRole, MessageView, ProviderKind, RendererSelection, SemanticKind,
-        TimelineItemContent, TimelineItemId, TimelineItemModel, ToolView,
-    };
+    use crate::ui::conversation::fixtures::{generic_item, message_item, tool_item};
+    use crate::ui::renderers::{MessageRole, TimelineItemContent};
 
     #[test]
     fn ai_acceptance_activity_counts_track_open_lifecycles_only() {
@@ -817,7 +812,7 @@ mod tests {
             "usage_observation",
             "unknown_diagnostic",
         ] {
-            let item = generic_item(source_type, GenericStatus::Unknown);
+            let item = generic_item(source_type);
             assert_eq!(
                 conversation_item_visibility(&item),
                 ConversationItemVisibility::HiddenChrome,
@@ -828,12 +823,8 @@ mod tests {
 
     #[test]
     fn conversation_classifies_user_and_assistant_message_roles() {
-        let user = message_item("You", MessageRole::User, "ship the dock collapse");
-        let assistant = message_item(
-            "Assistant",
-            MessageRole::Assistant,
-            "Done — dock starts collapsed.",
-        );
+        let user = message_item(MessageRole::User, "ship the dock collapse");
+        let assistant = message_item(MessageRole::Assistant, "Done — dock starts collapsed.");
         assert_eq!(
             conversation_item_visibility(&user),
             ConversationItemVisibility::Message
@@ -858,16 +849,11 @@ mod tests {
             _ => panic!("expected message content"),
         }
         assert_eq!(
-            conversation_item_visibility(&message_item(
-                "Reasoning",
-                MessageRole::Reasoning,
-                "checking fences"
-            )),
+            conversation_item_visibility(&message_item(MessageRole::Reasoning, "checking fences")),
             ConversationItemVisibility::Reasoning
         );
         assert_eq!(
             conversation_item_visibility(&message_item(
-                "Error (provider)",
                 MessageRole::Error,
                 "exact resume failed"
             )),
@@ -878,9 +864,9 @@ mod tests {
     #[test]
     fn idle_activity_summary_omits_raw_event_count_and_stays_quiet() {
         let items = vec![
-            message_item("You", MessageRole::User, "hello"),
-            message_item("Assistant", MessageRole::Assistant, "hi"),
-            generic_item("session_state", GenericStatus::Unknown),
+            message_item(MessageRole::User, "hello"),
+            message_item(MessageRole::Assistant, "hi"),
+            generic_item("session_state"),
         ];
         let summary = conversation_activity_summary(&items, "Conversation");
         assert!(
@@ -893,9 +879,9 @@ mod tests {
     #[test]
     fn useful_activity_summary_reports_running_tools_without_event_count() {
         let items = vec![
-            message_item("You", MessageRole::User, "run tests"),
-            tool_item("shell-1", "Bash", "running", ""),
-            generic_item("turn_state", GenericStatus::Unknown),
+            message_item(MessageRole::User, "run tests"),
+            tool_item("shell-1", "Bash", "running"),
+            generic_item("turn_state"),
         ];
         let summary = conversation_activity_summary(&items, "Conversation")
             .expect("running tools are useful activity");
@@ -905,80 +891,5 @@ mod tests {
             !summary.contains("event(s)"),
             "useful activity must still omit the raw event count: {summary}"
         );
-    }
-
-    fn message_item(role: &str, role_kind: MessageRole, text: &str) -> TimelineItemModel {
-        TimelineItemModel {
-            id: TimelineItemId::Event(EventId::new()),
-            task_id: TaskId::new(),
-            renderer_selection: RendererSelection::Specialized(SemanticKind::Message),
-            interaction: InteractionEligibility::None,
-            content: TimelineItemContent::Message(MessageView {
-                role: role.to_string(),
-                role_kind,
-                streaming: false,
-                markdown: MarkdownDocument {
-                    selectable: true,
-                    copyable: true,
-                    html_executed: false,
-                    prose_wraps: true,
-                    blocks: vec![MarkdownBlock::Paragraph {
-                        text: text.to_string(),
-                    }],
-                    pending_links: Vec::new(),
-                },
-            }),
-            activated_on_enter: false,
-            accessibility: AccessibilityMetadata::new(AccessibleRole::Region, role)
-                .expect("accessible name"),
-            turn_id: None,
-            related_event_id: None,
-        }
-    }
-
-    fn tool_item(tool_id: &str, name: &str, state: &str, summary: &str) -> TimelineItemModel {
-        TimelineItemModel {
-            id: TimelineItemId::Event(EventId::new()),
-            task_id: TaskId::new(),
-            renderer_selection: RendererSelection::Specialized(SemanticKind::Tool),
-            interaction: InteractionEligibility::None,
-            content: TimelineItemContent::Tool(ToolView {
-                tool_id: tool_id.to_string(),
-                name: name.to_string(),
-                state: state.to_string(),
-                summary: summary.to_string(),
-                provider_specific: false,
-            }),
-            activated_on_enter: false,
-            accessibility: AccessibilityMetadata::new(AccessibleRole::Status, name)
-                .expect("accessible name"),
-            turn_id: None,
-            related_event_id: None,
-        }
-    }
-
-    fn generic_item(source_type: &str, status: GenericStatus) -> TimelineItemModel {
-        let event_id = EventId::new();
-        TimelineItemModel {
-            id: TimelineItemId::Event(event_id),
-            task_id: TaskId::new(),
-            renderer_selection: RendererSelection::GenericFallback,
-            interaction: InteractionEligibility::None,
-            content: TimelineItemContent::Generic(GenericSemanticCard {
-                event_id,
-                provider: ProviderKind::parse("claude").expect("provider"),
-                source_type: source_type.to_string(),
-                schema_version: 1,
-                status,
-                title: source_type.to_string(),
-                redacted_fields: Vec::new(),
-                raw_terminal_available: false,
-            }),
-            activated_on_enter: false,
-            accessibility: AccessibilityMetadata::new(AccessibleRole::Status, source_type)
-                .expect("accessible name"),
-            turn_id: None,
-            related_event_id: None,
-        }
     }
 }
