@@ -1451,7 +1451,15 @@ git commit -m "test(ui): pin Rust and PWA conversation derivations to one corpus
 
 # Train 2 — Target UX
 
-### Task 6b: Populate `turn_id` so turn folds are not inert
+### Task 6b: RESOLVED - no turn id is persisted; schema work moved to its own spec
+
+**Investigated and closed without code changes.** No per-turn identifier exists anywhere in the durable journal: not in the `semantic_journal_facts` schema, `SemanticJournalFactRow`, `SemanticJournalFact`, any `SemanticJournalPayload` variant, or the `deny_unknown_fields` wire deserializer at `src/providers/journal.rs:821-865`. A real provider-native turn id IS read from Claude and Codex hooks (`src/ai/claude_hooks.rs:585-589`, `src/ai/codex_hooks.rs:208`) but is used as a deduplication key and discarded before the journal.
+
+`ConversationRow::TurnFold` therefore stays in place and stays inert on this branch. Persisting the identifier is a durable schema change and breaks this plan's Global Constraint that journal storage is unchanged, so it lives in its own spec: `docs/superpowers/specs/2026-08-20-persist-provider-turn-id-design.md`. Turn folds begin appearing when that lands; nothing on this branch depends on them.
+
+**Do not synthesize a turn id** from sequence numbers, timestamps, ordering, or message ids to make folds appear sooner. The project's invariants forbid inferring conversation identity that way.
+
+### Task 6b (superseded): Populate `turn_id` so turn folds are not inert
 
 **Discovered during Task 4b review, not in the original plan.** `src/ui/renderers/journal_view.rs:365` sets `turn_id: None` unconditionally on every projected item. Task 4b's `TurnFold` emission is therefore correct and completely inert: no production item ever carries a turn id, so no fold is ever produced, and the Target UX's turn-fold affordance cannot appear.
 
