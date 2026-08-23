@@ -24,6 +24,7 @@ pub struct MessageView {
     /// Display label only. Never match on this.
     pub role: String,
     pub role_kind: MessageRole,
+    pub occurred_at_ms: Option<u64>,
     pub streaming: bool,
     pub markdown: MarkdownDocument,
 }
@@ -134,6 +135,7 @@ impl SemanticRenderer for MessageRenderer {
             content: TimelineItemContent::Message(MessageView {
                 role: role.clone(),
                 role_kind: *role_kind,
+                occurred_at_ms: (event.occurred_at_ms > 0).then_some(event.occurred_at_ms),
                 streaming: *streaming,
                 markdown,
             }),
@@ -292,6 +294,7 @@ mod role_tests {
         let view = MessageView {
             role: "Thinking".to_string(),
             role_kind: MessageRole::Reasoning,
+            occurred_at_ms: None,
             streaming: false,
             markdown: MarkdownDocument {
                 selectable: true,
@@ -368,5 +371,16 @@ mod role_tests {
         };
         assert_ne!(view.role_kind, MessageRole::Assistant);
         assert_eq!(view.role_kind, MessageRole::Error);
+    }
+
+    #[test]
+    fn message_projection_preserves_a_real_timestamp_for_row_chrome() {
+        let mut event = message_event(MessageRole::Assistant);
+        event.occurred_at_ms = 1_725_000_001_234;
+        let model = MessageRenderer.project(&event).expect("message projects");
+        let TimelineItemContent::Message(view) = model.content else {
+            panic!("expected message content");
+        };
+        assert_eq!(view.occurred_at_ms, Some(event.occurred_at_ms));
     }
 }

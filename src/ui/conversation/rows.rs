@@ -51,6 +51,7 @@ pub enum ConversationRow {
         id: TimelineItemId,
         role: MessageRole,
         text: String,
+        occurred_at_ms: Option<u64>,
         streaming: bool,
     },
     Activity {
@@ -97,9 +98,7 @@ pub fn conversation_row_key(row: &ConversationRow) -> ConversationRowKey {
         }
         ConversationRow::Question { id, .. } => ConversationRowKey::Question(format!("{id:?}")),
         ConversationRow::Error { id, .. } => ConversationRowKey::Error(format!("{id:?}")),
-        ConversationRow::TurnFold { turn_id, .. } => {
-            ConversationRowKey::TurnFold(turn_id.clone())
-        }
+        ConversationRow::TurnFold { turn_id, .. } => ConversationRowKey::TurnFold(turn_id.clone()),
         ConversationRow::Working { .. } => ConversationRowKey::Working,
     }
 }
@@ -213,8 +212,8 @@ pub fn derive_conversation_rows(
     let mut previous_turn_id: Option<String> = None;
 
     let flush = |rows: &mut Vec<ConversationRow>,
-                     pending: &mut Vec<ActivityEntry>,
-                     anchor: &mut Option<TimelineItemId>| {
+                 pending: &mut Vec<ActivityEntry>,
+                 anchor: &mut Option<TimelineItemId>| {
         if pending.is_empty() {
             return;
         }
@@ -271,6 +270,7 @@ pub fn derive_conversation_rows(
                         id: item.id,
                         role,
                         text,
+                        occurred_at_ms: view.occurred_at_ms,
                         streaming: view.streaming,
                     }),
                 }
@@ -293,9 +293,9 @@ pub fn derive_conversation_rows(
             | TimelineItemContent::Artifact(_)
             | TimelineItemContent::Agent(_)
             | TimelineItemContent::Generic(_) => {}
-            TimelineItemContent::Tool(_) | TimelineItemContent::Plan(_) => unreachable!(
-                "tool and plan items are handled by activity_entry_of above"
-            ),
+            TimelineItemContent::Tool(_) | TimelineItemContent::Plan(_) => {
+                unreachable!("tool and plan items are handled by activity_entry_of above")
+            }
         }
     }
 
@@ -372,11 +372,18 @@ pub fn apply_activity_collapse(
         let group = format!("{anchor:?}");
         let is_expanded = expanded.iter().any(|candidate| candidate == &group);
         if entries.len() <= MAX_VISIBLE_ACTIVITY_ENTRIES {
-            out.push(ConversationRow::Activity { anchor, entries, state, summary });
+            out.push(ConversationRow::Activity {
+                anchor,
+                entries,
+                state,
+                summary,
+            });
             continue;
         }
         let hidden = entries.len() - MAX_VISIBLE_ACTIVITY_ENTRIES;
-        let only_tools = entries.iter().all(|entry| entry.identity.starts_with("tool:"));
+        let only_tools = entries
+            .iter()
+            .all(|entry| entry.identity.starts_with("tool:"));
         let shown = if is_expanded {
             entries.clone()
         } else {
@@ -413,7 +420,11 @@ pub fn activity_toggle_label(hidden: usize, expanded: bool, only_tools: bool) ->
         (false, _) => "previous log entries",
     };
     if expanded {
-        let shown = if only_tools { "tool calls" } else { "log entries" };
+        let shown = if only_tools {
+            "tool calls"
+        } else {
+            "log entries"
+        };
         format!("Show fewer {shown}")
     } else {
         format!("+{hidden} {noun}")
@@ -426,7 +437,10 @@ mod tests {
 
     #[test]
     fn generic_items_produce_no_conversation_row() {
-        let items = vec![generic_item("session_state"), generic_item("wholly_new_kind")];
+        let items = vec![
+            generic_item("session_state"),
+            generic_item("wholly_new_kind"),
+        ];
         let rows = derive_conversation_rows(&items, ConversationVerbosity::Calm);
         assert!(
             rows.is_empty(),
@@ -452,11 +466,17 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert!(matches!(
             &rows[0],
-            ConversationRow::Message { role: MessageRole::User, .. }
+            ConversationRow::Message {
+                role: MessageRole::User,
+                ..
+            }
         ));
         assert!(matches!(
             &rows[1],
-            ConversationRow::Message { role: MessageRole::Assistant, .. }
+            ConversationRow::Message {
+                role: MessageRole::Assistant,
+                ..
+            }
         ));
     }
 
@@ -497,7 +517,10 @@ mod tests {
 
     #[test]
     fn a_failed_tool_makes_the_group_a_failure() {
-        let items = vec![tool_item("t1", "Read", "succeeded"), tool_item("t2", "Bash", "failed")];
+        let items = vec![
+            tool_item("t1", "Read", "succeeded"),
+            tool_item("t2", "Bash", "failed"),
+        ];
         let rows = derive_conversation_rows(&items, ConversationVerbosity::Calm);
         match &rows[0] {
             ConversationRow::Activity { state, .. } => assert_eq!(*state, ActivityState::Failure),
@@ -509,7 +532,10 @@ mod tests {
     fn minimal_verbosity_drops_settled_successful_activity() {
         let items = vec![tool_item("t1", "Read", "succeeded")];
         assert!(derive_conversation_rows(&items, ConversationVerbosity::Minimal).is_empty());
-        assert_eq!(derive_conversation_rows(&items, ConversationVerbosity::Calm).len(), 1);
+        assert_eq!(
+            derive_conversation_rows(&items, ConversationVerbosity::Calm).len(),
+            1
+        );
     }
 
     #[test]
@@ -581,7 +607,12 @@ mod tests {
             other => panic!("expected an activity row, got {other:?}"),
         }
         match &collapsed[1] {
-            ConversationRow::ActivityToggle { hidden, expanded, only_tools, .. } => {
+            ConversationRow::ActivityToggle {
+                hidden,
+                expanded,
+                only_tools,
+                ..
+            } => {
                 assert_eq!(*hidden, 2);
                 assert!(!*expanded);
                 assert!(*only_tools);
@@ -626,11 +657,26 @@ mod tests {
 
     #[test]
     fn toggle_copy_is_count_and_kind_aware() {
-        assert_eq!(activity_toggle_label(1, false, true), "+1 previous tool call");
-        assert_eq!(activity_toggle_label(3, false, true), "+3 previous tool calls");
-        assert_eq!(activity_toggle_label(1, false, false), "+1 previous log entry");
-        assert_eq!(activity_toggle_label(2, true, true), "Show fewer tool calls");
-        assert_eq!(activity_toggle_label(2, true, false), "Show fewer log entries");
+        assert_eq!(
+            activity_toggle_label(1, false, true),
+            "+1 previous tool call"
+        );
+        assert_eq!(
+            activity_toggle_label(3, false, true),
+            "+3 previous tool calls"
+        );
+        assert_eq!(
+            activity_toggle_label(1, false, false),
+            "+1 previous log entry"
+        );
+        assert_eq!(
+            activity_toggle_label(2, true, true),
+            "Show fewer tool calls"
+        );
+        assert_eq!(
+            activity_toggle_label(2, true, false),
+            "Show fewer log entries"
+        );
     }
 
     #[test]
@@ -640,9 +686,9 @@ mod tests {
         let mut second = message_item(MessageRole::User, "next question");
         second.turn_id = Some("turn-2".to_string());
         let rows = derive_conversation_rows(&[first, second], ConversationVerbosity::Calm);
-        let folded = rows.iter().any(|row| {
-            matches!(row, ConversationRow::TurnFold { turn_id, .. } if turn_id == "turn-2")
-        });
+        let folded = rows.iter().any(
+            |row| matches!(row, ConversationRow::TurnFold { turn_id, .. } if turn_id == "turn-2"),
+        );
         assert!(folded, "a change of turn must emit a fold, got {rows:?}");
     }
 
@@ -668,7 +714,9 @@ mod tests {
         only.turn_id = Some("turn-1".to_string());
         let rows = derive_conversation_rows(&[only], ConversationVerbosity::Calm);
         assert!(
-            !rows.iter().any(|row| matches!(row, ConversationRow::TurnFold { .. })),
+            !rows
+                .iter()
+                .any(|row| matches!(row, ConversationRow::TurnFold { .. })),
             "the first turn must not emit a fold, got {rows:?}"
         );
     }
@@ -723,7 +771,15 @@ mod tests {
         let boundaries = duration_boundaries(&rows);
         assert_eq!(boundaries.len(), rows.len());
         assert_eq!(boundaries[0], Some(0), "a user turn opens its own boundary");
-        assert_eq!(boundaries[1], Some(0), "the answer is measured from the question");
-        assert_eq!(boundaries[2], Some(2), "the next question opens a new boundary");
+        assert_eq!(
+            boundaries[1],
+            Some(0),
+            "the answer is measured from the question"
+        );
+        assert_eq!(
+            boundaries[2],
+            Some(2),
+            "the next question opens a new boundary"
+        );
     }
 }

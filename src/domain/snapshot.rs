@@ -302,6 +302,8 @@ pub struct SnapshotPage {
 pub struct SemanticJournalFact {
     pub id: EventId,
     pub sequence: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occurred_at_ms: Option<i64>,
     pub provider: String,
     pub schema_version: u32,
     pub kind: String,

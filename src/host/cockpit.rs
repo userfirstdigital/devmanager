@@ -325,6 +325,7 @@ fn serve_conversation(
         .map(|event| SemanticJournalFact {
             id: conversation_event_id(task_id, event.sequence),
             sequence: event.sequence,
+            occurred_at_ms: i64::try_from(event.occurred_at_epoch_ms).ok(),
             provider: semantic_provider_name(event.source).to_string(),
             schema_version: 1,
             kind: semantic_payload_kind(&event.kind).to_string(),

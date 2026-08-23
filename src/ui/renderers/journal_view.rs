@@ -360,7 +360,10 @@ fn live_fact_event(
         schema_version: u16::try_from(fact.schema_version).unwrap_or(u16::MAX),
         provider,
         source_type: fact.kind.clone(),
-        occurred_at_ms: fact.sequence,
+        occurred_at_ms: fact
+            .occurred_at_ms
+            .and_then(|value| u64::try_from(value).ok())
+            .unwrap_or(0),
         raw_terminal_available: false,
         turn_id: None,
         related_event_id: None,
@@ -526,4 +529,46 @@ pub(crate) fn activate_approval_item(
             ..live
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::id::EventId;
+    use crate::domain::PrivacyClass;
+
+    #[test]
+    fn live_message_time_comes_from_the_fact_not_its_sequence() {
+        let task_id = TaskId::new();
+        let occurred_at_ms = 1_725_000_001_234_i64;
+        let fact = SemanticJournalFact {
+            id: EventId::new(),
+            sequence: 17,
+            occurred_at_ms: Some(occurred_at_ms),
+            provider: "codex".to_string(),
+            schema_version: 1,
+            kind: "user_message".to_string(),
+            visibility: "task".to_string(),
+            privacy_class: PrivacyClass::LocalOnly,
+            redacted: false,
+            payload: SemanticJournalPayload::UserMessage {
+                text: "hello".to_string(),
+            },
+        };
+        let event = live_fact_event(
+            task_id,
+            CapturedActionTarget {
+                task_id,
+                agent_session_id: None,
+                runtime_generation: 4,
+                request_id: None,
+                action_epoch: 9,
+            },
+            &fact,
+        )
+        .expect("fact projects");
+
+        assert_eq!(event.occurred_at_ms, occurred_at_ms as u64);
+        assert_ne!(event.occurred_at_ms, fact.sequence);
+    }
 }

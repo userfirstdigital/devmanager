@@ -14,8 +14,8 @@ use crate::domain::id::{OperationId, TaskId};
 use crate::protocol::CapabilitySet;
 use crate::ui::conversation::render::{conversation_row_element, conversation_row_height};
 use crate::ui::conversation::rows::{
-    apply_activity_collapse, conversation_row_key, derive_conversation_rows, ConversationRow,
-    ConversationRowKey, ConversationVerbosity,
+    apply_activity_collapse, conversation_row_key, derive_conversation_rows,
+    stable_conversation_rows, ConversationRow, ConversationRowKey, ConversationVerbosity,
 };
 use crate::ui::renderers::{
     inspect_operation, live_target, CapturedActionTarget, JournalAvailability, RenderModelError,
@@ -27,6 +27,10 @@ pub const DEFAULT_OVERSCAN: usize = 4;
 pub const MAX_PAINTED_ROWS: usize = 48;
 /// Shared readable measure for the conversation column and floating composer.
 pub const CONVERSATION_CONTENT_MAX_WIDTH: f32 = 860.0;
+/// Follow re-arm band above the true content bottom. Strict on purpose: a
+/// half-viewport "near end" test re-arms live-follow while the user is reading
+/// history and yanks them back down on the next streamed chunk.
+pub const FOLLOW_REARM_THRESHOLD_PX: u32 = 40;
 
 /// Row heights are estimated at a fixed baseline density/scale, never the
 /// live user theme. Threading the real `ThemeTokens` into this path would
@@ -190,7 +194,11 @@ impl Timeline {
     /// literal that bypasses the code under test.
     #[cfg(test)]
     pub(crate) fn for_test_items(items: Vec<TimelineItemModel>) -> Self {
-        let task_id = TaskId::new();
+        Self::for_test_task_items(TaskId::new(), items)
+    }
+
+    #[cfg(test)]
+    fn for_test_task_items(task_id: TaskId, items: Vec<TimelineItemModel>) -> Self {
         Self::assemble(
             task_id,
             JournalAvailability::LiveProjection,
@@ -246,25 +254,27 @@ impl Timeline {
             .overflow_y_scroll()
             .bg(tokens.surfaces.canvas.to_gpui())
             .child(
-                div()
-                    .id("native-conversation-column")
-                    .w_full()
-                    .mx_auto()
-                    .max_w(px(CONVERSATION_CONTENT_MAX_WIDTH))
-                    .px(px(tokens.density.spacing.md))
-                    .py(px(tokens.density.spacing.lg))
-                    .flex()
-                    .flex_col()
-                    .gap(px(tokens.density.spacing.md))
-                    .children(activity.map(|summary| {
-                        div()
-                            .w_full()
-                            .text_size(px(tokens.density.typography.caption))
-                            .text_color(tokens.text.secondary.to_gpui())
-                            .child(summary)
-                            .into_any_element()
-                    }))
-                    .children(painted_rows),
+                div().w_full().flex().justify_center().px(px(16.0)).child(
+                    div()
+                        .id("native-conversation-column")
+                        // A definite width is required here. The earlier
+                        // `w_full().max_w(..)` form did not clamp in GPUI.
+                        .w(px(CONVERSATION_CONTENT_MAX_WIDTH))
+                        .max_w_full()
+                        .py(px(tokens.density.spacing.lg))
+                        .flex()
+                        .flex_col()
+                        .gap(px(tokens.density.spacing.md))
+                        .children(activity.map(|summary| {
+                            div()
+                                .w_full()
+                                .text_size(px(tokens.density.typography.caption))
+                                .text_color(tokens.text.secondary.to_gpui())
+                                .child(summary)
+                                .into_any_element()
+                        }))
+                        .children(painted_rows),
+                ),
             )
             .into_any_element()
     }
@@ -357,16 +367,57 @@ impl Timeline {
     }
 
     pub fn at_bottom(&self) -> bool {
-        self.content_height <= self.viewport.height
-            || self
-                .viewport
-                .scroll_offset
-                .saturating_add(self.viewport.height)
-                >= self.content_height
+        let visible_end = self
+            .viewport
+            .scroll_offset
+            .saturating_add(self.viewport.height);
+        self.content_height.saturating_sub(visible_end) <= FOLLOW_REARM_THRESHOLD_PX
     }
 
     pub fn show_jump_to_latest(&self) -> bool {
         !self.at_bottom()
+    }
+
+    /// Carry reader intent across a fresh journal projection. Projecting a
+    /// streaming delta constructs new item data, but it must not silently
+    /// reset the viewport to the bottom. A following reader moves to the new
+    /// bottom; a detached reader keeps the same durable row anchor and pixel
+    /// offset while the new tail grows below it.
+    pub(crate) fn preserve_view_state_from(&mut self, previous: &Self) {
+        if self.task_id != previous.task_id {
+            return;
+        }
+
+        let next_rows = apply_activity_collapse(
+            derive_conversation_rows(&self.items, ConversationVerbosity::Calm),
+            &previous.expanded_activity,
+        );
+        self.rows = stable_conversation_rows(&previous.rows, next_rows);
+        self.expanded_activity = previous.expanded_activity.clone();
+        self.viewport = previous.viewport;
+        self.following = previous.following;
+        self.anchor = previous.anchor.clone();
+        self.rebuild_heights();
+
+        if previous.following {
+            self.jump_to_latest();
+            return;
+        }
+
+        if let Some(anchor) = previous.anchor.as_ref() {
+            if let Some(index) = self
+                .rows
+                .iter()
+                .position(|row| conversation_row_key(row) == anchor.key)
+            {
+                self.viewport.scroll_offset =
+                    self.prefix[index].saturating_add(anchor.offset_within);
+            }
+        }
+        self.clamp_scroll();
+        self.following = false;
+        self.refresh_window();
+        self.capture_anchor();
     }
 
     /// Keep the virtual window aligned with the actual conversation canvas.
@@ -395,12 +446,6 @@ impl Timeline {
         self.capture_anchor();
     }
 
-    /// Scroll/virtualization math walks the derived `rows`, not the raw
-    /// `items` list. A row can fold several items into one (an Activity
-    /// group) or none (a suppressed item that produces no row), so keying
-    /// height off items would reserve scroll space for content that never
-    /// paints. Keying off rows means a suppressed item costs zero height,
-    /// because it never produced a row to have a height at all.
     /// Scroll/virtualization math walks the derived `rows`, not the raw
     /// `items` list. A row can fold several items into one (an Activity
     /// group) or none (a suppressed item that produces no row), so keying
@@ -478,6 +523,15 @@ impl Timeline {
                 .saturating_sub(self.prefix[index]),
         });
     }
+
+    #[cfg(test)]
+    fn scroll_to_offset_for_test(&mut self, offset: u32) {
+        self.viewport.scroll_offset = offset;
+        self.clamp_scroll();
+        self.following = self.at_bottom();
+        self.refresh_window();
+        self.capture_anchor();
+    }
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -543,6 +597,7 @@ fn assert_task_projection(
 mod tests {
     use super::{
         conversation_activity_summary, ActivityCounts, Timeline, CONVERSATION_CONTENT_MAX_WIDTH,
+        FOLLOW_REARM_THRESHOLD_PX,
     };
     use crate::ui::conversation::fixtures::{generic_item, message_item, tool_item};
     use crate::ui::conversation::rows::{derive_conversation_rows, ConversationVerbosity};
@@ -640,6 +695,82 @@ mod tests {
         assert!(
             !summary.contains("event(s)"),
             "useful activity must still omit the raw event count: {summary}"
+        );
+    }
+
+    fn long_timeline(viewport_height: u32) -> Timeline {
+        let items = (0..80)
+            .map(|index| message_item(MessageRole::Assistant, &format!("message {index}")))
+            .collect();
+        let mut timeline = Timeline::for_test_items(items);
+        timeline.set_viewport_height(viewport_height);
+        timeline
+    }
+
+    #[test]
+    fn follow_rearms_within_a_pixel_band_not_only_at_the_exact_bottom() {
+        let mut timeline = long_timeline(400);
+        let offset = timeline
+            .content_height()
+            .saturating_sub(400)
+            .saturating_sub(20);
+        timeline.scroll_to_offset_for_test(offset);
+        assert!(
+            timeline.at_bottom(),
+            "a 20px gap is inside the {FOLLOW_REARM_THRESHOLD_PX}px re-arm band"
+        );
+        assert!(timeline.follow_latest());
+    }
+
+    #[test]
+    fn follow_does_not_rearm_while_reading_history() {
+        let mut timeline = long_timeline(400);
+        timeline.scroll_to_offset_for_test(400);
+        assert!(!timeline.at_bottom());
+        assert!(!timeline.follow_latest());
+    }
+
+    #[test]
+    fn follow_band_is_strictly_bounded_to_forty_pixels() {
+        let mut timeline = long_timeline(400);
+        let offset = timeline
+            .content_height()
+            .saturating_sub(400)
+            .saturating_sub(FOLLOW_REARM_THRESHOLD_PX + 1);
+        timeline.scroll_to_offset_for_test(offset);
+        assert!(!timeline.at_bottom());
+    }
+
+    #[test]
+    fn a_streaming_append_keeps_a_detached_readers_anchor_stable() {
+        let mut previous = long_timeline(400);
+        previous.scroll_to_offset_for_test(400);
+        let anchor = previous.visible_anchor_key().expect("reader anchor");
+        let offset = previous.viewport.scroll_offset;
+
+        let mut grown_items = previous.items.clone();
+        grown_items.push(message_item(MessageRole::Assistant, "new streamed tail"));
+        let mut next = Timeline::for_test_task_items(previous.task_id, grown_items);
+        next.preserve_view_state_from(&previous);
+
+        assert_eq!(next.visible_anchor_key(), Some(anchor));
+        assert_eq!(next.viewport.scroll_offset, offset);
+        assert!(!next.follow_latest());
+    }
+
+    #[test]
+    fn a_streaming_append_moves_a_following_reader_to_the_new_bottom() {
+        let previous = long_timeline(400);
+        assert!(previous.follow_latest());
+        let mut grown_items = previous.items.clone();
+        grown_items.push(message_item(MessageRole::Assistant, "new streamed tail"));
+        let mut next = Timeline::for_test_task_items(previous.task_id, grown_items);
+        next.preserve_view_state_from(&previous);
+
+        assert!(next.follow_latest());
+        assert_eq!(
+            next.viewport.scroll_offset,
+            next.content_height().saturating_sub(next.viewport.height)
         );
     }
 }

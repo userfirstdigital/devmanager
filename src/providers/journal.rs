@@ -1505,6 +1505,7 @@ impl JournalEvent {
         SemanticJournalFact {
             id: self.id,
             sequence: self.sequence,
+            occurred_at_ms: Some(self.occurred_at_ms),
             provider: provider_kind_sql(self.provider).to_string(),
             schema_version: self.schema_version,
             kind: self.kind.as_str().to_string(),
@@ -3435,6 +3436,7 @@ struct PersistedJournalPayloadProbe<'a> {
 struct JournalFactProjection<'a, P> {
     id: EventId,
     sequence: u64,
+    occurred_at_ms: i64,
     provider: &'a str,
     schema_version: u32,
     kind: &'a str,
@@ -3449,9 +3451,10 @@ impl<P: Serialize> Serialize for JournalFactProjection<'_, P> {
     where
         S: Serializer,
     {
-        let mut fact = serializer.serialize_struct("SemanticJournalFact", 9)?;
+        let mut fact = serializer.serialize_struct("SemanticJournalFact", 10)?;
         fact.serialize_field("id", &self.id)?;
         fact.serialize_field("sequence", &self.sequence)?;
+        fact.serialize_field("occurred_at_ms", &self.occurred_at_ms)?;
         fact.serialize_field("provider", &self.provider)?;
         fact.serialize_field("schema_version", &self.schema_version)?;
         fact.serialize_field("kind", &self.kind)?;
@@ -3536,6 +3539,7 @@ fn page_fact_projection<'a>(
     Ok(JournalFactProjection {
         id: EventId::from_bytes(row.event_id).map_err(|_| JournalError::Store)?,
         sequence,
+        occurred_at_ms: row.occurred_at_ms,
         provider: provider_kind_sql(provider),
         schema_version,
         kind: &row.kind,
@@ -3567,6 +3571,7 @@ fn page_fact_projection_preflight<'a>(
     Ok(JournalFactProjection {
         id: EventId::from_bytes(event_id).map_err(|_| JournalError::Store)?,
         sequence,
+        occurred_at_ms: row.occurred_at_ms,
         provider: provider_kind_sql(provider),
         schema_version,
         kind: row.kind,

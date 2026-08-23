@@ -1,21 +1,24 @@
 //! Target UX painting for derived conversation rows.
 //!
-//! Every element body here is ported from the throwaway look prototype at
-//! `src/ui/conversation_preview.rs` (committed at `5336cc2`), which already
-//! answered whether GPUI could land the Target UX treatments. This module is
-//! the first production consumer of that prototype: it paints the *closed*
+//! Every element body here was promoted from the throwaway look prototype
+//! committed at `5336cc2`, which answered whether GPUI could land the Target
+//! UX treatments before production code changed. This module paints the *closed*
 //! `ConversationRow` vocabulary, so there is no fallback arm and no way for
 //! an unmapped provider event to reach the screen -- it never becomes a row
 //! in the first place (see `rows.rs`).
 
-use gpui::{div, px, AnyElement, FontWeight, IntoElement, ParentElement, Styled};
+use gpui::{
+    div, font, px, AnyElement, ClipboardItem, ElementId, Font, FontFeatures, FontWeight,
+    InteractiveElement, IntoElement, ParentElement, StatefulInteractiveElement, Styled,
+};
+use std::sync::{Arc, OnceLock};
+use time::{format_description, format_description::BorrowedFormatItem, OffsetDateTime, UtcOffset};
 
 use crate::ui::conversation::rows::{
     activity_toggle_label, ActivityEntry, ActivityState, ConversationRow,
 };
-use crate::ui::conversation_preview::mix;
 use crate::ui::renderers::MessageRole;
-use crate::ui::tokens::ThemeTokens;
+use crate::ui::tokens::{mix_color, ThemeTokens};
 
 /// Target: the user bubble caps at 80 percent of the readable measure.
 const USER_BUBBLE_FRACTION: f32 = 0.80;
@@ -25,6 +28,24 @@ const USER_BUBBLE_RADIUS: f32 = 16.0;
 const ICON_SLOT: f32 = 20.0;
 /// Target: the working indicator uses three 4 px dots.
 const WORKING_DOT: f32 = 4.0;
+const META_REST_OPACITY: f32 = 0.0;
+const META_REVEALED_OPACITY: f32 = 1.0;
+
+fn tabular_numeral_font() -> Font {
+    // GPUI 0.2.2 can refine font features only through `Styled::font`, so
+    // start from its system-UI font helper and change just the feature set.
+    let mut font = font(".SystemUIFont");
+    font.features = FontFeatures(Arc::new(vec![("tnum".to_string(), 1)]));
+    font
+}
+
+fn message_meta_opacity(revealed: bool) -> f32 {
+    if revealed {
+        META_REVEALED_OPACITY
+    } else {
+        META_REST_OPACITY
+    }
+}
 
 use crate::ui::task_cockpit::timeline::CONVERSATION_CONTENT_MAX_WIDTH;
 
@@ -33,14 +54,27 @@ pub fn conversation_row_element(row: &ConversationRow, tokens: ThemeTokens) -> A
         ConversationRow::Message {
             role: MessageRole::User,
             text,
+            occurred_at_ms,
             ..
-        } => user_message_element(text.clone(), tokens),
+        } => message_row_element(row, text.clone(), *occurred_at_ms, true, false, tokens),
         ConversationRow::Message {
             role: MessageRole::Reasoning,
             text,
             ..
         } => reasoning_element(text.clone(), tokens),
-        ConversationRow::Message { text, .. } => assistant_message_element(text.clone(), tokens),
+        ConversationRow::Message {
+            text,
+            occurred_at_ms,
+            streaming,
+            ..
+        } => message_row_element(
+            row,
+            text.clone(),
+            *occurred_at_ms,
+            false,
+            *streaming,
+            tokens,
+        ),
         ConversationRow::Error { text, .. } => error_element(text.clone(), tokens),
         ConversationRow::Activity { entries, state, .. } => {
             activity_element(entries, *state, tokens)
@@ -50,16 +84,19 @@ pub fn conversation_row_element(row: &ConversationRow, tokens: ThemeTokens) -> A
             expanded,
             only_tools,
             ..
-        } => toggle_element(activity_toggle_label(*hidden, *expanded, *only_tools), tokens),
+        } => toggle_element(
+            activity_toggle_label(*hidden, *expanded, *only_tools),
+            tokens,
+        ),
         ConversationRow::Question {
             prompt,
             choices,
             settled_choice,
             ..
         } => question_element(prompt, choices, *settled_choice, tokens),
-        ConversationRow::TurnFold { label, expanded, .. } => {
-            turn_fold_element(label, *expanded, tokens)
-        }
+        ConversationRow::TurnFold {
+            label, expanded, ..
+        } => turn_fold_element(label, *expanded, tokens),
         ConversationRow::Working { elapsed_ms, step } => {
             working_element(*elapsed_ms, step.as_deref(), tokens)
         }
@@ -85,7 +122,14 @@ pub fn conversation_row_height(row: &ConversationRow, tokens: ThemeTokens) -> u3
             text,
             ..
         } => (16.0 + text_lines(text) * caption_line_height) as u32,
-        ConversationRow::Message { text, .. } => (16.0 + text_lines(text) * line_height) as u32,
+        ConversationRow::Message {
+            role: MessageRole::User,
+            text,
+            ..
+        } => (24.0 + text_lines(text) * line_height + 4.0 + caption_line_height) as u32,
+        ConversationRow::Message { text, .. } => {
+            (4.0 + text_lines(text) * line_height + 4.0 + caption_line_height) as u32
+        }
         ConversationRow::Error { text, .. } => {
             (32.0 + caption_line_height + text_lines(text) * line_height) as u32
         }
@@ -95,7 +139,10 @@ pub fn conversation_row_height(row: &ConversationRow, tokens: ThemeTokens) -> u3
         ConversationRow::ActivityToggle { .. } => (ICON_SLOT + 4.0) as u32,
         ConversationRow::Question {
             prompt, choices, ..
-        } => (28.0 + text_lines(prompt) * line_height + if choices.is_empty() { 0.0 } else { 32.0 }) as u32,
+        } => {
+            (28.0 + text_lines(prompt) * line_height + if choices.is_empty() { 0.0 } else { 32.0 })
+                as u32
+        }
         ConversationRow::TurnFold { .. } => 24.0 as u32,
         ConversationRow::Working { .. } => 20.0 as u32,
     }
@@ -110,7 +157,7 @@ fn turn_fold_element(label: &str, expanded: bool, tokens: ThemeTokens) -> AnyEle
         .pt(px(4.0))
         .pb(px(8.0))
         .border_b(px(1.0))
-        .border_color(mix(tokens.surfaces.canvas, tokens.borders.subtle, 0.60).to_gpui())
+        .border_color(mix_color(tokens.surfaces.canvas, tokens.borders.subtle, 0.60).to_gpui())
         .child(
             div()
                 .flex()
@@ -138,8 +185,6 @@ fn user_message_element(text: String, tokens: ThemeTokens) -> AnyElement {
         .justify_end()
         .child(
             div()
-                // A definite width, not `w_full().max_w(..)` -- the max_w
-                // form did not clamp in the prototype.
                 .max_w(px(CONVERSATION_CONTENT_MAX_WIDTH * USER_BUBBLE_FRACTION))
                 .p(px(12.0))
                 .rounded(px(USER_BUBBLE_RADIUS))
@@ -148,6 +193,127 @@ fn user_message_element(text: String, tokens: ThemeTokens) -> AnyElement {
                 .child(text),
         )
         .into_any_element()
+}
+
+/// Message chrome remains in layout and the tab order, but is visually
+/// absent until the exact row is hovered or the meta row receives keyboard
+/// focus. This is the same group-hover technique Zed uses for dense row
+/// actions; GPUI scopes the named group to the matching ancestor.
+fn message_row_element(
+    row: &ConversationRow,
+    text: String,
+    occurred_at_ms: Option<u64>,
+    user: bool,
+    streaming: bool,
+    tokens: ThemeTokens,
+) -> AnyElement {
+    let group = format!(
+        "conversation-message-{:?}",
+        crate::ui::conversation::rows::conversation_row_key(row)
+    );
+    let body = if user {
+        user_message_element(text.clone(), tokens)
+    } else {
+        assistant_message_element(text.clone(), tokens)
+    };
+
+    div()
+        .w_full()
+        .group(group.clone())
+        .flex()
+        .flex_col()
+        .gap(px(4.0))
+        .child(body)
+        .child(message_meta_element(
+            group,
+            text,
+            occurred_at_ms,
+            user,
+            streaming,
+            tokens,
+        ))
+        .into_any_element()
+}
+
+/// Cache the parsed timestamp recipe just as Zed does for dense Git-history
+/// rows. Message hover must not reparse a format description while a streamed
+/// conversation is repainting.
+fn message_timestamp_format() -> &'static [BorrowedFormatItem<'static>] {
+    static FORMAT: OnceLock<Vec<BorrowedFormatItem<'static>>> = OnceLock::new();
+    FORMAT.get_or_init(|| {
+        format_description::parse("[hour repr:12 padding:none]:[minute] [period case:lower]")
+            .expect("valid conversation timestamp format")
+    })
+}
+
+fn format_message_timestamp_at_offset(epoch_ms: u64, offset: UtcOffset) -> Option<String> {
+    let timestamp =
+        OffsetDateTime::from_unix_timestamp_nanos((epoch_ms as i128) * 1_000_000).ok()?;
+    timestamp
+        .to_offset(offset)
+        .format(message_timestamp_format())
+        .ok()
+}
+
+fn format_message_timestamp(epoch_ms: Option<u64>) -> Option<String> {
+    let offset = UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC);
+    format_message_timestamp_at_offset(epoch_ms?, offset)
+}
+
+fn message_meta_element(
+    group: String,
+    text: String,
+    occurred_at_ms: Option<u64>,
+    user: bool,
+    streaming: bool,
+    tokens: ThemeTokens,
+) -> AnyElement {
+    let copy_id = (ElementId::from("copy-conversation-message"), group.clone());
+    let mut meta = div()
+        .w_full()
+        .flex()
+        .items_center()
+        .justify_end()
+        .gap(px(8.0))
+        .pr(px(4.0))
+        .opacity(message_meta_opacity(false))
+        .group_hover(group, |style| style.opacity(message_meta_opacity(true)))
+        .tab_index(0)
+        .focus(|style| style.opacity(message_meta_opacity(true)))
+        .font(tabular_numeral_font())
+        .text_size(px(tokens.density.typography.caption))
+        .text_color(mix_color(tokens.surfaces.canvas, tokens.text.muted, 0.55).to_gpui());
+
+    if let Some(timestamp) = format_message_timestamp(occurred_at_ms) {
+        meta = meta.child(timestamp);
+    }
+
+    if !streaming {
+        meta = meta.child(
+            div()
+                .id(copy_id)
+                .cursor_pointer()
+                .hover(|style| style.text_color(tokens.text.primary.to_gpui()))
+                .on_click(move |_event, _window, cx| {
+                    cx.stop_propagation();
+                    cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+                })
+                .child("Copy"),
+        );
+    }
+
+    // Reverting agent work is intentionally advertised only for user turns,
+    // matching the Target UX. The mutation remains host-owned; this painter
+    // cannot mint a rewind request or bypass ComposerFence authority.
+    if user {
+        meta = meta.child(
+            div()
+                .text_color(tokens.text.muted.to_gpui())
+                .child("Revert"),
+        );
+    }
+
+    meta.into_any_element()
 }
 
 /// Assistant turn. No surface, no border, no avatar, no role label.
@@ -191,8 +357,6 @@ fn error_element(text: String, tokens: ThemeTokens) -> AnyElement {
         .px(px(tokens.density.spacing.md))
         .py(px(tokens.density.spacing.md))
         .rounded(px(tokens.density.radii.md))
-        .border(px(2.0))
-        .border_color(tokens.status.destructive.to_gpui())
         .bg(tokens.surfaces.raised.to_gpui())
         .flex()
         .flex_col()
@@ -207,27 +371,19 @@ fn error_element(text: String, tokens: ThemeTokens) -> AnyElement {
         .into_any_element()
 }
 
-/// Tone recolors the heading and, for `Active`, washes the background so a
-/// running entry reads as in-progress rather than settled.
-fn entry_tone(state: ActivityState, tokens: ThemeTokens) -> (gpui::Rgba, gpui::Rgba, &'static str) {
+/// Tone recolors the heading only. Work rows remain on the conversation
+/// canvas at rest; their status never grows into another card surface.
+fn entry_tone(state: ActivityState, tokens: ThemeTokens) -> (gpui::Rgba, &'static str) {
     match state {
-        ActivityState::Success => (tokens.text.primary.to_gpui(), tokens.surfaces.canvas.to_gpui(), "-"),
-        ActivityState::Active => (
-            tokens.text.primary.to_gpui(),
-            mix(tokens.surfaces.canvas, tokens.surfaces.hover, 0.20).to_gpui(),
-            "!",
-        ),
-        ActivityState::Failure => (
-            tokens.status.destructive.to_gpui(),
-            tokens.surfaces.canvas.to_gpui(),
-            "x",
-        ),
+        ActivityState::Success => (tokens.text.primary.to_gpui(), "-"),
+        ActivityState::Active => (tokens.status.warning.to_gpui(), "!"),
+        ActivityState::Failure => (tokens.status.destructive.to_gpui(), "x"),
     }
 }
 
 /// One work / tool entry. Quiet by default; failure recolors the heading only.
 fn work_entry_element(entry: &ActivityEntry, tokens: ThemeTokens) -> AnyElement {
-    let (heading_color, background, icon) = entry_tone(entry.state, tokens);
+    let (heading_color, icon) = entry_tone(entry.state, tokens);
     div()
         .w_full()
         .flex()
@@ -235,8 +391,7 @@ fn work_entry_element(entry: &ActivityEntry, tokens: ThemeTokens) -> AnyElement 
         .gap(px(6.0))
         .px(px(2.0))
         .py(px(2.0))
-        .rounded(px(tokens.density.radii.sm))
-        .bg(background)
+        .rounded(px(6.0))
         .child(
             div()
                 .flex_none()
@@ -266,7 +421,11 @@ fn work_entry_element(entry: &ActivityEntry, tokens: ThemeTokens) -> AnyElement 
 }
 
 /// Activity group. Each visible entry paints as its own quiet work row.
-fn activity_element(entries: &[ActivityEntry], _state: ActivityState, tokens: ThemeTokens) -> AnyElement {
+fn activity_element(
+    entries: &[ActivityEntry],
+    _state: ActivityState,
+    tokens: ThemeTokens,
+) -> AnyElement {
     let mut column = div().w_full().flex().flex_col().gap(px(2.0));
     for entry in entries {
         column = column.child(work_entry_element(entry, tokens));
@@ -284,7 +443,8 @@ fn toggle_element(label: String, tokens: ThemeTokens) -> AnyElement {
         .gap(px(6.0))
         .px(px(2.0))
         .py(px(2.0))
-        .rounded(px(tokens.density.radii.sm))
+        .rounded(px(6.0))
+        .font(tabular_numeral_font())
         .child(
             div()
                 .flex_none()
@@ -367,7 +527,7 @@ fn working_element(elapsed_ms: Option<u64>, step: Option<&str>, tokens: ThemeTok
             .flex_none()
             .size(px(WORKING_DOT))
             .rounded_full()
-            .bg(mix(tokens.surfaces.canvas, tokens.text.muted, 0.30).to_gpui())
+            .bg(mix_color(tokens.surfaces.canvas, tokens.text.muted, 0.30).to_gpui())
     };
     let elapsed_label = match elapsed_ms {
         None => "Working".to_string(),
@@ -390,6 +550,7 @@ fn working_element(elapsed_ms: Option<u64>, step: Option<&str>, tokens: ThemeTok
         .items_center()
         .gap(px(8.0))
         .text_size(px(11.0))
+        .font(tabular_numeral_font())
         .text_color(tokens.text.secondary.to_gpui())
         .child(
             div()
@@ -403,9 +564,74 @@ fn working_element(elapsed_ms: Option<u64>, step: Option<&str>, tokens: ThemeTok
         .child(div().child(elapsed_label))
         .children(step.map(|step| {
             div()
-                .text_color(mix(tokens.surfaces.canvas, tokens.text.muted, 0.55).to_gpui())
+                .text_color(mix_color(tokens.surfaces.canvas, tokens.text.muted, 0.55).to_gpui())
                 .child(format!("- {step}"))
                 .into_any_element()
         }))
         .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_conversation_row_renderer_draws_a_border() {
+        // KNOWN LIMITATION: this is a source-text assertion, and source-text
+        // assertions decay silently. GPUI offers no way to inspect a painted
+        // element's computed style from a unit test, so there is no behavioural
+        // equivalent available today. Split before this test module so the
+        // assertion does not count its own needle, and count `border_b`
+        // separately so a changed anchor cannot silently green the guard.
+        // Re-anchor this on the real element tree if a render harness lands.
+        let source = include_str!("render.rs");
+        let renderers = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("renderer source precedes its tests");
+        assert_eq!(
+            renderers.matches(".border(px(").count(),
+            0,
+            "conversation rows are separated by whitespace and surface \
+             lightness, never by borders"
+        );
+        assert_eq!(
+            renderers.matches(".border_b(px(").count(),
+            1,
+            "exactly one hairline exists, the turn fold's -- if this is 0 the \
+             anchor above has stopped matching and is guarding nothing"
+        );
+    }
+
+    #[test]
+    fn the_user_bubble_caps_at_eighty_percent_of_the_measure() {
+        assert!((USER_BUBBLE_FRACTION - 0.80).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn the_readable_measure_is_eight_hundred_and_sixty() {
+        assert_eq!(CONVERSATION_CONTENT_MAX_WIDTH, 860.0);
+    }
+
+    #[test]
+    fn message_meta_is_invisible_at_rest_and_visible_when_revealed() {
+        assert_eq!(message_meta_opacity(false), 0.0);
+        assert_eq!(message_meta_opacity(true), 1.0);
+    }
+
+    #[test]
+    fn message_timestamp_uses_twelve_hour_local_clock_copy() {
+        assert_eq!(
+            format_message_timestamp_at_offset(0, UtcOffset::UTC).as_deref(),
+            Some("12:00 am")
+        );
+        assert_eq!(
+            format_message_timestamp_at_offset(
+                13 * 60 * 60 * 1_000 + 5 * 60 * 1_000,
+                UtcOffset::UTC
+            )
+            .as_deref(),
+            Some("1:05 pm")
+        );
+    }
 }

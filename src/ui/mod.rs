@@ -10,7 +10,6 @@ pub mod actions;
 pub mod agent_connection;
 pub mod components;
 pub mod conversation;
-pub mod conversation_preview;
 pub mod native_shell;
 pub mod preview;
 pub mod preview_capture;

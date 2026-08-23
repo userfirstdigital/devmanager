@@ -1506,14 +1506,18 @@ mod tests {
         //   2. The sabotage check in Step 4 proves the anchor still matches.
         // Re-anchor this on the real element tree if a render harness lands.
         let source = include_str!("render.rs");
+        let renderers = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("renderer source precedes its tests");
         assert_eq!(
-            source.matches(".border(px(").count(),
+            renderers.matches(".border(px(").count(),
             0,
             "conversation rows are separated by whitespace and surface \
              lightness, never by borders"
         );
         assert_eq!(
-            source.matches(".border_b(px(").count(),
+            renderers.matches(".border_b(px(").count(),
             1,
             "exactly one hairline exists, the turn fold's -- if this is 0 the \
              anchor above has stopped matching and is guarding nothing"
@@ -1566,6 +1570,7 @@ git commit -m "feat(ui): apply target row treatments to the conversation canvas"
 
 **Files:**
 - Modify: `src/ui/task_cockpit/timeline.rs:329-348`
+- Modify: `src/ui/task_cockpit/shell.rs` — preserve the reader's follow/anchor state across fresh projections
 - Test: inline
 
 **Interfaces:**
@@ -1640,70 +1645,32 @@ git commit -m "fix(ui): re-arm live follow within a 40px band above the bottom"
 
 ```rust
     #[test]
-    fn meta_is_absent_at_rest_and_present_when_revealed() {
-        let tokens = theme(ThemeMode::Dark, Density::Comfortable, Scale::Scale100);
-        let key = ConversationRowKey::Message("row-1".to_string());
-        let other = ConversationRowKey::Message("row-2".to_string());
-
-        assert!(
-            hover_meta_is_empty(&key, None, None, tokens),
-            "at rest the row must paint no timestamp, copy or revert"
-        );
-        assert!(
-            hover_meta_is_empty(&key, Some(&other), None, tokens),
-            "hovering a different row must not reveal this one"
-        );
-        assert!(
-            !hover_meta_is_empty(&key, Some(&key), None, tokens),
-            "hovering the row must reveal its meta"
-        );
-        assert!(
-            !hover_meta_is_empty(&key, None, Some(&key), tokens),
-            "keyboard focus must reveal it too, not only the mouse"
-        );
+    fn message_meta_is_invisible_at_rest_and_visible_when_revealed() {
+        assert_eq!(message_meta_opacity(false), 0.0);
+        assert_eq!(message_meta_opacity(true), 1.0);
     }
 ```
 
-`hover_meta_is_empty` is a thin test helper over the same predicate `hover_meta` uses; expose that predicate rather than inspecting the returned element, so the assertion tests behaviour instead of source text. A test that greps `render.rs` for the string `hover_meta` passes as soon as the symbol exists, whether or not it does anything.
+The same helper must feed the resting style, named-group hover style, and focus style. Do not replace this with a grep for a symbol name; that would pass whether or not the runtime styles consume it.
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `CARGO_TARGET_DIR="C:/Temp/devmanager-train2" cargo test --lib conversation::render::tests::meta_is_absent`
-Expected: FAIL - `hover_meta_is_empty` does not exist.
+Run: `CARGO_TARGET_DIR="C:/Temp/devmanager-train2" cargo test --lib conversation::render::tests::message_meta_is_invisible`
+Expected: FAIL - `message_meta_opacity` does not exist.
 
 - [ ] **Step 3: Implement**
 
-**GPUI has no CSS-style group hover.** `.hover(|style| style.bg(..))` - the only hover idiom in this codebase, see `src/ui/native_shell.rs:13478` - restyles the hovered element itself and cannot reveal a child. `Color` has no alpha either: `src/ui/tokens.rs:130` documents that transparency is deliberately not part of the token contract, so fading a child in is not available.
+**Correction after checking the pinned GPUI and Zed source.** GPUI 0.2.2 does have named group hover (`.group(..)` / `.group_hover(..)`), and Zed's `VisibleOnHover` trait uses it for exactly this dense-row action pattern. The earlier entity-state direction was based on an incomplete local search and is superseded. Keep the meta row at opacity zero, reveal it from the exact named ancestor group, and make the meta row a tab stop whose focus style also raises opacity. This avoids adding mutable hover state to the pure `Timeline` projection.
 
-The reveal therefore has to be entity state. Add to `Timeline`:
-
-```rust
-    hovered_row: Option<ConversationRowKey>,
-    focused_row: Option<ConversationRowKey>,
-```
-
-Set them from `on_hover` and focus listeners registered per row in the painting loop, then have `hover_meta` return an empty element unless the row matches:
+Use one shared opacity function for the resting and revealed styles so its contract is directly testable:
 
 ```rust
-/// Timestamp, copy and revert for one message row. Returns an empty element
-/// unless the row is hovered or focused, so the transcript shows content only
-/// at rest.
-pub fn hover_meta(
-    row_key: &ConversationRowKey,
-    hovered: Option<&ConversationRowKey>,
-    focused: Option<&ConversationRowKey>,
-    tokens: ThemeTokens,
-) -> AnyElement {
-    let revealed = hovered == Some(row_key) || focused == Some(row_key);
-    if !revealed {
-        return div().into_any_element();
-    }
-    // timestamp, copy and revert, each carrying an accessible name
-    // ...
+fn message_meta_opacity(revealed: bool) -> f32 {
+    if revealed { 1.0 } else { 0.0 }
 }
 ```
 
-`focused` is a separate parameter rather than folded into `hovered` because keyboard focus must reveal the row too; the spec's accessibility requirements do not allow a mouse-only affordance.
+The painter uses `message_meta_opacity(false)` at rest and `message_meta_opacity(true)` in both `group_hover` and `focus`, so keyboard focus remains a first-class reveal path.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -1730,6 +1697,7 @@ git commit -m "feat(ui): reveal message chrome on hover and focus only"
 - Delete: `src/ui/conversation_preview.rs`
 - Delete: `tests/fixtures/ui/conversation.json`
 - Modify: `src/ui/mod.rs`, `src/ui/preview.rs`, `src/main.rs`
+- Modify: `src/ui/native_shell.rs`, `src/ui/tokens.rs` — promote the prototype's joined composer/context-strip shell into the real interactive composer
 
 - [ ] **Step 1: Remove the prototype**
 
@@ -1760,6 +1728,13 @@ Run the watcher and compare the conversation surface side by side with a running
 git add -A
 git commit -m "chore(ui): remove the throwaway conversation look prototype"
 ```
+
+#### Execution closeout (2026-08-23)
+
+- Tasks 1-10 are implemented in the real native conversation and composer surfaces; the throwaway prototype and fixture are removed.
+- Verification passed in the isolated `C:\Temp\devmanager-conversation-derivation` target: the serial Rust library suite reported 2,754 passed, 0 failed, and 2 ignored; the standalone conversation conformance harness reported 1 passed and 0 failed; and `cargo check --locked --lib --bins --tests` exited 0.
+- Code-level geometry and treatment review confirms borderless rows, a bare assistant turn, an 860 px centered conversation/composer column, named-group hover/focus chrome, and a joined composer/context strip. The composer is a close T3-style approximation while preserving DevManager's existing question, approval, attachment, provider, checkout, and branch behavior.
+- Native pixel/hover confirmation remains unverified in this environment: the Windows computer-control bridge was unavailable, the repository preview rendered its explicit host-unavailable fallback, and its native-host capture path exceeded the fixed first-frame deadline. No production profile or installed process was used as a fallback.
 
 ---
 

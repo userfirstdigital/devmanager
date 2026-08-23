@@ -418,7 +418,10 @@ impl TaskCockpitShell {
             .map_err(|error| error.to_string())
         })();
         match result {
-            Ok(timeline) => {
+            Ok(mut timeline) => {
+                if let Some(previous) = self.timeline.as_ref() {
+                    timeline.preserve_view_state_from(previous);
+                }
                 self.timeline = Some(timeline);
                 self.timeline_error = None;
             }
@@ -700,6 +703,7 @@ mod ai_acceptance_tests {
             facts: vec![SemanticJournalFact {
                 id: fact_id,
                 sequence: 17,
+                occurred_at_ms: None,
                 provider: "claude_code".into(),
                 schema_version: 1,
                 kind: "question".into(),

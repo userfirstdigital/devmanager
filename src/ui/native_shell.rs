@@ -123,7 +123,7 @@ use crate::ui::task_cockpit::{
 
 use crate::ui::terminal_adapter::TerminalDockAdapter;
 pub use crate::ui::terminal_adapter::{TerminalDockState, TERMINAL_ADAPTER_DEPENDENCY};
-use crate::ui::tokens::{RuntimePreferencesSnapshot, StatusMeaning};
+use crate::ui::tokens::{mix_color, RuntimePreferencesSnapshot, StatusMeaning};
 use crate::ui::workspace_layout::{PaneEdge, WindowFrame, WorkspaceLayout, WorkspaceLayoutStore};
 use crate::updater::{UpdaterService, UpdaterSnapshot, UpdaterStage};
 
@@ -188,6 +188,13 @@ const HOST_BOOTSTRAP_REATTACH_TICKS: usize = 60;
 const IDLE_PHOTO_FETCH_TIMEOUT: Duration = Duration::from_secs(8);
 #[cfg_attr(test, allow(dead_code))]
 const IDLE_PHOTO_MAX_BYTES: u64 = 8 * 1024 * 1024;
+const CONVERSATION_COMPOSER_HEIGHT_RESERVE: f32 = 190.0;
+const CONVERSATION_COMPOSER_OUTER_RADIUS: f32 = 22.0;
+const CONVERSATION_COMPOSER_INNER_RADIUS: f32 = 20.0;
+const CONVERSATION_COMPOSER_CONTEXT_INSET: f32 = 22.0;
+const CONVERSATION_COMPOSER_SEND_DIAMETER: f32 = 32.0;
+const CONVERSATION_COMPOSER_PLACEHOLDER: &str =
+    "Ask anything, @tag files/folders, $use skills, or / for commands";
 const COMPOSER_DRAFT_PERSIST_INTERVAL: Duration = Duration::from_millis(250);
 const NATIVE_SHUTDOWN_BUDGET: Duration = Duration::from_secs(2);
 const NATIVE_STARTUP_BUDGET: Duration = Duration::from_secs(5);
@@ -10191,9 +10198,9 @@ impl NativeShell {
         if self.interaction.selected_task().is_none() {
             return self.idle_conversation_photo_surface(tokens, Some(idle_photo_size));
         }
-        const COMPOSER_AND_GUTTER_HEIGHT: f32 = 148.0;
-        let timeline_height =
-            (f32::from(idle_photo_size.height) - COMPOSER_AND_GUTTER_HEIGHT).max(120.0) as u32;
+        let timeline_height = (f32::from(idle_photo_size.height)
+            - CONVERSATION_COMPOSER_HEIGHT_RESERVE)
+            .max(120.0) as u32;
         if let Some(timeline) = self.cockpit.timeline_mut() {
             timeline.set_viewport_height(timeline_height);
         }
@@ -10277,11 +10284,31 @@ impl NativeShell {
             .unwrap_or_default();
         let draft_is_empty = draft.is_empty();
         let draft_has_text = !draft.trim().is_empty();
-        let draft_label = if draft_is_empty {
-            "Ask Claude or Codex to build, fix, or explain…".to_string()
+        let provider_kind = self.active_provider_kind();
+        let draft_label = if draft_is_empty && provider_kind.is_none() {
+            "Enable a provider in Settings".to_string()
+        } else if draft_is_empty {
+            CONVERSATION_COMPOSER_PLACEHOLDER.to_string()
         } else {
             draft
         };
+        let provider_label = match provider_kind {
+            Some(ProviderKind::ClaudeCode) => "Claude Code",
+            Some(ProviderKind::Codex) => "Codex",
+            Some(ProviderKind::Cursor) => "Cursor",
+            None => "Provider",
+        };
+        let (checkout_label, branch_label) = self
+            .interaction
+            .selected_task()
+            .and_then(|task_id| self.client_model.as_ref()?.task(task_id))
+            .map(|snapshot| workspace_context_labels(&snapshot.task.workspace))
+            .unwrap_or_else(|| {
+                (
+                    "Local checkout".to_string(),
+                    "branch unavailable".to_string(),
+                )
+            });
         let mut slash_suggestions = self.slash_command_suggestions();
         if !slash_suggestions.is_empty() {
             self.slash_command_selection = self
@@ -10292,9 +10319,8 @@ impl NativeShell {
             let selected = self.slash_command_selection;
             div()
                 .id("native-task-composer-slash-menu")
-                .w_full()
-                .max_w(px(CONVERSATION_CONTENT_MAX_WIDTH))
-                .mx_auto()
+                .w(px(CONVERSATION_CONTENT_MAX_WIDTH))
+                .max_w_full()
                 .max_h(px(260.0))
                 .overflow_hidden()
                 .flex()
@@ -10456,157 +10482,237 @@ impl NativeShell {
             })
             .collect::<Vec<_>>();
         let showing_provider_terminal = self.cockpit.dock().showing_raw_terminal();
+        let composer_hairline = mix_color(tokens.surfaces.canvas, tokens.borders.subtle, 0.65);
+        let composer_pill = |label: &str| {
+            div()
+                .flex()
+                .items_center()
+                .px(px(10.0))
+                .py(px(5.0))
+                .rounded_full()
+                .bg(tokens.surfaces.sunken.to_gpui())
+                .text_size(px(tokens.density.typography.caption))
+                .text_color(tokens.text.secondary.to_gpui())
+                .child(label.to_string())
+                .into_any_element()
+        };
+        let send_base = div()
+            .id("native-task-composer-send")
+            .flex_none()
+            .size(px(CONVERSATION_COMPOSER_SEND_DIAMETER))
+            .rounded_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_size(px(tokens.density.typography.body))
+            .font_weight(FontWeight::SEMIBOLD);
+        let send_control = if send_enabled {
+            send_base
+                .cursor_pointer()
+                .bg(tokens.actions.primary.default.background.to_gpui())
+                .text_color(tokens.actions.primary.default.foreground.to_gpui())
+                .on_click(send)
+                .child("↑")
+        } else {
+            send_base
+                .bg(tokens.surfaces.disabled.to_gpui())
+                .text_color(tokens.text.disabled.to_gpui())
+                .child(if send_available { "↑" } else { "…" })
+        };
         let composer_footer = if self.composer.is_some() {
             div()
                 .id("native-task-composer")
                 .w_full()
                 .flex_none()
-                .px(px(tokens.density.spacing.md))
-                .pb(px(tokens.density.spacing.md))
-                .pt(px(tokens.density.spacing.sm))
+                .px(px(16.0))
+                .pb(px(12.0))
+                .pt(px(8.0))
                 .flex()
                 .flex_col()
-                .gap(px(tokens.density.spacing.sm))
-                .children(slash_menu)
-                .child(
+                .gap(px(0.0))
+                .children(slash_menu.map(|menu| {
                     div()
-                        .id("native-task-composer-card")
                         .w_full()
-                        .max_w(px(CONVERSATION_CONTENT_MAX_WIDTH))
-                        .mx_auto()
                         .flex()
-                        .flex_col()
-                        .gap(px(tokens.density.spacing.sm))
-                        .p(px(tokens.density.spacing.md))
-                        .rounded(px(tokens.density.radii.lg))
-                        .border(px(1.0))
-                        .border_color(tokens.borders.subtle.to_gpui())
-                        .bg(tokens.surfaces.raised.to_gpui())
-                        .shadow_md()
-                        .children((!question_option_buttons.is_empty()).then(|| {
-                            div()
-                                .id("native-question-options")
-                                .w_full()
-                                .flex()
-                                .flex_wrap()
-                                .gap(px(tokens.density.spacing.xs))
-                                .children(question_option_buttons)
-                                .into_any_element()
-                        }))
-                        .children((!image_chips.is_empty()).then(|| {
-                            div()
-                                .id("native-task-composer-attachments")
-                                .w_full()
-                                .flex()
-                                .flex_wrap()
-                                .gap(px(tokens.density.spacing.xs))
-                                .children(image_chips)
-                                .into_any_element()
-                        }))
-                        .child(
-                            div()
-                                .id("native-task-composer-input")
-                                .relative()
-                                .w_full()
-                                .min_h(px(72.0))
-                                .max_h(px(200.0))
-                                .overflow_y_scroll()
-                                .track_focus(&self.composer_focus_handle)
-                                .tab_stop(true)
-                                .cursor_text()
-                                .on_mouse_down(MouseButton::Left, focus)
-                                .on_key_down(key)
-                                .px(px(tokens.density.spacing.md))
-                                .py(px(tokens.density.spacing.sm))
-                                .rounded(px(tokens.density.radii.md))
-                                .border(px(1.0))
-                                .border_color(if self.composer_accessibility_focused {
-                                    tokens.borders.focus.to_gpui()
-                                } else {
-                                    tokens.borders.subtle.to_gpui()
-                                })
-                                .bg(tokens.surfaces.sunken.to_gpui())
-                                .text_color(if draft_is_empty {
-                                    tokens.text.muted.to_gpui()
-                                } else {
-                                    tokens.text.primary.to_gpui()
-                                })
-                                .child(draft_label)
-                                .child(composer_input_registration),
-                        )
-                        .children(self.composer_error.as_ref().map(|error| {
-                            div()
-                                .text_size(px(tokens.density.typography.caption))
-                                .text_color(tokens.status.destructive.to_gpui())
-                                .child(error.clone())
-                                .into_any_element()
-                        }))
-                        .children(composer_hold.map(|hold| {
-                            div()
-                                .text_size(px(tokens.density.typography.caption))
-                                .text_color(tokens.text.muted.to_gpui())
-                                .child(hold)
-                                .into_any_element()
-                        }))
-                        .child(
-                            div()
-                                .w_full()
-                                .flex()
-                                .items_center()
-                                .justify_between()
-                                .gap(px(tokens.density.spacing.sm))
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap(px(tokens.density.spacing.sm))
-                                        .child(
-                                            Button::new("native-task-composer-attach")
-                                                .label("Attach")
-                                                .ghost()
-                                                .disabled(composer_pending)
-                                                .on_click(attach),
-                                        ),
-                                )
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap(px(tokens.density.spacing.sm))
-                                        .children(has_question.then(|| {
-                                            Button::new("native-task-composer-answer")
-                                                .label("Answer")
-                                                .ghost()
-                                                .on_click(answer)
-                                                .into_any_element()
-                                        }))
-                                        .children(has_approval.then(|| {
-                                            Button::new("native-task-composer-reject")
-                                                .label("Reject")
-                                                .ghost()
-                                                .on_click(reject)
-                                                .into_any_element()
-                                        }))
-                                        .children(has_approval.then(|| {
-                                            Button::new("native-task-composer-approve")
-                                                .label("Approve")
-                                                .ghost()
-                                                .on_click(approve)
-                                                .into_any_element()
-                                        }))
-                                        .child(
-                                            Button::new("native-task-composer-send")
-                                                .label(if send_available {
-                                                    "Send"
-                                                } else {
-                                                    "Connecting…"
-                                                })
-                                                .primary()
-                                                .disabled(!send_enabled)
-                                                .on_click(send),
-                                        ),
-                                ),
-                        ),
+                        .justify_center()
+                        .pb(px(6.0))
+                        .child(menu)
+                        .into_any_element()
+                }))
+                .child(
+                    div().w_full().flex().justify_center().child(
+                        div()
+                            .id("native-task-composer-card")
+                            .w(px(CONVERSATION_CONTENT_MAX_WIDTH))
+                            .max_w_full()
+                            // The one-pixel padding is the ring. This is a
+                            // surface recipe, not another field border.
+                            .p(px(1.0))
+                            .rounded_tl(px(CONVERSATION_COMPOSER_OUTER_RADIUS))
+                            .rounded_tr(px(CONVERSATION_COMPOSER_OUTER_RADIUS))
+                            .bg(if self.composer_accessibility_focused {
+                                tokens.borders.focus.to_gpui()
+                            } else {
+                                composer_hairline.to_gpui()
+                            })
+                            .shadow_md()
+                            .child(
+                                div()
+                                    .w_full()
+                                    .rounded_tl(px(CONVERSATION_COMPOSER_INNER_RADIUS))
+                                    .rounded_tr(px(CONVERSATION_COMPOSER_INNER_RADIUS))
+                                    .bg(tokens.surfaces.raised.to_gpui())
+                                    .flex()
+                                    .flex_col()
+                                    .children((!question_option_buttons.is_empty()).then(|| {
+                                        div()
+                                            .id("native-question-options")
+                                            .w_full()
+                                            .px(px(16.0))
+                                            .pt(px(14.0))
+                                            .flex()
+                                            .flex_wrap()
+                                            .gap(px(tokens.density.spacing.xs))
+                                            .children(question_option_buttons)
+                                            .into_any_element()
+                                    }))
+                                    .children((!image_chips.is_empty()).then(|| {
+                                        div()
+                                            .id("native-task-composer-attachments")
+                                            .w_full()
+                                            .px(px(16.0))
+                                            .pt(px(14.0))
+                                            .flex()
+                                            .flex_wrap()
+                                            .gap(px(tokens.density.spacing.xs))
+                                            .children(image_chips)
+                                            .into_any_element()
+                                    }))
+                                    .child(
+                                        div()
+                                            .id("native-task-composer-input")
+                                            .relative()
+                                            .w_full()
+                                            .min_h(px(72.0))
+                                            .max_h(px(200.0))
+                                            .overflow_y_scroll()
+                                            .track_focus(&self.composer_focus_handle)
+                                            .tab_stop(true)
+                                            .cursor_text()
+                                            .on_mouse_down(MouseButton::Left, focus)
+                                            .on_key_down(key)
+                                            .px(px(16.0))
+                                            .pt(px(14.0))
+                                            .pb(px(28.0))
+                                            .text_color(if draft_is_empty {
+                                                tokens.text.muted.to_gpui()
+                                            } else {
+                                                tokens.text.primary.to_gpui()
+                                            })
+                                            .child(draft_label)
+                                            .child(composer_input_registration),
+                                    )
+                                    .children(self.composer_error.as_ref().map(|error| {
+                                        div()
+                                            .w_full()
+                                            .px(px(16.0))
+                                            .pb(px(8.0))
+                                            .text_size(px(tokens.density.typography.caption))
+                                            .text_color(tokens.status.destructive.to_gpui())
+                                            .child(error.clone())
+                                            .into_any_element()
+                                    }))
+                                    .children(composer_hold.map(|hold| {
+                                        div()
+                                            .w_full()
+                                            .px(px(16.0))
+                                            .pb(px(8.0))
+                                            .text_size(px(tokens.density.typography.caption))
+                                            .text_color(tokens.text.muted.to_gpui())
+                                            .child(hold)
+                                            .into_any_element()
+                                    }))
+                                    .child(
+                                        div()
+                                            .w_full()
+                                            .px(px(12.0))
+                                            .pb(px(12.0))
+                                            .flex()
+                                            .items_center()
+                                            .justify_between()
+                                            .gap(px(8.0))
+                                            .child(
+                                                div()
+                                                    .min_w(px(0.0))
+                                                    .flex()
+                                                    .flex_wrap()
+                                                    .items_center()
+                                                    .gap(px(6.0))
+                                                    .child(composer_pill(provider_label))
+                                                    .child(composer_pill("Provider defaults"))
+                                                    .child(composer_pill("Full access")),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex_none()
+                                                    .flex()
+                                                    .items_center()
+                                                    .gap(px(6.0))
+                                                    .children(has_question.then(|| {
+                                                        Button::new("native-task-composer-answer")
+                                                            .label("Answer")
+                                                            .ghost()
+                                                            .on_click(answer)
+                                                            .into_any_element()
+                                                    }))
+                                                    .children(has_approval.then(|| {
+                                                        Button::new("native-task-composer-reject")
+                                                            .label("Reject")
+                                                            .ghost()
+                                                            .on_click(reject)
+                                                            .into_any_element()
+                                                    }))
+                                                    .children(has_approval.then(|| {
+                                                        Button::new("native-task-composer-approve")
+                                                            .label("Approve")
+                                                            .ghost()
+                                                            .on_click(approve)
+                                                            .into_any_element()
+                                                    }))
+                                                    .child(
+                                                        Button::new("native-task-composer-attach")
+                                                            .label("+")
+                                                            .ghost()
+                                                            .disabled(composer_pending)
+                                                            .on_click(attach),
+                                                    )
+                                                    .child(send_control),
+                                            ),
+                                    ),
+                            ),
+                    ),
+                )
+                .child(
+                    div().w_full().flex().justify_center().child(
+                        div()
+                            .id("native-task-composer-context-strip")
+                            .w(px(CONVERSATION_CONTENT_MAX_WIDTH
+                                - 2.0 * CONVERSATION_COMPOSER_CONTEXT_INSET))
+                            .max_w_full()
+                            .px(px(12.0))
+                            .py(px(6.0))
+                            .rounded_bl(px(16.0))
+                            .rounded_br(px(16.0))
+                            .bg(tokens.surfaces.sunken.to_gpui())
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .text_size(px(tokens.density.typography.caption))
+                            .text_color(tokens.text.muted.to_gpui())
+                            .child(checkout_label)
+                            .child(div().flex_1())
+                            .child(branch_label),
+                    ),
                 )
                 .into_any_element()
         } else {
@@ -16099,6 +16205,43 @@ fn workspace_projection_label(workspace: &crate::domain::task::WorkspaceRef) -> 
     }
 }
 
+fn workspace_context_labels(workspace: &crate::domain::task::WorkspaceRef) -> (String, String) {
+    use crate::domain::task::{WorkspaceBindingKind, WorkspaceRef};
+
+    match workspace {
+        WorkspaceRef::Main | WorkspaceRef::MainWithFingerprint { .. } => {
+            ("Local checkout".to_string(), "main".to_string())
+        }
+        WorkspaceRef::Worktree { branch, .. }
+        | WorkspaceRef::WorktreeWithFingerprint { branch, .. } => (
+            "Local worktree".to_string(),
+            bounded_header_text(branch.clone()),
+        ),
+        WorkspaceRef::External { .. } => (
+            "External checkout".to_string(),
+            "branch unavailable".to_string(),
+        ),
+        WorkspaceRef::HostBound { binding }
+        | WorkspaceRef::ExternalWithFingerprint { binding, .. } => {
+            let checkout = match binding.kind() {
+                WorkspaceBindingKind::Main => "Local checkout",
+                WorkspaceBindingKind::Worktree => "Local worktree",
+                WorkspaceBindingKind::External => "External checkout",
+            };
+            let branch = binding.branch().unwrap_or(match binding.kind() {
+                WorkspaceBindingKind::Main => "main",
+                WorkspaceBindingKind::Worktree | WorkspaceBindingKind::External => {
+                    "branch unavailable"
+                }
+            });
+            (
+                checkout.to_string(),
+                bounded_header_text(branch.to_string()),
+            )
+        }
+    }
+}
+
 fn visible_status_label(status: VisibleTaskStatus) -> &'static str {
     match status {
         VisibleTaskStatus::Disconnected => "Disconnected",
@@ -16202,22 +16345,25 @@ mod tests {
         should_schedule_host_bootstrap_retry, take_retained_action_outcomes,
         update_state_from_stage, validate_connected_host_for_shell_launch,
         validate_host_projection_payloads, wait_for_cancellation,
-        worker_should_run_deferred_bootstrap, AccessibilityTree, AccessibleRole, AgentPresence,
-        AgentSessionId, ClientId, CommandId, ComposerControl, ComposerDraftKey, IsolatedDevProfile,
-        MainConversationCanvas, NativeAccessibilityAction, NativeActionRecord, NativeComposerImage,
-        NativeHeaderAttachment, NativeHostActionFailure, NativeHostActionOutcome,
-        NativeHostActionResult, NativeHostChildOwnership, NativeHostClientRuntime,
-        NativeHostLaunchMode, NativeHostLaunchSpec, NativeHostProjection, NativeHostProjectionKind,
-        NativeHostQueryBody, NativeHostRuntimeAttachment, NativeHostRuntimeEpochs,
-        NativeHostRuntimePort, NativeHostState, NativeHostWorkerCommand, NativeInteraction,
-        NativePlatformAccessibilityBridge, NativeShell, NativeShellMode, NativeShutdownDeadline,
-        OverlayTextFieldPart, OwnedChild, OwnedWorker, PaletteItem, PendingHostBootstrap,
-        ProjectId, ProjectInboxItem, ProviderKind, ReaperKind, ShellStage, TaskComposer, TaskId,
-        UpdateState, UpdaterStage, CONVERSATION_CONTENT_MAX_WIDTH, HOST_BOOTSTRAP_REATTACH_TICKS,
-        MAX_ACCESSIBILITY_ACTIONS, MAX_ACTION_LANE_RECORDS, MAX_ACTION_OUTCOME_PROJECTIONS,
-        MAX_HOST_PROJECTIONS, MAX_PENDING_HOST_ACTIONS, MAX_PENDING_PREFERENCES,
-        MAX_RETAINED_CHILDREN, MAX_RETAINED_WORKERS, MAX_RETRY_HOST_ACTIONS,
-        NATIVE_SNAPSHOT_PAGE_ITEMS, PRODUCTION_HOST_PROFILE,
+        worker_should_run_deferred_bootstrap, workspace_context_labels, AccessibilityTree,
+        AccessibleRole, AgentPresence, AgentSessionId, ClientId, CommandId, ComposerControl,
+        ComposerDraftKey, IsolatedDevProfile, MainConversationCanvas, NativeAccessibilityAction,
+        NativeActionRecord, NativeComposerImage, NativeHeaderAttachment, NativeHostActionFailure,
+        NativeHostActionOutcome, NativeHostActionResult, NativeHostChildOwnership,
+        NativeHostClientRuntime, NativeHostLaunchMode, NativeHostLaunchSpec, NativeHostProjection,
+        NativeHostProjectionKind, NativeHostQueryBody, NativeHostRuntimeAttachment,
+        NativeHostRuntimeEpochs, NativeHostRuntimePort, NativeHostState, NativeHostWorkerCommand,
+        NativeInteraction, NativePlatformAccessibilityBridge, NativeShell, NativeShellMode,
+        NativeShutdownDeadline, OverlayTextFieldPart, OwnedChild, OwnedWorker, PaletteItem,
+        PendingHostBootstrap, ProjectId, ProjectInboxItem, ProviderKind, ReaperKind, ShellStage,
+        TaskComposer, TaskId, UpdateState, UpdaterStage, CONVERSATION_COMPOSER_CONTEXT_INSET,
+        CONVERSATION_COMPOSER_INNER_RADIUS, CONVERSATION_COMPOSER_OUTER_RADIUS,
+        CONVERSATION_COMPOSER_PLACEHOLDER, CONVERSATION_COMPOSER_SEND_DIAMETER,
+        CONVERSATION_CONTENT_MAX_WIDTH, HOST_BOOTSTRAP_REATTACH_TICKS, MAX_ACCESSIBILITY_ACTIONS,
+        MAX_ACTION_LANE_RECORDS, MAX_ACTION_OUTCOME_PROJECTIONS, MAX_HOST_PROJECTIONS,
+        MAX_PENDING_HOST_ACTIONS, MAX_PENDING_PREFERENCES, MAX_RETAINED_CHILDREN,
+        MAX_RETAINED_WORKERS, MAX_RETRY_HOST_ACTIONS, NATIVE_SNAPSHOT_PAGE_ITEMS,
+        PRODUCTION_HOST_PROFILE,
     };
     use crate::protocol::FrameLimits;
     use crate::remote::RemoteImageAttachment;
@@ -16231,6 +16377,26 @@ mod tests {
     use std::sync::mpsc::SyncSender;
     use std::sync::{Arc, Mutex, OnceLock};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn target_composer_geometry_and_affordance_copy_are_pinned() {
+        assert_eq!(CONVERSATION_COMPOSER_OUTER_RADIUS, 22.0);
+        assert_eq!(CONVERSATION_COMPOSER_INNER_RADIUS, 20.0);
+        assert_eq!(CONVERSATION_COMPOSER_CONTEXT_INSET, 22.0);
+        assert_eq!(CONVERSATION_COMPOSER_SEND_DIAMETER, 32.0);
+        assert_eq!(
+            CONVERSATION_COMPOSER_PLACEHOLDER,
+            "Ask anything, @tag files/folders, $use skills, or / for commands"
+        );
+    }
+
+    #[test]
+    fn composer_context_separates_checkout_kind_from_branch() {
+        assert_eq!(
+            workspace_context_labels(&crate::domain::task::WorkspaceRef::Main),
+            ("Local checkout".to_string(), "main".to_string())
+        );
+    }
 
     #[test]
     fn native_terminal_keys_cover_provider_tui_navigation_and_text() {

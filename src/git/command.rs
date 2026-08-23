@@ -5754,6 +5754,15 @@ fn apply_git_policy(
         .env("LC_ALL", "C")
         .env("LANG", "C");
 
+    if matches!(policy, GitExecutionPolicy::ReadOnly) {
+        // `git status` may otherwise refresh the index as an optional
+        // optimization. That turns a host-authorized read into a filesystem
+        // mutation and correctly trips the repository graph substitution
+        // guard. Disable only optional locks/effects for read children;
+        // authorized mutations retain Git's required locking semantics.
+        command.env("GIT_OPTIONAL_LOCKS", "0");
+    }
+
     #[cfg(windows)]
     if Path::new(r"C:\Windows").is_dir() {
         command.env("SystemRoot", r"C:\Windows");
@@ -9933,6 +9942,11 @@ mod tests {
             environment.get(&OsString::from("GIT_SEQUENCE_EDITOR")),
             Some(&OsString::from(":"))
         );
+        assert_eq!(
+            environment.get(&OsString::from("GIT_OPTIONAL_LOCKS")),
+            Some(&OsString::from("0")),
+            "read-only Git commands must not opportunistically refresh the index"
+        );
         assert_eq!(environment.get(&OsString::from("GIT_ASKPASS")), None);
         assert_eq!(environment.get(&OsString::from("GIT_SSH_COMMAND")), None);
         assert_ne!(
@@ -9998,6 +10012,11 @@ mod tests {
                 "{key}"
             );
         }
+        assert_eq!(
+            mutation_environment.get(&OsString::from("GIT_OPTIONAL_LOCKS")),
+            None,
+            "authorized mutations retain Git's required locking semantics"
+        );
     }
 
     #[test]

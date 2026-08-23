@@ -31,6 +31,7 @@ pub(crate) fn message_item(role_kind: MessageRole, text: &str) -> TimelineItemMo
         content: TimelineItemContent::Message(MessageView {
             role: role.to_string(),
             role_kind,
+            occurred_at_ms: None,
             streaming: false,
             markdown: MarkdownDocument {
                 selectable: true,

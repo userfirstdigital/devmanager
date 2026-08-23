@@ -55,13 +55,29 @@ struct ConversationFixture {
 #[derive(serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum FixtureEvent {
-    UserMessage { text: String },
-    AssistantText { text: String },
-    ToolCall { tool_id: String, name: String, state: String },
-    SessionState { state: String },
-    TurnState { state: String },
-    UsageObservation { remaining_percent: u8 },
-    UnknownProviderEvent { source_type: String },
+    UserMessage {
+        text: String,
+    },
+    AssistantText {
+        text: String,
+    },
+    ToolCall {
+        tool_id: String,
+        name: String,
+        state: String,
+    },
+    SessionState {
+        state: String,
+    },
+    TurnState {
+        state: String,
+    },
+    UsageObservation {
+        remaining_percent: u8,
+    },
+    UnknownProviderEvent {
+        source_type: String,
+    },
 }
 
 #[derive(serde::Deserialize, Debug, PartialEq, Eq)]
@@ -70,15 +86,19 @@ enum ExpectedRow {
     Message { role: String, text: String },
     Activity { entries: usize, state: String },
     ActivityToggle { hidden: usize },
+    Question { prompt: String },
+    Error { text: String },
+    TurnFold { turn_id: String },
+    Working,
 }
 
 fn assert_conversation_fixture(path: &std::path::Path) {
     let bytes = std::fs::read(path).expect("fixture bytes");
-    let fixture: ConversationFixture =
-        serde_json::from_slice(&bytes).expect("fixture parses");
+    let fixture: ConversationFixture = serde_json::from_slice(&bytes).expect("fixture parses");
     assert_eq!(
         fixture.schema, "devmanager.conversation.fixture/v1",
-        "{} has an unexpected schema", fixture.id
+        "{} has an unexpected schema",
+        fixture.id
     );
 
     let items: Vec<TimelineItemModel> = fixture.events.iter().map(item_for_event).collect();
@@ -87,16 +107,22 @@ fn assert_conversation_fixture(path: &std::path::Path) {
         &[],
     );
 
-    let actual: Vec<ExpectedRow> = rows.iter().filter_map(summarize_row).collect();
+    let actual: Vec<ExpectedRow> = rows.iter().map(summarize_row).collect();
     assert_eq!(
         actual, fixture.expected_rows,
-        "fixture {} derived the wrong rows", fixture.id
+        "fixture {} derived the wrong rows",
+        fixture.id
     );
 }
 
-fn summarize_row(row: &ConversationRow) -> Option<ExpectedRow> {
+fn summarize_row(row: &ConversationRow) -> ExpectedRow {
+    // Total over `ConversationRow`: a spurious row of any of the four kinds
+    // that never appear in this corpus (Question, Error, TurnFold, Working)
+    // must still be REPORTED by the comparison, not silently dropped. Adding
+    // a variant to `ConversationRow` is a compile error here, matching the
+    // wildcard-free matches in rows.rs itself.
     match row {
-        ConversationRow::Message { role, text, .. } => Some(ExpectedRow::Message {
+        ConversationRow::Message { role, text, .. } => ExpectedRow::Message {
             role: match role {
                 MessageRole::User => "user".to_string(),
                 MessageRole::Assistant => "assistant".to_string(),
@@ -104,15 +130,22 @@ fn summarize_row(row: &ConversationRow) -> Option<ExpectedRow> {
                 MessageRole::Error => "error".to_string(),
             },
             text: text.clone(),
-        }),
-        ConversationRow::Activity { entries, state, .. } => Some(ExpectedRow::Activity {
+        },
+        ConversationRow::Activity { entries, state, .. } => ExpectedRow::Activity {
             entries: entries.len(),
             state: format!("{state:?}").to_lowercase(),
-        }),
+        },
         ConversationRow::ActivityToggle { hidden, .. } => {
-            Some(ExpectedRow::ActivityToggle { hidden: *hidden })
+            ExpectedRow::ActivityToggle { hidden: *hidden }
         }
-        _ => None,
+        ConversationRow::Question { prompt, .. } => ExpectedRow::Question {
+            prompt: prompt.clone(),
+        },
+        ConversationRow::Error { text, .. } => ExpectedRow::Error { text: text.clone() },
+        ConversationRow::TurnFold { turn_id, .. } => ExpectedRow::TurnFold {
+            turn_id: turn_id.clone(),
+        },
+        ConversationRow::Working { .. } => ExpectedRow::Working,
     }
 }
 
@@ -130,7 +163,11 @@ fn item_for_event(event: &FixtureEvent) -> TimelineItemModel {
     match event {
         FixtureEvent::UserMessage { text } => message_item(MessageRole::User, text),
         FixtureEvent::AssistantText { text } => message_item(MessageRole::Assistant, text),
-        FixtureEvent::ToolCall { tool_id, name, state } => tool_item(tool_id, name, state),
+        FixtureEvent::ToolCall {
+            tool_id,
+            name,
+            state,
+        } => tool_item(tool_id, name, state),
         FixtureEvent::SessionState { .. } => generic_item("session_state"),
         FixtureEvent::TurnState { .. } => generic_item("turn_state"),
         FixtureEvent::UsageObservation { .. } => generic_item("usage_observation"),
@@ -157,6 +194,7 @@ fn message_item(role_kind: MessageRole, text: &str) -> TimelineItemModel {
         content: TimelineItemContent::Message(MessageView {
             role: role.to_string(),
             role_kind,
+            occurred_at_ms: None,
             streaming: false,
             markdown: MarkdownDocument {
                 selectable: true,

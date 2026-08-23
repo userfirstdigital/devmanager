@@ -87,6 +87,14 @@
   a sequence-skipping terminal. Use persistent per-stream progress notification;
   do not add a channel allocation to every ordinary durable event.
 
+## Git child-process discipline
+
+- Every host-authorized read-only Git child must set `GIT_OPTIONAL_LOCKS=0`.
+  Commands such as `git status` may otherwise refresh the index and make the
+  fail-closed repository graph validator observe its own read as a mutation.
+  Do not set this variable for authorized mutation children; they must retain
+  Git's normal locking guarantees.
+
 ## Native live-shell discipline
 
 - Treat first-paint task preview and canonical conversation attachment as one

@@ -186,6 +186,24 @@ impl Color {
     }
 }
 
+/// Resolve a fractional foreground/surface recipe into one opaque token
+/// colour. GPUI cannot rely on browser-style alpha compositing, and the token
+/// contract deliberately stays opaque, so shared conversation surfaces blend
+/// at their owning boundary.
+pub(crate) fn mix_color(base: Color, other: Color, amount: f32) -> Color {
+    let amount = amount.clamp(0.0, 1.0);
+    let blend = |a: u8, b: u8| -> u8 {
+        let a = f32::from(a);
+        let b = f32::from(b);
+        (a + (b - a) * amount).round().clamp(0.0, 255.0) as u8
+    };
+    Color::rgb(
+        blend(base.red(), other.red()),
+        blend(base.green(), other.green()),
+        blend(base.blue(), other.blue()),
+    )
+}
+
 /// Deterministic preview capture marker. It is intentionally a token-module
 /// constant so preview rendering does not become a second color source.
 pub const PREVIEW_SENTINEL: Color = Color::from_u32(0x912bd4);
@@ -2099,6 +2117,16 @@ pub fn parse_hex_color(value: Option<&str>, fallback: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opaque_mix_preserves_endpoints_and_clamps_the_fraction() {
+        let dark = Color::rgb(10, 20, 30);
+        let light = Color::rgb(210, 220, 230);
+        assert_eq!(mix_color(dark, light, 0.0), dark);
+        assert_eq!(mix_color(dark, light, 1.0), light);
+        assert_eq!(mix_color(dark, light, -1.0), dark);
+        assert_eq!(mix_color(dark, light, 2.0), light);
+    }
 
     #[test]
     fn legacy_text_dim_meets_aa_on_panel_bg() {
