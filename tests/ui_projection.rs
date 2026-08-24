@@ -316,7 +316,7 @@ fn canonical_preview_is_large_enough_to_judge_full_shell_visual_parity() {
 }
 
 #[test]
-fn native_shell_uses_the_reference_full_height_sidebar_and_full_bleed_workspace() {
+fn native_shell_keeps_the_reference_workspace_and_independent_compact_panel_controls() {
     let source = include_str!("../src/ui/native_shell.rs");
 
     assert!(source.contains("native-shell-sidebar-column"));
@@ -325,7 +325,12 @@ fn native_shell_uses_the_reference_full_height_sidebar_and_full_bleed_workspace(
     assert!(source.contains("native-shell-sidebar-project-scope"));
     assert!(source.contains("native-shell-workspace-column"));
     assert!(source.contains("native-shell-workspace-topbar"));
-    assert!(source.contains("native-shell-compact-terminal-toggle"));
+    assert!(source.contains("native-shell-center-mode-switch"));
+    assert!(source.contains("native-task-center-conversation"));
+    assert!(source.contains("native-task-center-terminal"));
+    assert!(source.contains("native-shell-context-dock-toggle"));
+    assert!(source.contains("crate::icons::PANEL_RIGHT"));
+    assert!(!source.contains("native-shell-compact-terminal-toggle"));
     assert!(!source.contains(".child(canvas_switch)"));
 }
 

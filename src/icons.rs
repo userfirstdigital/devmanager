@@ -21,6 +21,7 @@ pub const GIT_BRANCH: &str = "icons/git-branch.svg";
 pub const CHEVRON_UP: &str = "icons/chevron-up.svg";
 pub const FILE_TEXT: &str = "icons/file-text.svg";
 pub const SEARCH: &str = "icons/search.svg";
+pub const PANEL_RIGHT: &str = "icons/panel-right.svg";
 
 pub fn app_icon(path: &'static str, size_px: f32, color: u32) -> impl IntoElement {
     svg().path(path).size(px(size_px)).text_color(rgb(color))

@@ -6016,6 +6016,12 @@ impl AccessibilityTree {
                 },
             )
             .gpui("native-shell-header-attachment", false, false),
+            AccessibilityNode::new(
+                AccessibleRole::Button,
+                "Toggle right panel",
+                "Expand or collapse the task context panel without changing the center canvas.",
+            )
+            .gpui("native-shell-context-dock-toggle", true, true),
             Self::header_settings_node(),
         ]);
         let canvas_switch = selected_task.map(|_| {
@@ -6025,12 +6031,20 @@ impl AccessibilityTree {
                 "Switch the center surface between Conversation and Terminal.",
             )
             .gpui("native-task-center-canvas-switch", false, false)
-            .with_children(vec![AccessibilityNode::new(
-                AccessibleRole::Button,
-                "Conversation / Terminal",
-                "Toggle the center surface between the conversation and bound provider terminal.",
-            )
-            .gpui("native-shell-compact-terminal-toggle", true, true)])
+            .with_children(vec![
+                AccessibilityNode::new(
+                    AccessibleRole::Button,
+                    "Conversation",
+                    "Show the task conversation in the center canvas.",
+                )
+                .gpui("native-task-center-conversation", true, true),
+                AccessibilityNode::new(
+                    AccessibleRole::Button,
+                    "Terminal",
+                    "Show the bound provider terminal in the center canvas.",
+                )
+                .gpui("native-task-center-terminal", true, true),
+            ])
         });
         let composer_children = selected_task
             .zip(composer)
@@ -6087,7 +6101,7 @@ impl AccessibilityTree {
         let context_dock = AccessibilityNode::new(
             AccessibleRole::Region,
             "Task context dock",
-            "Workspace, Git, files, SSH, browser, services, artifacts, review, and terminal tabs follow the selected task.",
+            "Changes, files, browser, services, artifacts, and review tabs follow the selected task independently of the center canvas.",
         )
         .gpui("native-shell-context-dock", false, false);
         let root = AccessibilityNode::new(
@@ -11894,10 +11908,14 @@ impl NativeShell {
     fn center_canvas_switch_visible_for_test(&mut self) -> bool {
         let _ = self.element_without_handlers();
         self.refresh_accessibility_tree();
-        self.accessibility_tree
+        let element_ids = self
+            .accessibility_tree
             .gpui_nodes()
             .into_iter()
-            .any(|node| node.element_id == "native-shell-compact-terminal-toggle")
+            .map(|node| node.element_id)
+            .collect::<std::collections::BTreeSet<_>>();
+        element_ids.contains("native-task-center-conversation")
+            && element_ids.contains("native-task-center-terminal")
     }
 
     #[cfg(test)]
@@ -12191,9 +12209,7 @@ impl NativeShell {
             "native-task-delete" => self.archive_selected_task(),
             "native-task-composer-input" => self.request_composer_accessibility_focus(),
             "native-task-composer-send" => self.activate_composer_control(ComposerControl::SendNow),
-            "native-shell-compact-terminal-toggle" => {
-                self.set_provider_terminal_visible(!self.cockpit.dock().showing_raw_terminal())
-            }
+            "native-shell-context-dock-toggle" => self.toggle_pane(PaneEdge::Dock),
             "native-task-center-conversation" => self.set_provider_terminal_visible(false),
             "native-task-center-terminal" => self.set_provider_terminal_visible(true),
             "native-task-composer-answer" => {
@@ -13844,24 +13860,59 @@ impl NativeShell {
 
     /// The application header. `host_status_control` is supplied by the caller
     /// so the interactive path can attach listeners without duplicating chrome.
-    /// Segmented control for the collapsible panes. Collapse state belongs in
-    /// the header rather than in a menu: it is a one-click, frequently-used
-    /// view control, and hiding it makes a collapsed pane look like a bug.
+    /// Compact, independent controls for the center canvas and right context
+    /// panel. T3 keeps layout controls in the title bar as quiet icon toggles;
+    /// the center mode remains an explicit two-state choice so the active
+    /// Conversation/Terminal surface is never ambiguous.
     fn pane_toggles(
         &self,
         tokens: crate::ui::tokens::ThemeTokens,
         cx: &Context<Self>,
     ) -> AnyElement {
         let terminal_visible = self.cockpit.dock().showing_raw_terminal();
-        let terminal_toggle = div()
-            .id("native-shell-compact-terminal-toggle")
+        let conversation_option = div()
+            .id("native-task-center-conversation")
+            .tab_stop(true)
             .flex()
             .flex_none()
             .items_center()
             .justify_center()
-            .h(px(24.0))
-            .px(px(9.0))
-            .rounded(px(tokens.density.radii.md))
+            .h(px(22.0))
+            .px(px(8.0))
+            .rounded(px(tokens.density.radii.sm))
+            .cursor_pointer()
+            .bg(if terminal_visible {
+                tokens.surfaces.raised.to_gpui()
+            } else {
+                tokens.surfaces.overlay.to_gpui()
+            })
+            .text_size(px(tokens.density.typography.caption))
+            .text_color(if terminal_visible {
+                tokens.text.muted.to_gpui()
+            } else {
+                tokens.text.primary.to_gpui()
+            })
+            .hover(|style| style.bg(tokens.surfaces.overlay.to_gpui()))
+            .on_click(cx.listener(|shell, _event: &ClickEvent, window, cx| {
+                cx.stop_propagation();
+                shell.set_provider_terminal_visible(false);
+                shell.composer_focus_handle.focus(window);
+                shell.pending_composer_focus = false;
+                cx.notify();
+            }))
+            .child("Conversation");
+        let terminal_option = div()
+            .id("native-task-center-terminal")
+            .tab_stop(true)
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .gap(px(5.0))
+            .h(px(22.0))
+            .px(px(8.0))
+            .rounded(px(tokens.density.radii.sm))
+            .cursor_pointer()
             .bg(if terminal_visible {
                 tokens.surfaces.overlay.to_gpui()
             } else {
@@ -13876,86 +13927,71 @@ impl NativeShell {
             .hover(|style| style.bg(tokens.surfaces.overlay.to_gpui()))
             .on_click(cx.listener(|shell, _event: &ClickEvent, window, cx| {
                 cx.stop_propagation();
-                let show_terminal = !shell.cockpit.dock().showing_raw_terminal();
-                shell.set_provider_terminal_visible(show_terminal);
-                if show_terminal {
-                    shell.terminal_focus_handle.focus(window);
-                    shell.pending_terminal_focus = false;
-                } else {
-                    shell.composer_focus_handle.focus(window);
-                    shell.pending_composer_focus = false;
-                }
+                shell.set_provider_terminal_visible(true);
+                shell.terminal_focus_handle.focus(window);
+                shell.pending_terminal_focus = false;
                 cx.notify();
             }))
-            .child(if terminal_visible {
-                "Conversation"
+            .child(crate::icons::app_icon(
+                crate::icons::TERMINAL,
+                12.0,
+                if terminal_visible {
+                    tokens.text.primary.to_u32()
+                } else {
+                    tokens.text.muted.to_u32()
+                },
+            ))
+            .child("Terminal");
+        let center_mode_switch = div()
+            .id("native-shell-center-mode-switch")
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(1.0))
+            .p(px(2.0))
+            .rounded(px(tokens.density.radii.md))
+            .bg(tokens.surfaces.raised.to_gpui())
+            .child(conversation_option)
+            .child(terminal_option);
+        let dock_visible = !self.layout.dock_collapsed;
+        let context_dock_toggle = div()
+            .id("native-shell-context-dock-toggle")
+            .tab_stop(true)
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .size(px(26.0))
+            .rounded(px(tokens.density.radii.md))
+            .cursor_pointer()
+            .bg(if dock_visible {
+                tokens.surfaces.overlay.to_gpui()
             } else {
-                "Terminal"
-            });
+                tokens.surfaces.canvas.to_gpui()
+            })
+            .hover(|style| style.bg(tokens.surfaces.overlay.to_gpui()))
+            .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
+                cx.stop_propagation();
+                shell.toggle_pane(PaneEdge::Dock);
+                cx.notify();
+            }))
+            .child(crate::icons::app_icon(
+                crate::icons::PANEL_RIGHT,
+                15.0,
+                if dock_visible {
+                    tokens.text.primary.to_u32()
+                } else {
+                    tokens.text.muted.to_u32()
+                },
+            ));
         div()
             .id("native-shell-pane-toggles")
             .flex()
             .flex_none()
             .items_center()
-            .gap(px(tokens.density.spacing.xxs))
-            .p(px(tokens.density.spacing.xxs))
-            .rounded(px(tokens.density.radii.md))
-            .bg(tokens.surfaces.raised.to_gpui())
-            .child(self.pane_toggle(
-                "native-shell-toggle-dock",
-                "Dock",
-                PaneEdge::Dock,
-                !self.layout.dock_collapsed,
-                tokens,
-                cx,
-            ))
-            .child(terminal_toggle)
-            .into_any_element()
-    }
-
-    fn pane_toggle(
-        &self,
-        id: &'static str,
-        label: &'static str,
-        edge: PaneEdge,
-        visible: bool,
-        tokens: crate::ui::tokens::ThemeTokens,
-        cx: &Context<Self>,
-    ) -> AnyElement {
-        let (foreground, background, weight) = if visible {
-            (
-                tokens.text.primary,
-                tokens.surfaces.overlay,
-                FontWeight::SEMIBOLD,
-            )
-        } else {
-            (
-                tokens.text.muted,
-                tokens.surfaces.raised,
-                FontWeight::NORMAL,
-            )
-        };
-        div()
-            .id(id)
-            .flex()
-            .flex_none()
-            .items_center()
-            .justify_center()
-            .h(px(22.0))
-            .px(px(tokens.density.spacing.sm))
-            .rounded(px(tokens.density.radii.sm))
-            .bg(background.to_gpui())
-            .text_size(px(tokens.density.typography.caption))
-            .line_height(px(tokens.density.typography.caption_line_height))
-            .font_weight(weight)
-            .text_color(foreground.to_gpui())
-            .hover(|style| style.bg(tokens.surfaces.overlay.to_gpui()))
-            .on_click(cx.listener(move |shell, _event: &ClickEvent, _window, cx| {
-                cx.stop_propagation();
-                shell.toggle_pane(edge);
-                cx.notify();
-            }))
-            .child(label)
+            .gap(px(5.0))
+            .child(center_mode_switch)
+            .child(context_dock_toggle)
             .into_any_element()
     }
 
@@ -17804,7 +17840,7 @@ mod tests {
     }
 
     #[test]
-    fn task_node_ids_maps_rendered_rows_after_settings_node() {
+    fn task_node_ids_maps_rendered_rows_after_toolbar_nodes() {
         use crate::ui::task_cockpit::TaskList;
 
         let first = TaskId::new();
@@ -17819,8 +17855,8 @@ mod tests {
         );
         let mapped = tree.task_node_ids_for_test();
         assert_eq!(mapped.len(), 2);
-        assert_eq!(mapped[0], (accesskit::NodeId::from(6), first));
-        assert_eq!(mapped[1], (accesskit::NodeId::from(7), second));
+        assert_eq!(mapped[0], (accesskit::NodeId::from(7), first));
+        assert_eq!(mapped[1], (accesskit::NodeId::from(8), second));
         let update = tree.platform_update_for_test();
         for &(node_id, task_id) in mapped {
             let node = update
@@ -20788,6 +20824,9 @@ mod tests {
     }
 
     fn center_task_canvas_switches_conversation_and_terminal(cx: &mut gpui::App) {
+        use crate::ui::actions::{KeyboardShortcut, ShortcutKey};
+        use crate::ui::task_cockpit::dock::DockTool as CockpitDockTool;
+
         let (runtime, _shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
         let (model, task_id) = terminal_bound_client_model();
         with_test_shell_in_app(cx, runtime, |shell| {
@@ -20814,10 +20853,28 @@ mod tests {
                 "bottom terminal strip must be removed"
             );
 
-            shell.set_provider_terminal_visible(true);
+            assert!(shell.layout.dock_collapsed);
+            shell.dispatch_named_accessibility_action("native-shell-context-dock-toggle");
+            assert!(
+                !shell.layout.dock_collapsed,
+                "the compact right-panel control must expand the context dock"
+            );
+            shell.dispatch_keyboard_for_test(KeyboardShortcut::alt(ShortcutKey::Digit(4)));
+            assert_eq!(shell.cockpit().active_tool(), CockpitDockTool::Browser);
+
+            shell.dispatch_named_accessibility_action("native-task-center-terminal");
             assert_eq!(
                 shell.main_conversation_canvas(),
                 MainConversationCanvas::TaskTerminal
+            );
+            assert_eq!(
+                shell.cockpit().active_tool(),
+                CockpitDockTool::Browser,
+                "the center-mode switch must not replace the expanded right-panel surface"
+            );
+            assert!(
+                !shell.layout.dock_collapsed,
+                "switching the center canvas must not collapse the right panel"
             );
             assert!(
                 shell.composer_error.as_deref() != Some("provider terminal turn is not ready yet"),
@@ -20837,11 +20894,13 @@ mod tests {
                 "ContextDock TerminalPresentation memory must restore Terminal for the task"
             );
 
-            shell.set_provider_terminal_visible(false);
+            shell.dispatch_named_accessibility_action("native-task-center-conversation");
             assert_eq!(
                 shell.main_conversation_canvas(),
                 MainConversationCanvas::TaskConversation
             );
+            assert_eq!(shell.cockpit().active_tool(), CockpitDockTool::Browser);
+            assert!(!shell.layout.dock_collapsed);
         });
     }
 

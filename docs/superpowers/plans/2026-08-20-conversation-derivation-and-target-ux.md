@@ -1736,6 +1736,11 @@ git commit -m "chore(ui): remove the throwaway conversation look prototype"
 - Code-level geometry and treatment review confirms a 256 px full-height sidebar, 78 px borderless task rows, a 44 px workspace top bar, a bare assistant turn, a 768 px centered conversation/composer column, named-group hover/focus chrome, and a joined composer/context strip. Existing question, approval, attachment, provider, checkout, branch, terminal, dock, and task actions remain wired to their production handlers.
 - Native pixels are verified through the real isolated host and canonical `NativeShell`: `conversation-target-ux-reference-1912-20260823-r2.png` is a 1912x1200 full-shell capture showing the plum canvas, navy selected task, flat task hierarchy, compact workspace chrome, connected Codex composer, and joined checkout/branch strip after bounded asynchronous settle. The isolated selected task has no durable transcript rows, so the proof exercises the production shell/composer composition without fabricating conversation data. Hover/focus behavior is verified by the GPUI named-group/focus implementation and focused tests. No production profile or installed process was used as a fallback.
 
+#### Independent panel-control follow-up (2026-08-23)
+
+- The workspace header now keeps a small explicit `Conversation | Terminal` center-canvas switch independent from the slim right-panel toggle. The panel toggle ports T3 Code's quiet `PanelRightIcon` treatment and expands the existing production Changes, Files, Browser, Services, Artifacts, and Review dock without replacing its state, shortcuts, width, or handlers.
+- Full-shell acceptance is recorded in `conversation-panels-collapsed-1912-20260823.png` and `conversation-browser-expanded-1912-20260823.png`, both captured at 1912x1200 through the canonical isolated preview. The complete serial Rust library suite passed with 2,755 passed, 0 failed, and 2 ignored; `cargo check --locked --lib --bins --tests` exited 0.
+
 ---
 
 ## Deferred to later trains
