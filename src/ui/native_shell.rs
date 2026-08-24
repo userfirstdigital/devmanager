@@ -33,7 +33,7 @@ use gpui::{
     WindowOptions,
 };
 use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::{Disableable, Selectable};
+use gpui_component::Disableable;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -193,6 +193,9 @@ const CONVERSATION_COMPOSER_OUTER_RADIUS: f32 = 22.0;
 const CONVERSATION_COMPOSER_INNER_RADIUS: f32 = 20.0;
 const CONVERSATION_COMPOSER_CONTEXT_INSET: f32 = 22.0;
 const CONVERSATION_COMPOSER_SEND_DIAMETER: f32 = 32.0;
+const T3_SIDEBAR_WIDTH: f32 = 256.0;
+const T3_SIDEBAR_ROW_HEIGHT: f32 = 78.0;
+const T3_WORKSPACE_TOPBAR_HEIGHT: f32 = 44.0;
 const CONVERSATION_COMPOSER_PLACEHOLDER: &str =
     "Ask anything, @tag files/folders, $use skills, or / for commands";
 const COMPOSER_DRAFT_PERSIST_INTERVAL: Duration = Duration::from_millis(250);
@@ -544,6 +547,19 @@ fn stable_task_element_id(task_id: TaskId) -> ElementId {
     // GPUI has a UUID element identity, so retain all 128 bits of the domain
     // TaskId instead of collapsing it to an offset or a lossy hash.
     ElementId::Uuid(Uuid::from_bytes(*task_id.as_bytes()))
+}
+
+fn stable_task_element_key(task_id: TaskId, suffix: &str) -> u64 {
+    let mut digest = Sha256::new();
+    digest.update(b"native-task");
+    digest.update([0]);
+    digest.update(task_id.as_bytes());
+    digest.update([0]);
+    digest.update(suffix.as_bytes());
+    let bytes: [u8; 8] = digest.finalize()[..8]
+        .try_into()
+        .expect("sha256 prefixes are always eight bytes");
+    u64::from_le_bytes(bytes)
 }
 
 fn stable_project_element_key(project_id: ProjectId, suffix: &str) -> u64 {
@@ -6009,20 +6025,12 @@ impl AccessibilityTree {
                 "Switch the center surface between Conversation and Terminal.",
             )
             .gpui("native-task-center-canvas-switch", false, false)
-            .with_children(vec![
-                AccessibilityNode::new(
-                    AccessibleRole::Button,
-                    "Conversation",
-                    "Show the task conversation timeline and composer.",
-                )
-                .gpui("native-task-center-conversation", true, true),
-                AccessibilityNode::new(
-                    AccessibleRole::Button,
-                    "Terminal",
-                    "Show the bound provider terminal in the center canvas.",
-                )
-                .gpui("native-task-center-terminal", true, true),
-            ])
+            .with_children(vec![AccessibilityNode::new(
+                AccessibleRole::Button,
+                "Conversation / Terminal",
+                "Toggle the center surface between the conversation and bound provider terminal.",
+            )
+            .gpui("native-shell-compact-terminal-toggle", true, true)])
         });
         let composer_children = selected_task
             .zip(composer)
@@ -9140,6 +9148,10 @@ impl NativeShell {
 
     fn active_provider_kind(&self) -> Option<ProviderKind> {
         let task_id = self.interaction.selected_task()?;
+        self.task_provider_kind(task_id)
+    }
+
+    fn task_provider_kind(&self, task_id: TaskId) -> Option<ProviderKind> {
         let snapshot = self.client_model.as_ref()?.task(task_id)?;
         let agent_id = snapshot.primary_agent_id?;
         snapshot
@@ -10487,10 +10499,8 @@ impl NativeShell {
             div()
                 .flex()
                 .items_center()
-                .px(px(10.0))
-                .py(px(5.0))
-                .rounded_full()
-                .bg(tokens.surfaces.sunken.to_gpui())
+                .px(px(6.0))
+                .py(px(4.0))
                 .text_size(px(tokens.density.typography.caption))
                 .text_color(tokens.text.secondary.to_gpui())
                 .child(label.to_string())
@@ -10739,52 +10749,6 @@ impl NativeShell {
         let conversation = self
             .cockpit
             .conversation_surface_with_footer(tokens, composer_footer);
-        let show_conversation = cx.listener(|shell, _event: &ClickEvent, window, cx| {
-            cx.stop_propagation();
-            shell.set_provider_terminal_visible(false);
-            shell.composer_focus_handle.focus(window);
-            shell.pending_composer_focus = false;
-            cx.notify();
-        });
-        let show_terminal = cx.listener(|shell, _event: &ClickEvent, window, cx| {
-            cx.stop_propagation();
-            shell.set_provider_terminal_visible(true);
-            shell.terminal_focus_handle.focus(window);
-            shell.pending_terminal_focus = false;
-            cx.notify();
-        });
-        let canvas_switch = div()
-            .id("native-task-center-canvas-switch")
-            .w_full()
-            .flex_none()
-            .px(px(tokens.density.spacing.md))
-            .pt(px(tokens.density.spacing.sm))
-            .flex()
-            .justify_center()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(tokens.density.spacing.xs))
-                    .px(px(tokens.density.spacing.xs))
-                    .py(px(tokens.density.spacing.xxs))
-                    .rounded(px(tokens.density.radii.md))
-                    .bg(tokens.surfaces.sunken.to_gpui())
-                    .child(
-                        Button::new("native-task-center-conversation")
-                            .label("Conversation")
-                            .ghost()
-                            .selected(!showing_provider_terminal)
-                            .on_click(show_conversation),
-                    )
-                    .child(
-                        Button::new("native-task-center-terminal")
-                            .label("Terminal")
-                            .ghost()
-                            .selected(showing_provider_terminal)
-                            .on_click(show_terminal),
-                    ),
-            );
         let center_body = if showing_provider_terminal {
             self.center_provider_terminal_surface(tokens, cx)
         } else {
@@ -10806,7 +10770,6 @@ impl NativeShell {
             .flex_1()
             .min_h(px(0.0))
             .flex_col()
-            .child(canvas_switch)
             .child(center_body)
             .into_any_element()
     }
@@ -11720,6 +11683,14 @@ impl NativeShell {
             .or_else(|| self.first_workspace_project_id())
     }
 
+    fn current_workspace_project_label(&self) -> Option<String> {
+        let project_id = self.current_workspace_project_id()?;
+        self.config_sidebar.projects.iter().find_map(|project| {
+            (ProjectId::parse(&project.workspace_id).ok() == Some(project_id))
+                .then(|| project.label.clone())
+        })
+    }
+
     fn project_inbox_items(&self) -> Vec<ProjectInboxItem> {
         let mut items = Vec::new();
         let mut represented = HashSet::new();
@@ -11926,10 +11897,7 @@ impl NativeShell {
         self.accessibility_tree
             .gpui_nodes()
             .into_iter()
-            .any(|node| {
-                node.element_id == "native-task-center-conversation"
-                    || node.element_id == "native-task-center-terminal"
-            })
+            .any(|node| node.element_id == "native-shell-compact-terminal-toggle")
     }
 
     #[cfg(test)]
@@ -12223,6 +12191,9 @@ impl NativeShell {
             "native-task-delete" => self.archive_selected_task(),
             "native-task-composer-input" => self.request_composer_accessibility_focus(),
             "native-task-composer-send" => self.activate_composer_control(ComposerControl::SendNow),
+            "native-shell-compact-terminal-toggle" => {
+                self.set_provider_terminal_visible(!self.cockpit.dock().showing_raw_terminal())
+            }
             "native-task-center-conversation" => self.set_provider_terminal_visible(false),
             "native-task-center-terminal" => self.set_provider_terminal_visible(true),
             "native-task-composer-answer" => {
@@ -12555,28 +12526,49 @@ impl NativeShell {
     }
 
     fn conversation_delete_action(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let tokens = self.preferences.tokens();
         let delete = self.interaction.selected_task().map(|_| {
-            Button::new("native-task-delete")
-                .label("Delete")
-                .tooltip("Delete this task")
-                .ghost()
+            div()
+                .id("native-task-delete")
+                .tab_stop(true)
+                .h(px(26.0))
+                .flex()
+                .items_center()
+                .px(px(10.0))
+                .rounded(px(6.0))
+                .cursor_pointer()
+                .bg(tokens.surfaces.raised.to_gpui())
+                .text_size(px(tokens.density.typography.caption))
+                .text_color(tokens.text.muted.to_gpui())
+                .hover(|style| style.bg(tokens.surfaces.overlay.to_gpui()))
                 .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
                     cx.stop_propagation();
                     shell.archive_selected_task();
                     cx.notify();
                 }))
+                .child("Delete")
                 .into_any_element()
         });
         let tools = self.layout.dock_collapsed.then(|| {
-            Button::new("native-shell-tools-affordance")
-                .label("Tools")
-                .tooltip("Show the context dock")
-                .ghost()
+            div()
+                .id("native-shell-tools-affordance")
+                .tab_stop(true)
+                .h(px(26.0))
+                .flex()
+                .items_center()
+                .px(px(10.0))
+                .rounded(px(6.0))
+                .cursor_pointer()
+                .bg(tokens.surfaces.raised.to_gpui())
+                .text_size(px(tokens.density.typography.caption))
+                .text_color(tokens.text.secondary.to_gpui())
+                .hover(|style| style.bg(tokens.surfaces.overlay.to_gpui()))
                 .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
                     cx.stop_propagation();
                     shell.toggle_pane(PaneEdge::Dock);
                     cx.notify();
                 }))
+                .child("Tools")
                 .into_any_element()
         });
         match (tools, delete) {
@@ -12604,31 +12596,22 @@ impl NativeShell {
         div()
             .id("native-shell-conversation-panel")
             .w_full()
+            .relative()
             .flex()
             .flex_col()
             .flex_1()
             .min_h(px(0.0))
             .overflow_hidden()
             .bg(tokens.surfaces.canvas.to_gpui())
-            .child(
-                div()
-                    .id("native-shell-conversation-header")
-                    .w_full()
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .h(px(Self::PANEL_HEADER_HEIGHT))
-                    .px(px(tokens.density.spacing.md))
-                    .child(
-                        div()
-                            .text_size(px(tokens.density.typography.caption))
-                            .text_color(tokens.text.muted.to_gpui())
-                            .child("Conversation"),
-                    )
-                    .children(trailing),
-            )
             .child(body)
+            .children(trailing.map(|actions| {
+                div()
+                    .absolute()
+                    .top(px(8.0))
+                    .right(px(12.0))
+                    .child(actions)
+                    .into_any_element()
+            }))
             .into_any_element()
     }
 
@@ -12637,7 +12620,7 @@ impl NativeShell {
     ///
     /// Header height is pinned so the workspace row can be measured against the
     /// window without reading back layout.
-    const HEADER_HEIGHT: f32 = 56.0;
+    const HEADER_HEIGHT: f32 = T3_WORKSPACE_TOPBAR_HEIGHT;
     const MIN_WORKSPACE_ROW_HEIGHT: f32 = 240.0;
     const PANEL_HEADER_HEIGHT: f32 = 34.0;
 
@@ -12959,10 +12942,8 @@ impl NativeShell {
     /// Fixed row height for the virtualized inbox. `uniform_list` requires a
     /// stable height, so the two text lines and their padding are summed from
     /// the same tokens that render them.
-    fn inbox_row_height(tokens: crate::ui::tokens::ThemeTokens) -> f32 {
-        tokens.density.typography.body_line_height
-            + tokens.density.typography.caption_line_height
-            + tokens.density.spacing.sm * 2.0
+    fn inbox_row_height(_tokens: crate::ui::tokens::ThemeTokens) -> f32 {
+        T3_SIDEBAR_ROW_HEIGHT
     }
 
     fn element_without_handlers(&self) -> impl IntoElement {
@@ -12991,7 +12972,7 @@ impl NativeShell {
     }
 
     fn modal_backdrop() -> gpui::Rgba {
-        gpui::rgba(0x00000059)
+        gpui::rgba(crate::ui::tokens::MODAL_BACKDROP_RGBA)
     }
 
     fn overlay_text_field(
@@ -13871,6 +13852,46 @@ impl NativeShell {
         tokens: crate::ui::tokens::ThemeTokens,
         cx: &Context<Self>,
     ) -> AnyElement {
+        let terminal_visible = self.cockpit.dock().showing_raw_terminal();
+        let terminal_toggle = div()
+            .id("native-shell-compact-terminal-toggle")
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .h(px(24.0))
+            .px(px(9.0))
+            .rounded(px(tokens.density.radii.md))
+            .bg(if terminal_visible {
+                tokens.surfaces.overlay.to_gpui()
+            } else {
+                tokens.surfaces.raised.to_gpui()
+            })
+            .text_size(px(tokens.density.typography.caption))
+            .text_color(if terminal_visible {
+                tokens.text.primary.to_gpui()
+            } else {
+                tokens.text.muted.to_gpui()
+            })
+            .hover(|style| style.bg(tokens.surfaces.overlay.to_gpui()))
+            .on_click(cx.listener(|shell, _event: &ClickEvent, window, cx| {
+                cx.stop_propagation();
+                let show_terminal = !shell.cockpit.dock().showing_raw_terminal();
+                shell.set_provider_terminal_visible(show_terminal);
+                if show_terminal {
+                    shell.terminal_focus_handle.focus(window);
+                    shell.pending_terminal_focus = false;
+                } else {
+                    shell.composer_focus_handle.focus(window);
+                    shell.pending_composer_focus = false;
+                }
+                cx.notify();
+            }))
+            .child(if terminal_visible {
+                "Conversation"
+            } else {
+                "Terminal"
+            });
         div()
             .id("native-shell-pane-toggles")
             .flex()
@@ -13888,6 +13909,7 @@ impl NativeShell {
                 tokens,
                 cx,
             ))
+            .child(terminal_toggle)
             .into_any_element()
     }
 
@@ -13950,101 +13972,70 @@ impl NativeShell {
         host_status_control: Option<AnyElement>,
         workspace_actions: Option<AnyElement>,
         pane_toggles: Option<AnyElement>,
-        settings_control: AnyElement,
+        _settings_control: AnyElement,
     ) -> AnyElement {
         let show_attachment = !self.header_attachment.label().is_empty()
             || !self.header_attachment.detail().is_empty();
         let show_connection = !matches!(self.host_state, NativeHostState::Connected { .. });
+        let project_label = self
+            .current_workspace_project_label()
+            .unwrap_or_else(|| "All projects".to_string());
+        let task_label = if self.header_attachment.label().is_empty() {
+            "DevManager".to_string()
+        } else {
+            self.header_attachment.label()
+        };
         div()
-            .id("native-shell-toolbar")
+            .id("native-shell-workspace-topbar")
             .w_full()
             .flex()
             .flex_none()
             .h(px(Self::HEADER_HEIGHT))
             .items_center()
-            .gap(px(tokens.density.spacing.lg))
-            .px(px(tokens.density.spacing.lg))
-            .bg(tokens.surfaces.overlay.to_gpui())
-            .border_b(px(1.0))
-            .border_color(tokens.borders.subtle.to_gpui())
+            .gap(px(tokens.density.spacing.sm))
+            .px(px(16.0))
+            .bg(tokens.surfaces.canvas.to_gpui())
             .child(
                 div()
-                    .id("native-shell-header-title")
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .gap(px(tokens.density.spacing.sm))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .w(px(24.0))
-                            .h(px(24.0))
-                            .rounded(px(tokens.density.radii.md))
-                            .bg(tokens.actions.primary.default.background.to_gpui())
-                            .text_size(px(tokens.density.typography.caption))
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(tokens.actions.primary.default.foreground.to_gpui())
-                            .child("DM"),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(tokens.density.typography.heading))
-                            .line_height(px(tokens.density.typography.heading_line_height))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(tokens.text.primary.to_gpui())
-                            .child("DevManager"),
-                    ),
-            )
-            .children(show_attachment.then(|| {
-                div()
+                    .id("native-shell-header-breadcrumb")
                     .flex()
                     .flex_1()
                     .min_w(px(0.0))
                     .items_center()
-                    .gap(px(tokens.density.spacing.lg))
+                    .gap(px(8.0))
+                    .child(div().flex_none().child(crate::icons::app_icon(
+                        crate::icons::FOLDER,
+                        14.0,
+                        tokens.text.muted.to_u32(),
+                    )))
                     .child(
                         div()
                             .flex_none()
-                            .w(px(1.0))
-                            .h(px(20.0))
-                            .bg(tokens.borders.subtle.to_gpui()),
+                            .text_size(px(tokens.density.typography.caption))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(tokens.text.secondary.to_gpui())
+                            .child(project_label),
                     )
+                    .children(show_attachment.then(|| {
+                        div()
+                            .flex_none()
+                            .text_color(tokens.text.muted.to_gpui())
+                            .child("/")
+                            .into_any_element()
+                    }))
                     .child(
                         div()
-                            .id("native-shell-header-attachment")
-                            .flex()
-                            .flex_col()
-                            .flex_1()
                             .min_w(px(0.0))
-                            .overflow_hidden()
-                            .child(
-                                div()
-                                    .text_size(px(tokens.density.typography.body))
-                                    .line_height(px(tokens.density.typography.body_line_height))
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(tokens.text.primary.to_gpui())
-                                    .truncate()
-                                    .child(self.header_attachment.label()),
-                            )
-                            .child(
-                                div()
-                                    .id("native-shell-header-detail")
-                                    .text_size(px(tokens.density.typography.caption))
-                                    .line_height(px(tokens.density.typography.caption_line_height))
-                                    .text_color(tokens.text.secondary.to_gpui())
-                                    .truncate()
-                                    .child(self.header_attachment.detail()),
-                            ),
-                    )
-                    .into_any_element()
-            }))
-            .children((!show_attachment).then(|| div().flex_1().into_any_element()))
+                            .truncate()
+                            .text_size(px(tokens.density.typography.caption))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(tokens.text.primary.to_gpui())
+                            .child(task_label),
+                    ),
+            )
             .children(workspace_actions)
             .children(pane_toggles)
             .children(show_connection.then(|| self.status_bar(tokens)))
-            .child(settings_control)
             .children(host_status_control.map(|control| div().flex_none().child(control)))
             .into_any_element()
     }
@@ -14116,17 +14107,8 @@ impl NativeShell {
         } else {
             Self::RAIL_THICKNESS + layout.dock_width
         };
-        let width = f32::from(viewport.width)
-            - tokens.density.spacing.lg * 2.0
-            - layout.inbox_width
-            - Self::RAIL_THICKNESS
-            - dock
-            - 2.0;
-        let height = f32::from(viewport.height)
-            - Self::HEADER_HEIGHT
-            - tokens.density.spacing.lg * 2.0
-            - Self::PANEL_HEADER_HEIGHT
-            - 2.0;
+        let width = f32::from(viewport.width) - T3_SIDEBAR_WIDTH - dock - 2.0;
+        let height = f32::from(viewport.height) - Self::HEADER_HEIGHT - 2.0;
         size(px(width.max(1.0)), px(height.max(1.0)))
     }
 
@@ -14315,14 +14297,15 @@ impl NativeShell {
         &self,
         tokens: crate::ui::tokens::ThemeTokens,
         conversation: AnyElement,
-        inbox: AnyElement,
+        sidebar: AnyElement,
+        workspace_header: AnyElement,
         dock: AnyElement,
         workspace_height: Option<Pixels>,
         layout: WorkspaceLayout,
         rails: Option<(AnyElement, AnyElement)>,
         conversation_trailing: Option<AnyElement>,
     ) -> AnyElement {
-        let (inbox_rail, dock_rail) = match rails {
+        let (_inbox_rail, dock_rail) = match rails {
             Some(rails) => rails,
             None => (
                 Self::pane_rail_static(true, tokens),
@@ -14344,7 +14327,7 @@ impl NativeShell {
         div()
             .id("native-shell-main-content")
             .flex()
-            .flex_col()
+            .flex_row()
             .flex_1()
             // Flex items default to `min-height: auto`, which would let the
             // stacked panels grow past the window instead of clipping inside
@@ -14352,45 +14335,42 @@ impl NativeShell {
             .min_h(px(0.0))
             .min_w(px(0.0))
             .overflow_hidden()
-            .gap(px(tokens.density.spacing.sm))
-            .p(px(tokens.density.spacing.lg))
+            .child(sidebar)
             .child(
-                workspace_row
+                div()
+                    .id("native-shell-workspace-column")
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .min_w(px(0.0))
+                    .child(workspace_header)
                     .child(
-                        div()
-                            .id("native-shell-inbox-column")
-                            .flex()
-                            .flex_col()
-                            .flex_none()
-                            .w(px(layout.inbox_width))
-                            .h_full()
-                            .min_h(px(0.0))
-                            .child(inbox),
-                    )
-                    .child(inbox_rail)
-                    .child(
-                        div()
-                            .id("native-shell-center-column")
-                            .flex()
-                            .flex_col()
-                            .flex_1()
-                            .min_h(px(0.0))
-                            .min_w(px(0.0))
-                            .child(conversation_panel),
-                    )
-                    .children(show_dock.then_some(dock_rail))
-                    .children(show_dock.then(|| {
-                        div()
-                            .id("native-shell-dock-column")
-                            .flex()
-                            .flex_col()
-                            .flex_none()
-                            .w(px(layout.dock_width))
-                            .min_h(px(0.0))
-                            .gap(px(tokens.density.spacing.md))
-                            .children(self.task_details_panel(tokens))
-                            .child(dock)
-                    })),
+                        workspace_row
+                            .child(
+                                div()
+                                    .id("native-shell-center-column")
+                                    .flex()
+                                    .flex_col()
+                                    .flex_1()
+                                    .min_h(px(0.0))
+                                    .min_w(px(0.0))
+                                    .child(conversation_panel),
+                            )
+                            .children(show_dock.then_some(dock_rail))
+                            .children(show_dock.then(|| {
+                                div()
+                                    .id("native-shell-dock-column")
+                                    .flex()
+                                    .flex_col()
+                                    .flex_none()
+                                    .w(px(layout.dock_width))
+                                    .min_h(px(0.0))
+                                    .gap(px(tokens.density.spacing.md))
+                                    .children(self.task_details_panel(tokens))
+                                    .child(dock)
+                            })),
+                    ),
             )
             .into_any_element()
     }
@@ -14410,6 +14390,76 @@ impl NativeShell {
             .overflow_hidden()
             .flex_col()
             .child(self.config_sidebar.surface(tokens, projects_heading_action))
+            .into_any_element()
+    }
+
+    fn sidebar_brand(tokens: crate::ui::tokens::ThemeTokens) -> AnyElement {
+        div()
+            .id("native-shell-sidebar-brand")
+            .w_full()
+            .h(px(T3_WORKSPACE_TOPBAR_HEIGHT))
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(8.0))
+            .px(px(12.0))
+            .child(
+                div()
+                    .size(px(22.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(6.0))
+                    .bg(tokens.actions.primary.default.background.to_gpui())
+                    .text_size(px(10.0))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(tokens.actions.primary.default.foreground.to_gpui())
+                    .child("DM"),
+            )
+            .child(
+                div()
+                    .min_w(px(0.0))
+                    .truncate()
+                    .text_size(px(tokens.density.typography.body))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(tokens.text.primary.to_gpui())
+                    .child("DevManager"),
+            )
+            .child(
+                div()
+                    .px(px(6.0))
+                    .py(px(2.0))
+                    .rounded_full()
+                    .bg(tokens.surfaces.raised.to_gpui())
+                    .text_size(px(9.0))
+                    .text_color(tokens.text.muted.to_gpui())
+                    .child("Visual"),
+            )
+            .into_any_element()
+    }
+
+    fn reference_sidebar(
+        tokens: crate::ui::tokens::ThemeTokens,
+        navigation: AnyElement,
+        inbox: AnyElement,
+        footer: AnyElement,
+    ) -> AnyElement {
+        div()
+            .id("native-shell-sidebar-column")
+            .flex()
+            .flex_col()
+            .flex_none()
+            .w(px(T3_SIDEBAR_WIDTH))
+            .h_full()
+            .min_h(px(0.0))
+            .overflow_hidden()
+            .bg(tokens.surfaces.sunken.to_gpui())
+            .border_r(px(1.0))
+            .border_color(tokens.borders.subtle.to_gpui())
+            .child(Self::sidebar_brand(tokens))
+            .child(navigation)
+            .child(inbox)
+            .child(footer)
             .into_any_element()
     }
 
@@ -14480,13 +14530,112 @@ impl NativeShell {
                 .children(task_rows)
                 .into_any_element()
         };
-        let inbox = Self::stacked_panel_grow(
-            "native-shell-task-inbox",
-            "Task inbox",
-            tokens,
-            inbox_body,
-            self.inbox_agent_header_actions_static(),
-        );
+        let navigation = div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .px(px(8.0))
+            .pb(px(8.0))
+            .child(
+                div()
+                    .id("native-shell-sidebar-search")
+                    .h(px(32.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .px(px(8.0))
+                    .rounded(px(6.0))
+                    .text_color(tokens.text.secondary.to_gpui())
+                    .child(crate::icons::app_icon(
+                        crate::icons::SEARCH,
+                        14.0,
+                        tokens.text.muted.to_u32(),
+                    ))
+                    .child("Search"),
+            )
+            .child(
+                div()
+                    .id("native-shell-sidebar-project-scope")
+                    .h(px(32.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .px(px(8.0))
+                    .rounded(px(6.0))
+                    .text_color(tokens.text.secondary.to_gpui())
+                    .child(crate::icons::app_icon(
+                        crate::icons::FOLDER,
+                        14.0,
+                        tokens.text.muted.to_u32(),
+                    ))
+                    .child(div().flex_1().child("All projects"))
+                    .child(crate::icons::app_icon(
+                        crate::icons::CHEVRON_DOWN,
+                        12.0,
+                        tokens.text.muted.to_u32(),
+                    ))
+                    .child("＋"),
+            )
+            .into_any_element();
+        let inbox = div()
+            .id("native-shell-task-inbox")
+            .w_full()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h(px(0.0))
+            .overflow_hidden()
+            .child(inbox_body)
+            .into_any_element();
+        let footer = div()
+            .id("native-shell-sidebar-footer")
+            .w_full()
+            .h(px(44.0))
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_between()
+            .px(px(10.0))
+            .border_t(px(1.0))
+            .border_color(tokens.borders.subtle.to_gpui())
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(14.0))
+                    .child(crate::icons::app_icon(
+                        crate::icons::SETTINGS,
+                        14.0,
+                        tokens.text.muted.to_u32(),
+                    ))
+                    .child(crate::icons::app_icon(
+                        crate::icons::GIT_BRANCH,
+                        14.0,
+                        tokens.text.muted.to_u32(),
+                    ))
+                    .child(crate::icons::app_icon(
+                        crate::icons::ACTIVITY,
+                        14.0,
+                        tokens.text.muted.to_u32(),
+                    )),
+            )
+            .child(
+                div()
+                    .size(px(28.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_full()
+                    .bg(tokens.actions.primary.default.background.to_gpui())
+                    .child(crate::icons::app_icon(
+                        crate::icons::PLUS,
+                        14.0,
+                        tokens.actions.primary.default.foreground.to_u32(),
+                    )),
+            )
+            .into_any_element();
+        let sidebar = Self::reference_sidebar(tokens, navigation, inbox, footer);
         let dock = Self::stacked_panel_grow(
             "native-shell-context-dock",
             self.cockpit.active_tool().label(),
@@ -14494,63 +14643,39 @@ impl NativeShell {
             self.context_dock_surface(tokens, None),
             None,
         );
-        // Project navigation now lives in the grouped Task Inbox. The former
-        // configuration rail remains available through Settings only.
-        let show_sidebar = false;
+        let workspace_header = self.header_bar(
+            tokens,
+            None,
+            None,
+            None,
+            Self::header_settings_control_static(),
+        );
         div()
             .id("native-shell-root")
             .size_full()
             .track_focus(&self.focus_handle)
             .flex()
-            .flex_col()
-            .bg(tokens.surfaces.raised.to_gpui())
+            .bg(tokens.surfaces.canvas.to_gpui())
             .text_size(px(tokens.density.typography.body))
             .line_height(px(tokens.density.typography.body_line_height))
             .text_color(tokens.text.primary.to_gpui())
-            .child(self.header_bar(
+            .child(self.main_column(
                 tokens,
+                if self.interaction.selected_task().is_none() {
+                    self.idle_conversation_photo_surface(tokens, None)
+                } else {
+                    self.cockpit
+                        .conversation_surface(tokens, self.composer.as_ref())
+                        .into_any_element()
+                },
+                sidebar,
+                workspace_header,
+                dock,
+                None,
+                layout,
                 None,
                 None,
-                None,
-                Self::header_settings_control_static(),
             ))
-            .child(
-                div()
-                    .id("native-shell-content")
-                    .flex()
-                    .flex_1()
-                    .min_h(px(0.0))
-                    .overflow_hidden()
-                    .children(show_sidebar.then(|| {
-                        self.sidebar(
-                            tokens,
-                            layout.sidebar_width,
-                            self.shows_add_project_plus().then(|| {
-                                Button::new("native-projects-add")
-                                    .label("+")
-                                    .tooltip("Add project")
-                                    .into_any_element()
-                            }),
-                        )
-                    }))
-                    .children(show_sidebar.then(|| Self::pane_rail_static(true, tokens)))
-                    .child(self.main_column(
-                        tokens,
-                        if self.interaction.selected_task().is_none() {
-                            self.idle_conversation_photo_surface(tokens, None)
-                        } else {
-                            self.cockpit
-                                .conversation_surface(tokens, self.composer.as_ref())
-                                .into_any_element()
-                        },
-                        inbox,
-                        dock,
-                        None,
-                        layout,
-                        None,
-                        None,
-                    )),
-            )
             .into_any_element()
     }
 
@@ -14560,18 +14685,49 @@ impl NativeShell {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let tokens = self.preferences.tokens();
-        let inbox_items = Arc::new(self.project_inbox_items());
+        let inbox_items = Arc::new(
+            self.project_inbox_items()
+                .into_iter()
+                .filter(|item| matches!(item, ProjectInboxItem::Task { .. }))
+                .collect::<Vec<_>>(),
+        );
         let task_ids = Arc::new(self.task_list.task_ids().to_vec());
         let row_models = Arc::new(
             task_ids
                 .iter()
                 .map(|task_id| {
+                    let row = self.inbox.row(*task_id);
+                    let project = row
+                        .map(|row| row.display.project.clone())
+                        .filter(|label| !label.trim().is_empty())
+                        .unwrap_or_else(|| "Project".to_string());
+                    let branch = row
+                        .map(|row| row.display.worktree.clone())
+                        .filter(|label| !label.trim().is_empty())
+                        .unwrap_or_else(|| "main".to_string());
+                    let status = self
+                        .task_row_status(*task_id)
+                        .map(visible_status_label)
+                        .unwrap_or("Unprojected")
+                        .to_string();
+                    let provider = self
+                        .task_provider_kind(*task_id)
+                        .map(|provider| match provider {
+                            ProviderKind::ClaudeCode => "Claude",
+                            ProviderKind::Codex => "Codex",
+                            ProviderKind::Cursor => "Cursor",
+                        })
+                        .unwrap_or("Agent")
+                        .to_string();
                     (
                         *task_id,
                         (
                             self.task_row_title(*task_id),
-                            self.task_row_detail(*task_id),
+                            project,
+                            branch,
+                            status,
                             Self::status_tone(self.task_row_status(*task_id), tokens),
+                            provider,
                         ),
                     )
                 })
@@ -14600,8 +14756,11 @@ impl NativeShell {
             .any(|action| action.provider == ProviderKind::Codex);
         let shell_entity = cx.entity().downgrade();
         let services_shell_entity = shell_entity.clone();
+        let task_list_generation = selected_task
+            .map(|task_id| stable_task_element_key(task_id, "uniform-list"))
+            .unwrap_or_default();
         let task_list_element = uniform_list(
-            "native-task-uniform-list",
+            ("native-task-uniform-list", task_list_generation),
             inbox_items.len(),
             move |range, _window, _app| {
                 range
@@ -14788,12 +14947,22 @@ impl NativeShell {
                         let shell_for_mouse = shell_entity.clone();
                         let shell_for_mouse_up = shell_entity.clone();
                         let shell_for_key = shell_entity.clone();
-                        let (row_title, row_detail, row_tone) =
+                        let (
+                            row_title,
+                            project_label,
+                            branch_label,
+                            status_label,
+                            row_tone,
+                            provider_label,
+                        ) =
                             row_models.get(&task_id).cloned().unwrap_or_else(|| {
                                 (
                                     format!("Task {task_id}"),
+                                    "Project".to_string(),
+                                    "main".to_string(),
                                     "Unprojected".to_string(),
                                     tokens.status.inactive,
+                                    "Agent".to_string(),
                                 )
                             });
                         let row_selected = selected_task == Some(task_id);
@@ -14845,30 +15014,34 @@ impl NativeShell {
                             .id(stable_task_element_id(task_id))
                             .tab_stop(true)
                             .w_full()
-                            .h(px(row_height))
+                            .h(px(row_height - 4.0))
                             .flex()
-                            .items_center()
-                            .gap(px(tokens.density.spacing.sm))
-                            .pl(px(tokens.density.spacing.xl))
-                            .pr(px(tokens.density.spacing.md))
-                            .border_l(px(2.0))
+                            .flex_col()
+                            .justify_center()
+                            .gap(px(3.0))
+                            .px(px(10.0))
+                            .py(px(7.0))
+                            .rounded(px(6.0))
                             .cursor_pointer();
-                        // Selection is carried by fill plus an accent edge, and
-                        // the same row still states its status in text, so the
-                        // list never depends on color alone.
+                        // T3's task rail is a quiet stack of borderless cards.
+                        // Only the active row receives a fill; status remains
+                        // explicit text, so the state never depends on color.
                         let row = if row_selected {
                             row.bg(tokens.surfaces.selection.to_gpui())
-                                .border_color(tokens.borders.selection.to_gpui())
                         } else {
-                            row.border_color(tokens.surfaces.raised.to_gpui())
-                                .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
+                            row.hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
                         };
                         let title_color = if row_selected {
                             tokens.text.on_selection.to_gpui()
                         } else {
                             tokens.text.primary.to_gpui()
                         };
-                        row
+                        div()
+                            .w_full()
+                            .h(px(row_height))
+                            .px(px(6.0))
+                            .py(px(2.0))
+                            .child(row
                             // Capture every button at the row boundary so a
                             // right/middle click cannot fall through to the
                             // terminal dock behind the list. The handler
@@ -14877,36 +15050,76 @@ impl NativeShell {
                             .capture_any_mouse_down(mouse_handler)
                             .capture_any_mouse_up(mouse_up_handler)
                             .on_key_down(key_handler)
-                            .child(Self::tone_dot(row_tone, 8.0))
                             .child(
                                 div()
+                                    .w_full()
                                     .flex()
-                                    .flex_col()
-                                    .flex_grow()
-                                    .overflow_hidden()
+                                    .items_center()
+                                    .gap(px(5.0))
+                                    .text_size(px(tokens.density.typography.caption))
+                                    .line_height(px(tokens.density.typography.caption_line_height))
+                                    .text_color(if row_selected {
+                                        tokens.text.on_selection.to_gpui()
+                                    } else {
+                                        tokens.text.secondary.to_gpui()
+                                    })
+                                    .child(crate::icons::app_icon(
+                                        crate::icons::FOLDER,
+                                        13.0,
+                                        if row_selected {
+                                            tokens.text.on_selection.to_u32()
+                                        } else {
+                                            tokens.text.secondary.to_u32()
+                                        },
+                                    ))
                                     .child(
                                         div()
-                                            .text_size(px(tokens.density.typography.body))
-                                            .line_height(px(tokens
-                                                .density
-                                                .typography
-                                                .body_line_height))
-                                            .text_color(title_color)
+                                            .flex_1()
+                                            .min_w(px(0.0))
                                             .truncate()
-                                            .child(row_title),
+                                            .child(project_label),
                                     )
                                     .child(
                                         div()
-                                            .text_size(px(tokens.density.typography.caption))
-                                            .line_height(px(tokens
-                                                .density
-                                                .typography
-                                                .caption_line_height))
-                                            .text_color(tokens.text.secondary.to_gpui())
-                                            .truncate()
-                                            .child(row_detail),
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(4.0))
+                                            .child(Self::tone_dot(row_tone, 7.0))
+                                            .child(status_label),
                                     ),
                             )
+                            .child(
+                                div()
+                                    .w_full()
+                                    .min_w(px(0.0))
+                                    .truncate()
+                                    .text_size(px(tokens.density.typography.body))
+                                    .line_height(px(tokens.density.typography.body_line_height))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(title_color)
+                                    .child(row_title),
+                            )
+                            .child(
+                                div()
+                                    .w_full()
+                                    .flex()
+                                    .items_center()
+                                    .text_size(px(tokens.density.typography.caption))
+                                    .line_height(px(tokens.density.typography.caption_line_height))
+                                    .text_color(if row_selected {
+                                        tokens.text.on_selection.to_gpui()
+                                    } else {
+                                        tokens.text.muted.to_gpui()
+                                    })
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w(px(0.0))
+                                            .truncate()
+                                            .child(branch_label),
+                                    )
+                                    .child(provider_label),
+                            ))
                             .into_any_element()
                         }
                     })
@@ -15156,9 +15369,10 @@ impl NativeShell {
             .child(self.context_dock_surface(tokens, Some(services_shell_entity)))
             .into_any_element();
 
-        let inbox_heading_action = if agents_connected {
+        let project_add_control = if agents_connected {
             Button::new("native-projects-add")
-                .label("+ Project")
+                .label("+")
+                .tooltip("Add project")
                 .ghost()
                 .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
                     cx.stop_propagation();
@@ -15170,18 +15384,101 @@ impl NativeShell {
             div()
                 .flex()
                 .items_center()
-                .gap(px(tokens.density.spacing.sm))
+                .px(px(7.0))
                 .text_size(px(tokens.density.typography.caption))
                 .text_color(tokens.text.muted.to_gpui())
-                .child(format!("{agent_loading_glyph} +Claude"))
-                .child(format!("{agent_loading_glyph} +Codex"))
+                .child(agent_loading_glyph)
                 .into_any_element()
         };
-        let inbox_panel = Self::stacked_panel_grow(
-            "native-shell-task-inbox",
-            "Task inbox",
-            tokens,
-            if inbox_is_empty {
+        let navigation = div()
+            .id("native-shell-sidebar-navigation")
+            .w_full()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .gap(px(3.0))
+            .px(px(8.0))
+            .pb(px(8.0))
+            .child(
+                div()
+                    .id("native-shell-sidebar-search")
+                    .tab_stop(true)
+                    .w_full()
+                    .h(px(34.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .px(px(8.0))
+                    .rounded(px(6.0))
+                    .cursor_pointer()
+                    .text_size(px(tokens.density.typography.caption))
+                    .text_color(tokens.text.secondary.to_gpui())
+                    .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
+                    .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
+                        cx.stop_propagation();
+                        shell.dispatch_keyboard(KeyboardShortcut::ctrl(
+                            crate::ui::actions::ShortcutKey::Character('p'),
+                        ));
+                        cx.notify();
+                    }))
+                    .child(crate::icons::app_icon(
+                        crate::icons::SEARCH,
+                        14.0,
+                        tokens.text.muted.to_u32(),
+                    ))
+                    .child(div().flex_1().child("Search"))
+                    .child(
+                        Button::new("native-sidebar-new-task")
+                            .label("+")
+                            .tooltip("New task")
+                            .ghost()
+                            .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
+                                cx.stop_propagation();
+                                shell.begin_new_task();
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .id("native-shell-sidebar-project-scope")
+                    .w_full()
+                    .h(px(34.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .px(px(8.0))
+                    .rounded(px(6.0))
+                    .text_size(px(tokens.density.typography.caption))
+                    .text_color(tokens.text.secondary.to_gpui())
+                    .child(crate::icons::app_icon(
+                        crate::icons::FOLDER,
+                        14.0,
+                        tokens.text.muted.to_u32(),
+                    ))
+                    .child(
+                        div()
+                            .flex_1()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("All projects"),
+                    )
+                    .child(crate::icons::app_icon(
+                        crate::icons::CHEVRON_DOWN,
+                        12.0,
+                        tokens.text.muted.to_u32(),
+                    ))
+                    .child(project_add_control),
+            )
+            .into_any_element();
+        let inbox_panel = div()
+            .id("native-shell-task-inbox")
+            .w_full()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h(px(0.0))
+            .overflow_hidden()
+            .child(if inbox_is_empty {
                 Self::inbox_empty_state(tokens, None)
             } else {
                 div()
@@ -15190,59 +15487,137 @@ impl NativeShell {
                     .flex()
                     .flex_col()
                     .flex_1()
-                    // The list still needs a floor so a short column keeps a
-                    // usable number of rows rather than collapsing to nothing.
                     .min_h(px(row_height * DEFAULT_VISIBLE_ROWS as f32))
                     .overflow_hidden()
                     .on_scroll_wheel(inbox_scroll)
                     .child(task_list_element)
                     .into_any_element()
-            },
-            Some(inbox_heading_action),
-        );
-
-        let header_settings_control = Button::new("native-header-settings")
-            .label("Settings")
-            .ghost()
-            .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
-                cx.stop_propagation();
-                shell.settings_open = true;
-                cx.notify();
-            }))
+            })
             .into_any_element();
+        let sidebar_footer = div()
+            .id("native-shell-sidebar-footer")
+            .w_full()
+            .h(px(44.0))
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_between()
+            .px(px(10.0))
+            .border_t(px(1.0))
+            .border_color(tokens.borders.subtle.to_gpui())
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(4.0))
+                    .child(
+                        div()
+                            .id("native-header-settings")
+                            .tab_stop(true)
+                            .size(px(28.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(6.0))
+                            .cursor_pointer()
+                            .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
+                            .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
+                                cx.stop_propagation();
+                                shell.settings_open = true;
+                                cx.notify();
+                            }))
+                            .child(crate::icons::app_icon(
+                                crate::icons::SETTINGS,
+                                14.0,
+                                tokens.text.muted.to_u32(),
+                            )),
+                    )
+                    .child(
+                        div()
+                            .id("native-sidebar-changes")
+                            .tab_stop(true)
+                            .size(px(28.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(6.0))
+                            .cursor_pointer()
+                            .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
+                            .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
+                                cx.stop_propagation();
+                                shell.dispatch_keyboard(KeyboardShortcut::alt(
+                                    crate::ui::actions::ShortcutKey::Digit(1),
+                                ));
+                                cx.notify();
+                            }))
+                            .child(crate::icons::app_icon(
+                                crate::icons::GIT_BRANCH,
+                                14.0,
+                                tokens.text.muted.to_u32(),
+                            )),
+                    )
+                    .child(
+                        div()
+                            .id("native-sidebar-services")
+                            .tab_stop(true)
+                            .size(px(28.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(6.0))
+                            .cursor_pointer()
+                            .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
+                            .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
+                                cx.stop_propagation();
+                                shell.dispatch_keyboard(KeyboardShortcut::alt(
+                                    crate::ui::actions::ShortcutKey::Digit(5),
+                                ));
+                                cx.notify();
+                            }))
+                            .child(crate::icons::app_icon(
+                                crate::icons::ACTIVITY,
+                                14.0,
+                                tokens.text.muted.to_u32(),
+                            )),
+                    ),
+            )
+            .child(
+                div()
+                    .id("native-sidebar-new-task-footer")
+                    .tab_stop(true)
+                    .size(px(28.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_full()
+                    .cursor_pointer()
+                    .bg(tokens.actions.primary.default.background.to_gpui())
+                    .hover(|style| style.bg(tokens.actions.primary.hover.background.to_gpui()))
+                    .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
+                        cx.stop_propagation();
+                        shell.begin_new_task();
+                        cx.notify();
+                    }))
+                    .child(crate::icons::app_icon(
+                        crate::icons::PLUS,
+                        14.0,
+                        tokens.actions.primary.default.foreground.to_u32(),
+                    )),
+            )
+            .into_any_element();
+        let sidebar = Self::reference_sidebar(tokens, navigation, inbox_panel, sidebar_footer);
 
         let layout = self
             .layout
             .fitted(f32::from(viewport.width), f32::from(viewport.height));
-        let stage = ShellStage::Cockpit;
-        let show_sidebar = false;
-        let pane_toggles = (stage == ShellStage::Cockpit).then(|| self.pane_toggles(tokens, cx));
-        let workspace_actions = None;
-        let setup_action =
-            (stage == ShellStage::Welcome && !self.shows_add_project_plus()).then(|| {
-                Button::new("native-connect-refresh")
-                    .label("Refresh")
-                    .primary()
-                    .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
-                        cx.stop_propagation();
-                        let _ = shell.dispatch_agent_connection_query(false);
-                        cx.notify();
-                    }))
-                    .into_any_element()
-            });
-        let setup_project_plus = self.shows_add_project_plus().then(|| {
-            Button::new("native-projects-add")
-                .label("+")
-                .tooltip("Add project")
-                .ghost()
-                .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
-                    cx.stop_propagation();
-                    shell.begin_choose_folder(cx);
-                    cx.notify();
-                }))
-                .into_any_element()
-        });
-        let sidebar_rail = self.pane_rail(PaneEdge::Sidebar, tokens, cx);
+        let workspace_actions = self.conversation_delete_action(cx);
+        let workspace_header = self.header_bar(
+            tokens,
+            None,
+            workspace_actions,
+            Some(self.pane_toggles(tokens, cx)),
+            Self::header_settings_control_static(),
+        );
         let workspace_rails = (
             self.pane_rail(PaneEdge::Inbox, tokens, cx),
             self.pane_rail(PaneEdge::Dock, tokens, cx),
@@ -15322,76 +15697,21 @@ impl NativeShell {
             .on_action::<NativeToggleTerminal>(toggle_terminal)
             .on_action::<NativeResetLayout>(reset_layout)
             .flex()
-            .flex_col()
-            .bg(tokens.surfaces.raised.to_gpui())
+            .bg(tokens.surfaces.canvas.to_gpui())
             .text_size(px(tokens.density.typography.body))
             .line_height(px(tokens.density.typography.body_line_height))
             .text_color(tokens.text.primary.to_gpui())
-            .child(self.header_bar(
+            .child(self.main_column(
                 tokens,
+                conversation,
+                sidebar,
+                workspace_header,
+                dock_panel,
                 None,
-                workspace_actions,
-                pane_toggles,
-                header_settings_control,
+                layout,
+                Some(workspace_rails),
+                None,
             ))
-            .child(
-                div()
-                    .id("native-shell-content")
-                    .flex()
-                    .flex_1()
-                    .min_h(px(0.0))
-                    .overflow_hidden()
-                    .children((stage == ShellStage::Cockpit).then(|| {
-                        div()
-                            .id("native-shell-cockpit")
-                            .flex()
-                            .flex_1()
-                            .min_h(px(0.0))
-                            .min_w(px(0.0))
-                            .overflow_hidden()
-                            .children(show_sidebar.then(|| {
-                                self.sidebar(
-                                    tokens,
-                                    layout.sidebar_width,
-                                    self.shows_add_project_plus().then(|| {
-                                        Button::new("native-projects-add")
-                                            .label("+")
-                                            .tooltip("Add project")
-                                            .ghost()
-                                            .on_click(cx.listener(
-                                                |shell, _event: &ClickEvent, _window, cx| {
-                                                    cx.stop_propagation();
-                                                    shell.begin_choose_folder(cx);
-                                                    cx.notify();
-                                                },
-                                            ))
-                                            .into_any_element()
-                                    }),
-                                )
-                            }))
-                            .children(show_sidebar.then_some(sidebar_rail))
-                            .child(self.main_column(
-                                tokens,
-                                conversation,
-                                inbox_panel,
-                                dock_panel,
-                                None,
-                                layout,
-                                Some(workspace_rails),
-                                self.conversation_delete_action(cx),
-                            ))
-                            .into_any_element()
-                    }))
-                    .children((stage != ShellStage::Cockpit).then(|| {
-                        self.setup_shell_content(
-                            stage,
-                            tokens,
-                            layout,
-                            setup_action,
-                            setup_project_plus,
-                        )
-                    })),
-            )
             .children(self.render_overlays(tokens, viewport, cx))
     }
 
@@ -16363,7 +16683,8 @@ mod tests {
         MAX_ACTION_LANE_RECORDS, MAX_ACTION_OUTCOME_PROJECTIONS, MAX_HOST_PROJECTIONS,
         MAX_PENDING_HOST_ACTIONS, MAX_PENDING_PREFERENCES, MAX_RETAINED_CHILDREN,
         MAX_RETAINED_WORKERS, MAX_RETRY_HOST_ACTIONS, NATIVE_SNAPSHOT_PAGE_ITEMS,
-        PRODUCTION_HOST_PROFILE,
+        PRODUCTION_HOST_PROFILE, T3_SIDEBAR_ROW_HEIGHT, T3_SIDEBAR_WIDTH,
+        T3_WORKSPACE_TOPBAR_HEIGHT,
     };
     use crate::protocol::FrameLimits;
     use crate::remote::RemoteImageAttachment;
@@ -16388,6 +16709,14 @@ mod tests {
             CONVERSATION_COMPOSER_PLACEHOLDER,
             "Ask anything, @tag files/folders, $use skills, or / for commands"
         );
+    }
+
+    #[test]
+    fn target_shell_geometry_matches_the_t3_reference_composition() {
+        assert_eq!(T3_SIDEBAR_WIDTH, 256.0);
+        assert_eq!(T3_SIDEBAR_ROW_HEIGHT, 78.0);
+        assert_eq!(T3_WORKSPACE_TOPBAR_HEIGHT, 44.0);
+        assert_eq!(CONVERSATION_CONTENT_MAX_WIDTH, 768.0);
     }
 
     #[test]
@@ -17559,7 +17888,7 @@ mod tests {
         ) {
             return;
         }
-        assert_eq!(CONVERSATION_CONTENT_MAX_WIDTH, 860.0);
+        assert_eq!(CONVERSATION_CONTENT_MAX_WIDTH, 768.0);
         assert!(
             WorkspaceLayout::default().dock_collapsed,
             "conversation-first layouts start with the dock collapsed"
@@ -21293,7 +21622,10 @@ mod tests {
 
     #[test]
     fn native_modal_backdrop_dims_without_hiding_the_cockpit() {
-        assert_eq!(NativeShell::modal_backdrop(), gpui::rgba(0x00000059));
+        assert_eq!(
+            NativeShell::modal_backdrop(),
+            gpui::rgba(crate::ui::tokens::MODAL_BACKDROP_RGBA)
+        );
     }
 
     #[test]

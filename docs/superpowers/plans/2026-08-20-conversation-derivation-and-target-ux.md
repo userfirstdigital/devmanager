@@ -15,7 +15,7 @@
 - Every train must pass `cargo check --locked --lib --bins --tests` in an isolated target before it is merge-ready.
 - Do not set an external `DEVMANAGER_PROFILE` for the full suite.
 - Cargo colorizes output. When reading a build log, strip ANSI first (`sed 's/\x1b\[[0-9;]*m//g'`) or an anchored `^error` grep silently reports zero errors on a failed build.
-- The conversation column measure is **860 px** (`CONVERSATION_CONTENT_MAX_WIDTH`, already defined in `src/ui/task_cockpit/timeline.rs`). This is a deliberate divergence from T3 Code's 768 px. Do not change it.
+- The conversation column measure is **768 px** (`CONVERSATION_CONTENT_MAX_WIDTH`, defined in `src/ui/task_cockpit/timeline.rs`), matching T3 Code's `max-w-3xl` geometry and the accepted visual reference.
 - `items_end()` on a flex column collapses its children to zero width in GPUI and they never paint. Right alignment uses `justify_end()` on a row.
 - A definite width (`w(px(..))`) is required for the readable measure. `w_full().max_w(..)` does not clamp.
 - Preserve every invariant in the "Invariants preserved" section of `docs/superpowers/specs/2026-08-20-conversation-derivation-single-source-design.md`: host authority, `providerSessionId` never synthesized, `ComposerFence` / `action_epoch` / `runtime_generation` fencing, question and approval identity fencing, `PromptVersionRef` provenance, `ComposerHostProjection` boundary, no raw PTY becoming conversation truth, and durable journal storage and `ALLOWED_JOURNAL_KINDS` unchanged.
@@ -1530,8 +1530,8 @@ mod tests {
     }
 
     #[test]
-    fn the_readable_measure_is_eight_hundred_and_sixty() {
-        assert_eq!(CONVERSATION_CONTENT_MAX_WIDTH, 860.0);
+    fn the_readable_measure_matches_the_t3_reference() {
+        assert_eq!(CONVERSATION_CONTENT_MAX_WIDTH, 768.0);
     }
 }
 ```
@@ -1720,7 +1720,7 @@ Expected: `EXIT=0`, error count `0`.
 
 - [ ] **Step 5: Live visual pass**
 
-Run the watcher and compare the conversation surface side by side with a running T3 Code window. Check the acceptance criteria in the spec that a test cannot cover: rows carry no borders, the assistant turn has no marker, chrome appears only on hover, the column measures 860 px, and the composer and its context strip read as one surface. Record the composer approximation verdict per acceptance criterion 21.
+Run the watcher and compare the conversation surface side by side with a running T3 Code window. Check the acceptance criteria in the spec that a test cannot cover: rows carry no borders, the assistant turn has no marker, chrome appears only on hover, the column measures 768 px, and the composer and its context strip read as one surface. Record the composer approximation verdict per acceptance criterion 21.
 
 - [ ] **Step 6: Commit**
 
@@ -1731,10 +1731,10 @@ git commit -m "chore(ui): remove the throwaway conversation look prototype"
 
 #### Execution closeout (2026-08-23)
 
-- Tasks 1-10 are implemented in the real native conversation and composer surfaces; the throwaway prototype and fixture are removed.
-- Verification passed in the isolated `C:\Temp\devmanager-conversation-derivation` target: the serial Rust library suite reported 2,754 passed, 0 failed, and 2 ignored; the standalone conversation conformance harness reported 1 passed and 0 failed; and `cargo check --locked --lib --bins --tests` exited 0.
-- Code-level geometry and treatment review confirms borderless rows, a bare assistant turn, an 860 px centered conversation/composer column, named-group hover/focus chrome, and a joined composer/context strip. The composer is a close T3-style approximation while preserving DevManager's existing question, approval, attachment, provider, checkout, and branch behavior.
-- Native pixels are now verified through the real isolated host and canonical `NativeShell`: `conversation-target-ux-final-20260823-1800.png` captured the persisted open Codex task, its production user-message treatment, provider context, and conversation canvas after a bounded asynchronous settle. The Windows computer-control bridge remained unavailable, so hover/focus behavior is verified by the GPUI named-group/focus implementation and focused tests rather than a pointer-driven screenshot. No production profile or installed process was used as a fallback.
+- Tasks 1-10 are implemented in the real native conversation and composer surfaces; the throwaway prototype and fixture are removed. The final reference-parity pass also replaced the legacy split cockpit chrome with the T3-style full-height task rail, compact workspace top bar, and full-bleed conversation canvas.
+- Verification passed in the isolated `C:\Temp\devmanager-conversation-derivation` target: the serial Rust library suite reported 2,755 passed, 0 failed, and 2 ignored; the standalone conversation conformance harness reported 1 passed and 0 failed; the UI token harness reported 20 passed and 0 failed; both reference-shell projection tests passed independently; and `cargo check --locked --lib --bins --tests` exited 0.
+- Code-level geometry and treatment review confirms a 256 px full-height sidebar, 78 px borderless task rows, a 44 px workspace top bar, a bare assistant turn, a 768 px centered conversation/composer column, named-group hover/focus chrome, and a joined composer/context strip. Existing question, approval, attachment, provider, checkout, branch, terminal, dock, and task actions remain wired to their production handlers.
+- Native pixels are verified through the real isolated host and canonical `NativeShell`: `conversation-target-ux-reference-1912-20260823-r2.png` is a 1912x1200 full-shell capture showing the plum canvas, navy selected task, flat task hierarchy, compact workspace chrome, connected Codex composer, and joined checkout/branch strip after bounded asynchronous settle. The isolated selected task has no durable transcript rows, so the proof exercises the production shell/composer composition without fabricating conversation data. Hover/focus behavior is verified by the GPUI named-group/focus implementation and focused tests. No production profile or installed process was used as a fallback.
 
 ---
 

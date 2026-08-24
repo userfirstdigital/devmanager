@@ -1398,13 +1398,17 @@ impl ThemeTokens {
     }
 }
 
-const DARK_SURFACE_CANVAS: Color = Color::from_u32(0x18181b);
-const DARK_SURFACE_RAISED: Color = Color::from_u32(0x27272a);
-const DARK_SURFACE_OVERLAY: Color = Color::from_u32(0x323238);
-const DARK_SURFACE_SUNKEN: Color = Color::from_u32(0x09090b);
-const DARK_SURFACE_HOVER: Color = Color::from_u32(0x323238);
-const DARK_SURFACE_SELECTION: Color = Color::from_u32(0x3f3f46);
-const DARK_SURFACE_DISABLED: Color = Color::from_u32(0x27272a);
+// T3 Code's dark shell uses a plum-black canvas, a still darker navigation
+// rail, and depth only where interaction calls for it. These values are
+// sampled from the accepted reference rather than approximated from the old
+// neutral zinc cockpit.
+const DARK_SURFACE_CANVAS: Color = Color::from_u32(0x1f1a24);
+const DARK_SURFACE_RAISED: Color = Color::from_u32(0x29232e);
+const DARK_SURFACE_OVERLAY: Color = Color::from_u32(0x2b2431);
+const DARK_SURFACE_SUNKEN: Color = Color::from_u32(0x1a131b);
+const DARK_SURFACE_HOVER: Color = Color::from_u32(0x241c25);
+const DARK_SURFACE_SELECTION: Color = Color::from_u32(0x001062);
+const DARK_SURFACE_DISABLED: Color = Color::from_u32(0x241e28);
 
 const DARK_TEXT_PRIMARY: Color = Color::from_u32(0xe4e4e7);
 const DARK_TEXT_SECONDARY: Color = Color::from_u32(0xd4d4d8);
@@ -1414,9 +1418,9 @@ const DARK_TEXT_INVERSE: Color = Color::from_u32(0xf8fafc);
 const DARK_TEXT_ON_ACCENT: Color = Color::from_u32(0xf8fafc);
 const DARK_TEXT_ON_SELECTION: Color = Color::from_u32(0xf8fafc);
 
-const DARK_BORDER_SUBTLE: Color = Color::from_u32(0x27272a);
-const DARK_BORDER_DEFAULT: Color = Color::from_u32(0x3f3f46);
-const DARK_BORDER_STRONG: Color = Color::from_u32(0x52525b);
+const DARK_BORDER_SUBTLE: Color = Color::from_u32(0x362d3d);
+const DARK_BORDER_DEFAULT: Color = Color::from_u32(0x493d50);
+const DARK_BORDER_STRONG: Color = Color::from_u32(0x66566d);
 const DARK_BORDER_FOCUS: Color = Color::from_u32(0xfacc15);
 const DARK_BORDER_SELECTION: Color = Color::from_u32(0xa1a1aa);
 const DARK_BORDER_DISABLED: Color = Color::from_u32(0x52525b);
@@ -1428,10 +1432,10 @@ const DARK_STATUS_WARNING: Color = Color::from_u32(0xfacc15);
 const DARK_STATUS_DESTRUCTIVE: Color = Color::from_u32(0xfb7185);
 const DARK_STATUS_INACTIVE: Color = Color::from_u32(0xa1a1aa);
 
-const DARK_ACTION_PRIMARY_DEFAULT: Color = Color::from_u32(0x5757c8);
-const DARK_ACTION_PRIMARY_HOVER: Color = Color::from_u32(0x5959d0);
-const DARK_ACTION_PRIMARY_FOCUS: Color = Color::from_u32(0x5b5bd6);
-const DARK_ACTION_PRIMARY_SELECTED: Color = Color::from_u32(0x5c5bd6);
+const DARK_ACTION_PRIMARY_DEFAULT: Color = Color::from_u32(0xce1a6b);
+const DARK_ACTION_PRIMARY_HOVER: Color = Color::from_u32(0xd4146a);
+const DARK_ACTION_PRIMARY_FOCUS: Color = Color::from_u32(0xd81b70);
+const DARK_ACTION_PRIMARY_SELECTED: Color = Color::from_u32(0xce1a6b);
 const DARK_ACTION_PRIMARY_DISABLED: Color = Color::from_u32(0x606876);
 const DARK_ACTION_PRIMARY_FOREGROUND: Color = Color::from_u32(0xf8fafc);
 const DARK_ACTION_DESTRUCTIVE_DEFAULT: Color = Color::from_u32(0xc62828);
@@ -1440,6 +1444,10 @@ const DARK_ACTION_DESTRUCTIVE_FOCUS: Color = Color::from_u32(0xc62828);
 const DARK_ACTION_DESTRUCTIVE_SELECTED: Color = Color::from_u32(0xc92a2a);
 const DARK_ACTION_DESTRUCTIVE_DISABLED: Color = Color::from_u32(0x606876);
 const DARK_ACTION_DESTRUCTIVE_FOREGROUND: Color = Color::from_u32(0xffffff);
+
+/// Shared translucent scrim for native modal surfaces. Kept in the canonical
+/// token module so native views never own ad-hoc RGB(A) literals.
+pub const MODAL_BACKDROP_RGBA: u32 = 0x00000059;
 
 const DARK_STATUS_EXTERNAL_SURFACE: Color = Color::from_u32(0x172554);
 const DARK_STATUS_EXTERNAL_FOREGROUND: Color = Color::from_u32(0xdbeafe);
@@ -1558,7 +1566,7 @@ const HC_TEXT_PRIMARY: Color = Color::from_u32(0xffffff);
 const HC_TEXT_SECONDARY: Color = Color::from_u32(0xf5f5f5);
 const HC_TEXT_MUTED: Color = Color::from_u32(0xe8e8e8);
 const HC_TEXT_DISABLED: Color = Color::from_u32(0xd6d6d6);
-const HC_TEXT_INVERSE: Color = Color::from_u32(0x000000);
+const HC_TEXT_INVERSE: Color = Color::from_u32(0xffffff);
 const HC_BORDER_FOCUS: Color = Color::from_u32(0xffff00);
 const HC_BORDER_DEFAULT: Color = Color::from_u32(0xd6d6d6);
 const HC_BORDER_STRONG: Color = Color::from_u32(0xffffff);

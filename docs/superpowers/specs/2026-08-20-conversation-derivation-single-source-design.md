@@ -277,20 +277,19 @@ important than any single measurement below.
 
 | Property | Value | Source |
 | --- | --- | --- |
-| Conversation column | **860 px max, 16 px side gutters** (DevManager choice; T3 Code uses 768) | `2026-08-18` spec / `CONVERSATION_CONTENT_MAX_WIDTH` |
+| Conversation column | **768 px max, 16 px side gutters** | T3 Code `max-w-3xl` / accepted reference / `CONVERSATION_CONTENT_MAX_WIDTH` |
 | Minimap gutter | 48 px persistent | `TIMELINE_MINIMAP_PERSISTENT_GUTTER` |
 | Minimap item spacing | 8 px, minimum 2 items, height `min(natural, 100vh - 18rem)` | `MessagesTimeline.logic.ts` |
 | Follow re-arm band | **40 px** above the true content bottom | `TIMELINE_FOLLOW_REARM_THRESHOLD_PX` |
 | Visible work entries | **1**, remainder behind a toggle row | `MAX_VISIBLE_WORK_LOG_ENTRIES` |
 
-**Column width is a deliberate divergence from T3 Code.** T3 Code uses 768 px
-(`TIMELINE_CONTENT_MAX_WIDTH`, rendered as `min(48rem, 100% - 2rem)`). DevManager keeps the
-**860 px** already specified in the 2026-08-18 redesign and already present as
-`CONVERSATION_CONTENT_MAX_WIDTH` in `src/ui/task_cockpit/timeline.rs`. This is a decision, not an
-oversight: it was reviewed against a running T3 Code instance and the wider measure was preferred.
+**Column width matches T3 Code.** T3 Code uses 768 px (`max-w-3xl`, rendered as
+`min(48rem, 100% - 2rem)`). DevManager uses the same **768 px** measure through
+`CONVERSATION_CONTENT_MAX_WIDTH` in `src/ui/task_cockpit/timeline.rs`, as confirmed by the accepted
+full-shell visual reference.
 
 Everything downstream of the measure follows it. Any surface T3 Code sizes to its conversation
-column — floating banners, the load-earlier header — uses **860 px** here, so the canvas stays
+column — floating banners, the load-earlier header — uses **768 px** here, so the canvas stays
 optically aligned. Per-row proportions that are expressed as fractions rather than pixels, notably
 the user bubble's 80 % cap, are unchanged and simply resolve wider.
 
@@ -434,7 +433,7 @@ rotates 180 degrees over 200 ms on expand. The copy is count- and kind-aware:
 cursor.
 
 **Banners.** Thread errors and provider status float centred above the transcript at the same
-860 px measure, sized to their content (`w-fit`), 12 px top padding, with a 24 px dismiss control
+768 px measure, sized to their content (`w-fit`), 12 px top padding, with a 24 px dismiss control
 inset 8 px from the top-right. Body copy clamps to three lines; the full text is available in a
 tooltip capped at 384 px with preserved whitespace.
 
@@ -527,17 +526,7 @@ promotional — the same restraint as the composer's draft headline.
 
 ### Deliberate divergences
 
-Five things are **not** copied literally:
-
-- **Conversation column width.** T3 Code uses 768 px; DevManager keeps **860 px**. Reviewed
-  against a running instance and chosen deliberately. See "Geometry" above for what follows from
-  it.
-- **Window chrome, sidebar, top bar, and terminal.** DevManager's shell, task inbox, dock, and
-  terminal are established surfaces with their own accessibility tree, and they are **not
-  rebuilt**. "Adjacent surfaces" above records T3 Code's measurements for them as calibration
-  targets only: where DevManager already disagrees, the difference is to be decided deliberately
-  and written down, not silently converged. Only the conversation canvas and composer are matched
-  outright.
+Three things are **not** copied literally:
 - **Terminal-context inline placeholder.** T3 Code represents inline terminal context with a
   `U+FFFC` OBJECT REPLACEMENT CHARACTER embedded in the prompt string. DevManager attaches terminal
   context through a different mechanism, and section 4 already defers that segment variant.
@@ -562,10 +551,8 @@ tolerates the bytes rather than concluding the file is missing or corrupt.
 `docs/superpowers/specs/2026-08-18-native-conversation-first-redesign.md` remains the source for
 image attachment rules, dock collapse and layout migration, slash-command overlay behaviour, and
 accessibility identities. Its visual sections are superseded by "Target UX" above wherever the two
-disagree, and they disagree in two places that matter:
+disagree. The remaining material disagreement is row treatment:
 
-- **Column width.** Unchanged at **860 px**. The earlier spec's measure stands; T3 Code's
-  narrower 768 px was considered and deliberately rejected.
 - **Row treatment.** The earlier spec describes assistant turns as "document-like blocks with a
   small provider/assistant marker". The target has **no marker at all**.
 
@@ -600,7 +587,7 @@ satisfied by construction and needs no denylist entry.
     wide; an assistant message renders with no surface, no border, and no role marker.
 12. Timestamp, copy, and revert controls are not painted at rest and appear on row hover or
     keyboard focus.
-13. The conversation column measures 860 px maximum with 16 px gutters, and the composer,
+13. The conversation column measures 768 px maximum with 16 px gutters, and the composer,
     floating banners, and load-earlier header all share
     that measure.
 14. The composer placeholder is the verbatim string in "Target UX", and `@`, `$`, and `/` each

@@ -15,7 +15,7 @@ DevManager's native task surface should feel like a modern AI development conver
 
 ## Conversation hierarchy
 
-The transcript uses a centered content column with a maximum width of 860 logical pixels and comfortable vertical spacing.
+The transcript uses a centered content column with a maximum width of 768 logical pixels and comfortable vertical spacing.
 
 - User turns are right-aligned, compact rounded bubbles with a subtle selected-surface background.
 - Assistant turns are left-aligned document-like blocks with a small provider/assistant marker and no full-width row border.
@@ -29,7 +29,7 @@ The activity summary appears only when it has useful state to report: running sh
 
 ## Composer
 
-The composer is a raised, rounded, shadowed surface floating above the bottom edge of the conversation. It shares the transcript's 860-pixel readable width.
+The composer is a raised, rounded, shadowed surface floating above the bottom edge of the conversation. It shares the transcript's 768-pixel readable width.
 
 - The input supports multiple wrapped lines; Enter submits and Shift+Enter inserts a newline.
 - The bottom action row contains image attachment, provider-terminal toggle, contextual question/approval actions, and a compact primary send action.
@@ -77,4 +77,3 @@ The conversation panel uses low-chrome canvas styling rather than the same heavy
 7. The right context dock starts collapsed after the one-time layout migration and reopens through the existing Dock control.
 8. No full-screen connection gate is introduced, no provider session identity is synthesized, and no raw PTY transcript becomes semantic conversation truth.
 9. Focused tests, the isolated Rust compile/full library gates, and a live watch-mode visual/interaction pass succeed.
-

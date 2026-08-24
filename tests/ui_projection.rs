@@ -23,6 +23,7 @@ use devmanager::ui::preview::{
     parse_preview_args, PreviewApplication, PreviewDismiss, PreviewError, PreviewOutputCapability,
     PreviewPathPolicy, PreviewRequest, PREVIEW_SCHEMA,
 };
+use devmanager::ui::preview_capture::{PREVIEW_WINDOW_HEIGHT, PREVIEW_WINDOW_WIDTH};
 use devmanager::ui::task_cockpit::{
     Inbox, InboxError, InboxFilter, InboxItemKey, InboxPresentationWidth, InboxRenderItem,
     InboxRuntime, InboxSection, InboxState, PrimaryProviderIcon, PrimaryProviderState,
@@ -306,6 +307,26 @@ fn visible_task_cockpit_capture_installs_the_native_shell_and_settles_asynchrono
     assert!(application.contains("instantiate_native_shell_for_capture"));
     assert!(application.contains(".timer(Duration::from_millis"));
     assert!(!application.contains("std::thread::sleep"));
+}
+
+#[test]
+fn canonical_preview_is_large_enough_to_judge_full_shell_visual_parity() {
+    assert_eq!(PREVIEW_WINDOW_WIDTH, 1912);
+    assert_eq!(PREVIEW_WINDOW_HEIGHT, 1200);
+}
+
+#[test]
+fn native_shell_uses_the_reference_full_height_sidebar_and_full_bleed_workspace() {
+    let source = include_str!("../src/ui/native_shell.rs");
+
+    assert!(source.contains("native-shell-sidebar-column"));
+    assert!(source.contains("native-shell-sidebar-brand"));
+    assert!(source.contains("native-shell-sidebar-search"));
+    assert!(source.contains("native-shell-sidebar-project-scope"));
+    assert!(source.contains("native-shell-workspace-column"));
+    assert!(source.contains("native-shell-workspace-topbar"));
+    assert!(source.contains("native-shell-compact-terminal-toggle"));
+    assert!(!source.contains(".child(canvas_switch)"));
 }
 
 #[test]

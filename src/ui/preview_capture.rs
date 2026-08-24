@@ -24,8 +24,8 @@ use crate::ui::preview::{PreviewRequest, PreviewRoot};
 /// request and covering GPUI setup, WGC startup, first frame, cleanup, join,
 /// and PNG settlement.
 pub const FIRST_FRAME_DEADLINE: Duration = Duration::from_secs(5);
-pub const PREVIEW_WINDOW_WIDTH: i32 = 640;
-pub const PREVIEW_WINDOW_HEIGHT: i32 = 360;
+pub const PREVIEW_WINDOW_WIDTH: i32 = 1912;
+pub const PREVIEW_WINDOW_HEIGHT: i32 = 1200;
 
 /// Maximum byte length of any capture diagnostic rendered for the UI.
 pub const MAX_CLEANUP_DIAGNOSTIC_BYTES: usize = 4096;
@@ -3861,7 +3861,8 @@ mod windows_capture_impl {
             if width != PREVIEW_WINDOW_WIDTH as u32 || height != PREVIEW_WINDOW_HEIGHT as u32 {
                 self.send_error(
                     PreviewCaptureError::InvalidWindowState {
-                        reason: "capture frame dimensions do not match the 640x360 contract",
+                        reason:
+                            "capture frame dimensions do not match the canonical preview contract",
                     },
                     capture_control,
                 );
@@ -4154,7 +4155,7 @@ mod windows_capture_impl {
         };
         if capture_width != PREVIEW_WINDOW_WIDTH || capture_height != PREVIEW_WINDOW_HEIGHT {
             return Err(PreviewCaptureError::InvalidWindowState {
-                reason: "preview capture bounds do not match the 640x360 contract",
+                reason: "preview capture bounds do not match the canonical preview contract",
             });
         }
 
@@ -4313,7 +4314,7 @@ mod windows_capture_impl {
             || frame.height != PREVIEW_WINDOW_HEIGHT as u32
         {
             return Err(PreviewCaptureError::InvalidWindowState {
-                reason: "capture frame dimensions do not match the 640x360 contract",
+                reason: "capture frame dimensions do not match the canonical preview contract",
             });
         }
         let after = foreground_hwnd();

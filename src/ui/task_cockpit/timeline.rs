@@ -26,7 +26,7 @@ use crate::ui::tokens::ThemeTokens;
 pub const DEFAULT_OVERSCAN: usize = 4;
 pub const MAX_PAINTED_ROWS: usize = 48;
 /// Shared readable measure for the conversation column and floating composer.
-pub const CONVERSATION_CONTENT_MAX_WIDTH: f32 = 860.0;
+pub const CONVERSATION_CONTENT_MAX_WIDTH: f32 = 768.0;
 /// Follow re-arm band above the true content bottom. Strict on purpose: a
 /// half-viewport "near end" test re-arms live-follow while the user is reading
 /// history and yanks them back down on the next streamed chunk.
@@ -678,7 +678,7 @@ mod tests {
             summary.is_none(),
             "idle transcripts must not surface a raw event count: {summary:?}"
         );
-        assert_eq!(CONVERSATION_CONTENT_MAX_WIDTH, 860.0);
+        assert_eq!(CONVERSATION_CONTENT_MAX_WIDTH, 768.0);
     }
 
     #[test]

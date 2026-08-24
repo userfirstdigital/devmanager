@@ -149,7 +149,10 @@
   replay work advance on GPUI's event loop before capture. Preserve bounded
   settle options across request revalidation, include the explicit settle in
   the preview's one absolute deadline, and use an executor timer rather than a
-  blocking thread sleep.
+  blocking thread sleep. For reference-driven visual work, capture the complete
+  canonical shell at representative reference geometry and compare its primary
+  composition, spacing, hierarchy, and palette against the reference. A small
+  crop proves only that the native host can paint; it is not visual acceptance.
 
 ## Lean phase execution
 

@@ -609,8 +609,8 @@ mod tests {
     }
 
     #[test]
-    fn the_readable_measure_is_eight_hundred_and_sixty() {
-        assert_eq!(CONVERSATION_CONTENT_MAX_WIDTH, 860.0);
+    fn the_readable_measure_matches_the_t3_reference() {
+        assert_eq!(CONVERSATION_CONTENT_MAX_WIDTH, 768.0);
     }
 
     #[test]

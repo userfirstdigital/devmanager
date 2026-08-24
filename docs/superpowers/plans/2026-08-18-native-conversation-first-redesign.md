@@ -61,7 +61,7 @@ enum ConversationItemVisibility {
 }
 ```
 
-Classify by `TimelineItemContent`, with generic lifecycle/usage extensions hidden. Render message, tool, plan, question, approval, error, and fallback content through separate GPUI builders. Use an 860-pixel centered column, no per-row full-width border, and no `max_h(280)` cap.
+Classify by `TimelineItemContent`, with generic lifecycle/usage extensions hidden. Render message, tool, plan, question, approval, error, and fallback content through separate GPUI builders. Use a 768-pixel centered column, no per-row full-width border, and no `max_h(280)` cap.
 
 - [ ] **Step 4: Run GREEN**
 
@@ -218,4 +218,3 @@ git diff --check
 - [ ] **Step 4: Run live watch-mode acceptance**
 
 Restart only the isolated watch app/host. Verify first task row latency, open a real Claude/Codex task, inspect the conversation visually, paste a PNG, send a prompt referencing it, exercise `/`, Shift+Enter, question response, Dock reopen/collapse, and provider-terminal return. Confirm the installed app PIDs/start times and config/remote hashes did not change.
-
