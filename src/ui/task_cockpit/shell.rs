@@ -27,7 +27,9 @@ use crate::ui::task_cockpit::dock::{
     ContextDock, DependencyUnavailable, DockEdge, DockProjectionError, DockTool, PointerPhase,
     PointerPress,
 };
-use crate::ui::task_cockpit::timeline::{Timeline, TimelineViewport};
+#[cfg(debug_assertions)]
+use crate::ui::task_cockpit::timeline::PreviewPlanStep;
+use crate::ui::task_cockpit::timeline::{ActivityToggleHandler, Timeline, TimelineViewport};
 use crate::ui::tokens::{theme, Density, Scale, ThemeMode};
 
 pub struct TaskCockpitShell {
@@ -452,6 +454,16 @@ impl TaskCockpitShell {
         self.timeline_error = None;
     }
 
+    #[cfg(debug_assertions)]
+    pub(crate) fn install_preview_plan_steps(
+        &mut self,
+        task_id: TaskId,
+        steps: &[PreviewPlanStep],
+    ) {
+        self.timeline = Some(Timeline::for_preview_plan_steps(task_id, steps));
+        self.timeline_error = None;
+    }
+
     pub fn conversation_hold_message(&self) -> Option<&str> {
         self.timeline_error.as_deref()
     }
@@ -507,6 +519,15 @@ impl TaskCockpitShell {
         tokens: crate::ui::tokens::ThemeTokens,
         footer: AnyElement,
     ) -> AnyElement {
+        self.conversation_surface_with_footer_and_activity_handler(tokens, footer, None)
+    }
+
+    pub fn conversation_surface_with_footer_and_activity_handler(
+        &self,
+        tokens: crate::ui::tokens::ThemeTokens,
+        footer: AnyElement,
+        activity_toggle: Option<ActivityToggleHandler>,
+    ) -> AnyElement {
         div()
             .id("native-task-conversation-surface")
             .w_full()
@@ -514,12 +535,16 @@ impl TaskCockpitShell {
             .min_h(gpui::px(0.0))
             .flex()
             .flex_col()
-            .child(self.conversation_timeline_surface(tokens))
+            .child(self.conversation_timeline_surface(tokens, activity_toggle))
             .child(footer)
             .into_any_element()
     }
 
-    fn conversation_timeline_surface(&self, tokens: crate::ui::tokens::ThemeTokens) -> AnyElement {
+    fn conversation_timeline_surface(
+        &self,
+        tokens: crate::ui::tokens::ThemeTokens,
+        activity_toggle: Option<ActivityToggleHandler>,
+    ) -> AnyElement {
         let timeline_error = self.timeline_error.clone().unwrap_or_else(|| {
             if self.dock.selected_task().is_none() {
                 "Add a project, then create a task. The conversation fills in once a task is selected.".to_string()
@@ -536,7 +561,7 @@ impl TaskCockpitShell {
                     .flex_1()
                     .min_h(gpui::px(0.0))
                     .overflow_hidden()
-                    .child(timeline.surface(tokens))
+                    .child(timeline.surface_with_activity_handler(tokens, activity_toggle))
                     .into_any_element()
             })
             .unwrap_or_else(move || {

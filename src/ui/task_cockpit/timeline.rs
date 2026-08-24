@@ -4,13 +4,16 @@
 //! raw `SemanticEvent` arrays are not part of the public API.
 
 use gpui::{
-    div, px, AnyElement, InteractiveElement, IntoElement, ParentElement,
+    div, px, AnyElement, App, InteractiveElement, IntoElement, ParentElement,
     StatefulInteractiveElement, Styled,
 };
 use std::collections::BTreeSet;
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::rc::Rc;
 
 use crate::client::model::ClientModel;
 use crate::domain::id::{OperationId, TaskId};
+use crate::domain::PlanStepStatus;
 use crate::protocol::CapabilitySet;
 use crate::ui::conversation::render::{conversation_row_element, conversation_row_height};
 use crate::ui::conversation::rows::{
@@ -23,6 +26,15 @@ use crate::ui::renderers::{
 };
 use crate::ui::tokens::ThemeTokens;
 
+#[cfg(debug_assertions)]
+use crate::domain::EventId;
+#[cfg(debug_assertions)]
+use crate::ui::components::interaction::{AccessibilityMetadata, AccessibleRole};
+#[cfg(debug_assertions)]
+use crate::ui::renderers::{
+    InteractionEligibility, PlanView, RendererSelection, SemanticKind, TimelineItemContent,
+};
+
 pub const DEFAULT_OVERSCAN: usize = 4;
 pub const MAX_PAINTED_ROWS: usize = 48;
 /// Shared readable measure for the conversation column and floating composer.
@@ -31,6 +43,41 @@ pub const CONVERSATION_CONTENT_MAX_WIDTH: f32 = 768.0;
 /// half-viewport "near end" test re-arms live-follow while the user is reading
 /// history and yanks them back down on the next streamed chunk.
 pub const FOLLOW_REARM_THRESHOLD_PX: u32 = 40;
+
+pub type ActivityToggleHandler = Rc<dyn Fn(String, &mut App)>;
+
+#[cfg(debug_assertions)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviewPlanStep {
+    pub step_id: String,
+    pub title: String,
+    pub status: String,
+}
+
+fn timeline_row_element(
+    row: &ConversationRow,
+    tokens: ThemeTokens,
+    activity_toggle: Option<ActivityToggleHandler>,
+) -> AnyElement {
+    let visual = conversation_row_element(row, tokens);
+    let ConversationRow::ActivityToggle { group, .. } = row else {
+        return visual;
+    };
+    let Some(activity_toggle) = activity_toggle else {
+        return visual;
+    };
+    let group = group.clone();
+    let mut element_hasher = DefaultHasher::new();
+    group.hash(&mut element_hasher);
+    let element_key = element_hasher.finish();
+    div()
+        .id(("native-conversation-activity-toggle", element_key))
+        .tab_stop(true)
+        .cursor_pointer()
+        .on_click(move |_event, _window, app| activity_toggle(group.clone(), app))
+        .child(visual)
+        .into_any_element()
+}
 
 /// Row heights are estimated at a fixed baseline density/scale, never the
 /// live user theme. Threading the real `ThemeTokens` into this path would
@@ -63,7 +110,9 @@ pub(crate) fn conversation_activity_summary(
             TimelineItemContent::Tool(view) => {
                 activity.observe_tool(&view.tool_id, &view.name, &view.state);
             }
-            TimelineItemContent::Plan(view) => activity.observe_plan(&view.status),
+            TimelineItemContent::Plan(view) => {
+                activity.observe_plan(view.step_id.as_deref(), &view.status)
+            }
             _ => {}
         }
     }
@@ -84,13 +133,16 @@ pub(crate) fn conversation_activity_summary(
             parts.push(format!("{other_tools} other tool(s) running"));
         }
     }
-    if activity.active_subagents > 0 {
-        parts.push(format!("{} subagent(s) active", activity.active_subagents));
+    if !activity.active_subagents.is_empty() {
+        parts.push(format!(
+            "{} subagent(s) active",
+            activity.active_subagents.len()
+        ));
     }
-    if activity.open_task_steps > 0 {
+    if !activity.open_task_steps.is_empty() {
         parts.push(format!(
             "Goal active · {} task step(s) open",
-            activity.open_task_steps
+            activity.open_task_steps.len()
         ));
     }
     if parts.is_empty() {
@@ -197,6 +249,49 @@ impl Timeline {
         Self::for_test_task_items(TaskId::new(), items)
     }
 
+    #[cfg(debug_assertions)]
+    pub(crate) fn for_preview_plan_steps(task_id: TaskId, steps: &[PreviewPlanStep]) -> Self {
+        let items = steps
+            .iter()
+            .map(|step| TimelineItemModel {
+                id: TimelineItemId::Event(EventId::new()),
+                task_id,
+                renderer_selection: RendererSelection::Specialized(SemanticKind::Plan),
+                interaction: InteractionEligibility::None,
+                content: TimelineItemContent::Plan(PlanView {
+                    step_id: Some(step.step_id.clone()),
+                    title: step.title.clone(),
+                    steps: vec![step.title.clone()],
+                    status: step.status.clone(),
+                }),
+                activated_on_enter: false,
+                accessibility: AccessibilityMetadata::new(
+                    AccessibleRole::Status,
+                    step.title.clone(),
+                )
+                .expect("validated preview plan title"),
+                turn_id: None,
+                related_event_id: None,
+            })
+            .collect();
+        Self::assemble(
+            task_id,
+            JournalAvailability::LiveProjection,
+            items,
+            TimelineViewport {
+                height: 1_200,
+                scroll_offset: 0,
+            },
+            CapturedActionTarget {
+                task_id,
+                agent_session_id: None,
+                runtime_generation: 0,
+                request_id: None,
+                action_epoch: 0,
+            },
+        )
+    }
+
     #[cfg(test)]
     fn for_test_task_items(task_id: TaskId, items: Vec<TimelineItemModel>) -> Self {
         Self::assemble(
@@ -233,6 +328,14 @@ impl Timeline {
     /// the native terminal. An unavailable journal remains visibly mounted as
     /// a typed hold until an authenticated semantic page is admitted.
     pub fn surface(&self, tokens: ThemeTokens) -> AnyElement {
+        self.surface_with_activity_handler(tokens, None)
+    }
+
+    pub fn surface_with_activity_handler(
+        &self,
+        tokens: ThemeTokens,
+        activity_toggle: Option<ActivityToggleHandler>,
+    ) -> AnyElement {
         let status = match self.availability {
             JournalAvailability::Unavailable(_) => {
                 "Semantic timeline awaiting authenticated journal"
@@ -245,7 +348,7 @@ impl Timeline {
         let painted_rows = self
             .painted_rows()
             .iter()
-            .map(|row| conversation_row_element(row, tokens))
+            .map(|row| timeline_row_element(row, tokens, activity_toggle.clone()))
             .collect::<Vec<_>>();
         div()
             .id("native-semantic-timeline")
@@ -254,29 +357,59 @@ impl Timeline {
             .overflow_y_scroll()
             .bg(tokens.surfaces.canvas.to_gpui())
             .child(
-                div().w_full().flex().justify_center().px(px(16.0)).child(
-                    div()
-                        .id("native-conversation-column")
-                        // A definite width is required here. The earlier
-                        // `w_full().max_w(..)` form did not clamp in GPUI.
-                        .w(px(CONVERSATION_CONTENT_MAX_WIDTH))
-                        .max_w_full()
-                        .py(px(tokens.density.spacing.lg))
-                        .flex()
-                        .flex_col()
-                        .gap(px(tokens.density.spacing.md))
-                        .children(activity.map(|summary| {
-                            div()
-                                .w_full()
-                                .text_size(px(tokens.density.typography.caption))
-                                .text_color(tokens.text.secondary.to_gpui())
-                                .child(summary)
-                                .into_any_element()
-                        }))
-                        .children(painted_rows),
-                ),
+                div()
+                    .w_full()
+                    .min_h(px(self.viewport.height as f32))
+                    .flex()
+                    .items_end()
+                    .justify_center()
+                    .px(px(16.0))
+                    .child(
+                        div()
+                            .id("native-conversation-column")
+                            // A definite width is required here. The earlier
+                            // `w_full().max_w(..)` form did not clamp in GPUI.
+                            .w(px(CONVERSATION_CONTENT_MAX_WIDTH))
+                            .max_w_full()
+                            .py(px(tokens.density.spacing.lg))
+                            .flex()
+                            .flex_col()
+                            .gap(px(tokens.density.spacing.md))
+                            .children(activity.map(|summary| {
+                                div()
+                                    .w_full()
+                                    .text_size(px(tokens.density.typography.caption))
+                                    .text_color(tokens.text.secondary.to_gpui())
+                                    .child(summary)
+                                    .into_any_element()
+                            }))
+                            .children(painted_rows),
+                    ),
             )
             .into_any_element()
+    }
+
+    pub fn toggle_activity_group(&mut self, group: &str) -> bool {
+        if !self.rows.iter().any(
+            |row| matches!(row, ConversationRow::ActivityToggle { group: row_group, .. } if row_group == group),
+        ) {
+            return false;
+        }
+        if let Some(index) = self
+            .expanded_activity
+            .iter()
+            .position(|candidate| candidate == group)
+        {
+            self.expanded_activity.remove(index);
+        } else {
+            self.expanded_activity.push(group.to_string());
+        }
+        self.rows = apply_activity_collapse(
+            derive_conversation_rows(&self.items, ConversationVerbosity::Calm),
+            &self.expanded_activity,
+        );
+        self.rebuild_heights();
+        true
     }
 
     pub fn items(&self) -> &[TimelineItemModel] {
@@ -538,8 +671,8 @@ impl Timeline {
 struct ActivityCounts {
     running_commands: BTreeSet<String>,
     running_shells: BTreeSet<String>,
-    active_subagents: usize,
-    open_task_steps: usize,
+    active_subagents: BTreeSet<String>,
+    open_task_steps: BTreeSet<String>,
 }
 
 impl ActivityCounts {
@@ -563,16 +696,27 @@ impl ActivityCounts {
         }
     }
 
-    fn observe_plan(&mut self, status: &str) {
+    fn observe_plan(&mut self, step_id: Option<&str>, status: &str) {
+        let Some(step_id) = step_id else {
+            return;
+        };
+        let Some(status) = PlanStepStatus::from_wire(status) else {
+            return;
+        };
+        let target = if step_id.starts_with("subagent:") {
+            &mut self.active_subagents
+        } else if step_id.starts_with("task:") {
+            &mut self.open_task_steps
+        } else {
+            return;
+        };
         match status {
-            "subagentStarted" => self.active_subagents += 1,
-            // Claude emits a correlated SubagentStop hook for every completed
-            // subagent. The later task notification is presentation-only and
-            // must not decrement a second time.
-            "subagentStopped" => self.active_subagents = self.active_subagents.saturating_sub(1),
-            "taskCreated" => self.open_task_steps += 1,
-            "taskCompleted" => self.open_task_steps = self.open_task_steps.saturating_sub(1),
-            _ => {}
+            PlanStepStatus::Pending | PlanStepStatus::Active => {
+                target.insert(step_id.to_string());
+            }
+            PlanStepStatus::Completed | PlanStepStatus::Failed => {
+                target.remove(step_id);
+            }
         }
     }
 }
@@ -645,25 +789,69 @@ mod tests {
 
         activity.observe_tool("shell-1", "Bash", "running");
         activity.observe_tool("shell-2", "PowerShell", "running");
-        activity.observe_plan("subagentStarted");
-        activity.observe_plan("taskCreated");
+        activity.observe_plan(Some("subagent:1"), "active");
+        activity.observe_plan(Some("task:1"), "pending");
         assert_eq!(activity.running_commands.len(), 2);
         assert_eq!(activity.running_shells.len(), 2);
-        assert_eq!(activity.active_subagents, 1);
-        assert_eq!(activity.open_task_steps, 1);
+        assert_eq!(activity.active_subagents.len(), 1);
+        assert_eq!(activity.open_task_steps.len(), 1);
 
         activity.observe_tool("shell-1", "Bash", "completed");
-        activity.observe_plan("subagentStopped");
-        activity.observe_plan("subagentCompleted");
-        activity.observe_plan("taskCompleted");
+        activity.observe_plan(Some("subagent:1"), "completed");
+        activity.observe_plan(Some("task:1"), "completed");
         assert_eq!(activity.running_commands.len(), 1);
-        assert_eq!(activity.active_subagents, 0);
-        assert_eq!(activity.open_task_steps, 0);
+        assert!(activity.active_subagents.is_empty());
+        assert!(activity.open_task_steps.is_empty());
 
         activity.observe_tool("shell-2", "PowerShell", "failed");
-        activity.observe_plan("subagentStopped");
-        activity.observe_plan("taskCompleted");
+        activity.observe_plan(Some("subagent:1"), "completed");
+        activity.observe_plan(Some("task:1"), "completed");
         assert_eq!(activity, ActivityCounts::default());
+    }
+
+    #[test]
+    fn activity_toggle_expands_and_collapses_the_real_timeline_projection() {
+        let mut timeline = Timeline::for_test_items(vec![
+            tool_item("tool-1", "Read", "completed"),
+            tool_item("tool-2", "Read", "completed"),
+            tool_item("tool-3", "Bash", "completed"),
+        ]);
+        let group = timeline
+            .rows()
+            .iter()
+            .find_map(|row| match row {
+                crate::ui::conversation::rows::ConversationRow::ActivityToggle {
+                    group, ..
+                } => Some(group.clone()),
+                _ => None,
+            })
+            .expect("collapsed timeline toggle");
+
+        assert!(timeline.toggle_activity_group(&group));
+        let expanded_count = timeline
+            .rows()
+            .iter()
+            .find_map(|row| match row {
+                crate::ui::conversation::rows::ConversationRow::Activity { entries, .. } => {
+                    Some(entries.len())
+                }
+                _ => None,
+            })
+            .expect("expanded activity row");
+        assert_eq!(expanded_count, 3);
+
+        assert!(timeline.toggle_activity_group(&group));
+        let collapsed_count = timeline
+            .rows()
+            .iter()
+            .find_map(|row| match row {
+                crate::ui::conversation::rows::ConversationRow::Activity { entries, .. } => {
+                    Some(entries.len())
+                }
+                _ => None,
+            })
+            .expect("collapsed activity row");
+        assert_eq!(collapsed_count, 1);
     }
 
     #[test]

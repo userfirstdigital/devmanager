@@ -87,6 +87,76 @@ pub fn omit_stale_quota_display<T>(observed_at: u64, now_ms: u64, display: T) ->
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanStepKind {
+    Task,
+    Subagent,
+}
+
+impl PlanStepKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Task => "task",
+            Self::Subagent => "subagent",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanStepStatus {
+    Pending,
+    Active,
+    Completed,
+    Failed,
+}
+
+impl PlanStepStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Active => "active",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+        }
+    }
+
+    /// Accept the canonical journal vocabulary plus legacy plan fixtures. An
+    /// unknown provider value deliberately remains unknown instead of being
+    /// presented as completed work.
+    pub fn from_wire(status: &str) -> Option<Self> {
+        match status {
+            "pending" | "taskCreated" => Some(Self::Pending),
+            "active" | "running" | "in_progress" | "inProgress" | "subagentStarted" => {
+                Some(Self::Active)
+            }
+            "completed" | "succeeded" | "taskCompleted" | "subagentStopped"
+            | "subagentCompleted" => Some(Self::Completed),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderPlanStepLifecycle {
+    pub kind: PlanStepKind,
+    pub status: PlanStepStatus,
+}
+
+/// The provider hook lifecycle states that are true plan steps. The later
+/// `subagentCompleted` prompt notification is intentionally excluded: it has
+/// no provider subject identity and is presentation-only.
+pub fn provider_plan_step_lifecycle(state: &str) -> Option<ProviderPlanStepLifecycle> {
+    let (kind, status) = match state {
+        "taskCreated" => (PlanStepKind::Task, PlanStepStatus::Pending),
+        "taskCompleted" => (PlanStepKind::Task, PlanStepStatus::Completed),
+        "subagentStarted" => (PlanStepKind::Subagent, PlanStepStatus::Active),
+        "subagentStopped" => (PlanStepKind::Subagent, PlanStepStatus::Completed),
+        _ => return None,
+    };
+    Some(ProviderPlanStepLifecycle { kind, status })
+}
+
 /// Provider-neutral, bounded semantic payload retained by the journal. Raw
 /// provider envelopes and terminal bytes are deliberately not represented.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -725,6 +795,54 @@ pub struct ProcessAccountingMemberSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_plan_lifecycle_is_typed_and_excludes_presentation_only_notifications() {
+        assert_eq!(
+            provider_plan_step_lifecycle("taskCreated"),
+            Some(ProviderPlanStepLifecycle {
+                kind: PlanStepKind::Task,
+                status: PlanStepStatus::Pending,
+            })
+        );
+        assert_eq!(
+            provider_plan_step_lifecycle("subagentStarted"),
+            Some(ProviderPlanStepLifecycle {
+                kind: PlanStepKind::Subagent,
+                status: PlanStepStatus::Active,
+            })
+        );
+        assert_eq!(
+            provider_plan_step_lifecycle("taskCompleted").map(|lifecycle| lifecycle.status),
+            Some(PlanStepStatus::Completed)
+        );
+        assert_eq!(
+            provider_plan_step_lifecycle("subagentStopped").map(|lifecycle| lifecycle.status),
+            Some(PlanStepStatus::Completed)
+        );
+        assert_eq!(provider_plan_step_lifecycle("subagentCompleted"), None);
+    }
+
+    #[test]
+    fn plan_step_status_parser_never_claims_unknown_state_is_completed() {
+        assert_eq!(
+            PlanStepStatus::from_wire("pending"),
+            Some(PlanStepStatus::Pending)
+        );
+        assert_eq!(
+            PlanStepStatus::from_wire("in_progress"),
+            Some(PlanStepStatus::Active)
+        );
+        assert_eq!(
+            PlanStepStatus::from_wire("completed"),
+            Some(PlanStepStatus::Completed)
+        );
+        assert_eq!(
+            PlanStepStatus::from_wire("failed"),
+            Some(PlanStepStatus::Failed)
+        );
+        assert_eq!(PlanStepStatus::from_wire("future-provider-state"), None);
+    }
 
     fn empty_snapshot_page() -> SnapshotPage {
         SnapshotPage {

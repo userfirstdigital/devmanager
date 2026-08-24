@@ -108,7 +108,9 @@ use crate::ui::task_cockpit::composer::{
 use crate::ui::task_cockpit::dock::{DockEdge, DockTool as CockpitDockTool};
 use crate::ui::task_cockpit::draft_store::{ComposerDraftKey, ComposerDraftStore};
 use crate::ui::task_cockpit::shell::TaskCockpitShell;
-use crate::ui::task_cockpit::timeline::CONVERSATION_CONTENT_MAX_WIDTH;
+#[cfg(debug_assertions)]
+use crate::ui::task_cockpit::timeline::PreviewPlanStep;
+use crate::ui::task_cockpit::timeline::{ActivityToggleHandler, CONVERSATION_CONTENT_MAX_WIDTH};
 use crate::ui::task_cockpit::{
     action_is_current, one_fresh_quota_observations, project_services_from_task_projection,
     project_services_panel, render_panel_action, render_task_browser_dock,
@@ -6804,6 +6806,10 @@ pub struct NativeShell {
     collapsed_projects: HashSet<ProjectId>,
     palette_index: usize,
     pending_select_task: Option<TaskId>,
+    /// Debug-preview-only semantic data used to prove the canonical Tasks card
+    /// without persisting fake provider events or sending a provider prompt.
+    #[cfg(debug_assertions)]
+    preview_plan_steps: Option<Vec<PreviewPlanStep>>,
 }
 
 /// What the main conversation canvas should show for the current selection.
@@ -7188,6 +7194,8 @@ impl NativeShell {
             collapsed_projects: HashSet::new(),
             palette_index: 0,
             pending_select_task: None,
+            #[cfg(debug_assertions)]
+            preview_plan_steps: None,
         };
         if start_controller {
             shell.start_controller(cx);
@@ -7201,6 +7209,11 @@ impl NativeShell {
 
     pub fn profile(&self) -> &IsolatedDevProfile {
         &self.profile
+    }
+
+    #[cfg(debug_assertions)]
+    pub(crate) fn install_preview_plan_steps(&mut self, steps: Vec<PreviewPlanStep>) {
+        self.preview_plan_steps = Some(steps);
     }
 
     pub fn host_connection(&self) -> &DevTestHostConnection {
@@ -10226,6 +10239,13 @@ impl NativeShell {
         if self.interaction.selected_task().is_none() {
             return self.idle_conversation_photo_surface(tokens, Some(idle_photo_size));
         }
+        #[cfg(debug_assertions)]
+        if let (Some(task_id), Some(steps)) = (
+            self.interaction.selected_task(),
+            self.preview_plan_steps.as_deref(),
+        ) {
+            self.cockpit.install_preview_plan_steps(task_id, steps);
+        }
         let timeline_height = (f32::from(idle_photo_size.height)
             - CONVERSATION_COMPOSER_HEIGHT_RESERVE)
             .max(120.0) as u32;
@@ -10762,9 +10782,25 @@ impl NativeShell {
                 )
                 .into_any_element()
         };
+        let shell_entity = cx.entity().downgrade();
+        let activity_toggle: ActivityToggleHandler = Rc::new(move |group, app| {
+            let _ = shell_entity.update(app, |shell, cx| {
+                if shell
+                    .cockpit
+                    .timeline_mut()
+                    .is_some_and(|timeline| timeline.toggle_activity_group(&group))
+                {
+                    cx.notify();
+                }
+            });
+        });
         let conversation = self
             .cockpit
-            .conversation_surface_with_footer(tokens, composer_footer);
+            .conversation_surface_with_footer_and_activity_handler(
+                tokens,
+                composer_footer,
+                Some(activity_toggle),
+            );
         let center_body = if showing_provider_terminal {
             self.center_provider_terminal_surface(tokens, cx)
         } else {
@@ -11889,11 +11925,6 @@ impl NativeShell {
             .gpui_nodes()
             .into_iter()
             .any(|node| node.element_id == "native-header-settings")
-    }
-
-    #[cfg(test)]
-    fn conversation_tools_affordance_visible_for_test(&self) -> bool {
-        true
     }
 
     #[cfg(test)]
@@ -15360,6 +15391,7 @@ impl NativeShell {
             let selected = tool == active_tool;
             let tab = div()
                 .id(element_id)
+                .tab_stop(true)
                 .flex()
                 .flex_none()
                 .items_center()
@@ -17943,16 +17975,16 @@ mod tests {
             .expect("headless shell test lock");
         gpui::Application::headless().run(|cx| {
             crate::ui::init(cx);
-            with_test_shell_in_app_cx(cx, runtime, |shell, _cx| {
+            with_test_shell_in_app_cx(cx, runtime, |shell, cx| {
                 assert!(shell.layout.dock_collapsed);
                 assert!(
-                    shell.conversation_tools_affordance_visible_for_test(),
+                    shell.conversation_delete_action(cx).is_some(),
                     "collapsed dock must keep an Add action affordance"
                 );
                 shell.toggle_pane(PaneEdge::Dock);
                 assert!(!shell.layout.dock_collapsed);
                 assert!(
-                    shell.conversation_tools_affordance_visible_for_test(),
+                    shell.conversation_delete_action(cx).is_some(),
                     "Add action is independent from the right-panel visibility"
                 );
             });

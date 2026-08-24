@@ -94,7 +94,8 @@ pub use resource::{
 };
 pub use snapshot::{
     canonical_artifact_content_page_size, canonical_event_page_size, canonical_snapshot_page_size,
-    ArtifactContentPage, CanonicalPageSizeError, EventPage, PageLimits, PageLimitsError,
+    provider_plan_step_lifecycle, ArtifactContentPage, CanonicalPageSizeError, EventPage,
+    PageLimits, PageLimitsError, PlanStepKind, PlanStepStatus, ProviderPlanStepLifecycle,
     SemanticJournalFact, SemanticJournalPage, SemanticJournalPayload, SnapshotItem,
     SnapshotItemKey, SnapshotPage, SnapshotSection, TaskSnapshot, TaskSnapshotItem,
     MAX_SNAPSHOT_PAGE_ENCODED_BYTES, MAX_SNAPSHOT_PAGE_ITEMS,

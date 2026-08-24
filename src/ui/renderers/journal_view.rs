@@ -313,7 +313,12 @@ fn live_fact_event(
                 capability: true,
                 settled: true,
             },
-            SemanticJournalPayload::PlanStep { title, status, .. } => SemanticEventBody::Plan {
+            SemanticJournalPayload::PlanStep {
+                step_id,
+                title,
+                status,
+            } => SemanticEventBody::Plan {
+                step_id: Some(step_id.clone()),
                 title: title.clone(),
                 steps: vec![title.clone()],
                 status: status.clone(),

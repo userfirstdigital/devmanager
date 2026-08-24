@@ -5,6 +5,7 @@
 //! escape-hatch variant, so an event kind nobody has mapped is structurally
 //! unrenderable rather than suppressed by a denylist.
 
+use crate::domain::PlanStepStatus;
 use crate::ui::renderers::{MessageRole, TimelineItemContent, TimelineItemId, TimelineItemModel};
 
 #[cfg(test)]
@@ -27,9 +28,16 @@ pub enum ActivityState {
     Failure,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivityKind {
+    Tool,
+    PlanStep,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActivityEntry {
     pub identity: String,
+    pub kind: ActivityKind,
     pub label: String,
     pub detail: String,
     pub state: ActivityState,
@@ -146,6 +154,7 @@ fn activity_entry_of(item: &TimelineItemModel) -> Option<ActivityEntry> {
     match &item.content {
         TimelineItemContent::Tool(view) => Some(ActivityEntry {
             identity: format!("tool:{}", view.tool_id),
+            kind: ActivityKind::Tool,
             label: view.name.clone(),
             detail: view.summary.clone(),
             state: match view.state.as_str() {
@@ -155,14 +164,22 @@ fn activity_entry_of(item: &TimelineItemModel) -> Option<ActivityEntry> {
             },
         }),
         TimelineItemContent::Plan(view) => Some(ActivityEntry {
-            identity: format!("plan:{}", view.title),
+            identity: view
+                .step_id
+                .as_ref()
+                .map(|step_id| format!("plan:{step_id}"))
+                .unwrap_or_else(|| format!("plan-event:{:?}", item.id)),
+            kind: ActivityKind::PlanStep,
             label: "Plan".to_string(),
             detail: view.title.clone(),
-            state: match view.status.as_str() {
-                "failed" => ActivityState::Failure,
-                "running" | "in_progress" | "inProgress" => ActivityState::Active,
-                "pending" => ActivityState::Pending,
-                _ => ActivityState::Success,
+            state: match PlanStepStatus::from_wire(&view.status) {
+                Some(PlanStepStatus::Failed) => ActivityState::Failure,
+                Some(PlanStepStatus::Active) => ActivityState::Active,
+                Some(PlanStepStatus::Pending) => ActivityState::Pending,
+                Some(PlanStepStatus::Completed) => ActivityState::Success,
+                // An unrecognised provider state must never inflate Tasks x/y
+                // by claiming completion. Keep it visibly unsettled.
+                None => ActivityState::Pending,
             },
         }),
         TimelineItemContent::Message(_)
@@ -385,19 +402,42 @@ pub fn apply_activity_collapse(
             });
             continue;
         }
-        let hidden = entries.len() - MAX_VISIBLE_ACTIVITY_ENTRIES;
-        let only_tools = entries
+        let plan_count = entries
             .iter()
-            .all(|entry| entry.identity.starts_with("tool:"));
+            .filter(|entry| entry.kind == ActivityKind::PlanStep)
+            .count();
+        let visible_tool_count = entries
+            .iter()
+            .filter(|entry| entry.kind == ActivityKind::Tool)
+            .count()
+            .min(MAX_VISIBLE_ACTIVITY_ENTRIES);
+        let collapsed_visible = plan_count + visible_tool_count;
+        if collapsed_visible >= entries.len() {
+            out.push(ConversationRow::Activity {
+                anchor,
+                entries,
+                state,
+                summary,
+            });
+            continue;
+        }
+        let hidden = entries.len() - collapsed_visible;
+        let only_tools = plan_count == 0;
         let shown = if is_expanded {
             entries.clone()
         } else {
+            let last_visible_tool = entries
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(index, entry)| (entry.kind == ActivityKind::Tool).then_some(index));
             entries
                 .iter()
-                .rev()
-                .take(MAX_VISIBLE_ACTIVITY_ENTRIES)
-                .rev()
-                .cloned()
+                .enumerate()
+                .filter(|(index, entry)| {
+                    entry.kind == ActivityKind::PlanStep || Some(*index) == last_visible_tool
+                })
+                .map(|(_, entry)| entry.clone())
                 .collect()
         };
         out.push(ConversationRow::Activity {
@@ -472,6 +512,48 @@ mod tests {
         assert_eq!(entries[0].detail, "Measure the reference");
         assert_eq!(entries[1].state, ActivityState::Active);
         assert_eq!(entries[2].state, ActivityState::Pending);
+    }
+
+    #[test]
+    fn plan_steps_with_duplicate_titles_keep_distinct_durable_identities() {
+        let rows = derive_conversation_rows(
+            &[
+                plan_item("step-1", "Run verification", "completed"),
+                plan_item("step-2", "Run verification", "pending"),
+            ],
+            ConversationVerbosity::Calm,
+        );
+        let ConversationRow::Activity { entries, .. } = &rows[0] else {
+            panic!("plan steps must remain activity entries");
+        };
+        assert_eq!(entries.len(), 2);
+        assert_ne!(entries[0].identity, entries[1].identity);
+    }
+
+    #[test]
+    fn calm_activity_collapse_keeps_every_plan_step_visible() {
+        let rows = derive_conversation_rows(
+            &[
+                plan_item("step-1", "One", "completed"),
+                plan_item("step-2", "Two", "in_progress"),
+                plan_item("step-3", "Three", "pending"),
+            ],
+            ConversationVerbosity::Calm,
+        );
+        let collapsed = apply_activity_collapse(rows, &[]);
+        assert!(
+            collapsed
+                .iter()
+                .all(|row| !matches!(row, ConversationRow::ActivityToggle { .. })),
+            "plan cards must not gain a dead activity fold: {collapsed:?}"
+        );
+        let Some(ConversationRow::Activity { entries, .. }) = collapsed
+            .iter()
+            .find(|row| matches!(row, ConversationRow::Activity { .. }))
+        else {
+            panic!("expected the plan activity row");
+        };
+        assert_eq!(entries.len(), 3);
     }
 
     #[test]

@@ -332,7 +332,7 @@ fn serve_conversation(
             visibility: "task".to_string(),
             privacy_class: PrivacyClass::LocalOnly,
             redacted: false,
-            payload: semantic_payload(&event.kind),
+            payload: semantic_payload(event),
         })
         .collect::<Vec<_>>();
     facts.reverse();
@@ -388,7 +388,7 @@ fn semantic_provider_name(source: crate::remote::presentation::SemanticSource) -
 }
 
 fn semantic_status_is_plan_step(state: &str) -> bool {
-    state.starts_with("subagent") || state.starts_with("task")
+    crate::domain::provider_plan_step_lifecycle(state).is_some()
 }
 
 fn semantic_payload_kind(kind: &crate::remote::presentation::SemanticEventKind) -> &'static str {
@@ -413,11 +413,11 @@ fn semantic_payload_kind(kind: &crate::remote::presentation::SemanticEventKind) 
 }
 
 fn semantic_payload(
-    kind: &crate::remote::presentation::SemanticEventKind,
+    event: &crate::remote::presentation::SemanticEvent,
 ) -> crate::domain::SemanticJournalPayload {
-    use crate::domain::SemanticJournalPayload;
+    use crate::domain::{provider_plan_step_lifecycle, SemanticJournalPayload};
     use crate::remote::presentation::{SemanticEventKind, SemanticToolState};
-    match kind {
+    match &event.kind {
         SemanticEventKind::UserMessage { text } => {
             SemanticJournalPayload::UserMessage { text: text.clone() }
         }
@@ -478,16 +478,16 @@ fn semantic_payload(
             options: choices.clone(),
         },
         SemanticEventKind::Status { state, detail } if semantic_status_is_plan_step(state) => {
+            let lifecycle = provider_plan_step_lifecycle(state)
+                .expect("plan-step classification and projection share one typed mapping");
+            let identity_sequence = event.replaces_sequence.unwrap_or(event.sequence);
             SemanticJournalPayload::PlanStep {
-                step_id: state.clone(),
-                title: detail.clone().unwrap_or_else(|| {
-                    if state.starts_with("task") {
-                        "Task".to_string()
-                    } else {
-                        "Subagent".to_string()
-                    }
+                step_id: format!("{}:{identity_sequence}", lifecycle.kind.as_str()),
+                title: detail.clone().unwrap_or_else(|| match lifecycle.kind {
+                    crate::domain::PlanStepKind::Task => "Task".to_string(),
+                    crate::domain::PlanStepKind::Subagent => "Subagent".to_string(),
                 }),
-                status: state.clone(),
+                status: lifecycle.status.as_str().to_string(),
             }
         }
         SemanticEventKind::Status { state, detail } => SemanticJournalPayload::SessionState {
@@ -1729,6 +1729,89 @@ mod tests {
     use crate::protocol::Capability;
     use crate::workspace::{WorkspaceRequest, WorkspaceResourceCoordinator};
     use std::fs;
+
+    #[test]
+    fn provider_lifecycle_projects_canonical_plan_status_and_sequence_identity() {
+        use crate::remote::presentation::{
+            SemanticEvent, SemanticEventKind, SemanticSource, StableSessionKey,
+        };
+
+        let event = SemanticEvent {
+            stable_session_key: StableSessionKey::from_tab("task"),
+            sequence: 9,
+            replaces_sequence: Some(4),
+            occurred_at_epoch_ms: 1,
+            source: SemanticSource::Claude,
+            kind: SemanticEventKind::Status {
+                state: "taskCompleted".to_string(),
+                detail: Some("Run verification".to_string()),
+            },
+        };
+
+        assert_eq!(semantic_payload_kind(&event.kind), "plan_step");
+        assert!(matches!(
+            semantic_payload(&event),
+            crate::domain::SemanticJournalPayload::PlanStep { step_id, title, status }
+                if step_id == "task:4" && title == "Run verification" && status == "completed"
+        ));
+    }
+
+    #[test]
+    fn claude_task_lifecycle_reaches_conversation_as_one_completed_plan_step() {
+        use crate::ai::claude_hooks::{ClaudeReducer, ClaudeReducerLimits};
+        use crate::remote::presentation::{SemanticJournalStore, StableSessionKey};
+        use std::sync::Mutex;
+
+        let (_repository, bus, client_id, task_id, _roots) = create_bound_task();
+        let key = StableSessionKey::from_tab(task_id.to_string());
+        let mut reducer = ClaudeReducer::new(key, ClaudeReducerLimits::default());
+        let mut store = SemanticJournalStore::default();
+        for body in [
+            br#"{"hook_event_name":"TaskCreated","task_id":"task-7","task_subject":"Verify UX"}"#
+                .as_slice(),
+            br#"{"hook_event_name":"TaskCompleted","task_id":"task-7","task_subject":"Verify UX"}"#
+                .as_slice(),
+        ] {
+            for draft in reducer.apply_json(body, 10).drafts {
+                store.record(draft);
+            }
+        }
+        let journal = Mutex::new(store);
+        let query = TaskCockpitQuery::Conversation { after_sequence: 0 };
+        let outcome = serve_task_cockpit(TaskCockpitDispatch {
+            capabilities: CapabilitySet::from_capabilities([
+                Capability::TaskCockpit,
+                Capability::SemanticConversation,
+            ]),
+            envelope_task_id: Some(task_id),
+            client_id,
+            connection_id: Uuid::now_v7(),
+            request_id: RequestId::new(),
+            query: &query,
+            bus: &bus,
+            service_runtime: None,
+            semantic_journal: Some(&journal),
+            ssh_endpoints: None,
+            ssh_runtime: None,
+            workspace_projects: None,
+            coordinator: None,
+            action_epoch: None,
+            runtime_generation: None,
+            config: None,
+        });
+        let QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Conversation(page))) =
+            outcome
+        else {
+            panic!("expected conversation page, got {outcome:?}");
+        };
+
+        assert_eq!(page.facts.len(), 1);
+        assert!(matches!(
+            &page.facts[0].payload,
+            crate::domain::SemanticJournalPayload::PlanStep { step_id, title, status }
+                if step_id == "task:1" && title == "Verify UX" && status == "completed"
+        ));
+    }
 
     fn create_bound_task() -> (
         tempfile::TempDir,

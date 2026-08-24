@@ -938,14 +938,16 @@ impl ClaudeReducer {
             .into_iter()
             .find_map(|field| value.get(field).and_then(Value::as_str))
             .map(bounded_text);
-        let identity_field = match event_name {
-            "SubagentStart" | "SubagentStop" => Some("agent_id"),
-            "TaskCreated" | "TaskCompleted" => Some("task_id"),
+        let identity = match event_name {
+            "SubagentStart" | "SubagentStop" => Some(("agent_id", "claude-subagent")),
+            "TaskCreated" | "TaskCompleted" => Some(("task_id", "claude-task")),
             _ => None,
         };
-        let deduplication_key = identity_field.and_then(|field| {
-            self.official_deduplication_key(value, field, &format!("claude-{event_name}"))
-        });
+        // Start and finish for one provider-native subject share a key. The
+        // semantic store therefore retains a replacement lineage instead of
+        // showing two plan rows for one task/subagent.
+        let deduplication_key = identity
+            .and_then(|(field, prefix)| self.official_deduplication_key(value, field, prefix));
         ClaudeReduceOutcome {
             drafts: vec![self.draft(
                 occurred_at_epoch_ms,
@@ -4454,6 +4456,29 @@ mod registry_race_tests {
 #[cfg(test)]
 mod ai_acceptance_tests {
     use super::*;
+
+    #[test]
+    fn lifecycle_start_and_finish_share_provider_subject_identity() {
+        let mut reducer = ClaudeReducer::new(
+            StableSessionKey::from_tab("lifecycle-tab"),
+            ClaudeReducerLimits::default(),
+        );
+        let started = reducer.apply_json(
+            br#"{"hook_event_name":"TaskCreated","task_id":"task-7","task_subject":"Verify UX"}"#,
+            40,
+        );
+        let completed = reducer.apply_json(
+            br#"{"hook_event_name":"TaskCompleted","task_id":"task-7","task_subject":"Verify UX"}"#,
+            41,
+        );
+
+        assert_eq!(started.drafts.len(), 1);
+        assert_eq!(completed.drafts.len(), 1);
+        assert_eq!(
+            started.drafts[0].deduplication_key, completed.drafts[0].deduplication_key,
+            "one provider task must replace its prior lifecycle projection"
+        );
+    }
 
     #[test]
     fn ai_acceptance_provider_task_notification_is_subagent_status_not_user_message() {

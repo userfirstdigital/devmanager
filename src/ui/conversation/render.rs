@@ -15,7 +15,7 @@ use std::sync::{Arc, OnceLock};
 use time::{format_description, format_description::BorrowedFormatItem, OffsetDateTime, UtcOffset};
 
 use crate::ui::conversation::rows::{
-    activity_toggle_label, ActivityEntry, ActivityState, ConversationRow,
+    activity_toggle_label, ActivityEntry, ActivityKind, ActivityState, ConversationRow,
 };
 use crate::ui::renderers::MessageRole;
 use crate::ui::tokens::{mix_color, ThemeTokens};
@@ -157,8 +157,14 @@ pub fn conversation_row_height(row: &ConversationRow, tokens: ThemeTokens) -> u3
 /// tool activity stays on the compact 24px cadence used by
 /// `work_entry_element`.
 fn activity_row_height(entries: &[ActivityEntry], caption_line_height: f32) -> f32 {
-    let work_count = entries.iter().filter(|entry| entry.label != "Plan").count();
-    let plan_count = entries.len().saturating_sub(work_count);
+    let work_count = entries
+        .iter()
+        .filter(|entry| entry.kind == ActivityKind::Tool)
+        .count();
+    let plan_count = entries
+        .iter()
+        .filter(|entry| entry.kind == ActivityKind::PlanStep)
+        .count();
     let work_height = work_count as f32 * (ICON_SLOT + 4.0);
     if plan_count == 0 {
         return work_height.max(ICON_SLOT + 4.0);
@@ -454,10 +460,12 @@ fn activity_element(
     tokens: ThemeTokens,
 ) -> AnyElement {
     let mut column = div().w_full().flex().flex_col().gap(px(2.0));
-    let work_entries = entries.iter().filter(|entry| entry.label != "Plan");
+    let work_entries = entries
+        .iter()
+        .filter(|entry| entry.kind == ActivityKind::Tool);
     let plan_entries = entries
         .iter()
-        .filter(|entry| entry.label == "Plan")
+        .filter(|entry| entry.kind == ActivityKind::PlanStep)
         .collect::<Vec<_>>();
     for entry in work_entries {
         column = column.child(work_entry_element(entry, tokens));
@@ -506,6 +514,7 @@ fn plan_card_element(entries: &[&ActivityEntry], tokens: ThemeTokens) -> AnyElem
                 )
                 .child(
                     div()
+                        .flex_1()
                         .min_w(px(0.0))
                         .text_color(
                             if matches!(
@@ -767,18 +776,21 @@ mod tests {
     fn tasks_card_progress_counts_only_completed_plan_steps() {
         let completed = ActivityEntry {
             identity: "plan:one".into(),
+            kind: ActivityKind::PlanStep,
             label: "Plan".into(),
             detail: "One".into(),
             state: ActivityState::Success,
         };
         let active = ActivityEntry {
             identity: "plan:two".into(),
+            kind: ActivityKind::PlanStep,
             label: "Plan".into(),
             detail: "Two".into(),
             state: ActivityState::Active,
         };
         let failed = ActivityEntry {
             identity: "plan:three".into(),
+            kind: ActivityKind::PlanStep,
             label: "Plan".into(),
             detail: "Three".into(),
             state: ActivityState::Failure,
@@ -791,12 +803,14 @@ mod tests {
     fn tasks_card_height_accounts_for_header_padding_and_every_step() {
         let plan = |identity: &str| ActivityEntry {
             identity: identity.into(),
+            kind: ActivityKind::PlanStep,
             label: "Plan".into(),
             detail: identity.into(),
             state: ActivityState::Active,
         };
         let tool = ActivityEntry {
             identity: "tool".into(),
+            kind: ActivityKind::Tool,
             label: "Command".into(),
             detail: "cargo fmt".into(),
             state: ActivityState::Success,

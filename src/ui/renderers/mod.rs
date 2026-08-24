@@ -232,6 +232,7 @@ pub enum SemanticEventBody {
         command_id: Option<CommandId>,
     },
     Plan {
+        step_id: Option<String>,
         title: String,
         steps: Vec<String>,
         status: String,
@@ -638,6 +639,7 @@ fn parse_known_body(
             },
         }),
         SemanticKind::Plan => Ok(SemanticEventBody::Plan {
+            step_id: optional_bounded_string(value, "step_id")?,
             title: bounded_required_string(value, "title")?,
             steps: required_string_array(value, "steps")?,
             status: bounded_required_string(value, "status")?,

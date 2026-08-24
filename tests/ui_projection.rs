@@ -72,6 +72,34 @@ fn task_cockpit_fixture() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ui/task-cockpit.json")
 }
 
+fn task_cockpit_reference_fixture() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ui/task-cockpit-reference.json")
+}
+
+#[test]
+fn task_cockpit_reference_fixture_carries_a_valid_visible_plan() {
+    let output_root = tempdir().expect("output root");
+    let temp_root = tempdir().expect("temp root");
+    let fixture = task_cockpit_reference_fixture();
+    let fixture_root = fixture.parent().expect("fixture parent");
+    let policy = PreviewPathPolicy::new(fixture_root, output_root.path(), temp_root.path());
+    let request =
+        PreviewRequest::validate(fixture, output_root.path().join("reference.png"), &policy)
+            .expect("reference request");
+    let preview = PreviewApplication::load(request, &policy).expect("reference fixture");
+    let conversation = preview
+        .root_snapshot()
+        .conversation
+        .as_ref()
+        .expect("conversation fixture");
+
+    assert_eq!(conversation.plan_steps.len(), 6);
+    assert_eq!(conversation.plan_steps[0].status, "active");
+    assert!(conversation.plan_steps[1..]
+        .iter()
+        .all(|step| step.status == "pending"));
+}
+
 fn repository_output(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join(".devmanager-next/evidence/phase-05/screenshots")

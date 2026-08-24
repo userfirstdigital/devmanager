@@ -9,6 +9,7 @@ pub struct PlanRenderer;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlanView {
+    pub step_id: Option<String>,
     pub title: String,
     pub steps: Vec<String>,
     pub status: String,
@@ -21,6 +22,7 @@ impl SemanticRenderer for PlanRenderer {
 
     fn project(&self, event: &SemanticEvent) -> Result<TimelineItemModel, RenderModelError> {
         let SemanticEventBody::Plan {
+            step_id,
             title,
             steps,
             status,
@@ -37,6 +39,7 @@ impl SemanticRenderer for PlanRenderer {
             renderer_selection: RendererSelection::Specialized(SemanticKind::Plan),
             interaction: InteractionEligibility::None,
             content: TimelineItemContent::Plan(PlanView {
+                step_id: step_id.clone(),
                 title: title.clone(),
                 steps: steps.clone(),
                 status: status.clone(),

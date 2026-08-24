@@ -80,8 +80,9 @@ pub(crate) fn plan_item(step_id: &str, title: &str, status: &str) -> TimelineIte
         renderer_selection: RendererSelection::Specialized(SemanticKind::Plan),
         interaction: InteractionEligibility::None,
         content: TimelineItemContent::Plan(PlanView {
+            step_id: Some(step_id.to_string()),
             title: title.to_string(),
-            steps: vec![step_id.to_string()],
+            steps: vec![title.to_string()],
             status: status.to_string(),
         }),
         activated_on_enter: false,

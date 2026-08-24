@@ -6,6 +6,7 @@ use gpui::{
 };
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::ffi::{OsStr, OsString};
 use std::fmt::{Display, Formatter};
@@ -68,6 +69,47 @@ pub struct PreviewRootFixture {
     pub label: String,
     #[serde(default)]
     pub gallery: Option<ComponentGalleryFixture>,
+    #[serde(default)]
+    pub conversation: Option<PreviewConversationFixture>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreviewConversationFixture {
+    pub plan_steps: Vec<PreviewPlanStepFixture>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreviewPlanStepFixture {
+    pub step_id: String,
+    pub title: String,
+    pub status: String,
+}
+
+impl PreviewConversationFixture {
+    fn validate(&self) -> Result<(), String> {
+        if self.plan_steps.is_empty() || self.plan_steps.len() > 32 {
+            return Err("preview conversation must carry 1..=32 plan steps".to_string());
+        }
+        let mut identities = BTreeSet::new();
+        for step in &self.plan_steps {
+            if step.step_id.trim().is_empty()
+                || step.step_id.len() > 128
+                || step.title.trim().is_empty()
+                || step.title.chars().count() > 512
+            {
+                return Err("preview plan step identity or title is invalid".to_string());
+            }
+            if crate::domain::PlanStepStatus::from_wire(&step.status).is_none() {
+                return Err("preview plan step status is unsupported".to_string());
+            }
+            if !identities.insert(step.step_id.as_str()) {
+                return Err("preview plan step identities must be unique".to_string());
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -484,6 +526,7 @@ pub struct PreviewRootSnapshot {
     pub title: String,
     pub body: String,
     pub component_gallery: Option<ComponentGalleryFixture>,
+    pub conversation: Option<PreviewConversationFixture>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -616,6 +659,25 @@ impl PreviewApplication {
                 });
             }
         };
+        let conversation = match (fixture.root.kind.as_str(), fixture.root.conversation) {
+            ("task-cockpit", Some(conversation)) => {
+                conversation
+                    .validate()
+                    .map_err(|message| PreviewError::MalformedFixture {
+                        path: request.fixture_path.clone(),
+                        message,
+                    })?;
+                Some(conversation)
+            }
+            ("task-cockpit", None) | ("minimal", None) | ("component_gallery", None) => None,
+            (_, Some(_)) => {
+                return Err(PreviewError::MalformedFixture {
+                    path: request.fixture_path,
+                    message: "conversation data requires a task-cockpit root".into(),
+                });
+            }
+            (_, None) => None,
+        };
         let is_task_cockpit = fixture.root.kind == "task-cockpit";
         let body = if is_task_cockpit {
             format!(
@@ -631,6 +693,7 @@ impl PreviewApplication {
             body,
             title: fixture.title,
             component_gallery,
+            conversation,
         };
         Ok(Self {
             request,
@@ -814,6 +877,19 @@ impl PreviewRoot {
             }
         })?;
         let shell = cx.new(|cx| NativeShell::new_for_headless(profile, cx));
+        #[cfg(debug_assertions)]
+        if let Some(conversation) = self.snapshot.conversation.as_ref() {
+            let steps = conversation
+                .plan_steps
+                .iter()
+                .map(|step| crate::ui::task_cockpit::timeline::PreviewPlanStep {
+                    step_id: step.step_id.clone(),
+                    title: step.title.clone(),
+                    status: step.status.clone(),
+                })
+                .collect();
+            let _ = shell.update(cx, |shell, _cx| shell.install_preview_plan_steps(steps));
+        }
         self.native_shell = Some(shell);
         Ok(self)
     }
@@ -853,6 +929,19 @@ impl PreviewRoot {
                 )
             }),
         };
+        #[cfg(debug_assertions)]
+        if let Some(conversation) = self.snapshot.conversation.as_ref() {
+            let steps = conversation
+                .plan_steps
+                .iter()
+                .map(|step| crate::ui::task_cockpit::timeline::PreviewPlanStep {
+                    step_id: step.step_id.clone(),
+                    title: step.title.clone(),
+                    status: step.status.clone(),
+                })
+                .collect();
+            let _ = shell.update(cx, |shell, _cx| shell.install_preview_plan_steps(steps));
+        }
         self.native_shell = Some(shell);
         Ok(self)
     }
