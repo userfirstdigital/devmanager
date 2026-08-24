@@ -29,7 +29,9 @@ pub const PREVIEW_SCHEMA: &str = "devmanager.ui.preview/v1";
 pub const MAX_FIXTURE_BYTES: u64 = 256 * 1024;
 pub const PREVIEW_SENTINEL_RGBA: [u8; 4] = [0x91, 0x2b, 0xd4, 0xff];
 const PREVIEW_SENTINEL_SIZE: f32 = 32.0;
-const PREVIEW_USAGE: &str = "usage: devmanager --ui-preview <fixture.json> --output <preview.png>";
+const PREVIEW_USAGE: &str =
+    "usage: devmanager --ui-preview <fixture.json> --output <preview.png> [--settle-ms <0..=5000>]";
+pub const MAX_PREVIEW_SETTLE_MS: u32 = 5_000;
 
 gpui::actions!(devmanager, [PreviewDismiss]);
 
@@ -91,6 +93,8 @@ pub enum GalleryState {
     Disabled,
     Loading,
     Destructive,
+    Selected,
+    Status,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -142,6 +146,8 @@ impl ComponentGalleryFixture {
             GalleryState::Disabled,
             GalleryState::Loading,
             GalleryState::Destructive,
+            GalleryState::Selected,
+            GalleryState::Status,
         ];
         if self.states.len() != required_states.len()
             || required_states
@@ -236,7 +242,7 @@ impl PreviewPathPolicy {
 pub struct PreviewRequest {
     fixture_path: PathBuf,
     output_path: PathBuf,
-    window_hold_ms: u32,
+    settle_delay_ms: u32,
     trusted_output_authority: Arc<preview_capture::CaptureOutputAuthority>,
 }
 
@@ -253,8 +259,8 @@ impl PreviewRequest {
         &self.trusted_output_authority
     }
 
-    pub(crate) fn window_hold_ms(&self) -> u32 {
-        self.window_hold_ms
+    pub fn settle_delay_ms(&self) -> u32 {
+        self.settle_delay_ms
     }
 
     pub fn write_bgra_png_atomic(
@@ -370,7 +376,7 @@ impl PreviewRequest {
         Ok(Self {
             fixture_path,
             output_path,
-            window_hold_ms: 0,
+            settle_delay_ms: 0,
             trusted_output_authority: Arc::new(trusted_output_authority),
         })
     }
@@ -387,6 +393,7 @@ where
     let mut args = args.into_iter().map(Into::into);
     let mut fixture = None;
     let mut output = None;
+    let mut settle_delay_ms = None;
     let mut saw_argument = false;
 
     while let Some(argument) = args.next() {
@@ -412,6 +419,25 @@ where
                     PreviewError::Usage("--output requires a PNG path".to_string())
                 })?));
             }
+            "--settle-ms" => {
+                if settle_delay_ms.is_some() {
+                    return Err(PreviewError::Usage(
+                        "--settle-ms may be supplied only once".to_string(),
+                    ));
+                }
+                let value = args.next().ok_or_else(|| {
+                    PreviewError::Usage("--settle-ms requires milliseconds".to_string())
+                })?;
+                let value = value.to_string_lossy().parse::<u32>().map_err(|_| {
+                    PreviewError::Usage("--settle-ms must be an unsigned integer".to_string())
+                })?;
+                if value > MAX_PREVIEW_SETTLE_MS {
+                    return Err(PreviewError::Usage(format!(
+                        "--settle-ms must not exceed {MAX_PREVIEW_SETTLE_MS}"
+                    )));
+                }
+                settle_delay_ms = Some(value);
+            }
             other => {
                 return Err(PreviewError::Usage(format!("unknown argument: {other}")));
             }
@@ -424,7 +450,9 @@ where
 
     let fixture = fixture.ok_or_else(|| PreviewError::Usage(PREVIEW_USAGE.to_string()))?;
     let output = output.ok_or_else(|| PreviewError::Usage(PREVIEW_USAGE.to_string()))?;
-    PreviewRequest::validate(fixture, output, policy)
+    let mut request = PreviewRequest::validate(fixture, output, policy)?;
+    request.settle_delay_ms = settle_delay_ms.unwrap_or_default();
+    Ok(request)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -500,11 +528,13 @@ pub struct PreviewApplication {
 
 impl PreviewApplication {
     pub fn load(request: PreviewRequest, policy: &PreviewPathPolicy) -> Result<Self, PreviewError> {
-        let request = PreviewRequest::validate(
+        let settle_delay_ms = request.settle_delay_ms();
+        let mut request = PreviewRequest::validate(
             request.fixture_path.clone(),
             request.output_path.clone(),
             policy,
         )?;
+        request.settle_delay_ms = settle_delay_ms;
         let bytes = read_fixture_bytes(&request.fixture_path)?;
         let fixture: PreviewFixture =
             serde_json::from_slice(&bytes).map_err(|error| PreviewError::MalformedFixture {
@@ -596,6 +626,10 @@ impl PreviewApplication {
 
     pub fn root_snapshot(&self) -> &PreviewRootSnapshot {
         &self.root_snapshot
+    }
+
+    pub fn settle_delay_ms(&self) -> u32 {
+        self.request.settle_delay_ms()
     }
 
     pub fn resources(&self) -> &PreviewResources {

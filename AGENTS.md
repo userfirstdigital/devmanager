@@ -145,6 +145,11 @@
   or consolidate its scenarios into one `Application` lifetime. Tests that
   render the idle conversation photo must install an in-memory image; do not
   let a detached network task outlive the GPUI application during teardown.
+- A visible native preview must mount the canonical shell and let snapshot and
+  replay work advance on GPUI's event loop before capture. Preserve bounded
+  settle options across request revalidation, include the explicit settle in
+  the preview's one absolute deadline, and use an executor timer rather than a
+  blocking thread sleep.
 
 ## Lean phase execution
 

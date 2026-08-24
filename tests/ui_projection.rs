@@ -250,6 +250,65 @@ fn preview_validation_rejects_no_args() {
 }
 
 #[test]
+fn preview_args_accept_only_a_bounded_settle_delay() {
+    let (_root, policy) = temporary_policy();
+    let fixture = write_fixture(&policy, "settled.json", FIXTURE_JSON);
+    let output = policy.output_root().join("settled.png");
+    let request = parse_preview_args(
+        [
+            "--ui-preview".into(),
+            fixture.into_os_string(),
+            "--output".into(),
+            output.into_os_string(),
+            "--settle-ms".into(),
+            "3500".into(),
+        ],
+        &policy,
+    )
+    .expect("bounded settle delay should be accepted");
+    assert_eq!(request.settle_delay_ms(), 3500);
+    let preview = PreviewApplication::load(request, &policy)
+        .expect("validated preview should preserve its settle delay");
+    assert_eq!(preview.settle_delay_ms(), 3500);
+
+    let fixture = write_fixture(&policy, "oversettled.json", FIXTURE_JSON);
+    let output = policy.output_root().join("oversettled.png");
+    let error = parse_preview_args(
+        [
+            "--ui-preview".into(),
+            fixture.into_os_string(),
+            "--output".into(),
+            output.into_os_string(),
+            "--settle-ms".into(),
+            "5001".into(),
+        ],
+        &policy,
+    )
+    .expect_err("oversized settle delay must be rejected");
+    assert!(matches!(error, PreviewError::Usage(_)));
+}
+
+#[test]
+fn visible_task_cockpit_capture_installs_the_native_shell_and_settles_asynchronously() {
+    let source = include_str!("../src/ui/preview_capture.rs");
+    let start = source
+        .find("fn run_preview_application(")
+        .expect("visible capture application");
+    let end = source[start..]
+        .find("trait NativeHwndExt")
+        .map(|offset| start + offset)
+        .expect("visible capture application end");
+    let application = &source[start..end];
+
+    assert!(
+        source.contains("FIRST_FRAME_DEADLINE + Duration::from_millis(u64::from(settle_delay_ms))")
+    );
+    assert!(application.contains("instantiate_native_shell_for_capture"));
+    assert!(application.contains(".timer(Duration::from_millis"));
+    assert!(!application.contains("std::thread::sleep"));
+}
+
+#[test]
 fn preview_validation_rejects_traversal_and_outside_fixture() {
     let (root, policy) = temporary_policy();
     let outside_fixture = root.path().join("outside.json");

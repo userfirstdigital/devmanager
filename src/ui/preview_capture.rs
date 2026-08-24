@@ -4348,14 +4348,16 @@ mod windows_capture_impl {
         request: &PreviewRequest,
     ) -> Result<CaptureReport, PreviewCaptureError> {
         let authority = Arc::clone(request.capture_authority());
-        let deadline = CaptureDeadline::from_now(FIRST_FRAME_DEADLINE);
+        let settle_delay_ms = request.settle_delay_ms();
+        let deadline = CaptureDeadline::from_now(
+            FIRST_FRAME_DEADLINE + Duration::from_millis(u64::from(settle_delay_ms)),
+        );
         deadline.remaining()?;
         let foreground_before = foreground_hwnd();
         let generation = CaptureGeneration::new();
         let lease = generation.begin();
         let worker_lease = lease.clone();
         let worker_authority = Arc::clone(&authority);
-        let window_hold_ms = request.window_hold_ms();
         let task = spawn_capture_worker(move || {
             catch_unwind(AssertUnwindSafe(|| {
                 run_preview_application(
@@ -4364,7 +4366,7 @@ mod windows_capture_impl {
                     foreground_before,
                     deadline,
                     worker_lease.clone(),
-                    window_hold_ms,
+                    settle_delay_ms,
                 )
             }))
             .unwrap_or_else(|_| {
@@ -4416,7 +4418,7 @@ mod windows_capture_impl {
         foreground_before: isize,
         deadline: CaptureDeadline,
         lease: CaptureLease,
-        window_hold_ms: u32,
+        settle_delay_ms: u32,
     ) -> Result<CaptureReport, PreviewCaptureError> {
         lease.check(deadline)?;
         let result_slot = Arc::new(Mutex::new(None));
@@ -4428,6 +4430,18 @@ mod windows_capture_impl {
         let application = gpui::Application::new().with_assets(crate::assets::AppAssets::new());
         application.run(move |cx| {
             crate::ui::preview::register_preview_environment(cx);
+            let root = match root.instantiate_native_shell_for_capture(cx, deadline.deadline) {
+                Ok(root) => root,
+                Err(error) => {
+                    store_capture_result(
+                        &result_for_app,
+                        &lease_for_app,
+                        Err(PreviewCaptureError::ApplicationFailed(error.to_string())),
+                    );
+                    cx.quit();
+                    return;
+                }
+            };
             let result_for_supervisor = Arc::clone(&result_for_app);
             let supervisor_lease = lease_for_app.clone();
             let supervisor_executor = cx.background_executor().clone();
@@ -4529,20 +4543,18 @@ mod windows_capture_impl {
                 return;
             }
 
-            if window_hold_ms > 0 {
-                std::thread::sleep(Duration::from_millis(u64::from(window_hold_ms)));
-                if let Err(error) = lease_for_app.check(deadline) {
-                    store_capture_result(&result_for_app, &lease_for_app, Err(error));
-                    cx.quit();
-                    return;
-                }
-            }
-
             let result_for_task = Arc::clone(&result_for_app);
             let capture_lease = lease_for_app.clone();
             let capture_authority = Arc::clone(&authority);
             let result_for_publication = Arc::clone(&result_for_task);
+            let settle_executor = cx.background_executor().clone();
             let capture_task = cx.background_executor().spawn(async move {
+                if settle_delay_ms > 0 {
+                    settle_executor
+                        .timer(Duration::from_millis(u64::from(settle_delay_ms)))
+                        .await;
+                    capture_lease.check(deadline)?;
+                }
                 capture_window_once(
                     hwnd,
                     capture_authority,
