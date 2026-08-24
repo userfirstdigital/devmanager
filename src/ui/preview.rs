@@ -29,6 +29,7 @@ pub const PREVIEW_SCHEMA: &str = "devmanager.ui.preview/v1";
 pub const MAX_FIXTURE_BYTES: u64 = 256 * 1024;
 pub const PREVIEW_SENTINEL_RGBA: [u8; 4] = [0x91, 0x2b, 0xd4, 0xff];
 const PREVIEW_SENTINEL_SIZE: f32 = 32.0;
+const PREVIEW_GALLERY_INSET_PX: u16 = 16;
 const PREVIEW_USAGE: &str =
     "usage: devmanager --ui-preview <fixture.json> --output <preview.png> [--settle-ms <0..=5000>]";
 pub const MAX_PREVIEW_SETTLE_MS: u32 = 5_000;
@@ -485,6 +486,24 @@ pub struct PreviewRootSnapshot {
     pub component_gallery: Option<ComponentGalleryFixture>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreviewFrameLayout {
+    FullBleed,
+    Inset { padding_px: u16 },
+}
+
+impl PreviewRootSnapshot {
+    fn frame_layout(&self) -> PreviewFrameLayout {
+        if self.root_kind == "task-cockpit" {
+            PreviewFrameLayout::FullBleed
+        } else {
+            PreviewFrameLayout::Inset {
+                padding_px: PREVIEW_GALLERY_INSET_PX,
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreviewInitReport {
     pub component_init_count: usize,
@@ -626,6 +645,10 @@ impl PreviewApplication {
 
     pub fn root_snapshot(&self) -> &PreviewRootSnapshot {
         &self.root_snapshot
+    }
+
+    pub fn frame_layout(&self) -> PreviewFrameLayout {
+        self.root_snapshot.frame_layout()
     }
 
     pub fn settle_delay_ms(&self) -> u32 {
@@ -870,11 +893,14 @@ impl PreviewRoot {
         };
         let preview = div()
             .size_full()
-            .p(px(16.0))
             .bg(tokens.surfaces.canvas.to_gpui())
             .text_color(tokens.text.primary.to_gpui())
-            .on_action::<PreviewDismiss>(|_, _, cx: &mut gpui::App| cx.quit())
-            .child(shell);
+            .on_action::<PreviewDismiss>(|_, _, cx: &mut gpui::App| cx.quit());
+        let preview = match self.snapshot.frame_layout() {
+            PreviewFrameLayout::FullBleed => preview,
+            PreviewFrameLayout::Inset { padding_px } => preview.p(px(f32::from(padding_px))),
+        }
+        .child(shell);
         if self.native_shell.is_none() {
             preview.child(
                 div()

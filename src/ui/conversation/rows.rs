@@ -8,7 +8,7 @@
 use crate::ui::renderers::{MessageRole, TimelineItemContent, TimelineItemId, TimelineItemModel};
 
 #[cfg(test)]
-use super::fixtures::{generic_item, message_item, tool_item};
+use super::fixtures::{generic_item, message_item, plan_item, tool_item};
 
 /// How much settled activity is derived at all. Distinct from
 /// `crate::ui::tokens::Density`, which is a visual metric scale.
@@ -22,6 +22,7 @@ pub enum ConversationVerbosity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActivityState {
     Active,
+    Pending,
     Success,
     Failure,
 }
@@ -110,6 +111,9 @@ fn activity_state_of(entries: &[ActivityEntry]) -> ActivityState {
     if entries.iter().any(|e| e.state == ActivityState::Active) {
         return ActivityState::Active;
     }
+    if entries.iter().any(|e| e.state == ActivityState::Pending) {
+        return ActivityState::Pending;
+    }
     ActivityState::Success
 }
 
@@ -156,7 +160,8 @@ fn activity_entry_of(item: &TimelineItemModel) -> Option<ActivityEntry> {
             detail: view.title.clone(),
             state: match view.status.as_str() {
                 "failed" => ActivityState::Failure,
-                "running" | "pending" => ActivityState::Active,
+                "running" | "in_progress" | "inProgress" => ActivityState::Active,
+                "pending" => ActivityState::Pending,
                 _ => ActivityState::Success,
             },
         }),
@@ -446,6 +451,27 @@ mod tests {
             rows.is_empty(),
             "unrecognised content must be structurally unrenderable, got {rows:?}"
         );
+    }
+
+    #[test]
+    fn plan_steps_keep_active_pending_statuses_and_titles_for_the_tasks_card() {
+        let rows = derive_conversation_rows(
+            &[
+                plan_item("step-1", "Measure the reference", "completed"),
+                plan_item("step-2", "Match the shell chrome", "in_progress"),
+                plan_item("step-3", "Verify the dock", "pending"),
+            ],
+            ConversationVerbosity::Calm,
+        );
+
+        let ConversationRow::Activity { entries, state, .. } = &rows[0] else {
+            panic!("plan steps must remain one activity projection");
+        };
+        assert_eq!(*state, ActivityState::Active);
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].detail, "Measure the reference");
+        assert_eq!(entries[1].state, ActivityState::Active);
+        assert_eq!(entries[2].state, ActivityState::Pending);
     }
 
     #[test]

@@ -28,6 +28,9 @@ const USER_BUBBLE_RADIUS: f32 = 16.0;
 const ICON_SLOT: f32 = 20.0;
 /// Target: the working indicator uses three 4 px dots.
 const WORKING_DOT: f32 = 4.0;
+/// Target: the floating Tasks card sits slightly inside the shared 768px
+/// conversation/composer measure.
+const PLAN_CARD_HORIZONTAL_INSET: f32 = 22.0;
 const META_REST_OPACITY: f32 = 0.0;
 const META_REVEALED_OPACITY: f32 = 1.0;
 
@@ -134,7 +137,7 @@ pub fn conversation_row_height(row: &ConversationRow, tokens: ThemeTokens) -> u3
             (32.0 + caption_line_height + text_lines(text) * line_height) as u32
         }
         ConversationRow::Activity { entries, .. } => {
-            (entries.len().max(1) as f32 * (ICON_SLOT + 4.0)) as u32
+            activity_row_height(entries, caption_line_height) as u32
         }
         ConversationRow::ActivityToggle { .. } => (ICON_SLOT + 4.0) as u32,
         ConversationRow::Question {
@@ -147,6 +150,29 @@ pub fn conversation_row_height(row: &ConversationRow, tokens: ThemeTokens) -> u3
         ConversationRow::Working { .. } => 20.0 as u32,
     }
     .clamp(16, 480)
+}
+
+/// Keep timeline virtualization aware of the surfaced Tasks card. The card
+/// groups plan steps behind one header and one set of padding, while ordinary
+/// tool activity stays on the compact 24px cadence used by
+/// `work_entry_element`.
+fn activity_row_height(entries: &[ActivityEntry], caption_line_height: f32) -> f32 {
+    let work_count = entries.iter().filter(|entry| entry.label != "Plan").count();
+    let plan_count = entries.len().saturating_sub(work_count);
+    let work_height = work_count as f32 * (ICON_SLOT + 4.0);
+    if plan_count == 0 {
+        return work_height.max(ICON_SLOT + 4.0);
+    }
+
+    let step_gaps = plan_count.saturating_sub(1) as f32 * 3.0;
+    let plan_card_height = 6.0
+        + 24.0
+        + caption_line_height
+        + 8.0
+        + plan_count as f32 * caption_line_height
+        + step_gaps;
+    let section_gap = if work_count > 0 { 2.0 } else { 0.0 };
+    work_height + section_gap + plan_card_height
 }
 
 /// Turn fold. The only hairline anywhere in the transcript.
@@ -377,6 +403,7 @@ fn entry_tone(state: ActivityState, tokens: ThemeTokens) -> (gpui::Rgba, &'stati
     match state {
         ActivityState::Success => (tokens.text.primary.to_gpui(), "-"),
         ActivityState::Active => (tokens.status.warning.to_gpui(), "!"),
+        ActivityState::Pending => (tokens.text.muted.to_gpui(), "o"),
         ActivityState::Failure => (tokens.status.destructive.to_gpui(), "x"),
     }
 }
@@ -427,10 +454,110 @@ fn activity_element(
     tokens: ThemeTokens,
 ) -> AnyElement {
     let mut column = div().w_full().flex().flex_col().gap(px(2.0));
-    for entry in entries {
+    let work_entries = entries.iter().filter(|entry| entry.label != "Plan");
+    let plan_entries = entries
+        .iter()
+        .filter(|entry| entry.label == "Plan")
+        .collect::<Vec<_>>();
+    for entry in work_entries {
         column = column.child(work_entry_element(entry, tokens));
     }
+    if !plan_entries.is_empty() {
+        column = column.child(plan_card_element(&plan_entries, tokens));
+    }
     column.into_any_element()
+}
+
+fn plan_progress(entries: &[&ActivityEntry]) -> (usize, usize) {
+    (
+        entries
+            .iter()
+            .filter(|entry| entry.state == ActivityState::Success)
+            .count(),
+        entries.len(),
+    )
+}
+
+fn plan_card_element(entries: &[&ActivityEntry], tokens: ThemeTokens) -> AnyElement {
+    let (completed, total) = plan_progress(entries);
+    let mut steps = div().w_full().flex().flex_col().gap(px(3.0));
+    for entry in entries {
+        let (symbol, color) = match entry.state {
+            ActivityState::Success => ("✓", tokens.status.success),
+            ActivityState::Active => ("•", tokens.actions.primary.default.background),
+            ActivityState::Pending => ("○", tokens.text.muted),
+            ActivityState::Failure => ("×", tokens.status.destructive),
+        };
+        steps = steps.child(
+            div()
+                .w_full()
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .text_size(px(tokens.density.typography.caption))
+                .line_height(px(tokens.density.typography.caption_line_height))
+                .child(
+                    div()
+                        .flex_none()
+                        .w(px(12.0))
+                        .text_center()
+                        .text_color(color.to_gpui())
+                        .child(symbol),
+                )
+                .child(
+                    div()
+                        .min_w(px(0.0))
+                        .text_color(
+                            if matches!(
+                                entry.state,
+                                ActivityState::Success | ActivityState::Pending
+                            ) {
+                                tokens.text.muted.to_gpui()
+                            } else {
+                                tokens.text.secondary.to_gpui()
+                            },
+                        )
+                        .child(entry.detail.clone()),
+                ),
+        );
+    }
+
+    div()
+        .w(px(
+            CONVERSATION_CONTENT_MAX_WIDTH - 2.0 * PLAN_CARD_HORIZONTAL_INSET
+        ))
+        .max_w_full()
+        .mx_auto()
+        .mt(px(6.0))
+        .px(px(14.0))
+        .py(px(12.0))
+        .rounded(px(tokens.density.radii.lg))
+        .bg(tokens.surfaces.raised.to_gpui())
+        .shadow_sm()
+        .flex()
+        .flex_col()
+        .gap(px(8.0))
+        .child(
+            div()
+                .w_full()
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .text_size(px(tokens.density.typography.caption))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(tokens.text.primary.to_gpui())
+                .child("☷")
+                .child("Tasks")
+                .child(
+                    div()
+                        .font(tabular_numeral_font())
+                        .font_weight(FontWeight::NORMAL)
+                        .text_color(tokens.text.muted.to_gpui())
+                        .child(format!("{completed}/{total}")),
+                ),
+        )
+        .child(steps)
+        .into_any_element()
 }
 
 /// Collapsed work group. Copy is count- and kind-aware, computed by
@@ -611,6 +738,7 @@ mod tests {
     #[test]
     fn the_readable_measure_matches_the_t3_reference() {
         assert_eq!(CONVERSATION_CONTENT_MAX_WIDTH, 768.0);
+        assert_eq!(PLAN_CARD_HORIZONTAL_INSET, 22.0);
     }
 
     #[test]
@@ -633,5 +761,51 @@ mod tests {
             .as_deref(),
             Some("1:05 pm")
         );
+    }
+
+    #[test]
+    fn tasks_card_progress_counts_only_completed_plan_steps() {
+        let completed = ActivityEntry {
+            identity: "plan:one".into(),
+            label: "Plan".into(),
+            detail: "One".into(),
+            state: ActivityState::Success,
+        };
+        let active = ActivityEntry {
+            identity: "plan:two".into(),
+            label: "Plan".into(),
+            detail: "Two".into(),
+            state: ActivityState::Active,
+        };
+        let failed = ActivityEntry {
+            identity: "plan:three".into(),
+            label: "Plan".into(),
+            detail: "Three".into(),
+            state: ActivityState::Failure,
+        };
+
+        assert_eq!(plan_progress(&[&completed, &active, &failed]), (1, 3));
+    }
+
+    #[test]
+    fn tasks_card_height_accounts_for_header_padding_and_every_step() {
+        let plan = |identity: &str| ActivityEntry {
+            identity: identity.into(),
+            label: "Plan".into(),
+            detail: identity.into(),
+            state: ActivityState::Active,
+        };
+        let tool = ActivityEntry {
+            identity: "tool".into(),
+            label: "Command".into(),
+            detail: "cargo fmt".into(),
+            state: ActivityState::Success,
+        };
+
+        let plan_only = activity_row_height(&[plan("one"), plan("two")], 16.0);
+        let mixed = activity_row_height(&[tool, plan("one"), plan("two")], 16.0);
+
+        assert_eq!(plan_only, 89.0);
+        assert_eq!(mixed, 115.0);
     }
 }

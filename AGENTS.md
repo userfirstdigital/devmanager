@@ -153,6 +153,11 @@
   canonical shell at representative reference geometry and compare its primary
   composition, spacing, hierarchy, and palette against the reference. A small
   crop proves only that the native host can paint; it is not visual acceptance.
+  On mixed-DPI Windows desktops, an oversized WGC window may return black below
+  the shortest compositor span even when its dimensions validate. Request the
+  canonical physical size at the desktop scale, stage the oversized position,
+  flush DWM, then issue a real move-only transition farther off-screen and flush
+  again before capture; inspect the bottom pixels, not only the PNG dimensions.
 
 ## Lean phase execution
 

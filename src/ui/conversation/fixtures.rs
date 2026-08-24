@@ -8,8 +8,8 @@ use crate::domain::id::{EventId, TaskId};
 use crate::ui::components::interaction::{AccessibilityMetadata, AccessibleRole};
 use crate::ui::renderers::{
     GenericSemanticCard, GenericStatus, InteractionEligibility, MarkdownBlock, MarkdownDocument,
-    MessageRole, MessageView, ProviderKind, RendererSelection, SemanticKind, TimelineItemContent,
-    TimelineItemId, TimelineItemModel, ToolView,
+    MessageRole, MessageView, PlanView, ProviderKind, RendererSelection, SemanticKind,
+    TimelineItemContent, TimelineItemId, TimelineItemModel, ToolView,
 };
 
 fn role_label(role_kind: MessageRole) -> &'static str {
@@ -67,6 +67,25 @@ pub(crate) fn tool_item(tool_id: &str, name: &str, state: &str) -> TimelineItemM
         }),
         activated_on_enter: false,
         accessibility: AccessibilityMetadata::new(AccessibleRole::Status, name)
+            .expect("accessible name"),
+        turn_id: None,
+        related_event_id: None,
+    }
+}
+
+pub(crate) fn plan_item(step_id: &str, title: &str, status: &str) -> TimelineItemModel {
+    TimelineItemModel {
+        id: TimelineItemId::Event(EventId::new()),
+        task_id: TaskId::new(),
+        renderer_selection: RendererSelection::Specialized(SemanticKind::Plan),
+        interaction: InteractionEligibility::None,
+        content: TimelineItemContent::Plan(PlanView {
+            title: title.to_string(),
+            steps: vec![step_id.to_string()],
+            status: status.to_string(),
+        }),
+        activated_on_enter: false,
+        accessibility: AccessibilityMetadata::new(AccessibleRole::Status, title)
             .expect("accessible name"),
         turn_id: None,
         related_event_id: None,

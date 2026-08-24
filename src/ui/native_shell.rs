@@ -188,14 +188,16 @@ const HOST_BOOTSTRAP_REATTACH_TICKS: usize = 60;
 const IDLE_PHOTO_FETCH_TIMEOUT: Duration = Duration::from_secs(8);
 #[cfg_attr(test, allow(dead_code))]
 const IDLE_PHOTO_MAX_BYTES: u64 = 8 * 1024 * 1024;
-const CONVERSATION_COMPOSER_HEIGHT_RESERVE: f32 = 190.0;
+const CONVERSATION_COMPOSER_HEIGHT_RESERVE: f32 = 230.0;
 const CONVERSATION_COMPOSER_OUTER_RADIUS: f32 = 22.0;
 const CONVERSATION_COMPOSER_INNER_RADIUS: f32 = 20.0;
 const CONVERSATION_COMPOSER_CONTEXT_INSET: f32 = 22.0;
 const CONVERSATION_COMPOSER_SEND_DIAMETER: f32 = 32.0;
+const CONVERSATION_COMPOSER_INPUT_MIN_HEIGHT: f32 = 102.0;
 const T3_SIDEBAR_WIDTH: f32 = 256.0;
 const T3_SIDEBAR_ROW_HEIGHT: f32 = 78.0;
-const T3_WORKSPACE_TOPBAR_HEIGHT: f32 = 44.0;
+const T3_WORKSPACE_TOPBAR_HEIGHT: f32 = 32.0;
+const T3_SIDEBAR_NAV_TOP_INSET: f32 = 12.0;
 const CONVERSATION_COMPOSER_PLACEHOLDER: &str =
     "Ask anything, @tag files/folders, $use skills, or / for commands";
 const COMPOSER_DRAFT_PERSIST_INTERVAL: Duration = Duration::from_millis(250);
@@ -10617,7 +10619,7 @@ impl NativeShell {
                                             .id("native-task-composer-input")
                                             .relative()
                                             .w_full()
-                                            .min_h(px(72.0))
+                                            .min_h(px(CONVERSATION_COMPOSER_INPUT_MIN_HEIGHT))
                                             .max_h(px(200.0))
                                             .overflow_y_scroll()
                                             .track_focus(&self.composer_focus_handle)
@@ -11891,7 +11893,7 @@ impl NativeShell {
 
     #[cfg(test)]
     fn conversation_tools_affordance_visible_for_test(&self) -> bool {
-        self.layout.dock_collapsed
+        true
     }
 
     #[cfg(test)]
@@ -12565,7 +12567,7 @@ impl NativeShell {
                 .child("Delete")
                 .into_any_element()
         });
-        let tools = self.layout.dock_collapsed.then(|| {
+        let add_action = {
             div()
                 .id("native-shell-tools-affordance")
                 .tab_stop(true)
@@ -12581,25 +12583,24 @@ impl NativeShell {
                 .hover(|style| style.bg(tokens.surfaces.overlay.to_gpui()))
                 .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
                     cx.stop_propagation();
-                    shell.toggle_pane(PaneEdge::Dock);
+                    shell.dispatch_keyboard(KeyboardShortcut::ctrl(
+                        crate::ui::actions::ShortcutKey::Character('k'),
+                    ));
                     cx.notify();
                 }))
-                .child("Tools")
+                .child("+ Add action")
                 .into_any_element()
-        });
-        match (tools, delete) {
-            (None, None) => None,
-            (tools, delete) => Some(
-                div()
-                    .id("native-conversation-panel-actions")
-                    .flex()
-                    .items_center()
-                    .gap(px(self.preferences.tokens().density.spacing.xs))
-                    .children(tools)
-                    .children(delete)
-                    .into_any_element(),
-            ),
-        }
+        };
+        Some(
+            div()
+                .id("native-conversation-panel-actions")
+                .flex()
+                .items_center()
+                .gap(px(self.preferences.tokens().density.spacing.xs))
+                .child(add_action)
+                .children(delete)
+                .into_any_element(),
+        )
     }
 
     /// Low-chrome conversation canvas: the transcript is the primary surface,
@@ -15349,10 +15350,10 @@ impl NativeShell {
             .w_full()
             .flex()
             .flex_none()
-            .flex_wrap()
             .items_center()
-            .gap(px(tokens.density.spacing.xxs))
-            .p(px(tokens.density.spacing.sm))
+            .gap(px(2.0))
+            .p(px(6.0))
+            .overflow_hidden()
             .border_b(px(1.0))
             .border_color(tokens.borders.subtle.to_gpui());
         for (tool, element_id, digit) in NATIVE_DOCK_TABS {
@@ -15360,9 +15361,10 @@ impl NativeShell {
             let tab = div()
                 .id(element_id)
                 .flex()
+                .flex_none()
                 .items_center()
                 .h(px(24.0))
-                .px(px(tokens.density.spacing.sm))
+                .px(px(4.0))
                 .rounded(px(tokens.density.radii.sm))
                 .text_size(px(tokens.density.typography.caption))
                 .line_height(px(tokens.density.typography.caption_line_height))
@@ -15434,6 +15436,7 @@ impl NativeShell {
             .flex_none()
             .gap(px(3.0))
             .px(px(8.0))
+            .pt(px(T3_SIDEBAR_NAV_TOP_INSET))
             .pb(px(8.0))
             .child(
                 div()
@@ -16713,13 +16716,14 @@ mod tests {
         NativeShutdownDeadline, OverlayTextFieldPart, OwnedChild, OwnedWorker, PaletteItem,
         PendingHostBootstrap, ProjectId, ProjectInboxItem, ProviderKind, ReaperKind, ShellStage,
         TaskComposer, TaskId, UpdateState, UpdaterStage, CONVERSATION_COMPOSER_CONTEXT_INSET,
-        CONVERSATION_COMPOSER_INNER_RADIUS, CONVERSATION_COMPOSER_OUTER_RADIUS,
+        CONVERSATION_COMPOSER_HEIGHT_RESERVE, CONVERSATION_COMPOSER_INNER_RADIUS,
+        CONVERSATION_COMPOSER_INPUT_MIN_HEIGHT, CONVERSATION_COMPOSER_OUTER_RADIUS,
         CONVERSATION_COMPOSER_PLACEHOLDER, CONVERSATION_COMPOSER_SEND_DIAMETER,
         CONVERSATION_CONTENT_MAX_WIDTH, HOST_BOOTSTRAP_REATTACH_TICKS, MAX_ACCESSIBILITY_ACTIONS,
         MAX_ACTION_LANE_RECORDS, MAX_ACTION_OUTCOME_PROJECTIONS, MAX_HOST_PROJECTIONS,
         MAX_PENDING_HOST_ACTIONS, MAX_PENDING_PREFERENCES, MAX_RETAINED_CHILDREN,
         MAX_RETAINED_WORKERS, MAX_RETRY_HOST_ACTIONS, NATIVE_SNAPSHOT_PAGE_ITEMS,
-        PRODUCTION_HOST_PROFILE, T3_SIDEBAR_ROW_HEIGHT, T3_SIDEBAR_WIDTH,
+        PRODUCTION_HOST_PROFILE, T3_SIDEBAR_NAV_TOP_INSET, T3_SIDEBAR_ROW_HEIGHT, T3_SIDEBAR_WIDTH,
         T3_WORKSPACE_TOPBAR_HEIGHT,
     };
     use crate::protocol::FrameLimits;
@@ -16741,6 +16745,8 @@ mod tests {
         assert_eq!(CONVERSATION_COMPOSER_INNER_RADIUS, 20.0);
         assert_eq!(CONVERSATION_COMPOSER_CONTEXT_INSET, 22.0);
         assert_eq!(CONVERSATION_COMPOSER_SEND_DIAMETER, 32.0);
+        assert_eq!(CONVERSATION_COMPOSER_INPUT_MIN_HEIGHT, 102.0);
+        assert_eq!(CONVERSATION_COMPOSER_HEIGHT_RESERVE, 230.0);
         assert_eq!(
             CONVERSATION_COMPOSER_PLACEHOLDER,
             "Ask anything, @tag files/folders, $use skills, or / for commands"
@@ -16751,7 +16757,8 @@ mod tests {
     fn target_shell_geometry_matches_the_t3_reference_composition() {
         assert_eq!(T3_SIDEBAR_WIDTH, 256.0);
         assert_eq!(T3_SIDEBAR_ROW_HEIGHT, 78.0);
-        assert_eq!(T3_WORKSPACE_TOPBAR_HEIGHT, 44.0);
+        assert_eq!(T3_WORKSPACE_TOPBAR_HEIGHT, 32.0);
+        assert_eq!(T3_SIDEBAR_NAV_TOP_INSET, 12.0);
         assert_eq!(CONVERSATION_CONTENT_MAX_WIDTH, 768.0);
     }
 
@@ -17940,11 +17947,14 @@ mod tests {
                 assert!(shell.layout.dock_collapsed);
                 assert!(
                     shell.conversation_tools_affordance_visible_for_test(),
-                    "collapsed dock must keep a Tools affordance"
+                    "collapsed dock must keep an Add action affordance"
                 );
                 shell.toggle_pane(PaneEdge::Dock);
                 assert!(!shell.layout.dock_collapsed);
-                assert!(!shell.conversation_tools_affordance_visible_for_test());
+                assert!(
+                    shell.conversation_tools_affordance_visible_for_test(),
+                    "Add action is independent from the right-panel visibility"
+                );
             });
             cx.quit();
         });

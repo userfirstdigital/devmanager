@@ -20,8 +20,8 @@ use devmanager::domain::task::{
 use devmanager::providers::ProviderKind;
 use devmanager::ui::components::AccessibleRole;
 use devmanager::ui::preview::{
-    parse_preview_args, PreviewApplication, PreviewDismiss, PreviewError, PreviewOutputCapability,
-    PreviewPathPolicy, PreviewRequest, PREVIEW_SCHEMA,
+    parse_preview_args, PreviewApplication, PreviewDismiss, PreviewError, PreviewFrameLayout,
+    PreviewOutputCapability, PreviewPathPolicy, PreviewRequest, PREVIEW_SCHEMA,
 };
 use devmanager::ui::preview_capture::{PREVIEW_WINDOW_HEIGHT, PREVIEW_WINDOW_WIDTH};
 use devmanager::ui::task_cockpit::{
@@ -312,7 +312,29 @@ fn visible_task_cockpit_capture_installs_the_native_shell_and_settles_asynchrono
 #[test]
 fn canonical_preview_is_large_enough_to_judge_full_shell_visual_parity() {
     assert_eq!(PREVIEW_WINDOW_WIDTH, 1912);
-    assert_eq!(PREVIEW_WINDOW_HEIGHT, 1200);
+    assert_eq!(PREVIEW_WINDOW_HEIGHT, 2092);
+}
+
+#[test]
+fn canonical_shell_is_full_bleed_while_component_previews_keep_their_gallery_frame() {
+    let policy = repository_policy();
+    let task_request = PreviewRequest::validate(
+        task_cockpit_fixture(),
+        repository_output("task-cockpit-frame-layout.png"),
+        &policy,
+    )
+    .expect("checked-in task cockpit fixture should be accepted");
+    let task_preview =
+        PreviewApplication::load(task_request, &policy).expect("task cockpit fixture should load");
+    assert_eq!(task_preview.frame_layout(), PreviewFrameLayout::FullBleed);
+
+    let (_root, minimal_policy) = temporary_policy();
+    let minimal_preview = PreviewApplication::load(valid_request(&minimal_policy), &minimal_policy)
+        .expect("minimal fixture should load");
+    assert_eq!(
+        minimal_preview.frame_layout(),
+        PreviewFrameLayout::Inset { padding_px: 16 }
+    );
 }
 
 #[test]

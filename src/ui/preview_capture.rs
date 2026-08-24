@@ -25,7 +25,51 @@ use crate::ui::preview::{PreviewRequest, PreviewRoot};
 /// and PNG settlement.
 pub const FIRST_FRAME_DEADLINE: Duration = Duration::from_secs(5);
 pub const PREVIEW_WINDOW_WIDTH: i32 = 1912;
-pub const PREVIEW_WINDOW_HEIGHT: i32 = 1200;
+pub const PREVIEW_WINDOW_HEIGHT: i32 = 2092;
+/// WGC returns black for the part of an oversized window that extends below
+/// the shortest display's compositor span in a mixed-monitor desktop, while
+/// the same compositor keeps the off-screen top paint available. Cap the safe
+/// visible span and keep a measured bottom inset so the complete native frame
+/// remains capturable even when GPUI initially centers it on a taller display.
+const WGC_SAFE_VISIBLE_HEIGHT_CAP: i32 = 1_680;
+const OVERSIZED_PREVIEW_BOTTOM_INSET: i32 = 240;
+const WGC_COMPOSITOR_PRIME_OFFSET: i32 = 160;
+
+fn preview_logical_window_size(scale_factor: f32) -> (f32, f32) {
+    let scale_factor = if scale_factor.is_finite() && scale_factor > 0.0 {
+        scale_factor
+    } else {
+        1.0
+    };
+    (
+        PREVIEW_WINDOW_WIDTH as f32 / scale_factor,
+        PREVIEW_WINDOW_HEIGHT as f32 / scale_factor,
+    )
+}
+
+fn preview_window_origin(
+    work_area: (i32, i32, i32, i32),
+    outer_width: i32,
+    outer_height: i32,
+) -> (i32, i32) {
+    let (left, top, right, bottom) = work_area;
+    let work_width = right.saturating_sub(left);
+    let work_height = bottom.saturating_sub(top);
+    let x = if outer_width > work_width {
+        right.saturating_sub(outer_width)
+    } else {
+        left
+    };
+    let safe_visible_height = work_height.min(WGC_SAFE_VISIBLE_HEIGHT_CAP);
+    let y = if outer_height > safe_visible_height {
+        top.saturating_add(safe_visible_height)
+            .saturating_sub(OVERSIZED_PREVIEW_BOTTOM_INSET)
+            .saturating_sub(outer_height)
+    } else {
+        top
+    };
+    (x, y)
+}
 
 /// Maximum byte length of any capture diagnostic rendered for the UI.
 pub const MAX_CLEANUP_DIAGNOSTIC_BYTES: usize = 4096;
@@ -3691,12 +3735,16 @@ mod windows_capture_impl {
     use std::sync::mpsc::{self, SyncSender};
     use std::sync::Arc;
     use windows::Win32::Foundation::{HWND, RECT};
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    };
     use windows::Win32::System::Threading::GetCurrentProcessId;
+    use windows::Win32::UI::HiDpi::GetDpiForSystem;
     use windows::Win32::UI::WindowsAndMessaging::{
         GetClientRect, GetForegroundWindow, GetWindowLongPtrW, GetWindowRect,
         GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, SetWindowLongPtrW,
-        SetWindowPos, ShowWindow, GWL_EXSTYLE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
-        SWP_NOSIZE, SWP_NOZORDER, SW_SHOWNOACTIVATE, WS_EX_NOACTIVATE,
+        SetWindowPos, ShowWindow, GWL_EXSTYLE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOSIZE,
+        SWP_NOZORDER, SW_SHOWNOACTIVATE, WS_EX_NOACTIVATE,
     };
     use windows_capture::capture::{CaptureControl, Context, GraphicsCaptureApiHandler};
     use windows_capture::frame::Frame;
@@ -3714,6 +3762,7 @@ mod windows_capture_impl {
             value: *mut c_void,
             value_size: u32,
         ) -> i32;
+        fn DwmFlush() -> i32;
     }
 
     fn extended_frame_size(hwnd: HWND) -> Option<(i32, i32)> {
@@ -4210,30 +4259,69 @@ mod windows_capture_impl {
             .saturating_add(PREVIEW_WINDOW_WIDTH.saturating_sub(current_capture_width));
         let outer_height = current_outer_height
             .saturating_add(PREVIEW_WINDOW_HEIGHT.saturating_sub(current_capture_height));
+        let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+        if monitor.is_invalid() {
+            return Err(PreviewCaptureError::InvalidWindowState {
+                reason: "preview display is unavailable",
+            });
+        }
+        let mut monitor_info = MONITORINFO {
+            cbSize: u32::try_from(std::mem::size_of::<MONITORINFO>()).unwrap_or(0),
+            ..MONITORINFO::default()
+        };
+        if !unsafe { GetMonitorInfoW(monitor, &mut monitor_info) }.as_bool() {
+            return Err(PreviewCaptureError::ApplicationFailed(
+                "Windows did not provide preview work-area bounds".into(),
+            ));
+        }
+        let (origin_x, origin_y) = preview_window_origin(
+            (
+                monitor_info.rcWork.left,
+                monitor_info.rcWork.top,
+                monitor_info.rcWork.right,
+                monitor_info.rcWork.bottom,
+            ),
+            outer_width,
+            outer_height,
+        );
         unsafe {
             SetWindowPos(
                 hwnd,
                 None,
-                0,
-                0,
+                origin_x,
+                origin_y,
                 outer_width,
                 outer_height,
                 SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_NOZORDER,
             )
         }
         .map_err(|error| PreviewCaptureError::ApplicationFailed(error.to_string()))?;
+        if unsafe { DwmFlush() } != 0 {
+            return Err(PreviewCaptureError::ApplicationFailed(
+                "DWM did not settle the canonical preview bounds".into(),
+            ));
+        }
         unsafe {
+            // Commit the sized frame first, then perform a real move-only
+            // transition farther off-screen. DWM otherwise coalesces the
+            // placement with SWP_FRAMECHANGED and leaves the oversized lower
+            // region black under mixed DPI.
             SetWindowPos(
                 hwnd,
                 None,
+                origin_x,
+                origin_y.saturating_sub(WGC_COMPOSITOR_PRIME_OFFSET),
                 0,
                 0,
-                0,
-                0,
-                SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER,
+                SWP_NOACTIVATE | SWP_NOSIZE | SWP_NOZORDER,
             )
         }
         .map_err(|error| PreviewCaptureError::ApplicationFailed(error.to_string()))?;
+        if unsafe { DwmFlush() } != 0 {
+            return Err(PreviewCaptureError::ApplicationFailed(
+                "DWM did not settle the off-screen preview surface".into(),
+            ));
+        }
         wait_for_capture_bounds(hwnd, deadline)?;
 
         let after = foreground_hwnd();
@@ -4431,6 +4519,8 @@ mod windows_capture_impl {
         let application = gpui::Application::new().with_assets(crate::assets::AppAssets::new());
         application.run(move |cx| {
             crate::ui::preview::register_preview_environment(cx);
+            let system_scale = unsafe { GetDpiForSystem() } as f32 / 96.0;
+            let (logical_width, logical_height) = preview_logical_window_size(system_scale);
             let root = match root.instantiate_native_shell_for_capture(cx, deadline.deadline) {
                 Ok(root) => root,
                 Err(error) => {
@@ -4472,10 +4562,7 @@ mod windows_capture_impl {
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
                         None,
-                        size(
-                            px(PREVIEW_WINDOW_WIDTH as f32),
-                            px(PREVIEW_WINDOW_HEIGHT as f32),
-                        ),
+                        size(px(logical_width), px(logical_height)),
                         cx,
                     ))),
                     titlebar: None,
@@ -4556,6 +4643,12 @@ mod windows_capture_impl {
                         .await;
                     capture_lease.check(deadline)?;
                 }
+                // GPUI applies its requested window bounds asynchronously after
+                // the native HWND is created.  Reassert the canonical physical
+                // size and oversized-window origin after the shell has settled;
+                // otherwise that late bounds update can move the window back to
+                // the work-area origin and WGC returns black below the display.
+                configure_native_window(hwnd, foreground_before, deadline, &capture_lease)?;
                 capture_window_once(
                     hwnd,
                     capture_authority,
@@ -4633,6 +4726,30 @@ pub fn validate_native_window(_hwnd: NativeHwnd) -> Result<ValidatedWindow, Prev
 mod tests {
     use super::*;
     use std::sync::mpsc;
+
+    #[test]
+    fn canonical_physical_frame_is_requested_at_the_desktop_scale() {
+        assert_eq!(preview_logical_window_size(1.0), (1912.0, 2092.0));
+        assert_eq!(preview_logical_window_size(1.25), (1529.6, 1673.6));
+        assert_eq!(preview_logical_window_size(0.0), (1912.0, 2092.0));
+    }
+
+    #[test]
+    fn oversized_reference_frame_is_bottom_inset_for_complete_wgc_paint() {
+        assert_eq!(
+            preview_window_origin((0, 0, 6144, 1680), 1912, 2092),
+            (0, -652)
+        );
+        assert_eq!(
+            preview_window_origin((0, 0, 3840, 2100), 1912, 2092),
+            (0, -652),
+            "a taller host monitor must retain the mixed-monitor WGC safety cap"
+        );
+        assert_eq!(
+            preview_window_origin((100, 50, 2100, 2200), 1912, 1200),
+            (100, 50)
+        );
+    }
 
     #[test]
     fn bounded_enqueue_cleanup_returns_at_the_deadline_and_reaps_late_worker() {
