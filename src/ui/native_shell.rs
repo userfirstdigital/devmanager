@@ -151,8 +151,10 @@ use crate::ui::project_actions::{
 use crate::ui::project_scope::{ProjectScope, ProjectScopeMenuState};
 use crate::ui::task_search::{TaskSearchCandidate, TaskSearchState};
 use crate::ui::task_workspace::{
-    apply_workspace_selection as apply_task_workspace_selection, TaskSurfaceRegistry,
-    TaskWorkspace, WorkspaceError, WorkspaceSelectionGesture,
+    apply_workspace_selection as apply_task_workspace_selection, Allocation, AllocationMetrics,
+    Axis, TaskPaneBody, TaskPaneProjection, TaskPaneViewModel, TaskSurfaceRegistry, TaskWorkspace,
+    TaskWorkspaceViewChild, TaskWorkspaceViewModel, TaskWorkspaceViewNode, Viewport,
+    WorkspaceError, WorkspaceSelectionGesture,
 };
 use crate::ui::terminal_adapter::TerminalDockAdapter;
 pub use crate::ui::terminal_adapter::{TerminalDockState, TERMINAL_ADAPTER_DEPENDENCY};
@@ -3250,6 +3252,11 @@ impl Default for NativeHeaderAttachment {
 fn bounded_header_text(value: String) -> String {
     const MAX_HEADER_TEXT_SCALARS: usize = 256;
     value.chars().take(MAX_HEADER_TEXT_SCALARS).collect()
+}
+
+fn bounded_workspace_snippet(value: &str) -> String {
+    const MAX_WORKSPACE_SNIPPET_SCALARS: usize = 512;
+    value.chars().take(MAX_WORKSPACE_SNIPPET_SCALARS).collect()
 }
 
 impl NativeHostProjection {
@@ -12993,6 +13000,391 @@ impl NativeShell {
         }
     }
 
+    fn task_workspace_view_model(&self) -> Option<TaskWorkspaceViewModel> {
+        let workspace = self.layout.task_workspace.as_ref()?;
+        let projections = workspace
+            .task_ids()
+            .into_iter()
+            .map(|task_id| {
+                let project_name = self
+                    .inbox
+                    .row(task_id)
+                    .map(|row| self.project_label_for_id(row.project_id))
+                    .unwrap_or_else(|| "Unknown project".to_string());
+                let provider_label = self
+                    .task_provider_kind(task_id)
+                    .map(|provider| match provider {
+                        ProviderKind::ClaudeCode => "Claude",
+                        ProviderKind::Codex => "Codex",
+                        ProviderKind::Cursor => "Cursor",
+                    })
+                    .unwrap_or("Agent")
+                    .to_string();
+                let status_label = self
+                    .task_row_status(task_id)
+                    .map(visible_status_label)
+                    .unwrap_or("Unprojected")
+                    .to_string();
+                let show_terminal = self
+                    .layout
+                    .task_center_terminal
+                    .get(&task_id.to_string())
+                    .copied()
+                    .unwrap_or(false);
+                (
+                    task_id,
+                    TaskPaneProjection {
+                        task_id,
+                        title: self.task_row_title(task_id),
+                        project_name,
+                        provider_label,
+                        status_label,
+                        latest_snippet: self
+                            .task_surfaces
+                            .latest_snippet(task_id)
+                            .map(str::to_string),
+                        show_terminal,
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        TaskWorkspaceViewModel::build(workspace, &projections).ok()
+    }
+
+    fn task_workspace_surface(
+        &mut self,
+        tokens: crate::ui::tokens::ThemeTokens,
+        workspace_size: Size<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let pane_count = self
+            .layout
+            .task_workspace
+            .as_ref()
+            .map(TaskWorkspace::pane_count)
+            .unwrap_or(0);
+        if pane_count <= 1 {
+            return self.task_conversation_surface(tokens, workspace_size, cx);
+        }
+
+        let (allocated, presentation_changed) = {
+            let workspace = self
+                .layout
+                .task_workspace
+                .as_mut()
+                .expect("multi-pane workspace has a tree");
+            let before = workspace.clone();
+            let allocated = workspace.allocate(
+                Viewport::new(
+                    f32::from(workspace_size.width),
+                    f32::from(workspace_size.height),
+                ),
+                AllocationMetrics {
+                    full_min_width: 360.0,
+                    full_min_height: 300.0,
+                    compact_min_width: 210.0,
+                    compact_min_height: 116.0,
+                    divider: 4.0,
+                },
+            );
+            (allocated, *workspace != before)
+        };
+        if presentation_changed {
+            self.mark_layout_dirty();
+        }
+        let Some(model) = self.task_workspace_view_model() else {
+            return self.task_conversation_surface(tokens, workspace_size, cx);
+        };
+        let Some(root) = model.root.as_ref() else {
+            return self.task_conversation_surface(tokens, workspace_size, cx);
+        };
+        self.render_task_workspace_node(root, &allocated, tokens, workspace_size, cx)
+    }
+
+    fn render_task_workspace_node(
+        &mut self,
+        node: &TaskWorkspaceViewNode,
+        allocated: &crate::ui::task_workspace::AllocatedWorkspace,
+        tokens: crate::ui::tokens::ThemeTokens,
+        workspace_size: Size<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        match node {
+            TaskWorkspaceViewNode::Pane(pane) => {
+                let pane_size = allocated
+                    .rect(pane.task_id)
+                    .map(|rect| size(px(rect.width), px(rect.height)))
+                    .unwrap_or(workspace_size);
+                self.render_task_workspace_pane(pane, tokens, pane_size, cx)
+            }
+            TaskWorkspaceViewNode::Split { axis, children } => {
+                let mut rendered = Vec::with_capacity(children.len());
+                for child in children {
+                    let content = self.render_task_workspace_node(
+                        &child.node,
+                        allocated,
+                        tokens,
+                        workspace_size,
+                        cx,
+                    );
+                    rendered.push(Self::task_workspace_child(*axis, child, content));
+                }
+                let split = div()
+                    .w_full()
+                    .h_full()
+                    .min_w(px(0.0))
+                    .min_h(px(0.0))
+                    .flex()
+                    .gap(px(4.0));
+                match axis {
+                    Axis::Horizontal => split.flex_row().children(rendered).into_any_element(),
+                    Axis::Vertical => split.flex_col().children(rendered).into_any_element(),
+                }
+            }
+        }
+    }
+
+    fn task_workspace_child(
+        axis: Axis,
+        child: &TaskWorkspaceViewChild,
+        content: AnyElement,
+    ) -> AnyElement {
+        let wrapper = div()
+            .min_w(px(0.0))
+            .min_h(px(0.0))
+            .overflow_hidden()
+            .child(content);
+        match (axis, child.allocation) {
+            (Axis::Horizontal, Allocation::Pinned { logical_px }) => wrapper
+                .flex_none()
+                .w(px(logical_px))
+                .h_full()
+                .into_any_element(),
+            (Axis::Vertical, Allocation::Pinned { logical_px }) => wrapper
+                .flex_none()
+                .h(px(logical_px))
+                .w_full()
+                .into_any_element(),
+            (Axis::Horizontal, Allocation::Auto { .. }) => wrapper
+                .flex_1()
+                .flex_basis(px(0.0))
+                .h_full()
+                .into_any_element(),
+            (Axis::Vertical, Allocation::Auto { .. }) => wrapper
+                .flex_1()
+                .flex_basis(px(0.0))
+                .w_full()
+                .into_any_element(),
+        }
+    }
+
+    fn render_task_workspace_pane(
+        &mut self,
+        pane: &TaskPaneViewModel,
+        tokens: crate::ui::tokens::ThemeTokens,
+        pane_size: Size<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let task_id = pane.task_id;
+        let focus = cx.listener(move |shell, _event: &MouseDownEvent, _window, cx| {
+            cx.stop_propagation();
+            let _ = shell.apply_workspace_selection(task_id, WorkspaceSelectionGesture::Plain);
+            cx.notify();
+        });
+        let compact = pane.body == TaskPaneBody::Compact;
+        let toggle = cx.listener(move |shell, _event: &ClickEvent, _window, cx| {
+            cx.stop_propagation();
+            shell.set_workspace_task_compact(task_id, !compact);
+            cx.notify();
+        });
+        let close = cx.listener(move |shell, _event: &ClickEvent, _window, cx| {
+            cx.stop_propagation();
+            let _ = shell.apply_workspace_selection(task_id, WorkspaceSelectionGesture::Toggle);
+            cx.notify();
+        });
+        let focus_border = if pane.focused {
+            tokens.borders.focus
+        } else {
+            tokens.borders.subtle
+        };
+        let task_element_key = u64::from_be_bytes(
+            task_id.as_bytes()[8..]
+                .try_into()
+                .expect("task identity tail is exactly eight bytes"),
+        );
+        let header = div()
+            .id(("native-task-pane-header", task_element_key))
+            .w_full()
+            .h(px(42.0))
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .px(px(10.0))
+            .border_b(px(1.0))
+            .border_color(tokens.borders.subtle.to_gpui())
+            .bg(tokens.surfaces.raised.to_gpui())
+            .on_mouse_down(MouseButton::Left, focus)
+            .child(
+                div()
+                    .min_w(px(0.0))
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .truncate()
+                            .text_size(px(tokens.density.typography.body))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(tokens.text.primary.to_gpui())
+                            .child(pane.title.clone()),
+                    )
+                    .child(
+                        div()
+                            .truncate()
+                            .text_size(px(tokens.density.typography.caption))
+                            .text_color(tokens.text.muted.to_gpui())
+                            .child(format!(
+                                "{} · {} · {}",
+                                pane.project_name, pane.provider_label, pane.status_label
+                            )),
+                    ),
+            )
+            .child(
+                div()
+                    .id(("native-task-pane-compact", task_element_key))
+                    .tab_stop(true)
+                    .px(px(7.0))
+                    .py(px(4.0))
+                    .rounded(px(5.0))
+                    .cursor_pointer()
+                    .text_size(px(tokens.density.typography.caption))
+                    .text_color(tokens.text.secondary.to_gpui())
+                    .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
+                    .on_click(toggle)
+                    .child(if compact { "Full" } else { "Compact" }),
+            )
+            .child(
+                div()
+                    .id(("native-task-pane-close", task_element_key))
+                    .tab_stop(true)
+                    .size(px(24.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(5.0))
+                    .cursor_pointer()
+                    .text_color(tokens.text.muted.to_gpui())
+                    .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
+                    .on_click(close)
+                    .child("×"),
+            );
+
+        let body = if pane.body == TaskPaneBody::Compact {
+            div()
+                .w_full()
+                .flex_1()
+                .min_h(px(0.0))
+                .flex()
+                .items_center()
+                .p(px(12.0))
+                .bg(tokens.surfaces.sunken.to_gpui())
+                .child(
+                    div()
+                        .w_full()
+                        .text_size(px(tokens.density.typography.body))
+                        .line_height(px(tokens.density.typography.body_line_height))
+                        .text_color(tokens.text.secondary.to_gpui())
+                        .child(
+                            pane.latest_snippet
+                                .as_deref()
+                                .map(bounded_workspace_snippet)
+                                .unwrap_or_else(|| "Waiting for activity…".to_string()),
+                        ),
+                )
+                .into_any_element()
+        } else if pane.build_composer {
+            self.task_conversation_surface(tokens, pane_size, cx)
+        } else {
+            let lines = if pane.paint_terminal {
+                self.task_surfaces.terminal_tail(task_id, 24)
+            } else {
+                self.task_surfaces.conversation_tail(task_id, 12)
+            };
+            let has_lines = !lines.is_empty();
+            let empty = if pane.paint_terminal {
+                "Terminal is live; waiting for output."
+            } else {
+                "Conversation is live; waiting for messages."
+            };
+            div()
+                .w_full()
+                .flex_1()
+                .min_h(px(0.0))
+                .overflow_y_scrollbar()
+                .flex()
+                .flex_col()
+                .gap(px(10.0))
+                .p(px(14.0))
+                .bg(tokens.surfaces.canvas.to_gpui())
+                .children(lines.into_iter().enumerate().map(|(index, line)| {
+                    div()
+                        .id((
+                            "native-task-pane-line",
+                            task_element_key.rotate_left(17) ^ index as u64,
+                        ))
+                        .w_full()
+                        .text_size(px(tokens.density.typography.body))
+                        .line_height(px(tokens.density.typography.body_line_height))
+                        .text_color(tokens.text.secondary.to_gpui())
+                        .child(bounded_workspace_snippet(&line))
+                }))
+                .children((!has_lines).then(|| {
+                    div()
+                        .text_color(tokens.text.muted.to_gpui())
+                        .child(empty)
+                        .into_any_element()
+                }))
+                .into_any_element()
+        };
+
+        div()
+            .id(("native-task-pane", task_element_key))
+            .w_full()
+            .h_full()
+            .min_w(px(0.0))
+            .min_h(px(0.0))
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .border(px(if pane.focused { 2.0 } else { 1.0 }))
+            .border_color(focus_border.to_gpui())
+            .rounded(px(tokens.density.radii.md))
+            .bg(tokens.surfaces.canvas.to_gpui())
+            .child(header)
+            .child(body)
+            .into_any_element()
+    }
+
+    fn set_workspace_task_compact(&mut self, task_id: TaskId, compact: bool) {
+        let changed = self
+            .layout
+            .task_workspace
+            .as_mut()
+            .is_some_and(|workspace| {
+                workspace.presentation(task_id)
+                    != Some(if compact {
+                        crate::ui::task_workspace::PanePresentation::CompactManual
+                    } else {
+                        crate::ui::task_workspace::PanePresentation::Full
+                    })
+                    && workspace.set_manual_compact(task_id, compact).is_ok()
+            });
+        if changed {
+            self.mark_layout_dirty();
+        }
+    }
+
     fn task_conversation_surface(
         &mut self,
         tokens: crate::ui::tokens::ThemeTokens,
@@ -22382,7 +22774,7 @@ impl NativeShell {
             self.pane_rail(PaneEdge::Inbox, tokens, cx),
             self.pane_rail(PaneEdge::Dock, tokens, cx),
         );
-        let conversation = self.task_conversation_surface(
+        let conversation = self.task_workspace_surface(
             tokens,
             Self::idle_conversation_photo_size(tokens, viewport, layout.clone()),
             cx,

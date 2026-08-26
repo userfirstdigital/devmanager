@@ -107,20 +107,34 @@ impl TaskConversationCache {
     }
 
     fn latest_snippet(&self) -> Option<&str> {
-        self.facts
+        self.facts.iter().rev().find_map(fact_snippet)
+    }
+
+    fn tail_snippets(&self, max: usize) -> Vec<String> {
+        let mut snippets: Vec<_> = self
+            .facts
             .iter()
             .rev()
-            .find_map(|fact| match &fact.payload {
-                SemanticJournalPayload::UserMessage { text }
-                | SemanticJournalPayload::AssistantText { text }
-                | SemanticJournalPayload::ReasoningSummary { text } => Some(text.as_str()),
-                SemanticJournalPayload::ApprovalRequest { summary, .. } => Some(summary.as_str()),
-                SemanticJournalPayload::Question { prompt, .. } => Some(prompt.as_str()),
-                SemanticJournalPayload::PlanStep { title, .. } => Some(title.as_str()),
-                SemanticJournalPayload::Error { message, .. } => Some(message.as_str()),
-                SemanticJournalPayload::ArtifactReference { label } => Some(label.as_str()),
-                _ => None,
-            })
+            .filter_map(fact_snippet)
+            .take(max)
+            .map(str::to_string)
+            .collect();
+        snippets.reverse();
+        snippets
+    }
+}
+
+fn fact_snippet(fact: &SemanticJournalFact) -> Option<&str> {
+    match &fact.payload {
+        SemanticJournalPayload::UserMessage { text }
+        | SemanticJournalPayload::AssistantText { text }
+        | SemanticJournalPayload::ReasoningSummary { text } => Some(text.as_str()),
+        SemanticJournalPayload::ApprovalRequest { summary, .. } => Some(summary.as_str()),
+        SemanticJournalPayload::Question { prompt, .. } => Some(prompt.as_str()),
+        SemanticJournalPayload::PlanStep { title, .. } => Some(title.as_str()),
+        SemanticJournalPayload::Error { message, .. } => Some(message.as_str()),
+        SemanticJournalPayload::ArtifactReference { label } => Some(label.as_str()),
+        _ => None,
     }
 }
 
@@ -223,6 +237,33 @@ impl TaskSurfaceRegistry {
     pub fn latest_snippet(&self, task_id: TaskId) -> Option<&str> {
         self.state(task_id)
             .and_then(|state| state.latest_snippet.as_deref())
+    }
+
+    pub fn conversation_tail(&self, task_id: TaskId, max: usize) -> Vec<String> {
+        self.state(task_id)
+            .map(|state| state.conversation.tail_snippets(max))
+            .unwrap_or_default()
+    }
+
+    pub fn terminal_tail(&self, task_id: TaskId, max: usize) -> Vec<String> {
+        let Some(terminal) = self
+            .state(task_id)
+            .and_then(|state| state.latest_terminal.as_ref())
+        else {
+            return Vec::new();
+        };
+        let start = terminal.screen.lines.len().saturating_sub(max);
+        terminal.screen.lines[start..]
+            .iter()
+            .map(|line| {
+                line.iter()
+                    .filter(|cell| !cell.hidden)
+                    .map(|cell| cell.character)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
     }
 }
 
