@@ -12,11 +12,14 @@ use crate::domain::ProjectId;
 /// The client may select a project id, but never supplies the root used to
 /// resolve its workspace request. Each admitted root retains the filesystem
 /// identity captured during ConfigStore/root validation so a later directory
-/// replacement at the same path fails closed.
+/// replacement at the same path fails closed. Active configured folders are
+/// retained with the same sealed authority so repository targeting never
+/// accepts a client path.
 #[derive(Clone, PartialEq, Eq)]
 pub struct WorkspaceProjectRoots {
     roots: BTreeMap<ProjectId, ConfiguredProjectRoot>,
     config_ids: BTreeMap<String, ProjectId>,
+    folders: Vec<ConfiguredProjectFolder>,
 }
 
 /// One host-configured project root together with the stable filesystem
@@ -26,6 +29,45 @@ pub struct WorkspaceProjectRoots {
 pub(crate) struct ConfiguredProjectRoot {
     path: PathBuf,
     identity: String,
+}
+
+/// One active configured project folder retained by sealed workspace authority.
+/// Identity is present only when the folder path was admitted; a stale or
+/// non-directory folder stays listed without a pin so catalog entries can
+/// mark it unavailable without poisoning sibling repositories.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct ConfiguredProjectFolder {
+    folder_config_id: String,
+    project_id: ProjectId,
+    label: String,
+    path: PathBuf,
+    identity: Option<String>,
+}
+
+impl ConfiguredProjectFolder {
+    pub(crate) fn folder_config_id(&self) -> &str {
+        &self.folder_config_id
+    }
+
+    pub(crate) fn project_id(&self) -> ProjectId {
+        self.project_id
+    }
+
+    pub(crate) fn label(&self) -> &str {
+        &self.label
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn identity(&self) -> Option<&str> {
+        self.identity.as_deref()
+    }
+
+    pub(crate) fn is_admitted(&self) -> bool {
+        self.identity.is_some()
+    }
 }
 
 impl ConfiguredProjectRoot {
@@ -57,6 +99,9 @@ pub enum WorkspaceProjectRootsError {
         first: ProjectId,
         second: ProjectId,
     },
+    InvalidFolderConfigId(String),
+    DuplicateFolderConfigId(String),
+    AmbiguousFolderConfigId(String),
     TooManyProjects,
 }
 
@@ -95,6 +140,12 @@ impl fmt::Display for WorkspaceProjectRootsError {
                     first, second
                 )
             }
+            Self::InvalidFolderConfigId(_) => {
+                f.write_str("configured folder selector identity is invalid")
+            }
+            Self::DuplicateFolderConfigId(_) | Self::AmbiguousFolderConfigId(_) => {
+                f.write_str("configured folder selector identity is ambiguous")
+            }
             Self::TooManyProjects => f.write_str("host project collection exceeds its bound"),
         }
     }
@@ -107,6 +158,7 @@ impl WorkspaceProjectRoots {
         Self {
             roots: BTreeMap::new(),
             config_ids: BTreeMap::new(),
+            folders: Vec::new(),
         }
     }
 
@@ -165,17 +217,21 @@ impl WorkspaceProjectRoots {
         Ok(Self {
             roots,
             config_ids: BTreeMap::new(),
+            folders: Vec::new(),
         })
     }
 
     /// Adapt only a sealed ConfigStore issuer into the host-owned root map.
     /// The raw `(ProjectId, PathBuf)` shape stays behind this crate-private
     /// boundary; production callers cannot choose either side of the pair.
+    /// Configured folders are admitted independently: a stale folder does not
+    /// poison project roots, and duplicate folder selector ids fail closed.
     pub(crate) fn from_config_issuer(
         issuer: &crate::config::ConfigWorkspaceIssuer,
     ) -> Result<Self, WorkspaceProjectRootsError> {
         let mut roots = Self::try_from_pairs(issuer.workspace_project_roots())?;
         roots.config_ids = issuer.workspace_project_config_ids().into_iter().collect();
+        roots.folders = admit_configured_folders(issuer.workspace_project_folders())?;
         Ok(roots)
     }
 
@@ -250,6 +306,87 @@ impl WorkspaceProjectRoots {
         project_id: ProjectId,
     ) -> Option<&ConfiguredProjectRoot> {
         self.roots.get(&project_id)
+    }
+
+    /// Active configured folders for repository targeting. Order matches the
+    /// sealed issuer (config order); archived folders are never present.
+    pub(crate) fn configured_folders(&self) -> &[ConfiguredProjectFolder] {
+        &self.folders
+    }
+
+    /// Look up one configured folder for the exact Task project. Folder config
+    /// ids are unique only within a Project; cross-project duplicates are valid.
+    pub(crate) fn configured_folder(
+        &self,
+        project_id: ProjectId,
+        folder_config_id: &str,
+    ) -> Option<&ConfiguredProjectFolder> {
+        let folder_config_id = folder_config_id.trim();
+        self.folders.iter().find(|folder| {
+            folder.project_id == project_id && folder.folder_config_id == folder_config_id
+        })
+    }
+}
+
+fn admit_configured_folders(
+    folders: Vec<(ProjectId, String, String, String, PathBuf)>,
+) -> Result<Vec<ConfiguredProjectFolder>, WorkspaceProjectRootsError> {
+    let mut admitted = Vec::with_capacity(folders.len());
+    let mut seen_ids = BTreeSet::<(ProjectId, String)>::new();
+    for (project_id, _project_config_id, folder_config_id, label, path) in folders {
+        if crate::domain::cockpit::validate_folder_config_id(&folder_config_id).is_err() {
+            return Err(WorkspaceProjectRootsError::InvalidFolderConfigId(
+                folder_config_id,
+            ));
+        }
+        if !seen_ids.insert((project_id, folder_config_id.clone())) {
+            return Err(WorkspaceProjectRootsError::DuplicateFolderConfigId(
+                folder_config_id,
+            ));
+        }
+        let (path, identity) =
+            if path.as_os_str().is_empty() || path.to_string_lossy().contains('\0') {
+                (path, None)
+            } else {
+                match crate::workspace::service::validate_host_workspace_path(&path, true) {
+                    Ok(validated) => (validated.path, Some(validated.identity)),
+                    Err(_) => (path, None),
+                }
+            };
+        admitted.push(ConfiguredProjectFolder {
+            folder_config_id,
+            project_id,
+            label: crate::domain::cockpit::redact_repository_label(&label),
+            path,
+            identity,
+        });
+    }
+    Ok(admitted)
+}
+
+#[cfg(test)]
+pub(crate) fn admit_configured_folders_for_test(
+    folders: Vec<(ProjectId, String, String, String, PathBuf)>,
+) -> Result<Vec<ConfiguredProjectFolder>, WorkspaceProjectRootsError> {
+    admit_configured_folders(folders)
+}
+
+#[cfg(test)]
+impl WorkspaceProjectRoots {
+    pub(crate) fn set_folders_for_test(&mut self, folders: Vec<ConfiguredProjectFolder>) {
+        self.folders = folders;
+    }
+
+    pub(crate) fn mark_folder_stale_for_test(
+        &mut self,
+        project_id: ProjectId,
+        folder_config_id: &str,
+    ) {
+        if let Some(folder) = self.folders.iter_mut().find(|folder| {
+            folder.project_id == project_id && folder.folder_config_id == folder_config_id
+        }) {
+            folder.identity = None;
+        }
     }
 }
 
@@ -533,6 +670,75 @@ mod project_root_tests {
             Err(super::WorkspaceProjectRootsError::DuplicateProjectId(project_id))
                 if project_id == first
         ));
+    }
+
+    #[test]
+    fn duplicate_folder_config_ids_fail_closed_within_project_only() {
+        let project_id = ProjectId::new();
+        let other_project = ProjectId::new();
+        let temp = tempfile::tempdir().expect("dup folders");
+        let folder_a = temp.path().join("a");
+        let folder_b = temp.path().join("b");
+        let folder_c = temp.path().join("c");
+        fs::create_dir(&folder_a).expect("a");
+        fs::create_dir(&folder_b).expect("b");
+        fs::create_dir(&folder_c).expect("c");
+        let err = super::admit_configured_folders_for_test(vec![
+            (
+                project_id,
+                "project".into(),
+                "same-id".into(),
+                "A".into(),
+                folder_a.clone(),
+            ),
+            (
+                project_id,
+                "project".into(),
+                "same-id".into(),
+                "B".into(),
+                folder_b,
+            ),
+        ])
+        .err()
+        .expect("same-project duplicate folder ids");
+        assert!(matches!(
+            err,
+            super::WorkspaceProjectRootsError::DuplicateFolderConfigId(_)
+        ));
+
+        let admitted = super::admit_configured_folders_for_test(vec![
+            (
+                project_id,
+                "project-a".into(),
+                "api".into(),
+                "A".into(),
+                folder_a,
+            ),
+            (
+                other_project,
+                "project-b".into(),
+                "api".into(),
+                "B".into(),
+                folder_c,
+            ),
+        ])
+        .expect("cross-project duplicate folder ids are valid");
+        let mut roots =
+            WorkspaceProjectRoots::try_from_pairs([(project_id, temp.path().to_path_buf())])
+                .expect("roots");
+        roots.set_folders_for_test(admitted);
+        assert_eq!(
+            roots
+                .configured_folder(project_id, "api")
+                .map(|folder| folder.label()),
+            Some("A")
+        );
+        assert_eq!(
+            roots
+                .configured_folder(other_project, "api")
+                .map(|folder| folder.label()),
+            Some("B")
+        );
     }
 
     #[test]

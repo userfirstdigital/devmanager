@@ -1204,6 +1204,7 @@ pub enum Command {
     CreateTaskV2(CreateTaskRequestIntent),
     RenameTask(RenameTaskIntent),
     SetTaskAttention(SetTaskAttentionIntent),
+    SettleTask,
     BeginCloseTask,
     ReopenTask,
     RegisterAgentSession {
@@ -1387,12 +1388,24 @@ pub fn decide(
                 attention: intent.attention,
             }])
         }
+        Command::SettleTask => {
+            let snap = require_task(snapshot, envelope)?;
+            require_expected_revision(snap, envelope)?;
+            match snap.task.lifecycle {
+                TaskLifecycle::Open => Ok(vec![Event::TaskSettled]),
+                TaskLifecycle::Settled => Ok(Vec::new()),
+                TaskLifecycle::Closing => Err(RejectionCode::Closing),
+                TaskLifecycle::Archived => Err(RejectionCode::InvalidTransition),
+            }
+        }
         Command::BeginCloseTask => decide_begin_close(snapshot, envelope),
         Command::ReopenTask => {
             let snap = require_task(snapshot, envelope)?;
             require_expected_revision(snap, envelope)?;
             match snap.task.lifecycle {
-                TaskLifecycle::Closing | TaskLifecycle::Archived => Ok(vec![Event::TaskReopened]),
+                TaskLifecycle::Settled | TaskLifecycle::Closing | TaskLifecycle::Archived => {
+                    Ok(vec![Event::TaskReopened])
+                }
                 TaskLifecycle::Open => Err(RejectionCode::InvalidTransition),
             }
         }
@@ -1661,7 +1674,7 @@ fn decide_begin_close(
     match snap.task.lifecycle {
         TaskLifecycle::Closing => Ok(Vec::new()),
         TaskLifecycle::Archived => Err(RejectionCode::InvalidTransition),
-        TaskLifecycle::Open => {
+        TaskLifecycle::Open | TaskLifecycle::Settled => {
             let action_epoch = snap
                 .task
                 .action_epoch
@@ -1761,7 +1774,7 @@ fn decide_submit_provider_input(
     {
         return Err(RejectionCode::InvalidTransition);
     }
-    Ok(vec![Event::ProviderInputAccepted {
+    let accepted = Event::ProviderInputAccepted {
         command_id: envelope.command_id,
         client_id: envelope.client_id,
         operation_id: OperationId::new(),
@@ -1776,7 +1789,8 @@ fn decide_submit_provider_input(
         action: intent.action().clone(),
         wait: intent.action().waits_for_turn(),
         delivery: crate::domain::provider_input::ProviderDeliveryVisibility::hold_until_destination_adapter(),
-    }])
+    };
+    Ok(vec![accepted])
 }
 
 fn decide_present_provider_question(
@@ -1960,7 +1974,7 @@ fn require_open_or_closing_task<'a>(
 ) -> Result<&'a TaskSnapshot, RejectionCode> {
     let snap = require_task(snapshot, envelope)?;
     match snap.task.lifecycle {
-        TaskLifecycle::Open | TaskLifecycle::Closing => Ok(snap),
+        TaskLifecycle::Open | TaskLifecycle::Settled | TaskLifecycle::Closing => Ok(snap),
         TaskLifecycle::Archived => Err(RejectionCode::InvalidTransition),
     }
 }
@@ -1971,7 +1985,7 @@ fn require_runtime_capable_task<'a>(
 ) -> Result<&'a TaskSnapshot, RejectionCode> {
     let snap = require_task(snapshot, envelope)?;
     match snap.task.lifecycle {
-        TaskLifecycle::Open => Ok(snap),
+        TaskLifecycle::Open | TaskLifecycle::Settled => Ok(snap),
         TaskLifecycle::Closing => Err(RejectionCode::Closing),
         TaskLifecycle::Archived => Err(RejectionCode::InvalidTransition),
     }

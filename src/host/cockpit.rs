@@ -15,14 +15,15 @@ use crate::domain::cockpit::{
     ConfigSidebarSnapshot, ConfigSidebarSsh, TaskCockpitDeniedReason, TaskCockpitQuery,
     TaskCockpitResult, TaskCockpitSurface, TaskCockpitUnavailableReason, TaskFileEntry,
     TaskFilesListProjection, TaskFilesReadProjection, TaskGitMutateIntent, TaskGitProjection,
-    TaskSshEndpoint, TaskSshLifecycle, TaskSshProjection, TaskSshRuntimeError,
-    TaskSshRuntimeProjection, MAX_COCKPIT_FILE_LIST, MAX_COCKPIT_READ_BYTES,
+    TaskRepositorySelector, TaskSshEndpoint, TaskSshLifecycle, TaskSshProjection,
+    TaskSshRuntimeError, TaskSshRuntimeProjection, MAX_COCKPIT_FILE_LIST, MAX_COCKPIT_READ_BYTES,
 };
 use crate::domain::id::{ClientId, CommandId, RequestId, TaskId};
 use crate::domain::query::{QueryError, QueryOutcome, QueryResult};
 use crate::domain::{AgentSessionFacts, ResourceFacts};
 use crate::git::command::{
-    issue_git_host_binding, GitCancellation, GitConfirmation, GitError, GitRepository,
+    issue_configured_repository_git_host_binding, issue_git_host_binding, GitCancellation,
+    GitConfirmation, GitError, GitRepository,
 };
 use crate::git::model::{MutationPlan, RepoPath, StatusKind};
 use crate::kernel::CommandBus;
@@ -85,11 +86,17 @@ pub(crate) fn serve_task_cockpit(dispatch: TaskCockpitDispatch<'_>) -> QueryOutc
         return QueryOutcome::Err(QueryError::UnsupportedCapability);
     }
     let surface = cockpit_surface(dispatch.query);
-    if matches!(dispatch.query, TaskCockpitQuery::ConfigCreateProject { .. }) {
+    if matches!(
+        dispatch.query,
+        TaskCockpitQuery::ConfigCreateProject { .. }
+            | TaskCockpitQuery::ConfigUpsertCommand { .. }
+            | TaskCockpitQuery::ConfigArchiveCommand { .. }
+            | TaskCockpitQuery::ConfigRunCommand { .. }
+    ) {
         // Mutation is owned by the exclusive host executor, which re-issues
         // workspace authority before returning a snapshot.
         return QueryOutcome::Err(QueryError::Unavailable {
-            reason: "config_create",
+            reason: "config_mutate",
         });
     }
     if matches!(dispatch.query, TaskCockpitQuery::AgentConnection) {
@@ -106,6 +113,24 @@ pub(crate) fn serve_task_cockpit(dispatch: TaskCockpitDispatch<'_>) -> QueryOutc
         return QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Config(
             config_sidebar_snapshot(config),
         )));
+    }
+    if let TaskCockpitQuery::ConfigCommandDetail {
+        project_id,
+        folder_id,
+        command_id,
+    } = dispatch.query
+    {
+        let Some(config) = dispatch.config else {
+            return QueryOutcome::Err(QueryError::Unavailable {
+                reason: "config_command_detail",
+            });
+        };
+        return match config_command_detail(config, project_id, folder_id, command_id) {
+            Some(detail) => QueryOutcome::Ok(QueryResult::TaskCockpit(
+                TaskCockpitResult::ConfigCommandDetail(detail),
+            )),
+            None => QueryOutcome::Err(QueryError::InvalidRequest),
+        };
     }
     let Some(task_id) = dispatch.envelope_task_id else {
         return denied(surface, TaskCockpitDeniedReason::MissingTask);
@@ -126,8 +151,31 @@ pub(crate) fn serve_task_cockpit(dispatch: TaskCockpitDispatch<'_>) -> QueryOutc
     match dispatch.query {
         TaskCockpitQuery::ConfigSnapshot
         | TaskCockpitQuery::AgentConnection
-        | TaskCockpitQuery::ConfigCreateProject { .. } => {
+        | TaskCockpitQuery::ConfigCreateProject { .. }
+        | TaskCockpitQuery::ConfigUpsertCommand { .. }
+        | TaskCockpitQuery::ConfigArchiveCommand { .. }
+        | TaskCockpitQuery::ConfigRunCommand { .. }
+        | TaskCockpitQuery::ConfigCommandDetail { .. } => {
             unreachable!("config snapshot is handled before task-scoped lookup")
+        }
+        TaskCockpitQuery::BrowserProcessSession => {
+            let process_session_id = dispatch
+                .service_runtime
+                .and_then(|runtime| runtime.live_ai_process_session_for_tab(&task_id.to_string()));
+            match process_session_id {
+                Some(process_session_id) => QueryOutcome::Ok(QueryResult::TaskCockpit(
+                    TaskCockpitResult::BrowserProcessSession(
+                        crate::domain::BrowserProcessSessionProjection {
+                            task_id,
+                            process_session_id,
+                        },
+                    ),
+                )),
+                None => unavailable(
+                    TaskCockpitSurface::Browser,
+                    TaskCockpitUnavailableReason::BrowserProcessSessionUnavailable,
+                ),
+            }
         }
         TaskCockpitQuery::Conversation { after_sequence } => {
             if !dispatch
@@ -141,10 +189,38 @@ pub(crate) fn serve_task_cockpit(dispatch: TaskCockpitDispatch<'_>) -> QueryOutc
         TaskCockpitQuery::WorkspaceStatus => QueryOutcome::Ok(QueryResult::TaskCockpit(
             TaskCockpitResult::Workspace(workspace_projection(task_id, &snapshot.task.workspace)),
         )),
-        TaskCockpitQuery::GitStatus => serve_git_status(&dispatch, task_id, &snapshot.task),
-        TaskCockpitQuery::GitMutate { intent, confirm } => {
-            serve_git_mutate(&dispatch, task_id, &snapshot.task, intent, *confirm)
+        TaskCockpitQuery::GitRepositories => {
+            serve_git_repositories(&dispatch, task_id, &snapshot.task)
         }
+        TaskCockpitQuery::GitStatus => serve_git_status_targeted(
+            &dispatch,
+            task_id,
+            &snapshot.task,
+            &TaskRepositorySelector::Workspace,
+        ),
+        TaskCockpitQuery::GitStatusTargeted { selector } => {
+            serve_git_status_targeted(&dispatch, task_id, &snapshot.task, selector)
+        }
+        TaskCockpitQuery::GitMutate { intent, confirm } => serve_git_mutate_targeted(
+            &dispatch,
+            task_id,
+            &snapshot.task,
+            &TaskRepositorySelector::Workspace,
+            intent,
+            *confirm,
+        ),
+        TaskCockpitQuery::GitMutateTargeted {
+            selector,
+            intent,
+            confirm,
+        } => serve_git_mutate_targeted(
+            &dispatch,
+            task_id,
+            &snapshot.task,
+            selector,
+            intent,
+            *confirm,
+        ),
         TaskCockpitQuery::FilesList {
             relative_directory,
             limit,
@@ -511,6 +587,42 @@ fn semantic_payload(
     }
 }
 
+pub(crate) fn config_command_detail(
+    config: &AppConfig,
+    project_id: &str,
+    folder_id: &str,
+    command_id: &str,
+) -> Option<crate::domain::ConfigCommandDetailProjection> {
+    const MAX_LABEL: usize = 96;
+    const MAX_COMMAND: usize = 4_096;
+    let project = config
+        .projects
+        .iter()
+        .find(|project| project.id == project_id && !is_archived(&project.archived))?;
+    let folder = project
+        .folders
+        .iter()
+        .find(|folder| folder.id == folder_id && !is_archived(&folder.archived))?;
+    let command = folder
+        .commands
+        .iter()
+        .find(|command| command.id == command_id && !is_archived(&command.archived))?;
+    Some(crate::domain::ConfigCommandDetailProjection {
+        project_id: bounded_config_text(&project.id, MAX_LABEL),
+        folder_id: bounded_config_text(&folder.id, MAX_LABEL),
+        command_id: bounded_config_text(&command.id, MAX_LABEL),
+        label: bounded_config_text(
+            if command.label.trim().is_empty() {
+                &command.id
+            } else {
+                &command.label
+            },
+            MAX_LABEL,
+        ),
+        command: bounded_config_text(&command.command, MAX_COMMAND),
+    })
+}
+
 pub(crate) fn config_sidebar_snapshot(config: &AppConfig) -> ConfigSidebarSnapshot {
     const MAX_PROJECTS: usize = 128;
     const MAX_FOLDERS: usize = 64;
@@ -746,21 +858,56 @@ fn map_supervisor_observe_error(error: SupervisorError) -> QueryOutcome {
     }
 }
 
-fn serve_git_status(
+fn serve_git_repositories(
     dispatch: &TaskCockpitDispatch<'_>,
     task_id: TaskId,
     task: &crate::domain::task::TaskFacts,
 ) -> QueryOutcome {
-    match open_git_repository(dispatch, task_id, task) {
-        Ok(repository) => git_status_outcome(task_id, &repository),
+    let Some(projects) = dispatch.workspace_projects else {
+        return unavailable(
+            TaskCockpitSurface::Git,
+            TaskCockpitUnavailableReason::WorkspaceAuthorityUnavailable,
+        );
+    };
+    let (service, authorization, command_id, action_epoch, runtime_generation) =
+        match live_mutation_authority(dispatch, task_id, task, TaskCockpitSurface::Git) {
+            Ok(authority) => authority,
+            Err(outcome) => return outcome,
+        };
+    let _ = (authorization, command_id, action_epoch, runtime_generation);
+    let binding = service.current();
+    let workspace_path = binding.map(|bound| bound.path().to_path_buf());
+    let workspace_repository = binding.and_then(|bound| bound.repository().cloned());
+    let catalog = crate::workspace::repository_targets::build_task_repository_catalog(
+        task_id,
+        task.project_id,
+        &task.workspace,
+        workspace_path.as_deref(),
+        workspace_repository.as_ref(),
+        projects,
+    );
+    QueryOutcome::Ok(QueryResult::TaskCockpit(
+        TaskCockpitResult::GitRepositories(catalog),
+    ))
+}
+
+fn serve_git_status_targeted(
+    dispatch: &TaskCockpitDispatch<'_>,
+    task_id: TaskId,
+    task: &crate::domain::task::TaskFacts,
+    selector: &TaskRepositorySelector,
+) -> QueryOutcome {
+    match open_git_repository_targeted(dispatch, task_id, task, selector) {
+        Ok((repository, resolved)) => git_status_outcome(task_id, &repository, &resolved),
         Err(outcome) => outcome,
     }
 }
 
-fn serve_git_mutate(
+fn serve_git_mutate_targeted(
     dispatch: &TaskCockpitDispatch<'_>,
     task_id: TaskId,
     task: &crate::domain::task::TaskFacts,
+    selector: &TaskRepositorySelector,
     intent: &TaskGitMutateIntent,
     confirm: bool,
 ) -> QueryOutcome {
@@ -769,6 +916,9 @@ fn serve_git_mutate(
             TaskCockpitSurface::Git,
             TaskCockpitDeniedReason::Unauthorized,
         );
+    }
+    if selector.validate().is_err() {
+        return QueryOutcome::Err(QueryError::InvalidRequest);
     }
     let paths = match intent {
         TaskGitMutateIntent::Stage { relative_paths }
@@ -785,11 +935,22 @@ fn serve_git_mutate(
             None
         }
     };
-    let repository = match open_git_repository(dispatch, task_id, task) {
-        Ok(repository) => repository,
-        Err(outcome) => return outcome,
-    };
+    let (repository, resolved) =
+        match open_git_repository_targeted(dispatch, task_id, task, selector) {
+            Ok(opened) => opened,
+            Err(outcome) => return outcome,
+        };
+    if !resolved.mutation_allowed {
+        return denied(
+            TaskCockpitSurface::Git,
+            TaskCockpitDeniedReason::CapabilityDenied,
+        );
+    }
     if let Err(outcome) = revalidate_git_fence(dispatch, task_id, task) {
+        return outcome;
+    }
+    // Revalidate configured identity immediately before mutation planning.
+    if let Err(outcome) = revalidate_configured_target_identity(dispatch, task_id, task, selector) {
         return outcome;
     }
     let planned = match intent {
@@ -816,9 +977,12 @@ fn serve_git_mutate(
         },
     };
     if !confirm {
-        return git_status_outcome(task_id, &repository);
+        return git_status_outcome(task_id, &repository, &resolved);
     }
     if let Err(outcome) = revalidate_git_fence(dispatch, task_id, task) {
+        return outcome;
+    }
+    if let Err(outcome) = revalidate_configured_target_identity(dispatch, task_id, task, selector) {
         return outcome;
     }
     let executed = match &planned {
@@ -831,12 +995,8 @@ fn serve_git_mutate(
     };
     match executed {
         Ok(()) => {
-            // A successful mutation can create or replace legitimate mutable
-            // Git graph entries (for example, the first commit creates
-            // `.git/logs`). Release the pre-effect pinned graph and reacquire
-            // host authority before projecting the post-effect status.
             drop(repository);
-            serve_git_status(dispatch, task_id, task)
+            serve_git_status_targeted(dispatch, task_id, task, selector)
         }
         Err(error) => map_git_error(error),
     }
@@ -910,12 +1070,18 @@ fn map_git_error(error: GitError) -> QueryOutcome {
     }
 }
 
-fn git_status_outcome(task_id: TaskId, repository: &GitRepository) -> QueryOutcome {
+fn git_status_outcome(
+    task_id: TaskId,
+    repository: &GitRepository,
+    resolved: &crate::workspace::repository_targets::ResolvedRepositoryTarget,
+) -> QueryOutcome {
     let started = std::time::Instant::now();
     match repository.status_summary() {
         Ok(status) => QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Git(
             TaskGitProjection {
                 task_id,
+                selector: Some(resolved.selector.clone()),
+                label: Some(resolved.label.clone()),
                 branch: status.branch.as_ref().map(|name| name.as_str().to_owned()),
                 ahead: status.ahead,
                 behind: status.behind,
@@ -940,13 +1106,63 @@ fn git_status_outcome(task_id: TaskId, repository: &GitRepository) -> QueryOutco
     }
 }
 
-fn open_git_repository(
+fn open_git_repository_targeted(
     dispatch: &TaskCockpitDispatch<'_>,
     task_id: TaskId,
     task: &crate::domain::task::TaskFacts,
-) -> Result<GitRepository, QueryOutcome> {
+    selector: &TaskRepositorySelector,
+) -> Result<
+    (
+        GitRepository,
+        crate::workspace::repository_targets::ResolvedRepositoryTarget,
+    ),
+    QueryOutcome,
+> {
+    if selector.validate().is_err() {
+        return Err(QueryOutcome::Err(QueryError::InvalidRequest));
+    }
+    let Some(projects) = dispatch.workspace_projects else {
+        return Err(unavailable(
+            TaskCockpitSurface::Git,
+            TaskCockpitUnavailableReason::WorkspaceAuthorityUnavailable,
+        ));
+    };
     let (service, authorization, command_id, action_epoch, runtime_generation) =
         live_mutation_authority(dispatch, task_id, task, TaskCockpitSurface::Git)?;
+    let binding = service.current();
+    let workspace_path = binding.map(|bound| bound.path().to_path_buf());
+    let workspace_repository = binding.and_then(|bound| bound.repository().cloned());
+    let resolved = crate::workspace::repository_targets::resolve_repository_target(
+        selector,
+        task.project_id,
+        &task.workspace,
+        workspace_path.as_deref(),
+        workspace_repository.as_ref(),
+        projects,
+    )
+    .map_err(|error| match error {
+        crate::workspace::repository_targets::RepositoryTargetError::InvalidSelector => {
+            QueryOutcome::Err(QueryError::InvalidRequest)
+        }
+        crate::workspace::repository_targets::RepositoryTargetError::UnknownSelector => denied(
+            TaskCockpitSurface::Git,
+            TaskCockpitDeniedReason::Unauthorized,
+        ),
+        crate::workspace::repository_targets::RepositoryTargetError::ReadOnly
+        | crate::workspace::repository_targets::RepositoryTargetError::Unavailable => denied(
+            TaskCockpitSurface::Git,
+            TaskCockpitDeniedReason::CapabilityDenied,
+        ),
+        crate::workspace::repository_targets::RepositoryTargetError::StaleIdentity => {
+            denied(TaskCockpitSurface::Git, TaskCockpitDeniedReason::StaleFence)
+        }
+    })?;
+    if !resolved.available {
+        return Err(denied(
+            TaskCockpitSurface::Git,
+            TaskCockpitDeniedReason::CapabilityDenied,
+        ));
+    }
     let lease = service
         .acquire_task_resource(
             task_id,
@@ -981,19 +1197,38 @@ fn open_git_repository(
         eprintln!("devmanager-host: cockpit Git fence revalidation failed: {outcome:?}");
         outcome
     })?;
-    let binding = issue_git_host_binding(
-        &authorization,
-        lease,
-        task_id,
-        task.project_id,
-        dispatch.client_id,
-        dispatch.connection_id,
-        dispatch.request_id,
-        command_id,
-        &task.workspace,
-        action_epoch,
-        runtime_generation,
-    )
+    let binding = match &resolved.selector {
+        TaskRepositorySelector::Workspace => issue_git_host_binding(
+            &authorization,
+            lease,
+            task_id,
+            task.project_id,
+            dispatch.client_id,
+            dispatch.connection_id,
+            dispatch.request_id,
+            command_id,
+            &task.workspace,
+            action_epoch,
+            runtime_generation,
+        ),
+        TaskRepositorySelector::ProjectRoot | TaskRepositorySelector::Folder { .. } => {
+            issue_configured_repository_git_host_binding(
+                &authorization,
+                lease,
+                task_id,
+                task.project_id,
+                dispatch.client_id,
+                dispatch.connection_id,
+                dispatch.request_id,
+                command_id,
+                &task.workspace,
+                action_epoch,
+                runtime_generation,
+                &resolved.path,
+                &resolved.identity,
+            )
+        }
+    }
     .map_err(|error| {
         eprintln!("devmanager-host: cockpit Git binding failed: {error:?}");
         unavailable(
@@ -1001,13 +1236,55 @@ fn open_git_repository(
             TaskCockpitUnavailableReason::GitAuthorityNotIssued,
         )
     })?;
-    GitRepository::from_host_binding(binding, GitCancellation::new()).map_err(|error| {
-        eprintln!("devmanager-host: cockpit Git repository open failed: {error:?}");
-        unavailable(
-            TaskCockpitSurface::Git,
-            TaskCockpitUnavailableReason::GitAuthorityNotIssued,
-        )
-    })
+    let repository =
+        GitRepository::from_host_binding(binding, GitCancellation::new()).map_err(|error| {
+            eprintln!("devmanager-host: cockpit Git repository open failed: {error:?}");
+            unavailable(
+                TaskCockpitSurface::Git,
+                TaskCockpitUnavailableReason::GitAuthorityNotIssued,
+            )
+        })?;
+    Ok((repository, resolved))
+}
+
+fn revalidate_configured_target_identity(
+    dispatch: &TaskCockpitDispatch<'_>,
+    task_id: TaskId,
+    task: &crate::domain::task::TaskFacts,
+    selector: &TaskRepositorySelector,
+) -> Result<(), QueryOutcome> {
+    match selector {
+        TaskRepositorySelector::Workspace => Ok(()),
+        TaskRepositorySelector::ProjectRoot | TaskRepositorySelector::Folder { .. } => {
+            let Some(projects) = dispatch.workspace_projects else {
+                return Err(unavailable(
+                    TaskCockpitSurface::Git,
+                    TaskCockpitUnavailableReason::WorkspaceAuthorityUnavailable,
+                ));
+            };
+            let (service, _, _, _, _) =
+                live_mutation_authority(dispatch, task_id, task, TaskCockpitSurface::Git)?;
+            let binding = service.current();
+            let workspace_path = binding.map(|bound| bound.path().to_path_buf());
+            let workspace_repository = binding.and_then(|bound| bound.repository().cloned());
+            let resolved = crate::workspace::repository_targets::resolve_repository_target(
+                selector,
+                task.project_id,
+                &task.workspace,
+                workspace_path.as_deref(),
+                workspace_repository.as_ref(),
+                projects,
+            )
+            .map_err(|_| denied(TaskCockpitSurface::Git, TaskCockpitDeniedReason::StaleFence))?;
+            if !resolved.mutation_allowed {
+                return Err(denied(
+                    TaskCockpitSurface::Git,
+                    TaskCockpitDeniedReason::CapabilityDenied,
+                ));
+            }
+            Ok(())
+        }
+    }
 }
 
 fn revalidate_git_fence(
@@ -2709,5 +2986,122 @@ mod tests {
             body.contains("query_with_timeout") && body.contains("task_cockpit_query_timeout"),
             "Task Cockpit must not use the generic 5s request deadline"
         );
+    }
+
+    #[test]
+    fn legacy_git_status_shim_equals_workspace_targeted_status() {
+        let (_repository, bus, client_id, task_id, roots) = create_bound_task();
+        let coordinator = WorkspaceResourceCoordinator::new();
+        let legacy = serve_task_cockpit(dispatch(
+            &bus,
+            client_id,
+            task_id,
+            &TaskCockpitQuery::GitStatus,
+            Some(&roots),
+            Some(&coordinator),
+            Some(1),
+            Some(1),
+        ));
+        let targeted = serve_task_cockpit(dispatch(
+            &bus,
+            client_id,
+            task_id,
+            &TaskCockpitQuery::GitStatusTargeted {
+                selector: TaskRepositorySelector::Workspace,
+            },
+            Some(&roots),
+            Some(&coordinator),
+            Some(1),
+            Some(1),
+        ));
+        let QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Git(legacy_git))) = legacy
+        else {
+            panic!("legacy git status failed: {legacy:?}");
+        };
+        let QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Git(targeted_git))) =
+            targeted
+        else {
+            panic!("targeted git status failed: {targeted:?}");
+        };
+        assert_eq!(legacy_git.task_id, targeted_git.task_id);
+        assert_eq!(legacy_git.branch, targeted_git.branch);
+        assert_eq!(legacy_git.ahead, targeted_git.ahead);
+        assert_eq!(legacy_git.behind, targeted_git.behind);
+        assert_eq!(legacy_git.change_count, targeted_git.change_count);
+        assert_eq!(legacy_git.detached, targeted_git.detached);
+        assert_eq!(
+            targeted_git.selector,
+            Some(TaskRepositorySelector::Workspace)
+        );
+    }
+
+    #[test]
+    fn main_task_git_repositories_catalog_and_targeted_mutate_share_selector_fence() {
+        let (_repository, bus, client_id, task_id, roots) = create_bound_task();
+        let coordinator = WorkspaceResourceCoordinator::new();
+        let catalog = serve_task_cockpit(dispatch(
+            &bus,
+            client_id,
+            task_id,
+            &TaskCockpitQuery::GitRepositories,
+            Some(&roots),
+            Some(&coordinator),
+            Some(1),
+            Some(1),
+        ));
+        let QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::GitRepositories(
+            projection,
+        ))) = catalog
+        else {
+            panic!("expected repository catalog, got {catalog:?}");
+        };
+        assert!(!projection.repositories.is_empty());
+        assert!(projection.repositories.iter().any(|entry| {
+            matches!(entry.selector, TaskRepositorySelector::Workspace) && entry.available
+        }));
+        let encoded = serde_json::to_string(&projection).expect("encode catalog");
+        assert!(!encoded.contains("C:"));
+        assert!(!encoded.contains("folder_path"));
+
+        let planned = serve_task_cockpit(dispatch(
+            &bus,
+            client_id,
+            task_id,
+            &TaskCockpitQuery::GitMutateTargeted {
+                selector: TaskRepositorySelector::Workspace,
+                intent: TaskGitMutateIntent::Stage {
+                    relative_paths: vec!["README.md".into()],
+                },
+                confirm: false,
+            },
+            Some(&roots),
+            Some(&coordinator),
+            Some(1),
+            Some(1),
+        ));
+        let QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Git(status))) = planned
+        else {
+            panic!("expected targeted plan status, got {planned:?}");
+        };
+        assert_eq!(status.selector, Some(TaskRepositorySelector::Workspace));
+
+        let path_like = serve_task_cockpit(dispatch(
+            &bus,
+            client_id,
+            task_id,
+            &TaskCockpitQuery::GitStatusTargeted {
+                selector: TaskRepositorySelector::Folder {
+                    folder_config_id: "C:/not-a-selector".into(),
+                },
+            },
+            Some(&roots),
+            Some(&coordinator),
+            Some(1),
+            Some(1),
+        ));
+        assert!(matches!(
+            path_like,
+            QueryOutcome::Err(QueryError::InvalidRequest)
+        ));
     }
 }

@@ -148,6 +148,26 @@ pub(crate) fn apply_event(
             )?;
             require_one_change(tx, "task.close_begun")?;
         }
+        Event::TaskSettled => {
+            let task_id = require_task_id(event)?;
+            let next_revision = require_next_revision(tx, shadow, task_id, event)?;
+            require_settle(tx, shadow, task_id)?;
+            let table = table_name("tasks", shadow);
+            tx.execute(
+                &format!(
+                    "UPDATE {table}
+                     SET lifecycle = ?1, revision = ?2, updated_at_ms = ?3
+                     WHERE task_id = ?4"
+                ),
+                rusqlite::params![
+                    lifecycle_text(TaskLifecycle::Settled),
+                    next_revision,
+                    event.occurred_at_ms,
+                    task_id.as_bytes().as_slice(),
+                ],
+            )?;
+            require_one_change(tx, "task.settled")?;
+        }
         Event::TaskReopened => {
             let task_id = require_task_id(event)?;
             let next_revision = require_next_revision(tx, shadow, task_id, event)?;
@@ -699,11 +719,18 @@ pub(crate) fn apply_event(
             delivery,
         } => {
             let task_id = require_task_id(event)?;
-            let (_, epoch) = read_task_lifecycle_epoch(tx, shadow, task_id)?;
+            let (lifecycle, epoch) = read_task_lifecycle_epoch(tx, shadow, task_id)?;
             let stored_epoch = u64_from_nonnegative_i64("tasks.action_epoch", epoch)?;
             if stored_epoch != *action_epoch {
                 return Err(StoreError::Projection(
                     "provider input action_epoch does not match task fence".into(),
+                ));
+            }
+            let reactivate = lifecycle == lifecycle_text(TaskLifecycle::Settled)
+                && matches!(action, crate::domain::ProviderInputAction::SendNow { .. });
+            if lifecycle != lifecycle_text(TaskLifecycle::Open) && !reactivate {
+                return Err(StoreError::Projection(
+                    "provider input requires Open, or Settled with SendNow, task lifecycle".into(),
                 ));
             }
             if delivery.is_delivered() {
@@ -825,6 +852,22 @@ pub(crate) fn apply_event(
                 }
                 Ok(())
             })?;
+            if reactivate {
+                let table = table_name("tasks", shadow);
+                tx.execute(
+                    &format!(
+                        "UPDATE {table}
+                         SET lifecycle = ?1
+                         WHERE task_id = ?2 AND lifecycle = ?3"
+                    ),
+                    rusqlite::params![
+                        lifecycle_text(TaskLifecycle::Open),
+                        task_id.as_bytes().as_slice(),
+                        lifecycle_text(TaskLifecycle::Settled),
+                    ],
+                )?;
+                require_one_change(tx, "provider input settled task reactivation")?;
+            }
             bump_task_revision(tx, shadow, task_id, event)?;
         }
         Event::ProviderQuestionPresented {
@@ -1633,9 +1676,9 @@ fn require_close_begun(
     action_epoch: u64,
 ) -> Result<(), StoreError> {
     let (lifecycle, stored_epoch) = read_task_lifecycle_epoch(tx, shadow, task_id)?;
-    if lifecycle != lifecycle_text(TaskLifecycle::Open) {
+    if !matches!(lifecycle.as_str(), "open" | "settled") {
         return Err(StoreError::Projection(format!(
-            "task.close_begun requires open lifecycle, found {lifecycle}"
+            "task.close_begun requires open or settled lifecycle, found {lifecycle}"
         )));
     }
     let stored_u64 = u64::try_from(stored_epoch).map_err(|_| StoreError::IntegerOutOfRange {
@@ -1656,12 +1699,22 @@ fn require_close_begun(
     Ok(())
 }
 
+fn require_settle(tx: &Transaction<'_>, shadow: bool, task_id: TaskId) -> Result<(), StoreError> {
+    let (lifecycle, _) = read_task_lifecycle_epoch(tx, shadow, task_id)?;
+    if lifecycle != lifecycle_text(TaskLifecycle::Open) {
+        return Err(StoreError::Projection(format!(
+            "task.settled requires open lifecycle, found {lifecycle}"
+        )));
+    }
+    Ok(())
+}
+
 fn require_reopen(tx: &Transaction<'_>, shadow: bool, task_id: TaskId) -> Result<(), StoreError> {
     let (lifecycle, _) = read_task_lifecycle_epoch(tx, shadow, task_id)?;
     match lifecycle.as_str() {
-        "closing" | "archived" => Ok(()),
+        "settled" | "closing" | "archived" => Ok(()),
         other => Err(StoreError::Projection(format!(
-            "task.reopened requires closing or archived lifecycle, found {other}"
+            "task.reopened requires settled, closing, or archived lifecycle, found {other}"
         ))),
     }
 }
@@ -2575,6 +2628,7 @@ pub(crate) fn pack<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, StoreError
 fn lifecycle_text(value: TaskLifecycle) -> &'static str {
     match value {
         TaskLifecycle::Open => "open",
+        TaskLifecycle::Settled => "settled",
         TaskLifecycle::Closing => "closing",
         TaskLifecycle::Archived => "archived",
     }

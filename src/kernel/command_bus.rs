@@ -6742,6 +6742,7 @@ fn validate_task_history_and_projection_with_agent_sessions(
 
     let expected_lifecycle = match snap.task.lifecycle {
         TaskLifecycle::Open => "open",
+        TaskLifecycle::Settled => "settled",
         TaskLifecycle::Closing => "closing",
         TaskLifecycle::Archived => "archived",
     };
@@ -6854,7 +6855,7 @@ fn enforce_command_decision_lifecycle_gate(
         | Event::ResourceReleased { .. } => {
             if !matches!(
                 snap.task.lifecycle,
-                TaskLifecycle::Open | TaskLifecycle::Closing
+                TaskLifecycle::Open | TaskLifecycle::Settled | TaskLifecycle::Closing
             ) {
                 return Err(StoreError::Corruption);
             }
@@ -6862,17 +6863,27 @@ fn enforce_command_decision_lifecycle_gate(
         Event::AgentSessionRegistered { .. }
         | Event::PrimaryAgentSet { .. }
         | Event::ResourceRegistered { .. }
-        | Event::ProviderInputAccepted { .. }
         | Event::ProviderQuestionPresented { .. }
         | Event::ProviderApprovalPresented { .. } => {
-            if snap.task.lifecycle != TaskLifecycle::Open {
+            if !matches!(
+                snap.task.lifecycle,
+                TaskLifecycle::Open | TaskLifecycle::Settled
+            ) {
+                return Err(StoreError::Corruption);
+            }
+        }
+        Event::ProviderInputAccepted { action, .. } => {
+            let valid = snap.task.lifecycle == TaskLifecycle::Open
+                || (snap.task.lifecycle == TaskLifecycle::Settled
+                    && matches!(action, crate::domain::ProviderInputAction::SendNow { .. }));
+            if !valid {
                 return Err(StoreError::Corruption);
             }
         }
         Event::ProviderWaitSettled { .. } => {
             if !matches!(
                 snap.task.lifecycle,
-                TaskLifecycle::Open | TaskLifecycle::Closing
+                TaskLifecycle::Open | TaskLifecycle::Settled | TaskLifecycle::Closing
             ) {
                 return Err(StoreError::Corruption);
             }
@@ -8567,7 +8578,7 @@ fn load_browser_book(
                 .map_err(|err| StoreError::Projection(err.to_string()))?;
         }
     }
-    if !matches!(lifecycle, TaskLifecycle::Open) {
+    if matches!(lifecycle, TaskLifecycle::Closing | TaskLifecycle::Archived) {
         book.close_task(task_id)
             .map_err(|err| StoreError::Projection(err.to_string()))?;
     }
@@ -10166,6 +10177,7 @@ impl_try_from_bytes16!(
 fn parse_lifecycle(value: &str) -> Result<TaskLifecycle, StoreError> {
     match value {
         "open" => Ok(TaskLifecycle::Open),
+        "settled" => Ok(TaskLifecycle::Settled),
         "closing" => Ok(TaskLifecycle::Closing),
         "archived" => Ok(TaskLifecycle::Archived),
         other => Err(StoreError::CodecMismatch {

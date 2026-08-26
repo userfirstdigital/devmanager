@@ -3262,6 +3262,13 @@ fn same_path_identity(left: &Path, right: &Path) -> bool {
     }
 }
 
+/// Discover the Git repository identity for a host-resolved configured target.
+/// Callers must already hold sealed workspace / folder authority; this never
+/// authorizes from a client path.
+pub(crate) fn discover_repository_for_target(workspace: &Path) -> Option<RepositoryIdentity> {
+    discover_repository(workspace)
+}
+
 fn discover_repository(workspace: &Path) -> Option<RepositoryIdentity> {
     let mut current = normalize_absolute_path(workspace).ok()?;
     loop {

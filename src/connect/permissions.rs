@@ -66,12 +66,18 @@ pub fn action_for_client_request(request: &ClientRequest) -> Option<(ActionId, O
                 Query::InspectHostQuit => ActionId::READ_OPERATION,
                 Query::PromptLibrary(_) => ActionId::READ_PERSONAL_PROMPTS,
                 Query::TaskCockpit(
-                    crate::domain::cockpit::TaskCockpitQuery::ConfigCreateProject { .. },
+                    crate::domain::cockpit::TaskCockpitQuery::ConfigCreateProject { .. }
+                    | crate::domain::cockpit::TaskCockpitQuery::ConfigUpsertCommand { .. }
+                    | crate::domain::cockpit::TaskCockpitQuery::ConfigArchiveCommand { .. }
+                    | crate::domain::cockpit::TaskCockpitQuery::ConfigRunCommand { .. }
+                    | crate::domain::cockpit::TaskCockpitQuery::ConfigCommandDetail { .. },
                 ) => {
-                    // Minting a project root is a host-local config mutation.
-                    // Connect must not map it as READ_TASK or forward it.
+                    // Config mutations and command-text detail stay host-local.
+                    // Connect must not map them as READ_TASK or forward them.
                     return None;
                 }
+                // GitRepositories / targeted Git status+mutate remain Task
+                // cockpit reads/mutations over READ_TASK; host fence owns paths.
                 Query::TaskCockpit(_) => ActionId::READ_TASK,
             };
             Some((action, envelope.task_id))
@@ -82,6 +88,7 @@ pub fn action_for_client_request(request: &ClientRequest) -> Option<(ActionId, O
                 | Command::CreateTaskV2(_)
                 | Command::RenameTask(_)
                 | Command::SetTaskAttention(_)
+                | Command::SettleTask
                 | Command::BeginCloseTask
                 | Command::ReopenTask
                 | Command::RegisterAgentSession { .. }

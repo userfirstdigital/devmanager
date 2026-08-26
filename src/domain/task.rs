@@ -778,6 +778,7 @@ pub enum WorkspaceChoice {
 #[serde(rename_all = "snake_case")]
 pub enum TaskLifecycle {
     Open,
+    Settled,
     Closing,
     Archived,
 }

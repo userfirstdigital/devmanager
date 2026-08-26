@@ -161,10 +161,33 @@ impl TaskList {
         let ids: Vec<_> = model
             .tasks()
             .iter()
-            .filter(|(_, snapshot)| snapshot.task.lifecycle != TaskLifecycle::Archived)
+            .filter(|(_, snapshot)| {
+                matches!(
+                    snapshot.task.lifecycle,
+                    TaskLifecycle::Open | TaskLifecycle::Closing
+                )
+            })
             .map(|(id, _)| *id)
             .collect();
         Self::from_virtual_task_ids(ids)
+    }
+
+    /// Native T3-style rail order: active tasks first, reversible Done tasks
+    /// last. Archived tasks remain outside the interactive rail.
+    pub fn from_client_model_with_settled_virtual(
+        model: &ClientModel,
+    ) -> Result<Self, TaskListOverflow> {
+        let mut active = Vec::new();
+        let mut settled = Vec::new();
+        for (id, snapshot) in model.tasks() {
+            match snapshot.task.lifecycle {
+                TaskLifecycle::Open | TaskLifecycle::Closing => active.push(*id),
+                TaskLifecycle::Settled => settled.push(*id),
+                TaskLifecycle::Archived => {}
+            }
+        }
+        active.extend(settled);
+        Self::from_virtual_task_ids(active)
     }
 
     pub fn from_task_preview(preview: &TaskInboxPreview) -> Result<Self, TaskListOverflow> {

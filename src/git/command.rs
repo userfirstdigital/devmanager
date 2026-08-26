@@ -564,6 +564,115 @@ pub(crate) fn issue_git_host_binding(
     })
 }
 
+/// Issue Git host binding for a host-resolved configured repository target.
+///
+/// The caller must already hold a revalidated Task workspace authorization and
+/// Git resource lease. The configured root/folder is identity-pinned and
+/// revalidated here before open; clients never supply the path.
+pub(crate) fn issue_configured_repository_git_host_binding(
+    authorization: &crate::workspace::WorkspaceAuthorization,
+    lease: crate::workspace::WorkspaceResourceLease,
+    task_id: crate::domain::TaskId,
+    project_id: crate::domain::ProjectId,
+    client_id: crate::domain::ClientId,
+    connection_id: Uuid,
+    request_id: crate::domain::RequestId,
+    command_id: crate::domain::CommandId,
+    workspace: &crate::domain::task::WorkspaceRef,
+    action_epoch: u64,
+    runtime_generation: u64,
+    configured_path: &Path,
+    configured_identity: &str,
+) -> Result<GitHostBinding, GitError> {
+    if lease.resource() != crate::workspace::WorkspaceResource::Git {
+        return Err(GitError::AuthorityUnavailable);
+    }
+    lease
+        .ensure_active()
+        .map_err(|_| GitError::AuthorityUnavailable)?;
+    // Revalidate the exact Task workspace authorization/fences first. Configured
+    // repository targeting is derived only after that succeeds.
+    let _binding = authorization
+        .validated_binding(
+            task_id,
+            project_id,
+            client_id,
+            connection_id,
+            request_id,
+            command_id,
+            workspace,
+            action_epoch,
+            runtime_generation,
+        )
+        .ok_or(GitError::AuthorityUnavailable)?;
+    let validated = crate::workspace::service::validate_host_workspace_path(configured_path, true)
+        .map_err(|reason| GitError::InvalidRepositoryRoot {
+            path: "<configured-root>".to_string(),
+            reason: reason.to_string(),
+        })?;
+    if validated.identity != configured_identity {
+        return Err(GitError::InvalidRepositoryRoot {
+            path: "<configured-root>".to_string(),
+            reason: "configured repository identity changed".to_string(),
+        });
+    }
+    let root = RepositoryRoot::open_with_approved_external_roots(validated.path.as_path(), &[])
+        .map_err(|reason| GitError::InvalidRepositoryRoot {
+            path: "<configured-root>".to_string(),
+            reason,
+        })?;
+    // Identity pin immediately before open: reject replacement races.
+    let revalidated =
+        crate::workspace::service::validate_host_workspace_path(root.path.as_path(), true)
+            .map_err(|reason| GitError::InvalidRepositoryRoot {
+                path: "<configured-root>".to_string(),
+                reason: reason.to_string(),
+            })?;
+    if revalidated.identity != configured_identity {
+        return Err(GitError::InvalidRepositoryRoot {
+            path: "<configured-root>".to_string(),
+            reason: "configured repository identity changed before open".to_string(),
+        });
+    }
+    let repository_identity = repository_graph_identity(&root);
+    let repository_static_identity = repository_static_graph_identity(&root);
+    let workspace_identity = WorkspaceIdentity::from_canonical_root(root.path.clone());
+    let identity = AuthorityIdentity {
+        task_id: task_id.to_string(),
+        workspace: workspace_identity,
+        repository_static_identity: repository_static_identity.clone(),
+        controller_id: client_id.to_string(),
+        connection_id: connection_id.to_string(),
+        request_id: request_id.to_string(),
+        command_id: command_id.to_string(),
+        action_epoch,
+        runtime_generation,
+    };
+    let state = Arc::new(AuthorityState::new(identity.clone()));
+    Ok(GitHostBinding {
+        capability: Arc::new(GitAuthorityCapability {
+            workspace_authorization: WorkspaceAuthorization(Arc::clone(&state)),
+            resource_lease: ResourceLease(Arc::clone(&state)),
+            controller: ControllerHandle(Arc::clone(&state)),
+            connection: ConnectionHandle(Arc::clone(&state)),
+            action_generation: ActionGeneration {
+                current: Arc::new(AtomicU64::new(action_epoch.max(1))),
+                issued: action_epoch.max(1),
+            },
+            identity,
+            bound_root: root.clone(),
+            root_handle: Arc::clone(&root.handle),
+            graph_handles: Arc::clone(&root.pinned_handles),
+            repository_identity: Arc::new(Mutex::new(repository_identity)),
+            repository_static_identity,
+            authority_deadline: Instant::now() + HOST_AUTHORITY_LIFETIME,
+            forced_expiry: Arc::new(AtomicBool::new(false)),
+            limits: GitLimits::default(),
+            workspace_resource_lease: Some(Arc::new(lease)),
+        }),
+    })
+}
+
 /// A single operation permit is deliberately non-Clone.  It is created by the
 /// eventual Workspace/Config issuer (the only current issuers are the
 /// test-only fixtures) and carries the exact operation, plan digest, endpoint,

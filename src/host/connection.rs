@@ -1067,6 +1067,13 @@ enum ExecutorControl {
     SealUpdateAfterDurableStage {
         ack: oneshot::Sender<Result<(), String>>,
     },
+    /// Typed in-process handoff of the UI-owned BrowserGatewayRegistrar into
+    /// the host ProcessManager. Sibling-process hosts cannot share this Arc;
+    /// they leave the registrar unset and browser tools fail visibly.
+    SetBrowserGatewayRegistrar {
+        registrar: Option<crate::browser::BrowserGatewayRegistrar>,
+        ack: oneshot::Sender<()>,
+    },
     #[cfg(test)]
     InspectOutput {
         id: ConnectionOutputId,
@@ -1705,6 +1712,24 @@ impl crate::updater::HostUpdateControlPort for HostRequestHandle {
 }
 
 impl HostRequestHandle {
+    /// In-process handoff of the UI BrowserGatewayRegistrar into the host
+    /// ProcessManager. No-op when the executor has no configured service runtime.
+    pub fn set_browser_gateway_registrar(
+        &self,
+        registrar: Option<crate::browser::BrowserGatewayRegistrar>,
+    ) -> Result<(), String> {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        self.control_tx
+            .try_send(ExecutorControl::SetBrowserGatewayRegistrar {
+                registrar,
+                ack: ack_tx,
+            })
+            .map_err(|_| "browser gateway registrar handoff queue is unavailable".to_string())?;
+        ack_rx
+            .blocking_recv()
+            .map_err(|_| "browser gateway registrar handoff was cancelled".to_string())
+    }
+
     /// Register dual-lane output for live durable delivery on this connection.
     ///
     /// The returned registration guard is armed before the send/await window so
@@ -2201,6 +2226,197 @@ impl HostWorkspaceAdmission {
                 reason: "config_create",
             }),
         }
+    }
+
+    fn apply_project_action_outcome(&mut self, query: &TaskCockpitQuery) -> QueryOutcome {
+        match self.apply_project_action(query) {
+            Ok(()) => QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Config(
+                super::cockpit::config_sidebar_snapshot(&self.store.snapshot().config),
+            ))),
+            Err(error) if error.kind() == ConfigErrorKind::Validation => {
+                QueryOutcome::Err(QueryError::InvalidRequest)
+            }
+            Err(_) => QueryOutcome::Err(QueryError::Unavailable {
+                reason: "config_mutate",
+            }),
+        }
+    }
+
+    fn apply_project_action(&mut self, query: &TaskCockpitQuery) -> Result<(), ConfigError> {
+        let revision = self.store.snapshot().revision;
+        match query {
+            TaskCockpitQuery::ConfigUpsertCommand {
+                project_id,
+                folder_id,
+                command_id,
+                label,
+                command,
+            } => {
+                let label = label.trim();
+                let command_text = command.trim();
+                if label.is_empty() || command_text.is_empty() {
+                    return Err(ConfigError::new(
+                        ConfigErrorKind::Validation,
+                        "project action requires a name and command",
+                    ));
+                }
+                let config = self.store.snapshot().config.clone();
+                let project = config
+                    .projects
+                    .iter()
+                    .find(|project| project.id == *project_id)
+                    .ok_or_else(|| {
+                        ConfigError::new(ConfigErrorKind::Validation, "project is unavailable")
+                    })?;
+                let resolved_folder_id = if folder_id.trim().is_empty() {
+                    if let Some(existing) = project.folders.iter().find(|folder| {
+                        !matches!(folder.archived, crate::config::Nullable::Value(true))
+                    }) {
+                        existing.id.clone()
+                    } else {
+                        let folder = crate::config::ProjectFolder {
+                            id: format!("folder-{}", Uuid::now_v7()),
+                            name: "Default".to_string(),
+                            folder_path: ".".to_string(),
+                            commands: Vec::new(),
+                            env_file_path: crate::config::Nullable::Null,
+                            port_variable: crate::config::Nullable::Null,
+                            hidden: crate::config::Nullable::Null,
+                            archived: crate::config::Nullable::Null,
+                            extra: Default::default(),
+                        };
+                        let created_id = folder.id.clone();
+                        self.store.execute(
+                            revision,
+                            ConfigCommand::CreateFolder {
+                                project_id: project_id.clone(),
+                                folder,
+                            },
+                        )?;
+                        created_id
+                    }
+                } else {
+                    folder_id.clone()
+                };
+                let revision = self.store.snapshot().revision;
+                let config = self.store.snapshot().config.clone();
+                let project = config
+                    .projects
+                    .iter()
+                    .find(|project| project.id == *project_id)
+                    .ok_or_else(|| {
+                        ConfigError::new(ConfigErrorKind::Validation, "project is unavailable")
+                    })?;
+                let folder = project
+                    .folders
+                    .iter()
+                    .find(|folder| folder.id == resolved_folder_id)
+                    .ok_or_else(|| {
+                        ConfigError::new(
+                            ConfigErrorKind::Validation,
+                            "project folder is unavailable",
+                        )
+                    })?;
+                if let Some(existing_id) = command_id.as_ref() {
+                    let existing = folder
+                        .commands
+                        .iter()
+                        .find(|entry| entry.id == *existing_id)
+                        .cloned()
+                        .ok_or_else(|| {
+                            ConfigError::new(ConfigErrorKind::Validation, "action is unavailable")
+                        })?;
+                    let mut updated = existing;
+                    updated.label = label.to_string();
+                    updated.command = command_text.to_string();
+                    self.store.execute(
+                        revision,
+                        ConfigCommand::UpdateCommand {
+                            project_id: project_id.clone(),
+                            folder_id: resolved_folder_id.clone(),
+                            command: updated,
+                        },
+                    )?;
+                } else {
+                    let timestamp = SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .map(|duration| duration.as_secs().to_string())
+                        .unwrap_or_else(|_| "0".to_string());
+                    let created = crate::config::RunCommand {
+                        id: format!("command-{}", Uuid::now_v7()),
+                        label: label.to_string(),
+                        command: command_text.to_string(),
+                        args: Vec::new(),
+                        env: crate::config::Nullable::Null,
+                        port: crate::config::Nullable::Null,
+                        auto_restart: crate::config::Nullable::Value(false),
+                        clear_logs_on_restart: crate::config::Nullable::Value(false),
+                        archived: crate::config::Nullable::Null,
+                        extra: Default::default(),
+                    };
+                    let _ = timestamp;
+                    self.store.execute(
+                        revision,
+                        ConfigCommand::CreateCommand {
+                            project_id: project_id.clone(),
+                            folder_id: resolved_folder_id,
+                            command: created,
+                        },
+                    )?;
+                }
+            }
+            TaskCockpitQuery::ConfigArchiveCommand {
+                project_id,
+                folder_id,
+                command_id,
+            } => {
+                self.store.execute(
+                    revision,
+                    ConfigCommand::ArchiveCommand {
+                        project_id: project_id.clone(),
+                        folder_id: folder_id.clone(),
+                        command_id: command_id.clone(),
+                    },
+                )?;
+            }
+            TaskCockpitQuery::ConfigRunCommand { .. } => {
+                // Run is admitted as a typed query so the native client can
+                // request it, but process launch remains owned by the service
+                // runtime. Without a bound service runtime this fails closed.
+                return Err(ConfigError::new(
+                    ConfigErrorKind::Validation,
+                    "project action run requires the host service runtime",
+                ));
+            }
+            _ => {
+                return Err(ConfigError::new(
+                    ConfigErrorKind::Validation,
+                    "unsupported project action",
+                ))
+            }
+        }
+        let revision = self.store.snapshot().revision;
+        let issuer = self.store.issue_workspace_authority(
+            revision,
+            self.issuer.action_epoch(),
+            self.issuer.runtime_generation(),
+        )?;
+        let roots = WorkspaceProjectRoots::from_config_issuer(&issuer).map_err(|_| {
+            ConfigError::new(
+                ConfigErrorKind::Validation,
+                "configured workspace roots are unavailable",
+            )
+        })?;
+        self.issuer = issuer;
+        self.roots = roots;
+        self.ssh_runtime = HostSshRuntime::new(
+            self.store.snapshot().config.clone(),
+            self.store
+                .path()
+                .parent()
+                .map(|parent| parent.join("ssh-keys")),
+        );
+        Ok(())
     }
 }
 
@@ -2855,6 +3071,12 @@ impl HostRequestExecutor {
                     .map_err(|error| error.to_string());
                 let _ = ack.send(result);
             }
+            ExecutorControl::SetBrowserGatewayRegistrar { registrar, ack } => {
+                if let Some(runtime) = self.configured_service_runtime.as_ref() {
+                    runtime.manager.set_browser_gateway_registrar(registrar);
+                }
+                let _ = ack.send(());
+            }
             #[cfg(test)]
             ExecutorControl::InspectOutput { id, ack } => {
                 let registered = self.outputs.contains_key(&id);
@@ -3307,6 +3529,9 @@ impl HostRequestExecutor {
                     let _ = ack.send(Err(
                         "update handoff rejected after quit intake quiesce".into()
                     ));
+                }
+                ExecutorControl::SetBrowserGatewayRegistrar { ack, .. } => {
+                    let _ = ack.send(());
                 }
                 #[cfg(test)]
                 ExecutorControl::InspectOutput { ack, .. } => {
@@ -4448,6 +4673,29 @@ impl HostRequestExecutor {
                             }
                             outcome
                         }
+                        None => QueryOutcome::Err(QueryError::Unavailable {
+                            reason: "config_store",
+                        }),
+                    };
+                    return Ok(QueryReply {
+                        request_id: envelope.request_id,
+                        outcome,
+                    });
+                }
+                if matches!(
+                    &query,
+                    TaskCockpitQuery::ConfigUpsertCommand { .. }
+                        | TaskCockpitQuery::ConfigArchiveCommand { .. }
+                        | TaskCockpitQuery::ConfigRunCommand { .. }
+                ) {
+                    if !negotiated.capabilities.grants_task_cockpit() {
+                        return Ok(QueryReply {
+                            request_id: envelope.request_id,
+                            outcome: QueryOutcome::Err(QueryError::UnsupportedCapability),
+                        });
+                    }
+                    let outcome = match self.config_admission.as_mut() {
+                        Some(admission) => admission.apply_project_action_outcome(&query),
                         None => QueryOutcome::Err(QueryError::Unavailable {
                             reason: "config_store",
                         }),

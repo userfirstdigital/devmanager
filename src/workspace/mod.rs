@@ -2,6 +2,7 @@ mod artifacts;
 pub mod checkpoint;
 pub mod files;
 pub mod model;
+pub(crate) mod repository_targets;
 pub mod service;
 pub mod worktree;
 

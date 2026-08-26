@@ -482,10 +482,14 @@ impl TaskProjectionIndex {
                 .expect("entry from index")
                 .clone();
             let key = TaskOrderKey::new(task_id, &entry);
-            if entry.lifecycle == TaskLifecycle::Archived {
-                index.archived_order.insert(key);
-            } else {
-                index.active_order.insert(key);
+            match entry.lifecycle {
+                TaskLifecycle::Open | TaskLifecycle::Closing => {
+                    index.active_order.insert(key);
+                }
+                TaskLifecycle::Settled => continue,
+                TaskLifecycle::Archived => {
+                    index.archived_order.insert(key);
+                }
             }
             index.insert_search_scalar_totals(&entry);
             index.insert_search_tokens(task_id, &entry);
@@ -909,13 +913,19 @@ impl TaskProjectionIndex {
         let task_id = snapshot.task.id;
         self.remove_task_id(task_id);
         let entry = TaskProjectionEntry::from_snapshot(snapshot, occurred_at_ms);
-        let archived = entry.lifecycle == TaskLifecycle::Archived;
         let key = TaskOrderKey::new(task_id, &entry);
         self.entries.insert(task_id, entry);
-        if archived {
-            self.archived_order.insert(key.clone());
-        } else {
-            self.active_order.insert(key.clone());
+        match self.entries[&task_id].lifecycle {
+            TaskLifecycle::Open | TaskLifecycle::Closing => {
+                self.active_order.insert(key.clone());
+            }
+            TaskLifecycle::Settled => {
+                self.incremental_updates = self.incremental_updates.saturating_add(1);
+                return;
+            }
+            TaskLifecycle::Archived => {
+                self.archived_order.insert(key.clone());
+            }
         }
         let entry = self
             .entries
@@ -929,10 +939,13 @@ impl TaskProjectionIndex {
 
     fn remove_task_id(&mut self, task_id: TaskId) {
         if let Some(entry) = self.entries.remove(&task_id) {
-            self.remove_search_scalar_totals(&entry);
             let key = TaskOrderKey::new(task_id, &entry);
             self.active_order.remove(&key);
             self.archived_order.remove(&key);
+            if entry.lifecycle == TaskLifecycle::Settled {
+                return;
+            }
+            self.remove_search_scalar_totals(&entry);
             for token in search_tokens(&entry.lower_title) {
                 let mut empty = false;
                 if let Some(posting) = self.search.get_mut(&token) {

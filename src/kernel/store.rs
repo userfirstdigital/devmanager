@@ -1434,6 +1434,7 @@ pub(crate) fn encode_event_payload(event: &Event) -> Result<Vec<u8>, StoreError>
         Event::TaskCloseBegun { action_epoch } => rmp_serde::to_vec(&TaskCloseBegunPayload {
             action_epoch: *action_epoch,
         }),
+        Event::TaskSettled => rmp_serde::to_vec(&TaskUnitPayload {}),
         Event::TaskReopened => rmp_serde::to_vec(&TaskUnitPayload {}),
         Event::TaskArchived => rmp_serde::to_vec(&TaskUnitPayload {}),
         Event::AgentSessionRegistered { agent } => {
@@ -1710,6 +1711,10 @@ pub(crate) fn decode_stored_event(
             Event::TaskCloseBegun {
                 action_epoch: p.action_epoch,
             }
+        }
+        "task.settled" => {
+            let _: TaskUnitPayload = unpack(payload)?;
+            Event::TaskSettled
         }
         "task.reopened" => {
             let _: TaskUnitPayload = unpack(payload)?;

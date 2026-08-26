@@ -11146,6 +11146,7 @@ mod tests {
                         hidden: false,
                         has_hyperlink: false,
                         default_background: true,
+                        default_foreground: false,
                     })
                     .collect()
             })
@@ -13153,6 +13154,7 @@ mod tests {
                     hidden: false,
                     has_hyperlink: false,
                     default_background: true,
+                    default_foreground: false,
                 })
                 .collect()];
             snapshot.rows = 1;
@@ -13229,6 +13231,7 @@ mod tests {
                     hidden: false,
                     has_hyperlink: false,
                     default_background: true,
+                    default_foreground: false,
                 })
                 .collect()];
             snapshot.rows = 1;

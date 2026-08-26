@@ -1004,6 +1004,7 @@ pub enum Event {
     TaskCloseBegun {
         action_epoch: u64,
     },
+    TaskSettled,
     TaskReopened,
     TaskArchived,
     AgentSessionRegistered {
@@ -1137,6 +1138,7 @@ impl Event {
             Self::TaskRenamed { .. } => "task.renamed",
             Self::TaskAttentionSet { .. } => "task.attention_set",
             Self::TaskCloseBegun { .. } => "task.close_begun",
+            Self::TaskSettled => "task.settled",
             Self::TaskReopened => "task.reopened",
             Self::TaskArchived => "task.archived",
             Self::AgentSessionRegistered { .. } => "agent_session.registered",
@@ -1192,6 +1194,8 @@ enum EventBody {
     TaskAttentionSet(TaskAttentionSetPayload),
     #[serde(rename = "task.close_begun")]
     TaskCloseBegun(TaskCloseBegunPayload),
+    #[serde(rename = "task.settled")]
+    TaskSettled(TaskUnitPayload),
     #[serde(rename = "task.reopened")]
     TaskReopened(TaskUnitPayload),
     #[serde(rename = "task.archived")]
@@ -1282,6 +1286,7 @@ impl From<&Event> for EventDocument {
                     action_epoch: *action_epoch,
                 })
             }
+            Event::TaskSettled => EventBody::TaskSettled(TaskUnitPayload {}),
             Event::TaskReopened => EventBody::TaskReopened(TaskUnitPayload {}),
             Event::TaskArchived => EventBody::TaskArchived(TaskUnitPayload {}),
             Event::AgentSessionRegistered { agent } => {
@@ -1548,6 +1553,7 @@ impl TryFrom<EventDocument> for Event {
             EventBody::TaskCloseBegun(p) => Event::TaskCloseBegun {
                 action_epoch: p.action_epoch,
             },
+            EventBody::TaskSettled(_) => Event::TaskSettled,
             EventBody::TaskReopened(_) => Event::TaskReopened,
             EventBody::TaskArchived(_) => Event::TaskArchived,
             EventBody::AgentSessionRegistered(p) => {
@@ -2159,7 +2165,10 @@ fn apply_into(
             snap.attention = *attention;
         }
         Event::TaskCloseBegun { action_epoch } => {
-            if snap.task.lifecycle != TaskLifecycle::Open {
+            if !matches!(
+                snap.task.lifecycle,
+                TaskLifecycle::Open | TaskLifecycle::Settled
+            ) {
                 return Err(ApplyError::InvalidTransition);
             }
             let expected = snap
@@ -2176,9 +2185,15 @@ fn apply_into(
                 .close_task(snap.task.id)
                 .map_err(apply_browser_error)?;
         }
+        Event::TaskSettled => {
+            if snap.task.lifecycle != TaskLifecycle::Open {
+                return Err(ApplyError::InvalidTransition);
+            }
+            snap.task.lifecycle = TaskLifecycle::Settled;
+        }
         Event::TaskReopened => {
             match snap.task.lifecycle {
-                TaskLifecycle::Closing | TaskLifecycle::Archived => {}
+                TaskLifecycle::Settled | TaskLifecycle::Closing | TaskLifecycle::Archived => {}
                 TaskLifecycle::Open => return Err(ApplyError::InvalidTransition),
             }
             snap.task.lifecycle = TaskLifecycle::Open;
@@ -2547,6 +2562,11 @@ fn apply_into(
                 current_turn,
                 false,
             )?;
+            if snap.task.lifecycle == TaskLifecycle::Settled
+                && matches!(action, ProviderInputAction::SendNow { .. })
+            {
+                snap.task.lifecycle = TaskLifecycle::Open;
+            }
             let session = snap.provider_sessions.entry(*agent_session_id).or_default();
             match action {
                 ProviderInputAction::AnswerQuestion { question_id, .. } => {

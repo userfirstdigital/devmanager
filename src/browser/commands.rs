@@ -2976,6 +2976,30 @@ impl BrowserCommandInbox {
         None
     }
 
+    /// Non-blocking drain used by the native shell GPUI tick when no async
+    /// window spawn owns the inbox yet.
+    pub fn try_recv(&mut self) -> Option<BrowserCommandRequest> {
+        while let Ok(envelope) = self.receiver.try_recv() {
+            if self.cancellations.is_current(
+                &envelope.workspace_key,
+                envelope.command.tab_id(),
+                envelope.cancellation_ticket,
+            ) && registration_ticket_is_current(
+                envelope.registration_lease.as_ref(),
+                envelope.cancellation_ticket.registration,
+            ) {
+                return Some(BrowserCommandRequest::from_envelope(
+                    envelope,
+                    Arc::clone(&self.cancellations),
+                    Arc::clone(&self.response_linearization),
+                    self.replay_coordinator.clone(),
+                ));
+            }
+            let _ = envelope.response.send(Err(BrowserError::Interrupted));
+        }
+        None
+    }
+
     pub fn pending_work_count(&self) -> usize {
         self.pending_work.count()
     }

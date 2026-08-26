@@ -293,6 +293,35 @@ fn closing_advances_action_epoch() {
 }
 
 #[test]
+fn settling_is_reversible_without_advancing_runtime_ownership() {
+    let task = task_id(0xd1);
+    let snap = create_task(None, task, 1, 0xd2);
+    let original_epoch = snap.task.action_epoch;
+
+    let settle = envelope(
+        command_id(0xd3),
+        Some(task),
+        Some(snap.task.revision),
+        Command::SettleTask,
+    );
+    let settled =
+        apply_decided(Some(snap), &settle, 2, 0xd4, 1_725_000_000_221).expect("settle task");
+    assert_eq!(settled.task.lifecycle, TaskLifecycle::Settled);
+    assert_eq!(settled.task.action_epoch, original_epoch);
+
+    let reopen = envelope(
+        command_id(0xd5),
+        Some(task),
+        Some(settled.task.revision),
+        Command::ReopenTask,
+    );
+    let reopened = apply_decided(Some(settled), &reopen, 3, 0xd6, 1_725_000_000_222)
+        .expect("restore settled task");
+    assert_eq!(reopened.task.lifecycle, TaskLifecycle::Open);
+    assert_eq!(reopened.task.action_epoch, original_epoch);
+}
+
+#[test]
 fn apply_rejects_stale_skipped_and_mismatched_task_revision() {
     let task = task_id(0xb5);
     let snap = create_task(None, task, 1, 0xb6);

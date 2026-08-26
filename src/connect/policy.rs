@@ -1429,6 +1429,7 @@ fn canonical_command_action(command: &Command) -> Option<ActionId> {
     match command {
         Command::RenameTask(_)
         | Command::SetTaskAttention(_)
+        | Command::SettleTask
         | Command::BeginCloseTask
         | Command::ReopenTask
         | Command::RegisterAgentSession { .. }

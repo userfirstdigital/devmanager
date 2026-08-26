@@ -8,15 +8,29 @@ use gpui::{App, Global};
 
 pub mod actions;
 pub mod agent_connection;
+pub mod browser_dock_lifecycle;
+pub mod browser_gateway_identity;
 pub mod components;
 pub mod conversation;
+pub mod header_actions;
+#[path = "composer/mod.rs"]
+pub mod native_composer;
 pub mod native_shell;
+#[cfg(test)]
+mod native_ux_behavior_tests;
 pub mod preview;
 pub mod preview_capture;
+pub mod project_actions;
+pub mod project_scope;
+pub mod provider_catalog;
+pub mod provider_catalog_contract;
+pub mod provider_catalog_seeds;
 pub mod renderers;
 pub mod shell;
 pub mod task_cockpit;
+pub mod task_search;
 pub mod terminal_adapter;
+pub mod theme_system;
 pub mod tokens;
 pub mod workspace_layout;
 

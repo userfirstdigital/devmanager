@@ -8,6 +8,7 @@ use crate::terminal::session::{
     TerminalCellSnapshot, TerminalCursorSnapshot, TerminalIndexedCellSnapshot, TerminalSessionView,
 };
 use crate::theme;
+use crate::ui::tokens::ThemeTokens;
 use alacritty_terminal::vte::ansi::CursorShape;
 use gpui::{
     canvas, div, fill, img, point, px, rgb, size, AnyElement, App, Bounds, Hsla, ImageSource,
@@ -26,6 +27,107 @@ pub const TERMINAL_SCROLLBAR_MIN_THUMB_HEIGHT_PX: f32 = 18.0;
 
 pub fn terminal_line_height(font_size: f32) -> f32 {
     (font_size + 5.0).max(TERMINAL_LINE_HEIGHT)
+}
+
+/// Explicit Copy palette for terminal chrome and default cell named colors.
+/// Built from [`ThemeTokens`] for live themed paint, or from legacy theme
+/// constants for the default wrapper used by older callers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalRenderPalette {
+    pub canvas: u32,
+    pub panel: u32,
+    pub panel_header: u32,
+    pub row: u32,
+    pub row_hover: u32,
+    pub button_hover: u32,
+    pub border: u32,
+    pub text_primary: u32,
+    pub text_muted: u32,
+    pub text_subtle: u32,
+    pub text_dim: u32,
+    pub selection_bg: u32,
+    pub selection_text: u32,
+    pub primary: u32,
+    pub primary_muted: u32,
+    pub danger: u32,
+    pub danger_bg: u32,
+    pub warning: u32,
+    pub success: u32,
+    pub terminal_bg: u32,
+    pub terminal_fg: u32,
+    pub terminal_cursor: u32,
+    pub terminal_selection: u32,
+    pub scrollbar_track: u32,
+    pub scrollbar_thumb: u32,
+}
+
+impl TerminalRenderPalette {
+    /// Map every chrome / named default color from the caller's active tokens.
+    pub fn from_tokens(tokens: ThemeTokens) -> Self {
+        Self {
+            canvas: tokens.surfaces.canvas.to_u32(),
+            panel: tokens.surfaces.sunken.to_u32(),
+            panel_header: tokens.surfaces.raised.to_u32(),
+            row: tokens.surfaces.overlay.to_u32(),
+            row_hover: tokens.surfaces.hover.to_u32(),
+            button_hover: tokens.surfaces.hover.to_u32(),
+            border: tokens.borders.default.to_u32(),
+            text_primary: tokens.text.primary.to_u32(),
+            text_muted: tokens.text.muted.to_u32(),
+            text_subtle: tokens.text.disabled.to_u32(),
+            text_dim: tokens.text.disabled.to_u32(),
+            selection_bg: tokens.terminal.selection.to_u32(),
+            selection_text: tokens.text.on_selection.to_u32(),
+            primary: tokens.actions.primary.default.background.to_u32(),
+            primary_muted: tokens.actions.primary.selected.background.to_u32(),
+            danger: tokens.status.destructive.to_u32(),
+            danger_bg: tokens.status.destructive_surface.to_u32(),
+            warning: tokens.status.warning.to_u32(),
+            success: tokens.status.success.to_u32(),
+            terminal_bg: tokens.terminal.background.to_u32(),
+            terminal_fg: tokens.terminal.foreground.to_u32(),
+            terminal_cursor: tokens.terminal.cursor.to_u32(),
+            terminal_selection: tokens.terminal.selection.to_u32(),
+            scrollbar_track: tokens.surfaces.raised.to_u32(),
+            scrollbar_thumb: tokens.text.muted.to_u32(),
+        }
+    }
+
+    /// Preserve the pre-token hard-coded visual defaults for legacy callers.
+    pub fn legacy_default() -> Self {
+        Self {
+            canvas: theme::APP_BG,
+            panel: theme::PANEL_BG,
+            panel_header: theme::PANEL_HEADER_BG,
+            row: theme::PROJECT_ROW_BG,
+            row_hover: theme::ROW_HOVER_BG,
+            button_hover: theme::BUTTON_HOVER_BG,
+            border: theme::BORDER_PRIMARY,
+            text_primary: theme::TEXT_PRIMARY,
+            text_muted: theme::TEXT_MUTED,
+            text_subtle: theme::TEXT_SUBTLE,
+            text_dim: theme::TEXT_DIM,
+            selection_bg: theme::SELECTION_BG,
+            selection_text: theme::SELECTION_TEXT,
+            primary: theme::PRIMARY,
+            primary_muted: theme::PRIMARY_MUTED,
+            danger: theme::DANGER_TEXT,
+            danger_bg: theme::DANGER_BG_SUBTLE,
+            warning: theme::WARNING_TEXT,
+            success: theme::SUCCESS_TEXT,
+            terminal_bg: theme::TERMINAL_BG,
+            terminal_fg: theme::TEXT_PRIMARY,
+            terminal_cursor: theme::SUCCESS_TEXT,
+            terminal_selection: theme::SELECTION_BG,
+            scrollbar_track: theme::PANEL_HEADER_BG,
+            scrollbar_thumb: theme::TEXT_DIM,
+        }
+    }
+}
+
+/// Public mapping seam used by themed render entrypoints and contract tests.
+pub fn terminal_render_palette_from_tokens(tokens: ThemeTokens) -> TerminalRenderPalette {
+    TerminalRenderPalette::from_tokens(tokens)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -293,6 +395,23 @@ pub fn render_terminal_surface(
     model: &TerminalPaneModel,
     actions: Option<TerminalPaneActions>,
 ) -> impl IntoElement {
+    render_terminal_surface_with_palette(model, actions, TerminalRenderPalette::legacy_default())
+}
+
+/// Themed terminal surface: every non-ANSI chrome color comes from `tokens`.
+pub fn render_terminal_surface_with_tokens(
+    model: &TerminalPaneModel,
+    actions: Option<TerminalPaneActions>,
+    tokens: ThemeTokens,
+) -> impl IntoElement {
+    render_terminal_surface_with_palette(model, actions, TerminalRenderPalette::from_tokens(tokens))
+}
+
+fn render_terminal_surface_with_palette(
+    model: &TerminalPaneModel,
+    actions: Option<TerminalPaneActions>,
+    palette: TerminalRenderPalette,
+) -> impl IntoElement {
     let mut actions = actions;
     let actionable_notice_action = actions
         .as_mut()
@@ -318,16 +437,16 @@ pub fn render_terminal_surface(
             div()
                 .px_2()
                 .py_1()
-                .bg(rgb(theme::PANEL_HEADER_BG))
+                .bg(rgb(palette.panel_header))
                 .text_xs()
-                .text_color(rgb(theme::TEXT_MUTED))
+                .text_color(rgb(palette.text_muted))
                 .child(SharedString::from(message.clone()))
         })
     };
     let actionable_banner = model
         .actionable_notice
         .as_ref()
-        .map(|banner| render_actionable_notice(banner, actionable_notice_action));
+        .map(|banner| render_actionable_notice(banner, actionable_notice_action, palette));
     let blocking_notice = model.blocking_notice.as_ref().map(|message| {
         div()
             .mx_2()
@@ -335,14 +454,14 @@ pub fn render_terminal_surface(
             .py_2()
             .border_t_1()
             .border_b_1()
-            .border_color(rgb(theme::BORDER_PRIMARY))
+            .border_color(rgb(palette.border))
             .flex()
             .items_center()
             .justify_center()
             .child(
                 div()
                     .text_sm()
-                    .text_color(rgb(theme::TEXT_MUTED))
+                    .text_color(rgb(palette.text_muted))
                     .child(SharedString::from(message.clone())),
             )
     });
@@ -359,8 +478,8 @@ pub fn render_terminal_surface(
     let status_color = model
         .session
         .as_ref()
-        .map(session_status_color)
-        .unwrap_or(theme::TEXT_MUTED);
+        .map(|session| session_status_color(session, palette))
+        .unwrap_or(palette.text_muted);
     let session_title = model
         .session
         .as_ref()
@@ -393,9 +512,9 @@ pub fn render_terminal_surface(
             div()
                 .px_2()
                 .py_1()
-                .bg(rgb(theme::PROJECT_ROW_BG))
+                .bg(rgb(palette.row))
                 .text_xs()
-                .text_color(rgb(theme::TEXT_MUTED))
+                .text_color(rgb(palette.text_muted))
                 .child(SharedString::from(exit.summary.clone()))
         });
     let terminal_body: AnyElement = if let Some(session) = model.session.as_ref() {
@@ -408,11 +527,16 @@ pub fn render_terminal_surface(
             model.font_size,
             model.cell_width,
             model.line_height,
+            palette,
         )
         .into_any_element()
     } else {
-        render_empty_body(empty_surface_message(model), model.splash_image.clone())
-            .into_any_element()
+        render_empty_body(
+            empty_surface_message(model),
+            model.splash_image.clone(),
+            palette,
+        )
+        .into_any_element()
     };
 
     div()
@@ -420,7 +544,7 @@ pub fn render_terminal_surface(
         .h_full()
         .flex()
         .flex_col()
-        .bg(rgb(theme::APP_BG))
+        .bg(rgb(palette.canvas))
         .child(
             div()
                 .h(px(22.0))
@@ -429,16 +553,16 @@ pub fn render_terminal_surface(
                 .items_center()
                 .justify_between()
                 .px(px(6.0))
-                .bg(rgb(theme::TOPBAR_BG))
+                .bg(rgb(palette.panel_header))
                 .border_b_1()
-                .border_color(rgb(theme::BORDER_PRIMARY))
+                .border_color(rgb(palette.border))
                 .overflow_hidden()
                 .child(
                     div()
                         .flex_shrink_0()
                         .text_xs()
                         .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .text_color(rgb(theme::TEXT_PRIMARY))
+                        .text_color(rgb(palette.text_primary))
                         .child(SharedString::from(header_title)),
                 )
                 .child(
@@ -458,14 +582,14 @@ pub fn render_terminal_surface(
                                         .text_color(rgb(runtime_controls
                                             .as_ref()
                                             .map(|controls| controls.port_color)
-                                            .unwrap_or(theme::TEXT_DIM)))
+                                            .unwrap_or(palette.text_dim)))
                                         .child(SharedString::from(detail.clone()))
                                 }),
                         )
                         .children(header_detail.map(|detail| {
                             div()
                                 .text_xs()
-                                .text_color(rgb(theme::TEXT_DIM))
+                                .text_color(rgb(palette.text_dim))
                                 .overflow_hidden()
                                 .whitespace_nowrap()
                                 .child(SharedString::from(detail))
@@ -481,7 +605,7 @@ pub fn render_terminal_surface(
                             div()
                                 .flex_shrink_0()
                                 .text_xs()
-                                .text_color(rgb(theme::TEXT_DIM))
+                                .text_color(rgb(palette.text_dim))
                                 .child(SharedString::from(format!(
                                     "font {}",
                                     model.font_size.round() as u32
@@ -489,13 +613,14 @@ pub fn render_terminal_surface(
                         ),
                 )
                 .children(open_browser_action.map(|on_click| {
-                    runtime_action_button("Browser", theme::PRIMARY, on_click).into_any_element()
+                    runtime_action_button("Browser", palette.primary, on_click, palette)
+                        .into_any_element()
                 }))
                 .children(
                     actions
                         .zip(runtime_controls.clone())
                         .map(|(actions, controls)| {
-                            render_runtime_actions(actions, controls).into_any_element()
+                            render_runtime_actions(actions, controls, palette).into_any_element()
                         }),
                 ),
         )
@@ -506,7 +631,7 @@ pub fn render_terminal_surface(
                     .flex()
                     .flex_col()
                     .gap(px(2.0))
-                    .bg(rgb(theme::TERMINAL_BG))
+                    .bg(rgb(palette.terminal_bg))
                     .children(notice)
                     .children(actionable_banner)
                     .children(blocking_notice)
@@ -514,8 +639,14 @@ pub fn render_terminal_surface(
                         &model.pending_annotations,
                         preview_annotation_action,
                         remove_annotation_action,
+                        palette,
                     ))
-                    .children(model.search.as_ref().map(render_search_bar))
+                    .children(
+                        model
+                            .search
+                            .as_ref()
+                            .map(|search| render_search_bar(search, palette)),
+                    )
                     .children(exit_banner)
                     .child(terminal_body)
                     .children(model.debug_enabled.then(|| {
@@ -523,7 +654,7 @@ pub fn render_terminal_surface(
                             .px_2()
                             .pb_1()
                             .text_xs()
-                            .text_color(rgb(theme::TEXT_SUBTLE))
+                            .text_color(rgb(palette.text_subtle))
                             .child(SharedString::from(
                                 metrics.unwrap_or_else(|| "No metrics yet".to_string()),
                             ))
@@ -536,6 +667,7 @@ fn render_pending_annotation_chips(
     models: &[PendingAnnotationChipModel],
     preview: Option<PendingAnnotationActionHandler>,
     remove: Option<PendingAnnotationActionHandler>,
+    palette: TerminalRenderPalette,
 ) -> Option<AnyElement> {
     (!models.is_empty()).then(|| {
         div()
@@ -543,9 +675,9 @@ fn render_pending_annotation_chips(
             .mt_1()
             .px_2()
             .py_1()
-            .bg(rgb(theme::PANEL_HEADER_BG))
+            .bg(rgb(palette.panel_header))
             .border_1()
-            .border_color(rgb(theme::BORDER_PRIMARY))
+            .border_color(rgb(palette.border))
             .rounded_sm()
             .flex()
             .items_center()
@@ -555,7 +687,7 @@ fn render_pending_annotation_chips(
                 div()
                     .flex_shrink_0()
                     .text_xs()
-                    .text_color(rgb(theme::TEXT_SUBTLE))
+                    .text_color(rgb(palette.text_subtle))
                     .child("Pending"),
             )
             .children(models.iter().cloned().map(|model| {
@@ -567,13 +699,13 @@ fn render_pending_annotation_chips(
                     .rounded_sm()
                     .border_1()
                     .border_color(rgb(if model.stale {
-                        theme::WARNING_TEXT
+                        palette.warning
                     } else {
-                        theme::BORDER_PRIMARY
+                        palette.border
                     }))
-                    .bg(rgb(theme::PROJECT_ROW_BG))
+                    .bg(rgb(palette.row))
                     .text_xs()
-                    .text_color(rgb(theme::TEXT_PRIMARY))
+                    .text_color(rgb(palette.text_primary))
                     .overflow_hidden()
                     .whitespace_nowrap()
                     .child(
@@ -596,8 +728,8 @@ fn render_pending_annotation_chips(
                             .px_1()
                             .rounded_sm()
                             .cursor_pointer()
-                            .text_color(rgb(theme::TEXT_MUTED))
-                            .hover(|style| style.bg(rgb(theme::ROW_HOVER_BG)))
+                            .text_color(rgb(palette.text_muted))
+                            .hover(|style| style.bg(rgb(palette.row_hover)))
                             .child("×")
                             .on_mouse_down(MouseButton::Left, move |event, window, cx| {
                                 cx.stop_propagation();
@@ -607,7 +739,7 @@ fn render_pending_annotation_chips(
                 if let Some(preview) = preview.clone() {
                     chip = chip
                         .cursor_pointer()
-                        .hover(|style| style.bg(rgb(theme::ROW_HOVER_BG)));
+                        .hover(|style| style.bg(rgb(palette.row_hover)));
                     chip = chip.on_mouse_down(MouseButton::Left, move |event, window, cx| {
                         cx.stop_propagation();
                         preview(action.clone(), event, window, cx);
@@ -628,8 +760,10 @@ fn render_grid(
     font_size: f32,
     cell_width: f32,
     line_height: f32,
+    palette: TerminalRenderPalette,
 ) -> impl IntoElement {
-    let (background_runs, text_runs, cursor_overlay) = collect_grid_paint_runs(session, selection);
+    let (background_runs, text_runs, cursor_overlay) =
+        collect_grid_paint_runs(session, selection, palette);
     let search_highlight = search_highlight.map(|highlight| {
         let start_column = highlight.start_column.min(session.screen.cols);
         let end_column = highlight
@@ -640,7 +774,7 @@ fn render_grid(
             row: highlight.row.min(session.screen.rows.saturating_sub(1)),
             start_column,
             cell_count: end_column.saturating_sub(start_column),
-            color: theme::PRIMARY_MUTED,
+            color: palette.primary_muted,
         }
     });
 
@@ -648,7 +782,7 @@ fn render_grid(
         .flex_1()
         .flex()
         .flex_row()
-        .bg(rgb(theme::TERMINAL_BG))
+        .bg(rgb(palette.terminal_bg))
         .overflow_hidden()
         .child(
             div()
@@ -657,7 +791,7 @@ fn render_grid(
                 .flex_col()
                 .px_1()
                 .py(px(2.0))
-                .bg(rgb(theme::TERMINAL_BG))
+                .bg(rgb(palette.terminal_bg))
                 .child(render_grid_canvas(
                     background_runs,
                     search_highlight,
@@ -668,16 +802,19 @@ fn render_grid(
                     line_height,
                 )),
         )
-        .children(scrollbar.map(|scrollbar| render_scrollbar(scrollbar, scrollbar_actions)))
+        .children(
+            scrollbar.map(|scrollbar| render_scrollbar(scrollbar, scrollbar_actions, palette)),
+        )
 }
 
 fn render_empty_body(
     message: String,
     splash_image: Option<std::sync::Arc<gpui::RenderImage>>,
+    palette: TerminalRenderPalette,
 ) -> impl IntoElement {
     div()
         .flex_1()
-        .bg(rgb(theme::TERMINAL_BG))
+        .bg(rgb(palette.terminal_bg))
         .flex()
         .items_center()
         .justify_center()
@@ -692,20 +829,23 @@ fn render_empty_body(
                 .px(px(10.0))
                 .py(px(8.0))
                 .text_xs()
-                .text_color(rgb(theme::TEXT_SUBTLE))
+                .text_color(rgb(palette.text_subtle))
                 .child(SharedString::from(message))
         }))
 }
 
-fn render_search_bar(model: &TerminalSearchUiModel) -> impl IntoElement {
+fn render_search_bar(
+    model: &TerminalSearchUiModel,
+    palette: TerminalRenderPalette,
+) -> impl IntoElement {
     div()
         .mx_2()
         .mt_1()
         .px_2()
         .py(px(6.0))
-        .bg(rgb(theme::PANEL_HEADER_BG))
+        .bg(rgb(palette.panel_header))
         .border_1()
-        .border_color(rgb(theme::BORDER_PRIMARY))
+        .border_color(rgb(palette.border))
         .rounded_sm()
         .flex()
         .items_center()
@@ -720,13 +860,13 @@ fn render_search_bar(model: &TerminalSearchUiModel) -> impl IntoElement {
                 .child(
                     div()
                         .text_xs()
-                        .text_color(rgb(theme::TEXT_SUBTLE))
+                        .text_color(rgb(palette.text_subtle))
                         .child("Search"),
                 )
                 .child(
                     div()
                         .text_xs()
-                        .text_color(rgb(theme::TEXT_PRIMARY))
+                        .text_color(rgb(palette.text_primary))
                         .overflow_hidden()
                         .whitespace_nowrap()
                         .child(SharedString::from(model.query.clone())),
@@ -741,16 +881,16 @@ fn render_search_bar(model: &TerminalSearchUiModel) -> impl IntoElement {
                     div()
                         .text_xs()
                         .text_color(rgb(if model.case_sensitive {
-                            theme::PRIMARY
+                            palette.primary
                         } else {
-                            theme::TEXT_DIM
+                            palette.text_dim
                         }))
                         .child(if model.case_sensitive { "Aa" } else { "aa" }),
                 )
                 .child(
                     div()
                         .text_xs()
-                        .text_color(rgb(theme::TEXT_SUBTLE))
+                        .text_color(rgb(palette.text_subtle))
                         .child(SharedString::from(model.summary.clone())),
                 ),
         )
@@ -759,6 +899,7 @@ fn render_search_bar(model: &TerminalSearchUiModel) -> impl IntoElement {
 fn render_scrollbar(
     scrollbar: TerminalScrollbarModel,
     actions: Option<TerminalScrollbarActions>,
+    palette: TerminalRenderPalette,
 ) -> impl IntoElement {
     canvas(
         move |_bounds, _window, _cx| (scrollbar, actions.clone()),
@@ -775,7 +916,7 @@ fn render_scrollbar(
                         .max(px(12.0)),
                 ),
             );
-            window.paint_quad(fill(track, rgb(theme::PANEL_HEADER_BG)));
+            window.paint_quad(fill(track, rgb(palette.scrollbar_track)));
 
             let thumb_height = (track.size.height * scrollbar.thumb_height_ratio.clamp(0.08, 1.0))
                 .max(px(TERMINAL_SCROLLBAR_MIN_THUMB_HEIGHT_PX));
@@ -786,7 +927,7 @@ fn render_scrollbar(
                 point(track.origin.x, thumb_top),
                 size(track.size.width, thumb_height),
             );
-            window.paint_quad(fill(thumb, rgb(theme::TEXT_DIM)));
+            window.paint_quad(fill(thumb, rgb(palette.scrollbar_thumb)));
 
             if let Some(actions) = actions.as_ref() {
                 let on_mouse_down = actions.on_mouse_down.clone();
@@ -877,6 +1018,7 @@ fn tab_kind_label(tab_type: Option<&TabType>) -> &'static str {
 fn collect_grid_paint_runs(
     session: &TerminalSessionView,
     selection: Option<&TerminalSelectionSnapshot>,
+    palette: TerminalRenderPalette,
 ) -> (
     Vec<TerminalBackgroundRect>,
     Vec<TerminalTextRun>,
@@ -906,7 +1048,7 @@ fn collect_grid_paint_runs(
                 && cursor.column == indexed.column
                 && matches!(cursor.shape, CursorShape::Block)
         });
-        let style = effective_cell_style(&indexed.cell, selected, cursor_cell);
+        let style = effective_cell_style(&indexed.cell, selected, cursor_cell, palette);
 
         if style.paint_background {
             let col = indexed.column;
@@ -979,7 +1121,7 @@ fn collect_grid_paint_runs(
             row: cursor.row,
             column: cursor.column,
             shape: cursor.shape,
-            color: theme::SUCCESS_TEXT,
+            color: palette.terminal_cursor,
         }),
         _ => None,
     });
@@ -1254,6 +1396,7 @@ fn effective_cell_style(
     cell: &TerminalCellSnapshot,
     selected: bool,
     cursor: Option<TerminalCursorSnapshot>,
+    palette: TerminalRenderPalette,
 ) -> EffectiveCellStyle {
     let mut foreground = cell.foreground;
     let mut background = cell.background;
@@ -1265,17 +1408,23 @@ fn effective_cell_style(
     let strike = cell.strike;
     let mut paint_background = !cell.default_background;
 
+    // Apply themed default foreground before selection/cursor overrides so
+    // custom/T3 tokens replace the stale NamedColor::Foreground static.
+    if cell.default_foreground {
+        foreground = palette.terminal_fg;
+    }
+
     if selected {
-        foreground = theme::SELECTION_TEXT;
-        background = theme::SELECTION_BG;
+        foreground = palette.selection_text;
+        background = palette.selection_bg;
         paint_background = true;
     }
 
     if let Some(cursor) = cursor {
         match cursor.shape {
             CursorShape::Block => {
-                foreground = theme::PANEL_BG;
-                background = theme::SUCCESS_TEXT;
+                foreground = palette.panel;
+                background = palette.terminal_cursor;
                 bold = true;
                 dim = false;
                 paint_background = true;
@@ -1301,6 +1450,7 @@ fn effective_cell_style(
 fn render_runtime_actions(
     actions: TerminalPaneActions,
     controls: TerminalRuntimeControlsModel,
+    palette: TerminalRenderPalette,
 ) -> impl IntoElement {
     let TerminalPaneActions {
         on_open_browser: _,
@@ -1339,39 +1489,51 @@ fn render_runtime_actions(
                 .can_start
                 .then_some(on_start_server)
                 .flatten()
-                .map(|on_click| runtime_action_button("start", theme::SUCCESS_TEXT, on_click)),
+                .map(|on_click| runtime_action_button("start", palette.success, on_click, palette)),
         )
         .children(
             controls
                 .can_stop
                 .then_some(on_stop_server)
                 .flatten()
-                .map(|on_click| runtime_action_button("stop", theme::DANGER_TEXT, on_click)),
+                .map(|on_click| runtime_action_button("stop", palette.danger, on_click, palette)),
         )
         .children(
             controls
                 .can_restart
                 .then_some(on_restart_server)
                 .flatten()
-                .map(|on_click| runtime_action_button("restart", theme::WARNING_TEXT, on_click)),
+                .map(|on_click| {
+                    runtime_action_button("restart", palette.warning, on_click, palette)
+                }),
         )
         .children(
             controls
                 .can_open_url
                 .then_some(on_open_local_url)
                 .flatten()
-                .map(|on_click| runtime_action_button("open", theme::PRIMARY, on_click)),
+                .map(|on_click| runtime_action_button("open", palette.primary, on_click, palette)),
         )
         .children(
             controls
                 .prompt_action_label
                 .zip(on_prompt_action)
                 .map(|(label, on_click)| {
-                    runtime_action_button(label.as_str(), controls.prompt_action_color, on_click)
+                    runtime_action_button(
+                        label.as_str(),
+                        controls.prompt_action_color,
+                        on_click,
+                        palette,
+                    )
                 }),
         )
         .children(controls.remote_control.map(|control| {
-            remote_control_button(control, on_take_remote_control, on_release_remote_control)
+            remote_control_button(
+                control,
+                on_take_remote_control,
+                on_release_remote_control,
+                palette,
+            )
         }))
         .children(
             controls
@@ -1386,11 +1548,12 @@ fn render_runtime_actions(
                             "search"
                         },
                         if controls.search_active {
-                            theme::PRIMARY
+                            palette.primary
                         } else {
-                            theme::TEXT_MUTED
+                            palette.text_muted
                         },
                         on_click,
+                        palette,
                     )
                 }),
         )
@@ -1399,14 +1562,18 @@ fn render_runtime_actions(
                 .search_active
                 .then_some(on_search_prev)
                 .flatten()
-                .map(|on_click| runtime_action_button("prev", theme::TEXT_MUTED, on_click)),
+                .map(|on_click| {
+                    runtime_action_button("prev", palette.text_muted, on_click, palette)
+                }),
         )
         .children(
             controls
                 .search_active
                 .then_some(on_search_next)
                 .flatten()
-                .map(|on_click| runtime_action_button("next", theme::TEXT_MUTED, on_click)),
+                .map(|on_click| {
+                    runtime_action_button("next", palette.text_muted, on_click, palette)
+                }),
         )
         .children(
             controls
@@ -1421,11 +1588,12 @@ fn render_runtime_actions(
                             "aa"
                         },
                         if controls.search_case_sensitive {
-                            theme::PRIMARY
+                            palette.primary
                         } else {
-                            theme::TEXT_MUTED
+                            palette.text_muted
                         },
                         on_click,
+                        palette,
                     )
                 }),
         )
@@ -1434,21 +1602,27 @@ fn render_runtime_actions(
                 .search_active
                 .then_some(on_close_search)
                 .flatten()
-                .map(|on_click| runtime_action_button("close", theme::TEXT_MUTED, on_click)),
+                .map(|on_click| {
+                    runtime_action_button("close", palette.text_muted, on_click, palette)
+                }),
         )
         .children(
             controls
                 .can_export_scrollback
                 .then_some(on_export_scrollback)
                 .flatten()
-                .map(|on_click| runtime_action_button("export", theme::TEXT_MUTED, on_click)),
+                .map(|on_click| {
+                    runtime_action_button("export", palette.text_muted, on_click, palette)
+                }),
         )
         .children(
             controls
                 .can_export_selection
                 .then_some(on_export_selection)
                 .flatten()
-                .map(|on_click| runtime_action_button("selection", theme::TEXT_MUTED, on_click)),
+                .map(|on_click| {
+                    runtime_action_button("selection", palette.text_muted, on_click, palette)
+                }),
         )
 }
 
@@ -1456,6 +1630,7 @@ fn remote_control_button(
     control: TerminalRemoteControlModel,
     on_take_remote_control: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
     on_release_remote_control: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
+    palette: TerminalRenderPalette,
 ) -> impl IntoElement {
     let action = if control.can_release {
         on_release_remote_control.map(|on_click| ("release", on_click))
@@ -1472,8 +1647,8 @@ fn remote_control_button(
         .px(px(5.0))
         .py(px(1.0))
         .border_1()
-        .border_color(rgb(theme::BORDER_PRIMARY))
-        .bg(rgb(theme::PANEL_HEADER_BG))
+        .border_color(rgb(palette.border))
+        .bg(rgb(palette.panel_header))
         .rounded_sm()
         .text_xs()
         .text_color(rgb(control.color))
@@ -1481,11 +1656,11 @@ fn remote_control_button(
         .children(action.map(|(label, on_click)| {
             div()
                 .px(px(4.0))
-                .bg(rgb(theme::BUTTON_HOVER_BG))
+                .bg(rgb(palette.button_hover))
                 .rounded_sm()
-                .text_color(rgb(theme::TEXT_PRIMARY))
+                .text_color(rgb(palette.text_primary))
                 .cursor_pointer()
-                .hover(|s| s.bg(rgb(theme::ROW_HOVER_BG)))
+                .hover(|s| s.bg(rgb(palette.row_hover)))
                 .child(SharedString::from(label.to_string()))
                 .on_mouse_down(MouseButton::Left, on_click)
         }))
@@ -1494,6 +1669,7 @@ fn remote_control_button(
 fn render_actionable_notice(
     banner: &TerminalActionableNotice,
     on_click: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
+    palette: TerminalRenderPalette,
 ) -> impl IntoElement {
     div()
         .mx(px(8.0))
@@ -1501,8 +1677,8 @@ fn render_actionable_notice(
         .px(px(10.0))
         .py(px(6.0))
         .border_1()
-        .border_color(rgb(theme::DANGER_TEXT))
-        .bg(rgb(theme::DANGER_BG_SUBTLE))
+        .border_color(rgb(palette.danger))
+        .bg(rgb(palette.danger_bg))
         .rounded_sm()
         .flex()
         .items_center()
@@ -1511,11 +1687,11 @@ fn render_actionable_notice(
             div()
                 .flex_1()
                 .text_sm()
-                .text_color(rgb(theme::DANGER_TEXT))
+                .text_color(rgb(palette.danger))
                 .child(SharedString::from(banner.message.clone())),
         )
         .children(on_click.map(|handler| {
-            runtime_action_button(banner.action_label, banner.action_color, handler)
+            runtime_action_button(banner.action_label, banner.action_color, handler, palette)
         }))
 }
 
@@ -1523,18 +1699,19 @@ fn runtime_action_button(
     label: &str,
     color: u32,
     on_click: Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
+    palette: TerminalRenderPalette,
 ) -> impl IntoElement {
     div()
         .px(px(5.0))
         .py(px(1.0))
         .border_1()
-        .border_color(rgb(theme::BORDER_PRIMARY))
-        .bg(rgb(theme::PANEL_HEADER_BG))
+        .border_color(rgb(palette.border))
+        .bg(rgb(palette.panel_header))
         .rounded_sm()
         .text_xs()
         .text_color(rgb(color))
         .cursor_pointer()
-        .hover(|s| s.bg(rgb(theme::BUTTON_HOVER_BG)))
+        .hover(|s| s.bg(rgb(palette.button_hover)))
         .child(SharedString::from(label.to_string()))
         .on_mouse_down(MouseButton::Left, on_click)
 }
@@ -1602,19 +1779,19 @@ fn session_status_label(session: &TerminalSessionView, is_ai_tab: bool) -> &'sta
     }
 }
 
-fn session_status_color(session: &TerminalSessionView) -> u32 {
+fn session_status_color(session: &TerminalSessionView, palette: TerminalRenderPalette) -> u32 {
     if session.runtime.unseen_ready {
-        return theme::SUCCESS_TEXT;
+        return palette.success;
     }
     if matches!(session.runtime.ai_activity, Some(AiActivity::Thinking)) {
-        return theme::WARNING_TEXT;
+        return palette.warning;
     }
 
     match session.runtime.status {
-        SessionStatus::Running => theme::TEXT_SUBTLE,
-        SessionStatus::Starting | SessionStatus::Stopping => theme::WARNING_TEXT,
-        SessionStatus::Crashed | SessionStatus::Failed => theme::DANGER_TEXT,
-        _ => theme::TEXT_MUTED,
+        SessionStatus::Running => palette.text_subtle,
+        SessionStatus::Starting | SessionStatus::Stopping => palette.warning,
+        SessionStatus::Crashed | SessionStatus::Failed => palette.danger,
+        _ => palette.text_muted,
     }
 }
 
@@ -1705,5 +1882,161 @@ mod resource_metric_tests {
             format_compact_process_count(&ResourceSnapshot::default()),
             "process count unavailable"
         );
+    }
+}
+
+#[cfg(test)]
+mod theme_palette_tests {
+    use super::{effective_cell_style, terminal_render_palette_from_tokens, TerminalRenderPalette};
+    use crate::terminal::session::TerminalCellSnapshot;
+    use crate::theme;
+    use crate::ui::tokens::{dark, Color, Density, Scale, ThemeMode, PREVIEW_SENTINEL};
+
+    fn sentinel_tokens() -> crate::ui::tokens::ThemeTokens {
+        let mut tokens = dark(Density::Comfortable, Scale::Scale100);
+        tokens.mode = ThemeMode::Dark;
+        tokens.surfaces.canvas = Color::from_u32(0x010101);
+        tokens.surfaces.raised = Color::from_u32(0x020202);
+        tokens.surfaces.overlay = Color::from_u32(0x030303);
+        tokens.surfaces.hover = Color::from_u32(0x040404);
+        tokens.surfaces.disabled = Color::from_u32(0x050505);
+        tokens.surfaces.sunken = Color::from_u32(0x161616);
+        tokens.borders.default = Color::from_u32(0x060606);
+        tokens.text.primary = Color::from_u32(0x070707);
+        tokens.text.muted = Color::from_u32(0x080808);
+        tokens.text.disabled = Color::from_u32(0x090909);
+        tokens.text.on_selection = Color::from_u32(0x0a0a0a);
+        tokens.actions.primary.default.background = Color::from_u32(0x0b0b0b);
+        tokens.actions.primary.selected.background = Color::from_u32(0x0c0c0c);
+        tokens.status.destructive = Color::from_u32(0x0d0d0d);
+        tokens.status.destructive_surface = Color::from_u32(0x0e0e0e);
+        tokens.status.warning = Color::from_u32(0x0f0f0f);
+        tokens.status.success = Color::from_u32(0x101010);
+        tokens.terminal.background = PREVIEW_SENTINEL;
+        tokens.terminal.foreground = Color::from_u32(0x121212);
+        tokens.terminal.cursor = Color::from_u32(0x131313);
+        tokens.terminal.selection = Color::from_u32(0x141414);
+        tokens
+    }
+
+    #[test]
+    fn sentinel_theme_tokens_map_into_terminal_render_palette() {
+        let tokens = sentinel_tokens();
+        let palette = terminal_render_palette_from_tokens(tokens);
+        assert_eq!(palette.canvas, 0x010101);
+        assert_eq!(palette.panel, 0x161616);
+        assert_eq!(palette.panel_header, 0x020202);
+        assert_eq!(palette.row, 0x030303);
+        assert_eq!(palette.row_hover, 0x040404);
+        assert_eq!(palette.button_hover, 0x040404);
+        assert_eq!(palette.border, 0x060606);
+        assert_eq!(palette.text_primary, 0x070707);
+        assert_eq!(palette.text_muted, 0x080808);
+        assert_eq!(palette.text_subtle, 0x090909);
+        assert_eq!(palette.text_dim, 0x090909);
+        assert_eq!(palette.selection_text, 0x0a0a0a);
+        assert_eq!(palette.primary, 0x0b0b0b);
+        assert_eq!(palette.primary_muted, 0x0c0c0c);
+        assert_eq!(palette.danger, 0x0d0d0d);
+        assert_eq!(palette.danger_bg, 0x0e0e0e);
+        assert_eq!(palette.warning, 0x0f0f0f);
+        assert_eq!(palette.success, 0x101010);
+        assert_eq!(palette.terminal_bg, PREVIEW_SENTINEL.to_u32());
+        assert_eq!(palette.terminal_fg, 0x121212);
+        assert_eq!(palette.terminal_cursor, 0x131313);
+        assert_eq!(palette.terminal_selection, 0x141414);
+        assert_eq!(palette.selection_bg, 0x141414);
+        assert_eq!(palette.scrollbar_track, 0x020202);
+        assert_eq!(palette.scrollbar_thumb, 0x080808);
+    }
+
+    #[test]
+    fn legacy_default_palette_matches_pre_token_theme_constants() {
+        let palette = TerminalRenderPalette::legacy_default();
+        assert_eq!(palette.canvas, theme::APP_BG);
+        assert_eq!(palette.panel, theme::PANEL_BG);
+        assert_eq!(palette.panel_header, theme::PANEL_HEADER_BG);
+        assert_eq!(palette.button_hover, theme::BUTTON_HOVER_BG);
+        assert_eq!(palette.text_dim, theme::TEXT_DIM);
+        assert_eq!(palette.terminal_bg, theme::TERMINAL_BG);
+        assert_eq!(palette.terminal_fg, theme::TEXT_PRIMARY);
+        assert_eq!(palette.terminal_cursor, theme::SUCCESS_TEXT);
+        assert_eq!(palette.selection_bg, theme::SELECTION_BG);
+        assert_eq!(palette.scrollbar_track, theme::PANEL_HEADER_BG);
+        assert_eq!(palette.scrollbar_thumb, theme::TEXT_DIM);
+    }
+
+    #[test]
+    fn effective_style_replaces_default_foreground_with_palette_terminal_fg() {
+        let palette = terminal_render_palette_from_tokens(sentinel_tokens());
+        let cell = TerminalCellSnapshot {
+            character: 'a',
+            zero_width: Vec::new(),
+            foreground: 0xe4e4e7,
+            background: 0x09090b,
+            bold: false,
+            dim: false,
+            italic: false,
+            underline: false,
+            undercurl: false,
+            strike: false,
+            hidden: false,
+            has_hyperlink: false,
+            default_background: true,
+            default_foreground: true,
+        };
+        let style = effective_cell_style(&cell, false, None, palette);
+        assert_eq!(style.foreground, palette.terminal_fg);
+        assert_eq!(style.foreground, 0x121212);
+        assert!(!style.paint_background);
+    }
+
+    #[test]
+    fn effective_style_keeps_explicit_ansi_foreground() {
+        let palette = terminal_render_palette_from_tokens(sentinel_tokens());
+        let cell = TerminalCellSnapshot {
+            character: 'x',
+            zero_width: Vec::new(),
+            foreground: 0xef4444,
+            background: 0x09090b,
+            bold: false,
+            dim: false,
+            italic: false,
+            underline: false,
+            undercurl: false,
+            strike: false,
+            hidden: false,
+            has_hyperlink: false,
+            default_background: true,
+            default_foreground: false,
+        };
+        let style = effective_cell_style(&cell, false, None, palette);
+        assert_eq!(style.foreground, 0xef4444);
+        assert_ne!(style.foreground, palette.terminal_fg);
+    }
+
+    #[test]
+    fn effective_style_selection_overrides_themed_default_foreground() {
+        let palette = terminal_render_palette_from_tokens(sentinel_tokens());
+        let cell = TerminalCellSnapshot {
+            character: 's',
+            zero_width: Vec::new(),
+            foreground: 0xe4e4e7,
+            background: 0x09090b,
+            bold: false,
+            dim: false,
+            italic: false,
+            underline: false,
+            undercurl: false,
+            strike: false,
+            hidden: false,
+            has_hyperlink: false,
+            default_background: true,
+            default_foreground: true,
+        };
+        let style = effective_cell_style(&cell, true, None, palette);
+        assert_eq!(style.foreground, palette.selection_text);
+        assert_eq!(style.background, palette.selection_bg);
+        assert!(style.paint_background);
     }
 }

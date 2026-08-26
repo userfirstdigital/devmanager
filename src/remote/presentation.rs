@@ -1442,6 +1442,7 @@ mod tests {
             hidden: false,
             has_hyperlink: false,
             default_background: true,
+            default_foreground: false,
         }
     }
 

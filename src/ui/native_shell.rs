@@ -22,6 +22,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use gpui::prelude::FluentBuilder;
 use gpui::{
     anchored, canvas, deferred, div, img, point, px, size, uniform_list, AnyElement, App,
     AppContext, Application, Bounds, ClickEvent, ClipboardEntry, Context, ElementId,
@@ -33,6 +34,7 @@ use gpui::{
     WindowOptions,
 };
 use gpui_component::button::{Button, ButtonVariants};
+use gpui_component::scroll::ScrollableElement;
 use gpui_component::Disableable;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -50,7 +52,7 @@ use crate::client::{
 use crate::config::paths::{resolve_app_paths, AppProfile, BuildKind};
 use crate::domain::cockpit::{
     AgentConnectionRow, AgentConnectionSnapshot, AgentPresence, ConfigSidebarProviderKind,
-    TaskCockpitQuery,
+    TaskCockpitQuery, TaskGitRepositoriesProjection, TaskRepositorySelector,
 };
 use crate::domain::command::{
     ArmUpdateInstallIntent, Command as DomainCommand, CommandEnvelope, CommandReceipt,
@@ -100,6 +102,9 @@ use crate::ui::shell::{
     PointerOwner, PromptLibraryViewport, ScalePercent, Shell, TerminalPressRejection,
     TerminalRelease,
 };
+use crate::ui::task_cockpit::changes_panel::{
+    reconcile_selected_repository, repository_mutation_allowed, repository_status_readable,
+};
 use crate::ui::task_cockpit::composer::{
     provider_command_catalog, provider_command_opens_terminal, AnswerPayload, ApprovalDecision,
     ComposerControl, ComposerDraftProjection, ComposerError, ComposerFence, ComposerHostProjection,
@@ -117,16 +122,42 @@ use crate::ui::task_cockpit::{
     update_observation_from_snapshot, ArtifactsPanelProjection, ChangesPanelProjection,
     ConfigSidebarActionRequest, ConfigSidebarProjection, ConfigSidebarUnavailableReason,
     FilesPanelProjection, Inbox, InboxPresentationWidth, InboxRenderModel, PanelAction,
-    ReviewPanelProjection, ServicePanelAction, ServicePanelTone, ServicesPanelProjection,
-    TaskBrowserDockModel, TaskHeaderModel, TaskList, TopBarProjectionController,
-    TopBarProjectionInput, UpdateState, WorkspacePanelProjection, DEFAULT_VISIBLE_ROWS,
-    FIXED_VIRTUAL_OVERSCAN,
+    PanelDisabledReason, ReviewPanelProjection, ServicePanelAction, ServicePanelTone,
+    ServicesPanelProjection, TaskBrowserDockModel, TaskHeaderModel, TaskList,
+    TopBarProjectionController, TopBarProjectionInput, UpdateState, WorkspacePanelProjection,
+    DEFAULT_VISIBLE_ROWS, FIXED_VIRTUAL_OVERSCAN,
 };
 
+use crate::browser::{
+    browser_command_channel, BrowserCommand, BrowserCommandBridge, BrowserCommandInbox,
+    BrowserGatewayHandle, BrowserGatewayRegistration, BrowserWorkspaceKey,
+    BrowserWorkspaceSnapshot,
+};
+use crate::ui::browser_dock_lifecycle::{
+    plan_browser_dock, BrowserDockIdentity, BrowserDockLifecycleError, BrowserDockPlan,
+    BrowserDockSurfaceState,
+};
+use crate::ui::browser_gateway_identity::registered_process_session_id;
+use crate::ui::header_actions::{HeaderCommitPhase, HeaderCommitWorkflow, HeaderOpenTarget};
+use crate::ui::native_composer::{
+    apply_suggestion, detect_trigger, filter_suggestions, ComposerCursor, PromptDocument,
+    PromptSegment, TriggerKind, TriggerMenuState, TriggerSuggestion, SKILL_TRIGGER_HOLD,
+};
+use crate::ui::project_actions::{
+    ProjectActionDraft, ProjectActionEditorField, ProjectActionMenuMode, ProjectActionRow,
+    ProjectActionWorkflow,
+};
+use crate::ui::project_scope::{ProjectScope, ProjectScopeMenuState};
+use crate::ui::task_search::{TaskSearchCandidate, TaskSearchState};
 use crate::ui::terminal_adapter::TerminalDockAdapter;
 pub use crate::ui::terminal_adapter::{TerminalDockState, TERMINAL_ADAPTER_DEPENDENCY};
+use crate::ui::theme_system::{
+    AppearancePreference, ThemeAppearance, ThemeColor, ThemeColorRole, ThemeController,
+    ThemePalette,
+};
 use crate::ui::tokens::{mix_color, RuntimePreferencesSnapshot, StatusMeaning};
 use crate::ui::workspace_layout::{PaneEdge, WindowFrame, WorkspaceLayout, WorkspaceLayoutStore};
+
 use crate::updater::{UpdaterService, UpdaterSnapshot, UpdaterStage};
 
 /// Explicit UI action: acknowledged client detach (host survives in production).
@@ -201,7 +232,7 @@ const T3_SIDEBAR_ROW_HEIGHT: f32 = 78.0;
 const T3_WORKSPACE_TOPBAR_HEIGHT: f32 = 32.0;
 const T3_SIDEBAR_NAV_TOP_INSET: f32 = 12.0;
 const CONVERSATION_COMPOSER_PLACEHOLDER: &str =
-    "Ask anything, @tag files/folders, $use skills, or / for commands";
+    crate::ui::native_composer::NATIVE_COMPOSER_PLACEHOLDER;
 const COMPOSER_DRAFT_PERSIST_INTERVAL: Duration = Duration::from_millis(250);
 const NATIVE_SHUTDOWN_BUDGET: Duration = Duration::from_secs(2);
 const NATIVE_STARTUP_BUDGET: Duration = Duration::from_secs(5);
@@ -593,6 +624,38 @@ fn stable_service_element_key(service_id: &str, suffix: &str) -> u64 {
     digest.update(service_id.as_bytes());
     digest.update([0]);
     digest.update(suffix.as_bytes());
+    let digest = digest.finalize();
+    u64::from_be_bytes(
+        digest[..8]
+            .try_into()
+            .expect("sha256 digest always contains eight bytes"),
+    )
+}
+
+/// Deterministic numeric suffix for theme-control ElementIds.
+///
+/// GPUI 0.2.2 tuple IDs accept only a static name plus an integer; hashing keeps
+/// theme and role controls distinct without embedding theme ids or paths.
+fn stable_theme_element_key(seed: &str, suffix: &str) -> u64 {
+    let mut digest = Sha256::new();
+    digest.update(b"native-theme");
+    digest.update([0]);
+    digest.update(seed.as_bytes());
+    digest.update([0]);
+    digest.update(suffix.as_bytes());
+    let digest = digest.finalize();
+    u64::from_be_bytes(
+        digest[..8]
+            .try_into()
+            .expect("sha256 digest always contains eight bytes"),
+    )
+}
+
+fn stable_changes_repo_element_key(element_id: &str) -> u64 {
+    let mut digest = Sha256::new();
+    digest.update(b"native-changes-repo");
+    digest.update([0]);
+    digest.update(element_id.as_bytes());
     let digest = digest.finalize();
     u64::from_be_bytes(
         digest[..8]
@@ -1788,6 +1851,13 @@ pub enum NativeHostCommand {
         command_id: CommandId,
         issued_at_ms: i64,
     },
+    TaskLifecycle {
+        task_id: TaskId,
+        expected_task_revision: u64,
+        command: crate::domain::command::Command,
+        command_id: CommandId,
+        issued_at_ms: i64,
+    },
     ServiceControl {
         action_id: &'static str,
         arguments: crate::client::action::ServiceControlArguments,
@@ -1874,7 +1944,8 @@ fn native_command_id(command: &NativeHostCommand) -> Option<CommandId> {
         NativeHostCommand::TaskCreate { command_id, .. }
         | NativeHostCommand::TaskCreateV2 { command_id, .. }
         | NativeHostCommand::TaskRename { command_id, .. }
-        | NativeHostCommand::TaskArchive { command_id, .. } => Some(*command_id),
+        | NativeHostCommand::TaskArchive { command_id, .. }
+        | NativeHostCommand::TaskLifecycle { command_id, .. } => Some(*command_id),
         NativeHostCommand::ServiceControl { command_id, .. } => Some(*command_id),
         NativeHostCommand::ProviderInput { command_id, .. } => Some(*command_id),
         NativeHostCommand::ProviderStart { command_id, .. } => Some(*command_id),
@@ -2000,6 +2071,583 @@ struct NewTaskDraft {
     error: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ThemeEditorMode {
+    #[default]
+    Guided,
+    Advanced,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ThemeEditorFocus {
+    Name,
+    Canvas,
+    Accent,
+    Role(ThemeColorRole),
+}
+
+struct ThemeEditorState {
+    /// Immutable safe id chosen when the editor opens (create/duplicate/edit).
+    theme_id: String,
+    /// `Some` when editing an already-installed custom theme.
+    editing_id: Option<String>,
+    /// Theme whose palettes originally seeded the draft halves.
+    seed_theme_id: String,
+    name: TextField,
+    mode: ThemeEditorMode,
+    focused: ThemeEditorFocus,
+    error: Option<String>,
+    /// Independent Light/Dark drafts; switching never drops the other half.
+    halves: ThemeEditorHalves,
+    /// Active-half UI bindings (mirrored from [`ThemeEditorHalves::active`]).
+    canvas: TextField,
+    accent: TextField,
+    role_fields: Vec<(ThemeColorRole, TextField)>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct ThemeEditorHalfDraft {
+    /// False when an edited custom theme never had this appearance (locked).
+    available: bool,
+    canvas: String,
+    accent: String,
+    roles: BTreeMap<ThemeColorRole, String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ThemeEditorHalves {
+    light: ThemeEditorHalfDraft,
+    dark: ThemeEditorHalfDraft,
+    active: ThemeAppearance,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ThemeEditorSaveKind {
+    Create { appearance: ThemeAppearance },
+    Update,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ThemeEditorAfterSave {
+    SelectCreated {
+        theme_id: String,
+        appearance: ThemeAppearance,
+    },
+    CloseUpdated,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ThemeEditorDuplicateDraftSpec {
+    editing_id: Option<String>,
+    theme_id: String,
+    seed_theme_id: String,
+    label: String,
+    persists_before_save: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ThemeCardActionAvailability {
+    select: bool,
+    duplicate_edit_copy: bool,
+    edit: bool,
+    export: bool,
+    remove: bool,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct ThemeRemovalIntent {
+    pending_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ThemeRemovalDecision {
+    ArmConfirm,
+    ConfirmRemove(String),
+}
+
+const THEME_GUIDED_SWATCHES: &[&str] = &[
+    "#fbfafc", "#18151d", "#ffffff", "#0b0b0f", "#f4f4f5", "#111827", "#0f172a", "#d60057",
+    "#e0005b", "#0055cc", "#79a7ff", "#16a34a", "#22c55e", "#ea580c", "#f59e0b", "#7c3aed",
+    "#a78bfa", "#0891b2", "#67e8f9", "#dc2626",
+];
+
+fn safe_theme_id_from_label(label: &str) -> String {
+    let mut out = String::new();
+    let mut pending_dash = false;
+    for character in label.trim().chars() {
+        let mapped = if character.is_ascii_alphanumeric() {
+            Some(character.to_ascii_lowercase())
+        } else if character.is_whitespace() || character == '-' || character == '_' {
+            None
+        } else {
+            None
+        };
+        match mapped {
+            Some(character) => {
+                if pending_dash && !out.is_empty() {
+                    out.push('-');
+                }
+                pending_dash = false;
+                out.push(character);
+            }
+            None => {
+                pending_dash = !out.is_empty();
+            }
+        }
+        if out.len() >= 48 {
+            break;
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    if out.is_empty() {
+        "custom-theme".to_string()
+    } else {
+        out
+    }
+}
+
+fn unique_theme_id(base: &str, occupied: &dyn Fn(&str) -> bool) -> String {
+    let mut candidate = base.to_string();
+    if candidate.is_empty() {
+        candidate = "custom-theme".to_string();
+    }
+    if !occupied(&candidate) {
+        return candidate;
+    }
+    let mut suffix = 2u32;
+    loop {
+        let next = format!("{base}-{suffix}");
+        if !occupied(&next) {
+            return next;
+        }
+        suffix = suffix.saturating_add(1);
+        if suffix > 10_000 {
+            return format!(
+                "{base}-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|duration| duration.as_millis())
+                    .unwrap_or(0)
+            );
+        }
+    }
+}
+
+fn unique_duplicate_theme_identity(
+    source_id: &str,
+    source_label: &str,
+    occupied: &dyn Fn(&str) -> bool,
+) -> (String, String) {
+    let base_id = format!("{}-copy", safe_theme_id_from_label(source_id));
+    let first_id = if occupied(&base_id) {
+        unique_theme_id(&base_id, occupied)
+    } else {
+        base_id.clone()
+    };
+    let label_base = {
+        let trimmed = source_label.trim();
+        if trimmed.is_empty() {
+            "Theme copy".to_string()
+        } else {
+            format!("{trimmed} copy")
+        }
+    };
+    let label = if first_id == base_id {
+        label_base
+    } else if let Some(suffix) = first_id.rsplit('-').next() {
+        format!("{label_base} {suffix}")
+    } else {
+        label_base
+    };
+    (first_id, label)
+}
+
+fn theme_card_action_availability(is_built_in: bool) -> ThemeCardActionAvailability {
+    if is_built_in {
+        ThemeCardActionAvailability {
+            select: true,
+            duplicate_edit_copy: true,
+            edit: false,
+            export: false,
+            remove: false,
+        }
+    } else {
+        ThemeCardActionAvailability {
+            select: true,
+            duplicate_edit_copy: true,
+            edit: true,
+            export: true,
+            remove: true,
+        }
+    }
+}
+
+fn guided_theme_preview_palette(
+    appearance: ThemeAppearance,
+    canvas: &str,
+    accent: &str,
+) -> Option<ThemePalette> {
+    let canvas = ThemeColor::parse(canvas).ok()?;
+    let accent = ThemeColor::parse(accent).ok()?;
+    Some(ThemePalette::managed(appearance, canvas, accent))
+}
+
+fn advanced_theme_palette_from_role_values<'a>(
+    values: impl IntoIterator<Item = (ThemeColorRole, &'a str)>,
+) -> Result<ThemePalette, String> {
+    let mut colors = BTreeMap::new();
+    for (role, raw) in values {
+        let color =
+            ThemeColor::parse(raw).map_err(|_| format!("Invalid color for {}", role.as_str()))?;
+        colors.insert(role, color);
+    }
+    for role in ThemeColorRole::ALL {
+        if !colors.contains_key(role) {
+            return Err(format!("Missing color for {}", role.as_str()));
+        }
+    }
+    ThemePalette::advanced(colors).map_err(|error| error.to_string())
+}
+
+fn theme_editor_half_from_palette(available: bool, palette: &ThemePalette) -> ThemeEditorHalfDraft {
+    let mut roles = BTreeMap::new();
+    for role in ThemeColorRole::ALL {
+        roles.insert(*role, palette.color(*role).to_hex());
+    }
+    ThemeEditorHalfDraft {
+        available,
+        canvas: palette.color(ThemeColorRole::Canvas).to_hex(),
+        accent: palette.color(ThemeColorRole::Accent).to_hex(),
+        roles,
+    }
+}
+
+fn theme_editor_locked_half() -> ThemeEditorHalfDraft {
+    ThemeEditorHalfDraft {
+        available: false,
+        canvas: String::new(),
+        accent: String::new(),
+        roles: BTreeMap::new(),
+    }
+}
+
+fn theme_editor_half_to_palette(
+    appearance: ThemeAppearance,
+    half: &ThemeEditorHalfDraft,
+    mode: ThemeEditorMode,
+) -> Result<ThemePalette, String> {
+    if !half.available {
+        return Err(format!(
+            "{} palette is unavailable.",
+            match appearance {
+                ThemeAppearance::Light => "Light",
+                ThemeAppearance::Dark => "Dark",
+            }
+        ));
+    }
+    match mode {
+        ThemeEditorMode::Guided => {
+            guided_theme_preview_palette(appearance, &half.canvas, &half.accent)
+                .ok_or_else(|| "Background and Accent colors must both be valid.".into())
+        }
+        ThemeEditorMode::Advanced => advanced_theme_palette_from_role_values(
+            half.roles
+                .iter()
+                .map(|(role, value)| (*role, value.as_str())),
+        ),
+    }
+}
+
+impl ThemeEditorHalves {
+    fn half(&self, appearance: ThemeAppearance) -> &ThemeEditorHalfDraft {
+        match appearance {
+            ThemeAppearance::Light => &self.light,
+            ThemeAppearance::Dark => &self.dark,
+        }
+    }
+
+    fn half_mut(&mut self, appearance: ThemeAppearance) -> &mut ThemeEditorHalfDraft {
+        match appearance {
+            ThemeAppearance::Light => &mut self.light,
+            ThemeAppearance::Dark => &mut self.dark,
+        }
+    }
+
+    fn flush_active(
+        &mut self,
+        canvas: &str,
+        accent: &str,
+        roles: impl IntoIterator<Item = (ThemeColorRole, String)>,
+    ) {
+        let active = self.active;
+        let half = self.half_mut(active);
+        if !half.available {
+            return;
+        }
+        half.canvas = canvas.to_string();
+        half.accent = accent.to_string();
+        for (role, value) in roles {
+            half.roles.insert(role, value);
+        }
+    }
+
+    fn switch_active(&mut self, next: ThemeAppearance) -> Result<(), String> {
+        if next == self.active {
+            return Ok(());
+        }
+        if !self.half(next).available {
+            return Err(format!(
+                "This theme has no {} palette.",
+                match next {
+                    ThemeAppearance::Light => "Light",
+                    ThemeAppearance::Dark => "Dark",
+                }
+            ));
+        }
+        self.active = next;
+        Ok(())
+    }
+}
+
+fn theme_editor_seed_halves(
+    is_editing: bool,
+    initial: ThemeAppearance,
+    light: Option<&ThemePalette>,
+    dark: Option<&ThemePalette>,
+    fallback_light: &ThemePalette,
+    fallback_dark: &ThemePalette,
+) -> ThemeEditorHalves {
+    let (light_half, dark_half) = if is_editing {
+        (
+            light
+                .map(|palette| theme_editor_half_from_palette(true, palette))
+                .unwrap_or_else(theme_editor_locked_half),
+            dark.map(|palette| theme_editor_half_from_palette(true, palette))
+                .unwrap_or_else(theme_editor_locked_half),
+        )
+    } else {
+        (
+            theme_editor_half_from_palette(true, light.unwrap_or(fallback_light)),
+            theme_editor_half_from_palette(true, dark.unwrap_or(fallback_dark)),
+        )
+    };
+    let active = if match initial {
+        ThemeAppearance::Light => light_half.available,
+        ThemeAppearance::Dark => dark_half.available,
+    } {
+        initial
+    } else if light_half.available {
+        ThemeAppearance::Light
+    } else {
+        ThemeAppearance::Dark
+    };
+    ThemeEditorHalves {
+        light: light_half,
+        dark: dark_half,
+        active,
+    }
+}
+
+fn theme_editor_save_palettes(
+    is_editing: bool,
+    halves: &ThemeEditorHalves,
+    mode: ThemeEditorMode,
+) -> Result<BTreeMap<ThemeAppearance, ThemePalette>, String> {
+    if is_editing {
+        let mut palettes = BTreeMap::new();
+        for appearance in [ThemeAppearance::Light, ThemeAppearance::Dark] {
+            let half = halves.half(appearance);
+            if half.available {
+                palettes.insert(
+                    appearance,
+                    theme_editor_half_to_palette(appearance, half, mode)?,
+                );
+            }
+        }
+        if palettes.is_empty() {
+            return Err("Theme has no editable appearance half.".into());
+        }
+        Ok(palettes)
+    } else {
+        let appearance = halves.active;
+        let half = halves.half(appearance);
+        Ok(BTreeMap::from([(
+            appearance,
+            theme_editor_half_to_palette(appearance, half, mode)?,
+        )]))
+    }
+}
+
+fn theme_editor_save_kind(
+    editing_id: Option<&str>,
+    appearance: ThemeAppearance,
+) -> ThemeEditorSaveKind {
+    if editing_id.is_some() {
+        ThemeEditorSaveKind::Update
+    } else {
+        ThemeEditorSaveKind::Create { appearance }
+    }
+}
+
+fn theme_editor_after_save(kind: ThemeEditorSaveKind, theme_id: &str) -> ThemeEditorAfterSave {
+    match kind {
+        ThemeEditorSaveKind::Create { appearance } => ThemeEditorAfterSave::SelectCreated {
+            theme_id: theme_id.to_string(),
+            appearance,
+        },
+        ThemeEditorSaveKind::Update => ThemeEditorAfterSave::CloseUpdated,
+    }
+}
+
+fn theme_editor_should_rollback_create_on_select_failure(kind: ThemeEditorSaveKind) -> bool {
+    matches!(kind, ThemeEditorSaveKind::Create { .. })
+}
+
+fn theme_editor_create_activation_failure_message(
+    activation_error: &str,
+    rollback: Result<(), String>,
+) -> String {
+    match rollback {
+        Ok(()) => format!(
+            "Could not activate the new theme ({activation_error}). The theme was not kept."
+        ),
+        Err(cleanup) => format!(
+            "Could not activate the new theme ({activation_error}). Cleanup also failed: {cleanup}"
+        ),
+    }
+}
+
+fn theme_editor_duplicate_draft_spec(
+    source_id: &str,
+    source_label: &str,
+    occupied: &dyn Fn(&str) -> bool,
+) -> ThemeEditorDuplicateDraftSpec {
+    let (theme_id, label) = unique_duplicate_theme_identity(source_id, source_label, occupied);
+    ThemeEditorDuplicateDraftSpec {
+        editing_id: None,
+        theme_id,
+        seed_theme_id: source_id.to_string(),
+        label,
+        persists_before_save: false,
+    }
+}
+
+impl ThemeRemovalIntent {
+    fn clear(&mut self) {
+        self.pending_id = None;
+    }
+
+    fn request(&mut self, theme_id: &str) -> ThemeRemovalDecision {
+        if self.pending_id.as_deref() == Some(theme_id) {
+            self.pending_id = None;
+            ThemeRemovalDecision::ConfirmRemove(theme_id.to_string())
+        } else {
+            self.pending_id = Some(theme_id.to_string());
+            ThemeRemovalDecision::ArmConfirm
+        }
+    }
+
+    fn is_armed(&self, theme_id: &str) -> bool {
+        self.pending_id.as_deref() == Some(theme_id)
+    }
+}
+
+fn theme_editor_role_groups() -> &'static [(&'static str, &'static [ThemeColorRole])] {
+    &[
+        (
+            "Foundation",
+            &[
+                ThemeColorRole::Canvas,
+                ThemeColorRole::Chrome,
+                ThemeColorRole::Toolbar,
+                ThemeColorRole::ToolbarForeground,
+                ThemeColorRole::ToolbarBorder,
+                ThemeColorRole::ToolbarControl,
+                ThemeColorRole::ToolbarControlForeground,
+                ThemeColorRole::ToolbarControlHover,
+                ThemeColorRole::Surface,
+                ThemeColorRole::SurfaceRaised,
+                ThemeColorRole::SurfaceOverlay,
+                ThemeColorRole::Text,
+                ThemeColorRole::TextMuted,
+                ThemeColorRole::Border,
+                ThemeColorRole::Input,
+            ],
+        ),
+        (
+            "Brand & content",
+            &[
+                ThemeColorRole::Focus,
+                ThemeColorRole::Accent,
+                ThemeColorRole::AccentForeground,
+                ThemeColorRole::Secondary,
+                ThemeColorRole::SecondaryForeground,
+                ThemeColorRole::Muted,
+                ThemeColorRole::MutedForeground,
+                ThemeColorRole::Placeholder,
+                ThemeColorRole::SecondaryLabel,
+                ThemeColorRole::IconMuted,
+                ThemeColorRole::AccentSurface,
+                ThemeColorRole::AccentSurfaceForeground,
+                ThemeColorRole::MessageSurface,
+                ThemeColorRole::MessageForeground,
+                ThemeColorRole::MessageAction,
+                ThemeColorRole::MessageActionForeground,
+                ThemeColorRole::MessageActionHover,
+            ],
+        ),
+        (
+            "Status",
+            &[
+                ThemeColorRole::Error,
+                ThemeColorRole::ErrorForeground,
+                ThemeColorRole::ErrorSurface,
+                ThemeColorRole::Warning,
+                ThemeColorRole::WarningForeground,
+                ThemeColorRole::WarningSurface,
+                ThemeColorRole::Update,
+                ThemeColorRole::UpdateForeground,
+                ThemeColorRole::UpdateSurface,
+            ],
+        ),
+        (
+            "Chrome & terminal",
+            &[
+                ThemeColorRole::CodeBackground,
+                ThemeColorRole::CodeForeground,
+                ThemeColorRole::Sidebar,
+                ThemeColorRole::SidebarForeground,
+                ThemeColorRole::SidebarMutedForeground,
+                ThemeColorRole::SidebarControlSurface,
+                ThemeColorRole::SidebarRowHover,
+                ThemeColorRole::SidebarRowActive,
+                ThemeColorRole::SidebarRowSelected,
+                ThemeColorRole::SidebarBorder,
+                ThemeColorRole::TerminalBackground,
+                ThemeColorRole::TerminalForeground,
+                ThemeColorRole::TerminalCursor,
+                ThemeColorRole::TerminalSelection,
+                ThemeColorRole::TerminalScrollbar,
+                ThemeColorRole::TerminalScrollbarHover,
+            ],
+        ),
+    ]
+}
+
+fn discard_theme_editor_draft(editor: &mut Option<ThemeEditorState>) {
+    *editor = None;
+}
+
+fn theme_role_display_label(role: ThemeColorRole) -> &'static str {
+    match role {
+        ThemeColorRole::Canvas => "Background",
+        ThemeColorRole::Accent => "Accent",
+        other => other.as_str(),
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ProjectInboxItem {
     Project {
@@ -2011,6 +2659,10 @@ enum ProjectInboxItem {
     Task {
         project_id: ProjectId,
         task_id: TaskId,
+        settled: bool,
+    },
+    DoneHeader {
+        task_count: usize,
     },
 }
 
@@ -4503,6 +5155,26 @@ async fn execute_native_command(
                 .await
                 .map(NativeHostExecutionResult::Command)
         }
+        NativeHostCommand::TaskLifecycle {
+            task_id,
+            expected_task_revision,
+            command,
+            command_id,
+            issued_at_ms,
+        } => {
+            let envelope = crate::domain::command::CommandEnvelope {
+                command_id,
+                client_id: client.client_id(),
+                task_id: Some(task_id),
+                issued_at_ms,
+                expected_task_revision: Some(expected_task_revision),
+                command,
+            };
+            client
+                .execute_command(envelope)
+                .await
+                .map(NativeHostExecutionResult::Command)
+        }
         NativeHostCommand::ServiceControl {
             action_id,
             arguments,
@@ -5505,13 +6177,20 @@ impl NativeInteraction {
         let request_task = match &request {
             ActionRequest::TaskShow { task_id } => Some(*task_id),
             ActionRequest::TaskRename(arguments) => Some(arguments.task_id),
+            ActionRequest::TaskSettle { task_id } | ActionRequest::TaskReopen { task_id } => {
+                Some(*task_id)
+            }
             ActionRequest::TaskArchive { task_id } => Some(*task_id),
             ActionRequest::ProviderInput(arguments) => Some(arguments.arguments.task_id),
             ActionRequest::StartProviderSession(arguments) => Some(arguments.task_id),
             ActionRequest::TaskCockpit { task_id, query } => match query {
                 TaskCockpitQuery::ConfigSnapshot
                 | TaskCockpitQuery::AgentConnection
-                | TaskCockpitQuery::ConfigCreateProject { .. } => None,
+                | TaskCockpitQuery::ConfigCreateProject { .. }
+                | TaskCockpitQuery::ConfigUpsertCommand { .. }
+                | TaskCockpitQuery::ConfigArchiveCommand { .. }
+                | TaskCockpitQuery::ConfigRunCommand { .. }
+                | TaskCockpitQuery::ConfigCommandDetail { .. } => None,
                 _ => Some(*task_id),
             },
             ActionRequest::Browser(arguments) => Some(arguments.task_id()),
@@ -5531,7 +6210,9 @@ impl NativeInteraction {
                 }
                 (Some(task.task.revision), Some(task.task.action_epoch))
             }
-            ActionRequest::TaskArchive { task_id } => {
+            ActionRequest::TaskSettle { task_id }
+            | ActionRequest::TaskReopen { task_id }
+            | ActionRequest::TaskArchive { task_id } => {
                 let model = self.client_model.as_ref()?;
                 let task = model.tasks().get(task_id)?;
                 if task.task.revision == 0 {
@@ -5622,6 +6303,22 @@ impl NativeInteraction {
                 task_id: *task_id,
                 expected_task_revision: expected_task_revision
                     .expect("archive revision was validated above"),
+                command_id,
+                issued_at_ms,
+            },
+            ActionRequest::TaskSettle { task_id } => NativeHostCommand::TaskLifecycle {
+                task_id: *task_id,
+                expected_task_revision: expected_task_revision
+                    .expect("settle revision was validated above"),
+                command: crate::domain::command::Command::SettleTask,
+                command_id,
+                issued_at_ms,
+            },
+            ActionRequest::TaskReopen { task_id } => NativeHostCommand::TaskLifecycle {
+                task_id: *task_id,
+                expected_task_revision: expected_task_revision
+                    .expect("reopen revision was validated above"),
+                command: crate::domain::command::Command::ReopenTask,
                 command_id,
                 issued_at_ms,
             },
@@ -5798,6 +6495,10 @@ pub struct AccessibilityTree {
 }
 
 impl AccessibilityTree {
+    fn push_dynamic_overlay_nodes(&mut self, nodes: Vec<AccessibilityNode>) {
+        self.root.children.extend(nodes);
+    }
+
     fn header_settings_node() -> AccessibilityNode {
         AccessibilityNode::new(
             AccessibleRole::Button,
@@ -5856,6 +6557,18 @@ impl AccessibilityTree {
         let codex_available = available_agents
             .iter()
             .any(|action| action.provider == ProviderKind::Codex);
+        let selected_is_settled = selected_task.is_some_and(|selected| {
+            project_items.iter().any(|item| {
+                matches!(
+                    item,
+                    ProjectInboxItem::Task {
+                        task_id,
+                        settled: true,
+                        ..
+                    } if *task_id == selected
+                )
+            })
+        });
         let mut task_element_ids = BTreeMap::new();
         let mut project_action_elements = BTreeMap::new();
         let mut rows = Vec::new();
@@ -5949,7 +6662,7 @@ impl AccessibilityTree {
                     {
                         push_task_row(&mut rows, &mut task_element_ids, *task_id);
                     }
-                    ProjectInboxItem::Task { .. } => {}
+                    ProjectInboxItem::Task { .. } | ProjectInboxItem::DoneHeader { .. } => {}
                 }
             }
         }
@@ -5984,6 +6697,22 @@ impl AccessibilityTree {
             )
             .gpui("native-task-delete", true, true)
         });
+        let settle_selected = selected_task.filter(|_| !selected_is_settled).map(|_| {
+            AccessibilityNode::new(
+                AccessibleRole::Button,
+                "Done",
+                "Move the selected task to the reversible Done section.",
+            )
+            .gpui("native-task-settle", true, true)
+        });
+        let restore_selected = selected_task.filter(|_| selected_is_settled).map(|_| {
+            AccessibilityNode::new(
+                AccessibleRole::Button,
+                "Restore",
+                "Return the selected Done task to the active list.",
+            )
+            .gpui("native-task-restore", true, true)
+        });
         let inbox = AccessibilityNode::new(
             AccessibleRole::Region,
             "Task inbox",
@@ -5994,6 +6723,8 @@ impl AccessibilityTree {
             std::iter::once(inbox_status)
                 .chain(rows)
                 .chain(project_action)
+                .chain(settle_selected)
+                .chain(restore_selected)
                 .chain(delete_selected)
                 .collect::<Vec<_>>(),
         );
@@ -6020,6 +6751,24 @@ impl AccessibilityTree {
                 },
             )
             .gpui("native-shell-header-attachment", false, false),
+            AccessibilityNode::new(
+                AccessibleRole::Button,
+                "Add action",
+                "Open the project action menu for the selected project.",
+            )
+            .gpui("native-shell-tools-affordance", true, true),
+            AccessibilityNode::new(
+                AccessibleRole::Button,
+                "Open",
+                "Open the selected task Files panel through typed workspace authority.",
+            )
+            .gpui("native-task-open", true, true),
+            AccessibilityNode::new(
+                AccessibleRole::Button,
+                "Commit",
+                "Review git changes and confirm a commit for the selected task repository.",
+            )
+            .gpui("native-task-commit", true, true),
             AccessibilityNode::new(
                 AccessibleRole::Button,
                 "Toggle right panel",
@@ -6107,7 +6856,20 @@ impl AccessibilityTree {
             "Task context dock",
             "Changes, files, browser, services, artifacts, and review tabs follow the selected task independently of the center canvas.",
         )
-        .gpui("native-shell-context-dock", false, false);
+        .gpui("native-shell-context-dock", false, false)
+        .with_children(
+            NATIVE_DOCK_TABS
+                .iter()
+                .map(|(tool, element_id, _)| {
+                    AccessibilityNode::new(
+                        AccessibleRole::Button,
+                        tool.label(),
+                        format!("Show the {} task context panel.", tool.label()),
+                    )
+                    .gpui(*element_id, true, true)
+                })
+                .collect(),
+        );
         let root = AccessibilityNode::new(
             AccessibleRole::Region,
             "DevManager",
@@ -6708,6 +7470,8 @@ pub struct NativeShell {
     connect_host_port: Option<Arc<HostClientConnectPort>>,
     host_state: NativeHostState,
     preferences: RuntimePreferencesSnapshot,
+    theme_controller: ThemeController,
+    theme_error: Option<String>,
     header_attachment: NativeHeaderAttachment,
     client_model: Option<Arc<ClientModel>>,
     inbox: Inbox,
@@ -6750,6 +7514,9 @@ pub struct NativeShell {
     /// AccessKit actions arrive outside a Window update; the next render owns
     /// the actual GPUI focus transfer.
     pending_composer_focus: bool,
+    /// Opening task search from the sidebar or shortcut must take keyboard
+    /// ownership from the composer on the next rendered frame.
+    pending_task_search_focus: bool,
     /// Accepted provider-menu commands move focus into the existing raw
     /// terminal on the next frame so arrow/Enter/Escape reach that same PTY.
     pending_terminal_focus: bool,
@@ -6800,16 +7567,52 @@ pub struct NativeShell {
     last_window_persist: Option<Instant>,
     add_project: Option<AddProjectDraft>,
     settings_open: bool,
+    settings_page: NativeSettingsPage,
+    theme_editor: Option<ThemeEditorState>,
+    theme_remove_intent: ThemeRemovalIntent,
+    theme_feedback: Option<String>,
     pending_folder_prompt: bool,
+    /// AccessKit cannot open a native path prompt directly. The controller
+    /// consumes this one-shot request on the GPUI application thread.
+    pending_composer_image_prompt: bool,
     new_task: Option<NewTaskDraft>,
     selected_project_id: Option<ProjectId>,
     collapsed_projects: HashSet<ProjectId>,
     palette_index: usize,
     pending_select_task: Option<TaskId>,
+    task_search: TaskSearchState,
+    project_scope_menu: ProjectScopeMenuState,
+    project_actions: ProjectActionWorkflow,
+    header_commit: HeaderCommitWorkflow,
+    /// Task-scoped Changes/Commit repository selection (not persisted).
+    selected_repository: Option<(TaskId, TaskRepositorySelector)>,
+    browser_page_bounds: Option<crate::browser::BrowserBounds>,
+    browser_parent_hwnd: Option<u64>,
+    browser_dock_diagnostic: Option<String>,
+    browser_bridge: BrowserCommandBridge,
+    browser_inbox: Option<BrowserCommandInbox>,
+    browser_gateway: Option<BrowserGatewayHandle>,
+    browser_registration: Option<BrowserGatewayRegistration>,
+    browser_address_draft: String,
+    browser_address_focused: bool,
+    browser_address_select_all: bool,
+    pending_browser_commands: std::collections::VecDeque<(BrowserWorkspaceKey, BrowserCommand)>,
+    composer_file_candidates: Vec<TriggerSuggestion>,
+    trigger_menu: Option<TriggerMenuState>,
+    /// Explicit HOLD marker kept readable in source for skill trigger honesty.
+    #[allow(dead_code)]
+    skill_trigger_hold: &'static str,
     /// Debug-preview-only semantic data used to prove the canonical Tasks card
     /// without persisting fake provider events or sending a provider prompt.
     #[cfg(debug_assertions)]
     preview_plan_steps: Option<Vec<PreviewPlanStep>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum NativeSettingsPage {
+    #[default]
+    Appearance,
+    Providers,
 }
 
 /// What the main conversation canvas should show for the current selection.
@@ -6842,6 +7645,12 @@ impl Drop for NativeShell {
                 let _ = self.browser_host.apply_native_shell_command(&command);
                 let _ = self.cockpit.finish_browser_detach();
             }
+        }
+        if let (Some(gateway), Some(registration)) = (
+            self.browser_gateway.as_ref(),
+            self.browser_registration.take(),
+        ) {
+            gateway.registrar().revoke(&registration);
         }
         let _ = self.browser_host.drain_events();
 
@@ -7103,6 +7912,14 @@ impl NativeShell {
             .unwrap_or_default();
         interaction.sync_host_epochs(initial_epochs);
         let browser_profile_root = profile.root().to_path_buf();
+        let browser_bridge_init = browser_command_channel(64);
+        let (theme_controller, theme_error) = match ThemeController::load_at(profile.root()) {
+            Ok(controller) => (controller, None),
+            Err(error) => (
+                ThemeController::with_defaults_at(profile.root()),
+                Some(error.to_string()),
+            ),
+        };
         let mut shell = Self {
             host_connection: profile.host_connection(),
             profile,
@@ -7113,6 +7930,8 @@ impl NativeShell {
             connect_host_port,
             host_state,
             preferences,
+            theme_controller,
+            theme_error,
             header_attachment,
             client_model: None,
             inbox,
@@ -7154,6 +7973,7 @@ impl NativeShell {
             composer: None,
             composer_accessibility_focused: false,
             pending_composer_focus: false,
+            pending_task_search_focus: false,
             pending_terminal_focus: false,
             composer_marked_range: None,
             pending_composer_submissions: BTreeMap::new(),
@@ -7188,15 +8008,43 @@ impl NativeShell {
             last_window_persist: None,
             add_project: None,
             settings_open: false,
+            settings_page: NativeSettingsPage::Appearance,
+            theme_editor: None,
+            theme_remove_intent: ThemeRemovalIntent::default(),
+            theme_feedback: None,
             pending_folder_prompt: false,
+            pending_composer_image_prompt: false,
             new_task: None,
             selected_project_id: None,
             collapsed_projects: HashSet::new(),
+            task_search: TaskSearchState::default(),
+            project_scope_menu: ProjectScopeMenuState::default(),
+            project_actions: ProjectActionWorkflow::default(),
+            header_commit: HeaderCommitWorkflow::default(),
+            selected_repository: None,
+            browser_page_bounds: None,
+            browser_parent_hwnd: None,
+            browser_dock_diagnostic: None,
+            browser_bridge: browser_bridge_init.0,
+            browser_inbox: Some(browser_bridge_init.1),
+            browser_gateway: None,
+            browser_registration: None,
+            browser_address_draft: String::new(),
+            browser_address_focused: false,
+            browser_address_select_all: false,
+            pending_browser_commands: std::collections::VecDeque::new(),
+            composer_file_candidates: Vec::new(),
+            trigger_menu: None,
+            skill_trigger_hold: SKILL_TRIGGER_HOLD,
             palette_index: 0,
             pending_select_task: None,
             #[cfg(debug_assertions)]
             preview_plan_steps: None,
         };
+        #[cfg(not(test))]
+        {
+            shell.reconcile_native_browser_gateway();
+        }
         if start_controller {
             shell.start_controller(cx);
         }
@@ -7238,6 +8086,546 @@ impl NativeShell {
         self.preferences
     }
 
+    fn theme_tokens(&self) -> crate::ui::tokens::ThemeTokens {
+        if self.preferences.mode() == crate::ui::tokens::ThemeMode::HighContrast {
+            return self.preferences.tokens();
+        }
+        let system = match self.preferences.mode() {
+            crate::ui::tokens::ThemeMode::Light => ThemeAppearance::Light,
+            crate::ui::tokens::ThemeMode::Dark | crate::ui::tokens::ThemeMode::HighContrast => {
+                ThemeAppearance::Dark
+            }
+        };
+        self.theme_controller
+            .active_palette(system)
+            .tokens(self.preferences.density(), self.preferences.scale())
+    }
+
+    fn close_settings(&mut self) {
+        self.settings_open = false;
+        self.cancel_theme_editor();
+        self.theme_remove_intent.clear();
+        self.theme_feedback = None;
+    }
+
+    fn cancel_theme_editor(&mut self) {
+        discard_theme_editor_draft(&mut self.theme_editor);
+        self.theme_controller.cancel_preview();
+    }
+
+    fn theme_id_occupied(&self, id: &str) -> bool {
+        self.theme_controller.library().get(id).is_some()
+    }
+
+    fn new_theme_color_field(label: &str, value: &str) -> TextField {
+        let mut field = TextField::new(label).expect("theme color field");
+        let _ = field.set_value(value);
+        field.focus();
+        field.blur();
+        field
+    }
+
+    fn seed_theme_editor_fields_from_half(
+        half: &ThemeEditorHalfDraft,
+    ) -> (TextField, TextField, Vec<(ThemeColorRole, TextField)>) {
+        let canvas = Self::new_theme_color_field("Background", &half.canvas);
+        let accent = Self::new_theme_color_field("Accent", &half.accent);
+        let role_fields = ThemeColorRole::ALL
+            .iter()
+            .copied()
+            .map(|role| {
+                let value = half
+                    .roles
+                    .get(&role)
+                    .cloned()
+                    .unwrap_or_else(|| "#000000".into());
+                (
+                    role,
+                    Self::new_theme_color_field(theme_role_display_label(role), &value),
+                )
+            })
+            .collect();
+        (canvas, accent, role_fields)
+    }
+
+    fn flush_theme_editor_active_half(editor: &mut ThemeEditorState) {
+        let canvas = editor.canvas.value().to_string();
+        let accent = editor.accent.value().to_string();
+        let roles = editor
+            .role_fields
+            .iter()
+            .map(|(role, field)| (*role, field.value().to_string()))
+            .collect::<Vec<_>>();
+        editor.halves.flush_active(&canvas, &accent, roles);
+    }
+
+    fn load_theme_editor_active_half(editor: &mut ThemeEditorState) {
+        let half = editor.halves.half(editor.halves.active).clone();
+        let _ = editor.canvas.set_value(&half.canvas);
+        let _ = editor.accent.set_value(&half.accent);
+        for (role, field) in &mut editor.role_fields {
+            let value = half
+                .roles
+                .get(role)
+                .cloned()
+                .unwrap_or_else(|| "#000000".into());
+            let _ = field.set_value(value);
+        }
+    }
+
+    fn fallback_theme_palettes(&self) -> (ThemePalette, ThemePalette) {
+        let light = self
+            .theme_controller
+            .library()
+            .get("t3-code")
+            .and_then(|theme| theme.palette(ThemeAppearance::Light))
+            .cloned()
+            .unwrap_or_else(|| {
+                ThemePalette::managed(
+                    ThemeAppearance::Light,
+                    ThemeColor::from_hex("#fbfafc")
+                        .unwrap_or_else(|_| ThemeColor::rgb(251, 250, 252)),
+                    ThemeColor::from_hex("#d60057").unwrap_or_else(|_| ThemeColor::rgb(214, 0, 87)),
+                )
+            });
+        let dark = self
+            .theme_controller
+            .library()
+            .get("t3-code")
+            .and_then(|theme| theme.palette(ThemeAppearance::Dark))
+            .cloned()
+            .unwrap_or_else(|| {
+                ThemePalette::managed(
+                    ThemeAppearance::Dark,
+                    ThemeColor::from_hex("#18151d").unwrap_or_else(|_| ThemeColor::rgb(24, 21, 29)),
+                    ThemeColor::from_hex("#e0005b").unwrap_or_else(|_| ThemeColor::rgb(224, 0, 91)),
+                )
+            });
+        (light, dark)
+    }
+
+    fn open_theme_editor(
+        &mut self,
+        editing_id: Option<String>,
+        theme_id: String,
+        seed_theme_id: String,
+        label: &str,
+        appearance: ThemeAppearance,
+        mode: ThemeEditorMode,
+    ) {
+        let light = self
+            .theme_controller
+            .library()
+            .get(&seed_theme_id)
+            .and_then(|theme| theme.palette(ThemeAppearance::Light))
+            .cloned();
+        let dark = self
+            .theme_controller
+            .library()
+            .get(&seed_theme_id)
+            .and_then(|theme| theme.palette(ThemeAppearance::Dark))
+            .cloned();
+        let (fallback_light, fallback_dark) = self.fallback_theme_palettes();
+        let is_editing = editing_id.is_some();
+        let halves = theme_editor_seed_halves(
+            is_editing,
+            appearance,
+            light.as_ref(),
+            dark.as_ref(),
+            &fallback_light,
+            &fallback_dark,
+        );
+        let mut name = TextField::new("Theme name").expect("theme name field");
+        let _ = name.set_value(label);
+        name.focus();
+        let (canvas, accent, role_fields) =
+            Self::seed_theme_editor_fields_from_half(halves.half(halves.active));
+        self.theme_editor = Some(ThemeEditorState {
+            theme_id,
+            editing_id,
+            seed_theme_id,
+            name,
+            mode,
+            focused: ThemeEditorFocus::Name,
+            error: None,
+            halves,
+            canvas,
+            accent,
+            role_fields,
+        });
+        self.theme_feedback = None;
+        self.theme_error = None;
+        self.sync_theme_editor_preview();
+    }
+
+    fn resolved_settings_appearance(&self) -> ThemeAppearance {
+        let system_appearance = match self.preferences.mode() {
+            crate::ui::tokens::ThemeMode::Light => ThemeAppearance::Light,
+            crate::ui::tokens::ThemeMode::Dark | crate::ui::tokens::ThemeMode::HighContrast => {
+                ThemeAppearance::Dark
+            }
+        };
+        self.theme_controller
+            .selection()
+            .resolve(system_appearance)
+            .appearance
+    }
+
+    fn begin_create_theme(&mut self) {
+        let appearance = self.resolved_settings_appearance();
+        let seed_theme_id = self
+            .theme_controller
+            .selection()
+            .resolve(appearance)
+            .theme_id;
+        let occupied = |id: &str| self.theme_id_occupied(id);
+        let theme_id = unique_theme_id(&safe_theme_id_from_label("Custom theme"), &occupied);
+        self.open_theme_editor(
+            None,
+            theme_id,
+            seed_theme_id,
+            "Custom theme",
+            appearance,
+            ThemeEditorMode::Guided,
+        );
+    }
+
+    fn begin_edit_theme(&mut self, theme_id: &str) {
+        let Some(theme) = self.theme_controller.library().get(theme_id).cloned() else {
+            self.theme_error = Some("Theme is not installed.".into());
+            return;
+        };
+        if theme.is_built_in() {
+            self.theme_error = Some("Built-in themes must be duplicated before editing.".into());
+            return;
+        }
+        let appearance = self.resolved_settings_appearance();
+        let mode = if theme.managed {
+            ThemeEditorMode::Guided
+        } else {
+            ThemeEditorMode::Advanced
+        };
+        self.open_theme_editor(
+            Some(theme.id.clone()),
+            theme.id.clone(),
+            theme.id.clone(),
+            &theme.label,
+            appearance,
+            mode,
+        );
+    }
+
+    fn begin_duplicate_theme(&mut self, source_id: &str) {
+        let Some(source) = self.theme_controller.library().get(source_id).cloned() else {
+            self.theme_error = Some("Source theme is not installed.".into());
+            return;
+        };
+        let occupied = |id: &str| self.theme_id_occupied(id);
+        let spec = theme_editor_duplicate_draft_spec(&source.id, &source.label, &occupied);
+        debug_assert!(!spec.persists_before_save);
+        debug_assert!(spec.editing_id.is_none());
+        let appearance = self.resolved_settings_appearance();
+        let mode = if source.managed {
+            ThemeEditorMode::Guided
+        } else {
+            ThemeEditorMode::Advanced
+        };
+        self.theme_error = None;
+        self.open_theme_editor(
+            spec.editing_id,
+            spec.theme_id,
+            spec.seed_theme_id,
+            &spec.label,
+            appearance,
+            mode,
+        );
+    }
+
+    fn switch_theme_editor_appearance(&mut self, appearance: ThemeAppearance) {
+        let Some(editor) = self.theme_editor.as_mut() else {
+            return;
+        };
+        if editor.halves.active == appearance {
+            return;
+        }
+        Self::flush_theme_editor_active_half(editor);
+        if let Err(error) = editor.halves.switch_active(appearance) {
+            editor.error = Some(error);
+            return;
+        }
+        Self::load_theme_editor_active_half(editor);
+        editor.error = None;
+        editor.focused = match editor.mode {
+            ThemeEditorMode::Guided => ThemeEditorFocus::Canvas,
+            ThemeEditorMode::Advanced => ThemeEditorFocus::Role(ThemeColorRole::Canvas),
+        };
+        Self::focus_theme_editor_field(editor, editor.focused);
+        self.sync_theme_editor_preview();
+    }
+
+    fn focus_theme_editor_field(editor: &mut ThemeEditorState, focus: ThemeEditorFocus) {
+        editor.name.blur();
+        editor.canvas.blur();
+        editor.accent.blur();
+        for (_, field) in &mut editor.role_fields {
+            field.blur();
+        }
+        editor.focused = focus;
+        match focus {
+            ThemeEditorFocus::Name => {
+                editor.name.focus();
+            }
+            ThemeEditorFocus::Canvas => {
+                editor.canvas.focus();
+            }
+            ThemeEditorFocus::Accent => {
+                editor.accent.focus();
+            }
+            ThemeEditorFocus::Role(role) => {
+                if let Some(index) = editor
+                    .role_fields
+                    .iter()
+                    .position(|(field_role, _)| *field_role == role)
+                {
+                    editor.role_fields[index].1.focus();
+                }
+            }
+        }
+    }
+
+    fn sync_theme_editor_preview(&mut self) {
+        let Some(editor) = self.theme_editor.as_ref() else {
+            return;
+        };
+        let appearance = editor.halves.active;
+        match editor.mode {
+            ThemeEditorMode::Guided => {
+                let canvas_raw = editor.canvas.value().to_string();
+                let accent_raw = editor.accent.value().to_string();
+                if let Some(palette) =
+                    guided_theme_preview_palette(appearance, &canvas_raw, &accent_raw)
+                {
+                    self.theme_controller.preview(palette);
+                    if let Some(editor) = self.theme_editor.as_mut() {
+                        editor.error = None;
+                    }
+                } else if let Some(editor) = self.theme_editor.as_mut() {
+                    let canvas_ok = ThemeColor::parse(&canvas_raw).is_ok();
+                    let accent_ok = ThemeColor::parse(&accent_raw).is_ok();
+                    editor.error = Some(match (canvas_ok, accent_ok) {
+                        (false, false) => "Background and Accent colors are invalid.".into(),
+                        (false, true) => "Background color is invalid.".into(),
+                        (true, false) => "Accent color is invalid.".into(),
+                        (true, true) => "Theme colors are incomplete.".into(),
+                    });
+                }
+            }
+            ThemeEditorMode::Advanced => {
+                let values: Vec<(ThemeColorRole, String)> = editor
+                    .role_fields
+                    .iter()
+                    .map(|(role, field)| (*role, field.value().to_string()))
+                    .collect();
+                match advanced_theme_palette_from_role_values(
+                    values.iter().map(|(role, value)| (*role, value.as_str())),
+                ) {
+                    Ok(palette) => {
+                        self.theme_controller.preview(palette);
+                        if let Some(editor) = self.theme_editor.as_mut() {
+                            editor.error = None;
+                        }
+                    }
+                    Err(error) => {
+                        if let Some(editor) = self.theme_editor.as_mut() {
+                            editor.error = Some(error);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn apply_guided_swatch(&mut self, target: ThemeEditorFocus, hex: &str) {
+        let Some(editor) = self.theme_editor.as_mut() else {
+            return;
+        };
+        match target {
+            ThemeEditorFocus::Canvas => {
+                let _ = editor.canvas.set_value(hex);
+                Self::focus_theme_editor_field(editor, ThemeEditorFocus::Canvas);
+            }
+            ThemeEditorFocus::Accent => {
+                let _ = editor.accent.set_value(hex);
+                Self::focus_theme_editor_field(editor, ThemeEditorFocus::Accent);
+            }
+            _ => {}
+        }
+        self.sync_theme_editor_preview();
+    }
+
+    fn save_theme_editor(&mut self) {
+        let Some(editor) = self.theme_editor.as_mut() else {
+            return;
+        };
+        let label = editor.name.value().trim().to_string();
+        if label.is_empty() {
+            editor.error = Some("Enter a theme name.".into());
+            return;
+        }
+        Self::flush_theme_editor_active_half(editor);
+        let theme_id = editor.theme_id.clone();
+        let editing_id = editor.editing_id.clone();
+        let appearance = editor.halves.active;
+        let mode = editor.mode;
+        let save_kind = theme_editor_save_kind(editing_id.as_deref(), appearance);
+        let palettes = match theme_editor_save_palettes(editing_id.is_some(), &editor.halves, mode)
+        {
+            Ok(palettes) => palettes,
+            Err(error) => {
+                editor.error = Some(error);
+                return;
+            }
+        };
+        let managed = matches!(mode, ThemeEditorMode::Guided);
+        let result = self.theme_controller.save_theme_definition(
+            editing_id.as_deref(),
+            &theme_id,
+            &label,
+            palettes,
+            managed,
+        );
+        match result {
+            Ok(saved) => {
+                self.theme_controller.cancel_preview();
+                match theme_editor_after_save(save_kind, &saved.id) {
+                    ThemeEditorAfterSave::SelectCreated {
+                        theme_id: created_id,
+                        appearance: created_appearance,
+                    } => {
+                        if let Err(error) = self
+                            .theme_controller
+                            .select_theme(&created_id, created_appearance)
+                        {
+                            let rollback =
+                                if theme_editor_should_rollback_create_on_select_failure(save_kind)
+                                {
+                                    self.theme_controller
+                                        .remove_custom_theme(&created_id)
+                                        .map_err(|cleanup| cleanup.to_string())
+                                } else {
+                                    Ok(())
+                                };
+                            let message = theme_editor_create_activation_failure_message(
+                                &error.to_string(),
+                                rollback,
+                            );
+                            // Resync first: a valid draft preview clears editor.error.
+                            // Install the activation/cleanup message afterward so it stays visible.
+                            self.theme_feedback = None;
+                            self.sync_theme_editor_preview();
+                            if let Some(editor) = self.theme_editor.as_mut() {
+                                editor.error = Some(message);
+                            }
+                            return;
+                        }
+                        discard_theme_editor_draft(&mut self.theme_editor);
+                        self.theme_feedback = Some(format!("Saved “{}”.", saved.label));
+                        self.theme_error = None;
+                    }
+                    ThemeEditorAfterSave::CloseUpdated => {
+                        discard_theme_editor_draft(&mut self.theme_editor);
+                        self.theme_feedback = Some(format!("Saved “{}”.", saved.label));
+                        self.theme_error = None;
+                    }
+                }
+            }
+            Err(error) => {
+                if let Some(editor) = self.theme_editor.as_mut() {
+                    editor.error = Some(error.to_string());
+                }
+            }
+        }
+    }
+
+    fn import_theme_from_clipboard(&mut self, cx: &mut Context<Self>) {
+        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+            self.theme_error = Some("Clipboard is empty. Copy a theme JSON file first.".into());
+            self.theme_feedback = None;
+            return;
+        };
+        match self.theme_controller.install_theme_file(&text) {
+            Ok(theme) => {
+                self.theme_error = None;
+                self.theme_feedback = Some(format!("Imported “{}”.", theme.label));
+                self.theme_remove_intent.clear();
+            }
+            Err(error) => {
+                self.theme_feedback = None;
+                self.theme_error = Some(format!("Import failed: {error}"));
+            }
+        }
+    }
+
+    fn export_theme_to_clipboard(&mut self, theme_id: &str, cx: &mut Context<Self>) {
+        match self.theme_controller.export_theme(theme_id) {
+            Ok(json) => {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(json));
+                self.theme_error = None;
+                self.theme_feedback = Some("Theme JSON copied to clipboard.".into());
+            }
+            Err(error) => {
+                self.theme_feedback = None;
+                self.theme_error = Some(format!("Export failed: {error}"));
+            }
+        }
+    }
+
+    fn request_remove_custom_theme(&mut self, theme_id: &str) {
+        match self.theme_remove_intent.request(theme_id) {
+            ThemeRemovalDecision::ArmConfirm => {
+                self.theme_feedback =
+                    Some("Click Remove again to confirm deleting this custom theme.".into());
+                self.theme_error = None;
+            }
+            ThemeRemovalDecision::ConfirmRemove(id) => {
+                match self.theme_controller.remove_custom_theme(&id) {
+                    Ok(()) => {
+                        if self.theme_editor.as_ref().is_some_and(|editor| {
+                            editor.theme_id == id
+                                || editor.editing_id.as_deref() == Some(id.as_str())
+                        }) {
+                            self.cancel_theme_editor();
+                        }
+                        self.theme_feedback = Some("Custom theme removed.".into());
+                        self.theme_error = None;
+                    }
+                    Err(error) => {
+                        self.theme_feedback = None;
+                        self.theme_error = Some(format!("Remove failed: {error}"));
+                    }
+                }
+            }
+        }
+    }
+
+    fn theme_editor_active_field_mut(editor: &mut ThemeEditorState) -> &mut TextField {
+        match editor.focused {
+            ThemeEditorFocus::Name => &mut editor.name,
+            ThemeEditorFocus::Canvas => &mut editor.canvas,
+            ThemeEditorFocus::Accent => &mut editor.accent,
+            ThemeEditorFocus::Role(role) => {
+                let index = editor
+                    .role_fields
+                    .iter()
+                    .position(|(field_role, _)| *field_role == role);
+                match index {
+                    Some(index) => &mut editor.role_fields[index].1,
+                    None => &mut editor.name,
+                }
+            }
+        }
+    }
+
     pub fn agent_connection(&self) -> Option<&AgentConnectionSnapshot> {
         self.agent_connection.as_ref()
     }
@@ -7274,6 +8662,151 @@ impl NativeShell {
             &project_items,
             composer.as_ref(),
         );
+        let mut overlay_nodes = Vec::new();
+        if !matches!(self.project_actions.mode, ProjectActionMenuMode::Closed) {
+            overlay_nodes.push(
+                AccessibilityNode::new(
+                    AccessibleRole::Menu,
+                    "Project actions",
+                    "Add, edit, run, or archive project actions.",
+                )
+                .gpui("native-project-action-panel", true, true),
+            );
+            if matches!(self.project_actions.mode, ProjectActionMenuMode::Editor(_)) {
+                overlay_nodes.push(
+                    AccessibilityNode::new(
+                        AccessibleRole::TextField,
+                        "Action name",
+                        "Edit the project action name.",
+                    )
+                    .gpui("native-project-action-name", true, true),
+                );
+                overlay_nodes.push(
+                    AccessibilityNode::new(
+                        AccessibleRole::TextField,
+                        "Action command",
+                        "Edit the project action command.",
+                    )
+                    .gpui("native-project-action-command", true, true),
+                );
+            }
+        }
+        if !matches!(self.header_commit.phase, HeaderCommitPhase::Idle) {
+            overlay_nodes.push(
+                AccessibilityNode::new(
+                    AccessibleRole::Region,
+                    "Commit changes",
+                    "Preview, confirm, and review commit results.",
+                )
+                .gpui("native-commit-panel", true, true),
+            );
+        }
+        if self.task_search.open() {
+            overlay_nodes.push(
+                AccessibilityNode::new(
+                    AccessibleRole::TextField,
+                    "Search tasks",
+                    "Filter the visible tasks and choose a result.",
+                )
+                .gpui("native-task-search-input", true, true)
+                .with_value(self.task_search.query().to_string())
+                .with_focus(self.task_search.focused()),
+            );
+        }
+        if self
+            .trigger_menu
+            .as_ref()
+            .is_some_and(|menu| !menu.suggestions.is_empty())
+        {
+            overlay_nodes.push(
+                AccessibilityNode::new(
+                    AccessibleRole::Menu,
+                    "Composer suggestions",
+                    "Choose a file or slash command suggestion.",
+                )
+                .gpui("native-composer-trigger-panel", true, true),
+            );
+        }
+        if self.cockpit.active_tool() == CockpitDockTool::Changes && !self.layout.dock_collapsed {
+            if let Some(task_id) = self.interaction.selected_task() {
+                let selected = self.selected_repository_for_task(task_id);
+                let panel = ChangesPanelProjection::from_host(
+                    self.cockpit
+                        .live_projection()
+                        .and_then(|projection| projection.git.as_ref()),
+                    self.cockpit
+                        .live_projection()
+                        .and_then(|projection| projection.repositories.as_ref()),
+                    selected.as_ref(),
+                    task_id,
+                    None,
+                );
+                for row in panel.repositories {
+                    let description = if !row.available {
+                        format!("{} is unavailable and cannot be selected.", row.label)
+                    } else if row.read_only {
+                        format!(
+                            "Select the {} repository ({}) for Changes status. This repository is read-only.",
+                            row.label, row.scope_label
+                        )
+                    } else {
+                        format!(
+                            "Select the {} repository ({}) for Changes status.",
+                            row.label, row.scope_label
+                        )
+                    };
+                    overlay_nodes.push(
+                        AccessibilityNode::new(
+                            AccessibleRole::Button,
+                            format!("{} · {} · {}", row.label, row.scope_label, row.state_label),
+                            description,
+                        )
+                        .gpui(row.element_id, row.available, row.available),
+                    );
+                }
+            }
+        }
+        if self.cockpit.active_tool() == CockpitDockTool::Browser && !self.layout.dock_collapsed {
+            for (id, label, description) in [
+                (
+                    "native-browser-back",
+                    "Back",
+                    "Navigate to the previous browser page.",
+                ),
+                (
+                    "native-browser-forward",
+                    "Forward",
+                    "Navigate to the next browser page.",
+                ),
+                (
+                    "native-browser-reload",
+                    "Reload",
+                    "Reload the active browser page.",
+                ),
+                (
+                    "native-browser-go",
+                    "Go",
+                    "Navigate to the entered address.",
+                ),
+            ] {
+                overlay_nodes.push(
+                    AccessibilityNode::new(AccessibleRole::Button, label, description)
+                        .gpui(id, true, true),
+                );
+            }
+            overlay_nodes.push(
+                AccessibilityNode::new(
+                    AccessibleRole::TextField,
+                    "Browser address",
+                    "Enter a URL for the task browser.",
+                )
+                .gpui("native-browser-address", true, true),
+            );
+        }
+        if !overlay_nodes.is_empty() {
+            self.accessibility_tree
+                .push_dynamic_overlay_nodes(overlay_nodes);
+        }
         self.platform_accessibility.sync(&self.accessibility_tree);
     }
 
@@ -7375,7 +8908,7 @@ impl NativeShell {
         }
     }
 
-    fn apply_query_body(&mut self, body: NativeHostQueryBody) {
+    fn apply_query_body(&mut self, action: &NativeActionRecord, body: NativeHostQueryBody) {
         match body {
             NativeHostQueryBody::Text => {}
             NativeHostQueryBody::ConfigSidebar(snapshot) => {
@@ -7399,9 +8932,77 @@ impl NativeShell {
                     self.sync_header_projection();
                     self.refresh_accessibility_tree();
                 }
+                // Projection always sees the result first; commit correlation uses the
+                // originating action command afterward (no query loops from paint).
                 self.cockpit.apply_cockpit_result(&result);
+                if let crate::domain::TaskCockpitResult::BrowserProcessSession(projection) = &result
+                {
+                    self.apply_browser_process_session(projection);
+                }
                 if let crate::domain::TaskCockpitResult::Services(services) = &result {
                     self.services_projection = project_services_from_task_projection(services);
+                }
+                if let crate::domain::TaskCockpitResult::Git(projection) = &result {
+                    if let Some((request_id, command_task_id, query)) =
+                        Self::task_cockpit_command_parts(&action.command)
+                    {
+                        self.header_commit.apply_status_from_command(
+                            projection,
+                            request_id,
+                            command_task_id,
+                            query,
+                        );
+                        let _ = self.header_commit.complete_from_command(
+                            projection,
+                            request_id,
+                            command_task_id,
+                            query,
+                        );
+                    }
+                }
+                if let crate::domain::TaskCockpitResult::GitRepositories(catalog) = &result {
+                    self.apply_repository_catalog(catalog);
+                }
+                if let crate::domain::TaskCockpitResult::FilesList(list) = &result {
+                    self.composer_file_candidates = list
+                        .entries
+                        .iter()
+                        .filter(|entry| !entry.secret)
+                        .map(|entry| TriggerSuggestion {
+                            label: entry.relative_path.clone(),
+                            insert: PromptSegment::FileRef {
+                                relative_path: entry.relative_path.clone(),
+                                is_directory: entry.is_directory,
+                            },
+                        })
+                        .collect();
+                    self.refresh_composer_trigger_menu();
+                }
+                if let crate::domain::TaskCockpitResult::ConfigCommandDetail(detail) = &result {
+                    let row = ProjectActionRow {
+                        project_config_id: detail.project_id.clone(),
+                        folder_id: detail.folder_id.clone(),
+                        command_id: detail.command_id.clone(),
+                        label: detail.label.clone(),
+                    };
+                    self.project_actions
+                        .apply_command_detail(&row, detail.command.clone());
+                }
+                if let crate::domain::TaskCockpitResult::Denied { reason, .. } = &result {
+                    self.fail_header_commit_from_action(
+                        action,
+                        format!("Commit denied: {reason:?}"),
+                    );
+                }
+                if let crate::domain::TaskCockpitResult::Unavailable { reason, .. } = &result {
+                    self.fail_header_commit_from_action(
+                        action,
+                        format!("Commit failed: {reason:?}"),
+                    );
+                    if !matches!(self.project_actions.mode, ProjectActionMenuMode::Closed) {
+                        self.project_actions
+                            .surface_error(format!("Host unavailable: {reason:?}"));
+                    }
                 }
             }
             NativeHostQueryBody::PromptLibrary(reply) => {
@@ -7423,6 +9024,86 @@ impl NativeShell {
         }
     }
 
+    fn task_cockpit_command_parts(
+        command: &NativeHostCommand,
+    ) -> Option<(RequestId, TaskId, &TaskCockpitQuery)> {
+        match command {
+            NativeHostCommand::TaskCockpitQuery {
+                request_id,
+                task_id,
+                query,
+            } => Some((*request_id, *task_id, query)),
+            _ => None,
+        }
+    }
+
+    fn fail_header_commit_from_action(&mut self, action: &NativeActionRecord, message: String) {
+        let Some((request_id, command_task_id, query)) =
+            Self::task_cockpit_command_parts(&action.command)
+        else {
+            return;
+        };
+        let _ = self
+            .header_commit
+            .fail_from_command(request_id, command_task_id, query, message);
+    }
+
+    /// Queue a commit status/mutate probe and bind its exact RequestId fence.
+    fn dispatch_header_commit_query(&mut self, task_id: TaskId, query: TaskCockpitQuery) {
+        match self.dispatch_action_recorded(ActionRequest::TaskCockpit {
+            task_id,
+            query: query.clone(),
+        }) {
+            Ok(record) => match native_request_id(&record.command) {
+                Some(request_id)
+                    if matches!(self.header_commit.phase, HeaderCommitPhase::LoadingStatus) =>
+                {
+                    self.header_commit.bind_status_request(request_id);
+                }
+                Some(request_id)
+                    if matches!(
+                        self.header_commit.phase,
+                        HeaderCommitPhase::Confirming { .. }
+                    ) =>
+                {
+                    self.header_commit.bind_mutate_request(request_id);
+                }
+                Some(_) => {}
+                None => self
+                    .header_commit
+                    .fail("Commit host request is missing a request id."),
+            },
+            Err(failure) => match failure.record {
+                None => {
+                    // Before-capture / capacity: fail the active commit immediately.
+                    self.header_commit.fail(failure.message);
+                }
+                Some(record) => {
+                    if let Some(request_id) = native_request_id(&record.command) {
+                        if matches!(self.header_commit.phase, HeaderCommitPhase::LoadingStatus) {
+                            self.header_commit.bind_status_request(request_id);
+                        } else if matches!(
+                            self.header_commit.phase,
+                            HeaderCommitPhase::Confirming { .. }
+                        ) {
+                            self.header_commit.bind_mutate_request(request_id);
+                        }
+                        if !self.header_commit.fail_from_command(
+                            request_id,
+                            task_id,
+                            &query,
+                            failure.message.clone(),
+                        ) {
+                            self.header_commit.fail(failure.message);
+                        }
+                    } else {
+                        self.header_commit.fail(failure.message);
+                    }
+                }
+            },
+        }
+    }
+
     fn refresh_selected_cockpit_surfaces(&mut self) {
         let Some(task_id) = self.interaction.selected_task() else {
             return;
@@ -7437,7 +9118,7 @@ impl NativeShell {
                     },
                     ActionRequest::TaskCockpit {
                         task_id,
-                        query: TaskCockpitQuery::GitStatus,
+                        query: TaskCockpitQuery::GitRepositories,
                     },
                 ],
             ),
@@ -7458,10 +9139,16 @@ impl NativeShell {
                     query: TaskCockpitQuery::ServiceSnapshots,
                 }],
             ),
-            CockpitDockTool::Terminal
-            | CockpitDockTool::Browser
-            | CockpitDockTool::Artifacts
-            | CockpitDockTool::Review => (None, Vec::new()),
+            CockpitDockTool::Browser => (
+                Some(crate::client::action::ACTION_BROWSER_NATIVE),
+                vec![ActionRequest::TaskCockpit {
+                    task_id,
+                    query: TaskCockpitQuery::BrowserProcessSession,
+                }],
+            ),
+            CockpitDockTool::Terminal | CockpitDockTool::Artifacts | CockpitDockTool::Review => {
+                (None, Vec::new())
+            }
         };
         if let Some(action_id) = loading_action {
             self.cockpit.begin_cockpit_query(task_id, action_id);
@@ -7618,6 +9305,10 @@ impl NativeShell {
                             .update(&mut async_cx, |shell, cx| {
                                 if shell.pending_folder_prompt {
                                     shell.schedule_folder_prompt(cx);
+                                }
+                                if shell.pending_composer_image_prompt {
+                                    shell.pending_composer_image_prompt = false;
+                                    shell.schedule_composer_image_picker(cx);
                                 }
                                 let agent_connection = shell.agent_connection.clone();
                                 let repaint = shell.controller_tick(MAX_PENDING_HOST_ACTIONS);
@@ -7809,6 +9500,7 @@ impl NativeShell {
         if is_agent_connection_query_command(&action.command) {
             self.agent_connection = Some(agent_connection_snapshot(AgentPresence::CheckFailed));
         }
+        self.fail_header_commit_from_action(action, format!("Commit failed: {error}"));
         self.discard_native_query_action(action);
         self.last_query_detail = Some(error);
     }
@@ -7824,6 +9516,7 @@ impl NativeShell {
             NativeHostActionResult::Stale => "host query superseded before it was sent",
             NativeHostActionResult::Queued => return,
         };
+        self.fail_header_commit_from_action(action, format!("Commit failed: {detail}"));
         self.discard_native_query_action(action);
         self.last_query_detail = Some(detail.to_string());
         self.restore_connected_host_state();
@@ -8042,7 +9735,7 @@ impl NativeShell {
                     self.conversation_query_in_flight = false;
                 }
                 self.last_query_detail = Some(detail);
-                self.apply_query_body(body);
+                self.apply_query_body(&action, body);
                 if let Some(request_id) = request_id {
                     self.pending_host_actions
                         .retain(|pending| native_request_id(&pending.command) != Some(request_id));
@@ -8502,9 +10195,33 @@ impl NativeShell {
                     self.request_composer_accessibility_focus();
                     repaint = true;
                 }
+                accesskit::Action::Focus if element_id == "native-browser-address" => {
+                    self.browser_address_focused = true;
+                    self.browser_address_select_all = true;
+                    repaint = true;
+                }
+                accesskit::Action::Focus if element_id == "native-task-search-input" => {
+                    self.pending_task_search_focus = true;
+                    repaint = true;
+                }
                 accesskit::Action::SetValue if element_id == "native-task-composer-input" => {
                     if let Some(accesskit::ActionData::Value(value)) = request.data {
                         self.replace_composer_accessibility_value(&value);
+                        repaint = true;
+                    }
+                }
+                accesskit::Action::SetValue if element_id == "native-browser-address" => {
+                    if let Some(accesskit::ActionData::Value(value)) = request.data {
+                        self.browser_address_draft = value.to_string();
+                        self.browser_address_select_all = false;
+                        repaint = true;
+                    }
+                }
+                accesskit::Action::SetValue if element_id == "native-task-search-input" => {
+                    if let Some(accesskit::ActionData::Value(value)) = request.data {
+                        self.task_search.set_query(value);
+                        self.pending_task_search_focus = true;
+                        self.refresh_accessibility_tree();
                         repaint = true;
                     }
                 }
@@ -8513,7 +10230,7 @@ impl NativeShell {
         }
 
         let offset = self.task_scroll_handle.0.borrow().base_handle.offset().y / px(1.0);
-        let metrics = self.preferences.tokens().density.physical();
+        let metrics = self.theme_tokens().density.physical();
         let first_visible = (offset.max(0.0) / metrics.row_height as f32).floor() as usize;
         let _ = self
             .task_list
@@ -8539,6 +10256,9 @@ impl NativeShell {
                 shell.preferences.density(),
             ));
             shell.record_window_frame(window);
+            shell.capture_browser_parent_hwnd(window);
+            shell.pump_pending_browser_commands(window);
+            shell.reconcile_browser_dock_lifecycle(Some(window));
         });
         self.appearance_subscription = Some(appearance);
         self.bounds_subscription = Some(bounds);
@@ -8892,7 +10612,7 @@ impl NativeShell {
     pub fn apply_client_model(&mut self, model: Arc<ClientModel>) -> Result<(), String> {
         let first_canonical = self.client_model.is_none();
         let previous_selected_task = self.interaction.selected_task();
-        let task_list = TaskList::from_client_model_virtual(&model)
+        let task_list = TaskList::from_client_model_with_settled_virtual(&model)
             .map_err(|error| format!("client model task projection failed: {error:?}"))?;
         self.apply_task_list(task_list);
         let selected_task_changed = self.interaction.selected_task() != previous_selected_task;
@@ -8909,10 +10629,38 @@ impl NativeShell {
             selected_task_changed || selected_task_needs_initial_follow,
         );
         if first_canonical {
+            self.restore_active_dock_tool_from_layout();
             let _ = self.dispatch_action(ActionRequest::HostStatus);
             let _ = self.dispatch_agent_connection_query(false);
         }
         Ok(())
+    }
+
+    fn restore_active_dock_tool_from_layout(&mut self) {
+        let tool = match self.layout.active_dock_tab.as_deref() {
+            Some("Changes") => Some(CockpitDockTool::Changes),
+            Some("Files") => Some(CockpitDockTool::Files),
+            Some("Browser") => Some(CockpitDockTool::Browser),
+            Some("Services") => Some(CockpitDockTool::Services),
+            Some("Artifacts") => Some(CockpitDockTool::Artifacts),
+            Some("Review") => Some(CockpitDockTool::Review),
+            _ => None,
+        };
+        let Some(tool) = tool else {
+            return;
+        };
+        if self.cockpit.active_tool() == tool {
+            return;
+        }
+        if self
+            .cockpit
+            .handle_tool_action(tool, RequestId::new())
+            .is_ok()
+        {
+            self.sync_terminal_from_cockpit();
+            self.reconcile_browser_dock_lifecycle(None);
+            self.refresh_selected_cockpit_surfaces();
+        }
     }
 
     /// Project a Tasks-only preview into the inbox without installing ClientModel
@@ -9109,10 +10857,18 @@ impl NativeShell {
             self.persist_layout();
         }
         let Some(task_id) = selected_task else {
+            self.selected_repository = None;
             self.clear_cockpit_projection();
             self.clear_composer_binding();
             return;
         };
+        if self
+            .selected_repository
+            .as_ref()
+            .is_some_and(|(owned_task, _)| *owned_task != task_id)
+        {
+            self.selected_repository = None;
+        }
         self.cockpit.follow_task(task_id);
         let composer_model = if let Some(model) = self.client_model.clone() {
             self.cockpit
@@ -9329,7 +11085,112 @@ impl NativeShell {
         {
             return false;
         }
-        self.insert_slash_command(&selected.command)
+        let inserted = self.insert_slash_command(&selected.command);
+        if inserted {
+            self.refresh_composer_trigger_menu();
+        }
+        inserted
+    }
+
+    /// Keep `@` / `/` trigger menus derived from the closed PromptSegment model.
+    /// `$` remains HOLD until a typed skill projection exists.
+    fn refresh_composer_trigger_menu(&mut self) {
+        let Some(composer) = self.composer.as_ref() else {
+            self.trigger_menu = None;
+            return;
+        };
+        let document = PromptDocument::from_plain_text(
+            self.interaction.selected_task(),
+            composer.draft_text(),
+        );
+        let cursor =
+            ComposerCursor::from_expanded(&document, document.serialize_provider_text().len());
+        let Some(trigger) = detect_trigger(&document, cursor) else {
+            self.trigger_menu = None;
+            return;
+        };
+        if trigger.kind == TriggerKind::Skill {
+            let _ = SKILL_TRIGGER_HOLD;
+            self.trigger_menu = None;
+            return;
+        }
+        let candidates: Vec<TriggerSuggestion> = match trigger.kind {
+            TriggerKind::Command => provider_command_catalog(
+                &self
+                    .active_provider_kind()
+                    .unwrap_or(ProviderKind::ClaudeCode),
+            )
+            .into_iter()
+            .map(|row| TriggerSuggestion {
+                label: row.label,
+                insert: PromptSegment::CommandRef {
+                    command: row.command,
+                },
+            })
+            .collect(),
+            TriggerKind::File => self.composer_file_candidates.clone(),
+            TriggerKind::Skill => Vec::new(),
+        };
+        let suggestions = filter_suggestions(trigger.kind, &trigger.query, &candidates)
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        self.trigger_menu = Some(TriggerMenuState {
+            trigger,
+            selected_index: 0,
+            suggestions,
+        });
+    }
+
+    fn accept_composer_trigger_selection(&mut self) -> bool {
+        let Some(menu) = self.trigger_menu.clone() else {
+            return false;
+        };
+        let Some(suggestion) = menu.selected().cloned() else {
+            return false;
+        };
+        let Some(composer) = self.composer.as_ref() else {
+            return false;
+        };
+        let mut document = PromptDocument::from_plain_text(
+            self.interaction.selected_task(),
+            composer.draft_text(),
+        );
+        if !apply_suggestion(&mut document, &menu.trigger, &suggestion) {
+            return false;
+        }
+        let text = document.serialize_provider_text();
+        self.trigger_menu = None;
+        self.insert_slash_command(&text);
+        self.request_composer_accessibility_focus();
+        true
+    }
+
+    fn request_composer_file_candidates(&mut self) {
+        let Some(task_id) = self.interaction.selected_task() else {
+            return;
+        };
+        let relative_directory = self
+            .trigger_menu
+            .as_ref()
+            .filter(|menu| menu.trigger.kind == TriggerKind::File)
+            .map(|menu| {
+                let query = menu.trigger.query.as_str();
+                if query.contains('/') {
+                    query.rsplit_once('/').map(|(parent, _)| parent.to_string())
+                } else {
+                    None
+                }
+            })
+            .flatten()
+            .filter(|value| !value.is_empty());
+        let _ = self.dispatch_task_cockpit_query(
+            task_id,
+            TaskCockpitQuery::FilesList {
+                relative_directory,
+                limit: 64,
+            },
+        );
     }
 
     fn set_provider_terminal_visible(&mut self, visible: bool) {
@@ -9345,6 +11206,12 @@ impl NativeShell {
                 .dock_mut()
                 .switch_to_semantic(model.as_ref(), None)
         };
+        if let Some(task_id) = self.interaction.selected_task() {
+            self.layout
+                .task_center_terminal
+                .insert(task_id.to_string(), visible);
+            self.persist_layout();
+        }
         if let Err(error) = result {
             self.composer_error = Some(format!("{error:?}"));
         } else {
@@ -9540,6 +11407,14 @@ impl NativeShell {
         self.composer_marked_range = None;
         if changed {
             self.cache_current_composer_draft();
+            self.refresh_composer_trigger_menu();
+            if self
+                .trigger_menu
+                .as_ref()
+                .is_some_and(|menu| menu.trigger.kind == TriggerKind::File)
+            {
+                self.request_composer_file_candidates();
+            }
         }
         let inserted_end = actual_start_utf16.saturating_add(text.encode_utf16().count());
         Ok(actual_start_utf16..inserted_end)
@@ -9561,6 +11436,44 @@ impl NativeShell {
         self.composer_error = None;
         let key = event.keystroke.key.as_str();
         let command = event.keystroke.modifiers.control || event.keystroke.modifiers.platform;
+        if self
+            .trigger_menu
+            .as_ref()
+            .is_some_and(|menu| !menu.suggestions.is_empty())
+        {
+            match key {
+                "escape" => {
+                    self.trigger_menu = None;
+                    window.prevent_default();
+                    cx.stop_propagation();
+                    return;
+                }
+                "up" | "arrowup" => {
+                    if let Some(menu) = self.trigger_menu.as_mut() {
+                        menu.move_selection(-1);
+                    }
+                    window.prevent_default();
+                    cx.stop_propagation();
+                    return;
+                }
+                "down" | "arrowdown" => {
+                    if let Some(menu) = self.trigger_menu.as_mut() {
+                        menu.move_selection(1);
+                    }
+                    window.prevent_default();
+                    cx.stop_propagation();
+                    return;
+                }
+                "enter" | "tab" => {
+                    if self.accept_composer_trigger_selection() {
+                        window.prevent_default();
+                        cx.stop_propagation();
+                        return;
+                    }
+                }
+                _ => {}
+            }
+        }
         if key == "escape" && !self.slash_command_suggestions().is_empty() {
             self.slash_command_menu_dismissed = true;
             window.prevent_default();
@@ -10860,7 +12773,7 @@ impl NativeShell {
                     .flex_1()
                     .min_h(px(0.0))
                     .overflow_hidden()
-                    .child(self.terminal.element()),
+                    .child(self.terminal.element_with_tokens(tokens)),
             );
         if !interactive {
             return surface.into_any_element();
@@ -11048,10 +12961,27 @@ impl NativeShell {
                     self.set_provider_terminal_visible(true);
                     return;
                 }
+                self.layout.active_dock_tab = Some(
+                    match tool {
+                        DockTool::Changes => "Changes",
+                        DockTool::Files => "Files",
+                        DockTool::Terminal => "Terminal",
+                        DockTool::Browser => "Browser",
+                        DockTool::Services => "Services",
+                        DockTool::Artifacts => "Artifacts",
+                        DockTool::Review => "Review",
+                    }
+                    .to_string(),
+                );
+                if self.layout.dock_collapsed {
+                    self.layout.dock_collapsed = false;
+                }
+                self.persist_layout();
                 let _ = self
                     .cockpit
                     .handle_tool_action(Self::cockpit_dock_tool(tool), RequestId::new());
                 self.sync_terminal_from_cockpit();
+                self.reconcile_browser_dock_lifecycle(None);
                 if matches!(tool, DockTool::Services) {
                     // Refresh the shared host/catalog seam when the services
                     // panel becomes active; the panel itself never mints a
@@ -11088,12 +13018,33 @@ impl NativeShell {
                     self.interaction.close_palettes();
                 }
             }
+            KeyboardAction::OpenTaskSwitcher => {
+                self.task_search.open_picker();
+                self.pending_task_search_focus = true;
+                self.pending_composer_focus = false;
+                self.pending_terminal_focus = false;
+                self.refresh_accessibility_tree();
+            }
             KeyboardAction::DismissTransient => {
                 self.add_project = None;
                 self.new_task = None;
+                self.task_search.close();
+                self.pending_task_search_focus = false;
+                self.project_scope_menu.close_menu();
+                self.project_actions.close();
+                self.refresh_accessibility_tree();
             }
             _ => {}
         }
+    }
+
+    fn focus_task_search_input(&mut self, window: &mut Window) {
+        if !self.task_search.open() {
+            return;
+        }
+        self.focus_handle.focus(window);
+        self.pending_task_search_focus = false;
+        self.refresh_accessibility_tree();
     }
 
     fn task_row_label(&self, task_id: TaskId) -> String {
@@ -11221,8 +13172,11 @@ impl NativeShell {
             Vec<AnyElement>,
         ) = match tool {
             CockpitDockTool::Changes => {
+                let selected = self.selected_repository_for_task(task_id);
                 let changes = ChangesPanelProjection::from_host(
                     live.and_then(|projection| projection.git.as_ref()),
+                    live.and_then(|projection| projection.repositories.as_ref()),
+                    selected.as_ref(),
                     task_id,
                     revision,
                 );
@@ -11231,11 +13185,77 @@ impl NativeShell {
                     task_id,
                     revision,
                 );
+                let mut rows: Vec<AnyElement> = changes
+                    .repositories
+                    .iter()
+                    .map(|row| {
+                        let selector = row.selector.clone();
+                        let available = row.available;
+                        let element_key = stable_changes_repo_element_key(&row.element_id);
+                        let label =
+                            format!("{} · {} · {}", row.label, row.scope_label, row.state_label);
+                        let selected_mark = if row.selected { "● " } else { "○ " };
+                        let mut row_div = div()
+                            .id(("native-changes-repo", element_key))
+                            .flex()
+                            .items_center()
+                            .gap(px(tokens.density.spacing.sm))
+                            .px(px(tokens.density.spacing.sm))
+                            .py(px(tokens.density.spacing.xs))
+                            .border_1()
+                            .border_color(tokens.borders.subtle.to_gpui())
+                            .text_color(if available {
+                                tokens.text.primary.to_gpui()
+                            } else {
+                                tokens.text.disabled.to_gpui()
+                            })
+                            .child(format!("{selected_mark}{label}"));
+                        if available {
+                            if let Some(shell_entity) = shell_entity.clone() {
+                                row_div = row_div.cursor_pointer().on_mouse_down(
+                                    MouseButton::Left,
+                                    move |event, _window, app| {
+                                        if event.button != MouseButton::Left {
+                                            return;
+                                        }
+                                        let _ = shell_entity.update(app, |shell, cx| {
+                                            cx.stop_propagation();
+                                            shell.select_changes_repository(selector.clone());
+                                            cx.notify();
+                                        });
+                                    },
+                                );
+                            }
+                        }
+                        row_div.into_any_element()
+                    })
+                    .collect();
+                if rows.is_empty() {
+                    rows.push(
+                        div()
+                            .text_color(tokens.text.secondary.to_gpui())
+                            .child("No repositories in the Task catalog yet.")
+                            .into_any_element(),
+                    );
+                }
                 (
                     "Changes",
-                    format!("{} · {}", workspace.summary(), changes.summary()),
+                    // Repository status must never be presented as the Project branch.
+                    format!(
+                        "{} · {}",
+                        workspace
+                            .kind
+                            .map(|kind| match kind {
+                                crate::domain::cockpit::TaskWorkspaceKind::Main => "main",
+                                crate::domain::cockpit::TaskWorkspaceKind::Worktree => "worktree",
+                                crate::domain::cockpit::TaskWorkspaceKind::External => "external",
+                                crate::domain::cockpit::TaskWorkspaceKind::Bound => "bound",
+                            })
+                            .unwrap_or("workspace"),
+                        changes.summary()
+                    ),
                     vec![workspace.refresh, changes.refresh],
-                    Vec::new(),
+                    rows,
                 )
             }
             CockpitDockTool::Files => {
@@ -11601,12 +13621,204 @@ impl NativeShell {
     ) -> AnyElement {
         match self.cockpit.active_tool() {
             CockpitDockTool::Terminal => self.terminal_dock_surface(tokens, shell_entity),
-            CockpitDockTool::Browser => self
-                .selected_browser_dock_model()
-                .map(|model| render_task_browser_dock(model, tokens).into_any_element())
-                .unwrap_or_else(|| {
-                    self.workspace_dock_surface(CockpitDockTool::Browser, tokens, shell_entity)
-                }),
+            CockpitDockTool::Browser => {
+                let mut model =
+                    self.selected_browser_dock_model()
+                        .unwrap_or_else(|| TaskBrowserDockModel {
+                            task_title: "Task browser".into(),
+                            address: String::new(),
+                            title: String::new(),
+                            security: BrowserSecurityState::Unknown,
+                            loading: false,
+                            error: None,
+                            progress: None,
+                            tab_labels: Vec::new(),
+                            selected_tab: None,
+                            diagnostic: None,
+                            approval: None,
+                            artifact_count: 0,
+                        });
+                if let Some(diagnostic) = self.browser_dock_diagnostic.clone() {
+                    model.diagnostic = Some(diagnostic);
+                }
+                let address = self.browser_address_draft.clone();
+                let chrome = render_task_browser_dock(model, tokens).into_any_element();
+                let shell_for_bounds = shell_entity.clone();
+                let shell_for_back = shell_entity.clone();
+                let shell_for_forward = shell_entity.clone();
+                let shell_for_reload = shell_entity.clone();
+                let shell_for_address = shell_entity.clone();
+                let shell_for_go = shell_entity.clone();
+                let nav = div()
+                    .id("native-shell-browser-chrome")
+                    .w_full()
+                    .flex()
+                    .gap(px(6.0))
+                    .p(px(6.0))
+                    .child(
+                        div()
+                            .id("native-browser-back")
+                            .px(px(8.0))
+                            .py(px(4.0))
+                            .rounded(px(4.0))
+                            .cursor_pointer()
+                            .child("Back")
+                            .on_mouse_down(MouseButton::Left, move |_event, window, app| {
+                                let Some(shell_for_back) = shell_for_back.as_ref() else {
+                                    return;
+                                };
+                                let _ = shell_for_back.update(app, |shell, cx| {
+                                    cx.stop_propagation();
+                                    shell.dispatch_browser_chrome_command(BrowserCommand::Back {
+                                        tab_id: "conversation".into(),
+                                    });
+                                    shell.pump_pending_browser_commands(window);
+                                    cx.notify();
+                                });
+                            }),
+                    )
+                    .child(
+                        div()
+                            .id("native-browser-forward")
+                            .px(px(8.0))
+                            .py(px(4.0))
+                            .rounded(px(4.0))
+                            .cursor_pointer()
+                            .child("Forward")
+                            .on_mouse_down(MouseButton::Left, move |_event, window, app| {
+                                let Some(shell_for_forward) = shell_for_forward.as_ref() else {
+                                    return;
+                                };
+                                let _ = shell_for_forward.update(app, |shell, cx| {
+                                    cx.stop_propagation();
+                                    shell.dispatch_browser_chrome_command(
+                                        BrowserCommand::Forward {
+                                            tab_id: "conversation".into(),
+                                        },
+                                    );
+                                    shell.pump_pending_browser_commands(window);
+                                    cx.notify();
+                                });
+                            }),
+                    )
+                    .child(
+                        div()
+                            .id("native-browser-reload")
+                            .px(px(8.0))
+                            .py(px(4.0))
+                            .rounded(px(4.0))
+                            .cursor_pointer()
+                            .child("Reload")
+                            .on_mouse_down(MouseButton::Left, move |_event, window, app| {
+                                let Some(shell_for_reload) = shell_for_reload.as_ref() else {
+                                    return;
+                                };
+                                let _ = shell_for_reload.update(app, |shell, cx| {
+                                    cx.stop_propagation();
+                                    shell.dispatch_browser_chrome_command(BrowserCommand::Reload {
+                                        tab_id: "conversation".into(),
+                                    });
+                                    shell.pump_pending_browser_commands(window);
+                                    cx.notify();
+                                });
+                            }),
+                    )
+                    .child(
+                        div()
+                            .id("native-browser-address")
+                            .flex_1()
+                            .px(px(8.0))
+                            .py(px(4.0))
+                            .rounded(px(4.0))
+                            .bg(tokens.surfaces.raised.to_gpui())
+                            .child(if address.is_empty() {
+                                "Address".to_string()
+                            } else {
+                                address
+                            })
+                            .on_mouse_down(MouseButton::Left, move |_event, _window, app| {
+                                let Some(shell_for_address) = shell_for_address.as_ref() else {
+                                    return;
+                                };
+                                let _ = shell_for_address.update(app, |shell, cx| {
+                                    cx.stop_propagation();
+                                    shell.browser_address_focused = true;
+                                    shell.browser_address_select_all = true;
+                                    cx.notify();
+                                });
+                            }),
+                    )
+                    .child(
+                        div()
+                            .id("native-browser-go")
+                            .px(px(8.0))
+                            .py(px(4.0))
+                            .rounded(px(4.0))
+                            .cursor_pointer()
+                            .child("Go")
+                            .on_mouse_down(MouseButton::Left, move |_event, window, app| {
+                                let Some(shell_for_go) = shell_for_go.as_ref() else {
+                                    return;
+                                };
+                                let _ = shell_for_go.update(app, |shell, cx| {
+                                    cx.stop_propagation();
+                                    let url = shell.browser_address_draft.clone();
+                                    if !url.trim().is_empty() {
+                                        shell.dispatch_browser_chrome_command(
+                                            BrowserCommand::Navigate {
+                                                tab_id: "conversation".into(),
+                                                url,
+                                            },
+                                        );
+                                        shell.pump_pending_browser_commands(window);
+                                    }
+                                    cx.notify();
+                                });
+                            }),
+                    );
+                div()
+                    .id("native-shell-browser-page")
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .child(nav)
+                    .child(chrome)
+                    .child(
+                        div()
+                            .id("native-shell-browser-pixels")
+                            .w_full()
+                            .flex_1()
+                            .min_h(px(120.0))
+                            .bg(tokens.surfaces.sunken.to_gpui())
+                            .child(canvas(
+                                move |bounds, window, app| {
+                                    let Some(shell_for_bounds) = shell_for_bounds.as_ref() else {
+                                        return;
+                                    };
+                                    let _ = shell_for_bounds.update(app, |shell, cx| {
+                                        let next = crate::browser::BrowserBounds {
+                                            x: f32::from(bounds.origin.x) as i32,
+                                            y: f32::from(bounds.origin.y) as i32,
+                                            width: f32::from(bounds.size.width) as i32,
+                                            height: f32::from(bounds.size.height) as i32,
+                                        };
+                                        if shell.browser_page_bounds != Some(next) {
+                                            shell.browser_page_bounds = Some(next);
+                                            // Bounds-only reconcile keeps retained HWND;
+                                            // window observers refresh HWND + pending commands.
+                                            shell.reconcile_browser_dock_lifecycle(None);
+                                        }
+                                        shell.pump_pending_browser_commands(window);
+                                        cx.notify();
+                                    });
+                                },
+                                |_bounds, _path, _window, _app| {},
+                            )),
+                    )
+                    .into_any_element()
+            }
             CockpitDockTool::Services => self.services_dock_surface(tokens, shell_entity),
             tool => self.workspace_dock_surface(tool, tokens, shell_entity),
         }
@@ -11743,13 +13955,63 @@ impl NativeShell {
         })
     }
 
+    fn project_scope(&self) -> ProjectScope {
+        let configured = self
+            .config_sidebar
+            .projects
+            .iter()
+            .filter_map(|project| ProjectId::parse(&project.workspace_id).ok())
+            .collect::<Vec<_>>();
+        let preferred = self
+            .layout
+            .project_scope_workspace_id
+            .as_deref()
+            .and_then(|workspace_id| ProjectId::parse(workspace_id).ok())
+            .map(ProjectScope::Project)
+            .unwrap_or(ProjectScope::All);
+        preferred.validated(&configured)
+    }
+
+    fn set_project_scope(&mut self, scope: ProjectScope) {
+        let configured = self
+            .config_sidebar
+            .projects
+            .iter()
+            .filter_map(|project| ProjectId::parse(&project.workspace_id).ok())
+            .collect::<Vec<_>>();
+        let scope = scope.validated(&configured);
+        self.project_scope_menu.set_scope(scope, &configured);
+        self.layout.project_scope_workspace_id = match scope {
+            ProjectScope::All => None,
+            ProjectScope::Project(project_id) => Some(project_id.to_string()),
+        };
+        self.persist_layout();
+    }
+
+    fn task_search_candidates(&self) -> Vec<TaskSearchCandidate> {
+        self.inbox
+            .active_rows()
+            .iter()
+            .filter(|row| self.project_scope().includes(row.project_id))
+            .map(|row| TaskSearchCandidate {
+                task_id: row.task_id,
+                title: row.title.clone(),
+                project_label: row.display.project.clone(),
+            })
+            .collect()
+    }
+
     fn project_inbox_items(&self) -> Vec<ProjectInboxItem> {
+        let scope = self.project_scope();
         let mut items = Vec::new();
         let mut represented = HashSet::new();
         for project in &self.config_sidebar.projects {
             let Ok(project_id) = ProjectId::parse(&project.workspace_id) else {
                 continue;
             };
+            if !scope.includes(project_id) {
+                continue;
+            }
             represented.insert(project_id);
             let tasks = self
                 .inbox
@@ -11769,11 +14031,15 @@ impl NativeShell {
                 items.extend(tasks.into_iter().map(|task_id| ProjectInboxItem::Task {
                     project_id,
                     task_id,
+                    settled: false,
                 }));
             }
         }
         for row in self.inbox.active_rows() {
             if represented.contains(&row.project_id) {
+                continue;
+            }
+            if !scope.includes(row.project_id) {
                 continue;
             }
             represented.insert(row.project_id);
@@ -11796,8 +14062,34 @@ impl NativeShell {
                 items.extend(tasks.into_iter().map(|task_id| ProjectInboxItem::Task {
                     project_id,
                     task_id,
+                    settled: false,
                 }));
             }
+        }
+        let settled = self
+            .client_model
+            .as_ref()
+            .into_iter()
+            .flat_map(|model| model.tasks().values())
+            .filter(|snapshot| {
+                snapshot.task.lifecycle == crate::domain::task::TaskLifecycle::Settled
+                    && scope.includes(snapshot.task.project_id)
+            })
+            .map(|snapshot| (snapshot.task.project_id, snapshot.task.id))
+            .collect::<Vec<_>>();
+        if !settled.is_empty() {
+            items.push(ProjectInboxItem::DoneHeader {
+                task_count: settled.len(),
+            });
+            items.extend(
+                settled
+                    .into_iter()
+                    .map(|(project_id, task_id)| ProjectInboxItem::Task {
+                        project_id,
+                        task_id,
+                        settled: true,
+                    }),
+            );
         }
         items
     }
@@ -12142,8 +14434,24 @@ impl NativeShell {
         let _ = self.dispatch_action(ActionRequest::TaskArchive { task_id });
     }
 
+    fn settle_selected_task(&mut self) {
+        let Some(task_id) = self.interaction.selected_task() else {
+            return;
+        };
+        let _ = self.dispatch_action(ActionRequest::TaskSettle { task_id });
+    }
+
+    fn reopen_task(&mut self, task_id: TaskId) {
+        self.interaction.sync_selected_task(Some(task_id));
+        let _ = self.dispatch_action(ActionRequest::TaskReopen { task_id });
+    }
+
     fn begin_new_task(&mut self) {
-        let Some(project_id) = self.current_workspace_project_id() else {
+        let project_id = match self.project_scope() {
+            ProjectScope::Project(project_id) => Some(project_id),
+            ProjectScope::All => self.current_workspace_project_id(),
+        };
+        let Some(project_id) = project_id else {
             self.open_add_project();
             return;
         };
@@ -12239,9 +14547,47 @@ impl NativeShell {
             }
             "native-inbox-plus-claude" => self.start_task_with_agent(ProviderKind::ClaudeCode),
             "native-inbox-plus-codex" => self.start_task_with_agent(ProviderKind::Codex),
+            "native-task-settle" => self.settle_selected_task(),
+            "native-task-restore" => {
+                if let Some(task_id) = self.interaction.selected_task() {
+                    self.reopen_task(task_id);
+                }
+            }
             "native-task-delete" => self.archive_selected_task(),
             "native-task-composer-input" => self.request_composer_accessibility_focus(),
+            "native-task-composer-attach" => self.pending_composer_image_prompt = true,
             "native-task-composer-send" => self.activate_composer_control(ComposerControl::SendNow),
+            "native-shell-tools-affordance" => self.open_project_action_menu(),
+            "native-task-open" => self.begin_header_open(),
+            "native-task-commit" => self.begin_header_commit(),
+            "native-browser-back" => {
+                self.dispatch_browser_chrome_command(BrowserCommand::Back {
+                    tab_id: "conversation".into(),
+                });
+            }
+            "native-browser-forward" => {
+                self.dispatch_browser_chrome_command(BrowserCommand::Forward {
+                    tab_id: "conversation".into(),
+                });
+            }
+            "native-browser-reload" => {
+                self.dispatch_browser_chrome_command(BrowserCommand::Reload {
+                    tab_id: "conversation".into(),
+                });
+            }
+            "native-browser-address" => {
+                self.browser_address_focused = true;
+                self.browser_address_select_all = true;
+            }
+            "native-browser-go" => {
+                let url = self.browser_address_draft.trim().to_string();
+                if !url.is_empty() {
+                    self.dispatch_browser_chrome_command(BrowserCommand::Navigate {
+                        tab_id: "conversation".into(),
+                        url,
+                    });
+                }
+            }
             "native-shell-context-dock-toggle" => self.toggle_pane(PaneEdge::Dock),
             "native-task-center-conversation" => self.set_provider_terminal_visible(false),
             "native-task-center-terminal" => self.set_provider_terminal_visible(true),
@@ -12273,8 +14619,31 @@ impl NativeShell {
             "native-connect-refresh" | "native-settings-refresh" => {
                 let _ = self.dispatch_agent_connection_query(false);
             }
-            "native-settings-cancel" => self.settings_open = false,
-            _ => {}
+            "native-settings-cancel" => self.close_settings(),
+            _ => {
+                if let Some(selector) = Self::repository_selector_from_element_id(element_id) {
+                    self.select_changes_repository(selector);
+                } else if let Some((_, _, digit)) = NATIVE_DOCK_TABS
+                    .iter()
+                    .find(|(_, dock_element_id, _)| *dock_element_id == element_id)
+                {
+                    self.dispatch_keyboard(KeyboardShortcut::alt(
+                        crate::ui::actions::ShortcutKey::Digit(*digit),
+                    ));
+                }
+            }
+        }
+    }
+
+    fn repository_selector_from_element_id(element_id: &str) -> Option<TaskRepositorySelector> {
+        match element_id {
+            "native-changes-repo-workspace" => Some(TaskRepositorySelector::Workspace),
+            "native-changes-repo-project-root" => Some(TaskRepositorySelector::ProjectRoot),
+            other => other
+                .strip_prefix("native-changes-repo-folder-")
+                .map(|folder_config_id| TaskRepositorySelector::Folder {
+                    folder_config_id: folder_config_id.to_owned(),
+                }),
         }
     }
 
@@ -12536,7 +14905,7 @@ impl NativeShell {
                 .flex()
                 .flex_none()
                 .items_center()
-                .gap(px(self.preferences.tokens().density.spacing.xs))
+                .gap(px(self.theme_tokens().density.spacing.xs))
                 .children(actions.into_iter().map(|action| {
                     Button::new(Self::inbox_agent_action_id(action.provider))
                         .label(action.label)
@@ -12557,7 +14926,7 @@ impl NativeShell {
                 .flex()
                 .flex_none()
                 .items_center()
-                .gap(px(self.preferences.tokens().density.spacing.xs))
+                .gap(px(self.theme_tokens().density.spacing.xs))
                 .children(actions.into_iter().map(|action| {
                     let provider = action.provider;
                     Button::new(Self::inbox_agent_action_id(provider))
@@ -12575,8 +14944,61 @@ impl NativeShell {
     }
 
     fn conversation_delete_action(&self, cx: &Context<Self>) -> Option<AnyElement> {
-        let tokens = self.preferences.tokens();
-        let delete = self.interaction.selected_task().map(|_| {
+        let tokens = self.theme_tokens();
+        let selected = self.interaction.selected_task();
+        let selected_is_settled = selected.is_some_and(|task_id| {
+            self.client_model
+                .as_ref()
+                .and_then(|model| model.tasks().get(&task_id))
+                .is_some_and(|snapshot| {
+                    snapshot.task.lifecycle == crate::domain::task::TaskLifecycle::Settled
+                })
+        });
+        let done = selected.filter(|_| !selected_is_settled).map(|_| {
+            div()
+                .id("native-task-settle")
+                .tab_stop(true)
+                .h(px(26.0))
+                .flex()
+                .items_center()
+                .px(px(10.0))
+                .rounded(px(6.0))
+                .cursor_pointer()
+                .bg(tokens.surfaces.raised.to_gpui())
+                .text_size(px(tokens.density.typography.caption))
+                .text_color(tokens.text.secondary.to_gpui())
+                .hover(|style| style.bg(tokens.surfaces.overlay.to_gpui()))
+                .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
+                    cx.stop_propagation();
+                    shell.settle_selected_task();
+                    cx.notify();
+                }))
+                .child("Done")
+                .into_any_element()
+        });
+        let restore = selected.filter(|_| selected_is_settled).map(|task_id| {
+            div()
+                .id("native-task-restore")
+                .tab_stop(true)
+                .h(px(26.0))
+                .flex()
+                .items_center()
+                .px(px(10.0))
+                .rounded(px(6.0))
+                .cursor_pointer()
+                .bg(tokens.surfaces.raised.to_gpui())
+                .text_size(px(tokens.density.typography.caption))
+                .text_color(tokens.text.secondary.to_gpui())
+                .hover(|style| style.bg(tokens.surfaces.overlay.to_gpui()))
+                .on_click(cx.listener(move |shell, _event: &ClickEvent, _window, cx| {
+                    cx.stop_propagation();
+                    shell.reopen_task(task_id);
+                    cx.notify();
+                }))
+                .child("Restore")
+                .into_any_element()
+        });
+        let delete = selected.map(|_| {
             div()
                 .id("native-task-delete")
                 .tab_stop(true)
@@ -12614,21 +15036,63 @@ impl NativeShell {
                 .hover(|style| style.bg(tokens.surfaces.overlay.to_gpui()))
                 .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
                     cx.stop_propagation();
-                    shell.dispatch_keyboard(KeyboardShortcut::ctrl(
-                        crate::ui::actions::ShortcutKey::Character('k'),
-                    ));
+                    shell.open_project_action_menu();
                     cx.notify();
                 }))
                 .child("+ Add action")
                 .into_any_element()
         };
+        let open = div()
+            .id("native-task-open")
+            .tab_stop(true)
+            .h(px(26.0))
+            .flex()
+            .items_center()
+            .px(px(10.0))
+            .rounded(px(6.0))
+            .cursor_pointer()
+            .bg(tokens.surfaces.raised.to_gpui())
+            .text_size(px(tokens.density.typography.caption))
+            .text_color(tokens.text.secondary.to_gpui())
+            .hover(|style| style.bg(tokens.surfaces.overlay.to_gpui()))
+            .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
+                cx.stop_propagation();
+                shell.begin_header_open();
+                cx.notify();
+            }))
+            .child("Open")
+            .into_any_element();
+        let commit = div()
+            .id("native-task-commit")
+            .tab_stop(true)
+            .h(px(26.0))
+            .flex()
+            .items_center()
+            .px(px(10.0))
+            .rounded(px(6.0))
+            .cursor_pointer()
+            .bg(tokens.surfaces.raised.to_gpui())
+            .text_size(px(tokens.density.typography.caption))
+            .text_color(tokens.text.secondary.to_gpui())
+            .hover(|style| style.bg(tokens.surfaces.overlay.to_gpui()))
+            .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
+                cx.stop_propagation();
+                shell.begin_header_commit();
+                cx.notify();
+            }))
+            .child("Commit")
+            .into_any_element();
         Some(
             div()
                 .id("native-conversation-panel-actions")
                 .flex()
                 .items_center()
-                .gap(px(self.preferences.tokens().density.spacing.xs))
+                .gap(px(self.theme_tokens().density.spacing.xs))
                 .child(add_action)
+                .child(open)
+                .child(commit)
+                .children(done)
+                .children(restore)
                 .children(delete)
                 .into_any_element(),
         )
@@ -13013,6 +15477,32 @@ impl NativeShell {
         if self.settings_open {
             return Some(self.render_settings_overlay(tokens, viewport, cx));
         }
+        if matches!(
+            self.header_commit.phase,
+            HeaderCommitPhase::Preview { .. }
+                | HeaderCommitPhase::Confirming { .. }
+                | HeaderCommitPhase::Success { .. }
+                | HeaderCommitPhase::Error(_)
+                | HeaderCommitPhase::LoadingStatus
+        ) {
+            return Some(self.render_commit_overlay(tokens, viewport, cx));
+        }
+        if !matches!(self.project_actions.mode, ProjectActionMenuMode::Closed) {
+            return Some(self.render_project_action_overlay(tokens, viewport, cx));
+        }
+        if self.project_scope_menu.open() {
+            return Some(self.render_project_scope_overlay(tokens, viewport, cx));
+        }
+        if self.task_search.open() || self.interaction.keyboard_state().task_switcher_open {
+            return Some(self.render_task_search_overlay(tokens, viewport, cx));
+        }
+        if self
+            .trigger_menu
+            .as_ref()
+            .is_some_and(|menu| !menu.suggestions.is_empty())
+        {
+            return Some(self.render_composer_trigger_overlay(tokens, viewport, cx));
+        }
         if self.interaction.keyboard_state().palette_open {
             return Some(self.render_command_palette(tokens, viewport, cx));
         }
@@ -13024,7 +15514,7 @@ impl NativeShell {
     }
 
     fn overlay_text_field(
-        id: &'static str,
+        id: impl Into<ElementId>,
         field: &TextField,
         placeholder: &'static str,
         tokens: crate::ui::tokens::ThemeTokens,
@@ -13342,6 +15832,434 @@ impl NativeShell {
         .into_any_element()
     }
 
+    fn render_theme_editor_panel(
+        &self,
+        editor: &ThemeEditorState,
+        tokens: crate::ui::tokens::ThemeTokens,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let guided = matches!(editor.mode, ThemeEditorMode::Guided);
+        let mut panel = div()
+            .id("native-theme-editor")
+            .w(px(340.0))
+            .max_h(px(560.0))
+            .overflow_y_scroll()
+            .flex_none()
+            .rounded(px(tokens.density.radii.lg))
+            .border(px(1.0))
+            .border_color(tokens.borders.subtle.to_gpui())
+            .bg(tokens.surfaces.overlay.to_gpui())
+            .p(px(tokens.density.spacing.md))
+            .flex()
+            .flex_col()
+            .gap(px(tokens.density.spacing.sm))
+            .child(
+                div()
+                    .text_size(px(tokens.density.typography.body))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(tokens.text.primary.to_gpui())
+                    .child(if editor.editing_id.is_some() {
+                        "Edit theme"
+                    } else {
+                        "Create theme"
+                    }),
+            )
+            .child(
+                div()
+                    .text_size(px(tokens.density.typography.caption))
+                    .text_color(tokens.text.muted.to_gpui())
+                    .child(format!("id · {}", editor.theme_id)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(tokens.density.spacing.xxs))
+                    .child(
+                        div()
+                            .text_size(px(tokens.density.typography.caption))
+                            .text_color(tokens.text.muted.to_gpui())
+                            .child("Name"),
+                    )
+                    .child(
+                        div()
+                            .id("native-theme-editor-name")
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|shell, _event: &MouseDownEvent, _window, cx| {
+                                    cx.stop_propagation();
+                                    if let Some(editor) = shell.theme_editor.as_mut() {
+                                        Self::focus_theme_editor_field(
+                                            editor,
+                                            ThemeEditorFocus::Name,
+                                        );
+                                    }
+                                    cx.notify();
+                                }),
+                            )
+                            .child(Self::overlay_text_field(
+                                "native-theme-editor-name-field",
+                                &editor.name,
+                                "Theme name",
+                                tokens,
+                            )),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap(px(tokens.density.spacing.sm))
+                    .child({
+                        let light_available = editor.halves.light.available;
+                        let mut button = Button::new("native-theme-editor-light")
+                            .label(if light_available {
+                                "Light"
+                            } else {
+                                "Light (unavailable)"
+                            })
+                            .on_click(cx.listener(move |shell, _event: &ClickEvent, _window, cx| {
+                                cx.stop_propagation();
+                                if light_available {
+                                    shell.switch_theme_editor_appearance(ThemeAppearance::Light);
+                                } else if let Some(editor) = shell.theme_editor.as_mut() {
+                                    editor.error = Some(
+                                        "This theme has no Light palette. Duplicate or create to add one."
+                                            .into(),
+                                    );
+                                }
+                                cx.notify();
+                            }));
+                        if editor.halves.active == ThemeAppearance::Light {
+                            button = button.primary();
+                        } else {
+                            button = button.ghost();
+                        }
+                        button
+                    })
+                    .child({
+                        let dark_available = editor.halves.dark.available;
+                        let mut button = Button::new("native-theme-editor-dark")
+                            .label(if dark_available {
+                                "Dark"
+                            } else {
+                                "Dark (unavailable)"
+                            })
+                            .on_click(cx.listener(move |shell, _event: &ClickEvent, _window, cx| {
+                                cx.stop_propagation();
+                                if dark_available {
+                                    shell.switch_theme_editor_appearance(ThemeAppearance::Dark);
+                                } else if let Some(editor) = shell.theme_editor.as_mut() {
+                                    editor.error = Some(
+                                        "This theme has no Dark palette. Duplicate or create to add one."
+                                            .into(),
+                                    );
+                                }
+                                cx.notify();
+                            }));
+                        if editor.halves.active == ThemeAppearance::Dark {
+                            button = button.primary();
+                        } else {
+                            button = button.ghost();
+                        }
+                        button
+                    }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap(px(tokens.density.spacing.sm))
+                    .child({
+                        let mut button = Button::new("native-theme-editor-guided")
+                            .label("Guided")
+                            .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
+                                cx.stop_propagation();
+                                if let Some(editor) = shell.theme_editor.as_mut() {
+                                    Self::flush_theme_editor_active_half(editor);
+                                    editor.mode = ThemeEditorMode::Guided;
+                                    let canvas = editor
+                                        .role_fields
+                                        .iter()
+                                        .find(|(role, _)| *role == ThemeColorRole::Canvas)
+                                        .map(|(_, field)| field.value().to_string());
+                                    let accent = editor
+                                        .role_fields
+                                        .iter()
+                                        .find(|(role, _)| *role == ThemeColorRole::Accent)
+                                        .map(|(_, field)| field.value().to_string());
+                                    if let Some(canvas) = canvas {
+                                        let _ = editor.canvas.set_value(canvas);
+                                    }
+                                    if let Some(accent) = accent {
+                                        let _ = editor.accent.set_value(accent);
+                                    }
+                                    Self::flush_theme_editor_active_half(editor);
+                                    Self::focus_theme_editor_field(
+                                        editor,
+                                        ThemeEditorFocus::Canvas,
+                                    );
+                                }
+                                shell.sync_theme_editor_preview();
+                                cx.notify();
+                            }));
+                        if guided {
+                            button = button.primary();
+                        } else {
+                            button = button.ghost();
+                        }
+                        button
+                    })
+                    .child({
+                        let mut button = Button::new("native-theme-editor-advanced")
+                            .label("Advanced")
+                            .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
+                                cx.stop_propagation();
+                                if let Some(editor) = shell.theme_editor.as_mut() {
+                                    Self::flush_theme_editor_active_half(editor);
+                                    editor.mode = ThemeEditorMode::Advanced;
+                                    let canvas = editor.canvas.value().to_string();
+                                    let accent = editor.accent.value().to_string();
+                                    for (role, field) in &mut editor.role_fields {
+                                        if *role == ThemeColorRole::Canvas {
+                                            let _ = field.set_value(&canvas);
+                                        } else if *role == ThemeColorRole::Accent {
+                                            let _ = field.set_value(&accent);
+                                        }
+                                    }
+                                    Self::flush_theme_editor_active_half(editor);
+                                    Self::focus_theme_editor_field(
+                                        editor,
+                                        ThemeEditorFocus::Role(ThemeColorRole::Canvas),
+                                    );
+                                }
+                                shell.sync_theme_editor_preview();
+                                cx.notify();
+                            }));
+                        if !guided {
+                            button = button.primary();
+                        } else {
+                            button = button.ghost();
+                        }
+                        button
+                    }),
+            );
+
+        if guided {
+            panel = panel
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(tokens.density.spacing.xxs))
+                        .child(
+                            div()
+                                .text_size(px(tokens.density.typography.caption))
+                                .text_color(tokens.text.muted.to_gpui())
+                                .child("Background (Canvas)"),
+                        )
+                        .child(
+                            div()
+                                .id("native-theme-editor-canvas")
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|shell, _event: &MouseDownEvent, _window, cx| {
+                                        cx.stop_propagation();
+                                        if let Some(editor) = shell.theme_editor.as_mut() {
+                                            Self::focus_theme_editor_field(
+                                                editor,
+                                                ThemeEditorFocus::Canvas,
+                                            );
+                                        }
+                                        cx.notify();
+                                    }),
+                                )
+                                .child(Self::overlay_text_field(
+                                    "native-theme-editor-canvas-field",
+                                    &editor.canvas,
+                                    "#fbfafc",
+                                    tokens,
+                                )),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(tokens.density.spacing.xxs))
+                        .child(
+                            div()
+                                .text_size(px(tokens.density.typography.caption))
+                                .text_color(tokens.text.muted.to_gpui())
+                                .child("Accent"),
+                        )
+                        .child(
+                            div()
+                                .id("native-theme-editor-accent")
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|shell, _event: &MouseDownEvent, _window, cx| {
+                                        cx.stop_propagation();
+                                        if let Some(editor) = shell.theme_editor.as_mut() {
+                                            Self::focus_theme_editor_field(
+                                                editor,
+                                                ThemeEditorFocus::Accent,
+                                            );
+                                        }
+                                        cx.notify();
+                                    }),
+                                )
+                                .child(Self::overlay_text_field(
+                                    "native-theme-editor-accent-field",
+                                    &editor.accent,
+                                    "#d60057",
+                                    tokens,
+                                )),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_size(px(tokens.density.typography.caption))
+                        .text_color(tokens.text.muted.to_gpui())
+                        .child("Swatches"),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap(px(tokens.density.spacing.xxs))
+                        .children(THEME_GUIDED_SWATCHES.iter().enumerate().filter_map(
+                            |(index, hex)| {
+                                let color = ThemeColor::parse(hex).ok()?;
+                                let target = if editor.focused == ThemeEditorFocus::Accent {
+                                    ThemeEditorFocus::Accent
+                                } else {
+                                    ThemeEditorFocus::Canvas
+                                };
+                                let swatch = (*hex).to_string();
+                                Some(
+                                    div()
+                                        .id(("native-theme-swatch", index))
+                                        .size(px(22.0))
+                                        .rounded(px(tokens.density.radii.sm))
+                                        .border(px(1.0))
+                                        .border_color(tokens.borders.subtle.to_gpui())
+                                        .bg(color.opaque().to_gpui())
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(
+                                                move |shell, _event: &MouseDownEvent, _window, cx| {
+                                                    cx.stop_propagation();
+                                                    shell.apply_guided_swatch(target, &swatch);
+                                                    cx.notify();
+                                                },
+                                            ),
+                                        )
+                                        .into_any_element(),
+                                )
+                            },
+                        )),
+                );
+        } else {
+            for (group_title, roles) in theme_editor_role_groups() {
+                panel = panel.child(
+                    div()
+                        .text_size(px(tokens.density.typography.caption))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(tokens.text.primary.to_gpui())
+                        .child(*group_title),
+                );
+                for role in roles.iter().copied() {
+                    let Some((_, field)) = editor
+                        .role_fields
+                        .iter()
+                        .find(|(field_role, _)| *field_role == role)
+                    else {
+                        continue;
+                    };
+                    panel = panel.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.0))
+                            .child(
+                                div()
+                                    .text_size(px(tokens.density.typography.caption))
+                                    .text_color(tokens.text.muted.to_gpui())
+                                    .child(theme_role_display_label(role)),
+                            )
+                            .child(
+                                div()
+                                    .id((
+                                        "native-theme-role",
+                                        stable_theme_element_key(role.as_str(), "role"),
+                                    ))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(
+                                            move |shell, _event: &MouseDownEvent, _window, cx| {
+                                                cx.stop_propagation();
+                                                if let Some(editor) = shell.theme_editor.as_mut() {
+                                                    Self::focus_theme_editor_field(
+                                                        editor,
+                                                        ThemeEditorFocus::Role(role),
+                                                    );
+                                                }
+                                                cx.notify();
+                                            },
+                                        ),
+                                    )
+                                    .child(Self::overlay_text_field(
+                                        (
+                                            "native-theme-role-field",
+                                            stable_theme_element_key(role.as_str(), "role-field"),
+                                        ),
+                                        field,
+                                        "#000000",
+                                        tokens,
+                                    )),
+                            ),
+                    );
+                }
+            }
+        }
+
+        panel
+            .when_some(editor.error.clone(), |content, error| {
+                content.child(
+                    div()
+                        .text_size(px(tokens.density.typography.caption))
+                        .text_color(tokens.status.destructive.to_gpui())
+                        .child(error),
+                )
+            })
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap(px(tokens.density.spacing.sm))
+                    .child(
+                        Button::new("native-theme-editor-cancel")
+                            .label("Cancel")
+                            .ghost()
+                            .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
+                                cx.stop_propagation();
+                                shell.cancel_theme_editor();
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("native-theme-editor-save")
+                            .label("Save")
+                            .primary()
+                            .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
+                                cx.stop_propagation();
+                                shell.save_theme_editor();
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn render_settings_overlay(
         &self,
         tokens: crate::ui::tokens::ThemeTokens,
@@ -13356,6 +16274,358 @@ impl NativeShell {
             ConfigSidebarProviderKind::Codex,
             self.agent_presence_for(ConfigSidebarProviderKind::Codex),
         );
+        let system_appearance = match self.preferences.mode() {
+            crate::ui::tokens::ThemeMode::Light => ThemeAppearance::Light,
+            crate::ui::tokens::ThemeMode::Dark | crate::ui::tokens::ThemeMode::HighContrast => {
+                ThemeAppearance::Dark
+            }
+        };
+        let selection = self.theme_controller.selection().clone();
+        let resolved = selection.resolve(system_appearance);
+        let appearance_button = |id: &'static str,
+                                 label: &'static str,
+                                 preference: AppearancePreference,
+                                 selected: bool| {
+            let mut button = Button::new(id).label(label).on_click(cx.listener(
+                move |shell, _event: &ClickEvent, _window, cx| {
+                    cx.stop_propagation();
+                    shell.theme_error = shell
+                        .theme_controller
+                        .set_appearance_preference(preference)
+                        .err()
+                        .map(|error| error.to_string());
+                    cx.notify();
+                },
+            ));
+            if selected {
+                button = button.primary();
+            } else {
+                button = button.ghost();
+            }
+            button
+        };
+        let theme_cards = self
+            .theme_controller
+            .library()
+            .themes()
+            .iter()
+            .filter_map(|theme| {
+                let palette = theme.palette(resolved.appearance)?;
+                let id = theme.id.clone();
+                let label = theme.label.clone();
+                let selected = id == resolved.theme_id;
+                let built_in = theme.is_built_in();
+                let actions = theme_card_action_availability(built_in);
+                let remove_armed = self.theme_remove_intent.is_armed(&id);
+                let canvas = palette.color(ThemeColorRole::Canvas).opaque().to_gpui();
+                let accent = palette.color(ThemeColorRole::Accent).opaque().to_gpui();
+                let button_id = ("native-theme", stable_theme_element_key(&id, "select"));
+                let select_id = id.clone();
+                let duplicate_id = id.clone();
+                let edit_id = id.clone();
+                let export_id = id.clone();
+                let remove_id = id.clone();
+                let dup_button_id = ("native-theme-dup", stable_theme_element_key(&id, "dup"));
+                let edit_button_id = ("native-theme-edit", stable_theme_element_key(&id, "edit"));
+                let export_button_id = (
+                    "native-theme-export",
+                    stable_theme_element_key(&id, "export"),
+                );
+                let remove_button_id = (
+                    "native-theme-remove",
+                    stable_theme_element_key(&id, "remove"),
+                );
+                Some(
+                    div()
+                        .w(px(168.0))
+                        .p(px(tokens.density.spacing.sm))
+                        .rounded(px(tokens.density.radii.md))
+                        .border(px(1.0))
+                        .border_color(if selected {
+                            tokens.borders.focus.to_gpui()
+                        } else {
+                            tokens.borders.subtle.to_gpui()
+                        })
+                        .bg(tokens.surfaces.canvas.to_gpui())
+                        .flex()
+                        .flex_col()
+                        .gap(px(tokens.density.spacing.xs))
+                        .child(
+                            div()
+                                .h(px(34.0))
+                                .rounded(px(tokens.density.radii.sm))
+                                .bg(canvas)
+                                .flex()
+                                .items_center()
+                                .justify_end()
+                                .pr(px(tokens.density.spacing.sm))
+                                .child(
+                                    div()
+                                        .size(px(18.0))
+                                        .rounded(px(tokens.density.radii.pill))
+                                        .bg(accent),
+                                ),
+                        )
+                        .child({
+                            let mut button = Button::new(button_id).label(label).on_click(
+                                cx.listener(move |shell, _event: &ClickEvent, _window, cx| {
+                                    cx.stop_propagation();
+                                    shell.theme_error = shell
+                                        .theme_controller
+                                        .select_theme(&select_id, resolved.appearance)
+                                        .err()
+                                        .map(|error| error.to_string());
+                                    shell.theme_remove_intent.clear();
+                                    cx.notify();
+                                }),
+                            );
+                            if selected {
+                                button = button.primary();
+                            } else {
+                                button = button.ghost();
+                            }
+                            button
+                        })
+                        .child(
+                            div()
+                                .flex()
+                                .flex_wrap()
+                                .gap(px(tokens.density.spacing.xxs))
+                                .when(actions.duplicate_edit_copy, |row| {
+                                    row.child(
+                                        Button::new(dup_button_id)
+                                            .label("Duplicate")
+                                            .ghost()
+                                            .on_click(cx.listener(
+                                                move |shell, _event: &ClickEvent, _window, cx| {
+                                                    cx.stop_propagation();
+                                                    shell.begin_duplicate_theme(&duplicate_id);
+                                                    cx.notify();
+                                                },
+                                            )),
+                                    )
+                                })
+                                .when(actions.edit, |row| {
+                                    row.child(
+                                        Button::new(edit_button_id).label("Edit").ghost().on_click(
+                                            cx.listener(
+                                                move |shell, _event: &ClickEvent, _window, cx| {
+                                                    cx.stop_propagation();
+                                                    shell.begin_edit_theme(&edit_id);
+                                                    cx.notify();
+                                                },
+                                            ),
+                                        ),
+                                    )
+                                })
+                                .when(actions.export, |row| {
+                                    row.child(
+                                        Button::new(export_button_id)
+                                            .label("Export")
+                                            .ghost()
+                                            .on_click(cx.listener(
+                                                move |shell, _event: &ClickEvent, _window, cx| {
+                                                    cx.stop_propagation();
+                                                    shell.export_theme_to_clipboard(&export_id, cx);
+                                                    cx.notify();
+                                                },
+                                            )),
+                                    )
+                                })
+                                .when(actions.remove, |row| {
+                                    row.child(
+                                        Button::new(remove_button_id)
+                                            .label(if remove_armed {
+                                                "Confirm remove"
+                                            } else {
+                                                "Remove"
+                                            })
+                                            .ghost()
+                                            .on_click(cx.listener(
+                                                move |shell, _event: &ClickEvent, _window, cx| {
+                                                    cx.stop_propagation();
+                                                    shell.request_remove_custom_theme(&remove_id);
+                                                    cx.notify();
+                                                },
+                                            )),
+                                    )
+                                }),
+                        )
+                        .into_any_element(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let theme_editor_panel = self
+            .theme_editor
+            .as_ref()
+            .map(|editor| self.render_theme_editor_panel(editor, tokens, cx));
+        let appearance_content = div()
+            .flex()
+            .flex_row()
+            .gap(px(tokens.density.spacing.lg))
+            .items_start()
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(tokens.density.spacing.lg))
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .child(
+                        div()
+                            .child(
+                                div()
+                                    .text_size(px(tokens.density.typography.heading))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(tokens.text.primary.to_gpui())
+                                    .child("Appearance"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(tokens.density.typography.caption))
+                                    .text_color(tokens.text.muted.to_gpui())
+                                    .child(
+                                        "Pick System, Light, or Dark, then select a built-in or custom theme. Create, import, duplicate, and edit custom themes here; built-ins stay read-only.",
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap(px(tokens.density.spacing.sm))
+                            .child(appearance_button(
+                                "native-theme-mode-system",
+                                "System",
+                                AppearancePreference::System,
+                                selection.appearance == AppearancePreference::System,
+                            ))
+                            .child(appearance_button(
+                                "native-theme-mode-light",
+                                "Light",
+                                AppearancePreference::Light,
+                                selection.appearance == AppearancePreference::Light,
+                            ))
+                            .child(appearance_button(
+                                "native-theme-mode-dark",
+                                "Dark",
+                                AppearancePreference::Dark,
+                                selection.appearance == AppearancePreference::Dark,
+                            )),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap(px(tokens.density.spacing.sm))
+                            .child(
+                                Button::new("native-theme-create")
+                                    .label("Create theme")
+                                    .primary()
+                                    .on_click(cx.listener(
+                                        |shell, _event: &ClickEvent, _window, cx| {
+                                            cx.stop_propagation();
+                                            shell.begin_create_theme();
+                                            cx.notify();
+                                        },
+                                    )),
+                            )
+                            .child(
+                                Button::new("native-theme-import")
+                                    .label("Import from clipboard")
+                                    .ghost()
+                                    .on_click(cx.listener(
+                                        |shell, _event: &ClickEvent, _window, cx| {
+                                            cx.stop_propagation();
+                                            shell.import_theme_from_clipboard(cx);
+                                            cx.notify();
+                                        },
+                                    )),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(tokens.density.typography.body))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(tokens.text.primary.to_gpui())
+                            .child(format!(
+                                "{} themes",
+                                match resolved.appearance {
+                                    ThemeAppearance::Light => "Light",
+                                    ThemeAppearance::Dark => "Dark",
+                                }
+                            )),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .gap(px(tokens.density.spacing.sm))
+                            .children(theme_cards),
+                    )
+                    .when_some(self.theme_feedback.clone(), |content, message| {
+                        content.child(
+                            div()
+                                .text_size(px(tokens.density.typography.caption))
+                                .text_color(tokens.text.secondary.to_gpui())
+                                .child(message),
+                        )
+                    })
+                    .when_some(self.theme_error.clone(), |content, error| {
+                        content.child(
+                            div()
+                                .text_size(px(tokens.density.typography.caption))
+                                .text_color(tokens.status.destructive.to_gpui())
+                                .child(error),
+                        )
+                    }),
+            )
+            .children(theme_editor_panel)
+            .into_any_element();
+        let providers_content = div()
+            .flex()
+            .flex_col()
+            .gap(px(tokens.density.spacing.md))
+            .child(
+                div()
+                    .text_size(px(tokens.density.typography.heading))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(tokens.text.primary.to_gpui())
+                    .child("Providers"),
+            )
+            .child(
+                div()
+                    .text_size(px(tokens.density.typography.body))
+                    .line_height(px(tokens.density.typography.body_line_height))
+                    .text_color(tokens.text.secondary.to_gpui())
+                    .child(claude_copy),
+            )
+            .child(
+                div()
+                    .text_size(px(tokens.density.typography.body))
+                    .line_height(px(tokens.density.typography.body_line_height))
+                    .text_color(tokens.text.secondary.to_gpui())
+                    .child(codex_copy),
+            )
+            .child(
+                div()
+                    .text_size(px(tokens.density.typography.caption))
+                    .text_color(tokens.text.muted.to_gpui())
+                    .child("DevManager does not log you in; sign in with that app, then Refresh"),
+            )
+            .child(
+                Button::new("native-settings-refresh")
+                    .label("Refresh providers")
+                    .primary()
+                    .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
+                        cx.stop_propagation();
+                        let _ = shell.dispatch_agent_connection_query(false);
+                        cx.notify();
+                    })),
+            )
+            .into_any_element();
+        let content = match self.settings_page {
+            NativeSettingsPage::Appearance => appearance_content,
+            NativeSettingsPage::Providers => providers_content,
+        };
         deferred(
             anchored()
                 .position(point(px(0.0), px(0.0)))
@@ -13374,14 +16644,19 @@ impl NativeShell {
                             MouseButton::Left,
                             cx.listener(|shell, _event: &MouseDownEvent, _window, cx| {
                                 cx.stop_propagation();
-                                shell.settings_open = false;
+                                shell.close_settings();
                                 cx.notify();
                             }),
                         )
                         .child(
                             div()
                                 .id("native-settings-dialog")
-                                .w(px(440.0))
+                                .w(px(if self.theme_editor.is_some() {
+                                    1100.0
+                                } else {
+                                    760.0
+                                }))
+                                .max_h(px((f32::from(viewport.height) - 48.0).max(320.0)))
                                 .rounded(px(tokens.density.radii.lg))
                                 .bg(tokens.surfaces.raised.to_gpui())
                                 .border(px(1.0))
@@ -13400,65 +16675,87 @@ impl NativeShell {
                                 )
                                 .child(
                                     div()
-                                        .text_size(px(tokens.density.typography.heading))
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(tokens.text.primary.to_gpui())
-                                        .child("Settings"),
-                                )
-                                .child(
-                                    div()
-                                        .text_size(px(tokens.density.typography.body))
-                                        .line_height(px(tokens.density.typography.body_line_height))
-                                        .text_color(tokens.text.secondary.to_gpui())
-                                        .child(claude_copy),
-                                )
-                                .child(
-                                    div()
-                                        .text_size(px(tokens.density.typography.body))
-                                        .line_height(px(tokens.density.typography.body_line_height))
-                                        .text_color(tokens.text.secondary.to_gpui())
-                                        .child(codex_copy),
-                                )
-                                .child(
-                                    div()
-                                        .text_size(px(tokens.density.typography.caption))
-                                        .text_color(tokens.text.muted.to_gpui())
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
                                         .child(
-                                            "DevManager does not log you in; sign in with that app, then Refresh",
+                                            div()
+                                                .text_size(px(tokens.density.typography.heading))
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_color(tokens.text.primary.to_gpui())
+                                                .child("Settings"),
+                                        )
+                                        .child(
+                                            Button::new("native-settings-cancel")
+                                                .label("Close")
+                                                .ghost()
+                                                .on_click(cx.listener(
+                                                    |shell, _event: &ClickEvent, _window, cx| {
+                                                        cx.stop_propagation();
+                                                        shell.close_settings();
+                                                        cx.notify();
+                                                    },
+                                                )),
                                         ),
                                 )
                                 .child(
                                     div()
                                         .flex()
-                                        .justify_end()
                                         .gap(px(tokens.density.spacing.sm))
                                         .child(
-                                            Button::new("native-settings-cancel")
-                                                .label("Cancel")
-                                                .ghost()
+                                            Button::new("native-settings-appearance")
+                                                .label("Appearance")
+                                                .when(
+                                                    self.settings_page
+                                                        == NativeSettingsPage::Appearance,
+                                                    |button| button.primary(),
+                                                )
+                                                .when(
+                                                    self.settings_page
+                                                        != NativeSettingsPage::Appearance,
+                                                    |button| button.ghost(),
+                                                )
                                                 .on_click(cx.listener(
                                                     |shell, _event: &ClickEvent, _window, cx| {
                                                         cx.stop_propagation();
-                                                        shell.settings_open = false;
+                                                        shell.settings_page =
+                                                            NativeSettingsPage::Appearance;
                                                         cx.notify();
                                                     },
                                                 )),
                                         )
                                         .child(
-                                            Button::new("native-settings-refresh")
-                                                .label("Refresh")
-                                                .primary()
+                                            Button::new("native-settings-providers")
+                                                .label("Providers")
+                                                .when(
+                                                    self.settings_page
+                                                        == NativeSettingsPage::Providers,
+                                                    |button| button.primary(),
+                                                )
+                                                .when(
+                                                    self.settings_page
+                                                        != NativeSettingsPage::Providers,
+                                                    |button| button.ghost(),
+                                                )
                                                 .on_click(cx.listener(
                                                     |shell, _event: &ClickEvent, _window, cx| {
                                                         cx.stop_propagation();
-                                                        let _ =
-                                                            shell.dispatch_agent_connection_query(
-                                                                false,
-                                                            );
+                                                        if shell.theme_editor.is_some() {
+                                                            shell.cancel_theme_editor();
+                                                        }
+                                                        shell.settings_page =
+                                                            NativeSettingsPage::Providers;
                                                         cx.notify();
                                                     },
                                                 )),
                                         ),
+                                )
+                                .child(
+                                    div()
+                                        .min_h(px(0.0))
+                                        .overflow_y_scrollbar()
+                                        .pr(px(tokens.density.spacing.xs))
+                                        .child(content),
                                 ),
                         ),
                 ),
@@ -13583,6 +16880,1552 @@ impl NativeShell {
         )
         .with_priority(2)
         .into_any_element()
+    }
+
+    fn render_task_search_overlay(
+        &self,
+        tokens: crate::ui::tokens::ThemeTokens,
+        viewport: Size<Pixels>,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let candidates = self.task_search_candidates();
+        let filtered = self.task_search.filtered(&candidates);
+        let selected = self.task_search.selected_index();
+        let mut list = div()
+            .id("native-task-search-results")
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .max_h(px(280.0))
+            .overflow_hidden();
+        if filtered.is_empty() {
+            list = list.child(
+                div()
+                    .px(px(10.0))
+                    .py(px(8.0))
+                    .text_color(tokens.text.muted.to_gpui())
+                    .child("No matching tasks"),
+            );
+        } else {
+            for (index, candidate) in filtered.into_iter().enumerate() {
+                let task_id = candidate.task_id;
+                let row = div()
+                    .id(("native-task-search-row", index))
+                    .px(px(10.0))
+                    .py(px(6.0))
+                    .rounded(px(6.0))
+                    .cursor_pointer()
+                    .bg(if index == selected {
+                        tokens.surfaces.raised.to_gpui()
+                    } else {
+                        tokens.surfaces.overlay.to_gpui()
+                    })
+                    .child(candidate.title.clone())
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |shell, _event: &MouseDownEvent, _window, cx| {
+                            cx.stop_propagation();
+                            let candidates = shell.task_search_candidates();
+                            if shell
+                                .task_search
+                                .select_index(index, candidates.len())
+                                .is_some()
+                            {
+                                if let Some(task_id) =
+                                    shell.task_search.confirm_selection(&candidates)
+                                {
+                                    let _ = shell.select_projected_task(task_id);
+                                }
+                            }
+                            shell.interaction.close_palettes();
+                            shell.pending_task_search_focus = false;
+                            shell.refresh_accessibility_tree();
+                            cx.notify();
+                        }),
+                    );
+                let _ = task_id;
+                list = list.child(row);
+            }
+        }
+        deferred(
+            anchored()
+                .position(point(px(0.0), px(0.0)))
+                .snap_to_window()
+                .child(
+                    div()
+                        .id("native-task-search-backdrop")
+                        .occlude()
+                        .w(viewport.width)
+                        .h(viewport.height)
+                        .flex()
+                        .items_start()
+                        .justify_start()
+                        .pt(px(48.0))
+                        .pl(px(24.0))
+                        .bg(Self::modal_backdrop())
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|shell, _event: &MouseDownEvent, _window, cx| {
+                                cx.stop_propagation();
+                                shell.task_search.close();
+                                shell.interaction.close_palettes();
+                                shell.pending_task_search_focus = false;
+                                shell.refresh_accessibility_tree();
+                                cx.notify();
+                            }),
+                        )
+                        .child(
+                            div()
+                                .id("native-task-search-panel")
+                                .w(px(360.0))
+                                .flex()
+                                .flex_col()
+                                .gap(px(8.0))
+                                .p(px(12.0))
+                                .rounded(px(10.0))
+                                .bg(tokens.surfaces.overlay.to_gpui())
+                                .border(px(1.0))
+                                .border_color(tokens.borders.subtle.to_gpui())
+                                .shadow_sm()
+                                .child(
+                                    div()
+                                        .id("native-task-search-input")
+                                        .track_focus(&self.focus_handle)
+                                        .tab_stop(true)
+                                        .cursor_text()
+                                        .px(px(10.0))
+                                        .py(px(8.0))
+                                        .rounded(px(6.0))
+                                        .bg(tokens.surfaces.sunken.to_gpui())
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(
+                                                |shell, _event: &MouseDownEvent, window, cx| {
+                                                    cx.stop_propagation();
+                                                    shell.focus_handle.focus(window);
+                                                    shell.pending_task_search_focus = false;
+                                                    cx.notify();
+                                                },
+                                            ),
+                                        )
+                                        .child(if self.task_search.query().is_empty() {
+                                            "Search tasks".to_string()
+                                        } else {
+                                            self.task_search.query().to_string()
+                                        }),
+                                )
+                                .child(list),
+                        ),
+                ),
+        )
+        .with_priority(2)
+        .into_any_element()
+    }
+
+    fn render_composer_trigger_overlay(
+        &self,
+        tokens: crate::ui::tokens::ThemeTokens,
+        viewport: Size<Pixels>,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let Some(menu) = self.trigger_menu.as_ref() else {
+            return div().into_any_element();
+        };
+        let selected = menu.selected_index;
+        let mut list = div().flex().flex_col().gap(px(2.0));
+        for (index, suggestion) in menu.suggestions.iter().enumerate() {
+            let label = suggestion.label.clone();
+            list = list.child(
+                div()
+                    .id(("native-composer-trigger-row", index))
+                    .px(px(10.0))
+                    .py(px(6.0))
+                    .rounded(px(6.0))
+                    .bg(if index == selected {
+                        tokens.surfaces.raised.to_gpui()
+                    } else {
+                        tokens.surfaces.overlay.to_gpui()
+                    })
+                    .child(label)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |shell, _event: &MouseDownEvent, _window, cx| {
+                            cx.stop_propagation();
+                            if let Some(menu) = shell.trigger_menu.as_mut() {
+                                menu.selected_index = index;
+                            }
+                            let _ = shell.accept_composer_trigger_selection();
+                            cx.notify();
+                        }),
+                    ),
+            );
+        }
+        deferred(
+            anchored()
+                .position(point(px(0.0), px(0.0)))
+                .snap_to_window()
+                .child(
+                    div()
+                        .id("native-composer-trigger-backdrop")
+                        .occlude()
+                        .w(viewport.width)
+                        .h(viewport.height)
+                        .flex()
+                        .items_end()
+                        .justify_center()
+                        .pb(px(96.0))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|shell, _event: &MouseDownEvent, _window, cx| {
+                                cx.stop_propagation();
+                                shell.trigger_menu = None;
+                                cx.notify();
+                            }),
+                        )
+                        .child(
+                            div()
+                                .id("native-composer-trigger-panel")
+                                .w(px(420.0))
+                                .max_h(px(280.0))
+                                .p(px(10.0))
+                                .rounded(px(10.0))
+                                .bg(tokens.surfaces.overlay.to_gpui())
+                                .border(px(1.0))
+                                .border_color(tokens.borders.subtle.to_gpui())
+                                .child(list),
+                        ),
+                ),
+        )
+        .with_priority(2)
+        .into_any_element()
+    }
+
+    fn render_project_scope_overlay(
+        &self,
+        tokens: crate::ui::tokens::ThemeTokens,
+        viewport: Size<Pixels>,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let configured = self
+            .config_sidebar
+            .projects
+            .iter()
+            .filter_map(|project| {
+                ProjectId::parse(&project.workspace_id)
+                    .ok()
+                    .map(|id| (id, project.label.clone()))
+            })
+            .collect::<Vec<_>>();
+        let selected = self.project_scope_menu.selected_index();
+        let mut list = div()
+            .id("native-project-scope-menu")
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(px(2.0));
+        let options = std::iter::once((None, "All projects".to_string()))
+            .chain(
+                configured
+                    .iter()
+                    .map(|(id, label)| (Some(*id), label.clone())),
+            )
+            .enumerate();
+        for (index, (project_id, label)) in options {
+            list = list.child(
+                div()
+                    .id(("native-project-scope-option", index))
+                    .px(px(10.0))
+                    .py(px(6.0))
+                    .rounded(px(6.0))
+                    .cursor_pointer()
+                    .bg(if index == selected {
+                        tokens.surfaces.raised.to_gpui()
+                    } else {
+                        tokens.surfaces.overlay.to_gpui()
+                    })
+                    .child(label)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |shell, _event: &MouseDownEvent, _window, cx| {
+                            cx.stop_propagation();
+                            let scope = match project_id {
+                                None => ProjectScope::All,
+                                Some(id) => ProjectScope::Project(id),
+                            };
+                            shell.set_project_scope(scope);
+                            shell.project_scope_menu.close_menu();
+                            cx.notify();
+                        }),
+                    ),
+            );
+        }
+        deferred(
+            anchored()
+                .position(point(px(0.0), px(0.0)))
+                .snap_to_window()
+                .child(
+                    div()
+                        .id("native-project-scope-backdrop")
+                        .occlude()
+                        .w(viewport.width)
+                        .h(viewport.height)
+                        .flex()
+                        .items_start()
+                        .justify_start()
+                        .pt(px(84.0))
+                        .pl(px(24.0))
+                        .bg(Self::modal_backdrop())
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|shell, _event: &MouseDownEvent, _window, cx| {
+                                cx.stop_propagation();
+                                shell.project_scope_menu.close_menu();
+                                cx.notify();
+                            }),
+                        )
+                        .child(
+                            div()
+                                .w(px(280.0))
+                                .p(px(10.0))
+                                .rounded(px(10.0))
+                                .bg(tokens.surfaces.overlay.to_gpui())
+                                .border(px(1.0))
+                                .border_color(tokens.borders.subtle.to_gpui())
+                                .child(list),
+                        ),
+                ),
+        )
+        .with_priority(2)
+        .into_any_element()
+    }
+
+    fn render_project_action_overlay(
+        &self,
+        tokens: crate::ui::tokens::ThemeTokens,
+        viewport: Size<Pixels>,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let body = match &self.project_actions.mode {
+            ProjectActionMenuMode::Closed => div().child("Closed"),
+            ProjectActionMenuMode::Menu { selected_index } => {
+                let rows = self.project_action_rows();
+                let mut list = div().flex().flex_col().gap(px(2.0));
+                for (index, row) in rows.iter().enumerate() {
+                    let run_command_id = row.command_id.clone();
+                    let edit_command_id = row.command_id.clone();
+                    let archive_command_id = row.command_id.clone();
+                    list = list.child(
+                        div()
+                            .id(("native-project-action-row", index))
+                            .px(px(10.0))
+                            .py(px(6.0))
+                            .rounded(px(6.0))
+                            .bg(if index == *selected_index {
+                                tokens.surfaces.raised.to_gpui()
+                            } else {
+                                tokens.surfaces.overlay.to_gpui()
+                            })
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .child(div().flex_1().child(row.label.clone()))
+                            .child(
+                                Button::new(("native-project-action-run", index))
+                                    .label("Run")
+                                    .on_click(cx.listener(
+                                        move |shell, _event: &ClickEvent, _window, cx| {
+                                            cx.stop_propagation();
+                                            shell.run_project_action(&run_command_id);
+                                            cx.notify();
+                                        },
+                                    )),
+                            )
+                            .child(
+                                Button::new(("native-project-action-edit", index))
+                                    .label("Edit")
+                                    .ghost()
+                                    .on_click(cx.listener(
+                                        move |shell, _event: &ClickEvent, _window, cx| {
+                                            cx.stop_propagation();
+                                            shell.edit_project_action(&edit_command_id);
+                                            cx.notify();
+                                        },
+                                    )),
+                            )
+                            .child(
+                                Button::new(("native-project-action-archive", index))
+                                    .label("Archive")
+                                    .ghost()
+                                    .on_click(cx.listener(
+                                        move |shell, _event: &ClickEvent, _window, cx| {
+                                            cx.stop_propagation();
+                                            shell.begin_archive_project_action(&archive_command_id);
+                                            cx.notify();
+                                        },
+                                    )),
+                            ),
+                    );
+                }
+                list = list
+                    .child(
+                        div()
+                            .id("native-project-action-add")
+                            .px(px(10.0))
+                            .py(px(6.0))
+                            .rounded(px(6.0))
+                            .cursor_pointer()
+                            .child("+ Add action…")
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|shell, _event: &MouseDownEvent, _window, cx| {
+                                    cx.stop_propagation();
+                                    shell.begin_add_project_action();
+                                    cx.notify();
+                                }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("native-project-action-layout-palette")
+                            .px(px(10.0))
+                            .py(px(6.0))
+                            .text_color(tokens.text.muted.to_gpui())
+                            .child("Layout commands…")
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|shell, _event: &MouseDownEvent, _window, cx| {
+                                    cx.stop_propagation();
+                                    shell.project_actions.close();
+                                    shell.dispatch_keyboard(KeyboardShortcut::ctrl(
+                                        crate::ui::actions::ShortcutKey::Character('k'),
+                                    ));
+                                    cx.notify();
+                                }),
+                            ),
+                    );
+                if let Some(error) = self.project_actions.last_error.clone() {
+                    list = list.child(
+                        div()
+                            .id("native-project-action-error")
+                            .text_color(tokens.status.destructive.to_gpui())
+                            .child(error),
+                    );
+                }
+                if let Some(result) = self.project_actions.last_result.clone() {
+                    list = list.child(
+                        div()
+                            .id("native-project-action-result")
+                            .text_color(tokens.text.secondary.to_gpui())
+                            .child(result),
+                    );
+                }
+                list.child("Enter runs · E edits · Delete archives · Esc closes")
+            }
+            ProjectActionMenuMode::ArchiveConfirm { row } => div()
+                .flex()
+                .flex_col()
+                .gap(px(8.0))
+                .child(format!("Archive action “{}”?", row.label))
+                .child("Enter confirms · Esc cancels")
+                .child(
+                    div()
+                        .flex()
+                        .gap(px(6.0))
+                        .child(
+                            Button::new("native-project-action-archive-cancel")
+                                .label("Cancel")
+                                .ghost()
+                                .on_click(cx.listener(
+                                    |shell, _event: &ClickEvent, _window, cx| {
+                                        cx.stop_propagation();
+                                        shell.project_actions.cancel_editor();
+                                        cx.notify();
+                                    },
+                                )),
+                        )
+                        .child(
+                            Button::new("native-project-action-archive-confirm")
+                                .label("Archive")
+                                .on_click(cx.listener(
+                                    |shell, _event: &ClickEvent, _window, cx| {
+                                        cx.stop_propagation();
+                                        shell.confirm_archive_project_action();
+                                        cx.notify();
+                                    },
+                                )),
+                        ),
+                ),
+            ProjectActionMenuMode::Editor(draft) => {
+                let name_focused = draft.focused_field == ProjectActionEditorField::Name;
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .id("native-project-action-name")
+                            .px(px(8.0))
+                            .py(px(6.0))
+                            .rounded(px(6.0))
+                            .bg(if name_focused {
+                                tokens.surfaces.raised.to_gpui()
+                            } else {
+                                tokens.surfaces.overlay.to_gpui()
+                            })
+                            .child(format!(
+                                "Name{}: {}",
+                                if name_focused { " ▌" } else { "" },
+                                draft.label
+                            ))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|shell, _event: &MouseDownEvent, _window, cx| {
+                                    cx.stop_propagation();
+                                    if let ProjectActionMenuMode::Editor(draft) =
+                                        &mut shell.project_actions.mode
+                                    {
+                                        draft.focus_field(ProjectActionEditorField::Name);
+                                    }
+                                    cx.notify();
+                                }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("native-project-action-command")
+                            .px(px(8.0))
+                            .py(px(6.0))
+                            .rounded(px(6.0))
+                            .bg(if !name_focused {
+                                tokens.surfaces.raised.to_gpui()
+                            } else {
+                                tokens.surfaces.overlay.to_gpui()
+                            })
+                            .child(format!(
+                                "Command{}: {}",
+                                if !name_focused { " ▌" } else { "" },
+                                draft.command
+                            ))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|shell, _event: &MouseDownEvent, _window, cx| {
+                                    cx.stop_propagation();
+                                    if let ProjectActionMenuMode::Editor(draft) =
+                                        &mut shell.project_actions.mode
+                                    {
+                                        draft.focus_field(ProjectActionEditorField::Command);
+                                    }
+                                    cx.notify();
+                                }),
+                            ),
+                    )
+                    .children(draft.error.clone().map(|error| {
+                        div()
+                            .id("native-project-action-error")
+                            .text_color(tokens.text.secondary.to_gpui())
+                            .child(error)
+                    }))
+                    .children(
+                        self.project_actions
+                            .last_result
+                            .clone()
+                            .map(|result| div().id("native-project-action-result").child(result)),
+                    )
+                    .child("Tab fields · Enter saves · Esc cancels")
+            }
+        };
+        deferred(
+            anchored()
+                .position(point(px(0.0), px(0.0)))
+                .snap_to_window()
+                .child(
+                    div()
+                        .id("native-project-action-backdrop")
+                        .occlude()
+                        .w(viewport.width)
+                        .h(viewport.height)
+                        .flex()
+                        .items_start()
+                        .justify_center()
+                        .pt(px(72.0))
+                        .bg(Self::modal_backdrop())
+                        .child(
+                            div()
+                                .id("native-project-action-panel")
+                                .w(px(360.0))
+                                .p(px(12.0))
+                                .rounded(px(10.0))
+                                .bg(tokens.surfaces.overlay.to_gpui())
+                                .border(px(1.0))
+                                .border_color(tokens.borders.subtle.to_gpui())
+                                .child(body),
+                        ),
+                ),
+        )
+        .with_priority(2)
+        .into_any_element()
+    }
+
+    fn render_commit_overlay(
+        &self,
+        tokens: crate::ui::tokens::ThemeTokens,
+        viewport: Size<Pixels>,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let body = match &self.header_commit.phase {
+            HeaderCommitPhase::LoadingStatus => div().child(format!(
+                "Loading git status for {}…",
+                self.header_commit.overlay_repository_label()
+            )),
+            HeaderCommitPhase::Preview {
+                message,
+                change_count,
+                branch,
+                error,
+            } => div()
+                .flex()
+                .flex_col()
+                .gap(px(8.0))
+                .child(format!(
+                    "Commit {} change(s) in {}{}",
+                    change_count,
+                    self.header_commit.overlay_repository_label(),
+                    branch
+                        .as_ref()
+                        .map(|branch| format!(" on {branch}"))
+                        .unwrap_or_default()
+                ))
+                .child(format!("Message: {message}"))
+                .children(error.clone().map(|error| {
+                    div()
+                        .text_color(tokens.text.secondary.to_gpui())
+                        .child(error)
+                }))
+                .child("Enter confirms · Esc cancels"),
+            HeaderCommitPhase::Confirming { message } => div()
+                .flex()
+                .flex_col()
+                .gap(px(8.0))
+                .child(format!(
+                    "Committing to {}: {message}",
+                    self.header_commit.overlay_repository_label()
+                ))
+                .child("Waiting for host confirmation…"),
+            HeaderCommitPhase::Success { message } => div()
+                .flex()
+                .flex_col()
+                .gap(px(8.0))
+                .child(message.clone())
+                .child("Enter or Esc closes"),
+            HeaderCommitPhase::Error(error) => div()
+                .text_color(tokens.text.secondary.to_gpui())
+                .child(error.clone()),
+            HeaderCommitPhase::Idle => div().child("Commit"),
+        };
+        deferred(
+            anchored()
+                .position(point(px(0.0), px(0.0)))
+                .snap_to_window()
+                .child(
+                    div()
+                        .id("native-commit-backdrop")
+                        .occlude()
+                        .w(viewport.width)
+                        .h(viewport.height)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .bg(Self::modal_backdrop())
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|shell, _event: &MouseDownEvent, _window, cx| {
+                                cx.stop_propagation();
+                                shell.header_commit.cancel();
+                                cx.notify();
+                            }),
+                        )
+                        .child(
+                            div()
+                                .id("native-commit-panel")
+                                .w(px(420.0))
+                                .p(px(14.0))
+                                .rounded(px(10.0))
+                                .bg(tokens.surfaces.overlay.to_gpui())
+                                .border(px(1.0))
+                                .border_color(tokens.borders.subtle.to_gpui())
+                                .child(body),
+                        ),
+                ),
+        )
+        .with_priority(2)
+        .into_any_element()
+    }
+
+    fn project_action_rows(&self) -> Vec<ProjectActionRow> {
+        let Some(project_id) = self
+            .project_actions
+            .project_id
+            .or_else(|| self.current_workspace_project_id())
+        else {
+            return Vec::new();
+        };
+        let Some(project) = self
+            .config_sidebar
+            .projects
+            .iter()
+            .find(|project| ProjectId::parse(&project.workspace_id).ok() == Some(project_id))
+        else {
+            return Vec::new();
+        };
+        self.config_sidebar
+            .servers
+            .iter()
+            .filter(|server| server.project_id == project.config_id)
+            .map(|server| ProjectActionRow {
+                project_config_id: server.project_id.clone(),
+                folder_id: server.folder_id.clone(),
+                command_id: server.command_id.clone(),
+                label: server.label.clone(),
+            })
+            .collect()
+    }
+
+    fn begin_add_project_action(&mut self) {
+        let Some(project_id) = self.current_workspace_project_id() else {
+            self.project_actions.last_error = Some("Select a project first.".into());
+            return;
+        };
+        let Some(project) = self
+            .config_sidebar
+            .projects
+            .iter()
+            .find(|project| ProjectId::parse(&project.workspace_id).ok() == Some(project_id))
+        else {
+            self.project_actions.last_error = Some("Project is unavailable.".into());
+            return;
+        };
+        let folder_id = project
+            .folders
+            .first()
+            .map(|folder| folder.config_id.clone())
+            .unwrap_or_default();
+        self.project_actions.open_menu(project_id);
+        self.project_actions
+            .begin_add(project.config_id.clone(), folder_id);
+    }
+
+    fn open_project_action_menu(&mut self) {
+        let Some(project_id) = self.current_workspace_project_id() else {
+            self.last_query_detail = Some("Select a project before adding an action.".into());
+            return;
+        };
+        self.project_actions.open_menu(project_id);
+    }
+
+    fn run_project_action(&mut self, command_id: &str) {
+        let rows = self.project_action_rows();
+        let Some(row) = rows.iter().find(|row| row.command_id == command_id) else {
+            self.project_actions.last_error = Some("Action is unavailable.".into());
+            return;
+        };
+        let Some(task_id) = self.interaction.selected_task() else {
+            self.project_actions.last_error = Some("Select a task to run an action.".into());
+            return;
+        };
+        let service_id = match row.service_id() {
+            Ok(service_id) => service_id,
+            Err(error) => {
+                self.project_actions
+                    .surface_error(format!("Action id is invalid: {error}"));
+                return;
+            }
+        };
+        let epochs = self.interaction.action_epochs();
+        let Some(request) =
+            self.service_action_request(task_id, &service_id, ServicePanelAction::Start, epochs)
+        else {
+            self.project_actions
+                .surface_error("Action cannot run until the host service capability is available.");
+            return;
+        };
+        match self.dispatch_action_checked(request) {
+            Ok(()) => self
+                .project_actions
+                .surface_result(format!("Starting {}…", row.label)),
+            Err(failure) => self.project_actions.surface_error(failure.message),
+        }
+    }
+
+    fn edit_project_action(&mut self, command_id: &str) {
+        let Some(row) = self
+            .project_action_rows()
+            .into_iter()
+            .find(|row| row.command_id == command_id)
+        else {
+            self.project_actions.surface_error("Action is unavailable.");
+            return;
+        };
+        let Some(task_id) = self.interaction.selected_task() else {
+            self.project_actions
+                .surface_error("Select a task before editing an action.");
+            return;
+        };
+        self.project_actions.begin_edit_loading(&row);
+        let request = ActionRequest::TaskCockpit {
+            task_id,
+            query: TaskCockpitQuery::ConfigCommandDetail {
+                project_id: row.project_config_id,
+                folder_id: row.folder_id,
+                command_id: row.command_id,
+            },
+        };
+        if let Err(failure) = self.dispatch_action_checked(request) {
+            self.project_actions.surface_error(failure.message);
+        }
+    }
+
+    fn begin_archive_project_action(&mut self, command_id: &str) {
+        let Some(row) = self
+            .project_action_rows()
+            .into_iter()
+            .find(|row| row.command_id == command_id)
+        else {
+            self.project_actions.surface_error("Action is unavailable.");
+            return;
+        };
+        self.project_actions.begin_archive_confirm(row);
+    }
+
+    fn confirm_archive_project_action(&mut self) {
+        let Some(row) = self.project_actions.take_archive_row() else {
+            return;
+        };
+        let Some(task_id) = self.interaction.selected_task() else {
+            self.project_actions
+                .surface_error("Select a task before archiving an action.");
+            return;
+        };
+        let label = row.label.clone();
+        let request = ActionRequest::TaskCockpit {
+            task_id,
+            query: TaskCockpitQuery::ConfigArchiveCommand {
+                project_id: row.project_config_id,
+                folder_id: row.folder_id,
+                command_id: row.command_id,
+            },
+        };
+        match self.dispatch_action_checked(request) {
+            Ok(()) => self
+                .project_actions
+                .surface_result(format!("Archiving {label}…")),
+            Err(failure) => self.project_actions.surface_error(failure.message),
+        }
+    }
+
+    fn save_project_action_draft(&mut self) {
+        let Some(draft) = self.project_actions.take_validated_draft() else {
+            return;
+        };
+        let Some(task_id) = self
+            .interaction
+            .selected_task()
+            .or_else(|| self.inbox.active_rows().first().map(|row| row.task_id))
+        else {
+            if let ProjectActionMenuMode::Editor(editor) = &mut self.project_actions.mode {
+                editor.error = Some("Open a task before saving actions.".into());
+            }
+            return;
+        };
+        let label = draft.label.clone();
+        let request = ActionRequest::TaskCockpit {
+            task_id,
+            query: TaskCockpitQuery::ConfigUpsertCommand {
+                project_id: draft.project_config_id,
+                folder_id: draft.folder_id,
+                command_id: draft.command_id,
+                label: draft.label,
+                command: draft.command,
+            },
+        };
+        match self.dispatch_action_checked(request) {
+            Ok(()) => {
+                self.project_actions.mode = ProjectActionMenuMode::Menu { selected_index: 0 };
+                self.project_actions
+                    .surface_result(format!("Saving {label}…"));
+            }
+            Err(failure) => self.project_actions.surface_error(failure.message),
+        }
+    }
+
+    fn handle_task_search_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = event.keystroke.key.as_str();
+        let candidates = self.task_search_candidates();
+        let filtered_len = self.task_search.filtered(&candidates).len();
+        match key {
+            "escape" => {
+                window.prevent_default();
+                if !self.task_search.query().is_empty() {
+                    self.task_search.clear_query();
+                } else {
+                    self.task_search.close();
+                    self.interaction.close_palettes();
+                }
+            }
+            "enter" => {
+                window.prevent_default();
+                if let Some(task_id) = self.task_search.confirm_selection(&candidates) {
+                    let _ = self.select_projected_task(task_id);
+                }
+                self.interaction.close_palettes();
+            }
+            "up" | "arrowup" => {
+                window.prevent_default();
+                self.task_search.move_selection(-1, filtered_len);
+            }
+            "down" | "arrowdown" => {
+                window.prevent_default();
+                self.task_search.move_selection(1, filtered_len);
+            }
+            "backspace" => {
+                window.prevent_default();
+                let mut query = self.task_search.query().to_string();
+                query.pop();
+                self.task_search.set_query(query);
+            }
+            _ => {
+                if let Some(input) = Self::overlay_key_input(event) {
+                    if let crate::ui::components::text_field::TextFieldKey::Character(ch) = input {
+                        window.prevent_default();
+                        let mut query = self.task_search.query().to_string();
+                        query.push(ch);
+                        self.task_search.set_query(query);
+                    }
+                }
+            }
+        }
+        self.refresh_accessibility_tree();
+        cx.notify();
+    }
+
+    fn handle_project_scope_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let configured = self
+            .config_sidebar
+            .projects
+            .iter()
+            .filter_map(|project| ProjectId::parse(&project.workspace_id).ok())
+            .collect::<Vec<_>>();
+        match event.keystroke.key.as_str() {
+            "escape" => {
+                window.prevent_default();
+                self.project_scope_menu.close_menu();
+            }
+            "enter" => {
+                window.prevent_default();
+                let scope = self.project_scope_menu.confirm_selection(&configured);
+                self.set_project_scope(scope);
+            }
+            "up" | "arrowup" => {
+                window.prevent_default();
+                self.project_scope_menu.move_selection(-1, configured.len());
+            }
+            "down" | "arrowdown" => {
+                window.prevent_default();
+                self.project_scope_menu.move_selection(1, configured.len());
+            }
+            _ => {}
+        }
+        cx.notify();
+    }
+
+    fn handle_project_action_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = event.keystroke.key.as_str();
+        match key {
+            "escape" => {
+                window.prevent_default();
+                if matches!(
+                    self.project_actions.mode,
+                    ProjectActionMenuMode::Editor(_) | ProjectActionMenuMode::ArchiveConfirm { .. }
+                ) {
+                    self.project_actions.cancel_editor();
+                } else {
+                    self.project_actions.close();
+                }
+            }
+            "enter" => {
+                window.prevent_default();
+                match &self.project_actions.mode {
+                    ProjectActionMenuMode::Editor(_) => self.save_project_action_draft(),
+                    ProjectActionMenuMode::ArchiveConfirm { .. } => {
+                        self.confirm_archive_project_action()
+                    }
+                    ProjectActionMenuMode::Menu { selected_index } => {
+                        let rows = self.project_action_rows();
+                        if *selected_index >= rows.len() {
+                            self.begin_add_project_action();
+                        } else if let Some(row) = rows.get(*selected_index) {
+                            let command_id = row.command_id.clone();
+                            self.run_project_action(&command_id);
+                        }
+                    }
+                    ProjectActionMenuMode::Closed => {}
+                }
+            }
+            "up" | "arrowup" => {
+                if matches!(
+                    self.project_actions.mode,
+                    ProjectActionMenuMode::Menu { .. }
+                ) {
+                    window.prevent_default();
+                    self.project_actions
+                        .move_menu_selection(-1, self.project_action_rows().len());
+                }
+            }
+            "down" | "arrowdown" => {
+                if matches!(
+                    self.project_actions.mode,
+                    ProjectActionMenuMode::Menu { .. }
+                ) {
+                    window.prevent_default();
+                    self.project_actions
+                        .move_menu_selection(1, self.project_action_rows().len());
+                }
+            }
+            "tab" => {
+                if let ProjectActionMenuMode::Editor(draft) = &mut self.project_actions.mode {
+                    window.prevent_default();
+                    draft.focus_field(draft.focused_field.toggle());
+                }
+            }
+            "backspace" | "delete" => {
+                if let ProjectActionMenuMode::Editor(draft) = &mut self.project_actions.mode {
+                    window.prevent_default();
+                    if key == "backspace" {
+                        draft.backspace();
+                    } else {
+                        draft.delete_forward_noop();
+                    }
+                } else if key == "delete" {
+                    if let ProjectActionMenuMode::Menu { selected_index } =
+                        &self.project_actions.mode
+                    {
+                        if let Some(row) = self.project_action_rows().get(*selected_index) {
+                            window.prevent_default();
+                            let command_id = row.command_id.clone();
+                            self.begin_archive_project_action(&command_id);
+                        }
+                    }
+                }
+            }
+            _ => {
+                if let ProjectActionMenuMode::Editor(draft) = &mut self.project_actions.mode {
+                    if let Some(input) = Self::overlay_key_input(event) {
+                        if let crate::ui::components::text_field::TextFieldKey::Character(ch) =
+                            input
+                        {
+                            window.prevent_default();
+                            draft.push_char(ch);
+                        }
+                    }
+                } else if key.eq_ignore_ascii_case("e") {
+                    if let ProjectActionMenuMode::Menu { selected_index } =
+                        &self.project_actions.mode
+                    {
+                        if let Some(row) = self.project_action_rows().get(*selected_index) {
+                            window.prevent_default();
+                            let command_id = row.command_id.clone();
+                            self.edit_project_action(&command_id);
+                        }
+                    }
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn handle_commit_overlay_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event.keystroke.key.as_str() {
+            "escape" => {
+                window.prevent_default();
+                self.header_commit.cancel();
+            }
+            "enter" => {
+                window.prevent_default();
+                match &self.header_commit.phase {
+                    HeaderCommitPhase::Preview { .. } => {
+                        if let Some(message) = self.header_commit.request_confirm() {
+                            if let (Some(task_id), Some(selector)) = (
+                                self.header_commit.task_id,
+                                self.header_commit.confirmed_selector().cloned(),
+                            ) {
+                                self.dispatch_header_commit_query(
+                                    task_id,
+                                    TaskCockpitQuery::GitMutateTargeted {
+                                        selector,
+                                        intent: crate::domain::TaskGitMutateIntent::Commit {
+                                            message,
+                                        },
+                                        confirm: true,
+                                    },
+                                );
+                                if matches!(
+                                    self.header_commit.phase,
+                                    HeaderCommitPhase::Confirming { .. }
+                                ) {
+                                    self.header_commit.mark_dispatched();
+                                }
+                            }
+                        }
+                    }
+                    HeaderCommitPhase::Success { .. } | HeaderCommitPhase::Error(_) => {
+                        self.header_commit.cancel();
+                    }
+                    _ => {}
+                }
+            }
+            "backspace" => {
+                window.prevent_default();
+                self.header_commit.backspace_message();
+            }
+            _ => {
+                if matches!(self.header_commit.phase, HeaderCommitPhase::Preview { .. }) {
+                    if let Some(input) = Self::overlay_key_input(event) {
+                        if let crate::ui::components::text_field::TextFieldKey::Character(ch) =
+                            input
+                        {
+                            window.prevent_default();
+                            self.header_commit.push_message_char(ch);
+                        }
+                    }
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn begin_header_commit(&mut self) {
+        let Some(task_id) = self.interaction.selected_task() else {
+            self.last_query_detail = Some("Select a task before committing.".into());
+            return;
+        };
+        let Some(selector) = self.selected_repository_for_task(task_id).or_else(|| {
+            self.repository_catalog_for_task(task_id)
+                .and_then(crate::ui::task_cockpit::changes_panel::default_repository_selector)
+        }) else {
+            self.header_commit
+                .begin_blocked(PanelDisabledReason::HostProjectionMissing);
+            self.last_query_detail =
+                Some("Repository catalog is unavailable for this task.".into());
+            return;
+        };
+        let Some(entry) = self
+            .repository_catalog_for_task(task_id)
+            .and_then(|catalog| {
+                catalog
+                    .repositories
+                    .iter()
+                    .find(|entry| entry.selector == selector)
+            })
+            .cloned()
+        else {
+            self.header_commit
+                .begin_blocked(PanelDisabledReason::HostProjectionMissing);
+            return;
+        };
+        if !repository_status_readable(&entry) {
+            self.header_commit
+                .begin_blocked(PanelDisabledReason::RepositoryUnavailable);
+            return;
+        }
+        if !repository_mutation_allowed(&entry) {
+            self.header_commit
+                .begin_blocked(PanelDisabledReason::RepositoryReadOnly);
+            return;
+        }
+        self.selected_repository = Some((task_id, selector.clone()));
+        self.header_commit
+            .begin(task_id, selector.clone(), entry.label.clone());
+        self.dispatch_header_commit_query(
+            task_id,
+            TaskCockpitQuery::GitStatusTargeted { selector },
+        );
+    }
+
+    fn selected_repository_for_task(&self, task_id: TaskId) -> Option<TaskRepositorySelector> {
+        self.selected_repository
+            .as_ref()
+            .filter(|(owned, _)| *owned == task_id)
+            .map(|(_, selector)| selector.clone())
+    }
+
+    fn repository_catalog_for_task(
+        &self,
+        task_id: TaskId,
+    ) -> Option<&TaskGitRepositoriesProjection> {
+        self.cockpit
+            .live_projection()
+            .and_then(|projection| projection.repositories.as_ref())
+            .filter(|catalog| catalog.task_id == task_id)
+    }
+
+    /// Reconcile Task-scoped selection from a fresh catalog and request targeted
+    /// status once. Catalog application is the only loop-free trigger for that
+    /// follow-up query (paint paths must not refresh).
+    fn apply_repository_catalog(&mut self, catalog: &TaskGitRepositoriesProjection) {
+        if self.interaction.selected_task() != Some(catalog.task_id) {
+            return;
+        }
+        let current = self.selected_repository_for_task(catalog.task_id);
+        let Some(selector) = reconcile_selected_repository(current.as_ref(), catalog) else {
+            self.selected_repository = None;
+            return;
+        };
+        self.selected_repository = Some((catalog.task_id, selector.clone()));
+        let _ = self.dispatch_task_cockpit_query(
+            catalog.task_id,
+            TaskCockpitQuery::GitStatusTargeted { selector },
+        );
+        self.refresh_accessibility_tree();
+    }
+
+    fn select_changes_repository(&mut self, selector: TaskRepositorySelector) {
+        let Some(task_id) = self.interaction.selected_task() else {
+            return;
+        };
+        let Some(entry) = self
+            .repository_catalog_for_task(task_id)
+            .and_then(|catalog| {
+                catalog
+                    .repositories
+                    .iter()
+                    .find(|entry| entry.selector == selector)
+            })
+        else {
+            return;
+        };
+        if !repository_status_readable(entry) {
+            self.last_query_detail = Some("Repository is unavailable.".into());
+            return;
+        }
+        self.selected_repository = Some((task_id, selector.clone()));
+        let _ = self
+            .dispatch_task_cockpit_query(task_id, TaskCockpitQuery::GitStatusTargeted { selector });
+        self.refresh_accessibility_tree();
+    }
+
+    fn begin_header_open(&mut self) {
+        let Some(task_id) = self.interaction.selected_task() else {
+            self.last_query_detail = Some("Select a task before opening files.".into());
+            return;
+        };
+        self.layout.active_dock_tab = Some("Files".to_string());
+        self.layout.dock_collapsed = false;
+        self.persist_layout();
+        self.dispatch_keyboard(KeyboardShortcut::alt(
+            crate::ui::actions::ShortcutKey::Digit(2),
+        ));
+        let _ = self.dispatch_task_cockpit_query(
+            task_id,
+            TaskCockpitQuery::FilesList {
+                relative_directory: HeaderOpenTarget::FilesRoot.files_list_directory(),
+                limit: 64,
+            },
+        );
+    }
+
+    fn reconcile_browser_dock_lifecycle(&mut self, window: Option<&Window>) {
+        let browser_tab_active = self.cockpit.active_tool() == CockpitDockTool::Browser;
+        let dock_expanded = !self.layout.dock_collapsed;
+        let host_available = self.browser_host.status().available;
+        let attached = self
+            .cockpit
+            .browser_projection()
+            .is_some_and(|projection| projection.attached());
+        let identity = self.browser_dock_identity();
+        let plan = plan_browser_dock(
+            identity.as_ref(),
+            BrowserDockSurfaceState {
+                dock_expanded,
+                browser_tab_active,
+                host_available,
+                attached,
+                parent_hwnd: self.browser_parent_hwnd.or_else(|| {
+                    window.and_then(|window| {
+                        #[cfg(target_os = "windows")]
+                        {
+                            use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+                            raw_window_handle::HasWindowHandle::window_handle(window)
+                                .ok()
+                                .and_then(|handle| match handle.as_raw() {
+                                    RawWindowHandle::Win32(win) => Some(win.hwnd.get() as u64),
+                                    _ => None,
+                                })
+                        }
+                        #[cfg(not(target_os = "windows"))]
+                        {
+                            let _ = window;
+                            None
+                        }
+                    })
+                }),
+                bounds: self.browser_page_bounds,
+            },
+        );
+        match plan {
+            BrowserDockPlan::ShowDiagnostic(error) => {
+                self.browser_dock_diagnostic = Some(error.message().to_string());
+            }
+            BrowserDockPlan::Park => {
+                if let Ok(command) = self.cockpit.detach_browser_native() {
+                    let _ = self.apply_browser_native_command(&command);
+                }
+                self.browser_dock_diagnostic = None;
+            }
+            BrowserDockPlan::BindAndAttach {
+                identity,
+                parent_hwnd,
+                bounds,
+            } => {
+                self.browser_dock_diagnostic = None;
+                let workspace_key = crate::browser::BrowserWorkspaceKey::new(
+                    identity.task_id.to_string(),
+                    "conversation",
+                );
+                let Ok(workspace_key) = workspace_key else {
+                    self.browser_dock_diagnostic = Some(
+                        BrowserDockLifecycleError::IdentityIncomplete
+                            .message()
+                            .into(),
+                    );
+                    return;
+                };
+                let gateway = crate::browser::BrowserGatewayBindingRef::new(
+                    identity.process_session_id.clone(),
+                );
+                if self.cockpit.browser_projection().is_none() {
+                    // Ensure/open the route before bind so registrar identity can settle.
+                    self.dispatch_browser_chrome_command(BrowserCommand::Ensure {
+                        snapshot: BrowserWorkspaceSnapshot::default(),
+                    });
+                    let _ = self.cockpit.bind_browser_native(
+                        identity.to_native_identity(),
+                        workspace_key,
+                        gateway,
+                        bounds,
+                    );
+                }
+                if let Ok(destination) =
+                    crate::browser::BrowserNativeDestination::from_raw(parent_hwnd)
+                {
+                    if let Ok(command) = self.cockpit.attach_browser_native(destination, bounds) {
+                        let _ = self.apply_browser_native_command(&command);
+                    }
+                }
+            }
+            BrowserDockPlan::Resize { bounds } => {
+                if let Ok(command) = self.cockpit.resize_browser_native(bounds) {
+                    let _ = self.apply_browser_native_command(&command);
+                }
+            }
+            BrowserDockPlan::Focus { focused } => {
+                if let Ok(command) = self.cockpit.focus_browser_native(focused) {
+                    let _ = self.apply_browser_native_command(&command);
+                }
+            }
+            BrowserDockPlan::Idle => {}
+        }
+    }
+
+    fn browser_dock_identity(&self) -> Option<BrowserDockIdentity> {
+        let task_id = self.interaction.selected_task()?;
+        let view = self.client_model.as_ref()?.browser_dock_view(task_id)?;
+        let agent_session_id = view.agent_session_id?;
+        let context_id = view.context_id?;
+        let resource_id = view.resource_id?;
+        let workspace_key = BrowserWorkspaceKey::new(task_id.to_string(), "conversation").ok()?;
+        // Prefer an already-bound projection, else the registrar (pre-bind).
+        // Never synthesize a process session id.
+        let process_session_id = self
+            .cockpit
+            .browser_projection()
+            .map(|projection| projection.gateway().process_session_id().to_string())
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                registered_process_session_id(
+                    self.browser_gateway
+                        .as_ref()
+                        .map(|gateway| gateway.registrar())
+                        .as_ref(),
+                    &workspace_key,
+                )
+            })?;
+        Some(BrowserDockIdentity {
+            task_id,
+            agent_session_id,
+            context_id,
+            resource_id,
+            process_session_id,
+        })
+    }
+
+    fn apply_browser_process_session(
+        &mut self,
+        projection: &crate::domain::BrowserProcessSessionProjection,
+    ) {
+        if self.interaction.selected_task() != Some(projection.task_id) {
+            return;
+        }
+        let Some(gateway) = self.browser_gateway.as_ref() else {
+            self.browser_dock_diagnostic = Some("Browser gateway is unavailable.".into());
+            return;
+        };
+        let Ok(workspace_key) =
+            BrowserWorkspaceKey::new(projection.task_id.to_string(), "conversation")
+        else {
+            self.browser_dock_diagnostic = Some("Browser workspace key is invalid.".into());
+            return;
+        };
+        if self
+            .browser_registration
+            .as_ref()
+            .is_some_and(|registration| {
+                registration.process_session_id() == projection.process_session_id
+                    && registration.workspace_key() == &workspace_key
+            })
+        {
+            return;
+        }
+        if let Some(registration) = self.browser_registration.take() {
+            gateway.registrar().revoke(&registration);
+        }
+        match gateway.registrar().register(
+            projection.process_session_id.clone(),
+            workspace_key,
+            BrowserWorkspaceSnapshot::default(),
+        ) {
+            Ok(registration) => {
+                self.browser_registration = Some(registration);
+                self.browser_dock_diagnostic = None;
+                self.reconcile_browser_dock_lifecycle(None);
+            }
+            Err(error) => {
+                self.browser_dock_diagnostic =
+                    Some(format!("Browser gateway registration failed: {error}"));
+            }
+        }
+    }
+
+    fn reconcile_native_browser_gateway(&mut self) {
+        if self.browser_gateway.is_some() {
+            return;
+        }
+        if !self.browser_host.status().available {
+            self.browser_dock_diagnostic = Some("BrowserWebViewHost is unavailable.".into());
+            return;
+        }
+        let app_config_dir = self.profile.root().to_path_buf();
+        match BrowserGatewayHandle::start_with_app_config_dir(
+            self.browser_bridge.clone(),
+            &app_config_dir,
+        ) {
+            Ok(gateway) => {
+                self.browser_host
+                    .attach_gateway_registrar(gateway.registrar());
+                self.browser_gateway = Some(gateway);
+                self.browser_dock_diagnostic = None;
+            }
+            Err(error) => {
+                self.browser_dock_diagnostic =
+                    Some(format!("Browser gateway failed to start: {error}"));
+            }
+        }
+    }
+
+    fn capture_browser_parent_hwnd(&mut self, window: &Window) {
+        #[cfg(target_os = "windows")]
+        {
+            use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+            if let Ok(handle) = raw_window_handle::HasWindowHandle::window_handle(window) {
+                if let RawWindowHandle::Win32(win) = handle.as_raw() {
+                    let hwnd = win.hwnd.get() as u64;
+                    if hwnd != 0 {
+                        self.browser_parent_hwnd = Some(hwnd);
+                    }
+                }
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = window;
+        }
+    }
+
+    fn dispatch_browser_chrome_command(&mut self, command: BrowserCommand) {
+        let Some(task_id) = self.interaction.selected_task() else {
+            self.browser_dock_diagnostic =
+                Some("Select a task before controlling the browser.".into());
+            return;
+        };
+        let Ok(workspace_key) = BrowserWorkspaceKey::new(task_id.to_string(), "conversation")
+        else {
+            self.browser_dock_diagnostic = Some("Browser workspace key is invalid.".into());
+            return;
+        };
+        self.pending_browser_commands
+            .push_back((workspace_key, command));
+    }
+
+    fn pump_pending_browser_commands(&mut self, window: &Window) {
+        while let Some((workspace_key, command)) = self.pending_browser_commands.pop_front() {
+            let bridge = self.browser_bridge.clone();
+            let result = bridge.with_locked_host_work_for_command(
+                &workspace_key,
+                &command,
+                |controls, lifecycle_requests, repair_cleanups| {
+                    for control in controls {
+                        self.browser_host.handle_control(control);
+                    }
+                    for cleanup in repair_cleanups {
+                        self.browser_host
+                            .handle_repair_highlight_cleanup(window, cleanup);
+                    }
+                    for request in lifecycle_requests {
+                        let _ = self.browser_host.handle_request(window, request);
+                    }
+                    self.browser_host
+                        .handle_command(window, &workspace_key, command.clone())
+                },
+            );
+            if let Err(error) = result {
+                self.browser_dock_diagnostic = Some(error.to_string());
+            }
+        }
+        while let Some(inbox) = self.browser_inbox.as_mut() {
+            let Some(_request) = inbox.try_recv() else {
+                break;
+            };
+        }
+        self.forward_browser_host_events();
     }
 
     fn render_command_palette(
@@ -13744,18 +18587,155 @@ impl NativeShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        if self.add_project.is_some() {
+        if self.browser_address_focused {
+            self.handle_browser_address_key(event, window, cx);
+            true
+        } else if self.add_project.is_some() {
             self.handle_add_project_key(event, window, cx);
             true
         } else if self.new_task.is_some() {
             self.handle_new_task_key(event, window, cx);
             true
+        } else if matches!(
+            self.header_commit.phase,
+            HeaderCommitPhase::Preview { .. }
+                | HeaderCommitPhase::Confirming { .. }
+                | HeaderCommitPhase::Error(_)
+                | HeaderCommitPhase::LoadingStatus
+        ) {
+            self.handle_commit_overlay_key(event, window, cx);
+            true
+        } else if !matches!(self.project_actions.mode, ProjectActionMenuMode::Closed) {
+            self.handle_project_action_key(event, window, cx);
+            true
+        } else if self.project_scope_menu.open() {
+            self.handle_project_scope_key(event, window, cx);
+            true
+        } else if self.task_search.open() || self.interaction.keyboard_state().task_switcher_open {
+            self.handle_task_search_key(event, window, cx);
+            true
         } else if self.interaction.keyboard_state().palette_open {
             self.handle_palette_key(event, window, cx);
+            true
+        } else if self.settings_open {
+            self.handle_settings_overlay_key(event, window, cx);
             true
         } else {
             false
         }
+    }
+
+    fn handle_settings_overlay_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = event.keystroke.key.as_str();
+        if key == "escape" {
+            window.prevent_default();
+            if self.theme_editor.is_some() {
+                self.cancel_theme_editor();
+            } else {
+                self.close_settings();
+            }
+            cx.notify();
+            return;
+        }
+        let Some(_) = self.theme_editor.as_ref() else {
+            return;
+        };
+        if event.keystroke.modifiers.control || event.keystroke.modifiers.platform {
+            match key {
+                "a" => {
+                    window.prevent_default();
+                    if let Some(editor) = self.theme_editor.as_mut() {
+                        Self::theme_editor_active_field_mut(editor).select_all();
+                    }
+                }
+                "v" => {
+                    window.prevent_default();
+                    if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                        if let Some(editor) = self.theme_editor.as_mut() {
+                            let field = Self::theme_editor_active_field_mut(editor);
+                            let epoch = field.focus_epoch();
+                            let _ = field.paste(&text, epoch);
+                        }
+                        self.sync_theme_editor_preview();
+                    }
+                }
+                _ => {}
+            }
+            cx.notify();
+            return;
+        }
+        if let Some(input) = Self::overlay_key_input(event) {
+            if let Some(editor) = self.theme_editor.as_mut() {
+                let field = Self::theme_editor_active_field_mut(editor);
+                let epoch = field.focus_epoch();
+                if field.handle_key(input, epoch).ok().unwrap_or(false) {
+                    window.prevent_default();
+                    self.sync_theme_editor_preview();
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn handle_browser_address_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = event.keystroke.key.as_str();
+        if (event.keystroke.modifiers.control || event.keystroke.modifiers.platform) && key == "a" {
+            window.prevent_default();
+            self.browser_address_select_all = true;
+        } else {
+            match key {
+                "escape" => {
+                    window.prevent_default();
+                    self.browser_address_focused = false;
+                    self.browser_address_select_all = false;
+                }
+                "enter" => {
+                    window.prevent_default();
+                    let url = self.browser_address_draft.trim().to_string();
+                    if !url.is_empty() {
+                        self.dispatch_browser_chrome_command(BrowserCommand::Navigate {
+                            tab_id: "conversation".into(),
+                            url,
+                        });
+                        self.pump_pending_browser_commands(window);
+                    }
+                    self.browser_address_focused = false;
+                    self.browser_address_select_all = false;
+                }
+                "backspace" | "delete" => {
+                    window.prevent_default();
+                    if self.browser_address_select_all {
+                        self.browser_address_draft.clear();
+                    } else {
+                        self.browser_address_draft.pop();
+                    }
+                    self.browser_address_select_all = false;
+                }
+                _ => {
+                    if let Some(crate::ui::components::text_field::TextFieldKey::Character(ch)) =
+                        Self::overlay_key_input(event)
+                    {
+                        window.prevent_default();
+                        if self.browser_address_select_all {
+                            self.browser_address_draft.clear();
+                        }
+                        self.browser_address_draft.push(ch);
+                        self.browser_address_select_all = false;
+                    }
+                }
+            }
+        }
+        cx.notify();
     }
 
     fn handle_add_project_key(
@@ -14353,7 +19333,7 @@ impl NativeShell {
     /// session over, so a store that refuses the write leaves the in-memory
     /// layout intact and the window usable.
     fn persist_layout(&self) {
-        if let Err(error) = self.layout_store.save(self.layout) {
+        if let Err(error) = self.layout_store.save(self.layout.clone()) {
             eprintln!(
                 "devmanager: workspace layout not persisted ({}): {error}",
                 self.layout_store.path().display()
@@ -14532,8 +19512,8 @@ impl NativeShell {
     }
 
     fn element_body(&self, task_rows: Vec<AnyElement>) -> impl IntoElement {
-        let tokens = self.preferences.tokens();
-        let layout = self.layout.sanitized();
+        let tokens = self.theme_tokens();
+        let layout = self.layout.clone().sanitized();
         // Connection state changes controls in-place; it never replaces the
         // workspace with a full-window waiting canvas.
         let stage = ShellStage::Cockpit;
@@ -14637,7 +19617,12 @@ impl NativeShell {
                         14.0,
                         tokens.text.muted.to_u32(),
                     ))
-                    .child(div().flex_1().child("All projects"))
+                    .child(div().flex_1().child(self.project_scope().label(|id| {
+                        self.config_sidebar.projects.iter().find_map(|project| {
+                            (ProjectId::parse(&project.workspace_id).ok() == Some(id))
+                                .then(|| project.label.as_str())
+                        })
+                    })))
                     .child(crate::icons::app_icon(
                         crate::icons::CHEVRON_DOWN,
                         12.0,
@@ -14752,11 +19737,16 @@ impl NativeShell {
         viewport: Size<Pixels>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let tokens = self.preferences.tokens();
+        let tokens = self.theme_tokens();
         let inbox_items = Arc::new(
             self.project_inbox_items()
                 .into_iter()
-                .filter(|item| matches!(item, ProjectInboxItem::Task { .. }))
+                .filter(|item| {
+                    matches!(
+                        item,
+                        ProjectInboxItem::Task { .. } | ProjectInboxItem::DoneHeader { .. }
+                    )
+                })
                 .collect::<Vec<_>>(),
         );
         let task_ids = Arc::new(self.task_list.task_ids().to_vec());
@@ -15011,7 +20001,28 @@ impl NativeShell {
                             };
                             header.into_any_element()
                         }
-                        ProjectInboxItem::Task { project_id, task_id } => {
+                        ProjectInboxItem::DoneHeader { task_count } => div()
+                            .id("native-done-section")
+                            .w_full()
+                            .h(px(32.0))
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .px(px(10.0))
+                            .mt(px(8.0))
+                            .border_t(px(1.0))
+                            .border_color(tokens.borders.subtle.to_gpui())
+                            .text_size(px(tokens.density.typography.caption))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(tokens.text.muted.to_gpui())
+                            .child("DONE")
+                            .child(task_count.to_string())
+                            .into_any_element(),
+                        ProjectInboxItem::Task {
+                            project_id,
+                            task_id,
+                            settled,
+                        } => {
                         let shell_for_mouse = shell_entity.clone();
                         let shell_for_mouse_up = shell_entity.clone();
                         let shell_for_key = shell_entity.clone();
@@ -15043,10 +20054,15 @@ impl NativeShell {
                                     if event.button == MouseButton::Left {
                                         shell.selected_project_id = Some(project_id);
                                         shell.focus_handle.focus(window);
-                                        let _ = shell
-                                            .interaction
-                                            .navigation_mouse_down(task_id, &shell.task_list);
-                                        shell.sync_cockpit_follow();
+                                        let _ = shell.interaction.navigation_mouse_down(
+                                            task_id,
+                                            &shell.task_list,
+                                        );
+                                        if settled {
+                                            shell.reopen_task(task_id);
+                                        } else {
+                                            shell.sync_cockpit_follow();
+                                        }
                                         shell.refresh_accessibility_tree();
                                         cx.notify();
                                     }
@@ -15069,10 +20085,15 @@ impl NativeShell {
                                     let _ = shell_for_key.update(app, |shell, cx| {
                                         cx.stop_propagation();
                                         shell.selected_project_id = Some(project_id);
-                                        let _ = shell
-                                            .interaction
-                                            .navigation_mouse_down(task_id, &shell.task_list);
-                                        shell.sync_cockpit_follow();
+                                        let _ = shell.interaction.navigation_mouse_down(
+                                            task_id,
+                                            &shell.task_list,
+                                        );
+                                        if settled {
+                                            shell.reopen_task(task_id);
+                                        } else {
+                                            shell.sync_cockpit_follow();
+                                        }
                                         shell.refresh_accessibility_tree();
                                         cx.notify();
                                     });
@@ -15096,6 +20117,9 @@ impl NativeShell {
                         // explicit text, so the state never depends on color.
                         let row = if row_selected {
                             row.bg(tokens.surfaces.selection.to_gpui())
+                        } else if settled {
+                            row.opacity(0.72)
+                                .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
                         } else {
                             row.hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
                         };
@@ -15153,7 +20177,11 @@ impl NativeShell {
                                             .items_center()
                                             .gap(px(4.0))
                                             .child(Self::tone_dot(row_tone, 7.0))
-                                            .child(status_label),
+                                            .child(if settled {
+                                                "Done".to_string()
+                                            } else {
+                                                status_label
+                                            }),
                                     ),
                             )
                             .child(
@@ -15278,11 +20306,12 @@ impl NativeShell {
                 crate::ui::actions::ShortcutKey::Character('k'),
             ));
         });
-        let open_switcher = cx.listener(|shell, _action: &NativeOpenTaskSwitcher, _window, cx| {
+        let open_switcher = cx.listener(|shell, _action: &NativeOpenTaskSwitcher, window, cx| {
             cx.stop_propagation();
             shell.dispatch_keyboard(KeyboardShortcut::ctrl(
                 crate::ui::actions::ShortcutKey::Character('p'),
             ));
+            shell.focus_task_search_input(window);
         });
         let open_command_palette =
             cx.listener(|shell, _action: &NativeOpenCommandPalette, _window, cx| {
@@ -15485,11 +20514,12 @@ impl NativeShell {
                     .text_size(px(tokens.density.typography.caption))
                     .text_color(tokens.text.secondary.to_gpui())
                     .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
-                    .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
+                    .on_click(cx.listener(|shell, _event: &ClickEvent, window, cx| {
                         cx.stop_propagation();
                         shell.dispatch_keyboard(KeyboardShortcut::ctrl(
                             crate::ui::actions::ShortcutKey::Character('p'),
                         ));
+                        shell.focus_task_search_input(window);
                         cx.notify();
                     }))
                     .child(crate::icons::app_icon(
@@ -15513,6 +20543,7 @@ impl NativeShell {
             .child(
                 div()
                     .id("native-shell-sidebar-project-scope")
+                    .tab_stop(true)
                     .w_full()
                     .h(px(34.0))
                     .flex()
@@ -15520,19 +20551,28 @@ impl NativeShell {
                     .gap(px(8.0))
                     .px(px(8.0))
                     .rounded(px(6.0))
+                    .cursor_pointer()
                     .text_size(px(tokens.density.typography.caption))
                     .text_color(tokens.text.secondary.to_gpui())
+                    .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
+                    .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
+                        cx.stop_propagation();
+                        shell.project_scope_menu.toggle_menu();
+                        cx.notify();
+                    }))
                     .child(crate::icons::app_icon(
                         crate::icons::FOLDER,
                         14.0,
                         tokens.text.muted.to_u32(),
                     ))
-                    .child(
-                        div()
-                            .flex_1()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("All projects"),
-                    )
+                    .child(div().flex_1().font_weight(FontWeight::SEMIBOLD).child(
+                        self.project_scope().label(|id| {
+                            self.config_sidebar.projects.iter().find_map(|project| {
+                                (ProjectId::parse(&project.workspace_id).ok() == Some(id))
+                                    .then(|| project.label.as_str())
+                            })
+                        }),
+                    ))
                     .child(crate::icons::app_icon(
                         crate::icons::CHEVRON_DOWN,
                         12.0,
@@ -15680,6 +20720,7 @@ impl NativeShell {
 
         let layout = self
             .layout
+            .clone()
             .fitted(f32::from(viewport.width), f32::from(viewport.height));
         let workspace_actions = self.conversation_delete_action(cx);
         let workspace_header = self.header_bar(
@@ -15695,7 +20736,7 @@ impl NativeShell {
         );
         let conversation = self.task_conversation_surface(
             tokens,
-            Self::idle_conversation_photo_size(tokens, viewport, layout),
+            Self::idle_conversation_photo_size(tokens, viewport, layout.clone()),
             cx,
         );
 
@@ -15803,6 +20844,14 @@ impl NativeShell {
         self.task_row_label(task_id)
     }
 
+    fn dispatch_task_cockpit_query(
+        &mut self,
+        task_id: TaskId,
+        query: TaskCockpitQuery,
+    ) -> Option<NativeActionRecord> {
+        self.dispatch_action(ActionRequest::TaskCockpit { task_id, query })
+    }
+
     fn dispatch_action(&mut self, request: ActionRequest) -> Option<NativeActionRecord> {
         self.dispatch_action_checked(request)
             .err()
@@ -15817,6 +20866,15 @@ impl NativeShell {
         &mut self,
         request: ActionRequest,
     ) -> Result<(), NativeActionDispatchFailure> {
+        self.dispatch_action_recorded(request).map(|_| ())
+    }
+
+    /// Narrow record-returning dispatch used by commit request-id fencing.
+    /// Existing callers keep `dispatch_action` / `dispatch_action_checked`.
+    fn dispatch_action_recorded(
+        &mut self,
+        request: ActionRequest,
+    ) -> Result<NativeActionRecord, NativeActionDispatchFailure> {
         if self.action_lane_len() >= MAX_ACTION_LANE_RECORDS {
             // The shell-side retry queue is deliberately bounded. Refuse a
             // new intent before constructing a record when that bound is
@@ -15838,7 +20896,7 @@ impl NativeShell {
         };
         if let NativeHostCommand::Browser(command) = record.command.clone() {
             return match self.apply_browser_native_command(&command) {
-                Ok(_) => Ok(()),
+                Ok(_) => Ok(record),
                 Err(error) => Err(NativeActionDispatchFailure::after_capture(
                     record,
                     error.to_string(),
@@ -15846,7 +20904,7 @@ impl NativeShell {
             };
         }
         match self.enqueue_host_action(record.clone()) {
-            NativeHostActionResult::Queued => Ok(()),
+            NativeHostActionResult::Queued => Ok(record),
             NativeHostActionResult::Disconnected => Err(
                 NativeActionDispatchFailure::after_capture(record, "the host is disconnected"),
             ),
@@ -16137,6 +21195,9 @@ impl Render for NativeShell {
         if self.pending_composer_focus && self.composer.is_some() {
             self.composer_focus_handle.focus(window);
             self.pending_composer_focus = false;
+        }
+        if self.pending_task_search_focus && self.task_search.open() {
+            self.focus_task_search_input(window);
         }
         let composer_is_focused =
             self.composer.is_some() && self.composer_focus_handle.is_focused(window);
@@ -16737,16 +21798,17 @@ mod tests {
         update_state_from_stage, validate_connected_host_for_shell_launch,
         validate_host_projection_payloads, wait_for_cancellation,
         worker_should_run_deferred_bootstrap, workspace_context_labels, AccessibilityTree,
-        AccessibleRole, AgentPresence, AgentSessionId, ClientId, CommandId, ComposerControl,
-        ComposerDraftKey, IsolatedDevProfile, MainConversationCanvas, NativeAccessibilityAction,
-        NativeActionRecord, NativeComposerImage, NativeHeaderAttachment, NativeHostActionFailure,
-        NativeHostActionOutcome, NativeHostActionResult, NativeHostChildOwnership,
-        NativeHostClientRuntime, NativeHostLaunchMode, NativeHostLaunchSpec, NativeHostProjection,
-        NativeHostProjectionKind, NativeHostQueryBody, NativeHostRuntimeAttachment,
-        NativeHostRuntimeEpochs, NativeHostRuntimePort, NativeHostState, NativeHostWorkerCommand,
-        NativeInteraction, NativePlatformAccessibilityBridge, NativeShell, NativeShellMode,
-        NativeShutdownDeadline, OverlayTextFieldPart, OwnedChild, OwnedWorker, PaletteItem,
-        PendingHostBootstrap, ProjectId, ProjectInboxItem, ProviderKind, ReaperKind, ShellStage,
+        AccessibleRole, AgentPresence, AgentSessionId, ClientId, CockpitDockTool, CommandId,
+        ComposerControl, ComposerDraftKey, IsolatedDevProfile, MainConversationCanvas,
+        NativeAccessibilityAction, NativeActionRecord, NativeComposerImage, NativeHeaderAttachment,
+        NativeHostActionFailure, NativeHostActionOutcome, NativeHostActionResult,
+        NativeHostChildOwnership, NativeHostClientRuntime, NativeHostLaunchMode,
+        NativeHostLaunchSpec, NativeHostProjection, NativeHostProjectionKind, NativeHostQueryBody,
+        NativeHostRuntimeAttachment, NativeHostRuntimeEpochs, NativeHostRuntimePort,
+        NativeHostState, NativeHostWorkerCommand, NativeInteraction,
+        NativePlatformAccessibilityBridge, NativeShell, NativeShellMode, NativeShutdownDeadline,
+        OverlayTextFieldPart, OwnedChild, OwnedWorker, PaletteItem, PendingHostBootstrap,
+        ProjectActionMenuMode, ProjectId, ProjectInboxItem, ProviderKind, ReaperKind, ShellStage,
         TaskComposer, TaskId, UpdateState, UpdaterStage, CONVERSATION_COMPOSER_CONTEXT_INSET,
         CONVERSATION_COMPOSER_HEIGHT_RESERVE, CONVERSATION_COMPOSER_INNER_RADIUS,
         CONVERSATION_COMPOSER_INPUT_MIN_HEIGHT, CONVERSATION_COMPOSER_OUTER_RADIUS,
@@ -16781,8 +21843,313 @@ mod tests {
         assert_eq!(CONVERSATION_COMPOSER_HEIGHT_RESERVE, 230.0);
         assert_eq!(
             CONVERSATION_COMPOSER_PLACEHOLDER,
-            "Ask anything, @tag files/folders, $use skills, or / for commands"
+            crate::ui::native_composer::NATIVE_COMPOSER_PLACEHOLDER
         );
+    }
+
+    #[test]
+    fn appearance_duplicate_ids_are_safe_and_unique() {
+        use super::{safe_theme_id_from_label, unique_duplicate_theme_identity};
+        assert_eq!(safe_theme_id_from_label("Ocean Breeze!"), "ocean-breeze");
+        assert_eq!(safe_theme_id_from_label("   "), "custom-theme");
+
+        let occupied = |id: &str| matches!(id, "ocean" | "ocean-copy");
+        let (first_id, first_label) = unique_duplicate_theme_identity("ocean", "Ocean", &occupied);
+        assert_eq!(first_id, "ocean-copy-2");
+        assert!(first_label.contains("copy"));
+
+        let free = |_: &str| false;
+        let (id, label) = unique_duplicate_theme_identity("t3-code", "T3 Code", &free);
+        assert_eq!(id, "t3-code-copy");
+        assert_eq!(label, "T3 Code copy");
+    }
+
+    #[test]
+    fn appearance_guided_draft_previews_only_when_both_colors_valid() {
+        use super::guided_theme_preview_palette;
+        use crate::ui::theme_system::{ThemeAppearance, ThemeColorRole};
+
+        assert!(
+            guided_theme_preview_palette(ThemeAppearance::Light, "not-a-color", "#0055cc")
+                .is_none()
+        );
+        assert!(guided_theme_preview_palette(ThemeAppearance::Light, "#fafafa", "nope").is_none());
+        let palette = guided_theme_preview_palette(ThemeAppearance::Dark, "#111319", "#79a7ff")
+            .expect("valid guided draft");
+        assert_eq!(palette.color(ThemeColorRole::Canvas).to_hex(), "#111319");
+        assert_eq!(palette.color(ThemeColorRole::Accent).to_hex(), "#79a7ff");
+    }
+
+    #[test]
+    fn appearance_cancel_clears_editor_and_preview_contract() {
+        use super::discard_theme_editor_draft;
+        use crate::ui::theme_system::{ThemeAppearance, ThemeColor, ThemePalette};
+
+        let mut editor: Option<super::ThemeEditorState> = None;
+        // Editor presence is optional for the cancel contract; clearing must
+        // always drop the session and require preview rollback by the caller.
+        discard_theme_editor_draft(&mut editor);
+        assert!(editor.is_none());
+
+        let mut preview: Option<ThemePalette> = Some(ThemePalette::managed(
+            ThemeAppearance::Light,
+            ThemeColor::from_hex("#ffffff").expect("white"),
+            ThemeColor::from_hex("#0000ff").expect("blue"),
+        ));
+        preview = None;
+        assert!(preview.is_none());
+    }
+
+    #[test]
+    fn appearance_advanced_save_rejects_invalid_role_before_mutation() {
+        use super::advanced_theme_palette_from_role_values;
+        use crate::ui::theme_system::ThemeColorRole;
+
+        let incomplete: Vec<(ThemeColorRole, &str)> = ThemeColorRole::ALL
+            .iter()
+            .copied()
+            .filter(|role| *role != ThemeColorRole::TerminalCursor)
+            .map(|role| (role, "#112233"))
+            .collect();
+        let err = advanced_theme_palette_from_role_values(incomplete)
+            .expect_err("missing role must fail");
+        assert!(err.contains("terminalCursor") || err.contains("Missing"));
+
+        let invalid: Vec<(ThemeColorRole, &str)> = ThemeColorRole::ALL
+            .iter()
+            .copied()
+            .map(|role| {
+                if role == ThemeColorRole::Accent {
+                    (role, "bad-color")
+                } else {
+                    (role, "#112233")
+                }
+            })
+            .collect();
+        let err =
+            advanced_theme_palette_from_role_values(invalid).expect_err("invalid role must fail");
+        assert!(err.contains("accent") || err.to_ascii_lowercase().contains("invalid"));
+    }
+
+    #[test]
+    fn appearance_builtin_and_custom_card_actions_match_contract() {
+        use super::theme_card_action_availability;
+        let built_in = theme_card_action_availability(true);
+        assert!(built_in.select);
+        assert!(built_in.duplicate_edit_copy);
+        assert!(!built_in.edit);
+        assert!(!built_in.export);
+        assert!(!built_in.remove);
+
+        let custom = theme_card_action_availability(false);
+        assert!(custom.select);
+        assert!(custom.duplicate_edit_copy);
+        assert!(custom.edit);
+        assert!(custom.export);
+        assert!(custom.remove);
+    }
+
+    #[test]
+    fn appearance_two_click_removal_intent() {
+        use super::{ThemeRemovalDecision, ThemeRemovalIntent};
+        let mut intent = ThemeRemovalIntent::default();
+        assert_eq!(
+            intent.request("night-sky"),
+            ThemeRemovalDecision::ArmConfirm
+        );
+        assert!(intent.is_armed("night-sky"));
+        assert_eq!(intent.request("other"), ThemeRemovalDecision::ArmConfirm);
+        assert!(intent.is_armed("other"));
+        assert!(!intent.is_armed("night-sky"));
+        assert_eq!(
+            intent.request("other"),
+            ThemeRemovalDecision::ConfirmRemove("other".into())
+        );
+        assert!(!intent.is_armed("other"));
+    }
+
+    #[test]
+    fn appearance_switching_retains_both_dirty_halves() {
+        use super::{theme_editor_half_from_palette, ThemeEditorHalves};
+        use crate::ui::theme_system::{ThemeAppearance, ThemeColor, ThemeColorRole, ThemePalette};
+
+        let light = ThemePalette::managed(
+            ThemeAppearance::Light,
+            ThemeColor::from_hex("#fafafa").expect("light canvas"),
+            ThemeColor::from_hex("#0055cc").expect("light accent"),
+        );
+        let dark = ThemePalette::managed(
+            ThemeAppearance::Dark,
+            ThemeColor::from_hex("#111319").expect("dark canvas"),
+            ThemeColor::from_hex("#79a7ff").expect("dark accent"),
+        );
+        let mut halves = ThemeEditorHalves {
+            light: theme_editor_half_from_palette(true, &light),
+            dark: theme_editor_half_from_palette(true, &dark),
+            active: ThemeAppearance::Light,
+        };
+        halves.flush_active(
+            "#eeeeee",
+            "#112233",
+            [(ThemeColorRole::Canvas, "#eeeeee".into())],
+        );
+        halves
+            .switch_active(ThemeAppearance::Dark)
+            .expect("dark half available");
+        assert_eq!(halves.light.canvas, "#eeeeee");
+        assert_eq!(halves.light.accent, "#112233");
+        halves.flush_active(
+            "#010101",
+            "#abcdef",
+            [(ThemeColorRole::Canvas, "#010101".into())],
+        );
+        halves
+            .switch_active(ThemeAppearance::Light)
+            .expect("light half available");
+        assert_eq!(halves.dark.canvas, "#010101");
+        assert_eq!(halves.dark.accent, "#abcdef");
+        assert_eq!(halves.light.canvas, "#eeeeee");
+        assert_eq!(halves.active, ThemeAppearance::Light);
+    }
+
+    #[test]
+    fn appearance_duplicate_cancel_has_no_persistence_by_construction() {
+        use super::theme_editor_duplicate_draft_spec;
+        let occupied = |id: &str| id == "t3-code";
+        let spec = theme_editor_duplicate_draft_spec("t3-code", "T3 Code", &occupied);
+        assert!(
+            spec.editing_id.is_none(),
+            "duplicate must open as create draft"
+        );
+        assert!(!spec.persists_before_save);
+        assert_eq!(spec.seed_theme_id, "t3-code");
+        assert_eq!(spec.theme_id, "t3-code-copy");
+        assert!(spec.label.contains("copy"));
+    }
+
+    #[test]
+    fn appearance_paired_edit_emits_both_palettes_single_and_new_emit_allowed_only() {
+        use super::{
+            theme_editor_half_from_palette, theme_editor_locked_half, theme_editor_save_palettes,
+            ThemeEditorHalves, ThemeEditorMode,
+        };
+        use crate::ui::theme_system::{ThemeAppearance, ThemeColor, ThemePalette};
+
+        let light = ThemePalette::managed(
+            ThemeAppearance::Light,
+            ThemeColor::from_hex("#fafafa").expect("light canvas"),
+            ThemeColor::from_hex("#0055cc").expect("light accent"),
+        );
+        let dark = ThemePalette::managed(
+            ThemeAppearance::Dark,
+            ThemeColor::from_hex("#111319").expect("dark canvas"),
+            ThemeColor::from_hex("#79a7ff").expect("dark accent"),
+        );
+        let paired = ThemeEditorHalves {
+            light: theme_editor_half_from_palette(true, &light),
+            dark: theme_editor_half_from_palette(true, &dark),
+            active: ThemeAppearance::Light,
+        };
+        let paired_saved =
+            theme_editor_save_palettes(true, &paired, ThemeEditorMode::Guided).expect("paired");
+        assert_eq!(paired_saved.len(), 2);
+        assert!(paired_saved.contains_key(&ThemeAppearance::Light));
+        assert!(paired_saved.contains_key(&ThemeAppearance::Dark));
+
+        let single = ThemeEditorHalves {
+            light: theme_editor_half_from_palette(true, &light),
+            dark: theme_editor_locked_half(),
+            active: ThemeAppearance::Light,
+        };
+        let single_saved =
+            theme_editor_save_palettes(true, &single, ThemeEditorMode::Guided).expect("single");
+        assert_eq!(single_saved.len(), 1);
+        assert!(single_saved.contains_key(&ThemeAppearance::Light));
+        assert!(!single_saved.contains_key(&ThemeAppearance::Dark));
+
+        let mut create = paired.clone();
+        create.active = ThemeAppearance::Dark;
+        let create_saved =
+            theme_editor_save_palettes(false, &create, ThemeEditorMode::Guided).expect("create");
+        assert_eq!(create_saved.len(), 1);
+        assert!(create_saved.contains_key(&ThemeAppearance::Dark));
+        assert!(!create_saved.contains_key(&ThemeAppearance::Light));
+    }
+
+    #[test]
+    fn appearance_successful_save_close_select_and_rollback_decisions() {
+        use super::{
+            theme_editor_after_save, theme_editor_save_kind,
+            theme_editor_should_rollback_create_on_select_failure, ThemeEditorAfterSave,
+            ThemeEditorSaveKind,
+        };
+        use crate::ui::theme_system::ThemeAppearance;
+
+        let create = theme_editor_save_kind(None, ThemeAppearance::Dark);
+        assert_eq!(
+            create,
+            ThemeEditorSaveKind::Create {
+                appearance: ThemeAppearance::Dark
+            }
+        );
+        assert_eq!(
+            theme_editor_after_save(create, "night-sky"),
+            ThemeEditorAfterSave::SelectCreated {
+                theme_id: "night-sky".into(),
+                appearance: ThemeAppearance::Dark,
+            }
+        );
+        assert!(theme_editor_should_rollback_create_on_select_failure(
+            create
+        ));
+
+        let update = theme_editor_save_kind(Some("night-sky"), ThemeAppearance::Light);
+        assert_eq!(update, ThemeEditorSaveKind::Update);
+        assert_eq!(
+            theme_editor_after_save(update, "night-sky"),
+            ThemeEditorAfterSave::CloseUpdated
+        );
+        assert!(!theme_editor_should_rollback_create_on_select_failure(
+            update
+        ));
+    }
+
+    #[test]
+    fn appearance_create_activation_failure_messages_are_honest() {
+        use super::theme_editor_create_activation_failure_message;
+        let cleaned = theme_editor_create_activation_failure_message("select failed", Ok(()));
+        assert!(cleaned.contains("Could not activate"));
+        assert!(cleaned.contains("was not kept"));
+        assert!(!cleaned.to_ascii_lowercase().contains("theme saved"));
+
+        let dirty = theme_editor_create_activation_failure_message(
+            "select failed",
+            Err("disk locked".into()),
+        );
+        assert!(dirty.contains("Could not activate"));
+        assert!(dirty.contains("Cleanup also failed"));
+        assert!(dirty.contains("disk locked"));
+        assert!(!dirty.to_ascii_lowercase().contains("theme saved"));
+    }
+
+    #[test]
+    fn appearance_locked_half_cannot_become_active() {
+        use super::{theme_editor_half_from_palette, theme_editor_locked_half, ThemeEditorHalves};
+        use crate::ui::theme_system::{ThemeAppearance, ThemeColor, ThemePalette};
+
+        let light = ThemePalette::managed(
+            ThemeAppearance::Light,
+            ThemeColor::from_hex("#fafafa").expect("light canvas"),
+            ThemeColor::from_hex("#0055cc").expect("light accent"),
+        );
+        let mut halves = ThemeEditorHalves {
+            light: theme_editor_half_from_palette(true, &light),
+            dark: theme_editor_locked_half(),
+            active: ThemeAppearance::Light,
+        };
+        assert!(halves.switch_active(ThemeAppearance::Dark).is_err());
+        assert_eq!(halves.active, ThemeAppearance::Light);
+        assert!(!halves.dark.available);
     }
 
     #[test]
@@ -17836,6 +23203,7 @@ mod tests {
             ProjectInboxItem::Task {
                 project_id,
                 task_id,
+                settled: false,
             },
         ];
         let snapshot = agent_connection_snapshot(AgentPresence::SignedIn);
@@ -17861,6 +23229,12 @@ mod tests {
             node.element_id == format!("native-project-codex-{project_id}")
                 && node.label == "Start Codex task in DevManager"
         }));
+        assert!(nodes
+            .iter()
+            .any(|node| node.element_id == "native-task-settle"));
+        assert!(!nodes
+            .iter()
+            .any(|node| node.element_id == "native-task-restore"));
 
         let (node_id, mapped_task_id) = tree.task_node_ids_for_test()[0];
         assert_eq!(mapped_task_id, task_id);
@@ -17876,6 +23250,29 @@ mod tests {
             Some(format!("native-task-row-{task_id}").as_str()),
             "project controls inserted ahead of tasks must not corrupt platform task routing"
         );
+
+        let settled_items = vec![
+            ProjectInboxItem::DoneHeader { task_count: 1 },
+            ProjectInboxItem::Task {
+                project_id,
+                task_id,
+                settled: true,
+            },
+        ];
+        let settled_tree = AccessibilityTree::for_task_list_with_projects(
+            &task_list,
+            Some(task_id),
+            &NativeHeaderAttachment::default(),
+            Some(&snapshot),
+            &settled_items,
+        );
+        let settled_nodes = settled_tree.gpui_nodes();
+        assert!(settled_nodes
+            .iter()
+            .any(|node| node.element_id == "native-task-restore"));
+        assert!(!settled_nodes
+            .iter()
+            .any(|node| node.element_id == "native-task-settle"));
     }
 
     #[test]
@@ -17894,8 +23291,8 @@ mod tests {
         );
         let mapped = tree.task_node_ids_for_test();
         assert_eq!(mapped.len(), 2);
-        assert_eq!(mapped[0], (accesskit::NodeId::from(7), first));
-        assert_eq!(mapped[1], (accesskit::NodeId::from(8), second));
+        assert_eq!(mapped[0], (accesskit::NodeId::from(10), first));
+        assert_eq!(mapped[1], (accesskit::NodeId::from(11), second));
         let update = tree.platform_update_for_test();
         for &(node_id, task_id) in mapped {
             let node = update
@@ -17954,6 +23351,37 @@ mod tests {
             .expect("send button");
         assert_eq!(send.role, AccessibleRole::Button);
         assert!(send.focusable && send.tab_stop);
+
+        let add_action = nodes
+            .iter()
+            .find(|node| node.element_id == "native-shell-tools-affordance")
+            .expect("Add action button");
+        assert_eq!(add_action.role, AccessibleRole::Button);
+        assert!(add_action.focusable && add_action.tab_stop);
+
+        for (element_id, label) in [
+            ("native-dock-tab-changes", "Changes"),
+            ("native-dock-tab-files", "Files"),
+            ("native-dock-tab-browser", "Browser"),
+            ("native-dock-tab-services", "Services"),
+            ("native-dock-tab-artifacts", "Artifacts"),
+            ("native-dock-tab-review", "Review"),
+        ] {
+            let tab = nodes
+                .iter()
+                .find(|node| node.element_id == element_id)
+                .unwrap_or_else(|| panic!("missing accessible {label} dock tab"));
+            assert_eq!(tab.role, AccessibleRole::Button);
+            assert_eq!(tab.label, label);
+            assert!(tab.focusable && tab.tab_stop);
+
+            let platform_tab = platform_update
+                .nodes
+                .iter()
+                .find_map(|(_, node)| (node.author_id() == Some(element_id)).then_some(node))
+                .unwrap_or_else(|| panic!("missing platform {label} dock tab"));
+            assert!(platform_tab.supports_action(accesskit::Action::Click));
+        }
     }
 
     #[test]
@@ -20150,6 +25578,7 @@ mod tests {
                         ProjectInboxItem::Task {
                             project_id,
                             task_id,
+                            settled: false,
                         },
                     ]
                 );
@@ -20871,7 +26300,9 @@ mod tests {
 
         let (runtime, _shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
         let (model, task_id) = terminal_bound_client_model();
+        let project_id = model.task(task_id).expect("task").task.project_id;
         with_test_shell_in_app(cx, runtime, |shell| {
+            shell.install_project_for_test("DevManager", project_id);
             shell
                 .apply_client_model(Arc::new(model))
                 .expect("apply model");
@@ -20901,8 +26332,41 @@ mod tests {
                 !shell.layout.dock_collapsed,
                 "the compact right-panel control must expand the context dock"
             );
+            for (element_id, expected_tool) in [
+                ("native-dock-tab-changes", CockpitDockTool::Changes),
+                ("native-dock-tab-files", CockpitDockTool::Files),
+                ("native-dock-tab-browser", CockpitDockTool::Browser),
+                ("native-dock-tab-services", CockpitDockTool::Services),
+                ("native-dock-tab-artifacts", CockpitDockTool::Artifacts),
+                ("native-dock-tab-review", CockpitDockTool::Review),
+            ] {
+                shell.dispatch_named_accessibility_action(element_id);
+                assert_eq!(
+                    shell.cockpit().active_tool(),
+                    expected_tool,
+                    "accessible dock tab {element_id} must use the production dock-selection path"
+                );
+            }
             shell.dispatch_keyboard_for_test(KeyboardShortcut::alt(ShortcutKey::Digit(4)));
             assert_eq!(shell.cockpit().active_tool(), CockpitDockTool::Browser);
+
+            assert!(matches!(
+                shell.project_actions.mode,
+                ProjectActionMenuMode::Closed
+            ));
+            shell.dispatch_named_accessibility_action("native-shell-tools-affordance");
+            assert!(
+                !matches!(shell.project_actions.mode, ProjectActionMenuMode::Closed),
+                "accessible Add action must open the project-action workflow"
+            );
+            shell.project_actions.close();
+
+            assert!(!shell.pending_composer_image_prompt);
+            shell.dispatch_named_accessibility_action("native-task-composer-attach");
+            assert!(
+                shell.pending_composer_image_prompt,
+                "accessible Attach must queue the production image picker"
+            );
 
             shell.dispatch_named_accessibility_action("native-task-center-terminal");
             assert_eq!(
@@ -21360,7 +26824,7 @@ mod tests {
                 &[
                     crate::domain::TaskCockpitQuery::Conversation { after_sequence: 0 },
                     crate::domain::TaskCockpitQuery::WorkspaceStatus,
-                    crate::domain::TaskCockpitQuery::GitStatus,
+                    crate::domain::TaskCockpitQuery::GitRepositories,
                 ],
             );
 
@@ -21420,6 +26884,15 @@ mod tests {
                     task_id,
                 })
                 .is_some();
+            let settle_failed = shell
+                .dispatch_action_for_test(crate::ui::components::ActionRequest::TaskSettle {
+                    task_id,
+                })
+                .is_some();
+            assert!(
+                !settle_failed,
+                "task.settle must enqueue without a capture failure"
+            );
             let accepted = shared.lock().expect("runtime").accepted.clone();
             (
                 shell
@@ -21457,6 +26930,11 @@ mod tests {
             report.3
         );
         assert!(
+            report.3.iter().any(|id| id == "native-task-settle"),
+            "an active selected task must expose Done: {:?}",
+            report.3
+        );
+        assert!(
             !report.4,
             "task.archive must enqueue without a capture failure"
         );
@@ -21469,6 +26947,19 @@ mod tests {
                     )
                 }),
             "Delete must dispatch TaskArchive for the selected task"
+        );
+        assert!(
+            report.6.iter().any(|record| {
+                matches!(
+                    record.command,
+                    super::NativeHostCommand::TaskLifecycle {
+                        task_id: id,
+                        command: crate::domain::command::Command::SettleTask,
+                        ..
+                    } if id == task_id
+                )
+            }),
+            "Done must dispatch the reversible SettleTask command"
         );
     }
 
@@ -21697,6 +27188,136 @@ mod tests {
             cx.quit();
         });
         assert!(completed.get(), "hidden composer scenario completed");
+    }
+
+    #[test]
+    fn saved_review_dock_is_restored_after_the_first_canonical_model() {
+        const TEST_NAME: &str =
+            "ui::native_shell::tests::saved_review_dock_is_restored_after_the_first_canonical_model";
+        if rerun_headless_shell_test_in_child(TEST_NAME) {
+            return;
+        }
+
+        gpui::Application::headless().run(|cx| {
+            crate::ui::init(cx);
+            let (runtime, _) = TestRuntime::new(true, NativeHostActionResult::Queued);
+            let (model, task_id) = terminal_bound_client_model();
+            with_test_shell_in_app(cx, runtime, |shell| {
+                shell.layout.selected_task = Some(task_id);
+                shell.layout.active_dock_tab = Some("Review".to_string());
+                shell.interaction.sync_selected_task(Some(task_id));
+
+                shell
+                    .apply_client_model(Arc::new(model))
+                    .expect("apply canonical model");
+
+                assert_eq!(shell.cockpit.active_tool(), CockpitDockTool::Review);
+            });
+            cx.quit();
+        });
+    }
+
+    #[test]
+    fn task_search_takes_focus_from_composer_and_accepts_text() {
+        const TEST_NAME: &str =
+            "ui::native_shell::tests::task_search_takes_focus_from_composer_and_accepts_text";
+        if rerun_headless_shell_test_in_child(TEST_NAME) {
+            return;
+        }
+
+        let completed = std::rc::Rc::new(std::cell::Cell::new(false));
+        let completed_for_app = std::rc::Rc::clone(&completed);
+        gpui::Application::new().run(move |cx| {
+            crate::ui::init(cx);
+            let workspace = tempfile::tempdir().expect("workspace tempdir");
+            let profile = isolated_dev_profile(workspace.path()).expect("isolated profile");
+            let (runtime, _) = TestRuntime::new(true, NativeHostActionResult::Queued);
+            let (model, task_id) = terminal_bound_client_model_with_kind_provider_at_epoch(
+                crate::domain::task::TaskAttention::None,
+                crate::providers::ProviderKind::Codex,
+                None,
+                3,
+            );
+            let window = cx
+                .open_window(
+                    WindowOptions {
+                        show: false,
+                        ..WindowOptions::default()
+                    },
+                    move |window, cx| {
+                        let entity = cx.new(|cx| {
+                            NativeShell::new_with_host_runtime_port(
+                                profile,
+                                Box::new(runtime),
+                                crate::ui::tokens::RuntimePreferencesSnapshot::default(),
+                                cx,
+                            )
+                        });
+                        entity.update(cx, |shell, _cx| {
+                            shell
+                                .apply_client_model(Arc::new(model))
+                                .expect("apply model");
+                            let list =
+                                crate::ui::task_cockpit::TaskList::from_client_model_virtual(
+                                    shell.client_model_snapshot().as_ref().expect("model"),
+                                )
+                                .expect("task list");
+                            let _ = shell.interaction.navigation_mouse_down(task_id, &list);
+                            shell.sync_cockpit_follow();
+                            shell.composer_focus_handle.focus(window);
+                        });
+                        entity
+                    },
+                )
+                .expect("open hidden task-search window");
+            let entity = window.entity(cx).expect("task-search root entity");
+            let any_window = window.into();
+
+            entity.update(cx, |shell, cx| {
+                shell.dispatch_keyboard_for_test(crate::ui::actions::KeyboardShortcut::ctrl(
+                    crate::ui::actions::ShortcutKey::Character('p'),
+                ));
+                cx.notify();
+            });
+            cx.refresh_windows();
+
+            cx.update_window(any_window, |_root, window, cx| {
+                entity.update(cx, |shell, _cx| shell.focus_task_search_input(window));
+                assert!(
+                    entity.read(cx).task_search.open(),
+                    "the task-search action must open the picker"
+                );
+                assert!(
+                    entity.read(cx).focus_handle.is_focused(window),
+                    "opening search must transfer focus away from the composer"
+                );
+                assert!(
+                    window.dispatch_keystroke(Keystroke::parse("d").expect("search key"), cx),
+                    "printable input must reach the open task search"
+                );
+            })
+            .expect("dispatch task-search keys");
+
+            let shell = entity.read(cx);
+            assert!(shell.task_search.open());
+            assert_eq!(shell.task_search.query(), "d");
+            let platform_input = shell
+                .platform_accessibility_tree_for_test()
+                .nodes
+                .into_iter()
+                .find_map(|(_, node)| {
+                    (node.author_id() == Some("native-task-search-input")).then_some(node)
+                })
+                .expect("task search must expose a platform text field");
+            assert_eq!(platform_input.role(), accesskit::Role::TextInput);
+            assert_eq!(platform_input.value(), Some("d"));
+            assert!(platform_input.supports_action(accesskit::Action::Focus));
+            assert!(platform_input.supports_action(accesskit::Action::SetValue));
+
+            completed_for_app.set(true);
+            cx.quit();
+        });
+        assert!(completed.get(), "hidden task-search scenario completed");
     }
 
     #[test]

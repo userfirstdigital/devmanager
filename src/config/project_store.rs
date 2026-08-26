@@ -104,13 +104,35 @@ pub struct ConfigAuthority {
 /// pairs when constructing its own `WorkspaceProjectRoots` authority.  Legacy
 /// string ids are mapped to random host-issued `ProjectId`s and remain tied to
 /// this config revision/fingerprint plus the host action/runtime generations.
+/// Active configured folders (non-archived) are retained alongside roots so a
+/// Task may target sibling or external repositories without client path
+/// authority.
 #[allow(dead_code)]
 pub(crate) struct ConfigWorkspaceIssuer {
     projects: Vec<(ProjectId, PathBuf, String)>,
+    folders: Vec<ConfigWorkspaceFolderTarget>,
     config_revision: ConfigRevision,
     snapshot_fingerprint: Option<FileFingerprint>,
     action_epoch: u64,
     runtime_generation: u64,
+}
+
+/// One active configured folder retained by [`ConfigWorkspaceIssuer`].
+/// Paths stay host-private; the opaque folder config id is the only selector
+/// identity a client may later present.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct ConfigWorkspaceFolderTarget {
+    pub(crate) project_id: ProjectId,
+    pub(crate) project_config_id: String,
+    pub(crate) folder_config_id: String,
+    pub(crate) label: String,
+    pub(crate) path: PathBuf,
+}
+
+impl fmt::Debug for ConfigWorkspaceFolderTarget {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ConfigWorkspaceFolderTarget(REDACTED)")
+    }
 }
 
 impl fmt::Debug for ConfigWorkspaceIssuer {
@@ -136,6 +158,27 @@ impl ConfigWorkspaceIssuer {
         self.projects
             .iter()
             .map(|(project_id, _, configured_id)| (configured_id.clone(), *project_id))
+            .collect()
+    }
+
+    /// Active (non-archived) configured folders retained with this issuer.
+    /// Folder config ids are unique within a Project; cross-project duplicates
+    /// are retained and later selected by Task ProjectId. Callers must not
+    /// invent or reorder these targets.
+    pub(crate) fn workspace_project_folders(
+        &self,
+    ) -> Vec<(ProjectId, String, String, String, PathBuf)> {
+        self.folders
+            .iter()
+            .map(|folder| {
+                (
+                    folder.project_id,
+                    folder.project_config_id.clone(),
+                    folder.folder_config_id.clone(),
+                    folder.label.clone(),
+                    folder.path.clone(),
+                )
+            })
             .collect()
     }
 
@@ -483,12 +526,23 @@ impl ConfigStore {
         }
 
         let mut projects = Vec::with_capacity(configured_projects.len());
-        for (config_id, root) in configured_projects {
+        let mut folders = Vec::new();
+        // Folder config ids are unique within a Project only (matches
+        // validate_project). Cross-project duplicates such as A/api and B/api
+        // are valid; Task scope later selects by ProjectId.
+        let mut folder_ids = BTreeSet::<(ProjectId, String)>::new();
+        for project in self
+            .snapshot
+            .config
+            .projects
+            .iter()
+            .filter(|project| !project.archived.as_ref().copied().unwrap_or(false))
+        {
             let project_id = self
                 .snapshot
                 .config
                 .workspace_project_ids()
-                .get(&config_id)
+                .get(&project.id)
                 .and_then(|opaque_id| ProjectId::parse(opaque_id).ok())
                 .ok_or_else(|| {
                     ConfigError::new(
@@ -496,11 +550,50 @@ impl ConfigStore {
                         "workspace identity mapping is invalid",
                     )
                 })?;
-            projects.push((project_id, PathBuf::from(root), config_id));
+            if let Some((_, root)) = configured_projects
+                .iter()
+                .find(|(config_id, _)| config_id == &project.id)
+            {
+                projects.push((project_id, PathBuf::from(root), project.id.clone()));
+            }
+            for folder in project
+                .folders
+                .iter()
+                .filter(|folder| !folder.archived.as_ref().copied().unwrap_or(false))
+            {
+                let folder_config_id = folder.id.trim();
+                if folder_config_id.is_empty()
+                    || crate::domain::cockpit::validate_folder_config_id(folder_config_id).is_err()
+                {
+                    return Err(ConfigError::new(
+                        ConfigErrorKind::Validation,
+                        "configured folder selector identity is invalid",
+                    ));
+                }
+                if !folder_ids.insert((project_id, folder_config_id.to_string())) {
+                    return Err(ConfigError::new(
+                        ConfigErrorKind::Validation,
+                        "configured folder selector identity is ambiguous",
+                    ));
+                }
+                let label = if folder.name.trim().is_empty() {
+                    folder.id.clone()
+                } else {
+                    folder.name.clone()
+                };
+                folders.push(ConfigWorkspaceFolderTarget {
+                    project_id,
+                    project_config_id: project.id.clone(),
+                    folder_config_id: folder_config_id.to_string(),
+                    label,
+                    path: PathBuf::from(folder.folder_path.trim()),
+                });
+            }
         }
 
         Ok(ConfigWorkspaceIssuer {
             projects,
+            folders,
             config_revision: self.snapshot.revision,
             snapshot_fingerprint: self.snapshot.fingerprint.clone(),
             action_epoch,

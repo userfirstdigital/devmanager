@@ -27,6 +27,8 @@ pub enum PanelDisabledReason {
     Directory,
     NotReviewable,
     Unsupported,
+    RepositoryUnavailable,
+    RepositoryReadOnly,
 }
 
 impl PanelDisabledReason {
@@ -39,6 +41,8 @@ impl PanelDisabledReason {
             Self::Directory => "Directories are opened from the file list",
             Self::NotReviewable => "This task is not ready for review",
             Self::Unsupported => "This action is not available yet",
+            Self::RepositoryUnavailable => "Repository is unavailable",
+            Self::RepositoryReadOnly => "Repository is read-only",
         }
     }
 }

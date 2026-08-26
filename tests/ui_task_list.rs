@@ -11,7 +11,8 @@ use devmanager::ui::shell::{
     ReleaseRejection, Shell, TerminalRelease,
 };
 use devmanager::ui::task_cockpit::{
-    Inbox, InboxFilter, InboxPresentationWidth, InboxRenderItem, VirtualWindow, MAX_TASK_LIST_ITEMS,
+    Inbox, InboxFilter, InboxPresentationWidth, InboxRenderItem, TaskList, VirtualWindow,
+    MAX_TASK_LIST_ITEMS,
 };
 use serde::Deserialize;
 use std::fs;
@@ -279,6 +280,28 @@ fn inbox_excludes_archived_tasks_and_rejects_their_navigation() {
     );
     assert_eq!(shell.selected_task(), Some(open));
     assert_eq!(shell.navigation_epoch(), epoch);
+}
+
+#[test]
+fn native_task_list_groups_settled_tasks_after_active_and_excludes_archive() {
+    let active = task_id_from_index(21);
+    let settled = task_id_from_index(22);
+    let archived = task_id_from_index(23);
+    let model = model_from_task_items(vec![
+        task_item_with_lifecycle(active, 0, TaskLifecycle::Open),
+        task_item_with_lifecycle(settled, 1, TaskLifecycle::Settled),
+        task_item_with_lifecycle(archived, 2, TaskLifecycle::Archived),
+    ]);
+
+    let list =
+        TaskList::from_client_model_with_settled_virtual(&model).expect("bounded native task list");
+    assert_eq!(list.task_ids(), &[active, settled]);
+    assert_eq!(model.task_projection_index().active_count(), 1);
+    assert_eq!(model.task_projection_index().archived_count(), 1);
+    assert_eq!(
+        Inbox::from_model(&model).task_ids().collect::<Vec<_>>(),
+        vec![active]
+    );
 }
 
 #[test]

@@ -170,13 +170,13 @@ fn contract_provider_e2e_script_default_never_launches_stock_providers() {
     ))
     .expect("provider e2e script");
     assert!(script.contains("Set-StrictMode"));
-    assert!(script.contains("-Fixture"));
-    assert!(script.contains("-IncludeProjectionFixture"));
-    assert!(script.contains("-IncludeRecovery"));
-    assert!(script.contains("-Authenticated"));
-    assert!(script.contains("-Provider"));
+    assert!(script.contains("[switch]$Fixture"));
+    assert!(script.contains("[switch]$IncludeProjectionFixture"));
+    assert!(script.contains("[switch]$IncludeRecovery"));
+    assert!(script.contains("[switch]$Authenticated"));
+    assert!(script.contains("[string[]]$Provider"));
     assert!(script.contains("DEVMANAGER_ALLOW_AUTHENTICATED_BROWSER_E2E"));
-    assert!(script.contains("-ConfigBase"));
+    assert!(script.contains("[string]$ConfigBase"));
     assert!(script.contains("claude"));
     assert!(script.contains("codex"));
     assert!(script.contains("cursor"));
@@ -247,8 +247,32 @@ fn http_get(url_path: &str, port: u16) -> (u16, String) {
         "GET {url_path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
     )
     .expect("write request");
-    let mut response = String::new();
-    stream.read_to_string(&mut response).expect("read response");
+    let mut response = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let complete_len = loop {
+        let read = stream.read(&mut chunk).expect("read response");
+        assert!(read > 0, "fixture server closed before a complete response");
+        response.extend_from_slice(&chunk[..read]);
+        assert!(response.len() <= 1_048_576, "fixture response is unbounded");
+        let Some(header_end) = response.windows(4).position(|window| window == b"\r\n\r\n") else {
+            continue;
+        };
+        let headers = std::str::from_utf8(&response[..header_end]).expect("response headers");
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().expect("content length"))
+            })
+            .expect("fixture response content length");
+        let complete_len = header_end + 4 + content_length;
+        if response.len() >= complete_len {
+            break complete_len;
+        }
+    };
+    response.truncate(complete_len);
+    let response = String::from_utf8(response).expect("utf-8 fixture response");
     let status = response
         .split_whitespace()
         .nth(1)

@@ -5,6 +5,7 @@
 //! the profile they belong to, so a dev profile cannot inherit or overwrite the
 //! installed profile's layout.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -14,7 +15,8 @@ use serde::{Deserialize, Serialize};
 use crate::domain::TaskId;
 
 const LAYOUT_SCHEMA_V1: &str = "devmanager.workspace-layout/v1";
-const LAYOUT_SCHEMA: &str = "devmanager.workspace-layout/v2";
+const LAYOUT_SCHEMA_V2: &str = "devmanager.workspace-layout/v2";
+const LAYOUT_SCHEMA: &str = "devmanager.workspace-layout/v3";
 const LAYOUT_FILE_NAME: &str = "workspace-layout.json";
 
 pub const SIDEBAR_MIN: f32 = 180.0;
@@ -64,7 +66,7 @@ impl WindowFrame {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WorkspaceLayout {
     pub sidebar_width: f32,
     pub inbox_width: f32,
@@ -83,6 +85,15 @@ pub struct WorkspaceLayout {
     /// can become active.
     #[serde(default)]
     pub selected_task: Option<TaskId>,
+    /// Active right-dock tab label (`Changes`, `Files`, …). Validated on restore.
+    #[serde(default)]
+    pub active_dock_tab: Option<String>,
+    /// Optional workspace project id for the sidebar scope menu. `None` = All.
+    #[serde(default)]
+    pub project_scope_workspace_id: Option<String>,
+    /// Per-task center canvas preference: true = provider terminal, false = conversation.
+    #[serde(default)]
+    pub task_center_terminal: BTreeMap<String, bool>,
 }
 
 impl Default for WorkspaceLayout {
@@ -100,6 +111,9 @@ impl Default for WorkspaceLayout {
             terminal_collapsed: false,
             window: None,
             selected_task: None,
+            active_dock_tab: None,
+            project_scope_workspace_id: None,
+            task_center_terminal: BTreeMap::new(),
         }
     }
 }
@@ -266,6 +280,7 @@ impl WorkspaceLayoutStore {
         };
         match file.schema.as_str() {
             LAYOUT_SCHEMA => file.layout.sanitized(),
+            LAYOUT_SCHEMA_V2 => file.layout.sanitized(),
             LAYOUT_SCHEMA_V1 => {
                 let mut layout = file.layout.sanitized();
                 layout.dock_collapsed = true;
@@ -353,7 +368,7 @@ mod tests {
         layout.set_value(PaneEdge::Terminal, 333.0);
         layout.sidebar_collapsed = true;
         layout.selected_task = Some(TaskId::new());
-        store.save(layout).expect("save layout");
+        store.save(layout.clone()).expect("save layout");
 
         assert_eq!(store.load(), layout);
     }
@@ -369,7 +384,7 @@ mod tests {
         let mut second = WorkspaceLayout::default();
         second.set_value(PaneEdge::Dock, 517.0);
         second.sidebar_collapsed = true;
-        store.save(second).expect("replace existing layout");
+        store.save(second.clone()).expect("replace existing layout");
 
         assert_eq!(store.load(), second);
     }
@@ -399,7 +414,7 @@ mod tests {
             height: 90.0,
             maximized: false,
         });
-        assert_eq!(layout.sanitized().restorable_window(), None);
+        assert_eq!(layout.clone().sanitized().restorable_window(), None);
 
         layout.window = Some(WindowFrame {
             x: 40.0,
@@ -408,7 +423,7 @@ mod tests {
             height: 900.0,
             maximized: false,
         });
-        assert_eq!(layout.sanitized().restorable_window(), None);
+        assert_eq!(layout.clone().sanitized().restorable_window(), None);
 
         let usable = WindowFrame {
             x: 120.0,
@@ -444,8 +459,9 @@ mod tests {
             terminal_collapsed: false,
             window: None,
             selected_task: None,
+            ..WorkspaceLayout::default()
         };
-        let fitted = layout.fitted(1000.0, 900.0);
+        let fitted = layout.clone().fitted(1000.0, 900.0);
         let rails = fitted.sidebar_width + fitted.inbox_width + fitted.dock_width;
         assert!(rails <= 1000.0 - CENTER_MIN + f32::EPSILON, "rails {rails}");
         assert!(fitted.dock_width >= DOCK_MIN);
@@ -463,7 +479,7 @@ mod tests {
             terminal_collapsed: true,
             ..WorkspaceLayout::default()
         };
-        let fitted = layout.fitted(1600.0, 1000.0);
+        let fitted = layout.clone().fitted(1600.0, 1000.0);
         assert_eq!(fitted.sidebar_width, 0.0);
         assert_eq!(fitted.dock_width, 0.0);
         assert_eq!(fitted.terminal_height, 0.0);
@@ -524,13 +540,40 @@ mod tests {
         assert_eq!(migrated.window, Some(window));
         assert_eq!(migrated.selected_task, Some(selected));
 
-        store.save(migrated).expect("persist migrated layout");
+        store
+            .save(migrated.clone())
+            .expect("persist migrated layout");
         let bytes = fs::read(store.path()).expect("read saved layout");
         let saved: serde_json::Value = serde_json::from_slice(&bytes).expect("parse saved");
         assert_eq!(
-            saved["schema"], "devmanager.workspace-layout/v2",
-            "save must write the conversation-first schema"
+            saved["schema"], "devmanager.workspace-layout/v3",
+            "save must write the current workspace-layout schema"
         );
         assert_eq!(store.load(), migrated);
+    }
+
+    #[test]
+    fn v3_persists_dock_tab_project_scope_and_center_surface() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let store = WorkspaceLayoutStore::at_profile_root(directory.path());
+        let layout = WorkspaceLayout {
+            active_dock_tab: Some("Browser".into()),
+            project_scope_workspace_id: Some("project-1".into()),
+            task_center_terminal: {
+                let mut map = BTreeMap::new();
+                map.insert("task-a".into(), true);
+                map
+            },
+            ..WorkspaceLayout::default()
+        };
+        store.save(layout).expect("save v3");
+        let loaded = store.load();
+        assert_eq!(loaded.active_dock_tab.as_deref(), Some("Browser"));
+        assert_eq!(
+            loaded.project_scope_workspace_id.as_deref(),
+            Some("project-1")
+        );
+        assert_eq!(loaded.task_center_terminal.get("task-a"), Some(&true));
+        assert!(loaded.dock_collapsed);
     }
 }

@@ -5,15 +5,15 @@
 //! fixtures.
 
 use crate::client::action::{
-    cockpit_surface_descriptors, CockpitSurfaceDescriptor, CockpitSurfaceKind, ACTION_FILES_LIST,
-    ACTION_FILES_READ, ACTION_GIT_STATUS, ACTION_SERVICE_HEALTH, ACTION_SERVICE_LOGS,
-    ACTION_SSH_STATUS, ACTION_WORKSPACE_STATUS,
+    cockpit_surface_descriptors, CockpitSurfaceDescriptor, CockpitSurfaceKind,
+    ACTION_BROWSER_NATIVE, ACTION_FILES_LIST, ACTION_FILES_READ, ACTION_GIT_STATUS,
+    ACTION_SERVICE_HEALTH, ACTION_SERVICE_LOGS, ACTION_SSH_STATUS, ACTION_WORKSPACE_STATUS,
 };
 use crate::domain::cockpit::{
     TaskCockpitDeniedReason, TaskCockpitResult, TaskCockpitSurface, TaskCockpitUnavailableReason,
     TaskFileEntry, TaskFilesListProjection, TaskFilesReadProjection, TaskGitProjection,
-    TaskServiceHealth, TaskServiceLogs, TaskServiceProjection, TaskServiceRuntimeState,
-    TaskSshProjection, TaskWorkspaceProjection,
+    TaskGitRepositoriesProjection, TaskServiceHealth, TaskServiceLogs, TaskServiceProjection,
+    TaskServiceRuntimeState, TaskSshProjection, TaskWorkspaceProjection,
 };
 use crate::domain::id::TaskId;
 
@@ -57,6 +57,7 @@ pub struct TaskCockpitLiveProjection {
     pub task_id: TaskId,
     pub load: CockpitSurfaceLoad,
     pub workspace: Option<TaskWorkspaceProjection>,
+    pub repositories: Option<TaskGitRepositoriesProjection>,
     pub git: Option<TaskGitProjection>,
     pub files: Option<TaskFilesListProjection>,
     pub file_read: Option<TaskFilesReadProjection>,
@@ -72,6 +73,7 @@ impl TaskCockpitLiveProjection {
             task_id,
             load: CockpitSurfaceLoad::Empty,
             workspace: None,
+            repositories: None,
             git: None,
             files: None,
             file_read: None,
@@ -92,8 +94,14 @@ impl TaskCockpitLiveProjection {
                 self.workspace = Some(value.clone());
                 self.load = load_for_ready_or_empty(false);
             }
+            TaskCockpitResult::GitRepositories(value) if value.task_id == self.task_id => {
+                self.repositories = Some(value.clone());
+                self.reconcile_git_with_catalog();
+                self.load = load_for_ready_or_empty(value.repositories.is_empty());
+            }
             TaskCockpitResult::Git(value) if value.task_id == self.task_id => {
                 self.git = Some(value.clone());
+                self.reconcile_git_with_catalog();
                 self.load =
                     load_for_ready_or_empty(value.change_count == 0 && value.branch.is_none());
             }
@@ -123,18 +131,53 @@ impl TaskCockpitLiveProjection {
             }
             TaskCockpitResult::Config(_)
             | TaskCockpitResult::AgentConnection(_)
-            | TaskCockpitResult::Conversation(_) => {}
+            | TaskCockpitResult::BrowserProcessSession(_)
+            | TaskCockpitResult::Conversation(_)
+            | TaskCockpitResult::ConfigCommandDetail(_) => {}
             TaskCockpitResult::Denied { reason, .. } => {
                 self.load = CockpitSurfaceLoad::Denied { reason: *reason };
             }
             TaskCockpitResult::Unavailable { reason, .. } => {
                 self.load = CockpitSurfaceLoad::Unavailable { reason: *reason };
             }
+            TaskCockpitResult::GitRepositories(_) => {
+                self.repositories = None;
+                self.git = None;
+                self.load = CockpitSurfaceLoad::Error {
+                    message: "task cockpit result does not match the selected task".into(),
+                };
+            }
+            TaskCockpitResult::Git(_) => {
+                self.git = None;
+                self.load = CockpitSurfaceLoad::Error {
+                    message: "task cockpit result does not match the selected task".into(),
+                };
+            }
             _ => {
                 self.load = CockpitSurfaceLoad::Error {
                     message: "task cockpit result does not match the selected task".into(),
                 };
             }
+        }
+    }
+
+    /// Drop retained git status when its selector is absent from the Task catalog.
+    fn reconcile_git_with_catalog(&mut self) {
+        let Some(catalog) = self.repositories.as_ref() else {
+            return;
+        };
+        let Some(git) = self.git.as_ref() else {
+            return;
+        };
+        let Some(selector) = git.selector.as_ref() else {
+            return;
+        };
+        if !catalog
+            .repositories
+            .iter()
+            .any(|entry| &entry.selector == selector)
+        {
+            self.git = None;
         }
     }
 
@@ -185,6 +228,7 @@ pub fn surface_query_action_id(surface: TaskCockpitSurface) -> Option<&'static s
         TaskCockpitSurface::Files => Some(ACTION_FILES_LIST),
         TaskCockpitSurface::Ssh => Some(ACTION_SSH_STATUS),
         TaskCockpitSurface::Services => Some(ACTION_SERVICE_LOGS),
+        TaskCockpitSurface::Browser => Some(ACTION_BROWSER_NATIVE),
     }
 }
 
@@ -213,8 +257,9 @@ pub fn summary_line(projection: &TaskCockpitLiveProjection, kind: CockpitSurface
             .git
             .as_ref()
             .map(|git| {
+                let repository = git.label.as_deref().unwrap_or("Repository");
                 format!(
-                    "Git · {} · {} change(s) · +{}/-{}",
+                    "Git · {repository} · {} · {} change(s) · +{}/-{}",
                     git.branch.as_deref().unwrap_or("detached"),
                     git.change_count,
                     git.ahead,
@@ -254,11 +299,27 @@ pub fn summary_line(projection: &TaskCockpitLiveProjection, kind: CockpitSurface
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::cockpit::{TaskServiceScope, TaskServiceSnapshot, TaskWorkspaceKind};
+    use crate::domain::cockpit::{
+        TaskRepositoryCatalogEntry, TaskRepositoryKind, TaskRepositorySelector, TaskServiceScope,
+        TaskServiceSnapshot, TaskWorkspaceKind,
+    };
     use crate::domain::id::ConfiguredServiceId;
 
     fn task_id() -> TaskId {
         TaskId::new()
+    }
+
+    fn git_projection(task_id: TaskId) -> TaskGitProjection {
+        TaskGitProjection {
+            task_id,
+            selector: Some(TaskRepositorySelector::Workspace),
+            label: Some("Workspace".into()),
+            branch: Some("codex/final-e2e-ui".into()),
+            ahead: 1,
+            behind: 0,
+            change_count: 2,
+            detached: false,
+        }
     }
 
     #[test]
@@ -268,18 +329,11 @@ mod tests {
         projection.begin_query(ACTION_GIT_STATUS);
         assert!(projection.load.is_loading());
 
-        projection.apply_result(&TaskCockpitResult::Git(TaskGitProjection {
-            task_id,
-            branch: Some("codex/final-e2e-ui".into()),
-            ahead: 1,
-            behind: 0,
-            change_count: 2,
-            detached: false,
-        }));
+        projection.apply_result(&TaskCockpitResult::Git(git_projection(task_id)));
         assert_eq!(projection.load, CockpitSurfaceLoad::Ready);
         assert_eq!(
             summary_line(&projection, CockpitSurfaceKind::Git),
-            "Git · codex/final-e2e-ui · 2 change(s) · +1/-0"
+            "Git · Workspace · codex/final-e2e-ui · 2 change(s) · +1/-0"
         );
 
         projection.apply_result(&TaskCockpitResult::FilesList(TaskFilesListProjection {
@@ -317,6 +371,96 @@ mod tests {
             .any(|id| id == ACTION_GIT_STATUS
                 || id == ACTION_FILES_LIST
                 || id == ACTION_SSH_STATUS));
+    }
+
+    #[test]
+    fn git_repositories_are_retained_and_clear_stale_status_when_selector_leaves_catalog() {
+        let task_id = task_id();
+        let mut projection = TaskCockpitLiveProjection::empty(task_id);
+        projection.apply_result(&TaskCockpitResult::Git(TaskGitProjection {
+            task_id,
+            selector: Some(TaskRepositorySelector::Folder {
+                folder_config_id: "sibling-a".into(),
+            }),
+            label: Some("Sibling A".into()),
+            branch: Some("feature".into()),
+            ahead: 0,
+            behind: 0,
+            change_count: 1,
+            detached: false,
+        }));
+        assert!(projection.git.is_some());
+
+        projection.apply_result(&TaskCockpitResult::GitRepositories(
+            TaskGitRepositoriesProjection {
+                task_id,
+                repositories: vec![
+                    TaskRepositoryCatalogEntry {
+                        selector: TaskRepositorySelector::Workspace,
+                        label: "Workspace".into(),
+                        kind: TaskRepositoryKind::Workspace,
+                        available: true,
+                        read_only: false,
+                    },
+                    TaskRepositoryCatalogEntry {
+                        selector: TaskRepositorySelector::ProjectRoot,
+                        label: "Project root".into(),
+                        kind: TaskRepositoryKind::ProjectRoot,
+                        available: true,
+                        read_only: false,
+                    },
+                ],
+            },
+        ));
+        assert_eq!(
+            projection
+                .repositories
+                .as_ref()
+                .map(|catalog| catalog.repositories.len()),
+            Some(2)
+        );
+        assert!(
+            projection.git.is_none(),
+            "status for a selector absent from the new catalog must clear"
+        );
+    }
+
+    #[test]
+    fn foreign_git_or_repository_catalog_results_fail_closed_and_drop_stale_git() {
+        let task_id = task_id();
+        let mut projection = TaskCockpitLiveProjection::empty(task_id);
+        projection.apply_result(&TaskCockpitResult::Git(git_projection(task_id)));
+        assert!(projection.git.is_some());
+
+        projection.apply_result(&TaskCockpitResult::GitRepositories(
+            TaskGitRepositoriesProjection {
+                task_id: TaskId::new(),
+                repositories: vec![TaskRepositoryCatalogEntry {
+                    selector: TaskRepositorySelector::Workspace,
+                    label: "Workspace".into(),
+                    kind: TaskRepositoryKind::Workspace,
+                    available: true,
+                    read_only: false,
+                }],
+            },
+        ));
+        assert!(matches!(projection.load, CockpitSurfaceLoad::Error { .. }));
+        assert!(projection.repositories.is_none());
+        assert!(projection.git.is_none());
+
+        projection.apply_result(&TaskCockpitResult::Git(git_projection(task_id)));
+        projection.apply_result(&TaskCockpitResult::Git(TaskGitProjection {
+            task_id: TaskId::new(),
+            selector: Some(TaskRepositorySelector::Workspace),
+            label: Some("Workspace".into()),
+            branch: Some("other".into()),
+            ahead: 0,
+            behind: 0,
+            change_count: 9,
+            detached: false,
+        }));
+        assert!(matches!(projection.load, CockpitSurfaceLoad::Error { .. }));
+        assert!(projection.git.is_none());
     }
 
     #[test]

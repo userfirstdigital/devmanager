@@ -396,6 +396,74 @@ fn begin_provider_dispatch(
     (task_id, agent_session_id, operation_id, permit)
 }
 
+#[test]
+fn send_now_reopens_a_settled_task_before_provider_delivery() {
+    use devmanager::domain::command::CommandReceipt;
+    use devmanager::domain::TaskLifecycle;
+    use tempfile::TempDir;
+
+    let dir = TempDir::new().expect("tempdir");
+    let path = dir.path().join("provider-input-settled-reopen.sqlite3");
+    let (mut bus, task_id, agent_session_id, action_epoch, revision, client_id) =
+        seed_open_task_with_agent(&path, 0x91);
+
+    let settled = bus
+        .execute(CommandEnvelope {
+            command_id: CommandId::from_bytes(fixed_uuid_v7(0x9a)).expect("settle command"),
+            client_id,
+            task_id: Some(task_id),
+            issued_at_ms: 1_725_003_000_100,
+            expected_task_revision: Some(revision),
+            command: Command::SettleTask,
+        })
+        .expect("settle task");
+    let CommandReceipt::Accepted {
+        task_revision: Some(settled_revision),
+        ..
+    } = settled
+    else {
+        panic!("settle must be accepted: {settled:?}");
+    };
+    let after_settle = bus
+        .task_snapshot(task_id)
+        .expect("settled snapshot")
+        .expect("task");
+    assert_eq!(after_settle.task.lifecycle, TaskLifecycle::Settled);
+    assert_eq!(after_settle.task.action_epoch, action_epoch);
+    assert_eq!(
+        after_settle
+            .agents
+            .get(&agent_session_id)
+            .expect("primary agent")
+            .lifecycle,
+        devmanager::domain::AgentSessionLifecycle::Open
+    );
+
+    let submitted = bus
+        .execute(CommandEnvelope {
+            command_id: CommandId::from_bytes(fixed_uuid_v7(0x9b)).expect("submit command"),
+            client_id,
+            task_id: Some(task_id),
+            issued_at_ms: 1_725_003_000_200,
+            expected_task_revision: Some(settled_revision),
+            command: Command::SubmitProviderInput(send_now_intent(
+                agent_session_id,
+                TurnId::from_bytes(fixed_uuid_v7(0x9c)).expect("turn"),
+                action_epoch,
+                "resume from Done",
+                false,
+            )),
+        })
+        .expect("submit against settled task");
+    assert!(matches!(submitted, CommandReceipt::Accepted { .. }));
+    let after_submit = bus
+        .task_snapshot(task_id)
+        .expect("reopened snapshot")
+        .expect("task");
+    assert_eq!(after_submit.task.lifecycle, TaskLifecycle::Open);
+    assert_eq!(after_submit.task.action_epoch, action_epoch);
+}
+
 fn register_secondary_agent(path: &std::path::Path, task_id: TaskId, tail: u8) -> AgentSessionId {
     use devmanager::domain::command::CommandReceipt;
     use devmanager::domain::{

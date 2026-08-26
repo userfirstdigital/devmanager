@@ -14,6 +14,12 @@ use crate::providers::ProviderKind;
 pub const MAX_COCKPIT_FILE_LIST: u16 = 64;
 pub const MAX_COCKPIT_READ_BYTES: u32 = 64 * 1024;
 pub const MAX_COCKPIT_RELATIVE_PATH_BYTES: usize = 1024;
+/// Bound on Task Cockpit repository catalog entries (Workspace + configured).
+pub const MAX_TASK_REPOSITORIES: usize = 32;
+/// Bound on opaque folder config ids carried by [`TaskRepositorySelector`].
+pub const MAX_FOLDER_CONFIG_ID_BYTES: usize = 128;
+/// Bound on redacted repository labels exposed on the wire.
+pub const MAX_REPOSITORY_LABEL_BYTES: usize = 96;
 
 /// Safe Task Cockpit projection of one exact stock-provider resource claim.
 ///
@@ -64,6 +70,7 @@ pub enum TaskCockpitSurface {
     Files,
     Ssh,
     Services,
+    Browser,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,6 +99,7 @@ pub enum TaskCockpitUnavailableReason {
     LogsUnsupported,
     HealthUnsupported,
     WorkspaceAuthorityUnavailable,
+    BrowserProcessSessionUnavailable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -100,6 +108,114 @@ pub enum TaskGitMutateIntent {
     Stage { relative_paths: Vec<String> },
     Unstage { relative_paths: Vec<String> },
     Commit { message: String },
+}
+
+/// Opaque client-chosen repository target. Paths never cross this boundary;
+/// the host resolves every locator from sealed config / workspace authority.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum TaskRepositorySelector {
+    /// The Task's existing bound checkout / worktree.
+    Workspace,
+    /// The configured Project root for the Task's project.
+    ProjectRoot,
+    /// One active configured Project folder, by opaque folder config id.
+    Folder { folder_config_id: String },
+}
+
+impl TaskRepositorySelector {
+    /// Reject empty, oversized, control, or path-like folder config ids.
+    /// Workspace / ProjectRoot selectors are always well-formed.
+    pub fn validate(&self) -> Result<(), TaskRepositorySelectorError> {
+        match self {
+            Self::Workspace | Self::ProjectRoot => Ok(()),
+            Self::Folder { folder_config_id } => validate_folder_config_id(folder_config_id),
+        }
+    }
+
+    pub const fn kind(&self) -> TaskRepositoryKind {
+        match self {
+            Self::Workspace => TaskRepositoryKind::Workspace,
+            Self::ProjectRoot => TaskRepositoryKind::ProjectRoot,
+            Self::Folder { .. } => TaskRepositoryKind::ConfiguredFolder,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskRepositorySelectorError {
+    EmptyFolderConfigId,
+    OversizedFolderConfigId,
+    InvalidFolderConfigId,
+    PathLikeFolderConfigId,
+}
+
+/// Wire kind / scope for one catalogued repository target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskRepositoryKind {
+    Workspace,
+    ProjectRoot,
+    ConfiguredFolder,
+}
+
+/// One bounded, path-redacted repository catalog entry for a Task.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskRepositoryCatalogEntry {
+    pub selector: TaskRepositorySelector,
+    pub label: String,
+    pub kind: TaskRepositoryKind,
+    pub available: bool,
+    pub read_only: bool,
+}
+
+/// Bounded catalog of repositories addressable for one Task / project.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskGitRepositoriesProjection {
+    pub task_id: TaskId,
+    pub repositories: Vec<TaskRepositoryCatalogEntry>,
+}
+
+pub fn validate_folder_config_id(raw: &str) -> Result<(), TaskRepositorySelectorError> {
+    let value = raw.trim();
+    if value.is_empty() {
+        return Err(TaskRepositorySelectorError::EmptyFolderConfigId);
+    }
+    if value.len() > MAX_FOLDER_CONFIG_ID_BYTES {
+        return Err(TaskRepositorySelectorError::OversizedFolderConfigId);
+    }
+    if value.contains('\0') || value.chars().any(char::is_control) {
+        return Err(TaskRepositorySelectorError::InvalidFolderConfigId);
+    }
+    if value.contains('/')
+        || value.contains('\\')
+        || value.contains("..")
+        || value.starts_with('.')
+        || value.as_bytes().get(1) == Some(&b':')
+        || value.contains(':')
+    {
+        return Err(TaskRepositorySelectorError::PathLikeFolderConfigId);
+    }
+    Ok(())
+}
+
+pub fn redact_repository_label(label: &str) -> String {
+    let filtered: String = label
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect();
+    let trimmed = filtered.trim();
+    if trimmed.is_empty() {
+        return "Repository".to_owned();
+    }
+    let bounded = truncate_to_max_bytes(trimmed, MAX_REPOSITORY_LABEL_BYTES);
+    if bounded.trim().is_empty() {
+        "Repository".to_owned()
+    } else {
+        bounded
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,12 +227,45 @@ pub enum TaskCockpitQuery {
     ConfigSnapshot,
     /// Read-only Claude and Codex CLI authentication observation.
     AgentConnection,
+    /// Exact host-owned live provider-process session for the selected Task.
+    /// The client may mirror this identity into its local Browser gateway, but
+    /// must never synthesize or infer a replacement id.
+    BrowserProcessSession,
     /// Host-owned project creation. The host validates the folder, persists
     /// it through ConfigStore, and re-issues workspace authority. Clients
     /// never write `config.json`.
     ConfigCreateProject {
         name: String,
         root_path: String,
+    },
+    /// Create or update one project RunCommand through ConfigStore.
+    ConfigUpsertCommand {
+        project_id: String,
+        folder_id: String,
+        #[serde(default)]
+        command_id: Option<String>,
+        label: String,
+        command: String,
+    },
+    /// Archive one project RunCommand through ConfigStore.
+    ConfigArchiveCommand {
+        project_id: String,
+        folder_id: String,
+        command_id: String,
+    },
+    /// Start one configured project command through the host service runtime.
+    ConfigRunCommand {
+        project_id: String,
+        folder_id: String,
+        command_id: String,
+    },
+    /// Narrow host-local read of one RunCommand's label + command text for
+    /// edit. ConfigSnapshot intentionally redacts commands; this query never
+    /// ships roots, env, or credentials.
+    ConfigCommandDetail {
+        project_id: String,
+        folder_id: String,
+        command_id: String,
     },
     /// Read the bounded provider-neutral semantic conversation retained for
     /// the selected Task. The cursor is exclusive; zero requests the current
@@ -125,7 +274,14 @@ pub enum TaskCockpitQuery {
         after_sequence: u64,
     },
     WorkspaceStatus,
+    /// Bounded path-redacted catalog of repositories for the exact Task/project.
+    GitRepositories,
+    /// Compatibility shim: identical to `GitStatusTargeted { selector: Workspace }`.
     GitStatus,
+    /// Explicitly targeted repository status for one opaque selector.
+    GitStatusTargeted {
+        selector: TaskRepositorySelector,
+    },
     FilesList {
         relative_directory: Option<String>,
         limit: u16,
@@ -142,7 +298,15 @@ pub enum TaskCockpitQuery {
         #[serde(default)]
         confirm: bool,
     },
+    /// Compatibility shim: identical to `GitMutateTargeted { selector: Workspace, .. }`.
     GitMutate {
+        intent: TaskGitMutateIntent,
+        #[serde(default)]
+        confirm: bool,
+    },
+    /// Explicitly targeted Git mutation for one opaque selector.
+    GitMutateTargeted {
+        selector: TaskRepositorySelector,
         intent: TaskGitMutateIntent,
         #[serde(default)]
         confirm: bool,
@@ -189,6 +353,11 @@ pub struct TaskWorkspaceProjection {
 #[serde(deny_unknown_fields)]
 pub struct TaskGitProjection {
     pub task_id: TaskId,
+    /// Present for targeted status; legacy Workspace shims may omit or set Workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector: Option<TaskRepositorySelector>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
     pub branch: Option<String>,
     pub ahead: u32,
     pub behind: u32,
@@ -440,9 +609,12 @@ impl AgentConnectionSnapshot {
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum TaskCockpitResult {
     Config(ConfigSidebarSnapshot),
+    ConfigCommandDetail(ConfigCommandDetailProjection),
     AgentConnection(AgentConnectionSnapshot),
+    BrowserProcessSession(BrowserProcessSessionProjection),
     Conversation(crate::domain::snapshot::SemanticJournalPage),
     Workspace(TaskWorkspaceProjection),
+    GitRepositories(TaskGitRepositoriesProjection),
     Git(TaskGitProjection),
     FilesList(TaskFilesListProjection),
     FilesRead(TaskFilesReadProjection),
@@ -458,6 +630,25 @@ pub enum TaskCockpitResult {
         surface: TaskCockpitSurface,
         reason: TaskCockpitUnavailableReason,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserProcessSessionProjection {
+    pub task_id: crate::domain::id::TaskId,
+    pub process_session_id: String,
+}
+
+/// Bounded host-local RunCommand detail for edit. Command text is included;
+/// roots, env files, and credentials stay host-private.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigCommandDetailProjection {
+    pub project_id: String,
+    pub folder_id: String,
+    pub command_id: String,
+    pub label: String,
+    pub command: String,
 }
 
 /// Truncate `text` to at most `max_bytes` without splitting a UTF-8 character.
@@ -503,6 +694,8 @@ pub fn git_projection(task_id: TaskId, workspace: &WorkspaceRef) -> TaskGitProje
     let (_, _, branch) = workspace_identity(workspace);
     TaskGitProjection {
         task_id,
+        selector: Some(TaskRepositorySelector::Workspace),
+        label: Some("Workspace".to_owned()),
         branch,
         ahead: 0,
         behind: 0,
@@ -546,10 +739,19 @@ pub fn cockpit_surface(query: &TaskCockpitQuery) -> TaskCockpitSurface {
     match query {
         TaskCockpitQuery::ConfigSnapshot
         | TaskCockpitQuery::AgentConnection
-        | TaskCockpitQuery::ConfigCreateProject { .. } => TaskCockpitSurface::Workspace,
+        | TaskCockpitQuery::ConfigCreateProject { .. }
+        | TaskCockpitQuery::ConfigUpsertCommand { .. }
+        | TaskCockpitQuery::ConfigArchiveCommand { .. }
+        | TaskCockpitQuery::ConfigRunCommand { .. }
+        | TaskCockpitQuery::ConfigCommandDetail { .. } => TaskCockpitSurface::Workspace,
+        TaskCockpitQuery::BrowserProcessSession => TaskCockpitSurface::Browser,
         TaskCockpitQuery::Conversation { .. } => TaskCockpitSurface::Conversation,
         TaskCockpitQuery::WorkspaceStatus => TaskCockpitSurface::Workspace,
-        TaskCockpitQuery::GitStatus | TaskCockpitQuery::GitMutate { .. } => TaskCockpitSurface::Git,
+        TaskCockpitQuery::GitRepositories
+        | TaskCockpitQuery::GitStatus
+        | TaskCockpitQuery::GitStatusTargeted { .. }
+        | TaskCockpitQuery::GitMutate { .. }
+        | TaskCockpitQuery::GitMutateTargeted { .. } => TaskCockpitSurface::Git,
         TaskCockpitQuery::FilesList { .. }
         | TaskCockpitQuery::FilesRead { .. }
         | TaskCockpitQuery::FilesWrite { .. } => TaskCockpitSurface::Files,
@@ -753,5 +955,203 @@ mod tests {
         };
         assert!(snapshot.connected());
         assert!(!AgentConnectionSnapshot { agents: vec![] }.connected());
+    }
+
+    #[test]
+    fn repository_selector_rejects_path_like_folder_ids() {
+        assert!(TaskRepositorySelector::Workspace.validate().is_ok());
+        assert!(TaskRepositorySelector::ProjectRoot.validate().is_ok());
+        assert!(TaskRepositorySelector::Folder {
+            folder_config_id: "apps-api".into(),
+        }
+        .validate()
+        .is_ok());
+        assert_eq!(
+            TaskRepositorySelector::Folder {
+                folder_config_id: "C:/repos/api".into(),
+            }
+            .validate(),
+            Err(TaskRepositorySelectorError::PathLikeFolderConfigId)
+        );
+        assert_eq!(
+            TaskRepositorySelector::Folder {
+                folder_config_id: "../secret".into(),
+            }
+            .validate(),
+            Err(TaskRepositorySelectorError::PathLikeFolderConfigId)
+        );
+        assert_eq!(
+            TaskRepositorySelector::Folder {
+                folder_config_id: "foo/bar".into(),
+            }
+            .validate(),
+            Err(TaskRepositorySelectorError::PathLikeFolderConfigId)
+        );
+        assert_eq!(
+            TaskRepositorySelector::Folder {
+                folder_config_id: String::new(),
+            }
+            .validate(),
+            Err(TaskRepositorySelectorError::EmptyFolderConfigId)
+        );
+    }
+
+    #[test]
+    fn redact_repository_label_is_utf8_byte_bounded_without_splitting_characters() {
+        assert_eq!(redact_repository_label("  plain  "), "plain");
+        assert_eq!(redact_repository_label("\u{0001}\u{0007}"), "Repository");
+        assert_eq!(redact_repository_label("   \t  "), "Repository");
+        let multibyte = "á".repeat(80);
+        let redacted = redact_repository_label(&multibyte);
+        assert!(redacted.len() <= MAX_REPOSITORY_LABEL_BYTES);
+        assert!(redacted.is_char_boundary(redacted.len()));
+        assert!(!redacted.is_empty());
+        assert_eq!(
+            redacted.chars().count(),
+            MAX_REPOSITORY_LABEL_BYTES / "á".len()
+        );
+        let mixed = format!("{}🎉", "a".repeat(95));
+        let redacted = redact_repository_label(&mixed);
+        assert!(redacted.len() <= MAX_REPOSITORY_LABEL_BYTES);
+        assert!(redacted.is_char_boundary(redacted.len()));
+        assert!(!redacted.contains('🎉'));
+    }
+
+    #[test]
+    fn git_repositories_and_targeted_status_roundtrip_without_paths() {
+        let task_id = TaskId::new();
+        let catalog = Query::TaskCockpit(TaskCockpitQuery::GitRepositories);
+        let encoded = serde_json::to_value(&catalog).expect("encode catalog query");
+        assert_eq!(
+            encoded.get("task_cockpit").and_then(|value| value.as_str()),
+            Some("git_repositories")
+        );
+        let decoded: Query = serde_json::from_value(encoded).expect("decode catalog query");
+        assert_eq!(decoded, catalog);
+
+        let targeted = Query::TaskCockpit(TaskCockpitQuery::GitStatusTargeted {
+            selector: TaskRepositorySelector::Folder {
+                folder_config_id: "sibling-b".into(),
+            },
+        });
+        let encoded = serde_json::to_value(&targeted).expect("encode targeted");
+        let payload = encoded
+            .get("task_cockpit")
+            .and_then(|value| value.get("git_status_targeted"))
+            .expect("targeted payload");
+        let text = payload.to_string();
+        assert!(!text.contains("C:"));
+        assert!(!text.contains("/repos/"));
+        assert!(!text.contains('\\'));
+        let decoded: Query = serde_json::from_value(encoded).expect("decode targeted");
+        assert_eq!(decoded, targeted);
+
+        let result = QueryResult::TaskCockpit(TaskCockpitResult::GitRepositories(
+            TaskGitRepositoriesProjection {
+                task_id,
+                repositories: vec![
+                    TaskRepositoryCatalogEntry {
+                        selector: TaskRepositorySelector::Workspace,
+                        label: "Workspace".into(),
+                        kind: TaskRepositoryKind::Workspace,
+                        available: true,
+                        read_only: false,
+                    },
+                    TaskRepositoryCatalogEntry {
+                        selector: TaskRepositorySelector::ProjectRoot,
+                        label: "Project".into(),
+                        kind: TaskRepositoryKind::ProjectRoot,
+                        available: true,
+                        read_only: false,
+                    },
+                ],
+            },
+        ));
+        let encoded = serde_json::to_string(&result).expect("encode result");
+        assert!(!encoded.contains("C:"));
+        assert!(!encoded.contains("/home/"));
+        let decoded: QueryResult = serde_json::from_str(&encoded).expect("decode result");
+        assert_eq!(decoded, result);
+
+        let status = QueryResult::TaskCockpit(TaskCockpitResult::Git(TaskGitProjection {
+            task_id,
+            selector: Some(TaskRepositorySelector::Folder {
+                folder_config_id: "sibling-b".into(),
+            }),
+            label: Some("Sibling B".into()),
+            branch: Some("main".into()),
+            ahead: 1,
+            behind: 0,
+            change_count: 2,
+            detached: false,
+        }));
+        let encoded = serde_json::to_string(&status).expect("encode status");
+        assert!(!encoded.contains("C:"));
+        assert!(!encoded.contains("folder_path"));
+        let decoded: QueryResult = serde_json::from_str(&encoded).expect("decode status");
+        assert_eq!(decoded, status);
+    }
+
+    #[test]
+    fn legacy_git_status_and_mutate_remain_workspace_shims_on_the_wire() {
+        let status = Query::TaskCockpit(TaskCockpitQuery::GitStatus);
+        let encoded = serde_json::to_value(&status).expect("encode status");
+        assert_eq!(
+            encoded.get("task_cockpit").and_then(|value| value.as_str()),
+            Some("git_status")
+        );
+        assert!(encoded
+            .get("task_cockpit")
+            .and_then(|value| value.get("selector"))
+            .is_none());
+
+        let mutate = Query::TaskCockpit(TaskCockpitQuery::GitMutate {
+            intent: TaskGitMutateIntent::Commit {
+                message: "ship".into(),
+            },
+            confirm: true,
+        });
+        let encoded = serde_json::to_value(&mutate).expect("encode mutate");
+        let payload = encoded
+            .get("task_cockpit")
+            .and_then(|value| value.get("git_mutate"))
+            .expect("git_mutate");
+        assert!(payload.get("selector").is_none());
+        assert_eq!(
+            cockpit_surface(&TaskCockpitQuery::GitStatus),
+            TaskCockpitSurface::Git
+        );
+        assert_eq!(
+            cockpit_surface(&TaskCockpitQuery::GitStatusTargeted {
+                selector: TaskRepositorySelector::Workspace,
+            }),
+            TaskCockpitSurface::Git
+        );
+        assert_eq!(
+            cockpit_surface(&TaskCockpitQuery::GitRepositories),
+            TaskCockpitSurface::Git
+        );
+    }
+
+    #[test]
+    fn targeted_mutate_binds_selector_on_the_wire() {
+        let mutate = Query::TaskCockpit(TaskCockpitQuery::GitMutateTargeted {
+            selector: TaskRepositorySelector::ProjectRoot,
+            intent: TaskGitMutateIntent::Stage {
+                relative_paths: vec!["README.md".into()],
+            },
+            confirm: false,
+        });
+        let encoded = serde_json::to_value(&mutate).expect("encode");
+        let payload = encoded
+            .get("task_cockpit")
+            .and_then(|value| value.get("git_mutate_targeted"))
+            .expect("targeted mutate");
+        assert_eq!(
+            payload.get("selector").and_then(|value| value.as_str()),
+            Some("project_root")
+        );
+        let decoded: Query = serde_json::from_value(encoded).expect("decode");
+        assert_eq!(decoded, mutate);
     }
 }

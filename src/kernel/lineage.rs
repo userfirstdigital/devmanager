@@ -544,6 +544,7 @@ fn is_pure_decision_fact(event: &Event) -> bool {
         Event::TaskCreated { .. }
             | Event::TaskRenamed { .. }
             | Event::TaskAttentionSet { .. }
+            | Event::TaskSettled
             | Event::TaskReopened
             | Event::TaskArchived
             | Event::AgentSessionRegistered { .. }

@@ -1982,6 +1982,8 @@ mod process_census_tests {
         projection.apply_result(&crate::domain::TaskCockpitResult::Git(
             crate::domain::TaskGitProjection {
                 task_id,
+                selector: Some(crate::domain::TaskRepositorySelector::Workspace),
+                label: Some("Workspace".into()),
                 branch: Some("codex/final-e2e-ui".into()),
                 ahead: 0,
                 behind: 0,

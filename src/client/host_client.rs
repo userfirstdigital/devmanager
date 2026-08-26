@@ -625,6 +625,24 @@ impl HostClient {
         }
     }
 
+    /// Query the bounded path-redacted repository catalog for one Task.
+    pub async fn query_git_repositories(
+        &mut self,
+        task_id: TaskId,
+    ) -> Result<Result<crate::domain::TaskGitRepositoriesProjection, QueryError>, IpcError> {
+        match self
+            .query_task_cockpit(task_id, TaskCockpitQuery::GitRepositories)
+            .await?
+        {
+            Ok(TaskCockpitResult::GitRepositories(catalog)) => Ok(Ok(catalog)),
+            Ok(_) => {
+                self.retire_connection();
+                Err(IpcError::UnexpectedResponse)
+            }
+            Err(error) => Ok(Err(error)),
+        }
+    }
+
     /// Open or resume one paged snapshot section. Requires granted PagedSnapshots.
     pub async fn snapshot_page(
         &mut self,

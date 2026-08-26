@@ -186,6 +186,7 @@ pub(crate) fn is_pure_slice_decision_fact(event: &Event) -> bool {
         Event::TaskCreated { .. }
         | Event::TaskRenamed { .. }
         | Event::TaskAttentionSet { .. }
+        | Event::TaskSettled
         | Event::TaskReopened
         | Event::TaskArchived
         | Event::AgentSessionRegistered { .. }
@@ -260,9 +261,13 @@ pub(crate) fn plan_effects(
                         "task teardown planning task scope mismatch".into(),
                     ));
                 }
-                if snap.task.lifecycle != crate::domain::task::TaskLifecycle::Open {
+                if !matches!(
+                    snap.task.lifecycle,
+                    crate::domain::task::TaskLifecycle::Open
+                        | crate::domain::task::TaskLifecycle::Settled
+                ) {
                     return Err(StoreError::Projection(
-                        "task teardown planning requires Open lifecycle".into(),
+                        "task teardown planning requires Open or Settled lifecycle".into(),
                     ));
                 }
                 let expected_epoch =
@@ -465,6 +470,7 @@ pub(crate) fn plan_effects(
             Event::TaskCreated { .. }
             | Event::TaskRenamed { .. }
             | Event::TaskAttentionSet { .. }
+            | Event::TaskSettled
             | Event::TaskReopened
             | Event::TaskArchived
             | Event::AgentSessionRegistered { .. }

@@ -61,8 +61,16 @@ pub const ACTION_TASK_CREATE: &str = "task.create";
 pub const ACTION_TASK_CREATE_V2: &str = "task.create.v2";
 /// Stable id for host-owned project creation from a name and folder path.
 pub const ACTION_CONFIG_CREATE_PROJECT: &str = "config.create_project";
+pub const ACTION_CONFIG_UPSERT_COMMAND: &str = "config.upsert_command";
+pub const ACTION_CONFIG_ARCHIVE_COMMAND: &str = "config.archive_command";
+pub const ACTION_CONFIG_RUN_COMMAND: &str = "config.run_command";
+pub const ACTION_CONFIG_COMMAND_DETAIL: &str = "config.command_detail";
 /// Stable id for renaming one Task through the host command boundary.
 pub const ACTION_TASK_RENAME: &str = "task.rename";
+/// Mark a Task Done without releasing its runtime or provider conversation.
+pub const ACTION_TASK_SETTLE: &str = "task.settle";
+/// Restore a Done Task to the active list.
+pub const ACTION_TASK_REOPEN: &str = "task.reopen";
 /// Stable id for archiving one Task through the host close boundary.
 pub const ACTION_TASK_ARCHIVE: &str = "task.archive";
 /// Canonical composer Send Now. Settles through SubmitProviderInput.
@@ -138,6 +146,8 @@ pub const ACTION_CONVERSATION_STATUS: &str = "conversation.status";
 pub const ACTION_WORKSPACE_STATUS: &str = "workspace.status";
 /// Task-scoped durable git identity/status projection.
 pub const ACTION_GIT_STATUS: &str = "git.status";
+/// Task-scoped bounded repository catalog for multi-folder projects.
+pub const ACTION_GIT_REPOSITORIES: &str = "git.repositories";
 /// Task-scoped files list query through WorkspaceFileService authority.
 pub const ACTION_FILES_LIST: &str = "files.list";
 /// Task-scoped files read query through WorkspaceFileService authority.
@@ -277,6 +287,46 @@ const ACTIONS: &[ActionDescriptor] = &[
         argument_schema: ActionArgumentSchema::TaskCockpitV1,
     },
     ActionDescriptor {
+        id: ACTION_CONFIG_UPSERT_COMMAND,
+        title: "Save project action",
+        description: "Create or update one project command through the host configuration store.",
+        keywords: &["project", "action", "command", "script", "config"],
+        scope: ActionScope::Host,
+        required_capability: Some(Capability::TaskCockpit),
+        risk: ActionRisk::Mutating,
+        argument_schema: ActionArgumentSchema::TaskCockpitV1,
+    },
+    ActionDescriptor {
+        id: ACTION_CONFIG_ARCHIVE_COMMAND,
+        title: "Archive project action",
+        description: "Archive one project command through the host configuration store.",
+        keywords: &["project", "action", "command", "archive", "config"],
+        scope: ActionScope::Host,
+        required_capability: Some(Capability::TaskCockpit),
+        risk: ActionRisk::Mutating,
+        argument_schema: ActionArgumentSchema::TaskCockpitV1,
+    },
+    ActionDescriptor {
+        id: ACTION_CONFIG_RUN_COMMAND,
+        title: "Run project action",
+        description: "Start one configured project command through the host service runtime.",
+        keywords: &["project", "action", "command", "run", "start"],
+        scope: ActionScope::Host,
+        required_capability: Some(Capability::TaskCockpit),
+        risk: ActionRisk::Mutating,
+        argument_schema: ActionArgumentSchema::TaskCockpitV1,
+    },
+    ActionDescriptor {
+        id: ACTION_CONFIG_COMMAND_DETAIL,
+        title: "Project action detail",
+        description: "Read one project command's label and command text for edit.",
+        keywords: &["project", "action", "command", "detail", "edit"],
+        scope: ActionScope::Host,
+        required_capability: Some(Capability::TaskCockpit),
+        risk: ActionRisk::ReadOnly,
+        argument_schema: ActionArgumentSchema::TaskCockpitV1,
+    },
+    ActionDescriptor {
         id: ACTION_TASK_RENAME,
         title: "Rename task",
         description: "Rename one Task through the host command boundary.",
@@ -285,6 +335,26 @@ const ACTIONS: &[ActionDescriptor] = &[
         required_capability: None,
         risk: ActionRisk::Mutating,
         argument_schema: ActionArgumentSchema::TaskRenameV1,
+    },
+    ActionDescriptor {
+        id: ACTION_TASK_SETTLE,
+        title: "Mark task Done",
+        description: "Move one Task to Done while preserving its runtime and conversation.",
+        keywords: &["task", "done", "settle", "complete"],
+        scope: ActionScope::Task,
+        required_capability: None,
+        risk: ActionRisk::Mutating,
+        argument_schema: ActionArgumentSchema::TaskId,
+    },
+    ActionDescriptor {
+        id: ACTION_TASK_REOPEN,
+        title: "Restore task",
+        description: "Return one Done Task to the active task list.",
+        keywords: &["task", "restore", "reopen", "unsettle"],
+        scope: ActionScope::Task,
+        required_capability: None,
+        risk: ActionRisk::Mutating,
+        argument_schema: ActionArgumentSchema::TaskId,
     },
     ActionDescriptor {
         id: ACTION_TASK_ARCHIVE,
@@ -447,6 +517,12 @@ pub enum ActionRequest {
     TaskCreate(TaskCreateArguments),
     TaskCreateV2(TaskCreateV2Arguments),
     TaskRename(TaskRenameArguments),
+    TaskSettle {
+        task_id: TaskId,
+    },
+    TaskReopen {
+        task_id: TaskId,
+    },
     TaskArchive {
         task_id: TaskId,
     },
@@ -477,6 +553,8 @@ impl ActionRequest {
             Self::TaskCreate(_) => ACTION_TASK_CREATE,
             Self::TaskCreateV2(_) => ACTION_TASK_CREATE_V2,
             Self::TaskRename(_) => ACTION_TASK_RENAME,
+            Self::TaskSettle { .. } => ACTION_TASK_SETTLE,
+            Self::TaskReopen { .. } => ACTION_TASK_REOPEN,
             Self::TaskArchive { .. } => ACTION_TASK_ARCHIVE,
             Self::ProviderInput(arguments) => arguments.action_id,
             Self::StartProviderSession(_) => ACTION_PROVIDER_START_SESSION,
@@ -557,9 +635,18 @@ pub const fn cockpit_query_action_id(query: &TaskCockpitQuery) -> &'static str {
         TaskCockpitQuery::ConfigSnapshot => ACTION_WORKSPACE_STATUS,
         TaskCockpitQuery::AgentConnection => ACTION_HOST_STATUS,
         TaskCockpitQuery::ConfigCreateProject { .. } => ACTION_CONFIG_CREATE_PROJECT,
+        TaskCockpitQuery::ConfigUpsertCommand { .. } => ACTION_CONFIG_UPSERT_COMMAND,
+        TaskCockpitQuery::ConfigArchiveCommand { .. } => ACTION_CONFIG_ARCHIVE_COMMAND,
+        TaskCockpitQuery::ConfigRunCommand { .. } => ACTION_CONFIG_RUN_COMMAND,
+        TaskCockpitQuery::ConfigCommandDetail { .. } => ACTION_CONFIG_COMMAND_DETAIL,
+        TaskCockpitQuery::BrowserProcessSession => ACTION_BROWSER_NATIVE,
         TaskCockpitQuery::Conversation { .. } => ACTION_CONVERSATION_STATUS,
         TaskCockpitQuery::WorkspaceStatus => ACTION_WORKSPACE_STATUS,
-        TaskCockpitQuery::GitStatus | TaskCockpitQuery::GitMutate { .. } => ACTION_GIT_STATUS,
+        TaskCockpitQuery::GitRepositories => ACTION_GIT_REPOSITORIES,
+        TaskCockpitQuery::GitStatus
+        | TaskCockpitQuery::GitStatusTargeted { .. }
+        | TaskCockpitQuery::GitMutate { .. }
+        | TaskCockpitQuery::GitMutateTargeted { .. } => ACTION_GIT_STATUS,
         TaskCockpitQuery::FilesList { .. } => ACTION_FILES_LIST,
         TaskCockpitQuery::FilesRead { .. } => ACTION_FILES_READ,
         TaskCockpitQuery::FilesWrite { .. } => ACTION_FILES_WRITE,
@@ -587,6 +674,7 @@ pub fn task_cockpit_request(task_id: TaskId, action_id: &str) -> Option<ActionRe
     let query = match action_id {
         ACTION_WORKSPACE_STATUS => TaskCockpitQuery::WorkspaceStatus,
         ACTION_GIT_STATUS => TaskCockpitQuery::GitStatus,
+        ACTION_GIT_REPOSITORIES => TaskCockpitQuery::GitRepositories,
         ACTION_FILES_LIST => TaskCockpitQuery::FilesList {
             relative_directory: None,
             limit: MAX_COCKPIT_FILE_LIST,
@@ -891,6 +979,17 @@ const TASK_COCKPIT_EXTENSION: &[ActionDescriptor] = &[
         title: "Git status",
         description: "Read a bounded redacted git identity for the selected Task workspace.",
         keywords: &["git", "status", "cockpit"],
+        scope: ActionScope::Task,
+        required_capability: Some(Capability::TaskCockpit),
+        risk: ActionRisk::ReadOnly,
+        argument_schema: ActionArgumentSchema::TaskCockpitV1,
+    },
+    ActionDescriptor {
+        id: ACTION_GIT_REPOSITORIES,
+        title: "Git repositories",
+        description:
+            "List bounded path-redacted repositories available for the selected Task project.",
+        keywords: &["git", "repositories", "catalog", "cockpit"],
         scope: ActionScope::Task,
         required_capability: Some(Capability::TaskCockpit),
         risk: ActionRisk::ReadOnly,
@@ -1571,21 +1670,23 @@ mod tests {
         task_cockpit_query, task_create_command, task_rename_command, task_show_query,
         ActionArgumentSchema, ActionRisk, ActionScope, ProviderStartArguments,
         ServiceControlArguments, TaskCreateArguments, TaskCreateV2Arguments, TaskRenameArguments,
-        ACTION_BROWSER_NATIVE, ACTION_CONFIG_CREATE_PROJECT, ACTION_CONVERSATION_STATUS,
-        ACTION_FILES_LIST, ACTION_FILES_READ, ACTION_GIT_STATUS, ACTION_HOST_ACTIONS,
-        ACTION_HOST_STATUS, ACTION_PROMPT_CHAIN_PAGE, ACTION_PROMPT_DIFF,
-        ACTION_PROMPT_METADATA_PAGE, ACTION_PROMPT_VERSION_PAGE, ACTION_PROVIDER_ANSWER_QUESTION,
-        ACTION_PROVIDER_NEW_CONVERSATION, ACTION_PROVIDER_QUEUE_FOLLOW_UP,
-        ACTION_PROVIDER_RESOLVE_APPROVAL, ACTION_PROVIDER_SEND_NOW, ACTION_PROVIDER_START_SESSION,
+        ACTION_BROWSER_NATIVE, ACTION_CONFIG_ARCHIVE_COMMAND, ACTION_CONFIG_COMMAND_DETAIL,
+        ACTION_CONFIG_CREATE_PROJECT, ACTION_CONFIG_RUN_COMMAND, ACTION_CONFIG_UPSERT_COMMAND,
+        ACTION_CONVERSATION_STATUS, ACTION_FILES_LIST, ACTION_FILES_READ, ACTION_GIT_REPOSITORIES,
+        ACTION_GIT_STATUS, ACTION_HOST_ACTIONS, ACTION_HOST_STATUS, ACTION_PROMPT_CHAIN_PAGE,
+        ACTION_PROMPT_DIFF, ACTION_PROMPT_METADATA_PAGE, ACTION_PROMPT_VERSION_PAGE,
+        ACTION_PROVIDER_ANSWER_QUESTION, ACTION_PROVIDER_NEW_CONVERSATION,
+        ACTION_PROVIDER_QUEUE_FOLLOW_UP, ACTION_PROVIDER_RESOLVE_APPROVAL,
+        ACTION_PROVIDER_SEND_NOW, ACTION_PROVIDER_START_SESSION,
         ACTION_PROVIDER_STEER_CURRENT_TURN, ACTION_PROVIDER_STOP_TURN,
         ACTION_PROVIDER_TERMINAL_INPUT, ACTION_SERVICE_HEALTH, ACTION_SERVICE_LOGS,
         ACTION_SERVICE_RESTART, ACTION_SERVICE_START, ACTION_SERVICE_STOP, ACTION_SSH_ACTION,
         ACTION_SSH_STATUS, ACTION_TASK_ANSWER_QUESTION, ACTION_TASK_ARCHIVE, ACTION_TASK_CREATE,
         ACTION_TASK_CREATE_V2, ACTION_TASK_LIST, ACTION_TASK_QUEUE_FOLLOW_UP, ACTION_TASK_RENAME,
-        ACTION_TASK_RESOLVE_APPROVAL, ACTION_TASK_SEND_NOW, ACTION_TASK_SHOW,
-        ACTION_TASK_STEER_CURRENT_TURN, ACTION_TASK_STOP_TURN, ACTION_UPDATER_CHECK,
-        ACTION_UPDATER_DOWNLOAD, ACTION_UPDATER_INSTALL, ACTION_UPDATER_START_BACKGROUND,
-        ACTION_WORKSPACE_STATUS,
+        ACTION_TASK_REOPEN, ACTION_TASK_RESOLVE_APPROVAL, ACTION_TASK_SEND_NOW, ACTION_TASK_SETTLE,
+        ACTION_TASK_SHOW, ACTION_TASK_STEER_CURRENT_TURN, ACTION_TASK_STOP_TURN,
+        ACTION_UPDATER_CHECK, ACTION_UPDATER_DOWNLOAD, ACTION_UPDATER_INSTALL,
+        ACTION_UPDATER_START_BACKGROUND, ACTION_WORKSPACE_STATUS,
     };
     use crate::{
         domain::{
@@ -1613,7 +1714,13 @@ mod tests {
         assert!(!ids.contains(&ACTION_TASK_CREATE));
         assert!(ids.contains(&ACTION_TASK_CREATE_V2));
         assert!(ids.contains(&ACTION_CONFIG_CREATE_PROJECT));
+        assert!(ids.contains(&ACTION_CONFIG_UPSERT_COMMAND));
+        assert!(ids.contains(&ACTION_CONFIG_ARCHIVE_COMMAND));
+        assert!(ids.contains(&ACTION_CONFIG_RUN_COMMAND));
+        assert!(ids.contains(&ACTION_CONFIG_COMMAND_DETAIL));
         assert!(ids.contains(&ACTION_TASK_RENAME));
+        assert!(ids.contains(&ACTION_TASK_SETTLE));
+        assert!(ids.contains(&ACTION_TASK_REOPEN));
         assert!(ids.contains(&ACTION_TASK_ARCHIVE));
         assert!(ids.contains(&ACTION_PROVIDER_SEND_NOW));
         assert!(ids.contains(&ACTION_PROVIDER_STEER_CURRENT_TURN));
@@ -1636,7 +1743,7 @@ mod tests {
         assert!(ids.contains(&ACTION_BROWSER_NATIVE));
         assert!(ids.contains(&ACTION_PROVIDER_START_SESSION));
         assert!(ids.contains(&ACTION_CONVERSATION_STATUS));
-        assert_eq!(ids.len(), 42);
+        assert_eq!(ids.len(), 49);
         assert!(ids.contains(&ACTION_SERVICE_START));
         assert!(ids.contains(&ACTION_SERVICE_STOP));
         assert!(ids.contains(&ACTION_SERVICE_RESTART));
@@ -1645,6 +1752,7 @@ mod tests {
         assert!(!ids.contains(&ACTION_SSH_ACTION));
         assert!(ids.contains(&ACTION_WORKSPACE_STATUS));
         assert!(ids.contains(&ACTION_GIT_STATUS));
+        assert!(ids.contains(&ACTION_GIT_REPOSITORIES));
         assert!(ids.contains(&ACTION_FILES_LIST));
         assert!(ids.contains(&ACTION_FILES_READ));
         assert!(ids.contains(&ACTION_SSH_STATUS));
@@ -1682,13 +1790,27 @@ mod tests {
                         ActionArgumentSchema::TaskCockpitV1,
                         Some(Capability::TaskCockpit),
                     ),
+                    ACTION_CONFIG_UPSERT_COMMAND
+                    | ACTION_CONFIG_ARCHIVE_COMMAND
+                    | ACTION_CONFIG_RUN_COMMAND => (
+                        ActionScope::Host,
+                        ActionRisk::Mutating,
+                        ActionArgumentSchema::TaskCockpitV1,
+                        Some(Capability::TaskCockpit),
+                    ),
+                    ACTION_CONFIG_COMMAND_DETAIL => (
+                        ActionScope::Host,
+                        ActionRisk::ReadOnly,
+                        ActionArgumentSchema::TaskCockpitV1,
+                        Some(Capability::TaskCockpit),
+                    ),
                     ACTION_TASK_RENAME => (
                         ActionScope::Task,
                         ActionRisk::Mutating,
                         ActionArgumentSchema::TaskRenameV1,
                         None,
                     ),
-                    ACTION_TASK_ARCHIVE => (
+                    ACTION_TASK_SETTLE | ACTION_TASK_REOPEN | ACTION_TASK_ARCHIVE => (
                         ActionScope::Task,
                         ActionRisk::Mutating,
                         ActionArgumentSchema::TaskId,
@@ -1756,6 +1878,7 @@ mod tests {
                     ),
                     ACTION_WORKSPACE_STATUS
                     | ACTION_GIT_STATUS
+                    | ACTION_GIT_REPOSITORIES
                     | ACTION_FILES_LIST
                     | ACTION_FILES_READ
                     | ACTION_SSH_STATUS => (
@@ -1959,6 +2082,7 @@ mod tests {
         let ids: Vec<&str> = catalog().iter().map(|action| action.id).collect();
         assert!(ids.contains(&ACTION_WORKSPACE_STATUS));
         assert!(ids.contains(&ACTION_GIT_STATUS));
+        assert!(ids.contains(&ACTION_GIT_REPOSITORIES));
         assert!(ids.contains(&ACTION_FILES_LIST));
         assert!(ids.contains(&ACTION_SSH_STATUS));
     }

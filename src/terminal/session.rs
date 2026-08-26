@@ -168,6 +168,11 @@ pub struct TerminalCellSnapshot {
     pub hidden: bool,
     pub has_hyperlink: bool,
     pub default_background: bool,
+    /// When true, paint may replace [`Self::foreground`] with the active theme
+    /// terminal foreground. Older snapshots omit this field and deserialize as
+    /// `false`, preserving their stored color literally.
+    #[serde(default)]
+    pub default_foreground: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -193,6 +198,7 @@ impl TerminalCellSnapshot {
             hidden: false,
             has_hyperlink: false,
             default_background: true,
+            default_foreground: true,
         }
     }
 }
@@ -3488,10 +3494,17 @@ impl LogWriter {
 fn renderable_cell_snapshot(cell: &Cell, colors: &Colors) -> TerminalCellSnapshot {
     let mut foreground = resolve_terminal_color(cell.fg, colors);
     let mut background = resolve_terminal_color(cell.bg, colors);
+    // After INVERSE, visual fg comes from the original bg and visual bg from the
+    // original fg — mirror that swap when tagging named default colors.
     let default_background = if cell.flags.contains(Flags::INVERSE) {
         matches!(cell.fg, AnsiColor::Named(NamedColor::Background))
     } else {
         matches!(cell.bg, AnsiColor::Named(NamedColor::Background))
+    };
+    let default_foreground = if cell.flags.contains(Flags::INVERSE) {
+        matches!(cell.bg, AnsiColor::Named(NamedColor::Foreground))
+    } else {
+        matches!(cell.fg, AnsiColor::Named(NamedColor::Foreground))
     };
 
     if cell.flags.contains(Flags::INVERSE) {
@@ -3515,6 +3528,7 @@ fn renderable_cell_snapshot(cell: &Cell, colors: &Colors) -> TerminalCellSnapsho
         hidden: cell.flags.contains(Flags::HIDDEN),
         has_hyperlink: cell.hyperlink().is_some(),
         default_background,
+        default_foreground,
     }
 }
 
@@ -5010,5 +5024,64 @@ mod tests {
 
         assert_eq!(truncate_utf8_boundary(text, 2), "a");
         assert_eq!(truncate_utf8_boundary(text, 5), "a😀");
+    }
+
+    #[test]
+    fn default_foreground_marker_for_named_default_cells() {
+        let colors = Colors::default();
+        let snap = renderable_cell_snapshot(&Cell::default(), &colors);
+        assert!(
+            snap.default_foreground,
+            "named Foreground must mark default_foreground"
+        );
+        assert!(
+            snap.default_background,
+            "named Background must mark default_background"
+        );
+    }
+
+    #[test]
+    fn default_foreground_marker_clears_on_inverse_of_default_cell() {
+        let colors = Colors::default();
+        let mut cell = Cell::default();
+        cell.flags.insert(Flags::INVERSE);
+        let snap = renderable_cell_snapshot(&cell, &colors);
+        // Visual fg comes from original Background; visual bg from original Foreground.
+        assert!(
+            !snap.default_foreground,
+            "inverse default cell visual fg is Background, not Foreground"
+        );
+        assert!(
+            !snap.default_background,
+            "inverse default cell visual bg is Foreground, not Background"
+        );
+        assert_eq!(
+            snap.foreground,
+            named_color_fallback(NamedColor::Background)
+        );
+        assert_eq!(snap.foreground, crate::theme::TERMINAL_BG);
+        assert_eq!(
+            snap.background,
+            named_color_fallback(NamedColor::Foreground)
+        );
+    }
+
+    #[test]
+    fn default_foreground_marker_stays_false_for_indexed_ansi() {
+        let colors = Colors::default();
+        let mut cell = Cell::default();
+        cell.fg = AnsiColor::Indexed(1);
+        let snap = renderable_cell_snapshot(&cell, &colors);
+        assert!(!snap.default_foreground);
+        assert!(snap.default_background);
+    }
+
+    #[test]
+    fn blank_cell_fixture_marks_default_foreground() {
+        let blank = TerminalCellSnapshot::blank(0x111111, 0x222222);
+        assert!(blank.default_foreground);
+        assert!(blank.default_background);
+        assert_eq!(blank.foreground, 0x111111);
+        assert_eq!(blank.background, 0x222222);
     }
 }

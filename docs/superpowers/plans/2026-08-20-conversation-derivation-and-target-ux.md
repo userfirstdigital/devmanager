@@ -1734,7 +1734,7 @@ git commit -m "chore(ui): remove the throwaway conversation look prototype"
 - Tasks 1-10 are implemented in the real native conversation and composer surfaces; the throwaway prototype and fixture are removed. The final reference-parity pass uses a full-height task rail, a 32 px compact workspace top bar, a full-bleed bottom-anchored conversation canvas, a floating Tasks progress card, and the reference-height joined composer/context strip.
 - Final review corrections preserve Claude task/subagent lifecycle identity as typed plan state instead of title or display-label heuristics, keep every durable plan step visible while folding only older tool calls, and wire the real activity fold, accessible dock tabs, and production Delete control. Provider start/finish events now reduce through one stable step identity and unknown lifecycle states cannot inflate completed progress.
 - Verification passed in the isolated `C:\Temp\devmanager-conversation-derivation` target: the serial Rust library suite reported 2,768 passed, 0 failed, and 2 ignored; conversation conformance reported 1 passed and 0 failed; all 52 UI projection tests passed when each was run in a fresh harness process as required for Windows GPUI process-global state; and `cargo check --locked --lib --bins --tests` exited 0. One preceding full-suite run exposed a load-sensitive existing Git-host test failure; that exact test then passed three consecutive isolated runs before the clean full-suite acceptance run. The combined UI harness is not used as Windows acceptance authority because GPUI owns process-global native state.
-- Code-level geometry and treatment review confirms a 256 px full-height sidebar, 78 px borderless task rows, a 32 px workspace top bar with a 12 px aligned sidebar inset, a bare assistant turn, a 768 px centered conversation/composer column, a 724 px Tasks card, a 102 px minimum composer input, named-group hover/focus chrome, and a joined composer/context strip. Existing question, approval, attachment, provider, checkout, branch, terminal, dock, and task actions remain wired to their production handlers; `+ Add action` opens the production command palette.
+- Code-level geometry and treatment review confirms a 256 px full-height sidebar, 78 px borderless task rows, a 32 px workspace top bar with a 12 px aligned sidebar inset, a bare assistant turn, a 768 px centered conversation/composer column, a 724 px Tasks card, a 102 px minimum composer input, named-group hover/focus chrome, and a joined composer/context strip. Existing question, approval, attachment, provider, checkout, branch, terminal, dock, and task actions remain wired to their production handlers. **Superseded for Add action / composer honesty:** see the 2026-08-25 ledger — `+ Add action` is the project-action workflow (layout palette is secondary), and the composer placeholder no longer advertises `$` skills.
 - Native pixels are verified through the real isolated host and canonical `NativeShell` at the reference's exact 1912x2092 geometry: `conversation-reference-1912x2092-collapsed-final-20260824-v5.png` proves the complete active-composer shell, `conversation-reference-1912x2092-tasks-final-20260824-v3.png` proves a real six-step Tasks card with horizontal typography and short-conversation bottom anchoring, and `conversation-reference-1912x2092-browser-expanded-final-20260824.png` proves the expandable one-row Changes, Files, Browser, Services, Artifacts, and Review dock. No production profile or installed process was used as a fallback.
 - The workspace header keeps a small explicit `Conversation | Terminal` center-canvas switch independent from the slim right-panel toggle. The panel toggle expands the existing production dock without replacing its persisted state, shortcuts, width, or handlers.
 
@@ -1747,3 +1747,58 @@ These are in the spec but out of scope for trains 1 and 2, and each needs its ow
 - **Train 3 — Catalog ownership.** Replace the `builtinCatalog.ts` scrape at `src/ui/task_cockpit/composer.rs:174` and `:237` with a Rust const table generated into TypeScript by `build.rs`. Independent of everything here; can land at any time and closes a live silent-failure path.
 - **Train 4 — Composer derivation.** `src/ui/composer/segments.rs` and `trigger.rs`: the closed `PromptSegment` vocabulary, the dual expanded/collapsed cursor model, and `@` / `$` / `/` trigger detection. Required before the composer placeholder's promise of `@tag files/folders` and `$use skills` is honest.
 - **Train 5 — PWA cutover and file reduction.** Host emits derived rows on the wire, the PWA renders them, `web/src/tasks/timeline/timelineModel.ts` and the Task 6 conformance test are deleted, and `timeline.rs` and `composer.rs` are reduced to painting.
+
+---
+
+## Native UX completion ledger (2026-08-25 source slice)
+
+Status vocabulary for this ledger:
+
+- **SATISFIED (source)**: source and regression tests exist in-tree for the stated seam. Not cargo-verified in this turn.
+- **PARTIAL (source)**: primary path is wired; named gaps remain.
+- **ABSENT**: not present.
+- **HOLD**: blocked on missing typed authority or production-reachability evidence.
+- **UNVERIFIED**: source-complete claims must not be read as test/desktop/visual acceptance.
+
+### Production-reachability and train status
+
+| Item | Status | Notes |
+| --- | --- | --- |
+| Train 3 catalog ownership | SATISFIED (source) / UNVERIFIED | Reviewed owner is `src/ui/provider_catalog_seeds.rs` (Rust const). `provider_catalog.rs` reads consts only. `build.rs` mirrors seeds into `web/src/tasks/commands/builtinCatalog.generated.ts`. Mismatch contract in `provider_catalog_contract.rs`. No scrape / silent empty fallback. |
+| Train 4 composer derivation | SATISFIED (source) / UNVERIFIED | `@`/`/` derive on composer edits; FilesList feeds `@` candidates (secrets excluded); trigger overlay + keyboard/mouse/Escape; `$` remains HOLD. Placeholder advertises `@`/`/` only. |
+| `$` skill menu | HOLD | No typed native skill projection/authority. Explicit `SKILL_TRIGGER_HOLD`. |
+| Train 5 PWA cutover | HOLD | Host still does not emit derived conversation rows on the wire. Keep `timelineModel.ts` until cutover is production-reachable. |
+| T3-compatible theme system | SATISFIED (source) / UNVERIFIED | Profile-local appearance selection, exact built-in light/dark semantic palettes, custom import/export/duplicate/edit/remove, Guided and Advanced editors, whole-shell preview/cancel, and terminal token propagation are implemented. Final Rust and desktop/visual verification remain pending. |
+| Multi-folder / multi-repository Projects | SATISFIED (source) / UNVERIFIED | Projects remain workspace containers. Host-issued opaque repository selectors expose the bound Task checkout, configured project root, and configured folders without paths on the wire. Changes and Commit are repository-targeted; folder IDs are scoped by Project; worktree sibling mutation fails closed. Final Rust and desktop verification remain pending. |
+| Tasks 1–10 conversation/target UX closeout claims above | PARTIAL | Superseded by this ledger; do not treat earlier “complete” wording as acceptance. |
+
+### A–K native completion seams
+
+| Seam | Status | Evidence |
+| --- | --- | --- |
+| A Task search | SATISFIED (source) / UNVERIFIED | `task_search.rs` + NativeShell overlay. |
+| B Project scope | SATISFIED (source) / UNVERIFIED | Persisted `project_scope_workspace_id`; `begin_new_task` uses Project scope when set. |
+| C Project actions | SATISFIED (source) / UNVERIFIED | Dual-field editor (Tab/backspace/mouse), `ConfigCommandDetail` edit, archive confirm, run via `ServiceControl` + fences, AccessKit nodes, correlated errors/results. |
+| D Browser pixels | PARTIAL (source) / UNVERIFIED | Gateway/bridge/inbox lifecycle on NativeShell; registrar identity before bind; HWND retained via window observers; chrome Back/Forward/Reload/Navigate; Ensure before bind. Sibling-process ProcessManager registrar handoff is typed (`HostRequestHandle::set_browser_gateway_registrar`) but only effective in-process. |
+| E Header Open/Commit | SATISFIED (source) / UNVERIFIED | Editable message + backspace; repository label and opaque selector are captured from targeted status; confirmation and success/failure are fenced to the exact queued request ID; AccessKit. |
+| F Dock / center | PARTIAL (source) / UNVERIFIED | Layout v3 dock tab + center preference persistence. |
+| G Conversation/composer paths | PARTIAL (source) / UNVERIFIED | Existing paths preserved. |
+| H Composer honesty | SATISFIED (source) / UNVERIFIED | `$` HOLD; `@`/`/` wired; placeholder exact. |
+| I Deferred trains | see table above | |
+| J Plan ledger | SATISFIED (source) | This section. |
+| K Tests | SATISFIED (source) / UNVERIFIED | Behavioral tests in `native_ux_behavior_tests.rs`, gateway identity, catalog contract, workflow modules. **Not run** (no cargo this turn). |
+
+### Explicit HOLDs
+
+1. `$` skill trigger menu — no typed native skill catalog/projection.
+2. Train 5 PWA cutover — host-emitted derived rows not production-reachable; keep `timelineModel.ts`.
+3. Sibling-process browser gateway registrar handoff — typed in-process `set_browser_gateway_registrar` exists; cross-process ProcessManager registration still requires co-location or a future IPC register RPC. Until a registered `process_session_id` exists, attach fails visibly (never synthesized).
+
+### Final local acceptance closeout (2026-08-25)
+
+The bullets below describe the earlier source slice and are historical evidence only. They do not verify the later theme, terminal, or multi-repository changes recorded above; the current completion verdict must come from the final isolated Rust and real-desktop acceptance run.
+
+- The T3-style reversible lifecycle is implemented as `Done` / `Restore`, separate from the existing destructive `Delete` path. A Done task retains its conversation and runtime ownership, moves after active tasks under the Done group, restores on task click or the Restore action, and atomically returns to active when a new `SendNow` input is accepted.
+- Live isolated desktop acceptance passed for Done, Restore, task-click reactivation, task-search focus/type/filter, and persistence across a complete client/host restart. The restarted shell retained the settled task and the saved Review dock. Provider-message reactivation remains live HOLD because sending would be a representational external action; the atomic transition is covered by the provider-input integration test.
+- Final local gates passed in `C:\Temp\devmanager-conversation-derivation`: Rust library suite 2,803 passed / 0 failed / 2 ignored; `cargo check --locked --lib --bins --tests`; `cargo fmt --all -- --check`; compact debug app and host builds; and the web typecheck/Vite/PWA production build.
+- T3 structural interaction parity is accepted for the Done lifecycle and three-column task/conversation/dock organization. Exact visual parity remains PARTIAL because DevManager intentionally retains its own light palette, density, and typography rather than reproducing T3 pixels.

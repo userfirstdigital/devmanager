@@ -1640,6 +1640,29 @@ impl ProcessManager {
             .unwrap_or_default()
     }
 
+    /// Return the exact current host-owned AI process session for one task tab.
+    ///
+    /// Browser gateway identity must be correlated to the launched runtime; it
+    /// must never be reconstructed from task ids, timestamps, or transcript
+    /// ordering. If duplicate live rows exist during a bounded transition, the
+    /// most recently started runtime wins deterministically.
+    pub fn live_ai_process_session_for_tab(&self, tab_id: &str) -> Option<String> {
+        self.runtime_state()
+            .sessions
+            .into_values()
+            .filter(|session| {
+                session.session_kind.is_ai()
+                    && session.status.is_live()
+                    && session.tab_id.as_deref() == Some(tab_id)
+            })
+            .max_by(|left, right| {
+                left.started_at
+                    .cmp(&right.started_at)
+                    .then_with(|| left.session_id.cmp(&right.session_id))
+            })
+            .map(|session| session.session_id)
+    }
+
     pub fn runtime_revision(&self) -> u64 {
         self.inner.runtime_revision.load(Ordering::Relaxed)
     }
@@ -10968,6 +10991,59 @@ mod tests {
                 .and_then(|tab| tab.provider_session_id.as_deref()),
             Some("provider-123")
         );
+    }
+
+    #[test]
+    fn live_ai_process_session_for_tab_returns_only_exact_live_ai_runtime() {
+        let manager = ProcessManager::new();
+        let cwd = std::env::current_dir().unwrap();
+        let mut live = SessionRuntimeState::new(
+            "runtime-exact",
+            cwd.clone(),
+            SessionDimensions::default(),
+            TerminalBackend::PortablePtyFeedingAlacritty,
+        );
+        live.configure_ai(AiLaunchSpec {
+            tab_id: "task-exact".to_string(),
+            project_id: "project-1".to_string(),
+            tool: SessionKind::Codex,
+            cwd: cwd.clone(),
+            shell_program: "powershell.exe".to_string(),
+            shell_args: Vec::new(),
+            startup_command: "codex".to_string(),
+        });
+        live.status = SessionStatus::Running;
+        manager.register_runtime_session(live);
+
+        let mut stopped = SessionRuntimeState::new(
+            "runtime-stopped",
+            cwd,
+            SessionDimensions::default(),
+            TerminalBackend::PortablePtyFeedingAlacritty,
+        );
+        stopped.configure_ai(AiLaunchSpec {
+            tab_id: "task-stopped".to_string(),
+            project_id: "project-1".to_string(),
+            tool: SessionKind::Claude,
+            cwd: std::env::current_dir().unwrap(),
+            shell_program: "powershell.exe".to_string(),
+            shell_args: Vec::new(),
+            startup_command: "claude".to_string(),
+        });
+        stopped.status = SessionStatus::Stopped;
+        manager.register_runtime_session(stopped);
+
+        assert_eq!(
+            manager
+                .live_ai_process_session_for_tab("task-exact")
+                .as_deref(),
+            Some("runtime-exact")
+        );
+        assert_eq!(
+            manager.live_ai_process_session_for_tab("task-stopped"),
+            None
+        );
+        assert_eq!(manager.live_ai_process_session_for_tab("missing"), None);
     }
 
     #[test]
