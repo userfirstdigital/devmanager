@@ -422,10 +422,56 @@ impl TaskWorkspace {
         Ok(())
     }
 
-    fn pane_mut(&mut self, pane_id: PaneId) -> Option<&mut TaskPane> {
+    pub(crate) fn pane_mut(&mut self, pane_id: PaneId) -> Option<&mut TaskPane> {
         self.root
             .as_mut()
             .and_then(|root| find_pane_mut(root, pane_id))
+    }
+
+    pub fn pin_task_axis_size(
+        &mut self,
+        task_id: TaskId,
+        logical_px: f32,
+    ) -> Result<(), WorkspaceError> {
+        if !logical_px.is_finite() || logical_px <= 0.0 {
+            return Err(WorkspaceError::InvalidTree);
+        }
+        let root = self.root_mut().ok_or(WorkspaceError::MissingPane)?;
+        if set_task_allocation(root, task_id, Allocation::Pinned { logical_px }) {
+            Ok(())
+        } else {
+            Err(WorkspaceError::MissingPane)
+        }
+    }
+
+    pub fn reset_task_axis_size(&mut self, task_id: TaskId) -> Result<(), WorkspaceError> {
+        let root = self.root_mut().ok_or(WorkspaceError::MissingPane)?;
+        if set_task_allocation(root, task_id, Allocation::auto()) {
+            Ok(())
+        } else {
+            Err(WorkspaceError::MissingPane)
+        }
+    }
+
+    pub(crate) fn task_is_unpinned(&self, task_id: TaskId) -> bool {
+        self.root
+            .as_ref()
+            .is_some_and(|root| task_path_is_auto(root, task_id, true))
+    }
+
+    pub(crate) fn set_presentation(
+        &mut self,
+        task_id: TaskId,
+        presentation: PanePresentation,
+    ) -> Result<(), WorkspaceError> {
+        let pane_id = self
+            .pane_for_task(task_id)
+            .map(|pane| pane.id)
+            .ok_or(WorkspaceError::MissingPane)?;
+        self.pane_mut(pane_id)
+            .ok_or(WorkspaceError::MissingPane)?
+            .presentation = presentation;
+        Ok(())
     }
 
     fn repair_focus_after_removal(&mut self, removed: PaneId) {
@@ -499,6 +545,41 @@ fn collect_task_ids(node: &WorkspaceNode, task_ids: &mut Vec<TaskId>) {
                 collect_task_ids(&child.node, task_ids);
             }
         }
+    }
+}
+
+fn set_task_allocation(node: &mut WorkspaceNode, task_id: TaskId, allocation: Allocation) -> bool {
+    let WorkspaceNode::Split { children, .. } = node else {
+        return false;
+    };
+    for child in children {
+        if !contains_task(&child.node, task_id) {
+            continue;
+        }
+        if set_task_allocation(&mut child.node, task_id, allocation) {
+            return true;
+        }
+        child.allocation = allocation;
+        return true;
+    }
+    false
+}
+
+fn contains_task(node: &WorkspaceNode, task_id: TaskId) -> bool {
+    find_pane_for_task(node, task_id).is_some()
+}
+
+fn task_path_is_auto(node: &WorkspaceNode, task_id: TaskId, path_is_auto: bool) -> bool {
+    match node {
+        WorkspaceNode::Pane(pane) => pane.task_id == task_id && path_is_auto,
+        WorkspaceNode::Split { children, .. } => children.iter().any(|child| {
+            contains_task(&child.node, task_id)
+                && task_path_is_auto(
+                    &child.node,
+                    task_id,
+                    path_is_auto && !child.allocation.is_pinned(),
+                )
+        }),
     }
 }
 
