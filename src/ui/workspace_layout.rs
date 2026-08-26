@@ -5,7 +5,7 @@
 //! the profile they belong to, so a dev profile cannot inherit or overwrite the
 //! installed profile's layout.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -13,10 +13,12 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::TaskId;
+use crate::ui::task_workspace::TaskWorkspace;
 
 const LAYOUT_SCHEMA_V1: &str = "devmanager.workspace-layout/v1";
 const LAYOUT_SCHEMA_V2: &str = "devmanager.workspace-layout/v2";
-const LAYOUT_SCHEMA: &str = "devmanager.workspace-layout/v3";
+const LAYOUT_SCHEMA_V3: &str = "devmanager.workspace-layout/v3";
+const LAYOUT_SCHEMA: &str = "devmanager.workspace-layout/v4";
 const LAYOUT_FILE_NAME: &str = "workspace-layout.json";
 
 pub const SIDEBAR_MIN: f32 = 180.0;
@@ -85,6 +87,10 @@ pub struct WorkspaceLayout {
     /// can become active.
     #[serde(default)]
     pub selected_task: Option<TaskId>,
+    /// Recursive multi-task pane tree. The selected task remains as a compact
+    /// compatibility cursor and is always synchronized to this tree's focus.
+    #[serde(default)]
+    pub task_workspace: Option<TaskWorkspace>,
     /// Active right-dock tab label (`Changes`, `Files`, …). Validated on restore.
     #[serde(default)]
     pub active_dock_tab: Option<String>,
@@ -111,6 +117,7 @@ impl Default for WorkspaceLayout {
             terminal_collapsed: false,
             window: None,
             selected_task: None,
+            task_workspace: None,
             active_dock_tab: None,
             project_scope_workspace_id: None,
             task_center_terminal: BTreeMap::new(),
@@ -167,7 +174,79 @@ impl WorkspaceLayout {
             self.set_value(edge, if value.is_finite() { value } else { fallback });
         }
         self.window = self.window.filter(WindowFrame::is_usable);
+        self.sanitize_task_workspace();
         self
+    }
+
+    /// Reconcile local pane membership against the canonical task projection.
+    /// Unknown panes and per-task surface preferences are discarded locally;
+    /// no host or durable task state is mutated.
+    pub fn reconcile_task_workspace(&mut self, valid_task_ids: &[TaskId]) -> bool {
+        let before = self.clone();
+        self.sanitize_task_workspace();
+
+        let valid: BTreeSet<TaskId> = valid_task_ids.iter().copied().collect();
+        let mut prune_failed = false;
+        if let Some(workspace) = self.task_workspace.as_mut() {
+            let unknown: Vec<_> = workspace
+                .task_ids()
+                .into_iter()
+                .filter(|task_id| !valid.contains(task_id))
+                .collect();
+            for task_id in unknown {
+                if let Some(pane_id) = workspace.pane_for_task(task_id).map(|pane| pane.id) {
+                    // The id was read from this exact validated tree. A failure
+                    // here means the tree changed unexpectedly, so fail closed.
+                    if workspace.remove_pane(pane_id).is_err() {
+                        prune_failed = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if prune_failed {
+            self.task_workspace = None;
+        }
+
+        if self
+            .task_workspace
+            .as_ref()
+            .is_some_and(|workspace| workspace.pane_count() == 0)
+        {
+            self.task_workspace = None;
+        }
+        if self.task_workspace.is_none() {
+            self.task_workspace = self
+                .selected_task
+                .filter(|task_id| valid.contains(task_id))
+                .map(TaskWorkspace::single);
+        }
+        self.selected_task = self
+            .task_workspace
+            .as_ref()
+            .and_then(TaskWorkspace::focused_task);
+
+        let valid_keys: BTreeSet<String> = valid.iter().map(ToString::to_string).collect();
+        self.task_center_terminal
+            .retain(|task_id, _| valid_keys.contains(task_id));
+        *self != before
+    }
+
+    fn sanitize_task_workspace(&mut self) {
+        let invalid_or_empty = self
+            .task_workspace
+            .as_ref()
+            .is_some_and(|workspace| workspace.validate().is_err() || workspace.pane_count() == 0);
+        if invalid_or_empty {
+            self.task_workspace = None;
+        }
+        if self.task_workspace.is_none() {
+            self.task_workspace = self.selected_task.map(TaskWorkspace::single);
+        }
+        self.selected_task = self
+            .task_workspace
+            .as_ref()
+            .and_then(TaskWorkspace::focused_task);
     }
 
     /// The window frame to restore, if one was stored and is still usable.
@@ -268,9 +347,9 @@ impl WorkspaceLayoutStore {
 
     /// Load the stored layout, falling back to defaults. A view preference is
     /// never worth failing a launch over, so unreadable or foreign-schema
-    /// storage degrades to the default geometry. Version-1 layouts migrate
-    /// once into the conversation-first schema by collapsing the context dock
-    /// while preserving every other stored preference.
+    /// storage degrades to the default geometry. Legacy layouts migrate their
+    /// selected task into a one-pane workspace; version 1 also collapses the
+    /// context dock once for the conversation-first shell.
     pub fn load(&self) -> WorkspaceLayout {
         let Ok(bytes) = fs::read(&self.path) else {
             return WorkspaceLayout::default();
@@ -280,6 +359,7 @@ impl WorkspaceLayoutStore {
         };
         match file.schema.as_str() {
             LAYOUT_SCHEMA => file.layout.sanitized(),
+            LAYOUT_SCHEMA_V3 => file.layout.sanitized(),
             LAYOUT_SCHEMA_V2 => file.layout.sanitized(),
             LAYOUT_SCHEMA_V1 => {
                 let mut layout = file.layout.sanitized();
@@ -367,7 +447,9 @@ mod tests {
         layout.set_value(PaneEdge::Inbox, 401.0);
         layout.set_value(PaneEdge::Terminal, 333.0);
         layout.sidebar_collapsed = true;
-        layout.selected_task = Some(TaskId::new());
+        let selected = TaskId::new();
+        layout.selected_task = Some(selected);
+        layout.task_workspace = Some(crate::ui::task_workspace::TaskWorkspace::single(selected));
         store.save(layout.clone()).expect("save layout");
 
         assert_eq!(store.load(), layout);
@@ -495,7 +577,7 @@ mod tests {
     }
 
     #[test]
-    fn v1_layout_migrates_once_to_v2_with_dock_collapsed() {
+    fn v1_layout_migrates_once_to_v4_with_dock_collapsed() {
         let directory = tempfile::tempdir().expect("temp dir");
         let store = WorkspaceLayoutStore::at_profile_root(directory.path());
         let selected = TaskId::new();
@@ -539,6 +621,13 @@ mod tests {
         assert!(migrated.terminal_collapsed);
         assert_eq!(migrated.window, Some(window));
         assert_eq!(migrated.selected_task, Some(selected));
+        assert_eq!(
+            migrated
+                .task_workspace
+                .as_ref()
+                .and_then(|workspace| workspace.focused_task()),
+            Some(selected)
+        );
 
         store
             .save(migrated.clone())
@@ -546,14 +635,14 @@ mod tests {
         let bytes = fs::read(store.path()).expect("read saved layout");
         let saved: serde_json::Value = serde_json::from_slice(&bytes).expect("parse saved");
         assert_eq!(
-            saved["schema"], "devmanager.workspace-layout/v3",
+            saved["schema"], "devmanager.workspace-layout/v4",
             "save must write the current workspace-layout schema"
         );
         assert_eq!(store.load(), migrated);
     }
 
     #[test]
-    fn v3_persists_dock_tab_project_scope_and_center_surface() {
+    fn v4_persists_dock_tab_project_scope_and_center_surface() {
         let directory = tempfile::tempdir().expect("temp dir");
         let store = WorkspaceLayoutStore::at_profile_root(directory.path());
         let layout = WorkspaceLayout {
@@ -566,7 +655,7 @@ mod tests {
             },
             ..WorkspaceLayout::default()
         };
-        store.save(layout).expect("save v3");
+        store.save(layout).expect("save v4");
         let loaded = store.load();
         assert_eq!(loaded.active_dock_tab.as_deref(), Some("Browser"));
         assert_eq!(
@@ -575,5 +664,109 @@ mod tests {
         );
         assert_eq!(loaded.task_center_terminal.get("task-a"), Some(&true));
         assert!(loaded.dock_collapsed);
+    }
+
+    #[test]
+    fn v3_selected_task_migrates_to_a_single_pane_workspace() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let store = WorkspaceLayoutStore::at_profile_root(directory.path());
+        let selected = TaskId::new();
+        let v3 = serde_json::json!({
+            "schema": "devmanager.workspace-layout/v3",
+            "layout": {
+                "sidebar_width": 285.0,
+                "inbox_width": 320.0,
+                "dock_width": 360.0,
+                "terminal_height": 200.0,
+                "selected_task": selected
+            }
+        });
+        fs::write(
+            store.path(),
+            serde_json::to_vec_pretty(&v3).expect("encode"),
+        )
+        .expect("write");
+
+        let migrated = store.load();
+        let workspace = migrated.task_workspace.as_ref().expect("workspace");
+        assert_eq!(workspace.pane_count(), 1);
+        assert_eq!(workspace.focused_task(), Some(selected));
+        assert_eq!(migrated.selected_task, Some(selected));
+    }
+
+    #[test]
+    fn corrupt_v4_workspace_fails_closed_without_losing_shell_geometry() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let store = WorkspaceLayoutStore::at_profile_root(directory.path());
+        let selected = TaskId::new();
+        let corrupt = serde_json::json!({
+            "schema": "devmanager.workspace-layout/v4",
+            "layout": {
+                "sidebar_width": 285.0,
+                "inbox_width": 410.0,
+                "dock_width": 520.0,
+                "terminal_height": 240.0,
+                "selected_task": selected,
+                "task_workspace": {
+                    "root": null,
+                    "focused": selected,
+                    "previous_focus": null,
+                    "focus_clock": 1
+                }
+            }
+        });
+        fs::write(
+            store.path(),
+            serde_json::to_vec_pretty(&corrupt).expect("encode"),
+        )
+        .expect("write");
+
+        let loaded = store.load();
+        assert_eq!(loaded.sidebar_width, 285.0);
+        assert_eq!(loaded.inbox_width, 410.0);
+        assert_eq!(loaded.dock_width, 520.0);
+        assert_eq!(loaded.terminal_height, 240.0);
+        let workspace = loaded.task_workspace.as_ref().expect("fallback workspace");
+        assert_eq!(workspace.pane_count(), 1);
+        assert_eq!(workspace.focused_task(), Some(selected));
+    }
+
+    #[test]
+    fn canonical_reconciliation_prunes_unknown_tasks_and_repairs_focus() {
+        use crate::ui::task_workspace::{Axis, TaskWorkspace};
+
+        let first = TaskId::new();
+        let removed = TaskId::new();
+        let third = TaskId::new();
+        let mut workspace = TaskWorkspace::single(first);
+        workspace
+            .insert_after_focused(removed, Axis::Horizontal)
+            .expect("insert removed task");
+        workspace
+            .insert_after_focused(third, Axis::Vertical)
+            .expect("insert third task");
+        workspace.focus_task(removed).expect("focus removed task");
+        let mut layout = WorkspaceLayout {
+            selected_task: Some(removed),
+            task_workspace: Some(workspace),
+            task_center_terminal: BTreeMap::from([
+                (first.to_string(), true),
+                (removed.to_string(), true),
+                ("not-a-task".into(), true),
+            ]),
+            ..WorkspaceLayout::default()
+        };
+
+        assert!(layout.reconcile_task_workspace(&[first, third]));
+        let workspace = layout.task_workspace.as_ref().expect("workspace");
+        assert_eq!(workspace.pane_count(), 2);
+        assert!(workspace.contains_task(first));
+        assert!(workspace.contains_task(third));
+        assert!(!workspace.contains_task(removed));
+        assert_eq!(layout.selected_task, workspace.focused_task());
+        assert_eq!(
+            layout.task_center_terminal,
+            BTreeMap::from([(first.to_string(), true)])
+        );
     }
 }
